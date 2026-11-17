@@ -7,7 +7,7 @@ Tags: release
 
 Summary: secantus-mdb 0.5.3-beta.182 shows a time-series collection's buckets, makes _id unique by the collection's default collation, stops a failed $out from destroying its target, and adds convertToCapped, cloneCollectionAsCapped, compact and reIndex.
 
-Two things in this release could leave a test passing on wrong data.
+Two things in this release could leave an application reading wrong data.
 
 - **A failed `$out` emptied its target.** The target was dropped before the
   new documents went in. If one of them was refused, by a duplicate `_id`
@@ -65,7 +65,7 @@ is refused (17152).
 We ran the pymongo, Go and Node driver suites against this code. Each
 gave the same result as the release before.
 
-This is a server for tests. It is single-node and it is a beta.
+This is a real single-node database, and it is a beta.
 
 `cargo install secantus-mdb --version 0.5.3-beta.182` builds it from crates.io.
 Binaries for Linux x86_64, macOS arm64 and Windows x86_64 are on the release.

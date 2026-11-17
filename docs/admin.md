@@ -1,5 +1,13 @@
 # Admin web UI
 
+:::{warning}
+The admin UI is part of the **deprecated Python package** (`secantus.admin`).
+It is not in the PyPI wheel, which carries only the Rust servers and the
+`secantusdb` launcher, and it is not tested in CI. It is a plain `pymongo`
+client, so it drives `secantusd-mdb` like any other MongoDB-wire server; run it
+from a source checkout of the repository.
+:::
+
 SecantusDB ships an optional local web UI — a FastAPI app served behind
 a [pywebview](https://pywebview.flowrl.com) window — for browsing
 collections, watching live metrics, managing users, tailing change
@@ -17,11 +25,12 @@ from OpenStreetMap; nothing else the UI does leaves your machine.
 
 ## Install
 
-The UI lives behind an optional extra so it doesn't pull a FastAPI /
-uvicorn / pywebview dependency closure into the base wheel:
+The UI lives behind the `admin` extra of the repository's Python package, so
+it doesn't pull a FastAPI / uvicorn / pywebview dependency closure into
+anything else. From a source checkout:
 
 ```bash
-pip install 'secantusdb[admin]'
+uv sync --extra admin
 ```
 
 The extra brings in `fastapi`, `uvicorn[standard]`, `jinja2`, `httpx`,
@@ -686,15 +695,16 @@ The gaps worth knowing about before you rely on a page. Full backlog at
 
 ## Programmatic use
 
-For tests or embedded scenarios, construct the FastAPI app directly
-via `secantus.admin.create_app`:
+To embed the app, construct the FastAPI app directly via
+`secantus.admin.create_app` (here pointed at a `secantusd-mdb` started by the
+`secantusdb` launcher):
 
 ```python
 from httpx import ASGITransport, AsyncClient
-from secantus import SecantusDBServer
 from secantus.admin import create_app
+from secantusdb import MongoServer
 
-with SecantusDBServer(port=0, storage_path=":memory:") as srv:
+with MongoServer() as srv:
     app = create_app(
         mongo_uri=srv.uri,
         token="testtoken",

@@ -87,7 +87,7 @@ by name rather than answering in the wrong order.
 - `cargo install secantus-pg --version 0.1.0-beta.17` from crates.io, and a
   query against what it built.
 
-This is a server for tests. It is single-node, and it is a beta.
+This is a real single-node database, and it is a beta.
 
 `cargo install secantus-pg --version 0.1.0-beta.17` builds it from crates.io.
 Binaries for Linux x86_64 and macOS arm64 are on the release.

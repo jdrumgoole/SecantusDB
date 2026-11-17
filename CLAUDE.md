@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-SecantusDB is a **surrogate single-node database**. It speaks real wire protocols on a real TCP socket over the same **WiredTiger** storage engine MongoDB ships, so an application's tests can run against it instead of standing up a real `mongod` or `postgres`. "Surrogate" rather than "fake" — these really are database servers, just intentionally scoped to single-node operation.
+SecantusDB is a **real single-node database** (Joe, 2026-11-17: "lose the 'for your tests' angle ... We are building a real database, not a toy"). It speaks real wire protocols on a real TCP socket over the same **WiredTiger** storage engine MongoDB ships, so any `pymongo` / `mongosh` / `psycopg` / `psql` client talks to it as it would to `mongod` or `postgres`. These are database servers, intentionally scoped to single-node operation. Do not describe them as a test double, a fake, a surrogate, an emulator or a tool for running your tests; tests are one legitimate use among many, not the pitch.
 
 **Four servers, two wire protocols, one storage format.** The Rust pair is the
 product. **The Python pair is FULLY DEPRECATED** (Joe, 2026-10-14: "We are
@@ -86,9 +86,12 @@ own test suite reaches for, not by a feature list.
 **Explicitly out of scope:** real replica sets, sharding, multi-node consistency —
 and their SQL equivalents (streaming replication, hot standby). SecantusDB advertises itself as a single-node `secantus` replica-set primary in the `hello` reply (so `pymongo`'s topology machinery accepts change streams), but the topology is fictional — there are no other members, no elections, no cross-node oplog. If a feature only makes sense in a multi-node deployment, SecantusDB does not implement it.
 
-The audience is developers who want fast, ephemeral, single-node MongoDB or
-PostgreSQL behaviour — in a test, in CI, in a container — without running the
-real thing. Not a production-grade emulator.
+The audience is anyone who wants a single-node MongoDB or PostgreSQL
+database that is one self-contained binary — for an application, in a
+container, embedded in a program, or in a test — behaving as the real
+product does within that scope. Positioning stays modest about maturity
+(it is a beta; no production-proven or SLA claims) but never frames it as
+a toy.
 
 **Performance work belongs to the Rust servers.** A benchmark that shows a
 Python server slow is reporting the design, not a regression. Route latency /
@@ -145,7 +148,7 @@ throughput / concurrency work to `crates/`.
   hash page models, `nodeToString` for `pg_rewrite` rather than baked
   trees).
 - **Wire-protocol fidelity over feature completeness.** Prefer returning a faithful "command not supported" error over a half-implemented feature that silently diverges from real server behaviour.
-- **Ease of use for the beginning programmer:** starting a server in a test should be one or two lines, with no external processes to manage.
+- **Ease of use for the beginning programmer:** starting a server (from a program, a script or a test) should be one or two lines, with no external processes to manage.
 
 ## Never ignore or discount an error — this is a database
 

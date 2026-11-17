@@ -61,7 +61,7 @@ that is the next thing to work on. A single durable `UPDATE` costs 334
 microseconds against PostgreSQL's 188, and a prepared read of one row 137
 against 60.
 
-This is a server for tests. It is single-node, it is a beta, and a role with
+This is a real single-node database, it is a beta, and a role with
 no password connects without one, so keep it on loopback.
 
 `cargo install secantus-pg --version 0.1.0-beta.6` builds it from crates.io.

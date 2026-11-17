@@ -13,7 +13,7 @@ prebuilt one (Linux x86_64, macOS arm64) with no toolchain. The prebuilt one
 is also the fastest: it is built with a profile that `cargo install` cannot
 have.
 
-## In a test
+## Embedded in a Rust program
 
 ```toml
 [dev-dependencies]
@@ -74,7 +74,7 @@ client certificate a revocation list names; `--tls-client-name DN`
 `CN=alice,O=Example`, in place of its common name; and `--tls-ident-file
 pg_ident.conf --tls-user-map NAME` (`map=NAME`) lets a certificate log in
 as the roles a user name map gives it. The files are read again on SIGHUP
-and on `select pg_reload_conf()`. In a Rust test these are
+and on `select pg_reload_conf()`. From Rust these are
 `TlsConfig::crl_file`, `client_name` and `user_map`, and
 `PgServer::reload`. Not supported: a key with a passphrase.
 

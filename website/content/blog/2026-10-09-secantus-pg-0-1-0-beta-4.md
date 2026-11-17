@@ -62,7 +62,7 @@ that as a `smallint`, and a value the planner has to widen is not reused yet.
 On macOS, where the last post's numbers came from, a durable `UPDATE` was level
 with PostgreSQL before this release.
 
-This is a server for tests. It is single-node, it is a beta, and a role with
+This is a real single-node database, it is a beta, and a role with
 no password connects without one, so keep it on loopback.
 
 `cargo install secantus-pg --version 0.1.0-beta.4` builds it from crates.io.

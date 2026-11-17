@@ -7,7 +7,7 @@ Tags: release
 
 Summary: secantus-mdb 0.5.3-beta.192 fixes dataSize over a key range, the sizes in $collStats and the counters in serverStatus, and checks the fields every command takes, as mongod does.
 
-Upgrade if you run `secantusd-rs` and your tests read what the server says
+Upgrade if you run `secantusd-rs` and read what the server says
 about itself, or rely on it refusing a malformed command.
 
 Three answers were wrong:
@@ -66,7 +66,7 @@ to test that a store is sound.
 We ran the pymongo, Go and Node driver suites against this code. Each gave
 the same result as the release before.
 
-This is a server for tests. It is single-node and it is a beta.
+This is a real single-node database, and it is a beta.
 
 `cargo install secantus-mdb --version 0.5.3-beta.192` builds it from crates.io.
 Binaries for Linux x86_64, macOS arm64 and Windows x86_64 are on the release.

@@ -48,7 +48,7 @@ html_theme_options = {
         '<a href="https://secantusdb.com/python-db.html">Python DB</a> &nbsp;·&nbsp; '
         '<a href="https://secantusdb.com/rust-db.html">Rust DB</a> &nbsp;·&nbsp; '
         '<a href="https://secantusdb.com/blog.html">Blog</a> &nbsp;·&nbsp; '
-        '<a href="https://secantusdb.com/docs/index.html">Python docs</a> &nbsp;·&nbsp; '
+        '<a href="https://secantusdb.com/docs/index.html">Docs</a> &nbsp;·&nbsp; '
         '<a href="https://secantusdb.com/docs/rust/index.html">Rust docs</a>'
     ),
 }

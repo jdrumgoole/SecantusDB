@@ -123,7 +123,7 @@ hosted Linux runner: each expects a notification within 25 to 50 ms and
 saw it 55 to 80 ms late. They pass on macOS. We have not yet established
 whether that is the shared runner or the server on Linux.
 
-This is a server for tests. It is single-node, and it is a beta.
+This is a real single-node database, and it is a beta.
 
 `cargo install secantus-pg --version 0.1.0-beta.13` builds it from crates.io.
 Binaries for Linux x86_64 and macOS arm64 are on the release.

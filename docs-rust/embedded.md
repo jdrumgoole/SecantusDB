@@ -1,10 +1,10 @@
-# Embedded in a test
+# Embedded in your application
 
-## From a Rust test
+## From Rust
 
 The `secantus-mdb` crate starts the server **in-process**: a real server on a
-real TCP port, with a temporary store removed on drop, so any number of tests
-can run in parallel. Add it as a dev-dependency and connect the official
+real TCP port, with a temporary store removed on drop, so any number of servers
+can run in parallel. Add it as a dependency and connect the official
 `mongodb` driver:
 
 ```rust
@@ -16,22 +16,27 @@ client.database("mydb").collection("users")
 
 `Server::builder()` sets a persistent store, a port, auth, TLS, the WiredTiger
 cache and the background sweepers. Like the daemon, it expires TTL-indexed
-documents every 60 seconds. A test that needs an expiry sooner sets
-`ttlMonitorSleepSecs` with `setParameter`, as it would on `mongod`, and can
-wait for `serverStatus().metrics.ttl.passes` to move instead of sleeping. A
+documents every 60 seconds. To get an expiry sooner, set
+`ttlMonitorSleepSecs` with `setParameter`, as on `mongod`, and wait for `serverStatus().metrics.ttl.passes` to move instead of sleeping. A
 server started this way advertises a
-single-node replica set named `secantus` and enables test commands, because
-it is a test's server.
+single-node replica set named `secantus` and enables test commands.
 
-## From a Python test
+## From Python
 
-The published `SecantusDB` wheel no longer contains the Rust server: it
-carries only the Python servers. From a Python test, either run
-`secantusd-mdb` (from the `secantus-mdb` crate or a release archive) as a
-subprocess and point `pymongo` at it, or use the Python server's
-`SecantusDBServer`, which has the same `pymongo` surface.
+`pip install SecantusDB` provides the `secantusdb` launcher, which starts the
+real `secantusd-mdb` binary as a subprocess on a free port, with a temporary
+data directory unless you pass `storage_path`:
 
-### The `RustServer` handle (source builds only)
+```python
+from pymongo import MongoClient
+from secantusdb import MongoServer
+
+with MongoServer() as server:
+    client = MongoClient(server.uri)
+    client["mydb"]["users"].insert_one({"_id": 1, "name": "Joe"})
+```
+
+### The `RustServer` handle (source builds only; not part of `pip install`)
 
 A checkout built with the storage-engine flag
 (`SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON uv sync --extra dev`)
@@ -107,7 +112,7 @@ same version string.
 
 ## Tests under pytest-xdist
 
-Same pattern as the Python server: `port=0` plus a unique `storage_path`
+`port=0` plus a unique `storage_path`
 per test (pytest's `tmp_path` gives both isolation and cleanup):
 
 ```python

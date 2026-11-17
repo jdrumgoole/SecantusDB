@@ -165,9 +165,9 @@ mongod.
 
 ```python
 from pymongo import MongoClient
-from secantus import SecantusDBServer
+from secantusdb import MongoServer
 
-with SecantusDBServer(port=0) as srv:
+with MongoServer() as srv:
     client = MongoClient(srv.uri)
     coll = client["app"]["places"]
 

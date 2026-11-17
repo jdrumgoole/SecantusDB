@@ -2,14 +2,13 @@
 
 ## Should you?
 
-SecantusDB started life as a **single-node test surrogate** for the
-MongoDB wire protocol — fast, embeddable, ephemeral, "don't stand up
-a real `mongod` just to run pytest." That's still the primary
-audience. The storage engine underneath (WiredTiger, the same engine
-real `mongod` uses) is genuinely production-grade, and the supported
-wire-protocol surface is conformant enough that production drivers
-talk to it cleanly. So the comparison most people reach for —
-"SecantusDB vs `mongod` in prod" — isn't the useful one. The useful
+SecantusDB is a **real single-node database** speaking the MongoDB
+(and PostgreSQL) wire protocol — fast, embeddable, and backed by the
+same WiredTiger storage engine real `mongod` uses. The storage engine
+is production-grade, and the supported wire-protocol surface is
+conformant enough that production drivers talk to it cleanly. So the
+comparison most people reach for — "SecantusDB vs `mongod` in prod" —
+isn't the useful one. The useful
 comparison is **SecantusDB vs single-node Postgres** for a small or
 medium application that wants document-shaped storage on one box.
 
@@ -32,8 +31,8 @@ doesn't pretend to compete in that space.
 | Crash recovery from journal | WAL replay on start | WT log replay on `wiredtiger_open` |
 | Per-commit durability | `synchronous_commit=on` default | `sync_on_commit=true` opt-in (see [Configuration](configuration.md)) |
 | Full snapshot backup | `pg_basebackup` | `secantusAdmin.backupArchive` (`.tar.gz`) |
-| Restore | swap dbpath + start | `secantus-restore-archive` → start fresh server |
-| Point-in-time recovery | WAL archiving + `recovery_target_time` | oplog replay to a timestamp — `secantusAdmin.restoreToTimestamp` (see [Recovery](recovery.md)) |
+| Restore | swap dbpath + start | `secantusd-mdb restore` → start fresh server |
+| Point-in-time recovery | WAL archiving + `recovery_target_time` | oplog replay to a timestamp — `secantusd-mdb restore --to-timestamp` (see [Recovery](recovery.md)) |
 | Native TLS | `ssl=on` | server-side TLS via `[tls] cert_file` / `key_file` |
 | Auth methods | md5 / scram / cert / peer / ldap / gss / pam | SCRAM-SHA-256 / SCRAM-SHA-1 / MONGODB-X509 (mTLS), with enforced RBAC |
 | Constraints / triggers / FKs / views | rich | schema validators (`$jsonSchema`), views (`viewOn` + pipeline); FKs/triggers via the [SQL frontend](sql.md), not the document store |
@@ -42,8 +41,9 @@ doesn't pretend to compete in that space.
 | Profiling | `log_min_duration_statement` + `pg_stat_*` | `profile` command + admin UI |
 | Maturity | production-hardened | beta (b20 at time of writing) |
 
-The headline gaps you must accept up front are **no PITR** (your RPO
-is "however often your snapshot cron fires"), **no replication /
+The headline gaps you must accept up front are **offline-only PITR**
+(a restore is a stopped-server operation, and without oplog archiving
+your RPO is "however often your snapshot cron fires"), **no replication /
 failover** (a process crash without a hot standby is downtime), and
 **beta maturity** (the project has not yet been through a public
 production incident — the existence of unknown sharp edges has not
@@ -65,7 +65,7 @@ and lets the daemon bind on the public interface (TLS terminates
 in-process — see [TLS](#tls) below):
 
 ```ini
-# /etc/systemd/system/secantusd-py.service
+# /etc/systemd/system/secantusd-mdb.service
 [Unit]
 Description=SecantusDB
 After=network.target
@@ -74,7 +74,7 @@ After=network.target
 Type=simple
 User=secantus
 Group=secantus
-ExecStart=/usr/local/bin/secantusd-py
+ExecStart=/usr/local/bin/secantusd-mdb
 Restart=on-failure
 RestartSec=2
 LimitNOFILE=65535
@@ -148,7 +148,7 @@ enforced, or you'll lock yourself out. The bootstrap sequence:
 
 ```bash
 # 1. Start once without auth.
-secantusd-py --storage-path /var/lib/secantus/data --no-auth
+secantusd-mdb --storage-path /var/lib/secantus/data   # auth is off unless --auth
 
 # 2. Create an admin in a separate shell.
 mongosh mongodb://127.0.0.1:27017/ --eval '
@@ -160,7 +160,7 @@ mongosh mongodb://127.0.0.1:27017/ --eval '
 '
 
 # 3. Stop the daemon, then start it via systemd with auth on.
-sudo systemctl start secantusd-py
+sudo systemctl start secantusd-mdb
 ```
 
 From there, application users get provisioned over the wire with
@@ -190,14 +190,13 @@ mongodb://admin:<pwd>@db.example.com:27017/?tls=true
 Add `&tlsCAFile=/path/to/ca.pem` if the cert is signed by a CA the
 client doesn't already trust. Use Let's Encrypt for a public host
 or your internal CA for an intranet deployment; the daemon doesn't
-care which issued the cert — Python's `ssl` module loads any
-PEM-format chain.
+care which issued the cert — it reads any PEM-format chain.
 
-Cert rotation is hot-swap-friendly *only* across a restart — the
-SSLContext is built once at startup and cached for the lifetime
-of the daemon. Bake `certbot renew --post-hook 'systemctl reload
-secantusd-py'` (a full restart, despite the name) into your renewal
-cron so renewed certs take effect.
+The daemon reads the certificate and key at startup and has no reload
+signal for them, so cert rotation takes a restart. Bake `certbot renew
+--post-hook 'systemctl restart secantusd-mdb'` into your renewal cron so
+renewed certs take effect. (`secantusd-pg` is different: it reads its TLS
+files again on SIGHUP.)
 
 For deployments that want stronger client-identity guarantees, add
 `[tls] ca_file` + `[tls] require_client_cert = true` for mTLS — the
@@ -245,13 +244,13 @@ For the native path, a simple hourly cron + off-host sync:
 **Restore lives in the offline CLI**:
 
 ```bash
-secantus-restore-archive \
-    --archive /srv/secantus-backups/archive-2026-05-18T03.tar.gz \
+secantusd-mdb restore \
+    --source /srv/secantus-backups/archive-2026-05-18T03.tar.gz \
     --target-dir /var/lib/secantus/data-restored
-sudo systemctl stop secantusd-py
+sudo systemctl stop secantusd-mdb
 sudo mv /var/lib/secantus/data /var/lib/secantus/data-old
 sudo mv /var/lib/secantus/data-restored /var/lib/secantus/data
-sudo systemctl start secantusd-py
+sudo systemctl start secantusd-mdb
 ```
 
 This is also reachable from the admin UI's `/backup` page (per-row
@@ -315,7 +314,7 @@ significantly higher than 1000.
 
 ### Disaster recovery
 
-With no replication and no PITR, your DR story is "restore the most
+With no replication, and PITR only as an offline restore, your DR story is "restore the most
 recent off-host snapshot." That means:
 
 * **RPO**: the gap between backups. With hourly snapshots you can
@@ -347,9 +346,8 @@ proxy, and a quarterly restore drill.
 
 The features that make SecantusDB worth choosing — embeddability,
 WiredTiger-class storage, the same wire protocol your apps already
-speak to mongod — are the same ones it shares with the project's
-test-surrogate origin. The features that make production *scary* —
-replication, PITR, mature TLS / auth integrations, decades of
+speak to mongod. The features that make production *scary* —
+replication, online PITR, mature TLS / auth integrations, decades of
 incident-tested edge-case handling — are the ones it doesn't have
 yet. Treat the comparison table above as the truth-in-advertising
 disclosure, and make the call from there.

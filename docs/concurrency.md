@@ -243,7 +243,7 @@ concurrency.
 ### What this means for your workload
 
 - **One connection doing batched writes** is a simple, fast
-  configuration for tests / dev / single-process applications.
+  configuration for dev / single-process applications.
   `pymongo`'s `insert_many` with batch=100 hits ~25,000 docs/s on the
   Rust server and ~11,000 on the Python server on commodity hardware
   with full durability.

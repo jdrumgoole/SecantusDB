@@ -1,51 +1,43 @@
 # Architecture
 
 The Rust server is a Cargo workspace under `crates/`, split so the pure
-engines never depend on Python **or** WiredTiger:
+engines never depend on WiredTiger. The full layer map, for both servers, is
+in the main tree's [Architecture](https://secantusdb.com/docs/architecture.html)
+page; the crates the MongoDB server is built from:
 
 | Crate | What it is |
 | --- | --- |
-| `secantus-core` | The pure-Rust operator engines: query matcher, update engine, aggregation pipeline + expression evaluator, projection, sort keys, geo, collation. No PyO3, no WiredTiger — pure functions over BSON. |
+| `secantus-core` | The pure-Rust operator engines: query matcher, update engine, aggregation pipeline + expression evaluator, projection, sort keys, geo, collation. No WiredTiger — pure functions over BSON. |
 | `secantus-storage` | The full WiredTiger-backed `Storage`: document/index/oplog tables, change-stream projection, transactions, backup/PITR archive + replay. |
 | `secantus-wt` | The WiredTiger FFI bindings (bindgen over the vendored C library). |
 | `secantus-server` | The server proper: wire protocol (`OP_MSG` / legacy handshake), command dispatch, cursors, auth (`secantus-auth`), TLS accept loop (rustls), CLI argument/config parsing. |
 | `secantus-auth` | SCRAM-SHA-1/256 mechanics, X509 DN matching, RBAC role resolution. |
 | `secantusdb` | The standalone binary crate — `secantusd-mdb`. Its own workspace (it links WiredTiger); builds the vendored WT and statically links it. |
-| `secantus-core-py`, `secantus-server-py`, `secantus-storage-py` | Thin PyO3 binding crates: `_secantus_core` (the parity-test vehicle), `_secantus_server` (the embedded `RustServer` handle), `_secantus_storage`. Python is only ever a launcher — never in the request path. |
+| `secantus-core-py`, `secantus-server-py`, `secantus-storage-py` | Thin PyO3 binding crates (`_secantus_core`, `_secantus_server`, `_secantus_storage`) used by the repository's own tests in a source build. They are not shipped by `pip install SecantusDB`, and Python is never in the request path. |
 
 The WiredTiger-linked crates are excluded from the clean workspace so
 `cargo fmt` / `clippy` / `test` run fast and toolchain-light; the WT crates
-build inside the wheel (CMake + scikit-build-core) or the standalone binary
-build.
+are built from their own directories (CMake builds the vendored WiredTiger).
 
-## Parity with the Python server
+## Engines and `mongod`
 
-Every Rust operator engine is pinned byte-for-byte to its pure-Python
-counterpart by parity test suites (curated corpora plus randomized fuzz).
-Where an exact reproduction isn't achievable — Python-`re` regex semantics,
-some Decimal128 edges — the Rust engine **defers**: it
-rejects the construct with a clean error rather than return a subtly
-different answer. That discipline is why the conformance numbers of the two
-servers track each other so closely.
-
-Collation is the exception. The Rust server compares strings through ICU4X,
-the Rust implementation of the algorithm and locale data `mongod` gets from
-ICU, and is checked against `mongod` directly; the Python server has its own
-approximation. The parity suites leave collated cases out.
+Collation compares strings through ICU (`secantus-icu`, the ICU `mongod`
+links), and the engines are checked against `mongod` directly. Where an exact
+reproduction is not achievable, an engine **defers**: it rejects the construct
+with a clean error rather than return a subtly different answer.
 
 ## Storage
 
-Same model as the Python server, same on-disk schema: documents stored as
-opaque BSON blobs keyed by byte-sortable `_id` encodings, secondary indexes
-over typed sort-key columns, a natural-order (insertion) index, and the
-oplog/pre-image tables that back change streams and point-in-time recovery.
-A data directory written by one server opens in the other.
+Documents are stored as opaque BSON blobs keyed by byte-sortable `_id`
+encodings, with secondary indexes over typed sort-key columns, a natural-order
+(insertion) index, and the oplog/pre-image tables that back change streams and
+point-in-time recovery.
 
 ## Versioning
 
 All crates carry one lockstep version (`0.MAJOR.PATCH-beta.N`, SemVer
-pre-release) that advances independently of the PyPI package's version.
+pre-release) that advances independently of the PostgreSQL server's.
 The canonical embedded value is `secantus_server::VERSION`, surfaced as
-`buildInfo.secantusVersion` over the wire, `secantusd-mdb --version` on the
-CLI, and `RustServer.version` on the embedded handle. See
+`buildInfo.secantusVersion` over the wire, and `secantusd-mdb --version` on the
+CLI. See
 [Releases](releases.md).

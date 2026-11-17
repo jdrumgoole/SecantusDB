@@ -1,195 +1,80 @@
 # Architecture
 
-SecantusDB is layered roughly outermost-in: a TCP accept loop on top of a
-wire-protocol codec, on top of a command dispatch table, on top of pure
-operator engines (query / update / projection / aggregation / expressions),
-on top of a WiredTiger-backed storage layer.
+SecantusDB is two servers, `secantusd-mdb` (MongoDB wire protocol) and
+`secantusd-pg` (PostgreSQL wire protocol), built from one Cargo workspace
+under `crates/`. Each is layered outermost-in: a TCP accept loop (with TLS) on
+a wire-protocol codec, on a command layer, on pure operator engines, on a
+WiredTiger-backed storage layer. The wire layer never knows about commands,
+the command layer never knows about SQL, and the pure engines take documents
+in and out with no I/O.
 
-## Layers
+## The MongoDB server
 
-### `src/secantus/server.py` — `SecantusDBServer`
+| Crate | Layer |
+| --- | --- |
+| `secantus-wire` | MongoDB wire framing: message header, `OP_MSG` (2013) and legacy `OP_QUERY` / `OP_REPLY` for the handshake. |
+| `secantus-server` | The TCP accept loop and connection handling over `secantus-wire` and `secantus-commands`, with TLS. |
+| `secantus-commands` | Command dispatch: the dispatch table, the error contract (`{ok: 0, errmsg, code, codeName}`, `CommandNotFound` for an unknown command), cursors, and the command handlers, including the planner and `explain`. |
+| `secantus-auth` | SCRAM-SHA-256 (and SCRAM-SHA-1) mechanics, X509 name matching and role resolution. |
+| `secantus-core` | The pure operator engines: query matcher, update operators, projection, the aggregation pipeline and expression evaluator, sort keys, geo and collation. No I/O, no WiredTiger. |
+| `secantus-icu` | The ICU collator `mongod` links, so collation compares as `mongod` does. |
+| `secantus-storage` / `secantus-storage-adapter` | The WiredTiger-backed `Storage` (collections, documents, indexes, oplog and pre-image tables, transactions, backup and point-in-time recovery) and its adapter to the command layer. |
+| `secantus-wt` / `secantus-wiredtiger-sys` | Safe Rust bindings over the vendored WiredTiger C library, and the build of WiredTiger itself (static, from `vendor/wiredtiger`). |
+| `secantusdb` | The `secantusd-mdb` binary and the `secantus-mdb` library (`secantus_mdb::Server`). |
 
-TCP accept loop on a daemon thread, one daemon thread per connection.
-Owns the `Storage` and the `CursorRegistry`. Per-request, builds a fresh
-`CommandContext(storage, cursors, db_name)` and calls into the command
-dispatcher.
+`secantus-wire`, `secantus-commands`, `secantus-server`, `secantus-auth` and
+`secantus-core` do not link WiredTiger, so they build and test on their own;
+the crates that do link it are built from their own directories.
 
-`port=0` lets the OS pick a free port — read it back from `server.port`
-or `server.uri` after `start()`.
+## The PostgreSQL server
 
-### `src/secantus/wire.py`
+| Crate | Layer |
+| --- | --- |
+| `secantus-pgwire` | SecantusDB's fork of `pgwire`: the PostgreSQL v3 wire protocol as a library. |
+| `secantus-pg-query` | SecantusDB's fork of `pg_query`: PostgreSQL's own parser (libpg_query). |
+| `secantus-pgplan` | Lowers PostgreSQL parse trees to the MQL filters `secantus-core` evaluates. |
+| `secantus-pgcatalog` | The SQL catalog documents (`pg_catalog` and friends). |
+| `secantus-pg` | The server: executor, catalogs, roles and authentication, TLS, and the `secantusd-pg` binary and `secantus_pg::PgServer` library. |
 
-The MongoDB wire codec:
+Because SQL is lowered onto the same engines and the same storage layer, the
+PostgreSQL server inherits their index acceleration and type handling.
 
-- 16-byte header (little-endian).
-- `OP_MSG` (op-code 2013) parse / build — the modern op-code that
-  `pymongo` 4.x uses for everything after the handshake.
-- Legacy `OP_QUERY` (2004) parse + `OP_REPLY` (1) build for the initial
-  handshake `pymongo` does on connect.
+## Storage
 
-`OP_MSG` kind-1 document sequences are merged into the body before
-dispatch, so command handlers see a single flat document.
+Both servers share one storage format on WiredTiger, the same engine `mongod`
+ships:
 
-### `src/secantus/commands.py`
+- **Documents are opaque BSON blobs**, keyed by a byte-sortable encoding of
+  `_id` (so walking the table gives MongoDB's natural cross-type order).
+  Filtering, projection, sorting and updates happen in the engines after
+  decoding; the storage layer never inspects a document. Any lossy
+  intermediate form (JSON, native column types) would show a client the
+  difference for `ObjectId`, `Decimal128`, int32 versus int64, dates,
+  `Binary` and regexes.
+- **Secondary indexes are WiredTiger indexes over typed sort-key columns**
+  derived from BSON values, not JSON and not coerced numerics. The byte order
+  of the keys matches BSON's cross-type sort order, so numbers of different
+  types that compare equal collide and order correctly.
+- **The oplog and pre-image tables** back change streams and point-in-time
+  recovery.
 
-Single dispatch table keyed on the first key of the request document.
-Handles handshake (`hello` / `isMaster` / `ping` / `buildInfo` / ...) and
-CRUD (`insert` / `find` / `update` / `delete` / `count` / `drop` /
-`aggregate` / `findAndModify` / `listCollections` / ...).
+A data directory written by `secantusd-pg` opens in `secantusd-mdb` (a table
+reads back as a collection, with the `PRIMARY KEY` as `_id`), but not at the
+same time: WiredTiger's exclusive file lock makes the second server exit. The
+reverse direction does not work, because `secantusd-pg` resolves names through
+a catalog that only `CREATE TABLE` writes.
 
-Errors raised by handlers are caught and turned into
-`{ok: 0, errmsg, code, codeName}`. Unknown commands return
-`code: 59 CommandNotFound` so the connection survives.
+## Concurrency
 
-### `src/secantus/query.py` — `matches(doc, filter, vars=None)`
+Each accepted connection is served on its own thread over WiredTiger
+sessions, so reads proceed in parallel and write throughput is
+bounded by WiredTiger's own write path and the durability setting
+(`--sync-on-commit`, the logged or non-logged data tables). See
+[Concurrency](concurrency.md) for what scales and what does not, and
+[Benchmark](benchmark.md) for measured numbers against `mongod`.
 
-Pure document-vs-filter predicate. Field-level operators: `$eq`, `$ne`,
-`$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$not`,
-`$regex` + `$options`, `$type`, `$size`, `$all`, `$mod`, `$elemMatch`.
-Document-level operators: `$and`, `$or`, `$nor`, `$expr`, `$jsonSchema`,
-`$comment` (no-op). Dotted paths walk into both maps and arrays.
+Tests of the servers run against real on-disk WiredTiger, never a mock.
 
-### `src/secantus/projection.py` — `apply_projection(doc, spec)`
-
-`find()`'s projection argument: inclusion / exclusion modes, `_id`
-defaults, dotted paths, plus the `$elemMatch` projection operator that
-returns the first array element matching a sub-filter.
-
-### `src/secantus/update.py` — `apply_update(doc, update)`
-
-Operators: `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$push`,
-`$pull`, `$addToSet`, `$pop`, `$rename`. Replacement-style updates
-preserve `_id`. Mixing operators with replacement fields is rejected.
-
-### `src/secantus/expressions.py` — `evaluate(expr, doc, vars=None)`
-
-The aggregation expression language: field paths (`"$x.y"`), `$$varname`
-user vars + `$$ROOT` / `$$CURRENT`, `$literal`, arithmetic, comparison,
-logical, `$cond` / `$ifNull`, `$size`, dates (with timezone support),
-strings, arrays, conversions, `$mergeObjects`, ... see
-[Aggregation](aggregation.md) for the full operator list.
-
-### `src/secantus/aggregate.py` — `apply_pipeline(docs, pipeline, ctx)`
-
-Pipeline stages — `$match`, `$count`, `$limit`, `$skip`, `$sort`,
-`$project`, `$addFields` / `$set`, `$unset`, `$unwind`, `$densify`,
-`$replaceRoot` / `$replaceWith`, `$group`, `$lookup` (hash-join),
-`$sample`, `$sortByCount`, `$facet`, `$bucket`, `$merge`, `$out`. See
-[Aggregation](aggregation.md) for details.
-
-### `src/secantus/cursors.py` — `CursorRegistry`
-
-Per-server, thread-safe map of int64 cursor id → remaining docs. Used
-by `find` and `aggregate` to support pagination via `getMore` /
-`killCursors`. Cursors carry a `last_access` timestamp; entries idle
-longer than `idle_ttl_seconds` (default 600s, matching MongoDB's
-10-minute cursor TTL) are pruned opportunistically. The clock is
-injectable for deterministic testing.
-
-### `src/secantus/sortkey.py`
-
-Pure `encode_value(v)` and `encode_compound([v1, v2, ...])` that produce
-**byte-sortable** bytes whose lexicographic order matches MongoDB's BSON
-cross-type sort order.
-
-Layout: `<rank_byte><payload>`. Numbers go through a "lexical decimal"
-form (sign byte + bias-shifted exponent + paired BCD digits + terminator)
-so int / long / double / Decimal128 collide on equal value and order
-correctly across the unified numeric type. NaN / ±Infinity get dedicated
-bracketing markers.
-
-`encode_value_directed(v, direction)` bitwise-inverts the bytes when
-`direction == -1` so the same encoder drives descending indexes.
-
-### `src/secantus/storage.py` — `Storage`
-
-Backed by **the same WiredTiger C library mongod ships** — vendored at
-`vendor/wiredtiger/` (mongodb-7.0.33), built from source as part of the
-wheel via scikit-build-core, and called via WT's official Python SWIG
-bindings. There is no Python re-implementation of the storage engine:
-B-tree pages, page eviction, checkpoint cadence, write-ahead logging,
-durability, and the on-disk format are all pure WiredTiger. That's the
-durability story — your data lives on the same battle-tested engine
-mongod uses.
-
-The four tables we keep in one WT connection:
-
-| Table | Key format | Value | Purpose |
-| --- | --- | --- | --- |
-| `secantus_collections` | `SS` | BSON options blob | `(db, coll)` registry |
-| `secantus_documents` | `SSu` | `bson.encode(doc)` | document store, keyed by `(db, coll, id_key)` |
-| `secantus_indexes` | `SSS` | BSON `{key, options}` | index registry |
-| `secantus_index_entries` | `SSSu` | `b""` | sortable index entries `(db, coll, name, packed)` |
-
-`id_key` is `sortkey.encode_value(_id)`: byte-sortable across BSON types,
-so iterating the doc table gives MongoDB's natural cross-type sort order.
-`update_matching(multi=False)` and `find()` without `sort` walk in this
-order, matching `mongod`.
-
-For index entries, `packed = escape(sortkey) + b"\x00\x00" + id_key` —
-the trailing `u` column packs both into one cell on purpose (WT
-length-prefixes non-trailing `u` columns, which would break lex order).
-
-WT sessions are thread-affine, kept in `threading.local()`; cursors per
-session per table are cached and `reset()` between calls. A global
-`RLock` serializes all public methods so we never have to think about
-WT's MVCC at the storage layer.
-
-`:memory:` is mapped to a `tempfile.mkdtemp()` opened with
-`in_memory=true` and `rmtree`-cleaned on `close()`.
-
-## Concurrency model
-
-- **Server:** one daemon thread per accepted connection.
-- **Storage:** all public methods acquire a global `RLock`; thread-safe
-  by serialization, not by fine-grained locking. Fine for single-node
-  workloads — write throughput is bounded by one writer at a time.
-- **Cursors:** internal `Lock`, separate from storage.
-- **Tests:** must run with `port=0` and a unique `storage_path` per
-  test (we use pytest's `tmp_path` fixture). Real on-disk WiredTiger
-  storage exercises the full schema; `:memory:` is reserved for the
-  perf-regression suite where in-memory baselines control variance.
-  Multiple `SecantusDBServer` instances coexist freely.
-
-## Type-mapping strategy
-
-Documents are stored as **opaque BSON blobs**. All filtering, projection,
-sorting, and updates happen in Python after `bson.decode`. The storage
-layer never inspects document content. This is deliberate: a `pymongo`
-client cannot tell SecantusDB apart from `mongod` for the operations it
-supports, and any lossy intermediate representation (JSON, native column
-types, etc.) would break that for `ObjectId` / `Decimal128` /
-`int32`-vs-`int64` / `Date`-with-tz / `Binary` / `Regex`.
-
-Secondary indexes are typed **sort-key columns** derived from BSON
-values via `sortkey.encode_value` — not JSON, not coerced numerics.
-
-## Performance
-
-Storage is fast (it's WiredTiger). The layers above storage are pure
-Python. That trade-off shapes the performance profile.
-
-A like-for-like benchmark — both servers running the same WT engine
-on the same machine, driven by the same `pymongo` client over a TCP
-socket — currently shows SecantusDB **8×–46× slower than mongod** per
-operation. CRUD reads (`find` with an indexed equality / range) sit
-near the lower end of that range; aggregation and bulk write
-operations (`update_many`, `delete_many`) sit at the upper end where
-Python-loop overhead dominates over the WT page reads / writes.
-
-See [`docs/benchmark.md`](benchmark.md) for the current numbers and
-the methodology to reproduce.
-
-What this means for use:
-
-- **Tests and dev**: SecantusDB is the right choice. Per-op latency
-  is in the hundreds of milliseconds for thousands of docs, which is
-  fine when the alternative is a `mongod` install in your CI image.
-- **Embedded single-node apps with modest throughput**: also a good
-  fit. WT durability + on-disk format mean your data survives restart
-  exactly the way it would under mongod.
-- **High-throughput production replacement for mongod**: not yet, and
-  honestly not the design goal. Hot-path Cython / native-code work in
-  the command dispatcher and query planner is the obvious lever if
-  the project ever decides to chase parity, but the current focus is
-  conformance, not throughput.
+The deprecated Python server had a different structure (a thread per
+connection, a global storage lock); its layer map is kept, as a record, on
+[Deprecated: Python servers](python-servers.md).

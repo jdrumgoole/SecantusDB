@@ -205,32 +205,24 @@ index acceleration as `find`.
 
 ## TTL indexes
 
-`expireAfterSeconds` is honoured by `Storage.prune_ttl(db, coll, *, now=None)`
-which walks the collection, deletes docs whose indexed `datetime` field is
-older than `now - expireAfterSeconds`, and removes their index entries.
-
-The clock is injectable so tests can drive expiry deterministically. There
-is **no background sweeper** — real MongoDB prunes every 60s; SecantusDB
-requires the caller to invoke `prune_ttl` explicitly. This is the right
-ergonomics for a test harness: the test that wants TTL behaviour fires the
-prune itself.
+`expireAfterSeconds` is honoured as on `mongod`: a background TTL monitor
+walks TTL-indexed collections, deletes documents whose indexed date field is
+older than `now - expireAfterSeconds`, and removes their index entries. Like
+`mongod`'s it runs every 60 seconds by default, `setParameter
+ttlMonitorSleepSecs` changes the interval without a restart, and
+`ttlMonitorEnabled` switches it off or on. `serverStatus().metrics.ttl.passes`
+counts completed passes, so a program that needs to see an expiry can wait for
+it to move instead of sleeping.
 
 ```python
-from secantus import SecantusDBServer
 import datetime as dt
+from pymongo import MongoClient
 
-with SecantusDBServer(port=0, storage_path=":memory:") as server:
-    client = MongoClient(server.uri)
-    coll = client["db"]["events"]
-    coll.create_index("createdAt", expireAfterSeconds=60)
-    coll.insert_one({"createdAt": dt.datetime(2026, 1, 1, tzinfo=dt.UTC)})
-
-    # Force expiry from the test:
-    pruned = server.storage.prune_ttl(
-        "db", "events",
-        now=dt.datetime(2026, 1, 1, 0, 5, tzinfo=dt.UTC),
-    )
-    assert pruned == 1
+client = MongoClient("mongodb://127.0.0.1:27017")
+coll = client["db"]["events"]
+coll.create_index("createdAt", expireAfterSeconds=60)
+coll.insert_one({"createdAt": dt.datetime.now(dt.UTC)})
+# About a minute later (the monitor's next pass), the document is gone.
 ```
 
 Docs without the TTL field, with non-date values, or with values inside the
@@ -391,7 +383,7 @@ collation collide on the second insert).
 Sort acceleration honours the same gate. A sort on a string field
 whose only matching index has a stored `collation` walks the index
 in order when the query carries a matching `collation`, and falls
-back to a Python sort otherwise (the index's byte order is
+back to an in-memory sort otherwise (the index's byte order is
 collation-normalised, so walking it for a codepoint-sort query
 would give the wrong order). Both single-field sorts and
 multi-field sorts that exactly match (or fully invert) a compound
@@ -406,15 +398,15 @@ list(coll.find().sort("name", 1).collation({"locale": "en", "strength": 2}))
 # Walks the same index backward — direction=backward.
 list(coll.find().sort("name", -1).collation({"locale": "en", "strength": 2}))
 
-# Sort without a matching collation falls back to Python sort.
+# Sort without a matching collation falls back to an in-memory sort.
 list(coll.find().sort("name", 1))   # COLLSCAN
 ```
 
 ## What's still missing
 
 - **TTL background sweeper** — `prune_ttl` is opt-in; no 60-second
-  cadence sweeper. Real mongod runs one; for an in-process test
-  surrogate the explicit-call ergonomics suit the audience better.
+  cadence sweeper. Real mongod runs one; for an in-process
+  server the explicit-call ergonomics suit the audience better.
 - **Text / hashed indexes** — out of scope (no full-text engine; no
   practical workload pulling hashed shard-key behaviour into an
-  in-process surrogate).
+  in-process server).

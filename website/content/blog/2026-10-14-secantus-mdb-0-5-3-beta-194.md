@@ -7,7 +7,7 @@ Tags: release
 
 Summary: secantus-mdb 0.5.3-beta.194 replaces its own permission check under --auth with mongod's: a privilege on a collection covers that collection, and every command needs the privileges mongod asks for.
 
-Upgrade if you run `secantusd-rs` with `--auth`, and your tests check that
+Upgrade if you run `secantusd-rs` with `--auth`, and check that
 a user is refused something.
 
 Before this release the server decided what an authenticated user could
@@ -69,7 +69,7 @@ Each user logged in.
 We ran the pymongo, Go and Node driver suites against this code. Each
 gave the same result as the release before.
 
-This is a server for tests. It is single-node and it is a beta.
+This is a real single-node database, and it is a beta.
 
 `cargo install secantus-mdb --version 0.5.3-beta.194` builds it from crates.io.
 Binaries for Linux x86_64, macOS arm64 and Windows x86_64 are on the release.

@@ -189,9 +189,9 @@ this harness is still inside the noise on most rows. The change-stream row's
 `mongod` figure comes from a separate replica-set run and is not interleaved.
 
 The trade is unchanged: conformance and WiredTiger durability over raw
-per-op latency. For ephemeral test and dev data the wall-clock difference
+per-op latency. For small dev data sets the wall-clock difference
 rarely matters; when it does, that's what the Rust server is for. See
-[The two servers](servers.md) and the
+[The servers](servers.md) and the
 [feature comparison](feature-comparison.md) for what each supports.
 
 ## How to refresh
