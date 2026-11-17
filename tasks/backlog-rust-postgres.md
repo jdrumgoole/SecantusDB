@@ -1757,24 +1757,22 @@ a regression test.
       (found while working RP-919).
       Verify: none -- a performance budget; the two tests named above time it
       Backlog-ID: RP-1020
-- [ ] **EXPLAIN VERBOSE prints no `Output` lists above a scan.** A plan
-      that is one relation's scan prints as VERBOSE does (RP-925); any
-      other node prints as without it: PostgreSQL 15.19 prints `explain
-      verbose select * from k where a > 5 order by b` (`k` 1,000 analysed
-      rows) with `Output: a, b` and `Sort Key: k.b` on the Sort, and the
-      Seq Scan under it as `Seq Scan on public.k` with `Output: a, b` and
-      `Filter: (k.a > 5)`; here the plain plan. A join's nodes each print
-      their `Output` too (`Output: e.a, e.b, e2.a, e2.b` on a Nested Loop,
-      its Materialize's and Memoize's likewise), and an inner index scan's
-      `Index Cond` is qualified (`(k.a > r.a)`). Measured on a private
-      15.19 cluster (found while working RP-916). Where to build it: the
-      lone-scan case is `explain::attach_verbose`, fed by
-      `ruleutils::explain_verbose_scan` through
-      `ExplainOptions.verbose_scan`; every other node needs its targetlist
-      deparsed (`show_plan_tlist`, prefixed when the range table holds more
-      than one relation) and its quals and keys printed with `unqualified
-      = false`.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a sort over a scan]
+- [ ] **EXPLAIN VERBOSE prints no `Output` lists on a join's nodes.** A
+      plan over one relation prints as VERBOSE does: its scan (RP-925) and
+      the Sorts and Limits above it, each with the scan's `Output` and its
+      `Sort Key` qualified (RP-966, in part). A join's nodes do not:
+      PostgreSQL 15.19 prints each with its `Output` (`Output: e.a, e.b,
+      e2.a, e2.b` on a Nested Loop, its Materialize's and Memoize's
+      likewise), and an inner index scan's `Index Cond` qualified (`(k.a >
+      r.a)`); here the plain plan. Nor does a Sort on a computed key
+      (`order by a+1` prints `Output: a, ((a + 1))` and `Sort Key: ((k.a +
+      1))` over a scan whose `Output: a, (a + 1)`): `attach_verbose`
+      declines a key that is not a bare column. Measured on a private 15.19
+      cluster (found while working RP-916). Where to build it: every other
+      node needs its targetlist deparsed (`show_plan_tlist`, prefixed when
+      the range table holds more than one relation) and its quals and keys
+      printed with `unqualified = false`.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join's nodes print their output under verbose]
       Backlog-ID: RP-966
 
 
@@ -2959,3 +2957,17 @@ statement is VALUES-only and runs there as written. The gap test is in
       the 15.19 reference on port 5415.
       Verify: none -- no EXPLAIN this server prints reaches an exact half yet (its HashAggregate over a HAVING prints zeros); `setop_order::tests::having_selectivity_is_postgres` notes the case
       Backlog-ID: RP-1023
+
+## Found while working RP-966 (2026-11-17)
+
+- [ ] **A Limit over a Sort of a filtered scan is not priced.**
+      PostgreSQL 15.19 prints `explain select a from k where a > 5 order by
+      b desc limit 3` (`k` analysed, 1,000 rows) as `Limit
+      (cost=30.36..30.37 rows=3 width=7)` over `Sort (cost=30.36..32.85
+      rows=995 width=7)` (a top-N heapsort, `cost_sort` with its bound)
+      over `Seq Scan on k (cost=0.00..17.50 rows=995 width=7)`; here every
+      node is `cost=0.00..0.00 rows=0 width=0`, with or without VERBOSE,
+      and with `select *` too. The same Sort without the LIMIT is priced.
+      Measured on the 15.19 reference on port 5415.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a limit over a descending sort]
+      Backlog-ID: RP-1025

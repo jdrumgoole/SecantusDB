@@ -3210,10 +3210,49 @@ pub(crate) fn attach_verbose(
     let Some(v) = scan else {
         return;
     };
-    if !is_scan_name(&root.name) || !root.children.is_empty() {
+    // The Sorts and Limits above the scan print its targetlist too, with
+    // each ORDER BY column the select list lacks (a resjunk entry), and
+    // their keys qualified (`show_plan_tlist`, `show_sort_keys` under
+    // VERBOSE; RP-966).
+    let plain = format!(" on {}", v.plain);
+    fn upper(n: &PlanNode) -> bool {
+        matches!(n.name.as_str(), "Sort" | "Limit") && n.children.len() == 1
+    }
+    let mut keys: Vec<String> = Vec::new();
+    let mut n: &PlanNode = root;
+    while upper(n) {
+        if let Some((_, text)) = n.details.iter().find(|(k, _)| k == "Sort Key") {
+            for key in text.split(", ") {
+                let col = key.split_once(' ').map_or(key, |(c, _)| c);
+                if !v.columns.iter().any(|c| c == col) {
+                    return;
+                }
+                keys.push(col.to_string());
+            }
+        }
+        n = &n.children[0];
+    }
+    if !is_scan_name(&n.name) || !n.children.is_empty() || !n.name.ends_with(&plain) {
         return;
     }
-    let plain = format!(" on {}", v.plain);
+    let mut output = v.output.clone();
+    for col in keys {
+        if !output.contains(&col) {
+            output.push(col);
+        }
+    }
+    let mut root = root;
+    while upper(root) {
+        if let Some(d) = root.details.iter_mut().find(|(k, _)| k == "Sort Key") {
+            d.1 =
+                d.1.split(", ")
+                    .map(|key| format!("{}.{key}", v.refname))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+        }
+        root.details.insert(0, ("Output".into(), output.join(", ")));
+        root = &mut root.children[0];
+    }
     let Some(head) = root.name.strip_suffix(&plain) else {
         return;
     };
@@ -3230,8 +3269,7 @@ pub(crate) fn attach_verbose(
             }
         }
     }
-    root.details
-        .insert(0, ("Output".into(), v.output.join(", ")));
+    root.details.insert(0, ("Output".into(), output.join(", ")));
 }
 
 /// A single-relation plan's scan names the relation's alias after it, as

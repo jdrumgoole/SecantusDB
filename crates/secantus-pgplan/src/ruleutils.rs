@@ -6390,6 +6390,11 @@ pub struct VerboseScan {
     /// Each WHERE conjunct: its text as the plain plan prints it, and
     /// qualified.
     pub quals: Vec<(String, String)>,
+    /// The name a qualified column is prefixed with: the alias, else the
+    /// relation (RP-966).
+    pub refname: String,
+    /// The relation's columns, as printed.
+    pub columns: Vec<String>,
 }
 
 /// [`VerboseScan`] for a SELECT over one relation; `None` for any other
@@ -6466,6 +6471,8 @@ pub fn explain_verbose_scan(
         plain: format!("{}{suffix}", q(&bare)),
         output,
         quals,
+        refname: q(&refname),
+        columns: def.columns.iter().map(|c| q(&c.name)).collect(),
     })
 }
 

@@ -1649,7 +1649,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "explain verbose of a sort over a scan": (
-        "RP-966",
+        "RP-966:fixed",
         _ANALYSED,
         "explain verbose select * from k where a > 5 order by b",
         [
@@ -1659,6 +1659,56 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on public.k  (cost=0.00..17.50 rows=995 width=7)",
             "        Output: a, b",
             "        Filter: (k.a > 5)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (RP-966): every node of a join prints
+    # its targetlist, qualified, and the join its `Inner Unique`.
+    "a join's nodes print their output under verbose": (
+        "RP-966",
+        _ANALYSED,
+        "explain verbose select * from e join k on e.a = k.a",
+        [
+            "Hash Join  (cost=27.50..45.14 rows=1000 width=14)",
+            "  Output: e.a, e.b, k.a, k.b",
+            "  Inner Unique: true",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        Output: k.a, k.b",
+            "        ->  Seq Scan on public.k  (cost=0.00..15.00 rows=1000 width=7)",
+            "              Output: k.a, k.b",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (RP-966): a Limit over the Sort prints
+    # the targetlist too, the ORDER BY column the select list lacks
+    # included, and the key keeps its direction.
+    "explain verbose of a limit over a descending sort": (
+        "RP-1025",
+        _ANALYSED,
+        "explain verbose select a from k where a > 5 order by b desc limit 3",
+        [
+            "Limit  (cost=30.36..30.37 rows=3 width=7)",
+            "  Output: a, b",
+            "  ->  Sort  (cost=30.36..32.85 rows=995 width=7)",
+            "        Output: a, b",
+            "        Sort Key: k.b DESC",
+            "        ->  Seq Scan on public.k  (cost=0.00..17.50 rows=995 width=7)",
+            "              Output: a, b",
+            "              Filter: (k.a > 5)",
+        ],
+    ),
+    "explain verbose of a sort over an aliased scan": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain verbose select * from k x where a > 5 order by x.b",
+        [
+            "Sort  (cost=67.04..69.53 rows=995 width=7)",
+            "  Output: a, b",
+            "  Sort Key: x.b",
+            "  ->  Seq Scan on public.k x  (cost=0.00..17.50 rows=995 width=7)",
+            "        Output: a, b",
+            "        Filter: (x.a > 5)",
         ],
     ),
     # Split from RP-354 and fixed: a `<>` whose operands differ in type
