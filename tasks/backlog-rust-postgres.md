@@ -1742,8 +1742,10 @@ a regression test.
       `ruleutils::explain_verbose_join`, `explain::attach_verbose_join`,
       `explain::attach_verbose_nested_loop`). Every other join does not:
       PostgreSQL 15.19 prints a Merge Join's, its Materialize's and
-      Memoize's `Output` likewise, and a nested loop's `Join Filter`
-      prefixed; here the plain plan. Nor does a WHERE conjunct reading both relations, an ON that is not column
+      Memoize's `Output` likewise; here the plain plan. (Since 2026-11-17
+      a nested loop over a scan and a Materialize of a scan, the ON its
+      `Join Filter`, prints every node's `Output`:
+      `explain::attach_verbose_materialized_loop`.) Nor does a WHERE conjunct reading both relations, an ON that is not column
       comparisons, or three or more
       relations (since 2026-11-17 a Sort on a computed key over one
       relation prints its resjunk entry, `Output: a, ((a + 1))` and `Sort
@@ -1755,7 +1757,10 @@ a regression test.
       than one relation; a node under a Hash, Sort or Material returns only
       the columns needed above, `CP_SMALL_TLIST`), its quals and keys
       printed with `unqualified = false`.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a nested loop with a join filter]
+      An inner index scan's `Filter` reading both relations (`e left join
+      k on e.a < k.a and e.b <> k.b`, `Filter: (e.b <> k.b)`) is still
+      printed plain.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a nested loop whose inner filter reads both relations]
       Backlog-ID: RP-966
 
 
@@ -2852,6 +2857,18 @@ statement is VALUES-only and runs there as written. The gap test is in
       Backlog-ID: RP-1023
 
 ## Found while working RP-966 (2026-11-17)
+
+- [ ] **A nested loop whose inner relation has its own WHERE conjunct is
+      not priced.** `explain select e.b from e join k on e.a <> k.a where
+      k.b = 'v1'` (`e`, `k` 1,000 analysed rows) is, on PostgreSQL 15.19,
+      `Nested Loop (cost=0.00..1532.75 rows=99900 width=3)` over `Seq Scan
+      on e` and a `Materialize (cost=0.00..18.00 rows=100 width=4)` of
+      `Seq Scan on k (cost=0.00..17.50 rows=100 width=4)`; here zeros and
+      no Materialize. With the conjunct on the OUTER table PostgreSQL
+      swaps the sides and this server matches it (found while working
+      RP-966).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop over a filtered inner relation is priced]
+      Backlog-ID: RP-1038
 
 - [ ] **A computed ORDER BY key written through an alias prints its
       synthetic name.** `explain select a from k x order by x.a*2` prints

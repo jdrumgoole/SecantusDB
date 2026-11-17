@@ -1791,7 +1791,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # Measured on PostgreSQL 15.19: a nested loop's Join Filter prefixed,
     # and its Materialize's and the scans' Output.
     "explain verbose of a nested loop with a join filter": (
-        "RP-966",
+        "RP-966:fixed",
         _ANALYSED,
         "explain verbose select * from e join k on e.a <> k.a",
         [
@@ -1804,6 +1804,36 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Output: k.a, k.b",
             "        ->  Seq Scan on public.k  (cost=0.00..15.00 rows=1000 width=7)",
             "              Output: k.a, k.b",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966).
+    "explain verbose of a nested loop whose inner filter reads both relations": (
+        "RP-966",
+        _ANALYSED,
+        "explain verbose select k.b, e.a from e left join k on e.a < k.a and e.b <> k.b",
+        [
+            "Nested Loop Left Join  (cost=0.28..9990.00 rows=300000 width=7)",
+            "  Output: k.b, e.a",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Index Scan using k_pkey on public.k  (cost=0.28..6.98 rows=300 width=7)",
+            "        Output: k.a, k.b",
+            "        Index Cond: (k.a > e.a)",
+            "        Filter: (e.b <> k.b)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966).
+    "a nested loop over a filtered inner relation is priced": (
+        "RP-1038",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a <> k.a where k.b = 'v1'",
+        [
+            "Nested Loop  (cost=0.00..1532.75 rows=99900 width=3)",
+            "  Join Filter: (e.a <> k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..18.00 rows=100 width=4)",
+            "        ->  Seq Scan on k  (cost=0.00..17.50 rows=100 width=4)",
+            "              Filter: (b = 'v1'::text)",
         ],
     ),
     # Measured on PostgreSQL 15.19: the key deparsed, not its slot's name.

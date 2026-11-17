@@ -3443,6 +3443,10 @@ pub(crate) fn attach_verbose_join(
 /// conjunct over one relation prints as its scan's `Filter`, prefixed.
 /// Any other nested loop prints as without VERBOSE.
 fn attach_verbose_nested_loop(root: &mut PlanNode, v: &secantus_pgplan::ruleutils::VerboseJoin) {
+    if root.children.len() == 2 && root.children[1].name == "Materialize" {
+        attach_verbose_materialized_loop(root, v);
+        return;
+    }
     if !root.details.is_empty() || root.children.len() != 2 {
         return;
     }
@@ -3521,6 +3525,64 @@ fn attach_verbose_nested_loop(root: &mut PlanNode, v: &secantus_pgplan::ruleutil
         node.details
             .insert(0, ("Output".into(), r.columns.join(", ")));
     }
+    root.details
+        .insert(0, ("Output".into(), v.output.join(", ")));
+}
+
+/// `EXPLAIN VERBOSE` of a two-relation nested loop whose inner side is a
+/// Materialize over a scan, the ON evaluated as its `Join Filter`
+/// (RP-966): the outer scan returns its physical target list, the
+/// Materialize and the scan under it only the columns the join needs
+/// (`CP_SMALL_TLIST`), as PostgreSQL 15.19 prints them. The `Join
+/// Filter` is already prefixed: two relations are in the range table.
+fn attach_verbose_materialized_loop(
+    root: &mut PlanNode,
+    v: &secantus_pgplan::ruleutils::VerboseJoin,
+) {
+    if root.details.len() != 1 || root.details[0].0 != "Join Filter" {
+        return;
+    }
+    let [outer, mat] = root.children.as_mut_slice() else {
+        return;
+    };
+    if !mat.details.is_empty() || mat.children.len() != 1 {
+        return;
+    }
+    let rel_of = |n: &PlanNode| -> Option<usize> {
+        if !is_scan_name(&n.name)
+            || !n.children.is_empty()
+            || n.details.iter().any(|(k, _)| k != "Filter")
+        {
+            return None;
+        }
+        v.rels
+            .iter()
+            .position(|r| n.name.ends_with(&format!(" on {}", r.plain)))
+    };
+    let (Some(o), Some(i)) = (rel_of(outer), rel_of(&mat.children[0])) else {
+        return;
+    };
+    let filtered = |n: &PlanNode, r: &secantus_pgplan::ruleutils::VerboseRel| {
+        n.details.iter().any(|(k, _)| k == "Filter") == !r.quals.is_empty()
+    };
+    if o == i || !filtered(outer, &v.rels[o]) || !filtered(&mat.children[0], &v.rels[i]) {
+        return;
+    }
+    let requalify = |n: &mut PlanNode, r: &secantus_pgplan::ruleutils::VerboseRel| {
+        let at = n.name.len() - r.plain.len();
+        n.name = format!("{}{}", &n.name[..at], r.relation);
+    };
+    requalify(outer, &v.rels[o]);
+    prefix_quals(outer, &v.rels[o].quals);
+    outer
+        .details
+        .insert(0, ("Output".into(), v.rels[o].columns.join(", ")));
+    let needed = v.rels[i].needed.join(", ");
+    mat.details.insert(0, ("Output".into(), needed.clone()));
+    let inner = &mut mat.children[0];
+    requalify(inner, &v.rels[i]);
+    prefix_quals(inner, &v.rels[i].quals);
+    inner.details.insert(0, ("Output".into(), needed));
     root.details
         .insert(0, ("Output".into(), v.output.join(", ")));
 }
