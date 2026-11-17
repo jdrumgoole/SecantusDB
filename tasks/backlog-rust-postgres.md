@@ -1805,16 +1805,6 @@ a regression test.
       = false`.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a sort over a scan]
       Backlog-ID: RP-966
-- [ ] **A scan of an aliased relation loses its alias and its quals in
-      EXPLAIN.** PostgreSQL 15.19 prints `explain select * from k x where
-      x.a > 5` (`k` analysed) as `Seq Scan on k x (cost=0.00..17.50
-      rows=995 width=7)` with `Filter: (a > 5)`; here `Seq Scan on k` and
-      no Filter: the quals' printer scopes the table under its own name, so
-      `x.a` does not resolve and `explain_scan_quals` gives up. A VERBOSE
-      plan of it then prints as without VERBOSE too. Measured on a private
-      15.19 cluster (found while working RP-925).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan of an aliased relation]
-      Backlog-ID: RP-967
 
 
 - [ ] **EXPLAIN ANALYZE's scan counters PostgreSQL prints that are still

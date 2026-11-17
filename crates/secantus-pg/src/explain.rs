@@ -3234,6 +3234,44 @@ pub(crate) fn attach_verbose(
         .insert(0, ("Output".into(), v.output.join(", ")));
 }
 
+/// A single-relation plan's scan names the relation's alias after it, as
+/// `ExplainTargetRel` prints `Seq Scan on k x` (RP-967).
+pub(crate) fn attach_scan_alias(root: &mut PlanNode, alias: &Option<String>) {
+    let Some(alias) = alias else {
+        return;
+    };
+    fn scans<'a>(n: &'a mut PlanNode, out: &mut Vec<&'a mut PlanNode>) {
+        if is_scan_name(&n.name) {
+            out.push(n);
+            return;
+        }
+        for c in &mut n.children {
+            scans(c, out);
+        }
+    }
+    let mut found = Vec::new();
+    scans(root, &mut found);
+    let [scan] = found.as_mut_slice() else {
+        return;
+    };
+    let Some(rel) = scan
+        .props
+        .iter()
+        .find(|(k, _)| k == "Relation Name")
+        .map(|(_, v)| v.clone())
+    else {
+        return;
+    };
+    if *alias == rel || scan.props.iter().any(|(k, _)| k == "Alias") {
+        return;
+    }
+    let suffix = format!(" on {rel}");
+    if scan.name.ends_with(&suffix) {
+        scan.name = format!("{} {alias}", scan.name);
+        scan.props.push(("Alias".into(), alias.clone()));
+    }
+}
+
 fn is_scan_name(name: &str) -> bool {
     name.starts_with("Seq Scan on ")
         || name.starts_with("Bitmap Heap Scan on ")
@@ -3349,6 +3387,7 @@ mod heap_fetches_tests {
             analyze: true,
             verbose: false,
             verbose_scan: None,
+            scan_alias: None,
             costs: false,
             timing: false,
             summary: false,
