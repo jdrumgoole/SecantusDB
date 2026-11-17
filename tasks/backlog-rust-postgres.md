@@ -1220,6 +1220,21 @@ one beside it.
       `typnamespace` is `pg_my_temp_schema()`, and that is no longer 0.
       `secantusd-pg` answers 42704 `type "pg_temp.t" does not exist` to
       the cast.
+      Measured 2026-11-17 against 15.19 (while working RP-950's bundle):
+      the composite IS made, but outside the temp namespace -- its
+      `pg_type` row's `typnamespace` is no `pg_temp_N`, the bare
+      `'ct911'::regtype` is 42704 too (15.19 finds it: the temp namespace
+      is searched first for types), and `create temp table t (x ct911)`
+      is 42704. `row(1)::pg_temp.ct911` already works. An enum has the
+      other half of the gap: `create type pg_temp.e as enum ('a')` then
+      `'pg_temp.e'::regtype` prints `pg_temp.e` where 15.19 prints `e`
+      -- it is kept under a schema literally named `pg_temp`, not the
+      session's. Faithful: a type made in `pg_temp` (any kind) lives in
+      the session's `pg_temp_N` (made by it, as a temp relation makes it),
+      is found by `LookupTypeName` through the implicit temp namespace at
+      the head of the path, and is dropped with the session's other temp
+      objects. This is the type side of the namespace RP-882 built for
+      relations, not a one-line fix.
       Verify: tests/backlog/test_rp_qualified_calls.py::test_standalone_temp_composite_is_in_the_temp_schema
       Backlog-ID: RP-971
 
