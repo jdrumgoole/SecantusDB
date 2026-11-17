@@ -807,7 +807,13 @@ one beside it.
     "m1.c desc, m0.b"`: 810 of 810 each, 10 differences before). Declined
     still (the join planned for every row and sorted, as before): a DESC
     NULLS LAST first key with a key after it (`--desc-nulls-last --then
-    "m0.c desc"` 776 of 810, 758 before); a descending first key a LEFT join NULL-extends
+    "m0.c desc"` 776 of 810, 758 before; tried 2026-11-17: searching it
+    under `merge_asc`, the index's backward scan marked `back_keys` for
+    merging, left 28 differences, 6 fewer two-table ones, but not the
+    gap test's inner two-table join, which PostgreSQL plans as a bounded
+    Sort over a Merge Join on the backward index scan and a Sort `b DESC`
+    -- the merge takes the backward scan's DESC direction, not ascending;
+    not diagnosed, so not landed); a descending first key a LEFT join NULL-extends
     or no clause reads (`ORDER_CLASS`), with a key after it; a later key a
     WHERE may fix to a constant; a table with an index of several columns;
     and a two-table join with a subquery side.
