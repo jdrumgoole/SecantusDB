@@ -1877,10 +1877,10 @@ a regression test.
       visibility map's fraction applied), and since 2026-11-17 a range on
       the hashed side's key read through its index (`where k.a < 10`,
       `Hash Join` over an `Index Scan using k_pkey`; that scan is the
-      side's ordered path in `unique_key_other_paths`). Still zeros there:
+      side's ordered path in `unique_key_other_paths`), and since 2026-11-17
       bounds on both sides' keys (`where e.a > 998 and k.a < 2000`, the
-      bound joining the inner's `Index Cond: ((a = e.a) AND (a < 2000))`). Measured on a private
-      15.19 cluster (found while working RP-393 and RP-397).
+      bound joining the inner's `Index Cond: ((a = e.a) AND (a < 2000))`).
+      Measured on a private 15.19 cluster (found while working RP-393 and RP-397).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends]
       Backlog-ID: RP-978
 - [ ] **EXPLAIN prints no estimate for a join over a scan filtered by an

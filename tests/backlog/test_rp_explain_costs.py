@@ -6664,8 +6664,72 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a = e.a)",
         ],
     ),
-    # Still open (RP-978): a hashed side read through its index on a range
-    # of the key.
+    # Bounds on both sides' keys: the inner's bound joins its parameterized
+    # Index Cond (RP-978, fixed).
+    "a bound on the inner key joins the parameterized index cond": (
+        "RP-978:fixed",
+        _ANALYSED,
+        "explain select * from e join k on k.a = e.a where e.a > 998 and k.a < 2000",
+        [
+            "Nested Loop  (cost=0.28..34.11 rows=2 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=2 width=7)",
+            "        Filter: (a > 998)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: ((a = e.a) AND (a < 2000))",
+        ],
+    ),
+    "verbose of a bound on the inner key in the parameterized index cond": (
+        "RP-978:fixed",
+        _ANALYSED,
+        "explain verbose select * from e join k on k.a = e.a where e.a > 998 and k.a < 2000",
+        [
+            "Nested Loop  (cost=0.28..34.11 rows=2 width=14)",
+            "  Output: e.a, e.b, k.a, k.b",
+            "  Inner Unique: true",
+            "  ->  Seq Scan on public.e  (cost=0.00..17.50 rows=2 width=7)",
+            "        Output: e.a, e.b",
+            "        Filter: (e.a > 998)",
+            "  ->  Index Scan using k_pkey on public.k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Output: k.a, k.b",
+            "        Index Cond: ((k.a = e.a) AND (k.a < 2000))",
+        ],
+    ),
+    "a bounded parameterized inner keeps its own filter": (
+        "RP-978:fixed",
+        _ANALYSED,
+        "explain verbose select * from e join k on k.a = e.a"
+        " where e.a > 998 and k.a < 2000 and k.b = 'v9'",
+        [
+            "Nested Loop  (cost=0.28..34.25 rows=1 width=14)",
+            "  Output: e.a, e.b, k.a, k.b",
+            "  Inner Unique: true",
+            "  ->  Seq Scan on public.e  (cost=0.00..17.50 rows=2 width=7)",
+            "        Output: e.a, e.b",
+            "        Filter: (e.a > 998)",
+            "  ->  Index Scan using k_pkey on public.k  (cost=0.28..8.30 rows=1 width=7)",
+            "        Output: k.a, k.b",
+            "        Index Cond: ((k.a = e.a) AND (k.a < 2000))",
+            "        Filter: (k.b = 'v9'::text)",
+        ],
+    ),
+    "verbose of a hashed side read through its key's index": (
+        "RP-978:fixed",
+        _ANALYSED,
+        "explain verbose select * from e join k on k.a = e.a where k.a < 10",
+        [
+            "Hash Join  (cost=8.54..26.18 rows=9 width=14)",
+            "  Output: e.a, e.b, k.a, k.b",
+            "  Inner Unique: true",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Hash  (cost=8.43..8.43 rows=9 width=7)",
+            "        Output: k.a, k.b",
+            "        ->  Index Scan using k_pkey on public.k  (cost=0.28..8.43 rows=9 width=7)",
+            "              Output: k.a, k.b",
+            "              Index Cond: (k.a < 10)",
+        ],
+    ),
     # The hashed side read through its key's index is a path the unique
     # key's merge and nested loops weigh too (RP-978, fixed).
     "a range on the hashed side's key reads it through its index": (

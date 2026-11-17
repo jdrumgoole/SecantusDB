@@ -3262,7 +3262,16 @@ impl PgHandler {
                     break;
                 }
             }
-            found?
+            // No index path won: the sequential scan, where it is the
+            // cheaper path (`set_cheapest`, RP-926) -- a bound on the key
+            // that keeps most rows (RP-978).
+            match found {
+                Some(f) => f,
+                None => match self.user_scan_path_reading(table, filter, read, &[])? {
+                    (scan, None) => (scan, None),
+                    _ => return None,
+                },
+            }
         } else {
             let (scan, None) = self.scan_estimate(table, filter, read)? else {
                 return None;
@@ -3342,7 +3351,7 @@ impl PgHandler {
         let reads_key_index =
             matches!(leading.as_slice(), [ix] if index.as_deref() == Some(ix.name.as_str()));
         let key_index = if key_indexed && (index.is_none() || reads_key_index) {
-            self.key_index_by(table, filter, nd, scan.2, reads_key_index, |ix| {
+            self.key_index_by(table, filter, nd, scan.2, true, |ix| {
                 (
                     ix.field == field,
                     ix.columns[1..].iter().any(|c| c == field),
