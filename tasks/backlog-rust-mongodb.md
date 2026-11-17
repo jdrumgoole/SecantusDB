@@ -773,17 +773,6 @@ These are explicit non-goals. Don't add them without a reason.
       Found while working RM-589, 2026-11-17.
       Verify: tests/backlog/test_rm_view_namespaces.py::test_a_transaction_statement_counts_the_transactions_locks
       Backlog-ID: RM-715
-- [ ] **A nested pipeline's unknown stage is "not supported", and a
-      `$unionWith` `pipeline: 1` runs.** mongod 8.2.11 parses the pipeline
-      of a `$facet`, a `$lookup` and a `$unionWith` with the command's own
-      (`LiteParsedPipeline`): an unknown stage in one is 40324, and a
-      `$unionWith` `pipeline` that is not an array is 14 ("A pipeline must
-      be an array of objects"). This server answers the first with
-      BadValue (2, "not supported by the Rust server") and runs the
-      second, answering ok with the collection twice. Found while working
-      RM-386, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm386.py::test_a_nested_pipeline_is_parsed_with_the_command
-      Backlog-ID: RM-603
 - [ ] **A `$setWindowFields`, `$densify` or `$fill` field of the wrong
       type is "not supported".** mongod 8.2.11 refuses `output: 1`,
       `field: 1` with 14, "BSON field '$densify.field' is the wrong type

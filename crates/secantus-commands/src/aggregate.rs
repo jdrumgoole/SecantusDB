@@ -2169,9 +2169,42 @@ fn lite_parse_pipeline(pipeline: &[Bson], db: &str) -> Result<(), CommandError> 
         if name == "$queryStats" {
             validate_query_stats(d.get(name))?;
         }
-        lookups_lite_parse(std::slice::from_ref(stage), db)?;
+        if name == "$lookup" {
+            lookup_lite_parse(d.get(name), db)?;
+        }
+        if name == "$unionWith" {
+            union_with_lite_parse(d.get(name))?;
+        }
+        // A `$facet`'s, a `$lookup`'s and a `$unionWith`'s pipeline is a
+        // `LiteParsedPipeline` of its own, built as its stage is read: an
+        // unknown stage there is 40324 as the command parses (RM-603).
+        for (_, sub, _) in sub_pipelines(stage) {
+            lite_parse_pipeline(sub, db)?;
+        }
     }
     Ok(())
+}
+
+/// What mongod's `$unionWith` refuses as it first reads its spec: a
+/// `pipeline` that is not an array of documents (14). It used to be read
+/// only where it was an array, and `pipeline: 1` ran the union with no
+/// sub-pipeline (RM-603, measured 8.2.11).
+fn union_with_lite_parse(spec: Option<&Bson>) -> Result<(), CommandError> {
+    let Some(Bson::Document(spec)) = spec else {
+        return Ok(());
+    };
+    match spec.get("pipeline") {
+        None => Ok(()),
+        Some(Bson::Array(stages)) if stages.iter().all(|s| matches!(s, Bson::Document(_))) => {
+            Ok(())
+        }
+        Some(Bson::Array(_)) => Err(CommandError::new(14, "TypeMismatch", PIPELINE_ELEMENT_MSG)),
+        Some(_) => Err(CommandError::new(
+            14,
+            "TypeMismatch",
+            "A pipeline must be an array of objects",
+        )),
+    }
 }
 
 pub(crate) fn validate_stage_names(pipeline: &[Bson], db: &str) -> Result<(), CommandError> {
@@ -6513,6 +6546,35 @@ mod current_op_metadata_tests {
 mod malformed_pipeline_tests {
     use super::*;
     use bson::doc;
+
+    /// A nested pipeline is lite-parsed with the command's own (RM-603,
+    /// measured mongod 8.2.11).
+    #[test]
+    fn nested_pipelines_are_lite_parsed() {
+        let check = |stage: Document| {
+            lite_parse_pipeline(&[Bson::Document(stage)], "db")
+                .err()
+                .map(|e| (e.code, e.errmsg))
+        };
+        let unknown = Some((40324, "Unrecognized pipeline stage name: '$bogus'".into()));
+        assert_eq!(check(doc! {"$facet": {"a": [{"$bogus": 1}]}}), unknown);
+        assert_eq!(
+            check(doc! {"$lookup": {"from": "c", "as": "x", "pipeline": [{"$bogus": 1}]}}),
+            unknown
+        );
+        assert_eq!(
+            check(doc! {"$unionWith": {"coll": "c", "pipeline": [{"$bogus": 1}]}}),
+            unknown
+        );
+        assert_eq!(
+            check(doc! {"$unionWith": {"coll": "c", "pipeline": 1}}),
+            Some((14, "A pipeline must be an array of objects".into()))
+        );
+        assert_eq!(
+            check(doc! {"$unionWith": {"coll": "c", "pipeline": [{"$match": {}}]}}),
+            None
+        );
+    }
 
     /// Values probed against real mongod (6.0.16 and 8.3.4 agree): every
     /// non-document element of `pipeline` is 14 TypeMismatch with one wording.

@@ -125,13 +125,14 @@ def _nested_pipelines(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-603")
+@pytest.mark.backlog_fixed("RM-603")
 def test_a_nested_pipeline_is_parsed_with_the_command(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 parses the pipeline of a `$facet`, a `$lookup` and a
     `$unionWith` as it parses the command's own: an unknown stage there is
     40324, and a `$unionWith` `pipeline` that is not an array is 14. This
-    server answers the first three with BadValue (2, "not supported by the
-    Rust server") and runs the fourth, answering ok."""
+    server answered the first three with BadValue (2, "not supported by the
+    Rust server") and ran the fourth, answering ok, until RM-603 lite-parsed
+    the nested pipelines with the command's own."""
     unknown = ("err", 40324, "Unrecognized pipeline stage name: '$bogus'")
     expected = {
         "facet-unknown-stage": unknown,
