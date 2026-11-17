@@ -2934,10 +2934,11 @@ sorted as `choose_hashed_setop` prices them, each group's row the first
 its first input gave.
 
 - [ ] **An INTERSECT over an input this server does not estimate keeps its
-      left input first.** `select max(x) from t692j group by k intersect
-      select 1.000` is `1.000` on PostgreSQL 15.19: the input's estimated
-      groups outnumber the constant's one, so the constant is the
-      HashSetOp's first input. Here it is `1.0`, the left input's:
+      left input first.** `select a.x from t692j a, t692j b, t692j c where
+      a.k = b.k and b.k = c.k intersect select 1.000` is `1.000` on
+      PostgreSQL 15.19: the input's estimated groups outnumber the
+      constant's one, so the constant is the HashSetOp's first input.
+      Here it is `1.0`, the left input's:
       `setop_input_estimate` estimates a constant, a VALUES list, one user
       table's stored columns through a WHERE the selectivity model covers,
       a nested set operation, and since 2026-11-17 an inner join of two
@@ -2945,16 +2946,14 @@ its first input gave.
       read (`join_input_estimate`: `eqjoinsel` from the default distinct
       counts over tables never analysed, the priced hash join's rows over
       analysed ones, `estimate_num_groups` clamped to the join's rows), or
-      its comma form (`from a, b where a.k = b.k`). It
-      leaves any other input -- a join with a WHERE or of more tables, an aggregate or GROUP BY, a
-      DISTINCT, a computed column, a FROM subquery other than VALUES, a
-      catalog -- in the written order, hashed. Measured on the 15.19
-      reference on port 5415.
-      `select max(x) from t692j group by k intersect select 1.000` and the
-      three-table comma join `select a.x from t692j a, t692j b, t692j c
-      where a.k = b.k and b.k = c.k intersect select 1.000` are both
-      `1.000` there and `1.0` here.
-      Verify: tests/backlog/test_rp_found_rp692.py::test_an_intersect_over_a_grouped_input_puts_the_smaller_input_first
+      its comma form (`from a, b where a.k = b.k`), and since 2026-11-17
+      an aggregate over one user table with no HAVING, grouped by plain
+      columns or not (its groups are its rows). It leaves any other input
+      -- a join with a WHERE or of more tables, a HAVING, a GROUP BY
+      expression, a DISTINCT, a computed column, a FROM subquery other
+      than VALUES, a catalog -- in the written order, hashed. Measured on
+      the 15.19 reference on port 5415.
+      Verify: tests/backlog/test_rp_found_rp692.py::test_an_intersect_over_a_three_table_join_puts_the_smaller_input_first
       Backlog-ID: RP-841
 
 ## Found while working RP-727 (2026-11-10)

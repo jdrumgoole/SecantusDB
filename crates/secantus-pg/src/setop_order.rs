@@ -183,6 +183,32 @@ impl PgHandler {
                 Some(values_groups(&vc.types, vc.rows.len() as f64))
             }
             Statement::Select(sel) => self.select_input_estimate(sel),
+            // An aggregated input's groups are its rows (`*pNumGroups =
+            // subpath->rows` under `hasAggs` or a GROUP BY): a plain
+            // aggregate's one row, or `estimate_num_groups` of the
+            // GROUP BY's columns over one user table's scan.
+            Statement::Aggregate(agg) => {
+                if agg.sub.is_some()
+                    || agg.join.is_some()
+                    || agg.series.is_some()
+                    || agg.grouping_sets.is_some()
+                    || agg.having.is_some()
+                    || agg.limit.is_some()
+                    || agg.offset != 0
+                    || agg.distinct
+                    || agg.group_by.iter().any(|k| k.expr.is_some())
+                {
+                    return None;
+                }
+                let rows = if agg.group_by.is_empty() {
+                    1.0
+                } else {
+                    let fields: Vec<String> =
+                        agg.group_by.iter().map(|k| k.field.clone()).collect();
+                    self.distinct_groups(&agg.table, &agg.filter, &fields)?
+                };
+                Some(InputEstimate { rows, groups: rows })
+            }
             _ => None,
         }
     }
