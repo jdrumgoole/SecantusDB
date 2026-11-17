@@ -676,7 +676,7 @@ fn streams(stage: &Bson) -> bool {
     STREAMING_STAGES.contains(&name.as_str()) && only_kept_meta(spec)
 }
 
-fn mentions_meta(v: &Bson) -> bool {
+pub(crate) fn mentions_meta(v: &Bson) -> bool {
     match v {
         Bson::Document(d) => d.iter().any(|(k, v)| k == "$meta" || mentions_meta(v)),
         Bson::Array(items) => items.iter().any(mentions_meta),

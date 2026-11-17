@@ -266,6 +266,10 @@ pub struct CursorCounts {
     /// A read run whole whose plan's examining each batch reports as far
     /// as that batch went (RM-708).
     pub examined: Option<BatchExamined>,
+    /// A `$sort` read through mongod's cursor stage after the stages its
+    /// slot-based engine took (RM-360): the pipeline interrupt checker's
+    /// ticks to its next check, which each `getMore` goes on counting.
+    pub ticks: Option<u32>,
 }
 
 /// What a plan read whole examined as it returned each document, `(keys,
@@ -651,6 +655,15 @@ impl CursorRegistry {
             e.streaming = true;
         }
         Ok(id)
+    }
+
+    /// Mark `cursor_id`'s `getMore`s as taking no lock of their own: its
+    /// read was all done by the command that opened it (RM-360).
+    pub fn set_locks_internally(&self, cursor_id: i64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = inner.cursors.get_mut(&cursor_id) {
+            e.locks_internally = true;
+        }
     }
 
     /// Whether a `getMore` of `cursor_id` takes no lock of its own, its
@@ -1504,7 +1517,7 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             batch.len(),
             exhausted,
             batch_size,
-        );
+        )?;
         if let Some(examined) = counts.examined {
             let (keys, docs) = examined.batch(batch.len(), exhausted);
             let returned = examined.returned + batch.len();
@@ -1623,7 +1636,7 @@ fn stream_get_more(
             batch.docs.len(),
             batch.exhausted,
             batch_size,
-        );
+        )?;
     }
     let open = !batch.exhausted;
     ctx.exec_stats = Some(crate::ExecStats {
@@ -1671,16 +1684,27 @@ fn report_counts(
     returned: usize,
     exhausted: bool,
     batch_size: Option<i64>,
-) {
+) -> Result<(), CommandError> {
     secantus_core::memlimit::add_report(&counts.reported);
-    let Some(mut loads) = counts.loads.clone() else {
-        return;
-    };
     let found_end = exhausted && batch_size.is_none_or(|n| (returned as i64) < n);
+    // The `$sort` after the cursor stage passes on each document with one
+    // `getNext`, and one more finds its end, each a tick of the pipeline's
+    // checker, which goes on from the batch before (RM-360).
+    if let Some(ticks) = counts.ticks {
+        secantus_core::deadline::resume_ticks(ticks);
+        secantus_core::deadline::tick_stages((returned + usize::from(found_end)) as u64)?;
+        secantus_core::deadline::pipeline_counted();
+        let left = secantus_core::deadline::ticks_to_check();
+        cursors.update_counts(cursor_id, |c| c.ticks = Some(left));
+    }
+    let Some(mut loads) = counts.loads.clone() else {
+        return Ok(());
+    };
     if let Some(extra) = loads.pull(returned + usize::from(found_end)) {
         secantus_core::memlimit::add_sort_counts(&loads.sort, extra);
     }
     cursors.update_counts(cursor_id, |c| c.loads = Some(loads));
+    Ok(())
 }
 
 /// The operation ended with cursor `cursor_id` open: keep what it reported

@@ -673,6 +673,9 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut read_pipeline: Vec<Bson> = Vec::new();
     // Whether the leading `$sort` blocks, for the pipeline run below.
     let mut leading_guard: Option<secantus_core::aggregate::LeadingSort> = None;
+    // The pipeline is a `$group` mongod's slot-based engine runs, read
+    // through its cursor stage by a `$sort` (RM-360).
+    let mut sorted_after_sbe = false;
     // Fetch the input documents + decide the remaining pipeline.
     let (ns, input, working_pipeline): (String, Vec<Document>, Vec<Bson>) = match &coll {
         Some(c) => {
@@ -1051,6 +1054,17 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     collation.as_ref(),
                 ) {
                     secantus_core::deadline::pipeline_counted();
+                } else {
+                    sorted_after_sbe = c == asked
+                        && crate::ts_buckets::bucketed(storage, &ctx.db_name, c).is_none()
+                        && sort_after_sbe_group(
+                            storage,
+                            &ctx.db_name,
+                            c,
+                            &read_pipeline,
+                            hint,
+                            collation.as_ref(),
+                        );
                 }
                 // The plan the pipeline's first read runs uses its indexes
                 // once (a `$lookup`'s reads count none: measured 8.2.11).
@@ -1262,6 +1276,40 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             loads = Some(stage);
         }
     }
+    // A `$sort` after a `$group` mongod's slot-based engine runs reads the
+    // group's output through the cursor stage, which takes the global lock
+    // for each buffer it loads (32 documents, then twice as many each time,
+    // until one comes back short); the `$sort` pulls every document through
+    // the cursor stage and one more that finds the end, then passes each on
+    // with a `getNext`, and one more finds its end when the batch is not
+    // filled -- each `getNext` a tick of the pipeline's interrupt checker
+    // (RM-360, measured 8.2.11 2026-11-17).
+    let mut ticks_left = None;
+    if sorted_after_sbe && !crate::explain::order::is_uncounted() && !doc.contains_key("autocommit")
+    {
+        let (mut loaded, mut asked) = (0usize, CURSOR_STAGE_FIRST_BUFFER);
+        loop {
+            crate::lock_manager::let_statement_ticket_go();
+            crate::lock_manager::global_read()?;
+            loaded += asked;
+            if loaded > total {
+                break;
+            }
+            asked *= 2;
+        }
+        let wanted = if batch_size < 0 {
+            DEFAULT_BATCH_SIZE as usize
+        } else {
+            batch_size as usize
+        };
+        let found_end = first_batch.len() < wanted;
+        secantus_core::deadline::resume_ticks(secantus_core::deadline::FRESH_TICKS);
+        secantus_core::deadline::tick_stages(
+            (total + 1 + first_batch.len() + usize::from(found_end)) as u64,
+        )?;
+        secantus_core::deadline::pipeline_counted();
+        ticks_left = Some(secantus_core::deadline::ticks_to_check());
+    }
     // Every document was read for the first batch: the cursor's `getMore`s
     // name the command that opened it and repeat its plan (RM-400).
     if cursor_id != 0 {
@@ -1272,7 +1320,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             c.plan_summary = plan_summary;
             c.has_sort_stage = has_sort_stage;
             c.loads = loads;
+            c.ticks = ticks_left;
         });
+        // Its `getMore`s read the documents the cursor stage loaded, and
+        // take no lock of their own (RM-360).
+        if ticks_left.is_some() {
+            ctx.cursors()?.set_locks_internally(cursor_id);
+        }
     }
     // `batchSize: 0` asks for the cursor and no documents, and mongod opens
     // one even over nothing -- a missing collection included.
@@ -7184,4 +7238,35 @@ mod documents_argument_tests {
             );
         }
     }
+}
+
+/// The documents mongod's cursor stage loads into its first buffer.
+const CURSOR_STAGE_FIRST_BUFFER: usize = 32;
+
+/// Whether `pipeline` is a `$group` (and the stages before it) that mongod's
+/// slot-based engine runs, followed by nothing but a `$sort` (RM-360).
+fn sort_after_sbe_group(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    pipeline: &[Bson],
+    hint: Option<&Bson>,
+    collation: Option<&secantus_core::collation::Collation>,
+) -> bool {
+    let hoisted = crate::explain::hoist::hoist_runnable(pipeline);
+    let Some(pushed) = crate::explain::sbe_pushdown(storage, db, coll, &hoisted, hint, collation)
+    else {
+        return false;
+    };
+    let name = |s: &Bson| {
+        s.as_document()
+            .and_then(|d| d.keys().next())
+            .map_or(String::new(), String::clone)
+    };
+    pushed > 0
+        && hoisted.len() == pushed + 1
+        && name(&hoisted[pushed - 1]) == "$group"
+        && name(&hoisted[pushed]) == "$sort"
+        && !crate::agg_meta::reads_sort_key(&hoisted[pushed])
+        && !crate::agg_stream::mentions_meta(&hoisted[pushed])
 }

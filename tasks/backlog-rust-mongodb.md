@@ -715,7 +715,10 @@ These are explicit non-goals. Don't add them without a reason.
       with the cursor from batch to batch. Since 2026-11-16 a `$map`,
       `$filter` or `$reduce` checks after every tenth element of each
       evaluation, as mongod 8.2.11's does, and leaves the pipeline's checker
-      alone. The line of a `find`, `count`
+      alone. Since 2026-11-17 a `$sort` alone after a `$group` SBE runs
+      counts the cursor stage's buffers (each a global IS) and its own and
+      the cursor stage's `getNext`s, and its `getMore`s go on counting
+      with no lock of their own. The line of a `find`, `count`
       or `distinct` of a collection with one candidate plan, a `getMore` of
       a `find`, an `aggregate` of a collection mongod's query layer runs
       whole, or whose stages after its cursor stage are `$project`,
@@ -737,8 +740,9 @@ These are explicit non-goals. Don't add them without a reason.
         its read, a `$limit` there (it stops its source short
         of the documents this server runs in one go), a `$lookup`,
         `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a stage
-        read whole that SBE does not take whole (a `$sort` after a
-        `$group`, `$count`, `$bucket`: 5 on mongod), one over a
+        read whole that SBE does not take whole (a `$count` or `$bucket`
+        after a `$group`: 5 on mongod; a `$sort` alone after one is
+        counted), one over a
         view or a time-series collection, and one asked for a first batch
         of none;
       - `findAndModify`: counted as the other writes are, it matches mongod
