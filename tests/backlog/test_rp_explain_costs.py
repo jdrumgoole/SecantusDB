@@ -6421,12 +6421,12 @@ def test_an_index_only_scan_after_a_delete_and_vacuum(rust_pg: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-926")
+@pytest.mark.backlog_fixed("RP-926")
 def test_a_wide_range_over_a_weakly_correlated_index(rust_pg: Any) -> None:
     """PostgreSQL 15.19 scans the heap for a range of 290 of 1,000 rows of
-    a column `g % 100` under a non-unique index; this server prints the
-    index scan it reads, unpriced, once the table is committed (inside the
-    transaction that made it, it prints PostgreSQL's plan)."""
+    a column `g % 100` under a non-unique index; this server printed the
+    index scan it read, unpriced, once the table was committed: where the
+    cost model chose the sequential scan, EXPLAIN kept the storage's node."""
     steps = [
         "create table k2 (x int, y int)",
         "insert into k2 select g, g % 100 from generate_series(1, 1000) g",

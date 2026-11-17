@@ -3754,8 +3754,10 @@ impl PgHandler {
     /// the whole arm, a partial index, or an index the clauses reach only
     /// past its leading column with no index that leads with them
     /// (PostgreSQL prices a full-index path for it, not modelled).
-    /// [`Self::user_index_path`] for a user table, `None` for a catalog.
-    pub(crate) fn user_index_path_reading(
+    /// [`Self::user_index_path`] for a user table, the sequential scan
+    /// priced where it wins (`Some((_, None))`), `None` for a catalog or a
+    /// choice not modelled (RP-926).
+    pub(crate) fn user_scan_path_reading(
         &self,
         table: &str,
         filter: &Document,
@@ -3770,7 +3772,13 @@ impl PgHandler {
         {
             return None;
         }
-        self.user_index_path(table, filter, fields, reads)
+        match self
+            .user_paths(table, filter, fields, reads, &PathWant::default())?
+            .chosen
+        {
+            Some(chosen) => Some(chosen),
+            None => Some((self.user_seq_scan(table, filter, fields)?, None)),
+        }
     }
 
     fn user_index_path(

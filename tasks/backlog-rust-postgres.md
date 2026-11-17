@@ -1763,23 +1763,6 @@ a regression test.
       frequencies match (found while working RP-313).
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_columns_correlation_follows_the_heap
       Backlog-ID: RP-358
-- [ ] **A committed table's wide range over a weakly correlated index is
-      read through the index, unpriced.** `k2 (x int, y int)` holds `g %
-      100` in `y` for 1,000 rows, indexed and analysed. A range of the
-      column wide enough (`select * from k2 where y > 70`, 290 rows) is
-      PostgreSQL 15.19's `Seq Scan on k2 (cost=0.00..17.50 rows=290
-      width=8)`, `Filter: (y > 70)`; here, once the table is committed,
-      `Index Scan using k2_y_idx`, priced zeros. Inside the transaction
-      that made it the plan is PostgreSQL's, and a narrower one (`y > 90`)
-      matches, so the cost model's path choice gives up only on the
-      committed table (`user_paths` returns `None` somewhere it does not
-      inside the transaction); find which `?` before fixing. (Since
-      2026-11-16 the nested loops into this index are priced as PostgreSQL
-      prices them: `dedup_index_size` takes the B-tree model's pages, 4,
-      where the dedup estimate gave up and `btree_size`'s 5 stood.)
-      Measured on a private 15.19 cluster (found while working RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_a_wide_range_over_a_weakly_correlated_index
-      Backlog-ID: RP-926
 - [ ] **A chain of inequality joins under a LIMIT runs far past the rows
       it returns.** `select e.a, e3.a, zs.a, e4.a from e join e e3 on e.a <
       e3.a join zs on e3.a > zs.a join e e4 on e4.a < zs.a limit 7 offset

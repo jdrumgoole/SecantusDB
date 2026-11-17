@@ -46804,8 +46804,10 @@ impl PgHandler {
                             && sel.windows.is_empty()
                         {
                             if let Some((cost, width, fields)) = scan_estimate::target_cost(sel) {
-                                if let Some(((startup, total, rows, w), Some(index))) = self
-                                    .user_index_path_reading(
+                                // The sequential scan where it is cheaper
+                                // than the index the storage reads (RP-926).
+                                if let Some(((startup, total, rows, w), index)) = self
+                                    .user_scan_path_reading(
                                         &sel.table,
                                         &sel.filter,
                                         &fields,
@@ -46814,7 +46816,7 @@ impl PgHandler {
                                 {
                                     tree.estimate =
                                         Some((startup, total + cost * rows, rows, w + width));
-                                    explain::index_path_node(&mut tree, index, &sel.table);
+                                    explain::scan_path_node(&mut tree, index, &sel.table);
                                 }
                             }
                         }
