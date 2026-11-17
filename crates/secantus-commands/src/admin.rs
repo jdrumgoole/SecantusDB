@@ -4149,7 +4149,14 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .map_err(command_error)?
         .iter()
         .any(|c| c == &coll);
-    if !exists {
+    // `system.views` is what mongod keeps its view definitions in, a
+    // collection with an `_id` index and no other. Here they are in the
+    // catalog, so it exists while a view does and has only that index to
+    // list (RM-588, measured 8.2.11).
+    let view_definitions = !exists
+        && coll == "system.views"
+        && !crate::ts_buckets::view_definitions(storage, &ctx.db_name)?.is_empty();
+    if !exists && !view_definitions {
         return Ok(CommandError::new(
             26,
             "NamespaceNotFound",
@@ -4157,9 +4164,13 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         )
         .into_reply());
     }
-    let listed = storage
-        .list_indexes(&ctx.db_name, &coll)
-        .map_err(command_error)?;
+    let listed = if view_definitions {
+        vec![doc! { "v": 2i32, "key": { "_id": 1i32 }, "name": "_id_" }]
+    } else {
+        storage
+            .list_indexes(&ctx.db_name, &coll)
+            .map_err(command_error)?
+    };
     let is_time_series = storage
         .get_collection_options(&ctx.db_name, &coll)
         .is_ok_and(|o| o.contains_key("timeseries"));
@@ -4216,9 +4227,11 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
         }
         (None, Some(Bson::String(s))) if s == "*" => {
-            storage
-                .drop_all_indexes(&ctx.db_name, &coll)
-                .map_err(command_error)?;
+            if !view_definitions {
+                storage
+                    .drop_all_indexes(&ctx.db_name, &coll)
+                    .map_err(command_error)?;
+            }
             reply.insert("msg", "non-_id indexes dropped for collection");
         }
         (None, Some(Bson::String(name))) => {
@@ -4228,9 +4241,10 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             if name == "_id_" {
                 return Ok(id_index());
             }
-            let existed = storage
-                .drop_index(&ctx.db_name, &coll, name)
-                .map_err(command_error)?;
+            let existed = !view_definitions
+                && storage
+                    .drop_index(&ctx.db_name, &coll, name)
+                    .map_err(command_error)?;
             if !existed && !was_building(name) {
                 return Ok(not_found(name));
             }

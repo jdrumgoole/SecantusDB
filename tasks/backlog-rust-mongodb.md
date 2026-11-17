@@ -748,13 +748,6 @@ These are explicit non-goals. Don't add them without a reason.
       e01df2d2 (2026-11-08), each command checked against a probe of its own.
       Backlog-ID: RM-360
       Verify: tests/backlog/test_rm_355_364.py::test_every_line_counts_its_interrupt_checks
-- [ ] **A `dropIndexes` of `system.views` is refused.** mongod 8.2.11 drops
-      `<db>.system.views`' indexes (`ok: 1`, its line and profile entry
-      naming `<db>.system.views`, `system`); this server refuses it with
-      NamespaceNotFound (26), though `system.views` exists. Found while
-      working RM-485, 2026-11-13.
-      Verify: tests/backlog/test_rm_view_ddl_refusals.py::test_a_drop_indexes_of_system_views_answers
-      Backlog-ID: RM-588
 - [ ] **A `find` of a clustered collection that leaves its cursor open
       does not say what it examined.** mongod 8.2.11's lines for a `find`
       of `<db>.system.buckets.ts` read four at a time, and its `getMore`s,
