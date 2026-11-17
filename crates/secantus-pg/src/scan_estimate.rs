@@ -671,6 +671,7 @@ impl PgHandler {
                         || (!leaf.filter.is_empty()
                             && !self.own_quals(&leaf.table, &leaf.filter).is_some_and(|q| {
                                 q.iter().all(|(_, q)| matches!(q, costsize::Qual::Ne))
+                                    || own_bounds_only(&q)
                             }))))
             {
                 return None;
@@ -713,11 +714,20 @@ impl PgHandler {
                 self.own_quals(&leaf.table, &leaf.filter)
                     .unwrap_or_default()
             };
+            // Bounds of one column of its own join that column's index
+            // quals (RP-979): their `clauselist_selectivity` scales the
+            // parameterized scan's.
+            let bounds_sel = if own_bounds_only(&quals) {
+                self.restriction_selectivity(&leaf.table, &leaf.filter)?
+            } else {
+                1.0
+            };
             leaves.push(SideLeaf {
                 table: leaf.table.clone(),
                 keys,
                 read,
                 quals,
+                bounds_sel,
             });
             Some((scan, width.3, index))
         };
@@ -1380,6 +1390,7 @@ impl PgHandler {
             read: l.read.clone(),
             // A chain's indexed table has no filter of its own.
             quals: Vec::new(),
+            bounds_sel: 1.0,
         };
         let mut params: Vec<Option<(u32, secantus_pgplan::joincost::ParamInner, ParamScan)>> =
             vec![None; n];
@@ -1865,8 +1876,13 @@ impl PgHandler {
             if index_only {
                 ki.index.visible = ki.allvisfrac;
             }
+            let own_sel = if leaf.quals.first().is_some_and(|(f, _)| *f == field) {
+                leaf.bounds_sel
+            } else {
+                1.0
+            };
             let Some((startup, total)) = costsize::param_range_index_scan(
-                &ki.rel, &ki.index, &field, &rest, &bounds, arg_ops, outer_rows,
+                &ki.rel, &ki.index, &field, &rest, &bounds, own_sel, arg_ops, outer_rows,
             ) else {
                 return ParamFound::Unmodelled;
             };
@@ -2158,6 +2174,7 @@ impl PgHandler {
             }
             let mut h =
                 self.hash_side_with(&p.table, &p.filter, &p.exprs, &p.field, &p.read, &p.above)?;
+            h.key_only_read = p.read.iter().all(|f| *f == p.field);
             // A side whose key is an expression: no statistics for it, so
             // `get_variable_numdistinct`'s 200 default, no MCVs and no
             // NULLs (`eqjoinsel`, `estimate_hash_bucket_stats`); not unique
@@ -3238,10 +3255,36 @@ impl PgHandler {
         let (width, None) = self.scan_estimate(table, &Document::new(), above)? else {
             return None;
         };
-        let key = self.analysed_key(table, field)?;
-        let col = &key.column;
-        let (nd, null_frac, mcv) = (key.ndistinct, key.null_frac, key.mcv.clone());
-        let unique = key.unique;
+        // A table never analysed has no statistics for the key
+        // (RP-1019): `get_variable_numdistinct`'s fallback -- a unique
+        // column's rows, a table under `DEFAULT_NUM_DISTINCT` rows its
+        // rows, else that default -- no NULLs and no MCVs.
+        let (key, unanalysed) = match self.analysed_key(table, field) {
+            Some(k) => (Some(k), None),
+            None => (None, Some(self.unanalysed_key(table, field)?)),
+        };
+        let (col, nd, null_frac, mcv, unique, tuples, default_nd) = match (&key, &unanalysed) {
+            (Some(k), _) => (
+                k.column.clone(),
+                k.ndistinct,
+                k.null_frac,
+                k.mcv.clone(),
+                k.unique,
+                k.tuples,
+                false,
+            ),
+            (None, Some(u)) => (
+                u.column.clone(),
+                u.ndistinct,
+                0.0,
+                Vec::new(),
+                u.unique,
+                u.tuples,
+                u.default_nd,
+            ),
+            (None, None) => return None,
+        };
+        let col = &col;
         let (numeric, ordered) = self.column_key_order(col);
         // `innerrel_is_unique` from the side's own restriction: its WHERE
         // fixes every key column of a unique index to a constant, so the
@@ -3276,7 +3319,12 @@ impl PgHandler {
             .collect();
         let key_indexed = !leading.is_empty();
         let key_index = if key_indexed && index.is_none() {
-            self.key_index(table, filter, field, &key, scan.2)
+            self.key_index_by(table, filter, nd, scan.2, |ix| {
+                (
+                    ix.field == field,
+                    ix.columns[1..].iter().any(|c| c == field),
+                )
+            })
         } else {
             None
         };
@@ -3293,62 +3341,55 @@ impl PgHandler {
             pg_type: col.pg_type.clone(),
             stats: (nd, null_frac, mcv),
             unique,
-            tuples: key.tuples,
-            column: key.slots.clone().map(|sl| (key.stats, sl)),
+            tuples,
+            column: key
+                .as_ref()
+                .and_then(|key| key.slots.clone().map(|sl| (key.stats, sl))),
             numeric,
             ordered,
             key_indexed,
             key_index,
             key_index_name,
             key_ops: 0.0,
-            default_nd: false,
+            default_nd,
+            no_stats: key.is_none(),
+            key_only_read: false,
         })
     }
 
-    /// The join key `field`'s index over analysed table `table`, scanned
-    /// with `filter` (RP-377): the one plain B-tree leading with it, sized
-    /// and correlated as [`Self::index_scan_estimate`] does. `None` where
-    /// another index leads with it, reads it past its first column or
-    /// serves a WHERE column, or the index is partial or a hash.
-    fn key_index(
-        &self,
-        table: &str,
-        filter: &Document,
-        field: &str,
-        key: &AnalysedKey,
-        rows: f64,
-    ) -> Option<KeyIndex> {
-        self.key_index_at(table, filter, field, key, rows, false)
-    }
-
-    /// [`Self::key_index`], or with `later` the one plain B-tree holding
-    /// `field` past its first column (RP-354), correlated by its leading
-    /// column as `btcostestimate` is. `None` where another index holds
-    /// `field` at the other position.
-    fn key_index_at(
-        &self,
-        table: &str,
-        filter: &Document,
-        field: &str,
-        key: &AnalysedKey,
-        rows: f64,
-        later: bool,
-    ) -> Option<KeyIndex> {
-        self.key_index_by(table, filter, key, rows, |ix| {
-            let (leading, past) = (
-                ix.field == field,
-                ix.columns[1..].iter().any(|c| c == field),
-            );
-            if later {
-                (past, leading)
-            } else {
-                (leading, past)
-            }
+    /// The join key `field` of user table `table` where the table holds no
+    /// statistics (RP-1019): `get_variable_numdistinct` with none -- a
+    /// unique column's distinct count is the relation's rows, a relation of
+    /// fewer than `DEFAULT_NUM_DISTINCT` rows its rows, else that default
+    /// (`isdefault`). `None` where the table was analysed: its missing
+    /// column statistics are not this case.
+    fn unanalysed_key(&self, table: &str, field: &str) -> Option<UnanalysedKey> {
+        let count = self
+            .storage
+            .count_matching(self.db(), table, &Document::new(), None)
+            .ok()?;
+        let pt = self.planner_table(table, count)?;
+        if pt.analyzed.is_some() {
+            return None;
+        }
+        let column = pt.def.columns.iter().find(|c| c.field() == field)?.clone();
+        let unique = pt.unique.iter().any(|u| u == field);
+        let (ndistinct, default_nd) = if unique || pt.tuples < 200.0 {
+            (costsize::clamp_row_est(pt.tuples), false)
+        } else {
+            (200.0, true)
+        };
+        Some(UnanalysedKey {
+            tuples: pt.tuples,
+            column,
+            unique,
+            ndistinct,
+            default_nd,
         })
     }
 
     /// The plain B-tree of `table` whose key columns are `columns`, sized
-    /// and correlated as [`Self::key_index`] does (RP-354): one of the
+    /// and correlated as [`Self::key_index_by`] does (RP-354): one of the
     /// indexes a parameterized scan may read.
     fn key_index_of(
         &self,
@@ -3357,7 +3398,7 @@ impl PgHandler {
         key: &AnalysedKey,
         rows: f64,
     ) -> Option<KeyIndex> {
-        self.key_index_by(table, &Document::new(), key, rows, |ix| {
+        self.key_index_by(table, &Document::new(), key.ndistinct, rows, |ix| {
             (ix.columns == columns, false)
         })
     }
@@ -3368,7 +3409,7 @@ impl PgHandler {
         &self,
         table: &str,
         filter: &Document,
-        key: &AnalysedKey,
+        ndistinct: f64,
         rows: f64,
         pick: impl Fn(&costsize::Index) -> (bool, bool),
     ) -> Option<KeyIndex> {
@@ -3377,10 +3418,14 @@ impl PgHandler {
             .count_matching(self.db(), table, &Document::new(), None)
             .ok()?;
         let pt = self.planner_table(table, count)?;
-        let stats = pt.analyzed.as_ref()?;
         let quals = costsize::conjuncts(filter)?;
         let mut indexes = self.cost_indexes(table, &pt.def, count as u64);
-        let correlations = Self::stats_correlations(&pt.def, stats);
+        // A table never analysed has no correlation to read: `btcostestimate`
+        // leaves it 0 (RP-1019).
+        let correlations = pt
+            .analyzed
+            .as_ref()
+            .map(|stats| Self::stats_correlations(&pt.def, stats));
         let mut found: Option<costsize::Index> = None;
         for ix in &mut indexes {
             // An index holding it at the other position is a path not
@@ -3403,7 +3448,10 @@ impl PgHandler {
                 }
                 return None;
             }
-            let c = correlations.get(&ix.field).copied().flatten()?;
+            let c = match &correlations {
+                Some(cs) => cs.get(&ix.field).copied().flatten()?,
+                None => 0.0,
+            };
             ix.correlation = if ix.columns.len() > 1 { c * 0.75 } else { c };
             if !ix.unique {
                 if let Some(Some((pages, height))) = self.dedup_index_size(table, ix) {
@@ -3420,7 +3468,7 @@ impl PgHandler {
             },
             index: found?,
             quals,
-            ndistinct: key.ndistinct,
+            ndistinct,
             where_sel: rows / pt.tuples.max(1.0),
             allvisfrac: pt.allvisfrac,
         })
@@ -7030,6 +7078,13 @@ struct HashSide {
     /// no statistics (RP-981).
     key_ops: f64,
     default_nd: bool,
+    /// Its table was never analysed (RP-1019): no statistics for the key,
+    /// so `mergejoinscansel` keeps its defaults and reads it whole.
+    no_stats: bool,
+    /// Its scan reads no column but its key: an index on the key could
+    /// serve it index-only (`check_index_only`), which a parameterized
+    /// inner here does not model.
+    key_only_read: bool,
 }
 
 /// A join key's B-tree index over an analysed table (RP-377): the table
@@ -7160,6 +7215,20 @@ struct SideLeaf {
     /// The side's own restriction, none an index qual: a parameterized
     /// scan of it checks them on each row it fetches (RP-918).
     quals: Vec<(String, costsize::Qual)>,
+    /// The selectivity of `quals` where they are all bounds of one column
+    /// ([`own_bounds_only`]), which join a parameterized scan's Index Cond
+    /// on that column (RP-979); else 1.
+    bounds_sel: f64,
+}
+
+/// Whether a side's own quals are all constant bounds (`>`, `<`, ...) of
+/// one column: an index scan bounded on that column by the join takes them
+/// as index quals beside the join clause (RP-979).
+fn own_bounds_only(quals: &[(String, costsize::Qual)]) -> bool {
+    !quals.is_empty()
+        && quals
+            .iter()
+            .all(|(f, q)| *f == quals[0].0 && matches!(q, costsize::Qual::Range(_)))
 }
 
 /// An operand of a `<>` between joined keys, for `eqjoinsel` and
@@ -7349,6 +7418,15 @@ fn hash_support(oid: i64) -> Option<bool> {
 }
 
 /// One analysed column's statistics (`PgHandler::analysed_key`).
+/// A join key of a table never analysed ([`PgHandler::unanalysed_key`]).
+struct UnanalysedKey {
+    tuples: f64,
+    column: secantus_pgcatalog::Column,
+    unique: bool,
+    ndistinct: f64,
+    default_nd: bool,
+}
+
 struct AnalysedKey {
     tuples: f64,
     column: secantus_pgcatalog::Column,
@@ -7707,7 +7785,9 @@ fn hash_join_of(
     // join clauses match (`approx_tuple_count`), and each inequality
     // scales the join's rows by its selectivity (RP-379: a `<>` by
     // `neqjoinsel`'s).
-    let matched = costsize::clamp_row_est(outer.rows * inner.rows * selectivity);
+    // `approx_tuple_count` multiplies the selectivity first, which can
+    // round apart from the join's own size (`8064.500000000001`, RP-1019).
+    let matched = costsize::clamp_row_est(selectivity * outer.rows * inner.rows);
     let filter_qual = qp * matched;
     let mut rows = outer.rows * inner.rows * selectivity * filter.selectivity;
     if left_join {
@@ -7726,7 +7806,7 @@ fn hash_join_of(
     } else {
         // Over an expression key `mergejoinscansel` finds no range and
         // keeps its defaults: each side read whole (RP-981).
-        let (mut ls, mut le, rs, re) = if expr_key {
+        let (mut ls, mut le, rs, re) = if expr_key || a.no_stats || b.no_stats {
             (0.0, 1.0, 0.0, 1.0)
         } else {
             let (ca, cb) = (merge_column(&a)?, merge_column(&b)?);
@@ -7739,7 +7819,7 @@ fn hash_join_of(
             ls = 0.0;
             le = 1.0;
         }
-        let tuples = costsize::clamp_row_est(outer.rows * inner.rows * selectivity);
+        let tuples = matched;
         let with_filter = |mut m: joincost::MergePlan| {
             m.total += filter_qual;
             m
@@ -7855,8 +7935,22 @@ fn hash_join_of(
         return None;
     }
     if unique_key {
-        let (other, merge) =
+        let (other, merge, nest_param) =
             unique_key_other_paths(&a, &b, &outer, &inner, rows, left_join, filter)?;
+        // The parameterized nested loop, cheaper beyond the fuzz factor and
+        // with no join filter left to check on each pair, is the plan.
+        if let Some((b_outer, param, startup)) = nest_param
+            .filter(|_| other * 1.01 < t0 && more.is_empty() && filter.count == 0 && !expr_key)
+        {
+            let (first, second) = if b_outer { (&b, &a) } else { (&a, &b) };
+            return Some((
+                first.scan,
+                param,
+                (startup, other, rows, width),
+                JoinPick::NestParam { b_outer },
+                [first.index.clone(), second.key_index_name.clone()],
+            ));
+        }
         if other <= t0 * 1.01 {
             // A merge reading a side presorted by its key's index, cheaper
             // beyond the fuzz factor, is the plan (RP-401); anything closer,
@@ -7914,6 +8008,16 @@ fn merge_column(s: &HashSide) -> Option<secantus_pgplan::colstats::Column<'_>> {
     })
 }
 
+/// What [`unique_key_other_paths`] finds: the cheapest path's total, a
+/// merge over a presorted side where that is it, and a parameterized nested
+/// loop where that is it (`b_outer`, the inner scan's estimate, the join's
+/// startup).
+type UniqueKeyPaths = (
+    f64,
+    Option<(secantus_pgplan::joincost::MergePlan, bool)>,
+    Option<(bool, Estimate, f64)>,
+);
+
 /// The cheapest total of the merge joins and nested loops PostgreSQL's
 /// `add_paths_to_joinrel` builds for `a` joined to `b` on one key, unique
 /// on a side (RP-377): each side's pathlist as `set_base_rel_pathlists`
@@ -7931,7 +8035,7 @@ fn unique_key_other_paths(
     rows: f64,
     left_join: bool,
     filter: JoinFilterCost,
-) -> Option<(f64, Option<(secantus_pgplan::joincost::MergePlan, bool)>)> {
+) -> Option<UniqueKeyPaths> {
     use secantus_pgplan::joincost::{
         base_pathlist, InPath, JoinMethod, JoinRel, MemoKey, RelPaths,
     };
@@ -7943,8 +8047,11 @@ fn unique_key_other_paths(
             return Some(out);
         }
         let k = s.key_index.as_ref()?;
-        // The Memoize over it is keyed on the other side's analysed column.
-        other.column.as_ref()?;
+        // The Memoize over it is keyed on the other side's column: its
+        // statistics, or a table never analysed's defaults (RP-1019).
+        if !other.no_stats {
+            other.column.as_ref()?;
+        }
         let (st, tt) = costsize::ordered_index_scan_with(
             &k.rel,
             &k.index,
@@ -7956,7 +8063,7 @@ fn unique_key_other_paths(
         // clause's (`var_eq_non_const`), at most the rows.
         let ppi_rows = costsize::clamp_row_est(k.rel.tuples * k.where_sel / k.ndistinct.max(1.0))
             .min(s.scan.2);
-        let memo_key = MemoKey::column(other.stats.0, false, other.tuples, other.scan.2);
+        let memo_key = MemoKey::column(other.stats.0, other.default_nd, other.tuples, other.scan.2);
         let param = |(startup, total): (f64, f64)| InPath {
             startup,
             total,
@@ -8057,7 +8164,37 @@ fn unique_key_other_paths(
             .map(|p| (p, !matches!(best.method, JoinMethod::MergeOuterA { .. }))),
         _ => None,
     };
-    Some((best.total, merge))
+    // A nested loop whose inner is the parameterized index scan, with no
+    // Memoize over it: the plan `explain::price_param_nest_loop` draws.
+    // An inner that could be read index-only is not modelled.
+    let nest_param = match best.method {
+        JoinMethod::Other | JoinMethod::NestOuterB if !best.memoized && !left_join => {
+            let b_outer = matches!(best.method, JoinMethod::NestOuterB);
+            let (inner, paths, side) = if b_outer {
+                (a, &pa, best.a_path)
+            } else {
+                (b, &pb, best.b_path)
+            };
+            paths
+                .get(side)
+                .filter(|p| p.req_outer != 0 && p.indexed && !inner.key_only_read)
+                .filter(|_| {
+                    inner
+                        .key_index
+                        .as_ref()
+                        .is_some_and(|k| k.index.columns.len() == 1)
+                })
+                .map(|p| {
+                    (
+                        b_outer,
+                        (p.startup, p.total, p.rows, inner.scan.3),
+                        best.startup,
+                    )
+                })
+        }
+        _ => None,
+    };
+    Some((best.total, merge, nest_param))
 }
 
 /// A priced two-table join: the printed outer scan's, the inner scan's and
@@ -8097,6 +8234,14 @@ pub(crate) enum JoinPick {
     Merge {
         b_outer: bool,
         plan: secantus_pgplan::joincost::MergePlan,
+    },
+    /// A nested loop over the outer side's scan, its inner the index scan
+    /// on the inner side's unique key parameterized by the outer row
+    /// (`match_unsorted_outer` over `build_index_paths`' parameterized
+    /// path; RP-978): the right table outer with `b_outer`. The inner
+    /// estimate is one scan's, as PostgreSQL prints it.
+    NestParam {
+        b_outer: bool,
     },
 }
 

@@ -41,6 +41,15 @@ _ANALYSED = [
     "analyze k",
 ]
 
+# Two tables of ten rows never analysed (RP-1019): the planner sizes each
+# at its default 1,270 rows.
+_NEVER_ANALYSED = [
+    "create table e (a int, b text)",
+    "insert into e select g, 'v' || g from generate_series(1, 10) g",
+    "create table k (a int primary key, b text)",
+    "insert into k select g, 'v' || g from generate_series(1, 10) g",
+]
+
 # Those, and thirty rows of a text column whose lengths vary (RP-386).
 _ANALYSED_THIRTY = _ANALYSED + [
     "create table s (a int, c text)",
@@ -1808,7 +1817,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966).
     "explain verbose of a nested loop whose inner filter reads both relations": (
-        "RP-966",
+        "RP-966:fixed",
         _ANALYSED,
         "explain verbose select k.b, e.a from e left join k on e.a < k.a and e.b <> k.b",
         [
@@ -1820,6 +1829,112 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Output: k.a, k.b",
             "        Index Cond: (k.a > e.a)",
             "        Filter: (e.b <> k.b)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (RP-966): a WHERE conjunct reading both
+    # relations is the hash join's `Join Filter`.
+    "explain verbose of a hash join whose where reads both relations": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain verbose select k.b, e.a from e join k on e.a = k.a where e.b <> k.b",
+        [
+            "Hash Join  (cost=27.50..45.14 rows=900 width=7)",
+            "  Output: k.b, e.a",
+            "  Inner Unique: true",
+            "  Hash Cond: (e.a = k.a)",
+            "  Join Filter: (e.b <> k.b)",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        Output: k.b, k.a",
+            "        ->  Seq Scan on public.k  (cost=0.00..15.00 rows=1000 width=7)",
+            "              Output: k.b, k.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (RP-966): a WHERE conjunct reading both
+    # relations is the parameterised inner index scan's `Filter`.
+    "explain verbose of a nested loop whose where reads both relations": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain verbose select k.b, e.a from e join k on e.a < k.a where e.b <> k.b",
+        [
+            "Nested Loop  (cost=0.28..9990.00 rows=300000 width=7)",
+            "  Output: k.b, e.a",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Index Scan using k_pkey on public.k  (cost=0.28..6.98 rows=300 width=7)",
+            "        Output: k.a, k.b",
+            "        Index Cond: (k.a > e.a)",
+            "        Filter: (e.b <> k.b)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: the ON and the WHERE comparison are
+    # one `Join Filter`, the columns both read in the Materialize's Output.
+    "explain verbose of a materialized loop whose where reads both relations": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain verbose select k.b, e.a from e join k on e.a <> k.a where e.b <> k.b",
+        [
+            "Nested Loop  (cost=0.00..17532.50 rows=899100 width=7)",
+            "  Output: k.b, e.a",
+            "  Join Filter: ((e.a <> k.a) AND (e.b <> k.b))",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        Output: k.b, k.a",
+            "        ->  Seq Scan on public.k  (cost=0.00..15.00 rows=1000 width=7)",
+            "              Output: k.b, k.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: a WHERE comparing an expression of one
+    # relation with the other's column is the inner index scan's
+    # `Index Cond`, the ON its `Filter`, every node's Output printed.
+    "explain verbose of a nested loop whose where compares an expression": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain verbose select k.b, e.a from e join k on e.a <> k.a where length(e.b) < k.a",
+        [
+            "Nested Loop  (cost=0.28..10322.50 rows=333000 width=7)",
+            "  Output: k.b, e.a",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Index Scan using k_pkey on public.k  (cost=0.28..6.98 rows=333 width=7)",
+            "        Output: k.a, k.b",
+            "        Index Cond: (k.a > length(e.b))",
+            "        Filter: (e.a <> k.a)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: a WHERE expression over both relations
+    # is the parameterised inner index scan's `Filter`, prefixed.
+    "explain verbose of an inner index scan filtering an expression of both": (
+        "RP-966",
+        _ANALYSED,
+        "explain verbose select k.b, e.a from e join k on e.a < k.a where e.a + k.a < 7",
+        [
+            "Nested Loop  (cost=0.28..8932.50 rows=111111 width=7)",
+            "  Output: k.b, e.a",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=4)",
+            "        Output: e.a, e.b",
+            "  ->  Index Scan using k_pkey on public.k  (cost=0.28..7.81 rows=111 width=7)",
+            "        Output: k.a, k.b",
+            "        Index Cond: (k.a > e.a)",
+            "        Filter: ((e.a + k.a) < 7)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966): a hash
+    # join whose WHERE compares an expression of the inner relation with
+    # the outer's column is priced like any other.
+    "a hash join with an expression join filter is priced": (
+        "RP-1039",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a = k.a where length(k.b) <> e.a",
+        [
+            "Hash Join  (cost=27.50..45.14 rows=999 width=3)",
+            "  Hash Cond: (e.a = k.a)",
+            "  Join Filter: (length(k.b) <> e.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966).
@@ -2136,10 +2251,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (a <> 2)",
         ],
     ),
-    # Still open: a bound of the inner side's own on its indexed key joins
-    # the parameterized scan's Index Cond (found while working RP-918).
+    # A bound of the inner side's own on its indexed key joins the
+    # parameterized scan's Index Cond (RP-979, fixed; found while working
+    # RP-918).
     "nested loop into an index with a range of the inner side": (
-        "RP-979",
+        "RP-979:fixed",
         _ANALYSED,
         "explain select * from e left join k on e.a < k.a and k.a > 2",
         [
@@ -2147,6 +2263,51 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Index Scan using k_pkey on k  (cost=0.28..6.98 rows=333 width=7)",
             "        Index Cond: ((a > e.a) AND (a > 2))",
+        ],
+    ),
+    # A join of two tables never analysed is priced from their default
+    # sizes and `get_variable_numdistinct`'s defaults (RP-1019): the unique
+    # key's side hashed ...
+    "hash join of two tables never analysed": (
+        "RP-1019:fixed",
+        _NEVER_ANALYSED,
+        "explain select * from k, e where k.a = e.a",
+        [
+            "Hash Join  (cost=38.58..64.62 rows=1270 width=72)",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..22.70 rows=1270 width=36)",
+            "  ->  Hash  (cost=22.70..22.70 rows=1270 width=36)",
+            "        ->  Seq Scan on k  (cost=0.00..22.70 rows=1270 width=36)",
+        ],
+    ),
+    # ... and over two keys of the 200 default a merge join, its
+    # `mergejoinscansel` reading both inputs whole and its 8064.5 rows
+    # rounded to even (`clamp_row_est`'s `rint`).
+    "merge join of two tables never analysed": (
+        "RP-1019:fixed",
+        _NEVER_ANALYSED,
+        "explain select * from e join k on e.b = k.b",
+        [
+            "Merge Join  (cost=176.34..303.67 rows=8064 width=72)",
+            "  Merge Cond: (e.b = k.b)",
+            "  ->  Sort  (cost=88.17..91.35 rows=1270 width=36)",
+            "        Sort Key: e.b",
+            "        ->  Seq Scan on e  (cost=0.00..22.70 rows=1270 width=36)",
+            "  ->  Sort  (cost=88.17..91.35 rows=1270 width=36)",
+            "        Sort Key: k.b",
+            "        ->  Seq Scan on k  (cost=0.00..22.70 rows=1270 width=36)",
+        ],
+    ),
+    # ... and two of them, their range's selectivity the scan's (RP-979).
+    "nested loop into an index with two bounds of the inner side": (
+        "RP-979:fixed",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and k.a > 2 and k.a < 900",
+        [
+            "Nested Loop Left Join  (cost=0.28..10047.50 rows=299000 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..7.04 rows=299 width=7)",
+            "        Index Cond: ((a > e.a) AND (a > 2) AND (a < 900))",
         ],
     ),
     # Fixed (RP-916): a parameterized index scan under an outer side with
@@ -6119,15 +6280,36 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Filter: (c ~ '^(w)\\1'::text)",
         ],
     ),
-    # Still open: a regex with a group repeated at least once, whose prefix
-    # walk is not modelled, prints zeros.
+    # Part of RP-423, fixed: a capturing group repeated with `+` is `x*x`
+    # (`parseqatom`), whose prefix is the group's first character ...
     "estimate of a regex match with a repeated group": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_STRINGS,
         "explain select * from w where c ~ '^(w0)+1'",
         [
             "Seq Scan on w  (cost=0.00..18.50 rows=101 width=10)",
             "  Filter: (c ~ '^(w0)+1'::text)",
+        ],
+    ),
+    # ... and a non-capturing one's, one whole copy of the group.
+    "estimate of a regex match with a repeated non-capturing group": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '^(?:w0)+1'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=101 width=10)",
+            "  Filter: (c ~ '^(?:w0)+1'::text)",
+        ],
+    ),
+    # Still open: a group repeated `{m,}` with m of 2 or more, whose prefix
+    # comes from the optimised NFA (`^(ab){2,}c` is `ab`), prints zeros.
+    "estimate of a regex match with a group repeated twice or more": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '^(w0){2,}1'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=1 width=10)",
+            "  Filter: (c ~ '^(w0){2,}1'::text)",
         ],
     ),
     # Still open: a LIKE's ESCAPE is a `like_escape` call PostgreSQL folds
@@ -6411,10 +6593,95 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "                    Index Cond: (a = e.a)",
         ],
     ),
-    # Still open: a constant the class generates for the inner side's
-    # indexed column is that index scan's Index Cond, not a Filter.
+    # Part of RP-978, fixed: an inner join whose range on the outer key
+    # leaves a few rows is the nested loop into the inner's unique key
+    # index, parameterized by the outer row, priced.
+    "a range on the join key of a unique inner is a parameterized nested loop": (
+        "RP-978:fixed",
+        _ANALYSED,
+        "explain select * from e join k on k.a = e.a where e.a > 998",
+        [
+            "Nested Loop  (cost=0.28..34.10 rows=2 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=2 width=7)",
+            "        Filter: (a > 998)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = e.a)",
+        ],
+    ),
+    "verbose of a parameterized nested loop into a unique key": (
+        "RP-978:fixed",
+        _ANALYSED,
+        "explain verbose select * from e join k on k.a = e.a where e.a > 998",
+        [
+            "Nested Loop  (cost=0.28..34.10 rows=2 width=14)",
+            "  Output: e.a, e.b, k.a, k.b",
+            "  Inner Unique: true",
+            "  ->  Seq Scan on public.e  (cost=0.00..17.50 rows=2 width=7)",
+            "        Output: e.a, e.b",
+            "        Filter: (e.a > 998)",
+            "  ->  Index Scan using k_pkey on public.k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Output: k.a, k.b",
+            "        Index Cond: (k.a = e.a)",
+        ],
+    ),
+    "analyze of a parameterized nested loop into a unique key": (
+        "RP-978:fixed",
+        _ANALYSED,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from e join k on k.a = e.a where e.a > 998",
+        [
+            "Nested Loop (actual rows=2 loops=1)",
+            "  ->  Seq Scan on e (actual rows=2 loops=1)",
+            "        Filter: (a > 998)",
+            "        Rows Removed by Filter: 998",
+            "  ->  Index Scan using k_pkey on k (actual rows=1 loops=2)",
+            "        Index Cond: (a = e.a)",
+        ],
+    ),
+    "a parameterized nested loop's inner keeps its own filter": (
+        "RP-978:fixed",
+        _ANALYSED,
+        "explain select * from e join k on k.a = e.a where e.a > 998 and k.b = 'v9'",
+        [
+            "Nested Loop  (cost=0.28..34.25 rows=1 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=2 width=7)",
+            "        Filter: (a > 998)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = e.a)",
+            "        Filter: (b = 'v9'::text)",
+        ],
+    ),
+    # Still open (RP-978): the parameterized inner read index-only, and a
+    # hashed side read through its index on a range of the key.
+    "a parameterized nested loop's inner read index-only": (
+        "RP-978",
+        _ANALYSED,
+        "explain select e.b from e join k on k.a = e.a where e.a > 998",
+        [
+            "Nested Loop  (cost=0.28..34.10 rows=2 width=3)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=2 width=7)",
+            "        Filter: (a > 998)",
+            "  ->  Index Only Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=4)",
+            "        Index Cond: (a = e.a)",
+        ],
+    ),
+    "a range on the hashed side's key reads it through its index": (
+        "RP-978",
+        _ANALYSED,
+        "explain select * from e join k on k.a = e.a where k.a < 10",
+        [
+            "Hash Join  (cost=8.54..26.18 rows=9 width=14)",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=8.43..8.43 rows=9 width=7)",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..8.43 rows=9 width=7)",
+            "              Index Cond: (a < 10)",
+        ],
+    ),
+    # A constant the class generates for the inner side's indexed column
+    # is that index scan's Index Cond, not a Filter (RP-977, fixed).
     "an equivalence class's generated constant is the inner index's cond": (
-        "RP-977",
+        "RP-977:fixed",
         _ANALYSED,
         "explain select * from e, k where e.a = k.a and e.a = 5",
         [

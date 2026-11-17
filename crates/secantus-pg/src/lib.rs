@@ -4631,6 +4631,10 @@ pub struct PgHandler {
     /// Armed with `cursor_capture` by a DECLARE over a simply updatable
     /// scan: each output row's stored `_id`, for `WHERE CURRENT OF`.
     cursor_ids: std::sync::Arc<Mutex<Option<Vec<Bson>>>>,
+    /// Armed while a cursor's rows are computed from a select list that
+    /// calls a VOLATILE function: each row's source, kept so a re-read
+    /// projects it again (RP-962).
+    cursor_sources: std::sync::Arc<Mutex<Option<SourceCapture>>>,
     /// A serial unique to this connection for the life of the process,
     /// naming the owner of an uncommitted-type view in
     /// [`INSTALLED_USER_TYPES`]. Distinct from `backend_pid`, which is
@@ -5008,6 +5012,31 @@ struct CursorState {
     /// (`PORTAL_ONE_RETURNING`, RP-905): not read-only, so a COMMIT or
     /// ROLLBACK while it is pinned is 55000 (`HoldPinnedPortals`).
     returning: bool,
+    /// How a row is projected again from its source row, when the select
+    /// list calls a VOLATILE function and the scan reads a row again by
+    /// projecting it again (`ExecScan`), as a backward FETCH and the
+    /// rewind of a WITH HOLD cursor's persisting do (RP-962). `None` once
+    /// the rows are persisted (a hold store is read back as stored).
+    reproject: Option<Arc<Reproject>>,
+    /// The source row behind each row of `rows`, from `base`, while
+    /// `reproject` is set.
+    sources: Vec<Document>,
+}
+
+/// What `project_stream_into` projects a cursor's source rows with: a row
+/// read again is projected again from its source (RP-962).
+pub(crate) struct Reproject {
+    schema: Arc<Vec<FieldInfo>>,
+    fields: Vec<String>,
+    casts: Vec<Option<secantus_pgplan::ColumnExpr>>,
+    env: RowEnv,
+}
+
+/// The source rows a cursor's run projected, and how it projected them.
+#[derive(Default)]
+pub(crate) struct SourceCapture {
+    pub(crate) docs: Vec<Document>,
+    pub(crate) spec: Option<Arc<Reproject>>,
 }
 
 /// What `WHERE CURRENT OF` needs of a cursor (RP-072): the one table it
@@ -5024,6 +5053,7 @@ impl CursorState {
     /// Drop the first `n` rows of the window, with their ids.
     fn drain_front(&mut self, n: usize) {
         self.rows.drain(..n);
+        self.sources.drain(..n.min(self.sources.len()));
         if let Some(t) = self.typed_rows.as_mut() {
             t.drain(..n.min(t.len()));
         }
@@ -5033,9 +5063,49 @@ impl CursorState {
         self.base += n;
     }
 
+    /// Keep the source rows behind `n` rows a pull computed, while they
+    /// are projected again on a re-read (RP-962); rows without their
+    /// sources end the re-projection.
+    pub(crate) fn absorb_sources(
+        &mut self,
+        reproject: Option<Arc<Reproject>>,
+        sources: Option<Vec<Document>>,
+        n: usize,
+    ) {
+        if let Some(spec) = reproject {
+            if self.base == 0 && self.rows.is_empty() && self.tail.is_none() {
+                self.reproject = Some(spec);
+            }
+        }
+        if self.reproject.is_none() {
+            return;
+        }
+        match sources {
+            Some(docs) if docs.len() == n => self.sources.extend(docs),
+            _ => {
+                self.reproject = None;
+                self.sources.clear();
+            }
+        }
+    }
+
+    /// Keep the ids of `n` rows a pull computed, for `WHERE CURRENT OF`;
+    /// rows without one each make the cursor not simply updatable, as rows
+    /// that did not come from one scan do.
+    pub(crate) fn absorb_ids(&mut self, ids: Option<Vec<Bson>>, n: usize) {
+        let Some(c) = self.current_of.as_mut() else {
+            return;
+        };
+        match ids {
+            Some(ids) if ids.len() == n => c.ids.extend(ids),
+            _ => self.current_of = None,
+        }
+    }
+
     /// Empty the window, to be read again from the start.
     fn clear_window(&mut self) {
         self.rows.clear();
+        self.sources.clear();
         self.typed_rows = Some(Vec::new());
         if let Some(c) = self.current_of.as_mut() {
             c.ids.clear();
@@ -5282,6 +5352,7 @@ impl PgHandler {
             cursor_capture: std::sync::Arc::new(Mutex::new(None)),
             cursor_run: AtomicBool::new(false),
             cursor_ids: std::sync::Arc::new(Mutex::new(None)),
+            cursor_sources: std::sync::Arc::new(Mutex::new(None)),
             session_serial: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -15098,11 +15169,34 @@ impl PgHandler {
                 if checks {
                     self.check_plpgsql_declarations(&def.name, &create_sql, &def.body)?;
                 }
+                // `make_return_stmt` refuses a RETURN's expression as it
+                // reads the RETURN, before a later error (RP-960).
+                let shape = if def.returns_set {
+                    plpgsql_fn::ReturnShape::Set
+                } else if def
+                    .all_params
+                    .iter()
+                    .any(|(_, _, mode)| mode == "o" || mode == "b" || mode == "t")
+                {
+                    plpgsql_fn::ReturnShape::OutParams
+                } else if def.is_procedure {
+                    plpgsql_fn::ReturnShape::Procedure
+                } else if def.return_type.eq_ignore_ascii_case("void")
+                    || def.return_type.eq_ignore_ascii_case("pg_catalog.void")
+                {
+                    plpgsql_fn::ReturnShape::Void
+                } else {
+                    plpgsql_fn::ReturnShape::Value
+                };
+                let (parsed, as_written) = match plpgsql_fn::return_with_value(&plain_sql, shape) {
+                    Some(e) => (Err(e), true),
+                    None => (parsed, false),
+                };
                 parsed.map_err(|e| {
                     // The scanner's position is in the body the compiler
                     // read; one the row-type rewrite moved is taken from the
                     // body as written, when it raises the same error.
-                    let at = if create_sql == plain_sql {
+                    let at = if as_written || create_sql == plain_sql {
                         e.position
                     } else {
                         plpgsql_fn::validate(&plain_sql)
@@ -15111,6 +15205,7 @@ impl PgHandler {
                             .and_then(|o| o.position)
                     };
                     let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate, e.message);
+                    info.hint = e.hint;
                     // `function_parse_error_transpose`.
                     info.position = at.and_then(|at| {
                         let (source, index) = self
@@ -31050,7 +31145,7 @@ impl PgHandler {
         // A cursor computes the rows this FETCH reaches, running its query
         // first if no FETCH has yet (RP-744, RP-897). A zero count reaches
         // only the row the cursor sits on, computed already.
-        self.fill_pending(name, direction, count)?;
+        self.fill_pending(name, direction, count, is_move)?;
         let mut cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
         let Some(cursor) = cursors.get_mut(name) else {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -36132,9 +36227,10 @@ impl PgHandler {
             // (`start_deferred_cursors`). Its row description is the
             // planner's until the run gives its own. Kept to run here: a
             // WITH HOLD cursor declared outside a block, whose transaction
-            // ends now (PostgreSQL materialises it at that commit), and a
-            // simply updatable one, whose rows' ids are captured with them.
-            if in_block && updatable.is_none() {
+            // ends now (PostgreSQL materialises it at that commit). A simply
+            // updatable one captures each row's id as the row is computed
+            // (RP-962).
+            if in_block {
                 let planned = match &*query {
                     Statement::Select(_)
                     | Statement::SetOp(_)
@@ -36198,11 +36294,16 @@ impl PgHandler {
                                 base: 0,
                                 pending: Some(pending),
                                 failed: false,
-                                current_of: None,
+                                current_of: updatable.clone().map(|table| CurrentOf {
+                                    table,
+                                    ids: Vec::new(),
+                                }),
                                 held: false,
                                 pinned: false,
                                 auto_held: false,
                                 returning: false,
+                                reproject: None,
+                                sources: Vec::new(),
                             },
                         );
                     if holdable {
@@ -36309,6 +36410,8 @@ impl PgHandler {
                             pinned: false,
                             auto_held: false,
                             returning: false,
+                            reproject: None,
+                            sources: Vec::new(),
                         },
                     );
                 if holdable {
@@ -36367,6 +36470,8 @@ impl PgHandler {
                         pinned: false,
                         auto_held: false,
                         returning: false,
+                        reproject: None,
+                        sources: Vec::new(),
                     },
                 );
             if holdable {
@@ -41962,6 +42067,22 @@ impl PgHandler {
         casts: &[Option<secantus_pgplan::ColumnExpr>],
         env: &RowEnv,
     ) -> PgWireResult<QueryResponse> {
+        self.project_rows_where(docs, None, def, columns, casts, env)
+    }
+
+    /// `project_rows`, keeping only the rows `residual` (a WHERE that did
+    /// not lower to a filter) holds for, tested as each row is streamed:
+    /// a cursor's rows are filtered as they are fetched, as PostgreSQL's
+    /// scan evaluates its qual for the row a FETCH reaches (RP-961).
+    fn project_rows_where(
+        &self,
+        docs: Vec<Document>,
+        residual: Option<secantus_pgplan::ColumnExpr>,
+        def: &TableDef,
+        columns: &[(String, String)],
+        casts: &[Option<secantus_pgplan::ColumnExpr>],
+        env: &RowEnv,
+    ) -> PgWireResult<QueryResponse> {
         let schema = Arc::new(self.row_schema(def, columns, casts));
         let mut fields: Vec<String> = columns.iter().map(|(_, f)| f.clone()).collect();
         let mut casts = casts.to_vec();
@@ -42003,7 +42124,20 @@ impl PgHandler {
             })?;
         }
         let source = stream::iter(docs.into_iter().map(Ok::<Document, PgWireError>));
-        Ok(self.project_stream(source.boxed(), schema, fields, casts, env))
+        let source = match residual {
+            None => source.boxed(),
+            Some(residual) => source
+                .filter_map(move |d| {
+                    let kept = d.and_then(|d| {
+                        let v = secantus_pgplan::apply_row_expr(&residual, &d)
+                            .map_err(|e| Self::err(&e))?;
+                        Ok((v == Bson::Boolean(true)).then_some(d))
+                    });
+                    futures::future::ready(kept.transpose())
+                })
+                .boxed(),
+        };
+        Ok(self.project_stream(source, schema, fields, casts, env))
     }
 
     /// `project_rows` over a source of documents that arrive as the rows are
@@ -42043,6 +42177,7 @@ impl PgHandler {
         // A `DECLARE CURSOR` over this SELECT arms row capture (see
         // `cursor_capture`); a plain SELECT leaves it disarmed and pays
         // only the `Option` check below -- no lock, no extra clone.
+        let own_run = capture_into.is_none();
         let ids = capture_into
             .is_none()
             .then(|| {
@@ -42062,6 +42197,26 @@ impl PgHandler {
                 .is_some();
             armed.then(|| self.cursor_capture.clone())
         });
+        // A cursor whose re-reads project again keeps each source row.
+        let sources = if own_run {
+            let mut slot = self
+                .cursor_sources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            slot.as_mut().map(|c| {
+                c.spec.get_or_insert_with(|| {
+                    Arc::new(Reproject {
+                        schema: schema.clone(),
+                        fields: fields.clone(),
+                        casts: casts.clone(),
+                        env: env.clone(),
+                    })
+                });
+                self.cursor_sources.clone()
+            })
+        } else {
+            None
+        };
         let computed: Vec<String> = (0..fields.len()).map(sort_input_key).collect();
         let rows = source.map(move |d| {
             let d = d?;
@@ -42174,6 +42329,11 @@ impl PgHandler {
             if let (Some(cap), Some(row)) = (&capture, captured) {
                 if let Some(buf) = cap.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                     buf.push(row);
+                }
+            }
+            if let Some(sources) = &sources {
+                if let Some(c) = sources.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                    c.docs.push(d);
                 }
             }
             Ok(enc.take_row())
@@ -42573,7 +42733,7 @@ impl PgHandler {
         // The rows it reaches are computed outside the cursor lock.
         if cursor.pending.is_some() {
             drop(cursors);
-            self.fill_pending(name, direction, wanted)
+            self.fill_pending(name, direction, wanted, false)
                 .map_err(Self::plan_error_of)?;
             cursors = self.cursors.lock().unwrap_or_else(|e| e.into_inner());
             let Some(again) = cursors.get_mut(name) else {
@@ -43735,9 +43895,29 @@ impl PgHandler {
                 if let Some(streamed) = self.try_stream_select(&sel, &env)? {
                     return Ok(vec![streamed]);
                 }
+                // A cursor's rows are filtered as a FETCH reaches them
+                // (RP-961): with nothing over the scan that reads every row
+                // first, its per-row WHERE is left to the row stream.
+                let mut sel = sel;
+                let residual = if self.cursor_run.load(std::sync::atomic::Ordering::Relaxed)
+                    && max_rows == 0
+                    && sel.order.is_empty()
+                    && sel.limit.is_none()
+                    && sel.offset == 0
+                    && sel.distinct == secantus_pgplan::Distinct::None
+                    && sel.windows.is_empty()
+                    && !sel.with_ties
+                    && sel.lock.is_none()
+                    && sel.lock_clauses.is_empty()
+                {
+                    sel.residual.take()
+                } else {
+                    None
+                };
                 let (docs, def) = self.select_docs(&sel, max_rows)?;
-                Ok(vec![Response::Query(self.project_rows(
+                Ok(vec![Response::Query(self.project_rows_where(
                     docs,
+                    residual,
                     &def,
                     &sel.columns,
                     &sel.casts,
@@ -46239,6 +46419,36 @@ impl PgHandler {
                                         );
                                     }
                                 }
+                                // A nested loop into the inner side's unique
+                                // key index, parameterized by the outer row
+                                // (RP-978).
+                                scan_estimate::JoinPick::NestParam { b_outer } => {
+                                    let inner_key =
+                                        explain::join_key_texts(sel).and_then(|(l, r)| {
+                                            let k = if b_outer { l } else { r };
+                                            k.split_once('.')
+                                                .map(|(a, c)| (a.to_string(), c.to_string()))
+                                        });
+                                    if let (Some((alias, column)), Some(index)) =
+                                        (inner_key, indexes[1].clone())
+                                    {
+                                        explain::price_param_nest_loop(
+                                            &mut tree,
+                                            a,
+                                            b,
+                                            join,
+                                            b_outer,
+                                            &scan_estimate::ParamScan {
+                                                index,
+                                                alias,
+                                                column,
+                                                index_only: false,
+                                                read: Vec::new(),
+                                                memoize: None,
+                                            },
+                                        );
+                                    }
+                                }
                             }
                             // A side read through its index (RP-369).
                             if tree.estimate.is_some() {
@@ -47158,7 +47368,7 @@ impl PgHandler {
                 explain::attach_join_conds(&mut tree, &join_conds, &options.join_cond_splits);
                 explain::attach_join_where(&mut tree, &options.join_where, &index_columns);
                 explain::move_param_conds(&mut tree);
-                explain::apply_implied_filters(&mut tree);
+                explain::apply_implied_filters(&mut tree, &index_columns);
                 explain::attach_scan_alias(&mut tree, &options.scan_alias);
                 explain::attach_verbose(&mut tree, &options.verbose_scan);
                 explain::attach_verbose_join(&mut tree, &options.verbose_join);

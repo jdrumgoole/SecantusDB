@@ -929,8 +929,8 @@ enum ReAtom {
     /// A set of more than one character (`.`, a bracket, `\d`): a state
     /// whose out-arcs are of several colors, or one color of several.
     Set,
-    /// A parenthesized group's alternatives.
-    Group(Vec<Vec<QuantifiedAtom>>),
+    /// A parenthesized group's alternatives, and whether it captures.
+    Group(Vec<Vec<QuantifiedAtom>>, bool),
 }
 
 /// A [`ReAtom`] and its quantifier's bounds.
@@ -1007,7 +1007,7 @@ fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String,
         fn first_char(atoms: &[QuantifiedAtom]) -> Option<char> {
             match atoms.iter().find(|a| a.2 != Some(0))? {
                 (ReAtom::Char(c), min, _) if *min > 0 => Some(*c),
-                (ReAtom::Group(alts), 1, Some(1)) => match alts.as_slice() {
+                (ReAtom::Group(alts, _), 1, Some(1)) => match alts.as_slice() {
                     [only] => first_char(only),
                     _ => None,
                 },
@@ -1036,8 +1036,8 @@ fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String,
                     }
                 }
                 ReAtom::Set => return Some(false),
-                ReAtom::Group(_) if *min == 0 => return Some(false),
-                ReAtom::Group(alts) if *max == Some(*min) => match alts.as_slice() {
+                ReAtom::Group(..) if *min == 0 => return Some(false),
+                ReAtom::Group(alts, _) if *max == Some(*min) => match alts.as_slice() {
                     [inner] => {
                         for _ in 0..*min {
                             if !walk(inner, prefix, insensitive, case_varies)? {
@@ -1060,7 +1060,30 @@ fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String,
                         return Some(false);
                     }
                 },
-                ReAtom::Group(_) => return None,
+                // A capturing group's `+` is `x*x` (`parseqatom` rewrites
+                // `x{m,}` as `x{m-1,}x`): the loop's copy and the final one
+                // both start with the group's first character, its arc
+                // going to two states -- that character, and no further
+                // (RP-423).
+                ReAtom::Group(alts, true) if *min == 1 && max.is_none() => {
+                    if let [only] = alts.as_slice() {
+                        if let Some(c) = first_char(only) {
+                            if !(insensitive && case_varies(c)) {
+                                prefix.push(c);
+                            }
+                        }
+                    }
+                    return Some(false);
+                }
+                // A non-capturing one is not rewritten: one copy, then the
+                // loop's choice.
+                ReAtom::Group(alts, false) if *min == 1 && max.is_none() => {
+                    if let [only] = alts.as_slice() {
+                        walk(only, prefix, insensitive, case_varies)?;
+                    }
+                    return Some(false);
+                }
+                ReAtom::Group(..) => return None,
             }
         }
         Some(true)
@@ -1180,7 +1203,7 @@ fn regex_atoms(
                 if let Some(i) = capture {
                     captures[i] = Some(inner.clone());
                 }
-                atoms.push((ReAtom::Group(inner), 1, Some(1)));
+                atoms.push((ReAtom::Group(inner, capture.is_some()), 1, Some(1)));
                 last_capture = capture;
                 continue;
             }
@@ -1202,7 +1225,7 @@ fn regex_atoms(
                         return None;
                     }
                     let copy = captures.get(n as usize - 1)?.clone()?;
-                    atoms.push((ReAtom::Group(copy), 1, Some(1)));
+                    atoms.push((ReAtom::Group(copy, false), 1, Some(1)));
                     last_capture = None;
                     continue;
                 }
@@ -1760,10 +1783,25 @@ mod tests {
             ("^a|b", false, Some(("", NoMatch))),
             ("a|^b", false, Some(("", NoMatch))),
             ("^a$|^b$", false, Some(("", NoMatch))),
-            // Not modelled: a group repeated at least once (`^(ab)+c` is
-            // `a`, `^a(b)+` is `ab`), an anchor inside, a back reference to an
-            // unclosed group.
-            ("^(ab)+c", false, None),
+            // A group repeated at least once: its first character's arc
+            // goes to two states (RP-423).
+            ("^(ab)+c", false, Some(("a", Partial))),
+            ("^a(b)+", false, Some(("ab", Partial))),
+            ("^(w0)+1", false, Some(("w", Partial))),
+            ("^x(ab)+", false, Some(("xa", Partial))),
+            ("^(ab)+$", false, Some(("a", Partial))),
+            ("^(a|b)+c", false, Some(("", NoMatch))),
+            ("^((ab))+c", false, Some(("a", Partial))),
+            ("^(a(b))+c", false, Some(("a", Partial))),
+            ("^(ab)+?c", false, Some(("a", Partial))),
+            // A non-capturing one is not rewritten: one copy, then the
+            // loop's choice.
+            ("^(?:ab)+c", false, Some(("ab", Partial))),
+            ("^x(?:ab)+y", false, Some(("xab", Partial))),
+            // Not modelled: a group repeated twice or more (`^(ab){2,}c`
+            // is `ab` on PostgreSQL 15.19), an anchor
+            // inside, a back reference to an unclosed group.
+            ("^(ab){2,}c", false, None),
             ("(^a)", false, None),
             ("^a\\1", false, None),
             // A back reference is a copy of the group it names, as

@@ -1757,11 +1757,37 @@ a regression test.
       than one relation; a node under a Hash, Sort or Material returns only
       the columns needed above, `CP_SMALL_TLIST`), its quals and keys
       printed with `unqualified = false`.
-      An inner index scan's `Filter` reading both relations (`e left join
-      k on e.a < k.a and e.b <> k.b`, `Filter: (e.b <> k.b)`) is still
-      printed plain.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a nested loop whose inner filter reads both relations]
+      (Since 2026-11-17 an inner index scan's `Filter` reading both
+      relations, an ON comparison, prints prefixed: `VerboseRel::join_quals`.)
+      (Since 2026-11-17 a hash join with a WHERE conjunct comparing a
+      column of each relation prints it as its `Join Filter`, its columns
+      in the Hash's `Output`: `VerboseJoin::join_filter`.) (Since 2026-11-17 a nested loop does too:
+      into a parameterised index scan the comparison is that scan's
+      `Filter`, prefixed, and over a Materialize it joins the ON's
+      conjuncts in the one `Join Filter`.) (Since 2026-11-17 a WHERE
+      comparison of an expression with the other relation's column does
+      too, as an inner `Index Cond` or a `Join Filter`, both already
+      prefixed: `VerboseJoin::unprinted_filter`.) Still the plain plan:
+      such an expression evaluated as the parameterised inner index
+      scan's `Filter` (`on e.a < k.a where e.a + k.a < 7`, PostgreSQL's
+      `Filter: ((e.a + k.a) < 7)`): `join_quals` holds only
+      column-to-column texts, so `attach_verbose_nested_loop` declines.
+      The fix is to print each cross-relation conjunct with a Printer
+      over both relations' scopes, bare for the scan's own columns, in
+      place of the hand-built `join_quals` strings.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of an inner index scan filtering an expression of both]
       Backlog-ID: RP-966
+
+- [ ] **A hash join whose WHERE compares an expression of one relation
+      with the other's column is priced at zero.** `explain select e.b
+      from e join k on e.a = k.a where length(k.b) <> e.a` (both tables
+      analysed, 1000 rows) prints `Hash Join  (cost=0.00..0.00 rows=0
+      width=0)` and zero costs on every node below it; PostgreSQL 15.19
+      prints `Hash Join  (cost=27.50..45.14 rows=999 width=3)` over scans
+      costed `0.00..15.00 rows=1000`. Found while working RP-966; the
+      same query with a column-to-column WHERE is priced.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash join with an expression join filter is priced]
+      Backlog-ID: RP-1039
 
 
 - [ ] **EXPLAIN ANALYZE's scan counters PostgreSQL prints that are still
@@ -1841,36 +1867,18 @@ a regression test.
       `select * from s left join (e join k on e.a < k.a) on s.a = e.a and
       k.b = 'v3'` is PostgreSQL's `Hash Right Join` with `s` hashed and a
       `Materialize` over `k`; here a `Hash Left Join` hashing the inner
-      join. The same inner join alone (`e join k on k.a = e.a where e.a >
-      998`) prints no estimate either: a range on the join key of a hash
-      join is not priced. Its rows are right. Measured on a private 15.19
-      cluster (found while working RP-393 and RP-397).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends]
+      join. Since 2026-11-17 the same inner join alone (`e join k on k.a =
+      e.a where e.a > 998`) is PostgreSQL's nested loop into `k_pkey`
+      parameterized by the outer row, priced (`JoinPick::NestParam`, drawn
+      by `explain::price_param_nest_loop`), where the unique-key path
+      search (`unique_key_other_paths`) picks it with no Memoize. Still
+      zeros there: that inner read index-only (`select e.b from e join k
+      ...`), and a range on the hashed side's key that reads it through
+      its index (`where k.a < 10`, PostgreSQL's `Hash Join (cost=8.54..26.18
+      rows=9 width=14)` over an `Index Scan using k_pkey`). Measured on a
+      private 15.19 cluster (found while working RP-393 and RP-397).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends], tests/backlog/test_rp_explain_costs.py::test_plan[a parameterized nested loop's inner read index-only], tests/backlog/test_rp_explain_costs.py::test_plan[a range on the hashed side's key reads it through its index]
       Backlog-ID: RP-978
-- [ ] **A nested loop into an index prints no estimate where the inner
-      side's own range on the indexed key joins its Index Cond.**
-      PostgreSQL 15.19 plans `explain select * from e left join k on e.a <
-      k.a and k.a > 2` (`e`, `k` 1,000 analysed rows, `k.a` the primary
-      key) as `Nested Loop Left Join (cost=0.28..10320.00 rows=332667
-      width=14)` over `Index Scan using k_pkey on k (cost=0.28..6.98
-      rows=333 width=7)` with `Index Cond: ((a > e.a) AND (a > 2))`; here
-      zeros over two Seq Scans and a `Join Filter: (e.a < k.a)`. A `<>` of
-      the inner side's own is that scan's Filter since RP-918; a bound is
-      an index qual, which `costsize::param_range_index_scan` refuses
-      beside the join clause. Its rows are right. Measured on a private
-      15.19 cluster (found while working RP-918).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index with a range of the inner side]
-      Backlog-ID: RP-979
-- [ ] **A constant an equivalence class generates for a join's inner
-      index scan is a Filter, not its Index Cond.** `select * from e, k
-      where e.a = k.a and e.a = 5` (`k.a` the primary key) is, on
-      PostgreSQL 15.19, a Nested Loop whose `Index Scan using k_pkey on k`
-      has `Index Cond: (a = 5)` (`generate_base_implied_equalities` gives
-      k its own `k.a = 5`, which the index takes); here the same scan
-      prints `Filter: (a = 5)`. The costs and rows match. Measured on a
-      private 15.19 cluster (found while working RP-402).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an equivalence class's generated constant is the inner index's cond]
-      Backlog-ID: RP-977
 - [ ] **EXPLAIN prints no estimate for a join over a scan filtered by an
       expression.** Since RP-404 a comparison of integer or text arithmetic
       with a constant, and a LIKE / ILIKE of an analysed string column, are
@@ -1886,7 +1894,10 @@ a regression test.
       overloads differ in `procost`; a regex whose prefix walk is not
       modelled (a group repeated other than at most once, an anchor inside
       a group, embedded options). A back reference is walked as a copy of
-      the group it names since 2026-11-17, as the regex compiler copies it. Since 2026-11-17 an
+      the group it names since 2026-11-17, as the regex compiler copies it,
+      and since 2026-11-17 a group repeated `+` (a capturing one is
+      `parseqatom`'s `x*x`, its prefix the group's first character; a
+      non-capturing one a whole copy). Since 2026-11-17 an
       inner ON join whose WHERE pushes expression comparisons to its sides
       prices each side as that scan's residual
       (`ExplainOptions::join_expr_quals`, `hash_side_with`), and since
@@ -1895,9 +1906,9 @@ a regression test.
       reads; since 2026-11-17 a LEFT join whose WHERE compares only
       preserved-side expressions (`preserved_exprs`), and an inner ON
       join whose WHERE holds inequalities over both tables, its Join
-      Filter (`where_join_filters`). A regex with a repeated group
-      (`select * from w where c ~ '^(w0)+1'`) is `Seq Scan on w
-      (cost=0.00..18.50 rows=101 width=10)` there and zeros here. Measured
+      Filter (`where_join_filters`). A regex with a group repeated twice
+      or more (`select * from w where c ~ '^(w0){2,}1'`) is `Seq Scan on w
+      (cost=0.00..18.50 rows=1 width=10)` there and zeros here. Measured
       on the 15.19 reference on port 5415 (found while working RP-404 and
       RP-354). The repeated group's prefix is not a walk of the regex's
       text: `pg_regprefix` reads the NFA after `regc_nfa.c`'s `optimize`
@@ -1909,7 +1920,7 @@ a regression test.
       `repeat`'s arcs gives (`aba`). The faithful fix ports `regcomp.c` /
       `regc_nfa.c`'s NFA build and optimisation and runs `findprefix` on
       it (2026-11-17, sized while working RP-841).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with a repeated group]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with a group repeated twice or more]
       Backlog-ID: RP-423
 - [ ] **A semi join cheaper unique-ified keeps the semi join's shape.**
       Since RP-411's first slice (2026-11-16) a WHERE that is one
@@ -1941,20 +1952,6 @@ a regression test.
       (`sublink_join::split_where`).
       Backlog-ID: RP-411
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sublink anded with an outer expression qual is planned as a join]
-- [ ] **A hash join of two tables never analysed is unpriced, and its
-      sides stay in written order.** `hash_side` prices a side only from
-      `analysed_key`, which needs `pg_statistic` rows. PostgreSQL 15.19
-      prices it anyway: each table at its default size (1,270 rows for an
-      empty or unvacuumed one), `eqjoinsel` from `get_variable_numdistinct`
-      (the 200 default, a unique column's row count). So `explain select *
-      from k, e where k.a = e.a` over fresh `e(a int, b text)` (10 rows) and
-      `k(a int primary key, b text)` is `Hash Join (cost=38.58..64.62
-      rows=1270 width=72)`, `Hash Cond: (e.a = k.a)`, `e` outer and `k`
-      hashed; here unpriced, `k` outer. The same plan is a DELETE ...
-      USING's. Measured on a private 15.19 cluster (found while working
-      RP-435).
-      Verify: tests/backlog/test_rp_dml_from.py::test_explain_prints_the_join
-      Backlog-ID: RP-1019
 - [ ] **An aggregate above an InitPlan's scan is a Subquery Scan.** Since
       RP-440's first slices (2026-11-16) a SELECT over one relation whose WHERE
       compares columns with uncorrelated FROM-less scalar subqueries plans
@@ -2567,37 +2564,17 @@ tests are scenarios in `tests/backlog/test_rp_batch26.py`.
 
 Measured on a private PostgreSQL 15.19 cluster.
 
-- [ ] **A syntax error in a PL/pgSQL expression is placed at the end of
-      the statement, not in the body.** `check_sql_expr` parses each
-      expression as the compiler reads it, and the error is placed at the
-      expression's token, transposed into the statement: on PostgreSQL
-      15.19 `do $$ declare x int := 1 +; begin null; end $$` is `syntax
-      error at end of input` at 27; here it is at 47. And `do $$ begin
-      perform 1 +; end $$` is the same error at 24 there, found at compile;
-      here it has no position, found when the PERFORM runs (CONTEXT
-      `PL/pgSQL function inline_code_block line 1 at PERFORM`). A CREATE
-      FUNCTION's (75 and 79) are placed since RP-621, which transposes the
-      scanner's `internalpos`; a DO block's error is not transposed yet
-      (RP-492 a DO's grammar errors).
-      Verify: tests/backlog/test_rp_found_rp619.py::test_expression_syntax_error_is_placed_in_the_body
-      Backlog-ID: RP-958
-- [ ] **A DO block refuses PL/pgSQL's `#` compile options.**
-      `plpgsql_compile_inline` reads a DO body with the function grammar,
-      so `do $$ #variable_conflict use_column\n begin null; end $$` and
-      `#print_strict_params on` before a DECLARE run on PostgreSQL 15.19.
-      Here both are 42601 `syntax error at or near "#"` at 7 (`pl::parse`
-      refuses the `#` before the body reaches the interpreter).
-      Verify: tests/backlog/test_rp_found_rp619.py::test_do_block_takes_compile_options
-      Backlog-ID: RP-959
-- [ ] **A RETURN with a value in a routine returning void is accepted.**
-      `make_return_stmt` refuses it as it reads the RETURN, before the
-      expression is parsed: on PostgreSQL 15.19 `do $$ begin return 1; end
-      $$` is 42804 `RETURN cannot have a parameter in function returning
-      void` at 20, `return 1 +;` the same, and a `returns void` function's
-      `return 1 +;` the same at 73. Here the first runs, and the other two
-      are 42601 `syntax error at end of input` (31, 76).
-      Verify: tests/backlog/test_rp_found_rp619.py::test_return_with_a_value_in_a_void_routine
-      Backlog-ID: RP-960
+- [ ] **A CREATE FUNCTION's compile error without a position has no
+      compile context.** An error PL/pgSQL's grammar raises without a
+      scanner position is framed `compilation of PL/pgSQL function "<name>"
+      near line N` (`plpgsql_compile_error_callback`): on PostgreSQL 15.19
+      `create function u958() returns void language plpgsql as $$ begin
+      raise unknown_thing; end $$` is 42704 `unrecognized exception
+      condition "unknown_thing"` with CONTEXT `compilation of PL/pgSQL
+      function "u958" near line 1`. Here the CONTEXT is missing. A DO block
+      has it since RP-958 (`do_compile_error`).
+      Verify: tests/backlog/test_rp_found_rp619.py::test_create_function_compile_error_has_context
+      Backlog-ID: RP-1040
 
 ## Found while working RP-573 (2026-11-08)
 
@@ -2634,54 +2611,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap tests are in
 `tests/backlog/test_rp_found_rp732.py`.
 
-
-## Found while working RP-744 (2026-11-12)
-
-Measured on PostgreSQL 15.19: the VALUES-only statements on the shared
-reference on port 5415, the ones that create a function, a sequence or a
-table on a private cluster. The gap tests are in
-`tests/backlog/test_rp_found_rp744.py`. Since RP-744, RP-895, RP-896 and
-RP-897 a cursor runs its query at the first FETCH and computes its select
-list as it is fetched (`portal_stream::PendingRows`); these are the shapes
-still computed whole, and the cursor answers that differ either way.
-
-- [ ] **A cursor reads a row again without computing it again.** Since
-      RP-744 the rows a cursor has computed are kept and read back, so a
-      `nextval` in its select list is drawn once per row. PostgreSQL 15.19
-      reads a row again by running the plan again: on a SCROLL cursor
-      over `select nextval('s') from generate_series(1, 4)`, `fetch 2`,
-      `fetch backward 1`, `fetch first` and `fetch 2` answer 1 2, 3, 4,
-      5 6, where this server answers 1 2, 1, 1, 2 3. A WITH HOLD cursor
-      is persisted at COMMIT by rewinding and running the query whole
-      (`PersistHoldablePortal`): after `fetch 1` and COMMIT, `currval` is
-      4 and `fetch all` answers 3 4 (here 3, and 2 3). Needs the
-      re-read to re-run the plan for a volatile select list, as
-      `ExecutorRewind` and a backward scan do. Found while working RP-895
-      (2026-11-14).
-      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_recomputes_a_volatile_column_when_it_reads_a_row_again
-      Backlog-ID: RP-962
-- [ ] **`select * from cursor_to_xml(...)` reads the cursor twice.** The
-      call in FROM fetches `count` rows twice: on a cursor over
-      `generate_series(1, 4)`, `select * from cursor_to_xml('c', 1, false,
-      true, '')` answers row 2 and the FETCH after it row 3, where
-      PostgreSQL 15.19 answers row 1 and then row 2, as `select
-      cursor_to_xml(...)` does here. A function in FROM looks to be run
-      once more than it is called (when planned and when run); a call
-      with a side effect is the case that shows it. Found while working
-      RP-895 (2026-11-14).
-      Verify: tests/backlog/test_rp_found_rp744.py::test_cursor_to_xml_in_from_reads_the_cursor_once
-      Backlog-ID: RP-963
-- [ ] **A cursor's WHERE is evaluated for every row at its first FETCH.**
-      Since RP-897 a cursor's query runs at the first FETCH that needs a
-      row (`portal_stream::PendingRows::Unstarted`), but the executor
-      evaluates the whole WHERE when it runs: `declare c cursor for select
-      k from (values (1), (2), (0)) s(k) where 10/k > 1` raises 22012 at
-      `fetch 1`, where PostgreSQL 15.19 filters as it is fetched and
-      answers `1`, then `2`, and the third FETCH raises. Needs the scan's
-      filter run in the row stream, as the select list is since RP-744.
-      Found while working RP-897 (2026-11-14).
-      Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursors_where_filters_as_it_is_fetched
-      Backlog-ID: RP-961
 
 ## Found while working RP-782 (2026-11-10)
 

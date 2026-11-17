@@ -35,7 +35,9 @@ pub fn clamp_row_est(n: f64) -> f64 {
     if n <= 1.0 {
         1.0
     } else {
-        n.round()
+        // `rint` in the default rounding mode: a half to the even
+        // neighbour (1270 * 1270 / 200 = 8064.5 is 8064 rows, RP-1019).
+        n.round_ties_even()
     }
 }
 
@@ -621,12 +623,14 @@ pub fn fuzzily_cheaper(new: (f64, f64), old: (f64, f64)) -> bool {
 /// (`btcostestimate`'s `indexBoundQuals` stop at the leading column
 /// without a qual), so every scan reads the whole index and checks each
 /// entry against the quals. `(startup, total)`.
+#[allow(clippy::too_many_arguments)]
 pub fn param_range_index_scan(
     rel: &Rel,
     index: &Index,
     column: &str,
     quals: &[(String, Qual)],
     bounds: &[bool],
+    own_sel: f64,
     arg_ops: f64,
     loop_count: f64,
 ) -> Option<(f64, f64)> {
@@ -634,15 +638,19 @@ pub fn param_range_index_scan(
         || bounds.is_empty()
         || !index.columns.iter().any(|c| c == column)
         // A `<>` on an index column is no index qual, only a filter of
-        // each row fetched (RP-918); any other would join the Index Cond.
-        || quals
-            .iter()
-            .any(|(f, q)| index.columns.contains(f) && !matches!(q, Qual::Ne))
+        // each row fetched (RP-918); a constant bound of `column` joins the
+        // Index Cond, `own_sel` its selectivity (RP-979), as a join clause
+        // never pairs into a range with it (`clauselist_selectivity`).
+        || quals.iter().any(|(f, q)| {
+            index.columns.contains(f)
+                && !matches!(q, Qual::Ne)
+                && !(f == column && matches!(q, Qual::Range(_)))
+        })
     {
         return None;
     }
     let mut quals = quals.to_vec();
-    let mut sel = 1.0;
+    let mut sel = own_sel;
     for lower in bounds {
         quals.push((column.to_string(), Qual::Range(*lower)));
         sel *= 1.0 / 3.0;
@@ -1874,14 +1882,14 @@ mod tests {
             later: Vec::new(),
         };
         let (startup, total) =
-            param_range_index_scan(&rel, &ix, "a", &[], &[true], 0.0, 100.0).unwrap();
+            param_range_index_scan(&rel, &ix, "a", &[], &[true], 1.0, 0.0, 100.0).unwrap();
         assert_eq!((startup, total), (0.275, 6.5025));
         // `explain select * from e left join k on e.a < k.a and e.a > k.a`
         // over the same `k` and 1,000 rows of `e`: `Index Cond: ((a >
         // e.a) AND (a < e.a))`, a ninth of the rows a scan, prints
         // `cost=0.28..2.53` on PostgreSQL 15.19 (RP-354).
         let (startup, total) =
-            param_range_index_scan(&rel, &ix, "a", &[], &[true, false], 0.0, 1000.0).unwrap();
+            param_range_index_scan(&rel, &ix, "a", &[], &[true, false], 1.0, 0.0, 1000.0).unwrap();
         assert_eq!(
             (format!("{startup:.2}"), format!("{total:.2}")),
             ("0.28".to_string(), "2.53".to_string())
@@ -1893,7 +1901,7 @@ mod tests {
         // PostgreSQL 15.19, the loop's 1,000 rescans 2.50 more than `e.a <
         // k.a`'s (RP-354).
         let (startup, total) =
-            param_range_index_scan(&rel, &ix, "a", &[], &[true], 1.0, 1000.0).unwrap();
+            param_range_index_scan(&rel, &ix, "a", &[], &[true], 1.0, 1.0, 1000.0).unwrap();
         assert_eq!(
             (format!("{startup:.2}"), format!("{total:.2}")),
             ("0.28".to_string(), "6.14".to_string())
@@ -1943,12 +1951,12 @@ mod tests {
             later: Vec::new(),
         };
         let (startup, total) =
-            param_range_index_scan(&rel, &ix, "y", &[], &[true], 0.0, 1000.0).unwrap();
+            param_range_index_scan(&rel, &ix, "y", &[], &[true], 1.0, 0.0, 1000.0).unwrap();
         assert_eq!(
             (format!("{startup:.2}"), format!("{total:.2}")),
             ("0.28".to_string(), "11.14".to_string())
         );
         // A column the index does not hold is no index qual.
-        assert!(param_range_index_scan(&rel, &ix, "z", &[], &[true], 0.0, 1000.0).is_none());
+        assert!(param_range_index_scan(&rel, &ix, "z", &[], &[true], 1.0, 0.0, 1000.0).is_none());
     }
 }

@@ -902,6 +902,100 @@ pub fn validate(create_sql: &str) -> Result<(), PlError> {
     parsed(create_sql).map(|_| ())
 }
 
+/// What a routine returns, as `make_return_stmt` sorts it to decide
+/// whether a RETURN may carry an expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnShape {
+    /// `fn_retset`: SETOF or RETURNS TABLE.
+    Set,
+    /// Returns `void` (a DO block too).
+    Void,
+    /// A procedure without output parameters.
+    Procedure,
+    /// Output parameters make the result.
+    OutParams,
+    /// A RETURN takes an expression.
+    Value,
+}
+
+/// `make_return_stmt`'s refusal of an expression after RETURN in a
+/// routine that cannot return one (RP-960). The grammar raises it as it
+/// reads the RETURN, before the expression is parsed, so it comes before
+/// any later error in the body and after any earlier one: a RETURN counts
+/// only when the body up to it is a prefix the grammar accepts. The
+/// position is the 1-based character in the body of the token after the
+/// RETURN (`yylloc`).
+pub fn return_with_value(create_sql: &str, shape: ReturnShape) -> Option<PlError> {
+    use pg_query::protobuf::Token;
+    let (sqlstate, message, hint) = match shape {
+        ReturnShape::Value => return None,
+        ReturnShape::Set => (
+            "42804",
+            "RETURN cannot have a parameter in function returning set",
+            Some("Use RETURN NEXT or RETURN QUERY."),
+        ),
+        ReturnShape::Void => (
+            "42804",
+            "RETURN cannot have a parameter in function returning void",
+            None,
+        ),
+        ReturnShape::Procedure => (
+            "42601",
+            "RETURN cannot have a parameter in a procedure",
+            None,
+        ),
+        ReturnShape::OutParams => (
+            "42804",
+            "RETURN cannot have a parameter in function with OUT parameters",
+            None,
+        ),
+    };
+    let (offset, body) = row_type::body_of(create_sql)?;
+    let tokens: Vec<(usize, usize, String)> = pg_query::scan(body)
+        .ok()?
+        .tokens
+        .iter()
+        .filter(|t| t.token != Token::SqlComment as i32 && t.token != Token::CComment as i32)
+        .filter_map(|t| {
+            let (start, end) = (t.start as usize, t.end as usize);
+            Some((start, end, body.get(start..end)?.to_ascii_lowercase()))
+        })
+        .collect();
+    for (i, (_, end, text)) in tokens.iter().enumerate() {
+        if text != "return" {
+            continue;
+        }
+        let opens_statement = i > 0
+            && matches!(
+                tokens[i - 1].2.as_str(),
+                ";" | "begin" | "then" | "else" | "loop" | ">>"
+            );
+        let Some((next_start, _, next)) = tokens.get(i + 1) else {
+            continue;
+        };
+        if !opens_statement || matches!(next.as_str(), ";" | "next" | "query") {
+            continue;
+        }
+        let reached = format!(
+            "{}{} ;{}",
+            &create_sql[..offset],
+            &body[..*end],
+            &create_sql[offset + body.len()..]
+        );
+        match validate(&reached) {
+            Err(e) if !e.message.ends_with("at end of input") => return None,
+            _ => {}
+        }
+        let mut err = PlError::new(sqlstate, message.to_string());
+        err.hint = hint.map(String::from);
+        err.position = u32::try_from(body[..*next_start].chars().count() + 1)
+            .ok()
+            .and_then(std::num::NonZeroU32::new);
+        return Some(err);
+    }
+    None
+}
+
 /// A variable a DECLARE section (or a cursor's argument list) declares:
 /// its line in the body, its name as PL/pgSQL records it, and its type's
 /// text exactly as written (libpg_query keeps `read_datatype`'s source

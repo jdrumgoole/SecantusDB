@@ -199,8 +199,8 @@ fn merge_join_plan(
     let osort = input(outer, outer_by_index)?;
     let isort = input(inner, inner_by_index)?;
     let (outer_path_rows, inner_path_rows) = (outer.rows.max(1.0), inner.rows.max(1.0));
-    let outer_skip_rows = (outer_path_rows * os).round();
-    let inner_skip_rows = (inner_path_rows * is).round();
+    let outer_skip_rows = (outer_path_rows * os).round_ties_even();
+    let inner_skip_rows = (inner_path_rows * is).round_ties_even();
     let outer_rows = clamp_row_est(outer_path_rows * oe);
     let inner_rows = clamp_row_est(inner_path_rows * ie);
     // Readjusted for the rounding above.
@@ -725,7 +725,7 @@ fn hash_join_core(
             let match_frac = sel * filter_sel;
             (match_frac, (match_frac * inner.rows / match_frac).max(1.0))
         });
-        let matched = (outer.rows * match_frac).round();
+        let matched = (outer.rows * match_frac).round_ties_even();
         let scan_frac = 2.0 / (match_count + 1.0);
         run += clause_cost(outer, inner)
             * matched
@@ -865,8 +865,8 @@ pub fn merge_join_sorted(
 ) -> MergePlan {
     let (outer_path_rows, inner_path_rows) = (outer.rows.max(1.0), inner.rows.max(1.0));
     let (os, oe, is, ie) = scansel;
-    let outer_skip_rows = (outer_path_rows * os).round();
-    let inner_skip_rows = (inner_path_rows * is).round();
+    let outer_skip_rows = (outer_path_rows * os).round_ties_even();
+    let inner_skip_rows = (inner_path_rows * is).round_ties_even();
     let outer_rows = clamp_row_est(outer_path_rows * oe);
     let inner_rows = clamp_row_est(inner_path_rows * ie);
     // Readjusted for the rounding above.
@@ -1229,6 +1229,7 @@ pub fn limit_choice_of(paths: &[(f64, f64)], rows: f64, count: f64, offset: f64)
             rows,
             rescan: (startup, total),
             req_outer: 0,
+            memoized: false,
         })
         .collect();
     limit_choice(&choices, rows, count, offset)
@@ -1309,6 +1310,7 @@ fn nest_loop_pathlist_with(
                             b_path: DEFAULT_INPUT,
                             rows: 0.0,
                             req_outer: 0,
+                            memoized: false,
                             rescan: (startup, total),
                         },
                         startup_counts,
@@ -1495,6 +1497,9 @@ struct JoinPath {
     req_outer: u32,
     /// What reading it again costs (`cost_rescan`): `(startup, total)`.
     rescan: (f64, f64),
+    /// A nested loop whose inner is a Memoize of its parameterized scan
+    /// (`get_memoize_path`).
+    memoized: bool,
 }
 
 /// `JoinChoice::a_path` / `b_path` for a path built from a `JoinSide`
@@ -1727,6 +1732,8 @@ pub struct JoinChoice {
     pub rescan: (f64, f64),
     /// The tables (a bit each) it needs from an outer side; 0 for none.
     pub req_outer: u32,
+    /// A nested loop whose inner is a Memoize of its parameterized scan.
+    pub memoized: bool,
 }
 
 impl JoinPath {
@@ -1742,6 +1749,7 @@ impl JoinPath {
             rows: self.rows,
             rescan: self.rescan,
             req_outer: self.req_outer,
+            memoized: self.memoized,
         }
     }
 }
@@ -1951,6 +1959,7 @@ impl JoinRel {
                     b_path: DEFAULT_INPUT,
                     rows: 0.0,
                     req_outer: 0,
+                    memoized: false,
                     rescan: (startup, total + extra),
                 },
                 startup_counts,
@@ -2069,6 +2078,7 @@ impl JoinRel {
                     b_path: DEFAULT_INPUT,
                     rows: 0.0,
                     req_outer: 0,
+                    memoized: false,
                     rescan: (startup, total + extra),
                 },
                 startup_counts,
@@ -2603,6 +2613,7 @@ impl JoinRel {
             ppi.push((req, r));
             r
         };
+        let memo_flag = std::cell::Cell::new(false);
         let mut consider = |(startup, total): (f64, f64),
                             order: Option<usize>,
                             method: JoinMethod,
@@ -2625,6 +2636,7 @@ impl JoinRel {
                     b_path: ids.1,
                     rows: path_rows,
                     req_outer,
+                    memoized: memo_flag.get(),
                     rescan: rescan.unwrap_or((startup, total + extra)),
                 },
                 startup_counts,
@@ -2744,6 +2756,7 @@ impl JoinRel {
                         if let Some(key) = memo {
                             let m = memoize(ip, &key, op.rows, inner.width);
                             if let Some(req) = nest_req(&m) {
+                                memo_flag.set(true);
                                 consider(
                                     nestloop_cost(op, &m, unique, false, q),
                                     op.class,
@@ -2752,6 +2765,7 @@ impl JoinRel {
                                     None,
                                     req,
                                 );
+                                memo_flag.set(false);
                             }
                         }
                     }
@@ -2889,6 +2903,7 @@ impl JoinRel {
                     b_path,
                     rows,
                     req_outer: 0,
+                    memoized: false,
                     rescan: rescan.unwrap_or((startup, total + extra)),
                 },
                 startup_counts,
@@ -3010,6 +3025,7 @@ pub fn base_pathlist(cands: &[InPath], startup_counts: bool) -> Option<(Vec<usiz
                 b_path: DEFAULT_INPUT,
                 rows: c.rows,
                 req_outer: c.req_outer,
+                memoized: false,
                 rescan: c.rescan,
             },
             startup_counts,
@@ -3103,6 +3119,7 @@ pub fn ordered_limit_choice(
                     b_path: DEFAULT_INPUT,
                     rows,
                     req_outer: 0,
+                    memoized: false,
                     rescan: (startup, total),
                 },
                 true,
@@ -3164,6 +3181,7 @@ pub fn limit_choice(paths: &[JoinChoice], rows: f64, count: f64, offset: f64) ->
                 b_path: DEFAULT_INPUT,
                 rows: count_rows.max(1.0),
                 req_outer: 0,
+                memoized: false,
                 rescan: (startup, total),
             },
             true,
@@ -3904,6 +3922,7 @@ mod tests {
             rows: 212_242.0,
             rescan: (0.0, 699_250.20),
             req_outer: 0,
+            memoized: false,
         };
         let hash = JoinChoice {
             startup: 120.0,

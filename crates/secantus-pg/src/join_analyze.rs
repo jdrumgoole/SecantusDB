@@ -425,7 +425,7 @@ impl PgHandler {
         sel: &secantus_pgplan::Select,
         actual: usize,
     ) {
-        if !tree.details.is_empty() || tree.inner_unique {
+        if !tree.details.is_empty() {
             return;
         }
         let left = match tree.name.as_str() {
@@ -502,6 +502,13 @@ impl PgHandler {
         let (Some(col), Some(param_alias)) = (col, param_alias) else {
             return;
         };
+        // An inner side unique on its equality to the outer row (RP-978)
+        // finds at most one row a loop, which the scan below counts as
+        // PostgreSQL's executor returns it; any other unique inner is not
+        // modelled.
+        if tree.inner_unique && !quals.iter().any(|(op, _, _)| *op == "=") {
+            return;
+        }
         // The relation the parameters come from.
         let (outer_table, outer_alias) = match &chain {
             None => match filtered_seq_scan(&tree.children[0]) {

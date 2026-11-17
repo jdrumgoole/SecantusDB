@@ -6549,6 +6549,10 @@ pub struct VerboseRel {
     /// Each WHERE conjunct over this relation alone, as the plain plan
     /// prints its scan's `Filter` and as VERBOSE prints it, prefixed.
     pub quals: Vec<(String, String)>,
+    /// Each ON comparison as the plain plan prints it when this relation's
+    /// scan evaluates it as a `Filter` (its own column bare, the other
+    /// side's prefixed), and as VERBOSE prints it, both prefixed.
+    pub join_quals: Vec<(String, String)>,
 }
 
 /// `EXPLAIN VERBOSE` of a SELECT joining two relations on an ON of
@@ -6563,6 +6567,12 @@ pub struct VerboseJoin {
     /// Every ON clause is an equality (a hash join's keys); otherwise
     /// some are other comparisons, which only a nested loop serves.
     pub all_equal: bool,
+    /// The WHERE holds a comparison of a column of each relation, which
+    /// the join evaluates as its `Join Filter`.
+    pub join_filter: bool,
+    /// A cross-relation WHERE conjunct is not a comparison of two columns,
+    /// so no `join_quals` entry can prefix it as an inner scan's `Filter`.
+    pub unprinted_filter: bool,
 }
 
 /// [`VerboseJoin`] for `SELECT <columns or *> FROM a [LEFT] JOIN b ON
@@ -6637,6 +6647,7 @@ pub fn explain_verbose_join(
         }
     };
     let mut needed: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+    let mut join_quals: [Vec<(String, String)>; 2] = [Vec::new(), Vec::new()];
     let mut need = |i: usize, col: &str| {
         if !needed[i].iter().any(|c| c == col) {
             needed[i].push(col.to_string());
@@ -6703,12 +6714,37 @@ pub fn explain_verbose_join(
         if li == ri {
             return None;
         }
+        let op = op.unwrap_or_default();
+        let side_text = |i: usize, c: &str, own: usize| {
+            if i == own {
+                q(c)
+            } else {
+                format!("{}.{}", q(&sides[i].0), q(c))
+            }
+        };
+        let full = format!(
+            "({}.{} {op} {}.{})",
+            q(&sides[li].0),
+            q(&lc),
+            q(&sides[ri].0),
+            q(&rc)
+        );
+        for own in [0usize, 1] {
+            let plain = format!(
+                "({} {op} {})",
+                side_text(li, &lc, own),
+                side_text(ri, &rc, own)
+            );
+            join_quals[own].push((plain, full.clone()));
+        }
         need(li, &lc);
         need(ri, &rc);
     }
     // The WHERE: each conjunct a restriction of one relation, which its
     // scan evaluates as its `Filter`; its columns are not needed above.
     let mut quals: [Vec<(String, String)>; 2] = [Vec::new(), Vec::new()];
+    let mut join_filter = false;
+    let mut unprinted_filter = false;
     if let Some(w) = s.where_clause.as_deref() {
         let none_lookup = |_: &str| None;
         let none_views = |_: &str| None;
@@ -6742,6 +6778,89 @@ pub fn explain_verbose_join(
             let i = match (print(part, 0, true), print(part, 1, true)) {
                 (Some(_), None) => 0,
                 (None, Some(_)) => 1,
+                (None, None) => {
+                    // A comparison of a column of each relation: the
+                    // join's `Join Filter`, its columns needed above.
+                    let Some(N::AExpr(a)) = part.node.as_ref() else {
+                        return None;
+                    };
+                    if a.kind() != pg_query::protobuf::AExprKind::AexprOp {
+                        return None;
+                    }
+                    let col = |n: &Option<Box<Node>>| match n.as_deref()?.node.as_ref() {
+                        Some(N::ColumnRef(c)) => resolve(c),
+                        _ => None,
+                    };
+                    let (Some((li, lc)), Some((ri, rc))) = (col(&a.lexpr), col(&a.rexpr)) else {
+                        // An expression of one relation compared with the
+                        // other's (`length(e.b) < k.a`): its columns are
+                        // needed above, and its text is printed already
+                        // prefixed or as an `Index Cond` (RP-966).
+                        let mut refs = Vec::new();
+                        let mut subquery = false;
+                        let mut copy = part.clone();
+                        crate::walk_expr(&mut copy, &mut |n| {
+                            match n.node.as_ref() {
+                                Some(N::ColumnRef(c)) => refs.push(c.clone()),
+                                Some(N::SubLink(_)) => subquery = true,
+                                _ => {}
+                            }
+                            Ok(())
+                        })
+                        .ok()?;
+                        if subquery {
+                            return None;
+                        }
+                        let refs: Vec<(usize, String)> =
+                            refs.iter().map(&resolve).collect::<Option<_>>()?;
+                        if !refs.iter().any(|r| r.0 == 0) || !refs.iter().any(|r| r.0 == 1) {
+                            return None;
+                        }
+                        for (i, c) in &refs {
+                            need(*i, c);
+                        }
+                        join_filter = true;
+                        unprinted_filter = true;
+                        continue;
+                    };
+                    if li == ri {
+                        return None;
+                    }
+                    // A parameterised inner scan evaluates it as its
+                    // `Filter`, as it does an ON comparison (RP-966).
+                    let op = a.name.iter().find_map(|n| match n.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    });
+                    if let Some(op @ ("=" | "<" | ">" | "<=" | ">=" | "<>")) = op {
+                        let side_text = |i: usize, c: &str, own: usize| {
+                            if i == own {
+                                q(c)
+                            } else {
+                                format!("{}.{}", q(&sides[i].0), q(c))
+                            }
+                        };
+                        let full = format!(
+                            "({}.{} {op} {}.{})",
+                            q(&sides[li].0),
+                            q(&lc),
+                            q(&sides[ri].0),
+                            q(&rc)
+                        );
+                        for own in [0usize, 1] {
+                            let plain = format!(
+                                "({} {op} {})",
+                                side_text(li, &lc, own),
+                                side_text(ri, &rc, own)
+                            );
+                            join_quals[own].push((plain, full.clone()));
+                        }
+                    }
+                    need(li, &lc);
+                    need(ri, &rc);
+                    join_filter = true;
+                    continue;
+                }
                 _ => return None,
             };
             quals[i].push((print(part, i, true)?, print(part, i, false)?));
@@ -6768,12 +6887,15 @@ pub fn explain_verbose_join(
                 .collect(),
             refname: q(refname),
             quals: quals[i].clone(),
+            join_quals: join_quals[i].clone(),
         }
     };
     Some(VerboseJoin {
         rels: [rel(0), rel(1)],
         output,
         all_equal,
+        join_filter,
+        unprinted_filter,
     })
 }
 
