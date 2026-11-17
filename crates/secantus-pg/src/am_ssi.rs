@@ -73,6 +73,18 @@ fn hint_for(table: &str) -> Option<ScanHint> {
     HINTS.with(|h| h.borrow().iter().rev().find(|x| x.table == table).cloned())
 }
 
+/// Whether a column carries a collation of its own that does not order
+/// by bytes, as the model orders text: `C`, `POSIX` and `C.UTF-8` compare
+/// bytewise (`lc_collate_is_c`, and UTF-8 byte order is code point order).
+fn own_collation_not_bytewise(c: &&secantus_pgcatalog::Column) -> bool {
+    c.extra.get_str("collation").is_ok_and(|coll| {
+        !matches!(
+            coll.trim_matches('"'),
+            "C" | "POSIX" | "C.UTF-8" | "default"
+        )
+    })
+}
+
 /// A GIN index this models: array columns under `array_ops`, scalar
 /// columns under `btree_gin`'s opclasses, `jsonb`
 /// columns under `jsonb_ops` or `jsonb_path_ops`, `tsvector` columns
@@ -919,10 +931,7 @@ impl crate::PgHandler {
             let keys: Vec<(String, String, bool)> = match &exprs {
                 Some(exprs) => {
                     // An expression's collation comes from its inputs.
-                    let collated = def
-                        .columns
-                        .iter()
-                        .any(|c| c.extra.contains_key("collation"));
+                    let collated = def.columns.iter().any(|c| own_collation_not_bytewise(&c));
                     exprs
                         .iter()
                         .map(|e| {
@@ -950,13 +959,7 @@ impl crate::PgHandler {
                         continue;
                     };
                     cols.iter()
-                        .map(|c| {
-                            (
-                                c.field(),
-                                c.pg_type.clone(),
-                                c.extra.contains_key("collation"),
-                            )
-                        })
+                        .map(|c| (c.field(), c.pg_type.clone(), own_collation_not_bytewise(c)))
                         .collect()
                 }
             };

@@ -944,11 +944,11 @@ def test_btree_gin_index_shapes_have_their_pages(pg: Any, case: str) -> None:
     assert got == ("ok", [(pages,)])
 
 
-@pytest.mark.backlog("RP-287")
+@pytest.mark.backlog_fixed("RP-287")
 def test_a_collated_btree_gin_index_has_its_pages(pg: Any) -> None:
-    """A btree_gin index over a column with its own collation is not
-    modelled (the model orders text by bytes only): PostgreSQL 15.19 sizes
-    this one at 14 pages; here `pg_relation_size` reads 0."""
+    """A btree_gin index over a column collated "C" (which orders by bytes,
+    as the model does) was left unmodelled and read 0 from
+    `pg_relation_size`; PostgreSQL 15.19 sizes it at 14 pages."""
     got = _in_block(
         pg,
         [
@@ -958,6 +958,24 @@ def test_a_collated_btree_gin_index_has_its_pages(pg: Any) -> None:
             "create index rp287_bci on rp287_bc using gin (a)",
         ],
         "select pg_relation_size('rp287_bci') / 8192",
+    )
+    assert got == ("ok", [(14,)])
+
+
+@pytest.mark.backlog("RP-287")
+def test_a_linguistically_collated_btree_gin_index_has_its_pages(pg: Any) -> None:
+    """A btree_gin index over a column collated "en_US" is not modelled
+    (the model orders text by bytes only): PostgreSQL 15.19 sizes this one
+    at 14 pages; here `pg_relation_size` reads 0."""
+    got = _in_block(
+        pg,
+        [
+            "create extension if not exists btree_gin",
+            'create table rp287_bu (a text collate "en_US")',
+            "insert into rp287_bu select 'v' || (g % 500) from generate_series(1, 20000) g",
+            "create index rp287_bui on rp287_bu using gin (a)",
+        ],
+        "select pg_relation_size('rp287_bui') / 8192",
     )
     assert got == ("ok", [(14,)])
 
