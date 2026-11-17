@@ -800,18 +800,20 @@ one beside it.
     index's backward scan, or a nested loop over one, is in its order
     (`Search::merge_asc`); `--desc --then m0.c` 1,665 of 1,665 (789 of 810
     before), `--desc --then "m1.c desc, m0.b"` 18 differences (33), the
-    18 not diagnosed. Declined still (the join planned for every row and
-    sorted, as before): a first key NULLS FIRST against its direction's
-    default with a key after it, whose order no merge and no index scan
-    gives (`--nulls-first --then m1.c`: 10 differences, all LEFT joins of
-    3,000 rows with the index; `--desc-nulls-last --then "m0.c desc"` 776
-    of 810, 758 before); a descending first key a LEFT join NULL-extends
+    18 not diagnosed. Since 2026-11-17 an ASC NULLS FIRST first key with
+    keys after it is searched too, under `Search::merge_asc`: no merge and
+    no index scan is in its order, so the plan is the cheapest under a
+    bounded Sort (`--nulls-first --then m1.c`, `--then m0.c`, `--then
+    "m1.c desc, m0.b"`: 810 of 810 each, 10 differences before). Declined
+    still (the join planned for every row and sorted, as before): a DESC
+    NULLS LAST first key with a key after it (`--desc-nulls-last --then
+    "m0.c desc"` 776 of 810, 758 before); a descending first key a LEFT join NULL-extends
     or no clause reads (`ORDER_CLASS`), with a key after it; a later key a
     WHERE may fix to a constant; a table with an index of several columns;
     and a two-table join with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_nulls_first_key_with_another_sorts_the_whole_join
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_desc_nulls_last_key_with_another_sorts_the_merge
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

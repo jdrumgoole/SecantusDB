@@ -1336,7 +1336,9 @@ impl PgHandler {
             // merge with that key's side outer sorts both sides descending
             // (`Search::order_desc`, `select_outer_pathkeys_for_merge`).
             let desc_outer = match &search.order {
-                Some((key, ORDER_CLASS)) if search.order_desc || search.order_nulls_first => {
+                Some((key, ORDER_CLASS))
+                    if (search.order_desc || search.order_nulls_first) && !search.merge_asc =>
+                {
                     (clause.a_key == *key, clause.b_key == *key)
                 }
                 _ => (false, false),
@@ -1875,7 +1877,7 @@ impl PgHandler {
         later.is_empty()
             || Self::order_class(&search, &chain, first).is_some_and(|class| {
                 self.later_order_keys_modelled(&search, first, class, later)
-                    .is_some_and(|n| n == 0 || !(nulls_first || (desc && class == ORDER_CLASS)))
+                    .is_some_and(|n| n == 0 || !(desc && (nulls_first || class == ORDER_CLASS)))
             })
     }
 
@@ -1982,10 +1984,10 @@ impl PgHandler {
                     // (`Search::merge_asc`); NULLS FIRST against the default,
                     // and a key no inner join's clause makes a class of
                     // (`ORDER_CLASS`), are not modelled.
-                    if n > 0 && (nulls_first || (desc && class == ORDER_CLASS)) {
+                    if n > 0 && desc && (nulls_first || class == ORDER_CLASS) {
                         return Ok(None);
                     }
-                    search.merge_asc = n > 0 && desc;
+                    search.merge_asc = n > 0 && (desc || nulls_first);
                     order_keys = n;
                 }
             }

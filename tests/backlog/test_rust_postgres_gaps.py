@@ -2839,15 +2839,15 @@ def test_a_descending_first_key_with_another_reads_an_index_backward(pg: Any) ->
     assert got == ("ok", [(125, 6), (20, 6), (55, 6), (90, 6), (160, 6)])
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_nulls_first_key_with_another_sorts_the_whole_join(pg: Any) -> None:
     """PostgreSQL 15.19, two 3,000-row tables never analysed, an index on
     t1.a: `t0 LEFT JOIN t1 ON t0.b = t1.a ORDER BY t1.a NULLS FIRST, t1.c
     LIMIT 5` is a bounded Sort over a Merge Right Join reading that index,
     which leaves the NULL-extended rows 63, 861, 1148, 2569, 2877 first. A
     NULLS FIRST first key with a key after it is no merge's order and no
-    index scan's, which the search declines, and the join it plans instead
-    leaves 28, 14, 21, 7, 35."""
+    index scan's; the search declined it, and the join it planned instead
+    left 28, 14, 21, 7, 35."""
     pg.execute("begin")
     try:
         _rp028_tables(pg, "rp028_n", 2, 3000)
@@ -2861,6 +2861,30 @@ def test_a_nulls_first_key_with_another_sorts_the_whole_join(pg: Any) -> None:
     finally:
         pg.execute("rollback")
     assert got == ("ok", [(63, None), (861, None), (1148, None), (2569, None), (2877, None)])
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_desc_nulls_last_key_with_another_sorts_the_merge(pg: Any) -> None:
+    """PostgreSQL 15.19, two 3,000-row tables never analysed, an index on
+    t1.a: `t0 JOIN t1 ON t0.b = t1.a ORDER BY t1.a DESC NULLS LAST, t0.c
+    DESC LIMIT 5` is a bounded Sort over a Merge Join reading that index
+    backward (its DESC NULLS FIRST, of use for merging only), which leaves
+    2554, 839, 2939, 1434, 2169. A DESC NULLS LAST first key with a key
+    after it is declined by the search, and the join it plans instead
+    leaves 1224, 1784, 1259, 1749, 174."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_d", 2, 3000)
+        pg.execute("create index on rp028_d1 (a)")
+        got = pg_answer(
+            pg,
+            "select rp028_d0.a, rp028_d1.a from rp028_d0"
+            " join rp028_d1 on rp028_d0.b = rp028_d1.a"
+            " order by rp028_d1.a desc nulls last, rp028_d0.c desc limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", [(2554, 6), (839, 6), (2939, 6), (1434, 6), (2169, 6)])
 
 
 @pytest.mark.backlog_fixed("RP-028")
