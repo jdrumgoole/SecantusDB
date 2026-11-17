@@ -3308,7 +3308,11 @@ pub(crate) fn attach_verbose_join(
     let Some(v) = join else {
         return;
     };
-    if !root.name.starts_with("Hash ") || join_type_of(&root.name).is_none() {
+    if root.name.starts_with("Nested Loop") {
+        attach_verbose_nested_loop(root, v);
+        return;
+    }
+    if !v.all_equal || !root.name.starts_with("Hash ") || join_type_of(&root.name).is_none() {
         return;
     }
     let [outer, hash] = root.children.as_mut_slice() else {
@@ -3350,6 +3354,66 @@ pub(crate) fn attach_verbose_join(
     inner.details.insert(0, ("Output".into(), needed));
     root.details
         .insert(0, ("Output".into(), v.output.join(", ")));
+}
+
+/// `EXPLAIN VERBOSE` of a two-relation nested loop whose inner side is a
+/// parameterised index scan (RP-966): both scans return their physical
+/// target list (no Hash or Material above them asks for `CP_SMALL_TLIST`),
+/// and the inner scan's `Index Cond` prefixes its own column, as
+/// PostgreSQL 15.19 prints `Index Cond: (k.a > e.a)`. Any other nested
+/// loop prints as without VERBOSE.
+fn attach_verbose_nested_loop(
+    root: &mut PlanNode,
+    v: &secantus_pgplan::ruleutils::VerboseJoin,
+) {
+    if !root.details.is_empty() || root.children.len() != 2 {
+        return;
+    }
+    let rel_of = |n: &PlanNode| -> Option<usize> {
+        if !is_scan_name(&n.name) || !n.children.is_empty() {
+            return None;
+        }
+        v.rels
+            .iter()
+            .position(|r| n.name.ends_with(&format!(" on {}", r.plain)))
+    };
+    let (Some(o), Some(i)) = (rel_of(&root.children[0]), rel_of(&root.children[1])) else {
+        return;
+    };
+    if o == i || !root.children[0].details.is_empty() {
+        return;
+    }
+    // The inner scan's only detail is `Index Cond: (<its column> <op> <outer ref>)`.
+    let inner_rel = &v.rels[i];
+    let mut cond = None;
+    for (k, text) in &root.children[1].details {
+        if k != "Index Cond" || cond.is_some() {
+            return;
+        }
+        let Some(body) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
+            return;
+        };
+        let Some((col, rest)) = body.split_once(' ') else {
+            return;
+        };
+        let qualified = format!("{}.{col}", inner_rel.refname);
+        if !inner_rel.columns.contains(&qualified) || !rest.contains('.') {
+            return;
+        }
+        cond = Some(format!("({qualified} {rest})"));
+    }
+    let Some(cond) = cond else {
+        return;
+    };
+    for (n, idx) in [(0usize, o), (1, i)] {
+        let r = &v.rels[idx];
+        let node = &mut root.children[n];
+        let at = node.name.len() - r.plain.len();
+        node.name = format!("{}{}", &node.name[..at], r.relation);
+        node.details.insert(0, ("Output".into(), r.columns.join(", ")));
+    }
+    root.children[1].details[1].1 = cond;
+    root.details.insert(0, ("Output".into(), v.output.join(", ")));
 }
 
 /// A single-relation plan's scan names the relation's alias after it, as

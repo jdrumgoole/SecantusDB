@@ -1743,16 +1743,18 @@ a regression test.
       and the Sorts and Limits above it, each with the scan's `Output` and
       its `Sort Key` qualified; and a hash join of two relations on column
       equalities with no WHERE prints every node's `Output` and its `Inner
-      Unique` (RP-966, in part: `ruleutils::explain_verbose_join`,
-      `explain::attach_verbose_join`). Every other join does not: PostgreSQL
-      15.19 prints a Nested Loop's, a Merge Join's, its Materialize's and
-      Memoize's `Output` likewise (`select e.b, k.b from e join k on e.a <
-      k.a`: `Output: e.b, k.b` on the Nested Loop, `Output: e.a, e.b` on the
-      outer Seq Scan, which returns its physical target list, `Output: k.a,
-      k.b` on the inner index scan and its `Index Cond: (k.a > e.a)`
-      prefixed); here the plain plan. Nor does a join with a WHERE (its
-      scans' quals prefixed), an ON that is not column equalities, or
-      three or more relations; nor a Sort on a computed key (`order by a+1`
+      Unique`, and a nested loop of two relations whose inner side is a
+      parameterised index scan prints both scans' physical `Output` and the
+      `Index Cond` prefixed (RP-966, in part:
+      `ruleutils::explain_verbose_join`, `explain::attach_verbose_join`,
+      `explain::attach_verbose_nested_loop`). Every other join does not:
+      PostgreSQL 15.19 prints a Merge Join's, its Materialize's and
+      Memoize's `Output` likewise, and a nested loop's `Join Filter`
+      prefixed; here the plain plan. Nor does a join with a WHERE (its
+      scans' quals prefixed, and the scan under the Hash returns its
+      `needed` columns in `reltarget` order, select list first: `Output:
+      e.b, e.a`), an ON that is not column comparisons, or three or more
+      relations; nor a Sort on a computed key (`order by a+1`
       prints `Output: a, ((a + 1))` and `Sort Key: ((k.a + 1))` over a scan
       whose `Output: a, (a + 1)`): `attach_verbose` declines a key that is
       not a bare column. Where to build it: every node's targetlist
@@ -1760,7 +1762,7 @@ a regression test.
       than one relation; a node under a Hash, Sort or Material returns only
       the columns needed above, `CP_SMALL_TLIST`), its quals and keys
       printed with `unqualified = false`.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop's nodes print their output under verbose]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join with a where prints its output under verbose]
       Backlog-ID: RP-966
 
 
