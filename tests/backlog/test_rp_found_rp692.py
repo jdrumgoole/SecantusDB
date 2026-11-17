@@ -200,14 +200,27 @@ def test_an_intersect_over_a_distinct_input_puts_the_smaller_input_first(dsn: st
     assert got == [("1.000",)]
 
 
+@pytest.mark.backlog_fixed("RP-841")
+def test_an_intersect_over_a_having_input_puts_the_smaller_input_first(dsn: str) -> None:
+    """`select max(x) from t692j group by k having max(x) > 0 intersect
+    select 1.000` is `1.000` on PostgreSQL 15.19: `cost_agg` scales the
+    groups by the HAVING's selectivity (1/3 for an inequality over an
+    aggregate), still more than the constant's one. Here it was `1.0`: an
+    aggregate with a HAVING was not estimated."""
+    with _connect(dsn) as c:
+        got = _text(
+            c, "select max(x) from t692j group by k having max(x) > 0 intersect select 1.000"
+        )
+    assert got == [("1.000",)]
+
+
 @pytest.mark.backlog("RP-841")
 @pytest.mark.parametrize(
     "query",
     [
-        "select max(x) from t692j group by k having max(x) > 0 intersect select 1.000",
         "select a.x from t692j a join t692j b on a.k = b.k where a.x > 0 intersect select 1.000",
     ],
-    ids=["having", "join with a where"],
+    ids=["join with a where"],
 )
 def test_an_intersect_over_another_unestimated_input_puts_the_smaller_input_first(
     dsn: str, query: str

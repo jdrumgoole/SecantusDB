@@ -2953,12 +2953,15 @@ its first input gave.
       WHERE) with no WHERE besides (`join_input_estimate`; three or more
       tables, `join_chain_input_estimate`, only over tables never
       analysed, each equivalence class's members joined in table order),
-      an aggregate over one user table with no HAVING, grouped by
-      plain columns or not, and (since 2026-11-17) a DISTINCT over any of
-      those leaves, its rows its groups. It leaves any other input -- a
-      join with a WHERE, a chain over an analysed table, a HAVING (whose
-      rows PostgreSQL scales by the qual's selectivity in `cost_agg`, 1/3
-      for `max(x) > 0`), a GROUP BY expression, a computed column, a FROM
+      an aggregate over one user table, grouped by plain columns or not,
+      and (since 2026-11-17) a DISTINCT over any of those leaves, its rows
+      its groups, and an aggregate's HAVING over aggregates, its groups
+      scaled by the qual's default selectivity as `cost_agg` scales them
+      (`having_selectivity`; two inequalities over one aggregate, a range
+      pair, are not modelled). It leaves any other input -- a join with a
+      WHERE (`a.x > 0` beside the join's equality), a chain over an
+      analysed table, a HAVING over a grouping column (which PostgreSQL
+      moves to the WHERE), a GROUP BY expression, a computed column, a FROM
       subquery other than VALUES, a catalog -- in the written order,
       hashed. Measured on
       the 15.19 reference on port 5415.
@@ -3007,3 +3010,13 @@ statement is VALUES-only and runs there as written. The gap test is in
       planner's selectivity estimate falls back the same way.
       Verify: tests/backlog/test_rp_found_rp423.py::test_a_back_reference_outside_a_where
       Backlog-ID: RP-1022
+- [ ] **`clamp_row_est` rounds a half away from zero.** PostgreSQL 15.19's
+      `clamp_row_est` is `rint`, ties to even: `select max(x) from hv group
+      by k having max(x) <> 5` over 300 groups (`hv(x numeric, k int)`,
+      3,000 rows, `k = g % 300`, analysed) is `HashAggregate (... rows=298
+      ...)`, 300 x 0.995 = 298.5. `costsize::clamp_row_est` uses
+      `f64::round`, which makes it 299; every estimate that lands on an
+      exact half with an even integer part is one row high. Measured on
+      the 15.19 reference on port 5415.
+      Verify: none -- no EXPLAIN this server prints reaches an exact half yet (its HashAggregate over a HAVING prints zeros); `setop_order::tests::having_selectivity_is_postgres` notes the case
+      Backlog-ID: RP-1023
