@@ -83,7 +83,7 @@ _CREATE_AND_DB_STATS = {
 }
 
 
-@pytest.mark.backlog("RM-602")
+@pytest.mark.backlog_fixed("RM-602")
 def test_create_and_db_stats_refused_as_they_parse_never_run(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
@@ -92,8 +92,8 @@ def test_create_and_db_stats_refused_as_they_parse_never_run(
     not a connection's first command (6788700), writes no `Slow query` line
     and no profile entry. A `listDatabases` on another database than
     `admin` is refused once it has parsed: logged, not counted. This server
-    parses these inside the run, so it counts each, and logs the first
-    seven."""
+    parsed these inside the run, so it counted each, and logged the first
+    seven, until RM-602 parsed them ahead of the run."""
     answers = {
         name: (_ran(rust_mongo, False, on, cmd), _ran(mongod_rs, True, on, cmd))
         for name, (on, cmd) in _CREATE_AND_DB_STATS.items()

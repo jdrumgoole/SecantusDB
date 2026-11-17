@@ -1807,6 +1807,7 @@ fn parse_before_locks(
         }
         "aggregate" => aggregate::parse(doc, db, false).map(drop),
         "count" => crud::count_parse(doc),
+        "create" => admin::create_parse(doc),
         "findAndModify" | "findandmodify" => findandmodify::parse(doc),
         "createIndexes" => argtypes::require_index_specs(doc),
         "dropIndexes" | "deleteIndexes" => admin::drop_indexes_parse(doc).map(drop),
@@ -1959,6 +1960,17 @@ fn dispatch_inner(
                 return e.into_reply();
             }
             ctx.parsed = true;
+            // `listDatabases` on another database than `admin` is refused
+            // once it has parsed: logged, but not a connection's first
+            // command (measured 8.2.11, RM-602).
+            if name == "listDatabases" && ctx.db_name != "admin" {
+                return CommandError::new(
+                    13,
+                    "Unauthorized",
+                    "listDatabases may only be run against the admin database.",
+                )
+                .into_reply();
+            }
             // Auth gating + RBAC run after CommandNotFound but before the
             // handler (mirrors `commands.py::dispatch`), so an unknown command
             // is still `59` rather than `13` even under `--auth`.

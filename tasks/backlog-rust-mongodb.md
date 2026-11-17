@@ -782,24 +782,6 @@ These are explicit non-goals. Don't add them without a reason.
       2026-11-13.
       Verify: tests/backlog/test_rm_found_2026_11_13_rm495.py::test_a_line_names_the_collection_a_command_works_through
       Backlog-ID: RM-596
-- [ ] **A `create` or `dbStats` refused for a field runs before it is
-      refused.** mongod 8.2.11 refuses a `create` with an unknown or
-      mistyped field (`bogus`, `storageEngine: 1`, `viewOn: 1`,
-      `autoIndexId`) or a `size` out of range, and a `dbStats` with an
-      unknown field or a `scale` that is not a number, as the command
-      parses: not a connection's first command (6788700), no `Slow query`
-      line. This server parses them in the handler's run, so it counts and
-      logs each. RM-386 moved the parse of `find`, the writes, `aggregate`,
-      `count`, `findAndModify`, `getMore`, `killCursors`, `drop`,
-      `listCollections`, `listIndexes`, `createIndexes`,
-      `renameCollection` and `explain` ahead of the run
-      (`parse_before_locks`); `create`'s checks interleave parse and run
-      (its capped 72s and `viewOn`/`pipeline` types), so its split needs a
-      probe of each check. A `listDatabases` on a database other than
-      `admin` (13) also counts, where mongod's does not. Found while
-      working RM-386, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm386.py::test_create_and_db_stats_refused_as_they_parse_never_run
-      Backlog-ID: RM-602
 - [ ] **A nested pipeline's unknown stage is "not supported", and a
       `$unionWith` `pipeline: 1` runs.** mongod 8.2.11 parses the pipeline
       of a `$facet`, a `$lookup` and a `$unionWith` with the command's own
