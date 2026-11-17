@@ -4221,43 +4221,44 @@ impl PgHandler {
         let width = |table: &str, fields: &[String]| -> Option<i64> {
             Some(self.scan_estimate(table, &Document::new(), fields)?.0 .3)
         };
+        let join_width = |j: &secantus_pgplan::joins::JoinRows| -> Option<i64> {
+            fn leaves<'a>(n: &'a JoinNode, out: &mut Vec<&'a JoinNode>) -> Option<()> {
+                match n {
+                    JoinNode::Leaf { .. } => out.push(n),
+                    JoinNode::Join { left, right, .. } => {
+                        leaves(left, out)?;
+                        leaves(right, out)?;
+                    }
+                    _ => return None,
+                }
+                Some(())
+            }
+            let mut found = Vec::new();
+            leaves(&j.tree, &mut found)?;
+            let mut total = 0;
+            for leaf in found {
+                let JoinNode::Leaf { plan, def, columns } = leaf else {
+                    return None;
+                };
+                let Statement::Select(scan) = plan.as_ref() else {
+                    return None;
+                };
+                let table = self.lookup(&scan.table)?;
+                let above: Vec<String> = columns
+                    .iter()
+                    .filter(|(key, _)| j.project.is_none() || j.needed.contains(key))
+                    .map(|(_, f)| {
+                        let c = def.columns.iter().find(|c| c.field() == *f)?;
+                        table.field_of(&c.name)
+                    })
+                    .collect::<Option<_>>()?;
+                total += width(&scan.table, &above)?;
+            }
+            Some(total)
+        };
         match stmt {
             Statement::Select(sel) => match sel.sub.as_ref().map(|s| s.plan.as_ref()) {
-                Some(Statement::JoinRows(j)) => {
-                    fn leaves<'a>(n: &'a JoinNode, out: &mut Vec<&'a JoinNode>) -> Option<()> {
-                        match n {
-                            JoinNode::Leaf { .. } => out.push(n),
-                            JoinNode::Join { left, right, .. } => {
-                                leaves(left, out)?;
-                                leaves(right, out)?;
-                            }
-                            _ => return None,
-                        }
-                        Some(())
-                    }
-                    let mut found = Vec::new();
-                    leaves(&j.tree, &mut found)?;
-                    let mut total = 0;
-                    for leaf in found {
-                        let JoinNode::Leaf { plan, def, columns } = leaf else {
-                            return None;
-                        };
-                        let Statement::Select(scan) = plan.as_ref() else {
-                            return None;
-                        };
-                        let table = self.lookup(&scan.table)?;
-                        let above: Vec<String> = columns
-                            .iter()
-                            .filter(|(key, _)| j.project.is_none() || j.needed.contains(key))
-                            .map(|(_, f)| {
-                                let c = def.columns.iter().find(|c| c.field() == *f)?;
-                                table.field_of(&c.name)
-                            })
-                            .collect::<Option<_>>()?;
-                        total += width(&scan.table, &above)?;
-                    }
-                    Some(total)
-                }
+                Some(Statement::JoinRows(j)) => join_width(j),
                 Some(_) => None,
                 // One table excluded before its width is set
                 // (`relation_excluded_by_constraints` ahead of
@@ -4267,6 +4268,14 @@ impl PgHandler {
                 None => None,
             },
             Statement::Aggregate(agg) if agg.sub.is_none() && agg.join.is_none() => Some(0),
+            // A join made dummy under an aggregate keeps the columns the
+            // aggregate reads, as one under a select does.
+            Statement::Aggregate(agg) if agg.join.is_none() => {
+                match agg.sub.as_ref().map(|s| s.plan.as_ref()) {
+                    Some(Statement::JoinRows(j)) => join_width(j),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -5347,6 +5356,82 @@ pub(crate) fn count_agg_estimate(input: Estimate, n: usize) -> Estimate {
     let (_, in_total, rows, _) = input;
     let startup = in_total + CPU_OPERATOR_COST * n as f64 * rows;
     (startup, startup + CPU_TUPLE_COST, 1.0, 8 * n as i64)
+}
+
+/// A plain Aggregate's estimate over `input` (RP-420): `cost_agg`'s
+/// AGG_PLAIN with `get_agg_clause_costs`' sums. Each aggregate's
+/// transition function (`procost` 1) runs once a row and its final
+/// function, where `pg_aggregate` names one, once at the end, both at
+/// startup; the one row costs `cpu_tuple_cost`. The width is each
+/// result type's `get_typavgwidth`. `None` for an aggregate whose
+/// `pg_aggregate` row is not resolved here: one over an expression, a
+/// DISTINCT, a FILTER, an ORDER BY, or a function outside the list below.
+pub(crate) fn plain_agg_estimate(
+    input: Estimate,
+    items: &[secantus_pgplan::AggItem],
+) -> Option<Estimate> {
+    use secantus_pgplan::AggFunc;
+    const CPU_OPERATOR_COST: f64 = 0.0025;
+    const CPU_TUPLE_COST: f64 = 0.01;
+    if items.is_empty() {
+        return None;
+    }
+    let facts = crate::catalog_facts::builtin();
+    // `find_compatible_agg` shares one state, and one final call, between
+    // identical calls; each still has its own output column.
+    let (mut finals, mut width) = (0usize, 0i64);
+    let mut seen: Vec<(AggFunc, Option<&str>)> = Vec::new();
+    let mut distinct_calls = 0usize;
+    for it in items {
+        if it.expr.is_some()
+            || it.expr2.is_some()
+            || it.field2.is_some()
+            || it.distinct
+            || it.filter.is_some()
+            || !it.order.is_empty()
+        {
+            return None;
+        }
+        let (name, args): (&str, Vec<i64>) = match it.func {
+            AggFunc::CountStar => ("count", Vec::new()),
+            // `count("any")`.
+            AggFunc::Count => ("count", vec![2276]),
+            f => {
+                let name = match f {
+                    AggFunc::Sum => "sum",
+                    AggFunc::Avg => "avg",
+                    AggFunc::Min => "min",
+                    AggFunc::Max => "max",
+                    AggFunc::BoolAnd => "bool_and",
+                    AggFunc::BoolOr => "bool_or",
+                    _ => return None,
+                };
+                let ty = secantus_pgplan::pgtypes::oid_of_name(it.source_type.as_deref()?)?;
+                (name, vec![ty])
+            }
+        };
+        let oid = facts.procs_by_name.get(name)?.iter().copied().find(|o| {
+            facts
+                .procs
+                .get(o)
+                .is_some_and(|p| p.kind == 'a' && p.args == args)
+        })?;
+        let (_, fin, _) = facts.aggregates.get(&oid).copied()?;
+        let call = (it.func, it.field.as_deref());
+        if !seen.contains(&call) {
+            seen.push(call);
+            distinct_calls += 1;
+            if fin != 0 {
+                finals += 1;
+            }
+        }
+        width += type_width(&secantus_pgplan::aggregate_item_type(it), -1);
+    }
+    let (_, in_total, rows, _) = input;
+    let startup = in_total
+        + CPU_OPERATOR_COST * distinct_calls as f64 * rows
+        + CPU_OPERATOR_COST * finals as f64;
+    Some((startup, startup + CPU_TUPLE_COST, 1.0, width))
 }
 
 /// A HashAggregate's estimate for a GROUP BY of `ncols` keys with `n`

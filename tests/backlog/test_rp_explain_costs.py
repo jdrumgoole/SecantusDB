@@ -4479,12 +4479,54 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # (`cost_agg` AGG_PLAIN over no rows): a sum's transition and final
     # functions, not only a count's (found while working RP-420).
     "a sum over a dummy relation is priced": (
-        "RP-420",
+        "RP-420:fixed",
         _ANALYSED,
         "explain select sum(a) from e where a = null",
         [
             "Aggregate  (cost=0.00..0.01 rows=1 width=8)",
             "  ->  Result  (cost=0.00..0.00 rows=0 width=0)",
+            "        One-Time Filter: false",
+        ],
+    ),
+    # Each result type's width, duplicate aggregates kept in the width
+    # (found while working RP-420).
+    "an avg, a min and a max over a dummy relation are priced": (
+        "RP-420:fixed",
+        _ANALYSED,
+        "explain select avg(a), min(b), max(a) from e where a = null",
+        [
+            "Aggregate  (cost=0.00..0.01 rows=1 width=68)",
+            "  ->  Result  (cost=0.00..0.00 rows=0 width=0)",
+            "        One-Time Filter: false",
+        ],
+    ),
+    "repeated aggregates over a dummy relation are priced": (
+        "RP-420:fixed",
+        _ANALYSED,
+        "explain select sum(a), avg(a), avg(a), avg(a), avg(a), avg(a) from e where a = null",
+        [
+            "Aggregate  (cost=0.00..0.01 rows=1 width=168)",
+            "  ->  Result  (cost=0.00..0.00 rows=0 width=0)",
+            "        One-Time Filter: false",
+        ],
+    ),
+    "a count over a dummy join is priced": (
+        "RP-420:fixed",
+        _ANALYSED,
+        "explain select count(*) from e x join e y on x.a = y.a where x.a = null",
+        [
+            "Aggregate  (cost=0.00..0.01 rows=1 width=8)",
+            "  ->  Result  (cost=0.00..0.00 rows=0 width=0)",
+            "        One-Time Filter: false",
+        ],
+    ),
+    "a sum over a dummy join keeps the join's width": (
+        "RP-420:fixed",
+        _ANALYSED,
+        "explain select sum(x.a), max(y.b) from e x join e y on x.a = y.a where x.a = null",
+        [
+            "Aggregate  (cost=0.00..0.01 rows=1 width=40)",
+            "  ->  Result  (cost=0.00..0.00 rows=0 width=7)",
             "        One-Time Filter: false",
         ],
     ),

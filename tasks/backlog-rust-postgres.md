@@ -1991,20 +1991,6 @@ a regression test.
       RP-435).
       Verify: tests/backlog/test_rp_dml_from.py::test_explain_prints_the_join
       Backlog-ID: RP-1019
-- [ ] **An aggregate other than a count over a dummy relation prints no
-      estimate.** Since RP-409 a WHERE that folds to constant false plans a
-      `Result` with `One-Time Filter: false`, costing nothing, as
-      PostgreSQL 15.19 does; a dummy join's Result keeps the width of the
-      columns the join carries, one table's is width 0, a count Aggregate
-      above it is priced (`dummy_width`, `scan_estimate.rs`), and since
-      2026-11-17 so are a Sort over one table's (its select list at its
-      types' widths) and an UPDATE's Result (the assigned columns and
-      `ctid`; `dummy_target_width`). Still open: any aggregate other than a
-      count, and a count over a dummy join, both priced zeros here.
-      Measured on the 15.19 reference on port 5415 (found while working
-      RP-409).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sum over a dummy relation is priced]
-      Backlog-ID: RP-420
 - [ ] **An aggregate above an InitPlan's scan is a Subquery Scan.** Since
       RP-440's first slices (2026-11-16) a SELECT over one relation whose WHERE
       compares columns with uncorrelated FROM-less scalar subqueries plans

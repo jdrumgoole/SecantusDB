@@ -46921,23 +46921,9 @@ impl PgHandler {
                         }
                     }
                     if let (Some(_), Statement::Aggregate(agg)) = (width, inner.as_ref()) {
-                        let counts = !agg.items.is_empty()
-                            && agg.items.iter().all(|it| {
-                                matches!(
-                                    it.func,
-                                    secantus_pgplan::AggFunc::CountStar
-                                        | secantus_pgplan::AggFunc::Count
-                                ) && it.expr.is_none()
-                                    && it.expr2.is_none()
-                                    && it.field2.is_none()
-                                    && !it.distinct
-                                    && it.filter.is_none()
-                                    && it.order.is_empty()
-                            });
                         if tree.name == "Aggregate"
                             && tree.children.len() == 1
                             && tree.children[0].name == "Result"
-                            && counts
                             && agg.group_by.is_empty()
                             && agg.grouping_sets.is_none()
                             && agg.groupings.is_empty()
@@ -46950,8 +46936,9 @@ impl PgHandler {
                                 .enumerate()
                                 .all(|(i, (_, c))| *c == secantus_pgplan::OutputCol::Agg(i))
                         {
-                            tree.estimate =
-                                Some(scan_estimate::count_agg_estimate(result, agg.items.len()));
+                            if let Some(e) = scan_estimate::plain_agg_estimate(result, &agg.items) {
+                                tree.estimate = Some(e);
+                            }
                         }
                     }
                 }
