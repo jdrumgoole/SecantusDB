@@ -3376,11 +3376,25 @@ pub(crate) fn attach_verbose_join(
     let Some(v) = join else {
         return;
     };
+    // A WHERE comparing the two relations is the join's `Join Filter`,
+    // already prefixed; its plan must print exactly that.
+    let join_filters = root
+        .details
+        .iter()
+        .filter(|(k, _)| k == "Join Filter")
+        .count();
+    if v.join_filter && (join_filters != 1 || !root.name.starts_with("Hash ")) {
+        return;
+    }
     if root.name.starts_with("Nested Loop") {
         attach_verbose_nested_loop(root, v);
         return;
     }
-    if !v.all_equal || !root.name.starts_with("Hash ") || join_type_of(&root.name).is_none() {
+    if !v.all_equal
+        || join_filters != usize::from(v.join_filter)
+        || !root.name.starts_with("Hash ")
+        || join_type_of(&root.name).is_none()
+    {
         return;
     }
     let [outer, hash] = root.children.as_mut_slice() else {

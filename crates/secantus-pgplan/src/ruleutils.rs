@@ -6567,6 +6567,9 @@ pub struct VerboseJoin {
     /// Every ON clause is an equality (a hash join's keys); otherwise
     /// some are other comparisons, which only a nested loop serves.
     pub all_equal: bool,
+    /// The WHERE holds a comparison of a column of each relation, which
+    /// the join evaluates as its `Join Filter`.
+    pub join_filter: bool,
 }
 
 /// [`VerboseJoin`] for `SELECT <columns or *> FROM a [LEFT] JOIN b ON
@@ -6737,6 +6740,7 @@ pub fn explain_verbose_join(
     // The WHERE: each conjunct a restriction of one relation, which its
     // scan evaluates as its `Filter`; its columns are not needed above.
     let mut quals: [Vec<(String, String)>; 2] = [Vec::new(), Vec::new()];
+    let mut join_filter = false;
     if let Some(w) = s.where_clause.as_deref() {
         let none_lookup = |_: &str| None;
         let none_views = |_: &str| None;
@@ -6770,6 +6774,28 @@ pub fn explain_verbose_join(
             let i = match (print(part, 0, true), print(part, 1, true)) {
                 (Some(_), None) => 0,
                 (None, Some(_)) => 1,
+                (None, None) => {
+                    // A comparison of a column of each relation: the
+                    // join's `Join Filter`, its columns needed above.
+                    let Some(N::AExpr(a)) = part.node.as_ref() else {
+                        return None;
+                    };
+                    if a.kind() != pg_query::protobuf::AExprKind::AexprOp {
+                        return None;
+                    }
+                    let col = |n: &Option<Box<Node>>| match n.as_deref()?.node.as_ref() {
+                        Some(N::ColumnRef(c)) => resolve(c),
+                        _ => None,
+                    };
+                    let ((li, lc), (ri, rc)) = (col(&a.lexpr)?, col(&a.rexpr)?);
+                    if li == ri {
+                        return None;
+                    }
+                    need(li, &lc);
+                    need(ri, &rc);
+                    join_filter = true;
+                    continue;
+                }
                 _ => return None,
             };
             quals[i].push((print(part, i, true)?, print(part, i, false)?));
@@ -6803,6 +6829,7 @@ pub fn explain_verbose_join(
         rels: [rel(0), rel(1)],
         output,
         all_equal,
+        join_filter,
     })
 }
 

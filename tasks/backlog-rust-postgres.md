@@ -1759,9 +1759,14 @@ a regression test.
       printed with `unqualified = false`.
       (Since 2026-11-17 an inner index scan's `Filter` reading both
       relations, an ON comparison, prints prefixed: `VerboseRel::join_quals`.)
-      A hash join with a WHERE conjunct reading both relations (its `Join
-      Filter: (e.b <> k.b)`) still prints the plain plan.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a hash join whose where reads both relations]
+      (Since 2026-11-17 a hash join with a WHERE conjunct comparing a
+      column of each relation prints it as its `Join Filter`, its columns
+      in the Hash's `Output`: `VerboseJoin::join_filter`.) A nested loop
+      with such a conjunct does not: PostgreSQL 15.19 pushes `e.b <> k.b`
+      into the parameterised inner index scan's `Filter`, where this
+      server keeps it as the loop's `Join Filter` -- a plan-shape
+      difference the plain EXPLAIN shares, not only VERBOSE's.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a nested loop whose where reads both relations]
       Backlog-ID: RP-966
 
 
