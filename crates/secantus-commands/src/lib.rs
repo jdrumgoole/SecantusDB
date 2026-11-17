@@ -2112,6 +2112,11 @@ fn dispatch_inner(
                         // aggregate took its source's namespace: its entry
                         // names the source (measured 8.2.11, RM-592).
                         profiler::mark_reached(ctx);
+                    } else if views::is_change_stream_refusal(name, doc, &reply) {
+                        // mongod refuses a `$changeStream` of a view as it
+                        // resolves the pipeline, and writes no `Slow query`
+                        // line for it (measured 8.2.11, RM-593).
+                        ctx.slow_log = Some(false);
                     }
                     return reply;
                 }

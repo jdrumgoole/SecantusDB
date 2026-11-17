@@ -159,6 +159,20 @@ pub(crate) fn refused_merge_into_view(
         .is_some_and(|s| is_view(s.as_ref(), &db, &coll))
 }
 
+/// Whether `reply` is the refusal (166) of an `aggregate` whose pipeline
+/// opens a change stream: `refusal` answers it only for a view.
+pub(crate) fn is_change_stream_refusal(name: &str, doc: &Document, reply: &Document) -> bool {
+    name == "aggregate"
+        && reply.get_i32("code") == Ok(166)
+        && doc
+            .get_array("pipeline")
+            .ok()
+            .and_then(|p| p.first())
+            .and_then(Bson::as_document)
+            .and_then(|s| s.keys().next())
+            .is_some_and(|k| k == "$changeStream")
+}
+
 /// Whether `doc` is an `insert`, `update` or `delete` of a view.
 pub(crate) fn is_view_write(name: &str, doc: &Document, ctx: &CommandContext) -> bool {
     matches!(name, "insert" | "update" | "delete")

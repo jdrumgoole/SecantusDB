@@ -520,10 +520,10 @@ def test_a_merge_into_a_view_is_profiled(rust_mongo: Any, mongod_rs: Any) -> Non
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-593")
+@pytest.mark.backlog_fixed("RM-593")
 def test_a_change_stream_of_a_view_writes_no_line(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 refuses a `$changeStream` of a view (166) and writes no
-    `Slow query` line for it; this server writes one."""
+    `Slow query` line for it; this server wrote one."""
     got = _lines(
         rust_mongo,
         mongod_rs,
