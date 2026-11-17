@@ -35,7 +35,9 @@ pub fn clamp_row_est(n: f64) -> f64 {
     if n <= 1.0 {
         1.0
     } else {
-        n.round()
+        // `rint` in the default rounding mode: a half to the even
+        // neighbour (1270 * 1270 / 200 = 8064.5 is 8064 rows, RP-1019).
+        n.round_ties_even()
     }
 }
 

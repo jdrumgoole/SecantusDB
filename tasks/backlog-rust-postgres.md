@@ -1943,20 +1943,6 @@ a regression test.
       (`sublink_join::split_where`).
       Backlog-ID: RP-411
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sublink anded with an outer expression qual is planned as a join]
-- [ ] **A hash join of two tables never analysed is unpriced, and its
-      sides stay in written order.** `hash_side` prices a side only from
-      `analysed_key`, which needs `pg_statistic` rows. PostgreSQL 15.19
-      prices it anyway: each table at its default size (1,270 rows for an
-      empty or unvacuumed one), `eqjoinsel` from `get_variable_numdistinct`
-      (the 200 default, a unique column's row count). So `explain select *
-      from k, e where k.a = e.a` over fresh `e(a int, b text)` (10 rows) and
-      `k(a int primary key, b text)` is `Hash Join (cost=38.58..64.62
-      rows=1270 width=72)`, `Hash Cond: (e.a = k.a)`, `e` outer and `k`
-      hashed; here unpriced, `k` outer. The same plan is a DELETE ...
-      USING's. Measured on a private 15.19 cluster (found while working
-      RP-435).
-      Verify: tests/backlog/test_rp_dml_from.py::test_explain_prints_the_join
-      Backlog-ID: RP-1019
 - [ ] **An aggregate above an InitPlan's scan is a Subquery Scan.** Since
       RP-440's first slices (2026-11-16) a SELECT over one relation whose WHERE
       compares columns with uncorrelated FROM-less scalar subqueries plans

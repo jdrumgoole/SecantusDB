@@ -210,12 +210,12 @@ def test_explain_join_of_a_constant_select_list(rust_pg: Any, sql: str, width: i
     ]
 
 
-@pytest.mark.backlog("RP-1019")
+@pytest.mark.backlog_fixed("RP-1019")
 def test_explain_prints_the_join(rust_pg: Any) -> None:
     """EXPLAIN of a DELETE ... USING a table prints the hash join
     PostgreSQL makes of it over two tables never analysed: priced from
-    their default sizes (1,270 rows each), the hashed side is `k`. Here
-    the join is unpriced and its sides stay in written order, as for the
+    their default sizes (1,270 rows each), the hashed side is `k`. The
+    join was unpriced and its sides stayed in written order, as for the
     SELECT `select * from k, e where k.a = e.a`."""
     assert _answers(
         rust_pg,

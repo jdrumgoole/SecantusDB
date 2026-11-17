@@ -41,6 +41,15 @@ _ANALYSED = [
     "analyze k",
 ]
 
+# Two tables of ten rows never analysed (RP-1019): the planner sizes each
+# at its default 1,270 rows.
+_NEVER_ANALYSED = [
+    "create table e (a int, b text)",
+    "insert into e select g, 'v' || g from generate_series(1, 10) g",
+    "create table k (a int primary key, b text)",
+    "insert into k select g, 'v' || g from generate_series(1, 10) g",
+]
+
 # Those, and thirty rows of a text column whose lengths vary (RP-386).
 _ANALYSED_THIRTY = _ANALYSED + [
     "create table s (a int, c text)",
@@ -2254,6 +2263,39 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Index Scan using k_pkey on k  (cost=0.28..6.98 rows=333 width=7)",
             "        Index Cond: ((a > e.a) AND (a > 2))",
+        ],
+    ),
+    # A join of two tables never analysed is priced from their default
+    # sizes and `get_variable_numdistinct`'s defaults (RP-1019): the unique
+    # key's side hashed ...
+    "hash join of two tables never analysed": (
+        "RP-1019:fixed",
+        _NEVER_ANALYSED,
+        "explain select * from k, e where k.a = e.a",
+        [
+            "Hash Join  (cost=38.58..64.62 rows=1270 width=72)",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..22.70 rows=1270 width=36)",
+            "  ->  Hash  (cost=22.70..22.70 rows=1270 width=36)",
+            "        ->  Seq Scan on k  (cost=0.00..22.70 rows=1270 width=36)",
+        ],
+    ),
+    # ... and over two keys of the 200 default a merge join, its
+    # `mergejoinscansel` reading both inputs whole and its 8064.5 rows
+    # rounded to even (`clamp_row_est`'s `rint`).
+    "merge join of two tables never analysed": (
+        "RP-1019:fixed",
+        _NEVER_ANALYSED,
+        "explain select * from e join k on e.b = k.b",
+        [
+            "Merge Join  (cost=176.34..303.67 rows=8064 width=72)",
+            "  Merge Cond: (e.b = k.b)",
+            "  ->  Sort  (cost=88.17..91.35 rows=1270 width=36)",
+            "        Sort Key: e.b",
+            "        ->  Seq Scan on e  (cost=0.00..22.70 rows=1270 width=36)",
+            "  ->  Sort  (cost=88.17..91.35 rows=1270 width=36)",
+            "        Sort Key: k.b",
+            "        ->  Seq Scan on k  (cost=0.00..22.70 rows=1270 width=36)",
         ],
     ),
     # ... and two of them, their range's selectivity the scan's (RP-979).

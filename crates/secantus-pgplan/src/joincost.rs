@@ -199,8 +199,8 @@ fn merge_join_plan(
     let osort = input(outer, outer_by_index)?;
     let isort = input(inner, inner_by_index)?;
     let (outer_path_rows, inner_path_rows) = (outer.rows.max(1.0), inner.rows.max(1.0));
-    let outer_skip_rows = (outer_path_rows * os).round();
-    let inner_skip_rows = (inner_path_rows * is).round();
+    let outer_skip_rows = (outer_path_rows * os).round_ties_even();
+    let inner_skip_rows = (inner_path_rows * is).round_ties_even();
     let outer_rows = clamp_row_est(outer_path_rows * oe);
     let inner_rows = clamp_row_est(inner_path_rows * ie);
     // Readjusted for the rounding above.
@@ -725,7 +725,7 @@ fn hash_join_core(
             let match_frac = sel * filter_sel;
             (match_frac, (match_frac * inner.rows / match_frac).max(1.0))
         });
-        let matched = (outer.rows * match_frac).round();
+        let matched = (outer.rows * match_frac).round_ties_even();
         let scan_frac = 2.0 / (match_count + 1.0);
         run += clause_cost(outer, inner)
             * matched
@@ -865,8 +865,8 @@ pub fn merge_join_sorted(
 ) -> MergePlan {
     let (outer_path_rows, inner_path_rows) = (outer.rows.max(1.0), inner.rows.max(1.0));
     let (os, oe, is, ie) = scansel;
-    let outer_skip_rows = (outer_path_rows * os).round();
-    let inner_skip_rows = (inner_path_rows * is).round();
+    let outer_skip_rows = (outer_path_rows * os).round_ties_even();
+    let inner_skip_rows = (inner_path_rows * is).round_ties_even();
     let outer_rows = clamp_row_est(outer_path_rows * oe);
     let inner_rows = clamp_row_est(inner_path_rows * ie);
     // Readjusted for the rounding above.
