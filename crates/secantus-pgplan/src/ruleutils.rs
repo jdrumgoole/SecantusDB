@@ -236,6 +236,24 @@ fn binary_coercible(from: &str, to: &str) -> bool {
     matches!((from, to), ("text", "varchar") | ("varchar", "text"))
 }
 
+/// An OID alias type (`regclass`, `regtype`, ...): no operators of its own.
+fn is_reg_alias(t: &str) -> bool {
+    matches!(
+        t,
+        "regclass"
+            | "regtype"
+            | "regproc"
+            | "regprocedure"
+            | "regoper"
+            | "regoperator"
+            | "regconfig"
+            | "regdictionary"
+            | "regnamespace"
+            | "regrole"
+            | "regcollation"
+    )
+}
+
 /// `format_type` of a type with no modifier: a bare `char` is `bpchar`.
 fn display_type(t: &str) -> String {
     match t {
@@ -1017,6 +1035,12 @@ impl<'a> Printer<'a> {
             if l == "unknown" {
                 return Some(("text".into(), "text".into()));
             }
+            // The `reg*` alias types have no `=` of their own: two of them
+            // meet as `oid` (`oideq`) over binary-coercible casts, which
+            // ruleutils prints (PostgreSQL 15.19, RP-941).
+            if is_reg_alias(l) {
+                return Some(("oid".into(), "oid".into()));
+            }
             return Some((String::new(), String::new()));
         }
         // An untyped literal takes the other side's type when that type has
@@ -1279,6 +1303,17 @@ impl<'a> Printer<'a> {
                                 _ => return None,
                             };
                             self.buf.push_str(b);
+                        }
+                        // A `regtype` constant prints as `regtypeout` does,
+                        // the type's canonical name (`'int4'` is `'integer'`).
+                        "regtype" => {
+                            let v = crate::cast_value(bson::Bson::String(lit.clone()), t).ok()?;
+                            let text = match crate::cast_value(v, "text").ok()? {
+                                bson::Bson::String(text) => text,
+                                _ => return None,
+                            };
+                            self.buf
+                                .push_str(&format!("{}::regtype", simple_quote_literal(&text)));
                         }
                         // A date / time constant prints in its type's output
                         // form (`'2020-01-01 00:00:00'::timestamp ...`).

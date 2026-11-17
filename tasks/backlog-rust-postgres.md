@@ -2807,16 +2807,6 @@ Measured on a private PostgreSQL 15.19 cluster.
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 `_SETUP` in `tests/backlog/test_rp_found_rp860.py` (`t860 (x int)`).
 
-- [ ] **A `regtype` comparison in a CHECK prints without its `oid`
-      casts.** `check (pg_typeof(x) = 'int4'::regtype)` prints `CHECK
-      (((pg_typeof(x))::oid = ('integer'::regtype)::oid))` on PostgreSQL
-      15.19: `regtype` has no `=`, so the parser resolves `oideq` over
-      binary-coercible casts, and ruleutils prints them. Here it is the
-      text as written, `CHECK ((pg_typeof(x) = 'int4'::regtype))`.
-      `ruleutils.rs` would need the operator resolution the analysed tree
-      records.
-      Verify: tests/backlog/test_rp_found_rp860.py::test_a_regtype_comparison_in_a_check_prints_its_oid_casts
-      Backlog-ID: RP-941
 
 ## Found while working RP-939 (2026-11-17)
 

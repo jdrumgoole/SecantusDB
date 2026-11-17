@@ -83,13 +83,13 @@ def test_a_not_valid_check_prints_not_valid(dsn: str) -> None:
     ) == ["ALTER TABLE", [("CHECK ((x > 0)) NOT VALID",)]]
 
 
-@pytest.mark.backlog("RP-941")
+@pytest.mark.backlog_fixed("RP-941")
 def test_a_regtype_comparison_in_a_check_prints_its_oid_casts(dsn: str) -> None:
     """`regtype` has no `=` of its own: the parser compares two of them as
     `oid` (`oideq` over binary-coercible casts), and ruleutils prints the
     casts, `((pg_typeof(x))::oid = ('integer'::regtype)::oid)`, on
-    PostgreSQL 15.19. Here it is printed as written, `(pg_typeof(x) =
-    'int4'::regtype)`."""
+    PostgreSQL 15.19. It was printed as written, `(pg_typeof(x) =
+    'int4'::regtype)`, until RP-941."""
     assert _script(
         dsn,
         ["alter table t860 add constraint k check (pg_typeof(x) = 'int4'::regtype)", _DEF],
