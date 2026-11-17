@@ -2313,12 +2313,28 @@ impl PgHandler {
             && comma_filters.iter().all(|f| f.aliases.len() == 2)
             && j.where_equalities.len() == equi.len()
             && j.where_equalities.iter().all(same_pair);
+        // An ON join's WHERE conjuncts over both tables that are not
+        // equalities are its join filter beside the ON's: one qual list,
+        // as for a comma join (RP-423).
+        let where_join_filters = on.is_some()
+            && !left_join
+            && !j.where_spans_equality
+            && !j.where_filters.is_empty()
+            && j.where_span_aliases.len() == j.where_filters.len()
+            && j.where_filters.iter().all(priced_kind);
         let filters = if comma_clause && !comma_filters.is_empty() {
             comma_filters
+        } else if where_join_filters {
+            on_filters
+                .into_iter()
+                .chain(j.where_filters.iter())
+                .collect()
         } else {
             on_filters
         };
-        if !comma_clause && (on.is_none() || !j.where_filters.is_empty() || j.where_spans_equality)
+        if !comma_clause
+            && !where_join_filters
+            && (on.is_none() || !j.where_filters.is_empty() || j.where_spans_equality)
         {
             return None;
         }
@@ -2338,7 +2354,13 @@ impl PgHandler {
             0
         };
         if let Some(residual) = sel.residual.as_ref().filter(|_| !pushed_exprs) {
-            if !comma_clause || !is_key_equality(residual, equi, filters.len() + comma_exprs) {
+            // The WHERE's join filters are re-checked above the join.
+            if where_join_filters {
+                if !is_key_equality(residual, &[], j.where_filters.len()) {
+                    return None;
+                }
+            } else if !comma_clause || !is_key_equality(residual, equi, filters.len() + comma_exprs)
+            {
                 return None;
             }
         }

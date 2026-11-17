@@ -5714,10 +5714,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Filter: (length(b) > 2)",
         ],
     ),
-    # Still open: a WHERE expression over both tables of a join is its
-    # Join Filter, which this server prints with zeros.
+    # Fixed with RP-423: a WHERE expression over both tables of an ON join
+    # is its Join Filter, which this server printed with zeros.
     "estimate of a join filtered by an expression over both tables": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_STRINGS,
         "explain select e.a from e join w on e.a = w.a where e.a + w.a > 996",
         [
@@ -5727,6 +5727,30 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on w  (cost=0.00..16.00 rows=1000 width=4)",
             "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
             "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    "estimate of a join filtered by an expression comparison over both tables": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select e.a from e join w on e.a = w.a where e.a < w.a + 5",
+        [
+            "Hash Join  (cost=27.50..62.25 rows=333 width=4)",
+            "  Hash Cond: (w.a = e.a)",
+            "  Join Filter: (e.a < (w.a + 5))",
+            "  ->  Seq Scan on w  (cost=0.00..16.00 rows=1000 width=4)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    # Still open: a regex with a back reference, whose prefix walk is not
+    # modelled, prints zeros.
+    "estimate of a regex match with a back reference": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '^(w)\\1'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=1 width=10)",
+            "  Filter: (c ~ '^(w)\\1'::text)",
         ],
     ),
     # Still open: a LIKE's ESCAPE is a `like_escape` call PostgreSQL folds

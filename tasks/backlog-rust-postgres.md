@@ -1935,12 +1935,14 @@ a regression test.
       2026-11-17 a comma join, whose residual holds the join clause beside
       the comparison; neither scan carries a column only its comparison
       reads; since 2026-11-17 a LEFT join whose WHERE compares only
-      preserved-side expressions (`preserved_exprs`). Still zeros there:
-      an expression over both tables, a Join Filter (`select e.a from e
-      join w on e.a = w.a where e.a + w.a > 996`, `Hash Join
-      (cost=27.50..62.25 rows=333 width=4)`). Measured on the 15.19
-      reference on port 5415 (found while working RP-404 and RP-354).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join filtered by an expression over both tables]
+      preserved-side expressions (`preserved_exprs`), and an inner ON
+      join whose WHERE holds inequalities over both tables, its Join
+      Filter (`where_join_filters`). A regex with a back reference
+      (`select * from w where c ~ '^(w)\1'`) is `Seq Scan on w
+      (cost=0.00..18.50 rows=1 width=10)` there and zeros here. Measured
+      on the 15.19 reference on port 5415 (found while working RP-404 and
+      RP-354).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with a back reference]
       Backlog-ID: RP-423
 - [ ] **A call over constants in a WHERE is not folded in EXPLAIN.**
       `eval_const_expressions` folds an immutable call whose arguments are
