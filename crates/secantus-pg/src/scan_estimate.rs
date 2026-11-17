@@ -5369,7 +5369,9 @@ impl PgHandler {
     }
 
     /// An inner join of two stored tables on one column equality, with no
-    /// WHERE, as a set operation's input (RP-841): its rows, and the groups
+    /// WHERE but comparisons of one side's column with a constant (over
+    /// tables never analysed), as a set operation's input (RP-841): its
+    /// rows, and the groups
     /// of the select list's columns. The rows are the priced hash join's
     /// where both sides are analysed; over two tables never analysed they
     /// are `calc_joinrel_size_estimate`'s product of the scans' rows and
@@ -5389,7 +5391,6 @@ impl PgHandler {
         // fields the select list reads from it.
         let sides: [(String, String, Vec<String>); 2] = if let Some(js) = &sel.join {
             if js.left_join
-                || !js.filter.is_empty()
                 || js.order.is_some()
                 || js.left_sub.is_some()
                 || js.right_sub.is_some()
@@ -5438,6 +5439,22 @@ impl PgHandler {
             self.planner_table_lazy(table, &count)
         };
         let tables = [counted(&sides[0].0)?, counted(&sides[1].0)?];
+        // Each side's rows: its table's, or, under a WHERE over it, its
+        // scan's (`set_baserel_size_estimates`), which the join's size and
+        // each side's groups are clamped to.
+        let side_rows: [f64; 2] = match &sel.join {
+            Some(js) if !js.filter.is_empty() => {
+                if tables.iter().any(|pt| pt.analyzed.is_some()) {
+                    return None;
+                }
+                let scan = |(table, alias): &(String, String)| -> Option<f64> {
+                    let filter = self.narrow_side_filter(&js.filter, table, alias, false)?;
+                    Some(self.user_seq_scan(table, &filter, &[])?.2)
+                };
+                [scan(&js.left)?, scan(&js.right)?]
+            }
+            _ => [tables[0].tuples, tables[1].tuples],
+        };
         let key_stat = |pt: &PlannerTable, field: &str| -> Option<hashagg::KeyStat> {
             let c = pt.def.columns.iter().find(|c| c.field() == field)?;
             let unique = pt.unique.iter().any(|u| u == field);
@@ -5476,7 +5493,7 @@ impl PgHandler {
                 mcv: &[],
             };
             let selec = secantus_pgplan::joincost::eqjoinsel_inner(&k(n1, d1), &k(n2, d2));
-            costsize::clamp_row_est(tables[0].tuples * tables[1].tuples * selec)
+            costsize::clamp_row_est(side_rows[0] * side_rows[1] * selec)
         } else {
             self.hash_join_estimate(sel)
                 .or_else(|| self.join_select_hash_estimate(sel))?
@@ -5490,8 +5507,7 @@ impl PgHandler {
                 .map(|f| key_stat(&tables[i], f))
                 .collect::<Option<_>>()?;
             if !keys.is_empty() {
-                groups *=
-                    hashagg::estimate_groups(&keys, tables[i].tuples, tables[i].tuples) as f64;
+                groups *= hashagg::estimate_groups(&keys, tables[i].tuples, side_rows[i]) as f64;
             }
         }
         Some((rows, groups.min(rows).max(1.0)))

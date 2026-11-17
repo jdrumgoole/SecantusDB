@@ -214,21 +214,39 @@ def test_an_intersect_over_a_having_input_puts_the_smaller_input_first(dsn: str)
     assert got == [("1.000",)]
 
 
+@pytest.mark.backlog_fixed("RP-841")
+def test_an_intersect_over_a_join_with_a_where_puts_the_smaller_input_first(dsn: str) -> None:
+    """`select a.x from t692j a join t692j b on a.k = b.k where a.x > 0
+    intersect select 1.000` is `1.000` on PostgreSQL 15.19: the join's
+    rows are its sides' scans' rows (the WHERE's default selectivity on
+    one) times `eqjoinsel`, its groups more than the constant's one. Here
+    it was `1.0`: a join with a WHERE was not estimated."""
+    with _connect(dsn) as c:
+        got = _text(
+            c,
+            "select a.x from t692j a join t692j b on a.k = b.k where a.x > 0"
+            " intersect select 1.000",
+        )
+    assert got == [("1.000",)]
+
+
 @pytest.mark.backlog("RP-841")
 @pytest.mark.parametrize(
     "query",
     [
-        "select a.x from t692j a join t692j b on a.k = b.k where a.x > 0 intersect select 1.000",
+        "select x from (select x from t692j) s intersect select 1.000",
+        "select x * 1 from t692j group by x * 1 intersect select 1.000",
+        "select x from t692j group by x having x > 0 intersect select 1.000",
     ],
-    ids=["join with a where"],
+    ids=["from subquery", "group by expression", "having over a grouping column"],
 )
 def test_an_intersect_over_another_unestimated_input_puts_the_smaller_input_first(
     dsn: str, query: str
 ) -> None:
     """Each is `1.000` on PostgreSQL 15.19: the input's estimated groups
     outnumber the constant's one, so the constant is the HashSetOp's first
-    input. Here a HAVING, a DISTINCT and a join with a WHERE are not
-    estimated, so the left input stays first."""
+    input. Here a FROM subquery, a GROUP BY expression and a HAVING over a
+    grouping column are not estimated, so the left input stays first."""
     with _connect(dsn) as c:
         got = _text(c, query)
     assert got == [("1.000",)]

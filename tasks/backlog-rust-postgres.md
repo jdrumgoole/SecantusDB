@@ -2950,7 +2950,9 @@ its first input gave.
       a constant, a VALUES list, one user table's stored columns through a
       WHERE the selectivity model covers, a nested set operation, an inner
       join of user tables whose every clause is a column equality (ON or
-      WHERE) with no WHERE besides (`join_input_estimate`; three or more
+      WHERE) with no WHERE besides but (since 2026-11-17, over tables never
+      analysed) comparisons of one side's column with a constant, each
+      side's rows its scan's (`join_input_estimate`; three or more
       tables, `join_chain_input_estimate`, only over tables never
       analysed, each equivalence class's members joined in table order),
       an aggregate over one user table, grouped by plain columns or not,
@@ -2959,10 +2961,11 @@ its first input gave.
       scaled by the qual's default selectivity as `cost_agg` scales them
       (`having_selectivity`; two inequalities over one aggregate, a range
       pair, are not modelled). It leaves any other input -- a join with a
-      WHERE (`a.x > 0` beside the join's equality), a chain over an
-      analysed table, a HAVING over a grouping column (which PostgreSQL
+      WHERE over an analysed table, a chain over an analysed table, a
+      HAVING over a grouping column (which PostgreSQL
       moves to the WHERE), a GROUP BY expression, a computed column, a FROM
-      subquery other than VALUES, a catalog -- in the written order,
+      subquery other than VALUES (`select x from (select x from t692j) s`),
+      a catalog -- in the written order,
       hashed. Measured on
       the 15.19 reference on port 5415.
       Verify: tests/backlog/test_rp_found_rp692.py::test_an_intersect_over_another_unestimated_input_puts_the_smaller_input_first
