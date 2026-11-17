@@ -17,7 +17,7 @@ repository = "https://github.com/jdrumgoole/SecantusDB"
 rust-version = "1.98"
 readme = "README.md"
 keywords = ["mongodb", "database", "embedded", "server", "wiredtiger"]
-categories = ["database-implementations", "development-tools::testing"]
+categories = ["database-implementations"]
 
 # `cargo binstall secantus-mdb` fetches the prebuilt, PGO-optimised binary that
 # release-binaries.yml attaches to the `secantusdb-v<version>` release, instead

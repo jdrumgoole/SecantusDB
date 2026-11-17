@@ -23,13 +23,20 @@ single-node replica set named `secantus` and enables test commands.
 
 ## From Python
 
-The published `SecantusDB` wheel no longer contains the Rust server: it
-carries only the Python servers. From Python, either run
-`secantusd-mdb` (from the `secantus-mdb` crate or a release archive) as a
-subprocess and point `pymongo` at it, or use the Python server's
-`SecantusDBServer`, which has the same `pymongo` surface.
+`pip install SecantusDB` provides the `secantusdb` launcher, which starts the
+real `secantusd-mdb` binary as a subprocess on a free port, with a temporary
+data directory unless you pass `storage_path`:
 
-### The `RustServer` handle (source builds only)
+```python
+from pymongo import MongoClient
+from secantusdb import MongoServer
+
+with MongoServer() as server:
+    client = MongoClient(server.uri)
+    client["mydb"]["users"].insert_one({"_id": 1, "name": "Joe"})
+```
+
+### The `RustServer` handle (source builds only; not part of `pip install`)
 
 A checkout built with the storage-engine flag
 (`SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON uv sync --extra dev`)

@@ -14,20 +14,18 @@ authenticated principal issues is checked against its role bindings — see
 
 ## Off by default
 
-Auth is opt-in. A vanilla `secantusd-py` daemon and the embedded
-`SecantusDBServer(...)` accept commands from any connection — same as
-running `mongod` without `--auth`. This keeps the test-harness use case
-zero-friction.
+Auth is opt-in. A vanilla `secantusd-mdb` daemon accepts commands from any
+connection — same as running `mongod` without `--auth`.
 
 ```bash
-secantusd-py --port 27117          # no auth required
+secantusd-mdb --port 27117          # no auth required
 ```
 
 ## Turning auth on
 
 Two equivalent switches:
 
-- CLI flag: `secantusd-py --auth`
+- CLI flag: `secantusd-mdb --auth`
 - Constructor: `SecantusDBServer(..., require_auth=True)`
 
 With auth on, only the handshake and the SCRAM exchange run on an
@@ -36,7 +34,7 @@ unauthenticated connection. Everything else (`find`, `insert`,
 completes a `saslStart` / `saslContinue` round-trip.
 
 ```bash
-secantusd-py --auth --port 27117
+secantusd-mdb --auth --port 27117
 ```
 
 ## Provisioning users

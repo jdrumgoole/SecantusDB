@@ -1,7 +1,14 @@
 # Installation
 
-Three ways to get the Rust server. It is not in the `SecantusDB` Python wheel,
-which carries only the Python servers.
+Three ways to get the Rust MongoDB server (`secantusd-mdb`). The
+[main Installation page](https://secantusdb.com/docs/installation.html)
+covers all three channels for both servers, including `secantusd-pg`.
+
+## From PyPI
+
+`pip install SecantusDB` installs prebuilt `secantusd-mdb` and `secantusd-pg`
+binaries on `PATH` (Linux x86_64, macOS arm64) and the `secantusdb` Python
+launcher (`from secantusdb import MongoServer, PostgresServer`).
 
 ## From crates.io (recommended)
 
@@ -10,21 +17,21 @@ included, and puts `secantusd-mdb` on `PATH`. It needs a Rust toolchain, CMake
 and a C compiler:
 
 ```bash
-cargo install secantus-mdb --version 0.5.3-beta.197
+cargo install secantus-mdb --version <version>
 secantusd-mdb --version
 secantusd-mdb --port 27017 --storage-path ./secantus-data
 ```
 
 The crate is a pre-release, so `cargo install` needs the `--version`; without
-it cargo stops at "nothing to install". The current version is on
+it cargo stops at "nothing to install". Take the current version from
 [crates.io](https://crates.io/crates/secantus-mdb).
 
-To run the server inside a Rust test instead, add the crate as a
-dev-dependency and start it in-process (see [Embedded](embedded.md)):
+To run the server inside a Rust program instead, add the crate as a
+dependency and start it in-process (see [Embedded](embedded.md)):
 
 ```toml
-[dev-dependencies]
-secantus-mdb = "0.5.3-beta.197"
+[dependencies]
+secantus-mdb = "0.5.3-beta"
 ```
 
 ## Prebuilt binary (no Rust toolchain)

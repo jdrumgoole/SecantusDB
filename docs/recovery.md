@@ -8,19 +8,16 @@ SecantusDB supports two recovery models:
    target time, by replaying the oplog forward.
 
 Both are **offline restores**: they produce a fresh data directory that you then
-point a *new* server at (`secantusd-py --storage-path <dir>` /
-`SecantusDBServer(storage_path=<dir>)`). Hot in-place restore over a live
+point a *new* server at (`secantusd-mdb --storage-path <dir>`). Hot in-place restore over a live
 WiredTiger connection isn't supported — real `mongod` restores work the same way
 (stop, swap the data directory, start).
 
-## One interface, two servers
+## The interface
 
-SecantusDB ships as [two separate servers](servers.md) — the pure-Python
-`secantusd-py` and the standalone Rust `secantusd-mdb` binary — and **both
-implement the full PITR surface** with the same subcommand:
+The MongoDB server, `secantusd-mdb` ([see the servers](servers.md)),
+implements the full PITR surface:
 
-- the `restore` subcommand — `secantusd-py restore` (the Python console script)
-  and `secantusd-mdb restore` (the Rust binary) take identical flags;
+- the `restore` subcommand, `secantusd-mdb restore`;
 - the `secantusAdmin.backupArchive`, `secantusAdmin.restoreToTimestamp`, and
   `secantusAdmin.archiveBaseSnapshot` wire commands;
 - the `--oplog-archive-dir` server flag.
@@ -114,18 +111,18 @@ wall-clock time. With neither, the whole oplog is replayed ("latest").
 
 ```bash
 # Recover to a wall-clock time (use `secantusd-mdb restore` for the Rust binary):
-secantusd-py restore --source /backups/db.tar.gz \
+secantusd-mdb restore --source /backups/db.tar.gz \
                      --target-dir /restore/at-1430 \
                      --to-time 2026-06-17T14:30:00Z
 
 # Or to a precise cluster timestamp (seconds[,ordinal]):
-secantusd-py restore --source /path/to/stopped-data-dir \
+secantusd-mdb restore --source /path/to/stopped-data-dir \
                      --target-dir /restore/exact \
                      --to-timestamp 1781716542,7
 
 # With neither --to-time nor --to-timestamp, the whole oplog is replayed
 # ("latest"). Then start a server on the result:
-secantusd-py --storage-path /restore/at-1430
+secantusd-mdb --storage-path /restore/at-1430
 ```
 
 `--source` is a backup `.tar.gz`, a stopped server's data directory, **or** a PITR
@@ -133,10 +130,9 @@ archive directory (see [Arbitrary window](pitr-arbitrary-window)
 below — auto-detected). `--target-dir` must be a fresh path.
 
 ```{note}
-The `restore` subcommand is provided by **both** servers with identical flags —
-`secantusd-py restore` (Python console script) and `secantusd-mdb restore` (Rust
-binary). The Rust binary additionally exposes `--to-timestamp` and
-`--preserve-oplog`; the Python CLI adds `--to-time`.
+The `restore` subcommand is `secantusd-mdb restore`. It exposes
+`--to-timestamp` and `--preserve-oplog`. (The deprecated Python server had its
+own console script, `secantusd-py restore`, which added `--to-time`.)
 ```
 
 ### Wire command
@@ -186,7 +182,7 @@ The recovery window is then the **oplog retention window**. Tune it for the
 horizon you need:
 
 ```bash
-secantusd-py --oplog-retention-seconds 604800 --oplog-max-entries 5000000   # ~1 week
+secantusd-mdb --oplog-retention-seconds 604800 --oplog-max-entries 5000000   # ~1 week
 ```
 
 (or the `[oplog]` section of `secantusd.toml`). The rule of thumb: *keep enough
@@ -202,7 +198,7 @@ oplog live — turn on **oplog archiving** and take periodic **base snapshots** 
 the same directory:
 
 ```bash
-secantusd-py --storage-path /data --oplog-archive-dir /pitr-archive
+secantusd-mdb --storage-path /data --oplog-archive-dir /pitr-archive
 ```
 
 With `--oplog-archive-dir` set, the rows `prune_oplog` is about to drop are first
@@ -218,7 +214,7 @@ Each writes a `base-<headSeq>.tar.gz` into the directory. To recover, point
 `restore` at the **archive directory** (the CLI and wire command auto-detect it):
 
 ```bash
-secantusd-py restore --source /pitr-archive --target-dir /restore/at-T \
+secantusd-mdb restore --source /pitr-archive --target-dir /restore/at-T \
                      --to-time 2026-06-10T09:00:00Z
 ```
 
@@ -234,7 +230,7 @@ By default the restored data directory starts a **fresh oplog timeline** — the
 replayed history isn't carried into the target, so a change stream on the restored
 server resumes only from the restore point forward (this matches `mongorestore`).
 
-Pass `--preserve-oplog` (`secantusd-py restore`) or `preserveOplog: true`
+Pass `--preserve-oplog` (`secantusd-mdb restore`) or `preserveOplog: true`
 (`secantusAdmin.restoreToTimestamp`) to carry the replayed oplog onto the restored
 directory **verbatim** — same seq, timestamp, and pre-images. A change stream on
 the restored server can then resume from a [resume token](change-streams.md)
@@ -247,11 +243,11 @@ present.
 |------|-----|--------------|------------|
 | Snapshot backup | — | `secantusAdmin.backupArchive` | `Storage.create_archive` |
 | Extract a snapshot | `secantus-restore-archive` | `secantusAdmin.restoreArchive` | `extract_backup_archive` |
-| Restore to a time | `secantusd-py restore --to-time/--to-timestamp` | `secantusAdmin.restoreToTimestamp` | `oplog_replay.restore_to_timestamp` |
-| Restore "latest" | `secantusd-py restore` (no bound) | `restoreToTimestamp` (no bound) | `restore_to_timestamp()` |
+| Restore to a time | `secantusd-mdb restore --to-time/--to-timestamp` | `secantusAdmin.restoreToTimestamp` | `oplog_replay.restore_to_timestamp` |
+| Restore "latest" | `secantusd-mdb restore` (no bound) | `restoreToTimestamp` (no bound) | `restore_to_timestamp()` |
 | Carry oplog for resume | `--preserve-oplog` | `preserveOplog: true` | `carry_oplog=True` |
 | Take a base snapshot | — | `secantusAdmin.archiveBaseSnapshot` | `Storage.archive_base_snapshot` |
-| Restore from an archive dir | `secantusd-py restore --source <dir>` | `restoreToTimestamp` (dir source) | `pitr_archive.restore_from_archive_dir` |
+| Restore from an archive dir | `secantusd-mdb restore --source <dir>` | `restoreToTimestamp` (dir source) | `pitr_archive.restore_from_archive_dir` |
 | Enable oplog archiving | `--oplog-archive-dir DIR` | — | `Storage(oplog_archive_dir=…)` |
 
 ## Notes & limitations

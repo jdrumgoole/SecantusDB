@@ -1,185 +1,131 @@
 # Quickstart
 
-SecantusDB runs in two modes from the same `SecantusDBServer` class:
+SecantusDB is two single-node database servers, each a real server process
+speaking a real wire protocol over WiredTiger:
 
-- **Embedded** — the server runs on a daemon thread inside your Python
-  process. Best when your application owns the database lifetime.
-- **Standalone daemon** — a long-running process that other tools,
-  processes, or language runtimes connect to over TCP. **This is the
-  drop-in `mongod` replacement**: any standard MongoDB driver or
-  command-line tool (`pymongo`, `mongo-go-driver`, `mongosh`,
-  `mongodump`, `mongorestore`, ...) connects unchanged — just point
-  the URI at SecantusDB's host:port.
+| Server | Command | Wire protocol | Clients |
+| --- | --- | --- | --- |
+| MongoDB server | `secantusd-mdb` | MongoDB | `pymongo`, `mongosh`, every MongoDB driver |
+| PostgreSQL server (beta) | `secantusd-pg` | PostgreSQL | `psycopg`, `psql`, SQLAlchemy, every PostgreSQL driver |
 
-Both modes default to **on-disk storage** at `./secantus-data` so data
-survives restarts. Pass `storage_path=":memory:"` (or `--storage-path
-:memory:` on the CLI) for a temporary, throwaway-data mode.
+[Install](installation.md) them from PyPI, crates.io, or a prebuilt archive,
+then run one as a daemon or start it from your own code. Both keep data on
+disk, in the directory you give them.
 
-## Embedded (in-process)
-
-A real script — start the server, connect, do work, shut down. The
-context manager handles startup and shutdown; `./secantus-data` is
-created on first run and reopened intact on later runs.
-
-```python
-from pymongo import MongoClient
-from secantus import SecantusDBServer
-
-with SecantusDBServer(port=27017) as server:
-    client = MongoClient(server.uri)
-    bottles = client["wine_cellar"]["bottles"]
-
-    bottles.insert_one({"_id": 1, "name": "Pommard 2018", "year": 2018})
-    bottles.insert_many(
-        [
-            {"_id": 2, "name": "Brunello 2015", "year": 2015},
-            {"_id": 3, "name": "Barolo 2017", "year": 2017},
-        ]
-    )
-
-    bottles.create_index([("year", 1)])
-    older = list(bottles.find({"year": {"$lte": 2017}}).sort("year"))
-    print([b["name"] for b in older])
-    # ['Brunello 2015', 'Barolo 2017']
-```
-
-When the `with` block exits the server stops cleanly. `./secantus-data`
-keeps the inserted documents — re-run the same script and `bottles.find`
-sees them again.
-
-For a different on-disk location, pass `storage_path=`:
-
-```python
-with SecantusDBServer(port=27017, storage_path="/var/lib/cellar") as server:
-    ...
-```
-
-## Standalone daemon
-
-Long-running process; other tools, processes, or language runtimes
-connect to it over TCP. Two ways to launch.
-
-### CLI
+## The MongoDB server
 
 ```bash
-secantusd-py --host 127.0.0.1 --port 27017
-# storage at ./secantus-data by default
+secantusd-mdb --host 127.0.0.1 --port 27017 --storage-path ./secantus-data
 ```
 
-`secantusd-py` is the standalone single-node Python server installed by `pip
-install SecantusDB`. The module form `python -m secantus` invokes the same
-entry point.
-
-Then from another shell — same commands you'd run against `mongod`:
+It prints `secantusd-mdb listening on <host>:<port>` once it accepts
+connections, runs until `SIGINT` / `SIGTERM`, and shuts WiredTiger down
+cleanly. `./secantus-data` is created on first run and reopened intact on
+later runs. Then, from another shell, use the same tools you would use against
+`mongod`:
 
 ```bash
 mongosh mongodb://127.0.0.1:27017
-mongodump   --uri mongodb://127.0.0.1:27017 --out ./dump
+mongodump    --uri mongodb://127.0.0.1:27017 --out ./dump
 mongorestore --uri mongodb://127.0.0.1:27017 ./dump
 ```
-
-Or from a Python script connecting to the running daemon:
 
 ```python
 from pymongo import MongoClient
 
 client = MongoClient("mongodb://127.0.0.1:27017")
-client["wine_cellar"]["bottles"].insert_one({"_id": 1, "name": "Pommard 2018"})
+bottles = client["wine_cellar"]["bottles"]
+bottles.insert_many(
+    [
+        {"_id": 1, "name": "Pommard 2018", "year": 2018},
+        {"_id": 2, "name": "Brunello 2015", "year": 2015},
+        {"_id": 3, "name": "Barolo 2017", "year": 2017},
+    ]
+)
+bottles.create_index([("year", 1)])
+older = list(bottles.find({"year": {"$lte": 2017}}).sort("year"))
+print([b["name"] for b in older])  # ['Brunello 2015', 'Barolo 2017']
 ```
 
-Or from Go — `mongo-go-driver` works the same way (see the
-[Go-driver validation report](validation-report-go.md)):
+Any other driver works the same way; `mongo-go-driver`, for instance (see the
+[Go-driver validation report](validation-report-go-rust-server.md)):
 
 ```go
 client, _ := mongo.Connect(options.Client().ApplyURI("mongodb://127.0.0.1:27017"))
 ```
 
-CLI flags:
+Common flags (the full table, the `secantusd.toml` config file, TLS and
+authentication are in the [Rust server docs](https://secantusdb.com/docs/rust/running.html)
+and [Configuration](configuration.md)):
 
 | Flag | Default | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `--host` | `127.0.0.1` | bind address |
-| `--port` | `27017` | TCP port (matches MongoDB's standard so existing tools just work) |
-| `--storage-path` | `./secantus-data` | WiredTiger home; pass `:memory:` for ephemeral |
-| `--log-level` | `INFO` | DEBUG / INFO / WARNING / ERROR |
+| `--port` | `27017` | TCP port; `0` picks a free one |
+| `--storage-path` | `./secantus-data` | WiredTiger home directory |
+| `--auth` | off | require SCRAM authentication |
+| `--log-level` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 
-`SIGINT` and `SIGTERM` are handled cleanly — the daemon calls
-`server.stop()` in the signal handler so WiredTiger shuts down without
-leaving stale lock files.
+## The PostgreSQL server (beta)
 
-### Programmatic
-
-When you embed the daemon in a larger long-running app (process
-supervisor, sandbox harness, etc.):
-
-```python
-from secantus import SecantusDBServer
-
-server = SecantusDBServer(host="127.0.0.1", port=27017, storage_path="/var/lib/cellar")
-server.start()       # returns once the listener is bound
-server.wait()        # blocks until server.stop() from another thread / signal
+```bash
+secantusd-pg ./secantus-pg-data 127.0.0.1:5432   # storage path, bind address
 ```
 
-## Temporary (in-memory) mode
+```python
+import psycopg
 
-For scratch experiments or tests, set `storage_path=":memory:"`. The
-server uses a tempdir WiredTiger home that's wiped on `stop()` — no
-files left behind, no port conflicts, fully parallel-safe. Combine with
-`port=0` so the OS picks a free port:
+with psycopg.connect("postgresql://postgres@127.0.0.1:5432/postgres", autocommit=True) as conn:
+    conn.execute("CREATE TABLE users (id int PRIMARY KEY, name text)")
+    conn.execute("INSERT INTO users VALUES (1, 'Joe')")
+    print(conn.execute("SELECT name FROM users WHERE id = 1").fetchone())  # ('Joe',)
+```
+
+`psql`, SQLAlchemy and the other PostgreSQL drivers connect the same way. See
+[SQL / PostgreSQL interface](sql.md) for the SQL surface.
+
+## Starting a server from your own code
+
+Each server can be started from the program that uses it, on a free port, with
+its data in a temporary directory removed on stop (or in a directory you pass
+as `storage_path`).
+
+**From Python**, the `secantusdb` launcher that `pip install SecantusDB`
+provides starts the real server binary as a subprocess:
 
 ```python
 from pymongo import MongoClient
-from secantus import SecantusDBServer
+from secantusdb import MongoServer, PostgresServer
 
-with SecantusDBServer(port=0, storage_path=":memory:") as server:
+with MongoServer() as server:                      # a free port, a temp directory
     client = MongoClient(server.uri)
-    # ... use client; nothing persists past this block ...
+    client["mydb"]["users"].insert_one({"_id": 1, "name": "Joe"})
+
+with PostgresServer(storage_path="./pg-data", port=5432) as server:
+    print(server.dsn)                              # postgresql://postgres@127.0.0.1:5432/postgres
 ```
 
-Pytest fixture form:
+**From Rust**, the crates are libraries as well: `secantus_mdb::Server` and
+`secantus_pg::PgServer` run the server in-process (see
+[Embedded in your application](https://secantusdb.com/docs/rust/embedded.html)).
 
-```python
-import pytest
-from pymongo import MongoClient
-from secantus import SecantusDBServer
-
-@pytest.fixture
-def client():
-    with SecantusDBServer(port=0, storage_path=":memory:") as server:
-        yield MongoClient(server.uri)
+```rust
+let server = secantus_mdb::Server::start()?;        // temporary store, OS-assigned port
+let client = mongodb::sync::Client::with_uri_str(server.uri())?;
 ```
 
-## Picking between them
-
-| Use case | Mode |
-|---|---|
-| Application owns the DB lifetime | Embedded, on-disk default |
-| Local dev replacement for `mongod` | Daemon (CLI), on-disk default |
-| CI scratch DB shared across processes | Daemon (CLI), persistent path |
-| Multi-language test (Python + Node + ...) | Daemon (CLI), fixed port |
-| Inside a parent application | Programmatic daemon, `start()` + `wait()` |
-| Pytest fixture / unit tests | Embedded, `port=0`, `:memory:` |
-
-## Async-friendly
-
-SecantusDB doesn't impose a threading model on client code — the server
-runs each connection on its own daemon thread under the hood, so
-`pymongo` clients (sync or via `motor`) just work.
-
-## Cleanup
-
-Always use the context-manager form for embedded mode, or call
-`server.stop()` in a teardown / signal handler for daemon mode. The CLI
-handles this for you. Letting the process exit without stopping the
-server is fine for the `:memory:` mode (everything is daemon threads +
-temp directories) but a persistent on-disk run will leave WiredTiger
-lock files behind that recovery has to clear on next open.
+A scratch instance on a free port with a temporary store is also what a test
+suite wants: start one per test or per session and point the driver at it.
 
 ## Next
 
+- [Installation](installation.md) — PyPI, crates.io and prebuilt binaries.
 - [Examples](examples.md) — connect, insert, index, query, drop.
+- [The servers](servers.md) — the two Rust servers and what each supports.
 - [Architecture](architecture.md) — what's running under the hood.
 - [Indexes](indexes.md) — index acceleration semantics, `explain`, hints.
 - [Aggregation](aggregation.md) — what pipeline stages and expression
   operators are supported.
 - [Compatibility](compatibility.md) — known differences from real `mongod`.
+- [Deprecated: Python servers](python-servers.md) — the original Python
+  servers, kept as a record.

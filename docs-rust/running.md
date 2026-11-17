@@ -68,7 +68,7 @@ in the storage engine the time went, which `mongod`'s line does.
 
 ## Configuration file
 
-Both MongoDB-wire daemons (`secantusd-py` and `secantusd-mdb`) read the same
+The daemon (`secantusd-mdb`) reads a
 `secantusd.toml`, discovered in order:
 
 1. `./secantusd.toml` (per-checkout / per-cwd)
@@ -76,10 +76,7 @@ Both MongoDB-wire daemons (`secantusd-py` and `secantusd-mdb`) read the same
 3. `/etc/secantus/secantusd.toml` (system-wide)
 
 or passed explicitly with `--config`. Every key is optional; explicit CLI
-flags override the file. The sections mirror the flags (a handful of keys
-are Rust-daemon-only — the commented `[storage]` modes below — and the
-Python daemon rejects them, so keep them out of a `secantusd.toml` shared
-with `secantusd-py`):
+flags override the file. The sections mirror the flags:
 
 ```toml
 [server]
@@ -100,7 +97,7 @@ noop_heartbeat_seconds = 0.0
 cache_size = "1G"
 session_max = 1000
 sync_on_commit = false
-# Rust-daemon-only storage modes (secantusd-py rejects these keys):
+# Storage modes:
 # oplog_async = true
 # oplog_nonlogged = true
 # data_nonlogged = true

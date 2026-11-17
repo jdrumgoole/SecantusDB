@@ -1,116 +1,74 @@
-# The two servers
+# The servers
 
-SecantusDB ships **two separate servers** that speak the same MongoDB wire
-protocol. You run **one or the other** — there is no in-process engine
-switching, and a client never sees a mix of the two.
+SecantusDB is **two single-node database servers**, one per wire protocol,
+both written in Rust over the same WiredTiger storage engine `mongod` ships.
+You run one or both; each is its own process with its own data directory.
 
-- **The Rust server** — the flagship: a self-contained Rust server (its own
-  wire / dispatch / cursors / accept loop over the pure-Rust engines and a
-  WiredTiger-backed store) that runs its accept loop off the GIL. It ships in
-  the `SecantusDB` wheel as an embedded lifecycle handle (`RustServer`) and
-  as the standalone `secantusd-mdb` binary; Python is only the launcher, never
-  in the request path.
-- **The Python server** — the original pure-Python `SecantusDBServer`. It is
-  the readable reference: every operator, stage and error message lands here
-  first.
+| | MongoDB server | PostgreSQL server (beta) |
+| --- | --- | --- |
+| Binary | `secantusd-mdb` | `secantusd-pg` |
+| Crate | [`secantus-mdb`](https://crates.io/crates/secantus-mdb) | [`secantus-pg`](https://crates.io/crates/secantus-pg) |
+| Library | `secantus_mdb::Server` | `secantus_pg::PgServer` |
+| Wire protocol | MongoDB | PostgreSQL |
+| Held to | `mongod` 8.x | PostgreSQL |
+| Conformance | **99.5%** of pymongo's own suite | psycopg 3's own suite, unmodified |
+| Speed | within 1.0×–3.2× of `mongod` per operation | see [Benchmark](benchmark.md) |
+| Get it | PyPI, crates.io, GitHub Releases | PyPI, crates.io, GitHub Releases |
 
-Each is held to **`mongod`**, never to the other. Comparing the two servers
-to each other detects drift; it never says which one is right.
+Each is held to the real product — **`mongod`** or **PostgreSQL** — never to
+the other server. See [Installation](installation.md) for the three ways to
+get them, and [Quickstart](quickstart.md) to run one.
 
-Both store data on the same vendored **WiredTiger** engine `mongod` ships, so
-the on-disk durability story is identical. The difference is the layers above
-storage — command dispatch, query planning, the operator engines — which are
-Python in one server and Rust in the other.
+Both store data on the vendored **WiredTiger** engine `mongod` ships, so the
+on-disk durability story is the same. A table `secantusd-pg` creates reads back
+through `secantusd-mdb` as a collection, with the `PRIMARY KEY` as `_id`; the
+reverse does not work, and the two cannot serve the same directory at the same
+time (WiredTiger's exclusive file lock makes the second server exit).
 
 :::{note}
-The old in-process accelerator (`SECANTUS_ENGINE=rust` /
-`SecantusDBServer(engine=...)`) has been **retired** in favour of this
-two-server split. The Python server is always pure-Python; the Rust engines
-live only in the Rust server.
+The original Python servers (`secantus.SecantusDBServer`, `secantusd-py`,
+`secantusd-py-pg`) are **fully deprecated**: not tested in CI, not published,
+no new work. They are documented, as a record, on
+[Deprecated: Python servers](python-servers.md). The old in-process
+accelerator (`SECANTUS_ENGINE=rust` / `SecantusDBServer(engine=...)`) was
+retired earlier.
 :::
-
-## Which one should I use?
-
-| | Rust server | Python server |
-| --- | --- | --- |
-| Package | the `secantus-mdb` crate (crates.io), or a release archive | `pip install SecantusDB` |
-| Run it as | `secantusd-mdb` / `secantus_mdb::Server` | `SecantusDBServer` / `secantusd-py` |
-| Conformance | **99.5%** of pymongo's own suite | see the [validation report](validation-report.md) |
-| Speed | within 1.0×–3.2× of `mongod` per operation | 2×–27× |
-| Request path | pure Rust (off the GIL) | pure Python |
-
-Use the **Rust server** to run SecantusDB — on a host, in a container, or embedded in your application.
-Reach for the **Python server** when you want to read how something works, or
-need one of the few features only it has (listed below and in the
-[Feature comparison](feature-comparison.md)). Speed figures are from
-[Benchmark](benchmark.md).
-
-The same split exists on the PostgreSQL side: the Rust PostgreSQL server
-(`secantusd-pg`) and the Python one
-(`SecantusPGServer` / `secantusd-py-pg`). See the
-[SQL / PostgreSQL interface](sql.md).
 
 ## Versioning
 
-The two servers are **separate deliverables on independent version lines**;
-they diverged at `0.5.2` and advance independently:
+The servers are **separate deliverables on independent version lines**:
 
-- **Python server** — `0.6.0bN` (PEP 440). This is the **PyPI package** version
-  in `pyproject.toml` / `secantus.__version__`.
-- **Rust server** — `0.5.3-beta.N` (SemVer pre-release), carried in lockstep
-  across the `crates/*` workspace and surfaced over the wire as
-  `buildInfo.secantusVersion`, by the `secantusd-mdb --version` flag, and by
-  the embedded handle's `RustServer.version`.
+- **MongoDB server** — `0.5.3-beta.N` (SemVer pre-release), carried in lockstep
+  across the MongoDB crates and surfaced over the wire as
+  `buildInfo.secantusVersion` and by `secantusd-mdb --version`.
+- **PostgreSQL server** — `0.1.0-beta.N`, on its own line
+  (`secantusd-pg --version`).
+- **The PyPI wheel** — versioned as the MongoDB server (`0.5.3-beta.196` is
+  `0.5.3b196`); it bundles the newest released `secantusd-pg` alongside.
 
 A change that touches only one server bumps only that server's version.
 
 ## Running each server
 
-### Python server
-
-```python
-from pymongo import MongoClient
-from secantus import SecantusDBServer
-
-with SecantusDBServer(port=27017) as server:
-    client = MongoClient(server.uri)
-    client["mydb"]["users"].insert_one({"_id": 1, "name": "Joe"})
-```
-
-Or as a daemon — `pip install` puts a `secantusd-py` script on `PATH`:
+### MongoDB server
 
 ```bash
-secantusd-py --host 127.0.0.1 --port 27017
+cargo install secantus-mdb --version <version>   # or: pip install SecantusDB
+secantusd-mdb --host 127.0.0.1 --port 27017 --storage-path ./secantus-data
 ```
 
-See [Quickstart](quickstart.md) and [Installation](installation.md).
+From Rust, `secantus_mdb::Server` starts the same server in-process; from
+Python, `secantusdb.MongoServer` starts the binary as a subprocess. Standalone
+`secantusd-mdb` archives are attached to the `secantusdb-v*` tags on
+[GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases). The
+daemon reads a `secantusd.toml` config (see [Configuration](configuration.md))
+and its own docs are in the
+[Rust server docs](https://secantusdb.com/docs/rust/index.html).
 
-### Rust server
+### PostgreSQL server
 
-The Rust server ships as the `secantus-mdb` crate on crates.io, not in the
-Python wheel. `cargo install` builds it (WiredTiger included) and puts the
-`secantusd-mdb` daemon on `PATH`:
-
-```bash
-cargo install secantus-mdb --version 0.5.3-beta.197
-secantusd-mdb --host 127.0.0.1 --port 27017
-```
-
-From a Rust test, the same crate starts the server in-process as
-`secantus_mdb::Server`. From a Python test, run `secantusd-mdb` as a
-subprocess and point `pymongo` at it, or use the Python server, which has
-the same `pymongo` surface.
-
-Standalone `secantusd-mdb` archives (no Python needed) are attached to the
-`secantusdb-v*` tags on
-[GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases). Both
-Mongo daemons read the same `secantusd.toml` config (see
-[Configuration](configuration.md)).
-
-### SQL / PostgreSQL servers
-
-The Rust PostgreSQL server is the `secantus-pg` crate on crates.io (`cargo
-install secantus-pg --version 0.1.0-beta.19`), and also ships as a standalone
+The PostgreSQL server is the `secantus-pg` crate on crates.io (`cargo
+install secantus-pg --version <version>`), is in the PyPI wheel, and also ships as a standalone
 `secantusd-pg` archive on
 the `secantusd-pg-v*` tags on
 [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases):
@@ -287,13 +245,6 @@ Until 0.1.0-beta.17 unknown users were trusted by default and
 `--refuse-unknown-users` refused them; that flag is still accepted, and
 changes nothing.
 
-The Python one needs the `sql` extra (`pip install "SecantusDB[sql]"`) and
-runs as `secantusd-py-pg`:
-
-```bash
-secantusd-py-pg --host 127.0.0.1 --port 5432 --storage-path ./secantus-data
-```
-
 See the [SQL / PostgreSQL interface](sql.md).
 
 ## What each server does **not** support
@@ -307,9 +258,9 @@ runtime).
 These are out of scope for **both** servers; the per-feature detail lives in
 [Compatibility](compatibility.md).
 
-### Python server
+### Python server (deprecated)
 
-The Python server implements the full in-scope wire surface. Its remaining
+The deprecated Python server implements the full in-scope wire surface. Its remaining
 divergences are the stopgaps and known edge cases enumerated in
 [Compatibility](compatibility.md) — the `_id` numeric-type bridge is
 undefined for `NaN` / infinity, `top` counters are always zero, and a handful
@@ -318,9 +269,9 @@ of date-format and
 Rust server does (`snappy`, `zstd`, `zlib`); a driver asked to compress
 simply sends uncompressed to it.
 
-### Rust server
+### Rust MongoDB server
 
-The Rust server passes 99.5% of pymongo's suite. The remaining *feature* differences (full three-way matrix in the
+The Rust MongoDB server passes 99.5% of pymongo's suite. The remaining *feature* differences (full three-way matrix in the
 [Feature comparison](feature-comparison.md)) are:
 
 - **Point-in-time restore over the wire** — `secantusAdmin.restoreToTimestamp`

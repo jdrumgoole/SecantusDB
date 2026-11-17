@@ -64,7 +64,7 @@ and lets the daemon bind on the public interface (TLS terminates
 in-process — see [TLS](#tls) below):
 
 ```ini
-# /etc/systemd/system/secantusd-py.service
+# /etc/systemd/system/secantusd-mdb.service
 [Unit]
 Description=SecantusDB
 After=network.target
@@ -73,7 +73,7 @@ After=network.target
 Type=simple
 User=secantus
 Group=secantus
-ExecStart=/usr/local/bin/secantusd-py
+ExecStart=/usr/local/bin/secantusd-mdb
 Restart=on-failure
 RestartSec=2
 LimitNOFILE=65535
@@ -147,7 +147,7 @@ enforced, or you'll lock yourself out. The bootstrap sequence:
 
 ```bash
 # 1. Start once without auth.
-secantusd-py --storage-path /var/lib/secantus/data --no-auth
+secantusd-mdb --storage-path /var/lib/secantus/data   # auth is off unless --auth
 
 # 2. Create an admin in a separate shell.
 mongosh mongodb://127.0.0.1:27017/ --eval '
@@ -159,7 +159,7 @@ mongosh mongodb://127.0.0.1:27017/ --eval '
 '
 
 # 3. Stop the daemon, then start it via systemd with auth on.
-sudo systemctl start secantusd-py
+sudo systemctl start secantusd-mdb
 ```
 
 From there, application users get provisioned over the wire with
@@ -195,7 +195,7 @@ PEM-format chain.
 Cert rotation is hot-swap-friendly *only* across a restart — the
 SSLContext is built once at startup and cached for the lifetime
 of the daemon. Bake `certbot renew --post-hook 'systemctl reload
-secantusd-py'` (a full restart, despite the name) into your renewal
+secantusd-mdb'` (a full restart, despite the name) into your renewal
 cron so renewed certs take effect.
 
 For deployments that want stronger client-identity guarantees, add
@@ -247,10 +247,10 @@ For the native path, a simple hourly cron + off-host sync:
 secantus-restore-archive \
     --archive /srv/secantus-backups/archive-2026-05-18T03.tar.gz \
     --target-dir /var/lib/secantus/data-restored
-sudo systemctl stop secantusd-py
+sudo systemctl stop secantusd-mdb
 sudo mv /var/lib/secantus/data /var/lib/secantus/data-old
 sudo mv /var/lib/secantus/data-restored /var/lib/secantus/data
-sudo systemctl start secantusd-py
+sudo systemctl start secantusd-mdb
 ```
 
 This is also reachable from the admin UI's `/backup` page (per-row

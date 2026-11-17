@@ -10,7 +10,7 @@ repository = "https://github.com/jdrumgoole/SecantusDB"
 rust-version = "1.98"
 readme = "README.md"
 keywords = ["postgresql", "database", "embedded", "server", "wiredtiger"]
-categories = ["database-implementations", "development-tools::testing"]
+categories = ["database-implementations"]
 
 # `cargo binstall secantus-pg` fetches the prebuilt binary that
 # release-pg-binaries.yml attaches to the `secantusd-pg-v<version>` release,

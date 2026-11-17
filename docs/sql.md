@@ -1,81 +1,48 @@
 # SQL / PostgreSQL interface
 
-SecantusDB can also speak **SQL over the PostgreSQL wire protocol**. The same
-WiredTiger data the MongoDB server stores is reachable a second way: a
-`SecantusPGServer` accepts connections from PostgreSQL clients and drivers, so a
-document written with `pymongo` can be read back as a row with `psql`, pg8000,
-or SQLAlchemy — and vice-versa.
+SecantusDB's PostgreSQL server, **`secantusd-pg`** (beta), speaks the
+PostgreSQL wire protocol on a real TCP socket and parses SQL with
+PostgreSQL's own grammar (libpg_query). Any PostgreSQL client or driver --
+`psql`, `psycopg`, pg8000, SQLAlchemy, JDBC -- connects to it as it would to
+`postgres`. Its exemplar is PostgreSQL: where the MongoDB server is held to
+`mongod` and `pymongo`, this one is held to PostgreSQL and the clients that
+talk to it.
 
-It is the SQL analogue of the MongoDB server: where the conformance target there
-is `pymongo`, here it is a PostgreSQL client. SQL is compiled down to the same
-query / update / aggregation engines the Mongo side uses, so it inherits index
-acceleration, the type system, and transactions for free.
-
-:::{note}
-The SQL interface is an **opt-in extra**. Install it with:
-
-```console
-$ pip install "SecantusDB[sql]"
-```
-
-The core MongoDB server never imports the SQL layer, so the base install stays
-lean.
-:::
+Rows live in the same WiredTiger store the MongoDB server uses. A table
+created through `secantusd-pg` reads back through `secantusd-mdb` as a
+collection, with the `PRIMARY KEY` as `_id` -- after a hand-off: the two
+servers cannot serve one directory at the same time, and the reverse direction
+(a collection written through MongoDB read as a table) is not supported.
 
 ## Starting the server
 
-`SecantusPGServer` mirrors `SecantusDBServer`: construct, `start()`, `stop()`,
-and a context-manager form. `port=0` picks a free port (handy in tests).
+Install it with `pip install SecantusDB`, `cargo install secantus-pg --version
+<version>`, or from a `secantusd-pg-v*` archive on GitHub Releases (see
+[Installation](installation.md)), then run it with a storage path and a bind
+address:
+
+```console
+$ secantusd-pg ./secantus-pg-data 127.0.0.1:5432
+```
+
+From Python, the `secantusdb` launcher starts it on a free port with a
+temporary data directory (or `storage_path=` to keep the data):
 
 ```python
-from secantus.sql import SecantusPGServer
+from secantusdb import PostgresServer
 
-with SecantusPGServer(port=5432, storage_path="./secantus-data") as server:
-    print(server.uri)          # postgresql://127.0.0.1:5432/postgres
+with PostgresServer() as server:
+    print(server.dsn)          # postgresql://postgres@127.0.0.1:<port>/postgres
     ...                        # connect and query; the server stops on exit
 ```
 
-For a long-running daemon, call `start()` and keep the process alive yourself:
-
-```python
-server = SecantusPGServer(port=5432, storage_path="./secantus-data")
-server.start()
-# ... the accept loop runs on a daemon thread; block your main thread here ...
-server.stop()
-```
-
-Or run it straight from the command line — `pip install "SecantusDB[sql]"` puts a
-`secantusd-py-pg` script on your `PATH` (the SQL sibling of the Mongo
-`secantusd-py` daemon):
-
-```console
-$ secantusd-py-pg --host 127.0.0.1 --port 5432 --storage-path ./secantus-data
-```
+From Rust, `secantus_pg::PgServer` runs it in-process.
 
 The connection's **database** selects the SecantusDB storage database; a SQL
 **table** is a collection; a **row** is a document.
 
-### Both protocols, one dataset
-
-Point a `SecantusPGServer` at the *same* `Storage` a `SecantusDBServer` owns and
-the two protocols serve the same data live:
-
-```python
-from pymongo import MongoClient
-from secantus import SecantusDBServer
-from secantus.sql import SecantusPGServer
-
-mongo = SecantusDBServer(port=27017)
-sql = SecantusPGServer(port=5432, storage=mongo.storage)  # share the store
-mongo.start()
-sql.start()
-
-# Write through MongoDB...
-MongoClient(mongo.uri)["shop"]["products"].insert_one(
-    {"_id": 1, "name": "Widget", "price": 9.99}
-)
-# ...read through SQL (database "shop" -> the same storage db).
-```
+The deprecated Python SQL server (`SecantusPGServer`, `secantusd-py-pg`) is
+documented, as a record, on [Deprecated: Python servers](python-servers.md).
 
 ## Connecting
 

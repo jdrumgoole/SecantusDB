@@ -14,3 +14,17 @@ PostgreSQL) are unchanged; tests remain one supported use among others.
   production-grade emulator" framing is replaced by the real-database framing.
 - `secantus-mdb` and `secantus-pg`: the `testing` crates.io keyword is
   replaced by `embedded`.
+- `docs/`: Rust-first. The index, installation, quickstart, servers and SQL
+  pages now lead with `secantusd-mdb` and `secantusd-pg`. Installation covers
+  all three channels: PyPI (`pip install SecantusDB`, the `secantusdb`
+  launcher and both prebuilt binaries), crates.io (`cargo install
+  secantus-mdb` / `secantus-pg`, and the crates as libraries) and the
+  prebuilt archives on GitHub Releases. The Python servers moved to a
+  clearly labelled "Deprecated: Python servers" page. Production,
+  configuration, authentication, recovery and examples pages use
+  `secantusd-mdb` and the `secantusdb` launcher.
+- `docs-rust/`: removes the stale claim that the PyPI wheel carries only the
+  Python servers, and stops comparing the Rust server to the Python server as
+  a reference.
+- `secantus-mdb` and `secantus-pg`: the `development-tools::testing` crates.io
+  category is dropped.

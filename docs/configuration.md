@@ -1,6 +1,6 @@
 # Configuration
 
-Both Mongo daemons (`secantusd-py` and `secantusd-mdb`) read the same
+The MongoDB daemon (`secantusd-mdb`) reads a
 `secantusd.toml` configuration file for deployment-shaped knobs that
 would otherwise have to be passed on every invocation. CLI flags still work and **override** any value
 set in the file, so the file is a per-deployment baseline rather
@@ -25,7 +25,7 @@ Concretely:
 
 When you don't pass `--config`, the launcher searches:
 
-1. `./secantusd.toml` — same directory you ran `secantusd-py` from
+1. `./secantusd.toml` — same directory you ran `secantusd-mdb` from
 2. `~/.secantus/secantusd.toml` — per-user
 3. `/etc/secantus/secantusd.toml` — system-wide
 
@@ -140,7 +140,7 @@ follow-on slice if your deployment needs a custom suite.
 Hot cert rotation isn't supported: the `SSLContext` is built once
 at startup and cached. Restart the daemon after renewing the cert
 (e.g. wire `certbot renew --post-hook 'systemctl reload
-secantusd-py'` into your renewal cron — a "reload" is a restart
+secantusd-mdb'` into your renewal cron — a "reload" is a restart
 despite the name).
 
 ### mTLS — verify client certs
