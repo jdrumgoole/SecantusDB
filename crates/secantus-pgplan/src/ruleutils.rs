@@ -6549,6 +6549,10 @@ pub struct VerboseRel {
     /// Each WHERE conjunct over this relation alone, as the plain plan
     /// prints its scan's `Filter` and as VERBOSE prints it, prefixed.
     pub quals: Vec<(String, String)>,
+    /// Each ON comparison as the plain plan prints it when this relation's
+    /// scan evaluates it as a `Filter` (its own column bare, the other
+    /// side's prefixed), and as VERBOSE prints it, both prefixed.
+    pub join_quals: Vec<(String, String)>,
 }
 
 /// `EXPLAIN VERBOSE` of a SELECT joining two relations on an ON of
@@ -6637,6 +6641,7 @@ pub fn explain_verbose_join(
         }
     };
     let mut needed: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+    let mut join_quals: [Vec<(String, String)>; 2] = [Vec::new(), Vec::new()];
     let mut need = |i: usize, col: &str| {
         if !needed[i].iter().any(|c| c == col) {
             needed[i].push(col.to_string());
@@ -6703,6 +6708,29 @@ pub fn explain_verbose_join(
         if li == ri {
             return None;
         }
+        let op = op.unwrap_or_default();
+        let side_text = |i: usize, c: &str, own: usize| {
+            if i == own {
+                q(c)
+            } else {
+                format!("{}.{}", q(&sides[i].0), q(c))
+            }
+        };
+        let full = format!(
+            "({}.{} {op} {}.{})",
+            q(&sides[li].0),
+            q(&lc),
+            q(&sides[ri].0),
+            q(&rc)
+        );
+        for own in [0usize, 1] {
+            let plain = format!(
+                "({} {op} {})",
+                side_text(li, &lc, own),
+                side_text(ri, &rc, own)
+            );
+            join_quals[own].push((plain, full.clone()));
+        }
         need(li, &lc);
         need(ri, &rc);
     }
@@ -6768,6 +6796,7 @@ pub fn explain_verbose_join(
                 .collect(),
             refname: q(refname),
             quals: quals[i].clone(),
+            join_quals: join_quals[i].clone(),
         }
     };
     Some(VerboseJoin {

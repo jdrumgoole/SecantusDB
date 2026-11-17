@@ -1808,7 +1808,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966).
     "explain verbose of a nested loop whose inner filter reads both relations": (
-        "RP-966",
+        "RP-966:fixed",
         _ANALYSED,
         "explain verbose select k.b, e.a from e left join k on e.a < k.a and e.b <> k.b",
         [
@@ -1820,6 +1820,26 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Output: k.a, k.b",
             "        Index Cond: (k.a > e.a)",
             "        Filter: (e.b <> k.b)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (RP-966): a WHERE conjunct reading both
+    # relations is the hash join's `Join Filter`.
+    "explain verbose of a hash join whose where reads both relations": (
+        "RP-966",
+        _ANALYSED,
+        "explain verbose select k.b, e.a from e join k on e.a = k.a where e.b <> k.b",
+        [
+            "Hash Join  (cost=27.50..45.14 rows=900 width=7)",
+            "  Output: k.b, e.a",
+            "  Inner Unique: true",
+            "  Hash Cond: (e.a = k.a)",
+            "  Join Filter: (e.b <> k.b)",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        Output: k.b, k.a",
+            "        ->  Seq Scan on public.k  (cost=0.00..15.00 rows=1000 width=7)",
+            "              Output: k.b, k.a",
         ],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966).

@@ -1757,10 +1757,11 @@ a regression test.
       than one relation; a node under a Hash, Sort or Material returns only
       the columns needed above, `CP_SMALL_TLIST`), its quals and keys
       printed with `unqualified = false`.
-      An inner index scan's `Filter` reading both relations (`e left join
-      k on e.a < k.a and e.b <> k.b`, `Filter: (e.b <> k.b)`) is still
-      printed plain.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a nested loop whose inner filter reads both relations]
+      (Since 2026-11-17 an inner index scan's `Filter` reading both
+      relations, an ON comparison, prints prefixed: `VerboseRel::join_quals`.)
+      A hash join with a WHERE conjunct reading both relations (its `Join
+      Filter: (e.b <> k.b)`) still prints the plain plan.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a hash join whose where reads both relations]
       Backlog-ID: RP-966
 
 

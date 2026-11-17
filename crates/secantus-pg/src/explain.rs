@@ -3475,8 +3475,10 @@ fn attach_verbose_nested_loop(root: &mut PlanNode, v: &secantus_pgplan::ruleutil
     }
     // The inner scan's `Index Cond: (<its column> <op> <outer ref>)`.
     let inner_rel = &v.rels[i];
+    // The inner scan may also evaluate an ON comparison as its `Filter`.
     let inner = &root.children[1];
-    if !filter_ok(inner, inner_rel) {
+    let inner_filters = inner.details.iter().filter(|(k, _)| k == "Filter").count();
+    if !(filter_ok(inner, inner_rel) || inner_filters == 1 && !inner_rel.join_quals.is_empty()) {
         return;
     }
     let mut cond = None;
@@ -3510,7 +3512,8 @@ fn attach_verbose_nested_loop(root: &mut PlanNode, v: &secantus_pgplan::ruleutil
         node.name = format!("{}{}", &node.name[..cut], r.relation);
         for (k, value) in &mut node.details {
             if k == "Filter" {
-                for (bare, qualified) in &r.quals {
+                let join = if n == 1 { r.join_quals.as_slice() } else { &[] };
+                for (bare, qualified) in r.quals.iter().chain(join) {
                     if value == bare {
                         value.clone_from(qualified);
                     } else {
