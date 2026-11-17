@@ -46419,6 +46419,36 @@ impl PgHandler {
                                         );
                                     }
                                 }
+                                // A nested loop into the inner side's unique
+                                // key index, parameterized by the outer row
+                                // (RP-978).
+                                scan_estimate::JoinPick::NestParam { b_outer } => {
+                                    let inner_key =
+                                        explain::join_key_texts(sel).and_then(|(l, r)| {
+                                            let k = if b_outer { l } else { r };
+                                            k.split_once('.')
+                                                .map(|(a, c)| (a.to_string(), c.to_string()))
+                                        });
+                                    if let (Some((alias, column)), Some(index)) =
+                                        (inner_key, indexes[1].clone())
+                                    {
+                                        explain::price_param_nest_loop(
+                                            &mut tree,
+                                            a,
+                                            b,
+                                            join,
+                                            b_outer,
+                                            &scan_estimate::ParamScan {
+                                                index,
+                                                alias,
+                                                column,
+                                                index_only: false,
+                                                read: Vec::new(),
+                                                memoize: None,
+                                            },
+                                        );
+                                    }
+                                }
                             }
                             // A side read through its index (RP-369).
                             if tree.estimate.is_some() {

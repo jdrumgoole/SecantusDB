@@ -1144,7 +1144,8 @@ pub(crate) fn split_conjuncts(text: &str) -> Vec<String> {
 /// `(column op other)`, the operator commuted for the second.
 fn index_cond_text(c: &str, own: &str, column: &str) -> Option<String> {
     let body = c.strip_prefix('(')?.strip_suffix(')')?;
-    for op in ["<=", ">=", "<", ">"] {
+    // An equality is the unique key's parameterized clause (RP-978).
+    for op in ["<=", ">=", "<", ">", "="] {
         let sep = format!(" {op} ");
         let Some((l, r)) = body.split_once(&sep) else {
             continue;
@@ -1160,6 +1161,7 @@ fn index_cond_text(c: &str, own: &str, column: &str) -> Option<String> {
                 "<" => ">",
                 "<=" => ">=",
                 ">" => "<",
+                "=" => "=",
                 _ => "<=",
             };
             return Some(format!("({column} {flipped} {l})"));
@@ -1439,6 +1441,43 @@ pub(crate) fn price_hash_join(
     root.estimate = Some(join);
 }
 
+/// Make the `Hash Join` this server drew the nested loop PostgreSQL keeps
+/// over the inner side's unique key index (RP-978): the outer scan, then
+/// the index scan parameterized by its row, whose join clause
+/// [`move_param_conds`] makes its `Index Cond`. `b_outer` puts the right
+/// table outer; `outer` and `inner` are the scans' estimates in that order,
+/// the inner's one scan's.
+pub(crate) fn price_param_nest_loop(
+    root: &mut PlanNode,
+    outer: crate::scan_estimate::Estimate,
+    inner: crate::scan_estimate::Estimate,
+    join: crate::scan_estimate::Estimate,
+    b_outer: bool,
+    param: &crate::scan_estimate::ParamScan,
+) {
+    if !matches!(root.name.as_str(), "Hash Join") || root.children.len() != 2 {
+        return;
+    }
+    if root.children[1].name != "Hash" || root.children[1].children.len() != 1 {
+        return;
+    }
+    let mut hash = root.children.pop().expect("two children");
+    let left = root.children.pop().expect("two children");
+    let right = hash.children.pop().expect("one child");
+    let (mut o, mut i) = if b_outer {
+        (right, left)
+    } else {
+        (left, right)
+    };
+    o.estimate = Some(outer);
+    i.estimate = Some(inner);
+    root.name = "Nested Loop".into();
+    root.children.push(o);
+    root.children.push(i);
+    param_index_inner(root, param);
+    root.estimate = Some(join);
+}
+
 /// Name a priced join's two scans, outer then inner, after the index each
 /// reads (RP-369): `Index Scan using <index> on <table>`, its `Index Name`
 /// first among its properties, as [`table_scan`] builds one; a `None`
@@ -1567,6 +1606,14 @@ pub(crate) fn render_text(
                     ));
                 }
             }
+        }
+        // A join with no qual after its `Output` (a nested loop whose join
+        // clause is its inner scan's Index Cond) still says so.
+        if unique_at == Some(n.details.len()) {
+            out.push(format!(
+                "{}Inner Unique: true",
+                " ".repeat(2 + 6 * depth + pad)
+            ));
         }
         if let (Some(n), Some(_)) = (n.heap_fetches, actual) {
             out.push(format!(

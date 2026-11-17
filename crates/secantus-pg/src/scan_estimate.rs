@@ -2174,6 +2174,7 @@ impl PgHandler {
             }
             let mut h =
                 self.hash_side_with(&p.table, &p.filter, &p.exprs, &p.field, &p.read, &p.above)?;
+            h.key_only_read = p.read.iter().all(|f| *f == p.field);
             // A side whose key is an expression: no statistics for it, so
             // `get_variable_numdistinct`'s 200 default, no MCVs and no
             // NULLs (`eqjoinsel`, `estimate_hash_bucket_stats`); not unique
@@ -3352,6 +3353,7 @@ impl PgHandler {
             key_ops: 0.0,
             default_nd,
             no_stats: key.is_none(),
+            key_only_read: false,
         })
     }
 
@@ -7079,6 +7081,10 @@ struct HashSide {
     /// Its table was never analysed (RP-1019): no statistics for the key,
     /// so `mergejoinscansel` keeps its defaults and reads it whole.
     no_stats: bool,
+    /// Its scan reads no column but its key: an index on the key could
+    /// serve it index-only (`check_index_only`), which a parameterized
+    /// inner here does not model.
+    key_only_read: bool,
 }
 
 /// A join key's B-tree index over an analysed table (RP-377): the table
@@ -7929,8 +7935,22 @@ fn hash_join_of(
         return None;
     }
     if unique_key {
-        let (other, merge) =
+        let (other, merge, nest_param) =
             unique_key_other_paths(&a, &b, &outer, &inner, rows, left_join, filter)?;
+        // The parameterized nested loop, cheaper beyond the fuzz factor and
+        // with no join filter left to check on each pair, is the plan.
+        if let Some((b_outer, param, startup)) = nest_param
+            .filter(|_| other * 1.01 < t0 && more.is_empty() && filter.count == 0 && !expr_key)
+        {
+            let (first, second) = if b_outer { (&b, &a) } else { (&a, &b) };
+            return Some((
+                first.scan,
+                param,
+                (startup, other, rows, width),
+                JoinPick::NestParam { b_outer },
+                [first.index.clone(), second.key_index_name.clone()],
+            ));
+        }
         if other <= t0 * 1.01 {
             // A merge reading a side presorted by its key's index, cheaper
             // beyond the fuzz factor, is the plan (RP-401); anything closer,
@@ -7988,6 +8008,16 @@ fn merge_column(s: &HashSide) -> Option<secantus_pgplan::colstats::Column<'_>> {
     })
 }
 
+/// What [`unique_key_other_paths`] finds: the cheapest path's total, a
+/// merge over a presorted side where that is it, and a parameterized nested
+/// loop where that is it (`b_outer`, the inner scan's estimate, the join's
+/// startup).
+type UniqueKeyPaths = (
+    f64,
+    Option<(secantus_pgplan::joincost::MergePlan, bool)>,
+    Option<(bool, Estimate, f64)>,
+);
+
 /// The cheapest total of the merge joins and nested loops PostgreSQL's
 /// `add_paths_to_joinrel` builds for `a` joined to `b` on one key, unique
 /// on a side (RP-377): each side's pathlist as `set_base_rel_pathlists`
@@ -8005,7 +8035,7 @@ fn unique_key_other_paths(
     rows: f64,
     left_join: bool,
     filter: JoinFilterCost,
-) -> Option<(f64, Option<(secantus_pgplan::joincost::MergePlan, bool)>)> {
+) -> Option<UniqueKeyPaths> {
     use secantus_pgplan::joincost::{
         base_pathlist, InPath, JoinMethod, JoinRel, MemoKey, RelPaths,
     };
@@ -8134,7 +8164,37 @@ fn unique_key_other_paths(
             .map(|p| (p, !matches!(best.method, JoinMethod::MergeOuterA { .. }))),
         _ => None,
     };
-    Some((best.total, merge))
+    // A nested loop whose inner is the parameterized index scan, with no
+    // Memoize over it: the plan `explain::price_param_nest_loop` draws.
+    // An inner that could be read index-only is not modelled.
+    let nest_param = match best.method {
+        JoinMethod::Other | JoinMethod::NestOuterB if !best.memoized && !left_join => {
+            let b_outer = matches!(best.method, JoinMethod::NestOuterB);
+            let (inner, paths, side) = if b_outer {
+                (a, &pa, best.a_path)
+            } else {
+                (b, &pb, best.b_path)
+            };
+            paths
+                .get(side)
+                .filter(|p| p.req_outer != 0 && p.indexed && !inner.key_only_read)
+                .filter(|_| {
+                    inner
+                        .key_index
+                        .as_ref()
+                        .is_some_and(|k| k.index.columns.len() == 1)
+                })
+                .map(|p| {
+                    (
+                        b_outer,
+                        (p.startup, p.total, p.rows, inner.scan.3),
+                        best.startup,
+                    )
+                })
+        }
+        _ => None,
+    };
+    Some((best.total, merge, nest_param))
 }
 
 /// A priced two-table join: the printed outer scan's, the inner scan's and
@@ -8174,6 +8234,14 @@ pub(crate) enum JoinPick {
     Merge {
         b_outer: bool,
         plan: secantus_pgplan::joincost::MergePlan,
+    },
+    /// A nested loop over the outer side's scan, its inner the index scan
+    /// on the inner side's unique key parameterized by the outer row
+    /// (`match_unsorted_outer` over `build_index_paths`' parameterized
+    /// path; RP-978): the right table outer with `b_outer`. The inner
+    /// estimate is one scan's, as PostgreSQL prints it.
+    NestParam {
+        b_outer: bool,
     },
 }
 

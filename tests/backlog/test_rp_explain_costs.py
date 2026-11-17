@@ -6593,6 +6593,91 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "                    Index Cond: (a = e.a)",
         ],
     ),
+    # Part of RP-978, fixed: an inner join whose range on the outer key
+    # leaves a few rows is the nested loop into the inner's unique key
+    # index, parameterized by the outer row, priced.
+    "a range on the join key of a unique inner is a parameterized nested loop": (
+        "RP-978:fixed",
+        _ANALYSED,
+        "explain select * from e join k on k.a = e.a where e.a > 998",
+        [
+            "Nested Loop  (cost=0.28..34.10 rows=2 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=2 width=7)",
+            "        Filter: (a > 998)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = e.a)",
+        ],
+    ),
+    "verbose of a parameterized nested loop into a unique key": (
+        "RP-978:fixed",
+        _ANALYSED,
+        "explain verbose select * from e join k on k.a = e.a where e.a > 998",
+        [
+            "Nested Loop  (cost=0.28..34.10 rows=2 width=14)",
+            "  Output: e.a, e.b, k.a, k.b",
+            "  Inner Unique: true",
+            "  ->  Seq Scan on public.e  (cost=0.00..17.50 rows=2 width=7)",
+            "        Output: e.a, e.b",
+            "        Filter: (e.a > 998)",
+            "  ->  Index Scan using k_pkey on public.k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Output: k.a, k.b",
+            "        Index Cond: (k.a = e.a)",
+        ],
+    ),
+    "analyze of a parameterized nested loop into a unique key": (
+        "RP-978:fixed",
+        _ANALYSED,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from e join k on k.a = e.a where e.a > 998",
+        [
+            "Nested Loop (actual rows=2 loops=1)",
+            "  ->  Seq Scan on e (actual rows=2 loops=1)",
+            "        Filter: (a > 998)",
+            "        Rows Removed by Filter: 998",
+            "  ->  Index Scan using k_pkey on k (actual rows=1 loops=2)",
+            "        Index Cond: (a = e.a)",
+        ],
+    ),
+    "a parameterized nested loop's inner keeps its own filter": (
+        "RP-978:fixed",
+        _ANALYSED,
+        "explain select * from e join k on k.a = e.a where e.a > 998 and k.b = 'v9'",
+        [
+            "Nested Loop  (cost=0.28..34.25 rows=1 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=2 width=7)",
+            "        Filter: (a > 998)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = e.a)",
+            "        Filter: (b = 'v9'::text)",
+        ],
+    ),
+    # Still open (RP-978): the parameterized inner read index-only, and a
+    # hashed side read through its index on a range of the key.
+    "a parameterized nested loop's inner read index-only": (
+        "RP-978",
+        _ANALYSED,
+        "explain select e.b from e join k on k.a = e.a where e.a > 998",
+        [
+            "Nested Loop  (cost=0.28..34.10 rows=2 width=3)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=2 width=7)",
+            "        Filter: (a > 998)",
+            "  ->  Index Only Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=4)",
+            "        Index Cond: (a = e.a)",
+        ],
+    ),
+    "a range on the hashed side's key reads it through its index": (
+        "RP-978",
+        _ANALYSED,
+        "explain select * from e join k on k.a = e.a where k.a < 10",
+        [
+            "Hash Join  (cost=8.54..26.18 rows=9 width=14)",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=8.43..8.43 rows=9 width=7)",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..8.43 rows=9 width=7)",
+            "              Index Cond: (a < 10)",
+        ],
+    ),
     # A constant the class generates for the inner side's indexed column
     # is that index scan's Index Cond, not a Filter (RP-977, fixed).
     "an equivalence class's generated constant is the inner index's cond": (

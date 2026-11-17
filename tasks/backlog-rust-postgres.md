@@ -1867,11 +1867,17 @@ a regression test.
       `select * from s left join (e join k on e.a < k.a) on s.a = e.a and
       k.b = 'v3'` is PostgreSQL's `Hash Right Join` with `s` hashed and a
       `Materialize` over `k`; here a `Hash Left Join` hashing the inner
-      join. The same inner join alone (`e join k on k.a = e.a where e.a >
-      998`) prints no estimate either: a range on the join key of a hash
-      join is not priced. Its rows are right. Measured on a private 15.19
-      cluster (found while working RP-393 and RP-397).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends]
+      join. Since 2026-11-17 the same inner join alone (`e join k on k.a =
+      e.a where e.a > 998`) is PostgreSQL's nested loop into `k_pkey`
+      parameterized by the outer row, priced (`JoinPick::NestParam`, drawn
+      by `explain::price_param_nest_loop`), where the unique-key path
+      search (`unique_key_other_paths`) picks it with no Memoize. Still
+      zeros there: that inner read index-only (`select e.b from e join k
+      ...`), and a range on the hashed side's key that reads it through
+      its index (`where k.a < 10`, PostgreSQL's `Hash Join (cost=8.54..26.18
+      rows=9 width=14)` over an `Index Scan using k_pkey`). Measured on a
+      private 15.19 cluster (found while working RP-393 and RP-397).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends], tests/backlog/test_rp_explain_costs.py::test_plan[a parameterized nested loop's inner read index-only], tests/backlog/test_rp_explain_costs.py::test_plan[a range on the hashed side's key reads it through its index]
       Backlog-ID: RP-978
 - [ ] **EXPLAIN prints no estimate for a join over a scan filtered by an
       expression.** Since RP-404 a comparison of integer or text arithmetic
