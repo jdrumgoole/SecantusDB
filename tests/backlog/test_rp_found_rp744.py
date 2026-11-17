@@ -7,7 +7,7 @@ computed every row's select list at the DECLARE):
 - a row a cursor reads again (a backward FETCH, a WITH HOLD cursor
   persisted at COMMIT) is not computed again, where PostgreSQL recomputes
   a volatile column;
-- `select * from cursor_to_xml(...)` reads the cursor twice;
+- `select * from cursor_to_xml(...)` read the cursor twice (fixed, RP-963);
 - a cursor over a set operation computed its rows at the DECLARE (fixed
   for a UNION ALL, its branches converted as they are read, RP-896), and
   still runs one with a UNION, INTERSECT or EXCEPT under it whole;
@@ -200,12 +200,12 @@ def test_a_cursor_recomputes_a_volatile_column_when_it_reads_a_row_again(dsn: st
     ]
 
 
-@pytest.mark.backlog("RP-963")
+@pytest.mark.backlog_fixed("RP-963")
 def test_cursor_to_xml_in_from_reads_the_cursor_once(dsn: str) -> None:
     """`select * from cursor_to_xml('c', 1, ...)` reads one row of the
     cursor on PostgreSQL 15.19, as the call in a select list does. Here the
-    call in FROM reads the cursor twice: it answers the second row, and the
-    FETCH after it the third. Measured on the shared reference."""
+    call in FROM read the cursor twice (once while its column was typed):
+    it answered the second row, and the FETCH after it the third. Measured on the shared reference."""
     assert _steps(
         dsn,
         [

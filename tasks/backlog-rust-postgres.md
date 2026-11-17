@@ -2660,17 +2660,6 @@ still computed whole, and the cursor answers that differ either way.
       (2026-11-14).
       Verify: tests/backlog/test_rp_found_rp744.py::test_a_cursor_recomputes_a_volatile_column_when_it_reads_a_row_again
       Backlog-ID: RP-962
-- [ ] **`select * from cursor_to_xml(...)` reads the cursor twice.** The
-      call in FROM fetches `count` rows twice: on a cursor over
-      `generate_series(1, 4)`, `select * from cursor_to_xml('c', 1, false,
-      true, '')` answers row 2 and the FETCH after it row 3, where
-      PostgreSQL 15.19 answers row 1 and then row 2, as `select
-      cursor_to_xml(...)` does here. A function in FROM looks to be run
-      once more than it is called (when planned and when run); a call
-      with a side effect is the case that shows it. Found while working
-      RP-895 (2026-11-14).
-      Verify: tests/backlog/test_rp_found_rp744.py::test_cursor_to_xml_in_from_reads_the_cursor_once
-      Backlog-ID: RP-963
 - [ ] **A cursor's WHERE is evaluated for every row at its first FETCH.**
       Since RP-897 a cursor's query runs at the first FETCH that needs a
       row (`portal_stream::PendingRows::Unstarted`), but the executor

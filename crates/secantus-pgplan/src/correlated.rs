@@ -118,6 +118,12 @@ pub const FETCH_CURSOR: &str = "\u{1f}fetch\u{1f}";
 /// The next `count` rows of the cursor `name`, as `SPI_cursor_fetch` reads
 /// them (34000 when no cursor has that name).
 pub(crate) fn fetch_cursor(name: &str, count: i64) -> Result<Vec<Vec<Bson>>> {
+    // A FETCH moves the cursor: while a statement is only typed or planned
+    // (`cursor_to_xml` in FROM is evaluated to learn its column), it reads
+    // nothing, as a sequence is not drawn then (RP-963).
+    if SUPPRESSED.with(|s| s.get()) || NO_CALLS.with(|s| s.get()) {
+        return Ok(Vec::new());
+    }
     run_direct(&format!("{FETCH_CURSOR}{count}\u{1f}{name}"), &[])
 }
 
