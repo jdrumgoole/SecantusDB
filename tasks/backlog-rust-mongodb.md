@@ -662,15 +662,6 @@ These are explicit non-goals. Don't add them without a reason.
       falls within mongod's own run-to-run spread of its answer.
       Verify: none -- mongod's own answer varies between runs; no test can pin it
       Backlog-ID: RM-556
-- [ ] **`find` drops a projection's `{$meta: "sortKey"}` field.** mongod
-      8.2.11 gives each document the sort key as an array:
-      `find({}, {k: {$meta: "sortKey"}}).sort({x: 1})` over `{_id: 1, x:
-      [3, 1]}` returns `{_id: 1, x: [3, 1], k: [1]}`. This server returns
-      the document without `k` (`apply_projection` omits the field). Under
-      `returnKey` the field is kept since RM-568 (`find::sort_key_array`).
-      Found 2026-11-15 (RM-568).
-      Verify: tests/backlog/test_rm_found_rm568.py::test_find_keeps_a_sort_key_meta_field
-      Backlog-ID: RM-703
 - [ ] **A `returnKey` read with a `sortKey` field over an index's order
       has no SORT_KEY_GENERATOR.** mongod 8.2.11 plans `find({y: {$gte:
       0}}, {k: {$meta: "sortKey"}}).sort({y: 1}).returnKey()` over `{y: 1,
