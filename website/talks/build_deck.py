@@ -7,6 +7,10 @@ ending in an optional ``<aside>`` of speaker notes. This writes
 ``/talks/<deck>/`` as a static file.
 
     python website/talks/build_deck.py pycon-ie-2026
+
+The deck sources in this folder are the canonical copy of each talk; edit
+them here and redeploy the site. Below 820px wide (or 500px tall) the page
+switches from the projected 16:9 stage to a scrolling reader view.
 """
 
 from __future__ import annotations
@@ -39,6 +43,7 @@ html,body{{margin:0;height:100%;background:#0B1915;overflow:hidden;}}
 #bar button{{background:none;border:1px solid #BFD3CB;color:inherit;
   border-radius:4px;padding:4px 10px;margin-left:6px;cursor:pointer;}}
 {css}
+{mobile}
 </style>
 </head>
 <body>
@@ -50,11 +55,15 @@ html,body{{margin:0;height:100%;background:#0B1915;overflow:hidden;}}
 <button id="next" aria-label="Next slide">&#8594;</button></div>
 <script>
 (function(){{
+  var READER={reader_js};
   var s=[].slice.call(document.querySelectorAll('#stage>section'));
   var stage=document.getElementById('stage'), i=0;
-  function fit(){{var k=Math.min(innerWidth/1920,innerHeight/1080);
+  var reader=matchMedia(READER);
+  function fit(){{if(reader.matches){{stage.style.transform='';return;}}
+    var k=Math.min(innerWidth/1920,innerHeight/1080);
     stage.style.transform='scale('+k+') translate(-50%,-50%)';}}
-  function show(n){{i=Math.max(0,Math.min(s.length-1,n));
+  function show(n){{if(reader.matches)return;
+    i=Math.max(0,Math.min(s.length-1,n));
     s.forEach(function(e,j){{e.classList.toggle('on',j===i);}});
     document.getElementById('num').textContent=(i+1)+' / '+s.length;
     history.replaceState(null,'','#'+(i+1));}}
@@ -65,12 +74,46 @@ html,body{{margin:0;height:100%;background:#0B1915;overflow:hidden;}}
     if(e.key==='Home')show(0); if(e.key==='End')show(s.length-1);}});
   document.getElementById('next').onclick=function(){{show(i+1);}};
   document.getElementById('prev').onclick=function(){{show(i-1);}};
+  s.forEach(function(e,j){{e.id=e.id||('s'+(j+1));}});
   fit(); show((parseInt(location.hash.slice(1),10)||1)-1);
 }})();
 </script>
 </body>
 </html>
 """
+
+#: Phones and small tablets get a scrolling, reflowed reading view instead of
+#: the 1920x1080 stage, which at phone width would scale body text to ~6px.
+READER_MEDIA = "(max-width: 820px), (max-height: 500px)"
+
+MOBILE_CSS = (
+    "@media " + READER_MEDIA + "{"
+    "html,body{height:auto;overflow:auto;}"
+    "#stage{position:static;width:auto;height:auto;transform:none!important;}"
+    "#stage>section{position:relative;display:flex!important;inset:auto;"
+    "padding:40px 16px!important;gap:20px!important;min-height:0;}"
+    "#bar{display:none;}"
+    "#stage h1{font-size:40px!important;}"
+    "#stage h2{font-size:28px!important;}"
+    "#stage h3{font-size:20px!important;}"
+    "#stage p,#stage li,#stage .body,#stage .l{font-size:16px!important;}"
+    "#stage .lede{font-size:19px!important;width:auto!important;}"
+    "#stage .eyebrow{font-size:12px!important;letter-spacing:2px;}"
+    "#stage .big,#stage .stat .n{font-size:40px!important;}"
+    "#stage .cards,#stage .stats{grid-template-columns:1fr!important;gap:16px!important;}"
+    "#stage .card,#stage .box{padding:16px!important;}"
+    "#stage .flow{flex-direction:column;align-items:stretch;gap:8px;}"
+    "#stage .arrow{font-size:20px;transform:rotate(90deg);align-self:center;}"
+    "#stage .box .t{font-size:17px;}"
+    "#stage ul.pts{font-size:16px;padding-left:20px;gap:10px;}"
+    "#stage .code{font-size:13px!important;padding:14px!important;"
+    "overflow-x:auto;white-space:nowrap!important;}"
+    "#stage .foot{position:static;width:auto;font-size:13px;}"
+    "#stage .stat{padding-left:14px;border-left-width:4px;}"
+    "#stage .rise{animation:none;}"
+    "#stage [style*='width:1400px']{width:auto!important;}"
+    "}"
+)
 
 _SECTION = re.compile(r"^\s*<section\b.*</section>\s*$", re.S)
 
@@ -94,6 +137,8 @@ def build(name: str) -> Path:
             title=html.escape(deck["title"]),
             fonts=fonts,
             css=css,
+            mobile=MOBILE_CSS,
+            reader_js=json.dumps(READER_MEDIA),
             slides="\n".join(slides),
         ),
         encoding="utf-8",
