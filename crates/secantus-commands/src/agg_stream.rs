@@ -405,6 +405,7 @@ const TIME_SERIES_STAGES: &[&str] = &[
     "$redact",
     "$skip",
     "$limit",
+    "$sort",
 ];
 
 /// A `$project` that only leaves fields out.
@@ -541,6 +542,9 @@ fn time_series(
         ask,
     );
     cursor.per_bucket = per_bucket;
+    // A `$sort` blocks: it runs once over every bucket the cursor stage
+    // unpacked, which mongod counts examined (five of five, RM-363).
+    cursor.whole = ask.pipeline.iter().any(|s| stage_name(s) == "$sort");
     Ok(Some((cursor, Vec::new())))
 }
 

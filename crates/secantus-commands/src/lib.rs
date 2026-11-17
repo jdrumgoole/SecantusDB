@@ -2059,7 +2059,10 @@ fn dispatch_inner(
             }
             // Ingress admission control, where mongod's `_initiateCommand`
             // admits: parsed, authorized, under its `maxTimeMS` (RM-355).
+            // One that never got its ticket acquired no collection, so its
+            // line names `<db>.$cmd` (measured 8.2.11, 2026-11-08).
             if let Err(e) = admit_ingress(name, doc, ctx) {
+                ctx.unacquired = true;
                 return e.into_reply();
             }
             if max_time_forced_to_expire(name, doc, ctx) {

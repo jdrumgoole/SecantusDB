@@ -554,15 +554,14 @@ These are explicit non-goals. Don't add them without a reason.
         as it runs and lets it go before its line reads its statistics, as
         mongod's does; a retryable one still holds every round to the end
         (RM-357's session row);
-      - the line of a command that never got its ingress ticket names
-        `<db>.$cmd` on mongod, its collection here; and mongod's first
-        retryable write after startup takes a second, exempt, ingress
-        admission (not traced), both measured 8.2.11 2026-11-08; an index
+      - mongod's first retryable write after startup takes a second,
+        exempt, ingress admission (not traced), measured 8.2.11
+        2026-11-08; an index
         build's `$currentOp` row has no `queues` here (mongod's not yet
         measured).
       **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08, the ticket pools 2026-11-09, and the per-command admission counts on the line 2026-11-09; what is left is above.
       Backlog-ID: RM-355
-      Verify: none -- the yield's second admission is RM-360's; the `$cmd` line name, the second exempt ingress admission and an index build's `queues` have no gap test yet
+      Verify: none -- the yield's second admission is RM-360's; the second exempt ingress admission and an index build's `queues` have no gap test yet
 - [ ] **Some writes' `locks` are not mongod's.** Since 2026-11-07 a write
       counts mongod's flow control tickets (one per global IX taken apart)
       and a retryable write's session checkout and session row, and a
@@ -573,7 +572,9 @@ These are explicit non-goals. Don't add them without a reason.
       one not there) reads the latest optime for its last op as mongod's
       entry point does (`lastop::entry_point_fixes`); since 2026-11-16 a
       `collMod` of a collection there takes mongod's global IS and its
-      collection X twice. Still different,
+      collection X twice; since 2026-11-17 a `findAndModify` that removes
+      takes one round, and a retryable one writes its image under the
+      transition, global and image collection IX. Still different,
       measured against a one-member replica set:
       - an `insert` of several documents one of which fails: mongod inserts
         them again a document at a time, each under a transition, global,
@@ -588,11 +589,6 @@ These are explicit non-goals. Don't add them without a reason.
         command's locks (`Metadata: {W: 1}`, one more global IX), taken
         without interrupt checks (the command's `numInterruptChecks` is
         mongod's without them);
-      - a retryable `findAndModify` writes its image under its locks (one
-        more transition, global and collection IX; a retryable remove reads
-        transition w 4, global w 3, database w 2, collection w 3 on mongod,
-        4/3/3/2 here, measured 2026-11-17); one without a `txnNumber` that
-        removes takes mongod's single round since 2026-11-17;
       - `$out` takes more transition locks than this server's rounds
         (measured on a standalone, RM-185), and an `$out`'s line here has
         one global IS more than mongod's (7 to 6, measured 8.2.11
@@ -721,7 +717,11 @@ These are explicit non-goals. Don't add them without a reason.
       alone. Since 2026-11-17 a `$sort` alone after a `$group` SBE runs
       counts the cursor stage's buffers (each a global IS) and its own and
       the cursor stage's `getNext`s, and its `getMore`s go on counting
-      with no lock of their own. The line of a `find`, `count`
+      with no lock of their own; so, since the same day, do a `$count`,
+      `$sortByCount` and `$bucket` SBE runs (the `$group` mongod expands
+      each into, with the `$project` or `$sort` after it left to the
+      pipeline), and a `$switch` of 50 branches or more (a `$bucket` of 50
+      buckets or more) keeps its `$group` classic, as on mongod. The line of a `find`, `count`
       or `distinct` of a collection with one candidate plan, a `getMore` of
       a `find`, an `aggregate` of a collection mongod's query layer runs
       whole, or whose stages after its cursor stage are `$project`,
@@ -742,10 +742,9 @@ These are explicit non-goals. Don't add them without a reason.
       - the other aggregates: one with a `$match` or `$redact` left after
         its read, a `$limit` there (it stops its source short
         of the documents this server runs in one go), a `$lookup`,
-        `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a stage
-        read whole that SBE does not take whole (a `$count` or `$bucket`
-        after a `$group`: 5 on mongod; a `$sort` alone after one is
-        counted), one over a
+        `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a `$group`
+        run classic over the cursor stage (a `$bucket` of 400 buckets: 16
+        and a `getMore` of 4 on mongod), one over a
         view or a time-series collection, and one asked for a first batch
         of none;
       - `findAndModify`: counted as the other writes are, it matches mongod
@@ -814,17 +813,18 @@ These are explicit non-goals. Don't add them without a reason.
         winner after its trial's buffer and count as mongod's do; the
         other readers still decline a contested plan
         (`order::stream_plan`);
-      - a read of a time-series collection made whole: under a `$sort`, a
+      - a read of a time-series collection made whole: under a
         `$group` (`count_documents`), an inclusion `$project` (RM-456), a
         filter on the meta field (RM-457), a hint or a collation. mongod
         counts the buckets its cursor stage buffered (five of five for a
         sorted `find`). Since RM-455 a `find` is the aggregation mongod
-        converts it to, and counts where a time-series `aggregate` streams;
+        converts it to, and counts where a time-series `aggregate` streams,
+        and since 2026-11-17 under a `$sort`;
       - a geo, `$near` or `$text` read (`$geoWithin` over a `2d` index:
         mongod 5 keys and 4 documents, this server none).
       Measured 2026-10-27, 2026-11-07, 2026-11-10 and 2026-11-13.
       Backlog-ID: RM-363
-      Verify: tests/backlog/test_rm_355_364.py::test_a_time_series_read_made_whole_counts_what_it_examined
+      Verify: tests/backlog/test_rm_355_364.py::test_a_grouped_time_series_read_counts_what_it_examined
 - [ ] **WiredTiger 11's interruptible cache wait is not on the line.**
       mongod 8.2.11's WiredTiger splits a cache wait into the share spent
       in interruptible eviction (`timeWaitingMicros.cacheInterruptibleMicros`)
