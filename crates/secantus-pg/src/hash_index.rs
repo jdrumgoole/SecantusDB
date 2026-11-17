@@ -455,6 +455,22 @@ impl crate::PgHandler {
         Some(self.with_hash_meta(table, &shape, |m| m.pages() as u32))
     }
 
+    /// Each hash index of `table`: its name, pages and index tuples, as
+    /// ANALYZE and `hashvacuumcleanup` report them.
+    pub(crate) fn hash_sizes(&self, table: &str) -> Vec<(String, u32, f64)> {
+        self.hash_index_shapes(table)
+            .into_iter()
+            .map(|shape| {
+                let pages = self.with_hash_meta(table, &shape, |m| m.pages() as u32);
+                (
+                    shape.name.clone(),
+                    pages,
+                    self.hash_indexed(table, &shape) as f64,
+                )
+            })
+            .collect()
+    }
+
     /// New tuple versions of `table` that are not heap-only, into each hash
     /// index (`_hash_doinsert`): SSI checks the key's bucket page, the
     /// tuple goes in, and a bucket may split, its locks copied to the new

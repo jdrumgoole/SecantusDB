@@ -1266,17 +1266,6 @@ records its pages and index tuples, from the metapage model
 `hash_index.rs` keeps; TRUNCATE records 0 pages, -1 tuples. Measured on a
 private 15.19 cluster:
 
-- [ ] **OPEN — ANALYZE and VACUUM leave a hash index's size as its build
-      recorded it.** A hash index built on an empty `(a int)` table, then
-      3,000 rows: PostgreSQL 15.19's ANALYZE records 18 pages and 3,000
-      tuples, and a VACUUM after deleting 1,000 rows 18 and 2,000
-      (`hashvacuumcleanup` reports every time); `secantusd-pg` keeps the
-      build's 10 pages and 0 tuples. `btree_analyzed` and the VACUUM's
-      index pass record the B-trees only, and an unmodelled hash index
-      (`HashShape::modelled` false) keeps no metapage past its build.
-      Verify: tests/backlog/test_rp_found_rp929.py::test_analyze_and_vacuum_record_a_hash_indexs_size
-      Backlog-ID: RP-954
-
 - [ ] **OPEN — a hash index has no overflow pages.** 1,000 rows of one
       key, all in one bucket: PostgreSQL 15.19 chains overflow pages to
       the full bucket (`_hash_addovflpage`) and records 12 pages;

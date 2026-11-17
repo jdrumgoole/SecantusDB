@@ -918,6 +918,8 @@ impl PgHandler {
             let pages = self.with_btree(table, &shape, |t| t.pages())?;
             self.record_index_size(table, &shape.name, pages, rows as f64)?;
         }
+        // A hash index's pages as its metapage has them (RP-954).
+        self.record_hash_sizes(table, self.hash_sizes(table))?;
         Ok(())
     }
 
@@ -945,6 +947,11 @@ impl PgHandler {
             return Ok(out);
         }
         self.hash_bulk_delete(table);
+        // `hashvacuumcleanup` reports every hash index a bulk delete
+        // visited (RP-954).
+        for (name, pages, tuples) in self.hash_sizes(table) {
+            out.push((name, pages, tuples as u64));
+        }
         self.am_bulk_delete(table, dead);
         for shape in self.btree_shapes(table) {
             let (pages, tuples) = self.with_btree(table, &shape, |t| {

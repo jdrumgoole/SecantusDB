@@ -15,7 +15,7 @@ import pytest
 SIZE = "SELECT relpages, reltuples FROM pg_class WHERE relname = '{}'"
 
 
-@pytest.mark.backlog("RP-954")
+@pytest.mark.backlog_fixed("RP-954")
 def test_analyze_and_vacuum_record_a_hash_indexs_size(pg: Any) -> None:
     """ANALYZE and VACUUM record each index's pages and tuples
     (`vac_update_relstats`); a hash index's VACUUM always reports them, as
@@ -24,7 +24,7 @@ def test_analyze_and_vacuum_record_a_hash_indexs_size(pg: Any) -> None:
     splitpoint of 16 buckets, 18 pages, which ANALYZE records with 3,000
     tuples, and a VACUUM after deleting 1,000 rows with 2,000.
     `secantusd-pg` kept the build's 10 pages and 0 tuples after both
-    (2026-11-14)."""
+    (2026-11-14), until both recorded the hash metapage model (RP-954)."""
     pg.execute("DROP TABLE IF EXISTS rp929m")
     pg.execute("CREATE TABLE rp929m (a int)")
     pg.execute("CREATE INDEX rp929m_h ON rp929m USING hash (a)")
