@@ -30,7 +30,7 @@ p{font-size:32px;line-height:1.4;}
 .stat .l{font-size:28px;color:var(--softdark);}
 .foot{position:absolute;left:128px;bottom:64px;width:1664px;font-size:24px;color:var(--soft);}
 .dark .foot{color:var(--softdark);}
-ul.pts{font-size:36px;line-height:1.45;padding-left:40px;display:flex;flex-direction:column;gap:20px;}
+ul.pts,ol.pts{font-size:36px;line-height:1.45;padding-left:40px;display:flex;flex-direction:column;gap:20px;}
 .flow{display:flex;flex-direction:row;align-items:center;gap:24px;}
 .box{background:#FBFAF6;border:3px solid var(--green);border-radius:12px;padding:28px 32px;flex:1;}
 .box p{font-size:28px;}
