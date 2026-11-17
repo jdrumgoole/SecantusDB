@@ -25,8 +25,13 @@ secantusd-mdb --port 27117          # no auth required
 
 Two equivalent switches:
 
-- CLI flag: `secantusd-mdb --auth`
-- Constructor: `SecantusDBServer(..., require_auth=True)`
+- CLI flag: `secantusd-mdb --auth` (or `auth = true` under `[server]` in
+  `secantusd.toml`)
+- Rust library: `secantus_mdb::Server::builder().auth(true)`
+
+(The `secantusdb.MongoServer` launcher takes only `storage_path` and `port`,
+so to run an authenticated server from Python, start `secantusd-mdb --auth`
+yourself.)
 
 With auth on, only the handshake and the SCRAM exchange run on an
 unauthenticated connection. Everything else (`find`, `insert`,
@@ -83,32 +88,24 @@ mongodb://alice:hunter2@127.0.0.1:27117/?authSource=admin&authMechanism=SCRAM-SH
 The chicken-and-egg problem: with `--auth` on you can't `createUser`
 without already being authenticated. There are two ways out:
 
-1. **Provision first, lock down second** — start without `--auth`, run
+1. **The localhost exception** — as on `mongod`, while the server has no
+   users at all, a connection from a loopback address may run `createUser`
+   on the `admin` database to create the first one. Once any user exists the
+   exception is closed for the rest of the server's life.
+2. **Provision first, lock down second** — start without `--auth`, run
    `createUser`, restart with `--auth`. The on-disk store keeps the
    user record across restarts.
-2. **Pre-seed in code** — for embedded use, reach into
-   `server.storage.add_user(...)` directly to insert the credential
-   record before clients connect. The shape mirrors mongod's
-   `admin.system.users[]` documents:
 
 ```python
-from secantus import SecantusDBServer
-from secantus.auth import SCRAM_SHA_256, derive_credentials
+from pymongo import MongoClient
 
-srv = SecantusDBServer(port=0, storage_path=":memory:", require_auth=True)
-srv.start()
-creds = derive_credentials("secret")
-srv.storage.add_user(
-    "admin",
-    "root",
+# secantusd-mdb --auth, no users yet: this works from loopback only.
+MongoClient("mongodb://127.0.0.1:27117/").admin.command(
     {
-        "_id": "admin.root",
-        "user": "root",
-        "db": "admin",
-        "credentials": creds.to_doc(),
+        "createUser": "root",
+        "pwd": "secret",
         "roles": [{"role": "root", "db": "admin"}],
-        "mechanisms": [SCRAM_SHA_256],
-    },
+    }
 )
 ```
 
@@ -129,8 +126,7 @@ admin.command("connectionStatus")                              # auth state
 With `--auth` on, every command from an authenticated connection is checked
 against the connection's effective roles; a miss returns `Unauthorized`
 (code 13) with mongod's `not authorized on <db> to execute command` message.
-With auth off (the zero-friction test-harness default) no privilege checks
-run.
+With auth off (the default) no privilege checks run.
 
 Built-in roles mirror mongod's: `read`, `readWrite`, `dbAdmin`, `userAdmin`,
 `dbOwner`, `readAnyDatabase`, `readWriteAnyDatabase`, `dbAdminAnyDatabase`,
@@ -258,4 +254,4 @@ advertised by default**. Pass `mechanisms=["SCRAM-SHA-1"]` to
 - **Internal cluster auth (keyfile / x509)** — only meaningful with
   replica sets / sharding, both out of scope.
 
-These are tracked in `tasks/backlog.md`.
+These are recorded as out of scope in `tasks/backlog-rust-mongodb.md` (section 3.1).

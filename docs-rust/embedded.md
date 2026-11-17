@@ -112,7 +112,7 @@ same version string.
 
 ## Tests under pytest-xdist
 
-Same pattern as the Python server: `port=0` plus a unique `storage_path`
+`port=0` plus a unique `storage_path`
 per test (pytest's `tmp_path` gives both isolation and cleanup):
 
 ```python

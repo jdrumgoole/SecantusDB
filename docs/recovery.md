@@ -15,21 +15,15 @@ WiredTiger connection isn't supported — real `mongod` restores work the same w
 ## The interface
 
 The MongoDB server, `secantusd-mdb` ([see the servers](servers.md)),
-implements the full PITR surface:
+provides:
 
 - the `restore` subcommand, `secantusd-mdb restore`;
-- the `secantusAdmin.backupArchive`, `secantusAdmin.restoreToTimestamp`, and
+- the `secantusAdmin.backupArchive`, `secantusAdmin.restoreArchive` and
   `secantusAdmin.archiveBaseSnapshot` wire commands;
 - the `--oplog-archive-dir` server flag.
 
-Because both servers store data in **the same WiredTiger schema** and write **the
-same mongod-shaped oplog**, a backup or data directory produced by one server is
-restorable by the other. The Python tooling restores a Rust server's data and the
-Rust binary restores a Python server's data, byte-for-byte — there is one PITR
-format, not two. (This identity is pinned by the cross-server tests
-`tests/test_rust_pitr_cross_server.py` and `tests/test_rust_binary_pitr.py`.)
-
-Everything below applies to both servers unless a heading says otherwise.
+The server stores data in WiredTiger and writes a **mongod-shaped oplog**, so
+a backup carries everything a restore needs.
 
 ## How it works
 
@@ -85,7 +79,7 @@ backup's recoverable range without opening WiredTiger.
 
 ## Snapshot backup
 
-`Storage.create_archive` forces a WiredTiger checkpoint and tars the consistent
+`secantusAdmin.backupArchive` forces a WiredTiger checkpoint and tars the consistent
 file set into a single `.tar.gz`. Over the wire it's the
 `secantusAdmin.backupArchive` command — taken **against the live server** (a
 consistent snapshot off WiredTiger's `backup:` cursor, no downtime):
@@ -98,8 +92,7 @@ admin.command({"secantusAdmin.backupArchive": 1, "outputPath": "/backups/db.tar.
 ```
 
 Restore the snapshot by extracting it into a fresh directory — with the
-`secantus-restore-archive` tool (Python) or the `secantusAdmin.restoreArchive`
-command — then start a new server on it. A plain snapshot restore lands you at the
+`secantusAdmin.restoreArchive` command — then start a new server on it. A plain snapshot restore lands you at the
 backup's checkpoint; for an arbitrary target time, use PITR below.
 
 ## Point-in-time recovery
@@ -110,17 +103,17 @@ wall-clock time. With neither, the whole oplog is replayed ("latest").
 ### CLI
 
 ```bash
-# Recover to a wall-clock time (use `secantusd-mdb restore` for the Rust binary):
+# Recover to a cluster timestamp (seconds[,ordinal]); here 2026-06-17T14:30:00Z:
 secantusd-mdb restore --source /backups/db.tar.gz \
                      --target-dir /restore/at-1430 \
-                     --to-time 2026-06-17T14:30:00Z
+                     --to-timestamp 1781706600
 
 # Or to a precise cluster timestamp (seconds[,ordinal]):
 secantusd-mdb restore --source /path/to/stopped-data-dir \
                      --target-dir /restore/exact \
                      --to-timestamp 1781716542,7
 
-# With neither --to-time nor --to-timestamp, the whole oplog is replayed
+# Without --to-timestamp, the whole oplog is replayed
 # ("latest"). Then start a server on the result:
 secantusd-mdb --storage-path /restore/at-1430
 ```
@@ -130,41 +123,17 @@ archive directory (see [Arbitrary window](pitr-arbitrary-window)
 below — auto-detected). `--target-dir` must be a fresh path.
 
 ```{note}
-The `restore` subcommand is `secantusd-mdb restore`. It exposes
-`--to-timestamp` and `--preserve-oplog`. (The deprecated Python server had its
-own console script, `secantusd-py restore`, which added `--to-time`.)
+The `restore` subcommand is `secantusd-mdb restore`. Its options are
+`--source`, `--target-dir`, `--to-timestamp` and `--preserve-oplog`; it takes a
+cluster timestamp, not a wall-clock time.
 ```
 
-### Wire command
+### Over the wire
 
-`secantusAdmin.restoreToTimestamp` exposes the same operation for admin tooling
-(both servers):
-
-```python
-admin.command({
-    "secantusAdmin.restoreToTimestamp": 1,
-    "source": "/backups/db.tar.gz",      # archive, stopped data dir, or archive dir
-    "targetDir": "/restore/at-1430",
-    "toTimestamp": Timestamp(1781716542, 7),   # or "toTime": <datetime>; omit for latest
-    "preserveOplog": False,                    # see "resume continuity" below
-})
-```
-
-### Python API
-
-The Python server's machinery is also importable directly:
-
-```python
-from secantus import oplog_replay
-
-# A backup archive or a stopped data directory:
-oplog_replay.restore_to_timestamp(source_dir, target_dir, to_ts=ts)        # data dir
-oplog_replay.restore_archive_to_timestamp(archive, target_dir, to_wall=t)  # .tar.gz
-
-# A PITR v2 archive directory:
-from secantus import pitr_archive
-pitr_archive.restore_from_archive_dir(archive_dir, target_dir, to_ts=ts)
-```
+The Rust server has no `secantusAdmin.restoreToTimestamp` command: a restore
+is the `secantusd-mdb restore` subcommand run against a stopped source. (The
+deprecated Python server exposed the same operation as that wire command; it
+is not on the Rust server, and there is no backlog item for it yet.)
 
 ### Transactions
 
@@ -203,19 +172,18 @@ secantusd-mdb --storage-path /data --oplog-archive-dir /pitr-archive
 
 With `--oplog-archive-dir` set, the rows `prune_oplog` is about to drop are first
 written to durable segment files (`oplog-<start>-<end>.seg`) in that directory.
-Take base snapshots on demand (there is no background scheduler — same explicit
-model as `prune_ttl` / `prune_oplog`):
+Take base snapshots on demand with the wire command below:
 
 ```python
 admin.command({"secantusAdmin.archiveBaseSnapshot": 1, "archiveDir": "/pitr-archive"})
 ```
 
 Each writes a `base-<headSeq>.tar.gz` into the directory. To recover, point
-`restore` at the **archive directory** (the CLI and wire command auto-detect it):
+`restore` at the **archive directory** (the CLI auto-detects it):
 
 ```bash
 secantusd-mdb restore --source /pitr-archive --target-dir /restore/at-T \
-                     --to-time 2026-06-10T09:00:00Z
+                     --to-timestamp 1781082000      # 2026-06-10T09:00:00Z
 ```
 
 Restore picks the newest base snapshot at or before the target time, extracts it,
@@ -230,8 +198,7 @@ By default the restored data directory starts a **fresh oplog timeline** — the
 replayed history isn't carried into the target, so a change stream on the restored
 server resumes only from the restore point forward (this matches `mongorestore`).
 
-Pass `--preserve-oplog` (`secantusd-mdb restore`) or `preserveOplog: true`
-(`secantusAdmin.restoreToTimestamp`) to carry the replayed oplog onto the restored
+Pass `--preserve-oplog` (`secantusd-mdb restore`) to carry the replayed oplog onto the restored
 directory **verbatim** — same seq, timestamp, and pre-images. A change stream on
 the restored server can then resume from a [resume token](change-streams.md)
 minted *before* the restore point, because the rows that token references are
@@ -239,16 +206,16 @@ present.
 
 ## Quick reference
 
-| Task | CLI | Wire command | Python API |
-|------|-----|--------------|------------|
-| Snapshot backup | — | `secantusAdmin.backupArchive` | `Storage.create_archive` |
-| Extract a snapshot | `secantus-restore-archive` | `secantusAdmin.restoreArchive` | `extract_backup_archive` |
-| Restore to a time | `secantusd-mdb restore --to-time/--to-timestamp` | `secantusAdmin.restoreToTimestamp` | `oplog_replay.restore_to_timestamp` |
-| Restore "latest" | `secantusd-mdb restore` (no bound) | `restoreToTimestamp` (no bound) | `restore_to_timestamp()` |
-| Carry oplog for resume | `--preserve-oplog` | `preserveOplog: true` | `carry_oplog=True` |
-| Take a base snapshot | — | `secantusAdmin.archiveBaseSnapshot` | `Storage.archive_base_snapshot` |
-| Restore from an archive dir | `secantusd-mdb restore --source <dir>` | `restoreToTimestamp` (dir source) | `pitr_archive.restore_from_archive_dir` |
-| Enable oplog archiving | `--oplog-archive-dir DIR` | — | `Storage(oplog_archive_dir=…)` |
+| Task | CLI | Wire command |
+|------|-----|--------------|
+| Snapshot backup | — | `secantusAdmin.backupArchive` |
+| Extract a snapshot | — | `secantusAdmin.restoreArchive` |
+| Restore to a time | `secantusd-mdb restore --to-timestamp` | — |
+| Restore "latest" | `secantusd-mdb restore` (no bound) | — |
+| Carry oplog for resume | `--preserve-oplog` | — |
+| Take a base snapshot | — | `secantusAdmin.archiveBaseSnapshot` |
+| Restore from an archive dir | `secantusd-mdb restore --source <dir>` | — |
+| Enable oplog archiving | `--oplog-archive-dir DIR` | — |
 
 ## Notes & limitations
 
@@ -257,8 +224,8 @@ present.
 - The source must be a **stopped** server's data directory or a backup archive —
   WiredTiger's single-writer lock forbids opening a live one. Take a
   `backupArchive` from the live server instead, then restore from that.
-- Base snapshots and oplog archiving have **no background scheduler** by design —
-  the operator drives `archiveBaseSnapshot` / pruning explicitly.
+- Base snapshots are taken on demand: the operator runs `archiveBaseSnapshot`
+  explicitly.
 - See [Change streams](change-streams.md) for the oplog model, [Running in
   production](production.md) for a deployment shape, and
   [Compatibility](compatibility.md) for the broader divergence list.

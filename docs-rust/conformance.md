@@ -1,11 +1,9 @@
 # Conformance
 
-The Rust server is measured the same way the Python server is: **unmodified
-upstream driver test suites** run against it, exactly as the driver
+The Rust server is measured with **unmodified upstream driver test suites** run against it, exactly as the driver
 maintainers run them against a real `mongod`.
 
-- **pymongo**: 99.5% of pymongo's own suite (1020 of 1025 running tests) —
-  level with the Python server. The
+- **pymongo**: 99.5% of pymongo's own suite (1020 of 1025 running tests). The
   [Rust-server validation report](https://secantusdb.com/docs/validation-report-rust-server.html)
   regenerates weekly with the exact failing-test list.
 - **mongo-java-driver**: 99.6% of the gauged suite; the two failures are
@@ -18,10 +16,10 @@ maintainers run them against a real `mongod`.
 
 The
 [feature comparison](https://secantusdb.com/docs/feature-comparison.html)
-maps both servers against real MongoDB feature by feature — commands,
+maps the server against real MongoDB feature by feature — commands,
 query/update/expression operators, aggregation stages, indexes, change
 streams, transactions, auth, and backup/PITR. The short version of what the
-Rust server does **not** have relative to the Python server:
+Rust server does **not** have:
 
 - `secantusAdmin.restoreToTimestamp` over the wire (use
   [`secantusd-mdb restore`](recovery.md) instead),
@@ -33,7 +31,7 @@ Rust server does **not** have relative to the Python server:
 
 Everything else — CRUD, aggregation, change streams with pre-images and
 resume, multi-document transactions, indexes (compound, partial, TTL,
-geo), auth/RBAC/TLS, backup/PITR — is at parity.
+geo), auth/RBAC/TLS, backup/PITR — is covered by the gauges above.
 
 How much of the server's own source those gauges and the project's test
 suites execute is measured separately, in [Test coverage](coverage.md).

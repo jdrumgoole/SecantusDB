@@ -23,9 +23,8 @@ instead).
 
 `0.MAJOR.PATCH-beta.N` (SemVer pre-release), carried in lockstep across
 every crate in the workspace. Most releases increment `N`; a patch (or
-minor/major) bump resets the beta label to `.0`. The Python package's
-PEP 440 version (`0.X.YbN` on PyPI) is a separate number — the two servers
-diverged at `0.5.2` and advance independently. A change that touches only
+minor/major) bump resets the beta label to `.0`. The PostgreSQL server (`secantusd-pg`) has its own version line, and the PyPI
+wheel's version is this server's (`0.5.3-beta.196` is `0.5.3b196`). A change that touches only
 one server bumps only that server's version.
 
 ## Platform matrix

@@ -992,9 +992,10 @@ the case you get: `Month` / `MONTH` / `month`), except `OF`, `TZH` and `TZM`,
 which Postgres registers in upper case only. Because matching is case-sensitive,
 `Ddth` is `D` + `d` + `th`, not `DD` + `th` — exactly as Postgres reads it.
 
-One limitation: Postgres defaults a template with no year in it to 1 BC.
-SecantusDB stores datetimes as Python `datetime`, which has no era and a minimum
-year of 1 AD, so a year-less template yields 1 AD instead.
+One limitation of the deprecated Python SQL server: Postgres defaults a
+template with no year in it to 1 BC, but its datetimes were Python `datetime`s,
+which have no era, so a year-less template yielded 1 AD. Not measured on
+`secantusd-pg`.
 
 ### Geometric types (`point` / `box` / `circle` / `polygon` / `lseg`)
 
@@ -1962,7 +1963,7 @@ SELECT dept, array_agg(name ORDER BY hired) FROM emp GROUP BY dept;
 SELECT string_agg(name, ', ' ORDER BY name DESC) FROM emp;
 ```
 
-The value + sort-key pair is collected per row and sorted in Python before the
+The value + sort-key pair is collected per row and sorted before the
 array is built / the string joined. Supported grouped, whole-table, **over a
 `JOIN`** (the value / sort-key expressions lower through the join resolver), and
 **under `GROUP BY ROLLUP` / `CUBE` / `GROUPING SETS`** (single-table and over a
@@ -1985,7 +1986,7 @@ FROM emp GROUP BY dept;
 cumulative fraction ≥ `f` (keeping the value's type); `mode()` returns the most
 frequent value (the smallest on a tie). NULLs are ignored; an all-NULL / empty
 group yields NULL. `f` must be in `[0, 1]` (else `2202E`). They collect the
-ordered values and compute in Python, so they work grouped and whole-table (not
+ordered values and compute from them, so they work grouped and whole-table (not
 yet over a JOIN).
 
 An aggregate can carry a `FILTER (WHERE cond)` clause — only rows satisfying
@@ -2318,7 +2319,7 @@ VALUES (1, 'a'), (2, 'b') ORDER BY 1;             -- a standalone constant table
 SELECT id FROM active UNION VALUES (99), (100);   -- a VALUES set-operation arm
 ```
 
-The combine happens in Python over each arm's result rows, so it composes with
+The combine happens over each arm's result rows, so it composes with
 any query the arms can express (joins, aggregates, subqueries).
 
 ## Common table expressions (WITH)
@@ -3365,211 +3366,40 @@ that path and never touches these commands.
 
 ## Authentication and TLS
 
-By default the server trusts every connection (matching the Mongo server's
-`require_auth=False` default). Turn on **SCRAM-SHA-256** by supplying users:
+`secantusd-pg` authenticates PostgreSQL roles. A role that has a password must
+prove it with SCRAM-SHA-256, and a wrong password is refused; the `postgres`
+role has no password and connects without one, as does any role created with no
+password. A user name the server has no role for is refused (it is asked for a
+password and none it gives is right) unless the server is started with
+`--trust-unknown-users`. Give `postgres` a password
+(`ALTER ROLE postgres PASSWORD '...'`) and every login then needs one:
 
-```python
-server = SecantusPGServer(port=5432, require_auth=True, users={"alice": "s3cret"})
-```
-
-```python
-pg8000.dbapi.connect(user="alice", password="s3cret", host="127.0.0.1", port=5432, database="db")
-```
-
-**TLS** is enabled by passing a certificate and key; the server answers the
-client's `SSLRequest` and wraps the socket:
-
-```python
-server = SecantusPGServer(
-    port=5432,
-    tls_cert_file="server.pem",
-    tls_key_file="server.key",
-)
+```sql
+CREATE ROLE app LOGIN PASSWORD 's3cret';
 ```
 
 ```python
-import ssl
-ctx = ssl.create_default_context(cafile="ca.pem")
-pg8000.dbapi.connect(user="alice", host="127.0.0.1", port=5432, database="db", ssl_context=ctx)
+import psycopg
+psycopg.connect("postgresql://app:s3cret@127.0.0.1:5432/postgres")
 ```
 
-### Roles (`CREATE ROLE` / `CREATE USER`)
+**TLS** is offered when the server is given a certificate and key
+(`--tls-cert-file` / `--tls-key-file`, or `PgServer::builder().tls(cert, key)`
+from Rust); a client that asks for it gets it. Client certificates
+(`--tls-client-cert`), a revocation list, user name maps and a `pg_hba.conf`
+(`--hba-file`) that decides each login as PostgreSQL's does are all in
+[the servers page](servers.md).
 
-SQL-level roles are recorded in the catalog and surfaced through `pg_catalog.pg_roles`,
-so `psql`'s `\du` and role-aware tooling see them:
+Out of the box the server is meant to be kept on loopback: with no
+`pg_hba.conf` and no TLS, any role without a password connects without one.
 
-```sql
-CREATE ROLE analyst;
-CREATE USER app WITH PASSWORD 'secret' CREATEDB;   -- USER implies LOGIN
-ALTER ROLE analyst WITH LOGIN;
-GRANT SELECT ON orders TO analyst;                 -- recorded + enforced (see below)
-DROP ROLE analyst;
-```
-
-`CREATE ROLE` / `CREATE USER` (with `LOGIN` / `SUPERUSER` / `CREATEDB` / `CREATEROLE` /
-`INHERIT` / `REPLICATION` and their `NO…` negations, `PASSWORD`, `CONNECTION LIMIT`),
-`ALTER ROLE`, and `DROP ROLE` are stored and reflected. Role-membership `GRANT` /
-`REVOKE` (`GRANT admin TO alice`) is accepted but not enforced. Table-privilege
-`GRANT` / `REVOKE` (`GRANT SELECT ON t TO alice`) **is** recorded and enforced — see
-[Table privileges](#table-privileges-grant--revoke) below. The connecting user
-always appears in `pg_roles` as a superuser login role, like Postgres' bootstrap
-superuser.
-
-These SQL roles are a schema-shape / reflection record, **distinct from the wire
-server's SCRAM auth users** (the `users={...}` constructor argument above): creating
-a SQL role does not by itself add a login credential, and vice versa.
-
-### Authorization (RBAC)
-
-By default the SQL surface is **unrestricted**: in trust mode (no `require_auth`)
-and for the embedded `run_sql` API, any statement runs against any database. To
-gate statements, start the server with `require_auth=True` **and** per-user role
-bindings via `user_roles`. Authorization then reuses the **same role model as the
-Mongo server** (`secantus.rbac`), so a SQL client and a Mongo client on the same
-`Storage` are held to the same roles:
-
-```python
-server = SecantusPGServer(
-    port=5432,
-    require_auth=True,
-    users={"analyst": "s3cret", "editor": "hunter2"},
-    user_roles={
-        "analyst": [{"role": "read", "db": "shop"}],       # SELECT only
-        "editor":  [{"role": "readWrite", "db": "shop"}],  # + INSERT/UPDATE/DELETE/DDL
-    },
-)
-```
-
-Each statement maps to one RBAC action on the connection's database and is
-checked with `rbac.check_privilege`: reads (`SELECT`, `DECLARE … CURSOR`, and a
-plain `WITH`) need `find`; `INSERT` / `UPDATE` / `DELETE` / `MERGE` (and any
-data-modifying CTE) need the matching write action; DDL needs
-`createCollection` / `dropCollection` / `createIndex`; `CREATE/DROP/ALTER ROLE`
-and `GRANT` / `REVOKE` need user-admin actions. Transaction control
-(`BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT`), `SET` / `SHOW`, cursor
-navigation (`FETCH` / `MOVE` / `CLOSE`), and session-info queries need no
-privilege. A denied statement returns SQLSTATE **`42501`**
-(`insufficient_privilege`) and the connection survives.
-
-Built-in roles (`read`, `readWrite`, `dbAdmin`, `dbOwner`, `root`, the
-`*AnyDatabase` variants) resolve directly; custom roles resolve through the
-shared roles table (`Storage.get_role` / the Mongo `createRole` command), so a
-role defined once governs both protocols. An authenticated user with no role
-binding can connect and run session-only statements but touches no data.
-
-Without `user_roles`, authorization stays off — pass it only when you want the
-per-database gate.
-
-### Table privileges (`GRANT` / `REVOKE`)
-
-`GRANT`/`REVOKE` of `SELECT` / `INSERT` / `UPDATE` / `DELETE` (or `ALL`) on a table
-are persisted and enforced as an **additive** layer over the Mongo RBAC roles
-above:
-
-```sql
-GRANT SELECT, INSERT ON orders TO analyst;   -- analyst can now read + insert orders
-GRANT SELECT ON orders TO PUBLIC;            -- everyone can read orders
-REVOKE INSERT ON orders FROM analyst;        -- take the insert back
-```
-
-A data operation is authorized when the connection's Mongo role covers it **or**
-a table grant does — so a grant *extends* access to a user whose role wouldn't
-otherwise allow the operation (including a user with no role at all, or via a
-`PUBLIC` grant), and a `REVOKE` takes that granted access back. Because the two
-axes are additive, a table grant never *shrinks* what a broader Mongo role
-(e.g. `readWrite`) already permits; use the role bindings for that. Enforcement
-follows the same opt-in as the RBAC gate: with authorization off (trust mode /
-embedded `run_sql`) grants are recorded and reflected but not enforced.
-
-Grants surface through `information_schema.role_table_grants` /
-`information_schema.table_privileges` and the `has_table_privilege([user,] table,
-privilege)` function:
-
-```sql
-SELECT grantee, privilege_type FROM information_schema.role_table_grants;
-SELECT has_table_privilege('analyst', 'orders', 'SELECT');   -- t
-```
-
-`ALL` expands to Postgres' seven table privileges for reflection fidelity, but
-only `SELECT` / `INSERT` / `UPDATE` / `DELETE` are enforced (the other operations
-don't exist in SecantusDB). Role-membership grants and grants on schemas /
-databases / sequences remain accepted no-ops.
-
-Grants can also be **column-scoped** for a finer grain than the whole table:
-
-```sql
-GRANT SELECT (id, title) ON articles TO editor;  -- editor reads only these columns
-GRANT UPDATE (title) ON articles TO editor;      -- and updates only this one
-```
-
-A column grant authorizes exactly the named columns. A statement is allowed on
-the column-grant path only when **every** column it touches is granted — a
-`SELECT` of an ungranted column (including a `SELECT *`, or a column referenced
-only in the `WHERE`) or an `UPDATE`/`INSERT` of an ungranted column is denied with
-`42501`. A whole-table grant (or a broader Mongo role) still covers every column,
-so column grants only *add* access — they never shrink it. Column grants surface
-through `information_schema.column_privileges` and
-`has_column_privilege([user,] table, column, privilege)`.
-
-### Switching identity (`SET ROLE` / `SET SESSION AUTHORIZATION`)
-
-A session can change its **current role** with `SET ROLE`, leaving the **session
-user** (the login identity) unchanged, and change both with `SET SESSION
-AUTHORIZATION`:
-
-```sql
-SET ROLE analyst;                 -- current_user is now analyst; session_user unchanged
-SELECT current_user, session_user;  -- ('analyst', 'joe')
-RESET ROLE;                       -- back to the login role (SET ROLE NONE is equivalent)
-
-SET SESSION AUTHORIZATION alice;  -- both current_user and session_user become alice
-RESET SESSION AUTHORIZATION;      -- back to the login identity
-```
-
-The current role (`current_user` / `current_role` / `user`) is what the table
-grants above are matched against, so a session that holds the `analyst` role can
-`SET ROLE analyst` to pick up whatever was granted to `analyst`. `session_user`
-always reports the login identity. `SHOW role` / `current_setting('role')` report
-the current role (`none` when it tracks the session user).
-
-When authorization is active, a session may only assume an identity it already
-holds — its own login, a role in its bindings, or anything if it is a superuser
-(`root`); assuming another identity to borrow its grants is denied with SQLSTATE
-`42501`. In trust mode (and the embedded API) the switch is unrestricted. Role
-*membership* is not otherwise tracked, so `SET ROLE` doesn't consult a membership
-graph beyond the session's own role bindings.
-
-### Row-level security (`CREATE POLICY`)
-
-Enable RLS on a table and attach policies to restrict which rows a role can see
-or write:
-
-```sql
-ALTER TABLE doc ENABLE ROW LEVEL SECURITY;
-CREATE POLICY owner_rows ON doc
-    FOR ALL TO public
-    USING (owner = current_user)         -- rows this role may read / target
-    WITH CHECK (owner = current_user);   -- rows this role may write
-```
-
-A policy's `USING` predicate is AND'd into the `WHERE` of a `SELECT` / `UPDATE` /
-`DELETE`, so only permitted rows are returned or affected; its `WITH CHECK`
-predicate is validated against each row an `INSERT` / `UPDATE` writes (a violation
-raises SQLSTATE `42501`). Identity functions (`current_user` / `session_user`) in
-a policy resolve to the session's identity — combined with `SET ROLE`, one
-connection can switch which rows it sees. `AS RESTRICTIVE` policies are AND'd with
-the OR of the permissive ones; a `FOR` clause scopes a policy to one command and
-`TO` scopes it to roles (default `public`). With RLS enabled and no applicable
-permissive policy, the table is default-deny (no rows).
-
-Enforcement follows the same opt-in as the rest of the RBAC surface: it bites
-only when authorization is active and a superuser (`root`) bypasses it, so trust
-mode and the embedded `run_sql` API record policies (visible in
-`pg_catalog.pg_policies`) but don't enforce them. **Limitations:** `USING`
-injection covers single-table `SELECT` / `UPDATE` / `DELETE` (a join doesn't get
-the base table's policy applied); there's no table-owner concept (RLS applies to
-every non-`root` role under active authorization, not "everyone except the
-owner"); and `FORCE ROW LEVEL SECURITY` is recorded but behaves like `ENABLE`.
+The SQL `GRANT` / `REVOKE`, `SET ROLE` and row-level-security (`CREATE POLICY`)
+surface is not described on this page for the Rust server yet; the open
+divergences from PostgreSQL are tracked in `tasks/backlog-rust-postgres.md`.
+The earlier description, written for the deprecated Python SQL server (whose
+users and RBAC bindings were passed to its constructor and shared the MongoDB
+roles), is kept as a record on
+[Deprecated: Python servers](python-servers.md).
 
 ## Session and catalog introspection
 

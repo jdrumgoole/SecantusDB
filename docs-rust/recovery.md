@@ -1,11 +1,10 @@
 # Backup and point-in-time recovery
 
-The Rust server has the same oplog-backed backup/recovery model as the
-Python server — hot backup archives over the wire, plus offline
-point-in-time restore. Archives are **portable between the two servers**:
-a backup taken from either restores on either. The concept-level docs are
-in the main tree's [Recovery](https://secantusdb.com/docs/recovery.html)
-page; this is the Rust-server surface.
+The Rust server has an oplog-backed backup/recovery model — hot backup
+archives over the wire, plus offline point-in-time restore. The
+concept-level docs are in the main tree's
+[Recovery](https://secantusdb.com/docs/recovery.html) page; this is the
+Rust-server surface.
 
 ## Hot backup (over the wire)
 
@@ -26,8 +25,7 @@ live retention window.
 ## Point-in-time restore (CLI)
 
 The Rust server's point-in-time restore is a subcommand of the binary
-(the Python server additionally exposes it over the wire as
-`secantusAdmin.restoreToTimestamp`):
+(there is no `secantusAdmin.restoreToTimestamp` wire command):
 
 ```
 secantusd-mdb restore --source PATH --target-dir PATH [--to-timestamp SECS[,ORD]]
@@ -64,6 +62,5 @@ secantusd-mdb --port 27017 --storage-path ./secantus-data-restored
 
 WiredTiger journals every commit; `--sync-on-commit` additionally fsyncs
 per commit (the `writeConcern j: true` guarantee) at a substantial
-throughput cost. Crash recovery is WiredTiger log replay on startup —
-identical semantics to the Python server, because it is literally the same
-storage engine.
+throughput cost. Crash recovery is WiredTiger log replay on startup — the
+same storage engine `mongod` ships.

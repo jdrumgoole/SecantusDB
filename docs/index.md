@@ -184,6 +184,8 @@ runtimes — without the clustering and infrastructure that `mongod` brings.
 - [Compatibility](compatibility.md) — known divergences from real MongoDB.
 - [Feature comparison](feature-comparison.md) — MongoDB vs the Rust server
   (and the deprecated Python server), feature by feature.
+- [Python launcher API](launcher-api.md) — `MongoServer` / `PostgresServer`
+  from `pip install SecantusDB`.
 - [API reference](api.md) — the deprecated Python server's `SecantusDBServer` and `Storage`.
 
 ## License
@@ -208,7 +210,9 @@ installation
 quickstart
 examples
 servers
+launcher-api
 python-servers
+api
 configuration
 architecture
 indexes
@@ -266,6 +270,5 @@ validation-report-pgx-rust-server
 validation-report-sqlstress-rust-server
 validation-report-pgtest-rust-server
 validation-report-pgjdbc-rust-server
-api
 changelog
 ```

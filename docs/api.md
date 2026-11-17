@@ -1,4 +1,11 @@
-# API reference
+# API reference (deprecated Python server)
+
+:::{warning}
+This is the autodoc of the **deprecated Python package** (`secantus`), not of the
+Rust servers and not of the `secantusdb` launcher that `pip install SecantusDB`
+provides; for that see [Python launcher API](launcher-api.md). It is kept with
+the other [Deprecated: Python servers](python-servers.md) material.
+:::
 
 The public surface is intentionally tiny. Most use cases need only
 `SecantusDBServer` — talk to it through `pymongo` and you get the full

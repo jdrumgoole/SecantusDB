@@ -28,3 +28,13 @@ PostgreSQL) are unchanged; tests remain one supported use among others.
   a reference.
 - `secantus-mdb` and `secantus-pg`: the `development-tools::testing` crates.io
   category is dropped.
+- The remaining pages are converted too. `sql.md` (authentication and TLS now
+  describe `secantusd-pg`'s roles, SCRAM, TLS and `pg_hba.conf`), `authentication`
+  (`--auth`, the localhost exception, `Server::builder().auth(true)`),
+  `change-streams`, `indexes` (the TTL monitor), `geospatial`, `recovery`
+  (`secantusd-mdb restore --to-timestamp`; no `restoreToTimestamp` wire
+  command on the Rust server), `production` (TLS needs a restart to rotate),
+  `admin` (marked as part of the deprecated Python package), `architecture`
+  (the Rust crate map; the Python layer map moved to the deprecated page) and
+  `docs-rust/`. A new page documents the `secantusdb` launcher API; `api.md` is
+  labelled as the deprecated Python server's autodoc.

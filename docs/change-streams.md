@@ -11,9 +11,9 @@ tokens, and can resume by token, `startAfter` token, or
 
 ```python
 from pymongo import MongoClient
-from secantus import SecantusDBServer
+from secantusdb import MongoServer
 
-with SecantusDBServer(port=0) as srv:
+with MongoServer() as srv:
     client = MongoClient(srv.uri, directConnection=True)
     db = client["app"]
     db.create_collection("orders")
@@ -42,8 +42,8 @@ event = next(cs)
 token = event["_id"]
 cs.close()
 
-# Later, possibly in a new process — but only if the SecantusDB server is
-# on-disk and survives. With `:memory:` storage, tokens die with the process.
+# Later, possibly in a new process — but only if the server's store survives
+# (a `storage_path`, not a temporary one removed on stop).
 cs2 = db["orders"].watch(resume_after=token)
 ```
 
@@ -102,28 +102,22 @@ When pre-images are not enabled on the collection, the field is omitted
 
 ## Retention and durability
 
-The oplog is a real WiredTiger table. With on-disk storage
-(`SecantusDBServer(storage_path="/path/to/wt-home")`), oplog rows
-survive process restart and resume tokens minted before a restart can
-be presented after.
+The oplog is a real WiredTiger table. With a persistent store
+(`secantusd-mdb --storage-path /path/to/wt-home`, or
+`MongoServer(storage_path=...)`), oplog rows survive process restart and
+resume tokens minted before a restart can be presented after.
 
 Retention defaults: **1 hour** by wall-clock and **100 000 entries** by
 count. Whichever cap kicks in first prunes the oldest entries plus
-their paired pre-images. Tune via the `Storage` constructor:
+their paired pre-images. Tune with daemon flags (or the matching
+`[oplog]` keys in `secantusd.toml`):
 
-```python
-from secantus.storage import Storage
-from secantus.server import SecantusDBServer
-
-# A retention-hostile config for tests that exercise resume failures.
-srv = SecantusDBServer(port=0, storage_path="/tmp/wt-home")
-srv.storage.oplog_retention_seconds = 5.0
-srv.storage.oplog_max_entries = 1000
+```bash
+secantusd-mdb --oplog-retention-seconds 5 --oplog-max-entries 1000
 ```
 
-Pruning is opportunistic (every 1000 emits) and exposed publicly as
-`Storage.prune_oplog(now=...)`. There is no background sweeper — same
-pattern as TTL indexes.
+The storage engine prunes as it writes, and the `secantusAdmin.pruneOplog`
+command runs a sweep immediately and replies `{pruned, ok}`.
 
 A resume token whose seq has been pruned surfaces
 `ChangeStreamHistoryLost` (code 286), wrapped by `pymongo` as
@@ -172,10 +166,10 @@ oplog is enabled. Capped-collection metadata (`size`, `max`) reads back
 through `listCollections.options` so admin tools that probe the shape
 see what they expect.
 
-`enable_oplog=False` (passed to `SecantusDBServer` / `Storage`) hides
-the entire surface — no `local` database, no `oplog.rs` collection,
-no oplog rows. The default is `True` since change streams depend on
-it.
+Starting `secantusd-mdb` with the `SECANTUS_DISABLE_OPLOG` environment
+variable set turns the oplog off, which hides the entire surface — no
+`local` database, no `oplog.rs` collection, no oplog rows. It is on by
+default since change streams depend on it.
 
 ## Invalidation
 
@@ -190,18 +184,15 @@ cursor id `0`, signalling end-of-stream to the client.
 
 ## Limitations
 
-See [`tasks/backlog.md`](https://github.com/jdrumgoole/SecantusDB/blob/main/tasks/backlog.md)
-"Change-stream limitations" for the canonical list. Highlights:
+See [`tasks/backlog-rust-mongodb.md`](https://github.com/jdrumgoole/SecantusDB/blob/main/tasks/backlog-rust-mongodb.md)
+for the canonical list of open gaps. Highlights:
 
 - Transactional writes DO carry `txnNumber` / `lsid` on their events
   (all events from one transaction share the commit `clusterTime`).
-- `$changeStreamSplitLargeEvent` is honoured at the envelope level on
-  the Python server — every event carries `{splitEvent: {fragment:1,
-  of:1}}` when the stage is given — but events never actually split
-  (oplog entries cap well below 16 MB in practice).
-  The Rust server adds `splitEvent` only to an event it split, as
-  `mongod` 8.2.11 does.
-- No `noop` heartbeats — resume tokens advance only on real ops.
+- `$changeStreamSplitLargeEvent` is supported: the server adds `splitEvent`
+  only to an event it split, as `mongod` 8.2.11 does.
+- `noop` heartbeats are off by default, so resume tokens advance only on real
+  ops; `--noop-heartbeat-seconds N` turns them on.
 - DDL "expanded" events (`createIndexes` / `dropIndexes`) are
   emitted only when the caller passes `show_expanded_events=True`
   to `coll.watch()` (mongod-faithful default-off). Without the
