@@ -53,7 +53,8 @@ A change that touches only one server bumps only that server's version.
 ### MongoDB server
 
 ```bash
-cargo install secantus-mdb --version 0.5.3-beta.197   # or: pip install SecantusDB
+pip install SecantusDB      # prebuilt secantusd-mdb and secantusd-pg on PATH
+# or: cargo install secantus-mdb --version 0.5.3-beta.197
 secantusd-mdb --host 127.0.0.1 --port 27017 --storage-path ./secantus-data
 ```
 
@@ -74,6 +75,7 @@ the `secantusd-pg-v*` tags on
 [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases):
 
 ```bash
+pip install SecantusDB      # the same wheel carries secantusd-pg
 secantusd-pg ./secantus-pg-data 127.0.0.1:5432
 ```
 

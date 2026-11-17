@@ -108,25 +108,9 @@ secantusd-mdb --port 27017 --storage-path ./data</code></pre>
 
 <section class="section">
   <div class="wrap">
-    <h2>How it differs from the Python reference</h2>
-    <p class="section-lead">Same database, same wire protocol, same storage on disk. Run this one; read the other one.</p>
-    <div class="compare-wrap">
-      <table class="compare-table">
-        <thead>
-          <tr><th>&nbsp;</th><th>Python reference</th><th>Rust MongoDB server</th></tr>
-        </thead>
-        <tbody>
-          <tr><th>Request path</th><td>Pure Python</td><td>Pure Rust</td></tr>
-          <tr><th>Reach for it when</th><td>You want to read, patch or extend the engine</td><td>You want to run it &mdash; anywhere, fast, with nothing installed</td></tr>
-          <tr><th>How you run it</th><td>From a source checkout only; no longer published</td><td><code>pip install SecantusDB</code>, the <code>secantus-mdb</code> crate, or a binary from Releases</td></tr>
-          <tr><th>Python required at runtime</th><td>Yes</td><td>No</td></tr>
-          <tr><th>Storage engine</th><td>WiredTiger</td><td>WiredTiger</td></tr>
-          <tr><th>Wire protocol &amp; drivers</th><td>MongoDB <code>OP_MSG</code> &mdash; all drivers</td><td>MongoDB <code>OP_MSG</code> &mdash; all drivers</td></tr>
-          <tr><th>Embeddable in Python</th><td>Native (in-process)</td><td>Yes &mdash; in-process on a GIL-released thread</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <div class="ctas" style="margin-top: 36px;">
+    <h2>Get it</h2>
+    <p class="section-lead"><code>pip install SecantusDB</code> puts <code>secantusd-mdb</code> and <code>secantusd-pg</code> on your <code>PATH</code>; or <code>cargo install secantus-mdb --version 0.5.3-beta.197</code>, or download a prebuilt binary.</p>
+    <div class="ctas" style="margin-top: 24px;">
       <a class="btn btn-primary" href="{{ SECANTUS_RUST_BINARY_URL }}" rel="noopener">Download the binary</a>
       <a class="btn btn-secondary" href="{{ SECANTUS_RUST_DOCS_URL }}index.html" rel="noopener">Read the Rust docs</a>
     </div>
