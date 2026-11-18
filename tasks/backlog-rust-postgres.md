@@ -2846,17 +2846,20 @@ statement is VALUES-only and runs there as written. The gap test is in
 
 ## Found while working RP-966 (2026-11-17)
 
-- [ ] **A nested loop whose inner relation has its own WHERE conjunct is
-      not priced.** `explain select e.b from e join k on e.a <> k.a where
-      k.b = 'v1'` (`e`, `k` 1,000 analysed rows) is, on PostgreSQL 15.19,
-      `Nested Loop (cost=0.00..1532.75 rows=99900 width=3)` over `Seq Scan
-      on e` and a `Materialize (cost=0.00..18.00 rows=100 width=4)` of
-      `Seq Scan on k (cost=0.00..17.50 rows=100 width=4)`; here zeros and
-      no Materialize. With the conjunct on the OUTER table PostgreSQL
-      swaps the sides and this server matches it (found while working
-      RP-966).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop over a filtered inner relation is priced]
-      Backlog-ID: RP-1038
+- [ ] **A nested loop whose inner relation has an index qual is not
+      priced.** `explain select e.b from e join k on e.a <> k.a where k.a
+      = 5` (`e`, `k` 1,000 analysed rows, `k.a` its primary key) prints a
+      Nested Loop over `Seq Scan on e` and `Index Scan using k_pkey on k`,
+      every cost zero; PostgreSQL 15.19 puts the one-row index side outer:
+      `Nested Loop (cost=0.28..35.79 rows=999 width=3)` over `Index Only
+      Scan using k_pkey on k (cost=0.28..8.29 rows=1 width=4)` and `Seq
+      Scan on e (cost=0.00..15.00 rows=1000 width=7)`. Since RP-1038 an
+      inner WHERE conjunct over a column no index covers is priced;
+      `nest_loop_estimate`'s side check still refuses a non-preserved
+      indexed side whose own quals an index can take. Found while working
+      RP-1038.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop over an inner relation's index qual is priced]
+      Backlog-ID: RP-1068
 
 
 - [ ] **An ORDER BY on a column the select list only computes from

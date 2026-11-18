@@ -2517,6 +2517,21 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966).
+    # Measured on PostgreSQL 15.19 (found while working RP-1038): the
+    # one-row index side is the loop's outer.
+    "a nested loop over an inner relation's index qual is priced": (
+        "RP-1068",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a <> k.a where k.a = 5",
+        [
+            "Nested Loop  (cost=0.28..35.79 rows=999 width=3)",
+            "  Join Filter: (e.a <> k.a)",
+            "  ->  Index Only Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=4)",
+            "        Index Cond: (a = 5)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Priced since RP-1038: no index covers the inner's conjunct.
     "a nested loop over a filtered inner relation is priced": (
         "RP-1038",
         _ANALYSED,
@@ -8050,6 +8065,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1038",
         "RP-1039",
         "RP-1025",
         "RP-1035",

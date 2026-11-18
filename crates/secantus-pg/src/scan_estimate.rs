@@ -632,6 +632,12 @@ impl PgHandler {
         let opaque_inequality = inequalities().any(|f| f.bounds.len() < 2);
         let indexes = self.index_relations();
         let project = j.project.as_deref();
+        let mut filter_reads = std::collections::HashSet::new();
+        for f in &filters {
+            if !secantus_pgplan::joins::expr_reads(&f.expr, &mut filter_reads) {
+                return None;
+            }
+        }
         // Each joined key's table and field, for `neqjoinsel`.
         let mut key_columns: Vec<(String, String, String)> = Vec::new();
         // Each side's table, its keys' stored fields and SQL names, and
@@ -672,6 +678,7 @@ impl PgHandler {
                             && !self.own_quals(&leaf.table, &leaf.filter).is_some_and(|q| {
                                 q.iter().all(|(_, q)| matches!(q, costsize::Qual::Ne))
                                     || own_bounds_only(&q)
+                                    || self.quals_unindexed(&leaf.table, &q)
                             }))))
             {
                 return None;
@@ -683,9 +690,18 @@ impl PgHandler {
                 let c = def.columns.iter().find(|c| c.field() == f)?;
                 table.field_of(&c.name)
             };
+            // A column only the scan's own WHERE conjuncts read is not in
+            // its target list (`build_base_rel_tlists`): it carries what
+            // the query above the join and the join's clauses read
+            // (RP-1038).
             let read: Vec<String> = columns
                 .iter()
-                .filter(|(key, _)| JoinRows::carries(project, key))
+                .filter(|(key, _)| {
+                    JoinRows::carries(project, key)
+                        && (project.is_none()
+                            || j.needed.contains(key)
+                            || filter_reads.contains(key))
+                })
                 .map(|(_, f)| stored(f))
                 .collect::<Option<_>>()?;
             let above: Vec<String> = columns
@@ -5037,6 +5053,36 @@ impl PgHandler {
 
     /// The quals `filter` is over user table `table`, as its scan's cost
     /// model sees them; none for an empty filter.
+    /// Whether no qual of `quals` reads a column an index of `table`
+    /// covers, so none can be an index scan's (`match_clause_to_index`)
+    /// and the table's only path under them is its sequential scan
+    /// (RP-1038). An index over an expression could match any qual.
+    fn quals_unindexed(&self, table: &str, quals: &[(String, costsize::Qual)]) -> bool {
+        let Some(def) = self.lookup(table) else {
+            return false;
+        };
+        let mut indexed: Vec<String> = Vec::new();
+        for ix in self.index_relations() {
+            if ix.table.name != table {
+                continue;
+            }
+            for k in ix.keys.iter().chain(ix.include.iter()) {
+                let Some(c) = usize::try_from(*k)
+                    .ok()
+                    .and_then(|k| k.checked_sub(1))
+                    .and_then(|k| def.columns.get(k))
+                else {
+                    return false;
+                };
+                let Some(f) = def.field_of(&c.name) else {
+                    return false;
+                };
+                indexed.push(f);
+            }
+        }
+        !quals.is_empty() && quals.iter().all(|(f, _)| !indexed.contains(f))
+    }
+
     fn own_quals(&self, table: &str, filter: &Document) -> Option<Vec<(String, costsize::Qual)>> {
         if filter.is_empty() {
             return Some(Vec::new());
