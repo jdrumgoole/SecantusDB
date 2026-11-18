@@ -1123,12 +1123,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       server refuses the `$meta` with code 2. Found 2026-11-13 (RM-521).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm521.py::test_a_facet_sort_key_is_empty
       Backlog-ID: RM-625
-- [ ] **A `$densify` sets no sort key.** mongod 8.2.11 leaves each
-      document the key of the field `$densify` sorted by: `{$meta:
-      "sortKey"}` reads `[n]` and a rank behind it ranks by it. This server
-      gives `[]` and ties every document. Found 2026-11-13 (RM-522).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_densify_sets_the_sort_key
-      Backlog-ID: RM-631
 - [ ] **The sort key is lost at a `$graphLookup` or a `$fill`.** mongod
       8.2.11 keeps it through both, as it does through the stages RM-520
       names; this server ends it at each, so a rank behind ties every

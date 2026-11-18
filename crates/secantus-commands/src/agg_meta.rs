@@ -250,10 +250,15 @@ pub(crate) fn mentions(v: &Bson, kind: &str) -> bool {
 /// a `$_internalSetWindowFields` compares it, an empty array's part
 /// `undefined`, which this engine's expressions take for MISSING; `$meta`
 /// gives that part as null, as it was before RM-410 kept the key whole.
+///
+/// A document with no key (one a `$densify` made, RM-631) gives it missing.
 fn sort_key_read() -> Bson {
-    Bson::Document(bson::doc! {
-        "$map": { "input": format!("${SORT_KEY}"), "in": { "$ifNull": ["$$this", null] } }
-    })
+    let key = format!("${SORT_KEY}");
+    Bson::Document(bson::doc! { "$cond": [
+        { "$eq": [{ "$type": &key }, "missing"] },
+        "$$REMOVE",
+        { "$map": { "input": &key, "in": { "$ifNull": ["$$this", null] } } },
+    ] })
 }
 
 /// Whether `stage` reads a document's sort-key metadata: a `{$meta:
@@ -303,9 +308,9 @@ fn ranks_by_sort_key(stage: &Bson) -> bool {
 pub(crate) fn ranks_with_no_sort_key(stages: &[Bson]) -> bool {
     stages.iter().enumerate().any(|(i, s)| {
         ranks_by_sort_key(s)
-            && stages[..i]
-                .iter()
-                .any(|b| DROPS_SORT_KEY.contains(&name(b)) || name(b) == "$unionWith")
+            && stages[..i].iter().any(|b| {
+                DROPS_SORT_KEY.contains(&name(b)) || matches!(name(b), "$unionWith" | "$densify")
+            })
     })
 }
 
@@ -528,6 +533,10 @@ pub(crate) fn rewrite_sort_metadata(
     let unions: Vec<bool> = (0..all.len())
         .map(|i| name(&all[i]) == "$unionWith" && union_adds_no_sort_key(&all, i))
         .collect();
+    // A rank lies behind each stage.
+    let all_ranks_ahead: Vec<bool> = (0..all.len())
+        .map(|i| all[i + 1..].iter().any(ranks_by_sort_key))
+        .collect();
     for (i, stage) in all.into_iter().enumerate() {
         let mut stage = stage;
         let name = name(&stage).to_string();
@@ -702,6 +711,40 @@ pub(crate) fn rewrite_sort_metadata(
                         fields.push(Bson::String(NO_SORT_KEY.to_string()));
                     }
                     spec.insert("fields", fields);
+                }
+            }
+            // mongod 8.2.11 gives each document `$densify` passes on the
+            // key of the field it densified by, `[n]` (not its partition's,
+            // and over any key it was handed), and the documents it makes
+            // none at all: `{$meta: "sortKey"}` is missing on them and a
+            // rank refuses them (2026-11-18, RM-631).
+            "$densify" => {
+                let field = stage
+                    .as_document()
+                    .and_then(|d| d.get_document("$densify").ok())
+                    .and_then(|spec| match spec.get("field") {
+                        Some(Bson::String(f)) if !f.is_empty() && !f.starts_with('$') => {
+                            Some(f.clone())
+                        }
+                        _ => None,
+                    });
+                if let Some(field) = field {
+                    out.push(Bson::Document(bson::doc! {
+                        "$_secantusSortKey": { "into": SORT_KEY, "by": { field: 1 } }
+                    }));
+                    out.push(stage);
+                    if all_ranks_ahead[i] {
+                        out.push(Bson::Document(bson::doc! { "$set": { NO_SORT_KEY: {
+                            "$cond": [
+                                { "$eq": [{ "$type": format!("${SORT_KEY}") }, "missing"] },
+                                true,
+                                "$$REMOVE",
+                            ]
+                        } } }));
+                        marked = true;
+                    }
+                    sort_live = true;
+                    continue;
                 }
             }
             "$setWindowFields" => {
@@ -1025,6 +1068,32 @@ mod tests {
                 doc! { "$project": { "m": "$$REMOVE" } },
                 doc! { "$set": { NO_SORT_KEY: true } },
                 rank,
+            ])
+        );
+    }
+
+    /// A `$densify` keys each document it passes on by its field and marks
+    /// the ones it makes as having none, for a rank to refuse (RM-631).
+    #[test]
+    fn a_densify_keys_by_its_field() {
+        let rank = doc! { "$_internalSetWindowFields": {
+        "sortBy": { "_id": 1 }, "output": { "r": { "$rank": {} } } } };
+        let densify =
+            doc! { "$densify": { "field": "n", "range": { "step": 1, "bounds": "full" } } };
+        let mut piped = stages(vec![densify.clone(), rank.clone()]);
+        assert!(needs_sort_metadata(&piped));
+        rewrite_sort_metadata(&mut piped, || None);
+        let key = format!("${SORT_KEY}");
+        assert_eq!(
+            piped,
+            stages(vec![
+                doc! { "$_secantusSortKey": { "into": SORT_KEY, "by": { "n": 1 } } },
+                densify,
+                doc! { "$set": { NO_SORT_KEY: { "$cond": [
+                    { "$eq": [{ "$type": key }, "missing"] }, true, "$$REMOVE",
+                ] } } },
+                rank,
+                doc! { "$unset": [SORT_KEY] },
             ])
         );
     }
