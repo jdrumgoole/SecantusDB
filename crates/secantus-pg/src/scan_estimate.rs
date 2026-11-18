@@ -2145,13 +2145,28 @@ impl PgHandler {
         }
         // The WHERE's conjuncts over the outer relation filter its scan;
         // the sublink is the plan's residual, never in its filter.
-        if !sj.outer_quals.is_empty() && sel.filter.is_empty() {
+        if sj.outer_quals.len() > sj.outer_exprs.len() && sel.filter.is_empty() {
             return None;
         }
-        let empty = Document::new();
-        let a = self.hash_side(&sj.outer.0, &sel.filter, &outer_key, &read, &fields)?;
+        for q in &sj.outer_exprs {
+            for f in &q.fields {
+                if !read.contains(f) {
+                    read.push(f.clone());
+                }
+            }
+        }
+        let a = self.hash_side_with(
+            &sj.outer.0,
+            &sel.filter,
+            &sj.outer_exprs,
+            &outer_key,
+            &read,
+            &fields,
+        )?;
+        // The subquery's WHERE filters the inner scan, which returns its
+        // key alone.
         let inner_read = [inner_key.clone()];
-        let b = self.hash_side(&sj.inner.0, &empty, &inner_key, &inner_read, &[])?;
+        let b = self.hash_side(&sj.inner.0, &sj.inner_filter, &inner_key, &inner_read, &[])?;
         let ((outer, inner, mut join, _, _), unique) = hash_semi_join_of(a, b)?;
         join.1 += target * join.2;
         join.3 += width;
@@ -4619,8 +4634,8 @@ impl PgHandler {
         self.user_seq_scan_with(table, filter, fields, &[], exprs, &[])
     }
 
-    /// Counts over one user table whose WHERE compares columns with
-    /// InitPlans' outputs (RP-440). The executor runs that WHERE as a FROM
+    /// Plain aggregates over one user table whose WHERE compares columns
+    /// with InitPlans' outputs (RP-440). The executor runs that WHERE as a FROM
     /// subquery under the Aggregate; PostgreSQL's `pull_up_simple_subquery`
     /// merges it, so its Subquery Scan is dropped and the Aggregate is
     /// priced by `cost_agg` (AGG_PLAIN) over the scan, the InitPlans' cost
@@ -4636,18 +4651,8 @@ impl PgHandler {
         let Statement::Select(sel) = sub.plan.as_ref() else {
             return;
         };
+        // `plain_agg_estimate` refuses the items it cannot price.
         let plain_counts = !agg.items.is_empty()
-            && agg.items.iter().all(|it| {
-                matches!(
-                    it.func,
-                    secantus_pgplan::AggFunc::CountStar | secantus_pgplan::AggFunc::Count
-                ) && it.expr.is_none()
-                    && it.expr2.is_none()
-                    && it.field2.is_none()
-                    && !it.distinct
-                    && it.filter.is_none()
-                    && it.order.is_empty()
-            })
             && agg.group_by.is_empty()
             && agg.grouping_sets.is_none()
             && agg.groupings.is_empty()
@@ -4697,10 +4702,12 @@ impl PgHandler {
         else {
             return;
         };
+        let Some((startup, total, rows, w)) = plain_agg_estimate(scan, &agg.items) else {
+            return;
+        };
         let mut scan_node = tree.children[0].children.remove(0);
         scan_node.estimate = Some(scan);
         tree.children[0] = scan_node;
-        let (startup, total, rows, w) = count_agg_estimate(scan, agg.items.len());
         tree.estimate = Some((startup + init_cost, total + init_cost, rows, w));
     }
 

@@ -1979,18 +1979,23 @@ a regression test.
       `compute_semi_anti_join_factors` takes them) it is planned and printed
       as that `Hash Join`. Still open: (1) Merge and nested-loop semi
       joins, the unique-ified side as the outer one, and a side read through
-      an index, are not priced. (2) Wider shapes still print the scan: a
-      sublink ANDed with an outer conjunct the scan's filter does not hold
-      whole (`select * from e where b in (select b from k) and length(b) >
-      1 and a > 5` is the unique-ified `Hash Join (cost=17.73..44.79 rows=332 width=7)`, its
-      scan `cost=0.00..22.50` with the expression's cost per row, on a
-      private 15.19 cluster), a subquery with its own WHERE, a cross-type
-      comparison. Conjuncts that lower wholly to the outer scan's filter
+      an index, are not priced; an IN subquery's own WHERE an index reads
+      (`select * from e where b in (select b from k where a > 990)`, k's
+      primary key on a) prints a zero-cost `Hash Semi Join` over k's Seq
+      Scan with that `Filter`, where 15.19 hashes a `HashAggregate` over
+      `Index Scan using k_pkey` (`Index Cond: (a > 990)`). Since 2026-11-18
+      an IN subquery's own WHERE over its relation filters the inner scan
+      (`SemiJoin::inner_filter`, `inner_quals`) and is priced where that
+      scan is sequential. (2) Wider shapes still print the scan: a
+      cross-type comparison, and an
+      outer conjunct other than a comparison of an expression with a
+      constant that the scan's filter does not hold whole. Outer conjuncts
       are pulled up with the sublink and filter that scan
-      (`sublink_join::split_where`).
+      (`sublink_join::split_where`); one that does not lower is priced as an
+      `ExprQual` (`SemiJoin::outer_exprs`).
       Backlog-ID: RP-411
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sublink anded with an outer expression qual is planned as a join]
-- [ ] **An aggregate above an InitPlan's scan is a Subquery Scan.** Since
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery read through an index is planned as a join]
+- [ ] **A node above an InitPlan's scan is unpriced.** Since
       RP-440's first slices (2026-11-16) a SELECT over one relation whose WHERE
       compares columns with uncorrelated FROM-less scalar subqueries plans
       each as an InitPlan on the top node, as PostgreSQL 15.19 does
@@ -2006,10 +2011,11 @@ a regression test.
       FROM, a correlated one, or a sublink beside any other non-constant
       qual is still printed inline (`select * from e where b = (select b
       from k limit 1)`); a join's ON InitPlan is unpriced; other nodes above
-      the scan (a Limit above a Sort, Unique, a computed sort key, an
-      aggregate other than a count, a GROUP BY) are unpriced. Measured on a private 15.19
-      cluster.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sum above an initplan's scan is priced]
+      the scan (a Limit above a Sort, Unique, a computed sort key, a GROUP
+      BY) are unpriced. Plain aggregates other than counts over the scan are
+      priced since 2026-11-18 (`plain_agg_estimate`). Measured on a private
+      15.19 cluster.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a limit above a sort above an initplan's scan is priced]
       Backlog-ID: RP-440
 
 ## Found by batch 54 (2026-10-24)
@@ -2674,17 +2680,6 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 `_SETUP` in `tests/backlog/test_rp_found_rp689.py`: `t689(a d689, v
 varchar(3), w dv689, c char(3))`, `d689` an `int` with `check (value > 0)`.
 
-- [ ] **A FROM alias that names a record variable is substituted.** With
-      `declare r t689`, `(select r.a from s689.st r limit 1)` (`s689.st`
-      has no column `a`) is NULL on PostgreSQL 15.19: `r.a` is the
-      variable's field, and the alias `r` is no column reference. Here the
-      binder (`Interp::bind` in `plpgsql_fn.rs`, which works on tokens) also
-      replaces the alias token with the record's value, so the subquery is
-      42601 `syntax error at or near "$2"`. A fix binds only the tokens the
-      parse tree has as column references (RP-838 added such a parse of the
-      bound text, `check_column_conflicts`).
-      Verify: tests/backlog/test_rp_found_rp689.py::test_a_from_alias_a_record_variable_shares_is_not_the_variable
-      Backlog-ID: RP-982
 
 
 ## Found while working RP-845 (2026-11-11)

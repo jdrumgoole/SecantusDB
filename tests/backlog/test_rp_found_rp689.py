@@ -9,8 +9,8 @@ found while working it:
 - reading a field a record does not have was 42P01 (RP-837, fixed);
 - a qualified column reference that a record variable's field shares was
   read as the field, not refused as ambiguous (RP-838, fixed);
-- a FROM item's alias that names a record variable is substituted as the
-  variable's value, a syntax error (RP-982).
+- a FROM item's alias that names a record variable was substituted as the
+  variable's value, a syntax error (RP-982, fixed).
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`.
@@ -243,10 +243,13 @@ def test_no_conflict_without_a_from_item_of_that_name(dsn: str) -> None:
     assert _answer(dsn, _R % body) == _raised("<NULL>")
 
 
-@pytest.mark.backlog("RP-982")
+@pytest.mark.backlog_fixed("RP-982")
 def test_a_from_alias_a_record_variable_shares_is_not_the_variable(dsn: str) -> None:
     # `s689.st` has no column `a`, so `r.a` is the variable's field (NULL);
     # the alias `r` itself is no column reference, and PL/pgSQL never
     # substitutes it.
     body = "raise exception '%', (select r.a from s689.st r limit 1);"
+    assert _answer(dsn, _R % body) == _raised("<NULL>")
+    # The same with AS.
+    body = "raise exception '%', (select r.a from s689.st as r limit 1);"
     assert _answer(dsn, _R % body) == _raised("<NULL>")

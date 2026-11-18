@@ -752,6 +752,18 @@ pub(crate) fn outer_quals_on_semi_join(
     }
 }
 
+/// A [`semi_join_tree`]'s inner scan filtered by the IN subquery's own
+/// WHERE (RP-411).
+pub(crate) fn inner_quals_on_semi_join(
+    tree: &mut PlanNode,
+    quals: &[(String, Option<String>)],
+    index_columns: &dyn Fn(&str) -> Vec<String>,
+) {
+    if !quals.is_empty() {
+        quals_on_scan(&mut tree.children[1].children[0], quals, index_columns);
+    }
+}
+
 /// A [`semi_join_tree`] planned as the inner join of its inner side made
 /// unique on the compared column (`create_unique_path`, RP-411): a `Hash
 /// Join` hashing a `HashAggregate` of the inner scan, grouped by the key.

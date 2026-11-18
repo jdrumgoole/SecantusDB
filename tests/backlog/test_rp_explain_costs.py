@@ -5237,7 +5237,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # An aggregate other than a count over an InitPlan's scan, measured on
     # 15.19 (RP-440).
     "a sum above an initplan's scan is priced": (
-        "RP-440",
+        "RP-440:fixed",
         _ANALYSED,
         "explain select sum(a) from e where b = (select 'v3'::text)",
         [
@@ -5246,6 +5246,22 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
             "  ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=4)",
             "        Filter: (b = $0)",
+        ],
+    ),
+    # A Limit above a Sort above an InitPlan's scan, measured on 15.19
+    # (RP-440).
+    "a limit above a sort above an initplan's scan is priced": (
+        "RP-440",
+        _ANALYSED,
+        "explain select a from e where b = (select 'v3'::text) order by a limit 5",
+        [
+            "Limit  (cost=19.17..19.18 rows=5 width=4)",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
+            "  ->  Sort  (cost=19.16..19.41 rows=100 width=4)",
+            "        Sort Key: e.a",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=4)",
+            "              Filter: (b = $0)",
         ],
     ),
     # A table whose only index is a composite one, its WHERE constraining
@@ -5399,7 +5415,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # An outer qual over an expression beside the sublink: its scan's
     # filter is priced with the expression's cost, measured on 15.19.
     "a sublink anded with an outer expression qual is planned as a join": (
-        "RP-411",
+        "RP-411:fixed",
         _ANALYSED_THIRTY,
         "explain select * from e where b in (select b from k) and length(b) > 1 and a > 5",
         [
@@ -5411,6 +5427,65 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  HashAggregate  (cost=17.50..17.60 rows=10 width=3)",
             "              Group Key: k.b",
             "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=3)",
+        ],
+    ),
+    # A scan's filter in `order_qual_clauses`' order, a built-in call
+    # costing its `procost`, measured on 15.19 (RP-411).
+    "a scan's filter puts a cheaper qual before a call": (
+        "RP-411:fixed",
+        _ANALYSED,
+        "explain select * from e where length(b) > 1 and a > 5",
+        [
+            "Seq Scan on e  (cost=0.00..22.50 rows=332 width=7)",
+            "  Filter: ((a > 5) AND (length(b) > 1))",
+        ],
+    ),
+    # A sublink whose subquery has its own WHERE, measured on 15.19.
+    "an in subquery with its own where is planned as a join": (
+        "RP-411:fixed",
+        _ANALYSED,
+        "explain select * from e where b in (select b from k where a > 500)",
+        [
+            "Hash Join  (cost=18.98..47.73 rows=1000 width=7)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=18.85..18.85 rows=10 width=3)",
+            "        ->  HashAggregate  (cost=18.75..18.85 rows=10 width=3)",
+            "              Group Key: k.b",
+            "              ->  Seq Scan on k  (cost=0.00..17.50 rows=500 width=3)",
+            "                    Filter: (a > 500)",
+        ],
+    ),
+    # Over a unique column, the inner join keeps the subquery's WHERE on
+    # the inner scan, measured on 15.19 (RP-411).
+    "an in subquery with its own where over a unique column is an inner join": (
+        "RP-411:fixed",
+        _ANALYSED,
+        "explain select * from e where a in (select a from k where b = 'v3')",
+        [
+            "Hash Join  (cost=18.75..36.39 rows=100 width=7)",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=17.50..17.50 rows=100 width=4)",
+            "        ->  Seq Scan on k  (cost=0.00..17.50 rows=100 width=4)",
+            "              Filter: (b = 'v3'::text)",
+        ],
+    ),
+    # An IN subquery whose WHERE an index reads: its side is that Index
+    # Scan, made unique, measured on 15.19 (RP-411).
+    "an in subquery read through an index is planned as a join": (
+        "RP-411",
+        _ANALYSED,
+        "explain select * from e where b in (select b from k where a > 990)",
+        [
+            "Hash Join  (cost=8.61..37.36 rows=1000 width=7)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=8.54..8.54 rows=6 width=3)",
+            "        ->  HashAggregate  (cost=8.47..8.54 rows=6 width=3)",
+            "              Group Key: k.b",
+            "              ->  Index Scan using k_pkey on k  (cost=0.28..8.45 rows=10 width=3)",
+            "                    Index Cond: (a > 990)",
         ],
     ),
     # Planned as the inner join `reduce_unique_semijoins` makes of it.

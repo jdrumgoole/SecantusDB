@@ -4015,7 +4015,7 @@ pub(crate) fn plain_call_procost(f: &pg_query::protobuf::FuncCall) -> Option<f64
 /// a scan (`index_other_operands_eval_cost`), in `cpu_operator_cost`
 /// units: [`qual_operators`]' operators and each call's `procost`. `None`
 /// where `n` is not built only of what [`priced_by`] prices with calls.
-fn bound_operand_cost(n: &pg_query::protobuf::Node) -> Option<f64> {
+pub(crate) fn bound_operand_cost(n: &pg_query::protobuf::Node) -> Option<f64> {
     if !priced_by(n, true) {
         return None;
     }
