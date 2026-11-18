@@ -2911,13 +2911,15 @@ def test_a_left_join_desc_nulls_last_key_with_another_sorts_the_merge(pg: Any) -
     assert got == ("ok", [(2554, 6), (839, 6), (2939, 6), (1434, 6), (2169, 6)])
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_left_join_preserved_desc_nulls_last_key_with_another(pg: Any) -> None:
     """PostgreSQL 15.19, two 3,000-row tables never analysed, an index on
     t1.a: `t0 LEFT JOIN t1 ON t0.b = t1.a ORDER BY t0.b DESC NULLS LAST,
-    t1.c LIMIT 5` leaves 1280, 1728, 1448, 1721, 1273; the search's plan
-    leaves 2939, 860, 1763, 433, 2141 (ties on t0.b and t1.c in another
-    order). Not diagnosed."""
+    t1.c LIMIT 5` leaves 1280, 1728, 1448, 1721, 1273 (a Merge Right Join
+    over t1's forward index scan). The search gave t1's index scan the
+    preserved key's class, as the outer join's two one-member classes
+    shared one id, and merged on its backward scan: 2939, 860, 1763, 433,
+    2141."""
     pg.execute("begin")
     try:
         _rp028_tables(pg, "rp028_p", 2, 3000)
@@ -2931,6 +2933,28 @@ def test_a_left_join_preserved_desc_nulls_last_key_with_another(pg: Any) -> None
     finally:
         pg.execute("rollback")
     assert got == ("ok", [(1280, 6), (1728, 6), (1448, 6), (1721, 6), (1273, 6)])
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_two_table_join_desc_with_another_key_at_3000_rows(pg: Any) -> None:
+    """PostgreSQL 15.19, two 3,000-row tables never analysed, an index on
+    t1.a: `t0 JOIN t1 ON t0.b = t1.a ORDER BY t0.b DESC, t0.c LIMIT 5`
+    leaves 860, 440, 1280, 1140, 2155; the search's plan leaves 20, 55,
+    90, 160, 125 (ties on t0.b and t0.c in another order). Not
+    diagnosed."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_q", 2, 3000)
+        pg.execute("create index on rp028_q1 (a)")
+        got = pg_answer(
+            pg,
+            "select rp028_q0.a, rp028_q1.a from rp028_q0"
+            " join rp028_q1 on rp028_q0.b = rp028_q1.a"
+            " order by rp028_q0.b desc, rp028_q0.c limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", [(860, 6), (440, 6), (1280, 6), (1140, 6), (2155, 6)])
 
 
 @pytest.mark.backlog_fixed("RP-028")

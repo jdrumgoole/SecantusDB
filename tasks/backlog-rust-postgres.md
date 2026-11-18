@@ -821,15 +821,20 @@ one beside it.
     shape worse, and `--desc-nulls-last --then "m0.c desc"` 787 of 810
     (781 before), `--desc-nulls-last --then m1.c` 801 (791), `--desc
     --then m0.c` 801 (797), `--desc --then "m1.c desc, m0.b"` 12
-    differences (18). Of what is left, two-table LEFT joins ordered by the
-    preserved side's key DESC NULLS LAST with another key leave ties in
-    another order (`two/3000/idx1/b_a/leftjoin/m0.b`), not diagnosed; the
-    rest are four- and five-table stars. Declined still: a later key a
+    differences (18). Since 2026-11-18 an outer join's clause no longer
+    puts the nullable side's index scan in the preserved key's order (its
+    two one-member classes shared one id), so a DESC NULLS LAST ORDER BY of
+    the preserved key keeps the forward scan and the Merge Right Join:
+    `--desc-nulls-last --then m1.c` 803 of 810, `--then "m0.c desc"` 789,
+    every two-table shape matching. Of what is left, `--desc --then m0.c`
+    (801 of 810) differs on six two-table shapes at 3,000 rows with an
+    index on m1.a (`two/3000/idx1/b_a/join/m0.b`, `.../leftjoin/m1.a`), not
+    diagnosed; the rest are four- and five-table stars. Declined still: a later key a
     WHERE may fix to a constant; a table with an index of several columns;
     and a two-table join with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_preserved_desc_nulls_last_key_with_another
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_two_table_join_desc_with_another_key_at_3000_rows
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

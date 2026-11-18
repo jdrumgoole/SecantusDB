@@ -1993,7 +1993,18 @@ impl PgHandler {
                 .collect();
             if search.order_desc || search.order_nulls_first {
                 let class = search.order.as_ref().map(|(_, c)| *c);
-                let in_order = |p: &InPath| p.class.is_some() && p.class == class;
+                // An outer join's clause makes a one-member class for each
+                // side (`key_ec` gives both one id): the other side's index
+                // scan is not in the ORDER BY's order.
+                let order_t = search.order.as_ref().and_then(|(k, _)| {
+                    let t = search.aliases.iter().position(|a| a == alias_of(k))?;
+                    let edge = class?.checked_sub(2)?;
+                    let outer = search.edge_outer.get(edge).copied().flatten().is_some();
+                    (outer && search.member_class(t, k).is_none()).then_some(t)
+                });
+                let in_order = |t: usize, p: &InPath| {
+                    p.class.is_some() && p.class == class && order_t.is_none_or(|o| o == t)
+                };
                 // The ORDER BY's own class (`ORDER_CLASS`: a key an outer
                 // join NULL-extends, or one no clause reads) has a
                 // one-member equivalence class that the query's pathkeys
@@ -2011,7 +2022,7 @@ impl PgHandler {
                 for (t, (list, ct, cs)) in base_lists.iter_mut().enumerate() {
                     let mut i = 0;
                     while i < list.len() {
-                        if !in_order(&list[i].0) {
+                        if !in_order(t, &list[i].0) {
                             i += 1;
                             continue;
                         }
