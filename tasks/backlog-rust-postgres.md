@@ -2343,15 +2343,6 @@ The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
       (`failing_array_element`); the SELECT's target list needs the same.
       Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_literal_domain_error_position
       Backlog-ID: RP-945
-- [ ] **A composite column compared with an untyped literal reads the
-      literal as the column's type.** `select * from tct where c =
-      '(0,x)'` is 0A000 `input of anonymous composite types is not
-      implemented` at 29 on PostgreSQL 15.19: there is no `ctp = ctp`
-      operator, so `=` resolves to `record = record` and the literal to an
-      anonymous `record`, which has no input. Here the literal is read as
-      `ctp` (23514 for this one, a comparison for a valid one).
-      Verify: tests/backlog/test_rp_found_rp552.py::test_composite_column_equals_untyped_literal
-      Backlog-ID: RP-947
 
 ## Found while working RP-534 (2026-11-08)
 
