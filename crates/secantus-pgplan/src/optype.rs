@@ -1740,9 +1740,45 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             e.rexpr.as_deref().and_then(|n| n.node.as_ref()),
         ) {
             if l.args.len() == r.args.len() {
+                let pattern = crate::PATTERN_ROW_OPS.with(|m| m.borrow().get(&e.location).cloned());
+                // The fields `pattern_ops` collated "C", seen without it.
+                let bare = |n: &'_ pg_query::protobuf::Node| match n.node.as_ref() {
+                    Some(N::CollateClause(c)) if pattern.is_some() => {
+                        c.arg.as_deref().cloned().unwrap_or_default()
+                    }
+                    _ => n.clone(),
+                };
                 for (a, b) in l.args.iter().zip(&r.args) {
                     type_row_literal_pair(a, b, scope)?;
-                    let (Some(at), Some(bt)) = (operand_type(a, scope), operand_type(b, scope))
+                    let (a, b) = (bare(a), bare(b));
+                    // Rewritten from `~<~` and its kin, which take only
+                    // strings: each pair is that operator's lookup
+                    // (`make_row_comparison_op`; RP-973). An untyped
+                    // literal or NULL is `unknown`, which a string operand
+                    // takes and no other type does.
+                    if let Some(pattern) = &pattern {
+                        let ty = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+                            Some(N::AConst(c))
+                                if c.isnull
+                                    || matches!(
+                                        c.val,
+                                        Some(pg_query::protobuf::a_const::Val::Sval(_))
+                                    ) =>
+                            {
+                                Some("unknown".to_string())
+                            }
+                            _ => operand_type(n, scope).filter(|t| !t.is_empty()),
+                        };
+                        let (Some(at), Some(bt)) = (ty(&a), ty(&b)) else {
+                            continue;
+                        };
+                        let takes = |t: &str| t == "unknown" || crate::pattern_string_type(t);
+                        if !(takes(&at) && takes(&bt)) {
+                            return Err(mismatch(pattern, &at, &bt, e.location));
+                        }
+                        continue;
+                    }
+                    let (Some(at), Some(bt)) = (operand_type(&a, scope), operand_type(&b, scope))
                     else {
                         continue;
                     };

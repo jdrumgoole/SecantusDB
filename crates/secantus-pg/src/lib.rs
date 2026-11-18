@@ -46265,8 +46265,28 @@ impl PgHandler {
                             && sel.order.is_empty()
                             && matches!(sel.distinct, secantus_pgplan::Distinct::None)
                             && !sel.with_ties;
+                        // A Limit above a Sort of the scan's rows: the
+                        // Sort is bounded by OFFSET + LIMIT (`cost_sort`'s
+                        // `limit_tuples`).
+                        let sorted_limited = tree.name == "Limit"
+                            && tree.children.len() == 1
+                            && tree.children[0].name == "Sort"
+                            && tree.children[0].children.len() == 1
+                            && tree.children[0].children[0].children.is_empty()
+                            && tree.children[0].children[0]
+                                .name
+                                .starts_with("Seq Scan on ")
+                            && (sel.limit.is_some() || sel.offset != 0)
+                            && sel.offset >= 0
+                            && !sel.order.is_empty()
+                            && matches!(sel.distinct, secantus_pgplan::Distinct::None)
+                            && !sel.with_ties
+                            && sel.order.iter().all(|k| {
+                                k.expr.is_none() && sel.columns.iter().any(|(_, f)| *f == k.field)
+                            });
                         if (sorted
                             || limited
+                            || sorted_limited
                             || tree.children.is_empty() && tree.name.starts_with("Seq Scan on "))
                             && sel.sub.is_none()
                             && sel.series.is_none()
@@ -46297,6 +46317,22 @@ impl PgHandler {
                                         self.kb_setting("work_mem", 4096),
                                     )
                                 })
+                            } else if sorted_limited {
+                                tree.children[0].children[0].estimate = scan;
+                                let count = sel.limit.map_or(0, |n| n.max(1));
+                                let bound = match sel.limit {
+                                    Some(n) if n >= 0 => (sel.offset + n.max(1)) as f64,
+                                    _ => -1.0,
+                                };
+                                let sort = scan.map(|e| {
+                                    scan_estimate::bounded_sort_estimate(
+                                        e,
+                                        self.kb_setting("work_mem", 4096),
+                                        bound,
+                                    )
+                                });
+                                tree.children[0].estimate = sort;
+                                sort.map(|e| scan_estimate::limit_estimate(e, sel.offset, count))
                             } else if limited {
                                 tree.children[0].estimate = scan;
                                 scan.map(|e| {

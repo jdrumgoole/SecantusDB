@@ -2011,11 +2011,13 @@ a regression test.
       FROM, a correlated one, or a sublink beside any other non-constant
       qual is still printed inline (`select * from e where b = (select b
       from k limit 1)`); a join's ON InitPlan is unpriced; other nodes above
-      the scan (a Limit above a Sort, Unique, a computed sort key, a GROUP
-      BY) are unpriced. Plain aggregates other than counts over the scan are
+      the scan (a DISTINCT, Unique, a computed sort key, a GROUP
+      BY) are unpriced. A Limit above a Sort of the scan, the Sort bounded
+      by OFFSET + LIMIT (`cost_sort`'s `limit_tuples`), is priced since
+      2026-11-18. Plain aggregates other than counts over the scan are
       priced since 2026-11-18 (`plain_agg_estimate`). Measured on a private
       15.19 cluster.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a limit above a sort above an initplan's scan is priced]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a distinct above an initplan's scan is priced]
       Backlog-ID: RP-440
 
 ## Found by batch 54 (2026-10-24)
@@ -2294,16 +2296,15 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
 Measured on PostgreSQL 15.19 (port 5415) with statements that create
 nothing. The gap tests are in `tests/backlog/test_rp_found_rp750.py`.
 
-- [ ] **A three-argument input function with a typmod is refused.**
-      `select numeric_in('1.5', 0, 5)` is 22003 `numeric field overflow`
-      on PostgreSQL 15.19 (typmod 5 is `numeric(0,1)`, VARHDRSZ + 1); here
-      it is 0A000 `function numeric_in(unknown, integer, integer) is not
-      supported yet`. RP-953 rewrote the input
-      functions to casts (`builtin_alias::input_call`), the three-argument
-      ones only for typmod -1: a typmod needs the cast to the type with that
-      modifier.
-      Verify: tests/backlog/test_rp_found_rp750.py::test_input_function_with_a_typmod
-      Backlog-ID: RP-953
+- [ ] **A `numeric` type name with precision 0 is accepted.**
+      `select '1.5'::numeric(0,1)` is 22023 `NUMERIC precision 0 must be
+      between 1 and 1000` at 15 on PostgreSQL 15.19 (`numerictypmodin`
+      checks the modifiers when the type name is read); here the cast runs
+      and is 22003 `numeric field overflow`. Found while working RP-953,
+      whose `numeric_in(c, 0, 5)` applies that same typmod at run time and
+      must keep doing so.
+      Verify: tests/backlog/test_rp_found_rp750.py::test_numeric_precision_zero_is_refused
+      Backlog-ID: RP-1042
 - [ ] **A cast from `cstring` to a type with no such cast is accepted.**
       `select 'x'::cstring::int4` is 42846 `cannot cast type cstring to
       integer` at 20 on PostgreSQL 15.19 (`cstring` casts only to the
@@ -2339,16 +2340,18 @@ Measured on PostgreSQL 15.19 with `create domain pint as int check (value >
 text)` and `create table tct (c ctp, d pint[])` holding `('(1,x)', null)`.
 The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
 
-- [ ] **An untyped literal an `INSERT ... SELECT` writes to a composite
-      or domain-array column reports a field's domain error with no
-      position.** `insert into tct(c) select '(0,x)'` is 23514 at 27 on
-      PostgreSQL 15.19: the SELECT's `unknown` output column is coerced to
-      the target column in the INSERT's analysis, reading the literal under
-      its position. Here it has none. RP-945 placed the VALUES and UPDATE
-      SET forms (`check_assigned_literal`) and an `ARRAY[]` element
-      (`failing_array_element`); the SELECT's target list needs the same.
-      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_literal_domain_error_position
-      Backlog-ID: RP-945
+- [ ] **A `text` column an `INSERT ... SELECT` writes to a composite
+      column is accepted.** `insert into tct(c) select '(0,x)'::text` is
+      42804 `column "c" is of type ctp but expression is of type text` at
+      27 on PostgreSQL 15.19, as is the bare literal under a UNION, an
+      ORDER BY, a DISTINCT or a subquery in FROM (each resolves the
+      `unknown` column to `text` first; `text` has no assignment cast to a
+      composite). Here the text is read as the composite (a field's domain
+      error, 23514, for these). Found while working RP-945, which placed
+      the plain SELECT's literal (`check_assigned_literal` over its target
+      list).
+      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_text_into_composite
+      Backlog-ID: RP-1044
 
 ## Found while working RP-534 (2026-11-08)
 
@@ -2706,16 +2709,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap tests are in
 `tests/backlog/test_rp_found_rp727.py`.
 
-- [ ] **A row comparison with a pattern operator over COLUMNS that are
-      not strings is answered.** `select (a, b) ~<~ (1, 2) from t973`
-      (`t973(a int, b int)`) is 42883 `operator does not exist: integer ~<~
-      integer` at 15 on PostgreSQL 15.19 (`make_row_comparison_op` looks up
-      each pair's operator). Here it compares the rows. RP-973 refused a
-      pair typed on its face (constants, casts) in `pattern_ops`, which
-      runs before any column is typed; a column pair needs the check where
-      the row comparison is typed.
-      Verify: tests/backlog/test_rp_found_rp727.py::test_row_pattern_operator_over_non_string_columns
-      Backlog-ID: RP-973
 
 ## Found while working RP-849 (2026-11-11)
 

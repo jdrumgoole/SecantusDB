@@ -729,7 +729,7 @@ pub(crate) fn is_input_function(name: &str) -> bool {
 /// it), a NULL, a parameter or a cast to `cstring`; any other argument is
 /// left for the planner to refuse (`int4in('1'::text)` is 42883 on
 /// PostgreSQL). The three-argument form (`numeric_in(c, typioparam,
-/// typmod)`) is rewritten only for typmod -1, which applies none.
+/// typmod)`) applies its typmod as a column assignment does.
 fn input_call(name: &str, args: &[pg_query::protobuf::Node]) -> Option<pg_query::protobuf::Node> {
     use pg_query::protobuf::a_const::Val;
     let ty = input_functions().get(&(name, args.len()))?;
@@ -753,7 +753,24 @@ fn input_call(name: &str, args: &[pg_query::protobuf::Node]) -> Option<pg_query:
             Some(N::AConst(c)) if matches!(&c.val, Some(Val::Ival(i)) if i.ival == -1)
         );
         if !no_typmod {
-            return None;
+            // The input function applies the modifier itself, as a column
+            // assignment does (`varcharin('abcd', 0, 7)` is 22001, not
+            // `abc`; `numeric_in('1.5', 0, 5)` is 22003 on 15.19): the
+            // value read at typmod -1, then `__typmod_coerce`. `bit` keeps
+            // no outer cast, as its bare name means `bit(1)` (RP-953).
+            let cast = if *ty == "bit" {
+                String::new()
+            } else {
+                format!("::{}", scalar::quote_identifier(ty))
+            };
+            // Read as `varbit`, for the same reason: `bit_in` checks the
+            // length against the modifier, not against `bit(1)`.
+            let read = if *ty == "bit" { "varbit" } else { ty };
+            let template = parse_expression(&format!(
+                "__typmod_coerce($1::text::{q}, '{ty}', $2){cast}",
+                q = scalar::quote_identifier(read),
+            ))?;
+            return Some(substitute(&template, &[args[0].clone(), typmod.clone()]));
         }
     }
     let template = parse_expression(&format!("$1::text::{}", scalar::quote_identifier(ty)))?;

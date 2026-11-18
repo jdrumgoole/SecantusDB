@@ -5248,10 +5248,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (b = $0)",
         ],
     ),
-    # A Limit above a Sort above an InitPlan's scan, measured on 15.19
-    # (RP-440).
+    # A Limit above a Sort above an InitPlan's scan was unpriced, the Sort
+    # bounded by the LIMIT, measured on 15.19 (RP-440, fixed).
     "a limit above a sort above an initplan's scan is priced": (
-        "RP-440",
+        "RP-440:fixed",
         _ANALYSED,
         "explain select a from e where b = (select 'v3'::text) order by a limit 5",
         [
@@ -5262,6 +5262,21 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Sort Key: e.a",
             "        ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=4)",
             "              Filter: (b = $0)",
+        ],
+    ),
+    # A SELECT DISTINCT hashed above an InitPlan's scan, measured on 15.19
+    # (RP-440).
+    "a distinct above an initplan's scan is priced": (
+        "RP-440",
+        _ANALYSED,
+        "explain select distinct a from e where b = (select 'v3'::text)",
+        [
+            "HashAggregate  (cost=17.76..18.76 rows=100 width=4)",
+            "  Group Key: e.a",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=4)",
+            "        Filter: (b = $0)",
         ],
     ),
     # A table whose only index is a composite one, its WHERE constraining

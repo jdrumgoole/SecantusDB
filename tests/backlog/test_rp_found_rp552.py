@@ -1,8 +1,9 @@
 """Gap tests of the divergences found while working RP-552 (a field's
 domain error in a record literal is at the literal): RP-945 (an untyped
 literal written to a composite or domain-array column, or coerced as an
-`ARRAY[]` element, reported a field's domain error with no position; still
-open for `INSERT ... SELECT`), RP-946
+`ARRAY[]` element or an `INSERT ... SELECT` output column, reported a
+field's domain error with no position; fixed), RP-1044 (a `text` SELECT
+column written to a composite column is accepted), RP-946
 (a NULL element of a NOT NULL domain's array literal was accepted; fixed),
 RP-947 (a
 composite column compared with an untyped literal read the literal as the
@@ -82,10 +83,48 @@ def test_assigned_literal_domain_error_position(query: str, dsn: str) -> None:
 
 
 # The SELECT's untyped output column is coerced to the target column in
-# the INSERT's analysis, under the literal's position.
-@pytest.mark.backlog("RP-945")
-def test_insert_select_literal_domain_error_position(dsn: str) -> None:
-    assert answer(dsn, "insert into tct(c) select '(0,x)'") == ("23514", _PINT, "27")
+# the INSERT's analysis, under the literal's position, even when no row is
+# selected.
+SELECTED = {
+    "insert into tct(c) select '(0,x)'": ("23514", _PINT, "27"),
+    "insert into tct(c) select '(0,x)' where false": ("23514", _PINT, "27"),
+    "insert into tct(d) select '{0}'": ("23514", _PINT, "27"),
+    "insert into tct(c, d) select '(1,x)', '{0}'": ("23514", _PINT, "39"),
+    "insert into tct(c) select '(0,x)' from tct": ("23514", _PINT, "27"),
+    "insert into tct(c) (select '(0,x)')": ("23514", _PINT, "28"),
+    "with w as (select 1) insert into tct(c) select '(0,x)'": ("23514", _PINT, "48"),
+    "insert into tct select '(0,x)' as z": ("23514", _PINT, "24"),
+    "insert into tnn select '{NULL}'": ("23502", _NNINT, "24"),
+}
+
+
+@pytest.mark.backlog_fixed("RP-945")
+@pytest.mark.parametrize("query", list(SELECTED))
+def test_insert_select_literal_domain_error_position(query: str, dsn: str) -> None:
+    """Each had no position (and `where false` was accepted)."""
+    assert answer(dsn, query) == SELECTED[query]
+
+
+# A set operation, ORDER BY or DISTINCT resolves the literal to `text`
+# first, and `text` has no assignment cast to a composite.
+TEXT_SELECTED = {
+    "insert into tct(c) select '(0,x)' union all select '(1,x)'": "27",
+    "insert into tct(c) select * from (select '(0,x)') s": "27",
+    "insert into tct(c) select '(0,x)'::text": "27",
+    "insert into tct(c) select '(0,x)' order by 1": "27",
+    "insert into tct(c) select distinct '(0,x)'": "36",
+}
+
+
+@pytest.mark.backlog("RP-1044")
+@pytest.mark.parametrize("query", list(TEXT_SELECTED))
+def test_insert_select_text_into_composite(query: str, dsn: str) -> None:
+    """42804 at the column; here the text is read as the composite."""
+    assert answer(dsn, query) == (
+        "42804",
+        'column "c" is of type ctp but expression is of type text',
+        TEXT_SELECTED[query],
+    )
 
 
 # `array_in` reads each element with `domain_in`, which refuses a NULL.

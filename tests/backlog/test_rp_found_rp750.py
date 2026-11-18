@@ -4,7 +4,8 @@ error carried no `JSON data, line N:` CONTEXT):
 - a `json` / `jsonb` input error on a constant had no statement position
   (RP-952);
 - a type's input function called by name (`jsonb_in`, `json_in`, `int4in`)
-  was refused 0A000 (RP-953).
+  was refused 0A000 (RP-953);
+- a `numeric(0, s)` type name is not refused (found while working RP-953).
 
 The expected answers were measured on PostgreSQL 15.19. None of the
 statements creates an object.
@@ -86,15 +87,65 @@ def test_three_argument_input_function_without_typmod(dsn: str) -> None:
         assert c.execute("select numeric_in('1.5', 0, -1)::text").fetchone() == ("1.5",)
 
 
-@pytest.mark.backlog("RP-953")
+@pytest.mark.backlog_fixed("RP-953")
 def test_input_function_with_a_typmod(dsn: str) -> None:
-    """`numeric_in(c, typioparam, typmod)` applies the typmod; here it is
+    """`numeric_in(c, typioparam, typmod)` applied the typmod; it was
     refused 0A000."""
     with psycopg.connect(dsn, autocommit=True) as c, pytest.raises(psycopg.Error) as info:
         c.execute("select numeric_in('1.5', 0, 5)")
     assert (info.value.sqlstate, info.value.diag.message_primary) == (
         "22003",
         "numeric field overflow",
+    )
+
+
+@pytest.mark.backlog_fixed("RP-953")
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        # Applied as an assignment: refused, not truncated.
+        (
+            "select varcharin('abcdef', 0, 7)::text",
+            ("22001", "value too long for type character varying(3)"),
+        ),
+        ("select varcharin('abc', 0, 2)::text", ("abc",)),
+        ("select timestamp_in('2020-01-01 1:2:3.456', 0, 1)::text", ("2020-01-01 01:02:03.5",)),
+        ("select time_in('1:2:3.456', 0, 0)::text", ("01:02:03",)),
+        ("select bit_in('101', 0, 3)::text", ("101",)),
+        ("select bit_in('101', 0, 4)", ("22026", "bit string length 3 does not match type bit(4)")),
+        ("select varbit_in('101', 0, 2)", ("22001", "bit string too long for type bit varying(2)")),
+        (
+            "select interval_in('1 day', 0, 524287)",
+            ("XX000", "unrecognized interval typmod: 524287"),
+        ),
+        ("select numeric_in('1.5', 0, 1 + 4)", ("22003", "numeric field overflow")),
+        ("select numeric_in('1', 0, null)", (None,)),
+        ("select pg_typeof(bit_in('101', 0, 3))::text", ("bit",)),
+    ],
+)
+def test_input_function_typmods(query: str, expected: tuple[object, ...], dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        try:
+            answer: object = c.execute(query).fetchone()
+        except psycopg.Error as e:
+            answer = (e.sqlstate, e.diag.message_primary)
+    assert answer == expected
+
+
+@pytest.mark.backlog("RP-1042")
+def test_numeric_precision_zero_is_refused(dsn: str) -> None:
+    """`numeric(0,1)` is refused when the type is read; here the cast runs
+    and overflows."""
+    with psycopg.connect(dsn, autocommit=True) as c, pytest.raises(psycopg.Error) as info:
+        c.execute("select '1.5'::numeric(0,1)")
+    assert (
+        info.value.sqlstate,
+        info.value.diag.message_primary,
+        info.value.diag.statement_position,
+    ) == (
+        "22023",
+        "NUMERIC precision 0 must be between 1 and 1000",
+        "15",
     )
 
 
