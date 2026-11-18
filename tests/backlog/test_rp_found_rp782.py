@@ -139,7 +139,7 @@ def test_pg_get_viewdef_of_the_remaining_system_views(dsn: str) -> None:
             _answer(c, sql)
             for sql in [
                 "select pg_get_viewdef('information_schema.domains'::regclass) is not null",
-                "select pg_get_viewdef('pg_sequences'::regclass) is not null",
+                "select pg_get_viewdef('pg_stats_ext'::regclass) is not null",
             ]
         ]
     assert got == [[(True,)], [(True,)]]
@@ -206,4 +206,106 @@ def test_an_added_domain_column_reaches_its_base_types_aggregates(dsn: str) -> N
         "UPDATE 2",
         [("x1,x2",)],
         "DROP TABLE",
+    ]
+
+
+# A CASE whose ELSE NULL takes the type of a `pg_` function's result: the
+# printer could not type `pg_sequence_last_value(oid)` (overload selection
+# leaves the `pg_` functions alone), so `pg_sequences` was NULL; fixed by
+# reading the result from PG 15's `pg_proc` when every overload of that
+# arity agrees (RP-798).
+@pytest.mark.backlog_fixed("RP-798")
+def test_pg_get_viewdef_of_pg_sequences(dsn: str) -> None:
+    with _connect(dsn) as c:
+        got = _answer(c, "select pg_get_viewdef('pg_sequences'::regclass)")
+    assert got == [
+        (
+            " SELECT n.nspname AS schemaname,\n"
+            "    c.relname AS sequencename,\n"
+            "    pg_get_userbyid(c.relowner) AS sequenceowner,\n"
+            "    (s.seqtypid)::regtype AS data_type,\n"
+            "    s.seqstart AS start_value,\n"
+            "    s.seqmin AS min_value,\n"
+            "    s.seqmax AS max_value,\n"
+            "    s.seqincrement AS increment_by,\n"
+            "    s.seqcycle AS cycle,\n"
+            "    s.seqcache AS cache_size,\n"
+            "        CASE\n"
+            "            WHEN has_sequence_privilege(c.oid, 'SELECT,USAGE'::text)"
+            " THEN pg_sequence_last_value((c.oid)::regclass)\n"
+            "            ELSE NULL::bigint\n"
+            "        END AS last_value\n"
+            "   FROM ((pg_sequence s\n"
+            "     JOIN pg_class c ON ((c.oid = s.seqrelid)))\n"
+            "     LEFT JOIN pg_namespace n ON ((n.oid = c.relnamespace)))\n"
+            "  WHERE ((NOT pg_is_other_temp_schema(n.oid)) AND (c.relkind = 'S'::\"char\"));",
+        )
+    ]
+
+
+# `name` keeps its type under NOT IN and `!~`: it has `namene` and
+# `nameregexne`. The printer cast it to text, so the `pg_stat*_user_*` /
+# `_sys_*` views would have printed wrong once their base views printed
+# (RP-798).
+@pytest.mark.backlog_fixed("RP-798")
+def test_pg_get_viewdef_keeps_name_under_in_and_regex(dsn: str) -> None:
+    with _connect(dsn) as c:
+        got = [
+            _answer(c, "select pg_get_viewdef('pg_statio_user_sequences'::regclass)"),
+            _answer(c, "drop view if exists vn782f"),
+            _answer(
+                c,
+                "create view vn782f as select relname from pg_class where relname not in "
+                "('a','b') and relname in ('c','d') and relname ~~ 'x%' and relname ~* 'y' "
+                "and relname !~~* 'z'",
+            ),
+            _answer(c, "select pg_get_viewdef('vn782f'::regclass)"),
+            _answer(c, "drop view vn782f"),
+        ]
+    assert got[0] == [
+        (
+            " SELECT pg_statio_all_sequences.relid,\n"
+            "    pg_statio_all_sequences.schemaname,\n"
+            "    pg_statio_all_sequences.relname,\n"
+            "    pg_statio_all_sequences.blks_read,\n"
+            "    pg_statio_all_sequences.blks_hit\n"
+            "   FROM pg_statio_all_sequences\n"
+            "  WHERE ((pg_statio_all_sequences.schemaname <> ALL (ARRAY['pg_catalog'::name,"
+            " 'information_schema'::name])) AND (pg_statio_all_sequences.schemaname !~"
+            " '^pg_toast'::text));",
+        )
+    ]
+    assert got[3] == [
+        (
+            " SELECT pg_class.relname\n"
+            "   FROM pg_class\n"
+            "  WHERE ((pg_class.relname <> ALL (ARRAY['a'::name, 'b'::name]))"
+            " AND (pg_class.relname = ANY (ARRAY['c'::name, 'd'::name]))"
+            " AND (pg_class.relname ~~ 'x%'::text) AND (pg_class.relname ~* 'y'::text)"
+            " AND (pg_class.relname !~~* 'z'::text));",
+        )
+    ]
+
+
+# `select_common_type` over `name` and `text` keeps `name`: each coerces
+# implicitly to the other, so the first type stands.
+@pytest.mark.backlog("RP-1045")
+def test_pg_get_viewdef_of_a_name_in_list_with_a_text_element(dsn: str) -> None:
+    with _connect(dsn) as c:
+        got = [
+            _answer(c, "drop view if exists vt782f"),
+            _answer(
+                c,
+                "create view vt782f as select relname from pg_class"
+                " where relname in ('g'::text, 'h')",
+            ),
+            _answer(c, "select pg_get_viewdef('vt782f'::regclass)"),
+            _answer(c, "drop view vt782f"),
+        ]
+    assert got[2] == [
+        (
+            " SELECT pg_class.relname\n"
+            "   FROM pg_class\n"
+            "  WHERE (pg_class.relname = ANY (ARRAY[('g'::text)::name, 'h'::name]));",
+        )
     ]

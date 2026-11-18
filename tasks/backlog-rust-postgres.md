@@ -2564,13 +2564,16 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 - [ ] **`pg_get_viewdef` of most system views is NULL.** PostgreSQL
       15.19 deparses every `pg_catalog` and `information_schema` view's
       rule. Here `system_view_defs` prints `system_views.sql`'s queries
-      through `ruleutils`, which reproduces 38 of the 75 `pg_catalog`
+      through `ruleutils`, which reproduces 56 of the 75 `pg_catalog`
       views exactly (`pg_tables`, `pg_roles`, `pg_stats`, `pg_settings`,
-      `pg_locks`, ...; none printed wrong, measured 2026-11-15) and
+      `pg_sequences`, `pg_stat_all_tables`, every `pg_statio_*` view, ...;
+      none printed wrong, measured 2026-11-18 in both print modes) and
       leaves the rest NULL rather than print them as written. Remaining:
-      the 37 other `pg_catalog` views (`pg_sequences`, `pg_policies`,
-      `pg_seclabels`, `pg_publication_tables`, `pg_stats_ext*`, and every
-      `pg_stat_*` / `pg_statio_*` view), which the printer refuses; and
+      the 19 other `pg_catalog` views (`pg_policies`, `pg_seclabels`,
+      `pg_publication_tables`, `pg_stats_ext*`, `pg_stat_activity`,
+      `pg_stat_database`, `pg_stat_ssl`, `pg_stat_gssapi`, the
+      `pg_stat_progress_*`, `pg_stat_replication*` and
+      `pg_stat_subscription*` views), which the printer refuses; and
       every `information_schema` view, left out because the printer casts
       to the bare domain where ruleutils qualifies it and casts a literal
       to the base type first
@@ -2579,6 +2582,15 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
       returning a record of OUT parameters prints since 2026-11-15.
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_the_remaining_system_views
       Backlog-ID: RP-798
+- [ ] **`pg_get_viewdef` types a `name IN (text, unknown)` list as
+      text.** `create view v as select relname from pg_class where relname
+      in ('g'::text, 'h')` prints `(pg_class.relname = ANY
+      (ARRAY[('g'::text)::name, 'h'::name]))` on PostgreSQL 15.19:
+      `select_common_type` keeps the first type, `name`, because text and
+      name each coerce implicitly to the other. Here the printer takes
+      text (`(pg_class.relname)::text = ANY (ARRAY['g'::text, 'h'::text])`).
+      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_a_name_in_list_with_a_text_element
+      Backlog-ID: RP-1045
 
 ## Found while working RP-816 (2026-11-11)
 

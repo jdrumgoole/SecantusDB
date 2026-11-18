@@ -1741,8 +1741,9 @@ impl<'a> Printer<'a> {
                     ("<>", "ALL")
                 };
                 // varchar has no `=` of its own: the operator is text's, so
-                // the column and the whole array are cast to text.
-                let via_text = matches!(common.as_str(), "varchar" | "name");
+                // the column and the whole array are cast to text. `name`
+                // has `nameeq` / `namene` and keeps its type.
+                let via_text = common == "varchar";
                 let lw = if via_text { "text".to_string() } else { lw };
                 let open = !self.pretty;
                 if open {
@@ -2003,7 +2004,9 @@ impl<'a> Printer<'a> {
         if !is_stringish(l) || !is_stringish(r) {
             return None;
         }
-        let lw = if matches!(l, "text" | "bpchar") {
+        // `name` has its own LIKE and regex operators taking a text
+        // pattern (`namelike`, `nameregexeq`, ...), as text and bpchar do.
+        let lw = if matches!(l, "text" | "bpchar" | "name") {
             ""
         } else {
             "text"
