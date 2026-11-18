@@ -1161,6 +1161,16 @@ _UNCOUNTED = {
         seed,
         lambda d: d.c.find_one_and_update({"_id": 1}, {"$set": {"q": 1}}),
     ),
+    # A `$sort` after an SBE `$group`, asked for no first batch: mongod
+    # plans it (5); this server's line prints none, and its `getMore` 5
+    # with two global IS to mongod's 4 and one (measured 8.2.11 2026-11-18).
+    "aggregate of no batch of groups": (
+        "aggregate",
+        seed,
+        lambda d: list(
+            d.c.aggregate([{"$group": {"_id": "$y"}}, {"$sort": {"_id": 1}}], batchSize=0)
+        ),
+    ),
     # Over a collection with no index of its own to build, so that the
     # setup's build cannot log a `createIndexes` line of its own.
     "createIndexes": (

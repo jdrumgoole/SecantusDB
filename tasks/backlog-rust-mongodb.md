@@ -730,12 +730,12 @@ These are explicit non-goals. Don't add them without a reason.
       buckets or more) keeps its `$group` classic, as on mongod. The line of a `find`, `count`
       or `distinct` of a collection with one candidate plan, a `getMore` of
       a `find`, an `aggregate` of a collection mongod's query layer runs
-      whole, or whose stages after its cursor stage are `$project`,
+      whole, or (since 2026-11-18 asked for a first batch of none too) whose stages after its cursor stage are `$project`,
       `$unset`, `$addFields`, `$set`, `$replaceRoot`, `$replaceWith`,
       `$unwind` and `$skip`, and the `getMore`s of its cursor,
       `listIndexes`, `listCollections`, `collStats`, `ping`, `buildInfo`,
       and an `insert`, `update` or `delete` on a member of a replica set
-      prints mongod's count (82 shapes in
+      prints mongod's count (86 shapes in
       `tests/mongod_live/test_interrupt_checks.py`). Every other line
       prints none, where mongod prints one:
       - a read with more than one candidate plan, a plan from the plan
@@ -751,8 +751,9 @@ These are explicit non-goals. Don't add them without a reason.
         `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a `$group`
         run classic over the cursor stage (a `$bucket` of 400 buckets: 16
         and a `getMore` of 4 on mongod), one over a
-        view or a time-series collection, and one asked for a first batch
-        of none;
+        view or a time-series collection, and a `$sort` after an SBE
+        `$group` asked for a first batch of none (mongod 5; its `getMore`
+        here 5 under two global IS, mongod's 4 under one);
       - `findAndModify`: counted as the other writes are, it matches mongod
         8.2.11 but where its locks do not (RM-357: a retryable one's image,
         19 to this server's 16; one that removes, 7 to 10), and an IDHACK

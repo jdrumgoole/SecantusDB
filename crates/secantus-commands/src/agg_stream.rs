@@ -121,8 +121,13 @@ pub(crate) fn open(ctx: &CommandContext, ask: &Ask) -> Result<Option<Opened>, Co
     // planned it; the stages that read other collections are checked as
     // each batch runs them, as the aggregate's own run checks them.
     cursor.notablescan = crate::notablescan::enabled(ctx).then(|| ask.ns.to_string());
-    // `batchSize: 0` asks for the cursor and reads nothing.
+    // `batchSize: 0` asks for the cursor and reads nothing: its checks are
+    // its planner's, as a `find` of no batch makes them (RM-360, measured
+    // 8.2.11 2026-11-18).
     let batch = if ask.batch_size == 0 {
+        if cursor.counted {
+            secantus_core::deadline::pipeline_counted();
+        }
         StreamedBatch {
             docs: Vec::new(),
             exhausted: false,
