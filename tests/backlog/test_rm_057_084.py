@@ -191,7 +191,10 @@ def test_upsert_field_order_from_several_equalities(rust_mongo: Any, mongod: Any
         {"$and": [{"d": 1}, {"c": 2}, {"b": 3}, {"a": 4}]},
     ):
         for client in (mongod, rust_mongo):
-            seen = {tuple(_upsert_order(client, q)) for _ in range(12)}
+            # 40 upserts: at an even split of a pair, a sample showing only
+            # one of its orders is a 2**-39 chance; 12 gave ~1 in 2,000 per
+            # check and failed PR #2863 (2026-11-18).
+            seen = {tuple(_upsert_order(client, q)) for _ in range(40)}
             assert seen <= _ABSL_FOUR, (client, q, seen)
             assert any(seen <= pair for pair in _ABSL_PAIRS), (client, q, seen)
             assert len(seen) == 2, (client, q, seen)
