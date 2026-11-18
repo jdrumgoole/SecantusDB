@@ -49207,6 +49207,15 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                     set_error_location(at);
                 }
             }
+            // `json_in` / `jsonb_in` quote none of their input in the
+            // message, so the literal is found by its node: `coerce_type`
+            // reads it under the literal's parser error position
+            // (`'t'::jsonb` is 22P02 at 8 on PostgreSQL 15.19, RP-952).
+            if let Some(at) = untyped_string_literal_location(tc) {
+                if is_json_input_error(e) {
+                    set_error_location(at);
+                }
+            }
         });
     }
     const_value_node(node, params)
@@ -49231,6 +49240,23 @@ fn literal_input_location(tc: &pg_query::protobuf::TypeCast) -> Option<i32> {
     domains::user_domain(&target)
         .is_none()
         .then_some(c.location)
+}
+
+/// The location of `tc`'s argument when it is an untyped string literal.
+fn untyped_string_literal_location(tc: &pg_query::protobuf::TypeCast) -> Option<i32> {
+    let Some(N::AConst(c)) = tc.arg.as_deref().and_then(|a| a.node.as_ref()) else {
+        return None;
+    };
+    (matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) && c.location >= 0)
+        .then_some(c.location)
+}
+
+/// Whether `e` is `json_in` / `jsonb_in` refusing its input.
+pub(crate) fn is_json_input_error(e: &Error) -> bool {
+    e.sqlstate() == "22P02"
+        && e.to_string()
+            .starts_with("invalid input syntax for type json")
+        && !e.to_string().starts_with("invalid input syntax for type jsonpath")
 }
 
 /// A simple CASE's WHEN label as its comparison with the argument sees it.
