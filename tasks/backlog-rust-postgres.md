@@ -2906,8 +2906,11 @@ statement is VALUES-only and runs there as written. The gap test is in
       scan's relation name is the temp schema's storage key, which the
       join-leaf alias logic then sees as differing from the alias. Only
       VERBOSE prints a schema (`pg_temp_3.t`). Measured on the 15.19
-      reference on port 5415.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan of a temporary table names it bare], tests/backlog/test_rp_explain_costs.py::test_plan[a scan of an aliased temporary table names it and its alias]
+      reference on port 5415. The same for any schema but `public` on the
+      search path: with `set search_path = q1`, `Seq Scan on q1.t t` where
+      PostgreSQL prints `Seq Scan on t`, in a join's scans too (found while
+      working RP-978, 2026-11-18).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan of a temporary table names it bare], tests/backlog/test_rp_explain_costs.py::test_plan[a scan of an aliased temporary table names it and its alias], tests/backlog/test_rp_explain_costs.py::test_plan[a scan of a table in a schema on the search path names it bare]
       Backlog-ID: RP-1029
 
 ## Found while working RP-971 (2026-11-17)

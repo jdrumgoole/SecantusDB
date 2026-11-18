@@ -3534,6 +3534,14 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         "explain select * from t",
         ["Seq Scan on t  (cost=0.00..35.50 rows=2550 width=4)"],
     ),
+    # A table of a schema on the search_path other than `public` is named
+    # bare too (found while working RP-978).
+    "a scan of a table in a schema on the search path names it bare": (
+        "RP-1029",
+        ["create schema q1", "set search_path = q1", "create table t (a int)"],
+        "explain select * from t",
+        ["Seq Scan on t  (cost=0.00..35.50 rows=2550 width=4)"],
+    ),
     "a scan of an aliased temporary table names it and its alias": (
         "RP-1029",
         ["create temp table t (a int)"],
