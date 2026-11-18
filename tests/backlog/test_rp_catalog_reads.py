@@ -2335,7 +2335,7 @@ def test_a_page_ddl_wrote_to_is_not_all_visible(rust_pg: Any) -> None:
     assert blocks == EXPECTED_CLEARED_VM_BLOCKS
 
 
-# RP-935: the index a catalog read directly is scanned through, and how
+# RP-935 (fixed): the index a catalog read directly is scanned through, and how
 # much of it, as PostgreSQL 15.19 builds the index path from every clause.
 # Each case is a statement, its catalog's index name prefix, and each
 # matching index's `(numscans, tuples_returned)` over a new session's first
@@ -2362,7 +2362,7 @@ def index_path(dsn: str, sql: str, prefix: str) -> dict[str, list[int]]:
     return {k: v[:2] for k, v in reads.items() if k.startswith(prefix)}
 
 
-@pytest.mark.backlog("RP-935")
+@pytest.mark.backlog_fixed("RP-935")
 @pytest.mark.parametrize("case", list(INDEX_PATHS))
 def test_a_catalog_scans_index_path(rust_pg: Any, case: str) -> None:
     """PostgreSQL 15.19 scans a catalog read directly through the index its

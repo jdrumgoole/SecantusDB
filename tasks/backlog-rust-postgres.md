@@ -1669,20 +1669,6 @@ a regression test.
       worktree's `.scratch/`, never the shared reference servers.
       Backlog-ID: RP-292
       Verify: tests/backlog/test_rp_catalog_reads.py::test_the_first_backend_after_a_start
-- [ ] **A catalog read directly is scanned by its leading equalities
-      alone.** The executor's catalog scan (`catalog_reads.rs`) takes the
-      first index whose leading column an equality matches, keyed by the
-      equalities on its leading columns. PostgreSQL 15.19 builds its index
-      paths from every clause (`match_clause_to_indexcol`): `select attnum
-      from pg_attribute where attrelid = 1259 and attnum = 1` scans
-      `pg_attribute_relid_attnum_index` for both keys (`[5, 5, 4]` over the
-      statement), where this server scans `pg_attribute_relid_attnam_index`
-      for `attrelid` alone (39 entries); and `select relname from pg_class
-      where relname >= 'pg_s' and relname < 'pg_t'` returns 74 entries of
-      `pg_class_relname_nsp_index`, where this server walks all 415. Their
-      heap and index blocks follow (found while working RP-291).
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_scans_index_path[two equalities], tests/backlog/test_rp_catalog_reads.py::test_a_catalog_scans_index_path[a range]
-      Backlog-ID: RP-935
 - [ ] **A database-wide ANALYZE measures only some catalog columns.** Since
       RP-311 each database holds `initdb`'s `pg_statistic` rows for the
       built-in catalogs. A plain `ANALYZE` (or `VACUUM ANALYZE`)
