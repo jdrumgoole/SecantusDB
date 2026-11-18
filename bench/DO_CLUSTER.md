@@ -856,10 +856,14 @@ binaries still executable), including `--purge-snapshots`.
   is nothing to shard or replicate across.
 - The agent measures `insert` / `find` / `update`. Aggregation, change
   streams, and transactions would each need their own operation type.
-- MongoDB is run as a standalone `mongod`, which is the like-for-like
-  comparison: SecantusDB is single-node by design. A real replica set would
-  pay replication costs SecantusDB never pays, which would flatter SecantusDB
-  rather than inform.
+- MongoDB runs as a one-member replica set (`--replSet secantus-bench`),
+  because that is how `secantusd-mdb` runs by default: it serves change
+  streams, and both servers take `w: "majority"` as the default write
+  concern, waiting for the journal before they acknowledge a write. There
+  are no other members, so no replication cost. Until 2026-11-18 `mongod`
+  ran standalone, acknowledging at `w: 1` without the journal wait while
+  SecantusDB waited, which measured that difference rather than the
+  engines (0.14x).
 - The agent is not a real driver, so it does not measure driver-side cost.
   That is deliberate (see [Why three machines](#why-three-machines)), but it
   means these numbers are a *server* ceiling, not an application forecast.

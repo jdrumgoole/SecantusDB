@@ -133,10 +133,10 @@ def _python_client() -> Iterator[pymongo.MongoClient]:
 
 @contextmanager
 def _mongod_replset_client() -> Iterator[pymongo.MongoClient]:
-    """Spawn a throwaway SINGLE-NODE REPLICA SET mongod (change streams need
-    one) — used only for the ``change_stream_drain`` reference number; every
-    other row keeps the standalone reference so the table stays comparable
-    with earlier publications."""
+    """Spawn a throwaway SINGLE-NODE REPLICA SET mongod: the reference for
+    every row. ``secantusd-mdb`` runs as a one-member replica set by default,
+    so both take ``w: "majority"`` and wait for the journal; a standalone
+    mongod skips that wait and measured the durability, not the engine."""
     data_dir = Path(tempfile.mkdtemp(prefix="cmp-mongod-rs-"))
     port = _free_port()
     proc = subprocess.Popen(
@@ -185,42 +185,13 @@ def _mongod_replset_client() -> Iterator[pymongo.MongoClient]:
 
 @contextmanager
 def _mongod_client(mongo_uri: str | None) -> Iterator[pymongo.MongoClient]:
-    """Connect to ``--mongo-uri`` if given, else spawn a throwaway single-node
-    ``mongod`` on a free port + temp dbpath (cleaned up on exit)."""
+    """Connect to ``--mongo-uri`` if given, else spawn a throwaway one-member
+    replica set ``mongod`` on a free port + temp dbpath (cleaned up on exit)."""
     if mongo_uri:
         yield pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
         return
-    data_dir = Path(tempfile.mkdtemp(prefix="cmp-mongod-"))
-    port = _free_port()
-    proc = subprocess.Popen(
-        [
-            "mongod",
-            "--bind_ip",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--dbpath",
-            str(data_dir),
-            "--logpath",
-            str(data_dir / "mongod.log"),
-            "--noauth",
-            "--quiet",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        _wait_for_listener("127.0.0.1", port)
-        time.sleep(0.5)  # mongod accepts TCP before the handshake is fully ready
-        yield pymongo.MongoClient(f"mongodb://127.0.0.1:{port}", serverSelectionTimeoutMS=5000)
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        shutil.rmtree(data_dir, ignore_errors=True)
+    with _mongod_replset_client() as client:
+        yield client
 
 
 def _run_workloads(client: pymongo.MongoClient, n: int) -> dict[str, float]:
@@ -321,9 +292,8 @@ def _run_workloads(client: pymongo.MongoClient, n: int) -> dict[str, float]:
 def _change_stream_drain(client: pymongo.MongoClient, n: int) -> float:
     """Seconds to drain ``n // 2`` change-stream events (inserted while the
     watch is open; only the drain is timed). ``NaN`` when the server rejects
-    ``$changeStream`` — a STANDALONE mongod does (its change streams need a
-    replica set), so the throwaway standalone reference gets its number from
-    a separate single-node-replica-set spawn in ``main``."""
+    ``$changeStream``, as a standalone mongod does; the reference here is a
+    one-member replica set, which serves them."""
     events = n // 2
     cs = client["perf"]["cs"]
     cs.drop()
@@ -527,21 +497,6 @@ def main(argv: list[str] | None = None) -> int:
     samples = _interleaved_runs(makers, args.n, args.reps)
     mongod = _medians(samples["mongod"]) if use_mongod else None
 
-    if (
-        mongod is not None
-        and math.isnan(mongod.get("change_stream_drain", float("nan")))
-        and not args.mongo_uri
-        and shutil.which("mongod") is not None
-    ):
-        # Standalone mongod rejects $changeStream — measure that one row
-        # against a throwaway single-node replica set.
-        drains = []
-        for _ in range(args.reps):
-            with _mongod_replset_client() as rc:
-                drains.append(_change_stream_drain(rc, args.n))
-        mongod["change_stream_drain"] = statistics.median(drains)
-        # Not measured in the interleaved passes, so it has no paired spread.
-        samples["mongod"].pop("change_stream_drain", None)
     rust = _medians(samples["rust"])
     py = _medians(samples["python"])
 

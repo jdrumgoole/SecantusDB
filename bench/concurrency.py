@@ -63,6 +63,31 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+MONGOD_REPLSET = "bench0"
+
+
+def _initiate_replset(port: int, *, timeout: float = 60.0) -> bool:
+    """Initiate the one-member mongod replica set and wait for PRIMARY."""
+    import pymongo
+
+    client = pymongo.MongoClient(
+        f"mongodb://127.0.0.1:{port}/", directConnection=True, serverSelectionTimeoutMS=10000
+    )
+    try:
+        client.admin.command(
+            "replSetInitiate",
+            {"_id": MONGOD_REPLSET, "members": [{"_id": 0, "host": f"127.0.0.1:{port}"}]},
+        )
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if client.admin.command("hello").get("isWritablePrimary"):
+                return True
+            time.sleep(0.2)
+        return False
+    finally:
+        client.close()
+
+
 def _wait_listen(host: str, port: int, *, timeout: float = 30.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -176,6 +201,10 @@ def _server_argv(server: str, port: int, storage_path: Path) -> list[str]:
             "--dbpath",
             str(storage_path),
             "--quiet",
+            # A one-member replica set, as secantusd-mdb runs by default:
+            # both then wait for the journal at w: "majority".
+            "--replSet",
+            MONGOD_REPLSET,
         ]
     raise SystemExit(f"unknown server {server!r}")
 
@@ -360,7 +389,10 @@ def run_concurrency_sweep(
             if not _wait_listen("127.0.0.1", port, timeout=30):
                 print("ERROR: server didn't come up", file=sys.stderr)
                 return 2, []
-            uri = f"mongodb://127.0.0.1:{port}/"
+            if server == "mongod" and not _initiate_replset(port):
+                print("ERROR: mongod never became PRIMARY", file=sys.stderr)
+                return 2, []
+            uri = f"mongodb://127.0.0.1:{port}/?directConnection=true"
             # Unique prefix per row: fresh collections, no drops (see
             # run_writers' note on why drops must never touch the window).
             stats, elapsed = run_writers(
