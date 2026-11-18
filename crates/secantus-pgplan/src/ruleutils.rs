@@ -5865,6 +5865,15 @@ pub fn explain_sort_keys(
             _ => None,
         })
         .collect();
+    // A key qualified by the FROM's alias resolves against it (RP-1035).
+    let refname = match s.from_clause.as_slice() {
+        [item] => match item.node.as_ref() {
+            Some(N::RangeVar(rv)) => rv.alias.as_ref().map(|a| a.aliasname.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+    .unwrap_or_else(|| def.name.clone());
     let mut computed = false;
     let mut out = Vec::new();
     for item in &s.sort_clause {
@@ -5892,8 +5901,8 @@ pub fn explain_sort_keys(
                 p.fold_consts = true;
                 p.explain_windows = true;
                 p.scopes.push(vec![Rte {
-                    refname: def.name.clone(),
-                    name: def.name.clone(),
+                    refname: refname.clone(),
+                    name: refname.clone(),
                     columns: def
                         .columns
                         .iter()
@@ -6145,6 +6154,28 @@ mod tests {
         ] {
             assert_eq!(meet_types(a, b).as_deref(), Some(want), "{a} meets {b}");
         }
+    }
+
+    /// PostgreSQL 15.19: `explain select a from k x order by x.a*2` prints
+    /// `Sort Key: ((a * 2))`, the key resolved through the alias (RP-1035).
+    #[test]
+    fn a_sort_key_through_an_alias_is_deparsed() {
+        let def = TableDef::new(
+            "k",
+            vec![
+                Column::new("a", "int4", false),
+                Column::new("b", "text", false),
+            ],
+        );
+        let Some(N::SelectStmt(s)) =
+            parse_select("select a from k x order by x.a*2").and_then(|n| n.node)
+        else {
+            panic!("not a select");
+        };
+        assert_eq!(
+            explain_sort_keys(&s, &def),
+            Some(vec!["((a * 2))".to_string()])
+        );
     }
 
     fn cat_lookup(n: &str) -> Option<TableDef> {

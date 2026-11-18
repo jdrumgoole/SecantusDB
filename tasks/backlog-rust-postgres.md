@@ -2765,13 +2765,6 @@ statement is VALUES-only and runs there as written. The gap test is in
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop over a filtered inner relation is priced]
       Backlog-ID: RP-1038
 
-- [ ] **A computed ORDER BY key written through an alias prints its
-      synthetic name.** `explain select a from k x order by x.a*2` prints
-      `Sort Key: __order0`; PostgreSQL 15.19 prints `Sort Key: ((a * 2))`
-      (the unaliased `order by a*2` already does). The plain plan's key
-      text is not deparsed against the alias's range-table entry.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a computed sort key through an alias prints its expression]
-      Backlog-ID: RP-1035
 
 - [ ] **A Sort on a computed key is priced in one shape only.** Since
       2026-11-17 (RP-966) a Sort straight over one relation's scan whose
