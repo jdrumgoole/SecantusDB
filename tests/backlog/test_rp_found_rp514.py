@@ -277,8 +277,42 @@ INITDB_DESCRIPTIONS = {
 }
 
 
-@pytest.mark.backlog("RP-969")
+@pytest.mark.backlog_fixed("RP-969")
 @pytest.mark.parametrize("routine", list(INITDB_DESCRIPTIONS))
 def test_builtin_routine_has_initdb_description(routine: str, dsn: str) -> None:
     got = answer(dsn, f"select obj_description('{routine}'::regprocedure, 'pg_proc')")
     assert got == ("ok", [(INITDB_DESCRIPTIONS[routine],)])
+
+
+@pytest.mark.backlog_fixed("RP-969")
+def test_comment_replaces_and_removes_initdb_description(dsn: str) -> None:
+    # COMMENT replaces initdb's row and IS NULL deletes it, initdb's
+    # included (`DeleteComments`), on PostgreSQL 15.19.
+    q = "select coalesce(obj_description('abs(int)'::regprocedure, 'pg_proc'), '<null>')"
+    with psycopg.connect(dsn) as c:
+        c.execute("comment on function abs(int) is 'mine'")
+        assert c.execute(q).fetchall() == [("mine",)]
+        c.execute("comment on function abs(int) is null")
+        assert c.execute(q).fetchall() == [("<null>",)]
+        c.rollback()
+    with psycopg.connect(dsn) as c:
+        assert c.execute(q).fetchall() == [("absolute value",)]
+
+
+# initdb's descriptions of the other built-in objects (`pg_type.dat`,
+# `pg_operator.dat`, `pg_am.dat`, ...), measured on PostgreSQL 15.19.
+INITDB_OTHER_DESCRIPTIONS = {
+    "select obj_description('int4'::regtype, 'pg_type')": (
+        "-2 billion to 2 billion integer, 4-byte storage"
+    ),
+    "select obj_description('+(int4,int4)'::regoperator, 'pg_operator')": "add",
+    "select obj_description(oid, 'pg_am') from pg_am where amname = 'btree'": (
+        "b-tree index access method"
+    ),
+}
+
+
+@pytest.mark.backlog("RP-969")
+@pytest.mark.parametrize("query", list(INITDB_OTHER_DESCRIPTIONS))
+def test_builtin_object_has_initdb_description(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == ("ok", [(INITDB_OTHER_DESCRIPTIONS[query],)])

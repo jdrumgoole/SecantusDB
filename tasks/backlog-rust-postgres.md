@@ -2131,17 +2131,19 @@ holding `(1, 'y')`.
 
 Measured on a private PostgreSQL 15.19 cluster.
 
-- [ ] **A built-in routine has no initdb description.** PostgreSQL 15.19
-      answers `obj_description('abs(int)'::regprocedure, 'pg_proc')` with
-      initdb's `absolute value` (from `pg_proc.dat`'s `descr`), and every
-      built-in routine has its row in `pg_description`. Here a built-in has
-      none until a COMMENT ON FUNCTION gives it one (RP-519 stores those by
-      the overload's oid). Faithful: carry initdb's `pg_description` rows
-      for `pg_proc` in the built-in catalog facts, served until a COMMENT
-      replaces or (IS NULL) removes one, as `schema_comments` does for
-      `public`; the other catalogs' initdb descriptions (types, operators,
-      access methods) are the same gap.
-      Verify: tests/backlog/test_rp_found_rp514.py::test_builtin_routine_has_initdb_description
+- [ ] **A built-in type, operator or access method has no initdb
+      description.** PostgreSQL 15.19's initdb writes `pg_description`
+      rows from every catalog's `.dat` `descr`: `pg_type`, `pg_operator`,
+      `pg_am`, `pg_collation`, `pg_conversion`, `pg_language`,
+      `pg_namespace`, `pg_extension` and the four text-search catalogs
+      (`obj_description('int4'::regtype, 'pg_type')` is `-2 billion to 2
+      billion integer, 4-byte storage`). Here only `pg_proc`'s are served
+      (since RP-969's first part: `pg15_proc_descriptions.tsv`, dumped by
+      `tools/probes/pg15_system_catalog_dump.py`, with a COMMENT replacing
+      and IS NULL deleting one), and `public`'s by `schema_comments`.
+      Faithful: dump the other classoids' rows the same way and serve each
+      under its catalog, a COMMENT overriding it.
+      Verify: tests/backlog/test_rp_found_rp514.py::test_builtin_object_has_initdb_description
       Backlog-ID: RP-969
 
 ## Found while working RP-527 (2026-11-08)

@@ -316,6 +316,22 @@ pub(crate) fn dumped(name: &str) -> &'static str {
     &ROWS[start..end]
 }
 
+/// Each built-in routine's description as `initdb` wrote it to
+/// `pg_description` from `pg_proc.dat` (`pg15_proc_descriptions.tsv`,
+/// `tools/probes/pg15_system_catalog_dump.py`): `(pg_proc oid, text)`.
+pub(crate) fn initdb_proc_descriptions() -> &'static [(i64, String)] {
+    static ROWS: std::sync::OnceLock<Vec<(i64, String)>> = std::sync::OnceLock::new();
+    ROWS.get_or_init(|| {
+        include_str!("pg15_proc_descriptions.tsv")
+            .lines()
+            .filter_map(|l| {
+                let (oid, text) = l.split_once('\t')?;
+                Some((oid.parse().ok()?, text.to_string()))
+            })
+            .collect()
+    })
+}
+
 /// A built-in object's ACL as `initdb` leaves it (`pg_init_privs`), by
 /// `(classoid, objoid, objsubid)`: `pg_subscription`'s columns are
 /// `{=r/postgres}`. PostgreSQL's current ACL of a system object is this

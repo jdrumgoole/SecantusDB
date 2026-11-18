@@ -20199,7 +20199,12 @@ impl PgHandler {
                     return self.put_comment_doc(
                         Self::BUILTIN_PROC_COMMENT_COLLECTION,
                         &id,
-                        comment.map(|c| bson::doc! {"_id": &id, "oid": oid, "comment": c}),
+                        // IS NULL deletes the row, initdb's included: a
+                        // document with no comment keeps it deleted.
+                        Some(match comment {
+                            Some(c) => bson::doc! {"_id": &id, "oid": oid, "comment": c},
+                            None => bson::doc! {"_id": &id, "oid": oid},
+                        }),
                     );
                 };
                 let id = key;
@@ -22570,7 +22575,9 @@ impl PgHandler {
                 .chain(self.transform_comments())
                 .map(|(oid, c)| (oid, 0, c)),
         );
-        // COMMENT ON a built-in routine, by its overload's oid.
+        // COMMENT ON a built-in routine, by its overload's oid, replacing
+        // or (IS NULL) removing initdb's description of it (RP-969).
+        let mut commented = HashSet::new();
         for d in self
             .storage
             .find_matching(
@@ -22582,10 +22589,20 @@ impl PgHandler {
             .iter()
             .filter_map(|b| decode_doc(b).ok())
         {
-            if let (Some(oid), Ok(c)) = (d.get("oid").and_then(bson_i64), d.get_str("comment")) {
+            let Some(oid) = d.get("oid").and_then(bson_i64) else {
+                continue;
+            };
+            commented.insert(oid);
+            if let Ok(c) = d.get_str("comment") {
                 tail.push((oid, 0, c.to_string()));
             }
         }
+        tail.extend(
+            crate::system_catalogs::initdb_proc_descriptions()
+                .iter()
+                .filter(|(oid, _)| !commented.contains(oid))
+                .map(|(oid, c)| (*oid, 0, c.clone())),
+        );
         // COMMENT ON FUNCTION / PROCEDURE, kept on the function's record,
         // under the oid `pg_proc` gives it.
         for d in self.user_function_docs()? {
