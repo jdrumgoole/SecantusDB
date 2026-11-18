@@ -1300,11 +1300,11 @@ def test_a_btree_gin_numeric_index_of_wide_values_and_nan_has_its_pages(pg: Any)
     assert got == ("ok", [(175,)])
 
 
-@pytest.mark.backlog("RP-287")
+@pytest.mark.backlog_fixed("RP-287")
 def test_a_btree_gin_interval_index_has_its_pages(pg: Any) -> None:
-    """A btree_gin index over an `interval` column is not modelled (16-byte
+    """A btree_gin index over an `interval` column was not modelled (16-byte
     keys ordered by `interval_cmp_internal`): PostgreSQL 15.19 sizes this
-    one at 177 pages; here `pg_relation_size` reads 0."""
+    one at 177 pages; here `pg_relation_size` read 0."""
     got = _in_block(
         pg,
         [
@@ -1317,3 +1317,22 @@ def test_a_btree_gin_interval_index_has_its_pages(pg: Any) -> None:
         "select pg_relation_size('rp287_bii') / 8192",
     )
     assert got == ("ok", [(177,)])
+
+
+@pytest.mark.backlog("RP-287")
+def test_a_btree_gin_time_index_has_its_pages(pg: Any) -> None:
+    """A btree_gin index over a `time` column is not modelled (8-byte keys
+    ordered by `time_cmp`): PostgreSQL 15.19 sizes this one at 66 pages;
+    here `pg_relation_size` reads 0."""
+    got = _in_block(
+        pg,
+        [
+            "create extension if not exists btree_gin",
+            "create table rp287_bt (a time)",
+            "insert into rp287_bt select make_time(g % 24, g % 60, (g % 61)::float8)"
+            " from generate_series(1, 20000) g",
+            "create index rp287_bti on rp287_bt using gin (a)",
+        ],
+        "select pg_relation_size('rp287_bti') / 8192",
+    )
+    assert got == ("ok", [(66,)])

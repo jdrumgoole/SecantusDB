@@ -198,6 +198,7 @@ impl ElemOps {
                 | "timestamp with time zone"
                 | "numeric"
                 | "decimal"
+                | "interval"
         )
     }
 
@@ -284,6 +285,7 @@ impl ElemOps {
             | "timestamp without time zone"
             | "timestamptz"
             | "timestamp with time zone" => (8, 8),
+            "interval" => (16, 8),
             _ => (4, 4),
         };
         align(align(AFTER_ATTNUM, typalign) + size, 8)
@@ -363,6 +365,13 @@ impl KeyOps for GinOps {
 /// One column's opclass alone, as a one-column index has it (`att` 0).
 impl KeyOps for ElemOps {
     fn cmp(&self, _: u16, a: &Bson, b: &Bson) -> std::cmp::Ordering {
+        // `interval_cmp_internal`: 30-day months, 24-hour days, in 128 bits.
+        if let (Some(x), Some(y)) = (
+            secantus_pgplan::Interval::from_bson(a),
+            secantus_pgplan::Interval::from_bson(b),
+        ) {
+            return x.comparable_micros().cmp(&y.comparable_micros());
+        }
         if self.is_numeric() {
             // `cmp_numerics`: NaN equal to itself and above every number.
             let text = |v: &Bson| secantus_pgplan::numeric::numeric_operand_text(v);
@@ -396,6 +405,10 @@ impl KeyOps for ElemOps {
             // A short varlena header when it fits one byte.
             let data = if len < 127 { 1 + len } else { 4 + len };
             return (8 + data + 7) & !7;
+        }
+        if self.elem == "interval" {
+            // The 8-byte header, then the 16-byte `Interval`.
+            return 24;
         }
         16
     }
