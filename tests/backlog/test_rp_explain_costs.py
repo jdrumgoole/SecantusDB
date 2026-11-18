@@ -5442,7 +5442,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # A sublink whose subquery has its own WHERE, measured on 15.19.
     "an in subquery with its own where is planned as a join": (
-        "RP-411",
+        "RP-411:fixed",
         _ANALYSED,
         "explain select * from e where b in (select b from k where a > 500)",
         [
@@ -5454,6 +5454,38 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Group Key: k.b",
             "              ->  Seq Scan on k  (cost=0.00..17.50 rows=500 width=3)",
             "                    Filter: (a > 500)",
+        ],
+    ),
+    # Over a unique column, the inner join keeps the subquery's WHERE on
+    # the inner scan, measured on 15.19 (RP-411).
+    "an in subquery with its own where over a unique column is an inner join": (
+        "RP-411:fixed",
+        _ANALYSED,
+        "explain select * from e where a in (select a from k where b = 'v3')",
+        [
+            "Hash Join  (cost=18.75..36.39 rows=100 width=7)",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=17.50..17.50 rows=100 width=4)",
+            "        ->  Seq Scan on k  (cost=0.00..17.50 rows=100 width=4)",
+            "              Filter: (b = 'v3'::text)",
+        ],
+    ),
+    # An IN subquery whose WHERE an index reads: its side is that Index
+    # Scan, made unique, measured on 15.19 (RP-411).
+    "an in subquery read through an index is planned as a join": (
+        "RP-411",
+        _ANALYSED,
+        "explain select * from e where b in (select b from k where a > 990)",
+        [
+            "Hash Join  (cost=8.61..37.36 rows=1000 width=7)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=8.54..8.54 rows=6 width=3)",
+            "        ->  HashAggregate  (cost=8.47..8.54 rows=6 width=3)",
+            "              Group Key: k.b",
+            "              ->  Index Scan using k_pkey on k  (cost=0.28..8.45 rows=10 width=3)",
+            "                    Index Cond: (a > 990)",
         ],
     ),
     # Planned as the inner join `reduce_unique_semijoins` makes of it.

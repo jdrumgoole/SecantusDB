@@ -7,8 +7,8 @@
 //! Recognised here: a plain parent over one plain relation whose WHERE is
 //! that sublink, alone or ANDed with conjuncts over the outer relation
 //! alone (which filter its scan), over a subquery reading one plain relation, with
-//! no WHERE (IN) or a WHERE that is the one correlating column equality
-//! (EXISTS). Anything else is left to the plan as written.
+//! a WHERE over that relation alone, which filters its scan (IN), or a WHERE
+//! that is the one correlating column equality (EXISTS). Anything else is left to the plan as written.
 //!
 //! Over an inner relation unique on its column, `reduce_unique_semijoins`
 //! makes the semi join an inner join: `as_inner_join` writes that join, and
@@ -41,6 +41,11 @@ pub struct SemiJoin {
     /// filter, comparisons of expressions with constants the scan runs per
     /// row (RP-411, as `ExplainOptions::scan_expr_quals`).
     pub outer_exprs: Vec<ExprQual>,
+    /// An IN subquery's own WHERE, over the inner relation alone, lowered
+    /// to the inner scan's filter (RP-411; empty: none).
+    pub inner_filter: Document,
+    /// That WHERE as the inner scan's `Filter` prints it.
+    pub inner_quals: Vec<(String, Option<String>)>,
     /// The EXPLAIN of the inner join `reduce_unique_semijoins` makes of
     /// it when the inner relation is unique on `inner_col` (RP-411):
     /// `outer JOIN inner ON outer.col = inner.col`, the select list read
@@ -236,13 +241,24 @@ pub(crate) fn semi_join_of(
         (inner_name.as_str(), &inner_def),
         (outer_name.as_str(), &outer_def),
     ];
+    let mut inner_filter = Document::new();
+    let mut inner_quals = Vec::new();
     let (outer_col, inner_col) = match SubLinkType::try_from(link.sub_link_type).ok()? {
         SubLinkType::AnySublink => {
             // `IN` leaves the operator name empty; `= ANY` names it.
-            if !(link.oper_name.is_empty() || is_equals(&link.oper_name))
-                || sub.where_clause.is_some()
-            {
+            if !(link.oper_name.is_empty() || is_equals(&link.oper_name)) {
                 return None;
+            }
+            // The subquery's own WHERE, over its relation alone and held
+            // whole by the scan's filter, filters the inner scan
+            // (`pull_up_sublinks` keeps it below the join).
+            if let Some(w) = sub.where_clause.as_deref() {
+                if crate::filter_sublink::has_sublink(w) || !outer_only(w, &inner_name, &inner_def)
+                {
+                    return None;
+                }
+                inner_filter = lower_where_nonvolatile(w, &inner_def, &[]).ok()?;
+                inner_quals = ruleutils::explain_conjuncts(w, &inner_def)?;
             }
             let [t] = sub.target_list.as_slice() else {
                 return None;
@@ -285,6 +301,8 @@ pub(crate) fn semi_join_of(
         outer_col,
         outer_quals,
         outer_exprs,
+        inner_filter,
+        inner_quals,
         inner_join: None,
     }))
 }
@@ -409,6 +427,14 @@ pub(crate) fn as_inner_join(query: &N, sj: &SemiJoin) -> Option<N> {
             location: -1,
         }))),
     });
+    // An IN subquery's own WHERE stays a qual of the inner relation; an
+    // EXISTS's is the correlating equality written above.
+    let any = link.sub_link_type == SubLinkType::AnySublink as i32;
+    if let Some(w) = sub.where_clause.as_deref().filter(|_| any) {
+        let mut w = w.clone();
+        qualify(&mut w, &sj.inner.1);
+        conjuncts.push(w);
+    }
     out.where_clause = and_of(conjuncts).map(Box::new);
     Some(N::SelectStmt(out))
 }

@@ -47294,6 +47294,11 @@ impl PgHandler {
                             &sj.outer_quals,
                             &index_columns,
                         );
+                        explain::inner_quals_on_semi_join(
+                            &mut tree,
+                            &sj.inner_quals,
+                            &index_columns,
+                        );
                         let priced = match inner.as_ref() {
                             Statement::Select(sel) => self.semi_join_estimate(sj, sel),
                             _ => None,

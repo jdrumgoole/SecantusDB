@@ -2155,7 +2155,6 @@ impl PgHandler {
                 }
             }
         }
-        let empty = Document::new();
         let a = self.hash_side_with(
             &sj.outer.0,
             &sel.filter,
@@ -2164,8 +2163,10 @@ impl PgHandler {
             &read,
             &fields,
         )?;
+        // The subquery's WHERE filters the inner scan, which returns its
+        // key alone.
         let inner_read = [inner_key.clone()];
-        let b = self.hash_side(&sj.inner.0, &empty, &inner_key, &inner_read, &[])?;
+        let b = self.hash_side(&sj.inner.0, &sj.inner_filter, &inner_key, &inner_read, &[])?;
         let ((outer, inner, mut join, _, _), unique) = hash_semi_join_of(a, b)?;
         join.1 += target * join.2;
         join.3 += width;

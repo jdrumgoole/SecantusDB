@@ -1979,18 +1979,22 @@ a regression test.
       `compute_semi_anti_join_factors` takes them) it is planned and printed
       as that `Hash Join`. Still open: (1) Merge and nested-loop semi
       joins, the unique-ified side as the outer one, and a side read through
-      an index, are not priced. (2) Wider shapes still print the scan: a
-      subquery with its own WHERE (`select * from e where b in (select b
-      from k where a > 500)` is the unique-ified `Hash Join
-      (cost=18.98..47.73 rows=1000 width=7)`, `Filter: (a > 500)` on k's
-      scan, on a private 15.19 cluster), a cross-type comparison, and an
+      an index, are not priced; an IN subquery's own WHERE an index reads
+      (`select * from e where b in (select b from k where a > 990)`, k's
+      primary key on a) prints a zero-cost `Hash Semi Join` over k's Seq
+      Scan with that `Filter`, where 15.19 hashes a `HashAggregate` over
+      `Index Scan using k_pkey` (`Index Cond: (a > 990)`). Since 2026-11-18
+      an IN subquery's own WHERE over its relation filters the inner scan
+      (`SemiJoin::inner_filter`, `inner_quals`) and is priced where that
+      scan is sequential. (2) Wider shapes still print the scan: a
+      cross-type comparison, and an
       outer conjunct other than a comparison of an expression with a
       constant that the scan's filter does not hold whole. Outer conjuncts
       are pulled up with the sublink and filter that scan
       (`sublink_join::split_where`); one that does not lower is priced as an
       `ExprQual` (`SemiJoin::outer_exprs`).
       Backlog-ID: RP-411
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery with its own where is planned as a join]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery read through an index is planned as a join]
 - [ ] **A node above an InitPlan's scan is unpriced.** Since
       RP-440's first slices (2026-11-16) a SELECT over one relation whose WHERE
       compares columns with uncorrelated FROM-less scalar subqueries plans
