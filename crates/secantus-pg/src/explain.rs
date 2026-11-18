@@ -4003,8 +4003,7 @@ pub(crate) fn attach_verbose_chain(
             prefix_quals(n, &r.quals);
             return Some((vec![i], r.reltarget.clone()));
         }
-        // A LEFT JOIN hashes its nullable relation alone, and so does
-        // the FULL JOIN that tops a chain.
+        // A LEFT or FULL JOIN hashes its nullable relation alone.
         let full = n.name == "Hash Full Join";
         let left = full || n.name == "Hash Left Join";
         if !(left || n.name == "Hash Join")
@@ -4029,7 +4028,7 @@ pub(crate) fn attach_verbose_chain(
         if joins_nullable(&rels) {
             return None;
         }
-        if full != (c.full && inner_rels == [c.rels.len() - 1])
+        if full != matches!(inner_rels.as_slice(), [x] if c.full[*x])
             || left != joins_nullable(&inner_rels)
             || (left
                 && (rels.len() != inner_rels[0] || !(0..inner_rels[0]).all(|x| rels.contains(&x))))

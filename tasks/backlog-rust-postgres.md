@@ -1672,9 +1672,11 @@ a regression test.
       a LEFT JOIN at any level of such a chain does too, each hashing its
       nullable relation alone: `VerboseChain::nullable`.) (Since 2026-11-18
       a FULL JOIN topping such a chain with no WHERE does too:
-      `VerboseChain::full`.) Still the plain plan: a nested loop or merge
+      `VerboseChain::full`.) (Since 2026-11-18 so does a FULL JOIN at any
+      level below only outer joins, and a LEFT JOIN above or below one:
+      an outer join's ON reduces nothing below it.) Still the plain plan: a nested loop or merge
       join in a chain, a RIGHT join in one (RP-1063 first), a FULL JOIN
-      below another join, a WHERE over a FULL JOIN (`... full join e e2
+      below an inner join (its plain plan differs too), a WHERE over a FULL JOIN (`... full join e e2
       on e2.a = k.a where e.b <> 'x'` is reduced to a `Hash Left Join` on
       PostgreSQL 15.19, `reduce_outer_joins`, whose plain plan matches here), a LEFT JOIN an inner ON above reduces to an inner one (RP-1061
       first), a WHERE on a LEFT JOIN's nullable side (its plain plan differs
@@ -1740,6 +1742,17 @@ a regression test.
       join k)` Hash Join over a Hash of `e e2`. Found while working RP-966.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a right join atop a chain hashes its preserved relation]
       Backlog-ID: RP-1063
+
+- [ ] **A FULL JOIN an inner join above reduces hashes the wrong side.**
+      `explain (costs off) select e.b, e2.b from e full join k on e.a =
+      k.a join e e2 on e2.a = k.a` (`e`, `k` analysed, 1000 rows) is a
+      `Hash Left Join` of `k` over a Hash of `e` here, `Hash Cond: (k.a =
+      e.a)`; PostgreSQL 15.19 reduces the FULL JOIN to a `Hash Right Join`
+      of `e` over a Hash of `k`, `Hash Cond: (e.a = k.a)`, `Inner Unique:
+      true` (`reduce_outer_joins`, then costing both sides). Found while
+      working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a full join an inner join reduces hashes its unique side]
+      Backlog-ID: RP-1064
 
 - [ ] **A hash join on an expression and a column pair hashes the
       expression's side.** `explain select e.b from e join k on e.a = k.a

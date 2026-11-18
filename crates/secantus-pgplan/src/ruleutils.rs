@@ -7233,9 +7233,9 @@ pub struct VerboseChain {
     /// Per relation: a LEFT JOIN adds it, its nullable side, so the join
     /// that brings it in is a `Hash Left Join` hashing it alone.
     pub nullable: Vec<bool>,
-    /// The topmost join is a FULL JOIN: a `Hash Full Join` hashing the
-    /// last relation alone, every relation nullable.
-    pub full: bool,
+    /// Per relation: a FULL JOIN adds it, a `Hash Full Join` hashing it
+    /// alone. Every join above a FULL JOIN is an outer join.
+    pub full: Vec<bool>,
 }
 
 /// [`VerboseChain`] for `SELECT <columns> FROM a JOIN b ON a.x = b.y JOIN
@@ -7262,20 +7262,25 @@ pub fn explain_verbose_chain(
     let mut ons: Vec<&Node> = Vec::new();
     let mut rights: Vec<&pg_query::protobuf::RangeVar> = Vec::new();
     let mut node: &Node = item;
-    // Per join, innermost last until reversed: is it a LEFT JOIN.
+    // Per join, innermost last until reversed: is it a LEFT (or FULL)
+    // JOIN, and is it a FULL JOIN.
     let mut lefts: Vec<bool> = Vec::new();
-    let mut full = false;
+    let mut fulls: Vec<bool> = Vec::new();
     let first = loop {
         match node.node.as_ref() {
             Some(N::JoinExpr(j)) => {
                 // A LEFT JOIN's nullable side is its right relation.
                 let mut left = j.jointype == pg_query::protobuf::JoinType::JoinLeft as i32;
-                // Only the topmost join may be a FULL JOIN: below one, the
-                // relations it null-extends change every join above.
-                if lefts.is_empty() && j.jointype == pg_query::protobuf::JoinType::JoinFull as i32 {
-                    full = true;
+                // A FULL JOIN only below outer joins: an inner join above
+                // one reduces it (`reduce_outer_joins`), another plan.
+                let full = j.jointype == pg_query::protobuf::JoinType::JoinFull as i32;
+                if full {
+                    if lefts.iter().any(|l| !l) {
+                        return None;
+                    }
                     left = true;
                 }
+                fulls.push(full);
                 if j.is_natural
                     || !j.using_clause.is_empty()
                     || j.alias.is_some()
@@ -7301,6 +7306,7 @@ pub fn explain_verbose_chain(
     rights.reverse();
     ons.reverse();
     lefts.reverse();
+    fulls.reverse();
     // Relation i + 1 is joined by join i.
     let nullable: Vec<bool> = std::iter::once(false)
         .chain(lefts.iter().copied())
@@ -7403,10 +7409,12 @@ pub fn explain_verbose_chain(
                     order[*i].push(c.clone());
                 }
             }
-            // A strict ON above a LEFT JOIN that reads its nullable side
-            // reduces it to an inner join (`reduce_outer_joins`): another
-            // plan.
-            if (0..on_i + 1).any(|x| nullable[x] && x != on_i + 1 && (l.0 == x || r.0 == x)) {
+            // A strict inner ON above a LEFT JOIN that reads its nullable
+            // side reduces it to an inner join (`reduce_outer_joins`):
+            // another plan. An outer join's ON reduces nothing below it.
+            if !lefts[on_i]
+                && (0..on_i + 1).any(|x| nullable[x] && x != on_i + 1 && (l.0 == x || r.0 == x))
+            {
                 return None;
             }
             if lefts[on_i] {
@@ -7432,7 +7440,7 @@ pub fn explain_verbose_chain(
     // `Filter`. Its columns are not in the `reltarget`.
     let mut quals: Vec<Vec<(String, String)>> = vec![Vec::new(); n];
     // A WHERE over a FULL JOIN filters above it, or reduces it.
-    if full && s.where_clause.is_some() {
+    if fulls.contains(&true) && s.where_clause.is_some() {
         return None;
     }
     if let Some(w) = s.where_clause.as_deref() {
@@ -7522,6 +7530,6 @@ pub fn explain_verbose_chain(
         rels,
         output: outputs.iter().map(|(i, c)| pre(*i, c)).collect(),
         nullable,
-        full,
+        full: std::iter::once(false).chain(fulls).collect(),
     })
 }

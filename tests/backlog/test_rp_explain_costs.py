@@ -2170,6 +2170,114 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Output: e2.b, e2.a",
         ],
     ),
+    # Measured on PostgreSQL 15.19 (2026-11-18): a FULL JOIN below another
+    # FULL JOIN keeps the ON's columns its nullable sides need above.
+    "explain verbose of a chain of full joins": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, e2.b, e3.b from e full join k on e.a = k.a "
+        "full join e e2 on e2.a = k.a full join e e3 on e3.a = e.a",
+        [
+            "Hash Full Join",
+            "  Output: e.b, e2.b, e3.b",
+            "  Hash Cond: (e.a = e3.a)",
+            "  ->  Hash Full Join",
+            "        Output: e.b, e.a, e2.b",
+            "        Hash Cond: (k.a = e2.a)",
+            "        ->  Hash Full Join",
+            "              Output: e.b, e.a, k.a",
+            "              Inner Unique: true",
+            "              Hash Cond: (e.a = k.a)",
+            "              ->  Seq Scan on public.e",
+            "                    Output: e.a, e.b",
+            "              ->  Hash",
+            "                    Output: k.a",
+            "                    ->  Seq Scan on public.k",
+            "                          Output: k.a",
+            "        ->  Hash",
+            "              Output: e2.b, e2.a",
+            "              ->  Seq Scan on public.e e2",
+            "                    Output: e2.b, e2.a",
+            "  ->  Hash",
+            "        Output: e3.b, e3.a",
+            "        ->  Seq Scan on public.e e3",
+            "              Output: e3.b, e3.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (2026-11-18): a LEFT JOIN's ON reading
+    # a FULL JOIN's side below it reduces nothing.
+    "explain verbose of a left join over a full join": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, e2.b from e full join k on e.a = k.a "
+        "left join e e2 on e2.a = k.a",
+        [
+            "Hash Left Join",
+            "  Output: e.b, e2.b",
+            "  Hash Cond: (k.a = e2.a)",
+            "  ->  Hash Full Join",
+            "        Output: e.b, k.a",
+            "        Inner Unique: true",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.a, e.b",
+            "        ->  Hash",
+            "              Output: k.a",
+            "              ->  Seq Scan on public.k",
+            "                    Output: k.a",
+            "  ->  Hash",
+            "        Output: e2.b, e2.a",
+            "        ->  Seq Scan on public.e e2",
+            "              Output: e2.b, e2.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (2026-11-18): a FULL JOIN's ON reading
+    # a LEFT JOIN's nullable side reduces nothing.
+    "explain verbose of a full join over a left join": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, e2.b from e left join k on e.a = k.a "
+        "full join e e2 on e2.a = k.a",
+        [
+            "Hash Full Join",
+            "  Output: e.b, e2.b",
+            "  Hash Cond: (k.a = e2.a)",
+            "  ->  Hash Left Join",
+            "        Output: e.b, k.a",
+            "        Inner Unique: true",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.a, e.b",
+            "        ->  Hash",
+            "              Output: k.a",
+            "              ->  Seq Scan on public.k",
+            "                    Output: k.a",
+            "  ->  Hash",
+            "        Output: e2.b, e2.a",
+            "        ->  Seq Scan on public.e e2",
+            "              Output: e2.b, e2.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966): an inner
+    # join above a FULL JOIN reduces it to a right join hashing `k`.
+    "a full join an inner join reduces hashes its unique side": (
+        "RP-1064",
+        _ANALYSED,
+        "explain (costs off) select e.b, e2.b from e full join k on e.a = k.a "
+        "join e e2 on e2.a = k.a",
+        [
+            "Hash Join",
+            "  Hash Cond: (k.a = e2.a)",
+            "  ->  Hash Right Join",
+            "        Inner Unique: true",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e",
+            "        ->  Hash",
+            "              ->  Seq Scan on k",
+            "  ->  Hash",
+            "        ->  Seq Scan on e e2",
+        ],
+    ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): an outer
     # join's Hash Cond clauses each put the outer side's column first.
     "an outer join's two-clause hash cond puts the outer column first": (
