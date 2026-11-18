@@ -1600,21 +1600,6 @@ a regression test.
       a `pg_stat_*` view 16 match, 22 differ.
       Backlog-ID: RP-290
       Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view], tests/backlog/test_rp_catalog_reads.py::test_gap[psql's describe query]
-- [ ] **An ORDER BY an index scan already returns in order is counted as
-      sorted, and the index's pathkeys are not read.** With query pathkeys
-      (an ORDER BY, a GROUP BY, a join), PostgreSQL 15.19 makes each
-      B-tree's leading key a pathkey (`build_index_pathkeys`: the key's
-      family's equality operator, an AMOPSTRATEGY search, and that
-      operator's merge-join families), going on to the next key when an
-      equality fixes the column; and when the index scan it chooses returns
-      the rows in the ORDER BY's order it puts no Sort over it, so the
-      executor never looks up the sort support function. On `SELECT c.oid
-      FROM pg_class c WHERE c.relname = 'rpc_t' ORDER BY c.relname` this
-      server counts the Sort's `pg_amproc` lookup; ordered by
-      `relnamespace` it also misses `oid_ops`' equality (2026-11-13, found
-      while working RP-290).
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[an ORDER BY an index gives]
-      Backlog-ID: RP-934
 - [ ] **A catalog row added after `initdb` counts no heap block** in
       `pg_statio_sys_tables`. A catalog scan counts its index pages
       (`catalog_btree.rs`, from `pg15_catalog_indexes.txt`) and, since

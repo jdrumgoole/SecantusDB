@@ -289,14 +289,14 @@ GAPS: dict[str, tuple[str, bool, list[str]]] = {
             "mark",
         ],
     ),
-    # An ORDER BY an index already gives: no Sort, so no sort support
+    # An ORDER BY an index already gives (fixed, RP-934): no Sort, so no sort support
     # (`PrepareSortSupportFromOrderingOp`); and with any query pathkeys,
     # each B-tree's leading columns become pathkeys (`build_index_pathkeys`:
     # their family's equality, and its merge-join families), a column
     # an equality fixes letting the next one in.
     "an ORDER BY an index gives": (
         "RP-934",
-        True,
+        False,
         [
             "a|",
             "b|",

@@ -180,6 +180,9 @@ struct Needs {
     patterns: Vec<(i64, i64, String)>,
     /// `pg_table_is_visible(oid)` of this relation's rows is a restriction.
     visible: bool,
+    /// The query's ORDER BY, when every item is a column of this lone
+    /// relation: `(attnum, descending)`.
+    order: Vec<(i64, bool)>,
 }
 
 /// [`Model::facts`]' memo: `(session, catalog version, invalidation
@@ -210,6 +213,9 @@ pub(crate) struct Model<'a> {
     pub(crate) exec: Vec<Scan>,
     /// The planner inputs gathered per range-table relation.
     needs: HashMap<i64, Needs>,
+    /// The last planned relation's chosen index scan returns its rows in
+    /// the ORDER BY's order, so no Sort is planned.
+    index_ordered: bool,
     /// Walking a stored query (a view's rule): its names and operators were
     /// resolved when it was stored, so only the planner and executor read.
     stored: bool,
@@ -268,6 +274,7 @@ impl<'a> Model<'a> {
             params: Vec::new(),
             exec: Vec::new(),
             needs: HashMap::new(),
+            index_ordered: false,
             stored: false,
             aggs: 0,
             silent: 0,
@@ -886,6 +893,52 @@ impl<'a> Model<'a> {
                 used = Some((ix.clone(), covering, ops));
             }
         }
+        // `build_index_pathkeys`, with query pathkeys: each B-tree key's
+        // equality operator in its family (`make_pathkey_from_sortinfo`),
+        // going on while the column has an equivalence class.
+        let fixed = |a: &i64| needs.eq_consts.iter().any(|(x, _)| x == a);
+        // `has_useful_pathkeys`: an ORDER BY key an equality makes constant
+        // is redundant, so a query ordered only by those has none.
+        let want: Vec<(i64, bool)> = needs
+            .order
+            .iter()
+            .filter(|(a, _)| !fixed(a))
+            .copied()
+            .collect();
+        if !needs.order.is_empty() && want.is_empty() {
+            self.index_ordered = true;
+        }
+        if !want.is_empty() {
+            for ix in rel.indexes.iter().filter(|i| i.am == BTREE_AM) {
+                for (pos, col) in ix.keys.iter().enumerate() {
+                    let Some(o) = ix.classes.get(pos).and_then(|c| self.h.cr_opclass(*c)) else {
+                        break;
+                    };
+                    let key = vec![K::O(o.family), K::O(o.intype), K::O(o.intype), K::O(3)];
+                    let found = builtin()
+                        .amop_strategy
+                        .contains_key(&(o.family, o.intype, o.intype, 3));
+                    self.search(Cache::AmopStrategy, key, |_| found);
+                    let has_class = fixed(col)
+                        || needs.order.iter().any(|(a, _)| a == col)
+                        || needs.joins.contains(col);
+                    if !has_class {
+                        break;
+                    }
+                }
+            }
+            // `pathkeys_contained_in`: the query's pathkeys, less those an
+            // equality makes constant, lead the chosen index's, all in one
+            // direction (a backward scan for descending).
+            if let Some((ix, _, _)) = &used {
+                let gives: Vec<i64> = ix.keys.iter().filter(|k| !fixed(k)).copied().collect();
+                let one_way = want.windows(2).all(|w| w[0].1 == w[1].1);
+                self.index_ordered = ix.am == BTREE_AM
+                    && one_way
+                    && want.len() <= gives.len()
+                    && want.iter().zip(&gives).all(|((a, _), k)| a == k);
+            }
+        }
         // `_bt_first`: a scan key whose operator compares the column with
         // another type finds the family's cross-type comparison proc
         // (AMPROCNUM); the same type's is in the index's descriptor.
@@ -1250,8 +1303,23 @@ impl<'a> Model<'a> {
     /// (`get_ordering_op_properties`, `get_mergejoin_opfamilies`), and, for
     /// a sort, the executor's sort support.
     fn sort_item(&mut self, typ: i64, desc: bool, group: bool) {
+        if let Some((f, t)) = self.sort_item_planned(typ, desc, group) {
+            self.sort_support(f, t);
+        }
+    }
+
+    /// `PrepareSortSupportFromOrderingOp`, for a Sort the plan keeps.
+    fn sort_support(&mut self, f: i64, t: i64) {
+        if !self.opfamily_proc(f, t, t, 2) {
+            self.opfamily_proc(f, t, t, 1);
+        }
+    }
+
+    /// [`Self::sort_item`] up to the planner: the family and type a Sort's
+    /// support would be looked up under.
+    fn sort_item_planned(&mut self, typ: i64, desc: bool, group: bool) -> Option<(i64, i64)> {
         if typ == UNKNOWN || typ <= 0 {
-            return;
+            return None;
         }
         let ops = self.type_cache(typ, TC_LT | TC_EQ | TC_GT | TC_HASHPROC);
         let sortop = if desc { ops.gt } else { ops.lt };
@@ -1260,11 +1328,9 @@ impl<'a> Model<'a> {
         if group {
             // Hashed grouping: the equality operator's function.
             self.oper_oid(ops.eq);
-        } else if let Some((f, t)) = ops.btree {
-            // `PrepareSortSupportFromOrderingOp`.
-            if !self.opfamily_proc(f, t, t, 2) {
-                self.opfamily_proc(f, t, t, 1);
-            }
+            None
+        } else {
+            ops.btree
         }
     }
 
@@ -1782,8 +1848,30 @@ impl<'a> Model<'a> {
                 self.sort_item(t, false, true);
             }
         }
+        // An ORDER BY of the lone relation's columns may be the order an
+        // index scan returns: its Sort, and the Sort's support, wait for
+        // the plan.
+        let lone =
+            (scope.rels.len() == 1 && s.group_clause.is_empty()).then(|| scope.rels[0].1.clone());
+        let mut order: Option<Vec<(i64, bool)>> = lone.as_ref().map(|_| Vec::new());
+        let mut pending = Vec::new();
         for sb in &s.sort_clause {
             if let Some(N::SortBy(b)) = sb.node.as_ref() {
+                let desc = b.sortby_dir == pb::SortByDir::SortbyDesc as i32;
+                let column = match (node(&b.node), &lone) {
+                    (Some(N::ColumnRef(c)), Some(rel)) => {
+                        let names = names_of(&c.fields);
+                        names
+                            .last()
+                            .and_then(|n| rel.columns.iter().find(|c| &c.1 == n))
+                            .map(|c| c.0)
+                    }
+                    _ => None,
+                };
+                match (column, order.as_mut()) {
+                    (Some(att), Some(o)) => o.push((att, desc)),
+                    _ => order = None,
+                }
                 if let Some(e) = node(&b.node) {
                     let t = match e {
                         // ORDER BY n: the n-th result column.
@@ -1796,11 +1884,22 @@ impl<'a> Model<'a> {
                         },
                         _ => self.expr(e, &scope, true),
                     };
-                    let desc = b.sortby_dir == pb::SortByDir::SortbyDesc as i32;
-                    self.sort_item(t, desc, false);
+                    if let Some(p) = self.sort_item_planned(t, desc, false) {
+                        pending.push(p);
+                    }
                 }
             }
         }
+        if let (Some(rel), Some(o)) = (&lone, &order) {
+            self.needs.entry(rel.oid).or_default().order = o.clone();
+        }
+        let deferred = order.as_ref().is_some_and(|o| !o.is_empty());
+        if !deferred {
+            for (f, t) in pending.drain(..) {
+                self.sort_support(f, t);
+            }
+        }
+        self.index_ordered = false;
         // `transformLimitClause`: the count and offset are int8.
         for l in [node(&s.limit_count), node(&s.limit_offset)]
             .into_iter()
@@ -1813,6 +1912,12 @@ impl<'a> Model<'a> {
         for (_, rel) in scope.rels.clone() {
             if rel.view.is_none() {
                 self.plan_rel(&rel);
+            }
+        }
+        // The executor's Sort, unless the index scan gives the order.
+        if !self.index_ordered {
+            for (f, t) in pending {
+                self.sort_support(f, t);
             }
         }
         // The executor: `ExecCheckRTPerms` on every relation, then the
