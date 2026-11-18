@@ -1437,11 +1437,12 @@ batch, their tests regression tests:
       been ordered as `varstr_cmp` orders them since 2026-11-17 (libc
       collations such as `en_US` do not exist here, a scope decision).
       A `btree_gin` index over a scalar `int2`/`int4`/`int8`/`float4`/
-      `float8`/`bool`/`text` column has been modelled since 2026-11-17 (one
-      key per row, the value itself); its scans are not, nor its other
-      types (`date`, `timestamp`, `numeric`, ...).
+      `float8`/`bool`/`text` column has been modelled since 2026-11-17, and
+      over `date`/`timestamp`/`timestamptz` since 2026-11-18 (one key per
+      row, the value itself); its scans are not, nor its other types
+      (`numeric`, `interval`, `time`, `bytea`, `inet`, ...).
       Backlog-ID: RP-287
-      Verify: tests/backlog/test_rp_top10_found.py::test_a_btree_gin_date_index_has_its_pages
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_btree_gin_numeric_index_has_its_pages
 
 
 ## Found by batch 71 (2026-10-25)

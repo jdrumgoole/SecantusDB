@@ -1223,11 +1223,11 @@ def test_a_select_list_nextval_in_an_autocommit_join_runs_once_a_row(rust_pg: An
     assert got == [([(1, 1), (2, 2), (3, 3)], (3,))] * 2
 
 
-@pytest.mark.backlog("RP-287")
+@pytest.mark.backlog_fixed("RP-287")
 def test_a_btree_gin_date_index_has_its_pages(pg: Any) -> None:
-    """A btree_gin index over a `date` column is not modelled (only int,
-    float, bool and text keys are): PostgreSQL 15.19 sizes this one at 14
-    pages; here `pg_relation_size` reads 0."""
+    """A btree_gin index over a `date` column was not modelled (only int,
+    float, bool and text keys were): PostgreSQL 15.19 sizes this one at 14
+    pages; `pg_relation_size` read 0."""
     got = _in_block(
         pg,
         [
@@ -1240,3 +1240,41 @@ def test_a_btree_gin_date_index_has_its_pages(pg: Any) -> None:
         "select pg_relation_size('rp287_bdi') / 8192",
     )
     assert got == ("ok", [(14,)])
+
+
+@pytest.mark.backlog_fixed("RP-287")
+@pytest.mark.parametrize("typ", ["timestamp", "timestamptz"])
+def test_a_btree_gin_timestamp_index_has_its_pages(pg: Any, typ: str) -> None:
+    """A btree_gin index over a `timestamp` / `timestamptz` column was not
+    modelled: PostgreSQL 15.19 sizes this one at 16 pages; `pg_relation_size`
+    read 0."""
+    got = _in_block(
+        pg,
+        [
+            "create extension if not exists btree_gin",
+            f"create table rp287_bts (a {typ})",
+            "insert into rp287_bts select timestamp '2020-01-01' + (g % 700) * interval '1 hour'"
+            " from generate_series(1, 20000) g",
+            "create index rp287_btsi on rp287_bts using gin (a)",
+        ],
+        "select pg_relation_size('rp287_btsi') / 8192",
+    )
+    assert got == ("ok", [(16,)])
+
+
+@pytest.mark.backlog("RP-287")
+def test_a_btree_gin_numeric_index_has_its_pages(pg: Any) -> None:
+    """A btree_gin index over a `numeric` column is not modelled (its keys
+    are varlena `numeric`s ordered by `cmp_numerics`): PostgreSQL 15.19
+    sizes this one at 15 pages; here `pg_relation_size` reads 0."""
+    got = _in_block(
+        pg,
+        [
+            "create extension if not exists btree_gin",
+            "create table rp287_bn (a numeric)",
+            "insert into rp287_bn select (g % 500) / 7.0 from generate_series(1, 20000) g",
+            "create index rp287_bni on rp287_bn using gin (a)",
+        ],
+        "select pg_relation_size('rp287_bni') / 8192",
+    )
+    assert got == ("ok", [(15,)])

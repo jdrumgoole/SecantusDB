@@ -191,6 +191,11 @@ impl ElemOps {
                 | "jsonb"
                 | "jsonb_path"
                 | "tsvector"
+                | "date"
+                | "timestamp"
+                | "timestamp without time zone"
+                | "timestamptz"
+                | "timestamp with time zone"
         )
     }
 
@@ -254,7 +259,14 @@ impl ElemOps {
         let (size, typalign) = match self.elem.as_str() {
             "bool" | "boolean" => (1, 1),
             "int2" | "smallint" => (2, 2),
-            "int8" | "bigint" | "float8" | "double precision" => (8, 8),
+            "int8"
+            | "bigint"
+            | "float8"
+            | "double precision"
+            | "timestamp"
+            | "timestamp without time zone"
+            | "timestamptz"
+            | "timestamp with time zone" => (8, 8),
             _ => (4, 4),
         };
         align(align(AFTER_ATTNUM, typalign) + size, 8)
