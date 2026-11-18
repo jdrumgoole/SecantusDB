@@ -2646,19 +2646,28 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415).
 
-- [ ] **A renamed partition key column leaves the key naming the old
-      column, and the table takes no more rows.** After `alter table p939k
-      rename column x to y` on `p939k (x int) partition by list (x)`,
-      PostgreSQL 15.19 still routes `insert into p939k values (1)` and
-      prints the key `LIST (y)`: the key holds the column's attnum. Here
-      the stored key text still names `x`, so the INSERT is 42703 `column
-      "x" does not exist`. The RENAME COLUMN arm renames the column in
-      stored CHECKs (`rename_column_in_expression`, RP-939); the partition
-      key, the partitions' bounds, and any other stored expression text
-      (defaults, generated columns, index expressions and predicates) were
-      not checked.
-      Verify: tests/backlog/test_rp_found_rp860.py::test_a_renamed_partition_key_column_still_routes
-      Backlog-ID: RP-1024
+- [ ] **`pg_get_partkeydef` prints an expression key with one pair of
+      parentheses too few.** `create table p (x int) partition by range
+      ((x + 1))` prints `RANGE (((x + 1)))` on PostgreSQL 15.19 (the key
+      list's, the expression's, the OpExpr's); here `RANGE ((x + 1))`.
+      Verify: tests/backlog/test_rp_found_rp860.py::test_pg_get_partkeydef_of_an_expression_key
+      Backlog-ID: RP-1052
+- [ ] **A renamed column leaves a generated column naming the old one,
+      and the table takes no more rows.** On `(x int, g int generated
+      always as (x * 2) stored)`, after `rename column x to y`, PostgreSQL
+      15.19 inserts `(3, 6)`; here the stored expression still names `x`,
+      42703. Faithful: rename it as the RENAME COLUMN arm does for CHECKs
+      and the partition key (`rename_column_in_expression`).
+      Verify: tests/backlog/test_rp_found_rp860.py::test_a_renamed_column_is_renamed_in_a_generated_column
+      Backlog-ID: RP-1053
+- [ ] **A renamed column leaves an expression index naming the old one,
+      and the table takes no more rows.** After `create index i on t ((x +
+      1)) where x > 0` and `rename column x to y`, PostgreSQL 15.19 inserts
+      and prints `(((y + 1))) WHERE (y > 0)`; here both still name `x` and
+      the INSERT is 42703. Column defaults measured fine (they cannot name
+      a column).
+      Verify: tests/backlog/test_rp_found_rp860.py::test_a_renamed_column_is_renamed_in_an_expression_index
+      Backlog-ID: RP-1054
 
 ## Found while working RP-751 (2026-11-10)
 

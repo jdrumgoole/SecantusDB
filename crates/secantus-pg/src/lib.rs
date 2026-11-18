@@ -45966,7 +45966,7 @@ impl PgHandler {
                 }
                 self.rewrite_catalog(&table, &def)?;
                 if partition::is_partitioned(&def) {
-                    self.sync_partition_columns(&def)?;
+                    self.sync_partition_columns(&def, None)?;
                 }
                 // A rewrite reindexes the table; otherwise the indexes the
                 // statement made are built (RP-196).
@@ -46116,12 +46116,13 @@ impl PgHandler {
                     )
                     .map_err(|e| Self::err(&e))?;
                 }
+                Self::rename_partition_key_column(&mut def, &column, &to)?;
                 if let Some(c) = def.columns.iter_mut().find(|c| c.name == column) {
                     c.name = to.clone();
                 }
                 self.rewrite_catalog(&table, &def)?;
                 if partition::is_partitioned(&def) {
-                    self.sync_partition_columns(&def)?;
+                    self.sync_partition_columns(&def, Some((&column, &to)))?;
                 }
                 Ok(vec![Response::Execution(Tag::new("ALTER TABLE"))])
             }
