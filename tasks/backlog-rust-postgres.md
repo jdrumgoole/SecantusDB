@@ -2872,13 +2872,3 @@ statement is VALUES-only and runs there as written. The gap test is in
 
 ## Found while working RP-971 (2026-11-17)
 
-- [ ] **A `pg_temp` name before the session has a temp namespace answers
-      "does not exist" for the object, not the schema.** In a fresh
-      session PostgreSQL 15.19 answers `select 'pg_temp.zz'::regclass` and
-      `select 'pg_temp.zz'::regtype` with 3F000 `schema "pg_temp" does not
-      exist` (`LookupExplicitNamespace` finds no `myTempNamespace`);
-      `secantusd-pg` answers 42P01 `relation "pg_temp.zz" does not exist`
-      and 42704 `type "pg_temp.zz" does not exist`. A function call
-      already answers 3F000 (`test_a_pg_temp_function_left_by_a_killed_server_is_gone_at_restart`).
-      Verify: tests/backlog/test_rp_qualified_calls.py::test_pg_temp_name_without_a_temp_namespace_is_an_undefined_schema
-      Backlog-ID: RP-1037
