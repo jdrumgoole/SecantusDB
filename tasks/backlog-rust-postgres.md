@@ -1668,9 +1668,15 @@ a regression test.
       scan's `Output` unless needed above: `ChainRel::quals`.) (Since
       2026-11-18 a chain whose topmost join is a LEFT JOIN prints every
       node's `Output`, the outer ON's columns kept out of the inner
-      equivalence classes: `VerboseChain::left_join`.) Still the plain
-      plan: a nested loop or merge join in a chain, any other outer join in
-      one, a WHERE on a LEFT JOIN's nullable side, and a WHERE conjunct
+      equivalence classes: `VerboseChain::left_join`.) (Since 2026-11-18
+      a LEFT JOIN at any level of such a chain does too, each hashing its
+      nullable relation alone: `VerboseChain::nullable`.) Still the plain
+      plan: a nested loop or merge join in a chain, a RIGHT or FULL join in
+      one, a LEFT JOIN an inner ON above reduces to an inner one (RP-1061
+      first), a WHERE on a LEFT JOIN's nullable side (its plain plan differs
+      too: `... left join e e2 on e2.a = k.a where e2.b <> 'x'` is reduced
+      and reordered on PostgreSQL 15.19, `where e2.b is null` a `Hash Right
+      Join` of `e2` and `k` under a Hash), and a WHERE conjunct
       reading two of its relations (`explain (verbose, costs off) select
       e.b, e2.b from e join k on e.a = k.a join e e2 on e2.a = e.a where
       e2.b <> k.b` on PostgreSQL 15.19 prints each node's `Output` and the
@@ -1692,6 +1698,26 @@ a regression test.
       join k) join e2`. Found while working RP-966.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a filtered relation of a three-way join is joined first]
       Backlog-ID: RP-1059
+
+- [ ] **A LEFT JOIN nothing reads is not removed.** `explain (costs
+      off) select e.b from e left join k on e.a = k.a` (`k.a` the primary
+      key) is a `Hash Left Join` here; PostgreSQL 15.19 prints `Seq Scan on
+      e` alone, as `remove_useless_joins` drops a LEFT JOIN whose inner side
+      is unique on the ON's columns and read nowhere above
+      (`join_is_removable`). Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join nothing reads is removed]
+      Backlog-ID: RP-1060
+
+- [ ] **A LEFT JOIN reduced to inner keeps its ON out of the
+      equivalence class.** `explain (costs off) select e.b, k.b from e
+      left join k on e.a = k.a join e e2 on e2.a = k.a` prints the top
+      `Hash Cond: (k.a = e2.a)`; PostgreSQL 15.19, which reduces the LEFT
+      JOIN to an inner one (`reduce_outer_joins`) before
+      `deconstruct_jointree`, merges `e.a = k.a` into the class with
+      `e2.a` and prints `Hash Cond: (e.a = e2.a)` (and no `Inner Unique`
+      on that join under VERBOSE). Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join reduced to inner joins the chain on its class]
+      Backlog-ID: RP-1061
 
 - [ ] **A hash join on an expression and a column pair hashes the
       expression's side.** `explain select e.b from e join k on e.a = k.a

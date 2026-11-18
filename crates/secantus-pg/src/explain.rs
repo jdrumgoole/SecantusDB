@@ -3968,7 +3968,6 @@ pub(crate) fn attach_verbose_chain(
         c: &VerboseChain,
         under_hash: bool,
         apply: bool,
-        top: bool,
     ) -> Option<(Vec<usize>, Tlist)> {
         if let Some(plain) = n.name.strip_prefix("Seq Scan on ") {
             if !n.children.is_empty() {
@@ -4004,13 +4003,9 @@ pub(crate) fn attach_verbose_chain(
             prefix_quals(n, &r.quals);
             return Some((vec![i], r.reltarget.clone()));
         }
-        // A LEFT JOIN is the topmost join, its nullable relation hashed.
-        let join_name = if top && c.left_join {
-            "Hash Left Join"
-        } else {
-            "Hash Join"
-        };
-        if n.name != join_name
+        // A LEFT JOIN hashes its nullable relation alone.
+        let left = n.name == "Hash Left Join";
+        if !(left || n.name == "Hash Join")
             || n.details
                 .iter()
                 .any(|(k, _)| k != "Hash Cond" && k != "Inner Unique")
@@ -4023,9 +4018,19 @@ pub(crate) fn attach_verbose_chain(
         if hash.name != "Hash" || !hash.details.is_empty() || hash.children.len() != 1 {
             return None;
         }
-        let (mut rels, mut tlist) = walk(outer, c, false, apply, false)?;
-        let (inner_rels, inner_tlist) = walk(&mut hash.children[0], c, true, apply, false)?;
-        if top && c.left_join && inner_rels != [c.rels.len() - 1] {
+        let (mut rels, mut tlist) = walk(outer, c, false, apply)?;
+        let (inner_rels, inner_tlist) = walk(&mut hash.children[0], c, true, apply)?;
+        // The join that brings in a nullable relation is its LEFT JOIN,
+        // every relation before it already joined; any other join finds
+        // it joined below.
+        let joins_nullable = |side: &[usize]| matches!(side, [x] if c.nullable[*x]);
+        if joins_nullable(&rels) {
+            return None;
+        }
+        if left != joins_nullable(&inner_rels)
+            || (left
+                && (rels.len() != inner_rels[0] || !(0..inner_rels[0]).all(|x| rels.contains(&x))))
+        {
             return None;
         }
         if apply {
@@ -4045,11 +4050,11 @@ pub(crate) fn attach_verbose_chain(
         return;
     };
     // Check the whole tree before changing any of it.
-    match walk(root, c, false, false, true) {
+    match walk(root, c, false, false) {
         Some((rels, _)) if rels.len() == c.rels.len() => {}
         _ => return,
     }
-    walk(root, c, false, true, true);
+    walk(root, c, false, true);
     root.details[0].1 = c.output.join(", ");
 }
 

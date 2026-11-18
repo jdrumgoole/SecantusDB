@@ -7230,9 +7230,9 @@ pub struct ChainNeed {
 pub struct VerboseChain {
     pub rels: Vec<ChainRel>,
     pub output: Vec<String>,
-    /// The topmost join is a LEFT JOIN, the last relation its nullable
-    /// side: a `Hash Left Join`.
-    pub left_join: bool,
+    /// Per relation: a LEFT JOIN adds it, its nullable side, so the join
+    /// that brings it in is a `Hash Left Join` hashing it alone.
+    pub nullable: Vec<bool>,
 }
 
 /// [`VerboseChain`] for `SELECT <columns> FROM a JOIN b ON a.x = b.y JOIN
@@ -7259,24 +7259,21 @@ pub fn explain_verbose_chain(
     let mut ons: Vec<&Node> = Vec::new();
     let mut rights: Vec<&pg_query::protobuf::RangeVar> = Vec::new();
     let mut node: &Node = item;
-    let mut left_join = false;
+    // Per join, innermost last until reversed: is it a LEFT JOIN.
+    let mut lefts: Vec<bool> = Vec::new();
     let first = loop {
         match node.node.as_ref() {
             Some(N::JoinExpr(j)) => {
-                // Only the topmost join may be a LEFT JOIN: its nullable
-                // side is the last relation, joined above every other.
+                // A LEFT JOIN's nullable side is its right relation.
                 let left = j.jointype == pg_query::protobuf::JoinType::JoinLeft as i32;
                 if j.is_natural
                     || !j.using_clause.is_empty()
                     || j.alias.is_some()
-                    || (j.jointype != pg_query::protobuf::JoinType::JoinInner as i32
-                        && !(left && rights.is_empty()))
+                    || (j.jointype != pg_query::protobuf::JoinType::JoinInner as i32 && !left)
                 {
                     return None;
                 }
-                if left {
-                    left_join = true;
-                }
+                lefts.push(left);
                 let Some(N::RangeVar(rv)) = j.rarg.as_deref()?.node.as_ref() else {
                     return None;
                 };
@@ -7293,6 +7290,11 @@ pub fn explain_verbose_chain(
     }
     rights.reverse();
     ons.reverse();
+    lefts.reverse();
+    // Relation i + 1 is joined by join i.
+    let nullable: Vec<bool> = std::iter::once(false)
+        .chain(lefts.iter().copied())
+        .collect();
     let mut sides: Vec<(String, TableDef, Option<String>)> = Vec::new();
     for rv in std::iter::once(first).chain(rights.iter().copied()) {
         if !rv.schemaname.is_empty() {
@@ -7363,7 +7365,6 @@ pub fn explain_verbose_chain(
     // is needed until the join above both of its relations
     // (`distribute_qual_to_rels` keeps it an outer-join clause).
     let mut outer_needs: Vec<((usize, String), [usize; 2])> = Vec::new();
-    let last_on = ons.len() - 1;
     for (on_i, on) in ons.iter().enumerate() {
         let mut parts = Vec::new();
         and_clauses(on, &mut parts);
@@ -7392,7 +7393,13 @@ pub fn explain_verbose_chain(
                     order[*i].push(c.clone());
                 }
             }
-            if left_join && on_i == last_on {
+            // A strict ON above a LEFT JOIN that reads its nullable side
+            // reduces it to an inner join (`reduce_outer_joins`): another
+            // plan.
+            if (0..on_i + 1).any(|x| nullable[x] && x != on_i + 1 && (l.0 == x || r.0 == x)) {
+                return None;
+            }
+            if lefts[on_i] {
                 outer_needs.push((l.clone(), [l.0, r.0]));
                 outer_needs.push((r.clone(), [l.0, r.0]));
                 continue;
@@ -7452,7 +7459,7 @@ pub fn explain_verbose_chain(
             }
             // A WHERE on the nullable side is not pushed below the outer
             // join (and may reduce it to an inner one).
-            if left_join && i == n - 1 {
+            if nullable[i] {
                 return None;
             }
             quals[i].push((print(part, i, true)?, print(part, i, false)?));
@@ -7500,6 +7507,6 @@ pub fn explain_verbose_chain(
     Some(VerboseChain {
         rels,
         output: outputs.iter().map(|(i, c)| pre(*i, c)).collect(),
-        left_join,
+        nullable,
     })
 }

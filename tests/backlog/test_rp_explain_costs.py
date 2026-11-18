@@ -2089,6 +2089,87 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Output: e2.b, e2.a",
         ],
     ),
+    # Measured on PostgreSQL 15.19 (2026-11-18): a LEFT JOIN below an inner
+    # join of a chain prints every node's `Output`, its ON's columns kept
+    # only while the join above still needs them.
+    "explain verbose of a three-way join over a left join": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, k.b from e left join k on e.a = k.a "
+        "join e e2 on e2.a = e.a",
+        [
+            "Hash Join",
+            "  Output: e.b, k.b",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Hash Left Join",
+            "        Output: e.b, e.a, k.b",
+            "        Inner Unique: true",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.a, e.b",
+            "        ->  Hash",
+            "              Output: k.b, k.a",
+            "              ->  Seq Scan on public.k",
+            "                    Output: k.b, k.a",
+            "  ->  Hash",
+            "        Output: e2.a",
+            "        ->  Seq Scan on public.e e2",
+            "              Output: e2.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (2026-11-18): two LEFT JOINs in a chain.
+    "explain verbose of a chain of two left joins": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, k.b, e2.b from e left join k on e.a = k.a "
+        "left join e e2 on e2.a = e.a",
+        [
+            "Hash Left Join",
+            "  Output: e.b, k.b, e2.b",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Hash Left Join",
+            "        Output: e.b, e.a, k.b",
+            "        Inner Unique: true",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.a, e.b",
+            "        ->  Hash",
+            "              Output: k.b, k.a",
+            "              ->  Seq Scan on public.k",
+            "                    Output: k.b, k.a",
+            "  ->  Hash",
+            "        Output: e2.b, e2.a",
+            "        ->  Seq Scan on public.e e2",
+            "              Output: e2.b, e2.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966): a LEFT
+    # JOIN to a unique key whose columns nothing reads is removed.
+    "a left join nothing reads is removed": (
+        "RP-1060",
+        _ANALYSED,
+        "explain (costs off) select e.b from e left join k on e.a = k.a",
+        ["Seq Scan on e"],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966): a LEFT
+    # JOIN an inner ON reduces to an inner one joins on its class.
+    "a left join reduced to inner joins the chain on its class": (
+        "RP-1061",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e left join k on e.a = k.a "
+        "join e e2 on e2.a = k.a",
+        [
+            "Hash Join",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Hash Join",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e",
+            "        ->  Hash",
+            "              ->  Seq Scan on k",
+            "  ->  Hash",
+            "        ->  Seq Scan on e e2",
+        ],
+    ),
     # Measured on PostgreSQL 15.19 (2026-11-18): a WHERE comparing two
     # relations of a chain is a join's `Join Filter`, its columns in the
     # `Output` below it.
