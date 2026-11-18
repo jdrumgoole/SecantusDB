@@ -2888,14 +2888,14 @@ def test_a_desc_nulls_last_key_with_another_sorts_the_merge(pg: Any) -> None:
     assert got == ("ok", [(2554, 6), (839, 6), (2939, 6), (1434, 6), (2169, 6)])
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_left_join_desc_nulls_last_key_with_another_sorts_the_merge(pg: Any) -> None:
     """PostgreSQL 15.19, two 3,000-row tables never analysed, an index on
     t1.a: `t0 LEFT JOIN t1 ON t0.b = t1.a ORDER BY t1.a DESC NULLS LAST,
     t0.c DESC LIMIT 5` leaves 2554, 839, 2939, 1434, 2169. A DESC NULLS
     LAST first key a LEFT join NULL-extends (`ORDER_CLASS`), with a key
-    after it, is declined by the search, and the join it plans instead
-    leaves 139, 34, 69, 104, 174."""
+    after it, was declined by the search, and the join it planned instead
+    left 139, 34, 69, 104, 174."""
     pg.execute("begin")
     try:
         _rp028_tables(pg, "rp028_l", 2, 3000)
@@ -2909,6 +2909,28 @@ def test_a_left_join_desc_nulls_last_key_with_another_sorts_the_merge(pg: Any) -
     finally:
         pg.execute("rollback")
     assert got == ("ok", [(2554, 6), (839, 6), (2939, 6), (1434, 6), (2169, 6)])
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_left_join_preserved_desc_nulls_last_key_with_another(pg: Any) -> None:
+    """PostgreSQL 15.19, two 3,000-row tables never analysed, an index on
+    t1.a: `t0 LEFT JOIN t1 ON t0.b = t1.a ORDER BY t0.b DESC NULLS LAST,
+    t1.c LIMIT 5` leaves 1280, 1728, 1448, 1721, 1273; the search's plan
+    leaves 2939, 860, 1763, 433, 2141 (ties on t0.b and t1.c in another
+    order). Not diagnosed."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_p", 2, 3000)
+        pg.execute("create index on rp028_p1 (a)")
+        got = pg_answer(
+            pg,
+            "select rp028_p0.a, rp028_p1.a from rp028_p0"
+            " left join rp028_p1 on rp028_p0.b = rp028_p1.a"
+            " order by rp028_p0.b desc nulls last, rp028_p1.c limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", [(1280, 6), (1728, 6), (1448, 6), (1721, 6), (1273, 6)])
 
 
 @pytest.mark.backlog_fixed("RP-028")
