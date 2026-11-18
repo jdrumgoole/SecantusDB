@@ -14,10 +14,10 @@
 //! with `statistics=(size)`), and dropped when the stage is done (measured on
 //! mongod 8.2.11, 2026-11-13).
 //!
-//! Opened at the first spill (or the first `serverStatus`, which reports
-//! it) rather than at startup, so a server that never
-//! spills (and the PostgreSQL server, which shares this crate) never makes
-//! the directory. Its tables are not compressed: mongod's are zstd at level
+//! The MongoDB server opens it at startup, as mongod does ([`SpillEngine::open`],
+//! RM-305); otherwise it is opened at the first spill (or the first
+//! `serverStatus`, which reports it), so the PostgreSQL server, which shares
+//! this crate, never makes the directory. Its tables are not compressed: mongod's are zstd at level
 //! -7 (`spillWiredTigerBlockCompressor`), which the vendored WiredTiger is
 //! not built with; that only shows once the engine writes a table's pages to
 //! its file.
@@ -116,11 +116,25 @@ pub fn open_config(cache_mb: i64) -> String {
          eviction_dirty_trigger={}MB,eviction_updates_trigger={}MB,config_base=false,\
          statistics=(fast),log=(enabled=false),\
          file_manager=(close_idle_time=600,close_scan_interval=10,close_handle_minimum=2000),\
-         statistics_log=(wait=0)",
+         statistics_log=(wait=0),{}",
         pct(5),
         pct(80),
-        pct(80)
+        pct(80),
+        crate::mongod_message_config()
     )
+}
+
+/// What opening the spill engine did, for mongod's startup lines `Opening
+/// spill WiredTiger` (10158000), its `WiredTiger message`s (22430) and
+/// `Spill WiredTiger opened` (10158001).
+#[derive(Debug, Clone)]
+pub struct SpillOpenRecord {
+    /// The configuration `wiredtiger_open` was given.
+    pub config: String,
+    /// The messages WiredTiger wrote while it opened, as it formatted them.
+    pub messages: Vec<String>,
+    /// How long `wiredtiger_open` took.
+    pub open: std::time::Duration,
 }
 
 /// The spill engine of the store at `dbpath`, opened by its first table.
@@ -175,6 +189,24 @@ impl SpillEngine {
         &self.home
     }
 
+    /// Open the engine now, as mongod 8.2 does at startup, and say what the
+    /// open did; `None` when it was already open.
+    pub fn open(&self) -> Result<Option<SpillOpenRecord>> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if conn.is_some() {
+            return Ok(None);
+        }
+        let config = open_config(self.cache_mb);
+        let started = std::time::Instant::now();
+        let opened = self.open_locked(&mut conn, &config)?;
+        let open = started.elapsed();
+        Ok(Some(SpillOpenRecord {
+            config,
+            messages: opened.take_messages(),
+            open,
+        }))
+    }
+
     /// The open engine, opening it (and dropping what an earlier run left in
     /// it) the first time.
     fn connection(&self) -> Result<Arc<Connection>> {
@@ -182,6 +214,19 @@ impl SpillEngine {
         if let Some(c) = conn.as_ref() {
             return Ok(Arc::clone(c));
         }
+        let opened = self.open_locked(&mut conn, &open_config(self.cache_mb))?;
+        // Nothing logs the messages of an open after startup.
+        opened.take_messages();
+        Ok(opened)
+    }
+
+    /// Open the engine into `conn` with `config`, dropping what an earlier
+    /// run left in it.
+    fn open_locked(
+        &self,
+        conn: &mut Option<Arc<Connection>>,
+        config: &str,
+    ) -> Result<Arc<Connection>> {
         std::fs::create_dir_all(&self.home).map_err(|e| {
             StorageError::Internal(format!(
                 "could not create the spill engine's directory {}: {e}",
@@ -194,7 +239,7 @@ impl SpillEngine {
                 self.home.display()
             ))
         })?;
-        let opened = Arc::new(Connection::open(home, &open_config(self.cache_mb))?);
+        let opened = Arc::new(Connection::open(home, config)?);
         drop_all(&opened.open_session()?)?;
         *conn = Some(Arc::clone(&opened));
         Ok(opened)

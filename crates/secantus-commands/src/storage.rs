@@ -339,6 +339,16 @@ pub struct StoreOpening {
     pub open: std::time::Duration,
 }
 
+/// What opening the spill engine at startup did (RM-305): the
+/// configuration `wiredtiger_open` was given, the messages WiredTiger wrote
+/// while it opened, and how long it took.
+#[derive(Debug, Clone)]
+pub struct SpillOpening {
+    pub config: String,
+    pub messages: Vec<String>,
+    pub open: std::time::Duration,
+}
+
 /// The storage operations the command handlers depend on. Bytes at the seam:
 /// documents go in/out as `bson::encode` bytes, as they come off the WT cursor.
 pub trait Storage: Send + Sync {
@@ -347,6 +357,13 @@ pub trait Storage: Send + Sync {
     /// fakes): a stage keeps its own file.
     fn spill_tables(&self) -> Option<std::sync::Arc<dyn SpillTables>> {
         None
+    }
+
+    /// Open the spill engine now, as mongod 8.2 does at startup ("Opening
+    /// spill WiredTiger"), and say what the open did. `Ok(None)` (the
+    /// default, for test fakes) when there is none or it is already open.
+    fn open_spill_engine(&self) -> Result<Option<SpillOpening>, String> {
+        Ok(None)
     }
 
     /// True when the store is non-persistent (WiredTiger `in_memory=true`).

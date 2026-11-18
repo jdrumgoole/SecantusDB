@@ -386,6 +386,12 @@ pub fn bind(
     listener.set_nonblocking(true)?;
     // How long each step of the start took, for `mongod startup complete`.
     let opening = storage.opening();
+    // mongod opens its spill engine as it creates the storage engine.
+    let step = Instant::now();
+    let spill_opening = storage
+        .open_spill_engine()
+        .map_err(|e| io::Error::other(format!("opening the spill engine: {e}")))?;
+    let spill_took = step.elapsed();
     let mut times = secantus_commands::diagnostics::StartupTimes {
         clean: !matches!(&opening, Some(o) if matches!(o.lock_file, Some((_, true, _)))),
         new_store: opening.as_ref().is_some_and(|o| o.new_store),
@@ -395,7 +401,7 @@ pub fn bind(
             .as_ref()
             .and_then(|o| o.lock_file.as_ref())
             .map_or(Duration::ZERO, |(_, _, took)| *took),
-        create_storage_engine: opening.as_ref().map_or(Duration::ZERO, |o| o.open),
+        create_storage_engine: opening.as_ref().map_or(Duration::ZERO, |o| o.open) + spill_took,
         ..Default::default()
     };
     let start_of_start = opening.as_ref().map_or(bind_started, |o| o.started);
@@ -517,6 +523,11 @@ pub fn bind(
     // ... then how the store opened.
     if let Some(opening) = &opening {
         for entry in secantus_commands::diagnostics::storage_opening_lines(opening) {
+            logs.log(entry);
+        }
+    }
+    if let Some(spill) = &spill_opening {
+        for entry in secantus_commands::diagnostics::spill_opening_lines(spill) {
             logs.log(entry);
         }
     }

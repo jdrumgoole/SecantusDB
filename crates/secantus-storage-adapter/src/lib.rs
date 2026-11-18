@@ -221,6 +221,17 @@ impl CmdStorage for StorageAdapter {
         Some(self.spill.clone())
     }
 
+    fn open_spill_engine(
+        &self,
+    ) -> Result<Option<secantus_commands::storage::SpillOpening>, String> {
+        let record = self.spill.open().map_err(|e| e.to_string())?;
+        Ok(record.map(|r| secantus_commands::storage::SpillOpening {
+            config: r.config,
+            messages: r.messages,
+            open: r.open,
+        }))
+    }
+
     fn bucket_catalog(&self) -> Option<&secantus_commands::BucketCatalog> {
         Some(&self.bucket_catalog)
     }
