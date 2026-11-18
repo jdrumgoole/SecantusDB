@@ -49256,7 +49256,9 @@ pub(crate) fn is_json_input_error(e: &Error) -> bool {
     e.sqlstate() == "22P02"
         && e.to_string()
             .starts_with("invalid input syntax for type json")
-        && !e.to_string().starts_with("invalid input syntax for type jsonpath")
+        && !e
+            .to_string()
+            .starts_with("invalid input syntax for type jsonpath")
 }
 
 /// A simple CASE's WHEN label as its comparison with the argument sees it.

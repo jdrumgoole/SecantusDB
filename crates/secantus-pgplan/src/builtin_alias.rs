@@ -756,10 +756,7 @@ fn input_call(name: &str, args: &[pg_query::protobuf::Node]) -> Option<pg_query:
             return None;
         }
     }
-    let template = parse_expression(&format!(
-        "$1::text::{}",
-        scalar::quote_identifier(ty)
-    ))?;
+    let template = parse_expression(&format!("$1::text::{}", scalar::quote_identifier(ty)))?;
     Some(substitute(&template, &args[..1]))
 }
 
