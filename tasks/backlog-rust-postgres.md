@@ -2256,22 +2256,23 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
 Measured on PostgreSQL 15.19 (port 5415) with statements that create
 nothing. The gap tests are in `tests/backlog/test_rp_found_rp750.py`.
 
-- [ ] **A `json` / `jsonb` input error on a constant has no position.**
-      `select 't'::jsonb` is 22P02 at 8 on PostgreSQL 15.19 (the literal),
-      `select 1, '[1,'::json` at 11, and `select json_typeof('x')` at 20;
-      here none is placed. `errpos.rs` finds a 22P02's literal by the
-      value the message quotes, and `invalid input syntax for type json`
-      quotes none: the input is only in the CONTEXT excerpt.
-      Verify: tests/backlog/test_rp_found_rp750.py::test_json_input_error_has_a_position
-      Backlog-ID: RP-952
-- [ ] **A type's input function called by name is refused.**
-      `select jsonb_in('{"b":1, "a":2}')` is `{"a": 2, "b": 1}` on
-      PostgreSQL 15.19 (the `unknown` literal coerces to `cstring`), as are
-      `json_in(...)` and `int4in('12')`; here each is 0A000 `function
-      jsonb_in(unknown) is not supported yet`. With a `text` argument both
-      servers answer 42883.
-      Verify: tests/backlog/test_rp_found_rp750.py::test_type_input_function_is_callable_by_name
+- [ ] **A three-argument input function with a typmod is refused.**
+      `select numeric_in('1.5', 0, 5)` is 22003 `numeric field overflow`
+      on PostgreSQL 15.19 (typmod 5 is `numeric(0,1)`, VARHDRSZ + 1); here
+      it is 0A000 `function numeric_in(unknown, integer, integer) is not
+      supported yet`. RP-953 rewrote the input
+      functions to casts (`builtin_alias::input_call`), the three-argument
+      ones only for typmod -1: a typmod needs the cast to the type with that
+      modifier.
+      Verify: tests/backlog/test_rp_found_rp750.py::test_input_function_with_a_typmod
       Backlog-ID: RP-953
+- [ ] **A cast from `cstring` to a type with no such cast is accepted.**
+      `select 'x'::cstring::int4` is 42846 `cannot cast type cstring to
+      integer` at 20 on PostgreSQL 15.19 (`cstring` casts only to the
+      string types, by I/O); here it reads the value as `int4` (22P02 for
+      this one, 12 for `'12'`).
+      Verify: tests/backlog/test_rp_found_rp750.py::test_cstring_casts_only_to_strings
+      Backlog-ID: RP-1041
 
 ## Found while working RP-570 (2026-11-08)
 

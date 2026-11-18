@@ -194,6 +194,14 @@ fn input_literal(sql: &str, toks: &[Tok], value: &str) -> Option<usize> {
     if resolved_to_text(sql, toks[i].start) {
         return None;
     }
+    // The argument of an input function called by name (`int4in('x')`) is
+    // read when the call runs, where there is no position (15.19, RP-953).
+    if i >= 2
+        && toks[i - 1].text == "("
+        && crate::builtin_alias::is_input_function(&unquote_ident(toks[i - 2].text))
+    {
+        return None;
+    }
     Some(toks[i].start)
 }
 

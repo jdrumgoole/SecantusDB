@@ -489,6 +489,7 @@ pub(crate) fn wanted(f: &pg_query::protobuf::FuncCall) -> bool {
         operators().contains_key(&(name.clone(), args.len()))
             || templates().contains_key(&(name.as_str(), args.len()))
             || family_template(&name, args.len()).is_some()
+            || input_functions().contains_key(&(name.as_str(), args.len()))
     })
 }
 
@@ -697,12 +698,80 @@ fn substitute(
     pg_query::protobuf::Node { node: Some(node) }
 }
 
+/// PostgreSQL 15.19's `pg_type.typinput`: `proname`, `pronargs`, `typname`.
+const TYPE_INPUT: &str = include_str!("pg_type_input.tsv");
+
+/// Each base type's input function, as the I/O conversion of its `cstring`
+/// argument: `int4in(c)` is `c::text::int4` (RP-953). Through `text`, as
+/// PostgreSQL has no cast from `cstring` to most types, only to `text`. `(name, pronargs)`
+/// to the type's name.
+fn input_functions() -> &'static HashMap<(&'static str, usize), &'static str> {
+    static I: OnceLock<HashMap<(&'static str, usize), &'static str>> = OnceLock::new();
+    I.get_or_init(|| {
+        TYPE_INPUT
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .filter_map(|l| {
+                let mut it = l.split('\t');
+                Some(((it.next()?, it.next()?.parse().ok()?), it.next()?))
+            })
+            .collect()
+    })
+}
+
+/// Whether `name` is a base type's input function (`int4in`).
+pub(crate) fn is_input_function(name: &str) -> bool {
+    input_functions().keys().any(|(n, _)| *n == name)
+}
+
+/// A call of a type's input function, as the cast it performs. The first
+/// argument must be `cstring`: an untyped literal (`unknown` coerces to
+/// it), a NULL, a parameter or a cast to `cstring`; any other argument is
+/// left for the planner to refuse (`int4in('1'::text)` is 42883 on
+/// PostgreSQL). The three-argument form (`numeric_in(c, typioparam,
+/// typmod)`) is rewritten only for typmod -1, which applies none.
+fn input_call(name: &str, args: &[pg_query::protobuf::Node]) -> Option<pg_query::protobuf::Node> {
+    use pg_query::protobuf::a_const::Val;
+    let ty = input_functions().get(&(name, args.len()))?;
+    let cstring_arg = match args[0].node.as_ref() {
+        Some(N::AConst(c)) => c.isnull || matches!(c.val, Some(Val::Sval(_))),
+        Some(N::ParamRef(_)) => true,
+        Some(N::TypeCast(t)) => t
+            .type_name
+            .as_ref()
+            .and_then(|tn| tn.names.last())
+            .is_some_and(|n| matches!(n.node.as_ref(), Some(N::String(s)) if s.sval == "cstring")),
+        _ => false,
+    };
+    if !cstring_arg {
+        return None;
+    }
+    if let [_, _, typmod] = args {
+        // The grammar folds `-1` into the constant (`doNegate`).
+        let no_typmod = matches!(
+            typmod.node.as_ref(),
+            Some(N::AConst(c)) if matches!(&c.val, Some(Val::Ival(i)) if i.ival == -1)
+        );
+        if !no_typmod {
+            return None;
+        }
+    }
+    let template = parse_expression(&format!(
+        "$1::text::{}",
+        scalar::quote_identifier(ty)
+    ))?;
+    Some(substitute(&template, &args[..1]))
+}
+
 /// The expression the call `n` stands for, when it is one of these.
 pub(crate) fn replacement(n: &pg_query::protobuf::Node) -> Option<pg_query::protobuf::Node> {
     let Some(N::FuncCall(f)) = n.node.as_ref() else {
         return None;
     };
     let (name, args) = plain_call(f)?;
+    if input_functions().contains_key(&(name.as_str(), args.len())) {
+        return input_call(&name, args);
+    }
     if let Some(template) = templates().get(&(name.as_str(), args.len())) {
         let types = template_param_types(template, args.len());
         if args.iter().zip(&types).any(|(a, t)| literal_refused(a, t)) {
