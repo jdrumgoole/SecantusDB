@@ -418,6 +418,8 @@ const TIME_SERIES_STAGES: &[&str] = &[
 /// only `{$count: {}}` and `{$sum: 1}` accumulators (measured 2026-11-18;
 /// `{$sum: 2}`, `{$sum: "$v"}`, `{$min: "$t"}` and `_id: {a: "$m"}` go to
 /// the slot-based engine, and a `$group` with none is a distinct scan).
+/// A constant key (`null`, `1`, `"a"`: what `count_documents` and `$count`
+/// send) runs the same way, over every bucket.
 fn groups_on_meta(stage: &Bson, meta: Option<&str>) -> bool {
     let Some(meta) = meta else {
         return false;
@@ -426,10 +428,15 @@ fn groups_on_meta(stage: &Bson, meta: Option<&str>) -> bool {
         return false;
     };
     let keyed = match spec.get("_id") {
-        Some(Bson::String(path)) => path
-            .strip_prefix('$')
-            .and_then(|p| p.strip_prefix(meta))
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.')),
+        Some(Bson::String(path)) => {
+            path.strip_prefix('$')
+                .and_then(|p| p.strip_prefix(meta))
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+                || !path.starts_with('$')
+        }
+        Some(Bson::Null | Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Boolean(_)) => {
+            true
+        }
         _ => false,
     };
     let one = |v: &Bson| match v {
@@ -538,11 +545,19 @@ fn time_series(
         .ok()
         .and_then(|o| crate::timeseries::Fields::of(&o))
         .and_then(|f| f.meta);
+    // `count_documents` sends an empty `$match` before its `$group`.
+    let lead = ask
+        .pipeline
+        .iter()
+        .take_while(|s| {
+            matches!(s.as_document().and_then(|d| d.get("$match")), Some(Bson::Document(m)) if m.is_empty())
+        })
+        .count();
     let meta_group = ask
         .pipeline
-        .first()
+        .get(lead)
         .is_some_and(|s| groups_on_meta(s, meta.as_deref()))
-        && ask.pipeline[1..].iter().all(fits);
+        && ask.pipeline[lead + 1..].iter().all(fits);
     if ask.hint.is_some()
         || ask.collation.is_some()
         || !(per_bucket || only_projects || meta_group || ask.pipeline.iter().all(fits))
