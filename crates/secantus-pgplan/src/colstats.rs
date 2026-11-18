@@ -947,7 +947,7 @@ type QuantifiedAtom = (ReAtom, u32, Option<u32>);
 /// the regex right after it, and status `None` (`REG_NOMATCH`) when the
 /// regex is not anchored, alternates at its top, or fixes no first
 /// character. `None` for a regex whose NFA this does not model: a group
-/// repeated other than at most once, a constraint or anchor anywhere but
+/// repeated within a bounded range, a constraint or anchor anywhere but
 /// a leading `^` and a trailing `$`, a back reference to a group not
 /// yet closed or quantified, a numeric character escape, embedded
 /// options or a director.
@@ -1081,6 +1081,15 @@ fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String,
                     if let [only] = alts.as_slice() {
                         walk(only, prefix, insensitive, case_varies)?;
                     }
+                    return Some(false);
+                }
+                // `x{m,}` with m >= 2, capturing or not: `repeat` builds
+                // it as `x{m-1,}x`, down to `x+` and the copies after it,
+                // and `x+` is one copy whose end loops back -- one whole
+                // copy, then the loop's choice (RP-423).
+                ReAtom::Group(alts, capturing) if *min >= 2 && max.is_none() => {
+                    let once = [(ReAtom::Group(alts.clone(), *capturing), 1, Some(1))];
+                    walk(&once, prefix, insensitive, case_varies)?;
                     return Some(false);
                 }
                 ReAtom::Group(..) => return None,
@@ -1794,14 +1803,25 @@ mod tests {
             ("^((ab))+c", false, Some(("a", Partial))),
             ("^(a(b))+c", false, Some(("a", Partial))),
             ("^(ab)+?c", false, Some(("a", Partial))),
+            // A group repeated `{m,}`, m >= 2: one whole copy, then the
+            // loop's choice (RP-423).
+            ("^(ab){2,}c", false, Some(("ab", Partial))),
+            ("^(ab){3,}c", false, Some(("ab", Partial))),
+            ("^(w0){2,}1", false, Some(("w0", Partial))),
+            ("^(?:ab){2,}c", false, Some(("ab", Partial))),
+            ("^(a|b){2,}c", false, Some(("", NoMatch))),
+            ("^(a(b)*){2,}", false, Some(("a", Partial))),
+            ("^x(abc){2,}", false, Some(("xabc", Partial))),
+            ("^(ab){2,}$", false, Some(("ab", Partial))),
+            ("^(ab*c){2,}", false, Some(("a", Partial))),
             // A non-capturing one is not rewritten: one copy, then the
             // loop's choice.
             ("^(?:ab)+c", false, Some(("ab", Partial))),
             ("^x(?:ab)+y", false, Some(("xab", Partial))),
-            // Not modelled: a group repeated twice or more (`^(ab){2,}c`
-            // is `ab` on PostgreSQL 15.19), an anchor
-            // inside, a back reference to an unclosed group.
-            ("^(ab){2,}c", false, None),
+            // Not modelled: a group repeated within a bounded range
+            // (`^(ab){1,3}` fixes no prefix on PostgreSQL 15.19), an
+            // anchor inside, a back reference to an unclosed group.
+            ("^(ab){1,3}", false, None),
             ("(^a)", false, None),
             ("^a\\1", false, None),
             // A back reference is a copy of the group it names, as
