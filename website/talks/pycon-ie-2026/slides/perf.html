@@ -1,0 +1,17 @@
+<section id="perf" class="alt">
+<p class="eyebrow">How fast? Measured against mongod 8.0.38</p>
+<h2>1.2×–3.6× of mongod per operation</h2>
+<table style="width:100%;border-collapse:collapse;font-size:30px;margin-top:24px;">
+<thead><tr style="text-align:left;border-bottom:2px solid currentColor;"><th style="padding:8px 0;">Operation (10k docs)</th><th style="text-align:right;">mongod</th><th style="text-align:right;">Rust server</th><th style="text-align:right;">×mongod</th></tr></thead>
+<tbody>
+<tr><td style="padding:6px 0;">find indexed range</td><td style="text-align:right;">17.1 ms</td><td style="text-align:right;">22.2 ms</td><td style="text-align:right;">1.3×</td></tr>
+<tr><td style="padding:6px 0;">find full scan</td><td style="text-align:right;">33.5 ms</td><td style="text-align:right;">40.8 ms</td><td style="text-align:right;">1.2×</td></tr>
+<tr><td style="padding:6px 0;">update_many (half)</td><td style="text-align:right;">231.9 ms</td><td style="text-align:right;">273.1 ms</td><td style="text-align:right;">1.2×</td></tr>
+<tr><td style="padding:6px 0;">change-stream drain</td><td style="text-align:right;">178.5 ms</td><td style="text-align:right;">241.0 ms</td><td style="text-align:right;">1.4×</td></tr>
+<tr><td style="padding:6px 0;">insert</td><td style="text-align:right;">177.4 ms</td><td style="text-align:right;">259.2 ms</td><td style="text-align:right;">1.5×</td></tr>
+<tr><td style="padding:6px 0;">aggregate $group</td><td style="text-align:right;">18.9 ms</td><td style="text-align:right;">53.0 ms</td><td style="text-align:right;">2.8×</td></tr>
+<tr><td style="padding:6px 0;">delete_many (half)</td><td style="text-align:right;">96.2 ms</td><td style="text-align:right;">343.1 ms</td><td style="text-align:right;">3.6×</td></tr>
+</tbody></table>
+<p class="foot">Medians of 15 interleaved reps, DigitalOcean, 18 November 2026. Both servers run as a single-node replica set, so a default write waits for the journal on both.</p>
+<aside>Same WiredTiger C library underneath both, so every gap here is in the layers above storage: dispatch, the query engine, aggregation. Reads are close; delete_many and aggregation are where the work is. ~2 min.</aside>
+</section>
