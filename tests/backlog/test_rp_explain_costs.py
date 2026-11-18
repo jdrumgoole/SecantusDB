@@ -5185,11 +5185,63 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # A Limit over an InitPlan's scan is priced, the InitPlan's cost on the
     # top node only, measured on 15.19 (RP-440).
     "a limit above an initplan's scan is priced": (
-        "RP-440",
+        "RP-440:fixed",
         _ANALYSED,
         "explain select a from e where b = (select 'v3'::text) limit 5",
         [
             "Limit  (cost=0.01..0.89 rows=5 width=4)",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=4)",
+            "        Filter: (b = $0)",
+        ],
+    ),
+    # The Limit's OFFSET, and a LIMIT 0 counted as 1, over an InitPlan's
+    # scan, measured on 15.19 (RP-440).
+    "a limit and offset above an initplan's scan are priced": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select a from e where b = (select 'v3'::text) limit 5 offset 20",
+        [
+            "Limit  (cost=3.51..4.38 rows=5 width=4)",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=4)",
+            "        Filter: (b = $0)",
+        ],
+    ),
+    "an offset above an initplan's scan is priced": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select a from e where b = (select 'v3'::text) offset 20",
+        [
+            "Limit  (cost=3.51..17.51 rows=80 width=4)",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=4)",
+            "        Filter: (b = $0)",
+        ],
+    ),
+    "a limit 0 above an initplan's scan is priced": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select a from e where b = (select 'v3'::text) limit 0",
+        [
+            "Limit  (cost=0.01..0.18 rows=1 width=4)",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=4)",
+            "        Filter: (b = $0)",
+        ],
+    ),
+    # An aggregate other than a count over an InitPlan's scan, measured on
+    # 15.19 (RP-440).
+    "a sum above an initplan's scan is priced": (
+        "RP-440",
+        _ANALYSED,
+        "explain select sum(a) from e where b = (select 'v3'::text)",
+        [
+            "Aggregate  (cost=17.76..17.77 rows=1 width=8)",
             "  InitPlan 1 (returns $0)",
             "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
             "  ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=4)",

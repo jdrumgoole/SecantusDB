@@ -2001,14 +2001,15 @@ a regression test.
       ON conjunct of that shape is placed in its side's scan as `Filter: (b =
       $0)`, inner and LEFT join alike (`initplan::on_init_plans`). Counts
       over the scan are an Aggregate straight over it, priced
-      (`PgHandler::init_plan_count_agg`). Still open: a subquery with a
+      (`PgHandler::init_plan_count_agg`), and a Limit (OFFSET included)
+      straight over the scan (`limit_estimate`). Still open: a subquery with a
       FROM, a correlated one, or a sublink beside any other non-constant
       qual is still printed inline (`select * from e where b = (select b
       from k limit 1)`); a join's ON InitPlan is unpriced; other nodes above
-      the scan (Limit, Unique, a computed sort key, an aggregate other than
-      a count, a GROUP BY) are unpriced. Measured on a private 15.19
+      the scan (a Limit above a Sort, Unique, a computed sort key, an
+      aggregate other than a count, a GROUP BY) are unpriced. Measured on a private 15.19
       cluster.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a limit above an initplan's scan is priced]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sum above an initplan's scan is priced]
       Backlog-ID: RP-440
 
 ## Found by batch 54 (2026-10-24)
