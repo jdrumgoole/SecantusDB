@@ -554,9 +554,17 @@ These are explicit non-goals. Don't add them without a reason.
         (RM-357's session row);
       - mongod's first retryable write after startup takes a second,
         exempt, ingress admission (not traced), measured 8.2.11
-        2026-11-08; an index
-        build's `$currentOp` row has no `queues` here (mongod's not yet
-        measured).
+        2026-11-08;
+      - an index build: mongod 8.2.11 (one-member replica set, measured
+        2026-11-18 under `hangAfterStartingIndexBuild`) shows TWO rows, the
+        `IndexBuildsCoordinatorMongod-0` thread's (`queues.ingress`
+        admissions 0, not holding; `queues.execution` holding a ticket,
+        admissions counting its yields, 139 for 1,000 documents; locks
+        `w` on transition, global, database and collection) and the
+        client's `createIndexes` (`ingress` 1, holding; `execution` 4, not
+        holding; `locks: {}`). This server builds in the command and has no
+        `configureFailPoint`, so neither row can be caught yet; a gap test
+        needs that failpoint (or a build slow enough to observe) first.
       **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08, the ticket pools 2026-11-09, and the per-command admission counts on the line 2026-11-09; what is left is above.
       Backlog-ID: RM-355
       Verify: none -- the yield's second admission is RM-360's; the second exempt ingress admission and an index build's `queues` have no gap test yet
