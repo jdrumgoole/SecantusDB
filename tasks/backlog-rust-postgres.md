@@ -1871,13 +1871,38 @@ a regression test.
       e.a where e.a > 998`) is PostgreSQL's nested loop into `k_pkey`
       parameterized by the outer row, priced (`JoinPick::NestParam`, drawn
       by `explain::price_param_nest_loop`), where the unique-key path
-      search (`unique_key_other_paths`) picks it with no Memoize. Still
-      zeros there: that inner read index-only (`select e.b from e join k
-      ...`), and a range on the hashed side's key that reads it through
-      its index (`where k.a < 10`, PostgreSQL's `Hash Join (cost=8.54..26.18
-      rows=9 width=14)` over an `Index Scan using k_pkey`). Measured on a
-      private 15.19 cluster (found while working RP-393 and RP-397).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends], tests/backlog/test_rp_explain_costs.py::test_plan[a parameterized nested loop's inner read index-only], tests/backlog/test_rp_explain_costs.py::test_plan[a range on the hashed side's key reads it through its index]
+      search (`unique_key_other_paths`) picks it with no Memoize, and
+      since 2026-11-17 that inner read index-only where it reads only its
+      key (`select e.b from e join k ...`, `HashSide::key_only_read`, the
+      visibility map's fraction applied), and since 2026-11-17 a range on
+      the hashed side's key read through its index (`where k.a < 10`,
+      `Hash Join` over an `Index Scan using k_pkey`; that scan is the
+      side's ordered path in `unique_key_other_paths`), and since 2026-11-17
+      bounds on both sides' keys (`where e.a > 998 and k.a < 2000`, the
+      bound joining the inner's `Index Cond: ((a = e.a) AND (a < 2000))`).
+      Sized 2026-11-18: every three-table plan with an outer join over a
+      nested join prints zeros here, whatever its shape, including the
+      one whose order and methods already match
+      (`s left join (e join s s2 on e.a = s2.a) on ...` is PostgreSQL's
+      `Hash Left Join (cost=20.16..21.58 rows=30 width=47)` over a hashed
+      `Hash Join (cost=1.39..20.15 rows=1 width=27)`):
+      `hash_join_estimate` / `joined_sides` price only a two-leaf
+      `JoinNode::Join`. The work is a join search over the outer join's
+      sides with the nested join as one priced relation
+      (`make_rel_from_joinlist` keeps the outer join's order constraints),
+      then each method as `joincost.rs` prices it for two leaves. The
+      `on true` plan's arithmetic checks out from 15.19's own formulas:
+      `Materialize` over the 34.10 nest loop is 0.28..34.11
+      (`cost_material`, 2 x cpu_operator_cost per row), and the
+      `Nested Loop Left Join` 0.28..36.16 (outer 1.30, inner 33.83 run,
+      29 rescans of 0.005, 60 x cpu_tuple_cost). The `k.b = 'v3'` plan is
+      `Hash Right Join (cost=1.68..1669.42 rows=1000 width=34)` over
+      `Nested Loop (cost=0.00..1532.75 rows=33333)` and a `Materialize
+      (cost=0.00..18.00 rows=100)` of `k`. Under ANALYZE the executor runs
+      a different tree from the one printed, so the actuals need the
+      executed shape to follow the chosen one.
+      Measured on a private 15.19 cluster (found while working RP-393 and RP-397).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends]
       Backlog-ID: RP-978
 - [ ] **EXPLAIN prints no estimate for a join over a scan filtered by an
       expression.** Since RP-404 a comparison of integer or text arithmetic
@@ -1892,12 +1917,19 @@ a regression test.
       regex match filters (the join's WHERE patterns collected by
       `explain_join_patterns`). Still zeros: a call of a function whose
       overloads differ in `procost`; a regex whose prefix walk is not
-      modelled (a group repeated other than at most once, an anchor inside
-      a group, embedded options). A back reference is walked as a copy of
+      modelled (an anchor a character may precede, or in a branch or an
+      optional group of one branch; embedded options). Since 2026-11-18 a `^` no
+      character precedes, inside a group or not, anchors the match as
+      `regc_nfa.c`'s optimisation pulls it into the `pre` state
+      (`strip_bos`: `^(?:^w0)1` and `(?:^w0)1` are both prefix `w01`). A back reference is walked as a copy of
       the group it names since 2026-11-17, as the regex compiler copies it,
       and since 2026-11-17 a group repeated `+` (a capturing one is
       `parseqatom`'s `x*x`, its prefix the group's first character; a
-      non-capturing one a whole copy). Since 2026-11-17 an
+      non-capturing one a whole copy), and since 2026-11-18 a group
+      repeated `{m,}` with m of 2 or more (one whole copy: `repeat`
+      builds `x{m-1,}x` down to `x+`), and since 2026-11-18 a group
+      repeated within a bounded range, which fixes no character of
+      itself (`^x(ab){1,2}` `x`, `^(ab){1,3}` none). Since 2026-11-17 an
       inner ON join whose WHERE pushes expression comparisons to its sides
       prices each side as that scan's residual
       (`ExplainOptions::join_expr_quals`, `hash_side_with`), and since
@@ -1906,9 +1938,14 @@ a regression test.
       reads; since 2026-11-17 a LEFT join whose WHERE compares only
       preserved-side expressions (`preserved_exprs`), and an inner ON
       join whose WHERE holds inequalities over both tables, its Join
-      Filter (`where_join_filters`). A regex with a group repeated twice
-      or more (`select * from w where c ~ '^(w0){2,}1'`) is `Seq Scan on w
-      (cost=0.00..18.50 rows=1 width=10)` there and zeros here. Measured
+      Filter (`where_join_filters`). Since 2026-11-18 a `^` in a branch
+      of alternatives nothing precedes leaves no prefix, as its second BOS
+      arc out of `pre` does in `findprefix` (`^(?:w|^x)0` is `rows=1000`,
+      `^(?:^ab|^ab)` and `^(?:w|^x)?0` no prefix). Since 2026-11-18 a `^` every path meets after a character
+      makes the regex `REG_UIMPOSSIBLE`, no prefix (`^w(?:^0)1` is
+      `rows=1`). One a character precedes in one branch is still zeros:
+      `regc_nfa.c` prunes that branch as dead (`^x(?:^w|y)0` is prefix
+      `xy0`; `^w(?:^x|0)0` is `rows=91`). Measured
       on the 15.19 reference on port 5415 (found while working RP-404 and
       RP-354). The repeated group's prefix is not a walk of the regex's
       text: `pg_regprefix` reads the NFA after `regc_nfa.c`'s `optimize`
@@ -1920,7 +1957,7 @@ a regression test.
       `repeat`'s arcs gives (`aba`). The faithful fix ports `regcomp.c` /
       `regc_nfa.c`'s NFA build and optimisation and runs `findprefix` on
       it (2026-11-17, sized while working RP-841).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with a group repeated twice or more]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with a dead anchor in a branch]
       Backlog-ID: RP-423
 - [ ] **A semi join cheaper unique-ified keeps the semi join's shape.**
       Since RP-411's first slice (2026-11-16) a WHERE that is one
@@ -2249,54 +2286,23 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
 Measured on PostgreSQL 15.19 (port 5415) with statements that create
 nothing. The gap tests are in `tests/backlog/test_rp_found_rp750.py`.
 
-- [ ] **A `json` / `jsonb` input error on a constant has no position.**
-      `select 't'::jsonb` is 22P02 at 8 on PostgreSQL 15.19 (the literal),
-      `select 1, '[1,'::json` at 11, and `select json_typeof('x')` at 20;
-      here none is placed. `errpos.rs` finds a 22P02's literal by the
-      value the message quotes, and `invalid input syntax for type json`
-      quotes none: the input is only in the CONTEXT excerpt.
-      Verify: tests/backlog/test_rp_found_rp750.py::test_json_input_error_has_a_position
-      Backlog-ID: RP-952
-- [ ] **A type's input function called by name is refused.**
-      `select jsonb_in('{"b":1, "a":2}')` is `{"a": 2, "b": 1}` on
-      PostgreSQL 15.19 (the `unknown` literal coerces to `cstring`), as are
-      `json_in(...)` and `int4in('12')`; here each is 0A000 `function
-      jsonb_in(unknown) is not supported yet`. With a `text` argument both
-      servers answer 42883.
-      Verify: tests/backlog/test_rp_found_rp750.py::test_type_input_function_is_callable_by_name
+- [ ] **A three-argument input function with a typmod is refused.**
+      `select numeric_in('1.5', 0, 5)` is 22003 `numeric field overflow`
+      on PostgreSQL 15.19 (typmod 5 is `numeric(0,1)`, VARHDRSZ + 1); here
+      it is 0A000 `function numeric_in(unknown, integer, integer) is not
+      supported yet`. RP-953 rewrote the input
+      functions to casts (`builtin_alias::input_call`), the three-argument
+      ones only for typmod -1: a typmod needs the cast to the type with that
+      modifier.
+      Verify: tests/backlog/test_rp_found_rp750.py::test_input_function_with_a_typmod
       Backlog-ID: RP-953
-
-## Found while working RP-686 (2026-11-14)
-
-Measured on a private PostgreSQL 15.19 cluster with the `_SCOPE_SETUP` in
-`tests/backlog/test_rp_found_rp664.py`.
-
-- [ ] **A correlated subquery in RETURNING reads the table after the
-      write.** `delete from t668 returning (select count(*) from t668 z
-      where z.a = t668.a)` is 1 per row on PostgreSQL 15.19, `update t668
-      set b = 100 returning (select z.b from t668 z where z.a = t668.a)`
-      returns each row's OLD `b`, and `insert into t668 values (9, 9)
-      returning (select count(*) from t668 z where z.a <= t668.a)` is 3:
-      RETURNING's subqueries run under the statement's snapshot, which
-      does not see the statement's own writes. Here they are 0, the new
-      `b` (100) and 4: a subquery correlated to the target row runs once
-      per returned row after the rows are written. (A subquery that reads
-      only an UPDATE's FROM or a DELETE's USING items is evaluated before
-      the write since RP-686, and reads the snapshot.)
-      Verify: tests/backlog/test_rp_found_rp664.py::test_a_returning_subquery_reads_the_statement_snapshot
-      Backlog-ID: RP-943
-- [ ] **An aggregate over outer references alone in a RETURNING subquery is
-      not refused.** `update t668 set a = 1 returning (select
-      array_agg(t668.b) from u668)` is 42803 `aggregate functions are not
-      allowed in RETURNING` on PostgreSQL 15.19 (an aggregate whose
-      arguments are all outer references belongs to the outer query level,
-      `check_agg_arguments`), as is the same over an UPDATE's FROM item
-      (`... from u668 where u668.k = t668.a returning (select max(u668.v)
-      from u668 z)`), a DELETE's and an INSERT's. Here the first returns
-      one array per row, the FROM-item one 21000, the DELETE and INSERT
-      ones a value per row.
-      Verify: tests/backlog/test_rp_found_rp664.py::test_an_outer_aggregate_in_a_returning_subquery_is_refused
-      Backlog-ID: RP-944
+- [ ] **A cast from `cstring` to a type with no such cast is accepted.**
+      `select 'x'::cstring::int4` is 42846 `cannot cast type cstring to
+      integer` at 20 on PostgreSQL 15.19 (`cstring` casts only to the
+      string types, by I/O); here it reads the value as `int4` (22P02 for
+      this one, 12 for `'12'`).
+      Verify: tests/backlog/test_rp_found_rp750.py::test_cstring_casts_only_to_strings
+      Backlog-ID: RP-1041
 
 ## Found while working RP-570 (2026-11-08)
 
@@ -2317,15 +2323,6 @@ as int`. The gap tests are in `tests/backlog/test_rp_found_rp607.py`.
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
 `tests/backlog/test_rp_found_rp612.py`.
 
-- [ ] **`oidvector`'s hash functions and `oidvectortypes` are refused.**
-      `hashoidvector('1 2')` is 456323500 on PostgreSQL 15.19,
-      `hashoidvectorextended('1 2', 0)` 4561117610811519404 and
-      `oidvectortypes('23 25')` `integer, text`; here each is 0A000
-      `function ... is not supported yet`. The hashes are `hash_array` over
-      the oids (`hashfn` has the scalar types' hashes), and
-      `oidvectortypes` is `format_type` of each oid joined by `, `.
-      Verify: tests/backlog/test_rp_found_rp612.py::test_oidvector_hash_and_types
-      Backlog-ID: RP-957
 
 ## Found while working RP-552 (2026-11-14)
 
@@ -2361,15 +2358,6 @@ The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
       `ctp` (23514 for this one, a comparison for a valid one).
       Verify: tests/backlog/test_rp_found_rp552.py::test_composite_column_equals_untyped_literal
       Backlog-ID: RP-947
-- [ ] **Under `PREPARE`, an error's recorded location is counted in the
-      inner statement.** `prepare p5 as select 1::inet` is 42846 at 23 on
-      PostgreSQL 15.19 (at the `::`); here it is 9, the `::`'s offset in
-      `select 1::inet`, which lands on `p5`. `prepare p as select
-      '(0,x)'::ctp` is 23514 at 21 there, none here. The token search
-      (`errpos.rs`) finds a literal in the whole text, so errors that rely
-      on it are right; every `set_error_location` site is shifted.
-      Verify: tests/backlog/test_rp_found_rp552.py::test_prepare_error_location
-      Backlog-ID: RP-948
 
 ## Found while working RP-534 (2026-11-08)
 
@@ -2763,16 +2751,13 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap test is in
 `tests/backlog/test_rp_found_rp423.py`.
 
-- [ ] **A back reference is an invalid regex outside a WHERE.** `select
-      'abab' ~ '(ab)\1'` is `t` on PostgreSQL 15.19, `regexp_replace('abab',
-      '(ab)\1', 'X')` is `X` and `regexp_match('xabab', '(ab)\1')` is
-      `{ab}`. Here each is 2201B `invalid regular expression`: the scalar
-      evaluator and the regex builtins compile with the linear `regex`
-      crate, which refuses a back reference (the "backreferences are not
-      supported" parse error). A WHERE over a table column matches, through
-      `secantus-core`'s backtracking fallback, and since RP-423 the
-      planner's selectivity estimate falls back the same way.
-      Verify: tests/backlog/test_rp_found_rp423.py::test_a_back_reference_outside_a_where
+- [ ] **A back reference under `~*` compares case-sensitively.** `select
+      'ABab' ~* '(ab)\1'` is `t` on PostgreSQL 15.19 (the ARE engine
+      compares a back reference under the pattern's case folding); here it
+      is `f`. Since RP-1022 a pattern the linear `regex` crate refuses runs
+      on `fancy-regex` (`pg_regex::PgRegex`), and fancy-regex 0.14 matches a
+      back reference byte for byte even under `(?i)`.
+      Verify: tests/backlog/test_rp_found_rp423.py::test_a_case_insensitive_back_reference
       Backlog-ID: RP-1022
 - [ ] **`clamp_row_est` rounds a half away from zero.** PostgreSQL 15.19's
       `clamp_row_est` is `rint`, ties to even: `select max(x) from hv group
@@ -2911,8 +2896,11 @@ statement is VALUES-only and runs there as written. The gap test is in
       scan's relation name is the temp schema's storage key, which the
       join-leaf alias logic then sees as differing from the alias. Only
       VERBOSE prints a schema (`pg_temp_3.t`). Measured on the 15.19
-      reference on port 5415.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan of a temporary table names it bare], tests/backlog/test_rp_explain_costs.py::test_plan[a scan of an aliased temporary table names it and its alias]
+      reference on port 5415. The same for any schema but `public` on the
+      search path: with `set search_path = q1`, `Seq Scan on q1.t t` where
+      PostgreSQL prints `Seq Scan on t`, in a join's scans too (found while
+      working RP-978, 2026-11-18).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan of a temporary table names it bare], tests/backlog/test_rp_explain_costs.py::test_plan[a scan of an aliased temporary table names it and its alias], tests/backlog/test_rp_explain_costs.py::test_plan[a scan of a table in a schema on the search path names it bare]
       Backlog-ID: RP-1029
 
 ## Found while working RP-971 (2026-11-17)

@@ -1,9 +1,10 @@
-"""Gap tests of divergences found while working RP-750 (a JSON input error
-carried no `JSON data, line N:` CONTEXT):
+"""Regression tests of divergences found while working RP-750 (a JSON input
+error carried no `JSON data, line N:` CONTEXT):
 
-- a `json` / `jsonb` input error on a constant has no statement position;
+- a `json` / `jsonb` input error on a constant had no statement position
+  (RP-952);
 - a type's input function called by name (`jsonb_in`, `json_in`, `int4in`)
-  is refused 0A000.
+  was refused 0A000 (RP-953).
 
 The expected answers were measured on PostgreSQL 15.19. None of the
 statements creates an object.
@@ -24,7 +25,7 @@ def dsn(rust_pg: object) -> Iterator[str]:
     yield _dsn(rust_pg) + " dbname=postgres"
 
 
-@pytest.mark.backlog("RP-952")
+@pytest.mark.backlog_fixed("RP-952")
 @pytest.mark.parametrize(
     ("query", "position"),
     [
@@ -39,7 +40,7 @@ def test_json_input_error_has_a_position(query: str, position: int, dsn: str) ->
     assert (info.value.sqlstate, info.value.diag.statement_position) == ("22P02", str(position))
 
 
-@pytest.mark.backlog("RP-953")
+@pytest.mark.backlog_fixed("RP-953")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -55,3 +56,54 @@ def test_type_input_function_is_callable_by_name(query: str, expected: str, dsn:
         except psycopg.Error as e:
             answer = (e.sqlstate, e.diag.message_primary)
     assert answer == (expected,)
+
+
+@pytest.mark.backlog_fixed("RP-953")
+@pytest.mark.parametrize(
+    ("query", "sqlstate", "position"),
+    [
+        # Read when the call runs: no position.
+        ("select int4in('x')", "22P02", None),
+        ("select jsonb_in('x')", "22P02", None),
+        ("select int2in('70000')", "22003", None),
+        # The argument must be `cstring`; `text` has no such function.
+        ("select int4in('12'::text)", "42883", "8"),
+        # `numeric_in` takes three arguments.
+        ("select numeric_in('1.5')", "42883", "8"),
+    ],
+)
+def test_type_input_function_refusals(
+    query: str, sqlstate: str, position: str | None, dsn: str
+) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c, pytest.raises(psycopg.Error) as info:
+        c.execute(query)
+    assert (info.value.sqlstate, info.value.diag.statement_position) == (sqlstate, position)
+
+
+@pytest.mark.backlog_fixed("RP-953")
+def test_three_argument_input_function_without_typmod(dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        assert c.execute("select numeric_in('1.5', 0, -1)::text").fetchone() == ("1.5",)
+
+
+@pytest.mark.backlog("RP-953")
+def test_input_function_with_a_typmod(dsn: str) -> None:
+    """`numeric_in(c, typioparam, typmod)` applies the typmod; here it is
+    refused 0A000."""
+    with psycopg.connect(dsn, autocommit=True) as c, pytest.raises(psycopg.Error) as info:
+        c.execute("select numeric_in('1.5', 0, 5)")
+    assert (info.value.sqlstate, info.value.diag.message_primary) == (
+        "22003",
+        "numeric field overflow",
+    )
+
+
+@pytest.mark.backlog("RP-1041")
+def test_cstring_casts_only_to_strings(dsn: str) -> None:
+    """`cstring` has no cast to `integer`; here it reads the value."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        try:
+            answer: object = c.execute("select '12'::cstring::int4").fetchone()
+        except psycopg.Error as e:
+            answer = (e.sqlstate, e.diag.statement_position)
+    assert answer == ("42846", "20")

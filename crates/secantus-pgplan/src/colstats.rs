@@ -931,6 +931,126 @@ enum ReAtom {
     Set,
     /// A parenthesized group's alternatives, and whether it captures.
     Group(Vec<Vec<QuantifiedAtom>>, bool),
+    /// A `^`: a BOS constraint arc, which [`strip_bos`] removes where no
+    /// character precedes it.
+    Bos,
+}
+
+/// Removes the `^`s of `atoms` that no character can precede, as
+/// `regc_nfa.c`'s optimisation pulls them back into the `pre` state's BOS
+/// arcs (`^(?:^w0)1` and `(?:^w0)1` are both prefix `w01` on 15.19);
+/// `at_start` is whether nothing has been consumed yet, and the result
+/// whether a `^` was removed. A group holding one is read once: a later
+/// copy follows a character, so its paths cannot match (`^(?:^w0)+1` is
+/// `w01`). `None` for a `^` a character may precede (an unsatisfiable or
+/// branch-local anchor, not modelled), or one inside an optional, repeated
+/// or alternating group. `no_prefix` is set where alternatives nothing
+/// precedes hold a `^`.
+fn strip_bos(
+    atoms: &mut Vec<QuantifiedAtom>,
+    at_start: &mut bool,
+    no_prefix: &mut bool,
+) -> Option<bool> {
+    let mut saw = false;
+    let mut out = Vec::with_capacity(atoms.len());
+    for (atom, min, mut max) in std::mem::take(atoms) {
+        let atom = match atom {
+            ReAtom::Bos => {
+                if !*at_start {
+                    return None;
+                }
+                saw = true;
+                continue;
+            }
+            ReAtom::Group(mut alts, capturing) if max != Some(0) => {
+                let mut inner_start = *at_start;
+                let found = match alts.as_mut_slice() {
+                    [only] if min >= 1 => strip_bos(only, &mut inner_start, no_prefix)?,
+                    // Alternatives nothing precedes, one with a `^`: its
+                    // BOS arc is a second one out of `pre`, and
+                    // `findprefix` finds no prefix (`^(?:^ab|^ab)`,
+                    // `^(?:w|^x)?0` on 15.19).
+                    [_, _, ..] if *at_start => {
+                        let mut any = false;
+                        for alt in alts.iter_mut() {
+                            any |= strip_bos(alt, &mut true, no_prefix)?;
+                        }
+                        if any {
+                            *no_prefix = true;
+                        }
+                        inner_start = false;
+                        false
+                    }
+                    _ => {
+                        let mut probe = alts.clone();
+                        for alt in &mut probe {
+                            strip_bos(alt, &mut false, no_prefix)?;
+                        }
+                        inner_start = false;
+                        false
+                    }
+                };
+                if found {
+                    if min != 1 {
+                        return None;
+                    }
+                    max = Some(1);
+                    saw = true;
+                }
+                *at_start = inner_start;
+                ReAtom::Group(alts, capturing)
+            }
+            other => {
+                if max != Some(0) {
+                    *at_start = false;
+                }
+                other
+            }
+        };
+        out.push((atom, min, max));
+    }
+    *atoms = out;
+    Some(saw)
+}
+
+/// Whether every path through `atoms` meets a `^` after consuming a
+/// character, so the regex cannot match (`^w(?:^0)1` is `rows=1` on
+/// 15.19). `at_start` is `Some(true)` where nothing has been consumed,
+/// `Some(false)` where something has on every path, `None` where it
+/// depends on the path; only a certain `Some(false)` makes a `^` dead.
+fn bos_after_char(atoms: &[QuantifiedAtom], at_start: &mut Option<bool>) -> bool {
+    for (atom, min, max) in atoms {
+        if *max == Some(0) {
+            continue;
+        }
+        match atom {
+            ReAtom::Bos => {
+                if *at_start == Some(false) {
+                    return true;
+                }
+            }
+            ReAtom::Char(_) | ReAtom::Set => {
+                if *min >= 1 {
+                    *at_start = Some(false);
+                } else if *at_start == Some(true) {
+                    *at_start = None;
+                }
+            }
+            ReAtom::Group(alts, _) => match alts.as_slice() {
+                [only] if *min >= 1 => {
+                    if bos_after_char(only, at_start) {
+                        return true;
+                    }
+                }
+                _ => {
+                    if *at_start == Some(true) {
+                        *at_start = None;
+                    }
+                }
+            },
+        }
+    }
+    false
 }
 
 /// A [`ReAtom`] and its quantifier's bounds.
@@ -946,14 +1066,13 @@ type QuantifiedAtom = (ReAtom, u32, Option<u32>);
 /// An atom bounded `{0}` is no atom. The prefix is exact when a `$` ends
 /// the regex right after it, and status `None` (`REG_NOMATCH`) when the
 /// regex is not anchored, alternates at its top, or fixes no first
-/// character. `None` for a regex whose NFA this does not model: a group
-/// repeated other than at most once, a constraint or anchor anywhere but
+/// character. `None` for a regex whose NFA this does not model: a constraint or anchor anywhere but
 /// a leading `^` and a trailing `$`, a back reference to a group not
 /// yet closed or quantified, a numeric character escape, embedded
 /// options or a director.
 fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String, PrefixStatus)> {
     let chars: Vec<char> = patt.chars().collect();
-    if patt.starts_with("***") || patt.starts_with("(?") {
+    if patt.starts_with("***") || patt.starts_with("(?") && !patt.starts_with("(?:") {
         return None;
     }
     // An alternation at the top: the `pre` state's rainbow, or BOS arcs
@@ -961,33 +1080,40 @@ fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String,
     if regex_has_bare(&chars, '|', true) {
         return Some((String::new(), PrefixStatus::None));
     }
-    if chars.first() != Some(&'^') {
-        // The `pre` state's rainbow: not anchored. A `^` further in
-        // anchors some branch, which is not modelled.
-        return if regex_has_bare(&chars, '^', false) {
-            None
-        } else {
-            Some((String::new(), PrefixStatus::None))
-        };
-    }
     let exact_end = chars.len() >= 2 && chars[chars.len() - 1] == '$' && {
-        let backslashes = chars[1..chars.len() - 1]
+        let backslashes = chars[..chars.len() - 1]
             .iter()
             .rev()
             .take_while(|c| **c == '\\')
             .count();
         backslashes % 2 == 0
     };
-    let body = &chars[1..chars.len() - usize::from(exact_end)];
+    // The `pre` state's rainbow: no `^` can anchor the match, whatever
+    // else of the regex is not modelled.
+    if !regex_has_bare(&chars, '^', false) {
+        return Some((String::new(), PrefixStatus::None));
+    }
+    let body = &chars[..chars.len() - usize::from(exact_end)];
     let mut pos = 0;
-    let alternatives = regex_atoms(body, &mut pos, &mut Vec::new())?;
+    let mut alternatives = regex_atoms(body, &mut pos, &mut Vec::new())?;
     if pos != body.len() {
         return None;
     }
     // The `pre` state's BOS arcs lead to more than one state.
-    let [atoms] = alternatives.as_slice() else {
+    let [atoms] = alternatives.as_mut_slice() else {
         return Some((String::new(), PrefixStatus::None));
     };
+    // A `^` every path reaches after a character: no path to the final
+    // state, `REG_UIMPOSSIBLE`, which `pg_regprefix` answers `REG_NOMATCH`.
+    if bos_after_char(atoms, &mut Some(true)) {
+        return Some((String::new(), PrefixStatus::None));
+    }
+    // The `pre` state's rainbow where no `^` anchors the match.
+    let mut no_prefix = false;
+    if !strip_bos(atoms, &mut true, &mut no_prefix)? || no_prefix {
+        return Some((String::new(), PrefixStatus::None));
+    }
+    let atoms = &*atoms;
     let case_varies = |c: char| {
         if c_ctype {
             c.is_ascii_alphabetic()
@@ -1036,6 +1162,7 @@ fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String,
                     }
                 }
                 ReAtom::Set => return Some(false),
+                ReAtom::Bos => continue,
                 ReAtom::Group(..) if *min == 0 => return Some(false),
                 ReAtom::Group(alts, _) if *max == Some(*min) => match alts.as_slice() {
                     [inner] => {
@@ -1083,7 +1210,19 @@ fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String,
                     }
                     return Some(false);
                 }
-                ReAtom::Group(..) => return None,
+                // `x{m,}` with m >= 2, capturing or not: `repeat` builds
+                // it as `x{m-1,}x`, down to `x+` and the copies after it,
+                // and `x+` is one copy whose end loops back -- one whole
+                // copy, then the loop's choice (RP-423).
+                ReAtom::Group(alts, capturing) if *min >= 2 && max.is_none() => {
+                    let once = [(ReAtom::Group(alts.clone(), *capturing), 1, Some(1))];
+                    walk(&once, prefix, insensitive, case_varies)?;
+                    return Some(false);
+                }
+                // `x{m,n}` with m < n: 15.19 fixes no character of it,
+                // capturing or not, whatever m is (`^x(ab){2,3}c` is `x`,
+                // `^(ab){1,3}` none) -- a choice at once (RP-423).
+                ReAtom::Group(..) => return Some(false),
             }
         }
         Some(true)
@@ -1159,11 +1298,15 @@ fn regex_atoms(
                 *pos += 1;
                 continue;
             }
-            '^' | '$' => return None,
+            '^' => {
+                *pos += 1;
+                ReAtom::Bos
+            }
+            '$' => return None,
             '*' | '+' | '?' | '{' => {
                 let (min, max) = regex_quantifier(chars, pos)?;
                 let last = atoms.last_mut()?;
-                if (last.1, last.2) != (1, Some(1)) {
+                if (last.1, last.2) != (1, Some(1)) || matches!(last.0, ReAtom::Bos) {
                     return None;
                 }
                 (last.1, last.2) = (min, max);
@@ -1777,6 +1920,11 @@ mod tests {
             ("^12$", true, Some(("12", Exact))),
             (r"^1\$", false, Some(("1$", Partial))),
             ("^$", false, Some(("", Exact))),
+            ("^(?:ab|ac)", false, Some(("a", Partial))),
+            ("^(?:w|^x)0", false, Some(("", NoMatch))),
+            ("(?:^w|^x)0", false, Some(("", NoMatch))),
+            ("^(?:^ab|^ab)", false, Some(("", NoMatch))),
+            ("^(?:w|^x)?0", false, Some(("", NoMatch))),
             ("^", false, Some(("", NoMatch))),
             ("abc", false, Some(("", NoMatch))),
             ("^ab|^ac", false, Some(("", NoMatch))),
@@ -1794,15 +1942,48 @@ mod tests {
             ("^((ab))+c", false, Some(("a", Partial))),
             ("^(a(b))+c", false, Some(("a", Partial))),
             ("^(ab)+?c", false, Some(("a", Partial))),
+            // A group repeated `{m,}`, m >= 2: one whole copy, then the
+            // loop's choice (RP-423).
+            ("^(ab){2,}c", false, Some(("ab", Partial))),
+            ("^(ab){3,}c", false, Some(("ab", Partial))),
+            ("^(w0){2,}1", false, Some(("w0", Partial))),
+            ("^(?:ab){2,}c", false, Some(("ab", Partial))),
+            ("^(a|b){2,}c", false, Some(("", NoMatch))),
+            ("^(a(b)*){2,}", false, Some(("a", Partial))),
+            ("^x(abc){2,}", false, Some(("xabc", Partial))),
+            ("^(ab){2,}$", false, Some(("ab", Partial))),
+            ("^(ab*c){2,}", false, Some(("a", Partial))),
             // A non-capturing one is not rewritten: one copy, then the
             // loop's choice.
             ("^(?:ab)+c", false, Some(("ab", Partial))),
             ("^x(?:ab)+y", false, Some(("xab", Partial))),
-            // Not modelled: a group repeated twice or more (`^(ab){2,}c`
-            // is `ab` on PostgreSQL 15.19), an anchor
-            // inside, a back reference to an unclosed group.
-            ("^(ab){2,}c", false, None),
-            ("(^a)", false, None),
+            // A group repeated within a bounded range fixes nothing of
+            // itself (PostgreSQL 15.19, a "C" column's Index Cond).
+            ("^(ab){1,3}", false, Some(("", NoMatch))),
+            ("^(w0){1,2}1", false, Some(("", NoMatch))),
+            ("^(?:ab){1,2}c", false, Some(("", NoMatch))),
+            ("^(ab){0,2}c", false, Some(("", NoMatch))),
+            ("^x(ab){1,2}", false, Some(("x", Partial))),
+            ("^xy(?:ab){2,4}c", false, Some(("xy", Partial))),
+            ("^x(a){2,5}", false, Some(("x", Partial))),
+            ("^(ab|ac){1,2}", false, Some(("", NoMatch))),
+            // A `^` no character precedes is the match's anchor
+            // (PostgreSQL 15.19, a "C" column's Index Cond: `w01` for
+            // each of the first four).
+            ("^(?:^w0)1", false, Some(("w01", Partial))),
+            ("^(^w0)1", false, Some(("w01", Partial))),
+            ("(?:^w0)1", false, Some(("w01", Partial))),
+            ("^(?:^w0)+1", false, Some(("w01", Partial))),
+            ("(^a)", false, Some(("a", Partial))),
+            // A `^` every path meets after a character: the regex cannot
+            // match (`REG_UIMPOSSIBLE`), and `pg_regprefix` finds none.
+            ("^w(?:^0)1", false, Some(("", PrefixStatus::None))),
+            ("^(?:^w)(?:^0)1", false, Some(("", PrefixStatus::None))),
+            // Not modelled: a `^` after a character in an optional group
+            // or a branch; a back reference to an unclosed group. (A `^`
+            // in a branch nothing precedes is modelled, above.)
+            ("^w(?:^x|0)0", false, None),
+            ("^(?:^w0)?1", false, None),
             ("^a\\1", false, None),
             // A back reference is a copy of the group it names, as
             // PostgreSQL 15.19's index conditions show.

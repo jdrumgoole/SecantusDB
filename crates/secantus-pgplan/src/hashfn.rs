@@ -580,6 +580,30 @@ fn jsonb_hash(text: &str, h: H) -> Result<u64> {
     Ok(hash)
 }
 
+/// An `oidvector`'s oids, from its text (`1 2`).
+pub(crate) fn oidvector_oids(v: &Bson) -> Result<Vec<u32>> {
+    if let Bson::Array(items) = arrays::strip(v) {
+        return items
+            .iter()
+            .map(|i| match i {
+                Bson::Int32(o) => Ok(*o as u32),
+                Bson::Int64(o) => Ok(*o as u32),
+                other => oidvector_oids(other)?
+                    .first()
+                    .copied()
+                    .ok_or_else(|| Error::Internal("an empty oidvector element".into())),
+            })
+            .collect();
+    }
+    value_text(v)
+        .split_ascii_whitespace()
+        .map(|t| {
+            t.parse::<u32>()
+                .map_err(|_| Error::Internal(format!("an oidvector element {t:?}")))
+        })
+        .collect()
+}
+
 /// The hash functions this module answers, as `(name, result type)`.
 pub(crate) fn result_type(name: &str, nargs: usize) -> Option<&'static str> {
     let extended = name.ends_with("extended");
@@ -588,7 +612,7 @@ pub(crate) fn result_type(name: &str, nargs: usize) -> Option<&'static str> {
         | "hashchar" | "hashfloat4" | "hashfloat8" | "hashinet" | "hashint2" | "hashint4"
         | "hashint8" | "hashmacaddr" | "hashmacaddr8" | "hashname" | "hashoid" | "hashtext"
         | "hashtid" | "interval_hash" | "pg_lsn_hash" | "time_hash" | "timestamp_hash"
-        | "timetz_hash" | "uuid_hash" | "jsonb_hash" => true,
+        | "timetz_hash" | "uuid_hash" | "jsonb_hash" | "hashoidvector" => true,
         n if extended => result_type(
             n.trim_end_matches("_extended").trim_end_matches("extended"),
             1,
@@ -684,6 +708,11 @@ pub(crate) fn call(name: &str, args: &[Bson], ty: &str) -> Option<Result<Bson>> 
             Ok(result)
         })(),
         "jsonb_hash" => jsonb_hash(&value_text(&args[0]), h),
+        // `hash_any` over the vector's oids as they sit in memory.
+        "hashoidvector" => oidvector_oids(&args[0]).map(|oids| {
+            let bytes: Vec<u8> = oids.iter().flat_map(|o| o.to_ne_bytes()).collect();
+            h.bytes(&bytes)
+        }),
         other => {
             let d = declared(other).unwrap_or("text");
             hash_value(&args[0], d, h)

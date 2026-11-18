@@ -15444,8 +15444,16 @@ impl PgHandler {
                 )
                 .and_then(|p| self.subquery_rows(&p))
             });
+            // A field's domain check is the literal's input when a
+            // composite's or an array's input runs it (`record_in` /
+            // `array_in` call `domain_in`), which records the literal's
+            // location; a cast straight to a domain checks it only when
+            // the expression runs (RP-948).
+            let at_literal = secantus_pgplan::take_error_location().is_some();
             let mut err = Self::err(&got.err()?);
-            if !sql_fn_validator::is_input_error(&err) {
+            let field_domain = at_literal
+                && matches!(&err, PgWireError::UserError(i) if i.code == "23514" || i.code == "23502");
+            if !sql_fn_validator::is_input_error(&err) && !field_domain {
                 return None;
             }
             if let PgWireError::UserError(info) = &mut err {
@@ -43645,6 +43653,7 @@ impl PgHandler {
 
             Statement::Insert(mut ins) => {
                 self.refuse_matview_write(&ins.table)?;
+                let own_writes = statement_views::hide_own_writes(self, ins.returning.as_ref());
                 if self.is_system_catalog(&ins.table)? {
                     return Err(Self::catalog_write_refused(&ins.table));
                 }
@@ -43838,6 +43847,7 @@ impl PgHandler {
                     // defaults included -- and tags the response `INSERT 0 n`
                     // with the row count pgwire appends.
                     Some(returning) => {
+                        drop(own_writes);
                         let mut response = self.project_rows(
                             ins.rows,
                             &def,
@@ -46422,7 +46432,10 @@ impl PgHandler {
                                 // A nested loop into the inner side's unique
                                 // key index, parameterized by the outer row
                                 // (RP-978).
-                                scan_estimate::JoinPick::NestParam { b_outer } => {
+                                scan_estimate::JoinPick::NestParam {
+                                    b_outer,
+                                    index_only,
+                                } => {
                                     let inner_key =
                                         explain::join_key_texts(sel).and_then(|(l, r)| {
                                             let k = if b_outer { l } else { r };
@@ -46442,7 +46455,7 @@ impl PgHandler {
                                                 index,
                                                 alias,
                                                 column,
-                                                index_only: false,
+                                                index_only,
                                                 read: Vec::new(),
                                                 memoize: None,
                                             },
@@ -49911,6 +49924,7 @@ impl PgHandler {
 
             Statement::Update(mut upd) => {
                 self.refuse_matview_write(&upd.table)?;
+                let own_writes = statement_views::hide_own_writes(self, upd.returning.as_ref());
                 upd.filter =
                     self.resolve_current_of(&upd.table, std::mem::take(&mut upd.filter))?;
                 if let Some(matched) = self.system_catalog_update(&upd)? {
@@ -50238,6 +50252,7 @@ impl PgHandler {
                 if let Some(returning) = upd.returning.as_ref() {
                     let def = def
                         .ok_or_else(|| Self::err(&PlanError::UndefinedTable(upd.table.clone())))?;
+                    drop(own_writes);
                     let mut response = self.project_rows(
                         returned,
                         &def,
@@ -50264,6 +50279,7 @@ impl PgHandler {
 
             Statement::Delete(mut del) => {
                 self.refuse_matview_write(&del.table)?;
+                let own_writes = statement_views::hide_own_writes(self, del.returning.as_ref());
                 del.filter =
                     self.resolve_current_of(&del.table, std::mem::take(&mut del.filter))?;
                 if self.is_system_catalog(&del.table)? {
@@ -50331,6 +50347,7 @@ impl PgHandler {
                     self.after_delete_rows(def, &kept)?;
                     self.fire_statement_triggers(&def.name, "AFTER", "DELETE")?;
                     if let Some(returning) = del.returning.as_ref() {
+                        drop(own_writes);
                         let mut response = self.project_rows(
                             kept,
                             def,
@@ -50382,6 +50399,7 @@ impl PgHandler {
                     let def = self
                         .lookup(&del.table)
                         .ok_or_else(|| Self::err(&PlanError::UndefinedTable(del.table.clone())))?;
+                    drop(own_writes);
                     let mut response = self.project_rows(
                         doomed,
                         &def,

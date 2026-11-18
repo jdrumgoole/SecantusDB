@@ -3534,6 +3534,14 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         "explain select * from t",
         ["Seq Scan on t  (cost=0.00..35.50 rows=2550 width=4)"],
     ),
+    # A table of a schema on the search_path other than `public` is named
+    # bare too (found while working RP-978).
+    "a scan of a table in a schema on the search path names it bare": (
+        "RP-1029",
+        ["create schema q1", "set search_path = q1", "create table t (a int)"],
+        "explain select * from t",
+        ["Seq Scan on t  (cost=0.00..35.50 rows=2550 width=4)"],
+    ),
     "a scan of an aliased temporary table names it and its alias": (
         "RP-1029",
         ["create temp table t (a int)"],
@@ -6301,15 +6309,72 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Filter: (c ~ '^(?:w0)+1'::text)",
         ],
     ),
-    # Still open: a group repeated `{m,}` with m of 2 or more, whose prefix
-    # comes from the optimised NFA (`^(ab){2,}c` is `ab`), prints zeros.
+    # Fixed: a group repeated `{m,}` with m of 2 or more printed zeros; its
+    # prefix is one whole copy of the group (`repeat`'s `x{m-1,}x`).
     "estimate of a regex match with a group repeated twice or more": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_STRINGS,
         "explain select * from w where c ~ '^(w0){2,}1'",
         [
             "Seq Scan on w  (cost=0.00..18.50 rows=1 width=10)",
             "  Filter: (c ~ '^(w0){2,}1'::text)",
+        ],
+    ),
+    # Fixed: a group repeated within a bounded range printed zeros; it
+    # fixes no character of the prefix.
+    "estimate of a regex match with a group repeated within a bounded range": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '^(w0){1,2}1'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=101 width=10)",
+            "  Filter: (c ~ '^(w0){1,2}1'::text)",
+        ],
+    ),
+    # Fixed in RP-423: an anchor inside a group, no character before it,
+    # printed zeros.
+    "estimate of a regex match with an anchor inside a group": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '^(?:^w0)1'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=101 width=10)",
+            "  Filter: (c ~ '^(?:^w0)1'::text)",
+        ],
+    ),
+    # Fixed with RP-423: an anchor in one branch of a group printed zeros.
+    "estimate of a regex match with an anchor in a branch": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '^(?:w|^x)0'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=1000 width=10)",
+            "  Filter: (c ~ '^(?:w|^x)0'::text)",
+        ],
+    ),
+    # Still open: a `^` after a character cannot match, which PostgreSQL's
+    # NFA optimisation sees; here the scan prints zeros.
+    # Still open: a `^` a character precedes in one branch of a group is
+    # pruned as dead by `regc_nfa.c`'s optimisation, leaving the other
+    # branch's prefix (`w00`); here zeros.
+    "estimate of a regex match with a dead anchor in a branch": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '^w(?:^x|0)0'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=91 width=10)",
+            "  Filter: (c ~ '^w(?:^x|0)0'::text)",
+        ],
+    ),
+    # Fixed under RP-423: a `^` every path meets after a character made
+    # the regex `REG_UIMPOSSIBLE`, no prefix; the scan printed zeros.
+    "estimate of a regex match with an anchor after a character": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '^w(?:^0)1'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=1 width=10)",
+            "  Filter: (c ~ '^w(?:^0)1'::text)",
         ],
     ),
     # Still open: a LIKE's ESCAPE is a `like_escape` call PostgreSQL folds
@@ -6651,10 +6716,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (b = 'v9'::text)",
         ],
     ),
-    # Still open (RP-978): the parameterized inner read index-only, and a
-    # hashed side read through its index on a range of the key.
+    # The parameterized inner read index-only (RP-978, fixed).
     "a parameterized nested loop's inner read index-only": (
-        "RP-978",
+        "RP-978:fixed",
         _ANALYSED,
         "explain select e.b from e join k on k.a = e.a where e.a > 998",
         [
@@ -6665,8 +6729,76 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a = e.a)",
         ],
     ),
+    # Bounds on both sides' keys: the inner's bound joins its parameterized
+    # Index Cond (RP-978, fixed).
+    "a bound on the inner key joins the parameterized index cond": (
+        "RP-978:fixed",
+        _ANALYSED,
+        "explain select * from e join k on k.a = e.a where e.a > 998 and k.a < 2000",
+        [
+            "Nested Loop  (cost=0.28..34.11 rows=2 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=2 width=7)",
+            "        Filter: (a > 998)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: ((a = e.a) AND (a < 2000))",
+        ],
+    ),
+    "verbose of a bound on the inner key in the parameterized index cond": (
+        "RP-978:fixed",
+        _ANALYSED,
+        "explain verbose select * from e join k on k.a = e.a where e.a > 998 and k.a < 2000",
+        [
+            "Nested Loop  (cost=0.28..34.11 rows=2 width=14)",
+            "  Output: e.a, e.b, k.a, k.b",
+            "  Inner Unique: true",
+            "  ->  Seq Scan on public.e  (cost=0.00..17.50 rows=2 width=7)",
+            "        Output: e.a, e.b",
+            "        Filter: (e.a > 998)",
+            "  ->  Index Scan using k_pkey on public.k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Output: k.a, k.b",
+            "        Index Cond: ((k.a = e.a) AND (k.a < 2000))",
+        ],
+    ),
+    "a bounded parameterized inner keeps its own filter": (
+        "RP-978:fixed",
+        _ANALYSED,
+        "explain verbose select * from e join k on k.a = e.a"
+        " where e.a > 998 and k.a < 2000 and k.b = 'v9'",
+        [
+            "Nested Loop  (cost=0.28..34.25 rows=1 width=14)",
+            "  Output: e.a, e.b, k.a, k.b",
+            "  Inner Unique: true",
+            "  ->  Seq Scan on public.e  (cost=0.00..17.50 rows=2 width=7)",
+            "        Output: e.a, e.b",
+            "        Filter: (e.a > 998)",
+            "  ->  Index Scan using k_pkey on public.k  (cost=0.28..8.30 rows=1 width=7)",
+            "        Output: k.a, k.b",
+            "        Index Cond: ((k.a = e.a) AND (k.a < 2000))",
+            "        Filter: (k.b = 'v9'::text)",
+        ],
+    ),
+    "verbose of a hashed side read through its key's index": (
+        "RP-978:fixed",
+        _ANALYSED,
+        "explain verbose select * from e join k on k.a = e.a where k.a < 10",
+        [
+            "Hash Join  (cost=8.54..26.18 rows=9 width=14)",
+            "  Output: e.a, e.b, k.a, k.b",
+            "  Inner Unique: true",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Hash  (cost=8.43..8.43 rows=9 width=7)",
+            "        Output: k.a, k.b",
+            "        ->  Index Scan using k_pkey on public.k  (cost=0.28..8.43 rows=9 width=7)",
+            "              Output: k.a, k.b",
+            "              Index Cond: (k.a < 10)",
+        ],
+    ),
+    # The hashed side read through its key's index is a path the unique
+    # key's merge and nested loops weigh too (RP-978, fixed).
     "a range on the hashed side's key reads it through its index": (
-        "RP-978",
+        "RP-978:fixed",
         _ANALYSED,
         "explain select * from e join k on k.a = e.a where k.a < 10",
         [
@@ -7381,4 +7513,23 @@ def test_a_bushy_chain_whose_on_splits_runs_each_clause_where_it_lands(
         (1, 6, 4, 3),
         (1, 6, 5, 3),
         (1, 6, 5, 4),
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-978")
+def test_vacuumed_parameterized_inner_reads_index_only(rust_pg: Any) -> None:
+    """A parameterized nested loop's inner, reading no column but its key,
+    was read index-only, its heap fetches cut by the visibility map
+    VACUUM set -- PostgreSQL 15.19's plan on a fresh cluster."""
+    steps = _ANALYSED + [
+        "vacuum k",
+        "vacuum e",
+        "explain select e.b from e join k on k.a = e.a where e.a > 998",
+    ]
+    assert run_autocommit(fresh_db(_dsn(rust_pg)), steps)[-1] == [
+        "Nested Loop  (cost=0.28..26.09 rows=2 width=3)",
+        "  ->  Seq Scan on e  (cost=0.00..17.50 rows=2 width=7)",
+        "        Filter: (a > 998)",
+        "  ->  Index Only Scan using k_pkey on k  (cost=0.28..4.29 rows=1 width=4)",
+        "        Index Cond: (a = e.a)",
     ]

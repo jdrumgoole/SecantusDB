@@ -6,6 +6,7 @@
 use bson::Bson;
 
 use crate::builtins::{int, text};
+use crate::pg_regex::PgRegex;
 use crate::{Error, Result};
 
 /// The options a regular-expression function takes, as PostgreSQL's
@@ -67,13 +68,28 @@ pub(crate) fn check_regex_numbers(name: &str, args: &[Bson]) -> Result<()> {
     Ok(())
 }
 
-fn build_regex(pattern: &str, flags: &str) -> Result<regex::Regex> {
-    regex::RegexBuilder::new(&crate::scalar::pg_regex_source(pattern))
-        .case_insensitive(flags.contains('i'))
-        .multi_line(flags.contains('n') || flags.contains('m') || flags.contains('w'))
-        .dot_matches_new_line(!(flags.contains('n') || flags.contains('m') || flags.contains('p')))
-        .ignore_whitespace(flags.contains('x'))
-        .build()
+fn build_regex(pattern: &str, flags: &str) -> Result<PgRegex> {
+    let has = |c: char| flags.contains(c);
+    let mut inline = String::new();
+    if has('i') {
+        inline.push('i');
+    }
+    if has('n') || has('m') || has('w') {
+        inline.push('m');
+    }
+    if !(has('n') || has('m') || has('p')) {
+        inline.push('s');
+    }
+    if has('x') {
+        inline.push('x');
+    }
+    let source = crate::scalar::pg_regex_source(pattern);
+    let source = if inline.is_empty() {
+        source
+    } else {
+        format!("(?{inline}){source}")
+    };
+    PgRegex::new(&source)
         .map_err(|_| Error::InvalidRegex(format!("invalid regular expression: \"{pattern}\"")))
 }
 
@@ -155,14 +171,14 @@ pub(crate) fn regexp_replace_from(args: &[Bson]) -> Result<Bson> {
     };
     let mut out = String::from(head);
     let mut last = 0;
-    for (i, caps) in re.captures_iter(tail).enumerate() {
-        let m = caps.get(0).expect("group 0 is the match");
+    for (i, groups) in re.captures_all(tail)?.into_iter().enumerate() {
+        let (start, end) = groups[0].expect("group 0 is the match");
         if which != 0 && i as i64 + 1 != which {
             continue;
         }
-        out.push_str(&tail[last..m.start()]);
-        caps.expand(&replacement, &mut out);
-        last = m.end();
+        out.push_str(&tail[last..start]);
+        crate::pg_regex::expand(tail, &groups, &replacement, &mut out);
+        last = end;
         if which != 0 {
             break;
         }
@@ -184,12 +200,12 @@ pub(crate) fn regexp_match(args: &[Bson]) -> Result<Bson> {
         ));
     }
     let re = build_regex(&pattern, &flags)?;
-    let Some(caps) = re.captures(&source) else {
+    let Some(caps) = re.captures(&source)? else {
         return Ok(Bson::Null);
     };
     let group = |i: usize| {
-        caps.get(i)
-            .map_or(Bson::Null, |m| Bson::String(m.as_str().to_string()))
+        crate::pg_regex::group_text(&source, &caps, i)
+            .map_or(Bson::Null, |m| Bson::String(m.to_string()))
     };
     Ok(Bson::Array(if caps.len() == 1 {
         vec![group(0)]

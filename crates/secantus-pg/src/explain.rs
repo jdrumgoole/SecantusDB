@@ -3578,10 +3578,14 @@ pub(crate) fn attach_verbose_join(
     let (Some(o), Some(i)) = (rel_of(outer), rel_of(inner)) else {
         return;
     };
-    // A scan with a Filter must print each of its relation's WHERE
-    // conjuncts, and one without none of them.
+    // A scan with a Filter or an Index Cond must print each of its
+    // relation's WHERE conjuncts, and one without none of them: a bound
+    // on the hashed side's key is its index scan's `Index Cond` (RP-978).
     let filtered = |n: &PlanNode, r: &secantus_pgplan::ruleutils::VerboseRel| {
-        n.details.iter().any(|(k, _)| k == "Filter") == !r.quals.is_empty()
+        n.details
+            .iter()
+            .any(|(k, _)| k == "Filter" || k == "Index Cond")
+            == !r.quals.is_empty()
     };
     if o == i || !filtered(outer, &v.rels[o]) || !filtered(inner, &v.rels[i]) {
         return;
@@ -3643,12 +3647,41 @@ fn attach_verbose_nested_loop(root: &mut PlanNode, v: &secantus_pgplan::ruleutil
     if !filter_ok(outer, &v.rels[o]) || outer.details.iter().any(|(k, _)| k != "Filter") {
         return;
     }
-    // The inner scan's `Index Cond: (<its column> <op> <outer ref>)`.
+    // The inner scan's `Index Cond: (<its column> <op> <outer ref>)`, and
+    // beside it, ANDed, each WHERE conjunct on the index's key
+    // (`((a = e.a) AND (a < 2000))`, RP-978).
     let inner_rel = &v.rels[i];
+    let index_cond_parts = |text: &str| -> Option<Vec<String>> {
+        let body = text.strip_prefix('(')?.strip_suffix(')')?;
+        if !body.starts_with('(') {
+            return Some(vec![text.to_string()]);
+        }
+        let parts: Vec<String> = body.split(" AND ").map(str::to_string).collect();
+        parts
+            .iter()
+            .all(|p| p.starts_with('(') && p.ends_with(')'))
+            .then_some(parts)
+    };
+    // The WHERE conjuncts the inner scan's `Index Cond` holds.
+    let in_cond: Vec<&(String, String)> = inner_rel
+        .quals
+        .iter()
+        .filter(|(bare, _)| {
+            root.children[1].details.iter().any(|(k, t)| {
+                k == "Index Cond" && index_cond_parts(t).is_some_and(|ps| ps.contains(bare))
+            })
+        })
+        .collect();
+    let inner_filter_ok = |n: &PlanNode, r: &secantus_pgplan::ruleutils::VerboseRel| {
+        n.details.iter().filter(|(k, _)| k == "Filter").count()
+            == usize::from(r.quals.len() > in_cond.len())
+    };
     // The inner scan may also evaluate an ON comparison as its `Filter`.
     let inner = &root.children[1];
     let inner_filters = inner.details.iter().filter(|(k, _)| k == "Filter").count();
-    if !(filter_ok(inner, inner_rel) || inner_filters == 1 && !inner_rel.join_quals.is_empty()) {
+    if !(inner_filter_ok(inner, inner_rel)
+        || inner_filters == 1 && !inner_rel.join_quals.is_empty())
+    {
         return;
     }
     // A Filter evaluating such a conjunct prints bare columns no
@@ -3675,17 +3708,39 @@ fn attach_verbose_nested_loop(root: &mut PlanNode, v: &secantus_pgplan::ruleutil
         if k != "Index Cond" || cond.is_some() {
             return;
         }
-        let Some(body) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
+        let Some(parts) = index_cond_parts(text) else {
             return;
         };
-        let Some((col, rest)) = body.split_once(' ') else {
-            return;
-        };
-        let qualified = format!("{}.{col}", inner_rel.refname);
-        if !inner_rel.columns.contains(&qualified) || !rest.contains('.') {
+        let mut params = 0;
+        let mut printed = Vec::new();
+        for part in &parts {
+            if let Some((_, qualified)) = in_cond.iter().find(|(bare, _)| bare == part) {
+                printed.push(qualified.clone());
+                continue;
+            }
+            let Some(body) = part.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
+                return;
+            };
+            let Some((col, rest)) = body.split_once(' ') else {
+                return;
+            };
+            let qualified = format!("{}.{col}", inner_rel.refname);
+            if !inner_rel.columns.contains(&qualified) || !rest.contains('.') {
+                return;
+            }
+            params += 1;
+            printed.push(format!("({qualified} {rest})"));
+        }
+        if params != 1 {
             return;
         }
-        cond = Some((at, format!("({qualified} {rest})")));
+        cond = Some((
+            at,
+            match printed.as_slice() {
+                [one] => one.clone(),
+                _ => format!("({})", printed.join(" AND ")),
+            },
+        ));
     }
     let Some((at, cond)) = cond else {
         return;
