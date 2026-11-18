@@ -1844,6 +1844,7 @@ jobs:
           # schemas. Binary only.
           files="$files tests/test_rust_pg_catalog_key_log.py"
           files="$files tests/test_rust_pgserver_relation_names.py"
+          files="$files tests/test_rust_pg_type_keyed.py"
           else
           files=""
           # The DIFFERENTIAL suite, whole: 836 cases against the PostgreSQL 14
