@@ -180,6 +180,38 @@ impl Column {
         }
     }
 
+    /// Whether this column is a single-column `bpchar` PRIMARY KEY whose row
+    /// keeps the value as written under the column's own name, while `_id`
+    /// holds it with its trailing blanks trimmed -- the key `bpchareq` /
+    /// `bcTruelen` compare (Joe, 2026-11-18; RP-693). A table created
+    /// before that layout keeps the value in `_id`, trimmed.
+    pub fn is_written_bpchar_key(&self) -> bool {
+        self.pk && self.field_override.as_deref() == Some(self.name.as_str())
+    }
+
+    /// Whether this column is one member of a COMPOSITE primary key, stored
+    /// at `_id.<name>`.
+    pub fn is_composite_key_member(&self) -> bool {
+        self.pk
+            && self
+                .field_override
+                .as_deref()
+                .is_some_and(|f| f.starts_with("_id."))
+    }
+
+    /// Whether a new single-column PRIMARY KEY over this column takes the
+    /// written-`bpchar` layout (`is_written_bpchar_key`): an unsized
+    /// `bpchar`, whose value is not padded back on the way out, under a name
+    /// a filter can address as a path.
+    pub fn takes_written_bpchar_key(&self) -> bool {
+        self.pg_type == "bpchar"
+            && self.typmod <= 4
+            && self.name != "_id"
+            && !self.name.contains('.')
+            && !self.name.starts_with('$')
+            && !self.name.starts_with("__")
+    }
+
     pub fn field(&self) -> String {
         match &self.field_override {
             Some(f) => f.clone(),
@@ -286,7 +318,12 @@ impl Column {
             field_override: d
                 .get_str("field")
                 .ok()
-                .filter(|f| f.starts_with("_id."))
+                .filter(|f| {
+                    f.starts_with("_id.")
+                        // A written-`bpchar` key's own field (RP-693).
+                        || (d.get_bool("pk").unwrap_or(false)
+                            && d.get_str("name").is_ok_and(|n| n == *f))
+                })
                 .map(str::to_string),
             pg_type: Self::type_from_stored(d.get_str("type").ok()?, decl_oid),
             pk: d.get_bool("pk").unwrap_or(false),
@@ -603,6 +640,47 @@ pub fn system_columns() -> Vec<Column> {
 }
 
 impl TableDef {
+    /// Whether a row of this table needs `derive_bpchar_keys`: it has a
+    /// `bpchar` PRIMARY KEY column.
+    pub fn has_bpchar_key(&self) -> bool {
+        self.columns.iter().any(|c| c.pk && c.pg_type == "bpchar")
+    }
+
+    /// Key `row` (keyed by stored field, a composite key flattened to
+    /// `_id.<name>`) by `bpchar`'s comparison, which ignores trailing blanks
+    /// (`bpchareq` / `bcTruelen`; RP-693): a written-`bpchar` key column
+    /// (`Column::is_written_bpchar_key`) sets `_id` from its value as
+    /// written, trimmed; every other `bpchar` key column -- a `char(n)`, a
+    /// composite key's member, or an unsized key of a table created before
+    /// that layout -- is stored trimmed, and its key field is trimmed in
+    /// place, whatever path built the row (COPY's did not). A row without
+    /// the column's field is left alone: an UPDATE's SET list names only
+    /// what it changes.
+    pub fn derive_bpchar_keys(&self, d: &mut Document) {
+        let trim = |v: &Bson| match v {
+            Bson::String(s) => Bson::String(s.trim_end_matches(' ').to_string()),
+            other => other.clone(),
+        };
+        for c in self
+            .columns
+            .iter()
+            .filter(|c| c.pk && c.pg_type == "bpchar")
+        {
+            if c.is_written_bpchar_key() {
+                if let Some(v) = d.get(&c.name) {
+                    let key = trim(v);
+                    d.insert("_id", key);
+                }
+            } else {
+                let f = c.field();
+                if let Some(v) = d.get(&f) {
+                    let key = trim(v);
+                    d.insert(f, key);
+                }
+            }
+        }
+    }
+
     /// `extra`'s record of each column's attnum, kept once a column has
     /// been dropped (until then a column's attnum is its place).
     const ATTNUMS: &'static str = "attnums";
@@ -871,3 +949,92 @@ impl TableDef {
 
 #[cfg(test)]
 mod golden;
+
+#[cfg(test)]
+mod bpchar_key_tests {
+    use super::{Column, TableDef};
+    use bson::{doc, Bson};
+
+    fn written_key() -> Column {
+        let mut c = Column::new("a", "bpchar", true);
+        c.field_override = Some("a".into());
+        c
+    }
+
+    #[test]
+    fn a_written_bpchar_key_round_trips_through_the_catalog() {
+        // RP-693: the layout is the column's `field`, so it survives a restart.
+        let c = written_key();
+        let back = Column::from_document(&c.to_document()).unwrap();
+        assert!(back.is_written_bpchar_key());
+        assert!(!back.is_composite_key_member());
+        assert_eq!(back.field(), "a");
+    }
+
+    #[test]
+    fn a_key_stored_before_the_layout_stays_in_id() {
+        // A store written before RP-693 names `_id` as the key's field: it
+        // keeps that layout and its answers.
+        let c = Column::new("a", "bpchar", true);
+        let back = Column::from_document(&c.to_document()).unwrap();
+        assert_eq!(back.field_override, None);
+        assert!(!back.is_written_bpchar_key());
+        assert_eq!(back.field(), "_id");
+        // A non-key column whose field is its name has no override either.
+        let plain = Column::new("a", "bpchar", false);
+        assert_eq!(
+            Column::from_document(&plain.to_document())
+                .unwrap()
+                .field_override,
+            None
+        );
+    }
+
+    #[test]
+    fn derive_bpchar_keys_trims_the_key_and_keeps_the_value() {
+        let def = TableDef::new("p", vec![written_key(), Column::new("b", "int4", false)]);
+        let mut d = doc! { "a": "k  ", "b": 1 };
+        def.derive_bpchar_keys(&mut d);
+        assert_eq!(d.get("a"), Some(&Bson::String("k  ".into())));
+        assert_eq!(d.get("_id"), Some(&Bson::String("k".into())));
+        // A SET list without the key leaves `_id` alone.
+        let mut set = doc! { "b": 2 };
+        def.derive_bpchar_keys(&mut set);
+        assert_eq!(set, doc! { "b": 2 });
+    }
+
+    #[test]
+    fn derive_bpchar_keys_trims_every_other_bpchar_key_in_place() {
+        // The old layout, a `char(n)` and a composite member are stored
+        // trimmed; a COPY row reaching the write untrimmed is keyed trimmed.
+        let def = TableDef::new("p", vec![Column::new("a", "bpchar", true)]);
+        let mut d = doc! { "_id": "w  " };
+        def.derive_bpchar_keys(&mut d);
+        assert_eq!(d, doc! { "_id": "w" });
+
+        let mut a = Column::new("a", "bpchar", true);
+        a.field_override = Some("_id.a".into());
+        let mut b = Column::new("b", "int4", true);
+        b.field_override = Some("_id.b".into());
+        let def = TableDef::new("q", vec![a, b]);
+        let mut d = doc! { "_id.a": "w ", "_id.b": 1 };
+        def.derive_bpchar_keys(&mut d);
+        assert_eq!(d, doc! { "_id.a": "w", "_id.b": 1 });
+        assert!(def.columns[0].is_composite_key_member());
+    }
+
+    #[test]
+    fn only_an_unsized_bpchar_under_a_plain_name_takes_the_layout() {
+        assert!(Column::new("a", "bpchar", true).takes_written_bpchar_key());
+        let mut sized = Column::new("a", "bpchar", true);
+        sized.typmod = 7;
+        assert!(!sized.takes_written_bpchar_key());
+        for name in ["_id", "x.y", "$d", "__k"] {
+            assert!(
+                !Column::new(name, "bpchar", true).takes_written_bpchar_key(),
+                "{name}"
+            );
+        }
+        assert!(!Column::new("a", "text", true).takes_written_bpchar_key());
+    }
+}

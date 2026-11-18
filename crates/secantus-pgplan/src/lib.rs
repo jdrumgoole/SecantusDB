@@ -4082,6 +4082,11 @@ pub struct Update {
     /// (RP-686). PostgreSQL joins once and returns from the joined tuple; a
     /// lookup after the write saw the rows the write had changed.
     pub joined: JoinedValues,
+    /// The field of the table's written-`bpchar` PRIMARY KEY column, if it
+    /// has one (`Column::is_written_bpchar_key`): a value assigned to it
+    /// keeps its trailing blanks, and `_id` is derived from it trimmed
+    /// (RP-693).
+    pub bpchar_key: Option<String>,
 }
 
 /// A write's joined-row values for RETURNING: (hidden field, expression
@@ -13888,6 +13893,14 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt, analyse_defaults: bool) -> Re
         for c in columns.iter_mut().filter(|c| c.pk) {
             c.field_override = Some(format!("_id.{}", c.name));
         }
+    } else if let Some(c) = columns
+        .iter_mut()
+        .find(|c| c.pk && c.takes_written_bpchar_key())
+    {
+        // An unsized `bpchar` key: the row keeps the value as written under
+        // the column's name, and `_id` is that value with its trailing
+        // blanks trimmed, which is what `bpchareq` compares (RP-693).
+        c.field_override = Some(c.name.clone());
     }
     let mut def = TableDef::new(&table, columns);
     if let Some(name) = pk_name {
@@ -15811,6 +15824,11 @@ pub fn insert_row_typed(
         // the column back could not parse it as a date.
         let value = if already_stored {
             value
+        } else if column.is_written_bpchar_key() && matches!(value, Bson::String(_)) {
+            // An unsized `bpchar` key keeps the text as written: `bpcharin`
+            // at typmod -1 drops no blanks, and a text or varchar value
+            // assigned to it keeps its own (RP-693).
+            value
         } else if let Some(cast) = types
             .get(i)
             .and_then(|t| user_casts::find_assignment(t, &column.pg_type))
@@ -15827,6 +15845,7 @@ pub fn insert_row_typed(
         let stored = carry_subms(&mut d, &field, value);
         d.insert(field, stored);
     }
+    def.derive_bpchar_keys(&mut d);
     Ok(canonical_key_order(def, d))
 }
 
@@ -15837,7 +15856,7 @@ pub fn canonical_key_order(def: &TableDef, mut d: Document) -> Document {
     let key_fields: Vec<String> = def
         .columns
         .iter()
-        .filter(|c| c.pk && c.field_override.is_some())
+        .filter(|c| c.is_composite_key_member())
         .map(|c| c.field())
         .collect();
     for f in key_fields {
@@ -48182,9 +48201,15 @@ fn plan_update(
         }
         let value = const_value(val, params)?;
         let source = static_type(val, &value);
-        let value = fit_to_column(assign_value(value, &source, &column.pg_type)?, column)?;
+        let value = if column.is_written_bpchar_key() && matches!(value, Bson::String(_)) {
+            // Kept as written (`insert_row_typed`, RP-693).
+            value
+        } else {
+            fit_to_column(assign_value(value, &source, &column.pg_type)?, column)?
+        };
         set_stored_value(&mut set, &mut unset, field, value);
     }
+    def.derive_bpchar_keys(&mut set);
     if set.is_empty() && set_exprs.is_empty() && set_subscripts.is_empty() {
         return Err(Error::Parse("UPDATE without a SET list".into()));
     }
@@ -48210,6 +48235,11 @@ fn plan_update(
         residual,
         returning,
         joined,
+        bpchar_key: def
+            .columns
+            .iter()
+            .find(|c| c.is_written_bpchar_key())
+            .map(|c| c.field()),
     }))
 }
 
@@ -48405,7 +48435,12 @@ pub fn update_row_sets(upd: &Update, row: &Document) -> Result<(Document, Vec<St
                 column_expr_type(expr).to_string(),
             ),
         };
-        let value = fit_assigned_length(assign_value(value, &source, pg_type)?, pg_type, *typmod)?;
+        let value = if upd.bpchar_key.as_ref() == Some(field) && matches!(value, Bson::String(_)) {
+            // Kept as written (`insert_row_typed`, RP-693).
+            value
+        } else {
+            fit_assigned_length(assign_value(value, &source, pg_type)?, pg_type, *typmod)?
+        };
         set_stored_value(&mut set, &mut unset, field.clone(), value);
     }
     for a in &upd.set_subscripts {
@@ -48418,6 +48453,12 @@ pub fn update_row_sets(upd: &Update, row: &Document) -> Result<(Document, Vec<St
             .unwrap_or_else(|| row.get(&a.field).cloned().unwrap_or(Bson::Null));
         let value = cast_value(apply_subscript_assign(a, row, current)?, &a.pg_type)?;
         set_stored_value(&mut set, &mut unset, a.field.clone(), value);
+    }
+    if let Some(key) = &upd.bpchar_key {
+        if let Some(Bson::String(v)) = set.get(key) {
+            let id = Bson::String(v.trim_end_matches(' ').to_string());
+            set.insert("_id", id);
+        }
     }
     Ok((set, unset))
 }
@@ -48616,7 +48657,10 @@ fn references_literal_only_column(node: &pg_query::protobuf::Node, def: &TableDe
 /// carries its system columns (`TableDef::from_document`); a materialised
 /// source's does not.
 fn keeps_bpchar_blanks(def: &TableDef, c: &Column) -> bool {
-    def.system_columns.is_empty() && c.pg_type == "bpchar" && c.typmod <= 4
+    (def.system_columns.is_empty() && c.pg_type == "bpchar" && c.typmod <= 4)
+        // A stored unsized `bpchar` PRIMARY KEY keeps the value as written
+        // in its own field; `_id` holds the trimmed key (RP-693).
+        || c.is_written_bpchar_key()
 }
 
 /// Whether `node` reads a column of `def` whose `bpchar` cells keep their

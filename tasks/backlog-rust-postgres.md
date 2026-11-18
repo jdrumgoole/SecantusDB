@@ -2281,44 +2281,43 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       KEY / UNIQUE / index is keyed by the value with trailing blanks
       trimmed (`bpchareq` / `bcTruelen`), while the row keeps the value as
       written.** Steps: (1) a `bpchar` PRIMARY KEY's `_id` trimmed, the
-      row's value as written, and every read / lookup path that builds
-      that key; (2) UNIQUE; (3) ON CONFLICT; (4) an indexed and a
-      pushed-down `=`; (5) the write keeping the blanks of every unsized
-      `bpchar` column. None has landed.
-      Probed 2026-11-18 on 15.19 and this server (step-1 session, no code
-      changed): `create table p2 (a bpchar primary key, b int)`, insert
-      `'k  '`, then `'k'` is 23505 on both, `on conflict (a) do update`
-      keeps the stored `'k  '` on 15.19, and `where a = 'k'`, `where a =
-      'k   '::bpchar`, `update ... where a='k'` and `delete ... where a='k '`
-      each find the row on both. The ONE difference: `octet_length(a)` is 3
-      on 15.19 and 1 here. A `char(3)` PRIMARY KEY already answers like
-      15.19 (stored trimmed, padded on output), so step 1 is about unsized
-      `bpchar` (and a `bpchar` member of a composite key) only.
-      Why step 1 is not one session: the PK column's stored field IS `_id`
-      (`field_for`), so a trimmed key and an as-written value need two
-      fields. Design for step 1: such a column gets `field_override` =
-      its name (holding the value as written) and `_id` (`_id.<name>` in a
-      composite key) becomes a derived key, `trim_end(' ')` of it, written
-      by the insert / update / COPY paths. Every site that equates "PK" with
-      "`_id`" then has to read the override: `encode_doc` (34 call sites),
-      `decode_doc` (53) and `row_id` (15) take no `TableDef`; lib.rs ~28847
-      and secantus-pgplan lib.rs ~15840 read `pk && field_override.is_some()`
-      as "composite key"; `heap.rs` and `btree.rs` (the page models) build
-      the key from `_id`; and the PK point lookup (`portal_stream.rs`
-      `primary_key_point`), ON CONFLICT, the FK checks and `insert_key_eq`
-      filter on `_id` with the probe value, which must be trimmed. A
-      pushed-down `=` on the column must go to `_id` with the trimmed
-      literal, since the stored field then holds blanks.
-      Stores written before step 1 (decided in that session): every
-      `bpchar` value this server has written since it gained `char(n)`
-      (#1654) went through `cast_value`'s trim, so an existing `_id` is
-      already the trimmed key and its value has already lost its blanks,
-      which no reader can restore. Such a table keeps its catalog entry
-      without the override and reads back as it always has; only a table
-      created after step 1 gets the two-field layout. An untrimmed `_id`
-      can only come from the MongoDB server writing the collection, which
-      is the MongoDB -> SQL hand-off CLAUDE.md says does not work, so the
-      PG server does not answer for it.
+      row's value as written -- LANDED 2026-11-18, below; (2) UNIQUE; (3)
+      ON CONFLICT on a UNIQUE arbiter; (4) an indexed and a pushed-down
+      `=`; (5) the write keeping the blanks of every unsized `bpchar`
+      column.
+      Step 1 as built (2026-11-18): a single-column unsized `bpchar`
+      PRIMARY KEY made by CREATE TABLE gets `field_override` = its own
+      name (`Column::is_written_bpchar_key`; the catalog's `field` is the
+      name, so it survives a restart), holding the value as written, and
+      `_id` is derived trimmed by `TableDef::derive_bpchar_keys` on every
+      write (`insert_row_typed`, the UPDATE SET list and per-row `after`,
+      `with_expr_fields` / `stored_rows_of`, which COPY reaches). ON
+      CONFLICT's `arbiter_key` and the foreign-key fields (`fk_fields`)
+      use `_id` for such a column; a predicate on it is evaluated per row
+      (`keeps_bpchar_blanks`), so an `=` on it scans until step 4.
+      `derive_bpchar_keys` also trims, in place, every other `bpchar` key
+      field: COPY had written `'w  '` untrimmed into the key of a
+      `char(n)`, a composite or an ALTER-added unsized key, so a later
+      `'w'` did not collide (23505 on 15.19). Still on the old, trimmed
+      layout (key right, value without its blanks): a `bpchar` member of
+      a COMPOSITE key (`primary key (a, b)` over two unsized `bpchar`:
+      `octet_length` of `'a '` is 2 on 15.19, 1 here) and a key added by
+      `ALTER TABLE ... ADD PRIMARY KEY` (its rows move into `_id`); both
+      go with step 5, which keeps the blanks of the non-key column they
+      start from. The page models (`heap.rs`, `btree.rs`) still size a
+      key from `_id`, trimmed, where PostgreSQL's index tuple holds the
+      value as written: unprobed, check with `bt_page_items` at step 4.
+      Tests: `tests/test_rust_pg_bpchar_key.py`, and
+      `bpchar_key_tests` in secantus-pgcatalog.
+      Stores written before step 1: every `bpchar` value this server wrote
+      went through `cast_value`'s trim, so an existing `_id` is already the
+      trimmed key and the value has lost its blanks, which no reader can
+      restore. Such a table's catalog names `_id` as the key's field, so it
+      keeps that layout and reads back as it always has (measured with the
+      pre-change binary's store; pinned by
+      `a_key_stored_before_the_layout_stays_in_id`). An untrimmed `_id`
+      can only come from the MongoDB server writing the collection, the
+      MongoDB -> SQL hand-off CLAUDE.md says does not work.
       **Decision needed (step-2 session, 2026-11-18, no code changed):
       how step 2 enforces UNIQUE.** The session was asked for UNIQUE
       through `value_unique` / `check_collated_unique`. That check reads

@@ -28629,7 +28629,12 @@ impl PgHandler {
         };
         let mut key = Document::new();
         for column in &columns {
-            let field = def.field_of(column)?;
+            // A written-`bpchar` key arbitrates on its trimmed `_id`, which
+            // the proposed row carries (RP-693).
+            let field = match def.column(column) {
+                Some(c) if c.is_written_bpchar_key() => "_id".to_string(),
+                _ => def.field_of(column)?,
+            };
             key.insert(field.clone(), proposed.get(&field).cloned()?);
         }
         Some(key)
@@ -28844,7 +28849,7 @@ impl PgHandler {
         let composite: Vec<&Column> = def
             .columns
             .iter()
-            .filter(|c| c.pk && c.field_override.is_some())
+            .filter(|c| c.is_composite_key_member())
             .collect();
         if !composite.is_empty() && key_pattern.keys().any(|f| f == "_id") {
             let id = key_value.get_document("_id").cloned().unwrap_or_default();
@@ -50913,6 +50918,10 @@ impl PgHandler {
                                 self.check_view_conditions(def, &after, &view_checks)?;
                                 self.check_partition_route(def, &after)?;
                             }
+                            if let Some(def) = def.as_ref() {
+                                // A BEFORE trigger's row too (RP-693).
+                                def.derive_bpchar_keys(&mut after);
+                            }
                             if referenced {
                                 key_changes.push((row.clone(), after.clone()));
                             }
@@ -52086,8 +52095,18 @@ impl PgHandler {
         parent: &TableDef,
         fk: &secantus_pgcatalog::ForeignKey,
     ) -> Option<(Vec<String>, Vec<String>)> {
-        let fields: Option<Vec<String>> = fk.columns.iter().map(|c| child.field_of(c)).collect();
-        let refs: Option<Vec<String>> = fk.ref_columns.iter().map(|c| parent.field_of(c)).collect();
+        // A written-`bpchar` key is matched by its trimmed `_id`: `bpchareq`
+        // ignores the blanks its own field keeps (RP-693).
+        let key_field = |def: &TableDef, c: &String| match def.column(c) {
+            Some(col) if col.is_written_bpchar_key() => Some("_id".to_string()),
+            _ => def.field_of(c),
+        };
+        let fields: Option<Vec<String>> = fk.columns.iter().map(|c| key_field(child, c)).collect();
+        let refs: Option<Vec<String>> = fk
+            .ref_columns
+            .iter()
+            .map(|c| key_field(parent, c))
+            .collect();
         Some((fields?, refs?))
     }
 

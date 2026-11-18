@@ -145,13 +145,17 @@ impl PgHandler {
             return Ok(rows);
         };
         let indexes = self.expr_indexes(&def)?;
-        if indexes.is_empty() {
+        let keyed = def.has_bpchar_key();
+        if indexes.is_empty() && !keyed {
             return Ok(rows);
         }
         rows.into_iter()
             .map(|raw| {
                 let mut d =
                     decode_doc(&raw).map_err(|e| Self::storage_err("could not read a row", e))?;
+                // A `bpchar` key is trimmed however the row was built
+                // (COPY included; RP-693).
+                def.derive_bpchar_keys(&mut d);
                 Self::fill_expr_fields(&indexes, &mut d)?;
                 encode_doc(&d).map_err(|e| Self::storage_err("could not encode a row", e))
             })
@@ -185,20 +189,29 @@ impl PgHandler {
         table: &str,
         rows: impl Iterator<Item = std::borrow::Cow<'a, Document>>,
     ) -> PgWireResult<Vec<(Vec<u8>, Document)>> {
-        let indexes = match self.lookup_ref(table) {
-            Some(def) => self.expr_indexes(&def)?,
+        let def = self.lookup_ref(table);
+        let indexes = match &def {
+            Some(def) => self.expr_indexes(def)?,
             None => Vec::new(),
         };
+        let keyed = def.as_ref().filter(|d| d.has_bpchar_key());
         rows.map(|row| {
             // With expression indexes, the row as `with_expr_fields`
             // reads it back from its encoding, and fills.
             let filled = if indexes.is_empty() {
-                None
+                keyed.map(|def| {
+                    let mut d = row.clone().into_owned();
+                    def.derive_bpchar_keys(&mut d);
+                    d
+                })
             } else {
                 let raw = crate::encode_doc(&row)
                     .map_err(|e| Self::storage_err("could not encode a row", e))?;
                 let mut d =
                     decode_doc(&raw).map_err(|e| Self::storage_err("could not read a row", e))?;
+                if let Some(def) = keyed {
+                    def.derive_bpchar_keys(&mut d);
+                }
                 Self::fill_expr_fields(&indexes, &mut d)?;
                 Some(d)
             };
