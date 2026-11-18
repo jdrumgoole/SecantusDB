@@ -23,6 +23,14 @@ pub enum Engine {
     Mongod,
 }
 
+/// mongod runs as a one-member replica set, as `secantusd-mdb` does by
+/// default: both then take `w: "majority"` as the default write concern and
+/// wait for the journal before acknowledging, and both serve change streams.
+/// A standalone mongod acknowledges at `w: 1` without the journal, which
+/// measured the durability wait rather than the engines (0.14x on
+/// 2026-11-18, against a mongod that skipped it).
+pub const MONGOD_REPLSET: &str = "secantus-bench";
+
 impl Engine {
     pub fn name(self) -> &'static str {
         match self {
@@ -103,7 +111,7 @@ impl Engine {
             ),
             Engine::Mongod => format!(
                 "/usr/bin/mongod --bind_ip {bind} --port {port} --dbpath {} \
-                 --wiredTigerCacheSizeGB {}",
+                 --wiredTigerCacheSizeGB {} --replSet {MONGOD_REPLSET}",
                 self.data_dir(),
                 cache_gb(cache_size)
             ),

@@ -292,6 +292,18 @@ systemctl start $SERVICE
 for _ in $(seq 1 120); do
   if (exec 3<>/dev/tcp/$BIND_HOST/$PORT) 2>/dev/null; then
     echo "server listening on $BIND_HOST:$PORT"
+    if [ -n "$REPLSET" ]; then
+      # A one-member replica set, as secantusd-mdb runs by default: initiate
+      # it (a kept data dir is already initiated) and wait for PRIMARY.
+      mongosh --quiet "mongodb://$BIND_HOST:$PORT/?directConnection=true" --eval "
+        try { rs.status() } catch (e) {
+          rs.initiate({_id: '$REPLSET', members: [{_id: 0, host: '$BIND_HOST:$PORT'}]})
+        }
+        for (let i = 0; i < 120 && !db.hello().isWritablePrimary; i++) sleep(500);
+        if (!db.hello().isWritablePrimary) { print('never became PRIMARY'); quit(1) }
+      "
+      echo "replica set $REPLSET primary on $BIND_HOST:$PORT"
+    fi
     exit 0
   fi
   if ! systemctl is-active --quiet $SERVICE; then
@@ -790,6 +802,14 @@ fn run_one_engine(
             ("SERVER_DATA", engine.data_dir().to_string()),
             ("BIND_HOST", server.private()),
             ("PORT", SERVER_PORT.to_string()),
+            (
+                "REPLSET",
+                if engine == Engine::Mongod {
+                    crate::engine::MONGOD_REPLSET.to_string()
+                } else {
+                    String::new()
+                },
+            ),
             (
                 "WIPE",
                 if opts.keep_data {
