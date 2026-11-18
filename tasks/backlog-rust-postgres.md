@@ -1917,8 +1917,7 @@ a regression test.
       regex match filters (the join's WHERE patterns collected by
       `explain_join_patterns`). Still zeros: a call of a function whose
       overloads differ in `procost`; a regex whose prefix walk is not
-      modelled (an anchor a character may precede, or in a branch or an
-      optional group of one branch; embedded options). Since 2026-11-18 a `^` no
+      modelled (an anchor in an optional group; embedded options). Since 2026-11-18 a `^` no
       character precedes, inside a group or not, anchors the match as
       `regc_nfa.c`'s optimisation pulls it into the `pre` state
       (`strip_bos`: `^(?:^w0)1` and `(?:^w0)1` are both prefix `w01`). A back reference is walked as a copy of
@@ -1943,9 +1942,11 @@ a regression test.
       arc out of `pre` does in `findprefix` (`^(?:w|^x)0` is `rows=1000`,
       `^(?:^ab|^ab)` and `^(?:w|^x)?0` no prefix). Since 2026-11-18 a `^` every path meets after a character
       makes the regex `REG_UIMPOSSIBLE`, no prefix (`^w(?:^0)1` is
-      `rows=1`). One a character precedes in one branch is still zeros:
-      `regc_nfa.c` prunes that branch as dead (`^x(?:^w|y)0` is prefix
-      `xy0`; `^w(?:^x|0)0` is `rows=91`). Measured
+      `rows=1`), and since 2026-11-18 a branch whose `^` a character
+      precedes is pruned as dead, as `regc_nfa.c` prunes it
+      (`prune_dead_branches`: `^x(?:^w|y)0` is prefix `xy0`,
+      `^w(?:^x|0)0` `rows=91`). Embedded options are still zeros
+      (`(?x)^w 0 0` is `rows=91` on 15.19). Measured
       on the 15.19 reference on port 5415 (found while working RP-404 and
       RP-354). The repeated group's prefix is not a walk of the regex's
       text: `pg_regprefix` reads the NFA after `regc_nfa.c`'s `optimize`
@@ -1957,7 +1958,7 @@ a regression test.
       `repeat`'s arcs gives (`aba`). The faithful fix ports `regcomp.c` /
       `regc_nfa.c`'s NFA build and optimisation and runs `findprefix` on
       it (2026-11-17, sized while working RP-841).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with a dead anchor in a branch]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with embedded options]
       Backlog-ID: RP-423
 - [ ] **A semi join cheaper unique-ified keeps the semi join's shape.**
       Since RP-411's first slice (2026-11-16) a WHERE that is one
@@ -2331,24 +2332,16 @@ Measured on PostgreSQL 15.19 with `create domain pint as int check (value >
 text)` and `create table tct (c ctp, d pint[])` holding `('(1,x)', null)`.
 The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
 
-- [ ] **An untyped literal written to a composite or domain-array column,
-      or coerced as an `ARRAY[]` element, reports a field's domain error
-      with no position.** `insert into tct(c) values ('(0,x)')` and
-      `insert into tct(d) values ('{0}')` are 23514 at 28 on PostgreSQL
-      15.19, `update tct set c = '(0,x)'` at 20 and `select
-      array['(0,x)']::ctp[]` at 14: `coerce_type` reads the literal with
-      `record_in` / `array_in` under its parser error position. Here each
-      has none. RP-552 recorded the literal's location for a TypeCast of
-      the literal only (`literal_input_location` in `const_value_inner`);
-      the write path and the `ARRAY[]` element coercion need the same.
-      Verify: tests/backlog/test_rp_found_rp552.py::test_assigned_literal_domain_error_position
+- [ ] **An untyped literal an `INSERT ... SELECT` writes to a composite
+      or domain-array column reports a field's domain error with no
+      position.** `insert into tct(c) select '(0,x)'` is 23514 at 27 on
+      PostgreSQL 15.19: the SELECT's `unknown` output column is coerced to
+      the target column in the INSERT's analysis, reading the literal under
+      its position. Here it has none. RP-945 placed the VALUES and UPDATE
+      SET forms (`check_assigned_literal`) and an `ARRAY[]` element
+      (`failing_array_element`); the SELECT's target list needs the same.
+      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_literal_domain_error_position
       Backlog-ID: RP-945
-- [ ] **A NULL element of a NOT NULL domain's array literal is accepted.**
-      `select '{NULL}'::nnint[]` is 23502 `domain nnint does not allow null
-      values` at 8 on PostgreSQL 15.19 (`array_in` reads each element with
-      `domain_in`, which refuses the NULL); here it is `{NULL}`.
-      Verify: tests/backlog/test_rp_found_rp552.py::test_not_null_domain_array_element
-      Backlog-ID: RP-946
 - [ ] **A composite column compared with an untyped literal reads the
       literal as the column's type.** `select * from tct where c =
       '(0,x)'` is 0A000 `input of anonymous composite types is not

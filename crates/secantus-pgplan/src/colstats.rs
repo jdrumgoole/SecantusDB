@@ -1053,6 +1053,57 @@ fn bos_after_char(atoms: &[QuantifiedAtom], at_start: &mut Option<bool>) -> bool
     false
 }
 
+/// Drops the alternatives of `atoms`' groups in which a `^` follows a
+/// character on every path, as `regc_nfa.c`'s optimisation prunes the
+/// states that cannot reach the final one (`^x(?:^w|y)0` is prefix `xy0`
+/// on 15.19). `at_start` is as for [`bos_after_char`]. True where a group
+/// every path takes loses all its alternatives: the regex cannot match.
+fn prune_dead_branches(atoms: &mut [QuantifiedAtom], at_start: &mut Option<bool>) -> bool {
+    for (atom, min, max) in atoms.iter_mut() {
+        if *max == Some(0) {
+            continue;
+        }
+        match atom {
+            ReAtom::Bos => {}
+            ReAtom::Char(_) | ReAtom::Set => {
+                if *min >= 1 {
+                    *at_start = Some(false);
+                } else if *at_start == Some(true) {
+                    *at_start = None;
+                }
+            }
+            ReAtom::Group(alts, _) => {
+                if alts.len() > 1 {
+                    alts.retain(|alt| !bos_after_char(alt, &mut at_start.clone()));
+                    if alts.is_empty() {
+                        if *min >= 1 {
+                            return true;
+                        }
+                        *max = Some(0);
+                        continue;
+                    }
+                }
+                match alts.as_mut_slice() {
+                    [only] if *min >= 1 => {
+                        if prune_dead_branches(only, at_start) {
+                            return true;
+                        }
+                    }
+                    _ => {
+                        for alt in alts.iter_mut() {
+                            prune_dead_branches(alt, &mut at_start.clone());
+                        }
+                        if *at_start == Some(true) {
+                            *at_start = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// A [`ReAtom`] and its quantifier's bounds.
 type QuantifiedAtom = (ReAtom, u32, Option<u32>);
 
@@ -1106,6 +1157,9 @@ fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String,
     // A `^` every path reaches after a character: no path to the final
     // state, `REG_UIMPOSSIBLE`, which `pg_regprefix` answers `REG_NOMATCH`.
     if bos_after_char(atoms, &mut Some(true)) {
+        return Some((String::new(), PrefixStatus::None));
+    }
+    if prune_dead_branches(atoms, &mut Some(true)) {
         return Some((String::new(), PrefixStatus::None));
     }
     // The `pre` state's rainbow where no `^` anchors the match.
@@ -1925,6 +1979,13 @@ mod tests {
             ("(?:^w|^x)0", false, Some(("", NoMatch))),
             ("^(?:^ab|^ab)", false, Some(("", NoMatch))),
             ("^(?:w|^x)?0", false, Some(("", NoMatch))),
+            // A branch whose `^` follows a character is pruned as dead
+            // (RP-423).
+            ("^x(?:^w|y)0", false, Some(("xy0", Partial))),
+            ("^w(?:^x|0)0", false, Some(("w00", Partial))),
+            ("^w(?:^x|^y)0", false, Some(("", NoMatch))),
+            ("^w(?:^x|0)?1", false, Some(("w", Partial))),
+            ("^w(x|^y|z)1", false, Some(("w", Partial))),
             ("^", false, Some(("", NoMatch))),
             ("abc", false, Some(("", NoMatch))),
             ("^ab|^ac", false, Some(("", NoMatch))),
@@ -1979,10 +2040,9 @@ mod tests {
             // match (`REG_UIMPOSSIBLE`), and `pg_regprefix` finds none.
             ("^w(?:^0)1", false, Some(("", PrefixStatus::None))),
             ("^(?:^w)(?:^0)1", false, Some(("", PrefixStatus::None))),
-            // Not modelled: a `^` after a character in an optional group
-            // or a branch; a back reference to an unclosed group. (A `^`
-            // in a branch nothing precedes is modelled, above.)
-            ("^w(?:^x|0)0", false, None),
+            // Not modelled: a `^` nothing precedes in an optional group; a
+            // back reference to an unclosed group. (A `^` in a branch is
+            // modelled, above.)
             ("^(?:^w0)?1", false, None),
             ("^a\\1", false, None),
             // A back reference is a copy of the group it names, as
