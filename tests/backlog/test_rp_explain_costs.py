@@ -4211,10 +4211,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Measured on PostgreSQL 15.19: a text expression key over a column of
-    # ten values merges, the expression's Sort Key its projected value.
+    # Measured on PostgreSQL 15.19 (RP-1032, fixed): a text expression key
+    # over a column of ten values merged, the expression's Sort Key its
+    # projected value.
     "an expression key over a column of few values is a merge join": (
-        "RP-1032",
+        "RP-1032:fixed",
         _ANALYSED,
         "explain select * from e join e e2 on e.b = e2.b || 'x'",
         [
@@ -4226,6 +4227,29 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
             "        Sort Key: ((e2.b || 'x'::text))",
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (RP-1071, found while working RP-1032): VERBOSE
+    # of a merge join lists each node's Output, the expression's Sort
+    # carrying the projected value.
+    "verbose of a merge join on an expression key": (
+        "RP-1071",
+        _ANALYSED,
+        "explain verbose select * from e join e e2 on e.b = e2.b || 'x'",
+        [
+            "Merge Join  (cost=129.66..224.66 rows=5000 width=14)",
+            "  Output: e.a, e.b, e2.a, e2.b",
+            "  Merge Cond: (e.b = ((e2.b || 'x'::text)))",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "        Sort Key: e.b",
+            "        ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "              Output: e.a, e.b",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Output: e2.a, e2.b, ((e2.b || 'x'::text))",
+            "        Sort Key: ((e2.b || 'x'::text))",
+            "        ->  Seq Scan on public.e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "              Output: e2.a, e2.b, (e2.b || 'x'::text)",
         ],
     ),
     # Measured on PostgreSQL 15.19: ANALYZE of an anti join hashed on an

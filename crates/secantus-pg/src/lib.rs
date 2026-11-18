@@ -47205,7 +47205,20 @@ impl PgHandler {
                                 // The merge path PostgreSQL keeps (RP-366):
                                 // both inputs sorted on the join keys.
                                 scan_estimate::JoinPick::Merge { b_outer, plan } => {
-                                    if let Some(keys) = explain::join_key_texts(sel) {
+                                    // On an expression key, the texts
+                                    // of its one ON equality (RP-1032).
+                                    let keys = if scan_estimate::has_expr_join_key(sel) {
+                                        match options.join_conds.as_slice() {
+                                            [cond] => explain::expr_merge_key_texts(
+                                                &tree.children[0],
+                                                cond,
+                                            ),
+                                            _ => None,
+                                        }
+                                    } else {
+                                        explain::join_key_texts(sel)
+                                    };
+                                    if let Some(keys) = keys {
                                         explain::price_merge_join(
                                             &mut tree, a, b, join, &plan, b_outer, &keys,
                                         );

@@ -8264,9 +8264,9 @@ fn hash_join_of(
             best
         }
     })?;
-    // A merge on an expression key sorts on the expression, whose plan is
-    // not drawn here (RP-981).
-    if expr_key && matches!(pick, JoinPick::Merge { .. }) {
+    // A merge on an expression key sorts on the expression, drawn as the
+    // scan's projected value (RP-1032); an outer one is not modelled.
+    if expr_key && left_join && matches!(pick, JoinPick::Merge { .. }) {
         return None;
     }
     // `match_unsorted_outer`'s nested loops are paths too, each pair

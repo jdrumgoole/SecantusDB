@@ -1206,6 +1206,59 @@ pub(crate) fn join_key_texts(sel: &secantus_pgplan::Select) -> Option<(String, S
     Some((dotted(l), dotted(r)))
 }
 
+/// A merge join's keys on an expression (RP-1032), `(left, right)` as
+/// each Sort Key prints them, from its one ON equality `cond`: a column
+/// as `alias.column`, an expression as a reference to the scan's
+/// projected value, `((e2.b || 'x'::text))`. `left` is the outer scan as
+/// the tree draws it before the merge is made.
+pub(crate) fn expr_merge_key_texts(left: &PlanNode, cond: &str) -> Option<(String, String)> {
+    let inner = cond.strip_prefix('(')?.strip_suffix(')')?;
+    let (a, b) = inner.split_once(" = ")?;
+    if b.contains(" = ") {
+        return None;
+    }
+    let qual = |o: &str| {
+        o.trim_start_matches('(')
+            .split_once('.')
+            .map(|(q, _)| q.to_string())
+    };
+    let mut names = Vec::new();
+    relation_names(left, &mut names);
+    let text = |o: &str| {
+        if o.starts_with('(') {
+            format!("({o})")
+        } else {
+            o.to_string()
+        }
+    };
+    match (names.contains(&qual(a)?), names.contains(&qual(b)?)) {
+        (true, false) => Some((text(a), text(b))),
+        (false, true) => Some((text(b), text(a))),
+        _ => None,
+    }
+}
+
+/// A `Merge Cond` equality with each expression operand as the Sort's
+/// projected value it compares, `(e.b = ((e2.b || 'x'::text)))` (RP-1032).
+fn merge_cond_text(c: &str) -> String {
+    let Some((a, b)) = c
+        .strip_prefix('(')
+        .and_then(|t| t.strip_suffix(')'))
+        .and_then(|t| t.split_once(" = "))
+        .filter(|(_, b)| !b.contains(" = "))
+    else {
+        return c.to_string();
+    };
+    let wrap = |o: &str| {
+        if o.starts_with('(') {
+            format!("({o})")
+        } else {
+            o.to_string()
+        }
+    };
+    format!("({} = {})", wrap(a), wrap(b))
+}
+
 /// Make the `Hash Join` this server drew the merge join PostgreSQL keeps
 /// (RP-366): each input under a `Sort` on its key, the inner read through
 /// a `Materialize` when the plan says so, and the join's, Sorts' and scans'
@@ -1286,7 +1339,11 @@ pub(crate) fn price_merge_join(
 /// one equality of two qualified columns, or neither operand names a
 /// relation scanned under the outer child.
 fn outer_first(n: &PlanNode, c: &str) -> Option<bool> {
-    if !(n.name.starts_with("Hash") && n.name.ends_with("Join")) || n.children.is_empty() {
+    // A merge join's clauses are switched the same way
+    // (`create_mergejoin_plan`, RP-1032).
+    if !((n.name.starts_with("Hash") || n.name.starts_with("Merge")) && n.name.ends_with("Join"))
+        || n.children.is_empty()
+    {
         return None;
     }
     let inner = c.strip_prefix('(')?.strip_suffix(')')?;
@@ -2675,6 +2732,11 @@ pub(crate) fn attach_join_conds(
                     Some(false) => c.clone(),
                     None if n.commute_cond => commute_equality(c).unwrap_or_else(|| c.clone()),
                     None => c.clone(),
+                };
+                let c = if label == "Merge Cond" {
+                    merge_cond_text(&c)
+                } else {
+                    c
                 };
                 n.details.insert(0, (label.into(), c));
             }

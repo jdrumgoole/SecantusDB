@@ -2930,37 +2930,46 @@ statement is VALUES-only and runs there as written. The gap test is in
       Backlog-ID: RP-1066
 
 - [ ] **A join on an expression key PostgreSQL prices is unpriced in
-      three shapes.** Since RP-981 a join of two analysed tables on one
+      two shapes.** Since RP-981 a join of two analysed tables on one
       equality between a column and an operator expression over one column
       of the other is a priced Hash Join (inner, LEFT, anti), hashing the
-      side whose key has statistics. Still a `Nested Loop` with `Join
-      Filter` and zero costs: against a unique column, `select * from e join
-      k on k.a = e.a - 1` (PostgreSQL 15.19 `Hash Join (cost=27.50..45.26
-      rows=1000 width=14)` hashing `k`, inner unique; `hash_join_of`'s
-      unique-key paths are not modelled over an expression); where the
-      merge wins, `e.b = e2.b || 'x'` over a ten-value column (`Merge Join
-      (cost=129.66..224.66 rows=5000 width=14)`, the expression's Sort Key
-      `((e2.b || 'x'::text))`; priced with `mergejoinscansel`'s defaults
-      and declined, the plan is not drawn); and across types, `e.a::bigint =
-      e2.a` (`Hash Join (cost=27.50..57.50 rows=1000 width=14)`; declined on
-      `pg_type`). An aggregate over such a join (`select count(*)`) and a
-      LEFT join filtered on a column not its key (`where e2.b is null`, a
-      `Hash Right Join` with `Filter`) stay unpriced as they do over a
-      column key. Measured on the 15.19 reference on port 5415.
-      Where each declines (read 2026-11-18, while working RP-1025/1036/
-      1038/1039): the unique column in `hash_join_of`'s `if unique_key &&
-      (redundant || expr_key) { return None }` -- `unique_key_other_paths`
-      would need the column side's index probed by the expression (its
-      param scan and Memoize keyed on an expression with no statistics,
-      200 distinct) and a merge sorting the expression side against the
-      presorted index; the merge at the end of `hash_join_of` (`expr_key
-      && JoinPick::Merge`), which needs the plan drawn with the
-      expression's Sort Key and `Merge Cond: (e.b = ((e2.b ||
-      'x'::text)))`; the cross-type one at its `a.pg_type != b.pg_type`
-      check, where `int8 = int4` is one integer opfamily's hashable
-      operator.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an expression key against a unique column is a hash join], tests/backlog/test_rp_explain_costs.py::test_plan[an expression key over a column of few values is a merge join]
+      side whose key has statistics, and since RP-1032 an inner one the
+      merge wins is a priced Merge Join (`e.b = e2.b || 'x'`, the
+      expression's Sort Key `((e2.b || 'x'::text))`). Still a `Nested
+      Loop` with `Join Filter` and zero costs: against a unique column,
+      `select * from e join k on k.a = e.a - 1` (PostgreSQL 15.19 `Hash
+      Join (cost=27.50..45.26 rows=1000 width=14)` hashing `k`, inner
+      unique; `hash_join_of`'s unique-key paths are not modelled over an
+      expression); and across types, `e.a::bigint = e2.a` (`Hash Join
+      (cost=27.50..57.50 rows=1000 width=14)`; declined on `pg_type`). A
+      LEFT join the merge wins is declined at the end of `hash_join_of`
+      (`expr_key && left_join && JoinPick::Merge`), its Merge Left/Right
+      Join not drawn. An aggregate over such a join (`select count(*)`)
+      and a LEFT join filtered on a column not its key (`where e2.b is
+      null`, a `Hash Right Join` with `Filter`) stay unpriced as they do
+      over a column key. Measured on the 15.19 reference on port 5415.
+      Where each declines (read 2026-11-18): the unique column in
+      `hash_join_of`'s `if unique_key && (redundant || expr_key) { return
+      None }` -- `unique_key_other_paths` would need the column side's
+      index probed by the expression (its param scan and Memoize keyed on
+      an expression with no statistics, 200 distinct) and a merge sorting
+      the expression side against the presorted index; the cross-type one
+      at its `a.pg_type != b.pg_type` check, where `int8 = int4` is one
+      integer opfamily's hashable operator.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an expression key against a unique column is a hash join]
       Backlog-ID: RP-1032
+- [ ] **VERBOSE of a merge join prints no `Output`.** `explain verbose
+      select * from e join e e2 on e.b = e2.b || 'x'` prints, in
+      PostgreSQL 15.19, `Output:` on the Merge Join, each Sort and each
+      scan, the expression side's Sort and scan carrying the projected
+      value (`Output: e2.a, e2.b, ((e2.b || 'x'::text))` over `Output:
+      e2.a, e2.b, (e2.b || 'x'::text)`), and the scans as `public.e`.
+      Here the plan prints as without VERBOSE: `attach_verbose_join`
+      handles a hash join and a nested loop only, so a merge on a column
+      key is the same. Measured on the 15.19 reference on port 5415
+      (found while working RP-1032).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[verbose of a merge join on an expression key]
+      Backlog-ID: RP-1071
 - [ ] **ANALYZE of a hash join on an expression key counts nothing below
       it.** `explain (analyze, costs off, timing off, summary off) select *
       from e left join e e2 on e.a = e2.a + 1 where e2.a is null` prints,
@@ -2968,7 +2977,10 @@ statement is VALUES-only and runs there as written. The gap test is in
       Hash's `Buckets: 1024  Batches: 1  Memory Usage: 47kB`; here only the
       join's own `actual rows=1`. `join_analyze` reads the `Hash Cond` as
       two columns. Measured on the 15.19 reference on port 5415 (found
-      while working RP-981).
+      while working RP-981). An inner join on an expression key the merge
+      wins (RP-1032) prints its Merge Join's `actual rows` but none on its
+      Sorts and scans, nor PostgreSQL's `Sort Method: quicksort  Memory:
+      71kB` on each Sort.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an anti join on an expression key]
       Backlog-ID: RP-1033
 - [ ] **A hash join written inner side first is not `Inner Unique`.**
