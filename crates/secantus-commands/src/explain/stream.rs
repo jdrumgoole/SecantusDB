@@ -1153,6 +1153,7 @@ fn sort_members(
             .map_err(sort_fault)?;
         } else {
             let sizing = secantus_core::sorter::Sizing {
+                beside: None,
                 sizes: None,
                 source: secantus_core::sorter::SortSource::QueryLayer,
                 fields: None,

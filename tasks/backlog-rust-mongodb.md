@@ -1126,17 +1126,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       working RM-325.
       Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_server_status_reports_the_spill_engine
       Backlog-ID: RM-614
-- [ ] **An SBE sort's whole-document row leaves out the fields read beside it.**
-      mongod 8.2.11's slot-based sort in front of `{$group: {_id: "$k", f:
-      {$first: "$$ROOT"}}}`, over 300 documents of a 1000-byte `s` under a
-      50000-byte budget, spills rows of the whole document AND `k` (the
-      result slot and the named slot the `$group` reads): 956700 bytes over
-      900 records. This server's row holds the document alone (952200, 5
-      bytes a record fewer): `group::downstream_fields` answers `None` for
-      "whole documents" and drops the fields read by name. Found 2026-11-13
-      (RM-506).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm506.py::test_a_whole_document_row_keeps_the_fields_read_beside_it
-      Backlog-ID: RM-615
 - [ ] **An SBE sort counts no memory for a field a document lacks.**
       mongod 8.2.11 counts every slot of an SBE sort's row in the memory it
       holds, a missing field's `Nothing` included (`getApproximateSize`:

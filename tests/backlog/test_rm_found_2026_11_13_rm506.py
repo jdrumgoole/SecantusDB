@@ -29,11 +29,11 @@ def _root_row(client: Any) -> dict:
     return {k: entry.get(k) for k in ("sortSpills", "sortSpilledRecords", "sortSpilledBytes")}
 
 
-@pytest.mark.backlog("RM-615")
+@pytest.mark.backlog_fixed("RM-615")
 def test_a_whole_document_row_keeps_the_fields_read_beside_it(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's SBE sort in front of a `$group` that reads `$$ROOT`
     and `$k` spills rows of the whole document and `k`: 956700 bytes over
-    900 records. This server's row holds the document alone, 5 bytes a
+    900 records. This server's row held the document alone, 5 bytes a
     record fewer (952200)."""
     assert _root_row(rust_mongo) == _root_row(mongod)
 

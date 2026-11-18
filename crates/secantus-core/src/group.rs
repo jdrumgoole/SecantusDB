@@ -1966,6 +1966,68 @@ pub fn pipeline_prefix_fields(stages: &[Bson]) -> Option<std::collections::BTree
     None
 }
 
+/// The top-level fields a `$group` right behind an SBE sort reads by name
+/// when it also reads the whole document (`$$ROOT` / `$$CURRENT`): mongod's
+/// row then holds the document's slot and one slot for each of these
+/// (RM-615). `None` when the next stage is not such a `$group`.
+pub fn fields_beside_root(stages: &[Bson]) -> Option<std::collections::BTreeSet<String>> {
+    // The markers around the stages SBE runs are not stages.
+    let (name, spec) = stages
+        .iter()
+        .filter_map(|st| st.as_document()?.iter().next())
+        .find(|(name, _)| name.as_str() != crate::sbe::ENGINE_STAGE)?;
+    if name != "$group" {
+        return None;
+    }
+    let mut fields = std::collections::BTreeSet::new();
+    let mut root = false;
+    for (k, v) in spec.as_document()? {
+        let arg = if k == "_id" {
+            v
+        } else {
+            let acc = v.as_document().filter(|a| a.len() == 1)?;
+            let (op, arg) = acc.iter().next()?;
+            if !SIMPLE_ACCUMULATORS.contains(&op.as_str()) {
+                return None;
+            }
+            arg
+        };
+        if !collect_fields_and_root(arg, &mut fields, &mut root) {
+            return None;
+        }
+    }
+    root.then_some(fields)
+}
+
+/// [`collect_fields`], with a bare `$$ROOT` / `$$CURRENT` noted in `root`
+/// rather than refused.
+fn collect_fields_and_root(
+    expr: &Bson,
+    out: &mut std::collections::BTreeSet<String>,
+    root: &mut bool,
+) -> bool {
+    match expr {
+        Bson::String(s) if s == "$$ROOT" || s == "$$CURRENT" => {
+            *root = true;
+            true
+        }
+        Bson::Array(a) => a.iter().all(|e| collect_fields_and_root(e, out, root)),
+        Bson::Document(d) if !(d.len() == 1 && d.contains_key("$literal")) => {
+            if d.len() == 1 {
+                let k = d.keys().next().expect("one key");
+                if matches!(
+                    k.as_str(),
+                    "$getField" | "$setField" | "$unsetField" | "$function" | "$accumulator"
+                ) {
+                    return false;
+                }
+            }
+            d.values().all(|v| collect_fields_and_root(v, out, root))
+        }
+        _ => collect_fields(expr, out),
+    }
+}
+
 /// The top-level fields of each document that `stages` read before a stage
 /// that replaces the documents -- or `None` when they need whole documents
 /// (a stage this walk does not know, or the end of the pipeline, where the
@@ -3555,6 +3617,7 @@ pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<V
                 .values()
                 .all(|acc| collect_fields(acc, &mut fields));
         let sizing = crate::sorter::Sizing {
+            beside: None,
             sizes: None,
             source: crate::sorter::SortSource::BucketAuto,
             fields: bounded.then_some(&fields),
@@ -3797,6 +3860,20 @@ fn render(v: &Bson) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_group_reading_the_root_names_the_fields_read_beside_it() {
+        let stages = [
+            Bson::Document(doc! { crate::sbe::ENGINE_STAGE: false }),
+            Bson::Document(doc! { "$group": { "_id": "$k", "f": { "$first": "$$ROOT" } } }),
+        ];
+        let got = super::fields_beside_root(&stages).expect("a $$ROOT row");
+        assert_eq!(got.into_iter().collect::<Vec<_>>(), vec!["k".to_string()]);
+        let named = [Bson::Document(
+            doc! { "$group": { "_id": "$k", "f": { "$first": "$t" } } },
+        )];
+        assert_eq!(super::fields_beside_root(&named), None);
+    }
     use super::*;
     use bson::doc;
 
