@@ -2598,15 +2598,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
       does not add.
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_the_remaining_system_views
       Backlog-ID: RP-798
-- [ ] **`pg_get_viewdef` types a `name IN (text, unknown)` list as
-      text.** `create view v as select relname from pg_class where relname
-      in ('g'::text, 'h')` prints `(pg_class.relname = ANY
-      (ARRAY[('g'::text)::name, 'h'::name]))` on PostgreSQL 15.19:
-      `select_common_type` keeps the first type, `name`, because text and
-      name each coerce implicitly to the other. Here the printer takes
-      text (`(pg_class.relname)::text = ANY (ARRAY['g'::text, 'h'::text])`).
-      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_a_name_in_list_with_a_text_element
-      Backlog-ID: RP-1045
 
 ## Found while working RP-798 (2026-11-18)
 

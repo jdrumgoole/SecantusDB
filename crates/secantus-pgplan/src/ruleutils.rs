@@ -4222,7 +4222,27 @@ fn meet_types(o: &str, t: &str) -> Option<String> {
     if (o == "oid" && is_int(t)) || (is_int(o) && t == "oid") {
         return Some("oid".to_string());
     }
-    (is_stringish(o) && is_stringish(t)).then(|| "text".to_string())
+    if !(is_stringish(o) && is_stringish(t)) {
+        return None;
+    }
+    if o == "unknown" || t == "unknown" {
+        return Some("text".to_string());
+    }
+    // One category: the first type stays unless it is the preferred one's
+    // rival that only coerces one way -- the next type is taken when the
+    // first coerces to it implicitly and it does not coerce back. Among
+    // the string types only name -> varchar / bpchar is not implicit
+    // (assignment), so a varchar or bpchar meets name at name, and text
+    // (preferred) keeps itself (RP-1045).
+    let implicit = |from: &str, to: &str| !(from == "name" && matches!(to, "varchar" | "bpchar"));
+    Some(
+        if o != "text" && implicit(o, t) && !implicit(t, o) {
+            t
+        } else {
+            o
+        }
+        .to_string(),
+    )
 }
 
 /// `set_deparse_for_query`'s column naming over one level: the USING
@@ -6105,6 +6125,27 @@ pub fn statistics_expr_def_pretty(sql: &str, def: &TableDef) -> Option<String> {
 mod tests {
     use super::*;
     use secantus_pgcatalog::Column;
+
+    /// `select_common_type` over two string types, left to right, as
+    /// PostgreSQL 15.19 resolves `select 'a'::A union all select 'b'::B`
+    /// (RP-1045).
+    #[test]
+    fn string_types_meet_as_select_common_type_does() {
+        for (a, b, want) in [
+            ("varchar", "text", "varchar"),
+            ("text", "varchar", "text"),
+            ("varchar", "name", "name"),
+            ("name", "varchar", "name"),
+            ("bpchar", "name", "name"),
+            ("name", "text", "name"),
+            ("text", "name", "text"),
+            ("bpchar", "varchar", "bpchar"),
+            ("varchar", "bpchar", "varchar"),
+            ("name", "bpchar", "name"),
+        ] {
+            assert_eq!(meet_types(a, b).as_deref(), Some(want), "{a} meets {b}");
+        }
+    }
 
     fn cat_lookup(n: &str) -> Option<TableDef> {
         match n {
