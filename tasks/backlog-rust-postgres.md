@@ -2336,7 +2336,8 @@ The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
       or coerced as an `ARRAY[]` element, reports a field's domain error
       with no position.** `insert into tct(c) values ('(0,x)')` and
       `insert into tct(d) values ('{0}')` are 23514 at 28 on PostgreSQL
-      15.19, `update tct set c = '(0,x)'` at 20 and `select
+      15.19 (and `insert into tnn values ('{NULL}')`, `tnn(x nnint[])`,
+      23502 at 25), `update tct set c = '(0,x)'` at 20 and `select
       array['(0,x)']::ctp[]` at 14: `coerce_type` reads the literal with
       `record_in` / `array_in` under its parser error position. Here each
       has none. RP-552 recorded the literal's location for a TypeCast of
@@ -2344,12 +2345,6 @@ The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
       the write path and the `ARRAY[]` element coercion need the same.
       Verify: tests/backlog/test_rp_found_rp552.py::test_assigned_literal_domain_error_position
       Backlog-ID: RP-945
-- [ ] **A NULL element of a NOT NULL domain's array literal is accepted.**
-      `select '{NULL}'::nnint[]` is 23502 `domain nnint does not allow null
-      values` at 8 on PostgreSQL 15.19 (`array_in` reads each element with
-      `domain_in`, which refuses the NULL); here it is `{NULL}`.
-      Verify: tests/backlog/test_rp_found_rp552.py::test_not_null_domain_array_element
-      Backlog-ID: RP-946
 - [ ] **A composite column compared with an untyped literal reads the
       literal as the column's type.** `select * from tct where c =
       '(0,x)'` is 0A000 `input of anonymous composite types is not

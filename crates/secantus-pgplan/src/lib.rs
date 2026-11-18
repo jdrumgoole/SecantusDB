@@ -42070,7 +42070,13 @@ impl ArrayParser<'_> {
         };
         match self.input {
             Some(input) => input(value),
-            None if value == Bson::Null => Ok(Bson::Null),
+            // `domain_in` runs on a NULL element too, which a NOT NULL
+            // domain refuses (`'{NULL}'::nnint[]` is 23502 on 15.19,
+            // RP-946); any other type's NULL is the null element.
+            None if value == Bson::Null => {
+                domains::domain_check(self.element_type, &value)?;
+                Ok(Bson::Null)
+            }
             None => cast_value(value, self.element_type),
         }
     }
