@@ -2828,14 +2828,6 @@ statement is VALUES-only and runs there as written. The gap test is in
       Measured on the 15.19 reference on port 5415.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash join written inner side first is inner unique]
       Backlog-ID: RP-1030
-- [ ] **A structured EXPLAIN VERBOSE names no `Schema` on a scan.**
-      `explain (verbose, costs off, format json) select * from e` prints
-      `"Relation Name": "e", "Schema": "public", "Alias": "e"` in
-      PostgreSQL 15.19 (`ExplainScanTarget` adds the schema under
-      VERBOSE); here no `Schema` key, on every scan of every structured
-      format. Measured on the 15.19 reference on port 5415.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a structured verbose scan names its schema]
-      Backlog-ID: RP-1031
 - [ ] **A Limit over a Sort of a filtered scan is not priced.**
       PostgreSQL 15.19 prints `explain select a from k where a > 5 order by
       b desc limit 3` (`k` analysed, 1,000 rows) as `Limit

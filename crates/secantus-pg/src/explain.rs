@@ -1547,7 +1547,8 @@ fn costs_text(n: &PlanNode) -> String {
 
 /// The `QUERY PLAN` text rows, PostgreSQL's layout: a child at depth d is
 /// `2 + 6(d-1)` spaces and `->  `, and a node's details sit at `2 + 6d`.
-/// Name each scanned relation as `ExplainScanTarget` does (RP-1029): its bare name, the schema only under VERBOSE (the session's
+/// Name each scanned relation as `ExplainScanTarget` does (RP-1029,
+/// RP-1031): its bare name, the schema only under VERBOSE (the session's
 /// own temporary schema as `pg_temp`, `get_namespace_name_or_temp`), and
 /// the alias only when it differs from that bare name. The plan carries
 /// a relation's storage key (`q1.t`, `pg_temp_5.t`) until here.
@@ -1579,6 +1580,9 @@ pub(crate) fn name_relations(n: &mut PlanNode, verbose: bool) {
                 }
             }
             n.props[i].1 = bare;
+        }
+        if verbose && !n.props.iter().any(|(k, _)| k == "Schema") {
+            n.props.insert(i + 1, ("Schema".into(), schema));
         }
     }
     for c in &mut n.children {
@@ -3426,6 +3430,7 @@ mod join_type_tests {
         let mut verbose = scan("Seq Scan on pg_temp_5.t x");
         name_relations(&mut verbose, true);
         assert_eq!(verbose.name, "Seq Scan on pg_temp.t x");
+        assert_eq!(verbose.props[1], ("Schema".into(), "pg_temp".into()));
     }
 
     #[test]
