@@ -1880,6 +1880,27 @@ a regression test.
       side's ordered path in `unique_key_other_paths`), and since 2026-11-17
       bounds on both sides' keys (`where e.a > 998 and k.a < 2000`, the
       bound joining the inner's `Index Cond: ((a = e.a) AND (a < 2000))`).
+      Sized 2026-11-18: every three-table plan with an outer join over a
+      nested join prints zeros here, whatever its shape, including the
+      one whose order and methods already match
+      (`s left join (e join s s2 on e.a = s2.a) on ...` is PostgreSQL's
+      `Hash Left Join (cost=20.16..21.58 rows=30 width=47)` over a hashed
+      `Hash Join (cost=1.39..20.15 rows=1 width=27)`):
+      `hash_join_estimate` / `joined_sides` price only a two-leaf
+      `JoinNode::Join`. The work is a join search over the outer join's
+      sides with the nested join as one priced relation
+      (`make_rel_from_joinlist` keeps the outer join's order constraints),
+      then each method as `joincost.rs` prices it for two leaves. The
+      `on true` plan's arithmetic checks out from 15.19's own formulas:
+      `Materialize` over the 34.10 nest loop is 0.28..34.11
+      (`cost_material`, 2 x cpu_operator_cost per row), and the
+      `Nested Loop Left Join` 0.28..36.16 (outer 1.30, inner 33.83 run,
+      29 rescans of 0.005, 60 x cpu_tuple_cost). The `k.b = 'v3'` plan is
+      `Hash Right Join (cost=1.68..1669.42 rows=1000 width=34)` over
+      `Nested Loop (cost=0.00..1532.75 rows=33333)` and a `Materialize
+      (cost=0.00..18.00 rows=100)` of `k`. Under ANALYZE the executor runs
+      a different tree from the one printed, so the actuals need the
+      executed shape to follow the chosen one.
       Measured on a private 15.19 cluster (found while working RP-393 and RP-397).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends]
       Backlog-ID: RP-978
