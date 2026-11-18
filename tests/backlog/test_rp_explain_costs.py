@@ -6320,14 +6320,25 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Filter: (c ~ '^(w0){2,}1'::text)",
         ],
     ),
-    # Still open: a group repeated within a bounded range prints zeros.
+    # Fixed: a group repeated within a bounded range printed zeros; it
+    # fixes no character of the prefix.
     "estimate of a regex match with a group repeated within a bounded range": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_STRINGS,
         "explain select * from w where c ~ '^(w0){1,2}1'",
         [
             "Seq Scan on w  (cost=0.00..18.50 rows=101 width=10)",
             "  Filter: (c ~ '^(w0){1,2}1'::text)",
+        ],
+    ),
+    # Still open: an anchor inside a group prints zeros.
+    "estimate of a regex match with an anchor inside a group": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '^(?:^w0)1'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=101 width=10)",
+            "  Filter: (c ~ '^(?:^w0)1'::text)",
         ],
     ),
     # Still open: a LIKE's ESCAPE is a `like_escape` call PostgreSQL folds

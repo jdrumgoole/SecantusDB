@@ -946,8 +946,7 @@ type QuantifiedAtom = (ReAtom, u32, Option<u32>);
 /// An atom bounded `{0}` is no atom. The prefix is exact when a `$` ends
 /// the regex right after it, and status `None` (`REG_NOMATCH`) when the
 /// regex is not anchored, alternates at its top, or fixes no first
-/// character. `None` for a regex whose NFA this does not model: a group
-/// repeated within a bounded range, a constraint or anchor anywhere but
+/// character. `None` for a regex whose NFA this does not model: a constraint or anchor anywhere but
 /// a leading `^` and a trailing `$`, a back reference to a group not
 /// yet closed or quantified, a numeric character escape, embedded
 /// options or a director.
@@ -1092,7 +1091,10 @@ fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String,
                     walk(&once, prefix, insensitive, case_varies)?;
                     return Some(false);
                 }
-                ReAtom::Group(..) => return None,
+                // `x{m,n}` with m < n: 15.19 fixes no character of it,
+                // capturing or not, whatever m is (`^x(ab){2,3}c` is `x`,
+                // `^(ab){1,3}` none) -- a choice at once (RP-423).
+                ReAtom::Group(..) => return Some(false),
             }
         }
         Some(true)
@@ -1818,10 +1820,18 @@ mod tests {
             // loop's choice.
             ("^(?:ab)+c", false, Some(("ab", Partial))),
             ("^x(?:ab)+y", false, Some(("xab", Partial))),
-            // Not modelled: a group repeated within a bounded range
-            // (`^(ab){1,3}` fixes no prefix on PostgreSQL 15.19), an
-            // anchor inside, a back reference to an unclosed group.
-            ("^(ab){1,3}", false, None),
+            // A group repeated within a bounded range fixes nothing of
+            // itself (PostgreSQL 15.19, a "C" column's Index Cond).
+            ("^(ab){1,3}", false, Some(("", NoMatch))),
+            ("^(w0){1,2}1", false, Some(("", NoMatch))),
+            ("^(?:ab){1,2}c", false, Some(("", NoMatch))),
+            ("^(ab){0,2}c", false, Some(("", NoMatch))),
+            ("^x(ab){1,2}", false, Some(("x", Partial))),
+            ("^xy(?:ab){2,4}c", false, Some(("xy", Partial))),
+            ("^x(a){2,5}", false, Some(("x", Partial))),
+            ("^(ab|ac){1,2}", false, Some(("", NoMatch))),
+            // Not modelled: an anchor inside, a back reference to an
+            // unclosed group.
             ("(^a)", false, None),
             ("^a\\1", false, None),
             // A back reference is a copy of the group it names, as

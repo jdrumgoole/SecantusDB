@@ -1896,14 +1896,15 @@ a regression test.
       regex match filters (the join's WHERE patterns collected by
       `explain_join_patterns`). Still zeros: a call of a function whose
       overloads differ in `procost`; a regex whose prefix walk is not
-      modelled (a group repeated within a bounded range, an anchor inside
-      a group, embedded options). A back reference is walked as a copy of
+      modelled (an anchor inside a group, embedded options). A back reference is walked as a copy of
       the group it names since 2026-11-17, as the regex compiler copies it,
       and since 2026-11-17 a group repeated `+` (a capturing one is
       `parseqatom`'s `x*x`, its prefix the group's first character; a
       non-capturing one a whole copy), and since 2026-11-18 a group
       repeated `{m,}` with m of 2 or more (one whole copy: `repeat`
-      builds `x{m-1,}x` down to `x+`). Since 2026-11-17 an
+      builds `x{m-1,}x` down to `x+`), and since 2026-11-18 a group
+      repeated within a bounded range, which fixes no character of
+      itself (`^x(ab){1,2}` `x`, `^(ab){1,3}` none). Since 2026-11-17 an
       inner ON join whose WHERE pushes expression comparisons to its sides
       prices each side as that scan's residual
       (`ExplainOptions::join_expr_quals`, `hash_side_with`), and since
@@ -1912,10 +1913,9 @@ a regression test.
       reads; since 2026-11-17 a LEFT join whose WHERE compares only
       preserved-side expressions (`preserved_exprs`), and an inner ON
       join whose WHERE holds inequalities over both tables, its Join
-      Filter (`where_join_filters`). A regex with a group repeated within
-      a bounded range (`select * from w where c ~ '^(w0){1,2}1'`) is `Seq
-      Scan on w (cost=0.00..18.50 rows=101 width=10)` there and zeros
-      here. Measured
+      Filter (`where_join_filters`). A regex with an anchor inside a
+      group (`select * from w where c ~ '^(?:^w0)1'`) is `Seq Scan on w
+      (cost=0.00..18.50 rows=101 width=10)` there and zeros here. Measured
       on the 15.19 reference on port 5415 (found while working RP-404 and
       RP-354). The repeated group's prefix is not a walk of the regex's
       text: `pg_regprefix` reads the NFA after `regc_nfa.c`'s `optimize`
@@ -1927,7 +1927,7 @@ a regression test.
       `repeat`'s arcs gives (`aba`). The faithful fix ports `regcomp.c` /
       `regc_nfa.c`'s NFA build and optimisation and runs `findprefix` on
       it (2026-11-17, sized while working RP-841).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with a group repeated within a bounded range]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with an anchor inside a group]
       Backlog-ID: RP-423
 - [ ] **A semi join cheaper unique-ified keeps the semi join's shape.**
       Since RP-411's first slice (2026-11-16) a WHERE that is one
