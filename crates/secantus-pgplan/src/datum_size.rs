@@ -59,7 +59,7 @@ fn align(n: usize, a: usize) -> usize {
 /// A `numeric`'s datum: 4-byte header, then the short form's 2-byte header
 /// (scale and weight both small) or the long form's 4, then its base-10000
 /// digits with leading and trailing zero groups dropped.
-fn numeric_size(text: &str) -> usize {
+pub fn numeric_size(text: &str) -> usize {
     let t = text.trim();
     if matches!(t, "NaN" | "Infinity" | "-Infinity") {
         return 6;

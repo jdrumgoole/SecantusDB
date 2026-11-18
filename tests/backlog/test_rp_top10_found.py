@@ -1262,11 +1262,11 @@ def test_a_btree_gin_timestamp_index_has_its_pages(pg: Any, typ: str) -> None:
     assert got == ("ok", [(16,)])
 
 
-@pytest.mark.backlog("RP-287")
+@pytest.mark.backlog_fixed("RP-287")
 def test_a_btree_gin_numeric_index_has_its_pages(pg: Any) -> None:
-    """A btree_gin index over a `numeric` column is not modelled (its keys
+    """A btree_gin index over a `numeric` column was not modelled (its keys
     are varlena `numeric`s ordered by `cmp_numerics`): PostgreSQL 15.19
-    sizes this one at 15 pages; here `pg_relation_size` reads 0."""
+    sizes this one at 15 pages; here `pg_relation_size` read 0."""
     got = _in_block(
         pg,
         [
@@ -1278,3 +1278,42 @@ def test_a_btree_gin_numeric_index_has_its_pages(pg: Any) -> None:
         "select pg_relation_size('rp287_bni') / 8192",
     )
     assert got == ("ok", [(15,)])
+
+
+@pytest.mark.backlog_fixed("RP-287")
+def test_a_btree_gin_numeric_index_of_wide_values_and_nan_has_its_pages(pg: Any) -> None:
+    """Wide, negative and NaN `numeric` keys: each key's varlena size
+    follows its base-10000 digits, and NaN sorts above every number.
+    PostgreSQL 15.19 sizes this index at 175 pages."""
+    got = _in_block(
+        pg,
+        [
+            "create extension if not exists btree_gin",
+            "create table rp287_bw (a numeric)",
+            "insert into rp287_bw select case when g % 97 = 0 then 'NaN'::numeric"
+            " else (g - 5000) * 12345.678901::numeric / (g % 13 + 1) end"
+            " from generate_series(1, 20000) g",
+            "create index rp287_bwi on rp287_bw using gin (a)",
+        ],
+        "select pg_relation_size('rp287_bwi') / 8192",
+    )
+    assert got == ("ok", [(175,)])
+
+
+@pytest.mark.backlog("RP-287")
+def test_a_btree_gin_interval_index_has_its_pages(pg: Any) -> None:
+    """A btree_gin index over an `interval` column is not modelled (16-byte
+    keys ordered by `interval_cmp_internal`): PostgreSQL 15.19 sizes this
+    one at 177 pages; here `pg_relation_size` reads 0."""
+    got = _in_block(
+        pg,
+        [
+            "create extension if not exists btree_gin",
+            "create table rp287_bi (a interval)",
+            "insert into rp287_bi select make_interval(days => g % 500, secs => g % 61)"
+            " from generate_series(1, 20000) g",
+            "create index rp287_bii on rp287_bi using gin (a)",
+        ],
+        "select pg_relation_size('rp287_bii') / 8192",
+    )
+    assert got == ("ok", [(177,)])

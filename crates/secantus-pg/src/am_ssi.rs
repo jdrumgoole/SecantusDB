@@ -196,7 +196,27 @@ impl ElemOps {
                 | "timestamp without time zone"
                 | "timestamptz"
                 | "timestamp with time zone"
+                | "numeric"
+                | "decimal"
         )
+    }
+
+    /// `numeric`'s keys: varlena datums compared by `cmp_numerics`.
+    fn is_numeric(&self) -> bool {
+        matches!(self.elem.as_str(), "numeric" | "decimal")
+    }
+
+    /// The key's bytes as a varlena's data (its header excluded): a
+    /// string's encoded bytes, or a `numeric`'s digits and header.
+    fn varlena_len(&self, v: &Bson) -> usize {
+        if self.is_numeric() {
+            let text = secantus_pgplan::numeric::numeric_text(v).unwrap_or_else(|| v.to_string());
+            return secantus_pgplan::datum_size::numeric_size(&text) - 4;
+        }
+        match v {
+            Bson::String(s) => secantus_pgplan::server_encoding::bytes(s).len(),
+            other => other.to_string().len(),
+        }
     }
 
     /// `jsonb_ops`' keys are `text` too: a flag byte, then the string;
@@ -244,11 +264,8 @@ impl ElemOps {
     fn multi_key_size(&self, v: &Bson) -> usize {
         const AFTER_ATTNUM: usize = 8 + 2;
         let align = |n: usize, a: usize| (n + a - 1) & !(a - 1);
-        if self.textual() {
-            let len = match v {
-                Bson::String(s) => secantus_pgplan::server_encoding::bytes(s).len(),
-                other => other.to_string().len(),
-            };
+        if self.textual() || self.is_numeric() {
+            let len = self.varlena_len(v);
             let end = if len < 127 {
                 AFTER_ATTNUM + 1 + len
             } else {
@@ -346,6 +363,15 @@ impl KeyOps for GinOps {
 /// One column's opclass alone, as a one-column index has it (`att` 0).
 impl KeyOps for ElemOps {
     fn cmp(&self, _: u16, a: &Bson, b: &Bson) -> std::cmp::Ordering {
+        if self.is_numeric() {
+            // `cmp_numerics`: NaN equal to itself and above every number.
+            let text = |v: &Bson| secantus_pgplan::numeric::numeric_operand_text(v);
+            if let (Some(x), Some(y)) = (text(a), text(b)) {
+                if let Some(o) = secantus_pgplan::numeric::compare_decimal_text(&x, &y) {
+                    return o;
+                }
+            }
+        }
         match (a, b) {
             (Bson::Int32(x), Bson::Int32(y)) => x.cmp(y),
             (Bson::Int64(x), Bson::Int64(y)) => x.cmp(y),
@@ -365,11 +391,8 @@ impl KeyOps for ElemOps {
     }
 
     fn key_size(&self, _: u16, v: &Bson) -> usize {
-        if self.textual() {
-            let len = match v {
-                Bson::String(s) => secantus_pgplan::server_encoding::bytes(s).len(),
-                other => other.to_string().len(),
-            };
+        if self.textual() || self.is_numeric() {
+            let len = self.varlena_len(v);
             // A short varlena header when it fits one byte.
             let data = if len < 127 { 1 + len } else { 4 + len };
             return (8 + data + 7) & !7;
@@ -378,10 +401,7 @@ impl KeyOps for ElemOps {
     }
 
     fn datum_size(&self, _: u16, v: &Bson) -> Option<usize> {
-        self.textual().then(|| match v {
-            Bson::String(s) => 4 + secantus_pgplan::server_encoding::bytes(s).len(),
-            other => 4 + other.to_string().len(),
-        })
+        (self.textual() || self.is_numeric()).then(|| 4 + self.varlena_len(v))
     }
 }
 
