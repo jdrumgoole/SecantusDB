@@ -1586,14 +1586,40 @@ def test_a_grouped_time_series_read_counts_what_it_examined(
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-363")
+@pytest.mark.backlog_fixed("RM-363")
+@pytest.mark.parametrize(
+    "pipeline",
+    [
+        [{"$match": {}}, {"$group": {"_id": 1, "n": {"$sum": 1}}}],
+        [{"$group": {"_id": None, "n": {"$sum": 1}}}],
+        [{"$group": {"_id": "a", "n": {"$count": {}}}}],
+    ],
+    ids=["count_documents", "null", "string"],
+)
 def test_a_counted_time_series_read_counts_what_it_examined(
+    rust_mongo: Any, mongod_rs: Any, pipeline: list
+) -> None:
+    """mongod 8.2.11 runs a `$group` on a constant that only counts (what
+    `count_documents` sends) over the buckets in the classic engine, and
+    its line counts the five it examined. This server read the collection
+    whole under that `$group`, and counted nothing, until it read such a
+    pipeline through its cursor stage (RM-363)."""
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.aggregate(pipeline)), _series)
+    answers = {s: _counts(_line(lines, "aggregate")) for s, (lines, _) in got.items()}
+    assert "docsExamined" in answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog("RM-363")
+def test_a_count_stage_time_series_read_counts_what_it_examined(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
-    """mongod 8.2.11's line for `count_documents` over five buckets counts
-    what it examined. This server reads a time-series collection whole
-    under that `$group`, and counts nothing."""
-    got = _both(rust_mongo, mongod_rs, lambda d: d.ts.count_documents({}), _series)
+    """mongod 8.2.11 runs `{$count: "n"}` over five buckets as a constant
+    `$group` and a `$project`, and its line counts the five it examined
+    (measured 2026-11-18). This server reads the collection whole under a
+    `$count`, and counts nothing."""
+    pipeline = [{"$count": "n"}]
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.aggregate(pipeline)), _series)
     answers = {s: _counts(_line(lines, "aggregate")) for s, (lines, _) in got.items()}
     assert "docsExamined" in answers["mongod"]
     assert answers["rust"] == answers["mongod"]
