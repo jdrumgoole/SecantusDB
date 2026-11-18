@@ -37,6 +37,10 @@ pub struct SemiJoin {
     /// The WHERE's other conjuncts, over the outer relation alone, as its
     /// scan's `Filter` prints them (empty: the WHERE is the sublink).
     pub outer_quals: Vec<(String, Option<String>)>,
+    /// The conjuncts of `outer_quals` that do not lower to the scan's
+    /// filter, comparisons of expressions with constants the scan runs per
+    /// row (RP-411, as `ExplainOptions::scan_expr_quals`).
+    pub outer_exprs: Vec<ExprQual>,
     /// The EXPLAIN of the inner join `reduce_unique_semijoins` makes of
     /// it when the inner relation is unique on `inner_col` (RP-411):
     /// `outer JOIN inner ON outer.col = inner.col`, the select list read
@@ -200,16 +204,19 @@ pub(crate) fn semi_join_of(
     if !rest.iter().all(|n| outer_only(n, &outer_name, &outer_def)) {
         return None;
     }
-    // Only conjuncts the scan's filter holds whole: one the executor keeps
-    // as a residual expression is not priced by that filter, and its cost
-    // per row is not modelled here.
-    let outer_quals = match and_of(rest) {
-        Some(w) => {
-            let Ok((_, None)) = lower_where_or_residual(&w, &outer_def, &[]) else {
-                return None;
-            };
-            ruleutils::explain_conjuncts(&w, &outer_def)?
+    // A conjunct the scan's filter does not hold whole is priced as a
+    // comparison of an expression with a constant, per row; any other is
+    // not modelled.
+    let mut outer_exprs = Vec::new();
+    for p in &rest {
+        match lower_where_nonvolatile(p, &outer_def, &[]) {
+            Ok(_) => {}
+            Err(Error::Unsupported(_)) => outer_exprs.push(expr_qual(p, &outer_def)?),
+            Err(_) => return None,
         }
+    }
+    let outer_quals = match and_of(rest) {
+        Some(w) => ruleutils::explain_conjuncts(&w, &outer_def)?,
         None => Vec::new(),
     };
     let Some(N::SelectStmt(sub)) = link.subselect.as_deref()?.node.as_ref() else {
@@ -277,6 +284,7 @@ pub(crate) fn semi_join_of(
         inner_col,
         outer_col,
         outer_quals,
+        outer_exprs,
         inner_join: None,
     }))
 }

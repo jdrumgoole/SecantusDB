@@ -4920,7 +4920,7 @@ fn qual_permutation(
         _ => None,
     };
     // Any other clause built only of what `cost_qual_eval` prices by its
-    // operators (RP-406): those operators, and one more per coercion of a
+    // operators and calls (RP-406): those, and one more per coercion of a
     // column the printer shows (`(a)::numeric`, a function call; a
     // relabelling to text is free). An equality stays unmodelled: it
     // joins an equivalence class, which is placed otherwise.
@@ -4941,10 +4941,9 @@ fn qual_permutation(
             Ok(())
         });
         let n = &bare;
-        if !crate::joins::priced_by_operator_count(n) {
-            return None;
-        }
-        let cost = (crate::joins::qual_operators(n) + column_coercions(text, types) as f64) * OP;
+        // A call of a built-in costs its `procost` (RP-411).
+        let ops = crate::joins::bound_operand_cost(n)?;
+        let cost = (ops + column_coercions(text, types) as f64) * OP;
         if let Some(N::AExpr(e)) = n.node.as_ref() {
             if e.kind == AExprKind::AexprOp as i32 && crate::operator_name(e).ok()? == "=" {
                 // An expression equal to a constant joins an equivalence

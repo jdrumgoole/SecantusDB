@@ -5399,7 +5399,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # An outer qual over an expression beside the sublink: its scan's
     # filter is priced with the expression's cost, measured on 15.19.
     "a sublink anded with an outer expression qual is planned as a join": (
-        "RP-411",
+        "RP-411:fixed",
         _ANALYSED_THIRTY,
         "explain select * from e where b in (select b from k) and length(b) > 1 and a > 5",
         [
@@ -5411,6 +5411,33 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  HashAggregate  (cost=17.50..17.60 rows=10 width=3)",
             "              Group Key: k.b",
             "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=3)",
+        ],
+    ),
+    # A scan's filter in `order_qual_clauses`' order, a built-in call
+    # costing its `procost`, measured on 15.19 (RP-411).
+    "a scan's filter puts a cheaper qual before a call": (
+        "RP-411:fixed",
+        _ANALYSED,
+        "explain select * from e where length(b) > 1 and a > 5",
+        [
+            "Seq Scan on e  (cost=0.00..22.50 rows=332 width=7)",
+            "  Filter: ((a > 5) AND (length(b) > 1))",
+        ],
+    ),
+    # A sublink whose subquery has its own WHERE, measured on 15.19.
+    "an in subquery with its own where is planned as a join": (
+        "RP-411",
+        _ANALYSED,
+        "explain select * from e where b in (select b from k where a > 500)",
+        [
+            "Hash Join  (cost=18.98..47.73 rows=1000 width=7)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=18.85..18.85 rows=10 width=3)",
+            "        ->  HashAggregate  (cost=18.75..18.85 rows=10 width=3)",
+            "              Group Key: k.b",
+            "              ->  Seq Scan on k  (cost=0.00..17.50 rows=500 width=3)",
+            "                    Filter: (a > 500)",
         ],
     ),
     # Planned as the inner join `reduce_unique_semijoins` makes of it.

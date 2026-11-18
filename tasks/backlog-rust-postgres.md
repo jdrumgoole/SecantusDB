@@ -1980,16 +1980,17 @@ a regression test.
       as that `Hash Join`. Still open: (1) Merge and nested-loop semi
       joins, the unique-ified side as the outer one, and a side read through
       an index, are not priced. (2) Wider shapes still print the scan: a
-      sublink ANDed with an outer conjunct the scan's filter does not hold
-      whole (`select * from e where b in (select b from k) and length(b) >
-      1 and a > 5` is the unique-ified `Hash Join (cost=17.73..44.79 rows=332 width=7)`, its
-      scan `cost=0.00..22.50` with the expression's cost per row, on a
-      private 15.19 cluster), a subquery with its own WHERE, a cross-type
-      comparison. Conjuncts that lower wholly to the outer scan's filter
+      subquery with its own WHERE (`select * from e where b in (select b
+      from k where a > 500)` is the unique-ified `Hash Join
+      (cost=18.98..47.73 rows=1000 width=7)`, `Filter: (a > 500)` on k's
+      scan, on a private 15.19 cluster), a cross-type comparison, and an
+      outer conjunct other than a comparison of an expression with a
+      constant that the scan's filter does not hold whole. Outer conjuncts
       are pulled up with the sublink and filter that scan
-      (`sublink_join::split_where`).
+      (`sublink_join::split_where`); one that does not lower is priced as an
+      `ExprQual` (`SemiJoin::outer_exprs`).
       Backlog-ID: RP-411
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sublink anded with an outer expression qual is planned as a join]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery with its own where is planned as a join]
 - [ ] **An aggregate above an InitPlan's scan is a Subquery Scan.** Since
       RP-440's first slices (2026-11-16) a SELECT over one relation whose WHERE
       compares columns with uncorrelated FROM-less scalar subqueries plans
