@@ -427,3 +427,41 @@ def test_on_conflict_infers_a_bpchar_unique_index(
         f"insert into w values ('y', 2) on conflict (a){where} do update set b = excluded.b "
         "returning octet_length(a), b",
     ) == [(2, 2)]
+
+
+# Step 4: an `=` over a `bpchar` key reads the trimmed key -- `_id` for the
+# PRIMARY KEY, the expression index's field for a UNIQUE -- so it is an index
+# scan, and every comparison there is `bpchareq` / `bpcharlt` (blanks
+# ignored), or a text comparison of `a::text` against a `text` constant.
+
+
+@pytest.mark.parametrize(
+    ("ddl", "index"), [("a bpchar primary key", "t_pkey"), ("a bpchar unique", "t_a_key")]
+)
+def test_an_indexed_equality_reads_the_trimmed_key(
+    connection: psycopg.Connection, ddl: str, index: str
+) -> None:
+    c = connection
+    c.execute(f"create table t ({ddl}, b int)")
+    c.execute("insert into t select 'k'||i, i from generate_series(1, 2000) i")
+    c.execute("insert into t values ('m', -2)")
+    _copy(c, "t", "k  \t-1\n")
+    c.execute("analyze t")
+    plan = [r[0] for r in c.execute("explain (costs off) select b from t where a = 'k'")]
+    assert plan == [f"Index Scan using {index} on t", "  Index Cond: (a = 'k'::bpchar)"]
+    for where, want in (
+        ("a = 'k'", [(-1,)]),
+        ("a = 'k  '::bpchar", [(-1,)]),
+        ("a in ('k', 'zz')", [(-1,)]),
+        ("a = 'k'::text", [(-1,)]),
+        ("a = 'k '::text", []),
+        ("a < 'k '", []),
+        ("a <> 'k' and b < 0", [(-2,)]),
+    ):
+        assert _rows(c, f"select b from t where {where} order by b") == want, where
+    assert _rows(c, "select count(*)::int from t where a > 'k1999'") == [(890,)]
+    assert _rows(c, "select b from t where a = %s::bpchar", ("k   ",)) == [(-1,)]
+    assert _rows(c, "select b from t where a = %s::text", ("k ",)) == []
+    c.execute("update t set b = -10 where a = 'k '")
+    c.execute("delete from t where a = 'm   '")
+    assert _rows(c, "select octet_length(a), b from t where b < 0") == [(3, -10)]

@@ -2284,7 +2284,7 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       row's value as written -- LANDED 2026-11-18, below; (2) UNIQUE --
       LANDED 2026-11-18, below; (3)
       ON CONFLICT on a UNIQUE arbiter -- LANDED 2026-11-18, below; (4) an indexed and a pushed-down
-      `=`; (5) the write keeping the blanks of every unsized `bpchar`
+      `=` -- LANDED 2026-11-18, below; (5) the write keeping the blanks of every unsized `bpchar`
       column.
       Step 1 as built (2026-11-18): a single-column unsized `bpchar`
       PRIMARY KEY made by CREATE TABLE gets `field_override` = its own
@@ -2352,6 +2352,23 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       UNIQUE collision shows the NEW row's key as written (`Key (a)=(k  )
       already exists.` for `'k'` then `'k  '`), and the ON CONFLICT row
       keeps `octet_length(a)` 3.
+      Step 4 as built (2026-11-18): a top-level comparison of a bare
+      `bpchar` column against a constant reads its trimmed key when it has
+      one -- `_id` for a written `bpchar` PRIMARY KEY, the step-2
+      expression index's field for a UNIQUE (`expr_where::rewrite`, which
+      already served `lower(t) = 'x'`) -- as a `bpchar` field, so the
+      constant is trimmed (`bpchar_operand`) and the filter is `bpchareq`
+      / `bpcharlt` pushed down, or a text comparison against a `text`
+      constant, the field being exactly `a::text`. EXPLAIN shows `Index
+      Scan using t_pkey` / `t_a_key` as 15.19 does (was `Seq Scan`). An
+      OR, or a column with no trimmed key, is still evaluated per row
+      (`keeps_bpchar_blanks`). Left for step 5: a plain (non-unique)
+      CREATE INDEX on an unsized `bpchar` is a storage index over the
+      value, right only while every write trims; it must become a trimmed
+      key, as a UNIQUE made before step 2 must, before the write keeps
+      blanks. An `=` ANDed with another filter is a Seq Scan in EXPLAIN
+      for every index (RP-1070). Tests: the step-4 test in
+      `tests/test_rust_pg_bpchar_key.py`.
       Verify: tests/backlog/test_rp_found_rp672.py::test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks
       Backlog-ID: RP-693
 
@@ -2373,6 +2390,17 @@ test is in `tests/backlog/test_rp_found_rp693.py`.
       it instead.
       Verify: tests/backlog/test_rp_found_rp693.py::test_copy_completes_its_own_xid
       Backlog-ID: RP-1069
+
+- [ ] **OPEN -- EXPLAIN shows a Seq Scan for an indexed `=` ANDed with a
+      filter.** `explain (costs off) select b from tp where a = 'x1' and
+      b < 0` over a 2,000-row `text` PRIMARY KEY (analyzed) is `Seq Scan
+      on tp / Filter: ((b < 0) AND (a = 'x1'::text))` here; 15.19 is `Index
+      Scan using tp_pkey on tp / Index Cond: (a = 'x1'::text) / Filter:
+      (b < 0)`. The `=` alone is an Index Scan on both; an expression index
+      (`lower(t) = 'x1' and b < 0`) and a `bpchar` key (RP-693 step 4) show
+      the same Seq Scan. Only the plan text differs: the rows are right.
+      Verify: tests/backlog/test_rp_found_rp693.py::test_explain_indexed_equality_with_a_filter
+      Backlog-ID: RP-1070
 
 ## Found while working RP-665 (2026-11-10)
 

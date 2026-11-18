@@ -66,16 +66,29 @@ pub(crate) fn rewrite(
     if def.name.is_empty() {
         return None;
     }
-    let indexes: Vec<(String, String)> = indexes_of(&def.name)
+    let mut indexes: Vec<(String, String)> = indexes_of(&def.name)
         .into_iter()
         .filter_map(|(sql, field)| Some((normalized_expression(&sql)?, field)))
         .collect();
+    // An unsized `bpchar` PRIMARY KEY keeps the value as written in its own
+    // field and its key, trimmed, in `_id` (RP-693): `_id` is its index.
+    for c in def.columns.iter().filter(|c| c.is_written_bpchar_key()) {
+        if let Some(sql) = normalized_expression(&scalar::quote_identifier(&c.name)) {
+            indexes.push((sql, "_id".to_string()));
+        }
+    }
     if indexes.is_empty() {
         return None;
     }
     let field_of = |n: &pg_query::protobuf::Node| -> Option<String> {
-        if matches!(n.node.as_ref(), Some(N::ColumnRef(_))) {
-            return None;
+        // A bare column reads its own field, unless it is a `bpchar` keyed
+        // trimmed (`bcTruelen`): its index field holds exactly `a::text`,
+        // so a comparison against it is `bpchareq` / `bpcharlt` (RP-693).
+        if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+            let col = column_ref_name(c).and_then(|name| def.column(&name))?;
+            if col.pg_type != "bpchar" {
+                return None;
+            }
         }
         let printed = deparse_expr(n).ok()?;
         indexes
@@ -134,6 +147,10 @@ pub(crate) fn rewrite(
     let mut extended = def.clone();
     for (sql, field) in &indexes {
         if !used.contains(field) || extended.column(field).is_some() {
+            continue;
+        }
+        if field == "_id" {
+            extended.columns.push(Column::new(field, "bpchar", false));
             continue;
         }
         let ty = plan_check_expression(sql, def)

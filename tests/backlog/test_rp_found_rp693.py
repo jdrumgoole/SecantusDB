@@ -50,3 +50,27 @@ def test_copy_completes_its_own_xid(dsn: str) -> None:
             assert answer == [(2,)]
         finally:
             c.execute(f"drop table {table}")
+
+
+@pytest.mark.backlog("RP-1070")
+def test_explain_indexed_equality_with_a_filter(dsn: str) -> None:
+    table = f"ix_and_{uuid.uuid4().hex[:8]}"
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(f"create table {table} (a text primary key, b int)")
+        try:
+            c.execute(f"insert into {table} select 'x'||i, i from generate_series(1, 2000) i")
+            c.execute(f"analyze {table}")
+            plan = [
+                r[0]
+                for r in c.execute(
+                    f"explain (costs off) select b from {table} where a = 'x1' and b < 0"
+                ).fetchall()
+            ]
+            # 15.19.
+            assert plan == [
+                f"Index Scan using {table}_pkey on {table}",
+                "  Index Cond: (a = 'x1'::text)",
+                "  Filter: (b < 0)",
+            ]
+        finally:
+            c.execute(f"drop table {table}")
