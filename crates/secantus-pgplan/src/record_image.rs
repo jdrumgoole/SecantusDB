@@ -12,8 +12,9 @@
 //! and records of different widths that agree on every common field are
 //! 42804. A field type whose image this module does not model is refused
 //! by name (0A000) rather than compared some other way.
-//! Modelled: the integers, oid, bool, the floats, numeric, date, the
-//! timestamps, uuid, text / varchar / bpchar and bytea.
+//! Modelled: the integers, oid, bool, `"char"`, the floats, numeric, date,
+//! time, timetz, the timestamps, interval, uuid, macaddr / macaddr8, inet /
+//! cidr, tid, pg_lsn, name, text / varchar / bpchar and bytea.
 
 use std::cmp::Ordering;
 
@@ -177,6 +178,73 @@ fn image(v: &Bson, ty: &str) -> Result<Image> {
             Bson::String(t) => Image::Bytes(crate::uuid_to_wire(t).ok_or_else(refused)?),
             _ => return Err(refused()),
         },
+        // `TimeADTGetDatum`: int64 microseconds since midnight.
+        "time" | "time without time zone" => {
+            Image::ByValue(crate::hashfn::time_micros(v).map_err(|_| refused())? as u64)
+        }
+        // `TimeTzADT`, attlen 12: the int64 time, then the int32 zone in
+        // seconds west of Greenwich, as they lie in memory.
+        "timetz" | "time with time zone" => {
+            let (micros, zone) = crate::hashfn::timetz_parts(v).map_err(|_| refused())?;
+            let mut b = micros.to_le_bytes().to_vec();
+            b.extend_from_slice(&zone.to_le_bytes());
+            Image::Bytes(b)
+        }
+        // `Interval`, attlen 16: int64 time, int32 day, int32 month. So
+        // `1 day` and `24 hours` differ.
+        "interval" => {
+            let iv = crate::Interval::from_bson(
+                &crate::cast_value(v.clone(), "interval").map_err(|_| refused())?,
+            )
+            .ok_or_else(refused)?;
+            let mut b = iv.micros.to_le_bytes().to_vec();
+            b.extend_from_slice(&iv.days.to_le_bytes());
+            b.extend_from_slice(&iv.months.to_le_bytes());
+            Image::Bytes(b)
+        }
+        // `NameData`, attlen 64: the name NUL-padded to NAMEDATALEN.
+        "name" => match v {
+            Bson::String(s) => {
+                let mut b = s.as_bytes().to_vec();
+                b.resize(64, 0);
+                Image::Bytes(b)
+            }
+            _ => return Err(refused()),
+        },
+        // `CharGetDatum`: one byte.
+        "\"char\"" => {
+            let t = crate::hashfn::text_of(v, "\"char\"").map_err(|_| refused())?;
+            Image::ByValue(u64::from(t.bytes().next().unwrap_or(0)))
+        }
+        // Fixed-length by reference: attlen 6 and 8, the address bytes.
+        "macaddr" | "macaddr8" => {
+            let t = crate::hashfn::text_of(v, ty).map_err(|_| refused())?;
+            Image::Bytes(crate::hashfn::hex_bytes(&t).map_err(|_| refused())?)
+        }
+        // A varlena `inet_struct`: family, bits, then the address.
+        "inet" | "cidr" => {
+            let t = crate::hashfn::text_of(v, ty).map_err(|_| refused())?;
+            Image::Bytes(crate::hashfn::inet_bytes(&t).map_err(|_| refused())?)
+        }
+        // `ItemPointerData`, attlen 6: `bi_hi`, `bi_lo`, `ip_posid`.
+        "tid" => {
+            let n = match crate::cast_value(v.clone(), "tid").map_err(|_| refused())? {
+                Bson::Int64(n) => n,
+                Bson::Int32(n) => i64::from(n),
+                _ => return Err(refused()),
+            };
+            let (block, offset) = ((n >> 16) as u32, (n & 0xffff) as u16);
+            let mut b = ((block >> 16) as u16).to_le_bytes().to_vec();
+            b.extend_from_slice(&(block as u16).to_le_bytes());
+            b.extend_from_slice(&offset.to_le_bytes());
+            Image::Bytes(b)
+        }
+        // `LSNGetDatum`: the uint64 position.
+        "pg_lsn" => Image::ByValue(
+            crate::systypes::lsn_of(v)
+                .or_else(|| crate::systypes::lsn_of(&crate::cast_value(v.clone(), "pg_lsn").ok()?))
+                .ok_or_else(refused)?,
+        ),
         "numeric" => {
             let text = crate::numeric::numeric_text(v)
                 .or_else(|| int(v).map(|i| i.to_string()))

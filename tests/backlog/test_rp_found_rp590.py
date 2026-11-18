@@ -172,17 +172,50 @@ def test_record_image_over_other_field_types(query: str, dsn: str) -> None:
     assert answer(dsn, query) == RECORD_IMAGE_OTHER_TYPES[query]
 
 
-# The field types whose datum image is not modelled yet: an interval is a
-# 16-byte fixed-length datum (so `1 day` and `24 hours` differ), a time its
-# int64 microseconds, a name its 64 NAMEDATALEN bytes (PostgreSQL 15.19).
+# More field types' datum images: an interval is a 16-byte fixed-length
+# datum (so `1 day` and `24 hours` differ), a time its int64 microseconds, a
+# name its 64 NAMEDATALEN bytes; the fixed-length ones compare by `memcmp`
+# of their little-endian memory (PostgreSQL 15.19).
 RECORD_IMAGE_REMAINING_TYPES = {
     "select (select row('1 day'::interval)) *= (select row('24 hours'::interval))": [(False,)],
+    "select (select row('1 mon'::interval)) *< (select row('31 days'::interval))": [(True,)],
+    "select (select row('-1 hour'::interval)) *> (select row('1 hour'::interval))": [(False,)],
     "select (select row('10:00'::time)) *< (select row('11:00'::time))": [(True,)],
+    "select (select row('10:00+00'::timetz)) *= (select row('11:00+01'::timetz))": [(False,)],
+    "select (select row('10:00+01'::timetz)) *< (select row('10:00+02'::timetz))": [(False,)],
     "select (select row('a'::name)) *= (select row('a'::name))": [(True,)],
+    "select (select row('b'::name)) *> (select row('ab'::name))": [(True,)],
+    """select (select row('a'::"char")) *< (select row('b'::"char"))""": [(True,)],
+    "select (select row('08:00:2b:01:02:03'::macaddr))"
+    " *< (select row('08:00:2b:01:02:04'::macaddr))": [(True,)],
+    "select (select row('10.0.0.1'::inet)) *< (select row('::1'::inet))": [(True,)],
+    "select (select row('10.0.0.1/8'::inet)) *> (select row('10.0.0.1'::inet))": [(False,)],
+    "select (select row('(0,2)'::tid)) *> (select row('(1,1)'::tid))": [(False,)],
+    "select (select row('0/10'::pg_lsn)) *< (select row('1/0'::pg_lsn))": [(True,)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-976")
+@pytest.mark.parametrize("query", list(RECORD_IMAGE_REMAINING_TYPES))
+def test_record_image_over_remaining_field_types(query: str, dsn: str) -> None:
+    """Interval, time, timetz, name, "char", macaddr, inet, tid and pg_lsn
+    fields were refused (0A000); their datum images are modelled now."""
+    assert answer(dsn, query) == RECORD_IMAGE_REMAINING_TYPES[query]
+
+
+# The field types whose datum image is still not modelled: money (an int64
+# by value), an array, a jsonb, a bit string and a range (varlenas with
+# their own layouts), measured on PostgreSQL 15.19.
+RECORD_IMAGE_STILL_REFUSED = {
+    "select (select row('1'::money)) *< (select row('2'::money))": [(True,)],
+    "select (select row('{1}'::int[])) *= (select row('{1}'::int[]))": [(True,)],
+    """select (select row('{"a":1}'::jsonb)) *= (select row('{"a": 1}'::jsonb))""": [(True,)],
+    "select (select row(B'101')) *< (select row(B'110'))": [(True,)],
+    "select (select row('[1,2)'::int4range)) *= (select row('[1,2)'::int4range))": [(True,)],
 }
 
 
 @pytest.mark.backlog("RP-976")
-@pytest.mark.parametrize("query", list(RECORD_IMAGE_REMAINING_TYPES))
-def test_record_image_over_remaining_field_types(query: str, dsn: str) -> None:
-    assert answer(dsn, query) == RECORD_IMAGE_REMAINING_TYPES[query]
+@pytest.mark.parametrize("query", list(RECORD_IMAGE_STILL_REFUSED))
+def test_record_image_over_still_refused_field_types(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == RECORD_IMAGE_STILL_REFUSED[query]

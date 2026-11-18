@@ -2171,17 +2171,18 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp590.py`.
 
 - [ ] **The `record_image` operators refuse some field types.** `*=` ..
-      `*>=` compare a record's fields by their binary images since RP-650,
-      for int2 / int4 / int8 / oid / bool / float4 / float8 / numeric /
-      date / timestamp / timestamptz / uuid / text / varchar / bpchar /
-      bytea fields. Every other type is 0A000 `a record_image comparison
-      over a field of type ... is not supported yet`; on PostgreSQL 15.19
-      `row('1 day'::interval) *= row('24 hours'::interval)` is `f` (16
-      fixed bytes: time, day, month), a time compares its int64
-      microseconds, a name its 64 NAMEDATALEN bytes. Each needs its
-      datum's image modelled in `record_image.rs` (`record_image_cmp`:
-      by-value words, fixed-length by-reference bytes, varlena data).
-      Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_over_remaining_field_types
+      `*>=` compare a record's fields by their binary images (RP-650): the
+      integers, oid, bool, `"char"`, the floats, numeric, date, time,
+      timetz, the timestamps, interval, uuid, macaddr / macaddr8, inet /
+      cidr, tid, pg_lsn, name, text / varchar / bpchar and bytea are
+      modelled in `record_image.rs`. Every other type is 0A000 `a
+      record_image comparison over a field of type ... is not supported
+      yet`; on PostgreSQL 15.19 `row('1'::money) *< row('2'::money)` is `t`
+      (an int64 by value), and an array, jsonb, bit string or range
+      compares by `memcmp` of its varlena data, each in its own on-disk
+      layout (`ArrayType` header and elements, `JsonbContainer`, `VarBit`,
+      `RangeType` with its flags byte). Each needs that layout modelled.
+      Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_over_still_refused_field_types
       Backlog-ID: RP-976
 
 ## Found while working RP-569 (2026-11-08)

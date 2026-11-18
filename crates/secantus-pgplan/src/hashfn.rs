@@ -175,7 +175,7 @@ impl H {
     }
 }
 
-fn text_of(v: &Bson, ty: &str) -> Result<String> {
+pub(crate) fn text_of(v: &Bson, ty: &str) -> Result<String> {
     if ty.is_empty() || ty == "unknown" {
         return Ok(value_text(v));
     }
@@ -255,7 +255,7 @@ pub(crate) fn inet_bytes(text: &str) -> Result<Vec<u8>> {
     })
 }
 
-fn hex_bytes(text: &str) -> Result<Vec<u8>> {
+pub(crate) fn hex_bytes(text: &str) -> Result<Vec<u8>> {
     let hex: String = text.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     (0..hex.len())
         .step_by(2)
