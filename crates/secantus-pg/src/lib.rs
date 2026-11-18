@@ -22603,6 +22603,13 @@ impl PgHandler {
                 .filter(|(oid, _)| !commented.contains(oid))
                 .map(|(oid, c)| (*oid, 0, c.clone())),
         );
+        // initdb's descriptions of the other built-in objects: `pg_type`,
+        // `pg_operator`, `pg_am`, ... (RP-969).
+        tail.extend(
+            crate::system_catalogs::initdb_other_descriptions()
+                .iter()
+                .map(|(_, oid, c)| (*oid, 0, c.clone())),
+        );
         // COMMENT ON FUNCTION / PROCEDURE, kept on the function's record,
         // under the oid `pg_proc` gives it.
         for d in self.user_function_docs()? {

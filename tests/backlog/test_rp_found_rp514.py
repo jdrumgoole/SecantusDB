@@ -312,7 +312,37 @@ INITDB_OTHER_DESCRIPTIONS = {
 }
 
 
-@pytest.mark.backlog("RP-969")
+@pytest.mark.backlog_fixed("RP-969")
 @pytest.mark.parametrize("query", list(INITDB_OTHER_DESCRIPTIONS))
 def test_builtin_object_has_initdb_description(query: str, dsn: str) -> None:
+    """A built-in type, operator and access method had no description:
+    initdb's are served from `pg15_other_descriptions.tsv`."""
     assert answer(dsn, query) == ("ok", [(INITDB_OTHER_DESCRIPTIONS[query],)])
+
+
+# COMMENT ON a built-in object of another catalog replaces (IS NULL
+# deletes) initdb's description; measured on PostgreSQL 15.19.
+COMMENT_ON_BUILTIN = {
+    "type": (
+        "comment on type int4 is 'x'",
+        "select obj_description('int4'::regtype, 'pg_type')",
+        "x",
+    ),
+    "operator, is null": (
+        "comment on operator +(int4,int4) is null",
+        "select obj_description('+(int4,int4)'::regoperator, 'pg_operator')",
+        None,
+    ),
+    "access method": (
+        "comment on access method btree is 'y'",
+        "select obj_description(403, 'pg_am')",
+        "y",
+    ),
+}
+
+
+@pytest.mark.backlog("RP-969")
+@pytest.mark.parametrize("case", list(COMMENT_ON_BUILTIN))
+def test_comment_on_builtin_object_replaces_initdb_description(case: str, dsn: str) -> None:
+    comment, query, want = COMMENT_ON_BUILTIN[case]
+    assert answer(dsn, comment, query) == ("ok", [(want,)])

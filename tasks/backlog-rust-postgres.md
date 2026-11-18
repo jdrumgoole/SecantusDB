@@ -2138,19 +2138,17 @@ holding `(1, 'y')`.
 
 Measured on a private PostgreSQL 15.19 cluster.
 
-- [ ] **A built-in type, operator or access method has no initdb
-      description.** PostgreSQL 15.19's initdb writes `pg_description`
-      rows from every catalog's `.dat` `descr`: `pg_type`, `pg_operator`,
-      `pg_am`, `pg_collation`, `pg_conversion`, `pg_language`,
-      `pg_namespace`, `pg_extension` and the four text-search catalogs
-      (`obj_description('int4'::regtype, 'pg_type')` is `-2 billion to 2
-      billion integer, 4-byte storage`). Here only `pg_proc`'s are served
-      (since RP-969's first part: `pg15_proc_descriptions.tsv`, dumped by
-      `tools/probes/pg15_system_catalog_dump.py`, with a COMMENT replacing
-      and IS NULL deleting one), and `public`'s by `schema_comments`.
-      Faithful: dump the other classoids' rows the same way and serve each
-      under its catalog, a COMMENT overriding it.
-      Verify: tests/backlog/test_rp_found_rp514.py::test_builtin_object_has_initdb_description
+- [ ] **COMMENT ON a built-in type, operator or access method does not
+      replace initdb's description.** PostgreSQL 15.19 keys the comment by
+      the object's oid in `pg_description`, replacing initdb's row (IS NULL
+      deletes it). Here initdb's rows are served for every catalog
+      (`pg15_other_descriptions.tsv`, since RP-969's second part), but
+      `comment on type int4 is 'x'` is accepted and changes nothing, and
+      COMMENT ON an operator or access method is 0A000. Faithful: store
+      such a comment by `(classoid, oid)` as `BUILTIN_PROC_COMMENT_COLLECTION`
+      does for routines, a document with no comment keeping initdb's
+      deleted, for every catalog `pg15_other_descriptions.tsv` covers.
+      Verify: tests/backlog/test_rp_found_rp514.py::test_comment_on_builtin_object_replaces_initdb_description
       Backlog-ID: RP-969
 
 ## Found while working RP-527 (2026-11-08)

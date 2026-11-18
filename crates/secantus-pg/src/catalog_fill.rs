@@ -1013,27 +1013,30 @@ impl PgHandler {
             .into_iter()
             .map(|(oid, subid, text)| {
                 // The catalog the object lives in, as `pg_description` keys it.
-                let classoid = if ts_configs.contains(&oid) {
-                    crate::ts_configs::PG_TS_CONFIG
-                } else if ts_dicts.contains(&oid) {
-                    crate::ts_dicts::PG_TS_DICT
-                } else if conversions.contains(&oid) {
-                    2607 // pg_conversion
-                } else if let Some((c, _, _)) = rp169.iter().find(|(_, o, _)| *o == oid) {
-                    *c
-                } else if constraints.contains(&oid) {
-                    2606
-                } else if extensions.contains(&oid) {
-                    3079
-                } else if relations.contains(&oid) {
-                    1259
-                } else if functions.contains(&oid)
-                    || crate::catalog_facts::builtin().procs.contains_key(&oid)
-                {
-                    1255
-                } else {
-                    1247
-                };
+                let classoid =
+                    if let Some(c) = crate::system_catalogs::initdb_description_class(oid) {
+                        c
+                    } else if ts_configs.contains(&oid) {
+                        crate::ts_configs::PG_TS_CONFIG
+                    } else if ts_dicts.contains(&oid) {
+                        crate::ts_dicts::PG_TS_DICT
+                    } else if conversions.contains(&oid) {
+                        2607 // pg_conversion
+                    } else if let Some((c, _, _)) = rp169.iter().find(|(_, o, _)| *o == oid) {
+                        *c
+                    } else if constraints.contains(&oid) {
+                        2606
+                    } else if extensions.contains(&oid) {
+                        3079
+                    } else if relations.contains(&oid) {
+                        1259
+                    } else if functions.contains(&oid)
+                        || crate::catalog_facts::builtin().procs.contains_key(&oid)
+                    {
+                        1255
+                    } else {
+                        1247
+                    };
                 let mut d = Document::new();
                 d.insert(f("objoid"), Bson::Int64(oid));
                 d.insert(f("classoid"), Bson::Int64(classoid));
