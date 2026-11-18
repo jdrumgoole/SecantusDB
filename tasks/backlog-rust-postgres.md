@@ -1763,14 +1763,40 @@ a regression test.
       prefixed: `VerboseJoin::unprinted_filter`.) (Since 2026-11-18 such
       an expression evaluated as the parameterised inner index scan's
       `Filter` does too, printed over both relations' scopes with the
-      scan's own columns bare, `Printer::bare_rel`.) A join of three
-      relations still prints the plain plan: `explain (verbose, costs
-      off) select e.b from e join k on e.a = k.a join e e2 on e2.a = e.a`
-      is, on PostgreSQL 15.19, every node with its `Output` (the upper
-      Hash Join's `e.b`, the lower one's `e.b, e.a, k.a`, each Hash's
-      the key it hashes); `explain_verbose_join` takes two relations only.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a join of three relations]
+      scan's own columns bare, `Printer::bare_rel`.) (Since 2026-11-18 a
+      left-deep chain of hash joins over three or more relations, inner
+      joins on column equalities with no WHERE, prints every node's
+      `Output`: each join its outer side's columns then its inner side's,
+      kept while a relation of their equivalence class is still outside
+      it, as `generate_base_implied_equalities` gives them that class's
+      relids: `ruleutils::explain_verbose_chain`,
+      `explain::attach_verbose_chain`.) Still the plain plan: an ON that is
+      not column comparisons (`explain (verbose, costs off) select e.b from
+      e join k on e.a = k.a + 1` is, on PostgreSQL 15.19, `Output: e.b`
+      over `Seq Scan on public.k` with `Output: k.a, k.b` and a Hash and
+      `Seq Scan on public.e` each with `Output: e.b, e.a`), a chain of
+      three or more relations with a WHERE or a nested loop or merge join
+      in it, and an outer join in one.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a join on an expression]
       Backlog-ID: RP-966
+
+- [ ] **EXPLAIN drops the Sort of an ORDER BY over a join with no
+      LIMIT.** `explain (costs off) select e.b, k.b from e join k on e.a =
+      k.a order by k.a` (both tables analysed, 1000 rows) prints the Hash
+      Join alone; PostgreSQL 15.19 prints `Sort` with `Sort Key: k.a` above
+      it. Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by over a join prints its sort]
+      Backlog-ID: RP-1056
+
+- [ ] **A join's Hash Cond names a different member of the equivalence
+      class than PostgreSQL's.** `explain (costs off) select k.b, e2.b
+      from e join k on e.a = k.a join e e2 on e2.a = k.a` (`e`, `k`
+      analysed, 1000 rows) prints the upper join's `Hash Cond: (k.a =
+      e2.a)`; PostgreSQL 15.19 prints `(e.a = e2.a)` over the same plan
+      shape, the clause `generate_join_implied_equalities` builds from the
+      class's members in their order. Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a three-way hash join names the class's first member]
+      Backlog-ID: RP-1057
 
 - [ ] **A hash join whose WHERE compares an expression of one relation
       with the other's column is priced at zero.** `explain select e.b

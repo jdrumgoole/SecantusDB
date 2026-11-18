@@ -1906,10 +1906,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # Measured on PostgreSQL 15.19: a WHERE expression over both relations
     # is the parameterised inner index scan's `Filter`, prefixed.
-    # Measured on PostgreSQL 15.19 (2026-11-18): a join of three relations
-    # prints every node's `Output` under VERBOSE.
+    # Fixed (RP-966, in part; measured on PostgreSQL 15.19, 2026-11-18): a
+    # join of three relations printed every node's `Output` under VERBOSE.
     "explain verbose of a join of three relations": (
-        "RP-966",
+        "RP-966:fixed",
         _ANALYSED,
         "explain (verbose, costs off) select e.b from e join k on e.a = k.a"
         " join e e2 on e2.a = e.a",
@@ -1931,6 +1931,91 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Output: e2.a",
             "        ->  Seq Scan on public.e e2",
             "              Output: e2.a",
+        ],
+    ),
+    # Fixed (RP-966, in part; measured on PostgreSQL 15.19, 2026-11-18): a
+    # chain of four relations, a column needed above a join only while a
+    # relation of its equivalence class is outside it.
+    "explain verbose of a join of four relations": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, e3.a from e join k on e.a = k.a"
+        " join e e2 on e2.a = e.a join e e3 on e3.b = e2.b",
+        [
+            "Hash Join",
+            "  Output: e.b, e3.a",
+            "  Hash Cond: (e2.b = e3.b)",
+            "  ->  Hash Join",
+            "        Output: e.b, e2.b",
+            "        Hash Cond: (e.a = e2.a)",
+            "        ->  Hash Join",
+            "              Output: e.b, e.a, k.a",
+            "              Inner Unique: true",
+            "              Hash Cond: (e.a = k.a)",
+            "              ->  Seq Scan on public.e",
+            "                    Output: e.a, e.b",
+            "              ->  Hash",
+            "                    Output: k.a",
+            "                    ->  Seq Scan on public.k",
+            "                          Output: k.a",
+            "        ->  Hash",
+            "              Output: e2.a, e2.b",
+            "              ->  Seq Scan on public.e e2",
+            "                    Output: e2.a, e2.b",
+            "  ->  Hash",
+            "        Output: e3.a, e3.b",
+            "        ->  Seq Scan on public.e e3",
+            "              Output: e3.a, e3.b",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (2026-11-18): a join on an expression
+    # prints every node's `Output` under VERBOSE.
+    "explain verbose of a join on an expression": (
+        "RP-966",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b from e join k on e.a = k.a + 1",
+        [
+            "Hash Join",
+            "  Output: e.b",
+            "  Hash Cond: ((k.a + 1) = e.a)",
+            "  ->  Seq Scan on public.k",
+            "        Output: k.a, k.b",
+            "  ->  Hash",
+            "        Output: e.b, e.a",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.b, e.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966).
+    "an order by over a join prints its sort": (
+        "RP-1056",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e join k on e.a = k.a order by k.a",
+        [
+            "Sort",
+            "  Sort Key: k.a",
+            "  ->  Hash Join",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e",
+            "        ->  Hash",
+            "              ->  Seq Scan on k",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966).
+    "a three-way hash join names the class's first member": (
+        "RP-1057",
+        _ANALYSED,
+        "explain (costs off) select k.b, e2.b from e join k on e.a = k.a join e e2 on e2.a = k.a",
+        [
+            "Hash Join",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Hash Join",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e",
+            "        ->  Hash",
+            "              ->  Seq Scan on k",
+            "  ->  Hash",
+            "        ->  Seq Scan on e e2",
         ],
     ),
     "explain verbose of an inner index scan filtering an expression of both": (

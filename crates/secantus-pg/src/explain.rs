@@ -3946,6 +3946,82 @@ pub(crate) fn attach_scan_alias(root: &mut PlanNode, alias: &Option<String>) {
     }
 }
 
+/// `EXPLAIN VERBOSE` of a left-deep chain of hash joins over three or
+/// more relations (RP-966): each join prints its `build_joinrel_tlist`
+/// (its outer side's columns, then its inner side's, each still needed
+/// above it), the top join the query's target list, each Hash its inner
+/// scan's `reltarget` (`CP_SMALL_TLIST`), and the outermost scan its
+/// physical target list. Any other plan prints as without VERBOSE.
+pub(crate) fn attach_verbose_chain(
+    root: &mut PlanNode,
+    chain: &Option<secantus_pgplan::ruleutils::VerboseChain>,
+) {
+    use secantus_pgplan::ruleutils::{ChainNeed, VerboseChain};
+    type Tlist = Vec<(String, ChainNeed)>;
+    fn walk(
+        n: &mut PlanNode,
+        c: &VerboseChain,
+        under_hash: bool,
+        apply: bool,
+    ) -> Option<(Vec<usize>, Tlist)> {
+        if let Some(plain) = n.name.strip_prefix("Seq Scan on ") {
+            if !n.details.is_empty() || !n.children.is_empty() {
+                return None;
+            }
+            let i = c.rels.iter().position(|r| r.plain == plain)?;
+            let r = &c.rels[i];
+            if !apply {
+                return Some((vec![i], r.reltarget.clone()));
+            }
+            n.name = format!("Seq Scan on {}", r.relation);
+            let out = if under_hash {
+                r.reltarget.iter().map(|(t, _)| t.clone()).collect()
+            } else {
+                r.columns.clone()
+            };
+            n.details.insert(0, ("Output".into(), out.join(", ")));
+            return Some((vec![i], r.reltarget.clone()));
+        }
+        if n.name != "Hash Join"
+            || n.details
+                .iter()
+                .any(|(k, _)| k != "Hash Cond" && k != "Inner Unique")
+        {
+            return None;
+        }
+        let [outer, hash] = n.children.as_mut_slice() else {
+            return None;
+        };
+        if hash.name != "Hash" || !hash.details.is_empty() || hash.children.len() != 1 {
+            return None;
+        }
+        let (mut rels, mut tlist) = walk(outer, c, false, apply)?;
+        let (inner_rels, inner_tlist) = walk(&mut hash.children[0], c, true, apply)?;
+        if apply {
+            let hashed: Vec<&str> = inner_tlist.iter().map(|(t, _)| t.as_str()).collect();
+            hash.details.insert(0, ("Output".into(), hashed.join(", ")));
+        }
+        rels.extend(inner_rels);
+        tlist.extend(inner_tlist);
+        tlist.retain(|(_, need)| need.output || need.ec_rels.iter().any(|r| !rels.contains(r)));
+        if apply {
+            let out: Vec<&str> = tlist.iter().map(|(t, _)| t.as_str()).collect();
+            n.details.insert(0, ("Output".into(), out.join(", ")));
+        }
+        Some((rels, tlist))
+    }
+    let Some(c) = chain else {
+        return;
+    };
+    // Check the whole tree before changing any of it.
+    match walk(root, c, false, false) {
+        Some((rels, _)) if rels.len() == c.rels.len() => {}
+        _ => return,
+    }
+    walk(root, c, false, true);
+    root.details[0].1 = c.output.join(", ");
+}
+
 fn is_scan_name(name: &str) -> bool {
     name.starts_with("Seq Scan on ")
         || name.starts_with("Bitmap Heap Scan on ")
@@ -4062,6 +4138,7 @@ mod heap_fetches_tests {
             verbose: false,
             verbose_scan: None,
             verbose_join: None,
+            verbose_chain: None,
             scan_alias: None,
             costs: false,
             timing: false,

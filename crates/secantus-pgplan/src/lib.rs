@@ -3762,6 +3762,8 @@ pub struct ExplainOptions {
     /// Under VERBOSE, a two-relation join's lists as its nodes print them
     /// (RP-966).
     pub verbose_join: Option<ruleutils::VerboseJoin>,
+    /// `EXPLAIN VERBOSE` of a join of three or more relations (RP-966).
+    pub verbose_chain: Option<ruleutils::VerboseChain>,
     /// A SELECT over one aliased relation: the alias its scan prints
     /// after the relation's name (RP-967).
     pub scan_alias: Option<String>,
@@ -12579,6 +12581,7 @@ fn plan_explain(
         verbose: false,
         verbose_scan: None,
         verbose_join: None,
+        verbose_chain: None,
         scan_alias: None,
         costs: true,
         timing: false,
@@ -12800,6 +12803,10 @@ fn plan_explain(
     };
     options.verbose_join = match &query {
         N::SelectStmt(s) if options.verbose => ruleutils::explain_verbose_join(s, lookup),
+        _ => None,
+    };
+    options.verbose_chain = match &query {
+        N::SelectStmt(s) if options.verbose => ruleutils::explain_verbose_chain(s, lookup),
         _ => None,
     };
     let scan_or_arms = explain_scan_or_arms(&query, lookup).unwrap_or_default();

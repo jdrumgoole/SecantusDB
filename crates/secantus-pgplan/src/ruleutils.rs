@@ -7147,3 +7147,238 @@ mod out_parameter_function_tests {
         );
     }
 }
+
+/// One relation of a [`VerboseChain`] (RP-966).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ChainRel {
+    /// The relation as the node names it: `public.e`, `public.e e2`.
+    pub relation: String,
+    /// The relation as the plain plan names it: `e`, `e e2`.
+    pub plain: String,
+    /// Every column, prefixed: a scan's physical target list.
+    pub columns: Vec<String>,
+    /// Its `reltarget`, prefixed, each with whether a join above any set
+    /// of relations still needs it: the target list's columns first, then
+    /// the ON clauses' in the order `deconstruct_jointree` distributes them.
+    pub reltarget: Vec<(String, ChainNeed)>,
+}
+
+/// Why a column of a [`ChainRel`] is needed above a join.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ChainNeed {
+    /// The query's target list reads it.
+    pub output: bool,
+    /// The relations of its equivalence class: it is needed above any join
+    /// that does not hold all of them (`generate_base_implied_equalities`
+    /// adds its Vars with the class's relids).
+    pub ec_rels: Vec<usize>,
+}
+
+/// `EXPLAIN VERBOSE` of a SELECT of columns over three or more relations
+/// inner-joined left-deep on ONs of column equalities, with no WHERE
+/// (RP-966).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VerboseChain {
+    pub rels: Vec<ChainRel>,
+    pub output: Vec<String>,
+}
+
+/// [`VerboseChain`] for `SELECT <columns> FROM a JOIN b ON a.x = b.y JOIN
+/// c ON ...`; `None` for any other shape.
+pub fn explain_verbose_chain(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<VerboseChain> {
+    if !s.group_clause.is_empty()
+        || s.having_clause.is_some()
+        || !s.distinct_clause.is_empty()
+        || !s.sort_clause.is_empty()
+        || s.limit_count.is_some()
+        || s.limit_offset.is_some()
+        || !s.window_clause.is_empty()
+        || s.where_clause.is_some()
+    {
+        return None;
+    }
+    let [item] = s.from_clause.as_slice() else {
+        return None;
+    };
+    // Unwind the left-deep chain: the leftmost relation, then each join's
+    // right side with its ON, innermost join first.
+    let mut ons: Vec<&Node> = Vec::new();
+    let mut rights: Vec<&pg_query::protobuf::RangeVar> = Vec::new();
+    let mut node: &Node = item;
+    let first = loop {
+        match node.node.as_ref() {
+            Some(N::JoinExpr(j)) => {
+                if j.is_natural
+                    || !j.using_clause.is_empty()
+                    || j.alias.is_some()
+                    || j.jointype != pg_query::protobuf::JoinType::JoinInner as i32
+                {
+                    return None;
+                }
+                let Some(N::RangeVar(rv)) = j.rarg.as_deref()?.node.as_ref() else {
+                    return None;
+                };
+                rights.push(rv);
+                ons.push(j.quals.as_deref()?);
+                node = j.larg.as_deref()?;
+            }
+            Some(N::RangeVar(rv)) => break rv,
+            _ => return None,
+        }
+    };
+    if rights.len() < 2 {
+        return None;
+    }
+    rights.reverse();
+    ons.reverse();
+    let mut sides: Vec<(String, TableDef, Option<String>)> = Vec::new();
+    for rv in std::iter::once(first).chain(rights.iter().copied()) {
+        if !rv.schemaname.is_empty() {
+            return None;
+        }
+        let def = lookup(&rv.relname)?;
+        let alias = rv.alias.as_ref().map(|a| a.aliasname.clone());
+        let refname = alias
+            .clone()
+            .unwrap_or_else(|| crate::schemas::split_key(&def.name).1);
+        if sides.iter().any(|s| s.0 == refname) {
+            return None;
+        }
+        sides.push((refname, def, alias));
+    }
+    let n = sides.len();
+    let resolve = |c: &pg_query::protobuf::ColumnRef| -> Option<(usize, String)> {
+        let names: Vec<&str> = c
+            .fields
+            .iter()
+            .map(|f| match f.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let has = |i: usize, col: &str| sides[i].1.columns.iter().any(|c| c.name == col);
+        match names.as_slice() {
+            [rel, col] => {
+                let i = sides.iter().position(|s| s.0 == *rel)?;
+                has(i, col).then(|| (i, col.to_string()))
+            }
+            [col] => {
+                let mut hits = (0..n).filter(|&i| has(i, col));
+                let i = hits.next()?;
+                hits.next().is_none().then(|| (i, col.to_string()))
+            }
+            _ => None,
+        }
+    };
+    let mut order: Vec<Vec<String>> = vec![Vec::new(); n];
+    let mut outputs: Vec<(usize, String)> = Vec::new();
+    for t in &s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return None;
+        };
+        if !rt.name.is_empty() {
+            return None;
+        }
+        let Some(N::ColumnRef(c)) = rt.val.as_deref()?.node.as_ref() else {
+            return None;
+        };
+        if c.fields
+            .iter()
+            .any(|f| matches!(f.node.as_ref(), Some(N::AStar(_))))
+        {
+            return None;
+        }
+        outputs.push(resolve(c)?);
+    }
+    for (i, c) in &outputs {
+        if !order[*i].contains(c) {
+            order[*i].push(c.clone());
+        }
+    }
+    // Union-find over the columns the ONs equate.
+    let mut ecs: Vec<Vec<(usize, String)>> = Vec::new();
+    for on in &ons {
+        let mut parts = Vec::new();
+        and_clauses(on, &mut parts);
+        for part in &parts {
+            let part: &Node = part;
+            let Some(N::AExpr(a)) = part.node.as_ref() else {
+                return None;
+            };
+            let op = a.name.iter().find_map(|n| match n.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            });
+            if a.kind() != pg_query::protobuf::AExprKind::AexprOp || op != Some("=") {
+                return None;
+            }
+            let col = |n: &Option<Box<Node>>| match n.as_deref()?.node.as_ref() {
+                Some(N::ColumnRef(c)) => resolve(c),
+                _ => None,
+            };
+            let (l, r) = (col(&a.lexpr)?, col(&a.rexpr)?);
+            if l.0 == r.0 {
+                return None;
+            }
+            for (i, c) in [&l, &r] {
+                if !order[*i].contains(c) {
+                    order[*i].push(c.clone());
+                }
+            }
+            let li = ecs.iter().position(|e| e.contains(&l));
+            let ri = ecs.iter().position(|e| e.contains(&r));
+            match (li, ri) {
+                (Some(x), Some(y)) if x == y => {}
+                (Some(x), Some(y)) => {
+                    let moved = ecs.remove(x.max(y));
+                    ecs[x.min(y)].extend(moved);
+                }
+                (Some(x), None) => ecs[x].push(r),
+                (None, Some(y)) => ecs[y].push(l),
+                (None, None) => ecs.push(vec![l, r]),
+            }
+        }
+    }
+    let pre = |i: usize, c: &str| format!("{}.{}", q(&sides[i].0), q(c));
+    let rels = sides
+        .iter()
+        .enumerate()
+        .map(|(i, (_, def, alias))| {
+            let (schema, bare) = crate::schemas::split_key(&def.name);
+            let suffix = alias
+                .as_ref()
+                .map(|a| format!(" {}", q(a)))
+                .unwrap_or_default();
+            ChainRel {
+                relation: format!("{}.{}{suffix}", q(&schema), q(&bare)),
+                plain: format!("{}{suffix}", q(&bare)),
+                columns: def.columns.iter().map(|c| pre(i, &c.name)).collect(),
+                reltarget: order[i]
+                    .iter()
+                    .map(|c| {
+                        let key = (i, c.clone());
+                        let mut ec_rels: Vec<usize> = ecs
+                            .iter()
+                            .find(|e| e.contains(&key))
+                            .map(|e| e.iter().map(|m| m.0).collect())
+                            .unwrap_or_default();
+                        ec_rels.sort_unstable();
+                        ec_rels.dedup();
+                        let need = ChainNeed {
+                            output: outputs.contains(&key),
+                            ec_rels,
+                        };
+                        (pre(i, c), need)
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    Some(VerboseChain {
+        rels,
+        output: outputs.iter().map(|(i, c)| pre(*i, c)).collect(),
+    })
+}
