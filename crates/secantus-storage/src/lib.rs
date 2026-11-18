@@ -21157,6 +21157,9 @@ impl Storage {
         if let Some(pages) = self.bounded_span_pages(session, db, coll, filter)? {
             return Ok(CandidatePages::Spans(pages));
         }
+        if let Some(pages) = self.residual_pages(session, db, coll, filter)? {
+            return Ok(pages);
+        }
         let routed = match self.try_index_id_keys(session, db, coll, filter)? {
             Some(r) => Some(r),
             None => self.try_residual_index_id_keys(session, db, coll, filter)?,
@@ -21197,6 +21200,55 @@ impl Storage {
                 self.rows_by_recordids(session, db, coll, rids)
             }
         }
+    }
+
+    /// [`Self::try_residual_index_id_keys`], not yet read, for a filter of
+    /// several fields each an operator clause (`{a: {$gte: 0}, b: {$gte:
+    /// 0}}`), which no index covers whole: the same sub-filters in the same
+    /// order, a sub-filter the bounded read serves read a page at a time
+    /// (RM-390), any other read whole as before. `None` for a filter the
+    /// router may cover whole (an equality, a partial index's residual),
+    /// which keeps its own read.
+    fn residual_pages(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<CandidatePages>> {
+        // With every clause an operator document, neither the compound
+        // equality read nor the compound prefix-and-range read applies
+        // (both need an equality), nor geo (one field): only the partial
+        // index's residual match, checked here without a read.
+        if filter.len() < 2
+            || filter.keys().any(|k| k.starts_with('$'))
+            || !filter.values().all(|v| matches!(v, Bson::Document(_)))
+            || self
+                .single_field_partial_residual_match(session, db, coll, filter)?
+                .is_some()
+        {
+            return Ok(None);
+        }
+        let subs = residual_subfilters(filter);
+        let wide = WIDE_OK.with(|w| w.get());
+        for pass_wide in [false, true] {
+            if pass_wide && !wide {
+                break;
+            }
+            for sub in &subs {
+                if let Some(pages) = with_wide(pass_wide, || {
+                    self.bounded_span_pages(session, db, coll, sub)
+                })? {
+                    return Ok(Some(CandidatePages::Spans(pages)));
+                }
+                if let Some(ids) =
+                    with_wide(pass_wide, || self.try_index_id_keys(session, db, coll, sub))?
+                {
+                    return Ok(Some(candidate_rows(ids)));
+                }
+            }
+        }
+        Ok(Some(CandidatePages::scan(false)))
     }
 
     /// The router's read for a filter of one field whose predicate

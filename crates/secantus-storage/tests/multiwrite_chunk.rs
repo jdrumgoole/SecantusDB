@@ -417,3 +417,53 @@ fn paged_index_write_moves_each_document_once() {
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A write of many whose filter no index covers whole reads one field's
+/// compound index a page at a time too (RM-390): only the documents the
+/// whole filter matches are written, each once, across pages.
+#[test]
+fn paged_compound_residual_write_moves_each_matching_document_once() {
+    let home = temp_home();
+    let st = Storage::open(home.to_str().unwrap()).unwrap();
+    let docs: Vec<Vec<u8>> = (0..2500i64)
+        .map(|i| enc(&doc! {"_id": i, "a": i, "b": i % 7, "n": 0}))
+        .collect();
+    st.insert("app", "c", docs, true).unwrap();
+    st.create_index("app", "c", "a_1_b_1", &doc! {"a": 1, "b": 1}, &doc! {})
+        .unwrap();
+    let out = st
+        .update_matching(
+            "app",
+            "c",
+            &doc! {"a": {"$gte": 0}, "b": {"$gte": 3}},
+            &doc! {"$inc": {"a": 1000, "n": 1}},
+            true,
+            false,
+            &[],
+            &Document::new(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+    let want = (0..2500i64).filter(|i| i % 7 >= 3).count() as u64;
+    assert_eq!((out.matched as u64, out.modified as u64), (want, want));
+    assert_eq!(
+        st.count_matching("app", "c", &doc! {"n": 1}, None).unwrap() as u64,
+        want,
+        "each matching document updated exactly once"
+    );
+    let deleted = st
+        .delete_matching(
+            "app",
+            "c",
+            &doc! {"a": {"$gte": 1000}, "b": {"$gte": 3}},
+            0,
+            &Document::new(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(deleted as u64, want);
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}

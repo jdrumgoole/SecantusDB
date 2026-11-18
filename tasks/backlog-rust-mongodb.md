@@ -1030,24 +1030,30 @@ Python behind the Rust server, a deferral answers 2 "aggregation pipeline
 uses a stage or operator not supported by the Rust server". The file has
 about forty such points; these are the ones measured.
 
-- [ ] **A write of many through a compound index of a clustered
+- [ ] **A write of many through some index reads of a clustered
       collection reads every candidate before it writes one.** mongod
       writes each document as its plan returns it, whatever the plan, so an
       updateMany or deleteMany out of `maxTimeMS` part-way has written some
       (mongod 8.2.11, 100,000 documents, `maxTimeMS: 30`). A plan this
       server's write cannot stream -- a clustered or time-series
       collection, a geo plan -- leaves the write to the store, which reads
-      a collection scan (since 2026-11-10) and a one-field bounded index
-      read (since 2026-11-17) a page at a time, writing each page first.
-      The router's other index reads (`try_index_id_keys`: a compound
-      index, `$in` / `$eq`, `$and`, `$or`, `$elemMatch`, geo) are still
-      read whole before the first page, and a budget spent there writes
-      nothing. The work is to stream a clustered collection's plan as an
-      ordinary one's (its natural order is `_id`'s, which the stream does
-      not yet read), or to page each of those reads into the write as
-      `bounded_span_pages` does; a geo plan is not yet probed.
+      a collection scan (since 2026-11-10), a one-field bounded index read
+      (since 2026-11-17), and a filter of operator clauses no index covers
+      whole through one field's bounded read, a compound index's included
+      (since 2026-11-18), a page at a time, writing each page first. The
+      router's other index reads (`try_index_id_keys`: an equality prefix
+      of a compound index, `$in` / `$eq`, `$and`, `$or`, `$elemMatch`,
+      geo) are still read whole before the first page, and a budget spent
+      there writes nothing. The work is to stream a clustered collection's
+      plan as an ordinary one's (its natural order is `_id`'s, which the
+      stream does not yet read), or to page each of those reads into the
+      write as `bounded_span_pages` does; none of those shapes is probed
+      against mongod yet.
       Backlog-ID: RM-390
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm390.py::test_a_write_of_many_through_a_compound_index_out_of_time_keeps_what_it_wrote
+      Verify: none -- the compound residual read this item's gap test
+      measured is paged (tests/backlog/test_rm_found_2026_11_10_rm390.py,
+      now backlog_fixed); the remaining shapes have no gap test until one
+      is probed against mongod 8.2.
 
 ### 7.086 The Rust MongoDB server, audited -- 2026-10-20
 
