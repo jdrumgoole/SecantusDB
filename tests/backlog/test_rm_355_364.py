@@ -1546,18 +1546,58 @@ def test_a_sorted_time_series_aggregate_counts_what_it_examined(
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-363")
+@pytest.mark.backlog_fixed("RM-363")
+@pytest.mark.parametrize(
+    "pipeline",
+    [
+        [{"$group": {"_id": "$m", "n": {"$sum": 1}}}],
+        [{"$group": {"_id": "$m", "n": {"$count": {}}}}, {"$sort": {"_id": 1}}],
+    ],
+    ids=["sum", "count then sort"],
+)
 def test_a_grouped_time_series_read_counts_what_it_examined(
-    rust_mongo: Any, mongod_rs: Any
+    rust_mongo: Any, mongod_rs: Any, pipeline: list
 ) -> None:
-    """mongod 8.2.11's line for an `aggregate` that groups five buckets
-    counts what its cursor stage examined. This server reads a time-series
-    collection whole under a `$group`, and counts nothing."""
-    pipeline = [{"$group": {"_id": "$m", "n": {"$sum": 1}}}]
+    """mongod 8.2.11 runs a `$group` on the meta field that only counts over
+    the buckets, in the classic engine, and its line counts the five its
+    cursor stage examined. This server read the collection whole under a
+    `$group`, and counted nothing, until it read such a pipeline through
+    its cursor stage (RM-363)."""
     got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.aggregate(pipeline)), _series)
     answers = {s: _counts(_line(lines, "aggregate")) for s, (lines, _) in got.items()}
     assert "docsExamined" in answers["mongod"]
     assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog("RM-363")
+def test_a_counted_time_series_read_counts_what_it_examined(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's line for `count_documents` over five buckets counts
+    what it examined. This server reads a time-series collection whole
+    under that `$group`, and counts nothing."""
+    got = _both(rust_mongo, mongod_rs, lambda d: d.ts.count_documents({}), _series)
+    answers = {s: _counts(_line(lines, "aggregate")) for s, (lines, _) in got.items()}
+    assert "docsExamined" in answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog("RM-719")
+def test_a_meta_group_summing_one_point_zero_answers_an_int(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 rewrites a `$group` on the meta field that sums `1.0`
+    to a sum of each bucket's `control.count`, and answers an int (60);
+    this server sums 1.0 per measurement and answers a double (60.0)."""
+    pipeline = [{"$group": {"_id": "$m", "n": {"$sum": 1.0}}}, {"$sort": {"_id": 1}}]
+    got = {}
+    for side, client in (("rust", rust_mongo), ("mongod", mongod_rs)):
+        db = client[fresh("rmsum")]
+        _series(db)
+        docs = list(db.ts.aggregate(pipeline))
+        client.drop_database(db.name)
+        got[side] = [(d["_id"], d["n"], type(d["n"]).__name__) for d in docs]
+    assert got["rust"] == got["mongod"]
 
 
 @pytest.mark.backlog_fixed("RM-363")

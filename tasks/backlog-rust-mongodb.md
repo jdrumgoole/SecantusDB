@@ -823,7 +823,9 @@ These are explicit non-goals. Don't add them without a reason.
         other readers still decline a contested plan
         (`order::stream_plan`);
       - a read of a time-series collection made whole: under a
-        `$group` (`count_documents`), an inclusion `$project` (RM-456), a
+        `$group` (`count_documents`; since 2026-11-18 a `$group` on the
+        meta field that only counts, which mongod runs over the buckets,
+        counts as mongod's does), an inclusion `$project` (RM-456), a
         filter on the meta field (RM-457), a hint or a collation. mongod
         counts the buckets its cursor stage buffered (five of five for a
         sorted `find`). Since RM-455 a `find` is the aggregation mongod
@@ -833,7 +835,15 @@ These are explicit non-goals. Don't add them without a reason.
         mongod 5 keys and 4 documents, this server none).
       Measured 2026-10-27, 2026-11-07, 2026-11-10 and 2026-11-13.
       Backlog-ID: RM-363
-      Verify: tests/backlog/test_rm_355_364.py::test_a_grouped_time_series_read_counts_what_it_examined
+      Verify: tests/backlog/test_rm_355_364.py::test_a_counted_time_series_read_counts_what_it_examined
+- [ ] **A time-series `$group` on the meta field that sums `1.0` answers a
+      double.** mongod 8.2.11 rewrites `{$group: {_id: "$m", n: {$sum:
+      1.0}}}` over a time-series collection to a sum of each bucket's
+      `control.count`, and answers `n: 60` (an int); this server sums 1.0
+      per measurement and answers `60.0`. Measured 2026-11-18. Found while
+      working RM-363.
+      Verify: tests/backlog/test_rm_355_364.py::test_a_meta_group_summing_one_point_zero_answers_an_int
+      Backlog-ID: RM-719
 - [ ] **WiredTiger 11's interruptible cache wait is not on the line.**
       mongod 8.2.11's WiredTiger splits a cache wait into the share spent
       in interruptible eviction (`timeWaitingMicros.cacheInterruptibleMicros`)

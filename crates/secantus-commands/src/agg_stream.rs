@@ -413,6 +413,48 @@ const TIME_SERIES_STAGES: &[&str] = &[
     "$sort",
 ];
 
+/// A `$group` mongod 8.2.11 runs over the buckets, in the classic engine
+/// behind a `$cursor` stage: keyed on the meta field (or a path in it), with
+/// only `{$count: {}}` and `{$sum: 1}` accumulators (measured 2026-11-18;
+/// `{$sum: 2}`, `{$sum: "$v"}`, `{$min: "$t"}` and `_id: {a: "$m"}` go to
+/// the slot-based engine, and a `$group` with none is a distinct scan).
+fn groups_on_meta(stage: &Bson, meta: Option<&str>) -> bool {
+    let Some(meta) = meta else {
+        return false;
+    };
+    let Some(Bson::Document(spec)) = stage.as_document().and_then(|d| d.get("$group")) else {
+        return false;
+    };
+    let keyed = match spec.get("_id") {
+        Some(Bson::String(path)) => path
+            .strip_prefix('$')
+            .and_then(|p| p.strip_prefix(meta))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.')),
+        _ => false,
+    };
+    let one = |v: &Bson| match v {
+        Bson::Int32(n) => *n == 1,
+        Bson::Int64(n) => *n == 1,
+        Bson::Double(n) => *n == 1.0,
+        _ => false,
+    };
+    let counts = |v: &Bson| {
+        let Bson::Document(acc) = v else {
+            return false;
+        };
+        acc.len() == 1
+            && match acc.iter().next() {
+                Some((op, arg)) if op == "$count" => {
+                    matches!(arg, Bson::Document(d) if d.is_empty())
+                }
+                Some((op, arg)) if op == "$sum" => one(arg),
+                _ => false,
+            }
+    };
+    let accs: Vec<_> = spec.iter().filter(|(k, _)| *k != "_id").collect();
+    keyed && !accs.is_empty() && accs.iter().all(|(_, v)| counts(v))
+}
+
 /// A `$project` that only leaves fields out.
 fn excludes_only(spec: &Bson) -> bool {
     fn zero(v: &Bson) -> bool {
@@ -491,15 +533,29 @@ fn time_series(
             .iter()
             .all(|s| project(s) || stage_name(s) == "$match");
     let only_projects = !ask.pipeline.is_empty() && ask.pipeline.iter().all(project);
+    let meta = storage
+        .get_collection_options(ask.db, ask.coll)
+        .ok()
+        .and_then(|o| crate::timeseries::Fields::of(&o))
+        .and_then(|f| f.meta);
+    let meta_group = ask
+        .pipeline
+        .first()
+        .is_some_and(|s| groups_on_meta(s, meta.as_deref()))
+        && ask.pipeline[1..].iter().all(fits);
     if ask.hint.is_some()
         || ask.collation.is_some()
-        || !(per_bucket || only_projects || ask.pipeline.iter().all(fits))
+        || !(per_bucket || only_projects || meta_group || ask.pipeline.iter().all(fits))
         || ask.pipeline.iter().any(mentions_meta)
     {
         return Ok(None);
     }
+    // mongod rewrites a `$group` on the meta field that only counts to a
+    // group over the buckets themselves, in the classic engine.
     let hoisted = crate::explain::hoist::hoist_runnable(ask.pipeline);
-    if crate::explain::sbe_pushdown(storage, ask.db, ask.coll, &hoisted, None, None).is_some() {
+    if !meta_group
+        && crate::explain::sbe_pushdown(storage, ask.db, ask.coll, &hoisted, None, None).is_some()
+    {
         return Ok(None);
     }
     let read_error = |e| crate::util::read_error_on_namespace(e, "aggregate", ask.ns);
@@ -547,9 +603,13 @@ fn time_series(
         ask,
     );
     cursor.per_bucket = per_bucket;
-    // A `$sort` blocks: it runs once over every bucket the cursor stage
-    // unpacked, which mongod counts examined (five of five, RM-363).
-    cursor.whole = ask.pipeline.iter().any(|s| stage_name(s) == "$sort");
+    // A `$sort` or a `$group` blocks: it runs once over every bucket the
+    // cursor stage unpacked, which mongod counts examined (five of five,
+    // RM-363).
+    cursor.whole = ask
+        .pipeline
+        .iter()
+        .any(|s| matches!(stage_name(s), "$sort" | "$group"));
     Ok(Some((cursor, Vec::new())))
 }
 
