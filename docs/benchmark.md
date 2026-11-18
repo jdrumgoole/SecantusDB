@@ -58,44 +58,44 @@ body[data-theme="dark"] .dviz-wrap {
 .dv-x { font-size:0.82em; opacity:0.75; }
 .dv-legend { display:flex; gap:16px; flex-wrap:wrap; margin:6px 0 4px; font-size:0.85rem; color:var(--dv-ink2); }
 .dv-legend .chip { display:inline-block; width:12px; height:12px; border-radius:3px; margin-right:6px; vertical-align:-1px; }
-</style><div class="dviz-wrap"><div class="dv-legend"><span><span class="chip" style="background:var(--dv-rust)"></span>Rust server</span></div><svg viewBox="0 0 760 344" role="img" aria-label="Per-operation latency as a multiple of mongod" class="dviz"><line x1="480.0" y1="18" x2="480.0" y2="306" class="dv-grid"/><text x="480.0" y="322" text-anchor="middle" class="dv-tick">2<tspan class="dv-x">x</tspan></text><line x1="620.0" y1="18" x2="620.0" y2="306" class="dv-grid"/><text x="620.0" y="322" text-anchor="middle" class="dv-tick">3<tspan class="dv-x">x</tspan></text><line x1="760.0" y1="18" x2="760.0" y2="306" class="dv-grid"/><text x="760.0" y="322" text-anchor="middle" class="dv-tick">4<tspan class="dv-x">x</tspan></text><line x1="340.0" y1="18" x2="340.0" y2="306" class="dv-ref"/><text x="340.0" y="12" text-anchor="middle" class="dv-tick">mongod = 1<tspan class="dv-x">x</tspan></text><text x="190" y="42" text-anchor="end" class="dv-lab">insert (10k docs)</text><path d="M200,26 h283.2 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-283.2 z" fill="var(--dv-rust)"><title>Rust server — 2.1x mongod</title></path><text x="493.2" y="37" class="dv-val">2.1<tspan class="dv-x">x</tspan></text><text x="190" y="76" text-anchor="end" class="dv-lab">find indexed range</text><path d="M200,60 h133.8 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-133.8 z" fill="var(--dv-rust)"><title>Rust server — 1.0x mongod</title></path><text x="343.8" y="71" class="dv-val">1.0<tspan class="dv-x">x</tspan></text><text x="190" y="110" text-anchor="end" class="dv-lab">find full scan</text><path d="M200,94 h147.6 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-147.6 z" fill="var(--dv-rust)"><title>Rust server — 1.1x mongod</title></path><text x="357.6" y="105" class="dv-val">1.1<tspan class="dv-x">x</tspan></text><text x="190" y="144" text-anchor="end" class="dv-lab">find filtered scan</text><path d="M200,128 h184.4 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-184.4 z" fill="var(--dv-rust)"><title>Rust server — 1.3x mongod</title></path><text x="394.4" y="139" class="dv-val">1.3<tspan class="dv-x">x</tspan></text><text x="190" y="178" text-anchor="end" class="dv-lab">update_many (half)</text><path d="M200,162 h194.3 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-194.3 z" fill="var(--dv-rust)"><title>Rust server — 1.4x mongod</title></path><text x="404.3" y="173" class="dv-val">1.4<tspan class="dv-x">x</tspan></text><text x="190" y="212" text-anchor="end" class="dv-lab">aggregate $group</text><path d="M200,196 h261.6 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-261.6 z" fill="var(--dv-rust)"><title>Rust server — 1.9x mongod</title></path><text x="471.6" y="207" class="dv-val">1.9<tspan class="dv-x">x</tspan></text><text x="190" y="246" text-anchor="end" class="dv-lab">aggregate multi-stage</text><path d="M200,230 h354.4 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-354.4 z" fill="var(--dv-rust)"><title>Rust server — 2.6x mongod</title></path><text x="564.4" y="241" class="dv-val">2.6<tspan class="dv-x">x</tspan></text><text x="190" y="280" text-anchor="end" class="dv-lab">delete_many (half)</text><path d="M200,264 h259.1 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-259.1 z" fill="var(--dv-rust)"><title>Rust server — 1.9x mongod</title></path><text x="469.1" y="275" class="dv-val">1.9<tspan class="dv-x">x</tspan></text><text x="190" y="314" text-anchor="end" class="dv-lab">change-stream drain</text><path d="M200,298 h168.1 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-168.1 z" fill="var(--dv-rust)"><title>Rust server — 1.2x mongod</title></path><text x="378.1" y="309" class="dv-val">1.2<tspan class="dv-x">x</tspan></text></svg></div>
+</style><div class="dviz-wrap"><div class="dv-legend"><span><span class="chip" style="background:var(--dv-rust)"></span>Rust server</span></div><svg viewBox="0 0 760 344" role="img" aria-label="Per-operation latency as a multiple of mongod" class="dviz"><line x1="480.0" y1="18" x2="480.0" y2="306" class="dv-grid"/><text x="480.0" y="322" text-anchor="middle" class="dv-tick">2<tspan class="dv-x">x</tspan></text><line x1="620.0" y1="18" x2="620.0" y2="306" class="dv-grid"/><text x="620.0" y="322" text-anchor="middle" class="dv-tick">3<tspan class="dv-x">x</tspan></text><line x1="760.0" y1="18" x2="760.0" y2="306" class="dv-grid"/><text x="760.0" y="322" text-anchor="middle" class="dv-tick">4<tspan class="dv-x">x</tspan></text><line x1="340.0" y1="18" x2="340.0" y2="306" class="dv-ref"/><text x="340.0" y="12" text-anchor="middle" class="dv-tick">mongod = 1<tspan class="dv-x">x</tspan></text><text x="190" y="42" text-anchor="end" class="dv-lab">insert (10k docs)</text><path d="M200,26 h200.6 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-200.6 z" fill="var(--dv-rust)"><title>Rust server — 1.5x mongod</title></path><text x="410.6" y="37" class="dv-val">1.5<tspan class="dv-x">x</tspan></text><text x="190" y="76" text-anchor="end" class="dv-lab">find indexed range</text><path d="M200,60 h177.3 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-177.3 z" fill="var(--dv-rust)"><title>Rust server — 1.3x mongod</title></path><text x="387.3" y="71" class="dv-val">1.3<tspan class="dv-x">x</tspan></text><text x="190" y="110" text-anchor="end" class="dv-lab">find full scan</text><path d="M200,94 h166.6 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-166.6 z" fill="var(--dv-rust)"><title>Rust server — 1.2x mongod</title></path><text x="376.6" y="105" class="dv-val">1.2<tspan class="dv-x">x</tspan></text><text x="190" y="144" text-anchor="end" class="dv-lab">find filtered scan</text><path d="M200,128 h189.7 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-189.7 z" fill="var(--dv-rust)"><title>Rust server — 1.4x mongod</title></path><text x="399.7" y="139" class="dv-val">1.4<tspan class="dv-x">x</tspan></text><text x="190" y="178" text-anchor="end" class="dv-lab">update_many (half)</text><path d="M200,162 h160.8 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-160.8 z" fill="var(--dv-rust)"><title>Rust server — 1.2x mongod</title></path><text x="370.8" y="173" class="dv-val">1.2<tspan class="dv-x">x</tspan></text><text x="190" y="212" text-anchor="end" class="dv-lab">aggregate $group</text><path d="M200,196 h389.6 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-389.6 z" fill="var(--dv-rust)"><title>Rust server — 2.8x mongod</title></path><text x="599.6" y="207" class="dv-val">2.8<tspan class="dv-x">x</tspan></text><text x="190" y="246" text-anchor="end" class="dv-lab">aggregate multi-stage</text><path d="M200,230 h359.6 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-359.6 z" fill="var(--dv-rust)"><title>Rust server — 2.6x mongod</title></path><text x="569.6" y="241" class="dv-val">2.6<tspan class="dv-x">x</tspan></text><text x="190" y="280" text-anchor="end" class="dv-lab">delete_many (half)</text><path d="M200,264 h495.5 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-495.5 z" fill="var(--dv-rust)"><title>Rust server — 3.6x mongod</title></path><text x="705.5" y="275" class="dv-val">3.6<tspan class="dv-x">x</tspan></text><text x="190" y="314" text-anchor="end" class="dv-lab">change-stream drain</text><path d="M200,298 h185.1 a4.0,4.0 0 0 1 4.0,4.0 v6.0 a4.0,4.0 0 0 1 -4.0,4.0 h-185.1 z" fill="var(--dv-rust)"><title>Rust server — 1.4x mongod</title></path><text x="395.1" y="309" class="dv-val">1.4<tspan class="dv-x">x</tspan></text></svg></div>
 ```
 
 | Workload | mongod | Rust server | ×mongod |
 |---|---:|---:|---:|
-| insert (10k docs) | 93.0 ms | 190.7 ms | 2.1× |
-| find indexed range | 11.3 ms | 11.2 ms | 1.0× |
-| find full scan | 20.9 ms | 22.6 ms | 1.1× |
-| find filtered scan | 16.0 ms | 21.5 ms | 1.3× |
-| update_many (half) | 109.8 ms | 155.4 ms | 1.4× |
-| aggregate $group | 14.3 ms | 27.1 ms | 1.9× |
-| aggregate multi-stage | 16.5 ms | 42.3 ms | 2.6× |
-| delete_many (half) | 56.0 ms | 105.2 ms | 1.9× |
-| change-stream drain | 115.0 ms | 141.4 ms | 1.2× |
+| insert (10k docs) | 177.4 ms | 259.2 ms | 1.5× |
+| find indexed range | 17.1 ms | 22.2 ms | 1.3× |
+| find full scan | 33.5 ms | 40.8 ms | 1.2× |
+| find filtered scan | 25.8 ms | 35.7 ms | 1.4× |
+| update_many (half) | 231.9 ms | 273.1 ms | 1.2× |
+| aggregate $group | 18.9 ms | 53.0 ms | 2.8× |
+| aggregate multi-stage | 26.7 ms | 69.2 ms | 2.6× |
+| delete_many (half) | 96.2 ms | 343.1 ms | 3.6× |
+| change-stream drain | 178.5 ms | 241.0 ms | 1.4× |
 
 \* Change-stream drain: 5,000 events consumed through a `watch()` cursor
-(only the drain is timed). mongod's number is measured against a throwaway
-**single-node replica set** — its change streams require one — while every
-other row keeps the standalone-mongod reference, so the rest of the table
-stays comparable with earlier publications.
+(only the drain is timed).
+
+**Both servers run as a single-node replica set** (since 2026-11-18). That is
+`secantusd-mdb`'s default mode, and the one change streams need. In it, a
+write with the default write concern waits for the journal to reach disk on
+both servers. Until 2026-11-18 the reference was a *standalone* `mongod`,
+which acknowledges a default write before the journal is synced, so the
+earlier tables are not comparable with this one. On that setup `mongod`'s
+writes were roughly half as expensive.
 
 ## Reading the numbers
 
-- **The Rust server runs at ~1.0×–3.2× of mongod** per operation, taking
-  the lowest and highest figure across three interleaved runs. The reads
-  sit closest: indexed range at 1.0×–1.2×, full scan at
-  1.1×–1.4×, filtered scan at 1.2×–1.3× and the change-stream drain at
-  1.1×–1.3×; `update_many` is 1.4×–1.7×. The widest gaps stay on
-  `insert` (2.1×–2.3×), `delete_many` (1.9×–2.1×) and the aggregation
-  paths (`$group` 1.9×–2.3×, multi-stage 2.6×–3.2×) — dispatch and
-  operator work above a storage engine that is literally the same C
-  library.
+- **The Rust server runs at 1.2×–3.6× of mongod** per operation (the
+  median of 15 interleaved repetitions, measured 2026-11-18 on a DigitalOcean
+  droplet, `mongod` 8.0.38). Reads, `update_many` and the change-stream drain
+  sit closest, at 1.2×–1.4×; `insert` is 1.5×. The widest gaps are the
+  aggregation paths (`$group` 2.8×, multi-stage 2.6×) and `delete_many`
+  (3.6×). The storage engine is the same C library, so these gaps are in
+  dispatch and operator work above it.
 
-  The previous publication gave this range as 1.0×–4.1×. Its top end was
-  the multi-stage aggregation in one run of a harness that measured the
-  servers one after another; measured interleaved, the same row is
-  3.2×, 2.9× and 2.6×. It is still the row that moves most between
-  runs. See "Three interleaved runs" below.
+  Single repetitions spread widely on a shared droplet. Indexed range, for
+  example, ran anywhere from 0.6× to 2.1×. Quote the medians, not one rep.
 
   The read rows improved sharply in 0.6.0b11: `getMore` had been reusing
   mongod's 101-document *first-batch* default on every batch, so a
@@ -109,7 +109,7 @@ stays comparable with earlier publications.
   under concurrent connections is a separate measurement (and a place where
   mongod's connection pooling / async accept loop wins regardless).
 
-### Three sequential runs, one build
+### Three sequential runs, one build (2026-10, standalone `mongod`)
 
 The per-operation harness was run three times on the same engine code —
 once on 2026-10-07 and twice on 2026-10-08, each on a freshly provisioned
@@ -211,52 +211,48 @@ client droplets, real NICs between them — and runs **SecantusDB and a real
 drift lands on both equally.
 
 <!-- head-to-head:begin -->
-Measured 2026-10-16 on DigitalOcean `lon1`: a `c-4 (4 vCPU, 8192 MB)` server and 2 x c-2, 16 workers each, 8 KiB **incompressible**
+Measured 2026-11-18 on DigitalOcean `ams3`: a `c-4 (4 vCPU, 8192 MB)` server and 2 x c-2, 16 workers each, 8 KiB **incompressible**
 documents, a 70/20/10 insert/find/update mix, a 4G WiredTiger cache for
 both engines, and 3 interleaved passes:
 
 | engine | version | ops/s (median) | spread | p50 | p99 | p99.9 | server CPU |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| SecantusDB | 7a89080d0434a980a4a6e9f4a3109bf4632cc0ff | **10,900** | 0.8% | 2.34 ms | 13.12 ms | **26.62 ms** | 78.9% |
-| mongod | 8.0.34 | **16,886** | 0.9% | 1.57 ms | 8.90 ms | **16.26 ms** | 80.3% |
+| SecantusDB | 90f5513a77a7f6499b188fcb528dffdfed065329 | **3,818** | 1.4% | 7.20 ms | 40.96 ms | **83.46 ms** | 67.2% |
+| mongod | 8.0.38 | **7,527** | 2.4% | 3.42 ms | 17.02 ms | **42.50 ms** | 76.4% |
 
-**SecantusDB reaches 0.65x of MongoDB's throughput on this workload, with p50
-latency within 1.49x and p99.9 within 1.64x.** Both engines saturated the same
+**SecantusDB reaches 0.51x of MongoDB's throughput on this workload, with p50
+latency within 2.10x and p99.9 within 1.96x.** Both engines saturated the same
 server while the clients sat idle, so both figures are server-bound and the
-comparison is fair. Run-to-run spread was about 0.8%.
+comparison is fair. Run-to-run spread was about 1.4%.
 <!-- head-to-head:end -->
 
-The table is 0.5.3-beta.196 against `mongod` 8.0.34. The ratio fell from the
-0.72×–0.76× published before, and that fall is `mongod`'s, not ours. On
-2026-10-16 we ran the previous release, 0.5.3-beta.195, against the same
-`mongod` 8.0.34 on a fresh set of droplets, as a control:
+The table is 0.5.3-beta.198 against `mongod` 8.0.38, **both running as a
+one-member replica set with journaled default writes**. Every earlier run
+compared against a *standalone* `mongod`. That setup does not wait for the
+journal on a default write, while `secantusd-mdb`, which is a replica-set
+primary by default, has waited for it since 0.5.3-beta.198. The earlier
+ratios therefore measured different durability, and they are not comparable
+with this one:
 
-| run | build | mongod | SecantusDB ops/s | mongod ops/s | throughput | p50 | p99 | p99.9 |
-| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2026-10-07 | beta.173 | 8.0.32 | 10,175 | 13,928 | 0.73× | 1.25× | 1.49× | 1.77× |
-| 2026-10-08 (a) | beta.173 | 8.0.32 | 9,064 | 12,635 | 0.72× | 1.32× | 1.39× | 1.26× |
-| 2026-10-08 (b) | beta.173 | 8.0.32 | 11,703 | 15,365 | 0.76× | 1.23× | 1.41× | 1.68× |
-| 2026-10-16 (control) | beta.195 | 8.0.34 | 7,236 | 12,122 | 0.60× | 1.61× | 1.28× | 2.86× |
-| 2026-10-16 | beta.196 | 8.0.34 | 10,900 | 16,886 | 0.65× | 1.49× | 1.47× | 1.64× |
+| run | build | mongod | mongod mode | SecantusDB ops/s | mongod ops/s | throughput | p50 | p99.9 |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 2026-10-07 | beta.173 | 8.0.32 | standalone | 10,175 | 13,928 | 0.73× | 1.25× | 1.77× |
+| 2026-10-16 | beta.196 | 8.0.34 | standalone | 10,900 | 16,886 | 0.65× | 1.49× | 1.64× |
+| 2026-11-18 | beta.198 | 8.0.38 | standalone | 1,682 | 12,280 | 0.14× | — | — |
+| 2026-11-18 | beta.198 | 8.0.38 | replica set | 3,818 | 7,527 | 0.51× | 2.10× | 1.96× |
 
-Against the same `mongod`, beta.196 measured 0.65× and beta.195 0.60×, so the
-planner and exact-number work in beta.196 cost nothing measurable here. Our own
-rate stayed inside the 9,000–11,700 ops/s it has held since 2026-10-07, while
-`mongod` 8.0.34 ran faster than 8.0.32 did on every earlier set of droplets.
-The absolute rate of both engines still moves by 30% or more from one set of
-droplets to the next (the control ran on slower ones), so compare the ratios,
-and only across runs against the same `mongod`.
+The third row is the run that set off the investigation: beta.198 now
+syncs the journal on every default write, and the standalone `mongod` never
+did. On like-for-like durability `mongod` loses about 55% of its throughput
+(16,886 to 7,527 ops/s, on different droplets), and SecantusDB is at 0.51× of it.
+Absolute rates move by 30% or more from one set of droplets to the next, so
+compare ratios within a run.
 
-**The p99.9 ratio is not stable.** It was 1.26×–1.77× across the 8.0.32 runs,
-and 1.64× and 2.86× in the two 8.0.34 runs; the control's 215 ms was one
-droplet set's tail, and the beta.196 run's was 26.6 ms. Our p99.9 has otherwise
-stayed between 26 ms and 40 ms since 0.5.3-beta.163 (37.3 ms).
-
-Before the block compressor changed, that ratio was **72×** — profiling found
-65% of server CPU inside zlib's `deflate`, and switching the default to lz4 cut
-p99.9 from 1,303 ms to 37 ms in one step. What remains is a real throughput gap
-(0.65× of `mongod` 8.0.34, 0.72×–0.76× of 8.0.32), no longer dominated by any
-single cause.
+Before the block compressor changed, the p99.9 ratio was **72×**. Profiling
+found 65% of server CPU inside zlib's `deflate`, and switching the default to
+lz4 cut p99.9 from 1,303 ms to 37 ms in one step. What remains is a real
+throughput gap on durable writes (0.51× of `mongod` 8.0.38), and it is no
+longer dominated by any single cause.
 
 Caveats, in both directions:
 
@@ -266,7 +262,7 @@ Caveats, in both directions:
 - **This is one workload shape.** Write-heavy, small documents, single-node, no
   secondary indexes beyond `_id` and the benchmark's own. It is a useful
   comparison, not a general claim.
-- **Tail latency is still the weaker axis.** p50 is within 1.5×; p99.9 is 1.3×–1.8× in most runs. If your
+- **Latency is still the weaker axis.** In the replica-set run, p50 was 2.1× and p99.9 2.0× `mongod`'s. If your
   workload is write-heavy and latency-sensitive at the tail, measure with your
   own data before switching.
 

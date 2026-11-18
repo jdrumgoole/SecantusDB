@@ -12,7 +12,7 @@ You run one or both; each is its own process with its own data directory.
 | Wire protocol | MongoDB | PostgreSQL |
 | Held to | `mongod` 8.x | PostgreSQL |
 | Conformance | **99.5%** of pymongo's own suite | psycopg 3's own suite, unmodified |
-| Speed | within 1.0×–3.2× of `mongod` per operation | see [Benchmark](benchmark.md) |
+| Speed | within 1.2×–3.6× of `mongod` per operation | see [Benchmark](benchmark.md) |
 | Get it | PyPI, crates.io, GitHub Releases | PyPI, crates.io, GitHub Releases |
 
 Each is held to the real product — **`mongod`** or **PostgreSQL** — never to

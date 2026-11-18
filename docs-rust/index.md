@@ -30,12 +30,12 @@ the `OP_MSG` handshake, the commands and the error codes are `mongod`'s, over
 the same WiredTiger on-disk engine.
 
 And it is fast: on the nine-workload benchmark the Rust server runs at
-**~1.0×–3.2× of real `mongod`** per operation across three runs
-(reads and the change-stream drain at 1.0×–1.4×, multi-stage
-aggregation at the high end — after a mimalloc allocator, LTO, and profile-guided optimization cut the
+**1.2×–3.6× of real `mongod`** per operation, both as a single-node
+replica set (reads and the change-stream drain at 1.2×–1.4×,
+`delete_many` and aggregation at the high end — after a mimalloc allocator, LTO, and profile-guided optimization cut the
 BSON-materialization allocation and hot-path branch cost), sustains
-**3.3×–3.7× multi-writer scaling fully durable** (monotonic to eight
-writers),
+**2.6× multi-writer scaling at eight writers with journaled writes**
+(monotonic),
 measured end-to-end through `pymongo` on
 on-disk WiredTiger. Numbers and methodology:
 [Benchmark](https://secantusdb.com/docs/benchmark.html) and
