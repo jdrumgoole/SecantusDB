@@ -1777,13 +1777,18 @@ a regression test.
       or a Memoize still prints the plain plan.) (Since 2026-11-18 such a
       chain with a WHERE whose conjuncts each read one relation prints them
       as its scans' `Filter`, prefixed, their columns kept out of a hashed
-      scan's `Output` unless needed above: `ChainRel::quals`.) Still the
-      plain plan: a nested loop or merge join in a chain, a WHERE conjunct
-      reading two of its relations, and an outer join in one (`explain
-      (verbose, costs off) select e.b, e2.b from e join k on e.a = k.a left
-      join e e2 on e2.a = k.a` on PostgreSQL 15.19 prints each node's
-      `Output` over the same `Hash Left Join` shape).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a three-way join ending in a left join]
+      scan's `Output` unless needed above: `ChainRel::quals`.) (Since
+      2026-11-18 a chain whose topmost join is a LEFT JOIN prints every
+      node's `Output`, the outer ON's columns kept out of the inner
+      equivalence classes: `VerboseChain::left_join`.) Still the plain
+      plan: a nested loop or merge join in a chain, any other outer join in
+      one, a WHERE on a LEFT JOIN's nullable side, and a WHERE conjunct
+      reading two of its relations (`explain (verbose, costs off) select
+      e.b, e2.b from e join k on e.a = k.a join e e2 on e2.a = e.a where
+      e2.b <> k.b` on PostgreSQL 15.19 prints each node's `Output` and the
+      `Join Filter` on the join below it; that query's plain plan also
+      joins in another order here, RP-1059).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a three-way join with a join filter]
       Backlog-ID: RP-966
 
 - [ ] **A WHERE-filtered relation of a three-way join is not joined
@@ -1793,7 +1798,10 @@ a regression test.
       joins `(e2 join e) join k`, the filtered `e e2` the outermost scan,
       `Hash Cond: (e2.a = e.a)` below `Hash Cond: (e.a = k.a)`. Size the
       join-order search's costing of the filtered relation from a probe
-      of each candidate's cost. Found while working RP-966.
+      of each candidate's cost. The same query with `where e2.b <> k.b`
+      and `on e2.a = e.a` is bushy on PostgreSQL 15.19, `e` against a
+      Hash of `(e2 join k)` with the `Join Filter`; here left-deep `(e
+      join k) join e2`. Found while working RP-966.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a filtered relation of a three-way join is joined first]
       Backlog-ID: RP-1059
 

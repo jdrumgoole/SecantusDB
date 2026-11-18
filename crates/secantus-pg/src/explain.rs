@@ -3968,6 +3968,7 @@ pub(crate) fn attach_verbose_chain(
         c: &VerboseChain,
         under_hash: bool,
         apply: bool,
+        top: bool,
     ) -> Option<(Vec<usize>, Tlist)> {
         if let Some(plain) = n.name.strip_prefix("Seq Scan on ") {
             if !n.children.is_empty() {
@@ -4003,7 +4004,13 @@ pub(crate) fn attach_verbose_chain(
             prefix_quals(n, &r.quals);
             return Some((vec![i], r.reltarget.clone()));
         }
-        if n.name != "Hash Join"
+        // A LEFT JOIN is the topmost join, its nullable relation hashed.
+        let join_name = if top && c.left_join {
+            "Hash Left Join"
+        } else {
+            "Hash Join"
+        };
+        if n.name != join_name
             || n.details
                 .iter()
                 .any(|(k, _)| k != "Hash Cond" && k != "Inner Unique")
@@ -4016,8 +4023,11 @@ pub(crate) fn attach_verbose_chain(
         if hash.name != "Hash" || !hash.details.is_empty() || hash.children.len() != 1 {
             return None;
         }
-        let (mut rels, mut tlist) = walk(outer, c, false, apply)?;
-        let (inner_rels, inner_tlist) = walk(&mut hash.children[0], c, true, apply)?;
+        let (mut rels, mut tlist) = walk(outer, c, false, apply, false)?;
+        let (inner_rels, inner_tlist) = walk(&mut hash.children[0], c, true, apply, false)?;
+        if top && c.left_join && inner_rels != [c.rels.len() - 1] {
+            return None;
+        }
         if apply {
             let hashed: Vec<&str> = inner_tlist.iter().map(|(t, _)| t.as_str()).collect();
             hash.details.insert(0, ("Output".into(), hashed.join(", ")));
@@ -4035,11 +4045,11 @@ pub(crate) fn attach_verbose_chain(
         return;
     };
     // Check the whole tree before changing any of it.
-    match walk(root, c, false, false) {
+    match walk(root, c, false, false, true) {
         Some((rels, _)) if rels.len() == c.rels.len() => {}
         _ => return,
     }
-    walk(root, c, false, true);
+    walk(root, c, false, true, true);
     root.details[0].1 = c.output.join(", ");
 }
 

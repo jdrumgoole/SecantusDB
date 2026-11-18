@@ -7230,6 +7230,9 @@ pub struct ChainNeed {
 pub struct VerboseChain {
     pub rels: Vec<ChainRel>,
     pub output: Vec<String>,
+    /// The topmost join is a LEFT JOIN, the last relation its nullable
+    /// side: a `Hash Left Join`.
+    pub left_join: bool,
 }
 
 /// [`VerboseChain`] for `SELECT <columns> FROM a JOIN b ON a.x = b.y JOIN
@@ -7256,15 +7259,23 @@ pub fn explain_verbose_chain(
     let mut ons: Vec<&Node> = Vec::new();
     let mut rights: Vec<&pg_query::protobuf::RangeVar> = Vec::new();
     let mut node: &Node = item;
+    let mut left_join = false;
     let first = loop {
         match node.node.as_ref() {
             Some(N::JoinExpr(j)) => {
+                // Only the topmost join may be a LEFT JOIN: its nullable
+                // side is the last relation, joined above every other.
+                let left = j.jointype == pg_query::protobuf::JoinType::JoinLeft as i32;
                 if j.is_natural
                     || !j.using_clause.is_empty()
                     || j.alias.is_some()
-                    || j.jointype != pg_query::protobuf::JoinType::JoinInner as i32
+                    || (j.jointype != pg_query::protobuf::JoinType::JoinInner as i32
+                        && !(left && rights.is_empty()))
                 {
                     return None;
+                }
+                if left {
+                    left_join = true;
                 }
                 let Some(N::RangeVar(rv)) = j.rarg.as_deref()?.node.as_ref() else {
                     return None;
@@ -7348,7 +7359,12 @@ pub fn explain_verbose_chain(
     }
     // Union-find over the columns the ONs equate.
     let mut ecs: Vec<Vec<(usize, String)>> = Vec::new();
-    for on in &ons {
+    // A LEFT JOIN's ON makes no equivalence class: each of its columns
+    // is needed until the join above both of its relations
+    // (`distribute_qual_to_rels` keeps it an outer-join clause).
+    let mut outer_needs: Vec<((usize, String), [usize; 2])> = Vec::new();
+    let last_on = ons.len() - 1;
+    for (on_i, on) in ons.iter().enumerate() {
         let mut parts = Vec::new();
         and_clauses(on, &mut parts);
         for part in &parts {
@@ -7375,6 +7391,11 @@ pub fn explain_verbose_chain(
                 if !order[*i].contains(c) {
                     order[*i].push(c.clone());
                 }
+            }
+            if left_join && on_i == last_on {
+                outer_needs.push((l.clone(), [l.0, r.0]));
+                outer_needs.push((r.clone(), [l.0, r.0]));
+                continue;
             }
             let li = ecs.iter().position(|e| e.contains(&l));
             let ri = ecs.iter().position(|e| e.contains(&r));
@@ -7429,6 +7450,11 @@ pub fn explain_verbose_chain(
             if readers.next().is_some() {
                 return None;
             }
+            // A WHERE on the nullable side is not pushed below the outer
+            // join (and may reduce it to an inner one).
+            if left_join && i == n - 1 {
+                return None;
+            }
             quals[i].push((print(part, i, true)?, print(part, i, false)?));
         }
     }
@@ -7455,6 +7481,9 @@ pub fn explain_verbose_chain(
                             .find(|e| e.contains(&key))
                             .map(|e| e.iter().map(|m| m.0).collect())
                             .unwrap_or_default();
+                        for (_, rels) in outer_needs.iter().filter(|(k, _)| *k == key) {
+                            ec_rels.extend(rels);
+                        }
                         ec_rels.sort_unstable();
                         ec_rels.dedup();
                         let need = ChainNeed {
@@ -7471,5 +7500,6 @@ pub fn explain_verbose_chain(
     Some(VerboseChain {
         rels,
         output: outputs.iter().map(|(i, c)| pre(*i, c)).collect(),
+        left_join,
     })
 }

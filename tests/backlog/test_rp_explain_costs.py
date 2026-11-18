@@ -2065,7 +2065,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # Measured on PostgreSQL 15.19 (2026-11-18): an outer join in a chain
     # prints every node's `Output` too.
     "explain verbose of a three-way join ending in a left join": (
-        "RP-966",
+        "RP-966:fixed",
         _ANALYSED,
         "explain (verbose, costs off) select e.b, e2.b from e join k on e.a = k.a "
         "left join e e2 on e2.a = k.a",
@@ -2087,6 +2087,35 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Output: e2.b, e2.a",
             "        ->  Seq Scan on public.e e2",
             "              Output: e2.b, e2.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (2026-11-18): a WHERE comparing two
+    # relations of a chain is a join's `Join Filter`, its columns in the
+    # `Output` below it.
+    "explain verbose of a three-way join with a join filter": (
+        "RP-966",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, e2.b from e join k on e.a = k.a "
+        "join e e2 on e2.a = e.a where e2.b <> k.b",
+        [
+            "Hash Join",
+            "  Output: e.b, e2.b",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on public.e",
+            "        Output: e.a, e.b",
+            "  ->  Hash",
+            "        Output: k.a, e2.b, e2.a",
+            "        ->  Hash Join",
+            "              Output: k.a, e2.b, e2.a",
+            "              Inner Unique: true",
+            "              Hash Cond: (e2.a = k.a)",
+            "              Join Filter: (e2.b <> k.b)",
+            "              ->  Seq Scan on public.e e2",
+            "                    Output: e2.a, e2.b",
+            "              ->  Hash",
+            "                    Output: k.a, k.b",
+            "                    ->  Seq Scan on public.k",
+            "                          Output: k.a, k.b",
         ],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): a
