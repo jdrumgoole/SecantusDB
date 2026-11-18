@@ -2387,6 +2387,58 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on k",
         ],
     ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966): the
+    # range-filtered `e` is hashed under `e2`, and `k` joined last through
+    # its index.
+    "a range-filtered relation of a three-way join is joined first": (
+        "RP-1059",
+        _ANALYSED,
+        "explain (costs off) select e.b, e2.b from e join k on e.a = k.a "
+        "join e e2 on e2.a = k.a where e.a < 5",
+        [
+            "Nested Loop",
+            "  Join Filter: (e.a = k.a)",
+            "  ->  Hash Join",
+            "        Hash Cond: (e2.a = e.a)",
+            "        ->  Seq Scan on e e2",
+            "        ->  Hash",
+            "              ->  Seq Scan on e",
+            "                    Filter: (a < 5)",
+            "  ->  Index Only Scan using k_pkey on k",
+            "        Index Cond: (a = e2.a)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966): the WHERE
+    # constant joins the ON's equivalence class, as in the comma join RP-977
+    # fixed, and each inner index scan takes it as its Index Cond.
+    "an explicit join's class constant is the inner index's cond": (
+        "RP-1065",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e join k on e.a = k.a where e.a = 3",
+        [
+            "Nested Loop",
+            "  ->  Seq Scan on e",
+            "        Filter: (a = 3)",
+            "  ->  Index Scan using k_pkey on k",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    "a three-way explicit join's class constant is each inner index's cond": (
+        "RP-1065",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e join k on e.a = k.a "
+        "join k k2 on k2.a = e.a where e.a = 3",
+        [
+            "Nested Loop",
+            "  ->  Nested Loop",
+            "        ->  Seq Scan on e",
+            "              Filter: (a = 3)",
+            "        ->  Index Scan using k_pkey on k",
+            "              Index Cond: (a = 3)",
+            "  ->  Index Only Scan using k_pkey on k k2",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): with a
     # second ON clause the expression's side is the probe side.
     "a hash join on an expression and a column pair hashes the column side": (

@@ -1687,7 +1687,13 @@ a regression test.
       e.b, e2.b from e join k on e.a = k.a join e e2 on e2.a = e.a where
       e2.b <> k.b` on PostgreSQL 15.19 prints each node's `Output` and the
       `Join Filter` on the join below it; that query's plain plan also
-      joins in another order here, RP-1059).
+      joins in another order here, RP-1059). As of 2026-11-18 every
+      remaining shape probed has a plain plan that differs too, so each
+      waits on the item named: a WHERE conjunct reading two relations of a
+      chain (RP-1059, all three pairings), a nested loop in a chain (RP-1059
+      for `where e.a < 5`, RP-1065 for `where e.a = 3`), a RIGHT join
+      (RP-1063). Work those first; the VERBOSE half then follows the
+      chain's `Output` rules above.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a three-way join with a join filter]
       Backlog-ID: RP-966
 
@@ -1701,9 +1707,27 @@ a regression test.
       of each candidate's cost. The same query with `where e2.b <> k.b`
       and `on e2.a = e.a` is bushy on PostgreSQL 15.19, `e` against a
       Hash of `(e2 join k)` with the `Join Filter`; here left-deep `(e
-      join k) join e2`. Found while working RP-966.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a filtered relation of a three-way join is joined first]
+      join k) join e2`. So with a range: `... on e2.a = k.a where e.a < 5`
+      is on PostgreSQL 15.19 a Nested Loop of `(e2 join e)`, `e` the
+      filtered Hash, into an Index Only Scan of `k` with `Join Filter: (e.a
+      = k.a)`; here `(e join k) join e2`, all hash joins. Found while
+      working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a filtered relation of a three-way join is joined first], tests/backlog/test_rp_explain_costs.py::test_plan[a range-filtered relation of a three-way join is joined first]
       Backlog-ID: RP-1059
+
+- [ ] **A WHERE constant does not join an explicit JOIN's equivalence
+      class.** `explain (costs off) select e.b, k.b from e join k on e.a =
+      k.a where e.a = 3` (`e`, `k` analysed, 1000 rows) is a `Hash Join`
+      on `(e.a = k.a)` here; PostgreSQL 15.19 puts the constant in the
+      class (`generate_base_implied_equalities_const`) and runs a Nested
+      Loop into `Index Scan using k_pkey on k`, `Index Cond: (a = 3)`, no
+      join clause, as RP-977 already does for the comma join `from e, k
+      where e.a = k.a and e.a = 5`. A third relation on the class (`join k
+      k2 on k2.a = e.a`) likewise gets its own `Index Cond: (a = 3)`. Find
+      where the ON's equalities miss the WHERE's constant. Found while
+      working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an explicit join's class constant is the inner index's cond], tests/backlog/test_rp_explain_costs.py::test_plan[a three-way explicit join's class constant is each inner index's cond]
+      Backlog-ID: RP-1065
 
 - [ ] **A LEFT JOIN nothing reads is not removed.** `explain (costs
       off) select e.b from e left join k on e.a = k.a` (`k.a` the primary
