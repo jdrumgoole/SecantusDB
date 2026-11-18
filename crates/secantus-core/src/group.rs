@@ -2563,9 +2563,9 @@ fn run_group(
             acc_mem[j] = acc_mem[j] - before + acc_memory(acc);
             acc_max[j] = acc_max[j].max(acc_mem[j]);
         }
-        // SBE holds its hash table to its own 100 MiB
-        // (`internalQuerySBEAggApproxMemoryUseInBytesBeforeSpill`, not
-        // settable at runtime on 8.2.11); the classic engine to
+        // SBE holds its hash table to its own budget
+        // (`internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill`,
+        // 100 MiB by default); the classic engine to
         // `internalDocumentSourceGroupMaxMemoryBytes` (measured 2026-10-26:
         // lowering that knob refuses or spills a classic `$group` and leaves
         // an SBE one alone).

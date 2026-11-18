@@ -20,9 +20,12 @@
 //! a merged `$stdDevPop`, or `$maxN` with ties, answers what mongod's merge
 //! answers.
 //!
-//! SBE spills its hash table to a WiredTiger record store of its own, which
-//! the engine crate cannot reach; its spill here is still this server's: a
-//! small BSON document per accumulator, read back into the same state.
+//! SBE spills its hash table to a record store of mongod's spill WiredTiger;
+//! here it spills to one table of the server's spill engine
+//! ([`crate::spill_table`], RM-612), each run a range of record ids read
+//! back in order, or to a file when no engine is handed in. The records are
+//! still this server's: a small BSON document per accumulator, read back
+//! into the same state.
 
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -68,11 +71,20 @@ pub(crate) struct Spills {
     runs: Vec<Run>,
     /// Spilled by SBE, in this server's own format.
     sbe: bool,
+    /// SBE's spill table in the server's spill engine, as mongod 8.2's
+    /// `HashAggStage` spills to a record store of its spill WiredTiger
+    /// (RM-612); dropped with this value.
+    table: Option<Box<dyn crate::spill_table::SpillTable>>,
+    /// The runs written to `table`: each its first record id and its
+    /// groups.
+    table_runs: Vec<(i64, usize)>,
+    /// The table's size after the last spill.
+    stored: i64,
 }
 
 impl Spills {
     pub(crate) fn is_empty(&self) -> bool {
-        self.runs.is_empty()
+        self.runs.is_empty() && self.table_runs.is_empty()
     }
 }
 
@@ -740,6 +752,30 @@ fn spill_sbe(ids: Vec<Bson>, states: Vec<Vec<Acc>>, spills: &mut Spills, held: u
     let mut order: Vec<usize> = (0..ids.len()).collect();
     order.sort_by(|&a, &b| order::cmp(&ids[a], &ids[b]));
     let mut groups: Vec<Option<(Bson, Vec<Acc>)>> = ids.into_iter().zip(states).map(Some).collect();
+    if spills.table.is_none() && spills.runs.is_empty() {
+        if let Some(table) = crate::spill_table::create() {
+            spills.table = Some(table.map_err(|e| table_error("create", e))?);
+        }
+    }
+    if let Some(table) = spills.table.as_mut() {
+        let first = spills.table_runs.last().map_or(1, |(f, n)| f + *n as i64);
+        let mut records = Vec::with_capacity(order.len());
+        for i in order {
+            let (id, accs) = groups[i].take().expect("each group is written once");
+            records.push((first + records.len() as i64, sbe_record(id, accs)?));
+        }
+        let count = records.len();
+        table
+            .insert(&records)
+            .map_err(|e| table_error("write", e))?;
+        let stored = table
+            .storage_size()
+            .map_err(|e| table_error("measure", e))?;
+        spills.table_runs.push((first, count));
+        memlimit::record_group_spill(count as i64, held as i64, stored - spills.stored);
+        spills.stored = stored;
+        return Ok(());
+    }
     let dir = memlimit::spill_dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return Err(io_error("create the directory for", &dir, e));
@@ -756,14 +792,7 @@ fn spill_sbe(ids: Vec<Bson>, states: Vec<Vec<Acc>>, spills: &mut Spills, held: u
     let mut records: i64 = 0;
     for i in order {
         let (id, accs) = groups[i].take().expect("each group is written once");
-        let mut states = Vec::with_capacity(accs.len());
-        for acc in accs {
-            states.push(Bson::Document(acc_to_doc(acc)?));
-        }
-        let record = doc! { "k": id, "s": states };
-        let mut buf = Vec::new();
-        crate::bsondoc::write(&record, &mut buf)
-            .map_err(|e| io_error("encode a group for", &path, e))?;
+        let buf = sbe_record(id, accs)?;
         out.write_all(&buf)
             .map_err(|e| io_error("write", &path, e))?;
         bytes += buf.len() as i64;
@@ -785,37 +814,88 @@ fn spill_sbe(ids: Vec<Bson>, states: Vec<Vec<Acc>>, spills: &mut Spills, held: u
     Ok(())
 }
 
-/// A run being read back: its file and the group at its head.
+/// An I/O failure on SBE's spill table: the query fails with it.
+fn table_error(what: &str, e: String) -> Fallback {
+    Fallback::mongo(1, format!("$group could not {what} its spill table: {e}"))
+}
+
+/// One spilled SBE group as this server encodes it: `{k: key, s: [state,
+/// ...]}`.
+fn sbe_record(id: Bson, accs: Vec<Acc>) -> R<Vec<u8>> {
+    let mut states = Vec::with_capacity(accs.len());
+    for acc in accs {
+        states.push(Bson::Document(acc_to_doc(acc)?));
+    }
+    let record = doc! { "k": id, "s": states };
+    let mut buf = Vec::new();
+    crate::bsondoc::write(&record, &mut buf)
+        .map_err(|e| Fallback::mongo(1, format!("$group could not encode a spilled group: {e}")))?;
+    Ok(buf)
+}
+
+/// How many records a run read back from the spill table reads at once.
+const TABLE_BATCH: usize = 64;
+
+/// Where a run is read back from.
+enum Source {
+    File(BufReader<File>),
+    /// The spill table: the next record id, and the records read ahead.
+    Table(i64, std::collections::VecDeque<Vec<u8>>),
+}
+
+/// A run being read back: its source and the group at its head.
 struct Reader {
     path: PathBuf,
-    input: BufReader<File>,
+    input: Source,
     left: usize,
     head: Option<(Bson, Vec<Acc>)>,
 }
 
 impl Reader {
-    fn advance(&mut self) -> R<()> {
+    fn advance(&mut self, table: Option<&dyn crate::spill_table::SpillTable>) -> R<()> {
         self.head = None;
         if self.left == 0 {
             return Ok(());
         }
         self.left -= 1;
+        let bytes = match &mut self.input {
+            Source::File(input) => Self::read_file(input, &self.path)?,
+            Source::Table(next, ahead) => {
+                if ahead.is_empty() {
+                    let table = table.expect("a table run reads from the spill table");
+                    let n = (self.left + 1).min(TABLE_BATCH);
+                    ahead.extend(table.read(*next, n).map_err(|e| table_error("read", e))?);
+                    *next += n as i64;
+                }
+                ahead
+                    .pop_front()
+                    .ok_or_else(|| table_error("read", "a short run".to_string()))?
+            }
+        };
+        self.decode(&bytes)
+    }
+
+    fn read_file(input: &mut BufReader<File>, path: &std::path::Path) -> R<Vec<u8>> {
         // Each record is one BSON document: its length, then the rest.
         let mut len = [0u8; 4];
-        self.input
+        input
             .read_exact(&mut len)
-            .map_err(|e| io_error("read", &self.path, e))?;
+            .map_err(|e| io_error("read", path, e))?;
         let size = usize::try_from(i32::from_le_bytes(len))
             .ok()
             .filter(|n| *n >= 5)
-            .ok_or_else(|| io_error("read", &self.path, "a record with a bad length"))?;
+            .ok_or_else(|| io_error("read", path, "a record with a bad length"))?;
         let mut bytes = vec![0u8; size];
         bytes[..4].copy_from_slice(&len);
-        self.input
+        input
             .read_exact(&mut bytes[4..])
-            .map_err(|e| io_error("read", &self.path, e))?;
+            .map_err(|e| io_error("read", path, e))?;
+        Ok(bytes)
+    }
+
+    fn decode(&mut self, bytes: &[u8]) -> R<()> {
         let record =
-            crate::bsondoc::from_bytes(&bytes).map_err(|e| io_error("read", &self.path, e))?;
+            crate::bsondoc::from_bytes(bytes).map_err(|e| io_error("read", &self.path, e))?;
         let id = record
             .get("k")
             .cloned()
@@ -851,15 +931,27 @@ fn merge_sbe(mut spills: Spills, fields: &[&str]) -> R<Vec<Document>> {
             groups: r.groups,
         })
         .collect();
+    let table = spills.table.take();
+    let table_ref = table.as_deref();
     for run in &runs {
         let file = File::open(&run.path).map_err(|e| io_error("open", &run.path, e))?;
         let mut reader = Reader {
             path: run.path.clone(),
-            input: BufReader::new(file),
+            input: Source::File(BufReader::new(file)),
             left: run.groups,
             head: None,
         };
-        reader.advance()?;
+        reader.advance(table_ref)?;
+        readers.push(reader);
+    }
+    for &(first, groups) in &spills.table_runs {
+        let mut reader = Reader {
+            path: PathBuf::from("the spill table"),
+            input: Source::Table(first, std::collections::VecDeque::new()),
+            left: groups,
+            head: None,
+        };
+        reader.advance(table_ref)?;
         readers.push(reader);
     }
     let mut out = Vec::new();
@@ -901,12 +993,15 @@ fn merge_sbe(mut spills: Spills, fields: &[&str]) -> R<Vec<Document>> {
                     (kept, into)
                 }
             });
-            r.advance()?;
+            r.advance(table_ref)?;
         }
         let (id, accs) = merged.expect("the least head merged");
         out.push(finalize(id, fields.iter().copied().zip(accs).collect())?);
     }
     drop(readers);
+    if let Some(table) = table {
+        table.drop_table().map_err(|e| table_error("drop", e))?;
+    }
     for run in std::mem::take(&mut spills.runs) {
         std::fs::remove_file(&run.path).map_err(|e| io_error("remove", &run.path, e))?;
     }
@@ -1467,6 +1562,82 @@ mod tests {
                  allowDiskUse:true to opt in"
             ))
         );
+    }
+
+    /// With a spill engine handed in, an SBE `$group` spills every run to
+    /// ONE table of it, reads the runs back from it by record id, reports
+    /// the table's size, and drops it at the end (RM-612).
+    #[test]
+    fn an_sbe_group_spills_to_the_spill_engine_handed_in() {
+        use crate::spill_table::{SpillTable, SpillTables};
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct Seen {
+            rows: BTreeMap<i64, Vec<u8>>,
+            tables: usize,
+            dropped: usize,
+        }
+        struct Engine(Arc<Mutex<Seen>>);
+        struct Table(Arc<Mutex<Seen>>);
+        impl SpillTables for Engine {
+            fn create(&self) -> Result<Box<dyn SpillTable>, String> {
+                self.0.lock().unwrap().tables += 1;
+                Ok(Box::new(Table(self.0.clone())))
+            }
+        }
+        impl SpillTable for Table {
+            fn insert(&mut self, records: &[(i64, Vec<u8>)]) -> Result<(), String> {
+                let mut seen = self.0.lock().unwrap();
+                for (id, b) in records {
+                    assert!(seen.rows.insert(*id, b.clone()).is_none(), "id {id} twice");
+                }
+                Ok(())
+            }
+            fn read(&self, first: i64, count: usize) -> Result<Vec<Vec<u8>>, String> {
+                let seen = self.0.lock().unwrap();
+                Ok((first..first + count as i64)
+                    .map(|i| seen.rows[&i].clone())
+                    .collect())
+            }
+            fn storage_size(&self) -> Result<i64, String> {
+                Ok(4096)
+            }
+            fn drop_table(self: Box<Self>) -> Result<(), String> {
+                self.0.lock().unwrap().dropped += 1;
+                Ok(())
+            }
+        }
+        let spec = bson!({"_id": "$_id", "p": {"$push": "$s"}, "t": {"$sum": "$n"}});
+        let input: Vec<Document> = (0..300)
+            .map(|i| doc! {"_id": i, "s": "x".repeat(1000), "n": i64::from(i)})
+            .collect();
+        let expected = {
+            let _e = crate::sbe::enter(true);
+            crate::group::group_stage(&spec, &input, &Document::new()).unwrap()
+        };
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let (out, report) = memlimit::captured(|| {
+            let _b = memlimit::with_budgets(Budgets {
+                sbe_group: 50_000,
+                ..Default::default()
+            });
+            let _e = crate::sbe::enter(true);
+            let _t = crate::spill_table::with_tables(Some(Arc::new(Engine(seen.clone()))));
+            crate::group::group_stage(&spec, &input, &Document::new()).unwrap()
+        });
+        let mut sorted = expected;
+        sorted.sort_by_key(|d| d.get_i32("_id").unwrap());
+        assert_eq!(out, sorted);
+        let seen = seen.lock().unwrap();
+        assert_eq!((seen.tables, seen.dropped), (1, 1));
+        assert_eq!(
+            seen.rows.keys().copied().collect::<Vec<_>>(),
+            (1..=300).collect::<Vec<_>>()
+        );
+        assert!(report.group_spills > 1, "{report:?}");
+        assert_eq!(report.group_spilled_records, 300);
+        assert_eq!(report.group_spilled_data_storage_size, 4096);
     }
 
     #[test]

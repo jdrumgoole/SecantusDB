@@ -93,7 +93,9 @@ def _mongod_with(*extra: str) -> Iterator[Any]:
 def test_an_sbe_group_spills_as_mongods(tmp_path: Any) -> None:
     """mongod 8.2.11 started with the SBE `$group`'s budget at 50000 spills a
     `$push` of 300 1000-byte strings 7 times, 312300 bytes, into its spill
-    engine (4096 on disk). This server refuses the startup parameter."""
+    engine (4096 on disk). This server takes the parameter and spills to its
+    spill engine the same 7 times (RM-612's first part), but counts 306900
+    bytes, its memory estimate."""
     with _mongod_with("--setParameter", SBE_BUDGET) as mongod:
         expected = _sbe_group_spill(mongod)
     with rust_mongo_server(tmp_path, "--setParameter", SBE_BUDGET) as rust:

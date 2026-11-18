@@ -248,6 +248,38 @@ impl SpillTable {
         }
     }
 
+    /// The `count` records from record id `first` on, in record-id order;
+    /// a record missing from the range is an error, never a short run.
+    pub fn read(&self, first: i64, count: usize) -> Result<Vec<Vec<u8>>> {
+        let mut out = Vec::with_capacity(count);
+        if count == 0 {
+            return Ok(out);
+        }
+        let cursor = self.session().open_cursor(&self.uri, None)?;
+        cursor.set_key_q(first);
+        cursor.search()?;
+        loop {
+            let id = cursor.get_key_q()?;
+            let want = first + out.len() as i64;
+            if id != want {
+                return Err(StorageError::Internal(format!(
+                    "{} has record {id} where {want} was written",
+                    self.uri
+                )));
+            }
+            out.push(cursor.get_value_u()?);
+            if out.len() == count {
+                return Ok(out);
+            }
+            if !cursor.next()? {
+                return Err(StorageError::Internal(format!(
+                    "{} ends after record {id}, before the {count} records from {first}",
+                    self.uri
+                )));
+            }
+        }
+    }
+
     /// The table's file size, as WiredTiger's block manager counts it.
     pub fn storage_size(&self) -> Result<i64> {
         let cursor = self.session().open_cursor(
@@ -308,6 +340,10 @@ impl secantus_core::spill_table::SpillTable for SpillTable {
         SpillTable::insert(self, records).map_err(|e| e.to_string())
     }
 
+    fn read(&self, first: i64, count: usize) -> std::result::Result<Vec<Vec<u8>>, String> {
+        SpillTable::read(self, first, count).map_err(|e| e.to_string())
+    }
+
     fn storage_size(&self) -> std::result::Result<i64, String> {
         SpillTable::storage_size(self).map_err(|e| e.to_string())
     }
@@ -363,6 +399,24 @@ mod tests {
 
     /// A store with no files spills under the system's temporary
     /// directory, and the engine's directory goes with the engine.
+    #[test]
+    fn a_run_reads_back_by_record_id_and_a_gap_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SpillEngine::new(dir.path(), 100);
+        let mut table = engine.create_table().unwrap();
+        table
+            .insert(&[(1, b"a".to_vec()), (2, b"b".to_vec()), (4, b"d".to_vec())])
+            .unwrap();
+        assert_eq!(
+            table.read(1, 2).unwrap(),
+            vec![b"a".to_vec(), b"b".to_vec()]
+        );
+        assert_eq!(table.read(4, 1).unwrap(), vec![b"d".to_vec()]);
+        assert!(table.read(2, 2).is_err(), "record 3 was never written");
+        assert!(table.read(4, 2).is_err(), "the table ends at 4");
+        table.drop_table().unwrap();
+    }
+
     #[test]
     fn a_temporary_engine_removes_its_directory() {
         let engine = SpillEngine::temporary(100);
