@@ -4685,6 +4685,10 @@ impl PgHandler {
             && tree.children[0].children.len() == 1
             && tree.children[0].children[0].children.is_empty()
             && tree.children[0].children[0].name == format!("Seq Scan on {}", sel.table);
+        if simple_sub && !plain_counts {
+            self.init_plan_grouped_counts(agg, sel, tree, param_quals, init_cost);
+            return;
+        }
         if !(plain_counts && simple_sub && shaped) {
             return;
         }
@@ -4709,6 +4713,119 @@ impl PgHandler {
         let mut scan_node = tree.children[0].children.remove(0);
         scan_node.estimate = Some(scan);
         tree.children[0] = scan_node;
+        tree.estimate = Some((startup + init_cost, total + init_cost, rows, w));
+    }
+
+    /// Counts grouped by stored columns over one user table whose WHERE
+    /// reads InitPlans (RP-440): the merged FROM subquery leaves a
+    /// HashAggregate straight over the scan, priced by `cost_agg`
+    /// (AGG_HASHED) where `add_paths_to_grouping_rel` keeps it over a Sort
+    /// and GroupAggregate. The same limits as the grouped count without an
+    /// InitPlan: no index on the table, each key projected once, and few
+    /// enough groups that the hash table fits `hash_mem`. The keys are
+    /// qualified, as the InitPlan lengthens the range table.
+    fn init_plan_grouped_counts(
+        &self,
+        agg: &secantus_pgplan::Aggregate,
+        sel: &secantus_pgplan::Select,
+        tree: &mut explain::PlanNode,
+        param_quals: &[(String, secantus_pgplan::colstats::Op)],
+        init_cost: f64,
+    ) {
+        use secantus_pgplan::OutputCol;
+        let shaped = tree.name == "HashAggregate"
+            && tree.children.len() == 1
+            && tree.children[0].name == format!("Subquery Scan on {}", sel.table)
+            && tree.children[0].children.len() == 1
+            && tree.children[0].children[0].children.is_empty()
+            && tree.children[0].children[0].name == format!("Seq Scan on {}", sel.table);
+        let counts = agg.items.iter().all(|it| {
+            matches!(
+                it.func,
+                secantus_pgplan::AggFunc::CountStar | secantus_pgplan::AggFunc::Count
+            ) && it.expr.is_none()
+                && it.expr2.is_none()
+                && it.field2.is_none()
+                && !it.distinct
+                && it.filter.is_none()
+                && it.order.is_empty()
+        });
+        let keys: Vec<String> = agg.group_by.iter().map(|k| k.field.clone()).collect();
+        let projected = |i: usize| {
+            agg.select
+                .iter()
+                .filter(|(_, c)| *c == OutputCol::Group(i))
+                .count()
+                == 1
+        };
+        let indexed = self
+            .index_relations()
+            .iter()
+            .any(|ix| ix.table.name == sel.table);
+        if !(shaped
+            && counts
+            && !indexed
+            && !keys.is_empty()
+            && agg.group_by.iter().all(|k| k.expr.is_none())
+            && (1..keys.len()).all(|i| !keys[..i].contains(&keys[i]))
+            && (0..keys.len()).all(projected)
+            && agg.select.len() == keys.len() + agg.items.len()
+            && (0..agg.items.len())
+                .all(|i| agg.select.iter().any(|(_, c)| *c == OutputCol::Agg(i)))
+            && agg.grouping_sets.is_none()
+            && agg.groupings.is_empty()
+            && agg.having.is_none()
+            && agg.exprs.is_empty()
+            && agg.order.is_empty()
+            && agg.limit.is_none()
+            && agg.offset == 0
+            && !agg.with_ties
+            && !agg.distinct
+            && agg.filter.is_empty()
+            && agg.series.is_none()
+            && agg.join.is_none())
+        {
+            return;
+        }
+        let mut fields = keys.clone();
+        for f in agg.items.iter().filter_map(|it| it.field.clone()) {
+            if !fields.contains(&f) {
+                fields.push(f);
+            }
+        }
+        let (Some(scan), Some(keyed)) = (
+            self.init_plan_scan_estimate(&sel.table, &sel.filter, param_quals, &fields),
+            self.init_plan_scan_estimate(&sel.table, &sel.filter, param_quals, &keys),
+        ) else {
+            return;
+        };
+        let Some(groups) = self.distinct_groups_over(&sel.table, &sel.filter, &keys, Some(scan.2))
+        else {
+            return;
+        };
+        let aggs = secantus_pgplan::costsize::AggCosts::simple(agg.items.len(), 0);
+        if groups > 50_000.0
+            || secantus_pgplan::costsize::sorted_grouping_wins(
+                scan.1,
+                scan.2,
+                groups,
+                keys.len(),
+                Some(aggs),
+                false,
+            )
+        {
+            return;
+        }
+        let (startup, total, rows, w) =
+            hashed_count_agg_estimate(scan, keys.len(), agg.items.len(), groups, keyed.3);
+        let mut scan_node = tree.children[0].children.remove(0);
+        scan_node.estimate = Some(scan);
+        tree.children[0] = scan_node;
+        let alias = crate::explain::display_alias(&sel.table);
+        let qualified: Vec<String> = keys.iter().map(|k| format!("{alias}.{k}")).collect();
+        for d in tree.details.iter_mut().filter(|(k, _)| k == "Group Key") {
+            d.1 = qualified.join(", ");
+        }
         tree.estimate = Some((startup + init_cost, total + init_cost, rows, w));
     }
 

@@ -5265,9 +5265,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # A GROUP BY hashed above an InitPlan's scan, measured on 15.19
-    # (RP-440): the executor's FROM subquery is merged away.
+    # (RP-440): the executor's FROM subquery was merged away.
     "a group by above an initplan's scan is priced": (
-        "RP-440",
+        "RP-440:fixed",
         _ANALYSED,
         "explain select b, count(*) from e where a > (select 5) group by b",
         [
@@ -5276,6 +5276,21 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  InitPlan 1 (returns $0)",
             "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
             "  ->  Seq Scan on e  (cost=0.00..17.50 rows=333 width=3)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    # A grouped sum hashed above an InitPlan's scan, measured on 15.19
+    # (RP-440): grouped aggregates other than counts are unpriced.
+    "a grouped sum above an initplan's scan is priced": (
+        "RP-440",
+        _ANALYSED,
+        "explain select b, sum(a) from e where a > (select 5) group by b",
+        [
+            "HashAggregate  (cost=19.18..19.28 rows=10 width=11)",
+            "  Group Key: e.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=333 width=7)",
             "        Filter: (a > $0)",
         ],
     ),

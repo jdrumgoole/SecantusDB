@@ -2014,7 +2014,11 @@ a regression test.
       FROM, a correlated one, or a sublink beside any other non-constant
       qual is still printed inline (`select * from e where b = (select b
       from k limit 1)`); a join's ON InitPlan is unpriced; other nodes above
-      the scan (a computed sort key, a GROUP BY) are unpriced. A SELECT
+      the scan (a computed sort key, a GROUP BY of anything but counts of
+      stored columns) are unpriced. Counts grouped by stored columns
+      straight over the scan, on a table with no index, are hashed and
+      priced since 2026-11-18 (`init_plan_grouped_counts`); a grouped
+      `sum` or other aggregate is not. A SELECT
       DISTINCT of stored columns straight over the scan, on a table with no
       index, is hashed and priced since 2026-11-18 (`create_distinct_paths`
       against a Sort and Unique); over an indexed table, or with an ORDER
@@ -2023,7 +2027,7 @@ a regression test.
       2026-11-18. Plain aggregates other than counts over the scan are
       priced since 2026-11-18 (`plain_agg_estimate`). Measured on a private
       15.19 cluster.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a group by above an initplan's scan is priced]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a grouped sum above an initplan's scan is priced]
       Backlog-ID: RP-440
 
 ## Found by batch 54 (2026-10-24)
