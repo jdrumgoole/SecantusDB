@@ -6354,8 +6354,22 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # Still open: a `^` after a character cannot match, which PostgreSQL's
     # NFA optimisation sees; here the scan prints zeros.
-    "estimate of a regex match with an anchor after a character": (
+    # Still open: a `^` a character precedes in one branch of a group is
+    # pruned as dead by `regc_nfa.c`'s optimisation, leaving the other
+    # branch's prefix (`w00`); here zeros.
+    "estimate of a regex match with a dead anchor in a branch": (
         "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '^w(?:^x|0)0'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=91 width=10)",
+            "  Filter: (c ~ '^w(?:^x|0)0'::text)",
+        ],
+    ),
+    # Fixed under RP-423: a `^` every path meets after a character made
+    # the regex `REG_UIMPOSSIBLE`, no prefix; the scan printed zeros.
+    "estimate of a regex match with an anchor after a character": (
+        "RP-423:fixed",
         _ANALYSED_STRINGS,
         "explain select * from w where c ~ '^w(?:^0)1'",
         [

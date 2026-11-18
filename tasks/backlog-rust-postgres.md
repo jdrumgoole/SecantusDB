@@ -1941,10 +1941,11 @@ a regression test.
       Filter (`where_join_filters`). Since 2026-11-18 a `^` in a branch
       of alternatives nothing precedes leaves no prefix, as its second BOS
       arc out of `pre` does in `findprefix` (`^(?:w|^x)0` is `rows=1000`,
-      `^(?:^ab|^ab)` and `^(?:w|^x)?0` no prefix). A `^` after a
-      character, which cannot match (`^w(?:^0)1`), is `rows=1` there and
-      zeros here; one in a later branch is pruned as dead
-      (`^x(?:^w|y)0` is prefix `xy0`). Measured
+      `^(?:^ab|^ab)` and `^(?:w|^x)?0` no prefix). Since 2026-11-18 a `^` every path meets after a character
+      makes the regex `REG_UIMPOSSIBLE`, no prefix (`^w(?:^0)1` is
+      `rows=1`). One a character precedes in one branch is still zeros:
+      `regc_nfa.c` prunes that branch as dead (`^x(?:^w|y)0` is prefix
+      `xy0`; `^w(?:^x|0)0` is `rows=91`). Measured
       on the 15.19 reference on port 5415 (found while working RP-404 and
       RP-354). The repeated group's prefix is not a walk of the regex's
       text: `pg_regprefix` reads the NFA after `regc_nfa.c`'s `optimize`
@@ -1956,7 +1957,7 @@ a regression test.
       `repeat`'s arcs gives (`aba`). The faithful fix ports `regcomp.c` /
       `regc_nfa.c`'s NFA build and optimisation and runs `findprefix` on
       it (2026-11-17, sized while working RP-841).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with an anchor after a character]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with a dead anchor in a branch]
       Backlog-ID: RP-423
 - [ ] **A semi join cheaper unique-ified keeps the semi join's shape.**
       Since RP-411's first slice (2026-11-16) a WHERE that is one

@@ -1013,6 +1013,46 @@ fn strip_bos(
     Some(saw)
 }
 
+/// Whether every path through `atoms` meets a `^` after consuming a
+/// character, so the regex cannot match (`^w(?:^0)1` is `rows=1` on
+/// 15.19). `at_start` is `Some(true)` where nothing has been consumed,
+/// `Some(false)` where something has on every path, `None` where it
+/// depends on the path; only a certain `Some(false)` makes a `^` dead.
+fn bos_after_char(atoms: &[QuantifiedAtom], at_start: &mut Option<bool>) -> bool {
+    for (atom, min, max) in atoms {
+        if *max == Some(0) {
+            continue;
+        }
+        match atom {
+            ReAtom::Bos => {
+                if *at_start == Some(false) {
+                    return true;
+                }
+            }
+            ReAtom::Char(_) | ReAtom::Set => {
+                if *min >= 1 {
+                    *at_start = Some(false);
+                } else if *at_start == Some(true) {
+                    *at_start = None;
+                }
+            }
+            ReAtom::Group(alts, _) => match alts.as_slice() {
+                [only] if *min >= 1 => {
+                    if bos_after_char(only, at_start) {
+                        return true;
+                    }
+                }
+                _ => {
+                    if *at_start == Some(true) {
+                        *at_start = None;
+                    }
+                }
+            },
+        }
+    }
+    false
+}
+
 /// A [`ReAtom`] and its quantifier's bounds.
 type QuantifiedAtom = (ReAtom, u32, Option<u32>);
 
@@ -1063,6 +1103,11 @@ fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String,
     let [atoms] = alternatives.as_mut_slice() else {
         return Some((String::new(), PrefixStatus::None));
     };
+    // A `^` every path reaches after a character: no path to the final
+    // state, `REG_UIMPOSSIBLE`, which `pg_regprefix` answers `REG_NOMATCH`.
+    if bos_after_char(atoms, &mut Some(true)) {
+        return Some((String::new(), PrefixStatus::None));
+    }
     // The `pre` state's rainbow where no `^` anchors the match.
     let mut no_prefix = false;
     if !strip_bos(atoms, &mut true, &mut no_prefix)? || no_prefix {
@@ -1930,12 +1975,14 @@ mod tests {
             ("(?:^w0)1", false, Some(("w01", Partial))),
             ("^(?:^w0)+1", false, Some(("w01", Partial))),
             ("(^a)", false, Some(("a", Partial))),
-            // Not modelled: a `^` after a character (the regex cannot
-            // match), in an optional group or a branch; a back reference
-            // to an unclosed group. (A `^` in a branch nothing precedes
-            // is modelled, above.)
-            ("^w(?:^0)1", false, None),
-            ("^(?:^w)(?:^0)1", false, None),
+            // A `^` every path meets after a character: the regex cannot
+            // match (`REG_UIMPOSSIBLE`), and `pg_regprefix` finds none.
+            ("^w(?:^0)1", false, Some(("", PrefixStatus::None))),
+            ("^(?:^w)(?:^0)1", false, Some(("", PrefixStatus::None))),
+            // Not modelled: a `^` after a character in an optional group
+            // or a branch; a back reference to an unclosed group. (A `^`
+            // in a branch nothing precedes is modelled, above.)
+            ("^w(?:^x|0)0", false, None),
             ("^(?:^w0)?1", false, None),
             ("^a\\1", false, None),
             // A back reference is a copy of the group it names, as
