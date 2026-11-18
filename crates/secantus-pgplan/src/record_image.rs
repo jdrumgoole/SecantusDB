@@ -16,7 +16,7 @@
 //! time, timetz, the timestamps, interval, uuid, macaddr / macaddr8, inet /
 //! cidr, tid, pg_lsn, name, text / varchar / bpchar, bytea, money, bit /
 //! varbit, jsonb, arrays of any of those but bit / varbit, and
-//! the built-in ranges.
+//! the built-in ranges and multiranges.
 
 use std::cmp::Ordering;
 
@@ -276,6 +276,9 @@ fn image(v: &Bson, ty: &str) -> Result<Image> {
         }
         t if RANGE_TYPES.iter().any(|(n, _)| *n == t) => {
             Image::Bytes(range_image(v, t).ok_or_else(refused)?)
+        }
+        t if MULTIRANGE_TYPES.iter().any(|(n, _)| *n == t) => {
+            Image::Bytes(multirange_image(v, t).ok_or_else(refused)?)
         }
         // An `unknown` field (a bare literal in `row(1, 'a')`) is a cstring,
         // attlen -2, which `record_image_cmp` has no case for.
@@ -542,40 +545,114 @@ fn range_image(v: &Bson, ty: &str) -> Option<Vec<u8>> {
     let oid = RANGE_TYPES.iter().find(|(n, _)| *n == ty)?.1;
     let Bson::String(text) = v else { return None };
     let r = crate::range::parse_stored(text).ok()?;
-    let (elem, _) = crate::range::range_element(ty)?;
     let mut out = oid.to_le_bytes().to_vec();
+    let flags = range_bounds(&r, ty, &mut out)?;
+    out.push(flags);
+    Some(out)
+}
+
+/// Appends `r`'s finite bounds as `range_serialize` lays them after the
+/// range's oid (`out` holds that oid, so it is 4 bytes past the varlena
+/// header), and returns the flags byte.
+fn range_bounds(r: &crate::range::Range, ty: &str, out: &mut Vec<u8>) -> Option<u8> {
+    let (elem, _) = crate::range::range_element(ty)?;
     let mut flags = 0u8;
     if r.empty {
-        flags |= 0x01;
-    } else {
-        for (bound, inc, inc_flag, inf_flag) in [
-            (&r.lower, r.lower_inc, 0x02, 0x08),
-            (&r.upper, r.upper_inc, 0x04, 0x10),
-        ] {
-            let Some(b) = bound else {
-                flags |= inf_flag;
-                continue;
+        return Some(0x01);
+    }
+    for (bound, inc, inc_flag, inf_flag) in [
+        (&r.lower, r.lower_inc, 0x02, 0x08),
+        (&r.upper, r.upper_inc, 0x04, 0x10),
+    ] {
+        let Some(b) = bound else {
+            flags |= inf_flag;
+            continue;
+        };
+        if inc {
+            flags |= inc_flag;
+        }
+        if elem == "numeric" {
+            let n = numeric_image(b)?;
+            out.push((((n.len() + 1) << 1) | 1) as u8);
+            out.extend(n);
+        } else {
+            let (_, len, align) = fixed_element(&elem)?;
+            let value = match elem.as_str() {
+                "int4" | "int8" => Bson::Int64(b.parse().ok()?),
+                "date" => Bson::String(b.clone()),
+                _ => crate::cast_value(Bson::String(b.clone()), "timestamp").ok()?,
             };
-            if inc {
-                flags |= inc_flag;
-            }
-            if elem == "numeric" {
-                let n = numeric_image(b)?;
-                out.push((((n.len() + 1) << 1) | 1) as u8);
-                out.extend(n);
-            } else {
-                let (_, len, align) = fixed_element(&elem)?;
-                let value = match elem.as_str() {
-                    "int4" | "int8" => Bson::Int64(b.parse().ok()?),
-                    "date" => Bson::String(b.clone()),
-                    _ => crate::cast_value(Bson::String(b.clone()), "timestamp").ok()?,
-                };
-                pad_to(&mut out, 4, align);
-                out.extend(fixed_bytes(&value, &elem, len)?);
-            }
+            pad_to(out, 4, align);
+            out.extend(fixed_bytes(&value, &elem, len)?);
         }
     }
-    out.push(flags);
+    Some(flags)
+}
+
+/// The built-in multirange types and their `pg_type` oids.
+const MULTIRANGE_TYPES: &[(&str, u32)] = &[
+    ("int4multirange", 4451),
+    ("nummultirange", 4532),
+    ("tsmultirange", 4533),
+    ("tstzmultirange", 4534),
+    ("datemultirange", 4535),
+    ("int8multirange", 4536),
+];
+
+/// A `MultirangeType`'s varlena data (`make_multirange` and
+/// `write_multirange_data` in `multirangetypes.c`): the multirange type's
+/// oid, the range count, one uint32 item for every range but the first
+/// (every `MULTIRANGE_ITEM_OFFSET_STRIDE`th the offset of its bounds with
+/// `MULTIRANGE_ITEM_OFF_BIT`, the others the length of the previous
+/// range's), one flags byte per range, padding to the element type's
+/// alignment, then each range's bounds as `range_serialize` wrote them
+/// (without its header, oid and flags), each padded to that alignment.
+fn multirange_image(v: &Bson, ty: &str) -> Option<Vec<u8>> {
+    const STRIDE: usize = 4;
+    const OFF_BIT: u32 = 0x8000_0000;
+    let oid = MULTIRANGE_TYPES.iter().find(|(n, _)| *n == ty)?.1;
+    let Bson::String(text) = v else { return None };
+    let member = crate::range::multirange_member(ty)?;
+    let (elem, _) = crate::range::range_element(&member)?;
+    let align = if elem == "numeric" {
+        4
+    } else {
+        fixed_element(&elem)?.2
+    };
+    let members = crate::range::multirange_from_text(text, ty).ok()?;
+    let n = members.len();
+    let mut bounds: Vec<Vec<u8>> = Vec::with_capacity(n);
+    let mut flags = Vec::with_capacity(n);
+    for r in &members {
+        // The bounds as they lie in the range, 8 bytes past its start
+        // (varlena header and oid), which keeps their alignment.
+        let mut b = vec![0u8; 4];
+        flags.push(range_bounds(r, &member, &mut b)?);
+        bounds.push(b.split_off(4));
+    }
+    let mut out = oid.to_le_bytes().to_vec();
+    out.extend((n as u32).to_le_bytes());
+    let items_at = out.len();
+    out.resize(items_at + 4 * n.saturating_sub(1), 0);
+    out.extend(&flags);
+    pad_to(&mut out, 4, align);
+    let begin = out.len();
+    let mut prev = 0u32;
+    for (i, b) in bounds.iter().enumerate() {
+        let at = (out.len() - begin) as u32;
+        if i > 0 {
+            let item = if i % STRIDE != 0 {
+                at - prev
+            } else {
+                at | OFF_BIT
+            };
+            out[items_at + 4 * (i - 1)..items_at + 4 * i].copy_from_slice(&item.to_le_bytes());
+            prev = at;
+        }
+        out.extend(b);
+        let len = b.len().div_ceil(align) * align;
+        out.resize(begin + at as usize + len, 0);
+    }
     Some(out)
 }
 
@@ -648,7 +725,7 @@ fn numeric_image(text: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{jsonb_image, numeric_image};
+    use super::{jsonb_image, multirange_image, numeric_image};
 
     fn jsonb(text: &str) -> Vec<u8> {
         jsonb_image(&crate::json::parse(text).unwrap()).unwrap()
@@ -681,6 +758,25 @@ mod tests {
         // 1 and 1.0 differ in display scale.
         assert_ne!(jsonb("1"), jsonb("1.0"));
         assert_eq!(jsonb("1e0"), jsonb("1"));
+    }
+
+    /// `make_multirange`'s layout for `{[1,3),[5,6)}`: oid, count, one
+    /// item (the first range's bounds' length), the two flags bytes padded
+    /// to int alignment, then each range's two int4 bounds.
+    #[test]
+    fn multirange_images_follow_make_multirange() {
+        let img = multirange_image(
+            &bson::Bson::String("{[1,3),[5,6)}".into()),
+            "int4multirange",
+        )
+        .unwrap();
+        let mut want: Vec<u8> = [4451u32, 2, 8]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        want.extend([0x02, 0x02, 0, 0]);
+        want.extend([1u32, 3, 5, 6].iter().flat_map(|w| w.to_le_bytes()));
+        assert_eq!(img, want);
     }
 
     /// The bytes `make_result`'s short format lays out for each value on a

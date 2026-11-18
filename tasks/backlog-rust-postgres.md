@@ -2153,12 +2153,13 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       2026-11-18), arrays of fixed-length elements (by value, or by
       reference: interval, uuid, timetz, name, macaddr / macaddr8, tid) or
       of text / varchar / bpchar / numeric / bytea / inet / cidr / jsonb
-      (each with the 4-byte header `array_in` gives it, measured) and the
-      built-in ranges are modelled. Every other type is 0A000 `a
+      (each with the 4-byte header `array_in` gives it, measured), the
+      built-in ranges and the built-in multiranges (`make_multirange`'s
+      layout, 2026-11-18) are modelled. Every other type is 0A000 `a
       record_image comparison over a field of type ... is not supported
       yet`. Remaining, measured on PostgreSQL 15.19: arrays of any other
-      varlena element, a user range, a multirange and a composite field (a
-      `HeapTupleHeader` varlena).
+      varlena element, a user range or multirange, and a composite field
+      (a `HeapTupleHeader` varlena).
       Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_over_still_refused_field_types
       Backlog-ID: RP-976
 
