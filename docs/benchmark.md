@@ -268,3 +268,35 @@ Caveats, in both directions:
 
 Reproduce with `invoke do-bench --repeat 3 --payload random` (needs a
 DigitalOcean API token; the harness provisions, measures and destroys).
+
+## Startup time
+
+How long each server takes from process spawn until a client gets an
+answer: `hello` reporting a writable primary for the MongoDB servers,
+`SELECT 1` for the PostgreSQL servers. A **cold** start opens an empty data
+directory; for PostgreSQL that includes `initdb`, because `secantusd-pg`
+creates its own store and `postgres` cannot start without one. A **warm**
+start reopens a directory left by a clean shutdown. Medians of 10 interleaved
+runs on an Apple M2 Pro, 2026-11-18:
+
+| server | cold start | warm start |
+| --- | ---: | ---: |
+| mongod 8.2.11, one-member replica set | 672 ms | 344 ms |
+| mongod 8.2.11, standalone | 293 ms | 358 ms |
+| secantusd-mdb 0.5.3-beta.198 | 487 ms | 370 ms |
+| PostgreSQL 15.19 (cold includes `initdb`, 446 ms) | 472 ms | 28 ms |
+| secantusd-pg 0.1.0-beta.20 | 570 ms | 469 ms |
+
+`secantusd-mdb` starts faster than `mongod` in the same replica-set mode from
+cold and matches it warm. `secantusd-pg` is close to PostgreSQL from cold, but
+a warm PostgreSQL restart takes 28 ms against our 469 ms: that gap is ours to
+close.
+
+Every run with `--record` is appended to
+[`bench/results/startup_history.jsonl`](https://github.com/jdrumgoole/SecantusDB/blob/main/bench/results/startup_history.jsonl)
+with the date, the host, each binary's version and the commit, so the trend
+can be followed. Compare rows only from the same host.
+
+```bash
+invoke startup-times --reps 10 --record
+```

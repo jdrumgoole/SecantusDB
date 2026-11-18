@@ -1,68 +1,62 @@
-"""Compare cold-start startup latency of the three standalone servers.
+"""Startup time: mongod vs secantusd-mdb, PostgreSQL vs secantusd-pg.
 
-Measures how long each of these single-node servers takes, from process
-spawn to serving its first wire-protocol command, over a fresh (cold)
-on-disk WiredTiger data directory:
+Measures how long each server takes from process spawn until a real client
+gets an answer, in two scenarios:
 
-- **mongod**            — real MongoDB, run as a standalone ``mongod``.
-- **SecantusDB (py)**   — the pure-Python server (``python -m secantus``).
-- **SecantusDB (rust)** — the pure-Rust server: the compiled ``secantusd-mdb``
-  binary from ``crates/secantusdb`` (no libpython, no Python interpreter in
-  the process). The ``.venv/bin/secantusd-py`` console-script is NOT used — it
-  is a Python wrapper that launches the Python server.
+- **cold**: an empty data directory. For PostgreSQL this includes
+  ``initdb``, because ``secantusd-pg`` creates its own store on first start
+  and ``postgres`` cannot start without one. ``initdb`` is also recorded on
+  its own.
+- **warm**: a restart over a data directory a previous start created and
+  shut down cleanly.
 
-All three are launched the same way — a throwaway process on a free port
-with an empty data dir and ``--standalone`` topology — so the numbers are
-apples-to-apples. Two timings are recorded per run:
+"Ready" means:
 
-- **listen**  — spawn → the port accepts a raw TCP connection.
-- **ready**   — spawn → a fresh pymongo client completes ``admin.ping``
-  (the real "ready to serve" moment, and the headline number).
+- **MongoDB servers:** a fresh pymongo client gets ``hello`` with
+  ``isWritablePrimary: true``. ``secantusd-mdb`` runs in its default mode, a
+  one-member replica set. ``mongod`` is measured twice: as a one-member
+  replica set (the like-for-like row; a cold start includes
+  ``replSetInitiate`` and the election) and standalone.
+- **PostgreSQL servers:** a fresh psycopg connection runs ``SELECT 1``.
 
-Each server is measured ``--reps`` times over independent cold data dirs;
-the report prints median / min / max / mean of both timings in ms.
-
-Run it::
+Each row is the median of ``--reps`` runs, with min and max. With
+``--record`` the run is appended as one JSON line to
+``bench/results/startup_history.jsonl``, with the date, the host, each
+binary's version and the repository commit, so the numbers can be tracked
+over time. Compare history rows only from the same host.
 
     uv run python -m bench.startup_times
-    uv run python -m bench.startup_times --reps 10 --no-mongod --json
+    uv run python -m bench.startup_times --reps 10 --record
 
-mongod is skipped with a note when it is not on PATH. The Rust server uses
-the compiled ``secantusdb`` binary (release preferred, else debug;
-auto-discovered under ``crates/`` and ``build/``, or set ``SECANTUSDB_BIN``);
-build it with ``./inv rust-server-build`` or ``cargo build -p secantus-mdb``.
+Binaries: ``--mdb-bin`` / ``--pg-bin`` (or ``SECANTUSD_MDB_BIN`` /
+``SECANTUSD_PG_BIN``); otherwise the release builds under
+``crates/*/target/release``. ``mongod``, ``postgres`` and ``initdb`` come
+from ``PATH`` or ``--mongod-bin`` / ``--pg-bindir``.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
+import platform
 import shutil
+import signal
 import socket
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from collections.abc import Callable
 from pathlib import Path
 
-from pymongo import MongoClient
-from pymongo.errors import PyMongoError
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
+HISTORY = REPO_ROOT / "bench" / "results" / "startup_history.jsonl"
 DEFAULT_REPS = 5
-
-
-@dataclass(frozen=True)
-class ServerSpec:
-    """A server we can spawn as a standalone daemon on a chosen port."""
-
-    key: str
-    label: str
-    # Build the argv given (port, data_dir). Returns None when unavailable.
-    argv: object
+TIMEOUT_S = 60.0
+POLL_S = 0.005
 
 
 def _free_port() -> int:
@@ -71,334 +65,377 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _is_native_binary(path: Path) -> bool:
-    """True if ``path`` is a compiled executable, not a ``#!`` shebang script.
+def _find_binary(env: str, explicit: str | None, crate: str, name: str) -> str | None:
+    for cand in (explicit, os.environ.get(env)):
+        if cand:
+            return cand
+    for p in (
+        REPO_ROOT / "crates" / crate / "target" / "release" / name,
+        REPO_ROOT / "crates" / "target" / "release" / name,
+    ):
+        if p.exists():
+            return str(p)
+    return shutil.which(name)
 
-    Critical guard: ``.venv/bin/secantusd-py`` is a Python console-script that
-    launches the *Python* server, so it must never be picked for the Rust
-    row — that would benchmark the Python server twice.
-    """
+
+def _version(argv: list[str]) -> str:
     try:
-        with open(path, "rb") as fh:
-            return fh.read(2) != b"#!"
-    except OSError:
-        return False
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    return out.strip().splitlines()[0] if out.strip() else "unknown"
 
 
-def _rust_binary() -> str | None:
-    """Locate the pure-Rust standalone ``secantusd-mdb`` binary (no libpython).
+def _wait(check: Callable[[], bool], proc: subprocess.Popen, what: str) -> None:
+    deadline = time.perf_counter() + TIMEOUT_S
+    while time.perf_counter() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"{what} exited with {proc.returncode} before it was ready")
+        try:
+            if check():
+                return
+        except Exception:  # noqa: BLE001 - not ready yet; any client error means retry
+            pass
+        time.sleep(POLL_S)
+    raise RuntimeError(f"{what} not ready after {TIMEOUT_S:.0f}s")
 
-    Prefers a release build, falls back to the debug build. Override with
-    the ``SECANTUSDB_BIN`` environment variable. The ``.venv/bin/secantusd-py``
-    console-script is deliberately excluded — it is a Python wrapper around
-    the Python server, not the Rust binary.
+
+def _stop(proc: subprocess.Popen) -> None:
+    """Shut down cleanly (SIGTERM), so a warm start reopens a clean store."""
+    if proc.poll() is None:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise RuntimeError(f"pid {proc.pid} ignored SIGTERM for {TIMEOUT_S:.0f}s") from None
+    if proc.returncode not in (0, -signal.SIGTERM):
+        raise RuntimeError(f"pid {proc.pid} exited with {proc.returncode} on shutdown")
+
+
+# -- readiness checks ---------------------------------------------------------
+
+
+def _mongo_primary(port: int) -> Callable[[], bool]:
+    """One client, created once the port listens, polled with ``hello``.
+
+    A client per attempt is wrong here: pymongo waits ~500 ms before retrying
+    a refused connection, which put a 500 ms step into every result.
     """
-    override = os.environ.get("SECANTUSDB_BIN")
-    if override:
-        return override if _is_native_binary(Path(override)) else None
+    from pymongo import MongoClient
 
-    candidates = [
-        REPO_ROOT / "crates" / "secantusdb" / "target" / "release" / "secantusd-mdb",
-        *sorted(REPO_ROOT.glob("build/*/secantusdb-target/release/secantusd-mdb")),
-        REPO_ROOT / "crates" / "secantusdb" / "target" / "debug" / "secantusd-mdb",
-    ]
-    for candidate in candidates:
-        if candidate.exists() and _is_native_binary(candidate):
-            return str(candidate)
-    return None
+    client: list[MongoClient] = []
+
+    def check() -> bool:
+        if not client:
+            client.append(
+                MongoClient(
+                    f"mongodb://127.0.0.1:{port}/?directConnection=true",
+                    serverSelectionTimeoutMS=TIMEOUT_S * 1000,
+                    heartbeatFrequencyMS=500,
+                )
+            )
+        try:
+            ok = bool(client[0].admin.command("hello").get("isWritablePrimary"))
+        except Exception:
+            client.pop().close()
+            raise
+        if ok:
+            client.pop().close()
+        return ok
+
+    return check
 
 
-def _mongod_argv(port: int, data_dir: Path) -> list[str]:
-    return [
-        "mongod",
+def _pg_select1(port: int) -> Callable[[], bool]:
+    import psycopg
+
+    def check() -> bool:
+        with psycopg.connect(
+            host="127.0.0.1", port=port, user="postgres", dbname="postgres", connect_timeout=1
+        ) as c:
+            return c.execute("SELECT 1").fetchone() == (1,)
+
+    return check
+
+
+# -- one start of each server ---------------------------------------------------
+
+
+def _listening(port: int) -> Callable[[], bool]:
+    def check() -> bool:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            return True
+
+    return check
+
+
+def _start(
+    argv: list[str],
+    port: int,
+    log: Path,
+    ready: Callable[[], bool],
+    what: str,
+    after_listen: Callable[[], None] | None = None,
+) -> tuple[float, subprocess.Popen]:
+    t0 = time.perf_counter()
+    with open(log, "ab") as fh:
+        proc = subprocess.Popen(argv, stdout=fh, stderr=subprocess.STDOUT)
+    try:
+        _wait(_listening(port), proc, what)
+        if after_listen is not None:
+            after_listen()
+        _wait(ready, proc, what)
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    return (time.perf_counter() - t0) * 1000, proc
+
+
+def run_mdb(binary: str, data: Path, cold: bool, port: int) -> float:
+    argv = [binary, "--port", str(port), "--storage-path", str(data)]
+    ms, proc = _start(argv, port, data.parent / "mdb.log", _mongo_primary(port), "secantusd-mdb")
+    _stop(proc)
+    return ms
+
+
+def run_mongod(binary: str, data: Path, cold: bool, replset: bool, port: int) -> float:
+    data.mkdir(exist_ok=True)
+    argv = [
+        binary,
         "--bind_ip",
         "127.0.0.1",
         "--port",
         str(port),
         "--dbpath",
-        str(data_dir),
+        str(data),
         "--logpath",
-        str(data_dir / "mongod.log"),
-        "--noauth",
-        "--quiet",
+        str(data.parent / "mongod.log"),
+        "--logappend",
     ]
+    if replset:
+        argv += ["--replSet", "startup"]
+    initiate = None
+    if replset and cold:
+        from pymongo import MongoClient
 
+        def initiate() -> None:
+            deadline = time.perf_counter() + TIMEOUT_S
+            while True:
+                try:
+                    with MongoClient(
+                        f"mongodb://127.0.0.1:{port}/?directConnection=true",
+                        serverSelectionTimeoutMS=200,
+                    ) as c:
+                        c.admin.command(
+                            "replSetInitiate",
+                            {
+                                "_id": "startup",
+                                "members": [{"_id": 0, "host": f"127.0.0.1:{port}"}],
+                            },
+                        )
+                        return
+                except Exception:  # noqa: BLE001 - not listening yet
+                    if time.perf_counter() > deadline:
+                        raise
+                    time.sleep(POLL_S)
 
-def _python_argv(port: int, data_dir: Path) -> list[str]:
-    return [
-        sys.executable,
-        "-m",
-        "secantus",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        str(port),
-        "--storage-path",
-        str(data_dir),
-        "--log-level",
-        "WARNING",
-        "--standalone",
-    ]
-
-
-def _rust_argv_factory(binary: str):
-    # The pure-Rust binary has no --log-level flag (unlike python -m secantus).
-    def build(port: int, data_dir: Path) -> list[str]:
-        return [
-            binary,
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--storage-path",
-            str(data_dir),
-            "--standalone",
-        ]
-
-    return build
-
-
-def _tcp_open(port: int) -> bool:
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-            return True
-    except OSError:
-        return False
-
-
-def _ping_ok(port: int) -> bool:
-    """One cheap, self-contained ``ping`` attempt with a short timeout."""
-    client: MongoClient | None = None
-    try:
-        client = MongoClient(
-            "127.0.0.1",
-            port,
-            directConnection=True,
-            serverSelectionTimeoutMS=200,
-            connectTimeoutMS=200,
-        )
-        client.admin.command("ping")
-        return True
-    except PyMongoError:
-        return False
-    finally:
-        if client is not None:
-            client.close()
-
-
-@dataclass
-class Timing:
-    listen_s: float
-    ready_s: float
-
-
-def _measure_once(spec: ServerSpec, timeout: float) -> Timing:
-    """Spawn the server on a fresh cold data dir; time listen + ready."""
-    with tempfile.TemporaryDirectory(prefix=f"startup-{spec.key}-") as tmp:
-        data_dir = Path(tmp)
-        port = _free_port()
-        argv = spec.argv(port, data_dir)
-
-        t0 = time.monotonic()
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-        )
-        try:
-            deadline = t0 + timeout
-            listen_s = float("nan")
-            ready_s = float("nan")
-
-            # Phase 1: raw TCP listener up.
-            while time.monotonic() < deadline:
-                if proc.poll() is not None:
-                    raise RuntimeError(
-                        f"{spec.label} exited early (code {proc.returncode}) "
-                        f"before accepting connections"
-                    )
-                if _tcp_open(port):
-                    listen_s = time.monotonic() - t0
-                    break
-                time.sleep(0.002)
-            else:
-                raise RuntimeError(f"{spec.label} did not open port within {timeout}s")
-
-            # Phase 2: wire protocol serving a command.
-            while time.monotonic() < deadline:
-                if _ping_ok(port):
-                    ready_s = time.monotonic() - t0
-                    break
-                time.sleep(0.005)
-            else:
-                raise RuntimeError(f"{spec.label} did not serve ping within {timeout}s")
-
-            return Timing(listen_s=listen_s, ready_s=ready_s)
-        finally:
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-
-
-@dataclass
-class Result:
-    label: str
-    listen_ms: list[float]
-    ready_ms: list[float]
-
-
-def _measure_server(spec: ServerSpec, reps: int, timeout: float, *, quiet: bool) -> Result:
-    listen_ms: list[float] = []
-    ready_ms: list[float] = []
-    for i in range(reps):
-        t = _measure_once(spec, timeout)
-        listen_ms.append(t.listen_s * 1000.0)
-        ready_ms.append(t.ready_s * 1000.0)
-        if not quiet:
-            print(
-                f"  {spec.label:<18} rep {i + 1}/{reps}: "
-                f"listen {t.listen_s * 1000.0:8.1f} ms   ready {t.ready_s * 1000.0:8.1f} ms",
-                flush=True,
-            )
-    return Result(label=spec.label, listen_ms=listen_ms, ready_ms=ready_ms)
-
-
-def _fmt_stats(samples: list[float]) -> str:
-    return (
-        f"{statistics.median(samples):8.1f}  "
-        f"{min(samples):8.1f}  "
-        f"{max(samples):8.1f}  "
-        f"{statistics.fmean(samples):8.1f}"
+    ms, proc = _start(
+        argv, port, data.parent / "mongod.log", _mongo_primary(port), "mongod", initiate
     )
+    _stop(proc)
+    return ms
 
 
-def _print_report(results: list[Result]) -> None:
-    print()
-    print("Cold startup latency (fresh on-disk WiredTiger, standalone topology)")
-    print("=" * 78)
-    header = f"{'server':<18} {'metric':<8} {'median':>8}  {'min':>8}  {'max':>8}  {'mean':>8}"
-    print(header)
-    print("-" * 78)
-    # Sort fastest-ready first.
-    for r in sorted(results, key=lambda r: statistics.median(r.ready_ms)):
-        print(f"{r.label:<18} {'ready':<8} {_fmt_stats(r.ready_ms)}   (ms)")
-        print(f"{'':<18} {'listen':<8} {_fmt_stats(r.listen_ms)}   (ms)")
-    print("-" * 78)
-
-    ready_medians = {r.label: statistics.median(r.ready_ms) for r in results}
-    fastest_label = min(ready_medians, key=ready_medians.__getitem__)
-    fastest = ready_medians[fastest_label]
-    print(f"Fastest to serve: {fastest_label} ({fastest:.1f} ms median)")
-    for label, med in sorted(ready_medians.items(), key=lambda kv: kv[1]):
-        if label == fastest_label:
-            continue
-        print(f"  {label:<18} {med / fastest:5.2f}x slower to serve than {fastest_label}")
-    print("=" * 78)
+def run_pg(binary: str, data: Path, cold: bool, port: int) -> float:
+    argv = [binary, str(data), f"127.0.0.1:{port}"]
+    ms, proc = _start(argv, port, data.parent / "pg.log", _pg_select1(port), "secantusd-pg")
+    _stop(proc)
+    return ms
 
 
-def _json_report(results: list[Result]) -> dict:
+def run_postgres(bindir: Path, data: Path, cold: bool, port: int) -> tuple[float, float]:
+    """Return (total ms, initdb ms). initdb is 0 on a warm start."""
+    t0 = time.perf_counter()
+    init_ms = 0.0
+    if cold:
+        subprocess.run(
+            [
+                str(bindir / "initdb"),
+                "-D",
+                str(data),
+                "-U",
+                "postgres",
+                "--auth=trust",
+                "--no-sync",
+                "-E",
+                "UTF8",
+                "--locale=C",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        init_ms = (time.perf_counter() - t0) * 1000
+    argv = [
+        str(bindir / "postgres"),
+        "-D",
+        str(data),
+        "-p",
+        str(port),
+        "-c",
+        "listen_addresses=127.0.0.1",
+        "-k",
+        "",
+    ]
+    ms, proc = _start(argv, port, data.parent / "postgres.log", _pg_select1(port), "postgres")
+    _stop(proc)
+    return ms + init_ms, init_ms
+
+
+# -- driver ---------------------------------------------------------------------
+
+
+def _summary(xs: list[float]) -> dict:
     return {
-        "unit": "ms",
-        "servers": [
-            {
-                "label": r.label,
-                "ready": {
-                    "median": statistics.median(r.ready_ms),
-                    "min": min(r.ready_ms),
-                    "max": max(r.ready_ms),
-                    "mean": statistics.fmean(r.ready_ms),
-                    "samples": r.ready_ms,
-                },
-                "listen": {
-                    "median": statistics.median(r.listen_ms),
-                    "min": min(r.listen_ms),
-                    "max": max(r.listen_ms),
-                    "mean": statistics.fmean(r.listen_ms),
-                    "samples": r.listen_ms,
-                },
-            }
-            for r in results
-        ],
+        "median_ms": round(statistics.median(xs), 1),
+        "min_ms": round(min(xs), 1),
+        "max_ms": round(max(xs), 1),
+        "runs_ms": [round(x, 1) for x in xs],
     }
 
 
-def _build_specs(no_mongod: bool) -> list[ServerSpec]:
-    specs: list[ServerSpec] = []
+def measure(
+    reps: int, mdb: str | None, pg: str | None, mongod: str | None, pg_bindir: Path | None
+) -> dict:
+    servers: dict[str, Callable[[Path, bool, int], float | tuple[float, float]]] = {}
+    versions: dict[str, str] = {}
+    if mongod:
+        servers["mongod (replica set)"] = lambda d, c, p: run_mongod(mongod, d, c, True, p)
+        servers["mongod (standalone)"] = lambda d, c, p: run_mongod(mongod, d, c, False, p)
+        versions["mongod"] = _version([mongod, "--version"])
+    if mdb:
+        servers["secantusd-mdb"] = lambda d, c, p: run_mdb(mdb, d, c, p)
+        versions["secantusd-mdb"] = _version([mdb, "--version"])
+    if pg_bindir:
+        servers["postgres"] = lambda d, c, p: run_postgres(pg_bindir, d, c, p)
+        versions["postgres"] = _version([str(pg_bindir / "postgres"), "--version"])
+    if pg:
+        servers["secantusd-pg"] = lambda d, c, p: run_pg(pg, d, c, p)
+        versions["secantusd-pg"] = _version([pg, "--version"])
 
-    if not no_mongod:
-        if shutil.which("mongod") is not None:
-            specs.append(ServerSpec("mongod", "mongod", _mongod_argv))
-        else:
-            print("mongod not on PATH; skipping the mongod comparison.", file=sys.stderr)
+    results: dict[str, dict] = {name: {} for name in servers}
+    initdb: list[float] = []
+    # Interleave servers inside each rep, so drift on the machine lands on all.
+    raw: dict[str, dict[str, list[float]]] = {n: {"cold": [], "warm": []} for n in servers}
+    for rep in range(reps):
+        for name, fn in servers.items():
+            with tempfile.TemporaryDirectory(prefix="startup-") as tmp:
+                data = Path(tmp) / "data"
+                # The same port for cold and warm: a replica set's config
+                # names its member by host:port.
+                port = _free_port()
+                for scenario in ("cold", "warm"):
+                    out = fn(data, scenario == "cold", port)
+                    if isinstance(out, tuple):
+                        out, init_ms = out
+                        if scenario == "cold":
+                            initdb.append(init_ms)
+                    raw[name][scenario].append(out)
+        print(f"  rep {rep + 1}/{reps} done", file=sys.stderr)
+    for name in servers:
+        results[name] = {s: _summary(v) for s, v in raw[name].items()}
+    if initdb:
+        results["postgres"]["initdb"] = _summary(initdb)
+    return {"servers": results, "versions": versions}
 
-    specs.append(ServerSpec("python", "SecantusDB (py)", _python_argv))
 
-    rust = _rust_binary()
-    if rust is not None:
-        specs.append(ServerSpec("rust", "SecantusDB (rust)", _rust_argv_factory(rust)))
-    else:
-        print(
-            "secantusdb binary not found (looked in .venv/bin and PATH); "
-            "skipping the Rust server. Build it with `./inv rust-server-build` "
-            "or install the binary.",
-            file=sys.stderr,
+def _git_commit() -> str:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def _host() -> str:
+    """CPU model and core count, not the machine's name, so history can be shared."""
+    cpu = platform.processor() or platform.machine()
+    if platform.system() == "Darwin":
+        cpu = _version(["sysctl", "-n", "machdep.cpu.brand_string"])
+    elif Path("/proc/cpuinfo").exists():
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name"):
+                cpu = line.split(":", 1)[1].strip()
+                break
+    return f"{platform.system()} {platform.machine()}, {cpu}, {os.cpu_count()} cores"
+
+
+def _table(run: dict) -> str:
+    rows = [
+        "| server | cold start (median, min–max) | warm start (median, min–max) |",
+        "| --- | ---: | ---: |",
+    ]
+    for name, r in run["servers"].items():
+        cells = []
+        for s in ("cold", "warm"):
+            x = r[s]
+            cells.append(f"{x['median_ms']:.0f} ms ({x['min_ms']:.0f}–{x['max_ms']:.0f})")
+        rows.append(f"| {name} | {cells[0]} | {cells[1]} |")
+    if "initdb" in run["servers"].get("postgres", {}):
+        rows.append(
+            f"\npostgres cold start includes initdb: median "
+            f"{run['servers']['postgres']['initdb']['median_ms']:.0f} ms"
         )
-
-    return specs
+    return "\n".join(rows)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="bench.startup_times",
-        description="Compare cold-start startup latency of mongod, the SecantusDB "
-        "Python server, and the SecantusDB Rust server (all standalone).",
-    )
-    parser.add_argument(
-        "--reps",
-        type=int,
-        default=DEFAULT_REPS,
-        help=f"Number of cold-start measurements per server (default: {DEFAULT_REPS}).",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=60.0,
-        help="Per-run timeout in seconds waiting for the server to serve (default: 60).",
-    )
-    parser.add_argument(
-        "--no-mongod",
-        action="store_true",
-        help="Skip the mongod comparison (SecantusDB servers only).",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit machine-readable JSON instead of the formatted table.",
-    )
-    args = parser.parse_args(argv)
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--reps", type=int, default=DEFAULT_REPS)
+    ap.add_argument("--mdb-bin")
+    ap.add_argument("--pg-bin")
+    ap.add_argument("--mongod-bin", default=shutil.which("mongod"))
+    ap.add_argument("--pg-bindir", help="directory holding postgres and initdb")
+    ap.add_argument("--record", action="store_true", help=f"append the run to {HISTORY.name}")
+    ap.add_argument("--json", action="store_true", help="print the run as JSON")
+    args = ap.parse_args(argv)
 
-    if args.reps < 1:
-        parser.error("--reps must be >= 1")
+    mdb = _find_binary("SECANTUSD_MDB_BIN", args.mdb_bin, "secantusdb", "secantusd-mdb")
+    pg = _find_binary("SECANTUSD_PG_BIN", args.pg_bin, "secantus-pg", "secantusd-pg")
+    pg_bindir = Path(args.pg_bindir) if args.pg_bindir else None
+    if pg_bindir is None and shutil.which("postgres"):
+        pg_bindir = Path(shutil.which("postgres")).parent
+    missing = [
+        n
+        for n, v in (
+            ("secantusd-mdb", mdb),
+            ("secantusd-pg", pg),
+            ("mongod", args.mongod_bin),
+            ("postgres", pg_bindir),
+        )
+        if not v
+    ]
+    if missing:
+        print(f"not found, so not measured: {', '.join(missing)}", file=sys.stderr)
 
-    specs = _build_specs(args.no_mongod)
-    if not specs:
-        print("No servers available to measure.", file=sys.stderr)
-        return 1
-
-    results: list[Result] = []
-    for spec in specs:
-        if not args.json:
-            print(f"Measuring {spec.label} ({args.reps} cold starts)...", flush=True)
-        results.append(_measure_server(spec, args.reps, args.timeout, quiet=args.json))
-
-    if args.json:
-        print(json.dumps(_json_report(results), indent=2))
-    else:
-        _print_report(results)
+    load_before = round(os.getloadavg()[0], 2)
+    run = measure(args.reps, mdb, pg, args.mongod_bin, pg_bindir)
+    run = {
+        "date": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "host": _host(),
+        "load_avg_1m": {"before": load_before, "after": round(os.getloadavg()[0], 2)},
+        "commit": _git_commit(),
+        "reps": args.reps,
+        **run,
+    }
+    print(json.dumps(run, indent=2) if args.json else _table(run))
+    if args.record:
+        with HISTORY.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(run, separators=(",", ":")) + "\n")
+        print(f"\nrecorded in {HISTORY.relative_to(REPO_ROOT)}", file=sys.stderr)
     return 0
 
 
