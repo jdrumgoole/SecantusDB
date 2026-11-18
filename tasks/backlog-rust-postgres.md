@@ -2332,18 +2332,15 @@ Measured on PostgreSQL 15.19 with `create domain pint as int check (value >
 text)` and `create table tct (c ctp, d pint[])` holding `('(1,x)', null)`.
 The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
 
-- [ ] **An untyped literal written to a composite or domain-array column,
-      or coerced as an `ARRAY[]` element, reports a field's domain error
-      with no position.** `insert into tct(c) values ('(0,x)')` and
-      `insert into tct(d) values ('{0}')` are 23514 at 28 on PostgreSQL
-      15.19 (and `insert into tnn values ('{NULL}')`, `tnn(x nnint[])`,
-      23502 at 25), `update tct set c = '(0,x)'` at 20 and `select
-      array['(0,x)']::ctp[]` at 14: `coerce_type` reads the literal with
-      `record_in` / `array_in` under its parser error position. Here each
-      has none. RP-552 recorded the literal's location for a TypeCast of
-      the literal only (`literal_input_location` in `const_value_inner`);
-      the write path and the `ARRAY[]` element coercion need the same.
-      Verify: tests/backlog/test_rp_found_rp552.py::test_assigned_literal_domain_error_position
+- [ ] **An untyped literal an `INSERT ... SELECT` writes to a composite
+      or domain-array column reports a field's domain error with no
+      position.** `insert into tct(c) select '(0,x)'` is 23514 at 27 on
+      PostgreSQL 15.19: the SELECT's `unknown` output column is coerced to
+      the target column in the INSERT's analysis, reading the literal under
+      its position. Here it has none. RP-945 placed the VALUES and UPDATE
+      SET forms (`check_assigned_literal`) and an `ARRAY[]` element
+      (`failing_array_element`); the SELECT's target list needs the same.
+      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_literal_domain_error_position
       Backlog-ID: RP-945
 - [ ] **A composite column compared with an untyped literal reads the
       literal as the column's type.** `select * from tct where c =

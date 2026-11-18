@@ -15209,6 +15209,7 @@ fn plan_insert(
         for (item, target) in items.iter().zip(&targets) {
             if let Some(column) = def.column(target) {
                 check_assignment_type(column, item)?;
+                check_assigned_literal(column, item, params)?;
             }
         }
     }
@@ -15450,6 +15451,43 @@ fn check_assignment_type(column: &Column, node: &pg_query::protobuf::Node) -> Re
             }
         }
     })
+}
+
+/// An untyped string literal assigned to an array or composite column is
+/// read by the column type's input while the statement is analysed
+/// (`transformAssignedExpr` -> `coerce_type`), and `array_in` / `record_in`
+/// check each element's or field's domain there, under the literal's error
+/// position: `insert into tct(c) values ('(0,x)')`, a field of domain `pint`
+/// failing its CHECK, is 23514 at the literal on 15.19 (RP-945). The
+/// literal is read as its cast to the column's type, which records that
+/// position (`const_value_inner`); only a domain error is raised here, as
+/// any other input error is raised, and placed, where it was.
+fn check_assigned_literal(
+    column: &Column,
+    node: &pg_query::protobuf::Node,
+    params: &[Bson],
+) -> Result<()> {
+    let Some(N::AConst(c)) = node.node.as_ref() else {
+        return Ok(());
+    };
+    if !matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) {
+        return Ok(());
+    }
+    let ty = column.pg_type.as_str();
+    if !(ty.ends_with("[]") || user_composite_oid(ty).is_some()) {
+        return Ok(());
+    }
+    let cast = pg_query::protobuf::Node {
+        node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+            arg: Some(Box::new(node.clone())),
+            type_name: Some(type_name_node(ty)),
+            location: -1,
+        }))),
+    };
+    match const_value(&cast, params) {
+        Err(e) if matches!(e.sqlstate(), "23514" | "23502") => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// Where an expression starts, as PostgreSQL's `exprLocation` reports it.
@@ -47894,6 +47932,7 @@ fn plan_update(
             &**val
         };
         check_assignment_type(column, val)?;
+        check_assigned_literal(column, val, params)?;
         // An assignment through a user cast (`AS ASSIGNMENT` / `AS
         // IMPLICIT`): the value is cast to the column's type, which the
         // cast evaluation takes through the user's cast.
@@ -49222,6 +49261,11 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                     set_error_location(at);
                 }
             }
+            if matches!(e.sqlstate(), "23514" | "23502") {
+                if let Some(at) = failing_array_element(tc, params) {
+                    set_error_location(at);
+                }
+            }
         });
     }
     const_value_node(node, params)
@@ -49246,6 +49290,40 @@ fn literal_input_location(tc: &pg_query::protobuf::TypeCast) -> Option<i32> {
     domains::user_domain(&target)
         .is_none()
         .then_some(c.location)
+}
+
+/// The untyped string element of `ARRAY[...]::t[]` whose read as `t`
+/// fails a domain: `transformArrayExpr` coerces each element to the
+/// element type, and `record_in` / `array_in` read a literal one under its
+/// own parser error position (`array['(0,x)']::ctp[]` is 23514 at 14 on
+/// 15.19, RP-945). Looked for only once the cast has failed.
+fn failing_array_element(tc: &pg_query::protobuf::TypeCast, params: &[Bson]) -> Option<i32> {
+    let Some(N::AArrayExpr(a)) = tc.arg.as_deref().and_then(|a| a.node.as_ref()) else {
+        return None;
+    };
+    let target = tc.type_name.as_ref().map(type_name_of)?;
+    let element = target.strip_suffix("[]")?;
+    if element.ends_with("[]") || user_composite_oid(element).is_none() {
+        return None;
+    }
+    a.elements.iter().find_map(|e| {
+        let Some(N::AConst(c)) = e.node.as_ref() else {
+            return None;
+        };
+        if !matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) || c.location < 0 {
+            return None;
+        }
+        let cast = pg_query::protobuf::Node {
+            node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                arg: Some(Box::new(e.clone())),
+                type_name: Some(type_name_node(element)),
+                location: -1,
+            }))),
+        };
+        const_value_node(&cast, params)
+            .is_err_and(|err| matches!(err.sqlstate(), "23514" | "23502"))
+            .then_some(c.location)
+    })
 }
 
 /// The location of `tc`'s argument when it is an untyped string literal.

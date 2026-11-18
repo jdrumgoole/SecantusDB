@@ -1,7 +1,8 @@
 """Gap tests of the divergences found while working RP-552 (a field's
 domain error in a record literal is at the literal): RP-945 (an untyped
 literal written to a composite or domain-array column, or coerced as an
-`ARRAY[]` element, reports a field's domain error with no position), RP-946
+`ARRAY[]` element, reported a field's domain error with no position; still
+open for `INSERT ... SELECT`), RP-946
 (a NULL element of a NOT NULL domain's array literal was accepted; fixed),
 RP-947 (a
 composite column compared with an untyped literal reads the literal as the
@@ -73,10 +74,18 @@ ASSIGNED = {
 }
 
 
-@pytest.mark.backlog("RP-945")
+@pytest.mark.backlog_fixed("RP-945")
 @pytest.mark.parametrize("query", list(ASSIGNED))
 def test_assigned_literal_domain_error_position(query: str, dsn: str) -> None:
+    """Each had no position; the literal is read where it is analysed."""
     assert answer(dsn, query) == ASSIGNED[query]
+
+
+# The SELECT's untyped output column is coerced to the target column in
+# the INSERT's analysis, under the literal's position.
+@pytest.mark.backlog("RP-945")
+def test_insert_select_literal_domain_error_position(dsn: str) -> None:
+    assert answer(dsn, "insert into tct(c) select '(0,x)'") == ("23514", _PINT, "27")
 
 
 # `array_in` reads each element with `domain_in`, which refuses a NULL.
