@@ -5398,6 +5398,18 @@ pub(crate) fn limit_estimate(input: Estimate, offset: i64, count: i64) -> Estima
 /// `2 * cpu_operator_cost`. The input is read in full before the first row
 /// is returned, so its total cost is the Sort's startup.
 pub(crate) fn sort_estimate(input: Estimate, work_mem_kb: usize) -> Estimate {
+    bounded_sort_estimate(input, work_mem_kb, -1.0)
+}
+
+/// A Sort's estimate with `cost_sort`'s `limit_tuples` (RP-440): a bound
+/// below the input's rows, which fits `work_mem`, makes the sort a top-N
+/// heap sort, `comparison_cost * tuples * LOG2(2 * bound)`. A bound of 0
+/// or less is none.
+pub(crate) fn bounded_sort_estimate(
+    input: Estimate,
+    work_mem_kb: usize,
+    limit_tuples: f64,
+) -> Estimate {
     const CPU_OPERATOR_COST: f64 = 0.0025;
     const SEQ_PAGE_COST: f64 = 1.0;
     const RANDOM_PAGE_COST: f64 = 4.0;
@@ -5409,7 +5421,15 @@ pub(crate) fn sort_estimate(input: Estimate, work_mem_kb: usize) -> Estimate {
     let maxalign = |n: i64| ((n + 7) / 8 * 8) as f64;
     let input_bytes = tuples * (maxalign(width) + maxalign(23));
     let sort_mem_bytes = work_mem_kb as f64 * 1024.0;
-    let mut startup = if input_bytes > sort_mem_bytes {
+    let (output_tuples, output_bytes) = if limit_tuples > 0.0 && limit_tuples < tuples {
+        (
+            limit_tuples,
+            limit_tuples * (maxalign(width) + maxalign(23)),
+        )
+    } else {
+        (tuples, input_bytes)
+    };
+    let mut startup = if output_bytes > sort_mem_bytes {
         // An external merge sort.
         let npages = (input_bytes / BLCKSZ).ceil();
         let nruns = input_bytes / sort_mem_bytes;
@@ -5425,6 +5445,9 @@ pub(crate) fn sort_estimate(input: Estimate, work_mem_kb: usize) -> Estimate {
         let page_accesses = 2.0 * npages * log_runs;
         comparison_cost * tuples * secantus_pgplan::costsize::pg_log2(tuples)
             + page_accesses * (SEQ_PAGE_COST * 0.75 + RANDOM_PAGE_COST * 0.25)
+    } else if tuples > 2.0 * output_tuples || input_bytes > sort_mem_bytes {
+        // A bounded heap sort (`tuplesort_set_bound`).
+        comparison_cost * tuples * secantus_pgplan::costsize::pg_log2(2.0 * output_tuples)
     } else {
         comparison_cost * tuples * secantus_pgplan::costsize::pg_log2(tuples)
     };
@@ -8538,5 +8561,21 @@ mod key_bound_tests {
             &doc! { "$or": [{ "a": { "$gt": 5 } }, { "b": "v1" }] },
             "a"
         ));
+    }
+}
+
+#[cfg(test)]
+mod bounded_sort_tests {
+    use super::bounded_sort_estimate;
+
+    #[test]
+    fn a_limit_bounds_the_sort_to_a_heap() {
+        // PostgreSQL 15.19: a Sort under `limit 5` over a Seq Scan of
+        // (0.00..17.50 rows=100 width=4) is (19.16..19.41 rows=100).
+        let (s, t, r, _) = bounded_sort_estimate((0.0, 17.5, 100.0, 4), 4096, 5.0);
+        assert_eq!(
+            (format!("{s:.2}"), format!("{t:.2}"), r),
+            ("19.16".into(), "19.41".into(), 100.0)
+        );
     }
 }

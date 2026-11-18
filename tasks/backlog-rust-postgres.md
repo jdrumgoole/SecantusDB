@@ -2011,11 +2011,13 @@ a regression test.
       FROM, a correlated one, or a sublink beside any other non-constant
       qual is still printed inline (`select * from e where b = (select b
       from k limit 1)`); a join's ON InitPlan is unpriced; other nodes above
-      the scan (a Limit above a Sort, Unique, a computed sort key, a GROUP
-      BY) are unpriced. Plain aggregates other than counts over the scan are
+      the scan (a DISTINCT, Unique, a computed sort key, a GROUP
+      BY) are unpriced. A Limit above a Sort of the scan, the Sort bounded
+      by OFFSET + LIMIT (`cost_sort`'s `limit_tuples`), is priced since
+      2026-11-18. Plain aggregates other than counts over the scan are
       priced since 2026-11-18 (`plain_agg_estimate`). Measured on a private
       15.19 cluster.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a limit above a sort above an initplan's scan is priced]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a distinct above an initplan's scan is priced]
       Backlog-ID: RP-440
 
 ## Found by batch 54 (2026-10-24)
