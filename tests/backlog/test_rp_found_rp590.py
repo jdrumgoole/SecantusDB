@@ -467,10 +467,46 @@ RECORD_IMAGE_STILL_REFUSED = {
     "select (select row('{[1,2)}'::int4multirange)) *= (select row('{[1,2)}'::int4multirange))": [
         (True,)
     ],
-    "select (select row(array['1 day'::interval])) *= (select row(array['1 day'::interval]))": [
-        (True,)
-    ],
 }
+
+
+# Measured on PostgreSQL 15.19.
+RECORD_IMAGE_FIXED_BYREF_ARRAYS = [
+    ("array['1 day'::interval]", "*=", "array['1 day'::interval]", True),
+    ("array['1 day'::interval]", "*<", "array['24 hours'::interval]", True),
+    ("array['1 day'::interval, null]", "*<", "array['1 day'::interval]", False),
+    ("array[null, '1 mon'::interval]", "*>", "array[null, '30 days'::interval]", False),
+    (
+        "array['00000000-0000-0000-0000-000000000002'::uuid]",
+        "*<",
+        "array['00000000-0000-0000-0000-000000000001'::uuid,"
+        " '00000000-0000-0000-0000-000000000000'::uuid]",
+        True,
+    ),
+    ("array['b'::name]", "*<", "array['ab'::name]", False),
+    ("array['a'::name, null]", "*=", "array['a'::name, null]", True),
+    ("array['01:00+01'::timetz]", "*<", "array['00:00+00'::timetz]", False),
+    ("array['08:00:2b:01:02:03'::macaddr]", "*<", "array['08:00:2b:01:02:04'::macaddr]", True),
+    (
+        "array['08:00:2b:01:02:03:04:05'::macaddr8, null]",
+        "*=",
+        "array['08:00:2b:01:02:03:04:05'::macaddr8, null]",
+        True,
+    ),
+    ("array['(1,2)'::tid]", "*<", "array['(0,3)'::tid]", False),
+    ("array['(0,1)'::tid, '(0,2)'::tid]", "*<", "array['(0,1)'::tid, '(0,3)'::tid]", True),
+]
+
+
+@pytest.mark.backlog_fixed("RP-976")
+@pytest.mark.parametrize(("left", "op", "right", "want"), RECORD_IMAGE_FIXED_BYREF_ARRAYS)
+def test_record_image_over_arrays_of_fixed_length_by_reference_elements(
+    left: str, op: str, right: str, want: bool, dsn: str
+) -> None:
+    """Arrays of interval, uuid, name, timetz, macaddr, macaddr8 and tid were
+    0A000: each element is its whole image at its type's alignment."""
+    query = f"select (select row({left})) {op} (select row({right}))"
+    assert answer(dsn, query) == [(want,)]
 
 
 @pytest.mark.backlog("RP-976")

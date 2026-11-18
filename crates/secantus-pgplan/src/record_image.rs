@@ -15,8 +15,7 @@
 //! Modelled: the integers, oid, bool, `"char"`, the floats, numeric, date,
 //! time, timetz, the timestamps, interval, uuid, macaddr / macaddr8, inet /
 //! cidr, tid, pg_lsn, name, text / varchar / bpchar, bytea, money, bit /
-//! varbit, jsonb, arrays of those fixed-length, text-like, inet / cidr or
-//! jsonb elements, and
+//! varbit, jsonb, arrays of any of those but bit / varbit, and
 //! the built-in ranges.
 
 use std::cmp::Ordering;
@@ -312,11 +311,27 @@ fn fixed_element(ty: &str) -> Option<(u32, usize, usize)> {
     })
 }
 
+/// A fixed-length by-reference element type's `pg_type` facts: `(oid,
+/// typlen, typalign)`. Its stored bytes are its whole image.
+fn fixed_byref_element(ty: &str) -> Option<(u32, usize, usize)> {
+    Some(match ty {
+        "name" => (19, 64, 1),
+        "tid" => (27, 6, 2),
+        "macaddr8" => (774, 8, 4),
+        "macaddr" => (829, 6, 4),
+        "interval" => (1186, 16, 8),
+        "timetz" | "time with time zone" => (1266, 12, 8),
+        "uuid" => (2950, 16, 1),
+        _ => return None,
+    })
+}
+
 /// One fixed-length element as it lies in an array or range: the low
 /// `len` bytes of its Datum, native (little-endian) order.
 fn fixed_bytes(v: &Bson, ty: &str, len: usize) -> Option<Vec<u8>> {
     match image(v, ty).ok()? {
         Image::ByValue(w) => Some(w.to_le_bytes()[..len].to_vec()),
+        Image::Bytes(b) if b.len() == len && fixed_byref_element(ty).is_some() => Some(b),
         Image::Bytes(_) => None,
     }
 }
@@ -336,7 +351,7 @@ fn pad_to(out: &mut Vec<u8>, base: usize, align: usize) {
 /// it (`(size << 2)`, little-endian), measured on PostgreSQL 15.19:
 /// `row('{b}'::text[]) *< row('{<63 a>}'::text[])` is false.
 fn array_image(v: &Bson, elem: &str) -> Option<Vec<u8>> {
-    let (oid, len, align) = match fixed_element(elem) {
+    let (oid, len, align) = match fixed_element(elem).or_else(|| fixed_byref_element(elem)) {
         Some(f) => f,
         None => (varlena_element(elem)?, 0, 4),
     };
