@@ -4776,6 +4776,19 @@ pub fn server_status(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     // "wiredTiger" is honest — SecantusDB is WiredTiger-backed, the same
     // engine mongod uses. Kept byte-identical to the Python server's
     // `_storage_engine_section`.
+    // The spill engine aggregation stages spill to, before `storageEngine`
+    // as mongod 8.2 orders it (RM-614).
+    if section_wanted(doc, "spillWiredTiger") {
+        match ctx.storage().ok().and_then(|s| s.spill_engine_status()) {
+            Some(Ok((storage_size, version, stats))) => {
+                let mut section = doc! { "storageSize": Bson::Int64(storage_size) };
+                section.extend(wired_tiger_section(&version, stats));
+                reply.insert("spillWiredTiger", section);
+            }
+            Some(Err(e)) => return Err(crate::util::command_error(e)),
+            None => {}
+        }
+    }
     reply.insert(
         "storageEngine",
         doc! {

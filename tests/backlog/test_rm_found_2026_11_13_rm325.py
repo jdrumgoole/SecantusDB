@@ -153,10 +153,10 @@ def _spill_engine_status(client: Any) -> Any:
     return {"storageSize": section.get("storageSize"), "uri": section.get("uri")}
 
 
-@pytest.mark.backlog("RM-614")
+@pytest.mark.backlog_fixed("RM-614")
 def test_server_status_reports_the_spill_engine(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `serverStatus` has a `spillWiredTiger` section from
     startup -- the spill engine's statistics, `storageSize` 0 while nothing
-    is spilled (`spillWiredTigerServerStatusVerbosity` 1). This server's has
+    is spilled (`spillWiredTigerServerStatusVerbosity` 1). This server's had
     none."""
     assert _spill_engine_status(rust_mongo) == _spill_engine_status(mongod)

@@ -1117,15 +1117,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Found 2026-11-18 working RM-613.
       Verify: tests/backlog/test_rm_found_2026_11_18_rm613.py::test_an_approximate_median_is_mongods_tdigest
       Backlog-ID: RM-720
-- [ ] **`serverStatus` has no `spillWiredTiger` section.** mongod 8.2.11
-      reports its spill engine's statistics there from startup (`uri`
-      `"statistics:"`, `storageSize` 0 while nothing is spilled, `version`,
-      and the block-manager and cache counters;
-      `spillWiredTigerServerStatusVerbosity` 1). This server opens its spill
-      engine at the first spill and reports none of it. Found 2026-11-13
-      working RM-325.
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_server_status_reports_the_spill_engine
-      Backlog-ID: RM-614
 - [ ] **An SBE sort counts no memory for a field a document lacks.**
       mongod 8.2.11 counts every slot of an SBE sort's row in the memory it
       holds, a missing field's `Nothing` included (`getApproximateSize`:

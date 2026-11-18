@@ -1493,6 +1493,12 @@ impl CmdStorage for StorageAdapter {
         Some((m.sleep_secs, m.enabled, m.passes, m.deleted))
     }
 
+    fn spill_engine_status(
+        &self,
+    ) -> Option<Result<(i64, String, Vec<(String, i64)>), StorageError>> {
+        Some(self.spill.status().map_err(map_err))
+    }
+
     fn engine_statistics(&self) -> Option<Result<(String, Vec<(String, i64)>), StorageError>> {
         Some(self.inner.wt_statistics().map_err(map_err))
     }

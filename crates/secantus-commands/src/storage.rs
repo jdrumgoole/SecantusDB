@@ -1307,6 +1307,17 @@ pub trait Storage: Send + Sync {
         None
     }
 
+    /// The spill engine's `serverStatus.spillWiredTiger` numbers: the bytes
+    /// its tables hold on disk, its version and its statistics,
+    /// `(description, value)` in its order. Default: `None`, a backend with
+    /// no spill engine.
+    #[allow(clippy::type_complexity)]
+    fn spill_engine_status(
+        &self,
+    ) -> Option<Result<(i64, String, Vec<(String, i64)>), StorageError>> {
+        None
+    }
+
     /// Run TTL pruning across every collection, returning the number of docs
     /// deleted. Backs `secantusAdmin.pruneTtl` — an immediate pass (the WT
     /// backend also sweeps on a background cadence). Default: unsupported; the
