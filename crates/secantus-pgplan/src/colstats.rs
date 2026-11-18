@@ -931,6 +931,66 @@ enum ReAtom {
     Set,
     /// A parenthesized group's alternatives, and whether it captures.
     Group(Vec<Vec<QuantifiedAtom>>, bool),
+    /// A `^`: a BOS constraint arc, which [`strip_bos`] removes where no
+    /// character precedes it.
+    Bos,
+}
+
+/// Removes the `^`s of `atoms` that no character can precede, as
+/// `regc_nfa.c`'s optimisation pulls them back into the `pre` state's BOS
+/// arcs (`^(?:^w0)1` and `(?:^w0)1` are both prefix `w01` on 15.19);
+/// `at_start` is whether nothing has been consumed yet, and the result
+/// whether a `^` was removed. A group holding one is read once: a later
+/// copy follows a character, so its paths cannot match (`^(?:^w0)+1` is
+/// `w01`). `None` for a `^` a character may precede (an unsatisfiable or
+/// branch-local anchor, not modelled), or one inside an optional, repeated
+/// or alternating group.
+fn strip_bos(atoms: &mut Vec<QuantifiedAtom>, at_start: &mut bool) -> Option<bool> {
+    let mut saw = false;
+    let mut out = Vec::with_capacity(atoms.len());
+    for (atom, min, mut max) in std::mem::take(atoms) {
+        let atom = match atom {
+            ReAtom::Bos => {
+                if !*at_start {
+                    return None;
+                }
+                saw = true;
+                continue;
+            }
+            ReAtom::Group(mut alts, capturing) if max != Some(0) => {
+                let mut inner_start = *at_start;
+                let found = match alts.as_mut_slice() {
+                    [only] if min >= 1 => strip_bos(only, &mut inner_start)?,
+                    _ => {
+                        let mut probe = alts.clone();
+                        for alt in &mut probe {
+                            strip_bos(alt, &mut false)?;
+                        }
+                        inner_start = false;
+                        false
+                    }
+                };
+                if found {
+                    if min != 1 {
+                        return None;
+                    }
+                    max = Some(1);
+                    saw = true;
+                }
+                *at_start = inner_start;
+                ReAtom::Group(alts, capturing)
+            }
+            other => {
+                if max != Some(0) {
+                    *at_start = false;
+                }
+                other
+            }
+        };
+        out.push((atom, min, max));
+    }
+    *atoms = out;
+    Some(saw)
 }
 
 /// A [`ReAtom`] and its quantifier's bounds.
@@ -952,7 +1012,7 @@ type QuantifiedAtom = (ReAtom, u32, Option<u32>);
 /// options or a director.
 fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String, PrefixStatus)> {
     let chars: Vec<char> = patt.chars().collect();
-    if patt.starts_with("***") || patt.starts_with("(?") {
+    if patt.starts_with("***") || patt.starts_with("(?") && !patt.starts_with("(?:") {
         return None;
     }
     // An alternation at the top: the `pre` state's rainbow, or BOS arcs
@@ -960,33 +1020,34 @@ fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String,
     if regex_has_bare(&chars, '|', true) {
         return Some((String::new(), PrefixStatus::None));
     }
-    if chars.first() != Some(&'^') {
-        // The `pre` state's rainbow: not anchored. A `^` further in
-        // anchors some branch, which is not modelled.
-        return if regex_has_bare(&chars, '^', false) {
-            None
-        } else {
-            Some((String::new(), PrefixStatus::None))
-        };
-    }
     let exact_end = chars.len() >= 2 && chars[chars.len() - 1] == '$' && {
-        let backslashes = chars[1..chars.len() - 1]
+        let backslashes = chars[..chars.len() - 1]
             .iter()
             .rev()
             .take_while(|c| **c == '\\')
             .count();
         backslashes % 2 == 0
     };
-    let body = &chars[1..chars.len() - usize::from(exact_end)];
+    // The `pre` state's rainbow: no `^` can anchor the match, whatever
+    // else of the regex is not modelled.
+    if !regex_has_bare(&chars, '^', false) {
+        return Some((String::new(), PrefixStatus::None));
+    }
+    let body = &chars[..chars.len() - usize::from(exact_end)];
     let mut pos = 0;
-    let alternatives = regex_atoms(body, &mut pos, &mut Vec::new())?;
+    let mut alternatives = regex_atoms(body, &mut pos, &mut Vec::new())?;
     if pos != body.len() {
         return None;
     }
     // The `pre` state's BOS arcs lead to more than one state.
-    let [atoms] = alternatives.as_slice() else {
+    let [atoms] = alternatives.as_mut_slice() else {
         return Some((String::new(), PrefixStatus::None));
     };
+    // The `pre` state's rainbow where no `^` anchors the match.
+    if !strip_bos(atoms, &mut true)? {
+        return Some((String::new(), PrefixStatus::None));
+    }
+    let atoms = &*atoms;
     let case_varies = |c: char| {
         if c_ctype {
             c.is_ascii_alphabetic()
@@ -1035,6 +1096,7 @@ fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String,
                     }
                 }
                 ReAtom::Set => return Some(false),
+                ReAtom::Bos => continue,
                 ReAtom::Group(..) if *min == 0 => return Some(false),
                 ReAtom::Group(alts, _) if *max == Some(*min) => match alts.as_slice() {
                     [inner] => {
@@ -1170,11 +1232,15 @@ fn regex_atoms(
                 *pos += 1;
                 continue;
             }
-            '^' | '$' => return None,
+            '^' => {
+                *pos += 1;
+                ReAtom::Bos
+            }
+            '$' => return None,
             '*' | '+' | '?' | '{' => {
                 let (min, max) = regex_quantifier(chars, pos)?;
                 let last = atoms.last_mut()?;
-                if (last.1, last.2) != (1, Some(1)) {
+                if (last.1, last.2) != (1, Some(1)) || matches!(last.0, ReAtom::Bos) {
                     return None;
                 }
                 (last.1, last.2) = (min, max);
@@ -1830,9 +1896,21 @@ mod tests {
             ("^xy(?:ab){2,4}c", false, Some(("xy", Partial))),
             ("^x(a){2,5}", false, Some(("x", Partial))),
             ("^(ab|ac){1,2}", false, Some(("", NoMatch))),
-            // Not modelled: an anchor inside, a back reference to an
-            // unclosed group.
-            ("(^a)", false, None),
+            // A `^` no character precedes is the match's anchor
+            // (PostgreSQL 15.19, a "C" column's Index Cond: `w01` for
+            // each of the first four).
+            ("^(?:^w0)1", false, Some(("w01", Partial))),
+            ("^(^w0)1", false, Some(("w01", Partial))),
+            ("(?:^w0)1", false, Some(("w01", Partial))),
+            ("^(?:^w0)+1", false, Some(("w01", Partial))),
+            ("(^a)", false, Some(("a", Partial))),
+            // Not modelled: a `^` after a character (the regex cannot
+            // match), in an optional group or a branch; a back reference
+            // to an unclosed group.
+            ("^w(?:^0)1", false, None),
+            ("^(?:^w)(?:^0)1", false, None),
+            ("^(?:^w0)?1", false, None),
+            ("^(?:w|^x)0", false, None),
             ("^a\\1", false, None),
             // A back reference is a copy of the group it names, as
             // PostgreSQL 15.19's index conditions show.
