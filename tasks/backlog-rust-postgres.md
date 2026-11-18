@@ -2521,17 +2521,6 @@ tests are scenarios in `tests/backlog/test_rp_batch26.py`.
 
 Measured on a private PostgreSQL 15.19 cluster.
 
-- [ ] **A CREATE FUNCTION's compile error without a position has no
-      compile context.** An error PL/pgSQL's grammar raises without a
-      scanner position is framed `compilation of PL/pgSQL function "<name>"
-      near line N` (`plpgsql_compile_error_callback`): on PostgreSQL 15.19
-      `create function u958() returns void language plpgsql as $$ begin
-      raise unknown_thing; end $$` is 42704 `unrecognized exception
-      condition "unknown_thing"` with CONTEXT `compilation of PL/pgSQL
-      function "u958" near line 1`. Here the CONTEXT is missing. A DO block
-      has it since RP-958 (`do_compile_error`).
-      Verify: tests/backlog/test_rp_found_rp619.py::test_create_function_compile_error_has_context
-      Backlog-ID: RP-1040
 
 ## Found while working RP-573 (2026-11-08)
 

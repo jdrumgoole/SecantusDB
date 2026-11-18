@@ -172,7 +172,7 @@ def test_do_block_compile_error_has_context(dsn: str) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-1040")
+@pytest.mark.backlog_fixed("RP-1040")
 def test_create_function_compile_error_has_context(dsn: str) -> None:
     assert _answers(
         dsn,
