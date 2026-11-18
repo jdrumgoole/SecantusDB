@@ -1969,9 +1969,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on PostgreSQL 15.19 (2026-11-18): a join on an expression
-    # prints every node's `Output` under VERBOSE.
+    # printed every node's `Output` under VERBOSE (fixed: the ON's
+    # expression sides' columns are needed below the join).
     "explain verbose of a join on an expression": (
-        "RP-966",
+        "RP-966:fixed",
         _ANALYSED,
         "explain (verbose, costs off) select e.b from e join k on e.a = k.a + 1",
         [
@@ -1984,6 +1985,66 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Output: e.b, e.a",
             "        ->  Seq Scan on public.e",
             "              Output: e.b, e.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (2026-11-18): a nested loop over a
+    # Materialize, the ON an expression, prints every node's `Output`.
+    "explain verbose of a materialized loop on an expression": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b from e join k on e.a < k.a + 1",
+        [
+            "Nested Loop",
+            "  Output: e.b",
+            "  Join Filter: (e.a < (k.a + 1))",
+            "  ->  Seq Scan on public.e",
+            "        Output: e.a, e.b",
+            "  ->  Materialize",
+            "        Output: k.a",
+            "        ->  Seq Scan on public.k",
+            "              Output: k.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (2026-11-18): a chain of three
+    # relations with a WHERE prints every node's `Output`.
+    "explain verbose of a three-way join with a where": (
+        "RP-966",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, e2.b from e join k on e.a = k.a "
+        "join e e2 on e2.a = k.a where e2.b <> 'x'",
+        [
+            "Hash Join",
+            "  Output: e.b, e2.b",
+            "  Inner Unique: true",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Hash Join",
+            "        Output: e.b, e.a, e2.b, e2.a",
+            "        Hash Cond: (e2.a = e.a)",
+            "        ->  Seq Scan on public.e e2",
+            "              Output: e2.a, e2.b",
+            "              Filter: (e2.b <> 'x'::text)",
+            "        ->  Hash",
+            "              Output: e.b, e.a",
+            "              ->  Seq Scan on public.e",
+            "                    Output: e.b, e.a",
+            "  ->  Hash",
+            "        Output: k.a",
+            "        ->  Seq Scan on public.k",
+            "              Output: k.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966): with a
+    # second ON clause the expression's side is the probe side.
+    "a hash join on an expression and a column pair hashes the column side": (
+        "RP-1058",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a = k.a + 1 and e.b = k.b",
+        [
+            "Hash Join  (cost=30.00..54.75 rows=100 width=3)",
+            "  Hash Cond: (((k.a + 1) = e.a) AND (k.b = e.b))",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966).

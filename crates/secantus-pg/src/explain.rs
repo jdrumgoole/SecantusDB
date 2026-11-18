@@ -3620,6 +3620,11 @@ pub(crate) fn attach_verbose_join(
         return;
     }
     if root.name.starts_with("Nested Loop") {
+        // An ON over an expression prints as the Materialize loop's
+        // `Join Filter`, already prefixed; an index scan cannot serve it.
+        if v.expr_on && !(root.children.len() == 2 && root.children[1].name == "Materialize") {
+            return;
+        }
         attach_verbose_nested_loop(root, v);
         return;
     }

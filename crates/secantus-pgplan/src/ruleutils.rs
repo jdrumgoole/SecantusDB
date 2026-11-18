@@ -6751,6 +6751,9 @@ pub struct VerboseJoin {
     /// A cross-relation WHERE conjunct is not a comparison of two columns,
     /// so no `join_quals` entry can prefix it as an inner scan's `Filter`.
     pub unprinted_filter: bool,
+    /// An ON clause compares an expression rather than two columns: only
+    /// a hash join, whose `Hash Cond` prints it, is printed (RP-966).
+    pub expr_on: bool,
 }
 
 /// [`VerboseJoin`] for `SELECT <columns or *> FROM a [LEFT] JOIN b ON
@@ -6868,6 +6871,7 @@ pub fn explain_verbose_join(
     // The ON: equalities between a column of each side.
     let mut parts = Vec::new();
     let mut all_equal = true;
+    let mut expr_on = false;
     and_clauses(j.quals.as_deref()?, &mut parts);
     for part in &parts {
         let part: &Node = part;
@@ -6888,7 +6892,48 @@ pub fn explain_verbose_join(
             Some(N::ColumnRef(c)) => resolve(c),
             _ => None,
         };
-        let ((li, lc), (ri, rc)) = (col(&a.lexpr)?, col(&a.rexpr)?);
+        let (Some((li, lc)), Some((ri, rc))) = (col(&a.lexpr), col(&a.rexpr)) else {
+            // An expression of one relation compared with an expression
+            // of the other (`e.a = k.a + 1`): its columns are needed
+            // below the join, which prints the clause itself as its
+            // `Hash Cond`, already prefixed (RP-966).
+            let mut rels = [None, None];
+            for (slot, n) in rels.iter_mut().zip([&a.lexpr, &a.rexpr]) {
+                let mut refs = Vec::new();
+                let mut other = false;
+                let mut copy = n.as_deref()?.clone();
+                crate::walk_expr(&mut copy, &mut |n| {
+                    match n.node.as_ref() {
+                        Some(N::ColumnRef(c)) => refs.push(c.clone()),
+                        Some(N::SubLink(_)) => other = true,
+                        _ => {}
+                    }
+                    Ok(())
+                })
+                .ok()?;
+                if other {
+                    return None;
+                }
+                let refs: Vec<(usize, String)> =
+                    refs.iter().map(&resolve).collect::<Option<_>>()?;
+                let i = refs.first()?.0;
+                if refs.iter().any(|r| r.0 != i) {
+                    return None;
+                }
+                *slot = Some((i, refs));
+            }
+            let [Some((li, lrefs)), Some((ri, rrefs))] = rels else {
+                return None;
+            };
+            if li == ri {
+                return None;
+            }
+            for (i, c) in lrefs.iter().chain(&rrefs) {
+                need(*i, c);
+            }
+            expr_on = true;
+            continue;
+        };
         if li == ri {
             return None;
         }
@@ -7108,6 +7153,7 @@ pub fn explain_verbose_join(
         all_equal,
         join_filter,
         unprinted_filter,
+        expr_on,
     })
 }
 

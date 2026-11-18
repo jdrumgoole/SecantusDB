@@ -1770,15 +1770,29 @@ a regression test.
       kept while a relation of their equivalence class is still outside
       it, as `generate_base_implied_equalities` gives them that class's
       relids: `ruleutils::explain_verbose_chain`,
-      `explain::attach_verbose_chain`.) Still the plain plan: an ON that is
-      not column comparisons (`explain (verbose, costs off) select e.b from
-      e join k on e.a = k.a + 1` is, on PostgreSQL 15.19, `Output: e.b`
-      over `Seq Scan on public.k` with `Output: k.a, k.b` and a Hash and
-      `Seq Scan on public.e` each with `Output: e.b, e.a`), a chain of
-      three or more relations with a WHERE or a nested loop or merge join
-      in it, and an outer join in one.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a join on an expression]
+      `explain::attach_verbose_chain`.) (Since 2026-11-18 a two-relation
+      hash join or Materialize loop whose ON compares expressions of one
+      relation each, `e.a = k.a + 1`, prints every node's `Output`:
+      `VerboseJoin::expr_on`; such an ON into a parameterised index scan
+      or a Memoize still prints the plain plan.) Still the plain plan: a
+      chain of three or more relations with a WHERE (`explain (verbose,
+      costs off) select e.b, e2.b from e join k on e.a = k.a join e e2 on
+      e2.a = k.a where e2.b <> 'x'` on PostgreSQL 15.19 prints each node's
+      `Output`, the filtered scan `Output: e2.a, e2.b` above its `Filter`)
+      or a nested loop or merge join in it, and an outer join in one.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a three-way join with a where]
       Backlog-ID: RP-966
+
+- [ ] **A hash join on an expression and a column pair hashes the
+      expression's side.** `explain select e.b from e join k on e.a = k.a
+      + 1 and e.b = k.b` (both analysed, 1000 rows) hashes `k` and prints
+      `Hash Cond: ((e.a = (k.a + 1)) AND (e.b = k.b))`; PostgreSQL 15.19
+      hashes `e` (`Hash Join (cost=30.00..54.75 rows=100 width=3)`, `Hash
+      Cond: (((k.a + 1) = e.a) AND (k.b = e.b))`, `k` the probe side). With
+      the expression clause alone the sides match (RP-981). Found while
+      working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash join on an expression and a column pair hashes the column side]
+      Backlog-ID: RP-1058
 
 - [ ] **EXPLAIN drops the Sort of an ORDER BY over a join with no
       LIMIT.** `explain (costs off) select e.b, k.b from e join k on e.a =
