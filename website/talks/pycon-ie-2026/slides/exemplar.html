@@ -2,9 +2,9 @@
 <p class="eyebrow">Act two · How do you know it’s right?</p>
 <h2>Run it against the real server. Don’t reason about the source.</h2>
 <div class="cards">
-<div class="card rise" style="--i:0"><h3>One exemplar</h3><p class="body">mongod 8.x and PostgreSQL. Never another SecantusDB server, never our own docs.</p></div>
-<div class="card rise" style="--i:1"><h3>Differential probes</h3><p class="body">Same pymongo code against SecantusDB and real mongod; diff the answers, including BSON types.</p></div>
-<div class="card rise" style="--i:2"><h3>Parity isn’t correctness</h3><p class="body">Our Python and Rust servers once agreed on $bucket, $densify and $stdDev — and were both wrong.</p></div>
+<div class="card rise" style="--i:0"><h3>One exemplar</h3><p class="body">mongod 8.x and PostgreSQL</p></div>
+<div class="card rise" style="--i:1"><h3>Differential probes</h3><p class="body">Same code, both servers, diff</p></div>
+<div class="card rise" style="--i:2"><h3>Parity isn’t correctness</h3><p class="body">Two of ours agreed. Both wrong.</p></div>
 </div>
-<aside>Every real bug in our August sweeps came from executing behaviour and comparing, not from reading code. Estimates from reading code were wrong in both directions. Tell the $asinh story briefly: two of our own engines agreed, mongod disagreed. ~3 min.</aside>
+<aside><p>How do you know it's right? You run it against the real server.</p><p><b>One exemplar.</b> mongod 8.x for the MongoDB server and PostgreSQL for the SQL server. Never another SecantusDB server, never our own docs.</p><p><b>Differential probes.</b> The same pymongo code against SecantusDB and against real mongod; diff the answers, including the BSON types, not just the values.</p><p><b>Parity isn't correctness.</b> Our Python and Rust servers once agreed on $bucket, $densify and $stdDev, and both were wrong. Tell the $asinh story briefly: two of our own engines agreed, mongod disagreed, and mongod is right by definition.</p><p>Every real bug in the August sweeps came from executing behaviour and comparing, not from reading code. Estimates from reading code were wrong in both directions.</p><p class="time">Time: ~3 min</p></aside>
 </section>

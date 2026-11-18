@@ -19,6 +19,5 @@
 <p class="arrow">→</p>
 <div class="box wt" style="flex:1.2;"><p class="t">same tables</p><p>same files</p></div>
 </div>
-<p style="font-size:28px;color:var(--soft);">A Cargo workspace of about 20 crates. The engines have no PyO3, so the standalone binaries and the Python bindings share them.</p>
-<aside>Walk the two rows. Point: a CREATE TABLE in the Postgres server reads back as a collection in the MongoDB server — a hand-off, not concurrent serving; WiredTiger’s file lock lets only one serve at a time. ~2 min.</aside>
+<aside><p>Walk the two rows.</p><p><b>MongoDB:</b> pymongo sends OP_MSG; secantus-wire turns it into commands; secantus-core runs the query, update and aggregation engines; secantus-storage talks to WiredTiger.</p><p><b>PostgreSQL:</b> psycopg speaks the PG wire protocol; libpg_query, PostgreSQL's own parser, parses the SQL; secantus-pgplan lowers it to the filters the core engine evaluates; and it lands in the same tables, in the same files.</p><p>It's a Cargo workspace of about 20 crates. The engines have no PyO3, so the standalone binaries and the Python bindings share them.</p><p>A CREATE TABLE in the Postgres server reads back as a collection in the MongoDB server. That's a hand-off, not concurrent serving: WiredTiger's file lock lets only one server open the directory at a time.</p><p class="time">Time: ~2 min</p></aside>
 </section>

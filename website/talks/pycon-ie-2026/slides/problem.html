@@ -2,9 +2,9 @@
 <p class="eyebrow">Why build a database?</p>
 <h2>Two protocols everyone already speaks</h2>
 <div class="cards">
-<div class="card rise" style="--i:0"><h3>The clients exist</h3><p class="body">pymongo, psycopg, SQLAlchemy and drivers in a dozen languages. Speak their wire protocol and they all work.</p></div>
-<div class="card rise" style="--i:1"><h3>The engine exists</h3><p class="body">WiredTiger, the storage engine inside MongoDB: checkpoints, transactions, durability.</p></div>
-<div class="card rise" style="--i:2"><h3>The gap</h3><p class="body">One small, self-contained server that speaks both, starts in one line and needs nothing else installed.</p></div>
+<div class="card rise" style="--i:0"><h3>The clients exist</h3><p class="body">Drivers in a dozen languages</p></div>
+<div class="card rise" style="--i:1"><h3>The engine exists</h3><p class="body">WiredTiger, inside MongoDB</p></div>
+<div class="card rise" style="--i:2"><h3>The gap</h3><p class="body">One small server for both</p></div>
 </div>
-<aside>Set up the motivation: we didn’t have to invent a client ecosystem or a storage engine. The work is the server in between, and being faithful to the real products. ~2 min.</aside>
+<aside><p>The motivation: we didn't have to invent a client ecosystem or a storage engine.</p><p><b>The clients exist.</b> pymongo, psycopg, SQLAlchemy and official drivers in a dozen languages. If you speak their wire protocol correctly, they all just work, and their authors have already written thousands of tests describing what a server must do.</p><p><b>The engine exists.</b> WiredTiger gives us checkpoints, transactions and durability. We don't write B-trees or a write-ahead log.</p><p><b>The gap</b> is the server in between: one small, self-contained server that is faithful to the real products, starts in one line and needs nothing else installed. All the hard work is in being faithful.</p><p class="time">Time: ~2 min</p></aside>
 </section>
