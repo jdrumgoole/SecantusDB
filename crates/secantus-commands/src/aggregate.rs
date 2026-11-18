@@ -4010,10 +4010,19 @@ fn apply_union_with(
         collection_documents(storage, db, from, &Document::new(), collation)?;
     if let Some(sub) = sub_pipeline {
         let _sub = InSubPipeline::enter(SubPipeline::UnionWith);
+        // A `$sort` in the sub-pipeline sets the sort key its own
+        // `{$meta: "sortKey"}` and `$_internalSetWindowFields` ranks read, as
+        // a `$lookup`'s does (mongod 8.2.11, RM-624): the one the read of
+        // `from` takes, a view's stages in front.
+        let mut rewritten = sub.clone();
+        crate::agg_meta::rewrite_sort_metadata(&mut rewritten, || {
+            let (base, whole) = resolve_view(storage, db, from, sub.clone()).ok()?;
+            crate::explain::pipeline_canonical(&base, &whole).sort
+        });
         // mongod plans the sub-pipeline as a query of its own, so it has its
         // own pushdown into SBE (measured 8.2.11: `$mod` by zero in a
         // `$group` there is SBE's 4848403).
-        let hoisted = crate::explain::hoist::hoist_runnable(sub);
+        let hoisted = crate::explain::hoist::hoist_runnable(&rewritten);
         let sub = match crate::explain::sbe_pushdown(storage, db, from, &hoisted, None, collation) {
             Some(end) => {
                 if storage.collection_exists(db, from).unwrap_or(false) {

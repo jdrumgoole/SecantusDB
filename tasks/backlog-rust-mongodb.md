@@ -1128,15 +1128,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Found 2026-11-13 (RM-509).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm509.py::test_an_empty_window_counts_no_function
       Backlog-ID: RM-619
-- [ ] **A `$unionWith` sub-pipeline's `$sort` sets no sort key.** In a
-      `$unionWith` pipeline, mongod 8.2.11 ranks a
-      `$_internalSetWindowFields` by the key the sub-pipeline's `$sort` set
-      and gives it as `{$meta: "sortKey"}`; this server ties every document
-      and refuses the `$meta` (code 2). The same gap RM-521 closed for
-      `$lookup` (`apply_union_with` does not run
-      `agg_meta::rewrite_sort_metadata`). Found 2026-11-13 (RM-521).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm521.py::test_a_union_with_sub_pipeline_sort_sets_the_key
-      Backlog-ID: RM-624
 - [ ] **`{$meta: "sortKey"}` in a `$facet` is refused, not `[]`.** mongod
       8.2.11 gives `[]` in a `$facet` pipeline, behind the facet's own
       `$sort` too (its ranks tie there, which this server matches); this

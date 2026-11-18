@@ -17,11 +17,11 @@ from tests.backlog.test_rm_found_2026_11_10_rm410 import RANK, _answers
 META = {"$addFields": {"m": {"$meta": "sortKey"}}}
 
 
-@pytest.mark.backlog("RM-624")
+@pytest.mark.backlog_fixed("RM-624")
 def test_a_union_with_sub_pipeline_sort_sets_the_key(rust_mongo: Any, mongod: Any) -> None:
     """In a `$unionWith` pipeline, mongod 8.2.11 ranks by the key the
     sub-pipeline's `$sort` set, and `{$meta: "sortKey"}` reads it; this
-    server ties every document and refuses the `$meta` (code 2)."""
+    server tied every document and refused the `$meta` (code 2)."""
     pipelines = {
         "rank": [
             {"$limit": 1},
