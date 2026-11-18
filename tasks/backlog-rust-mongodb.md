@@ -1117,6 +1117,21 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Found 2026-11-18 working RM-613.
       Verify: tests/backlog/test_rm_found_2026_11_18_rm613.py::test_an_approximate_median_is_mongods_tdigest
       Backlog-ID: RM-720
+- [ ] **An upsert's field order sometimes repeats for all twelve
+      upserts.** `tests/backlog/test_rm_057_084.py::test_upsert_field_order_from_several_equalities`
+      (RM-059's regression test) failed in one RM-625 gate run on
+      2026-11-18 and once in about 60 reruns: this server gave
+      `('d', 'c', 'a', 'b', 'x')` for all twelve upserts of
+      `{d: 1, c: 2, b: 3, a: 4}`, where the test expects both orders of an
+      absl pair. The order comes from `secantus_core::absl_hash`'s
+      per-thread `NextSeed` (start at a thread-local's address, step
+      0xad53), so a run of identical orders depends on where a thread's seed
+      starts. Not yet known: whether mongod's own `NextSeed` can give a
+      twelve-long run too (then the test asks more than mongod guarantees)
+      or the model differs from absl (then the server is wrong). Found
+      2026-11-18 (RM-625).
+      Verify: none -- intermittent, about 1 run in 30; no deterministic gap test until the cause is known
+      Backlog-ID: RM-721
 - [ ] **The sort key is lost at a `$graphLookup` or a `$fill`.** mongod
       8.2.11 keeps it through both, as it does through the stages RM-520
       names; this server ends it at each, so a rank behind ties every
