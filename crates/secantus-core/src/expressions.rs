@@ -9832,6 +9832,12 @@ fn op_ts_field(arg: &Bson, ctx: &Ctx, seconds: bool) -> R {
 /// threaded through evaluation -- which would change the value path, and the
 /// value path is right.
 fn operand_is_missing(arg: &Bson, ctx: &Ctx) -> bool {
+    // A query filter's sort key is missing (`op_meta`; RM-633).
+    if let Bson::Document(d) = arg {
+        return d.len() == 1
+            && matches!(d.get("$meta"), Some(Bson::String(k)) if k == "sortKey")
+            && in_query_filter();
+    }
     let Bson::String(s) = arg else { return false };
     if s == "$$REMOVE" {
         return true;

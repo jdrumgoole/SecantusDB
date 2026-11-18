@@ -1150,16 +1150,14 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       of its own, apart from every BSON value. Found 2026-11-13 (RM-525).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm525.py::test_a_stored_undefined_is_not_missing, tests/backlog/test_rm_found_2026_11_13_rm525.py::test_a_group_keeps_undefined_apart_from_null
       Backlog-ID: RM-635
-- [ ] **A `$match` that reads a missing sort key names it `undefined`.**
-      With no `$sort` ahead of it, `{$match: {$expr: {$gt: [{$size:
-      {$meta: "sortKey"}}, 0]}}}` is mongod 8.2.11's 17124 "Executor error
-      during aggregate command on namespace: ... :: caused by :: The
-      argument to $size must be an array, but was of type: missing"; this
-      server's has no envelope and says `undefined`. (`$addFields` reads
-      the key as `[]` on both.) The `undefined` is RM-635's MISSING; the
-      envelope is this item's own. Found 2026-11-13 (RM-524).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm524.py::test_a_match_reads_a_missing_sort_key
-      Backlog-ID: RM-633
+- [ ] **A leading `$match` on `{$size: "$$REMOVE"}` is an executor error.**
+      mongod 8.2.11 folds it: 17124 "Failed to optimize pipeline :: caused
+      by :: The argument to $size must be an array, but was of type:
+      missing"; this server's says "Executor error during aggregate command
+      on namespace: ...". `$addFields` folds on both. Found 2026-11-18
+      (RM-633).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm524.py::test_a_match_on_a_constant_remove_fails_to_optimize
+      Backlog-ID: RM-722
 - [ ] **A `$project` of `{$meta: "sortKey"}` with no `$sort` is refused as
       unsupported.** mongod 8.2.11 refuses `{$project: {t: {$type: {$meta:
       "sortKey"}}}}` with code 2 "Failed to determine whether query system
