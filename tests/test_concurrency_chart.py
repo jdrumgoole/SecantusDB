@@ -60,8 +60,9 @@ def test_scaling_ratios() -> None:
 
 
 def test_render_viz_structure(results: dict) -> None:
-    # The site leaves the deprecated Python series out; the docs keep all four.
-    for style, prefix, lines in [("website", "viz", 3), ("docs", "dv", 4)]:
+    # Neither surface draws the deprecated Python series, even when the
+    # results carry it.
+    for style, prefix, lines in [("website", "viz", 3), ("docs", "dv", 3)]:
         svg = render_viz(results, style)
         assert svg.count("<path ") == lines
         assert svg.count("<circle ") == 4 * lines
@@ -80,6 +81,7 @@ def test_render_viz_tooltips(results: dict) -> None:
     docs = render_viz(results, "docs")
     assert "<title>Rust server — 8 writers: 2.72x its single-writer rate</title>" in docs
     assert "data-tip" not in docs
+    assert "Python" not in docs
 
 
 def test_render_viz_singular_writer_phrase(results: dict) -> None:
@@ -93,7 +95,8 @@ def test_render_tables(results: dict) -> None:
     row = "<tr><th>1</th><td>105,700</td><td>35,400</td><td>50,400</td></tr>"
     assert row in website
     docs = render_docs_table(results)
-    assert "| 8 | 7,600 | 96,400 | 119,200 | 481,000 |" in docs
+    assert "| 8 | 96,400 | 119,200 | 481,000 |" in docs
+    assert "Python" not in docs
 
 
 def test_nudge_labels_separates_collisions() -> None:
