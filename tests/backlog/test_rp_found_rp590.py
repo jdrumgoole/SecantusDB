@@ -226,8 +226,85 @@ def test_record_image_over_money_and_bit_strings(query: str, dsn: str) -> None:
     assert answer(dsn, query) == RECORD_IMAGE_MONEY_AND_BITS[query]
 
 
+# Measured on PostgreSQL 15.19: an array compares by its `ArrayType` image
+# (ndim, dataoffset, element oid, dims, lower bounds, NULL bitmap, the
+# MAXALIGNed elements), so a longer first dimension or a NULL bitmap
+# decides before any element; a range by its `RangeType` image (oid, finite
+# bounds, the flags byte last), so `[1.0,2]` and `[1.00,2]` differ.
+RECORD_IMAGE_ARRAYS_AND_RANGES = [
+    ("'{1}'::int[]", "*<", "'{1}'::int[]", False),
+    ("'{1}'::int[]", "*=", "'{1}'::int[]", True),
+    ("'{-1}'::int[]", "*<", "'{1}'::int[]", False),
+    ("'{-1}'::int[]", "*=", "'{1}'::int[]", False),
+    ("'{1,2}'::int[]", "*<", "'{2}'::int[]", False),
+    ("'{1,2}'::int[]", "*=", "'{2}'::int[]", False),
+    ("'{}'::int[]", "*<", "'{1}'::int[]", True),
+    ("'{}'::int[]", "*=", "'{1}'::int[]", False),
+    ("'{{1,2},{3,4}}'::int[]", "*<", "'{1,2,3,4}'::int[]", False),
+    ("'{{1,2},{3,4}}'::int[]", "*=", "'{1,2,3,4}'::int[]", False),
+    ("'[0:1]={1,2}'::int[]", "*<", "'{1,2}'::int[]", True),
+    ("'[0:1]={1,2}'::int[]", "*=", "'{1,2}'::int[]", False),
+    ("array[1,null]::int[]", "*<", "array[1,2]::int[]", False),
+    ("array[1,null]::int[]", "*=", "array[1,2]::int[]", False),
+    ("array[null,1]::int[]", "*<", "array[1]::int[]", False),
+    ("array[null,1]::int[]", "*=", "array[1]::int[]", False),
+    ("'{1}'::int8[]", "*<", "'{2}'::int8[]", True),
+    ("'{1}'::int8[]", "*=", "'{2}'::int8[]", False),
+    ("'{t}'::bool[]", "*<", "'{f,f}'::bool[]", True),
+    ("'{t}'::bool[]", "*=", "'{f,f}'::bool[]", False),
+    ("'{1.5}'::float8[]", "*<", "'{-1}'::float8[]", False),
+    ("'{1.5}'::float8[]", "*=", "'{-1}'::float8[]", False),
+    ("'{2020-01-01}'::date[]", "*<", "'{1999-01-01}'::date[]", True),
+    ("'{2020-01-01}'::date[]", "*=", "'{1999-01-01}'::date[]", False),
+    ("'{1,2}'::int2[]", "*<", "'{1,3}'::int2[]", True),
+    ("'{1,2}'::int2[]", "*=", "'{1,3}'::int2[]", False),
+    ("'[1,2)'::int4range", "*<", "'[1,2)'::int4range", False),
+    ("'[1,2)'::int4range", "*=", "'[1,2)'::int4range", True),
+    ("'[1,3)'::int4range", "*<", "'[2,3)'::int4range", True),
+    ("'[1,3)'::int4range", "*=", "'[2,3)'::int4range", False),
+    ("'empty'::int4range", "*<", "'[2,3)'::int4range", True),
+    ("'empty'::int4range", "*=", "'[2,3)'::int4range", False),
+    ("'(,3)'::int4range", "*<", "'[2,3)'::int4range", False),
+    ("'(,3)'::int4range", "*=", "'[2,3)'::int4range", False),
+    ("'[1,)'::int4range", "*<", "'[1,2)'::int4range", False),
+    ("'[1,)'::int4range", "*=", "'[1,2)'::int4range", False),
+    ("'[1,2)'::int8range", "*<", "'[1,5)'::int8range", True),
+    ("'[1,2)'::int8range", "*=", "'[1,5)'::int8range", False),
+    ("'[1.0,2]'::numrange", "*<", "'[1.00,2]'::numrange", False),
+    ("'[1.0,2]'::numrange", "*=", "'[1.00,2]'::numrange", False),
+    ("'[1.5,2]'::numrange", "*<", "'(1.5,2]'::numrange", False),
+    ("'[1.5,2]'::numrange", "*=", "'(1.5,2]'::numrange", False),
+    ("'[2020-01-01,2020-02-01)'::daterange", "*<", "'[2020-01-02,2020-02-01)'::daterange", True),
+    ("'[2020-01-01,2020-02-01)'::daterange", "*=", "'[2020-01-02,2020-02-01)'::daterange", False),
+    (
+        "'[2020-01-01 10:00,2020-02-01)'::tsrange",
+        "*<",
+        "'[2020-01-01 09:00,2020-02-01)'::tsrange",
+        False,
+    ),
+    (
+        "'[2020-01-01 10:00,2020-02-01)'::tsrange",
+        "*=",
+        "'[2020-01-01 09:00,2020-02-01)'::tsrange",
+        False,
+    ),
+    ("'[2020-01-01 10:00+00,)'::tstzrange", "*<", "'[2020-01-01 09:00+00,)'::tstzrange", False),
+    ("'[2020-01-01 10:00+00,)'::tstzrange", "*=", "'[2020-01-01 09:00+00,)'::tstzrange", False),
+]
+
+
+@pytest.mark.backlog_fixed("RP-976")
+@pytest.mark.parametrize(("left", "op", "right", "want"), RECORD_IMAGE_ARRAYS_AND_RANGES)
+def test_record_image_over_arrays_and_ranges(
+    left: str, op: str, right: str, want: bool, dsn: str
+) -> None:
+    """Arrays of fixed-length elements and the built-in ranges were 0A000."""
+    query = f"select (select row({left})) {op} (select row({right}))"
+    assert answer(dsn, query) == [(want,)]
+
+
 RECORD_IMAGE_STILL_REFUSED = {
-    "select (select row('{1}'::int[])) *= (select row('{1}'::int[]))": [(True,)],
+    "select (select row('{a}'::text[])) *= (select row('{a}'::text[]))": [(True,)],
     """select (select row('{"a":1}'::jsonb)) *= (select row('{"a": 1}'::jsonb))""": [(True,)],
     "select (select row('[1,2)'::int4range)) *= (select row('[1,2)'::int4range))": [(True,)],
 }

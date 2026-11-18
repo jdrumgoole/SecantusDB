@@ -14,7 +14,8 @@
 //! by name (0A000) rather than compared some other way.
 //! Modelled: the integers, oid, bool, `"char"`, the floats, numeric, date,
 //! time, timetz, the timestamps, interval, uuid, macaddr / macaddr8, inet /
-//! cidr, tid, pg_lsn, name, text / varchar / bpchar and bytea.
+//! cidr, tid, pg_lsn, name, text / varchar / bpchar, bytea, money, bit /
+//! varbit, arrays of a fixed-length element, and the built-in ranges.
 
 use std::cmp::Ordering;
 
@@ -264,6 +265,12 @@ fn image(v: &Bson, ty: &str) -> Result<Image> {
             }
             _ => return Err(refused()),
         },
+        t if t.ends_with("[]") => {
+            Image::Bytes(array_image(v, &canonical(t.trim_end_matches("[]"))).ok_or_else(refused)?)
+        }
+        t if RANGE_TYPES.iter().any(|(n, _)| *n == t) => {
+            Image::Bytes(range_image(v, t).ok_or_else(refused)?)
+        }
         // An `unknown` field (a bare literal in `row(1, 'a')`) is a cstring,
         // attlen -2, which `record_image_cmp` has no case for.
         "unknown" => {
@@ -274,6 +281,148 @@ fn image(v: &Bson, ty: &str) -> Result<Image> {
         }
         _ => return Err(refused()),
     })
+}
+
+/// A fixed-length element type's `pg_type` facts: `(oid, typlen,
+/// typalign)`. Its stored bytes are the low `typlen` bytes of its Datum.
+fn fixed_element(ty: &str) -> Option<(u32, usize, usize)> {
+    Some(match ty {
+        "bool" => (16, 1, 1),
+        "\"char\"" => (18, 1, 1),
+        "int2" => (21, 2, 2),
+        "int4" => (23, 4, 4),
+        "int8" => (20, 8, 8),
+        "oid" => (26, 4, 4),
+        "float4" => (700, 4, 4),
+        "float8" => (701, 8, 8),
+        "money" => (790, 8, 8),
+        "date" => (1082, 4, 4),
+        "time" | "time without time zone" => (1083, 8, 8),
+        "timestamp" | "timestamp without time zone" => (1114, 8, 8),
+        "timestamptz" | "timestamp with time zone" => (1184, 8, 8),
+        "pg_lsn" => (3220, 8, 8),
+        _ => return None,
+    })
+}
+
+/// One fixed-length element as it lies in an array or range: the low
+/// `len` bytes of its Datum, native (little-endian) order.
+fn fixed_bytes(v: &Bson, ty: &str, len: usize) -> Option<Vec<u8>> {
+    match image(v, ty).ok()? {
+        Image::ByValue(w) => Some(w.to_le_bytes()[..len].to_vec()),
+        Image::Bytes(_) => None,
+    }
+}
+
+fn pad_to(out: &mut Vec<u8>, base: usize, align: usize) {
+    while !(base + out.len()).is_multiple_of(align) {
+        out.push(0);
+    }
+}
+
+/// An `ArrayType`'s varlena data (`array.h`): `ndim`, `dataoffset` (0
+/// without a NULL, else the offset of the data with the bitmap), the
+/// element type's oid, each dimension's length then each lower bound, the
+/// NULL bitmap (a set bit is a present element, LSB first), padding to
+/// MAXALIGN, then the present elements, each at its type's alignment.
+/// Modelled over fixed-length elements; a varlena element is not.
+fn array_image(v: &Bson, elem: &str) -> Option<Vec<u8>> {
+    let (oid, len, align) = fixed_element(elem)?;
+    let dims = crate::arrays::dim_lengths(&crate::arrays::strip(v));
+    let lbs = crate::arrays::lower_bounds(v);
+    let items = if dims.is_empty() {
+        Vec::new()
+    } else {
+        crate::arrays::flatten(v)
+    };
+    let nitems = items.len();
+    let has_nulls = items.iter().any(|i| matches!(i, Bson::Null));
+    let ndim = dims.len();
+    // Offsets are from the start of the ArrayType, its 4-byte length word
+    // included, which the image leaves out.
+    let maxalign = |n: usize| n.div_ceil(8) * 8;
+    let bitmap = if has_nulls { nitems.div_ceil(8) } else { 0 };
+    let data_offset = maxalign(16 + 8 * ndim + bitmap);
+    let mut out = Vec::new();
+    out.extend((ndim as i32).to_le_bytes());
+    out.extend((if has_nulls { data_offset as i32 } else { 0 }).to_le_bytes());
+    out.extend(oid.to_le_bytes());
+    for d in &dims {
+        out.extend((*d as i32).to_le_bytes());
+    }
+    for i in 0..ndim {
+        out.extend((lbs.get(i).copied().unwrap_or(1) as i32).to_le_bytes());
+    }
+    if has_nulls {
+        let mut bits = vec![0u8; bitmap];
+        for (i, it) in items.iter().enumerate() {
+            if !matches!(it, Bson::Null) {
+                bits[i / 8] |= 1 << (i % 8);
+            }
+        }
+        out.extend(bits);
+    }
+    out.resize(data_offset - 4, 0);
+    for it in items.iter().filter(|i| !matches!(i, Bson::Null)) {
+        pad_to(&mut out, 4, align);
+        out.extend(fixed_bytes(it, elem, len)?);
+    }
+    Some(out)
+}
+
+/// The built-in range types and their `pg_type` oids.
+const RANGE_TYPES: &[(&str, u32)] = &[
+    ("int4range", 3904),
+    ("numrange", 3906),
+    ("tsrange", 3908),
+    ("tstzrange", 3910),
+    ("daterange", 3912),
+    ("int8range", 3926),
+];
+
+/// A `RangeType`'s varlena data (`range_serialize`): the range type's oid,
+/// each finite bound at its subtype's alignment (a numeric bound with a
+/// one-byte short header, unaligned), then the flags byte (`EMPTY` 0x01,
+/// `LB_INC` 0x02, `UB_INC` 0x04, `LB_INF` 0x08, `UB_INF` 0x10).
+fn range_image(v: &Bson, ty: &str) -> Option<Vec<u8>> {
+    let oid = RANGE_TYPES.iter().find(|(n, _)| *n == ty)?.1;
+    let Bson::String(text) = v else { return None };
+    let r = crate::range::parse_stored(text).ok()?;
+    let (elem, _) = crate::range::range_element(ty)?;
+    let mut out = oid.to_le_bytes().to_vec();
+    let mut flags = 0u8;
+    if r.empty {
+        flags |= 0x01;
+    } else {
+        for (bound, inc, inc_flag, inf_flag) in [
+            (&r.lower, r.lower_inc, 0x02, 0x08),
+            (&r.upper, r.upper_inc, 0x04, 0x10),
+        ] {
+            let Some(b) = bound else {
+                flags |= inf_flag;
+                continue;
+            };
+            if inc {
+                flags |= inc_flag;
+            }
+            if elem == "numeric" {
+                let n = numeric_image(b)?;
+                out.push((((n.len() + 1) << 1) | 1) as u8);
+                out.extend(n);
+            } else {
+                let (_, len, align) = fixed_element(&elem)?;
+                let value = match elem.as_str() {
+                    "int4" | "int8" => Bson::Int64(b.parse().ok()?),
+                    "date" => Bson::String(b.clone()),
+                    _ => crate::cast_value(Bson::String(b.clone()), "timestamp").ok()?,
+                };
+                pad_to(&mut out, 4, align);
+                out.extend(fixed_bytes(&value, &elem, len)?);
+            }
+        }
+    }
+    out.push(flags);
+    Some(out)
 }
 
 /// A numeric's varlena data as `make_result` lays it out: the short
