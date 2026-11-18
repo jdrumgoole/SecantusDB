@@ -450,7 +450,7 @@ _DO_CLUSTER = (
         "payload": "Document payload: repeat (default, compressible) | random (incompressible).",
         "doc-bytes": "Payload bytes per document (default: 8192).",
         "batch-size": "Documents per insert call (default: 1).",
-        "region": "DigitalOcean region (default: lon1).",
+        "region": "DigitalOcean region (default: ams3; lon1 has no c-4 plan).",
         "server-size": "Server droplet size (default: c-4, dedicated CPU).",
         "client-size": "Client droplet size (default: c-2).",
         "build": "Server binary: 'release' (published tarball) or 'source' (build on the droplet).",
@@ -469,7 +469,7 @@ def do_bench(
     payload: str = "repeat",
     doc_bytes: int = 8192,
     batch_size: int = 1,
-    region: str = "lon1",
+    region: str = "ams3",
     server_size: str = "c-4",
     client_size: str = "c-2",
     build: str = "release",
@@ -524,6 +524,7 @@ def do_bench(
         "workers": "Load processes per client droplet (default: 16).",
         "repeat": "Interleaved measurement passes (default: 3).",
         "keep": "Leave the droplets running afterwards (default: destroy them).",
+        "region": "DigitalOcean region (default: ams3; lon1 has no c-4 plan).",
     },
 )
 def release_benchmark(
@@ -532,6 +533,7 @@ def release_benchmark(
     workers: int = 16,
     repeat: int = 3,
     keep: bool = False,
+    region: str = "ams3",
 ) -> None:
     """Re-measure SecantusDB against MongoDB for a release, on real hardware.
 
@@ -561,6 +563,7 @@ def release_benchmark(
     """
     cmd = (
         f"{_DO_CLUSTER} all"
+        f" --region {shlex.quote(region)}"
         f" --duration {float(duration)}"
         f" --workers {int(workers)}"
         f" --repeat {int(repeat)}"
@@ -677,7 +680,7 @@ def do_perf(
 @task(
     name="do-up",
     help={
-        "region": "DigitalOcean region (default: lon1).",
+        "region": "DigitalOcean region (default: ams3; lon1 has no c-4 plan).",
         "fresh": "Ignore existing snapshots.",
         "server-size": "Server droplet size (default: c-4; the PostgreSQL table uses c-16).",
         "client-size": "Client droplet size (default: c-2).",
@@ -685,7 +688,7 @@ def do_perf(
 )
 def do_up(
     c: Context,
-    region: str = "lon1",
+    region: str = "ams3",
     fresh: bool = False,
     server_size: str = "c-4",
     client_size: str = "c-2",

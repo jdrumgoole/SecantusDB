@@ -12,7 +12,7 @@ use crate::BenchResult;
 use crate::{ALL_ROLES, SERVER_ROLE};
 
 pub const DEFAULT_PREFIX: &str = "secantus-bench";
-pub const DEFAULT_REGION: &str = "lon1";
+pub const DEFAULT_REGION: &str = "ams3";
 // CPU-optimized (dedicated hyperthread), NOT shared-CPU `s-*`. A shared
 // droplet's steal time varies with whoever else is on the host, which makes
 // run-to-run comparison meaningless — the one thing a perf harness must not do.
@@ -274,8 +274,12 @@ pub fn hostname() -> String {
 
 /// A dedicated VPC so client -> server traffic stays on private, free,
 /// low-latency networking rather than the public interface.
+///
+/// The name carries the region: DigitalOcean VPC names are unique across the
+/// whole account, so a region-less name left in one region refused a cluster
+/// in any other ("a VPC with the same name already exists").
 pub fn ensure_vpc(api: &Api, cfg: &Config) -> BenchResult<String> {
-    let name = format!("{}-vpc", cfg.prefix);
+    let name = format!("{}-{}-vpc", cfg.prefix, cfg.region);
     for vpc in api.paged("/vpcs", "vpcs", "")? {
         let matches = vpc.get("name").and_then(|v| v.as_str()) == Some(name.as_str())
             && vpc.get("region").and_then(|v| v.as_str()) == Some(cfg.region.as_str());
