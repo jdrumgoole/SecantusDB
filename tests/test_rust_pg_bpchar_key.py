@@ -1,6 +1,6 @@
 """A `bpchar` PRIMARY KEY on the Rust PostgreSQL server: keyed by the value
 with its trailing blanks trimmed, while the row keeps the value as written
-(RP-693, step 1).
+(RP-693, steps 1-3).
 
 PostgreSQL compares `bpchar` with `bpchareq` / `bcTruelen`, which ignore
 trailing blanks, so `'k'` and `'k  '` are the same key; but an unsized
@@ -362,3 +362,68 @@ def test_a_bpchar_unique_over_rows_differing_only_in_blanks_is_refused(
     assert e.value.diag.message_primary.startswith("could not create unique index")
     assert e.value.diag.message_detail == "Key (a)=(k  ) is duplicated."
     assert _rows(c, "select count(*) from pg_indexes where tablename = 'x'") == [(0,)]
+
+
+# Step 3: ON CONFLICT over a `bpchar` UNIQUE arbitrates on the trimmed key,
+# whatever blanks the stored row kept. COPY keeps a non-key cell's blanks, so
+# the stored `'w  '` differs from the proposed `'w'` in them alone. Each
+# statement after a COPY is preceded by another, as the COPY's xid is still
+# running until one ends it (RP-1069).
+
+
+def _copied(c: psycopg.Connection, ddl: list[str], table: str, text: str) -> None:
+    for d in ddl:
+        c.execute(d)
+    _copy(c, table, text)
+    c.execute("select 1")
+
+
+def test_on_conflict_on_a_bpchar_unique_finds_a_row_kept_with_blanks(
+    connection: psycopg.Connection,
+) -> None:
+    c = connection
+    _copied(c, ["create table u (a bpchar unique, b int)"], "u", "w  \t1\n")
+    assert _rows(c, "insert into u values ('w', 4) on conflict (a) do nothing returning b") == []
+    assert _rows(
+        c,
+        "insert into u values ('w', 2) on conflict (a) do update set b = excluded.b "
+        "returning a, octet_length(a), b",
+    ) == [("w  ", 3, 2)]
+    assert _rows(
+        c,
+        "insert into u values ('w ', 3) on conflict on constraint u_a_key "
+        "do update set b = excluded.b returning a, octet_length(a), b",
+    ) == [("w  ", 3, 3)]
+    assert _rows(c, "select a, octet_length(a), b from u") == [("w  ", 3, 3)]
+
+
+def test_on_conflict_on_a_composite_bpchar_unique(connection: psycopg.Connection) -> None:
+    c = connection
+    _copied(c, ["create table v (a bpchar, c int, b int, unique (a, c))"], "v", "z  \t1\t1\n")
+    assert _rows(
+        c,
+        "insert into v values ('z', 1, 2) on conflict (a, c) do update set b = excluded.b "
+        "returning octet_length(a), b",
+    ) == [(3, 2)]
+    # Another `c` is another key.
+    assert _rows(
+        c, "insert into v values ('z', 2, 5) on conflict (a, c) do nothing returning b"
+    ) == [(5,)]
+
+
+@pytest.mark.parametrize("where", ["", " where b > 0"])
+def test_on_conflict_infers_a_bpchar_unique_index(
+    connection: psycopg.Connection, where: str
+) -> None:
+    c = connection
+    _copied(
+        c,
+        ["create table w (a bpchar, b int)", f"create unique index wi on w (a){where}"],
+        "w",
+        "y \t1\n",
+    )
+    assert _rows(
+        c,
+        f"insert into w values ('y', 2) on conflict (a){where} do update set b = excluded.b "
+        "returning octet_length(a), b",
+    ) == [(2, 2)]

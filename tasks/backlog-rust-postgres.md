@@ -2283,7 +2283,7 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       written.** Steps: (1) a `bpchar` PRIMARY KEY's `_id` trimmed, the
       row's value as written -- LANDED 2026-11-18, below; (2) UNIQUE --
       LANDED 2026-11-18, below; (3)
-      ON CONFLICT on a UNIQUE arbiter; (4) an indexed and a pushed-down
+      ON CONFLICT on a UNIQUE arbiter -- LANDED 2026-11-18, below; (4) an indexed and a pushed-down
       `=`; (5) the write keeping the blanks of every unsized `bpchar`
       column.
       Step 1 as built (2026-11-18): a single-column unsized `bpchar`
@@ -2340,15 +2340,39 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       UNIQUE was made before step 2 keeps its plain storage index, which
       is right while every write trims; step 5 must rebuild such an index
       as the expression index before the write keeps blanks. ON CONFLICT
-      on such a UNIQUE already arbitrates correctly while writes trim
-      (pinned: `b` updated); step 3 must keep that once they do not --
-      `arbiter_key` probes the column's field with an exact
-      `find_matching`. Still unpinned until step 5: 15.19's DETAIL for a
+      on such a UNIQUE arbitrated correctly only while the stored value
+      was trimmed. Step 3 as built (2026-11-18): an ON CONFLICT target
+      that is such a UNIQUE -- a column list, `on constraint`, or a column
+      list inferring a (partial) CREATE UNIQUE INDEX -- arbitrates on the
+      expression index's trimmed field (`expression_arbiter`), not on the
+      column's value: over a COPYed `'w  '`, `'w'` had been 23505 under a
+      constraint and 42P10 (no arbiter) under a unique index. A UNIQUE made
+      before step 2 falls back to the column. Tests: the step-3 tests in
+      `tests/test_rust_pg_bpchar_key.py`. Still unpinned until step 5: 15.19's DETAIL for a
       UNIQUE collision shows the NEW row's key as written (`Key (a)=(k  )
       already exists.` for `'k'` then `'k  '`), and the ON CONFLICT row
       keeps `octet_length(a)` 3.
       Verify: tests/backlog/test_rp_found_rp672.py::test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks
       Backlog-ID: RP-693
+
+## Found while working RP-693 (2026-11-18)
+
+Measured on PostgreSQL 15.19 (port 5415) over a scratch table. The gap
+test is in `tests/backlog/test_rp_found_rp693.py`.
+
+- [ ] **OPEN -- COPY in autocommit leaves its xid running, so the next
+      statement shares it.** After `copy t from stdin` the copied row's
+      `xmin` is the xid `txid_current()` then returns (730 and 730 here;
+      15.19 6257 then 6258), and an `insert ... on conflict (a) do update`
+      over the copied row is refused 21000 ("cannot affect row a second
+      time"; 15.19 updates it), because `written_by_this_command` sees its
+      own xid and cid on the row. `on_copy_done` commits the COPY's own
+      storage transaction but does not end the statement's transaction
+      state (`xids::end`, the table locks, `ssi_end`) as the implicit
+      transaction's end does (lib.rs ~35855); the statement after it ends
+      it instead.
+      Verify: tests/backlog/test_rp_found_rp693.py::test_copy_completes_its_own_xid
+      Backlog-ID: RP-1069
 
 ## Found while working RP-665 (2026-11-10)
 

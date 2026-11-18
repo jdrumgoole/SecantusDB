@@ -28569,19 +28569,46 @@ impl PgHandler {
         table: &str,
         oc: &secantus_pgplan::OnConflict,
     ) -> PgWireResult<Option<String>> {
-        let Some(secantus_pgplan::ConflictTarget::Columns(cols)) = &oc.target else {
-            return Ok(None);
+        let cols = match &oc.target {
+            Some(secantus_pgplan::ConflictTarget::Columns(cols)) => cols,
+            // A named UNIQUE constraint whose index is an expression index
+            // (an unsized `bpchar` or a `"dot.s"` column): its arbiter is
+            // that index's field, which holds the key as the index compares
+            // it (RP-693).
+            Some(secantus_pgplan::ConflictTarget::Constraint(name)) => {
+                let indexes = self
+                    .storage
+                    .list_indexes(self.db(), table)
+                    .map_err(|e| Self::storage_err("could not list the indexes", e))?;
+                return Ok(indexes
+                    .iter()
+                    .any(|ix| {
+                        ix.get_str("name") == Ok(name.as_str())
+                            && Self::index_expressions(ix).is_some()
+                    })
+                    .then(|| name.clone()));
+            }
+            None => return Ok(None),
         };
         let mark = secantus_pgplan::CONFLICT_EXPR_MARK;
         // A column named `"dot.s"` / `"$x"` is enforced by an expression
         // index over the quoted column (see `create_unique_index`).
-        let literal = self.lookup(table).is_some_and(|def| {
+        let def = self.lookup(table);
+        let literal = def.as_ref().is_some_and(|def| {
             cols.iter().any(|c| {
                 def.field_of(c)
-                    .is_some_and(|f| secantus_pgplan::is_literal_only_column_field(&def, &f))
+                    .is_some_and(|f| secantus_pgplan::is_literal_only_column_field(def, &f))
             })
         });
-        if !literal && !cols.iter().any(|c| c.starts_with(mark)) {
+        // So is a UNIQUE over an unsized `bpchar` made since RP-693 step 2,
+        // keyed trimmed; one made before is a plain index, found by the
+        // caller when no expression index matches.
+        let bpchar = !literal
+            && def.as_ref().is_some_and(|def| {
+                cols.iter()
+                    .any(|c| !c.starts_with(mark) && unique_needs_expression(def, c))
+            });
+        if !literal && !bpchar && !cols.iter().any(|c| c.starts_with(mark)) {
             return Ok(None);
         }
         let normalize = |e: &str| secantus_pgplan::normalized_expression(e).unwrap_or_default();
@@ -28624,6 +28651,9 @@ impl PgHandler {
             if usable {
                 return Ok(ix.get_str("name").ok().map(str::to_string));
             }
+        }
+        if bpchar {
+            return Ok(None);
         }
         Err(Self::err(&PlanError::NoArbiter(
             "there is no unique or exclusion constraint matching the ON CONFLICT specification"
