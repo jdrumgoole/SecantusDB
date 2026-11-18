@@ -1148,11 +1148,21 @@ impl FunctionMemory {
                 (held, peak)
             }
             FunctionMemory::Growing { acc, fed } => {
-                while *fed <= upto && *fed < slots.len() {
-                    group::apply_acc(acc, c.arg, &docs[slots[*fed]], vars)?;
-                    *fed += 1;
+                // A window that has held no document yet (no lower end and
+                // an upper end before the partition's first) gives the
+                // accumulator nothing, and mongod counts it as 0 until it
+                // does (RM-619, measured macOS 8.2.11).
+                if !empty {
+                    while *fed <= upto && *fed < slots.len() {
+                        group::apply_acc(acc, c.arg, &docs[slots[*fed]], vars)?;
+                        *fed += 1;
+                    }
                 }
-                let held = group::acc_memory_classic(acc);
+                let held = if *fed == 0 {
+                    0
+                } else {
+                    group::acc_memory_classic(acc)
+                };
                 (held, held)
             }
             FunctionMemory::ExpMovingAvg => (EXP_MOVING_AVG, EXP_MOVING_AVG),
@@ -3500,6 +3510,33 @@ mod budget_tests {
     /// window slides; a covariance only the queue's. With no lower end the
     /// accumulator holds every point `$integral` was given, the covariance
     /// its size alone, and either nothing while its window is still empty.
+    /// RM-619 (macOS mongod 8.2.11, `maxFunctionMemoryUsageBytes`): a
+    /// growing `$sum`, `$push` or `$avg` whose window has held no document
+    /// counts 0, not the accumulator's size or a value it was never given.
+    #[test]
+    fn an_empty_growing_window_counts_no_function() {
+        for (n, upper) in [(1, -1), (2, -2)] {
+            for op in ["$sum", "$push", "$avg"] {
+                let docs: Vec<Document> = (0..n).map(|i| doc! {"_id": i, "n": i * 2}).collect();
+                let mut output = Document::new();
+                output.insert(op, "$n");
+                output.insert("window", doc! {"documents": ["unbounded", upper]});
+                let (_, report) = memlimit::captured(|| {
+                    set_window_fields_each(
+                        &window(Bson::Document(output), false),
+                        docs,
+                        &Document::new(),
+                        None,
+                        None,
+                        None,
+                        &mut |_| Ok(()),
+                    )
+                });
+                assert_eq!(report.windows[0].max_function_memory[0].1, 0, "{n} {op}");
+            }
+        }
+    }
+
     #[test]
     fn integral_and_covariance_count_what_they_hold() {
         let layout = crate::memlimit::LAYOUT;

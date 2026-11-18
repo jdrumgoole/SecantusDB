@@ -119,9 +119,9 @@ def _empty_window_functions(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-619")
+@pytest.mark.backlog_fixed("RM-619")
 def test_an_empty_window_counts_no_function(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 counts a function with no lower end as 0 while its
     window has held no document (`maxFunctionMemoryUsageBytes`); this
-    server counts the accumulator's size, and `$push` the first value."""
+    server counted the accumulator's size, and `$push` the first value."""
     assert _empty_window_functions(rust_mongo) == _empty_window_functions(mongod)

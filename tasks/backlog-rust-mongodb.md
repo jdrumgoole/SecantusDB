@@ -1120,53 +1120,12 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Found 2026-11-18 working RM-613.
       Verify: tests/backlog/test_rm_found_2026_11_18_rm613.py::test_an_approximate_median_is_mongods_tdigest
       Backlog-ID: RM-720
-- [ ] **A window with no lower end counts its function before it holds a
-      value.** mongod 8.2.11 reports `maxFunctionMemoryUsageBytes` 0 for a
-      `$sum`, `$push` or `$avg` over `["unbounded", -2]` in a partition of
-      two documents (one: `["unbounded", -1]` too), whose window never
-      holds a document; this server counts the accumulator's size (184,
-      136, 152), and for `$push` the first document's value, which its
-      `FunctionMemory::Growing` reads although the window is empty.
-      `$integral` and the covariances already count 0 there (RM-509).
-      Found 2026-11-13 (RM-509).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm509.py::test_an_empty_window_counts_no_function
-      Backlog-ID: RM-619
-- [ ] **A `$unionWith` sub-pipeline's `$sort` sets no sort key.** In a
-      `$unionWith` pipeline, mongod 8.2.11 ranks a
-      `$_internalSetWindowFields` by the key the sub-pipeline's `$sort` set
-      and gives it as `{$meta: "sortKey"}`; this server ties every document
-      and refuses the `$meta` (code 2). The same gap RM-521 closed for
-      `$lookup` (`apply_union_with` does not run
-      `agg_meta::rewrite_sort_metadata`). Found 2026-11-13 (RM-521).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm521.py::test_a_union_with_sub_pipeline_sort_sets_the_key
-      Backlog-ID: RM-624
 - [ ] **`{$meta: "sortKey"}` in a `$facet` is refused, not `[]`.** mongod
       8.2.11 gives `[]` in a `$facet` pipeline, behind the facet's own
       `$sort` too (its ranks tie there, which this server matches); this
       server refuses the `$meta` with code 2. Found 2026-11-13 (RM-521).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm521.py::test_a_facet_sort_key_is_empty
       Backlog-ID: RM-625
-- [ ] **A rank behind `$documents` and a `$sort` is answered, not
-      refused.** mongod 8.2.11 refuses a `$_internalSetWindowFields`
-      `$rank` there with 9973200 "Attempt to get sort key which has not been
-      populated", collectionless and in a `$lookup` pipeline alike; this
-      server ties both. A `$sort` the pipeline runs itself writes no key
-      (only the query layer's does, RM-523), and with no read of a
-      collection in front the documents have no key at all; the marking of
-      keyless documents RM-522 added (`agg_meta::DROPS_SORT_KEY`) does not
-      cover `$documents`. Found 2026-11-13 (RM-521).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm521.py::test_a_sort_behind_documents_sets_no_key
-      Backlog-ID: RM-626
-- [ ] **A `$unionWith` ends the sort key.** mongod 8.2.11 keeps the outer
-      documents' key through a `$unionWith`, so a rank behind it ranks them
-      by the `$sort` in front, and the documents it adds carry their
-      sub-pipeline's key (the empty one with no `$sort`) to a later
-      `{$meta: "sortKey"}` -- but not to a rank, which refuses them (RM-522).
-      This server ends the key at the `$unionWith` (it is not in
-      `agg_meta::KEEPS_SORT_METADATA`): every `$meta` reads `[]` and every
-      rank ties. Found 2026-11-13 (RM-522).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_union_passes_the_sort_key_on
-      Backlog-ID: RM-630
 - [ ] **A `$densify` sets no sort key.** mongod 8.2.11 leaves each
       document the key of the field `$densify` sorted by: `{$meta:
       "sortKey"}` reads `[n]` and a rank behind it ranks by it. This server

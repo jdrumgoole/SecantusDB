@@ -48,7 +48,8 @@ def test_skips_what_ci_deliberately_does_not_run() -> None:
 
 def test_rebuilds_the_pg_binary_provenance_checks() -> None:
     """The provenance hook refuses a run while any artifact it knows is stale;
-    the gate rebuilds `secantusd-pg` at the path that hook checks."""
+    the gate rebuilds (or, on a MongoDB-only change, removes) `secantusd-pg`
+    at the path that hook checks."""
     spec = importlib.util.spec_from_file_location("provenance", ROOT / "tools/provenance.py")
     assert spec and spec.loader
     prov = importlib.util.module_from_spec(spec)

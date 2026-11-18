@@ -286,7 +286,8 @@ def main() -> int:
     # and skip otherwise: ci-selected took ~100 s or 400-850 s by that alone
     # (2026-11-08/09). A MongoDB-only change cannot move their answers, and
     # CI's pg-oracle runs them whenever it can.
-    if not (args.full or base is None or pg_needed(changed)):
+    pg = args.full or base is None or pg_needed(changed)
+    if not pg:
         pg_tests = [f for f in selected if is_pg_server_test(f)]
         selected = [f for f in selected if not is_pg_server_test(f)]
         print(
@@ -337,8 +338,19 @@ def main() -> int:
         # `gate_pg.sh --storage` holds a `secantusd-pg`, so rebuild it too
         # (2026-11-07: RM-361's gate aborted every pytest step on one built
         # before a rebase).
-        if (root / "crates/secantus-pg/target/debug/secantusd-pg").exists():
-            g.step("pg-build", ["./inv", "rust-pgserver-build"])
+        pg_bin = root / "crates/secantus-pg/target/debug/secantusd-pg"
+        pg_target = pg_bin.parents[1]
+        if pg_bin.exists():
+            if pg:
+                g.step("pg-build", ["./inv", "rust-pgserver-build"])
+            else:
+                # No PostgreSQL test runs on a MongoDB-only change (above), so
+                # drop the lane's PG build rather than keep it fresh: a
+                # missing binary is not stale to tools/provenance.py, and the
+                # rebuild alone kept ~9 GB per lane and pushed lanes over
+                # SECANTUS_LANE_MAX_GB, wiping every cargo target (2026-11-18).
+                shutil.rmtree(pg_target, ignore_errors=True)
+                print(f"    removed {pg_target}: no PostgreSQL test runs", flush=True)
 
     pytest = [str(py), "-m", "pytest", "-p", "no:cacheprovider", "-q", "-rs"]
     timeouts = ["--timeout=120", "--timeout-method=thread", "--max-worker-restart=3"]

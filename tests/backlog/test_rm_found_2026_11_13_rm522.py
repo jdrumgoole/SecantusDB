@@ -17,13 +17,13 @@ from tests.backlog.test_rm_found_2026_11_10_rm410 import RANK_ID, _answers
 META = {"$addFields": {"m": {"$meta": "sortKey"}}}
 
 
-@pytest.mark.backlog("RM-630")
+@pytest.mark.backlog_fixed("RM-630")
 def test_a_union_passes_the_sort_key_on(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 keeps the outer documents' sort key through a
     `$unionWith`, and the documents it adds carry their sub-pipeline's key
     to a later `{$meta: "sortKey"}` (the empty one with no `$sort`); a rank
-    behind it ranks the outer documents by theirs. This server ends the key
-    at the `$unionWith`: every `$meta` reads `[]` and every rank ties."""
+    behind it ranks the outer documents by theirs. This server ended the key
+    at the `$unionWith`: every `$meta` read `[]` and every rank tied."""
     sort = {"$sort": {"k": 1}}
     pipelines = {
         "$meta": [sort, {"$unionWith": "c"}, META, {"$project": {"m": 1}}],

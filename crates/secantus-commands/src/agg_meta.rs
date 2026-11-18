@@ -53,6 +53,9 @@ const KEEPS_SORT_METADATA: &[&str] = &[
     "$lookup",
     "$setWindowFields",
     "$_secantusCarry",
+    // The outer documents keep theirs; the ones it adds carry their
+    // sub-pipeline's (8.2.11, 2026-11-18, RM-630; see `key_union_documents`).
+    "$unionWith",
     // Where the stages move between mongod's engines: no stage of its own.
     secantus_core::sbe::ENGINE_STAGE,
     // Passes each document on as it is.
@@ -116,6 +119,7 @@ const DROPS_SORT_KEY: &[&str] = &[
     "$count",
     "$facet",
     "$redact",
+    "$documents",
 ];
 
 /// The stages that keep a document's metadata as they pass it on.
@@ -385,6 +389,61 @@ fn mark_union_documents(stage: &mut Bson) {
     }
 }
 
+/// Give the documents `$unionWith` adds the sort key their sub-pipeline
+/// leaves them, as mongod passes it on to a later `{$meta: "sortKey"}`
+/// (8.2.11, 2026-11-18, RM-630): the key of a `$sort` that leads it (behind
+/// `$match` stages only, so mongod's query layer runs it) when every stage
+/// after keeps the key, and the empty key otherwise. A sub-pipeline that
+/// makes new documents leaves them none.
+fn key_union_documents(stage: &mut Bson) {
+    let Some(outer) = stage.as_document_mut() else {
+        return;
+    };
+    let spec = match outer.get_mut("$unionWith") {
+        Some(Bson::String(coll)) => {
+            let coll = coll.clone();
+            outer.insert("$unionWith", bson::doc! { "coll": coll, "pipeline": [] });
+            match outer.get_mut("$unionWith") {
+                Some(Bson::Document(spec)) => spec,
+                _ => return,
+            }
+        }
+        Some(Bson::Document(spec)) => spec,
+        _ => return,
+    };
+    if !matches!(spec.get("pipeline"), Some(Bson::Array(_))) {
+        spec.insert("pipeline", Vec::<Bson>::new());
+    }
+    let Some(Bson::Array(sub)) = spec.get_mut("pipeline") else {
+        return;
+    };
+    if sub.iter().any(|s| DROPS_SORT_KEY.contains(&name(s))) {
+        return;
+    }
+    let lead = sub.iter().position(|s| name(s) != "$match");
+    let sorted = lead.filter(|&at| {
+        name(&sub[at]) == "$sort"
+            && sub[at + 1..]
+                .iter()
+                .all(|s| KEEPS_SORT_METADATA.contains(&name(s)))
+    });
+    match sorted.and_then(|at| {
+        sub[at]
+            .as_document()
+            .and_then(|d| d.get_document("$sort").ok())
+            .cloned()
+            .map(|by| (at, by))
+    }) {
+        Some((at, by)) => sub.insert(
+            at + 1,
+            Bson::Document(bson::doc! { "$_secantusSortKey": { "into": SORT_KEY, "by": by } }),
+        ),
+        None => sub.push(Bson::Document(
+            bson::doc! { "$set": { SORT_KEY: { "$literal": [] } } },
+        )),
+    }
+}
+
 /// Replace each `{$meta: kind}` in `v` with `with`.
 fn replace_with(v: &mut Bson, kind: &str, with: &Bson) {
     match v {
@@ -480,13 +539,16 @@ pub(crate) fn rewrite_sort_metadata(
         if keyless {
             // Not into a `$lookup`'s sub-pipeline, which reads its own
             // documents' key, nor a `$setWindowFields`, which holds it off.
-            let own = !matches!(name.as_str(), "$lookup" | "$setWindowFields");
+            let own = !matches!(name.as_str(), "$lookup" | "$unionWith" | "$setWindowFields");
             if (keeps && own) || name == "$group" {
                 replace_with(&mut stage, "sortKey", &Bson::String("$$REMOVE".into()));
             }
             if ranks_by_sort_key(&stage) {
                 out.push(Bson::Document(bson::doc! { "$set": { NO_SORT_KEY: true } }));
             }
+        }
+        if name == "$unionWith" && sort_live && !keyless {
+            key_union_documents(&mut stage);
         }
         if unions[i] && !keyless {
             mark_union_documents(&mut stage);
@@ -510,7 +572,7 @@ pub(crate) fn rewrite_sort_metadata(
         // A `$lookup`'s sub-pipeline reads its own documents' metadata
         // (RM-521); a `$setWindowFields` holds the sort key off its
         // documents while it runs, so a `$meta` in it is left to refuse.
-        let reads_here = name != "$lookup";
+        let reads_here = !matches!(name.as_str(), "$lookup" | "$unionWith");
         let reads_sort_here = name != "$setWindowFields";
         if (keeps && reads_here) || name == "$group" {
             if !reads_sort_here {
