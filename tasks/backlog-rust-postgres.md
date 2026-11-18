@@ -1670,9 +1670,15 @@ a regression test.
       node's `Output`, the outer ON's columns kept out of the inner
       equivalence classes: `VerboseChain::left_join`.) (Since 2026-11-18
       a LEFT JOIN at any level of such a chain does too, each hashing its
-      nullable relation alone: `VerboseChain::nullable`.) Still the plain
-      plan: a nested loop or merge join in a chain, a RIGHT or FULL join in
-      one, a LEFT JOIN an inner ON above reduces to an inner one (RP-1061
+      nullable relation alone: `VerboseChain::nullable`.) (Since 2026-11-18
+      a FULL JOIN topping such a chain with no WHERE does too:
+      `VerboseChain::full`.) (Since 2026-11-18 so does a FULL JOIN at any
+      level below only outer joins, and a LEFT JOIN above or below one:
+      an outer join's ON reduces nothing below it.) Still the plain plan: a nested loop or merge
+      join in a chain, a RIGHT join in one (RP-1063 first), a FULL JOIN
+      below an inner join (its plain plan differs too), a WHERE over a FULL JOIN (`... full join e e2
+      on e2.a = k.a where e.b <> 'x'` is reduced to a `Hash Left Join` on
+      PostgreSQL 15.19, `reduce_outer_joins`, whose plain plan matches here), a LEFT JOIN an inner ON above reduces to an inner one (RP-1061
       first), a WHERE on a LEFT JOIN's nullable side (its plain plan differs
       too: `... left join e e2 on e2.a = k.a where e2.b <> 'x'` is reduced
       and reordered on PostgreSQL 15.19, `where e2.b is null` a `Hash Right
@@ -1681,7 +1687,13 @@ a regression test.
       e.b, e2.b from e join k on e.a = k.a join e e2 on e2.a = e.a where
       e2.b <> k.b` on PostgreSQL 15.19 prints each node's `Output` and the
       `Join Filter` on the join below it; that query's plain plan also
-      joins in another order here, RP-1059).
+      joins in another order here, RP-1059). As of 2026-11-18 every
+      remaining shape probed has a plain plan that differs too, so each
+      waits on the item named: a WHERE conjunct reading two relations of a
+      chain (RP-1059, all three pairings), a nested loop in a chain (RP-1059
+      for `where e.a < 5`, RP-1065 for `where e.a = 3`), a RIGHT join
+      (RP-1063). Work those first; the VERBOSE half then follows the
+      chain's `Output` rules above.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a three-way join with a join filter]
       Backlog-ID: RP-966
 
@@ -1695,9 +1707,27 @@ a regression test.
       of each candidate's cost. The same query with `where e2.b <> k.b`
       and `on e2.a = e.a` is bushy on PostgreSQL 15.19, `e` against a
       Hash of `(e2 join k)` with the `Join Filter`; here left-deep `(e
-      join k) join e2`. Found while working RP-966.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a filtered relation of a three-way join is joined first]
+      join k) join e2`. So with a range: `... on e2.a = k.a where e.a < 5`
+      is on PostgreSQL 15.19 a Nested Loop of `(e2 join e)`, `e` the
+      filtered Hash, into an Index Only Scan of `k` with `Join Filter: (e.a
+      = k.a)`; here `(e join k) join e2`, all hash joins. Found while
+      working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a filtered relation of a three-way join is joined first], tests/backlog/test_rp_explain_costs.py::test_plan[a range-filtered relation of a three-way join is joined first]
       Backlog-ID: RP-1059
+
+- [ ] **A WHERE constant does not join an explicit JOIN's equivalence
+      class.** `explain (costs off) select e.b, k.b from e join k on e.a =
+      k.a where e.a = 3` (`e`, `k` analysed, 1000 rows) is a `Hash Join`
+      on `(e.a = k.a)` here; PostgreSQL 15.19 puts the constant in the
+      class (`generate_base_implied_equalities_const`) and runs a Nested
+      Loop into `Index Scan using k_pkey on k`, `Index Cond: (a = 3)`, no
+      join clause, as RP-977 already does for the comma join `from e, k
+      where e.a = k.a and e.a = 5`. A third relation on the class (`join k
+      k2 on k2.a = e.a`) likewise gets its own `Index Cond: (a = 3)`. Find
+      where the ON's equalities miss the WHERE's constant. Found while
+      working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an explicit join's class constant is the inner index's cond], tests/backlog/test_rp_explain_costs.py::test_plan[a three-way explicit join's class constant is each inner index's cond]
+      Backlog-ID: RP-1065
 
 - [ ] **A LEFT JOIN nothing reads is not removed.** `explain (costs
       off) select e.b from e left join k on e.a = k.a` (`k.a` the primary
@@ -1718,6 +1748,35 @@ a regression test.
       on that join under VERBOSE). Found while working RP-966.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join reduced to inner joins the chain on its class]
       Backlog-ID: RP-1061
+
+- [ ] **An outer join's multi-column Hash Cond prints the nullable
+      side's column first.** `explain (costs off) select e.b, e2.b from e
+      full join e e2 on e2.a = e.a and e2.b = e.b` (a `Hash Left Join`
+      too) prints `Hash Cond: ((e2.a = e.a) AND (e2.b = e.b))`; PostgreSQL
+      15.19 prints `((e.a = e2.a) AND (e.b = e2.b))`, each clause commuted
+      to put the outer side's column first. A single-clause ON is printed
+      outer first already. Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an outer join's two-clause hash cond puts the outer column first]
+      Backlog-ID: RP-1062
+
+- [ ] **A RIGHT JOIN atop a chain hashes the chain.** `explain (costs
+      off) select e.b, e2.b from e join k on e.a = k.a right join e e2 on
+      e2.a = k.a` is a `Hash Left Join` of `e e2` over a Hash of `(e join
+      k)` here; PostgreSQL 15.19 prints a `Hash Right Join` of the `(e
+      join k)` Hash Join over a Hash of `e e2`. Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a right join atop a chain hashes its preserved relation]
+      Backlog-ID: RP-1063
+
+- [ ] **A FULL JOIN an inner join above reduces hashes the wrong side.**
+      `explain (costs off) select e.b, e2.b from e full join k on e.a =
+      k.a join e e2 on e2.a = k.a` (`e`, `k` analysed, 1000 rows) is a
+      `Hash Left Join` of `k` over a Hash of `e` here, `Hash Cond: (k.a =
+      e.a)`; PostgreSQL 15.19 reduces the FULL JOIN to a `Hash Right Join`
+      of `e` over a Hash of `k`, `Hash Cond: (e.a = k.a)`, `Inner Unique:
+      true` (`reduce_outer_joins`, then costing both sides). Found while
+      working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a full join an inner join reduces hashes its unique side]
+      Backlog-ID: RP-1064
 
 - [ ] **A hash join on an expression and a column pair hashes the
       expression's side.** `explain select e.b from e join k on e.a = k.a
@@ -1747,17 +1806,6 @@ a regression test.
       class's members in their order. Found while working RP-966.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a three-way hash join names the class's first member]
       Backlog-ID: RP-1057
-
-- [ ] **A hash join whose WHERE compares an expression of one relation
-      with the other's column is priced at zero.** `explain select e.b
-      from e join k on e.a = k.a where length(k.b) <> e.a` (both tables
-      analysed, 1000 rows) prints `Hash Join  (cost=0.00..0.00 rows=0
-      width=0)` and zero costs on every node below it; PostgreSQL 15.19
-      prints `Hash Join  (cost=27.50..45.14 rows=999 width=3)` over scans
-      costed `0.00..15.00 rows=1000`. Found while working RP-966; the
-      same query with a column-to-column WHERE is priced.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash join with an expression join filter is priced]
-      Backlog-ID: RP-1039
 
 
 - [ ] **EXPLAIN ANALYZE's scan counters PostgreSQL prints that are still
@@ -2228,6 +2276,74 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       path (`bpchareq` / `bcTruelen`), not a trimmed copy of the value;
       that is several PRs touching the stored row, so it needs its own
       planned sequence, not a bundle slot.
+      **Decided (Joe, 2026-11-18): build the faithful fix in steps,
+      including the on-disk change for `bpchar` keys -- a `bpchar` PRIMARY
+      KEY / UNIQUE / index is keyed by the value with trailing blanks
+      trimmed (`bpchareq` / `bcTruelen`), while the row keeps the value as
+      written.** Steps: (1) a `bpchar` PRIMARY KEY's `_id` trimmed, the
+      row's value as written, and every read / lookup path that builds
+      that key; (2) UNIQUE; (3) ON CONFLICT; (4) an indexed and a
+      pushed-down `=`; (5) the write keeping the blanks of every unsized
+      `bpchar` column. None has landed.
+      Probed 2026-11-18 on 15.19 and this server (step-1 session, no code
+      changed): `create table p2 (a bpchar primary key, b int)`, insert
+      `'k  '`, then `'k'` is 23505 on both, `on conflict (a) do update`
+      keeps the stored `'k  '` on 15.19, and `where a = 'k'`, `where a =
+      'k   '::bpchar`, `update ... where a='k'` and `delete ... where a='k '`
+      each find the row on both. The ONE difference: `octet_length(a)` is 3
+      on 15.19 and 1 here. A `char(3)` PRIMARY KEY already answers like
+      15.19 (stored trimmed, padded on output), so step 1 is about unsized
+      `bpchar` (and a `bpchar` member of a composite key) only.
+      Why step 1 is not one session: the PK column's stored field IS `_id`
+      (`field_for`), so a trimmed key and an as-written value need two
+      fields. Design for step 1: such a column gets `field_override` =
+      its name (holding the value as written) and `_id` (`_id.<name>` in a
+      composite key) becomes a derived key, `trim_end(' ')` of it, written
+      by the insert / update / COPY paths. Every site that equates "PK" with
+      "`_id`" then has to read the override: `encode_doc` (34 call sites),
+      `decode_doc` (53) and `row_id` (15) take no `TableDef`; lib.rs ~28847
+      and secantus-pgplan lib.rs ~15840 read `pk && field_override.is_some()`
+      as "composite key"; `heap.rs` and `btree.rs` (the page models) build
+      the key from `_id`; and the PK point lookup (`portal_stream.rs`
+      `primary_key_point`), ON CONFLICT, the FK checks and `insert_key_eq`
+      filter on `_id` with the probe value, which must be trimmed. A
+      pushed-down `=` on the column must go to `_id` with the trimmed
+      literal, since the stored field then holds blanks.
+      Stores written before step 1 (decided in that session): every
+      `bpchar` value this server has written since it gained `char(n)`
+      (#1654) went through `cast_value`'s trim, so an existing `_id` is
+      already the trimmed key and its value has already lost its blanks,
+      which no reader can restore. Such a table keeps its catalog entry
+      without the override and reads back as it always has; only a table
+      created after step 1 gets the two-field layout. An untrimmed `_id`
+      can only come from the MongoDB server writing the collection, which
+      is the MongoDB -> SQL hand-off CLAUDE.md says does not work, so the
+      PG server does not answer for it.
+      **Decision needed (step-2 session, 2026-11-18, no code changed):
+      how step 2 enforces UNIQUE.** The session was asked for UNIQUE
+      through `value_unique` / `check_collated_unique`. That check reads
+      every stored row before the write, and `unique_indexes`' own comment
+      (secantus-pg lib.rs ~28640) says why a read-before-write "cannot
+      uphold a constraint": it misses a value another transaction committed
+      after the snapshot or is inserting now, so the storage unique index
+      is the arbiter. Today that index still catches `'k'` / `'k  '`
+      because every write trims, so the gap opens only at step 5. ON
+      CONFLICT has the same dependency: `insert_on_conflict` finds the
+      conflict from the storage index's E11000 and probes with an exact
+      `find_matching`, so neither path sees a blank-only difference.
+      Options, most faithful first: (a) back a `bpchar` UNIQUE with a
+      storage unique index over a derived field holding the trimmed value
+      (the `expr_index` mechanism a UNIQUE expression index already uses),
+      which is PostgreSQL's btree over `bpcharcmp`, matches step 1's
+      trimmed `_id`, gives ON CONFLICT its E11000 and arbiter probe on that
+      field, and is the index step 4's `=` can use; an on-disk change for
+      tables created after it. (b) `value_unique` as asked: a full scan per
+      write and per row of a COPY, racy under concurrency. Neither changes
+      an answer before step 5. Probed on 15.19: `'k  '` then `'k'` into
+      an unsized `bpchar` UNIQUE is 23505 `Key (a)=(k)`, and `on conflict
+      (a) do update set b = excluded.b` updates the stored row, which
+      keeps `octet_length(a)` 3 (the regression tests for step 2 should
+      pin both).
       Verify: tests/backlog/test_rp_found_rp672.py::test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks
       Backlog-ID: RP-693
 
@@ -2730,32 +2846,48 @@ statement is VALUES-only and runs there as written. The gap test is in
 
 ## Found while working RP-966 (2026-11-17)
 
-- [ ] **A nested loop whose inner relation has its own WHERE conjunct is
-      not priced.** `explain select e.b from e join k on e.a <> k.a where
-      k.b = 'v1'` (`e`, `k` 1,000 analysed rows) is, on PostgreSQL 15.19,
-      `Nested Loop (cost=0.00..1532.75 rows=99900 width=3)` over `Seq Scan
-      on e` and a `Materialize (cost=0.00..18.00 rows=100 width=4)` of
-      `Seq Scan on k (cost=0.00..17.50 rows=100 width=4)`; here zeros and
-      no Materialize. With the conjunct on the OUTER table PostgreSQL
-      swaps the sides and this server matches it (found while working
-      RP-966).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop over a filtered inner relation is priced]
-      Backlog-ID: RP-1038
+- [ ] **A nested loop whose inner relation has an index qual is not
+      priced.** `explain select e.b from e join k on e.a <> k.a where k.a
+      = 5` (`e`, `k` 1,000 analysed rows, `k.a` its primary key) prints a
+      Nested Loop over `Seq Scan on e` and `Index Scan using k_pkey on k`,
+      every cost zero; PostgreSQL 15.19 puts the one-row index side outer:
+      `Nested Loop (cost=0.28..35.79 rows=999 width=3)` over `Index Only
+      Scan using k_pkey on k (cost=0.28..8.29 rows=1 width=4)` and `Seq
+      Scan on e (cost=0.00..15.00 rows=1000 width=7)`. Since RP-1038 an
+      inner WHERE conjunct over a column no index covers is priced;
+      `nest_loop_estimate`'s side check still refuses a non-preserved
+      indexed side whose own quals an index can take. Found while working
+      RP-1038.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop over an inner relation's index qual is priced]
+      Backlog-ID: RP-1068
 
 
-- [ ] **A Sort on a computed key is priced in one shape only.** Since
-      2026-11-17 (RP-966) a Sort straight over one relation's scan whose
-      computed keys are operator expressions over the select list's
-      columns is priced, each key a resjunk entry of the scan's target
-      list (its operators' `cpu_operator_cost` per row, its type's width).
-      Still `cost=0.00..0.00`: a select list with a computed entry (`select
-      a+1 from k order by a+1`, PostgreSQL 15.19 `Sort (cost=67.33..69.83
-      rows=1000 width=4)` over `Seq Scan (cost=0.00..17.50 ...)`), a LIMIT
-      above the Sort, a key that calls a function (`order by lower(b)`,
-      `width=36`), and a key reading a column the select list does not
-      return. `sort_key_cost` and the Sort pricing in `lib.rs` (RP-318)
-      decline them.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sort on a computed key under a computed select list is priced]
+- [ ] **An ORDER BY on a column the select list only computes from
+      names the computed entry as its Sort Key.** `explain (costs off)
+      select a+1 from e order by a` prints `Sort Key: ?column?`;
+      PostgreSQL 15.19 prints `Sort Key: a` (the key is a resjunk column
+      of the scan, which this server's costs already price: `Sort
+      (cost=67.33..69.83 rows=1000 width=8)` matches). Over `k`, whose
+      primary key returns `a` in order, PostgreSQL prints `Index Only Scan
+      using k_pkey on k (cost=0.28..45.77 rows=1000 width=8)` and no Sort
+      at all. Found while working RP-1036.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by on a column only a computed entry reads names the column]
+      Backlog-ID: RP-1066
+
+- [ ] **A Sort under a select list that calls a function is not
+      priced.** Since RP-966, RP-1025 and RP-1036 a Sort (and a Limit
+      above it) straight over one relation's scan is priced with computed
+      keys -- operators and built-in calls at their `procost` -- and
+      computed select-list entries made of operators (a key equal to one
+      shares it). Still `cost=0.00..0.00`: a select-list entry that calls
+      a function, `select upper(b) from e order by lower(b)` (PostgreSQL
+      15.19 `Sort (cost=69.83..72.33 rows=1000 width=64)` over `Seq Scan
+      on e (cost=0.00..20.00 rows=1000 width=64)`): `target_cost` prices a
+      select-list entry with `row_expr_ops`, which declines calls (the
+      sort key's `expr_ops(.., true)` prices them). Widening it reaches
+      every plan `target_cost` prices, and `make_sort_input_target`
+      postpones an expensive entry above the Sort under a LIMIT.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sort under a select list calling a function is priced]
       Backlog-ID: RP-1036
 
 - [ ] **A join on an expression key PostgreSQL prices is unpriced in
@@ -2776,6 +2908,18 @@ statement is VALUES-only and runs there as written. The gap test is in
       LEFT join filtered on a column not its key (`where e2.b is null`, a
       `Hash Right Join` with `Filter`) stay unpriced as they do over a
       column key. Measured on the 15.19 reference on port 5415.
+      Where each declines (read 2026-11-18, while working RP-1025/1036/
+      1038/1039): the unique column in `hash_join_of`'s `if unique_key &&
+      (redundant || expr_key) { return None }` -- `unique_key_other_paths`
+      would need the column side's index probed by the expression (its
+      param scan and Memoize keyed on an expression with no statistics,
+      200 distinct) and a merge sorting the expression side against the
+      presorted index; the merge at the end of `hash_join_of` (`expr_key
+      && JoinPick::Merge`), which needs the plan drawn with the
+      expression's Sort Key and `Merge Cond: (e.b = ((e2.b ||
+      'x'::text)))`; the cross-type one at its `a.pg_type != b.pg_type`
+      check, where `int8 = int4` is one integer opfamily's hashable
+      operator.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an expression key against a unique column is a hash join], tests/backlog/test_rp_explain_costs.py::test_plan[an expression key over a column of few values is a merge join]
       Backlog-ID: RP-1032
 - [ ] **ANALYZE of a hash join on an expression key counts nothing below
@@ -2798,18 +2942,6 @@ statement is VALUES-only and runs there as written. The gap test is in
       Measured on the 15.19 reference on port 5415.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash join written inner side first is inner unique]
       Backlog-ID: RP-1030
-- [ ] **A Limit over a Sort of a filtered scan is not priced.**
-      PostgreSQL 15.19 prints `explain select a from k where a > 5 order by
-      b desc limit 3` (`k` analysed, 1,000 rows) as `Limit
-      (cost=30.36..30.37 rows=3 width=7)` over `Sort (cost=30.36..32.85
-      rows=995 width=7)` (a top-N heapsort, `cost_sort` with its bound)
-      over `Seq Scan on k (cost=0.00..17.50 rows=995 width=7)`; here every
-      node is `cost=0.00..0.00 rows=0 width=0`, with or without VERBOSE,
-      and with `select *` too. The same Sort without the LIMIT is priced.
-      Measured on the 15.19 reference on port 5415.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a limit over a descending sort]
-      Backlog-ID: RP-1025
-
 ## Found while working RP-980 (2026-11-17)
 
 - [ ] **An anti join with an outer conjunct beside it is not planned as

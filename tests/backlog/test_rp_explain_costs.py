@@ -2143,6 +2143,174 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Output: e2.b, e2.a",
         ],
     ),
+    # Measured on PostgreSQL 15.19 (2026-11-18): a FULL JOIN atop a chain
+    # hashes its right relation alone, as a LEFT JOIN does.
+    "explain verbose of a chain ending in a full join": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, e2.b from e join k on e.a = k.a "
+        "full join e e2 on e2.a = k.a",
+        [
+            "Hash Full Join",
+            "  Output: e.b, e2.b",
+            "  Hash Cond: (k.a = e2.a)",
+            "  ->  Hash Join",
+            "        Output: e.b, k.a",
+            "        Inner Unique: true",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.a, e.b",
+            "        ->  Hash",
+            "              Output: k.a",
+            "              ->  Seq Scan on public.k",
+            "                    Output: k.a",
+            "  ->  Hash",
+            "        Output: e2.b, e2.a",
+            "        ->  Seq Scan on public.e e2",
+            "              Output: e2.b, e2.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (2026-11-18): a FULL JOIN below another
+    # FULL JOIN keeps the ON's columns its nullable sides need above.
+    "explain verbose of a chain of full joins": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, e2.b, e3.b from e full join k on e.a = k.a "
+        "full join e e2 on e2.a = k.a full join e e3 on e3.a = e.a",
+        [
+            "Hash Full Join",
+            "  Output: e.b, e2.b, e3.b",
+            "  Hash Cond: (e.a = e3.a)",
+            "  ->  Hash Full Join",
+            "        Output: e.b, e.a, e2.b",
+            "        Hash Cond: (k.a = e2.a)",
+            "        ->  Hash Full Join",
+            "              Output: e.b, e.a, k.a",
+            "              Inner Unique: true",
+            "              Hash Cond: (e.a = k.a)",
+            "              ->  Seq Scan on public.e",
+            "                    Output: e.a, e.b",
+            "              ->  Hash",
+            "                    Output: k.a",
+            "                    ->  Seq Scan on public.k",
+            "                          Output: k.a",
+            "        ->  Hash",
+            "              Output: e2.b, e2.a",
+            "              ->  Seq Scan on public.e e2",
+            "                    Output: e2.b, e2.a",
+            "  ->  Hash",
+            "        Output: e3.b, e3.a",
+            "        ->  Seq Scan on public.e e3",
+            "              Output: e3.b, e3.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (2026-11-18): a LEFT JOIN's ON reading
+    # a FULL JOIN's side below it reduces nothing.
+    "explain verbose of a left join over a full join": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, e2.b from e full join k on e.a = k.a "
+        "left join e e2 on e2.a = k.a",
+        [
+            "Hash Left Join",
+            "  Output: e.b, e2.b",
+            "  Hash Cond: (k.a = e2.a)",
+            "  ->  Hash Full Join",
+            "        Output: e.b, k.a",
+            "        Inner Unique: true",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.a, e.b",
+            "        ->  Hash",
+            "              Output: k.a",
+            "              ->  Seq Scan on public.k",
+            "                    Output: k.a",
+            "  ->  Hash",
+            "        Output: e2.b, e2.a",
+            "        ->  Seq Scan on public.e e2",
+            "              Output: e2.b, e2.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (2026-11-18): a FULL JOIN's ON reading
+    # a LEFT JOIN's nullable side reduces nothing.
+    "explain verbose of a full join over a left join": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, e2.b from e left join k on e.a = k.a "
+        "full join e e2 on e2.a = k.a",
+        [
+            "Hash Full Join",
+            "  Output: e.b, e2.b",
+            "  Hash Cond: (k.a = e2.a)",
+            "  ->  Hash Left Join",
+            "        Output: e.b, k.a",
+            "        Inner Unique: true",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.a, e.b",
+            "        ->  Hash",
+            "              Output: k.a",
+            "              ->  Seq Scan on public.k",
+            "                    Output: k.a",
+            "  ->  Hash",
+            "        Output: e2.b, e2.a",
+            "        ->  Seq Scan on public.e e2",
+            "              Output: e2.b, e2.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966): an inner
+    # join above a FULL JOIN reduces it to a right join hashing `k`.
+    "a full join an inner join reduces hashes its unique side": (
+        "RP-1064",
+        _ANALYSED,
+        "explain (costs off) select e.b, e2.b from e full join k on e.a = k.a "
+        "join e e2 on e2.a = k.a",
+        [
+            "Hash Join",
+            "  Hash Cond: (k.a = e2.a)",
+            "  ->  Hash Right Join",
+            "        Inner Unique: true",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e",
+            "        ->  Hash",
+            "              ->  Seq Scan on k",
+            "  ->  Hash",
+            "        ->  Seq Scan on e e2",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966): an outer
+    # join's Hash Cond clauses each put the outer side's column first.
+    "an outer join's two-clause hash cond puts the outer column first": (
+        "RP-1062",
+        _ANALYSED,
+        "explain (costs off) select e.b, e2.b from e full join e e2 on e2.a = e.a and e2.b = e.b",
+        [
+            "Hash Full Join",
+            "  Hash Cond: ((e.a = e2.a) AND (e.b = e2.b))",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on e e2",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966): a RIGHT
+    # JOIN atop a chain keeps the chain outer and hashes the preserved side.
+    "a right join atop a chain hashes its preserved relation": (
+        "RP-1063",
+        _ANALYSED,
+        "explain (costs off) select e.b, e2.b from e join k on e.a = k.a "
+        "right join e e2 on e2.a = k.a",
+        [
+            "Hash Right Join",
+            "  Hash Cond: (k.a = e2.a)",
+            "  ->  Hash Join",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e",
+            "        ->  Hash",
+            "              ->  Seq Scan on k",
+            "  ->  Hash",
+            "        ->  Seq Scan on e e2",
+        ],
+    ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): a LEFT
     # JOIN to a unique key whose columns nothing reads is removed.
     "a left join nothing reads is removed": (
@@ -2219,6 +2387,58 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on k",
         ],
     ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966): the
+    # range-filtered `e` is hashed under `e2`, and `k` joined last through
+    # its index.
+    "a range-filtered relation of a three-way join is joined first": (
+        "RP-1059",
+        _ANALYSED,
+        "explain (costs off) select e.b, e2.b from e join k on e.a = k.a "
+        "join e e2 on e2.a = k.a where e.a < 5",
+        [
+            "Nested Loop",
+            "  Join Filter: (e.a = k.a)",
+            "  ->  Hash Join",
+            "        Hash Cond: (e2.a = e.a)",
+            "        ->  Seq Scan on e e2",
+            "        ->  Hash",
+            "              ->  Seq Scan on e",
+            "                    Filter: (a < 5)",
+            "  ->  Index Only Scan using k_pkey on k",
+            "        Index Cond: (a = e2.a)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966): the WHERE
+    # constant joins the ON's equivalence class, as in the comma join RP-977
+    # fixed, and each inner index scan takes it as its Index Cond.
+    "an explicit join's class constant is the inner index's cond": (
+        "RP-1065",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e join k on e.a = k.a where e.a = 3",
+        [
+            "Nested Loop",
+            "  ->  Seq Scan on e",
+            "        Filter: (a = 3)",
+            "  ->  Index Scan using k_pkey on k",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    "a three-way explicit join's class constant is each inner index's cond": (
+        "RP-1065",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e join k on e.a = k.a "
+        "join k k2 on k2.a = e.a where e.a = 3",
+        [
+            "Nested Loop",
+            "  ->  Nested Loop",
+            "        ->  Seq Scan on e",
+            "              Filter: (a = 3)",
+            "        ->  Index Scan using k_pkey on k",
+            "              Index Cond: (a = 3)",
+            "  ->  Index Only Scan using k_pkey on k k2",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): with a
     # second ON clause the expression's side is the probe side.
     "a hash join on an expression and a column pair hashes the column side": (
@@ -2282,7 +2502,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): a hash
     # join whose WHERE compares an expression of the inner relation with
-    # the outer's column is priced like any other.
+    # the outer's column is priced like any other. Priced since RP-1039.
     "a hash join with an expression join filter is priced": (
         "RP-1039",
         _ANALYSED,
@@ -2297,6 +2517,21 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966).
+    # Measured on PostgreSQL 15.19 (found while working RP-1038): the
+    # one-row index side is the loop's outer.
+    "a nested loop over an inner relation's index qual is priced": (
+        "RP-1068",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a <> k.a where k.a = 5",
+        [
+            "Nested Loop  (cost=0.28..35.79 rows=999 width=3)",
+            "  Join Filter: (e.a <> k.a)",
+            "  ->  Index Only Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=4)",
+            "        Index Cond: (a = 5)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Priced since RP-1038: no index covers the inner's conjunct.
     "a nested loop over a filtered inner relation is priced": (
         "RP-1038",
         _ANALYSED,
@@ -2322,8 +2557,33 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on PostgreSQL 15.19: the shared entry is computed once.
-    "a sort on a computed key under a computed select list is priced": (
+    # Measured on PostgreSQL 15.19 (RP-1036): the select list's call is
+    # the scan's, one `procost` a row, its text 32 bytes wide.
+    "a sort under a select list calling a function is priced": (
         "RP-1036",
+        _ANALYSED,
+        "explain select upper(b) from e order by lower(b)",
+        [
+            "Sort  (cost=69.83..72.33 rows=1000 width=64)",
+            "  Sort Key: (lower(b))",
+            "  ->  Seq Scan on e  (cost=0.00..20.00 rows=1000 width=64)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (RP-1066): the key is a resjunk column
+    # of the scan, named as itself.
+    "an order by on a column only a computed entry reads names the column": (
+        "RP-1066",
+        _ANALYSED,
+        "explain (costs off) select a+1 from e order by a",
+        [
+            "Sort",
+            "  Sort Key: a",
+            "  ->  Seq Scan on e",
+        ],
+    ),
+    # Priced since RP-1036.
+    "a sort on a computed key under a computed select list is priced": (
+        "RP-1036:fixed",
         _ANALYSED,
         "explain select a+1 from k order by a+1",
         [
@@ -2367,7 +2627,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # Measured on PostgreSQL 15.19 (RP-966): a Limit over the Sort prints
     # the targetlist too, the ORDER BY column the select list lacks
-    # included, and the key keeps its direction.
+    # included, and the key keeps its direction. Priced since RP-1025: a
+    # bounded Sort over the scan, the key a resjunk column of it.
     "explain verbose of a limit over a descending sort": (
         "RP-1025",
         _ANALYSED,
@@ -7804,6 +8065,9 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1038",
+        "RP-1039",
+        "RP-1025",
         "RP-1035",
         "RP-1031",
         "RP-1029",

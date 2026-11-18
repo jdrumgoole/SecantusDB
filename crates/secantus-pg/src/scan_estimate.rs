@@ -632,6 +632,12 @@ impl PgHandler {
         let opaque_inequality = inequalities().any(|f| f.bounds.len() < 2);
         let indexes = self.index_relations();
         let project = j.project.as_deref();
+        let mut filter_reads = std::collections::HashSet::new();
+        for f in &filters {
+            if !secantus_pgplan::joins::expr_reads(&f.expr, &mut filter_reads) {
+                return None;
+            }
+        }
         // Each joined key's table and field, for `neqjoinsel`.
         let mut key_columns: Vec<(String, String, String)> = Vec::new();
         // Each side's table, its keys' stored fields and SQL names, and
@@ -672,6 +678,7 @@ impl PgHandler {
                             && !self.own_quals(&leaf.table, &leaf.filter).is_some_and(|q| {
                                 q.iter().all(|(_, q)| matches!(q, costsize::Qual::Ne))
                                     || own_bounds_only(&q)
+                                    || self.quals_unindexed(&leaf.table, &q)
                             }))))
             {
                 return None;
@@ -683,9 +690,18 @@ impl PgHandler {
                 let c = def.columns.iter().find(|c| c.field() == f)?;
                 table.field_of(&c.name)
             };
+            // A column only the scan's own WHERE conjuncts read is not in
+            // its target list (`build_base_rel_tlists`): it carries what
+            // the query above the join and the join's clauses read
+            // (RP-1038).
             let read: Vec<String> = columns
                 .iter()
-                .filter(|(key, _)| JoinRows::carries(project, key))
+                .filter(|(key, _)| {
+                    JoinRows::carries(project, key)
+                        && (project.is_none()
+                            || j.needed.contains(key)
+                            || filter_reads.contains(key))
+                })
                 .map(|(_, f)| stored(f))
                 .collect::<Option<_>>()?;
             let above: Vec<String> = columns
@@ -2339,12 +2355,15 @@ impl PgHandler {
         // where each is `<`, `<=`, `>` or `>=` between the two tables
         // (`DEFAULT_INEQ_SEL`) or a `<>` between two of their columns
         // (`neqjoinsel`, RP-379); any other stays unpriced.
+        // A `<>` with an expression or a cast operand is `neqjoinsel` over
+        // an operand with no statistics (RP-1039).
         let priced_kind = |f: &secantus_pgplan::joins::JoinFilter| {
             f.aliases.len() == 2
                 && matches!(
                     f.kind,
                     secantus_pgplan::joins::FilterKind::Inequality
                         | secantus_pgplan::joins::FilterKind::NotEqual(..)
+                        | secantus_pgplan::joins::FilterKind::NotEqualCast(..)
                 )
         };
         if *on_other && (on_filters.is_empty() || !on_filters.iter().all(priced_kind)) {
@@ -2389,6 +2408,7 @@ impl PgHandler {
                     f.kind,
                     secantus_pgplan::joins::FilterKind::Inequality
                         | secantus_pgplan::joins::FilterKind::NotEqual(..)
+                        | secantus_pgplan::joins::FilterKind::NotEqualCast(..)
                 )
             })
             .collect();
@@ -2657,6 +2677,14 @@ impl PgHandler {
                     }
                     let eq = secantus_pgplan::joincost::eqjoinsel_inner(&key(&x), &key(&y));
                     1.0 - eq.clamp(0.0, 1.0)
+                }
+                secantus_pgplan::joins::FilterKind::NotEqualCast(l, r) => {
+                    let column = |k: &str| {
+                        let s = side(&left, k).or_else(|| side(&right, k))?;
+                        Some((k.to_string(), s.table, s.field))
+                    };
+                    let key_columns = [column(&l.key)?, column(&r.key)?];
+                    neqjoinsel_cast(self, &key_columns, l, r)?
                 }
                 _ => 1.0 / 3.0,
             };
@@ -5025,6 +5053,36 @@ impl PgHandler {
 
     /// The quals `filter` is over user table `table`, as its scan's cost
     /// model sees them; none for an empty filter.
+    /// Whether no qual of `quals` reads a column an index of `table`
+    /// covers, so none can be an index scan's (`match_clause_to_index`)
+    /// and the table's only path under them is its sequential scan
+    /// (RP-1038). An index over an expression could match any qual.
+    fn quals_unindexed(&self, table: &str, quals: &[(String, costsize::Qual)]) -> bool {
+        let Some(def) = self.lookup(table) else {
+            return false;
+        };
+        let mut indexed: Vec<String> = Vec::new();
+        for ix in self.index_relations() {
+            if ix.table.name != table {
+                continue;
+            }
+            for k in ix.keys.iter().chain(ix.include.iter()) {
+                let Some(c) = usize::try_from(*k)
+                    .ok()
+                    .and_then(|k| k.checked_sub(1))
+                    .and_then(|k| def.columns.get(k))
+                else {
+                    return false;
+                };
+                let Some(f) = def.field_of(&c.name) else {
+                    return false;
+                };
+                indexed.push(f);
+            }
+        }
+        !quals.is_empty() && quals.iter().all(|(f, _)| !indexed.contains(f))
+    }
+
     fn own_quals(&self, table: &str, filter: &Document) -> Option<Vec<(String, costsize::Qual)>> {
         if filter.is_empty() {
             return Some(Vec::new());
@@ -6579,10 +6637,27 @@ const UNIT_COST_OPERATORS: &[&str] = &[
 /// conversion, priced differently), a function call, an operator not
 /// known to cost one.
 fn row_expr_ops(n: &pg_query::protobuf::Node, nparams: usize) -> Option<(u32, bool)> {
+    expr_ops(n, nparams, false).map(|(o, r)| (o as u32, r))
+}
+
+/// `row_expr_ops`, in `cpu_operator_cost` units, with `calls` also pricing
+/// a plain call of a built-in at its `procost` (`cost_qual_eval` of a
+/// FuncExpr), as a sort key's is (RP-1036).
+fn expr_ops(n: &pg_query::protobuf::Node, nparams: usize, calls: bool) -> Option<(f64, bool)> {
     use pg_query::protobuf::node::Node as N;
     match n.node.as_ref()? {
-        N::AConst(_) => Some((0, false)),
-        N::ParamRef(p) => Some((0, usize::try_from(p.number).ok()? > nparams)),
+        N::FuncCall(f) if calls => {
+            let procost = secantus_pgplan::joins::plain_call_procost(f)?;
+            let (mut ops, mut reads) = (0.0, false);
+            for a in &f.args {
+                let (o, r) = expr_ops(a, nparams, calls)?;
+                ops += o;
+                reads |= r;
+            }
+            Some((if reads { ops + procost } else { 0.0 }, reads))
+        }
+        N::AConst(_) => Some((0.0, false)),
+        N::ParamRef(p) => Some((0.0, usize::try_from(p.number).ok()? > nparams)),
         N::AExpr(e) if e.kind == pg_query::protobuf::AExprKind::AexprOp as i32 => {
             let op = match e.name.last()?.node.as_ref()? {
                 N::String(s) => s.sval.as_str(),
@@ -6591,16 +6666,16 @@ fn row_expr_ops(n: &pg_query::protobuf::Node, nparams: usize) -> Option<(u32, bo
             if !UNIT_COST_OPERATORS.contains(&op) {
                 return None;
             }
-            let (mut ops, mut reads) = (0, false);
+            let (mut ops, mut reads) = (0.0, false);
             for side in [e.lexpr.as_deref(), e.rexpr.as_deref()]
                 .into_iter()
                 .flatten()
             {
-                let (o, r) = row_expr_ops(side, nparams)?;
+                let (o, r) = expr_ops(side, nparams, calls)?;
                 ops += o;
                 reads |= r;
             }
-            Some((if reads { ops + 1 } else { 0 }, reads))
+            Some((if reads { ops + 1.0 } else { 0.0 }, reads))
         }
         _ => None,
     }
@@ -6743,26 +6818,69 @@ fn row_entry_cost(e: &secantus_pgplan::ColumnExpr) -> Option<(f64, i64)> {
 /// `(per-row cost, width)` the ORDER BY's computed keys add to the scan
 /// under its Sort (RP-966): each is a resjunk entry of the scan's target
 /// list (`make_sort_input_target` leaves it to the scan), priced as a
-/// select-list expression. `None` where a key is not priced, or reads a
-/// column the select list does not return (whose width the scan would add).
+/// select-list expression, a built-in call at its `procost` (RP-1036). A
+/// key equal to a computed select-list entry is that entry, already in the
+/// target list; the columns a key reads are not (the scan returns the key's
+/// value, not them). `None` where a key is not priced.
 pub(crate) fn sort_key_cost(sel: &secantus_pgplan::Select) -> Option<(f64, i64)> {
     let (mut cost, mut width) = (0.0, 0);
     for k in &sel.order {
         let Some(e) = &k.expr else { continue };
-        let secantus_pgplan::ColumnExpr::Row { fields, .. } = e else {
+        if sel.casts.iter().flatten().any(|c| same_row_expr(c, e)) {
+            continue;
+        }
+        let secantus_pgplan::ColumnExpr::Row {
+            expr,
+            fields,
+            params,
+            result_type,
+            ..
+        } = e
+        else {
             return None;
         };
-        if !fields
-            .iter()
-            .all(|(_, f, _)| sel.columns.iter().any(|(_, c)| c == f))
+        if fields.iter().any(|(_, _, t)| {
+            secantus_pgplan::pgtypes::oid_of_name(t).is_none_or(|oid| oid >= 10000)
+        }) || secantus_pgplan::pgtypes::oid_of_name(result_type).is_none_or(|oid| oid >= 10000)
         {
             return None;
         }
-        let (c, w) = row_entry_cost(e)?;
-        cost += c;
-        width += w;
+        let (ops, _) = expr_ops(expr, params.len(), true)?;
+        cost += ops * costsize::CPU_OPERATOR_COST;
+        width += type_width(result_type, -1);
     }
     Some((cost, width))
+}
+
+/// `equal()` of two row expressions: the same tree over the same columns,
+/// wherever in the statement each was written.
+fn same_row_expr(a: &secantus_pgplan::ColumnExpr, b: &secantus_pgplan::ColumnExpr) -> bool {
+    use secantus_pgplan::ColumnExpr::Row;
+    static LOCATION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let location =
+        LOCATION.get_or_init(|| regex::Regex::new(r"location: -?\d+").expect("static regex"));
+    match (a, b) {
+        (
+            Row {
+                expr: x,
+                fields: fx,
+                params: px,
+                ..
+            },
+            Row {
+                expr: y,
+                fields: fy,
+                params: py,
+                ..
+            },
+        ) => {
+            fx == fy
+                && px == py
+                && location.replace_all(&format!("{x:?}"), "")
+                    == location.replace_all(&format!("{y:?}"), "")
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
