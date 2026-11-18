@@ -232,6 +232,35 @@ pub fn storage_opening_lines(
     lines
 }
 
+/// The lines mongod 8.2.11 writes on `initandlisten` as it opens its spill
+/// engine, right after `WiredTiger session cache max value has been set`
+/// (measured 2026-11-18): `Opening spill WiredTiger` (10158000) with the
+/// configuration, the engine's own `WiredTiger message`s (22430), and
+/// `Spill WiredTiger opened` (10158001) with how long that took.
+pub fn spill_opening_lines(opening: &crate::storage::SpillOpening) -> Vec<crate::logbuf::LogEntry> {
+    use crate::logbuf::LogEntry;
+    let mut lines = vec![LogEntry::new(
+        "I",
+        "STORAGE",
+        10158000,
+        "initandlisten",
+        "Opening spill WiredTiger",
+    )
+    .attr(doc! {"config": opening.config.as_str()})];
+    lines.extend(opening.messages.iter().map(|m| wiredtiger_message(m)));
+    lines.push(
+        LogEntry::new(
+            "I",
+            "STORAGE",
+            10158001,
+            "initandlisten",
+            "Spill WiredTiger opened",
+        )
+        .attr(doc! {"durationMillis": millis(opening.open)}),
+    );
+    lines
+}
+
 /// The most sessions mongod's session cache keeps:
 /// `wiredTigerSessionCacheMaxPercentage` (50) percent of the `session_max`
 /// WiredTiger was opened with (8.2.11 logs 16500 for its 33000), WiredTiger's
@@ -1185,6 +1214,30 @@ mod tests {
         assert_eq!(
             lines[0].attr.as_ref().unwrap(),
             &doc! {"lockFile": "d/mongod.lock"}
+        );
+    }
+
+    /// RM-305: mongod 8.2.11's spill engine lines, the engine's own
+    /// messages between them.
+    #[test]
+    fn spill_opening_is_mongods_lines() {
+        let opening = crate::storage::SpillOpening {
+            config: "create,cache_size=100M".into(),
+            messages: vec!["not json".into()],
+            open: std::time::Duration::from_millis(7),
+        };
+        let lines = spill_opening_lines(&opening);
+        assert_eq!(
+            lines.iter().map(|e| e.id).collect::<Vec<_>>(),
+            [10158000, 22430, 10158001]
+        );
+        assert_eq!(
+            lines[0].attr.as_ref().unwrap(),
+            &doc! {"config": "create,cache_size=100M"}
+        );
+        assert_eq!(
+            lines[2].attr.as_ref().unwrap(),
+            &doc! {"durationMillis": 7i64}
         );
     }
 
