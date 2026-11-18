@@ -899,9 +899,10 @@ These are explicit non-goals. Don't add them without a reason.
   (22315), WiredTiger's own messages under it (22430, since 2026-11-16:
   the store opens with mongod's `json_output` / `verbose` configuration),
   `WiredTiger opened` (4795906), `WiredTiger recoveryTimestamp` (23987,
-  since 2026-11-17) and, last, `mongod startup complete`
+  since 2026-11-17), `WiredTiger session cache max value has been set`
+  (9086700, since 2026-11-18) and, last, `mongod startup complete`
   (8423403). mongod writes about fifty more there that this server does
-  not: the network lines, the session-cache line (9086700), the spill WiredTiger's open and its own 22430 messages, the
+  not: the network lines, the spill WiredTiger's open (10158000) and its own 22430 messages, the
   durable catalog, FCV, FTDC and flow-control lines (measured 2026-10-24,
   2026-11-07, 2026-11-10, 2026-11-13 and 2026-11-16). Two limits on the
   22430 lines: they are held by the connection and written together once
@@ -911,7 +912,7 @@ These are explicit non-goals. Don't add them without a reason.
   each. The vendored WiredTiger 7.0 writes four on a new store where
   mongod's newer engine writes fourteen. Found with RM-302.
   Backlog-ID: RM-305
-  Verify: tests/backlog/test_rm_001_028.py::test_startup_writes_the_session_cache_line_after_recovery
+  Verify: tests/backlog/test_rm_001_028.py::test_startup_opens_the_spill_wiredtiger_after_the_session_cache
 ### 7.091 mongod's slot-based engine (SBE) -- 2026-10-23
 
 mongod 8.2 runs the front of a pipeline in its slot-based engine when it can

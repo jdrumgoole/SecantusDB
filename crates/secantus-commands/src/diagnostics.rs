@@ -171,7 +171,8 @@ pub fn startup_details(require_auth: bool) -> [crate::logbuf::LogEntry; 3] {
 /// a process id, `Opening WiredTiger` (22315) with the configuration
 /// `wiredtiger_open` was given, and `WiredTiger opened` (4795906) with how
 /// long that took, then `WiredTiger recoveryTimestamp` (23987) with the
-/// timestamp WiredTiger recovered to.
+/// timestamp WiredTiger recovered to, and `WiredTiger session cache max
+/// value has been set` (9086700).
 pub fn storage_opening_lines(
     opening: &crate::storage::StoreOpening,
 ) -> Vec<crate::logbuf::LogEntry> {
@@ -218,7 +219,30 @@ pub fn storage_opening_lines(
             increment: ts as u32,
         }}),
     );
+    lines.push(
+        LogEntry::new(
+            "I",
+            "STORAGE",
+            9086700,
+            "initandlisten",
+            "WiredTiger session cache max value has been set",
+        )
+        .attr(doc! {"sessionCacheMax": session_cache_max(&opening.wt_config)}),
+    );
     lines
+}
+
+/// The most sessions mongod's session cache keeps:
+/// `wiredTigerSessionCacheMaxPercentage` (50) percent of the `session_max`
+/// WiredTiger was opened with (8.2.11 logs 16500 for its 33000), WiredTiger's
+/// default 100 when the configuration names none.
+fn session_cache_max(wt_config: &str) -> i32 {
+    let session_max = wt_config
+        .split(',')
+        .find_map(|kv| kv.trim().strip_prefix("session_max="))
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(100);
+    (session_max * 50 / 100) as i32
 }
 
 /// `WiredTiger message` (22430): one message WiredTiger wrote, as mongod's
@@ -1139,7 +1163,9 @@ mod tests {
         let ids = |o: &crate::storage::StoreOpening| -> Vec<i32> {
             storage_opening_lines(o).iter().map(|e| e.id).collect()
         };
-        assert_eq!(ids(&opening), [22315, 4795906, 23987]);
+        assert_eq!(ids(&opening), [22315, 4795906, 23987, 9086700]);
+        assert_eq!(session_cache_max("create,session_max=33000"), 16500);
+        assert_eq!(session_cache_max("create"), 50);
         let lines = storage_opening_lines(&opening);
         assert_eq!(
             lines[0].attr.as_ref().unwrap(),
@@ -1153,7 +1179,7 @@ mod tests {
         let lines = storage_opening_lines(&opening);
         assert_eq!(
             lines.iter().map(|e| e.id).collect::<Vec<_>>(),
-            [22271, 22315, 4795906, 23987]
+            [22271, 22315, 4795906, 23987, 9086700]
         );
         assert_eq!(lines[0].severity, "W");
         assert_eq!(

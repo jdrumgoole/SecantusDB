@@ -813,14 +813,24 @@ def test_startup_writes_the_recovery_timestamp_after_opening(rust_mongo: Any) ->
     assert line["attr"] == {"recoveryTimestamp": {"$timestamp": {"t": 0, "i": 0}}}, line
 
 
-@pytest.mark.backlog("RM-305")
+@pytest.mark.backlog_fixed("RM-305")
 def test_startup_writes_the_session_cache_line_after_recovery(rust_mongo: Any) -> None:
     """After `WiredTiger recoveryTimestamp` (23987) mongod 8.2.11 writes
-    `WiredTiger session cache max value has been set` (9086700), then the
-    spill WiredTiger and durable-catalog lines (measured 2026-11-17 on a new
-    dbpath). This server goes straight on."""
+    `WiredTiger session cache max value has been set` (9086700), half its
+    `session_max` (measured 2026-11-17 and 2026-11-18 on a new dbpath). This
+    server went straight on until 2026-11-18."""
     ids = _startup_ids(rust_mongo)
     assert ids[ids.index(23987) + 1] == 9086700, ids
+
+
+@pytest.mark.backlog("RM-305")
+def test_startup_opens_the_spill_wiredtiger_after_the_session_cache(rust_mongo: Any) -> None:
+    """After `WiredTiger session cache max value has been set` (9086700)
+    mongod 8.2.11 writes `Opening spill WiredTiger` (10158000) and the spill
+    engine's own 22430 messages (measured 2026-11-18 on a new dbpath). This
+    server goes straight on."""
+    ids = _startup_ids(rust_mongo)
+    assert ids[ids.index(9086700) + 1] == 10158000, ids
 
 
 def _op_msg(sock: socket.socket, command: dict, request_id: int) -> dict:
