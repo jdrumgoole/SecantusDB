@@ -826,15 +826,23 @@ one beside it.
     two one-member classes shared one id), so a DESC NULLS LAST ORDER BY of
     the preserved key keeps the forward scan and the Merge Right Join:
     `--desc-nulls-last --then m1.c` 803 of 810, `--then "m0.c desc"` 789,
-    every two-table shape matching. Of what is left, `--desc --then m0.c`
-    (801 of 810) differs on six two-table shapes at 3,000 rows with an
-    index on m1.a (`two/3000/idx1/b_a/join/m0.b`, `.../leftjoin/m1.a`), not
-    diagnosed; the rest are four- and five-table stars. Declined still: a later key a
+    every two-table shape matching. Since 2026-11-18, under
+    `Search::merge_asc`, a DESC (NULLS FIRST) first key's backward index
+    scan, in the query's order, is weighed as a merge's outer (the merge
+    runs descending and leaves the query's order, `match_unsorted_outer`),
+    and a forward scan an outer join leaves out of the ORDER BY's order is
+    in the merge's ascending one (a Merge Right Join reads it presorted):
+    `--desc --then m0.c` 809 of 810 (801), `--desc --then "m1.c desc,
+    m0.b"` 2 differences (12), every two-table shape matching, no other
+    variant worse. What is left there is a five-table two-hub shape
+    (`multi5/300/idx1/two_hubs2/inner/ordlastlim5`), not diagnosed; the
+    `--desc-nulls-last` ones (7 and 21 differences) are four- and
+    five-table stars. Declined still: a later key a
     WHERE may fix to a constant; a table with an index of several columns;
     and a two-table join with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_two_table_join_desc_with_another_key_at_3000_rows
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_five_table_two_hub_join_desc_with_another_key
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
