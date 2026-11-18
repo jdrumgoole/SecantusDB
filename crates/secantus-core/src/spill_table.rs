@@ -30,6 +30,10 @@ pub trait SpillTable {
     /// transaction.
     fn insert(&mut self, records: &[(i64, Vec<u8>)]) -> Result<(), String>;
 
+    /// The bytes of the `count` records from record id `first` on, in
+    /// record-id order: a run a stage wrote, read back.
+    fn read(&self, first: i64, count: usize) -> Result<Vec<Vec<u8>>, String>;
+
     /// The table's size on disk: its file's size as WiredTiger's block
     /// manager counts it.
     fn storage_size(&self) -> Result<i64, String>;

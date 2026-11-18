@@ -245,6 +245,7 @@ impl CmdStorage for StorageAdapter {
             wt_config: r.wt_config.clone(),
             wt_open: r.wt_open,
             wt_messages: r.wt_messages.clone(),
+            recovery_timestamp: r.recovery_timestamp,
             open: r.open,
         })
     }
@@ -1490,6 +1491,12 @@ impl CmdStorage for StorageAdapter {
     fn ttl_monitor(&self) -> Option<(i64, bool, u64, u64)> {
         let m = self.inner.ttl_monitor();
         Some((m.sleep_secs, m.enabled, m.passes, m.deleted))
+    }
+
+    fn spill_engine_status(
+        &self,
+    ) -> Option<Result<(i64, String, Vec<(String, i64)>), StorageError>> {
+        Some(self.spill.status().map_err(map_err))
     }
 
     fn engine_statistics(&self) -> Option<Result<(String, Vec<(String, i64)>), StorageError>> {

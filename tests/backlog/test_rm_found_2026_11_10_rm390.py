@@ -108,16 +108,17 @@ def test_a_contested_write_of_many_out_of_time_keeps_what_it_wrote(
     assert _write_out_of_time(rust_mongo, "contested", op, budget=400) == theirs
 
 
-@pytest.mark.backlog("RM-390")
+@pytest.mark.backlog_fixed("RM-390")
 @pytest.mark.parametrize("op", ["update", "delete"])
 def test_a_write_of_many_through_a_compound_index_out_of_time_keeps_what_it_wrote(
     rust_mongo: Any, mongod_rs: Any, op: str
 ) -> None:
     """The same write through compound index `a_1_b_1` of a clustered
     collection: mongod 8.2.11 writes as its plan returns and stops
-    part-way. This server's router reads a compound index's RecordIds
-    whole before the first write, and a budget spent there writes
-    nothing."""
+    part-way. This server's router read a compound index's RecordIds
+    whole before the first write, and a budget spent there wrote
+    nothing; a filter no index covers whole now reads its one field's
+    index a page at a time into the write."""
     theirs = _write_out_of_time(mongod_rs, "clustered-compound", op)
     assert theirs == (("err", 50), True), theirs
     assert _write_out_of_time(rust_mongo, "clustered-compound", op) == theirs

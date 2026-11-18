@@ -117,6 +117,10 @@ pub struct Sizing<'a> {
     /// (`memUsageForSorter`, [`crate::docstore`]): it stands for the
     /// document's and its overhead.
     pub sizes: Option<&'a [usize]>,
+    /// An SBE sort whose row holds the whole document (`fields` is
+    /// `None`): the top-level fields the stages after it ALSO read by name,
+    /// each a slot of the row beside the document's (RM-615).
+    pub beside: Option<&'a BTreeSet<String>>,
 }
 
 /// The memory a sorter keeps aside for reading its runs back
@@ -145,10 +149,24 @@ fn doc_size(doc: &Document, sizing: &Sizing) -> usize {
         sizing.fields.is_none_or(|f| f.contains(k)) && sizing.added.is_none_or(|a| !a.contains(k))
     };
     let body = if sizing.source == SortSource::Sbe {
-        doc.iter()
-            .filter(|(k, _)| kept(k))
-            .map(|(_, v)| memlimit::sbe_size(v))
-            .sum::<usize>()
+        // Every slot of the row counts, a field the document lacks
+        // included: `Nothing` is a tag and a value (`getApproximateSize`,
+        // RM-616).
+        let slot = |v: Option<&Bson>| v.map_or(memlimit::SBE_VALUE, memlimit::sbe_size);
+        match sizing.fields {
+            Some(fields) => fields
+                .iter()
+                .filter(|k| kept(k))
+                .map(|k| slot(doc.get(k)))
+                .sum::<usize>(),
+            None => {
+                doc.iter()
+                    .filter(|(k, _)| kept(k))
+                    .map(|(_, v)| memlimit::sbe_size(v))
+                    .sum::<usize>()
+                    + beside_values(doc, sizing).map(slot).sum::<usize>()
+            }
+        }
     } else if sizing.fields.is_none() && sizing.added.is_none() {
         memlimit::bson_len(doc)
     } else {
@@ -244,6 +262,23 @@ fn kept(doc: &Document, sizing: &Sizing) -> Document {
         .collect()
 }
 
+/// The values of the named slots an SBE sort's whole-document row holds
+/// beside the document (RM-615), in name order: a field the document lacks
+/// is not counted (RM-616).
+fn beside_values<'d>(
+    doc: &'d Document,
+    sizing: &Sizing<'d>,
+) -> impl Iterator<Item = Option<&'d Bson>> {
+    sizing
+        .fields
+        .is_none()
+        .then_some(sizing.beside)
+        .flatten()
+        .into_iter()
+        .flatten()
+        .map(|n| doc.get(n))
+}
+
 /// The slots of an SBE sort's row of kept values, by name
 /// (`PlanStageSlots::getRequiredNamesInOrder` sorts them, and the scan
 /// makes their slots in that order), or `None` when the stages after it
@@ -273,7 +308,14 @@ fn write_record(
             Some(names) => {
                 spill_file::write_sbe_row(&names.iter().map(|n| d.get(n)).collect::<Vec<_>>(), out)
             }
-            None => spill_file::write_sbe_row(&[Some(&Bson::Document(d.clone()))], out),
+            // The whole document, then each field read beside it by name
+            // (mongod's result slot and its named slots, RM-615).
+            None => {
+                let whole = Bson::Document(d.clone());
+                let mut row = vec![Some(&whole)];
+                row.extend(sizing.beside.into_iter().flatten().map(|n| d.get(n)));
+                spill_file::write_sbe_row(&row, out)
+            }
         };
     }
     match keys.as_slice() {
@@ -376,8 +418,10 @@ fn read_sbe_record(
             }
             d
         }
-        None => match (values.pop(), values.is_empty()) {
-            (Some(Some(Bson::Document(d))), true) => d,
+        // The document's slot comes first; the named slots beside it hold
+        // copies of its own fields.
+        None => match values.into_iter().next() {
+            Some(Some(Bson::Document(d))) => d,
             _ => return Err(bad("a row without its document")),
         },
     };
@@ -1175,6 +1219,7 @@ fn sort_members(
         Ordering::Equal
     };
     let sizing = Sizing {
+        beside: None,
         source: SortSource::Member,
         fields: None,
         budget,
@@ -1294,6 +1339,21 @@ fn meta_sort_fields(spec: &Bson) -> R<(Vec<(String, bool)>, Vec<(usize, MetaKey)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_sbe_row_counts_a_missing_fields_slot() {
+        let fields: BTreeSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let sizing = Sizing {
+            source: SortSource::Sbe,
+            fields: Some(&fields),
+            budget: 1 << 20,
+            added: None,
+            sizes: None,
+            beside: None,
+        };
+        // `b` is `Nothing`: a tag and a value, as `a`'s int (RM-616).
+        assert_eq!(doc_size(&doc! {"a": 1}, &sizing), 9 + 9 + 32);
+    }
+
     use super::*;
 
     /// RM-577: a `default` sort of documents counts each RID_AND_OBJ
@@ -1316,6 +1376,7 @@ mod tests {
     fn a_meta_sort_key_ties_or_draws() {
         let docs: Vec<Document> = (0..6).map(|i| doc! { "_id": i, "a": i % 2 }).collect();
         let sizing = Sizing {
+            beside: None,
             sizes: None,
             source: SortSource::QueryLayer,
             fields: None,
@@ -1362,6 +1423,7 @@ mod tests {
     fn a_spilled_sort_answers_the_keys_one_held_in_memory_does() {
         let whole = {
             let sizing = Sizing {
+                beside: None,
                 sizes: None,
                 source: SortSource::QueryLayer,
                 fields: None,
@@ -1372,6 +1434,7 @@ mod tests {
         };
         memlimit::reset_report();
         let sizing = Sizing {
+            beside: None,
             sizes: None,
             source: SortSource::QueryLayer,
             fields: None,
@@ -1408,6 +1471,7 @@ mod tests {
     #[test]
     fn ties_come_in_the_order_the_builds_std_sort_leaves_them() {
         let sizing = Sizing {
+            beside: None,
             sizes: None,
             source: SortSource::Stored,
             fields: None,
@@ -1467,6 +1531,7 @@ mod tests {
     fn each_document_keeps_its_place_through_a_spilled_sort() {
         let docs: Vec<Document> = items(300, 1000).into_iter().map(|(_, d)| d).collect();
         let sizing = Sizing {
+            beside: None,
             sizes: None,
             source: SortSource::Stored,
             fields: None,
@@ -1498,6 +1563,7 @@ mod tests {
             })
             .collect();
         let sizing = Sizing {
+            beside: None,
             sizes: None,
             source: SortSource::QueryLayer,
             fields: None,
@@ -1528,6 +1594,7 @@ mod tests {
     /// spilledDataStorageSize)`.
     fn spilled(items: Vec<(Vec<Bson>, Document)>, budget: usize) -> (i64, i64, i64) {
         let sizing = Sizing {
+            beside: None,
             sizes: None,
             source: SortSource::QueryLayer,
             fields: None,
@@ -1732,6 +1799,7 @@ mod tests {
         };
         let counted = |budget: usize, limit: Option<usize>| {
             let sizing = Sizing {
+                beside: None,
                 sizes: None,
                 source: SortSource::Sbe,
                 fields: Some(&fields),
@@ -1763,6 +1831,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let sizing = Sizing {
+            beside: None,
             sizes: None,
             source: SortSource::Sbe,
             fields: Some(&fields),
@@ -1791,6 +1860,7 @@ mod tests {
         // mongod 8.2.11, `find({z: 0}).sort({y: 1})` over six documents:
         // `totalDataSizeSorted` 0 for a limit of 1, 134 for 2 (RM-374).
         let sizing = Sizing {
+            beside: None,
             sizes: None,
             source: SortSource::QueryLayer,
             fields: None,
@@ -1822,6 +1892,7 @@ mod tests {
         // profile's `sortSpills`, `sortSpilledRecords` and
         // `sortTotalDataSizeBytes` (RM-399).
         let sizing = Sizing {
+            beside: None,
             sizes: None,
             source: SortSource::QueryLayer,
             fields: None,

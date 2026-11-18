@@ -14,7 +14,8 @@
 //! with `statistics=(size)`), and dropped when the stage is done (measured on
 //! mongod 8.2.11, 2026-11-13).
 //!
-//! Opened at the first spill rather than at startup, so a server that never
+//! Opened at the first spill (or the first `serverStatus`, which reports
+//! it) rather than at startup, so a server that never
 //! spills (and the PostgreSQL server, which shares this crate) never makes
 //! the directory. Its tables are not compressed: mongod's are zstd at level
 //! -7 (`spillWiredTigerBlockCompressor`), which the vendored WiredTiger is
@@ -42,6 +43,60 @@ const DROP_CFG: &str = "force=true";
 
 /// The statistic a table's size on disk is read from.
 const FILE_SIZE: &str = "block-manager: file size in bytes";
+
+/// The engine statistics mongod 8.2.11 reports in
+/// `serverStatus.spillWiredTiger` at verbosity 1, in WiredTiger's order.
+pub const STATUS_STATISTICS: &[&str] = &[
+    "block-manager: blocks read",
+    "block-manager: blocks written",
+    "block-manager: bytes read",
+    "block-manager: bytes written",
+    "cache: application thread time evicting (usecs)",
+    "cache: application threads eviction requested with cache fill ratio < 25%",
+    "cache: application threads eviction requested with cache fill ratio >= 75%",
+    "cache: application threads page write from cache to disk count",
+    "cache: application threads page write from cache to disk time (usecs)",
+    "cache: bytes allocated for updates",
+    "cache: bytes currently in the cache",
+    "cache: bytes read into cache",
+    "cache: bytes written from cache",
+    "cache: eviction currently operating in aggressive mode",
+    "cache: eviction empty score",
+    "cache: eviction state",
+    "cache: eviction walk target strategy clean pages",
+    "cache: eviction walk target strategy dirty pages",
+    "cache: eviction walk target strategy pages with updates",
+    "cache: forced eviction - pages evicted that were clean count",
+    "cache: forced eviction - pages evicted that were dirty count",
+    "cache: forced eviction - pages selected count",
+    "cache: forced eviction - pages selected unable to be evicted count",
+    "cache: hazard pointer blocked page eviction",
+    "cache: maximum bytes configured",
+    "cache: maximum page size seen at eviction",
+    "cache: number of times dirty trigger was reached",
+    "cache: number of times eviction trigger was reached",
+    "cache: number of times updates trigger was reached",
+    "cache: page evict attempts by application threads",
+    "cache: page evict failures by application threads",
+    "cache: pages queued for eviction",
+    "cache: pages queued for urgent eviction",
+    "cache: tracked dirty bytes in the cache",
+    "session: open session count",
+];
+
+/// A table's file size, as WiredTiger's block manager counts it.
+fn table_size(session: &Session, uri: &str) -> Result<i64> {
+    let cursor = session.open_cursor(&format!("statistics:{uri}"), Some("statistics=(size)"))?;
+    while cursor.next()? {
+        let (description, value) = cursor.get_value_stat()?;
+        if description == FILE_SIZE {
+            return Ok(value);
+        }
+    }
+    Err(StorageError::Internal(format!(
+        "{uri}'s statistics have no \"{FILE_SIZE}\""
+    )))
+}
 
 /// The spill engine's cache, in megabytes, for a machine of `mem_mb`
 /// megabytes: 2.5% of it, held between 100 and 1000 (mongod 8.2's
@@ -143,6 +198,45 @@ impl SpillEngine {
         drop_all(&opened.open_session()?)?;
         *conn = Some(Arc::clone(&opened));
         Ok(opened)
+    }
+
+    /// What `serverStatus.spillWiredTiger` reports at mongod 8.2's
+    /// `spillWiredTigerServerStatusVerbosity` 1 (`SpillWiredTigerKVEngine`'s
+    /// server-status section, measured on 8.2.11, 2026-11-18): the bytes
+    /// every spill table holds on disk, the engine's version, and the
+    /// statistics in [`STATUS_STATISTICS`], `(description, value)` in the
+    /// engine's order. mongod has the engine open from startup; this server
+    /// opens it here when nothing has spilled yet, so the section is there
+    /// from the first `serverStatus` as it is on mongod.
+    #[allow(clippy::type_complexity)]
+    pub fn status(&self) -> Result<(i64, String, Vec<(String, i64)>)> {
+        let conn = self.connection()?;
+        let session = conn.open_session()?;
+        let mut tables = Vec::new();
+        {
+            let cursor = session.open_cursor("metadata:", None)?;
+            while cursor.next()? {
+                let key = cursor.get_key_s()?;
+                if key.starts_with("table:") {
+                    tables.push(key);
+                }
+            }
+        }
+        let mut storage_size = 0i64;
+        for t in &tables {
+            storage_size += table_size(&session, t)?;
+        }
+        let mut stats = Vec::new();
+        {
+            let cursor = session.open_cursor("statistics:", None)?;
+            while cursor.next()? {
+                let (description, value) = cursor.get_value_stat()?;
+                if STATUS_STATISTICS.contains(&description.as_str()) {
+                    stats.push((description, value));
+                }
+            }
+        }
+        Ok((storage_size, secantus_wt::version_string(), stats))
     }
 
     /// A new, empty spill table.
@@ -248,22 +342,41 @@ impl SpillTable {
         }
     }
 
-    /// The table's file size, as WiredTiger's block manager counts it.
-    pub fn storage_size(&self) -> Result<i64> {
-        let cursor = self.session().open_cursor(
-            &format!("statistics:{}", self.uri),
-            Some("statistics=(size)"),
-        )?;
-        while cursor.next()? {
-            let (description, value) = cursor.get_value_stat()?;
-            if description == FILE_SIZE {
-                return Ok(value);
+    /// The `count` records from record id `first` on, in record-id order;
+    /// a record missing from the range is an error, never a short run.
+    pub fn read(&self, first: i64, count: usize) -> Result<Vec<Vec<u8>>> {
+        let mut out = Vec::with_capacity(count);
+        if count == 0 {
+            return Ok(out);
+        }
+        let cursor = self.session().open_cursor(&self.uri, None)?;
+        cursor.set_key_q(first);
+        cursor.search()?;
+        loop {
+            let id = cursor.get_key_q()?;
+            let want = first + out.len() as i64;
+            if id != want {
+                return Err(StorageError::Internal(format!(
+                    "{} has record {id} where {want} was written",
+                    self.uri
+                )));
+            }
+            out.push(cursor.get_value_u()?);
+            if out.len() == count {
+                return Ok(out);
+            }
+            if !cursor.next()? {
+                return Err(StorageError::Internal(format!(
+                    "{} ends after record {id}, before the {count} records from {first}",
+                    self.uri
+                )));
             }
         }
-        Err(StorageError::Internal(format!(
-            "{}'s statistics have no \"{FILE_SIZE}\"",
-            self.uri
-        )))
+    }
+
+    /// The table's file size, as WiredTiger's block manager counts it.
+    pub fn storage_size(&self) -> Result<i64> {
+        table_size(self.session(), &self.uri)
     }
 
     /// Drop the table and its file.
@@ -308,6 +421,10 @@ impl secantus_core::spill_table::SpillTable for SpillTable {
         SpillTable::insert(self, records).map_err(|e| e.to_string())
     }
 
+    fn read(&self, first: i64, count: usize) -> std::result::Result<Vec<Vec<u8>>, String> {
+        SpillTable::read(self, first, count).map_err(|e| e.to_string())
+    }
+
     fn storage_size(&self) -> std::result::Result<i64, String> {
         SpillTable::storage_size(self).map_err(|e| e.to_string())
     }
@@ -338,6 +455,29 @@ mod tests {
     /// it with, 4096 bytes, as mongod 8.2.11's window spill of 300 documents
     /// of 1000 bytes did; dropping it removes the file.
     #[test]
+    fn status_reports_mongods_statistics_and_the_tables_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SpillEngine::new(dir.path(), 100);
+        let (size, version, stats) = engine.status().unwrap();
+        assert_eq!(size, 0);
+        assert!(version.starts_with("WiredTiger "));
+        let names: Vec<&str> = stats.iter().map(|(d, _)| d.as_str()).collect();
+        // mongod's list, in its order, less the counters the vendored
+        // WiredTiger (11.x) does not keep.
+        let mut want = STATUS_STATISTICS.iter();
+        for name in &names {
+            assert!(
+                want.any(|w| w == name),
+                "{name} is not mongod's, or out of order"
+            );
+        }
+        assert!(names.len() >= 20, "{names:?}");
+        let mut table = engine.create_table().unwrap();
+        table.insert(&[(1, vec![b'x'; 100])]).unwrap();
+        assert_eq!(engine.status().unwrap().0, table.storage_size().unwrap());
+    }
+
+    #[test]
     fn a_spill_table_held_in_cache_is_4096_bytes_and_drops_its_file() {
         let dir = tempfile::tempdir().unwrap();
         let engine = SpillEngine::new(dir.path(), 100);
@@ -363,6 +503,24 @@ mod tests {
 
     /// A store with no files spills under the system's temporary
     /// directory, and the engine's directory goes with the engine.
+    #[test]
+    fn a_run_reads_back_by_record_id_and_a_gap_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SpillEngine::new(dir.path(), 100);
+        let mut table = engine.create_table().unwrap();
+        table
+            .insert(&[(1, b"a".to_vec()), (2, b"b".to_vec()), (4, b"d".to_vec())])
+            .unwrap();
+        assert_eq!(
+            table.read(1, 2).unwrap(),
+            vec![b"a".to_vec(), b"b".to_vec()]
+        );
+        assert_eq!(table.read(4, 1).unwrap(), vec![b"d".to_vec()]);
+        assert!(table.read(2, 2).is_err(), "record 3 was never written");
+        assert!(table.read(4, 2).is_err(), "the table ends at 4");
+        table.drop_table().unwrap();
+    }
+
     #[test]
     fn a_temporary_engine_removes_its_directory() {
         let engine = SpillEngine::temporary(100);

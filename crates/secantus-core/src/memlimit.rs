@@ -60,7 +60,7 @@ const RC_DECIMAL: usize = 32;
 /// The longest string a classic `Value` keeps inline.
 const SHORT_STR: usize = 11;
 /// An SBE value's tag and word.
-const SBE_VALUE: usize = 9;
+pub(crate) const SBE_VALUE: usize = 9;
 /// The longest string SBE keeps in the word (`StringSmall`).
 const SBE_SMALL_STR: usize = 7;
 /// What a classic accumulator starts at (`sizeof(*this)`; measured for
@@ -175,9 +175,8 @@ pub(crate) const LAYOUT: Layout = if crate::stl::LIBCXX {
 pub struct Budgets {
     /// `internalDocumentSourceGroupMaxMemoryBytes`: a classic `$group`.
     pub group: usize,
-    /// `internalQuerySBEAggApproxMemoryUseInBytesBeforeSpill`: an SBE
-    /// `$group`. Not settable at runtime on mongod 8.2.11, so no parameter
-    /// sets it here either.
+    /// `internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill`:
+    /// an SBE `$group`, settable at runtime and at startup (RM-612).
     pub sbe_group: usize,
     /// `internalQueryMaxPushBytes`
     pub push: usize,
@@ -219,7 +218,7 @@ impl Default for Budgets {
 
 impl Budgets {
     /// The parameter names, each with the field it sets.
-    pub const PARAMETERS: [&'static str; 10] = [
+    pub const PARAMETERS: [&'static str; 11] = [
         "internalQueryMaxBlockingSortMemoryUsageBytes",
         "internalDocumentSourceBucketAutoMaxMemoryBytes",
         "internalDocumentSourceGroupMaxMemoryBytes",
@@ -230,12 +229,16 @@ impl Budgets {
         "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
         "internalLookupStageIntermediateDocumentMaxSizeBytes",
         "internalQueryFacetMaxOutputDocSizeBytes",
+        "internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill",
     ];
 
     /// Set the budget the parameter `name` names; false for another name.
     pub fn set(&mut self, name: &str, bytes: usize) -> bool {
         let slot = match name {
             "internalDocumentSourceGroupMaxMemoryBytes" => &mut self.group,
+            "internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill" => {
+                &mut self.sbe_group
+            }
             "internalQueryMaxPushBytes" => &mut self.push,
             "internalQueryMaxAddToSetBytes" => &mut self.add_to_set,
             "internalQueryMaxConcatArraysBytes" => &mut self.concat_arrays,

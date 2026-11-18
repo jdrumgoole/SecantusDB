@@ -1594,6 +1594,7 @@ pub(crate) fn sort_stats(
         return;
     };
     let sizing = secantus_core::sorter::Sizing {
+        beside: None,
         sizes: None,
         source: secantus_core::sorter::SortSource::QueryLayer,
         fields: None,

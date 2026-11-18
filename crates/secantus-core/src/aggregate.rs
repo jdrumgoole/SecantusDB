@@ -258,6 +258,11 @@ pub fn apply_pipeline(
                     group::downstream_fields(&after)
                 })
                 .flatten();
+            // A row of the whole document also holds the fields read by
+            // name beside it (RM-615).
+            let sbe_beside = (source == Some(crate::sorter::SortSource::Sbe) && sbe_row.is_none())
+                .then(|| group::fields_beside_root(&pipeline[i + 1..]))
+                .flatten();
             let kept_fields = |source: crate::sorter::SortSource| match source {
                 crate::sorter::SortSource::QueryLayer => None,
                 crate::sorter::SortSource::Sbe => sbe_row.as_ref(),
@@ -360,7 +365,16 @@ pub fn apply_pipeline(
                 (Some(source), Some(input)) => {
                     order = stable(&docs)?;
                     let fields = kept_fields(source);
-                    budgeted_sort_stage(input, spec, source, fields, None, None, limit)?;
+                    budgeted_sort_stage(
+                        input,
+                        spec,
+                        source,
+                        fields,
+                        None,
+                        None,
+                        limit,
+                        sbe_beside.as_ref(),
+                    )?;
                     docs.truncate(limit.unwrap_or(usize::MAX));
                     docs
                 }
@@ -377,6 +391,7 @@ pub fn apply_pipeline(
                         added,
                         sizes.as_deref(),
                         limit,
+                        sbe_beside.as_ref(),
                     )?;
                     order = stores.is_some().then_some(placed);
                     sorted
@@ -710,6 +725,7 @@ fn window_sort_budget(
         Ordering::Equal
     };
     let sizing = crate::sorter::Sizing {
+        beside: None,
         sizes,
         source,
         fields,
@@ -2265,6 +2281,7 @@ pub fn leading_sort(blocking: bool, sbe: bool) -> LeadingSort {
 
 /// `$sort` held to its memory budget (RM-315): mongod's external sorter,
 /// which spills to disk or refuses (292).
+#[allow(clippy::too_many_arguments)]
 fn budgeted_sort_stage(
     docs: Vec<Document>,
     spec: &Bson,
@@ -2273,8 +2290,10 @@ fn budgeted_sort_stage(
     added: Option<&std::collections::BTreeSet<String>>,
     sizes: Option<&[usize]>,
     limit: Option<usize>,
+    beside: Option<&std::collections::BTreeSet<String>>,
 ) -> R<(Vec<Document>, Vec<usize>)> {
     let sizing = crate::sorter::Sizing {
+        beside,
         sizes,
         source,
         fields,

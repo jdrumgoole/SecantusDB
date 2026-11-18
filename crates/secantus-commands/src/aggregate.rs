@@ -909,6 +909,22 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // Asked for a first batch of none, mongod runs nothing until
                 // the first `getMore` (measured 8.2.11, 2026-10-25).
                 if batch_size == 0 {
+                    // It still plans the pipeline's front, and so makes its
+                    // planner's checks: a pipeline its query layer takes
+                    // whole counts them as a `find` of no batch does (5, one
+                    // more per index scan, measured 8.2.11 2026-11-18;
+                    // RM-360). Its `getMore` reruns and counts its own.
+                    if crate::explain::query_layer_takes_whole(
+                        storage,
+                        &ctx.db_name,
+                        c,
+                        &read_pipeline,
+                        hint,
+                        collation.as_ref(),
+                    ) {
+                        let _ = crate::explain::summary::plan_summary(doc, ctx);
+                        secantus_core::deadline::pipeline_counted();
+                    }
                     let deferred = crate::agg_stream::Deferred {
                         command: doc.clone(),
                     };

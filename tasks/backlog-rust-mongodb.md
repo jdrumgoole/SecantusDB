@@ -556,9 +556,17 @@ These are explicit non-goals. Don't add them without a reason.
         (RM-357's session row);
       - mongod's first retryable write after startup takes a second,
         exempt, ingress admission (not traced), measured 8.2.11
-        2026-11-08; an index
-        build's `$currentOp` row has no `queues` here (mongod's not yet
-        measured).
+        2026-11-08;
+      - an index build: mongod 8.2.11 (one-member replica set, measured
+        2026-11-18 under `hangAfterStartingIndexBuild`) shows TWO rows, the
+        `IndexBuildsCoordinatorMongod-0` thread's (`queues.ingress`
+        admissions 0, not holding; `queues.execution` holding a ticket,
+        admissions counting its yields, 139 for 1,000 documents; locks
+        `w` on transition, global, database and collection) and the
+        client's `createIndexes` (`ingress` 1, holding; `execution` 4, not
+        holding; `locks: {}`). This server builds in the command and has no
+        `configureFailPoint`, so neither row can be caught yet; a gap test
+        needs that failpoint (or a build slow enough to observe) first.
       **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08, the ticket pools 2026-11-09, and the per-command admission counts on the line 2026-11-09; what is left is above.
       Backlog-ID: RM-355
       Verify: none -- the yield's second admission is RM-360's; the second exempt ingress admission and an index build's `queues` have no gap test yet
@@ -574,7 +582,10 @@ These are explicit non-goals. Don't add them without a reason.
       `collMod` of a collection there takes mongod's global IS and its
       collection X twice; since 2026-11-17 a `findAndModify` that removes
       takes one round, and a retryable one writes its image under the
-      transition, global and image collection IX. Still different,
+      transition, global and image collection IX; since 2026-11-18 a
+      profiled update or delete statement's entry counts mongod's
+      `Metadata: {W: 1}` and global, database and collection IX in its
+      command's locks. Still different,
       measured against a one-member replica set:
       - an `insert` of several documents one of which fails: mongod inserts
         them again a document at a time, each under a transition, global,
@@ -585,10 +596,9 @@ These are explicit non-goals. Don't add them without a reason.
       - an `update` or `delete` keeps its session row per statement, under
         the statement's own locks, and takes each statement's round as the
         statement runs (this server takes every round first and writes the
-        row once, after); a profiled statement's own entry is counted in its
-        command's locks (`Metadata: {W: 1}`, one more global IX), taken
-        without interrupt checks (the command's `numInterruptChecks` is
-        mongod's without them);
+        row once, after); the profiled statement's entry's locks are taken
+        without interrupt checks here (the command's `numInterruptChecks`
+        is mongod's without them);
       - `$out` takes more transition locks than this server's rounds
         (measured on a standalone, RM-185), and an `$out`'s line here has
         one global IS more than mongod's (7 to 6, measured 8.2.11
@@ -724,12 +734,12 @@ These are explicit non-goals. Don't add them without a reason.
       buckets or more) keeps its `$group` classic, as on mongod. The line of a `find`, `count`
       or `distinct` of a collection with one candidate plan, a `getMore` of
       a `find`, an `aggregate` of a collection mongod's query layer runs
-      whole, or whose stages after its cursor stage are `$project`,
+      whole, or (since 2026-11-18 asked for a first batch of none too) whose stages after its cursor stage are `$project`,
       `$unset`, `$addFields`, `$set`, `$replaceRoot`, `$replaceWith`,
       `$unwind` and `$skip`, and the `getMore`s of its cursor,
       `listIndexes`, `listCollections`, `collStats`, `ping`, `buildInfo`,
       and an `insert`, `update` or `delete` on a member of a replica set
-      prints mongod's count (82 shapes in
+      prints mongod's count (86 shapes in
       `tests/mongod_live/test_interrupt_checks.py`). Every other line
       prints none, where mongod prints one:
       - a read with more than one candidate plan, a plan from the plan
@@ -745,8 +755,9 @@ These are explicit non-goals. Don't add them without a reason.
         `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a `$group`
         run classic over the cursor stage (a `$bucket` of 400 buckets: 16
         and a `getMore` of 4 on mongod), one over a
-        view or a time-series collection, and one asked for a first batch
-        of none;
+        view or a time-series collection, and a `$sort` after an SBE
+        `$group` asked for a first batch of none (mongod 5; its `getMore`
+        here 5 under two global IS, mongod's 4 under one);
       - `findAndModify`: counted as the other writes are, it matches mongod
         8.2.11 but where its locks do not (RM-357: a retryable one's image,
         19 to this server's 16; one that removes, 7 to 10), and an IDHACK
@@ -814,7 +825,9 @@ These are explicit non-goals. Don't add them without a reason.
         other readers still decline a contested plan
         (`order::stream_plan`);
       - a read of a time-series collection made whole: under a
-        `$group` (`count_documents`), an inclusion `$project` (RM-456), a
+        `$group` (`count_documents`; since 2026-11-18 a `$group` on the
+        meta field that only counts, which mongod runs over the buckets,
+        counts as mongod's does), an inclusion `$project` (RM-456), a
         filter on the meta field (RM-457), a hint or a collation. mongod
         counts the buckets its cursor stage buffered (five of five for a
         sorted `find`). Since RM-455 a `find` is the aggregation mongod
@@ -824,7 +837,15 @@ These are explicit non-goals. Don't add them without a reason.
         mongod 5 keys and 4 documents, this server none).
       Measured 2026-10-27, 2026-11-07, 2026-11-10 and 2026-11-13.
       Backlog-ID: RM-363
-      Verify: tests/backlog/test_rm_355_364.py::test_a_grouped_time_series_read_counts_what_it_examined
+      Verify: tests/backlog/test_rm_355_364.py::test_a_counted_time_series_read_counts_what_it_examined
+- [ ] **A time-series `$group` on the meta field that sums `1.0` answers a
+      double.** mongod 8.2.11 rewrites `{$group: {_id: "$m", n: {$sum:
+      1.0}}}` over a time-series collection to a sum of each bucket's
+      `control.count`, and answers `n: 60` (an int); this server sums 1.0
+      per measurement and answers `60.0`. Measured 2026-11-18. Found while
+      working RM-363.
+      Verify: tests/backlog/test_rm_355_364.py::test_a_meta_group_summing_one_point_zero_answers_an_int
+      Backlog-ID: RM-719
 - [ ] **WiredTiger 11's interruptible cache wait is not on the line.**
       mongod 8.2.11's WiredTiger splits a cache wait into the share spent
       in interruptible eviction (`timeWaitingMicros.cacheInterruptibleMicros`)
@@ -890,10 +911,11 @@ These are explicit non-goals. Don't add them without a reason.
   lock file's `Detected unclean shutdown` (22271), `Opening WiredTiger`
   (22315), WiredTiger's own messages under it (22430, since 2026-11-16:
   the store opens with mongod's `json_output` / `verbose` configuration),
-  `WiredTiger opened` (4795906) and, last, `mongod startup complete`
+  `WiredTiger opened` (4795906), `WiredTiger recoveryTimestamp` (23987,
+  since 2026-11-17), `WiredTiger session cache max value has been set`
+  (9086700, since 2026-11-18) and, last, `mongod startup complete`
   (8423403). mongod writes about fifty more there that this server does
-  not: the network lines, the recovery-timestamp (23987) and session-cache
-  lines, the spill WiredTiger's open and its own 22430 messages, the
+  not: the network lines, the spill WiredTiger's open (10158000) and its own 22430 messages, the
   durable catalog, FCV, FTDC and flow-control lines (measured 2026-10-24,
   2026-11-07, 2026-11-10, 2026-11-13 and 2026-11-16). Two limits on the
   22430 lines: they are held by the connection and written together once
@@ -903,7 +925,7 @@ These are explicit non-goals. Don't add them without a reason.
   each. The vendored WiredTiger 7.0 writes four on a new store where
   mongod's newer engine writes fourteen. Found with RM-302.
   Backlog-ID: RM-305
-  Verify: tests/backlog/test_rm_001_028.py::test_startup_writes_the_recovery_timestamp_after_opening
+  Verify: tests/backlog/test_rm_001_028.py::test_startup_opens_the_spill_wiredtiger_after_the_session_cache
 ### 7.091 mongod's slot-based engine (SBE) -- 2026-10-23
 
 mongod 8.2 runs the front of a pipeline in its slot-based engine when it can
@@ -1011,63 +1033,30 @@ Python behind the Rust server, a deferral answers 2 "aggregation pipeline
 uses a stage or operator not supported by the Rust server". The file has
 about forty such points; these are the ones measured.
 
-- [ ] **A write of many through a compound index of a clustered
+- [ ] **A write of many through some index reads of a clustered
       collection reads every candidate before it writes one.** mongod
       writes each document as its plan returns it, whatever the plan, so an
       updateMany or deleteMany out of `maxTimeMS` part-way has written some
       (mongod 8.2.11, 100,000 documents, `maxTimeMS: 30`). A plan this
       server's write cannot stream -- a clustered or time-series
       collection, a geo plan -- leaves the write to the store, which reads
-      a collection scan (since 2026-11-10) and a one-field bounded index
-      read (since 2026-11-17) a page at a time, writing each page first.
-      The router's other index reads (`try_index_id_keys`: a compound
-      index, `$in` / `$eq`, `$and`, `$or`, `$elemMatch`, geo) are still
-      read whole before the first page, and a budget spent there writes
-      nothing. The work is to stream a clustered collection's plan as an
-      ordinary one's (its natural order is `_id`'s, which the stream does
-      not yet read), or to page each of those reads into the write as
-      `bounded_span_pages` does; a geo plan is not yet probed.
+      a collection scan (since 2026-11-10), a one-field bounded index read
+      (since 2026-11-17), and a filter of operator clauses no index covers
+      whole through one field's bounded read, a compound index's included
+      (since 2026-11-18), a page at a time, writing each page first. The
+      router's other index reads (`try_index_id_keys`: an equality prefix
+      of a compound index, `$in` / `$eq`, `$and`, `$or`, `$elemMatch`,
+      geo) are still read whole before the first page, and a budget spent
+      there writes nothing. The work is to stream a clustered collection's
+      plan as an ordinary one's (its natural order is `_id`'s, which the
+      stream does not yet read), or to page each of those reads into the
+      write as `bounded_span_pages` does; none of those shapes is probed
+      against mongod yet.
       Backlog-ID: RM-390
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm390.py::test_a_write_of_many_through_a_compound_index_out_of_time_keeps_what_it_wrote
-- [ ] **An explain of a read whose plan two indexes contest reads the
-      whole collection.** Over `{a: {$gte: 0}, b: {$gte: 0}}` with
-      indexes `a_1` and `b_1`, mongod 8.2.11's `explain` of a
-      `find(...).limit(101)` at `queryPlanner` takes 0.3 ms whether the
-      collection holds 10,000 documents or 100,000: its trial reads only
-      what the candidate plans reach. This server's grows ten times over
-      (debug build, 2026-11-13: 127 ms at 10,000, 1,282 ms at 100,000),
-      because `explain` plans over every document of the collection,
-      loaded into memory first (`explain/mod.rs`, `Target.docs`, read by
-      `target()`). The answers are the same; the cost is the whole
-      collection. A find and a write of one try their plans over what the
-      plans reach since 2026-11-17 (RM-610, part); the work is to give
-      explain's trial the store, as `order.rs`'s `Lazy` does, in place of
-      `Held`. Found while fixing RM-390's CI test, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_2026_11_13_contested_reads.py::test_a_contested_read_costs_what_it_returns
-      Backlog-ID: RM-610
-- [ ] **A profile entry counts what it examined as int64, where mongod
-      writes int32.** mongod 8.2.11's `system.profile` entry for an
-      updateMany or a find holds `keysExamined` and `docsExamined` as
-      int32 (`{"$numberInt": "50"}`, measured 2026-11-13); this server's
-      holds them as int64, so a reader that checks the BSON type, or
-      compares entries exactly, sees a different document. Found while
-      working RM-390, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm390.py::test_a_profile_entry_counts_what_it_examined_as_int32
-      Backlog-ID: RM-601
-- [ ] **A write's profile entry counts no yields, where mongod counts
-      each.** mongod 8.2.11's executor yields once its yield period (10 ms)
-      has passed, before a `work()` call, and its `system.profile` entry
-      says how often: a deleteMany of three documents that take half a
-      second each to test has `numYield: 5` (before staging the second and
-      third, before the call that finds the end, and twice inside the
-      batch, which it splits once deleting it has run
-      `batchedDeletesTargetBatchTimeMS`, 5 ms; measured 2026-11-13). This
-      server's entry for it says `numYield: 0`, although since RM-501 a
-      batched delete yields at those boundaries; the profiler writes a
-      literal 0 for several commands (`profiler/record.rs`), not probed
-      one by one. Found while working RM-501.
-      Verify: tests/backlog/test_rm_found_rm501.py::test_a_delete_many_profile_entry_counts_its_yields
-      Backlog-ID: RM-609
+      Verify: none -- the compound residual read this item's gap test
+      measured is paged (tests/backlog/test_rm_found_2026_11_10_rm390.py,
+      now backlog_fixed); the remaining shapes have no gap test until one
+      is probed against mongod 8.2.
 
 ### 7.086 The Rust MongoDB server, audited -- 2026-10-20
 
@@ -1099,69 +1088,38 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       to run. Found 2026-11-13 working RM-325.
       Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_a_window_spill_the_engine_writes_out_is_mongods_size
       Backlog-ID: RM-611
-- [ ] **An SBE `$group`'s budget cannot be set at startup, and its spill
-      is this server's.** mongod 8.2.11 takes
-      `internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill`
-      on its command line (not at runtime), and at 50000 spills a slot-based
-      `$group` `$push` of 300 1000-byte strings 7 times, 312300 bytes, into
-      a table of its spill engine (`groupSpilledDataStorageSize` 4096).
-      `secantusd-mdb` refuses the parameter ("Unknown --setParameter"), so
-      the SBE `$group`'s budget is always 100 MiB and what it spills is
-      unmeasured. Found 2026-11-13 working RM-325 (its remainder).
+- [ ] **An SBE `$group`'s spill counts bytes, and spills, by this server's
+      estimate, not mongod's.** With its budget
+      (`internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill`,
+      taken at runtime and at startup since RM-612's first part) at 50000,
+      mongod 8.2.11 spills 300 single-value groups 7 times for each shape
+      below, and its `groupSpilledBytes` follows the spilled value rows:
+      `{$push: "$s"}` of a 1000-byte string 312300, with a `$sum` beside it
+      321900, `{$first: "$s"}` 304200, a `$sum` keyed on a 1000-byte string
+      12300, no accumulator at all 2700 (9 a group). This server reports its
+      memory estimate at each spill (306900 for each of the first four),
+      and keyed on a 1000-byte string spills 6 times, 304990 bytes: SBE's
+      hash-table accounting (`HashAggStage`'s memory check and its
+      `spilledBytes`) needs porting. The spill itself now goes to one
+      table of the spill engine, as mongod's does (spills, records and the
+      4096-byte storage size match). Found 2026-11-13 working RM-325;
+      measured 2026-11-18.
       Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_an_sbe_group_spills_as_mongods
       Backlog-ID: RM-612
-- [ ] **A `$median` / `$percentile` spills the values, where mongod spills
-      its t-digest.** A classic `$group` of `{$median: {input: "$n", method:
-      "approximate"}}` over 300 groups of one value each, under a 5000-byte
-      budget, writes a 5561-byte spill file on mongod 8.2.11
-      (`groupSpilledDataStorageSize`, its accumulator's t-digest) and 2948
-      here, which keeps and writes the values (an empty digest: 1986 to
-      1510). The memory counted is mongod's since RM-502 up to the t-digest's
-      first flush (6000 finite values); the centroids a flush makes are not
-      counted (`group::tdigest_buffer`), and need the same port. Found
-      2026-11-13 working RM-325 (its remainder).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_a_median_spills_mongods_state
-      Backlog-ID: RM-613
-- [ ] **`serverStatus` has no `spillWiredTiger` section.** mongod 8.2.11
-      reports its spill engine's statistics there from startup (`uri`
-      `"statistics:"`, `storageSize` 0 while nothing is spilled, `version`,
-      and the block-manager and cache counters;
-      `spillWiredTigerServerStatusVerbosity` 1). This server opens its spill
-      engine at the first spill and reports none of it. Found 2026-11-13
-      working RM-325.
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_server_status_reports_the_spill_engine
-      Backlog-ID: RM-614
-- [ ] **An SBE sort's whole-document row leaves out the fields read beside it.**
-      mongod 8.2.11's slot-based sort in front of `{$group: {_id: "$k", f:
-      {$first: "$$ROOT"}}}`, over 300 documents of a 1000-byte `s` under a
-      50000-byte budget, spills rows of the whole document AND `k` (the
-      result slot and the named slot the `$group` reads): 956700 bytes over
-      900 records. This server's row holds the document alone (952200, 5
-      bytes a record fewer): `group::downstream_fields` answers `None` for
-      "whole documents" and drops the fields read by name. Found 2026-11-13
-      (RM-506).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm506.py::test_a_whole_document_row_keeps_the_fields_read_beside_it
-      Backlog-ID: RM-615
-- [ ] **An SBE sort counts no memory for a field a document lacks.**
-      mongod 8.2.11 counts every slot of an SBE sort's row in the memory it
-      holds, a missing field's `Nothing` included (`getApproximateSize`:
-      its tag and value, 9 bytes); this server counts only the fields a
-      document has (`sorter::doc_size`). With `t` on half of 300 documents
-      of a 1000-byte `s`, `[{$sort: {n: 1}}, {$group: {_id: "$k", f:
-      {$first: "$t"}, g: {$first: "$s"}}}]` under 50000 bytes reports
-      `sortTotalDataSizeBytes` 276834 on mongod and 275673 here (129 slots of
-      9). Found 2026-11-13 (RM-506).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm506.py::test_a_missing_field_counts_its_slot
-      Backlog-ID: RM-616
-- [ ] **`explain` with `executionStats` answers where a `$setWindowFields`
-      fails.** mongod 8.2.11 runs the pipeline for `executionStats` and
-      returns the executor's error: a `$sum` of `{$divide: [1, "$z"]}` over
-      a `z` of 0 (code 2), an `$integral` of a null input (5423900), a
-      `$derivative` of one (5624903). This server returns an `explain`
-      document for each, `maxFunctionMemoryUsageBytes` and all, while its
-      `aggregate` of the same pipeline refuses. Found 2026-11-13 (RM-509).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm509.py::test_explain_reports_a_window_functions_error
-      Backlog-ID: RM-617
+- [ ] **An approximate `$median` / `$percentile` ranks the values, where
+      mongod interpolates its t-digest.** mongod 8.2.11 answers from
+      `TDigest` (delta 2000, a flush every 6000 values that merges
+      centroids, then interpolation between them): over 5999 values of
+      `(i * 7919) % 30011 * 0.37` it answers 5552.219999999999 and over
+      20000 5551.609969919785, where this server answers the discrete rank
+      of the values it keeps (5552.22, 5551.48). The port also owes the
+      memory a flush's centroids take (`group::tdigest_buffer` counts only
+      the buffer) and the merged centroids a spill writes
+      (`group_spill::tdigest_state` writes every value as a centroid of
+      weight one, mongod's format while its flush leaves values alone).
+      Found 2026-11-18 working RM-613.
+      Verify: tests/backlog/test_rm_found_2026_11_18_rm613.py::test_an_approximate_median_is_mongods_tdigest
+      Backlog-ID: RM-720
 - [ ] **`$derivative`'s partition cache holds too little.** mongod 8.2.11's
       `maxTotalMemoryUsageBytes` for a `$derivative` over ten documents of
       125 bytes is 1250 for any window with no lower end (the whole

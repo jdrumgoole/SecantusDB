@@ -796,14 +796,41 @@ def test_startup_writes_wiredtigers_own_messages(rust_mongo: Any) -> None:
         assert {"ts_sec", "ts_usec", "thread", "session_name", "msg"} <= message.keys()
 
 
-@pytest.mark.backlog("RM-305")
+@pytest.mark.backlog_fixed("RM-305")
 def test_startup_writes_the_recovery_timestamp_after_opening(rust_mongo: Any) -> None:
     """Right after `WiredTiger opened` (4795906) mongod 8.2.11 writes
     `WiredTiger recoveryTimestamp` (23987, `RECOVERY`) on `initandlisten`,
-    then the session-cache, spill WiredTiger and durable-catalog lines
-    (measured 2026-11-16 on a new dbpath). This server goes straight on."""
+    `{t: 0, i: 0}` on a new dbpath (measured 2026-11-16 and 2026-11-17).
+    This server went straight on until 2026-11-17."""
     ids = _startup_ids(rust_mongo)
     assert ids[ids.index(4795906) + 1] == 23987, ids
+    line = next(
+        e
+        for e in map(json.loads, rust_mongo.admin.command("getLog", "global")["log"])
+        if e["id"] == 23987
+    )
+    assert (line["s"], line["c"], line["msg"]) == ("I", "RECOVERY", "WiredTiger recoveryTimestamp")
+    assert line["attr"] == {"recoveryTimestamp": {"$timestamp": {"t": 0, "i": 0}}}, line
+
+
+@pytest.mark.backlog_fixed("RM-305")
+def test_startup_writes_the_session_cache_line_after_recovery(rust_mongo: Any) -> None:
+    """After `WiredTiger recoveryTimestamp` (23987) mongod 8.2.11 writes
+    `WiredTiger session cache max value has been set` (9086700), half its
+    `session_max` (measured 2026-11-17 and 2026-11-18 on a new dbpath). This
+    server went straight on until 2026-11-18."""
+    ids = _startup_ids(rust_mongo)
+    assert ids[ids.index(23987) + 1] == 9086700, ids
+
+
+@pytest.mark.backlog("RM-305")
+def test_startup_opens_the_spill_wiredtiger_after_the_session_cache(rust_mongo: Any) -> None:
+    """After `WiredTiger session cache max value has been set` (9086700)
+    mongod 8.2.11 writes `Opening spill WiredTiger` (10158000) and the spill
+    engine's own 22430 messages (measured 2026-11-18 on a new dbpath). This
+    server goes straight on."""
+    ids = _startup_ids(rust_mongo)
+    assert ids[ids.index(9086700) + 1] == 10158000, ids
 
 
 def _op_msg(sock: socket.socket, command: dict, request_id: int) -> dict:

@@ -100,8 +100,9 @@ def test_a_group_over_budget_without_disk_is_refused(rust_mongo: Any, mongod: An
 
 
 def test_an_sbe_group_is_not_held_to_the_classic_budget(rust_mongo: Any, mongod: Any) -> None:
-    # SBE's hash aggregation has a budget of its own, which 8.2.11 does not
-    # let a client change: the classic knob at 100 bytes leaves it running.
+    # SBE's hash aggregation has a budget of its own
+    # (`internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill`):
+    # the classic knob at 100 bytes leaves it running.
     def answer(client: Any) -> tuple:
         got = _group(client, False, False, budget=100)
         return got if got[0] != "ok" else ("ok", sorted(got[1], key=lambda d: d["_id"]))
@@ -372,3 +373,38 @@ def test_a_window_partition_spills_as_mongods_does(rust_mongo: Any, mongod: Any)
     theirs = _window_spills(mongod)
     assert theirs["spills"] > 1, theirs
     same(_window_spills(rust_mongo), theirs)
+
+
+SBE_BUDGET = "internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill"
+
+
+def _sbe_spill(client: Any) -> dict:
+    """An SBE `$group` `$push` of 300 1000-byte strings under its budget at
+    50000, set at runtime (mongod 8.2.11 takes it at runtime and at
+    startup): how often it spilled, what, and the spill table's size."""
+    client.drop_database("rm612")
+    db = client.rm612
+    db.c.insert_many([{"_id": i, "s": "x" * 1000, "n": i} for i in range(300)])
+    was = client.admin.command({"setParameter": 1, SBE_BUDGET: 50_000})["was"]
+    db.command({"profile": 2})
+    try:
+        out = list(db.c.aggregate([{"$group": {"_id": "$n", "t": {"$push": "$s"}}}], comment="sbe"))
+    finally:
+        db.command({"profile": 0})
+        client.admin.command({"setParameter": 1, SBE_BUDGET: was})
+    entry = db.system.profile.find_one({"command.comment": "sbe"}) or {}
+    keep = ("usedDisk", "groupSpills", "groupSpilledRecords", "groupSpilledDataStorageSize")
+    return {
+        "was": was,
+        "groups": sorted((d["_id"], len(d["t"])) for d in out),
+        **{k: entry.get(k) for k in keep},
+    }
+
+
+def test_an_sbe_group_spills_to_the_spill_engine(rust_mongo: Any, mongod: Any) -> None:
+    # RM-612: 7 spills of 300 records in all, into one table of the spill
+    # engine that stays in its cache (4096 bytes). `groupSpilledBytes` is
+    # still this server's (RM-612's remainder).
+    theirs = _sbe_spill(mongod)
+    assert theirs["groupSpills"] == 7, theirs  # not vacuous: it spilled
+    same(_sbe_spill(rust_mongo), theirs)

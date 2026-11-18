@@ -296,6 +296,12 @@ const SETTABLE: &[(&str, ParamKind)] = &[
         ParamKind::Int32AtLeast(0),
     ),
     ("internalQueryMaxPushBytes", ParamKind::IntAbove(0, true)),
+    // The SBE `$group`'s budget, settable at runtime and at startup on
+    // mongod 8.2.11 (measured 2026-11-18, RM-612).
+    (
+        "internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill",
+        ParamKind::IntAbove(0, false),
+    ),
     // How long a plan executor runs between yields, each its interrupt
     // check (`secantus_core::deadline::check`, RM-360).
     ("internalQueryExecYieldPeriodMS", ParamKind::Int32AtLeast(0)),
@@ -630,6 +636,10 @@ impl ServerParams {
     }
 }
 
+/// The SBE `$group`'s memory budget, which `--setParameter` also sets.
+const SBE_GROUP_BUDGET: &str =
+    "internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill";
+
 /// The parameters `--setParameter name=value` sets when the server starts,
 /// and whether each is a boolean (else a whole number): the logical session
 /// cache's, which mongod takes only at startup.
@@ -668,6 +678,22 @@ pub fn parse_startup_parameter(
         return crate::admission::execution::parse_startup(name, value, test_commands, &current)
             .map(|v| (name.to_string(), v))
             .map_err(|why: String| bad(why.as_str()));
+    }
+    if name == SBE_GROUP_BUDGET {
+        // A long above 0 (mongod 8.2.11, 2026-11-18): `Did not consume
+        // whole string.` for anything but digits, then `N is not greater
+        // than 0`.
+        let digits = value.strip_prefix(['-', '+']).unwrap_or(value);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad("Did not consume whole string."));
+        }
+        let n: i64 = value.parse().map_err(|_| bad("Value is out of range"))?;
+        if n <= 0 {
+            return Err(bad(&format!(
+                "Invalid value for parameter {name}: {n} is not greater than 0"
+            )));
+        }
+        return Ok((name.to_string(), Bson::Int64(n)));
     }
     let Some((_, boolean)) = STARTUP.iter().find(|(n, _)| *n == name) else {
         if crate::serverinfo::known_params(false).contains_key(name) {
@@ -1791,6 +1817,35 @@ mod tests {
             params.get("wiredTigerConcurrentWriteTransactions"),
             Some(Bson::Int32(10))
         );
+    }
+
+    /// The SBE `$group`'s budget at startup: a long above 0, refused in
+    /// mongod 8.2.11's words (measured 2026-11-18, RM-612).
+    #[test]
+    fn the_sbe_group_budget_is_a_positive_long_at_startup() {
+        let n = SBE_GROUP_BUDGET;
+        assert_eq!(
+            parse_startup_parameter(&format!("{n}=50000"), false, &[]),
+            Ok((n.to_string(), Bson::Int64(50_000)))
+        );
+        for (value, why) in [
+            ("abc", "Did not consume whole string.".to_string()),
+            ("1.5", "Did not consume whole string.".to_string()),
+            (
+                "0",
+                format!("Invalid value for parameter {n}: 0 is not greater than 0"),
+            ),
+            (
+                "-1",
+                format!("Invalid value for parameter {n}: -1 is not greater than 0"),
+            ),
+        ] {
+            assert_eq!(
+                parse_startup_parameter(&format!("{n}={value}"), false, &[]),
+                Err(format!("Bad value for parameter \"{n}\": {why}")),
+                "{value}"
+            );
+        }
     }
 
     #[test]

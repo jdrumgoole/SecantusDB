@@ -3370,6 +3370,9 @@ mod budget_tests {
                 seen.ids.extend(records.iter().map(|(id, _)| *id));
                 Ok(())
             }
+            fn read(&self, _: i64, _: usize) -> Result<Vec<Vec<u8>>, String> {
+                Err("a window never reads its spill back".to_string())
+            }
             fn storage_size(&self) -> Result<i64, String> {
                 Ok(4096)
             }

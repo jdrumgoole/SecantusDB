@@ -572,8 +572,14 @@ fn outcome(
                 }
                 // What a streamed read examined for this batch.
                 if let Some(e) = &ctx.exec_stats {
-                    entry.insert("keysExamined", e.keys_examined);
-                    entry.insert("docsExamined", e.docs_examined);
+                    entry.insert(
+                        "keysExamined",
+                        crate::opdebug::append_number(e.keys_examined),
+                    );
+                    entry.insert(
+                        "docsExamined",
+                        crate::opdebug::append_number(e.docs_examined),
+                    );
                 }
                 // A stage that spilled (RM-211): mongod 8.2.11 puts
                 // `usedDisk` here and its `$group`'s spill counts after
@@ -603,7 +609,7 @@ fn outcome(
                 if id == 0 {
                     entry.insert("cursorExhausted", true);
                 }
-                entry.insert("numYield", 0_i32);
+                entry.insert("numYield", int32(secantus_core::deadline::yields()));
                 entry.insert("nreturned", int32(returned()));
                 if spilled.sort_spills > 0 {
                     entry.insert("sortSpills", spilled.sort_spills);
@@ -643,28 +649,28 @@ fn outcome(
                     entry.insert("nModified", int32(modified.unwrap_or(0)));
                     entry.insert("nUpserted", i32::from(upserted));
                 }
-                entry.insert("numYield", 0_i32);
+                entry.insert("numYield", int32(secantus_core::deadline::yields()));
                 let found = !matches!(reply.get("value"), None | Some(Bson::Null));
                 entry.insert("nreturned", i32::from(found));
                 return;
             }
             "count" => {
-                entry.insert("numYield", 0_i32);
+                entry.insert("numYield", int32(secantus_core::deadline::yields()));
                 entry.insert("nreturned", 1_i32);
                 return;
             }
             "distinct" => {
-                entry.insert("numYield", 0_i32);
+                entry.insert("numYield", int32(secantus_core::deadline::yields()));
                 let values = reply.get_array("values").map_or(0, |v| v.len() as i64);
                 entry.insert("nreturned", int32(values));
                 return;
             }
             _ => {}
         }
-        entry.insert("numYield", 0_i32);
+        entry.insert("numYield", int32(secantus_core::deadline::yields()));
         return;
     }
-    entry.insert("numYield", 0_i32);
+    entry.insert("numYield", int32(secantus_core::deadline::yields()));
     failure(reply, entry);
 }
 
@@ -680,8 +686,14 @@ fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: 
         entry.insert("queryShapeHash", shape);
     }
     if let (true, Some(e)) = (ok, &ctx.exec_stats) {
-        entry.insert("keysExamined", e.keys_examined);
-        entry.insert("docsExamined", e.docs_examined);
+        entry.insert(
+            "keysExamined",
+            crate::opdebug::append_number(e.keys_examined),
+        );
+        entry.insert(
+            "docsExamined",
+            crate::opdebug::append_number(e.docs_examined),
+        );
         // A `distinct` of a view ran an aggregation whose cursor it read to
         // the end (RM-493; measured 8.2.11).
         if e.exhausted {
@@ -1112,8 +1124,8 @@ impl Statement {
             out.insert("planCacheKey", key.clone());
         }
         if let (Some((keys, docs)), false) = (self.ran.examined, failed) {
-            out.insert("keysExamined", keys);
-            out.insert("docsExamined", docs);
+            out.insert("keysExamined", crate::opdebug::append_number(keys));
+            out.insert("docsExamined", crate::opdebug::append_number(docs));
         }
         if self.ran.oplog_slot_micros > 0 {
             out.insert(
@@ -1144,14 +1156,14 @@ impl Statement {
                 entry.insert("nMatched", int32(*matched));
                 entry.insert("nModified", int32(*modified));
                 entry.insert("nUpserted", int32(*upserted));
-                entry.insert("numYield", 0_i32);
+                entry.insert("numYield", int32(secantus_core::deadline::yields()));
             }
             StatementOutcome::Deleted(n) => {
                 entry.insert("ndeleted", int32(*n));
-                entry.insert("numYield", 0_i32);
+                entry.insert("numYield", int32(secantus_core::deadline::yields()));
             }
             StatementOutcome::Failed(error) => {
-                entry.insert("numYield", 0_i32);
+                entry.insert("numYield", int32(secantus_core::deadline::yields()));
                 let reply = doc! {
                     "errmsg": error.get_str("errmsg").unwrap_or(""),
                     "code": error.get_i32("code").unwrap_or(0),
@@ -1484,6 +1496,9 @@ impl<'a> Statements<'a> {
             crate::slowop::statement_line("WRITE", statement.log_attributes(), worked);
         }
         if self.profiled {
+            // mongod writes the statement's entry now, under locks its
+            // command's line and later statements count.
+            crate::lock_manager::note_statement_profile_write();
             STATEMENTS.with(|s| {
                 if let Some(list) = s.borrow_mut().as_mut() {
                     list.push(statement);

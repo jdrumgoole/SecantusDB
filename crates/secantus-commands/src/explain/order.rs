@@ -595,6 +595,40 @@ impl plan::Whole for Lazy<'_> {
     }
 }
 
+/// An explain's trial (RM-610): over what the candidate plans reach, read
+/// from the store, as mongod's is; `fallback` when the plans' scans cannot
+/// be read so.
+pub(crate) struct Reaching<'a> {
+    lazy: Lazy<'a>,
+    fallback: &'a dyn plan::Whole,
+}
+
+impl<'a> Reaching<'a> {
+    /// `None` when the trial cannot run the filters itself
+    /// ([`trial_runs_filters`]).
+    pub(crate) fn new(
+        storage: &'a dyn Storage,
+        ask: &'a Ask<'a>,
+        query: &Query,
+        catalog: &[Arc<super::IndexInfo>],
+        canonical: &Document,
+        fallback: &'a dyn plan::Whole,
+    ) -> Option<Reaching<'a>> {
+        trial_runs_filters(ask, query, catalog).then(|| Reaching {
+            lazy: Lazy::new(storage, ask, None, catalog, canonical),
+            fallback,
+        })
+    }
+}
+
+impl plan::Whole for Reaching<'_> {
+    fn docs(&self, plans: &[&Node], works: i64) -> Option<plan::Docs<'_>> {
+        self.lazy
+            .docs(plans, works)
+            .or_else(|| self.fallback.docs(plans, works))
+    }
+}
+
 /// The indexes `ask` may be planned over: the collection's, or the ones an
 /// index filter set for its shape leaves.
 pub(crate) fn ask_catalog(

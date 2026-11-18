@@ -771,6 +771,11 @@ fn listed(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
             Bson::Int64(104_857_600),
         ),
         (
+            "internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill",
+            true,
+            Bson::Int64(104_857_600),
+        ),
+        (
             "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
             true,
             Bson::Int64(104_857_600),

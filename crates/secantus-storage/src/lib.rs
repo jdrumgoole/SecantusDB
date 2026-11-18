@@ -237,6 +237,10 @@ pub struct OpenRecord {
     /// as `WiredTiger message` (22430) between `Opening WiredTiger` and
     /// `WiredTiger opened`.
     pub wt_messages: Vec<String>,
+    /// WiredTiger's recovery timestamp (`get=recovery`) right after the
+    /// open: the stable timestamp of the checkpoint it opened from, 0 when
+    /// none (mongod's `WiredTiger recoveryTimestamp`, 23987).
+    pub recovery_timestamp: u64,
     /// How long the whole open took after the lock file: WiredTiger, the
     /// tables, the recovery and the upgrades (mongod's
     /// `createStorageEngineMillis`).
@@ -8379,6 +8383,11 @@ impl Storage {
         let conn = Arc::new(Connection::open(home, config)?);
         let wt_open = wt_started.elapsed();
         let wt_messages = conn.take_messages();
+        // mongod reads the checkpoint's stable timestamp back right after
+        // the open and logs it as `WiredTiger recoveryTimestamp` (23987);
+        // WiredTiger answers in hex, `0` when there is none.
+        let recovery_timestamp = u64::from_str_radix(&conn.query_timestamp("get=recovery")?, 16)
+            .map_err(|e| StorageError::Internal(format!("recovery timestamp: {e}")))?;
         // An existing store's mode is the one its tables were created with,
         // read from WiredTiger's own metadata before anything is created: a
         // logged store records no mode of its own, and neither does a
@@ -8583,6 +8592,7 @@ impl Storage {
                 wt_config: config.to_string(),
                 wt_open,
                 wt_messages,
+                recovery_timestamp,
                 open: Duration::ZERO,
             },
             lock_file,
@@ -21147,6 +21157,9 @@ impl Storage {
         if let Some(pages) = self.bounded_span_pages(session, db, coll, filter)? {
             return Ok(CandidatePages::Spans(pages));
         }
+        if let Some(pages) = self.residual_pages(session, db, coll, filter)? {
+            return Ok(pages);
+        }
         let routed = match self.try_index_id_keys(session, db, coll, filter)? {
             Some(r) => Some(r),
             None => self.try_residual_index_id_keys(session, db, coll, filter)?,
@@ -21187,6 +21200,55 @@ impl Storage {
                 self.rows_by_recordids(session, db, coll, rids)
             }
         }
+    }
+
+    /// [`Self::try_residual_index_id_keys`], not yet read, for a filter of
+    /// several fields each an operator clause (`{a: {$gte: 0}, b: {$gte:
+    /// 0}}`), which no index covers whole: the same sub-filters in the same
+    /// order, a sub-filter the bounded read serves read a page at a time
+    /// (RM-390), any other read whole as before. `None` for a filter the
+    /// router may cover whole (an equality, a partial index's residual),
+    /// which keeps its own read.
+    fn residual_pages(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<CandidatePages>> {
+        // With every clause an operator document, neither the compound
+        // equality read nor the compound prefix-and-range read applies
+        // (both need an equality), nor geo (one field): only the partial
+        // index's residual match, checked here without a read.
+        if filter.len() < 2
+            || filter.keys().any(|k| k.starts_with('$'))
+            || !filter.values().all(|v| matches!(v, Bson::Document(_)))
+            || self
+                .single_field_partial_residual_match(session, db, coll, filter)?
+                .is_some()
+        {
+            return Ok(None);
+        }
+        let subs = residual_subfilters(filter);
+        let wide = WIDE_OK.with(|w| w.get());
+        for pass_wide in [false, true] {
+            if pass_wide && !wide {
+                break;
+            }
+            for sub in &subs {
+                if let Some(pages) = with_wide(pass_wide, || {
+                    self.bounded_span_pages(session, db, coll, sub)
+                })? {
+                    return Ok(Some(CandidatePages::Spans(pages)));
+                }
+                if let Some(ids) =
+                    with_wide(pass_wide, || self.try_index_id_keys(session, db, coll, sub))?
+                {
+                    return Ok(Some(candidate_rows(ids)));
+                }
+            }
+        }
+        Ok(Some(CandidatePages::scan(false)))
     }
 
     /// The router's read for a filter of one field whose predicate
@@ -23605,6 +23667,11 @@ impl Storage {
             }
             let mut idx = 0usize;
             while idx < batch.len() {
+                // A batch split by its time target resumes in a later
+                // `work()` call, before which the executor may yield.
+                if idx > 0 && batched {
+                    deadline::yield_point().map_err(|_| StorageError::MaxTimeExpired)?;
+                }
                 let (consumed, d, stopped) =
                     self.retry_write_conflicts("delete_matching_chunk", || {
                         let session = self.op_session()?;
@@ -23617,6 +23684,7 @@ impl Storage {
                                 filter,
                                 let_vars,
                                 coll_opt,
+                                batched,
                             )
                         })
                     })?;
@@ -23753,7 +23821,13 @@ impl Storage {
         filter: &Document,
         let_vars: &Document,
         coll_opt: Option<&Collation>,
+        batched: bool,
     ) -> Result<(usize, usize, Option<StorageError>)> {
+        // mongod's `BatchedDeleteStage::_deleteBatch` stops a batch once it
+        // has run `batchedDeletesTargetBatchTimeMS` (5 ms), commits what it
+        // deleted and finishes the rest in its next `work()` call (RM-609).
+        const TARGET_BATCH_TIME: std::time::Duration = std::time::Duration::from_millis(5);
+        let started = std::time::Instant::now();
         // Large scalar `$in` / `$nin` lists hashed once for the scan.
         let in_sets = secantus_core::query::InSets::prepare(filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
@@ -23780,6 +23854,9 @@ impl Storage {
         for (recordid, scanned, yielded) in rids {
             let recordid = *recordid;
             if deleted >= WRITE_CHUNK_MAX_DOCS || chunk_bytes >= WRITE_CHUNK_MAX_BYTES {
+                break;
+            }
+            if batched && consumed > 0 && started.elapsed() >= TARGET_BATCH_TIME {
                 break;
             }
             consumed += 1;

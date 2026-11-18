@@ -88,10 +88,12 @@ def test_a_contested_find_and_write_of_one_cost_what_they_return(
     assert _growth(rust_mongo, names) == theirs
 
 
-@pytest.mark.backlog("RM-610")
+@pytest.mark.backlog_fixed("RM-610")
 def test_a_contested_read_costs_what_it_returns(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod's cost of an explain at queryPlanner is flat in the
-    collection's size; this server's grows with it."""
+    collection's size; this server's grew with it, as explain read the
+    whole collection first, until RM-610 tried its plans over what they
+    reach."""
     names = ("explain at queryPlanner",)
     theirs = _growth(mongod_rs, names)
     assert all(theirs.values()), theirs

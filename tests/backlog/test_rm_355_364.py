@@ -523,12 +523,18 @@ def test_a_write_reports_mongods_locks_and_flow_control(
 
 #: Writes whose locks are not mongod's yet (RM-357's remainder).
 _DIVERGING_WRITES = {
-    # A delete that writes nothing reads the latest optime twice (the write
-    # path and the command), and keeps its session row under its own locks.
-    "delete matching nothing": lambda d: _w1(d).delete_one({"_id": 999}),
-    # Each statement keeps its session row under its own locks, and takes
-    # its round as it runs: this server takes every statement's first.
+    # A retryable statement keeps its session row under its own locks.
     "update": lambda d: _w1(d).update_one({"_id": 1}, {"$set": {"q": 1}}),
+    "$out": lambda d: list(_w1(_plain(d)).aggregate([{"$match": {}}, {"$out": "o"}])),
+}
+
+
+#: Writes whose statements are profiled: each statement's entry is written
+#: on its command's locker, after the statement's line.
+_PROFILED_STATEMENTS = {
+    # A delete that writes nothing reads the latest optime twice (the write
+    # path and the command).
+    "delete matching nothing": lambda d: _w1(d).delete_one({"_id": 999}),
     "update of two statements": lambda d: _plain(d).command(
         "update",
         "c",
@@ -538,8 +544,22 @@ _DIVERGING_WRITES = {
         ],
         writeConcern={"w": 1},
     ),
-    "$out": lambda d: list(_w1(_plain(d)).aggregate([{"$match": {}}, {"$out": "o"}])),
 }
+
+
+@pytest.mark.backlog_fixed("RM-357")
+@pytest.mark.parametrize("name", list(_PROFILED_STATEMENTS))
+def test_a_profiled_statement_counts_its_entry_in_its_commands_locks(
+    rust_mongo: Any, mongod_rs: Any, name: str
+) -> None:
+    """mongod 8.2.11 writes an update or delete statement's profile entry on
+    its command's locker after the statement's line: the command's line and
+    each later statement's count one `Metadata: {W: 1}` and one more global,
+    database and collection IX for it (measured 2026-11-07). This server
+    counted no lock for the entry."""
+    answers = _write_locks(rust_mongo, mongod_rs, _PROFILED_STATEMENTS[name])
+    assert answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
 
 
 #: findAndModify removes without a `txnNumber`, found and not.
@@ -1161,6 +1181,16 @@ _UNCOUNTED = {
         seed,
         lambda d: d.c.find_one_and_update({"_id": 1}, {"$set": {"q": 1}}),
     ),
+    # A `$sort` after an SBE `$group`, asked for no first batch: mongod
+    # plans it (5); this server's line prints none, and its `getMore` 5
+    # with two global IS to mongod's 4 and one (measured 8.2.11 2026-11-18).
+    "aggregate of no batch of groups": (
+        "aggregate",
+        seed,
+        lambda d: list(
+            d.c.aggregate([{"$group": {"_id": "$y"}}, {"$sort": {"_id": 1}}], batchSize=0)
+        ),
+    ),
     # Over a collection with no index of its own to build, so that the
     # setup's build cannot log a `createIndexes` line of its own.
     "createIndexes": (
@@ -1516,18 +1546,58 @@ def test_a_sorted_time_series_aggregate_counts_what_it_examined(
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-363")
+@pytest.mark.backlog_fixed("RM-363")
+@pytest.mark.parametrize(
+    "pipeline",
+    [
+        [{"$group": {"_id": "$m", "n": {"$sum": 1}}}],
+        [{"$group": {"_id": "$m", "n": {"$count": {}}}}, {"$sort": {"_id": 1}}],
+    ],
+    ids=["sum", "count then sort"],
+)
 def test_a_grouped_time_series_read_counts_what_it_examined(
-    rust_mongo: Any, mongod_rs: Any
+    rust_mongo: Any, mongod_rs: Any, pipeline: list
 ) -> None:
-    """mongod 8.2.11's line for an `aggregate` that groups five buckets
-    counts what its cursor stage examined. This server reads a time-series
-    collection whole under a `$group`, and counts nothing."""
-    pipeline = [{"$group": {"_id": "$m", "n": {"$sum": 1}}}]
+    """mongod 8.2.11 runs a `$group` on the meta field that only counts over
+    the buckets, in the classic engine, and its line counts the five its
+    cursor stage examined. This server read the collection whole under a
+    `$group`, and counted nothing, until it read such a pipeline through
+    its cursor stage (RM-363)."""
     got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.aggregate(pipeline)), _series)
     answers = {s: _counts(_line(lines, "aggregate")) for s, (lines, _) in got.items()}
     assert "docsExamined" in answers["mongod"]
     assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog("RM-363")
+def test_a_counted_time_series_read_counts_what_it_examined(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's line for `count_documents` over five buckets counts
+    what it examined. This server reads a time-series collection whole
+    under that `$group`, and counts nothing."""
+    got = _both(rust_mongo, mongod_rs, lambda d: d.ts.count_documents({}), _series)
+    answers = {s: _counts(_line(lines, "aggregate")) for s, (lines, _) in got.items()}
+    assert "docsExamined" in answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog("RM-719")
+def test_a_meta_group_summing_one_point_zero_answers_an_int(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 rewrites a `$group` on the meta field that sums `1.0`
+    to a sum of each bucket's `control.count`, and answers an int (60);
+    this server sums 1.0 per measurement and answers a double (60.0)."""
+    pipeline = [{"$group": {"_id": "$m", "n": {"$sum": 1.0}}}, {"$sort": {"_id": 1}}]
+    got = {}
+    for side, client in (("rust", rust_mongo), ("mongod", mongod_rs)):
+        db = client[fresh("rmsum")]
+        _series(db)
+        docs = list(db.ts.aggregate(pipeline))
+        client.drop_database(db.name)
+        got[side] = [(d["_id"], d["n"], type(d["n"]).__name__) for d in docs]
+    assert got["rust"] == got["mongod"]
 
 
 @pytest.mark.backlog_fixed("RM-363")

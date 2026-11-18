@@ -228,6 +228,25 @@ PIPELINES: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any], tuple[str
     "aggregate of a first batch, full": (_documents(101), _pipeline([_ADD]), _PIPELINE),
     "aggregate and its getMores": (_documents(1000), _pipeline([_ADD]), _PIPELINE),
     "aggregate in small batches": (_documents(300), _pipeline([_ADD], batchSize=50), _PIPELINE),
+    # A first batch of none plans the pipeline's front and reads nothing:
+    # 5 on mongod 8.2.11, 6 with an index scan, as a `find` of no batch
+    # (measured 2026-11-18); its `getMore` reads it all.
+    "aggregate of a first batch of none": (seed, _pipeline([], batchSize=0), _PIPELINE),
+    "aggregate of no batch through its cursor stage": (
+        seed,
+        _pipeline([_ADD], batchSize=0),
+        _PIPELINE,
+    ),
+    "aggregate of no batch over an index": (
+        seed,
+        _pipeline([{"$match": {"x": {"$gte": 4}}}], batchSize=0),
+        _PIPELINE,
+    ),
+    "aggregate of no batch sorting": (
+        seed,
+        _pipeline([{"$sort": {"y": 1}}], batchSize=0),
+        _PIPELINE,
+    ),
     "aggregate of several stages": (
         _documents(300),
         _pipeline(

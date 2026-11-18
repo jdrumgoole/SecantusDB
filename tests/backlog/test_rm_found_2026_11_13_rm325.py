@@ -93,7 +93,9 @@ def _mongod_with(*extra: str) -> Iterator[Any]:
 def test_an_sbe_group_spills_as_mongods(tmp_path: Any) -> None:
     """mongod 8.2.11 started with the SBE `$group`'s budget at 50000 spills a
     `$push` of 300 1000-byte strings 7 times, 312300 bytes, into its spill
-    engine (4096 on disk). This server refuses the startup parameter."""
+    engine (4096 on disk). This server takes the parameter and spills to its
+    spill engine the same 7 times (RM-612's first part), but counts 306900
+    bytes, its memory estimate."""
     with _mongod_with("--setParameter", SBE_BUDGET) as mongod:
         expected = _sbe_group_spill(mongod)
     with rust_mongo_server(tmp_path, "--setParameter", SBE_BUDGET) as rust:
@@ -134,12 +136,13 @@ def _median_spilled_bytes(client: Any) -> Any:
     )
 
 
-@pytest.mark.backlog("RM-613")
+@pytest.mark.backlog_fixed("RM-613")
 def test_a_median_spills_mongods_state(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's classic `$group` spills each group's `$median` as its
     t-digest: 300 groups of one value each, a 5561-byte spill file. This
-    server spills the values it keeps, 2948. (`groupSpilledBytes`, 84000, is
-    the memory estimate at each spill, mongod's since RM-502.)"""
+    server spilled the values it kept, 2948, until it wrote the digest too.
+    (`groupSpilledBytes`, 84000, is the memory estimate at each spill,
+    mongod's since RM-502.)"""
     assert _median_spilled_bytes(rust_mongo) == _median_spilled_bytes(mongod)
 
 
@@ -150,10 +153,10 @@ def _spill_engine_status(client: Any) -> Any:
     return {"storageSize": section.get("storageSize"), "uri": section.get("uri")}
 
 
-@pytest.mark.backlog("RM-614")
+@pytest.mark.backlog_fixed("RM-614")
 def test_server_status_reports_the_spill_engine(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `serverStatus` has a `spillWiredTiger` section from
     startup -- the spill engine's statistics, `storageSize` 0 while nothing
-    is spilled (`spillWiredTigerServerStatusVerbosity` 1). This server's has
+    is spilled (`spillWiredTigerServerStatusVerbosity` 1). This server's had
     none."""
     assert _spill_engine_status(rust_mongo) == _spill_engine_status(mongod)

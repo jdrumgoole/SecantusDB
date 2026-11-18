@@ -504,41 +504,61 @@ pub(crate) fn pipeline_canonical(coll: &str, pipeline: &[Bson]) -> PipelineQuery
     }
 }
 
-/// Everything read from storage to plan one collection.
+/// Everything read from storage to plan one collection. Its documents are
+/// read only when something asks for them: a trial that reads what its
+/// plans reach does not (RM-610).
 struct Target {
     exists: bool,
-    docs: Vec<Document>,
+    docs: std::cell::OnceCell<Vec<Document>>,
     catalog: Vec<Arc<IndexInfo>>,
+    db: String,
+    coll: String,
+}
+
+impl Target {
+    /// The whole collection, read from `storage` the first time it is
+    /// asked for.
+    fn docs(&self, storage: &dyn crate::storage::Storage) -> Result<&[Document], CommandError> {
+        if let Some(docs) = self.docs.get() {
+            return Ok(docs);
+        }
+        let docs = if self.exists {
+            let raw = storage
+                .find_collated(
+                    &self.db,
+                    &self.coll,
+                    &Document::new(),
+                    None,
+                    None,
+                    None,
+                    &Document::new(),
+                )
+                .map_err(command_error)?;
+            decode_docs(raw)?
+        } else {
+            vec![]
+        };
+        Ok(self.docs.get_or_init(|| docs))
+    }
 }
 
 fn target(ctx: &CommandContext, coll: &str) -> Result<Target, CommandError> {
     let storage = ctx.storage()?;
     let db = &ctx.db_name;
     let exists = storage.collection_exists(db, coll).unwrap_or(false);
-    if !exists {
-        return Ok(Target {
-            exists,
-            docs: vec![],
-            catalog: vec![],
-        });
-    }
-    let raw = storage
-        .find_collated(
-            db,
-            coll,
-            &Document::new(),
-            None,
-            None,
-            None,
-            &Document::new(),
-        )
-        .map_err(command_error)?;
-    let docs = decode_docs(raw)?;
-    let catalog = catalog(storage, db, coll, Some(&docs)).map_err(command_error)?;
+    // The multikey paths from the store's own record of them, as a find's
+    // planner reads them.
+    let catalog = if exists {
+        catalog(storage, db, coll, None).map_err(command_error)?
+    } else {
+        vec![]
+    };
     Ok(Target {
         exists,
-        docs,
+        docs: std::cell::OnceCell::new(),
         catalog,
+        db: db.clone(),
+        coll: coll.to_string(),
     })
 }
 
@@ -637,20 +657,53 @@ fn catalog(
     Ok(catalog)
 }
 
-/// The collection `explain` already read, for the planner to count over.
+/// The collection `explain` reads whole, for the planner to count over;
+/// an error reading it is kept for the caller to return.
 struct Held<'a> {
-    docs: &'a [Document],
+    t: &'a Target,
+    storage: &'a dyn crate::storage::Storage,
     collation: Option<&'a Collation>,
+    failed: std::cell::RefCell<Option<CommandError>>,
+}
+
+impl<'a> Held<'a> {
+    fn new(
+        t: &'a Target,
+        storage: &'a dyn crate::storage::Storage,
+        collation: Option<&'a Collation>,
+    ) -> Held<'a> {
+        Held {
+            t,
+            storage,
+            collation,
+            failed: Default::default(),
+        }
+    }
+
+    /// The error reading the collection, if one was met.
+    fn check(&self) -> Result<(), CommandError> {
+        match self.failed.borrow_mut().take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
 }
 
 impl plan::Whole for Held<'_> {
     fn docs(&self, _plans: &[&Node], _works: i64) -> Option<plan::Docs<'_>> {
+        let docs = match self.t.docs(self.storage) {
+            Ok(docs) => docs,
+            Err(e) => {
+                self.failed.borrow_mut().get_or_insert(e);
+                return None;
+            }
+        };
         Some(plan::Docs {
-            docs: std::borrow::Cow::Borrowed(self.docs),
+            docs: std::borrow::Cow::Borrowed(docs),
             known: None,
             collation: self.collation,
             reach: None,
-            total: Some(self.docs.len()),
+            total: Some(docs.len()),
         })
     }
 }
@@ -714,19 +767,20 @@ fn plan_for(
             ));
         }
     }
-    let whole = Held {
-        docs: &t.docs,
+    let held = Held::new(t, ctx.storage()?, collation);
+    let no_vars = Document::new();
+    let ask = order::Ask {
+        db: &ctx.db_name,
+        coll: &s.coll,
+        filter: &s.filter,
+        sort: s.sort.as_ref(),
+        hint: None,
         collation,
+        vars: &no_vars,
+        limit: 0,
+        asked: Default::default(),
     };
-    let trial = plan::Trial {
-        total: Some(t.docs.len()),
-        matched: None,
-        whole: &whole,
-        ranked: Default::default(),
-        cache: None,
-        cached_ran: Default::default(),
-    };
-    let q = Query {
+    let mut q = Query {
         canonical,
         sort: s.sort.as_ref(),
         projection: s.projection.as_ref(),
@@ -742,8 +796,25 @@ fn plan_for(
         wanted: None,
         sbe,
         implies: &implies,
-        trial: Some(&trial),
+        trial: None,
     };
+    // A trial that runs the filters itself reads only what its plans reach,
+    // as mongod's does (RM-610); otherwise the whole collection.
+    let reaching = (s.hint.is_none() && s.min_max.is_none())
+        .then(|| order::Reaching::new(storage, &ask, &q, &t.catalog, canonical, &held))
+        .flatten();
+    let trial = plan::Trial {
+        total: None,
+        matched: None,
+        whole: match &reaching {
+            Some(r) => r as &dyn plan::Whole,
+            None => &held,
+        },
+        ranked: Default::default(),
+        cache: None,
+        cached_ran: Default::default(),
+    };
+    q.trial = Some(&trial);
     let node = match &s.kind {
         Kind::Find => plan::plan(&q, &t.catalog),
         Kind::Count => plan::count(&q, &t.catalog),
@@ -755,6 +826,7 @@ fn plan_for(
             plan::write(&q, &t.catalog, true, *multi, false, *returns)
         }
     };
+    held.check()?;
     let mut ranked = std::mem::take(&mut *trial.ranked.borrow_mut());
     // A later stage reading each document's sort key, with no sort of the
     // query's own to keep one, has the query compute it (RM-428).
@@ -1029,21 +1101,20 @@ fn distinct_group(
     t: &Target,
     ctx: &CommandContext,
 ) -> Result<Option<(Shape, Node, Vec<plan::Ranked>)>, CommandError> {
-    let whole = Held {
-        docs: &t.docs,
-        collation,
-    };
+    let whole = Held::new(t, ctx.storage()?, collation);
     let trial = plan::Trial {
-        total: Some(t.docs.len()),
+        total: None,
         matched: None,
         whole: &whole,
         ranked: Default::default(),
         cache: None,
         cached_ran: Default::default(),
     };
-    distinct_group_with(s, collation, &t.catalog, Some(&trial), |asked| {
+    let grouped = distinct_group_with(s, collation, &t.catalog, Some(&trial), |asked| {
         plan_for(asked, canonical, collation, t, ctx, false)
-    })
+    })?;
+    whole.check()?;
+    Ok(grouped)
 }
 
 /// The read of a pipeline that opens with a `$group` mongod answers from a
@@ -2085,7 +2156,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                 pushed: front.pushed,
                 tail: &front.tail,
                 is_cached,
-                docs: &t.docs,
+                docs: t.docs(storage)?,
                 stage_counts: &stage_counts,
                 cursor_pulled,
                 stage_spills: &stage_spills,
@@ -2150,7 +2221,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                 pushed: added.len(),
                 tail: &[],
                 is_cached,
-                docs: &t.docs,
+                docs: t.docs(storage)?,
                 stage_counts: &stage_counts,
                 cursor_pulled,
                 stage_spills: &stage_spills,
@@ -2158,7 +2229,8 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             return sbe_reply(r, planner, &sbe, verbosity, ctx);
         }
     }
-    let stats = wanted.then(|| {
+    let all = if wanted { Some(t.docs(storage)?) } else { None };
+    let stats = all.map(|all| {
         let (multi, upsert, returns) = match &s.kind {
             Kind::Update {
                 multi,
@@ -2169,7 +2241,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             _ => (true, false, false),
         };
         let env = exec::Env {
-            docs: &t.docs,
+            docs: all,
             collation: collation.as_ref(),
             skip: s.skip,
             limit: s.limit,
@@ -3066,6 +3138,32 @@ fn aggregate(
                 && e.errmsg.starts_with("$geoNear requires a geo index")
                 && e.errmsg.ends_with(&format!(".{DRY} does not exist")) => {}
         other => other?,
+    }
+    // mongod runs the pipeline for `executionStats`, and a window
+    // function's run-time error is the executor's, not an explain
+    // document (measured 8.2.11: codes 2, 5423900, 5624903; RM-617).
+    if verbosity != Verbosity::QueryPlanner
+        && target_coll.is_some()
+        && pipeline.iter().any(|s| s.contains_key("$setWindowFields"))
+    {
+        let mut run = checked.clone();
+        run.insert(
+            "aggregate",
+            inner.get("aggregate").cloned().unwrap_or(Bson::Null),
+        );
+        run.insert("cursor", doc! { "batchSize": i32::MAX });
+        let reply = order::uncounted(|| crate::aggregate::aggregate_inline(&run, ctx))?;
+        if let Some(id) = reply
+            .get_document("cursor")
+            .ok()
+            .and_then(|c| c.get("id"))
+            .and_then(as_i64)
+            .filter(|id| *id != 0)
+        {
+            if let Ok(cursors) = ctx.cursors() {
+                cursors.kill(&[id]);
+            }
+        }
     }
     let db = ctx.db_name.clone();
     if inline {

@@ -31,14 +31,15 @@ def _delete_many_yields(client: Any) -> Any:
     return found[-1].get("numYield") if found else None
 
 
-@pytest.mark.backlog("RM-609")
+@pytest.mark.backlog_fixed("RM-609")
 def test_a_delete_many_profile_entry_counts_its_yields(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod's executor yields once its yield period (10 ms) has passed,
     before a `work()` call: a deleteMany of three slow documents yields
     before staging the second and third, before the call that finds the
     end, and between the documents of the batch it deletes, which it
     splits once the batch has run `batchedDeletesTargetBatchTimeMS` (5 ms):
-    `numYield: 5`. This server's profile entry for a delete says 0."""
+    `numYield: 5`. This server's profile entry for a delete said 0, a
+    literal, and its batch did not split on time (RM-609)."""
     theirs = _delete_many_yields(mongod_rs)
     assert theirs == 5, theirs
     assert _delete_many_yields(rust_mongo) == theirs

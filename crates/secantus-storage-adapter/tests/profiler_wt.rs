@@ -454,8 +454,8 @@ fn update_and_delete_are_profiled_by_statement() {
         assert_eq!(keys(&profiled[0]), want);
         assert_eq!(
             (
-                profiled[0].get_i64("keysExamined"),
-                profiled[0].get_i64("docsExamined"),
+                profiled[0].get_i32("keysExamined"),
+                profiled[0].get_i32("docsExamined"),
                 profiled[0].get_str("planSummary"),
             ),
             (Ok(1), Ok(1), Ok("IXSCAN { _id: 1 }"))
