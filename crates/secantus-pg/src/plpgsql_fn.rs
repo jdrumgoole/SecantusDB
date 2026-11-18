@@ -2014,6 +2014,47 @@ impl Interp<'_> {
         }
         let scan = pg_query::scan(text).map_err(|e| PlError::new("42601", e.to_string()))?;
         let tokens = scan.tokens;
+        // PL/pgSQL substitutes a variable through the parser's ColumnRef
+        // hook, and a FROM item's alias is no column reference: `from
+        // s.st r` keeps its alias `r` though a record variable shares the
+        // name (RP-982). Each aliased relation's alias token, by byte
+        // offset: the relation's name from its location, an optional AS,
+        // then the alias.
+        let alias_starts: std::collections::HashSet<u32> = pg_query::parse(text)
+            .ok()
+            .map(|p| {
+                p.protobuf
+                    .nodes()
+                    .into_iter()
+                    .filter_map(|(n, _, _, _)| match n {
+                        pg_query::NodeRef::RangeVar(rv) if rv.alias.is_some() => {
+                            u32::try_from(rv.location).ok()
+                        }
+                        _ => None,
+                    })
+                    .filter_map(|at| {
+                        let mut j = tokens.iter().position(|t| t.start as u32 == at)?;
+                        while tokens
+                            .get(j + 1)
+                            .and_then(|t| text.get(t.start as usize..t.end as usize))
+                            == Some(".")
+                        {
+                            j += 2;
+                        }
+                        j += 1;
+                        let word = |k: usize| {
+                            tokens
+                                .get(k)
+                                .and_then(|t| text.get(t.start as usize..t.end as usize))
+                        };
+                        if word(j).is_some_and(|w| w.eq_ignore_ascii_case("as")) {
+                            j += 1;
+                        }
+                        tokens.get(j).map(|t| t.start as u32)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let tok = |i: usize| -> Option<&str> {
             let t = tokens.get(i)?;
             text.get(t.start as usize..t.end as usize)
@@ -2143,7 +2184,9 @@ impl Interp<'_> {
                             }
                         }
                     }
-                } else if !matches!(next, Some("(" | "=>" | ":=")) {
+                } else if !matches!(next, Some("(" | "=>" | ":="))
+                    && !alias_starts.contains(&(t.start as u32))
+                {
                     // A named argument's name (`p(r => r)`) is not a column
                     // reference, so not a variable either.
                     if let Some((v, ty)) = self.scalar(&name) {

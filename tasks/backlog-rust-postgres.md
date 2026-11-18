@@ -2675,17 +2675,6 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 `_SETUP` in `tests/backlog/test_rp_found_rp689.py`: `t689(a d689, v
 varchar(3), w dv689, c char(3))`, `d689` an `int` with `check (value > 0)`.
 
-- [ ] **A FROM alias that names a record variable is substituted.** With
-      `declare r t689`, `(select r.a from s689.st r limit 1)` (`s689.st`
-      has no column `a`) is NULL on PostgreSQL 15.19: `r.a` is the
-      variable's field, and the alias `r` is no column reference. Here the
-      binder (`Interp::bind` in `plpgsql_fn.rs`, which works on tokens) also
-      replaces the alias token with the record's value, so the subquery is
-      42601 `syntax error at or near "$2"`. A fix binds only the tokens the
-      parse tree has as column references (RP-838 added such a parse of the
-      bound text, `check_column_conflicts`).
-      Verify: tests/backlog/test_rp_found_rp689.py::test_a_from_alias_a_record_variable_shares_is_not_the_variable
-      Backlog-ID: RP-982
 
 
 ## Found while working RP-845 (2026-11-11)
