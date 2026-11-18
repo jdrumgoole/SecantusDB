@@ -1123,16 +1123,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       server refuses the `$meta` with code 2. Found 2026-11-13 (RM-521).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm521.py::test_a_facet_sort_key_is_empty
       Backlog-ID: RM-625
-- [ ] **A `$unionWith` ends the sort key.** mongod 8.2.11 keeps the outer
-      documents' key through a `$unionWith`, so a rank behind it ranks them
-      by the `$sort` in front, and the documents it adds carry their
-      sub-pipeline's key (the empty one with no `$sort`) to a later
-      `{$meta: "sortKey"}` -- but not to a rank, which refuses them (RM-522).
-      This server ends the key at the `$unionWith` (it is not in
-      `agg_meta::KEEPS_SORT_METADATA`): every `$meta` reads `[]` and every
-      rank ties. Found 2026-11-13 (RM-522).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_union_passes_the_sort_key_on
-      Backlog-ID: RM-630
 - [ ] **A `$densify` sets no sort key.** mongod 8.2.11 leaves each
       document the key of the field `$densify` sorted by: `{$meta:
       "sortKey"}` reads `[n]` and a rank behind it ranks by it. This server
