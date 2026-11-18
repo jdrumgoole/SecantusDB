@@ -89,12 +89,12 @@ def _derivative_totals(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-618")
+@pytest.mark.backlog_fixed("RM-618")
 def test_a_derivatives_cache_holds_what_mongods_does(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `maxTotalMemoryUsageBytes` for a `$derivative` over
     ten documents of 125 bytes: 1250 with no lower end, 1000 for `[-3, 3]`
     and `[-5, 0]`, 500 for `[-1, 1]`, 375 for `[0, 0]` (the function holds
-    nothing on either server); this server's cache keeps 250 or 500."""
+    nothing on either server); this server's cache kept 250 or 500."""
     assert _derivative_totals(rust_mongo) == _derivative_totals(mongod)
 
 
