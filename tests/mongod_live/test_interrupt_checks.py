@@ -350,6 +350,16 @@ PIPELINES: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any], tuple[str
         _pipeline(_GROUP_SORT, batchSize=50),
         _PIPELINE,
     ),
+    "aggregate sorting groups, a first batch of none": (
+        seed,
+        _pipeline(_GROUP_SORT, batchSize=0),
+        _PIPELINE,
+    ),
+    "aggregate sorting 300 groups, a first batch of none": (
+        _groups(300),
+        _pipeline(_GROUP_SORT, batchSize=0),
+        _PIPELINE,
+    ),
     "aggregate sorting the groups of a $match": (
         seed,
         _pipeline([{"$match": {"x": {"$gt": 2}}}, *_GROUP_SORT]),

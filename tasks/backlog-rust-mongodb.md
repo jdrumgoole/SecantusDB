@@ -585,7 +585,9 @@ These are explicit non-goals. Don't add them without a reason.
       transition, global and image collection IX; since 2026-11-18 a
       profiled update or delete statement's entry counts mongod's
       `Metadata: {W: 1}` and global, database and collection IX in its
-      command's locks. Still different,
+      command's locks; since 2026-11-18 a retryable `update` or `delete`
+      statement takes its own round as it runs and keeps its session's row
+      under it. Still different,
       measured against a one-member replica set:
       - an `insert` of several documents one of which fails: mongod inserts
         them again a document at a time, each under a transition, global,
@@ -593,10 +595,7 @@ These are explicit non-goals. Don't add them without a reason.
         (`insertBatchAndHandleErrors`), and counts an interrupt check for
         each lock; this server takes no such rounds, and its line prints no
         `numInterruptChecks` (RM-360);
-      - an `update` or `delete` keeps its session row per statement, under
-        the statement's own locks, and takes each statement's round as the
-        statement runs (this server takes every round first and writes the
-        row once, after); the profiled statement's entry's locks are taken
+      - a profiled `update` or `delete` statement's entry's locks are taken
         without interrupt checks here (the command's `numInterruptChecks`
         is mongod's without them);
       - `$out` takes more transition locks than this server's rounds
@@ -734,12 +733,12 @@ These are explicit non-goals. Don't add them without a reason.
       buckets or more) keeps its `$group` classic, as on mongod. The line of a `find`, `count`
       or `distinct` of a collection with one candidate plan, a `getMore` of
       a `find`, an `aggregate` of a collection mongod's query layer runs
-      whole, or (since 2026-11-18 asked for a first batch of none too) whose stages after its cursor stage are `$project`,
+      whole, a `$sort` after an SBE `$group`, or (since 2026-11-18 asked for a first batch of none too, the `$sort` after a `$group` included) whose stages after its cursor stage are `$project`,
       `$unset`, `$addFields`, `$set`, `$replaceRoot`, `$replaceWith`,
       `$unwind` and `$skip`, and the `getMore`s of its cursor,
       `listIndexes`, `listCollections`, `collStats`, `ping`, `buildInfo`,
       and an `insert`, `update` or `delete` on a member of a replica set
-      prints mongod's count (86 shapes in
+      prints mongod's count (88 shapes in
       `tests/mongod_live/test_interrupt_checks.py`). Every other line
       prints none, where mongod prints one:
       - a read with more than one candidate plan, a plan from the plan
@@ -755,9 +754,7 @@ These are explicit non-goals. Don't add them without a reason.
         `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a `$group`
         run classic over the cursor stage (a `$bucket` of 400 buckets: 16
         and a `getMore` of 4 on mongod), one over a
-        view or a time-series collection, and a `$sort` after an SBE
-        `$group` asked for a first batch of none (mongod 5; its `getMore`
-        here 5 under two global IS, mongod's 4 under one);
+        view or a time-series collection;
       - `findAndModify`: counted as the other writes are, it matches mongod
         8.2.11 but where its locks do not (RM-357: a retryable one's image,
         19 to this server's 16; one that removes, 7 to 10), and an IDHACK
@@ -1120,18 +1117,21 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Found 2026-11-18 working RM-613.
       Verify: tests/backlog/test_rm_found_2026_11_18_rm613.py::test_an_approximate_median_is_mongods_tdigest
       Backlog-ID: RM-720
-- [ ] **`{$meta: "sortKey"}` in a `$facet` is refused, not `[]`.** mongod
-      8.2.11 gives `[]` in a `$facet` pipeline, behind the facet's own
-      `$sort` too (its ranks tie there, which this server matches); this
-      server refuses the `$meta` with code 2. Found 2026-11-13 (RM-521).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm521.py::test_a_facet_sort_key_is_empty
-      Backlog-ID: RM-625
-- [ ] **A `$densify` sets no sort key.** mongod 8.2.11 leaves each
-      document the key of the field `$densify` sorted by: `{$meta:
-      "sortKey"}` reads `[n]` and a rank behind it ranks by it. This server
-      gives `[]` and ties every document. Found 2026-11-13 (RM-522).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_densify_sets_the_sort_key
-      Backlog-ID: RM-631
+- [ ] **An upsert's field order sometimes repeats for all twelve
+      upserts.** `tests/backlog/test_rm_057_084.py::test_upsert_field_order_from_several_equalities`
+      (RM-059's regression test) failed in one RM-625 gate run on
+      2026-11-18 and once in about 60 reruns: this server gave
+      `('d', 'c', 'a', 'b', 'x')` for all twelve upserts of
+      `{d: 1, c: 2, b: 3, a: 4}`, where the test expects both orders of an
+      absl pair. The order comes from `secantus_core::absl_hash`'s
+      per-thread `NextSeed` (start at a thread-local's address, step
+      0xad53), so a run of identical orders depends on where a thread's seed
+      starts. Not yet known: whether mongod's own `NextSeed` can give a
+      twelve-long run too (then the test asks more than mongod guarantees)
+      or the model differs from absl (then the server is wrong). Found
+      2026-11-18 (RM-625).
+      Verify: none -- intermittent, about 1 run in 30; no deterministic gap test until the cause is known
+      Backlog-ID: RM-721
 - [ ] **The sort key is lost at a `$graphLookup` or a `$fill`.** mongod
       8.2.11 keeps it through both, as it does through the stages RM-520
       names; this server ends it at each, so a rank behind ties every

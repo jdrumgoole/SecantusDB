@@ -250,10 +250,15 @@ pub(crate) fn mentions(v: &Bson, kind: &str) -> bool {
 /// a `$_internalSetWindowFields` compares it, an empty array's part
 /// `undefined`, which this engine's expressions take for MISSING; `$meta`
 /// gives that part as null, as it was before RM-410 kept the key whole.
+///
+/// A document with no key (one a `$densify` made, RM-631) gives it missing.
 fn sort_key_read() -> Bson {
-    Bson::Document(bson::doc! {
-        "$map": { "input": format!("${SORT_KEY}"), "in": { "$ifNull": ["$$this", null] } }
-    })
+    let key = format!("${SORT_KEY}");
+    Bson::Document(bson::doc! { "$cond": [
+        { "$eq": [{ "$type": &key }, "missing"] },
+        "$$REMOVE",
+        { "$map": { "input": &key, "in": { "$ifNull": ["$$this", null] } } },
+    ] })
 }
 
 /// Whether `stage` reads a document's sort-key metadata: a `{$meta:
@@ -303,9 +308,9 @@ fn ranks_by_sort_key(stage: &Bson) -> bool {
 pub(crate) fn ranks_with_no_sort_key(stages: &[Bson]) -> bool {
     stages.iter().enumerate().any(|(i, s)| {
         ranks_by_sort_key(s)
-            && stages[..i]
-                .iter()
-                .any(|b| DROPS_SORT_KEY.contains(&name(b)) || name(b) == "$unionWith")
+            && stages[..i].iter().any(|b| {
+                DROPS_SORT_KEY.contains(&name(b)) || matches!(name(b), "$unionWith" | "$densify")
+            })
     })
 }
 
@@ -481,6 +486,75 @@ fn is_inclusion(spec: &Document) -> bool {
     })
 }
 
+/// Rewrites each pipeline of a `$facet` for the metadata in reach as it
+/// starts: a `{$meta: "sortKey"}` reads the key the documents carry, or
+/// `[]` in `$addFields`, `$set` and `$group` when they carry none, and is
+/// missing in `$match` and `$redact`. A `$sort` in the facet sets no key,
+/// and the metadata ends at its first stage outside
+/// [`KEEPS_SORT_METADATA`], where the hidden fields come off (RM-625).
+fn rewrite_facet_metadata(stage: &mut Bson, sort_live: bool, geo_live: bool) {
+    let Some(Bson::Document(facets)) = stage.as_document_mut().and_then(|d| d.get_mut("$facet"))
+    else {
+        return;
+    };
+    let mut live: Vec<&str> = Vec::new();
+    if sort_live {
+        live.push(SORT_KEY);
+    }
+    if geo_live {
+        live.extend([GEO_DISTANCE, GEO_POINT]);
+    }
+    for (_, sub) in facets.iter_mut() {
+        let Bson::Array(stages) = sub else { continue };
+        let mut out: Vec<Bson> = Vec::with_capacity(stages.len() + 1);
+        let (mut sort_on, mut geo_on) = (sort_live, geo_live);
+        for mut s in std::mem::take(stages) {
+            let n = name(&s).to_string();
+            let keeps = KEEPS_SORT_METADATA.contains(&n.as_str());
+            if matches!(n.as_str(), "$match" | "$redact") {
+                replace_with(&mut s, "sortKey", &Bson::String("$$REMOVE".into()));
+            }
+            if keeps || n == "$group" {
+                if sort_on {
+                    replace_with(&mut s, "sortKey", &sort_key_read());
+                } else if matches!(n.as_str(), "$addFields" | "$set" | "$group") {
+                    replace_with(
+                        &mut s,
+                        "sortKey",
+                        &Bson::Document(bson::doc! { "$literal": [] }),
+                    );
+                }
+                if geo_on {
+                    replace(&mut s, "geoNearDistance", GEO_DISTANCE);
+                    replace(&mut s, "geoNearPoint", GEO_POINT);
+                }
+            }
+            if (sort_on || geo_on) && !keeps {
+                if n != "$group" {
+                    out.push(Bson::Document(bson::doc! { "$unset": live.clone() }));
+                }
+                sort_on = false;
+                geo_on = false;
+            } else if (sort_on || geo_on) && n == "$project" {
+                if let Some(Bson::Document(spec)) =
+                    s.as_document_mut().and_then(|d| d.get_mut("$project"))
+                {
+                    if is_inclusion(spec) {
+                        for f in &live {
+                            spec.insert(*f, 1);
+                        }
+                    }
+                }
+            }
+            out.push(s);
+        }
+        if sort_on || geo_on {
+            out.push(Bson::Document(bson::doc! { "$unset": live.clone() }));
+        }
+        *stages = out;
+    }
+}
+
 /// `{$meta: "sortKey"}`, `"geoNearDistance"` and `"geoNearPoint"`, which
 /// mongod keeps from a `$sort` or a `$geoNear` through the stages in
 /// [`KEEPS_SORT_METADATA`] and into a `$group`. Each is rewritten into a read
@@ -527,6 +601,10 @@ pub(crate) fn rewrite_sort_metadata(
     }
     let unions: Vec<bool> = (0..all.len())
         .map(|i| name(&all[i]) == "$unionWith" && union_adds_no_sort_key(&all, i))
+        .collect();
+    // A rank lies behind each stage.
+    let all_ranks_ahead: Vec<bool> = (0..all.len())
+        .map(|i| all[i + 1..].iter().any(ranks_by_sort_key))
         .collect();
     for (i, stage) in all.into_iter().enumerate() {
         let mut stage = stage;
@@ -591,6 +669,12 @@ pub(crate) fn rewrite_sort_metadata(
                 replace(&mut stage, "geoNearPoint", GEO_POINT);
             }
         }
+        // A `$facet` pipeline continues from the documents' metadata: the
+        // query layer's sort key reads there, and with none it is `[]`, its
+        // own `$sort` setting none (mongod 8.2.11, 2026-11-18, RM-625).
+        if name == "$facet" && !keyless {
+            rewrite_facet_metadata(&mut stage, sort_live, geo_live);
+        }
         let live: Vec<&str> = [
             (sort_live, SORT_KEY),
             (geo_live, GEO_DISTANCE),
@@ -601,7 +685,9 @@ pub(crate) fn rewrite_sort_metadata(
         .map(|(_, f)| *f)
         .collect();
         if !keeps && !live.is_empty() {
-            if name != "$group" {
+            if name == "$facet" {
+                // Each facet pipeline takes the fields off itself.
+            } else if name != "$group" {
                 // The metadata ends here; take its fields off first.
                 out.push(Bson::Document(bson::doc! { "$unset": live.clone() }));
             }
@@ -702,6 +788,40 @@ pub(crate) fn rewrite_sort_metadata(
                         fields.push(Bson::String(NO_SORT_KEY.to_string()));
                     }
                     spec.insert("fields", fields);
+                }
+            }
+            // mongod 8.2.11 gives each document `$densify` passes on the
+            // key of the field it densified by, `[n]` (not its partition's,
+            // and over any key it was handed), and the documents it makes
+            // none at all: `{$meta: "sortKey"}` is missing on them and a
+            // rank refuses them (2026-11-18, RM-631).
+            "$densify" => {
+                let field = stage
+                    .as_document()
+                    .and_then(|d| d.get_document("$densify").ok())
+                    .and_then(|spec| match spec.get("field") {
+                        Some(Bson::String(f)) if !f.is_empty() && !f.starts_with('$') => {
+                            Some(f.clone())
+                        }
+                        _ => None,
+                    });
+                if let Some(field) = field {
+                    out.push(Bson::Document(bson::doc! {
+                        "$_secantusSortKey": { "into": SORT_KEY, "by": { field: 1 } }
+                    }));
+                    out.push(stage);
+                    if all_ranks_ahead[i] {
+                        out.push(Bson::Document(bson::doc! { "$set": { NO_SORT_KEY: {
+                            "$cond": [
+                                { "$eq": [{ "$type": format!("${SORT_KEY}") }, "missing"] },
+                                true,
+                                "$$REMOVE",
+                            ]
+                        } } }));
+                        marked = true;
+                    }
+                    sort_live = true;
+                    continue;
                 }
             }
             "$setWindowFields" => {
@@ -1025,6 +1145,32 @@ mod tests {
                 doc! { "$project": { "m": "$$REMOVE" } },
                 doc! { "$set": { NO_SORT_KEY: true } },
                 rank,
+            ])
+        );
+    }
+
+    /// A `$densify` keys each document it passes on by its field and marks
+    /// the ones it makes as having none, for a rank to refuse (RM-631).
+    #[test]
+    fn a_densify_keys_by_its_field() {
+        let rank = doc! { "$_internalSetWindowFields": {
+        "sortBy": { "_id": 1 }, "output": { "r": { "$rank": {} } } } };
+        let densify =
+            doc! { "$densify": { "field": "n", "range": { "step": 1, "bounds": "full" } } };
+        let mut piped = stages(vec![densify.clone(), rank.clone()]);
+        assert!(needs_sort_metadata(&piped));
+        rewrite_sort_metadata(&mut piped, || None);
+        let key = format!("${SORT_KEY}");
+        assert_eq!(
+            piped,
+            stages(vec![
+                doc! { "$_secantusSortKey": { "into": SORT_KEY, "by": { "n": 1 } } },
+                densify,
+                doc! { "$set": { NO_SORT_KEY: { "$cond": [
+                    { "$eq": [{ "$type": key }, "missing"] }, true, "$$REMOVE",
+                ] } } },
+                rank,
+                doc! { "$unset": [SORT_KEY] },
             ])
         );
     }

@@ -44,11 +44,11 @@ def test_a_union_passes_the_sort_key_on(rust_mongo: Any, mongod: Any) -> None:
     assert _answers(rust_mongo, pipelines) == _answers(mongod, pipelines)
 
 
-@pytest.mark.backlog("RM-631")
+@pytest.mark.backlog_fixed("RM-631")
 def test_a_densify_sets_the_sort_key(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `$densify` leaves each document the key of the
     field it densified by: `{$meta: "sortKey"}` reads it and a rank behind
-    it ranks by it. This server gives `[]` and ties them."""
+    it ranks by it. This server gave `[]` and tied them."""
     densify = {"$densify": {"field": "n", "range": {"step": 1, "bounds": "full"}}}
     pipelines = {
         "$meta": [densify, META, {"$project": {"m": 1}}],

@@ -1426,6 +1426,10 @@ impl<'a> Statements<'a> {
 
     /// Close the open statement, if any, against the tallies now.
     pub(crate) fn close(&mut self, n: i32, modified: i32, upserted: usize, errors: &[Bson]) {
+        // A retryable statement keeps its session's row before it ends.
+        if let Some(storage) = self.storage {
+            crate::session::keep_statement_row(storage);
+        }
         let Some(open) = self.open.take() else {
             // What a statement that never opened noted is not the next's.
             STATEMENT_EXEC.with(|s| *s.borrow_mut() = None);
