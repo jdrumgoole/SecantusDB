@@ -101,6 +101,9 @@ def test_input_function_with_a_typmod(dsn: str) -> None:
 @pytest.mark.backlog("RP-1041")
 def test_cstring_casts_only_to_strings(dsn: str) -> None:
     """`cstring` has no cast to `integer`; here it reads the value."""
-    with psycopg.connect(dsn, autocommit=True) as c, pytest.raises(psycopg.Error) as info:
-        c.execute("select '12'::cstring::int4")
-    assert (info.value.sqlstate, info.value.diag.statement_position) == ("42846", "20")
+    with psycopg.connect(dsn, autocommit=True) as c:
+        try:
+            answer: object = c.execute("select '12'::cstring::int4").fetchone()
+        except psycopg.Error as e:
+            answer = (e.sqlstate, e.diag.statement_position)
+    assert answer == ("42846", "20")
