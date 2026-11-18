@@ -2720,15 +2720,15 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap tests are in
 `tests/backlog/test_rp_found_rp727.py`.
 
-- [ ] **A row comparison with a pattern operator over fields that are not
-      strings is a collation error.** `select (1, 2) ~<~ (1, 3)` is 42883
-      `operator does not exist: integer ~<~ integer` at 15 on PostgreSQL
-      15.19 (`make_row_comparison_op` looks up each pair's operator). Here
-      it is 42804 `collations are not supported by type integer` with no
-      position: `pattern_ops` rewrites `~<~` to `<` and collates each
-      field `"C"` before any operand is typed. The subquery form (`(1, 2)
-      ~<~ any (select 1, 3)`) is right since RP-851.
-      Verify: tests/backlog/test_rp_found_rp727.py::test_row_pattern_operator_over_non_strings
+- [ ] **A row comparison with a pattern operator over COLUMNS that are
+      not strings is answered.** `select (a, b) ~<~ (1, 2) from t973`
+      (`t973(a int, b int)`) is 42883 `operator does not exist: integer ~<~
+      integer` at 15 on PostgreSQL 15.19 (`make_row_comparison_op` looks up
+      each pair's operator). Here it compares the rows. RP-973 refused a
+      pair typed on its face (constants, casts) in `pattern_ops`, which
+      runs before any column is typed; a column pair needs the check where
+      the row comparison is typed.
+      Verify: tests/backlog/test_rp_found_rp727.py::test_row_pattern_operator_over_non_string_columns
       Backlog-ID: RP-973
 
 ## Found while working RP-849 (2026-11-11)
