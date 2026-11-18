@@ -1227,6 +1227,8 @@ one beside it.
       runs `only_on("darwin")`, and verify reports it ELSEWHERE on CI. Not
       separated: macOS from arm64 (no arm64 Linux or x86_64 macOS runner
       measured). Close it when it passes every run on darwin.)
+      Its gap test sits at the budget's edge: on 2026-11-18 one build
+      passed it 2 of 3 runs at load ~10, so a FIXED? needs repeated runs.
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
