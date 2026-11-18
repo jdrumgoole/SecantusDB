@@ -1234,22 +1234,18 @@ one beside it.
 
 ## Found while working RP-911 (2026-11-15)
 
-## Found while working RP-927 (2026-11-14)
+## Found while working RP-970 (2026-11-18)
 
-- [ ] **OPEN — psql's `\d` column query straight after DDL builds every
-      user type for a column of a user type.** The collation subquery
-      (`COLLATION_QUERY`) over a table `(a e1, b e2)` of two user enums,
-      first after its `CREATE TABLE`: PostgreSQL 15.19 takes 0.15 ms with
-      no other table and 0.22 ms with 400 (private cluster); a debug
-      `secantusd-pg` 22 ms and 79 ms. Since RP-927 a `pg_type` key of a
-      built-in oid builds alone, but a user type's key builds every enum,
-      composite (every table's row type) and range (`build_catalog_rows`'s
-      `user_types`), and a second user key in a message cycle builds every
-      row. PostgreSQL reads the one row through the oid index
-      (`SearchSysCache`): the faithful fix builds a user key's row from
-      that type's catalog entry alone.
-      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_over_two_user_types_costs_the_same_at_400_tables
-      Backlog-ID: RP-970
+- [ ] **OPEN — `'_custom'::regtype` names `custom`'s array, not the type
+      named `_custom`.** After `CREATE TYPE _custom AS ENUM ('b')` and then
+      `CREATE TYPE custom AS ENUM ('c')`, PostgreSQL 15.19 resolves
+      `'_custom'::regtype` to the enum `_custom` (and names `custom`'s array
+      `___custom`, which `pg_type` here already lists). `secantusd-pg`
+      resolves it to `custom`'s array type: a `_`-prefixed name is read as
+      an array of the rest before a type of that exact name is looked for.
+      PostgreSQL's `typenameTypeId` looks the name up in `pg_type` as given.
+      Verify: tests/backlog/test_rp_found_rp970.py::test_an_underscore_type_name_resolves_to_that_type
+      Backlog-ID: RP-1055
 
 ## Found by a CI run (2026-11-07)
 

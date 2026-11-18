@@ -23956,8 +23956,12 @@ impl PgHandler {
         // and built every user type (RP-927).
         let pinned = catalog_key(name, filter);
         let schema_free = |k: i64| name == "pg_type" && k < Self::FIRST_USER_TYPE_OID;
+        // A user type's key builds its one row (RP-970), at the cost of a
+        // pass over the type lists rather than of every row they make, so
+        // a `pg_type` key is always built alone.
+        let keyed_alone = |k: i64| name == "pg_type" || schema_free(k);
         let keyed_name = pinned.as_ref().map(|(_, k)| format!("{name}\u{1f}{k}"));
-        let (hit, build_key) = {
+        let (hit, mut build_key) = {
             let cache = self.virtual_cache.lock().unwrap_or_else(|e| e.into_inner());
             let current = |n: &str| {
                 cache
@@ -23975,9 +23979,9 @@ impl PgHandler {
                             (*c, *v, *g) == key
                                 && n.strip_prefix(&prefix)
                                     .and_then(|k| k.parse::<i64>().ok())
-                                    .is_some_and(|k| !schema_free(k))
+                                    .is_some_and(|k| !keyed_alone(k))
                         });
-                        let alone = pinned.as_ref().is_some_and(|(_, k)| schema_free(*k));
+                        let alone = pinned.as_ref().is_some_and(|(_, k)| keyed_alone(*k));
                         (
                             None,
                             if another && !alone {
@@ -23997,7 +24001,21 @@ impl PgHandler {
                 // Rows a read failed in are not kept: the next reader builds
                 // them again (and the failure stays noted for this one's).
                 let outer = CATALOG_FILL_ERROR.with(|e| e.borrow_mut().take());
-                let rows = self.catalog_rows_keyed(name, build_key.as_ref());
+                let mut rows = self.catalog_rows_keyed(name, build_key.as_ref());
+                // A user `pg_type` key that names no element type (an
+                // array's) builds every row, kept as the whole catalog's so
+                // the cycle's other keys read it (RP-970).
+                if let (Some(built), Some((field, k))) = (&rows, &build_key) {
+                    if name == "pg_type"
+                        && *k >= Self::FIRST_USER_TYPE_OID
+                        && !built
+                            .iter()
+                            .any(|d| d.get(field).and_then(bson_i64) == Some(*k))
+                    {
+                        build_key = None;
+                        rows = self.catalog_rows_keyed(name, None);
+                    }
+                }
                 let failed = CATALOG_FILL_ERROR.with(|e| {
                     let mut e = e.borrow_mut();
                     if e.is_none() {
@@ -25363,6 +25381,16 @@ impl PgHandler {
                 // every user type's oid, and its array's, is drawn from 16384
                 // up. Only the built-in rows are built for it (RP-715).
                 let user_types = key.is_none_or(|(_, k)| *k >= Self::FIRST_USER_TYPE_OID);
+                // A read pinned to a user type's oid builds that type's row
+                // alone, as PostgreSQL reads it through `pg_type`'s oid index
+                // (`SearchSysCache`), never every enum, range and table row
+                // type (RP-970). An array's key falls back to every row
+                // (`PgHandler::virtual_rows`): its name (`makeArrayTypeName`)
+                // depends on every other type's.
+                let only = key
+                    .map(|(_, k)| *k)
+                    .filter(|k| *k >= Self::FIRST_USER_TYPE_OID);
+                let want = |oid: i64| only.is_none_or(|k| k == oid);
                 let mut rows: Vec<Document> = secantus_pgplan::pgtypes::BUILTIN_TYPES
                     .iter()
                     .map(|(typname, oid, typarray)| {
@@ -25400,6 +25428,9 @@ impl PgHandler {
                 // User enums ride along, their typarray DERIVED as
                 // oid + 100_000 -- the shared-store rule, never stored.
                 for (name, oid, _) in self.enums_if(user_types)? {
+                    if !want(oid) {
+                        continue;
+                    }
                     let mut d = Document::new();
                     d.insert(def.field_of("typname").expect("column"), name);
                     d.insert(def.field_of("oid").expect("column"), Bson::Int64(oid));
@@ -25428,7 +25459,7 @@ impl PgHandler {
                     true => self.composites().ok()?,
                     false => Arc::default(),
                 };
-                for (name, oid, _) in composites.iter().cloned() {
+                for (name, oid, _) in composites.iter().filter(|c| want(c.1)).cloned() {
                     let mut d = Document::new();
                     d.insert(def.field_of("typname").expect("column"), name);
                     d.insert(def.field_of("oid").expect("column"), Bson::Int64(oid));
@@ -25452,7 +25483,11 @@ impl PgHandler {
                     true => self.ranges().ok()?,
                     false => Vec::new(),
                 };
-                for (name, oid, _) in ranges.iter().cloned() {
+                for (name, oid, _) in ranges
+                    .iter()
+                    .filter(|r| want(r.1) || want(r.1 + Self::MULTIRANGE_TYPE_OID_OFFSET))
+                    .cloned()
+                {
                     let mut d = Document::new();
                     d.insert(def.field_of("typname").expect("column"), name.clone());
                     d.insert(def.field_of("oid").expect("column"), Bson::Int64(oid));
@@ -25494,7 +25529,7 @@ impl PgHandler {
                     true => self.base_types().ok()?,
                     false => Vec::new(),
                 };
-                for b in base_types {
+                for b in base_types.into_iter().filter(|b| want(b.oid)) {
                     let mut d = Document::new();
                     let raw = base_docs.iter().find(|x| {
                         x.get_i64("oid")
@@ -25596,7 +25631,7 @@ impl PgHandler {
                     true => self.domains().unwrap_or_default(),
                     false => Vec::new(),
                 };
-                for dm in &domains {
+                for dm in domains.iter().filter(|dm| want(dm.oid)) {
                     let mut d = Document::new();
                     d.insert(def.field_of("typname").expect("column"), dm.name.clone());
                     d.insert(def.field_of("oid").expect("column"), Bson::Int64(dm.oid));
@@ -25676,6 +25711,9 @@ impl PgHandler {
                         else {
                             continue;
                         };
+                        if !want(oid) && !want(oid + Self::MULTIRANGE_TYPE_OID_OFFSET) {
+                            continue;
+                        }
                         if let Some((_, ns)) = namespaces.iter().find(|(n, _)| n == schema) {
                             type_namespace.insert(oid, *ns);
                             type_namespace.insert(oid + Self::USER_TYPE_ARRAY_OID_OFFSET, *ns);
@@ -25758,6 +25796,9 @@ impl PgHandler {
                 };
                 for (view, _) in views {
                     let oid = self.view_type_relid(&view);
+                    if !want(oid) {
+                        continue;
+                    }
                     let mut d = Document::new();
                     d.insert(f("typname"), view.as_str());
                     d.insert(f("oid"), Bson::Int64(oid));

@@ -407,7 +407,7 @@ def test_create_table_costs_the_same_at_800_tables_within_a_tenth(
     assert _median_excess(pairs, 2) < 0.002, _describe(pairs, "CREATE TABLE", 2 * GROWTH_TABLES)
 
 
-@pytest.mark.backlog("RP-970")
+@pytest.mark.backlog_fixed("RP-970")
 def test_the_first_catalog_query_after_ddl_over_two_user_types_costs_the_same_at_400_tables(
     pg_pair: tuple[Any, Any],
 ) -> None:
@@ -416,8 +416,9 @@ def test_the_first_catalog_query_after_ddl_over_two_user_types_costs_the_same_at
     same time however many other tables there are (0.15 ms with none, 0.22
     ms with 400, private cluster, 2026-11-14): one `pg_type` row per column
     through the oid index. A debug `secantusd-pg` took 22 ms with none and
-    79 ms with 400 (2026-11-14): a key of a user type builds every user
-    type, and the second one in a message cycle builds every row.
+    79 ms with 400 (2026-11-14): a key of a user type built every user
+    type, and the second one in a message cycle built every row. Since
+    RP-970 a user type's key builds that type's row alone.
 
     The bound is RP-927's: a server with 400 more tables against one with
     none, within half again plus 5 ms.
