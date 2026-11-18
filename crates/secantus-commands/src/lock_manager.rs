@@ -1063,8 +1063,13 @@ pub fn statement_rounds(
         // The full round is taken inside the first, which it holds: the
         // write takes one flow control ticket where `drop`'s two rounds
         // take two (measured 8.2.11).
+        // One that removes takes a single write round, whether or not it
+        // finds a document, retryable or not (measured 8.2.11, 2026-11-17).
         "findAndModify" | "findandmodify" => {
             let c = coll?;
+            if doc.get("remove").is_some_and(crate::util::truthy) {
+                return Some(vec![write_round(Some(c))]);
+            }
             let mut nested = write_round(None);
             nested.extend(write_round(Some(c)));
             Some(vec![nested])
@@ -1090,6 +1095,18 @@ pub fn statement_rounds(
             let mut exclusive = write_round(None);
             exclusive.push((Resource::Collection(format!("{db}.{c}")), X));
             Some(vec![write_round(Some(c)), exclusive])
+        }
+        // A global IS alone, then one write round that takes the
+        // collection in X twice, the second nested in the first, so one
+        // flow control ticket (measured 8.2.11, 2026-11-16: transition w 1,
+        // global r 1 w 1, database w 1, collection W 2). A collection that
+        // is not there is not measured: it keeps the plain chain.
+        "collMod" => {
+            let c = coll.filter(|c| exists(c))?;
+            let mut x = write_round(None);
+            x.push((Resource::Collection(format!("{db}.{c}")), X));
+            x.push((Resource::Collection(format!("{db}.{c}")), X));
+            Some(vec![vec![(Resource::Global, Is)], x])
         }
         "dropDatabase" => Some(vec![vec![
             (Resource::ReplicationStateTransition, Ix),
@@ -1646,6 +1663,7 @@ pub fn write_rounds(db: &str, coll: &str, n: usize) -> Option<Guard> {
         owner,
         // Not the statement's own chain: whose the statement is stays as it was.
         previous_owner: STATEMENT_OWNER.with(std::cell::Cell::get),
+        previous_round: None,
         chain: round,
     })
 }
@@ -1747,7 +1765,59 @@ pub struct Guard {
     lm: std::sync::Arc<LockManager>,
     owner: Owner,
     previous_owner: Option<Owner>,
+    /// The enclosing statement's round, restored on drop; `None` for a
+    /// guard that did not replace it ([`write_rounds`]).
+    previous_round: Option<Option<StatementRound>>,
     chain: Vec<(Resource, Mode)>,
+}
+
+/// The round an `update` or `delete` statement holds while it runs, taken
+/// again for each statement (mongod's `performUpdates` / `performDeletes`
+/// acquire the collection per statement).
+struct StatementRound {
+    lm: std::sync::Arc<LockManager>,
+    owner: Owner,
+    chain: Vec<(Resource, Mode)>,
+    held: bool,
+}
+
+thread_local! {
+    static PER_STATEMENT: std::cell::RefCell<Option<StatementRound>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The running `update` or `delete` statement is done: its round, and with
+/// it its execution ticket, is let go before its `Slow query` line reads
+/// its statistics under a global IS (and a ticket) of their own, as
+/// mongod's statement does (measured 8.2.11, RM-355).
+pub fn statement_done() {
+    PER_STATEMENT.with(|p| {
+        if let Some(round) = p.borrow_mut().as_mut().filter(|r| r.held) {
+            round.lm.release(round.owner);
+            round.held = false;
+        }
+    });
+}
+
+/// The next statement of an `update` or `delete` starts: it takes its own
+/// round (letting go of the last statement's, if that one never finished).
+pub fn next_statement() -> Result<(), crate::CommandError> {
+    let taken = PER_STATEMENT.with(|p| {
+        let mut p = p.borrow_mut();
+        let Some(round) = p.as_mut() else {
+            return Ok(());
+        };
+        if round.held {
+            round.lm.release(round.owner);
+            round.held = false;
+        }
+        acquire_chain(&round.lm, round.owner, &round.chain)?;
+        round.held = true;
+        Ok(())
+    });
+    taken.map_err(|_: MaxTimeMsExpired| {
+        take_ticket_error().unwrap_or_else(crate::CommandError::max_time_expired)
+    })
 }
 
 impl Guard {
@@ -1764,6 +1834,19 @@ impl Guard {
         let mut rounds =
             statement_rounds(doc, db, facts).unwrap_or_else(|| vec![statement_chain(doc, db)]);
         let chain = rounds.pop().unwrap_or_default();
+        // mongod's `update` and `delete` take each statement's round as the
+        // statement runs and let it go before its line is written
+        // ([`next_statement`], [`statement_done`]): only the first is taken
+        // here. A retryable write keeps its locks to write its session's row
+        // after the last statement, which this server does once (RM-357).
+        let per_statement = matches!(
+            doc.keys().next().map(String::as_str),
+            Some("update" | "delete")
+        ) && !chain.is_empty()
+            && HELD_TO_END.with(|h| h.borrow().is_none());
+        if per_statement {
+            rounds.clear();
+        }
         // The rounds before the last are taken and let go, as mongod does.
         let refused = || take_ticket_error().unwrap_or_else(crate::CommandError::max_time_expired);
         for round in &rounds {
@@ -1775,12 +1858,23 @@ impl Guard {
         }
         let owner = lm.statement_owner();
         match acquire_chain(lm, owner, &chain) {
-            Ok(()) => Some(Ok(Self {
-                lm: lm.clone(),
-                owner,
-                previous_owner: STATEMENT_OWNER.with(|o| o.replace(Some(owner))),
-                chain,
-            })),
+            Ok(()) => {
+                let previous_round = PER_STATEMENT.with(|p| {
+                    p.replace(per_statement.then(|| StatementRound {
+                        lm: lm.clone(),
+                        owner,
+                        chain: chain.clone(),
+                        held: true,
+                    }))
+                });
+                Some(Ok(Self {
+                    lm: lm.clone(),
+                    owner,
+                    previous_owner: STATEMENT_OWNER.with(|o| o.replace(Some(owner))),
+                    previous_round: Some(previous_round),
+                    chain,
+                }))
+            }
             Err(_) => Some(Err(refused())),
         }
     }
@@ -1833,6 +1927,9 @@ impl LockManager {
 impl Drop for Guard {
     fn drop(&mut self) {
         STATEMENT_OWNER.with(|o| o.set(self.previous_owner));
+        if let Some(previous) = self.previous_round.take() {
+            PER_STATEMENT.with(|p| *p.borrow_mut() = previous);
+        }
         let kept = HELD_TO_END.with(|h| match h.borrow_mut().as_mut() {
             Some(held) => {
                 held.push((self.lm.clone(), self.owner));
@@ -1886,6 +1983,32 @@ impl HeldToEnd {
             (Resource::Global, Mode::Ix),
             (Resource::Database(db.to_string()), Mode::Ix),
             (Resource::Collection(format!("{db}.{coll}")), Mode::Ix),
+        ];
+        for (res, mode) in &round {
+            lm.acquire(owner, res, *mode)?;
+        }
+        Ok(())
+    }
+}
+
+impl HeldToEnd {
+    /// The round a retryable `findAndModify`'s image is written in, inside
+    /// the held statement's locks: the transition, global and
+    /// `config.image_collection` locks in IX, with no database lock of its
+    /// own (measured 8.2.11, 2026-11-17: the image adds one transition, one
+    /// global and one collection IX to the line, and no database IX).
+    /// Nothing when no statement lock is held.
+    pub fn image_round(&self) -> Result<(), MaxTimeMsExpired> {
+        let Some((lm, owner)) = HELD_TO_END.with(|h| h.borrow().as_ref()?.last().cloned()) else {
+            return Ok(());
+        };
+        let round = [
+            (Resource::ReplicationStateTransition, Mode::Ix),
+            (Resource::Global, Mode::Ix),
+            (
+                Resource::Collection("config.image_collection".to_string()),
+                Mode::Ix,
+            ),
         ];
         for (res, mode) in &round {
             lm.acquire(owner, res, *mode)?;
@@ -2191,6 +2314,24 @@ mod tests {
         );
     }
 
+    /// RM-357: a `findAndModify` that removes takes one flat write round.
+    #[test]
+    fn find_and_modify_that_removes_takes_one_round() {
+        use super::{statement_rounds, Resource, StorageFacts};
+        let facts = StorageFacts {
+            storage: None,
+            db: "db",
+        };
+        let doc = bson::doc! {"findAndModify": "c", "remove": true};
+        let rounds = statement_rounds(&doc, "db", &facts).unwrap();
+        assert_eq!(rounds.len(), 1);
+        assert_eq!(rounds[0].len(), 4);
+        assert_eq!(
+            rounds[0].last().unwrap().0,
+            Resource::Collection("db.c".into())
+        );
+    }
+
     /// RM-357: under `hold_to_end` a statement's locks outlast it, and a
     /// write round taken inside them is nested: no ticket of its own, and
     /// all of it let go when the scope ends.
@@ -2331,6 +2472,28 @@ mod tests {
             {"$facet": {"x": [{"$lookup": {"from": "x", "pipeline": [], "as": "j"}}]}},
         ]);
         assert_eq!(rounds(lookup, bson::Bson::Int32(1)).len(), 1);
+    }
+
+    /// `collMod` takes a global IS alone, then one write round holding the
+    /// collection in X twice (measured 8.2.11, RM-357).
+    #[test]
+    fn coll_mod_takes_mongods_rounds() {
+        use super::{statement_rounds, Mode::*, Resource};
+        let rounds = statement_rounds(&bson::doc! {"collMod": "c"}, "a", &Catalog).unwrap();
+        let coll = (Resource::Collection("a.c".into()), X);
+        assert_eq!(
+            rounds,
+            vec![
+                vec![(Resource::Global, Is)],
+                vec![
+                    (Resource::ReplicationStateTransition, Ix),
+                    (Resource::Global, Ix),
+                    (Resource::Database("a".into()), Ix),
+                    coll.clone(),
+                    coll,
+                ],
+            ]
+        );
     }
 
     // ------------------------------------------- execution tickets (RM-355)

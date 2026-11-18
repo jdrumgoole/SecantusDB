@@ -3,7 +3,7 @@
 A three-way feature matrix: **MongoDB** (real `mongod`, the conformance
 target — SecantusDB vendors the same WiredTiger storage engine and
 advertises wire version 7.0) against SecantusDB's **Python server** and
-**Rust server** (see [The two servers](servers.md)).
+**Rust server** (see [The servers](servers.md)).
 
 The honest, machine-checked statement of conformance is the
 [validation reports](validation-summary.md) — the official driver test
@@ -20,8 +20,8 @@ The MongoDB column describes `mongod` 7.0 itself and is the reference.
 | | MongoDB | Python server | Rust server |
 | --- | --- | --- | --- |
 | What it is | the real thing | pure-Python in-process server | self-contained Rust server, GIL-free request path |
-| Install | external `mongod` process | `pip install SecantusDB` | the `secantus-mdb` crate (crates.io), or a release archive |
-| Run | daemon | 1-line embedded (`SecantusDBServer`) or `secantusd-py` daemon | `secantusd-rs` daemon, or in-process from Rust (`secantus_mdb::Server`) |
+| Install | external `mongod` process | source checkout only (deprecated, not published) | `pip install SecantusDB`, the `secantus-mdb` crate (crates.io), or a release archive |
+| Run | daemon | 1-line embedded (`SecantusDBServer`) or `secantusd-py` daemon | `secantusd-mdb` daemon, or in-process from Rust (`secantus_mdb::Server`) |
 | pymongo's own suite | 100% by definition | **99.5%** (1020 pass / 5 fail) | **99.5%** (1020 pass / 5 fail) |
 | Version line | 7.0.x | `0.5.4bN` (the PyPI package) | `0.5.3-beta.N` (crates, `buildInfo.secantusVersion`) |
 
@@ -69,7 +69,7 @@ command set. The divergences:
 | `replSetStepDown` | ✅ | ⚠️ the single-node behaviour: `force: true` makes the node a secondary for the period (writes `10107`, reads served), then primary again. Election TIMING not reproduced — mongod's return is driven by an election, so a 0-second period takes ~19s there and 0s here | ⚠️ same |
 | `getParameter` / `setParameter` | ✅ | ⚠️ the parameters this server actually has (`logLevel`, `quiet`, and the read-only handshake ones). A name we do not register is refused `72` rather than accepted and ignored | ⚠️ same |
 | Atlas Search index commands (`createSearchIndexes`, …) | Atlas only | ❌ rejected (`CommandNotSupported`) | ❌ rejected |
-| `secantusAdmin.*` (backup / PITR / prune — SecantusDB-proprietary) | — | ✅ | ✅ (`restoreToTimestamp` via the `secantusd-rs restore` CLI rather than a wire command) |
+| `secantusAdmin.*` (backup / PITR / prune — SecantusDB-proprietary) | — | ✅ | ✅ (`restoreToTimestamp` via the `secantusd-mdb restore` CLI rather than a wire command) |
 
 ## Query operators
 
@@ -249,7 +249,7 @@ still returns a generic `BadValue` for the `$project` case).
 | Oplog (single-node, retention + pruning) | ✅ | ✅ | ✅ |
 | Hot backup archive | ✅ (backup cursor / ops tooling) | ✅ `secantusAdmin.backupArchive` / `archiveBaseSnapshot` | ✅ same commands |
 | Restore an archive | ✅ | ✅ `secantusAdmin.restoreArchive` / `secantus-restore-archive` | ✅ |
-| Point-in-time restore (oplog replay) | ✅ (ops tooling) | ✅ `secantusAdmin.restoreToTimestamp` | ⚠️ `secantusd-rs restore` CLI; no wire command yet |
+| Point-in-time restore (oplog replay) | ✅ (ops tooling) | ✅ `secantusAdmin.restoreToTimestamp` | ⚠️ `secantusd-mdb restore` CLI; no wire command yet |
 | Archives portable between the two servers | — | ✅ | ✅ |
 
 ## Beyond MongoDB: the SQL/PostgreSQL frontend
@@ -260,7 +260,7 @@ below.** The Python server speaks the PostgreSQL wire protocol as
 same WiredTiger data, so `psql`, psycopg or SQLAlchemy connect to the store
 MongoDB clients use. See [SQL / PostgreSQL interface](sql.md).
 
-The **"Rust server" column below is the Rust MONGODB server** (`secantusd-rs`),
+The **"Rust server" column below is the Rust MONGODB server** (`secantusd-mdb`),
 which speaks no SQL — so its ❌ is about that binary, not about the Rust side.
 `secantusd-pg` is a separate deliverable with its own version line and is not
 represented here.

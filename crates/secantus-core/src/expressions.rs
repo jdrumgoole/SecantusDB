@@ -4237,9 +4237,6 @@ fn op_object_to_array(arg: &Bson, ctx: &Ctx) -> R {
 /// of `ctx`'s scope (mirrors `_Ctx.with_var`). The document (so `$$ROOT` and
 /// bare `$field` paths) is unchanged — only the var scope grows.
 fn eval_with_vars(expr: &Bson, ctx: &Ctx, extra: &[(&str, Bson)]) -> R {
-    // One element of a `$map` / `$filter` / `$reduce`: an interrupt point,
-    // as it is in mongod (RM-313).
-    crate::deadline::check_expression()?;
     let mut vars = ctx.vars.clone();
     let mut per_doc = ctx.per_doc.to_vec();
     for (name, value) in extra {
@@ -4322,8 +4319,9 @@ fn op_map(arg: &Bson, ctx: &Ctx) -> R {
     let null = Bson::Null;
     let in_expr = d.get("in").unwrap_or(&null);
     let mut out = Vec::with_capacity(arr.len());
-    for elem in arr {
+    for (i, elem) in arr.into_iter().enumerate() {
         out.push(eval_with_vars(in_expr, ctx, &[(&var, elem)])?);
+        crate::deadline::check_expression(i + 1)?;
     }
     Ok(Bson::Array(out))
 }
@@ -4359,8 +4357,10 @@ fn op_filter(arg: &Bson, ctx: &Ctx) -> R {
         None => None,
     };
     let mut out: Vec<Bson> = Vec::new();
-    for elem in arr {
-        if truthy(&eval_with_vars(cond, ctx, &[(&var, elem.clone())])?) {
+    for (i, elem) in arr.into_iter().enumerate() {
+        let keep = truthy(&eval_with_vars(cond, ctx, &[(&var, elem.clone())])?);
+        crate::deadline::check_expression(i + 1)?;
+        if keep {
             out.push(elem);
             if let Some(lim) = limit {
                 if out.len() as i128 >= lim {
@@ -4416,8 +4416,9 @@ fn op_reduce(arg: &Bson, ctx: &Ctx) -> R {
     let mut acc = eval_opt(d.get("initialValue"), ctx)?;
     let null = Bson::Null;
     let in_expr = d.get("in").unwrap_or(&null);
-    for elem in arr {
+    for (i, elem) in arr.into_iter().enumerate() {
         acc = eval_with_vars(in_expr, ctx, &[("value", acc), ("this", elem)])?;
+        crate::deadline::check_expression(i + 1)?;
     }
     Ok(acc)
 }
@@ -9943,6 +9944,8 @@ fn find_all_values_path(arg: &Bson) -> Result<Option<&str>, Fallback> {
         other => other,
     };
     let constant = match arg {
+        // The operand parses before the const check (RM-594).
+        Bson::String(s) if s == "$" => return crate::expr_parse::operand(arg).map(|_| None),
         Bson::String(s) if s.starts_with('$') => None,
         Bson::Document(d) if d.len() == 1 => d.get("$literal").or_else(|| d.get("$const")),
         Bson::Document(_) | Bson::Array(_) => None,
@@ -12769,6 +12772,7 @@ mod find_all_values_at_path_tests {
         assert_eq!(code(values(&doc! {}, bson!(1))), 9567004);
         assert_eq!(code(values(&doc! {}, Bson::Null)), 9567004);
         assert_eq!(code(values(&doc! {}, bson!("$a.b"))), 5511201);
+        assert_eq!(code(values(&doc! {}, bson!("$"))), 16872);
         assert_eq!(
             code(values(&doc! {}, bson!({"$concat": ["a", ".b"]}))),
             5511201

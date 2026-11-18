@@ -750,7 +750,7 @@ def _recorded_find(client: Any) -> Any:
 
 @pytest.fixture
 def recording_rust(tmp_path: Any) -> Iterator[Any]:
-    """A `secantusd-rs` of this test's own, for the reason `recording_mongod`
+    """A `secantusd-mdb` of this test's own, for the reason `recording_mongod`
     is one."""
     from tests.backlog.conftest import rust_mongo_server
 

@@ -374,7 +374,7 @@ jobs:
         env:
           # gauge_common.rust_binary()'s default search only covers the cargo
           # target dir; the storage-engine sync stages the daemon in .venv/bin.
-          SECANTUSDB_BIN: .venv/bin/secantusd-rs
+          SECANTUSDB_BIN: .venv/bin/secantusd-mdb
           # The 2-core runner executes slt files 5-10x slower than a dev
           # machine; 300s (the local calibration) timed out ~15 files that
           # passed locally in ~25s each on the first weekly slt run.

@@ -82,8 +82,8 @@ if [ "$expected" != "$actual" ]; then
 fi
 rm -rf /tmp/secantus-unpack && mkdir -p /tmp/secantus-unpack
 tar -xzf /tmp/secantusdb.tar.gz -C /tmp/secantus-unpack
-bin=$(find /tmp/secantus-unpack -maxdepth 3 -type f -name secantusd-rs | head -1)
-if [ -z "$bin" ]; then echo "no secantusd-rs in the archive" >&2; exit 1; fi
+bin=$(find /tmp/secantus-unpack -maxdepth 3 -type f -name secantusd-mdb | head -1)
+if [ -z "$bin" ]; then echo "no secantusd-mdb in the archive" >&2; exit 1; fi
 install -m 0755 "$bin" "$SERVER_BIN"
 "$SERVER_BIN" --version | tee "$REMOTE_DIR/VERSION"
 echo "installed from $TAG"
@@ -122,7 +122,7 @@ if [ -z "$wt" ] || [ ! -f "$wt/include/wiredtiger.h" ]; then
 fi
 export SECANTUS_WT_INCLUDE="$wt/include" SECANTUS_WT_LIB="$wt"
 cargo build --release --locked --manifest-path crates/secantusdb/Cargo.toml
-bin=$(find crates/secantusdb/target -maxdepth 3 -type f -name secantusd-rs | head -1)
+bin=$(find crates/secantusdb/target -maxdepth 3 -type f -name secantusd-mdb | head -1)
 install -m 0755 "$bin" "$SERVER_BIN"
 "$SERVER_BIN" --version | tee "$REMOTE_DIR/VERSION"
 echo "built from $SERVER_REF"
@@ -231,8 +231,8 @@ if [ -z "$wt" ] || [ ! -f "$wt/include/wiredtiger.h" ]; then
 fi
 export SECANTUS_WT_INCLUDE="$wt/include" SECANTUS_WT_LIB="$wt"
 cargo build --release --locked --manifest-path crates/secantusdb/Cargo.toml
-bin=$(find crates/secantusdb/target -maxdepth 3 -type f -name secantusd-rs | head -1)
-install -m 0755 "$bin" /usr/local/bin/secantusd-rs
+bin=$(find crates/secantusdb/target -maxdepth 3 -type f -name secantusd-mdb | head -1)
+install -m 0755 "$bin" /usr/local/bin/secantusd-mdb
 "$PERF_DIR/.venv-perf/bin/python" -c "import _secantus_server as s; print('embedded server', s.__version__)"
 echo "perf environment ready at $PERF_REF"
 "#;
@@ -242,13 +242,13 @@ echo "perf environment ready at $PERF_REF"
 ///
 /// The systemd units this harness installs for the throughput benchmark bind
 /// the same ports these harnesses want, so they are stopped first -- and a
-/// running `secantusd-rs` or `mongod` would also be competing for CPU, which
+/// running `secantusd-mdb` or `mongod` would also be competing for CPU, which
 /// is precisely the contamination the droplet exists to avoid.
 const PERF_RUN: &str = r#"
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 cd "$PERF_DIR"
-systemctl stop secantusd-rs 2>/dev/null || true
+systemctl stop secantusd-mdb 2>/dev/null || true
 systemctl stop mongod 2>/dev/null || true
 sleep 2
 mkdir -p bench/results

@@ -1,6 +1,6 @@
 # Rust MongoDB server: the backlog -- plan (2026-10-14)
 
-Scope: what is still open for `secantusd-rs` against mongod 8.2.11, taken from
+Scope: what is still open for `secantusd-mdb` against mongod 8.2.11, taken from
 `tasks/backlog.md` §7 (7.064 to 7.084, measured by the probes this month,
 plus the open lines of 7.05 and 7.06). Every entry of 7.00 to 7.04 and 7.5 to
 7.8 is closed. The exemplar is mongod only; the Python server is never the
@@ -42,7 +42,7 @@ Four rows do not match the figures their backlog entries give:
 `transactions` (backlog 7.072: 11, counted in scenarios), `cursor_commands`
 (7.073: 5 scenarios), `change_stream_commands` (7.074: 5 results) and
 `insert_delete_count_distinct` (7.078: 32). The binary tree this table was
-measured on is not recorded. Re-run a probe, and record `secantusd-rs
+measured on is not recorded. Re-run a probe, and record `secantusd-mdb
 --version`, before quoting its row anywhere.
 
 ## How each batch lands
@@ -356,7 +356,7 @@ Each unblocks rows that otherwise stay open.
 | A schema change under an open transaction (RM-084) | model mongod's collection locks; DDL waits and answers 50 at `maxTimeMS` |
 | Privileges of the `secantusAdmin` commands | keep the mapping; scope decision (formerly RM-028) |
 | `explain` | mongod's plan; where the router reads differently, bring the router to the plan (RM-094) |
-| Stored time-series buckets (RM-088) | done 2026-11-11 (#2684): real BSONColumn buckets, with the catalog above; what is left is RM-457, RM-548, RM-549 |
+| Stored time-series buckets (RM-088) | done 2026-11-11 (#2684): real BSONColumn buckets, with the catalog above; what is left is RM-457, RM-548, RM-709, RM-710, RM-711 (RM-549, split) |
 | Profiler and `Slow query` execution statistics (RM-023, done 2026-10-27) | counted during execution, with the streaming cursors; what is left is RM-355, RM-357 to RM-364 |
 | Wire compression | already speaks snappy, zstd and zlib (2026-10-15); add the `serverStatus` counters (RM-147) |
 | Server-side JavaScript | keep refusing; scope decision (formerly RM-009); the two Go `$where` leaves are expected failures |

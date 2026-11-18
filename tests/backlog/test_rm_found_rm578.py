@@ -32,11 +32,12 @@ def _execution_stats(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-707")
+@pytest.mark.backlog_fixed("RM-707")
 def test_a_geo_near_stage_reports_mongods_execution_stats(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's GEO_NEAR_2D reports `searchIntervals`, the rings'
     `inputStages`, its work counts and 52 keys examined for twelve points.
-    This server's stage reports none of them and counts no keys."""
+    This server's stage reported none of them and counted no keys, until it
+    ran mongod's ring search, scan by scan (RM-707)."""
     answers = {
         server: _execution_stats(client)
         for server, client in (("mongod", mongod), ("rust", rust_mongo))

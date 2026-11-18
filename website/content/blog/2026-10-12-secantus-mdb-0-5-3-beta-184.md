@@ -7,8 +7,8 @@ Tags: release
 
 Summary: secantus-mdb 0.5.3-beta.184 reports the plan mongod reports from explain, with index bounds and the stages of count, distinct and the write commands, and refuses an unknown query operator on an empty collection.
 
-If your tests run a query against an empty collection on `secantusd-rs`,
-upgrade. One thing in this release could leave a test passing on a query
+If you run a query against an empty collection on `secantusd-rs`,
+upgrade. One thing in this release could leave an application accepting a query
 `mongod` refuses.
 
 - **An unknown query operator was accepted when there was nothing to
@@ -63,7 +63,7 @@ plan shows an index. The results are the same.
 We ran the pymongo, Go and Node driver suites against this code. Each gave
 the same result as the release before.
 
-This is a server for tests. It is single-node and it is a beta.
+This is a real single-node database, and it is a beta.
 
 `cargo install secantus-mdb --version 0.5.3-beta.184` builds it from crates.io.
 Binaries for Linux x86_64, macOS arm64 and Windows x86_64 are on the release.

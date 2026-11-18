@@ -109,12 +109,89 @@ pub(crate) fn refusal_is_profiled(name: &str) -> bool {
     matches!(name, "listIndexes" | "collStats" | "collstats")
 }
 
-/// The reply to a command mongod refuses on a view, or `None` to run it.
-pub(crate) fn refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Option<Document> {
+/// The view an `aggregate`'s `$out` writes to, when `reply` is mongod's
+/// refusal of it (166). A `$merge` into a view: `refused_merge_into_view`.
+pub(crate) fn refused_out_view(
+    name: &str,
+    doc: &Document,
+    reply: &Document,
+    ctx: &CommandContext,
+) -> Option<String> {
+    if name != "aggregate" || reply.get_i32("code") != Ok(166) {
+        return None;
+    }
+    let stage = doc.get_array("pipeline").ok()?.last()?.as_document()?;
+    if !stage.contains_key("$out") {
+        return None;
+    }
+    let (db, coll) = write_target(stage, &ctx.db_name)?;
+    is_view(ctx.storage.as_ref()?.as_ref(), &db, &coll).then(|| format!("{db}.{coll}"))
+}
+
+/// Whether `reply` is mongod's refusal (166) of an `aggregate` whose
+/// `$merge` writes to a view. mongod 8.2.11 profiles it under the
+/// collection the pipeline reads (`<db>.c`, `ok: 0`), not the view (RM-592).
+pub(crate) fn refused_merge_into_view(
+    name: &str,
+    doc: &Document,
+    reply: &Document,
+    ctx: &CommandContext,
+) -> bool {
+    if name != "aggregate" || reply.get_i32("code") != Ok(166) {
+        return false;
+    }
+    let Some(stage) = doc
+        .get_array("pipeline")
+        .ok()
+        .and_then(|p| p.last())
+        .and_then(|s| s.as_document())
+    else {
+        return false;
+    };
+    if !stage.contains_key("$merge") {
+        return false;
+    }
+    let Some((db, coll)) = write_target(stage, &ctx.db_name) else {
+        return false;
+    };
+    ctx.storage
+        .as_ref()
+        .is_some_and(|s| is_view(s.as_ref(), &db, &coll))
+}
+
+/// Whether `reply` is the refusal (166) of an `aggregate` whose pipeline
+/// opens a change stream: `refusal` answers it only for a view.
+pub(crate) fn is_change_stream_refusal(name: &str, doc: &Document, reply: &Document) -> bool {
+    name == "aggregate"
+        && reply.get_i32("code") == Ok(166)
+        && doc
+            .get_array("pipeline")
+            .ok()
+            .and_then(|p| p.first())
+            .and_then(Bson::as_document)
+            .and_then(|s| s.keys().next())
+            .is_some_and(|k| k == "$changeStream")
+}
+
+/// Whether `doc` is an `insert`, `update` or `delete` of a view.
+pub(crate) fn is_view_write(name: &str, doc: &Document, ctx: &CommandContext) -> bool {
+    matches!(name, "insert" | "update" | "delete")
+        && ctx.storage.as_ref().is_some_and(|storage| {
+            doc.get_str(name).is_ok_and(|coll| {
+                coll != "system.views" && is_view(storage.as_ref(), &ctx.db_name, coll)
+            })
+        })
+}
+
+/// The reply to an `insert`, `update` or `delete` of a view, or `None` to
+/// run it. mongod 8.2.11 refuses the write once it holds the namespace: a
+/// retryable one after checking its session out, an insert after its write
+/// rounds, a statement of a transaction under the transaction's locks, so
+/// `run_handler` asks here once it holds the statement's locks, under its
+/// slow-operation and current-operation scopes (RM-589).
+pub(crate) fn write_refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Option<Document> {
     let storage = ctx.storage.as_ref()?;
     let db = ctx.db_name.as_str();
-    // `system.views` holds the definitions and is not one of them: a write
-    // to it has a refusal of its own, which the handler gives.
     let view = |coll: &str| coll != "system.views" && is_view(storage.as_ref(), db, coll);
     match name {
         // A write reports one error per statement, or only the first when the
@@ -145,12 +222,17 @@ pub(crate) fn refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Optio
                 .collect();
             // Each statement it tried has a line of its own before the
             // command's, an insert's none (measured 8.2.11, RM-487).
+            let in_txn = doc.get("autocommit") == Some(&Bson::Boolean(false));
+            let _slow = crate::slowop::enter(ctx);
+            let _current = crate::lock_manager::enter(ctx.locks.as_ref());
+            // An insert's two write rounds come before the view is found
+            // (measured 8.2.11, RM-589).
+            if name == "insert" && !in_txn {
+                drop(crate::lock_manager::write_rounds(db, coll, 2));
+            }
             if name != "insert" {
                 let op = if name == "update" { "update" } else { "remove" };
                 let specs = doc.get_array(statements).map(Vec::as_slice).unwrap_or(&[]);
-                let in_txn = doc.get("autocommit") == Some(&Bson::Boolean(false));
-                let _slow = crate::slowop::enter(ctx);
-                let _current = crate::lock_manager::enter(ctx.locks.as_ref());
                 for (spec, error) in specs.iter().zip(&errors) {
                     let spec = spec.as_document().cloned().unwrap_or_default();
                     crate::profiler::refused_statement(db, coll, op, &spec, error, doc, !in_txn);
@@ -164,6 +246,21 @@ pub(crate) fn refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Optio
             reply.insert("ok", 1.0);
             Some(reply)
         }
+        _ => None,
+    }
+}
+
+/// The reply to a command mongod refuses on a view, or `None` to run it.
+pub(crate) fn refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Option<Document> {
+    let storage = ctx.storage.as_ref()?;
+    let db = ctx.db_name.as_str();
+    // `system.views` holds the definitions and is not one of them: a write
+    // to it has a refusal of its own, which the handler gives.
+    let view = |coll: &str| coll != "system.views" && is_view(storage.as_ref(), db, coll);
+    match name {
+        // A write is refused where mongod refuses it, holding its session
+        // and its locks: `write_refusal`, from `run_handler` (RM-589).
+        "insert" | "update" | "delete" => None,
         "findAndModify" | "findandmodify" | "createIndexes" | "listIndexes" | "dropIndexes"
         | "deleteIndexes" | "collStats" | "collstats" => {
             let coll = doc.get_str(name).ok()?;
@@ -194,7 +291,22 @@ pub(crate) fn refusal(name: &str, doc: &Document, ctx: &CommandContext) -> Optio
                     Some("$changeStream") if ctx.replica_set_name.is_some() => {
                         return Some(unsupported(not_a_collection(&ns)));
                     }
-                    Some("$collStats") => return Some(executor(not_a_collection(&ns))),
+                    // mongod answers a view's `$collStats: {}` and its
+                    // `latencyStats`, and refuses the statistics only a
+                    // collection keeps (RM-590, measured 8.2.11).
+                    Some("$collStats")
+                        if pipeline
+                            .first()
+                            .and_then(Bson::as_document)
+                            .and_then(|s| s.get_document("$collStats").ok())
+                            .is_some_and(|spec| {
+                                ["count", "storageStats", "queryExecStats"]
+                                    .iter()
+                                    .any(|k| spec.contains_key(*k))
+                            }) =>
+                    {
+                        return Some(executor(not_a_collection(&ns)));
+                    }
                     _ => {}
                 }
             }

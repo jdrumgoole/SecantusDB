@@ -455,7 +455,7 @@ up. **All five surfaces are now done** (2026-08-29):
       **The Rust server does NOT share the crashes** — its `as_i64` returns
       `None` where Python's `int()` raises — but it does share the
       accepted-and-ignored family; that belongs to the standing "point the same
-      probe at `secantusd-rs`" item in 1b and is not closed here.
+      probe at `secantusd-mdb`" item in 1b and is not closed here.
       One test was pinning the permissive behaviour, the third instance this
       week: `test_tailable_drop_closes_pymongo_cursor_cleanly` set
       `max_await_time_ms` on a plain `TAILABLE` cursor, which real mongod

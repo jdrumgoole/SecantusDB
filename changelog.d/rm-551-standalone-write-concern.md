@@ -1,6 +1,6 @@
 ### Rust MongoDB server: a standalone implies `w: 1` and refuses the default-concern commands
 
-`secantusd-rs --standalone` kept a replica-set member's write-concern
+`secantusd-mdb --standalone` kept a replica-set member's write-concern
 machinery. It now behaves as mongod 8.2.11 does as a standalone.
 
 #### Fixed

@@ -1,0 +1,10 @@
+<section id="exemplar" class="dark">
+<p class="eyebrow">Act two · How do you know it’s right?</p>
+<h2>Run it against the real server. Don’t reason about the source.</h2>
+<div class="cards">
+<div class="card rise" style="--i:0"><h3>One exemplar</h3><p class="body">mongod 8.x and PostgreSQL. Never another SecantusDB server, never our own docs.</p></div>
+<div class="card rise" style="--i:1"><h3>Differential probes</h3><p class="body">Same pymongo code against SecantusDB and real mongod; diff the answers, including BSON types.</p></div>
+<div class="card rise" style="--i:2"><h3>Parity isn’t correctness</h3><p class="body">Our Python and Rust servers once agreed on $bucket, $densify and $stdDev — and were both wrong.</p></div>
+</div>
+<aside>Every real bug in our August sweeps came from executing behaviour and comparing, not from reading code. Estimates from reading code were wrong in both directions. Tell the $asinh story briefly: two of our own engines agreed, mongod disagreed. ~3 min.</aside>
+</section>

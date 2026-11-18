@@ -21,7 +21,7 @@ Rust**, both over the WiredTiger storage engine (vendored at
 
 | server | binary | crate | wire |
 | --- | --- | --- | --- |
-| MongoDB server | `secantusd-rs` | `crates/secantusdb` (ships as `secantus-mdb`) | MongoDB (`OP_MSG`, `OP_QUERY`, `OP_COMPRESSED`) |
+| MongoDB server | `secantusd-mdb` | `crates/secantusdb` (ships as `secantus-mdb`) | MongoDB (`OP_MSG`, `OP_QUERY`, `OP_COMPRESSED`) |
 | PostgreSQL server | `secantusd-pg` | `crates/secantus-pg` (ships as `secantus-pg`) | PostgreSQL v3 frontend/backend protocol |
 
 They are distributed **only** as crates on crates.io and as prebuilt

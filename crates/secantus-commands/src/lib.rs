@@ -313,6 +313,17 @@ pub struct CommandContext {
     /// The views the operation resolved, as its line's and profile entry's
     /// `resolvedViews` list them (RM-362).
     pub resolved_views: Option<Vec<Bson>>,
+    /// The view an `$out` was refused for writing to: mongod 8.2.11 names it
+    /// on the aggregate's line and profile entry (RM-591).
+    pub refused_out_view: Option<String>,
+    /// The operation ended before it acquired the collection it names, so
+    /// its line names `<db>.$cmd`: a `create` of a collection that exists
+    /// with the same options (measured 8.2.11, RM-595).
+    pub unacquired: bool,
+    /// The collection a command worked through rather than the one it
+    /// named: a `convertToCapped`'s temporary copy, which mongod 8.2.11's
+    /// line names (RM-596).
+    pub worked_through: Option<String>,
     /// How many documents a `findAndModify` changed, for its line.
     pub modified: Option<i64>,
     /// How long the operation waited for its write concern, in ms.
@@ -437,6 +448,9 @@ impl CommandContext {
             flow_control_tickets: 0,
             planning_micros: None,
             resolved_views: None,
+            refused_out_view: None,
+            unacquired: false,
+            worked_through: None,
             modified: None,
             write_concern_wait: None,
             last_op_seq: 0,
@@ -768,10 +782,10 @@ fn lookup(name: &str) -> Option<Handler> {
         "listDatabases" => stats_admin::list_databases,
         "listIndexes" => admin::list_indexes,
         "createIndexes" => admin::create_indexes,
-        "createSearchIndexes" | "updateSearchIndex" | "dropSearchIndex" => {
+        "createSearchIndexes" | "updateSearchIndex" | "dropSearchIndex" | "listSearchIndexes" => {
             admin::search_index_not_supported
         }
-        "dropIndexes" => admin::drop_indexes,
+        "dropIndexes" | "deleteIndexes" => admin::drop_indexes,
         "dropDatabase" => admin::drop_database,
         "renameCollection" => admin::rename_collection,
         "collStats" | "collstats" => stats_admin::coll_stats,
@@ -974,6 +988,9 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     ctx.flow_control_tickets = 0;
     ctx.planning_micros = None;
     ctx.resolved_views = None;
+    ctx.refused_out_view = None;
+    ctx.unacquired = false;
+    ctx.worked_through = None;
     ctx.modified = None;
     ctx.write_concern_wait = None;
     ctx.cpu_nanos = None;
@@ -1323,7 +1340,8 @@ fn attach_write_concern_error(wc: &Document, provenance: &str, reply: &mut Docum
 /// because `writeConcernMajorityJournalDefault` is true on this one-member
 /// set -- and that is the implicit default, so a write with no write concern
 /// at all is journaled, as on mongod 8.2.11. `w: 0` never waits. A statement
-/// inside a transaction takes no write concern; its commit does.
+/// inside a transaction takes no write concern; its commit and its abort
+/// do (mongod 8.2.11: the abort's line counts the wait's ticket, RM-355).
 fn wants_journal(
     name: &str,
     doc: &Document,
@@ -1332,8 +1350,8 @@ fn wants_journal(
     standalone: bool,
 ) -> bool {
     let in_transaction = doc.contains_key("autocommit");
-    let takes =
-        name == "commitTransaction" || (!in_transaction && takes_default_write_concern(name, doc));
+    let takes = matches!(name, "commitTransaction" | "abortTransaction")
+        || (!in_transaction && takes_default_write_concern(name, doc));
     if !takes {
         return false;
     }
@@ -1369,6 +1387,7 @@ pub(crate) fn takes_default_write_concern(name: &str, doc: &Document) -> bool {
         | "create"
         | "createIndexes"
         | "dropIndexes"
+        | "deleteIndexes"
         | "drop"
         | "dropDatabase"
         | "renameCollection"
@@ -1534,6 +1553,7 @@ fn is_write_concern_command(name: &str) -> bool {
             | "createIndexes"
             | "drop"
             | "dropIndexes"
+            | "deleteIndexes"
             | "dropDatabase"
             | "renameCollection"
     )
@@ -1734,6 +1754,7 @@ fn collection_name_problem(name: &str, doc: &Document, db: &str) -> Option<Comma
             | "create"
             | "collMod"
             | "dropIndexes"
+            | "deleteIndexes"
             | "collStats"
             | "collstats"
             | "validate"
@@ -1792,9 +1813,10 @@ fn parse_before_locks(
         }
         "aggregate" => aggregate::parse(doc, db, false).map(drop),
         "count" => crud::count_parse(doc),
+        "create" => admin::create_parse(doc),
         "findAndModify" | "findandmodify" => findandmodify::parse(doc),
         "createIndexes" => argtypes::require_index_specs(doc),
-        "dropIndexes" => admin::drop_indexes_parse(doc).map(drop),
+        "dropIndexes" | "deleteIndexes" => admin::drop_indexes_parse(doc).map(drop),
         "dbStats" | "dbstats" => stats_admin::parse_db_stats(doc).map(drop),
         "listDatabases" => stats_admin::parse_list_databases(doc).map(drop),
         "drop" => admin::drop_parse(doc),
@@ -1944,6 +1966,17 @@ fn dispatch_inner(
                 return e.into_reply();
             }
             ctx.parsed = true;
+            // `listDatabases` on another database than `admin` is refused
+            // once it has parsed: logged, but not a connection's first
+            // command (measured 8.2.11, RM-602).
+            if name == "listDatabases" && ctx.db_name != "admin" {
+                return CommandError::new(
+                    13,
+                    "Unauthorized",
+                    "listDatabases may only be run against the admin database.",
+                )
+                .into_reply();
+            }
             // Auth gating + RBAC run after CommandNotFound but before the
             // handler (mirrors `commands.py::dispatch`), so an unknown command
             // is still `59` rather than `13` even under `--auth`.
@@ -2026,7 +2059,10 @@ fn dispatch_inner(
             }
             // Ingress admission control, where mongod's `_initiateCommand`
             // admits: parsed, authorized, under its `maxTimeMS` (RM-355).
+            // One that never got its ticket acquired no collection, so its
+            // line names `<db>.$cmd` (measured 8.2.11, 2026-11-08).
             if let Err(e) = admit_ingress(name, doc, ctx) {
+                ctx.unacquired = true;
                 return e.into_reply();
             }
             if max_time_forced_to_expire(name, doc, ctx) {
@@ -2094,11 +2130,35 @@ fn dispatch_inner(
                         }
                         drop(locks);
                         profiler::mark_reached(ctx);
+                    } else if let Some(ns) = views::refused_out_view(name, doc, &reply, ctx) {
+                        // mongod's `$out` takes its target's namespace and
+                        // finds the view there: its line and entry name the
+                        // view (measured 8.2.11, RM-591).
+                        profiler::note_namespace(ns.clone());
+                        ctx.refused_out_view = Some(ns);
+                        profiler::mark_reached(ctx);
+                    } else if views::refused_merge_into_view(name, doc, &reply, ctx) {
+                        // mongod's `$merge` refuses the view after the
+                        // aggregate took its source's namespace: its entry
+                        // names the source (measured 8.2.11, RM-592).
+                        profiler::mark_reached(ctx);
+                    } else if views::is_change_stream_refusal(name, doc, &reply) {
+                        // mongod refuses a `$changeStream` of a view as it
+                        // resolves the pipeline, and writes no `Slow query`
+                        // line for it (measured 8.2.11, RM-593).
+                        ctx.slow_log = Some(false);
                     }
                     return reply;
                 }
             }
-            profiler::mark_reached(ctx);
+            // A write of a view outside a transaction is refused in the run
+            // (`views::write_refusal`), and mongod 8.2.11 profiles none
+            // (RM-589).
+            let view_write = doc.get("autocommit") != Some(&Bson::Boolean(false))
+                && views::is_view_write(name, doc, ctx);
+            if !view_write {
+                profiler::mark_reached(ctx);
+            }
             let mut reply = session::run(name, handler, doc, ctx);
             // A failpoint-configured writeConcernError attaches to a successful reply,
             // AND so do the failpoint's errorLabels. The labels are what make the
@@ -2528,6 +2588,12 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
         if let Some(reply) = index_builds::before_locks(doc, ctx) {
             return reply;
         }
+    }
+    // A write of a view is refused here, after its session is checked out
+    // (or under its transaction's locks), taking the rounds mongod takes
+    // before it finds the view (RM-589).
+    if let Some(reply) = views::write_refusal(command_name(doc), doc, ctx) {
+        return reply;
     }
     // A `getMore` of a pipeline whose cursor stage takes its own locks as
     // it fills its buffer takes none of its own (RM-360).

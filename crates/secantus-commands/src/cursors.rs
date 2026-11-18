@@ -263,6 +263,39 @@ pub struct CursorCounts {
     /// A query-layer sort read through the cursor stage, which counts it
     /// again at each buffer it loads (RM-326).
     pub loads: Option<CursorLoads>,
+    /// A read run whole whose plan's examining each batch reports as far
+    /// as that batch went (RM-708).
+    pub examined: Option<BatchExamined>,
+    /// A `$sort` read through mongod's cursor stage after the stages its
+    /// slot-based engine took (RM-360): the pipeline interrupt checker's
+    /// ticks to its next check, which each `getMore` goes on counting.
+    pub ticks: Option<u32>,
+}
+
+/// What a plan read whole examined as it returned each document, `(keys,
+/// docs)`, and in all; and how many documents the cursor has returned.
+#[derive(Debug, Clone)]
+pub struct BatchExamined {
+    pub marks: Vec<(i64, i64)>,
+    pub all: (i64, i64),
+    pub returned: usize,
+    pub plan_summary: Option<String>,
+    pub command: Document,
+}
+
+impl BatchExamined {
+    /// What a batch of `n` more documents examined: up to its last
+    /// document, and to the end of the read when it ends the cursor.
+    fn batch(&self, n: usize, exhausted: bool) -> (i64, i64) {
+        let at = |i: usize| i.checked_sub(1).and_then(|i| self.marks.get(i).copied());
+        let before = at(self.returned).unwrap_or((0, 0));
+        let after = if exhausted {
+            self.all
+        } else {
+            at(self.returned + n).unwrap_or(self.all)
+        };
+        (after.0 - before.0, after.1 - before.1)
+    }
 }
 
 /// A query-layer sort read through mongod's cursor stage, and how far the
@@ -622,6 +655,15 @@ impl CursorRegistry {
             e.streaming = true;
         }
         Ok(id)
+    }
+
+    /// Mark `cursor_id`'s `getMore`s as taking no lock of their own: its
+    /// read was all done by the command that opened it (RM-360).
+    pub fn set_locks_internally(&self, cursor_id: i64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = inner.cursors.get_mut(&cursor_id) {
+            e.locks_internally = true;
+        }
     }
 
     /// Whether a `getMore` of `cursor_id` takes no lock of its own, its
@@ -1181,7 +1223,32 @@ fn mint_id(cursors: &HashMap<i64, Entry>, tailable: bool) -> Result<i64, CursorE
 /// connection's first command (RM-386, measured 8.2.11). The cursor's id.
 pub(crate) fn get_more_parse(doc: &Document) -> Result<i64, CommandError> {
     // mongod PARSES before it looks the cursor up, so a wrong-typed argument is
-    // its own error rather than CursorNotFound about a cursor that exists.
+    // its own error rather than CursorNotFound about a cursor that exists. Its
+    // IDL checks the other fields' types and unknown fields first, then the
+    // required `collection`, and the command-name field (the cursor id) last:
+    // `{getMore: 1}` is refused for the missing `collection` (RM-606,
+    // measured 8.2.11).
+    if doc.contains_key("collection") {
+        argtypes::require_required_string(doc, "collection", "getMore.collection")?;
+    }
+    argtypes::require_number(doc, "batchSize", "getMore.batchSize")?;
+    argtypes::require_number(doc, "maxTimeMS", "getMore.maxTimeMS")?;
+    const FIELDS: &[&str] = &[
+        "getMore",
+        "collection",
+        "batchSize",
+        "term",
+        "lastKnownCommittedOpTime",
+        "includeQueryStatsMetrics",
+    ];
+    if let Some(key) = argtypes::unknown_field(doc, FIELDS) {
+        return Err(CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field 'getMore.{key}' is an unknown field."),
+        ));
+    }
+    argtypes::require_required_string(doc, "collection", "getMore.collection")?;
     let cursor_id = match doc.get("getMore") {
         Some(Bson::Int64(id)) => *id,
         None | Some(Bson::Null) => {
@@ -1202,24 +1269,6 @@ pub(crate) fn get_more_parse(doc: &Document) -> Result<i64, CommandError> {
             ))
         }
     };
-    argtypes::require_required_string(doc, "collection", "getMore.collection")?;
-    argtypes::require_number(doc, "batchSize", "getMore.batchSize")?;
-    argtypes::require_number(doc, "maxTimeMS", "getMore.maxTimeMS")?;
-    const FIELDS: &[&str] = &[
-        "getMore",
-        "collection",
-        "batchSize",
-        "term",
-        "lastKnownCommittedOpTime",
-        "includeQueryStatsMetrics",
-    ];
-    if let Some(key) = argtypes::unknown_field(doc, FIELDS) {
-        return Err(CommandError::new(
-            40415,
-            "IDLUnknownField",
-            format!("BSON field 'getMore.{key}' is an unknown field."),
-        ));
-    }
     if let Some(n) = doc.get("batchSize").and_then(as_i64).filter(|n| *n < 0) {
         return Err(CommandError::new(
             2,
@@ -1356,9 +1405,24 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // newly-appended entries). killCursors wakes this via notify.
             // The wait holds no execution ticket, as mongod's lets its
             // locks and ticket go while it waits for data (RM-355).
-            let slice = (deadline - now).min(Duration::from_millis(100));
-            crate::lock_manager::without_ticket(|| {
-                storage.wait_for_oplog(position, slice.as_millis() as u64)
+            // mongod 8.2.11 yields twice for each wait for data -- the
+            // executor's yield on reaching the end, then the yield it waits
+            // for inserts in -- and each takes its ticket again (measured
+            // 2026-11-17: 4 execution admissions for a getMore that waits
+            // once, 6 for one woken by a write its filter rejects, which
+            // waits twice). So: one empty yield, then ONE ticketless wait
+            // for the whole of it; the 100 ms slices only let `killOp` and
+            // the deadline be seen, and take no ticket of their own (RM-355).
+            crate::lock_manager::without_ticket(|| ());
+            crate::lock_manager::without_ticket(|| loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() || crate::ops::current_killed() {
+                    break;
+                }
+                let slice = left.min(Duration::from_millis(100));
+                if storage.wait_for_oplog(position, slice.as_millis().max(1) as u64) > position {
+                    break;
+                }
             });
             awaited += now.elapsed();
         }
@@ -1453,11 +1517,31 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             batch.len(),
             exhausted,
             batch_size,
-        );
-        // A cursor whose documents were all read for its first batch: its
-        // `getMore` names the command that opened it, and examines nothing
-        // (measured 8.2.11).
-        if let Some(origin) = counts.origin {
+        )?;
+        if let Some(examined) = counts.examined {
+            let (keys, docs) = examined.batch(batch.len(), exhausted);
+            let returned = examined.returned + batch.len();
+            cursors.update_counts(cursor_id, |c| {
+                if let Some(e) = c.examined.as_mut() {
+                    e.returned = returned;
+                }
+            });
+            ctx.exec_stats = Some(crate::ExecStats {
+                keys_examined: keys,
+                docs_examined: docs,
+                cursor_id,
+                exhausted,
+                plan_summary: examined.plan_summary,
+                originating_command: Some(examined.command),
+                write_concern: info.write_concern,
+                has_sort_stage: counts.has_sort_stage,
+                exec_stages: None,
+                write_run: None,
+            });
+        } else if let Some(origin) = counts.origin {
+            // A cursor whose documents were all read for its first batch: its
+            // `getMore` names the command that opened it, and examines nothing
+            // (measured 8.2.11).
             ctx.exec_stats = Some(crate::ExecStats {
                 keys_examined: 0,
                 docs_examined: 0,
@@ -1552,7 +1636,7 @@ fn stream_get_more(
             batch.docs.len(),
             batch.exhausted,
             batch_size,
-        );
+        )?;
     }
     let open = !batch.exhausted;
     ctx.exec_stats = Some(crate::ExecStats {
@@ -1600,16 +1684,27 @@ fn report_counts(
     returned: usize,
     exhausted: bool,
     batch_size: Option<i64>,
-) {
+) -> Result<(), CommandError> {
     secantus_core::memlimit::add_report(&counts.reported);
-    let Some(mut loads) = counts.loads.clone() else {
-        return;
-    };
     let found_end = exhausted && batch_size.is_none_or(|n| (returned as i64) < n);
+    // The `$sort` after the cursor stage passes on each document with one
+    // `getNext`, and one more finds its end, each a tick of the pipeline's
+    // checker, which goes on from the batch before (RM-360).
+    if let Some(ticks) = counts.ticks {
+        secantus_core::deadline::resume_ticks(ticks);
+        secantus_core::deadline::tick_stages((returned + usize::from(found_end)) as u64)?;
+        secantus_core::deadline::pipeline_counted();
+        let left = secantus_core::deadline::ticks_to_check();
+        cursors.update_counts(cursor_id, |c| c.ticks = Some(left));
+    }
+    let Some(mut loads) = counts.loads.clone() else {
+        return Ok(());
+    };
     if let Some(extra) = loads.pull(returned + usize::from(found_end)) {
         secantus_core::memlimit::add_sort_counts(&loads.sort, extra);
     }
     cursors.update_counts(cursor_id, |c| c.loads = Some(loads));
+    Ok(())
 }
 
 /// The operation ended with cursor `cursor_id` open: keep what it reported
@@ -1837,6 +1932,24 @@ mod tests {
     use super::*;
     use crate::dispatch;
     use std::sync::{Arc, Mutex as StdMutex};
+
+    /// Each batch counts as far as its last document, the last to the end
+    /// of the read (RM-708: ten documents, two of them filtered out after
+    /// the last match, read four at a time).
+    #[test]
+    fn a_batch_examines_as_far_as_it_went() {
+        let mut e = BatchExamined {
+            marks: (1..=8).map(|d| (0, d)).collect(),
+            all: (0, 10),
+            returned: 4,
+            plan_summary: None,
+            command: Document::new(),
+        };
+        assert_eq!(e.batch(0, false), (0, 0));
+        assert_eq!(e.batch(4, true), (0, 6));
+        e.returned = 0;
+        assert_eq!(e.batch(4, false), (0, 4));
+    }
 
     fn enc(d: &Document) -> Vec<u8> {
         let mut v = Vec::new();

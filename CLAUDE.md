@@ -4,12 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-SecantusDB is a **surrogate single-node database**. It speaks real wire protocols on a real TCP socket over the same **WiredTiger** storage engine MongoDB ships, so an application's tests can run against it instead of standing up a real `mongod` or `postgres`. "Surrogate" rather than "fake" — these really are database servers, just intentionally scoped to single-node operation.
+SecantusDB is a **real single-node database** (Joe, 2026-11-17: "lose the 'for your tests' angle ... We are building a real database, not a toy"). It speaks real wire protocols on a real TCP socket over the same **WiredTiger** storage engine MongoDB ships, so any `pymongo` / `mongosh` / `psycopg` / `psql` client talks to it as it would to `mongod` or `postgres`. These are database servers, intentionally scoped to single-node operation. Do not describe them as a test double, a fake, a surrogate, an emulator or a tool for running your tests; tests are one legitimate use among many, not the pitch.
 
 **Four servers, two wire protocols, one storage format.** The Rust pair is the
 product. **The Python pair is FULLY DEPRECATED** (Joe, 2026-10-14: "We are
-focussed on rust servers only"; 2026-10-20: stop publishing to PyPI, and take
-the Python servers out of CI and the release process).
+focussed on rust servers only"; 2026-10-20: stop publishing them to PyPI, and
+take the Python servers out of CI and the release process; 2026-11-16: PyPI
+carries the Rust servers instead).
 
 **What fully deprecated means here:**
 - **All new work goes to the Rust servers.** Do not add features, operators,
@@ -18,7 +19,8 @@ the Python servers out of CI and the release process).
 - **The Python servers are not the reference for anything.** The exemplar
   was always the real product (`mongod`, PostgreSQL; see "Design
   constraints"); the Python code remains readable prior art, nothing more.
-- **Nothing publishes them, and CI does not test them** (2026-10-20). A
+- **Nothing publishes them, and CI does not test them** (2026-10-20); the
+  PyPI wheel carries only the Rust servers. A
   Python-server test a change breaks is not your problem to fix. pytest stays
   the test runner, including for the Rust servers' Python test files.
 - **Do not delete the `secantus` package.** Every Rust job builds WiredTiger
@@ -33,7 +35,7 @@ the Python servers out of CI and the release process).
 
 | server | binary / entry point | wire | role |
 | --- | --- | --- | --- |
-| **Rust MongoDB server** | `secantusd-rs` (`crates/secantusdb`) | MongoDB | **the flagship.** Ships as the `secantus-mdb` crate (crates.io) and prebuilt binaries per platform |
+| **Rust MongoDB server** | `secantusd-mdb` (`crates/secantusdb`) | MongoDB | **the flagship.** Ships as the `secantus-mdb` crate (crates.io) and prebuilt binaries per platform |
 | **Rust PostgreSQL server** | `secantusd-pg` (`crates/secantus-pg`) | PostgreSQL | **the newest.** Ships as the `secantus-pg` crate (on crates.io since `0.1.0-beta.3`, 2026-10-07) and standalone binaries on the `secantusd-pg-v*` releases (Linux x86_64, macOS arm64); builds from its own directory |
 | Python MongoDB server | `SecantusDBServer` / `secantusd-py` | MongoDB | **fully deprecated** (2026-10-20): not tested in CI, not published |
 | Python PostgreSQL server | `secantusd-py-pg` (`secantus.sql.pgserver`) | PostgreSQL | **fully deprecated** (2026-10-20): not tested in CI, not published |
@@ -46,7 +48,7 @@ promise -- breaking it is silent data loss. Cross-protocol between them is
 proven in ONE direction and never concurrently (measured 2026-09-18, pinned in
 `tests/test_rust_pgserver_slice.py`):
   - SQL -> MongoDB **works**: a `secantusd-pg` table reads back through
-    `secantusd-rs` as a collection, with the `PRIMARY KEY` as `_id`.
+    `secantusd-mdb` as a collection, with the `PRIMARY KEY` as `_id`.
   - MongoDB -> SQL **does not**: the Rust PG server resolves names through
     `__sql_catalog__`, which only `CREATE TABLE` writes. The Python SQL layer's
     sampling of uncatalogued collections does NOT carry across.
@@ -56,12 +58,19 @@ proven in ONE direction and never concurrently (measured 2026-09-18, pinned in
 
 The import package is `secantus`; the public Python class is `SecantusDBServer`.
 
-**Distribution: crates and tagged binaries only; nothing goes to PyPI**
-(2026-10-20): the `secantus-mdb` crate (`secantusd-rs`, `secantus_mdb::Server`)
+**Distribution: crates, tagged binaries, and one PyPI wheel of both Rust
+servers.** The `secantus-mdb` crate (`secantusd-mdb`, `secantus_mdb::Server`)
 plus `secantusdb-v*` binaries, and the `secantus-pg` crate plus `secantusd-pg-v*`
-binaries. The embedded Python `RustServer` / `PgServer` handles are a
-SOURCE-BUILD tool for this repo's tests -- never document them to users as
-something `pip install` provides.
+binaries. Since 2026-11-16 (Joe) the `SecantusDB` project on PyPI is back,
+with different contents: `publish-pypi.yml` repackages the released
+`secantusd-mdb` and the newest released `secantusd-pg` into one
+`py3-none` wheel per platform (Linux x86_64, macOS arm64), versioned as the
+MongoDB server (`0.5.3-beta.196` -> `0.5.3b196`), with the `secantusdb`
+launcher (`MongoServer` / `PostgresServer`; `packaging/pypi/`). It runs
+after every `secantusdb-v*` release; nothing is compiled in it. The wheel
+carries **no Python server**, and no other PyPI project exists. The
+embedded `RustServer` / `PgServer` handles remain a SOURCE-BUILD tool for
+this repo's tests -- never document them as something `pip install` provides.
 
 Internal references to `fongo` or `fongodb` (earlier names, dropped to avoid brand clashes) are stale -- flag and rename to `secantus` (or `SecantusDB` for the brand form).
 
@@ -77,9 +86,12 @@ own test suite reaches for, not by a feature list.
 **Explicitly out of scope:** real replica sets, sharding, multi-node consistency —
 and their SQL equivalents (streaming replication, hot standby). SecantusDB advertises itself as a single-node `secantus` replica-set primary in the `hello` reply (so `pymongo`'s topology machinery accepts change streams), but the topology is fictional — there are no other members, no elections, no cross-node oplog. If a feature only makes sense in a multi-node deployment, SecantusDB does not implement it.
 
-The audience is developers who want fast, ephemeral, single-node MongoDB or
-PostgreSQL behaviour — in a test, in CI, in a container — without running the
-real thing. Not a production-grade emulator.
+The audience is anyone who wants a single-node MongoDB or PostgreSQL
+database that is one self-contained binary — for an application, in a
+container, embedded in a program, or in a test — behaving as the real
+product does within that scope. Positioning stays modest about maturity
+(it is a beta; no production-proven or SLA claims) but never frames it as
+a toy.
 
 **Performance work belongs to the Rust servers.** A benchmark that shows a
 Python server slow is reporting the design, not a regression. Route latency /
@@ -136,7 +148,7 @@ throughput / concurrency work to `crates/`.
   hash page models, `nodeToString` for `pg_rewrite` rather than baked
   trees).
 - **Wire-protocol fidelity over feature completeness.** Prefer returning a faithful "command not supported" error over a half-implemented feature that silently diverges from real server behaviour.
-- **Ease of use for the beginning programmer:** starting a server in a test should be one or two lines, with no external processes to manage.
+- **Ease of use for the beginning programmer:** starting a server (from a program, a script or a test) should be one or two lines, with no external processes to manage.
 
 ## Never ignore or discount an error — this is a database
 
@@ -209,7 +221,7 @@ The Rust side is a Cargo workspace under `crates/`: `secantus-core` (pure-Rust
 engines + geo + aggregation, **no PyO3**), `secantus-storage` (the full WT-backed
 `Storage`, pure-Rust), `secantus-wt` (the WT FFI), plus thin PyO3 binding crates
 (`secantus-core-py` → the `_secantus_core` abi3 extension). The PyO3-free split is
-exactly what lets the Rust server / standalone `secantusd-rs` binary reuse the
+exactly what lets the Rust server / standalone `secantusd-mdb` binary reuse the
 engines.
 
 - **The parity suites (`tests/test_rust_*_parity.py`) no longer run in CI**
@@ -242,7 +254,7 @@ engines.
   ones run **unmodified** upstream test suites against SecantusDB (invocation,
   toolchains and quirks: `/conformance-gauges`). The weekly `validate.yml`
   runs every gauge against a Rust server, as a `*-rust-server` lane: the
-  MongoDB drivers against `secantusd-rs`, the SQL gauges (`--server rust`)
+  MongoDB drivers against `secantusd-mdb`, the SQL gauges (`--server rust`)
   against `secantusd-pg`. **Keep `invoke validate-all
   --jobs` at 4 or fewer** (1 for a committable number): beyond that CPU
   contention flakes timing-sensitive tests. The C++ gauge binds port 27017.
@@ -266,8 +278,8 @@ engines.
   extra uncollects ~1,700 parity tests while still exiting 0 (`batch-worktree`).
 - To run a single test serially: `uv run python -m pytest -n0 tests/path::test_name`. The `-p no:xdist` form fails because `addopts` still injects `-n auto`.
 - Sphinx docs in `docs/` (Markdown via `myst-parser`, furo theme). Built with `-W` (warnings-as-errors). `invoke docs` to build, `invoke docs-serve` to preview.
-- Never run `uv publish` / `twine upload` or push a `vX.Y.Z` tag (see
-  Distribution, above).
+- Never run `uv publish` / `twine upload` or push a `vX.Y.Z` tag: the PyPI
+  wheel publishes only from `publish-pypi.yml` (see Distribution, above).
 - The on-disk repo path is `/Users/jdrumgoole/GIT/SecantusDB`. The **import package** is `secantus` (`src/secantus/`, `import secantus`); the distribution name in `pyproject.toml` is `SecantusDB`.
 
 ## Releases and website

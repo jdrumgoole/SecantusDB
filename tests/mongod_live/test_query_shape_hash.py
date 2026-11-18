@@ -542,6 +542,105 @@ DISTINCTS: list[tuple[str, Any]] = [
 ]
 
 
+# `$jsonSchema`, shaped as the tree mongod's JSON Schema parser builds:
+# every keyword, a restriction with and without a stated type, the top
+# level's own rules, and the placeholder an `items` entry prints.
+JSON_SCHEMAS: list[dict] = [
+    {},
+    {"minimum": 1},
+    {"type": "object"},
+    {"bsonType": "int"},
+    {"bsonType": ["int", "string"]},
+    {"required": ["x"], "properties": {"x": {"bsonType": "int"}}},
+    {"properties": {"a": {}}},
+    {"properties": {"a.b": {"bsonType": "int"}}},
+    {
+        "properties": {
+            "a": {
+                "type": "number",
+                "minimum": 1,
+                "exclusiveMinimum": True,
+                "maximum": 5,
+                "exclusiveMaximum": False,
+                "multipleOf": 2,
+            }
+        }
+    },
+    {"properties": {"a": {"bsonType": ["number"], "minimum": 0, "multipleOf": 1.5}}},
+    {"properties": {"a": {"type": ["string", "null"], "pattern": "^x", "minLength": 2}}},
+    {"properties": {"a": {"type": "string", "minimum": 3, "maxLength": 4}}},
+    {"properties": {"a": {"bsonType": "double", "pattern": "x"}}},
+    {
+        "properties": {
+            "a": {
+                "bsonType": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "uniqueItems": True,
+                "items": {"bsonType": "int"},
+            }
+        }
+    },
+    {
+        "properties": {
+            "a": {"bsonType": "array", "items": [{"bsonType": "int"}, {}], "additionalItems": False}
+        }
+    },
+    {"properties": {"a": {"items": [{}], "additionalItems": {"bsonType": "string"}}}},
+    {"properties": {"a": {"items": {"not": {}}, "additionalItems": True}}},
+    {"properties": {"a": {"items": [{"properties": {"q": {}}}, {"allOf": [{}]}, {"minimum": 1}]}}},
+    {"properties": {"a": {"enum": [{"b": 1}, "s", None, [1, 2]]}}},
+    {
+        "properties": {
+            "a": {"uniqueItems": False, "enum": [{"b": {"c": [1, {"d": "x"}]}, "e": []}, {}]}
+        }
+    },
+    {"enum": [{"b": 1}, 2]},
+    {"enum": [1, 2]},
+    {
+        "allOf": [{"required": ["a"]}, {"minProperties": 2}],
+        "anyOf": [{"required": ["b"]}],
+        "oneOf": [{"required": ["c"]}, {"required": ["d"]}],
+        "not": {"required": ["e"]},
+    },
+    {"dependencies": {"a": ["b", "c"], "d": {"required": ["e"]}}},
+    {
+        "properties": {
+            "o": {
+                "dependencies": {"a": ["b"]},
+                "required": ["z", "y"],
+                "maxProperties": 4,
+                "patternProperties": {"^p": {"bsonType": "int"}},
+                "additionalProperties": {"bsonType": "string"},
+            }
+        }
+    },
+    {"patternProperties": {"^p": {}}, "additionalProperties": True},
+    {
+        "properties": {
+            "x": {"minimum": 3, "enum": [1, 2]},
+            "y": {"type": "object", "properties": {"z": {"type": "string"}}},
+        },
+        "minProperties": 1,
+        "additionalProperties": False,
+    },
+    {"title": "t", "description": "d", "properties": {"a": {"title": "x", "bsonType": "object"}}},
+    {"properties": {"a": {"type": "boolean", "maxProperties": 2, "required": ["x"]}}},
+    {
+        "properties": {
+            "a": {
+                "bsonType": "number",
+                "required": ["x"],
+                "properties": {"x": {}},
+                "additionalProperties": False,
+            }
+        }
+    },
+    {"properties": {"a": {"bsonType": ["object", "array"], "minProperties": 0}}},
+    {"items": {}, "additionalItems": False, "minItems": 2, "uniqueItems": True, "maxLength": 3},
+]
+
+
 @pytest.fixture(scope="module")
 def servers(rust_mongo: Any, mongod_rs: Any) -> Any:
     for client in (rust_mongo, mongod_rs):
@@ -612,7 +711,38 @@ def test_an_expression(servers: Any, expression: Any) -> None:
     _check(servers, SON([("aggregate", "c"), ("pipeline", pipeline), ("cursor", {})]))
 
 
-@pytest.mark.parametrize("pipeline", STAGES, ids=[str(p) for p in STAGES])
+#: Shaped (RM-358) but not run by `test_query_stats.py`: this server does
+#: not run them as mongod does yet (RM-717, RM-718).
+UNRUN_STAGES: list[list] = [
+    # `$out` to a time-series collection (RM-358).
+    [
+        {
+            "$out": {
+                "db": "t",
+                "coll": "ts",
+                "timeseries": {"timeField": "t", "metaField": "m", "granularity": "hours"},
+            }
+        }
+    ],
+    [{"$out": {"db": "t", "coll": "ts2", "timeseries": {"timeField": "t"}}}],
+    # `from: {db, coll}` in `local` / `config` (RM-358).
+    [{"$lookup": {"from": {"db": "local", "coll": "oplog.rs"}, "as": "j", "pipeline": []}}],
+    [
+        {
+            "$lookup": {
+                "from": {"db": "config", "coll": "cache.chunks.t.c"},
+                "localField": "x",
+                "foreignField": "k",
+                "as": "j",
+            }
+        }
+    ],
+]
+
+
+@pytest.mark.parametrize(
+    "pipeline", STAGES + UNRUN_STAGES, ids=[str(p) for p in STAGES + UNRUN_STAGES]
+)
 def test_a_stage(servers: Any, pipeline: list) -> None:
     _check(servers, SON([("aggregate", "c"), ("pipeline", pipeline), ("cursor", {})]))
 
@@ -620,6 +750,12 @@ def test_a_stage(servers: Any, pipeline: list) -> None:
 @pytest.mark.parametrize("coll,pipeline", HYBRID, ids=[str(h) for h in HYBRID])
 def test_a_hybrid_search(servers: Any, coll: str, pipeline: list) -> None:
     _check(servers, SON([("aggregate", coll), ("pipeline", pipeline), ("cursor", {})]))
+
+
+@pytest.mark.parametrize("schema", JSON_SCHEMAS, ids=[str(j) for j in JSON_SCHEMAS])
+def test_a_json_schema(servers: Any, schema: dict) -> None:
+    _check(servers, SON([("find", "c"), ("filter", {"$jsonSchema": schema})]))
+    _check(servers, SON([("find", "c"), ("filter", {"x": {"$gt": 1}, "$jsonSchema": schema})]))
 
 
 @pytest.mark.parametrize("filt", GEO_FILTERS, ids=[str(f) for f in GEO_FILTERS])
@@ -648,6 +784,17 @@ def test_a_collectionless_aggregate(servers: Any) -> None:
         {},
         {"fullDocument": "updateLookup", "fullDocumentBeforeChange": "whenAvailable"},
         {"startAtOperationTime": Timestamp(5, 1), "showExpandedEvents": True},
+        # The other flags, in mongod's order whatever the request's (RM-358).
+        {"showSystemEvents": True},
+        {"showRawUpdateDescription": True, "fullDocument": "required"},
+        {
+            "showRawUpdateDescription": True,
+            "allowToRunOnSystemNS": False,
+            "allowToRunOnConfigDB": False,
+            "showExpandedEvents": True,
+            "showSystemEvents": False,
+            "showMigrationEvents": False,
+        },
     ],
     ids=str,
 )

@@ -3,7 +3,7 @@
 meets, and how `explain` moves a `$match` ahead of the stages before it.
 
 The reference is mongod 8.2.11, asked live (`mongod`); the Rust server is
-`secantusd-rs` (`rust_mongo`).
+`secantusd-mdb` (`rust_mongo`).
 """
 
 from __future__ import annotations

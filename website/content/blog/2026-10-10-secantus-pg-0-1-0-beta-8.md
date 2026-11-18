@@ -106,7 +106,7 @@ error names a column without its table.
 psycopg 3.3.4's unmodified suite, run on macOS against this release's code:
 of the 5,731 tests that ran, 5,544 pass and none fail.
 
-This is a server for tests. It is single-node, and it is a beta.
+This is a real single-node database, and it is a beta.
 
 `cargo install secantus-pg --version 0.1.0-beta.8` builds it from crates.io.
 Binaries for Linux x86_64 and macOS arm64 are on the release.

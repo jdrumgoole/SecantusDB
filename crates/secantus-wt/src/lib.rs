@@ -154,7 +154,7 @@ pub struct Connection {
     /// The event handler WiredTiger was given. It writes its defaults into
     /// the callbacks left null, so the handler is the connection's own and
     /// outlives it: `Drop` closes the connection before this field drops.
-    _handler: Box<sys::WT_EVENT_HANDLER>,
+    handler: Box<Handler>,
 }
 
 // The connection handle is safe to share across threads; WiredTiger's own MVCC
@@ -188,16 +188,64 @@ unsafe extern "C" fn handle_error(
     1
 }
 
-/// The event handler a connection is opened with: only the error callback
-/// is ours, and WiredTiger fills in its defaults for the rest -- writing
-/// them into the struct, which is why it cannot be a `static`.
-fn event_handler() -> Box<sys::WT_EVENT_HANDLER> {
-    Box::new(sys::WT_EVENT_HANDLER {
-        handle_error: Some(handle_error),
-        handle_message: None,
-        handle_progress: None,
-        handle_close: None,
-        handle_general: None,
+/// The most WiredTiger messages a connection holds before it drops the
+/// newest: nothing drains them after the open, so a long-lived connection
+/// must not grow without bound.
+const MESSAGES_HELD: usize = 4096;
+
+/// The event handler a connection is opened with. WiredTiger is given a
+/// pointer to `base`, the first field, and hands it back to each callback,
+/// so the callbacks reach the rest of the struct through it. Only the error
+/// and message callbacks are ours; WiredTiger fills in its defaults for the
+/// rest -- writing them into the struct, which is why it cannot be a
+/// `static`.
+#[repr(C)]
+struct Handler {
+    base: sys::WT_EVENT_HANDLER,
+    /// The messages WiredTiger wrote (its `verbose` and informational
+    /// output), in order, as WiredTiger formatted them: JSON when the
+    /// connection was opened with `json_output=(message)`.
+    messages: std::sync::Mutex<Vec<String>>,
+}
+
+/// WiredTiger's message callback: the message is held for
+/// [`Connection::take_messages`], as mongod's handler passes each one to its
+/// log (`WiredTiger message`, 22430), rather than printed on stdout.
+unsafe extern "C" fn handle_message(
+    handler: *mut sys::WT_EVENT_HANDLER,
+    _session: *mut sys::WT_SESSION,
+    message: *const c_char,
+) -> c_int {
+    if handler.is_null() || message.is_null() {
+        return 0;
+    }
+    // SAFETY: `handler` is the `base` of a live `Handler` (repr(C), first
+    // field): the connection owns it and closes before dropping it.
+    let handler = unsafe { &*(handler as *const Handler) };
+    // SAFETY: WiredTiger passes a NUL-terminated message.
+    let text = unsafe { CStr::from_ptr(message) }
+        .to_string_lossy()
+        .into_owned();
+    let mut held = handler
+        .messages
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held.len() < MESSAGES_HELD {
+        held.push(text);
+    }
+    0
+}
+
+fn event_handler() -> Box<Handler> {
+    Box::new(Handler {
+        base: sys::WT_EVENT_HANDLER {
+            handle_error: Some(handle_error),
+            handle_message: Some(handle_message),
+            handle_progress: None,
+            handle_close: None,
+            handle_general: None,
+        },
+        messages: std::sync::Mutex::new(Vec::new()),
     })
 }
 
@@ -226,13 +274,27 @@ impl Connection {
         let mut ptr: *mut sys::WT_CONNECTION = ptr::null_mut();
         let mut handler = event_handler();
         check(unsafe {
-            sys::wiredtiger_open(home_c.as_ptr(), &mut *handler, cfg_c.as_ptr(), &mut ptr)
+            sys::wiredtiger_open(home_c.as_ptr(), &mut handler.base, cfg_c.as_ptr(), &mut ptr)
         })?;
         Ok(Connection {
             ptr,
             stats: keeps_statistics(config),
-            _handler: handler,
+            handler,
         })
+    }
+
+    /// The messages WiredTiger has written since the last call, oldest
+    /// first, each as WiredTiger formatted it (a JSON object when the
+    /// connection was opened with `json_output=(message)`). At most
+    /// [`MESSAGES_HELD`] are kept between calls.
+    pub fn take_messages(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .handler
+                .messages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// Open a new session (thread-affine — open one per thread).

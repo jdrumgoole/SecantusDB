@@ -45,9 +45,9 @@ pymongo = pytest.importorskip("pymongo")
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 RS_BINARY = pathlib.Path(
-    os.environ.get("SECANTUSDB_BIN") or REPO / "crates/secantusdb/target/debug/secantusd-rs"
+    os.environ.get("SECANTUSDB_BIN") or REPO / "crates/secantusdb/target/debug/secantusd-mdb"
 )
-_RS_BANNER = re.compile(r"secantusd-rs listening on (\S+):(\d+)")
+_RS_BANNER = re.compile(r"secantusd-mdb listening on (\S+):(\d+)")
 PG15_DSN = os.environ.get(
     "SECANTUS_PG_ORACLE_DSN_15", "host=127.0.0.1 port=5415 dbname=postgres user=postgres"
 )
@@ -172,7 +172,7 @@ def drain_output(proc: subprocess.Popen) -> None:
 
 @pytest.fixture(scope="module")
 def rust_mongo(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
-    """A pymongo client to a `secantusd-rs` of this module's own, whose
+    """A pymongo client to a `secantusd-mdb` of this module's own, whose
     execution control, as `mongod_rs`'s, counts no ticket as held too long:
     a line's `delinquencyInfo` is load's, not the operation's."""
     with rust_mongo_server(tmp_path_factory.mktemp("rust-mongo")) as client:
@@ -181,7 +181,7 @@ def rust_mongo(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
 
 @contextlib.contextmanager
 def rust_mongo_server(store: Any, *extra_args: str) -> Iterator[Any]:
-    """A `secantusd-rs` on `store`, as `rust_mongo` starts one, for a test
+    """A `secantusd-mdb` on `store`, as `rust_mongo` starts one, for a test
     that needs a server no other test shares; `extra_args` follow the
     defaults on its command line (`--standalone`, for a comparison with a
     standalone mongod)."""
@@ -210,7 +210,7 @@ def rust_mongo_server(store: Any, *extra_args: str) -> Iterator[Any]:
             m = _RS_BANNER.search(line)
             if m or not line:
                 break
-        assert m, f"secantusd-rs did not start: {line!r}"
+        assert m, f"secantusd-mdb did not start: {line!r}"
         drain_output(proc)
         client = pymongo.MongoClient(
             host=m.group(1), port=int(m.group(2)), serverSelectionTimeoutMS=10_000

@@ -66,7 +66,7 @@ one gave the same result as the day before, test for test. None of these bugs
 was in a path the drivers' own suites exercise, which is why comparing against
 `mongod` directly found them and the suites had not.
 
-This is a server for tests. It is single-node and it is a beta.
+This is a real single-node database, and it is a beta.
 
 `cargo install secantus-mdb --version 0.5.3-beta.176` builds it from crates.io.
 Binaries for Linux x86_64, macOS arm64 and Windows x86_64 are on the release.

@@ -24,10 +24,10 @@ def _answer(client: Any, op: Any) -> tuple:
         client.drop_database(db.name)
 
 
-@pytest.mark.backlog("RM-587")
+@pytest.mark.backlog_fixed("RM-587")
 def test_a_data_size_of_a_view_is_refused(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 refuses a `dataSize` of a view with
-    CommandNotSupportedOnView; this server answers `ok: 1`."""
+    CommandNotSupportedOnView; this server answered `ok: 1`."""
 
     def op(db: Any) -> Any:
         return db.command("dataSize", f"{db.name}.v")
@@ -37,14 +37,30 @@ def test_a_data_size_of_a_view_is_refused(rust_mongo: Any, mongod_rs: Any) -> No
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-588")
+@pytest.mark.backlog_fixed("RM-588")
 def test_a_drop_indexes_of_system_views_answers(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 drops the indexes of `<db>.system.views`, which a view
-    creates; this server refuses it with NamespaceNotFound."""
+    creates; this server refused it with NamespaceNotFound."""
 
     def op(db: Any) -> Any:
         return db.command("dropIndexes", "system.views", index="*")
 
     got = {"rust": _answer(rust_mongo, op), "mongod": _answer(mongod_rs, op)}
     assert got["mongod"] == ("ok", 1.0)
+    assert got["rust"] == got["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-588")
+@pytest.mark.parametrize("index", ["_id_", "nope", {"_id": 1}, {"x": 1}, ["nope"]])
+def test_a_drop_indexes_of_system_views_knows_its_id_index(
+    rust_mongo: Any, mongod_rs: Any, index: Any
+) -> None:
+    """`system.views` has an `_id` index and no other: mongod 8.2.11 refuses
+    to drop `_id_` (72) and finds no other index (27)."""
+
+    def op(db: Any) -> Any:
+        return db.command("dropIndexes", "system.views", index=index)
+
+    got = {"rust": _answer(rust_mongo, op), "mongod": _answer(mongod_rs, op)}
+    assert got["mongod"][0] == "err"
     assert got["rust"] == got["mongod"]

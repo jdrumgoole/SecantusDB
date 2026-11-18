@@ -21,7 +21,7 @@ every command that waits for a write concern.
 
 #### Found
 
-- RM-551: `secantusd-rs --standalone` keeps a replica set's write concern.
+- RM-551: `secantusd-mdb --standalone` keeps a replica set's write concern.
   A write with no write concern waits for the journal as `w: "majority"`
   does, and `setDefaultRWConcern` and `getDefaultRWConcern` answer. mongod's
   standalone implies `w: 1` and refuses both commands with 51300.

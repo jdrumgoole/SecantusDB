@@ -2689,6 +2689,17 @@ fn wrap(a: Access, q: &Query) -> Node {
     // limit no sort absorbed (`analyzeDataAccess`; measured 8.2.11: `RETURN_KEY
     // <- SORT <- COLLSCAN`, RM-470).
     if q.return_key {
+        // A sort the index provides makes no sort keys, so a projection's
+        // `{$meta: "sortKey"}` has a SORT_KEY_GENERATOR compute them
+        // (measured 8.2.11: `RETURN_KEY <- SORT_KEY_GENERATOR <- IXSCAN`,
+        // RM-706); a blocking SORT makes its own.
+        let sort_key = q.projection.is_some_and(|p| {
+            p.values()
+                .any(|v| secantus_core::projection::meta_spec(v) == Some("sortKey"))
+        });
+        if blocking.is_none() && sort_key && q.sort.is_some_and(|s| !s.is_empty()) {
+            node = super::sort_key_generator(node, None);
+        }
         node = Node::ReturnKey(Box::new(node));
     }
     if q.limit > 0 && (blocking.is_none() || absorbed.is_none()) {

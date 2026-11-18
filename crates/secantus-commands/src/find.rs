@@ -58,6 +58,12 @@ struct TailableFindProducer {
     projection: Option<Document>,
     let_vars: Document,
     collation: Option<secantus_core::collation::Collation>,
+    /// The oplog tail when the last scan began. Every insert into the
+    /// collection logs an entry, so a document the scan missed has a later
+    /// seq: an `awaitData` getMore waits for the oplog to pass this, and
+    /// sleeps until a write instead of rescanning (and re-taking an
+    /// execution ticket) in a loop (RM-355).
+    seen_seq: i64,
 }
 
 impl CursorProducer for TailableFindProducer {
@@ -65,6 +71,9 @@ impl CursorProducer for TailableFindProducer {
         if self.fatal.is_some() {
             return Vec::new();
         }
+        // Read before the scan, so a write that races it moves the tail past
+        // this and wakes the wait.
+        self.seen_seq = self.storage.oplog_tail_seq();
         // Capped rollover: if the doc we last returned has been evicted, the
         // cursor is lapped — mongod kills it with CappedPositionLost.
         if let Some(after) = self.after {
@@ -133,7 +142,7 @@ impl CursorProducer for TailableFindProducer {
     }
 
     fn position(&self) -> i64 {
-        0
+        self.seen_seq
     }
 
     fn invalidated(&self) -> bool {
@@ -1039,6 +1048,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             filter: filter.clone(),
             projection: projection.cloned(),
             let_vars: let_vars.clone(),
+            seen_seq: 0,
             collation: collation.clone(),
         });
         let cursor_id = cursors
@@ -1089,6 +1099,9 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         for (k, v) in spec {
             match secantus_core::projection::meta_spec(v) {
                 Some(m @ ("recordId" | "indexKey")) => metas.push((k.clone(), m)),
+                // The sort key as an array (mongod 8.2.11, RM-703); a read
+                // with no sort is refused before here.
+                Some("sortKey") if sort.is_some() => metas.push((k.clone(), "sortKey")),
                 Some(_) => {}
                 None => {
                     let mut v = v.clone();
@@ -1150,6 +1163,15 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         } else {
             None
         };
+        let sort_keys: Option<Vec<Bson>> = match sort {
+            Some(s) if metas.iter().any(|(_, m)| *m == "sortKey") => Some(
+                originals
+                    .iter()
+                    .map(|d| sort_key_array(d, s, &ns))
+                    .collect::<Result<_, _>>()?,
+            ),
+            _ => None,
+        };
         let mut projected = match &nested_spec {
             Some(rewritten) => {
                 crate::agg_meta::attach(
@@ -1176,6 +1198,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             for (field, meta) in &metas {
                 let value = match *meta {
                     "recordId" => record_ids.as_ref().and_then(|r| r[i]).map(Bson::Int64),
+                    "sortKey" => sort_keys.as_ref().map(|k| k[i].clone()),
                     _ => index_keys.as_ref().map(|k| Bson::Document(k[i].clone())),
                 };
                 if let Some(v) = value {
@@ -1266,7 +1289,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     //     reply then carries only the cursor envelope (`{ cursor: { id, ns } }`).
     // In both cases only the cursor *remainder* (stored as bytes in the registry)
     // is ever re-encoded.
-    match projection {
+    let reply: Result<Document, CommandError> = match projection {
         Some(spec) => {
             let projected = project_to_docs(docs, spec, &filter, &let_vars, &ns)?;
             let (first_batch, cursor_id): (Vec<Bson>, i64) = if single_batch {
@@ -1315,7 +1338,78 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 "ok": 1.0,
             })
         }
+    };
+    let reply = reply?;
+    // A clustered collection's read (a time-series collection's buckets
+    // among them) is read whole, as no stream reads one: what its plan
+    // examined is counted by running it, as `explain` does, when the first
+    // batch ends the read (RM-586; mongod 8.2.11's line for a `find` of
+    // ten buckets has `keysExamined: 0`, `docsExamined: 10`, `nBatches: 1`).
+    //
+    // One that leaves its cursor open counts each batch as far as the
+    // plan went to fill it, and the last batch on to the end of the read
+    // (RM-708; mongod 8.2.11's lines for that `find` read four at a time
+    // say `docsExamined` 4, 4, 2): the cursor keeps where each document
+    // left the count, for its `getMore`s.
+    let cursor_id = reply
+        .get_document("cursor")
+        .and_then(|c| c.get_i64("id"))
+        .unwrap_or(0);
+    let store = ctx.storage.clone();
+    if let (true, Some(store)) = (ctx.exec_stats.is_none() && !tailable, store) {
+        let examined = is_clustered(store.as_ref(), &ctx.db_name, &coll)
+            .then(|| {
+                crate::explain::summary::find_examined_marks(store.as_ref(), &ctx.db_name, doc)
+            })
+            .flatten();
+        if let Some((marks, all)) = examined {
+            if cursor_id == 0 {
+                ctx.exec_stats = Some(crate::ExecStats {
+                    keys_examined: all.0,
+                    docs_examined: all.1,
+                    exhausted: true,
+                    ..Default::default()
+                });
+            } else if let Some(cursors) = ctx.cursors.clone() {
+                let first = match &ctx.pending_batch {
+                    Some(p) => p.batch.len(),
+                    None => reply
+                        .get_document("cursor")
+                        .and_then(|c| c.get_array("firstBatch"))
+                        .map_or(0, Vec::len),
+                };
+                let (keys, docs) = first
+                    .checked_sub(1)
+                    .and_then(|i| marks.get(i).copied())
+                    .unwrap_or((0, 0));
+                ctx.exec_stats = Some(crate::ExecStats {
+                    keys_examined: keys,
+                    docs_examined: docs,
+                    cursor_id,
+                    ..Default::default()
+                });
+                let summary = crate::explain::summary::plan_summary(doc, ctx);
+                let command = doc.clone();
+                cursors.update_counts(cursor_id, |c| {
+                    c.examined = Some(crate::cursors::BatchExamined {
+                        marks,
+                        all,
+                        returned: first,
+                        plan_summary: summary,
+                        command,
+                    })
+                });
+            }
+        }
     }
+    Ok(reply)
+}
+
+/// `db.coll` is clustered: its records are keyed by `_id`.
+fn is_clustered(storage: &dyn crate::storage::Storage, db: &str, coll: &str) -> bool {
+    storage
+        .get_collection_options(db, coll)
+        .is_ok_and(|o| o.contains_key("clusteredIndex"))
 }
 
 /// The filter's errors a read that matched nothing never met: mongod parses
@@ -1478,12 +1572,14 @@ fn shape_streamed(
             // A top-level `$meta` goes after the projected fields, where
             // mongod puts it; one inside an expression reads a field the
             // documents are given for the projection (`agg_meta`).
+            let cursor_sort = cursor.command.get_document("sort").ok();
             let mut metas: Vec<(String, &str)> = Vec::new();
             let mut rewritten = Document::new();
             let mut nested = false;
             for (k, v) in spec {
                 match secantus_core::projection::meta_spec(v) {
                     Some(m @ ("recordId" | "indexKey")) => metas.push((k.clone(), m)),
+                    Some("sortKey") if cursor_sort.is_some() => metas.push((k.clone(), "sortKey")),
                     Some(_) => {}
                     None => {
                         let mut v = v.clone();
@@ -1503,6 +1599,20 @@ fn shape_streamed(
                 }
                 rewritten.insert(k.clone(), v.clone());
             }
+            let sort_keys: Option<Vec<Bson>> = match cursor_sort {
+                Some(s) if metas.iter().any(|(_, m)| *m == "sortKey") => Some(
+                    docs.iter()
+                        .map(|b| {
+                            let d =
+                                secantus_core::bsondoc::from_bytes(b.as_slice()).map_err(|e| {
+                                    CommandError::new(1, "InternalError", e.to_string())
+                                })?;
+                            sort_key_array(&d, s, &cursor.ns)
+                        })
+                        .collect::<Result<_, _>>()?,
+                ),
+                _ => None,
+            };
             let mut projected = if nested {
                 let mut originals: Vec<Document> = docs
                     .iter()
@@ -1535,6 +1645,7 @@ fn shape_streamed(
                 for (field, meta) in &metas {
                     let value = match *meta {
                         "recordId" => Some(Bson::Int64(rids[i])),
+                        "sortKey" => sort_keys.as_ref().map(|k| k[i].clone()),
                         _ => keys[i].clone().map(Bson::Document),
                     };
                     if let Some(v) = value {

@@ -1,6 +1,6 @@
 ### The Rust MongoDB server speaks wire compression
 
-`secantusd-rs` accepts `OP_COMPRESSED` with `snappy`, `zstd` and `zlib`,
+`secantusd-mdb` accepts `OP_COMPRESSED` with `snappy`, `zstd` and `zlib`,
 mongod's default set, so a driver configured with `compressors=`
 compresses its traffic as it does against mongod 8.2.11. A pymongo run
 through each compressor gave the same results, and the same counts of

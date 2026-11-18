@@ -464,10 +464,11 @@ pub fn data_size(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let (db, coll) = (db.as_str(), coll.as_str());
     let storage = ctx.storage()?;
     // A time-series collection is a view over its buckets to mongod, and
-    // `dataSize` refuses a view (measured 8.2.11).
+    // `dataSize` refuses a view, a plain one too (measured 8.2.11, RM-587).
     if storage
         .get_collection_options(db, coll)
         .is_ok_and(|o| o.contains_key("timeseries"))
+        || crate::views::is_view(storage, db, coll)
     {
         return Err(err(
             166,

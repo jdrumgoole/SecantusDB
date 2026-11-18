@@ -477,6 +477,24 @@ function handler(event) {
     var uri = request.uri;
     if (uri.endsWith('/')) {
         request.uri = uri + 'index.html';
+        return request;
+    }
+    // A directory named without its trailing slash (/talks/pycon-ie-2026):
+    // every file the site publishes has an extension, so a last segment
+    // without a dot is a directory. Redirect to the slash form so the
+    // page's relative links resolve against the directory.
+    var last = uri.substring(uri.lastIndexOf('/') + 1);
+    if (last.length > 0 && last.indexOf('.') === -1) {
+        var keys = Object.keys(request.querystring);
+        var qs = keys.length ? '?' + keys.map(function (k) {
+            var v = request.querystring[k];
+            return v.value === '' ? k : k + '=' + v.value;
+        }).join('&') : '';
+        return {
+            statusCode: 301,
+            statusDescription: 'Moved Permanently',
+            headers: { location: { value: uri + '/' + qs } },
+        };
     }
     return request;
 }

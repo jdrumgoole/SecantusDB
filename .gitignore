@@ -98,6 +98,7 @@ tests/cross_driver/rust/.cargo.lock-build
 # data dir that may be created if a SecantusDBServer is started with
 # website/ as cwd; aws-state.json contains account-specific resource IDs.
 website/output/
+website/content/talks/
 website/themes/secantus/static/img/
 website/infra/aws-state.json
 website/secantus-data/

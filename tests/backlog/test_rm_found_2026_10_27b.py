@@ -4,7 +4,7 @@ otherwise than mongod's (fixed in the same batch), and the cursors that
 still read everything at the command.
 
 The reference is mongod 8.2.11 (`mongod`); the Rust server is
-`secantusd-rs` (`rust_mongo`).
+`secantusd-mdb` (`rust_mongo`).
 """
 
 from __future__ import annotations

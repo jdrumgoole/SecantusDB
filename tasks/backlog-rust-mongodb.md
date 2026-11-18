@@ -308,6 +308,7 @@ These are explicit non-goals. Don't add them without a reason.
       push/PR would catch this class at the cost of runner time on an already
       congested queue. Cheaper middle grounds: one extra Linux Python on PRs,
       or make the cron's failure loud (it currently notifies nobody).
+      **Decided (Joe, 2026-11-16): make the weekly cron's failure loud (it notifies) AND add one extra Linux Python to PR runs; not the full 3.13 matrix.**
       Backlog-ID: RM-014
       Verify: none -- CI matrix policy decision
 
@@ -346,6 +347,7 @@ These are explicit non-goals. Don't add them without a reason.
       Why it matters: the concurrency chart's CLAIM is its shape ("monotonic,
       no cliff"), and a noisy neighbour is exactly what could fake a cliff or
       hide one.
+      **Decided (Joe, 2026-11-16): run the concurrency benchmark on dedicated-CPU droplets, created for the run and destroyed after.**
       Backlog-ID: RM-015
       Verify: none -- cloud account tier for a benchmark
 
@@ -547,25 +549,19 @@ These are explicit non-goals. Don't add them without a reason.
       (`tests/mongod_live/test_ingress_admission.py`). Open:
       - where this server's ticket points differ from mongod's: a yield here
         keeps its locks, so it keeps its ticket and takes no second
-        admission (mongod returns both and takes them again, RM-360); an
-        `awaitData` getMore returns its ticket for each 100 ms of its wait,
-        where mongod's yields once per wait; `abortTransaction`'s line
-        counts two execution admissions, where mongod's unstash makes it
-        three (`commitTransaction`'s three match, measured 2026-11-12);
-        and an `update` or `delete` statement's line counts one admission
-        fewer, its command's line one fewer per statement, because the
-        statement's line is written with the command's locks still held
-        (RM-357's statement rounds), where mongod's statement has let its
-        own go and takes a fresh ticket to read its statistics;
-      - the line of a command that never got its ingress ticket names
-        `<db>.$cmd` on mongod, its collection here; and mongod's first
-        retryable write after startup takes a second, exempt, ingress
-        admission (not traced), both measured 8.2.11 2026-11-08; an index
+        admission (mongod returns both and takes them again, RM-360).
+        Since 2026-11-17 an `update` or `delete` statement takes its round
+        as it runs and lets it go before its line reads its statistics, as
+        mongod's does; a retryable one still holds every round to the end
+        (RM-357's session row);
+      - mongod's first retryable write after startup takes a second,
+        exempt, ingress admission (not traced), measured 8.2.11
+        2026-11-08; an index
         build's `$currentOp` row has no `queues` here (mongod's not yet
         measured).
       **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08, the ticket pools 2026-11-09, and the per-command admission counts on the line 2026-11-09; what is left is above.
       Backlog-ID: RM-355
-      Verify: tests/backlog/test_rm_355_364.py::test_ending_a_transaction_takes_mongods_execution_tickets
+      Verify: none -- the yield's second admission is RM-360's; the second exempt ingress admission and an index build's `queues` have no gap test yet
 - [ ] **Some writes' `locks` are not mongod's.** Since 2026-11-07 a write
       counts mongod's flow control tickets (one per global IX taken apart)
       and a retryable write's session checkout and session row, and a
@@ -574,7 +570,11 @@ These are explicit non-goals. Don't add them without a reason.
       2026-11-12 a command that took the global lock in IX and logged
       nothing (`create` of a collection there, `drop` or `dropIndexes` of
       one not there) reads the latest optime for its last op as mongod's
-      entry point does (`lastop::entry_point_fixes`). Still different,
+      entry point does (`lastop::entry_point_fixes`); since 2026-11-16 a
+      `collMod` of a collection there takes mongod's global IS and its
+      collection X twice; since 2026-11-17 a `findAndModify` that removes
+      takes one round, and a retryable one writes its image under the
+      transition, global and image collection IX. Still different,
       measured against a one-member replica set:
       - an `insert` of several documents one of which fails: mongod inserts
         them again a document at a time, each under a transition, global,
@@ -589,59 +589,47 @@ These are explicit non-goals. Don't add them without a reason.
         command's locks (`Metadata: {W: 1}`, one more global IX), taken
         without interrupt checks (the command's `numInterruptChecks` is
         mongod's without them);
-      - a retryable `findAndModify` writes its image under its locks (one
-        more transition, global and collection IX), and one that removes
-        takes a single round;
-      - `collMod` and `$out` take more transition locks than this server's
-        rounds (`$out`'s were measured on a standalone, RM-185), and an
-        `$out`'s line here has one global IS more than mongod's (7 to 6,
-        measured 8.2.11 2026-11-12);
+      - `$out` takes more transition locks than this server's rounds
+        (measured on a standalone, RM-185), and an `$out`'s line here has
+        one global IS more than mongod's (7 to 6, measured 8.2.11
+        2026-11-12); a `collMod` of a collection not there is not measured;
       - each global lock taken apart takes an execution ticket, so where
         these locks differ the line's `queues.execution` admissions differ
-        too (RM-355; `collMod`'s line has 3 here, 4 on mongod);
-      - a statement of a transaction shows `{}` on mongod's line and the
-        transaction's initial locks in its entry;
+        too (RM-355);
+      - a statement of a transaction shows the transaction's initial locks
+        in its profile entry on mongod (its line prints `{}` here too since
+        2026-11-17); the entry is not compared yet;
       - a collectionless `aggregate` takes no lock of its own since
         2026-11-09, as on mongod, but one whose `$lookup` or `$unionWith`
         reads a collection takes the global IS three times on mongod's line
         (four in its entry, four execution admissions) and once here.
       Backlog-ID: RM-357
       Verify: tests/backlog/test_rm_355_364.py::test_more_writes_report_mongods_locks
+- [ ] **A `$lookup` from `{db: "local", coll: "oplog.rs"}` is refused.**
+      mongod 8.2.11 runs a `$lookup` whose `from` is `{db, coll}` naming a
+      collection in `local` or `config`; this server answers FailedToParse
+      (9), as mongod does only for any other database. Found 2026-11-17
+      (RM-358).
+      Verify: tests/backlog/test_rm_found_2026_11_17_rm358.py::test_a_lookup_from_the_oplog_runs
+      Backlog-ID: RM-717
+- [ ] **`$out` to a new time-series collection does not check the time
+      field.** mongod 8.2.11 fails the `aggregate` (BadValue, 2) when a
+      document it writes has no `timeField` date; this server writes it.
+      Found 2026-11-17 (RM-358).
+      Verify: tests/backlog/test_rm_found_2026_11_17_rm358.py::test_out_to_time_series_needs_the_time_field
+      Backlog-ID: RM-718
 - [ ] **Some queries have no `queryShapeHash`.** Since 2026-11-07 a
       `find`'s, `distinct`'s and `aggregate`'s line, profile entry and
       `explain` carry mongod's `queryShapeHash` (`secantus-commands`
-      `query_shape.rs`); since 2026-11-09 it covers geo, `$text`, `$where`
-      and `$sampleRate` predicates, the aggregation operators and
-      accumulators with arguments of their own, the stages mongod desugars,
-      change streams, `aggregate: 1` and DBPointer literals
-      (`tests/mongod_live/test_query_shape_hash.py`, against mongod
-      8.2.11); since 2026-11-12 `$rankFusion` and `$scoreFusion`, as the
-      pipelines mongod desugars them into, and a `$geoNear` with no
-      `distanceField`. A query using one of these prints none, where mongod
-      prints one:
-      - `$jsonSchema`, which mongod shapes as the `$_internalSchema*`
-        predicates its JSON Schema parser translates the schema into
-        (`json_schema_parser.cpp`, about 1,950 lines in 8.2.11, and the
-        serializer of each of the ~18 internal predicates it builds);
-      - a `$rankFusion` or `$scoreFusion` input of `$search` or
-        `$vectorSearch`, which need mongot;
-      - options measured nowhere yet: a `$lookup` `from` naming another
-        database, `$out` to a time-series collection, change stream
-        options beyond `fullDocument`, `fullDocumentBeforeChange`,
-        `allChangesForCluster` and `showExpandedEvents`.
-      Each is mongod's serializer for that node, transcribed and checked as
-      the shaped ones were.
+      `query_shape.rs`, `tests/mongod_live/test_query_shape_hash.py`,
+      against mongod 8.2.11), `$jsonSchema` among them since 2026-11-16,
+      and a `$lookup` from `local` / `config`, `$out` to a time-series
+      collection and every change stream flag since 2026-11-17. A query
+      with a `$rankFusion` or `$scoreFusion` input of `$search` or
+      `$vectorSearch` prints none, where mongod prints one; those stages
+      need mongot, so mongod's serializer for them is unmeasured here.
       Backlog-ID: RM-358
-      Verify: tests/backlog/test_rm_355_364.py::test_a_query_of_every_kind_names_its_query_shape
-- [ ] **`$scoreFusion` combines by `"average"`, not `"avg"`.** mongod
-      8.2.11's `combination.method` is `"avg"` or `"expression"` (its IDL
-      enum, `kAvg: "avg"`) and refuses `"average"` with 2 (`Enumeration
-      value 'average' for field '$scoreFusion.combination.method' is not a
-      valid value.`); `"average"` is only the method's name in
-      `scoreDetails`. This server takes `"average"` and refuses `"avg"`
-      (`hybrid.rs`). Found 2026-11-12 (RM-358).
-      Verify: tests/backlog/test_rm_found_rm358.py::test_score_fusion_combines_by_avg
-      Backlog-ID: RM-553
+      Verify: none -- the mongot inputs need a mongot
 - [ ] **`test_a_write_while_an_index_builds` reads mongod's answer off a
       5 ms lock wait.** `tests/mongod_live/test_txn_catalog_changes.py`
       asserts mongod 8.2.11 refuses a transaction's insert while an index
@@ -676,33 +664,31 @@ These are explicit non-goals. Don't add them without a reason.
       falls within mongod's own run-to-run spread of its answer.
       Verify: none -- mongod's own answer varies between runs; no test can pin it
       Backlog-ID: RM-556
-- [ ] **`find` drops a projection's `{$meta: "sortKey"}` field.** mongod
-      8.2.11 gives each document the sort key as an array:
-      `find({}, {k: {$meta: "sortKey"}}).sort({x: 1})` over `{_id: 1, x:
-      [3, 1]}` returns `{_id: 1, x: [3, 1], k: [1]}`. This server returns
-      the document without `k` (`apply_projection` omits the field). Under
-      `returnKey` the field is kept since RM-568 (`find::sort_key_array`).
-      Found 2026-11-15 (RM-568).
-      Verify: tests/backlog/test_rm_found_rm568.py::test_find_keeps_a_sort_key_meta_field
-      Backlog-ID: RM-703
-- [ ] **A `returnKey` read with a `sortKey` field over an index's order
-      has no SORT_KEY_GENERATOR.** mongod 8.2.11 plans `find({y: {$gte:
-      0}}, {k: {$meta: "sortKey"}}).sort({y: 1}).returnKey()` over `{y: 1,
-      x: 1}` as `RETURN_KEY <- SORT_KEY_GENERATOR <- IXSCAN`; this
-      server's explain names `RETURN_KEY <- IXSCAN`. The keys returned
-      match. Found 2026-11-15 (RM-568).
-      Verify: tests/backlog/test_rm_found_rm568b.py::test_return_key_with_a_sort_key_over_an_index_sort_explains_a_key_generator
-      Backlog-ID: RM-706
-- [ ] **A GEO_NEAR stage's `executionStats` are not mongod's.** mongod
-      8.2.11's GEO_NEAR_2D for `find({loc: {$near: [0, 0]}})` over twelve
-      points and a `{loc: "2d"}` index reports `searchIntervals`, an
-      `inputStages` list of the rings' index scans, the stage's work
-      counts, and 52 `totalKeysExamined`; this server's stage (planned
-      since RM-578, `Node::GeoNear`) prints none of them and counts 0 keys,
-      its executionStats walking the documents in storage order
-      (`exec.rs`). Found 2026-11-15 (RM-578).
-      Verify: tests/backlog/test_rm_found_rm578.py::test_a_geo_near_stage_reports_mongods_execution_stats
-      Backlog-ID: RM-707
+- [ ] **A 2dsphere index a MultiPoint gives several keys is not multikey.**
+      mongod 8.2.11 marks it multikey: the IXSCAN of each GEO_NEAR_2DSPHERE
+      ring (and of a `$geoWithin`) reports `isMultiKey: true` and
+      `multiKeyPaths: {loc: ["loc"]}`. This server's catalog records the
+      index as not multikey, so its ring scans report `false` and `[]`.
+      Found 2026-11-17 (RM-707).
+      Verify: tests/backlog/test_rm_found_rm707.py::test_a_multipoint_2dsphere_near_ring_scan_is_multikey
+      Backlog-ID: RM-712
+- [ ] **A `$near` with a predicate on a compound 2d index's trailing field
+      is not planned as GEO_NEAR_2D.** mongod 8.2.11 answers `{loc: {$near:
+      [0, 0]}, z: 1}` over `{loc: "2d", z: 1}` with GEO_NEAR_2D, the `z`
+      predicate a key filter (`filter: {z: {$eq: 1}}`) on each ring's IXSCAN
+      over `[MinKey, MaxKey]`; the ring search here already counts that
+      filter (`geoorder::scan`), but the plan this server explains is a FETCH
+      over another stage, and the IXSCAN's `filter` field is not rendered.
+      Found 2026-11-17 (RM-707).
+      Verify: tests/backlog/test_rm_found_rm707.py::test_a_near_over_a_compound_2d_index_with_its_trailing_field_plans_geo_near
+      Backlog-ID: RM-713
+- [ ] **A LIMIT over a GEO_NEAR stage reports no work counts.** mongod
+      8.2.11's LIMIT over GEO_NEAR_2D (`find` with `limit: 3`) reports
+      `works` (one more than its input's), `advanced` and `needTime`; this
+      server's LIMIT there prints none of them (the plan has no trial to
+      take them from, `exec::graft_work`). Found 2026-11-17 (RM-707).
+      Verify: tests/backlog/test_rm_found_rm707.py::test_a_limit_over_a_geo_near_reports_its_works
+      Backlog-ID: RM-714
 - [ ] **Some lines have no `numInterruptChecks`.** Since 2026-11-08 this
       server checks for interrupt where mongod 8.2 does, and counts it
       (`secantus_core::deadline::check_for_interrupt`): at dispatch, at
@@ -725,7 +711,17 @@ These are explicit non-goals. Don't add them without a reason.
       buffer the stage fills (the global IS it takes for it, so a `getMore`
       of such a cursor takes no lock of its own) and ticks the pipeline's
       interrupt checker once per stage `getNext`, the checker going on
-      with the cursor from batch to batch. The line of a `find`, `count`
+      with the cursor from batch to batch. Since 2026-11-16 a `$map`,
+      `$filter` or `$reduce` checks after every tenth element of each
+      evaluation, as mongod 8.2.11's does, and leaves the pipeline's checker
+      alone. Since 2026-11-17 a `$sort` alone after a `$group` SBE runs
+      counts the cursor stage's buffers (each a global IS) and its own and
+      the cursor stage's `getNext`s, and its `getMore`s go on counting
+      with no lock of their own; so, since the same day, do a `$count`,
+      `$sortByCount` and `$bucket` SBE runs (the `$group` mongod expands
+      each into, with the `$project` or `$sort` after it left to the
+      pipeline), and a `$switch` of 50 branches or more (a `$bucket` of 50
+      buckets or more) keeps its `$group` classic, as on mongod. The line of a `find`, `count`
       or `distinct` of a collection with one candidate plan, a `getMore` of
       a `find`, an `aggregate` of a collection mongod's query layer runs
       whole, or whose stages after its cursor stage are `$project`,
@@ -733,7 +729,7 @@ These are explicit non-goals. Don't add them without a reason.
       `$unwind` and `$skip`, and the `getMore`s of its cursor,
       `listIndexes`, `listCollections`, `collStats`, `ping`, `buildInfo`,
       and an `insert`, `update` or `delete` on a member of a replica set
-      prints mongod's count (74 shapes in
+      prints mongod's count (82 shapes in
       `tests/mongod_live/test_interrupt_checks.py`). Every other line
       prints none, where mongod prints one:
       - a read with more than one candidate plan, a plan from the plan
@@ -746,11 +742,9 @@ These are explicit non-goals. Don't add them without a reason.
       - the other aggregates: one with a `$match` or `$redact` left after
         its read, a `$limit` there (it stops its source short
         of the documents this server runs in one go), a `$lookup`,
-        `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a stage
-        read whole that SBE does not take whole (a `$sort` after a
-        `$group`, `$count`, `$bucket`: 5 on mongod), a pipeline whose
-        expressions run `$map`, `$filter` or `$reduce` (this server ticks
-        the checker once an element, mongod 8.2.11 not at all), one over a
+        `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a `$group`
+        run classic over the cursor stage (a `$bucket` of 400 buckets: 16
+        and a `getMore` of 4 on mongod), one over a
         view or a time-series collection, and one asked for a first batch
         of none;
       - `findAndModify`: counted as the other writes are, it matches mongod
@@ -778,250 +772,59 @@ These are explicit non-goals. Don't add them without a reason.
       e01df2d2 (2026-11-08), each command checked against a probe of its own.
       Backlog-ID: RM-360
       Verify: tests/backlog/test_rm_355_364.py::test_every_line_counts_its_interrupt_checks
-- [ ] **A `dataSize` of a view answers.** mongod 8.2.11 refuses
-      `{dataSize: "<db>.v"}` of a view (166, CommandNotSupportedOnView);
-      this server answers `ok: 1`, sizing nothing. Found while working
-      RM-485, 2026-11-13.
-      Verify: tests/backlog/test_rm_view_ddl_refusals.py::test_a_data_size_of_a_view_is_refused
-      Backlog-ID: RM-587
-- [ ] **A `dropIndexes` of `system.views` is refused.** mongod 8.2.11 drops
-      `<db>.system.views`' indexes (`ok: 1`, its line and profile entry
-      naming `<db>.system.views`, `system`); this server refuses it with
-      NamespaceNotFound (26), though `system.views` exists. Found while
-      working RM-485, 2026-11-13.
-      Verify: tests/backlog/test_rm_view_ddl_refusals.py::test_a_drop_indexes_of_system_views_answers
-      Backlog-ID: RM-588
-- [ ] **A `find` of a time-series collection's buckets does not say what
-      it examined.** mongod 8.2.11's line for a `find` of
-      `<db>.system.buckets.ts` has `keysExamined`, `docsExamined` and
-      `nBatches`, as one of a collection's does; this server's has its
-      `planSummary` and `nreturned` and none of those. Found while working
-      RM-484, 2026-11-13.
-      Verify: tests/backlog/test_rm_ts_ddl_lines.py::test_a_find_of_buckets_says_what_it_examined
-      Backlog-ID: RM-586
-- [ ] **A refused write of a view counts fewer locks than mongod's.**
-      mongod 8.2.11 refuses a write of a view once it holds the namespace
-      for the write; this server refuses it earlier, in `views::refusal`,
-      before `session::run`, and its lines count fewer locks: a retryable
-      `update` / `delete` is refused before its session is checked out, so
-      its statement and command lines are one `ReplicationStateTransition`
-      w short (the transition lock `retryable_write_transition_lock`
-      takes); an `insert`'s line has none of its two write rounds (no
-      `Database` / `Collection`, no `flowControl`); a statement of a
-      transaction has `locks: {}` where mongod's has the transaction's
-      (`MultiDocumentTransactionsBarrier`, the rounds). The faithful fix
-      refuses the write where mongod does, after the session checkout and
-      the write's acquisition; whether a refused retryable write then uses
-      up its `txnNumber`, as on mongod, wants probing first. Found while
-      working RM-487, 2026-11-13.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_refused_write_of_a_view_takes_mongods_locks
-      Backlog-ID: RM-589
-- [ ] **A `$collStats` of a view is refused.** mongod 8.2.11 answers a
-      `$collStats: {}` or `{latencyStats: {}}` stage of a view (one
-      document, `ns`, `host`, `localTime`, and `latencyStats` when asked),
-      and refuses `count`, `storageStats` and `queryExecStats` (166); this
-      server refuses every `$collStats` of a view. Found while working
-      RM-488, 2026-11-13.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_coll_stats_stage_of_a_view_answers
-      Backlog-ID: RM-590
-- [ ] **An `$out` into a view is not profiled, and its line names the
-      source.** mongod 8.2.11 refuses it (166) with a line and a profile
-      entry naming the view (`<db>.v`, `ok: 0`); this server's line names
-      the collection the pipeline reads, and it writes no entry. Found
-      while working RM-488, 2026-11-13.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_an_out_into_a_view_names_the_view
-      Backlog-ID: RM-591
-- [ ] **A `$merge` into a view is not profiled.** mongod 8.2.11 refuses it
-      (166) and profiles the `aggregate` under the collection it reads
-      (`<db>.c`, `ok: 0`); this server writes no entry. Found while
-      working RM-488, 2026-11-13.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_merge_into_a_view_is_profiled
-      Backlog-ID: RM-592
-- [ ] **A `$changeStream` of a view writes a line.** Both servers refuse
-      it (166), and mongod 8.2.11 writes no `Slow query` line for it; this
-      server writes one (`<db>.v`, `ok: 0`). Found while working RM-488,
-      2026-11-13.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_change_stream_of_a_view_writes_no_line
-      Backlog-ID: RM-593
-- [ ] **A `count_documents` names an `IXSCAN` where mongod runs a
-      `COUNT_SCAN`.** A `count_documents` is a `$match` and a `$group` that
-      reads no field. Where its filter bounds the index on `x` -- of a
-      collection, or of a view `{$match: {x: {$gte: 1}}}` over it -- mongod
-      8.2.11 runs a `COUNT_SCAN { x: 1 }` that examines 11 keys and no
-      document; this server fetches the 11 documents through an
-      `IXSCAN { x: 1 }`, and its line says so. A line's `planSummary` is
-      planned from the catalog (`explain/summary.rs`), and naming a
-      `COUNT_SCAN` there would name a plan that did not run: the executor
-      has to run the count scan first, which is the SBE `GROUP` over a
-      `COUNT_SCAN` of RM-071 (which `explain` builds and runs since
-      2026-11-14, RM-072).
-      An `aggregate` of a view otherwise names the plan beneath it since
-      2026-11-13. Found while working RM-381, 2026-11-10.
-      Verify: tests/backlog/test_rm_view_lines.py::test_a_count_documents_runs_a_count_scan
-      Backlog-ID: RM-494
-- [ ] **A bare `"$"` is read as a missing field, not refused.** mongod
-      8.2.11 refuses `"$"` wherever an expression parses an operand (16872
-      "'$' by itself is not a valid FieldPath"): `{$project: {f: "$"}}`,
-      `{$toUpper: "$"}`, `{$concat: ["$", "x"]}`. This server answers each
-      as if it named a missing field (`{}`, `""`, `null`), and
-      `{$_internalFindAllValuesAtPath: "$"}` with that operator's 5511201.
-      The check belongs with the operand parse (`expr_parse::operand`),
-      before any operator's own. Found while working RM-493, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm493.py::test_a_bare_dollar_is_no_field_path
-      Backlog-ID: RM-594
-- [ ] **A `Slow query` line names a collection a command refused before
-      it acquired one.** mongod 8.2.11's line for a `create` of a
-      collection that exists (which succeeds) and for a `findAndModify`
-      with neither `update` nor `remove` (FailedToParse) names `<db>.$cmd`;
-      this server's names `<db>.c`. Found while working RM-495, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm495.py::test_a_command_refused_before_it_acquires_its_collection_names_cmd
-      Backlog-ID: RM-595
-- [ ] **A `Slow query` line names a command's value, not the collection it
-      works through.** mongod 8.2.11's line for a `filemd5` names its
-      root's chunks (`<db>.fs.chunks`), for a `convertToCapped` the
-      temporary collection it builds (`<db>.tmpXXXXX.convertToCapped.c`),
-      for a `rolesInfo` of a role `admin.system.roles`; this server's name
-      `<db>.$cmd`, `<db>.c` and `<db>.$cmd`. Found while working RM-495,
-      2026-11-13.
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm495.py::test_a_line_names_the_collection_a_command_works_through
-      Backlog-ID: RM-596
-- [ ] **`deleteIndexes` is refused as a command this server does not
-      know.** mongod 8.2.11 runs it as `dropIndexes`'s alias; this server
-      answers CommandNotFound (59), though its lock, view and time-series
-      tables already list it. Found while working RM-495, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm495.py::test_delete_indexes_is_drop_indexes
-      Backlog-ID: RM-597
-- [ ] **A `create` or `dbStats` refused for a field runs before it is
-      refused.** mongod 8.2.11 refuses a `create` with an unknown or
-      mistyped field (`bogus`, `storageEngine: 1`, `viewOn: 1`,
-      `autoIndexId`) or a `size` out of range, and a `dbStats` with an
-      unknown field or a `scale` that is not a number, as the command
-      parses: not a connection's first command (6788700), no `Slow query`
-      line. This server parses them in the handler's run, so it counts and
-      logs each. RM-386 moved the parse of `find`, the writes, `aggregate`,
-      `count`, `findAndModify`, `getMore`, `killCursors`, `drop`,
-      `listCollections`, `listIndexes`, `createIndexes`,
-      `renameCollection` and `explain` ahead of the run
-      (`parse_before_locks`); `create`'s checks interleave parse and run
-      (its capped 72s and `viewOn`/`pipeline` types), so its split needs a
-      probe of each check. A `listDatabases` on a database other than
-      `admin` (13) also counts, where mongod's does not. Found while
-      working RM-386, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm386.py::test_create_and_db_stats_refused_as_they_parse_never_run
-      Backlog-ID: RM-602
-- [ ] **A nested pipeline's unknown stage is "not supported", and a
-      `$unionWith` `pipeline: 1` runs.** mongod 8.2.11 parses the pipeline
-      of a `$facet`, a `$lookup` and a `$unionWith` with the command's own
-      (`LiteParsedPipeline`): an unknown stage in one is 40324, and a
-      `$unionWith` `pipeline` that is not an array is 14 ("A pipeline must
-      be an array of objects"). This server answers the first with
-      BadValue (2, "not supported by the Rust server") and runs the
-      second, answering ok with the collection twice. Found while working
-      RM-386, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm386.py::test_a_nested_pipeline_is_parsed_with_the_command
-      Backlog-ID: RM-603
-- [ ] **A `$setWindowFields`, `$densify` or `$fill` field of the wrong
-      type is "not supported".** mongod 8.2.11 refuses `output: 1`,
-      `field: 1` with 14, "BSON field '$densify.field' is the wrong type
-      'int', expected type 'string'"; this server answers BadValue (2),
-      "aggregation pipeline uses a stage or operator not supported by the
-      Rust server". Found while working RM-386, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm386.py::test_a_stage_field_of_the_wrong_type_is_a_type_mismatch
-      Backlog-ID: RM-604
-- [ ] **`$search`, `$vectorSearch` and `$listSearchIndexes` are refused
-      with an older mongod's code and message.** mongod 8.2.11 without
-      `mongot` refuses each as it runs with 31082 (SearchNotEnabled):
-      "Using $search and $vectorSearch aggregation stages requires
-      additional configuration. ..." for the first two, its own wording for
-      `$listSearchIndexes`. This server answers all three with 115
-      (CommandNotSupported) and `SEARCH_INDEX_ATLAS_MSG` ("... an
-      Atlas-compatible deployment to use this feature."). Found while
-      working RM-386, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm386.py::test_an_atlas_stage_is_refused_as_mongod_refuses_it
-      Backlog-ID: RM-605
-- [ ] **A `getMore` with an int cursor id is refused for its type.**
-      mongod 8.2.11 reads `{getMore: 5, collection: "c"}` as cursor 5
-      (CursorNotFound, 43), and `{getMore: 1}` is refused for the missing
-      `collection`; this server refuses the int with 14, "BSON field
-      'getMore.getMore' is the wrong type 'int', expected type 'long'".
-      Found while working RM-386, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm386.py::test_a_get_more_takes_an_int_cursor_id
-      Backlog-ID: RM-606
-- [ ] **A command refused as it runs is profiled where mongod's is not,
-      and the other way.** mongod 8.2.11 profiles a `distinct` refused for
-      its fields; it profiles no `findAndModify` with neither `update` nor
-      `remove` or with an undefined `$$variable`, no `createIndexes`
-      refused for a spec, no `create` refused for its capped options, no
-      write to a `system.` namespace it does not take, no `explain` of an
-      `insert`, no `dbStats` of `scale: 0`; and it profiles a
-      `$querySettings` stage refused for a field. This server does each the
-      other way (`profiler::refused_unprofiled` reads the reply's message
-      for some of these). Each is run, and logged, on both. Found while
-      working RM-386, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm386.py::test_a_command_refused_as_it_runs_is_profiled_as_mongod_profiles_it
-      Backlog-ID: RM-607
-- [ ] **An `update` whose statement fails writes one `Slow query` line,
-      not two.** mongod 8.2.11 writes the statement's line (`<db>.c`) and
-      the command's (`<db>.$cmd`) for an `update` whose one statement is
-      refused as it parses its update (`u: {$bogus: {a: 1}}`, a write
-      error in an `ok: 1` reply); this server writes the command's alone.
-      Found while working RM-386, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm386.py::test_an_update_with_a_failed_statement_writes_two_lines
-      Backlog-ID: RM-608
+- [ ] **A statement of a transaction does not count the transaction's
+      locks.** mongod 8.2.11's line for it counts
+      `MultiDocumentTransactionsBarrier` w 1, `ReplicationStateTransition`
+      w 3 and a flow control ticket beside the statement's Global /
+      Database / Collection, and the command's line has `locks: {}`; this
+      server's statement line has the statement's three only, no
+      `flowControl`, and its command line counts them again. Nothing takes
+      `Resource::MdtBarrier`. Of a collection and of a view alike (a write
+      of a view is refused under the transaction's locks since RM-589).
+      Found while working RM-589, 2026-11-17.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_transaction_statement_counts_the_transactions_locks
+      Backlog-ID: RM-715
+- [ ] **An empty `$densify.range` or `$fill.output` is refused with the
+      wrong answer.** mongod 8.2.11 parses `range` as it reads it, so
+      `{$densify: {range: {}}}` is 40414 "BSON field
+      '$densify.range.bounds' is missing but a required field" (before the
+      missing `field`), and `{$fill: {output: {}}}` is 6050203 "The output
+      field in '$fill' must contain an object with at least one element".
+      This server names the missing `field` for the first and answers
+      BadValue (2), "not supported by the Rust server", for the second.
+      Found while working RM-604, 2026-11-17.
+      Verify: tests/backlog/test_rm_found_rm604.py::test_an_empty_densify_range_or_fill_output_is_refused_as_mongod_refuses_it
+      Backlog-ID: RM-716
 - [ ] **Operations this server runs another way than mongod's plan say
       less.** Since RM-023 a read or a write's read that a stream runs as
       mongod's plan counts its keys and documents examined, and since
       RM-359 its profile entry carries its stages (`execStats`); these do
       neither:
       - a read two or more plans could serve, which mongod chooses by
-        trial, other than a `find`'s or an `aggregate`'s that streams: an
-        `aggregate` that sorts or groups what its `$match` reads (mongod:
-        133 keys and documents over 400, this server none), a `count`'s,
-        a `distinct`'s, a write's. Its documents come from the store's
+        trial, other than a `find`'s or an `aggregate`'s: an `aggregate`
+        that groups what a `$match` and a `$skip` or `$limit` read (in SBE
+        the entry's reads are the trial's to that limit, and the counted
+        read does not yet bound its trial by it; RM-340's test pins the
+        plan), a `count`'s, a
+        `distinct`'s, a write's. Its documents come from the store's
         router. mongod counts what the winner examined in its trial, and
-        since RM-349 a `find` (since 2026-11-13 an unsorted `aggregate` of
-        stages that stream) streams the winner after its trial's buffer
-        and counts as mongod's does; the other readers still decline a
-        contested plan (`order::stream_plan`);
-      - a read of a time-series collection made whole: under a `$sort`, a
+        since RM-349 a `find` and an `aggregate` (one that streams, sorts
+        or, since 2026-11-17, groups what its `$match` reads) run the
+        winner after its trial's buffer and count as mongod's do; the
+        other readers still decline a contested plan
+        (`order::stream_plan`);
+      - a read of a time-series collection made whole: under a
         `$group` (`count_documents`), an inclusion `$project` (RM-456), a
         filter on the meta field (RM-457), a hint or a collation. mongod
         counts the buckets its cursor stage buffered (five of five for a
         sorted `find`). Since RM-455 a `find` is the aggregation mongod
-        converts it to, and counts where a time-series `aggregate` streams;
+        converts it to, and counts where a time-series `aggregate` streams,
+        and since 2026-11-17 under a `$sort`;
       - a geo, `$near` or `$text` read (`$geoWithin` over a `2d` index:
         mongod 5 keys and 4 documents, this server none).
       Measured 2026-10-27, 2026-11-07, 2026-11-10 and 2026-11-13.
       Backlog-ID: RM-363
-      Verify: tests/backlog/test_rm_355_364.py::test_a_contested_aggregate_that_does_not_stream_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_a_time_series_read_made_whole_counts_what_it_examined
-- [ ] **A contested read's line names the plan its trial lost.** For a
-      `find` or `aggregate` of `{x: {$lt: 30}, y: 1}` over indexes on `x`
-      and `y`, mongod 8.2.11's trial runs the index on `x`, its plan cache
-      entry and its line both say `IXSCAN { x: 1 }`; this server runs and
-      caches the same plan, but its line names `IXSCAN { y: 1 }`, the plan
-      its fixed preference puts first: `explain/summary.rs` plans the line's
-      summary from the catalog with no trial. The summary should be the
-      plan the read ran (the cached plan, or the trial's winner). Found
-      while working RM-363, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm363.py::test_a_contested_read_names_the_plan_its_trial_chose
-      Backlog-ID: RM-598
-- [ ] **A line says nothing of how its plan was chosen.** mongod 8.2.11's
-      `Slow query` line for a read whose plan its trial chose says
-      `fromMultiPlanner: true` (and `fromPlanCache: true` for one that ran
-      the cache's active plan); this server's line carries neither, though
-      `explain/order.rs` notes both for `$queryStats`
-      (`opdebug::note_planned`). Found while working RM-363, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_rm363.py::test_a_contested_read_says_it_was_multi_planned
-      Backlog-ID: RM-599
-- [ ] **A time-series read bounded on its time field is not a clustered
-      scan of its buckets.** mongod 8.2.11's line for a `find({t: {$gt:
-      <date>}})` of a time-series collection, with no index serving the
-      bound, says `CLUSTERED_IXSCAN`: the buckets are clustered by `_id`,
-      whose timestamp is each bucket's start, so the bound on
-      `control.min.t` bounds the `_id`s read. This server's says
-      `COLLSCAN`. Found while working RM-496, 2026-11-13.
-      Backlog-ID: RM-600
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm363.py::test_a_time_series_read_bounded_on_its_time_field_scans_the_clustered_buckets
+      Verify: tests/backlog/test_rm_355_364.py::test_a_grouped_time_series_read_counts_what_it_examined
 - [ ] **WiredTiger 11's interruptible cache wait is not on the line.**
       mongod 8.2.11's WiredTiger splits a cache wait into the share spent
       in interruptible eviction (`timeWaitingMicros.cacheInterruptibleMicros`)
@@ -1054,7 +857,7 @@ These are explicit non-goals. Don't add them without a reason.
       one WiredTiger table per collection (`key_format=q`) and one per
       index (KeyString keys), so no key names its namespace. Measured with
       the gap test's insert of fifty documents into `c`, with the `_id` and
-      `x` indexes (`secantusd-rs` from `rm-batch` at 6bcd8f41, mongod
+      `x` indexes (`secantusd-mdb` from `rm-batch` at 6bcd8f41, mongod
       8.2.11): a 9-character database name gives 362.8 bytes per document
       here against 311.6 on mongod. A 49-character name gives 481.4 here
       against 313.8: 40 more characters cost 118.6 bytes here (three keys
@@ -1076,6 +879,7 @@ These are explicit non-goals. Don't add them without a reason.
       the Rust PG server links it, and the PG session is told before the
       format changes.
       Verify: tests/backlog/test_rm_355_364.py::test_an_insert_in_a_transaction_counts_mongods_dirty_bytes
+      **Decided (Joe, 2026-11-16): go ahead, staged as above -- storage first, then KeyString; a format bump that refuses an old store; the PG session told before the format changes.**
       Backlog-ID: RM-499
 
 - [ ] **mongod's startup lines this server does not write.** Since RM-302
@@ -1084,16 +888,22 @@ These are explicit non-goals. Don't add them without a reason.
   `Build Info` (23403), `Operating System` (51765), `Options set by command
   line` (21951), the
   lock file's `Detected unclean shutdown` (22271), `Opening WiredTiger`
-  (22315), `WiredTiger opened` (4795906) and, last, `mongod startup
-  complete` (8423403). mongod writes about sixty more there that this
-  server does not: WiredTiger's own messages under `Opening WiredTiger`
-  (22430, from its `verbose=[recovery_progress:1,...]` and
-  `json_output=(error,message)` configuration), the network lines, the
-  storage-engine detection and recovery lines, the spill WiredTiger, the
+  (22315), WiredTiger's own messages under it (22430, since 2026-11-16:
+  the store opens with mongod's `json_output` / `verbose` configuration),
+  `WiredTiger opened` (4795906) and, last, `mongod startup complete`
+  (8423403). mongod writes about fifty more there that this server does
+  not: the network lines, the recovery-timestamp (23987) and session-cache
+  lines, the spill WiredTiger's open and its own 22430 messages, the
   durable catalog, FCV, FTDC and flow-control lines (measured 2026-10-24,
-  2026-11-07, 2026-11-10 and 2026-11-13). Found with RM-302.
+  2026-11-07, 2026-11-10, 2026-11-13 and 2026-11-16). Two limits on the
+  22430 lines: they are held by the connection and written together once
+  the open returns, not as WiredTiger writes them, and a message written
+  after the open (a checkpoint's or compaction's progress, the shutdown's
+  recovery lines) is held (up to 4096) but never logged, where mongod logs
+  each. The vendored WiredTiger 7.0 writes four on a new store where
+  mongod's newer engine writes fourteen. Found with RM-302.
   Backlog-ID: RM-305
-  Verify: tests/backlog/test_rm_001_028.py::test_startup_writes_wiredtigers_own_messages
+  Verify: tests/backlog/test_rm_001_028.py::test_startup_writes_the_recovery_timestamp_after_opening
 ### 7.091 mongod's slot-based engine (SBE) -- 2026-10-23
 
 mongod 8.2 runs the front of a pipeline in its slot-based engine when it can
@@ -1201,40 +1011,38 @@ Python behind the Rust server, a deferral answers 2 "aggregation pipeline
 uses a stage or operator not supported by the Rust server". The file has
 about forty such points; these are the ones measured.
 
-- [ ] **A write of many through an index of a clustered collection reads
-      every candidate before it writes one.** mongod writes each document
-      as its plan returns it, whatever the plan, so an updateMany or
-      deleteMany out of `maxTimeMS` part-way has written some (mongod
-      8.2.11, 2026-11-10, 100,000 documents, `maxTimeMS: 30`: through index
-      `a_1` of a collection clustered by `_id` 4,599 updated and 11,280
-      deleted). A plan this server's write cannot stream -- a clustered or
-      time-series collection, a geo plan -- leaves the write to the store,
-      which since 2026-11-10 reads its candidates a page at a time and
-      writes each page first, so a collection scan out of time keeps what
-      it wrote. The router's RecordIds of an index (`try_index_id_keys`)
-      are still read whole before the first page, and a budget spent there
-      writes nothing. The work is to stream a clustered collection's plan
-      as an ordinary one's (its natural order is `_id`'s, which the stream
-      does not yet read), or to read the index a page at a time into the
-      write; a geo plan is the same shape, not yet probed. (A contested
-      plan is tried over what its candidates reach and streamed since
-      2026-11-13.)
+- [ ] **A write of many through a compound index of a clustered
+      collection reads every candidate before it writes one.** mongod
+      writes each document as its plan returns it, whatever the plan, so an
+      updateMany or deleteMany out of `maxTimeMS` part-way has written some
+      (mongod 8.2.11, 100,000 documents, `maxTimeMS: 30`). A plan this
+      server's write cannot stream -- a clustered or time-series
+      collection, a geo plan -- leaves the write to the store, which reads
+      a collection scan (since 2026-11-10) and a one-field bounded index
+      read (since 2026-11-17) a page at a time, writing each page first.
+      The router's other index reads (`try_index_id_keys`: a compound
+      index, `$in` / `$eq`, `$and`, `$or`, `$elemMatch`, geo) are still
+      read whole before the first page, and a budget spent there writes
+      nothing. The work is to stream a clustered collection's plan as an
+      ordinary one's (its natural order is `_id`'s, which the stream does
+      not yet read), or to page each of those reads into the write as
+      `bounded_span_pages` does; a geo plan is not yet probed.
       Backlog-ID: RM-390
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm390.py::test_a_write_of_many_out_of_time_keeps_what_it_wrote_whatever_its_plan
-- [ ] **A read whose plan two indexes contest reads every match.**
-      Over `{a: {$gte: 0}, b: {$gte: 0}}` with indexes `a_1` and `b_1`,
-      mongod 8.2.11 tries both plans for about 101 results and then runs
-      the winner only as far as the read needs, so a `find(...).limit(101)`
-      takes 0.3 ms, an `updateOne` 4-5 ms and an `explain` at
-      `queryPlanner` 0.3 ms whether the collection holds 10,000 documents
-      or 100,000. This server's time for each grows with the collection,
-      ten times over for ten times the documents (debug build, 2026-11-13:
-      80, 135 and 127 ms at 10,000; 710, 1,221 and 1,282 ms at 100,000), so
-      it reads every match before the limit, the single write or the plan
-      choice stops it. The answers are the same; the cost is the whole
-      read. A write of many has streamed a contested plan since
-      2026-11-13 (RM-390); a read, a write of one and `explain` do not.
-      Found while fixing RM-390's CI test, 2026-11-13.
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm390.py::test_a_write_of_many_through_a_compound_index_out_of_time_keeps_what_it_wrote
+- [ ] **An explain of a read whose plan two indexes contest reads the
+      whole collection.** Over `{a: {$gte: 0}, b: {$gte: 0}}` with
+      indexes `a_1` and `b_1`, mongod 8.2.11's `explain` of a
+      `find(...).limit(101)` at `queryPlanner` takes 0.3 ms whether the
+      collection holds 10,000 documents or 100,000: its trial reads only
+      what the candidate plans reach. This server's grows ten times over
+      (debug build, 2026-11-13: 127 ms at 10,000, 1,282 ms at 100,000),
+      because `explain` plans over every document of the collection,
+      loaded into memory first (`explain/mod.rs`, `Target.docs`, read by
+      `target()`). The answers are the same; the cost is the whole
+      collection. A find and a write of one try their plans over what the
+      plans reach since 2026-11-17 (RM-610, part); the work is to give
+      explain's trial the store, as `order.rs`'s `Lazy` does, in place of
+      `Held`. Found while fixing RM-390's CI test, 2026-11-13.
       Verify: tests/backlog/test_rm_found_2026_11_13_contested_reads.py::test_a_contested_read_costs_what_it_returns
       Backlog-ID: RM-610
 - [ ] **A profile entry counts what it examined as int64, where mongod
@@ -1265,7 +1073,7 @@ about forty such points; these are the ones measured.
 
 An audit of the command, expression and wire layers, each finding reproduced
 against mongod 8.2.11 (standalone, or a one-member replica set where it
-needs sessions) with a `secantusd-rs` built from tree `af2629ec`. The gap
+needs sessions) with a `secantusd-mdb` built from tree `af2629ec`. The gap
 tests are in `tests/backlog/test_rm_found_2026_10_20b.py` and ask mongod
 live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
 `j: true` durability (RM-186), `storageSize` (RM-040).
@@ -1275,7 +1083,7 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
   history for a logged table, so a store created with `--data-logged`, or by
   the PostgreSQL server, refuses `atClusterTime` before the newest time with
   246 SnapshotUnavailable, by name, rather than answer as of now; without
-  `atClusterTime` it reads the latest data, which is correct. `secantusd-rs`
+  `atClusterTime` it reads the latest data, which is correct. `secantusd-mdb`
   creates its stores the other way, mongod's (RM-210).
 - [ ] **A spill the spill engine writes out takes this server's size on
       disk, not mongod's.** A `$setWindowFields` spills to a table of a
@@ -1297,7 +1105,7 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       on its command line (not at runtime), and at 50000 spills a slot-based
       `$group` `$push` of 300 1000-byte strings 7 times, 312300 bytes, into
       a table of its spill engine (`groupSpilledDataStorageSize` 4096).
-      `secantusd-rs` refuses the parameter ("Unknown --setParameter"), so
+      `secantusd-mdb` refuses the parameter ("Unknown --setParameter"), so
       the SBE `$group`'s budget is always 100 MiB and what it spills is
       unmeasured. Found 2026-11-13 working RM-325 (its remainder).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_an_sbe_group_spills_as_mongods
@@ -1865,12 +1673,12 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       mongod's settings, a read of their shape is refused (411) or planned
       over its `indexHints` (RM-219), since 2026-11-10 its
       `queryFramework` chooses the engine, and since 2026-11-14
-      `showDebugQueryShape` gives each `debugQueryShape` (RM-418). Open:
-      a query whose shape `query_shape.rs` does not compute (a
-      `$jsonSchema` filter) is refused 115 where mongod keeps the setting;
-      and a write made to `config.clusterParameters` directly is read only
-      at the next start (mongod's op observer reloads it).
-      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_setting_for_a_query_the_server_does_not_shape
+      `showDebugQueryShape` gives each `debugQueryShape` (RM-418), and
+      since 2026-11-16 a `$jsonSchema` query's setting is kept (RM-358).
+      Open: a write made to `config.clusterParameters` directly is read
+      only at the next start (mongod's op observer reloads it).
+      Verify: none -- no gap test yet for the direct write to
+      `config.clusterParameters`
       Backlog-ID: RM-418
 - [ ] **A `find` under `queryFramework: "sbe"` that is sorted or
       index-served is explained in the classic shape.** mongod 8.2.11 runs
@@ -1903,7 +1711,7 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
 
 A read-only audit of `secantus-storage` / `secantus-wt`, the layer both
 Rust servers use. The two items with gap tests were reproduced against
-mongod 8.2.11 with a `secantusd-rs` built from tree `af2629ec`; the rest
+mongod 8.2.11 with a `secantusd-mdb` built from tree `af2629ec`; the rest
 were confirmed by reading the code path and need a fault no quick test can
 inject (a panic, a power loss, a failing checkpoint).
 
@@ -2070,6 +1878,14 @@ Still different:
       oplog spans several tables), lists by database and then name rather
       than creation order, gives an index `spec` in `listIndexes`' key
       order, and reads a geo index's `multikey` from the documents now.
+      Not workable as one fix (a fix-one session declined it, 2026-11-14): it
+      bundles about ten gaps (buildInfo's per-OS block, latencyStats,
+      connectionStatus privileges, hostInfo.extra on Linux, $indexStats
+      following the trial, $listCatalog fields, sessions in
+      config.system.sessions) besides the per-table sizes RM-499 decides.
+      Split it into one item per gap, each with its own gap test, before
+      batching.
+      **Decided (Joe, 2026-11-16): RM-499 goes ahead; once its storage stage lands, split this item's per-table parts and its other parts into separate items with their own gap tests.**
       Backlog-ID: RM-040
       Verify: tests/backlog/test_rm_029_056.py::test_coll_stats_wiredtiger_and_index_details
 
@@ -2240,6 +2056,11 @@ Still different, all 77:
       either side of 15 characters. **Decided (Joe, 2026-11-08, on RM-341):
       a layout table per mongod build, chosen by the target the server is
       built for, each fitted by probing that platform's mongod 8.2.11.**
+      Blocked (2026-11-14): fitting the LIBSTDCXX_X86_64 table needs a Linux
+      x86_64 mongod 8.2.11, and this Mac has only macOS builds and no
+      container runtime. Either install colima or Docker and run the Linux
+      image here, or probe CI's Linux mongod from a dedicated session.
+      **Decided (Joe, 2026-11-16): install colima on this Mac and run the Linux x86_64 mongod 8.2.11 image locally to fit LIBSTDCXX_X86_64.**
       Backlog-ID: RM-442
       Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_an_entry_reports_its_estimated_size_on_linux
 - [ ] **A `$cursor` the pipeline stops reading reports a plan run to its
@@ -2369,6 +2190,9 @@ A `readConcern` with an `atClusterTime` older than the oldest timestamp is
       and the two delinquency totals).
       **Decided 2026-10-16 (Joe):** leave it open; no stand-in values. Build
       it when those mechanisms exist.
+      Blocked (checked 2026-11-14): waits on RM-355 (execution admission
+      control) and RM-360 (interrupt checks), per the decision above; both are
+      still open in part.
       Backlog-ID: RM-170
       Verify: tests/backlog/test_rm_found_2026_10_16.py::test_include_query_stats_metrics_adds_a_metrics_document
 
@@ -2621,26 +2445,61 @@ bucket documents in `system.buckets.<name>`, each data field mongod's
 compressed column, placed by mongod's bucket catalog
 (`crates/secantus-commands/src/bucket_catalog.rs`). What is left:
 
+- [ ] **RUST MongoDB server: `serverStatus` has no `bucketCatalog`
+      section.** mongod 8.2.11 reports one once a time-series collection is
+      written to: `numBuckets`, `numOpenBuckets`, `numIdleBuckets`,
+      `numArchivedBuckets`, `memoryUsage`, the execution counters
+      (`numBucketInserts`, `numBucketUpdates`, `numCommits`,
+      `numMeasurementsCommitted`, the `numBucketsClosedDueTo...` and
+      `numBucketReopeningsFailedDueTo...` families and the rest, 45 fields in
+      all, in one order) and `stateManagement` (`bucketsManaged`,
+      `currentEra`, `erasWithRemainingBuckets`, `trackedClearOperations`).
+      None before the first write. This server reports no section. Every
+      field but `memoryUsage` is the catalog's own state
+      (`crates/secantus-commands/src/bucket_catalog.rs`): report it from what
+      the catalog keeps, counting as mongod does (a commit per bucket per
+      batch, an update when a measurement joins an open bucket, and so on).
+      `memoryUsage` is reported with the key but its value is RM-710's.
+      Measured 2026-11-11 and 2026-11-16 (a time-series collection gives a
+      section after four inserts over two metadata values: `numBuckets` 2,
+      `numCommits` 2, `numMeasurementsCommitted` 4). (This was part of
+      RM-549, split 2026-11-16, Joe's go-ahead.)
+      Verify: tests/backlog/test_rm_found_2026_11_11_rm088.py::test_server_status_reports_the_bucket_catalog, tests/backlog/test_rm_bucket_catalog.py::test_bucket_catalog_counts_and_counters_follow_the_writes
+      Backlog-ID: RM-709
 - [ ] **RUST MongoDB server: the bucket catalog keeps no account of its
-      memory.** mongod 8.2.11 reports a `bucketCatalog` section in
-      `serverStatus` once a time-series collection is written to
-      (`numBuckets`, `numOpenBuckets`, `numIdleBuckets`,
-      `numArchivedBuckets`, `memoryUsage`, the execution counters,
-      `stateManagement`), and closes or archives idle buckets when the
-      catalog's memory passes `timeseriesIdleBucketExpiryMemoryUsageThreshold`
-      (a share of the machine's memory). This server reports no section and
-      never expires an idle bucket. Everything but the memory is the
-      catalog's to report; `memoryUsage`, and so the expiry, is the bytes
-      mongod's own C++ structures allocate through its tracking allocators,
-      which this server does not make. Measured 2026-11-11.
+      memory.** mongod 8.2.11's `bucketCatalog.memoryUsage` is the bytes its
+      own C++ structures allocate through tracking allocators: 12552 with one
+      bucket holding one measurement (and a one-character metadata value),
+      12828 after four more measurements, a new field among them, join that
+      bucket; each repeats run for run, while a larger catalog varies by about
+      a hundred bytes between runs (so only the small cases are pinned). This
+      server reports no section, and keeps no such account.
       **Decided (Joe, 2026-11-11):** model mongod's accounting: charge each
       bucket, its column builders, summaries, schema and the catalog's maps
       the bytes mongod's structures allocate through its tracking
-      allocators, so `memoryUsage` and idle-bucket expiry follow mongod's.
-      The size limit's memory accounting (`getCacheDerivedBucketMaxSize`,
-      decided 2026-10-16) does not depend on it and is built.
-      Verify: tests/backlog/test_rm_found_2026_11_11_rm088.py::test_server_status_reports_the_bucket_catalog
-      Backlog-ID: RM-549
+      allocators, so `memoryUsage` follows mongod's. The size limit's memory
+      accounting (`getCacheDerivedBucketMaxSize`, decided 2026-10-16) does
+      not depend on it and is built. Needs RM-709's section to report it
+      through, and RM-711's expiry needs this. (This was part of RM-549, split
+      2026-11-16, Joe's go-ahead.)
+      Verify: tests/backlog/test_rm_bucket_catalog.py::test_bucket_catalog_memory_usage_is_the_bytes_mongod_accounts
+      Backlog-ID: RM-710
+- [ ] **RUST MongoDB server: idle buckets never expire past
+      `timeseriesIdleBucketExpiryMemoryUsageThreshold`.** mongod 8.2.11
+      closes idle buckets (and counts `numBucketsClosedDueToMemoryThreshold`
+      and `numBucketsArchivedDueToMemoryThreshold`, equal) when the catalog's
+      memory passes the threshold (`getParameter` reports 5 by default, a share of the
+      machine's memory; a byte count set at runtime, here after the first
+      write, takes effect) as a bucket is opened for a new metadata
+      value; with it at 30000 bytes, 21 buckets opened for 21 metadata values
+      leave 14 to 17 in the catalog, and every bucket document stays stored.
+      Which expire depends on the stripe each lands in, so only the facts
+      are pinned. This server never expires an idle bucket, and refuses the
+      `setParameter` (code 72). **Waits on RM-710** (the memory accounting
+      decides when the threshold is passed) and needs RM-709's counters. (This was part of RM-549, split 2026-11-16, Joe's
+      go-ahead.)
+      Verify: tests/backlog/test_rm_bucket_catalog.py::test_idle_buckets_expire_past_the_memory_threshold
+      Backlog-ID: RM-711
 - **Scope decision — a `hashed` index on a time-series collection** is
   refused as on any collection: hashed indexes are out of scope.
 - **Scope decision — `listCollections` order around time-series buckets.**
@@ -2789,7 +2648,7 @@ dropped (four), and `listIndexes` lists by name.
 - **The multikey `$sort` plan artifact**: accepted -- mongod contradicting its
   own `_id` tie-break.
 - **Decimal128 transcendental last digit**: authorised (correctly rounded).
-- **Make Rust the recommended default**: decided 2026-10-16 (Joe): Rust first everywhere — README (the PyPI page) and docs lead with the Rust servers, the Python servers move to a marked-deprecated section, and the `secantusdb` alias names `secantusd-rs`. Removing the Python servers stays a separate decision.
+- **Make Rust the recommended default**: decided 2026-10-16 (Joe): Rust first everywhere — README (the PyPI page) and docs lead with the Rust servers, the Python servers move to a marked-deprecated section, and the `secantusdb` alias names `secantusd-mdb`. Removing the Python servers stays a separate decision.
 - **PyPI trusted publisher for `secantus-core` / lockstep publishing**: needs
   Joe's PyPI account.
 - **CI Python matrix (3.10 only on push)** and **vendored WiredTiger rebuilt per
@@ -2914,23 +2773,6 @@ race on demand, which is worth having if this area changes again.
   Diagnose before trusting week-over-week go comparisons.
   Backlog-ID: RM-118
   Verify: none -- Go gauge CI test-count discrepancy
-- [ ] **One-time: configure a PyPI Trusted Publisher for `secantus-core`.**
-  On PyPI, add a Trusted Publisher for the (new) `secantus-core` project pointing
-  at `.github/workflows/rust-wheels.yml` (environment `pypi`), mirroring the
-  `secantus` setup. Until this exists the tag-gated `publish` job fails auth; the
-  `build`/`sdist` jobs run on every push/PR and are already CI-validated, so this
-  is the only thing blocking the first published `secantus-core` wheel.
-  Backlog-ID: RM-121
-  Verify: none -- PyPI account configuration
-- [ ] **Release-process: bump & publish `secantus-core` in lockstep.** The
-  `secantus[rust]` extra pins `secantus-core` to the exact SecantusDB version, so
-  every release must (a) bump BOTH versions — root `pyproject.toml` and
-  `crates/secantus-core/pyproject.toml` — and the `rust` extra pin in the root
-  pyproject, and (b) publish both wheels. Wire this into the `/secantusdb-release`
-  skill so the two can never drift (the `secantus[rust]` install breaks if the
-  matching `secantus-core` version isn't on PyPI).
-  Backlog-ID: RM-122
-  Verify: none -- release-process wiring
 
 ### 7.4 Verified rust-only gauge tail (2026-06-25)
 
@@ -3062,6 +2904,7 @@ the zlib block compressor; re-measure under the current lz4 default.
   vendored WiredTiger (`HAVE_BUILTIN_EXTENSION_ZLIB`) and is what the data
   tables use, so this is a connection-string change, not a build change.
   mongod uses snappy; zlib measured well here.
+  **Decided (Joe, 2026-11-16): benchmark first -- write latency and throughput with the log uncompressed, zlib, and snappy (mongod's choice; add it to the WiredTiger build if needed) -- then choose on the numbers.**
   Backlog-ID: RM-131
   Verify: none -- WAL compressor config/perf decision
 
@@ -3071,7 +2914,7 @@ the zlib block compressor; re-measure under the current lz4 default.
 re-measurement on Linux (`bench/results/mdb-droplet/2026-10-13-log-file-max/`)
 found no throughput difference between 2GB / 512MB / 128MB / 32MB.
 
-- [ ] **64 writers got less than 16 from `secantusd-rs`** in that run
+- [ ] **64 writers got less than 16 from `secantusd-mdb`** in that run
   (about 16,100 operations a second against 22,400, half inserts and half
   updates of 1 KiB documents), with the clients' CPUs under 5% busy. Not
   looked into.
@@ -3132,11 +2975,13 @@ above was of a fixed limit; the tail under probing is not yet measured.
 - [ ] **`--oplog-async` as a default** — worth 24% of the tail and 42% of the
   stalls on its own, independently of the cache story. Every write currently
   passes through one process-wide `Arc<Mutex<OplogState>>`.
+  **Decided (Joe, 2026-11-16): match mongod's model -- probe how mongod 8.2 orders the oplog and data writes and what a crash keeps, and make the default whatever reproduces that; no speed-only default.**
   Backlog-ID: RM-135
   Verify: none -- --oplog-async default decision
 - [ ] **Cache defaulting** — the daemon caps at 4G; the sweep shows the tail is
   governed by cache headroom versus write rate, so the default deserves
   revisiting (and documenting) rather than being a fixed number.
+  **Decided (Joe, 2026-11-16): adopt mongod's rule -- the larger of 50% of (RAM - 1 GB) and 256 MB -- and document it.**
   Backlog-ID: RM-136
   Verify: none -- cache-size default decision
 
@@ -3189,20 +3034,6 @@ touched:
 
 ## The backlog verifier's pytest stalled once in CI (2026-10-21)
 
-- [ ] **One CI run of the storage-engine (ubuntu) backlog step stalled for
-  300 s and was killed.** PR #2082's run 39691311797, first attempt: the
-  `tools/backlog.py verify --regressions` pytest reported no test for 301 s
-  ("=== pytest session stalled ==="), three tests of
-  `tests/backlog/test_rm_found_2026_10_20b.py` never ran
-  (`test_snapshot_read_at_cluster_time`,
-  `test_snapshot_session_keeps_its_snapshot`, `test_diagnostic_stages`), and
-  the step failed. The re-run passed, `main` had passed six runs in a row,
-  and the module ran in 23 s locally. Not known: which test hung. The
-  stall dump prints the CONTROLLER's threads only, so the next stall should
-  dump the workers' stacks too (and the servers they started) -- that is
-  the change that makes this diagnosable.
-  Backlog-ID: RM-254
-  Verify: none -- an intermittent CI stall whose hung test is unknown
 - [ ] **RM-008's limiter test reads mongod's answer under load as a
   different answer.** `test_ingress_rate_limiter_admits_queues_and_closes`
   opens six connections against each server with the limiter at one a

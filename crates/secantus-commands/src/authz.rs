@@ -237,8 +237,8 @@ pub(crate) fn check(
 
         "listIndexes" => c.on_collection(doc, name, &["listIndexes"]),
         "createIndexes" => c.on_collection(doc, name, &["createIndex"]),
-        "dropIndexes" => c.on_collection(doc, name, &["dropIndex"]),
-        "createSearchIndexes" | "updateSearchIndex" | "dropSearchIndex" => {
+        "dropIndexes" | "deleteIndexes" => c.on_collection(doc, name, &["dropIndex"]),
+        "createSearchIndexes" | "updateSearchIndex" | "dropSearchIndex" | "listSearchIndexes" => {
             c.on_collection(doc, name, &[name]);
         }
         "create" => {

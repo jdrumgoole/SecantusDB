@@ -5,13 +5,13 @@ not be able to tell SecantusDB apart from a real `mongod` for the operations
 it supports. This page lists the divergences that exist anyway.
 
 :::{note}
-This page describes the **Python server** — the conformance reference.
-SecantusDB also ships a separate **Rust server** that speaks the same wire
-protocol and now matches the Python server on pymongo's suite; its few
-remaining feature gaps are delineated in [The two servers](servers.md), and
-the full three-way matrix against real `mongod` is in the
+This page was written against the original **Python server** and still lists
+its divergences from `mongod`; the Rust MongoDB server, `secantusd-mdb`, is the
+product and is held to `mongod` directly. Its remaining feature gaps are
+delineated in [The servers](servers.md), and the full matrix against real
+`mongod` is in the
 [Feature comparison](feature-comparison.md). The separate
-**PostgreSQL-wire SQL front end** (`pip install "SecantusDB[sql]"`) has its own
+**PostgreSQL server** (`secantusd-pg`) has its own
 conformance target (`psql` + `psycopg`) and its own supported-SQL matrix in
 [SQL / PostgreSQL interface](sql.md).
 :::

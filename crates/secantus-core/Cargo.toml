@@ -1,6 +1,6 @@
 [package]
 name = "secantus-core"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 edition = "2021"
 description = "Pure-Rust operator engines for SecantusDB (sort keys, query matcher, update operators, aggregation-expression evaluator, projection, change-stream diff, aggregation pipeline)."
 license = "GPL-2.0-only"
@@ -40,7 +40,7 @@ regex-automata = "0.4"
 # Collation: the ICU 57.1 mongod links, built from mongo's own copy
 # (`vendor/icu4c-57.1`). A sort key is written to disk
 # (`collation::KEY_FORMAT`), and this is the collator that makes its bytes.
-secantus-icu = { version = "=0.5.3-beta.196", path = "../secantus-icu" }
+secantus-icu = { version = "=0.5.3-beta.198", path = "../secantus-icu" }
 # Backtracking regex with lookaround + backreference support (Python `re`-style),
 # used only when the linear `regex` engine above can't compile a pattern — e.g.
 # the negative-lookahead `^(?!system\.)` pymongo emits for listCollections name

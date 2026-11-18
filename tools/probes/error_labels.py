@@ -23,7 +23,7 @@ Needs both servers with failpoints enabled; compares the Rust server only (the
 Python server is not the reference):
 
     mongod --replSet rs0 --setParameter enableTestCommands=1 ...   (initiated)
-    secantusd-rs --enable-test-commands ...
+    secantusd-mdb --enable-test-commands ...
     PROBE_MONGOD="mongodb://127.0.0.1:27041/?directConnection=true" \\
     PROBE_SERVER="mongodb://127.0.0.1:27056/?directConnection=true" \\
         python tools/probes/error_labels.py

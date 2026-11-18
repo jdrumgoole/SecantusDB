@@ -2,7 +2,7 @@
 
 `tests/test_crash_recovery.py` hard-kills a writer, but only with
 `SECANTUS_DATA_NONLOGGED=1` (data tables recovered by oplog replay), which
-is not how `secantusd-rs` runs by default. The one default-mode kill test,
+is not how `secantusd-mdb` runs by default. The one default-mode kill test,
 RM-186's regression test in `tests/backlog/`, kills an IDLE server after 50
 sequential inserts. This one kills the standalone binary while four clients
 are inserting, updating and deleting concurrently, every write with
@@ -34,7 +34,7 @@ pymongo = pytest.importorskip("pymongo")
 from pymongo.write_concern import WriteConcern  # noqa: E402
 
 _REPO = pathlib.Path(__file__).resolve().parent.parent
-_BANNER = re.compile(r"secantusd-rs listening on (\S+):(\d+)")
+_BANNER = re.compile(r"secantusd-mdb listening on (\S+):(\d+)")
 
 
 def _binary() -> pathlib.Path | None:
@@ -42,7 +42,7 @@ def _binary() -> pathlib.Path | None:
     if env:
         return pathlib.Path(env) if pathlib.Path(env).exists() else None
     for profile in ("debug", "release"):
-        p = _REPO / "crates" / "secantusdb" / "target" / profile / "secantusd-rs"
+        p = _REPO / "crates" / "secantusdb" / "target" / profile / "secantusd-mdb"
         if p.exists():
             return p
     return None
@@ -50,7 +50,7 @@ def _binary() -> pathlib.Path | None:
 
 _BIN = _binary()
 pytestmark = [
-    pytest.mark.skipif(_BIN is None, reason="secantusd-rs binary not built"),
+    pytest.mark.skipif(_BIN is None, reason="secantusd-mdb binary not built"),
     pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL semantics: POSIX only"),
 ]
 
@@ -75,7 +75,7 @@ class _Server:
             m = _BANNER.search(line)
             if m or not line:
                 break
-        assert m, f"secantusd-rs did not start: {line!r}"
+        assert m, f"secantusd-mdb did not start: {line!r}"
         # Keep draining: an unread pipe fills at 64 KiB and blocks the server.
         out = self.proc.stdout
         threading.Thread(target=lambda: [None for _ in out], daemon=True).start()
@@ -165,7 +165,7 @@ def test_acknowledged_journaled_writes_survive_sigkill_mid_load(store: pathlib.P
         # the kill lands in the middle of steady concurrent load.
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline and min(w.n_acked for w in writers) < 50:
-            assert server.proc.poll() is None, "secantusd-rs exited under load"
+            assert server.proc.poll() is None, "secantusd-mdb exited under load"
             time.sleep(0.05)
         assert min(w.n_acked for w in writers) >= 50, "load never got going"
         server.kill()

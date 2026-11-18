@@ -3,7 +3,7 @@ again after a yield (RM-501, 2026-11-13), measured against mongod 8.2.11:
 a delete's profile entry counts no yields.
 
 The reference is mongod, asked live (`mongod_rs`, a one-member replica set);
-the Rust server is `secantusd-rs` (`rust_mongo`).
+the Rust server is `secantusd-mdb` (`rust_mongo`).
 """
 
 from __future__ import annotations

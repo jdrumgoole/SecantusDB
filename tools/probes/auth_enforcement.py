@@ -9,7 +9,7 @@ commands; what is compared is whether the command ran and, when it did not,
 the error code. The message of an `Unauthorized` names the whole command
 with its session id and is not compared.
 
-    PROBE_RUST_BIN=crates/secantusdb/target/release/secantusd-rs \\
+    PROBE_RUST_BIN=crates/secantusdb/target/release/secantusd-mdb \\
         python tools/probes/auth_enforcement.py
 
 `PROBE_ONLY=<substring>` keeps the users or commands whose name contains it;

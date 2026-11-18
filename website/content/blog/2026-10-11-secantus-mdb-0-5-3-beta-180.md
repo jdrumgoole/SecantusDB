@@ -7,8 +7,8 @@ Tags: release
 
 Summary: secantus-mdb 0.5.3-beta.180 checks the session fields on every command, remembers a retryable write statement by statement, reports a commit that failed, and aborts an abandoned transaction when its lifetime runs out.
 
-If your tests use transactions or retryable writes on `secantusd-rs`, upgrade.
-Four things in this release could leave a test passing on wrong data.
+If you use transactions or retryable writes on `secantusd-rs`, upgrade.
+Four things in this release could leave an application reading wrong data.
 
 - **A failed commit answered `ok: 1`.** When the storage engine refused a
   `commitTransaction`, the error was dropped and the client was told the
@@ -89,7 +89,7 @@ What this release does not do:
 We ran the pymongo, Go and Node driver suites against this code. Each gave
 the same result as the release before.
 
-This is a server for tests. It is single-node and it is a beta.
+This is a real single-node database, and it is a beta.
 
 `cargo install secantus-mdb --version 0.5.3-beta.180` builds it from crates.io.
 Binaries for Linux x86_64, macOS arm64 and Windows x86_64 are on the release.

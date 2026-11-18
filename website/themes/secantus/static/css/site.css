@@ -640,7 +640,13 @@ article.post .body h3 { font-size: 19px; margin: 28px 0 10px; font-weight: 600; 
   .hero h1 { font-size: 36px; }
   .hero .lead { font-size: 17px; }
   .section { padding: 56px 0; }
-  .site-nav { gap: 14px; font-size: 13px; }
+  /* Eight links do not fit beside the logo at phone width: put the nav on
+     its own row and let it wrap, rather than widening the whole page. */
+  .site-header .wrap { flex-wrap: wrap; row-gap: 10px; padding-top: 14px; padding-bottom: 12px; }
+  .site-nav { gap: 0 16px; font-size: 13px; flex-wrap: wrap; width: 100%; }
+  .site-nav a { padding: 3px 0; }
+  /* Long identifiers (namespaces, flags) in prose must not widen the page. */
+  p code, li code, td code { overflow-wrap: anywhere; }
 }
 
 /* ---- Two servers (engines) — dark band on home + Rust-server page ---- */

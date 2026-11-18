@@ -1,8 +1,8 @@
 [package]
 name = "secantus-mdb"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 edition = "2021"
-description = "A surrogate MongoDB server for tests: the real wire protocol over WiredTiger, single-node. Embed it (secantus_mdb::Server) or run the secantusd-rs binary."
+description = "A single-node MongoDB server: the real wire protocol over WiredTiger. Embed it (secantus_mdb::Server) or run the secantusd-mdb binary."
 license = "GPL-2.0-only"
 repository = "https://github.com/jdrumgoole/SecantusDB"
 
@@ -16,8 +16,8 @@ repository = "https://github.com/jdrumgoole/SecantusDB"
 # into the parent `crates` workspace, matching secantus-storage-adapter.
 rust-version = "1.98"
 readme = "README.md"
-keywords = ["mongodb", "database", "testing", "server", "wiredtiger"]
-categories = ["database-implementations", "development-tools::testing"]
+keywords = ["mongodb", "database", "embedded", "server", "wiredtiger"]
+categories = ["database-implementations"]
 
 # `cargo binstall secantus-mdb` fetches the prebuilt, PGO-optimised binary that
 # release-binaries.yml attaches to the `secantusdb-v<version>` release, instead
@@ -31,13 +31,13 @@ pkg-fmt = "tgz"
 
 # Binary name follows the `secantusd-<engine>` daemon scheme so the compiled
 # Rust server is distinguishable from the Python one (`secantusd-py`). The Cargo
-# package stays `secantusdb`; only the emitted binary is `secantusd-rs`.
+# package stays `secantusdb`; only the emitted binary is `secantusd-mdb`.
 [lib]
 name = "secantus_mdb"
 path = "src/lib.rs"
 
 [[bin]]
-name = "secantusd-rs"
+name = "secantusd-mdb"
 path = "src/main.rs"
 # The binary's own dependencies (signal handling, logging, the allocator) are
 # not the library's: a test that uses `secantus_mdb::Server` as a
@@ -47,10 +47,10 @@ required-features = ["bin"]
 [dependencies]
 bson = "2"
 ctrlc = { version = "3", features = ["termination"], optional = true }
-secantus-storage = { version = "=0.5.3-beta.196", path = "../secantus-storage" }
-secantus-storage-adapter = { version = "=0.5.3-beta.196", path = "../secantus-storage-adapter" }
-secantus-commands = { version = "=0.5.3-beta.196", path = "../secantus-commands" }
-secantus-server = { version = "=0.5.3-beta.196", path = "../secantus-server" }
+secantus-storage = { version = "=0.5.3-beta.198", path = "../secantus-storage" }
+secantus-storage-adapter = { version = "=0.5.3-beta.198", path = "../secantus-storage-adapter" }
+secantus-commands = { version = "=0.5.3-beta.198", path = "../secantus-commands" }
+secantus-server = { version = "=0.5.3-beta.198", path = "../secantus-server" }
 # --log-level: init a logger to the resolved level before storage opens.
 log = { version = "0.4", optional = true }
 env_logger = { version = "0.11", optional = true }
@@ -69,7 +69,7 @@ libc = { version = "0.2", optional = true }
 # drop it (`--no-default-features`) — instrumenting mimalloc's internals crashed
 # the arm64-macOS build; the habit is kept for Linux too, harmlessly.
 default = ["bin", "mimalloc"]
-# Builds the `secantusd-rs` binary. Off, the crate is the library alone.
+# Builds the `secantusd-mdb` binary. Off, the crate is the library alone.
 bin = ["dep:ctrlc", "dep:log", "dep:env_logger", "dep:libc"]
 # Enabled only for the PGO instrumented stage-1 build: writes the profile to
 # SECANTUS_PGO_OUT on shutdown via __llvm_profile_set_filename/write_file, because
@@ -83,7 +83,7 @@ pgo-instrument = []
 # user's tests would.
 mongodb = { version = "3", features = ["sync", "snappy-compression", "zlib-compression"] }
 # Raw OP_COMPRESSED frames for the wire-compression tests.
-secantus-wire = { version = "=0.5.3-beta.196", path = "../secantus-wire" }
+secantus-wire = { version = "=0.5.3-beta.198", path = "../secantus-wire" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 futures-util = "0.3"
 

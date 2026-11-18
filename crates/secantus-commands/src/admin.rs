@@ -198,7 +198,71 @@ fn validation_enum_problem(doc: &Document, command: &str) -> Option<CommandError
 }
 
 /// `create` — create a collection, persisting recognised options.
+/// What mongod's IDL parse of `create` refuses, run ahead of the command
+/// (`parse_before_locks`): its fields in document order, each unknown one
+/// 40415 and each known one checked for its type (measured 8.2.11:
+/// `{bogus: 1, storageEngine: 1}` is 40415, `{expireAfterSeconds: "x",
+/// bogus: 1}` is 14), then the options refused on sight and the range of
+/// `size` and `max`. All of it comes before the capped 72s and the
+/// namespace checks, which run with the command (RM-602).
+pub(crate) fn create_parse(doc: &Document) -> Result<(), CommandError> {
+    for key in doc.keys() {
+        if key.starts_with('$') {
+            continue;
+        }
+        if !CREATE_KNOWN_OPTIONS.contains(&key.as_str()) {
+            return Err(CommandError::new(
+                40415,
+                "IDLUnknownField",
+                format!("BSON field 'create.{key}' is an unknown field."),
+            ));
+        }
+        match key.as_str() {
+            "storageEngine" | "validator" | "timeseries" | "collation" => {
+                argtypes::require_object(doc, key, &format!("create.{key}"))?
+            }
+            "capped" => argtypes::require_bool_or_number(doc, "capped", "create.capped")?,
+            "size" | "max" => argtypes::require_number(doc, key, &format!("create.{key}"))?,
+            "viewOn" | "validationLevel" | "validationAction" => {
+                crate::ddl_checks::string(doc, "create", key)?
+            }
+            "expireAfterSeconds" => {
+                argtypes::require_number(doc, "expireAfterSeconds", "create.expireAfterSeconds")?
+            }
+            "pipeline" => match doc.get("pipeline") {
+                None | Some(Bson::Null | Bson::Array(_)) => {}
+                Some(v) => {
+                    return Err(CommandError::new(
+                        14,
+                        "TypeMismatch",
+                        format!(
+                            "BSON field 'create.pipeline' is the wrong type '{}', expected \
+                             type 'array'",
+                            secantus_core::query::bson_type_name(v)
+                        ),
+                    ))
+                }
+            },
+            _ => {}
+        }
+    }
+    crate::ddl_checks::create(doc)?;
+    for (field, check) in [
+        (
+            "size",
+            capped_size as fn(&str, &Bson) -> Result<i64, CommandError>,
+        ),
+        ("max", capped_max),
+    ] {
+        if let Some(v) = doc.get(field).filter(|v| !matches!(v, Bson::Null)) {
+            check(field, v)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    create_parse(doc)?;
     // Before the namespace checks: mongod parses the command before executing it,
     // so a wrong-typed option on a MISSING collection is still the type error.
     argtypes::require_object(doc, "storageEngine", "create.storageEngine")?;
@@ -515,6 +579,9 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // separately, and is never a requested option.
         existing.remove("uuid");
         if existing == opts {
+            // mongod answers this before it acquires the collection: its
+            // line names `<db>.$cmd` (measured 8.2.11, RM-595).
+            ctx.unacquired = true;
             return Ok(doc! { "ok": 1.0 });
         }
         // A time-series collection on either side has its own wording.
@@ -4142,14 +4209,21 @@ pub fn drop_indexes_parse(doc: &Document) -> Result<Option<Vec<String>>, Command
 
 pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let names = drop_indexes_parse(doc)?;
-    let coll = coll_arg(doc, "dropIndexes")?;
+    let coll = coll_arg(doc, doc.keys().next().map_or("dropIndexes", |k| k.as_str()))?;
     let storage = ctx.storage()?;
     let exists = storage
         .list_collections(&ctx.db_name)
         .map_err(command_error)?
         .iter()
         .any(|c| c == &coll);
-    if !exists {
+    // `system.views` is what mongod keeps its view definitions in, a
+    // collection with an `_id` index and no other. Here they are in the
+    // catalog, so it exists while a view does and has only that index to
+    // list (RM-588, measured 8.2.11).
+    let view_definitions = !exists
+        && coll == "system.views"
+        && !crate::ts_buckets::view_definitions(storage, &ctx.db_name)?.is_empty();
+    if !exists && !view_definitions {
         return Ok(CommandError::new(
             26,
             "NamespaceNotFound",
@@ -4157,9 +4231,13 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         )
         .into_reply());
     }
-    let listed = storage
-        .list_indexes(&ctx.db_name, &coll)
-        .map_err(command_error)?;
+    let listed = if view_definitions {
+        vec![doc! { "v": 2i32, "key": { "_id": 1i32 }, "name": "_id_" }]
+    } else {
+        storage
+            .list_indexes(&ctx.db_name, &coll)
+            .map_err(command_error)?
+    };
     let is_time_series = storage
         .get_collection_options(&ctx.db_name, &coll)
         .is_ok_and(|o| o.contains_key("timeseries"));
@@ -4216,9 +4294,11 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
         }
         (None, Some(Bson::String(s))) if s == "*" => {
-            storage
-                .drop_all_indexes(&ctx.db_name, &coll)
-                .map_err(command_error)?;
+            if !view_definitions {
+                storage
+                    .drop_all_indexes(&ctx.db_name, &coll)
+                    .map_err(command_error)?;
+            }
             reply.insert("msg", "non-_id indexes dropped for collection");
         }
         (None, Some(Bson::String(name))) => {
@@ -4228,9 +4308,10 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             if name == "_id_" {
                 return Ok(id_index());
             }
-            let existed = storage
-                .drop_index(&ctx.db_name, &coll, name)
-                .map_err(command_error)?;
+            let existed = !view_definitions
+                && storage
+                    .drop_index(&ctx.db_name, &coll, name)
+                    .map_err(command_error)?;
             if !existed && !was_building(name) {
                 return Ok(not_found(name));
             }
@@ -5503,13 +5584,10 @@ fn split_ns(ns: &str) -> (String, String) {
 /// mongo-c-driver's `/index-management/{update,drop}SearchIndex` caught. The
 /// message is shared with the `$listSearchIndexes` stage so the two stay in
 /// lockstep. Mirrors `commands._search_index_not_supported`.
+/// mongod 8.2.11 refuses each, `listSearchIndexes` too, with 31082
+/// (SearchNotEnabled) when it has no `mongot` (RM-605).
 pub fn search_index_not_supported(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
-    Ok(CommandError::new(
-        115,
-        "CommandNotSupported",
-        crate::aggregate::SEARCH_INDEX_ATLAS_MSG,
-    )
-    .into_reply())
+    Ok(crate::aggregate::search_not_enabled(crate::aggregate::SEARCH_INDEX_ATLAS_MSG).into_reply())
 }
 
 #[cfg(test)]
@@ -5540,6 +5618,7 @@ mod parity_tests {
             "createSearchIndexes",
             "updateSearchIndex",
             "dropSearchIndex",
+            "listSearchIndexes",
         ] {
             assert!(
                 crate::lookup_for_test(name).is_some(),
@@ -5548,7 +5627,7 @@ mod parity_tests {
         }
         let reply = search_index_not_supported(&doc! {"dropSearchIndex": "c"}, &mut ctx()).unwrap();
         let (code, name, msg) = err_of(&reply);
-        assert_eq!((code, name.as_str()), (115, "CommandNotSupported"));
+        assert_eq!((code, name.as_str()), (31082, "SearchNotEnabled"));
         assert!(
             msg.contains("Atlas"),
             "the driver specs assert on 'Atlas': {msg}"
@@ -5560,10 +5639,10 @@ mod parity_tests {
     /// accepting the unknown field made them fail.
     #[test]
     fn create_rejects_an_unknown_top_level_option() {
-        let reply = create(&doc! {"create": "c", "invalid": true}, &mut ctx()).unwrap();
-        let (code, name, msg) = err_of(&reply);
-        assert_eq!((code, name.as_str()), (40415, "IDLUnknownField"));
-        assert!(msg.contains("create.invalid"), "{msg}");
+        // Refused as the command parses (RM-602), so an error, not a reply.
+        let e = create(&doc! {"create": "c", "invalid": true}, &mut ctx()).unwrap_err();
+        assert_eq!((e.code, e.code_name.as_str()), (40415, "IDLUnknownField"));
+        assert!(e.errmsg.contains("create.invalid"), "{}", e.errmsg);
     }
 
     #[test]
@@ -5907,5 +5986,34 @@ mod validator_problem_tests {
             p(doc! {"$jsonSchema": {"required": ["a"]}, "b": {"$gt": 1}}),
             None
         );
+    }
+}
+
+/// `create_parse` checks the fields in document order, as mongod's IDL
+/// parse does (measured 8.2.11, RM-602).
+#[cfg(test)]
+mod create_parse_tests {
+    use super::create_parse;
+    use bson::doc;
+
+    fn code(d: bson::Document) -> i32 {
+        create_parse(&d).unwrap_err().code
+    }
+
+    #[test]
+    fn fields_are_checked_in_document_order() {
+        assert_eq!(
+            code(doc! {"create": "d", "bogus": 1, "storageEngine": 1}),
+            40415
+        );
+        assert_eq!(
+            code(doc! {"create": "d", "expireAfterSeconds": "x", "bogus": 1}),
+            14
+        );
+        assert_eq!(code(doc! {"create": "d", "viewOn": 1, "capped": true}), 14);
+        assert_eq!(code(doc! {"create": "d", "capped": true, "size": 0}), 2);
+        assert_eq!(code(doc! {"create": "d", "autoIndexId": true}), 40415);
+        // The capped 72s are the run's, not the parse's.
+        assert!(create_parse(&doc! {"create": "d", "capped": true}).is_ok());
     }
 }

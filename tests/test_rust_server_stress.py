@@ -22,7 +22,7 @@ import pytest
 
 _server = pytest.importorskip("_secantus_server")
 # The Python server writes without timestamps, which a store whose data
-# tables are not logged (secantusd-rs's default since RM-210) refuses once a
+# tables are not logged (secantusd-mdb's default since RM-210) refuses once a
 # key has one: the hand-off is tested on a store created with them logged.
 pymongo = pytest.importorskip("pymongo")
 

@@ -27,7 +27,7 @@ from tests.backlog.conftest import _RS_BANNER, RS_BINARY, drain_output
 
 @contextlib.contextmanager
 def _rust_on(store: str, *flags: str, crash: bool = False) -> Iterator[tuple[str, int]]:
-    """A `secantusd-rs` on `store`, which outlives it; `crash` stops it with
+    """A `secantusd-mdb` on `store`, which outlives it; `crash` stops it with
     SIGKILL rather than a clean shutdown."""
     assert RS_BINARY.exists(), f"{RS_BINARY} is not built"
     proc = subprocess.Popen(
@@ -44,7 +44,7 @@ def _rust_on(store: str, *flags: str, crash: bool = False) -> Iterator[tuple[str
             m = _RS_BANNER.search(line)
             if m or not line:
                 break
-        assert m, f"secantusd-rs did not start: {line!r}"
+        assert m, f"secantusd-mdb did not start: {line!r}"
         drain_output(proc)
         yield m.group(1), int(m.group(2))
     finally:

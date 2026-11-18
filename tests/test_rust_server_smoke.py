@@ -897,9 +897,10 @@ def test_view_reads_resolve_against_rust_server(tmp_path) -> None:
 
 
 def test_aggregate_stage_name_validation_against_rust_server(tmp_path) -> None:
-    """The Rust server validates aggregation stage names up-front (matching the
-    Python server / mongod): an unrecognized stage → Location40324, an Atlas-only
-    stage → CommandNotSupported (115). Recognized stages run normally."""
+    """The Rust server validates aggregation stage names up-front (as mongod
+    8.2.11 does): an unrecognized stage → Location40324, an Atlas-only stage
+    → SearchNotEnabled (31082) as it runs, after a later bad stage's 40324.
+    Recognized stages run normally."""
     import pymongo.errors
 
     srv = _server.RustServer(str(tmp_path / "wt"), 0)
@@ -910,9 +911,10 @@ def test_aggregate_stage_name_validation_against_rust_server(tmp_path) -> None:
         for pipeline, code in [
             ([{"$badStage": {}}], 40324),
             ([{"$match": {"a": 1}}, {"$nope": 1}], 40324),
-            ([{"$search": {}}], 115),
-            ([{"$vectorSearch": {}}], 115),
-            ([{"$listSearchIndexes": {}}], 115),
+            ([{"$search": {}}], 31082),
+            ([{"$vectorSearch": {}}], 31082),
+            ([{"$listSearchIndexes": {}}], 31082),
+            ([{"$search": {}}, {"$nope": 1}], 40324),
         ]:
             with pytest.raises(pymongo.errors.OperationFailure) as exc:
                 list(db.c.aggregate(pipeline))
@@ -2711,7 +2713,7 @@ def test_replset_step_down_against_rust_server(tmp_path) -> None:
     """The whole observable of a single-node replica set's step-down.
 
     The embedded handle defaults to a STANDALONE (`replica_set_name=None`),
-    unlike the `secantusd-rs` binary which advertises `secantus`. A standalone
+    unlike the `secantusd-mdb` binary which advertises `secantus`. A standalone
     correctly answers 76 `NoReplicationEnabled` here, so every step-down test
     has to ask for the replica-set persona explicitly.
 

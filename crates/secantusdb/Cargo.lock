@@ -1492,9 +1492,9 @@ dependencies = [
 
 [[package]]
 name = "libz-sys"
-version = "1.1.31"
+version = "1.1.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff20308ecabd635a2dc1dd5834a86c462cca20efba1d5d3ddab1f8aea3455cb2"
+checksum = "fee3f59f4321dab0c78d828942e7aa09d0bd8ad6e78a501977e6bf3d02938045"
 dependencies = [
  "cc",
  "libc",
@@ -2236,7 +2236,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "secantus-auth"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 dependencies = [
  "base64",
  "hmac 0.12.1",
@@ -2251,7 +2251,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-commands"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 dependencies = [
  "base64",
  "bson",
@@ -2269,7 +2269,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 dependencies = [
  "bson",
  "chrono",
@@ -2285,14 +2285,14 @@ dependencies = [
 
 [[package]]
 name = "secantus-icu"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "secantus-mdb"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 dependencies = [
  "bson",
  "ctrlc",
@@ -2312,7 +2312,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-server"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 dependencies = [
  "bson",
  "log",
@@ -2327,7 +2327,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-storage"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 dependencies = [
  "bson",
  "flate2",
@@ -2341,7 +2341,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-storage-adapter"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 dependencies = [
  "bson",
  "secantus-commands",
@@ -2350,7 +2350,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wire"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 dependencies = [
  "bson",
  "flate2",
@@ -2360,7 +2360,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wiredtiger-sys"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 dependencies = [
  "cc",
  "cmake",
@@ -2369,7 +2369,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wt"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 dependencies = [
  "secantus-wiredtiger-sys",
 ]

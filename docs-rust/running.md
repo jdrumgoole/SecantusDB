@@ -1,10 +1,10 @@
 # Running the daemon
 
 ```bash
-secantusd-rs --host 127.0.0.1 --port 27017 --storage-path ./secantus-data
+secantusd-mdb --host 127.0.0.1 --port 27017 --storage-path ./secantus-data
 ```
 
-The daemon prints `secantusd-rs listening on <host>:<port>` once the accept
+The daemon prints `secantusd-mdb listening on <host>:<port>` once the accept
 loop is up (launchers can parse that line), runs until SIGINT/SIGTERM, and
 shuts WiredTiger down cleanly on exit. `--port 0` binds an OS-assigned
 port. Bad arguments exit 2; `--help` / `--version` exit 0.
@@ -68,7 +68,7 @@ in the storage engine the time went, which `mongod`'s line does.
 
 ## Configuration file
 
-Both MongoDB-wire daemons (`secantusd-py` and `secantusd-rs`) read the same
+The daemon (`secantusd-mdb`) reads a
 `secantusd.toml`, discovered in order:
 
 1. `./secantusd.toml` (per-checkout / per-cwd)
@@ -76,10 +76,7 @@ Both MongoDB-wire daemons (`secantusd-py` and `secantusd-rs`) read the same
 3. `/etc/secantus/secantusd.toml` (system-wide)
 
 or passed explicitly with `--config`. Every key is optional; explicit CLI
-flags override the file. The sections mirror the flags (a handful of keys
-are Rust-daemon-only — the commented `[storage]` modes below — and the
-Python daemon rejects them, so keep them out of a `secantusd.toml` shared
-with `secantusd-py`):
+flags override the file. The sections mirror the flags:
 
 ```toml
 [server]
@@ -100,7 +97,7 @@ noop_heartbeat_seconds = 0.0
 cache_size = "1G"
 session_max = 1000
 sync_on_commit = false
-# Rust-daemon-only storage modes (secantusd-py rejects these keys):
+# Storage modes:
 # oplog_async = true
 # oplog_nonlogged = true
 # data_nonlogged = true

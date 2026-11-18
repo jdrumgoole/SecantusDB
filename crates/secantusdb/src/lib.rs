@@ -18,7 +18,7 @@
 //! parallel. [`Server::builder`] sets a persistent store, a port, auth, TLS,
 //! the WiredTiger cache and the background sweepers.
 //!
-//! Like the `secantusd-rs` daemon, a server expires TTL-indexed documents
+//! Like the `secantusd-mdb` daemon, a server expires TTL-indexed documents
 //! every 60 seconds ([`Builder::ttl_sweep`]). The noop oplog heartbeat, which
 //! also prunes the oplog, is off by default, as on the daemon
 //! ([`Builder::noop_heartbeat`]).
@@ -26,7 +26,7 @@
 //! Like the embedded Python handle, `start()` advertises a single-node replica
 //! set named `secantus` (so drivers accept change streams and transactions)
 //! and enables test commands (`configureFailPoint`), because a server started
-//! in-process is a test's server. The `secantusd-rs` binary keeps `mongod`'s
+//! in-process is a test's server. The `secantusd-mdb` binary keeps `mongod`'s
 //! defaults instead.
 //!
 //! Building this crate compiles WiredTiger from bundled source, which needs
@@ -43,7 +43,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use secantus_commands::{CursorRegistry, Storage as CmdStorage};
 pub use secantus_server::TlsOptions;
 use secantus_server::{bind, RunningServer, ServerConfig};
-use secantus_storage::{wt_config, Storage, StorageOptions};
+use secantus_storage::{mongod_message_config, wt_config, Storage, StorageOptions};
 use secantus_storage_adapter::StorageAdapter;
 
 /// The replica-set name [`Server::start`] advertises, as the Python server does.
@@ -348,8 +348,12 @@ impl Builder {
             &StorageOptions {
                 // The embedded handle's 128MB log: many short-lived stores must
                 // not each carry a large sparse log file.
-                wt_config: Some(wt_config(&self.cache_size, 1000, false, "128MB")),
-                // mongod's split, as `secantusd-rs` creates stores (RM-210).
+                wt_config: Some(format!(
+                    "{},{}",
+                    wt_config(&self.cache_size, 1000, false, "128MB"),
+                    mongod_message_config()
+                )),
+                // mongod's split, as `secantusd-mdb` creates stores (RM-210).
                 data_nonlogged: Some(true),
                 transactions_logged_at_commit: true,
                 // mongod's lock file: a clean shutdown empties it, and the next

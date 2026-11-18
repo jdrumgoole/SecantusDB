@@ -101,7 +101,7 @@ Aggregations are also faster. Over 10,000 five-field documents on a Mac, a
 multi-stage pipeline went from 13.1 ms to 10.1 ms (`mongod`: 4.6 ms), and
 `$match` then `$count` from 6.2 ms to 3.0 ms (`mongod`: 1.4 ms).
 
-These are servers for tests. They are single-node, and they are betas.
+These are real single-node databases, and they are betas.
 
 `cargo install secantus-pg --version 0.1.0-beta.7` and
 `cargo install secantus-mdb --version 0.5.3-beta.175` build them from

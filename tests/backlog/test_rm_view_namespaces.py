@@ -407,25 +407,18 @@ def test_a_query_settings_refusal_counts_rejected_not_failed(
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-589")
+@pytest.mark.backlog_fixed("RM-589")
 def test_a_refused_write_of_a_view_takes_mongods_locks(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 refuses a write of a view once it holds the namespace
     for the write: a retryable `update` after checking its session out (one
-    more transition lock), an `insert` after its write rounds, and a
-    statement of a transaction under the transaction's locks. This server
-    refuses each before those, and its lines count fewer locks: the
-    retryable statement and command one transition lock short, the insert
-    no write round, the transaction's statement none at all."""
+    more transition lock), an `insert` after its two write rounds. This
+    server refused each before those, and its lines counted the retryable
+    statement and command one transition lock short and the insert no
+    write round."""
 
     def op(db: Any) -> None:
         _refused(lambda d: d.v.update_one({}, {"$set": {"a": 1}}))(db)
         _refused(lambda d: d.v.insert_one({"a": 1}))(db)
-
-        def txn(d: Any) -> None:
-            with d.client.start_session() as s, s.start_transaction():
-                d.v.update_one({}, {"$set": {"a": 1}}, session=s)
-
-        _refused(txn)(db)
 
     got = {
         server: [(_first(a), _ns(a), a.get("locks"), a.get("flowControl")) for _, a in lines]
@@ -434,6 +427,37 @@ def test_a_refused_write_of_a_view_takes_mongods_locks(rust_mongo: Any, mongod_r
     statement = got["mongod"][0]
     assert statement[:2] == ("q", "v")
     assert statement[2]["ReplicationStateTransition"] == {"acquireCount": {"w": 2}}
+    assert got["rust"] == got["mongod"]
+
+
+@pytest.mark.backlog("RM-715")
+def test_a_transaction_statement_counts_the_transactions_locks(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's line for a statement of a transaction counts the
+    transaction's locks (`MultiDocumentTransactionsBarrier`, three
+    `ReplicationStateTransition` w, a flow control ticket), and the
+    command's line has `locks: {}`; this server's statement line has the
+    statement's Global / Database / Collection only, no `flowControl`, and
+    its command line counts them again. Of a collection and of a view
+    alike."""
+
+    def op(db: Any) -> None:
+        for coll in ("c", "v"):
+
+            def txn(d: Any, coll: str = coll) -> None:
+                with d.client.start_session() as s, s.start_transaction():
+                    d[coll].update_one({}, {"$set": {"a": 1}}, session=s)
+
+            _refused(txn)(db)
+
+    got = {
+        server: [(_first(a), _ns(a), a.get("locks"), a.get("flowControl")) for _, a in lines]
+        for server, (lines, _) in _both(rust_mongo, mongod_rs, op).items()
+    }
+    statement = got["mongod"][0]
+    assert statement[:2] == ("q", "c")
+    assert "MultiDocumentTransactionsBarrier" in statement[2]
     assert got["rust"] == got["mongod"]
 
 
@@ -452,10 +476,10 @@ def _coll_stats_of_view(client: Any) -> list:
     return got
 
 
-@pytest.mark.backlog("RM-590")
+@pytest.mark.backlog_fixed("RM-590")
 def test_a_coll_stats_stage_of_a_view_answers(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 answers a `$collStats: {}` or `{latencyStats: {}}` of a
-    view, and refuses `count` and `storageStats` (166); this server refuses
+    view, and refuses `count` and `storageStats` (166); this server refused
     every `$collStats` of a view."""
     got = {s: _coll_stats_of_view(c) for s, c in (("rust", rust_mongo), ("mongod", mongod_rs))}
     assert got["mongod"] == [
@@ -467,11 +491,11 @@ def test_a_coll_stats_stage_of_a_view_answers(rust_mongo: Any, mongod_rs: Any) -
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-591")
+@pytest.mark.backlog_fixed("RM-591")
 def test_an_out_into_a_view_names_the_view(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line and profile entry for an `$out` into a view, which
-    it refuses, name the view; this server's line names the collection the
-    pipeline reads, and it writes no entry."""
+    it refuses, name the view; this server's line named the collection the
+    pipeline reads, and it wrote no entry."""
     got = {}
     for server, (lines, entries) in _both(
         rust_mongo, mongod_rs, _refused(lambda d: list(d.c.aggregate([{"$out": "v"}])))
@@ -483,10 +507,10 @@ def test_an_out_into_a_view_names_the_view(rust_mongo: Any, mongod_rs: Any) -> N
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-592")
+@pytest.mark.backlog_fixed("RM-592")
 def test_a_merge_into_a_view_is_profiled(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 profiles a `$merge` into a view, which it refuses, under
-    the collection the pipeline reads; this server writes no entry."""
+    the collection the pipeline reads; this server wrote no entry."""
     got = _entries(
         rust_mongo,
         mongod_rs,
@@ -496,10 +520,10 @@ def test_a_merge_into_a_view_is_profiled(rust_mongo: Any, mongod_rs: Any) -> Non
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-593")
+@pytest.mark.backlog_fixed("RM-593")
 def test_a_change_stream_of_a_view_writes_no_line(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 refuses a `$changeStream` of a view (166) and writes no
-    `Slow query` line for it; this server writes one."""
+    `Slow query` line for it; this server wrote one."""
     got = _lines(
         rust_mongo,
         mongod_rs,

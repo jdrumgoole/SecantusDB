@@ -4,7 +4,7 @@
 
 Each of these was a storage error turned into silence. With `--oplog-async`,
 an entry the oplog fails to keep is now logged and recorded, and
-`Storage::close()` returns it, so `secantusd-rs` exits non-zero:
+`Storage::close()` returns it, so `secantusd-mdb` exits non-zero:
 - a batch whose final retry at shutdown fails;
 - a drainer that cannot open a session;
 - an entry that cannot be encoded, which is still stored empty so the

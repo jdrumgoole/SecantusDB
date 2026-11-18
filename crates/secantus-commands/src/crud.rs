@@ -1242,6 +1242,9 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut statements = crate::profiler::Statements::start(Some(storage), doc);
     for (index, spec) in deletes.iter().copied().enumerate() {
         statements.close(n, 0, 0, &write_errors);
+        if index > 0 {
+            crate::lock_manager::next_statement()?;
+        }
         crate::lastop::starting_op(storage, index);
         let Bson::Document(spec) = spec else { continue };
         let mut refused: Option<(i32, String)> = let_problem.clone();
@@ -2274,6 +2277,9 @@ pub(crate) fn update_in(
     let mut statements = crate::profiler::Statements::start(Some(storage), doc);
     for (index, spec) in updates.iter().enumerate() {
         statements.close(n, n_modified, upserted.len(), &write_errors);
+        if index > 0 {
+            crate::lock_manager::next_statement()?;
+        }
         crate::lastop::starting_op(storage, index);
         let Bson::Document(spec) = spec else { continue };
 
@@ -2530,9 +2536,18 @@ pub(crate) fn update_in(
         // apply-time engine would never run. Pipeline-form `u` is validated below.
         if !matches!(spec.get("u"), Some(Bson::Array(_))) {
             if let Some((code, errmsg)) = update_spec_error(&doc_field(spec, "u")) {
-                write_errors.push(Bson::Document(doc! {
+                let error = doc! {
                     "index": index as i32, "code": code, "errmsg": errmsg,
-                }));
+                };
+                // mongod parses the update once it holds the collection, and
+                // writes the refused statement's `Slow query` line (no plan,
+                // no counts, `ok: 0`) before the command's (measured 8.2.11,
+                // RM-608). Its acquisition is already counted on this
+                // command's locks.
+                crate::profiler::refused_statement(
+                    db_name, &coll, "update", spec, &error, doc, false,
+                );
+                write_errors.push(Bson::Document(error));
                 if ordered {
                     break;
                 }

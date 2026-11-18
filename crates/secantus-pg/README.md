@@ -1,9 +1,9 @@
 # secantus-pg
 
-A **surrogate PostgreSQL server** for tests: it speaks the real PostgreSQL wire
+A **single-node PostgreSQL server**: it speaks the real PostgreSQL wire
 protocol on a real TCP socket, parses SQL with PostgreSQL's own grammar
-(libpg_query), and stores rows in WiredTiger, scoped to a single node. Point an
-application's test suite at it instead of standing up a real `postgres`.
+(libpg_query), and stores rows in WiredTiger. Any PostgreSQL driver connects
+to it as it would to `postgres`.
 
 Building it compiles WiredTiger and libpg_query from source, which needs
 **CMake, a C compiler and libclang**. The first build takes a few minutes as a
@@ -11,9 +11,10 @@ test dependency. `cargo install` builds with link-time optimisation and takes
 about ten. If you only want the binary, `cargo binstall secantus-pg` fetches a
 prebuilt one (Linux x86_64, macOS arm64) with no toolchain. The prebuilt one
 is also the fastest: it is built with a profile that `cargo install` cannot
-have.
+have. `pip install SecantusDB` also installs a prebuilt `secantusd-pg` (and
+`secantusd-mdb`) on your `PATH`, with no Rust toolchain.
 
-## In a test
+## Embedded in a Rust program
 
 ```toml
 [dev-dependencies]
@@ -44,7 +45,7 @@ the libpq key/value form, `.url()` the `postgresql://` form.
 ## The binary
 
 ```sh
-cargo install secantus-pg --version 0.1.0-beta.17   # a pre-release: cargo needs the version
+cargo install secantus-pg --version 0.1.0-beta.20   # a pre-release: cargo needs the version
 secantusd-pg ./pg-data 127.0.0.1:5433   # storage path, bind address
 ```
 
@@ -74,7 +75,7 @@ client certificate a revocation list names; `--tls-client-name DN`
 `CN=alice,O=Example`, in place of its common name; and `--tls-ident-file
 pg_ident.conf --tls-user-map NAME` (`map=NAME`) lets a certificate log in
 as the roles a user name map gives it. The files are read again on SIGHUP
-and on `select pg_reload_conf()`. In a Rust test these are
+and on `select pg_reload_conf()`. From Rust these are
 `TlsConfig::crl_file`, `client_name` and `user_map`, and
 `PgServer::reload`. Not supported: a key with a passphrase.
 

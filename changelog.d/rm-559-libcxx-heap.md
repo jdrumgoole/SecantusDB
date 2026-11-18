@@ -1,6 +1,6 @@
 ### Rust MongoDB server: on macOS, equal heap entries leave in libc++'s order
 
-A macOS arm64 build of `secantusd-rs` now pops its priority queues (mongod's
+A macOS arm64 build of `secantusd-mdb` now pops its priority queues (mongod's
 `std::priority_queue`s) as
 libc++'s `std::pop_heap` does, as it already sorts as libc++'s
 `std::sort` (RM-526): each platform's mongod is the reference, and the

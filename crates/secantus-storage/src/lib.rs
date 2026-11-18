@@ -232,6 +232,11 @@ pub struct OpenRecord {
     pub wt_config: String,
     /// How long `wiredtiger_open` took.
     pub wt_open: Duration,
+    /// The messages WiredTiger wrote while it opened, in order, as it
+    /// formatted them (JSON under `json_output=(message)`): mongod logs each
+    /// as `WiredTiger message` (22430) between `Opening WiredTiger` and
+    /// `WiredTiger opened`.
+    pub wt_messages: Vec<String>,
     /// How long the whole open took after the lock file: WiredTiger, the
     /// tables, the recovery and the upgrades (mongod's
     /// `createStorageEngineMillis`).
@@ -753,6 +758,26 @@ enum CandidatePages {
     },
     /// Rows a hinted index read returned, read whole.
     Read(std::vec::IntoIter<ScannedDoc>),
+    /// An index read between bounds, a page of entries at a time, each
+    /// page's RecordIds fetched before the next is read: the router's
+    /// single-field bounded read ([`Storage::bounded_id_keys`]), streamed
+    /// into the write rather than read whole first (RM-390).
+    Spans(SpanPages),
+}
+
+/// Where a paged read of index `name` over `spans` has got to.
+struct SpanPages {
+    name: String,
+    spans: Vec<scan_bounds::Span>,
+    dir: i32,
+    /// The span being read.
+    at: usize,
+    /// The last entry read (its packed key), the next page reads after it.
+    last: Option<Vec<u8>>,
+    /// The RecordIds handed out: a document an index entry names twice (a
+    /// multikey index), or that a write moved further on, is taken once,
+    /// as mongod's write stages take each RecordId once.
+    seen: HashSet<i64>,
 }
 
 /// One page of [`CandidatePages`]: each row's RecordId and document.
@@ -2623,6 +2648,17 @@ const DEFAULT_CONFIG: &str = "create,session_max=1000,cache_size=4G,\
 /// `--sync-on-commit`). Mirrors `storage.py`'s config assembly and matches
 /// [`DEFAULT_CONFIG`] byte-for-byte for the engine defaults (`"4G"`, `1000`,
 /// `false`) — see the `wt_config_matches_default` test.
+/// The message configuration mongod 8.2.11 opens WiredTiger with (measured
+/// 2026-11-16 from its `Opening WiredTiger` line): JSON messages, and the
+/// recovery, checkpoint and compaction progress at verbosity 1 with each
+/// other category at 0 (`INFO`). Appended by the MongoDB server, whose log
+/// carries each message as mongod's does (`WiredTiger message`, 22430).
+/// The vendored WiredTiger 7.0 has no `live_restore` categories and names
+/// eviction `evict`; those differ from mongod's string.
+pub fn mongod_message_config() -> &'static str {
+    "json_output=(error,message),verbose=[recovery_progress:1,checkpoint_progress:1,compact_progress:1,backup:0,checkpoint:0,compact:0,evict:0,fileops:0,history_store:0,recovery:0,rts:0,salvage:0,tiered:0,timestamp:0,transaction:0,verify:0,log:0]"
+}
+
 pub fn wt_config(
     cache_size: &str,
     session_max: u32,
@@ -5501,7 +5537,7 @@ pub struct Storage {
     /// clean shutdown leaves the log un-truncated and reopen replays the full
     /// retained log; the checkpoint bounds recovery time and truncates the log.
     /// Resolved from the environment on open (see `resolve_durable`): production
-    /// (the `secantusd-rs` daemon) is durable; the Python test suite sets
+    /// (the `secantusd-mdb` daemon) is durable; the Python test suite sets
     /// `SECANTUS_TEST_FAST_STORAGE=1`, which turns it off so parallel workers
     /// don't serialise on the close fsync (the `SECANTUS_FORCE_DURABLE=1` CI lane
     /// forces it back on). `durable=false` is safe only for ephemeral instances
@@ -8311,7 +8347,7 @@ impl Storage {
     /// `None` falls back to the corresponding env var (or the default), so
     /// existing callers and the env-driven workflows keep working; an
     /// explicit `Some` wins over the environment. This is what the Python
-    /// `RustServer(...)` kwargs and the `secantusd-rs` flags thread through.
+    /// `RustServer(...)` kwargs and the `secantusd-mdb` flags thread through.
     pub fn open_with_options(home: &str, opts: &StorageOptions) -> Result<Storage> {
         let started = Instant::now();
         let (lock_file, lock_record) = match &opts.lock_file {
@@ -8342,6 +8378,7 @@ impl Storage {
         let wt_started = Instant::now();
         let conn = Arc::new(Connection::open(home, config)?);
         let wt_open = wt_started.elapsed();
+        let wt_messages = conn.take_messages();
         // An existing store's mode is the one its tables were created with,
         // read from WiredTiger's own metadata before anything is created: a
         // logged store records no mode of its own, and neither does a
@@ -8545,6 +8582,7 @@ impl Storage {
                 new_store,
                 wt_config: config.to_string(),
                 wt_open,
+                wt_messages,
                 open: Duration::ZERO,
             },
             lock_file,
@@ -21106,6 +21144,9 @@ impl Storage {
         if filter.is_empty() || force_scan {
             return Ok(CandidatePages::scan(false));
         }
+        if let Some(pages) = self.bounded_span_pages(session, db, coll, filter)? {
+            return Ok(CandidatePages::Spans(pages));
+        }
         let routed = match self.try_index_id_keys(session, db, coll, filter)? {
             Some(r) => Some(r),
             None => self.try_residual_index_id_keys(session, db, coll, filter)?,
@@ -21134,7 +21175,180 @@ impl Storage {
                 Ok(docs)
             }
             CandidatePages::Read(rows) => Ok(rows.collect()),
+            CandidatePages::Spans(mut pages) => {
+                let mut rids = Vec::new();
+                loop {
+                    let page = self.next_span_page(db, coll, &mut pages, WRITE_CHUNK_MAX_DOCS)?;
+                    if page.is_empty() && pages.at >= pages.spans.len() {
+                        break;
+                    }
+                    rids.extend(page);
+                }
+                self.rows_by_recordids(session, db, coll, rids)
+            }
         }
+    }
+
+    /// The router's read for a filter of one field whose predicate
+    /// [`Self::bounded_id_keys`] reads between bounds, not yet read: the
+    /// same index and spans, to be read a page at a time. `None` for any
+    /// other shape, which [`Self::try_index_id_keys`] routes whole.
+    fn bounded_span_pages(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<SpanPages>> {
+        if filter.len() != 1 {
+            return Ok(None);
+        }
+        let (field, value) = filter.iter().next().unwrap();
+        if field.starts_with('$') || field == "_id" {
+            return Ok(None);
+        }
+        // The shapes `lookup_id_keys_via_leading_field` reads otherwise
+        // (`$in`, `$eq`), and those `try_index_id_keys` routes before it
+        // (geo, `$elemMatch`), keep their own reads.
+        let Bson::Document(opdoc) = value else {
+            return Ok(None);
+        };
+        const ROUTED_ELSEWHERE: [&str; 7] = [
+            "$in",
+            "$eq",
+            "$elemMatch",
+            "$geoWithin",
+            "$geoIntersects",
+            "$near",
+            "$nearSphere",
+        ];
+        if opdoc.is_empty()
+            || !opdoc.keys().all(|k| k.starts_with('$'))
+            || opdoc.keys().any(|k| ROUTED_ELSEWHERE.contains(&k.as_str()))
+        {
+            return Ok(None);
+        }
+        let Some(idx) = self.find_leading_field_index(session, db, coll, field, filter)? else {
+            return Ok(None);
+        };
+        let (name, dir, is_compound) = (idx.0.as_str(), idx.1, idx.2);
+        let multikey = self.flagged_multikey(session, db, coll, name)?;
+        let Some(bounds) = scan_bounds::for_predicate(value, multikey, dir == -1) else {
+            return Ok(None);
+        };
+        if !wide_read_allowed(bounds.broad) {
+            return Ok(None);
+        }
+        let spans = scan_bounds::to_spans(&bounds, dir, escape_kb);
+        // What `bounded_id_keys` notes of the read, before it is read; a
+        // key out of value order is noted as a page meets it.
+        note_routed(name);
+        if (multikey && !bounds.scalar_points())
+            || (is_compound && self.has_descending_column(session, db, coll, name)?)
+        {
+            note_unordered();
+        }
+        Ok(Some(SpanPages {
+            name: name.to_string(),
+            spans,
+            dir,
+            at: 0,
+            last: None,
+            seen: HashSet::new(),
+        }))
+    }
+
+    /// Up to `max` entries more of `pages`' index read, as the RecordIds
+    /// not handed out before, on this call's snapshot: [`Self::scan_spans`]
+    /// resumed after the last entry it read. Empty with `pages.at` past the
+    /// last span when the read is done.
+    fn next_span_page(
+        &self,
+        db: &str,
+        coll: &str,
+        pages: &mut SpanPages,
+        max: usize,
+    ) -> Result<Vec<i64>> {
+        let session = self.op_session()?;
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let key_name =
+            |s: &str| secantus_wt::name_bytes(s).unwrap_or_else(|| s.as_bytes().to_vec());
+        let (db_key, coll_key, name_key) = (key_name(db), key_name(coll), key_name(&pages.name));
+        let mut out = Vec::new();
+        let mut entries = 0usize;
+        while pages.at < pages.spans.len() && entries < max {
+            let span = &pages.spans[pages.at];
+            let mut hi = Vec::new();
+            match &span.hi {
+                Some(h) => hi.extend_from_slice(h),
+                None => hi.push(0xFF),
+            }
+            let seed = match &pages.last {
+                Some(last) => last.clone(),
+                None => span.lo.clone().unwrap_or_default(),
+            };
+            cur.reset()?;
+            cur.set_key_sssu(db, coll, &pages.name, &seed);
+            let mut more = match cur.search_near() {
+                Ok(cmp) => {
+                    // Strictly after the last entry read, which is still there
+                    // or has gone; at or after a span's start.
+                    if cmp < 0 || (cmp == 0 && pages.last.is_some()) {
+                        cur.next()?
+                    } else {
+                        true
+                    }
+                }
+                Err(e) if e.is_not_found() => false,
+                Err(e) => return Err(e.into()),
+            };
+            let mut span_done = true;
+            while more {
+                if deadline::check().is_err() {
+                    return Err(StorageError::MaxTimeExpired);
+                }
+                if entries >= max {
+                    span_done = false;
+                    break;
+                }
+                let step = cur.with_key_sssu(|d, c, n, packed| {
+                    if d != db_key.as_slice()
+                        || c != coll_key.as_slice()
+                        || n != name_key.as_slice()
+                    {
+                        return None;
+                    }
+                    let (row_esc, row_id) = unpack_entry(packed);
+                    if row_esc >= hi.as_slice() {
+                        return None;
+                    }
+                    let out_of_order = pages.dir == -1
+                        && row_esc
+                            .first()
+                            .is_some_and(|b| scan_bounds::open_ended_rank(0xFF - b));
+                    Some((packed.to_vec(), row_id, out_of_order))
+                })?;
+                let Some((packed, row_id, out_of_order)) = step else {
+                    break;
+                };
+                if out_of_order {
+                    note_unordered();
+                }
+                entries += 1;
+                pages.last = Some(packed);
+                if let Some(rid) = row_id {
+                    if pages.seen.insert(rid) {
+                        out.push(rid);
+                    }
+                }
+                more = cur.next()?;
+            }
+            if span_done {
+                pages.at += 1;
+                pages.last = None;
+            }
+        }
+        Ok(out)
     }
 
     /// The next page of `pages`, up to `max` rows each with its document as
@@ -21177,6 +21391,22 @@ impl Storage {
                 }
                 Ok(Some(page))
             }
+            CandidatePages::Spans(spans) => loop {
+                let rids = self.next_span_page(db, coll, spans, max)?;
+                if rids.is_empty() {
+                    if spans.at >= spans.spans.len() {
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                let docs = self.records_by_id(db, coll, &rids)?;
+                return Ok(Some(
+                    rids.into_iter()
+                        .zip(docs)
+                        .filter_map(|(rid, doc)| doc.map(|d| (rid, d)))
+                        .collect(),
+                ));
+            },
             CandidatePages::Read(rows) => {
                 let page: CandidatePage = rows
                     .by_ref()

@@ -1,4 +1,4 @@
-//! `secantusd-rs` — the standalone Rust server binary (R7).
+//! `secantusd-mdb` — the standalone Rust server binary (R7).
 //!
 //! The non-Python entry point over the same crates the embedded
 //! `_secantus_server` handle (R6) uses: parse args → open the WiredTiger
@@ -33,11 +33,11 @@ use secantus_commands::{CursorRegistry, Storage as CmdStorage};
 use secantus_server::args::{parse_args, CliArgs, Parsed};
 use secantus_server::bind;
 use secantus_server::config::resolve;
-use secantus_storage::{wt_config, Storage, StorageOptions};
+use secantus_storage::{mongod_message_config, wt_config, Storage, StorageOptions};
 use secantus_storage_adapter::StorageAdapter;
 
 const RESTORE_HELP: &str = "\
-Usage: secantusd-rs restore --source PATH --target-dir PATH [--to-timestamp SECS[,ORD]]
+Usage: secantusd-mdb restore --source PATH --target-dir PATH [--to-timestamp SECS[,ORD]]
 
 Point-in-time recovery: rebuild a fresh data directory as the database was at a
 target time by replaying a stopped server's oplog forward. The source must be a
@@ -82,7 +82,7 @@ fn main() -> ExitCode {
         return match run_restore(&argv[1..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(msg) => {
-                eprintln!("secantusd-rs restore: {msg}");
+                eprintln!("secantusd-mdb restore: {msg}");
                 ExitCode::from(2)
             }
         };
@@ -94,8 +94,8 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(msg) => {
-            eprintln!("secantusd-rs: {msg}");
-            eprintln!("Try 'secantusd-rs --help' for usage.");
+            eprintln!("secantusd-mdb: {msg}");
+            eprintln!("Try 'secantusd-mdb --help' for usage.");
             // argparse's exit code for bad arguments, matching the Python CLI.
             return ExitCode::from(2);
         }
@@ -115,14 +115,14 @@ fn main() -> ExitCode {
     let (cfg, source) = match resolve(parsed.config_path.as_deref(), &parsed.overrides) {
         Ok(pair) => pair,
         Err(msg) => {
-            eprintln!("secantusd-rs: {msg}");
+            eprintln!("secantusd-mdb: {msg}");
             return ExitCode::from(2);
         }
     };
     let cli = match CliArgs::from_resolved(&cfg) {
         Ok(cli) => cli,
         Err(msg) => {
-            eprintln!("secantusd-rs: {msg}");
+            eprintln!("secantusd-mdb: {msg}");
             return ExitCode::from(2);
         }
     };
@@ -139,7 +139,7 @@ fn main() -> ExitCode {
         return match run_repair(&cli) {
             Ok(()) => ExitCode::SUCCESS,
             Err(msg) => {
-                eprintln!("secantusd-rs: {msg}");
+                eprintln!("secantusd-mdb: {msg}");
                 // mongod's exit code for a repair that could not finish
                 // (`EXIT_UNCAUGHT`, measured 8.2.11 on a missing --dbpath).
                 ExitCode::from(100)
@@ -150,7 +150,7 @@ fn main() -> ExitCode {
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
-            eprintln!("secantusd-rs: {msg}");
+            eprintln!("secantusd-mdb: {msg}");
             ExitCode::FAILURE
         }
     }
@@ -298,7 +298,7 @@ fn run(cli: CliArgs) -> Result<(), String> {
 
     // The smoke test (and any wrapping launcher) reads this line to learn the
     // bound address, so it must hit stdout before we block.
-    println!("secantusd-rs listening on {}", running.address());
+    println!("secantusd-mdb listening on {}", running.address());
     use std::io::Write as _;
     let _ = std::io::stdout().flush();
 
@@ -349,11 +349,15 @@ fn storage_options(cli: &CliArgs) -> StorageOptions {
     // Open with the resolved WiredTiger knobs (--cache-size / --session-max /
     // --sync-on-commit). The daemon default is `1G` (matching the Python
     // server); the engine/library default via `Storage::open` stays `256M`.
-    let wt = wt_config(
-        &cli.cache_size,
-        cli.session_max,
-        cli.sync_on_commit,
-        &cli.log_file_max,
+    let wt = format!(
+        "{},{}",
+        wt_config(
+            &cli.cache_size,
+            cli.session_max,
+            cli.sync_on_commit,
+            &cli.log_file_max,
+        ),
+        mongod_message_config()
     );
     // Storage write-path modes (--oplog-async / --oplog-nonlogged /
     // --data-nonlogged / --checkpoint-seconds): `None` defers to the matching
@@ -387,7 +391,7 @@ fn run_repair(cli: &CliArgs) -> Result<(), String> {
         })
         .map_err(|e| format!("repair of {} failed: {e}", cli.storage_path))?;
     println!(
-        "secantusd-rs repaired {}: {} tables verified, {} salvaged{}, {} collections' \
+        "secantusd-mdb repaired {}: {} tables verified, {} salvaged{}, {} collections' \
          indexes rebuilt",
         cli.storage_path,
         report.verified.len() + report.salvaged.len(),
@@ -451,7 +455,7 @@ fn flag_value(
         .ok_or_else(|| format!("{key} requires a value"))
 }
 
-/// `secantusd-rs restore` — replay a stopped source's oplog into a fresh target.
+/// `secantusd-mdb restore` — replay a stopped source's oplog into a fresh target.
 /// Hand-rolled arg parsing (like the server), accepting both `--flag value` and
 /// `--flag=value`.
 fn run_restore(args: &[String]) -> Result<(), String> {
@@ -502,7 +506,7 @@ fn run_restore(args: &[String]) -> Result<(), String> {
     .map_err(|e| format!("{e:?}"))?;
     println!(
         "Restored {} operations (through oplog seq {}) into {}.\n\
-         Start a server on it: secantusd-rs --storage-path {}",
+         Start a server on it: secantusd-mdb --storage-path {}",
         stats.ops_applied, stats.last_seq, target_dir, target_dir
     );
     Ok(())

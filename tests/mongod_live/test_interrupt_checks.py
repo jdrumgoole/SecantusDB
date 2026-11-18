@@ -32,6 +32,11 @@ tick; the checker lives with the cursor, so a `getMore` goes on counting
 where the batch before stopped. Such a `getMore` takes no lock of its own,
 and so reads no storage statistics unless it filled a buffer.
 
+A `$sort` after a `$group` the slot-based engine runs reads the groups
+through the cursor stage in the same way: a global IS per buffer, and a
+tick for each document the `$sort` pulls from it, each it passes on, and
+each end found.
+
 What this server does not count yet prints no field, and is RM-360's
 remainder: plans with several candidates, the pipelines it does not model,
 `findAndModify`, DDL, and the write concerns whose waits are not modelled
@@ -74,11 +79,28 @@ def _documents(n: int) -> Callable[[Any], Any]:
     return setup
 
 
+def _arrays(n: int) -> Callable[[Any], Any]:
+    """Twelve documents, each with an array `a` of `n` elements."""
+    return lambda db: db.c.insert_many([{"_id": i, "a": list(range(n))} for i in range(12)])
+
+
 def _pipeline(pipeline: list, **kwargs: Any) -> Callable[[Any], Any]:
     return lambda d: list(d.c.aggregate(pipeline, **kwargs))
 
 
 _ADD = {"$addFields": {"q": 1}}
+
+_GROUP_SORT = [{"$group": {"_id": "$y"}}, {"$sort": {"_id": 1}}]
+
+
+def _groups(n: int) -> Callable[[Any], Any]:
+    """`n` documents over an index on `x`, each its own group of `y`."""
+
+    def setup(db: Any) -> None:
+        db.c.insert_many([{"_id": i, "x": i, "y": i} for i in range(n)])
+        db.c.create_index("x")
+
+    return setup
 
 
 #: label -> (setup, operation, the commands whose lines are compared).
@@ -233,6 +255,131 @@ PIPELINES: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any], tuple[str
     "aggregate with a $skip between two $unwinds": (
         _documents(400),
         _pipeline([{"$unwind": "$a"}, {"$skip": 5}, {"$unwind": "$a"}], batchSize=60),
+        _PIPELINE,
+    ),
+    # mongod 8.2.11 checks after every tenth element of each evaluation of a
+    # `$map`, `$filter` or `$reduce`, its count starting again with the
+    # next (RM-360): 9 elements check none, 10 once, 50 five times.
+    "aggregate with a $map of 2": (
+        seed,
+        _pipeline([{"$addFields": {"m": {"$map": {"input": [1, 2], "in": "$$this"}}}}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $map of 9": (
+        _arrays(9),
+        _pipeline([{"$addFields": {"m": {"$map": {"input": "$a", "in": "$$this"}}}}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $map of 10": (
+        _arrays(10),
+        _pipeline([{"$addFields": {"m": {"$map": {"input": "$a", "in": "$$this"}}}}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $map of 127": (
+        _arrays(127),
+        _pipeline([{"$addFields": {"m": {"$map": {"input": "$a", "in": "$$this"}}}}]),
+        _PIPELINE,
+    ),
+    "aggregate with two $maps of 5 and a nested one": (
+        _arrays(5),
+        _pipeline(
+            [
+                {
+                    "$addFields": {
+                        "m": {"$map": {"input": "$a", "in": "$$this"}},
+                        "n": {"$map": {"input": "$a", "in": {"$map": {"input": "$a", "in": 1}}}},
+                    }
+                }
+            ]
+        ),
+        _PIPELINE,
+    ),
+    "aggregate with a $filter of 50": (
+        _arrays(50),
+        _pipeline([{"$addFields": {"m": {"$filter": {"input": "$a", "cond": True}}}}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $filter stopped by its limit at 10": (
+        _arrays(50),
+        _pipeline([{"$addFields": {"m": {"$filter": {"input": "$a", "cond": True, "limit": 10}}}}]),
+        _PIPELINE,
+    ),
+    # A `$sort` after a `$group` mongod's slot-based engine runs reads the
+    # groups through the cursor stage: a global IS per buffer it loads, and
+    # a tick per `getNext` of the `$sort` and of the cursor stage beneath it
+    # (RM-360, measured 8.2.11 2026-11-17: 32 groups 6, 96 groups 8, 300
+    # groups 12 and a `getMore` of 3).
+    "aggregate sorting three groups": (seed, _pipeline(_GROUP_SORT), _PIPELINE),
+    "aggregate sorting 32 groups, one buffer full": (
+        _groups(32),
+        _pipeline(_GROUP_SORT),
+        _PIPELINE,
+    ),
+    "aggregate sorting 96 groups": (_groups(96), _pipeline(_GROUP_SORT), _PIPELINE),
+    "aggregate sorting 101 groups, a first batch full": (
+        _groups(101),
+        _pipeline(_GROUP_SORT),
+        _PIPELINE,
+    ),
+    "aggregate sorting 400 groups, and its getMore": (
+        _groups(400),
+        _pipeline(_GROUP_SORT),
+        _PIPELINE,
+    ),
+    "aggregate sorting 300 groups in small batches": (
+        _groups(300),
+        _pipeline(_GROUP_SORT, batchSize=50),
+        _PIPELINE,
+    ),
+    "aggregate sorting the groups of a $match": (
+        seed,
+        _pipeline([{"$match": {"x": {"$gt": 2}}}, *_GROUP_SORT]),
+        _PIPELINE,
+    ),
+    # A `$count`, `$sortByCount` or `$bucket` is a `$group` SBE takes and a
+    # `$project` or `$sort` the pipeline runs over the cursor stage, counted
+    # as a `$sort` after a `$group` is (RM-360, measured 8.2.11 2026-11-17:
+    # a `$count` 5 at any size; a `$sortByCount` of 300 groups 12 and a
+    # `getMore` of 3).
+    "aggregate counting": (_groups(300), _pipeline([{"$count": "n"}]), _PIPELINE),
+    "aggregate counting groups": (
+        seed,
+        _pipeline([{"$group": {"_id": "$y"}}, {"$count": "n"}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $sortByCount of 300": (
+        _groups(300),
+        _pipeline([{"$sortByCount": "$y"}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $sortByCount of groups": (
+        _groups(300),
+        _pipeline([{"$group": {"_id": "$y"}}, {"$sortByCount": "$_id"}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $bucket": (
+        _groups(300),
+        _pipeline([{"$bucket": {"groupBy": "$y", "boundaries": [0, 1000]}}]),
+        _PIPELINE,
+    ),
+    # 49 buckets, the most SBE takes: a `$bucket` of 50 is a `$switch` of 50
+    # branches, which keeps its `$group` classic.
+    "aggregate with a $bucket of 49 buckets": (
+        _groups(300),
+        _pipeline([{"$bucket": {"groupBy": "$y", "boundaries": [*range(0, 294, 6), 1000]}}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $reduce of 50": (
+        _arrays(50),
+        _pipeline(
+            [
+                {
+                    "$addFields": {
+                        "m": {"$reduce": {"input": "$a", "initialValue": 0, "in": "$$value"}}
+                    }
+                }
+            ]
+        ),
         _PIPELINE,
     ),
 }

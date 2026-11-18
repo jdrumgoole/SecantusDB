@@ -80,7 +80,7 @@ URI of an already-running server, instead of starting an embedded Python one.
 The probes drive the wire, so the server under test is just an address:
 
     ./inv rust-binary-build
-    crates/secantusdb/target/debug/secantusd-rs --port 27055 --storage-path /tmp/rs &
+    crates/secantusdb/target/debug/secantusd-mdb --port 27055 --storage-path /tmp/rs &
     PROBE_SERVER="mongodb://127.0.0.1:27055" \
       PROBE_MONGOD="mongodb://127.0.0.1:27041" \
       uv run --no-sync python tools/probes/arg_types_extended.py

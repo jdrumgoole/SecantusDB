@@ -179,7 +179,7 @@ Changelog = "https://secantusdb.com/docs/changelog.html"
 # names the wire protocol when it isn't the default MongoDB wire.
 #   secantusd-py     — Python MongoDB-wire server (this package)
 #   secantusd-py-pg  — Python PostgreSQL-wire server (secantus.sql.pgserver)
-#   secantusd-rs     — Rust MongoDB-wire server (crates/secantusdb [[bin]])
+#   secantusd-mdb     — Rust MongoDB-wire server (crates/secantusdb [[bin]])
 secantusd-py = "secantus.cli:main"
 secantusd-py-pg = "secantus.sql.pgserver:main"
 # Utility commands carry the bare `secantus` import-name prefix (they aren't
@@ -334,7 +334,7 @@ markers = [
     "slow: long-running benchmarks / scaling regressions (run via `pytest -m slow`, not in default suite)",
     "differential: same operation against SecantusDB and a real mongod (skipped when no mongod is on PATH; run via `pytest -m differential`)",
     "backlog(id): a gap test for an open Rust-server backlog item; fails while the item is open (run via `python tools/backlog.py verify`, not in default suite)",
-    "mongod_live: the Rust MongoDB server against a live mongod 8.2 (tests/mongod_live/); needs the secantusd-rs binary and mongod, run by CI's storage-engine job (not in default suite)",
+    "mongod_live: the Rust MongoDB server against a live mongod 8.2 (tests/mongod_live/); needs the secantusd-mdb binary and mongod, run by CI's storage-engine job (not in default suite)",
     "backlog_fixed(id): the regression test a fixed backlog item's gap test became; needs the reference servers (run via `python tools/backlog.py verify`, not in default suite)",
 ]
 

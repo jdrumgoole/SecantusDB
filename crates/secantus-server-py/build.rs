@@ -19,7 +19,7 @@
 /// extension links `secantus-storage`, `-storage-adapter`, `-commands`,
 /// `-server` and `-pgserver`, which transitively covers nearly the whole
 /// workspace, so enumerating them would be a list that silently goes stale when
-/// a dependency is added. `HEAD:crates` is what the `secantusd-rs` and
+/// a dependency is added. `HEAD:crates` is what the `secantusd-mdb` and
 /// `secantusd-pg` binaries already stamp, so the three agree. The cost is that
 /// an unrelated crate's change reads as stale here; the benefit is that a
 /// missing dependency edge cannot make the check lie.

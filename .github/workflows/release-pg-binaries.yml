@@ -1,17 +1,19 @@
 # Release the standalone `secantusd-pg` Rust PostgreSQL-wire server binary as
 # prebuilt, static-WiredTiger archives attached to a GitHub Release.
 #
-# The PostgreSQL-side twin of `release-binaries.yml`, which ships `secantusd-rs`.
+# The PostgreSQL-side twin of `release-binaries.yml`, which ships `secantusd-mdb`.
 # Same shape deliberately: build the vendored WiredTiger static lib through the
 # wheel path CI already proves green, link the binary against it, smoke the exact
 # artifact, then attach `tar.gz` + `.sha256` to a GitHub Release. Read that file
 # first — the reasoning behind the WT staging and the toolchain steps lives there
 # and is not repeated here.
 #
-# TAG SCHEME — a THIRD, distinct namespace:
-#   publish.yml          fires on `vX.Y.Z` / `vX.Y.ZbN`   (the PyPI package)
+# TAG SCHEME — a distinct namespace:
 #   release-binaries.yml fires on `secantusdb-v*`          (the Rust MongoDB server)
 #   THIS file            fires on `secantusd-pg-v*`        (the Rust PG server)
+#   publish-pypi.yml bundles the newest release of THIS file's archives into the
+#   PyPI wheel it builds after each `secantusdb-v*` release, so a PG release
+#   meant for the wheel must finish before the MongoDB release does.
 #
 # The PG server is NOT in the MongoDB crates' lockstep version: it sits at
 # `0.1.0-beta.0` while `crates/secantusdb` is at `0.5.3-beta.163`. Folding it

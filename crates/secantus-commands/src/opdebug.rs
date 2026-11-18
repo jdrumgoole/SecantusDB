@@ -639,6 +639,10 @@ pub(crate) fn refused_before_acquiring(name: &str, reply: &Document) -> bool {
     match name {
         "dropIndexes" | "deleteIndexes" => matches!(code, Ok(26 | 166)),
         "collMod" => code == Ok(26),
+        // A `findAndModify` refused as it parses (FailedToParse: neither
+        // `update` nor `remove`) has acquired nothing (measured 8.2.11,
+        // RM-595).
+        "findAndModify" | "findandmodify" => code == Ok(9),
         _ => false,
     }
 }
@@ -726,6 +730,8 @@ mod tests {
         assert!(refused_before_acquiring("collMod", &refused(26)));
         assert!(!refused_before_acquiring("collMod", &refused(72)));
         assert!(!refused_before_acquiring("collMod", &doc! {"ok": 1.0}));
+        assert!(refused_before_acquiring("findAndModify", &refused(9)));
+        assert!(!refused_before_acquiring("findAndModify", &refused(2)));
     }
 
     #[test]

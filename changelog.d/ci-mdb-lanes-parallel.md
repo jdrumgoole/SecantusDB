@@ -25,7 +25,7 @@ full-match restore in a `rust-storage` lane compiles 10 crates, not 652.
   7 of 583 packages.
 - New `mdb-binary` job, two shards: `backlog` (`tools/backlog.py verify`
   for the RM items) and `live` (`tests/mongod_live/` and the R7 binary
-  tests). Both build the debug `secantusd-rs` against the cached
+  tests). Both build the debug `secantusd-mdb` against the cached
   WiredTiger build the `rust-storage` lanes use.
 - `storage-engine`: the smoke-test step runs with `-n auto
   --dist=loadgroup`; the R7 step stays here for the macOS cron cell only.

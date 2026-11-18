@@ -111,15 +111,15 @@ def _rust_binary() -> str:
         return env
     cargo_target = repo / "crates" / "secantusdb" / "target"
     for cand in (
-        Path(sys.executable).parent / "secantusd-rs",
-        cargo_target / "release" / "secantusd-rs",
-        cargo_target / "debug" / "secantusd-rs",
+        Path(sys.executable).parent / "secantusd-mdb",
+        cargo_target / "release" / "secantusd-mdb",
+        cargo_target / "debug" / "secantusd-mdb",
     ):
         if cand.exists():
             _require_fresh(cand, repo)
             return str(cand)
     raise SystemExit(
-        "secantusd-rs not found — build with "
+        "secantusd-mdb not found — build with "
         "SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON uv sync --extra dev, "
         "or set SECANTUSDB_BIN."
     )

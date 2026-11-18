@@ -31,7 +31,7 @@ catalogs report it as the primary key. Fixes RP-281
 #### Changed
 
 - A table with a deferrable primary key keeps a generated `_id`, so read
-  through `secantusd-rs` as a collection its `_id` is that generated value,
+  through `secantusd-mdb` as a collection its `_id` is that generated value,
   not the key (Joe's call, 2026-10-27). A table whose primary key is not
   deferrable keeps the key as `_id`, as before. The key is stored as a
   unique constraint carrying `primary: true` in `__sql_catalog__`, which

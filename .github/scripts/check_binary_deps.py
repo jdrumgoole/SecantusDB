@@ -3,7 +3,7 @@
 machine that downloads it may not have.
 
 This exists because a published archive can be broken in a way NOTHING else in
-the pipeline notices. Both macOS binaries of 2026-09-19 --- secantusd-rs
+the pipeline notices. Both macOS binaries of 2026-09-19 --- secantusd-mdb
 0.5.3-beta.164 and secantusd-pg 0.1.0-beta.1 --- linked liblz4 by its absolute
 Homebrew path, `/opt/homebrew/opt/lz4/lib/liblz4.1.dylib`, and would not launch
 on a Mac without Homebrew lz4 installed there. The build succeeded, the smoke

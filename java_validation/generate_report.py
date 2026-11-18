@@ -120,7 +120,7 @@ def render(xml_dir: Path, out_path: Path) -> None:
             "Run `uv run python -m invoke validate-java --server rust` to "
             "refresh. The same unmodified suite as "
             "`docs/validation-report-java.md`, pointed at the standalone "
-            "**Rust server** (`secantusd-rs`) instead of the Python one — "
+            "**Rust server** (`secantusd-mdb`) instead of the Python one — "
             "the gap between the two reports is part of the Rust server's "
             "remaining to-do list."
         )
@@ -200,7 +200,7 @@ def render(xml_dir: Path, out_path: Path) -> None:
     if rust:
         md.append(
             "In `--server rust` mode the same two-phase spawn runs the "
-            "standalone `secantusd-rs` binary (via `gauge_common.for_server`, "
+            "standalone `secantusd-mdb` binary (via `gauge_common.for_server`, "
             "same flags) instead of `python -m secantus`, so the numbers "
             "above measure the Rust server."
         )

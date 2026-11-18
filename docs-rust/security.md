@@ -1,11 +1,10 @@
 # Security
 
-The Rust server implements the same authentication, authorization, and
-transport-security surface as the Python server — the same user records on
-disk, the same commands, the same driver-facing behaviour. This page is the
-Rust-server operational summary; the concept-level documentation lives in
+The Rust server implements authentication, authorization and transport
+security as `mongod` does, and drivers see `mongod`'s behaviour. This page is
+the Rust-server operational summary; the concept-level documentation lives in
 the main tree's [Authentication](https://secantusdb.com/docs/authentication.html)
-page and applies verbatim.
+page.
 
 ## Authentication
 
@@ -15,7 +14,7 @@ page and applies verbatim.
   standard `authenticate` command path every driver uses.
 
 Auth is off by default. Flip it on with `--auth` (daemon) or
-`require_auth=True` (embedded handle); only the handshake and the SCRAM
+`Server::builder().auth(true)` (the `secantus_mdb` library); only the handshake and the SCRAM
 exchange then run unauthenticated, everything else returns `Unauthorized`
 (code 13) until the connection authenticates.
 
@@ -67,7 +66,7 @@ The server's own commands have no mongod rule, so the server sets one:
 Transport security is [rustls](https://github.com/rustls/rustls)-based:
 
 ```bash
-secantusd-rs \
+secantusd-mdb \
   --tls-cert-file /etc/letsencrypt/live/db.example.com/fullchain.pem \
   --tls-key-file  /etc/letsencrypt/live/db.example.com/privkey.pem \
   --tls-ca-file   /etc/ssl/client-ca.crt \
@@ -84,9 +83,9 @@ secantusd-rs \
   authentication.
 
 The same settings are available in the `[tls]` section of
-`secantusd.toml` and as `RustServer(...)` constructor arguments.
+`secantusd.toml` and, from Rust, as `Server::builder().tls(...)`.
 
 ## Out of scope
 
-Same non-goals as the Python server: LDAP, Kerberos/GSSAPI, PLAIN,
+Out of scope: LDAP, Kerberos/GSSAPI, PLAIN,
 MONGODB-AWS, MONGODB-OIDC, and keyfile cluster auth (no cluster).

@@ -1,0 +1,11 @@
+<section id="postgres" class="dark">
+<p class="eyebrow">The second protocol</p>
+<h2>Then we did it again for PostgreSQL</h2>
+<ul class="pts">
+<li>Extended query protocol, prepared statements, text and binary formats</li>
+<li>Transactions, savepoints, two-phase commit, COPY, LISTEN / NOTIFY</li>
+<li>The catalog tables clients introspect, so psql and SQLAlchemy just work</li>
+<li>Rule: always the most faithful PostgreSQL model — serializable isolation ported from PostgreSQL’s own predicate.c</li>
+</ul>
+<aside>Scope is set by what psycopg’s own test suite reaches for, not a feature list. The faithfulness rule: when there’s a cheap approximation and a faithful port, we take the port, and sequence the work by cost rather than cutting corners. ~3 min.</aside>
+</section>

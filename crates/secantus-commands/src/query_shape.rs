@@ -34,13 +34,17 @@
 //! into (`document_source_rank_fusion.cpp`,
 //! `document_source_score_fusion.cpp`).
 //!
-//! Where a query uses something this module does not shape (`$jsonSchema`,
-//! a hybrid search over `$search`, an option no one has measured), [`hash`]
-//! answers `None` and no hash is printed: a wrong hash would be worse than
+//! `$jsonSchema` is the tree mongod's JSON Schema parser builds from the
+//! schema ([`json_schema`]).
+//!
+//! Where a query uses something this module does not shape (a hybrid
+//! search over `$search`, an option no one has measured), [`hash`] answers `None` and no hash is printed: a wrong hash would be worse than
 //! none (`tasks/backlog-rust-mongodb.md` names what is left).
 
 use bson::{doc, oid::ObjectId, spec::BinarySubtype, Binary, Bson, DateTime, Document, Timestamp};
 use sha2::{Digest, Sha256};
+
+mod json_schema;
 
 /// `queryShapeHash` of `request`, run against database `db`: uppercase hex
 /// of the SHA-256, or `None` for a command mongod gives no query shape or a
@@ -734,6 +738,7 @@ fn pathless(op: &str, v: &Bson) -> Option<Option<Node>> {
         "$or" => Node::Or(list(v)?),
         "$nor" => Node::Nor(list(v)?),
         "$comment" => return Some(None),
+        "$jsonSchema" => json_schema::parse(v.as_document()?)?,
         "$alwaysTrue" | "$alwaysFalse" => Node::Raw(doc! { op: lit(Bson::Int32(1)) }),
         "$expr" => Node::Raw(doc! { "$expr": expr(v, true)? }),
         "$where" => {
@@ -2510,16 +2515,28 @@ fn coll_stats(spec: &Document) -> Option<Document> {
 /// resume token, otherwise the operation time mongod picks) and the two
 /// `fullDocument` modes.
 fn change_stream(spec: &Document) -> Option<Document> {
-    const KEYS: [&str; 7] = [
+    // The flags in `DocumentSourceChangeStreamSpec`'s order, which its
+    // shape keeps (mongod 8.2.11, measured 2026-11-17, RM-358).
+    const FLAGS: [&str; 7] = [
+        "allChangesForCluster",
+        "showMigrationEvents",
+        "showSystemEvents",
+        "allowToRunOnConfigDB",
+        "allowToRunOnSystemNS",
+        "showExpandedEvents",
+        "showRawUpdateDescription",
+    ];
+    const KEYS: [&str; 5] = [
         "resumeAfter",
         "startAfter",
         "startAtOperationTime",
         "fullDocument",
         "fullDocumentBeforeChange",
-        "allChangesForCluster",
-        "showExpandedEvents",
     ];
-    if spec.keys().any(|k| !KEYS.contains(&k.as_str())) {
+    if spec
+        .keys()
+        .any(|k| !KEYS.contains(&k.as_str()) && !FLAGS.contains(&k.as_str()))
+    {
         return None;
     }
     let mut out = Document::new();
@@ -2553,7 +2570,7 @@ fn change_stream(spec: &Document) -> Option<Document> {
         spec.get("fullDocumentBeforeChange")
             .map_or(Some("off"), Bson::as_str)?,
     );
-    for key in ["allChangesForCluster", "showExpandedEvents"] {
+    for key in FLAGS {
         if let Some(v) = spec.get(key) {
             out.insert(key, v.as_bool()?);
         }
@@ -3218,8 +3235,27 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
             if d.keys().any(|k| !KEYS.contains(&k.as_str())) {
                 return None;
             }
+            // `from: {db, coll}` names a collection in `local` or `config`
+            // (all mongod 8.2.11 accepts); its shape keeps the namespace
+            // form, `db` first (measured 2026-11-17, RM-358).
+            let (from_db, from) = match d.get("from")? {
+                Bson::String(c) => (db, c.as_str()),
+                Bson::Document(f) if f.len() == 2 => {
+                    let fdb = f.get_str("db").ok()?;
+                    if !matches!(fdb, "local" | "config") {
+                        return None;
+                    }
+                    (fdb, f.get_str("coll").ok()?)
+                }
+                _ => return None,
+            };
+            let from_shape = if d.get("from")?.as_str().is_some() {
+                Bson::String(ident(from))
+            } else {
+                Bson::Document(doc! { "db": ident(from_db), "coll": ident(from) })
+            };
             let mut out = doc! {
-                "from": ident(d.get_str("from").ok()?),
+                "from": from_shape,
                 "as": field_path(d.get_str("as").ok()?),
             };
             match (d.get("localField"), d.get("foreignField")) {
@@ -3239,9 +3275,8 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
                         None => Document::new(),
                     };
                     out.insert("let", vars);
-                    let from = d.get_str("from").ok()?;
                     let p = p.as_array()?;
-                    out.insert("pipeline", pipeline_shape(db, from, p)?);
+                    out.insert("pipeline", pipeline_shape(from_db, from, p)?);
                     // `DocumentSourceLookUp::serializeToArray` flags a
                     // hybrid search's join (`isHybridSearchPipeline`): the
                     // hash covers it, and mongod 8.2.11's `$queryStats`
@@ -3341,14 +3376,27 @@ fn stage_shape(db: &str, coll: &str, stage: &Document) -> Option<Vec<Document>> 
         "$fill" => fill(spec.as_document()?)?,
         "$densify" => densify(spec.as_document()?)?,
         "$out" => {
-            let (out_db, coll) = match spec {
-                Bson::String(c) => (db, c.as_str()),
-                Bson::Document(d) if d.len() == 2 => {
-                    (d.get_str("db").ok()?, d.get_str("coll").ok()?)
+            let (out_db, coll, ts) = match spec {
+                Bson::String(c) => (db, c.as_str(), None),
+                Bson::Document(d) => {
+                    // `timeseries` options are printed as given, granularity
+                    // defaults unfilled (mongod 8.2.11, measured 2026-11-17).
+                    let ts = match d.get("timeseries") {
+                        Some(t) => Some(t.as_document()?.clone()),
+                        None => None,
+                    };
+                    if d.len() != 2 + usize::from(ts.is_some()) {
+                        return None;
+                    }
+                    (d.get_str("db").ok()?, d.get_str("coll").ok()?, ts)
                 }
                 _ => return None,
             };
-            vec![doc! { "$out": { "coll": ident(coll), "db": ident(out_db) } }]
+            let mut out = doc! { "coll": ident(coll), "db": ident(out_db) };
+            if let Some(ts) = ts {
+                out.insert("timeseries", ts);
+            }
+            vec![doc! { "$out": out }]
         }
         "$merge" => vec![doc! { "$merge": merge(db, coll, spec)? }],
         "$geoNear" => vec![doc! { "$geoNear": geo_near(spec.as_document()?)? }],
@@ -3767,7 +3815,10 @@ mod tests {
     #[test]
     fn what_it_cannot_shape_has_no_hash() {
         assert_eq!(
-            hash("d", &doc! { "find": "c", "filter": { "$jsonSchema": {} } }),
+            hash(
+                "d",
+                &doc! { "find": "c", "filter": { "$jsonSchema": { "$ref": "#" } } }
+            ),
             None
         );
         // mongod refuses a hybrid search with no input pipeline, and one

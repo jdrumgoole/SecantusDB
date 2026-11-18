@@ -4,7 +4,7 @@ megabytes here, where mongod 8.2.11 takes 1% of it in bytes. Fixed by
 RM-657: `hostinfo::Host` keeps the memory in bytes.
 
 The reference is mongod, asked live (`mongod`); the Rust server is
-`secantusd-rs` (`rust_mongo`). On macOS the memory is a whole number of
+`secantusd-mdb` (`rust_mongo`). On macOS the memory is a whole number of
 MiB, so the two agree there; Linux's `MemTotal` is not.
 """
 

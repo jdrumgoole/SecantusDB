@@ -2,7 +2,7 @@
 time-series `find` the aggregation mongod converts it to (RM-363, RM-455).
 
 The reference is mongod 8.2.11 (`mongod`, `mongod_rs`); the Rust server is
-`secantusd-rs` (`rust_mongo`).
+`secantusd-mdb` (`rust_mongo`).
 """
 
 from __future__ import annotations
@@ -158,7 +158,7 @@ def test_every_read_of_a_time_series_index_names_it_over_the_buckets(
     assert {k: v for k, v in got.items() if v != want[k]} == {}
 
 
-@pytest.mark.backlog("RM-600")
+@pytest.mark.backlog_fixed("RM-600")
 def test_a_time_series_read_bounded_on_its_time_field_scans_the_clustered_buckets(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
@@ -166,7 +166,7 @@ def test_a_time_series_read_bounded_on_its_time_field_scans_the_clustered_bucket
     field, with no index to serve the bound, as a `CLUSTERED_IXSCAN` of its
     buckets: they are clustered by `_id`, whose timestamp is each bucket's
     start, so the bound on `control.min.t` bounds the `_id`s read. This
-    server's line says `COLLSCAN` (measured 2026-11-13)."""
+    server's line said `COLLSCAN` (measured 2026-11-13)."""
 
     def summary(client: Any, is_mongod: bool) -> Any:
         lines, profile = logged(

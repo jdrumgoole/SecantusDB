@@ -10,7 +10,7 @@ where mongod reports 4096).
 
 #### Fixed
 
-- `secantusd-rs` now opens a spill engine at `<dbpath>/_tmp/spilldb` the
+- `secantusd-mdb` now opens a spill engine at `<dbpath>/_tmp/spilldb` the
   first time a stage spills, with mongod 8.2's configuration: no log, a
   cache of 2.5% of the machine's memory held between 100 and 1000 MB, one
   eviction thread, a 5% dirty target and 80% dirty and updates triggers.

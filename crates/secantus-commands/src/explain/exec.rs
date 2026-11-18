@@ -9,9 +9,11 @@
 //! the reported plan would touch and never a measurement of this server.
 
 use super::bounds::{sort_key, Interval};
-use super::node::{num, IndexInfo, IxScan, Node, Stats};
+use super::node::{num, IndexInfo, IxScan, Node, Stats, WorkCounts};
 use bson::{Bson, Document};
 use secantus_core::collation::Collation;
+use secantus_core::geoorder::near::{Candidate, IntervalCounts, NearSearch, Source};
+use secantus_core::geoorder::FieldBounds;
 use secantus_core::heap::Heap;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
@@ -795,6 +797,34 @@ struct Run<'a> {
     keys: i64,
     docs: i64,
     extra: Document,
+    /// A GEO_NEAR stage's ring search, over the documents it reads.
+    near: Option<Box<(NearSearch<()>, Docs)>>,
+}
+
+/// The collection as a `$near` search reads it, unchanging.
+struct Docs(Vec<Candidate<()>>);
+
+impl Source<()> for Docs {
+    type Error = std::convert::Infallible;
+    fn candidates(&mut self) -> Result<&[Candidate<()>], Self::Error> {
+        Ok(&self.0)
+    }
+}
+
+/// The ring search mongod's GEO_NEAR stage runs for `clause` over `index`,
+/// or `None` when the search is not one this replays.
+fn near_search(index: &IndexInfo, clause: &Document, env: &Env) -> Option<(NearSearch<()>, Docs)> {
+    let geo = index.geo.as_ref()?;
+    let found = crate::near::find_near(clause).ok()??;
+    let base = super::geo::trailing_bounds(geo, env.query.unwrap_or(clause))?;
+    let measure = secantus_core::geoorder::near::Measure::new(geo, &found.near)?;
+    let docs = env
+        .docs
+        .iter()
+        .enumerate()
+        .map(|(i, d)| measure.candidate(i as i64, d, true, ()))
+        .collect();
+    Some((NearSearch::new(measure, base), Docs(docs)))
 }
 
 impl<'a> Run<'a> {
@@ -827,6 +857,10 @@ impl<'a> Run<'a> {
                 extra.insert(format!("failedAnd_{i}"), 0_i32);
             }
         }
+        let near = match node {
+            Node::GeoNear { index, clause, .. } => near_search(index, clause, env).map(Box::new),
+            _ => None,
+        };
         let mut inputs: Vec<Run> = inputs.into_iter().map(|n| Run::new(n, env)).collect();
         if let Node::Sort { on_keys: true, .. } = node {
             inputs[0].keep_found();
@@ -846,6 +880,7 @@ impl<'a> Run<'a> {
             keys: 0,
             docs: 0,
             extra,
+            near,
         }
     }
 
@@ -904,8 +939,16 @@ impl<'a> Run<'a> {
                 }
                 None
             }
-            // The documents the search returns, in storage order: the
-            // search's own rings and their counts are not modelled here.
+            // mongod's ring search, ring by ring (RM-707).
+            Node::GeoNear { .. } if self.near.is_some() => {
+                let near = self.near.as_mut()?;
+                let (search, docs) = &mut **near;
+                let row = search.next(docs).unwrap_or_else(|e| match e {});
+                self.keys = search.keys_examined;
+                self.docs = search.docs_examined;
+                row.map(|(rid, ())| rid as usize)
+            }
+            // A search this does not replay: the documents in storage order.
             Node::GeoNear { clause, .. } => {
                 let clause = Some(clause.clone());
                 while self.pos < env.docs.len() {
@@ -1191,14 +1234,154 @@ impl<'a> Run<'a> {
         let mut extra = self.extra.clone();
         fixed_extra(self.node, &mut extra);
         let docs = fetched(self.node, self.returned, &mut extra).unwrap_or(self.docs);
+        let mut work = None;
+        if let (Node::GeoNear { index, sphere, .. }, Some(near)) = (self.node, &self.near) {
+            let search = &near.0;
+            let c = &search.counts;
+            work = Some(WorkCounts {
+                works: c.works,
+                advanced: c.advanced,
+                need_time: c.need_time,
+                eof: c.eof,
+                ..WorkCounts::default()
+            });
+            near_extra(index, *sphere, search, &mut extra);
+        }
         Stats {
             n_returned: self.returned,
             keys: self.keys,
             docs,
             extra,
             children: self.inputs.iter().map(Run::stats).collect(),
-            work: None,
+            work,
         }
+    }
+}
+
+/// A GEO_NEAR stage's `searchIntervals` (the rings it finished) and
+/// `inputStages` (each ring's FETCH over its IXSCAN), as mongod 8.2.11
+/// reports them.
+fn near_extra(index: &IndexInfo, sphere: bool, search: &NearSearch<()>, extra: &mut Document) {
+    let rings = &search.counts.intervals;
+    // A ring is listed from when it is buffered, the one being handed out
+    // with what it has returned so far.
+    let intervals: Vec<Bson> = rings
+        .iter()
+        .map(|i| {
+            Bson::Document(bson::doc! {
+                "minDistance": i.min,
+                "maxDistance": i.max,
+                "maxInclusive": i.inclusive_max,
+                "nBuffered": num(i.buffered),
+                "nReturned": num(i.returned),
+            })
+        })
+        .collect();
+    let stages: Vec<Bson> = rings
+        .iter()
+        .map(|i| Bson::Document(ring_stages(index, sphere, search.counts.multikey, i)))
+        .collect();
+    extra.insert("searchIntervals", intervals);
+    extra.insert("inputStages", stages);
+}
+
+fn common(out: &mut Document, n: i64, works: i64, advanced: i64, need_time: i64) {
+    out.insert("nReturned", num(n));
+    out.insert("executionTimeMillisEstimate", 0_i32);
+    out.insert("works", num(works));
+    out.insert("advanced", num(advanced));
+    out.insert("needTime", num(need_time));
+    out.insert("needYield", 0_i32);
+    out.insert("saveState", 0_i32);
+    out.insert("restoreState", 0_i32);
+    out.insert("isEOF", 1_i32);
+}
+
+/// One ring's FETCH over its IXSCAN.
+fn ring_stages(index: &IndexInfo, sphere: bool, multikey: bool, ring: &IntervalCounts) -> Document {
+    let s = &ring.scan;
+    let mut scan = bson::doc! { "stage": "IXSCAN" };
+    common(&mut scan, s.advanced, s.works, s.advanced, s.need_time);
+    scan.insert("keyPattern", index.key.clone());
+    scan.insert("indexName", index.name.clone());
+    // A `2d` index is multikey when a document has several entries, not
+    // for the array a point is (`[x, y]`).
+    scan.insert(
+        "isMultiKey",
+        if sphere {
+            index.is_multikey()
+        } else {
+            multikey
+        },
+    );
+    if sphere {
+        let mut paths = Document::new();
+        for (at, field) in index.key.keys().enumerate() {
+            let list: Vec<Bson> = index
+                .multikey_paths
+                .get(at)
+                .map(|p| p.iter().cloned().map(Bson::String).collect())
+                .unwrap_or_default();
+            paths.insert(field.clone(), list);
+        }
+        scan.insert("multiKeyPaths", paths);
+    }
+    scan.insert("isUnique", index.unique);
+    scan.insert("isSparse", index.sparse);
+    scan.insert("isPartial", index.partial.is_some());
+    scan.insert("indexVersion", index.version);
+    scan.insert("direction", "forward");
+    let geo_at = index.geo.as_ref().map_or(0, |g| g.geo_at);
+    let mut bounds = Document::new();
+    for (at, field) in index.key.keys().enumerate() {
+        let list: Vec<Bson> = if at == geo_at {
+            geo_bounds(&ring.bounds)
+        } else {
+            vec![Bson::String("[MinKey, MaxKey]".into())]
+        };
+        bounds.insert(field.clone(), list);
+    }
+    scan.insert("indexBounds", bounds);
+    scan.insert("keysExamined", num(s.keys_examined));
+    scan.insert("seeks", num(s.seeks));
+    scan.insert("dupsTested", 0_i32);
+    scan.insert("dupsDropped", 0_i32);
+    let mut fetch = bson::doc! { "stage": "FETCH" };
+    if !sphere {
+        fetch.insert("filter", bson::doc! { "$TwoDPtInAnnulusExpression": true });
+    }
+    // The FETCH works as often as its scan; the last work finds the end.
+    let fetch_need = s.works - ring.fetch_advanced - 1;
+    common(
+        &mut fetch,
+        ring.fetch_advanced,
+        s.works,
+        ring.fetch_advanced,
+        fetch_need,
+    );
+    fetch.insert("docsExamined", num(ring.docs));
+    fetch.insert("alreadyHasObj", 0_i32);
+    fetch.insert("inputStage", scan);
+    fetch
+}
+
+/// A geo field's intervals as mongod prints them: a `2d` geohash as
+/// `BinData(128, ...)`, a `2dsphere` cell as its integer.
+fn geo_bounds(bounds: &FieldBounds) -> Vec<Bson> {
+    match bounds {
+        FieldBounds::Hashes(list) => list
+            .iter()
+            .map(|(lo, hi)| {
+                Bson::String(format!(
+                    "[BinData(128, {lo:016X}), BinData(128, {hi:016X})]"
+                ))
+            })
+            .collect(),
+        FieldBounds::Cells(list) => list
+            .iter()
+            .map(|(lo, hi)| Bson::String(format!("[{lo}, {hi}]")))
+            .collect(),
+        _ => vec![Bson::String("[MinKey, MaxKey]".into())],
     }
 }
 
@@ -1512,9 +1695,24 @@ pub(crate) fn run(plan: &Node, env: &Env) -> Stats {
     stats
 }
 
+/// [`run`], with what the plan had examined, `(keys, docs)`, as it
+/// returned each of its documents: where a batch that ends at that
+/// document stops counting, as mongod's executor stops working when the
+/// batch is full (RM-708).
+pub(crate) fn run_marks(plan: &Node, env: &Env) -> (Vec<(i64, i64)>, Stats) {
+    let mut root = Run::new(plan, env);
+    let mut marks = Vec::new();
+    while root.pull(env).is_some() {
+        marks.push(root.stats().totals());
+    }
+    (marks, root.stats())
+}
+
 /// Each stage's work accounting from `worked`, a tree of the same plan.
 fn graft_work(stats: &mut Stats, worked: &Stats) {
-    stats.work = worked.work;
+    if worked.work.is_some() || stats.work.is_none() {
+        stats.work = worked.work;
+    }
     if stats.children.len() == worked.children.len() {
         for (s, w) in stats.children.iter_mut().zip(&worked.children) {
             graft_work(s, w);

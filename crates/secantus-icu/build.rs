@@ -62,6 +62,19 @@ fn main() {
         return;
     }
 
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    // On glibc Linux, link the C++ runtime statically, as mongod does. A
+    // dynamic `libstdc++.so.6` ties a released binary to the C++ runtime of
+    // the machine that built it, and the release workflows refuse it
+    // (`.github/scripts/check_binary_deps.py`). Where the toolchain ships no
+    // `libstdc++.a` the link falls back to the shared library.
+    let static_stdcxx = if target_os == "linux" && target_env == "gnu" {
+        static_libstdcxx_dir()
+    } else {
+        None
+    };
+
     let text = fs::read_to_string(&bazel).expect("read BUILD.bazel");
     let includes = [source.join("common"), source.join("i18n")];
     // Dependencies first in the build, last on the link line: cc emits each
@@ -71,6 +84,7 @@ fn main() {
         &[manifest.join("shim/shim.cpp")],
         &includes,
         None,
+        static_stdcxx.is_some(),
     );
     for (target, local) in [
         ("icu_i18n", Some("U_I18N_IMPLEMENTATION")),
@@ -89,14 +103,23 @@ fn main() {
             .into_iter()
             .partition(|f| f.extension().is_some_and(|e| e == "c"));
         if !cpp.is_empty() {
-            compile(&format!("secantus_{target}_cpp"), &cpp, &includes, local);
+            compile(
+                &format!("secantus_{target}_cpp"),
+                &cpp,
+                &includes,
+                local,
+                static_stdcxx.is_some(),
+            );
         }
         if !c.is_empty() {
-            compile(&format!("secantus_{target}_c"), &c, &includes, local);
+            compile(&format!("secantus_{target}_c"), &c, &includes, local, false);
         }
     }
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if let Some(dir) = &static_stdcxx {
+        // After the ICU archives on the link line, which reference it.
+        println!("cargo:rustc-link-search=native={}", dir.display());
+        println!("cargo:rustc-link-lib=static=stdc++");
+    }
     if target_os == "linux" && target_env == "gnu" {
         println!("cargo:rustc-link-lib=dylib=dl");
     }
@@ -150,7 +173,29 @@ fn srcs(text: &str, target: &str) -> Vec<String> {
     out
 }
 
-fn compile(lib: &str, files: &[PathBuf], includes: &[PathBuf], local: Option<&str>) {
+/// The directory holding the C++ compiler's `libstdc++.a`, if it has one.
+fn static_libstdcxx_dir() -> Option<PathBuf> {
+    let compiler = cc::Build::new().cpp(true).get_compiler();
+    let out = std::process::Command::new(compiler.path())
+        .arg("-print-file-name=libstdc++.a")
+        .output()
+        .ok()?;
+    let path = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim());
+    // An unknown file name is echoed back bare, not as a path.
+    if path.is_absolute() && path.is_file() {
+        path.parent().map(Path::to_path_buf)
+    } else {
+        None
+    }
+}
+
+fn compile(
+    lib: &str,
+    files: &[PathBuf],
+    includes: &[PathBuf],
+    local: Option<&str>,
+    static_stdcxx: bool,
+) {
     let cpp = files
         .iter()
         .any(|f| f.extension().is_some_and(|e| e == "cpp"));
@@ -167,6 +212,10 @@ fn compile(lib: &str, files: &[PathBuf], includes: &[PathBuf], local: Option<&st
         .cpp(cpp);
     if cpp {
         b.std("c++17");
+        if static_stdcxx {
+            // main() links the static archive instead.
+            b.cpp_link_stdlib(None);
+        }
     }
     for (k, v) in DEFINES {
         b.define(k, Some(*v));

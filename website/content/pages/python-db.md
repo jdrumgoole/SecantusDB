@@ -1,11 +1,8 @@
-Title: The Python reference implementation
+Title: Python servers (retired)
 Slug: python-db
 Save_as: python-db.html
-Template: python_db
+Template: redirect
 Status: hidden
+Redirect: /rust-db.html
 
-Summary: SecantusDB's pure-Python servers — the reference implementation the Rust servers are held to, embeddable in two lines, and the specification for everything the project does.
-
-<!-- This page renders entirely from the `python_db` template
-     (themes/secantus/templates/python_db.html). The body is intentionally
-     empty. -->
+The Python servers are deprecated. Moved to /rust-db.html.

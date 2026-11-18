@@ -1,6 +1,6 @@
 ### The Rust MongoDB server keeps mongod's query stats
 
-Set `internalQueryStatsRateLimit` off its default of 0 and `secantusd-rs` now
+Set `internalQueryStatsRateLimit` off its default of 0 and `secantusd-mdb` now
 records every `find`, `aggregate`, `distinct` and `count` that succeeds, as
 mongod 8.2 does, and `$queryStats` lists them. Each entry is filed under
 mongod's key: the query shape printed with debug type strings

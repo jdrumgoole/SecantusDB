@@ -1,13 +1,14 @@
 # Examples
 
-Each example below runs end-to-end against an embedded `SecantusDBServer`.
+Each example below runs end-to-end against a real `secantusd-mdb`, started from
+Python with the `secantusdb` launcher (`pip install SecantusDB`).
 
-Snippets use `port=0, storage_path=":memory:"` so each one is
-self-contained: an OS-assigned port avoids collisions, and the in-memory
-store leaves nothing behind on disk. **Production usage is on-disk and
-single-port** — drop `storage_path` (defaults to `./secantus-data`) and
-pick a fixed port like `27017`. See [Quickstart](quickstart.md) for the
-real-usage shape.
+Snippets use `MongoServer()`, which picks a free port and keeps the data in a
+temporary directory removed on exit, so each one is self-contained. **A
+deployed server is on-disk and single-port** — run `secantusd-mdb
+--storage-path ./secantus-data --port 27017` as a daemon and connect with
+`MongoClient("mongodb://127.0.0.1:27017")`. See [Quickstart](quickstart.md)
+for the real-usage shape.
 
 The running theme is a small wine-cellar app — bottles, regions, vintages.
 
@@ -15,9 +16,9 @@ The running theme is a small wine-cellar app — bottles, regions, vintages.
 
 ```python
 from pymongo import MongoClient
-from secantus import SecantusDBServer
+from secantusdb import MongoServer
 
-with SecantusDBServer(port=0, storage_path=":memory:") as server:
+with MongoServer() as server:
     client = MongoClient(server.uri)
     db = client["wine_cellar"]
     print(db.command("ping"))   # {'ok': 1.0}
@@ -31,9 +32,9 @@ WiredTiger cleanup, and the `:memory:` temp directory.
 
 ```python
 from pymongo import MongoClient
-from secantus import SecantusDBServer
+from secantusdb import MongoServer
 
-with SecantusDBServer(port=0, storage_path=":memory:") as server:
+with MongoServer() as server:
     bottles = MongoClient(server.uri)["wine_cellar"]["bottles"]
 
     one = bottles.insert_one(
@@ -65,9 +66,9 @@ which index was used.
 
 ```python
 from pymongo import MongoClient
-from secantus import SecantusDBServer
+from secantusdb import MongoServer
 
-with SecantusDBServer(port=0, storage_path=":memory:") as server:
+with MongoServer() as server:
     bottles = MongoClient(server.uri)["wine_cellar"]["bottles"]
 
     # Single-field ascending.
@@ -103,9 +104,9 @@ For TTL indexes (`expireAfterSeconds`) and the full picker semantics, see
 
 ```python
 from pymongo import MongoClient
-from secantus import SecantusDBServer
+from secantusdb import MongoServer
 
-with SecantusDBServer(port=0, storage_path=":memory:") as server:
+with MongoServer() as server:
     bottles = MongoClient(server.uri)["wine_cellar"]["bottles"]
     bottles.insert_many(
         [
@@ -155,9 +156,9 @@ with SecantusDBServer(port=0, storage_path=":memory:") as server:
 
 ```python
 from pymongo import MongoClient
-from secantus import SecantusDBServer
+from secantusdb import MongoServer
 
-with SecantusDBServer(port=0, storage_path=":memory:") as server:
+with MongoServer() as server:
     bottles = MongoClient(server.uri)["wine_cellar"]["bottles"]
     bottles.insert_one({"_id": 1, "name": "Pommard 2018", "drunk": False})
 
@@ -176,9 +177,9 @@ with SecantusDBServer(port=0, storage_path=":memory:") as server:
 
 ```python
 from pymongo import MongoClient
-from secantus import SecantusDBServer
+from secantusdb import MongoServer
 
-with SecantusDBServer(port=0, storage_path=":memory:") as server:
+with MongoServer() as server:
     client = MongoClient(server.uri)
     cellar = client["wine_cellar"]
     cellar["bottles"].insert_one({"name": "Pommard 2018"})
@@ -206,12 +207,12 @@ freely.
 ```python
 import pytest
 from pymongo import MongoClient
-from secantus import SecantusDBServer
+from secantusdb import MongoServer
 
 
 @pytest.fixture
 def db():
-    with SecantusDBServer(port=0, storage_path=":memory:") as server:
+    with MongoServer() as server:
         client = MongoClient(server.uri)
         try:
             yield client["wine_cellar"]
@@ -237,16 +238,14 @@ def test_index_picks_correctly(db):
 
 ## Persistent storage
 
-All examples above explicitly request `:memory:` so each snippet is
-independent. The actual default is on-disk at `./secantus-data`. To use
-a different on-disk location:
+All examples above use a temporary directory so each snippet is
+independent. To keep the data in a directory of your choice:
 
 ```python
-from secantus import SecantusDBServer
+from secantusdb import MongoServer
 
-# Drop the storage_path arg entirely to get the default ./secantus-data,
-# or pass any directory path. Created on first run, reopened intact later.
-server = SecantusDBServer(host="127.0.0.1", port=27017, storage_path="/var/lib/cellar")
+# Any directory path. Created on first run, reopened intact later.
+server = MongoServer(storage_path="/var/lib/cellar", port=27017)
 server.start()
 try:
     # ... server is now persistent at /var/lib/cellar ...

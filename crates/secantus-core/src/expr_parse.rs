@@ -168,6 +168,10 @@ fn path_error(path: &str, key: bool) -> Option<Fallback> {
 /// `Expression::parseOperand`: any value in expression position.
 pub fn operand(v: &Bson) -> R {
     match v {
+        // `FieldPath` refuses a path of `$` alone (RM-594).
+        Bson::String(s) if s == "$" => {
+            Err(Fallback::mongo(16872, "'$' by itself is not a valid FieldPath").bare())
+        }
         // A field path with a NUL in it is refused when it parses, as mongod
         // refuses it; read on, the NUL and two hex digits after it would be
         // taken for the escape of a name that is not UTF-8 (RM-222).
@@ -648,6 +652,15 @@ mod tests {
 
     fn code(v: Bson) -> Option<i32> {
         operand(&v).err().and_then(|f| f.as_mongo().map(|(c, _)| c))
+    }
+
+    #[test]
+    fn a_bare_dollar_is_no_field_path() {
+        // Measured 8.2.11, 2026-11-13 (RM-594).
+        assert_eq!(code(bson!("$")), Some(16872));
+        assert_eq!(code(bson!({"$toUpper": "$"})), Some(16872));
+        assert_eq!(code(bson!({"$concat": ["$", "x"]})), Some(16872));
+        assert_eq!(code(bson!("$$ROOT")), None);
     }
 
     #[test]

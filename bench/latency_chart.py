@@ -7,9 +7,10 @@ comparison. Reads ``bench/results/latency.json`` (written by hand from a
 - the markdown table and the inline SVG in ``docs/benchmark.md``
 - the inline SVG in ``website/themes/secantus/templates/performance.html``
 
-Both SVG blocks share one geometry (bar width = ratio * PX_PER_X - CAP,
-mongod's 1x reference line at ``X0 + PX_PER_X``); they differ only in CSS
-class prefixes and tooltip mechanism, which is what ``Style`` captures. The
+Both SVG blocks share one bar geometry (bar width = ratio * px_per_x - CAP,
+mongod's 1x reference line at ``X0 + px_per_x``). Neither draws the
+deprecated Python server; they differ only in CSS class prefixes and
+tooltip mechanism, which is what ``Style`` captures. The
 surrounding prose (the "short version" ranges) is hand-maintained — the
 script prints the fresh ranges so the prose can be checked against them.
 
@@ -54,6 +55,12 @@ class Style:
     tooltip_attr: bool  # data-tip attribute (site) vs <title> child (docs)
     rust_name: str
     py_name: str
+    # The deprecated Python servers are not drawn on either surface (Joe,
+    # 2026-11-17 for the site, 2026-11-18 for the docs).
+    show_py: bool = False
+    px_per_x: float = PX_PER_X
+    row_h: float = ROW_H
+    ticks: tuple[int, ...] = (5, 10, 15, 20, 25)
 
 
 SITE = Style(
@@ -70,6 +77,10 @@ SITE = Style(
     tooltip_attr=True,
     rust_name="Rust DB",
     py_name="Python DB",
+    show_py=False,
+    px_per_x=140.0,
+    row_h=34.0,
+    ticks=(2, 3, 4),
 )
 DOCS = Style(
     svg_class="dviz",
@@ -85,11 +96,14 @@ DOCS = Style(
     tooltip_attr=False,
     rust_name="Rust server",
     py_name="Python server",
+    px_per_x=140.0,
+    row_h=34.0,
+    ticks=(2, 3, 4),
 )
 
 
 def _bar(x_ratio: float, y: float, fill: str, tip: str, st: Style) -> str:
-    w = max(x_ratio * PX_PER_X - CAP, 1.0)
+    w = max(x_ratio * st.px_per_x - CAP, 1.0)
     path = (
         f'<path d="M{X0:.0f},{y:.0f} h{w:.1f} a{CAP},{CAP} 0 0 1 {CAP},{CAP} '
         f"v{BAR_H - 2 * CAP:.1f} a{CAP},{CAP} 0 0 1 -{CAP},{CAP} "
@@ -101,7 +115,7 @@ def _bar(x_ratio: float, y: float, fill: str, tip: str, st: Style) -> str:
 
 
 def _val(x_ratio: float, y: float, ratio_text: str, st: Style) -> str:
-    x = X0 + max(x_ratio * PX_PER_X - CAP, 1.0) + CAP + 6.0
+    x = X0 + max(x_ratio * st.px_per_x - CAP, 1.0) + CAP + 6.0
     return (
         f'<text x="{x:.1f}" y="{y:.0f}" class="{st.val}">'
         f'{ratio_text}<tspan class="{st.x}">x</tspan></text>'
@@ -109,14 +123,14 @@ def _val(x_ratio: float, y: float, ratio_text: str, st: Style) -> str:
 
 
 def render_svg(workloads: list[dict], st: Style, aria: str) -> str:
-    height = TOP + len(workloads) * ROW_H - 16.0 + 28.0
+    height = TOP + len(workloads) * st.row_h - 16.0 + 28.0
     view_h = int(round(height / 2) * 2)
     parts = [
         f'<svg viewBox="0 0 760 {view_h}" role="img" aria-label="{aria}" class="{st.svg_class}">'
     ]
-    bottom = TOP + len(workloads) * ROW_H - 26.0
-    for mult in (5, 10, 15, 20, 25):
-        x = X0 + mult * PX_PER_X
+    bottom = TOP + len(workloads) * st.row_h - 26.0
+    for mult in st.ticks:
+        x = X0 + mult * st.px_per_x
         parts.append(
             f'<line x1="{x:.1f}" y1="18" x2="{x:.1f}" y2="{bottom:.0f}" class="{st.grid}"/>'
         )
@@ -124,7 +138,7 @@ def render_svg(workloads: list[dict], st: Style, aria: str) -> str:
             f'<text x="{x:.1f}" y="{bottom + 16:.0f}" text-anchor="middle" class="{st.tick}">'
             f'{mult}<tspan class="{st.x}">x</tspan></text>'
         )
-    ref_x = X0 + PX_PER_X
+    ref_x = X0 + st.px_per_x
     parts.append(
         f'<line x1="{ref_x:.1f}" y1="18" x2="{ref_x:.1f}" y2="{bottom:.0f}" class="{st.ref}"/>'
     )
@@ -135,31 +149,30 @@ def render_svg(workloads: list[dict], st: Style, aria: str) -> str:
     y = TOP
     for w in workloads:
         rust_x = w["rust_ms"] / w["mongod_ms"]
-        py_x = w["py_ms"] / w["mongod_ms"]
         parts.append(
             f'<text x="{X0 - 10:.0f}" y="{y + 16:.0f}" text-anchor="end" class="{st.lab}">'
             f"{w['label']}</text>"
         )
         parts.append(_bar(rust_x, y, st.rust_fill, f"{st.rust_name} — {rust_x:.1f}x mongod", st))
         parts.append(_val(rust_x, y + 11, f"{rust_x:.1f}", st))
-        parts.append(_bar(py_x, y + 16, st.py_fill, f"{st.py_name} — {py_x:.1f}x mongod", st))
-        parts.append(_val(py_x, y + 27, f"{py_x:.1f}", st))
-        y += ROW_H
+        if st.show_py:
+            py_x = w["py_ms"] / w["mongod_ms"]
+            parts.append(_bar(py_x, y + 16, st.py_fill, f"{st.py_name} — {py_x:.1f}x mongod", st))
+            parts.append(_val(py_x, y + 27, f"{py_x:.1f}", st))
+        y += st.row_h
     parts.append("</svg>")
     return "".join(parts)
 
 
 def render_table(workloads: list[dict]) -> str:
     lines = [
-        "| Workload | mongod | Rust server | ×mongod | Python server | ×mongod |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| Workload | mongod | Rust server | ×mongod |",
+        "|---|---:|---:|---:|",
     ]
     for w in workloads:
         rust_x = w["rust_ms"] / w["mongod_ms"]
-        py_x = w["py_ms"] / w["mongod_ms"]
         lines.append(
-            f"| {w['md_label']} | {w['mongod_ms']:.1f} ms | {w['rust_ms']:.1f} ms | "
-            f"{rust_x:.1f}× | {w['py_ms']:.1f} ms | {py_x:.1f}× |"
+            f"| {w['md_label']} | {w['mongod_ms']:.1f} ms | {w['rust_ms']:.1f} ms | {rust_x:.1f}× |"
         )
     return "\n".join(lines)
 
@@ -177,14 +190,11 @@ def render_html_tbody(workloads: list[dict]) -> str:
     rows = []
     for w in workloads:
         rust_x = w["rust_ms"] / w["mongod_ms"]
-        py_x = w["py_ms"] / w["mongod_ms"]
         label = w["label"] + ("&#42;" if "drain" in w["label"] else "")
         rows.append(
             f"          <tr><th>{label}</th><td>{w['mongod_ms']:.1f} ms</td>"
             f"<td>{w['rust_ms']:.1f} ms</td>"
-            f'<td>{rust_x:.1f}<span class="unit-x">x</span></td>'
-            f"<td>{w['py_ms']:.1f} ms</td>"
-            f'<td>{py_x:.1f}<span class="unit-x">x</span></td></tr>'
+            f'<td>{rust_x:.1f}<span class="unit-x">x</span></td></tr>'
         )
     return "        <tbody>\n" + "\n".join(rows) + "\n        </tbody>"
 
@@ -202,7 +212,8 @@ def splice_html_tbody(path: Path, new_tbody: str) -> None:
 def splice_table(path: Path, new_table: str) -> None:
     src = path.read_text()
     out, n = re.subn(
-        r"\| Workload \| mongod \| Rust server \| ×mongod \| Python server \| ×mongod \|\n"
+        # Matches the table with or without the retired Python columns.
+        r"\| Workload \| mongod \| Rust server \| ×mongod \|(?: Python server \| ×mongod \|)?\n"
         r"(?:\|[^\n]*\|\n)+",
         new_table + "\n",
         src,
@@ -227,14 +238,8 @@ def main() -> None:
     )
     splice_html_tbody(PERF_HTML, render_html_tbody(workloads))
     rust = [w["rust_ms"] / w["mongod_ms"] for w in workloads]
-    py = [w["py_ms"] / w["mongod_ms"] for w in workloads]
-    ratio = [p / r for r, p in zip(rust, py, strict=True)]
     print(f"rewrote {DOCS_MD.relative_to(REPO)} and {PERF_HTML.relative_to(REPO)}")
-    print(
-        f"prose check — Rust: {min(rust):.1f}x–{max(rust):.1f}x of mongod; "
-        f"Python: {min(py):.1f}x–{max(py):.1f}x; "
-        f"Rust vs Python: {min(ratio):.1f}x–{max(ratio):.1f}x"
-    )
+    print(f"prose check — Rust: {min(rust):.1f}x–{max(rust):.1f}x of mongod")
     print("review the hand-maintained prose around both charts against these ranges")
 
 

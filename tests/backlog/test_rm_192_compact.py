@@ -362,7 +362,7 @@ def _start(store: str) -> tuple[subprocess.Popen, pymongo.MongoClient]:
         m = _RS_BANNER.search(line)
         if m or not line:
             break
-    assert m, f"secantusd-rs did not start: {line!r}"
+    assert m, f"secantusd-mdb did not start: {line!r}"
     drain_output(proc)
     return proc, pymongo.MongoClient(host=m.group(1), port=int(m.group(2)))
 

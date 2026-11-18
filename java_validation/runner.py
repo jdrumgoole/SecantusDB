@@ -164,7 +164,7 @@ def default_forks(environ: Mapping[str, str]) -> int:
     (``JavaDriverTest``) shared by every class. With several forks, a fork
     that finishes drops the database under the forks still running.
 
-    Measured 2026-10-09 with a logging proxy in front of ``secantusd-rs``: a
+    Measured 2026-10-09 with a logging proxy in front of ``secantusd-mdb``: a
     ``dropDatabase JavaDriverTest`` from another connection arrived 2 ms
     before ``MongoCollectionTest`` read back two documents it had just
     inserted, and the read returned none. Twelve forks produced one such

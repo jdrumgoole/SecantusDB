@@ -2,7 +2,7 @@
 
 Measured 2026-10-15 (raw artifact), generated 2026-10-15 — SecantusDB 0.7.0b3 vs mongo-java-driver cb45be6bb147 (`vendor/mongo-java-driver/`).
 
-Run `uv run python -m invoke validate-java --server rust` to refresh. The same unmodified suite as `docs/validation-report-java.md`, pointed at the standalone **Rust server** (`secantusd-rs`) instead of the Python one — the gap between the two reports is part of the Rust server's remaining to-do list.
+Run `uv run python -m invoke validate-java --server rust` to refresh. The same unmodified suite as `docs/validation-report-java.md`, pointed at the standalone **Rust server** (`secantusd-mdb`) instead of the Python one — the gap between the two reports is part of the Rust server's remaining to-do list.
 
 ## Scope
 
@@ -21,7 +21,7 @@ Run `uv run python -m invoke validate-java --server rust` to refresh. The same u
 
 **mongo-java-driver's tests are run unmodified, against a standalone SecantusDB daemon.** The submodule at `vendor/mongo-java-driver/` is checked out at the pinned upstream tag with zero local edits. `java_validation/runner.py` does a two-phase spawn: phase 1 boots `python -m secantus --port 27018 --storage-path <tempdir> --standalone` without `--auth` and uses pymongo to createUser `root-user` (root role); phase 2 stops that daemon and restarts on the same tempdir **with `--auth`**, so the user record persists and the server now enforces auth. Gradle then runs the driver's bundled wrapper (`./gradlew --no-daemon -Dorg.mongodb.test.uri=mongodb://root-user:password@127.0.0.1:27018/?authSource=admin`) for the in-scope modules in `java_validation/include_modules.py`. The system property is the seam Java's `ClusterFixture` test infrastructure reads; Gradle forwards it to the test JVM. Standalone topology is critical: without `--standalone` the driver's `getSecondary()` is an unbounded sleep loop on non-RS deployments.
 
-In `--server rust` mode the same two-phase spawn runs the standalone `secantusd-rs` binary (via `gauge_common.for_server`, same flags) instead of `python -m secantus`, so the numbers above measure the Rust server.
+In `--server rust` mode the same two-phase spawn runs the standalone `secantusd-mdb` binary (via `gauge_common.for_server`, same flags) instead of `python -m secantus`, so the numbers above measure the Rust server.
 
 These are **integration specs** under `driver-sync/src/test/functional/` — every test opens a real TCP connection to the SecantusDB daemon, SCRAM-authenticates, and exchanges wire commands end-to-end. The pass rate is therefore a true measure of SecantusDB's compatibility with the Java driver, not of the driver's own pure-code logic.
 

@@ -355,7 +355,7 @@ def concurrency_refresh(
     """Re-measure N-writer scaling and refresh the concurrency graphs.
 
     Runs ``bench.concurrency --server all`` (python, rust, rust-async,
-    mongod — needs ``mongod`` on PATH and a built ``secantusd-rs``) with
+    mongod — needs ``mongod`` on PATH and a built ``secantusd-mdb``) with
     interleaved runs, writes the medians to
     ``bench/results/concurrency.json``, then regenerates the
     marker-delimited chart + table blocks in
@@ -2413,10 +2413,10 @@ def changelog_collate(c: Context) -> None:
 
 
 _PYPI_STOPPED = (
-    "SecantusDB no longer publishes to PyPI (Joe, 2026-10-20): the Python servers "
-    "are fully deprecated, and the Rust servers ship as crates and tagged GitHub "
-    "binaries. Cut a Rust release with a `secantusdb-v*` or `secantusd-pg-v*` tag "
-    "(see the secantusdb-release skill)."
+    "SecantusDB no longer publishes the Python servers (Joe, 2026-10-20). The "
+    "PyPI wheel now carries the two Rust servers and is published by "
+    "publish-pypi.yml after each `secantusdb-v*` release. Cut a Rust release with "
+    "a `secantusdb-v*` or `secantusd-pg-v*` tag (see the secantusdb-release skill)."
 )
 
 

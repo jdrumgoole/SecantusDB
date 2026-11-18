@@ -166,7 +166,7 @@ def _start(store: Any) -> tuple[subprocess.Popen, Any]:
     )
     assert proc.stdout is not None
     m = _RS_BANNER.search(proc.stdout.readline())
-    assert m, "secantusd-rs did not start"
+    assert m, "secantusd-mdb did not start"
     drain_output(proc)
     client = pymongo.MongoClient(host=m.group(1), port=int(m.group(2)), directConnection=True)
     return proc, client

@@ -60,12 +60,14 @@ def test_scaling_ratios() -> None:
 
 
 def test_render_viz_structure(results: dict) -> None:
-    for style, prefix in [("website", "viz"), ("docs", "dv")]:
+    # Neither surface draws the deprecated Python series, even when the
+    # results carry it.
+    for style, prefix, lines in [("website", "viz", 3), ("docs", "dv", 3)]:
         svg = render_viz(results, style)
-        assert svg.count("<path ") == 4
-        assert svg.count("<circle ") == 16
+        assert svg.count("<path ") == lines
+        assert svg.count("<circle ") == 4 * lines
         assert svg.count('stroke-dasharray="6 4"') == 1
-        assert svg.count(f'class="{prefix}-val"') == 4
+        assert svg.count(f'class="{prefix}-val"') == lines
         # the 1x reference line plus 2x/3x/4x gridlines for this data
         assert f'class="{prefix}-ref"' in svg
         assert svg.count(f'class="{prefix}-grid"') == 3
@@ -74,11 +76,12 @@ def test_render_viz_structure(results: dict) -> None:
 def test_render_viz_tooltips(results: dict) -> None:
     website = render_viz(results, "website")
     assert 'data-tip="mongod — 2 writers: 1.92x its 1-writer rate"' in website
-    assert 'data-tip="Python DB — 8 writers: 0.63x its 1-writer rate"' in website
+    assert "Python" not in website
     assert "<title>" not in website
     docs = render_viz(results, "docs")
     assert "<title>Rust server — 8 writers: 2.72x its single-writer rate</title>" in docs
     assert "data-tip" not in docs
+    assert "Python" not in docs
 
 
 def test_render_viz_singular_writer_phrase(results: dict) -> None:
@@ -89,10 +92,11 @@ def test_render_viz_singular_writer_phrase(results: dict) -> None:
 
 def test_render_tables(results: dict) -> None:
     website = render_website_table(results)
-    row = "<tr><th>1</th><td>105,700</td><td>35,400</td><td>50,400</td><td>12,100</td></tr>"
+    row = "<tr><th>1</th><td>105,700</td><td>35,400</td><td>50,400</td></tr>"
     assert row in website
     docs = render_docs_table(results)
-    assert "| 8 | 7,600 | 96,400 | 119,200 | 481,000 |" in docs
+    assert "| 8 | 96,400 | 119,200 | 481,000 |" in docs
+    assert "Python" not in docs
 
 
 def test_nudge_labels_separates_collisions() -> None:

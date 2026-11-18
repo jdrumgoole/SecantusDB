@@ -270,57 +270,35 @@ fn plan_info_with(
         out.summary = Some("EOF".to_string());
         return out;
     }
-    let Ok(collation) = crate::util::effective_collation(storage, db, &s.coll, &s.options) else {
+    let Some(mut node) = planned(storage, db, &s) else {
         return out;
     };
-    let Ok(full) = catalog(storage, db, &s.coll, None) else {
-        return out;
-    };
-    let (catalog, _) = crate::index_filters::apply(
-        storage,
-        db,
-        &s.coll,
-        &s.filter,
-        s.sort.as_ref(),
-        s.projection.as_ref(),
-        collation.as_ref(),
-        full,
-    );
-    let Ok(hint) = resolve_hint(s.hint.as_ref(), &catalog) else {
-        return out;
-    };
-    let canonical = parsed::parsed_query(&s.filter);
-    let implies = |partial: &Document| storage.query_implies_partial(&s.filter, partial);
-    let q = Query {
-        canonical: &canonical,
-        sort: s.sort.as_ref(),
-        projection: s.projection.as_ref(),
-        skip: s.skip,
-        limit: s.limit,
-        hint,
-        collation: collation.as_ref(),
-        min_max: s.min_max.is_some(),
-        return_key: s.return_key,
-        show_record_id: s.show_record_id,
-        batch_size: s.batch_size,
-        keys_only: false,
-        wanted: None,
-        sbe: false,
-        implies: &implies,
-        trial: None,
-    };
-    let node = match &s.kind {
-        Kind::Find => plan::plan(&q, &catalog),
-        Kind::Count => plan::count(&q, &catalog),
-        Kind::Distinct(key) => plan::distinct(&q, &catalog, key, !s.filter.is_empty()),
-        _ => return out,
-    };
+    let collation = crate::util::effective_collation(storage, db, &s.coll, &s.options)
+        .ok()
+        .flatten();
+    // A group that reads no field counts the keys of a plan of one index
+    // scan: mongod names the COUNT_SCAN it runs (RM-494).
+    if name == "aggregate" && super::shape_counts_keys(storage, db, &s, collation.as_ref(), &stages)
+    {
+        if let Some(scan) = super::count_scan_of(&node) {
+            node = scan;
+        }
+    }
     let buckets = storage
         .get_collection_options(db, &s.coll)
         .ok()
         .and_then(|options| Layout::of(&options));
     let mut leaves_of = Vec::new();
     leaves(&node.to_doc(None), buckets.as_ref(), &mut leaves_of);
+    // mongod clusters a time-series collection's buckets by `_id`, whose
+    // timestamp is each bucket's start, so a Date bound on the time field
+    // bounds the `_id`s a scan reads: it names a CLUSTERED_IXSCAN where
+    // this plan scans the whole collection (RM-600).
+    if let Some(layout) = &buckets {
+        if leaves_of == ["COLLSCAN"] && bounds_time(&s.filter, &layout.time) {
+            leaves_of = vec!["CLUSTERED_IXSCAN".to_string()];
+        }
+    }
     out.summary = (!leaves_of.is_empty()).then(|| leaves_of.join(", "));
     let scan = match &node {
         Node::Projection { input, .. } => input.as_ref(),
@@ -349,6 +327,139 @@ fn plan_info_with(
     }
     out
 }
+/// Whether `filter` bounds the time field `time` by a Date, in a conjunct
+/// mongod turns into bounds on a time-series collection's clustered `_id`
+/// (measured 8.2.11, 2026-11-17): `$eq` (or an implicit one), `$gt`,
+/// `$gte`, `$lt`, `$lte`, an `$in` of one Date, under `$and` or in an
+/// `$expr` comparison of `$<time>` and a Date. A bound by any other type,
+/// `$ne`, `$not`, `$nor` or one arm of an `$or` bounds nothing.
+fn bounds_time(filter: &Document, time: &str) -> bool {
+    let date = |v: &Bson| matches!(v, Bson::DateTime(_));
+    filter
+        .iter()
+        .any(|(key, value)| match (key.as_str(), value) {
+            ("$and", Bson::Array(arms)) => arms
+                .iter()
+                .filter_map(Bson::as_document)
+                .any(|arm| bounds_time(arm, time)),
+            ("$expr", Bson::Document(expr)) => expr.iter().any(|(op, args)| {
+                matches!(op.as_str(), "$eq" | "$gt" | "$gte" | "$lt" | "$lte")
+                    && matches!(args, Bson::Array(a) if a.len() == 2
+                    && a[0].as_str() == Some(&format!("${time}"))
+                    && date(&a[1]))
+            }),
+            (field, Bson::Document(ops))
+                if field == time && ops.keys().all(|k| k.starts_with('$')) =>
+            {
+                ops.iter().any(|(op, v)| match op.as_str() {
+                    "$eq" | "$gt" | "$gte" | "$lt" | "$lte" => date(v),
+                    "$in" => matches!(v, Bson::Array(a) if a.len() == 1 && date(&a[0])),
+                    _ => false,
+                })
+            }
+            (field, v) if field == time => date(v),
+            _ => false,
+        })
+}
+
+/// The plan [`plan_info`] names for the read shaped `s` on `db`, planned
+/// apart from the plan cache. `None`: no such plan.
+fn planned(storage: &dyn crate::storage::Storage, db: &str, s: &Shape) -> Option<Node> {
+    let Ok(collation) = crate::util::effective_collation(storage, db, &s.coll, &s.options) else {
+        return None;
+    };
+    let Ok(full) = catalog(storage, db, &s.coll, None) else {
+        return None;
+    };
+    let (catalog, _) = crate::index_filters::apply(
+        storage,
+        db,
+        &s.coll,
+        &s.filter,
+        s.sort.as_ref(),
+        s.projection.as_ref(),
+        collation.as_ref(),
+        full,
+    );
+    let Ok(hint) = resolve_hint(s.hint.as_ref(), &catalog) else {
+        return None;
+    };
+    let canonical = parsed::parsed_query(&s.filter);
+    let implies = |partial: &Document| storage.query_implies_partial(&s.filter, partial);
+    let q = Query {
+        canonical: &canonical,
+        sort: s.sort.as_ref(),
+        projection: s.projection.as_ref(),
+        skip: s.skip,
+        limit: s.limit,
+        hint,
+        collation: collation.as_ref(),
+        min_max: s.min_max.is_some(),
+        return_key: s.return_key,
+        show_record_id: s.show_record_id,
+        batch_size: s.batch_size,
+        keys_only: false,
+        wanted: None,
+        sbe: false,
+        implies: &implies,
+        trial: None,
+    };
+    Some(match &s.kind {
+        Kind::Find => plan::plan(&q, &catalog),
+        Kind::Count => plan::count(&q, &catalog),
+        Kind::Distinct(key) => plan::distinct(&q, &catalog, key, !s.filter.is_empty()),
+        _ => return None,
+    })
+}
+
+/// What a plan examined, `(keys, docs)`, as it returned each document,
+/// and in all.
+pub(crate) type Examined = (Vec<(i64, i64)>, (i64, i64));
+
+/// What a `find` of `request` examined, for a read that did not count it
+/// as it read (a clustered collection's, which no stream reads): its plan
+/// run over the collection's documents, as `explain`'s `executionStats`
+/// runs it, with where each returned document left the count, for a read
+/// whose cursor stays open (RM-586, RM-708). `None`: not a `find` of a
+/// collection there is.
+pub(crate) fn find_examined_marks(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    request: &Document,
+) -> Option<Examined> {
+    let s = shape_of(request)?;
+    if !matches!(s.kind, Kind::Find) || !storage.collection_exists(db, &s.coll).unwrap_or(false) {
+        return None;
+    }
+    let node = planned(storage, db, &s)?;
+    let collation = crate::util::effective_collation(storage, db, &s.coll, &s.options).ok()?;
+    let raw = storage
+        .find_collated(
+            db,
+            &s.coll,
+            &Document::new(),
+            None,
+            None,
+            None,
+            &Document::new(),
+        )
+        .ok()?;
+    let docs = crate::util::decode_docs(raw).ok()?;
+    let env = super::exec::Env {
+        docs: &docs,
+        collation: collation.as_ref(),
+        skip: s.skip,
+        limit: s.limit,
+        multi: true,
+        upsert: false,
+        returns: false,
+        known: None,
+        query: Some(&s.filter),
+    };
+    let (marks, stats) = super::exec::run_marks(&node, &env);
+    Some((marks, stats.totals()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,6 +495,35 @@ mod tests {
             "EXPRESS_IXSCAN { _id: 1 }"
         );
         assert_eq!(summary(doc! {"stage": "EOF"}), "EOF");
+    }
+
+    /// The bounds on a time field mongod 8.2.11 read as a CLUSTERED_IXSCAN
+    /// of the buckets (RM-600), and the ones it read as a COLLSCAN.
+    #[test]
+    fn a_date_bound_on_the_time_field_bounds_the_clustered_buckets() {
+        let d = Bson::DateTime(bson::DateTime::from_millis(1_704_412_800_000));
+        for f in [
+            doc! {"t": {"$gt": d.clone()}},
+            doc! {"t": {"$lte": d.clone()}},
+            doc! {"t": d.clone()},
+            doc! {"t": {"$in": [d.clone()]}},
+            doc! {"t": {"$gt": d.clone(), "$lt": 5}},
+            doc! {"v": 1, "$and": [{"t": {"$gte": d.clone()}}]},
+            doc! {"$expr": {"$gt": ["$t", d.clone()]}},
+        ] {
+            assert!(bounds_time(&f, "t"), "{f}");
+        }
+        for f in [
+            doc! {"t": {"$gt": 5}},
+            doc! {"t": {"$ne": d.clone()}},
+            doc! {"t": {"$not": {"$lt": d.clone()}}},
+            doc! {"t": {"$in": [d.clone(), 5]}},
+            doc! {"$or": [{"t": {"$gt": d.clone()}}, {"v": 1}]},
+            doc! {"$nor": [{"t": {"$lt": d.clone()}}]},
+            doc! {"u": {"$gt": d.clone()}},
+        ] {
+            assert!(!bounds_time(&f, "t"), "{f}");
+        }
     }
 
     /// A time-series collection's indexes as mongod 8.2.11 named them in

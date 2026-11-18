@@ -20,11 +20,11 @@ def _first_batch(client: Any, command: dict) -> Any:
         client.drop_database(db.name)
 
 
-@pytest.mark.backlog("RM-703")
+@pytest.mark.backlog_fixed("RM-703")
 def test_find_keeps_a_sort_key_meta_field(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 gives each document its sort key as an array, the
     smallest element of an array under an ascending sort. This server
-    omits the field."""
+    omitted the field."""
     command = {
         "find": "c",
         "filter": {},
@@ -33,6 +33,25 @@ def test_find_keeps_a_sort_key_meta_field(rust_mongo: Any, mongod: Any) -> None:
     }
     answers = {s: _first_batch(c, command) for s, c in (("mongod", mongod), ("rust", rust_mongo))}
     assert answers["mongod"] == [{"_id": 1, "x": [3, 1], "k": [1]}, {"_id": 2, "x": 2, "k": [2]}]
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-703")
+def test_find_keeps_a_sort_key_meta_field_across_get_more(rust_mongo: Any, mongod: Any) -> None:
+    """The sort key stays on documents a getMore returns, beside an
+    inclusion, under a descending compound sort (mongod 8.2.11)."""
+
+    def answer(client: Any) -> list:
+        db = client["rm_found_568_" + uuid.uuid4().hex[:8]]
+        db.c.insert_many([{"_id": n, "x": n % 3, "y": n} for n in range(5)])
+        try:
+            cur = db.c.find({}, {"x": 1, "k": {"$meta": "sortKey"}}).sort([("x", -1), ("y", 1)])
+            return list(cur.batch_size(2))
+        finally:
+            client.drop_database(db.name)
+
+    answers = {s: answer(c) for s, c in (("mongod", mongod), ("rust", rust_mongo))}
+    assert answers["mongod"][0] == {"_id": 2, "x": 2, "k": [2, 2]}
     assert answers["rust"] == answers["mongod"]
 
 

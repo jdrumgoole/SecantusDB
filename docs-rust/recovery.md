@@ -1,11 +1,10 @@
 # Backup and point-in-time recovery
 
-The Rust server has the same oplog-backed backup/recovery model as the
-Python server — hot backup archives over the wire, plus offline
-point-in-time restore. Archives are **portable between the two servers**:
-a backup taken from either restores on either. The concept-level docs are
-in the main tree's [Recovery](https://secantusdb.com/docs/recovery.html)
-page; this is the Rust-server surface.
+The Rust server has an oplog-backed backup/recovery model — hot backup
+archives over the wire, plus offline point-in-time restore. The
+concept-level docs are in the main tree's
+[Recovery](https://secantusdb.com/docs/recovery.html) page; this is the
+Rust-server surface.
 
 ## Hot backup (over the wire)
 
@@ -26,11 +25,10 @@ live retention window.
 ## Point-in-time restore (CLI)
 
 The Rust server's point-in-time restore is a subcommand of the binary
-(the Python server additionally exposes it over the wire as
-`secantusAdmin.restoreToTimestamp`):
+(there is no `secantusAdmin.restoreToTimestamp` wire command):
 
 ```
-secantusd-rs restore --source PATH --target-dir PATH [--to-timestamp SECS[,ORD]]
+secantusd-mdb restore --source PATH --target-dir PATH [--to-timestamp SECS[,ORD]]
 ```
 
 It rebuilds a fresh data directory as the database was at the target time
@@ -52,18 +50,17 @@ Typical flow:
 ```bash
 # 1. Stop the server (or extract a backup archive).
 # 2. Replay to the moment before the bad deploy:
-secantusd-rs restore \
+secantusd-mdb restore \
     --source ./secantus-data \
     --target-dir ./secantus-data-restored \
     --to-timestamp 1752694800
 # 3. Start fresh on the restored directory:
-secantusd-rs --port 27017 --storage-path ./secantus-data-restored
+secantusd-mdb --port 27017 --storage-path ./secantus-data-restored
 ```
 
 ## Durability knobs
 
 WiredTiger journals every commit; `--sync-on-commit` additionally fsyncs
 per commit (the `writeConcern j: true` guarantee) at a substantial
-throughput cost. Crash recovery is WiredTiger log replay on startup —
-identical semantics to the Python server, because it is literally the same
-storage engine.
+throughput cost. Crash recovery is WiredTiger log replay on startup — the
+same storage engine `mongod` ships.

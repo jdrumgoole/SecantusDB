@@ -7,8 +7,8 @@ This module lets each gauge runner target either server, selected by the
 ``rust``), mirroring the pymongo gauge's ``invoke validate --server rust``.
 
 - **Python server**: ``python -m secantus <args>`` (unchanged).
-- **Rust server**: the standalone ``secantusd-rs`` binary
-  (``crates/secantusdb/target/{release,debug}/secantusd-rs`` or ``$SECANTUSDB_BIN``).
+- **Rust server**: the standalone ``secantusd-mdb`` binary
+  (``crates/secantusdb/target/{release,debug}/secantusd-mdb`` or ``$SECANTUSDB_BIN``).
   The binary doesn't yet accept the Python server's tuning flags (``--log-level``
   / ``--noop-heartbeat-seconds`` / ``--cache-size`` / ``--session-max`` /
   ``--sync-on-commit`` — R7 tail), so [`for_server`] strips them.
@@ -34,14 +34,14 @@ import time
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent
 
 # Both servers print "listening on <host>:<port>" once bound:
-#   rust:   "secantusd-rs listening on 127.0.0.1:59091"   (stdout)
+#   rust:   "secantusd-mdb listening on 127.0.0.1:59091"   (stdout)
 #   python: "... secantus.server: secantus listening on 127.0.0.1:59092"  (stderr)
 _LISTENING_RE = re.compile(r"listening on (\d{1,3}(?:\.\d{1,3}){3}):(\d+)")
 
 # Python-server-only daemon flags the `secantusdb` binary doesn't accept yet;
 # each takes a following value, dropped together when targeting the Rust server.
 #
-# EMPTY since 2026-09-30: `secantusd-rs --help` accepts every flag this used to
+# EMPTY since 2026-09-30: `secantusd-mdb --help` accepts every flag this used to
 # list (`--log-level`, `--noop-heartbeat-seconds`, `--cache-size`,
 # `--session-max`, `--sync-on-commit`, `--oplog-retention-seconds`), so
 # stripping them only hid behaviour from the Rust gauges -- the Go gauge's
@@ -87,7 +87,7 @@ def rust_binary() -> str:
         _require_fresh(pathlib.Path(env))
         return env
     for profile in ("release", "debug"):
-        p = _REPO_ROOT / "crates" / "secantusdb" / "target" / profile / "secantusd-rs"
+        p = _REPO_ROOT / "crates" / "secantusdb" / "target" / profile / "secantusd-mdb"
         if p.exists():
             _require_fresh(p)
             return str(p)

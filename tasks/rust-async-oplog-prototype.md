@@ -161,7 +161,7 @@ Productization landed (Phase C of the concurrency-parity plan):
 
 - ~~**Config surface.**~~ DONE — `StorageOptions` on the storage crate;
   `RustServer(oplog_async=…, oplog_nonlogged=…, data_nonlogged=…,
-  checkpoint_seconds=…)` kwargs; `secantusd-rs --oplog-async /
+  checkpoint_seconds=…)` kwargs; `secantusd-mdb --oplog-async /
   --oplog-nonlogged / --data-nonlogged / --checkpoint-seconds` +
   `[storage]` TOML keys. `None`/unset defers to the `SECANTUS_*` env vars.
 - ~~**`prune_oplog` under async:**~~ DONE — `drain_pending_oplog` mirrors the

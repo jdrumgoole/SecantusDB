@@ -244,6 +244,7 @@ impl CmdStorage for StorageAdapter {
             new_store: r.new_store,
             wt_config: r.wt_config.clone(),
             wt_open: r.wt_open,
+            wt_messages: r.wt_messages.clone(),
             open: r.open,
         })
     }

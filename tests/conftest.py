@@ -20,6 +20,7 @@ import importlib.machinery
 import importlib.util
 import os
 import pathlib
+import signal
 import sys
 import threading
 import time
@@ -317,7 +318,7 @@ def _check_artifact_build_provenance() -> None:
 
     for name, rel, rebuild in (
         ("secantusd-pg", provenance.PGSERVER_REL, provenance.REBUILD_PGSERVER_CMD),
-        ("secantusd-rs", provenance.RS_REL, provenance.REBUILD_RS_CMD),
+        ("secantusd-mdb", provenance.RS_REL, provenance.REBUILD_RS_CMD),
     ):
         # `binary_staleness` resolves the Windows `.exe` suffix and abstains on a
         # binary that does not exist -- its tests skip, so there is nothing to be
@@ -526,7 +527,7 @@ def _cap_file_size() -> None:
     failed with "No space left on device". Nothing a test writes needs to be
     anywhere near that size, so the soft `RLIMIT_FSIZE` is lowered here, in
     every pytest process, and every process it starts -- mongod,
-    `secantusd-rs`, `secantusd-pg`, `pg_dump` -- inherits it. A child that
+    `secantusd-mdb`, `secantusd-pg`, `pg_dump` -- inherits it. A child that
     writes past it is killed by SIGXFSZ (`subprocess` restores that signal's
     default in the child), which surfaces as a dead server and a failing
     test: the runaway is reported, not silently absorbed. Inside pytest
@@ -567,6 +568,7 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     # runs strictly after every pytest_configure, so our file wins and stays the
     # fatal-signal target for the whole run.
     _arm_crash_faulthandler(session.config)
+    _arm_worker_stack_dump(session.config)
 
 
 def _reap_abandoned_pytest_tmp(config: pytest.Config) -> None:
@@ -908,6 +910,137 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         session.exitstatus = 1
 
 
+# --- Stall dump of the xdist WORKERS (RM-254) --------------------------------
+#
+# The controller's stall report used to print only the controller's own
+# threads, which on a stall are always the same idle ``execnet`` receive loops:
+# the hung test lives in a WORKER (or in a server a worker started) and the
+# dump never named it. A worker therefore registers a ``faulthandler`` SIGUSR1
+# handler that writes every thread's stack to a file named after the
+# CONTROLLER's pid (a popen worker's parent), and the controller signals each
+# of its children at stall time, then prints the files plus a listing (and,
+# where a sampler exists, a native sample) of every deeper descendant -- the
+# servers the workers started.
+#
+# A file, not stderr: pytest's fd capture has redirected fd 2 by the time any
+# test runs, so a registered stderr handle would write into the capture buffer.
+# faulthandler's handler runs in C, so it answers even a worker whose GIL is
+# held by a wedged thread.
+_STALL_WORKER_SIGNAL = getattr(signal, "SIGUSR1", None)
+_worker_dump_file = None  # held open for the process lifetime, like _crash_dump_file
+
+
+def _worker_dump_path(controller_pid: int, worker: str) -> str:
+    import tempfile
+
+    return os.path.join(
+        tempfile.gettempdir(), f"secantus-stall-{controller_pid}", f"{worker}-{os.getpid()}.txt"
+    )
+
+
+def _arm_worker_stack_dump(config: pytest.Config) -> None:
+    """In an xdist worker, make SIGUSR1 dump every thread's stack to a file."""
+    global _worker_dump_file
+    workerinput = getattr(config, "workerinput", None)
+    if workerinput is None or _STALL_WORKER_SIGNAL is None:
+        return
+    try:
+        path = _worker_dump_path(os.getppid(), str(workerinput.get("workerid", "gw?")))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        _worker_dump_file = open(path, "w", buffering=1)  # noqa: SIM115 - process lifetime
+        faulthandler.register(
+            _STALL_WORKER_SIGNAL, file=_worker_dump_file, all_threads=True, chain=False
+        )
+    except OSError as exc:
+        sys.stderr.write(f"could not arm the worker stall dump: {exc}\n")
+
+
+def _process_table() -> dict[int, tuple[int, str]]:
+    """``{pid: (ppid, command)}`` for every process; empty where ``ps`` fails."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    table: dict[int, tuple[int, str]] = {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
+    return table
+
+
+def _native_sample(pid: int) -> str:
+    """Best-effort native stack of ``pid`` (macOS ``sample``, else ``gdb``)."""
+    import shutil
+    import subprocess
+
+    if shutil.which("sample"):
+        cmd = ["sample", str(pid), "1", "-mayDie"]
+    elif shutil.which("gdb"):
+        cmd = ["gdb", "-p", str(pid), "-batch", "-ex", "thread apply all bt"]
+    else:
+        return "(no native sampler: neither `sample` nor `gdb` on PATH)"
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"(native sample failed: {exc!r})"
+    return (r.stdout + r.stderr)[-20000:]
+
+
+def _dump_worker_stacks(out) -> None:
+    """Print each worker's thread stacks and every server process below them."""
+    import shutil
+
+    table = _process_table()
+    me = os.getpid()
+    workers = sorted(p for p, (pp, _) in table.items() if pp == me)
+    out.write(f"=== xdist workers (children of controller {me}): {workers or 'none found'} ===\n")
+    if _STALL_WORKER_SIGNAL is not None:
+        for pid in workers:
+            try:
+                os.kill(pid, _STALL_WORKER_SIGNAL)
+            except OSError as exc:
+                out.write(f"could not signal worker {pid}: {exc}\n")
+        time.sleep(2.0)  # let each worker's C-level handler finish writing
+    dump_dir = os.path.dirname(_worker_dump_path(me, "x"))
+    try:
+        names = sorted(os.listdir(dump_dir))
+    except OSError:
+        names = []
+    for name in names:
+        out.write(f"\n--- worker thread stacks: {name} ---\n")
+        try:
+            with open(os.path.join(dump_dir, name)) as fh:
+                out.write(fh.read() or "(empty: worker did not answer SIGUSR1)\n")
+        except OSError as exc:
+            out.write(f"(unreadable: {exc})\n")
+    if not names:
+        out.write("(no worker stack files: workers did not arm the dump)\n")
+    shutil.rmtree(dump_dir, ignore_errors=True)
+    # Descendants below the workers: the servers they started (and their kids).
+    owned = set(workers)
+    servers: list[int] = []
+    changed = True
+    while changed:
+        changed = False
+        for pid, (pp, _) in table.items():
+            if pp in owned and pid not in owned:
+                owned.add(pid)
+                servers.append(pid)
+                changed = True
+    out.write(f"\n=== processes started by the workers: {len(servers)} ===\n")
+    for pid in sorted(servers):
+        pp, cmd = table[pid]
+        out.write(f"  pid {pid} ppid {pp}: {cmd[:300]}\n")
+    for pid in sorted(servers)[:8]:  # bounded: a sample is seconds per process
+        out.write(f"\n--- native stack of pid {pid} ---\n{_native_sample(pid)}\n")
+    out.flush()
+
+
 def _stall_trigger(
     now: float,
     last_progress_at: float,
@@ -1000,6 +1133,10 @@ def _arm_stall_watchdog(config: pytest.Config) -> None:
                 "worker, and this process is the controller. Thread stacks follow.\n\n"
             )
             faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            try:
+                _dump_worker_stacks(sys.stderr)
+            except Exception as exc:  # noqa: BLE001 - a diagnostic must never block the exit
+                sys.stderr.write(f"worker stack dump failed: {exc!r}\n")
             sys.stderr.write("\n=== exiting non-zero to fail fast ===\n")
             sys.stderr.flush()
             # os._exit, not sys.exit: this is a daemon thread, and a wedged

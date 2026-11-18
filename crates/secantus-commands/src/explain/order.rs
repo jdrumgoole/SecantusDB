@@ -1286,27 +1286,34 @@ fn tried(
     catalog: &[Arc<super::IndexInfo>],
     canonical: &Document,
 ) -> Result<Option<(Node, Option<TrialBuffer>)>, StorageError> {
-    let Some(matched) = storage.matching_rows(
-        ask.db,
-        ask.coll,
-        ask.filter,
-        ask.hint,
-        ask.collation,
-        ask.vars,
-    )?
-    else {
-        return Ok(None);
+    // A trial that can run the filters itself reads only what its plans
+    // reach, as mongod's does (RM-610); otherwise it is given every match.
+    let lazy = trial_runs_filters(ask, query, catalog);
+    let rows = if lazy {
+        None
+    } else {
+        let Some(matched) = storage.matching_rows(
+            ask.db,
+            ask.coll,
+            ask.filter,
+            ask.hint,
+            ask.collation,
+            ask.vars,
+        )?
+        else {
+            return Ok(None);
+        };
+        Some(matched.rows)
     };
-    let rows = matched.rows;
     let hook = if ask.hint.is_none() {
         ReadCache::new(storage, ask, canonical.clone(), catalog_of(storage, ask)?)?
     } else {
         None
     };
-    let whole = Lazy::new(storage, ask, Some(&rows), catalog, canonical);
+    let whole = Lazy::new(storage, ask, rows.as_ref(), catalog, canonical);
     let trial = plan::Trial {
         total: None,
-        matched: Some(rows.len()),
+        matched: rows.as_ref().map(|r| r.len()),
         whole: &whole,
         ranked: Default::default(),
         cache: hook.as_ref().map(|h| h as &dyn plan::CacheHook),
@@ -2557,12 +2564,11 @@ pub(crate) fn counted_plan(
 }
 
 /// Whether a contested `planned` read is tried here, before anything is
-/// read (RM-390): a write of many, which mongod tries over what its
-/// candidate plans reach and then writes each document the winner returns,
-/// so that one out of time part-way has written some. Not a sort, a geo
-/// predicate (read with its own scan), an `$expr`, whose variables the
-/// trial's filters are not given, or candidates a stream does not run (an
-/// index intersection, a rooted `$or`'s branches), which would leave the
+/// read: a write, which mongod tries over what its candidate plans reach
+/// and then writes each document the winner returns, so that a write of
+/// many out of time part-way has written some (RM-390) and a write of one
+/// reads only as far as its document (RM-610). Not when the trial cannot
+/// run the filters itself ([`trial_runs_filters`]), which would leave the
 /// write to plan through the cache a second time.
 fn tries_write(
     ask: &Ask,
@@ -2570,8 +2576,17 @@ fn tries_write(
     query: &Query,
     catalog: &[Arc<super::IndexInfo>],
 ) -> bool {
-    matches!(planned, Planned::Write { multi: true, .. })
-        && ask.hint.is_none()
+    matches!(planned, Planned::Write { .. }) && trial_runs_filters(ask, query, catalog)
+}
+
+/// Whether mongod's trial of a contested read can be run here over only
+/// what its candidates' scans reach, the filters run by the trial itself
+/// (RM-390, RM-610), rather than over every match read first: no hint, no
+/// sort, no geo predicate (read with its own scan), no `$expr`, whose
+/// variables the trial's filters are not given, and candidates that each
+/// read through one index (no index intersection, no rooted `$or`).
+fn trial_runs_filters(ask: &Ask, query: &Query, catalog: &[Arc<super::IndexInfo>]) -> bool {
+    ask.hint.is_none()
         && ask.sort.is_none_or(|s| s.is_empty())
         && !mentions_geo(ask.filter)
         && !mentions_expr(ask.filter)
@@ -2887,6 +2902,60 @@ pub(crate) struct Counted {
     pub sort_input: Option<Vec<Vec<u8>>>,
 }
 
+/// A read mongod answers with a COUNT_SCAN (RM-494): a pipeline's query
+/// whose group reads no field ([`super::pipeline_counts_keys`]), over a
+/// plan of one index scan its documents need not be fetched for. The scan
+/// counts the index's keys and reads no document; each key is an empty
+/// document for the group to count. `None`: mongod keeps the plan.
+pub(crate) fn count_scanned(
+    storage: &dyn Storage,
+    ask: &Ask,
+    projection: Option<&Document>,
+) -> Result<Option<(Counted, String)>, StorageError> {
+    if ask.sort.is_some() || ask.limit != 0 {
+        return Ok(None);
+    }
+    let Some(plan) = stream_plan(
+        storage,
+        ask,
+        0,
+        0,
+        projection,
+        false,
+        StreamFlags::default(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(scan) = super::count_scan_of(&plan) else {
+        return Ok(None);
+    };
+    let opts = super::stream::Options {
+        collation: ask.collation,
+        ..Default::default()
+    };
+    let Some(mut stream) =
+        super::stream::Stream::of_count(&scan, ask.db, ask.coll, ask.filter, ask.vars, &opts)?
+    else {
+        return Ok(None);
+    };
+    stream.count_as_sbe();
+    let all = stream.read_all(storage)?;
+    // An empty BSON document: its length, 5, and its terminator.
+    let empty = vec![5_u8, 0, 0, 0, 0];
+    let mut summary = Vec::new();
+    super::summary::leaves_of(&scan, &mut summary);
+    Ok(Some((
+        Counted {
+            docs: vec![empty; all.docs.len()],
+            keys_examined: all.keys_examined,
+            docs_examined: all.docs_examined,
+            sort_input: None,
+        },
+        summary.join(", "),
+    )))
+}
+
 /// [`find`], run as mongod's plan for the read runs when a stream can run
 /// it (RM-023): every document, in the plan's order (a sort of whole
 /// documents included), with the keys and documents it examined. `limit`
@@ -2904,7 +2973,16 @@ pub(crate) fn find_counted(
         sorts_documents: true,
         ..Default::default()
     };
-    let Some(plan) = stream_plan(storage, ask, 0, ask.limit, projection, false, flags)? else {
+    // A plan two or more indexes contest is chosen by mongod's trial, run
+    // through the plan cache, when the caller asks for the cache (RM-363):
+    // the winner's trial results are read first, and the read goes on from
+    // where it stopped, counting what the winner examined.
+    let planned = if ask.asked.cached {
+        stream_tried(storage, ask, 0, ask.limit, projection, false, flags)?
+    } else {
+        stream_plan(storage, ask, 0, ask.limit, projection, false, flags)?.map(|plan| (plan, None))
+    };
+    let Some((plan, trial)) = planned else {
         return Ok(None);
     };
     // No budget here: the pipeline's leading `$sort` holds the sort to its
@@ -2919,6 +2997,15 @@ pub(crate) fn find_counted(
     else {
         return Ok(None);
     };
+    if let Some(trial) = trial {
+        let _active = secantus_core::collation::activate(ask.collation);
+        stream.buffer_trial(
+            storage,
+            trial.results,
+            trial.ended,
+            trial.cached.then_some(&plan),
+        )?;
+    }
     let all = stream.read_all(storage)?;
     Ok(Some(Counted {
         docs: all.docs,

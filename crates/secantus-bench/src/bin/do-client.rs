@@ -450,7 +450,7 @@ fn mem_available_kb() -> Option<u64> {
 fn cmd_sample(args: &Args) -> BenchResult<()> {
     let duration = args.f64_or("--duration", 60.0)?;
     let interval = args.f64_or("--interval", 1.0)?;
-    let process = args.str_or("--process", "secantusd-rs");
+    let process = args.str_or("--process", "secantusd-mdb");
     let out = args.str_or("--out", "/tmp/do-server-sample.json");
 
     let mut samples: Vec<serde_json::Value> = Vec::new();

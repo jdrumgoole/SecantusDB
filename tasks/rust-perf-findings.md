@@ -684,7 +684,7 @@ share *in async mode*: with the drainer's oplog writes going to non-logged table
 WAL volume leaves the writers' path entirely and the 8-writer rate jumps ~40%
 past plain async.
 
-Vehicle: `bench.concurrency --server rust` (standalone `secantusd-rs` daemon,
+Vehicle: `bench.concurrency --server rust` (standalone `secantusd-mdb` daemon,
 cache 1G, 8 KiB docs, `insert_many` batch 100, per-writer collections), 15 s
 runs, 3 reps interleaved per arm, medians; box quiesced (reps agree within ~2%).
 Numbers are daemon-vehicle, so they sit above the embedded-server figures in

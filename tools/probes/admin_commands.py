@@ -6,7 +6,7 @@ their refusals, what they persist, and what a stored default write concern
 does to the writes that follow. Both servers are started by the probe on
 empty stores, so a scenario's state is its own:
 
-    PROBE_RUST_BIN=crates/secantusdb/target/debug/secantusd-rs \\
+    PROBE_RUST_BIN=crates/secantusdb/target/debug/secantusd-mdb \\
         python tools/probes/admin_commands.py
 
 `PROBE_MONGOD_BIN` names another mongod (default: the one on `PATH`). The

@@ -1,0 +1,10 @@
+<section id="errors" class="alt">
+<p class="eyebrow">Act four · Process</p>
+<h2>In a database, an error is never noise</h2>
+<div class="cards">
+<div class="card"><h3>No skip to green</h3><p class="body">No xfail, no deselect, no retry-past. A WT_PANIC under stress is a bug, even if one thread passes.</p></div>
+<div class="card"><h3>“Flaky” is a bug report</h3><p class="body">Only under load, only in parallel: descriptions of a race, not excuses.</p></div>
+<div class="card"><h3>Backlog = failing tests</h3><p class="body">Every open gap is a test asserting the real server’s answer. Fixing it turns it into a regression test.</p></div>
+</div>
+<aside>Cultural rules that matter more than any code. The backlog: every item has an ID and a gap test under tests/backlog that fails while it’s open — so the backlog can’t lie. About 230 open items across the two Rust servers today. ~2 min.</aside>
+</section>

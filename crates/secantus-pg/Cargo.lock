@@ -1357,9 +1357,9 @@ dependencies = [
 
 [[package]]
 name = "libz-sys"
-version = "1.1.31"
+version = "1.1.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff20308ecabd635a2dc1dd5834a86c462cca20efba1d5d3ddab1f8aea3455cb2"
+checksum = "fee3f59f4321dab0c78d828942e7aa09d0bd8ad6e78a501977e6bf3d02938045"
 dependencies = [
  "cc",
  "libc",
@@ -2243,7 +2243,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-auth"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 dependencies = [
  "base64 0.22.1",
  "hmac 0.12.1",
@@ -2258,7 +2258,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-core"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 dependencies = [
  "bson",
  "chrono",
@@ -2274,14 +2274,14 @@ dependencies = [
 
 [[package]]
 name = "secantus-icu"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "secantus-pg"
-version = "0.1.0-beta.17"
+version = "0.1.0-beta.20"
 dependencies = [
  "aes",
  "async-trait",
@@ -2319,7 +2319,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-pg-query"
-version = "0.1.0-beta.17"
+version = "0.1.0-beta.20"
 dependencies = [
  "bindgen",
  "cc",
@@ -2335,14 +2335,14 @@ dependencies = [
 
 [[package]]
 name = "secantus-pgcatalog"
-version = "0.1.0-beta.17"
+version = "0.1.0-beta.20"
 dependencies = [
  "bson",
 ]
 
 [[package]]
 name = "secantus-pgplan"
-version = "0.1.0-beta.17"
+version = "0.1.0-beta.20"
 dependencies = [
  "aes",
  "blowfish 0.9.1",
@@ -2382,7 +2382,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-pgwire"
-version = "0.1.0-beta.17"
+version = "0.1.0-beta.20"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2410,7 +2410,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-storage"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 dependencies = [
  "bson",
  "flate2",
@@ -2424,7 +2424,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wiredtiger-sys"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 dependencies = [
  "cc",
  "cmake",
@@ -2433,7 +2433,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wt"
-version = "0.5.3-beta.196"
+version = "0.5.3-beta.198"
 dependencies = [
  "secantus-wiredtiger-sys",
 ]

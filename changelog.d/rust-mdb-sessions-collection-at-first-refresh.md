@@ -23,7 +23,7 @@ they mean to:
 
 #### Fixed
 
-- `secantusd-rs` started as a replica-set member (the default) no longer
+- `secantusd-mdb` started as a replica-set member (the default) no longer
   creates `config.system.sessions` at startup; a standalone still does
   (`tests/mongod_live/test_logical_sessions.py::test_a_set_member_builds_the_sessions_collection_at_its_first_refresh`).
 
