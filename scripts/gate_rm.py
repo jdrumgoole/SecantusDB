@@ -338,8 +338,9 @@ def main() -> int:
         # `gate_pg.sh --storage` holds a `secantusd-pg`, so rebuild it too
         # (2026-11-07: RM-361's gate aborted every pytest step on one built
         # before a rebase).
-        pg_target = root / "crates/secantus-pg/target"
-        if (pg_target / "debug/secantusd-pg").exists():
+        pg_bin = root / "crates/secantus-pg/target/debug/secantusd-pg"
+        pg_target = pg_bin.parents[1]
+        if pg_bin.exists():
             if pg:
                 g.step("pg-build", ["./inv", "rust-pgserver-build"])
             else:
