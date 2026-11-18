@@ -149,15 +149,202 @@ def test_record_image_operators(query: str, dsn: str) -> None:
 
 
 # `record_image_cmp` compares every by-value or varlena datum, whatever its
-# type: a date is its int32 day number, a uuid its 16 bytes.
+# type: a date is its int32 day number, a uuid its 16 bytes. Fixed for
+# date, timestamp, timestamptz and uuid; other types stay RP-976.
 RECORD_IMAGE_OTHER_TYPES = {
     "select (select row('2024-01-02'::date)) *< (select row('2024-01-03'::date))": [(True,)],
     "select (select row('00000000-0000-0000-0000-000000000001'::uuid))"
     " *= (select row('00000000-0000-0000-0000-000000000001'::uuid))": [(True,)],
+    # A negative day count is a large unsigned word: before 2000 sorts after.
+    "select (select row('1999-12-31'::date)) *< (select row('2000-01-01'::date))": [(False,)],
+    "select (select row('2024-01-01 00:00'::timestamp))"
+    " *< (select row('2024-01-01 00:00:01'::timestamp))": [(True,)],
+    "select (select row('1990-01-01 00:00+00'::timestamptz))"
+    " *> (select row('2024-01-01 00:00+00'::timestamptz))": [(True,)],
+    "select (select row('ff000000-0000-0000-0000-000000000000'::uuid))"
+    " *> (select row('01000000-0000-0000-0000-000000000000'::uuid))": [(True,)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-976")
+@pytest.mark.parametrize("query", list(RECORD_IMAGE_OTHER_TYPES))
+def test_record_image_over_other_field_types(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == RECORD_IMAGE_OTHER_TYPES[query]
+
+
+# More field types' datum images: an interval is a 16-byte fixed-length
+# datum (so `1 day` and `24 hours` differ), a time its int64 microseconds, a
+# name its 64 NAMEDATALEN bytes; the fixed-length ones compare by `memcmp`
+# of their little-endian memory (PostgreSQL 15.19).
+RECORD_IMAGE_REMAINING_TYPES = {
+    "select (select row('1 day'::interval)) *= (select row('24 hours'::interval))": [(False,)],
+    "select (select row('1 mon'::interval)) *< (select row('31 days'::interval))": [(True,)],
+    "select (select row('-1 hour'::interval)) *> (select row('1 hour'::interval))": [(False,)],
+    "select (select row('10:00'::time)) *< (select row('11:00'::time))": [(True,)],
+    "select (select row('10:00+00'::timetz)) *= (select row('11:00+01'::timetz))": [(False,)],
+    "select (select row('10:00+01'::timetz)) *< (select row('10:00+02'::timetz))": [(False,)],
+    "select (select row('a'::name)) *= (select row('a'::name))": [(True,)],
+    "select (select row('b'::name)) *> (select row('ab'::name))": [(True,)],
+    """select (select row('a'::"char")) *< (select row('b'::"char"))""": [(True,)],
+    "select (select row('08:00:2b:01:02:03'::macaddr))"
+    " *< (select row('08:00:2b:01:02:04'::macaddr))": [(True,)],
+    "select (select row('10.0.0.1'::inet)) *< (select row('::1'::inet))": [(True,)],
+    "select (select row('10.0.0.1/8'::inet)) *> (select row('10.0.0.1'::inet))": [(False,)],
+    "select (select row('(0,2)'::tid)) *> (select row('(1,1)'::tid))": [(False,)],
+    "select (select row('0/10'::pg_lsn)) *< (select row('1/0'::pg_lsn))": [(True,)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-976")
+@pytest.mark.parametrize("query", list(RECORD_IMAGE_REMAINING_TYPES))
+def test_record_image_over_remaining_field_types(query: str, dsn: str) -> None:
+    """Interval, time, timetz, name, "char", macaddr, inet, tid and pg_lsn
+    fields were refused (0A000); their datum images are modelled now."""
+    assert answer(dsn, query) == RECORD_IMAGE_REMAINING_TYPES[query]
+
+
+# The field types whose datum image is still not modelled: money (an int64
+# by value), an array, a jsonb, a bit string and a range (varlenas with
+# their own layouts), measured on PostgreSQL 15.19.
+# Measured on PostgreSQL 15.19: money is an int64 by value (so -1 sorts
+# above 2), and a bit string's VarBit image starts with its native-endian bit
+# count, so B'11111111111' (11 bits) sorts below B'1'.
+RECORD_IMAGE_MONEY_AND_BITS = {
+    "select (select row('1'::money)) *< (select row('2'::money))": [(True,)],
+    "select (select row('-1'::money)) *> (select row('2'::money))": [(True,)],
+    "select (select row(B'101')) *< (select row(B'110'))": [(True,)],
+    "select (select row(B'1')) *< (select row(B'10'))": [(True,)],
+    "select (select row(B'11111111111')) *< (select row(B'1'))": [(False,)],
+    "select (select row(B'10'::varbit)) *> (select row(B'1'::varbit))": [(True,)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-976")
+@pytest.mark.parametrize("query", list(RECORD_IMAGE_MONEY_AND_BITS))
+def test_record_image_over_money_and_bit_strings(query: str, dsn: str) -> None:
+    """Money and bit-string fields were 0A000; they compare by their images."""
+    assert answer(dsn, query) == RECORD_IMAGE_MONEY_AND_BITS[query]
+
+
+# Measured on PostgreSQL 15.19: an array compares by its `ArrayType` image
+# (ndim, dataoffset, element oid, dims, lower bounds, NULL bitmap, the
+# MAXALIGNed elements), so a longer first dimension or a NULL bitmap
+# decides before any element; a range by its `RangeType` image (oid, finite
+# bounds, the flags byte last), so `[1.0,2]` and `[1.00,2]` differ.
+RECORD_IMAGE_ARRAYS_AND_RANGES = [
+    ("'{1}'::int[]", "*<", "'{1}'::int[]", False),
+    ("'{1}'::int[]", "*=", "'{1}'::int[]", True),
+    ("'{-1}'::int[]", "*<", "'{1}'::int[]", False),
+    ("'{-1}'::int[]", "*=", "'{1}'::int[]", False),
+    ("'{1,2}'::int[]", "*<", "'{2}'::int[]", False),
+    ("'{1,2}'::int[]", "*=", "'{2}'::int[]", False),
+    ("'{}'::int[]", "*<", "'{1}'::int[]", True),
+    ("'{}'::int[]", "*=", "'{1}'::int[]", False),
+    ("'{{1,2},{3,4}}'::int[]", "*<", "'{1,2,3,4}'::int[]", False),
+    ("'{{1,2},{3,4}}'::int[]", "*=", "'{1,2,3,4}'::int[]", False),
+    ("'[0:1]={1,2}'::int[]", "*<", "'{1,2}'::int[]", True),
+    ("'[0:1]={1,2}'::int[]", "*=", "'{1,2}'::int[]", False),
+    ("array[1,null]::int[]", "*<", "array[1,2]::int[]", False),
+    ("array[1,null]::int[]", "*=", "array[1,2]::int[]", False),
+    ("array[null,1]::int[]", "*<", "array[1]::int[]", False),
+    ("array[null,1]::int[]", "*=", "array[1]::int[]", False),
+    ("'{1}'::int8[]", "*<", "'{2}'::int8[]", True),
+    ("'{1}'::int8[]", "*=", "'{2}'::int8[]", False),
+    ("'{t}'::bool[]", "*<", "'{f,f}'::bool[]", True),
+    ("'{t}'::bool[]", "*=", "'{f,f}'::bool[]", False),
+    ("'{1.5}'::float8[]", "*<", "'{-1}'::float8[]", False),
+    ("'{1.5}'::float8[]", "*=", "'{-1}'::float8[]", False),
+    ("'{2020-01-01}'::date[]", "*<", "'{1999-01-01}'::date[]", True),
+    ("'{2020-01-01}'::date[]", "*=", "'{1999-01-01}'::date[]", False),
+    ("'{1,2}'::int2[]", "*<", "'{1,3}'::int2[]", True),
+    ("'{1,2}'::int2[]", "*=", "'{1,3}'::int2[]", False),
+    ("'[1,2)'::int4range", "*<", "'[1,2)'::int4range", False),
+    ("'[1,2)'::int4range", "*=", "'[1,2)'::int4range", True),
+    ("'[1,3)'::int4range", "*<", "'[2,3)'::int4range", True),
+    ("'[1,3)'::int4range", "*=", "'[2,3)'::int4range", False),
+    ("'empty'::int4range", "*<", "'[2,3)'::int4range", True),
+    ("'empty'::int4range", "*=", "'[2,3)'::int4range", False),
+    ("'(,3)'::int4range", "*<", "'[2,3)'::int4range", False),
+    ("'(,3)'::int4range", "*=", "'[2,3)'::int4range", False),
+    ("'[1,)'::int4range", "*<", "'[1,2)'::int4range", False),
+    ("'[1,)'::int4range", "*=", "'[1,2)'::int4range", False),
+    ("'[1,2)'::int8range", "*<", "'[1,5)'::int8range", True),
+    ("'[1,2)'::int8range", "*=", "'[1,5)'::int8range", False),
+    ("'[1.0,2]'::numrange", "*<", "'[1.00,2]'::numrange", False),
+    ("'[1.0,2]'::numrange", "*=", "'[1.00,2]'::numrange", False),
+    ("'[1.5,2]'::numrange", "*<", "'(1.5,2]'::numrange", False),
+    ("'[1.5,2]'::numrange", "*=", "'(1.5,2]'::numrange", False),
+    ("'[2020-01-01,2020-02-01)'::daterange", "*<", "'[2020-01-02,2020-02-01)'::daterange", True),
+    ("'[2020-01-01,2020-02-01)'::daterange", "*=", "'[2020-01-02,2020-02-01)'::daterange", False),
+    (
+        "'[2020-01-01 10:00,2020-02-01)'::tsrange",
+        "*<",
+        "'[2020-01-01 09:00,2020-02-01)'::tsrange",
+        False,
+    ),
+    (
+        "'[2020-01-01 10:00,2020-02-01)'::tsrange",
+        "*=",
+        "'[2020-01-01 09:00,2020-02-01)'::tsrange",
+        False,
+    ),
+    ("'[2020-01-01 10:00+00,)'::tstzrange", "*<", "'[2020-01-01 09:00+00,)'::tstzrange", False),
+    ("'[2020-01-01 10:00+00,)'::tstzrange", "*=", "'[2020-01-01 09:00+00,)'::tstzrange", False),
+]
+
+
+@pytest.mark.backlog_fixed("RP-976")
+@pytest.mark.parametrize(("left", "op", "right", "want"), RECORD_IMAGE_ARRAYS_AND_RANGES)
+def test_record_image_over_arrays_and_ranges(
+    left: str, op: str, right: str, want: bool, dsn: str
+) -> None:
+    """Arrays of fixed-length elements and the built-in ranges were 0A000."""
+    query = f"select (select row({left})) {op} (select row({right}))"
+    assert answer(dsn, query) == [(want,)]
+
+
+RECORD_IMAGE_VARLENA_ARRAYS = [
+    (
+        "'{b}'::text[]",
+        "*<",
+        "'{" + "a" * 63 + "}'::text[]",
+        False,
+    ),
+    ("'{a}'::text[]", "*=", "'{a}'::text[]", True),
+    ("'{a,b}'::text[]", "*<", "'{ab}'::text[]", False),
+    ("'{x,NULL}'::text[]", "*<", "'{x,y}'::text[]", False),
+    ("'{x,NULL,z}'::text[]", "*>", "'{x,NULL,y}'::text[]", True),
+    ("'{a}'::varchar[]", "*<", "'{b}'::varchar[]", True),
+    ("'{ab}'::varchar[]", "*<", "'{b}'::varchar[]", False),
+    ("'{a}'::char(3)[]", "*=", "'{a}'::char(3)[]", True),
+    ("'{a}'::char(3)[]", "*<", "'{a}'::char(2)[]", False),
+    ("'{1.5}'::numeric[]", "*=", "'{1.50}'::numeric[]", False),
+    ("'{1.5}'::numeric[]", "*<", "'{1.50}'::numeric[]", False),
+    ("'{-1}'::numeric[]", "*<", "'{1}'::numeric[]", False),
+    ("""'{"\\\\x01"}'::bytea[]""", "*<", """'{"\\\\x0102"}'::bytea[]""", True),
+    ("'[2:3]={a,b}'::text[]", "*>", "'{a,b}'::text[]", True),
+    ("'{{a,b},{c,d}}'::text[]", "*<", "'{a,b,c,d}'::text[]", False),
+]
+
+
+@pytest.mark.backlog_fixed("RP-976")
+@pytest.mark.parametrize(("left", "op", "right", "want"), RECORD_IMAGE_VARLENA_ARRAYS)
+def test_record_image_over_arrays_of_varlena_elements(
+    left: str, op: str, right: str, want: bool, dsn: str
+) -> None:
+    """Arrays of text, varchar, bpchar, numeric and bytea were 0A000: an
+    element keeps the 4-byte header array_in gives it (PostgreSQL 15.19)."""
+    query = f"select (select row({left})) {op} (select row({right}))"
+    assert answer(dsn, query) == [(want,)]
+
+
+RECORD_IMAGE_STILL_REFUSED = {
+    """select (select row('{"a":1}'::jsonb)) *= (select row('{"a": 1}'::jsonb))""": [(True,)],
+    "select (select row('[1,2)'::int4range)) *= (select row('[1,2)'::int4range))": [(True,)],
 }
 
 
 @pytest.mark.backlog("RP-976")
-@pytest.mark.parametrize("query", list(RECORD_IMAGE_OTHER_TYPES))
-def test_record_image_over_other_field_types(query: str, dsn: str) -> None:
-    assert answer(dsn, query) == RECORD_IMAGE_OTHER_TYPES[query]
+@pytest.mark.parametrize("query", list(RECORD_IMAGE_STILL_REFUSED))
+def test_record_image_over_still_refused_field_types(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == RECORD_IMAGE_STILL_REFUSED[query]

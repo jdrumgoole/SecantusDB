@@ -157,7 +157,7 @@ fn to_match(s: &str, caps: &regex::Captures) -> RegexMatch {
 /// is Perl/Python-`re`-compatible, so its leftmost-first match and per-group
 /// participation line up with Python's for the lookaround / backreference
 /// patterns that reach this path.
-fn to_match_fancy(s: &str, caps: &fancy_regex::Captures) -> RegexMatch {
+fn to_match_fancy(s: &str, caps: &fancy_regex::Captures<str>) -> RegexMatch {
     let whole = caps.get(0).unwrap();
     let captures = (1..caps.len())
         .map(|i| caps.get(i).map(|m| m.as_str().to_string()))

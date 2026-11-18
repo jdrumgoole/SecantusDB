@@ -5774,8 +5774,9 @@ impl PgHandler {
     ];
     /// `COMMENT ON INDEX`, keyed by index name: the Python server's store.
     const INDEX_COMMENT_COLLECTION: &'static str = "__sql_index_comments__";
-    /// `COMMENT ON` a built-in routine: `{_id: <pg_proc oid>, comment}`,
-    /// one per overload as `pg_description` keys it (RP-519).
+    /// `COMMENT ON` a built-in routine, type, operator or access method:
+    /// `{_id: <oid>, comment}`, as `pg_description` keys it (RP-519, RP-969);
+    /// initdb's oids are unique across the bootstrap catalogs.
     const BUILTIN_PROC_COMMENT_COLLECTION: &'static str = "__sql_builtin_proc_comments__";
     /// `COMMENT ON` every other kind of object the catalog has no row of its
     /// own to carry it on: `{_id: "<kind>\0<name>", kind, name, comment}`.
@@ -19028,7 +19029,10 @@ impl PgHandler {
                 format!("relation \"{name}\" already exists"),
             ))));
         }
-        let body_fields = self.describe_fields(&cv.body, 0, &[])?.unwrap_or_default();
+        // `DefineView` parse-analyses the query and plans nothing: a constant
+        // is not folded, so `select 1/0` makes a view (RP-968).
+        let analyse = |q: &str| secantus_pgplan::analysing_only(|| self.describe_fields(q, 0, &[]));
+        let body_fields = analyse(&cv.body)?.unwrap_or_default();
         if cv.columns.len() > body_fields.len() {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
@@ -19036,9 +19040,7 @@ impl PgHandler {
                 "CREATE VIEW specifies more column names than columns".into(),
             ))));
         }
-        let fields = self
-            .describe_fields(&cv.definition, 0, &[])?
-            .unwrap_or_default();
+        let fields = analyse(&cv.definition)?.unwrap_or_default();
         {
             let mut seen = HashSet::new();
             for f in &fields {
@@ -19062,7 +19064,7 @@ impl PgHandler {
         if let Some(old) = &existing {
             // OR REPLACE may only ADD columns at the end: each existing one
             // keeps its name and type (PostgreSQL's 42P16 rules).
-            let old_fields = self.describe_fields(old, 0, &[])?.unwrap_or_default();
+            let old_fields = analyse(old)?.unwrap_or_default();
             if fields.len() < old_fields.len() {
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".into(),
@@ -20031,6 +20033,104 @@ impl PgHandler {
     /// constraints carry their comment in the table's catalog row, indexes in
     /// the index-comment store (both where the Python server keeps them);
     /// everything else in `COMMENT_COLLECTION`.
+    /// A built-in type named by `names`: its oid, below
+    /// `FirstNormalObjectId` as initdb assigns them.
+    /// `pg_catalog` comes first on every search path, so a bare name is the
+    /// built-in one when there is one.
+    fn builtin_type_oid(names: &[String]) -> Option<i64> {
+        let name = match names {
+            [n] => n,
+            [schema, n] if schema == "pg_catalog" => n,
+            _ => return None,
+        };
+        secantus_pgplan::pgtypes::oid_of_name(name).filter(|oid| *oid < 16384)
+    }
+
+    /// The operator `name(left,right)` names, as `get_object_address`
+    /// finds it: each operand type must exist (42704), then the operator
+    /// (42883, printed `integer ## integer` as `op_signature_string` does).
+    fn operator_oid_for_comment(signature: &str) -> PgWireResult<i64> {
+        let (name, args) = signature
+            .strip_suffix(')')
+            .and_then(|s| s.split_once('('))
+            .unwrap_or((signature, ""));
+        let mut display = Vec::new();
+        for arg in args.split(',') {
+            if arg == "NONE" {
+                continue;
+            }
+            let oid = secantus_pgplan::user_casts::type_oid(arg).ok_or_else(|| {
+                Self::user_error("42704", format!("type \"{arg}\" does not exist"))
+            })?;
+            display.push(secantus_pgplan::regtype_text(oid));
+        }
+        secantus_pgplan::regobj::resolve("regoperator", signature).map_err(|_| {
+            let printed = match display.as_slice() {
+                [l, r] => format!("{l} {name} {r}"),
+                [r] => format!("{name} {r}"),
+                _ => name.to_string(),
+            };
+            Self::user_error("42883", format!("operator does not exist: {printed}"))
+        })
+    }
+
+    /// `COMMENT ON` a built-in object of a catalog with no record of ours to
+    /// carry it: `pg_description` keys it by the object's oid, replacing
+    /// initdb's row, and IS NULL deletes that row -- a document with no
+    /// comment keeps it deleted (RP-969).
+    fn comment_on_builtin_object(
+        &self,
+        kind: &str,
+        name: &str,
+        oid: i64,
+        comment: Option<String>,
+    ) -> PgWireResult<()> {
+        if oid >= 16384 {
+            return Err(Self::user_error(
+                "0A000",
+                format!("COMMENT ON a user-defined {kind} ({name}) is not supported"),
+            ));
+        }
+        let id = oid.to_string();
+        self.put_comment_doc(
+            Self::BUILTIN_PROC_COMMENT_COLLECTION,
+            &id,
+            Some(match comment {
+                Some(c) => bson::doc! {"_id": &id, "oid": oid, "comment": c},
+                None => bson::doc! {"_id": &id, "oid": oid},
+            }),
+        )
+    }
+
+    /// The oid of a built-in row of a catalog, by its name (and, where the
+    /// catalog has one, its `pg_catalog` namespace): `name` or
+    /// `pg_catalog.name`.
+    fn builtin_catalog_object_oid(
+        &self,
+        catalog: &str,
+        name_col: &str,
+        nsp_col: &str,
+        names: &[String],
+    ) -> Option<i64> {
+        let name = match names {
+            [n] => n.as_str(),
+            [s, n] if s == "pg_catalog" && !nsp_col.is_empty() => n.as_str(),
+            _ => return None,
+        };
+        let def = Self::virtual_table(catalog)?;
+        let rows = self.catalog_rows(catalog)?;
+        let f = |c: &str| def.field_of(c).unwrap_or_default();
+        let (fname, fnsp, foid) = (f(name_col), f(nsp_col), f("oid"));
+        let found = rows.iter().find_map(|r| {
+            let hit = r.get_str(&fname).ok() == Some(name)
+                && (nsp_col.is_empty() || r.get(&fnsp).and_then(crate::bson_i64) == Some(11));
+            hit.then(|| r.get(&foid).and_then(crate::bson_i64))
+                .flatten()
+                .filter(|o| *o < 16384)
+        });
+        found
+    }
+
     fn comment_on(
         &self,
         kind: &str,
@@ -20198,7 +20298,12 @@ impl PgHandler {
                     return self.put_comment_doc(
                         Self::BUILTIN_PROC_COMMENT_COLLECTION,
                         &id,
-                        comment.map(|c| bson::doc! {"_id": &id, "oid": oid, "comment": c}),
+                        // IS NULL deletes the row, initdb's included: a
+                        // document with no comment keeps it deleted.
+                        Some(match comment {
+                            Some(c) => bson::doc! {"_id": &id, "oid": oid, "comment": c},
+                            None => bson::doc! {"_id": &id, "oid": oid},
+                        }),
                     );
                 };
                 let id = key;
@@ -20216,10 +20321,80 @@ impl PgHandler {
                 self.delete_type_doc(Self::FUNCTION_COLLECTION, &id)?;
                 self.insert_type_doc(Self::FUNCTION_COLLECTION, &id, doc)
             }
+            "operator" | "access method" => {
+                let name = names.first().map_or("", String::as_str);
+                let oid = if kind == "operator" {
+                    Self::operator_oid_for_comment(name)?
+                } else {
+                    secantus_pgplan::misc_alter::method_oid(name).ok_or_else(|| {
+                        Self::user_error(
+                            "42704",
+                            format!("access method \"{name}\" does not exist"),
+                        )
+                    })?
+                };
+                self.comment_on_builtin_object(kind, name, oid, comment)
+            }
+            "type" if Self::builtin_type_oid(names).is_some() => {
+                let oid = Self::builtin_type_oid(names).unwrap_or_default();
+                self.comment_on_builtin_object(kind, &names.join("."), oid, comment)
+            }
             "domain" => self.comment_on_domain(&Self::comment_relation(names), comment),
             "text search configuration" => self.comment_on_ts_config(names, comment),
             "text search dictionary" => self.comment_on_ts_dict(names, comment),
-            "conversion" => self.comment_on_conversion(names, comment),
+            // A user conversion first, as the search path finds it; then
+            // initdb's, keyed by its `pg_conversion` oid.
+            "conversion" => match self.found_conversion(names) {
+                Err(e) => match self.builtin_catalog_object_oid(
+                    "pg_conversion",
+                    "conname",
+                    "connamespace",
+                    names,
+                ) {
+                    Some(oid) => {
+                        self.comment_on_builtin_object(kind, &names.join("."), oid, comment)
+                    }
+                    None => Err(e),
+                },
+                Ok(_) => self.comment_on_conversion(names, comment),
+            },
+            "language" | "collation" | "text search parser" | "text search template" => {
+                let (catalog, name_col, nsp_col) = match kind {
+                    "language" => ("pg_language", "lanname", None),
+                    "collation" => ("pg_collation", "collname", Some("collnamespace")),
+                    "text search parser" => ("pg_ts_parser", "prsname", Some("prsnamespace")),
+                    _ => ("pg_ts_template", "tmplname", Some("tmplnamespace")),
+                };
+                let found = match nsp_col {
+                    Some(nsp) => self.builtin_catalog_object_oid(catalog, name_col, nsp, names),
+                    None => self.builtin_catalog_object_oid(catalog, name_col, "", names),
+                };
+                let Some(oid) = found else {
+                    return Err(Self::user_error(
+                        "42704",
+                        format!("{kind} \"{}\" does not exist", names.join(".")),
+                    ));
+                };
+                self.comment_on_builtin_object(kind, &names.join("."), oid, comment)
+            }
+            "schema" | "extension"
+                if names.len() == 1
+                    && matches!(
+                        (kind, names[0].as_str()),
+                        ("schema", "pg_catalog" | "information_schema" | "pg_toast")
+                            | ("extension", "plpgsql")
+                    ) =>
+            {
+                let (catalog, name_col) = if kind == "schema" {
+                    ("pg_namespace", "nspname")
+                } else {
+                    ("pg_extension", "extname")
+                };
+                let oid = self
+                    .builtin_catalog_object_oid(catalog, name_col, "", names)
+                    .unwrap_or_default();
+                self.comment_on_builtin_object(kind, &names[0], oid, comment)
+            }
             "operator class" => self.comment_on_opclass(true, names, comment),
             "operator family" => self.comment_on_opclass(false, names, comment),
             "subscription" => {
@@ -22569,7 +22744,10 @@ impl PgHandler {
                 .chain(self.transform_comments())
                 .map(|(oid, c)| (oid, 0, c)),
         );
-        // COMMENT ON a built-in routine, by its overload's oid.
+        // COMMENT ON a built-in routine, type, operator or access method, by
+        // its oid, replacing or (IS NULL) removing initdb's description of
+        // it (RP-969).
+        let mut commented = HashSet::new();
         for d in self
             .storage
             .find_matching(
@@ -22581,10 +22759,30 @@ impl PgHandler {
             .iter()
             .filter_map(|b| decode_doc(b).ok())
         {
-            if let (Some(oid), Ok(c)) = (d.get("oid").and_then(bson_i64), d.get_str("comment")) {
+            let Some(oid) = d.get("oid").and_then(bson_i64) else {
+                continue;
+            };
+            commented.insert(oid);
+            if let Ok(c) = d.get_str("comment") {
                 tail.push((oid, 0, c.to_string()));
             }
         }
+        // `plpgsql`'s description, which initdb gives it, goes the same way.
+        head.retain(|(oid, _, _)| !commented.contains(oid));
+        tail.extend(
+            crate::system_catalogs::initdb_proc_descriptions()
+                .iter()
+                .filter(|(oid, _)| !commented.contains(oid))
+                .map(|(oid, c)| (*oid, 0, c.clone())),
+        );
+        // initdb's descriptions of the other built-in objects: `pg_type`,
+        // `pg_operator`, `pg_am`, ... (RP-969).
+        tail.extend(
+            crate::system_catalogs::initdb_other_descriptions()
+                .iter()
+                .filter(|(_, oid, _)| !commented.contains(oid))
+                .map(|(_, oid, c)| (*oid, 0, c.clone())),
+        );
         // COMMENT ON FUNCTION / PROCEDURE, kept on the function's record,
         // under the oid `pg_proc` gives it.
         for d in self.user_function_docs()? {
@@ -46284,9 +46482,32 @@ impl PgHandler {
                             && sel.order.iter().all(|k| {
                                 k.expr.is_none() && sel.columns.iter().any(|(_, f)| *f == k.field)
                             });
+                        // A SELECT DISTINCT of stored columns straight
+                        // over the scan: `create_distinct_paths` hashes it
+                        // where that beats a Sort and Unique (RP-440).
+                        let distinct = tree.name == "Unique"
+                            && tree.children.len() == 1
+                            && tree.children[0].children.is_empty()
+                            && tree.children[0].name.starts_with("Seq Scan on ")
+                            && matches!(sel.distinct, secantus_pgplan::Distinct::All)
+                            && sel.limit.is_none()
+                            && sel.offset == 0
+                            && sel.order.is_empty()
+                            && !sel.with_ties
+                            && sel.casts.iter().all(Option::is_none)
+                            && !sel.columns.is_empty()
+                            && {
+                                let mut seen = std::collections::HashSet::new();
+                                sel.columns.iter().all(|(_, f)| seen.insert(f))
+                            }
+                            && !self
+                                .index_relations()
+                                .iter()
+                                .any(|ix| ix.table.name == sel.table);
                         if (sorted
                             || limited
                             || sorted_limited
+                            || distinct
                             || tree.children.is_empty() && tree.name.starts_with("Seq Scan on "))
                             && sel.sub.is_none()
                             && sel.series.is_none()
@@ -46342,6 +46563,48 @@ impl PgHandler {
                                         sel.limit.map_or(0, |n| n.max(1)),
                                     )
                                 })
+                            } else if distinct {
+                                let fields: Vec<String> =
+                                    sel.columns.iter().map(|(_, f)| f.clone()).collect();
+                                let hashed = scan.and_then(|e| {
+                                    let groups = self.distinct_groups_over(
+                                        &sel.table,
+                                        &sel.filter,
+                                        &fields,
+                                        Some(e.2),
+                                    )?;
+                                    let work_mem = self.kb_setting("work_mem", 4096);
+                                    let unique = scan_estimate::unique_estimate(
+                                        scan_estimate::sort_estimate(e, work_mem),
+                                        fields.len(),
+                                        groups,
+                                    );
+                                    let hashed = scan_estimate::hashed_distinct_estimate(
+                                        e,
+                                        fields.len(),
+                                        groups,
+                                    );
+                                    // `add_path`'s fuzz factor: within 1%
+                                    // either may be kept, so neither is.
+                                    (hashed.1 * 1.01 < unique.1).then_some(hashed)
+                                });
+                                if hashed.is_some() {
+                                    tree.children[0].estimate = scan;
+                                    tree.name = "HashAggregate".into();
+                                    // The InitPlan's range table entry
+                                    // qualifies the keys (`useprefix`).
+                                    let alias = options
+                                        .scan_alias
+                                        .clone()
+                                        .unwrap_or_else(|| explain::display_alias(&sel.table));
+                                    let keys: Vec<String> = sel
+                                        .columns
+                                        .iter()
+                                        .map(|(_, f)| format!("{alias}.{f}"))
+                                        .collect();
+                                    tree.details.push(("Group Key".into(), keys.join(", ")));
+                                }
+                                hashed
                             } else {
                                 scan
                             };
@@ -47330,16 +47593,21 @@ impl PgHandler {
                             &sj.outer_quals,
                             &index_columns,
                         );
+                        let priced = match inner.as_ref() {
+                            Statement::Select(sel) => self.semi_join_estimate(sj, sel),
+                            _ => None,
+                        };
+                        // The inner side read through the index its own
+                        // WHERE bounds, where that is its cheaper path.
+                        if let Some((.., Some(index))) = &priced {
+                            explain::name_index_scans(&mut tree, &[None, Some(index.clone())]);
+                        }
                         explain::inner_quals_on_semi_join(
                             &mut tree,
                             &sj.inner_quals,
                             &index_columns,
                         );
-                        let priced = match inner.as_ref() {
-                            Statement::Select(sel) => self.semi_join_estimate(sj, sel),
-                            _ => None,
-                        };
-                        if let Some((outer, scanned, join, unique)) = priced {
+                        if let Some((outer, scanned, join, unique, _)) = priced {
                             tree.estimate = Some(join);
                             tree.children[0].estimate = Some(outer);
                             tree.children[1].children[0].estimate = Some(scanned);

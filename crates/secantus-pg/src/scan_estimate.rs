@@ -2118,12 +2118,13 @@ impl PgHandler {
     /// pulled up into (RP-411), its outer side reading `sel`'s targets:
     /// the outer scan's, the hashed inner scan's and the join's, and the
     /// inner side's `HashAggregate` where the inner join of the inner side
-    /// made unique is the cheaper path (`create_unique_path`).
+    /// made unique is the cheaper path (`create_unique_path`), and the
+    /// index the inner scan reads, where it reads one.
     pub(crate) fn semi_join_estimate(
         &self,
         sj: &secantus_pgplan::SemiJoin,
         sel: &secantus_pgplan::Select,
-    ) -> Option<(Estimate, Estimate, Estimate, Option<Estimate>)> {
+    ) -> Option<SemiJoinEstimate> {
         if sel.table != sj.outer.0 || sel.join.is_some() || sel.sub.is_some() {
             return None;
         }
@@ -2167,10 +2168,10 @@ impl PgHandler {
         // key alone.
         let inner_read = [inner_key.clone()];
         let b = self.hash_side(&sj.inner.0, &sj.inner_filter, &inner_key, &inner_read, &[])?;
-        let ((outer, inner, mut join, _, _), unique) = hash_semi_join_of(a, b)?;
+        let ((outer, inner, mut join, _, [_, index]), unique) = hash_semi_join_of(a, b)?;
         join.1 += target * join.2;
         join.3 += width;
-        Some((outer, inner, join, unique))
+        Some((outer, inner, join, unique, index))
     }
 
     /// A side that reads no column but its key is read index-only through
@@ -4684,6 +4685,10 @@ impl PgHandler {
             && tree.children[0].children.len() == 1
             && tree.children[0].children[0].children.is_empty()
             && tree.children[0].children[0].name == format!("Seq Scan on {}", sel.table);
+        if simple_sub && !plain_counts {
+            self.init_plan_grouped_counts(agg, sel, tree, param_quals, init_cost);
+            return;
+        }
         if !(plain_counts && simple_sub && shaped) {
             return;
         }
@@ -4708,6 +4713,119 @@ impl PgHandler {
         let mut scan_node = tree.children[0].children.remove(0);
         scan_node.estimate = Some(scan);
         tree.children[0] = scan_node;
+        tree.estimate = Some((startup + init_cost, total + init_cost, rows, w));
+    }
+
+    /// Counts grouped by stored columns over one user table whose WHERE
+    /// reads InitPlans (RP-440): the merged FROM subquery leaves a
+    /// HashAggregate straight over the scan, priced by `cost_agg`
+    /// (AGG_HASHED) where `add_paths_to_grouping_rel` keeps it over a Sort
+    /// and GroupAggregate. The same limits as the grouped count without an
+    /// InitPlan: no index on the table, each key projected once, and few
+    /// enough groups that the hash table fits `hash_mem`. The keys are
+    /// qualified, as the InitPlan lengthens the range table.
+    fn init_plan_grouped_counts(
+        &self,
+        agg: &secantus_pgplan::Aggregate,
+        sel: &secantus_pgplan::Select,
+        tree: &mut explain::PlanNode,
+        param_quals: &[(String, secantus_pgplan::colstats::Op)],
+        init_cost: f64,
+    ) {
+        use secantus_pgplan::OutputCol;
+        let shaped = tree.name == "HashAggregate"
+            && tree.children.len() == 1
+            && tree.children[0].name == format!("Subquery Scan on {}", sel.table)
+            && tree.children[0].children.len() == 1
+            && tree.children[0].children[0].children.is_empty()
+            && tree.children[0].children[0].name == format!("Seq Scan on {}", sel.table);
+        let counts = agg.items.iter().all(|it| {
+            matches!(
+                it.func,
+                secantus_pgplan::AggFunc::CountStar | secantus_pgplan::AggFunc::Count
+            ) && it.expr.is_none()
+                && it.expr2.is_none()
+                && it.field2.is_none()
+                && !it.distinct
+                && it.filter.is_none()
+                && it.order.is_empty()
+        });
+        let keys: Vec<String> = agg.group_by.iter().map(|k| k.field.clone()).collect();
+        let projected = |i: usize| {
+            agg.select
+                .iter()
+                .filter(|(_, c)| *c == OutputCol::Group(i))
+                .count()
+                == 1
+        };
+        let indexed = self
+            .index_relations()
+            .iter()
+            .any(|ix| ix.table.name == sel.table);
+        if !(shaped
+            && counts
+            && !indexed
+            && !keys.is_empty()
+            && agg.group_by.iter().all(|k| k.expr.is_none())
+            && (1..keys.len()).all(|i| !keys[..i].contains(&keys[i]))
+            && (0..keys.len()).all(projected)
+            && agg.select.len() == keys.len() + agg.items.len()
+            && (0..agg.items.len())
+                .all(|i| agg.select.iter().any(|(_, c)| *c == OutputCol::Agg(i)))
+            && agg.grouping_sets.is_none()
+            && agg.groupings.is_empty()
+            && agg.having.is_none()
+            && agg.exprs.is_empty()
+            && agg.order.is_empty()
+            && agg.limit.is_none()
+            && agg.offset == 0
+            && !agg.with_ties
+            && !agg.distinct
+            && agg.filter.is_empty()
+            && agg.series.is_none()
+            && agg.join.is_none())
+        {
+            return;
+        }
+        let mut fields = keys.clone();
+        for f in agg.items.iter().filter_map(|it| it.field.clone()) {
+            if !fields.contains(&f) {
+                fields.push(f);
+            }
+        }
+        let (Some(scan), Some(keyed)) = (
+            self.init_plan_scan_estimate(&sel.table, &sel.filter, param_quals, &fields),
+            self.init_plan_scan_estimate(&sel.table, &sel.filter, param_quals, &keys),
+        ) else {
+            return;
+        };
+        let Some(groups) = self.distinct_groups_over(&sel.table, &sel.filter, &keys, Some(scan.2))
+        else {
+            return;
+        };
+        let aggs = secantus_pgplan::costsize::AggCosts::simple(agg.items.len(), 0);
+        if groups > 50_000.0
+            || secantus_pgplan::costsize::sorted_grouping_wins(
+                scan.1,
+                scan.2,
+                groups,
+                keys.len(),
+                Some(aggs),
+                false,
+            )
+        {
+            return;
+        }
+        let (startup, total, rows, w) =
+            hashed_count_agg_estimate(scan, keys.len(), agg.items.len(), groups, keyed.3);
+        let mut scan_node = tree.children[0].children.remove(0);
+        scan_node.estimate = Some(scan);
+        tree.children[0] = scan_node;
+        let alias = crate::explain::display_alias(&sel.table);
+        let qualified: Vec<String> = keys.iter().map(|k| format!("{alias}.{k}")).collect();
+        for d in tree.details.iter_mut().filter(|(k, _)| k == "Group Key") {
+            d.1 = qualified.join(", ");
+        }
         tree.estimate = Some((startup + init_cost, total + init_cost, rows, w));
     }
 
@@ -5494,6 +5612,18 @@ impl PgHandler {
         filter: &Document,
         fields: &[String],
     ) -> Option<f64> {
+        self.distinct_groups_over(table, filter, fields, None)
+    }
+
+    /// `distinct_groups` over a scan whose rows are already estimated
+    /// (`rows`), as one whose WHERE reads an InitPlan (RP-440).
+    pub(crate) fn distinct_groups_over(
+        &self,
+        table: &str,
+        filter: &Document,
+        fields: &[String],
+        rows: Option<f64>,
+    ) -> Option<f64> {
         if !self
             .shared_table_defs()
             .ok()?
@@ -5531,7 +5661,10 @@ impl PgHandler {
                 })
             })
             .collect::<Option<_>>()?;
-        let (_, _, rows, _) = self.user_seq_scan(table, filter, &[])?;
+        let rows = match rows {
+            Some(rows) => rows,
+            None => self.user_seq_scan(table, filter, &[])?.2,
+        };
         Some(hashagg::estimate_groups(&keys, pt.tuples, rows) as f64)
     }
 
@@ -7508,6 +7641,17 @@ struct AnalysedKey {
     mcv: Vec<(Vec<u8>, f32)>,
 }
 
+/// [`PgHandler::semi_join_estimate`]'s answer: the outer scan's, the
+/// inner scan's and the join's estimates, the inner side's `HashAggregate`
+/// where it is unique-ified, and the index the inner scan reads.
+pub(crate) type SemiJoinEstimate = (
+    Estimate,
+    Estimate,
+    Estimate,
+    Option<Estimate>,
+    Option<String>,
+);
+
 /// The most further equality clauses [`hash_join_of`] prices.
 const MORE_HASH_CLAUSES: usize = 3;
 
@@ -7525,17 +7669,13 @@ const MORE_HASH_CLAUSES: usize = 3;
 /// the two Sorts a merge must start with, the outer scan and the inner
 /// rescans a nested loop pays for each unmatched outer row, and the outer
 /// scan and the inner side's `HashAggregate` any join of the unique-ified
-/// side reads. A side read through an index is not priced.
+/// side reads. An outer side read through an index is not priced; the
+/// inner one is (its index the join estimate's second).
 fn hash_semi_join_of(a: HashSide, b: HashSide) -> Option<(JoinEstimate, Option<Estimate>)> {
     use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
     const CPU_OPERATOR_COST: f64 = 0.0025;
     const CPU_TUPLE_COST: f64 = 0.01;
-    if a.pg_type != b.pg_type
-        || a.index.is_some()
-        || b.index.is_some()
-        || a.key_indexed
-        || b.key_indexed
-    {
+    if a.pg_type != b.pg_type || a.index.is_some() || a.key_indexed || b.key_indexed {
         return None;
     }
     fn key(s: &HashSide) -> KeyStats<'_> {
@@ -7586,7 +7726,13 @@ fn hash_semi_join_of(a: HashSide, b: HashSide) -> Option<(JoinEstimate, Option<E
     // aggregate's rows; the outer side hashed, a plain hash join. A merge
     // must still sort the outer side, and a nested loop evaluates the
     // clause on every pair of rows: bounds of those.
-    let groups = costsize::clamp_row_est(b.stats.0.min(inner.rows));
+    // `estimate_num_groups`: the key's distinct values scaled down to the
+    // rows the inner side's own WHERE keeps.
+    let mut reldistinct = b.stats.0.min(b.tuples);
+    if reldistinct > 0.0 && inner.rows < b.tuples {
+        reldistinct *= 1.0 - ((b.tuples - inner.rows) / b.tuples).powf(b.tuples / reldistinct);
+    }
+    let groups = costsize::clamp_row_est(costsize::clamp_row_est(reldistinct).min(inner.rows));
     let agg_startup = b.scan.1 + CPU_OPERATOR_COST * inner.rows;
     let agg = (agg_startup, agg_startup + CPU_TUPLE_COST * groups);
     let bounds = [
@@ -7601,7 +7747,7 @@ fn hash_semi_join_of(a: HashSide, b: HashSide) -> Option<(JoinEstimate, Option<E
         ..side(&b)
     };
     let (u_startup, via_unique) =
-        joincost::hash_semi_join(&outer, &unique, nselec, (jselec, match_count), &[kb]);
+        joincost::hash_join_over_unique_path(&outer, &unique, nselec, (jselec, match_count), &[kb]);
     // The outer side hashed under the aggregate's rows: an inner join on
     // a side not known unique (one that is is not modelled here).
     if a.unique {
@@ -7647,12 +7793,7 @@ fn hash_semi_join_of(a: HashSide, b: HashSide) -> Option<(JoinEstimate, Option<E
 /// side read through an index (presorted for a merge) is not priced.
 fn hash_anti_join_of(a: HashSide, b: HashSide) -> Option<JoinEstimate> {
     use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
-    if a.pg_type != b.pg_type
-        || a.index.is_some()
-        || b.index.is_some()
-        || a.key_indexed
-        || b.key_indexed
-    {
+    if a.pg_type != b.pg_type || a.index.is_some() || a.key_indexed || b.key_indexed {
         return None;
     }
     fn key(s: &HashSide) -> KeyStats<'_> {

@@ -233,6 +233,8 @@ def main(dsn: str) -> None:
 
         statistics(conn)
         class_sizes(conn)
+        proc_descriptions(conn)
+        other_descriptions(conn)
         index_pages(conn)
         heap_tids(conn)
 
@@ -267,6 +269,37 @@ def statistics(conn: psycopg.Connection) -> None:
         for block in copy:
             out.append(bytes(block).decode())
     (ROOT / "crates/secantus-pg/src/pg15_catalog_statistics.txt").write_text("".join(out))
+
+
+def proc_descriptions(conn: psycopg.Connection) -> None:
+    """Each built-in routine's `pg_description` row as `initdb` wrote it from
+    `pg_proc.dat`'s ``descr``: `oid` and text (RP-969)."""
+    out = [
+        f"{oid}\t{escape(text)}\n"
+        for oid, text in conn.execute(
+            "select objoid, description from pg_description"
+            " where classoid = 'pg_proc'::regclass and objsubid = 0 and objoid < 16384"
+            " order by objoid"
+        )
+    ]
+    (ROOT / "crates/secantus-pg/src/pg15_proc_descriptions.tsv").write_text("".join(out))
+
+
+def other_descriptions(conn: psycopg.Connection) -> None:
+    """Every other built-in object's `pg_description` row as `initdb` wrote
+    it from its catalog's `.dat` ``descr`` (`pg_type`, `pg_operator`,
+    `pg_am`, ...): `classoid`, `oid` and text (RP-969). `public`'s is
+    `schema_comments`'."""
+    out = [
+        f"{classoid}\t{oid}\t{escape(text)}\n"
+        for classoid, oid, text in conn.execute(
+            "select classoid::int8, objoid, description from pg_description"
+            " where classoid <> 'pg_proc'::regclass and objsubid = 0 and objoid < 16384"
+            " and not (classoid = 'pg_namespace'::regclass and objoid = 2200)"
+            " order by classoid, objoid"
+        )
+    ]
+    (ROOT / "crates/secantus-pg/src/pg15_other_descriptions.tsv").write_text("".join(out))
 
 
 def class_sizes(conn: psycopg.Connection) -> None:

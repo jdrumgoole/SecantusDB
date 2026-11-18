@@ -1,0 +1,3228 @@
+3	row-oriented heap table access method handler
+31	I/O
+33	I/O
+34	I/O
+35	I/O
+38	I/O
+39	I/O
+40	I/O
+41	I/O
+42	I/O
+43	I/O
+44	I/O
+45	I/O
+46	I/O
+47	I/O
+48	I/O
+49	I/O
+50	I/O
+51	I/O
+52	I/O
+53	I/O
+54	I/O
+55	I/O
+56	implementation of < operator
+57	implementation of > operator
+60	implementation of = operator
+61	implementation of = operator
+62	implementation of = operator
+63	implementation of = operator
+64	implementation of < operator
+65	implementation of = operator
+66	implementation of < operator
+67	implementation of = operator
+68	implementation of = operator
+69	implementation of = operator
+70	implementation of <> operator
+72	implementation of <= operator
+73	implementation of > operator
+74	implementation of >= operator
+77	convert char to int4
+78	convert int4 to char
+79	implementation of ~ operator
+84	implementation of <> operator
+86	I/O
+87	I/O
+88	I/O
+89	PostgreSQL version string
+90	I/O
+101	restriction selectivity of = and related operators
+102	restriction selectivity of <> and related operators
+103	restriction selectivity of < and related operators on scalar datatypes
+104	restriction selectivity of > and related operators on scalar datatypes
+105	join selectivity of = and related operators
+106	join selectivity of <> and related operators
+107	join selectivity of < and related operators on scalar datatypes
+108	join selectivity of > and related operators on scalar datatypes
+109	I/O
+110	I/O
+115	implementation of >^ operator
+116	implementation of <^ operator
+117	I/O
+118	I/O
+119	I/O
+120	I/O
+121	I/O
+122	I/O
+123	I/O
+124	I/O
+125	implementation of && operator
+126	implementation of >= operator
+127	implementation of > operator
+128	implementation of = operator
+129	implementation of < operator
+130	implementation of <= operator
+131	implementation of |>> operator
+132	implementation of << operator
+133	implementation of >> operator
+134	implementation of <<| operator
+135	implementation of ~= operator
+136	implementation of <@ operator
+137	implementation of <@ operator
+138	implementation of @@ operator
+139	restriction selectivity for area-comparison operators
+140	join selectivity for area-comparison operators
+141	implementation of * operator
+144	implementation of <> operator
+145	implementation of <> operator
+146	implementation of > operator
+147	implementation of > operator
+148	implementation of <= operator
+149	implementation of <= operator
+150	implementation of >= operator
+151	implementation of >= operator
+152	implementation of * operator
+153	implementation of / operator
+154	implementation of / operator
+155	implementation of % operator
+156	implementation of % operator
+157	implementation of <> operator
+158	implementation of = operator
+159	implementation of = operator
+160	implementation of < operator
+161	implementation of < operator
+162	implementation of > operator
+163	implementation of > operator
+164	implementation of <> operator
+165	implementation of <> operator
+166	implementation of <= operator
+167	implementation of <= operator
+168	implementation of >= operator
+169	implementation of >= operator
+170	implementation of * operator
+171	implementation of * operator
+172	implementation of / operator
+173	implementation of / operator
+176	implementation of + operator
+177	implementation of + operator
+178	implementation of + operator
+179	implementation of + operator
+180	implementation of - operator
+181	implementation of - operator
+182	implementation of - operator
+183	implementation of - operator
+184	implementation of = operator
+185	implementation of <> operator
+186	implementation of ~= operator
+187	implementation of @> operator
+188	implementation of << operator
+189	implementation of &< operator
+190	implementation of &> operator
+191	implementation of >> operator
+192	implementation of <@ operator
+193	implementation of @> operator
+195	I/O
+196	I/O
+197	I/O
+198	I/O
+200	I/O
+201	I/O
+202	implementation of * operator
+203	implementation of / operator
+204	implementation of + operator
+205	implementation of - operator
+206	implementation of - operator
+207	implementation of @ operator
+208	aggregate transition function
+209	larger of two
+211	smaller of two
+212	implementation of - operator
+213	implementation of - operator
+214	I/O
+215	I/O
+216	implementation of * operator
+217	implementation of / operator
+218	implementation of + operator
+219	implementation of - operator
+220	implementation of - operator
+221	implementation of @ operator
+222	aggregate transition function
+223	larger of two
+224	smaller of two
+225	implementation of @@ operator
+227	implementation of @@ operator
+228	round to nearest integer
+229	truncate to integer
+230	implementation of |/ operator
+231	implementation of ||/ operator
+232	implementation of ^ operator
+233	natural exponential (e^x)
+234	natural logarithm
+235	convert int2 to float8
+236	convert int2 to float4
+237	convert float8 to int2
+238	convert float4 to int2
+239	implementation of <-> operator
+240	implementation of = operator
+241	implementation of < operator
+242	implementation of <= operator
+243	implementation of >= operator
+244	implementation of > operator
+245	implementation of <> operator
+246	less-equal-greater
+247	implementation of = operator
+248	implementation of < operator
+249	implementation of <= operator
+250	implementation of >= operator
+251	implementation of > operator
+252	implementation of <> operator
+253	less-equal-greater
+266	concatenate name and oid
+267	I/O
+268	I/O
+274	current date and time - increments during transactions
+275	return the next oid for a system table
+276	aggregate combine function
+277	implementation of ?# operator
+278	implementation of ?# operator
+279	implementation of * operator
+280	implementation of / operator
+281	implementation of + operator
+282	implementation of - operator
+283	implementation of * operator
+284	implementation of / operator
+285	implementation of + operator
+286	implementation of - operator
+287	implementation of = operator
+288	implementation of <> operator
+289	implementation of < operator
+290	implementation of <= operator
+291	implementation of > operator
+292	implementation of >= operator
+293	implementation of = operator
+294	implementation of <> operator
+295	implementation of < operator
+296	implementation of <= operator
+297	implementation of > operator
+298	implementation of >= operator
+299	implementation of = operator
+300	implementation of <> operator
+301	implementation of < operator
+302	implementation of <= operator
+303	implementation of > operator
+304	implementation of >= operator
+305	implementation of = operator
+306	implementation of <> operator
+307	implementation of < operator
+308	implementation of <= operator
+309	implementation of > operator
+310	implementation of >= operator
+311	convert float4 to float8
+312	convert float8 to float4
+313	convert int2 to int4
+314	convert int4 to int2
+315	Is JIT compilation available in this session?
+316	convert int4 to float8
+317	convert float8 to int4
+318	convert int4 to float4
+319	convert float4 to int4
+320	bucket number of operand in equal-width histogram
+321	I/O
+322	I/O
+323	I/O
+324	I/O
+326	I/O
+327	I/O
+328	hash
+329	hash
+330	btree index access method handler
+331	hash index access method handler
+332	gist index access method handler
+333	gin index access method handler
+334	spgist index access method handler
+335	brin index access method handler
+336	restriction selectivity of <= and related operators on scalar datatypes
+337	restriction selectivity of >= and related operators on scalar datatypes
+338	validate an operator class
+339	implementation of ~= operator
+340	implementation of @> operator
+341	implementation of << operator
+342	implementation of &< operator
+343	implementation of &> operator
+344	implementation of >> operator
+345	implementation of <@ operator
+346	implementation of && operator
+347	I/O
+348	I/O
+350	less-equal-greater
+351	less-equal-greater
+354	less-equal-greater
+355	less-equal-greater
+356	less-equal-greater
+357	implementation of <-> operator
+358	less-equal-greater
+359	less-equal-greater
+360	less-equal-greater
+361	implementation of <-> operator
+362	implementation of # operator
+363	implementation of <-> operator
+364	implementation of <-> operator
+365	implementation of <-> operator
+366	implementation of ## operator
+367	implementation of ## operator
+368	implementation of ## operator
+369	implementation of <@ operator
+370	implementation of <-> operator
+371	implementation of <-> operator
+372	implementation of <@ operator
+373	implementation of ?# operator
+376	split delimited text, with null string
+377	less-equal-greater
+378	append element onto end of array
+379	prepend element onto front of array
+380	implementation of <-> operator
+381	implementation of <-> operator
+382	less-equal-greater
+383	implementation of || operator
+384	concatenate array elements, using delimiter and null string, into text
+386	join selectivity of <= and related operators on scalar datatypes
+390	implementation of <> operator
+391	implementation of < operator
+392	implementation of > operator
+393	implementation of <= operator
+394	split delimited text
+395	concatenate array elements, using delimiter, into text
+396	implementation of >= operator
+398	join selectivity of >= and related operators on scalar datatypes
+399	hash
+400	hash
+401	convert char(n) to text
+404	less-equal-greater
+406	convert name to text
+407	convert text to name
+408	convert name to char(n)
+409	convert char(n) to name
+421	implementation of <-> operator
+422	hash
+425	hash
+432	hash
+436	I/O
+437	I/O
+438	count the number of NULL arguments
+440	count the number of non-NULL arguments
+441	hash
+442	hash
+443	hash
+444	hash
+445	hash
+446	hash
+447	hash
+448	hash
+449	hash
+450	hash
+451	hash
+452	hash
+453	hash
+454	hash
+455	hash
+456	hash
+457	hash
+458	larger of two
+459	smaller of two
+460	I/O
+461	I/O
+462	implementation of - operator
+463	implementation of + operator
+464	implementation of - operator
+465	implementation of * operator
+466	implementation of / operator
+467	implementation of = operator
+468	implementation of <> operator
+469	implementation of < operator
+470	implementation of > operator
+471	implementation of <= operator
+472	implementation of >= operator
+474	implementation of = operator
+475	implementation of <> operator
+476	implementation of < operator
+477	implementation of > operator
+478	implementation of <= operator
+479	implementation of >= operator
+480	convert int8 to int4
+481	convert int4 to int8
+482	convert int8 to float8
+483	convert float8 to int8
+515	larger of two
+516	smaller of two
+598	abbreviated display of inet value
+599	abbreviated display of cidr value
+605	change netmask of inet
+619	implementation of <> operator
+626	hash
+635	change netmask of cidr
+636	test property of an index access method
+637	test property of an index
+638	test property of an index column
+652	convert int8 to float4
+653	convert float4 to int8
+655	implementation of < operator
+656	implementation of <= operator
+657	implementation of > operator
+658	implementation of >= operator
+659	implementation of <> operator
+668	adjust char() to typmod length
+669	adjust varchar() to typmod length
+676	return name of given index build phase
+677	implementation of < operator
+678	implementation of <= operator
+679	implementation of = operator
+680	implementation of >= operator
+681	implementation of > operator
+683	network part of address
+696	netmask of address
+697	netmask length
+698	broadcast address of network
+699	show address octets only
+702	implementation of <-> operator
+704	implementation of <-> operator
+710	deprecated, use current_user instead
+711	address family (4 for IPv4, 6 for IPv6)
+714	convert int8 to int2
+715	large object create
+716	implementation of < operator
+717	implementation of <= operator
+720	octet length
+721	get byte
+722	set byte
+723	get bit
+724	set bit
+725	implementation of <-> operator
+727	implementation of <-> operator
+728	implementation of <-> operator
+729	implementation of <-> operator
+730	show all parts of inet/cidr value
+740	implementation of < operator
+741	implementation of <= operator
+742	implementation of > operator
+743	implementation of >= operator
+744	implementation of = operator
+745	current user name
+746	session user name
+747	array dimensions
+748	number of array dimensions
+749	substitute portion of string
+750	I/O
+751	I/O
+752	substitute portion of string
+753	MACADDR manufacturer fields
+754	convert int2 to int8
+764	large object import
+765	large object export
+766	increment
+767	large object import
+768	larger of two
+769	smaller of two
+770	larger of two
+771	smaller of two
+772	hash
+776	hash
+777	hash
+778	hash
+779	hash
+780	hash
+781	hash
+782	hash
+785	implementation of <-> operator
+810	encoding name of current database
+817	get the currently executing query
+830	implementation of = operator
+831	implementation of < operator
+832	implementation of <= operator
+833	implementation of > operator
+834	implementation of >= operator
+835	implementation of <> operator
+836	less-equal-greater
+837	implementation of + operator
+838	implementation of - operator
+839	implementation of * operator
+840	implementation of / operator
+841	implementation of + operator
+842	less-equal-greater
+846	implementation of * operator
+847	implementation of / operator
+848	implementation of * operator
+849	position of substring
+850	implementation of ~~ operator
+851	implementation of !~~ operator
+852	implementation of = operator
+853	implementation of <> operator
+854	implementation of < operator
+855	implementation of > operator
+856	implementation of <= operator
+857	implementation of >= operator
+858	implementation of ~~ operator
+859	implementation of !~~ operator
+860	convert char to char(n)
+861	name of the current database
+862	implementation of * operator
+863	implementation of * operator
+864	implementation of * operator
+865	implementation of / operator
+866	implementation of * operator
+867	implementation of / operator
+868	position of substring
+870	lowercase
+871	uppercase
+872	capitalize each word
+873	left-pad string to length
+874	right-pad string to length
+875	trim selected characters from left end of string
+876	trim selected characters from right end of string
+877	extract portion of string
+878	map a set of characters appearing in string
+879	left-pad string to length
+880	right-pad string to length
+881	trim spaces from left end of string
+882	trim spaces from right end of string
+883	extract portion of string
+884	trim selected characters from both ends of string
+885	trim spaces from both ends of string
+886	I/O
+887	I/O
+888	implementation of = operator
+889	implementation of <> operator
+890	implementation of < operator
+891	implementation of <= operator
+892	implementation of > operator
+893	implementation of >= operator
+894	implementation of + operator
+895	implementation of - operator
+896	implementation of * operator
+897	implementation of / operator
+898	larger of two
+899	smaller of two
+910	I/O
+911	I/O
+919	implementation of * operator
+920	implementation of = operator
+921	implementation of < operator
+922	implementation of <= operator
+923	implementation of > operator
+924	implementation of >= operator
+925	implementation of <> operator
+926	less-equal-greater
+927	implementation of << operator
+928	implementation of <<= operator
+929	implementation of >> operator
+930	implementation of >>= operator
+935	output money amount as words
+936	extract portion of string
+937	extract portion of string
+938	non-persistent series generator
+939	non-persistent series generator
+940	modulus
+941	modulus
+942	implementation of - operator
+943	implementation of * operator
+944	convert text to char
+945	implementation of % operator
+946	convert char to text
+947	modulus
+948	implementation of / operator
+949	hash
+952	large object open
+953	large object close
+954	large object read
+955	large object write
+956	large object seek
+957	large object create
+958	large object position
+959	implementation of <@ operator
+960	implementation of <@ operator
+961	implementation of ## operator
+964	large object unlink (delete)
+972	hash
+973	implementation of ?# operator
+975	box area
+976	box width
+977	box height
+978	implementation of <-> operator
+979	area of a closed path
+980	implementation of # operator
+981	box diagonal
+982	implementation of < operator
+983	implementation of > operator
+984	implementation of = operator
+985	implementation of <= operator
+986	implementation of >= operator
+987	implementation of @-@ operator
+988	implementation of <> operator
+989	implementation of ?| operator
+990	implementation of ?- operator
+991	implementation of <-> operator
+992	slope between points
+993	convert points to line segment
+994	implementation of ?# operator
+995	implementation of ?|| operator
+996	implementation of ?-| operator
+997	implementation of ?| operator
+998	implementation of ?- operator
+999	implementation of = operator
+1004	truncate large object
+1023	planner support for textlike
+1024	planner support for texticregexeq
+1025	planner support for texticlike
+1026	adjust timestamp to new time zone
+1030	GiST support
+1031	I/O
+1032	I/O
+1035	add/update ACL item
+1036	remove ACL item
+1037	contains
+1039	encoding name of current database
+1044	I/O
+1045	I/O
+1046	I/O
+1047	I/O
+1048	implementation of = operator
+1049	implementation of < operator
+1050	implementation of <= operator
+1051	implementation of > operator
+1052	implementation of >= operator
+1053	implementation of <> operator
+1062	implementation of = operator
+1063	larger of two
+1064	smaller of two
+1065	view two-phase transactions
+1066	non-persistent series generator
+1067	non-persistent series generator
+1068	non-persistent series generator
+1069	non-persistent series generator
+1078	less-equal-greater
+1079	convert text to regclass
+1080	hash
+1081	format a type oid and atttypmod to canonical SQL
+1084	I/O
+1085	I/O
+1086	implementation of = operator
+1087	implementation of < operator
+1088	implementation of <= operator
+1089	implementation of > operator
+1090	implementation of >= operator
+1091	implementation of <> operator
+1092	less-equal-greater
+1102	implementation of < operator
+1103	implementation of <= operator
+1104	implementation of > operator
+1105	implementation of >= operator
+1106	implementation of <> operator
+1107	less-equal-greater
+1136	statistics: information about WAL activity
+1137	get wal replay pause state
+1138	larger of two
+1139	smaller of two
+1140	implementation of - operator
+1141	implementation of + operator
+1142	implementation of - operator
+1143	I/O
+1144	I/O
+1145	implementation of = operator
+1146	implementation of + operator
+1147	implementation of - operator
+1148	implementation of * operator
+1149	implementation of / operator
+1150	I/O
+1151	I/O
+1152	implementation of = operator
+1153	implementation of <> operator
+1154	implementation of < operator
+1155	implementation of <= operator
+1156	implementation of >= operator
+1157	implementation of > operator
+1158	convert UNIX epoch to timestamptz
+1159	adjust timestamp to new time zone
+1160	I/O
+1161	I/O
+1162	implementation of = operator
+1163	implementation of <> operator
+1164	implementation of < operator
+1165	implementation of <= operator
+1166	implementation of >= operator
+1167	implementation of > operator
+1168	implementation of - operator
+1169	implementation of + operator
+1170	implementation of - operator
+1171	extract field from timestamp with time zone
+1172	extract field from interval
+1173	planner support for network_sub/superset
+1174	convert date to timestamp with time zone
+1175	promote groups of 24 hours to numbers of days
+1176	convert date and time to timestamp with time zone
+1177	jsonpath exists test with timezone
+1178	convert timestamp with time zone to date
+1179	jsonpath query with timezone
+1180	jsonpath query wrapped into array with timezone
+1181	age of a transaction ID, in transactions before current transaction
+1188	implementation of - operator
+1189	implementation of + operator
+1190	implementation of - operator
+1191	array subscripts generator
+1192	array subscripts generator
+1193	array constructor with value
+1194	base 10 logarithm
+1195	smaller of two
+1196	larger of two
+1197	smaller of two
+1198	larger of two
+1199	date difference preserving months and years
+1200	adjust interval precision
+1215	get description for object id and catalog name
+1216	get description for table column
+1217	truncate timestamp with time zone to specified units
+1218	truncate interval to specified units
+1219	increment
+1230	implementation of @ operator
+1236	larger of two
+1237	smaller of two
+1238	implementation of ~* operator
+1239	implementation of !~* operator
+1240	implementation of ~* operator
+1241	implementation of !~* operator
+1242	I/O
+1243	I/O
+1244	I/O
+1245	I/O
+1246	implementation of < operator
+1250	deferred UNIQUE constraint check
+1251	implementation of @ operator
+1252	implementation of !~ operator
+1253	implementation of @ operator
+1254	implementation of ~ operator
+1256	implementation of !~ operator
+1257	length
+1258	implementation of || operator
+1264	convert encoding name to encoding id
+1265	implementation of <> operator
+1267	I/O
+1268	parse qualified identifier to array of identifiers
+1269	bytes required to store the value, perhaps with compression
+1271	intervals overlap?
+1272	implementation of + operator
+1273	extract field from time with time zone
+1274	implementation of + operator
+1275	implementation of - operator
+1276	implementation of * operator
+1277	implementation of / operator
+1278	implementation of + operator
+1279	implementation of - operator
+1280	implementation of * operator
+1281	implementation of / operator
+1282	quote an identifier for usage in a querystring
+1283	quote a literal for usage in a querystring
+1284	truncate timestamp with time zone to specified units in specified time zone
+1285	quote a data value for usage in a querystring
+1286	array constructor with value
+1287	convert int8 to oid
+1288	convert oid to int8
+1289	quote a possibly-null literal for usage in a querystring
+1290	quote a possibly-null data value for usage in a querystring
+1291	trigger to suppress updates when new and old records match
+1292	implementation of = operator
+1293	expand multirange to set of ranges
+1294	latest tid of a tuple
+1295	promote groups of 30 days to numbers of months
+1296	implementation of + operator
+1297	implementation of + operator
+1298	implementation of + operator
+1299	current transaction time
+1300	restriction selectivity for position-comparison operators
+1301	join selectivity for position-comparison operators
+1302	restriction selectivity for containment comparison operators
+1303	join selectivity for containment comparison operators
+1304	intervals overlap?
+1305	intervals overlap?
+1306	intervals overlap?
+1307	intervals overlap?
+1308	intervals overlap?
+1309	intervals overlap?
+1310	intervals overlap?
+1311	intervals overlap?
+1312	I/O
+1313	I/O
+1314	less-equal-greater
+1315	less-equal-greater
+1316	convert timestamp to time
+1317	length
+1318	character length
+1319	implementation of = operator
+1326	implementation of / operator
+1339	base 10 logarithm
+1340	base 10 logarithm
+1341	natural logarithm
+1342	round to nearest integer
+1343	truncate to integer
+1344	square root
+1345	cube root
+1346	exponentiation
+1347	natural exponential (e^x)
+1348	deprecated, use two-argument form instead
+1349	print type names of oidvector field
+1350	I/O
+1351	I/O
+1352	implementation of = operator
+1353	implementation of <> operator
+1354	implementation of < operator
+1355	implementation of <= operator
+1356	implementation of >= operator
+1357	implementation of > operator
+1358	less-equal-greater
+1359	convert date and time with time zone to timestamp with time zone
+1362	hostmask of address
+1364	planner support for textregexeq
+1365	make ACL item
+1367	character length
+1368	exponentiation
+1369	character length
+1370	convert time to interval
+1371	view system lock information
+1372	character length
+1373	finite date?
+1374	octet length
+1375	octet length
+1376	factorial
+1377	larger of two
+1378	smaller of two
+1379	larger of two
+1380	smaller of two
+1381	character length
+1384	extract field from date
+1385	extract field from time
+1386	date difference from today preserving months and years
+1387	constraint description
+1388	convert timestamp with time zone to time with time zone
+1389	finite timestamp?
+1390	finite interval?
+1391	statistics: start time for current backend session
+1392	statistics: address of client connected to backend
+1393	statistics: port number of client connected to backend
+1394	absolute value
+1395	absolute value
+1396	absolute value
+1397	absolute value
+1398	absolute value
+1400	convert varchar to name
+1401	convert name to varchar
+1402	current schema name
+1403	current schema search list
+1404	substitute portion of string
+1405	substitute portion of string
+1406	vertically aligned
+1407	horizontally aligned
+1408	parallel
+1409	perpendicular
+1410	vertical
+1411	horizontal
+1412	parallel
+1413	perpendicular
+1414	vertical
+1415	horizontal
+1416	center of
+1419	convert interval to time
+1421	convert points to box
+1422	implementation of + operator
+1423	implementation of - operator
+1424	implementation of * operator
+1425	implementation of / operator
+1426	implementation of @> operator
+1427	I/O
+1428	implementation of @> operator
+1429	implementation of <@ operator
+1430	path closed?
+1431	path open?
+1432	implementation of # operator
+1433	close path
+1434	open path
+1435	implementation of + operator
+1436	implementation of + operator
+1437	implementation of - operator
+1438	implementation of * operator
+1439	implementation of / operator
+1440	convert x, y to point
+1441	implementation of + operator
+1442	implementation of - operator
+1443	implementation of * operator
+1444	implementation of / operator
+1445	implementation of # operator
+1446	convert polygon to bounding box
+1447	convert polygon to path
+1448	convert box to polygon
+1449	convert path to polygon
+1450	I/O
+1451	I/O
+1452	implementation of ~= operator
+1453	implementation of @> operator
+1454	implementation of << operator
+1455	implementation of &< operator
+1456	implementation of &> operator
+1457	implementation of >> operator
+1458	implementation of <@ operator
+1459	implementation of && operator
+1460	implementation of <<| operator
+1461	implementation of |>> operator
+1462	implementation of = operator
+1463	implementation of <> operator
+1464	implementation of < operator
+1465	implementation of > operator
+1466	implementation of <= operator
+1467	implementation of >= operator
+1468	area of circle
+1469	diameter of circle
+1470	radius of circle
+1471	implementation of <-> operator
+1472	implementation of @@ operator
+1473	convert point and radius to circle
+1474	convert polygon to circle
+1475	convert vertex count and circle to polygon
+1476	implementation of <-> operator
+1477	implementation of @> operator
+1478	implementation of <@ operator
+1479	convert box to circle
+1480	convert circle to box
+1481	base 10 logarithm
+1482	implementation of <> operator
+1483	implementation of < operator
+1484	implementation of <= operator
+1485	implementation of > operator
+1486	implementation of >= operator
+1487	implementation of @-@ operator
+1488	implementation of ## operator
+1489	implementation of ## operator
+1490	I/O
+1491	I/O
+1492	implementation of = operator
+1493	construct line from points
+1494	implementation of # operator
+1495	implementation of ?# operator
+1496	implementation of ?|| operator
+1497	implementation of ?-| operator
+1498	implementation of ?| operator
+1499	implementation of ?- operator
+1530	distance between endpoints
+1531	sum of path segments
+1532	center of
+1534	center of
+1540	center of
+1541	diagonal of
+1542	center of
+1543	center of
+1544	convert circle to 12-vertex polygon
+1545	number of points
+1556	number of points
+1564	I/O
+1565	I/O
+1569	matches LIKE expression
+1570	does not match LIKE expression
+1571	matches LIKE expression
+1572	does not match LIKE expression
+1573	source text of a rule
+1574	sequence next value
+1575	sequence current value
+1576	set sequence value
+1579	I/O
+1580	I/O
+1581	implementation of = operator
+1582	implementation of <> operator
+1592	implementation of >= operator
+1593	implementation of > operator
+1594	implementation of <= operator
+1595	implementation of < operator
+1596	less-equal-greater
+1597	convert encoding id to encoding name
+1598	random value
+1599	set random seed
+1600	arcsine
+1601	arccosine
+1602	arctangent
+1603	arctangent, two arguments
+1604	sine
+1605	cosine
+1606	tangent
+1607	cotangent
+1608	radians to degrees
+1609	degrees to radians
+1610	PI
+1618	implementation of * operator
+1619	type of the argument
+1620	convert first char to int4
+1621	convert int4 to char
+1622	replicate string n times
+1623	convert SQL regexp pattern to POSIX style
+1624	implementation of * operator
+1631	implementation of ~~ operator
+1632	implementation of !~~ operator
+1633	implementation of ~~* operator
+1634	implementation of !~~* operator
+1635	implementation of ~~* operator
+1636	implementation of !~~* operator
+1637	convert LIKE pattern to use backslash escapes
+1638	implementation of > operator
+1639	implementation of >= operator
+1640	select statement of a view
+1641	select statement of a view
+1642	role name by OID (with fallback)
+1643	index description
+1644	referential integrity FOREIGN KEY ... REFERENCES
+1645	referential integrity FOREIGN KEY ... REFERENCES
+1646	referential integrity ON DELETE CASCADE
+1647	referential integrity ON UPDATE CASCADE
+1648	referential integrity ON DELETE RESTRICT
+1649	referential integrity ON UPDATE RESTRICT
+1650	referential integrity ON DELETE SET NULL
+1651	referential integrity ON UPDATE SET NULL
+1652	referential integrity ON DELETE SET DEFAULT
+1653	referential integrity ON UPDATE SET DEFAULT
+1654	referential integrity ON DELETE NO ACTION
+1655	referential integrity ON UPDATE NO ACTION
+1656	implementation of ~* operator
+1657	implementation of !~* operator
+1658	implementation of ~ operator
+1659	implementation of !~ operator
+1660	implementation of ~~* operator
+1661	implementation of !~~* operator
+1662	trigger description
+1665	name of sequence for a serial column
+1666	implementation of = operator
+1667	implementation of <> operator
+1668	implementation of >= operator
+1669	implementation of > operator
+1670	implementation of <= operator
+1671	implementation of < operator
+1672	less-equal-greater
+1673	implementation of & operator
+1674	implementation of | operator
+1675	implementation of # operator
+1676	implementation of ~ operator
+1677	implementation of << operator
+1678	implementation of >> operator
+1679	implementation of || operator
+1680	extract portion of bitstring
+1681	bitstring length
+1682	octet length
+1683	convert int4 to bitstring
+1684	convert bitstring to int4
+1685	adjust bit() to typmod length
+1686	list of SQL keywords
+1687	adjust varbit() to typmod length
+1688	hash
+1689	convert ACL item array to table, primarily for use by information schema
+1690	implementation of - operator
+1691	implementation of <= operator
+1692	implementation of >= operator
+1693	less-equal-greater
+1696	hash
+1697	hash
+1698	position of sub-bitstring
+1699	extract portion of bitstring
+1701	I/O
+1702	I/O
+1703	adjust numeric to typmod precision/scale
+1704	implementation of @ operator
+1705	absolute value
+1706	sign of value
+1707	value rounded to 'scale'
+1708	value rounded to 'scale' of zero
+1709	value truncated to 'scale'
+1710	value truncated to 'scale' of zero
+1711	nearest integer >= value
+1712	nearest integer <= value
+1713	length of string in specified encoding
+1714	convert string with specified source encoding name
+1715	convert inet to cidr
+1716	deparse an encoded expression
+1717	convert string with specified destination encoding name
+1718	implementation of = operator
+1719	implementation of <> operator
+1720	implementation of > operator
+1721	implementation of >= operator
+1722	implementation of < operator
+1723	implementation of <= operator
+1724	implementation of + operator
+1725	implementation of - operator
+1726	implementation of * operator
+1727	implementation of / operator
+1728	modulus
+1729	implementation of % operator
+1730	square root
+1731	square root
+1732	natural exponential (e^x)
+1733	natural exponential (e^x)
+1734	natural logarithm
+1735	natural logarithm
+1736	logarithm base m of n
+1737	logarithm base m of n
+1738	exponentiation
+1739	implementation of ^ operator
+1740	convert int4 to numeric
+1741	base 10 logarithm
+1742	convert float4 to numeric
+1743	convert float8 to numeric
+1744	convert numeric to int4
+1745	convert numeric to float4
+1746	convert numeric to float8
+1747	implementation of + operator
+1748	implementation of - operator
+1749	implementation of + operator
+1750	implementation of - operator
+1764	increment by one
+1765	set sequence value and is_called status
+1766	smaller of two
+1767	larger of two
+1768	format interval to text
+1769	less-equal-greater
+1770	format timestamp with time zone to text
+1771	implementation of - operator
+1772	format numeric to text
+1773	format int4 to text
+1774	format int8 to text
+1775	format float4 to text
+1776	format float8 to text
+1777	convert text to numeric
+1778	convert text to timestamp with time zone
+1779	convert numeric to int8
+1780	convert text to date
+1781	convert int8 to numeric
+1782	convert int2 to numeric
+1783	convert numeric to int2
+1798	I/O
+1799	I/O
+1810	length in bits
+1811	length in bits
+1812	length in bits
+1813	convert string with specified encoding names
+1814	restriction selectivity of ILIKE
+1815	restriction selectivity of NOT ILIKE
+1816	join selectivity of ILIKE
+1817	join selectivity of NOT ILIKE
+1818	restriction selectivity of regex match
+1819	restriction selectivity of LIKE
+1820	restriction selectivity of case-insensitive regex match
+1821	restriction selectivity of regex non-match
+1822	restriction selectivity of NOT LIKE
+1823	restriction selectivity of case-insensitive regex non-match
+1824	join selectivity of regex match
+1825	join selectivity of LIKE
+1826	join selectivity of case-insensitive regex match
+1827	join selectivity of regex non-match
+1828	join selectivity of NOT LIKE
+1829	join selectivity of case-insensitive regex non-match
+1830	aggregate final function
+1831	aggregate final function
+1832	aggregate final function
+1833	aggregate transition function
+1834	aggregate transition function
+1835	aggregate transition function
+1836	aggregate transition function
+1837	aggregate final function
+1838	aggregate final function
+1839	aggregate final function
+1840	aggregate transition function
+1841	aggregate transition function
+1842	aggregate transition function
+1843	aggregate transition function
+1844	aggregate final function
+1845	encode text from DB encoding to ASCII text
+1846	encode text from encoding to ASCII text
+1847	encode text from encoding to ASCII text
+1848	implementation of + operator
+1850	implementation of = operator
+1851	implementation of <> operator
+1852	implementation of < operator
+1853	implementation of > operator
+1854	implementation of <= operator
+1855	implementation of >= operator
+1856	implementation of = operator
+1857	implementation of <> operator
+1858	implementation of < operator
+1859	implementation of > operator
+1860	implementation of <= operator
+1861	implementation of >= operator
+1892	implementation of & operator
+1893	implementation of | operator
+1894	implementation of # operator
+1895	implementation of ~ operator
+1896	implementation of << operator
+1897	implementation of >> operator
+1898	implementation of & operator
+1899	implementation of | operator
+1900	implementation of # operator
+1901	implementation of ~ operator
+1902	implementation of << operator
+1903	implementation of >> operator
+1904	implementation of & operator
+1905	implementation of | operator
+1906	implementation of # operator
+1907	implementation of ~ operator
+1908	implementation of << operator
+1909	implementation of >> operator
+1910	implementation of + operator
+1911	implementation of + operator
+1912	implementation of + operator
+1913	implementation of + operator
+1914	implementation of + operator
+1915	implementation of + operator
+1922	user privilege on relation by username, rel name
+1923	user privilege on relation by username, rel oid
+1924	user privilege on relation by user oid, rel name
+1925	user privilege on relation by user oid, rel oid
+1926	current user privilege on relation by rel name
+1927	current user privilege on relation by rel oid
+1928	statistics: number of scans done for table/index
+1929	statistics: number of tuples read by seqscan
+1930	statistics: number of tuples fetched by idxscan
+1931	statistics: number of tuples inserted
+1932	statistics: number of tuples updated
+1933	statistics: number of tuples deleted
+1934	statistics: number of blocks fetched
+1935	statistics: number of blocks found in cache
+1936	statistics: currently active backend IDs
+1937	statistics: PID of backend
+1938	statistics: database ID of backend
+1939	statistics: user ID of backend
+1940	statistics: current query of backend
+1941	statistics: number of backends in database
+1942	statistics: transactions committed
+1943	statistics: transactions rolled back
+1944	statistics: blocks fetched for database
+1945	statistics: blocks found in cache for database
+1946	convert bytea value into some ascii-only text string
+1947	convert ascii-encoded text string into bytea value
+1948	implementation of = operator
+1949	implementation of < operator
+1950	implementation of <= operator
+1951	implementation of > operator
+1952	implementation of >= operator
+1953	implementation of <> operator
+1954	less-equal-greater
+1961	adjust timestamp precision
+1962	aggregate transition function
+1963	aggregate transition function
+1964	aggregate final function
+1965	larger of two
+1966	smaller of two
+1967	adjust timestamptz precision
+1968	adjust time precision
+1969	adjust time with time zone precision
+1972	statistics: number of tuples hot updated
+1973	trunc(x/y)
+1980	trunc(x/y)
+1986	convert SQL regexp pattern to POSIX style
+1987	convert SQL regexp pattern to POSIX style
+1993	get description for object id and shared catalog name
+2003	implementation of || operator
+2004	implementation of || operator
+2005	implementation of ~~ operator
+2006	implementation of !~~ operator
+2007	matches LIKE expression
+2008	does not match LIKE expression
+2009	convert LIKE pattern to use backslash escapes
+2010	octet length
+2011	implementation of || operator
+2012	extract portion of string
+2013	extract portion of string
+2014	position of substring
+2015	trim selected bytes from both ends of string
+2019	convert timestamp with time zone to time
+2020	truncate timestamp to specified units
+2021	extract field from timestamp
+2022	statistics: information about currently active backends
+2023	jsonpath query first item with timezone
+2024	convert date to timestamp
+2025	convert date and time to timestamp
+2026	statistics: current backend PID
+2027	convert timestamp with time zone to timestamp
+2028	convert timestamp to timestamp with time zone
+2029	convert timestamp to date
+2030	jsonpath match with timezone
+2031	implementation of - operator
+2032	implementation of + operator
+2033	implementation of - operator
+2034	configuration load time
+2035	smaller of two
+2036	larger of two
+2037	adjust time with time zone to new zone
+2038	adjust time with time zone to new zone
+2039	hash
+2041	intervals overlap?
+2042	intervals overlap?
+2043	intervals overlap?
+2044	intervals overlap?
+2045	less-equal-greater
+2046	convert time with time zone to time
+2047	convert time to time with time zone
+2048	finite timestamp?
+2049	format timestamp to text
+2050	maximum value of all anyarray input values
+2051	minimum value of all anyarray input values
+2052	implementation of = operator
+2053	implementation of <> operator
+2054	implementation of < operator
+2055	implementation of <= operator
+2056	implementation of >= operator
+2057	implementation of > operator
+2058	date difference preserving months and years
+2059	date difference from today preserving months and years
+2069	adjust timestamp to new time zone
+2070	adjust timestamp to new time zone
+2071	implementation of + operator
+2072	implementation of - operator
+2073	extract text matching regular expression
+2074	extract text matching SQL regular expression
+2075	convert int8 to bitstring
+2076	convert bitstring to int8
+2077	SHOW X as a function
+2078	SET X as a function
+2079	is table visible in search path?
+2080	is type visible in search path?
+2081	is function visible in search path?
+2082	is operator visible in search path?
+2083	is opclass visible in search path?
+2084	SHOW ALL as a function
+2085	extract portion of string
+2086	extract portion of string
+2087	replace all occurrences in string of old_substr with new_substr
+2088	split string by field_sep and return field_num
+2089	convert int4 number to hex
+2090	convert int8 number to hex
+2091	array lower dimension
+2092	array upper dimension
+2093	is conversion visible in search path?
+2094	statistics: start time for current query of backend
+2096	terminate a server process
+2098	definition of a function
+2100	the average (arithmetic mean) as numeric of all bigint values
+2101	the average (arithmetic mean) as numeric of all integer values
+2102	the average (arithmetic mean) as numeric of all smallint values
+2103	the average (arithmetic mean) as numeric of all numeric values
+2104	the average (arithmetic mean) as float8 of all float4 values
+2105	the average (arithmetic mean) as float8 of all float8 values
+2106	the average (arithmetic mean) as interval of all interval values
+2107	sum as numeric across all bigint input values
+2108	sum as bigint across all integer input values
+2109	sum as bigint across all smallint input values
+2110	sum as float4 across all float4 input values
+2111	sum as float8 across all float8 input values
+2112	sum as money across all money input values
+2113	sum as interval across all interval input values
+2114	sum as numeric across all numeric input values
+2115	maximum value of all bigint input values
+2116	maximum value of all integer input values
+2117	maximum value of all smallint input values
+2118	maximum value of all oid input values
+2119	maximum value of all float4 input values
+2120	maximum value of all float8 input values
+2121	compression method for the compressed datum
+2122	maximum value of all date input values
+2123	maximum value of all time input values
+2124	maximum value of all time with time zone input values
+2125	maximum value of all money input values
+2126	maximum value of all timestamp input values
+2127	maximum value of all timestamp with time zone input values
+2128	maximum value of all interval input values
+2129	maximum value of all text input values
+2130	maximum value of all numeric input values
+2131	minimum value of all bigint input values
+2132	minimum value of all integer input values
+2133	minimum value of all smallint input values
+2134	minimum value of all oid input values
+2135	minimum value of all float4 input values
+2136	minimum value of all float8 input values
+2137	statistics: force stats to be flushed after the next commit
+2138	minimum value of all date input values
+2139	minimum value of all time input values
+2140	minimum value of all time with time zone input values
+2141	minimum value of all money input values
+2142	minimum value of all timestamp input values
+2143	minimum value of all timestamp with time zone input values
+2144	minimum value of all interval input values
+2145	minimum value of all text values
+2146	minimum value of all numeric input values
+2147	number of input rows for which the input expression is not null
+2148	historical alias for var_samp
+2149	historical alias for var_samp
+2150	historical alias for var_samp
+2151	historical alias for var_samp
+2152	historical alias for var_samp
+2153	historical alias for var_samp
+2154	historical alias for stddev_samp
+2155	historical alias for stddev_samp
+2156	historical alias for stddev_samp
+2157	historical alias for stddev_samp
+2158	historical alias for stddev_samp
+2159	historical alias for stddev_samp
+2160	implementation of ~<~ operator
+2161	implementation of ~<=~ operator
+2162	argument list of a function
+2163	implementation of ~>=~ operator
+2164	implementation of ~>~ operator
+2165	result type of a function
+2166	less-equal-greater
+2167	nearest integer >= value
+2168	total disk space usage for the specified database
+2169	exponentiation
+2170	bucket number of operand in equal-width histogram
+2171	cancel a server process' current query
+2172	prepare for taking an online backup
+2174	implementation of ~<~ operator
+2175	implementation of ~<=~ operator
+2176	array length
+2177	implementation of ~>=~ operator
+2178	implementation of ~>~ operator
+2179	GiST support
+2180	less-equal-greater
+2181	user privilege on sequence by username, seq name
+2182	user privilege on sequence by username, seq oid
+2183	user privilege on sequence by user oid, seq name
+2184	user privilege on sequence by user oid, seq oid
+2185	current user privilege on sequence by seq name
+2186	current user privilege on sequence by seq oid
+2188	less-equal-greater
+2189	less-equal-greater
+2190	less-equal-greater
+2191	less-equal-greater
+2192	less-equal-greater
+2193	less-equal-greater
+2194	less-equal-greater
+2195	less-equal-greater
+2196	inet address of the client
+2197	client's port number for this connection
+2198	inet address of the server
+2199	server's port number for this connection
+2212	I/O
+2213	I/O
+2214	I/O
+2215	I/O
+2216	I/O
+2217	I/O
+2218	I/O
+2219	I/O
+2220	I/O
+2221	I/O
+2230	statistics: discard current transaction's statistics snapshot
+2232	identity argument list of a function
+2233	hash
+2234	hash
+2236	bitwise-and smallint aggregate
+2237	bitwise-or smallint aggregate
+2238	bitwise-and integer aggregate
+2239	bitwise-or integer aggregate
+2240	bitwise-and bigint aggregate
+2241	bitwise-or bigint aggregate
+2242	bitwise-and bit aggregate
+2243	bitwise-or bit aggregate
+2244	maximum value of all bpchar input values
+2245	minimum value of all bpchar input values
+2246	(internal)
+2247	(internal)
+2248	(internal)
+2250	user privilege on database by username, database name
+2251	user privilege on database by username, database oid
+2252	user privilege on database by user oid, database name
+2253	user privilege on database by user oid, database oid
+2254	current user privilege on database by database name
+2255	current user privilege on database by database oid
+2256	user privilege on function by username, function name
+2257	user privilege on function by username, function oid
+2258	user privilege on function by user oid, function name
+2259	user privilege on function by user oid, function oid
+2260	current user privilege on function by function name
+2261	current user privilege on function by function oid
+2262	user privilege on language by username, language name
+2263	user privilege on language by username, language oid
+2264	user privilege on language by user oid, language name
+2265	user privilege on language by user oid, language oid
+2266	current user privilege on language by language name
+2267	current user privilege on language by language oid
+2268	user privilege on schema by username, schema name
+2269	user privilege on schema by username, schema oid
+2270	user privilege on schema by user oid, schema name
+2271	user privilege on schema by user oid, schema oid
+2272	current user privilege on schema by schema name
+2273	current user privilege on schema by schema oid
+2274	statistics: reset collected statistics for current database
+2282	information about all memory contexts of local backend
+2284	replace text using regexp
+2285	replace text using regexp
+2286	total disk space usage for the specified table and associated indexes
+2288	convert a long int to a human readable text using size units
+2289	convert generic options array to name/value table
+2290	I/O
+2291	I/O
+2292	I/O
+2293	I/O
+2294	I/O
+2295	I/O
+2296	I/O
+2297	I/O
+2298	I/O
+2299	I/O
+2300	I/O
+2301	I/O
+2302	I/O
+2303	I/O
+2304	I/O
+2305	I/O
+2306	statistics: information about SLRU caches
+2307	statistics: reset collected statistics for a single SLRU
+2308	nearest integer >= value
+2309	nearest integer <= value
+2310	sign of value
+2311	MD5 hash
+2312	I/O
+2313	I/O
+2316	(internal)
+2319	maximum octet length of a character in given encoding
+2320	nearest integer >= value
+2321	MD5 hash
+2322	total disk space usage for the specified tablespace
+2323	total disk space usage for the specified tablespace
+2324	total disk space usage for the specified database
+2325	disk space usage for the main fork of the specified table or index
+2331	expand array to set of rows
+2332	disk space usage for the specified fork of a table or index
+2333	aggregate transition function
+2334	aggregate final function
+2335	concatenate aggregate input into an array
+2338	implementation of < operator
+2339	implementation of <= operator
+2340	implementation of = operator
+2341	implementation of > operator
+2342	implementation of >= operator
+2343	implementation of <> operator
+2344	less-equal-greater
+2351	implementation of < operator
+2352	implementation of <= operator
+2353	implementation of = operator
+2354	implementation of > operator
+2355	implementation of >= operator
+2356	implementation of <> operator
+2357	less-equal-greater
+2364	implementation of < operator
+2365	implementation of <= operator
+2366	implementation of = operator
+2367	implementation of > operator
+2368	implementation of >= operator
+2369	implementation of <> operator
+2370	less-equal-greater
+2377	implementation of < operator
+2378	implementation of <= operator
+2379	implementation of = operator
+2380	implementation of > operator
+2381	implementation of >= operator
+2382	implementation of <> operator
+2383	less-equal-greater
+2390	user privilege on tablespace by username, tablespace name
+2391	user privilege on tablespace by username, tablespace oid
+2392	user privilege on tablespace by user oid, tablespace name
+2393	user privilege on tablespace by user oid, tablespace oid
+2394	current user privilege on tablespace by tablespace name
+2395	current user privilege on tablespace by tablespace oid
+2398	I/O
+2399	I/O
+2400	I/O
+2401	I/O
+2402	I/O
+2403	I/O
+2404	I/O
+2405	I/O
+2406	I/O
+2407	I/O
+2408	I/O
+2409	I/O
+2410	I/O
+2411	I/O
+2412	I/O
+2413	I/O
+2414	I/O
+2415	I/O
+2416	I/O
+2417	I/O
+2418	I/O
+2419	I/O
+2420	I/O
+2421	I/O
+2422	I/O
+2423	I/O
+2424	I/O
+2425	I/O
+2426	I/O
+2427	I/O
+2428	I/O
+2429	I/O
+2430	I/O
+2431	I/O
+2432	I/O
+2433	I/O
+2434	I/O
+2435	I/O
+2436	I/O
+2437	I/O
+2438	I/O
+2439	I/O
+2440	I/O
+2441	I/O
+2442	I/O
+2443	I/O
+2444	I/O
+2445	I/O
+2446	I/O
+2447	I/O
+2448	I/O
+2449	I/O
+2450	I/O
+2451	I/O
+2452	I/O
+2453	I/O
+2454	I/O
+2455	I/O
+2456	I/O
+2457	I/O
+2458	I/O
+2459	I/O
+2460	I/O
+2461	I/O
+2462	hyperbolic sine
+2463	hyperbolic cosine
+2464	hyperbolic tangent
+2465	inverse hyperbolic sine
+2466	inverse hyperbolic cosine
+2467	inverse hyperbolic tangent
+2468	I/O
+2469	I/O
+2470	I/O
+2471	I/O
+2472	I/O
+2473	I/O
+2474	I/O
+2475	I/O
+2476	I/O
+2477	I/O
+2478	I/O
+2479	I/O
+2480	I/O
+2481	I/O
+2482	I/O
+2483	I/O
+2484	I/O
+2485	I/O
+2486	I/O
+2487	I/O
+2488	I/O
+2489	I/O
+2490	I/O
+2491	I/O
+2492	I/O
+2493	I/O
+2494	I/O
+2495	I/O
+2496	I/O
+2497	I/O
+2498	I/O
+2499	I/O
+2500	I/O
+2501	I/O
+2502	I/O
+2503	I/O
+2504	source text of a rule with pretty-print option
+2505	select statement of a view with pretty-print option
+2506	select statement of a view with pretty-print option
+2507	index description (full create statement or single expression) with pretty-print option
+2508	constraint description with pretty-print option
+2509	deparse an encoded expression with pretty-print option
+2510	get the prepared statements for this session
+2511	get the open cursors for this session
+2512	aggregate final function
+2513	aggregate final function
+2514	aggregate final function
+2515	aggregate transition function
+2516	aggregate transition function
+2517	boolean-and aggregate
+2518	boolean-or aggregate
+2519	boolean-and aggregate
+2520	implementation of < operator
+2521	implementation of <= operator
+2522	implementation of = operator
+2523	implementation of > operator
+2524	implementation of >= operator
+2525	implementation of <> operator
+2526	less-equal-greater
+2527	implementation of < operator
+2528	implementation of <= operator
+2529	implementation of = operator
+2530	implementation of > operator
+2531	implementation of >= operator
+2532	implementation of <> operator
+2533	less-equal-greater
+2546	implementation of + operator
+2547	implementation of + operator
+2548	implementation of + operator
+2549	implementation of + operator
+2550	implementation of + operator
+2556	get OIDs of databases in a tablespace
+2557	convert int4 to boolean
+2558	convert boolean to int4
+2559	current value from last used sequence
+2560	postmaster start time
+2561	get array of PIDs of sessions blocking specified backend PID from acquiring a heavyweight lock
+2562	implementation of <<| operator
+2563	implementation of &<| operator
+2564	implementation of |&> operator
+2565	implementation of |>> operator
+2566	implementation of <<| operator
+2567	implementation of &<| operator
+2568	implementation of |&> operator
+2569	implementation of |>> operator
+2578	GiST support
+2580	convert jsonb to float8
+2581	GiST support
+2582	GiST support
+2583	GiST support
+2584	GiST support
+2585	GiST support
+2586	GiST support
+2587	implementation of &<| operator
+2588	implementation of |&> operator
+2591	GiST support
+2592	GiST support
+2596	aggregate final function
+2597	I/O
+2598	I/O
+2599	get the available time zone abbreviations
+2614	test XML value against XPath expression
+2621	reload configuration files
+2622	rotate log file
+2623	get information about file
+2624	read text from a file
+2625	list all files in a directory
+2626	sleep for the specified time in seconds
+2627	implementation of ~ operator
+2628	implementation of & operator
+2629	implementation of | operator
+2630	implementation of + operator
+2631	implementation of + operator
+2632	implementation of - operator
+2633	implementation of - operator
+2641	sample variance of bigint input values (square of the sample standard deviation)
+2642	sample variance of integer input values (square of the sample standard deviation)
+2643	sample variance of smallint input values (square of the sample standard deviation)
+2644	sample variance of float4 input values (square of the sample standard deviation)
+2645	sample variance of float8 input values (square of the sample standard deviation)
+2646	sample variance of numeric input values (square of the sample standard deviation)
+2647	current transaction time
+2648	current statement time
+2649	current clock time
+2700	GIN tsvector support
+2705	user privilege on role by username, role name
+2706	user privilege on role by username, role oid
+2707	user privilege on role by user oid, role name
+2708	user privilege on role by user oid, role oid
+2709	current user privilege on role by role name
+2710	current user privilege on role by role oid
+2711	promote groups of 24 hours to numbers of days and promote groups of 30 days to numbers of months
+2712	sample standard deviation of bigint input values
+2713	sample standard deviation of integer input values
+2714	sample standard deviation of smallint input values
+2715	sample standard deviation of float4 input values
+2716	sample standard deviation of float8 input values
+2717	sample standard deviation of numeric input values
+2718	population variance of bigint input values (square of the population standard deviation)
+2719	population variance of integer input values (square of the population standard deviation)
+2720	population variance of smallint input values (square of the population standard deviation)
+2721	population variance of float4 input values (square of the population standard deviation)
+2722	population variance of float8 input values (square of the population standard deviation)
+2723	population variance of numeric input values (square of the population standard deviation)
+2724	population standard deviation of bigint input values
+2725	population standard deviation of integer input values
+2726	population standard deviation of smallint input values
+2727	population standard deviation of float4 input values
+2728	population standard deviation of float8 input values
+2729	population standard deviation of numeric input values
+2730	trigger description with pretty-print option
+2731	arcsine, degrees
+2732	arccosine, degrees
+2733	arctangent, degrees
+2734	arctangent, two arguments, degrees
+2735	sine, degrees
+2736	cosine, degrees
+2737	tangent, degrees
+2738	cotangent, degrees
+2739	finish taking an online backup
+2740	aggregate serial function
+2741	aggregate deserial function
+2743	GIN array support
+2744	GIN array support
+2746	aggregate transition function
+2747	implementation of && operator
+2748	implementation of @> operator
+2749	implementation of <@ operator
+2758	statistics: tuples returned for database
+2759	statistics: tuples fetched for database
+2760	statistics: tuples inserted in database
+2761	statistics: tuples updated in database
+2762	statistics: tuples deleted in database
+2763	find match(es) for regexp
+2764	find match(es) for regexp
+2765	split string by pattern
+2766	split string by pattern
+2767	split string by pattern
+2768	split string by pattern
+2769	statistics: number of timed checkpoints started by the bgwriter
+2770	statistics: number of backend requested checkpoints started by the bgwriter
+2771	statistics: number of buffers written by the bgwriter during checkpoints
+2772	statistics: number of buffers written by the bgwriter for cleaning dirty buffers
+2773	statistics: number of times the bgwriter stopped processing when it had written too many buffers while cleaning
+2774	GIN array support
+2775	statistics: number of buffers written by backends
+2777	I/O
+2778	I/O
+2781	statistics: last manual vacuum time for a table
+2782	statistics: last auto vacuum time for a table
+2783	statistics: last manual analyze time for a table
+2784	statistics: last auto analyze time for a table
+2785	aggregate combine function
+2786	aggregate serial function
+2787	aggregate deserial function
+2788	statistics: wait event type on which backend is currently waiting
+2790	implementation of > operator
+2791	implementation of < operator
+2792	implementation of >= operator
+2793	implementation of <= operator
+2794	less-equal-greater
+2795	larger of two
+2796	smaller of two
+2797	maximum value of all tid input values
+2798	minimum value of all tid input values
+2803	number of input rows
+2804	increment, ignores second argument
+2805	aggregate transition function
+2806	aggregate transition function
+2807	aggregate final function
+2808	aggregate final function
+2809	aggregate final function
+2810	aggregate final function
+2811	aggregate final function
+2812	aggregate final function
+2813	aggregate final function
+2814	aggregate final function
+2815	aggregate final function
+2816	aggregate final function
+2817	aggregate final function
+2818	number of input rows in which both expressions are not null
+2819	sum of squares of the independent variable (sum(X^2) - sum(X)^2/N)
+2820	sum of squares of the dependent variable (sum(Y^2) - sum(Y)^2/N)
+2821	sum of products of independent times dependent variable (sum(X*Y) - sum(X) * sum(Y)/N)
+2822	average of the independent variable (sum(X)/N)
+2823	average of the dependent variable (sum(Y)/N)
+2824	square of the correlation coefficient
+2825	slope of the least-squares-fit linear equation determined by the (X, Y) pairs
+2826	y-intercept of the least-squares-fit linear equation determined by the (X, Y) pairs
+2827	population covariance
+2828	sample covariance
+2829	correlation coefficient
+2844	statistics: block read time, in milliseconds
+2845	statistics: block write time, in milliseconds
+2848	switch to new wal file
+2849	current wal write location
+2850	wal filename and byte offset, given a wal location
+2851	wal filename, given a wal location
+2852	current wal insert location
+2853	statistics: wait event on which backend is currently waiting
+2854	get OID of current session's temp schema, if any
+2855	is schema another session's temp schema?
+2856	get the available time zone names
+2857	statistics: start time for backend's current transaction
+2858	aggregate transition function
+2859	statistics: number of buffer allocations
+2878	statistics: number of live tuples
+2879	statistics: number of dead tuples
+2880	obtain exclusive advisory lock
+2881	obtain shared advisory lock
+2882	obtain exclusive advisory lock if available
+2883	obtain shared advisory lock if available
+2884	release exclusive advisory lock
+2885	release shared advisory lock
+2886	obtain exclusive advisory lock
+2887	obtain shared advisory lock
+2888	obtain exclusive advisory lock if available
+2889	obtain shared advisory lock if available
+2890	release exclusive advisory lock
+2891	release shared advisory lock
+2892	release all advisory locks
+2893	I/O
+2894	I/O
+2895	generate XML comment
+2896	perform a non-validating parse of a character string to produce an XML value
+2897	validate an XML value
+2898	I/O
+2899	I/O
+2900	aggregate transition function
+2901	concatenate XML values
+2902	I/O typmod
+2903	I/O typmod
+2904	I/O typmod
+2905	I/O typmod
+2906	I/O typmod
+2907	I/O typmod
+2908	I/O typmod
+2909	I/O typmod
+2910	I/O typmod
+2911	I/O typmod
+2912	I/O typmod
+2913	I/O typmod
+2914	I/O typmod
+2915	I/O typmod
+2916	I/O typmod
+2917	I/O typmod
+2918	I/O typmod
+2919	I/O typmod
+2920	I/O typmod
+2921	I/O typmod
+2922	serialize an XML value to a character string
+2923	map table contents to XML
+2924	map query result to XML
+2925	map rows from cursor to XML
+2926	map table structure to XML Schema
+2927	map query result structure to XML Schema
+2928	map cursor structure to XML Schema
+2929	map table contents and structure to XML and XML Schema
+2930	map query result and structure to XML and XML Schema
+2931	evaluate XPath expression, with namespaces support
+2932	evaluate XPath expression
+2933	map schema contents to XML
+2934	map schema structure to XML Schema
+2935	map schema contents and structure to XML and XML Schema
+2936	map database contents to XML
+2937	map database structure to XML Schema
+2938	map database contents and structure to XML and XML Schema
+2939	I/O
+2940	I/O
+2941	I/O
+2942	I/O
+2943	get current transaction ID
+2944	get current snapshot
+2945	get xmin of snapshot
+2946	get xmax of snapshot
+2947	get set of in-progress txids in snapshot
+2948	is txid visible in snapshot?
+2952	I/O
+2953	I/O
+2954	implementation of < operator
+2955	implementation of <= operator
+2956	implementation of = operator
+2957	implementation of >= operator
+2958	implementation of > operator
+2959	implementation of <> operator
+2960	less-equal-greater
+2961	I/O
+2962	I/O
+2963	hash
+2971	convert boolean to text
+2978	statistics: number of function calls
+2979	statistics: total execution time of function, in milliseconds
+2980	statistics: self execution time of function, in milliseconds
+2981	implementation of = operator
+2982	implementation of <> operator
+2983	implementation of < operator
+2984	implementation of > operator
+2985	implementation of <= operator
+2986	implementation of >= operator
+2987	less-equal-greater
+2997	disk space usage for the specified table, including TOAST, free space and visibility map
+2998	disk space usage for all indexes attached to the specified table
+2999	filenode identifier of relation
+3000	user privilege on foreign data wrapper by username, foreign data wrapper name
+3001	user privilege on foreign data wrapper by username, foreign data wrapper oid
+3002	user privilege on foreign data wrapper by user oid, foreign data wrapper name
+3003	user privilege on foreign data wrapper by user oid, foreign data wrapper oid
+3004	current user privilege on foreign data wrapper by foreign data wrapper name
+3005	current user privilege on foreign data wrapper by foreign data wrapper oid
+3006	user privilege on server by username, server name
+3007	user privilege on server by username, server oid
+3008	user privilege on server by user oid, server name
+3009	user privilege on server by user oid, server oid
+3010	current user privilege on server by server name
+3011	current user privilege on server by server oid
+3012	user privilege on column by username, rel name, col name
+3013	user privilege on column by username, rel name, col attnum
+3014	user privilege on column by username, rel oid, col name
+3015	user privilege on column by username, rel oid, col attnum
+3016	user privilege on column by user oid, rel name, col name
+3017	user privilege on column by user oid, rel name, col attnum
+3018	user privilege on column by user oid, rel oid, col name
+3019	user privilege on column by user oid, rel oid, col attnum
+3020	current user privilege on column by rel name, col name
+3021	current user privilege on column by rel name, col attnum
+3022	current user privilege on column by rel oid, col name
+3023	current user privilege on column by rel oid, col attnum
+3024	user privilege on any column by username, rel name
+3025	user privilege on any column by username, rel oid
+3026	user privilege on any column by user oid, rel name
+3027	user privilege on any column by user oid, rel oid
+3028	current user privilege on any column by rel name
+3029	current user privilege on any column by rel oid
+3030	substitute portion of bitstring
+3031	substitute portion of bitstring
+3032	get bit
+3033	set bit
+3034	file path of relation
+3035	get the channels that the current backend listens to
+3036	send a notification event
+3037	statistics: number of scans done for table/index in current transaction
+3038	statistics: number of tuples read by seqscan in current transaction
+3039	statistics: number of tuples fetched by idxscan in current transaction
+3040	statistics: number of tuples inserted in current transaction
+3041	statistics: number of tuples updated in current transaction
+3042	statistics: number of tuples deleted in current transaction
+3043	statistics: number of tuples hot updated in current transaction
+3044	statistics: number of blocks fetched in current transaction
+3045	statistics: number of blocks found in cache in current transaction
+3046	statistics: number of function calls in current transaction
+3047	statistics: total execution time of function in current transaction, in milliseconds
+3048	statistics: self execution time of function in current transaction, in milliseconds
+3049	test XML value against XPath expression, with namespace support
+3050	test XML value against XPath expression
+3051	determine if a string is well formed XML
+3052	determine if a string is well formed XML document
+3053	determine if a string is well formed XML content
+3054	statistics: number of manual vacuums for a table
+3055	statistics: number of auto vacuums for a table
+3056	statistics: number of manual analyzes for a table
+3057	statistics: number of auto analyzes for a table
+3058	concatenate values
+3059	concatenate values with separators
+3060	extract the first n characters
+3061	extract the last n characters
+3062	reverse text
+3063	statistics: number of backend buffer writes that did their own fsync
+3064	GiST support
+3065	statistics: recovery conflicts in database caused by drop tablespace
+3066	statistics: recovery conflicts in database caused by relation lock
+3067	statistics: recovery conflicts in database caused by snapshot expiry
+3068	statistics: recovery conflicts in database caused by shared buffer pin
+3069	statistics: recovery conflicts in database caused by buffer deadlock
+3070	statistics: recovery conflicts in database
+3071	pause wal replay
+3072	resume wal replay, if it was paused
+3073	true if wal replay is paused
+3074	statistics: last reset for a database
+3075	statistics: last reset for the bgwriter
+3076	GIN array support (obsolete)
+3077	GIN tsvector support (obsolete)
+3078	sequence parameters, for use by information schema
+3082	list available extensions
+3083	list available extension versions
+3084	list an extension's version update paths
+3086	flag an extension's table contents to be emitted by pg_dump
+3087	GIN tsvector support (obsolete)
+3088	GIN tsvector support (obsolete)
+3089	obtain exclusive advisory lock
+3090	obtain shared advisory lock
+3091	obtain exclusive advisory lock if available
+3092	obtain shared advisory lock if available
+3093	obtain exclusive advisory lock
+3094	obtain shared advisory lock
+3095	obtain exclusive advisory lock if available
+3096	obtain shared advisory lock if available
+3097	planner support for varchar length coercion
+3098	create a named restore point
+3099	statistics: information about currently active replication
+3100	row number within partition
+3101	integer rank with gaps
+3102	integer rank without gaps
+3103	fractional rank within partition
+3104	fractional row number within partition
+3105	split rows into N groups
+3106	fetch the preceding row value
+3107	fetch the Nth preceding row value
+3108	fetch the Nth preceding row value with default
+3109	fetch the following row value
+3110	fetch the Nth following row value
+3111	fetch the Nth following row value with default
+3112	fetch the first row value
+3113	fetch the last row value
+3114	fetch the Nth row value
+3116	I/O
+3117	I/O
+3120	I/O
+3121	I/O
+3129	sort support
+3130	sort support
+3131	sort support
+3132	sort support
+3133	sort support
+3134	sort support
+3135	sort support
+3136	sort support
+3137	sort support
+3138	user privilege on type by username, type name
+3139	user privilege on type by username, type oid
+3140	user privilege on type by user oid, type name
+3141	user privilege on type by user oid, type oid
+3142	current user privilege on type by type name
+3143	current user privilege on type by type oid
+3144	implementation of ~ operator
+3145	implementation of & operator
+3146	implementation of | operator
+3150	statistics: number of temporary files written
+3151	statistics: number of bytes in temporary files written
+3152	statistics: deadlocks detected in database
+3153	map array to json
+3154	map array to json with optional pretty printing
+3155	map row to json
+3156	map row to json with optional pretty printing
+3157	planner support for numeric length coercion
+3158	planner support for varbit length coercion
+3159	select statement of a view with pretty-printing and specified line wrapping
+3160	statistics: checkpoint time spent writing buffers to disk, in milliseconds
+3161	statistics: checkpoint time spent synchronizing buffers to disk, in milliseconds
+3162	collation of the argument; implementation of the COLLATION FOR expression
+3163	current trigger depth
+3165	difference in bytes, given two wal locations
+3166	convert a numeric to a human readable text using size units
+3167	remove any occurrences of an element from an array
+3168	replace any occurrences of an element in an array
+3169	restriction selectivity for range operators
+3170	large object seek (64 bit)
+3171	large object position (64 bit)
+3172	truncate large object (64 bit)
+3173	json aggregate transition function
+3174	json aggregate final function
+3175	aggregate input into json
+3176	map input to json
+3177	statistics: number of tuples changed since last analyze
+3178	aggregate final function
+3179	array cardinality
+3180	json object aggregate transition function
+3181	implementation of *= operator
+3182	implementation of *<> operator
+3183	implementation of *< operator
+3184	implementation of *> operator
+3185	implementation of *<= operator
+3186	implementation of *>= operator
+3187	less-equal-greater based on byte images
+3195	statistics: information about WAL archiver
+3196	json object aggregate final function
+3197	aggregate input into a json object
+3198	build a json array from any inputs
+3199	build an empty json array
+3200	build a json object from pairwise key/value inputs
+3201	build an empty json object
+3202	map text array of key value pairs to json object
+3203	map text arrays of keys and values to json object
+3204	get record fields from a json object
+3205	get set of records with fields from a json array of objects
+3207	length of jsonb array
+3208	key value pairs of a jsonb object
+3209	get record fields from a jsonb object
+3210	get the type of a jsonb value
+3214	implementation of ->> operator
+3215	implementation of -> operator
+3216	implementation of ->> operator
+3217	get value from jsonb with path elements
+3218	bucket number of operand given a sorted array of bucket lower bounds
+3219	elements of a jsonb array
+3229	I/O
+3230	I/O
+3231	implementation of < operator
+3232	implementation of <= operator
+3233	implementation of = operator
+3234	implementation of >= operator
+3235	implementation of > operator
+3236	implementation of <> operator
+3237	implementation of - operator
+3238	I/O
+3239	I/O
+3251	less-equal-greater
+3252	hash
+3255	sort support
+3259	non-persistent series generator
+3260	non-persistent series generator
+3261	remove object fields with null values from json
+3262	remove object fields with null values from jsonb
+3263	map text array of key value pairs to jsonb object
+3264	map text array of key value pairs to jsonb object
+3265	jsonb aggregate transition function
+3266	jsonb aggregate final function
+3267	aggregate input into jsonb
+3268	jsonb object aggregate transition function
+3269	jsonb object aggregate final function
+3270	aggregate inputs into jsonb object
+3271	build a jsonb array from any inputs
+3272	build an empty jsonb array
+3273	build a jsonb object from pairwise key/value inputs
+3274	build an empty jsonb object
+3275	implementation of <-> operator
+3277	returns an offset of value in array
+3278	returns an offset of value in array with start index
+3279	returns an array of offsets of some value in array
+3280	GiST support
+3281	number of decimal digits in the fractional part
+3282	GiST support
+3283	sort support
+3288	GiST support
+3290	implementation of <-> operator
+3292	implementation of <-> operator
+3293	read text from a file
+3294	SHOW X as a function, optionally no error for missing variable
+3295	read bytea from a file
+3296	get the fraction of the asynchronous notification queue currently in use
+3297	list all files in a directory
+3298	row security for current context active on table by table oid
+3299	row security for current context active on table by table name
+3300	sort support
+3301	implementation of || operator
+3302	implementation of - operator
+3303	implementation of - operator
+3304	implementation of #- operator
+3305	Set part of a jsonb
+3306	Indented text from jsonb
+3307	get information about file
+3308	implementation of <> operator
+3309	implementation of <> operator
+3311	I/O
+3312	I/O
+3313	BERNOULLI tablesample method handler
+3314	SYSTEM tablesample method handler
+3317	statistics: information about WAL receiver
+3318	statistics: information about progress of backends running maintenance command
+3319	delete lexemes that do not have one of the given weights
+3320	set given weight for given lexemes
+3321	delete lexeme
+3322	expand tsvector to set of rows
+3323	delete given lexemes
+3324	aggregate combine function
+3325	aggregate combine function
+3326	convert tsvector to array of lexemes
+3327	build tsvector from array of lexemes
+3328	sort support
+3329	show config file settings
+3330	current wal flush location
+3331	sort support
+3332	sort support
+3333	sort support
+3334	convert a size in human-readable format with size units into bytes
+3335	aggregate serial function
+3336	aggregate deserial function
+3337	aggregate combine function
+3338	aggregate combine function
+3339	aggregate serial function
+3340	aggregate deserial function
+3341	aggregate combine function
+3342	aggregate combine function
+3343	implementation of - operator
+3344	implementation of * operator
+3345	implementation of / operator
+3348	get current transaction ID
+3352	partition key description
+3353	list files in the log directory
+3354	list of files in the WAL directory
+3355	I/O
+3356	I/O
+3357	I/O
+3358	I/O
+3359	sort support
+3360	commit status of transaction
+3376	get array of PIDs of sessions blocking specified backend PID from acquiring a safe snapshot
+3378	isolationtester support function
+3382	get identification of SQL object for pg_get_object_address()
+3383	BRIN minmax support
+3384	BRIN minmax support
+3385	BRIN minmax support
+3386	BRIN minmax support
+3387	aggregate transition function
+3388	aggregate final function
+3389	aggregate final function
+3390	aggregate final function
+3391	aggregate final function
+3392	aggregate final function
+3393	aggregate final function
+3396	find first match for regexp
+3397	find first match for regexp
+3399	implementation of * operator
+3400	pg_config binary as a function
+3401	show pg_hba.conf rules
+3403	is statistics object visible in search path?
+3404	I/O
+3405	I/O
+3406	I/O
+3407	I/O
+3408	partition constraint description
+3409	hash
+3410	hash
+3411	hash
+3412	hash
+3413	hash
+3414	hash
+3415	extended statistics object description
+3416	hash
+3417	hash a range
+3418	hash
+3419	SHA-224 hash
+3420	SHA-256 hash
+3421	SHA-384 hash
+3422	SHA-512 hash
+3423	view partition tree tables
+3424	get top-most partition root parent
+3425	view ancestors of the partition
+3426	statistics: checksum failures detected in database
+3427	details about MCV list items
+3428	statistics: when last checksum failure was detected in database
+3432	generate random UUID
+3434	GiST tsvector support
+3435	sort support
+3436	promote standby server
+3437	restriction selectivity of exact prefix
+3438	join selectivity of exact prefix
+3441	pg_controldata general state information as a function
+3442	pg_controldata checkpoint state information as a function
+3443	pg_controldata recovery state information as a function
+3444	pg_controldata init state information as a function
+3445	import collations from operating system
+3446	I/O
+3447	I/O
+3448	get actual version of collation from operating system
+3449	convert jsonb to numeric
+3450	convert jsonb to int2
+3451	convert jsonb to int4
+3452	convert jsonb to int8
+3453	convert jsonb to float4
+3454	relation OID for filenode and tablespace
+3457	create new large object with given content
+3458	read entire large object
+3459	read large object from offset for length
+3460	write data at offset
+3461	construct timestamp
+3462	construct timestamp with time zone
+3463	construct timestamp with time zone
+3464	construct interval
+3465	elements of jsonb array
+3469	SP-GiST support for quad tree over range
+3470	SP-GiST support for quad tree over range
+3471	SP-GiST support for quad tree over range
+3472	SP-GiST support for quad tree over range
+3473	SP-GiST support for quad tree over range
+3475	get set of records with fields from a jsonb array of objects
+3476	convert operator name to regoperator
+3478	implementation of -> operator
+3479	convert proname to regprocedure
+3480	GIN support
+3482	GIN support
+3483	GIN support
+3484	GIN support
+3485	GIN support
+3486	GIN support
+3487	GIN support
+3488	GIN support
+3489	GIN support
+3490	get record fields from a jsonb object
+3491	get set of records with fields from a jsonb array of objects
+3492	convert operator name to regoper
+3493	convert type name to regtype
+3494	convert proname to regproc
+3495	convert classname to regclass
+3496	aggregate transition function
+3497	aggregate transition function
+3498	aggregate final function
+3499	aggregate final function
+3504	I/O
+3505	I/O
+3506	I/O
+3507	I/O
+3508	implementation of = operator
+3509	implementation of <> operator
+3510	implementation of < operator
+3511	implementation of > operator
+3512	implementation of <= operator
+3513	implementation of >= operator
+3514	less-equal-greater
+3515	hash
+3524	smaller of two
+3525	larger of two
+3526	maximum value of all enum input values
+3527	minimum value of all enum input values
+3528	first value of the input enum type
+3529	last value of the input enum type
+3530	range between the two given enum values, as an ordered array
+3531	range of the given enum type, as an ordered array
+3532	I/O
+3533	I/O
+3535	aggregate transition function
+3536	aggregate final function
+3537	get identification of SQL object
+3538	concatenate aggregate input into a string
+3539	format text message
+3540	format text message
+3543	aggregate transition function
+3544	aggregate final function
+3545	concatenate aggregate input into a bytea
+3546	decrement
+3547	decrement, ignores second argument
+3548	aggregate transition function
+3549	aggregate transition function
+3551	implementation of && operator
+3553	GiST support
+3554	GiST support
+3555	GiST support
+3556	convert jsonb to boolean
+3557	GiST support
+3558	GiST support
+3559	GiST support
+3560	restriction selectivity for network operators
+3561	join selectivity for network operators
+3562	larger of two
+3563	smaller of two
+3564	maximum value of all inet input values
+3565	minimum value of all inet input values
+3566	list objects dropped by the current command
+3567	aggregate transition function
+3568	aggregate transition function
+3569	aggregate transition function
+3570	aggregate transition function
+3571	aggregate transition function
+3572	aggregate final function
+3573	GiST support
+3577	emit a textual logical decoding message
+3578	emit a binary logical decoding message
+3579	Insert value into a jsonb
+3581	get commit timestamp of a transaction
+3582	for use by pg_upgrade
+3583	get transaction Id, commit timestamp and replication origin of latest transaction commit
+3584	for use by pg_upgrade
+3586	for use by pg_upgrade
+3587	for use by pg_upgrade
+3588	for use by pg_upgrade
+3589	for use by pg_upgrade
+3590	for use by pg_upgrade
+3591	for use by pg_upgrade
+3594	I/O
+3595	I/O
+3610	I/O
+3611	I/O
+3612	I/O
+3613	I/O
+3616	implementation of < operator
+3617	implementation of <= operator
+3618	implementation of = operator
+3619	implementation of <> operator
+3620	implementation of >= operator
+3621	implementation of > operator
+3622	less-equal-greater
+3623	strip position information
+3624	set given weight for whole tsvector
+3625	implementation of || operator
+3634	implementation of @@ operator
+3635	implementation of @@ operator
+3638	I/O
+3639	I/O
+3640	I/O
+3641	I/O
+3646	I/O
+3647	I/O
+3648	GiST tsvector support
+3649	GiST tsvector support
+3650	GiST tsvector support
+3651	GiST tsvector support
+3652	GiST tsvector support
+3653	GiST tsvector support
+3654	GiST tsvector support
+3656	GIN tsvector support
+3657	GIN tsvector support
+3658	GIN tsvector support
+3662	implementation of < operator
+3663	implementation of <= operator
+3664	implementation of = operator
+3665	implementation of <> operator
+3666	implementation of >= operator
+3667	implementation of > operator
+3668	less-equal-greater
+3669	implementation of && operator
+3670	implementation of || operator
+3671	implementation of !! operator
+3672	number of nodes
+3673	show real useful query for GiST index
+3684	rewrite tsquery
+3685	rewrite tsquery
+3686	restriction selectivity of tsvector @@ tsquery
+3687	join selectivity of tsvector @@ tsquery
+3688	tsvector typanalyze
+3689	statistics of tsvector column
+3690	statistics of tsvector column
+3691	implementation of @> operator
+3692	implementation of <@ operator
+3695	GiST tsquery support
+3696	implementation of ^@ operator
+3697	GiST tsquery support
+3698	GiST tsquery support
+3699	GiST tsquery support
+3700	GiST tsquery support
+3701	GiST tsquery support
+3703	relevance
+3704	relevance
+3705	relevance
+3706	relevance
+3707	relevance
+3708	relevance
+3709	relevance
+3710	relevance
+3711	number of lexemes
+3713	get parser's token types
+3714	get parser's token types
+3715	parse text to tokens
+3716	parse text to tokens
+3717	(internal)
+3718	(internal)
+3719	(internal)
+3720	(internal)
+3721	(internal)
+3723	normalize one word by dictionary
+3724	GIN tsvector support
+3725	(internal)
+3726	(internal)
+3728	(internal)
+3729	(internal)
+3731	(internal)
+3732	(internal)
+3736	I/O
+3737	I/O
+3738	I/O
+3739	I/O
+3740	(internal)
+3741	(internal)
+3743	generate headline
+3744	generate headline
+3745	transform to tsvector
+3746	make tsquery
+3747	transform to tsquery
+3749	transform to tsvector
+3750	make tsquery
+3751	transform to tsquery
+3752	trigger for automatic update of tsvector column
+3753	trigger for automatic update of tsvector column
+3754	generate headline
+3755	generate headline
+3756	is text search parser visible in search path?
+3757	is text search dictionary visible in search path?
+3758	is text search configuration visible in search path?
+3759	get current tsearch configuration
+3760	implementation of @@ operator
+3761	implementation of @@ operator
+3768	is text search template visible in search path?
+3771	I/O
+3772	I/O
+3773	I/O
+3774	I/O
+3775	statistics: reset collected statistics shared across the cluster
+3776	statistics: reset collected statistics for a single table or index in the current database or shared across all databases in the cluster
+3777	statistics: reset collected statistics for a single function in the current database
+3778	tablespace location
+3779	create a physical replication slot
+3780	drop a replication slot
+3781	information about replication slots currently in use
+3782	get changes from replication slot
+3783	get binary changes from replication slot
+3784	peek at changes from replication slot
+3785	peek at binary changes from replication slot
+3786	set up a logical replication slot
+3787	map input to jsonb
+3788	statistics: timestamp of the current statistics snapshot
+3789	clean up GIN pending list
+3790	GiST tsvector support (obsolete)
+3791	GIN tsvector support (obsolete)
+3792	GIN tsvector support (obsolete)
+3793	GiST tsquery support (obsolete)
+3795	SP-GiST support
+3796	SP-GiST support
+3797	SP-GiST support
+3798	SP-GiST support
+3799	SP-GiST support
+3800	current logging collector file location
+3801	current logging collector file location
+3803	I/O
+3804	I/O
+3805	I/O
+3806	I/O
+3808	function argument default
+3809	export a snapshot
+3810	true if server is in recovery
+3811	convert int4 to money
+3812	convert int8 to money
+3815	is collation visible in search path?
+3816	array typanalyze
+3817	restriction selectivity for array-containment operators
+3818	join selectivity for array-containment operators
+3819	view members of a multixactid
+3820	current wal flush location
+3821	last wal replay location
+3822	implementation of / operator
+3823	convert money to numeric
+3824	convert numeric to money
+3826	read text from a file
+3827	read bytea from a file
+3828	read bytea from a file
+3829	is opfamily visible in search path?
+3830	timestamp of last replay xact
+3832	I/O
+3833	I/O
+3834	I/O
+3835	I/O
+3836	I/O
+3837	I/O
+3839	get machine-parseable identification of SQL object
+3840	int4range constructor
+3841	int4range constructor
+3842	is a relation insertable/updatable/deletable
+3843	is a column updatable
+3844	numrange constructor
+3845	numrange constructor
+3846	construct date
+3847	construct time
+3848	lower bound of range
+3849	upper bound of range
+3850	is the range empty?
+3851	is the range's lower bound inclusive?
+3852	is the range's upper bound inclusive?
+3853	is the range's lower bound infinite?
+3854	is the range's upper bound infinite?
+3855	implementation of = operator
+3856	implementation of <> operator
+3857	implementation of && operator
+3858	implementation of @> operator
+3859	implementation of @> operator
+3860	implementation of <@ operator
+3861	implementation of <@ operator
+3862	implementation of -|- operator
+3863	implementation of << operator
+3864	implementation of >> operator
+3865	implementation of &< operator
+3866	implementation of &> operator
+3867	implementation of + operator
+3868	implementation of * operator
+3869	implementation of - operator
+3870	less-equal-greater
+3871	implementation of < operator
+3872	implementation of <= operator
+3873	implementation of >= operator
+3874	implementation of > operator
+3875	GiST support
+3876	GiST support
+3878	advance logical replication slot
+3879	GiST support
+3880	GiST support
+3881	GiST support
+3902	hash a range
+3914	convert an int4 range to canonical form
+3915	convert a date range to canonical form
+3916	range typanalyze
+3917	planner support for timestamp length coercion
+3918	planner support for interval length coercion
+3920	GIN array support
+3921	GIN tsvector support
+3922	float8 difference of two int4 values
+3923	float8 difference of two int8 values
+3924	float8 difference of two numeric values
+3925	float8 difference of two date values
+3928	convert an int8 range to canonical form
+3929	float8 difference of two timestamp values
+3930	float8 difference of two timestamp with time zone values
+3931	get jsonb object keys
+3932	key value pairs of a jsonb object
+3933	tsrange constructor
+3934	tsrange constructor
+3935	sleep for the specified interval
+3936	sleep until the specified time
+3937	tstzrange constructor
+3938	tstzrange constructor
+3939	age of a multi-transaction ID, in multi-transactions before current multi-transaction
+3940	get value from jsonb as text with path elements
+3941	daterange constructor
+3942	daterange constructor
+3943	show hardwired default privileges, primarily for use by the information schema
+3944	planner support for time length coercion
+3945	int8range constructor
+3946	int8range constructor
+3947	implementation of -> operator
+3948	implementation of ->> operator
+3949	implementation of -> operator
+3950	implementation of ->> operator
+3951	get value from json with path elements
+3952	brin: standalone scan new table pages
+3953	get value from json as text with path elements
+3954	get OID-based object address from name/args arrays
+3955	key value pairs of a json object
+3956	length of json array
+3957	get json object keys
+3958	key value pairs of a json object
+3959	key value pairs of a json object
+3960	get record fields from a json object
+3961	get set of records with fields from a json array of objects
+3968	get the type of a json value
+3969	elements of json array
+3970	aggregate transition function
+3971	aggregate transition function
+3972	discrete percentile
+3973	aggregate final function
+3974	continuous distribution percentile
+3975	aggregate final function
+3976	continuous distribution percentile
+3977	aggregate final function
+3978	multiple discrete percentiles
+3979	aggregate final function
+3980	multiple continuous percentiles
+3981	aggregate final function
+3982	multiple continuous percentiles
+3983	aggregate final function
+3984	most common value
+3985	aggregate final function
+3986	rank of hypothetical row
+3987	aggregate final function
+3988	fractional rank of hypothetical row
+3989	aggregate final function
+3990	cumulative distribution of hypothetical row
+3991	aggregate final function
+3992	rank of hypothetical row without gaps
+3993	aggregate final function
+3994	planner support for generate_series
+3995	planner support for generate_series
+3996	planner support for array_unnest
+3998	GiST support
+3999	brin: standalone scan new table pages
+4001	I/O
+4002	I/O
+4003	I/O
+4004	I/O
+4005	jsonpath exists test
+4006	jsonpath query
+4007	jsonpath query wrapped into array
+4008	jsonpath query first item
+4009	jsonpath match
+4010	implementation of @? operator
+4011	implementation of @@ operator
+4014	brin: desummarize page range
+4018	SP-GiST support for quad tree over point
+4019	SP-GiST support for quad tree over point
+4020	SP-GiST support for quad tree over point
+4021	SP-GiST support for quad tree over point
+4022	SP-GiST support for quad tree and k-d tree over point
+4023	SP-GiST support for k-d tree over point
+4024	SP-GiST support for k-d tree over point
+4025	SP-GiST support for k-d tree over point
+4026	SP-GiST support for k-d tree over point
+4027	SP-GiST support for radix tree over text
+4028	SP-GiST support for radix tree over text
+4029	SP-GiST support for radix tree over text
+4030	SP-GiST support for radix tree over text
+4031	SP-GiST support for radix tree over text
+4032	sequence last value
+4038	implementation of <> operator
+4039	implementation of < operator
+4040	implementation of > operator
+4041	implementation of <= operator
+4042	implementation of >= operator
+4043	implementation of = operator
+4044	less-equal-greater
+4045	hash
+4046	implementation of @> operator
+4047	implementation of ? operator
+4048	implementation of ?| operator
+4049	implementation of ?& operator
+4050	implementation of <@ operator
+4051	aggregate transition function
+4052	aggregate final function
+4053	concatenate aggregate input into an array
+4057	the smallest range which includes both of the given ranges
+4063	the smallest network which includes both of the given networks
+4067	bounding box of two boxes
+4071	are the addresses from the same family?
+4083	for use by pg_upgrade
+4084	I/O
+4085	I/O
+4086	convert namespace name to regnamespace
+4087	I/O
+4088	I/O
+4091	convert point to empty box
+4092	I/O
+4093	convert role name to regrole
+4094	I/O
+4095	I/O
+4098	I/O
+4099	rotate log file - old version for adminpack 1.0
+4100	read text from a file - old version for adminpack 1.0
+4101	for use by pg_upgrade
+4105	BRIN inclusion support
+4106	BRIN inclusion support
+4107	BRIN inclusion support
+4108	BRIN inclusion support
+4110	I/O
+4111	I/O
+4112	MACADDR8 manufacturer fields
+4113	implementation of = operator
+4114	implementation of < operator
+4115	implementation of <= operator
+4116	implementation of > operator
+4117	implementation of >= operator
+4118	implementation of <> operator
+4119	less-equal-greater
+4120	implementation of ~ operator
+4121	implementation of & operator
+4122	implementation of | operator
+4123	convert macaddr to macaddr8
+4124	convert macaddr8 to macaddr
+4125	set 7th bit in macaddr8
+4126	window RANGE support
+4127	window RANGE support
+4128	window RANGE support
+4129	window RANGE support
+4130	window RANGE support
+4131	window RANGE support
+4132	window RANGE support
+4133	window RANGE support
+4134	window RANGE support
+4135	window RANGE support
+4136	window RANGE support
+4137	window RANGE support
+4138	window RANGE support
+4139	window RANGE support
+4140	window RANGE support
+4141	window RANGE support
+4187	larger of two
+4188	smaller of two
+4189	maximum value of all pg_lsn input values
+4190	minimum value of all pg_lsn input values
+4193	I/O
+4194	I/O
+4195	convert classname to regcollation
+4196	I/O
+4197	I/O
+4201	generate headline from jsonb
+4202	generate headline from jsonb
+4203	generate headline from jsonb
+4204	generate headline from jsonb
+4205	generate headline from json
+4206	generate headline from json
+4207	generate headline from json
+4208	generate headline from json
+4209	transform string values from jsonb to tsvector
+4210	transform string values from json to tsvector
+4211	transform string values from jsonb to tsvector
+4212	transform string values from json to tsvector
+4213	transform specified values from jsonb to tsvector
+4214	transform specified values from jsonb to tsvector
+4215	transform specified values from json to tsvector
+4216	transform specified values from json to tsvector
+4220	copy a physical replication slot, changing temporality
+4221	copy a physical replication slot
+4222	copy a logical replication slot, changing temporality and plugin
+4223	copy a logical replication slot, changing temporality
+4224	copy a logical replication slot
+4226	I/O
+4227	I/O
+4228	the smallest range which includes the whole multirange
+4229	I/O
+4230	I/O
+4231	I/O
+4232	I/O
+4233	I/O
+4234	I/O
+4235	lower bound of multirange
+4236	upper bound of multirange
+4237	is the multirange empty?
+4238	is the multirange's lower bound inclusive?
+4239	is the multirange's upper bound inclusive?
+4240	is the multirange's lower bound infinite?
+4241	is the multirange's upper bound infinite?
+4242	multirange typanalyze
+4243	restriction selectivity for multirange operators
+4244	implementation of = operator
+4245	implementation of <> operator
+4246	implementation of && operator
+4247	implementation of && operator
+4248	implementation of && operator
+4249	implementation of @> operator
+4250	implementation of @> operator
+4251	implementation of @> operator
+4252	implementation of <@ operator
+4253	implementation of <@ operator
+4254	implementation of <@ operator
+4255	implementation of -|- operator
+4256	implementation of -|- operator
+4257	implementation of -|- operator
+4258	implementation of << operator
+4259	implementation of << operator
+4260	implementation of << operator
+4261	implementation of >> operator
+4262	implementation of >> operator
+4263	implementation of >> operator
+4264	implementation of &< operator
+4265	implementation of &< operator
+4266	implementation of &< operator
+4267	implementation of &> operator
+4268	implementation of &> operator
+4269	implementation of &> operator
+4270	implementation of + operator
+4271	implementation of - operator
+4272	implementation of * operator
+4273	less-equal-greater
+4274	implementation of < operator
+4275	implementation of <= operator
+4276	implementation of >= operator
+4277	implementation of > operator
+4278	hash a multirange
+4279	hash a multirange
+4280	int4multirange constructor
+4281	int4multirange constructor
+4282	int4multirange constructor
+4283	nummultirange constructor
+4284	nummultirange constructor
+4285	nummultirange constructor
+4286	tsmultirange constructor
+4287	tsmultirange constructor
+4288	tsmultirange constructor
+4289	tstzmultirange constructor
+4290	tstzmultirange constructor
+4291	tstzmultirange constructor
+4292	datemultirange constructor
+4293	datemultirange constructor
+4294	datemultirange constructor
+4295	int8multirange constructor
+4296	int8multirange constructor
+4297	int8multirange constructor
+4298	anymultirange cast
+4299	aggregate transition function
+4300	aggregate final function
+4301	combine aggregate input into a multirange
+4302	internal conversion function for KOI8R to MULE_INTERNAL
+4303	internal conversion function for MULE_INTERNAL to KOI8R
+4304	internal conversion function for ISO-8859-5 to MULE_INTERNAL
+4305	internal conversion function for MULE_INTERNAL to ISO-8859-5
+4306	internal conversion function for WIN1251 to MULE_INTERNAL
+4307	internal conversion function for MULE_INTERNAL to WIN1251
+4308	internal conversion function for WIN866 to MULE_INTERNAL
+4309	internal conversion function for MULE_INTERNAL to WIN866
+4310	internal conversion function for KOI8R to WIN1251
+4311	internal conversion function for WIN1251 to KOI8R
+4312	internal conversion function for KOI8R to WIN866
+4313	internal conversion function for WIN866 to KOI8R
+4314	internal conversion function for WIN866 to WIN1251
+4315	internal conversion function for WIN1251 to WIN866
+4316	internal conversion function for ISO-8859-5 to KOI8R
+4317	internal conversion function for KOI8R to ISO-8859-5
+4318	internal conversion function for ISO-8859-5 to WIN1251
+4319	internal conversion function for WIN1251 to ISO-8859-5
+4320	internal conversion function for ISO-8859-5 to WIN866
+4321	internal conversion function for WIN866 to ISO-8859-5
+4322	internal conversion function for EUC_CN to MULE_INTERNAL
+4323	internal conversion function for MULE_INTERNAL to EUC_CN
+4324	internal conversion function for EUC_JP to SJIS
+4325	internal conversion function for SJIS to EUC_JP
+4326	internal conversion function for EUC_JP to MULE_INTERNAL
+4327	internal conversion function for SJIS to MULE_INTERNAL
+4328	internal conversion function for MULE_INTERNAL to EUC_JP
+4329	internal conversion function for MULE_INTERNAL to SJIS
+4330	internal conversion function for EUC_KR to MULE_INTERNAL
+4331	internal conversion function for MULE_INTERNAL to EUC_KR
+4332	internal conversion function for EUC_TW to BIG5
+4333	internal conversion function for BIG5 to EUC_TW
+4334	internal conversion function for EUC_TW to MULE_INTERNAL
+4335	internal conversion function for BIG5 to MULE_INTERNAL
+4336	internal conversion function for MULE_INTERNAL to EUC_TW
+4337	internal conversion function for MULE_INTERNAL to BIG5
+4338	internal conversion function for LATIN2 to MULE_INTERNAL
+4339	internal conversion function for MULE_INTERNAL to LATIN2
+4340	internal conversion function for WIN1250 to MULE_INTERNAL
+4341	internal conversion function for MULE_INTERNAL to WIN1250
+4342	internal conversion function for LATIN2 to WIN1250
+4343	internal conversion function for WIN1250 to LATIN2
+4344	internal conversion function for LATIN1 to MULE_INTERNAL
+4345	internal conversion function for MULE_INTERNAL to LATIN1
+4346	internal conversion function for LATIN3 to MULE_INTERNAL
+4347	internal conversion function for MULE_INTERNAL to LATIN3
+4348	internal conversion function for LATIN4 to MULE_INTERNAL
+4349	internal conversion function for MULE_INTERNAL to LATIN4
+4350	Unicode normalization
+4351	check Unicode normalization
+4352	internal conversion function for BIG5 to UTF8
+4353	internal conversion function for UTF8 to BIG5
+4354	internal conversion function for UTF8 to KOI8R
+4355	internal conversion function for KOI8R to UTF8
+4356	internal conversion function for UTF8 to KOI8U
+4357	internal conversion function for KOI8U to UTF8
+4358	internal conversion function for UTF8 to WIN
+4359	internal conversion function for WIN to UTF8
+4360	internal conversion function for EUC_CN to UTF8
+4361	internal conversion function for UTF8 to EUC_CN
+4362	internal conversion function for EUC_JP to UTF8
+4363	internal conversion function for UTF8 to EUC_JP
+4364	internal conversion function for EUC_KR to UTF8
+4365	internal conversion function for UTF8 to EUC_KR
+4366	internal conversion function for EUC_TW to UTF8
+4367	internal conversion function for UTF8 to EUC_TW
+4368	internal conversion function for GB18030 to UTF8
+4369	internal conversion function for UTF8 to GB18030
+4370	internal conversion function for GBK to UTF8
+4371	internal conversion function for UTF8 to GBK
+4372	internal conversion function for UTF8 to ISO-8859 2-16
+4373	internal conversion function for ISO-8859 2-16 to UTF8
+4374	internal conversion function for LATIN1 to UTF8
+4375	internal conversion function for UTF8 to LATIN1
+4376	internal conversion function for JOHAB to UTF8
+4377	internal conversion function for UTF8 to JOHAB
+4378	internal conversion function for SJIS to UTF8
+4379	internal conversion function for UTF8 to SJIS
+4380	internal conversion function for UHC to UTF8
+4381	internal conversion function for UTF8 to UHC
+4382	internal conversion function for EUC_JIS_2004 to UTF8
+4383	internal conversion function for UTF8 to EUC_JIS_2004
+4384	internal conversion function for SHIFT_JIS_2004 to UTF8
+4385	internal conversion function for UTF8 to SHIFT_JIS_2004
+4386	internal conversion function for EUC_JIS_2004 to SHIFT_JIS_2004
+4387	internal conversion function for SHIFT_JIS_2004 to EUC_JIS_2004
+4388	range aggregate by intersecting
+4389	range aggregate by intersecting
+4390	for use by pg_upgrade
+4391	for use by pg_upgrade
+4401	range aggregate by intersecting
+4450	range aggregate by intersecting
+4541	implementation of @> operator
+4542	implementation of <@ operator
+4543	log memory contexts of the specified backend
+4545	for use by pg_upgrade
+4546	for use by pg_upgrade
+4547	for use by pg_upgrade
+4548	for use by pg_upgrade
+4566	return Oid of the table getting rewritten
+4567	return reason code for table getting rewritten
+4568	list DDL actions being executed by the current command
+4591	BRIN bloom support
+4592	BRIN bloom support
+4593	BRIN bloom support
+4594	BRIN bloom support
+4595	BRIN bloom support
+4596	I/O
+4597	I/O
+4598	I/O
+4599	I/O
+4616	BRIN multi minmax support
+4617	BRIN multi minmax support
+4618	BRIN multi minmax support
+4619	BRIN multi minmax support
+4620	BRIN multi minmax support
+4621	BRIN multi minmax int2 distance
+4622	BRIN multi minmax int4 distance
+4623	BRIN multi minmax int8 distance
+4624	BRIN multi minmax float4 distance
+4625	BRIN multi minmax float8 distance
+4626	BRIN multi minmax numeric distance
+4627	BRIN multi minmax tid distance
+4628	BRIN multi minmax uuid distance
+4629	BRIN multi minmax date distance
+4630	BRIN multi minmax time distance
+4631	BRIN multi minmax interval distance
+4632	BRIN multi minmax timetz distance
+4633	BRIN multi minmax pg_lsn distance
+4634	BRIN multi minmax macaddr distance
+4635	BRIN multi minmax macaddr8 distance
+4636	BRIN multi minmax inet distance
+4637	BRIN multi minmax timestamp distance
+4638	I/O
+4639	I/O
+4640	I/O
+4641	I/O
+5001	transform to tsquery
+5003	implementation of <-> operator
+5004	phrase-concatenate with distance
+5006	transform to tsquery
+5007	transform to tsquery
+5009	transform to tsquery
+5010	SP-GiST support for quad tree over 2-D types represented by their bounding boxes
+5011	SP-GiST support for quad tree over polygons
+5012	SP-GiST support for quad tree over box
+5013	SP-GiST support for quad tree over box
+5014	SP-GiST support for quad tree over box
+5015	SP-GiST support for quad tree over box
+5016	SP-GiST support for quad tree over box
+5018	I/O
+5019	I/O
+5020	I/O
+5021	I/O
+5022	implementation of + operator
+5023	implementation of + operator
+5024	implementation of - operator
+5028	hash partition CHECK constraint
+5029	list files in the pgsql_tmp directory
+5030	list files in the pgsql_tmp directory
+5031	list of files in the archive_status directory
+5033	sort support
+5034	implementation of < operator
+5035	implementation of > operator
+5036	implementation of <= operator
+5037	implementation of >= operator
+5040	restriction selectivity for generic matching operators
+5041	join selectivity for generic matching operators
+5042	minimum scale needed to represent the value
+5043	numeric with minimum scale needed to represent the value
+5044	greatest common divisor
+5045	greatest common divisor
+5046	least common multiple
+5047	least common multiple
+5048	greatest common divisor
+5049	least common multiple
+5050	equal image
+5051	equal image
+5052	allocations from the main shared memory segment
+5053	statistics: number of tuples inserted since last vacuum
+5054	Set part of a jsonb, handle NULL value
+5055	I/O
+5056	I/O
+5057	I/O
+5058	I/O
+5059	get current transaction ID
+5060	get current transaction ID
+5061	get current snapshot
+5062	get xmin of snapshot
+5063	get xmax of snapshot
+5064	get set of in-progress transactions in snapshot
+5065	is xid8 visible in snapshot?
+5066	commit status of transaction
+5070	I/O
+5071	convert xid8 to xid
+5081	I/O
+5082	I/O
+5083	I/O
+5084	implementation of = operator
+5085	implementation of <> operator
+5086	I/O
+5087	I/O
+5088	I/O
+5089	I/O
+5090	I/O
+5091	I/O
+5092	I/O
+5093	I/O
+5094	I/O
+5095	I/O
+5096	less-equal-greater
+5097	larger of two
+5098	smaller of two
+5099	maximum value of all xid8 input values
+5100	minimum value of all xid8 input values
+6003	create a replication origin
+6004	drop replication origin identified by its name
+6005	translate the replication origin's name to its id
+6006	configure session to maintain replication progress tracking for the passed in origin
+6007	teardown configured replication progress tracking
+6008	is a replication origin configured in this session
+6009	get the replication progress of the current session
+6010	setup the transaction's origin lsn and timestamp
+6011	reset the transaction's origin lsn and timestamp
+6012	advance replication origin to specific location
+6013	get an individual replication origin's replication progress
+6014	get progress for all replication origins
+6098	jsonb subscripting logic
+6103	convert numeric to pg_lsn
+6118	statistics: information about subscription
+6119	get information of tables in a publication
+6120	oid of replica identity index if any
+6121	returns whether a relation can be part of a publication
+6154	GiST support
+6156	GiST support
+6159	list of catalog foreign key relationships
+6160	split delimited text
+6161	split delimited text, with null string
+6162	number of set bits
+6163	number of set bits
+6164	bitwise-xor smallint aggregate
+6165	bitwise-xor integer aggregate
+6166	bitwise-xor bigint aggregate
+6167	bitwise-xor bit aggregate
+6168	get commit timestamp and replication origin of a transaction
+6169	statistics: information about replication slot
+6170	statistics: reset collected statistics for a single replication slot
+6172	remove last N elements of array
+6173	extended statistics expressions
+6174	extended statistics columns
+6177	bin timestamp into specified interval
+6178	bin timestamp with time zone into specified interval
+6179	standard array subscripting support
+6180	raw array subscripting support
+6183	debug function for text search configuration
+6184	debug function for current text search configuration
+6185	statistics: session time, in milliseconds
+6186	statistics: session active time, in milliseconds
+6187	statistics: session idle in transaction time, in milliseconds
+6188	statistics: total number of sessions
+6189	statistics: number of sessions disconnected by the client closing the network connection
+6190	statistics: number of sessions disconnected by fatal errors
+6191	statistics: number of sessions killed by administrative action
+6192	hash
+6193	hash
+6195	trim selected bytes from left end of string
+6196	trim selected bytes from right end of string
+6197	function SQL body
+6198	unescape Unicode characters
+6199	extract field from date
+6200	extract field from time
+6201	extract field from time with time zone
+6202	extract field from timestamp
+6203	extract field from timestamp with time zone
+6204	extract field from interval
+6205	user privilege on parameter by username, parameter name
+6206	user privilege on parameter by user oid, parameter name
+6207	current user privilege on parameter by parameter name
+6224	get resource managers loaded in system
+6225	aggregate transition function
+6226	aggregate final function
+6227	combine aggregate input into a multirange
+6230	statistics: check if a stats object exists
+6231	statistics: information about subscription stats
+6232	statistics: reset collected statistics for a single subscription
+6233	planner support for row_number run condition
+6234	planner support for rank run condition
+6235	planner support for dense rank run condition
+6236	planner support for count run condition
+6240	return flags for specified GUC
+6241	stop making pinned objects during initdb
+6242	planner support for text_starts_with
+6248	statistics: information about WAL prefetching
+6249	get actual version of database collation from operating system
+6250	show pg_ident.conf mappings
+6251	replace text using regexp
+6252	replace text using regexp
+6253	replace text using regexp
+6254	count regexp matches
+6255	count regexp matches
+6256	count regexp matches
+6257	position of regexp match
+6258	position of regexp match
+6259	position of regexp match
+6260	position of regexp match
+6261	position of regexp match
+6262	position of regexp match
+6263	test for regexp match
+6264	test for regexp match
+6265	extract substring that matches regexp
+6266	extract substring that matches regexp
+6267	extract substring that matches regexp
+6268	extract substring that matches regexp
+6269	extract substring that matches regexp
+6270	list of files in the pg_logical/snapshots directory
+6271	list of files in the pg_logical/mappings directory
+6272	list of files in the pg_replslot/slot_name directory

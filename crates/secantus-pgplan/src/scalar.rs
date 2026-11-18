@@ -2048,10 +2048,13 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             let oid = match args.first() {
                 Some(Bson::Int32(i)) => i64::from(*i),
                 Some(Bson::Int64(i)) => *i,
-                Some(other) => match crate::regclass_oid(other) {
-                    Some(o) => o,
-                    None => return Ok(Bson::Null),
-                },
+                // Any object-identifier type: its oid (`'int4'::regtype`).
+                Some(other) => {
+                    match crate::regclass_oid(other).or_else(|| crate::regtype_oid(other)) {
+                        Some(o) => o,
+                        None => return Ok(Bson::Null),
+                    }
+                }
                 None => return Ok(Bson::Null),
             };
             if name == "shobj_description" {

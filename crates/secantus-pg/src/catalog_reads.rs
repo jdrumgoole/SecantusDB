@@ -166,6 +166,9 @@ struct Needs {
     all: HashSet<i64>,
     /// Equality constants on columns, for a catalog's executor scan.
     eq_consts: Vec<(i64, Bson)>,
+    /// Inequality constants on columns, `column op constant` with the
+    /// column put on the left: `(attnum, "<" | "<=" | ">" | ">=", value)`.
+    range_consts: Vec<(i64, &'static str, Bson)>,
     /// `column IN (...)`: `(attnum, element type)`.
     saops: Vec<(i64, i64)>,
     /// Columns in join clauses.
@@ -177,6 +180,9 @@ struct Needs {
     patterns: Vec<(i64, i64, String)>,
     /// `pg_table_is_visible(oid)` of this relation's rows is a restriction.
     visible: bool,
+    /// The query's ORDER BY, when every item is a column of this lone
+    /// relation: `(attnum, descending)`.
+    order: Vec<(i64, bool)>,
 }
 
 /// [`Model::facts`]' memo: `(session, catalog version, invalidation
@@ -207,6 +213,9 @@ pub(crate) struct Model<'a> {
     pub(crate) exec: Vec<Scan>,
     /// The planner inputs gathered per range-table relation.
     needs: HashMap<i64, Needs>,
+    /// The last planned relation's chosen index scan returns its rows in
+    /// the ORDER BY's order, so no Sort is planned.
+    index_ordered: bool,
     /// Walking a stored query (a view's rule): its names and operators were
     /// resolved when it was stored, so only the planner and executor read.
     stored: bool,
@@ -265,6 +274,7 @@ impl<'a> Model<'a> {
             params: Vec::new(),
             exec: Vec::new(),
             needs: HashMap::new(),
+            index_ordered: false,
             stored: false,
             aggs: 0,
             silent: 0,
@@ -776,63 +786,71 @@ impl<'a> Model<'a> {
         // holding every column read gives an index-only scan. `used` holds
         // the scan's index and the operators of its conditions.
         let mut used: Option<(Index, bool, Vec<IndexCond>)> = None;
+        let mut best = (0usize, 0usize);
         for ix in &rel.indexes {
             let Some(lead) = ix.keys.first().copied() else {
                 continue;
             };
-            let class = ix.classes.first().copied().unwrap_or(0);
-            let family = self.h.cr_opclass(class).map_or(0, |o| o.family);
-            let lead_type = rel.columns.iter().find(|c| c.0 == lead).map_or(0, |c| c.2);
-            let index_coll = type_collation(self.h.cr_base_type(lead_type));
+            // `match_restriction_clauses_to_index`: every column of the
+            // index, each restriction on it.
             let mut ops = Vec::new();
-            for (a, opr, konst) in needs.quals.clone() {
-                if a != lead {
-                    continue;
-                }
-                let expr_coll = needs
-                    .colls
-                    .iter()
-                    .find(|(x, o, _)| *x == a && *o == opr)
-                    .map_or(index_coll, |c| c.2);
-                // `match_opclause_to_indexcol`: with the index's collation
-                // (`IndexCollMatchesExprColl`), `op_in_opfamily`, an
-                // AMOPOPID search for the operator's membership in the
-                // column's family.
-                if index_coll == 0 || index_coll == expr_coll {
-                    let member = self.op_in_family(opr, class);
-                    self.search(
-                        Cache::AmopOpid,
-                        vec![K::O(opr), K::N("s".to_string()), K::O(family)],
-                        |_| member,
-                    );
-                    if member {
-                        ops.push((opr, expr_coll, opr));
+            let mut matched_cols: Vec<i64> = Vec::new();
+            for (pos, col) in ix.keys.clone().into_iter().enumerate() {
+                let class = ix.classes.get(pos).copied().unwrap_or(0);
+                let family = self.h.cr_opclass(class).map_or(0, |o| o.family);
+                let col_type = rel.columns.iter().find(|c| c.0 == col).map_or(0, |c| c.2);
+                let index_coll = type_collation(self.h.cr_base_type(col_type));
+                for (a, opr, konst) in needs.quals.clone() {
+                    if a != col {
                         continue;
                     }
-                }
-                // Otherwise `get_index_clause_from_support`: a pattern
-                // operator's `match_pattern_prefix` asks whether the
-                // collation is deterministic, then makes an exact match
-                // the family's equality.
-                if !konst || pattern_operator(opr).is_none() {
-                    continue;
-                }
-                if expr_coll != 0 {
-                    self.search(Cache::CollOid, vec![K::O(expr_coll)], |_| true);
-                }
-                if let Some(eq) = exact.iter().find(|e| e.0 == a && e.1 == opr).map(|e| e.3) {
-                    let member = self.op_in_family(eq, class);
-                    self.search(
-                        Cache::AmopOpid,
-                        vec![K::O(eq), K::N("s".to_string()), K::O(family)],
-                        |_| member,
-                    );
-                    if member {
-                        // `btcostestimate`'s selectivity of the derived
-                        // condition: its estimator (`get_oprrest`). The
-                        // condition takes the index's collation.
-                        self.oper_oid(eq);
-                        ops.push((eq, index_coll, opr));
+                    let expr_coll = needs
+                        .colls
+                        .iter()
+                        .find(|(x, o, _)| *x == a && *o == opr)
+                        .map_or(index_coll, |c| c.2);
+                    // `match_opclause_to_indexcol`: with the index's collation
+                    // (`IndexCollMatchesExprColl`), `op_in_opfamily`, an
+                    // AMOPOPID search for the operator's membership in the
+                    // column's family.
+                    if index_coll == 0 || index_coll == expr_coll {
+                        let member = self.op_in_family(opr, class);
+                        self.search(
+                            Cache::AmopOpid,
+                            vec![K::O(opr), K::N("s".to_string()), K::O(family)],
+                            |_| member,
+                        );
+                        if member {
+                            ops.push((opr, expr_coll, opr));
+                            matched_cols.push(col);
+                            continue;
+                        }
+                    }
+                    // Otherwise `get_index_clause_from_support`: a pattern
+                    // operator's `match_pattern_prefix` asks whether the
+                    // collation is deterministic, then makes an exact match
+                    // the family's equality.
+                    if !konst || pattern_operator(opr).is_none() {
+                        continue;
+                    }
+                    if expr_coll != 0 {
+                        self.search(Cache::CollOid, vec![K::O(expr_coll)], |_| true);
+                    }
+                    if let Some(eq) = exact.iter().find(|e| e.0 == a && e.1 == opr).map(|e| e.3) {
+                        let member = self.op_in_family(eq, class);
+                        self.search(
+                            Cache::AmopOpid,
+                            vec![K::O(eq), K::N("s".to_string()), K::O(family)],
+                            |_| member,
+                        );
+                        if member {
+                            // `btcostestimate`'s selectivity of the derived
+                            // condition: its estimator (`get_oprrest`). The
+                            // condition takes the index's collation.
+                            self.oper_oid(eq);
+                            ops.push((eq, index_coll, opr));
+                            matched_cols.push(col);
+                        }
                     }
                 }
             }
@@ -861,8 +879,64 @@ impl<'a> Model<'a> {
             if !matches {
                 continue;
             }
-            if used.is_none() {
+            // The cheapest path: here, the one whose conditions bind the
+            // most leading columns by equality, then the most columns.
+            let score = (
+                ix.keys
+                    .iter()
+                    .take_while(|k| needs.eq_consts.iter().any(|(a, _)| a == *k))
+                    .count(),
+                ix.keys.iter().filter(|k| matched_cols.contains(k)).count(),
+            );
+            if used.is_none() || score > best {
+                best = score;
                 used = Some((ix.clone(), covering, ops));
+            }
+        }
+        // `build_index_pathkeys`, with query pathkeys: each B-tree key's
+        // equality operator in its family (`make_pathkey_from_sortinfo`),
+        // going on while the column has an equivalence class.
+        let fixed = |a: &i64| needs.eq_consts.iter().any(|(x, _)| x == a);
+        // `has_useful_pathkeys`: an ORDER BY key an equality makes constant
+        // is redundant, so a query ordered only by those has none.
+        let want: Vec<(i64, bool)> = needs
+            .order
+            .iter()
+            .filter(|(a, _)| !fixed(a))
+            .copied()
+            .collect();
+        if !needs.order.is_empty() && want.is_empty() {
+            self.index_ordered = true;
+        }
+        if !want.is_empty() {
+            for ix in rel.indexes.iter().filter(|i| i.am == BTREE_AM) {
+                for (pos, col) in ix.keys.iter().enumerate() {
+                    let Some(o) = ix.classes.get(pos).and_then(|c| self.h.cr_opclass(*c)) else {
+                        break;
+                    };
+                    let key = vec![K::O(o.family), K::O(o.intype), K::O(o.intype), K::O(3)];
+                    let found = builtin()
+                        .amop_strategy
+                        .contains_key(&(o.family, o.intype, o.intype, 3));
+                    self.search(Cache::AmopStrategy, key, |_| found);
+                    let has_class = fixed(col)
+                        || needs.order.iter().any(|(a, _)| a == col)
+                        || needs.joins.contains(col);
+                    if !has_class {
+                        break;
+                    }
+                }
+            }
+            // `pathkeys_contained_in`: the query's pathkeys, less those an
+            // equality makes constant, lead the chosen index's, all in one
+            // direction (a backward scan for descending).
+            if let Some((ix, _, _)) = &used {
+                let gives: Vec<i64> = ix.keys.iter().filter(|k| !fixed(k)).copied().collect();
+                let one_way = want.windows(2).all(|w| w[0].1 == w[1].1);
+                self.index_ordered = ix.am == BTREE_AM
+                    && one_way
+                    && want.len() <= gives.len()
+                    && want.iter().zip(&gives).all(|((a, _), k)| a == k);
             }
         }
         // `_bt_first`: a scan key whose operator compares the column with
@@ -952,32 +1026,35 @@ impl<'a> Model<'a> {
         }
         // A catalog read directly is scanned by the executor.
         if rel.catalog && matches!(rel.kind, 'r') {
-            let scan =
-                match &used {
-                    Some((ix, covering, _)) => {
-                        let n = self.h.cr_catalog_matches(rel, ix, &needs.eq_consts);
-                        // The equalities on the index's leading columns are the
-                        // scan's key.
-                        let key =
-                            ix.keys
+            let scan = match &used {
+                Some((ix, covering, _)) => {
+                    let n =
+                        self.h
+                            .cr_catalog_matches(rel, ix, &needs.eq_consts, &needs.range_consts);
+                    // The equalities on the index's leading columns are the
+                    // scan's key.
+                    let key = ix
+                        .keys
+                        .iter()
+                        .map_while(|k| {
+                            needs
+                                .eq_consts
                                 .iter()
-                                .map_while(|k| {
-                                    needs.eq_consts.iter().find(|(a, _)| a == k).map(|(_, v)| {
-                                        match v {
-                                            Bson::String(s) => K::N(s.clone()),
-                                            v => K::O(crate::bson_i64(v).unwrap_or_default()),
-                                        }
-                                    })
+                                .find(|(a, _)| a == k)
+                                .map(|(_, v)| match v {
+                                    Bson::String(s) => K::N(s.clone()),
+                                    v => K::O(crate::bson_i64(v).unwrap_or_default()),
                                 })
-                                .collect();
-                        if *covering {
-                            Scan::IndexOnly(ix.oid, key, n)
-                        } else {
-                            Scan::Index(ix.oid, key, n)
-                        }
+                        })
+                        .collect();
+                    if *covering {
+                        Scan::IndexOnly(ix.oid, key, n)
+                    } else {
+                        Scan::Index(ix.oid, key, n)
                     }
-                    None => Scan::Seq(rel.oid, self.h.cr_catalog_rows(rel)),
-                };
+                }
+                None => Scan::Seq(rel.oid, self.h.cr_catalog_rows(rel)),
+            };
             self.exec.push(scan);
         }
     }
@@ -1226,8 +1303,23 @@ impl<'a> Model<'a> {
     /// (`get_ordering_op_properties`, `get_mergejoin_opfamilies`), and, for
     /// a sort, the executor's sort support.
     fn sort_item(&mut self, typ: i64, desc: bool, group: bool) {
+        if let Some((f, t)) = self.sort_item_planned(typ, desc, group) {
+            self.sort_support(f, t);
+        }
+    }
+
+    /// `PrepareSortSupportFromOrderingOp`, for a Sort the plan keeps.
+    fn sort_support(&mut self, f: i64, t: i64) {
+        if !self.opfamily_proc(f, t, t, 2) {
+            self.opfamily_proc(f, t, t, 1);
+        }
+    }
+
+    /// [`Self::sort_item`] up to the planner: the family and type a Sort's
+    /// support would be looked up under.
+    fn sort_item_planned(&mut self, typ: i64, desc: bool, group: bool) -> Option<(i64, i64)> {
         if typ == UNKNOWN || typ <= 0 {
-            return;
+            return None;
         }
         let ops = self.type_cache(typ, TC_LT | TC_EQ | TC_GT | TC_HASHPROC);
         let sortop = if desc { ops.gt } else { ops.lt };
@@ -1236,11 +1328,9 @@ impl<'a> Model<'a> {
         if group {
             // Hashed grouping: the equality operator's function.
             self.oper_oid(ops.eq);
-        } else if let Some((f, t)) = ops.btree {
-            // `PrepareSortSupportFromOrderingOp`.
-            if !self.opfamily_proc(f, t, t, 2) {
-                self.opfamily_proc(f, t, t, 1);
-            }
+            None
+        } else {
+            ops.btree
         }
     }
 
@@ -1758,8 +1848,30 @@ impl<'a> Model<'a> {
                 self.sort_item(t, false, true);
             }
         }
+        // An ORDER BY of the lone relation's columns may be the order an
+        // index scan returns: its Sort, and the Sort's support, wait for
+        // the plan.
+        let lone =
+            (scope.rels.len() == 1 && s.group_clause.is_empty()).then(|| scope.rels[0].1.clone());
+        let mut order: Option<Vec<(i64, bool)>> = lone.as_ref().map(|_| Vec::new());
+        let mut pending = Vec::new();
         for sb in &s.sort_clause {
             if let Some(N::SortBy(b)) = sb.node.as_ref() {
+                let desc = b.sortby_dir == pb::SortByDir::SortbyDesc as i32;
+                let column = match (node(&b.node), &lone) {
+                    (Some(N::ColumnRef(c)), Some(rel)) => {
+                        let names = names_of(&c.fields);
+                        names
+                            .last()
+                            .and_then(|n| rel.columns.iter().find(|c| &c.1 == n))
+                            .map(|c| c.0)
+                    }
+                    _ => None,
+                };
+                match (column, order.as_mut()) {
+                    (Some(att), Some(o)) => o.push((att, desc)),
+                    _ => order = None,
+                }
                 if let Some(e) = node(&b.node) {
                     let t = match e {
                         // ORDER BY n: the n-th result column.
@@ -1772,11 +1884,22 @@ impl<'a> Model<'a> {
                         },
                         _ => self.expr(e, &scope, true),
                     };
-                    let desc = b.sortby_dir == pb::SortByDir::SortbyDesc as i32;
-                    self.sort_item(t, desc, false);
+                    if let Some(p) = self.sort_item_planned(t, desc, false) {
+                        pending.push(p);
+                    }
                 }
             }
         }
+        if let (Some(rel), Some(o)) = (&lone, &order) {
+            self.needs.entry(rel.oid).or_default().order = o.clone();
+        }
+        let deferred = order.as_ref().is_some_and(|o| !o.is_empty());
+        if !deferred {
+            for (f, t) in pending.drain(..) {
+                self.sort_support(f, t);
+            }
+        }
+        self.index_ordered = false;
         // `transformLimitClause`: the count and offset are int8.
         for l in [node(&s.limit_count), node(&s.limit_offset)]
             .into_iter()
@@ -1789,6 +1912,12 @@ impl<'a> Model<'a> {
         for (_, rel) in scope.rels.clone() {
             if rel.view.is_none() {
                 self.plan_rel(&rel);
+            }
+        }
+        // The executor's Sort, unless the index scan gives the order.
+        if !self.index_ordered {
+            for (f, t) in pending {
+                self.sort_support(f, t);
             }
         }
         // The executor: `ExecCheckRTPerms` on every relation, then the
@@ -2289,9 +2418,13 @@ impl<'a> Model<'a> {
             }
             konst(e)
         };
+        let mut flipped = false;
         let (side, value) = match (col(&a.lexpr), col(&a.rexpr)) {
             (Some(c), None) => (Some(c), konst(&a.rexpr)),
-            (None, Some(c)) => (Some(c), konst(&a.lexpr)),
+            (None, Some(c)) => {
+                flipped = true;
+                (Some(c), konst(&a.lexpr))
+            }
             (Some(l), Some(r)) if l.0 != r.0 => {
                 self.join_clause(opr, l, r);
                 (None, None)
@@ -2308,9 +2441,22 @@ impl<'a> Model<'a> {
             if let (Some(_), Some(Bson::String(p))) = (pattern_operator(opr), &value) {
                 n.patterns.push((att, opr, p.clone()));
             }
-            let is_eq = self.h.cr_operator(opr).is_some_and(|o| o.name == "=");
-            if let (true, Some(v)) = (is_eq, value) {
-                n.eq_consts.push((att, v));
+            let name = self
+                .h
+                .cr_operator(opr)
+                .map(|o| o.name.clone())
+                .unwrap_or_default();
+            let range = match (name.as_str(), flipped) {
+                ("<", false) | (">", true) => Some("<"),
+                ("<=", false) | (">=", true) => Some("<="),
+                (">", false) | ("<", true) => Some(">"),
+                (">=", false) | ("<=", true) => Some(">="),
+                _ => None,
+            };
+            match (name.as_str(), range, value) {
+                ("=", _, Some(v)) => n.eq_consts.push((att, v)),
+                (_, Some(r), Some(v)) => n.range_consts.push((att, r, v)),
+                _ => {}
             }
         }
     }
@@ -3787,9 +3933,16 @@ impl PgHandler {
 
     /// How many of a catalog's rows an index scan's equality on the index's
     /// leading columns returns.
-    pub(crate) fn cr_catalog_matches(&self, rel: &Rel, ix: &Index, eq: &[(i64, Bson)]) -> i64 {
+    pub(crate) fn cr_catalog_matches(
+        &self,
+        rel: &Rel,
+        ix: &Index,
+        eq: &[(i64, Bson)],
+        range: &[(i64, &'static str, Bson)],
+    ) -> i64 {
         let def = self.catalog_def(&rel.name);
         let mut conds = Vec::new();
+        let mut bounds: Vec<(String, &str, Bson)> = Vec::new();
         for k in &ix.keys {
             match eq.iter().find(|(a, _)| a == k) {
                 Some((_, v)) => {
@@ -3800,7 +3953,23 @@ impl PgHandler {
                         .unwrap_or_default();
                     conds.push((field, v.clone()));
                 }
-                None => break,
+                None => {
+                    // `_bt_first` / `_bt_checkkeys`: the first column the
+                    // equalities do not fix bounds the scan by its
+                    // inequalities.
+                    let col = rel.columns.iter().find(|c| c.0 == *k).map(|c| c.1.clone());
+                    let field = col
+                        .as_deref()
+                        .and_then(|c| def.as_ref().and_then(|d| d.field_of(c)))
+                        .unwrap_or_default();
+                    bounds.extend(
+                        range
+                            .iter()
+                            .filter(|(a, _, _)| a == k)
+                            .map(|(_, o, v)| (field.clone(), *o, v.clone())),
+                    );
+                    break;
+                }
             }
         }
         // An equality on the relation's oid builds that relation's rows
@@ -3817,6 +3986,21 @@ impl PgHandler {
                     (Some(Bson::String(a)), Bson::String(b)) => a == b,
                     (Some(a), Bson::Int64(b)) => crate::bson_i64(a) == Some(*b),
                     _ => false,
+                }) && bounds.iter().all(|(f, o, v)| {
+                    let ord = match (r.get(f), v) {
+                        (Some(Bson::String(a)), Bson::String(b)) => a.as_str().cmp(b.as_str()),
+                        (Some(a), Bson::Int64(b)) => match crate::bson_i64(a) {
+                            Some(a) => a.cmp(b),
+                            None => return false,
+                        },
+                        _ => return false,
+                    };
+                    match *o {
+                        "<" => ord.is_lt(),
+                        "<=" => ord.is_le(),
+                        ">" => ord.is_gt(),
+                        _ => ord.is_ge(),
+                    }
                 })
             })
             .count() as i64

@@ -1858,15 +1858,13 @@ impl PgHandler {
 
     /// Whether the search plans `node` for an ORDER BY under a LIMIT
     /// (`four_table_join` with both): its first column's joined-row key
-    /// (`desc` when descending), and `later` its later columns', which it
-    /// plans for when [`PgHandler::later_order_keys_modelled`] does, and with
-    /// any that is a pathkey of its own only after a first key in an inner
-    /// join's class when descending (`Search::merge_asc`).
+    /// and `later` its later columns', which it
+    /// plans for when [`PgHandler::later_order_keys_modelled`] does
+    /// (`Search::merge_asc` when one is a pathkey of its own).
     pub(crate) fn ordered_limit_searched(
         &self,
         node: &JoinNode,
         first: &str,
-        desc: bool,
         later: &[String],
     ) -> bool {
         let Some((chain, search)) = self.four_table_chain(node, true, true) else {
@@ -1875,7 +1873,7 @@ impl PgHandler {
         later.is_empty()
             || Self::order_class(&search, &chain, first).is_some_and(|class| {
                 self.later_order_keys_modelled(&search, first, class, later)
-                    .is_some_and(|n| n == 0 || !(desc && class == ORDER_CLASS))
+                    .is_some()
             })
     }
 
@@ -1978,13 +1976,9 @@ impl PgHandler {
                     // (`select_outer_pathkeys_for_merge`); with another key
                     // it sorts ascending, NULLs last, which this search's
                     // descending or NULLS FIRST class order does not model.
-                    // A descending first key merges ascending
-                    // (`Search::merge_asc`); NULLS FIRST against the default,
-                    // and a key no inner join's clause makes a class of
-                    // (`ORDER_CLASS`), are not modelled.
-                    if n > 0 && desc && class == ORDER_CLASS {
-                        return Ok(None);
-                    }
+                    // A descending or NULLS FIRST first key then merges
+                    // ascending (`Search::merge_asc`), its own class
+                    // (`ORDER_CLASS`) included.
                     search.merge_asc = n > 0 && (desc || nulls_first);
                     order_keys = n;
                 }

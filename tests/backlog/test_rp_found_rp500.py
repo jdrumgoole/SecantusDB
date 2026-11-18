@@ -290,10 +290,11 @@ def test_statement_describe_and_no_data_analyse_without_evaluating(dsn: str) -> 
         c.execute("drop table if exists rp511n, rp511p")
 
 
-@pytest.mark.backlog("RP-968")
+@pytest.mark.backlog_fixed("RP-968")
 def test_create_view_analyses_without_evaluating(dsn: str) -> None:
     # `DefineView` parse-analyses the query and plans nothing, so a view
-    # over `1/0` is created; reading it raises (PostgreSQL 15.19).
+    # over `1/0` was created; reading it raised (PostgreSQL 15.19). Fixed:
+    # CREATE VIEW describes its query under `analysing_only`.
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute("drop view if exists rp511v")
     try:

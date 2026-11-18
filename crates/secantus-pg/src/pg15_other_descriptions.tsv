@@ -1,0 +1,1907 @@
+1247	16	boolean, 'true'/'false'
+1247	17	variable-length string, binary values escaped
+1247	18	single character
+1247	19	63-byte type for storing system identifiers
+1247	20	~18 digit integer, 8-byte storage
+1247	21	-32 thousand to 32 thousand, 2-byte storage
+1247	22	array of int2, used in system tables
+1247	23	-2 billion to 2 billion integer, 4-byte storage
+1247	24	registered procedure
+1247	25	variable-length string, no limit specified
+1247	26	object identifier(oid), maximum 4 billion
+1247	27	(block, offset), physical location of tuple
+1247	28	transaction id
+1247	29	command identifier type, sequence in transaction id
+1247	30	array of oids, used in system tables
+1247	32	internal type for passing CollectedCommand
+1247	114	JSON stored as text
+1247	142	XML content
+1247	194	string representing an internal node tree
+1247	325	pseudo-type for the result of an index AM handler function
+1247	600	geometric point '(x, y)'
+1247	601	geometric line segment '(pt1,pt2)'
+1247	602	geometric path '(pt1,...)'
+1247	603	geometric box '(lower left,upper right)'
+1247	604	geometric polygon '(pt1,...)'
+1247	628	geometric line
+1247	650	network IP address/netmask, network address
+1247	700	single-precision floating point number, 4-byte storage
+1247	701	double-precision floating point number, 8-byte storage
+1247	705	pseudo-type representing an undetermined type
+1247	718	geometric circle '(center,radius)'
+1247	774	XX:XX:XX:XX:XX:XX:XX:XX, MAC address
+1247	790	monetary amounts, $d,ddd.cc
+1247	829	XX:XX:XX:XX:XX:XX, MAC address
+1247	869	IP address/netmask, host address, netmask optional
+1247	1033	access control list
+1247	1042	char(length), blank-padded string, fixed storage length
+1247	1043	varchar(length), non-blank-padded string, variable storage length
+1247	1082	date
+1247	1083	time of day
+1247	1114	date and time
+1247	1184	date and time with time zone
+1247	1186	@ <number> <units>, time interval
+1247	1266	time of day with time zone
+1247	1560	fixed-length bit string
+1247	1562	variable-length bit string
+1247	1700	numeric(precision, decimal), arbitrary precision number
+1247	1790	reference to cursor (portal name)
+1247	2202	registered procedure (with args)
+1247	2203	registered operator
+1247	2204	registered operator (with args)
+1247	2205	registered class
+1247	2206	registered type
+1247	2249	pseudo-type representing any composite type
+1247	2275	C-style string
+1247	2276	pseudo-type representing any type
+1247	2277	pseudo-type representing a polymorphic array type
+1247	2278	pseudo-type for the result of a function with no real result
+1247	2279	pseudo-type for the result of a trigger function
+1247	2280	pseudo-type for the result of a language handler function
+1247	2281	pseudo-type representing an internal data structure
+1247	2283	pseudo-type representing a polymorphic base type
+1247	2776	pseudo-type representing a polymorphic base type that is not an array
+1247	2950	UUID datatype
+1247	2970	txid snapshot
+1247	3115	pseudo-type for the result of an FDW handler function
+1247	3220	PostgreSQL LSN datatype
+1247	3310	pseudo-type for the result of a tablesample method function
+1247	3361	multivariate ndistinct coefficients
+1247	3402	multivariate dependencies
+1247	3500	pseudo-type representing a polymorphic base type that is an enum
+1247	3614	text representation for text search
+1247	3615	query representation for text search
+1247	3642	GiST index internal text representation for text search
+1247	3734	registered text search configuration
+1247	3769	registered text search dictionary
+1247	3802	Binary JSON
+1247	3831	pseudo-type representing a range over a polymorphic base type
+1247	3838	pseudo-type for the result of an event trigger function
+1247	3904	range of integers
+1247	3906	range of numerics
+1247	3908	range of timestamps without time zone
+1247	3910	range of timestamps with time zone
+1247	3912	range of dates
+1247	3926	range of bigints
+1247	4072	JSON path
+1247	4089	registered namespace
+1247	4096	registered role
+1247	4191	registered collation
+1247	4451	multirange of integers
+1247	4532	multirange of numerics
+1247	4533	multirange of timestamps without time zone
+1247	4534	multirange of timestamps with time zone
+1247	4535	multirange of dates
+1247	4536	multirange of bigints
+1247	4537	pseudo-type representing a polymorphic base type that is a multirange
+1247	4538	pseudo-type representing a multirange over a polymorphic common type
+1247	4600	BRIN bloom summary
+1247	4601	BRIN minmax-multi summary
+1247	5017	multivariate MCV list
+1247	5038	snapshot
+1247	5069	full transaction id
+1247	5077	pseudo-type representing a polymorphic common type
+1247	5078	pseudo-type representing an array of polymorphic common type elements
+1247	5079	pseudo-type representing a polymorphic common type that is not an array
+1247	5080	pseudo-type representing a range over a polymorphic common type
+2601	2	heap table access method
+2601	403	b-tree index access method
+2601	405	hash index access method
+2601	783	GiST index access method
+2601	2742	GIN index access method
+2601	3580	block range index (BRIN) access method
+2601	4000	SP-GiST index access method
+2607	4402	conversion for KOI8R to MULE_INTERNAL
+2607	4403	conversion for MULE_INTERNAL to KOI8R
+2607	4404	conversion for ISO-8859-5 to MULE_INTERNAL
+2607	4405	conversion for MULE_INTERNAL to ISO-8859-5
+2607	4406	conversion for WIN1251 to MULE_INTERNAL
+2607	4407	conversion for MULE_INTERNAL to WIN1251
+2607	4408	conversion for WIN866 to MULE_INTERNAL
+2607	4409	conversion for MULE_INTERNAL to WIN866
+2607	4410	conversion for KOI8R to WIN1251
+2607	4411	conversion for WIN1251 to KOI8R
+2607	4412	conversion for KOI8R to WIN866
+2607	4413	conversion for WIN866 to KOI8R
+2607	4414	conversion for WIN866 to WIN1251
+2607	4415	conversion for WIN1251 to WIN866
+2607	4416	conversion for ISO-8859-5 to KOI8R
+2607	4417	conversion for KOI8R to ISO-8859-5
+2607	4418	conversion for ISO-8859-5 to WIN1251
+2607	4419	conversion for WIN1251 to ISO-8859-5
+2607	4420	conversion for ISO-8859-5 to WIN866
+2607	4421	conversion for WIN866 to ISO-8859-5
+2607	4422	conversion for EUC_CN to MULE_INTERNAL
+2607	4423	conversion for MULE_INTERNAL to EUC_CN
+2607	4424	conversion for EUC_JP to SJIS
+2607	4425	conversion for SJIS to EUC_JP
+2607	4426	conversion for EUC_JP to MULE_INTERNAL
+2607	4427	conversion for SJIS to MULE_INTERNAL
+2607	4428	conversion for MULE_INTERNAL to EUC_JP
+2607	4429	conversion for MULE_INTERNAL to SJIS
+2607	4430	conversion for EUC_KR to MULE_INTERNAL
+2607	4431	conversion for MULE_INTERNAL to EUC_KR
+2607	4432	conversion for EUC_TW to BIG5
+2607	4433	conversion for BIG5 to EUC_TW
+2607	4434	conversion for EUC_TW to MULE_INTERNAL
+2607	4435	conversion for BIG5 to MULE_INTERNAL
+2607	4436	conversion for MULE_INTERNAL to EUC_TW
+2607	4437	conversion for MULE_INTERNAL to BIG5
+2607	4438	conversion for LATIN2 to MULE_INTERNAL
+2607	4439	conversion for MULE_INTERNAL to LATIN2
+2607	4440	conversion for WIN1250 to MULE_INTERNAL
+2607	4441	conversion for MULE_INTERNAL to WIN1250
+2607	4442	conversion for LATIN2 to WIN1250
+2607	4443	conversion for WIN1250 to LATIN2
+2607	4444	conversion for LATIN1 to MULE_INTERNAL
+2607	4445	conversion for MULE_INTERNAL to LATIN1
+2607	4446	conversion for LATIN3 to MULE_INTERNAL
+2607	4447	conversion for MULE_INTERNAL to LATIN3
+2607	4448	conversion for LATIN4 to MULE_INTERNAL
+2607	4449	conversion for MULE_INTERNAL to LATIN4
+2607	4452	conversion for BIG5 to UTF8
+2607	4453	conversion for UTF8 to BIG5
+2607	4454	conversion for UTF8 to KOI8R
+2607	4455	conversion for KOI8R to UTF8
+2607	4456	conversion for UTF8 to KOI8U
+2607	4457	conversion for KOI8U to UTF8
+2607	4458	conversion for UTF8 to WIN866
+2607	4459	conversion for WIN866 to UTF8
+2607	4460	conversion for UTF8 to WIN874
+2607	4461	conversion for WIN874 to UTF8
+2607	4462	conversion for UTF8 to WIN1250
+2607	4463	conversion for WIN1250 to UTF8
+2607	4464	conversion for UTF8 to WIN1251
+2607	4465	conversion for WIN1251 to UTF8
+2607	4466	conversion for UTF8 to WIN1252
+2607	4467	conversion for WIN1252 to UTF8
+2607	4468	conversion for UTF8 to WIN1253
+2607	4469	conversion for WIN1253 to UTF8
+2607	4470	conversion for UTF8 to WIN1254
+2607	4471	conversion for WIN1254 to UTF8
+2607	4472	conversion for UTF8 to WIN1255
+2607	4473	conversion for WIN1255 to UTF8
+2607	4474	conversion for UTF8 to WIN1256
+2607	4475	conversion for WIN1256 to UTF8
+2607	4476	conversion for UTF8 to WIN1257
+2607	4477	conversion for WIN1257 to UTF8
+2607	4478	conversion for UTF8 to WIN1258
+2607	4479	conversion for WIN1258 to UTF8
+2607	4480	conversion for EUC_CN to UTF8
+2607	4481	conversion for UTF8 to EUC_CN
+2607	4482	conversion for EUC_JP to UTF8
+2607	4483	conversion for UTF8 to EUC_JP
+2607	4484	conversion for EUC_KR to UTF8
+2607	4485	conversion for UTF8 to EUC_KR
+2607	4486	conversion for EUC_TW to UTF8
+2607	4487	conversion for UTF8 to EUC_TW
+2607	4488	conversion for GB18030 to UTF8
+2607	4489	conversion for UTF8 to GB18030
+2607	4490	conversion for GBK to UTF8
+2607	4491	conversion for UTF8 to GBK
+2607	4492	conversion for UTF8 to LATIN2
+2607	4493	conversion for LATIN2 to UTF8
+2607	4494	conversion for UTF8 to LATIN3
+2607	4495	conversion for LATIN3 to UTF8
+2607	4496	conversion for UTF8 to LATIN4
+2607	4497	conversion for LATIN4 to UTF8
+2607	4498	conversion for UTF8 to LATIN5
+2607	4499	conversion for LATIN5 to UTF8
+2607	4500	conversion for UTF8 to LATIN6
+2607	4501	conversion for LATIN6 to UTF8
+2607	4502	conversion for UTF8 to LATIN7
+2607	4503	conversion for LATIN7 to UTF8
+2607	4504	conversion for UTF8 to LATIN8
+2607	4505	conversion for LATIN8 to UTF8
+2607	4506	conversion for UTF8 to LATIN9
+2607	4507	conversion for LATIN9 to UTF8
+2607	4508	conversion for UTF8 to LATIN10
+2607	4509	conversion for LATIN10 to UTF8
+2607	4510	conversion for UTF8 to ISO-8859-5
+2607	4511	conversion for ISO-8859-5 to UTF8
+2607	4512	conversion for UTF8 to ISO-8859-6
+2607	4513	conversion for ISO-8859-6 to UTF8
+2607	4514	conversion for UTF8 to ISO-8859-7
+2607	4515	conversion for ISO-8859-7 to UTF8
+2607	4516	conversion for UTF8 to ISO-8859-8
+2607	4517	conversion for ISO-8859-8 to UTF8
+2607	4518	conversion for LATIN1 to UTF8
+2607	4519	conversion for UTF8 to LATIN1
+2607	4520	conversion for JOHAB to UTF8
+2607	4521	conversion for UTF8 to JOHAB
+2607	4522	conversion for SJIS to UTF8
+2607	4523	conversion for UTF8 to SJIS
+2607	4524	conversion for UHC to UTF8
+2607	4525	conversion for UTF8 to UHC
+2607	4526	conversion for EUC_JIS_2004 to UTF8
+2607	4527	conversion for UTF8 to EUC_JIS_2004
+2607	4528	conversion for SHIFT_JIS_2004 to UTF8
+2607	4529	conversion for UTF8 to SHIFT_JIS_2004
+2607	4530	conversion for EUC_JIS_2004 to SHIFT_JIS_2004
+2607	4531	conversion for SHIFT_JIS_2004 to EUC_JIS_2004
+2612	12	built-in functions
+2612	13	dynamically-loaded C functions
+2612	14	SQL-language functions
+2612	13827	PL/pgSQL procedural language
+2615	11	system catalog schema
+2615	99	reserved schema for TOAST tables
+2617	15	equal
+2617	36	not equal
+2617	37	less than
+2617	58	less than
+2617	59	greater than
+2617	76	greater than
+2617	80	less than or equal
+2617	82	greater than or equal
+2617	85	not equal
+2617	91	equal
+2617	92	equal
+2617	93	equal
+2617	94	equal
+2617	95	less than
+2617	96	equal
+2617	97	less than
+2617	98	equal
+2617	254	equal
+2617	255	less than
+2617	256	less than or equal
+2617	257	greater than or equal
+2617	258	greater than
+2617	259	not equal
+2617	260	equal
+2617	261	less than
+2617	262	less than or equal
+2617	263	greater than or equal
+2617	264	greater than
+2617	265	not equal
+2617	349	append element onto end of array
+2617	352	equal
+2617	353	equal
+2617	374	prepend element onto front of array
+2617	375	concatenate
+2617	385	equal
+2617	387	equal
+2617	402	not equal
+2617	410	equal
+2617	411	not equal
+2617	412	less than
+2617	413	greater than
+2617	414	less than or equal
+2617	415	greater than or equal
+2617	416	equal
+2617	417	not equal
+2617	418	less than
+2617	419	greater than
+2617	420	less than or equal
+2617	430	greater than or equal
+2617	433	contains
+2617	439	modulus
+2617	473	absolute value
+2617	484	negate
+2617	485	is left of
+2617	486	overlaps or is left of
+2617	487	overlaps or is right of
+2617	488	is right of
+2617	489	is contained by
+2617	490	contains
+2617	491	same as
+2617	492	overlaps
+2617	493	is left of
+2617	494	overlaps or is left of
+2617	495	overlaps or is right of
+2617	496	is right of
+2617	497	is contained by
+2617	498	contains
+2617	499	same as
+2617	500	overlaps
+2617	501	greater than or equal by area
+2617	502	greater than by area
+2617	503	equal by area
+2617	504	less than by area
+2617	505	less than or equal by area
+2617	506	deprecated, use |>> instead
+2617	507	is left of
+2617	508	is right of
+2617	509	deprecated, use <<| instead
+2617	510	same as
+2617	511	point inside box
+2617	512	point within closed path, or point on open path
+2617	513	center of
+2617	514	multiply
+2617	517	distance between
+2617	518	not equal
+2617	519	not equal
+2617	520	greater than
+2617	521	greater than
+2617	522	less than or equal
+2617	523	less than or equal
+2617	524	greater than or equal
+2617	525	greater than or equal
+2617	526	multiply
+2617	527	divide
+2617	528	divide
+2617	529	modulus
+2617	530	modulus
+2617	531	not equal
+2617	532	equal
+2617	533	equal
+2617	534	less than
+2617	535	less than
+2617	536	greater than
+2617	537	greater than
+2617	538	not equal
+2617	539	not equal
+2617	540	less than or equal
+2617	541	less than or equal
+2617	542	greater than or equal
+2617	543	greater than or equal
+2617	544	multiply
+2617	545	multiply
+2617	546	divide
+2617	547	divide
+2617	550	add
+2617	551	add
+2617	552	add
+2617	553	add
+2617	554	subtract
+2617	555	subtract
+2617	556	subtract
+2617	557	subtract
+2617	558	negate
+2617	559	negate
+2617	584	negate
+2617	585	negate
+2617	586	add
+2617	587	subtract
+2617	588	divide
+2617	589	multiply
+2617	590	absolute value
+2617	591	add
+2617	592	subtract
+2617	593	divide
+2617	594	multiply
+2617	595	absolute value
+2617	596	square root
+2617	597	cube root
+2617	606	distance between
+2617	607	equal
+2617	608	not equal
+2617	609	less than
+2617	610	greater than
+2617	611	less than or equal
+2617	612	greater than or equal
+2617	613	distance between
+2617	614	distance between
+2617	615	distance between
+2617	616	distance between
+2617	617	distance between
+2617	618	distance between
+2617	620	equal
+2617	621	not equal
+2617	622	less than
+2617	623	greater than
+2617	624	less than or equal
+2617	625	greater than or equal
+2617	630	not equal
+2617	631	less than
+2617	632	less than or equal
+2617	633	greater than
+2617	634	greater than or equal
+2617	639	matches regular expression, case-sensitive
+2617	640	does not match regular expression, case-sensitive
+2617	641	matches regular expression, case-sensitive
+2617	642	does not match regular expression, case-sensitive
+2617	643	not equal
+2617	644	not equal
+2617	645	less than
+2617	646	greater than
+2617	647	less than or equal
+2617	648	greater than or equal
+2617	649	equal
+2617	654	concatenate
+2617	660	less than
+2617	661	less than or equal
+2617	662	greater than
+2617	663	greater than or equal
+2617	664	less than
+2617	665	less than or equal
+2617	666	greater than
+2617	667	greater than or equal
+2617	670	equal
+2617	671	not equal
+2617	672	less than
+2617	673	less than or equal
+2617	674	greater than
+2617	675	greater than or equal
+2617	682	absolute value
+2617	684	add
+2617	685	subtract
+2617	686	multiply
+2617	687	divide
+2617	688	add
+2617	689	subtract
+2617	690	multiply
+2617	691	divide
+2617	692	add
+2617	693	subtract
+2617	694	multiply
+2617	695	divide
+2617	706	distance between
+2617	707	distance between
+2617	708	distance between
+2617	709	distance between
+2617	712	distance between
+2617	713	not equal
+2617	731	add points (translate)
+2617	732	subtract points (translate)
+2617	733	multiply points (scale/rotate)
+2617	734	divide points (scale/rotate)
+2617	735	concatenate
+2617	736	add (translate path)
+2617	737	subtract (translate path)
+2617	738	multiply (rotate/scale path)
+2617	739	divide (rotate/scale path)
+2617	755	contains
+2617	756	is contained by
+2617	757	contains
+2617	758	is contained by
+2617	759	contains
+2617	760	distance between
+2617	761	distance between
+2617	762	distance between
+2617	763	distance between
+2617	773	absolute value
+2617	784	distance between
+2617	792	equal
+2617	793	less than
+2617	794	greater than
+2617	795	less than or equal
+2617	796	greater than or equal
+2617	797	number of points
+2617	798	intersect
+2617	799	sum of path segment lengths
+2617	800	is above (allows touching)
+2617	801	is below (allows touching)
+2617	802	deprecated, use && instead
+2617	803	box intersection
+2617	804	add point to box (translate)
+2617	805	subtract point from box (translate)
+2617	806	multiply box by point (scale)
+2617	807	divide box by point (scale)
+2617	808	horizontally aligned
+2617	809	vertically aligned
+2617	818	add
+2617	819	subtract
+2617	820	multiply
+2617	821	divide
+2617	822	add
+2617	823	subtract
+2617	824	multiply
+2617	825	divide
+2617	843	multiply
+2617	844	divide
+2617	845	multiply
+2617	900	equal
+2617	901	not equal
+2617	902	less than
+2617	903	greater than
+2617	904	less than or equal
+2617	905	greater than or equal
+2617	906	add
+2617	907	subtract
+2617	908	multiply
+2617	909	divide
+2617	912	multiply
+2617	913	divide
+2617	914	multiply
+2617	915	divide
+2617	916	multiply
+2617	917	multiply
+2617	918	multiply
+2617	931	is subnet
+2617	932	is subnet or equal
+2617	933	is supernet
+2617	934	is supernet or equal
+2617	965	exponentiation
+2617	966	add/update ACL item
+2617	967	remove ACL item
+2617	968	contains
+2617	969	center of
+2617	971	center of
+2617	974	equal
+2617	1038	exponentiation
+2617	1054	equal
+2617	1055	matches regular expression, case-sensitive
+2617	1056	does not match regular expression, case-sensitive
+2617	1057	not equal
+2617	1058	less than
+2617	1059	less than or equal
+2617	1060	greater than
+2617	1061	greater than or equal
+2617	1070	equal
+2617	1071	not equal
+2617	1072	less than
+2617	1073	greater than
+2617	1074	less than or equal
+2617	1075	greater than or equal
+2617	1076	add
+2617	1077	subtract
+2617	1093	equal
+2617	1094	not equal
+2617	1095	less than
+2617	1096	less than or equal
+2617	1097	greater than
+2617	1098	greater than or equal
+2617	1099	subtract
+2617	1100	add
+2617	1101	subtract
+2617	1108	equal
+2617	1109	not equal
+2617	1110	less than
+2617	1111	less than or equal
+2617	1112	greater than
+2617	1113	greater than or equal
+2617	1116	add
+2617	1117	subtract
+2617	1118	divide
+2617	1119	multiply
+2617	1120	equal
+2617	1121	not equal
+2617	1122	less than
+2617	1123	greater than
+2617	1124	less than or equal
+2617	1125	greater than or equal
+2617	1126	add
+2617	1127	subtract
+2617	1128	divide
+2617	1129	multiply
+2617	1130	equal
+2617	1131	not equal
+2617	1132	less than
+2617	1133	greater than
+2617	1134	less than or equal
+2617	1135	greater than or equal
+2617	1201	equal
+2617	1202	not equal
+2617	1203	less than
+2617	1204	less than or equal
+2617	1205	greater than
+2617	1206	greater than or equal
+2617	1207	matches LIKE expression
+2617	1208	does not match LIKE expression
+2617	1209	matches LIKE expression
+2617	1210	does not match LIKE expression
+2617	1211	matches LIKE expression
+2617	1212	does not match LIKE expression
+2617	1220	equal
+2617	1221	not equal
+2617	1222	less than
+2617	1223	less than or equal
+2617	1224	greater than
+2617	1225	greater than or equal
+2617	1226	matches regular expression, case-insensitive
+2617	1227	does not match regular expression, case-insensitive
+2617	1228	matches regular expression, case-insensitive
+2617	1229	does not match regular expression, case-insensitive
+2617	1234	matches regular expression, case-insensitive
+2617	1235	does not match regular expression, case-insensitive
+2617	1320	equal
+2617	1321	not equal
+2617	1322	less than
+2617	1323	less than or equal
+2617	1324	greater than
+2617	1325	greater than or equal
+2617	1327	add
+2617	1328	subtract
+2617	1329	subtract
+2617	1330	equal
+2617	1331	not equal
+2617	1332	less than
+2617	1333	less than or equal
+2617	1334	greater than
+2617	1335	greater than or equal
+2617	1336	negate
+2617	1337	add
+2617	1338	subtract
+2617	1360	convert date and time to timestamp
+2617	1361	convert date and time with time zone to timestamp with time zone
+2617	1363	convert time and date to timestamp
+2617	1366	convert time with time zone and date to timestamp with time zone
+2617	1383	distance between
+2617	1399	subtract
+2617	1420	center of
+2617	1500	equal by area
+2617	1501	not equal by area
+2617	1502	less than by area
+2617	1503	greater than by area
+2617	1504	less than or equal by area
+2617	1505	greater than or equal by area
+2617	1506	is left of
+2617	1507	overlaps or is left of
+2617	1508	overlaps or is right of
+2617	1509	is right of
+2617	1510	is contained by
+2617	1511	contains
+2617	1512	same as
+2617	1513	overlaps
+2617	1514	is above
+2617	1515	is below
+2617	1516	add
+2617	1517	subtract
+2617	1518	multiply
+2617	1519	divide
+2617	1520	distance between
+2617	1521	number of points
+2617	1522	distance between
+2617	1523	distance between
+2617	1525	intersect
+2617	1526	parallel
+2617	1527	perpendicular
+2617	1528	horizontal
+2617	1529	vertical
+2617	1535	equal
+2617	1536	intersection point
+2617	1537	intersect
+2617	1538	intersect
+2617	1539	intersect
+2617	1546	point on line
+2617	1547	is contained by
+2617	1548	lseg on line
+2617	1549	is contained by
+2617	1550	equal
+2617	1551	not equal
+2617	1552	less than
+2617	1553	less than or equal
+2617	1554	greater than
+2617	1555	greater than or equal
+2617	1557	closest point to A on B
+2617	1558	closest point to A on B
+2617	1559	closest point to A on B
+2617	1567	closest point to A on B
+2617	1577	closest point to A on B
+2617	1578	closest point to A on B
+2617	1583	multiply
+2617	1584	multiply
+2617	1585	divide
+2617	1586	not equal
+2617	1587	less than by length
+2617	1588	less than or equal by length
+2617	1589	greater than by length
+2617	1590	greater than or equal by length
+2617	1591	distance between endpoints
+2617	1611	intersect
+2617	1612	parallel
+2617	1613	perpendicular
+2617	1614	horizontal
+2617	1615	vertical
+2617	1616	equal
+2617	1617	intersection point
+2617	1625	matches LIKE expression, case-insensitive
+2617	1626	does not match LIKE expression, case-insensitive
+2617	1627	matches LIKE expression, case-insensitive
+2617	1628	does not match LIKE expression, case-insensitive
+2617	1629	matches LIKE expression, case-insensitive
+2617	1630	does not match LIKE expression, case-insensitive
+2617	1694	less than or equal
+2617	1695	greater than or equal
+2617	1751	negate
+2617	1752	equal
+2617	1753	not equal
+2617	1754	less than
+2617	1755	less than or equal
+2617	1756	greater than
+2617	1757	greater than or equal
+2617	1758	add
+2617	1759	subtract
+2617	1760	multiply
+2617	1761	divide
+2617	1762	modulus
+2617	1763	absolute value
+2617	1784	equal
+2617	1785	not equal
+2617	1786	less than
+2617	1787	greater than
+2617	1788	less than or equal
+2617	1789	greater than or equal
+2617	1791	bitwise and
+2617	1792	bitwise or
+2617	1793	bitwise exclusive or
+2617	1794	bitwise not
+2617	1795	bitwise shift left
+2617	1796	bitwise shift right
+2617	1797	concatenate
+2617	1800	add
+2617	1801	subtract
+2617	1802	add
+2617	1803	subtract
+2617	1804	equal
+2617	1805	not equal
+2617	1806	less than
+2617	1807	greater than
+2617	1808	less than or equal
+2617	1809	greater than or equal
+2617	1849	add
+2617	1862	equal
+2617	1863	not equal
+2617	1864	less than
+2617	1865	greater than
+2617	1866	less than or equal
+2617	1867	greater than or equal
+2617	1868	equal
+2617	1869	not equal
+2617	1870	less than
+2617	1871	greater than
+2617	1872	less than or equal
+2617	1873	greater than or equal
+2617	1874	bitwise and
+2617	1875	bitwise or
+2617	1876	bitwise exclusive or
+2617	1877	bitwise not
+2617	1878	bitwise shift left
+2617	1879	bitwise shift right
+2617	1880	bitwise and
+2617	1881	bitwise or
+2617	1882	bitwise exclusive or
+2617	1883	bitwise not
+2617	1884	bitwise shift left
+2617	1885	bitwise shift right
+2617	1886	bitwise and
+2617	1887	bitwise or
+2617	1888	bitwise exclusive or
+2617	1889	bitwise not
+2617	1890	bitwise shift left
+2617	1891	bitwise shift right
+2617	1916	unary plus
+2617	1917	unary plus
+2617	1918	unary plus
+2617	1919	unary plus
+2617	1920	unary plus
+2617	1921	unary plus
+2617	1955	equal
+2617	1956	not equal
+2617	1957	less than
+2617	1958	less than or equal
+2617	1959	greater than
+2617	1960	greater than or equal
+2617	2016	matches LIKE expression
+2617	2017	does not match LIKE expression
+2617	2018	concatenate
+2617	2060	equal
+2617	2061	not equal
+2617	2062	less than
+2617	2063	less than or equal
+2617	2064	greater than
+2617	2065	greater than or equal
+2617	2066	add
+2617	2067	subtract
+2617	2068	subtract
+2617	2314	less than
+2617	2315	less than or equal
+2617	2317	greater than or equal
+2617	2318	greater than
+2617	2326	less than
+2617	2327	less than or equal
+2617	2329	greater than or equal
+2617	2330	greater than
+2617	2345	less than
+2617	2346	less than or equal
+2617	2347	equal
+2617	2348	greater than or equal
+2617	2349	greater than
+2617	2350	not equal
+2617	2358	less than
+2617	2359	less than or equal
+2617	2360	equal
+2617	2361	greater than or equal
+2617	2362	greater than
+2617	2363	not equal
+2617	2371	less than
+2617	2372	less than or equal
+2617	2373	equal
+2617	2374	greater than or equal
+2617	2375	greater than
+2617	2376	not equal
+2617	2384	less than
+2617	2385	less than or equal
+2617	2386	equal
+2617	2387	greater than or equal
+2617	2388	greater than
+2617	2389	not equal
+2617	2534	less than
+2617	2535	less than or equal
+2617	2536	equal
+2617	2537	greater than or equal
+2617	2538	greater than
+2617	2539	not equal
+2617	2540	less than
+2617	2541	less than or equal
+2617	2542	equal
+2617	2543	greater than or equal
+2617	2544	greater than
+2617	2545	not equal
+2617	2551	add
+2617	2552	add
+2617	2553	add
+2617	2554	add
+2617	2555	add
+2617	2570	is below
+2617	2571	overlaps or is below
+2617	2572	overlaps or is above
+2617	2573	is above
+2617	2574	is below
+2617	2575	overlaps or is below
+2617	2576	overlaps or is above
+2617	2577	is above
+2617	2589	overlaps or is below
+2617	2590	overlaps or is above
+2617	2634	bitwise not
+2617	2635	bitwise and
+2617	2636	bitwise or
+2617	2637	add
+2617	2638	add
+2617	2639	subtract
+2617	2640	subtract
+2617	2750	overlaps
+2617	2751	contains
+2617	2752	is contained by
+2617	2779	concatenate
+2617	2780	concatenate
+2617	2799	less than
+2617	2800	greater than
+2617	2801	less than or equal
+2617	2802	greater than or equal
+2617	2860	equal
+2617	2861	not equal
+2617	2862	less than
+2617	2863	less than or equal
+2617	2864	greater than or equal
+2617	2865	greater than
+2617	2866	overlaps
+2617	2867	overlaps
+2617	2868	overlaps
+2617	2869	contains
+2617	2870	contains
+2617	2871	contains
+2617	2872	is contained by
+2617	2873	is contained by
+2617	2874	is contained by
+2617	2875	overlaps or is left of
+2617	2876	overlaps or is left of
+2617	2877	overlaps or is left of
+2617	2972	equal
+2617	2973	not equal
+2617	2974	less than
+2617	2975	greater than
+2617	2976	less than or equal
+2617	2977	greater than or equal
+2617	2988	equal
+2617	2989	not equal
+2617	2990	less than
+2617	2991	greater than
+2617	2992	less than or equal
+2617	2993	greater than or equal
+2617	3147	bitwise not
+2617	3148	bitwise and
+2617	3149	bitwise or
+2617	3188	identical
+2617	3189	not identical
+2617	3190	less than
+2617	3191	greater than
+2617	3192	less than or equal
+2617	3193	greater than or equal
+2617	3206	get value from jsonb as text with path elements
+2617	3211	get jsonb object field
+2617	3212	get jsonb array element
+2617	3213	get value from jsonb with path elements
+2617	3222	equal
+2617	3223	not equal
+2617	3224	less than
+2617	3225	greater than
+2617	3226	less than or equal
+2617	3227	greater than or equal
+2617	3228	minus
+2617	3240	equal
+2617	3241	not equal
+2617	3242	less than
+2617	3243	greater than
+2617	3244	less than or equal
+2617	3245	greater than or equal
+2617	3246	contains
+2617	3247	key exists
+2617	3248	any key exists
+2617	3249	all keys exist
+2617	3250	is contained by
+2617	3276	distance between
+2617	3284	concatenate
+2617	3285	delete object field
+2617	3286	delete array element
+2617	3287	delete path
+2617	3289	distance between
+2617	3291	distance between
+2617	3315	not equal
+2617	3316	not equal
+2617	3346	multiply
+2617	3347	divide
+2617	3349	multiply
+2617	3362	equal
+2617	3363	not equal
+2617	3364	less than
+2617	3365	less than or equal
+2617	3366	greater than
+2617	3367	greater than or equal
+2617	3368	bitwise not
+2617	3369	bitwise and
+2617	3370	bitwise or
+2617	3398	delete object fields
+2617	3477	get jsonb object field as text
+2617	3481	get jsonb array element as text
+2617	3516	equal
+2617	3517	not equal
+2617	3518	less than
+2617	3519	greater than
+2617	3520	less than or equal
+2617	3521	greater than or equal
+2617	3552	overlaps (is subnet or supernet)
+2617	3585	overlaps or is right of
+2617	3627	less than
+2617	3628	less than or equal
+2617	3629	equal
+2617	3630	not equal
+2617	3631	greater than or equal
+2617	3632	greater than
+2617	3633	concatenate
+2617	3636	text search match
+2617	3637	text search match
+2617	3660	deprecated, use @@ instead
+2617	3661	deprecated, use @@ instead
+2617	3674	less than
+2617	3675	less than or equal
+2617	3676	equal
+2617	3677	not equal
+2617	3678	greater than or equal
+2617	3679	greater than
+2617	3680	AND-concatenate
+2617	3681	OR-concatenate
+2617	3682	NOT tsquery
+2617	3693	contains
+2617	3694	is contained by
+2617	3762	text search match
+2617	3763	text search match
+2617	3825	divide
+2617	3877	starts with
+2617	3882	equal
+2617	3883	not equal
+2617	3884	less than
+2617	3885	less than or equal
+2617	3886	greater than or equal
+2617	3887	greater than
+2617	3888	overlaps
+2617	3889	contains
+2617	3890	contains
+2617	3891	is contained by
+2617	3892	is contained by
+2617	3893	is left of
+2617	3894	is right of
+2617	3895	overlaps or is left of
+2617	3896	overlaps or is right of
+2617	3897	is adjacent to
+2617	3898	range union
+2617	3899	range difference
+2617	3900	range intersection
+2617	3962	get json object field
+2617	3963	get json object field as text
+2617	3964	get json array element
+2617	3965	get json array element as text
+2617	3966	get value from json with path elements
+2617	3967	get value from json as text with path elements
+2617	4012	jsonpath exists
+2617	4013	jsonpath match
+2617	4035	overlaps or is right of
+2617	4142	overlaps or is right of
+2617	4161	is above
+2617	4162	is below
+2617	4179	is adjacent to
+2617	4180	is adjacent to
+2617	4198	is adjacent to
+2617	4392	multirange union
+2617	4393	multirange minus
+2617	4394	multirange intersect
+2617	4395	is left of
+2617	4396	is left of
+2617	4397	is left of
+2617	4398	is right of
+2617	4399	is right of
+2617	4400	is right of
+2617	4539	contains
+2617	4540	is contained by
+2617	5005	phrase-concatenate
+2617	5025	add
+2617	5026	add
+2617	5027	subtract
+2617	5068	equal
+2617	5072	not equal
+2617	5073	less than
+2617	5074	greater than
+2617	5075	less than or equal
+2617	5076	greater than or equal
+3079	13823	PL/pgSQL procedural language
+3456	100	database's default collation
+3456	950	standard C collation
+3456	951	standard POSIX collation
+3456	12606	Unknown language
+3456	12607	Afrikaans
+3456	12608	Afrikaans (Namibia)
+3456	12609	Afrikaans (South Africa)
+3456	12610	Aghem
+3456	12611	Aghem (Cameroon)
+3456	12612	Akan
+3456	12613	Akan (Ghana)
+3456	12614	Amharic
+3456	12615	Amharic (Ethiopia)
+3456	12616	Arabic
+3456	12617	Arabic (world)
+3456	12618	Arabic (United Arab Emirates)
+3456	12619	Arabic (Bahrain)
+3456	12620	Arabic (Djibouti)
+3456	12621	Arabic (Algeria)
+3456	12622	Arabic (Egypt)
+3456	12623	Arabic (Western Sahara)
+3456	12624	Arabic (Eritrea)
+3456	12625	Arabic (Israel)
+3456	12626	Arabic (Iraq)
+3456	12627	Arabic (Jordan)
+3456	12628	Arabic (Comoros)
+3456	12629	Arabic (Kuwait)
+3456	12630	Arabic (Lebanon)
+3456	12631	Arabic (Libya)
+3456	12632	Arabic (Morocco)
+3456	12633	Arabic (Mauritania)
+3456	12634	Arabic (Oman)
+3456	12635	Arabic (Palestinian Territories)
+3456	12636	Arabic (Qatar)
+3456	12637	Arabic (Saudi Arabia)
+3456	12638	Arabic (Sudan)
+3456	12639	Arabic (Somalia)
+3456	12640	Arabic (South Sudan)
+3456	12641	Arabic (Syria)
+3456	12642	Arabic (Chad)
+3456	12643	Arabic (Tunisia)
+3456	12644	Arabic (Yemen)
+3456	12645	Assamese
+3456	12646	Assamese (India)
+3456	12647	Asu
+3456	12648	Asu (Tanzania)
+3456	12649	Asturian
+3456	12650	Asturian (Spain)
+3456	12651	Azerbaijani
+3456	12652	Azerbaijani (Cyrillic)
+3456	12653	Azerbaijani (Cyrillic, Azerbaijan)
+3456	12654	Azerbaijani (Latin)
+3456	12655	Azerbaijani (Latin, Azerbaijan)
+3456	12656	Basaa
+3456	12657	Basaa (Cameroon)
+3456	12658	Belarusian
+3456	12659	Belarusian (Belarus)
+3456	12660	Bemba
+3456	12661	Bemba (Zambia)
+3456	12662	Bena
+3456	12663	Bena (Tanzania)
+3456	12664	Bulgarian
+3456	12665	Bulgarian (Bulgaria)
+3456	12666	Haryanvi
+3456	12667	Haryanvi (India)
+3456	12668	Bhojpuri
+3456	12669	Bhojpuri (India)
+3456	12670	Bambara
+3456	12671	Bambara (Mali)
+3456	12672	Bangla
+3456	12673	Bangla (Bangladesh)
+3456	12674	Bangla (India)
+3456	12675	Tibetan
+3456	12676	Tibetan (China)
+3456	12677	Tibetan (India)
+3456	12678	Breton
+3456	12679	Breton (France)
+3456	12680	Bodo
+3456	12681	Bodo (India)
+3456	12682	Bosnian
+3456	12683	Bosnian (Cyrillic)
+3456	12684	Bosnian (Cyrillic, Bosnia & Herzegovina)
+3456	12685	Bosnian (Latin)
+3456	12686	Bosnian (Latin, Bosnia & Herzegovina)
+3456	12687	Catalan
+3456	12688	Catalan (Andorra)
+3456	12689	Catalan (Spain)
+3456	12690	Catalan (France)
+3456	12691	Catalan (Italy)
+3456	12692	Chakma
+3456	12693	Chakma (Bangladesh)
+3456	12694	Chakma (India)
+3456	12695	Chechen
+3456	12696	Chechen (Russia)
+3456	12697	Cebuano
+3456	12698	Cebuano (Philippines)
+3456	12699	Chiga
+3456	12700	Chiga (Uganda)
+3456	12701	Cherokee
+3456	12702	Cherokee (United States)
+3456	12703	Central Kurdish
+3456	12704	Central Kurdish (Iraq)
+3456	12705	Central Kurdish (Iran)
+3456	12706	Czech
+3456	12707	Czech (Czechia)
+3456	12708	Chuvash
+3456	12709	Chuvash (Russia)
+3456	12710	Welsh
+3456	12711	Welsh (United Kingdom)
+3456	12712	Danish
+3456	12713	Danish (Denmark)
+3456	12714	Danish (Greenland)
+3456	12715	Taita
+3456	12716	Taita (Kenya)
+3456	12717	German
+3456	12718	German (Austria)
+3456	12719	German (Belgium)
+3456	12720	German (Switzerland)
+3456	12721	German (Germany)
+3456	12722	German (Italy)
+3456	12723	German (Liechtenstein)
+3456	12724	German (Luxembourg)
+3456	12725	Zarma
+3456	12726	Zarma (Niger)
+3456	12727	Dogri
+3456	12728	Dogri (India)
+3456	12729	Lower Sorbian
+3456	12730	Lower Sorbian (Germany)
+3456	12731	Duala
+3456	12732	Duala (Cameroon)
+3456	12733	Jola-Fonyi
+3456	12734	Jola-Fonyi (Senegal)
+3456	12735	Dzongkha
+3456	12736	Dzongkha (Bhutan)
+3456	12737	Embu
+3456	12738	Embu (Kenya)
+3456	12739	Ewe
+3456	12740	Ewe (Ghana)
+3456	12741	Ewe (Togo)
+3456	12742	Greek
+3456	12743	Greek (Cyprus)
+3456	12744	Greek (Greece)
+3456	12745	English
+3456	12746	English (world)
+3456	12747	English (Europe)
+3456	12748	English (United Arab Emirates)
+3456	12749	English (Antigua & Barbuda)
+3456	12750	English (Anguilla)
+3456	12751	English (American Samoa)
+3456	12752	English (Austria)
+3456	12753	English (Australia)
+3456	12754	English (Barbados)
+3456	12755	English (Belgium)
+3456	12756	English (Burundi)
+3456	12757	English (Bermuda)
+3456	12758	English (Bahamas)
+3456	12759	English (Botswana)
+3456	12760	English (Belize)
+3456	12761	English (Canada)
+3456	12762	English (Cocos [Keeling] Islands)
+3456	12763	English (Switzerland)
+3456	12764	English (Cook Islands)
+3456	12765	English (Cameroon)
+3456	12766	English (Christmas Island)
+3456	12767	English (Cyprus)
+3456	12768	English (Germany)
+3456	12769	English (Diego Garcia)
+3456	12770	English (Denmark)
+3456	12771	English (Dominica)
+3456	12772	English (Eritrea)
+3456	12773	English (Finland)
+3456	12774	English (Fiji)
+3456	12775	English (Falkland Islands)
+3456	12776	English (Micronesia)
+3456	12777	English (United Kingdom)
+3456	12778	English (Grenada)
+3456	12779	English (Guernsey)
+3456	12780	English (Ghana)
+3456	12781	English (Gibraltar)
+3456	12782	English (Gambia)
+3456	12783	English (Guam)
+3456	12784	English (Guyana)
+3456	12785	English (Hong Kong SAR China)
+3456	12786	English (Ireland)
+3456	12787	English (Israel)
+3456	12788	English (Isle of Man)
+3456	12789	English (India)
+3456	12790	English (British Indian Ocean Territory)
+3456	12791	English (Jersey)
+3456	12792	English (Jamaica)
+3456	12793	English (Kenya)
+3456	12794	English (Kiribati)
+3456	12795	English (St. Kitts & Nevis)
+3456	12796	English (Cayman Islands)
+3456	12797	English (St. Lucia)
+3456	12798	English (Liberia)
+3456	12799	English (Lesotho)
+3456	12800	English (Madagascar)
+3456	12801	English (Marshall Islands)
+3456	12802	English (Macao SAR China)
+3456	12803	English (Northern Mariana Islands)
+3456	12804	English (Montserrat)
+3456	12805	English (Malta)
+3456	12806	English (Mauritius)
+3456	12807	English (Maldives)
+3456	12808	English (Malawi)
+3456	12809	English (Malaysia)
+3456	12810	English (Namibia)
+3456	12811	English (Norfolk Island)
+3456	12812	English (Nigeria)
+3456	12813	English (Netherlands)
+3456	12814	English (Nauru)
+3456	12815	English (Niue)
+3456	12816	English (New Zealand)
+3456	12817	English (Papua New Guinea)
+3456	12818	English (Philippines)
+3456	12819	English (Pakistan)
+3456	12820	English (Pitcairn Islands)
+3456	12821	English (Puerto Rico)
+3456	12822	English (Palau)
+3456	12823	English (Rwanda)
+3456	12824	English (Solomon Islands)
+3456	12825	English (Seychelles)
+3456	12826	English (Sudan)
+3456	12827	English (Sweden)
+3456	12828	English (Singapore)
+3456	12829	English (St. Helena)
+3456	12830	English (Slovenia)
+3456	12831	English (Sierra Leone)
+3456	12832	English (South Sudan)
+3456	12833	English (Sint Maarten)
+3456	12834	English (Eswatini)
+3456	12835	English (Turks & Caicos Islands)
+3456	12836	English (Tokelau)
+3456	12837	English (Tonga)
+3456	12838	English (Trinidad & Tobago)
+3456	12839	English (Tuvalu)
+3456	12840	English (Tanzania)
+3456	12841	English (Uganda)
+3456	12842	English (U.S. Outlying Islands)
+3456	12843	English (United States)
+3456	12844	English (United States, Computer)
+3456	12845	English (St. Vincent & Grenadines)
+3456	12846	English (British Virgin Islands)
+3456	12847	English (U.S. Virgin Islands)
+3456	12848	English (Vanuatu)
+3456	12849	English (Samoa)
+3456	12850	English (South Africa)
+3456	12851	English (Zambia)
+3456	12852	English (Zimbabwe)
+3456	12853	Esperanto
+3456	12854	Esperanto (world)
+3456	12855	Spanish
+3456	12856	Spanish (Latin America)
+3456	12857	Spanish (Argentina)
+3456	12858	Spanish (Bolivia)
+3456	12859	Spanish (Brazil)
+3456	12860	Spanish (Belize)
+3456	12861	Spanish (Chile)
+3456	12862	Spanish (Colombia)
+3456	12863	Spanish (Costa Rica)
+3456	12864	Spanish (Cuba)
+3456	12865	Spanish (Dominican Republic)
+3456	12866	Spanish (Ceuta & Melilla)
+3456	12867	Spanish (Ecuador)
+3456	12868	Spanish (Spain)
+3456	12869	Spanish (Equatorial Guinea)
+3456	12870	Spanish (Guatemala)
+3456	12871	Spanish (Honduras)
+3456	12872	Spanish (Canary Islands)
+3456	12873	Spanish (Mexico)
+3456	12874	Spanish (Nicaragua)
+3456	12875	Spanish (Panama)
+3456	12876	Spanish (Peru)
+3456	12877	Spanish (Philippines)
+3456	12878	Spanish (Puerto Rico)
+3456	12879	Spanish (Paraguay)
+3456	12880	Spanish (El Salvador)
+3456	12881	Spanish (United States)
+3456	12882	Spanish (Uruguay)
+3456	12883	Spanish (Venezuela)
+3456	12884	Estonian
+3456	12885	Estonian (Estonia)
+3456	12886	Basque
+3456	12887	Basque (Spain)
+3456	12888	Ewondo
+3456	12889	Ewondo (Cameroon)
+3456	12890	Persian
+3456	12891	Persian (Afghanistan)
+3456	12892	Persian (Iran)
+3456	12893	Fula
+3456	12894	Fula (Adlam)
+3456	12895	Fula (Adlam, Burkina Faso)
+3456	12896	Fula (Adlam, Cameroon)
+3456	12897	Fula (Adlam, Ghana)
+3456	12898	Fula (Adlam, Gambia)
+3456	12899	Fula (Adlam, Guinea)
+3456	12900	Fula (Adlam, Guinea-Bissau)
+3456	12901	Fula (Adlam, Liberia)
+3456	12902	Fula (Adlam, Mauritania)
+3456	12903	Fula (Adlam, Niger)
+3456	12904	Fula (Adlam, Nigeria)
+3456	12905	Fula (Adlam, Sierra Leone)
+3456	12906	Fula (Adlam, Senegal)
+3456	12907	Fula (Latin)
+3456	12908	Fula (Latin, Burkina Faso)
+3456	12909	Fula (Latin, Cameroon)
+3456	12910	Fula (Latin, Ghana)
+3456	12911	Fula (Latin, Gambia)
+3456	12912	Fula (Latin, Guinea)
+3456	12913	Fula (Latin, Guinea-Bissau)
+3456	12914	Fula (Latin, Liberia)
+3456	12915	Fula (Latin, Mauritania)
+3456	12916	Fula (Latin, Niger)
+3456	12917	Fula (Latin, Nigeria)
+3456	12918	Fula (Latin, Sierra Leone)
+3456	12919	Fula (Latin, Senegal)
+3456	12920	Finnish
+3456	12921	Finnish (Finland)
+3456	12922	Filipino
+3456	12923	Filipino (Philippines)
+3456	12924	Faroese
+3456	12925	Faroese (Denmark)
+3456	12926	Faroese (Faroe Islands)
+3456	12927	French
+3456	12928	French (Belgium)
+3456	12929	French (Burkina Faso)
+3456	12930	French (Burundi)
+3456	12931	French (Benin)
+3456	12933	French (Canada)
+3456	12934	French (Congo - Kinshasa)
+3456	12935	French (Central African Republic)
+3456	12936	French (Congo - Brazzaville)
+3456	12937	French (Switzerland)
+3456	12939	French (Cameroon)
+3456	12940	French (Djibouti)
+3456	12941	French (Algeria)
+3456	12942	French (France)
+3456	12943	French (Gabon)
+3456	12944	French (French Guiana)
+3456	12945	French (Guinea)
+3456	12946	French (Guadeloupe)
+3456	12947	French (Equatorial Guinea)
+3456	12948	French (Haiti)
+3456	12949	French (Comoros)
+3456	12950	French (Luxembourg)
+3456	12951	French (Morocco)
+3456	12952	French (Monaco)
+3456	12953	French (St. Martin)
+3456	12954	French (Madagascar)
+3456	12955	French (Mali)
+3456	12956	French (Martinique)
+3456	12957	French (Mauritania)
+3456	12958	French (Mauritius)
+3456	12959	French (New Caledonia)
+3456	12960	French (Niger)
+3456	12961	French (French Polynesia)
+3456	12962	French (St. Pierre & Miquelon)
+3456	12964	French (Rwanda)
+3456	12965	French (Seychelles)
+3456	12966	French (Senegal)
+3456	12967	French (Syria)
+3456	12968	French (Chad)
+3456	12969	French (Togo)
+3456	12970	French (Tunisia)
+3456	12971	French (Vanuatu)
+3456	12972	French (Wallis & Futuna)
+3456	12973	French (Mayotte)
+3456	12974	Friulian
+3456	12975	Friulian (Italy)
+3456	12976	Western Frisian
+3456	12977	Western Frisian (Netherlands)
+3456	12978	Irish
+3456	12979	Irish (United Kingdom)
+3456	12980	Irish (Ireland)
+3456	12981	Scottish Gaelic
+3456	12982	Scottish Gaelic (United Kingdom)
+3456	12983	Galician
+3456	12984	Galician (Spain)
+3456	12985	Swiss German
+3456	12986	Swiss German (Switzerland)
+3456	12987	Swiss German (France)
+3456	12988	Swiss German (Liechtenstein)
+3456	12989	Gujarati
+3456	12990	Gujarati (India)
+3456	12991	Gusii
+3456	12992	Gusii (Kenya)
+3456	12993	Manx
+3456	12994	Manx (Isle of Man)
+3456	12995	Hausa
+3456	12996	Hausa (Ghana)
+3456	12997	Hausa (Niger)
+3456	12998	Hausa (Nigeria)
+3456	12999	Hawaiian
+3456	13000	Hawaiian (United States)
+3456	13001	Hebrew
+3456	13002	Hebrew (Israel)
+3456	13003	Hindi
+3456	13004	Hindi (India)
+3456	13005	Hindi (Latin)
+3456	13006	Hindi (Latin, India)
+3456	13007	Croatian
+3456	13008	Croatian (Bosnia & Herzegovina)
+3456	13009	Croatian (Croatia)
+3456	13010	Upper Sorbian
+3456	13011	Upper Sorbian (Germany)
+3456	13012	Hungarian
+3456	13013	Hungarian (Hungary)
+3456	13014	Armenian
+3456	13015	Armenian (Armenia)
+3456	13016	Interlingua
+3456	13017	Interlingua (world)
+3456	13018	Indonesian
+3456	13019	Indonesian (Indonesia)
+3456	13020	Igbo
+3456	13021	Igbo (Nigeria)
+3456	13022	Sichuan Yi
+3456	13023	Sichuan Yi (China)
+3456	13024	Icelandic
+3456	13025	Icelandic (Iceland)
+3456	13026	Italian
+3456	13027	Italian (Switzerland)
+3456	13028	Italian (Italy)
+3456	13029	Italian (San Marino)
+3456	13030	Italian (Vatican City)
+3456	13031	Japanese
+3456	13032	Japanese (Japan)
+3456	13033	Ngomba
+3456	13034	Ngomba (Cameroon)
+3456	13035	Machame
+3456	13036	Machame (Tanzania)
+3456	13037	Javanese
+3456	13038	Javanese (Indonesia)
+3456	13039	Georgian
+3456	13040	Georgian (Georgia)
+3456	13041	Kabyle
+3456	13042	Kabyle (Algeria)
+3456	13043	Kamba
+3456	13044	Kamba (Kenya)
+3456	13045	Makonde
+3456	13046	Makonde (Tanzania)
+3456	13047	Kabuverdianu
+3456	13048	Kabuverdianu (Cape Verde)
+3456	13049	Kaingang
+3456	13050	Kaingang (Brazil)
+3456	13051	Koyra Chiini
+3456	13052	Koyra Chiini (Mali)
+3456	13053	Kikuyu
+3456	13054	Kikuyu (Kenya)
+3456	13055	Kazakh
+3456	13056	Kazakh (Kazakhstan)
+3456	13057	Kako
+3456	13058	Kako (Cameroon)
+3456	13059	Kalaallisut
+3456	13060	Kalaallisut (Greenland)
+3456	13061	Kalenjin
+3456	13062	Kalenjin (Kenya)
+3456	13063	Khmer
+3456	13064	Khmer (Cambodia)
+3456	13065	Kannada
+3456	13066	Kannada (India)
+3456	13067	Korean
+3456	13068	Korean (North Korea)
+3456	13069	Korean (South Korea)
+3456	13070	Konkani
+3456	13071	Konkani (India)
+3456	13072	Kashmiri
+3456	13073	Kashmiri (Arabic)
+3456	13074	Kashmiri (Arabic, India)
+3456	13075	Kashmiri (Devanagari)
+3456	13076	Kashmiri (Devanagari, India)
+3456	13077	Shambala
+3456	13078	Shambala (Tanzania)
+3456	13079	Bafia
+3456	13080	Bafia (Cameroon)
+3456	13081	Colognian
+3456	13082	Colognian (Germany)
+3456	13083	Kurdish
+3456	13084	Kurdish (Turkey)
+3456	13085	Cornish
+3456	13086	Cornish (United Kingdom)
+3456	13087	Kyrgyz
+3456	13088	Kyrgyz (Kyrgyzstan)
+3456	13089	Langi
+3456	13090	Langi (Tanzania)
+3456	13091	Luxembourgish
+3456	13092	Luxembourgish (Luxembourg)
+3456	13093	Ganda
+3456	13094	Ganda (Uganda)
+3456	13095	Lakota
+3456	13096	Lakota (United States)
+3456	13097	Lingala
+3456	13098	Lingala (Angola)
+3456	13099	Lingala (Congo - Kinshasa)
+3456	13100	Lingala (Central African Republic)
+3456	13101	Lingala (Congo - Brazzaville)
+3456	13102	Lao
+3456	13103	Lao (Laos)
+3456	13104	Northern Luri
+3456	13105	Northern Luri (Iraq)
+3456	13106	Northern Luri (Iran)
+3456	13107	Lithuanian
+3456	13108	Lithuanian (Lithuania)
+3456	13109	Luba-Katanga
+3456	13110	Luba-Katanga (Congo - Kinshasa)
+3456	13111	Luo
+3456	13112	Luo (Kenya)
+3456	13113	Luyia
+3456	13114	Luyia (Kenya)
+3456	13115	Latvian
+3456	13116	Latvian (Latvia)
+3456	13117	Maithili
+3456	13118	Maithili (India)
+3456	13119	Masai
+3456	13120	Masai (Kenya)
+3456	13121	Masai (Tanzania)
+3456	13122	Meru
+3456	13123	Meru (Kenya)
+3456	13124	Morisyen
+3456	13125	Morisyen (Mauritius)
+3456	13126	Malagasy
+3456	13127	Malagasy (Madagascar)
+3456	13128	Makhuwa-Meetto
+3456	13129	Makhuwa-Meetto (Mozambique)
+3456	13134	Macedonian
+3456	13135	Macedonian (North Macedonia)
+3456	13136	Malayalam
+3456	13137	Malayalam (India)
+3456	13138	Mongolian
+3456	13139	Mongolian (Mongolia)
+3456	13140	Manipuri
+3456	13141	Manipuri (Bangla)
+3456	13142	Manipuri (Bangla, India)
+3456	13143	Marathi
+3456	13144	Marathi (India)
+3456	13145	Malay
+3456	13146	Malay (Brunei)
+3456	13147	Malay (Indonesia)
+3456	13148	Malay (Malaysia)
+3456	13149	Malay (Singapore)
+3456	13150	Maltese
+3456	13151	Maltese (Malta)
+3456	13152	Mundang
+3456	13153	Mundang (Cameroon)
+3456	13154	Burmese
+3456	13155	Burmese (Myanmar [Burma])
+3456	13156	Mazanderani
+3456	13157	Mazanderani (Iran)
+3456	13158	Nama
+3456	13159	Nama (Namibia)
+3456	13163	North Ndebele
+3456	13164	North Ndebele (Zimbabwe)
+3456	13165	Nepali
+3456	13166	Nepali (India)
+3456	13167	Nepali (Nepal)
+3456	13168	Dutch
+3456	13169	Dutch (Aruba)
+3456	13170	Dutch (Belgium)
+3456	13171	Dutch (Caribbean Netherlands)
+3456	13173	Dutch (Netherlands)
+3456	13174	Dutch (Suriname)
+3456	13175	Dutch (Sint Maarten)
+3456	13176	Kwasio
+3456	13177	Kwasio (Cameroon)
+3456	13178	Norwegian Nynorsk
+3456	13179	Norwegian Nynorsk (Norway)
+3456	13180	Ngiemboon
+3456	13181	Ngiemboon (Cameroon)
+3456	13182	Norwegian
+3456	13183	Nuer
+3456	13184	Nuer (South Sudan)
+3456	13185	Nyankole
+3456	13186	Nyankole (Uganda)
+3456	13187	Oromo
+3456	13188	Oromo (Ethiopia)
+3456	13189	Oromo (Kenya)
+3456	13190	Odia
+3456	13191	Odia (India)
+3456	13192	Ossetic
+3456	13193	Ossetic (Georgia)
+3456	13194	Ossetic (Russia)
+3456	13195	Punjabi
+3456	13196	Punjabi (Arabic)
+3456	13197	Punjabi (Arabic, Pakistan)
+3456	13198	Punjabi (Gurmukhi)
+3456	13199	Punjabi (Gurmukhi, India)
+3456	13200	Nigerian Pidgin
+3456	13201	Nigerian Pidgin (Nigeria)
+3456	13202	Polish
+3456	13203	Polish (Poland)
+3456	13204	Pashto
+3456	13205	Pashto (Afghanistan)
+3456	13206	Pashto (Pakistan)
+3456	13207	Portuguese
+3456	13208	Portuguese (Angola)
+3456	13209	Portuguese (Brazil)
+3456	13210	Portuguese (Switzerland)
+3456	13211	Portuguese (Cape Verde)
+3456	13212	Portuguese (Equatorial Guinea)
+3456	13213	Portuguese (Guinea-Bissau)
+3456	13214	Portuguese (Luxembourg)
+3456	13215	Portuguese (Macao SAR China)
+3456	13216	Portuguese (Mozambique)
+3456	13217	Portuguese (Portugal)
+3456	13219	Portuguese (Timor-Leste)
+3456	13220	Quechua
+3456	13221	Quechua (Bolivia)
+3456	13222	Quechua (Ecuador)
+3456	13223	Quechua (Peru)
+3456	13224	Rajasthani
+3456	13225	Rajasthani (India)
+3456	13226	Romansh
+3456	13227	Romansh (Switzerland)
+3456	13228	Rundi
+3456	13229	Rundi (Burundi)
+3456	13230	Romanian
+3456	13231	Romanian (Moldova)
+3456	13232	Romanian (Romania)
+3456	13233	Rombo
+3456	13234	Rombo (Tanzania)
+3456	13235	Russian
+3456	13236	Russian (Belarus)
+3456	13237	Russian (Kyrgyzstan)
+3456	13238	Russian (Kazakhstan)
+3456	13239	Russian (Moldova)
+3456	13240	Russian (Russia)
+3456	13241	Russian (Ukraine)
+3456	13242	Kinyarwanda
+3456	13243	Kinyarwanda (Rwanda)
+3456	13244	Rwa
+3456	13245	Rwa (Tanzania)
+3456	13246	Sanskrit
+3456	13247	Sanskrit (India)
+3456	13248	Yakut
+3456	13249	Yakut (Russia)
+3456	13250	Samburu
+3456	13251	Samburu (Kenya)
+3456	13252	Santali
+3456	13253	Santali (Ol Chiki)
+3456	13254	Santali (Ol Chiki, India)
+3456	13255	Sangu
+3456	13256	Sangu (Tanzania)
+3456	13257	Sardinian
+3456	13258	Sardinian (Italy)
+3456	13259	Sindhi
+3456	13260	Sindhi (Arabic)
+3456	13261	Sindhi (Arabic, Pakistan)
+3456	13262	Sindhi (Devanagari)
+3456	13263	Sindhi (Devanagari, India)
+3456	13264	Northern Sami
+3456	13265	Northern Sami (Finland)
+3456	13266	Northern Sami (Norway)
+3456	13267	Northern Sami (Sweden)
+3456	13268	Sena
+3456	13269	Sena (Mozambique)
+3456	13270	Koyraboro Senni
+3456	13271	Koyraboro Senni (Mali)
+3456	13272	Sango
+3456	13273	Sango (Central African Republic)
+3456	13274	Tachelhit
+3456	13275	Tachelhit (Latin)
+3456	13276	Tachelhit (Latin, Morocco)
+3456	13277	Tachelhit (Tifinagh)
+3456	13278	Tachelhit (Tifinagh, Morocco)
+3456	13279	Sinhala
+3456	13280	Sinhala (Sri Lanka)
+3456	13281	Slovak
+3456	13282	Slovak (Slovakia)
+3456	13283	Slovenian
+3456	13284	Slovenian (Slovenia)
+3456	13285	Inari Sami
+3456	13286	Inari Sami (Finland)
+3456	13287	Shona
+3456	13288	Shona (Zimbabwe)
+3456	13289	Somali
+3456	13290	Somali (Djibouti)
+3456	13291	Somali (Ethiopia)
+3456	13292	Somali (Kenya)
+3456	13293	Somali (Somalia)
+3456	13294	Albanian
+3456	13295	Albanian (Albania)
+3456	13296	Albanian (North Macedonia)
+3456	13297	Albanian (Kosovo)
+3456	13298	Serbian
+3456	13299	Serbian (Cyrillic)
+3456	13300	Serbian (Cyrillic, Bosnia & Herzegovina)
+3456	13301	Serbian (Cyrillic, Montenegro)
+3456	13302	Serbian (Cyrillic, Serbia)
+3456	13303	Serbian (Cyrillic, Kosovo)
+3456	13304	Serbian (Latin)
+3456	13305	Serbian (Latin, Bosnia & Herzegovina)
+3456	13306	Serbian (Latin, Montenegro)
+3456	13307	Serbian (Latin, Serbia)
+3456	13308	Serbian (Latin, Kosovo)
+3456	13309	Sundanese
+3456	13310	Sundanese (Latin)
+3456	13311	Sundanese (Latin, Indonesia)
+3456	13312	Swedish
+3456	13314	Swedish (Finland)
+3456	13315	Swedish (Sweden)
+3456	13316	Swahili
+3456	13317	Swahili (Congo - Kinshasa)
+3456	13318	Swahili (Kenya)
+3456	13319	Swahili (Tanzania)
+3456	13320	Swahili (Uganda)
+3456	13321	Tamil
+3456	13322	Tamil (India)
+3456	13323	Tamil (Sri Lanka)
+3456	13324	Tamil (Malaysia)
+3456	13325	Tamil (Singapore)
+3456	13326	Telugu
+3456	13327	Telugu (India)
+3456	13328	Teso
+3456	13329	Teso (Kenya)
+3456	13330	Teso (Uganda)
+3456	13331	Tajik
+3456	13332	Tajik (Tajikistan)
+3456	13333	Thai
+3456	13334	Thai (Thailand)
+3456	13335	Tigrinya
+3456	13336	Tigrinya (Eritrea)
+3456	13337	Tigrinya (Ethiopia)
+3456	13338	Turkmen
+3456	13339	Turkmen (Turkmenistan)
+3456	13340	Tongan
+3456	13341	Tongan (Tonga)
+3456	13342	Turkish
+3456	13343	Turkish (Cyprus)
+3456	13344	Turkish (Turkey)
+3456	13345	Tatar
+3456	13346	Tatar (Russia)
+3456	13347	Tasawaq
+3456	13348	Tasawaq (Niger)
+3456	13349	Central Atlas Tamazight
+3456	13350	Central Atlas Tamazight (Morocco)
+3456	13351	Uyghur
+3456	13352	Uyghur (China)
+3456	13353	Ukrainian
+3456	13354	Ukrainian (Ukraine)
+3456	13355	Urdu
+3456	13356	Urdu (India)
+3456	13357	Urdu (Pakistan)
+3456	13358	Uzbek
+3456	13359	Uzbek (Arabic)
+3456	13360	Uzbek (Arabic, Afghanistan)
+3456	13361	Uzbek (Cyrillic)
+3456	13362	Uzbek (Cyrillic, Uzbekistan)
+3456	13363	Uzbek (Latin)
+3456	13364	Uzbek (Latin, Uzbekistan)
+3456	13365	Vai
+3456	13366	Vai (Latin)
+3456	13367	Vai (Latin, Liberia)
+3456	13368	Vai (Vai)
+3456	13369	Vai (Vai, Liberia)
+3456	13370	Vietnamese
+3456	13371	Vietnamese (Vietnam)
+3456	13372	Vunjo
+3456	13373	Vunjo (Tanzania)
+3456	13374	Walser
+3456	13375	Walser (Switzerland)
+3456	13376	Wolof
+3456	13377	Wolof (Senegal)
+3456	13378	Xhosa
+3456	13379	Xhosa (South Africa)
+3456	13380	Soga
+3456	13381	Soga (Uganda)
+3456	13382	Yangben
+3456	13383	Yangben (Cameroon)
+3456	13384	Yiddish
+3456	13385	Yiddish (world)
+3456	13386	Yoruba
+3456	13387	Yoruba (Benin)
+3456	13388	Yoruba (Nigeria)
+3456	13389	Nheengatu
+3456	13390	Nheengatu (Brazil)
+3456	13391	Nheengatu (Colombia)
+3456	13392	Nheengatu (Venezuela)
+3456	13393	Cantonese
+3456	13394	Cantonese (Simplified)
+3456	13395	Cantonese (Simplified, China)
+3456	13396	Cantonese (Traditional)
+3456	13397	Cantonese (Traditional, Hong Kong SAR China)
+3456	13398	Standard Moroccan Tamazight
+3456	13399	Standard Moroccan Tamazight (Morocco)
+3456	13400	Chinese
+3456	13401	Chinese (Simplified)
+3456	13402	Chinese (Simplified, China)
+3456	13403	Chinese (Simplified, Hong Kong SAR China)
+3456	13404	Chinese (Simplified, Macao SAR China)
+3456	13405	Chinese (Simplified, Singapore)
+3456	13406	Chinese (Traditional)
+3456	13407	Chinese (Traditional, Hong Kong SAR China)
+3456	13408	Chinese (Traditional, Macao SAR China)
+3456	13409	Chinese (Traditional, Taiwan)
+3456	13410	Zulu
+3456	13411	Zulu (South Africa)
+3600	3765	simple dictionary: just lower case and check for stopword
+3600	13415	snowball stemmer for arabic language
+3600	13417	snowball stemmer for armenian language
+3600	13419	snowball stemmer for basque language
+3600	13421	snowball stemmer for catalan language
+3600	13423	snowball stemmer for danish language
+3600	13425	snowball stemmer for dutch language
+3600	13427	snowball stemmer for english language
+3600	13429	snowball stemmer for finnish language
+3600	13431	snowball stemmer for french language
+3600	13433	snowball stemmer for german language
+3600	13435	snowball stemmer for greek language
+3600	13437	snowball stemmer for hindi language
+3600	13439	snowball stemmer for hungarian language
+3600	13441	snowball stemmer for indonesian language
+3600	13443	snowball stemmer for irish language
+3600	13445	snowball stemmer for italian language
+3600	13447	snowball stemmer for lithuanian language
+3600	13449	snowball stemmer for nepali language
+3600	13451	snowball stemmer for norwegian language
+3600	13453	snowball stemmer for portuguese language
+3600	13455	snowball stemmer for romanian language
+3600	13457	snowball stemmer for russian language
+3600	13459	snowball stemmer for serbian language
+3600	13461	snowball stemmer for spanish language
+3600	13463	snowball stemmer for swedish language
+3600	13465	snowball stemmer for tamil language
+3600	13467	snowball stemmer for turkish language
+3600	13469	snowball stemmer for yiddish language
+3601	3722	default word parser
+3602	3748	simple configuration
+3602	13416	configuration for arabic language
+3602	13418	configuration for armenian language
+3602	13420	configuration for basque language
+3602	13422	configuration for catalan language
+3602	13424	configuration for danish language
+3602	13426	configuration for dutch language
+3602	13428	configuration for english language
+3602	13430	configuration for finnish language
+3602	13432	configuration for french language
+3602	13434	configuration for german language
+3602	13436	configuration for greek language
+3602	13438	configuration for hindi language
+3602	13440	configuration for hungarian language
+3602	13442	configuration for indonesian language
+3602	13444	configuration for irish language
+3602	13446	configuration for italian language
+3602	13448	configuration for lithuanian language
+3602	13450	configuration for nepali language
+3602	13452	configuration for norwegian language
+3602	13454	configuration for portuguese language
+3602	13456	configuration for romanian language
+3602	13458	configuration for russian language
+3602	13460	configuration for serbian language
+3602	13462	configuration for spanish language
+3602	13464	configuration for swedish language
+3602	13466	configuration for tamil language
+3602	13468	configuration for turkish language
+3602	13470	configuration for yiddish language
+3764	3727	simple dictionary: just lower case and check for stopword
+3764	3730	synonym dictionary: replace word by its synonym
+3764	3733	ispell dictionary
+3764	3742	thesaurus dictionary: phrase by phrase substitution
+3764	13414	snowball stemmer

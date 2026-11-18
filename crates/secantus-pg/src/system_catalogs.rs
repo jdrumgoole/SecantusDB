@@ -316,6 +316,54 @@ pub(crate) fn dumped(name: &str) -> &'static str {
     &ROWS[start..end]
 }
 
+/// Each built-in routine's description as `initdb` wrote it to
+/// `pg_description` from `pg_proc.dat` (`pg15_proc_descriptions.tsv`,
+/// `tools/probes/pg15_system_catalog_dump.py`): `(pg_proc oid, text)`.
+pub(crate) fn initdb_proc_descriptions() -> &'static [(i64, String)] {
+    static ROWS: std::sync::OnceLock<Vec<(i64, String)>> = std::sync::OnceLock::new();
+    ROWS.get_or_init(|| {
+        include_str!("pg15_proc_descriptions.tsv")
+            .lines()
+            .filter_map(|l| {
+                let (oid, text) = l.split_once('\t')?;
+                Some((oid.parse().ok()?, text.to_string()))
+            })
+            .collect()
+    })
+}
+
+/// Every other built-in object's description as `initdb` wrote it to
+/// `pg_description` from its catalog's `.dat` (`pg15_other_descriptions.tsv`,
+/// `tools/probes/pg15_system_catalog_dump.py`): `(classoid, oid, text)`.
+pub(crate) fn initdb_other_descriptions() -> &'static [(i64, i64, String)] {
+    static ROWS: std::sync::OnceLock<Vec<(i64, i64, String)>> = std::sync::OnceLock::new();
+    ROWS.get_or_init(|| {
+        include_str!("pg15_other_descriptions.tsv")
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.splitn(3, '\t');
+                let classoid = f.next()?.parse().ok()?;
+                let oid = f.next()?.parse().ok()?;
+                Some((classoid, oid, f.next()?.to_string()))
+            })
+            .collect()
+    })
+}
+
+/// The catalog a built-in object with an initdb description lives in, by
+/// its oid: unique across the bootstrap catalogs, as `genbki` assigns them.
+pub(crate) fn initdb_description_class(oid: i64) -> Option<i64> {
+    static MAP: std::sync::OnceLock<HashMap<i64, i64>> = std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        initdb_other_descriptions()
+            .iter()
+            .map(|(c, o, _)| (*o, *c))
+            .collect()
+    })
+    .get(&oid)
+    .copied()
+}
+
 /// A built-in object's ACL as `initdb` leaves it (`pg_init_privs`), by
 /// `(classoid, objoid, objsubid)`: `pg_subscription`'s columns are
 /// `{=r/postgres}`. PostgreSQL's current ACL of a system object is this

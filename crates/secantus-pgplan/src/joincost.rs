@@ -533,7 +533,7 @@ pub fn hash_anti_join(
         sel,
         1.0,
         inner_keys,
-        Some((factors, true)),
+        Some((factors, true, false)),
     )
 }
 
@@ -555,7 +555,30 @@ pub fn hash_semi_join(
         sel,
         1.0,
         inner_keys,
-        Some((factors, false)),
+        Some((factors, false, false)),
+    )
+}
+
+/// The inner join of `outer` to a `UniquePath` of the inner relation
+/// hashed (`create_unique_path`, RP-411): priced with the inner relation's
+/// semi-join `factors`, as `final_cost_hashjoin` prices an `inner_unique`
+/// join, and each bucket holding at most one entry (`innerbucketsize =
+/// 1.0 / virtualbuckets`, no MCV frequency).
+pub fn hash_join_over_unique_path(
+    outer: &JoinSide,
+    inner: &JoinSide,
+    sel: f64,
+    factors: (f64, f64),
+    inner_keys: &[KeyStats<'_>],
+) -> (f64, f64) {
+    hash_join_core(
+        outer,
+        inner,
+        0.0,
+        sel,
+        1.0,
+        inner_keys,
+        Some((factors, false, true)),
     )
 }
 
@@ -630,8 +653,11 @@ fn hash_join_core(
     sel: f64,
     filter_sel: f64,
     inner_keys: &[KeyStats<'_>],
-    semi_anti: Option<((f64, f64), bool)>,
+    semi_anti: Option<((f64, f64), bool, bool)>,
 ) -> (f64, f64) {
+    // The semi or anti join's factors, whether it is an anti join, and
+    // whether the inner side is a `UniquePath`.
+    let unique_path = semi_anti.is_some_and(|(_, _, u)| u);
     let mut startup = outer.scan.0 + inner.scan.1;
     let mut run = outer.scan.1 - outer.scan.0;
     // `initial_cost_hashjoin`: each hash clause is evaluated once per
@@ -680,7 +706,10 @@ fn hash_join_core(
         };
         f.clamp(1.0e-6, 1.0)
     };
-    let bucketsize = if inner_keys.is_empty() {
+    let bucketsize = if unique_path {
+        // A unique-ified inner side has one entry a key.
+        1.0 / buckets
+    } else if inner_keys.is_empty() {
         let mut b = bucket_of(inner.ndistinct, inner.default_ndistinct);
         for i in 0..inner.extra.n {
             b = b.min(bucket_of(
@@ -721,7 +750,7 @@ fn hash_join_core(
         bucket
     };
     let tuples = if inner.unique || semi_anti.is_some() {
-        let (match_frac, match_count) = semi_anti.map(|(f, _)| f).unwrap_or_else(|| {
+        let (match_frac, match_count) = semi_anti.map(|(f, _, _)| f).unwrap_or_else(|| {
             let match_frac = sel * filter_sel;
             (match_frac, (match_frac * inner.rows / match_frac).max(1.0))
         });
@@ -735,7 +764,7 @@ fn hash_join_core(
             * (outer.rows - matched)
             * clamp_row_est(inner.rows / buckets)
             * 0.05;
-        if semi_anti.is_some_and(|(_, anti)| anti) {
+        if semi_anti.is_some_and(|(_, anti, _)| anti) {
             outer.rows - matched
         } else {
             matched

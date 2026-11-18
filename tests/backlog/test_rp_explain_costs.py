@@ -5264,10 +5264,70 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Filter: (b = $0)",
         ],
     ),
+    # A GROUP BY hashed above an InitPlan's scan, measured on 15.19
+    # (RP-440): the executor's FROM subquery was merged away.
+    "a group by above an initplan's scan is priced": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select b, count(*) from e where a > (select 5) group by b",
+        [
+            "HashAggregate  (cost=19.18..19.28 rows=10 width=11)",
+            "  Group Key: e.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=333 width=3)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    # A grouped sum hashed above an InitPlan's scan, measured on 15.19
+    # (RP-440): grouped aggregates other than counts are unpriced.
+    "a grouped sum above an initplan's scan is priced": (
+        "RP-440",
+        _ANALYSED,
+        "explain select b, sum(a) from e where a > (select 5) group by b",
+        [
+            "HashAggregate  (cost=19.18..19.28 rows=10 width=11)",
+            "  Group Key: e.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=333 width=7)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    # A SELECT DISTINCT of two columns hashed above an InitPlan's scan,
+    # measured on 15.19 (RP-440).
+    "a two-column distinct above an initplan's scan is priced": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select distinct a, b from e where b = (select 'v3'::text)",
+        [
+            "HashAggregate  (cost=18.01..19.01 rows=100 width=7)",
+            "  Group Key: e.a, e.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=7)",
+            "        Filter: (b = $0)",
+        ],
+    ),
+    # A SELECT DISTINCT over an InitPlan's range comparison, measured on
+    # 15.19 (RP-440).
+    "a distinct above an initplan's range scan is priced": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select distinct b from e where a > (select 5)",
+        [
+            "HashAggregate  (cost=18.34..18.44 rows=10 width=3)",
+            "  Group Key: e.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=333 width=3)",
+            "        Filter: (a > $0)",
+        ],
+    ),
     # A SELECT DISTINCT hashed above an InitPlan's scan, measured on 15.19
     # (RP-440).
     "a distinct above an initplan's scan is priced": (
-        "RP-440",
+        "RP-440:fixed",
         _ANALYSED,
         "explain select distinct a from e where b = (select 'v3'::text)",
         [
@@ -5486,10 +5546,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Filter: (b = 'v3'::text)",
         ],
     ),
-    # An IN subquery whose WHERE an index reads: its side is that Index
-    # Scan, made unique, measured on 15.19 (RP-411).
+    # An IN subquery whose WHERE an index reads printed a zero-cost Hash
+    # Semi Join over a Seq Scan; its side is that Index Scan, made unique,
+    # measured on 15.19 (RP-411, fixed).
     "an in subquery read through an index is planned as a join": (
-        "RP-411",
+        "RP-411:fixed",
         _ANALYSED,
         "explain select * from e where b in (select b from k where a > 990)",
         [
@@ -5501,6 +5562,38 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Group Key: k.b",
             "              ->  Index Scan using k_pkey on k  (cost=0.28..8.45 rows=10 width=3)",
             "                    Index Cond: (a > 990)",
+        ],
+    ),
+    # The same over a wider index range, measured on 15.19 (RP-411).
+    "an in subquery over an index range is planned as a join": (
+        "RP-411:fixed",
+        _ANALYSED,
+        "explain select * from e where b in (select b from k where a < 20)",
+        [
+            "Hash Join  (cost=8.86..37.61 rows=1000 width=7)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=8.74..8.74 rows=9 width=3)",
+            "        ->  HashAggregate  (cost=8.65..8.74 rows=9 width=3)",
+            "              Group Key: k.b",
+            "              ->  Index Scan using k_pkey on k  (cost=0.28..8.61 rows=19 width=3)",
+            "                    Index Cond: (a < 20)",
+        ],
+    ),
+    # An IN whose two sides compare expressions, measured on 15.19 (RP-411).
+    "an in subquery comparing expressions is planned as a join": (
+        "RP-411",
+        _ANALYSED,
+        "explain select * from e where a::bigint in (select a::bigint + 0 from k where b = 'v3')",
+        [
+            "Hash Join  (cost=20.00..45.25 rows=500 width=7)",
+            "  Hash Cond: ((e.a)::bigint = ((k.a)::bigint + 0))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=18.75..18.75 rows=100 width=4)",
+            "        ->  HashAggregate  (cost=17.75..18.75 rows=100 width=4)",
+            "              Group Key: ((k.a)::bigint + 0)",
+            "              ->  Seq Scan on k  (cost=0.00..17.50 rows=100 width=4)",
+            "                    Filter: (b = 'v3'::text)",
         ],
     ),
     # Planned as the inner join `reduce_unique_semijoins` makes of it.

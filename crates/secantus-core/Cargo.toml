@@ -45,7 +45,7 @@ secantus-icu = { version = "=0.5.3-beta.198", path = "../secantus-icu" }
 # used only when the linear `regex` engine above can't compile a pattern — e.g.
 # the negative-lookahead `^(?!system\.)` pymongo emits for listCollections name
 # filters. The standalone server has no Python to defer to, so it evaluates here.
-fancy-regex = "0.14"
+fancy-regex = "0.20"
 # `$rand` — a uniform random double in [0, 1). Inherently non-deterministic, so
 # it's NOT byte-pinned to the Python evaluator (no parity corpus case); both
 # engines independently produce a fresh value in range.

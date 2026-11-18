@@ -969,9 +969,11 @@ pub(crate) fn builtin_beats(
 /// `current_database`, ...) that overload selection leaves to the server,
 /// read from PG 15's `pg_proc` when every overload of that arity returns
 /// the same concrete type, so no choice between them can change it
-/// (RP-342: `current_setting(...) <> ''` resolves `text <> text`).
+/// (RP-342: `current_setting(...) <> ''` resolves `text <> text`). The
+/// other `pg_` functions, which `select_candidates` leaves alone too, are
+/// read the same way (`pg_sequence_last_value` is `int8`, RP-798).
 pub(crate) fn session_reader_result_type(name: &str, arity: usize) -> Option<String> {
-    if !crate::scalar::is_catalog_reader(name) {
+    if !crate::scalar::is_catalog_reader(name) && !name.starts_with("pg_") {
         return None;
     }
     let mut rets = sigs()

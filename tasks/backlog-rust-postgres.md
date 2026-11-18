@@ -815,16 +815,21 @@ one beside it.
     desc"` 781 of 810, 776 before, none worse; `--then m1.c` 791 of 810).
     `--desc --then m0.c` measured 797 of 810 on 2026-11-17 with and
     without that change (13 differences, 10 two-table LEFT joins), not
-    the 0 recorded above: not diagnosed. Declined still (the join planned
-    for every row and sorted, as before): a descending first key a LEFT
-    join NULL-extends or no clause reads (`ORDER_CLASS`), with a key after
-    it (the 12 two-table LEFT join shapes left under `--desc-nulls-last
-    --then "m0.c desc"`); a later key a
+    the 0 recorded above: not diagnosed. Since 2026-11-18 a descending
+    first key a LEFT join NULL-extends or no clause reads (`ORDER_CLASS`),
+    with a key after it, is searched too, under `Search::merge_asc`; no
+    shape worse, and `--desc-nulls-last --then "m0.c desc"` 787 of 810
+    (781 before), `--desc-nulls-last --then m1.c` 801 (791), `--desc
+    --then m0.c` 801 (797), `--desc --then "m1.c desc, m0.b"` 12
+    differences (18). Of what is left, two-table LEFT joins ordered by the
+    preserved side's key DESC NULLS LAST with another key leave ties in
+    another order (`two/3000/idx1/b_a/leftjoin/m0.b`), not diagnosed; the
+    rest are four- and five-table stars. Declined still: a later key a
     WHERE may fix to a constant; a table with an index of several columns;
     and a two-table join with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_desc_nulls_last_key_with_another_sorts_the_merge
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_preserved_desc_nulls_last_key_with_another
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
@@ -1437,11 +1442,12 @@ batch, their tests regression tests:
       been ordered as `varstr_cmp` orders them since 2026-11-17 (libc
       collations such as `en_US` do not exist here, a scope decision).
       A `btree_gin` index over a scalar `int2`/`int4`/`int8`/`float4`/
-      `float8`/`bool`/`text` column has been modelled since 2026-11-17 (one
-      key per row, the value itself); its scans are not, nor its other
-      types (`date`, `timestamp`, `numeric`, ...).
+      `float8`/`bool`/`text` column has been modelled since 2026-11-17, and
+      over `date`/`timestamp`/`timestamptz`, `numeric` and `interval` since
+      2026-11-18 (one key per row, the value itself); its scans are not, nor
+      its other types (`time`, `timetz`, `bytea`, `inet`, ...).
       Backlog-ID: RP-287
-      Verify: tests/backlog/test_rp_top10_found.py::test_a_btree_gin_date_index_has_its_pages
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_btree_gin_time_index_has_its_pages
 
 
 ## Found by batch 71 (2026-10-25)
@@ -1600,21 +1606,6 @@ a regression test.
       a `pg_stat_*` view 16 match, 22 differ.
       Backlog-ID: RP-290
       Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view], tests/backlog/test_rp_catalog_reads.py::test_gap[psql's describe query]
-- [ ] **An ORDER BY an index scan already returns in order is counted as
-      sorted, and the index's pathkeys are not read.** With query pathkeys
-      (an ORDER BY, a GROUP BY, a join), PostgreSQL 15.19 makes each
-      B-tree's leading key a pathkey (`build_index_pathkeys`: the key's
-      family's equality operator, an AMOPSTRATEGY search, and that
-      operator's merge-join families), going on to the next key when an
-      equality fixes the column; and when the index scan it chooses returns
-      the rows in the ORDER BY's order it puts no Sort over it, so the
-      executor never looks up the sort support function. On `SELECT c.oid
-      FROM pg_class c WHERE c.relname = 'rpc_t' ORDER BY c.relname` this
-      server counts the Sort's `pg_amproc` lookup; ordered by
-      `relnamespace` it also misses `oid_ops`' equality (2026-11-13, found
-      while working RP-290).
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[an ORDER BY an index gives]
-      Backlog-ID: RP-934
 - [ ] **A catalog row added after `initdb` counts no heap block** in
       `pg_statio_sys_tables`. A catalog scan counts its index pages
       (`catalog_btree.rs`, from `pg15_catalog_indexes.txt`) and, since
@@ -1669,20 +1660,6 @@ a regression test.
       worktree's `.scratch/`, never the shared reference servers.
       Backlog-ID: RP-292
       Verify: tests/backlog/test_rp_catalog_reads.py::test_the_first_backend_after_a_start
-- [ ] **A catalog read directly is scanned by its leading equalities
-      alone.** The executor's catalog scan (`catalog_reads.rs`) takes the
-      first index whose leading column an equality matches, keyed by the
-      equalities on its leading columns. PostgreSQL 15.19 builds its index
-      paths from every clause (`match_clause_to_indexcol`): `select attnum
-      from pg_attribute where attrelid = 1259 and attnum = 1` scans
-      `pg_attribute_relid_attnum_index` for both keys (`[5, 5, 4]` over the
-      statement), where this server scans `pg_attribute_relid_attnam_index`
-      for `attrelid` alone (39 entries); and `select relname from pg_class
-      where relname >= 'pg_s' and relname < 'pg_t'` returns 74 entries of
-      `pg_class_relname_nsp_index`, where this server walks all 415. Their
-      heap and index blocks follow (found while working RP-291).
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_scans_index_path[two equalities], tests/backlog/test_rp_catalog_reads.py::test_a_catalog_scans_index_path[a range]
-      Backlog-ID: RP-935
 - [ ] **A database-wide ANALYZE measures only some catalog columns.** Since
       RP-311 each database holds `initdb`'s `pg_statistic` rows for the
       built-in catalogs. A plain `ANALYZE` (or `VACUUM ANALYZE`)
@@ -1978,15 +1955,18 @@ a regression test.
       its semi factors those of the base relation as
       `compute_semi_anti_join_factors` takes them) it is planned and printed
       as that `Hash Join`. Still open: (1) Merge and nested-loop semi
-      joins, the unique-ified side as the outer one, and a side read through
-      an index, are not priced; an IN subquery's own WHERE an index reads
-      (`select * from e where b in (select b from k where a > 990)`, k's
-      primary key on a) prints a zero-cost `Hash Semi Join` over k's Seq
-      Scan with that `Filter`, where 15.19 hashes a `HashAggregate` over
-      `Index Scan using k_pkey` (`Index Cond: (a > 990)`). Since 2026-11-18
-      an IN subquery's own WHERE over its relation filters the inner scan
-      (`SemiJoin::inner_filter`, `inner_quals`) and is priced where that
-      scan is sequential. (2) Wider shapes still print the scan: a
+      joins, the unique-ified side as the outer one, and an outer side read
+      through an index, are not priced. Since 2026-11-18 an IN subquery's
+      own WHERE over its relation filters the inner scan
+      (`SemiJoin::inner_filter`, `inner_quals`) and is priced, read through
+      the index it bounds where that is cheaper (`select * from e where b
+      in (select b from k where a > 990)` hashes a `HashAggregate` over
+      `Index Scan using k_pkey`), the unique-ified side's groups scaled to
+      its rows (`estimate_num_groups`) and its hash buckets one entry each
+      (`final_cost_hashjoin`'s UniquePath rule,
+      `joincost::hash_join_over_unique_path`). (2) Wider shapes still print
+      the scan: an IN comparing expressions (`a::bigint in (select
+      a::bigint + 0 ...)`, which 15.19 groups by the expression), a
       cross-type comparison, and an
       outer conjunct other than a comparison of an expression with a
       constant that the scan's filter does not hold whole. Outer conjuncts
@@ -1994,7 +1974,7 @@ a regression test.
       (`sublink_join::split_where`); one that does not lower is priced as an
       `ExprQual` (`SemiJoin::outer_exprs`).
       Backlog-ID: RP-411
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery read through an index is planned as a join]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery comparing expressions is planned as a join]
 - [ ] **A node above an InitPlan's scan is unpriced.** Since
       RP-440's first slices (2026-11-16) a SELECT over one relation whose WHERE
       compares columns with uncorrelated FROM-less scalar subqueries plans
@@ -2011,13 +1991,20 @@ a regression test.
       FROM, a correlated one, or a sublink beside any other non-constant
       qual is still printed inline (`select * from e where b = (select b
       from k limit 1)`); a join's ON InitPlan is unpriced; other nodes above
-      the scan (a DISTINCT, Unique, a computed sort key, a GROUP
-      BY) are unpriced. A Limit above a Sort of the scan, the Sort bounded
+      the scan (a computed sort key, a GROUP BY of anything but counts of
+      stored columns) are unpriced. Counts grouped by stored columns
+      straight over the scan, on a table with no index, are hashed and
+      priced since 2026-11-18 (`init_plan_grouped_counts`); a grouped
+      `sum` or other aggregate is not. A SELECT
+      DISTINCT of stored columns straight over the scan, on a table with no
+      index, is hashed and priced since 2026-11-18 (`create_distinct_paths`
+      against a Sort and Unique); over an indexed table, or with an ORDER
+      BY, it is still unpriced. A Limit above a Sort of the scan, the Sort bounded
       by OFFSET + LIMIT (`cost_sort`'s `limit_tuples`), is priced since
       2026-11-18. Plain aggregates other than counts over the scan are
       priced since 2026-11-18 (`plain_agg_estimate`). Measured on a private
       15.19 cluster.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a distinct above an initplan's scan is priced]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a grouped sum above an initplan's scan is priced]
       Backlog-ID: RP-440
 
 ## Found by batch 54 (2026-10-24)
@@ -2128,19 +2115,6 @@ holding `(1, 'y')`.
 
 Measured on a private PostgreSQL 15.19 cluster.
 
-- [ ] **A built-in routine has no initdb description.** PostgreSQL 15.19
-      answers `obj_description('abs(int)'::regprocedure, 'pg_proc')` with
-      initdb's `absolute value` (from `pg_proc.dat`'s `descr`), and every
-      built-in routine has its row in `pg_description`. Here a built-in has
-      none until a COMMENT ON FUNCTION gives it one (RP-519 stores those by
-      the overload's oid). Faithful: carry initdb's `pg_description` rows
-      for `pg_proc` in the built-in catalog facts, served until a COMMENT
-      replaces or (IS NULL) removes one, as `schema_comments` does for
-      `public`; the other catalogs' initdb descriptions (types, operators,
-      access methods) are the same gap.
-      Verify: tests/backlog/test_rp_found_rp514.py::test_builtin_routine_has_initdb_description
-      Backlog-ID: RP-969
-
 ## Found while working RP-527 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
@@ -2160,17 +2134,19 @@ gap tests are in `tests/backlog/test_rp_found_rp532.py`.
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp590.py`.
 
-- [ ] **The `record_image` operators refuse most field types.** `*=` ..
-      `*>=` compare a record's fields by their binary images since RP-650,
-      but only for int2 / int4 / int8 / oid / bool / float4 / float8 /
-      numeric / text / varchar / bpchar / bytea fields. `(select
-      row('2024-01-02'::date)) *< (select row('2024-01-03'::date))` is `t`
-      on PostgreSQL 15.19 (a date is its int32 day number), and a uuid
-      compares its 16 bytes; here each is 0A000 `a record_image comparison
-      over a field of type date is not supported yet`. Every other type
-      needs its datum's image modelled (`record_image_cmp`: by-value words,
-      fixed-length by-reference bytes, varlena data).
-      Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_over_other_field_types
+- [ ] **The `record_image` operators refuse some field types.** `*=` ..
+      `*>=` compare a record's fields by their binary images (RP-650):
+      the scalar types in `record_image.rs`, arrays of fixed-length
+      elements or of text / varchar / bpchar / numeric / bytea (each with
+      the 4-byte header `array_in` gives it, measured) and the built-in
+      ranges are modelled (2026-11-18). Every other type is 0A000 `a
+      record_image comparison over a field of type ... is not supported
+      yet`. Remaining, measured on PostgreSQL 15.19: jsonb compares by
+      `memcmp` of its `JsonbContainer` (header word, JEntries, keys sorted
+      by length then bytes, int-aligned numerics); arrays of any other
+      element (jsonb, inet, interval, ...), a user range, a multirange and
+      a composite field are refused too.
+      Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_over_still_refused_field_types
       Backlog-ID: RP-976
 
 ## Found while working RP-569 (2026-11-08)
@@ -2363,17 +2339,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`,
 ## Found while working RP-500 (2026-11-07)
 
 Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`.
-
-- [ ] **CREATE VIEW evaluates a constant expression.** PostgreSQL
-      15.19's `DefineView` parse-analyses the query and plans nothing:
-      `create view rp511v as select 1/0 as x` is created, and only reading
-      it raises 22012. Here CREATE VIEW raises 22012 itself. Since RP-511 a
-      statement's Describe, a PREPARE and `CREATE TABLE AS ... WITH NO
-      DATA` fold no constant (`analysing_only`, inside
-      `with_analysed_typmods`); CREATE VIEW reaches a planning path outside
-      that scope.
-      Verify: tests/backlog/test_rp_found_rp500.py::test_create_view_analyses_without_evaluating
-      Backlog-ID: RP-968
 
 ## Found while working RP-316 (2026-11-02)
 
@@ -2604,13 +2569,16 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 - [ ] **`pg_get_viewdef` of most system views is NULL.** PostgreSQL
       15.19 deparses every `pg_catalog` and `information_schema` view's
       rule. Here `system_view_defs` prints `system_views.sql`'s queries
-      through `ruleutils`, which reproduces 38 of the 75 `pg_catalog`
+      through `ruleutils`, which reproduces 56 of the 75 `pg_catalog`
       views exactly (`pg_tables`, `pg_roles`, `pg_stats`, `pg_settings`,
-      `pg_locks`, ...; none printed wrong, measured 2026-11-15) and
+      `pg_sequences`, `pg_stat_all_tables`, every `pg_statio_*` view, ...;
+      none printed wrong, measured 2026-11-18 in both print modes) and
       leaves the rest NULL rather than print them as written. Remaining:
-      the 37 other `pg_catalog` views (`pg_sequences`, `pg_policies`,
-      `pg_seclabels`, `pg_publication_tables`, `pg_stats_ext*`, and every
-      `pg_stat_*` / `pg_statio_*` view), which the printer refuses; and
+      the 19 other `pg_catalog` views (`pg_policies`, `pg_seclabels`,
+      `pg_publication_tables`, `pg_stats_ext*`, `pg_stat_activity`,
+      `pg_stat_database`, `pg_stat_ssl`, `pg_stat_gssapi`, the
+      `pg_stat_progress_*`, `pg_stat_replication*` and
+      `pg_stat_subscription*` views), which the printer refuses; and
       every `information_schema` view, left out because the printer casts
       to the bare domain where ruleutils qualifies it and casts a literal
       to the base type first
@@ -2619,6 +2587,15 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
       returning a record of OUT parameters prints since 2026-11-15.
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_the_remaining_system_views
       Backlog-ID: RP-798
+- [ ] **`pg_get_viewdef` types a `name IN (text, unknown)` list as
+      text.** `create view v as select relname from pg_class where relname
+      in ('g'::text, 'h')` prints `(pg_class.relname = ANY
+      (ARRAY[('g'::text)::name, 'h'::name]))` on PostgreSQL 15.19:
+      `select_common_type` keeps the first type, `name`, because text and
+      name each coerce implicitly to the other. Here the printer takes
+      text (`(pg_class.relname)::text = ANY (ARRAY['g'::text, 'h'::text])`).
+      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_a_name_in_list_with_a_text_element
+      Backlog-ID: RP-1045
 
 ## Found while working RP-816 (2026-11-11)
 
@@ -2724,14 +2701,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap test is in
 `tests/backlog/test_rp_found_rp423.py`.
 
-- [ ] **A back reference under `~*` compares case-sensitively.** `select
-      'ABab' ~* '(ab)\1'` is `t` on PostgreSQL 15.19 (the ARE engine
-      compares a back reference under the pattern's case folding); here it
-      is `f`. Since RP-1022 a pattern the linear `regex` crate refuses runs
-      on `fancy-regex` (`pg_regex::PgRegex`), and fancy-regex 0.14 matches a
-      back reference byte for byte even under `(?i)`.
-      Verify: tests/backlog/test_rp_found_rp423.py::test_a_case_insensitive_back_reference
-      Backlog-ID: RP-1022
 - [ ] **`clamp_row_est` rounds a half away from zero.** PostgreSQL 15.19's
       `clamp_row_est` is `rint`, ties to even: `select max(x) from hv group
       by k having max(x) <> 5` over 300 groups (`hv(x numeric, k int)`,

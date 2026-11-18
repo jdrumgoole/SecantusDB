@@ -277,8 +277,183 @@ INITDB_DESCRIPTIONS = {
 }
 
 
-@pytest.mark.backlog("RP-969")
+@pytest.mark.backlog_fixed("RP-969")
 @pytest.mark.parametrize("routine", list(INITDB_DESCRIPTIONS))
 def test_builtin_routine_has_initdb_description(routine: str, dsn: str) -> None:
     got = answer(dsn, f"select obj_description('{routine}'::regprocedure, 'pg_proc')")
     assert got == ("ok", [(INITDB_DESCRIPTIONS[routine],)])
+
+
+@pytest.mark.backlog_fixed("RP-969")
+def test_comment_replaces_and_removes_initdb_description(dsn: str) -> None:
+    # COMMENT replaces initdb's row and IS NULL deletes it, initdb's
+    # included (`DeleteComments`), on PostgreSQL 15.19.
+    q = "select coalesce(obj_description('abs(int)'::regprocedure, 'pg_proc'), '<null>')"
+    with psycopg.connect(dsn) as c:
+        c.execute("comment on function abs(int) is 'mine'")
+        assert c.execute(q).fetchall() == [("mine",)]
+        c.execute("comment on function abs(int) is null")
+        assert c.execute(q).fetchall() == [("<null>",)]
+        c.rollback()
+    with psycopg.connect(dsn) as c:
+        assert c.execute(q).fetchall() == [("absolute value",)]
+
+
+# initdb's descriptions of the other built-in objects (`pg_type.dat`,
+# `pg_operator.dat`, `pg_am.dat`, ...), measured on PostgreSQL 15.19.
+INITDB_OTHER_DESCRIPTIONS = {
+    "select obj_description('int4'::regtype, 'pg_type')": (
+        "-2 billion to 2 billion integer, 4-byte storage"
+    ),
+    "select obj_description('+(int4,int4)'::regoperator, 'pg_operator')": "add",
+    "select obj_description(oid, 'pg_am') from pg_am where amname = 'btree'": (
+        "b-tree index access method"
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-969")
+@pytest.mark.parametrize("query", list(INITDB_OTHER_DESCRIPTIONS))
+def test_builtin_object_has_initdb_description(query: str, dsn: str) -> None:
+    """A built-in type, operator and access method had no description:
+    initdb's are served from `pg15_other_descriptions.tsv`."""
+    assert answer(dsn, query) == ("ok", [(INITDB_OTHER_DESCRIPTIONS[query],)])
+
+
+# COMMENT ON a built-in object of another catalog replaces (IS NULL
+# deletes) initdb's description; measured on PostgreSQL 15.19.
+COMMENT_ON_BUILTIN = {
+    "type": (
+        "comment on type int4 is 'x'",
+        "select obj_description('int4'::regtype, 'pg_type')",
+        "x",
+    ),
+    "operator, is null": (
+        "comment on operator +(int4,int4) is null",
+        "select obj_description('+(int4,int4)'::regoperator, 'pg_operator')",
+        None,
+    ),
+    "access method": (
+        "comment on access method btree is 'y'",
+        "select obj_description(403, 'pg_am')",
+        "y",
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-969")
+@pytest.mark.parametrize("case", list(COMMENT_ON_BUILTIN))
+def test_comment_on_builtin_object_replaces_initdb_description(case: str, dsn: str) -> None:
+    """COMMENT ON a built-in type was accepted and lost, and on an operator
+    or access method was 0A000; each now replaces initdb's description."""
+    comment, query, want = COMMENT_ON_BUILTIN[case]
+    assert answer(dsn, comment, query) == ("ok", [(want,)])
+
+
+# How COMMENT ON names a built-in type, operator or access method, and what
+# it says when there is none; measured on PostgreSQL 15.19.
+COMMENT_ON_BUILTIN_NAMING = {
+    "type alias": (
+        "comment on type integer is 'i'",
+        "select obj_description('int4'::regtype, 'pg_type')",
+        ("ok", [("i",)]),
+    ),
+    "qualified type, is null": (
+        "comment on type pg_catalog.text is null",
+        "select obj_description('text'::regtype, 'pg_type')",
+        ("ok", [(None,)]),
+    ),
+    "prefix operator": (
+        "comment on operator -(none, int4) is 'neg'",
+        "select obj_description('-(none,int4)'::regoperator, 'pg_operator')",
+        ("ok", [("neg",)]),
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-969")
+@pytest.mark.parametrize("case", list(COMMENT_ON_BUILTIN_NAMING))
+def test_comment_on_builtin_object_naming(case: str, dsn: str) -> None:
+    comment, query, want = COMMENT_ON_BUILTIN_NAMING[case]
+    assert answer(dsn, comment, query) == want
+
+
+COMMENT_ON_MISSING_BUILTIN = {
+    "comment on operator ##(int4, int4) is 'z'": (
+        "42883",
+        "operator does not exist: integer ## integer",
+    ),
+    "comment on operator ##(none, int4) is 'z'": (
+        "42883",
+        "operator does not exist: ## integer",
+    ),
+    "comment on operator +(int4, nosuch) is 'z'": (
+        "42704",
+        'type "nosuch" does not exist',
+    ),
+    "comment on access method nosuch is 'z'": (
+        "42704",
+        'access method "nosuch" does not exist',
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-969")
+@pytest.mark.parametrize("comment", list(COMMENT_ON_MISSING_BUILTIN))
+def test_comment_on_missing_builtin_object(comment: str, dsn: str) -> None:
+    got = answer(dsn, comment)
+    assert (got[0], got[1]) == COMMENT_ON_MISSING_BUILTIN[comment]
+
+
+# COMMENT ON a built-in object of the other catalogs initdb describes; each
+# replaces initdb's description on PostgreSQL 15.19.
+COMMENT_ON_OTHER_BUILTIN = {
+    "conversion": (
+        "comment on conversion utf8_to_iso_8859_1 is 'q'",
+        "select obj_description((select oid from pg_conversion"
+        " where conname = 'utf8_to_iso_8859_1'), 'pg_conversion')",
+        "q",
+    ),
+    "language": (
+        "comment on language plpgsql is 'q'",
+        "select obj_description((select oid from pg_language"
+        " where lanname = 'plpgsql'), 'pg_language')",
+        "q",
+    ),
+    "schema": (
+        "comment on schema pg_catalog is 'q'",
+        "select obj_description('pg_catalog'::regnamespace, 'pg_namespace')",
+        "q",
+    ),
+    "collation, is null": (
+        'comment on collation "C" is null',
+        "select obj_description((select oid from pg_collation"
+        " where collname = 'C'), 'pg_collation')",
+        None,
+    ),
+    "text search parser": (
+        "comment on text search parser \"default\" is 'q'",
+        "select obj_description((select oid from pg_ts_parser"
+        " where prsname = 'default'), 'pg_ts_parser')",
+        "q",
+    ),
+    "text search template": (
+        "comment on text search template simple is 'q'",
+        "select obj_description((select oid from pg_ts_template"
+        " where tmplname = 'simple'), 'pg_ts_template')",
+        "q",
+    ),
+    "extension": (
+        "comment on extension plpgsql is 'q'",
+        "select obj_description((select oid from pg_extension"
+        " where extname = 'plpgsql'), 'pg_extension')",
+        "q",
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-969")
+@pytest.mark.parametrize("case", list(COMMENT_ON_OTHER_BUILTIN))
+def test_comment_on_other_builtin_catalogs(case: str, dsn: str) -> None:
+    comment, query, want = COMMENT_ON_OTHER_BUILTIN[case]
+    assert answer(dsn, comment, query) == ("ok", [(want,)])
