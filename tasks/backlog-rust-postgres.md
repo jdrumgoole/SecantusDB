@@ -2735,16 +2735,13 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap test is in
 `tests/backlog/test_rp_found_rp423.py`.
 
-- [ ] **A back reference is an invalid regex outside a WHERE.** `select
-      'abab' ~ '(ab)\1'` is `t` on PostgreSQL 15.19, `regexp_replace('abab',
-      '(ab)\1', 'X')` is `X` and `regexp_match('xabab', '(ab)\1')` is
-      `{ab}`. Here each is 2201B `invalid regular expression`: the scalar
-      evaluator and the regex builtins compile with the linear `regex`
-      crate, which refuses a back reference (the "backreferences are not
-      supported" parse error). A WHERE over a table column matches, through
-      `secantus-core`'s backtracking fallback, and since RP-423 the
-      planner's selectivity estimate falls back the same way.
-      Verify: tests/backlog/test_rp_found_rp423.py::test_a_back_reference_outside_a_where
+- [ ] **A back reference under `~*` compares case-sensitively.** `select
+      'ABab' ~* '(ab)\1'` is `t` on PostgreSQL 15.19 (the ARE engine
+      compares a back reference under the pattern's case folding); here it
+      is `f`. Since RP-1022 a pattern the linear `regex` crate refuses runs
+      on `fancy-regex` (`pg_regex::PgRegex`), and fancy-regex 0.14 matches a
+      back reference byte for byte even under `(?i)`.
+      Verify: tests/backlog/test_rp_found_rp423.py::test_a_case_insensitive_back_reference
       Backlog-ID: RP-1022
 - [ ] **`clamp_row_est` rounds a half away from zero.** PostgreSQL 15.19's
       `clamp_row_est` is `rint`, ties to even: `select max(x) from hv group

@@ -21,6 +21,7 @@ mod dml_pullup;
 mod domain_scope;
 mod initplan;
 mod join_alias;
+mod pg_regex;
 mod record_image;
 mod relabel;
 mod sublink_join;
@@ -18226,7 +18227,7 @@ fn srf_rows(
             let (source, pattern) = (text(&a[0]), text(&a[1]));
             let flags = a.get(2).map(text).unwrap_or_default();
             builtins::check_regex_flags(&flags)?;
-            let re = regex::Regex::new(&format!(
+            let re = pg_regex::PgRegex::new(&format!(
                 "{}{}",
                 if flags.contains('i') { "(?i)" } else { "" },
                 scalar::pg_regex_source(&pattern)
@@ -18234,23 +18235,22 @@ fn srf_rows(
             .map_err(|_| {
                 Error::InvalidRegex(format!("invalid regular expression: \"{pattern}\""))
             })?;
-            let row = |c: regex::Captures| -> Vec<Bson> {
+            let row = |c: pg_regex::Groups| -> Vec<Bson> {
+                let text = |i: usize| {
+                    pg_regex::group_text(&source, &c, i)
+                        .map_or(Bson::Null, |m| Bson::String(m.to_string()))
+                };
                 let cells: Vec<Bson> = if c.len() > 1 {
-                    (1..c.len())
-                        .map(|i| {
-                            c.get(i)
-                                .map_or(Bson::Null, |m| Bson::String(m.as_str().to_string()))
-                        })
-                        .collect()
+                    (1..c.len()).map(text).collect()
                 } else {
-                    vec![Bson::String(c[0].to_string())]
+                    vec![text(0)]
                 };
                 vec![Bson::Array(cells)]
             };
             let rows: Vec<Vec<Bson>> = if flags.contains('g') {
-                re.captures_iter(&source).map(row).collect()
+                re.captures_all(&source)?.into_iter().map(row).collect()
             } else {
-                re.captures(&source).map(row).into_iter().collect()
+                re.captures(&source)?.map(row).into_iter().collect()
             };
             return Ok(Some((vec![name.into()], vec!["text[]".into()], rows)));
         }
@@ -40278,7 +40278,7 @@ fn regexp_replace(args: &[Bson]) -> Result<Bson> {
         builder.push_str("(?i)");
     }
     builder.push_str(&scalar::pg_regex_source(&pattern));
-    let re = regex::Regex::new(&builder)
+    let re = pg_regex::PgRegex::new(&builder)
         .map_err(|_| Error::InvalidRegex(format!("invalid regular expression: \"{pattern}\"")))?;
     // PostgreSQL's `\1` group references are the regex crate's `${1}`, and its
     // `\&` -- the WHOLE match -- is `${0}`. Without the `\&` case the escape
@@ -40318,11 +40318,11 @@ fn regexp_replace(args: &[Bson]) -> Result<Bson> {
         }
         out
     };
-    Ok(Bson::String(if flags.contains('g') {
-        re.replace_all(&source, replacement.as_str()).into_owned()
-    } else {
-        re.replace(&source, replacement.as_str()).into_owned()
-    }))
+    Ok(Bson::String(re.replace(
+        &source,
+        replacement.as_str(),
+        flags.contains('g'),
+    )?))
 }
 
 /// Apply one computed-column expression to a row's stored value. The wire
@@ -52750,11 +52750,14 @@ fn eval_pattern_match_const(e: &AExpr, params: &[Bson]) -> Result<Bson> {
     } else {
         scalar::pg_regex_source(pattern)
     };
-    let re = regex::RegexBuilder::new(&source)
-        .case_insensitive(insensitive)
-        .build()
+    let source = if insensitive {
+        format!("(?i){source}")
+    } else {
+        source
+    };
+    let re = pg_regex::PgRegex::new(&source)
         .map_err(|err| Error::InvalidText(format!("invalid regular expression: {err}")))?;
-    Ok(Bson::Boolean(re.is_match(subject) != negated))
+    Ok(Bson::Boolean(re.is_match(subject)? != negated))
 }
 
 /// Lower `LIKE` / `ILIKE` / `~` and their negations to an MQL `$regex`.
