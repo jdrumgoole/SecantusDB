@@ -1048,22 +1048,6 @@ about forty such points; these are the ones measured.
       `bounded_span_pages` does; a geo plan is not yet probed.
       Backlog-ID: RM-390
       Verify: tests/backlog/test_rm_found_2026_11_10_rm390.py::test_a_write_of_many_through_a_compound_index_out_of_time_keeps_what_it_wrote
-- [ ] **An explain of a read whose plan two indexes contest reads the
-      whole collection.** Over `{a: {$gte: 0}, b: {$gte: 0}}` with
-      indexes `a_1` and `b_1`, mongod 8.2.11's `explain` of a
-      `find(...).limit(101)` at `queryPlanner` takes 0.3 ms whether the
-      collection holds 10,000 documents or 100,000: its trial reads only
-      what the candidate plans reach. This server's grows ten times over
-      (debug build, 2026-11-13: 127 ms at 10,000, 1,282 ms at 100,000),
-      because `explain` plans over every document of the collection,
-      loaded into memory first (`explain/mod.rs`, `Target.docs`, read by
-      `target()`). The answers are the same; the cost is the whole
-      collection. A find and a write of one try their plans over what the
-      plans reach since 2026-11-17 (RM-610, part); the work is to give
-      explain's trial the store, as `order.rs`'s `Lazy` does, in place of
-      `Held`. Found while fixing RM-390's CI test, 2026-11-13.
-      Verify: tests/backlog/test_rm_found_2026_11_13_contested_reads.py::test_a_contested_read_costs_what_it_returns
-      Backlog-ID: RM-610
 
 ### 7.086 The Rust MongoDB server, audited -- 2026-10-20
 
