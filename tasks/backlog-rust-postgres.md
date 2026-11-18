@@ -2574,22 +2574,21 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 - [ ] **`pg_get_viewdef` of most system views is NULL.** PostgreSQL
       15.19 deparses every `pg_catalog` and `information_schema` view's
       rule. Here `system_view_defs` prints `system_views.sql`'s queries
-      through `ruleutils`, which reproduces 56 of the 75 `pg_catalog`
+      through `ruleutils`, which reproduces 68 of the 75 `pg_catalog`
       views exactly (`pg_tables`, `pg_roles`, `pg_stats`, `pg_settings`,
-      `pg_sequences`, `pg_stat_all_tables`, every `pg_statio_*` view, ...;
-      none printed wrong, measured 2026-11-18 in both print modes) and
-      leaves the rest NULL rather than print them as written. Remaining:
-      the 19 other `pg_catalog` views (`pg_policies`, `pg_seclabels`,
-      `pg_publication_tables`, `pg_stats_ext*`, `pg_stat_activity`,
-      `pg_stat_database`, `pg_stat_ssl`, `pg_stat_gssapi`, the
-      `pg_stat_progress_*`, `pg_stat_replication*` and
-      `pg_stat_subscription*` views), which the printer refuses; and
-      every `information_schema` view, left out because the printer casts
-      to the bare domain where ruleutils qualifies it and casts a literal
-      to the base type first
+      `pg_stat_activity`, every `pg_stat_progress_*` view, ...; none
+      printed wrong, measured 2026-11-18 in both print modes) and leaves
+      the rest NULL rather than print them as written. Remaining: the 7
+      other `pg_catalog` views (`pg_policies`, `pg_publication_tables`,
+      `pg_seclabels`, `pg_stat_database`, `pg_stat_replication_slots`,
+      `pg_stats_ext`, `pg_stats_ext_exprs`), which the printer refuses;
+      and every `information_schema` view, left out because the printer
+      casts to the bare domain where ruleutils qualifies it and casts a
+      literal to the base type first
       (`('c'::character varying)::information_schema.character_data`,
-      `(x)::information_schema.sql_identifier`). A function in FROM
-      returning a record of OUT parameters prints since 2026-11-15.
+      `(x)::information_schema.sql_identifier`). A user view over
+      `generate_series(1, c.relnatts)` is still refused: ruleutils casts
+      the int2 argument to `integer`, which the printer does not add.
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_the_remaining_system_views
       Backlog-ID: RP-798
 - [ ] **`pg_get_viewdef` types a `name IN (text, unknown)` list as

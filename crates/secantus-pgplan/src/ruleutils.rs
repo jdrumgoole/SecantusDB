@@ -3122,12 +3122,7 @@ impl Printer<'_> {
         if f.agg_star || f.over.is_some() || !f.agg_order.is_empty() {
             return None;
         }
-        if let Some(mut columns) = f
-            .args
-            .is_empty()
-            .then(|| crate::builtin_out_columns(&fname))
-            .flatten()
-        {
+        if let Some(mut columns) = crate::builtin_out_columns(&fname, f.args.len()) {
             // The OUT parameters name the columns; an alias may rename
             // the leading ones (`addRangeTableEntryForFunction`).
             let name = match rf.alias.as_ref() {
@@ -3628,7 +3623,20 @@ impl Printer<'_> {
                 .unwrap_or_else(|| t.name.clone());
             // `get_target_list`: no AS where the column printed under its
             // output name.
-            let plain_var = match t.expr.node.as_ref() {
+            // A cast to the type the column already has is no node at all
+            // (`coerce_type`), so the target is still the Var.
+            let mut bare = &t.expr;
+            while let Some(N::TypeCast(tc)) = bare.node.as_ref() {
+                let (Some(tn), Some(arg)) = (tc.type_name.as_ref(), tc.arg.as_deref()) else {
+                    break;
+                };
+                let target = base_type(&crate::type_name_of(tn));
+                if crate::declared_typmod_public(tn) >= 0 || self.typ(arg) != Some(target) {
+                    break;
+                }
+                bare = arg;
+            }
+            let plain_var = match bare.node.as_ref() {
                 Some(N::ColumnRef(c)) => self
                     .resolve(&names(&c.fields))
                     .is_some_and(|(_, col, _)| col == name),
@@ -3962,6 +3970,23 @@ impl Printer<'_> {
                 let rte = entry(self, *at)?;
                 *at += 1;
                 let (call, _, _) = self.function_item(rf)?;
+                // `transformRangeFunction` marks the entry LATERAL when its
+                // arguments name a column of this query's other FROM items.
+                let mut refs = Vec::new();
+                crate::walk_expr(&mut call.clone(), &mut |n| {
+                    if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+                        refs.push(names(&c.fields));
+                    }
+                    Ok(())
+                })
+                .ok()?;
+                let level = self.scopes.len().checked_sub(1)?;
+                if refs
+                    .iter()
+                    .any(|f| self.lookup(f).is_some_and(|(scope, _, _)| scope == level))
+                {
+                    self.buf.push_str("LATERAL ");
+                }
                 self.expr(&call)?;
                 self.buf.push(' ');
                 self.buf.push_str(&q(&rte.refname));
