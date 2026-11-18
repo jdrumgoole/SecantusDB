@@ -8778,6 +8778,35 @@ fn typmod_ival(node: &pg_query::protobuf::Node) -> Option<i32> {
     }
 }
 
+/// `numerictypmodin`'s checks on a `numeric(p[,s])` type name, made when the
+/// name is read (`typenameTypeMod`), so a cast refuses before any value is
+/// seen (`null::numeric(0)` too): 22023 at the type name.
+pub(crate) fn numeric_typmod_error(tn: &pg_query::protobuf::TypeName) -> Option<Error> {
+    if tn.typmods.is_empty()
+        || !matches!(
+            type_name(&tn.names).to_ascii_lowercase().as_str(),
+            "numeric" | "decimal"
+        )
+    {
+        return None;
+    }
+    let mods: Vec<i32> = tn.typmods.iter().filter_map(typmod_ival).collect();
+    if mods.len() != tn.typmods.len() {
+        return None;
+    }
+    let bad = |m: String| Some(Error::Sqlstate("22023", m));
+    match mods.as_slice() {
+        [p, ..] if !(1..=1000).contains(p) && mods.len() <= 2 => {
+            bad(format!("NUMERIC precision {p} must be between 1 and 1000"))
+        }
+        [_, s] if !(-1000..=1000).contains(s) => {
+            bad(format!("NUMERIC scale {s} must be between -1000 and 1000"))
+        }
+        [_] | [_, _] => None,
+        _ => bad("invalid NUMERIC type modifier".into()),
+    }
+}
+
 /// The `atttypmod` a declared type carries, or -1 for an unmodified type.
 pub(crate) fn declared_typmod_public(tn: &pg_query::protobuf::TypeName) -> i32 {
     declared_typmod(tn)

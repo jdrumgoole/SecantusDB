@@ -2095,6 +2095,14 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
         // instead (`func_cast` marks the casts it builds with location -1).
         N::TypeCast(tc) => {
             regclass::cast(tc, scope)?;
+            if let Some(e) = tc
+                .type_name
+                .as_ref()
+                .and_then(|tn| crate::numeric_typmod_error(tn).map(|e| (tn.location, e)))
+            {
+                set_error_location(e.0);
+                return Err(e.1);
+            }
             if let (Some(arg), Some(tn)) = (tc.arg.as_deref(), tc.type_name.as_ref()) {
                 let target = type_name_of(tn);
                 if let Some(e) = operand_type(arg, scope).and_then(|source| {

@@ -2286,15 +2286,6 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
 Measured on PostgreSQL 15.19 (port 5415) with statements that create
 nothing. The gap tests are in `tests/backlog/test_rp_found_rp750.py`.
 
-- [ ] **A `numeric` type name with precision 0 is accepted.**
-      `select '1.5'::numeric(0,1)` is 22023 `NUMERIC precision 0 must be
-      between 1 and 1000` at 15 on PostgreSQL 15.19 (`numerictypmodin`
-      checks the modifiers when the type name is read); here the cast runs
-      and is 22003 `numeric field overflow`. Found while working RP-953,
-      whose `numeric_in(c, 0, 5)` applies that same typmod at run time and
-      must keep doing so.
-      Verify: tests/backlog/test_rp_found_rp750.py::test_numeric_precision_zero_is_refused
-      Backlog-ID: RP-1042
 
 ## Found while working RP-570 (2026-11-08)
 
