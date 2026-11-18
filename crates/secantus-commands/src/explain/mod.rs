@@ -3139,6 +3139,32 @@ fn aggregate(
                 && e.errmsg.ends_with(&format!(".{DRY} does not exist")) => {}
         other => other?,
     }
+    // mongod runs the pipeline for `executionStats`, and a window
+    // function's run-time error is the executor's, not an explain
+    // document (measured 8.2.11: codes 2, 5423900, 5624903; RM-617).
+    if verbosity != Verbosity::QueryPlanner
+        && target_coll.is_some()
+        && pipeline.iter().any(|s| s.contains_key("$setWindowFields"))
+    {
+        let mut run = checked.clone();
+        run.insert(
+            "aggregate",
+            inner.get("aggregate").cloned().unwrap_or(Bson::Null),
+        );
+        run.insert("cursor", doc! { "batchSize": i32::MAX });
+        let reply = order::uncounted(|| crate::aggregate::aggregate_inline(&run, ctx))?;
+        if let Some(id) = reply
+            .get_document("cursor")
+            .ok()
+            .and_then(|c| c.get("id"))
+            .and_then(as_i64)
+            .filter(|id| *id != 0)
+        {
+            if let Ok(cursors) = ctx.cursors() {
+                cursors.kill(&[id]);
+            }
+        }
+    }
     let db = ctx.db_name.clone();
     if inline {
         echo = inner.clone();

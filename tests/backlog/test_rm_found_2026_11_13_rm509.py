@@ -59,11 +59,11 @@ def _explain_codes(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-617")
+@pytest.mark.backlog_fixed("RM-617")
 def test_explain_reports_a_window_functions_error(rust_mongo: Any, mongod: Any) -> None:
     """mongod runs the pipeline for `executionStats` and returns the
     executor's error (8.2.11: codes 2, 5423900 and 5624903 for these three
-    windows); this server returns an `explain` document for each."""
+    windows); this server returned an `explain` document for each."""
     assert _explain_codes(rust_mongo) == _explain_codes(mongod)
 
 

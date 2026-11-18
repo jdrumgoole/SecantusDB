@@ -1117,15 +1117,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Found 2026-11-18 working RM-613.
       Verify: tests/backlog/test_rm_found_2026_11_18_rm613.py::test_an_approximate_median_is_mongods_tdigest
       Backlog-ID: RM-720
-- [ ] **`explain` with `executionStats` answers where a `$setWindowFields`
-      fails.** mongod 8.2.11 runs the pipeline for `executionStats` and
-      returns the executor's error: a `$sum` of `{$divide: [1, "$z"]}` over
-      a `z` of 0 (code 2), an `$integral` of a null input (5423900), a
-      `$derivative` of one (5624903). This server returns an `explain`
-      document for each, `maxFunctionMemoryUsageBytes` and all, while its
-      `aggregate` of the same pipeline refuses. Found 2026-11-13 (RM-509).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm509.py::test_explain_reports_a_window_functions_error
-      Backlog-ID: RM-617
 - [ ] **`$derivative`'s partition cache holds too little.** mongod 8.2.11's
       `maxTotalMemoryUsageBytes` for a `$derivative` over ten documents of
       125 bytes is 1250 for any window with no lower end (the whole
