@@ -822,7 +822,7 @@ These are explicit non-goals. Don't add them without a reason.
         `$group` (since 2026-11-18 a `$group` on the
         meta field that only counts, which mongod runs over the buckets,
         counts as mongod's does, and since 2026-11-18 one on a constant,
-        `count_documents`'s; a `$count` stage, a `$group` after a `$match`
+        `count_documents`'s, and a `$count` stage; a `$group` after a `$match`
         on a measurement field, which mongod runs in SBE, and one after a
         `$match` on the meta field, which mongod reads through its index,
         still count nothing), an inclusion `$project` (RM-456), a
@@ -835,7 +835,7 @@ These are explicit non-goals. Don't add them without a reason.
         mongod 5 keys and 4 documents, this server none).
       Measured 2026-10-27, 2026-11-07, 2026-11-10 and 2026-11-13.
       Backlog-ID: RM-363
-      Verify: tests/backlog/test_rm_355_364.py::test_a_count_stage_time_series_read_counts_what_it_examined
+      Verify: tests/backlog/test_rm_355_364.py::test_a_group_after_a_measurement_match_counts_what_it_examined
 - [ ] **A time-series `$group` on the meta field that sums `1.0` answers a
       double.** mongod 8.2.11 rewrites `{$group: {_id: "$m", n: {$sum:
       1.0}}}` over a time-series collection to a sum of each bucket's

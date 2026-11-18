@@ -472,6 +472,17 @@ fn groups_on_meta(stage: &Bson, meta: Option<&str>) -> bool {
     keyed && !accs.is_empty() && accs.iter().all(|(_, v)| counts(v))
 }
 
+/// A `$count` stage, which mongod 8.2.11 runs over a time-series
+/// collection's buckets as a `$group` on a constant and a `$project`
+/// (measured 2026-11-18: five of five buckets examined, RM-363).
+fn counts_stage(stage: &Bson) -> bool {
+    stage_name(stage) == "$count"
+        && matches!(
+            stage.as_document().and_then(|d| d.get("$count")),
+            Some(Bson::String(_))
+        )
+}
+
 /// A `$project` that only leaves fields out.
 fn excludes_only(spec: &Bson) -> bool {
     fn zero(v: &Bson) -> bool {
@@ -566,7 +577,7 @@ fn time_series(
     let meta_group = ask
         .pipeline
         .get(lead)
-        .is_some_and(|s| groups_on_meta(s, meta.as_deref()))
+        .is_some_and(|s| groups_on_meta(s, meta.as_deref()) || counts_stage(s))
         && ask.pipeline[lead + 1..].iter().all(fits);
     if ask.hint.is_some()
         || ask.collation.is_some()
@@ -634,7 +645,7 @@ fn time_series(
     cursor.whole = ask
         .pipeline
         .iter()
-        .any(|s| matches!(stage_name(s), "$sort" | "$group"));
+        .any(|s| matches!(stage_name(s), "$sort" | "$group" | "$count"));
     Ok(Some((cursor, Vec::new())))
 }
 
