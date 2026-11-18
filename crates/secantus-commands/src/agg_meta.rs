@@ -116,6 +116,7 @@ const DROPS_SORT_KEY: &[&str] = &[
     "$count",
     "$facet",
     "$redact",
+    "$documents",
 ];
 
 /// The stages that keep a document's metadata as they pass it on.

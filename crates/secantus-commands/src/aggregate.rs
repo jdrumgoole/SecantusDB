@@ -1212,11 +1212,22 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
         }
         // Collectionless aggregate (e.g. `{aggregate: 1, pipeline: [{$documents: …}]}`).
-        None => (
-            format!("{}.$cmd.aggregate", ctx.db_name),
-            Vec::new(),
-            pipeline,
-        ),
+        // A `$sort` here writes no sort key (RM-523) and `$documents` gives
+        // none, so a rank behind them is refused as on mongod 8.2.11
+        // (RM-626); the rewrite marks the documents keyless.
+        None => {
+            let mut pipeline = pipeline;
+            if pipeline.iter().any(crate::agg_meta::reads_sort_key)
+                || crate::agg_meta::ranks_with_no_sort_key(&pipeline)
+            {
+                crate::agg_meta::rewrite_sort_metadata(&mut pipeline, || None);
+            }
+            (
+                format!("{}.$cmd.aggregate", ctx.db_name),
+                Vec::new(),
+                pipeline,
+            )
+        }
     };
 
     // A stage that reads another collection is held to `notablescan` too.

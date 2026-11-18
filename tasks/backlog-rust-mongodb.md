@@ -1123,17 +1123,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       server refuses the `$meta` with code 2. Found 2026-11-13 (RM-521).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm521.py::test_a_facet_sort_key_is_empty
       Backlog-ID: RM-625
-- [ ] **A rank behind `$documents` and a `$sort` is answered, not
-      refused.** mongod 8.2.11 refuses a `$_internalSetWindowFields`
-      `$rank` there with 9973200 "Attempt to get sort key which has not been
-      populated", collectionless and in a `$lookup` pipeline alike; this
-      server ties both. A `$sort` the pipeline runs itself writes no key
-      (only the query layer's does, RM-523), and with no read of a
-      collection in front the documents have no key at all; the marking of
-      keyless documents RM-522 added (`agg_meta::DROPS_SORT_KEY`) does not
-      cover `$documents`. Found 2026-11-13 (RM-521).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm521.py::test_a_sort_behind_documents_sets_no_key
-      Backlog-ID: RM-626
 - [ ] **A `$unionWith` ends the sort key.** mongod 8.2.11 keeps the outer
       documents' key through a `$unionWith`, so a rank behind it ranks them
       by the `$sort` in front, and the documents it adds carry their
