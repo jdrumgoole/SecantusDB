@@ -452,7 +452,7 @@ COMMENT_ON_OTHER_BUILTIN = {
 }
 
 
-@pytest.mark.backlog("RP-969")
+@pytest.mark.backlog_fixed("RP-969")
 @pytest.mark.parametrize("case", list(COMMENT_ON_OTHER_BUILTIN))
 def test_comment_on_other_builtin_catalogs(case: str, dsn: str) -> None:
     comment, query, want = COMMENT_ON_OTHER_BUILTIN[case]

@@ -20102,6 +20102,35 @@ impl PgHandler {
         )
     }
 
+    /// The oid of a built-in row of a catalog, by its name (and, where the
+    /// catalog has one, its `pg_catalog` namespace): `name` or
+    /// `pg_catalog.name`.
+    fn builtin_catalog_object_oid(
+        &self,
+        catalog: &str,
+        name_col: &str,
+        nsp_col: &str,
+        names: &[String],
+    ) -> Option<i64> {
+        let name = match names {
+            [n] => n.as_str(),
+            [s, n] if s == "pg_catalog" && !nsp_col.is_empty() => n.as_str(),
+            _ => return None,
+        };
+        let def = Self::virtual_table(catalog)?;
+        let rows = self.catalog_rows(catalog)?;
+        let f = |c: &str| def.field_of(c).unwrap_or_default();
+        let (fname, fnsp, foid) = (f(name_col), f(nsp_col), f("oid"));
+        let found = rows.iter().find_map(|r| {
+            let hit = r.get_str(&fname).ok() == Some(name)
+                && (nsp_col.is_empty() || r.get(&fnsp).and_then(crate::bson_i64) == Some(11));
+            hit.then(|| r.get(&foid).and_then(crate::bson_i64))
+                .flatten()
+                .filter(|o| *o < 16384)
+        });
+        found
+    }
+
     fn comment_on(
         &self,
         kind: &str,
@@ -20313,7 +20342,59 @@ impl PgHandler {
             "domain" => self.comment_on_domain(&Self::comment_relation(names), comment),
             "text search configuration" => self.comment_on_ts_config(names, comment),
             "text search dictionary" => self.comment_on_ts_dict(names, comment),
-            "conversion" => self.comment_on_conversion(names, comment),
+            // A user conversion first, as the search path finds it; then
+            // initdb's, keyed by its `pg_conversion` oid.
+            "conversion" => match self.found_conversion(names) {
+                Err(e) => match self.builtin_catalog_object_oid(
+                    "pg_conversion",
+                    "conname",
+                    "connamespace",
+                    names,
+                ) {
+                    Some(oid) => {
+                        self.comment_on_builtin_object(kind, &names.join("."), oid, comment)
+                    }
+                    None => Err(e),
+                },
+                Ok(_) => self.comment_on_conversion(names, comment),
+            },
+            "language" | "collation" | "text search parser" | "text search template" => {
+                let (catalog, name_col, nsp_col) = match kind {
+                    "language" => ("pg_language", "lanname", None),
+                    "collation" => ("pg_collation", "collname", Some("collnamespace")),
+                    "text search parser" => ("pg_ts_parser", "prsname", Some("prsnamespace")),
+                    _ => ("pg_ts_template", "tmplname", Some("tmplnamespace")),
+                };
+                let found = match nsp_col {
+                    Some(nsp) => self.builtin_catalog_object_oid(catalog, name_col, nsp, names),
+                    None => self.builtin_catalog_object_oid(catalog, name_col, "", names),
+                };
+                let Some(oid) = found else {
+                    return Err(Self::user_error(
+                        "42704",
+                        format!("{kind} \"{}\" does not exist", names.join(".")),
+                    ));
+                };
+                self.comment_on_builtin_object(kind, &names.join("."), oid, comment)
+            }
+            "schema" | "extension"
+                if names.len() == 1
+                    && matches!(
+                        (kind, names[0].as_str()),
+                        ("schema", "pg_catalog" | "information_schema" | "pg_toast")
+                            | ("extension", "plpgsql")
+                    ) =>
+            {
+                let (catalog, name_col) = if kind == "schema" {
+                    ("pg_namespace", "nspname")
+                } else {
+                    ("pg_extension", "extname")
+                };
+                let oid = self
+                    .builtin_catalog_object_oid(catalog, name_col, "", names)
+                    .unwrap_or_default();
+                self.comment_on_builtin_object(kind, &names[0], oid, comment)
+            }
             "operator class" => self.comment_on_opclass(true, names, comment),
             "operator family" => self.comment_on_opclass(false, names, comment),
             "subscription" => {
@@ -22686,6 +22767,8 @@ impl PgHandler {
                 tail.push((oid, 0, c.to_string()));
             }
         }
+        // `plpgsql`'s description, which initdb gives it, goes the same way.
+        head.retain(|(oid, _, _)| !commented.contains(oid));
         tail.extend(
             crate::system_catalogs::initdb_proc_descriptions()
                 .iter()

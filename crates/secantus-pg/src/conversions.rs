@@ -67,7 +67,7 @@ impl PgHandler {
             .find(|d| d.get_str("schema") == Ok(schema) && d.get_str("name") == Ok(name))
     }
 
-    fn found_conversion(&self, parts: &[String]) -> PgWireResult<Document> {
+    pub(crate) fn found_conversion(&self, parts: &[String]) -> PgWireResult<Document> {
         let (schema, name) = self.conversion_name(parts, false)?;
         self.conversion_doc(&schema, &name).ok_or_else(|| {
             Self::user_error(
