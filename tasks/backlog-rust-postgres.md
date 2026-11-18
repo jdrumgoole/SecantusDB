@@ -2174,13 +2174,12 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       `*>=` compare a record's fields by their binary images (RP-650): the
       integers, oid, bool, `"char"`, the floats, numeric, date, time,
       timetz, the timestamps, interval, uuid, macaddr / macaddr8, inet /
-      cidr, tid, pg_lsn, name, text / varchar / bpchar and bytea are
-      modelled in `record_image.rs`. Every other type is 0A000 `a
-      record_image comparison over a field of type ... is not supported
-      yet`; on PostgreSQL 15.19 `row('1'::money) *< row('2'::money)` is `t`
-      (an int64 by value), and an array, jsonb, bit string or range
+      cidr, tid, pg_lsn, name, text / varchar / bpchar, bytea, money and
+      bit / varbit are modelled in `record_image.rs`. Every other
+      type is 0A000 `a record_image comparison over a field of type ... is
+      not supported yet`; on PostgreSQL 15.19 an array, jsonb or range
       compares by `memcmp` of its varlena data, each in its own on-disk
-      layout (`ArrayType` header and elements, `JsonbContainer`, `VarBit`,
+      layout (`ArrayType` header and elements, `JsonbContainer`,
       `RangeType` with its flags byte). Each needs that layout modelled.
       Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_over_still_refused_field_types
       Backlog-ID: RP-976

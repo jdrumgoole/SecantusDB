@@ -251,6 +251,19 @@ fn image(v: &Bson, ty: &str) -> Result<Image> {
                 .ok_or_else(refused)?;
             Image::Bytes(numeric_image(&text).ok_or_else(refused)?)
         }
+        // `Cash` is an int64 passed by value (`CashGetDatum`).
+        "money" => Image::ByValue(crate::money::cents_of(v).ok_or_else(refused)? as u64),
+        // A `VarBit` varlena: the int32 bit count as it lies in memory, then
+        // the bits packed MSB-first, the pad bits zero.
+        t if crate::bits::is_bit_type(t) => match v {
+            Bson::String(s) => {
+                let mut b = crate::bits::to_wire(s);
+                let n = i32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+                b[..4].copy_from_slice(&n.to_le_bytes());
+                Image::Bytes(b)
+            }
+            _ => return Err(refused()),
+        },
         // An `unknown` field (a bare literal in `row(1, 'a')`) is a cstring,
         // attlen -2, which `record_image_cmp` has no case for.
         "unknown" => {

@@ -206,11 +206,29 @@ def test_record_image_over_remaining_field_types(query: str, dsn: str) -> None:
 # The field types whose datum image is still not modelled: money (an int64
 # by value), an array, a jsonb, a bit string and a range (varlenas with
 # their own layouts), measured on PostgreSQL 15.19.
-RECORD_IMAGE_STILL_REFUSED = {
+# Measured on PostgreSQL 15.19: money is an int64 by value (so -1 sorts
+# above 2), and a bit string's VarBit image starts with its native-endian bit
+# count, so B'11111111111' (11 bits) sorts below B'1'.
+RECORD_IMAGE_MONEY_AND_BITS = {
     "select (select row('1'::money)) *< (select row('2'::money))": [(True,)],
+    "select (select row('-1'::money)) *> (select row('2'::money))": [(True,)],
+    "select (select row(B'101')) *< (select row(B'110'))": [(True,)],
+    "select (select row(B'1')) *< (select row(B'10'))": [(True,)],
+    "select (select row(B'11111111111')) *< (select row(B'1'))": [(False,)],
+    "select (select row(B'10'::varbit)) *> (select row(B'1'::varbit))": [(True,)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-976")
+@pytest.mark.parametrize("query", list(RECORD_IMAGE_MONEY_AND_BITS))
+def test_record_image_over_money_and_bit_strings(query: str, dsn: str) -> None:
+    """Money and bit-string fields were 0A000; they compare by their images."""
+    assert answer(dsn, query) == RECORD_IMAGE_MONEY_AND_BITS[query]
+
+
+RECORD_IMAGE_STILL_REFUSED = {
     "select (select row('{1}'::int[])) *= (select row('{1}'::int[]))": [(True,)],
     """select (select row('{"a":1}'::jsonb)) *= (select row('{"a": 1}'::jsonb))""": [(True,)],
-    "select (select row(B'101')) *< (select row(B'110'))": [(True,)],
     "select (select row('[1,2)'::int4range)) *= (select row('[1,2)'::int4range))": [(True,)],
 }
 
