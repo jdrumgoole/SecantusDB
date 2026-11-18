@@ -8,8 +8,8 @@ comparison. Reads ``bench/results/latency.json`` (written by hand from a
 - the inline SVG in ``website/themes/secantus/templates/performance.html``
 
 Both SVG blocks share one bar geometry (bar width = ratio * px_per_x - CAP,
-mongod's 1x reference line at ``X0 + px_per_x``). The site drops the Python
-series and rescales; otherwise they differ only in CSS class prefixes and
+mongod's 1x reference line at ``X0 + px_per_x``). Neither draws the
+deprecated Python server; they differ only in CSS class prefixes and
 tooltip mechanism, which is what ``Style`` captures. The
 surrounding prose (the "short version" ranges) is hand-maintained — the
 script prints the fresh ranges so the prose can be checked against them.
@@ -55,9 +55,9 @@ class Style:
     tooltip_attr: bool  # data-tip attribute (site) vs <title> child (docs)
     rust_name: str
     py_name: str
-    # The site shows the Rust server against mongod only (the Python servers
-    # are deprecated, Joe 2026-11-17); docs/benchmark.md keeps all three.
-    show_py: bool = True
+    # The deprecated Python servers are not drawn on either surface (Joe,
+    # 2026-11-17 for the site, 2026-11-18 for the docs).
+    show_py: bool = False
     px_per_x: float = PX_PER_X
     row_h: float = ROW_H
     ticks: tuple[int, ...] = (5, 10, 15, 20, 25)
@@ -96,6 +96,9 @@ DOCS = Style(
     tooltip_attr=False,
     rust_name="Rust server",
     py_name="Python server",
+    px_per_x=140.0,
+    row_h=34.0,
+    ticks=(2, 3, 4),
 )
 
 
@@ -146,7 +149,6 @@ def render_svg(workloads: list[dict], st: Style, aria: str) -> str:
     y = TOP
     for w in workloads:
         rust_x = w["rust_ms"] / w["mongod_ms"]
-        py_x = w["py_ms"] / w["mongod_ms"]
         parts.append(
             f'<text x="{X0 - 10:.0f}" y="{y + 16:.0f}" text-anchor="end" class="{st.lab}">'
             f"{w['label']}</text>"
@@ -154,6 +156,7 @@ def render_svg(workloads: list[dict], st: Style, aria: str) -> str:
         parts.append(_bar(rust_x, y, st.rust_fill, f"{st.rust_name} — {rust_x:.1f}x mongod", st))
         parts.append(_val(rust_x, y + 11, f"{rust_x:.1f}", st))
         if st.show_py:
+            py_x = w["py_ms"] / w["mongod_ms"]
             parts.append(_bar(py_x, y + 16, st.py_fill, f"{st.py_name} — {py_x:.1f}x mongod", st))
             parts.append(_val(py_x, y + 27, f"{py_x:.1f}", st))
         y += st.row_h
@@ -163,15 +166,13 @@ def render_svg(workloads: list[dict], st: Style, aria: str) -> str:
 
 def render_table(workloads: list[dict]) -> str:
     lines = [
-        "| Workload | mongod | Rust server | ×mongod | Python server | ×mongod |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| Workload | mongod | Rust server | ×mongod |",
+        "|---|---:|---:|---:|",
     ]
     for w in workloads:
         rust_x = w["rust_ms"] / w["mongod_ms"]
-        py_x = w["py_ms"] / w["mongod_ms"]
         lines.append(
-            f"| {w['md_label']} | {w['mongod_ms']:.1f} ms | {w['rust_ms']:.1f} ms | "
-            f"{rust_x:.1f}× | {w['py_ms']:.1f} ms | {py_x:.1f}× |"
+            f"| {w['md_label']} | {w['mongod_ms']:.1f} ms | {w['rust_ms']:.1f} ms | {rust_x:.1f}× |"
         )
     return "\n".join(lines)
 
@@ -211,7 +212,8 @@ def splice_html_tbody(path: Path, new_tbody: str) -> None:
 def splice_table(path: Path, new_table: str) -> None:
     src = path.read_text()
     out, n = re.subn(
-        r"\| Workload \| mongod \| Rust server \| ×mongod \| Python server \| ×mongod \|\n"
+        # Matches the table with or without the retired Python columns.
+        r"\| Workload \| mongod \| Rust server \| ×mongod \|(?: Python server \| ×mongod \|)?\n"
         r"(?:\|[^\n]*\|\n)+",
         new_table + "\n",
         src,
@@ -236,14 +238,8 @@ def main() -> None:
     )
     splice_html_tbody(PERF_HTML, render_html_tbody(workloads))
     rust = [w["rust_ms"] / w["mongod_ms"] for w in workloads]
-    py = [w["py_ms"] / w["mongod_ms"] for w in workloads]
-    ratio = [p / r for r, p in zip(rust, py, strict=True)]
     print(f"rewrote {DOCS_MD.relative_to(REPO)} and {PERF_HTML.relative_to(REPO)}")
-    print(
-        f"prose check — Rust: {min(rust):.1f}x–{max(rust):.1f}x of mongod; "
-        f"Python: {min(py):.1f}x–{max(py):.1f}x; "
-        f"Rust vs Python: {min(ratio):.1f}x–{max(ratio):.1f}x"
-    )
+    print(f"prose check — Rust: {min(rust):.1f}x–{max(rust):.1f}x of mongod")
     print("review the hand-maintained prose around both charts against these ranges")
 
 
