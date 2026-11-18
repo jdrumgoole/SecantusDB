@@ -3,7 +3,10 @@ domain error in a record literal is at the literal): RP-945 (an untyped
 literal written to a composite or domain-array column, or coerced as an
 `ARRAY[]` element or an `INSERT ... SELECT` output column, reported a
 field's domain error with no position; fixed), RP-1044 (a `text` SELECT
-column written to a composite column is accepted), RP-946
+column written to a composite column was accepted; fixed), RP-1048 (a
+`text` SELECT column written to a domain-array column is accepted), RP-1049
+(a `record` SELECT column written to a composite column is accepted), RP-1050
+(a UNION of a composite and a record has no error position), RP-946
 (a NULL element of a NOT NULL domain's array literal was accepted; fixed),
 RP-947 (a
 composite column compared with an untyped literal read the literal as the
@@ -109,6 +112,9 @@ def test_insert_select_literal_domain_error_position(query: str, dsn: str) -> No
 # first, and `text` has no assignment cast to a composite.
 TEXT_SELECTED = {
     "insert into tct(c) select '(0,x)' union all select '(1,x)'": "27",
+    "insert into tct(c) select '(1,x)' group by 1": "27",
+    "insert into tct(c) select '(1,x)' where false union select '(1,x)'": "27",
+    "insert into tct(c) select null::text": "27",
     "insert into tct(c) select * from (select '(0,x)') s": "27",
     "insert into tct(c) select '(0,x)'::text": "27",
     "insert into tct(c) select '(0,x)' order by 1": "27",
@@ -116,10 +122,10 @@ TEXT_SELECTED = {
 }
 
 
-@pytest.mark.backlog("RP-1044")
+@pytest.mark.backlog_fixed("RP-1044")
 @pytest.mark.parametrize("query", list(TEXT_SELECTED))
 def test_insert_select_text_into_composite(query: str, dsn: str) -> None:
-    """42804 at the column; here the text is read as the composite."""
+    """42804 at the column; the text was read as the composite."""
     assert answer(dsn, query) == (
         "42804",
         'column "c" is of type ctp but expression is of type text',
@@ -187,3 +193,33 @@ def test_prepare_error_location(query: str, dsn: str) -> None:
     """A composite or array literal's field domain error was not raised at
     PREPARE; analysis now raises it at the literal."""
     assert answer(dsn, query) == PREPARED[query]
+
+
+@pytest.mark.backlog("RP-1048")
+def test_insert_select_text_into_domain_array(dsn: str) -> None:
+    """`text` has no assignment cast to `pint[]`; here it is read as the array."""
+    assert answer(dsn, "insert into tct(d) select '{1}' union all select '{1}'") == (
+        "42804",
+        'column "d" is of type pint[] but expression is of type text',
+        "27",
+    )
+
+
+@pytest.mark.backlog("RP-1049")
+def test_insert_select_record_into_composite(dsn: str) -> None:
+    """`record` to `ctp` is not an assignment coercion; here it is stored."""
+    assert answer(dsn, "insert into tct(c) select row(1,'x')") == (
+        "42846",
+        "cannot cast type record to ctp",
+        "27",
+    )
+
+
+@pytest.mark.backlog("RP-1050")
+def test_union_composite_record_position(dsn: str) -> None:
+    """The UNION's type mismatch is placed at the right arm's column."""
+    assert answer(dsn, "insert into tct(c) select (1,'x')::ctp union select row(2,'y')") == (
+        "42804",
+        "UNION types ctp and record cannot be matched",
+        "53",
+    )

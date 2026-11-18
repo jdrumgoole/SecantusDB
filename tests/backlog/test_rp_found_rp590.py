@@ -464,9 +464,6 @@ def test_record_image_over_arrays_of_jsonb_and_inet(
 
 RECORD_IMAGE_STILL_REFUSED = {
     "select (select row(row(1, 'a')::ca)) *= (select row(row(1, 'a')::ca))": [(True,)],
-    "select (select row('{[1,2)}'::int4multirange)) *= (select row('{[1,2)}'::int4multirange))": [
-        (True,)
-    ],
 }
 
 
@@ -507,6 +504,57 @@ def test_record_image_over_arrays_of_fixed_length_by_reference_elements(
     0A000: each element is its whole image at its type's alignment."""
     query = f"select (select row({left})) {op} (select row({right}))"
     assert answer(dsn, query) == [(want,)]
+
+
+# Each `(left, right, type)` answers `(left *< right, left *= right,
+# right *< left)`, measured on PostgreSQL 15.19.
+RECORD_IMAGE_MULTIRANGES = [
+    ("{[1,2)}", "{[1,2),[5,6)}", "int4multirange", (True, False, False)),
+    ("{[1,2),[5,6)}", "{[1,2),[4,6)}", "int4multirange", (False, False, True)),
+    ("{}", "{[1,2)}", "int4multirange", (True, False, False)),
+    ("{}", "{}", "int4multirange", (False, True, False)),
+    ("{[1,2)}", "{(,2)}", "int8multirange", (True, False, False)),
+    ("{[-1,3)}", "{[1,2)}", "int8multirange", (False, False, True)),
+    ("{[1.5,2)}", "{[1.50,2)}", "nummultirange", (False, False, True)),
+    ("{[1.5,2),[3,4)}", "{[1.5,2),[3.0,4)}", "nummultirange", (True, False, False)),
+    ("{[1,1000000),[3000000,4000000)}", "{[1,10000),[3,4)}", "nummultirange", (False, False, True)),
+    (
+        "{[1,2),[3,4),[5,6),[7,8),[9,10),[11,12)}",
+        "{[1,2),[3,4),[5,6),[7,8),[9,11),[12,13)}",
+        "int8multirange",
+        (True, False, False),
+    ),
+    (
+        "{[1,2),[3,4),[5,6),[7,8),[9,10)}",
+        "{[1,2),[3,4),[5,6),[7,8)}",
+        "int4multirange",
+        (False, False, True),
+    ),
+    (
+        "{[2020-01-01,2020-02-01)}",
+        "{[2020-01-02,2020-02-01)}",
+        "datemultirange",
+        (True, False, False),
+    ),
+    (
+        "{[2020-01-01 00:00,2020-02-01)}",
+        "{[2020-01-01 00:00:01,2020-02-01), [2021-01-01,)}",
+        "tsmultirange",
+        (True, False, False),
+    ),
+]
+
+
+@pytest.mark.backlog_fixed("RP-976")
+@pytest.mark.parametrize(("left", "right", "ty", "want"), RECORD_IMAGE_MULTIRANGES)
+def test_record_image_over_multiranges(
+    left: str, right: str, ty: str, want: tuple[bool, bool, bool], dsn: str
+) -> None:
+    """A built-in multirange field was 0A000: its image is the
+    `MultirangeType` `make_multirange` lays out (count, items, flags, then
+    each range's bounds at the element's alignment)."""
+    a, b = f"(select row('{left}'::{ty}))", f"(select row('{right}'::{ty}))"
+    assert answer(dsn, f"select {a} *< {b}, {a} *= {b}, {b} *< {a}") == [want]
 
 
 @pytest.mark.backlog("RP-976")

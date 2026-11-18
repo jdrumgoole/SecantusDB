@@ -31597,13 +31597,29 @@ impl PgHandler {
             let Some(col) = def.column(target) else {
                 continue;
             };
-            let Some(target_oid) = secantus_pgplan::pgtypes::oid_of_name(&col.pg_type) else {
-                continue;
-            };
             let source_oid = i64::from(field.datatype().oid());
-            if casts::assignment_path(source_oid, target_oid)
-                || secantus_pgplan::user_casts::assignment_exists(source_oid, target_oid)
-            {
+            // A built-in type has no ASSIGNMENT cast to a user composite: a
+            // `text` (a literal under a UNION, ORDER BY or DISTINCT, or a
+            // subquery's output) is 42804, not read by `record_in` (RP-1044).
+            // A `record` (`row(...)`) is coerced field by field instead.
+            const RECORD: i64 = 2249;
+            let builtin_to_composite = secantus_pgplan::user_composite_oid(&col.pg_type).is_some()
+                && !matches!(source_oid, RECORD | 705)
+                && secantus_pgplan::pgtypes::BUILTIN_TYPES
+                    .iter()
+                    .any(|(_, el, _)| *el == source_oid);
+            let target_oid = if builtin_to_composite {
+                None
+            } else {
+                match secantus_pgplan::pgtypes::oid_of_name(&col.pg_type) {
+                    Some(oid) => Some(oid),
+                    None => continue,
+                }
+            };
+            if target_oid.is_some_and(|target_oid| {
+                casts::assignment_path(source_oid, target_oid)
+                    || secantus_pgplan::user_casts::assignment_exists(source_oid, target_oid)
+            }) {
                 continue;
             }
             // `name_of_oid` names the scalars; an array is its element's

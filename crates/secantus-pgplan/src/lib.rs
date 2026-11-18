@@ -8778,6 +8778,35 @@ fn typmod_ival(node: &pg_query::protobuf::Node) -> Option<i32> {
     }
 }
 
+/// `numerictypmodin`'s checks on a `numeric(p[,s])` type name, made when the
+/// name is read (`typenameTypeMod`), so a cast refuses before any value is
+/// seen (`null::numeric(0)` too): 22023 at the type name.
+pub(crate) fn numeric_typmod_error(tn: &pg_query::protobuf::TypeName) -> Option<Error> {
+    if tn.typmods.is_empty()
+        || !matches!(
+            type_name(&tn.names).to_ascii_lowercase().as_str(),
+            "numeric" | "decimal"
+        )
+    {
+        return None;
+    }
+    let mods: Vec<i32> = tn.typmods.iter().filter_map(typmod_ival).collect();
+    if mods.len() != tn.typmods.len() {
+        return None;
+    }
+    let bad = |m: String| Some(Error::Sqlstate("22023", m));
+    match mods.as_slice() {
+        [p, ..] if !(1..=1000).contains(p) && mods.len() <= 2 => {
+            bad(format!("NUMERIC precision {p} must be between 1 and 1000"))
+        }
+        [_, s] if !(-1000..=1000).contains(s) => {
+            bad(format!("NUMERIC scale {s} must be between -1000 and 1000"))
+        }
+        [_] | [_, _] => None,
+        _ => bad("invalid NUMERIC type modifier".into()),
+    }
+}
+
 /// The `atttypmod` a declared type carries, or -1 for an unmodified type.
 pub(crate) fn declared_typmod_public(tn: &pg_query::protobuf::TypeName) -> i32 {
     declared_typmod(tn)
@@ -15421,7 +15450,12 @@ fn plan_insert(
 /// arm's expression, as PostgreSQL does.
 fn source_targets(sel: &pg_query::protobuf::SelectStmt) -> Vec<SourceTarget> {
     let mut leftmost = sel;
-    let set_op = sel.op != pg_query::protobuf::SetOperation::SetopNone as i32;
+    // A set operation, ORDER BY, DISTINCT or GROUP BY resolves an `unknown`
+    // output column to `text` before the INSERT sees it.
+    let set_op = sel.op != pg_query::protobuf::SetOperation::SetopNone as i32
+        || !sel.sort_clause.is_empty()
+        || !sel.distinct_clause.is_empty()
+        || !sel.group_clause.is_empty();
     while leftmost.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
         match leftmost.larg.as_deref() {
             Some(l) => leftmost = l,
@@ -42401,7 +42435,17 @@ pub(crate) fn char_out(b: u8) -> String {
 /// string types' I/O casts, and nothing for the other numbers or boolean --
 /// `65::int2::"char"` and `'A'::"char"::int8` are both refused, NULL or not
 /// (measured). The call `"char"(x)` is a function, not this cast.
+///
+/// `cstring` is a pseudo-type whose only casts are the I/O conversions to
+/// the string types (`'x'::cstring::int4` is 42846 on PostgreSQL 15.19;
+/// `::text` reads the value), so any other target is refused the same way.
 pub(crate) fn char_cast_refused(source: &str, target: &str) -> Option<Error> {
+    if source == "cstring" && target != "cstring" && !is_string_type(target) {
+        return Some(Error::CannotCoerce(format!(
+            "cannot cast type cstring to {}",
+            display_type(target)
+        )));
+    }
     let other = match (source, target) {
         (s, QUOTED_CHAR) if s != QUOTED_CHAR => s,
         (QUOTED_CHAR, t) if t != QUOTED_CHAR => t,

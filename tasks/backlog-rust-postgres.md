@@ -2153,12 +2153,13 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       2026-11-18), arrays of fixed-length elements (by value, or by
       reference: interval, uuid, timetz, name, macaddr / macaddr8, tid) or
       of text / varchar / bpchar / numeric / bytea / inet / cidr / jsonb
-      (each with the 4-byte header `array_in` gives it, measured) and the
-      built-in ranges are modelled. Every other type is 0A000 `a
+      (each with the 4-byte header `array_in` gives it, measured), the
+      built-in ranges and the built-in multiranges (`make_multirange`'s
+      layout, 2026-11-18) are modelled. Every other type is 0A000 `a
       record_image comparison over a field of type ... is not supported
       yet`. Remaining, measured on PostgreSQL 15.19: arrays of any other
-      varlena element, a user range, a multirange and a composite field (a
-      `HeapTupleHeader` varlena).
+      varlena element, a user range or multirange, and a composite field
+      (a `HeapTupleHeader` varlena).
       Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_over_still_refused_field_types
       Backlog-ID: RP-976
 
@@ -2285,22 +2286,6 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
 Measured on PostgreSQL 15.19 (port 5415) with statements that create
 nothing. The gap tests are in `tests/backlog/test_rp_found_rp750.py`.
 
-- [ ] **A `numeric` type name with precision 0 is accepted.**
-      `select '1.5'::numeric(0,1)` is 22023 `NUMERIC precision 0 must be
-      between 1 and 1000` at 15 on PostgreSQL 15.19 (`numerictypmodin`
-      checks the modifiers when the type name is read); here the cast runs
-      and is 22003 `numeric field overflow`. Found while working RP-953,
-      whose `numeric_in(c, 0, 5)` applies that same typmod at run time and
-      must keep doing so.
-      Verify: tests/backlog/test_rp_found_rp750.py::test_numeric_precision_zero_is_refused
-      Backlog-ID: RP-1042
-- [ ] **A cast from `cstring` to a type with no such cast is accepted.**
-      `select 'x'::cstring::int4` is 42846 `cannot cast type cstring to
-      integer` at 20 on PostgreSQL 15.19 (`cstring` casts only to the
-      string types, by I/O); here it reads the value as `int4` (22P02 for
-      this one, 12 for `'12'`).
-      Verify: tests/backlog/test_rp_found_rp750.py::test_cstring_casts_only_to_strings
-      Backlog-ID: RP-1041
 
 ## Found while working RP-570 (2026-11-08)
 
@@ -2329,18 +2314,30 @@ Measured on PostgreSQL 15.19 with `create domain pint as int check (value >
 text)` and `create table tct (c ctp, d pint[])` holding `('(1,x)', null)`.
 The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
 
-- [ ] **A `text` column an `INSERT ... SELECT` writes to a composite
-      column is accepted.** `insert into tct(c) select '(0,x)'::text` is
-      42804 `column "c" is of type ctp but expression is of type text` at
-      27 on PostgreSQL 15.19, as is the bare literal under a UNION, an
-      ORDER BY, a DISTINCT or a subquery in FROM (each resolves the
-      `unknown` column to `text` first; `text` has no assignment cast to a
-      composite). Here the text is read as the composite (a field's domain
-      error, 23514, for these). Found while working RP-945, which placed
-      the plain SELECT's literal (`check_assigned_literal` over its target
-      list).
-      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_text_into_composite
-      Backlog-ID: RP-1044
+- [ ] **A `text` column an `INSERT ... SELECT` writes to a domain-array
+      column is accepted.** `insert into tct(d) select '{1}' union all
+      select '{1}'` is 42804 `column "d" is of type pint[] but expression is
+      of type text` at 27 on PostgreSQL 15.19; here the text is read as the
+      array. `check_insert_select_types` (secantus-pg) skips a target whose
+      type `oid_of_name` cannot name, which an array of a domain is. Found
+      while working RP-1044, which closed the composite case there.
+      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_text_into_domain_array
+      Backlog-ID: RP-1048
+- [ ] **A `record` column an `INSERT ... SELECT` writes to a composite
+      column is accepted.** `insert into tct(c) select row(1,'x')` is 42846
+      `cannot cast type record to ctp` at 27 on PostgreSQL 15.19 (a
+      `RowExpr` is coerced to a composite only where it is written, as in
+      `VALUES`, not through a subquery's output column); here the row is
+      stored. RP-1044's check lets `record` through for this reason.
+      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_record_into_composite
+      Backlog-ID: RP-1049
+- [ ] **A UNION of a composite and a `record` has no error position.**
+      `insert into tct(c) select (1,'x')::ctp union select row(2,'y')` is
+      42804 `UNION types ctp and record cannot be matched` at 53 (the right
+      arm's column) on PostgreSQL 15.19; here the message matches and the
+      position is missing. Found while working RP-1044.
+      Verify: tests/backlog/test_rp_found_rp552.py::test_union_composite_record_position
+      Backlog-ID: RP-1050
 
 ## Found while working RP-534 (2026-11-08)
 

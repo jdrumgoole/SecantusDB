@@ -132,10 +132,10 @@ def test_input_function_typmods(query: str, expected: tuple[object, ...], dsn: s
     assert answer == expected
 
 
-@pytest.mark.backlog("RP-1042")
+@pytest.mark.backlog_fixed("RP-1042")
 def test_numeric_precision_zero_is_refused(dsn: str) -> None:
-    """`numeric(0,1)` is refused when the type is read; here the cast runs
-    and overflows."""
+    """`numeric(0,1)` was not refused when the type was read; the cast ran
+    and overflowed."""
     with psycopg.connect(dsn, autocommit=True) as c, pytest.raises(psycopg.Error) as info:
         c.execute("select '1.5'::numeric(0,1)")
     assert (
@@ -149,12 +149,44 @@ def test_numeric_precision_zero_is_refused(dsn: str) -> None:
     )
 
 
-@pytest.mark.backlog("RP-1041")
+@pytest.mark.backlog_fixed("RP-1041")
 def test_cstring_casts_only_to_strings(dsn: str) -> None:
-    """`cstring` has no cast to `integer`; here it reads the value."""
+    """`cstring` had no cast to `integer`, but the server read the value
+    (42846 at 21 on PostgreSQL 15.19 for this statement)."""
     with psycopg.connect(dsn, autocommit=True) as c:
         try:
             answer: object = c.execute("select '12'::cstring::int4").fetchone()
         except psycopg.Error as e:
             answer = (e.sqlstate, e.diag.statement_position)
-    assert answer == ("42846", "20")
+    assert answer == ("42846", "21")
+
+
+@pytest.mark.backlog_fixed("RP-1042")
+@pytest.mark.parametrize(
+    ("query", "message", "position"),
+    [
+        ("select '1'::numeric(1001)", "NUMERIC precision 1001 must be between 1 and 1000", "13"),
+        ("select '1'::numeric(5,1001)", "NUMERIC scale 1001 must be between -1000 and 1000", "13"),
+        (
+            "select '1'::numeric(5,-1001)",
+            "NUMERIC scale -1001 must be between -1000 and 1000",
+            "13",
+        ),
+        ("select '1'::numeric(1,2,3)", "invalid NUMERIC type modifier", "13"),
+        ("select null::numeric(0)", "NUMERIC precision 0 must be between 1 and 1000", "14"),
+        ("select cast('1' as numeric(0))", "NUMERIC precision 0 must be between 1 and 1000", "20"),
+        ("select '1'::decimal(0)", "NUMERIC precision 0 must be between 1 and 1000", "13"),
+        ("select '{1}'::numeric(0)[]", "NUMERIC precision 0 must be between 1 and 1000", "15"),
+    ],
+)
+def test_numeric_typmod_checked_when_read(
+    dsn: str, query: str, message: str, position: str
+) -> None:
+    """`numerictypmodin`'s checks, each measured on PostgreSQL 15.19."""
+    with psycopg.connect(dsn, autocommit=True) as c, pytest.raises(psycopg.Error) as info:
+        c.execute(query)
+    assert (
+        info.value.sqlstate,
+        info.value.diag.message_primary,
+        info.value.diag.statement_position,
+    ) == ("22023", message, position)
