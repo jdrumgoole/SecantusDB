@@ -2908,6 +2908,18 @@ statement is VALUES-only and runs there as written. The gap test is in
       LEFT join filtered on a column not its key (`where e2.b is null`, a
       `Hash Right Join` with `Filter`) stay unpriced as they do over a
       column key. Measured on the 15.19 reference on port 5415.
+      Where each declines (read 2026-11-18, while working RP-1025/1036/
+      1038/1039): the unique column in `hash_join_of`'s `if unique_key &&
+      (redundant || expr_key) { return None }` -- `unique_key_other_paths`
+      would need the column side's index probed by the expression (its
+      param scan and Memoize keyed on an expression with no statistics,
+      200 distinct) and a merge sorting the expression side against the
+      presorted index; the merge at the end of `hash_join_of` (`expr_key
+      && JoinPick::Merge`), which needs the plan drawn with the
+      expression's Sort Key and `Merge Cond: (e.b = ((e2.b ||
+      'x'::text)))`; the cross-type one at its `a.pg_type != b.pg_type`
+      check, where `int8 = int4` is one integer opfamily's hashable
+      operator.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an expression key against a unique column is a hash join], tests/backlog/test_rp_explain_costs.py::test_plan[an expression key over a column of few values is a merge join]
       Backlog-ID: RP-1032
 - [ ] **ANALYZE of a hash join on an expression key counts nothing below
