@@ -338,9 +338,138 @@ def test_record_image_over_arrays_of_varlena_elements(
     assert answer(dsn, query) == [(want,)]
 
 
+# Measured on PostgreSQL 15.19: (left, right, left *< right, left *= right).
+RECORD_IMAGE_JSONB = [
+    ("null", "true", False, False),
+    ("1", "null", False, False),
+    ("1", "true", False, False),
+    ("1", "1.0", True, False),
+    ("1", '"a"', False, False),
+    ("1", '"ab"', False, False),
+    ("1", "[]", False, False),
+    ("1", "{}", False, False),
+    ("1", '["a",1]', True, False),
+    ("1", '[1,"a"]', True, False),
+    ("1", '{"a":1}', False, False),
+    ("1", '{"a": 1.0}', False, False),
+    ("1", '{"b":1,"a":2}', True, False),
+    ("1", '{"aa":1,"b":2}', True, False),
+    ("1.0", "null", False, False),
+    ("1.0", "true", False, False),
+    ("1.0", '"a"', False, False),
+    ("1.0", '"ab"', False, False),
+    ("1.0", "[]", False, False),
+    ("1.0", "{}", False, False),
+    ("1.0", '["a",1]', True, False),
+    ("1.0", '[1,"a"]', True, False),
+    ("1.0", '{"a":1}', False, False),
+    ("1.0", '{"a": 1.0}', False, False),
+    ("1.0", '{"b":1,"a":2}', True, False),
+    ("1.0", '{"aa":1,"b":2}', True, False),
+    ('"a"', "null", False, False),
+    ('"a"', "true", False, False),
+    ('"a"', '"ab"', True, False),
+    ('"a"', "[]", False, False),
+    ('"a"', "{}", False, False),
+    ('"a"', '["a",1]', True, False),
+    ('"a"', '[1,"a"]', True, False),
+    ('"a"', '{"a":1}', False, False),
+    ('"a"', '{"a": 1.0}', False, False),
+    ('"a"', '{"b":1,"a":2}', True, False),
+    ('"a"', '{"aa":1,"b":2}', True, False),
+    ('"ab"', "null", False, False),
+    ('"ab"', "true", False, False),
+    ('"ab"', "[]", False, False),
+    ('"ab"', "{}", False, False),
+    ('"ab"', '["a",1]', True, False),
+    ('"ab"', '[1,"a"]', True, False),
+    ('"ab"', '{"a":1}', False, False),
+    ('"ab"', '{"a": 1.0}', False, False),
+    ('"ab"', '{"b":1,"a":2}', True, False),
+    ('"ab"', '{"aa":1,"b":2}', True, False),
+    ("[]", "null", True, False),
+    ("[]", "true", True, False),
+    ("[]", "{}", False, False),
+    ("{}", "null", True, False),
+    ("{}", "true", True, False),
+    ('["a",1]', "null", False, False),
+    ('["a",1]', "true", False, False),
+    ('["a",1]', "[]", False, False),
+    ('["a",1]', "{}", False, False),
+    ('["a",1]', '[1,"a"]', True, False),
+    ('["a",1]', '{"a":1}', False, False),
+    ('["a",1]', '{"a": 1.0}', False, False),
+    ('["a",1]', '{"b":1,"a":2}', False, False),
+    ('["a",1]', '{"aa":1,"b":2}', False, False),
+    ('[1,"a"]', "null", False, False),
+    ('[1,"a"]', "true", False, False),
+    ('[1,"a"]', "[]", False, False),
+    ('[1,"a"]', "{}", False, False),
+    ('[1,"a"]', '{"a":1}', False, False),
+    ('[1,"a"]', '{"a": 1.0}', False, False),
+    ('[1,"a"]', '{"b":1,"a":2}', False, False),
+    ('[1,"a"]', '{"aa":1,"b":2}', False, False),
+    ('{"a":1}', "null", True, False),
+    ('{"a":1}', "true", True, False),
+    ('{"a":1}', "[]", False, False),
+    ('{"a":1}', "{}", False, False),
+    ('{"a":1}', '{"a": 1.0}', True, False),
+    ('{"a":1}', '{"b":1,"a":2}', True, False),
+    ('{"a":1}', '{"aa":1,"b":2}', True, False),
+    ('{"a": 1.0}', "null", True, False),
+    ('{"a": 1.0}', "true", True, False),
+    ('{"a": 1.0}', "[]", False, False),
+    ('{"a": 1.0}', "{}", False, False),
+    ('{"a": 1.0}', '{"b":1,"a":2}', True, False),
+    ('{"a": 1.0}', '{"aa":1,"b":2}', True, False),
+    ('{"b":1,"a":2}', "null", False, False),
+    ('{"b":1,"a":2}', "true", False, False),
+    ('{"b":1,"a":2}', "[]", False, False),
+    ('{"b":1,"a":2}', "{}", False, False),
+    ('{"b":1,"a":2}', '{"aa":1,"b":2}', True, False),
+    ('{"aa":1,"b":2}', "null", False, False),
+    ('{"aa":1,"b":2}', "true", False, False),
+    ('{"aa":1,"b":2}', "[]", False, False),
+    ('{"aa":1,"b":2}', "{}", False, False),
+    ("[" + ",".join(str(i) for i in range(40)) + "]", '"' + "x" * 70 + '"', False, False),
+]
+
+
+@pytest.mark.backlog_fixed("RP-976")
+@pytest.mark.parametrize(("left", "right", "lt", "eq"), RECORD_IMAGE_JSONB)
+def test_record_image_over_jsonb(left: str, right: str, lt: bool, eq: bool, dsn: str) -> None:
+    """jsonb was 0A000: it compares by memcmp of its JsonbContainer."""
+    a, b = (f"(select row('{v}'::jsonb))" for v in (left, right))
+    assert answer(dsn, f"select {a} *< {b}, {a} *= {b}") == [(lt, eq)]
+
+
+RECORD_IMAGE_MORE_ARRAYS = [
+    ("array['1'::jsonb]", "*<", "array['1.0'::jsonb]", True),
+    ("""array['{"a":1}'::jsonb, null]""", "*<", "array['1'::jsonb]", False),
+    ("array['1.1.1.1'::inet]", "*<", "array['1.1.1.1/24'::inet]", False),
+    ("array['::1'::inet, null]", "*=", "array['::1'::inet, null]", True),
+    ("array['10.0.0.0/8'::cidr]", "*<", "array['10.0.0.0/16'::cidr]", True),
+]
+
+
+@pytest.mark.backlog_fixed("RP-976")
+@pytest.mark.parametrize(("left", "op", "right", "want"), RECORD_IMAGE_MORE_ARRAYS)
+def test_record_image_over_arrays_of_jsonb_and_inet(
+    left: str, op: str, right: str, want: bool, dsn: str
+) -> None:
+    """Arrays of jsonb, inet and cidr were 0A000 (PostgreSQL 15.19)."""
+    query = f"select (select row({left})) {op} (select row({right}))"
+    assert answer(dsn, query) == [(want,)]
+
+
 RECORD_IMAGE_STILL_REFUSED = {
-    """select (select row('{"a":1}'::jsonb)) *= (select row('{"a": 1}'::jsonb))""": [(True,)],
-    "select (select row('[1,2)'::int4range)) *= (select row('[1,2)'::int4range))": [(True,)],
+    "select (select row(row(1, 'a')::ca)) *= (select row(row(1, 'a')::ca))": [(True,)],
+    "select (select row('{[1,2)}'::int4multirange)) *= (select row('{[1,2)}'::int4multirange))": [
+        (True,)
+    ],
+    "select (select row(array['1 day'::interval])) *= (select row(array['1 day'::interval]))": [
+        (True,)
+    ],
 }
 
 

@@ -404,7 +404,7 @@ fn write_json_string(s: &str, out: &mut String) {
 /// `jsonb` stores numbers as `numeric`, so the exponent is expanded
 /// (`-1.5e10` -> `-15000000000`) while a trailing zero written in the literal
 /// survives (`1.10` stays `1.10`, because that is its scale). Both measured.
-fn normalise_number(text: &str) -> String {
+pub(crate) fn normalise_number(text: &str) -> String {
     let (mantissa, exponent) = match text.split_once(['e', 'E']) {
         Some((m, e)) => (m, e.parse::<i32>().unwrap_or(0)),
         None => (text, 0),
