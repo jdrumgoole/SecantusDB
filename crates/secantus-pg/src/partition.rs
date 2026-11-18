@@ -1194,14 +1194,56 @@ impl PgHandler {
         Err(user_err("42P16", message))
     }
 
+    /// RENAME COLUMN on a partitioned table: PostgreSQL's key holds the
+    /// column's attnum, so it follows the rename; the stored key here names
+    /// the column (or holds an expression's text), so each entry is renamed
+    /// (RP-1024). Called with the table's definition before the rename.
+    pub(crate) fn rename_partition_key_column(
+        def: &mut TableDef,
+        old: &str,
+        new: &str,
+    ) -> PgWireResult<()> {
+        let before = def.clone();
+        let Ok(by) = def.extra.get_document_mut("partition_by") else {
+            return Ok(());
+        };
+        let Ok(columns) = by.get_array_mut("columns") else {
+            return Ok(());
+        };
+        for c in columns.iter_mut() {
+            let Some(text) = c.as_str() else { continue };
+            let renamed = if text == old {
+                new.to_string()
+            } else if text.starts_with('(') {
+                let inner = secantus_pgplan::rename_column_in_expression(text, &before, old, new)
+                    .map_err(|e| user_err("XX000", e.to_string()))?;
+                if inner == text {
+                    continue;
+                }
+                format!("({inner})")
+            } else {
+                continue;
+            };
+            *c = Bson::String(renamed);
+        }
+        Ok(())
+    }
+
     /// After a partitioned table's columns change, its partitions' columns
     /// follow: they are the same columns.
-    pub(crate) fn sync_partition_columns(&self, parent: &TableDef) -> PgWireResult<()> {
+    pub(crate) fn sync_partition_columns(
+        &self,
+        parent: &TableDef,
+        renamed: Option<(&str, &str)>,
+    ) -> PgWireResult<()> {
         for mut child in self.partitions_of(&parent.name)? {
             child.columns = parent.columns.clone();
+            if let Some((old, new)) = renamed {
+                Self::rename_partition_key_column(&mut child, old, new)?;
+            }
             self.rewrite_catalog(&child.name.clone(), &child)?;
             if is_partitioned(&child) {
-                self.sync_partition_columns(&child)?;
+                self.sync_partition_columns(&child, renamed)?;
             }
         }
         Ok(())

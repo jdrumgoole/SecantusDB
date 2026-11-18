@@ -96,12 +96,12 @@ def test_a_regtype_comparison_in_a_check_prints_its_oid_casts(dsn: str) -> None:
     ) == ["ALTER TABLE", [("CHECK (((pg_typeof(x))::oid = ('integer'::regtype)::oid))",)]]
 
 
-@pytest.mark.backlog("RP-1024")
+@pytest.mark.backlog_fixed("RP-1024")
 def test_a_renamed_partition_key_column_still_routes(dsn: str) -> None:
     """The partition key holds the column's attnum: after `rename column x
     to y` on a partitioned table, a row still routes and the key prints
-    `LIST (y)` on PostgreSQL 15.19 (shared reference, port 5415). Here the
-    stored key text still names `x`, so the INSERT is 42703 `column "x"
+    `LIST (y)` on PostgreSQL 15.19 (shared reference, port 5415). The
+    stored key text still named `x`, so the INSERT was 42703 `column "x"
     does not exist`. Found while working RP-939."""
     assert _script(
         dsn,
@@ -121,5 +121,71 @@ def test_a_renamed_partition_key_column_still_routes(dsn: str) -> None:
         "ALTER TABLE",
         "INSERT 0 1",
         [("LIST (y)",)],
+        "DROP TABLE",
+    ]
+
+
+@pytest.mark.backlog("RP-1052")
+def test_pg_get_partkeydef_of_an_expression_key(dsn: str) -> None:
+    """`pg_get_partkeydef` prints an expression key as ruleutils does,
+    `RANGE (((x + 1)))` on PostgreSQL 15.19 (shared reference, port 5415):
+    the key list's parentheses, the expression's own, and the OpExpr's.
+    Here one layer is missing. Found while working RP-1024."""
+    assert _script(
+        dsn,
+        [
+            "drop table if exists p1024e",
+            "create table p1024e (x int) partition by range ((x + 1))",
+            "select pg_get_partkeydef('p1024e'::regclass)",
+            "drop table p1024e",
+        ],
+    ) == ["DROP TABLE", "CREATE TABLE", [("RANGE (((x + 1)))",)], "DROP TABLE"]
+
+
+@pytest.mark.backlog("RP-1053")
+def test_a_renamed_column_is_renamed_in_a_generated_column(dsn: str) -> None:
+    """A generated column's expression holds the column's attnum: after
+    `rename column x to y` an INSERT still computes it, `(3, 6)`, on
+    PostgreSQL 15.19 (shared reference, port 5415). Here the stored
+    expression still names `x`, so the INSERT is 42703. Found while
+    working RP-1024."""
+    assert _script(
+        dsn,
+        [
+            "drop table if exists p1024g",
+            "create table p1024g (x int, g int generated always as (x * 2) stored)",
+            "alter table p1024g rename column x to y",
+            "insert into p1024g (y) values (3)",
+            "select * from p1024g",
+            "drop table p1024g",
+        ],
+    ) == ["DROP TABLE", "CREATE TABLE", "ALTER TABLE", "INSERT 0 1", [(3, 6)], "DROP TABLE"]
+
+
+@pytest.mark.backlog("RP-1054")
+def test_a_renamed_column_is_renamed_in_an_expression_index(dsn: str) -> None:
+    """An index expression and predicate hold the column's attnum: after
+    `rename column x to y` an INSERT still maintains the index, which
+    prints `(((y + 1))) WHERE (y > 0)`, on PostgreSQL 15.19 (shared
+    reference, port 5415). Here both still name `x` and the INSERT is
+    42703. Found while working RP-1024."""
+    assert _script(
+        dsn,
+        [
+            "drop table if exists p1024i",
+            "create table p1024i (x int)",
+            "create index p1024ii on p1024i ((x + 1)) where x > 0",
+            "alter table p1024i rename column x to y",
+            "insert into p1024i values (3)",
+            "select pg_get_indexdef('p1024ii'::regclass)",
+            "drop table p1024i",
+        ],
+    ) == [
+        "DROP TABLE",
+        "CREATE TABLE",
+        "CREATE INDEX",
+        "ALTER TABLE",
+        "INSERT 0 1",
+        [("CREATE INDEX p1024ii ON public.p1024i USING btree (((y + 1))) WHERE (y > 0)",)],
         "DROP TABLE",
     ]

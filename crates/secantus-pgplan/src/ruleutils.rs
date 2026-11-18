@@ -193,6 +193,9 @@ struct Printer<'a> {
     pretty: bool,
     /// `pg_get_expr` over one relation: columns print bare.
     unqualified: bool,
+    /// A scan's own relation, whose columns its quals print bare while
+    /// another relation's print prefixed (`show_scan_qual`, RP-966).
+    bare_rel: Option<String>,
     /// EXPLAIN prints the planned expression, whose constants
     /// `eval_const_expressions` has folded: an integer literal coerced to
     /// `oid` is the constant `'1259'::oid`, not `(1259)::oid`.
@@ -444,6 +447,7 @@ impl<'a> Printer<'a> {
             col_names_visible: true,
             pretty: false,
             unqualified: false,
+            bare_rel: None,
             fold_consts: false,
             markers: false,
             legacy_joins: false,
@@ -1403,7 +1407,7 @@ impl<'a> Printer<'a> {
                 }
                 let fields = names(&c.fields);
                 let (rel, col, _) = self.resolve(&fields)?;
-                if self.unqualified || rel.is_empty() {
+                if self.unqualified || rel.is_empty() || self.bare_rel.as_ref() == Some(&rel) {
                     self.buf.push_str(&q(&col));
                 } else {
                     self.buf.push_str(&format!("{}.{}", q(&rel), q(&col)));
@@ -4222,7 +4226,27 @@ fn meet_types(o: &str, t: &str) -> Option<String> {
     if (o == "oid" && is_int(t)) || (is_int(o) && t == "oid") {
         return Some("oid".to_string());
     }
-    (is_stringish(o) && is_stringish(t)).then(|| "text".to_string())
+    if !(is_stringish(o) && is_stringish(t)) {
+        return None;
+    }
+    if o == "unknown" || t == "unknown" {
+        return Some("text".to_string());
+    }
+    // One category: the first type stays unless it is the preferred one's
+    // rival that only coerces one way -- the next type is taken when the
+    // first coerces to it implicitly and it does not coerce back. Among
+    // the string types only name -> varchar / bpchar is not implicit
+    // (assignment), so a varchar or bpchar meets name at name, and text
+    // (preferred) keeps itself (RP-1045).
+    let implicit = |from: &str, to: &str| !(from == "name" && matches!(to, "varchar" | "bpchar"));
+    Some(
+        if o != "text" && implicit(o, t) && !implicit(t, o) {
+            t
+        } else {
+            o
+        }
+        .to_string(),
+    )
 }
 
 /// `set_deparse_for_query`'s column naming over one level: the USING
@@ -5845,6 +5869,15 @@ pub fn explain_sort_keys(
             _ => None,
         })
         .collect();
+    // A key qualified by the FROM's alias resolves against it (RP-1035).
+    let refname = match s.from_clause.as_slice() {
+        [item] => match item.node.as_ref() {
+            Some(N::RangeVar(rv)) => rv.alias.as_ref().map(|a| a.aliasname.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+    .unwrap_or_else(|| def.name.clone());
     let mut computed = false;
     let mut out = Vec::new();
     for item in &s.sort_clause {
@@ -5872,8 +5905,8 @@ pub fn explain_sort_keys(
                 p.fold_consts = true;
                 p.explain_windows = true;
                 p.scopes.push(vec![Rte {
-                    refname: def.name.clone(),
-                    name: def.name.clone(),
+                    refname: refname.clone(),
+                    name: refname.clone(),
                     columns: def
                         .columns
                         .iter()
@@ -6105,6 +6138,49 @@ pub fn statistics_expr_def_pretty(sql: &str, def: &TableDef) -> Option<String> {
 mod tests {
     use super::*;
     use secantus_pgcatalog::Column;
+
+    /// `select_common_type` over two string types, left to right, as
+    /// PostgreSQL 15.19 resolves `select 'a'::A union all select 'b'::B`
+    /// (RP-1045).
+    #[test]
+    fn string_types_meet_as_select_common_type_does() {
+        for (a, b, want) in [
+            ("varchar", "text", "varchar"),
+            ("text", "varchar", "text"),
+            ("varchar", "name", "name"),
+            ("name", "varchar", "name"),
+            ("bpchar", "name", "name"),
+            ("name", "text", "name"),
+            ("text", "name", "text"),
+            ("bpchar", "varchar", "bpchar"),
+            ("varchar", "bpchar", "varchar"),
+            ("name", "bpchar", "name"),
+        ] {
+            assert_eq!(meet_types(a, b).as_deref(), Some(want), "{a} meets {b}");
+        }
+    }
+
+    /// PostgreSQL 15.19: `explain select a from k x order by x.a*2` prints
+    /// `Sort Key: ((a * 2))`, the key resolved through the alias (RP-1035).
+    #[test]
+    fn a_sort_key_through_an_alias_is_deparsed() {
+        let def = TableDef::new(
+            "k",
+            vec![
+                Column::new("a", "int4", false),
+                Column::new("b", "text", false),
+            ],
+        );
+        let Some(N::SelectStmt(s)) =
+            parse_select("select a from k x order by x.a*2").and_then(|n| n.node)
+        else {
+            panic!("not a select");
+        };
+        assert_eq!(
+            explain_sort_keys(&s, &def),
+            Some(vec!["((a * 2))".to_string()])
+        );
+    }
 
     fn cat_lookup(n: &str) -> Option<TableDef> {
         match n {
@@ -6675,6 +6751,9 @@ pub struct VerboseJoin {
     /// A cross-relation WHERE conjunct is not a comparison of two columns,
     /// so no `join_quals` entry can prefix it as an inner scan's `Filter`.
     pub unprinted_filter: bool,
+    /// An ON clause compares an expression rather than two columns: only
+    /// a hash join, whose `Hash Cond` prints it, is printed (RP-966).
+    pub expr_on: bool,
 }
 
 /// [`VerboseJoin`] for `SELECT <columns or *> FROM a [LEFT] JOIN b ON
@@ -6792,6 +6871,7 @@ pub fn explain_verbose_join(
     // The ON: equalities between a column of each side.
     let mut parts = Vec::new();
     let mut all_equal = true;
+    let mut expr_on = false;
     and_clauses(j.quals.as_deref()?, &mut parts);
     for part in &parts {
         let part: &Node = part;
@@ -6812,7 +6892,48 @@ pub fn explain_verbose_join(
             Some(N::ColumnRef(c)) => resolve(c),
             _ => None,
         };
-        let ((li, lc), (ri, rc)) = (col(&a.lexpr)?, col(&a.rexpr)?);
+        let (Some((li, lc)), Some((ri, rc))) = (col(&a.lexpr), col(&a.rexpr)) else {
+            // An expression of one relation compared with an expression
+            // of the other (`e.a = k.a + 1`): its columns are needed
+            // below the join, which prints the clause itself as its
+            // `Hash Cond`, already prefixed (RP-966).
+            let mut rels = [None, None];
+            for (slot, n) in rels.iter_mut().zip([&a.lexpr, &a.rexpr]) {
+                let mut refs = Vec::new();
+                let mut other = false;
+                let mut copy = n.as_deref()?.clone();
+                crate::walk_expr(&mut copy, &mut |n| {
+                    match n.node.as_ref() {
+                        Some(N::ColumnRef(c)) => refs.push(c.clone()),
+                        Some(N::SubLink(_)) => other = true,
+                        _ => {}
+                    }
+                    Ok(())
+                })
+                .ok()?;
+                if other {
+                    return None;
+                }
+                let refs: Vec<(usize, String)> =
+                    refs.iter().map(&resolve).collect::<Option<_>>()?;
+                let i = refs.first()?.0;
+                if refs.iter().any(|r| r.0 != i) {
+                    return None;
+                }
+                *slot = Some((i, refs));
+            }
+            let [Some((li, lrefs)), Some((ri, rrefs))] = rels else {
+                return None;
+            };
+            if li == ri {
+                return None;
+            }
+            for (i, c) in lrefs.iter().chain(&rrefs) {
+                need(*i, c);
+            }
+            expr_on = true;
+            continue;
+        };
         if li == ri {
             return None;
         }
@@ -6922,6 +7043,39 @@ pub fn explain_verbose_join(
                         for (i, c) in &refs {
                             need(*i, c);
                         }
+                        // A parameterised inner scan evaluates it as its
+                        // `Filter`: its own columns bare in the plain
+                        // plan, every column prefixed under VERBOSE.
+                        let both = |bare: Option<&String>| -> Option<String> {
+                            let mut p = Printer::new(&cat, 0);
+                            p.fold_consts = true;
+                            p.bare_rel = bare.cloned();
+                            p.scopes.push(
+                                sides
+                                    .iter()
+                                    .map(|(refname, def, _)| Rte {
+                                        refname: refname.clone(),
+                                        name: refname.clone(),
+                                        columns: def
+                                            .columns
+                                            .iter()
+                                            .map(|c| (c.name.clone(), base_type(&c.pg_type)))
+                                            .collect(),
+                                        qualified_only: false,
+                                        ..Default::default()
+                                    })
+                                    .collect(),
+                            );
+                            p.expr(part)?;
+                            Some(p.buf)
+                        };
+                        if let Some(full) = both(None) {
+                            for own in [0usize, 1] {
+                                if let Some(plain) = both(Some(&sides[own].0)) {
+                                    join_quals[own].push((plain, full.clone()));
+                                }
+                            }
+                        }
                         join_filter = true;
                         unprinted_filter = true;
                         continue;
@@ -6999,6 +7153,7 @@ pub fn explain_verbose_join(
         all_equal,
         join_filter,
         unprinted_filter,
+        expr_on,
     })
 }
 
@@ -7037,4 +7192,321 @@ mod out_parameter_function_tests {
             "{got}"
         );
     }
+}
+
+/// One relation of a [`VerboseChain`] (RP-966).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ChainRel {
+    /// The relation as the node names it: `public.e`, `public.e e2`.
+    pub relation: String,
+    /// The relation as the plain plan names it: `e`, `e e2`.
+    pub plain: String,
+    /// Every column, prefixed: a scan's physical target list.
+    pub columns: Vec<String>,
+    /// Its `reltarget`, prefixed, each with whether a join above any set
+    /// of relations still needs it: the target list's columns first, then
+    /// the ON clauses' in the order `deconstruct_jointree` distributes them.
+    pub reltarget: Vec<(String, ChainNeed)>,
+    /// Each WHERE conjunct over this relation alone, as the plain plan
+    /// prints its scan's `Filter` and as VERBOSE prints it, prefixed.
+    pub quals: Vec<(String, String)>,
+}
+
+/// Why a column of a [`ChainRel`] is needed above a join.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ChainNeed {
+    /// The query's target list reads it.
+    pub output: bool,
+    /// The relations of its equivalence class: it is needed above any join
+    /// that does not hold all of them (`generate_base_implied_equalities`
+    /// adds its Vars with the class's relids).
+    pub ec_rels: Vec<usize>,
+}
+
+/// `EXPLAIN VERBOSE` of a SELECT of columns over three or more relations
+/// inner-joined left-deep on ONs of column equalities, with a WHERE whose
+/// every conjunct reads one relation (RP-966).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VerboseChain {
+    pub rels: Vec<ChainRel>,
+    pub output: Vec<String>,
+    /// Per relation: a LEFT JOIN adds it, its nullable side, so the join
+    /// that brings it in is a `Hash Left Join` hashing it alone.
+    pub nullable: Vec<bool>,
+}
+
+/// [`VerboseChain`] for `SELECT <columns> FROM a JOIN b ON a.x = b.y JOIN
+/// c ON ...`; `None` for any other shape.
+pub fn explain_verbose_chain(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<VerboseChain> {
+    if !s.group_clause.is_empty()
+        || s.having_clause.is_some()
+        || !s.distinct_clause.is_empty()
+        || !s.sort_clause.is_empty()
+        || s.limit_count.is_some()
+        || s.limit_offset.is_some()
+        || !s.window_clause.is_empty()
+    {
+        return None;
+    }
+    let [item] = s.from_clause.as_slice() else {
+        return None;
+    };
+    // Unwind the left-deep chain: the leftmost relation, then each join's
+    // right side with its ON, innermost join first.
+    let mut ons: Vec<&Node> = Vec::new();
+    let mut rights: Vec<&pg_query::protobuf::RangeVar> = Vec::new();
+    let mut node: &Node = item;
+    // Per join, innermost last until reversed: is it a LEFT JOIN.
+    let mut lefts: Vec<bool> = Vec::new();
+    let first = loop {
+        match node.node.as_ref() {
+            Some(N::JoinExpr(j)) => {
+                // A LEFT JOIN's nullable side is its right relation.
+                let left = j.jointype == pg_query::protobuf::JoinType::JoinLeft as i32;
+                if j.is_natural
+                    || !j.using_clause.is_empty()
+                    || j.alias.is_some()
+                    || (j.jointype != pg_query::protobuf::JoinType::JoinInner as i32 && !left)
+                {
+                    return None;
+                }
+                lefts.push(left);
+                let Some(N::RangeVar(rv)) = j.rarg.as_deref()?.node.as_ref() else {
+                    return None;
+                };
+                rights.push(rv);
+                ons.push(j.quals.as_deref()?);
+                node = j.larg.as_deref()?;
+            }
+            Some(N::RangeVar(rv)) => break rv,
+            _ => return None,
+        }
+    };
+    if rights.len() < 2 {
+        return None;
+    }
+    rights.reverse();
+    ons.reverse();
+    lefts.reverse();
+    // Relation i + 1 is joined by join i.
+    let nullable: Vec<bool> = std::iter::once(false)
+        .chain(lefts.iter().copied())
+        .collect();
+    let mut sides: Vec<(String, TableDef, Option<String>)> = Vec::new();
+    for rv in std::iter::once(first).chain(rights.iter().copied()) {
+        if !rv.schemaname.is_empty() {
+            return None;
+        }
+        let def = lookup(&rv.relname)?;
+        let alias = rv.alias.as_ref().map(|a| a.aliasname.clone());
+        let refname = alias
+            .clone()
+            .unwrap_or_else(|| crate::schemas::split_key(&def.name).1);
+        if sides.iter().any(|s| s.0 == refname) {
+            return None;
+        }
+        sides.push((refname, def, alias));
+    }
+    let n = sides.len();
+    let resolve = |c: &pg_query::protobuf::ColumnRef| -> Option<(usize, String)> {
+        let names: Vec<&str> = c
+            .fields
+            .iter()
+            .map(|f| match f.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let has = |i: usize, col: &str| sides[i].1.columns.iter().any(|c| c.name == col);
+        match names.as_slice() {
+            [rel, col] => {
+                let i = sides.iter().position(|s| s.0 == *rel)?;
+                has(i, col).then(|| (i, col.to_string()))
+            }
+            [col] => {
+                let mut hits = (0..n).filter(|&i| has(i, col));
+                let i = hits.next()?;
+                hits.next().is_none().then(|| (i, col.to_string()))
+            }
+            _ => None,
+        }
+    };
+    let mut order: Vec<Vec<String>> = vec![Vec::new(); n];
+    let mut outputs: Vec<(usize, String)> = Vec::new();
+    for t in &s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return None;
+        };
+        if !rt.name.is_empty() {
+            return None;
+        }
+        let Some(N::ColumnRef(c)) = rt.val.as_deref()?.node.as_ref() else {
+            return None;
+        };
+        if c.fields
+            .iter()
+            .any(|f| matches!(f.node.as_ref(), Some(N::AStar(_))))
+        {
+            return None;
+        }
+        outputs.push(resolve(c)?);
+    }
+    for (i, c) in &outputs {
+        if !order[*i].contains(c) {
+            order[*i].push(c.clone());
+        }
+    }
+    // Union-find over the columns the ONs equate.
+    let mut ecs: Vec<Vec<(usize, String)>> = Vec::new();
+    // A LEFT JOIN's ON makes no equivalence class: each of its columns
+    // is needed until the join above both of its relations
+    // (`distribute_qual_to_rels` keeps it an outer-join clause).
+    let mut outer_needs: Vec<((usize, String), [usize; 2])> = Vec::new();
+    for (on_i, on) in ons.iter().enumerate() {
+        let mut parts = Vec::new();
+        and_clauses(on, &mut parts);
+        for part in &parts {
+            let part: &Node = part;
+            let Some(N::AExpr(a)) = part.node.as_ref() else {
+                return None;
+            };
+            let op = a.name.iter().find_map(|n| match n.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            });
+            if a.kind() != pg_query::protobuf::AExprKind::AexprOp || op != Some("=") {
+                return None;
+            }
+            let col = |n: &Option<Box<Node>>| match n.as_deref()?.node.as_ref() {
+                Some(N::ColumnRef(c)) => resolve(c),
+                _ => None,
+            };
+            let (l, r) = (col(&a.lexpr)?, col(&a.rexpr)?);
+            if l.0 == r.0 {
+                return None;
+            }
+            for (i, c) in [&l, &r] {
+                if !order[*i].contains(c) {
+                    order[*i].push(c.clone());
+                }
+            }
+            // A strict ON above a LEFT JOIN that reads its nullable side
+            // reduces it to an inner join (`reduce_outer_joins`): another
+            // plan.
+            if (0..on_i + 1).any(|x| nullable[x] && x != on_i + 1 && (l.0 == x || r.0 == x)) {
+                return None;
+            }
+            if lefts[on_i] {
+                outer_needs.push((l.clone(), [l.0, r.0]));
+                outer_needs.push((r.clone(), [l.0, r.0]));
+                continue;
+            }
+            let li = ecs.iter().position(|e| e.contains(&l));
+            let ri = ecs.iter().position(|e| e.contains(&r));
+            match (li, ri) {
+                (Some(x), Some(y)) if x == y => {}
+                (Some(x), Some(y)) => {
+                    let moved = ecs.remove(x.max(y));
+                    ecs[x.min(y)].extend(moved);
+                }
+                (Some(x), None) => ecs[x].push(r),
+                (None, Some(y)) => ecs[y].push(l),
+                (None, None) => ecs.push(vec![l, r]),
+            }
+        }
+    }
+    // Each WHERE conjunct must read exactly one relation: its scan's
+    // `Filter`. Its columns are not in the `reltarget`.
+    let mut quals: Vec<Vec<(String, String)>> = vec![Vec::new(); n];
+    if let Some(w) = s.where_clause.as_deref() {
+        let none_lookup = |_: &str| None;
+        let none_views = |_: &str| None;
+        let cat = Catalog {
+            lookup: &none_lookup,
+            view_sql: &none_views,
+            home_schema: None,
+        };
+        let print = |part: &Node, i: usize, unqualified: bool| -> Option<String> {
+            let (refname, def, _) = &sides[i];
+            let mut p = Printer::new(&cat, 0);
+            p.unqualified = unqualified;
+            p.fold_consts = true;
+            p.scopes.push(vec![Rte {
+                refname: refname.clone(),
+                name: refname.clone(),
+                columns: def
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), base_type(&c.pg_type)))
+                    .collect(),
+                qualified_only: false,
+                ..Default::default()
+            }]);
+            p.expr(part)?;
+            Some(p.buf)
+        };
+        let mut parts = Vec::new();
+        and_clauses(w, &mut parts);
+        for part in &parts {
+            let part: &Node = part;
+            let mut readers = (0..n).filter(|&i| print(part, i, true).is_some());
+            let i = readers.next()?;
+            if readers.next().is_some() {
+                return None;
+            }
+            // A WHERE on the nullable side is not pushed below the outer
+            // join (and may reduce it to an inner one).
+            if nullable[i] {
+                return None;
+            }
+            quals[i].push((print(part, i, true)?, print(part, i, false)?));
+        }
+    }
+    let pre = |i: usize, c: &str| format!("{}.{}", q(&sides[i].0), q(c));
+    let rels = sides
+        .iter()
+        .enumerate()
+        .map(|(i, (_, def, alias))| {
+            let (schema, bare) = crate::schemas::split_key(&def.name);
+            let suffix = alias
+                .as_ref()
+                .map(|a| format!(" {}", q(a)))
+                .unwrap_or_default();
+            ChainRel {
+                relation: format!("{}.{}{suffix}", q(&schema), q(&bare)),
+                plain: format!("{}{suffix}", q(&bare)),
+                columns: def.columns.iter().map(|c| pre(i, &c.name)).collect(),
+                reltarget: order[i]
+                    .iter()
+                    .map(|c| {
+                        let key = (i, c.clone());
+                        let mut ec_rels: Vec<usize> = ecs
+                            .iter()
+                            .find(|e| e.contains(&key))
+                            .map(|e| e.iter().map(|m| m.0).collect())
+                            .unwrap_or_default();
+                        for (_, rels) in outer_needs.iter().filter(|(k, _)| *k == key) {
+                            ec_rels.extend(rels);
+                        }
+                        ec_rels.sort_unstable();
+                        ec_rels.dedup();
+                        let need = ChainNeed {
+                            output: outputs.contains(&key),
+                            ec_rels,
+                        };
+                        (pre(i, c), need)
+                    })
+                    .collect(),
+                quals: quals[i].clone(),
+            }
+        })
+        .collect();
+    Some(VerboseChain {
+        rels,
+        output: outputs.iter().map(|(i, c)| pre(*i, c)).collect(),
+        nullable,
+    })
 }

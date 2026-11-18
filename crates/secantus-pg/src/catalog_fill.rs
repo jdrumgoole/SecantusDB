@@ -1202,6 +1202,37 @@ impl PgHandler {
             .collect()
     }
 
+    /// The tables `relids` name, with each one's direct parents (which
+    /// `attinhcount` / `attislocal` look up by name), as `(oid, def)` in
+    /// `defs`' order -- the entries the every-table list would hold for
+    /// them. `None` when a catalog cannot be read.
+    fn tables_of_relids<'a>(
+        &self,
+        defs: &'a [Arc<TableDef>],
+        relids: &[i64],
+    ) -> Option<Vec<(i64, &'a TableDef)>> {
+        let mut names: Vec<String> = Vec::new();
+        for oid in relids.iter().filter(|o| **o != 0) {
+            names.extend(self.relation_names_of_oid(*oid)?.0);
+        }
+        let parents: Vec<String> = defs
+            .iter()
+            .filter(|t| names.contains(&t.name))
+            .flat_map(|t| {
+                let mut p = Self::inherited_parents(t);
+                p.extend(crate::partition::parent_of(t).map(str::to_string));
+                p
+            })
+            .collect();
+        names.extend(parents);
+        Some(
+            defs.iter()
+                .filter(|t| names.contains(&t.name))
+                .filter_map(|t| Some((self.relation_oid(&t.name)?, &**t)))
+                .collect(),
+        )
+    }
+
     /// Fill the extra columns of `name`'s rows with PostgreSQL's values.
     pub(crate) fn fill_catalog_columns(&self, name: &str, def: &TableDef, rows: &mut [Document]) {
         let extra = extra_columns(name);
@@ -1226,15 +1257,31 @@ impl PgHandler {
         };
         // Every oid from one map: a lookup per table re-fetched the catalog
         // documents for each (RP-911).
-        let oids = if defs.is_empty() {
-            Arc::default()
-        } else {
-            self.relation_oids().unwrap_or_default()
+        // `pg_attribute`'s rows of a few relations need those tables and
+        // their parents alone, found by oid through the relation index, as
+        // PostgreSQL reads `pg_class` by oid for each (RP-911).
+        let few = (name == "pg_attribute" && !defs.is_empty())
+            .then(|| {
+                let mut relids: Vec<i64> = rows.iter().map(|r| int(get(r, "attrelid"))).collect();
+                relids.sort_unstable();
+                relids.dedup();
+                (relids.len() <= 8).then_some(relids)
+            })
+            .flatten()
+            .and_then(|relids| self.tables_of_relids(&defs, &relids));
+        let tables: Vec<(i64, &TableDef)> = match few {
+            Some(tables) => tables,
+            None => {
+                let oids = if defs.is_empty() {
+                    Arc::default()
+                } else {
+                    self.relation_oids().unwrap_or_default()
+                };
+                defs.iter()
+                    .filter_map(|t| Some((Self::oid_in(&oids, &t.name)?, &**t)))
+                    .collect()
+            }
         };
-        let tables: Vec<(i64, &TableDef)> = defs
-            .iter()
-            .filter_map(|t| Some((Self::oid_in(&oids, &t.name)?, &**t)))
-            .collect();
         // By oid, the first of each: every row asks for its relation's
         // several times, and a scan of the list per ask made the fill
         // quadratic in the number of tables (RP-715).

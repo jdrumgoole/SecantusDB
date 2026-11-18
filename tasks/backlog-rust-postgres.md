@@ -1124,132 +1124,21 @@ one beside it.
 
 ## Found by a CI run (2026-11-09)
 
-- [ ] **OPEN — the first statement after DDL still rebuilds per-version
-      session state from every table.** Every statement that may change the
-      catalog moves the version `bump_catalog_version` keeps, and the next
-      statement on each connection republishes what the planner reads
-      (`install_session_state`, `publish_user_types`): the tableoid
-      expressions, the relations, the constraint and index definitions and
-      the comments, each listed from every table. PostgreSQL invalidates
-      only the cache entries of the rows a statement changed (`inval.c`).
-      psql's `\d` collation subquery straight after a `CREATE TABLE`, debug
-      build, 2026-11-13: about 0.010 s with no other table and 0.014 s with
-      800 (PostgreSQL 15.19: 0.33 ms with 200, 0.20 ms with 400). Fixed so
-      far: keyed `pg_type` reads, unchanged table definitions reused across
-      versions (RP-715); the republication reads the definitions in place
-      with one oid map, and the storage keeps each collection's index list
-      until a change of that collection (2026-11-12, from 0.036 s at 800);
-      the index relations derived once per catalog version and planner
-      generation rather than per ask, one oid map for the comments,
-      constraint definitions and `pg_attribute` fill instead of a catalog
-      fetch per table, and a composite found by name through a map rather
-      than a scan of every row type per described column (2026-11-13, from
-      0.027 s at 800); the type catalog's documents and the table
-      definitions shared (`Arc`) across versions, an unchanged one reused
-      by its stored bytes and its sorted place carried forward, and the
-      composite listings built once per version (2026-11-13, from 0.021 s
-      to 0.018 s at 800, 0.010 s with none); the row types, the plain
-      tables' `tableoid` texts and the publishable relations published as
-      the catalog documents they derive from and derived at a statement's
-      first lookup, a `pg_catalog` type's name answered without them (in
-      the planner and in the RowDescription's wire types), a keyed
-      `pg_attribute` read decoding its own relation's composite alone, and
-      each table's index list read in place (2026-11-13, to 0.014 s at
-      800); the constraint texts rendered and every table's comments
-      listed at a statement's first lookup of one (the texts render under
-      the session state of that lookup, as `pg_get_constraintdef` does in
-      PostgreSQL; a changed search path is part of the publication's key),
-      a table with no key, unique constraint or index of its own skipped
-      before any oid lookup in the index relations, and the oid map built
-      only when a table has one (2026-11-13: the republication per catalog
-      version at about 800 tables, sampled, from 3.4 ms to 2.6 ms); a
-      table's index list read only when the storage's index-name map
-      (RP-928's, kept current from the index catalog's change log) says it
-      holds an index, and the relations for `regclass` listed at a
-      statement's first relation lookup (2026-11-15: a `SELECT 1` straight
-      after a `CREATE TABLE` at 800 tables, median of a loop, from 8.1 ms
-      to 4.0 ms; the collation query's gap ratio from 0.017/0.013 s to
-      0.013/0.010 s); the composite and table catalogs patched from the
-      storage's catalog key log (`Storage::catalog_doc_changes_since`:
-      each committed `__`-collection document write's `_id`, read off its
-      oplog entry and logged at commit, as `inval.c` queues the catalog
-      rows a transaction changed), so the statement after DDL re-reads
-      only the documents its commit changed (2026-11-15: their full reads
-      and decodes gone from a profile at 800 tables; the gap ratio, best
-      of five, from 16.6/13.7 ms to 12.5/10.4 and 15.0/12.2 ms, one run
-      in three under the bar; a loop's median 16.3 ms at 800 against
-      15.8 ms with none). What is left, sampled at 800 tables (debug
-      build, 2026-11-15), each a pass over every relation per catalog
-      version, about 2 ms in all: `publish_user_types` republishing every
-      table's row type, `install_session_state`'s per-table
-      closures and `inheritance`, `patch_table_defs` copying the 800
-      definitions' stored bytes, and `relation_oids` listing every
-      relation at the collation query's `regclass` lookup. (A per-table
-      memo of the index relations by the identity of their inputs was
-      measured slower than deriving them, 2026-11-13.) The faithful
-      end state keys the published state per relation and invalidates
-      what the key log names; a user relation's entries depend on more
-      than its own catalog row (its grants, its inheritance parents and
-      children, the foreign keys naming it, the types its columns name),
-      so each key has to carry them, or a stale entry is a wrong answer.
-      Its gap test is a timing ratio and can pass once by noise (a
-      `gate_pg.sh` backlog step on 2026-11-13 reported it `FIXED?`, then
-      it failed three of three runs alone): rerun it alone before closing.
-      (2026-11-15: whether the session holds a temp relation, for its temp
-      namespace, no longer lists every relation -- it forced the deferred
-      `regclass` list on every statement after DDL; a temp sequence is
-      flagged when the list is deferred. The gap test then passed five of
-      ten alone, and RP-928's eight of ten, at a load average near 14.)
-      (2026-11-15, after RP-928's `relation_oid` became a keyed lookup:
-      still five of ten alone at a load average near 12. A `sample` of a
-      `CREATE TABLE` loop at 800 tables, debug build, put the statement
-      start's republication at about half the samples: `patch_table_defs`
-      copying every definition (~10%), `publish_user_types`' index
-      relations (~6%), its `relations_derivation` temp check and the
-      `session_has_temp` scans (~4% each), `inheritance` (~3%). Each is a
-      linear pass, none quadratic, so what is left is the per-relation
-      keying above, not another lookup to swap in.)
-      (2026-11-15, in a pg-batch lane, cause of the spread unknown: it passed
-      in two of four runs, so the remainder sits at its tenth's edge; a
-      FIXED? from one run is not a fix, and a close needs it to pass
-      every run.)
-      (2026-11-17: still open. Its gap test passed CI once more, PR #2794,
-      a min of five per server taken apart; a debug build here measured a
-      ratio of 1.23 to 1.29 in ten of ten runs of fifteen rounds. The test
-      now takes fifteen paired rounds and bounds their median, and failed
-      ten of ten serially and three of three under `-n 9`.)
-      (2026-11-17, platform: CI's pg-oracle (backlog) step builds the same
-      `dev` profile binary, `crates/secantus-pg/target/debug/secantusd-pg`,
-      and passed the paired-median test on x86_64 Linux (job 134018142698,
-      PR #2821); this arm64 Mac failed six of six more runs of that build at
-      a median ratio of 1.26-1.27 (14 ms against 18 ms; the test now prints
-      each round's ratio). The gap shows only on macOS here, so its test
-      runs `only_on("darwin")`, and verify reports it ELSEWHERE on CI. Not
-      separated: macOS from arm64 (no arm64 Linux or x86_64 macOS runner
-      measured). Close it when it passes every run on darwin.)
-      Its gap test sits at the budget's edge: on 2026-11-18 one build
-      passed it 2 of 3 runs at load ~10, so a FIXED? needs repeated runs.
-      Backlog-ID: RP-911
-      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
 ## Found while working RP-911 (2026-11-15)
 
-## Found while working RP-927 (2026-11-14)
+## Found while working RP-970 (2026-11-18)
 
-- [ ] **OPEN — psql's `\d` column query straight after DDL builds every
-      user type for a column of a user type.** The collation subquery
-      (`COLLATION_QUERY`) over a table `(a e1, b e2)` of two user enums,
-      first after its `CREATE TABLE`: PostgreSQL 15.19 takes 0.15 ms with
-      no other table and 0.22 ms with 400 (private cluster); a debug
-      `secantusd-pg` 22 ms and 79 ms. Since RP-927 a `pg_type` key of a
-      built-in oid builds alone, but a user type's key builds every enum,
-      composite (every table's row type) and range (`build_catalog_rows`'s
-      `user_types`), and a second user key in a message cycle builds every
-      row. PostgreSQL reads the one row through the oid index
-      (`SearchSysCache`): the faithful fix builds a user key's row from
-      that type's catalog entry alone.
-      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_over_two_user_types_costs_the_same_at_400_tables
-      Backlog-ID: RP-970
+- [ ] **OPEN — `'_custom'::regtype` names `custom`'s array, not the type
+      named `_custom`.** After `CREATE TYPE _custom AS ENUM ('b')` and then
+      `CREATE TYPE custom AS ENUM ('c')`, PostgreSQL 15.19 resolves
+      `'_custom'::regtype` to the enum `_custom` (and names `custom`'s array
+      `___custom`, which `pg_type` here already lists). `secantusd-pg`
+      resolves it to `custom`'s array type: a `_`-prefixed name is read as
+      an array of the rest before a type of that exact name is looked for.
+      PostgreSQL's `typenameTypeId` looks the name up in `pg_type` as given.
+      Verify: tests/backlog/test_rp_found_rp970.py::test_an_underscore_type_name_resolves_to_that_type
+      Backlog-ID: RP-1055
 
 ## Found by a CI run (2026-11-07)
 
@@ -1759,16 +1648,105 @@ a regression test.
       conjuncts in the one `Join Filter`.) (Since 2026-11-17 a WHERE
       comparison of an expression with the other relation's column does
       too, as an inner `Index Cond` or a `Join Filter`, both already
-      prefixed: `VerboseJoin::unprinted_filter`.) Still the plain plan:
-      such an expression evaluated as the parameterised inner index
-      scan's `Filter` (`on e.a < k.a where e.a + k.a < 7`, PostgreSQL's
-      `Filter: ((e.a + k.a) < 7)`): `join_quals` holds only
-      column-to-column texts, so `attach_verbose_nested_loop` declines.
-      The fix is to print each cross-relation conjunct with a Printer
-      over both relations' scopes, bare for the scan's own columns, in
-      place of the hand-built `join_quals` strings.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of an inner index scan filtering an expression of both]
+      prefixed: `VerboseJoin::unprinted_filter`.) (Since 2026-11-18 such
+      an expression evaluated as the parameterised inner index scan's
+      `Filter` does too, printed over both relations' scopes with the
+      scan's own columns bare, `Printer::bare_rel`.) (Since 2026-11-18 a
+      left-deep chain of hash joins over three or more relations, inner
+      joins on column equalities with no WHERE, prints every node's
+      `Output`: each join its outer side's columns then its inner side's,
+      kept while a relation of their equivalence class is still outside
+      it, as `generate_base_implied_equalities` gives them that class's
+      relids: `ruleutils::explain_verbose_chain`,
+      `explain::attach_verbose_chain`.) (Since 2026-11-18 a two-relation
+      hash join or Materialize loop whose ON compares expressions of one
+      relation each, `e.a = k.a + 1`, prints every node's `Output`:
+      `VerboseJoin::expr_on`; such an ON into a parameterised index scan
+      or a Memoize still prints the plain plan.) (Since 2026-11-18 such a
+      chain with a WHERE whose conjuncts each read one relation prints them
+      as its scans' `Filter`, prefixed, their columns kept out of a hashed
+      scan's `Output` unless needed above: `ChainRel::quals`.) (Since
+      2026-11-18 a chain whose topmost join is a LEFT JOIN prints every
+      node's `Output`, the outer ON's columns kept out of the inner
+      equivalence classes: `VerboseChain::left_join`.) (Since 2026-11-18
+      a LEFT JOIN at any level of such a chain does too, each hashing its
+      nullable relation alone: `VerboseChain::nullable`.) Still the plain
+      plan: a nested loop or merge join in a chain, a RIGHT or FULL join in
+      one, a LEFT JOIN an inner ON above reduces to an inner one (RP-1061
+      first), a WHERE on a LEFT JOIN's nullable side (its plain plan differs
+      too: `... left join e e2 on e2.a = k.a where e2.b <> 'x'` is reduced
+      and reordered on PostgreSQL 15.19, `where e2.b is null` a `Hash Right
+      Join` of `e2` and `k` under a Hash), and a WHERE conjunct
+      reading two of its relations (`explain (verbose, costs off) select
+      e.b, e2.b from e join k on e.a = k.a join e e2 on e2.a = e.a where
+      e2.b <> k.b` on PostgreSQL 15.19 prints each node's `Output` and the
+      `Join Filter` on the join below it; that query's plain plan also
+      joins in another order here, RP-1059).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a three-way join with a join filter]
       Backlog-ID: RP-966
+
+- [ ] **A WHERE-filtered relation of a three-way join is not joined
+      first.** `explain (costs off) select e.b, e2.b from e join k on e.a
+      = k.a join e e2 on e2.a = k.a where e2.b <> 'x'` (`e`, `k`
+      analysed, 1000 rows) joins `(e join k) join e2`; PostgreSQL 15.19
+      joins `(e2 join e) join k`, the filtered `e e2` the outermost scan,
+      `Hash Cond: (e2.a = e.a)` below `Hash Cond: (e.a = k.a)`. Size the
+      join-order search's costing of the filtered relation from a probe
+      of each candidate's cost. The same query with `where e2.b <> k.b`
+      and `on e2.a = e.a` is bushy on PostgreSQL 15.19, `e` against a
+      Hash of `(e2 join k)` with the `Join Filter`; here left-deep `(e
+      join k) join e2`. Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a filtered relation of a three-way join is joined first]
+      Backlog-ID: RP-1059
+
+- [ ] **A LEFT JOIN nothing reads is not removed.** `explain (costs
+      off) select e.b from e left join k on e.a = k.a` (`k.a` the primary
+      key) is a `Hash Left Join` here; PostgreSQL 15.19 prints `Seq Scan on
+      e` alone, as `remove_useless_joins` drops a LEFT JOIN whose inner side
+      is unique on the ON's columns and read nowhere above
+      (`join_is_removable`). Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join nothing reads is removed]
+      Backlog-ID: RP-1060
+
+- [ ] **A LEFT JOIN reduced to inner keeps its ON out of the
+      equivalence class.** `explain (costs off) select e.b, k.b from e
+      left join k on e.a = k.a join e e2 on e2.a = k.a` prints the top
+      `Hash Cond: (k.a = e2.a)`; PostgreSQL 15.19, which reduces the LEFT
+      JOIN to an inner one (`reduce_outer_joins`) before
+      `deconstruct_jointree`, merges `e.a = k.a` into the class with
+      `e2.a` and prints `Hash Cond: (e.a = e2.a)` (and no `Inner Unique`
+      on that join under VERBOSE). Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join reduced to inner joins the chain on its class]
+      Backlog-ID: RP-1061
+
+- [ ] **A hash join on an expression and a column pair hashes the
+      expression's side.** `explain select e.b from e join k on e.a = k.a
+      + 1 and e.b = k.b` (both analysed, 1000 rows) hashes `k` and prints
+      `Hash Cond: ((e.a = (k.a + 1)) AND (e.b = k.b))`; PostgreSQL 15.19
+      hashes `e` (`Hash Join (cost=30.00..54.75 rows=100 width=3)`, `Hash
+      Cond: (((k.a + 1) = e.a) AND (k.b = e.b))`, `k` the probe side). With
+      the expression clause alone the sides match (RP-981). Found while
+      working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash join on an expression and a column pair hashes the column side]
+      Backlog-ID: RP-1058
+
+- [ ] **EXPLAIN drops the Sort of an ORDER BY over a join with no
+      LIMIT.** `explain (costs off) select e.b, k.b from e join k on e.a =
+      k.a order by k.a` (both tables analysed, 1000 rows) prints the Hash
+      Join alone; PostgreSQL 15.19 prints `Sort` with `Sort Key: k.a` above
+      it. Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by over a join prints its sort]
+      Backlog-ID: RP-1056
+
+- [ ] **A join's Hash Cond names a different member of the equivalence
+      class than PostgreSQL's.** `explain (costs off) select k.b, e2.b
+      from e join k on e.a = k.a join e e2 on e2.a = k.a` (`e`, `k`
+      analysed, 1000 rows) prints the upper join's `Hash Cond: (k.a =
+      e2.a)`; PostgreSQL 15.19 prints `(e.a = e2.a)` over the same plan
+      shape, the clause `generate_join_implied_equalities` builds from the
+      class's members in their order. Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a three-way hash join names the class's first member]
+      Backlog-ID: RP-1057
 
 - [ ] **A hash join whose WHERE compares an expression of one relation
       with the other's column is priced at zero.** `explain select e.b
@@ -2598,15 +2576,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
       does not add.
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_the_remaining_system_views
       Backlog-ID: RP-798
-- [ ] **`pg_get_viewdef` types a `name IN (text, unknown)` list as
-      text.** `create view v as select relname from pg_class where relname
-      in ('g'::text, 'h')` prints `(pg_class.relname = ANY
-      (ARRAY[('g'::text)::name, 'h'::name]))` on PostgreSQL 15.19:
-      `select_common_type` keeps the first type, `name`, because text and
-      name each coerce implicitly to the other. Here the printer takes
-      text (`(pg_class.relname)::text = ANY (ARRAY['g'::text, 'h'::text])`).
-      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_a_name_in_list_with_a_text_element
-      Backlog-ID: RP-1045
 
 ## Found while working RP-798 (2026-11-18)
 
@@ -2646,19 +2615,28 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415).
 
-- [ ] **A renamed partition key column leaves the key naming the old
-      column, and the table takes no more rows.** After `alter table p939k
-      rename column x to y` on `p939k (x int) partition by list (x)`,
-      PostgreSQL 15.19 still routes `insert into p939k values (1)` and
-      prints the key `LIST (y)`: the key holds the column's attnum. Here
-      the stored key text still names `x`, so the INSERT is 42703 `column
-      "x" does not exist`. The RENAME COLUMN arm renames the column in
-      stored CHECKs (`rename_column_in_expression`, RP-939); the partition
-      key, the partitions' bounds, and any other stored expression text
-      (defaults, generated columns, index expressions and predicates) were
-      not checked.
-      Verify: tests/backlog/test_rp_found_rp860.py::test_a_renamed_partition_key_column_still_routes
-      Backlog-ID: RP-1024
+- [ ] **`pg_get_partkeydef` prints an expression key with one pair of
+      parentheses too few.** `create table p (x int) partition by range
+      ((x + 1))` prints `RANGE (((x + 1)))` on PostgreSQL 15.19 (the key
+      list's, the expression's, the OpExpr's); here `RANGE ((x + 1))`.
+      Verify: tests/backlog/test_rp_found_rp860.py::test_pg_get_partkeydef_of_an_expression_key
+      Backlog-ID: RP-1052
+- [ ] **A renamed column leaves a generated column naming the old one,
+      and the table takes no more rows.** On `(x int, g int generated
+      always as (x * 2) stored)`, after `rename column x to y`, PostgreSQL
+      15.19 inserts `(3, 6)`; here the stored expression still names `x`,
+      42703. Faithful: rename it as the RENAME COLUMN arm does for CHECKs
+      and the partition key (`rename_column_in_expression`).
+      Verify: tests/backlog/test_rp_found_rp860.py::test_a_renamed_column_is_renamed_in_a_generated_column
+      Backlog-ID: RP-1053
+- [ ] **A renamed column leaves an expression index naming the old one,
+      and the table takes no more rows.** After `create index i on t ((x +
+      1)) where x > 0` and `rename column x to y`, PostgreSQL 15.19 inserts
+      and prints `(((y + 1))) WHERE (y > 0)`; here both still name `x` and
+      the INSERT is 42703. Column defaults measured fine (they cannot name
+      a column).
+      Verify: tests/backlog/test_rp_found_rp860.py::test_a_renamed_column_is_renamed_in_an_expression_index
+      Backlog-ID: RP-1054
 
 ## Found while working RP-751 (2026-11-10)
 
@@ -2764,13 +2742,6 @@ statement is VALUES-only and runs there as written. The gap test is in
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop over a filtered inner relation is priced]
       Backlog-ID: RP-1038
 
-- [ ] **A computed ORDER BY key written through an alias prints its
-      synthetic name.** `explain select a from k x order by x.a*2` prints
-      `Sort Key: __order0`; PostgreSQL 15.19 prints `Sort Key: ((a * 2))`
-      (the unaliased `order by a*2` already does). The plain plan's key
-      text is not deparsed against the alias's range-table entry.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a computed sort key through an alias prints its expression]
-      Backlog-ID: RP-1035
 
 - [ ] **A Sort on a computed key is priced in one shape only.** Since
       2026-11-17 (RP-966) a Sort straight over one relation's scan whose
@@ -2827,14 +2798,6 @@ statement is VALUES-only and runs there as written. The gap test is in
       Measured on the 15.19 reference on port 5415.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash join written inner side first is inner unique]
       Backlog-ID: RP-1030
-- [ ] **A structured EXPLAIN VERBOSE names no `Schema` on a scan.**
-      `explain (verbose, costs off, format json) select * from e` prints
-      `"Relation Name": "e", "Schema": "public", "Alias": "e"` in
-      PostgreSQL 15.19 (`ExplainScanTarget` adds the schema under
-      VERBOSE); here no `Schema` key, on every scan of every structured
-      format. Measured on the 15.19 reference on port 5415.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a structured verbose scan names its schema]
-      Backlog-ID: RP-1031
 - [ ] **A Limit over a Sort of a filtered scan is not priced.**
       PostgreSQL 15.19 prints `explain select a from k where a > 5 order by
       b desc limit 3` (`k` analysed, 1,000 rows) as `Limit
@@ -2868,20 +2831,6 @@ statement is VALUES-only and runs there as written. The gap test is in
 
 ## Found while working RP-981 (2026-11-17)
 
-- [ ] **EXPLAIN names a temporary table's scan by its schema and repeats
-      it as an alias.** PostgreSQL 15.19 prints `explain select * from t`
-      (`t` a temporary table) as `Seq Scan on t (cost=0.00..35.50
-      rows=2550 width=4)`, and `... from t x` as `Seq Scan on t x`; here
-      `Seq Scan on pg_temp_22.t t` and `Seq Scan on pg_temp_22.t x`: the
-      scan's relation name is the temp schema's storage key, which the
-      join-leaf alias logic then sees as differing from the alias. Only
-      VERBOSE prints a schema (`pg_temp_3.t`). Measured on the 15.19
-      reference on port 5415. The same for any schema but `public` on the
-      search path: with `set search_path = q1`, `Seq Scan on q1.t t` where
-      PostgreSQL prints `Seq Scan on t`, in a join's scans too (found while
-      working RP-978, 2026-11-18).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan of a temporary table names it bare], tests/backlog/test_rp_explain_costs.py::test_plan[a scan of an aliased temporary table names it and its alias], tests/backlog/test_rp_explain_costs.py::test_plan[a scan of a table in a schema on the search path names it bare]
-      Backlog-ID: RP-1029
 
 ## Found while working RP-971 (2026-11-17)
 

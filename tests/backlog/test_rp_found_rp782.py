@@ -443,7 +443,7 @@ def test_pg_get_viewdef_keeps_name_under_in_and_regex(dsn: str) -> None:
 
 # `select_common_type` over `name` and `text` keeps `name`: each coerces
 # implicitly to the other, so the first type stands.
-@pytest.mark.backlog("RP-1045")
+@pytest.mark.backlog_fixed("RP-1045")
 def test_pg_get_viewdef_of_a_name_in_list_with_a_text_element(dsn: str) -> None:
     with _connect(dsn) as c:
         got = [

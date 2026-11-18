@@ -1547,6 +1547,49 @@ fn costs_text(n: &PlanNode) -> String {
 
 /// The `QUERY PLAN` text rows, PostgreSQL's layout: a child at depth d is
 /// `2 + 6(d-1)` spaces and `->  `, and a node's details sit at `2 + 6d`.
+/// Name each scanned relation as `ExplainScanTarget` does (RP-1029,
+/// RP-1031): its bare name, the schema only under VERBOSE (the session's
+/// own temporary schema as `pg_temp`, `get_namespace_name_or_temp`), and
+/// the alias only when it differs from that bare name. The plan carries
+/// a relation's storage key (`q1.t`, `pg_temp_5.t`) until here.
+pub(crate) fn name_relations(n: &mut PlanNode, verbose: bool) {
+    if let Some(i) = n.props.iter().position(|(k, _)| k == "Relation Name") {
+        let key = n.props[i].1.clone();
+        let (schema, bare) = secantus_pgplan::schemas::split_key(&key);
+        let schema = if schema.starts_with("pg_temp_") {
+            "pg_temp".to_string()
+        } else {
+            schema
+        };
+        if key != bare {
+            if let Some(at) = n.name.find(&format!(" on {key}")) {
+                let rest = &n.name[at + 4 + key.len()..];
+                if rest.is_empty() || rest.starts_with(' ') {
+                    let alias = rest.trim_start();
+                    let shown = if verbose {
+                        format!("{schema}.{bare}")
+                    } else {
+                        bare.clone()
+                    };
+                    let mut name = format!("{} on {shown}", &n.name[..at]);
+                    if !alias.is_empty() && alias != bare {
+                        name.push(' ');
+                        name.push_str(alias);
+                    }
+                    n.name = name;
+                }
+            }
+            n.props[i].1 = bare;
+        }
+        if verbose && !n.props.iter().any(|(k, _)| k == "Schema") {
+            n.props.insert(i + 1, ("Schema".into(), schema));
+        }
+    }
+    for c in &mut n.children {
+        name_relations(c, verbose);
+    }
+}
+
 pub(crate) fn render_text(
     root: &PlanNode,
     options: &ExplainOptions,
@@ -3369,6 +3412,28 @@ mod join_type_tests {
     }
 
     #[test]
+    fn a_scan_names_its_relation_bare_and_its_schema_only_under_verbose() {
+        // PostgreSQL 15.19 (RP-1029): `Seq Scan on t x` for a temporary
+        // `t`, `Seq Scan on pg_temp.t x` under VERBOSE.
+        let scan = |name: &str| {
+            let mut n = PlanNode::new(name.to_string());
+            n.props.push(("Relation Name".into(), "pg_temp_5.t".into()));
+            n
+        };
+        let mut plain = scan("Seq Scan on pg_temp_5.t x");
+        name_relations(&mut plain, false);
+        assert_eq!(plain.name, "Seq Scan on t x");
+        assert_eq!(plain.props, vec![("Relation Name".into(), "t".into())]);
+        let mut bare = scan("Seq Scan on pg_temp_5.t t");
+        name_relations(&mut bare, false);
+        assert_eq!(bare.name, "Seq Scan on t");
+        let mut verbose = scan("Seq Scan on pg_temp_5.t x");
+        name_relations(&mut verbose, true);
+        assert_eq!(verbose.name, "Seq Scan on pg_temp.t x");
+        assert_eq!(verbose.props[1], ("Schema".into(), "pg_temp".into()));
+    }
+
+    #[test]
     fn a_computed_sort_key_is_a_resjunk_entry_under_verbose() {
         // PostgreSQL 15.19, `explain verbose select a from k order by
         // a+1 desc` (RP-966).
@@ -3555,6 +3620,11 @@ pub(crate) fn attach_verbose_join(
         return;
     }
     if root.name.starts_with("Nested Loop") {
+        // An ON over an expression prints as the Materialize loop's
+        // `Join Filter`, already prefixed; an index scan cannot serve it.
+        if v.expr_on && !(root.children.len() == 2 && root.children[1].name == "Materialize") {
+            return;
+        }
         attach_verbose_nested_loop(root, v);
         return;
     }
@@ -3881,6 +3951,113 @@ pub(crate) fn attach_scan_alias(root: &mut PlanNode, alias: &Option<String>) {
     }
 }
 
+/// `EXPLAIN VERBOSE` of a left-deep chain of hash joins over three or
+/// more relations (RP-966): each join prints its `build_joinrel_tlist`
+/// (its outer side's columns, then its inner side's, each still needed
+/// above it), the top join the query's target list, each Hash its inner
+/// scan's `reltarget` (`CP_SMALL_TLIST`), and the outermost scan its
+/// physical target list. Any other plan prints as without VERBOSE.
+pub(crate) fn attach_verbose_chain(
+    root: &mut PlanNode,
+    chain: &Option<secantus_pgplan::ruleutils::VerboseChain>,
+) {
+    use secantus_pgplan::ruleutils::{ChainNeed, VerboseChain};
+    type Tlist = Vec<(String, ChainNeed)>;
+    fn walk(
+        n: &mut PlanNode,
+        c: &VerboseChain,
+        under_hash: bool,
+        apply: bool,
+    ) -> Option<(Vec<usize>, Tlist)> {
+        if let Some(plain) = n.name.strip_prefix("Seq Scan on ") {
+            if !n.children.is_empty() {
+                return None;
+            }
+            let i = c.rels.iter().position(|r| r.plain == plain)?;
+            let r = &c.rels[i];
+            // Its WHERE conjuncts, and nothing else, are its `Filter`.
+            let filters: Vec<&str> = n
+                .details
+                .iter()
+                .map(|(k, v)| (k == "Filter").then_some(v.as_str()))
+                .collect::<Option<_>>()?;
+            let want: Vec<&str> = r.quals.iter().map(|(b, _)| b.as_str()).collect();
+            let expected = match want.as_slice() {
+                [] => None,
+                [one] => Some(one.to_string()),
+                many => Some(format!("({})", many.join(" AND "))),
+            };
+            if filters.first().map(|f| f.to_string()) != expected || filters.len() > 1 {
+                return None;
+            }
+            if !apply {
+                return Some((vec![i], r.reltarget.clone()));
+            }
+            n.name = format!("Seq Scan on {}", r.relation);
+            let out = if under_hash {
+                r.reltarget.iter().map(|(t, _)| t.clone()).collect()
+            } else {
+                r.columns.clone()
+            };
+            n.details.insert(0, ("Output".into(), out.join(", ")));
+            prefix_quals(n, &r.quals);
+            return Some((vec![i], r.reltarget.clone()));
+        }
+        // A LEFT JOIN hashes its nullable relation alone.
+        let left = n.name == "Hash Left Join";
+        if !(left || n.name == "Hash Join")
+            || n.details
+                .iter()
+                .any(|(k, _)| k != "Hash Cond" && k != "Inner Unique")
+        {
+            return None;
+        }
+        let [outer, hash] = n.children.as_mut_slice() else {
+            return None;
+        };
+        if hash.name != "Hash" || !hash.details.is_empty() || hash.children.len() != 1 {
+            return None;
+        }
+        let (mut rels, mut tlist) = walk(outer, c, false, apply)?;
+        let (inner_rels, inner_tlist) = walk(&mut hash.children[0], c, true, apply)?;
+        // The join that brings in a nullable relation is its LEFT JOIN,
+        // every relation before it already joined; any other join finds
+        // it joined below.
+        let joins_nullable = |side: &[usize]| matches!(side, [x] if c.nullable[*x]);
+        if joins_nullable(&rels) {
+            return None;
+        }
+        if left != joins_nullable(&inner_rels)
+            || (left
+                && (rels.len() != inner_rels[0] || !(0..inner_rels[0]).all(|x| rels.contains(&x))))
+        {
+            return None;
+        }
+        if apply {
+            let hashed: Vec<&str> = inner_tlist.iter().map(|(t, _)| t.as_str()).collect();
+            hash.details.insert(0, ("Output".into(), hashed.join(", ")));
+        }
+        rels.extend(inner_rels);
+        tlist.extend(inner_tlist);
+        tlist.retain(|(_, need)| need.output || need.ec_rels.iter().any(|r| !rels.contains(r)));
+        if apply {
+            let out: Vec<&str> = tlist.iter().map(|(t, _)| t.as_str()).collect();
+            n.details.insert(0, ("Output".into(), out.join(", ")));
+        }
+        Some((rels, tlist))
+    }
+    let Some(c) = chain else {
+        return;
+    };
+    // Check the whole tree before changing any of it.
+    match walk(root, c, false, false) {
+        Some((rels, _)) if rels.len() == c.rels.len() => {}
+        _ => return,
+    }
+    walk(root, c, false, true);
+    root.details[0].1 = c.output.join(", ");
+}
+
 fn is_scan_name(name: &str) -> bool {
     name.starts_with("Seq Scan on ")
         || name.starts_with("Bitmap Heap Scan on ")
@@ -3997,6 +4174,7 @@ mod heap_fetches_tests {
             verbose: false,
             verbose_scan: None,
             verbose_join: None,
+            verbose_chain: None,
             scan_alias: None,
             costs: false,
             timing: false,
