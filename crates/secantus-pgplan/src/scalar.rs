@@ -94,6 +94,7 @@ const CATALOG_NAMES: &[&str] = &[
     "pg_client_encoding",
     "pg_reload_conf",
     "format_type",
+    "oidvectortypes",
     "pg_encoding_max_length",
     "obj_description",
     "col_description",
@@ -2087,6 +2088,17 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         // A function body is kept as its source text (`prosrc`), never as
         // a SQL-standard `BEGIN ATOMIC` parse tree, so there is none.
         "pg_get_function_sqlbody" => Ok(Bson::Null),
+        // Each oid as `format_type` writes it, joined by `, ` (RP-957).
+        "oidvectortypes" => match args.first() {
+            None | Some(Bson::Null) => Ok(Bson::Null),
+            Some(v) => Ok(Bson::String(
+                crate::hashfn::oidvector_oids(v)?
+                    .into_iter()
+                    .map(|o| format_type_oid(i64::from(o), None))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )),
+        },
         "pg_get_userbyid" => Ok(match args.first() {
             None | Some(Bson::Null) => Bson::Null,
             Some(Bson::Int32(i)) => Bson::String(crate::regobj::role_name(i64::from(*i))),
@@ -2245,21 +2257,31 @@ fn format_type_call(args: &[Bson]) -> Result<Bson> {
         // A NULL OID is the one argument that DOES make it NULL.
         return Ok(Bson::Null);
     };
-    let Some(name) = crate::pgtypes::type_name_of_oid(oid) else {
-        // A user type (enum, composite, range, domain, ...) prints as its
-        // regtype name; only an oid nothing knows is `???`.
-        let text = crate::regtype_text(oid);
-        return Ok(Bson::String(if text == oid.to_string() {
-            format!("???({oid})")
-        } else {
-            text
-        }));
-    };
     let typmod = args.get(1).and_then(|v| match v {
         Bson::Int32(x) => Some(*x),
         Bson::Int64(x) => i32::try_from(*x).ok(),
         _ => None,
     });
+    Ok(Bson::String(format_type_oid(oid, typmod)))
+}
+
+/// `format_type_extended(oid, typmod, FORMAT_TYPE_ALLOW_INVALID)`: the
+/// invalid oid 0 is `-` and an oid no type has is `???` (PostgreSQL
+/// 15.19; `format_type(0, NULL)` was `pg_node_tree[]`).
+pub(crate) fn format_type_oid(oid: i64, typmod: Option<i32>) -> String {
+    if oid == 0 {
+        return "-".to_string();
+    }
+    let Some(name) = crate::pgtypes::type_name_of_oid(oid) else {
+        // A user type (enum, composite, range, domain, ...) prints as its
+        // regtype name; only an oid nothing knows is `???`.
+        let text = crate::regtype_text(oid);
+        return if text == oid.to_string() {
+            "???".to_string()
+        } else {
+            text
+        };
+    };
     // Oid 18 is the one-byte `"char"`, which the planner's names call
     // `char` and read as `bpchar` elsewhere (`format_type(18, NULL)` was
     // `character`; RP-301).
@@ -2268,7 +2290,7 @@ fn format_type_call(args: &[Bson]) -> Result<Bson> {
         1002 => format!("{}[]", crate::QUOTED_CHAR),
         _ => name,
     };
-    Ok(Bson::String(format_type_text(&name, typmod)))
+    format_type_text(&name, typmod)
 }
 
 /// `format_type`'s rendering: the display name, with the declared width or
@@ -3009,7 +3031,7 @@ pub fn static_result_type(name: &str) -> &'static str {
         "pg_settings_get_flags" => "text[]",
         "pg_get_userbyid" | "getdatabaseencoding" | "pg_encoding_to_char" => "name",
         "pg_char_to_encoding" => "int4",
-        "pg_get_function_sqlbody" => "text",
+        "pg_get_function_sqlbody" | "oidvectortypes" => "text",
         "to_number" => "numeric",
         "jsonb_path_exists"
         | "jsonb_path_match"
