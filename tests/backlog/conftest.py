@@ -253,6 +253,19 @@ def mongod_rs() -> Iterator[Any]:
     `find` holding its ticket longer does on an idle machine. Both servers
     run with the interval out of reach (`rust_mongo` too, since RM-355's
     line prints it), so the lines compared are the operation's own."""
+    yield from _replica_set()
+
+
+@pytest.fixture(scope="module")
+def mongod_rs_no_yield() -> Iterator[Any]:
+    """`mongod_rs` with time-based plan yielding off: on Linux x86-64 (the
+    exemplar build) a short operation makes no such yield, while macOS
+    arm64 makes one, a global IS more (`test_rm_185_locks`'s `mongod`)."""
+    yield from _replica_set("internalQueryExecYieldPeriodMS=86400000")
+
+
+def _replica_set(*parameters: str) -> Iterator[Any]:
+    """A throwaway single-node replica set, with `parameters` set."""
     from tests.mongod_reference import MONGOD, _host_port, _start_mongod, _stop_mongod
 
     assert MONGOD, "no mongod on PATH: the reference server is required"
@@ -262,6 +275,7 @@ def mongod_rs() -> Iterator[Any]:
             "backlog",
             "--setParameter",
             f"delinquentAcquisitionIntervalMillis={NO_DELINQUENCY_MILLIS}",
+            *(arg for p in parameters for arg in ("--setParameter", p)),
         )
     )
     try:

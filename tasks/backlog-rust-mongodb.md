@@ -585,7 +585,9 @@ These are explicit non-goals. Don't add them without a reason.
       `Metadata: {W: 1}` and global, database and collection IX in its
       command's locks; since 2026-11-18 a retryable `update` or `delete`
       statement takes its own round as it runs and keeps its session's row
-      under it. Still different,
+      under it; since 2026-11-18 an `$out` on a replica set's primary takes
+      its four global IS under the transition lock, and the transition lock
+      alone once for each X round after the first. Still different,
       measured against a one-member replica set:
       - an `insert` of several documents one of which fails: mongod inserts
         them again a document at a time, each under a transition, global,
@@ -596,10 +598,7 @@ These are explicit non-goals. Don't add them without a reason.
       - a profiled `update` or `delete` statement's entry's locks are taken
         without interrupt checks here (the command's `numInterruptChecks`
         is mongod's without them);
-      - `$out` takes more transition locks than this server's rounds
-        (measured on a standalone, RM-185), and an `$out`'s line here has
-        one global IS more than mongod's (7 to 6, measured 8.2.11
-        2026-11-12); a `collMod` of a collection not there is not measured;
+      - a `collMod` of a collection not there is not measured;
       - each global lock taken apart takes an execution ticket, so where
         these locks differ the line's `queues.execution` admissions differ
         too (RM-355);

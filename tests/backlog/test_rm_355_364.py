@@ -523,8 +523,43 @@ def test_a_write_reports_mongods_locks_and_flow_control(
 
 #: Writes whose locks are not mongod's yet (RM-357's remainder).
 _DIVERGING_WRITES = {
-    "$out": lambda d: list(_w1(_plain(d)).aggregate([{"$match": {}}, {"$out": "o"}])),
+    # mongod takes the global IS three times on the line of a collectionless
+    # aggregate whose `$lookup` reads a collection; this server once.
+    "$documents and $lookup": lambda d: list(
+        _plain(d).aggregate(
+            [
+                {"$documents": [{"_id": 1}]},
+                {"$lookup": {"from": "c", "localField": "_id", "foreignField": "_id", "as": "j"}},
+            ]
+        )
+    ),
 }
+
+
+#: `$out`, to a new target and replacing one.
+_OUTS = {
+    "$out": lambda d: list(_w1(_plain(d)).aggregate([{"$match": {}}, {"$out": "o"}])),
+    "$out replacing its target": lambda d: [
+        list(_w1(_plain(d)).aggregate([{"$match": {}}, {"$out": "o"}])) for _ in range(2)
+    ],
+}
+
+
+@pytest.mark.backlog_fixed("RM-357")
+@pytest.mark.parametrize("name", list(_OUTS))
+def test_out_reports_a_replica_sets_locks(
+    rust_mongo: Any, mongod_rs_no_yield: Any, name: str
+) -> None:
+    """mongod 8.2.11's primary checks an `$out` under four global IS, each
+    with the transition lock, and takes the transition lock alone once more
+    for each X round after the first: `{ReplicationStateTransition: {w:
+    10}, Global: {r: 5, w: 4}}`, 12 and `{r: 5, w: 5}` replacing its target
+    (measured 2026-11-18, time-based yields off, which the Linux build does
+    not make here). This server took a standalone's rounds, six global IS
+    without the transition lock."""
+    answers = _write_locks(rust_mongo, mongod_rs_no_yield, _OUTS[name])
+    assert answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
 
 
 #: Retryable updates and deletes: each statement keeps its session's row.
