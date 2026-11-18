@@ -1682,6 +1682,7 @@ pub fn write_rounds(db: &str, coll: &str, n: usize) -> Option<Guard> {
         // Not the statement's own chain: whose the statement is stays as it was.
         previous_owner: STATEMENT_OWNER.with(std::cell::Cell::get),
         previous_round: None,
+        previous_running: RUNNING.with(|r| r.borrow().clone()),
         chain: round,
     })
 }
@@ -1786,6 +1787,8 @@ pub struct Guard {
     /// The enclosing statement's round, restored on drop; `None` for a
     /// guard that did not replace it ([`write_rounds`]).
     previous_round: Option<Option<StatementRound>>,
+    /// The enclosing running statement, restored on drop.
+    previous_running: Option<(std::sync::Arc<LockManager>, Owner)>,
     chain: Vec<(Resource, Mode)>,
 }
 
@@ -1800,6 +1803,9 @@ struct StatementRound {
 }
 
 thread_local! {
+    /// The running statement's lock manager and owner.
+    static RUNNING: std::cell::RefCell<Option<(std::sync::Arc<LockManager>, Owner)>> =
+        const { std::cell::RefCell::new(None) };
     static PER_STATEMENT: std::cell::RefCell<Option<StatementRound>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -1855,13 +1861,12 @@ impl Guard {
         // mongod's `update` and `delete` take each statement's round as the
         // statement runs and let it go before its line is written
         // ([`next_statement`], [`statement_done`]): only the first is taken
-        // here. A retryable write keeps its locks to write its session's row
-        // after the last statement, which this server does once (RM-357).
+        // here. A retryable statement keeps its session's row under its own
+        // round before letting it go (`session::keep_statement_row`, RM-357).
         let per_statement = matches!(
             doc.keys().next().map(String::as_str),
             Some("update" | "delete")
-        ) && !chain.is_empty()
-            && HELD_TO_END.with(|h| h.borrow().is_none());
+        ) && !chain.is_empty();
         if per_statement {
             rounds.clear();
         }
@@ -1890,6 +1895,7 @@ impl Guard {
                     owner,
                     previous_owner: STATEMENT_OWNER.with(|o| o.replace(Some(owner))),
                     previous_round: Some(previous_round),
+                    previous_running: RUNNING.with(|r| r.replace(Some((lm.clone(), owner)))),
                     chain,
                 }))
             }
@@ -1945,6 +1951,7 @@ impl LockManager {
 impl Drop for Guard {
     fn drop(&mut self) {
         STATEMENT_OWNER.with(|o| o.set(self.previous_owner));
+        RUNNING.with(|r| *r.borrow_mut() = self.previous_running.take());
         if let Some(previous) = self.previous_round.take() {
             PER_STATEMENT.with(|p| *p.borrow_mut() = previous);
         }
@@ -1993,7 +2000,21 @@ impl HeldToEnd {
     /// control ticket of its own (measured 8.2.11: a retryable insert takes
     /// one, as any insert). Nothing when no statement lock is held.
     pub fn write_round(&self, db: &str, coll: &str) -> Result<(), MaxTimeMsExpired> {
-        let Some((lm, owner)) = HELD_TO_END.with(|h| h.borrow().as_ref()?.last().cloned()) else {
+        held_write_round(db, coll)
+    }
+}
+
+/// [`HeldToEnd::write_round`], from code that runs inside the scope without
+/// a handle to it: an `update` or `delete` statement keeping its session's
+/// row under its own locks (RM-357).
+pub fn held_write_round(db: &str, coll: &str) -> Result<(), MaxTimeMsExpired> {
+    {
+        // The running statement's locks if one runs, else the last kept.
+        let running = RUNNING.with(|r| r.borrow().clone());
+        let Some((lm, owner)) = running
+            .filter(|_| HELD_TO_END.with(|h| h.borrow().is_some()))
+            .or_else(|| HELD_TO_END.with(|h| h.borrow().as_ref()?.last().cloned()))
+        else {
             return Ok(());
         };
         let round = [

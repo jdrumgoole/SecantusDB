@@ -1319,6 +1319,17 @@ fn retryable_write(
             s.set_retry_image(Some(doc.get("new").is_some_and(crate::util::truthy)));
         }
     }
+    let per_statement = matches!(name, "update" | "delete");
+    if per_statement {
+        STATEMENT_ROW.with(|r| {
+            *r.borrow_mut() = Some(StatementRow {
+                session: session.clone(),
+                txn_number,
+                kept: None,
+                error: None,
+            })
+        });
+    }
     let (mut reply, records) = match name {
         "insert" => retry_insert(handler, doc, ctx, &ids, &done),
         "update" | "delete" => retry_batch(name, handler, doc, ctx, &ids, &done),
@@ -1330,11 +1341,21 @@ fn retryable_write(
         }
         _ => (crate::run_handler(handler, doc, ctx), Vec::new()),
     };
+    let statement_row = if per_statement {
+        STATEMENT_ROW.with(|r| r.borrow_mut().take())
+    } else {
+        None
+    };
     if let Some(s) = ctx.storage.as_ref() {
         s.set_retryable_session(None);
         s.set_statement_position(None);
         s.set_insert_positions(None);
         s.set_retry_image(None);
+        // An update's or delete's statements kept the row as they ended.
+        let (kept, row_error) = statement_row.map_or((None, None), |r| (r.kept, r.error));
+        if let Some(e) = row_error {
+            reply = e.into_reply();
+        }
         // The time of the last entry this write logged, if it logged any.
         if let Some(ts) = s.take_last_retryable_ts() {
             pin_operation_time(&mut reply, ctx.replica_set_name.is_some(), s.as_ref());
@@ -1358,6 +1379,8 @@ fn retryable_write(
             if let Err(e) = kept {
                 reply = e.into_reply();
             }
+        } else if kept.is_some() {
+            pin_operation_time(&mut reply, ctx.replica_set_name.is_some(), s.as_ref());
         }
     }
     drop(held);
@@ -1491,6 +1514,49 @@ pub(crate) fn logical_session_id(id: &[u8], users: &[(String, String)]) -> Docum
             bytes: user_digest(users),
         },
     }
+}
+
+/// A retryable `update` or `delete` on this thread: the session whose row
+/// each statement keeps as it ends.
+struct StatementRow {
+    session: Document,
+    txn_number: i64,
+    /// The time of the last entry a statement kept the row for.
+    kept: Option<bson::Timestamp>,
+    /// The first error keeping the row raised; the statements after it keep
+    /// none.
+    error: Option<CommandError>,
+}
+
+thread_local! {
+    static STATEMENT_ROW: std::cell::RefCell<Option<StatementRow>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The running statement of a retryable `update` or `delete` ends: when it
+/// logged an entry, keep its session's row now, under the statement's own
+/// locks and before its line, as mongod 8.2.11's `performUpdates` /
+/// `performDeletes` do per statement (`onWriteOpCompletedOnPrimary`;
+/// measured 2026-11-07, RM-357). Nothing outside such a write.
+pub(crate) fn keep_statement_row(storage: &dyn crate::Storage) {
+    STATEMENT_ROW.with(|r| {
+        let mut r = r.borrow_mut();
+        let Some(row) = r.as_mut().filter(|row| row.error.is_none()) else {
+            return;
+        };
+        let Some(ts) = storage.take_last_retryable_ts() else {
+            return;
+        };
+        row.kept = Some(ts);
+        let kept = crate::lock_manager::held_write_round("config", "transactions")
+            .map_err(|_| CommandError::max_time_expired())
+            .and_then(|()| {
+                record_session_transaction(storage, row.session.clone(), row.txn_number, ts, None)
+            });
+        if let Err(e) = kept {
+            row.error = Some(e);
+        }
+    });
 }
 
 /// Keep the session's row in `config.transactions`, as mongod 8.2.11 keeps

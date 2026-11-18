@@ -583,7 +583,9 @@ These are explicit non-goals. Don't add them without a reason.
       transition, global and image collection IX; since 2026-11-18 a
       profiled update or delete statement's entry counts mongod's
       `Metadata: {W: 1}` and global, database and collection IX in its
-      command's locks. Still different,
+      command's locks; since 2026-11-18 a retryable `update` or `delete`
+      statement takes its own round as it runs and keeps its session's row
+      under it. Still different,
       measured against a one-member replica set:
       - an `insert` of several documents one of which fails: mongod inserts
         them again a document at a time, each under a transition, global,
@@ -591,10 +593,7 @@ These are explicit non-goals. Don't add them without a reason.
         (`insertBatchAndHandleErrors`), and counts an interrupt check for
         each lock; this server takes no such rounds, and its line prints no
         `numInterruptChecks` (RM-360);
-      - an `update` or `delete` keeps its session row per statement, under
-        the statement's own locks, and takes each statement's round as the
-        statement runs (this server takes every round first and writes the
-        row once, after); the profiled statement's entry's locks are taken
+      - a profiled `update` or `delete` statement's entry's locks are taken
         without interrupt checks here (the command's `numInterruptChecks`
         is mongod's without them);
       - `$out` takes more transition locks than this server's rounds

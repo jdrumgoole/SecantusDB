@@ -523,10 +523,37 @@ def test_a_write_reports_mongods_locks_and_flow_control(
 
 #: Writes whose locks are not mongod's yet (RM-357's remainder).
 _DIVERGING_WRITES = {
-    # A retryable statement keeps its session row under its own locks.
-    "update": lambda d: _w1(d).update_one({"_id": 1}, {"$set": {"q": 1}}),
     "$out": lambda d: list(_w1(_plain(d)).aggregate([{"$match": {}}, {"$out": "o"}])),
 }
+
+
+#: Retryable updates and deletes: each statement keeps its session's row.
+_RETRYABLE_STATEMENTS = {
+    "update": lambda d: _w1(d).update_one({"_id": 1}, {"$set": {"q": 1}}),
+    "delete": lambda d: _w1(d).delete_one({"_id": 1}),
+    "update of two statements": lambda d: _w1(d).bulk_write(
+        [
+            pymongo.UpdateOne({"_id": 1}, {"$set": {"q": 1}}),
+            pymongo.UpdateOne({"_id": 2}, {"$set": {"q": 1}}),
+        ]
+    ),
+    "update matching nothing": lambda d: _w1(d).update_one({"_id": 999}, {"$set": {"q": 1}}),
+}
+
+
+@pytest.mark.backlog_fixed("RM-357")
+@pytest.mark.parametrize("name", list(_RETRYABLE_STATEMENTS))
+def test_a_retryable_statement_keeps_its_session_row_under_its_locks(
+    rust_mongo: Any, mongod_rs: Any, name: str
+) -> None:
+    """mongod 8.2.11 keeps a retryable update or delete statement's session
+    row as the statement ends, under the statement's own locks: its line
+    counts one more transition, global, database and collection IX for it
+    (measured 2026-11-07). This server wrote the row once, after the last
+    statement, outside every statement's line."""
+    answers = _write_locks(rust_mongo, mongod_rs, _RETRYABLE_STATEMENTS[name])
+    assert answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
 
 
 #: Writes whose statements are profiled: each statement's entry is written
