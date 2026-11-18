@@ -2314,18 +2314,30 @@ Measured on PostgreSQL 15.19 with `create domain pint as int check (value >
 text)` and `create table tct (c ctp, d pint[])` holding `('(1,x)', null)`.
 The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
 
-- [ ] **A `text` column an `INSERT ... SELECT` writes to a composite
-      column is accepted.** `insert into tct(c) select '(0,x)'::text` is
-      42804 `column "c" is of type ctp but expression is of type text` at
-      27 on PostgreSQL 15.19, as is the bare literal under a UNION, an
-      ORDER BY, a DISTINCT or a subquery in FROM (each resolves the
-      `unknown` column to `text` first; `text` has no assignment cast to a
-      composite). Here the text is read as the composite (a field's domain
-      error, 23514, for these). Found while working RP-945, which placed
-      the plain SELECT's literal (`check_assigned_literal` over its target
-      list).
-      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_text_into_composite
-      Backlog-ID: RP-1044
+- [ ] **A `text` column an `INSERT ... SELECT` writes to a domain-array
+      column is accepted.** `insert into tct(d) select '{1}' union all
+      select '{1}'` is 42804 `column "d" is of type pint[] but expression is
+      of type text` at 27 on PostgreSQL 15.19; here the text is read as the
+      array. `check_insert_select_types` (secantus-pg) skips a target whose
+      type `oid_of_name` cannot name, which an array of a domain is. Found
+      while working RP-1044, which closed the composite case there.
+      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_text_into_domain_array
+      Backlog-ID: RP-1048
+- [ ] **A `record` column an `INSERT ... SELECT` writes to a composite
+      column is accepted.** `insert into tct(c) select row(1,'x')` is 42846
+      `cannot cast type record to ctp` at 27 on PostgreSQL 15.19 (a
+      `RowExpr` is coerced to a composite only where it is written, as in
+      `VALUES`, not through a subquery's output column); here the row is
+      stored. RP-1044's check lets `record` through for this reason.
+      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_record_into_composite
+      Backlog-ID: RP-1049
+- [ ] **A UNION of a composite and a `record` has no error position.**
+      `insert into tct(c) select (1,'x')::ctp union select row(2,'y')` is
+      42804 `UNION types ctp and record cannot be matched` at 53 (the right
+      arm's column) on PostgreSQL 15.19; here the message matches and the
+      position is missing. Found while working RP-1044.
+      Verify: tests/backlog/test_rp_found_rp552.py::test_union_composite_record_position
+      Backlog-ID: RP-1050
 
 ## Found while working RP-534 (2026-11-08)
 

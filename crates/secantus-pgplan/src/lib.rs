@@ -15450,7 +15450,12 @@ fn plan_insert(
 /// arm's expression, as PostgreSQL does.
 fn source_targets(sel: &pg_query::protobuf::SelectStmt) -> Vec<SourceTarget> {
     let mut leftmost = sel;
-    let set_op = sel.op != pg_query::protobuf::SetOperation::SetopNone as i32;
+    // A set operation, ORDER BY, DISTINCT or GROUP BY resolves an `unknown`
+    // output column to `text` before the INSERT sees it.
+    let set_op = sel.op != pg_query::protobuf::SetOperation::SetopNone as i32
+        || !sel.sort_clause.is_empty()
+        || !sel.distinct_clause.is_empty()
+        || !sel.group_clause.is_empty();
     while leftmost.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
         match leftmost.larg.as_deref() {
             Some(l) => leftmost = l,
