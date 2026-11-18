@@ -73,6 +73,7 @@ mod numeric;
 pub mod order;
 mod paths;
 mod regexutil;
+mod sbe_hashagg;
 mod summation;
 mod tzdb;
 mod windowfields;

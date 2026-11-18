@@ -393,7 +393,13 @@ def _sbe_spill(client: Any) -> dict:
         db.command({"profile": 0})
         client.admin.command({"setParameter": 1, SBE_BUDGET: was})
     entry = db.system.profile.find_one({"command.comment": "sbe"}) or {}
-    keep = ("usedDisk", "groupSpills", "groupSpilledRecords", "groupSpilledDataStorageSize")
+    keep = (
+        "usedDisk",
+        "groupSpills",
+        "groupSpilledBytes",
+        "groupSpilledRecords",
+        "groupSpilledDataStorageSize",
+    )
     return {
         "was": was,
         "groups": sorted((d["_id"], len(d["t"])) for d in out),
@@ -402,9 +408,9 @@ def _sbe_spill(client: Any) -> dict:
 
 
 def test_an_sbe_group_spills_to_the_spill_engine(rust_mongo: Any, mongod: Any) -> None:
-    # RM-612: 7 spills of 300 records in all, into one table of the spill
-    # engine that stays in its cache (4096 bytes). `groupSpilledBytes` is
-    # still this server's (RM-612's remainder).
+    # RM-612: 7 spills of 300 records in all, 312300 bytes (each record's
+    # accumulator row and key type bits), into one table of the spill engine
+    # that stays in its cache (4096 bytes).
     theirs = _sbe_spill(mongod)
     assert theirs["groupSpills"] == 7, theirs  # not vacuous: it spilled
     same(_sbe_spill(rust_mongo), theirs)

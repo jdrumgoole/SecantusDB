@@ -1092,24 +1092,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       to run. Found 2026-11-13 working RM-325.
       Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_a_window_spill_the_engine_writes_out_is_mongods_size
       Backlog-ID: RM-611
-- [ ] **An SBE `$group`'s spill counts bytes, and spills, by this server's
-      estimate, not mongod's.** With its budget
-      (`internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill`,
-      taken at runtime and at startup since RM-612's first part) at 50000,
-      mongod 8.2.11 spills 300 single-value groups 7 times for each shape
-      below, and its `groupSpilledBytes` follows the spilled value rows:
-      `{$push: "$s"}` of a 1000-byte string 312300, with a `$sum` beside it
-      321900, `{$first: "$s"}` 304200, a `$sum` keyed on a 1000-byte string
-      12300, no accumulator at all 2700 (9 a group). This server reports its
-      memory estimate at each spill (306900 for each of the first four),
-      and keyed on a 1000-byte string spills 6 times, 304990 bytes: SBE's
-      hash-table accounting (`HashAggStage`'s memory check and its
-      `spilledBytes`) needs porting. The spill itself now goes to one
-      table of the spill engine, as mongod's does (spills, records and the
-      4096-byte storage size match). Found 2026-11-13 working RM-325;
-      measured 2026-11-18.
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_an_sbe_group_spills_as_mongods
-      Backlog-ID: RM-612
 - [ ] **An approximate `$median` / `$percentile` ranks the values, where
       mongod interpolates its t-digest.** mongod 8.2.11 answers from
       `TDigest` (delta 2000, a flush every 6000 values that merges
