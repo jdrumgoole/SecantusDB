@@ -193,6 +193,9 @@ struct Printer<'a> {
     pretty: bool,
     /// `pg_get_expr` over one relation: columns print bare.
     unqualified: bool,
+    /// A scan's own relation, whose columns its quals print bare while
+    /// another relation's print prefixed (`show_scan_qual`, RP-966).
+    bare_rel: Option<String>,
     /// EXPLAIN prints the planned expression, whose constants
     /// `eval_const_expressions` has folded: an integer literal coerced to
     /// `oid` is the constant `'1259'::oid`, not `(1259)::oid`.
@@ -444,6 +447,7 @@ impl<'a> Printer<'a> {
             col_names_visible: true,
             pretty: false,
             unqualified: false,
+            bare_rel: None,
             fold_consts: false,
             markers: false,
             legacy_joins: false,
@@ -1403,7 +1407,7 @@ impl<'a> Printer<'a> {
                 }
                 let fields = names(&c.fields);
                 let (rel, col, _) = self.resolve(&fields)?;
-                if self.unqualified || rel.is_empty() {
+                if self.unqualified || rel.is_empty() || self.bare_rel.as_ref() == Some(&rel) {
                     self.buf.push_str(&q(&col));
                 } else {
                     self.buf.push_str(&format!("{}.{}", q(&rel), q(&col)));
@@ -6993,6 +6997,39 @@ pub fn explain_verbose_join(
                         }
                         for (i, c) in &refs {
                             need(*i, c);
+                        }
+                        // A parameterised inner scan evaluates it as its
+                        // `Filter`: its own columns bare in the plain
+                        // plan, every column prefixed under VERBOSE.
+                        let both = |bare: Option<&String>| -> Option<String> {
+                            let mut p = Printer::new(&cat, 0);
+                            p.fold_consts = true;
+                            p.bare_rel = bare.cloned();
+                            p.scopes.push(
+                                sides
+                                    .iter()
+                                    .map(|(refname, def, _)| Rte {
+                                        refname: refname.clone(),
+                                        name: refname.clone(),
+                                        columns: def
+                                            .columns
+                                            .iter()
+                                            .map(|c| (c.name.clone(), base_type(&c.pg_type)))
+                                            .collect(),
+                                        qualified_only: false,
+                                        ..Default::default()
+                                    })
+                                    .collect(),
+                            );
+                            p.expr(part)?;
+                            Some(p.buf)
+                        };
+                        if let Some(full) = both(None) {
+                            for own in [0usize, 1] {
+                                if let Some(plain) = both(Some(&sides[own].0)) {
+                                    join_quals[own].push((plain, full.clone()));
+                                }
+                            }
                         }
                         join_filter = true;
                         unprinted_filter = true;

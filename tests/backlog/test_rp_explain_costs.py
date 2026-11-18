@@ -1906,8 +1906,35 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # Measured on PostgreSQL 15.19: a WHERE expression over both relations
     # is the parameterised inner index scan's `Filter`, prefixed.
-    "explain verbose of an inner index scan filtering an expression of both": (
+    # Measured on PostgreSQL 15.19 (2026-11-18): a join of three relations
+    # prints every node's `Output` under VERBOSE.
+    "explain verbose of a join of three relations": (
         "RP-966",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b from e join k on e.a = k.a"
+        " join e e2 on e2.a = e.a",
+        [
+            "Hash Join",
+            "  Output: e.b",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Hash Join",
+            "        Output: e.b, e.a, k.a",
+            "        Inner Unique: true",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.a, e.b",
+            "        ->  Hash",
+            "              Output: k.a",
+            "              ->  Seq Scan on public.k",
+            "                    Output: k.a",
+            "  ->  Hash",
+            "        Output: e2.a",
+            "        ->  Seq Scan on public.e e2",
+            "              Output: e2.a",
+        ],
+    ),
+    "explain verbose of an inner index scan filtering an expression of both": (
+        "RP-966:fixed",
         _ANALYSED,
         "explain verbose select k.b, e.a from e join k on e.a < k.a where e.a + k.a < 7",
         [

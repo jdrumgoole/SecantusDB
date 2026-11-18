@@ -1760,15 +1760,16 @@ a regression test.
       conjuncts in the one `Join Filter`.) (Since 2026-11-17 a WHERE
       comparison of an expression with the other relation's column does
       too, as an inner `Index Cond` or a `Join Filter`, both already
-      prefixed: `VerboseJoin::unprinted_filter`.) Still the plain plan:
-      such an expression evaluated as the parameterised inner index
-      scan's `Filter` (`on e.a < k.a where e.a + k.a < 7`, PostgreSQL's
-      `Filter: ((e.a + k.a) < 7)`): `join_quals` holds only
-      column-to-column texts, so `attach_verbose_nested_loop` declines.
-      The fix is to print each cross-relation conjunct with a Printer
-      over both relations' scopes, bare for the scan's own columns, in
-      place of the hand-built `join_quals` strings.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of an inner index scan filtering an expression of both]
+      prefixed: `VerboseJoin::unprinted_filter`.) (Since 2026-11-18 such
+      an expression evaluated as the parameterised inner index scan's
+      `Filter` does too, printed over both relations' scopes with the
+      scan's own columns bare, `Printer::bare_rel`.) A join of three
+      relations still prints the plain plan: `explain (verbose, costs
+      off) select e.b from e join k on e.a = k.a join e e2 on e2.a = e.a`
+      is, on PostgreSQL 15.19, every node with its `Output` (the upper
+      Hash Join's `e.b`, the lower one's `e.b, e.a, k.a`, each Hash's
+      the key it hashes); `explain_verbose_join` takes two relations only.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a join of three relations]
       Backlog-ID: RP-966
 
 - [ ] **A hash join whose WHERE compares an expression of one relation
