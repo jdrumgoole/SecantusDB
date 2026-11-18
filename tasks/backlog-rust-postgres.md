@@ -2271,6 +2271,31 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       can only come from the MongoDB server writing the collection, which
       is the MongoDB -> SQL hand-off CLAUDE.md says does not work, so the
       PG server does not answer for it.
+      **Decision needed (step-2 session, 2026-11-18, no code changed):
+      how step 2 enforces UNIQUE.** The session was asked for UNIQUE
+      through `value_unique` / `check_collated_unique`. That check reads
+      every stored row before the write, and `unique_indexes`' own comment
+      (secantus-pg lib.rs ~28640) says why a read-before-write "cannot
+      uphold a constraint": it misses a value another transaction committed
+      after the snapshot or is inserting now, so the storage unique index
+      is the arbiter. Today that index still catches `'k'` / `'k  '`
+      because every write trims, so the gap opens only at step 5. ON
+      CONFLICT has the same dependency: `insert_on_conflict` finds the
+      conflict from the storage index's E11000 and probes with an exact
+      `find_matching`, so neither path sees a blank-only difference.
+      Options, most faithful first: (a) back a `bpchar` UNIQUE with a
+      storage unique index over a derived field holding the trimmed value
+      (the `expr_index` mechanism a UNIQUE expression index already uses),
+      which is PostgreSQL's btree over `bpcharcmp`, matches step 1's
+      trimmed `_id`, gives ON CONFLICT its E11000 and arbiter probe on that
+      field, and is the index step 4's `=` can use; an on-disk change for
+      tables created after it. (b) `value_unique` as asked: a full scan per
+      write and per row of a COPY, racy under concurrency. Neither changes
+      an answer before step 5. Probed on 15.19: `'k  '` then `'k'` into
+      an unsized `bpchar` UNIQUE is 23505 `Key (a)=(k)`, and `on conflict
+      (a) do update set b = excluded.b` updates the stored row, which
+      keeps `octet_length(a)` 3 (the regression tests for step 2 should
+      pin both).
       Verify: tests/backlog/test_rp_found_rp672.py::test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks
       Backlog-ID: RP-693
 
