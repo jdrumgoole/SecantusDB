@@ -486,6 +486,75 @@ fn is_inclusion(spec: &Document) -> bool {
     })
 }
 
+/// Rewrites each pipeline of a `$facet` for the metadata in reach as it
+/// starts: a `{$meta: "sortKey"}` reads the key the documents carry, or
+/// `[]` in `$addFields`, `$set` and `$group` when they carry none, and is
+/// missing in `$match` and `$redact`. A `$sort` in the facet sets no key,
+/// and the metadata ends at its first stage outside
+/// [`KEEPS_SORT_METADATA`], where the hidden fields come off (RM-625).
+fn rewrite_facet_metadata(stage: &mut Bson, sort_live: bool, geo_live: bool) {
+    let Some(Bson::Document(facets)) = stage.as_document_mut().and_then(|d| d.get_mut("$facet"))
+    else {
+        return;
+    };
+    let mut live: Vec<&str> = Vec::new();
+    if sort_live {
+        live.push(SORT_KEY);
+    }
+    if geo_live {
+        live.extend([GEO_DISTANCE, GEO_POINT]);
+    }
+    for (_, sub) in facets.iter_mut() {
+        let Bson::Array(stages) = sub else { continue };
+        let mut out: Vec<Bson> = Vec::with_capacity(stages.len() + 1);
+        let (mut sort_on, mut geo_on) = (sort_live, geo_live);
+        for mut s in std::mem::take(stages) {
+            let n = name(&s).to_string();
+            let keeps = KEEPS_SORT_METADATA.contains(&n.as_str());
+            if matches!(n.as_str(), "$match" | "$redact") {
+                replace_with(&mut s, "sortKey", &Bson::String("$$REMOVE".into()));
+            }
+            if keeps || n == "$group" {
+                if sort_on {
+                    replace_with(&mut s, "sortKey", &sort_key_read());
+                } else if matches!(n.as_str(), "$addFields" | "$set" | "$group") {
+                    replace_with(
+                        &mut s,
+                        "sortKey",
+                        &Bson::Document(bson::doc! { "$literal": [] }),
+                    );
+                }
+                if geo_on {
+                    replace(&mut s, "geoNearDistance", GEO_DISTANCE);
+                    replace(&mut s, "geoNearPoint", GEO_POINT);
+                }
+            }
+            if (sort_on || geo_on) && !keeps {
+                if n != "$group" {
+                    out.push(Bson::Document(bson::doc! { "$unset": live.clone() }));
+                }
+                sort_on = false;
+                geo_on = false;
+            } else if (sort_on || geo_on) && n == "$project" {
+                if let Some(Bson::Document(spec)) =
+                    s.as_document_mut().and_then(|d| d.get_mut("$project"))
+                {
+                    if is_inclusion(spec) {
+                        for f in &live {
+                            spec.insert(*f, 1);
+                        }
+                    }
+                }
+            }
+            out.push(s);
+        }
+        if sort_on || geo_on {
+            out.push(Bson::Document(bson::doc! { "$unset": live.clone() }));
+        }
+        *stages = out;
+    }
+}
+
 /// `{$meta: "sortKey"}`, `"geoNearDistance"` and `"geoNearPoint"`, which
 /// mongod keeps from a `$sort` or a `$geoNear` through the stages in
 /// [`KEEPS_SORT_METADATA`] and into a `$group`. Each is rewritten into a read
@@ -600,6 +669,12 @@ pub(crate) fn rewrite_sort_metadata(
                 replace(&mut stage, "geoNearPoint", GEO_POINT);
             }
         }
+        // A `$facet` pipeline continues from the documents' metadata: the
+        // query layer's sort key reads there, and with none it is `[]`, its
+        // own `$sort` setting none (mongod 8.2.11, 2026-11-18, RM-625).
+        if name == "$facet" && !keyless {
+            rewrite_facet_metadata(&mut stage, sort_live, geo_live);
+        }
         let live: Vec<&str> = [
             (sort_live, SORT_KEY),
             (geo_live, GEO_DISTANCE),
@@ -610,7 +685,9 @@ pub(crate) fn rewrite_sort_metadata(
         .map(|(_, f)| *f)
         .collect();
         if !keeps && !live.is_empty() {
-            if name != "$group" {
+            if name == "$facet" {
+                // Each facet pipeline takes the fields off itself.
+            } else if name != "$group" {
                 // The metadata ends here; take its fields off first.
                 out.push(Bson::Document(bson::doc! { "$unset": live.clone() }));
             }

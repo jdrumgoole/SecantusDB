@@ -35,12 +35,27 @@ def test_a_union_with_sub_pipeline_sort_sets_the_key(rust_mongo: Any, mongod: An
     assert _answers(rust_mongo, pipelines) == _answers(mongod, pipelines)
 
 
-@pytest.mark.backlog("RM-625")
+@pytest.mark.backlog_fixed("RM-625")
 def test_a_facet_sort_key_is_empty(rust_mongo: Any, mongod: Any) -> None:
     """In a `$facet` pipeline, mongod 8.2.11 gives `{$meta: "sortKey"}` as
     `[]` even behind the facet's own `$sort` (its ranks tie, which this
-    server matches); this server refuses the `$meta` (code 2)."""
+    server matches); this server refused the `$meta` (code 2)."""
     pipelines = {"$meta": [{"$facet": {"f": [{"$sort": {"k": 1}}, META]}}]}
+    assert _answers(rust_mongo, pipelines) == _answers(mongod, pipelines)
+
+
+@pytest.mark.backlog_fixed("RM-625")
+def test_a_facet_reads_the_sort_key_in_front(rust_mongo: Any, mongod: Any) -> None:
+    """A `$facet` behind the query layer's `$sort` reads that key in
+    `$addFields` and `$project` (mongod 8.2.11, 2026-11-18); with no key a
+    `$group` gives `[]` and a `$match` sees it missing."""
+    sort = {"$sort": {"k": 1}}
+    pipelines = {
+        "$addFields": [sort, {"$facet": {"f": [META]}}],
+        "$project": [sort, {"$facet": {"f": [{"$project": {"m": {"$meta": "sortKey"}}}]}}],
+        "$group": [{"$facet": {"f": [{"$group": {"_id": {"$meta": "sortKey"}}}]}}],
+        "$match": [{"$facet": {"f": [{"$match": {"$expr": {"$eq": [{"$meta": "sortKey"}, []]}}}]}}],
+    }
     assert _answers(rust_mongo, pipelines) == _answers(mongod, pipelines)
 
 

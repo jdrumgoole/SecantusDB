@@ -1117,12 +1117,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Found 2026-11-18 working RM-613.
       Verify: tests/backlog/test_rm_found_2026_11_18_rm613.py::test_an_approximate_median_is_mongods_tdigest
       Backlog-ID: RM-720
-- [ ] **`{$meta: "sortKey"}` in a `$facet` is refused, not `[]`.** mongod
-      8.2.11 gives `[]` in a `$facet` pipeline, behind the facet's own
-      `$sort` too (its ranks tie there, which this server matches); this
-      server refuses the `$meta` with code 2. Found 2026-11-13 (RM-521).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm521.py::test_a_facet_sort_key_is_empty
-      Backlog-ID: RM-625
 - [ ] **The sort key is lost at a `$graphLookup` or a `$fill`.** mongod
       8.2.11 keeps it through both, as it does through the stages RM-520
       names; this server ends it at each, so a rank behind ties every
