@@ -1045,19 +1045,21 @@ about forty such points; these are the ones measured.
       a collection scan (since 2026-11-10), a one-field bounded index read
       (since 2026-11-17), and a filter of operator clauses no index covers
       whole through one field's bounded read, a compound index's included
+      (since 2026-11-18), and one field's `$in` / `$eq` of plain scalars
       (since 2026-11-18), a page at a time, writing each page first. The
       router's other index reads (`try_index_id_keys`: an equality prefix
-      of a compound index, `$in` / `$eq`, `$and`, `$or`, `$elemMatch`,
-      geo) are still read whole before the first page, and a budget spent
+      of a compound index, a plain equality `{a: 5}`, an `$in` holding a
+      null, document, array or regex, `$and`, `$or`, `$elemMatch`, geo)
+      are still read whole before the first page, and a budget spent
       there writes nothing. The work is to stream a clustered collection's
       plan as an ordinary one's (its natural order is `_id`'s, which the
       stream does not yet read), or to page each of those reads into the
       write as `bounded_span_pages` does; none of those shapes is probed
       against mongod yet.
       Backlog-ID: RM-390
-      Verify: none -- the compound residual read this item's gap test
-      measured is paged (tests/backlog/test_rm_found_2026_11_10_rm390.py,
-      now backlog_fixed); the remaining shapes have no gap test until one
+      Verify: none -- the compound residual and `$in` reads this item's
+      gap tests measured are paged
+      (tests/backlog/test_rm_found_2026_11_10_rm390.py, now backlog_fixed); the remaining shapes have no gap test until one
       is probed against mongod 8.2.
 
 ### 7.086 The Rust MongoDB server, audited -- 2026-10-20

@@ -28,7 +28,8 @@ def _write_out_of_time(client: Any, plan: str, op: str, budget: int = 30) -> tup
     """An updateMany (`$inc: {n: 1}`) or a deleteMany of 100,000 documents
     with `maxTimeMS: budget`, its read `plan`: `clustered-index` reads index
     `a_1` of a collection clustered by `_id`, `clustered-compound` reads
-    compound index `a_1_b_1` of one, `contested` has indexes `a_1` and
+    compound index `a_1_b_1` of one, `clustered-in` reads index `b_1` of one
+    over an `$in` of points, `contested` has indexes `a_1` and
     `b_1` both able to answer it. Its error code, and whether it had
     written some documents but not all."""
     db = client["rm390"]
@@ -39,7 +40,10 @@ def _write_out_of_time(client: Any, plan: str, op: str, budget: int = 30) -> tup
         db.c.insert_many(
             [{"_id": i, "a": i, "b": i % 7, "n": 0} for i in range(start, start + 10_000)]
         )
-    if plan == "clustered-compound":
+    if plan == "clustered-in":
+        db.c.create_index("b")
+        query = {"b": {"$in": list(range(7))}}
+    elif plan == "clustered-compound":
         db.c.create_index([("a", 1), ("b", 1)])
         query = {"a": {"$gte": 0}, "b": {"$gte": 0}}
     else:
@@ -122,3 +126,19 @@ def test_a_write_of_many_through_a_compound_index_out_of_time_keeps_what_it_wrot
     theirs = _write_out_of_time(mongod_rs, "clustered-compound", op)
     assert theirs == (("err", 50), True), theirs
     assert _write_out_of_time(rust_mongo, "clustered-compound", op) == theirs
+
+
+@pytest.mark.backlog_fixed("RM-390")
+@pytest.mark.parametrize("op", ["update", "delete"])
+def test_a_write_of_many_through_an_in_out_of_time_keeps_what_it_wrote(
+    rust_mongo: Any, mongod_rs: Any, op: str
+) -> None:
+    """The same write through index `b_1` of a clustered collection, its
+    filter an `$in` of the seven values `b` takes: mongod 8.2.11 writes as
+    its plan returns and stops part-way. This server read the `$in`'s every
+    RecordId before the first write, and a budget spent there wrote
+    nothing; an `$in` of plain scalars is now read a page at a time into
+    the write."""
+    theirs = _write_out_of_time(mongod_rs, "clustered-in", op)
+    assert theirs == (("err", 50), True), theirs
+    assert _write_out_of_time(rust_mongo, "clustered-in", op) == theirs

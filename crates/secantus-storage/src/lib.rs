@@ -21269,11 +21269,32 @@ impl Storage {
         if field.starts_with('$') || field == "_id" {
             return Ok(None);
         }
-        // The shapes `lookup_id_keys_via_leading_field` reads otherwise
-        // (`$in`, `$eq`), and those `try_index_id_keys` routes before it
-        // (geo, `$elemMatch`), keep their own reads.
+        // The shapes `try_index_id_keys` routes before it (geo,
+        // `$elemMatch`) keep their own reads, as does an `$in` / `$eq` of
+        // anything but plain scalars, which `lookup_id_keys_via_leading_field`
+        // reads otherwise. An `$in` / `$eq` of plain scalars is the same
+        // points read between bounds, paged (RM-390).
         let Bson::Document(opdoc) = value else {
             return Ok(None);
+        };
+        let plain = |v: &Bson| {
+            !matches!(
+                v,
+                Bson::Document(_) | Bson::Array(_) | Bson::RegularExpression(_) | Bson::Null
+            )
+        };
+        let points_ok = opdoc.len() == 1
+            && match opdoc.iter().next() {
+                Some((k, Bson::Array(vals))) if k == "$in" => {
+                    !vals.is_empty() && vals.iter().all(plain)
+                }
+                Some((k, v)) if k == "$eq" => plain(v),
+                _ => false,
+            };
+        let routed_elsewhere: &[&str] = if points_ok {
+            &ROUTED_ELSEWHERE[2..]
+        } else {
+            &ROUTED_ELSEWHERE
         };
         const ROUTED_ELSEWHERE: [&str; 7] = [
             "$in",
@@ -21286,7 +21307,7 @@ impl Storage {
         ];
         if opdoc.is_empty()
             || !opdoc.keys().all(|k| k.starts_with('$'))
-            || opdoc.keys().any(|k| ROUTED_ELSEWHERE.contains(&k.as_str()))
+            || opdoc.keys().any(|k| routed_elsewhere.contains(&k.as_str()))
         {
             return Ok(None);
         }
