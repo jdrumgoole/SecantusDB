@@ -12773,6 +12773,7 @@ fn plan_explain(
                     let cat = ruleutils::Catalog {
                         lookup,
                         view_sql: &none,
+                        home_schema: None,
                     };
                     ruleutils::explain_join_sort_keys(s, &cat)
                 }
@@ -12837,6 +12838,7 @@ fn plan_explain(
                 let cat = ruleutils::Catalog {
                     lookup,
                     view_sql: &none,
+                    home_schema: None,
                 };
                 // A JOIN, or a comma list of plain relations (`FROM a, b`,
                 // RP-329), whose WHERE's conjuncts over both are join quals.
@@ -38268,6 +38270,11 @@ pub(crate) fn is_pg_catalog_relation(name: &str) -> bool {
         || CATALOG_RELATIONS.iter().any(|(n, _)| *n == name)
 }
 
+/// Is `name` one of `schema`'s system relations?
+pub(crate) fn system_relation_in(schema: &str, name: &str) -> bool {
+    system_relation(schema, name).is_some()
+}
+
 fn system_relation(schema: &str, name: &str) -> Option<i64> {
     SYSTEM_RELATIONS
         .get()?
@@ -40281,6 +40288,12 @@ pub(crate) fn user_type_or_array_oid(name: &str) -> Option<i64> {
             .map(|oid| oid + USER_TYPE_ARRAY_OID_OFFSET),
         None => user_type_oid(trimmed).or_else(|| user_composite_oid(trimmed)),
     }
+}
+
+/// Does `name` resolve to a user-defined type (a domain, enum, range, base
+/// or composite type)?
+pub(crate) fn user_type_exists(name: &str) -> bool {
+    user_type_oid(name).is_some() || user_composite_oid(name).is_some()
 }
 
 fn user_type_oid(name: &str) -> Option<i64> {

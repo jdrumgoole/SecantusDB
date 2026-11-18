@@ -2573,26 +2573,29 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 
 - [ ] **`pg_get_viewdef` of most system views is NULL.** PostgreSQL
       15.19 deparses every `pg_catalog` and `information_schema` view's
-      rule. Here `system_view_defs` prints `system_views.sql`'s queries
-      through `ruleutils`, which reproduces 69 of the 75 `pg_catalog`
-      views exactly (`pg_tables`, `pg_roles`, `pg_stats`, `pg_settings`,
-      `pg_stat_activity`, `pg_stat_database`, every `pg_stat_progress_*`
-      view, ...; none printed wrong, measured 2026-11-18 in both print
-      modes) and leaves the rest NULL rather than print them as written.
+      rule. Here `system_view_defs` prints `system_views.sql`'s and
+      `information_schema.sql`'s queries through `ruleutils`, which
+      reproduces 69 of the 75 `pg_catalog` views and 23 of the 65
+      `information_schema` views exactly (none printed wrong, measured
+      2026-11-18 in both print modes by md5 against a fresh 15.19 cluster)
+      and leaves the rest NULL rather than print them as written.
       Remaining: the 6 other `pg_catalog` views (`pg_policies`,
       `pg_publication_tables`, `pg_seclabels`,
       `pg_stat_replication_slots`, `pg_stats_ext`, `pg_stats_ext_exprs`),
       which the printer refuses (`pg_stat_replication_slots`' query cannot
       even be a user view here: `LATERAL
       pg_stat_get_replication_slot(slot_name) s` gives `s` no columns,
-      42703 `column s.slot_name does not exist`);
-      and every `information_schema` view, left out because the printer
-      casts to the bare domain where ruleutils qualifies it and casts a
-      literal to the base type first
-      (`('c'::character varying)::information_schema.character_data`,
-      `(x)::information_schema.sql_identifier`). A user view over
-      `generate_series(1, c.relnatts)` is still refused: ruleutils casts
-      the int2 argument to `integer`, which the printer does not add.
+      42703 `column s.slot_name does not exist`); and 42
+      `information_schema` views (`columns`, `tables`, `domains`,
+      `views`, `routines`' siblings, the `role_*` / `*_usage` /
+      `*_privileges` views, ...). Most of those compare a domain-typed
+      column with an operator (`administrable_role_authorizations`:
+      `WHERE ((applicable_roles.is_grantable)::text = 'YES'::text)`, the
+      operator resolved on the base type with the column coerced), which
+      the printer refuses: it types the operand as the domain. A user
+      view over `generate_series(1, c.relnatts)` is still refused:
+      ruleutils casts the int2 argument to `integer`, which the printer
+      does not add.
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_the_remaining_system_views
       Backlog-ID: RP-798
 - [ ] **`pg_get_viewdef` types a `name IN (text, unknown)` list as
