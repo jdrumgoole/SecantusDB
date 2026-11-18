@@ -60,7 +60,7 @@ const RC_DECIMAL: usize = 32;
 /// The longest string a classic `Value` keeps inline.
 const SHORT_STR: usize = 11;
 /// An SBE value's tag and word.
-const SBE_VALUE: usize = 9;
+pub(crate) const SBE_VALUE: usize = 9;
 /// The longest string SBE keeps in the word (`StringSmall`).
 const SBE_SMALL_STR: usize = 7;
 /// What a classic accumulator starts at (`sizeof(*this)`; measured for

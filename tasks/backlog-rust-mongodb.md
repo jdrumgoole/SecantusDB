@@ -1117,17 +1117,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Found 2026-11-18 working RM-613.
       Verify: tests/backlog/test_rm_found_2026_11_18_rm613.py::test_an_approximate_median_is_mongods_tdigest
       Backlog-ID: RM-720
-- [ ] **An SBE sort counts no memory for a field a document lacks.**
-      mongod 8.2.11 counts every slot of an SBE sort's row in the memory it
-      holds, a missing field's `Nothing` included (`getApproximateSize`:
-      its tag and value, 9 bytes); this server counts only the fields a
-      document has (`sorter::doc_size`). With `t` on half of 300 documents
-      of a 1000-byte `s`, `[{$sort: {n: 1}}, {$group: {_id: "$k", f:
-      {$first: "$t"}, g: {$first: "$s"}}}]` under 50000 bytes reports
-      `sortTotalDataSizeBytes` 276834 on mongod and 275673 here (129 slots of
-      9). Found 2026-11-13 (RM-506).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm506.py::test_a_missing_field_counts_its_slot
-      Backlog-ID: RM-616
 - [ ] **`explain` with `executionStats` answers where a `$setWindowFields`
       fails.** mongod 8.2.11 runs the pipeline for `executionStats` and
       returns the executor's error: a `$sum` of `{$divide: [1, "$z"]}` over

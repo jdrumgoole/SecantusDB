@@ -149,13 +149,24 @@ fn doc_size(doc: &Document, sizing: &Sizing) -> usize {
         sizing.fields.is_none_or(|f| f.contains(k)) && sizing.added.is_none_or(|a| !a.contains(k))
     };
     let body = if sizing.source == SortSource::Sbe {
-        doc.iter()
-            .filter(|(k, _)| kept(k))
-            .map(|(_, v)| memlimit::sbe_size(v))
-            .sum::<usize>()
-            + beside_values(doc, sizing)
-                .map(memlimit::sbe_size)
-                .sum::<usize>()
+        // Every slot of the row counts, a field the document lacks
+        // included: `Nothing` is a tag and a value (`getApproximateSize`,
+        // RM-616).
+        let slot = |v: Option<&Bson>| v.map_or(memlimit::SBE_VALUE, memlimit::sbe_size);
+        match sizing.fields {
+            Some(fields) => fields
+                .iter()
+                .filter(|k| kept(k))
+                .map(|k| slot(doc.get(k)))
+                .sum::<usize>(),
+            None => {
+                doc.iter()
+                    .filter(|(k, _)| kept(k))
+                    .map(|(_, v)| memlimit::sbe_size(v))
+                    .sum::<usize>()
+                    + beside_values(doc, sizing).map(slot).sum::<usize>()
+            }
+        }
     } else if sizing.fields.is_none() && sizing.added.is_none() {
         memlimit::bson_len(doc)
     } else {
@@ -254,7 +265,10 @@ fn kept(doc: &Document, sizing: &Sizing) -> Document {
 /// The values of the named slots an SBE sort's whole-document row holds
 /// beside the document (RM-615), in name order: a field the document lacks
 /// is not counted (RM-616).
-fn beside_values<'d>(doc: &'d Document, sizing: &Sizing<'d>) -> impl Iterator<Item = &'d Bson> {
+fn beside_values<'d>(
+    doc: &'d Document,
+    sizing: &Sizing<'d>,
+) -> impl Iterator<Item = Option<&'d Bson>> {
     sizing
         .fields
         .is_none()
@@ -262,7 +276,7 @@ fn beside_values<'d>(doc: &'d Document, sizing: &Sizing<'d>) -> impl Iterator<It
         .flatten()
         .into_iter()
         .flatten()
-        .filter_map(|n| doc.get(n))
+        .map(|n| doc.get(n))
 }
 
 /// The slots of an SBE sort's row of kept values, by name
@@ -1325,6 +1339,21 @@ fn meta_sort_fields(spec: &Bson) -> R<(Vec<(String, bool)>, Vec<(usize, MetaKey)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_sbe_row_counts_a_missing_fields_slot() {
+        let fields: BTreeSet<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let sizing = Sizing {
+            source: SortSource::Sbe,
+            fields: Some(&fields),
+            budget: 1 << 20,
+            added: None,
+            sizes: None,
+            beside: None,
+        };
+        // `b` is `Nothing`: a tag and a value, as `a`'s int (RM-616).
+        assert_eq!(doc_size(&doc! {"a": 1}, &sizing), 9 + 9 + 32);
+    }
+
     use super::*;
 
     /// RM-577: a `default` sort of documents counts each RID_AND_OBJ

@@ -59,12 +59,12 @@ def _missing_field(client: Any) -> dict:
     return {k: entry.get(k) for k in ("sortSpills", "sortSpilledBytes", "sortTotalDataSizeBytes")}
 
 
-@pytest.mark.backlog("RM-616")
+@pytest.mark.backlog_fixed("RM-616")
 def test_a_missing_field_counts_its_slot(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 counts an SBE sort row's slot for a field a document
     lacks (`Nothing`) in the memory the sort holds, as it counts any value
-    (`getApproximateSize`: its tag and value, 9 bytes); this server counts
+    (`getApproximateSize`: its tag and value, 9 bytes); this server counted
     nothing for it: with `t` on half of 300 documents, mongod reports a
     `sortTotalDataSizeBytes` of 276834, this server 275673 (129 slots of
-    9)."""
+    9) before RM-616 was fixed."""
     assert _missing_field(rust_mongo) == _missing_field(mongod)
