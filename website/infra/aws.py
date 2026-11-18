@@ -485,7 +485,8 @@ function handler(event) {
     // page's relative links resolve against the directory.
     var last = uri.substring(uri.lastIndexOf('/') + 1);
     if (last.length > 0 && last.indexOf('.') === -1) {
-        var qs = Object.keys(request.querystring).length ? '?' + Object.keys(request.querystring).map(function (k) {
+        var keys = Object.keys(request.querystring);
+        var qs = keys.length ? '?' + keys.map(function (k) {
             var v = request.querystring[k];
             return v.value === '' ? k : k + '=' + v.value;
         }).join('&') : '';
