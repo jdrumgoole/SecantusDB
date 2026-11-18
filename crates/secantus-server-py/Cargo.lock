@@ -718,9 +718,9 @@ checksum = "4443176a9f2c162692bd3d352d745ef9413eec5782a80d8fd6f8a1ac692a07f7"
 
 [[package]]
 name = "fancy-regex"
-version = "0.14.0"
+version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e24cb5a94bcae1e5408b0effca5cd7172ea3c5755049c5f3af4cd283a165298"
+checksum = "0a2e16b9a584b602f1e0e5e22c30ca0906786088c27500653e432d086def8b53"
 dependencies = [
  "bit-set",
  "regex-automata",
@@ -1653,24 +1653,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pg_query"
-version = "6.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42a66643c4aa9c929b68b2c9e30d6c4d955bfd1e87e255ce6c5d0c026082436c"
-dependencies = [
- "bindgen",
- "cc",
- "fs_extra",
- "glob",
- "itertools 0.10.5",
- "prost",
- "prost-build",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "phf"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2328,7 +2310,6 @@ dependencies = [
  "futures",
  "libc",
  "md-5 0.10.6",
- "pg_query",
  "pkcs8",
  "postgres-types",
  "rand 0.9.5",
@@ -2336,6 +2317,7 @@ dependencies = [
  "rustls-pki-types",
  "secantus-auth",
  "secantus-core",
+ "secantus-pg-query",
  "secantus-pgcatalog",
  "secantus-pgplan",
  "secantus-pgwire",
@@ -2346,6 +2328,22 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+]
+
+[[package]]
+name = "secantus-pg-query"
+version = "0.1.0-beta.17"
+dependencies = [
+ "bindgen",
+ "cc",
+ "fs_extra",
+ "glob",
+ "itertools 0.10.5",
+ "prost",
+ "prost-build",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2366,6 +2364,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "des",
+ "fancy-regex",
  "flate2",
  "getrandom 0.2.17",
  "hmac 0.12.1",
@@ -2378,11 +2377,11 @@ dependencies = [
  "md-5 0.10.6",
  "num-bigint",
  "num-traits",
- "pg_query",
  "prost",
  "pwhash",
  "regex",
  "rust-stemmers",
+ "secantus-pg-query",
  "secantus-pgcatalog",
  "serde_json",
  "sha1",
@@ -2855,7 +2854,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",

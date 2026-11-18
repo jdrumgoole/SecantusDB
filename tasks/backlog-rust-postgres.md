@@ -2727,14 +2727,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap test is in
 `tests/backlog/test_rp_found_rp423.py`.
 
-- [ ] **A back reference under `~*` compares case-sensitively.** `select
-      'ABab' ~* '(ab)\1'` is `t` on PostgreSQL 15.19 (the ARE engine
-      compares a back reference under the pattern's case folding); here it
-      is `f`. Since RP-1022 a pattern the linear `regex` crate refuses runs
-      on `fancy-regex` (`pg_regex::PgRegex`), and fancy-regex 0.14 matches a
-      back reference byte for byte even under `(?i)`.
-      Verify: tests/backlog/test_rp_found_rp423.py::test_a_case_insensitive_back_reference
-      Backlog-ID: RP-1022
 - [ ] **`clamp_row_est` rounds a half away from zero.** PostgreSQL 15.19's
       `clamp_row_est` is `rint`, ties to even: `select max(x) from hv group
       by k having max(x) <> 5` over 300 groups (`hv(x numeric, k int)`,

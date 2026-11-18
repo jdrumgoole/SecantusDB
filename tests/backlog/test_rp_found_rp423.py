@@ -3,7 +3,8 @@
 - a back reference was an invalid regex outside a WHERE: the scalar
   evaluator and the regex builtins compiled with a linear engine that
   refuses it (RP-1022, fixed: they fall back to a backtracking one);
-- a back reference under `~*` still compares case-sensitively (RP-1022).
+- a back reference under `~*` compared case-sensitively (RP-1022, fixed:
+  fancy-regex 0.20).
 
 An answer is the rows and the column names, or `(sqlstate, message,
 position)` for an error. Measured on PostgreSQL 15.19 (the shared reference
@@ -61,7 +62,37 @@ def test_a_back_reference_outside_a_where(query: str, dsn: str) -> None:
     assert answer(dsn, query) == BACK_REFERENCES[query]
 
 
-@pytest.mark.backlog("RP-1022")
-def test_a_case_insensitive_back_reference(dsn: str) -> None:
-    """Under `~*` the back reference matches case-insensitively too."""
-    assert answer(dsn, r"select 'ABab' ~* '(ab)\1' as m") == ([(True,)], ["m"])
+# fancy-regex 0.14 compared a back reference byte for byte even under
+# `(?i)`; 0.20 folds it. The WHERE path (`secantus-core`) runs the same
+# engine. ASCII only: the reference's database is `ctype C`, which folds no
+# other letter.
+CASE_INSENSITIVE = {
+    r"select 'ABab' ~* '(ab)\1' as m": ([(True,)], ["m"]),
+    r"select 'ABab' ~ '(?i)(ab)\1' as m": ([(True,)], ["m"]),
+    r"select 'abAB' !~* '(ab)\1' as m": ([(False,)], ["m"]),
+    r"select 'ABab' ~ '(ab)\1' as m": ([(False,)], ["m"]),
+    r"select regexp_replace('ABabX', '(ab)\1', 'Y', 'i') as r": ([("YX",)], ["r"]),
+    r"select regexp_match('xAbaB', '(ab)\1', 'i') as r": ([(["Ab"],)], ["r"]),
+    r"select regexp_count('ABab abAB', '(ab)\1', 1, 'i') as n": ([(2,)], ["n"]),
+    r"select x from (values ('ABab'), ('abab'), ('abAB'), ('abcd')) v(x)"
+    r" where x ~* '(ab)\1' order by x": ([("ABab",), ("abAB",), ("abab",)], ["x"]),
+}
+
+
+@pytest.mark.backlog_fixed("RP-1022")
+@pytest.mark.parametrize("query", list(CASE_INSENSITIVE))
+def test_a_case_insensitive_back_reference(query: str, dsn: str) -> None:
+    """Under `~*` the back reference matched case-sensitively."""
+    assert answer(dsn, query) == CASE_INSENSITIVE[query]
+
+
+@pytest.mark.backlog_fixed("RP-1022")
+def test_a_case_insensitive_back_reference_in_a_where(dsn: str) -> None:
+    """A table's WHERE runs the pattern in `secantus-core`."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop table if exists r1022")
+        c.execute("create table r1022 (x text)")
+        c.execute("insert into r1022 values ('ABab'), ('abab'), ('abAB'), ('abcd')")
+        rows = c.execute(r"select x from r1022 where x ~* '(ab)\1' order by x").fetchall()
+        count = c.execute(r"select count(*) from r1022 where x !~* '(ab)\1'").fetchone()
+    assert (rows, count) == ([("ABab",), ("abAB",), ("abab",)], (1,))
