@@ -1820,13 +1820,17 @@ fn retry_batch(
             crate::run_handler(handler, &reduced, ctx)
         }
     });
-    if !ok(&reply) {
-        return (reply, Vec::new());
-    }
+    // The statements that wrote are kept whatever the command answered: a
+    // batch that fails part-way (an interrupt between two statements, a
+    // spent `maxTimeMS`) leaves the statements before it committed, and a
+    // retry must answer for them, not run them again.
     let records: Vec<(i32, StmtRecord)> = noted
         .into_iter()
         .filter_map(|(position, record)| Some((ids[*fresh.get(position)?], record)))
         .collect();
+    if !ok(&reply) {
+        return (reply, records);
+    }
     if direct {
         return (reply, records);
     }
@@ -2267,6 +2271,45 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("refused: {}", e.errmsg));
         assert!(env.in_txn && env.start && env.txn_number == Some(0));
+    }
+
+    /// RM (killed batch): an `update` batch that fails part-way -- a kill
+    /// that lands as the next statement takes its locks makes the handler
+    /// return `Err` -- leaves the statements before it committed, and their
+    /// records must survive the failed reply: a retry answers for them and
+    /// runs the rest, where dropping them applied `$inc` a second time.
+    #[test]
+    fn a_batch_that_fails_part_way_keeps_the_records_of_its_applied_statements() {
+        fn two_then_killed(_: &Document, _: &mut CommandContext) -> crate::HandlerResult {
+            for index in 0..2 {
+                transactions::note_statement(index, StmtRecord::Update { upserted: None });
+            }
+            Err(CommandError::new(
+                11601,
+                "Interrupted",
+                "operation was interrupted",
+            ))
+        }
+        let command = doc! {
+            "update": "c",
+            "updates": [
+                {"q": {"_id": 0}, "u": {"$inc": {"n": 1}}},
+                {"q": {"_id": 1}, "u": {"$inc": {"n": 1}}},
+                {"q": {"_id": 2}, "u": {"$inc": {"n": 1}}},
+            ],
+        };
+        let mut ctx = CommandContext::new(7);
+        let (reply, records) = retry_batch(
+            "update",
+            two_then_killed,
+            &command,
+            &mut ctx,
+            &[0, 1, 2],
+            &transactions::Applied::default(),
+        );
+        assert!(!ok(&reply), "{reply}");
+        let kept: Vec<i32> = records.iter().map(|(id, _)| *id).collect();
+        assert_eq!(kept, vec![0, 1]);
     }
 
     #[test]
