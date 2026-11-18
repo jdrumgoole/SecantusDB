@@ -1421,7 +1421,12 @@ fn classic_topn_take(
 /// `aggTopBottomNFinalize`, 8.2.11): a heap whose root is the worst kept, a
 /// document replacing it when it sorts strictly before it (after it, for the
 /// bottom), and the heap sorted into sort order at the end.
-fn sbe_top_bottom_n(items: Vec<Keyed>, n: usize, top: bool, dirs: &[bool]) -> Vec<Keyed> {
+pub(crate) fn sbe_top_bottom_n(
+    items: Vec<Keyed>,
+    n: usize,
+    top: bool,
+    dirs: &[bool],
+) -> Vec<Keyed> {
     let heap_less = |a: &Keyed, b: &Keyed| {
         let o = pattern_cmp(&a.0, &b.0, dirs);
         if top {
@@ -1575,7 +1580,7 @@ fn classic_nelem_take(
 /// `$maxN` / `$minN` as SBE keeps them (`aggMinMaxN`, 8.2.11): a heap of at
 /// most `n` values whose root is the worst kept; a value replaces the root
 /// when it is strictly better, and the heap is sorted best first at the end.
-fn sbe_min_max_n(vals: Vec<Bson>, n: usize, largest: bool) -> Vec<Bson> {
+pub(crate) fn sbe_min_max_n(vals: Vec<Bson>, n: usize, largest: bool) -> Vec<Bson> {
     let better = |a: &Bson, b: &Bson| {
         let o = crate::order::cmp(a, b);
         if largest {
@@ -2591,6 +2596,21 @@ fn run_group(
     let mut acc_max: Vec<usize> = vec![0; compiled.len()];
     let mut spills = crate::group_spill::Spills::default();
     let shape = crate::group_spill::IdShape::of(id_expr);
+    // SBE checks its table as mongod's `HashAggStage` does (RM-612).
+    let specs: Vec<crate::sbe_hashagg::AccSpec> = compiled
+        .iter()
+        .map(|c| crate::sbe_hashagg::AccSpec {
+            op: c.op,
+            arg: c.arg,
+        })
+        .collect();
+    let mut sbe_check = crate::sbe_hashagg::MemoryCheck::default();
+    let sbe_spilled = |ids: &[Bson], states: &[Vec<Acc>]| -> usize {
+        ids.iter()
+            .zip(states)
+            .map(|(id, accs)| crate::sbe_hashagg::spilled_bytes(id_expr, id, &specs, accs))
+            .sum()
+    };
 
     for d in docs {
         crate::deadline::check()?;
@@ -2636,16 +2656,32 @@ fn run_group(
         } else {
             memlimit::budgets().group
         };
-        if budgeted && mem > limit {
+        // SBE estimates its table from the row the document went to, at
+        // checkpoints it paces (`checkMemoryUsageAndSpillIfNecessary`), and
+        // spills when the estimate reaches the budget.
+        let over = if sbe {
+            budgeted
+                && sbe_check.should_spill(
+                    ids.len(),
+                    || crate::sbe_hashagg::row_size(id_expr, &ids[idx], &specs, &states[idx]),
+                    limit,
+                )
+        } else {
+            budgeted && mem > limit
+        };
+        if over {
             if !memlimit::disk_allowed() {
                 return Err(group_memory_error(sbe));
             }
             index.clear();
+            // SBE counts the records it writes; the classic engine its
+            // memory estimate.
+            let held = if sbe { sbe_spilled(&ids, &states) } else { mem };
             crate::group_spill::spill(
                 std::mem::take(&mut ids),
                 std::mem::take(&mut states),
                 &mut spills,
-                mem,
+                held,
                 &shape,
             )?;
             mem = 0;
@@ -2656,7 +2692,8 @@ fn run_group(
     let out = if !spills.is_empty() {
         // What is still in memory is spilled too, and every group comes out
         // of the merge, in key order.
-        crate::group_spill::spill(ids, states, &mut spills, mem, &shape)?;
+        let held = if sbe { sbe_spilled(&ids, &states) } else { mem };
+        crate::group_spill::spill(ids, states, &mut spills, held, &shape)?;
         let accs: Vec<(&str, &str, &Bson)> =
             compiled.iter().map(|c| (c.field, c.op, c.arg)).collect();
         crate::group_spill::merge(spills, &accs, &shape, vars)?
@@ -2689,7 +2726,7 @@ fn run_group(
 
 /// The fields of an `_id` that is an expression object: mongod groups on
 /// each one's value (`_idFieldNames`, `_idExpressions`).
-fn id_fields(id_expr: &Bson) -> Option<Vec<(&str, &Bson)>> {
+pub(crate) fn id_fields(id_expr: &Bson) -> Option<Vec<(&str, &Bson)>> {
     match id_expr {
         Bson::Document(d) if d.keys().next().is_some_and(|k| !k.starts_with('$')) => {
             Some(d.iter().map(|(k, e)| (k.as_str(), e)).collect())

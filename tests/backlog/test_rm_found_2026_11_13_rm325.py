@@ -62,13 +62,14 @@ def test_a_window_spill_the_engine_writes_out_is_mongods_size(rust_mongo: Any, m
 SBE_BUDGET = "internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill=50000"
 
 
-def _sbe_group_spill(client: Any) -> dict:
+def _sbe_group_spill(client: Any, group: dict | None = None) -> dict:
     client.drop_database("rm325sbe")
     db = client.rm325sbe
     db.c.insert_many([{"_id": i, "k": i % 7, "s": "x" * 1000, "n": i} for i in range(300)])
     db.command({"profile": 2})
     try:
-        list(db.c.aggregate([{"$group": {"_id": "$n", "t": {"$push": "$s"}}}], comment="sbe"))
+        group = group or {"_id": "$n", "t": {"$push": "$s"}}
+        list(db.c.aggregate([{"$group": group}], comment="sbe"))
     finally:
         db.command({"profile": 0})
     entry = db.system.profile.find_one({"command.comment": "sbe"}) or {}
@@ -89,17 +90,35 @@ def _mongod_with(*extra: str) -> Iterator[Any]:
         _stop_mongod(proc, dbpath)
 
 
-@pytest.mark.backlog("RM-612")
-def test_an_sbe_group_spills_as_mongods(tmp_path: Any) -> None:
+# Shapes whose spills mongod 8.2.11 counts differently from a memory sum:
+# 7 spills of 321900 bytes, 7 of 304200, 8 of 328500, 7 of 312693 over 49
+# records (2026-11-18).
+SBE_SHAPES = [
+    {"_id": "$n", "t": {"$push": "$s"}},
+    {"_id": "$n", "t": {"$push": "$s"}, "c": {"$sum": "$n"}},
+    {"_id": "$n", "t": {"$first": "$s"}},
+    {
+        "_id": {"a": "$n", "b": "$k"},
+        "t": {"$addToSet": "$s"},
+        "m": {"$maxN": {"input": "$n", "n": 3}},
+    },
+    {"_id": "$k", "t": {"$topN": {"output": "$s", "sortBy": {"n": -1, "k": 1}, "n": 20}}},
+]
+
+
+@pytest.mark.backlog_fixed("RM-612")
+@pytest.mark.parametrize("group", SBE_SHAPES, ids=["push", "push-sum", "first", "set-maxn", "topn"])
+def test_an_sbe_group_spills_as_mongods(tmp_path: Any, group: dict) -> None:
     """mongod 8.2.11 started with the SBE `$group`'s budget at 50000 spills a
     `$push` of 300 1000-byte strings 7 times, 312300 bytes, into its spill
-    engine (4096 on disk). This server takes the parameter and spills to its
-    spill engine the same 7 times (RM-612's first part), but counts 306900
-    bytes, its memory estimate."""
+    engine (4096 on disk). This server spilled the same 7 times but counted
+    306900 bytes, its memory estimate, and spilled other shapes a different
+    number of times, until it ported `HashAggStage`'s memory check and the
+    bytes of each record it writes."""
     with _mongod_with("--setParameter", SBE_BUDGET) as mongod:
-        expected = _sbe_group_spill(mongod)
+        expected = _sbe_group_spill(mongod, group)
     with rust_mongo_server(tmp_path, "--setParameter", SBE_BUDGET) as rust:
-        assert _sbe_group_spill(rust) == expected
+        assert _sbe_group_spill(rust, group) == expected
 
 
 def _median_spilled_bytes(client: Any) -> Any:

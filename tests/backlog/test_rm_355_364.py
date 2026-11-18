@@ -523,8 +523,43 @@ def test_a_write_reports_mongods_locks_and_flow_control(
 
 #: Writes whose locks are not mongod's yet (RM-357's remainder).
 _DIVERGING_WRITES = {
-    "$out": lambda d: list(_w1(_plain(d)).aggregate([{"$match": {}}, {"$out": "o"}])),
+    # mongod takes the global IS three times on the line of a collectionless
+    # aggregate whose `$lookup` reads a collection; this server once.
+    "$documents and $lookup": lambda d: list(
+        _plain(d).aggregate(
+            [
+                {"$documents": [{"_id": 1}]},
+                {"$lookup": {"from": "c", "localField": "_id", "foreignField": "_id", "as": "j"}},
+            ]
+        )
+    ),
 }
+
+
+#: `$out`, to a new target and replacing one.
+_OUTS = {
+    "$out": lambda d: list(_w1(_plain(d)).aggregate([{"$match": {}}, {"$out": "o"}])),
+    "$out replacing its target": lambda d: [
+        list(_w1(_plain(d)).aggregate([{"$match": {}}, {"$out": "o"}])) for _ in range(2)
+    ],
+}
+
+
+@pytest.mark.backlog_fixed("RM-357")
+@pytest.mark.parametrize("name", list(_OUTS))
+def test_out_reports_a_replica_sets_locks(
+    rust_mongo: Any, mongod_rs_no_yield: Any, name: str
+) -> None:
+    """mongod 8.2.11's primary checks an `$out` under four global IS, each
+    with the transition lock, and takes the transition lock alone once more
+    for each X round after the first: `{ReplicationStateTransition: {w:
+    10}, Global: {r: 5, w: 4}}`, 12 and `{r: 5, w: 5}` replacing its target
+    (measured 2026-11-18, time-based yields off, which the Linux build does
+    not make here). This server took a standalone's rounds, six global IS
+    without the transition lock."""
+    answers = _write_locks(rust_mongo, mongod_rs_no_yield, _OUTS[name])
+    assert answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
 
 
 #: Retryable updates and deletes: each statement keeps its session's row.
@@ -1610,15 +1645,30 @@ def test_a_counted_time_series_read_counts_what_it_examined(
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-363")
+@pytest.mark.backlog_fixed("RM-363")
 def test_a_count_stage_time_series_read_counts_what_it_examined(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11 runs `{$count: "n"}` over five buckets as a constant
     `$group` and a `$project`, and its line counts the five it examined
-    (measured 2026-11-18). This server reads the collection whole under a
-    `$count`, and counts nothing."""
+    (measured 2026-11-18). This server read the collection whole under a
+    `$count`, and counted nothing, until a `$count` ran over the buckets as
+    a `$group` on a constant does."""
     pipeline = [{"$count": "n"}]
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.aggregate(pipeline)), _series)
+    answers = {s: _counts(_line(lines, "aggregate")) for s, (lines, _) in got.items()}
+    assert "docsExamined" in answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog("RM-363")
+def test_a_group_after_a_measurement_match_counts_what_it_examined(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 runs a `$group` after a `$match` on a measurement field
+    in the slot-based engine, and its line counts the buckets it examined.
+    This server reads the collection whole there, and counts nothing."""
+    pipeline = [{"$match": {"v": {"$gte": 10}}}, {"$group": {"_id": "$m", "n": {"$sum": 1}}}]
     got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.aggregate(pipeline)), _series)
     answers = {s: _counts(_line(lines, "aggregate")) for s, (lines, _) in got.items()}
     assert "docsExamined" in answers["mongod"]

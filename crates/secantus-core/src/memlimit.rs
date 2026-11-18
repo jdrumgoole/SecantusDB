@@ -62,7 +62,7 @@ const SHORT_STR: usize = 11;
 /// An SBE value's tag and word.
 pub(crate) const SBE_VALUE: usize = 9;
 /// The longest string SBE keeps in the word (`StringSmall`).
-const SBE_SMALL_STR: usize = 7;
+pub(crate) const SBE_SMALL_STR: usize = 7;
 /// What a classic accumulator starts at (`sizeof(*this)`; measured for
 /// `$addToSet`, and used for the others, whose size the errors never show).
 pub const ACCUMULATOR_BASE: usize = 144;
@@ -665,7 +665,7 @@ pub fn bson_len(doc: &Document) -> usize {
         .sum::<usize>()
 }
 
-fn array_len(items: &[Bson]) -> usize {
+pub(crate) fn array_len(items: &[Bson]) -> usize {
     5 + items
         .iter()
         .enumerate()
@@ -683,7 +683,7 @@ fn digits(mut i: usize) -> usize {
 }
 
 /// The bytes `v` takes as a BSON element's value.
-fn value_len(v: &Bson) -> usize {
+pub(crate) fn value_len(v: &Bson) -> usize {
     match v {
         Bson::Double(_) | Bson::DateTime(_) | Bson::Timestamp(_) | Bson::Int64(_) => 8,
         Bson::String(s) | Bson::JavaScriptCode(s) | Bson::Symbol(s) => 5 + s.len(),

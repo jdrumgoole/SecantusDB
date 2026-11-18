@@ -587,7 +587,9 @@ These are explicit non-goals. Don't add them without a reason.
       `Metadata: {W: 1}` and global, database and collection IX in its
       command's locks; since 2026-11-18 a retryable `update` or `delete`
       statement takes its own round as it runs and keeps its session's row
-      under it. Still different,
+      under it; since 2026-11-18 an `$out` on a replica set's primary takes
+      its four global IS under the transition lock, and the transition lock
+      alone once for each X round after the first. Still different,
       measured against a one-member replica set:
       - an `insert` of several documents one of which fails: mongod inserts
         them again a document at a time, each under a transition, global,
@@ -598,10 +600,7 @@ These are explicit non-goals. Don't add them without a reason.
       - a profiled `update` or `delete` statement's entry's locks are taken
         without interrupt checks here (the command's `numInterruptChecks`
         is mongod's without them);
-      - `$out` takes more transition locks than this server's rounds
-        (measured on a standalone, RM-185), and an `$out`'s line here has
-        one global IS more than mongod's (7 to 6, measured 8.2.11
-        2026-11-12); a `collMod` of a collection not there is not measured;
+      - a `collMod` of a collection not there is not measured;
       - each global lock taken apart takes an execution ticket, so where
         these locks differ the line's `queues.execution` admissions differ
         too (RM-355);
@@ -735,10 +734,11 @@ These are explicit non-goals. Don't add them without a reason.
       a `find`, an `aggregate` of a collection mongod's query layer runs
       whole, a `$sort` after an SBE `$group`, or (since 2026-11-18 asked for a first batch of none too, the `$sort` after a `$group` included) whose stages after its cursor stage are `$project`,
       `$unset`, `$addFields`, `$set`, `$replaceRoot`, `$replaceWith`,
-      `$unwind` and `$skip`, and the `getMore`s of its cursor,
+      `$unwind`, `$skip` and (since 2026-11-18, with a cursor stage over a
+      plan with a limit filling one buffer to it) `$limit`, and the `getMore`s of its cursor,
       `listIndexes`, `listCollections`, `collStats`, `ping`, `buildInfo`,
       and an `insert`, `update` or `delete` on a member of a replica set
-      prints mongod's count (88 shapes in
+      prints mongod's count (93 shapes in
       `tests/mongod_live/test_interrupt_checks.py`). Every other line
       prints none, where mongod prints one:
       - a read with more than one candidate plan, a plan from the plan
@@ -749,8 +749,7 @@ These are explicit non-goals. Don't add them without a reason.
         all for a cached plan, and this planner's candidates are not its
         enumeration;
       - the other aggregates: one with a `$match` or `$redact` left after
-        its read, a `$limit` there (it stops its source short
-        of the documents this server runs in one go), a `$lookup`,
+        its read, a `$lookup`,
         `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a `$group`
         run classic over the cursor stage (a `$bucket` of 400 buckets: 16
         and a `getMore` of 4 on mongod), one over a
@@ -825,7 +824,7 @@ These are explicit non-goals. Don't add them without a reason.
         `$group` (since 2026-11-18 a `$group` on the
         meta field that only counts, which mongod runs over the buckets,
         counts as mongod's does, and since 2026-11-18 one on a constant,
-        `count_documents`'s; a `$count` stage, a `$group` after a `$match`
+        `count_documents`'s, and a `$count` stage; a `$group` after a `$match`
         on a measurement field, which mongod runs in SBE, and one after a
         `$match` on the meta field, which mongod reads through its index,
         still count nothing), an inclusion `$project` (RM-456), a
@@ -838,7 +837,7 @@ These are explicit non-goals. Don't add them without a reason.
         mongod 5 keys and 4 documents, this server none).
       Measured 2026-10-27, 2026-11-07, 2026-11-10 and 2026-11-13.
       Backlog-ID: RM-363
-      Verify: tests/backlog/test_rm_355_364.py::test_a_count_stage_time_series_read_counts_what_it_examined
+      Verify: tests/backlog/test_rm_355_364.py::test_a_group_after_a_measurement_match_counts_what_it_examined
 - [ ] **A time-series `$group` on the meta field that sums `1.0` answers a
       double.** mongod 8.2.11 rewrites `{$group: {_id: "$m", n: {$sum:
       1.0}}}` over a time-series collection to a sum of each bucket's
@@ -1048,19 +1047,21 @@ about forty such points; these are the ones measured.
       a collection scan (since 2026-11-10), a one-field bounded index read
       (since 2026-11-17), and a filter of operator clauses no index covers
       whole through one field's bounded read, a compound index's included
+      (since 2026-11-18), and one field's `$in` / `$eq` of plain scalars
       (since 2026-11-18), a page at a time, writing each page first. The
       router's other index reads (`try_index_id_keys`: an equality prefix
-      of a compound index, `$in` / `$eq`, `$and`, `$or`, `$elemMatch`,
-      geo) are still read whole before the first page, and a budget spent
+      of a compound index, a plain equality `{a: 5}`, an `$in` holding a
+      null, document, array or regex, `$and`, `$or`, `$elemMatch`, geo)
+      are still read whole before the first page, and a budget spent
       there writes nothing. The work is to stream a clustered collection's
       plan as an ordinary one's (its natural order is `_id`'s, which the
       stream does not yet read), or to page each of those reads into the
       write as `bounded_span_pages` does; none of those shapes is probed
       against mongod yet.
       Backlog-ID: RM-390
-      Verify: none -- the compound residual read this item's gap test
-      measured is paged (tests/backlog/test_rm_found_2026_11_10_rm390.py,
-      now backlog_fixed); the remaining shapes have no gap test until one
+      Verify: none -- the compound residual and `$in` reads this item's
+      gap tests measured are paged
+      (tests/backlog/test_rm_found_2026_11_10_rm390.py, now backlog_fixed); the remaining shapes have no gap test until one
       is probed against mongod 8.2.
 
 ### 7.086 The Rust MongoDB server, audited -- 2026-10-20
@@ -1093,24 +1094,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       to run. Found 2026-11-13 working RM-325.
       Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_a_window_spill_the_engine_writes_out_is_mongods_size
       Backlog-ID: RM-611
-- [ ] **An SBE `$group`'s spill counts bytes, and spills, by this server's
-      estimate, not mongod's.** With its budget
-      (`internalQuerySlotBasedExecutionHashAggApproxMemoryUseInBytesBeforeSpill`,
-      taken at runtime and at startup since RM-612's first part) at 50000,
-      mongod 8.2.11 spills 300 single-value groups 7 times for each shape
-      below, and its `groupSpilledBytes` follows the spilled value rows:
-      `{$push: "$s"}` of a 1000-byte string 312300, with a `$sum` beside it
-      321900, `{$first: "$s"}` 304200, a `$sum` keyed on a 1000-byte string
-      12300, no accumulator at all 2700 (9 a group). This server reports its
-      memory estimate at each spill (306900 for each of the first four),
-      and keyed on a 1000-byte string spills 6 times, 304990 bytes: SBE's
-      hash-table accounting (`HashAggStage`'s memory check and its
-      `spilledBytes`) needs porting. The spill itself now goes to one
-      table of the spill engine, as mongod's does (spills, records and the
-      4096-byte storage size match). Found 2026-11-13 working RM-325;
-      measured 2026-11-18.
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_an_sbe_group_spills_as_mongods
-      Backlog-ID: RM-612
 - [ ] **An approximate `$median` / `$percentile` ranks the values, where
       mongod interpolates its t-digest.** mongod 8.2.11 answers from
       `TDigest` (delta 2000, a flush every 6000 values that merges
@@ -1169,16 +1152,14 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       of its own, apart from every BSON value. Found 2026-11-13 (RM-525).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm525.py::test_a_stored_undefined_is_not_missing, tests/backlog/test_rm_found_2026_11_13_rm525.py::test_a_group_keeps_undefined_apart_from_null
       Backlog-ID: RM-635
-- [ ] **A `$match` that reads a missing sort key names it `undefined`.**
-      With no `$sort` ahead of it, `{$match: {$expr: {$gt: [{$size:
-      {$meta: "sortKey"}}, 0]}}}` is mongod 8.2.11's 17124 "Executor error
-      during aggregate command on namespace: ... :: caused by :: The
-      argument to $size must be an array, but was of type: missing"; this
-      server's has no envelope and says `undefined`. (`$addFields` reads
-      the key as `[]` on both.) The `undefined` is RM-635's MISSING; the
-      envelope is this item's own. Found 2026-11-13 (RM-524).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm524.py::test_a_match_reads_a_missing_sort_key
-      Backlog-ID: RM-633
+- [ ] **A leading `$match` on `{$size: "$$REMOVE"}` is an executor error.**
+      mongod 8.2.11 folds it: 17124 "Failed to optimize pipeline :: caused
+      by :: The argument to $size must be an array, but was of type:
+      missing"; this server's says "Executor error during aggregate command
+      on namespace: ...". `$addFields` folds on both. Found 2026-11-18
+      (RM-633).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm524.py::test_a_match_on_a_constant_remove_fails_to_optimize
+      Backlog-ID: RM-722
 - [ ] **A `$project` of `{$meta: "sortKey"}` with no `$sort` is refused as
       unsupported.** mongod 8.2.11 refuses `{$project: {t: {$type: {$meta:
       "sortKey"}}}}` with code 2 "Failed to determine whether query system

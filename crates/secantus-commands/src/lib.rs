@@ -2118,6 +2118,7 @@ fn dispatch_inner(
                         let facts = lock_manager::StorageFacts {
                             storage: ctx.storage.as_ref(),
                             db: &ctx.db_name,
+                            replica_set: ctx.replica_set_name.is_some(),
                         };
                         let locks = lock_manager::Guard::statement(
                             ctx.locks.as_ref(),
@@ -2609,6 +2610,7 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
         let facts = lock_manager::StorageFacts {
             storage: ctx.storage.as_ref(),
             db: &ctx.db_name,
+            replica_set: ctx.replica_set_name.is_some(),
         };
         match lock_manager::Guard::statement(ctx.locks.as_ref(), doc, &ctx.db_name, &facts) {
             Some(Ok(guard)) => Some(guard),

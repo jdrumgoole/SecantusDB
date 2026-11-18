@@ -29,7 +29,9 @@ One that reads through its cursor stage checks once for each buffer that
 stage fills -- the global IS it takes for it -- and its stages tick the
 pipeline's interrupt checker once per `getNext`, checking every 128th
 tick; the checker lives with the cursor, so a `getMore` goes on counting
-where the batch before stopped. Such a `getMore` takes no lock of its own,
+where the batch before stopped. A `$limit` stops asking its source once it has
+passed its count, and a cursor stage over a plan with a limit fills one
+buffer to it, with no first buffer of 32. Such a `getMore` takes no lock of its own,
 and so reads no storage statistics unless it filled a buffer.
 
 A `$sort` after a `$group` the slot-based engine runs reads the groups
@@ -269,6 +271,31 @@ PIPELINES: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any], tuple[str
     "aggregate with a $skip": (
         _documents(400),
         _pipeline([_ADD, {"$skip": 150}], batchSize=40),
+        _PIPELINE,
+    ),
+    "aggregate with a $limit after an $unwind": (
+        _documents(400),
+        _pipeline([{"$unwind": "$a"}, {"$limit": 50}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $limit after an $unwind, over several batches": (
+        _documents(400),
+        _pipeline([{"$unwind": "$a"}, {"$limit": 300}, {"$set": {"b": 1}}], batchSize=40),
+        _PIPELINE,
+    ),
+    "aggregate with a $limit past the end": (
+        _documents(400),
+        _pipeline([{"$unwind": "$a"}, {"$limit": 5000}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $skip and a $limit after an $unwind": (
+        _documents(400),
+        _pipeline([{"$unwind": "$a"}, {"$skip": 5}, {"$limit": 20}]),
+        _PIPELINE,
+    ),
+    "aggregate with a $limit after an $addFields": (
+        _documents(400),
+        _pipeline([_ADD, {"$limit": 50}]),
         _PIPELINE,
     ),
     "aggregate with a $skip between two $unwinds": (

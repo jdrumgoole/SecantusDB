@@ -1656,9 +1656,13 @@ pub fn is_constant_expression(expr: &Bson, bound: &[String]) -> bool {
             // wrong type is an executor error too (probed 2026-10-22). Nor the
             // regex operators or `$sortArray`, whose literal input of the wrong
             // type fails per document, in SBE with SBE's code (2026-10-23).
+            // Nor `$meta`, which reads each document's metadata: a `$match`
+            // reading a missing sort key is an executor error (8.2.11,
+            // RM-633).
             if matches!(
                 op.as_str(),
                 "$rand"
+                    | "$meta"
                     | "$map"
                     | "$filter"
                     | "$reduce"

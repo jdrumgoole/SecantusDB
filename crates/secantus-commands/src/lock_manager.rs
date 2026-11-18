@@ -840,6 +840,10 @@ pub trait Facts {
     /// The names of `db`'s collections as mongod's catalog holds them: its
     /// views left out, and `system.views` in when it has one.
     fn collections_of(&self, db: &str) -> Vec<String>;
+    /// The server runs as a replica set's primary, not a standalone.
+    fn replica_set(&self) -> bool {
+        false
+    }
 }
 
 /// [`Facts`] off a server's storage; with none (unit tests), every
@@ -847,9 +851,14 @@ pub trait Facts {
 pub struct StorageFacts<'a> {
     pub storage: Option<&'a std::sync::Arc<dyn crate::storage::Storage>>,
     pub db: &'a str,
+    /// The server runs as a replica set's primary (`--replSet`).
+    pub replica_set: bool,
 }
 
 impl Facts for StorageFacts<'_> {
+    fn replica_set(&self) -> bool {
+        self.replica_set
+    }
     fn exists(&self, coll: &str) -> bool {
         self.storage
             .is_none_or(|s| s.collection_exists(self.db, coll).unwrap_or(true))
@@ -1245,6 +1254,11 @@ fn collectionless_without_reads(doc: &bson::Document) -> bool {
 /// replaced -- and two write rounds. The macOS arm64 build reads one more
 /// global IS: a time-based plan yield that its Linux build does not make
 /// (with `internalQueryExecYieldPeriodMS` off, macOS reads six too; RM-185).
+/// A replica set's primary checks with four of the global IS instead, each
+/// under the transition lock, and takes the transition lock alone once
+/// more for each X round after the first (mongod 8.2.11, one-member
+/// replica set with that period off, measured 2026-11-18: `{w: 10}` and
+/// global `{r: 5, w: 4}`, `{w: 12}` and `{r: 5, w: 5}` replacing; RM-357).
 /// `$merge` writes a round per document, which is not known before the
 /// pipeline runs: it takes them as it writes (`write_rounds`).
 fn out_rounds(
@@ -1280,9 +1294,24 @@ fn out_rounds(
         (Resource::Database(db.to_string()), Is),
         (Resource::Collection(format!("{db}.{src}")), Is),
     ]];
-    rounds.extend((0..6).map(|_| vec![(Resource::Global, Is)]));
+    let replica_set = facts.replica_set();
+    if replica_set {
+        rounds.extend((0..4).map(|_| {
+            vec![
+                (Resource::ReplicationStateTransition, Ix),
+                (Resource::Global, Is),
+            ]
+        }));
+    } else {
+        rounds.extend((0..6).map(|_| vec![(Resource::Global, Is)]));
+    }
     let replaced = out_db == db && facts.exists(&target);
-    rounds.extend((0..if replaced { 3 } else { 2 }).map(|_| write(X)));
+    for i in 0..if replaced { 3 } else { 2 } {
+        if replica_set && i > 0 {
+            rounds.push(vec![(Resource::ReplicationStateTransition, Ix)]);
+        }
+        rounds.push(write(X));
+    }
     rounds.extend((0..2).map(|_| write(Ix)));
     Some(rounds)
 }
@@ -2339,6 +2368,7 @@ mod tests {
         let facts = StorageFacts {
             storage: None,
             db: "db",
+            replica_set: false,
         };
         let rounds = statement_rounds(&bson::doc! {"findAndModify": "c"}, "db", &facts).unwrap();
         assert_eq!(rounds.len(), 1);
@@ -2360,6 +2390,7 @@ mod tests {
         let facts = StorageFacts {
             storage: None,
             db: "db",
+            replica_set: false,
         };
         let doc = bson::doc! {"findAndModify": "c", "remove": true};
         let rounds = statement_rounds(&doc, "db", &facts).unwrap();
@@ -2384,6 +2415,7 @@ mod tests {
         let facts = StorageFacts {
             storage: None,
             db: "db",
+            replica_set: false,
         };
         begin_operation();
         let held = hold_to_end();
@@ -2488,6 +2520,51 @@ mod tests {
             "validateDBMetadata": 1, "db": "nosuch", "collection": "q", "apiParameters": api
         });
         assert_eq!(reads(&missing), (1, vec![]));
+    }
+
+    /// `$out`'s rounds on a standalone and on a replica set's primary
+    /// (measured 8.2.11 with time-based yields off, RM-185 and RM-357).
+    #[test]
+    fn out_takes_a_replica_sets_transition_locks() {
+        use super::{statement_rounds, Mode, Resource};
+        struct Set(bool, bool);
+        impl super::Facts for Set {
+            fn exists(&self, c: &str) -> bool {
+                c == "c" || (self.1 && c == "o")
+            }
+            fn is_empty(&self, _: &str) -> bool {
+                false
+            }
+            fn index_keys(&self, _: &str) -> Vec<bson::Document> {
+                Vec::new()
+            }
+            fn collections(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn databases(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn collections_of(&self, _: &str) -> Vec<String> {
+                Vec::new()
+            }
+            fn replica_set(&self) -> bool {
+                self.0
+            }
+        }
+        let doc = bson::doc! {"aggregate": "c", "pipeline": [{"$match": {}}, {"$out": "o"}]};
+        let count = |facts: Set| {
+            let rounds = statement_rounds(&doc, "a", &facts).unwrap();
+            let n =
+                |lock: (Resource, Mode)| rounds.iter().flatten().filter(|l| **l == lock).count();
+            (
+                n((Resource::ReplicationStateTransition, Mode::Ix)),
+                n((Resource::Global, Mode::Is)),
+                n((Resource::Global, Mode::Ix)),
+            )
+        };
+        assert_eq!(count(Set(false, false)), (5, 7, 4));
+        assert_eq!(count(Set(true, false)), (10, 5, 4));
+        assert_eq!(count(Set(true, true)), (12, 5, 5));
     }
 
     /// A collectionless aggregate takes no lock unless a stage reads a
