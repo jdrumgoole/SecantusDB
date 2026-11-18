@@ -2294,16 +2294,15 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
 Measured on PostgreSQL 15.19 (port 5415) with statements that create
 nothing. The gap tests are in `tests/backlog/test_rp_found_rp750.py`.
 
-- [ ] **A three-argument input function with a typmod is refused.**
-      `select numeric_in('1.5', 0, 5)` is 22003 `numeric field overflow`
-      on PostgreSQL 15.19 (typmod 5 is `numeric(0,1)`, VARHDRSZ + 1); here
-      it is 0A000 `function numeric_in(unknown, integer, integer) is not
-      supported yet`. RP-953 rewrote the input
-      functions to casts (`builtin_alias::input_call`), the three-argument
-      ones only for typmod -1: a typmod needs the cast to the type with that
-      modifier.
-      Verify: tests/backlog/test_rp_found_rp750.py::test_input_function_with_a_typmod
-      Backlog-ID: RP-953
+- [ ] **A `numeric` type name with precision 0 is accepted.**
+      `select '1.5'::numeric(0,1)` is 22023 `NUMERIC precision 0 must be
+      between 1 and 1000` at 15 on PostgreSQL 15.19 (`numerictypmodin`
+      checks the modifiers when the type name is read); here the cast runs
+      and is 22003 `numeric field overflow`. Found while working RP-953,
+      whose `numeric_in(c, 0, 5)` applies that same typmod at run time and
+      must keep doing so.
+      Verify: tests/backlog/test_rp_found_rp750.py::test_numeric_precision_zero_is_refused
+      Backlog-ID: RP-1042
 - [ ] **A cast from `cstring` to a type with no such cast is accepted.**
       `select 'x'::cstring::int4` is 42846 `cannot cast type cstring to
       integer` at 20 on PostgreSQL 15.19 (`cstring` casts only to the
