@@ -2502,7 +2502,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): a hash
     # join whose WHERE compares an expression of the inner relation with
-    # the outer's column is priced like any other.
+    # the outer's column is priced like any other. Priced since RP-1039.
     "a hash join with an expression join filter is priced": (
         "RP-1039",
         _ANALYSED,
@@ -8050,6 +8050,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1039",
         "RP-1025",
         "RP-1035",
         "RP-1031",

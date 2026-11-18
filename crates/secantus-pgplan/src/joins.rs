@@ -3777,14 +3777,14 @@ fn not_equal_cast(c: &pg_query::protobuf::Node, scope: &Scope) -> Option<(Filter
     let operand = |n: Option<&pg_query::protobuf::Node>| -> Option<CastKey> {
         let n = n?;
         match n.node.as_ref()? {
-            N::TypeCast(tc) => Some(CastKey {
+            N::TypeCast(tc) if bare_key(tc.arg.as_deref()?).is_some() => Some(CastKey {
                 key: bare_key(tc.arg.as_deref()?)?,
                 cast: Some(cast_key_target(tc, scope)?.1),
             }),
-            _ => Some(CastKey {
-                key: bare_key(n)?,
-                cast: None,
-            }),
+            _ => match bare_key(n) {
+                Some(key) => Some(CastKey { key, cast: None }),
+                None => expression_operand(n, scope),
+            },
         }
     };
     let (mut l, mut r) = (operand(e.lexpr.as_deref())?, operand(e.rexpr.as_deref())?);
@@ -3825,6 +3825,33 @@ fn not_equal_cast(c: &pg_query::protobuf::Node, scope: &Scope) -> Option<(Filter
         o.cast = Some(to);
     }
     (cast || coercions > 0).then_some((FilterKind::NotEqualCast(l, r), coercions))
+}
+
+/// A `<>` operand that is an expression over one relation's columns
+/// (`length(k.b)`, `k.a + 1`): an expression with no statistics
+/// (`examine_variable`), as a cast key is, of its result type (RP-1039).
+/// Keyed by the first column it reads, for its relation's rows. `None`
+/// where it reads no column or more than one relation's, or its type is
+/// not a built-in one.
+fn expression_operand(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<CastKey> {
+    let aliases = key_aliases(n);
+    if aliases.len() != 1 {
+        return None;
+    }
+    let mut key = None;
+    let mut node = n.clone();
+    let _ = walk_expr(&mut node, &mut |x| {
+        if let (None, Some(N::ColumnRef(c))) = (&key, x.node.as_ref()) {
+            key = column_ref_name(c);
+        }
+        Ok(())
+    });
+    let ty = column_expr_type(&on_expr(n, scope, &[]).ok()?).to_string();
+    let oid = crate::pgtypes::oid_of_name(&ty).filter(|o| *o < 10000)?;
+    Some(CastKey {
+        key: key?,
+        cast: Some(oid),
+    })
 }
 
 /// The operators `n` evaluates: each operator and IS DISTINCT FROM, a

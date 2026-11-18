@@ -1807,17 +1807,6 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a three-way hash join names the class's first member]
       Backlog-ID: RP-1057
 
-- [ ] **A hash join whose WHERE compares an expression of one relation
-      with the other's column is priced at zero.** `explain select e.b
-      from e join k on e.a = k.a where length(k.b) <> e.a` (both tables
-      analysed, 1000 rows) prints `Hash Join  (cost=0.00..0.00 rows=0
-      width=0)` and zero costs on every node below it; PostgreSQL 15.19
-      prints `Hash Join  (cost=27.50..45.14 rows=999 width=3)` over scans
-      costed `0.00..15.00 rows=1000`. Found while working RP-966; the
-      same query with a column-to-column WHERE is priced.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash join with an expression join filter is priced]
-      Backlog-ID: RP-1039
-
 
 - [ ] **EXPLAIN ANALYZE's scan counters PostgreSQL prints that are still
       left out.** Since RP-383 a user table's heap pages carry the

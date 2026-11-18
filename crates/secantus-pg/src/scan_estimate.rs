@@ -2339,12 +2339,15 @@ impl PgHandler {
         // where each is `<`, `<=`, `>` or `>=` between the two tables
         // (`DEFAULT_INEQ_SEL`) or a `<>` between two of their columns
         // (`neqjoinsel`, RP-379); any other stays unpriced.
+        // A `<>` with an expression or a cast operand is `neqjoinsel` over
+        // an operand with no statistics (RP-1039).
         let priced_kind = |f: &secantus_pgplan::joins::JoinFilter| {
             f.aliases.len() == 2
                 && matches!(
                     f.kind,
                     secantus_pgplan::joins::FilterKind::Inequality
                         | secantus_pgplan::joins::FilterKind::NotEqual(..)
+                        | secantus_pgplan::joins::FilterKind::NotEqualCast(..)
                 )
         };
         if *on_other && (on_filters.is_empty() || !on_filters.iter().all(priced_kind)) {
@@ -2389,6 +2392,7 @@ impl PgHandler {
                     f.kind,
                     secantus_pgplan::joins::FilterKind::Inequality
                         | secantus_pgplan::joins::FilterKind::NotEqual(..)
+                        | secantus_pgplan::joins::FilterKind::NotEqualCast(..)
                 )
             })
             .collect();
@@ -2657,6 +2661,14 @@ impl PgHandler {
                     }
                     let eq = secantus_pgplan::joincost::eqjoinsel_inner(&key(&x), &key(&y));
                     1.0 - eq.clamp(0.0, 1.0)
+                }
+                secantus_pgplan::joins::FilterKind::NotEqualCast(l, r) => {
+                    let column = |k: &str| {
+                        let s = side(&left, k).or_else(|| side(&right, k))?;
+                        Some((k.to_string(), s.table, s.field))
+                    };
+                    let key_columns = [column(&l.key)?, column(&r.key)?];
+                    neqjoinsel_cast(self, &key_columns, l, r)?
                 }
                 _ => 1.0 / 3.0,
             };
