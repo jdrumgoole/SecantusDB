@@ -6354,16 +6354,27 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # Still open: a `^` after a character cannot match, which PostgreSQL's
     # NFA optimisation sees; here the scan prints zeros.
-    # Still open: a `^` a character precedes in one branch of a group is
-    # pruned as dead by `regc_nfa.c`'s optimisation, leaving the other
-    # branch's prefix (`w00`); here zeros.
+    # Fixed under RP-423: a `^` a character precedes in one branch of a
+    # group was pruned as dead, as `regc_nfa.c`'s optimisation prunes it,
+    # leaving the other branch's prefix (`w00`); the scan printed zeros.
     "estimate of a regex match with a dead anchor in a branch": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_STRINGS,
         "explain select * from w where c ~ '^w(?:^x|0)0'",
         [
             "Seq Scan on w  (cost=0.00..18.50 rows=91 width=10)",
             "  Filter: (c ~ '^w(?:^x|0)0'::text)",
+        ],
+    ),
+    # Still open: a regex with embedded options (`(?x)` expanded syntax)
+    # is estimated by its compiled prefix (`w00`); here zeros.
+    "estimate of a regex match with embedded options": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '(?x)^w 0 0'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=91 width=10)",
+            "  Filter: (c ~ '(?x)^w 0 0'::text)",
         ],
     ),
     # Fixed under RP-423: a `^` every path meets after a character made

@@ -1917,8 +1917,7 @@ a regression test.
       regex match filters (the join's WHERE patterns collected by
       `explain_join_patterns`). Still zeros: a call of a function whose
       overloads differ in `procost`; a regex whose prefix walk is not
-      modelled (an anchor a character may precede, or in a branch or an
-      optional group of one branch; embedded options). Since 2026-11-18 a `^` no
+      modelled (an anchor in an optional group; embedded options). Since 2026-11-18 a `^` no
       character precedes, inside a group or not, anchors the match as
       `regc_nfa.c`'s optimisation pulls it into the `pre` state
       (`strip_bos`: `^(?:^w0)1` and `(?:^w0)1` are both prefix `w01`). A back reference is walked as a copy of
@@ -1943,9 +1942,11 @@ a regression test.
       arc out of `pre` does in `findprefix` (`^(?:w|^x)0` is `rows=1000`,
       `^(?:^ab|^ab)` and `^(?:w|^x)?0` no prefix). Since 2026-11-18 a `^` every path meets after a character
       makes the regex `REG_UIMPOSSIBLE`, no prefix (`^w(?:^0)1` is
-      `rows=1`). One a character precedes in one branch is still zeros:
-      `regc_nfa.c` prunes that branch as dead (`^x(?:^w|y)0` is prefix
-      `xy0`; `^w(?:^x|0)0` is `rows=91`). Measured
+      `rows=1`), and since 2026-11-18 a branch whose `^` a character
+      precedes is pruned as dead, as `regc_nfa.c` prunes it
+      (`prune_dead_branches`: `^x(?:^w|y)0` is prefix `xy0`,
+      `^w(?:^x|0)0` `rows=91`). Embedded options are still zeros
+      (`(?x)^w 0 0` is `rows=91` on 15.19). Measured
       on the 15.19 reference on port 5415 (found while working RP-404 and
       RP-354). The repeated group's prefix is not a walk of the regex's
       text: `pg_regprefix` reads the NFA after `regc_nfa.c`'s `optimize`
@@ -1957,7 +1958,7 @@ a regression test.
       `repeat`'s arcs gives (`aba`). The faithful fix ports `regcomp.c` /
       `regc_nfa.c`'s NFA build and optimisation and runs `findprefix` on
       it (2026-11-17, sized while working RP-841).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with a dead anchor in a branch]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with embedded options]
       Backlog-ID: RP-423
 - [ ] **A semi join cheaper unique-ified keeps the semi join's shape.**
       Since RP-411's first slice (2026-11-16) a WHERE that is one
