@@ -732,10 +732,11 @@ These are explicit non-goals. Don't add them without a reason.
       a `find`, an `aggregate` of a collection mongod's query layer runs
       whole, a `$sort` after an SBE `$group`, or (since 2026-11-18 asked for a first batch of none too, the `$sort` after a `$group` included) whose stages after its cursor stage are `$project`,
       `$unset`, `$addFields`, `$set`, `$replaceRoot`, `$replaceWith`,
-      `$unwind` and `$skip`, and the `getMore`s of its cursor,
+      `$unwind`, `$skip` and (since 2026-11-18, with a cursor stage over a
+      plan with a limit filling one buffer to it) `$limit`, and the `getMore`s of its cursor,
       `listIndexes`, `listCollections`, `collStats`, `ping`, `buildInfo`,
       and an `insert`, `update` or `delete` on a member of a replica set
-      prints mongod's count (88 shapes in
+      prints mongod's count (93 shapes in
       `tests/mongod_live/test_interrupt_checks.py`). Every other line
       prints none, where mongod prints one:
       - a read with more than one candidate plan, a plan from the plan
@@ -746,8 +747,7 @@ These are explicit non-goals. Don't add them without a reason.
         all for a cached plan, and this planner's candidates are not its
         enumeration;
       - the other aggregates: one with a `$match` or `$redact` left after
-        its read, a `$limit` there (it stops its source short
-        of the documents this server runs in one go), a `$lookup`,
+        its read, a `$lookup`,
         `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a `$group`
         run classic over the cursor stage (a `$bucket` of 400 buckets: 16
         and a `getMore` of 4 on mongod), one over a

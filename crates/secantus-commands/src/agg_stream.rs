@@ -51,9 +51,9 @@ const STREAMING_STAGES: &[&str] = &[
 /// The stages after a cursor stage whose `getNext` calls -- each one tick
 /// of mongod's `ExpressionContext` interrupt checker -- are counted here
 /// (RM-360): each passes on one document per call, or (`$skip`) drops some,
-/// or (`$unwind`) makes several of one. A pipeline with any other prints no
-/// count: a `$limit` there stops its source short of the documents this
-/// cursor runs in one go, a `$lookup` or `$unionWith` reads through
+/// or (`$unwind`) makes several of one, or (`$limit`) stops asking its
+/// source once it has passed its count. A pipeline with any other prints no
+/// count: a `$lookup` or `$unionWith` reads through
 /// pipelines of its own, and a `$match` or `$redact` left after the read
 /// is not always where mongod's optimizer leaves it (RM-538: a `$match` on
 /// a field an `$addFields` renames moves ahead of it onto the field).
@@ -66,6 +66,7 @@ const COUNTED_STAGES: &[&str] = &[
     "$replaceWith",
     "$unwind",
     "$skip",
+    "$limit",
 ];
 
 /// Whether a stage reads metadata this cursor rewrites into stages of its
@@ -374,9 +375,18 @@ fn build(
         let end = stages.len();
         stages = secantus_core::sbe::mark(stages, 0, end);
     }
+    // A cursor stage over a plan with a limit fills its buffer to the
+    // limit, its bytes aside, with no first buffer of 32 (measured 8.2.11,
+    // 2026-11-18: `[{$addFields}, {$limit: 50}]` takes the global IS once
+    // for its read, as the whole read's model in `agg_executor` does).
+    let first = if limit > 0 {
+        usize::MAX / 2
+    } else {
+        FIRST_BUFFER
+    };
     let mut cursor = AggStream::new(
         Feed::Plan(Box::new(source)),
-        (!per_batch).then_some(FIRST_BUFFER),
+        (!per_batch).then_some(first),
         stages,
         ask,
     );
@@ -1049,7 +1059,7 @@ impl AggStream {
                             crate::lock_manager::let_statement_ticket_go();
                             crate::lock_manager::global_read()?;
                         }
-                        self.buffer = Some(n * 2);
+                        self.buffer = Some(n.saturating_mul(2));
                         source.next_buffer(storage, n, BUFFER_BYTES)
                     }
                     None => source.next_batch(storage, left, max_bytes),
@@ -1160,7 +1170,15 @@ impl AggStream {
             let mut owed = std::mem::take(&mut self.owed[i]);
             let mut passed: Vec<(Document, u64)> = Vec::with_capacity(items.len());
             match self.counts[i] {
-                // `$skip` (a `$limit` is not counted: `COUNTED_STAGES`).
+                // A `$limit` passes on its count and asks for no more: the
+                // documents after it were never pulled, nor their calls made.
+                Some(left) if stage_name(&self.stages[i]) == "$limit" => {
+                    let n = (left.max(0) as usize).min(items.len());
+                    items.truncate(n);
+                    self.counts[i] = Some(left - n as i64);
+                    passed = items;
+                }
+                // `$skip`.
                 Some(left) => {
                     let n = (left.max(0) as usize).min(items.len());
                     owed += items.drain(..n).map(|(_, t)| t).sum::<u64>();
@@ -1200,8 +1218,22 @@ impl AggStream {
 
     /// The `getNext` calls that find the pipeline over: one of each stage,
     /// down to the cursor stage, and those the stages still owe.
+    /// A `$limit` that has passed its count ends the pipeline there: the
+    /// calls stop at it, and what the stages before it owe was never made.
     fn calls_at_eof(&self) -> u64 {
-        1 + self.stages.len().saturating_sub(self.in_plan) as u64 + self.owed.iter().sum::<u64>()
+        let spent = (0..self.stages.len())
+            .rev()
+            .find(|&i| self.counts[i] == Some(0) && stage_name(&self.stages[i]) == "$limit");
+        match spent {
+            Some(at) => {
+                (self.stages.len() - at.max(self.in_plan)) as u64
+                    + self.owed[at + 1..].iter().sum::<u64>()
+            }
+            None => {
+                1 + self.stages.len().saturating_sub(self.in_plan) as u64
+                    + self.owed.iter().sum::<u64>()
+            }
+        }
     }
 
     fn run_stages(
