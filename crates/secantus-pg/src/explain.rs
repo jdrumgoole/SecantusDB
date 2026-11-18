@@ -589,7 +589,7 @@ pub(crate) fn window_stack(sel: &secantus_pgplan::Select) -> Option<Vec<WindowSt
 }
 
 /// A join's key names are `alias<US>column`; a plan names only the alias.
-fn display_alias(name: &str) -> String {
+pub(crate) fn display_alias(name: &str) -> String {
     name.split(secantus_pgplan::joins::SEP)
         .next()
         .unwrap_or(name)

@@ -46302,9 +46302,32 @@ impl PgHandler {
                             && sel.order.iter().all(|k| {
                                 k.expr.is_none() && sel.columns.iter().any(|(_, f)| *f == k.field)
                             });
+                        // A SELECT DISTINCT of stored columns straight
+                        // over the scan: `create_distinct_paths` hashes it
+                        // where that beats a Sort and Unique (RP-440).
+                        let distinct = tree.name == "Unique"
+                            && tree.children.len() == 1
+                            && tree.children[0].children.is_empty()
+                            && tree.children[0].name.starts_with("Seq Scan on ")
+                            && matches!(sel.distinct, secantus_pgplan::Distinct::All)
+                            && sel.limit.is_none()
+                            && sel.offset == 0
+                            && sel.order.is_empty()
+                            && !sel.with_ties
+                            && sel.casts.iter().all(Option::is_none)
+                            && !sel.columns.is_empty()
+                            && {
+                                let mut seen = std::collections::HashSet::new();
+                                sel.columns.iter().all(|(_, f)| seen.insert(f))
+                            }
+                            && !self
+                                .index_relations()
+                                .iter()
+                                .any(|ix| ix.table.name == sel.table);
                         if (sorted
                             || limited
                             || sorted_limited
+                            || distinct
                             || tree.children.is_empty() && tree.name.starts_with("Seq Scan on "))
                             && sel.sub.is_none()
                             && sel.series.is_none()
@@ -46360,6 +46383,48 @@ impl PgHandler {
                                         sel.limit.map_or(0, |n| n.max(1)),
                                     )
                                 })
+                            } else if distinct {
+                                let fields: Vec<String> =
+                                    sel.columns.iter().map(|(_, f)| f.clone()).collect();
+                                let hashed = scan.and_then(|e| {
+                                    let groups = self.distinct_groups_over(
+                                        &sel.table,
+                                        &sel.filter,
+                                        &fields,
+                                        Some(e.2),
+                                    )?;
+                                    let work_mem = self.kb_setting("work_mem", 4096);
+                                    let unique = scan_estimate::unique_estimate(
+                                        scan_estimate::sort_estimate(e, work_mem),
+                                        fields.len(),
+                                        groups,
+                                    );
+                                    let hashed = scan_estimate::hashed_distinct_estimate(
+                                        e,
+                                        fields.len(),
+                                        groups,
+                                    );
+                                    // `add_path`'s fuzz factor: within 1%
+                                    // either may be kept, so neither is.
+                                    (hashed.1 * 1.01 < unique.1).then_some(hashed)
+                                });
+                                if hashed.is_some() {
+                                    tree.children[0].estimate = scan;
+                                    tree.name = "HashAggregate".into();
+                                    // The InitPlan's range table entry
+                                    // qualifies the keys (`useprefix`).
+                                    let alias = options
+                                        .scan_alias
+                                        .clone()
+                                        .unwrap_or_else(|| explain::display_alias(&sel.table));
+                                    let keys: Vec<String> = sel
+                                        .columns
+                                        .iter()
+                                        .map(|(_, f)| format!("{alias}.{f}"))
+                                        .collect();
+                                    tree.details.push(("Group Key".into(), keys.join(", ")));
+                                }
+                                hashed
                             } else {
                                 scan
                             };

@@ -5495,6 +5495,18 @@ impl PgHandler {
         filter: &Document,
         fields: &[String],
     ) -> Option<f64> {
+        self.distinct_groups_over(table, filter, fields, None)
+    }
+
+    /// `distinct_groups` over a scan whose rows are already estimated
+    /// (`rows`), as one whose WHERE reads an InitPlan (RP-440).
+    pub(crate) fn distinct_groups_over(
+        &self,
+        table: &str,
+        filter: &Document,
+        fields: &[String],
+        rows: Option<f64>,
+    ) -> Option<f64> {
         if !self
             .shared_table_defs()
             .ok()?
@@ -5532,7 +5544,10 @@ impl PgHandler {
                 })
             })
             .collect::<Option<_>>()?;
-        let (_, _, rows, _) = self.user_seq_scan(table, filter, &[])?;
+        let rows = match rows {
+            Some(rows) => rows,
+            None => self.user_seq_scan(table, filter, &[])?.2,
+        };
         Some(hashagg::estimate_groups(&keys, pt.tuples, rows) as f64)
     }
 
