@@ -19028,7 +19028,10 @@ impl PgHandler {
                 format!("relation \"{name}\" already exists"),
             ))));
         }
-        let body_fields = self.describe_fields(&cv.body, 0, &[])?.unwrap_or_default();
+        // `DefineView` parse-analyses the query and plans nothing: a constant
+        // is not folded, so `select 1/0` makes a view (RP-968).
+        let analyse = |q: &str| secantus_pgplan::analysing_only(|| self.describe_fields(q, 0, &[]));
+        let body_fields = analyse(&cv.body)?.unwrap_or_default();
         if cv.columns.len() > body_fields.len() {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
@@ -19036,9 +19039,7 @@ impl PgHandler {
                 "CREATE VIEW specifies more column names than columns".into(),
             ))));
         }
-        let fields = self
-            .describe_fields(&cv.definition, 0, &[])?
-            .unwrap_or_default();
+        let fields = analyse(&cv.definition)?.unwrap_or_default();
         {
             let mut seen = HashSet::new();
             for f in &fields {
@@ -19062,7 +19063,7 @@ impl PgHandler {
         if let Some(old) = &existing {
             // OR REPLACE may only ADD columns at the end: each existing one
             // keeps its name and type (PostgreSQL's 42P16 rules).
-            let old_fields = self.describe_fields(old, 0, &[])?.unwrap_or_default();
+            let old_fields = analyse(old)?.unwrap_or_default();
             if fields.len() < old_fields.len() {
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".into(),
