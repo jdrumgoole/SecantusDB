@@ -2298,6 +2298,13 @@ impl PgHandler {
 }
 
 impl plpgsql_fn::Host for PlHost<'_> {
+    fn compiled_label(&self, create_sql: &str, label: &dyn Fn() -> String) -> String {
+        let mut labels = self.h.pl_labels.lock().unwrap_or_else(|e| e.into_inner());
+        labels
+            .entry(create_sql.to_string())
+            .or_insert_with(label)
+            .clone()
+    }
     fn push_frame(&self, frame: String) {
         self.h.push_pl_frame(frame);
     }
@@ -4725,6 +4732,9 @@ pub struct PgHandler {
     /// savepoint level of the transaction that made it while that is
     /// open (`myTempNamespaceSubID`), `Some(None)` once committed.
     temp_namespace: Mutex<Option<Option<usize>>>,
+    /// The CONTEXT label each PL/pgSQL function got at the session's first
+    /// compile of it, by its CREATE text (`plpgsql_compile`'s cache).
+    pl_labels: Mutex<HashMap<String, String>>,
     /// The open block declared a `WITH HOLD` cursor: another thing
     /// PostgreSQL refuses to PREPARE.
     holdable_declared: AtomicBool,
@@ -5379,6 +5389,7 @@ impl PgHandler {
             wire_dealloc: Mutex::new(Vec::new()),
             temp_tables: Mutex::new(Vec::new()),
             temp_namespace: Mutex::new(None),
+            pl_labels: Mutex::new(HashMap::new()),
             holdable_declared: AtomicBool::new(false),
             txn_gucs: Mutex::new(HashMap::new()),
             statement_gucs: Mutex::new(HashMap::new()),

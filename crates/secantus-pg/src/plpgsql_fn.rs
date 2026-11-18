@@ -340,6 +340,14 @@ pub trait Host {
     fn pin_cursor(&self, name: &str, pinned: bool) {
         let _ = (name, pinned);
     }
+    /// The CONTEXT label of the function `create_sql` defines, as the
+    /// session compiled it: `plpgsql_compile` labels a function once and
+    /// keeps the label while the compiled function is cached, whatever the
+    /// search path of a later call (RP-1034). `label` makes it at the first.
+    fn compiled_label(&self, create_sql: &str, label: &dyn Fn() -> String) -> String {
+        let _ = create_sql;
+        label()
+    }
 }
 
 /// A record value: its columns (name, type) and their values, or NULL.
@@ -1485,7 +1493,7 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         cursor_options: open_cursor::cursor_options(&f),
         cursor_argrows: open_cursor::cursor_argrows(&f),
         expression_types: std::cell::RefCell::default(),
-        label: function_label(create_sql),
+        label: host.compiled_label(create_sql, &|| function_label(create_sql)),
         dyn_text: None,
         scopes: block_scope::scopes(&f),
         defaults: f
