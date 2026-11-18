@@ -523,12 +523,18 @@ def test_a_write_reports_mongods_locks_and_flow_control(
 
 #: Writes whose locks are not mongod's yet (RM-357's remainder).
 _DIVERGING_WRITES = {
-    # A delete that writes nothing reads the latest optime twice (the write
-    # path and the command), and keeps its session row under its own locks.
-    "delete matching nothing": lambda d: _w1(d).delete_one({"_id": 999}),
-    # Each statement keeps its session row under its own locks, and takes
-    # its round as it runs: this server takes every statement's first.
+    # A retryable statement keeps its session row under its own locks.
     "update": lambda d: _w1(d).update_one({"_id": 1}, {"$set": {"q": 1}}),
+    "$out": lambda d: list(_w1(_plain(d)).aggregate([{"$match": {}}, {"$out": "o"}])),
+}
+
+
+#: Writes whose statements are profiled: each statement's entry is written
+#: on its command's locker, after the statement's line.
+_PROFILED_STATEMENTS = {
+    # A delete that writes nothing reads the latest optime twice (the write
+    # path and the command).
+    "delete matching nothing": lambda d: _w1(d).delete_one({"_id": 999}),
     "update of two statements": lambda d: _plain(d).command(
         "update",
         "c",
@@ -538,8 +544,22 @@ _DIVERGING_WRITES = {
         ],
         writeConcern={"w": 1},
     ),
-    "$out": lambda d: list(_w1(_plain(d)).aggregate([{"$match": {}}, {"$out": "o"}])),
 }
+
+
+@pytest.mark.backlog_fixed("RM-357")
+@pytest.mark.parametrize("name", list(_PROFILED_STATEMENTS))
+def test_a_profiled_statement_counts_its_entry_in_its_commands_locks(
+    rust_mongo: Any, mongod_rs: Any, name: str
+) -> None:
+    """mongod 8.2.11 writes an update or delete statement's profile entry on
+    its command's locker after the statement's line: the command's line and
+    each later statement's count one `Metadata: {W: 1}` and one more global,
+    database and collection IX for it (measured 2026-11-07). This server
+    counted no lock for the entry."""
+    answers = _write_locks(rust_mongo, mongod_rs, _PROFILED_STATEMENTS[name])
+    assert answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
 
 
 #: findAndModify removes without a `txnNumber`, found and not.

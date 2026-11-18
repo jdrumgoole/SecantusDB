@@ -580,7 +580,10 @@ These are explicit non-goals. Don't add them without a reason.
       `collMod` of a collection there takes mongod's global IS and its
       collection X twice; since 2026-11-17 a `findAndModify` that removes
       takes one round, and a retryable one writes its image under the
-      transition, global and image collection IX. Still different,
+      transition, global and image collection IX; since 2026-11-18 a
+      profiled update or delete statement's entry counts mongod's
+      `Metadata: {W: 1}` and global, database and collection IX in its
+      command's locks. Still different,
       measured against a one-member replica set:
       - an `insert` of several documents one of which fails: mongod inserts
         them again a document at a time, each under a transition, global,
@@ -591,10 +594,9 @@ These are explicit non-goals. Don't add them without a reason.
       - an `update` or `delete` keeps its session row per statement, under
         the statement's own locks, and takes each statement's round as the
         statement runs (this server takes every round first and writes the
-        row once, after); a profiled statement's own entry is counted in its
-        command's locks (`Metadata: {W: 1}`, one more global IX), taken
-        without interrupt checks (the command's `numInterruptChecks` is
-        mongod's without them);
+        row once, after); the profiled statement's entry's locks are taken
+        without interrupt checks here (the command's `numInterruptChecks`
+        is mongod's without them);
       - `$out` takes more transition locks than this server's rounds
         (measured on a standalone, RM-185), and an `$out`'s line here has
         one global IS more than mongod's (7 to 6, measured 8.2.11

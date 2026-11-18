@@ -1462,6 +1462,24 @@ fn note_operation_lock(kind: &'static str, mode: Mode, waited: bool) {
     });
 }
 
+/// The locks mongod's profiler takes to write a write statement's own
+/// profile entry, which it does on the statement's command's locker, after
+/// the statement's line: the global, database and `system.profile` IX and
+/// the profile collection's `Metadata` X (`profile()` in `introspect.cpp`;
+/// measured 8.2.11, RM-357: an update's line counts one `Metadata: {W: 1}`
+/// and one more global, database and collection IX per profiled statement,
+/// with no transition lock and no flow control ticket).
+pub fn note_statement_profile_write() {
+    for (kind, mode) in [
+        ("Global", Mode::Ix),
+        ("Database", Mode::Ix),
+        ("Collection", Mode::Ix),
+        ("Metadata", Mode::X),
+    ] {
+        note_operation_lock(kind, mode, false);
+    }
+}
+
 /// mongod's `ResourceType` order, which `serverStatus.locks` and an
 /// operation's `locks` keep.
 const KIND_ORDER: [&str; 8] = [

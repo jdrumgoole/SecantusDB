@@ -1496,6 +1496,9 @@ impl<'a> Statements<'a> {
             crate::slowop::statement_line("WRITE", statement.log_attributes(), worked);
         }
         if self.profiled {
+            // mongod writes the statement's entry now, under locks its
+            // command's line and later statements count.
+            crate::lock_manager::note_statement_profile_write();
             STATEMENTS.with(|s| {
                 if let Some(list) = s.borrow_mut().as_mut() {
                     list.push(statement);
