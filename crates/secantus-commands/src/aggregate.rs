@@ -925,6 +925,26 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         let _ = crate::explain::summary::plan_summary(doc, ctx);
                         secantus_core::deadline::pipeline_counted();
                     }
+                    // A `$sort` after an SBE `$group` plans its front and
+                    // counts the same 5; its `getMore` takes no lock of its
+                    // own, the cursor stage taking a global IS per buffer
+                    // (RM-360, measured 8.2.11 2026-11-18).
+                    let sorted_after_sbe = c == asked
+                        && !crate::explain::order::is_uncounted()
+                        && !doc.contains_key("autocommit")
+                        && crate::ts_buckets::bucketed(storage, &ctx.db_name, c).is_none()
+                        && sort_after_sbe_group(
+                            storage,
+                            &ctx.db_name,
+                            c,
+                            &read_pipeline,
+                            hint,
+                            collation.as_ref(),
+                        );
+                    if sorted_after_sbe {
+                        let _ = crate::explain::summary::plan_summary(doc, ctx);
+                        secantus_core::deadline::pipeline_counted();
+                    }
                     let deferred = crate::agg_stream::Deferred {
                         command: doc.clone(),
                     };
@@ -933,6 +953,9 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         .map_err(|e| {
                             CommandError::new(1, "InternalError", format!("cursor registry: {e:?}"))
                         })?;
+                    if sorted_after_sbe {
+                        cursors.set_locks_internally(id);
+                    }
                     return Ok(doc! {
                         "cursor": { "firstBatch": [], "id": Bson::Int64(id), "ns": ns },
                         "ok": 1.0,
