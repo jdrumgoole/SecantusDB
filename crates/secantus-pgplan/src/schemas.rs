@@ -775,8 +775,7 @@ fn not_on_path(name: &str, location: i32) -> Error {
 }
 
 pub(crate) fn relation_exists(key: &str) -> bool {
-    RELATION_KEYS.with(|k| k.borrow().contains(key))
-        || crate::deferred::read(&PLAN_USER_RELATIONS, |t| t.iter().any(|(n, _, _)| n == key))
+    RELATION_KEYS.with(|k| k.borrow().contains(key)) || crate::user_relation_named(key)
 }
 
 /// The key an UNQUALIFIED reference resolves to: the first schema on the path

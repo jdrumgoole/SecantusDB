@@ -16,8 +16,6 @@ from typing import Any
 
 import pytest
 
-from tests.backlog.conftest import only_on
-
 #: psql 15's column query for `\d`, cut to the correlated subquery that holds
 #: all the time: a comma join of pg_collation and pg_type, filtered by
 #: equalities on the OUTER row's columns.
@@ -249,39 +247,32 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables(
     )
 
 
-@pytest.mark.backlog("RP-911")
+@pytest.mark.backlog_fixed("RP-911")
 def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth(
     pg_pair: tuple[Any, Any],
 ) -> None:
     """PostgreSQL 15.19 answers the first collation query after a `CREATE
     TABLE` in the same time however many other tables there are (0.33 ms
     with 200, 0.20 ms with 400, private cluster, 2026-11-12): DDL
-    invalidates only the cache entries of the rows it changed (`inval.c`).
-    A debug `secantusd-pg` takes about 0.011 s with no other table and
-    0.015 s with 800 (2026-11-13, with the constraint texts and comments
-    derived at their first lookup): the statement after any DDL still
-    reads every table's and every row type's catalog document, each
-    table's index list and the relations for `regclass`, for each catalog
-    version, and its own catalog reads cost about 1 ms more.
+    invalidates only the cache entries of the rows it changed (`inval.c`),
+    and its scans read one relation's rows by index.
+
+    A debug `secantusd-pg` on arm64 macOS took a median ratio of 1.2 to
+    1.27 at 800 tables until 2026-11-18 (12-14 ms against 15-17 ms): the
+    query's `'t'::regclass` listed every relation to find one name, and
+    the keyed `pg_attribute` read built a map of every relation's oid,
+    scanned every composite for its key and filled its rows from a map of
+    every table. Each now looks up the one relation: `regclass` asks the
+    catalog by name, and the relation and type oids are found through an
+    index kept current from the documents a commit changed. Ratios of 1.04
+    to 1.14 followed, six of six runs at a load average near 11.
 
     The first-after-DDL run on a server with 800 more tables against one
-    with none, within a
-    tenth again plus 1 ms: the growth the previous test's bound still
-    allows (about 3.5 ms) fails it by more than a millisecond.
-
-    Measured as 15 paired rounds (`_paired`), the median of the large
-    server's run less 1.1 times its pair's under 1 ms (2026-11-17: the
-    minima of each server's runs taken apart let CI's noise flip verdicts,
-    PRs #2732, #2744, #2769 and #2794).
-    The fastest of five passed CI on 2026-11-17 (PR #2794) while a debug
-    build here measured a ratio of 1.23 to 1.29 in ten of ten runs of
-    fifteen rounds, by minimum and by median alike."""
-    only_on(
-        "darwin",
-        why="the same debug build passes on x86_64 Linux CI (PRs #2794 and "
-        "#2821, min-of-five and paired-median methods) and fails every run "
-        "on arm64 macOS at a median ratio of 1.26-1.27 (2026-11-17)",
-    )
+    with none, within a tenth again plus 1 ms, measured as 15 paired
+    rounds (`_paired`): the median of the large server's run less 1.1
+    times its pair's under 1 ms (2026-11-17: the minima of each server's
+    runs taken apart let CI's noise flip verdicts, PRs #2732, #2744, #2769
+    and #2794)."""
     small, large = pg_pair
     _grow(large, "rp911", 2 * GROWTH_TABLES)
     pairs = _paired(small, large, _first_collation, "rp911c")

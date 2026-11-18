@@ -38235,6 +38235,15 @@ pub fn relation_is_publishable(oid: i64) -> Option<bool> {
     table_is_visible(oid).map(|_| false)
 }
 
+/// Is a user relation stored under `key`? Asked of the keyed lookup while
+/// the relations are deferred, so the list is not built for one name.
+pub(crate) fn user_relation_named(key: &str) -> bool {
+    match USER_RELATION_FIND.with(|f| f.borrow().clone()) {
+        Some(find) => find(key, None).is_some(),
+        None => crate::deferred::read(&PLAN_USER_RELATIONS, |t| t.iter().any(|(n, _, _)| n == key)),
+    }
+}
+
 /// Relations: `(name, oid, temp)`.
 pub fn set_user_relations(relations: Vec<(String, i64, bool)>) {
     schemas::bump_resolve_epoch();
@@ -38243,6 +38252,19 @@ pub fn set_user_relations(relations: Vec<(String, i64, bool)>) {
         temp.is_some_and(|p| relations.iter().any(|(n, _, _)| n.starts_with(&p))),
     );
     PLAN_USER_RELATIONS.with(|t| t.set(relations));
+    USER_RELATION_FIND.with(|f| *f.borrow_mut() = None);
+}
+
+/// One relation's oid by stored name (and temp-ness when given), as the
+/// first entry of the deferred list would answer it.
+type RelationFind = std::rc::Rc<dyn Fn(&str, Option<bool>) -> Option<i64>>;
+
+thread_local! {
+    /// Answers a lookup of one name while [`PLAN_USER_RELATIONS`] is still
+    /// deferred, so a `'t'::regclass` does not list every relation: PostgreSQL
+    /// reads `pg_class` by name (`get_relname_relid`) (RP-911).
+    static USER_RELATION_FIND: std::cell::RefCell<Option<RelationFind>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The relations `build` lists, at the first lookup (see [`deferred`]).
@@ -38250,13 +38272,16 @@ pub fn set_user_relations(relations: Vec<(String, i64, bool)>) {
 /// schema though not among the relation keys (a temp sequence, a
 /// standalone temp composite), so asking whether the session holds a temp
 /// relation does not list them all (RP-911).
+/// `find` answers one name's lookup without the list.
 pub fn defer_user_relations(
     build: impl FnOnce() -> Vec<(String, i64, bool)> + 'static,
+    find: impl Fn(&str, Option<bool>) -> Option<i64> + 'static,
     temp_outside_keys: bool,
 ) {
     schemas::bump_resolve_epoch();
     schemas::set_temp_outside_keys(temp_outside_keys);
     PLAN_USER_RELATIONS.with(|t| t.defer(build));
+    USER_RELATION_FIND.with(|f| *f.borrow_mut() = Some(std::rc::Rc::new(find)));
 }
 
 /// PostgreSQL's own relations -- every `pg_catalog`, `information_schema` and
@@ -38552,6 +38577,9 @@ pub(crate) fn relation_oid(schema: Option<&str>, name: &str) -> Option<i64> {
         });
         if cooking {
             return Some(0);
+        }
+        if let Some(find) = USER_RELATION_FIND.with(|f| f.borrow().clone()) {
+            return find(stored, temp);
         }
         crate::deferred::read(&PLAN_USER_RELATIONS, |t| {
             t.iter()
