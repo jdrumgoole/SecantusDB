@@ -1120,15 +1120,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Found 2026-11-18 working RM-613.
       Verify: tests/backlog/test_rm_found_2026_11_18_rm613.py::test_an_approximate_median_is_mongods_tdigest
       Backlog-ID: RM-720
-- [ ] **`$derivative`'s partition cache holds too little.** mongod 8.2.11's
-      `maxTotalMemoryUsageBytes` for a `$derivative` over ten documents of
-      125 bytes is 1250 for any window with no lower end (the whole
-      partition), 1000 for `[-3, 3]` and `[-5, 0]`, 500 for `[-1, 1]`, 375
-      for `[0, 0]`; this server's `reach` keeps two to four documents (250,
-      500). The function itself holds nothing on either. Found 2026-11-13
-      (RM-509).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm509.py::test_a_derivatives_cache_holds_what_mongods_does
-      Backlog-ID: RM-618
 - [ ] **A window with no lower end counts its function before it holds a
       value.** mongod 8.2.11 reports `maxFunctionMemoryUsageBytes` 0 for a
       `$sum`, `$push` or `$avg` over `["unbounded", -2]` in a partition of

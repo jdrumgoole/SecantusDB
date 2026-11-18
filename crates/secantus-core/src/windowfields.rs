@@ -876,7 +876,14 @@ fn reach(
         };
         return Ok((keep, hi.max(p)));
     }
-    if range || (matches!(c.op, "$first" | "$last") && window_removes(Some(w))) {
+    // `$derivative` reads its window's endpoints through a `kEndpoints`
+    // accessor, which lets go only of what lies left of the endpoint it
+    // found the time before -- with no lower end, nothing (measured 8.2.11,
+    // RM-618: ten documents hold ten, `[-3, 3]` eight, `[0, 0]` three).
+    if range
+        || c.op == "$derivative"
+        || (matches!(c.op, "$first" | "$last") && window_removes(Some(w)))
+    {
         return Ok((clamp((lo - 1).min(p)), hi.max(p)));
     }
     Ok((pos, hi.max(p)))
