@@ -2925,18 +2925,6 @@ statement is VALUES-only and runs there as written. The gap test is in
       Measured on the 15.19 reference on port 5415.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash join written inner side first is inner unique]
       Backlog-ID: RP-1030
-- [ ] **A Limit over a Sort of a filtered scan is not priced.**
-      PostgreSQL 15.19 prints `explain select a from k where a > 5 order by
-      b desc limit 3` (`k` analysed, 1,000 rows) as `Limit
-      (cost=30.36..30.37 rows=3 width=7)` over `Sort (cost=30.36..32.85
-      rows=995 width=7)` (a top-N heapsort, `cost_sort` with its bound)
-      over `Seq Scan on k (cost=0.00..17.50 rows=995 width=7)`; here every
-      node is `cost=0.00..0.00 rows=0 width=0`, with or without VERBOSE,
-      and with `select *` too. The same Sort without the LIMIT is priced.
-      Measured on the 15.19 reference on port 5415.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a limit over a descending sort]
-      Backlog-ID: RP-1025
-
 ## Found while working RP-980 (2026-11-17)
 
 - [ ] **An anti join with an outer conjunct beside it is not planned as

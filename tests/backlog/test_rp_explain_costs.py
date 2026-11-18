@@ -2587,7 +2587,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # Measured on PostgreSQL 15.19 (RP-966): a Limit over the Sort prints
     # the targetlist too, the ORDER BY column the select list lacks
-    # included, and the key keeps its direction.
+    # included, and the key keeps its direction. Priced since RP-1025: a
+    # bounded Sort over the scan, the key a resjunk column of it.
     "explain verbose of a limit over a descending sort": (
         "RP-1025",
         _ANALYSED,
@@ -8024,6 +8025,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1025",
         "RP-1035",
         "RP-1031",
         "RP-1029",

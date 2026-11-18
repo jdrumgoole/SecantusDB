@@ -47575,12 +47575,31 @@ impl PgHandler {
                 // (RP-382) the cheapest path's, where `create_ordered_paths`
                 // keeps that Sort over every index scan already in the
                 // ORDER BY's order.
-                if tree.name == "Sort"
+                // Under a bare Limit (RP-1025) the Sort is bounded by the
+                // Limit's count past its offset (`cost_sort`'s
+                // `limit_tuples`), and the Limit is `adjust_limit_rows_costs`
+                // over it.
+                let sort_limited = tree.name == "Limit"
+                    && tree.details.is_empty()
                     && tree.children.len() == 1
-                    && tree.children[0].children.is_empty()
-                    && explain::is_relation_scan(&tree.children[0].name)
+                    && tree.children[0].name == "Sort";
+                let sort_node = if sort_limited {
+                    &tree.children[0]
+                } else {
+                    &tree
+                };
+                if sort_node.name == "Sort"
+                    && sort_node.children.len() == 1
+                    && sort_node.children[0].children.is_empty()
+                    && explain::is_relation_scan(&sort_node.children[0].name)
                 {
                     if let Statement::Select(sel) = inner.as_ref() {
+                        let count = sel.limit.map_or(0, |n| n.max(1));
+                        let limit_ok = if sort_limited {
+                            sel.limit.is_some_and(|n| n >= 0) && sel.offset >= 0
+                        } else {
+                            sel.limit.is_none() && sel.offset == 0
+                        };
                         // Every key one way with its default NULLS, the
                         // order a B-tree gives forwards or backwards.
                         let one_way = sel.order.iter().all(|k| {
@@ -47599,17 +47618,22 @@ impl PgHandler {
                             && sel.series.is_none()
                             && sel.join.is_none()
                             && sel.windows.is_empty()
-                            && sel.limit.is_none()
-                            && sel.offset == 0
+                            && limit_ok
                             && matches!(sel.distinct, secantus_pgplan::Distinct::None)
                             && !sel.with_ties
                             && sel.casts.iter().all(Option::is_none)
-                            && sel.order.iter().all(|k| {
-                                k.expr.is_some() || sel.columns.iter().any(|(_, f)| *f == k.field)
-                            })
                         {
-                            let fields: Vec<String> =
-                                sel.columns.iter().map(|(_, f)| f.clone()).collect();
+                            // A stored key the select list does not return
+                            // is a resjunk column of the scan (RP-1025).
+                            let fields = first_occurrences(
+                                Vec::new(),
+                                sel.columns.iter().map(|(_, f)| f.clone()).chain(
+                                    sel.order
+                                        .iter()
+                                        .filter(|k| k.expr.is_none())
+                                        .map(|k| k.field.clone()),
+                                ),
+                            );
                             // A computed key no index returns in order: the
                             // scan computes it (RP-966).
                             let computed = sel.order.iter().any(|k| k.expr.is_some());
@@ -47628,21 +47652,43 @@ impl PgHandler {
                                 let (startup, total, rows, width) = estimate;
                                 let estimate =
                                     (startup, total + key_cost * rows, rows, width + key_width);
-                                let sort = scan_estimate::sort_estimate(
+                                let bound = if sort_limited {
+                                    (sel.offset + count) as f64
+                                } else {
+                                    -1.0
+                                };
+                                let sort = scan_estimate::bounded_sort_estimate(
                                     estimate,
                                     self.kb_setting("work_mem", 4096),
+                                    bound,
                                 );
-                                if !ordered
-                                    .iter()
-                                    .any(|o| scan_estimate::presorted_wins(*o, sort))
-                                {
+                                // Under a LIMIT an index in the ORDER BY's
+                                // order is weighed fractionally, which is
+                                // not modelled here: such a plan stays
+                                // unpriced.
+                                let declined = if sort_limited {
+                                    !ordered.is_empty()
+                                } else {
+                                    ordered
+                                        .iter()
+                                        .any(|o| scan_estimate::presorted_wins(*o, sort))
+                                };
+                                if !declined {
+                                    let sort_node = if sort_limited {
+                                        tree.estimate = Some(scan_estimate::limit_estimate(
+                                            sort, sel.offset, count,
+                                        ));
+                                        &mut tree.children[0]
+                                    } else {
+                                        &mut tree
+                                    };
                                     explain::scan_path_node(
-                                        &mut tree.children[0],
+                                        &mut sort_node.children[0],
                                         index,
                                         &sel.table,
                                     );
-                                    tree.children[0].estimate = Some(estimate);
-                                    tree.estimate = Some(sort);
+                                    sort_node.children[0].estimate = Some(estimate);
+                                    sort_node.estimate = Some(sort);
                                 }
                             }
                         }
