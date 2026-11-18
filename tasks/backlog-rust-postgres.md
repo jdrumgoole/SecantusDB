@@ -2877,22 +2877,6 @@ statement is VALUES-only and runs there as written. The gap test is in
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by on a column only a computed entry reads names the column]
       Backlog-ID: RP-1066
 
-- [ ] **A Sort under a select list that calls a function is not
-      priced.** Since RP-966, RP-1025 and RP-1036 a Sort (and a Limit
-      above it) straight over one relation's scan is priced with computed
-      keys -- operators and built-in calls at their `procost` -- and
-      computed select-list entries made of operators (a key equal to one
-      shares it). Still `cost=0.00..0.00`: a select-list entry that calls
-      a function, `select upper(b) from e order by lower(b)` (PostgreSQL
-      15.19 `Sort (cost=69.83..72.33 rows=1000 width=64)` over `Seq Scan
-      on e (cost=0.00..20.00 rows=1000 width=64)`): `target_cost` prices a
-      select-list entry with `row_expr_ops`, which declines calls (the
-      sort key's `expr_ops(.., true)` prices them). Widening it reaches
-      every plan `target_cost` prices, and `make_sort_input_target`
-      postpones an expensive entry above the Sort under a LIMIT.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sort under a select list calling a function is priced]
-      Backlog-ID: RP-1036
-
 - [ ] **A join on an expression key PostgreSQL prices is unpriced in
       three shapes.** Since RP-981 a join of two analysed tables on one
       equality between a column and an operator expression over one column

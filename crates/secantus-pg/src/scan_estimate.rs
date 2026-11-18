@@ -6781,6 +6781,24 @@ pub(crate) fn target_cost(sel: &secantus_pgplan::Select) -> Option<(f64, i64, Ve
                 cost += c;
                 width += w;
             }
+            // A call over the column among constants (RP-1036): its
+            // `procost`, as `cost_qual_eval` charges a FuncExpr.
+            Some(ColumnExpr::Call {
+                name,
+                args,
+                result_type,
+            }) => {
+                if secantus_pgplan::pgtypes::oid_of_name(result_type).is_none_or(|oid| oid >= 10000)
+                {
+                    return None;
+                }
+                let procost = secantus_pgplan::joins::column_call_procost(name, args.len())?;
+                if procost > 10.0 {
+                    return None;
+                }
+                cost += procost * costsize::CPU_OPERATOR_COST;
+                width += type_width(result_type, -1);
+            }
             Some(_) => return None,
         }
     }
@@ -6788,7 +6806,8 @@ pub(crate) fn target_cost(sel: &secantus_pgplan::Select) -> Option<(f64, i64, Ve
 }
 
 /// `(per-row cost, width)` of one computed target entry over built-in
-/// types (RP-333): each operator one `cpu_operator_cost`, the width its
+/// types (RP-333): each operator one `cpu_operator_cost`, each built-in
+/// call its `procost` (RP-1036), the width its
 /// type's `get_typavgwidth`. `None` for any entry not priced.
 fn row_entry_cost(e: &secantus_pgplan::ColumnExpr) -> Option<(f64, i64)> {
     let secantus_pgplan::ColumnExpr::Row {
@@ -6808,9 +6827,16 @@ fn row_entry_cost(e: &secantus_pgplan::ColumnExpr) -> Option<(f64, i64)> {
     {
         return None;
     }
-    let (ops, _) = row_expr_ops(expr, params.len())?;
+    // A built-in call at its `procost` (RP-1036). An entry with a call
+    // that comes to more than `make_sort_input_target`'s expensive bound
+    // may be postponed above a Sort, which this target does not model:
+    // declined, as before calls were priced.
+    let (ops, _) = expr_ops(expr, params.len(), true)?;
+    if ops > 10.0 && row_expr_ops(expr, params.len()).is_none() {
+        return None;
+    }
     Some((
-        f64::from(ops) * costsize::CPU_OPERATOR_COST,
+        ops * costsize::CPU_OPERATOR_COST,
         type_width(result_type, -1),
     ))
 }

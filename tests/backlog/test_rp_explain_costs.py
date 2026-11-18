@@ -2557,10 +2557,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on PostgreSQL 15.19: the shared entry is computed once.
-    # Measured on PostgreSQL 15.19 (RP-1036): the select list's call is
-    # the scan's, one `procost` a row, its text 32 bytes wide.
+    # Measured on PostgreSQL 15.19 (RP-1036, fixed): the select list's call
+    # was the scan's, one `procost` a row, its text 32 bytes wide.
     "a sort under a select list calling a function is priced": (
-        "RP-1036",
+        "RP-1036:fixed",
         _ANALYSED,
         "explain select upper(b) from e order by lower(b)",
         [
