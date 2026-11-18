@@ -1229,6 +1229,11 @@ one beside it.
       measured). Close it when it passes every run on darwin.)
       Its gap test sits at the budget's edge: on 2026-11-18 one build
       passed it 2 of 3 runs at load ~10, so a FIXED? needs repeated runs.
+      (2026-11-18, after RP-970 built a user `pg_type` key's row alone: a
+      debug build passed it 3 of 5 runs alone at load ~5; the two failures
+      had a median ratio of 1.19, 12 ms against 14-15 ms at 800 tables, so
+      what is left is the statement start's republication above, not the
+      `pg_type` build. The fast gate's verify reported it FIXED? once.)
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
