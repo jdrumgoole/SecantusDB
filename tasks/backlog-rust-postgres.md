@@ -1991,7 +1991,7 @@ a regression test.
       `ExprQual` (`SemiJoin::outer_exprs`).
       Backlog-ID: RP-411
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery with its own where is planned as a join]
-- [ ] **An aggregate above an InitPlan's scan is a Subquery Scan.** Since
+- [ ] **A node above an InitPlan's scan is unpriced.** Since
       RP-440's first slices (2026-11-16) a SELECT over one relation whose WHERE
       compares columns with uncorrelated FROM-less scalar subqueries plans
       each as an InitPlan on the top node, as PostgreSQL 15.19 does
@@ -2007,10 +2007,11 @@ a regression test.
       FROM, a correlated one, or a sublink beside any other non-constant
       qual is still printed inline (`select * from e where b = (select b
       from k limit 1)`); a join's ON InitPlan is unpriced; other nodes above
-      the scan (a Limit above a Sort, Unique, a computed sort key, an
-      aggregate other than a count, a GROUP BY) are unpriced. Measured on a private 15.19
-      cluster.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sum above an initplan's scan is priced]
+      the scan (a Limit above a Sort, Unique, a computed sort key, a GROUP
+      BY) are unpriced. Plain aggregates other than counts over the scan are
+      priced since 2026-11-18 (`plain_agg_estimate`). Measured on a private
+      15.19 cluster.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a limit above a sort above an initplan's scan is priced]
       Backlog-ID: RP-440
 
 ## Found by batch 54 (2026-10-24)

@@ -4633,8 +4633,8 @@ impl PgHandler {
         self.user_seq_scan_with(table, filter, fields, &[], exprs, &[])
     }
 
-    /// Counts over one user table whose WHERE compares columns with
-    /// InitPlans' outputs (RP-440). The executor runs that WHERE as a FROM
+    /// Plain aggregates over one user table whose WHERE compares columns
+    /// with InitPlans' outputs (RP-440). The executor runs that WHERE as a FROM
     /// subquery under the Aggregate; PostgreSQL's `pull_up_simple_subquery`
     /// merges it, so its Subquery Scan is dropped and the Aggregate is
     /// priced by `cost_agg` (AGG_PLAIN) over the scan, the InitPlans' cost
@@ -4650,18 +4650,8 @@ impl PgHandler {
         let Statement::Select(sel) = sub.plan.as_ref() else {
             return;
         };
+        // `plain_agg_estimate` refuses the items it cannot price.
         let plain_counts = !agg.items.is_empty()
-            && agg.items.iter().all(|it| {
-                matches!(
-                    it.func,
-                    secantus_pgplan::AggFunc::CountStar | secantus_pgplan::AggFunc::Count
-                ) && it.expr.is_none()
-                    && it.expr2.is_none()
-                    && it.field2.is_none()
-                    && !it.distinct
-                    && it.filter.is_none()
-                    && it.order.is_empty()
-            })
             && agg.group_by.is_empty()
             && agg.grouping_sets.is_none()
             && agg.groupings.is_empty()
@@ -4711,10 +4701,12 @@ impl PgHandler {
         else {
             return;
         };
+        let Some((startup, total, rows, w)) = plain_agg_estimate(scan, &agg.items) else {
+            return;
+        };
         let mut scan_node = tree.children[0].children.remove(0);
         scan_node.estimate = Some(scan);
         tree.children[0] = scan_node;
-        let (startup, total, rows, w) = count_agg_estimate(scan, agg.items.len());
         tree.estimate = Some((startup + init_cost, total + init_cost, rows, w));
     }
 
