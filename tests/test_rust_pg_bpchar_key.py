@@ -268,3 +268,97 @@ def test_the_layout_survives_a_restart(server: _Server) -> None:
         assert _rows(c, "select a, octet_length(a) from p where a = 'x'") == [("x  ", 3)]
         with pytest.raises(psycopg.errors.UniqueViolation):
             c.execute("insert into p values ('x', 2)")
+
+
+# Step 2 (RP-693): a UNIQUE over an unsized `bpchar` is a storage unique index
+# over a hidden field holding the value with its trailing blanks trimmed --
+# PostgreSQL's btree over `bpcharcmp` (Joe, 2026-11-18). Measured on 15.19.
+
+
+def test_a_bpchar_unique_constraint_ignores_trailing_blanks(
+    connection: psycopg.Connection,
+) -> None:
+    c = connection
+    c.execute("create table u1 (a bpchar unique, b int)")
+    c.execute("insert into u1 values ('k  ', 1)")
+    with pytest.raises(psycopg.errors.UniqueViolation) as e:
+        c.execute("insert into u1 values ('k', 2)")
+    assert e.value.diag.constraint_name == "u1_a_key"
+    assert e.value.diag.message_detail == "Key (a)=(k) already exists."
+    # NULLs stay distinct.
+    c.execute("insert into u1 values (null, 3), (null, 4)")
+    assert _rows(c, "select indexdef from pg_indexes where tablename = 'u1'") == [
+        ("CREATE UNIQUE INDEX u1_a_key ON public.u1 USING btree (a)",)
+    ]
+
+
+def test_on_conflict_on_a_bpchar_unique_arbitrates_on_the_trimmed_key(
+    connection: psycopg.Connection,
+) -> None:
+    c = connection
+    c.execute("create table u1 (a bpchar unique, b int)")
+    c.execute("insert into u1 values ('k  ', 1)")
+    c.execute("insert into u1 values ('k ', 3) on conflict (a) do update set b = excluded.b")
+    # PostgreSQL's row keeps `octet_length(a)` 3: the write keeps the blanks
+    # only at step 5.
+    assert _rows(c, "select b from u1") == [(3,)]
+    assert _rows(c, "insert into u1 values ('k', 6) on conflict do nothing returning b") == []
+
+
+def test_a_bpchar_unique_index_and_a_composite_unique(connection: psycopg.Connection) -> None:
+    c = connection
+    c.execute("create table u2 (a bpchar, b int)")
+    c.execute("create unique index u2i on u2 (a)")
+    c.execute("insert into u2 values ('k', 1)")
+    with pytest.raises(psycopg.errors.UniqueViolation) as e:
+        c.execute("insert into u2 values ('k  ', 2)")
+    assert e.value.diag.constraint_name == "u2i"
+    c.execute("create table u3 (a bpchar, c int, unique (a, c))")
+    c.execute("insert into u3 values ('z', 1), ('z ', 2)")
+    with pytest.raises(psycopg.errors.UniqueViolation) as e:
+        c.execute("insert into u3 values ('z ', 1)")
+    assert e.value.diag.constraint_name == "u3_a_c_key"
+    assert _rows(
+        c, "select indexdef from pg_indexes where tablename in ('u2', 'u3') order by 1"
+    ) == [
+        ("CREATE UNIQUE INDEX u2i ON public.u2 USING btree (a)",),
+        ("CREATE UNIQUE INDEX u3_a_c_key ON public.u3 USING btree (a, c)",),
+    ]
+
+
+def test_copy_and_an_added_unique_collide_on_the_trimmed_key(server: _Server) -> None:
+    with server.connect() as c:
+        c.execute("create table u (a bpchar unique, b int)")
+        _copy(c, "u", "w  \t1\n")
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            c.execute("insert into u values ('w', 2)")
+        c.execute("create table v (a bpchar, b int)")
+        c.execute("insert into v values ('q', 1), ('r', 2)")
+        c.execute("alter table v add unique (a)")
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            c.execute("insert into v values ('q ', 3)")
+    server.stop()
+    server.start()
+    with server.connect() as c:
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            c.execute("insert into u values ('w ', 3)")
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            c.execute("insert into v values ('r  ', 3)")
+        assert _rows(c, "select count(*) from u") == [(1,)]
+
+
+@pytest.mark.parametrize("ddl", ["create unique index xi on x (a)", "alter table x add unique (a)"])
+def test_a_bpchar_unique_over_rows_differing_only_in_blanks_is_refused(
+    connection: psycopg.Connection, ddl: str
+) -> None:
+    # COPY keeps a non-key `bpchar` cell's blanks, so the rows differ only in
+    # them; the build reports the row stored first, as written.
+    c = connection
+    c.execute("create table x (a bpchar, b int)")
+    _copy(c, "x", "k  \t1\n")
+    c.execute("insert into x values ('k', 2)")
+    with pytest.raises(psycopg.errors.UniqueViolation) as e:
+        c.execute(ddl)
+    assert e.value.diag.message_primary.startswith("could not create unique index")
+    assert e.value.diag.message_detail == "Key (a)=(k  ) is duplicated."
+    assert _rows(c, "select count(*) from pg_indexes where tablename = 'x'") == [(0,)]

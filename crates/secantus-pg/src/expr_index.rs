@@ -36,10 +36,28 @@ pub(crate) fn field_index(field: &str) -> Option<(String, Vec<String>)> {
     FIELDS.with(|f| f.borrow().get(field).cloned())
 }
 
+/// Whether an index key `sql` (planned as `expr`) is a `bpchar`: a bare
+/// `bpchar` column, or an expression of that type. Such a key compares by
+/// `bpcharcmp`, its trailing blanks ignored (RP-693).
+pub(crate) fn is_bpchar_key(def: &TableDef, sql: &str, expr: &secantus_pgplan::ColumnExpr) -> bool {
+    let bare = sql
+        .strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .map_or_else(|| sql.to_string(), |r| r.replace("\"\"", "\""));
+    def.column(&bare).map_or_else(
+        || secantus_pgplan::column_expr_type(expr) == "bpchar",
+        |c| c.pg_type == "bpchar",
+    )
+}
+
 /// One expression index, its expressions planned once.
 pub(crate) struct ExprIndex {
     pub field: String,
     exprs: Vec<secantus_pgplan::ColumnExpr>,
+    /// Per expression, whether its key is a `bpchar`: keyed with its
+    /// trailing blanks trimmed (`bcTruelen`), as `bpcharcmp` compares
+    /// (RP-693).
+    bpchar: Vec<bool>,
     predicate: Option<secantus_pgplan::ColumnExpr>,
     /// `NULLS NOT DISTINCT`: a NULL value is a key like any other.
     nulls_not_distinct: bool,
@@ -56,8 +74,12 @@ impl ExprIndex {
             }
         }
         let mut values = Vec::with_capacity(self.exprs.len());
-        for e in &self.exprs {
+        for (e, bpchar) in self.exprs.iter().zip(&self.bpchar) {
             let v = secantus_pgplan::apply_row_expr(e, row).map_err(|e| PgHandler::err(&e))?;
+            let v = match v {
+                Bson::String(s) if *bpchar => Bson::String(s.trim_end_matches(' ').to_string()),
+                v => v,
+            };
             if v == Bson::Null && !self.nulls_not_distinct {
                 return Ok(None);
             }
@@ -99,6 +121,11 @@ impl PgHandler {
                 .iter()
                 .map(|e| secantus_pgplan::plan_check_expression(e, def).map_err(|e| Self::err(&e)))
                 .collect::<PgWireResult<Vec<_>>>()?;
+            let bpchar = exprs
+                .iter()
+                .zip(&planned)
+                .map(|(sql, e)| is_bpchar_key(def, sql, e))
+                .collect();
             let predicate = ix
                 .get_str("sqlPredicate")
                 .ok()
@@ -112,6 +139,7 @@ impl PgHandler {
             out.push(ExprIndex {
                 field: Self::expression_index_field(&name),
                 exprs: planned,
+                bpchar,
                 predicate,
                 nulls_not_distinct: crate::nulls_not_distinct(ix),
             });

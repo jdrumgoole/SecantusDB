@@ -2281,7 +2281,8 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       KEY / UNIQUE / index is keyed by the value with trailing blanks
       trimmed (`bpchareq` / `bcTruelen`), while the row keeps the value as
       written.** Steps: (1) a `bpchar` PRIMARY KEY's `_id` trimmed, the
-      row's value as written -- LANDED 2026-11-18, below; (2) UNIQUE; (3)
+      row's value as written -- LANDED 2026-11-18, below; (2) UNIQUE --
+      LANDED 2026-11-18, below; (3)
       ON CONFLICT on a UNIQUE arbiter; (4) an indexed and a pushed-down
       `=`; (5) the write keeping the blanks of every unsized `bpchar`
       column.
@@ -2318,31 +2319,34 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       `a_key_stored_before_the_layout_stays_in_id`). An untrimmed `_id`
       can only come from the MongoDB server writing the collection, the
       MongoDB -> SQL hand-off CLAUDE.md says does not work.
-      **Decision needed (step-2 session, 2026-11-18, no code changed):
-      how step 2 enforces UNIQUE.** The session was asked for UNIQUE
-      through `value_unique` / `check_collated_unique`. That check reads
-      every stored row before the write, and `unique_indexes`' own comment
-      (secantus-pg lib.rs ~28640) says why a read-before-write "cannot
-      uphold a constraint": it misses a value another transaction committed
-      after the snapshot or is inserting now, so the storage unique index
-      is the arbiter. Today that index still catches `'k'` / `'k  '`
-      because every write trims, so the gap opens only at step 5. ON
-      CONFLICT has the same dependency: `insert_on_conflict` finds the
-      conflict from the storage index's E11000 and probes with an exact
-      `find_matching`, so neither path sees a blank-only difference.
-      Options, most faithful first: (a) back a `bpchar` UNIQUE with a
-      storage unique index over a derived field holding the trimmed value
-      (the `expr_index` mechanism a UNIQUE expression index already uses),
-      which is PostgreSQL's btree over `bpcharcmp`, matches step 1's
-      trimmed `_id`, gives ON CONFLICT its E11000 and arbiter probe on that
-      field, and is the index step 4's `=` can use; an on-disk change for
-      tables created after it. (b) `value_unique` as asked: a full scan per
-      write and per row of a COPY, racy under concurrency. Neither changes
-      an answer before step 5. Probed on 15.19: `'k  '` then `'k'` into
-      an unsized `bpchar` UNIQUE is 23505 `Key (a)=(k)`, and `on conflict
-      (a) do update set b = excluded.b` updates the stored row, which
-      keeps `octet_length(a)` 3 (the regression tests for step 2 should
-      pin both).
+      **Decided (Joe, 2026-11-18, replacing the step-2 'Decision needed'):
+      option (a), a storage unique index over a derived field holding the
+      trimmed value (PostgreSQL's btree over `bpcharcmp`)**, not
+      `value_unique`'s read-before-write, which misses a concurrent writer.
+      Step 2 as built (2026-11-18): a UNIQUE constraint (CREATE TABLE or
+      ALTER TABLE ADD) or a CREATE UNIQUE INDEX with an unsized `bpchar`
+      column is an expression index over the bare quoted columns
+      (`unique_needs_expression`, the route a `"dot.s"` column already
+      took), and `ExprIndex` keys every `bpchar` key -- a bare `bpchar`
+      column or a `bpchar`-typed expression (`expr_index::is_bpchar_key`)
+      -- with its trailing blanks trimmed; `sqlKeys` / `sqlExpressions`
+      stay the column, so `pg_index` (`indkey`, no `indexprs`),
+      `pg_indexes` and `\d` match 15.19. The build's pre-checks
+      (`check_existing_unique`, `expression_key`) compare `bpchar` trimmed
+      and report the row stored first, as written (`Key (a)=(k  ) is
+      duplicated.` on 15.19); before, a CREATE UNIQUE INDEX over a COPYed
+      `'k  '` and an inserted `'k'` left the index behind. Tests: the
+      step-2 tests in `tests/test_rust_pg_bpchar_key.py`. A table whose
+      UNIQUE was made before step 2 keeps its plain storage index, which
+      is right while every write trims; step 5 must rebuild such an index
+      as the expression index before the write keeps blanks. ON CONFLICT
+      on such a UNIQUE already arbitrates correctly while writes trim
+      (pinned: `b` updated); step 3 must keep that once they do not --
+      `arbiter_key` probes the column's field with an exact
+      `find_matching`. Still unpinned until step 5: 15.19's DETAIL for a
+      UNIQUE collision shows the NEW row's key as written (`Key (a)=(k  )
+      already exists.` for `'k'` then `'k  '`), and the ON CONFLICT row
+      keeps `octet_length(a)` 3.
       Verify: tests/backlog/test_rp_found_rp672.py::test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks
       Backlog-ID: RP-693
 

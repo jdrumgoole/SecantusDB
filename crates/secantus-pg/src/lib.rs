@@ -2948,6 +2948,20 @@ fn join_text_hash(v: &str) -> String {
     format!("s{v}")
 }
 
+/// Whether a storage UNIQUE index over column `col` of `def` must key a
+/// hidden expression field rather than the stored field itself: a
+/// `"dot.s"` / `"$x"` column, which a key spec reads as a path, or an unsized
+/// `bpchar`, which `bpcharcmp` compares with its trailing blanks ignored
+/// while the row keeps them (`ExprIndex` keys it by `bcTruelen`; Joe,
+/// 2026-11-18; RP-693).
+fn unique_needs_expression(def: &TableDef, col: &str) -> bool {
+    def.column(col)
+        .is_some_and(|c| c.pg_type == "bpchar" && c.typmod <= 4)
+        || def
+            .field_of(col)
+            .is_some_and(|f| secantus_pgplan::is_literal_only_column_field(def, &f))
+}
+
 /// Whether a UNIQUE / PRIMARY KEY constraint covers a column whose equality
 /// the storage index over the stored form cannot see -- a `jsonb` (equal by
 /// value) or a nondeterministic collation -- so `check_collated_unique`
@@ -17459,10 +17473,21 @@ impl PgHandler {
             (_, Bson::Null) => std::cmp::Ordering::Less,
             _ => secantus_pgplan::compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal),
         };
+        // A `bpchar` key compares with its trailing blanks ignored
+        // (`bpcharcmp`; RP-693), and is shown as written.
+        let bpchar: Vec<bool> = columns
+            .iter()
+            .map(|c| def.column(c).is_some_and(|c| c.pg_type == "bpchar"))
+            .collect();
+        let trimmed = |v: &Bson, bpchar: bool| match v {
+            Bson::String(s) if bpchar => Bson::String(s.trim_end_matches(' ').to_string()),
+            v => v.clone(),
+        };
         let cmp_key = |a: &Vec<Bson>, b: &Vec<Bson>| {
             a.iter()
                 .zip(b)
-                .map(|(x, y)| cmp_field(x, y))
+                .zip(&bpchar)
+                .map(|((x, y), t)| cmp_field(&trimmed(x, *t), &trimmed(y, *t)))
                 .find(|o| o.is_ne())
                 .unwrap_or(std::cmp::Ordering::Equal)
         };
@@ -17511,8 +17536,10 @@ impl PgHandler {
             .collect();
         keys.sort_by(cmp_key);
         for pair in keys.windows(2) {
-            let key = &pair[1];
-            if cmp_key(&pair[0], key).is_eq() {
+            // The first row stored of the two, as the btree build reports
+            // (the sort is stable): `Key (a)=(k  )` for `'k  '` then `'k'`.
+            let key = &pair[0];
+            if cmp_key(key, &pair[1]).is_eq() {
                 let shown: Vec<String> = key
                     .iter()
                     .map(|v| {
@@ -18764,6 +18791,15 @@ impl PgHandler {
             if v == Bson::Null && !nulls_not_distinct(ix) {
                 return Ok(None);
             }
+            // A `bpchar` key is keyed by `bcTruelen`, as `ExprIndex` keys it,
+            // and shown as written (RP-693).
+            let (v, as_written) = match v {
+                Bson::String(s) if crate::expr_index::is_bpchar_key(def, e, &expr) => (
+                    Bson::String(s.trim_end_matches(' ').to_string()),
+                    Bson::String(s),
+                ),
+                v => (v.clone(), v),
+            };
             // A collated key (`__coll_key('c', col)`) is SHOWN as its column's
             // value, as PostgreSQL shows `Key (s)=(Apple)`.
             let display = match e
@@ -18776,7 +18812,7 @@ impl PgHandler {
                         .map_err(|e| Self::err(&e))?;
                     secantus_pgplan::apply_row_expr(&inner, row).map_err(|e| Self::err(&e))?
                 }
-                None => v.clone(),
+                None => as_written,
             };
             shown.push(secantus_pgplan::value_text(&display));
             key.push(v);
@@ -19162,13 +19198,15 @@ impl PgHandler {
             return self.create_expression_index(&def, &name, &ci);
         }
         if ci.unique
-            && ci.columns.iter().any(|(c, _)| {
-                def.field_of(c)
-                    .is_some_and(|f| secantus_pgplan::is_literal_only_column_field(&def, &f))
-            })
+            && ci
+                .columns
+                .iter()
+                .any(|(c, _)| unique_needs_expression(&def, c))
         {
-            // A storage key spec reads `"dot.s"` as a path: the UNIQUE index
-            // is an expression index over the quoted columns instead.
+            // A storage key spec reads `"dot.s"` as a path, and compares an
+            // unsized `bpchar` exactly where `bpcharcmp` ignores trailing
+            // blanks (RP-693): the UNIQUE index is an expression index over
+            // the columns' keys instead.
             let mut ci = ci;
             ci.expressions = ci.columns.iter().map(|(c, _)| quote_ident(c)).collect();
             return self.create_expression_index(&def, &name, &ci);
@@ -28695,21 +28733,27 @@ impl PgHandler {
             if fields.len() != uq.columns.len() {
                 return Ok(());
             }
-            if fields
-                .iter()
-                .any(|f| secantus_pgplan::is_literal_only_column_field(def, f))
-            {
+            if uq.columns.iter().any(|c| unique_needs_expression(def, c)) {
                 // A storage index reads `"dot.s"` as a path and `"$x"` as
                 // nothing, so it would index every row as NULL and enforce
-                // nothing. Such a constraint is an EXPRESSION index over the
-                // quoted columns instead: a hidden field holding the literal
-                // key's value, which storage can index.
-                let quoted: Vec<String> = uq.columns.iter().map(|c| quote_ident(c)).collect();
+                // nothing; and it compares an unsized `bpchar` exactly, where
+                // `bpcharcmp` ignores trailing blanks (RP-693). Such a
+                // constraint is an EXPRESSION index instead: a hidden field
+                // holding the key as the constraint compares it, which
+                // storage can index.
+                // The key as `pg_get_indexdef` and a 23505 name it: quoted
+                // only where PostgreSQL's `quote_identifier` would.
+                let quoted: Vec<String> = uq
+                    .columns
+                    .iter()
+                    .map(|c| secantus_pgplan::scalar::quote_identifier(c))
+                    .collect();
+                let exprs: Vec<String> = uq.columns.iter().map(|c| quote_ident(c)).collect();
                 let field = Self::expression_index_field(&uq.name);
                 let mut options = bson::doc! {
                     "unique": true,
                     "partialFilterExpression": { field.clone(): { "$exists": true } },
-                    "sqlExpressions": quoted.clone(),
+                    "sqlExpressions": exprs,
                     "sqlKeys": quoted,
                 };
                 if uq.nulls_not_distinct {
