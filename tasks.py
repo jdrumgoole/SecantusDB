@@ -233,30 +233,36 @@ def compare_servers(
 @task(
     name="startup-times",
     help={
-        "reps": "Cold-start measurements per server (default: 5).",
-        "no-mongod": "Skip the mongod comparison (SecantusDB servers only).",
-        "json": "Emit machine-readable JSON instead of the formatted table.",
+        "reps": "Starts per server and scenario (default: 5).",
+        "record": "Append the run to bench/results/startup_history.jsonl.",
+        "mdb-bin": "secantusd-mdb binary (default: SECANTUSD_MDB_BIN or the release build).",
+        "pg-bin": "secantusd-pg binary (default: SECANTUSD_PG_BIN or the release build).",
+        "pg-bindir": "Directory holding PostgreSQL's postgres and initdb (default: from PATH).",
+        "json": "Print the run as JSON instead of a table.",
     },
 )
 def startup_times(
     c: Context,
     reps: int = 5,
-    no_mongod: bool = False,
+    record: bool = False,
+    mdb_bin: str = "",
+    pg_bin: str = "",
+    pg_bindir: str = "",
     json: bool = False,
 ) -> None:
-    """Compare cold-start startup latency of the three standalone servers.
+    """Startup time: mongod vs secantusd-mdb, PostgreSQL vs secantusd-pg.
 
-    Spawns mongod, the Python server (``python -m secantus``), and the Rust
-    server (the ``secantusdb`` binary) as standalone daemons over a fresh
-    on-disk WiredTiger dir, and reports how long each takes from process
-    spawn to serving its first ``ping`` (median / min / max / mean over
-    ``--reps`` cold starts). mongod is skipped when not on PATH; the Rust
-    server uses the standalone binary, so it does NOT need the embedded
-    ``_secantus_server`` extension built.
+    Cold (empty data directory) and warm (restart) starts, timed from spawn
+    until a client gets an answer. ``--record`` appends the run to
+    ``bench/results/startup_history.jsonl`` with the date, host, versions and
+    commit, so the numbers can be tracked over time.
     """
     cmd = f"uv run --no-sync python -m bench.startup_times --reps {int(reps)}"
-    if no_mongod:
-        cmd += " --no-mongod"
+    for flag, val in (("--mdb-bin", mdb_bin), ("--pg-bin", pg_bin), ("--pg-bindir", pg_bindir)):
+        if val:
+            cmd += f" {flag} {shlex.quote(val)}"
+    if record:
+        cmd += " --record"
     if json:
         cmd += " --json"
     c.run(cmd, pty=PTY)
