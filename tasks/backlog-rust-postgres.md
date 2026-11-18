@@ -2870,19 +2870,32 @@ statement is VALUES-only and runs there as written. The gap test is in
       Backlog-ID: RP-1038
 
 
-- [ ] **A Sort on a computed key is priced in one shape only.** Since
-      2026-11-17 (RP-966) a Sort straight over one relation's scan whose
-      computed keys are operator expressions over the select list's
-      columns is priced, each key a resjunk entry of the scan's target
-      list (its operators' `cpu_operator_cost` per row, its type's width).
-      Still `cost=0.00..0.00`: a select list with a computed entry (`select
-      a+1 from k order by a+1`, PostgreSQL 15.19 `Sort (cost=67.33..69.83
-      rows=1000 width=4)` over `Seq Scan (cost=0.00..17.50 ...)`), a LIMIT
-      above the Sort, a key that calls a function (`order by lower(b)`,
-      `width=36`), and a key reading a column the select list does not
-      return. `sort_key_cost` and the Sort pricing in `lib.rs` (RP-318)
-      decline them.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sort on a computed key under a computed select list is priced]
+- [ ] **An ORDER BY on a column the select list only computes from
+      names the computed entry as its Sort Key.** `explain (costs off)
+      select a+1 from e order by a` prints `Sort Key: ?column?`;
+      PostgreSQL 15.19 prints `Sort Key: a` (the key is a resjunk column
+      of the scan, which this server's costs already price: `Sort
+      (cost=67.33..69.83 rows=1000 width=8)` matches). Over `k`, whose
+      primary key returns `a` in order, PostgreSQL prints `Index Only Scan
+      using k_pkey on k (cost=0.28..45.77 rows=1000 width=8)` and no Sort
+      at all. Found while working RP-1036.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by on a column only a computed entry reads names the column]
+      Backlog-ID: RP-1066
+
+- [ ] **A Sort under a select list that calls a function is not
+      priced.** Since RP-966, RP-1025 and RP-1036 a Sort (and a Limit
+      above it) straight over one relation's scan is priced with computed
+      keys -- operators and built-in calls at their `procost` -- and
+      computed select-list entries made of operators (a key equal to one
+      shares it). Still `cost=0.00..0.00`: a select-list entry that calls
+      a function, `select upper(b) from e order by lower(b)` (PostgreSQL
+      15.19 `Sort (cost=69.83..72.33 rows=1000 width=64)` over `Seq Scan
+      on e (cost=0.00..20.00 rows=1000 width=64)`): `target_cost` prices a
+      select-list entry with `row_expr_ops`, which declines calls (the
+      sort key's `expr_ops(.., true)` prices them). Widening it reaches
+      every plan `target_cost` prices, and `make_sort_input_target`
+      postpones an expensive entry above the Sort under a LIMIT.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sort under a select list calling a function is priced]
       Backlog-ID: RP-1036
 
 - [ ] **A join on an expression key PostgreSQL prices is unpriced in

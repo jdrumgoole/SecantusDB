@@ -2542,8 +2542,33 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on PostgreSQL 15.19: the shared entry is computed once.
-    "a sort on a computed key under a computed select list is priced": (
+    # Measured on PostgreSQL 15.19 (RP-1036): the select list's call is
+    # the scan's, one `procost` a row, its text 32 bytes wide.
+    "a sort under a select list calling a function is priced": (
         "RP-1036",
+        _ANALYSED,
+        "explain select upper(b) from e order by lower(b)",
+        [
+            "Sort  (cost=69.83..72.33 rows=1000 width=64)",
+            "  Sort Key: (lower(b))",
+            "  ->  Seq Scan on e  (cost=0.00..20.00 rows=1000 width=64)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (RP-1066): the key is a resjunk column
+    # of the scan, named as itself.
+    "an order by on a column only a computed entry reads names the column": (
+        "RP-1066",
+        _ANALYSED,
+        "explain (costs off) select a+1 from e order by a",
+        [
+            "Sort",
+            "  Sort Key: a",
+            "  ->  Seq Scan on e",
+        ],
+    ),
+    # Priced since RP-1036.
+    "a sort on a computed key under a computed select list is priced": (
+        "RP-1036:fixed",
         _ANALYSED,
         "explain select a+1 from k order by a+1",
         [

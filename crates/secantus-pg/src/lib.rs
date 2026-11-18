@@ -47621,13 +47621,15 @@ impl PgHandler {
                             && limit_ok
                             && matches!(sel.distinct, secantus_pgplan::Distinct::None)
                             && !sel.with_ties
-                            && sel.casts.iter().all(Option::is_none)
                         {
+                            // The select list's computed entries are the
+                            // scan's (RP-1036), priced as a target list.
+                            let target = scan_estimate::target_cost(sel);
                             // A stored key the select list does not return
                             // is a resjunk column of the scan (RP-1025).
                             let fields = first_occurrences(
                                 Vec::new(),
-                                sel.columns.iter().map(|(_, f)| f.clone()).chain(
+                                target.iter().flat_map(|(_, _, f)| f.iter().cloned()).chain(
                                     sel.order
                                         .iter()
                                         .filter(|k| k.expr.is_none())
@@ -47645,13 +47647,22 @@ impl PgHandler {
                                     sel.order.iter().map(|k| k.field.clone()).collect()
                                 },
                             };
-                            if let (Some((key_cost, key_width)), Some((estimate, index, ordered))) = (
+                            if let (
+                                Some((target_cost, target_width, _)),
+                                Some((key_cost, key_width)),
+                                Some((estimate, index, ordered)),
+                            ) = (
+                                target,
                                 scan_estimate::sort_key_cost(sel),
                                 self.upper_scan(&sel.table, &sel.filter, &fields, &want),
                             ) {
                                 let (startup, total, rows, width) = estimate;
-                                let estimate =
-                                    (startup, total + key_cost * rows, rows, width + key_width);
+                                let estimate = (
+                                    startup,
+                                    total + (target_cost + key_cost) * rows,
+                                    rows,
+                                    width + target_width + key_width,
+                                );
                                 let bound = if sort_limited {
                                     (sel.offset + count) as f64
                                 } else {

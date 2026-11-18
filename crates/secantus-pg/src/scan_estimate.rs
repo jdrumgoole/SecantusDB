@@ -6579,10 +6579,27 @@ const UNIT_COST_OPERATORS: &[&str] = &[
 /// conversion, priced differently), a function call, an operator not
 /// known to cost one.
 fn row_expr_ops(n: &pg_query::protobuf::Node, nparams: usize) -> Option<(u32, bool)> {
+    expr_ops(n, nparams, false).map(|(o, r)| (o as u32, r))
+}
+
+/// `row_expr_ops`, in `cpu_operator_cost` units, with `calls` also pricing
+/// a plain call of a built-in at its `procost` (`cost_qual_eval` of a
+/// FuncExpr), as a sort key's is (RP-1036).
+fn expr_ops(n: &pg_query::protobuf::Node, nparams: usize, calls: bool) -> Option<(f64, bool)> {
     use pg_query::protobuf::node::Node as N;
     match n.node.as_ref()? {
-        N::AConst(_) => Some((0, false)),
-        N::ParamRef(p) => Some((0, usize::try_from(p.number).ok()? > nparams)),
+        N::FuncCall(f) if calls => {
+            let procost = secantus_pgplan::joins::plain_call_procost(f)?;
+            let (mut ops, mut reads) = (0.0, false);
+            for a in &f.args {
+                let (o, r) = expr_ops(a, nparams, calls)?;
+                ops += o;
+                reads |= r;
+            }
+            Some((if reads { ops + procost } else { 0.0 }, reads))
+        }
+        N::AConst(_) => Some((0.0, false)),
+        N::ParamRef(p) => Some((0.0, usize::try_from(p.number).ok()? > nparams)),
         N::AExpr(e) if e.kind == pg_query::protobuf::AExprKind::AexprOp as i32 => {
             let op = match e.name.last()?.node.as_ref()? {
                 N::String(s) => s.sval.as_str(),
@@ -6591,16 +6608,16 @@ fn row_expr_ops(n: &pg_query::protobuf::Node, nparams: usize) -> Option<(u32, bo
             if !UNIT_COST_OPERATORS.contains(&op) {
                 return None;
             }
-            let (mut ops, mut reads) = (0, false);
+            let (mut ops, mut reads) = (0.0, false);
             for side in [e.lexpr.as_deref(), e.rexpr.as_deref()]
                 .into_iter()
                 .flatten()
             {
-                let (o, r) = row_expr_ops(side, nparams)?;
+                let (o, r) = expr_ops(side, nparams, calls)?;
                 ops += o;
                 reads |= r;
             }
-            Some((if reads { ops + 1 } else { 0 }, reads))
+            Some((if reads { ops + 1.0 } else { 0.0 }, reads))
         }
         _ => None,
     }
@@ -6743,26 +6760,69 @@ fn row_entry_cost(e: &secantus_pgplan::ColumnExpr) -> Option<(f64, i64)> {
 /// `(per-row cost, width)` the ORDER BY's computed keys add to the scan
 /// under its Sort (RP-966): each is a resjunk entry of the scan's target
 /// list (`make_sort_input_target` leaves it to the scan), priced as a
-/// select-list expression. `None` where a key is not priced, or reads a
-/// column the select list does not return (whose width the scan would add).
+/// select-list expression, a built-in call at its `procost` (RP-1036). A
+/// key equal to a computed select-list entry is that entry, already in the
+/// target list; the columns a key reads are not (the scan returns the key's
+/// value, not them). `None` where a key is not priced.
 pub(crate) fn sort_key_cost(sel: &secantus_pgplan::Select) -> Option<(f64, i64)> {
     let (mut cost, mut width) = (0.0, 0);
     for k in &sel.order {
         let Some(e) = &k.expr else { continue };
-        let secantus_pgplan::ColumnExpr::Row { fields, .. } = e else {
+        if sel.casts.iter().flatten().any(|c| same_row_expr(c, e)) {
+            continue;
+        }
+        let secantus_pgplan::ColumnExpr::Row {
+            expr,
+            fields,
+            params,
+            result_type,
+            ..
+        } = e
+        else {
             return None;
         };
-        if !fields
-            .iter()
-            .all(|(_, f, _)| sel.columns.iter().any(|(_, c)| c == f))
+        if fields.iter().any(|(_, _, t)| {
+            secantus_pgplan::pgtypes::oid_of_name(t).is_none_or(|oid| oid >= 10000)
+        }) || secantus_pgplan::pgtypes::oid_of_name(result_type).is_none_or(|oid| oid >= 10000)
         {
             return None;
         }
-        let (c, w) = row_entry_cost(e)?;
-        cost += c;
-        width += w;
+        let (ops, _) = expr_ops(expr, params.len(), true)?;
+        cost += ops * costsize::CPU_OPERATOR_COST;
+        width += type_width(result_type, -1);
     }
     Some((cost, width))
+}
+
+/// `equal()` of two row expressions: the same tree over the same columns,
+/// wherever in the statement each was written.
+fn same_row_expr(a: &secantus_pgplan::ColumnExpr, b: &secantus_pgplan::ColumnExpr) -> bool {
+    use secantus_pgplan::ColumnExpr::Row;
+    static LOCATION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let location =
+        LOCATION.get_or_init(|| regex::Regex::new(r"location: -?\d+").expect("static regex"));
+    match (a, b) {
+        (
+            Row {
+                expr: x,
+                fields: fx,
+                params: px,
+                ..
+            },
+            Row {
+                expr: y,
+                fields: fy,
+                params: py,
+                ..
+            },
+        ) => {
+            fx == fy
+                && px == py
+                && location.replace_all(&format!("{x:?}"), "")
+                    == location.replace_all(&format!("{y:?}"), "")
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
