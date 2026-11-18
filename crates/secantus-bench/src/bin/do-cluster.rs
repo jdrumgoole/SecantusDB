@@ -76,7 +76,7 @@ COMMANDS
 
 CLUSTER OPTIONS (all commands)
   --prefix NAME        Resource name prefix and tag        [secantus-bench]
-  --region SLUG        DigitalOcean region                 [lon1]
+  --region SLUG        DigitalOcean region                 [ams3]
   --server-size SLUG   Server droplet plan                 [c-4]
   --client-size SLUG   Client droplet plan                 [c-2]
   --image SLUG         Base image                          [ubuntu-24-04-x64]

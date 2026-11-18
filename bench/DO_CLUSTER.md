@@ -278,7 +278,7 @@ for this server (`bench/results/pg-droplet/2026-10-12-low-client-noise/`).
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--prefix NAME` | `secantus-bench` | Name prefix and DigitalOcean tag for every resource |
-| `--region SLUG` | `lon1` | DigitalOcean region |
+| `--region SLUG` | `ams3` (lon1 has no c-4 plan) | DigitalOcean region |
 | `--server-size SLUG` | `c-4` | Server droplet plan |
 | `--client-size SLUG` | `c-2` | Client droplet plan |
 | `--image SLUG` | `ubuntu-24-04-x64` | Base image |
