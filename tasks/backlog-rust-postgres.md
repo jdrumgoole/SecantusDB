@@ -2124,17 +2124,23 @@ holding `(1, 'y')`.
 
 Measured on a private PostgreSQL 15.19 cluster.
 
-- [ ] **COMMENT ON a built-in type, operator or access method does not
-      replace initdb's description.** PostgreSQL 15.19 keys the comment by
-      the object's oid in `pg_description`, replacing initdb's row (IS NULL
-      deletes it). Here initdb's rows are served for every catalog
-      (`pg15_other_descriptions.tsv`, since RP-969's second part), but
-      `comment on type int4 is 'x'` is accepted and changes nothing, and
-      COMMENT ON an operator or access method is 0A000. Faithful: store
-      such a comment by `(classoid, oid)` as `BUILTIN_PROC_COMMENT_COLLECTION`
-      does for routines, a document with no comment keeping initdb's
-      deleted, for every catalog `pg15_other_descriptions.tsv` covers.
-      Verify: tests/backlog/test_rp_found_rp514.py::test_comment_on_builtin_object_replaces_initdb_description
+- [ ] **COMMENT ON a built-in conversion, language, schema, collation,
+      text search parser or template, or extension does not replace
+      initdb's description.** PostgreSQL 15.19 keys the comment by the
+      object's oid in `pg_description`, replacing initdb's row (IS NULL
+      deletes it). Types, operators and access methods do, through
+      `comment_on_builtin_object` (oids are unique across the bootstrap
+      catalogs, so `BUILTIN_PROC_COMMENT_COLLECTION` holds them all).
+      Remaining, measured 2026-11-18: `comment on conversion
+      utf8_to_iso_8859_1` is 42704 (only user conversions are found);
+      COMMENT ON a language, collation, text search parser or template is
+      0A000 `COMMENT ON this kind of object` (no `ObjectType` arm in
+      `plan_comment`); `comment on schema pg_catalog` and `comment on
+      extension plpgsql` are accepted but `obj_description` still shows
+      initdb's text. Each needs its name resolved to the built-in oid and
+      the same store; the read path already drops initdb's row for an oid
+      in it.
+      Verify: tests/backlog/test_rp_found_rp514.py::test_comment_on_other_builtin_catalogs
       Backlog-ID: RP-969
 
 ## Found while working RP-527 (2026-11-08)

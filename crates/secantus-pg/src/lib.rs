@@ -5774,8 +5774,9 @@ impl PgHandler {
     ];
     /// `COMMENT ON INDEX`, keyed by index name: the Python server's store.
     const INDEX_COMMENT_COLLECTION: &'static str = "__sql_index_comments__";
-    /// `COMMENT ON` a built-in routine: `{_id: <pg_proc oid>, comment}`,
-    /// one per overload as `pg_description` keys it (RP-519).
+    /// `COMMENT ON` a built-in routine, type, operator or access method:
+    /// `{_id: <oid>, comment}`, as `pg_description` keys it (RP-519, RP-969);
+    /// initdb's oids are unique across the bootstrap catalogs.
     const BUILTIN_PROC_COMMENT_COLLECTION: &'static str = "__sql_builtin_proc_comments__";
     /// `COMMENT ON` every other kind of object the catalog has no row of its
     /// own to carry it on: `{_id: "<kind>\0<name>", kind, name, comment}`.
@@ -20032,6 +20033,75 @@ impl PgHandler {
     /// constraints carry their comment in the table's catalog row, indexes in
     /// the index-comment store (both where the Python server keeps them);
     /// everything else in `COMMENT_COLLECTION`.
+    /// A built-in type named by `names`: its oid, below
+    /// `FirstNormalObjectId` as initdb assigns them.
+    /// `pg_catalog` comes first on every search path, so a bare name is the
+    /// built-in one when there is one.
+    fn builtin_type_oid(names: &[String]) -> Option<i64> {
+        let name = match names {
+            [n] => n,
+            [schema, n] if schema == "pg_catalog" => n,
+            _ => return None,
+        };
+        secantus_pgplan::pgtypes::oid_of_name(name).filter(|oid| *oid < 16384)
+    }
+
+    /// The operator `name(left,right)` names, as `get_object_address`
+    /// finds it: each operand type must exist (42704), then the operator
+    /// (42883, printed `integer ## integer` as `op_signature_string` does).
+    fn operator_oid_for_comment(signature: &str) -> PgWireResult<i64> {
+        let (name, args) = signature
+            .strip_suffix(')')
+            .and_then(|s| s.split_once('('))
+            .unwrap_or((signature, ""));
+        let mut display = Vec::new();
+        for arg in args.split(',') {
+            if arg == "NONE" {
+                continue;
+            }
+            let oid = secantus_pgplan::user_casts::type_oid(arg).ok_or_else(|| {
+                Self::user_error("42704", format!("type \"{arg}\" does not exist"))
+            })?;
+            display.push(secantus_pgplan::regtype_text(oid));
+        }
+        secantus_pgplan::regobj::resolve("regoperator", signature).map_err(|_| {
+            let printed = match display.as_slice() {
+                [l, r] => format!("{l} {name} {r}"),
+                [r] => format!("{name} {r}"),
+                _ => name.to_string(),
+            };
+            Self::user_error("42883", format!("operator does not exist: {printed}"))
+        })
+    }
+
+    /// `COMMENT ON` a built-in object of a catalog with no record of ours to
+    /// carry it: `pg_description` keys it by the object's oid, replacing
+    /// initdb's row, and IS NULL deletes that row -- a document with no
+    /// comment keeps it deleted (RP-969).
+    fn comment_on_builtin_object(
+        &self,
+        kind: &str,
+        name: &str,
+        oid: i64,
+        comment: Option<String>,
+    ) -> PgWireResult<()> {
+        if oid >= 16384 {
+            return Err(Self::user_error(
+                "0A000",
+                format!("COMMENT ON a user-defined {kind} ({name}) is not supported"),
+            ));
+        }
+        let id = oid.to_string();
+        self.put_comment_doc(
+            Self::BUILTIN_PROC_COMMENT_COLLECTION,
+            &id,
+            Some(match comment {
+                Some(c) => bson::doc! {"_id": &id, "oid": oid, "comment": c},
+                None => bson::doc! {"_id": &id, "oid": oid},
+            }),
+        )
+    }
+
     fn comment_on(
         &self,
         kind: &str,
@@ -20221,6 +20291,24 @@ impl PgHandler {
                 // read under the transaction's snapshot (RP-518).
                 self.delete_type_doc(Self::FUNCTION_COLLECTION, &id)?;
                 self.insert_type_doc(Self::FUNCTION_COLLECTION, &id, doc)
+            }
+            "operator" | "access method" => {
+                let name = names.first().map_or("", String::as_str);
+                let oid = if kind == "operator" {
+                    Self::operator_oid_for_comment(name)?
+                } else {
+                    secantus_pgplan::misc_alter::method_oid(name).ok_or_else(|| {
+                        Self::user_error(
+                            "42704",
+                            format!("access method \"{name}\" does not exist"),
+                        )
+                    })?
+                };
+                self.comment_on_builtin_object(kind, name, oid, comment)
+            }
+            "type" if Self::builtin_type_oid(names).is_some() => {
+                let oid = Self::builtin_type_oid(names).unwrap_or_default();
+                self.comment_on_builtin_object(kind, &names.join("."), oid, comment)
             }
             "domain" => self.comment_on_domain(&Self::comment_relation(names), comment),
             "text search configuration" => self.comment_on_ts_config(names, comment),
@@ -22575,8 +22663,9 @@ impl PgHandler {
                 .chain(self.transform_comments())
                 .map(|(oid, c)| (oid, 0, c)),
         );
-        // COMMENT ON a built-in routine, by its overload's oid, replacing
-        // or (IS NULL) removing initdb's description of it (RP-969).
+        // COMMENT ON a built-in routine, type, operator or access method, by
+        // its oid, replacing or (IS NULL) removing initdb's description of
+        // it (RP-969).
         let mut commented = HashSet::new();
         for d in self
             .storage
@@ -22608,6 +22697,7 @@ impl PgHandler {
         tail.extend(
             crate::system_catalogs::initdb_other_descriptions()
                 .iter()
+                .filter(|(_, oid, _)| !commented.contains(oid))
                 .map(|(_, oid, c)| (*oid, 0, c.clone())),
         );
         // COMMENT ON FUNCTION / PROCEDURE, kept on the function's record,

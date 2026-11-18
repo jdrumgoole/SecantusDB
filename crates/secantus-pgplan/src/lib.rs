@@ -29574,6 +29574,8 @@ fn plan_comment(c: &pg_query::protobuf::CommentStmt) -> Result<Statement> {
         Ok(O::ObjectOpfamily) => "operator family",
         Ok(O::ObjectSubscription) => "subscription",
         Ok(O::ObjectTransform) => "transform",
+        Ok(O::ObjectOperator) => "operator",
+        Ok(O::ObjectAccessMethod) => "access method",
         _ => return Err(Error::Unsupported("COMMENT ON this kind of object".into())),
     };
     fn strings(n: &pg_query::protobuf::Node, out: &mut Vec<String>) {
@@ -29591,6 +29593,21 @@ fn plan_comment(c: &pg_query::protobuf::CommentStmt) -> Result<Statement> {
         // its argument types and a schema-qualified name keeps its schema.
         Some(N::ObjectWithArgs(ow)) if matches!(kind, "function" | "procedure" | "routine") => {
             names.extend(routine_signature(ow));
+        }
+        // An operator is named `name(left,right)`, as `regoperatorin` reads
+        // it: a prefix operator's missing left operand is `NONE`.
+        Some(N::ObjectWithArgs(ow)) if kind == "operator" => {
+            let mut name = Vec::new();
+            ow.objname.iter().for_each(|n| strings(n, &mut name));
+            let args: Vec<String> = ow
+                .objargs
+                .iter()
+                .map(|n| match n.node.as_ref() {
+                    Some(N::TypeName(tn)) => type_name_of(tn),
+                    _ => "NONE".to_string(),
+                })
+                .collect();
+            names.push(format!("{}({})", name.join("."), args.join(",")));
         }
         _ => {
             if let Some(o) = c.object.as_deref() {

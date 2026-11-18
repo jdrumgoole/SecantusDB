@@ -341,8 +341,119 @@ COMMENT_ON_BUILTIN = {
 }
 
 
-@pytest.mark.backlog("RP-969")
+@pytest.mark.backlog_fixed("RP-969")
 @pytest.mark.parametrize("case", list(COMMENT_ON_BUILTIN))
 def test_comment_on_builtin_object_replaces_initdb_description(case: str, dsn: str) -> None:
+    """COMMENT ON a built-in type was accepted and lost, and on an operator
+    or access method was 0A000; each now replaces initdb's description."""
     comment, query, want = COMMENT_ON_BUILTIN[case]
+    assert answer(dsn, comment, query) == ("ok", [(want,)])
+
+
+# How COMMENT ON names a built-in type, operator or access method, and what
+# it says when there is none; measured on PostgreSQL 15.19.
+COMMENT_ON_BUILTIN_NAMING = {
+    "type alias": (
+        "comment on type integer is 'i'",
+        "select obj_description('int4'::regtype, 'pg_type')",
+        ("ok", [("i",)]),
+    ),
+    "qualified type, is null": (
+        "comment on type pg_catalog.text is null",
+        "select obj_description('text'::regtype, 'pg_type')",
+        ("ok", [(None,)]),
+    ),
+    "prefix operator": (
+        "comment on operator -(none, int4) is 'neg'",
+        "select obj_description('-(none,int4)'::regoperator, 'pg_operator')",
+        ("ok", [("neg",)]),
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-969")
+@pytest.mark.parametrize("case", list(COMMENT_ON_BUILTIN_NAMING))
+def test_comment_on_builtin_object_naming(case: str, dsn: str) -> None:
+    comment, query, want = COMMENT_ON_BUILTIN_NAMING[case]
+    assert answer(dsn, comment, query) == want
+
+
+COMMENT_ON_MISSING_BUILTIN = {
+    "comment on operator ##(int4, int4) is 'z'": (
+        "42883",
+        "operator does not exist: integer ## integer",
+    ),
+    "comment on operator ##(none, int4) is 'z'": (
+        "42883",
+        "operator does not exist: ## integer",
+    ),
+    "comment on operator +(int4, nosuch) is 'z'": (
+        "42704",
+        'type "nosuch" does not exist',
+    ),
+    "comment on access method nosuch is 'z'": (
+        "42704",
+        'access method "nosuch" does not exist',
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-969")
+@pytest.mark.parametrize("comment", list(COMMENT_ON_MISSING_BUILTIN))
+def test_comment_on_missing_builtin_object(comment: str, dsn: str) -> None:
+    got = answer(dsn, comment)
+    assert (got[0], got[1]) == COMMENT_ON_MISSING_BUILTIN[comment]
+
+
+# COMMENT ON a built-in object of the other catalogs initdb describes; each
+# replaces initdb's description on PostgreSQL 15.19.
+COMMENT_ON_OTHER_BUILTIN = {
+    "conversion": (
+        "comment on conversion utf8_to_iso_8859_1 is 'q'",
+        "select obj_description((select oid from pg_conversion"
+        " where conname = 'utf8_to_iso_8859_1'), 'pg_conversion')",
+        "q",
+    ),
+    "language": (
+        "comment on language plpgsql is 'q'",
+        "select obj_description((select oid from pg_language"
+        " where lanname = 'plpgsql'), 'pg_language')",
+        "q",
+    ),
+    "schema": (
+        "comment on schema pg_catalog is 'q'",
+        "select obj_description('pg_catalog'::regnamespace, 'pg_namespace')",
+        "q",
+    ),
+    "collation, is null": (
+        'comment on collation "C" is null',
+        "select obj_description((select oid from pg_collation"
+        " where collname = 'C'), 'pg_collation')",
+        None,
+    ),
+    "text search parser": (
+        "comment on text search parser \"default\" is 'q'",
+        "select obj_description((select oid from pg_ts_parser"
+        " where prsname = 'default'), 'pg_ts_parser')",
+        "q",
+    ),
+    "text search template": (
+        "comment on text search template simple is 'q'",
+        "select obj_description((select oid from pg_ts_template"
+        " where tmplname = 'simple'), 'pg_ts_template')",
+        "q",
+    ),
+    "extension": (
+        "comment on extension plpgsql is 'q'",
+        "select obj_description((select oid from pg_extension"
+        " where extname = 'plpgsql'), 'pg_extension')",
+        "q",
+    ),
+}
+
+
+@pytest.mark.backlog("RP-969")
+@pytest.mark.parametrize("case", list(COMMENT_ON_OTHER_BUILTIN))
+def test_comment_on_other_builtin_catalogs(case: str, dsn: str) -> None:
+    comment, query, want = COMMENT_ON_OTHER_BUILTIN[case]
     assert answer(dsn, comment, query) == ("ok", [(want,)])
