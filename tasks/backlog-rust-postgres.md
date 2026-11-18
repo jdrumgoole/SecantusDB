@@ -821,15 +821,28 @@ one beside it.
     shape worse, and `--desc-nulls-last --then "m0.c desc"` 787 of 810
     (781 before), `--desc-nulls-last --then m1.c` 801 (791), `--desc
     --then m0.c` 801 (797), `--desc --then "m1.c desc, m0.b"` 12
-    differences (18). Of what is left, two-table LEFT joins ordered by the
-    preserved side's key DESC NULLS LAST with another key leave ties in
-    another order (`two/3000/idx1/b_a/leftjoin/m0.b`), not diagnosed; the
-    rest are four- and five-table stars. Declined still: a later key a
+    differences (18). Since 2026-11-18 an outer join's clause no longer
+    puts the nullable side's index scan in the preserved key's order (its
+    two one-member classes shared one id), so a DESC NULLS LAST ORDER BY of
+    the preserved key keeps the forward scan and the Merge Right Join:
+    `--desc-nulls-last --then m1.c` 803 of 810, `--then "m0.c desc"` 789,
+    every two-table shape matching. Since 2026-11-18, under
+    `Search::merge_asc`, a DESC (NULLS FIRST) first key's backward index
+    scan, in the query's order, is weighed as a merge's outer (the merge
+    runs descending and leaves the query's order, `match_unsorted_outer`),
+    and a forward scan an outer join leaves out of the ORDER BY's order is
+    in the merge's ascending one (a Merge Right Join reads it presorted):
+    `--desc --then m0.c` 809 of 810 (801), `--desc --then "m1.c desc,
+    m0.b"` 2 differences (12), every two-table shape matching, no other
+    variant worse. What is left there is a five-table two-hub shape
+    (`multi5/300/idx1/two_hubs2/inner/ordlastlim5`), not diagnosed; the
+    `--desc-nulls-last` ones (7 and 21 differences) are four- and
+    five-table stars. Declined still: a later key a
     WHERE may fix to a constant; a table with an index of several columns;
     and a two-table join with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_left_join_preserved_desc_nulls_last_key_with_another
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_five_table_two_hub_join_desc_with_another_key
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
@@ -2136,16 +2149,16 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 
 - [ ] **The `record_image` operators refuse some field types.** `*=` ..
       `*>=` compare a record's fields by their binary images (RP-650):
-      the scalar types in `record_image.rs`, arrays of fixed-length
-      elements or of text / varchar / bpchar / numeric / bytea (each with
-      the 4-byte header `array_in` gives it, measured) and the built-in
-      ranges are modelled (2026-11-18). Every other type is 0A000 `a
+      the scalar types in `record_image.rs`, jsonb (its `JsonbContainer`,
+      2026-11-18), arrays of fixed-length elements (by value, or by
+      reference: interval, uuid, timetz, name, macaddr / macaddr8, tid) or
+      of text / varchar / bpchar / numeric / bytea / inet / cidr / jsonb
+      (each with the 4-byte header `array_in` gives it, measured) and the
+      built-in ranges are modelled. Every other type is 0A000 `a
       record_image comparison over a field of type ... is not supported
-      yet`. Remaining, measured on PostgreSQL 15.19: jsonb compares by
-      `memcmp` of its `JsonbContainer` (header word, JEntries, keys sorted
-      by length then bytes, int-aligned numerics); arrays of any other
-      element (jsonb, inet, interval, ...), a user range, a multirange and
-      a composite field are refused too.
+      yet`. Remaining, measured on PostgreSQL 15.19: arrays of any other
+      varlena element, a user range, a multirange and a composite field (a
+      `HeapTupleHeader` varlena).
       Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_over_still_refused_field_types
       Backlog-ID: RP-976
 
@@ -2569,22 +2582,21 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 - [ ] **`pg_get_viewdef` of most system views is NULL.** PostgreSQL
       15.19 deparses every `pg_catalog` and `information_schema` view's
       rule. Here `system_view_defs` prints `system_views.sql`'s queries
-      through `ruleutils`, which reproduces 56 of the 75 `pg_catalog`
+      through `ruleutils`, which reproduces 68 of the 75 `pg_catalog`
       views exactly (`pg_tables`, `pg_roles`, `pg_stats`, `pg_settings`,
-      `pg_sequences`, `pg_stat_all_tables`, every `pg_statio_*` view, ...;
-      none printed wrong, measured 2026-11-18 in both print modes) and
-      leaves the rest NULL rather than print them as written. Remaining:
-      the 19 other `pg_catalog` views (`pg_policies`, `pg_seclabels`,
-      `pg_publication_tables`, `pg_stats_ext*`, `pg_stat_activity`,
-      `pg_stat_database`, `pg_stat_ssl`, `pg_stat_gssapi`, the
-      `pg_stat_progress_*`, `pg_stat_replication*` and
-      `pg_stat_subscription*` views), which the printer refuses; and
-      every `information_schema` view, left out because the printer casts
-      to the bare domain where ruleutils qualifies it and casts a literal
-      to the base type first
+      `pg_stat_activity`, every `pg_stat_progress_*` view, ...; none
+      printed wrong, measured 2026-11-18 in both print modes) and leaves
+      the rest NULL rather than print them as written. Remaining: the 7
+      other `pg_catalog` views (`pg_policies`, `pg_publication_tables`,
+      `pg_seclabels`, `pg_stat_database`, `pg_stat_replication_slots`,
+      `pg_stats_ext`, `pg_stats_ext_exprs`), which the printer refuses;
+      and every `information_schema` view, left out because the printer
+      casts to the bare domain where ruleutils qualifies it and casts a
+      literal to the base type first
       (`('c'::character varying)::information_schema.character_data`,
-      `(x)::information_schema.sql_identifier`). A function in FROM
-      returning a record of OUT parameters prints since 2026-11-15.
+      `(x)::information_schema.sql_identifier`). A user view over
+      `generate_series(1, c.relnatts)` is still refused: ruleutils casts
+      the int2 argument to `integer`, which the printer does not add.
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_the_remaining_system_views
       Backlog-ID: RP-798
 - [ ] **`pg_get_viewdef` types a `name IN (text, unknown)` list as

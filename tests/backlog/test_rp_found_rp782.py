@@ -131,7 +131,7 @@ def test_pg_get_viewdef_of_a_system_view(dsn: str) -> None:
 
 # The system views the printer does not reproduce are still NULL: an
 # `information_schema` view (its domain casts), and `pg_catalog` views
-# such as `pg_sequences` and the `pg_stat_*` family.
+# such as `pg_stats_ext`.
 @pytest.mark.backlog("RP-798")
 def test_pg_get_viewdef_of_the_remaining_system_views(dsn: str) -> None:
     with _connect(dsn) as c:
@@ -143,6 +143,47 @@ def test_pg_get_viewdef_of_the_remaining_system_views(dsn: str) -> None:
             ]
         ]
     assert got == [[(True,)], [(True,)]]
+
+
+# A built-in taking IN arguments and returning a record of OUT parameters
+# prints with its column list; one whose arguments name a sibling FROM
+# item prints LATERAL (`transformRangeFunction`); a cast to the type a
+# column already has prints no AS. These views were NULL (RP-798),
+# measured on PostgreSQL 15.19.
+@pytest.mark.backlog_fixed("RP-798")
+def test_pg_get_viewdef_of_views_over_functions_with_in_arguments(dsn: str) -> None:
+    with _connect(dsn) as c:
+        got = [
+            _answer(c, f"select pg_get_viewdef('{v}'::regclass)")
+            for v in ("pg_stat_subscription_stats", "pg_stat_gssapi")
+        ]
+        analyze = _answer(c, "select pg_get_viewdef('pg_stat_progress_analyze'::regclass)")
+    assert got == [
+        [
+            (
+                " SELECT ss.subid,\n    s.subname,\n    ss.apply_error_count,\n"
+                "    ss.sync_error_count,\n    ss.stats_reset\n   FROM pg_subscription s,\n"
+                "    LATERAL pg_stat_get_subscription_stats(s.oid)"
+                " ss(subid, apply_error_count, sync_error_count, stats_reset);",
+            )
+        ],
+        [
+            (
+                " SELECT s.pid,\n    s.gss_auth AS gss_authenticated,\n"
+                "    s.gss_princ AS principal,\n    s.gss_enc AS encrypted\n"
+                "   FROM pg_stat_get_activity(NULL::integer) s(datid, pid, usesysid,"
+                " application_name, state, query, wait_event_type, wait_event, xact_start,"
+                " query_start, backend_start, state_change, client_addr, client_hostname,"
+                " client_port, backend_xid, backend_xmin, backend_type, ssl, sslversion,"
+                " sslcipher, sslbits, ssl_client_dn, ssl_client_serial, ssl_issuer_dn,"
+                " gss_auth, gss_princ, gss_enc, leader_pid, query_id)\n"
+                "  WHERE (s.client_port IS NOT NULL);",
+            )
+        ],
+    ]
+    assert analyze[0][0].startswith(
+        " SELECT s.pid,\n    s.datid,\n    d.datname,\n    s.relid,\n        CASE s.param1\n"
+    )
 
 
 # A function in FROM returning a record of OUT parameters prints with its

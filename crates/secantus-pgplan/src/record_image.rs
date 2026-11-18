@@ -15,7 +15,8 @@
 //! Modelled: the integers, oid, bool, `"char"`, the floats, numeric, date,
 //! time, timetz, the timestamps, interval, uuid, macaddr / macaddr8, inet /
 //! cidr, tid, pg_lsn, name, text / varchar / bpchar, bytea, money, bit /
-//! varbit, arrays of those fixed-length or text-like elements, and the built-in ranges.
+//! varbit, jsonb, arrays of any of those but bit / varbit, and
+//! the built-in ranges.
 
 use std::cmp::Ordering;
 
@@ -268,6 +269,11 @@ fn image(v: &Bson, ty: &str) -> Result<Image> {
         t if t.ends_with("[]") => {
             Image::Bytes(array_image(v, &canonical(t.trim_end_matches("[]"))).ok_or_else(refused)?)
         }
+        "jsonb" => {
+            let t = crate::hashfn::text_of(v, "jsonb").map_err(|_| refused())?;
+            let j = crate::json::parse(&t).map_err(|_| refused())?;
+            Image::Bytes(jsonb_image(&j).ok_or_else(refused)?)
+        }
         t if RANGE_TYPES.iter().any(|(n, _)| *n == t) => {
             Image::Bytes(range_image(v, t).ok_or_else(refused)?)
         }
@@ -305,11 +311,27 @@ fn fixed_element(ty: &str) -> Option<(u32, usize, usize)> {
     })
 }
 
+/// A fixed-length by-reference element type's `pg_type` facts: `(oid,
+/// typlen, typalign)`. Its stored bytes are its whole image.
+fn fixed_byref_element(ty: &str) -> Option<(u32, usize, usize)> {
+    Some(match ty {
+        "name" => (19, 64, 1),
+        "tid" => (27, 6, 2),
+        "macaddr8" => (774, 8, 4),
+        "macaddr" => (829, 6, 4),
+        "interval" => (1186, 16, 8),
+        "timetz" | "time with time zone" => (1266, 12, 8),
+        "uuid" => (2950, 16, 1),
+        _ => return None,
+    })
+}
+
 /// One fixed-length element as it lies in an array or range: the low
 /// `len` bytes of its Datum, native (little-endian) order.
 fn fixed_bytes(v: &Bson, ty: &str, len: usize) -> Option<Vec<u8>> {
     match image(v, ty).ok()? {
         Image::ByValue(w) => Some(w.to_le_bytes()[..len].to_vec()),
+        Image::Bytes(b) if b.len() == len && fixed_byref_element(ty).is_some() => Some(b),
         Image::Bytes(_) => None,
     }
 }
@@ -329,7 +351,7 @@ fn pad_to(out: &mut Vec<u8>, base: usize, align: usize) {
 /// it (`(size << 2)`, little-endian), measured on PostgreSQL 15.19:
 /// `row('{b}'::text[]) *< row('{<63 a>}'::text[])` is false.
 fn array_image(v: &Bson, elem: &str) -> Option<Vec<u8>> {
-    let (oid, len, align) = match fixed_element(elem) {
+    let (oid, len, align) = match fixed_element(elem).or_else(|| fixed_byref_element(elem)) {
         Some(f) => f,
         None => (varlena_element(elem)?, 0, 4),
     };
@@ -392,8 +414,114 @@ fn varlena_element(ty: &str) -> Option<u32> {
         "bpchar" => 1042,
         "varchar" => 1043,
         "numeric" => 1700,
+        "cidr" => 650,
+        "inet" => 869,
+        "jsonb" => 3802,
         _ => return None,
     })
+}
+
+const JB_FSCALAR: u32 = 0x1000_0000;
+const JB_FOBJECT: u32 = 0x2000_0000;
+const JB_FARRAY: u32 = 0x4000_0000;
+const JENTRY_ISNUMERIC: u32 = 0x1000_0000;
+const JENTRY_ISBOOL_FALSE: u32 = 0x2000_0000;
+const JENTRY_ISBOOL_TRUE: u32 = 0x3000_0000;
+const JENTRY_ISNULL: u32 = 0x4000_0000;
+const JENTRY_ISCONTAINER: u32 = 0x5000_0000;
+const JENTRY_HAS_OFF: u32 = 0x8000_0000;
+const JB_OFFSET_STRIDE: usize = 32;
+
+/// A jsonb's varlena data as `convertToJsonb` lays it out (`jsonb_util.c`):
+/// a `JsonbContainer` -- the header word (count and `JB_F*` flags), one
+/// `JEntry` per child (an object's keys first, then its values), then the
+/// children's data. A raw scalar is a one-element array flagged
+/// `JB_FSCALAR`. Object keys are sorted by length, then bytes, the last of
+/// a duplicate kept. A numeric child is padded to int alignment and stored
+/// as its whole varlena (4-byte header included); a nested container is
+/// padded likewise. Every `JB_OFFSET_STRIDE`th `JEntry` holds the end
+/// offset (`JENTRY_HAS_OFF`), the others the child's length, padding
+/// included.
+fn jsonb_image(j: &crate::json::Json) -> Option<Vec<u8>> {
+    use crate::json::Json;
+    let mut out = Vec::new();
+    match j {
+        Json::Array(_) | Json::Object(_) => jsonb_container(j, &mut out)?,
+        scalar => jsonb_children(JB_FARRAY | JB_FSCALAR, &[scalar], &mut out)?,
+    }
+    Some(out)
+}
+
+fn jsonb_container(j: &crate::json::Json, out: &mut Vec<u8>) -> Option<()> {
+    use crate::json::Json;
+    match j {
+        Json::Array(items) => {
+            let items: Vec<&Json> = items.iter().collect();
+            jsonb_children(JB_FARRAY, &items, out)
+        }
+        Json::Object(pairs) => {
+            let mut kept: Vec<(&String, &Json)> = Vec::new();
+            for (k, v) in pairs {
+                match kept.iter_mut().find(|(e, _)| *e == k) {
+                    Some(slot) => slot.1 = v,
+                    None => kept.push((k, v)),
+                }
+            }
+            kept.sort_by(|x, y| x.0.len().cmp(&y.0.len()).then_with(|| x.0.cmp(y.0)));
+            let keys: Vec<Json> = kept.iter().map(|(k, _)| Json::Str((*k).clone())).collect();
+            let children: Vec<&Json> = keys.iter().chain(kept.iter().map(|(_, v)| *v)).collect();
+            jsonb_children(JB_FOBJECT, &children, out)
+        }
+        _ => None,
+    }
+}
+
+/// Writes a container header with `flags`, then `children`' JEntries and
+/// data. `out` is already int-aligned relative to the jsonb's start.
+fn jsonb_children(flags: u32, children: &[&crate::json::Json], out: &mut Vec<u8>) -> Option<()> {
+    use crate::json::Json;
+    let count = if flags & JB_FOBJECT != 0 {
+        children.len() / 2
+    } else {
+        children.len()
+    };
+    out.extend((flags | count as u32).to_le_bytes());
+    let entries_at = out.len();
+    out.resize(entries_at + 4 * children.len(), 0);
+    let mut total = 0usize;
+    for (i, child) in children.iter().enumerate() {
+        let start = out.len();
+        let kind = match child {
+            Json::Null => JENTRY_ISNULL,
+            Json::Bool(false) => JENTRY_ISBOOL_FALSE,
+            Json::Bool(true) => JENTRY_ISBOOL_TRUE,
+            Json::Str(s) => {
+                out.extend(s.as_bytes());
+                0
+            }
+            Json::Number(n) => {
+                pad_to(out, 0, 4);
+                let text = crate::json::normalise_number(n);
+                let data = numeric_image(&text)?;
+                out.extend((((data.len() + 4) as u32) << 2).to_le_bytes());
+                out.extend(data);
+                JENTRY_ISNUMERIC
+            }
+            Json::Array(_) | Json::Object(_) => {
+                pad_to(out, 0, 4);
+                jsonb_container(child, out)?;
+                JENTRY_ISCONTAINER
+            }
+        };
+        total += out.len() - start;
+        let meta = if i % JB_OFFSET_STRIDE == 0 {
+            kind | total as u32 | JENTRY_HAS_OFF
+        } else {
+            kind | (out.len() - start) as u32
+        };
+        out[entries_at + 4 * i..entries_at + 4 * i + 4].copy_from_slice(&meta.to_le_bytes());
+    }
+    Some(())
 }
 
 /// The built-in range types and their `pg_type` oids.
@@ -520,7 +648,40 @@ fn numeric_image(text: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::numeric_image;
+    use super::{jsonb_image, numeric_image};
+
+    fn jsonb(text: &str) -> Vec<u8> {
+        jsonb_image(&crate::json::parse(text).unwrap()).unwrap()
+    }
+
+    /// `convertToJsonb`'s layout, read off `jsonb_send`-free images: a raw
+    /// scalar is a one-element array, keys sort by length then bytes, and
+    /// a numeric is padded to int alignment with its 4-byte header kept.
+    #[test]
+    fn jsonb_images_follow_convert_to_jsonb() {
+        // true: [FSCALAR|FARRAY|1][BOOL_TRUE|HAS_OFF|0]
+        assert_eq!(
+            jsonb("true"),
+            [0x5000_0001u32, 0xB000_0000]
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+        // {"bb":null,"a":"x"}: keys a, bb; then values "x", null.
+        let mut want: Vec<u8> = [0x2000_0002u32, 0x8000_0001, 2, 0x0000_0001, 0x4000_0000]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        want.extend(b"abbx");
+        assert_eq!(jsonb(r#"{"bb":null,"a":"x"}"#), want);
+        // ["a",1]: the numeric is padded from offset 1 to 4.
+        let img = jsonb(r#"["a",1]"#);
+        assert_eq!(&img[8..12], &(0x1000_0000u32 | (3 + 4 + 4)).to_le_bytes());
+        assert_eq!(&img[12..16], b"a\0\0\0");
+        // 1 and 1.0 differ in display scale.
+        assert_ne!(jsonb("1"), jsonb("1.0"));
+        assert_eq!(jsonb("1e0"), jsonb("1"));
+    }
 
     /// The bytes `make_result`'s short format lays out for each value on a
     /// little-endian machine (`numeric.c`'s NUMERIC_SHORT header bits).

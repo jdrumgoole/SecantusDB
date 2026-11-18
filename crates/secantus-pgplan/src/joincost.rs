@@ -2822,6 +2822,15 @@ impl JoinRel {
                     Some(back_keys as fn(usize) -> usize)
                 } else if o_class.is_some_and(|c| op.class == Some(asc_keys(c))) {
                     Some(asc_keys as fn(usize) -> usize)
+                } else if o_class.is_some_and(|c| {
+                    c != USELESS_KEYS && c & ASC_KEYS != 0 && op.class == Some(c & !ASC_KEYS)
+                }) {
+                    // Under `Search::merge_asc` a DESC (NULLS FIRST) ORDER
+                    // BY's backward index scan is in the query's order: a
+                    // merge with it outer runs descending, its inner sorted
+                    // so, and leaves the query's order
+                    // (`match_unsorted_outer` follows the outer's pathkeys).
+                    Some((|c| c) as fn(usize) -> usize)
                 } else {
                     None
                 };

@@ -12123,10 +12123,11 @@ fn builtin_function_sig(oid: i64) -> Option<(&'static str, &'static str, &'stati
 }
 
 /// The result columns of the one built-in function named `name` that takes
-/// no input and returns a record of OUT parameters (`pg_show_all_settings`),
-/// in order, as `(name, type)`: what an RTE_FUNCTION's columns are named
-/// and typed from (`get_expr_result_tupdesc`).
-pub(crate) fn builtin_out_columns(name: &str) -> Option<Vec<(String, String)>> {
+/// `nargs` inputs and returns a record of OUT parameters
+/// (`pg_show_all_settings()`, `pg_stat_get_activity(pid)`), in order, as
+/// `(name, type)`: what an RTE_FUNCTION's columns are named and typed from
+/// (`get_expr_result_tupdesc`).
+pub(crate) fn builtin_out_columns(name: &str, nargs: usize) -> Option<Vec<(String, String)>> {
     let [oid] = regobj::builtin_proc_oids(name) else {
         return None;
     };
@@ -12134,7 +12135,14 @@ pub(crate) fn builtin_out_columns(name: &str) -> Option<Vec<(String, String)>> {
     if !matches!(result, "record" | "SETOF record") {
         return None;
     }
-    args.split(", ")
+    let args: Vec<&str> = args.split(", ").collect();
+    // The IN parameters lead (`pg_stat_get_activity(pid integer, OUT ...)`).
+    let inputs = args.iter().take_while(|a| !a.starts_with("OUT ")).count();
+    if inputs != nargs || args[..inputs].iter().any(|a| a.starts_with("INOUT ")) {
+        return None;
+    }
+    args[inputs..]
+        .iter()
         .map(|a| {
             let (name, ty) = a.strip_prefix("OUT ")?.split_once(' ')?;
             Some((name.to_string(), ruleutils::base_type(ty)))

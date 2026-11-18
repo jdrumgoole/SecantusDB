@@ -1612,7 +1612,21 @@ impl PgHandler {
                         && c & secantus_pgplan::joincost::BACK_KEYS != 0
                 })
         };
-        let back = back_input(built.a, a_pick, a_sorted) || back_input(built.b, b_pick, b_sorted);
+        // Under `Search::merge_asc`, a side presorted in the ORDER BY's own
+        // (DESC NULLS FIRST) order -- a backward index scan -- merges
+        // descending: the merge takes its outer's pathkeys.
+        let order_input = |rel: usize, pick: Pick, sorted: bool| {
+            sorted
+                && search.merge_asc
+                && search.order_desc
+                && !search.order_nulls_first
+                && search.path_class(rel, pick).is_some()
+                && search.path_class(rel, pick) == search.order.as_ref().map(|(_, c)| *c)
+        };
+        let back = back_input(built.a, a_pick, a_sorted)
+            || back_input(built.b, b_pick, b_sorted)
+            || order_input(built.a, a_pick, a_sorted)
+            || order_input(built.b, b_pick, b_sorted);
         let merge_in_order = (search.order_desc || search.order_nulls_first)
             && !search.merge_asc
             && !back
@@ -1993,7 +2007,18 @@ impl PgHandler {
                 .collect();
             if search.order_desc || search.order_nulls_first {
                 let class = search.order.as_ref().map(|(_, c)| *c);
-                let in_order = |p: &InPath| p.class.is_some() && p.class == class;
+                // An outer join's clause makes a one-member class for each
+                // side (`key_ec` gives both one id): the other side's index
+                // scan is not in the ORDER BY's order.
+                let order_t = search.order.as_ref().and_then(|(k, _)| {
+                    let t = search.aliases.iter().position(|a| a == alias_of(k))?;
+                    let edge = class?.checked_sub(2)?;
+                    let outer = search.edge_outer.get(edge).copied().flatten().is_some();
+                    (outer && search.member_class(t, k).is_none()).then_some(t)
+                });
+                let in_order = |t: usize, p: &InPath| {
+                    p.class.is_some() && p.class == class && order_t.is_none_or(|o| o == t)
+                };
                 // The ORDER BY's own class (`ORDER_CLASS`: a key an outer
                 // join NULL-extends, or one no clause reads) has a
                 // one-member equivalence class that the query's pathkeys
@@ -2011,7 +2036,19 @@ impl PgHandler {
                 for (t, (list, ct, cs)) in base_lists.iter_mut().enumerate() {
                     let mut i = 0;
                     while i < list.len() {
-                        if !in_order(&list[i].0) {
+                        if !in_order(t, &list[i].0) {
+                            // Under `Search::merge_asc` the merge clause's
+                            // class is its ascending order: a forward scan of
+                            // the side an outer join's clause leaves out of
+                            // the ORDER BY's order is in it, of use for
+                            // merging (a Merge Right Join reads it presorted).
+                            if search.merge_asc
+                                && list[i].0.class.is_some()
+                                && list[i].0.class == class
+                            {
+                                let c = list[i].0.class.unwrap_or(ORDER_CLASS);
+                                list[i].0.class = Some(secantus_pgplan::joincost::asc_keys(c));
+                            }
                             i += 1;
                             continue;
                         }
