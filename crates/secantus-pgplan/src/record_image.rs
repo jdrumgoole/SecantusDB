@@ -15,7 +15,7 @@
 //! Modelled: the integers, oid, bool, `"char"`, the floats, numeric, date,
 //! time, timetz, the timestamps, interval, uuid, macaddr / macaddr8, inet /
 //! cidr, tid, pg_lsn, name, text / varchar / bpchar, bytea, money, bit /
-//! varbit, arrays of a fixed-length element, and the built-in ranges.
+//! varbit, arrays of those fixed-length or text-like elements, and the built-in ranges.
 
 use std::cmp::Ordering;
 
@@ -325,9 +325,14 @@ fn pad_to(out: &mut Vec<u8>, base: usize, align: usize) {
 /// element type's oid, each dimension's length then each lower bound, the
 /// NULL bitmap (a set bit is a present element, LSB first), padding to
 /// MAXALIGN, then the present elements, each at its type's alignment.
-/// Modelled over fixed-length elements; a varlena element is not.
+/// A varlena element keeps the 4-byte header `array_in` and `ARRAY[]` give
+/// it (`(size << 2)`, little-endian), measured on PostgreSQL 15.19:
+/// `row('{b}'::text[]) *< row('{<63 a>}'::text[])` is false.
 fn array_image(v: &Bson, elem: &str) -> Option<Vec<u8>> {
-    let (oid, len, align) = fixed_element(elem)?;
+    let (oid, len, align) = match fixed_element(elem) {
+        Some(f) => f,
+        None => (varlena_element(elem)?, 0, 4),
+    };
     let dims = crate::arrays::dim_lengths(&crate::arrays::strip(v));
     let lbs = crate::arrays::lower_bounds(v);
     let items = if dims.is_empty() {
@@ -365,9 +370,30 @@ fn array_image(v: &Bson, elem: &str) -> Option<Vec<u8>> {
     out.resize(data_offset - 4, 0);
     for it in items.iter().filter(|i| !matches!(i, Bson::Null)) {
         pad_to(&mut out, 4, align);
-        out.extend(fixed_bytes(it, elem, len)?);
+        if len == 0 {
+            let Image::Bytes(data) = image(it, elem).ok()? else {
+                return None;
+            };
+            out.extend((((data.len() + 4) as u32) << 2).to_le_bytes());
+            out.extend(data);
+        } else {
+            out.extend(fixed_bytes(it, elem, len)?);
+        }
     }
     Some(out)
+}
+
+/// The `pg_type` oid of a varlena element type with int alignment whose
+/// image `image` models.
+fn varlena_element(ty: &str) -> Option<u32> {
+    Some(match ty {
+        "bytea" => 17,
+        "text" => 25,
+        "bpchar" => 1042,
+        "varchar" => 1043,
+        "numeric" => 1700,
+        _ => return None,
+    })
 }
 
 /// The built-in range types and their `pg_type` oids.

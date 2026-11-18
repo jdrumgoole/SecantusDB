@@ -303,8 +303,42 @@ def test_record_image_over_arrays_and_ranges(
     assert answer(dsn, query) == [(want,)]
 
 
+RECORD_IMAGE_VARLENA_ARRAYS = [
+    (
+        "'{b}'::text[]",
+        "*<",
+        "'{" + "a" * 63 + "}'::text[]",
+        False,
+    ),
+    ("'{a}'::text[]", "*=", "'{a}'::text[]", True),
+    ("'{a,b}'::text[]", "*<", "'{ab}'::text[]", False),
+    ("'{x,NULL}'::text[]", "*<", "'{x,y}'::text[]", False),
+    ("'{x,NULL,z}'::text[]", "*>", "'{x,NULL,y}'::text[]", True),
+    ("'{a}'::varchar[]", "*<", "'{b}'::varchar[]", True),
+    ("'{ab}'::varchar[]", "*<", "'{b}'::varchar[]", False),
+    ("'{a}'::char(3)[]", "*=", "'{a}'::char(3)[]", True),
+    ("'{a}'::char(3)[]", "*<", "'{a}'::char(2)[]", False),
+    ("'{1.5}'::numeric[]", "*=", "'{1.50}'::numeric[]", False),
+    ("'{1.5}'::numeric[]", "*<", "'{1.50}'::numeric[]", False),
+    ("'{-1}'::numeric[]", "*<", "'{1}'::numeric[]", False),
+    ("""'{"\\\\x01"}'::bytea[]""", "*<", """'{"\\\\x0102"}'::bytea[]""", True),
+    ("'[2:3]={a,b}'::text[]", "*>", "'{a,b}'::text[]", True),
+    ("'{{a,b},{c,d}}'::text[]", "*<", "'{a,b,c,d}'::text[]", False),
+]
+
+
+@pytest.mark.backlog_fixed("RP-976")
+@pytest.mark.parametrize(("left", "op", "right", "want"), RECORD_IMAGE_VARLENA_ARRAYS)
+def test_record_image_over_arrays_of_varlena_elements(
+    left: str, op: str, right: str, want: bool, dsn: str
+) -> None:
+    """Arrays of text, varchar, bpchar, numeric and bytea were 0A000: an
+    element keeps the 4-byte header array_in gives it (PostgreSQL 15.19)."""
+    query = f"select (select row({left})) {op} (select row({right}))"
+    assert answer(dsn, query) == [(want,)]
+
+
 RECORD_IMAGE_STILL_REFUSED = {
-    "select (select row('{a}'::text[])) *= (select row('{a}'::text[]))": [(True,)],
     """select (select row('{"a":1}'::jsonb)) *= (select row('{"a": 1}'::jsonb))""": [(True,)],
     "select (select row('[1,2)'::int4range)) *= (select row('[1,2)'::int4range))": [(True,)],
 }

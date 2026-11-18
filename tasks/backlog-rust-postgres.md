@@ -2132,15 +2132,15 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 - [ ] **The `record_image` operators refuse some field types.** `*=` ..
       `*>=` compare a record's fields by their binary images (RP-650):
       the scalar types in `record_image.rs`, arrays of fixed-length
-      elements and the built-in ranges are modelled (2026-11-18). Every
-      other type is 0A000 `a record_image comparison over a field of type
-      ... is not supported yet`. Remaining, measured on PostgreSQL 15.19:
-      jsonb compares by `memcmp` of its `JsonbContainer` (header word,
-      JEntries, keys sorted by length then bytes, int-aligned numerics);
-      an array of a varlena element (`text[]`, `numeric[]`, ...) needs the
-      element's stored header form settled (4-byte as `array_in` builds
-      it, or short) before its image can be laid out; a user range, a
-      multirange and a composite field are refused too.
+      elements or of text / varchar / bpchar / numeric / bytea (each with
+      the 4-byte header `array_in` gives it, measured) and the built-in
+      ranges are modelled (2026-11-18). Every other type is 0A000 `a
+      record_image comparison over a field of type ... is not supported
+      yet`. Remaining, measured on PostgreSQL 15.19: jsonb compares by
+      `memcmp` of its `JsonbContainer` (header word, JEntries, keys sorted
+      by length then bytes, int-aligned numerics); arrays of any other
+      element (jsonb, inet, interval, ...), a user range, a multirange and
+      a composite field are refused too.
       Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_over_still_refused_field_types
       Backlog-ID: RP-976
 
