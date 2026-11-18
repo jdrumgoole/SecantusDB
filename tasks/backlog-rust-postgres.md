@@ -2295,13 +2295,6 @@ nothing. The gap tests are in `tests/backlog/test_rp_found_rp750.py`.
       must keep doing so.
       Verify: tests/backlog/test_rp_found_rp750.py::test_numeric_precision_zero_is_refused
       Backlog-ID: RP-1042
-- [ ] **A cast from `cstring` to a type with no such cast is accepted.**
-      `select 'x'::cstring::int4` is 42846 `cannot cast type cstring to
-      integer` at 20 on PostgreSQL 15.19 (`cstring` casts only to the
-      string types, by I/O); here it reads the value as `int4` (22P02 for
-      this one, 12 for `'12'`).
-      Verify: tests/backlog/test_rp_found_rp750.py::test_cstring_casts_only_to_strings
-      Backlog-ID: RP-1041
 
 ## Found while working RP-570 (2026-11-08)
 

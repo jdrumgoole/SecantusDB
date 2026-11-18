@@ -149,12 +149,13 @@ def test_numeric_precision_zero_is_refused(dsn: str) -> None:
     )
 
 
-@pytest.mark.backlog("RP-1041")
+@pytest.mark.backlog_fixed("RP-1041")
 def test_cstring_casts_only_to_strings(dsn: str) -> None:
-    """`cstring` has no cast to `integer`; here it reads the value."""
+    """`cstring` had no cast to `integer`, but the server read the value
+    (42846 at 21 on PostgreSQL 15.19 for this statement)."""
     with psycopg.connect(dsn, autocommit=True) as c:
         try:
             answer: object = c.execute("select '12'::cstring::int4").fetchone()
         except psycopg.Error as e:
             answer = (e.sqlstate, e.diag.statement_position)
-    assert answer == ("42846", "20")
+    assert answer == ("42846", "21")

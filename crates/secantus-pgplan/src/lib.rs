@@ -42401,7 +42401,17 @@ pub(crate) fn char_out(b: u8) -> String {
 /// string types' I/O casts, and nothing for the other numbers or boolean --
 /// `65::int2::"char"` and `'A'::"char"::int8` are both refused, NULL or not
 /// (measured). The call `"char"(x)` is a function, not this cast.
+///
+/// `cstring` is a pseudo-type whose only casts are the I/O conversions to
+/// the string types (`'x'::cstring::int4` is 42846 on PostgreSQL 15.19;
+/// `::text` reads the value), so any other target is refused the same way.
 pub(crate) fn char_cast_refused(source: &str, target: &str) -> Option<Error> {
+    if source == "cstring" && target != "cstring" && !is_string_type(target) {
+        return Some(Error::CannotCoerce(format!(
+            "cannot cast type cstring to {}",
+            display_type(target)
+        )));
+    }
     let other = match (source, target) {
         (s, QUOTED_CHAR) if s != QUOTED_CHAR => s,
         (QUOTED_CHAR, t) if t != QUOTED_CHAR => t,
