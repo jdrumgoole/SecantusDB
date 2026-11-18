@@ -1103,18 +1103,20 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       measured 2026-11-18.
       Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_an_sbe_group_spills_as_mongods
       Backlog-ID: RM-612
-- [ ] **A `$median` / `$percentile` spills the values, where mongod spills
-      its t-digest.** A classic `$group` of `{$median: {input: "$n", method:
-      "approximate"}}` over 300 groups of one value each, under a 5000-byte
-      budget, writes a 5561-byte spill file on mongod 8.2.11
-      (`groupSpilledDataStorageSize`, its accumulator's t-digest) and 2948
-      here, which keeps and writes the values (an empty digest: 1986 to
-      1510). The memory counted is mongod's since RM-502 up to the t-digest's
-      first flush (6000 finite values); the centroids a flush makes are not
-      counted (`group::tdigest_buffer`), and need the same port. Found
-      2026-11-13 working RM-325 (its remainder).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_a_median_spills_mongods_state
-      Backlog-ID: RM-613
+- [ ] **An approximate `$median` / `$percentile` ranks the values, where
+      mongod interpolates its t-digest.** mongod 8.2.11 answers from
+      `TDigest` (delta 2000, a flush every 6000 values that merges
+      centroids, then interpolation between them): over 5999 values of
+      `(i * 7919) % 30011 * 0.37` it answers 5552.219999999999 and over
+      20000 5551.609969919785, where this server answers the discrete rank
+      of the values it keeps (5552.22, 5551.48). The port also owes the
+      memory a flush's centroids take (`group::tdigest_buffer` counts only
+      the buffer) and the merged centroids a spill writes
+      (`group_spill::tdigest_state` writes every value as a centroid of
+      weight one, mongod's format while its flush leaves values alone).
+      Found 2026-11-18 working RM-613.
+      Verify: tests/backlog/test_rm_found_2026_11_18_rm613.py::test_an_approximate_median_is_mongods_tdigest
+      Backlog-ID: RM-720
 - [ ] **`serverStatus` has no `spillWiredTiger` section.** mongod 8.2.11
       reports its spill engine's statistics there from startup (`uri`
       `"statistics:"`, `storageSize` 0 while nothing is spilled, `version`,

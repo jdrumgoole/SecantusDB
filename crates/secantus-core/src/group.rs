@@ -2447,7 +2447,7 @@ const TDIGEST_BUFFER: usize = 6000;
 /// (`TDigest::memUsageBytes`, 8.2): the vector's capacity in doubles, which
 /// doubles from one as values arrive (macOS 8.2.11: one value 8 bytes, three
 /// 32) and keeps the capacity it reached when a flush empties it. The
-/// centroids a flush makes are not counted yet (RM-613).
+/// centroids a flush makes are not counted yet (RM-720).
 fn tdigest_buffer(buffered: usize) -> usize {
     if buffered == 0 {
         return 0;

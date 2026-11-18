@@ -136,12 +136,13 @@ def _median_spilled_bytes(client: Any) -> Any:
     )
 
 
-@pytest.mark.backlog("RM-613")
+@pytest.mark.backlog_fixed("RM-613")
 def test_a_median_spills_mongods_state(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's classic `$group` spills each group's `$median` as its
     t-digest: 300 groups of one value each, a 5561-byte spill file. This
-    server spills the values it keeps, 2948. (`groupSpilledBytes`, 84000, is
-    the memory estimate at each spill, mongod's since RM-502.)"""
+    server spilled the values it kept, 2948, until it wrote the digest too.
+    (`groupSpilledBytes`, 84000, is the memory estimate at each spill,
+    mongod's since RM-502.)"""
     assert _median_spilled_bytes(rust_mongo) == _median_spilled_bytes(mongod)
 
 

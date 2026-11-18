@@ -354,8 +354,8 @@ fn merge_state(acc: Acc) -> R<Option<Bson>> {
             let (count, mean, m2) = welford(&values);
             Bson::Document(doc! { "m2": m2, "mean": mean, "count": count })
         }
-        // mongod writes its t-digest here; this server keeps the values.
-        Acc::Percentile { values, .. } => doubles(values),
+        // mongod's t-digest, serialized (RM-613).
+        Acc::Percentile { values, .. } => tdigest_state(values),
         Acc::NElem { kind, n, vals, .. } => Bson::Array(nelem_result(kind, n.unwrap_or(0), vals)?),
         // `{generatedSortKey, output}` for each item kept, in sort order: the
         // key is the one sort field's value, or an array of them.
@@ -510,9 +510,7 @@ impl Merging {
                     Some(_) => return Err(bad()),
                 },
                 Acc::Percentile { values, .. } => {
-                    for v in array(state)? {
-                        values.push(v.as_f64().ok_or_else(bad)?);
-                    }
+                    tdigest_values(&array(state)?, values).ok_or_else(bad)?
                 }
                 Acc::NElem { vals, .. } => vals.extend(array(state)?),
                 Acc::TopN { dirs, items, .. } => {
@@ -1133,6 +1131,51 @@ fn optional(t: &str, v: Option<Bson>) -> Document {
     d
 }
 
+/// A `$median` / `$percentile`'s state as mongod 8.2.11's
+/// `TDigest::serialize` writes it into a classic `$group`'s spill: an array of
+/// doubles, `[negInfCount, posInfCount, min, max]` and then each centroid's
+/// `weight, mean` in mean order. The infinities are counted, not kept, and
+/// take no part in `min` / `max`, which start at
+/// `numeric_limits<double>::max()` and `::min()` (the smallest positive
+/// normal, not the lowest double). Measured 2026-11-18 from the spill file
+/// itself.
+///
+/// This server keeps the values, so every finite value is a centroid of
+/// weight one: mongod's digest too while its buffer's flush leaves each
+/// value alone. Where its flush merges centroids, this one does not
+/// (RM-720).
+fn tdigest_state(mut values: Vec<f64>) -> Bson {
+    let neg = values.iter().filter(|v| **v == f64::NEG_INFINITY).count();
+    let pos = values.iter().filter(|v| **v == f64::INFINITY).count();
+    values.retain(|v| v.is_finite());
+    values.sort_by(f64::total_cmp);
+    // Folded from those starting values, as mongod's are: a digest of 0, or
+    // of negatives alone, keeps `max` at the smallest positive double.
+    let min = values.iter().copied().fold(f64::MAX, f64::min);
+    let max = values.iter().copied().fold(f64::MIN_POSITIVE, f64::max);
+    let mut out = vec![neg as f64, pos as f64, min, max];
+    for v in values {
+        out.extend([1.0, v]);
+    }
+    doubles(out)
+}
+
+/// Read a [`tdigest_state`] back into the values it holds, or None for a
+/// state this server did not write.
+fn tdigest_values(state: &[Bson], values: &mut Vec<f64>) -> Option<()> {
+    let f: Vec<f64> = state.iter().map(Bson::as_f64).collect::<Option<_>>()?;
+    if f.len() < 4 || !f.len().is_multiple_of(2) {
+        return None;
+    }
+    let count = |c: f64| (c >= 0.0 && c.fract() == 0.0).then_some(c as usize);
+    values.extend(std::iter::repeat_n(f64::NEG_INFINITY, count(f[0])?));
+    values.extend(std::iter::repeat_n(f64::INFINITY, count(f[1])?));
+    for c in f[4..].chunks(2) {
+        values.extend(std::iter::repeat_n(c[1], count(c[0])?));
+    }
+    Some(())
+}
+
 fn doubles(values: Vec<f64>) -> Bson {
     Bson::Array(values.into_iter().map(Bson::Double).collect())
 }
@@ -1399,6 +1442,35 @@ mod tests {
     use bson::{bson, doc, Bson, Document};
 
     use crate::memlimit::{self, Budgets};
+
+    /// The states mongod 8.2.11 spilled for these groups (2026-11-18).
+    #[test]
+    fn a_percentile_spills_mongods_tdigest() {
+        let inf = f64::INFINITY;
+        let cases: [(Vec<f64>, Vec<f64>); 5] = [
+            (
+                vec![inf, -inf, inf, 3.0, 1.0],
+                vec![1.0, 2.0, 1.0, 3.0, 1.0, 1.0, 1.0, 3.0],
+            ),
+            (vec![], vec![0.0, 0.0, f64::MAX, f64::MIN_POSITIVE]),
+            (vec![-inf], vec![1.0, 0.0, f64::MAX, f64::MIN_POSITIVE]),
+            (
+                vec![5.0, 5.0, 2.0],
+                vec![0.0, 0.0, 2.0, 5.0, 1.0, 2.0, 1.0, 5.0, 1.0, 5.0],
+            ),
+            (vec![0.0], vec![0.0, 0.0, 0.0, f64::MIN_POSITIVE, 1.0, 0.0]),
+        ];
+        for (values, want) in cases {
+            let state = super::tdigest_state(values.clone());
+            assert_eq!(state, super::doubles(want));
+            let mut back = Vec::new();
+            super::tdigest_values(state.as_array().unwrap(), &mut back).unwrap();
+            let (mut a, mut b) = (back, values);
+            a.sort_by(f64::total_cmp);
+            b.sort_by(f64::total_cmp);
+            assert_eq!(a, b);
+        }
+    }
 
     fn docs(n: i32) -> Vec<Document> {
         (0..n)
