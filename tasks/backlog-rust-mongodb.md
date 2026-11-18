@@ -1117,17 +1117,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Found 2026-11-18 working RM-613.
       Verify: tests/backlog/test_rm_found_2026_11_18_rm613.py::test_an_approximate_median_is_mongods_tdigest
       Backlog-ID: RM-720
-- [ ] **A window with no lower end counts its function before it holds a
-      value.** mongod 8.2.11 reports `maxFunctionMemoryUsageBytes` 0 for a
-      `$sum`, `$push` or `$avg` over `["unbounded", -2]` in a partition of
-      two documents (one: `["unbounded", -1]` too), whose window never
-      holds a document; this server counts the accumulator's size (184,
-      136, 152), and for `$push` the first document's value, which its
-      `FunctionMemory::Growing` reads although the window is empty.
-      `$integral` and the covariances already count 0 there (RM-509).
-      Found 2026-11-13 (RM-509).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm509.py::test_an_empty_window_counts_no_function
-      Backlog-ID: RM-619
 - [ ] **`{$meta: "sortKey"}` in a `$facet` is refused, not `[]`.** mongod
       8.2.11 gives `[]` in a `$facet` pipeline, behind the facet's own
       `$sort` too (its ranks tie there, which this server matches); this
