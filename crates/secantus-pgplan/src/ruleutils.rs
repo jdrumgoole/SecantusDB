@@ -7207,6 +7207,9 @@ pub struct ChainRel {
     /// of relations still needs it: the target list's columns first, then
     /// the ON clauses' in the order `deconstruct_jointree` distributes them.
     pub reltarget: Vec<(String, ChainNeed)>,
+    /// Each WHERE conjunct over this relation alone, as the plain plan
+    /// prints its scan's `Filter` and as VERBOSE prints it, prefixed.
+    pub quals: Vec<(String, String)>,
 }
 
 /// Why a column of a [`ChainRel`] is needed above a join.
@@ -7221,8 +7224,8 @@ pub struct ChainNeed {
 }
 
 /// `EXPLAIN VERBOSE` of a SELECT of columns over three or more relations
-/// inner-joined left-deep on ONs of column equalities, with no WHERE
-/// (RP-966).
+/// inner-joined left-deep on ONs of column equalities, with a WHERE whose
+/// every conjunct reads one relation (RP-966).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct VerboseChain {
     pub rels: Vec<ChainRel>,
@@ -7242,7 +7245,6 @@ pub fn explain_verbose_chain(
         || s.limit_count.is_some()
         || s.limit_offset.is_some()
         || !s.window_clause.is_empty()
-        || s.where_clause.is_some()
     {
         return None;
     }
@@ -7388,6 +7390,48 @@ pub fn explain_verbose_chain(
             }
         }
     }
+    // Each WHERE conjunct must read exactly one relation: its scan's
+    // `Filter`. Its columns are not in the `reltarget`.
+    let mut quals: Vec<Vec<(String, String)>> = vec![Vec::new(); n];
+    if let Some(w) = s.where_clause.as_deref() {
+        let none_lookup = |_: &str| None;
+        let none_views = |_: &str| None;
+        let cat = Catalog {
+            lookup: &none_lookup,
+            view_sql: &none_views,
+            home_schema: None,
+        };
+        let print = |part: &Node, i: usize, unqualified: bool| -> Option<String> {
+            let (refname, def, _) = &sides[i];
+            let mut p = Printer::new(&cat, 0);
+            p.unqualified = unqualified;
+            p.fold_consts = true;
+            p.scopes.push(vec![Rte {
+                refname: refname.clone(),
+                name: refname.clone(),
+                columns: def
+                    .columns
+                    .iter()
+                    .map(|c| (c.name.clone(), base_type(&c.pg_type)))
+                    .collect(),
+                qualified_only: false,
+                ..Default::default()
+            }]);
+            p.expr(part)?;
+            Some(p.buf)
+        };
+        let mut parts = Vec::new();
+        and_clauses(w, &mut parts);
+        for part in &parts {
+            let part: &Node = part;
+            let mut readers = (0..n).filter(|&i| print(part, i, true).is_some());
+            let i = readers.next()?;
+            if readers.next().is_some() {
+                return None;
+            }
+            quals[i].push((print(part, i, true)?, print(part, i, false)?));
+        }
+    }
     let pre = |i: usize, c: &str| format!("{}.{}", q(&sides[i].0), q(c));
     let rels = sides
         .iter()
@@ -7420,6 +7464,7 @@ pub fn explain_verbose_chain(
                         (pre(i, c), need)
                     })
                     .collect(),
+                quals: quals[i].clone(),
             }
         })
         .collect();

@@ -3970,11 +3970,26 @@ pub(crate) fn attach_verbose_chain(
         apply: bool,
     ) -> Option<(Vec<usize>, Tlist)> {
         if let Some(plain) = n.name.strip_prefix("Seq Scan on ") {
-            if !n.details.is_empty() || !n.children.is_empty() {
+            if !n.children.is_empty() {
                 return None;
             }
             let i = c.rels.iter().position(|r| r.plain == plain)?;
             let r = &c.rels[i];
+            // Its WHERE conjuncts, and nothing else, are its `Filter`.
+            let filters: Vec<&str> = n
+                .details
+                .iter()
+                .map(|(k, v)| (k == "Filter").then_some(v.as_str()))
+                .collect::<Option<_>>()?;
+            let want: Vec<&str> = r.quals.iter().map(|(b, _)| b.as_str()).collect();
+            let expected = match want.as_slice() {
+                [] => None,
+                [one] => Some(one.to_string()),
+                many => Some(format!("({})", many.join(" AND "))),
+            };
+            if filters.first().map(|f| f.to_string()) != expected || filters.len() > 1 {
+                return None;
+            }
             if !apply {
                 return Some((vec![i], r.reltarget.clone()));
             }
@@ -3985,6 +4000,7 @@ pub(crate) fn attach_verbose_chain(
                 r.columns.clone()
             };
             n.details.insert(0, ("Output".into(), out.join(", ")));
+            prefix_quals(n, &r.quals);
             return Some((vec![i], r.reltarget.clone()));
         }
         if n.name != "Hash Join"

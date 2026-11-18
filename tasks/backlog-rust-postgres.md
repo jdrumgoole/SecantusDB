@@ -1774,14 +1774,28 @@ a regression test.
       hash join or Materialize loop whose ON compares expressions of one
       relation each, `e.a = k.a + 1`, prints every node's `Output`:
       `VerboseJoin::expr_on`; such an ON into a parameterised index scan
-      or a Memoize still prints the plain plan.) Still the plain plan: a
-      chain of three or more relations with a WHERE (`explain (verbose,
-      costs off) select e.b, e2.b from e join k on e.a = k.a join e e2 on
-      e2.a = k.a where e2.b <> 'x'` on PostgreSQL 15.19 prints each node's
-      `Output`, the filtered scan `Output: e2.a, e2.b` above its `Filter`)
-      or a nested loop or merge join in it, and an outer join in one.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a three-way join with a where]
+      or a Memoize still prints the plain plan.) (Since 2026-11-18 such a
+      chain with a WHERE whose conjuncts each read one relation prints them
+      as its scans' `Filter`, prefixed, their columns kept out of a hashed
+      scan's `Output` unless needed above: `ChainRel::quals`.) Still the
+      plain plan: a nested loop or merge join in a chain, a WHERE conjunct
+      reading two of its relations, and an outer join in one (`explain
+      (verbose, costs off) select e.b, e2.b from e join k on e.a = k.a left
+      join e e2 on e2.a = k.a` on PostgreSQL 15.19 prints each node's
+      `Output` over the same `Hash Left Join` shape).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a three-way join ending in a left join]
       Backlog-ID: RP-966
+
+- [ ] **A WHERE-filtered relation of a three-way join is not joined
+      first.** `explain (costs off) select e.b, e2.b from e join k on e.a
+      = k.a join e e2 on e2.a = k.a where e2.b <> 'x'` (`e`, `k`
+      analysed, 1000 rows) joins `(e join k) join e2`; PostgreSQL 15.19
+      joins `(e2 join e) join k`, the filtered `e e2` the outermost scan,
+      `Hash Cond: (e2.a = e.a)` below `Hash Cond: (e.a = k.a)`. Size the
+      join-order search's costing of the filtered relation from a probe
+      of each candidate's cost. Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a filtered relation of a three-way join is joined first]
+      Backlog-ID: RP-1059
 
 - [ ] **A hash join on an expression and a column pair hashes the
       expression's side.** `explain select e.b from e join k on e.a = k.a

@@ -2006,31 +2006,107 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on PostgreSQL 15.19 (2026-11-18): a chain of three
-    # relations with a WHERE prints every node's `Output`.
+    # relations with a WHERE prints every node's `Output`, a filtered
+    # scan its `Filter` prefixed.
     "explain verbose of a three-way join with a where": (
-        "RP-966",
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, k.b from e join k on e.a = k.a "
+        "join e e2 on e2.a = e.a where e.b <> 'x'",
+        [
+            "Hash Join",
+            "  Output: e.b, k.b",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Hash Join",
+            "        Output: e.b, e.a, k.b, k.a",
+            "        Inner Unique: true",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.a, e.b",
+            "              Filter: (e.b <> 'x'::text)",
+            "        ->  Hash",
+            "              Output: k.b, k.a",
+            "              ->  Seq Scan on public.k",
+            "                    Output: k.b, k.a",
+            "  ->  Hash",
+            "        Output: e2.a",
+            "        ->  Seq Scan on public.e e2",
+            "              Output: e2.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (2026-11-18): a hashed scan's filter
+    # reads a column its `Output` leaves out.
+    "explain verbose of a three-way join filtering the hashed relation": (
+        "RP-966:fixed",
         _ANALYSED,
         "explain (verbose, costs off) select e.b, e2.b from e join k on e.a = k.a "
-        "join e e2 on e2.a = k.a where e2.b <> 'x'",
+        "join e e2 on e2.a = e.a where k.b <> 'x' and k.a > 5",
         [
             "Hash Join",
             "  Output: e.b, e2.b",
-            "  Inner Unique: true",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Hash Join",
+            "        Output: e.b, e.a, k.a",
+            "        Inner Unique: true",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.a, e.b",
+            "        ->  Hash",
+            "              Output: k.a",
+            "              ->  Seq Scan on public.k",
+            "                    Output: k.a",
+            "                    Filter: ((k.b <> 'x'::text) AND (k.a > 5))",
+            "  ->  Hash",
+            "        Output: e2.b, e2.a",
+            "        ->  Seq Scan on public.e e2",
+            "              Output: e2.b, e2.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (2026-11-18): an outer join in a chain
+    # prints every node's `Output` too.
+    "explain verbose of a three-way join ending in a left join": (
+        "RP-966",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, e2.b from e join k on e.a = k.a "
+        "left join e e2 on e2.a = k.a",
+        [
+            "Hash Left Join",
+            "  Output: e.b, e2.b",
+            "  Hash Cond: (k.a = e2.a)",
+            "  ->  Hash Join",
+            "        Output: e.b, k.a",
+            "        Inner Unique: true",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.a, e.b",
+            "        ->  Hash",
+            "              Output: k.a",
+            "              ->  Seq Scan on public.k",
+            "                    Output: k.a",
+            "  ->  Hash",
+            "        Output: e2.b, e2.a",
+            "        ->  Seq Scan on public.e e2",
+            "              Output: e2.b, e2.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966): a
+    # relation filtered by the WHERE is the outermost of the chain.
+    "a filtered relation of a three-way join is joined first": (
+        "RP-1059",
+        _ANALYSED,
+        "explain (costs off) select e.b, e2.b from e join k on e.a = k.a "
+        "join e e2 on e2.a = k.a where e2.b <> 'x'",
+        [
+            "Hash Join",
             "  Hash Cond: (e.a = k.a)",
             "  ->  Hash Join",
-            "        Output: e.b, e.a, e2.b, e2.a",
             "        Hash Cond: (e2.a = e.a)",
-            "        ->  Seq Scan on public.e e2",
-            "              Output: e2.a, e2.b",
-            "              Filter: (e2.b <> 'x'::text)",
+            "        ->  Seq Scan on e e2",
+            "              Filter: (b <> 'x'::text)",
             "        ->  Hash",
-            "              Output: e.b, e.a",
-            "              ->  Seq Scan on public.e",
-            "                    Output: e.b, e.a",
+            "              ->  Seq Scan on e",
             "  ->  Hash",
-            "        Output: k.a",
-            "        ->  Seq Scan on public.k",
-            "              Output: k.a",
+            "        ->  Seq Scan on k",
         ],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): with a
