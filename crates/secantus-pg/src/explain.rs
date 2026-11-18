@@ -1547,6 +1547,45 @@ fn costs_text(n: &PlanNode) -> String {
 
 /// The `QUERY PLAN` text rows, PostgreSQL's layout: a child at depth d is
 /// `2 + 6(d-1)` spaces and `->  `, and a node's details sit at `2 + 6d`.
+/// Name each scanned relation as `ExplainScanTarget` does (RP-1029): its bare name, the schema only under VERBOSE (the session's
+/// own temporary schema as `pg_temp`, `get_namespace_name_or_temp`), and
+/// the alias only when it differs from that bare name. The plan carries
+/// a relation's storage key (`q1.t`, `pg_temp_5.t`) until here.
+pub(crate) fn name_relations(n: &mut PlanNode, verbose: bool) {
+    if let Some(i) = n.props.iter().position(|(k, _)| k == "Relation Name") {
+        let key = n.props[i].1.clone();
+        let (schema, bare) = secantus_pgplan::schemas::split_key(&key);
+        let schema = if schema.starts_with("pg_temp_") {
+            "pg_temp".to_string()
+        } else {
+            schema
+        };
+        if key != bare {
+            if let Some(at) = n.name.find(&format!(" on {key}")) {
+                let rest = &n.name[at + 4 + key.len()..];
+                if rest.is_empty() || rest.starts_with(' ') {
+                    let alias = rest.trim_start();
+                    let shown = if verbose {
+                        format!("{schema}.{bare}")
+                    } else {
+                        bare.clone()
+                    };
+                    let mut name = format!("{} on {shown}", &n.name[..at]);
+                    if !alias.is_empty() && alias != bare {
+                        name.push(' ');
+                        name.push_str(alias);
+                    }
+                    n.name = name;
+                }
+            }
+            n.props[i].1 = bare;
+        }
+    }
+    for c in &mut n.children {
+        name_relations(c, verbose);
+    }
+}
+
 pub(crate) fn render_text(
     root: &PlanNode,
     options: &ExplainOptions,
@@ -3366,6 +3405,27 @@ mod join_type_tests {
         assert_eq!(join_type_of("Hash"), None);
         assert_eq!(join_type_of("HashAggregate"), None);
         assert_eq!(join_type_of("Seq Scan"), None);
+    }
+
+    #[test]
+    fn a_scan_names_its_relation_bare_and_its_schema_only_under_verbose() {
+        // PostgreSQL 15.19 (RP-1029): `Seq Scan on t x` for a temporary
+        // `t`, `Seq Scan on pg_temp.t x` under VERBOSE.
+        let scan = |name: &str| {
+            let mut n = PlanNode::new(name.to_string());
+            n.props.push(("Relation Name".into(), "pg_temp_5.t".into()));
+            n
+        };
+        let mut plain = scan("Seq Scan on pg_temp_5.t x");
+        name_relations(&mut plain, false);
+        assert_eq!(plain.name, "Seq Scan on t x");
+        assert_eq!(plain.props, vec![("Relation Name".into(), "t".into())]);
+        let mut bare = scan("Seq Scan on pg_temp_5.t t");
+        name_relations(&mut bare, false);
+        assert_eq!(bare.name, "Seq Scan on t");
+        let mut verbose = scan("Seq Scan on pg_temp_5.t x");
+        name_relations(&mut verbose, true);
+        assert_eq!(verbose.name, "Seq Scan on pg_temp.t x");
     }
 
     #[test]

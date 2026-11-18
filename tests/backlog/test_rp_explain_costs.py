@@ -7445,6 +7445,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1029",
         "RP-981",
         "RP-967",
         "RP-1021",

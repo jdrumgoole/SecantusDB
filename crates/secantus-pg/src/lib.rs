@@ -47910,6 +47910,7 @@ impl PgHandler {
                     tree = explain::PlanNode::over(name.clone(), tree);
                     tree.estimate = estimate;
                 }
+                explain::name_relations(&mut tree, options.verbose);
                 let (ty, lines) = if options.format == "json" {
                     (
                         Type::JSON,
