@@ -38511,7 +38511,7 @@ fn resolve_regclass(text: &str) -> Result<i64> {
     };
     // `RangeVarGetRelid` looks the schema up before the relation in it
     // (`LookupExplicitNamespace`): a missing one is 3F000 (RP-675).
-    if let Some(s) = schema.filter(|s| !schemas::schema_exists(s)) {
+    if let Some(s) = schema.filter(|s| !schemas::explicit_schema_exists(s)) {
         return Err(Error::Sqlstate(
             "3F000",
             format!("schema \"{s}\" does not exist"),
@@ -46682,9 +46682,8 @@ pub(crate) fn type_schema_exists(schema: &str) -> bool {
     matches!(
         schema,
         "pg_catalog" | "public" | "information_schema" | "pg_toast"
-    ) || schema == "pg_temp"
-        || schema.starts_with("pg_temp_")
-        || schemas::schema_exists(schema)
+    ) || schema.starts_with("pg_temp_")
+        || schemas::explicit_schema_exists(schema)
 }
 
 /// `1` for `infinity`, `-1` for `-infinity`, as an infinite timestamp is

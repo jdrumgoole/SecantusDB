@@ -207,6 +207,16 @@ pub fn schema_exists(schema: &str) -> bool {
     is_builtin(schema) || USER_SCHEMAS.with(|s| s.borrow().iter().any(|n| n == schema))
 }
 
+/// Does a schema a name is explicitly qualified with exist
+/// (`LookupExplicitNamespace`)? `pg_temp` is the session's temp schema,
+/// which is no schema until the session makes it (RP-1037).
+pub fn explicit_schema_exists(schema: &str) -> bool {
+    if schema == "pg_temp" {
+        return temp_schema_in_use().is_some();
+    }
+    schema_exists(schema)
+}
+
 fn is_user_schema(schema: &str) -> bool {
     !is_builtin(schema) && USER_SCHEMAS.with(|s| s.borrow().iter().any(|n| n == schema))
 }

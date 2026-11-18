@@ -2155,11 +2155,15 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       of text / varchar / bpchar / numeric / bytea / inet / cidr / jsonb
       (each with the 4-byte header `array_in` gives it, measured), the
       built-in ranges and the built-in multiranges (`make_multirange`'s
-      layout, 2026-11-18) are modelled. Every other type is 0A000 `a
-      record_image comparison over a field of type ... is not supported
-      yet`. Remaining, measured on PostgreSQL 15.19: arrays of any other
-      varlena element, a user range or multirange, and a composite field
-      (a `HeapTupleHeader` varlena).
+      layout, 2026-11-18) and named composites (the `HeapTupleHeader`
+      `heap_form_tuple` builds, 2026-11-18) are modelled. Every other type
+      is 0A000 `a record_image comparison over a field of type ... is not
+      supported yet`. Remaining, measured on PostgreSQL 15.19: arrays of
+      any other varlena element (`xml[]`), a user range or multirange, an
+      anonymous `record` field (its typmod is the session's blessed one),
+      and a composite whose type has a dropped attribute (its `natts`
+      and NULL bitmap count the dropped column; the planner's field list
+      does not, so such a value is imaged as though never altered).
       Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_over_still_refused_field_types
       Backlog-ID: RP-976
 
@@ -2521,17 +2525,6 @@ tests are scenarios in `tests/backlog/test_rp_batch26.py`.
 
 Measured on a private PostgreSQL 15.19 cluster.
 
-- [ ] **A CREATE FUNCTION's compile error without a position has no
-      compile context.** An error PL/pgSQL's grammar raises without a
-      scanner position is framed `compilation of PL/pgSQL function "<name>"
-      near line N` (`plpgsql_compile_error_callback`): on PostgreSQL 15.19
-      `create function u958() returns void language plpgsql as $$ begin
-      raise unknown_thing; end $$` is 42704 `unrecognized exception
-      condition "unknown_thing"` with CONTEXT `compilation of PL/pgSQL
-      function "u958" near line 1`. Here the CONTEXT is missing. A DO block
-      has it since RP-958 (`do_compile_error`).
-      Verify: tests/backlog/test_rp_found_rp619.py::test_create_function_compile_error_has_context
-      Backlog-ID: RP-1040
 
 ## Found while working RP-573 (2026-11-08)
 
@@ -2579,14 +2572,18 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 - [ ] **`pg_get_viewdef` of most system views is NULL.** PostgreSQL
       15.19 deparses every `pg_catalog` and `information_schema` view's
       rule. Here `system_view_defs` prints `system_views.sql`'s queries
-      through `ruleutils`, which reproduces 68 of the 75 `pg_catalog`
+      through `ruleutils`, which reproduces 69 of the 75 `pg_catalog`
       views exactly (`pg_tables`, `pg_roles`, `pg_stats`, `pg_settings`,
-      `pg_stat_activity`, every `pg_stat_progress_*` view, ...; none
-      printed wrong, measured 2026-11-18 in both print modes) and leaves
-      the rest NULL rather than print them as written. Remaining: the 7
-      other `pg_catalog` views (`pg_policies`, `pg_publication_tables`,
-      `pg_seclabels`, `pg_stat_database`, `pg_stat_replication_slots`,
-      `pg_stats_ext`, `pg_stats_ext_exprs`), which the printer refuses;
+      `pg_stat_activity`, `pg_stat_database`, every `pg_stat_progress_*`
+      view, ...; none printed wrong, measured 2026-11-18 in both print
+      modes) and leaves the rest NULL rather than print them as written.
+      Remaining: the 6 other `pg_catalog` views (`pg_policies`,
+      `pg_publication_tables`, `pg_seclabels`,
+      `pg_stat_replication_slots`, `pg_stats_ext`, `pg_stats_ext_exprs`),
+      which the printer refuses (`pg_stat_replication_slots`' query cannot
+      even be a user view here: `LATERAL
+      pg_stat_get_replication_slot(slot_name) s` gives `s` no columns,
+      42703 `column s.slot_name does not exist`);
       and every `information_schema` view, left out because the printer
       casts to the bare domain where ruleutils qualifies it and casts a
       literal to the base type first
@@ -2605,6 +2602,29 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
       text (`(pg_class.relname)::text = ANY (ARRAY['g'::text, 'h'::text])`).
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_a_name_in_list_with_a_text_element
       Backlog-ID: RP-1045
+
+## Found while working RP-798 (2026-11-18)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster; the
+views read only `pg_class`.
+
+- [ ] **`pg_get_viewdef` names a CASE column `case` where ruleutils takes
+      its ELSE column's name.** `create view v as select case when c.oid >
+      5 then 0 else c.relnatts end from pg_class c` prints `END AS
+      relnatts` on PostgreSQL 15.19 (`FigureColnameInternal` reads a
+      `CaseExpr`'s `defresult` at strength 1); here `END AS "case"`.
+      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_names_a_case_column_by_its_else_column
+      Backlog-ID: RP-1046
+- [ ] **`pg_get_viewdef` prints an IN list holding a column as `= ANY
+      (ARRAY[...])`.** `create view v as select c.relnatts in (1,
+      c.relam::int) from pg_class c` prints `((c.relnatts = 1) OR
+      (c.relnatts = (c.relam)::integer))` on PostgreSQL 15.19:
+      `transformAExprIn` builds a ScalarArrayOpExpr only of the list's
+      Var-free elements, and only when there are two or more, and ORs an
+      `=` for each of the rest. Here `(c.relnatts = ANY (ARRAY[1,
+      (c.relam)::integer]))`.
+      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_an_in_list_holding_a_column
+      Backlog-ID: RP-1047
 
 ## Found while working RP-816 (2026-11-11)
 
@@ -2856,13 +2876,3 @@ statement is VALUES-only and runs there as written. The gap test is in
 
 ## Found while working RP-971 (2026-11-17)
 
-- [ ] **A `pg_temp` name before the session has a temp namespace answers
-      "does not exist" for the object, not the schema.** In a fresh
-      session PostgreSQL 15.19 answers `select 'pg_temp.zz'::regclass` and
-      `select 'pg_temp.zz'::regtype` with 3F000 `schema "pg_temp" does not
-      exist` (`LookupExplicitNamespace` finds no `myTempNamespace`);
-      `secantusd-pg` answers 42P01 `relation "pg_temp.zz" does not exist`
-      and 42704 `type "pg_temp.zz" does not exist`. A function call
-      already answers 3F000 (`test_a_pg_temp_function_left_by_a_killed_server_is_gone_at_restart`).
-      Verify: tests/backlog/test_rp_qualified_calls.py::test_pg_temp_name_without_a_temp_namespace_is_an_undefined_schema
-      Backlog-ID: RP-1037

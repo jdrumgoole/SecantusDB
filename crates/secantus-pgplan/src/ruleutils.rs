@@ -3284,16 +3284,8 @@ impl Printer<'_> {
                     rt
                 } else if rt == "unknown" {
                     lt
-                } else if let Some((m, _)) = numeric_meet(&lt, &rt) {
-                    if m.is_empty() {
-                        lt
-                    } else {
-                        m.to_string()
-                    }
-                } else if is_stringish(&lt) && is_stringish(&rt) {
-                    "text".into()
                 } else {
-                    return None;
+                    meet_types(&lt, &rt)?
                 };
                 out.push((ln, t));
             }
@@ -4154,6 +4146,11 @@ fn meet_types(o: &str, t: &str) -> Option<String> {
             _ => 3,
         };
         return Some(if w(o) >= w(t) { o } else { t }.to_string());
+    }
+    // An integer coerces implicitly to oid and oid only by assignment to an
+    // integer, so `select_common_type` takes oid either way round.
+    if (o == "oid" && is_int(t)) || (is_int(o) && t == "oid") {
+        return Some("oid".to_string());
     }
     (is_stringish(o) && is_stringish(t)).then(|| "text".to_string())
 }

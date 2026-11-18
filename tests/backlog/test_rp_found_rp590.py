@@ -26,11 +26,13 @@ from tests.backlog.test_rp_batch26 import _dsn
 
 _SETUP = [
     "drop table if exists tca",
-    "drop type if exists ca, cb, cc, cd cascade",
+    "drop type if exists cf, ca, cb, cc, cd, ce cascade",
     "create type ca as (x int, y text)",
     "create type cb as (x int, y int)",
     "create type cc as (x int, y text, z int)",
     "create type cd as (p int, q text)",
+    "create type ce as (a int8, b text, c int2)",
+    "create type cf as (p ca, q numeric)",
     "create table tca (k int, v ca)",
     "insert into tca values (1, row(1, 'a')), (2, row(2, 'b')), (3, null)",
 ]
@@ -463,8 +465,37 @@ def test_record_image_over_arrays_of_jsonb_and_inet(
 
 
 RECORD_IMAGE_STILL_REFUSED = {
-    "select (select row(row(1, 'a')::ca)) *= (select row(row(1, 'a')::ca))": [(True,)],
+    "select (select row(array['<a/>'::xml])) *= (select row(array['<a/>'::xml]))": [(True,)],
 }
+
+# Measured on PostgreSQL 15.19: a composite field's image is its
+# `HeapTupleHeader` (typmod, type oid, ctid, infomask2, infomask, hoff,
+# bitmap) then its fields as `heap_fill_tuple` lays them.
+RECORD_IMAGE_COMPOSITES = [
+    ("row(1, 'a')::ca", "*=", "row(1, 'a')::ca", True),
+    ("row(1, 'b')::ca", "*<", "row(2, 'a')::ca", True),
+    ("row(-1, 'a')::ca", "*<", "row(1, 'a')::ca", False),
+    ("row(1, null)::ca", "*<", "row(1, 'a')::ca", True),
+    ("row(null, 'z')::ca", "*>", "row(1, 'a')::ca", True),
+    ("row(256, 'a')::ca", "*<", "row(1, 'b')::ca", True),
+    ("row(1, 'ab')::ca", "*<", "row(1, 'b')::ca", False),
+    ("row(1, repeat('a', 200))::ca", "*<", "row(1, 'b')::ca", False),
+    ("row(5, 'a', 3)::ce", "*<", "row(5, 'a', 2)::ce", False),
+    ("row(row(1, 'a')::ca, 1.0)::cf", "*=", "row(row(1, 'a')::ca, 1.00)::cf", False),
+    ("row(row(1, 'a')::ca, 1.0)::cf", "*<", "row(row(1, 'a')::ca, 1.00)::cf", False),
+    ("row(null, null)::ca", "*<", "row(1, null)::ca", True),
+]
+
+
+@pytest.mark.backlog_fixed("RP-976")
+@pytest.mark.parametrize(("left", "op", "right", "want"), RECORD_IMAGE_COMPOSITES)
+def test_record_image_over_composite_fields(
+    left: str, op: str, right: str, want: bool, dsn: str
+) -> None:
+    """A composite field was 0A000: its image is the `HeapTupleHeader`
+    `heap_form_tuple` builds, then the fields `heap_fill_tuple` lays out."""
+    query = f"select (select row({left})) {op} (select row({right}))"
+    assert answer(dsn, query) == [(want,)]
 
 
 # Measured on PostgreSQL 15.19.

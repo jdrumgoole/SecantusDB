@@ -16,7 +16,7 @@
 //! time, timetz, the timestamps, interval, uuid, macaddr / macaddr8, inet /
 //! cidr, tid, pg_lsn, name, text / varchar / bpchar, bytea, money, bit /
 //! varbit, jsonb, arrays of any of those but bit / varbit, and
-//! the built-in ranges and multiranges.
+//! the built-in ranges and multiranges, and named composites.
 
 use std::cmp::Ordering;
 
@@ -280,6 +280,9 @@ fn image(v: &Bson, ty: &str) -> Result<Image> {
         t if MULTIRANGE_TYPES.iter().any(|(n, _)| *n == t) => {
             Image::Bytes(multirange_image(v, t).ok_or_else(refused)?)
         }
+        t if crate::user_composite_fields(t).is_some() => {
+            Image::Bytes(composite_image(v, t).ok_or_else(refused)?)
+        }
         // An `unknown` field (a bare literal in `row(1, 'a')`) is a cstring,
         // attlen -2, which `record_image_cmp` has no case for.
         "unknown" => {
@@ -406,6 +409,107 @@ fn array_image(v: &Bson, elem: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+const HEAP_HASNULL: u16 = 0x0001;
+const HEAP_HASVARWIDTH: u16 = 0x0002;
+
+/// A named composite's datum, its 4-byte length word left out: the
+/// `HeapTupleHeaderData` `heap_form_tuple` builds (`heaptuple.c`) --
+/// `datum_typmod` -1, `datum_typeid` the type's oid, `t_ctid` invalid
+/// (block `0xFFFFFFFF`, offset 0), `t_infomask2` the attribute count,
+/// `t_infomask` `HEAP_HASNULL` / `HEAP_HASVARWIDTH`, `t_hoff` -- then the
+/// NULL bitmap (a set bit is a present field), padding to MAXALIGN, and
+/// the fields as `heap_fill_tuple` lays them: a by-value or fixed-length
+/// field at its alignment, a varlena of at most 126 data bytes with a
+/// 1-byte header and no alignment, a longer one aligned with its 4-byte
+/// header. Offsets count from the tuple's start. A composite whose type
+/// carries a dropped attribute is not told apart here (the planner keeps
+/// only the live fields).
+fn composite_image(v: &Bson, ty: &str) -> Option<Vec<u8>> {
+    let oid = crate::user_composite_oid(ty)?;
+    let defs = crate::user_composite_fields(ty)?;
+    let fields = crate::record_fields(v)?;
+    if fields.len() != defs.len() {
+        return None;
+    }
+    let natts = fields.len();
+    let has_nulls = fields.iter().any(|f| matches!(f, Bson::Null));
+    let bitmap = if has_nulls { natts.div_ceil(8) } else { 0 };
+    let hoff = (23 + bitmap).div_ceil(8) * 8;
+    let mut data: Vec<u8> = Vec::new();
+    let mut infomask = if has_nulls { HEAP_HASNULL } else { 0 };
+    for (f, (_, t)) in fields.iter().zip(&defs) {
+        if matches!(f, Bson::Null) {
+            continue;
+        }
+        let t = canonical(t);
+        if let Some((_, len, align)) = fixed_element(&t).or_else(|| fixed_byref_element(&t)) {
+            pad_to(&mut data, hoff, align);
+            data.extend(fixed_bytes(f, &t, len)?);
+            continue;
+        }
+        let align = varlena_align(&t)?;
+        let Image::Bytes(b) = image(f, &t).ok()? else {
+            return None;
+        };
+        infomask |= HEAP_HASVARWIDTH;
+        if b.len() < 0x7f {
+            data.push((((b.len() + 1) as u8) << 1) | 1);
+        } else {
+            pad_to(&mut data, hoff, align);
+            data.extend((((b.len() + 4) as u32) << 2).to_le_bytes());
+        }
+        data.extend(b);
+    }
+    let mut out = Vec::with_capacity(hoff + data.len());
+    out.extend((-1i32).to_le_bytes());
+    out.extend((oid as u32).to_le_bytes());
+    out.extend([0xff, 0xff, 0xff, 0xff, 0, 0]);
+    out.extend((natts as u16).to_le_bytes());
+    out.extend(infomask.to_le_bytes());
+    out.push(hoff as u8);
+    if has_nulls {
+        let mut bits = vec![0u8; bitmap];
+        for (i, f) in fields.iter().enumerate() {
+            if !matches!(f, Bson::Null) {
+                bits[i / 8] |= 1 << (i % 8);
+            }
+        }
+        out.extend(bits);
+    }
+    out.resize(hoff - 4, 0);
+    out.extend(data);
+    Some(out)
+}
+
+/// The `typalign` of a varlena field type whose image `image` models.
+fn varlena_align(t: &str) -> Option<usize> {
+    if let Some(elem) = t.strip_suffix("[]") {
+        let elem = canonical(elem);
+        let double = fixed_element(&elem)
+            .or_else(|| fixed_byref_element(&elem))
+            .is_some_and(|(_, _, a)| a == 8);
+        return Some(if double { 8 } else { 4 });
+    }
+    if varlena_element(t).is_some() || crate::bits::is_bit_type(t) {
+        return Some(4);
+    }
+    if crate::user_composite_fields(t).is_some() {
+        return Some(8);
+    }
+    // A range or multirange is aligned as its subtype.
+    let is_range = RANGE_TYPES
+        .iter()
+        .chain(MULTIRANGE_TYPES)
+        .any(|(n, _)| *n == t);
+    is_range.then(|| {
+        if t.starts_with("int8") || t.starts_with("ts") {
+            8
+        } else {
+            4
+        }
+    })
 }
 
 /// The `pg_type` oid of a varlena element type with int alignment whose

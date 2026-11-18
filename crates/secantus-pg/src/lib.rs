@@ -15207,6 +15207,25 @@ impl PgHandler {
                     };
                     let mut info = ErrorInfo::new("ERROR".into(), e.sqlstate, e.message);
                     info.hint = e.hint;
+                    // An error the grammar raises without a scanner position
+                    // (an unknown condition name) is framed by the compile
+                    // (`plpgsql_compile_error_callback`), not placed (RP-1040).
+                    if at.is_none() && info.code != "42601" {
+                        let line =
+                            plpgsql_fn::compile_error_offset(&def.body, &info.message, &|prefix| {
+                                let mut d = read_back.clone();
+                                d.insert("body", prefix);
+                                plpgsql_fn::validate(&plpgsql_create_sql(&d)).map_err(|e| e.message)
+                            })
+                            .map_or(1, |o| {
+                                1 + def.body.chars().take(o).filter(|c| *c == '\n').count()
+                            });
+                        info.where_context = Some(format!(
+                            "compilation of PL/pgSQL function \"{}\" near line {line}",
+                            def.name
+                        ));
+                        return PgWireError::UserError(Box::new(info));
+                    }
                     // `function_parse_error_transpose`.
                     info.position = at.and_then(|at| {
                         let (source, index) = self

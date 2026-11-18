@@ -538,9 +538,10 @@ def test_standalone_temp_composite_is_in_the_temp_schema(dsn: str) -> None:
     ) == [(True, False)]
 
 
-@pytest.mark.backlog("RP-1037")
+@pytest.mark.backlog_fixed("RP-1037")
 def test_pg_temp_name_without_a_temp_namespace_is_an_undefined_schema(dsn: str) -> None:
     """Before the session has a temp namespace, `pg_temp.x` names a schema
-    that does not exist: 3F000 on 15.19 for a relation and a type alike."""
+    that does not exist: 3F000 on 15.19 for a relation and a type alike,
+    as here since RP-1037 fixed it."""
     for q in ("select 'pg_temp.zz'::regclass", "select 'pg_temp.zz'::regtype"):
         assert answer(dsn, q)[:2] == ("3F000", 'schema "pg_temp" does not exist'), q
