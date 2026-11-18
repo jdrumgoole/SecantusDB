@@ -837,15 +837,31 @@ def test_startup_opens_the_spill_wiredtiger_after_the_session_cache(rust_mongo: 
     assert set(after[: after.index(10158001)]) <= {22430}, ids
 
 
-@pytest.mark.backlog("RM-305")
+@pytest.mark.backlog_fixed("RM-305")
 def test_startup_initializes_the_durable_catalog_after_the_spill_engine(rust_mongo: Any) -> None:
     """After `Spill WiredTiger opened` (10158001) mongod 8.2.11 writes
     `Initializing durable catalog` (9529901), `Retrieving all idents from
     storage engine` (9529902) and `Initializing all collections in durable
-    catalog` (9529903) (measured 2026-11-18 on a new dbpath). This server
-    writes none of them."""
+    catalog` (9529903) (measured 2026-11-18 on a new dbpath), the first and
+    last with the catalog's collection count (6 on a store holding six
+    collections). This server wrote none of them until 2026-11-18."""
     ids = _startup_ids(rust_mongo)
-    assert ids[ids.index(10158001) + 1] == 9529901, ids
+    at = ids.index(10158001)
+    assert ids[at + 1 : at + 4] == [9529901, 9529902, 9529903], ids
+    lines = [json.loads(line) for line in rust_mongo.admin.command("getLog", "global")["log"]]
+    first = next(e for e in lines if e["id"] == 9529901)
+    last = next(e for e in lines if e["id"] == 9529903)
+    assert first["attr"]["numRecords"] == last["attr"]["numEntries"] >= 0, (first, last)
+
+
+@pytest.mark.backlog("RM-305")
+def test_startup_drops_spill_idents_after_the_durable_catalog(rust_mongo: Any) -> None:
+    """After `Initializing all collections in durable catalog` (9529903)
+    mongod 8.2.11 writes `Dropping spill idents` (10682200, attr
+    `numIdents`) on `initandlisten` before it listens (measured 2026-11-18,
+    on a new dbpath and on a restart). This server does not write it."""
+    ids = _startup_ids(rust_mongo)
+    assert 10682200 in ids[ids.index(9529903) :], ids
 
 
 def _op_msg(sock: socket.socket, command: dict, request_id: int) -> dict:

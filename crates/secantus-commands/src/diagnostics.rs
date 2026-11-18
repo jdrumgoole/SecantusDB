@@ -261,6 +261,42 @@ pub fn spill_opening_lines(opening: &crate::storage::SpillOpening) -> Vec<crate:
     lines
 }
 
+/// The lines mongod 8.2.11 writes on `initandlisten` as it loads its
+/// durable catalog, right after `Spill WiredTiger opened` (measured
+/// 2026-11-18): `Initializing durable catalog` (9529901) with the catalog's
+/// record count, `Retrieving all idents from storage engine` (9529902) and
+/// `Initializing all collections in durable catalog` (9529903) with its
+/// entry count. mongod keeps one catalog record per collection, so both
+/// counts are the number of collections the catalog holds.
+pub fn durable_catalog_lines(collections: i64) -> Vec<crate::logbuf::LogEntry> {
+    use crate::logbuf::LogEntry;
+    vec![
+        LogEntry::new(
+            "I",
+            "STORAGE",
+            9529901,
+            "initandlisten",
+            "Initializing durable catalog",
+        )
+        .attr(doc! {"numRecords": collections}),
+        LogEntry::new(
+            "I",
+            "STORAGE",
+            9529902,
+            "initandlisten",
+            "Retrieving all idents from storage engine",
+        ),
+        LogEntry::new(
+            "I",
+            "STORAGE",
+            9529903,
+            "initandlisten",
+            "Initializing all collections in durable catalog",
+        )
+        .attr(doc! {"numEntries": collections}),
+    ]
+}
+
 /// The most sessions mongod's session cache keeps:
 /// `wiredTigerSessionCacheMaxPercentage` (50) percent of the `session_max`
 /// WiredTiger was opened with (8.2.11 logs 16500 for its 33000), WiredTiger's
@@ -1239,6 +1275,19 @@ mod tests {
             lines[2].attr.as_ref().unwrap(),
             &doc! {"durationMillis": 7i64}
         );
+    }
+
+    /// RM-305: mongod 8.2.11's durable catalog lines and their counts.
+    #[test]
+    fn durable_catalog_is_mongods_three_lines() {
+        let lines = durable_catalog_lines(6);
+        assert_eq!(
+            lines.iter().map(|e| e.id).collect::<Vec<_>>(),
+            [9529901, 9529902, 9529903]
+        );
+        assert_eq!(lines[0].attr.as_ref().unwrap(), &doc! {"numRecords": 6i64});
+        assert!(lines[1].attr.is_none());
+        assert_eq!(lines[2].attr.as_ref().unwrap(), &doc! {"numEntries": 6i64});
     }
 
     #[test]
