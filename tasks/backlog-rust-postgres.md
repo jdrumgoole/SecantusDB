@@ -2709,16 +2709,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap tests are in
 `tests/backlog/test_rp_found_rp727.py`.
 
-- [ ] **A row comparison with a pattern operator over COLUMNS that are
-      not strings is answered.** `select (a, b) ~<~ (1, 2) from t973`
-      (`t973(a int, b int)`) is 42883 `operator does not exist: integer ~<~
-      integer` at 15 on PostgreSQL 15.19 (`make_row_comparison_op` looks up
-      each pair's operator). Here it compares the rows. RP-973 refused a
-      pair typed on its face (constants, casts) in `pattern_ops`, which
-      runs before any column is typed; a column pair needs the check where
-      the row comparison is typed.
-      Verify: tests/backlog/test_rp_found_rp727.py::test_row_pattern_operator_over_non_string_columns
-      Backlog-ID: RP-973
 
 ## Found while working RP-849 (2026-11-11)
 

@@ -5829,6 +5829,7 @@ fn pattern_ops(node: &mut N) -> Result<()> {
             _ => None,
         }
     };
+    PATTERN_ROW_OPS.with(|m| m.borrow_mut().clear());
     let wanted = node.nodes().iter().any(|(n, _, _, _)| {
         matches!(n, pg_query::NodeRef::AExpr(e)
             if op_of(e).as_deref().and_then(plain).is_some())
@@ -5899,6 +5900,9 @@ fn pattern_ops(node: &mut N) -> Result<()> {
                             display_type(&rt)
                         )));
                     }
+                    // A field only planning types (a column) is checked
+                    // where the row comparison is typed (`optype`).
+                    PATTERN_ROW_OPS.with(|m| m.borrow_mut().insert(e.location, op.clone()));
                 }
                 let side = if literal(&e.rexpr) && !literal(&e.lexpr) {
                     &mut e.lexpr
@@ -5919,6 +5923,22 @@ fn pattern_ops(node: &mut N) -> Result<()> {
     Ok(())
 }
 
+thread_local! {
+    /// The row comparisons `pattern_ops` rewrote from a text pattern
+    /// operator, by location, to the operator as written: `optype` refuses
+    /// a pair of them no string type has, once its columns are typed
+    /// (RP-973).
+    pub(crate) static PATTERN_ROW_OPS: std::cell::RefCell<std::collections::HashMap<i32, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Whether the text pattern operators take a value of type `t`: a string
+/// type, or a domain over one.
+pub(crate) fn pattern_string_type(t: &str) -> bool {
+    let string = |t: &str| matches!(t, "text" | "varchar" | "bpchar" | "name" | "char");
+    string(t) || domains::base_type_and_typmod(t).is_some_and(|(base, _, _)| string(&base))
+}
+
 /// The two types of a row pair the text pattern operators do not take:
 /// both fields typed on their face (not an untyped literal, which takes the
 /// other side's type) and one of them no string type.
@@ -5937,7 +5957,7 @@ fn pattern_pair_refused(
         }
     };
     let (l, r) = (face(a)?, face(b)?);
-    let string = |t: &str| matches!(t, "text" | "varchar" | "bpchar" | "name" | "char");
+    let string = pattern_string_type;
     (!l.is_empty() && !r.is_empty() && (!string(&l) || !string(&r))).then_some((l, r))
 }
 

@@ -4,7 +4,8 @@
   RP-849);
 - a row field that is an untyped literal was compared as a string, not
   coerced to its pair's type (fixed: RP-850);
-- a row comparison with a pattern operator (`~<~`) is refused.
+- a row comparison with a pattern operator (`~<~`) over fields no string
+  type has was answered (fixed: RP-973).
 
 An answer is the rows and the column names, or `(sqlstate, message,
 position)` for an error. Measured on PostgreSQL 15.19 (the shared reference
@@ -126,13 +127,41 @@ def test_row_pattern_operator_over_non_strings(query: str, dsn: str) -> None:
     assert answer(dsn, query) == PATTERN_OVER_NON_STRINGS[query]
 
 
-@pytest.mark.backlog("RP-973")
-def test_row_pattern_operator_over_non_string_columns(dsn: str) -> None:
-    """A pair of integer COLUMNS is 42883 too; here it is compared."""
-    with psycopg.connect(dsn, autocommit=True) as c:
-        c.execute("create table if not exists t973 (a int, b int)")
-    assert answer(dsn, "select (a, b) ~<~ (1, 2) from t973") == (
+# Over columns, each pair is checked once the columns are typed; a row of
+# string columns still compares. `t973` holds one row.
+PATTERN_OVER_COLUMNS = {
+    "select (a, b) ~<~ (1, 2) from t973": (
         "42883",
         "operator does not exist: integer ~<~ integer",
         "15",
-    )
+    ),
+    "select (t, a) ~>=~ ('a', 1) from t973": (
+        "42883",
+        "operator does not exist: integer ~>=~ integer",
+        "15",
+    ),
+    "select 1 from t973 where (a, b) ~>~ (0, 0)": (
+        "42883",
+        "operator does not exist: integer ~>~ integer",
+        "33",
+    ),
+    "select (t, b) ~<~ ('a', null) from t973": (
+        "42883",
+        "operator does not exist: integer ~<~ unknown",
+        "15",
+    ),
+    "select (t, v) ~<~ ('a', 'c') from t973": ([(True,)], ["?column?"]),
+    "select (c, t) ~<=~ ('c', 'z') from t973": ([(True,)], ["?column?"]),
+    "select (t, null) ~<~ ('a', 'b') from t973": ([(None,)], ["?column?"]),
+}
+
+
+@pytest.mark.backlog_fixed("RP-973")
+@pytest.mark.parametrize("query", list(PATTERN_OVER_COLUMNS))
+def test_row_pattern_operator_over_non_string_columns(query: str, dsn: str) -> None:
+    """A pair of integer COLUMNS was compared; it is 42883 as for constants."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop table if exists t973")
+        c.execute("create table t973 (a int, b int, t text, v varchar, c char(2))")
+        c.execute("insert into t973 values (1, 2, 'a', 'b', 'c')")
+    assert answer(dsn, query) == PATTERN_OVER_COLUMNS[query]
