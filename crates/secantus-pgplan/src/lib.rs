@@ -15267,6 +15267,28 @@ fn plan_insert(
         }) {
             return Err(generated_assignment(t, true));
         }
+        // A bare literal in a plain SELECT's target list is an `unknown`
+        // output column, coerced to its target column in the INSERT's own
+        // analysis (`transformInsertStmt` -> `transformAssignedExpr`), so a
+        // field's domain error is raised there, under the literal's
+        // position, even when no row is selected. A set operation, ORDER
+        // BY, DISTINCT or GROUP BY resolves it to `text` first (RP-945).
+        if sel.op == pg_query::protobuf::SetOperation::SetopNone as i32
+            && sel.sort_clause.is_empty()
+            && sel.distinct_clause.is_empty()
+            && sel.group_clause.is_empty()
+        {
+            for (item, target) in sel.target_list.iter().zip(&targets) {
+                let (Some(N::ResTarget(rt)), Some(column)) =
+                    (item.node.as_ref(), def.column(target))
+                else {
+                    continue;
+                };
+                if let Some(val) = rt.val.as_deref() {
+                    check_assigned_literal(column, val, params)?;
+                }
+            }
+        }
         Some(Box::new(plan_select(sel, lookup, params)?))
     } else {
         None

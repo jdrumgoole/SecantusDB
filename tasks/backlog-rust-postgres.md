@@ -2340,16 +2340,18 @@ Measured on PostgreSQL 15.19 with `create domain pint as int check (value >
 text)` and `create table tct (c ctp, d pint[])` holding `('(1,x)', null)`.
 The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
 
-- [ ] **An untyped literal an `INSERT ... SELECT` writes to a composite
-      or domain-array column reports a field's domain error with no
-      position.** `insert into tct(c) select '(0,x)'` is 23514 at 27 on
-      PostgreSQL 15.19: the SELECT's `unknown` output column is coerced to
-      the target column in the INSERT's analysis, reading the literal under
-      its position. Here it has none. RP-945 placed the VALUES and UPDATE
-      SET forms (`check_assigned_literal`) and an `ARRAY[]` element
-      (`failing_array_element`); the SELECT's target list needs the same.
-      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_literal_domain_error_position
-      Backlog-ID: RP-945
+- [ ] **A `text` column an `INSERT ... SELECT` writes to a composite
+      column is accepted.** `insert into tct(c) select '(0,x)'::text` is
+      42804 `column "c" is of type ctp but expression is of type text` at
+      27 on PostgreSQL 15.19, as is the bare literal under a UNION, an
+      ORDER BY, a DISTINCT or a subquery in FROM (each resolves the
+      `unknown` column to `text` first; `text` has no assignment cast to a
+      composite). Here the text is read as the composite (a field's domain
+      error, 23514, for these). Found while working RP-945, which placed
+      the plain SELECT's literal (`check_assigned_literal` over its target
+      list).
+      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_text_into_composite
+      Backlog-ID: RP-1044
 
 ## Found while working RP-534 (2026-11-08)
 
