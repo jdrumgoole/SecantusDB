@@ -47330,16 +47330,21 @@ impl PgHandler {
                             &sj.outer_quals,
                             &index_columns,
                         );
+                        let priced = match inner.as_ref() {
+                            Statement::Select(sel) => self.semi_join_estimate(sj, sel),
+                            _ => None,
+                        };
+                        // The inner side read through the index its own
+                        // WHERE bounds, where that is its cheaper path.
+                        if let Some((.., Some(index))) = &priced {
+                            explain::name_index_scans(&mut tree, &[None, Some(index.clone())]);
+                        }
                         explain::inner_quals_on_semi_join(
                             &mut tree,
                             &sj.inner_quals,
                             &index_columns,
                         );
-                        let priced = match inner.as_ref() {
-                            Statement::Select(sel) => self.semi_join_estimate(sj, sel),
-                            _ => None,
-                        };
-                        if let Some((outer, scanned, join, unique)) = priced {
+                        if let Some((outer, scanned, join, unique, _)) = priced {
                             tree.estimate = Some(join);
                             tree.children[0].estimate = Some(outer);
                             tree.children[1].children[0].estimate = Some(scanned);

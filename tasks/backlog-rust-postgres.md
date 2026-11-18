@@ -1978,15 +1978,18 @@ a regression test.
       its semi factors those of the base relation as
       `compute_semi_anti_join_factors` takes them) it is planned and printed
       as that `Hash Join`. Still open: (1) Merge and nested-loop semi
-      joins, the unique-ified side as the outer one, and a side read through
-      an index, are not priced; an IN subquery's own WHERE an index reads
-      (`select * from e where b in (select b from k where a > 990)`, k's
-      primary key on a) prints a zero-cost `Hash Semi Join` over k's Seq
-      Scan with that `Filter`, where 15.19 hashes a `HashAggregate` over
-      `Index Scan using k_pkey` (`Index Cond: (a > 990)`). Since 2026-11-18
-      an IN subquery's own WHERE over its relation filters the inner scan
-      (`SemiJoin::inner_filter`, `inner_quals`) and is priced where that
-      scan is sequential. (2) Wider shapes still print the scan: a
+      joins, the unique-ified side as the outer one, and an outer side read
+      through an index, are not priced. Since 2026-11-18 an IN subquery's
+      own WHERE over its relation filters the inner scan
+      (`SemiJoin::inner_filter`, `inner_quals`) and is priced, read through
+      the index it bounds where that is cheaper (`select * from e where b
+      in (select b from k where a > 990)` hashes a `HashAggregate` over
+      `Index Scan using k_pkey`), the unique-ified side's groups scaled to
+      its rows (`estimate_num_groups`) and its hash buckets one entry each
+      (`final_cost_hashjoin`'s UniquePath rule,
+      `joincost::hash_join_over_unique_path`). (2) Wider shapes still print
+      the scan: an IN comparing expressions (`a::bigint in (select
+      a::bigint + 0 ...)`, which 15.19 groups by the expression), a
       cross-type comparison, and an
       outer conjunct other than a comparison of an expression with a
       constant that the scan's filter does not hold whole. Outer conjuncts
@@ -1994,7 +1997,7 @@ a regression test.
       (`sublink_join::split_where`); one that does not lower is priced as an
       `ExprQual` (`SemiJoin::outer_exprs`).
       Backlog-ID: RP-411
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery read through an index is planned as a join]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery comparing expressions is planned as a join]
 - [ ] **A node above an InitPlan's scan is unpriced.** Since
       RP-440's first slices (2026-11-16) a SELECT over one relation whose WHERE
       compares columns with uncorrelated FROM-less scalar subqueries plans

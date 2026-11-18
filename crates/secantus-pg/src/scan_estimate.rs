@@ -2118,12 +2118,13 @@ impl PgHandler {
     /// pulled up into (RP-411), its outer side reading `sel`'s targets:
     /// the outer scan's, the hashed inner scan's and the join's, and the
     /// inner side's `HashAggregate` where the inner join of the inner side
-    /// made unique is the cheaper path (`create_unique_path`).
+    /// made unique is the cheaper path (`create_unique_path`), and the
+    /// index the inner scan reads, where it reads one.
     pub(crate) fn semi_join_estimate(
         &self,
         sj: &secantus_pgplan::SemiJoin,
         sel: &secantus_pgplan::Select,
-    ) -> Option<(Estimate, Estimate, Estimate, Option<Estimate>)> {
+    ) -> Option<SemiJoinEstimate> {
         if sel.table != sj.outer.0 || sel.join.is_some() || sel.sub.is_some() {
             return None;
         }
@@ -2167,10 +2168,10 @@ impl PgHandler {
         // key alone.
         let inner_read = [inner_key.clone()];
         let b = self.hash_side(&sj.inner.0, &sj.inner_filter, &inner_key, &inner_read, &[])?;
-        let ((outer, inner, mut join, _, _), unique) = hash_semi_join_of(a, b)?;
+        let ((outer, inner, mut join, _, [_, index]), unique) = hash_semi_join_of(a, b)?;
         join.1 += target * join.2;
         join.3 += width;
-        Some((outer, inner, join, unique))
+        Some((outer, inner, join, unique, index))
     }
 
     /// A side that reads no column but its key is read index-only through
@@ -7508,6 +7509,17 @@ struct AnalysedKey {
     mcv: Vec<(Vec<u8>, f32)>,
 }
 
+/// [`PgHandler::semi_join_estimate`]'s answer: the outer scan's, the
+/// inner scan's and the join's estimates, the inner side's `HashAggregate`
+/// where it is unique-ified, and the index the inner scan reads.
+pub(crate) type SemiJoinEstimate = (
+    Estimate,
+    Estimate,
+    Estimate,
+    Option<Estimate>,
+    Option<String>,
+);
+
 /// The most further equality clauses [`hash_join_of`] prices.
 const MORE_HASH_CLAUSES: usize = 3;
 
@@ -7525,17 +7537,13 @@ const MORE_HASH_CLAUSES: usize = 3;
 /// the two Sorts a merge must start with, the outer scan and the inner
 /// rescans a nested loop pays for each unmatched outer row, and the outer
 /// scan and the inner side's `HashAggregate` any join of the unique-ified
-/// side reads. A side read through an index is not priced.
+/// side reads. An outer side read through an index is not priced; the
+/// inner one is (its index the join estimate's second).
 fn hash_semi_join_of(a: HashSide, b: HashSide) -> Option<(JoinEstimate, Option<Estimate>)> {
     use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
     const CPU_OPERATOR_COST: f64 = 0.0025;
     const CPU_TUPLE_COST: f64 = 0.01;
-    if a.pg_type != b.pg_type
-        || a.index.is_some()
-        || b.index.is_some()
-        || a.key_indexed
-        || b.key_indexed
-    {
+    if a.pg_type != b.pg_type || a.index.is_some() || a.key_indexed || b.key_indexed {
         return None;
     }
     fn key(s: &HashSide) -> KeyStats<'_> {
@@ -7586,7 +7594,13 @@ fn hash_semi_join_of(a: HashSide, b: HashSide) -> Option<(JoinEstimate, Option<E
     // aggregate's rows; the outer side hashed, a plain hash join. A merge
     // must still sort the outer side, and a nested loop evaluates the
     // clause on every pair of rows: bounds of those.
-    let groups = costsize::clamp_row_est(b.stats.0.min(inner.rows));
+    // `estimate_num_groups`: the key's distinct values scaled down to the
+    // rows the inner side's own WHERE keeps.
+    let mut reldistinct = b.stats.0.min(b.tuples);
+    if reldistinct > 0.0 && inner.rows < b.tuples {
+        reldistinct *= 1.0 - ((b.tuples - inner.rows) / b.tuples).powf(b.tuples / reldistinct);
+    }
+    let groups = costsize::clamp_row_est(costsize::clamp_row_est(reldistinct).min(inner.rows));
     let agg_startup = b.scan.1 + CPU_OPERATOR_COST * inner.rows;
     let agg = (agg_startup, agg_startup + CPU_TUPLE_COST * groups);
     let bounds = [
@@ -7601,7 +7615,7 @@ fn hash_semi_join_of(a: HashSide, b: HashSide) -> Option<(JoinEstimate, Option<E
         ..side(&b)
     };
     let (u_startup, via_unique) =
-        joincost::hash_semi_join(&outer, &unique, nselec, (jselec, match_count), &[kb]);
+        joincost::hash_join_over_unique_path(&outer, &unique, nselec, (jselec, match_count), &[kb]);
     // The outer side hashed under the aggregate's rows: an inner join on
     // a side not known unique (one that is is not modelled here).
     if a.unique {
@@ -7647,12 +7661,7 @@ fn hash_semi_join_of(a: HashSide, b: HashSide) -> Option<(JoinEstimate, Option<E
 /// side read through an index (presorted for a merge) is not priced.
 fn hash_anti_join_of(a: HashSide, b: HashSide) -> Option<JoinEstimate> {
     use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
-    if a.pg_type != b.pg_type
-        || a.index.is_some()
-        || b.index.is_some()
-        || a.key_indexed
-        || b.key_indexed
-    {
+    if a.pg_type != b.pg_type || a.index.is_some() || a.key_indexed || b.key_indexed {
         return None;
     }
     fn key(s: &HashSide) -> KeyStats<'_> {
