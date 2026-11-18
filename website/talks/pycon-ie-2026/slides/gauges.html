@@ -2,10 +2,10 @@
 <p class="eyebrow">Conformance gauges</p>
 <h2>Borrow other people’s test suites — unmodified</h2>
 <div class="stats" style="grid-template-columns:1fr 1fr 1fr;">
-<div class="stat"><span class="n">13</span><span class="l" style="color:var(--soft);">MongoDB driver suites: pymongo, Go, Node, Java, Kotlin, Ruby, Rust, PHP, C, C++, C#</span></div>
-<div class="stat"><span class="n">7</span><span class="l" style="color:var(--soft);">SQL suites, including psycopg, sqllogictest and SQLAlchemy’s dialect tests</span></div>
-<div class="stat"><span class="n">0</span><span class="l" style="color:var(--soft);">edits to those suites. A git submodule, pointed at us</span></div>
+<div class="stat"><span class="n">13</span><span class="l" style="color:var(--soft);">MongoDB driver suites</span></div>
+<div class="stat"><span class="n">7</span><span class="l" style="color:var(--soft);">SQL suites</span></div>
+<div class="stat"><span class="n">0</span><span class="l" style="color:var(--soft);">edits to them</span></div>
 </div>
-<p class="lede">A hang or a timeout is a failure, never a skip. Count tests started against tests that reported.</p>
-<aside>Driver authors have already written thousands of tests describing what a server must do. Run them weekly against both Rust servers. Anecdote: a gauge once reported 100% because a hang killed the run before failures were counted — hence “started vs reported”. ~2 min.</aside>
+<p class="lede">A hang is a failure, never a skip.</p>
+<aside><p>Borrow other people's test suites, unmodified.</p><p>Driver authors have already written thousands of tests describing what a server must do. We run thirteen MongoDB driver suites (pymongo sync and async, Go, Node, Java, Kotlin, Ruby, Rust, both PHP drivers, C, C++ and C#) and seven SQL suites, including psycopg, sqllogictest and SQLAlchemy's dialect tests.</p><p>Each one is a git submodule, pointed at our server, with zero edits. They run weekly against both Rust servers.</p><p>The rule: a hang or a timeout is a failure, never a skip. Anecdote: the Go gauge reported 100% for months, because a hung test killed the run at 476 of 481 tests before the failures were counted. So now we count tests started against tests that reported.</p><p class="time">Time: ~2 min</p></aside>
 </section>

@@ -4,10 +4,8 @@
 <div class="cards two">
 <div class="code"><span class="c"># 26 April 2026, first commit</span><br>a MongoDB wire server<br>in Python<br><br><span class="c"># the next day</span><br>sort and projection<br>cursor pagination via getMore</div>
 <div style="display:flex;flex-direction:column;gap:24px;">
-<p>asyncio socket server, OP_MSG parsing, BSON in and out.</p>
-<p>Scope set by one question: <b>what does pymongo actually send?</b> Handshake, CRUD, cursors, aggregation, findAndModify — then change streams.</p>
-<p>Python was the fastest way to learn the protocol and settle the design.</p>
+<p class="lede">Scope: <b>what does pymongo actually send?</b></p>
 </div>
 </div>
-<aside>Python was the right first language: fastest way to learn the protocol, and pymongo is the client we target. It was a prototype; the product is the Rust servers. ~3 min.</aside>
+<aside><p>26 April 2026: the first commit, a MongoDB wire server in Python. The next day it had sort, projection and cursor pagination through getMore.</p><p>An asyncio socket server, OP_MSG parsing, BSON in and out.</p><p>The scope came from one question: <b>what does pymongo actually send?</b> The handshake, CRUD, cursors, aggregation, findAndModify, and then change streams.</p><p>Python was the right first language. It was the fastest way to learn the protocol, and pymongo is the client we target. But it was a prototype; the product is the Rust servers.</p><p class="time">Time: ~3 min</p></aside>
 </section>

@@ -2,9 +2,9 @@
 <p class="eyebrow">Act four · Process</p>
 <h2>In a database, an error is never noise</h2>
 <div class="cards">
-<div class="card"><h3>No skip to green</h3><p class="body">No xfail, no deselect, no retry-past. A WT_PANIC under stress is a bug, even if one thread passes.</p></div>
-<div class="card"><h3>“Flaky” is a bug report</h3><p class="body">Only under load, only in parallel: descriptions of a race, not excuses.</p></div>
-<div class="card"><h3>Backlog = failing tests</h3><p class="body">Every open gap is a test asserting the real server’s answer. Fixing it turns it into a regression test.</p></div>
+<div class="card"><h3>No skip to green</h3><p class="body">No xfail, no retry-past</p></div>
+<div class="card"><h3>“Flaky” is a bug report</h3><p class="body">It describes a race</p></div>
+<div class="card"><h3>Backlog = failing tests</h3><p class="body">Every gap is a test</p></div>
 </div>
-<aside>Cultural rules that matter more than any code. The backlog: every item has an ID and a gap test under tests/backlog that fails while it’s open — so the backlog can’t lie. About 230 open items across the two Rust servers today. ~2 min.</aside>
+<aside><p>Cultural rules that matter more than any code.</p><p><b>No skip to green.</b> No xfail, no deselect, no retry-past. A WT_PANIC under stress is a bug, even if a single-threaded test passes; stress is exactly when a database has to hold.</p><p><b>"Flaky" is a bug report.</b> "Only under load" and "only in parallel" describe a race; they don't excuse it.</p><p><b>The backlog is failing tests.</b> Every open item has an ID and a gap test that asserts the real server's answer, so it fails while the item is open. Fixing the item turns it into a regression test, so the backlog can't lie. About 230 items are open across the two Rust servers today.</p><p class="time">Time: ~2 min</p></aside>
 </section>

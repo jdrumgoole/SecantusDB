@@ -41,6 +41,24 @@ html,body{{margin:0;height:100%;background:#0B1915;overflow:hidden;}}
 #stage h1,#stage h2,#stage h3,#stage p,#stage ul,#stage ol{{margin:0;}}
 #bar{{position:fixed;right:16px;bottom:10px;color:#BFD3CB;opacity:.7;
   font:14px/1 system-ui,sans-serif;}}
+.nlink{{position:absolute;left:40px;bottom:24px;font:500 18px/1 system-ui,sans-serif;
+  color:inherit;opacity:.35;text-decoration:none;border-bottom:1px dotted currentColor;}}
+.nlink:hover,.nlink:focus{{opacity:.8;}}
+#notes{{position:fixed;inset:0;background:rgba(11,25,21,.72);z-index:10;display:flex;
+  align-items:center;justify-content:center;padding:16px;box-sizing:border-box;}}
+#notes[hidden]{{display:none;}}
+#notes .nbox{{position:relative;background:#F5F2EA;color:#10231E;max-width:760px;width:100%;
+  max-height:86vh;overflow:auto;border-radius:8px;padding:32px 36px;box-sizing:border-box;
+  font:17px/1.6 'Inter',system-ui,sans-serif;}}
+#notes h2{{font:600 24px/1.25 'Space Grotesk',system-ui,sans-serif;margin:0 0 16px;}}
+#notes .nkick{{font:600 12px/1 system-ui,sans-serif;letter-spacing:2px;text-transform:uppercase;
+  color:#1F6B4F;margin:0 0 8px;}}
+#notes p{{margin:0 0 12px;font-size:17px!important;line-height:1.6!important;
+  color:#10231E!important;width:auto!important;}}
+#notes ul{{margin:0 0 12px;padding-left:20px;}}
+#notes .time{{color:#4A5A55;font-size:14px;}}
+#nclose{{position:absolute;right:12px;top:10px;background:none;border:0;font-size:28px;
+  cursor:pointer;color:#4A5A55;}}
 #bar button{{background:none;border:1px solid #BFD3CB;color:inherit;
   border-radius:4px;padding:4px 10px;margin-left:6px;cursor:pointer;}}
 {css}
@@ -54,6 +72,9 @@ html,body{{margin:0;height:100%;background:#0B1915;overflow:hidden;}}
 <div id="bar"><span id="num"></span>
 <button id="prev" aria-label="Previous slide">&#8592;</button>
 <button id="next" aria-label="Next slide">&#8594;</button></div>
+<div id="notes" role="dialog" aria-modal="true" aria-labelledby="notes-h" hidden>
+<div class="nbox"><button id="nclose" aria-label="Close speaker notes">&#215;</button>
+<p class="nkick">Speaker notes</p><h2 id="notes-h"></h2><div id="nbody"></div></div></div>
 <script>
 (function(){{
   var READER={reader_js};
@@ -70,12 +91,26 @@ html,body{{margin:0;height:100%;background:#0B1915;overflow:hidden;}}
     history.replaceState(null,'','#'+(i+1));}}
   addEventListener('resize',fit);
   addEventListener('keydown',function(e){{
+    if(!notes.hidden){{if(e.key==='Escape'||e.key==='n')closeNotes();return;}}
+    if(e.key==='n'&&!reader.matches){{openNotes(s[i]);return;}}
     if(['ArrowRight','PageDown',' '].indexOf(e.key)>=0){{show(i+1);e.preventDefault();}}
     if(['ArrowLeft','PageUp'].indexOf(e.key)>=0){{show(i-1);e.preventDefault();}}
     if(e.key==='Home')show(0); if(e.key==='End')show(s.length-1);}});
   document.getElementById('next').onclick=function(){{show(i+1);}};
   document.getElementById('prev').onclick=function(){{show(i-1);}};
   s.forEach(function(e,j){{e.id=e.id||('s'+(j+1));}});
+  var notes=document.getElementById('notes'),last=null;
+  function openNotes(sec){{var a=sec.querySelector('aside');if(!a)return;
+    var h=sec.querySelector('h1,h2,.big');
+    document.getElementById('notes-h').textContent=h?h.textContent:'';
+    document.getElementById('nbody').innerHTML=a.innerHTML;
+    last=document.activeElement;notes.hidden=false;document.getElementById('nclose').focus();}}
+  function closeNotes(){{notes.hidden=true;if(last)last.focus();}}
+  s.forEach(function(e){{if(!e.querySelector('aside'))return;
+    var l=document.createElement('a');l.href='#';l.className='nlink';l.textContent='Speaker notes';
+    l.onclick=function(ev){{ev.preventDefault();openNotes(e);}};e.appendChild(l);}});
+  document.getElementById('nclose').onclick=closeNotes;
+  notes.onclick=function(ev){{if(ev.target===notes)closeNotes();}};
   fit(); show((parseInt(location.hash.slice(1),10)||1)-1);
 }})();
 </script>
@@ -94,6 +129,7 @@ MOBILE_CSS = (
     "#stage>section{position:relative;display:flex!important;inset:auto;"
     "padding:40px 16px!important;gap:20px!important;min-height:0;}"
     "#bar{display:none;}"
+    "#stage .nlink{position:static;align-self:flex-start;font-size:14px;opacity:.6;}"
     "#stage h1{font-size:40px!important;}"
     "#stage h2{font-size:28px!important;}"
     "#stage h3{font-size:20px!important;}"
