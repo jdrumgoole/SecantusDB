@@ -1,10 +1,28 @@
-<section id="problem">
+<section id="problem" style="gap:32px;">
 <p class="eyebrow">Why build a database?</p>
 <h2>Two protocols everyone already speaks</h2>
 <div class="cards">
-<div class="card rise" style="--i:0"><h3>The clients exist</h3><p class="body">Drivers in a dozen languages</p></div>
-<div class="card rise" style="--i:1"><h3>The engine exists</h3><p class="body">WiredTiger, inside MongoDB</p></div>
-<div class="card rise" style="--i:2"><h3>The gap</h3><p class="body">One small server for both</p></div>
+<div class="card rise" style="padding:24px 32px;gap:8px;--i:0"><h3>The clients exist</h3><p class="body">Drivers in a dozen languages</p></div>
+<div class="card rise" style="padding:24px 32px;gap:8px;--i:1"><h3>The engine exists</h3><p class="body">WiredTiger, inside MongoDB</p></div>
+<div class="card rise" style="padding:24px 32px;gap:8px;--i:2"><h3>The gap</h3><p class="body">One small server for both</p></div>
 </div>
-<aside><p>The motivation: we didn't have to invent a client ecosystem or a storage engine.</p><p><b>The clients exist.</b> pymongo, psycopg, SQLAlchemy and official drivers in a dozen languages. If you speak their wire protocol correctly, they all just work, and their authors have already written thousands of tests describing what a server must do.</p><p><b>The engine exists.</b> WiredTiger gives us checkpoints, transactions and durability. We don't write B-trees or a write-ahead log.</p><p><b>The gap</b> is the server in between: one small, self-contained server that is faithful to the real products, starts in one line and needs nothing else installed. All the hard work is in being faithful.</p><p class="time">Time: ~2 min</p></aside>
+<div class="flow">
+<div class="box"><p class="t">pymongo</p><p>OP_MSG</p></div>
+<p class="arrow">→</p>
+<div class="box"><p class="t">secantus-wire</p><p>commands</p></div>
+<p class="arrow">→</p>
+<div class="box"><p class="t">secantus-core</p><p>query, update, aggregate</p></div>
+<p class="arrow">→</p>
+<div class="box wt" style="flex:1.2;"><p class="t">secantus-storage</p><p>WiredTiger</p></div>
+</div>
+<div class="flow">
+<div class="box"><p class="t">psycopg</p><p>PG wire</p></div>
+<p class="arrow">→</p>
+<div class="box"><p class="t">libpg_query</p><p>real PG parser</p></div>
+<p class="arrow">→</p>
+<div class="box"><p class="t">secantus-pgplan</p><p>SQL → MQL filters</p></div>
+<p class="arrow">→</p>
+<div class="box wt" style="flex:1.2;"><p class="t">same tables</p><p>same files</p></div>
+</div>
+<aside><p>The motivation: we didn't have to invent a client ecosystem or a storage engine.</p><p><b>The clients exist.</b> pymongo, psycopg, SQLAlchemy and official drivers in a dozen languages. If you speak their wire protocol correctly, they all just work, and their authors have already written thousands of tests describing what a server must do.</p><p><b>The engine exists.</b> WiredTiger gives us checkpoints, transactions and durability. We don't write B-trees or a write-ahead log.</p><p><b>The gap</b> is the server in between: one small, self-contained server that is faithful to the real products, starts in one line and needs nothing else installed. All the hard work is in being faithful.</p><p><b>Then walk the two rows: that's the server in between.</b></p><p><b>MongoDB:</b> pymongo sends OP_MSG; secantus-wire turns it into commands; secantus-core runs the query, update and aggregation engines; secantus-storage talks to WiredTiger.</p><p><b>PostgreSQL:</b> psycopg speaks the PG wire protocol; libpg_query, PostgreSQL's own parser, parses the SQL; secantus-pgplan lowers it to the filters the core engine evaluates; and it lands in the same tables, in the same files.</p><p>It's a Cargo workspace of about 20 crates. The engines have no PyO3, so the standalone binaries and the Python bindings share them.</p><p>A CREATE TABLE in the Postgres server reads back as a collection in the MongoDB server. That's a hand-off, not concurrent serving: WiredTiger's file lock lets only one server open the directory at a time.</p><p class="time">Time: ~4 min</p></aside>
 </section>
