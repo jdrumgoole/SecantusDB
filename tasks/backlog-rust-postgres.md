@@ -1670,9 +1670,13 @@ a regression test.
       node's `Output`, the outer ON's columns kept out of the inner
       equivalence classes: `VerboseChain::left_join`.) (Since 2026-11-18
       a LEFT JOIN at any level of such a chain does too, each hashing its
-      nullable relation alone: `VerboseChain::nullable`.) Still the plain
-      plan: a nested loop or merge join in a chain, a RIGHT or FULL join in
-      one, a LEFT JOIN an inner ON above reduces to an inner one (RP-1061
+      nullable relation alone: `VerboseChain::nullable`.) (Since 2026-11-18
+      a FULL JOIN topping such a chain with no WHERE does too:
+      `VerboseChain::full`.) Still the plain plan: a nested loop or merge
+      join in a chain, a RIGHT join in one (RP-1063 first), a FULL JOIN
+      below another join, a WHERE over a FULL JOIN (`... full join e e2
+      on e2.a = k.a where e.b <> 'x'` is reduced to a `Hash Left Join` on
+      PostgreSQL 15.19, `reduce_outer_joins`, whose plain plan matches here), a LEFT JOIN an inner ON above reduces to an inner one (RP-1061
       first), a WHERE on a LEFT JOIN's nullable side (its plain plan differs
       too: `... left join e e2 on e2.a = k.a where e2.b <> 'x'` is reduced
       and reordered on PostgreSQL 15.19, `where e2.b is null` a `Hash Right
@@ -1718,6 +1722,24 @@ a regression test.
       on that join under VERBOSE). Found while working RP-966.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join reduced to inner joins the chain on its class]
       Backlog-ID: RP-1061
+
+- [ ] **An outer join's multi-column Hash Cond prints the nullable
+      side's column first.** `explain (costs off) select e.b, e2.b from e
+      full join e e2 on e2.a = e.a and e2.b = e.b` (a `Hash Left Join`
+      too) prints `Hash Cond: ((e2.a = e.a) AND (e2.b = e.b))`; PostgreSQL
+      15.19 prints `((e.a = e2.a) AND (e.b = e2.b))`, each clause commuted
+      to put the outer side's column first. A single-clause ON is printed
+      outer first already. Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an outer join's two-clause hash cond puts the outer column first]
+      Backlog-ID: RP-1062
+
+- [ ] **A RIGHT JOIN atop a chain hashes the chain.** `explain (costs
+      off) select e.b, e2.b from e join k on e.a = k.a right join e e2 on
+      e2.a = k.a` is a `Hash Left Join` of `e e2` over a Hash of `(e join
+      k)` here; PostgreSQL 15.19 prints a `Hash Right Join` of the `(e
+      join k)` Hash Join over a Hash of `e e2`. Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a right join atop a chain hashes its preserved relation]
+      Backlog-ID: RP-1063
 
 - [ ] **A hash join on an expression and a column pair hashes the
       expression's side.** `explain select e.b from e join k on e.a = k.a

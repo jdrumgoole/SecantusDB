@@ -2143,6 +2143,66 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Output: e2.b, e2.a",
         ],
     ),
+    # Measured on PostgreSQL 15.19 (2026-11-18): a FULL JOIN atop a chain
+    # hashes its right relation alone, as a LEFT JOIN does.
+    "explain verbose of a chain ending in a full join": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, e2.b from e join k on e.a = k.a "
+        "full join e e2 on e2.a = k.a",
+        [
+            "Hash Full Join",
+            "  Output: e.b, e2.b",
+            "  Hash Cond: (k.a = e2.a)",
+            "  ->  Hash Join",
+            "        Output: e.b, k.a",
+            "        Inner Unique: true",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.a, e.b",
+            "        ->  Hash",
+            "              Output: k.a",
+            "              ->  Seq Scan on public.k",
+            "                    Output: k.a",
+            "  ->  Hash",
+            "        Output: e2.b, e2.a",
+            "        ->  Seq Scan on public.e e2",
+            "              Output: e2.b, e2.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966): an outer
+    # join's Hash Cond clauses each put the outer side's column first.
+    "an outer join's two-clause hash cond puts the outer column first": (
+        "RP-1062",
+        _ANALYSED,
+        "explain (costs off) select e.b, e2.b from e full join e e2 on e2.a = e.a and e2.b = e.b",
+        [
+            "Hash Full Join",
+            "  Hash Cond: ((e.a = e2.a) AND (e.b = e2.b))",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on e e2",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-966): a RIGHT
+    # JOIN atop a chain keeps the chain outer and hashes the preserved side.
+    "a right join atop a chain hashes its preserved relation": (
+        "RP-1063",
+        _ANALYSED,
+        "explain (costs off) select e.b, e2.b from e join k on e.a = k.a "
+        "right join e e2 on e2.a = k.a",
+        [
+            "Hash Right Join",
+            "  Hash Cond: (k.a = e2.a)",
+            "  ->  Hash Join",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e",
+            "        ->  Hash",
+            "              ->  Seq Scan on k",
+            "  ->  Hash",
+            "        ->  Seq Scan on e e2",
+        ],
+    ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): a LEFT
     # JOIN to a unique key whose columns nothing reads is removed.
     "a left join nothing reads is removed": (

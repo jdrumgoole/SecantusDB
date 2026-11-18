@@ -7233,6 +7233,9 @@ pub struct VerboseChain {
     /// Per relation: a LEFT JOIN adds it, its nullable side, so the join
     /// that brings it in is a `Hash Left Join` hashing it alone.
     pub nullable: Vec<bool>,
+    /// The topmost join is a FULL JOIN: a `Hash Full Join` hashing the
+    /// last relation alone, every relation nullable.
+    pub full: bool,
 }
 
 /// [`VerboseChain`] for `SELECT <columns> FROM a JOIN b ON a.x = b.y JOIN
@@ -7261,11 +7264,18 @@ pub fn explain_verbose_chain(
     let mut node: &Node = item;
     // Per join, innermost last until reversed: is it a LEFT JOIN.
     let mut lefts: Vec<bool> = Vec::new();
+    let mut full = false;
     let first = loop {
         match node.node.as_ref() {
             Some(N::JoinExpr(j)) => {
                 // A LEFT JOIN's nullable side is its right relation.
-                let left = j.jointype == pg_query::protobuf::JoinType::JoinLeft as i32;
+                let mut left = j.jointype == pg_query::protobuf::JoinType::JoinLeft as i32;
+                // Only the topmost join may be a FULL JOIN: below one, the
+                // relations it null-extends change every join above.
+                if lefts.is_empty() && j.jointype == pg_query::protobuf::JoinType::JoinFull as i32 {
+                    full = true;
+                    left = true;
+                }
                 if j.is_natural
                     || !j.using_clause.is_empty()
                     || j.alias.is_some()
@@ -7421,6 +7431,10 @@ pub fn explain_verbose_chain(
     // Each WHERE conjunct must read exactly one relation: its scan's
     // `Filter`. Its columns are not in the `reltarget`.
     let mut quals: Vec<Vec<(String, String)>> = vec![Vec::new(); n];
+    // A WHERE over a FULL JOIN filters above it, or reduces it.
+    if full && s.where_clause.is_some() {
+        return None;
+    }
     if let Some(w) = s.where_clause.as_deref() {
         let none_lookup = |_: &str| None;
         let none_views = |_: &str| None;
@@ -7508,5 +7522,6 @@ pub fn explain_verbose_chain(
         rels,
         output: outputs.iter().map(|(i, c)| pre(*i, c)).collect(),
         nullable,
+        full,
     })
 }
