@@ -149,15 +149,40 @@ def test_record_image_operators(query: str, dsn: str) -> None:
 
 
 # `record_image_cmp` compares every by-value or varlena datum, whatever its
-# type: a date is its int32 day number, a uuid its 16 bytes.
+# type: a date is its int32 day number, a uuid its 16 bytes. Fixed for
+# date, timestamp, timestamptz and uuid; other types stay RP-976.
 RECORD_IMAGE_OTHER_TYPES = {
     "select (select row('2024-01-02'::date)) *< (select row('2024-01-03'::date))": [(True,)],
     "select (select row('00000000-0000-0000-0000-000000000001'::uuid))"
     " *= (select row('00000000-0000-0000-0000-000000000001'::uuid))": [(True,)],
+    # A negative day count is a large unsigned word: before 2000 sorts after.
+    "select (select row('1999-12-31'::date)) *< (select row('2000-01-01'::date))": [(False,)],
+    "select (select row('2024-01-01 00:00'::timestamp))"
+    " *< (select row('2024-01-01 00:00:01'::timestamp))": [(True,)],
+    "select (select row('1990-01-01 00:00+00'::timestamptz))"
+    " *> (select row('2024-01-01 00:00+00'::timestamptz))": [(True,)],
+    "select (select row('ff000000-0000-0000-0000-000000000000'::uuid))"
+    " *> (select row('01000000-0000-0000-0000-000000000000'::uuid))": [(True,)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-976")
+@pytest.mark.parametrize("query", list(RECORD_IMAGE_OTHER_TYPES))
+def test_record_image_over_other_field_types(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == RECORD_IMAGE_OTHER_TYPES[query]
+
+
+# The field types whose datum image is not modelled yet: an interval is a
+# 16-byte fixed-length datum (so `1 day` and `24 hours` differ), a time its
+# int64 microseconds, a name its 64 NAMEDATALEN bytes (PostgreSQL 15.19).
+RECORD_IMAGE_REMAINING_TYPES = {
+    "select (select row('1 day'::interval)) *= (select row('24 hours'::interval))": [(False,)],
+    "select (select row('10:00'::time)) *< (select row('11:00'::time))": [(True,)],
+    "select (select row('a'::name)) *= (select row('a'::name))": [(True,)],
 }
 
 
 @pytest.mark.backlog("RP-976")
-@pytest.mark.parametrize("query", list(RECORD_IMAGE_OTHER_TYPES))
-def test_record_image_over_other_field_types(query: str, dsn: str) -> None:
-    assert answer(dsn, query) == RECORD_IMAGE_OTHER_TYPES[query]
+@pytest.mark.parametrize("query", list(RECORD_IMAGE_REMAINING_TYPES))
+def test_record_image_over_remaining_field_types(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == RECORD_IMAGE_REMAINING_TYPES[query]

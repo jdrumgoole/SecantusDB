@@ -12,6 +12,8 @@
 //! and records of different widths that agree on every common field are
 //! 42804. A field type whose image this module does not model is refused
 //! by name (0A000) rather than compared some other way.
+//! Modelled: the integers, oid, bool, the floats, numeric, date, the
+//! timestamps, uuid, text / varchar / bpchar and bytea.
 
 use std::cmp::Ordering;
 
@@ -95,6 +97,9 @@ pub(crate) fn compare(op: &str, a: &Bson, b: &Bson) -> Result<Bson> {
     }))
 }
 
+/// 2000-01-01 00:00:00 UTC in microseconds since the Unix epoch.
+const POSTGRES_EPOCH_MICROS: i64 = 946_684_800_000_000;
+
 /// A field type's internal name, its typmod dropped.
 fn canonical(t: &str) -> String {
     let base = t.split('(').next().unwrap_or(t).trim();
@@ -150,6 +155,26 @@ fn image(v: &Bson, ty: &str) -> Result<Image> {
         },
         "bytea" => match v {
             Bson::Binary(b) => Image::Bytes(b.bytes.clone()),
+            _ => return Err(refused()),
+        },
+        // `DateADTGetDatum`: the int32 day count from 2000-01-01, sign-extended.
+        "date" => match v {
+            Bson::String(t) => {
+                Image::ByValue(i64::from(crate::date_to_pg_days(t).ok_or_else(refused)?) as u64)
+            }
+            _ => return Err(refused()),
+        },
+        // `TimestampGetDatum`: int64 microseconds from 2000-01-01 UTC.
+        "timestamp"
+        | "timestamptz"
+        | "timestamp without time zone"
+        | "timestamp with time zone" => {
+            let micros = crate::instant_micros_pub(v).ok_or_else(refused)?;
+            Image::ByValue((micros - POSTGRES_EPOCH_MICROS) as u64)
+        }
+        // A fixed-length by-reference datum (attlen 16): `memcmp` of its bytes.
+        "uuid" => match v {
+            Bson::String(t) => Image::Bytes(crate::uuid_to_wire(t).ok_or_else(refused)?),
             _ => return Err(refused()),
         },
         "numeric" => {
