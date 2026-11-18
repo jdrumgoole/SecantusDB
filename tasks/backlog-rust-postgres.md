@@ -2228,6 +2228,49 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       path (`bpchareq` / `bcTruelen`), not a trimmed copy of the value;
       that is several PRs touching the stored row, so it needs its own
       planned sequence, not a bundle slot.
+      **Decided (Joe, 2026-11-18): build the faithful fix in steps,
+      including the on-disk change for `bpchar` keys -- a `bpchar` PRIMARY
+      KEY / UNIQUE / index is keyed by the value with trailing blanks
+      trimmed (`bpchareq` / `bcTruelen`), while the row keeps the value as
+      written.** Steps: (1) a `bpchar` PRIMARY KEY's `_id` trimmed, the
+      row's value as written, and every read / lookup path that builds
+      that key; (2) UNIQUE; (3) ON CONFLICT; (4) an indexed and a
+      pushed-down `=`; (5) the write keeping the blanks of every unsized
+      `bpchar` column. None has landed.
+      Probed 2026-11-18 on 15.19 and this server (step-1 session, no code
+      changed): `create table p2 (a bpchar primary key, b int)`, insert
+      `'k  '`, then `'k'` is 23505 on both, `on conflict (a) do update`
+      keeps the stored `'k  '` on 15.19, and `where a = 'k'`, `where a =
+      'k   '::bpchar`, `update ... where a='k'` and `delete ... where a='k '`
+      each find the row on both. The ONE difference: `octet_length(a)` is 3
+      on 15.19 and 1 here. A `char(3)` PRIMARY KEY already answers like
+      15.19 (stored trimmed, padded on output), so step 1 is about unsized
+      `bpchar` (and a `bpchar` member of a composite key) only.
+      Why step 1 is not one session: the PK column's stored field IS `_id`
+      (`field_for`), so a trimmed key and an as-written value need two
+      fields. Design for step 1: such a column gets `field_override` =
+      its name (holding the value as written) and `_id` (`_id.<name>` in a
+      composite key) becomes a derived key, `trim_end(' ')` of it, written
+      by the insert / update / COPY paths. Every site that equates "PK" with
+      "`_id`" then has to read the override: `encode_doc` (34 call sites),
+      `decode_doc` (53) and `row_id` (15) take no `TableDef`; lib.rs ~28847
+      and secantus-pgplan lib.rs ~15840 read `pk && field_override.is_some()`
+      as "composite key"; `heap.rs` and `btree.rs` (the page models) build
+      the key from `_id`; and the PK point lookup (`portal_stream.rs`
+      `primary_key_point`), ON CONFLICT, the FK checks and `insert_key_eq`
+      filter on `_id` with the probe value, which must be trimmed. A
+      pushed-down `=` on the column must go to `_id` with the trimmed
+      literal, since the stored field then holds blanks.
+      Stores written before step 1 (decided in that session): every
+      `bpchar` value this server has written since it gained `char(n)`
+      (#1654) went through `cast_value`'s trim, so an existing `_id` is
+      already the trimmed key and its value has already lost its blanks,
+      which no reader can restore. Such a table keeps its catalog entry
+      without the override and reads back as it always has; only a table
+      created after step 1 gets the two-field layout. An untrimmed `_id`
+      can only come from the MongoDB server writing the collection, which
+      is the MongoDB -> SQL hand-off CLAUDE.md says does not work, so the
+      PG server does not answer for it.
       Verify: tests/backlog/test_rp_found_rp672.py::test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks
       Backlog-ID: RP-693
 
