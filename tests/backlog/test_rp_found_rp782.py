@@ -158,6 +158,90 @@ def test_pg_get_viewdef_of_a_union_of_an_integer_and_an_oid(dsn: str) -> None:
     assert got == [(" SELECT 0 AS oid\nUNION ALL\n SELECT pg_database.oid\n   FROM pg_database;",)]
 
 
+# `information_schema` views print like PostgreSQL 15.19's (md5 of each
+# print mode): a cast to one of its domains is a `CoerceToDomain`, printed
+# qualified over a literal folded to the base type, and a relation of the
+# view's own schema is qualified. These were NULL (RP-798).
+INFORMATION_SCHEMA_VIEWDEF_MD5 = {
+    "applicable_roles": ("7b2228d7129e68f9ef8ac3bcf3e5a997", "7a916288707a88eeab8e34cec869ac26"),
+    "foreign_data_wrappers": (
+        "dc66fbbcc5b07bc3fd21a7d29d2e9ac4",
+        "e2a26391087a52ac3eea9e6366c9ad17",
+    ),
+    "information_schema_catalog_name": (
+        "98db718db18460a9db827a806a8f2b21",
+        "d7a78c3875c8ac1227eae2d030adc766",
+    ),
+    "schemata": ("582f055df269ae7d14b87133470c182e", "b755dd39bfb4cc0f52f667684a4bd191"),
+}
+
+
+@pytest.mark.backlog_fixed("RP-798")
+@pytest.mark.parametrize("view", list(INFORMATION_SCHEMA_VIEWDEF_MD5))
+def test_pg_get_viewdef_of_an_information_schema_view(view: str, dsn: str) -> None:
+    with _connect(dsn) as c:
+        got = _answer(
+            c,
+            f"select md5(pg_get_viewdef('information_schema.{view}'::regclass, false)),"
+            f" md5(pg_get_viewdef('information_schema.{view}'::regclass, true))",
+        )
+    assert got == [INFORMATION_SCHEMA_VIEWDEF_MD5[view]]
+
+
+# Measured on PostgreSQL 15.19.
+@pytest.mark.backlog_fixed("RP-798")
+def test_pg_get_viewdef_of_casts_to_information_schema_domains(dsn: str) -> None:
+    with _connect(dsn) as c:
+        c.execute(
+            "create or replace view v798d as select 'YES'::information_schema.yes_or_no a,"
+            " 5::information_schema.cardinal_number d,"
+            " null::information_schema.sql_identifier e,"
+            " relname::information_schema.character_data f from pg_class"
+        )
+        got = _answer(c, "select pg_get_viewdef('v798d'::regclass), pg_get_viewdef('v798d', true)")
+        c.execute("drop view v798d")
+    assert got == [
+        (
+            " SELECT ('YES'::character varying)::information_schema.yes_or_no AS a,\n"
+            "    (5)::information_schema.cardinal_number AS d,\n"
+            "    (NULL::name)::information_schema.sql_identifier AS e,\n"
+            "    (pg_class.relname)::information_schema.character_data AS f\n"
+            "   FROM pg_class;",
+            " SELECT 'YES'::character varying::information_schema.yes_or_no AS a,\n"
+            "    5::information_schema.cardinal_number AS d,\n"
+            "    NULL::name::information_schema.sql_identifier AS e,\n"
+            "    pg_class.relname::information_schema.character_data AS f\n"
+            "   FROM pg_class;",
+        )
+    ]
+
+
+# A set operation's later branches print their own column names inside a
+# subquery (no result descriptor), the view's names at the top. Measured on
+# PostgreSQL 15.19; the printer named every branch by the leftmost one.
+@pytest.mark.backlog_fixed("RP-798")
+def test_pg_get_viewdef_names_set_operation_branches(dsn: str) -> None:
+    with _connect(dsn) as c:
+        c.execute(
+            "create or replace view v798s as select m.a from (select relname as a from pg_class"
+            " union select relname as q from pg_class) m"
+        )
+        c.execute("create or replace view v798t as select 1 as a union select 2 as b")
+        got = _answer(c, "select pg_get_viewdef('v798s'::regclass), pg_get_viewdef('v798t')")
+        c.execute("drop view v798s, v798t")
+    assert got == [
+        (
+            " SELECT m.a\n"
+            "   FROM ( SELECT pg_class.relname AS a\n"
+            "           FROM pg_class\n"
+            "        UNION\n"
+            "         SELECT pg_class.relname AS q\n"
+            "           FROM pg_class) m;",
+            " SELECT 1 AS a\nUNION\n SELECT 2 AS a;",
+        )
+    ]
+
+
 # The system views the printer does not reproduce are still NULL: an
 # `information_schema` view (its domain casts), and `pg_catalog` views
 # such as `pg_stats_ext`.

@@ -549,6 +549,7 @@ impl PgHandler {
         let cat = secantus_pgplan::ruleutils::Catalog {
             lookup: &lookup,
             view_sql: &view_sql,
+            home_schema: None,
         };
         self.rule_docs()
             .iter()

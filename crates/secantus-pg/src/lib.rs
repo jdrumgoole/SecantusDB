@@ -2298,6 +2298,13 @@ impl PgHandler {
 }
 
 impl plpgsql_fn::Host for PlHost<'_> {
+    fn compiled_label(&self, create_sql: &str, label: &dyn Fn() -> String) -> String {
+        let mut labels = self.h.pl_labels.lock().unwrap_or_else(|e| e.into_inner());
+        labels
+            .entry(create_sql.to_string())
+            .or_insert_with(label)
+            .clone()
+    }
     fn push_frame(&self, frame: String) {
         self.h.push_pl_frame(frame);
     }
@@ -4725,6 +4732,9 @@ pub struct PgHandler {
     /// savepoint level of the transaction that made it while that is
     /// open (`myTempNamespaceSubID`), `Some(None)` once committed.
     temp_namespace: Mutex<Option<Option<usize>>>,
+    /// The CONTEXT label each PL/pgSQL function got at the session's first
+    /// compile of it, by its CREATE text (`plpgsql_compile`'s cache).
+    pl_labels: Mutex<HashMap<String, String>>,
     /// The open block declared a `WITH HOLD` cursor: another thing
     /// PostgreSQL refuses to PREPARE.
     holdable_declared: AtomicBool,
@@ -5379,6 +5389,7 @@ impl PgHandler {
             wire_dealloc: Mutex::new(Vec::new()),
             temp_tables: Mutex::new(Vec::new()),
             temp_namespace: Mutex::new(None),
+            pl_labels: Mutex::new(HashMap::new()),
             holdable_declared: AtomicBool::new(false),
             txn_gucs: Mutex::new(HashMap::new()),
             statement_gucs: Mutex::new(HashMap::new()),
@@ -17921,6 +17932,7 @@ impl PgHandler {
         let cat = secantus_pgplan::ruleutils::Catalog {
             lookup: &lookup,
             view_sql: &view_sql,
+            home_schema: None,
         };
         // Each one's `written_aliases`, where its document keeps them.
         let mut written: HashMap<String, Vec<bool>> = HashMap::new();
@@ -17962,7 +17974,7 @@ impl PgHandler {
             .collect()
     }
 
-    /// Every `pg_catalog` view's definition, as `view_defs_as` prints it
+    /// Every `pg_catalog` and `information_schema` view's definition, as `view_defs_as` prints it
     /// in `mode` (RP-798): `system_views.sql`'s queries printed by ruleutils over the
     /// system relations alone, once per process, as they are the same
     /// for every database. A view the printer does not reproduce is left
@@ -17971,6 +17983,9 @@ impl PgHandler {
         static DEFS: [OnceLock<Vec<(i64, String, String)>>; 3] =
             [OnceLock::new(), OnceLock::new(), OnceLock::new()];
         DEFS[usize::from(mode.min(2))].get_or_init(|| {
+            // The printer qualifies a relation of the view's own schema by
+            // the system relations, which may not be installed yet.
+            catalog_meta::install_system_relations();
             let queries = secantus_pgplan::nodetostring::system::system_view_queries();
             let lookup = |n: &str| Self::virtual_table(n);
             let view_sql = |n: &str| {
@@ -17979,10 +17994,6 @@ impl PgHandler {
                     .find(|(_, v, _)| v == n)
                     .map(|(_, _, q)| q.clone())
             };
-            let cat = secantus_pgplan::ruleutils::Catalog {
-                lookup: &lookup,
-                view_sql: &view_sql,
-            };
             catalog_meta::system_class_lines()
                 .filter_map(|line| {
                     let mut f = line.split('\t');
@@ -17990,10 +18001,11 @@ impl PgHandler {
                     let name = f.next()?;
                     let nsp = f.next()?;
                     (f.next()? == "v").then_some(())?;
-                    // The printer types an `information_schema` domain cast
-                    // as the bare domain, where ruleutils qualifies it and
-                    // casts a literal to the base type first (RP-798).
-                    (nsp == "pg_catalog").then_some(())?;
+                    let cat = secantus_pgplan::ruleutils::Catalog {
+                        lookup: &lookup,
+                        view_sql: &view_sql,
+                        home_schema: Some(nsp),
+                    };
                     let (_, _, sql) = queries.iter().find(|(s, v, _)| s == nsp && v == name)?;
                     let text = match mode {
                         1 => secantus_pgplan::ruleutils::viewdef_pretty(sql, None, &cat),

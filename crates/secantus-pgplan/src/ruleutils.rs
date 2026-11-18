@@ -170,6 +170,10 @@ pub struct Catalog<'a> {
     pub lookup: &'a dyn Fn(&str) -> Option<TableDef>,
     /// A view's definition SQL, by name.
     pub view_sql: &'a dyn Fn(&str) -> Option<String>,
+    /// The schema a system view was created in, when printing one:
+    /// initdb resolved its names with that schema first on the path, so a
+    /// relation found there is qualified (`generate_relation_name`).
+    pub home_schema: Option<&'a str>,
 }
 
 struct Printer<'a> {
@@ -1427,6 +1431,28 @@ impl<'a> Printer<'a> {
                 let label = crate::scalar::format_type_text_public(&target, Some(typmod));
                 let arg = tc.arg.as_deref()?;
                 let own = self.typ(arg)?;
+                // A cast to a domain is a `CoerceToDomain` over its input:
+                // a literal is first folded into a constant of the base
+                // type, and the domain prints schema-qualified, as
+                // `format_type` qualifies a type not on the search path.
+                if let Some((domain, base)) = information_schema_domain(&target) {
+                    let label = format!("information_schema.{domain}");
+                    if !self.pretty {
+                        self.buf.push('(');
+                    }
+                    if own == "unknown" {
+                        self.const_as(arg, base)?;
+                    } else if self.pretty {
+                        self.child(arg, "", Parent::Cast)?;
+                    } else {
+                        self.expr(arg)?;
+                    }
+                    if !self.pretty {
+                        self.buf.push(')');
+                    }
+                    self.buf.push_str(&format!("::{label}"));
+                    return Some(());
+                }
                 if own == "unknown" {
                     // The parser folds a literal into a constant of the
                     // target type.
@@ -1657,6 +1683,15 @@ impl<'a> Printer<'a> {
                     return self.row_compare(&op, &lr.args, &rr.args);
                 }
                 let (lt, rt) = (self.typ(l)?, self.typ(r)?);
+                // An operator over a domain resolves on its base type and
+                // coerces the operand (`(x)::text = 'YES'::text`), which
+                // this printer does not model: refuse rather than print it
+                // over the domain.
+                if information_schema_domain(&lt).is_some()
+                    || information_schema_domain(&rt).is_some()
+                {
+                    return None;
+                }
                 // Array containment / overlap: same element types, no cast.
                 if matches!(op.as_str(), "@>" | "<@" | "&&") && is_array(&lt) && is_array(&rt) {
                     if lt != rt {
@@ -2721,6 +2756,25 @@ fn flatten_bool<'n>(
 }
 
 /// A declared type without its modifier, as the analyser compares types.
+/// The `information_schema` domains `information_schema.sql` creates, as
+/// `(name, base type)`. An unqualified name means one only while no user
+/// type of that name would be found first.
+fn information_schema_domain(t: &str) -> Option<(&'static str, &'static str)> {
+    let bare = match t.strip_prefix("information_schema.") {
+        Some(b) => b,
+        None if crate::user_type_exists(t) => return None,
+        None => t,
+    };
+    Some(match bare {
+        "cardinal_number" => ("cardinal_number", "int4"),
+        "character_data" => ("character_data", "varchar"),
+        "sql_identifier" => ("sql_identifier", "name"),
+        "time_stamp" => ("time_stamp", "timestamptz"),
+        "yes_or_no" => ("yes_or_no", "varchar"),
+        _ => return None,
+    })
+}
+
 pub(crate) fn base_type(t: &str) -> String {
     let t = t.trim();
     let base = t.split('(').next().unwrap_or(t).trim();
@@ -3354,11 +3408,16 @@ impl Printer<'_> {
             printed?;
         }
         if s.op != SetOperation::SetopNone as i32 {
-            let outputs = match colnames {
+            // The view's own query names every branch by the view's
+            // columns; with no result descriptor (anything else: a FROM subquery, a WITH body, a sublink),
+            // `get_target_list` names each branch's columns by its own
+            // `resname`, not the leftmost branch's.
+            let outputs: Vec<String> = match colnames {
                 Some(c) => c.to_vec(),
                 None => self.query_columns(n)?.into_iter().map(|(n, _)| n).collect(),
             };
-            self.setop(s, &outputs)?;
+            let top = self.depth == 0;
+            self.setop(s, if top { Some(&outputs[..]) } else { colnames })?;
             // A set operation's ORDER BY names its output columns, and
             // ruleutils prints them by NUMBER (`force_colno`).
             if !s.sort_clause.is_empty() {
@@ -3486,7 +3545,11 @@ impl Printer<'_> {
     }
 
     /// `get_setop_query`.
-    fn setop(&mut self, s: &pg_query::protobuf::SelectStmt, colnames: &[String]) -> Option<()> {
+    fn setop(
+        &mut self,
+        s: &pg_query::protobuf::SelectStmt,
+        colnames: Option<&[String]>,
+    ) -> Option<()> {
         let op = SetOperation::try_from(s.op).ok()?;
         if op == SetOperation::SetopNone {
             let leaf_paren = s.with_clause.is_some()
@@ -3512,7 +3575,7 @@ impl Printer<'_> {
                 &Node {
                     node: Some(N::SelectStmt(Box::new(s.clone()))),
                 },
-                Some(colnames),
+                colnames,
             )?;
             self.buf.push_str(&inner.buf);
             if leaf_paren {
@@ -3931,7 +3994,14 @@ impl Printer<'_> {
                     // path (pg_dump sets it empty); `pg_catalog`'s are
                     // always found.
                     None => {
-                        if matches!(rv.schemaname.as_str(), "" | "public")
+                        if let Some(home) = self.cat.home_schema.filter(|h| {
+                            *h != "pg_catalog"
+                                && !crate::is_pg_catalog_relation(&rv.relname)
+                                && crate::system_relation_in(h, &rv.relname)
+                        }) {
+                            self.buf.push_str(&q(home));
+                            self.buf.push('.');
+                        } else if matches!(rv.schemaname.as_str(), "" | "public")
                             && !crate::is_pg_catalog_relation(&rv.relname)
                             && !crate::schemas::search_path().iter().any(|s| s == "public")
                         {
@@ -5729,6 +5799,7 @@ fn expr_node_printed_with(
     let cat = Catalog {
         lookup: &none_lookup,
         view_sql: &none_views,
+        home_schema: None,
     };
     let mut p = Printer::new(&cat, 0);
     p.unqualified = unqualified;
@@ -5764,6 +5835,7 @@ pub fn explain_sort_keys(
     let cat = Catalog {
         lookup: &none_lookup,
         view_sql: &none_views,
+        home_schema: None,
     };
     let targets: Vec<&Node> = s
         .target_list
@@ -5901,6 +5973,7 @@ pub fn explain_one_time_qual(n: &Node) -> Option<String> {
     let cat = Catalog {
         lookup: &none_lookup,
         view_sql: &none_views,
+        home_schema: None,
     };
     let mut p = Printer::new(&cat, 0);
     p.unqualified = true;
@@ -5946,6 +6019,7 @@ pub fn expr_def(sql: &str, def: &TableDef) -> Option<String> {
     let cat = Catalog {
         lookup: &none_lookup,
         view_sql: &none_views,
+        home_schema: None,
     };
     let mut p = Printer::new(&cat, 0);
     p.unqualified = true;
@@ -5993,6 +6067,7 @@ pub fn statistics_expr_def_pretty(sql: &str, def: &TableDef) -> Option<String> {
     let cat = Catalog {
         lookup: &none_lookup,
         view_sql: &none_views,
+        home_schema: None,
     };
     let mut p = Printer::new(&cat, 0);
     p.unqualified = true;
@@ -6069,6 +6144,7 @@ mod tests {
         let cat = Catalog {
             lookup: &cat_lookup,
             view_sql: &none,
+            home_schema: None,
         };
         viewdef(sql, written, &cat)
     }
@@ -6394,6 +6470,7 @@ mod join_where_tests {
         let cat = Catalog {
             lookup: &lookup,
             view_sql: &none,
+            home_schema: None,
         };
         join_where(s, &cat)
             .unwrap()
@@ -6479,6 +6556,7 @@ pub fn explain_verbose_scan(
     let cat = Catalog {
         lookup: &none_lookup,
         view_sql: &none_views,
+        home_schema: None,
     };
     let printer = |unqualified: bool| {
         let mut p = Printer::new(&cat, 0);
@@ -6775,6 +6853,7 @@ pub fn explain_verbose_join(
         let cat = Catalog {
             lookup: &none_lookup,
             view_sql: &none_views,
+            home_schema: None,
         };
         let print = |part: &Node, i: usize, unqualified: bool| -> Option<String> {
             let (refname, def, _) = &sides[i];
@@ -6937,6 +7016,7 @@ mod out_parameter_function_tests {
         let cat = Catalog {
             lookup: &none_t,
             view_sql: &none_v,
+            home_schema: None,
         };
         let got = viewdef(
             "SELECT * FROM pg_show_all_settings() AS A(n, s)",

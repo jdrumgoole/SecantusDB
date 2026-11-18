@@ -1227,6 +1227,8 @@ one beside it.
       runs `only_on("darwin")`, and verify reports it ELSEWHERE on CI. Not
       separated: macOS from arm64 (no arm64 Linux or x86_64 macOS runner
       measured). Close it when it passes every run on darwin.)
+      Its gap test sits at the budget's edge: on 2026-11-18 one build
+      passed it 2 of 3 runs at load ~10, so a FIXED? needs repeated runs.
       Backlog-ID: RP-911
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth
 
@@ -2571,26 +2573,29 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 
 - [ ] **`pg_get_viewdef` of most system views is NULL.** PostgreSQL
       15.19 deparses every `pg_catalog` and `information_schema` view's
-      rule. Here `system_view_defs` prints `system_views.sql`'s queries
-      through `ruleutils`, which reproduces 69 of the 75 `pg_catalog`
-      views exactly (`pg_tables`, `pg_roles`, `pg_stats`, `pg_settings`,
-      `pg_stat_activity`, `pg_stat_database`, every `pg_stat_progress_*`
-      view, ...; none printed wrong, measured 2026-11-18 in both print
-      modes) and leaves the rest NULL rather than print them as written.
+      rule. Here `system_view_defs` prints `system_views.sql`'s and
+      `information_schema.sql`'s queries through `ruleutils`, which
+      reproduces 69 of the 75 `pg_catalog` views and 23 of the 65
+      `information_schema` views exactly (none printed wrong, measured
+      2026-11-18 in both print modes by md5 against a fresh 15.19 cluster)
+      and leaves the rest NULL rather than print them as written.
       Remaining: the 6 other `pg_catalog` views (`pg_policies`,
       `pg_publication_tables`, `pg_seclabels`,
       `pg_stat_replication_slots`, `pg_stats_ext`, `pg_stats_ext_exprs`),
       which the printer refuses (`pg_stat_replication_slots`' query cannot
       even be a user view here: `LATERAL
       pg_stat_get_replication_slot(slot_name) s` gives `s` no columns,
-      42703 `column s.slot_name does not exist`);
-      and every `information_schema` view, left out because the printer
-      casts to the bare domain where ruleutils qualifies it and casts a
-      literal to the base type first
-      (`('c'::character varying)::information_schema.character_data`,
-      `(x)::information_schema.sql_identifier`). A user view over
-      `generate_series(1, c.relnatts)` is still refused: ruleutils casts
-      the int2 argument to `integer`, which the printer does not add.
+      42703 `column s.slot_name does not exist`); and 42
+      `information_schema` views (`columns`, `tables`, `domains`,
+      `views`, `routines`' siblings, the `role_*` / `*_usage` /
+      `*_privileges` views, ...). Most of those compare a domain-typed
+      column with an operator (`administrable_role_authorizations`:
+      `WHERE ((applicable_roles.is_grantable)::text = 'YES'::text)`, the
+      operator resolved on the base type with the column coerced), which
+      the printer refuses: it types the operand as the domain. A user
+      view over `generate_series(1, c.relnatts)` is still refused:
+      ruleutils casts the int2 argument to `integer`, which the printer
+      does not add.
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_the_remaining_system_views
       Backlog-ID: RP-798
 - [ ] **`pg_get_viewdef` types a `name IN (text, unknown)` list as
@@ -2672,16 +2677,20 @@ test is in `tests/backlog/test_rp_found_rp833.py`.
 Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
 test is in `tests/backlog/test_rp_found_rp833.py`.
 
-- [ ] **A function's CONTEXT label follows the search path of each call,
-      not of its first.** `plpgsql_compile` labels a function once, when the
-      session first compiles it, and keeps that label while the compiled
-      function is cached: on PostgreSQL 15.19, `s.f()` called first with
-      `s` off the path is `PL/pgSQL function s.f()`, and still is after
-      `set search_path = s`. Here `function_label` runs on every call, so
-      the second is `f()`. Faithful: label at the session's first compile,
-      kept until the function is replaced or dropped.
-      Verify: tests/backlog/test_rp_found_rp833.py::test_a_function_label_is_fixed_at_its_first_compile
-      Backlog-ID: RP-1034
+- [ ] **A function replaced by an identical CREATE keeps the label of its
+      old compile.** PostgreSQL revalidates a cached compiled function by
+      its `pg_proc` row's `xmin` and `ctid` (`plpgsql_compile`), so any
+      rewrite of the row -- an identical `CREATE OR REPLACE`, a DROP and
+      re-CREATE, an `ALTER FUNCTION ... OWNER TO`, from any session --
+      recompiles it and labels it afresh: on PostgreSQL 15.19 `s.f()` called
+      first off the path is `PL/pgSQL function s.f()`, and after another
+      session's identical `CREATE OR REPLACE` and `set search_path = s` it
+      is `f()`. `secantusd-pg` keys the session's label cache by the CREATE
+      text (RP-1034) and keeps `s.f()`. Faithful: stamp each function row
+      with the writing transaction's xid (`xids::writer`) and key the cache
+      by the function's oid and that stamp.
+      Verify: tests/backlog/test_rp_found_rp833.py::test_an_identical_replace_relabels_the_function
+      Backlog-ID: RP-1051
 
 ## Found while working RP-689 (2026-11-10)
 
