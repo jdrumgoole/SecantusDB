@@ -1897,7 +1897,7 @@ a regression test.
       `explain_join_patterns`). Still zeros: a call of a function whose
       overloads differ in `procost`; a regex whose prefix walk is not
       modelled (an anchor a character may precede, or in a branch or an
-      optional group; embedded options). Since 2026-11-18 a `^` no
+      optional group of one branch; embedded options). Since 2026-11-18 a `^` no
       character precedes, inside a group or not, anchors the match as
       `regc_nfa.c`'s optimisation pulls it into the `pre` state
       (`strip_bos`: `^(?:^w0)1` and `(?:^w0)1` are both prefix `w01`). A back reference is walked as a copy of
@@ -1917,10 +1917,13 @@ a regression test.
       reads; since 2026-11-17 a LEFT join whose WHERE compares only
       preserved-side expressions (`preserved_exprs`), and an inner ON
       join whose WHERE holds inequalities over both tables, its Join
-      Filter (`where_join_filters`). A regex with an anchor in a branch
-      (`select * from w where c ~ '^(?:w|^x)0'`) is `Seq Scan on w
-      (cost=0.00..18.50 rows=1000 width=10)` there and zeros here; one
-      after a character, which cannot match (`^w(?:^0)1`), is `rows=1`. Measured
+      Filter (`where_join_filters`). Since 2026-11-18 a `^` in a branch
+      of alternatives nothing precedes leaves no prefix, as its second BOS
+      arc out of `pre` does in `findprefix` (`^(?:w|^x)0` is `rows=1000`,
+      `^(?:^ab|^ab)` and `^(?:w|^x)?0` no prefix). A `^` after a
+      character, which cannot match (`^w(?:^0)1`), is `rows=1` there and
+      zeros here; one in a later branch is pruned as dead
+      (`^x(?:^w|y)0` is prefix `xy0`). Measured
       on the 15.19 reference on port 5415 (found while working RP-404 and
       RP-354). The repeated group's prefix is not a walk of the regex's
       text: `pg_regprefix` reads the NFA after `regc_nfa.c`'s `optimize`
@@ -1932,7 +1935,7 @@ a regression test.
       `repeat`'s arcs gives (`aba`). The faithful fix ports `regcomp.c` /
       `regc_nfa.c`'s NFA build and optimisation and runs `findprefix` on
       it (2026-11-17, sized while working RP-841).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with an anchor in a branch]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with an anchor after a character]
       Backlog-ID: RP-423
 - [ ] **A semi join cheaper unique-ified keeps the semi join's shape.**
       Since RP-411's first slice (2026-11-16) a WHERE that is one

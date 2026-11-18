@@ -944,8 +944,13 @@ enum ReAtom {
 /// copy follows a character, so its paths cannot match (`^(?:^w0)+1` is
 /// `w01`). `None` for a `^` a character may precede (an unsatisfiable or
 /// branch-local anchor, not modelled), or one inside an optional, repeated
-/// or alternating group.
-fn strip_bos(atoms: &mut Vec<QuantifiedAtom>, at_start: &mut bool) -> Option<bool> {
+/// or alternating group. `no_prefix` is set where alternatives nothing
+/// precedes hold a `^`.
+fn strip_bos(
+    atoms: &mut Vec<QuantifiedAtom>,
+    at_start: &mut bool,
+    no_prefix: &mut bool,
+) -> Option<bool> {
     let mut saw = false;
     let mut out = Vec::with_capacity(atoms.len());
     for (atom, min, mut max) in std::mem::take(atoms) {
@@ -960,11 +965,26 @@ fn strip_bos(atoms: &mut Vec<QuantifiedAtom>, at_start: &mut bool) -> Option<boo
             ReAtom::Group(mut alts, capturing) if max != Some(0) => {
                 let mut inner_start = *at_start;
                 let found = match alts.as_mut_slice() {
-                    [only] if min >= 1 => strip_bos(only, &mut inner_start)?,
+                    [only] if min >= 1 => strip_bos(only, &mut inner_start, no_prefix)?,
+                    // Alternatives nothing precedes, one with a `^`: its
+                    // BOS arc is a second one out of `pre`, and
+                    // `findprefix` finds no prefix (`^(?:^ab|^ab)`,
+                    // `^(?:w|^x)?0` on 15.19).
+                    [_, _, ..] if *at_start => {
+                        let mut any = false;
+                        for alt in alts.iter_mut() {
+                            any |= strip_bos(alt, &mut true, no_prefix)?;
+                        }
+                        if any {
+                            *no_prefix = true;
+                        }
+                        inner_start = false;
+                        false
+                    }
                     _ => {
                         let mut probe = alts.clone();
                         for alt in &mut probe {
-                            strip_bos(alt, &mut false)?;
+                            strip_bos(alt, &mut false, no_prefix)?;
                         }
                         inner_start = false;
                         false
@@ -1044,7 +1064,8 @@ fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String,
         return Some((String::new(), PrefixStatus::None));
     };
     // The `pre` state's rainbow where no `^` anchors the match.
-    if !strip_bos(atoms, &mut true)? {
+    let mut no_prefix = false;
+    if !strip_bos(atoms, &mut true, &mut no_prefix)? || no_prefix {
         return Some((String::new(), PrefixStatus::None));
     }
     let atoms = &*atoms;
@@ -1854,6 +1875,11 @@ mod tests {
             ("^12$", true, Some(("12", Exact))),
             (r"^1\$", false, Some(("1$", Partial))),
             ("^$", false, Some(("", Exact))),
+            ("^(?:ab|ac)", false, Some(("a", Partial))),
+            ("^(?:w|^x)0", false, Some(("", NoMatch))),
+            ("(?:^w|^x)0", false, Some(("", NoMatch))),
+            ("^(?:^ab|^ab)", false, Some(("", NoMatch))),
+            ("^(?:w|^x)?0", false, Some(("", NoMatch))),
             ("^", false, Some(("", NoMatch))),
             ("abc", false, Some(("", NoMatch))),
             ("^ab|^ac", false, Some(("", NoMatch))),
@@ -1906,11 +1932,11 @@ mod tests {
             ("(^a)", false, Some(("a", Partial))),
             // Not modelled: a `^` after a character (the regex cannot
             // match), in an optional group or a branch; a back reference
-            // to an unclosed group.
+            // to an unclosed group. (A `^` in a branch nothing precedes
+            // is modelled, above.)
             ("^w(?:^0)1", false, None),
             ("^(?:^w)(?:^0)1", false, None),
             ("^(?:^w0)?1", false, None),
-            ("^(?:w|^x)0", false, None),
             ("^a\\1", false, None),
             // A back reference is a copy of the group it names, as
             // PostgreSQL 15.19's index conditions show.
