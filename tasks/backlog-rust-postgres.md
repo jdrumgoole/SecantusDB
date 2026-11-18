@@ -2568,14 +2568,18 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 - [ ] **`pg_get_viewdef` of most system views is NULL.** PostgreSQL
       15.19 deparses every `pg_catalog` and `information_schema` view's
       rule. Here `system_view_defs` prints `system_views.sql`'s queries
-      through `ruleutils`, which reproduces 68 of the 75 `pg_catalog`
+      through `ruleutils`, which reproduces 69 of the 75 `pg_catalog`
       views exactly (`pg_tables`, `pg_roles`, `pg_stats`, `pg_settings`,
-      `pg_stat_activity`, every `pg_stat_progress_*` view, ...; none
-      printed wrong, measured 2026-11-18 in both print modes) and leaves
-      the rest NULL rather than print them as written. Remaining: the 7
-      other `pg_catalog` views (`pg_policies`, `pg_publication_tables`,
-      `pg_seclabels`, `pg_stat_database`, `pg_stat_replication_slots`,
-      `pg_stats_ext`, `pg_stats_ext_exprs`), which the printer refuses;
+      `pg_stat_activity`, `pg_stat_database`, every `pg_stat_progress_*`
+      view, ...; none printed wrong, measured 2026-11-18 in both print
+      modes) and leaves the rest NULL rather than print them as written.
+      Remaining: the 6 other `pg_catalog` views (`pg_policies`,
+      `pg_publication_tables`, `pg_seclabels`,
+      `pg_stat_replication_slots`, `pg_stats_ext`, `pg_stats_ext_exprs`),
+      which the printer refuses (`pg_stat_replication_slots`' query cannot
+      even be a user view here: `LATERAL
+      pg_stat_get_replication_slot(slot_name) s` gives `s` no columns,
+      42703 `column s.slot_name does not exist`);
       and every `information_schema` view, left out because the printer
       casts to the bare domain where ruleutils qualifies it and casts a
       literal to the base type first
@@ -2594,6 +2598,29 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
       text (`(pg_class.relname)::text = ANY (ARRAY['g'::text, 'h'::text])`).
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_a_name_in_list_with_a_text_element
       Backlog-ID: RP-1045
+
+## Found while working RP-798 (2026-11-18)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster; the
+views read only `pg_class`.
+
+- [ ] **`pg_get_viewdef` names a CASE column `case` where ruleutils takes
+      its ELSE column's name.** `create view v as select case when c.oid >
+      5 then 0 else c.relnatts end from pg_class c` prints `END AS
+      relnatts` on PostgreSQL 15.19 (`FigureColnameInternal` reads a
+      `CaseExpr`'s `defresult` at strength 1); here `END AS "case"`.
+      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_names_a_case_column_by_its_else_column
+      Backlog-ID: RP-1046
+- [ ] **`pg_get_viewdef` prints an IN list holding a column as `= ANY
+      (ARRAY[...])`.** `create view v as select c.relnatts in (1,
+      c.relam::int) from pg_class c` prints `((c.relnatts = 1) OR
+      (c.relnatts = (c.relam)::integer))` on PostgreSQL 15.19:
+      `transformAExprIn` builds a ScalarArrayOpExpr only of the list's
+      Var-free elements, and only when there are two or more, and ORs an
+      `=` for each of the rest. Here `(c.relnatts = ANY (ARRAY[1,
+      (c.relam)::integer]))`.
+      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_an_in_list_holding_a_column
+      Backlog-ID: RP-1047
 
 ## Found while working RP-816 (2026-11-11)
 

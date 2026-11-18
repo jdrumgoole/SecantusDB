@@ -129,6 +129,35 @@ def test_pg_get_viewdef_of_a_system_view(dsn: str) -> None:
     ]
 
 
+# `pg_stat_database` reads `SELECT 0 AS oid ... UNION ALL SELECT oid ...`:
+# `select_common_type` takes oid for an integer and an oid, as an integer
+# coerces implicitly to oid and oid only by assignment to an integer. The
+# printer refused the meet, so the view was NULL (RP-798). The md5s are of
+# PostgreSQL 15.19's text in each print mode.
+@pytest.mark.backlog_fixed("RP-798")
+def test_pg_get_viewdef_of_pg_stat_database(dsn: str) -> None:
+    with _connect(dsn) as c:
+        got = _answer(
+            c,
+            "select md5(pg_get_viewdef('pg_stat_database'::regclass, false)),"
+            " md5(pg_get_viewdef('pg_stat_database'::regclass, true))",
+        )
+    assert got == [("e53a1cc7dce4f6f7beda4a5f96ad5ee5", "ae875e0fc37768b28af9bd4745f95520")]
+
+
+# An integer and an oid meet at oid in a set operation, the constant left
+# as it is written.
+@pytest.mark.backlog_fixed("RP-798")
+def test_pg_get_viewdef_of_a_union_of_an_integer_and_an_oid(dsn: str) -> None:
+    with _connect(dsn) as c:
+        c.execute(
+            "create or replace view v798u as select 0 as oid union all select oid from pg_database"
+        )
+        got = _answer(c, "select pg_get_viewdef('v798u'::regclass)")
+        c.execute("drop view v798u")
+    assert got == [(" SELECT 0 AS oid\nUNION ALL\n SELECT pg_database.oid\n   FROM pg_database;",)]
+
+
 # The system views the printer does not reproduce are still NULL: an
 # `information_schema` view (its domain casts), and `pg_catalog` views
 # such as `pg_stats_ext`.
@@ -348,5 +377,43 @@ def test_pg_get_viewdef_of_a_name_in_list_with_a_text_element(dsn: str) -> None:
             " SELECT pg_class.relname\n"
             "   FROM pg_class\n"
             "  WHERE (pg_class.relname = ANY (ARRAY[('g'::text)::name, 'h'::name]));",
+        )
+    ]
+
+
+def _viewdef_of(dsn: str, name: str, query: str) -> object:
+    with _connect(dsn) as c:
+        c.execute(f"create or replace view {name} as {query}")
+        got = _answer(c, f"select pg_get_viewdef('{name}'::regclass)")
+        c.execute(f"drop view {name}")
+    return got
+
+
+# `FigureColnameInternal` names a CASE by its ELSE result (RP-1046).
+@pytest.mark.backlog("RP-1046")
+def test_pg_get_viewdef_names_a_case_column_by_its_else_column(dsn: str) -> None:
+    got = _viewdef_of(
+        dsn, "v1046", "select case when c.oid > 5 then 0 else c.relnatts end from pg_class c"
+    )
+    assert got == [
+        (
+            " SELECT\n"
+            "        CASE\n"
+            "            WHEN (c.oid > (5)::oid) THEN 0\n"
+            "            ELSE (c.relnatts)::integer\n"
+            "        END AS relnatts\n"
+            "   FROM pg_class c;",
+        )
+    ]
+
+
+# `transformAExprIn` ORs an `=` for each element holding a Var (RP-1047).
+@pytest.mark.backlog("RP-1047")
+def test_pg_get_viewdef_of_an_in_list_holding_a_column(dsn: str) -> None:
+    got = _viewdef_of(dsn, "v1047", "select c.relnatts in (1, c.relam::int) from pg_class c")
+    assert got == [
+        (
+            ' SELECT ((c.relnatts = 1) OR (c.relnatts = (c.relam)::integer)) AS "?column?"\n'
+            "   FROM pg_class c;",
         )
     ]
