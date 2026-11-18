@@ -5,8 +5,8 @@ literal written to a composite or domain-array column, or coerced as an
 open for `INSERT ... SELECT`), RP-946
 (a NULL element of a NOT NULL domain's array literal was accepted; fixed),
 RP-947 (a
-composite column compared with an untyped literal reads the literal as the
-column's type) and RP-948 (under `PREPARE`, a recorded error location is
+composite column compared with an untyped literal read the literal as the
+column's type; fixed) and RP-948 (under `PREPARE`, a recorded error location is
 counted in the inner statement).
 
 An answer is the rows, the command tag for a statement that returns none,
@@ -112,12 +112,22 @@ def test_not_null_domain_array_element_written(dsn: str) -> None:
 
 # No `ctp = ctp` operator: `=` is `record = record`, and the literal an
 # anonymous record, which has no input.
-@pytest.mark.backlog("RP-947")
-def test_composite_column_equals_untyped_literal(dsn: str) -> None:
-    assert answer(dsn, "select * from tct where c = '(0,x)'") == (
+COMPOSITE_EQUALS_LITERAL = {
+    "select * from tct where c = '(0,x)'": "29",
+    "select * from tct where '(0,x)' = c": "25",
+    "select * from tct where c in ('(0,x)')": "31",
+    "select * from tct where c is distinct from '(0,x)'": "44",
+}
+
+
+@pytest.mark.backlog_fixed("RP-947")
+@pytest.mark.parametrize("query", list(COMPOSITE_EQUALS_LITERAL))
+def test_composite_column_equals_untyped_literal(query: str, dsn: str) -> None:
+    """The literal was read as `ctp`, so a field's domain error came first."""
+    assert answer(dsn, query) == (
         "0A000",
         "input of anonymous composite types is not implemented",
-        "29",
+        COMPOSITE_EQUALS_LITERAL[query],
     )
 
 

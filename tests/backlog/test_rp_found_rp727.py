@@ -99,17 +99,40 @@ def test_row_comparison_with_a_pattern_operator(query: str, dsn: str) -> None:
 
 
 # Each pair's operator is looked up before anything is collated: `integer
-# ~<~ integer` does not exist. Here `pattern_ops` collates the fields first.
+# ~<~ integer` does not exist. `pattern_ops` collated the fields first.
 PATTERN_OVER_NON_STRINGS = {
     "select (1, 2) ~<~ (1, 3)": (
         "42883",
         "operator does not exist: integer ~<~ integer",
         "15",
     ),
+    "select ('a', 2) ~<~ ('a', 3)": (
+        "42883",
+        "operator does not exist: integer ~<~ integer",
+        "17",
+    ),
+    "select (1.5, 'x') ~>=~ (1.5, 'y')": (
+        "42883",
+        "operator does not exist: numeric ~>=~ numeric",
+        "19",
+    ),
+    "select ('a'::char(2), 'b') ~<~ ('a', 'c')": ([(True,)], ["?column?"]),
 }
 
 
-@pytest.mark.backlog("RP-973")
+@pytest.mark.backlog_fixed("RP-973")
 @pytest.mark.parametrize("query", list(PATTERN_OVER_NON_STRINGS))
 def test_row_pattern_operator_over_non_strings(query: str, dsn: str) -> None:
     assert answer(dsn, query) == PATTERN_OVER_NON_STRINGS[query]
+
+
+@pytest.mark.backlog("RP-973")
+def test_row_pattern_operator_over_non_string_columns(dsn: str) -> None:
+    """A pair of integer COLUMNS is 42883 too; here it is compared."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("create table if not exists t973 (a int, b int)")
+    assert answer(dsn, "select (a, b) ~<~ (1, 2) from t973") == (
+        "42883",
+        "operator does not exist: integer ~<~ integer",
+        "15",
+    )

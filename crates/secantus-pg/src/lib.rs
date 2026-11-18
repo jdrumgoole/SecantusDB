@@ -46255,7 +46255,18 @@ impl PgHandler {
                             && sel.order.iter().all(|k| {
                                 k.expr.is_none() && sel.columns.iter().any(|(_, f)| *f == k.field)
                             });
+                        // A Limit straight over the scan
+                        // (`adjust_limit_rows_costs`).
+                        let limited = tree.name == "Limit"
+                            && tree.children.len() == 1
+                            && tree.children[0].children.is_empty()
+                            && tree.children[0].name.starts_with("Seq Scan on ")
+                            && (sel.limit.is_some() || sel.offset != 0)
+                            && sel.order.is_empty()
+                            && matches!(sel.distinct, secantus_pgplan::Distinct::None)
+                            && !sel.with_ties;
                         if (sorted
+                            || limited
                             || tree.children.is_empty() && tree.name.starts_with("Seq Scan on "))
                             && sel.sub.is_none()
                             && sel.series.is_none()
@@ -46284,6 +46295,15 @@ impl PgHandler {
                                     scan_estimate::sort_estimate(
                                         e,
                                         self.kb_setting("work_mem", 4096),
+                                    )
+                                })
+                            } else if limited {
+                                tree.children[0].estimate = scan;
+                                scan.map(|e| {
+                                    scan_estimate::limit_estimate(
+                                        e,
+                                        sel.offset,
+                                        sel.limit.map_or(0, |n| n.max(1)),
                                     )
                                 })
                             } else {

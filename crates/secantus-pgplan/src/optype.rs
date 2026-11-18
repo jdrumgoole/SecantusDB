@@ -1339,7 +1339,12 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             let Some(pg_query::protobuf::a_const::Val::Sval(label)) = c.val.as_ref() else {
                 continue;
             };
-            if let Some(ty) = operand_type(col, scope).filter(|t| crate::user_enum(t).is_some()) {
+            // A composite is among the user types too (`user_enum` answers
+            // for it): its literal is an anonymous `record`, refused below
+            // by `row_against_non_row`, never read as the type (RP-947).
+            if let Some(ty) = operand_type(col, scope)
+                .filter(|t| crate::user_enum(t).is_some() && user_composite(t).is_none())
+            {
                 crate::cast_value(Bson::String(label.sval.clone()), &ty)?;
             }
         }
@@ -1367,7 +1372,9 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             e.lexpr.as_deref(),
             e.rexpr.as_deref().and_then(|n| n.node.as_ref()),
         ) {
-            if let Some(ty) = operand_type(col, scope).filter(|t| crate::user_enum(t).is_some()) {
+            if let Some(ty) = operand_type(col, scope)
+                .filter(|t| crate::user_enum(t).is_some() && user_composite(t).is_none())
+            {
                 for (i, item) in items.items.iter().enumerate() {
                     // A cancellation point every so often, as in the typing
                     // loop below (RP-748).

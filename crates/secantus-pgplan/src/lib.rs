@@ -5791,7 +5791,7 @@ fn rewrite_statement(node: &mut N) -> Result<()> {
     cancel::check()?;
     func_cast::rewrite(node);
     cancel::check()?;
-    pattern_ops(node);
+    pattern_ops(node)?;
     cancel::check()?;
     unknown_args::check_ambiguous(node)?;
     cancel::check()?;
@@ -5815,7 +5815,7 @@ fn rewrite_statement(node: &mut N) -> Result<()> {
 /// what they are planned as (a `bpchar`'s trailing blanks still not
 /// counting). A user operator of one of those names is left
 /// alone.
-fn pattern_ops(node: &mut N) {
+fn pattern_ops(node: &mut N) -> Result<()> {
     let plain = |op: &str| match op {
         "~<~" => Some("<"),
         "~<=~" => Some("<="),
@@ -5834,7 +5834,7 @@ fn pattern_ops(node: &mut N) {
             if op_of(e).as_deref().and_then(plain).is_some())
     });
     if !wanted {
-        return;
+        return Ok(());
     }
     let collate = |arg: Option<Box<pg_query::protobuf::Node>>| {
         arg.map(|a| {
@@ -5873,15 +5873,38 @@ fn pattern_ops(node: &mut N) {
                             Some(pg_query::protobuf::a_const::Val::Sval(_))))
                 };
                 e.name = vec![string_node(to)];
+                // Between two rows the operator is each pair's
+                // (`make_row_comparison_op`, a RowCompareExpr of `~<~` as
+                // of `<`): the fields are collated, not the row, which
+                // has no collation (RP-851). A pair whose types the
+                // operator does not take is its own 42883, at the operator
+                // (`(1, 2) ~<~ (1, 3)` on 15.19, RP-973): checked for
+                // fields typed on their face (a constant, a cast).
+                if let (Some(N::RowExpr(l)), Some(N::RowExpr(r))) = (
+                    e.lexpr.as_deref().and_then(|n| n.node.as_ref()),
+                    e.rexpr.as_deref().and_then(|n| n.node.as_ref()),
+                ) {
+                    if let Some((lt, rt)) = l
+                        .args
+                        .iter()
+                        .zip(&r.args)
+                        .find_map(|(a, b)| pattern_pair_refused(a, b))
+                    {
+                        if e.location >= 0 {
+                            set_error_location(e.location);
+                        }
+                        return Err(Error::UndefinedFunction(format!(
+                            "operator does not exist: {} {op} {}",
+                            display_type(&lt),
+                            display_type(&rt)
+                        )));
+                    }
+                }
                 let side = if literal(&e.rexpr) && !literal(&e.lexpr) {
                     &mut e.lexpr
                 } else {
                     &mut e.rexpr
                 };
-                // Between two rows the operator is each pair's
-                // (`make_row_comparison_op`, a RowCompareExpr of `~<~` as
-                // of `<`): the fields are collated, not the row, which
-                // has no collation (RP-851).
                 if let Some(N::RowExpr(r)) = side.as_deref_mut().and_then(|n| n.node.as_mut()) {
                     for a in r.args.iter_mut() {
                         let taken = std::mem::take(a);
@@ -5893,6 +5916,29 @@ fn pattern_ops(node: &mut N) {
             }
         }
     }
+    Ok(())
+}
+
+/// The two types of a row pair the text pattern operators do not take:
+/// both fields typed on their face (not an untyped literal, which takes the
+/// other side's type) and one of them no string type.
+fn pattern_pair_refused(
+    a: &pg_query::protobuf::Node,
+    b: &pg_query::protobuf::Node,
+) -> Option<(String, String)> {
+    let face = |n: &pg_query::protobuf::Node| -> Option<String> {
+        match n.node.as_ref()? {
+            N::AConst(c) if c.isnull => None,
+            N::AConst(c) if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) => {
+                None
+            }
+            N::AConst(_) | N::TypeCast(_) => Some(static_type(n, &Bson::Null)),
+            _ => None,
+        }
+    };
+    let (l, r) = (face(a)?, face(b)?);
+    let string = |t: &str| matches!(t, "text" | "varchar" | "bpchar" | "name" | "char");
+    (!l.is_empty() && !r.is_empty() && (!string(&l) || !string(&r))).then_some((l, r))
 }
 
 /// `parse_one` for a statement as its client wrote it: a bare name the

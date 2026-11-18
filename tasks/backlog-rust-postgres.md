@@ -2001,14 +2001,15 @@ a regression test.
       ON conjunct of that shape is placed in its side's scan as `Filter: (b =
       $0)`, inner and LEFT join alike (`initplan::on_init_plans`). Counts
       over the scan are an Aggregate straight over it, priced
-      (`PgHandler::init_plan_count_agg`). Still open: a subquery with a
+      (`PgHandler::init_plan_count_agg`), and a Limit (OFFSET included)
+      straight over the scan (`limit_estimate`). Still open: a subquery with a
       FROM, a correlated one, or a sublink beside any other non-constant
       qual is still printed inline (`select * from e where b = (select b
       from k limit 1)`); a join's ON InitPlan is unpriced; other nodes above
-      the scan (Limit, Unique, a computed sort key, an aggregate other than
-      a count, a GROUP BY) are unpriced. Measured on a private 15.19
+      the scan (a Limit above a Sort, Unique, a computed sort key, an
+      aggregate other than a count, a GROUP BY) are unpriced. Measured on a private 15.19
       cluster.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a limit above an initplan's scan is priced]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sum above an initplan's scan is priced]
       Backlog-ID: RP-440
 
 ## Found by batch 54 (2026-10-24)
@@ -2342,15 +2343,6 @@ The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
       (`failing_array_element`); the SELECT's target list needs the same.
       Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_literal_domain_error_position
       Backlog-ID: RP-945
-- [ ] **A composite column compared with an untyped literal reads the
-      literal as the column's type.** `select * from tct where c =
-      '(0,x)'` is 0A000 `input of anonymous composite types is not
-      implemented` at 29 on PostgreSQL 15.19: there is no `ctp = ctp`
-      operator, so `=` resolves to `record = record` and the literal to an
-      anonymous `record`, which has no input. Here the literal is read as
-      `ctp` (23514 for this one, a comparison for a valid one).
-      Verify: tests/backlog/test_rp_found_rp552.py::test_composite_column_equals_untyped_literal
-      Backlog-ID: RP-947
 
 ## Found while working RP-534 (2026-11-08)
 
@@ -2719,15 +2711,15 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written. The gap tests are in
 `tests/backlog/test_rp_found_rp727.py`.
 
-- [ ] **A row comparison with a pattern operator over fields that are not
-      strings is a collation error.** `select (1, 2) ~<~ (1, 3)` is 42883
-      `operator does not exist: integer ~<~ integer` at 15 on PostgreSQL
-      15.19 (`make_row_comparison_op` looks up each pair's operator). Here
-      it is 42804 `collations are not supported by type integer` with no
-      position: `pattern_ops` rewrites `~<~` to `<` and collates each
-      field `"C"` before any operand is typed. The subquery form (`(1, 2)
-      ~<~ any (select 1, 3)`) is right since RP-851.
-      Verify: tests/backlog/test_rp_found_rp727.py::test_row_pattern_operator_over_non_strings
+- [ ] **A row comparison with a pattern operator over COLUMNS that are
+      not strings is answered.** `select (a, b) ~<~ (1, 2) from t973`
+      (`t973(a int, b int)`) is 42883 `operator does not exist: integer ~<~
+      integer` at 15 on PostgreSQL 15.19 (`make_row_comparison_op` looks up
+      each pair's operator). Here it compares the rows. RP-973 refused a
+      pair typed on its face (constants, casts) in `pattern_ops`, which
+      runs before any column is typed; a column pair needs the check where
+      the row comparison is typed.
+      Verify: tests/backlog/test_rp_found_rp727.py::test_row_pattern_operator_over_non_string_columns
       Backlog-ID: RP-973
 
 ## Found while working RP-849 (2026-11-11)
