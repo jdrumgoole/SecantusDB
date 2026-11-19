@@ -3380,6 +3380,41 @@ impl Drop for InSubPipeline {
     }
 }
 
+/// Whether the running `aggregate` is collectionless (`aggregate: 1`),
+/// which takes no lock of its own while its pipeline runs.
+fn command_holds_no_lock() -> bool {
+    COMMAND_NS.with(|n| {
+        n.borrow()
+            .as_deref()
+            .is_some_and(|ns| ns.ends_with(".$cmd.aggregate"))
+    })
+}
+
+/// A read of a `$lookup`'s or `$unionWith`'s collection under no lock of
+/// the command's: mongod acquires the collection, then its cursor stage
+/// loads a buffer, each taking the global IS (RM-357).
+fn unlocked_foreign_read() -> Result<(), CommandError> {
+    crate::lock_manager::global_read()?;
+    crate::lock_manager::global_read()
+}
+
+/// Whether `stage` refers to one of the `let` variables (`$$name`,
+/// `$$name.path`).
+fn uses_variable(stage: &Bson, let_spec: Option<&Document>) -> bool {
+    let Some(names) = let_spec else {
+        return false;
+    };
+    match stage {
+        Bson::String(s) => s.strip_prefix("$$").is_some_and(|v| {
+            let name = v.split('.').next().unwrap_or(v);
+            names.contains_key(name)
+        }),
+        Bson::Document(d) => d.values().any(|v| uses_variable(v, let_spec)),
+        Bson::Array(items) => items.iter().any(|v| uses_variable(v, let_spec)),
+        _ => false,
+    }
+}
+
 /// While alive, the `aggregate` command on `ns` is running.
 pub(crate) struct InCommand(Option<String>);
 
@@ -3664,6 +3699,25 @@ fn apply_lookup(
         }
         return Ok(out);
     };
+
+    // A collectionless `aggregate` holds no lock, so each read of `from`
+    // takes the global IS of its own, twice (mongod 8.2.11, one-member
+    // replica set, 2026-11-18: `{$documents: [3 docs]}` then an equality
+    // `$lookup` reads `Global: {r: 7}`, the one before the pipeline and two
+    // per document). mongod's sub-pipeline cache reads `from` once for all
+    // the outer documents unless the pipeline's first stage is correlated:
+    // the equality form's `$match` on `foreignField`, or a `let` variable
+    // in that stage (RM-357).
+    if !docs.is_empty() && command_holds_no_lock() {
+        let correlated = (local_field.is_some() && foreign_field.is_some())
+            || written_pipeline
+                .and_then(|p| p.first())
+                .is_some_and(|first| uses_variable(first, let_spec));
+        let reads = if correlated { docs.len() } else { 1 };
+        for _ in 0..reads {
+            unlocked_foreign_read()?;
+        }
+    }
 
     // Index-driven simple form: when there's no sub-pipeline, both fields are
     // present, and the foreign collection has a leading-field index on
@@ -4039,6 +4093,11 @@ fn apply_union_with(
                 shown: Default::default(),
             },
         )?;
+    }
+    // Read under no lock of a collectionless `aggregate`'s own: the global
+    // IS twice, as a `$lookup`'s read (RM-357).
+    if command_holds_no_lock() {
+        unlocked_foreign_read()?;
     }
     let mut foreign: Vec<Document> =
         collection_documents(storage, db, from, &Document::new(), collation)?;
@@ -7142,6 +7201,21 @@ mod query_stats_tests {
                 "{spec:?}"
             );
         }
+    }
+
+    /// A stage is correlated when it names one of the `let` variables,
+    /// alone or with a path; `$$ROOT` and unbound names are not (RM-357).
+    #[test]
+    fn a_stage_uses_a_let_variable_by_name() {
+        let names = doc! {"i": "$_id"};
+        let uses = |stage: Bson| super::uses_variable(&stage, Some(&names));
+        assert!(uses(
+            bson::bson!({"$match": {"$expr": {"$eq": ["$_id", "$$i"]}}})
+        ));
+        assert!(uses(bson::bson!({"$addFields": {"z": "$$i.a"}})));
+        assert!(!uses(bson::bson!({"$addFields": {"z": "$$ROOT"}})));
+        assert!(!uses(bson::bson!({"$addFields": {"z": "$$it"}})));
+        assert!(!super::uses_variable(&bson::bson!({"a": "$$i"}), None));
     }
 
     /// Only first, only on `admin` with `{aggregate: 1}`; nested, the

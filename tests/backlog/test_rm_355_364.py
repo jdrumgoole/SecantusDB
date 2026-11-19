@@ -8,6 +8,7 @@ its item names with mongod 8.2's.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import json
 from collections.abc import Iterator
@@ -523,17 +524,97 @@ def test_a_write_reports_mongods_locks_and_flow_control(
 
 #: Writes whose locks are not mongod's yet (RM-357's remainder).
 _DIVERGING_WRITES = {
-    # mongod takes the global IS three times on the line of a collectionless
-    # aggregate whose `$lookup` reads a collection; this server once.
-    "$documents and $lookup": lambda d: list(
-        _plain(d).aggregate(
-            [
-                {"$documents": [{"_id": 1}]},
-                {"$lookup": {"from": "c", "localField": "_id", "foreignField": "_id", "as": "j"}},
-            ]
-        )
-    ),
+    # mongod inserts a batch again a document at a time once one fails,
+    # each under a transition, global, database and collection lock of its
+    # own (`insertBatchAndHandleErrors`); this server takes no such rounds.
+    "insert of three, one a duplicate": lambda d: _insert_with_a_duplicate(d),
 }
+
+
+def _insert_with_a_duplicate(d: Any) -> None:
+    # The duplicate's failure is the point: the lines are what is compared.
+    with contextlib.suppress(pymongo.errors.BulkWriteError):
+        _plain(d).c.insert_many([{"_id": 200}, {"_id": 1}, {"_id": 201}], ordered=False)
+
+
+_LOOKUP = {"from": "c", "localField": "_id", "foreignField": "_id", "as": "j"}
+
+#: Collectionless aggregates whose `$lookup` or `$unionWith` reads `c`.
+_UNLOCKED_READS = {
+    "$documents and $lookup": [{"$documents": [{"_id": 1}]}, {"$lookup": _LOOKUP}],
+    "$lookup of three documents": [
+        {"$documents": [{"_id": 1}, {"_id": 2}, {"_id": 3}]},
+        {"$lookup": _LOOKUP},
+    ],
+    "two $lookup": [
+        {"$documents": [{"_id": 1}]},
+        {"$lookup": _LOOKUP},
+        {"$lookup": {**_LOOKUP, "as": "k"}},
+    ],
+    "$lookup of no documents": [{"$documents": []}, {"$lookup": _LOOKUP}],
+    "$lookup of a missing collection": [
+        {"$documents": [{"_id": 1}]},
+        {"$lookup": {**_LOOKUP, "from": "nope"}},
+    ],
+    "$lookup in a $facet": [
+        {"$documents": [{"_id": 1}]},
+        {"$facet": {"x": [{"$lookup": _LOOKUP}]}},
+    ],
+    "uncorrelated pipeline $lookup": [
+        {"$documents": [{"_id": 1}, {"_id": 2}]},
+        {"$lookup": {"from": "c", "pipeline": [], "as": "j"}},
+    ],
+    "correlated pipeline $lookup": [
+        {"$documents": [{"_id": 1}, {"_id": 2}, {"_id": 3}]},
+        {
+            "$lookup": {
+                "from": "c",
+                "let": {"i": "$_id"},
+                "pipeline": [{"$match": {"$expr": {"$eq": ["$_id", "$$i"]}}}],
+                "as": "j",
+            }
+        },
+    ],
+    "pipeline $lookup correlated after its first stage": [
+        {"$documents": [{"_id": 1}, {"_id": 2}, {"_id": 3}]},
+        {
+            "$lookup": {
+                "from": "c",
+                "let": {"i": "$_id"},
+                "pipeline": [{"$sort": {"_id": 1}}, {"$addFields": {"z": "$$i"}}],
+                "as": "j",
+            }
+        },
+    ],
+    "$unionWith": [{"$documents": [{"_id": 1}]}, {"$unionWith": "c"}],
+    "$unionWith with a pipeline": [
+        {"$documents": [{"_id": 1}, {"_id": 2}]},
+        {"$unionWith": {"coll": "c", "pipeline": [{"$match": {}}]}},
+    ],
+    "two $unionWith": [
+        {"$documents": [{"_id": 1}]},
+        {"$unionWith": "c"},
+        {"$unionWith": "c"},
+    ],
+}
+
+
+@pytest.mark.backlog_fixed("RM-357")
+@pytest.mark.parametrize("name", list(_UNLOCKED_READS))
+def test_a_collectionless_aggregate_reads_under_no_lock(
+    rust_mongo: Any, mongod_rs: Any, name: str
+) -> None:
+    """mongod 8.2.11's line for a collectionless `aggregate` whose
+    `$lookup` or `$unionWith` reads a collection takes the global IS once
+    and then twice for each read of it, which its sub-pipeline cache makes
+    once unless the `$lookup`'s first stage is correlated (`Global: {r: 7}`
+    for an equality `$lookup` of three documents; measured 2026-11-18).
+    This server took the global IS once."""
+    answers = _write_locks(
+        rust_mongo, mongod_rs, lambda d: list(_plain(d).aggregate(_UNLOCKED_READS[name]))
+    )
+    assert answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
 
 
 #: `$out`, to a new target and replacing one.

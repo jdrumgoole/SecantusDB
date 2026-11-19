@@ -587,7 +587,10 @@ These are explicit non-goals. Don't add them without a reason.
       statement takes its own round as it runs and keeps its session's row
       under it; since 2026-11-18 an `$out` on a replica set's primary takes
       its four global IS under the transition lock, and the transition lock
-      alone once for each X round after the first. Still different,
+      alone once for each X round after the first; since 2026-11-18 a
+      collectionless `aggregate`'s `$lookup` and `$unionWith` take the
+      global IS twice for each read of their collection, under no lock of
+      the command's. Still different,
       measured against a one-member replica set:
       - an `insert` of several documents one of which fails: mongod inserts
         them again a document at a time, each under a transition, global,
@@ -605,10 +608,11 @@ These are explicit non-goals. Don't add them without a reason.
       - a statement of a transaction shows the transaction's initial locks
         in its profile entry on mongod (its line prints `{}` here too since
         2026-11-17); the entry is not compared yet;
-      - a collectionless `aggregate` takes no lock of its own since
-        2026-11-09, as on mongod, but one whose `$lookup` or `$unionWith`
-        reads a collection takes the global IS three times on mongod's line
-        (four in its entry, four execution admissions) and once here.
+      - a collectionless `aggregate` whose `$lookup` or `$unionWith` reads
+        a collection takes mongod's global IS on its line since 2026-11-18
+        (once, then twice per read of the collection), but its profile
+        entry (one more on mongod) and its line's execution admissions are
+        not compared yet.
       Backlog-ID: RM-357
       Verify: tests/backlog/test_rm_355_364.py::test_more_writes_report_mongods_locks
 - [ ] **A `$lookup` from `{db: "local", coll: "oplog.rs"}` is refused.**
