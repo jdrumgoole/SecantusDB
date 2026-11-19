@@ -151,6 +151,8 @@ Each phase lands as its own PR, after all of:
 
 ### Store-format version across phases
 
+Confirmed by Joe, 2026-11-19.
+
 Phases 2 to 5, 4b included, each change the format. Each one **bumps the store-format
 version**, so a store written by an earlier phase is refused by name like any
 other old store. **No release of either Rust server is cut between phase 2
@@ -273,6 +275,9 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
    layout description, and the docs pages that describe the store.
 
 ## Ownership and parallel work
+
+The first two rules were confirmed by Joe, 2026-11-19. The first is an
+exception to CLAUDE.md's one-server rule, limited to this plan.
 
 - This change spans both Rust servers, which CLAUDE.md's "one session works on
   ONE Rust server" rule otherwise forbids. **One session owns the whole plan,
