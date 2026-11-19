@@ -188,7 +188,12 @@ def build_wheel(
     # The licences come from the checkout the workflow runs from: archives
     # before 2026-10 carry no LICENSE-ICU.
     repo = HERE.parent.parent
-    for name, src in (("LICENSE", "LICENSE"), ("LICENSE-ICU", "vendor/icu4c-57.1/LICENSE")):
+    for name, src in (
+        ("LICENSE", "LICENSE"),
+        ("LICENSE-ICU", "vendor/icu4c-57.1/LICENSE"),
+        ("LICENSE-snappy", "vendor/snappy/dist/COPYING"),
+        ("LICENSE-zstd", "vendor/zstandard/zstd/LICENSE"),
+    ):
         files.append((f"{dist_info}/licenses/{name}", (repo / src).read_bytes(), False))
     files.append(
         (f"{dist_info}/METADATA", _metadata(version, mongodb_version, postgres_version), False)

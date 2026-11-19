@@ -183,37 +183,73 @@ endif()
 # (macOS SDK + manylinux/musllinux). Windows has no default libz, so WT builds
 # there without the compressor (the storage layer omits the block_compressor
 # clause on Windows too — see secantus-storage BOOTSTRAP).
-# OFF by default: enabling the extra compressors makes WiredTiger's builtin
-# extensions reference libsnappy / liblz4 / libzstd, which then have to be
-# present at link time and on every build platform. That is a dependency
-# decision, not an experiment knob, so the default build is unchanged.
+# lz4 is the block compressor today's stores use and zlib the one older ones
+# do; `block_compressor` is recorded per table at create time, so both stay
+# linked.
 #
-# Turn it ON (with `SECANTUS_WT_EXTRA_COMPRESSORS=1` in the environment for the
-# Rust link step) to reproduce the compressor sweep in tasks/backlog.md.
-# Profiling the daemon under sustained write load put **65% of server CPU
-# inside zlib's `deflate`** on WiredTiger's page-reconciliation path, and
-# swapping zlib for lz4 measured +86% throughput and -97% p99.9 on
-# incompressible data, +15% / -88% on compressible. mongod defaults to snappy
-# for exactly this reason.
-# lz4 is the DEFAULT block compressor (see secantus-storage's table configs);
-# zlib is built alongside it and is NOT optional, because `block_compressor` is
-# recorded per table at create time — a store created before the switch has
-# zlib tables that can only be opened while the zlib extension is linked.
-#
-# snappy and zstd stay opt-in: they measured close to lz4 and adding two more
-# link dependencies to every wheel target for no further gain is not worth it.
-# Turn them on to reproduce the sweep in tasks/backlog.md.
-option(SECANTUS_WT_EXTRA_COMPRESSORS
-       "Also build the snappy and zstd block compressors (lz4 + zlib always build)"
-       OFF)
+# snappy and zstd are mongod's: its catalog, collections and journal are
+# snappy-compressed, its time-series buckets zstd-compressed, and SecantusDB's
+# stores move to that layout (tasks/mongod-storage-model-plan.md). They are
+# mongo r8.2.11's own copies (vendor/snappy, vendor/zstandard), compiled here
+# as static libraries with the source lists of mongo's BUILD.bazel files, and
+# builtin on EVERY platform, Windows included. WiredTiger's SWIG module links
+# them, and with them the C++ runtime snappy needs.
+set(SNAPPY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/snappy)
+set(ZSTD_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/zstandard/zstd/lib)
+if(WIN32)
+    set(_snappy_platform build_windows)
+elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+    set(_snappy_platform build_macOS_aarch64)
+elseif(APPLE)
+    set(_snappy_platform build_macOS_x86_64)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set(_snappy_platform build_linux_aarch64)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    set(_snappy_platform build_linux_x86_64)
+else()
+    set(_snappy_platform build_posix)
+endif()
+add_library(secantus_snappy STATIC
+    ${SNAPPY_DIR}/dist/snappy.cc
+    ${SNAPPY_DIR}/dist/snappy-c.cc
+    ${SNAPPY_DIR}/dist/snappy-sinksource.cc)
+target_include_directories(secantus_snappy PRIVATE
+    ${SNAPPY_DIR}/dist ${SNAPPY_DIR}/platform/build_all
+    ${SNAPPY_DIR}/platform/${_snappy_platform})
+target_compile_definitions(secantus_snappy PRIVATE HAVE_CONFIG_H)
+set_target_properties(secantus_snappy PROPERTIES
+    POSITION_INDEPENDENT_CODE ON CXX_STANDARD 17)
+file(GLOB _zstd_sources
+    ${ZSTD_LIB_DIR}/common/*.c ${ZSTD_LIB_DIR}/compress/*.c
+    ${ZSTD_LIB_DIR}/decompress/*.c ${ZSTD_LIB_DIR}/deprecated/*.c
+    ${ZSTD_LIB_DIR}/dictBuilder/*.c)
+if(NOT WIN32)
+    list(APPEND _zstd_sources ${ZSTD_LIB_DIR}/decompress/huf_decompress_amd64.S)
+    enable_language(ASM)
+endif()
+add_library(secantus_zstd STATIC ${_zstd_sources})
+target_include_directories(secantus_zstd PRIVATE ${ZSTD_LIB_DIR})
+set_target_properties(secantus_zstd PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+if(WIN32)
+    set(_wt_cxx_runtime "")
+elseif(APPLE)
+    set(_wt_cxx_runtime -lc++)
+else()
+    set(_wt_cxx_runtime -lstdc++)
+endif()
+set(WT_COMPRESSOR_ARG
+    -DWT_STANDALONE_BUILD=OFF
+    -DENABLE_SNAPPY=OFF -DHAVE_BUILTIN_EXTENSION_SNAPPY=ON
+    -DHAVE_LIBSNAPPY=$<TARGET_FILE:secantus_snappy>
+    -DHAVE_LIBSNAPPY_INCLUDES=${SNAPPY_DIR}/dist
+    -DENABLE_ZSTD=OFF -DHAVE_BUILTIN_EXTENSION_ZSTD=ON
+    -DHAVE_LIBZSTD=$<TARGET_FILE:secantus_zstd>
+    -DHAVE_LIBZSTD_INCLUDES=${ZSTD_LIB_DIR}
+    "-DCMAKE_MODULE_LINKER_FLAGS=${_wt_cxx_runtime}"
+    "-DCMAKE_SHARED_LINKER_FLAGS=${_wt_cxx_runtime}")
 if(WIN32)
     set(WT_ZLIB_ARG "")
-elseif(SECANTUS_WT_EXTRA_COMPRESSORS)
-    set(WT_ZLIB_ARG
-        -DENABLE_ZLIB=OFF -DHAVE_BUILTIN_EXTENSION_ZLIB=ON
-        -DENABLE_LZ4=OFF -DHAVE_BUILTIN_EXTENSION_LZ4=ON
-        -DENABLE_SNAPPY=OFF -DHAVE_BUILTIN_EXTENSION_SNAPPY=ON
-        -DENABLE_ZSTD=OFF -DHAVE_BUILTIN_EXTENSION_ZSTD=ON)
 else()
     set(WT_ZLIB_ARG
         -DENABLE_ZLIB=OFF -DHAVE_BUILTIN_EXTENSION_ZLIB=ON
@@ -232,6 +268,7 @@ ExternalProject_Add(wiredtiger_ext
         -DWT_SHA=${WT_SRC_SHA}
         -DWT_PATCHES=${WT_PATCH_SHA}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_wt_source.cmake
+    DEPENDS           secantus_snappy secantus_zstd
     BINARY_DIR        ${WT_BINARY_DIR}
     INSTALL_DIR       ${WT_INSTALL_DIR}
     # ExternalProject inherits the parent generator unless CMAKE_GENERATOR is
@@ -280,6 +317,8 @@ ExternalProject_Add(wiredtiger_ext
         # it explicitly makes a stale cache harmless; fresh CI containers never
         # saw it, a developer's incremental tree does.)
         ${WT_ZLIB_ARG}
+        # mongod's build: WT_STANDALONE_BUILD=OFF, snappy and zstd builtin.
+        ${WT_COMPRESSOR_ARG}
         # Belt-and-braces with BUILD_COMMAND below; ENABLE_CPPSUITE=OFF
         # also short-circuits the configure-time SWIG/Catch2 lookups.
         -DENABLE_CPPSUITE=OFF

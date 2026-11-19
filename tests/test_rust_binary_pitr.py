@@ -11,6 +11,7 @@ crates/secantusdb/Cargo.toml``, or set ``SECANTUSDB_BIN``).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import pathlib
 import re
@@ -18,6 +19,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
 from typing import Any
 
 try:
@@ -54,7 +56,6 @@ _TIMEOUT_MARK = pytest.mark.timeout(
 
 pymongo = pytest.importorskip("pymongo")
 
-from secantus import SecantusDBServer  # noqa: E402
 from secantus.storage import Storage  # noqa: E402
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -135,6 +136,46 @@ def _serialize_binary_tests():
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
+@contextlib.contextmanager
+def _rust_server(data: pathlib.Path, *extra: str) -> Iterator[pymongo.MongoClient]:
+    """A `secantusd-mdb` on `data`, stopped (SIGTERM, a clean close) on exit.
+
+    These tests used to write their data with the deprecated Python server;
+    since the storage-model change (tasks/mongod-storage-model-plan.md,
+    phase 1) a Rust server refuses a store in the earlier layout, which is
+    the one the Python server writes. The restore paths they cover are the
+    Rust binary's, so the data now comes from it too. `--data-logged`: the
+    reads below are the Python `Storage`'s, which writes without timestamps
+    (see the v2 test below).
+    """
+    assert _BIN is not None
+    proc = subprocess.Popen(
+        [str(_BIN), "--port", "0", "--storage-path", str(data), "--data-logged", *extra],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        line = _read_banner_line(proc)
+        drain(proc)
+        m = _BANNER.search(line)
+        assert m, f"no listening banner in: {line!r}"
+        client = pymongo.MongoClient(
+            m.group(1),
+            int(m.group(2)),
+            directConnection=True,
+            serverSelectionTimeoutMS=5000,
+            socketTimeoutMS=120000,
+        )
+        try:
+            yield client
+        finally:
+            client.close()
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=30)
+
+
 def _docs(path: pathlib.Path, db: str, coll: str) -> list[dict[str, Any]]:
     s = Storage(str(path), enable_oplog=True)
     try:
@@ -163,17 +204,15 @@ def _restore(
     )
 
 
-def test_rust_binary_restores_python_server_data(tmp_path: pathlib.Path) -> None:
-    data = tmp_path / "pydata"
-    with SecantusDBServer(port=0, storage_path=str(data)) as srv:
-        coll = pymongo.MongoClient(srv.uri, directConnection=True, socketTimeoutMS=120000)["app"][
-            "c"
-        ]
+def test_rust_binary_restores_server_data(tmp_path: pathlib.Path) -> None:
+    data = tmp_path / "data"
+    with _rust_server(data) as client:
+        coll = client["app"]["c"]
         coll.insert_many([{"_id": 1, "v": 1}, {"_id": 2, "v": 2}])
         coll.update_one({"_id": 1}, {"$set": {"v": 100, "tag": "x"}})
         coll.delete_one({"_id": 2})
         coll.insert_one({"_id": 3, "v": 3})
-    # Python server is stopped (WiredTiger lock released) on context exit.
+    # The server is stopped (WiredTiger lock released) on context exit.
 
     out = tmp_path / "restored"
     res = _restore(data, out)
@@ -183,12 +222,9 @@ def test_rust_binary_restores_python_server_data(tmp_path: pathlib.Path) -> None
 
 
 def test_rust_binary_restore_to_timestamp(tmp_path: pathlib.Path) -> None:
-    data = tmp_path / "pydata"
-    with SecantusDBServer(port=0, storage_path=str(data)) as srv:
-        coll = pymongo.MongoClient(srv.uri, directConnection=True, socketTimeoutMS=120000)["app"][
-            "c"
-        ]
-        coll.insert_many([{"_id": 1}, {"_id": 2}])
+    data = tmp_path / "data"
+    with _rust_server(data) as client:
+        client["app"]["c"].insert_many([{"_id": 1}, {"_id": 2}])
 
     # The timestamp after the two inserts, read from the stopped data dir.
     s = Storage(str(data), enable_oplog=True)
@@ -310,12 +346,9 @@ def _restored_oplog_len(path: pathlib.Path) -> int:
 def test_rust_binary_preserve_oplog(tmp_path: pathlib.Path) -> None:
     """`--preserve-oplog` carries the replayed oplog onto the restored dir; the
     default leaves it empty (Phase R, R5b)."""
-    data = tmp_path / "pydata"
-    with SecantusDBServer(port=0, storage_path=str(data)) as srv:
-        coll = pymongo.MongoClient(srv.uri, directConnection=True, socketTimeoutMS=120000)["app"][
-            "c"
-        ]
-        coll.insert_many([{"_id": 1}, {"_id": 2}, {"_id": 3}])
+    data = tmp_path / "data"
+    with _rust_server(data) as client:
+        client["app"]["c"].insert_many([{"_id": 1}, {"_id": 2}, {"_id": 3}])
 
     carried = tmp_path / "carried"
     assert _restore(data, carried, "--preserve-oplog").returncode == 0

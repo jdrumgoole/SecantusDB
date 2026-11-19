@@ -235,12 +235,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
+name = "secantus-compressors"
+version = "0.5.3-beta.198"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "secantus-wiredtiger-sys"
 version = "0.5.3-beta.198"
 dependencies = [
  "cc",
  "cmake",
  "libz-sys",
+ "secantus-compressors",
 ]
 
 [[package]]
@@ -248,6 +256,7 @@ name = "secantus-wt"
 version = "0.5.3-beta.198"
 dependencies = [
  "bindgen",
+ "secantus-compressors",
  "secantus-wiredtiger-sys",
 ]
 

@@ -67,6 +67,7 @@ mod lockfile;
 pub use lockfile::LockFileRecord;
 mod scan_bounds;
 mod sizes;
+pub mod store_format;
 
 pub use catalog_changes::CatalogChange;
 pub use index_build::{IndexBuildAbort, IndexBuildInfo, IndexBuildSpec};
@@ -2709,23 +2710,21 @@ pub fn wt_config(
 // zlib tables; dropping the extension would make that data unreadable. Only
 // newly created tables get lz4, and a mixed store is fine.
 //
-// **Windows** WT is built without either compressor (no default libz), so the
-// clause is omitted there — a `block_compressor=` table create would fail with
-// "unknown compressor". Set at create time; existing tables keep their format
-// (WT stores it in metadata).
+// **Windows** WiredTiger is built without zlib and lz4 (no default libz), but
+// with snappy and zstd, which are compiled from mongo's copies everywhere.
 // RecordId keying: the doc table is keyed by (db, coll, RecordId:i64) — the
 // monotonic per-collection insertion seq — not by id_key. This puts the table in
 // insertion order (so the `secantus_natural` forward table is dropped) and cuts
 // write amplification 4->3. `secantus_natural_seq` (id_key -> RecordId) is the
 // `_id` index. See tasks/rust-recordid-plan.md.
-#[cfg(not(target_os = "windows"))]
-const DOC_TABLE_CFG: &str = "key_format=SSq,value_format=u,block_compressor=lz4";
-#[cfg(target_os = "windows")]
-const DOC_TABLE_CFG: &str = "key_format=SSq,value_format=u";
-#[cfg(not(target_os = "windows"))]
-const QU_COMPRESSED_CFG: &str = "key_format=q,value_format=u,block_compressor=lz4";
-#[cfg(target_os = "windows")]
-const QU_COMPRESSED_CFG: &str = "key_format=q,value_format=u";
+//
+// **snappy, everywhere** (2026-11-19): mongod's own collection compressor,
+// built into WiredTiger on every platform from mongo's copy
+// (crates/secantus-compressors), so a store's tables are the ones mongod
+// writes (tasks/mongod-storage-model-plan.md). lz4 and zlib stay linked for
+// the reasons above; no table this build creates uses them.
+const DOC_TABLE_CFG: &str = "key_format=SSq,value_format=u,block_compressor=snappy";
+const QU_COMPRESSED_CFG: &str = "key_format=q,value_format=u,block_compressor=snappy";
 
 // The full table set `storage.py` bootstraps. Sub-phase 1 only reads/writes the
 // collections + documents tables, but creating the rest keeps the on-disk schema
@@ -8379,6 +8378,15 @@ impl Storage {
             .unwrap_or_else(|| std::env::var_os("SECANTUS_OPLOG_ASYNC").is_some());
         let in_memory = config.contains("in_memory=true");
         let new_store = in_memory || !std::path::Path::new(home).join("WiredTiger.wt").exists();
+        // mongod's layout (tasks/mongod-storage-model-plan.md): check the
+        // store's format and lay out a new one BEFORE WiredTiger opens it,
+        // which would refuse an earlier layout's files with a bare EACCES;
+        // and keep the log where mongod does, snappy-compressed.
+        if !in_memory {
+            store_format::prepare(std::path::Path::new(home))?;
+        }
+        let config = store_format::mongod_log_config(config);
+        let config = config.as_str();
         let wt_started = Instant::now();
         let conn = Arc::new(Connection::open(home, config)?);
         let wt_open = wt_started.elapsed();
@@ -10698,11 +10706,28 @@ impl Storage {
         let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
         let mut builder = tar::Builder::new(enc);
         while cursor.next()? {
-            let rel = cursor.get_key_s()?;
+            let mut rel = cursor.get_key_s()?;
+            // WiredTiger names a log file bare, though the log lives in
+            // `journal/` (mongod's layout); archive it under its real path,
+            // as mongod's backup does, so a restore puts it back there.
+            if rel.starts_with("WiredTigerLog.") {
+                rel = format!("{}/{rel}", store_format::JOURNAL_DIR);
+            }
             let full = std::path::Path::new(&self.home).join(&rel);
             builder
                 .append_path_with_name(&full, &rel)
                 .map_err(|e| archive_err("create_archive", e))?;
+        }
+        // The files the layout keeps beside WiredTiger's, which its backup
+        // cursor does not list: mongod's backup adds `storage.bson` the same
+        // way. Without them a restored store would be refused at open.
+        for rel in [store_format::STORAGE_BSON, store_format::FORMAT_FILE] {
+            let full = std::path::Path::new(&self.home).join(rel);
+            if full.exists() {
+                builder
+                    .append_path_with_name(&full, rel)
+                    .map_err(|e| archive_err("create_archive", e))?;
+            }
         }
         let data =
             serde_json::to_vec(manifest).map_err(|e| archive_err("create_archive manifest", e))?;
@@ -28049,15 +28074,12 @@ mod tests {
         assert_eq!(wt_config("4G", 1000, false, "128MB"), DEFAULT_CONFIG);
     }
 
-    /// New tables are created with lz4 — the compressor sweep measured it at
-    /// +86% throughput and -97% p99.9 against zlib (tasks/backlog-rust-mongodb.md).
+    /// New tables are created with snappy, mongod's collection compressor,
+    /// on every platform (tasks/mongod-storage-model-plan.md).
     #[test]
-    fn value_heavy_tables_default_to_lz4() {
+    fn value_heavy_tables_use_mongods_snappy() {
         for cfg in [DOC_TABLE_CFG, QU_COMPRESSED_CFG] {
-            #[cfg(not(target_os = "windows"))]
-            assert!(cfg.contains("block_compressor=lz4"), "{cfg}");
-            #[cfg(target_os = "windows")]
-            assert!(!cfg.contains("block_compressor"), "{cfg}");
+            assert!(cfg.contains("block_compressor=snappy"), "{cfg}");
         }
     }
 
@@ -29098,9 +29120,11 @@ mod tests {
             c.set_value_u(b"raw-unframed-blob");
             c.insert().unwrap();
         } // drop closes the fabrication connection before the reopen
+          // Refused before WiredTiger opens it, as every store in the layout
+          // before mongod's is (store_format.rs): never mis-read.
         match Storage::open(home_s) {
             Err(StorageError::Internal(m)) => {
-                assert!(m.contains("RecordId"), "unexpected message: {m}")
+                assert!(m.contains("earlier SecantusDB"), "unexpected message: {m}")
             }
             Err(other) => panic!("expected Internal fatal, got: {other:?}"),
             Ok(_) => panic!("expected open to be refused for an SSu doc shard"),

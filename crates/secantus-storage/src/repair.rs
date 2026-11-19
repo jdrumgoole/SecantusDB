@@ -135,6 +135,12 @@ fn verify_and_salvage(
     report: &mut RepairReport,
     log: &mut dyn FnMut(&str),
 ) -> Result<()> {
+    // The same layout check and log location as `Storage::open`: a bare
+    // connection that missed `journal/` would start a fresh log and skip
+    // recovery of the real one.
+    crate::store_format::prepare(std::path::Path::new(home))?;
+    let config = crate::store_format::mongod_log_config(config);
+    let config = config.as_str();
     let conn = match Connection::open(home, config) {
         Ok(conn) => conn,
         Err(e) if e.is_try_salvage() => {
