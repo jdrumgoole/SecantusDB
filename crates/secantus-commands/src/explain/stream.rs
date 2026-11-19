@@ -205,8 +205,6 @@ struct IndexMeta {
     collation: Option<Collation>,
     sparse: bool,
     multikey: bool,
-    /// The `_id` index: each entry one `id_key`, not a compound key.
-    id: bool,
 }
 
 /// The index entry a document was found at: the index, and each field's
@@ -280,9 +278,6 @@ fn mongod_key(meta: &IndexMeta, field: usize, doc: &Document, part: &[u8]) -> bo
 
 /// Whether every field of `entry` is one of mongod's keys for `blob`.
 fn holds_entry(entry: &EntryKey, blob: &[u8]) -> Result<bool, StorageError> {
-    if entry.meta.id {
-        return Ok(true);
-    }
     let doc = secantus_core::bsondoc::from_bytes(blob).map_err(undecodable)?;
     Ok((0..entry.parts.len()).all(|i| mongod_key(&entry.meta, i, &doc, &entry.parts[i])))
 }
@@ -312,11 +307,10 @@ enum Limits {
     },
 }
 
-/// Where an index scan starts: the index's own edge, a raw `_id` key, or
-/// the values of the first entries it can need.
+/// Where an index scan starts: the index's own edge, or the values of the
+/// first entries it can need.
 enum Start {
     Edge,
-    Raw(Vec<u8>),
     Values(Vec<Bson>),
 }
 
@@ -414,7 +408,6 @@ impl IndexScan {
         let (from, after) = match (&self.last, &self.start) {
             (Some((resume, rid)), _) => (IndexFrom::Resume(resume), Some(*rid)),
             (None, Start::Edge) => (IndexFrom::Edge, None),
-            (None, Start::Raw(raw)) => (IndexFrom::Raw(raw), None),
             (None, Start::Values(values)) => (IndexFrom::Values(values), None),
         };
         let Some(rows) = cx.storage.index_entries_from(
@@ -445,16 +438,12 @@ impl IndexScan {
             if let Some(read) = self.read.as_mut() {
                 read.push(rid);
             }
-            let asc: Vec<Vec<u8>> = if self.meta.id {
-                vec![raw.clone()]
-            } else {
-                sortkey::split_directed(&raw, &self.meta.dirs)
-                    .ok_or_else(unreadable)?
-                    .into_iter()
-                    .zip(&self.meta.dirs)
-                    .map(|(part, dir)| sortkey::ascending_part(part, *dir))
-                    .collect()
-            };
+            let asc: Vec<Vec<u8>> = sortkey::split_directed(&raw, &self.meta.dirs)
+                .ok_or_else(unreadable)?
+                .into_iter()
+                .zip(&self.meta.dirs)
+                .map(|(part, dir)| sortkey::ascending_part(part, *dir))
+                .collect();
             let scan = asc
                 .iter()
                 .zip(&self.meta.dirs)
@@ -1787,9 +1776,6 @@ impl Stage {
 
 /// An index scan of `ix` from its start, when one streams.
 fn index_scan(ix: &IxScan, opts: &Options) -> Result<Option<IndexScan>, StorageError> {
-    // The `_id` index's entries are the documents' `_id` keys, in mongod's
-    // order since `_id` key format 2.
-    let id = ix.index.name == "_id_";
     let fields = ix.index.fields();
     let dirs: Vec<i32> = fields
         .iter()
@@ -1804,13 +1790,9 @@ fn index_scan(ix: &IxScan, opts: &Options) -> Result<Option<IndexScan>, StorageE
         collation: collation.clone(),
         sparse: ix.index.sparse,
         multikey: ix.index.is_multikey(),
-        id,
     });
     // Each field's stored key for a value, as the entries hold it.
     let stored = |v: &Bson, dir: i32| -> Option<Vec<u8>> {
-        if id {
-            return sortkey::encode_id_key(v).ok();
-        }
         sortkey::encode_value_directed(v, dir, collation.as_ref()).ok()
     };
     let join = |values: &[(Bson, i32)]| -> Option<Vec<u8>> {
@@ -1843,16 +1825,7 @@ fn index_scan(ix: &IxScan, opts: &Options) -> Result<Option<IndexScan>, StorageE
         // of that key; with no `max`, at the end of the index.
         let start_doc = if ix.backward { opts.max } else { opts.min };
         let start = match start_doc {
-            None if id && ix.backward => Start::Raw(vec![0xFF]),
             None => Start::Edge,
-            Some(_) if id => Start::Raw(
-                if ix.backward {
-                    max.clone()
-                } else {
-                    min.clone()
-                }
-                .unwrap_or_default(),
-            ),
             Some(d) => Start::Values(d.values().cloned().collect()),
         };
         (Limits::MinMax { min, max }, start, false)
@@ -1884,7 +1857,6 @@ fn index_scan(ix: &IxScan, opts: &Options) -> Result<Option<IndexScan>, StorageE
             Start::Edge
         } else {
             match join(&firsts) {
-                Some(raw) if id => Start::Raw(raw),
                 Some(_) => Start::Values(firsts.iter().map(|(v, _)| v.clone()).collect()),
                 None => return Ok(None),
             }
@@ -3537,19 +3509,10 @@ fn key_document(entry: &EntryKey, blob: &[u8]) -> Result<Document, StorageError>
     let mut out = Document::new();
     for (i, field) in meta.fields.iter().enumerate() {
         let part = &entry.parts[i];
-        let values = if meta.id {
-            doc.get("_id").cloned().into_iter().collect()
-        } else {
-            secantus_core::index_keys::field_keys(&doc, field, meta.sparse).mongod
-        };
-        let found = values.into_iter().find(|v| {
-            let encoded = if meta.id {
-                sortkey::encode_id_key(v)
-            } else {
-                sortkey::encode_value(v, meta.collation.as_ref())
-            };
-            encoded.is_ok_and(|k| k == *part)
-        });
+        let values = secantus_core::index_keys::field_keys(&doc, field, meta.sparse).mongod;
+        let found = values
+            .into_iter()
+            .find(|v| sortkey::encode_value(v, meta.collation.as_ref()).is_ok_and(|k| k == *part));
         let value = match (found, &meta.collation) {
             (Some(Bson::String(s)), Some(c)) => Bson::String(
                 String::from_utf8_lossy(&secantus_core::collation::sort_key(&s, c)).into_owned(),

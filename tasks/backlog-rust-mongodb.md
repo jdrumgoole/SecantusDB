@@ -881,12 +881,13 @@ These are explicit non-goals. Don't add them without a reason.
       at random.) Measured 2026-11-10. Found while working RM-385.
       The surplus is this store's shared
       tables. Every key an insert writes carries the namespace as strings,
-      because collections share sixteen document shards
-      (`key_format=SSq`), every `_id` index is a row in
-      `secantus_natural_seq` (`SSu`), and every secondary index is a row in
+      because collections shared sixteen document shards
+      (`key_format=SSq`), every `_id` index was a row in
+      `secantus_natural_seq` (`SSu`), and every secondary index was a row in
       `secantus_index_entries` (`SSSu`, plus the index name). mongod keeps
       one WiredTiger table per collection (`key_format=q`) and one per
-      index (KeyString keys), so no key names its namespace. Measured with
+      index (KeyString keys), so no key names its namespace; since store
+      format 4 so does this store (storage-model phases 3, 4a and 4d). Measured with
       the gap test's insert of fifty documents into `c`, with the `_id` and
       `x` indexes (`secantusd-mdb` from `rm-batch` at 6bcd8f41, mongod
       8.2.11): a 9-character database name gives 362.8 bytes per document
@@ -2048,13 +2049,9 @@ behind, in the order the collection holds them. The Rust server differs on
 32. Pinned by
 `crates/secantus-storage-adapter/tests/insert_delete_count_distinct_wt.rs`.
 
-A document `_id` takes a claim by value in `UNIQ_TABLE`
-(`Storage::document_id_claim`), on top of the `_id` index keyed by BSON
-bytes (`encode_id_key`, on disk and shared with the Python server). A
-document stored before that is given its claim the first time this version
-opens the store (`backfill_document_id_claims`, once for a store; a row in
-`UNIQ_TABLE` under an empty namespace records it). Two stored documents
-already equal by value both stay, and the older holds the claim.
+A document `_id` is compared by value: the `_id_` index is keyed by the
+KeyString of `_id` (store format 4), where `{a: 1}` and `{a: 1.0}` are one
+key, so there is no claim beside it.
 
 Still different, of those 32 (the other four are the items below):
 

@@ -10,8 +10,9 @@
 //! salvage operation.` for a table, `Repairing collection` and then either
 //! `Validate did not make any repairs` or an index build for a collection.
 //!
-//! Here the tables are shared (the document shards, the `_id` table, the
-//! entries and claims tables, the catalog, the oplog), so:
+//! Here every collection's documents, `_id` index and other indexes are
+//! tables of their own (`collection-<UUID>`, `index-<UUID>`), beside the
+//! registry tables, the catalog and the oplog, so:
 //!
 //! 1. Every table is verified, and salvaged when that fails, on a bare
 //!    WiredTiger connection before the store is opened -- `verify` and
@@ -20,11 +21,10 @@
 //!    (`WT_TRY_SALVAGE` at open) is opened with `salvage=true` first.
 //! 2. The store is opened, which replays the oplog as after a crash.
 //! 3. Every collection is checked against its indexes; a collection whose
-//!    document shard was salvaged, or whose indexes were in a salvaged
-//!    table, or whose check finds an entry missing or extra, has its `_id`
-//!    index and its other indexes rebuilt from its documents.
-//! 4. When the claims table was salvaged, every `_id` claim is dropped and
-//!    taken again from the documents as the store reopens.
+//!    documents table was salvaged, or whose indexes (the `_id` index
+//!    included) were in a salvaged table, or whose check finds an entry
+//!    missing or extra, has its `_id` index and its other indexes rebuilt from
+//!    its documents.
 //!
 //! Two documents a salvage brought back with the same `_id` (a deleted one
 //! resurrected beside its replacement) keep the earlier one in the `_id`
@@ -72,9 +72,7 @@ pub fn repair(
 
     let storage = Storage::open_with_options(home, opts)?;
     let salvaged = |t: &str| report.salvaged.iter().any(|s| s == t);
-    let shared_index_salvaged = [NAT_SEQ_TABLE, UNIQ_TABLE, IDX_TABLE]
-        .iter()
-        .any(|t| salvaged(t));
+    let shared_index_salvaged = salvaged(IDX_TABLE);
     let mut rebuilt = Vec::new();
     let mut duplicates = 0u64;
     for db in storage.list_databases()? {
@@ -84,7 +82,7 @@ pub fn repair(
             let check = storage.check_collection(&db, &coll)?;
             let inconsistent = check_disagrees(&check);
             let table = storage.collection_table_name(&db, &coll)?;
-            let table_salvaged = table.as_deref().is_some_and(&salvaged)
+            let table_salvaged = table.as_deref().is_some_and(salvaged)
                 || storage
                     .index_table_names(&db, &coll)?
                     .iter()
@@ -104,17 +102,8 @@ pub fn repair(
              _id index"
         ));
     }
-    let claims_salvaged = salvaged(UNIQ_TABLE);
-    if claims_salvaged {
-        storage.purge_all_id_claims()?;
-    }
     storage.close()?;
     drop(storage);
-    if claims_salvaged {
-        // The open takes the `_id` claims again from the documents.
-        let storage = Storage::open_with_options(home, opts)?;
-        storage.close()?;
-    }
     report.rebuilt = rebuilt;
     report.duplicate_ids = duplicates;
     Ok(report)
@@ -213,67 +202,80 @@ impl Storage {
         let _gen = self.ddl_generation_scope();
         let session = self.conn.open_session()?;
 
-        // The `_id` index: emptied, then one row per document.
-        loop {
-            session.begin_transaction(None)?;
-            let removed = (|| -> Result<usize> {
-                let cur = session.open_cursor(NAT_SEQ_TABLE, None)?;
-                cur.set_key_ssu(db, coll, b"");
-                let mut more = match cur.search_near() {
-                    Ok(cmp) if cmp < 0 => cur.next()?,
-                    Ok(_) => true,
-                    Err(e) if e.is_not_found() => false,
-                    Err(e) => return Err(e.into()),
-                };
-                let mut keys = Vec::new();
-                while more && keys.len() < PURGE_CHUNK_MAX_ROWS {
-                    let (d, c, k) = cur.get_key_ssu()?;
-                    if d != db || c != coll {
-                        break;
+        // The `_id` index: emptied, then one entry per document.
+        let id_table = index_table_of(&session, db, coll, ID_INDEX_NAME)?;
+        if let Some(table) = &id_table {
+            loop {
+                session.begin_transaction(None)?;
+                let removed = (|| -> Result<usize> {
+                    let cur = session.open_cursor(table, None)?;
+                    let mut keys = Vec::new();
+                    let mut more = cur.next()?;
+                    while more && keys.len() < PURGE_CHUNK_MAX_ROWS {
+                        keys.push(cur.get_key_u()?);
+                        more = cur.next()?;
                     }
-                    keys.push(k);
-                    more = cur.next()?;
-                }
-                let del = session.open_cursor(NAT_SEQ_TABLE, None)?;
-                for k in &keys {
-                    del.set_key_ssu(db, coll, k);
-                    del.remove()?;
-                }
-                Ok(keys.len())
-            })();
-            match removed {
-                Ok(n) => {
-                    commit_stamped(&session, &self.oplog, self.timestamped)?;
-                    if n < PURGE_CHUNK_MAX_ROWS {
-                        break;
+                    let del = session.open_cursor(table, None)?;
+                    let mut bytes = 0i64;
+                    for k in &keys {
+                        del.set_key_u(k);
+                        del.remove()?;
+                        bytes += k.len() as i64;
                     }
-                }
-                Err(e) => {
-                    session.rollback_transaction(None)?;
-                    return Err(e);
+                    self.sizes
+                        .adjust(&session, db, coll, Delta::entries(ID_INDEX_NAME, -bytes));
+                    Ok(keys.len())
+                })();
+                match removed {
+                    Ok(n) => {
+                        commit_stamped(&session, &self.oplog, self.timestamped)?;
+                        if n < PURGE_CHUNK_MAX_ROWS {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        session.rollback_transaction(None)?;
+                        return Err(e);
+                    }
                 }
             }
         }
-        let mut rows: Vec<(i64, Vec<u8>)> = Vec::new();
-        self.visit_docs(&session, db, coll, |recordid, idk, _| {
-            rows.push((recordid, idk.to_vec()));
+        let mut rows: Vec<(i64, Document)> = Vec::new();
+        self.visit_docs(&session, db, coll, |recordid, _idk, blob| {
+            if id_table.is_some() {
+                rows.push((recordid, decode_doc(blob)?));
+            }
             Ok(())
         })?;
+        let shape = self.id_shape(&session, db, coll)?;
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
         let mut duplicates = 0u64;
         for chunk in rows.chunks(PURGE_CHUNK_MAX_ROWS) {
             session.begin_transaction(None)?;
             let written = (|| -> Result<u64> {
-                let cur = session.open_cursor(NAT_SEQ_TABLE, None)?;
+                let Some(table) = &id_table else {
+                    return Ok(0);
+                };
+                let cur = session.open_cursor(table, None)?;
                 let mut dup = 0u64;
-                for (recordid, idk) in chunk {
-                    if !seen.insert(idk.clone()) {
+                for (recordid, doc) in chunk {
+                    let id = doc.get("_id").unwrap_or(&Bson::Null);
+                    let entry = shape
+                        .id_entry(id, *recordid)
+                        .map_err(|_| StorageError::UnsupportedId)?;
+                    if !seen.insert(entry.key.clone()) {
                         dup += 1;
                         continue;
                     }
-                    cur.set_key_ssu(db, coll, idk);
-                    cur.set_value_q(*recordid);
+                    cur.set_key_u(&entry.key);
+                    cur.set_value_u(&entry.value);
                     cur.insert()?;
+                    self.sizes.adjust(
+                        &session,
+                        db,
+                        coll,
+                        Delta::entries(ID_INDEX_NAME, entry.key.len() as i64),
+                    );
                 }
                 Ok(dup)
             })();
@@ -289,7 +291,7 @@ impl Storage {
             }
         }
 
-        // Every other index, as `rebuild_outdated_indexes` rebuilds one:
+        // Every other index, as a build makes one:
         // its catalog row, entries and claims dropped, then built again.
         let mut indexes: Vec<(String, Document, Document)> = Vec::new();
         {
@@ -329,7 +331,6 @@ impl Storage {
                 // Its entries are in a table of its own: dropped (once this
                 // commits), and a new one built.
                 self.unplace_index(&session, db, coll, name)?;
-                self.purge_unique_claims(&session, db, coll, Some(name))?;
                 self.create_index_in_txn(&session, db, coll, name, key, options, false)?;
                 Ok(())
             })();
@@ -342,21 +343,5 @@ impl Storage {
             }
         }
         Ok(duplicates)
-    }
-
-    /// Drop every `_id` claim and the markers that say they were taken, so
-    /// the next open takes them again from the documents (a repair whose
-    /// claims table was salvaged).
-    pub(crate) fn purge_all_id_claims(&self) -> Result<()> {
-        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let session = self.conn.open_session()?;
-        session.begin_transaction(None)?;
-        match self.purge_id_claims(&session) {
-            Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped),
-            Err(e) => {
-                session.rollback_transaction(None)?;
-                Err(e)
-            }
-        }
     }
 }

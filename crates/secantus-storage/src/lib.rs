@@ -13,8 +13,9 @@
 //!   table yields insertion (natural / RecordId) order, and the `id_key`
 //!   (`sortkey.encode_value(_id)`, needed to maintain the `_id` + secondary
 //!   indexes and NOT reconstructable for suffixed timeseries keys) rides in-band
-//!   in the value (see `frame_doc_value`). The `_id` index (`secantus_natural_seq`:
-//!   `(db, coll, id_key) -> RecordId`) resolves an `_id` to its RecordId;
+//!   in the value (see `frame_doc_value`). The `_id` index (`_id_`, a table
+//!   of its own, `index-<UUID>`: the KeyString of `_id` -> the RecordId, as
+//!   mongod's) resolves an `_id` to its RecordId;
 //! * inserts write the `_id` index with a non-overwriting cursor so a duplicate
 //!   `_id` surfaces as a duplicate-key error;
 //! * a global lock serialises public methods (1:1 with `storage.py`'s `RLock`).
@@ -398,12 +399,6 @@ pub struct UserTransactionHandle {
     /// and not at the second one's first write.
     defer_creates: bool,
     deferred_creates: BTreeMap<(String, String), Vec<u8>>,
-    /// For each of `deferred_creates`, the name its `_id` index rows and
-    /// unique claims are kept under until the commit moves them (`key_coll`):
-    /// keyed by the plain name, two transactions that each created the
-    /// collection and stored one `_id` would conflict at the second insert,
-    /// where mongod fails the second COMMIT.
-    deferred_keys: BTreeMap<(String, String), String>,
     /// For each of `deferred_creates`, the table its documents went into
     /// (`mdb_catalog::Placement`), recorded in `secantus_idents` and
     /// `_mdb_catalog` when the commit writes the registry row.
@@ -835,8 +830,12 @@ fn next_catalog_id() -> i64 {
 /// `_mdb_catalog` row it will be listed under. A table is not part of any
 /// transaction: one a rollback orphans is dropped when nothing reads it
 /// (`Storage::drop_ident_table`), or at the next open.
-fn place_new_collection(session: &Session, data_nonlogged: bool) -> Result<mdb_catalog::Placement> {
-    let placement = mdb_catalog::Placement {
+fn place_new_collection(
+    session: &Session,
+    coll: &str,
+    data_nonlogged: bool,
+) -> Result<mdb_catalog::Placement> {
+    let mut placement = mdb_catalog::Placement {
         ident: mdb_catalog::new_collection_ident(),
         catalog_id: next_catalog_id(),
         indexes: BTreeMap::new(),
@@ -845,6 +844,17 @@ fn place_new_collection(session: &Session, data_nonlogged: bool) -> Result<mdb_c
         &placement.table(),
         &data_table_cfg(mdb_catalog::COLLECTION_TABLE_CFG, data_nonlogged),
     )?;
+    // The `_id_` index's table, made with the collection as mongod makes it
+    // (`formatVersion=8`: the RecordId is the value). `system.profile` has
+    // no `_id` index.
+    if coll != PROFILE_COLLECTION {
+        let ident = mdb_catalog::new_index_ident();
+        session.create(
+            &mdb_catalog::table_uri(&ident),
+            &data_table_cfg(mdb_catalog::INDEX_TABLE_CFG, data_nonlogged),
+        )?;
+        placement.indexes.insert(ID_INDEX_NAME.to_string(), ident);
+    }
     Ok(placement)
 }
 
@@ -998,18 +1008,14 @@ pub(crate) fn collection_table(session: &Session, db: &str, coll: &str) -> Resul
 }
 
 /// The WiredTiger table that holds index `name`'s entries on `(db, coll)`
-/// (`$listCatalog`'s `idxIdent`, `pg_relation_filepath`): the `_id` index is
-/// still the `_id -> RecordId` map (the next step of the storage model gives
-/// it a table of its own); every other index is an `index-<UUID>` table.
+/// (`$listCatalog`'s `idxIdent`, `pg_relation_filepath`): an `index-<UUID>`
+/// table, the `_id` index's included.
 pub(crate) fn index_table_of(
     session: &Session,
     db: &str,
     coll: &str,
     name: &str,
 ) -> Result<Option<String>> {
-    if name == ID_INDEX_NAME {
-        return Ok(Some(NAT_SEQ_TABLE.to_string()));
-    }
     Ok(index_ident(session, db, coll, name)?.map(|i| mdb_catalog::table_uri(&i)))
 }
 
@@ -1022,8 +1028,6 @@ pub const CATALOG_TABLE: &str = COLL_TABLE;
 pub enum IndexPos<'a> {
     /// The first entry (or the last, reading backward).
     Edge,
-    /// A raw `_id` key (the `_id` index only).
-    Raw(&'a [u8]),
     /// The entries holding these leading key values, whatever follows them:
     /// forward, from the first of them; backward, from the last.
     Values(&'a [Bson]),
@@ -1762,78 +1766,10 @@ fn unframe_doc_value(value: &[u8]) -> Result<(&[u8], &[u8])> {
     Ok((&rest[..len], &rest[len..]))
 }
 
-/// Refuse to open a store whose index entries predate the RecordId entry format
-/// (step 2). Those entries carry the doc's `id_key` in their trailing half; this
-/// build reads that half as an 8-byte RecordId. Unlike the step-1 doc-table
-/// change this is NOT visible in WiredTiger's `key_format` (still `SSSu` either
-/// way) — the difference is inside the value bytes — so the index catalog
-/// carries an explicit `options.entryFormat` marker and its absence is the
-/// signal.
-///
-/// There is deliberately **no migration**: the Rust servers are pre-1.0 beta
-/// with no upgrading users, so refusing to open beats re-packing every index
-/// entry on a path that has to be perfect. (`unpack_entry` already returns
-/// `None` for a legacy entry rather than mis-reading it, so nothing fetches the
-/// wrong document even before this fires — this turns a silent
-/// nothing-matches into a loud refusal.)
-fn reject_legacy_index_entry_format(session: &Session) -> Result<()> {
-    let c = match session.open_cursor(IDX_TABLE, None) {
-        Ok(c) => c,
-        Err(e) if e.is_not_found() => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    let mut more = c.next()?;
-    while more {
-        let (db, coll, name) = c.get_key_sss()?;
-        let blob = c.get_value_u()?;
-        if !blob.is_empty() {
-            let d = decode_doc(&blob)?;
-            let fmt = d
-                .get_document("options")
-                .ok()
-                .and_then(|o| o.get_i32("entryFormat").ok())
-                .unwrap_or(1);
-            if fmt < OLDEST_REBUILDABLE_ENTRY_FORMAT {
-                return Err(StorageError::Internal(format!(
-                    "SecantusDB storage at this path has index entries written by a \
-                     build before the RecordId index-entry change: index '{name}' on \
-                     '{db}.{coll}' is entryFormat {fmt}, but this build requires \
-                     {ENTRY_FORMAT}. There is no in-place upgrade (pre-1.0 \
-                     beta, no migration) — start from a fresh data directory, drop and \
-                     recreate the indexes, or downgrade to the build that wrote it."
-                )));
-            }
-        }
-        more = c.next()?;
-    }
-    Ok(())
-}
-
 const IDX_TABLE: &str = "table:secantus_indexes";
-/// Unique-index key claims: `(db, coll, index, escaped_sortkey) -> RecordId`.
-///
-/// The entries table cannot enforce uniqueness itself — its key carries the
-/// RecordId, so two different docs sharing an indexed value occupy two distinct
-/// WT keys and never collide. Uniqueness was therefore a *probe read*, which by
-/// construction cannot see a value committed after the caller's snapshot nor one
-/// an open transaction is holding uncommitted: a transaction and a concurrent
-/// writer could each insert the same value and both commit. This table keys on
-/// the value alone, so WiredTiger rejects the second claim itself. Mirrors the
-/// Python server's `_UNIQ_TABLE` (#775).
-const UNIQ_TABLE: &str = "table:secantus_unique_keys";
-
 /// Ceiling on the number of keys one doc may contribute to a compound index
 /// when more than one indexed field is array-valued (the cartesian product).
 const MAX_COMPOUND_KEYS: usize = 10_000;
-
-// Natural-order (insertion) index. mongod returns an unsorted `find()` in
-// insertion (storage / RecordId) order, which equals `_id` order only for
-// monotonic `_id`s — so a separate seq index is needed. `NAT_TABLE` maps a
-// monotonic insertion `seq` to the doc's `id_key`; `NAT_SEQ_TABLE` is the reverse
-// (so a delete can find and drop the seq). Mirrors the Python storage's
-// `secantus_natural` / `secantus_natural_seq`.
-const NAT_TABLE: &str = "table:secantus_natural";
-const NAT_SEQ_TABLE: &str = "table:secantus_natural_seq";
 
 // Oplog / change-stream tables (Phase 4 sub-phase 3). `q`-keyed (int64 seq) for
 // the oplog + pre-images; a single `S` key ("state") for the recovery metadata.
@@ -2421,17 +2357,11 @@ struct IndexDesc {
     /// `Some` for a `2dsphere` S2 index — its field. Writes covering cells +
     /// ancestors per geometry, not `index_key_variants`.
     geo_sphere: Option<GeoSphere>,
-    /// The `_id` of a collection with a default collation: not a catalog
-    /// index and with no entries, only a claim in `UNIQ_TABLE` under the
-    /// collated key. The `_id` index proper is keyed by value, so it lets
-    /// `"A"` in beside `"a"`; mongod, whose `_id` index takes the
-    /// collection's collation, refuses it. See [`Storage::index_descs`].
-    id_claim: bool,
-    /// With `id_claim`: the collection is clustered.
+    /// The collection is clustered (a duplicate key is reported as
+    /// mongod reports one on a clustered collection's key).
     clustered: bool,
     /// The BinData order this index's keys are written in (see
-    /// [`BINDATA_ORDER_OPT`]); an `_id` claim's is always
-    /// [`BinDataOrder::Format4`].
+    /// [`BINDATA_ORDER_OPT`]).
     key_order: BinDataOrder,
 }
 
@@ -2454,6 +2384,74 @@ impl IndexDesc {
     /// How this index's values become the KeyString its entries are keyed by.
     fn shape(&self) -> KeyShape {
         KeyShape::new(&self.key_spec, self.collation.clone(), self.key_order)
+    }
+}
+
+/// The shape of an `_id_` index's keys under `collation`.
+fn id_key_shape(collation: Option<Collation>) -> KeyShape {
+    KeyShape::new(&bson::doc! {"_id": 1i32}, collation, BinDataOrder::Mongod)
+}
+
+/// A collection's `_id_` table opened for a read or a batch of writes: its
+/// cursor (none when the collection has no `_id` index) and the shape of its
+/// keys.
+struct IdIndex {
+    cur: Option<Cursor>,
+    shape: KeyShape,
+    /// The table's URI, for a write conflict's cause.
+    uri: String,
+}
+
+/// `(db, coll)`'s `_id_` table opened with `config`, its keys shaped by
+/// `shape`; an index with no table has no cursor ([`IdIndex`]).
+fn open_id_index(
+    session: &Session,
+    db: &str,
+    coll: &str,
+    config: Option<&str>,
+    shape: KeyShape,
+) -> Result<IdIndex> {
+    let Some(ident) = index_ident(session, db, coll, ID_INDEX_NAME)? else {
+        return Ok(IdIndex::none());
+    };
+    let uri = mdb_catalog::table_uri(&ident);
+    let cur = match session.open_cursor(&uri, config) {
+        Ok(c) => c,
+        Err(e) if e.is_missing_table() => return Err(index_gone()),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(IdIndex {
+        cur: Some(cur),
+        shape,
+        uri,
+    })
+}
+
+impl IdIndex {
+    fn none() -> IdIndex {
+        IdIndex {
+            cur: None,
+            shape: id_key_shape(None),
+            uri: String::new(),
+        }
+    }
+
+    /// The RecordId the document with this `_id` has, if there is one.
+    fn recordid_of(&self, id: &Bson) -> Result<Option<i64>> {
+        let Some(cur) = &self.cur else {
+            return Ok(None);
+        };
+        let key = self
+            .shape
+            .id_key(id)
+            .map_err(|_| StorageError::UnsupportedId)?;
+        cur.reset()?;
+        cur.set_key_u(&key);
+        match cur.search() {
+            Ok(()) => Ok(ixkeys::id_entry_rid(&cur.get_value_u()?)),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -2926,9 +2924,8 @@ pub fn wt_config(
 // with snappy and zstd, which are compiled from mongo's copies everywhere.
 // RecordId keying: the doc table is keyed by (db, coll, RecordId:i64) — the
 // monotonic per-collection insertion seq — not by id_key. This puts the table in
-// insertion order (so the `secantus_natural` forward table is dropped) and cuts
-// write amplification 4->3. `secantus_natural_seq` (id_key -> RecordId) is the
-// `_id` index. See tasks/rust-recordid-plan.md.
+// insertion order and cuts write amplification 4->3. The `_id_` index table
+// maps `_id` -> RecordId. See tasks/rust-recordid-plan.md.
 //
 // **snappy, everywhere** (2026-11-19): mongod's own collection compressor,
 // built into WiredTiger on every platform from mongo's copy
@@ -2957,14 +2954,6 @@ const BOOTSTRAP: &[(&str, &str)] = &[
     (mdb_catalog::IDENTS_TABLE, "key_format=SS,value_format=u"),
     (TOMB_TABLE, "key_format=SS,value_format=u"),
     ("table:secantus_indexes", "key_format=SSS,value_format=u"),
-    (
-        "table:secantus_unique_keys",
-        "key_format=SSSu,value_format=q",
-    ),
-    (
-        "table:secantus_natural_seq",
-        "key_format=SSu,value_format=q",
-    ),
     // NOTE: table:secantus_oplog is created in `open_with_config_durable`
     // (its config depends on `oplog_table_cfg()`).
     ("table:secantus_oplog_meta", "key_format=S,value_format=u"),
@@ -3568,15 +3557,6 @@ const GEO_KEYS: &str = "geoKeys";
 /// The value of [`GEO_KEYS`] this build writes.
 const GEO_KEY_FORMAT: i32 = 2;
 
-/// Catalog marker on an index: the number-key format
-/// (`sortkey::NUMBER_KEY_FORMAT`) its entries were written with. An index
-/// without it was built before 2026-10-15, when a double was keyed by its
-/// shortest decimal rather than its exact value and every number whose
-/// exponent fell outside -128..=127 shared one key per sign; it is rebuilt
-/// when the store opens. Both servers write and read it. Not a user option:
-/// `listIndexes` strips it.
-const NUMBER_KEYS: &str = "numberKeys";
-
 /// The order an index was built in, among its collection's (RM-081): mongod
 /// lists indexes, and tries their plans, in build order. One more than the
 /// collection's highest; an index built before this was recorded has none
@@ -3595,41 +3575,7 @@ fn build_seq(opts: &Document) -> i64 {
 
 /// Options only this server's catalog carries, which a rebuild leaves out of
 /// the options it builds from: `create_index_in_txn` stamps them again.
-const BUILD_STAMPS: &[&str] = &[
-    "entryFormat",
-    "multikey",
-    MULTIKEY_PATHS,
-    COLLATION_KEYS,
-    GEO_KEYS,
-    NUMBER_KEYS,
-    "pythonKeys",
-];
-
-/// Whether an index's entries were written by rules this build does not
-/// read them by (see `rebuild_outdated_indexes`).
-fn index_entries_outdated(key: &Document, opts: &Document) -> bool {
-    if opts.get_i32(NUMBER_KEYS).ok() != Some(sortkey::NUMBER_KEY_FORMAT) {
-        return true;
-    }
-    // Format 4 has format 5's entry layout and keys only BinData,
-    // JavaScript-with-scope and MaxKey differently, so it is re-keyed rather
-    // than refused (`OLDEST_REBUILDABLE_ENTRY_FORMAT`).
-    if opts.get_i32("entryFormat").ok() < Some(ENTRY_FORMAT) {
-        return true;
-    }
-    if parse_geo_2d(key, opts).is_some() {
-        return opts.get_i32(GEO_KEYS).ok() != Some(GEO_KEY_FORMAT);
-    }
-    if parse_geo_sphere(key).is_some() {
-        return !matches!(opts.get_i32(GEO_KEYS), Ok(1) | Ok(GEO_KEY_FORMAT));
-    }
-    let collated = opts
-        .get_document("collation")
-        .ok()
-        .and_then(secantus_core::collation::parse)
-        .is_some();
-    collated && opts.get_i32(COLLATION_KEYS).ok() != Some(secantus_core::collation::KEY_FORMAT)
-}
+const BUILD_STAMPS: &[&str] = &["multikey", MULTIKEY_PATHS, COLLATION_KEYS, GEO_KEYS];
 
 /// The catalog option recording an index whose keys put BinData in
 /// PostgreSQL's byte order (`"bytes"`): one the PG server built. Absent means
@@ -3663,67 +3609,6 @@ fn index_key_collation(opts: &Document) -> Option<Collation> {
     secantus_core::collation::parse(opts.get_document("collation").ok()?)
 }
 
-/// Order-preserving escape so `\x00\x00` is unambiguous as a separator: every
-/// `0x00` byte becomes `0x00 0xff`. Mirrors `storage._escape_kb`.
-fn escape_kb(kb: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(kb.len());
-    for &b in kb {
-        out.push(b);
-        if b == 0 {
-            out.push(0xff);
-        }
-    }
-    out
-}
-
-/// On-disk index-ENTRY format version, recorded per index as
-/// `options.entryFormat` in the index catalog:
-///
-/// * 1 (implicit, absent) — entries whose trailing half is the doc's `id_key`.
-/// * 2 — entries whose trailing half is the 8-byte RecordId.
-/// * 3 — `sortkey` gives JavaScript its own type rank (13) instead of the
-///   string rank, which shifts MaxKey from 13 to 14. Every key byte for a
-///   JavaScript or MaxKey value therefore changes. A version-2 store would read
-///   back in the OLD order, and since `order::type_rank` moved with it, the
-///   index and a collection scan would disagree — an index that changes the
-///   sort answer.
-/// * 4 — documents and arrays are keyed by VALUE (`sortkey::encode_doc`):
-///   type, then name, then value per element, the way mongod compares them.
-///   Formats 1-3 keyed them by raw BSON, whose leading length made byte order
-///   SIZE order, so ranges, partial-filter implication and sort walks over
-///   document keys had to be refused. `_id` keys are NOT index entries and
-///   kept the old encoding until `_id` key format 2 (`sortkey::ID_KEY_FORMAT`,
-///   `Storage::upgrade_id_keys`).
-/// * 5 — BinData keys carry the subtype between length and bytes, and
-///   JavaScript-with-scope has a rank of its own after JavaScript (14, which
-///   moves MaxKey to 15) keyed by code then scope: mongod's order
-///   (RM-232 / RM-233, decided by Joe 2026-10-21). A format-4 index is
-///   rebuilt when the store opens (`index_entries_outdated`); formats 1-3 are
-///   still refused. The PG server's indexes record PostgreSQL's BinData order
-///   instead (`BINDATA_ORDER_OPT`).
-/// * 6 — an index's entries are mongod's keys in mongod's order, so that a
-///   cursor can walk them and return what mongod's walk returns (RM-080,
-///   2026-10-27). A DESCENDING field's key is the ascending key inverted and
-///   then terminated (`sortkey::DESC_END`): inverted alone, `"a"` sorted
-///   before `"ab"` where the field's order has `"ab"` first. An empty leaf
-///   array is keyed `undefined` (after MinKey, before null), and an element
-///   on a dotted path that does not reach the leaf is keyed null in an index
-///   that is not sparse (`secantus_core::index_keys`); format 5 kept neither.
-///   The whole-array key this store writes besides mongod's keys stays. A
-///   format-5 index (and a format-4 one) is rebuilt when the store opens.
-///
-/// The catalog is the only place this is visible — the WT `key_format` is
-/// `SSSu` for all three — so the marker is how an older store is detected
-/// (`reject_legacy_index_entry_format`). The deprecated Python servers' `_ENTRY_FORMAT`
-/// stays at 4: compatibility with them is no longer a constraint (2026-10-16).
-const ENTRY_FORMAT: i32 = 6;
-
-/// The oldest entry format an open brings up to date by rebuilding the index
-/// (`rebuild_outdated_indexes`) instead of refusing the store: 4, whose entries
-/// are laid out as 5's and differ only in how a few types are keyed. A store
-/// the deprecated Python servers write is format 4, and opens.
-const OLDEST_REBUILDABLE_ENTRY_FORMAT: i32 = 4;
-
 /// Whether an index entry's key is a whole-array key rather than an element key.
 ///
 /// The first byte of an entry's KeyString is the type byte of its first
@@ -3741,51 +3626,6 @@ fn is_whole_array_key(key: &[u8], idx_dir: i32) -> bool {
             first == expected
         }
     }
-}
-
-/// [`Storage::index_entries_from`] over the `_id` index: up to `max`
-/// `(id_key, RecordId)` of `db.coll` from `from` on (past it when `past`),
-/// in `id_key` order, or descending from `from` down when `backward`.
-fn id_entries_from(
-    session: &Session,
-    db: &str,
-    coll: &str,
-    from: &[u8],
-    past: bool,
-    max: usize,
-    backward: bool,
-) -> Result<Vec<(Vec<u8>, i64)>> {
-    let cur = session.open_cursor(NAT_SEQ_TABLE, None)?;
-    let kc = key_coll(db, coll);
-    cur.set_key_ssu(db, &kc, from);
-    let mut more = match cur.search_near() {
-        Ok(0) if past => {
-            if backward {
-                cur.prev()?
-            } else {
-                cur.next()?
-            }
-        }
-        Ok(cmp) if backward => cmp <= 0 || cur.prev()?,
-        Ok(cmp) => cmp >= 0 || cur.next()?,
-        Err(e) if e.is_not_found() => false,
-        Err(e) => return Err(e.into()),
-    };
-    let mut out = Vec::with_capacity(max.min(1024));
-    while more && out.len() < max {
-        // The streamed reads poll the `maxTimeMS` budget and `killOp`
-        // where the whole-collection scan does.
-        if deadline::check().is_err() {
-            return Err(StorageError::MaxTimeExpired);
-        }
-        let (d, c, id_key) = cur.get_key_ssu()?;
-        if d != db || c != kc.as_ref() {
-            break;
-        }
-        out.push((id_key, cur.get_value_q()?));
-        more = if backward { cur.prev()? } else { cur.next()? };
-    }
-    Ok(out)
 }
 
 /// Join compound key parts with `COMPOUND_SEP` between components (mirrors
@@ -4011,7 +3851,6 @@ fn index_desc_from(name: String, key_spec: Document, opts: &Document) -> IndexDe
         partial,
         geo_2d,
         geo_sphere,
-        id_claim: false,
         clustered: false,
         key_order: index_bindata_order(opts),
     }
@@ -4860,7 +4699,7 @@ fn conflict_key_value(
 /// `encode_value(_id)`, so `_id` equality is a primary-key point lookup, not a
 /// COLLSCAN — and `_id_` is virtual (no entries table). `$in` keys come back
 /// deduplicated in ascending byte order. Mirrors `storage._id_point_lookup_keys`.
-fn id_point_lookup_keys(spec: &Bson) -> Result<Option<Vec<Vec<u8>>>> {
+fn id_point_lookup_keys(spec: &Bson) -> Result<Option<Vec<Bson>>> {
     match spec {
         Bson::Document(d) => {
             let keys: Vec<&String> = d.keys().collect();
@@ -4872,7 +4711,8 @@ fn id_point_lookup_keys(spec: &Bson) -> Result<Option<Vec<Vec<u8>>>> {
                 if matches!(v, Bson::Document(_)) || is_regex_value(v) {
                     return Ok(None);
                 }
-                return Ok(Some(vec![id_key(v)?]));
+                id_key(v)?;
+                return Ok(Some(vec![v.clone()]));
             }
             if keys.len() == 1 && keys[0] == "$in" {
                 let vals = match d.get("$in") {
@@ -4885,16 +4725,20 @@ fn id_point_lookup_keys(spec: &Bson) -> Result<Option<Vec<Vec<u8>>>> {
                 {
                     return Ok(None);
                 }
-                let mut set: BTreeSet<Vec<u8>> = BTreeSet::new();
+                // Distinct values, in `_id` order.
+                let mut set: BTreeMap<Vec<u8>, Bson> = BTreeMap::new();
                 for v in vals {
-                    set.insert(id_key(v)?);
+                    set.insert(id_key(v)?, v.clone());
                 }
-                return Ok(Some(set.into_iter().collect()));
+                return Ok(Some(set.into_values().collect()));
             }
             Ok(None)
         }
         _ if is_regex_value(spec) => Ok(None),
-        _ => Ok(Some(vec![id_key(spec)?])),
+        _ => {
+            id_key(spec)?;
+            Ok(Some(vec![spec.clone()]))
+        }
     }
 }
 
@@ -7184,11 +7028,11 @@ pub fn take_write_conflict_cause() -> Option<String> {
 }
 
 /// mongod's cause for a conflict writing a collection's `_id` index row.
-fn note_id_index_conflict<T>(r: Result<T>) -> Result<T> {
+fn note_id_index_conflict<T>(r: Result<T>, uri: &str) -> Result<T> {
     if matches!(r, Err(StorageError::WriteConflict)) {
         CONFLICT_CAUSE.with(|c| {
             *c.borrow_mut() = Some(format!(
-                "WiredTigerIdIndex::_insert: index: _id_; uri: {NAT_SEQ_TABLE}"
+                "WiredTigerIdIndex::_insert: index: _id_; uri: {uri}"
             ))
         });
     }
@@ -7905,52 +7749,6 @@ fn load_stable_marker(session: &Session) -> Option<(i64, bool)> {
     None
 }
 
-/// The oplog-meta row recording a store's number-key format (see
-/// `Storage::upgrade_number_keys`).
-const NUMBER_KEYS_META: &str = "numberKeys";
-
-/// The oplog-meta row recording a store's `_id` key format
-/// (`sortkey::ID_KEY_FORMAT`; see `Storage::upgrade_id_keys`).
-const ID_KEYS_META: &str = "idKeys";
-
-/// The `_id` key format a store's keys are in: 1 when it never recorded one
-/// (every store written before 2026-10-27).
-fn stored_id_key_format(session: &Session) -> Result<i32> {
-    let c = match session.open_cursor(OPLOG_META_TABLE, None) {
-        Ok(c) => c,
-        Err(e) if e.is_missing_table() || e.is_not_found() => return Ok(1),
-        Err(e) => return Err(e.into()),
-    };
-    c.set_key_s(ID_KEYS_META);
-    match c.search() {
-        Ok(()) => {
-            let d = decode_doc(&c.get_value_u()?)?;
-            Ok(d.get_i32("format").unwrap_or(1))
-        }
-        Err(e) if e.is_not_found() => Ok(1),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// The number-key format a store's keys are in: 1 when it never recorded
-/// one (every store written before 2026-10-15).
-fn stored_number_key_format(session: &Session) -> Result<i32> {
-    let c = match session.open_cursor(OPLOG_META_TABLE, None) {
-        Ok(c) => c,
-        Err(e) if e.is_missing_table() || e.is_not_found() => return Ok(1),
-        Err(e) => return Err(e.into()),
-    };
-    c.set_key_s(NUMBER_KEYS_META);
-    match c.search() {
-        Ok(()) => {
-            let d = decode_doc(&c.get_value_u()?)?;
-            Ok(d.get_i32("format").unwrap_or(1))
-        }
-        Err(e) if e.is_not_found() => Ok(1),
-        Err(e) => Err(e.into()),
-    }
-}
-
 fn load_oplog_meta(session: &Session) -> Result<OplogState> {
     let c = session.open_cursor(OPLOG_META_TABLE, None)?;
     c.set_key_s("state");
@@ -8615,9 +8413,6 @@ impl Storage {
             // intact for this check. (Runs before `migrate_legacy_docs` — that
             // path is the pre-*shard* case, which this check does not touch.)
             reconcile_idents(&boot)?;
-            // Same fail-fast for the index-ENTRY format (step 2). Runs after the
-            // doc-table check so the more fundamental mismatch is reported first.
-            reject_legacy_index_entry_format(&boot)?;
             // Recover the oplog seq / timestamp counters from the meta row, or
             // reconstruct them by scanning the oplog table.
             load_oplog_meta(&boot)?
@@ -8788,10 +8583,6 @@ impl Storage {
         // Before the store takes any write -- crash recovery's replay and the
         // upgrades below write documents, and each write moves the counts.
         storage.open_size_storer(&size_fingerprint)?;
-        // Before anything looks a key up: crash recovery below replays writes
-        // by `_id`.
-        storage.upgrade_number_keys()?;
-        storage.upgrade_id_keys()?;
         // Before recovery's replay, which records the pre-images of the
         // writes it replays beside them.
         storage.migrate_legacy_pre_images()?;
@@ -8814,12 +8605,8 @@ impl Storage {
         // Finish any chunked drop a crash interrupted (registry row already
         // gone; the leftover rows must not resurface under a re-created name).
         storage.recover_pending_drops()?;
-        // Before a revived prepared transaction can write through an index.
-        storage.rebuild_outdated_indexes()?;
         storage.revive_prepared_xacts()?;
         storage.note_existing_timeseries()?;
-        storage.backfill_document_id_claims()?;
-        storage.backfill_collated_id_claims()?;
         // `_mdb_catalog` from the registry, after everything above that can
         // rewrite index rows.
         if !storage.in_memory {
@@ -9559,7 +9346,7 @@ impl Storage {
     /// stream sees a `create` event before the first insert (mongod 8.2.11,
     /// with `showExpandedEvents`).
     fn create_for_write(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
-        if ensure_collection(session, db, coll, self.data_nonlogged)? && self.enable_oplog {
+        if ensure_collection(self, session, db, coll)? && self.enable_oplog {
             self.emit_create_oplog(session, db, coll, &Document::new())?;
         }
         Ok(())
@@ -11281,7 +11068,7 @@ impl Storage {
         let ns_lock = self.coll_lock(db, coll);
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.catalog_write(|session| {
-            ensure_collection(session, db, coll, self.data_nonlogged)?;
+            ensure_collection(self, session, db, coll)?;
             let mut current = coll_options(session, db, coll)?.unwrap_or_default();
             for (k, v) in opts {
                 current.insert(k.clone(), v.clone());
@@ -11318,7 +11105,7 @@ impl Storage {
         let ns_lock = self.coll_lock(db, coll);
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.catalog_write(|session| {
-            ensure_collection(session, db, coll, self.data_nonlogged)?;
+            ensure_collection(self, session, db, coll)?;
             let mut current = coll_options(session, db, coll)?.unwrap_or_default();
             // The options BEFORE the merge below: mongod puts these on the `modify`
             // change event as `stateBeforeChange`, and stores them in the oplog
@@ -11386,7 +11173,7 @@ impl Storage {
         // only if still absent.
         let lock = self.coll_lock(db, coll);
         let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
-        ensure_collection(&session, db, coll, self.data_nonlogged)?;
+        ensure_collection(self, &session, db, coll)?;
         collection_uuid(&session, db, coll)
     }
 
@@ -11437,11 +11224,11 @@ impl Storage {
         }
         let (db, coll) = (PRE_IMAGES_DB, PRE_IMAGES_COLL);
         if !collection_registered(session, db, coll)? {
-            ensure_collection(session, db, coll, self.data_nonlogged)?;
+            ensure_collection(self, session, db, coll)?;
             write_coll_options(session, db, coll, &bson::doc! {"clusteredIndex": true})?;
         }
         let doc_cur = open_doc_cursor(session, db, coll, Some("overwrite=false"))?;
-        let nat_cur = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
+        let id_ix = self.id_index(session, db, coll, Some("overwrite=false"))?;
         for blob in records {
             let id = bson::RawDocument::from_bytes(blob)
                 .and_then(|d| d.get("_id"))
@@ -11450,7 +11237,7 @@ impl Storage {
             let id =
                 Bson::try_from(id.to_raw_bson()).map_err(|e| StorageError::Bson(e.to_string()))?;
             let key = id_key(&id)?;
-            let recordid = match self.write_nat_entry_with(&nat_cur, db, coll, &key) {
+            let recordid = match self.write_nat_entry_with(session, &id_ix, db, coll, &id) {
                 Ok(r) => r,
                 Err(StorageError::DuplicateId) => continue,
                 Err(e) => return Err(e),
@@ -11460,7 +11247,7 @@ impl Storage {
             doc_cur.set_value_u(&frame_doc_value(&key, blob));
             doc_cur.insert()?;
             self.sizes
-                .adjust(session, db, coll, Delta::insert(key.len(), blob.len()));
+                .adjust(session, db, coll, Delta::insert(blob.len()));
         }
         Ok(())
     }
@@ -12235,7 +12022,6 @@ impl Storage {
             planner_pending: 0,
             defer_creates: false,
             deferred_creates: BTreeMap::new(),
-            deferred_keys: BTreeMap::new(),
             deferred_placements: BTreeMap::new(),
             written_ns: Vec::new(),
             unattributed: false,
@@ -12582,9 +12368,8 @@ impl Storage {
             // commit, as on mongod (see `deferred_creates`).
             if !handle.deferred_creates.is_empty() {
                 let creates = std::mem::take(&mut handle.deferred_creates);
-                let keys = std::mem::take(&mut handle.deferred_keys);
                 let placed = std::mem::take(&mut handle.deferred_placements);
-                if let Err(e) = flush_deferred_creates(self, &session, creates, keys, placed) {
+                if let Err(e) = flush_deferred_creates(self, &session, creates, placed) {
                     // Nothing of it is committed: `session` drops below and
                     // rolls it back.
                     handle.deregister_minted();
@@ -12765,7 +12550,6 @@ impl Storage {
         let _planner = PlannerScope::ending(handle);
         let _registry = RegistryEnd(std::mem::take(&mut handle.wrote_registry));
         handle.deferred_creates.clear();
-        handle.deferred_keys.clear();
         // The tables made for the collections it created hold nothing anyone
         // can see: they go when nothing reads them (see `drop_ident_table`).
         let made: Vec<String> = std::mem::take(&mut handle.deferred_placements)
@@ -12966,7 +12750,6 @@ impl Storage {
         // finds them there rather than creating them again.
         fresh.defer_creates = handle.defer_creates;
         fresh.deferred_creates = handle.deferred_creates.clone();
-        fresh.deferred_keys = handle.deferred_keys.clone();
         fresh.deferred_placements = handle.deferred_placements.clone();
         // The guard and the rollback are made holding the write lock of every
         // collection the transaction has written a row of (sorted, as the
@@ -13246,13 +13029,12 @@ impl Storage {
         // prepares: the collections it holds until commit go in now.
         if !handle.deferred_creates.is_empty() {
             let creates = std::mem::take(&mut handle.deferred_creates);
-            let keys = std::mem::take(&mut handle.deferred_keys);
             let placed = std::mem::take(&mut handle.deferred_placements);
             let session = handle
                 .session
                 .as_ref()
                 .ok_or_else(|| StorageError::Internal("transaction already closed".into()))?;
-            flush_deferred_creates(self, session, creates, keys, placed)?;
+            flush_deferred_creates(self, session, creates, placed)?;
         }
         let ops = self.transaction_write_set(&mut handle)?;
         // A transaction id for `pg_prepared_xacts.transaction`: one oplog seq,
@@ -13376,7 +13158,7 @@ impl Storage {
         }
         let ns = format!("{db}.{coll}");
         let db_cmd = format!("{db}.$cmd");
-        let mut ids: Vec<Vec<u8>> = Vec::new();
+        let mut ids: Vec<(Vec<u8>, Bson)> = Vec::new();
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
         for blob in self.transaction_write_set(handle)? {
             let raw = bson::RawDocument::from_bytes(&blob)
@@ -13399,7 +13181,7 @@ impl Storage {
                         .map_err(|e: bson::raw::Error| StorageError::Bson(e.to_string()))?;
                     let k = id_key(&id)?;
                     if seen.insert(k.clone()) {
-                        ids.push(k);
+                        ids.push((k, id));
                     }
                 }
                 "i" | "u" | "d" => {}
@@ -13425,8 +13207,8 @@ impl Storage {
             return Ok(Some(TableOverlay { rows }));
         }
         let cur = open_doc_cursor(session, db, coll, None)?;
-        for k in ids {
-            let found = match self.doc_recordid(session, db, coll, &k)? {
+        for (k, id) in ids {
+            let found = match self.doc_recordid(session, db, coll, &id)? {
                 None => None,
                 Some(recordid) => {
                     cur.reset()?;
@@ -13830,13 +13612,13 @@ impl Storage {
                 if let Some(c) = self.unique_conflict(&session, db, coll, &doc, &descs, None)? {
                     // A repeated `_id` is the error mongod reports when both
                     // are repeated; the write below raises it.
-                    if meta.timeseries || self.doc_recordid(&session, db, coll, &key)?.is_none() {
+                    if meta.timeseries || self.doc_recordid(&session, db, coll, &id)?.is_none() {
                         return Err(StorageError::DuplicateKey(Box::new(c)));
                     }
                 }
                 // Mint the RecordId + write the `_id` index (id_key -> RecordId);
                 // this overwrite=false insert is where a duplicate `_id` is caught.
-                let recordid = self.write_nat_entry(&session, db, coll, &key)?;
+                let recordid = self.write_nat_entry(&session, db, coll, &id)?;
                 // Doc table keyed by the (unique) RecordId.
                 let cur = open_doc_cursor(&session, db, coll, None)?;
                 note_row(db, coll, recordid)?;
@@ -13845,7 +13627,7 @@ impl Storage {
                 cur.set_value_u(&frame_doc_value(&key, blob));
                 cur.insert()?;
                 self.sizes
-                    .adjust(&session, db, coll, Delta::insert(key.len(), blob.len()));
+                    .adjust(&session, db, coll, Delta::insert(blob.len()));
                 // Maintain secondary indexes: write this doc's entries (still carrying
                 // id_key as the fetch pointer in step 1; IXSCAN resolves id_key ->
                 // RecordId -> doc), and lazily flag any index this doc makes multikey.
@@ -14083,7 +13865,7 @@ impl Storage {
                 // size, and its entry's position when it was written.
                 let mut outcomes: Vec<(usize, Option<usize>)> = Vec::with_capacity(docs.len());
                 let doc_cur = open_doc_cursor(&session, db, coll, Some("overwrite=false"))?;
-                let nat_cur = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
+                let id_ix = self.id_index(&session, db, coll, Some("overwrite=false"))?;
                 for (offset, doc_bytes) in docs.iter().enumerate() {
                     let index = base_index + offset;
                     outcomes.push((doc_bytes.len(), None));
@@ -14119,12 +13901,7 @@ impl Storage {
                     // the `_id`, as mongod does: the write below finds it.
                     let conflict =
                         match self.unique_conflict(&session, db, coll, doc, &descs, None)? {
-                            Some(_)
-                                if !timeseries
-                                    && self.doc_recordid(&session, db, coll, &key)?.is_some() =>
-                            {
-                                None
-                            }
+                            Some(_) if !timeseries && id_ix.recordid_of(id)?.is_some() => None,
                             other => other,
                         };
                     if let Some(c) = conflict {
@@ -14171,7 +13948,7 @@ impl Storage {
                     // a duplicate `_id` is caught here now (not by the doc-table
                     // insert, which is keyed by the unique RecordId). WT_DUPLICATE_KEY
                     // does not abort the transaction, so unordered inserts continue.
-                    let recordid = match self.write_nat_entry_with(&nat_cur, db, coll, &key) {
+                    let recordid = match self.write_nat_entry_with(&session, &id_ix, db, coll, id) {
                         Ok(r) => r,
                         Err(StorageError::DuplicateId) => {
                             let ns = format!("{db}.{coll}");
@@ -14195,7 +13972,7 @@ impl Storage {
                             // it does a second spelling: the same message,
                             // `keyValue` and extra fields (RM-142, measured 8.2.11).
                             let mut id_conflict: Option<UniqueConflict> = None;
-                            if let Some(claim) = self.id_claim_desc(&session, db, coll)? {
+                            if let Some(claim) = self.id_conflict_desc(&session, db, coll)? {
                                 let kb = claim.key_variants(doc, false)?.into_iter().next();
                                 if let Some(kb) = kb {
                                     let conflict = with_bindata_order(claim.key_order, || {
@@ -14253,7 +14030,7 @@ impl Storage {
                     doc_cur.set_value_u(&frame_doc_value(&key, blob));
                     doc_cur.insert()?;
                     self.sizes
-                        .adjust(&session, db, coll, Delta::insert(key.len(), blob.len()));
+                        .adjust(&session, db, coll, Delta::insert(blob.len()));
                     self.write_index_entries(&session, db, coll, doc, &descs, recordid)?;
                     self.count_index_keys(&session, db, coll, None, Some(doc), &descs)?;
                     self.maybe_mark_multikey(&session, db, coll, doc, &descs)?;
@@ -14427,7 +14204,7 @@ impl Storage {
         }
         let session = self.op_session()?;
         // Resolve `_id` -> RecordId via the `_id` index, then fetch the doc row.
-        let Some(recordid) = self.doc_recordid(&session, db, coll, &key)? else {
+        let Some(recordid) = self.doc_recordid(&session, db, coll, id)? else {
             return Ok(None);
         };
         let cur = open_doc_cursor(&session, db, coll, None)?;
@@ -14473,16 +14250,16 @@ impl Storage {
             self.with_statement_txn(&session, || {
                 // Existence check — resolve the doc's RecordId via the `_id` index,
                 // then read its row so we can retract its entries.
-                let Some(recordid) = self.doc_recordid(&session, db, coll, &key)? else {
+                let Some(recordid) = self.doc_recordid(&session, db, coll, id)? else {
                     return Ok(false);
                 };
                 let probe = open_doc_cursor(&session, db, coll, None)?;
                 probe.set_key_ssq(db, coll, recordid);
-                let (old_idk_len, old_blob) = match probe.search() {
+                let old_blob = match probe.search() {
                     Ok(()) => {
                         let value = probe.get_value_u()?;
-                        let (idk, blob) = unframe_doc_value(&value)?;
-                        (idk.len(), blob.to_vec())
+                        let (_idk, blob) = unframe_doc_value(&value)?;
+                        blob.to_vec()
                     }
                     Err(e) if e.is_not_found() => return Ok(false),
                     Err(e) => return Err(e.into()),
@@ -14519,7 +14296,7 @@ impl Storage {
                     &session,
                     db,
                     coll,
-                    Delta::replace((old_idk_len, old_blob.len()), (key.len(), blob.len())),
+                    Delta::replace(old_blob.len(), blob.len()),
                 );
 
                 // Maintain secondary indexes as a set diff (additions first, removals
@@ -14583,36 +14360,32 @@ impl Storage {
             self.with_statement_txn(&session, || {
                 // Resolve `_id` -> RecordId (read-only; the `_id`-index row is removed
                 // last, by delete_nat_entry, to keep "doc row first, entries after").
-                let Some(recordid) = self.doc_recordid(&session, db, coll, &key)? else {
+                let Some(recordid) = self.doc_recordid(&session, db, coll, id)? else {
                     return Ok(false);
                 };
                 let cur = open_doc_cursor(&session, db, coll, None)?;
                 cur.set_key_ssq(db, coll, recordid);
                 // Read the doc first so we can retract its index entries, then remove.
-                let (old_idk_len, old_blob) = match cur.search() {
+                let old_blob = match cur.search() {
                     Ok(()) => {
                         let value = cur.get_value_u()?;
-                        let (idk, blob) = unframe_doc_value(&value)?;
-                        (idk.len(), blob.to_vec())
+                        let (_idk, blob) = unframe_doc_value(&value)?;
+                        blob.to_vec()
                     }
                     Err(e) if e.is_not_found() => return Ok(false),
                     Err(e) => return Err(e.into()),
                 };
                 undo_note_row(db, coll, &key, Some((recordid, &old_blob)), &old_blob)?;
                 cur.remove()?;
-                self.sizes.adjust(
-                    &session,
-                    db,
-                    coll,
-                    Delta::remove(old_idk_len, old_blob.len()),
-                );
+                self.sizes
+                    .adjust(&session, db, coll, Delta::remove(old_blob.len()));
                 note_deleted(db, coll, &old_blob);
                 let old_doc = decode_doc(&old_blob)?;
                 let descs = self.index_descs(&session, db, coll)?;
                 // `delete_by_id` is a bare-`_id` path (not used for timeseries).
                 self.delete_index_entries(&session, db, coll, &old_doc, &descs, recordid)?;
                 self.count_index_keys(&session, db, coll, Some(&old_doc), None, &descs)?;
-                self.delete_nat_entry(&session, db, coll, &key)?;
+                self.delete_nat_entry(&session, db, coll, id, recordid)?;
                 // Oplog: a delete is op "d" with `o` = `o2` = {_id}. The pre-image (the
                 // deleted doc) is stored when changeStreamPreAndPostImages is enabled.
                 if self.enable_oplog {
@@ -15020,7 +14793,7 @@ impl Storage {
                 if collection_registered(&session, db, coll)? {
                     return Ok(false);
                 }
-                ensure_collection(&session, db, coll, self.data_nonlogged)?;
+                ensure_collection(self, &session, db, coll)?;
                 if !options.is_empty() {
                     // Persist before minting the UUID below — collection_uuid re-reads and
                     // merges, so the options survive.
@@ -15029,6 +14802,13 @@ impl Storage {
                         current.insert(k.clone(), v.clone());
                     }
                     write_coll_options(&session, db, coll, &current)?;
+                    // A time-series collection keeps measurements that repeat
+                    // an `_id`, so it has no `_id` index to hold them
+                    // unique (`is_timeseries`).
+                    if options.contains_key("timeseries") {
+                        self.unplace_index(&session, db, coll, ID_INDEX_NAME)?;
+                        sync_catalog_entry(&session, db, coll)?;
+                    }
                 }
                 if self.enable_oplog {
                     self.emit_create_oplog(&session, db, coll, options)?;
@@ -15224,9 +15004,9 @@ impl Storage {
         Ok(n)
     }
 
-    /// Phase 2 of a chunked drop: delete the unregistered collection's rows in
-    /// bounded batches (each its own statement transaction), then clear the
-    /// tombstone. Caller holds whatever exclusion it needs (the drop path holds
+    /// Phase 2 of a chunked drop: the unregistered collection's rows are in
+    /// tables a drop has unlisted and drops whole, so what is left is its
+    /// index catalog rows; then clear the tombstone. Caller holds whatever exclusion it needs (the drop path holds
     /// the global + namespace locks; open-time recovery runs single-threaded).
     fn purge_dropped_collection(&self, db: &str, coll: &str) -> Result<()> {
         // Planner writes made here are released once they are visible.
@@ -15234,28 +15014,6 @@ impl Storage {
         self.forget_record_ids(db, coll);
         // It writes the index catalog.
         note_planner_write_of(db, coll);
-        loop {
-            let n = self.retry_write_conflicts("drop_collection purge(uniq)", || {
-                let session = self.op_session()?;
-                self.with_statement_txn(&session, || {
-                    self.purge_uniq_batch(&session, db, coll, PURGE_CHUNK_MAX_ROWS)
-                })
-            })?;
-            if n < PURGE_CHUNK_MAX_ROWS {
-                break;
-            }
-        }
-        loop {
-            let n = self.retry_write_conflicts("drop_collection purge(nat)", || {
-                let session = self.op_session()?;
-                self.with_statement_txn(&session, || {
-                    self.purge_nat_batch(&session, db, coll, PURGE_CHUNK_MAX_ROWS)
-                })
-            })?;
-            if n < PURGE_CHUNK_MAX_ROWS {
-                break;
-            }
-        }
         // Final small transaction: the index catalog rows (a handful) and the
         // tombstone itself.
         self.retry_write_conflicts("drop_collection purge(final)", || {
@@ -15504,8 +15262,7 @@ impl Storage {
         //   A. small txn: tombstone DST — a crash mid-copy leaves partial rows
         //      behind an unregistered name with a plain drop tombstone, which
         //      open-time recovery purges (the rename simply never happened);
-        //   B. batched txns: copy src rows to dst (fresh RecordIds, index
-        //      catalog + rebuilt entries + unique claims per batch);
+        //   B. (nothing: the tables move with the placement at the switch);
         //   C. small txn — THE SWITCH: register dst, unregister src, move the
         //      tombstone dst -> src, emit the rename oplog entry. After this
         //      commit the rename has happened; a crash leaves src's rows
@@ -15604,60 +15361,12 @@ impl Storage {
                 Ok(())
             })
         })?;
-        // Phase B: copy in bounded batches, resuming by source RecordId.
-        // Each record keeps its RecordId (so insertion order too), and the
-        // destination numbers on from where the source would have; index
-        // entries + unique claims are rebuilt per doc.
+        // Phase B: nothing to copy. The documents stay in their table, which
+        // moves to the new name at the switch with every index's table, the
+        // `_id` index and the unique indexes' entries among them, each
+        // holding its RecordIds (mongod's rename is catalog-only). The
+        // destination numbers on from where the source would have.
         let src_next = self.next_record_id(src_db, src_coll)?;
-        let mut after: Option<i64> = None;
-        loop {
-            let copied = self.retry_write_conflicts("rename_collection copy", || {
-                let session = self.op_session()?;
-                self.with_statement_txn(&session, || {
-                    let batch = self.scan_docs_batch(
-                        &session,
-                        src_db,
-                        src_coll,
-                        after,
-                        PURGE_CHUNK_MAX_ROWS,
-                    )?;
-                    let dst_descs =
-                        self.rename_descs(&session, (src_db, src_coll), (dst_db, dst_coll))?;
-                    // The documents stay in their table (it moves to the
-                    // new name at the switch); their `_id` and index entries
-                    // are written under it, RecordIds kept.
-                    let mut last = after;
-                    for (src_rid, id_k, blob) in &batch {
-                        // The record keeps its RecordId, as mongod's renamed
-                        // collection keeps its records (measured 8.2.11).
-                        let recordid =
-                            self.write_nat_entry_kept(&session, dst_db, dst_coll, id_k, *src_rid)?;
-                        let doc = decode_doc(blob)?;
-                        self.write_index_rows(
-                            &session, dst_db, dst_coll, &doc, &dst_descs, recordid, false,
-                        )?;
-                        last = Some(*src_rid);
-                    }
-                    Ok((batch.len(), last))
-                })
-            });
-            let (n, last) = match copied {
-                Ok(v) => v,
-                Err(e) => {
-                    // A failed copy leaves partial rows behind the tombstoned,
-                    // unregistered destination. Purge them before surfacing
-                    // the error — the locks are still held, so nothing can
-                    // have observed the partial copy, and leaving it would
-                    // resurface the rows under a later CREATE of that name.
-                    let _ = self.purge_dropped_collection(dst_db, dst_coll);
-                    return Err(e);
-                }
-            };
-            after = last;
-            if n < PURGE_CHUNK_MAX_ROWS {
-                break;
-            }
-        }
         self.set_next_record_id(dst_db, dst_coll, src_next);
         // Phase C — the switch.
         self.retry_write_conflicts("rename_collection switch", || {
@@ -15778,39 +15487,19 @@ impl Storage {
             }
             self.unplace_collection(session, dst_db, dst_coll)?;
         }
-        // Collect every src row, drop the src tables, then re-key into dst.
-        let docs = self.scan_docs(session, src_db, src_coll)?;
         let idx_rows = self.collect_idx_rows(session, src_db, src_coll)?;
-        let src_id_claim = self.id_claim_desc(session, src_db, src_coll)?;
         let src_next = self.next_record_id(src_db, src_coll)?;
         self.purge_collection_tables(session, src_db, src_coll)?;
         // The documents stay in their table, under their RecordIds: the
         // table moves to the new name (mongod's rename is catalog-only), and
-        // the `_id` index rows are written under it.
+        // with it the `_id` index and every other index's table.
         self.move_placement(session, (src_db, src_coll), (dst_db, dst_coll))?;
-        let mut moved: Vec<(i64, Document)> = Vec::with_capacity(docs.len());
-        for (src_rid, id_k, blob) in &docs {
-            let recordid = self.write_nat_entry_kept(session, dst_db, dst_coll, id_k, *src_rid)?;
-            moved.push((recordid, decode_doc(blob)?));
-        }
         let icur = session.open_cursor(IDX_TABLE, None)?;
         for (name, payload) in &idx_rows {
             icur.reset()?;
             icur.set_key_sss(dst_db, dst_coll, name);
             icur.set_value_u(payload);
             icur.insert()?;
-        }
-        // The index entries are in the indexes' own tables, which moved with
-        // the placement and hold the records' RecordIds, kept; only the
-        // unique claims, keyed by namespace, are written again. The index
-        // catalog rows are written above, so `index_descs` sees the
-        // destination's indexes here.
-        let mut dst_descs = self.index_descs(session, dst_db, dst_coll)?;
-        if !dst_descs.iter().any(|d| d.id_claim) {
-            dst_descs.extend(src_id_claim);
-        }
-        for (recordid, doc) in &moved {
-            self.write_index_rows(session, dst_db, dst_coll, doc, &dst_descs, *recordid, false)?;
         }
         self.set_next_record_id(dst_db, dst_coll, src_next);
         let rc = session.open_cursor(COLL_TABLE, None)?;
@@ -15961,14 +15650,17 @@ impl Storage {
 
     fn walk_sizes(&self, session: &Session, db: &str, coll: &str) -> Result<CollectionSizes> {
         let mut out = CollectionSizes::default();
-        self.visit_docs(session, db, coll, |_, id_k, blob| {
+        self.visit_docs(session, db, coll, |_, _id_k, blob| {
             out.records += 1;
             out.data_size += blob.len() as i64;
-            out.id_index_size += id_k.len() as i64;
             Ok(())
         })?;
         self.visit_entry_rows(session, db, coll, |name, packed| {
-            *out.index_sizes.entry(name.to_string()).or_insert(0) += packed.len() as i64;
+            if name == ID_INDEX_NAME {
+                out.id_index_size += packed.len() as i64;
+            } else {
+                *out.index_sizes.entry(name.to_string()).or_insert(0) += packed.len() as i64;
+            }
             Ok(())
         })?;
         Ok(out)
@@ -16047,18 +15739,24 @@ impl Storage {
         let session = self.conn.open_session()?;
         let mut out = Document::new();
         let mut id_size = 0i64;
-        self.visit_docs(&session, db, coll, |_, id_k, _| {
-            id_size += id_k.len() as i64;
+        let mut others: Vec<(String, i64)> = Vec::new();
+        self.visit_entry_rows(&session, db, coll, |name, packed| {
+            if name == ID_INDEX_NAME {
+                id_size += packed.len() as i64;
+            } else if let Some((_, n)) = others.iter_mut().find(|(k, _)| k == name) {
+                *n += packed.len() as i64;
+            } else {
+                others.push((name.to_string(), packed.len() as i64));
+            }
             Ok(())
         })?;
+        // The `_id` index first, as mongod lists it.
         if id_size > 0 {
             out.insert(ID_INDEX_NAME, id_size);
         }
-        self.visit_entry_rows(&session, db, coll, |name, packed| {
-            let prev = out.get_i64(name).unwrap_or(0);
-            out.insert(name, prev + packed.len() as i64);
-            Ok(())
-        })?;
+        for (name, bytes) in others {
+            out.insert(name, bytes);
+        }
         Ok(out)
     }
 
@@ -16169,7 +15867,7 @@ impl Storage {
                 out.push(None);
                 continue;
             };
-            out.push(self.doc_recordid(&session, db, coll, &id_key(&id)?)?);
+            out.push(self.doc_recordid(&session, db, coll, &id)?);
         }
         Ok(out)
     }
@@ -16719,7 +16417,7 @@ impl Storage {
         note_planner_write_of(db, coll);
         let geo = parse_geo_2d(key_spec, options);
         let geo_sphere = parse_geo_sphere(key_spec);
-        ensure_collection(session, db, coll, self.data_nonlogged)?;
+        ensure_collection(self, session, db, coll)?;
 
         let c = session.open_cursor(IDX_TABLE, None)?;
         c.set_key_sss(db, coll, name);
@@ -16764,8 +16462,6 @@ impl Storage {
         // step-1 ones. Not a user option: `listIndexes` strips it (like
         // `multikey`), and the options-conflict check compares only the
         // enumerated user-facing options, so it never provokes a false conflict.
-        stored_options.insert("entryFormat", ENTRY_FORMAT);
-        stored_options.insert(NUMBER_KEYS, sortkey::NUMBER_KEY_FORMAT);
         // The PG server's index keeps PostgreSQL's BinData order; a rebuild
         // passes the recorded order back in and keeps it.
         if !stored_options.contains_key(BINDATA_ORDER_OPT)
@@ -17459,10 +17155,6 @@ impl Storage {
                 // Its entries are in its own table, dropped once this
                 // commits and nothing reads it.
                 self.unplace_index(&session, db, coll, name)?;
-                // The index is gone, so its claims must go too — otherwise
-                // recreating it (or inserting the value again) is refused
-                // against an index that no longer exists.
-                self.purge_unique_claims(&session, db, coll, Some(name))?;
                 // The catalog mongod reads says what the registry says.
                 sync_catalog_entry(&session, db, coll)?;
                 // Oplog: a DDL `op: "c"` `dropIndexes` entry so a `showExpandedEvents`
@@ -17598,8 +17290,7 @@ impl Storage {
     fn planner_descs(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<IndexDesc>> {
         let mut descs = self.index_descs(session, db, coll)?;
         let order = order::bindata_order();
-        descs
-            .retain(|d| !d.hidden && d.collation.is_none() && (d.id_claim || d.key_order == order));
+        descs.retain(|d| !d.hidden && d.collation.is_none() && d.key_order == order);
         Ok(descs)
     }
 
@@ -17829,190 +17520,170 @@ impl Storage {
         Ok(0)
     }
 
-    /// Record a doc's insertion position: `seq -> id_key` plus the reverse
-    /// `id_key -> seq`. Mirrors `storage._write_nat_entry`.
-    /// Assign the doc a RecordId (monotonic insertion seq) and write the `_id`
-    /// index row (`id_key -> RecordId`). Returns the RecordId — the caller keys
-    /// the doc table by it. The forward `NAT_TABLE` (seq -> id_key) is gone: the
-    /// doc table is itself in RecordId (= insertion) order.
-    fn write_nat_entry(
+    /// The shape of `(db, coll)`'s `_id_` keys: the KeyString of `_id` under
+    /// the collection's default collation, which is what mongod's `_id_`
+    /// index takes (an `_id` the collation calls equal to another is a
+    /// duplicate), in mongod's BinData order.
+    fn id_shape(&self, session: &Session, db: &str, coll: &str) -> Result<KeyShape> {
+        let collation = match self.coll_options_cached(session, db, coll)? {
+            Some(o) if o.contains_key("collation") => o
+                .get_document("collation")
+                .ok()
+                .and_then(secantus_core::collation::parse),
+            _ => None,
+        };
+        Ok(id_key_shape(collation))
+    }
+
+    /// `(db, coll)`'s `_id_` table as `session` sees it, opened with
+    /// `config`. A collection with no `_id` index (`system.profile`, a
+    /// time-series collection) or none at all has no cursor: nothing is
+    /// written for it and a lookup finds nothing.
+    fn id_index(
         &self,
         session: &Session,
         db: &str,
         coll: &str,
-        id_key: &[u8],
-    ) -> Result<i64> {
-        // overwrite=false: the `_id` index is where a duplicate `_id` is now caught
-        // (the doc table is keyed by the unique RecordId, so it can't reject dups).
-        let rev = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
-        self.write_nat_entry_with(&rev, db, coll, id_key)
+        config: Option<&str>,
+    ) -> Result<IdIndex> {
+        if index_ident(session, db, coll, ID_INDEX_NAME)?.is_none() {
+            return Ok(IdIndex::none());
+        }
+        open_id_index(session, db, coll, config, self.id_shape(session, db, coll)?)
     }
 
-    /// [`Self::write_nat_entry`] through a cursor the caller opened on
-    /// `NAT_SEQ_TABLE` with `overwrite=false` and reuses across a batch, so a
+    /// Assign the doc a RecordId (monotonic insertion seq) and write its
+    /// `_id_` entry. Returns the RecordId -- the caller keys the doc table by
+    /// it.
+    fn write_nat_entry(&self, session: &Session, db: &str, coll: &str, id: &Bson) -> Result<i64> {
+        // overwrite=false: the `_id` index is where a duplicate `_id` is caught
+        // (the doc table is keyed by the unique RecordId, so it can't reject dups).
+        let ix = self.id_index(session, db, coll, Some("overwrite=false"))?;
+        self.write_nat_entry_with(session, &ix, db, coll, id)
+    }
+
+    /// [`Self::write_nat_entry`] through an `_id_` table the caller opened
+    /// with `overwrite=false` and reuses across a batch, so a
     /// ten-thousand-document insert opens it once.
     fn write_nat_entry_with(
         &self,
-        rev: &Cursor,
+        session: &Session,
+        ix: &IdIndex,
         db: &str,
         coll: &str,
-        id_key: &[u8],
+        id: &Bson,
     ) -> Result<i64> {
         let recordid = self.mint_record_id(db, coll)?;
         // A wasted RecordId on the dup path is harmless — RecordIds only need to be
         // unique + monotonic; gaps are fine.
-        self.write_nat_entry_at(rev, db, coll, id_key, recordid)
+        self.write_nat_entry_at(session, ix, db, coll, id, recordid)
     }
 
-    /// Write the `_id` index row of a document that keeps RecordId
-    /// `recordid` (a renamed collection's, which keeps its records' ids).
-    fn write_nat_entry_kept(
-        &self,
-        session: &Session,
-        db: &str,
-        coll: &str,
-        id_key: &[u8],
-        recordid: i64,
-    ) -> Result<i64> {
-        let rev = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
-        self.write_nat_entry_at(&rev, db, coll, id_key, recordid)
-    }
-
-    /// The `_id` index row `id_key -> recordid` of `(db, coll)`.
+    /// The `_id_` entry of `id`, held by `recordid`: `_id`'s KeyString as
+    /// the key, the RecordId and TypeBits as the value, inserted with
+    /// `overwrite=false` so a key another document holds is a duplicate (the
+    /// way mongod's `WiredTigerIdIndex::_insert` finds one).
     fn write_nat_entry_at(
         &self,
-        rev: &Cursor,
+        session: &Session,
+        ix: &IdIndex,
         db: &str,
         coll: &str,
-        id_key: &[u8],
+        id: &Bson,
         recordid: i64,
     ) -> Result<i64> {
-        rev.reset()?;
+        let Some(cur) = &ix.cur else {
+            return Ok(recordid);
+        };
+        let entry = ix
+            .shape
+            .id_entry(id, recordid)
+            .map_err(|_| StorageError::UnsupportedId)?;
+        cur.reset()?;
         CONFLICT_CAUSE.with(|c| c.borrow_mut().take());
-        note_id_index_conflict(note_id_key(db, coll, id_key))?;
-        rev.set_key_ssu(db, &key_coll(db, coll), id_key);
-        rev.set_value_q(recordid);
-        note_id_index_conflict(match rev.insert() {
-            Ok(()) => Ok(recordid),
-            Err(e) if e.is_duplicate_key() => Err(StorageError::DuplicateId),
-            Err(e) => Err(e.into()),
-        })
+        note_id_index_conflict(note_id_key(db, coll, &entry.key), &ix.uri)?;
+        cur.set_key_u(&entry.key);
+        cur.set_value_u(&entry.value);
+        note_id_index_conflict(
+            match cur.insert() {
+                Ok(()) => {
+                    self.sizes.adjust(
+                        session,
+                        db,
+                        coll,
+                        Delta::entries(ID_INDEX_NAME, entry.key.len() as i64),
+                    );
+                    Ok(recordid)
+                }
+                Err(e) if e.is_duplicate_key() => Err(StorageError::DuplicateId),
+                Err(e) => Err(e.into()),
+            },
+            &ix.uri,
+        )
     }
 
-    /// The `_id` index lookup: resolve a doc's `id_key` to its RecordId (the
+    /// The `_id` index lookup: resolve a document's `_id` to its RecordId (the
     /// doc-table key). `None` if the doc doesn't exist.
     fn doc_recordid(
         &self,
         session: &Session,
         db: &str,
         coll: &str,
-        id_key: &[u8],
+        id: &Bson,
     ) -> Result<Option<i64>> {
-        let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
-        rev.set_key_ssu(db, &key_coll(db, coll), id_key);
-        match rev.search() {
-            Ok(()) => Ok(Some(rev.get_value_q()?)),
-            Err(e) if e.is_not_found() => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        let ix = self.id_index(session, db, coll, None)?;
+        ix.recordid_of(id)
     }
 
-    /// Drop a doc's insertion-order entry (both directions). No-op if absent
-    /// (legacy docs predating the index). Mirrors `storage._delete_nat_entry`.
+    /// Drop a doc's `_id_` entry, as mongod's `WiredTigerIdIndex::_unindex`
+    /// does: by its key. An entry another record holds is left alone.
     fn delete_nat_entry(
         &self,
         session: &Session,
         db: &str,
         coll: &str,
-        id_key: &[u8],
-    ) -> Result<Option<i64>> {
-        // Remove the `_id` index row and return the RecordId it mapped to, so the
-        // caller can delete the doc-table row keyed by it. (No forward NAT_TABLE
-        // row to remove — the doc table itself is in RecordId order.)
-        let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
-        rev.set_key_ssu(db, &key_coll(db, coll), id_key);
-        let recordid = match rev.search() {
-            Ok(()) => rev.get_value_q()?,
-            Err(e) if e.is_not_found() => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        note_id_key(db, coll, id_key)?;
-        rev.remove()?;
-        Ok(Some(recordid))
+        id: &Bson,
+        recordid: i64,
+    ) -> Result<()> {
+        let ix = self.id_index(session, db, coll, None)?;
+        self.delete_nat_entry_with(session, &ix, db, coll, id, recordid)
     }
 
-    /// Drop every natural-order entry for `(db, coll)` (both directions) — called
-    /// on drop / rename so a later re-create can't resurrect stale positions.
-    fn drop_nat_collection(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
-        // Forward (db, coll, seq) in the LEGACY table: collect this
-        // collection's seqs, then remove. The table is not created on a new
-        // store, and an absent one simply has no rows -- but this must NOT
-        // return early, because the reverse half below cleans NAT_SEQ_TABLE,
-        // the live `_id` index. Skipping that leaves stale index entries that
-        // reject a re-insert into the recreated namespace with a duplicate
-        // key (caught by drop_chunk::drop_collection_survives_a_small_cache).
-        if let Some(nat) = match session.open_cursor(NAT_TABLE, None) {
-            Ok(c) => Some(c),
-            Err(e) if e.is_missing_table() => None,
-            Err(e) => return Err(e.into()),
-        } {
-            nat.set_key_ssq(db, coll, i64::MIN);
-            let mut more = match nat.search_near() {
-                Ok(cmp) => {
-                    if cmp < 0 {
-                        nat.next()?
-                    } else {
-                        true
-                    }
-                }
-                Err(e) if e.is_not_found() => false,
-                Err(e) => return Err(e.into()),
-            };
-            let mut seqs: Vec<i64> = Vec::new();
-            while more {
-                let (d, c, seq) = nat.get_key_ssq()?;
-                if d != db || c != coll {
-                    break;
-                }
-                seqs.push(seq);
-                more = nat.next()?;
-            }
-            for seq in seqs {
-                nat.set_key_ssq(db, coll, seq);
-                if nat.search().is_ok() {
-                    nat.remove()?;
-                }
-            }
-        }
-        // Reverse (db, coll, id_key) in the LIVE `_id` index -- always run.
-        let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
-        rev.set_key_ssu(db, coll, b"");
-        let mut more = match rev.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    rev.next()?
-                } else {
-                    true
-                }
-            }
-            Err(e) if e.is_not_found() => false,
-            Err(e) => return Err(e.into()),
+    fn delete_nat_entry_with(
+        &self,
+        session: &Session,
+        ix: &IdIndex,
+        db: &str,
+        coll: &str,
+        id: &Bson,
+        recordid: i64,
+    ) -> Result<()> {
+        let Some(cur) = &ix.cur else {
+            return Ok(());
         };
-        let mut keys: Vec<Vec<u8>> = Vec::new();
-        while more {
-            let (d, c, k) = rev.get_key_ssu()?;
-            if d != db || c != coll {
-                break;
+        let key = ix
+            .shape
+            .id_key(id)
+            .map_err(|_| StorageError::UnsupportedId)?;
+        cur.reset()?;
+        cur.set_key_u(&key);
+        match cur.search() {
+            Ok(()) => {
+                if ixkeys::id_entry_rid(&cur.get_value_u()?) != Some(recordid) {
+                    return Ok(());
+                }
             }
-            keys.push(k);
-            more = rev.next()?;
+            Err(e) if e.is_not_found() => return Ok(()),
+            Err(e) => return Err(e.into()),
         }
-        for k in keys {
-            rev.set_key_ssu(db, coll, &k);
-            if rev.search().is_ok() {
-                rev.remove()?;
-            }
-        }
+        note_id_key(db, coll, &key)?;
+        cur.remove()?;
+        self.sizes.adjust(
+            session,
+            db,
+            coll,
+            Delta::entries(ID_INDEX_NAME, -(key.len() as i64)),
+        );
         Ok(())
     }
 
@@ -18192,7 +17863,7 @@ impl Storage {
                 if batch.is_empty() {
                     break;
                 }
-                for (recordid, id_k, blob) in batch {
+                for (recordid, _id_k, blob) in batch {
                     after = Some(recordid);
                     // The newest document always stays, even when it alone
                     // is larger than `size`: mongod 8.2.11 keeps `[59]` after
@@ -18216,10 +17887,16 @@ impl Storage {
                     doc_cur.set_key_ssq(db, coll, recordid);
                     doc_cur.remove()?;
                     self.sizes
-                        .adjust(session, db, coll, Delta::remove(id_k.len(), blob.len()));
+                        .adjust(session, db, coll, Delta::remove(blob.len()));
                     self.delete_index_entries(session, db, coll, &doc, descs, recordid)?;
                     self.count_index_keys(session, db, coll, Some(&doc), None, descs)?;
-                    self.delete_nat_entry(session, db, coll, &id_k)?;
+                    self.delete_nat_entry(
+                        session,
+                        db,
+                        coll,
+                        doc.get("_id").unwrap_or(&Bson::Null),
+                        recordid,
+                    )?;
                     total -= blob.len() as i64;
                     count -= 1;
                     if oplog_on {
@@ -18349,9 +18026,6 @@ impl Storage {
         recordid: i64,
     ) -> Result<Vec<EntryKey>> {
         let mut out = Vec::new();
-        if desc.id_claim {
-            return Ok(out);
-        }
         // 2d geo index: one cell entry per point-valued field (point-only).
         if let Some(geo) = &desc.geo_2d {
             for kb in get_path(doc, &geo.field)
@@ -18381,6 +18055,10 @@ impl Storage {
         Ok(out)
     }
 
+    /// Write `doc`'s index entries for every index in `descs`.
+    ///
+    /// A unique index's keys are claimed BEFORE any entry is written, so a
+    /// rejected claim leaves nothing behind ([`Self::claim_unique_key`]).
     fn write_index_entries(
         &self,
         session: &Session,
@@ -18390,94 +18068,32 @@ impl Storage {
         descs: &[IndexDesc],
         recordid: i64,
     ) -> Result<()> {
-        self.write_index_rows(session, db, coll, doc, descs, recordid, true)
-    }
-
-    /// [`Self::write_index_entries`]; with `entries` false only the unique
-    /// claims are written (a rename moves the indexes' tables whole, their
-    /// entries with them, but the claims are keyed by the namespace).
-    #[allow(clippy::too_many_arguments)]
-    fn write_index_rows(
-        &self,
-        session: &Session,
-        db: &str,
-        coll: &str,
-        doc: &Document,
-        descs: &[IndexDesc],
-        recordid: i64,
-        entries: bool,
-    ) -> Result<()> {
         // An index being built over the collection records the write too.
         self.index_build_side_write(session, db, coll, None, Some(doc), recordid)?;
-        // A document `_id` is also claimed by value (see `document_id_claim`).
-        let with_id_claim;
-        let descs: &[IndexDesc] = match self.document_id_claim(session, db, coll, doc, descs)? {
-            Some(claim) => {
-                with_id_claim = [descs, std::slice::from_ref(&claim)].concat();
-                &with_id_claim
-            }
-            None => descs,
-        };
         if descs.is_empty() {
             return Ok(());
         }
-        // The entry's trailing half is the doc's RecordId (step 2), so the old
-        // `id_key_override` plumbing that existed purely to compute it is gone.
-        // Claim each unique key BEFORE writing entries, so a rejected claim
-        // leaves nothing behind. `overwrite=false` makes WiredTiger itself
-        // refuse a key another row holds — including one an open transaction is
-        // holding uncommitted, which the snapshot-read probe cannot see. Two
-        // writers racing the same key collide here and one takes a write
-        // conflict, which the retry wrapper turns into a clean duplicate-key
-        // error. Mirrors `storage._claim_unique_key`.
-        let claims = session.open_cursor(UNIQ_TABLE, Some("overwrite=false"))?;
         for desc in descs {
-            // `_id_` is deliberately excluded: `_id` uniqueness is already
-            // enforced by the `_id` index (`write_nat_entry`'s overwrite=false
-            // insert into NAT_SEQ_TABLE), which is the only path from an `_id`
-            // to its doc row. Claiming it here too would double-write every
-            // insert for no added guarantee — and the extra dirty content
-            // pushed a large transaction over WiredTiger's cache before the
-            // dirty-budget guard could report it (caught by txn_budget).
-            // The exception is a collection with a default collation, whose
-            // `_id` is also unique by that collation (`id_claim`).
-            let claimed =
-                desc.id_claim || (desc.name != "_id_" && (desc.unique || desc.prepare_unique));
-            if !claimed || !self.doc_in_partial(doc, desc)? {
+            if !(desc.unique || desc.prepare_unique) || !self.doc_in_partial(doc, desc)? {
                 continue;
             }
-            for (kb, values) in desc.key_values(doc, desc.sparse)? {
-                let esc = escape_kb(&kb);
-                note_unique_claim(db, coll, &desc.name, &esc)?;
-                claims.reset()?;
-                claims.set_key_sssu(db, &key_coll(db, coll), &desc.name, &esc);
-                claims.set_value_q(recordid);
-                match claims.insert() {
-                    Ok(()) => {}
-                    Err(e) if e.is_duplicate_key() => {
-                        if self.take_stale_claim(session, db, coll, desc, &kb, &values, recordid)? {
-                            continue;
-                        }
-                        return Err(StorageError::DuplicateKey(Box::new(
-                            with_bindata_order(desc.key_order, || {
-                                UniqueConflict::new(
-                                    format!("{db}.{coll}"),
-                                    &desc.name,
-                                    &desc.key_spec,
-                                    doc,
-                                    &kb,
-                                    desc.collation.as_ref(),
-                                )
-                            })
-                            .on_clustered(desc.clustered),
-                        )));
-                    }
-                    Err(e) => return Err(e.into()),
-                }
+            let keys = desc.key_values(doc, desc.sparse)?;
+            if keys.is_empty() {
+                continue;
             }
-        }
-        if !entries {
-            return Ok(());
+            let cur = open_index_cursor(session, db, coll, &desc.name, Some("overwrite=false"))?;
+            let shape = desc.shape();
+            for (kb, values) in &keys {
+                self.claim_unique_key(
+                    session,
+                    &cur,
+                    (db, coll),
+                    desc,
+                    &shape,
+                    (kb, values),
+                    (doc, recordid),
+                )?;
+            }
         }
         for desc in descs {
             let keys = self.packed_entry_keys(doc, desc, recordid)?;
@@ -18490,6 +18106,217 @@ impl Storage {
             }
         }
         Ok(())
+    }
+
+    /// Claim one key of a unique index for `recordid`, as mongod's
+    /// `WiredTigerIndex::_checkDups` does for an index whose entries carry
+    /// the RecordId in their key (so two documents with one value hold two
+    /// keys and WiredTiger itself would not tell them apart):
+    ///
+    /// 1. insert the KeyString of the value alone (the prefix key) with
+    ///    `overwrite=false` -- WiredTiger refuses it to a transaction that
+    ///    meets another's write of it, committed after the snapshot or still
+    ///    open, which a read of the snapshot cannot see -- then remove it
+    ///    again in the same transaction. The two writes stay a conflict for
+    ///    every concurrent writer of the value, and leave nothing behind;
+    /// 2. look at the entries that start with that prefix: one held by
+    ///    another RecordId is a duplicate.
+    ///
+    /// Two writers racing one value collide in step 1, and one takes a write
+    /// conflict, which the retry wrapper turns into a clean duplicate-key
+    /// error (the retry finds the other's entry in step 2).
+    #[allow(clippy::too_many_arguments)]
+    fn claim_unique_key(
+        &self,
+        _session: &Session,
+        cur: &Cursor,
+        (db, coll): (&str, &str),
+        desc: &IndexDesc,
+        shape: &KeyShape,
+        (kb, values): (&[u8], &[Bson]),
+        (doc, recordid): (&Document, i64),
+    ) -> Result<()> {
+        let duplicate = || {
+            StorageError::DuplicateKey(Box::new(
+                with_bindata_order(desc.key_order, || {
+                    UniqueConflict::new(
+                        format!("{db}.{coll}"),
+                        &desc.name,
+                        &desc.key_spec,
+                        doc,
+                        kb,
+                        desc.collation.as_ref(),
+                    )
+                })
+                .on_clustered(desc.clustered),
+            ))
+        };
+        let prefix = shape.exact(values)?;
+        note_unique_claim(db, coll, &desc.name, &prefix)?;
+        cur.reset()?;
+        cur.set_key_u(&prefix);
+        cur.set_value_u(b"");
+        match cur.insert() {
+            Ok(()) => {}
+            Err(e) if e.is_duplicate_key() => return Err(duplicate()),
+            Err(e) => return Err(e.into()),
+        }
+        cur.reset()?;
+        cur.set_key_u(&prefix);
+        match cur.remove() {
+            Ok(()) => {}
+            Err(e) if e.is_not_found() => {}
+            Err(e) => return Err(e.into()),
+        }
+        cur.reset()?;
+        let mut more = seek_ge(cur, &prefix)?;
+        while more {
+            let (held, rid) = cur.with_key_u(|k| (k.starts_with(&prefix), ixkeys::entry_rid(k)))?;
+            if !held {
+                break;
+            }
+            if rid != Some(recordid) {
+                return Err(duplicate());
+            }
+            more = cur.next()?;
+        }
+        Ok(())
+    }
+
+    /// Claim the unique keys an update gives `recordid` and the old document
+    /// had not (the entry diff writes and drops the entries themselves).
+    /// Run after `unique_conflict` has passed the new document, so a
+    /// duplicate here is a write another transaction made meanwhile.
+    #[allow(clippy::too_many_arguments)]
+    fn move_unique_claims(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        old_doc: &Document,
+        new_doc: &Document,
+        descs: &[IndexDesc],
+        recordid: i64,
+    ) -> Result<()> {
+        for desc in descs {
+            if !(desc.unique || desc.prepare_unique) {
+                continue;
+            }
+            let keys = |doc: &Document| -> Result<Vec<(Vec<u8>, Vec<Bson>)>> {
+                if !self.doc_in_partial(doc, desc)? {
+                    return Ok(Vec::new());
+                }
+                desc.key_values(doc, desc.sparse)
+            };
+            let old_keys = keys(old_doc)?;
+            let new_keys = keys(new_doc)?;
+            let added: Vec<&(Vec<u8>, Vec<Bson>)> = new_keys
+                .iter()
+                .filter(|(k, _)| !old_keys.iter().any(|(o, _)| o == k))
+                .collect();
+            if added.is_empty() {
+                continue;
+            }
+            let cur = open_index_cursor(session, db, coll, &desc.name, Some("overwrite=false"))?;
+            let shape = desc.shape();
+            for (kb, values) in added {
+                self.claim_unique_key(
+                    session,
+                    &cur,
+                    (db, coll),
+                    desc,
+                    &shape,
+                    (kb, values),
+                    (new_doc, recordid),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove `doc`'s index entries for every index in `descs` (recomputes the
+    /// same packed keys `write_index_entries` produced — same sparse / partial
+    /// gating, so it removes exactly what was written). A unique index's
+    /// claim on a value is its entry, so nothing else is released.
+    fn delete_index_entries(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        doc: &Document,
+        descs: &[IndexDesc],
+        recordid: i64,
+    ) -> Result<()> {
+        // An index being built over the collection records the write too.
+        self.index_build_side_write(session, db, coll, Some(doc), None, recordid)?;
+        for desc in descs {
+            let entries = self.packed_entry_keys(doc, desc, recordid)?;
+            if entries.is_empty() {
+                continue;
+            }
+            let cur = open_index_cursor(session, db, coll, &desc.name, Some("overwrite=false"))?;
+            for entry in &entries {
+                self.drop_index_entry(session, &cur, db, coll, &desc.name, &entry.key)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The first unique-index violation `candidate` would cause, or `None`.
+    /// Probes the index's entries for one sharing *any* key the candidate
+    /// generates and belonging to a *different* doc (`exclude_recordid`
+    /// skips the candidate's own row, for replace/update). Every key, not just
+    /// the canonical one: on a multikey index mongod's rule is "no two docs
+    /// share a generated key", and for a path descending through an array the
+    /// canonical key isn't among the entries at all.
+    /// Mirrors `storage._unique_conflict`.
+    fn unique_conflict(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        candidate: &Document,
+        descs: &[IndexDesc],
+        exclude_recordid: Option<i64>,
+    ) -> Result<Option<UniqueConflict>> {
+        for desc in descs {
+            // `prepareUnique` arms an index to reject dup *new* writes (11000)
+            // before it's formally unique — so it enforces uniqueness here too.
+            if (!desc.unique && !desc.prepare_unique) || !self.doc_in_partial(candidate, desc)? {
+                continue;
+            }
+            let shape = desc.shape();
+            let cur = open_index_cursor(session, db, coll, &desc.name, None)?;
+            for (kb, values) in desc.key_values(candidate, desc.sparse)? {
+                let exact = shape.exact(&values)?;
+                cur.reset()?;
+                let mut more = seek_ge(&cur, &exact)?;
+                while more {
+                    let row = cur.get_key_u()?;
+                    if !row.starts_with(&exact) {
+                        break;
+                    }
+                    let row_id = ixkeys::entry_rid(&row);
+                    // `row_id` is None only for a key that is not an entry's;
+                    // treat it as "not me" rather than silently matching.
+                    let is_self = row_id.is_some() && exclude_recordid == row_id;
+                    if !is_self {
+                        return Ok(Some(with_bindata_order(desc.key_order, || {
+                            UniqueConflict::new(
+                                format!("{db}.{coll}"),
+                                &desc.name,
+                                &desc.key_spec,
+                                candidate,
+                                &kb,
+                                desc.collation.as_ref(),
+                            )
+                        })));
+                    }
+                    more = cur.next()?;
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Write one index entry with `cur` (opened `overwrite=false` on the
@@ -18548,223 +18375,6 @@ impl Storage {
         }
     }
 
-    /// Remove `doc`'s index entries for every index in `descs` (recomputes the
-    /// same packed keys `write_index_entries` produced — same sparse / partial
-    /// gating, so it removes exactly what was written).
-    fn delete_index_entries(
-        &self,
-        session: &Session,
-        db: &str,
-        coll: &str,
-        doc: &Document,
-        descs: &[IndexDesc],
-        recordid: i64,
-    ) -> Result<()> {
-        // An index being built over the collection records the write too.
-        self.index_build_side_write(session, db, coll, Some(doc), None, recordid)?;
-        // A document `_id` is also claimed by value (see `document_id_claim`).
-        let with_id_claim;
-        let descs: &[IndexDesc] = match self.document_id_claim(session, db, coll, doc, descs)? {
-            Some(claim) => {
-                with_id_claim = [descs, std::slice::from_ref(&claim)].concat();
-                &with_id_claim
-            }
-            None => descs,
-        };
-        if descs.is_empty() {
-            return Ok(());
-        }
-        // Release the unique claims this RecordId owns. Only its own: a claim
-        // the row never held belongs to somebody else, and dropping it would
-        // let a genuine duplicate through. The value is the owning RecordId
-        // precisely so this can be checked.
-        let claims = session.open_cursor(UNIQ_TABLE, None)?;
-        for desc in descs {
-            if desc.id_claim || (desc.name != "_id_" && (desc.unique || desc.prepare_unique)) {
-                for kb in desc.key_variants(doc, desc.sparse)? {
-                    claims.reset()?;
-                    claims.set_key_sssu(db, &key_coll(db, coll), &desc.name, &escape_kb(&kb));
-                    match claims.search() {
-                        Ok(()) => {
-                            if claims.get_value_q().ok() == Some(recordid) {
-                                note_unique_claim(db, coll, &desc.name, &escape_kb(&kb))?;
-                                match claims.remove() {
-                                    Ok(()) => {}
-                                    Err(e) if e.is_not_found() => {}
-                                    Err(e) => return Err(e.into()),
-                                }
-                            }
-                        }
-                        Err(e) if e.is_not_found() => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-            }
-            let entries = self.packed_entry_keys(doc, desc, recordid)?;
-            if entries.is_empty() {
-                continue;
-            }
-            let cur = open_index_cursor(session, db, coll, &desc.name, Some("overwrite=false"))?;
-            for entry in &entries {
-                self.drop_index_entry(session, &cur, db, coll, &desc.name, &entry.key)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Take over the claim on `kb` in `desc` for `recordid` when the row
-    /// holding it no longer holds the value, and say whether it was taken.
-    /// A claim is stale when its owner is `recordid` itself, when the owning
-    /// row is gone, or (for a secondary unique index) when the owner has no
-    /// entry for the value any more: entries move with every update, so a
-    /// missing one means the owner moved off the value. Stores written
-    /// before updates moved their claims (RP-296) hold such claims, and
-    /// without this a value an UPDATE left was refused to every later row.
-    /// A claim this transaction cannot see as committed never reaches here:
-    /// WiredTiger answers its `overwrite=false` insert with a write conflict.
-    #[allow(clippy::too_many_arguments)]
-    fn take_stale_claim(
-        &self,
-        session: &Session,
-        db: &str,
-        coll: &str,
-        desc: &IndexDesc,
-        kb: &[u8],
-        values: &[Bson],
-        recordid: i64,
-    ) -> Result<bool> {
-        let esc = escape_kb(kb);
-        let owner = session.open_cursor(UNIQ_TABLE, None)?;
-        owner.set_key_sssu(db, &key_coll(db, coll), &desc.name, &esc);
-        let held = match owner.search() {
-            Ok(()) => Some(owner.get_value_q()?),
-            Err(e) if e.is_not_found() => None,
-            Err(e) => return Err(e.into()),
-        };
-        let stale = match held {
-            None => true,
-            Some(id) if id == recordid => true,
-            Some(id) if !self.claim_owner_exists(session, db, coll, id)? => true,
-            Some(_) if desc.id_claim => false,
-            Some(id) => {
-                let entry = open_index_cursor(session, db, coll, &desc.name, None)?;
-                entry.set_key_u(&desc.shape().entry(values, id)?.key);
-                match entry.search() {
-                    Ok(()) => false,
-                    Err(e) if e.is_not_found() => true,
-                    Err(e) => return Err(e.into()),
-                }
-            }
-        };
-        if stale {
-            owner.reset()?;
-            owner.set_key_sssu(db, &key_coll(db, coll), &desc.name, &esc);
-            owner.set_value_q(recordid);
-            owner.insert()?;
-        }
-        Ok(stale)
-    }
-
-    /// Move `recordid`'s unique claims from `old_doc`'s keys to `new_doc`'s,
-    /// as an update must (RP-296): claim each key the new document has that
-    /// the old one had not, then release each the old one had that the new
-    /// one has not -- only where this row owns it. Claiming first, with
-    /// `overwrite=false`, keeps the guarantee `write_index_entries` gives an
-    /// insert: two writers moving onto one value collide in WiredTiger even
-    /// when neither has committed. Run after `unique_conflict` has passed
-    /// the new document, so a duplicate here is a claim whose holder has
-    /// left the value (`take_stale_claim`) or a genuine conflict.
-    #[allow(clippy::too_many_arguments)]
-    fn move_unique_claims(
-        &self,
-        session: &Session,
-        db: &str,
-        coll: &str,
-        old_doc: &Document,
-        new_doc: &Document,
-        descs: &[IndexDesc],
-        recordid: i64,
-    ) -> Result<()> {
-        let mut claims: Option<Cursor> = None;
-        for desc in descs {
-            if !(desc.id_claim || (desc.name != "_id_" && (desc.unique || desc.prepare_unique))) {
-                continue;
-            }
-            let keys = |doc: &Document| -> Result<Vec<(Vec<u8>, Vec<Bson>)>> {
-                if !self.doc_in_partial(doc, desc)? {
-                    return Ok(Vec::new());
-                }
-                desc.key_values(doc, desc.sparse)
-            };
-            let old_keys = keys(old_doc)?;
-            let new_keys = keys(new_doc)?;
-            if old_keys
-                .iter()
-                .map(|k| &k.0)
-                .eq(new_keys.iter().map(|k| &k.0))
-            {
-                continue;
-            }
-            let claims = match &claims {
-                Some(c) => c,
-                None => claims.insert(session.open_cursor(UNIQ_TABLE, Some("overwrite=false"))?),
-            };
-            for (kb, values) in new_keys
-                .iter()
-                .filter(|(k, _)| !old_keys.iter().any(|(o, _)| o == k))
-            {
-                let esc = escape_kb(kb);
-                note_unique_claim(db, coll, &desc.name, &esc)?;
-                claims.reset()?;
-                claims.set_key_sssu(db, &key_coll(db, coll), &desc.name, &esc);
-                claims.set_value_q(recordid);
-                match claims.insert() {
-                    Ok(()) => {}
-                    Err(e) if e.is_duplicate_key() => {
-                        if !self.take_stale_claim(session, db, coll, desc, kb, values, recordid)? {
-                            return Err(StorageError::DuplicateKey(Box::new(
-                                with_bindata_order(desc.key_order, || {
-                                    UniqueConflict::new(
-                                        format!("{db}.{coll}"),
-                                        &desc.name,
-                                        &desc.key_spec,
-                                        new_doc,
-                                        kb,
-                                        desc.collation.as_ref(),
-                                    )
-                                })
-                                .on_clustered(desc.clustered),
-                            )));
-                        }
-                    }
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            for (kb, _) in old_keys
-                .iter()
-                .filter(|(k, _)| !new_keys.iter().any(|(n, _)| n == k))
-            {
-                let esc = escape_kb(kb);
-                claims.reset()?;
-                claims.set_key_sssu(db, &key_coll(db, coll), &desc.name, &esc);
-                match claims.search() {
-                    Ok(()) if claims.get_value_q().ok() == Some(recordid) => {
-                        note_unique_claim(db, coll, &desc.name, &esc)?;
-                        match claims.remove() {
-                            Ok(()) => {}
-                            Err(e) if e.is_not_found() => {}
-                            Err(e) => return Err(e.into()),
-                        }
-                    }
-                    Ok(()) => {}
-                    Err(e) if e.is_not_found() => {}
-                    Err(e) => return Err(e.into()),
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Index maintenance for an update: the set difference between the old and
     /// new doc's packed entry keys, per index. Unchanged keys get NO WT
     /// operations — which is both the fast path (a `$set` of an unindexed
@@ -18816,9 +18426,6 @@ impl Storage {
     /// whole-array key this store writes besides is not one of mongod's. A
     /// geo index: its entries.
     fn reference_keys(&self, doc: &Document, desc: &IndexDesc) -> Result<HashSet<Vec<u8>>> {
-        if desc.id_claim {
-            return Ok(HashSet::new());
-        }
         if desc.geo_2d.is_some() || desc.geo_sphere.is_some() {
             return Ok(self
                 .packed_entry_keys(doc, desc, 0)?
@@ -18952,55 +18559,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Drop every unique-key claim under `(db, coll)`, or under one index when
-    /// `index` is given.
-    ///
-    /// Claims MUST die with the namespace that owns them. A claim outliving its
-    /// collection makes a later insert of the same value fail as a duplicate
-    /// against a row that no longer exists — the false-rejection class #808 hit
-    /// on the Python side, where nothing purged the table on drop and a
-    /// drop/recreate/re-insert cycle was refused.
-    fn purge_unique_claims(
-        &self,
-        session: &Session,
-        db: &str,
-        coll: &str,
-        index: Option<&str>,
-    ) -> Result<()> {
-        let scan = session.open_cursor(UNIQ_TABLE, None)?;
-        let del = session.open_cursor(UNIQ_TABLE, None)?;
-        scan.reset()?;
-        scan.set_key_sssu(db, coll, index.unwrap_or(""), b"");
-        let mut more = match scan.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    scan.next()?
-                } else {
-                    true
-                }
-            }
-            Err(e) if e.is_not_found() => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
-        while more {
-            let (d, c, n, k) = scan.get_key_sssu()?;
-            if d != db || c != coll {
-                break;
-            }
-            if index.is_none_or(|want| want == n) {
-                del.reset()?;
-                del.set_key_sssu(&d, &c, &n, &k);
-                match del.remove() {
-                    Ok(()) => {}
-                    Err(e) if e.is_not_found() => {}
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            more = scan.next()?;
-        }
-        Ok(())
-    }
-
     /// Whether `doc` is covered by `desc`'s partial filter (always true for a
     /// non-partial index). A partial filter the Rust query engine can't evaluate
     /// surfaces as `QueryUnsupported`.
@@ -19016,13 +18574,11 @@ impl Storage {
     /// Parse every stored index into an `IndexDesc` (name, key_spec, sparse,
     /// unique, partial filter).
     fn index_descs(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<IndexDesc>> {
-        let mut descs: Vec<IndexDesc> = self
+        Ok(self
             .iter_indexes(session, db, coll)?
             .into_iter()
             .map(|(name, key_spec, opts)| index_desc_from(name, key_spec, &opts))
-            .collect();
-        descs.extend(self.id_claim_desc(session, db, coll)?);
-        Ok(descs)
+            .collect())
     }
 
     /// The catalog generation under which a read of the catalog through
@@ -19126,876 +18682,14 @@ impl Storage {
         Ok(Some(opts))
     }
 
-    /// The claim a document-valued `_id` takes, beside its row in the `_id` index.
-    ///
-    /// The `_id` index keys a document `_id` by its BSON bytes, so `{a: 1}` and
-    /// `{a: 1.0}` are two keys and both documents were stored; mongod, which
-    /// compares the values, refuses the second (measured 8.2.11, 2026-10-12).
-    /// Those key bytes are on disk and shared with the Python server, so they
-    /// stay as they are. The value is claimed in `UNIQ_TABLE` as well, under the
-    /// key an index would give it, where every number of one value is one key.
-    /// That is the claim a collated collection already takes for every `_id`
-    /// (`id_claim`), and such a collection needs no second one.
-    ///
-    /// A document stored before this claim existed is given one the first
-    /// time this version opens the store (`backfill_document_id_claims`).
-    ///
-    /// A time-series collection keeps measurements that repeat an `_id`, and
-    /// claims none.
-    fn document_id_claim(
+    /// The `_id` index as a duplicate-key error describes it, under the
+    /// collection's default collation when it has one.
+    fn id_conflict_desc(
         &self,
         session: &Session,
         db: &str,
         coll: &str,
-        doc: &Document,
-        descs: &[IndexDesc],
     ) -> Result<Option<IndexDesc>> {
-        if !matches!(doc.get("_id"), Some(Bson::Document(_)))
-            || descs.iter().any(|d| d.id_claim)
-            || self.is_timeseries(session, db, coll)?
-        {
-            return Ok(None);
-        }
-        Ok(Some(IndexDesc {
-            name: ID_INDEX_NAME.to_string(),
-            key_spec: bson::doc! {"_id": 1},
-            sparse: false,
-            hidden: false,
-            collation: None,
-            unique: false,
-            prepare_unique: false,
-            partial: None,
-            geo_2d: None,
-            geo_sphere: None,
-            id_claim: true,
-            clustered: false,
-            key_order: BinDataOrder::Format4,
-        }))
-    }
-
-    /// Give every stored document-valued `_id` the claim a new one takes
-    /// (`document_id_claim`), once for a store.
-    ///
-    /// A document written before that claim existed holds none, so a second
-    /// document equal to it by value was still accepted. This walks the
-    /// `_id` index of every collection for the keys of document type and
-    /// claims each. Nothing stored is rewritten: the claims are new rows in
-    /// `UNIQ_TABLE`. A row there under an empty namespace, which no
-    /// collection can have, records that the walk is done; it sits in the
-    /// table the claims are in, so the two are kept or lost together.
-    ///
-    /// Two stored documents already equal by value cannot both hold the
-    /// claim. The older keeps it, both stay readable, and the count is
-    /// logged; inserting a third is refused.
-    ///
-    /// A document the Python server writes after this takes no claim.
-    fn backfill_document_id_claims(&self) -> Result<()> {
-        const DONE: &str = "$document_id_claims";
-        const CHUNK: usize = 500;
-        let session = self.conn.open_session()?;
-        {
-            let marker = session.open_cursor(UNIQ_TABLE, None)?;
-            marker.set_key_sssu("", "", DONE, b"");
-            match marker.search() {
-                Ok(()) => return Ok(()),
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        // The collections that claim a document `_id`: not a time-series
-        // collection, which keeps measurements that repeat one, and not one
-        // with a default collation, whose every `_id` is claimed already.
-        let mut collections: Vec<(String, String)> = Vec::new();
-        {
-            let cur = session.open_cursor(COLL_TABLE, None)?;
-            let mut more = cur.next()?;
-            while more {
-                let (db, coll) = cur.get_key_ss()?;
-                let blob = cur.get_value_u()?;
-                let skip = !blob.is_empty()
-                    && (options_name_timeseries(&blob)?
-                        || default_collation(&session, &db, &coll)?.is_some());
-                if !skip {
-                    collections.push((db, coll));
-                }
-                more = cur.next()?;
-            }
-        }
-        let key_spec = bson::doc! {"_id": 1};
-        let mut duplicates = 0u64;
-        for (db, coll) in &collections {
-            // The RecordIds under this collection's document-typed `_id` keys.
-            let mut rows: Vec<i64> = Vec::new();
-            {
-                let cur = match session.open_cursor(NAT_SEQ_TABLE, None) {
-                    Ok(c) => c,
-                    Err(e) if e.is_missing_table() => break,
-                    Err(e) => return Err(e.into()),
-                };
-                cur.set_key_ssu(db, coll, &[sortkey::RANK_DOCUMENT]);
-                let mut more = match cur.search_near() {
-                    Ok(cmp) => {
-                        if cmp < 0 {
-                            cur.next()?
-                        } else {
-                            true
-                        }
-                    }
-                    Err(e) if e.is_not_found() => false,
-                    Err(e) => return Err(e.into()),
-                };
-                while more {
-                    let (d, c, key) = cur.get_key_ssu()?;
-                    if &d != db || &c != coll || key.first() != Some(&sortkey::RANK_DOCUMENT) {
-                        break;
-                    }
-                    rows.push(cur.get_value_q()?);
-                    more = cur.next()?;
-                }
-            }
-            if rows.is_empty() {
-                continue;
-            }
-            let docs = match open_doc_cursor(&session, db, coll, None) {
-                Ok(c) => c,
-                Err(e) if e.is_missing_table() => continue,
-                Err(e) => return Err(e.into()),
-            };
-            for chunk in rows.chunks(CHUNK) {
-                session.begin_transaction(None)?;
-                let outcome = (|| -> Result<(u64, u64)> {
-                    let claims = session.open_cursor(UNIQ_TABLE, Some("overwrite=false"))?;
-                    let owners = session.open_cursor(UNIQ_TABLE, None)?;
-                    let (mut taken, mut held) = (0u64, 0u64);
-                    for &recordid in chunk {
-                        docs.reset()?;
-                        docs.set_key_ssq(db, coll, recordid);
-                        match docs.search() {
-                            Ok(()) => {}
-                            Err(e) if e.is_not_found() => continue,
-                            Err(e) => return Err(e.into()),
-                        }
-                        let value = docs.get_value_u()?;
-                        let (_, blob) = unframe_doc_value(&value)?;
-                        let doc = decode_doc(blob)?;
-                        if !matches!(doc.get("_id"), Some(Bson::Document(_))) {
-                            continue;
-                        }
-                        for kb in with_bindata_order(BinDataOrder::Format4, || {
-                            index_key_variants_c(&doc, &key_spec, false, None)
-                        })? {
-                            match self.claim_stored_id(
-                                &session,
-                                (&claims, &owners),
-                                (db, coll),
-                                &escape_kb(&kb),
-                                recordid,
-                            )? {
-                                Some(true) => taken += 1,
-                                Some(false) => held += 1,
-                                None => {}
-                            }
-                        }
-                    }
-                    Ok((taken, held))
-                })();
-                match outcome {
-                    Ok((_, held)) => {
-                        commit_stamped(&session, &self.oplog, self.timestamped)?;
-                        duplicates += held;
-                    }
-                    Err(e) => {
-                        let _ = session.rollback_transaction(None);
-                        return Err(e);
-                    }
-                }
-            }
-        }
-        // In its own transaction: a timestamped store's purge may have
-        // removed the marker at a timestamp, and the key then takes one.
-        session.begin_transaction(None)?;
-        let written = (|| -> Result<()> {
-            let marker = session.open_cursor(UNIQ_TABLE, None)?;
-            marker.set_key_sssu("", "", DONE, b"");
-            marker.set_value_q(0);
-            marker.insert()?;
-            Ok(())
-        })();
-        match written {
-            Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped)?,
-            Err(e) => {
-                let _ = session.rollback_transaction(None);
-                return Err(e);
-            }
-        }
-        // Quiet unless something is wrong: the walk runs again after every
-        // hand-over from the Python server, and a server's first line of
-        // output is the one a launcher waits for.
-        if duplicates > 0 {
-            eprintln!(
-                "secantus-storage: {duplicates} stored document _id values are duplicates by \
-                 value of another stored _id, and stay as they are"
-            );
-        }
-        Ok(())
-    }
-
-    /// Claim one stored document's `_id` key `esc` for `recordid`, as a walk
-    /// over stored documents does it. `Some(true)` when the claim is taken
-    /// (or moved from a row that is gone), `Some(false)` when another stored
-    /// document already holds it, `None` when this document held it already.
-    fn claim_stored_id(
-        &self,
-        session: &Session,
-        (claims, owners): (&Cursor, &Cursor),
-        (db, coll): (&str, &str),
-        esc: &[u8],
-        recordid: i64,
-    ) -> Result<Option<bool>> {
-        claims.reset()?;
-        claims.set_key_sssu(db, coll, ID_INDEX_NAME, esc);
-        claims.set_value_q(recordid);
-        match claims.insert() {
-            Ok(()) => return Ok(Some(true)),
-            Err(e) if e.is_duplicate_key() => {}
-            Err(e) => return Err(e.into()),
-        }
-        owners.reset()?;
-        owners.set_key_sssu(db, coll, ID_INDEX_NAME, esc);
-        let owner = match owners.search() {
-            Ok(()) => Some(owners.get_value_q()?),
-            Err(e) if e.is_not_found() => None,
-            Err(e) => return Err(e.into()),
-        };
-        match owner {
-            Some(id) if id == recordid => Ok(None),
-            Some(id) if self.claim_owner_exists(session, db, coll, id)? => Ok(Some(false)),
-            // Nobody's: the row it named is gone.
-            _ => {
-                owners.reset()?;
-                owners.set_key_sssu(db, coll, ID_INDEX_NAME, esc);
-                owners.set_value_q(recordid);
-                owners.insert()?;
-                Ok(Some(true))
-            }
-        }
-    }
-
-    /// Give every stored document of a collection with a default collation
-    /// the `_id` claim a new one takes (`id_claim_desc`), once for a store.
-    ///
-    /// That claim, under the `_id`'s collation key, is what refuses a second
-    /// spelling of an `_id` the collation calls equal. It landed 2026-10-11,
-    /// and a document stored before then holds none, so `{_id: "A"}` was
-    /// still accepted beside a stored `{_id: "a"}` under strength 2. The walk
-    /// is the one `backfill_document_id_claims` makes, over every document of
-    /// such a collection rather than only those with a document `_id`, and
-    /// it is recorded the same way, under its own marker.
-    ///
-    /// The Python server takes no claims, and removes both markers when it
-    /// opens a store, so the walk runs again after it has had the store.
-    ///
-    /// The marker's value is the `collation::KEY_FORMAT` the claims were
-    /// keyed by (0, written before 2026-11-09, is format 1: ICU4X's keys).
-    /// Under any other format the claims are not where a write looks for
-    /// them, so they are dropped and the walk taken again.
-    fn backfill_collated_id_claims(&self) -> Result<()> {
-        const DONE: &str = "$collated_id_claims";
-        const CHUNK: usize = 500;
-        let format = i64::from(secantus_core::collation::KEY_FORMAT);
-        let session = self.conn.open_session()?;
-        let stale = {
-            let marker = session.open_cursor(UNIQ_TABLE, None)?;
-            marker.set_key_sssu("", "", DONE, b"");
-            match marker.search() {
-                Ok(()) => {
-                    let found = marker.get_value_q()?;
-                    if (if found == 0 { 1 } else { found }) == format {
-                        return Ok(());
-                    }
-                    true
-                }
-                Err(e) if e.is_not_found() => false,
-                Err(e) => return Err(e.into()),
-            }
-        };
-        let mut collections: Vec<(String, String, Collation)> = Vec::new();
-        {
-            let cur = session.open_cursor(COLL_TABLE, None)?;
-            let mut more = cur.next()?;
-            while more {
-                let (db, coll) = cur.get_key_ss()?;
-                let blob = cur.get_value_u()?;
-                if !blob.is_empty() && !options_name_timeseries(&blob)? {
-                    if let Some((collation, _)) = default_collation(&session, &db, &coll)? {
-                        collections.push((db, coll, collation));
-                    }
-                }
-                more = cur.next()?;
-            }
-        }
-        if stale {
-            for (db, coll, _) in &collections {
-                session.begin_transaction(None)?;
-                match self.purge_unique_claims(&session, db, coll, Some(ID_INDEX_NAME)) {
-                    Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped)?,
-                    Err(e) => {
-                        let _ = session.rollback_transaction(None);
-                        return Err(e);
-                    }
-                }
-            }
-        }
-        let key_spec = bson::doc! {"_id": 1};
-        let mut duplicates = 0u64;
-        for (db, coll, collation) in &collections {
-            let rows = self.scan_docs(&session, db, coll)?;
-            for chunk in rows.chunks(CHUNK) {
-                session.begin_transaction(None)?;
-                let outcome = (|| -> Result<(u64, u64)> {
-                    let claims = session.open_cursor(UNIQ_TABLE, Some("overwrite=false"))?;
-                    let owners = session.open_cursor(UNIQ_TABLE, None)?;
-                    let (mut taken, mut held) = (0u64, 0u64);
-                    for (recordid, _id_k, blob) in chunk {
-                        let doc = decode_doc(blob)?;
-                        for kb in with_bindata_order(BinDataOrder::Format4, || {
-                            index_key_variants_c(&doc, &key_spec, false, Some(collation))
-                        })? {
-                            match self.claim_stored_id(
-                                &session,
-                                (&claims, &owners),
-                                (db, coll),
-                                &escape_kb(&kb),
-                                *recordid,
-                            )? {
-                                Some(true) => taken += 1,
-                                Some(false) => held += 1,
-                                None => {}
-                            }
-                        }
-                    }
-                    Ok((taken, held))
-                })();
-                match outcome {
-                    Ok((_, held)) => {
-                        commit_stamped(&session, &self.oplog, self.timestamped)?;
-                        duplicates += held;
-                    }
-                    Err(e) => {
-                        let _ = session.rollback_transaction(None);
-                        return Err(e);
-                    }
-                }
-            }
-        }
-        // In its own transaction: a timestamped store's purge may have
-        // removed the marker at a timestamp, and the key then takes one.
-        session.begin_transaction(None)?;
-        let written = (|| -> Result<()> {
-            let marker = session.open_cursor(UNIQ_TABLE, None)?;
-            marker.set_key_sssu("", "", DONE, b"");
-            marker.set_value_q(format);
-            marker.insert()?;
-            Ok(())
-        })();
-        match written {
-            Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped)?,
-            Err(e) => {
-                let _ = session.rollback_transaction(None);
-                return Err(e);
-            }
-        }
-        // Quiet unless something is wrong (see `backfill_document_id_claims`).
-        if duplicates > 0 {
-            eprintln!(
-                "secantus-storage: {duplicates} stored _id values are equal under their \
-                 collection's collation to another stored _id, and stay as they are"
-            );
-        }
-        Ok(())
-    }
-
-    /// Rebuild, before anything reads through it, every index whose entries
-    /// this build would not have written:
-    ///
-    /// * a `2d` or `2dsphere` index without [`GEO_KEYS`], built before
-    ///   2026-10-13 or by the Python server: it holds no entry for a value
-    ///   with several locations, or for a point written as a document other
-    ///   than `{lng, lat}`, so a query through it misses those documents;
-    /// * an index with a collation and without [`COLLATION_KEYS`], built by
-    ///   this server before 2026-10-10 (plain values) or by the Python server
-    ///   (its own folded strings): its entries do not compare by the
-    ///   collation, so a lookup through it finds the wrong documents.
-    ///
-    /// The rebuild is the build `createIndexes` runs, from the options the
-    /// user gave, in one transaction per index and with no oplog entry. One
-    /// that cannot be built from the stored documents (a unique index they
-    /// break under its collation, a geo value the index now refuses) stops the
-    /// store from opening, naming the index: answering from it would be wrong,
-    /// and dropping a user's index here would be a decision the user did not
-    /// make.
-    fn rebuild_outdated_indexes(&self) -> Result<()> {
-        // Planner writes made here are released once they are visible.
-        let _planner = PlannerScope::new();
-        // It writes the index catalog.
-        note_planner_write();
-        let session = self.conn.open_session()?;
-        let mut outdated: Vec<(String, String, String, Document, Document)> = Vec::new();
-        {
-            let cur = match session.open_cursor(IDX_TABLE, None) {
-                Ok(c) => c,
-                Err(e) if e.is_not_found() || e.is_missing_table() => return Ok(()),
-                Err(e) => return Err(e.into()),
-            };
-            let mut more = cur.next()?;
-            while more {
-                let (db, coll, name) = cur.get_key_sss()?;
-                let blob = cur.get_value_u()?;
-                if !blob.is_empty() {
-                    let payload = decode_doc(&blob)?;
-                    let key = payload.get_document("key").cloned().unwrap_or_default();
-                    let opts = payload.get_document("options").cloned().unwrap_or_default();
-                    if index_entries_outdated(&key, &opts) {
-                        outdated.push((db, coll, name, key, opts));
-                    }
-                }
-                more = cur.next()?;
-            }
-        }
-        for (db, coll, name, key, opts) in &outdated {
-            let mut options = opts.clone();
-            for stamp in BUILD_STAMPS {
-                options.remove(*stamp);
-            }
-            session.begin_transaction(None)?;
-            let outcome = (|| -> Result<()> {
-                let c = session.open_cursor(IDX_TABLE, None)?;
-                c.set_key_sss(db, coll, name);
-                c.search()?;
-                c.remove()?;
-                self.unplace_index(&session, db, coll, name)?;
-                self.purge_unique_claims(&session, db, coll, Some(name))?;
-                self.create_index_in_txn(&session, db, coll, name, key, &options, false)?;
-                Ok(())
-            })();
-            match outcome {
-                Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped)?,
-                Err(e) => {
-                    let _ = session.rollback_transaction(None);
-                    return Err(StorageError::Internal(format!(
-                        "SecantusDB storage at this path has index '{name}' on '{db}.{coll}', \
-                         built by an earlier version or by the Python server, whose entries \
-                         this build reads differently, and it cannot be rebuilt from the \
-                         documents stored: {e}. Drop the index with the build that wrote it, \
-                         or start from a fresh data directory."
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Bring a store written with number-key format 1 to format 2
-    /// (`sortkey::NUMBER_KEY_FORMAT`), once, before anything reads or writes
-    /// through its keys. Format 1 keyed a double by its shortest decimal and
-    /// collapsed every number whose exponent fell outside -128..=127, so its
-    /// keys are not where this build looks for them:
-    ///
-    /// * the `_id` index row and the in-row `_id` key of every document whose
-    ///   `_id` is a number are re-keyed (`rekey_numeric_ids`);
-    /// * the `_id` claims in `UNIQ_TABLE` are dropped with their two "done"
-    ///   markers, and taken again by `backfill_document_id_claims` /
-    ///   `backfill_collated_id_claims` as the open finishes;
-    /// * every secondary index without the [`NUMBER_KEYS`] stamp is rebuilt
-    ///   (`rebuild_outdated_indexes`).
-    ///
-    /// Then the store records format 2 in the oplog-meta table under
-    /// `"numberKeys"`, which the Python server reads and writes too. The
-    /// re-keying commits in chunks and is safe to repeat: a key of format 2
-    /// never equals one of format 1 (their sign markers differ), so an
-    /// interrupted run picks up where it stopped.
-    fn upgrade_number_keys(&self) -> Result<()> {
-        let session = self.conn.open_session()?;
-        if stored_number_key_format(&session)? >= sortkey::NUMBER_KEY_FORMAT {
-            return Ok(());
-        }
-        self.rekey_numeric_ids(&session)?;
-        session.begin_transaction(None)?;
-        match self.purge_id_claims(&session) {
-            Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped)?,
-            Err(e) => {
-                let _ = session.rollback_transaction(None);
-                return Err(e);
-            }
-        }
-        self.rebuild_outdated_indexes()?;
-        session.begin_transaction(None)?;
-        let outcome = (|| -> Result<()> {
-            let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
-            cur.set_key_s(NUMBER_KEYS_META);
-            cur.set_value_u(&encode_doc(
-                &bson::doc! {"format": sortkey::NUMBER_KEY_FORMAT},
-            )?);
-            cur.insert()?;
-            Ok(())
-        })();
-        match outcome {
-            Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped)?,
-            Err(e) => {
-                let _ = session.rollback_transaction(None);
-                return Err(e);
-            }
-        }
-        Ok(())
-    }
-
-    /// Re-key every document whose `_id` is a number keyed by number-key
-    /// format 1: its row in the `_id` index and the `_id` key framed into its
-    /// document row. A time-series key keeps its 10-byte suffix.
-    ///
-    /// Format 1 gave two different values one key and one value two keys, so
-    /// two stored documents can now hold `_id`s mongod calls equal (the Int64
-    /// `2^62` and the double `2^62`). The one re-keyed first takes the key;
-    /// the other keeps its old one and stays readable by a scan, and the
-    /// count is logged -- as `backfill_document_id_claims` does for document
-    /// `_id`s equal by value.
-    fn rekey_numeric_ids(&self, session: &Session) -> Result<()> {
-        const CHUNK: usize = 500;
-        // `(db, coll, old key, RecordId)` for every format-1 number key.
-        let mut rows: Vec<(String, String, Vec<u8>, i64)> = Vec::new();
-        {
-            let cur = match session.open_cursor(NAT_SEQ_TABLE, None) {
-                Ok(c) => c,
-                Err(e) if e.is_missing_table() || e.is_not_found() => return Ok(()),
-                Err(e) => return Err(e.into()),
-            };
-            let mut more = cur.next()?;
-            while more {
-                let (db, coll, key) = cur.get_key_ssu()?;
-                if sortkey::is_format1_number_key(&key) {
-                    let rid = cur.get_value_q()?;
-                    rows.push((db, coll, key, rid));
-                }
-                more = cur.next()?;
-            }
-        }
-        let mut kept = 0u64;
-        let mut timeseries: HashMap<(String, String), bool> = HashMap::new();
-        for chunk in rows.chunks(CHUNK) {
-            session.begin_transaction(None)?;
-            let outcome = (|| -> Result<u64> {
-                let nat = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
-                let nat_del = session.open_cursor(NAT_SEQ_TABLE, None)?;
-                let mut kept = 0u64;
-                for (db, coll, old, rid) in chunk {
-                    let ts = match timeseries.get(&(db.clone(), coll.clone())) {
-                        Some(t) => *t,
-                        None => {
-                            let t = coll_meta(session, db, coll)?.timeseries;
-                            timeseries.insert((db.clone(), coll.clone()), t);
-                            t
-                        }
-                    };
-                    let docs = match open_doc_cursor(session, db, coll, None) {
-                        Ok(c) => c,
-                        Err(e) if e.is_missing_table() => continue,
-                        Err(e) => return Err(e.into()),
-                    };
-                    docs.set_key_ssq(db, coll, *rid);
-                    match docs.search() {
-                        Ok(()) => {}
-                        // An `_id` row whose document is gone: nothing to key.
-                        Err(e) if e.is_not_found() => continue,
-                        Err(e) => return Err(e.into()),
-                    }
-                    let value = docs.get_value_u()?;
-                    let (framed, blob) = unframe_doc_value(&value)?;
-                    if framed != old.as_slice() {
-                        return Err(StorageError::Internal(format!(
-                            "document {rid} of '{db}.{coll}' holds another _id key than \
-                             its _id index row"
-                        )));
-                    }
-                    let raw = bson::RawDocument::from_bytes(blob)
-                        .map_err(|e| StorageError::Bson(e.to_string()))?;
-                    let id: Bson = raw
-                        .get("_id")
-                        .map_err(|e| StorageError::Bson(e.to_string()))?
-                        .ok_or_else(|| {
-                            StorageError::Internal(format!(
-                                "document {rid} of '{db}.{coll}' has no _id"
-                            ))
-                        })?
-                        .to_raw_bson()
-                        .try_into()
-                        .map_err(|e: bson::raw::Error| StorageError::Bson(e.to_string()))?;
-                    let mut new = id_key(&id)?;
-                    if ts {
-                        let suffix = old.len().saturating_sub(10);
-                        new.extend_from_slice(&old[suffix..]);
-                    }
-                    nat.reset()?;
-                    nat.set_key_ssu(db, coll, &new);
-                    nat.set_value_q(*rid);
-                    match nat.insert() {
-                        Ok(()) => {}
-                        Err(e) if e.is_duplicate_key() => {
-                            kept += 1;
-                            continue;
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                    nat_del.reset()?;
-                    nat_del.set_key_ssu(db, coll, old);
-                    nat_del.remove()?;
-                    let blob = blob.to_vec();
-                    docs.reset()?;
-                    docs.set_key_ssq(db, coll, *rid);
-                    docs.set_value_u(&frame_doc_value(&new, &blob));
-                    docs.update()?;
-                    self.sizes.adjust(
-                        session,
-                        db,
-                        coll,
-                        Delta::replace((old.len(), blob.len()), (new.len(), blob.len())),
-                    );
-                }
-                Ok(kept)
-            })();
-            match outcome {
-                Ok(n) => {
-                    commit_stamped(session, &self.oplog, self.timestamped)?;
-                    kept += n;
-                }
-                Err(e) => {
-                    let _ = session.rollback_transaction(None);
-                    return Err(e);
-                }
-            }
-        }
-        if kept > 0 {
-            eprintln!(
-                "secantus-storage: {kept} stored numeric _id values are equal to another \
-                 stored _id by exact value, and keep their earlier key"
-            );
-        }
-        Ok(())
-    }
-
-    /// Bring a store written with `_id` key format 1 to format 2
-    /// (`sortkey::ID_KEY_FORMAT`), once, before anything reads or writes
-    /// through its keys. Format 1 keyed a document `_id` by its raw BSON and a
-    /// BinData, JavaScript-with-scope or MaxKey `_id` by entry format 4's
-    /// bytes, so the `_id` index was not in mongod's order for them, and a
-    /// cursor walking it could not return what mongod's walk returns (RM-080).
-    /// The `_id` index row and the in-row `_id` key of each such document are
-    /// re-keyed; the `_id` claims keep their keys (they key a document by
-    /// value already). A store whose data tables are not logged is
-    /// checkpointed before the format is recorded, so that a crash cannot
-    /// leave the record without the keys it describes.
-    fn upgrade_id_keys(&self) -> Result<()> {
-        let session = self.conn.open_session()?;
-        if stored_id_key_format(&session)? >= sortkey::ID_KEY_FORMAT {
-            return Ok(());
-        }
-        // A new store holds no format-1 keys: there is nothing to re-key, and
-        // the checkpoint below only guards re-keyed data. Skipping both keeps
-        // a checkpoint (~30-100 ms, measured 2026-11-19) off every cold start.
-        if !self.open_record.new_store {
-            self.rekey_format1_ids(&session)?;
-            if self.data_nonlogged && !self.in_memory {
-                self.checkpoint()?;
-            }
-        }
-        session.begin_transaction(None)?;
-        let outcome = (|| -> Result<()> {
-            let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
-            cur.set_key_s(ID_KEYS_META);
-            cur.set_value_u(&encode_doc(&bson::doc! {"format": sortkey::ID_KEY_FORMAT})?);
-            cur.insert()?;
-            Ok(())
-        })();
-        match outcome {
-            Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped)?,
-            Err(e) => {
-                if let Err(rollback) = session.rollback_transaction(None) {
-                    eprintln!(
-                        "secantus-storage: rolling back the _id key format record failed: \
-                         {rollback:?}"
-                    );
-                }
-                return Err(e);
-            }
-        }
-        Ok(())
-    }
-
-    /// Re-key every document whose `_id` key `_id` key format 1 wrote
-    /// otherwise than format 2: its row in the `_id` index and the `_id` key
-    /// framed into its document row. A time-series key keeps its 10-byte
-    /// suffix. Two documents whose `_id`s mongod calls equal (`{a: 1}` and
-    /// `{a: 1.0}`, which format 1 keyed apart) cannot both take the new key:
-    /// the one re-keyed first does, the other keeps its old key and stays
-    /// readable by a scan, and the count is logged -- as
-    /// `rekey_numeric_ids` does.
-    fn rekey_format1_ids(&self, session: &Session) -> Result<()> {
-        const CHUNK: usize = 500;
-        let mut rows: Vec<(String, String, Vec<u8>, i64)> = Vec::new();
-        {
-            let cur = match session.open_cursor(NAT_SEQ_TABLE, None) {
-                Ok(c) => c,
-                Err(e) if e.is_missing_table() || e.is_not_found() => return Ok(()),
-                Err(e) => return Err(e.into()),
-            };
-            let mut more = cur.next()?;
-            while more {
-                let (db, coll, key) = cur.get_key_ssu()?;
-                if sortkey::may_be_format1_id_key(&key) {
-                    let rid = cur.get_value_q()?;
-                    rows.push((db, coll, key, rid));
-                }
-                more = cur.next()?;
-            }
-        }
-        let mut kept = 0u64;
-        let mut timeseries: HashMap<(String, String), bool> = HashMap::new();
-        for chunk in rows.chunks(CHUNK) {
-            session.begin_transaction(None)?;
-            let outcome = (|| -> Result<u64> {
-                let nat = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
-                let nat_del = session.open_cursor(NAT_SEQ_TABLE, None)?;
-                let mut kept = 0u64;
-                for (db, coll, old, rid) in chunk {
-                    let ts = match timeseries.get(&(db.clone(), coll.clone())) {
-                        Some(t) => *t,
-                        None => {
-                            let t = coll_meta(session, db, coll)?.timeseries;
-                            timeseries.insert((db.clone(), coll.clone()), t);
-                            t
-                        }
-                    };
-                    let docs = match open_doc_cursor(session, db, coll, None) {
-                        Ok(c) => c,
-                        Err(e) if e.is_missing_table() => continue,
-                        Err(e) => return Err(e.into()),
-                    };
-                    docs.set_key_ssq(db, coll, *rid);
-                    match docs.search() {
-                        Ok(()) => {}
-                        // An `_id` row whose document is gone: nothing to key.
-                        Err(e) if e.is_not_found() => continue,
-                        Err(e) => return Err(e.into()),
-                    }
-                    let value = docs.get_value_u()?;
-                    let (framed, blob) = unframe_doc_value(&value)?;
-                    if framed != old.as_slice() {
-                        return Err(StorageError::Internal(format!(
-                            "document {rid} of '{db}.{coll}' holds another _id key than \
-                             its _id index row"
-                        )));
-                    }
-                    let raw = bson::RawDocument::from_bytes(blob)
-                        .map_err(|e| StorageError::Bson(e.to_string()))?;
-                    let id: Bson = raw
-                        .get("_id")
-                        .map_err(|e| StorageError::Bson(e.to_string()))?
-                        .ok_or_else(|| {
-                            StorageError::Internal(format!(
-                                "document {rid} of '{db}.{coll}' has no _id"
-                            ))
-                        })?
-                        .to_raw_bson()
-                        .try_into()
-                        .map_err(|e: bson::raw::Error| StorageError::Bson(e.to_string()))?;
-                    let mut new = id_key(&id)?;
-                    if ts {
-                        let suffix = old.len().saturating_sub(10);
-                        new.extend_from_slice(&old[suffix..]);
-                    }
-                    if new == *old {
-                        continue;
-                    }
-                    nat.reset()?;
-                    nat.set_key_ssu(db, coll, &new);
-                    nat.set_value_q(*rid);
-                    match nat.insert() {
-                        Ok(()) => {}
-                        Err(e) if e.is_duplicate_key() => {
-                            kept += 1;
-                            continue;
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                    nat_del.reset()?;
-                    nat_del.set_key_ssu(db, coll, old);
-                    nat_del.remove()?;
-                    let blob = blob.to_vec();
-                    docs.reset()?;
-                    docs.set_key_ssq(db, coll, *rid);
-                    docs.set_value_u(&frame_doc_value(&new, &blob));
-                    docs.update()?;
-                    self.sizes.adjust(
-                        session,
-                        db,
-                        coll,
-                        Delta::replace((old.len(), blob.len()), (new.len(), blob.len())),
-                    );
-                }
-                Ok(kept)
-            })();
-            match outcome {
-                Ok(n) => {
-                    commit_stamped(session, &self.oplog, self.timestamped)?;
-                    kept += n;
-                }
-                Err(e) => {
-                    if let Err(rollback) = session.rollback_transaction(None) {
-                        eprintln!(
-                            "secantus-storage: rolling back an _id re-key chunk failed: \
-                             {rollback:?}"
-                        );
-                    }
-                    return Err(e);
-                }
-            }
-        }
-        if kept > 0 {
-            eprintln!(
-                "secantus-storage: {kept} stored _id values are equal to another stored _id \
-                 by value, and keep their earlier key"
-            );
-        }
-        Ok(())
-    }
-
-    /// Drop every `_id` claim in `UNIQ_TABLE` (the index name `_id_`) and the
-    /// two rows recording that they were all taken, so that the open takes
-    /// them again under the current keys.
-    fn purge_id_claims(&self, session: &Session) -> Result<()> {
-        let scan = session.open_cursor(UNIQ_TABLE, None)?;
-        let del = session.open_cursor(UNIQ_TABLE, None)?;
-        let mut more = scan.next()?;
-        while more {
-            let (d, c, n, k) = scan.get_key_sssu()?;
-            let marker = d.is_empty()
-                && c.is_empty()
-                && matches!(n.as_str(), "$document_id_claims" | "$collated_id_claims");
-            if n == ID_INDEX_NAME || marker {
-                del.reset()?;
-                del.set_key_sssu(&d, &c, &n, &k);
-                match del.remove() {
-                    Ok(()) => {}
-                    Err(e) if e.is_not_found() => {}
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            more = scan.next()?;
-        }
-        Ok(())
-    }
-
-    /// The `id_claim` descriptor of a collection with a default collation.
-    fn id_claim_desc(&self, session: &Session, db: &str, coll: &str) -> Result<Option<IndexDesc>> {
         Ok(
             default_collation(session, db, coll)?.map(|(collation, clustered)| IndexDesc {
                 name: ID_INDEX_NAME.to_string(),
@@ -20008,153 +18702,10 @@ impl Storage {
                 partial: None,
                 geo_2d: None,
                 geo_sphere: None,
-                id_claim: true,
                 clustered,
                 key_order: BinDataOrder::Format4,
             }),
         )
-    }
-
-    /// The destination's descriptors during a rename. Its options are written
-    /// last, so the collated `_id` claim is taken from the source, whose
-    /// options the destination is about to inherit.
-    fn rename_descs(
-        &self,
-        session: &Session,
-        src: (&str, &str),
-        dst: (&str, &str),
-    ) -> Result<Vec<IndexDesc>> {
-        let mut descs = self.index_descs(session, dst.0, dst.1)?;
-        if !descs.iter().any(|d| d.id_claim) {
-            descs.extend(self.id_claim_desc(session, src.0, src.1)?);
-        }
-        Ok(descs)
-    }
-
-    /// Whether the document a claim names is still there. A claim can outlive
-    /// its row (the Python server, sharing this store, does not release an
-    /// `_id` claim), and a RecordId is never reused, so a claim whose row is
-    /// gone belongs to nobody.
-    fn claim_owner_exists(
-        &self,
-        session: &Session,
-        db: &str,
-        coll: &str,
-        recordid: i64,
-    ) -> Result<bool> {
-        let cur = match open_doc_cursor(session, db, coll, None) {
-            Ok(c) => c,
-            Err(e) if e.is_missing_table() => return Ok(false),
-            Err(e) => return Err(e.into()),
-        };
-        cur.set_key_ssq(db, coll, recordid);
-        match cur.search() {
-            Ok(()) => Ok(true),
-            Err(e) if e.is_not_found() => Ok(false),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// The first unique-index violation `candidate` would cause, or `None`.
-    /// Probes the entries table for an existing row sharing *any* key the
-    /// candidate generates and belonging to a *different* doc (`exclude_recordid`
-    /// skips the candidate's own row, for replace/update). Every key, not just
-    /// the canonical one: on a multikey index mongod's rule is "no two docs
-    /// share a generated key", and for a path descending through an array the
-    /// canonical key isn't among the entries at all.
-    /// Mirrors `storage._unique_conflict`.
-    fn unique_conflict(
-        &self,
-        session: &Session,
-        db: &str,
-        coll: &str,
-        candidate: &Document,
-        descs: &[IndexDesc],
-        exclude_recordid: Option<i64>,
-    ) -> Result<Option<UniqueConflict>> {
-        // A document `_id` is also claimed by value (see `document_id_claim`).
-        let with_id_claim;
-        let descs: &[IndexDesc] =
-            match self.document_id_claim(session, db, coll, candidate, descs)? {
-                Some(claim) => {
-                    with_id_claim = [descs, std::slice::from_ref(&claim)].concat();
-                    &with_id_claim
-                }
-                None => descs,
-            };
-        if descs.is_empty() {
-            return Ok(None);
-        }
-        for desc in descs {
-            // The collated `_id` has no entries to probe: its claim is the
-            // record of who holds the key.
-            if desc.id_claim {
-                let claims = session.open_cursor(UNIQ_TABLE, None)?;
-                for kb in desc.key_variants(candidate, false)? {
-                    claims.reset()?;
-                    claims.set_key_sssu(db, &key_coll(db, coll), &desc.name, &escape_kb(&kb));
-                    let owner = match claims.search() {
-                        Ok(()) => claims.get_value_q()?,
-                        Err(e) if e.is_not_found() => continue,
-                        Err(e) => return Err(e.into()),
-                    };
-                    if exclude_recordid != Some(owner)
-                        && self.claim_owner_exists(session, db, coll, owner)?
-                    {
-                        return Ok(Some(
-                            with_bindata_order(desc.key_order, || {
-                                UniqueConflict::new(
-                                    format!("{db}.{coll}"),
-                                    &desc.name,
-                                    &desc.key_spec,
-                                    candidate,
-                                    &kb,
-                                    desc.collation.as_ref(),
-                                )
-                            })
-                            .on_clustered(desc.clustered),
-                        ));
-                    }
-                }
-                continue;
-            }
-            // `prepareUnique` arms an index to reject dup *new* writes (11000)
-            // before it's formally unique — so it enforces uniqueness here too.
-            if (!desc.unique && !desc.prepare_unique) || !self.doc_in_partial(candidate, desc)? {
-                continue;
-            }
-            let shape = desc.shape();
-            let cur = open_index_cursor(session, db, coll, &desc.name, None)?;
-            for (kb, values) in desc.key_values(candidate, desc.sparse)? {
-                let exact = shape.exact(&values)?;
-                cur.reset()?;
-                let mut more = seek_ge(&cur, &exact)?;
-                while more {
-                    let row = cur.get_key_u()?;
-                    if !row.starts_with(&exact) {
-                        break;
-                    }
-                    let row_id = ixkeys::entry_rid(&row);
-                    // `row_id` is None only for a key that is not an entry's;
-                    // treat it as "not me" rather than silently matching.
-                    let is_self = row_id.is_some() && exclude_recordid == row_id;
-                    if !is_self {
-                        return Ok(Some(with_bindata_order(desc.key_order, || {
-                            UniqueConflict::new(
-                                format!("{db}.{coll}"),
-                                &desc.name,
-                                &desc.key_spec,
-                                candidate,
-                                &kb,
-                                desc.collation.as_ref(),
-                            )
-                        })));
-                    }
-                    more = cur.next()?;
-                }
-            }
-        }
-        Ok(None)
     }
 
     /// Collection names registered under `db` (no lock, session-scoped — for
@@ -20186,145 +18737,10 @@ impl Storage {
         Ok(out)
     }
 
-    /// Delete up to `limit` natural-order rows (forward then reverse tables)
-    /// for the collection; returns how many were deleted.
-    fn purge_nat_batch(
-        &self,
-        session: &Session,
-        db: &str,
-        coll: &str,
-        limit: usize,
-    ) -> Result<usize> {
-        // Forward half, in the LEGACY table. It is not created on a new store,
-        // and an absent one has no rows -- but this must NOT return early: the
-        // reverse half below purges NAT_SEQ_TABLE, the live `_id` index, and
-        // skipping it leaves entries that reject a re-insert into the
-        // recreated namespace (caught by
-        // drop_chunk::drop_collection_survives_a_small_cache).
-        let mut seqs: Vec<i64> = Vec::new();
-        if let Some(nat) = match session.open_cursor(NAT_TABLE, None) {
-            Ok(c) => Some(c),
-            Err(e) if e.is_missing_table() => None,
-            Err(e) => return Err(e.into()),
-        } {
-            nat.set_key_ssq(db, coll, i64::MIN);
-            let mut more = match nat.search_near() {
-                Ok(cmp) => {
-                    if cmp < 0 {
-                        nat.next()?
-                    } else {
-                        true
-                    }
-                }
-                Err(e) if e.is_not_found() => false,
-                Err(e) => return Err(e.into()),
-            };
-            while more && seqs.len() < limit {
-                let (d, c, seq) = nat.get_key_ssq()?;
-                if d != db || c != coll {
-                    break;
-                }
-                seqs.push(seq);
-                more = nat.next()?;
-            }
-            for seq in &seqs {
-                nat.reset()?;
-                nat.set_key_ssq(db, coll, *seq);
-                if nat.search().is_ok() {
-                    nat.remove()?;
-                }
-            }
-        }
-        let mut deleted = seqs.len();
-        if deleted >= limit {
-            return Ok(deleted);
-        }
-        let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
-        rev.set_key_ssu(db, coll, b"");
-        let mut more = match rev.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    rev.next()?
-                } else {
-                    true
-                }
-            }
-            Err(e) if e.is_not_found() => false,
-            Err(e) => return Err(e.into()),
-        };
-        let mut keys: Vec<Vec<u8>> = Vec::new();
-        while more && deleted + keys.len() < limit {
-            let (d, c, k) = rev.get_key_ssu()?;
-            if d != db || c != coll {
-                break;
-            }
-            keys.push(k);
-            more = rev.next()?;
-        }
-        for k in &keys {
-            rev.reset()?;
-            rev.set_key_ssu(db, coll, k);
-            if rev.search().is_ok() {
-                rev.remove()?;
-            }
-        }
-        deleted += keys.len();
-        Ok(deleted)
-    }
-
-    /// Delete up to `limit` unique-key claims for the collection (all
-    /// indexes); returns how many were deleted.
-    fn purge_uniq_batch(
-        &self,
-        session: &Session,
-        db: &str,
-        coll: &str,
-        limit: usize,
-    ) -> Result<usize> {
-        let scan = session.open_cursor(UNIQ_TABLE, None)?;
-        let del = session.open_cursor(UNIQ_TABLE, None)?;
-        scan.reset()?;
-        scan.set_key_sssu(db, coll, "", b"");
-        let mut more = match scan.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    scan.next()?
-                } else {
-                    true
-                }
-            }
-            Err(e) if e.is_not_found() => return Ok(0),
-            Err(e) => return Err(e.into()),
-        };
-        let mut keys: Vec<(String, Vec<u8>)> = Vec::new();
-        while more && keys.len() < limit {
-            let (d, c, n, k) = scan.get_key_sssu()?;
-            if d != db || c != coll {
-                break;
-            }
-            keys.push((n, k));
-            more = scan.next()?;
-        }
-        for (n, k) in &keys {
-            del.reset()?;
-            del.set_key_sssu(db, coll, n, k);
-            match del.remove() {
-                Ok(()) => {}
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(keys.len())
-    }
-
     fn purge_collection_tables(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
         // It writes the index catalog.
         note_planner_write_of(db, coll);
         self.forget_record_ids(db, coll);
-        // Unique-key claims die with the namespace (see purge_unique_claims):
-        // a surviving claim would reject a later insert of the same value
-        // against a row that no longer exists.
-        self.purge_unique_claims(session, db, coll, None)?;
         // The documents are not purged row by row: they are in the
         // collection's own table, which a drop unlists and drops whole
         // (`unplace_collection`) and a rename moves (`move_placement`). Each
@@ -20340,8 +18756,9 @@ impl Storage {
             Err(e) if e.is_missing_table() => {}
             Err(e) => return Err(e.into()),
         }
-        // The indexes' entries are in tables of their own, which a drop
-        // unlists and drops whole (`unplace_collection`) and a rename moves.
+        // The indexes' entries, the `_id` index's among them and uniqueness
+        // with them, are in tables of their own, which a drop unlists and
+        // drops whole (`unplace_collection`) and a rename moves.
         for (name, _key_spec, _opts) in self.iter_indexes(session, db, coll)? {
             let ic = session.open_cursor(IDX_TABLE, None)?;
             ic.set_key_sss(db, coll, &name);
@@ -20351,10 +18768,6 @@ impl Storage {
                 Err(e) => return Err(e.into()),
             }
         }
-        // Drop the natural-order entries too, so a re-created collection can't
-        // resurrect stale insertion positions (which would double a re-inserted
-        // `_id` in a natural scan).
-        self.drop_nat_collection(session, db, coll)?;
         Ok(())
     }
 
@@ -20558,22 +18971,25 @@ impl Storage {
         let descs: Vec<IndexDesc> = self
             .index_descs(session, db, coll)?
             .into_iter()
-            .filter(|d| !d.id_claim && d.name != ID_INDEX_NAME)
+            .filter(|d| d.name != ID_INDEX_NAME)
             .collect();
         let mut expected: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
         let mut keys: HashMap<String, i64> = HashMap::new();
-        let mut ids: HashSet<Vec<u8>> = HashSet::new();
+        let mut ids: HashSet<i64> = HashSet::new();
         let (mut records, mut undecodable, mut id_missing) = (0i64, 0i64, 0i64);
-        for (recordid, id_key, blob) in self.scan_docs(session, db, coll)? {
+        let id_ix = self.id_index(session, db, coll, None)?;
+        for (recordid, _id_key, blob) in self.scan_docs(session, db, coll)? {
             records += 1;
-            if self.doc_recordid(session, db, coll, &id_key)? != Some(recordid) {
-                id_missing += 1;
-            }
-            ids.insert(id_key);
+            ids.insert(recordid);
             let Ok(doc) = secantus_core::bsondoc::from_bytes(&blob) else {
                 undecodable += 1;
                 continue;
             };
+            if id_ix.cur.is_some()
+                && id_ix.recordid_of(doc.get("_id").unwrap_or(&Bson::Null))? != Some(recordid)
+            {
+                id_missing += 1;
+            }
             for desc in &descs {
                 let packed = self.packed_entry_keys(&doc, desc, recordid)?;
                 let held = if desc.geo_2d.is_some() || desc.geo_sphere.is_some() {
@@ -20597,24 +19013,18 @@ impl Storage {
             actual.entry(name).or_default().insert(packed);
         }
         // The `_id` index: an entry whose document is gone.
+        actual.remove(ID_INDEX_NAME);
         let mut id_extra = 0i64;
-        let nat = session.open_cursor(NAT_SEQ_TABLE, None)?;
-        nat.set_key_ssu(db, coll, b"");
-        let mut more = match nat.search_near() {
-            Ok(cmp) if cmp < 0 => nat.next()?,
-            Ok(_) => true,
-            Err(e) if e.is_not_found() => false,
-            Err(e) => return Err(e.into()),
-        };
-        while more {
-            let (d, c, id_key) = nat.get_key_ssu()?;
-            if d != db || c != coll {
-                break;
+        if let Some(cur) = &id_ix.cur {
+            cur.reset()?;
+            let mut more = cur.next()?;
+            while more {
+                let rid = ixkeys::id_entry_rid(&cur.get_value_u()?);
+                if !rid.is_some_and(|r| ids.contains(&r)) {
+                    id_extra += 1;
+                }
+                more = cur.next()?;
             }
-            if !ids.contains(&id_key) {
-                id_extra += 1;
-            }
-            more = nat.next()?;
         }
         let mut indexes = vec![Bson::Document(bson::doc! {
             "name": ID_INDEX_NAME,
@@ -21051,11 +19461,10 @@ impl Storage {
     /// `backward`: in descending order, from the last entry at or before
     /// `from` (before `Resume`).
     ///
-    /// The `_id` index (`_id_`) is the `_id` keys every document row holds,
-    /// read in their own order: `from` is then [`IndexPos::Raw`] (or
-    /// [`IndexPos::Resume`] of an entry's own `raw`, with `after`), each
-    /// entry is a document's `id_key` (not a compound key), and a resumed
-    /// scan goes past that key, which no other document shares.
+    /// The `_id` index (`_id_`) is read as any other: its table holds the
+    /// KeyString of `_id` as the key and the RecordId and TypeBits as the
+    /// value, and no other document shares a key, so a resumed scan goes
+    /// past the key it resumes from.
     #[allow(clippy::too_many_arguments)]
     pub fn index_entries_from(
         &self,
@@ -21063,52 +19472,29 @@ impl Storage {
         coll: &str,
         name: &str,
         from: IndexPos<'_>,
-        after: Option<i64>,
+        _after: Option<i64>,
         max: usize,
         backward: bool,
     ) -> Result<Vec<IndexRow>> {
         let session = self.op_session()?;
-        if name == ID_INDEX_NAME {
-            let (key, past): (&[u8], bool) = match from {
-                IndexPos::Edge if backward => (&[0xFF], false),
-                IndexPos::Edge => (&[], false),
-                IndexPos::Raw(k) => (k, after.is_some()),
-                IndexPos::Resume(k) => (k, true),
-                IndexPos::Values(_) => {
-                    return Err(StorageError::Internal(
-                        "the _id index is read from its raw keys".into(),
-                    ))
-                }
-            };
-            return Ok(
-                id_entries_from(&session, db, coll, key, past, max, backward)?
-                    .into_iter()
-                    .map(|(raw, rid)| IndexRow {
-                        resume: raw.clone(),
-                        raw,
-                        rid,
-                    })
-                    .collect(),
-            );
-        }
         let cur = match open_index_cursor(&session, db, coll, name, None) {
             Ok(c) => c,
             // No such index or collection: nothing to read.
             Err(StorageError::Wt(e)) if e.code == SNAPSHOT_UNAVAILABLE => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
-        let shape = self.index_shape(&session, db, coll, name)?;
+        let is_id = name == ID_INDEX_NAME;
+        let shape = if is_id {
+            self.id_shape(&session, db, coll)?
+        } else {
+            self.index_shape(&session, db, coll, name)?
+        };
         // Where the walk starts, as a key the table is searched near.
         let mut more = match (from, backward) {
             (IndexPos::Edge, false) => seek_ge(&cur, &[])?,
             (IndexPos::Edge, true) => {
                 cur.reset()?;
                 cur.prev()?
-            }
-            (IndexPos::Raw(_), _) => {
-                return Err(StorageError::Internal(
-                    "a secondary index is read from values or a resume key".into(),
-                ))
             }
             (IndexPos::Values(values), false) => seek_ge(&cur, &shape.seek(values, false)?)?,
             (IndexPos::Values(values), true) => {
@@ -21140,8 +19526,15 @@ impl Storage {
                 return Err(StorageError::MaxTimeExpired);
             }
             let key = cur.get_key_u()?;
-            let type_bits = cur.get_value_u()?;
-            let (values, rid) = shape.decode(&key, &type_bits)?;
+            let value = cur.get_value_u()?;
+            // An `_id_` entry holds its RecordId in the value, any other the
+            // TypeBits only (and the RecordId at the end of its key).
+            let (values, rid) = if is_id {
+                let (id, rid) = shape.decode_id(&key, &value)?;
+                (vec![id], rid)
+            } else {
+                shape.decode(&key, &value)?
+            };
             let mut raw = Vec::new();
             for (i, v) in values.iter().enumerate() {
                 if i > 0 {
@@ -22675,9 +21068,8 @@ impl Storage {
     /// what a server compares with the rows other transactions hold.
     pub fn row_of_id(&self, db: &str, coll: &str, id: &Bson) -> Result<Option<WrittenRow>> {
         let session = self.op_session()?;
-        let key = id_key(id)?;
         Ok(self
-            .doc_recordid(&session, db, coll, &key)?
+            .doc_recordid(&session, db, coll, id)?
             .map(|r| (db.to_string(), coll.to_string(), r)))
     }
 
@@ -23381,7 +21773,7 @@ impl Storage {
                 session,
                 db,
                 coll,
-                Delta::replace((id_k.len(), blob.len()), (id_k.len(), new_blob.len())),
+                Delta::replace(blob.len(), new_blob.len()),
             );
             self.remove_index_entries(session, db, coll, &removals)?;
             self.maybe_mark_multikey(session, db, coll, &new, &descs)?;
@@ -23556,7 +21948,7 @@ impl Storage {
                             &session,
                             db,
                             coll,
-                            Delta::replace((id_k.len(), blob.len()), (id_k.len(), new_blob.len())),
+                            Delta::replace(blob.len(), new_blob.len()),
                         );
                         self.remove_index_entries(&session, db, coll, &removals)?;
                         self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
@@ -23773,7 +22165,7 @@ impl Storage {
                     }
                     // Mint the RecordId + write the `_id` index first, then key the
                     // doc row by that RecordId (framed value carries the id_key).
-                    let recordid = match self.write_nat_entry(&session, db, coll, &new_id_key) {
+                    let recordid = match self.write_nat_entry(&session, db, coll, &id) {
                         Ok(r) => r,
                         // The upserted `_id` is taken: mongod names the
                         // collection, the index and the key, as it does for
@@ -23796,12 +22188,8 @@ impl Storage {
                     cur.set_key_ssq(db, coll, recordid);
                     cur.set_value_u(&frame_doc_value(&new_id_key, &new_blob));
                     cur.insert()?;
-                    self.sizes.adjust(
-                        &session,
-                        db,
-                        coll,
-                        Delta::insert(new_id_key.len(), new_blob.len()),
-                    );
+                    self.sizes
+                        .adjust(&session, db, coll, Delta::insert(new_blob.len()));
                     self.write_index_entries(&session, db, coll, &new, &descs, recordid)?;
                     self.count_index_keys(&session, db, coll, None, Some(&new), &descs)?;
                     self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
@@ -23951,8 +22339,9 @@ impl Storage {
                 let mut out = Vec::with_capacity(blobs.len());
                 for blob in blobs {
                     let doc = decode_doc(&blob)?;
-                    let key = id_key(doc.get("_id").unwrap_or(&Bson::Null))?;
-                    if let Some(recordid) = self.doc_recordid(session, db, coll, &key)? {
+                    let id = doc.get("_id").unwrap_or(&Bson::Null);
+                    let key = id_key(id)?;
+                    if let Some(recordid) = self.doc_recordid(session, db, coll, id)? {
                         out.push((recordid, key, blob));
                     }
                 }
@@ -24274,11 +22663,17 @@ impl Storage {
             cur.set_key_ssq(db, coll, recordid);
             cur.remove()?;
             self.sizes
-                .adjust(session, db, coll, Delta::remove(id_k.len(), blob.len()));
+                .adjust(session, db, coll, Delta::remove(blob.len()));
             note_deleted(db, coll, &blob);
             self.delete_index_entries(session, db, coll, &doc, &descs, recordid)?;
             self.count_index_keys(session, db, coll, Some(&doc), None, &descs)?;
-            self.delete_nat_entry(session, db, coll, &id_k)?;
+            self.delete_nat_entry(
+                session,
+                db,
+                coll,
+                doc.get("_id").unwrap_or(&Bson::Null),
+                recordid,
+            )?;
             deleted += 1;
             // Index-entry removals are the delete's dirty content; approximate
             // with the doc size (each removal dirties an entry page).
@@ -24360,11 +22755,17 @@ impl Storage {
                     cur.set_key_ssq(db, coll, recordid);
                     cur.remove()?;
                     self.sizes
-                        .adjust(&session, db, coll, Delta::remove(id_k.len(), blob.len()));
+                        .adjust(&session, db, coll, Delta::remove(blob.len()));
                     note_deleted(db, coll, &blob);
                     self.delete_index_entries(&session, db, coll, &doc, &descs, recordid)?;
                     self.count_index_keys(&session, db, coll, Some(&doc), None, &descs)?;
-                    self.delete_nat_entry(&session, db, coll, &id_k)?;
+                    self.delete_nat_entry(
+                        &session,
+                        db,
+                        coll,
+                        doc.get("_id").unwrap_or(&Bson::Null),
+                        recordid,
+                    )?;
                     deleted += 1;
                     if oplog_on {
                         // `o` and `o2` are both `{_id}` — encode once, splice twice.
@@ -25204,15 +23605,19 @@ impl Storage {
         // rows. There, fall through to a collection scan.
         if filter.len() == 1 && !self.is_timeseries(session, db, coll)? {
             if let Some(spec) = filter.get("_id") {
-                if let Some(id_keys) = id_point_lookup_keys(spec)? {
+                if let Some(ids) = id_point_lookup_keys(spec)? {
                     // Callers want RecordIds. For an `_id` lookup the `_id` index IS
                     // the primary access path (not the secondary-index hop step 2
                     // removed), so resolve each key through it; a key with no row
                     // simply matches nothing.
-                    let mut rids = Vec::with_capacity(id_keys.len());
-                    for id_k in &id_keys {
-                        if let Some(rid) = self.doc_recordid(session, db, coll, id_k)? {
-                            rids.push(rid);
+                    let ix = self.id_index(session, db, coll, None)?;
+                    let mut rids = Vec::with_capacity(ids.len());
+                    let mut seen = HashSet::new();
+                    for id in &ids {
+                        if let Some(rid) = ix.recordid_of(id)? {
+                            if seen.insert(rid) {
+                                rids.push(rid);
+                            }
                         }
                     }
                     return Ok(Some(rids));
@@ -25636,7 +24041,7 @@ impl Storage {
         let descs = self.index_descs_cached(session, db, coll)?;
         descs
             .iter()
-            .find(|d| d.name == name && !d.id_claim)
+            .find(|d| d.name == name)
             .map(IndexDesc::shape)
             .ok_or_else(index_gone)
     }
@@ -25873,10 +24278,8 @@ impl Storage {
 
     /// Candidates for a predicate on `_id` that is not a point lookup -- a
     /// range, a negation, a type -- read from the `_id` index between the
-    /// predicate's bounds. `_id` key format 1 keyed a document `_id` by its
-    /// raw BSON, not by value; a store is re-keyed to format 2 when it opens
-    /// (`upgrade_id_keys`), but a document `_id` equal by value to another
-    /// keeps its old key, so documents are still read whole and out of order.
+    /// predicate's bounds, in the order of the keys (mongod's, under the
+    /// collection's collation).
     fn try_id_range_id_keys(
         &self,
         session: &Session,
@@ -25884,53 +24287,43 @@ impl Storage {
         coll: &str,
         spec: &Bson,
     ) -> Result<Option<Vec<i64>>> {
-        let Some(mut bounds) = scan_bounds::for_predicate(spec, false, false) else {
+        let Some(bounds) = scan_bounds::for_predicate(spec, false, false) else {
             return Ok(None);
         };
         if !wide_read_allowed(bounds.broad) {
             return Ok(None);
         }
-        let legacy = [scan_bounds::rank_doc(), scan_bounds::rank_array()];
-        bounds.widen_ranks(&legacy);
-        let spans = scan_bounds::to_spans(&bounds, 1, |k| k.to_vec());
+        let ix = self.id_index(session, db, coll, None)?;
+        let Some(cur) = &ix.cur else {
+            return Ok(None);
+        };
+        let Some(spans) = scan_bounds::to_key_spans(&bounds, 1, &ix.shape, 0) else {
+            return Ok(None);
+        };
         note_routed("_id_");
-        let kc = key_coll(db, coll);
-        let cur = session.open_cursor(NAT_SEQ_TABLE, None)?;
         let mut out = Vec::new();
-        let mut ordered = true;
         for span in &spans {
             let lo = span.lo.clone().unwrap_or_default();
             let hi = span.hi.clone().unwrap_or_else(|| vec![0xFF]);
             cur.reset()?;
-            cur.set_key_ssu(db, &kc, &lo);
-            let mut more = match cur.search_near() {
-                Ok(cmp) => {
-                    if cmp < 0 {
-                        cur.next()?
-                    } else {
-                        true
-                    }
-                }
-                Err(e) if e.is_not_found() => false,
-                Err(e) => return Err(e.into()),
-            };
+            let mut more = seek_ge(cur, &lo)?;
             while more {
                 if deadline::check().is_err() {
                     return Err(StorageError::MaxTimeExpired);
                 }
-                let (d, c, idk) = cur.get_key_ssu()?;
-                if d != db || c != kc.as_ref() || idk.as_slice() >= hi.as_slice() {
+                if cur.with_key_u(|k| k >= hi.as_slice())? {
                     break;
                 }
-                if idk.first().is_some_and(|r| legacy.contains(r)) {
-                    ordered = false;
+                match ixkeys::id_entry_rid(&cur.get_value_u()?) {
+                    Some(rid) => out.push(rid),
+                    None => {
+                        return Err(StorageError::Internal(
+                            "an _id index entry holds no RecordId".into(),
+                        ))
+                    }
                 }
-                out.push(cur.get_value_q()?);
                 more = cur.next()?;
             }
-        }
-        if !ordered {
-            note_unordered();
         }
         Ok(Some(out))
     }
@@ -26542,7 +24935,9 @@ fn sync_catalog_entry(session: &Session, db: &str, coll: &str) -> Result<()> {
         }
     };
     let mut indexes = Vec::new();
-    if coll != PROFILE_COLLECTION {
+    // A collection with an `_id` index table lists it, as mongod does (not
+    // `system.profile`, nor a time-series collection).
+    if placement.indexes.contains_key(ID_INDEX_NAME) {
         let id_key = bson::doc! {"_id": 1i32};
         indexes.push(mdb_catalog::CatalogIndex {
             spec: bson::doc! {"v": 2i32, "key": id_key.clone(), "name": ID_INDEX_NAME},
@@ -26668,12 +25063,8 @@ fn index_event_spec(payload: &Document, name: &str) -> Document {
 
 /// Register the collection if it is not registered, answering whether it was
 /// created here.
-fn ensure_collection(
-    session: &Session,
-    db: &str,
-    coll: &str,
-    data_nonlogged: bool,
-) -> Result<bool> {
+fn ensure_collection(store: &Storage, session: &Session, db: &str, coll: &str) -> Result<bool> {
+    let data_nonlogged = store.data_nonlogged;
     let probe = session.open_cursor(COLL_TABLE, None)?;
     probe.set_key_ss(db, coll);
     match probe.search() {
@@ -26690,19 +25081,11 @@ fn ensure_collection(
             handle
                 .deferred_creates
                 .insert((db.to_string(), coll.to_string()), empty_options());
-            let incarnation: String = new_uuid_bytes()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            handle.deferred_keys.insert(
-                (db.to_string(), coll.to_string()),
-                format!("{coll}{DEFERRED_KEY_SEP}{incarnation}"),
-            );
             // Its commit changes what other sessions see in the registry.
             handle.wrote_registry = true;
             // Its documents' table is made now (a table is not part of any
             // transaction); the commit records where it is.
-            let placement = place_new_collection(session, data_nonlogged)?;
+            let placement = place_new_collection(session, coll, data_nonlogged)?;
             handle
                 .deferred_placements
                 .insert((db.to_string(), coll.to_string()), placement);
@@ -26721,8 +25104,17 @@ fn ensure_collection(
             note_coll_table_write(db, coll);
             // The collection's own documents table, as mongod makes it, and
             // its `_mdb_catalog` row, in this transaction.
-            let placement = place_new_collection(session, data_nonlogged)?;
+            let placement = place_new_collection(session, coll, data_nonlogged)?;
             mdb_catalog::write_placement(session, db, coll, &placement)?;
+            // Its tables are not part of the transaction: one that rolls back
+            // leaves them unlisted, and they go once nothing reads them.
+            let pending = store.drop_pending.clone();
+            let idents: Vec<String> = placement.idents().cloned().collect();
+            session.on_transaction_end(Box::new(move |committed| {
+                if !committed {
+                    pending.lock().extend(idents);
+                }
+            }));
             sync_catalog_entry(session, db, coll)?;
             Ok(true)
         }
@@ -27135,17 +25527,9 @@ fn pre_image_of_entry(
 /// `None`.
 fn pre_image_record_by_id(session: &Session, id: &Document) -> Result<Option<Vec<u8>>> {
     let (db, coll) = (PRE_IMAGES_DB, PRE_IMAGES_COLL);
-    let key = id_key(&Bson::Document(id.clone()))?;
-    let rev = match session.open_cursor(NAT_SEQ_TABLE, None) {
-        Ok(c) => c,
-        Err(e) if e.is_missing_table() => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    rev.set_key_ssu(db, &key_coll(db, coll), &key);
-    let recordid = match rev.search() {
-        Ok(()) => rev.get_value_q()?,
-        Err(e) if e.is_not_found() => return Ok(None),
-        Err(e) => return Err(e.into()),
+    let ix = open_id_index(session, db, coll, None, id_key_shape(None))?;
+    let Some(recordid) = ix.recordid_of(&Bson::Document(id.clone()))? else {
+        return Ok(None);
     };
     let cur = match open_doc_cursor(session, db, coll, None) {
         Ok(c) => c,
@@ -27198,7 +25582,7 @@ fn remove_expired_pre_images(
         };
         by_oplog || by_age
     };
-    let mut doomed: Vec<(i64, Vec<u8>, usize)> = Vec::new();
+    let mut doomed: Vec<(i64, Bson, usize)> = Vec::new();
     cur.set_key_ssq(db, coll, i64::MIN);
     let mut more = match cur.search_near() {
         Ok(cmp) if cmp < 0 => cur.next()?,
@@ -27212,11 +25596,15 @@ fn remove_expired_pre_images(
             break;
         }
         let value = cur.get_value_u()?;
-        let (idk, blob) = unframe_doc_value(&value)?;
+        let (_idk, blob) = unframe_doc_value(&value)?;
         if !expired(blob) {
             break;
         }
-        doomed.push((rid, idk.to_vec(), blob.len()));
+        let id = secantus_core::bsondoc::fields(blob, |key| key == "_id")
+            .ok()
+            .and_then(|mut d| d.remove("_id"))
+            .unwrap_or(Bson::Null);
+        doomed.push((rid, id, blob.len()));
         more = cur.next()?;
     }
     drop(cur);
@@ -27224,11 +25612,11 @@ fn remove_expired_pre_images(
         return Ok(0);
     }
     let docs = open_doc_cursor(session, db, coll, None)?;
-    let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
+    let ix = open_id_index(session, db, coll, None, id_key_shape(None))?;
     for batch in doomed.chunks(PRUNE_DELETE_BATCH) {
         session.begin_transaction(None)?;
         let removed = (|| -> Result<()> {
-            for (rid, idk, len) in batch {
+            for (rid, id, len) in batch {
                 docs.reset()?;
                 docs.set_key_ssq(db, coll, *rid);
                 match docs.remove() {
@@ -27237,14 +25625,25 @@ fn remove_expired_pre_images(
                     Err(e) if e.is_not_found() => continue,
                     Err(e) => return Err(e.into()),
                 }
-                rev.reset()?;
-                rev.set_key_ssu(db, &key_coll(db, coll), idk);
-                match rev.remove() {
-                    Ok(()) => {}
-                    Err(e) if e.is_not_found() => {}
-                    Err(e) => return Err(e.into()),
+                if let Some(rev) = &ix.cur {
+                    let key = ix
+                        .shape
+                        .id_key(id)
+                        .map_err(|_| StorageError::UnsupportedId)?;
+                    rev.reset()?;
+                    rev.set_key_u(&key);
+                    match rev.remove() {
+                        Ok(()) => sizes.adjust(
+                            session,
+                            db,
+                            coll,
+                            Delta::entries(ID_INDEX_NAME, -(key.len() as i64)),
+                        ),
+                        Err(e) if e.is_not_found() => {}
+                        Err(e) => return Err(e.into()),
+                    }
                 }
-                sizes.adjust(session, db, coll, Delta::remove(idk.len(), *len));
+                sizes.adjust(session, db, coll, Delta::remove(*len));
             }
             Ok(())
         })();
@@ -27902,23 +26301,9 @@ fn flush_deferred_creates(
     storage: &Storage,
     session: &Session,
     creates: BTreeMap<(String, String), Vec<u8>>,
-    keys: BTreeMap<(String, String), String>,
     placements: BTreeMap<(String, String), mdb_catalog::Placement>,
 ) -> Result<()> {
     let written = (|| -> Result<()> {
-        // The `_id` index rows and unique claims, from the name they were kept
-        // under to the collection's own. One somebody else holds is the same
-        // conflict as the registry row.
-        for ((db, coll), held) in &keys {
-            move_keyed_rows(session, NAT_SEQ_TABLE, db, held, coll, |c| {
-                let (_, _, k) = c.get_key_ssu()?;
-                Ok((None, k))
-            })?;
-            move_keyed_rows(session, UNIQ_TABLE, db, held, coll, |c| {
-                let (_, _, n, k) = c.get_key_sssu()?;
-                Ok((Some(n), k))
-            })?;
-        }
         let cur = session.open_cursor(COLL_TABLE, Some("overwrite=false"))?;
         for ((db, coll), blob) in &creates {
             cur.reset()?;
@@ -27958,105 +26343,6 @@ fn flush_deferred_creates(
     }
     COLL_TABLE_GEN.fetch_add(1, Ordering::SeqCst);
     Ok(())
-}
-
-/// Move every row of `table` under `(db, from, ...)` to `(db, to, ...)`, in
-/// the transaction. `split` reads a row's key past the collection: the index
-/// name (for `UNIQ_TABLE`) and the trailing bytes. A row `to` already holds
-/// is mongod's 112 for `to`.
-fn move_keyed_rows(
-    session: &Session,
-    table: &str,
-    db: &str,
-    from: &str,
-    to: &str,
-    split: impl Fn(&Cursor) -> Result<(Option<String>, Vec<u8>)>,
-) -> Result<()> {
-    let scan = session.open_cursor(table, None)?;
-    let mut rows: Vec<(Option<String>, Vec<u8>, i64)> = Vec::new();
-    let with_name = table == UNIQ_TABLE;
-    if with_name {
-        scan.set_key_sssu(db, from, "", b"");
-    } else {
-        scan.set_key_ssu(db, from, b"");
-    }
-    let mut more = match scan.search_near() {
-        Ok(cmp) => {
-            if cmp < 0 {
-                scan.next()?
-            } else {
-                true
-            }
-        }
-        Err(e) if e.is_not_found() => false,
-        Err(e) => return Err(e.into()),
-    };
-    while more {
-        let (d, c) = if with_name {
-            let (d, c, _, _) = scan.get_key_sssu()?;
-            (d, c)
-        } else {
-            let (d, c, _) = scan.get_key_ssu()?;
-            (d, c)
-        };
-        if d != db || c != from {
-            break;
-        }
-        let (name, key) = split(&scan)?;
-        rows.push((name, key, scan.get_value_q()?));
-        more = scan.next()?;
-    }
-    let put = session.open_cursor(table, Some("overwrite=false"))?;
-    let del = session.open_cursor(table, None)?;
-    for (name, key, value) in rows {
-        put.reset()?;
-        del.reset()?;
-        match &name {
-            Some(n) => {
-                put.set_key_sssu(db, to, n, &key);
-                del.set_key_sssu(db, from, n, &key);
-            }
-            None => {
-                put.set_key_ssu(db, to, &key);
-                del.set_key_ssu(db, from, &key);
-            }
-        }
-        put.set_value_q(value);
-        match put.insert() {
-            Ok(()) => {}
-            Err(e) if e.is_duplicate_key() || e.is_rollback() => {
-                return Err(namespace_in_use(db, to));
-            }
-            Err(e) => return Err(e.into()),
-        }
-        del.remove()?;
-    }
-    Ok(())
-}
-
-/// Between a collection's name and the incarnation a transaction keeps its
-/// `_id` index rows and claims under (`key_coll`). Not a character a
-/// collection name holds.
-const DEFERRED_KEY_SEP: &str = "\u{1}txn\u{1}";
-
-/// The name the `_id` index rows and unique claims of `(db, coll)` are keyed
-/// under: the collection's own, or, for one the running transaction created
-/// and has not committed, the name it keeps them under until its commit
-/// moves them (`UserTransactionHandle::deferred_keys`).
-fn key_coll<'a>(db: &str, coll: &'a str) -> std::borrow::Cow<'a, str> {
-    if let Some(hp) = Storage::active_handle() {
-        // SAFETY: see `Storage::active_handle`; a shared read.
-        let handle = unsafe { &*hp };
-        if !handle.deferred_keys.is_empty() {
-            if let Some(held) = handle
-                .deferred_keys
-                .get(&(db.to_string(), coll.to_string()))
-            {
-                return std::borrow::Cow::Owned(held.clone());
-            }
-        }
-    }
-    std::borrow::Cow::Borrowed(coll)
 }
 
 /// Whether an options blob names a time-series collection.
@@ -28597,175 +26883,6 @@ mod tests {
         assert!(!cfg.contains("block_compressor"), "{cfg}");
     }
 
-    /// A store whose document shards were written before the RecordId keying
-    /// change (keyed `SSu`, unframed values) must be REFUSED at open, not
-    /// silently mis-read with `SSq` cursor ops. There is no in-place migration
-    /// (pre-1.0 beta) — see `tasks/backlog-rust-mongodb.md` §7.8.
-    /// A store whose index entries predate the RecordId entry format must be
-    /// REFUSED at open. Unlike the doc-table change this is invisible to WT's
-    /// `key_format`, so the catalog's `entryFormat` marker is the only signal —
-    /// strip it and the store must be rejected rather than reading `id_key`
-    /// bytes as RecordIds.
-    #[test]
-    fn open_rejects_legacy_index_entry_format() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("db");
-        std::fs::create_dir_all(&home).unwrap();
-        let home_s = home.to_str().unwrap();
-        {
-            let st = Storage::open(home_s).unwrap();
-            st.insert(
-                "app",
-                "c",
-                vec![encode_doc(&doc! {"_id": 1i32, "x": 7i32}).unwrap()],
-                true,
-            )
-            .unwrap();
-            st.create_index("app", "c", "x_1", &doc! {"x": 1i32}, &Document::new())
-                .unwrap();
-        }
-        // Downgrade the catalog row to a step-1 store: same bytes, marker removed.
-        {
-            let conn = Connection::open(home_s, DEFAULT_CONFIG).unwrap();
-            let sess = conn.open_session().unwrap();
-            let _raw = untimestamped(&sess);
-            let c = sess.open_cursor(IDX_TABLE, None).unwrap();
-            c.set_key_sss("app", "c", "x_1");
-            c.search().unwrap();
-            let mut d = decode_doc(&c.get_value_u().unwrap()).unwrap();
-            let mut opts = d.get_document("options").cloned().unwrap_or_default();
-            assert_eq!(opts.get_i32("entryFormat").ok(), Some(ENTRY_FORMAT));
-            opts.remove("entryFormat");
-            d.insert("options", Bson::Document(opts));
-            c.reset().unwrap();
-            c.set_key_sss("app", "c", "x_1");
-            c.set_value_u(&encode_doc(&d).unwrap());
-            c.update().unwrap();
-        }
-        match Storage::open(home_s) {
-            Err(StorageError::Internal(m)) => {
-                assert!(m.contains("entryFormat"), "unexpected message: {m}")
-            }
-            Err(other) => panic!("expected Internal fatal, got: {other:?}"),
-            Ok(_) => panic!("expected open to be refused for a step-1 index entry format"),
-        }
-    }
-
-    /// Rewrite index `name`'s catalog options as an older build would have
-    /// left them, and remove its entries: `edit` takes the options away.
-    fn age_index(home: &str, coll: &str, name: &str, edit: impl FnOnce(&mut Document)) {
-        let conn = Connection::open(home, DEFAULT_CONFIG).unwrap();
-        let sess = conn.open_session().unwrap();
-        let _raw = untimestamped(&sess);
-        let c = sess.open_cursor(IDX_TABLE, None).unwrap();
-        c.set_key_sss("app", coll, name);
-        c.search().unwrap();
-        let mut d = decode_doc(&c.get_value_u().unwrap()).unwrap();
-        let mut opts = d.get_document("options").cloned().unwrap_or_default();
-        edit(&mut opts);
-        d.insert("options", Bson::Document(opts));
-        c.reset().unwrap();
-        c.set_key_sss("app", coll, name);
-        c.set_value_u(&encode_doc(&d).unwrap());
-        c.update().unwrap();
-        // The index's entries are in its own table.
-        let table = index_table_of(&sess, "app", coll, name).unwrap().unwrap();
-        let scan = sess.open_cursor(&table, None).unwrap();
-        let del = sess.open_cursor(&table, None).unwrap();
-        let mut more = scan.next().unwrap();
-        while more {
-            let key = scan.get_key_u().unwrap();
-            del.set_key_u(&key);
-            del.remove().unwrap();
-            more = scan.next().unwrap();
-        }
-    }
-
-    /// Make a store look as a build before number-key format 2 left it: no
-    /// `numberKeys` stamp on any index and no format recorded. The keys
-    /// themselves are written by `sortkey::with_number_key_format_1`.
-    fn forget_number_key_format(home: &str) {
-        let conn = Connection::open(home, DEFAULT_CONFIG).unwrap();
-        let sess = conn.open_session().unwrap();
-        let _raw = untimestamped(&sess);
-        let scan = sess.open_cursor(IDX_TABLE, None).unwrap();
-        let mut rows = Vec::new();
-        let mut more = scan.next().unwrap();
-        while more {
-            let key = scan.get_key_sss().unwrap();
-            let mut d = decode_doc(&scan.get_value_u().unwrap()).unwrap();
-            let mut opts = d.get_document("options").cloned().unwrap_or_default();
-            opts.remove(NUMBER_KEYS);
-            d.insert("options", Bson::Document(opts));
-            rows.push((key, d));
-            more = scan.next().unwrap();
-        }
-        let c = sess.open_cursor(IDX_TABLE, None).unwrap();
-        for ((db, coll, name), d) in rows {
-            c.reset().unwrap();
-            c.set_key_sss(&db, &coll, &name);
-            c.set_value_u(&encode_doc(&d).unwrap());
-            c.update().unwrap();
-        }
-        let meta = sess.open_cursor(OPLOG_META_TABLE, None).unwrap();
-        meta.set_key_s(NUMBER_KEYS_META);
-        meta.remove().unwrap();
-    }
-
-    /// An index of entry format 4 -- laid out as format 5, keying BinData
-    /// without its subtype -- is rebuilt when the store opens, not refused
-    /// (RM-232), and answers from the rebuilt entries.
-    #[test]
-    fn open_rebuilds_an_entry_format_4_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("db");
-        std::fs::create_dir_all(&home).unwrap();
-        let home_s = home.to_str().unwrap();
-        let bin = |b: &[u8], s: u8| {
-            Bson::Binary(bson::Binary {
-                subtype: s.into(),
-                bytes: b.to_vec(),
-            })
-        };
-        {
-            let st = Storage::open(home_s).unwrap();
-            let docs = [
-                (1, bin(b"\x01", 5)),
-                (2, bin(b"\x02", 0)),
-                (3, bin(b"\x01\x01", 0)),
-            ]
-            .into_iter()
-            .map(|(u, b)| encode_doc(&doc! {"_id": u, "u": u, "b": b}).unwrap())
-            .collect();
-            st.insert("app", "c", docs, true).unwrap();
-            st.create_index("app", "c", "b_1", &doc! {"b": 1i32}, &Document::new())
-                .unwrap();
-        }
-        age_index(home_s, "c", "b_1", |o| {
-            o.insert("entryFormat", 4i32);
-        });
-        let st = Storage::open(home_s).unwrap();
-        let (_, _, opts) = st
-            .iter_indexes(&st.conn.open_session().unwrap(), "app", "c")
-            .unwrap()
-            .into_iter()
-            .find(|(n, _, _)| n == "b_1")
-            .unwrap();
-        assert_eq!(opts.get_i32("entryFormat").ok(), Some(ENTRY_FORMAT));
-        assert_eq!(ids_of(&st, "c", doc! {"b": bin(b"\x02", 0)}), vec![2]);
-        // mongod's order: length, then subtype, then bytes. `\x01` of subtype 5
-        // and the longer `\x01\x01` are both above `\x02` of subtype 0.
-        assert_eq!(
-            ids_of(&st, "c", doc! {"b": {"$gt": bin(b"\x02", 0)}}),
-            vec![1, 3]
-        );
-    }
-
-    /// An index of entry format 5 -- a descending string keyed by its
-    /// inverted bytes alone, no `undefined` key for an empty array -- is
-    /// rebuilt when the store opens (RM-080), and its entries are then in
-    /// mongod's order: walking `{s: -1}` meets `"ab"` before `"a"`, as
-    /// mongod 8.2.11's walk does.
     /// The planner's catalog comes in `listIndexes`' build order, mongod's
     /// catalog order, not by name: the planner sorts an `$or`'s branches by
     /// it, and `y_1_x_1` built before `x_1_y_1` is read first (RM-572).
@@ -28801,135 +26918,6 @@ mod tests {
             .collect();
         assert_eq!(planner, ["_id_", "y_1_x_1", "x_1_y_1"]);
         assert_eq!(planner, listed);
-    }
-
-    #[test]
-    fn open_rebuilds_an_entry_format_5_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("db");
-        std::fs::create_dir_all(&home).unwrap();
-        let home_s = home.to_str().unwrap();
-        {
-            let st = Storage::open(home_s).unwrap();
-            let docs = [(1, "a"), (2, "ab"), (3, ""), (4, "b")]
-                .into_iter()
-                .map(|(u, s)| encode_doc(&doc! {"_id": u, "u": u, "s": s, "t": []}).unwrap())
-                .collect();
-            st.insert("app", "c", docs, true).unwrap();
-            st.create_index("app", "c", "s_-1", &doc! {"s": -1i32}, &Document::new())
-                .unwrap();
-            st.create_index("app", "c", "t_1", &doc! {"t": 1i32}, &Document::new())
-                .unwrap();
-        }
-        for name in ["s_-1", "t_1"] {
-            age_index(home_s, "c", name, |o| {
-                o.insert("entryFormat", 5i32);
-            });
-        }
-        let st = Storage::open(home_s).unwrap();
-        for name in ["s_-1", "t_1"] {
-            let (_, _, opts) = st
-                .iter_indexes(&st.conn.open_session().unwrap(), "app", "c")
-                .unwrap()
-                .into_iter()
-                .find(|(n, _, _)| n == name)
-                .unwrap();
-            assert_eq!(opts.get_i32("entryFormat").ok(), Some(ENTRY_FORMAT));
-        }
-        let walk = st
-            .index_entries_from("app", "c", "s_-1", IndexPos::Edge, None, 10, false)
-            .unwrap();
-        let order: Vec<i64> = walk.iter().map(|row| row.rid).collect();
-        // "b", "ab", "a", "": RecordIds 4, 2, 1, 3.
-        assert_eq!(order, vec![4, 2, 1, 3]);
-        let undefined = sortkey::encode_value(&Bson::Undefined, None).unwrap();
-        let walk = st
-            .index_entries_from(
-                "app",
-                "c",
-                "t_1",
-                IndexPos::Values(&[Bson::Undefined]),
-                None,
-                10,
-                false,
-            )
-            .unwrap();
-        assert!(walk.iter().take(4).all(|row| row.raw == undefined));
-        assert_eq!(ids_of(&st, "c", doc! {"s": {"$lte": "ab"}}), vec![1, 2, 3]);
-        assert_eq!(ids_of(&st, "c", doc! {"t": []}), vec![1, 2, 3, 4]);
-    }
-
-    /// A store written with `_id` key format 1 -- a document `_id` keyed by
-    /// its raw BSON, a BinData one without its subtype, MaxKey at rank 14 --
-    /// is re-keyed when it opens (RM-080): the `_id` index is then in
-    /// mongod's order (`{a: 2, b: [3]}` before `{a: 5}`, which raw BSON's
-    /// length put after it), every document is still found by its `_id`, and
-    /// the format is recorded.
-    #[test]
-    fn open_rekeys_a_store_written_with_id_key_format_1() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_str().unwrap();
-        let uuid = |b: u8| {
-            Bson::Binary(bson::Binary {
-                subtype: bson::spec::BinarySubtype::Uuid,
-                bytes: vec![b; 16],
-            })
-        };
-        let ids = [
-            bson::bson!({"a": 5}),
-            bson::bson!({"a": 2, "b": [3]}),
-            uuid(2),
-            uuid(1),
-            Bson::MaxKey,
-            Bson::Int32(7),
-            Bson::String("s".into()),
-        ];
-        {
-            let st = Storage::open(home).unwrap();
-            sortkey::with_id_key_format_1(|| {
-                let blobs = ids
-                    .iter()
-                    .enumerate()
-                    .map(|(u, id)| {
-                        encode_doc(&doc! {"_id": id.clone(), "u": u as i32 + 1}).unwrap()
-                    })
-                    .collect();
-                let (n, errors) = st.insert("app", "i", blobs, true).unwrap();
-                assert!(errors.is_empty(), "{errors:?}");
-                assert_eq!(n, ids.len());
-            });
-            // A store this old recorded no `_id` key format.
-            let session = st.conn.open_session().unwrap();
-            let _raw = untimestamped(&session);
-            let meta = session.open_cursor(OPLOG_META_TABLE, None).unwrap();
-            meta.set_key_s(ID_KEYS_META);
-            meta.remove().unwrap();
-        }
-        let st = Storage::open(home).unwrap();
-        let session = st.conn.open_session().unwrap();
-        assert_eq!(
-            stored_id_key_format(&session).unwrap(),
-            sortkey::ID_KEY_FORMAT
-        );
-        let walk: Vec<i64> = st
-            .index_entries_from("app", "i", ID_INDEX_NAME, IndexPos::Edge, None, 10, false)
-            .unwrap()
-            .into_iter()
-            .map(|row| row.rid)
-            .collect();
-        // Number, string, {a: 2, b: [3]}, {a: 5}, the two UUIDs by bytes,
-        // MaxKey: mongod 8.2.11's order of these `_id`s.
-        assert_eq!(walk, vec![6, 7, 2, 1, 4, 3, 5]);
-        for (u, id) in ids.iter().enumerate() {
-            assert_eq!(
-                ids_of(&st, "i", doc! {"_id": id.clone()}),
-                vec![u as i32 + 1],
-                "{id}"
-            );
-        }
-        let check = st.check_collection("app", "i").unwrap();
-        let (_, missing, extra) = index_check(&check, ID_INDEX_NAME);
-        assert_eq!((missing, extra), (0, 0));
     }
 
     /// An index built on a thread in PostgreSQL's BinData order (the PG
@@ -28989,568 +26977,6 @@ mod tests {
             .collect();
         out.sort_unstable();
         out
-    }
-
-    /// A store written with number-key format 1 (a double keyed by its
-    /// shortest decimal, numbers beyond exponent +-127 collapsed) is re-keyed
-    /// when it opens -- its `_id` rows, its document `_id` claims and every
-    /// index -- and then answers as mongod 8.2.11 does (measured
-    /// 2026-10-15): the double `0.1` is not `Decimal128("0.1")`, and
-    /// `1e-300` sorts below 1.
-    #[test]
-    fn open_rekeys_a_store_written_with_number_key_format_1() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_str().unwrap();
-        let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
-        let docs = vec![
-            doc! {"_id": 0.1, "a": 0.1, "u": 1i32},
-            doc! {"_id": dec("0.25"), "a": dec("0.1"), "u": 2i32},
-            doc! {"_id": 1e-300, "a": 1e-300, "u": 3i32},
-            // Format 1 gave 1e-300 and 3e250 one key: only one can be an `_id`.
-            doc! {"_id": "big", "a": 3e250, "u": 4i32},
-            doc! {"_id": -1e-300, "a": -1e-300, "u": 5i32},
-            doc! {"_id": 5i32, "a": 5i32, "u": 6i32},
-            doc! {"_id": {"k": 0.1}, "a": [0.1, 2i32], "u": 7i32},
-            doc! {"_id": Bson::Int64(1 << 62), "a": Bson::Int64(1 << 62), "u": 8i32},
-            // Equal to the Int64 above by exact value; format 1 keyed it apart.
-            doc! {"_id": 2f64.powi(62), "a": 2f64.powi(62), "u": 9i32},
-            doc! {"_id": "s", "a": "s", "u": 10i32},
-        ];
-        {
-            let st = Storage::open(home).unwrap();
-            sortkey::with_number_key_format_1(|| {
-                let blobs = docs.iter().map(|d| encode_doc(d).unwrap()).collect();
-                let (n, errors) = st.insert("app", "n", blobs, true).unwrap();
-                assert!(errors.is_empty(), "{errors:?}");
-                assert_eq!(n, docs.len());
-                st.create_index("app", "n", "a_1", &doc! {"a": 1}, &Document::new())
-                    .unwrap();
-                st.create_index("app", "n", "u_1", &doc! {"u": 1}, &doc! {"unique": true})
-                    .unwrap();
-            });
-        }
-        forget_number_key_format(home);
-
-        let st = Storage::open(home).unwrap();
-        let session = st.conn.open_session().unwrap();
-        let _raw = untimestamped(&session);
-        assert_eq!(
-            stored_number_key_format(&session).unwrap(),
-            sortkey::NUMBER_KEY_FORMAT
-        );
-        for name in ["a_1", "u_1"] {
-            assert_eq!(
-                index_options(&st, "n", name).get_i32(NUMBER_KEYS),
-                Ok(sortkey::NUMBER_KEY_FORMAT)
-            );
-        }
-        let check = st.check_collection("app", "n").unwrap();
-        for name in ["a_1", "u_1"] {
-            let (entries, missing, extra) = index_check(&check, name);
-            assert!(entries > 0, "{name}");
-            assert_eq!((missing, extra), (0, 0), "{name}");
-        }
-        // Every document is still there.
-        assert_eq!(ids_of(&st, "n", doc! {}), (1..=10).collect::<Vec<_>>());
-        // Through the index, by exact value.
-        assert_eq!(ids_of(&st, "n", doc! {"a": 0.1}), [1, 7]);
-        assert_eq!(ids_of(&st, "n", doc! {"a": dec("0.1")}), [2]);
-        assert_eq!(ids_of(&st, "n", doc! {"a": {"$lt": 1}}), [1, 2, 3, 5, 7]);
-        assert_eq!(ids_of(&st, "n", doc! {"a": {"$gt": 1e200}}), [4]);
-        assert_eq!(ids_of(&st, "n", doc! {"a": Bson::Int64(1 << 62)}), [8, 9]);
-        // Through the `_id` index.
-        for (id, u) in [
-            (Bson::Double(0.1), 1),
-            (dec("0.25"), 2),
-            (Bson::Double(1e-300), 3),
-            (Bson::String("big".into()), 4),
-            (Bson::Double(-1e-300), 5),
-            (Bson::Int32(5), 6),
-        ] {
-            assert_eq!(ids_of(&st, "n", doc! {"_id": id.clone()}), [u], "{id}");
-        }
-        assert_eq!(ids_of(&st, "n", doc! {"_id": {"$lt": 1}}), [1, 2, 3, 5]);
-        // Re-keyed `_id`s are held: the same value again is a duplicate, an
-        // `_id` equal only by its shortest decimal is not (mongod accepts
-        // `Decimal128("0.1")` beside the double `0.1`).
-        let again = |d: Document| {
-            st.insert("app", "n", vec![encode_doc(&d).unwrap()], true)
-                .unwrap()
-                .1
-                .len()
-        };
-        assert_eq!(again(doc! {"_id": 0.1, "u": 11i32}), 1);
-        assert_eq!(again(doc! {"_id": {"k": 0.1}, "u": 12i32}), 1);
-        assert_eq!(again(doc! {"_id": 1e-300, "u": 13i32}), 1);
-        assert_eq!(again(doc! {"_id": dec("0.1"), "u": 14i32}), 0);
-        // The two `_id`s equal by exact value: one holds the key, both stay.
-        assert_eq!(again(doc! {"_id": Bson::Int64(1 << 62), "u": 15i32}), 1);
-        drop(_raw);
-        drop(session);
-        drop(st);
-        // Opening again changes nothing.
-        let st = Storage::open(home).unwrap();
-        assert_eq!(ids_of(&st, "n", doc! {"a": 0.1}), [1, 7]);
-        assert_eq!(ids_of(&st, "n", doc! {}).len(), 11);
-    }
-
-    /// A unique index whose stored values format 1 kept apart but which are
-    /// equal by exact value cannot be rebuilt: the store refuses to open and
-    /// names the index, as for any index it cannot rebuild.
-    #[test]
-    fn open_refuses_a_unique_index_format_1_kept_apart() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_str().unwrap();
-        {
-            let st = Storage::open(home).unwrap();
-            sortkey::with_number_key_format_1(|| {
-                st.insert(
-                    "app",
-                    "n",
-                    vec![
-                        encode_doc(&doc! {"_id": 1i32, "u": Bson::Int64(1 << 62)}).unwrap(),
-                        encode_doc(&doc! {"_id": 2i32, "u": 2f64.powi(62)}).unwrap(),
-                    ],
-                    true,
-                )
-                .unwrap();
-                st.create_index("app", "n", "u_1", &doc! {"u": 1}, &doc! {"unique": true})
-                    .unwrap();
-            });
-        }
-        forget_number_key_format(home);
-        let err = match Storage::open(home) {
-            Ok(_) => panic!("opened a store whose unique index cannot be rebuilt"),
-            Err(e) => e.to_string(),
-        };
-        assert!(err.contains("u_1"), "{err}");
-    }
-
-    fn index_options(s: &Storage, coll: &str, name: &str) -> Document {
-        let session = s.conn.open_session().unwrap();
-        s.iter_indexes(&session, "app", coll)
-            .unwrap()
-            .into_iter()
-            .find(|(n, _, _)| n == name)
-            .map(|(_, _, o)| o)
-            .unwrap()
-    }
-
-    /// A geo index built before 2026-10-13 (no `geoKeys`) holds no entry for
-    /// a value with several locations or a point written as `{x, y}`. Opening
-    /// the store rebuilds it, so a query through it finds them.
-    #[test]
-    fn open_rebuilds_a_geo_index_without_its_marker() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_str().unwrap();
-        {
-            let st = Storage::open(home).unwrap();
-            st.insert(
-                "app",
-                "g",
-                vec![
-                    encode_doc(&doc! {"_id": 1i32, "loc": [1.0, 1.0]}).unwrap(),
-                    encode_doc(&doc! {"_id": 2i32, "loc": [[5.0, 5.0], [30.0, 30.0]]}).unwrap(),
-                    encode_doc(&doc! {"_id": 3i32, "loc": {"x": 2.0, "y": 2.0}}).unwrap(),
-                ],
-                true,
-            )
-            .unwrap();
-            st.insert(
-                "app",
-                "h",
-                vec![
-                    encode_doc(&doc! {"_id": 1i32, "loc": [1.0, 1.0]}).unwrap(),
-                    encode_doc(
-                        &doc! {"_id": 2i32, "loc": {"type": "MultiPoint", "coordinates": [[5.0, 5.0], [30.0, 30.0]]}},
-                    )
-                    .unwrap(),
-                ],
-                true,
-            )
-            .unwrap();
-            for (coll, kind) in [("g", "2d"), ("h", "2dsphere")] {
-                st.create_index("app", coll, "geo", &doc! {"loc": kind}, &Document::new())
-                    .unwrap();
-                assert_eq!(
-                    index_options(&st, coll, "geo").get_i32(GEO_KEYS),
-                    Ok(GEO_KEY_FORMAT)
-                );
-            }
-        }
-        for coll in ["g", "h"] {
-            age_index(home, coll, "geo", |o| {
-                o.remove(GEO_KEYS);
-            });
-        }
-        let st = Storage::open(home).unwrap();
-        for coll in ["g", "h"] {
-            let check = st.check_collection("app", coll).unwrap();
-            let (entries, missing, extra) = index_check(&check, "geo");
-            assert!(entries > 0, "{coll}");
-            assert_eq!((missing, extra), (0, 0), "{coll}");
-            let opts = index_options(&st, coll, "geo");
-            assert_eq!(opts.get_i32(GEO_KEYS), Ok(GEO_KEY_FORMAT), "{coll}");
-            assert_eq!(opts.get_bool("multikey"), Ok(true), "{coll}");
-        }
-        assert_eq!(
-            index_options(&st, "h", "geo").get_i32("2dsphereIndexVersion"),
-            Ok(3)
-        );
-        let found = st
-            .find_matching(
-                "app",
-                "g",
-                &doc! {"loc": {"$geoWithin": {"$box": [[0.0, 0.0], [10.0, 10.0]]}}},
-            )
-            .unwrap();
-        assert_eq!(found.len(), 3);
-    }
-
-    /// A `2d` index of geo-key format 1 whose `bits` was given as a double
-    /// holds 26-bit cells, the default format 1 read it as; mongod reads
-    /// `bits: 20.0` as 20 bits. Opening the store rebuilds it at format 2. A
-    /// `2dsphere` index of format 1 is current and is left as it is.
-    #[test]
-    fn open_rebuilds_a_format_1_2d_index_and_keeps_a_format_1_2dsphere_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_str().unwrap();
-        let docs = [
-            doc! {"_id": 1i32, "loc": [1.0, 1.0]},
-            doc! {"_id": 2i32, "loc": [7.5, -3.25]},
-            doc! {"_id": 3i32, "loc": [-9.0, 9.0]},
-            doc! {"_id": 4i32, "loc": [40.0, 40.0]},
-        ];
-        let options = doc! {"bits": 20.0, "min": -50.0, "max": 50.0};
-        // What format 1 wrote for each document: its cell at 26 bits.
-        let mut stale: Vec<EntryKey> = Vec::new();
-        let sphere_entries;
-        {
-            let st = Storage::open(home).unwrap();
-            for coll in ["g", "h"] {
-                st.insert(
-                    "app",
-                    coll,
-                    docs.iter().map(|d| encode_doc(d).unwrap()).collect(),
-                    true,
-                )
-                .unwrap();
-            }
-            st.create_index("app", "g", "geo", &doc! {"loc": "2d"}, &options)
-                .unwrap();
-            st.create_index(
-                "app",
-                "h",
-                "geo",
-                &doc! {"loc": "2dsphere"},
-                &Document::new(),
-            )
-            .unwrap();
-            let read_as = |bits: u32| Geo2d {
-                field: "loc".to_string(),
-                bits,
-                lo: -50.0,
-                hi: 50.0,
-            };
-            let session = st.conn.open_session().unwrap();
-            let _raw = untimestamped(&session);
-            for (rid, _, blob) in st.scan_docs(&session, "app", "g").unwrap() {
-                let loc = decode_doc(&blob).unwrap().get("loc").cloned().unwrap();
-                let (old, new) = (read_as(26).cell_kbs(&loc), read_as(20).cell_kbs(&loc));
-                // Otherwise the test would not tell the formats apart.
-                assert_ne!(old, new);
-                stale.extend(old.iter().map(|kb| geo_entry(kb, rid).unwrap()));
-            }
-            sphere_entries = st.check_collection("app", "h").unwrap();
-        }
-        // The 2d index as format 1 left it: the marker, and 26-bit entries.
-        age_index(home, "g", "geo", |o| {
-            o.insert(GEO_KEYS, 1i32);
-        });
-        {
-            let conn = Connection::open(home, DEFAULT_CONFIG).unwrap();
-            let sess = conn.open_session().unwrap();
-            let _raw = untimestamped(&sess);
-            let table = index_table_of(&sess, "app", "g", "geo").unwrap().unwrap();
-            let c = sess.open_cursor(&table, None).unwrap();
-            for entry in &stale {
-                c.set_key_u(&entry.key);
-                c.set_value_u(&entry.type_bits);
-                c.insert().unwrap();
-                c.reset().unwrap();
-            }
-            // The 2dsphere index marked format 1, its entries untouched.
-            let ix = sess.open_cursor(IDX_TABLE, None).unwrap();
-            ix.set_key_sss("app", "h", "geo");
-            ix.search().unwrap();
-            let mut d = decode_doc(&ix.get_value_u().unwrap()).unwrap();
-            let mut opts = d.get_document("options").cloned().unwrap();
-            opts.insert(GEO_KEYS, 1i32);
-            d.insert("options", Bson::Document(opts));
-            ix.reset().unwrap();
-            ix.set_key_sss("app", "h", "geo");
-            ix.set_value_u(&encode_doc(&d).unwrap());
-            ix.update().unwrap();
-        }
-        let st = Storage::open(home).unwrap();
-        let check = st.check_collection("app", "g").unwrap();
-        let (entries, missing, extra) = index_check(&check, "geo");
-        assert_eq!((entries, missing, extra), (4, 0, 0), "{check}");
-        assert_eq!(
-            index_options(&st, "g", "geo").get_i32(GEO_KEYS),
-            Ok(GEO_KEY_FORMAT)
-        );
-        let found: Vec<i32> = st
-            .find_matching(
-                "app",
-                "g",
-                &doc! {"loc": {"$geoWithin": {"$box": [[-10.0, -10.0], [10.0, 10.0]]}}},
-            )
-            .unwrap()
-            .iter()
-            .map(|b| decode_doc(b).unwrap().get_i32("_id").unwrap())
-            .collect();
-        let mut found = found;
-        found.sort();
-        assert_eq!(found, [1, 2, 3]);
-        // Not rebuilt: still format 1, and the same entries.
-        assert_eq!(index_options(&st, "h", "geo").get_i32(GEO_KEYS), Ok(1));
-        assert_eq!(st.check_collection("app", "h").unwrap(), sphere_entries);
-        let (_, missing, extra) = index_check(&sphere_entries, "geo");
-        assert_eq!((missing, extra), (0, 0));
-    }
-
-    /// A collated index without `collationKeys` (this server before
-    /// 2026-10-10, or the Python server) is rebuilt with collation keys when
-    /// the store opens.
-    #[test]
-    fn open_rebuilds_a_collated_index_without_its_marker() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_str().unwrap();
-        {
-            let st = Storage::open(home).unwrap();
-            st.insert(
-                "app",
-                "c",
-                vec![
-                    encode_doc(&doc! {"_id": 1i32, "s": "a"}).unwrap(),
-                    encode_doc(&doc! {"_id": 2i32, "s": "B"}).unwrap(),
-                ],
-                true,
-            )
-            .unwrap();
-            st.create_index(
-                "app",
-                "c",
-                "s_ci",
-                &doc! {"s": 1i32},
-                &doc! {"collation": {"locale": "en", "strength": 2i32}},
-            )
-            .unwrap();
-        }
-        age_index(home, "c", "s_ci", |o| {
-            o.remove(COLLATION_KEYS);
-        });
-        let st = Storage::open(home).unwrap();
-        let check = st.check_collection("app", "c").unwrap();
-        assert_eq!(index_check(&check, "s_ci"), (2, 0, 0));
-        let opts = index_options(&st, "c", "s_ci");
-        assert_eq!(
-            opts.get_i32(COLLATION_KEYS),
-            Ok(secantus_core::collation::KEY_FORMAT)
-        );
-        assert_eq!(opts.get_i32("entryFormat"), Ok(ENTRY_FORMAT));
-        // The rebuilt index refuses a second spelling of a stored value.
-        drop(st);
-        let st = Storage::open(home).unwrap();
-        st.drop_index("app", "c", "s_ci").unwrap();
-        st.create_index(
-            "app",
-            "c",
-            "s_ci",
-            &doc! {"s": 1i32},
-            &doc! {"collation": {"locale": "en", "strength": 2i32}, "unique": true},
-        )
-        .unwrap();
-        drop(st);
-        age_index(home, "c", "s_ci", |o| {
-            o.remove(COLLATION_KEYS);
-        });
-        let st = Storage::open(home).unwrap();
-        let (_, errors) = st
-            .insert(
-                "app",
-                "c",
-                vec![encode_doc(&doc! {"_id": 3i32, "s": "A"}).unwrap()],
-                true,
-            )
-            .unwrap();
-        assert_eq!(errors.len(), 1, "{errors:?}");
-    }
-
-    /// A unique collated index that the stored documents break under its
-    /// collation cannot be rebuilt, and the store is refused, naming it.
-    #[test]
-    fn open_refuses_an_outdated_index_it_cannot_rebuild() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_str().unwrap();
-        {
-            let st = Storage::open(home).unwrap();
-            st.insert(
-                "app",
-                "c",
-                vec![
-                    encode_doc(&doc! {"_id": 1i32, "s": "a"}).unwrap(),
-                    encode_doc(&doc! {"_id": 2i32, "s": "A"}).unwrap(),
-                ],
-                true,
-            )
-            .unwrap();
-            st.create_index("app", "c", "s_u", &doc! {"s": 1i32}, &doc! {"unique": true})
-                .unwrap();
-        }
-        // As the Python server, or this one before 2026-10-10, left it: a
-        // collation in the options, plain values in the entries.
-        age_index(home, "c", "s_u", |o| {
-            o.insert("collation", doc! {"locale": "en", "strength": 2i32});
-        });
-        match Storage::open(home) {
-            Err(StorageError::Internal(m)) => {
-                assert!(m.contains("'s_u' on 'app.c'"), "unexpected message: {m}")
-            }
-            Err(other) => panic!("expected Internal, got: {other:?}"),
-            Ok(_) => panic!("expected the open to be refused"),
-        }
-    }
-
-    /// A collection with a default collation whose documents were stored
-    /// without `_id` claims (before 2026-10-11, or by the Python server) has
-    /// them claimed when the store opens, so a second spelling is refused.
-    #[test]
-    fn open_claims_collated_ids_stored_without_a_claim() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_str().unwrap();
-        {
-            let st = Storage::open(home).unwrap();
-            st.create_collection_with_options(
-                "app",
-                "k",
-                &doc! {"collation": {"locale": "en", "strength": 2i32}},
-            )
-            .unwrap();
-            st.insert(
-                "app",
-                "k",
-                vec![encode_doc(&doc! {"_id": "a"}).unwrap()],
-                true,
-            )
-            .unwrap();
-        }
-        {
-            let conn = Connection::open(home, DEFAULT_CONFIG).unwrap();
-            let sess = conn.open_session().unwrap();
-            let _raw = untimestamped(&sess);
-            let scan = sess.open_cursor(UNIQ_TABLE, None).unwrap();
-            let del = sess.open_cursor(UNIQ_TABLE, None).unwrap();
-            let mut more = scan.next().unwrap();
-            while more {
-                let (d, c, n, k) = scan.get_key_sssu().unwrap();
-                if c == "k" || n == "$collated_id_claims" {
-                    del.set_key_sssu(&d, &c, &n, &k);
-                    del.remove().unwrap();
-                }
-                more = scan.next().unwrap();
-            }
-        }
-        let st = Storage::open(home).unwrap();
-        let (_, errors) = st
-            .insert(
-                "app",
-                "k",
-                vec![encode_doc(&doc! {"_id": "A"}).unwrap()],
-                true,
-            )
-            .unwrap();
-        assert_eq!(errors.len(), 1, "{errors:?}");
-    }
-
-    /// Collated `_id` claims keyed by an older `collation::KEY_FORMAT` (ICU4X's
-    /// bytes, before 2026-11-09, under a marker of 0) are not where a write
-    /// looks: the open drops them and claims again under this format's keys,
-    /// so a second spelling is still refused and no stale claim is left.
-    #[test]
-    fn open_rekeys_collated_id_claims_of_an_older_key_format() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_str().unwrap();
-        {
-            let st = Storage::open(home).unwrap();
-            st.create_collection_with_options(
-                "app",
-                "k",
-                &doc! {"collation": {"locale": "en", "strength": 2i32}},
-            )
-            .unwrap();
-            st.insert(
-                "app",
-                "k",
-                vec![encode_doc(&doc! {"_id": "a"}).unwrap()],
-                true,
-            )
-            .unwrap();
-        }
-        // ICU4X keyed "a" at strength 2 as 2b0105; ICU 57.1 as 290105.
-        let old_key = escape_kb(&[0x2b, 0x01, 0x05]);
-        {
-            let conn = Connection::open(home, DEFAULT_CONFIG).unwrap();
-            let sess = conn.open_session().unwrap();
-            let _raw = untimestamped(&sess);
-            let scan = sess.open_cursor(UNIQ_TABLE, None).unwrap();
-            let edit = sess.open_cursor(UNIQ_TABLE, None).unwrap();
-            let mut rows = Vec::new();
-            let mut more = scan.next().unwrap();
-            while more {
-                let (d, c, n, k) = scan.get_key_sssu().unwrap();
-                rows.push((d, c, n, k, scan.get_value_q().unwrap()));
-                more = scan.next().unwrap();
-            }
-            for (d, c, n, k, rid) in rows {
-                if c == "k" {
-                    edit.set_key_sssu(&d, &c, &n, &k);
-                    edit.remove().unwrap();
-                    edit.set_key_sssu(&d, &c, &n, &old_key);
-                    edit.set_value_q(rid);
-                    edit.insert().unwrap();
-                } else if n == "$collated_id_claims" {
-                    edit.set_key_sssu(&d, &c, &n, &k);
-                    edit.set_value_q(0);
-                    edit.insert().unwrap();
-                }
-            }
-        }
-        let st = Storage::open(home).unwrap();
-        let (_, errors) = st
-            .insert(
-                "app",
-                "k",
-                vec![encode_doc(&doc! {"_id": "A"}).unwrap()],
-                true,
-            )
-            .unwrap();
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        let sess = st.conn.open_session().unwrap();
-        let cur = sess.open_cursor(UNIQ_TABLE, None).unwrap();
-        cur.set_key_sssu("app", "k", ID_INDEX_NAME, &old_key);
-        assert!(
-            cur.search().unwrap_err().is_not_found(),
-            "the stale claim is left"
-        );
-        cur.reset().unwrap();
-        cur.set_key_sssu("", "", "$collated_id_claims", b"");
-        cur.search().unwrap();
-        assert_eq!(
-            cur.get_value_q().unwrap(),
-            i64::from(secantus_core::collation::KEY_FORMAT)
-        );
     }
 
     /// A clustered collection's own `expireAfterSeconds` expires a document
@@ -29740,40 +27166,13 @@ mod tests {
         assert!(!resolve_durable(None, false, true));
     }
 
-    /// A store an earlier version wrote holds no claim on a document `_id`.
-    /// The first open by this version claims each, so a document equal to a
-    /// stored one by value is refused afterwards, and the walk runs once.
+    /// A document `_id` is unique by value, as mongod's: the `_id_` index
+    /// keys it by KeyString, where `{a: 1}`, `{a: 1.0}` and `{a: 1i64}` are
+    /// one key. It is no claim of its own to take or to lose: the key is the
+    /// entry of the document that holds it, so deleting that document frees
+    /// the value, and a reopen keeps the answer.
     #[test]
-    fn a_stored_document_id_is_claimed_at_open() {
-        fn strip_claims(s: &Storage) {
-            let session = s.conn.open_session().unwrap();
-            let _raw = untimestamped(&session);
-            let cur = session.open_cursor(UNIQ_TABLE, None).unwrap();
-            let mut keys = Vec::new();
-            let mut more = cur.next().unwrap();
-            while more {
-                keys.push(cur.get_key_sssu().unwrap());
-                more = cur.next().unwrap();
-            }
-            for (d, c, n, k) in keys {
-                cur.reset().unwrap();
-                cur.set_key_sssu(&d, &c, &n, &k);
-                cur.remove().unwrap();
-            }
-        }
-        fn claims(s: &Storage) -> Vec<(String, String, String)> {
-            let session = s.conn.open_session().unwrap();
-            let _raw = untimestamped(&session);
-            let cur = session.open_cursor(UNIQ_TABLE, None).unwrap();
-            let mut out = Vec::new();
-            let mut more = cur.next().unwrap();
-            while more {
-                let (d, c, n, _) = cur.get_key_sssu().unwrap();
-                out.push((d, c, n));
-                more = cur.next().unwrap();
-            }
-            out
-        }
+    fn a_document_id_is_unique_by_value() {
         let insert = |s: &Storage, coll: &str, d: Document| {
             let (n, errors) = s
                 .insert("app", coll, vec![encode_doc(&d).unwrap()], true)
@@ -29788,46 +27187,27 @@ mod tests {
                 .unwrap()
         };
         {
-            // As an earlier version left it: the documents, keyed by `_id`
-            // key format 1 (raw BSON), and no claim. `d` holds two documents
-            // that version let in as different.
             let s = open();
-            sortkey::with_id_key_format_1(|| {
-                assert_eq!(
-                    insert(&s, "c", doc! {"_id": {"a": 1i32}, "v": 1i32}),
-                    (1, 0)
-                );
-                assert_eq!(insert(&s, "c", doc! {"_id": {"a": 2i32}}), (1, 0));
-                assert_eq!(insert(&s, "c", doc! {"_id": 7i32}), (1, 0));
-                assert_eq!(insert(&s, "d", doc! {"_id": {"k": 1i32}}), (1, 0));
-                strip_claims(&s);
-                assert_eq!(insert(&s, "d", doc! {"_id": {"k": 1.0}}), (1, 0));
-            });
-            strip_claims(&s);
-            assert!(claims(&s).is_empty());
-            let session = s.conn.open_session().unwrap();
-            let _raw = untimestamped(&session);
-            let meta = session.open_cursor(OPLOG_META_TABLE, None).unwrap();
-            meta.set_key_s(ID_KEYS_META);
-            meta.remove().unwrap();
-        }
-        {
-            let s = open();
-            let held = claims(&s);
-            let of = |coll: &str| held.iter().filter(|(_, c, _)| c == coll).count();
-            // Two document `_id`s in `c`; one claim for the two documents of
-            // `d`; the rows that say the two walks (document `_id`s, and
-            // `_id`s under a collation) are done.
-            assert_eq!((of("c"), of("d"), of("")), (2, 1, 2), "{held:?}");
-            // A stored `_id` written another way is a duplicate now.
+            assert_eq!(
+                insert(&s, "c", doc! {"_id": {"a": 1i32}, "v": 1i32}),
+                (1, 0)
+            );
+            assert_eq!(insert(&s, "c", doc! {"_id": {"a": 2i32}}), (1, 0));
+            assert_eq!(insert(&s, "c", doc! {"_id": 7i32}), (1, 0));
+            assert_eq!(insert(&s, "d", doc! {"_id": {"k": 1i32}}), (1, 0));
+            // The same value written another way is a duplicate.
             assert_eq!(insert(&s, "c", doc! {"_id": {"a": 1.0}}), (0, 1));
             assert_eq!(insert(&s, "c", doc! {"_id": {"a": 2i64}}), (0, 1));
             assert_eq!(insert(&s, "d", doc! {"_id": {"k": 1i64}}), (0, 1));
             assert_eq!(insert(&s, "c", doc! {"_id": {"a": 3i32}}), (1, 0));
-            // Nothing stored was touched: both of `d`'s documents are there.
-            assert_eq!(s.find_matching("app", "d", &doc! {}).unwrap().len(), 2);
+            assert_eq!(insert(&s, "c", doc! {"_id": 7.0}), (0, 1));
+        }
+        {
+            let s = open();
+            assert_eq!(insert(&s, "c", doc! {"_id": {"a": 1.0}}), (0, 1));
+            assert_eq!(s.find_matching("app", "d", &doc! {}).unwrap().len(), 1);
             assert_eq!(s.find_matching("app", "c", &doc! {}).unwrap().len(), 4);
-            // Deleting the claimed document frees the value.
+            // Deleting the document that holds the value frees it.
             assert_eq!(
                 s.delete_matching("app", "c", &doc! {"v": 1i32}, 0, &doc! {}, None)
                     .unwrap(),
@@ -29835,32 +27215,6 @@ mod tests {
             );
             assert_eq!(insert(&s, "c", doc! {"_id": {"a": 1.0}}), (1, 0));
         }
-        {
-            // The walks do not run again: a claim taken away stays away.
-            let s = open();
-            assert_eq!(
-                claims(&s).iter().filter(|(_, c, _)| c.is_empty()).count(),
-                2
-            );
-            let session = s.conn.open_session().unwrap();
-            let _raw = untimestamped(&session);
-            let cur = session.open_cursor(UNIQ_TABLE, None).unwrap();
-            let mut more = cur.next().unwrap();
-            let mut gone = 0;
-            while more {
-                let (d, c, n, k) = cur.get_key_sssu().unwrap();
-                if c == "d" {
-                    let del = session.open_cursor(UNIQ_TABLE, None).unwrap();
-                    del.set_key_sssu(&d, &c, &n, &k);
-                    del.remove().unwrap();
-                    gone += 1;
-                }
-                more = cur.next().unwrap();
-            }
-            assert_eq!(gone, 1);
-        }
-        let s = open();
-        assert_eq!(claims(&s).iter().filter(|(_, c, _)| c == "d").count(), 0);
     }
 
     /// A durable close (`Drop` with `durable=true`) checkpoints and the data
@@ -30535,7 +27889,7 @@ mod tests {
             let session = s.conn.open_session().unwrap();
             let _raw = untimestamped(&session);
             let rows = s.collect_entry_rows(&session, "app", "t").unwrap();
-            let (name, key) = rows.first().unwrap().clone();
+            let (name, key) = rows.iter().find(|(n, _)| n == "v_1").unwrap().clone();
             let table = index_table_of(&session, "app", "t", &name)
                 .unwrap()
                 .unwrap();
@@ -30549,9 +27903,11 @@ mod tests {
             entries.set_key_u(&stray.key);
             entries.set_value_u(&stray.type_bits);
             entries.insert().unwrap();
-            let id_key = sortkey::encode_value(&Bson::Int32(2), None).unwrap();
-            let ids = session.open_cursor(NAT_SEQ_TABLE, None).unwrap();
-            ids.set_key_ssu("app", "t", &id_key);
+            let id_table = index_table_of(&session, "app", "t", ID_INDEX_NAME)
+                .unwrap()
+                .unwrap();
+            let ids = session.open_cursor(&id_table, None).unwrap();
+            ids.set_key_u(&id_key_shape(None).id_key(&Bson::Int32(2)).unwrap());
             ids.remove().unwrap();
         }
         let check = s.check_collection("app", "t").unwrap();
@@ -31185,13 +28541,6 @@ mod tests {
     }
 
     #[test]
-    fn escape_kb_doubles_zero_bytes() {
-        assert_eq!(escape_kb(b"\x01\x00\x02"), vec![0x01, 0x00, 0xff, 0x02]);
-        assert_eq!(escape_kb(b"abc"), b"abc".to_vec());
-        assert_eq!(escape_kb(b"\x00\x00"), vec![0x00, 0xff, 0x00, 0xff]);
-    }
-
-    #[test]
     fn an_entry_is_the_keystring_then_the_recordid() {
         // `KeyString(values) + RecordId`, the TypeBits as the value.
         let shape = KeyShape::new(&doc! {"k": 1i32}, None, BinDataOrder::Mongod);
@@ -31470,17 +28819,17 @@ mod tests {
         // Bare scalar, $eq, and $in (sorted + deduped) are point lookups.
         assert_eq!(
             id_point_lookup_keys(&Bson::Int32(5)).unwrap(),
-            Some(vec![ev(&Bson::Int32(5))])
+            Some(vec![Bson::Int32(5)])
         );
         assert_eq!(
             id_point_lookup_keys(&Bson::Document(doc! {"$eq": 5i32})).unwrap(),
-            Some(vec![ev(&Bson::Int32(5))])
+            Some(vec![Bson::Int32(5)])
         );
         assert_eq!(
             id_point_lookup_keys(&Bson::Document(doc! {"$in": [3i32, 1i32, 3i32]}))
                 .unwrap()
                 .unwrap(),
-            vec![ev(&Bson::Int32(1)), ev(&Bson::Int32(3))]
+            vec![Bson::Int32(1), Bson::Int32(3)]
         );
         // Range op, literal subdocument, and operator-valued $eq are NOT.
         assert_eq!(

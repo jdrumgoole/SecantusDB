@@ -99,8 +99,6 @@ pub type IdKeyRows = Vec<(Vec<u8>, Vec<u8>)>;
 pub enum IndexFrom<'a> {
     /// The first entry (the last, reading backward).
     Edge,
-    /// A raw `_id` key, for the `_id` index only.
-    Raw(&'a [u8]),
     /// The entries holding these leading key values, whatever follows them:
     /// forward, from the first of them; backward, from the last of those
     /// that hold exactly these values (a bare prefix is before every entry
@@ -112,8 +110,7 @@ pub enum IndexFrom<'a> {
 }
 
 /// An index entry: its key's per-field `sortkey` encodings joined by
-/// `COMPOUND_SEP` (`raw`; for the `_id` index, the `_id` key), its RecordId,
-/// and where a read resumes after it.
+/// `COMPOUND_SEP` (`raw`), its RecordId, and where a read resumes after it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexEntry {
     pub raw: Vec<u8>,
@@ -1532,7 +1529,7 @@ pub trait Storage: Send + Sync {
     /// the entry a resume names), in the index's order: an index scan a
     /// streaming cursor resumes. `backward`: descending, from the last entry
     /// no greater than `from` (strictly before a resume's entry). The `_id`
-    /// index's entries are the documents' `_id` keys, one per document.
+    /// index is read as any other: one entry per document.
     /// `None` when the store cannot read this way.
     #[allow(clippy::too_many_arguments)]
     fn index_entries_from(

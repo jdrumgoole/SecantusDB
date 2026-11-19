@@ -1715,7 +1715,6 @@ impl CmdStorage for StorageAdapter {
         use secantus_commands::storage::IndexFrom;
         let pos = match from {
             IndexFrom::Edge => secantus_storage::IndexPos::Edge,
-            IndexFrom::Raw(k) => secantus_storage::IndexPos::Raw(k),
             IndexFrom::Values(v) => secantus_storage::IndexPos::Values(v),
             IndexFrom::Resume(k) => secantus_storage::IndexPos::Resume(k),
         };

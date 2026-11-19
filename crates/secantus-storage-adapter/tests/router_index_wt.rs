@@ -425,15 +425,15 @@ fn an_id_range_reads_the_id_index() {
     assert_eq!(ints(got(doc! {"_id": {"$gt": 15}})), [16, 17, 18, 19]);
     assert_eq!(ints(got(doc! {"_id": {"$gte": 3, "$lt": 6}})), [3, 4, 5]);
     assert_eq!(access(&s, "ix", doc! {"_id": {"$gt": 15}}), ordered("_id_"));
-    // A document `_id` is keyed by its raw BSON: its bracket is read whole,
-    // and not claimed to be in order.
+    // A document `_id` is keyed by value, as mongod's (`_id_` is a KeyString
+    // table): its bracket is read in order like any other.
     assert_eq!(
         got(doc! {"_id": {"$gte": {"k": 0}}}),
         [Bson::Document(doc! {"k": 1})]
     );
     assert_eq!(
         access(&s, "ix", doc! {"_id": {"$gte": {"k": 0}}}),
-        unordered("_id_")
+        ordered("_id_")
     );
     assert_eq!(
         got(doc! {"_id": {"$type": "string"}}),

@@ -239,7 +239,7 @@ fn a_backward_index_walk_resumes_before_its_entry() {
 }
 
 #[test]
-fn the_id_index_walks_the_documents_id_keys() {
+fn the_id_index_walks_the_documents_in_id_order() {
     with_db(|st| {
         insert(
             st,
@@ -249,6 +249,7 @@ fn the_id_index_walks_the_documents_id_keys() {
                 .collect::<Vec<_>>(),
         );
         let key = |i: i32| encode_value(&Bson::Int32(i), None).unwrap();
+        let three = [Bson::Int32(3)];
         let ids = |rows: &[IndexRow]| -> Vec<i32> {
             let rids: Vec<i64> = rows.iter().map(|r| r.rid).collect();
             st.records_by_id("db", "c", &rids)
@@ -263,7 +264,15 @@ fn the_id_index_walks_the_documents_id_keys() {
         assert_eq!(ids(&all), [1, 2, 3, 4, 5]);
         assert_eq!(all[0].raw, key(1));
         let from_three = st
-            .index_entries_from("db", "c", "_id_", IndexPos::Raw(&key(3)), None, 100, false)
+            .index_entries_from(
+                "db",
+                "c",
+                "_id_",
+                IndexPos::Values(&three),
+                None,
+                100,
+                false,
+            )
             .unwrap();
         assert_eq!(ids(&from_three), [3, 4, 5]);
         let past_three = st
@@ -271,19 +280,27 @@ fn the_id_index_walks_the_documents_id_keys() {
                 "db",
                 "c",
                 "_id_",
-                IndexPos::Raw(&key(3)),
-                Some(0),
+                IndexPos::Resume(&all[2].resume),
+                Some(all[2].rid),
                 100,
                 false,
             )
             .unwrap();
         assert_eq!(ids(&past_three), [4, 5]);
         let down_from_three = st
-            .index_entries_from("db", "c", "_id_", IndexPos::Raw(&key(3)), None, 100, true)
+            .index_entries_from("db", "c", "_id_", IndexPos::Values(&three), None, 100, true)
             .unwrap();
         assert_eq!(ids(&down_from_three), [3, 2, 1]);
         let below_three = st
-            .index_entries_from("db", "c", "_id_", IndexPos::Raw(&key(3)), Some(0), 2, true)
+            .index_entries_from(
+                "db",
+                "c",
+                "_id_",
+                IndexPos::Resume(&all[2].resume),
+                Some(all[2].rid),
+                2,
+                true,
+            )
             .unwrap();
         assert_eq!(ids(&below_three), [2, 1]);
         assert!(st
