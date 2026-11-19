@@ -1,8 +1,10 @@
 # Plan: an in-process `MongoServer` in the PyPI wheel
 
 Status: **agreed, 2026-11-19** (Joe answered the four open questions the same day; see the end).
-Phases 1-4 built on branch `python-embedded` (2026-11-19); phase 5 is the
-first release through it. See "As built" at the end for where the build
+Phases 1-4 merged in #2915 (2026-11-19). Phase 5, the first release
+through it, **waits for the storage-model release freeze**
+(`tasks/mongod-storage-model-plan.md`: no Rust server release between that
+plan's phase 1 and phase 6 landing); see "Phase 5" at the end. See "As built" at the end for where the build
 departs from the text below. Asked for by Joe on 2026-11-19: "make it
 the default for python, the subprocess launcher should be an option".
 
@@ -287,3 +289,42 @@ Rehearsed locally (macOS arm64, 2026-11-19): `build_wheels.py` over the real
 a locally built extension archive. uv resolved CPython 3.10 and 3.12 to the
 abi3 wheel and free-threaded 3.13t to the fallback, and `smoke_test.py`
 passed on all three.
+
+## Phase 5: waiting for the storage-model freeze (2026-11-19)
+
+Not started. #2915 merged after the storage-model plan's phases 1 and 2,
+which change the on-disk format and started its release freeze, so no
+commit on `main` carries the in-process wheel without an intermediate store
+format. The first `secantusdb-v*` release after that plan's phase 6 is the
+first release through this one, and it needs a lockstep bump made then:
+the beta.199 bump (#2916) was opened before the freeze was noticed.
+
+Ready for it:
+
+- **The workflow dry run** (`release-binaries.yml`, `dry_run: true`, on the
+  `secantusdb-v0.5.3-beta.198` tag, run 44582995023). The extension built on
+  Linux and macOS and passed the load check on CPython 3.10 and 3.13 on both;
+  Linux passed the dependency check. Every failure came from the old tag's
+  own tree, which a dispatch checks out: no `vendor/snappy` for the
+  packaging step, and the old `check_binary_deps.py` without the `otool -D`
+  filter that drops the dylib's own install name. A tag cut from `main`
+  carries both.
+- **Every crate the release publishes is on crates.io**, including
+  `secantus-compressors` (published by hand by Joe, 2026-11-19), so the
+  release's crates.io run needs no first publish. Its trusted publisher
+  binding is unconfirmed: the release's `publish crates` run shows it.
+- **Windows WiredTiger under MSVC 19.52** (runner image 20261111 on) failed
+  on C4815 under strict `/WX`; `cmake/patch_wt_strict.py` disables that one
+  diagnostic (#2917). Proven harmless on MSVC 19.51 (four runs). Not yet
+  run on 19.52: after #2917 every Windows runner served image 20261103
+  (19.51), and `psycopg-windows.yml` does not run on a `cmake/` change. Read
+  the compiler line of the next Windows run (`C compiler identification`):
+  the first on 19.52 is the proof. The release's Windows binary build
+  depends on it.
+
+Then, at the release: watch `release-binaries.yml` (three binary archives
+plus two `secantusdb-ext-*` archives), `publish-pypi.yml` (four wheels, both
+smoke steps) and `publish crates`; then `pip install SecantusDB` from PyPI
+into clean venvs on Linux x86_64 and macOS arm64, `MongoServer()` and
+`MongoServer(embedded=False)` each, before the website, the blog post or the
+talk deck say it ships.
