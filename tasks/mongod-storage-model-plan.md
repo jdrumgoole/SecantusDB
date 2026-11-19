@@ -1,6 +1,6 @@
 # Plan: move the on-disk layout to mongod's storage model
 
-Status: **draft for review** (2026-11-19). No code has changed.
+Status: **open questions answered** (2026-11-19). No code has changed.
 
 ## Why
 
@@ -95,18 +95,21 @@ Each phase lands as its own PR with the full storage gate (`cargo fmt`,
 3. **One table per collection.** Documents move to their ident's table, keyed
    by RecordId, as plain BSON. Drop becomes a WT drop and rename a catalog
    change; the chunked purge and its tombstones go.
-4. **One table per index, today's key bytes.** Each index gets its own table
-   holding today's sort-key bytes; `_id_` becomes a real unique index and
-   `secantus_natural_seq` and `secantus_unique_keys` go. This keeps the
-   planner, explain and scan bounds working unchanged while the layout moves.
-5. **KeyString** (if open question 1 says yes). Port mongod's KeyString
-   encoding and TypeBits, switch the index tables to it, and move the 88
-   `sortkey::` sites that read stored bytes. In-memory comparisons in
-   `secantus-core` that only order values stay as they are.
+4. **One table per index, in KeyString.** Port mongod's KeyString encoding
+   and TypeBits; each index gets its own table keyed by KeyString; `_id_`
+   becomes a real unique index and `secantus_natural_seq` and
+   `secantus_unique_keys` go. The 88 `sortkey::` sites that read stored bytes
+   (explain, scan bounds, the planner) move to KeyString. In-memory
+   comparisons in `secantus-core` that only order values stay as they are.
+5. **Timeseries buckets.** Store time-series data as `system.buckets`
+   bucket documents, as mongod does; remove the framed value.
 6. **Size storer and the PostgreSQL server.** Key sizes by ident.
    `pg_relation_filepath` (secantus-pg/src/lib.rs:22636) returns the ident's
    file. Confirm the SQL-to-collection hand-off test still passes.
-7. **Clean-up.** Remove the legacy-table readers, the shard routing and the
+7. **mongod opens the store.** A test creates a store with SecantusDB,
+   stops it, starts mongod 8.2.11 on the directory and reads every
+   collection and index back.
+8. **Clean-up.** Remove the legacy-table readers, the shard routing and the
    format markers this replaces; rewrite the layout tests below.
 
 ## Tests that pin today's layout
@@ -144,25 +147,25 @@ mid-flight; the refusal message for an old store.
 - **Backup and PITR archives** name tables; `pitr_archive.rs`, `repair.rs` and
   `compact.rs` need the new names.
 
-## Open questions for Joe
+## Decisions on the open questions (Joe, 2026-11-19)
 
-1. **KeyString or our sort-key bytes in the index tables?** KeyString is the
-   faithful choice and lets index keys match mongod byte for byte. It is also
-   the largest phase, because explain, scan bounds and the planner read stored
-   key bytes. Recommendation: KeyString, after phase 4 has moved the layout.
-2. **The oplog: one `local.oplog.rs` table keyed by timestamp, or keep the 16
-   seq-keyed shards?** The shards were the measured fix for write scaling in
-   July. Recommendation: keep the shards now and revisit after phase 5, with a
-   concurrency run to decide.
-3. **Timeseries documents** carry a framed `_id` key because it cannot be
-   rebuilt from `_id` (S:1413-1418). mongod stores time-series buckets as
-   ordinary documents in a `system.buckets` collection. Follow that, or keep a
-   frame for timeseries only?
-4. **Goal: same model, or files mongod can open?** Matching mongod's table
-   names, catalog documents and KeyString would be close to letting mongod open
-   a SecantusDB store, but that is not promised by anything above.
-   Recommendation: same model, with mongod-compatible files as a non-goal for
-   now.
+1. **KeyString from the start.** The per-index tables are written in mongod's
+   KeyString (with TypeBits) when they are created; there is no intermediate
+   phase on today's sort-key bytes. Phases 4 and 5 merge.
+2. **Oplog: keep the 16 seq-keyed shards for now.** Revisit after the
+   KeyString work, with a `do-perf` concurrency run to decide whether one
+   `local.oplog.rs` table keyed by timestamp holds up.
+3. **Timeseries: follow mongod's buckets.** Time-series data is stored as
+   bucket documents in a `system.buckets.<coll>` collection, as mongod does;
+   the framed value goes entirely.
+4. **Goal: files mongod can open.** A SecantusDB store must open in mongod
+   8.2.11, and a test proves it. This means matching `_mdb_catalog`,
+   `sizeStorer`, ident naming, the table configs (`app_metadata`, formats)
+   and `WiredTiger.turtle` / `storage.bson` exactly, so phase 0's appendix
+   becomes the specification, not a sanity check. Open sub-question for
+   phase 0: the vendored WiredTiger is mongodb-7.0.33 while mongod 8.2 ships
+   a newer WT; whether 8.2 opens files written by 7.0's WT must be measured
+   first.
 
 ## Not in scope
 
