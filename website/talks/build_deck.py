@@ -162,25 +162,29 @@ MOBILE_CSS = (
 )
 
 
-def deck_version(src: Path) -> str:
-    """The deck's version: the date and short hash of the last commit that
-    touched its folder, with ``+local`` when the folder has uncommitted edits.
-    Derived from git so it can never go stale; ``unversioned`` outside git."""
+def deck_version(src: Path, base: str) -> str:
+    """The deck's version, ``v<major>.<minor>.<patch>``.
+
+    ``major.minor`` is ``deck.json``'s ``version``, set by hand for a
+    milestone. ``patch`` counts the commits that changed the deck's folder
+    since that version string was introduced, so every committed change
+    gets a new number without anyone bumping it. ``+local`` marks
+    uncommitted edits; outside git the patch is omitted.
+    """
 
     def git(*args: str) -> str:
         return subprocess.run(
             ["git", "-C", str(src), *args], capture_output=True, text=True, check=True
         ).stdout.strip()
 
+    pattern = r'"version"\s*:\s*"' + re.escape(base) + '"'
     try:
-        stamp = git("log", "-1", "--format=%cs %h", "--", ".")
+        since = git("log", "-1", "--format=%H", "--pickaxe-regex", "-S", pattern, "--", "deck.json")
+        patch = int(git("rev-list", "--count", f"{since}..HEAD", "--", ".")) if since else 0
         dirty = git("status", "--porcelain", "--", ".")
-    except (OSError, subprocess.CalledProcessError):
-        return "unversioned"
-    if not stamp:
-        return "unversioned"
-    date, sha = stamp.split()
-    return f"v{date} · {sha}" + ("+local" if dirty else "")
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return f"v{base}"
+    return f"v{base}.{patch}" + ("+local" if dirty else "")
 
 
 _SECTION = re.compile(r"^\s*<section\b.*</section>\s*$", re.S)
@@ -207,7 +211,7 @@ def build(name: str) -> Path:
             css=css,
             mobile=MOBILE_CSS,
             reader_js=json.dumps(READER_MEDIA),
-            version_js=json.dumps(deck_version(src)),
+            version_js=json.dumps(deck_version(src, deck["version"])),
             slides="\n".join(slides),
         ),
         encoding="utf-8",
