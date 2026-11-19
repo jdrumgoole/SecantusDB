@@ -1,11 +1,26 @@
-<section id="gauges">
-<p class="eyebrow">Conformance gauges</p>
+<section id="gauges" style="gap:40px;">
+<p class="eyebrow">Act two · Conformance gauges</p>
 <h2>Borrow other people’s test suites — unmodified</h2>
-<div class="stats" style="grid-template-columns:1fr 1fr 1fr;">
-<div class="stat"><span class="n">13</span><span class="l" style="color:var(--soft);">MongoDB driver suites</span></div>
-<div class="stat"><span class="n">7</span><span class="l" style="color:var(--soft);">SQL suites</span></div>
+<div style="display:grid;grid-template-columns:320px 1fr;gap:56px;align-items:start;">
+<div class="stats" style="grid-template-columns:1fr;gap:40px;">
+<div class="stat"><span class="n">13</span><span class="l" style="color:var(--soft);">MongoDB driver test suites</span></div>
 <div class="stat"><span class="n">0</span><span class="l" style="color:var(--soft);">edits to them</span></div>
 </div>
+<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;">
+<div class="box" style="padding:12px 20px;"><p class="t" style="font-size:24px;">Python</p><p style="font-size:19px;color:var(--soft);">pymongo</p></div>
+<div class="box" style="padding:12px 20px;"><p class="t" style="font-size:24px;">Python</p><p style="font-size:19px;color:var(--soft);">pymongo (async)</p></div>
+<div class="box" style="padding:12px 20px;"><p class="t" style="font-size:24px;">Node.js</p><p style="font-size:19px;color:var(--soft);">mongo-node-driver</p></div>
+<div class="box" style="padding:12px 20px;"><p class="t" style="font-size:24px;">Java</p><p style="font-size:19px;color:var(--soft);">mongo-java-driver</p></div>
+<div class="box" style="padding:12px 20px;"><p class="t" style="font-size:24px;">Kotlin</p><p style="font-size:19px;color:var(--soft);">mongo-kotlin-driver</p></div>
+<div class="box" style="padding:12px 20px;"><p class="t" style="font-size:24px;">Go</p><p style="font-size:19px;color:var(--soft);">mongo-go-driver</p></div>
+<div class="box" style="padding:12px 20px;"><p class="t" style="font-size:24px;">Rust</p><p style="font-size:19px;color:var(--soft);">mongo-rust-driver</p></div>
+<div class="box" style="padding:12px 20px;"><p class="t" style="font-size:24px;">C</p><p style="font-size:19px;color:var(--soft);">mongo-c-driver</p></div>
+<div class="box" style="padding:12px 20px;"><p class="t" style="font-size:24px;">C++</p><p style="font-size:19px;color:var(--soft);">mongo-cxx-driver</p></div>
+<div class="box" style="padding:12px 20px;"><p class="t" style="font-size:24px;">C#</p><p style="font-size:19px;color:var(--soft);">mongo-csharp-driver</p></div>
+<div class="box" style="padding:12px 20px;"><p class="t" style="font-size:24px;">Ruby</p><p style="font-size:19px;color:var(--soft);">mongo-ruby-driver</p></div>
+<div class="box" style="padding:12px 20px;"><p class="t" style="font-size:24px;">PHP</p><p style="font-size:19px;color:var(--soft);">mongo-php-library<br>mongo-php-driver</p></div>
+</div>
+</div>
 <p class="lede">A hang is a failure, never a skip.</p>
-<aside><p>Driver authors have already written thousands of tests describing what a server must do. We run thirteen MongoDB driver suites, pymongo to C#, and seven SQL suites including psycopg, sqllogictest and SQLAlchemy's dialect tests. Each is a git submodule with zero edits, run weekly against the Rust servers.</p><p>A hang is a failure, never a skip. The Go gauge reported 100% for months, because a hung test killed the run at 476 of 481 tests before the failures were counted. Now we count tests started against tests that reported.</p><p class="time">Time: ~1½ min</p></aside>
+<aside><p>Driver authors have already written thousands of tests describing what a server must do. We run the official MongoDB drivers' own test suites, thirteen of them across eleven languages, each a git submodule with zero edits, run weekly against the Rust server.</p><p>A hang is a failure, never a skip. The Go gauge reported 100% for months, because a hung test killed the run at 476 of 481 tests before the failures were counted. Now we count tests started against tests that reported.</p><p class="time">Time: ~1½ min</p></aside>
 </section>
