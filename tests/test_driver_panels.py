@@ -68,7 +68,7 @@ def test_render_validation_panel_contains_required_chrome() -> None:
     assert "<strong>959</strong> tests passed" in panel
     assert "<strong>0</strong> failed" in panel
     assert "Read the report" in panel
-    assert "validation-report.html" in panel
+    assert "validation-report-rust-server.html" in panel
 
 
 def test_render_validation_panel_shows_expected_failure_note() -> None:

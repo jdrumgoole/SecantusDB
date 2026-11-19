@@ -74,7 +74,3 @@ bounded by WiredTiger's own write path and the durability setting
 [Benchmark](benchmark.md) for measured numbers against `mongod`.
 
 Tests of the servers run against real on-disk WiredTiger, never a mock.
-
-The deprecated Python server had a different structure (a thread per
-connection, a global storage lock); its layer map is kept, as a record, on
-[Deprecated: Python servers](python-servers.md).

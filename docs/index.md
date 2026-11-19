@@ -69,8 +69,6 @@ talking to: same handshake, same wire frames, same error codes.
 The Rust server also has its own documentation tree, covering running the
 daemon, configuration, TLS, recovery and embedding, at
 [secantusdb.com/docs/rust](https://secantusdb.com/docs/rust/index.html).
-The original Python servers are fully deprecated and kept only as a record:
-[Deprecated: Python servers](python-servers.md).
 
 Connect with **any** MongoDB driver or tool, unchanged:
 
@@ -89,19 +87,19 @@ The conformance evidence: the official test suites for **pymongo**,
 **mongo-ruby-driver**, **mongo-rust-driver**, and the **PHP**
 library + extension all run against
 SecantusDB **unmodified** — see the
-[pymongo](validation-report.md),
-[pymongo-async](validation-report-pymongo-async.md),
-[Go-driver](validation-report-go.md),
-[Node-driver](validation-report-node.md),
-[Java-driver](validation-report-java.md),
-[Kotlin-driver](validation-report-kotlin.md),
-[Ruby-driver](validation-report-ruby.md),
-[Rust-driver](validation-report-rust.md),
-[PHP-library](validation-report-php-lib.md),
-[PHP-extension](validation-report-php-ext.md),
-[C-driver](validation-report-c.md),
-[C++-driver](validation-report-cxx.md), and
-[.NET-driver](validation-report-dotnet.md) validation reports for
+[pymongo](validation-report-rust-server.md),
+[pymongo-async](validation-report-pymongo-async-rust-server.md),
+[Go-driver](validation-report-go-rust-server.md),
+[Node-driver](validation-report-node-rust-server.md),
+[Java-driver](validation-report-java-rust-server.md),
+[Kotlin-driver](validation-report-kotlin-rust-server.md),
+[Ruby-driver](validation-report-ruby-rust-server.md),
+[Rust-driver](validation-report-rust-rust-server.md),
+[PHP-library](validation-report-php-lib-rust-server.md),
+[PHP-extension](validation-report-php-ext-rust-server.md),
+[C-driver](validation-report-c-rust-server.md),
+[C++-driver](validation-report-cxx-rust-server.md), and
+[.NET-driver](validation-report-dotnet-rust-server.md) validation reports for
 current pass-rates per feature category.
 
 ## What's in scope
@@ -155,8 +153,6 @@ runtimes — without the clustering and infrastructure that `mongod` brings.
   each doesn't support yet.
 - [Rust server docs](https://secantusdb.com/docs/rust/index.html) — running,
   configuring, securing, recovering and embedding `secantusd-mdb`.
-- [Deprecated: Python servers](python-servers.md) — the original Python
-  servers, kept as a record.
 - [Architecture](architecture.md) — wire / commands / query / aggregate /
   storage layers.
 - [Indexes](indexes.md) — single-field, compound, mixed-direction, partial,
@@ -182,11 +178,10 @@ runtimes — without the clustering and infrastructure that `mongod` brings.
 - [Concurrency](concurrency.md) — what scales, what doesn't, and why
   multi-writer throughput is capped by WiredTiger.
 - [Compatibility](compatibility.md) — known divergences from real MongoDB.
-- [Feature comparison](feature-comparison.md) — MongoDB vs the Rust server
-  (and the deprecated Python server), feature by feature.
+- [Feature comparison](feature-comparison.md) — MongoDB vs the Rust server,
+  feature by feature.
 - [Python launcher API](launcher-api.md) — `MongoServer` / `PostgresServer`
   from `pip install SecantusDB`.
-- [API reference](api.md) — the deprecated Python server's `SecantusDBServer` and `Storage`.
 
 ## License
 
@@ -211,8 +206,6 @@ quickstart
 examples
 servers
 launcher-api
-python-servers
-api
 configuration
 architecture
 indexes
@@ -230,26 +223,6 @@ compatibility
 feature-comparison
 benchmark
 validation-summary
-validation-report
-validation-report-pymongo-async
-validation-report-go
-validation-report-node
-validation-report-java
-validation-report-kotlin
-validation-report-ruby
-validation-report-rust
-validation-report-php-lib
-validation-report-php-ext
-validation-report-c
-validation-report-cxx
-validation-report-dotnet
-validation-report-psycopg
-validation-report-slt
-validation-report-sqlalchemy
-validation-report-pgx
-validation-report-sqlstress
-validation-report-pgtest
-validation-report-pgjdbc
 validation-report-rust-server
 validation-report-pymongo-async-rust-server
 validation-report-go-rust-server

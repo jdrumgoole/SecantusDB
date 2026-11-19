@@ -25,15 +25,6 @@ through `secantusd-mdb` as a collection, with the `PRIMARY KEY` as `_id`; the
 reverse does not work, and the two cannot serve the same directory at the same
 time (WiredTiger's exclusive file lock makes the second server exit).
 
-:::{note}
-The original Python servers (`secantus.SecantusDBServer`, `secantusd-py`,
-`secantusd-py-pg`) are **fully deprecated**: not tested in CI, not published,
-no new work. They are documented, as a record, on
-[Deprecated: Python servers](python-servers.md). The old in-process
-accelerator (`SECANTUS_ENGINE=rust` / `SecantusDBServer(engine=...)`) was
-retired earlier.
-:::
-
 ## Versioning
 
 The servers are **separate deliverables on independent version lines**:
@@ -260,41 +251,26 @@ runtime).
 These are out of scope for **both** servers; the per-feature detail lives in
 [Compatibility](compatibility.md).
 
-### Python server (deprecated)
-
-The deprecated Python server implements the full in-scope wire surface. Its remaining
-divergences are the stopgaps and known edge cases enumerated in
-[Compatibility](compatibility.md) — the `_id` numeric-type bridge is
-undefined for `NaN` / infinity, `top` counters are always zero, and a handful
-of date-format and
-`$group`-ordering edge cases. It does not speak `OP_COMPRESSED`, which the
-Rust server does (`snappy`, `zstd`, `zlib`); a driver asked to compress
-simply sends uncompressed to it.
-
 ### Rust MongoDB server
 
-The Rust MongoDB server passes 99.5% of pymongo's suite. The remaining *feature* differences (full three-way matrix in the
+The Rust MongoDB server passes 99.5% of pymongo's suite. The remaining *feature* differences (full matrix in the
 [Feature comparison](feature-comparison.md)) are:
 
-- **Point-in-time restore over the wire** — `secantusAdmin.restoreToTimestamp`
-  is Python-server-only; the Rust server does the same restore via the
-  `secantusd-mdb restore` CLI subcommand.
+- **Point-in-time restore over the wire** — there is no wire command; restore
+  with the `secantusd-mdb restore` CLI subcommand.
 - **Session lifecycle** — `endSessions` / `refreshSessions` / `killSessions`
-  are acknowledged no-ops on the Rust server; the Python server tracks
-  sessions with a 30-minute idle TTL.
+  are acknowledged no-ops; mongod tracks sessions with a 30-minute idle TTL.
 - **Operator edges** — a handful of `$dateFromString` / `$dateToString`
   format directives, Decimal128 arithmetic edges, and mixed-type sort
   orderings the Rust engine rejects rather than risk diverging from
   `mongod`.
 - **Thinner diagnostics** — `serverStatus` / `dbStats` / `collStats` return a
-  smaller subset of fields than the Python server's replies.
+  smaller subset of fields than mongod's replies.
 
-Both servers mint resume tokens in SecantusDB's own `{s, t, n, k}` layout
+The server mints resume tokens in SecantusDB's own `{s, t, n, k}` layout
 rather than mongod's keystring format — tokens round-trip within SecantusDB but
 cannot be presented to a real `mongod` (or vice versa).
 
 The current Rust-server pass rate, and the exact set of failing pymongo tests,
 is regenerated each run into the
-[Rust-server validation report](validation-report-rust-server.md). The gap
-against the [Python-server report](validation-report.md) is the canonical,
-machine-checked statement of what the Rust server doesn't support yet.
+[Rust-server validation report](validation-report-rust-server.md).

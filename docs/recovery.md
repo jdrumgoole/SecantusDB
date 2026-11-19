@@ -131,9 +131,7 @@ cluster timestamp, not a wall-clock time.
 ### Over the wire
 
 The Rust server has no `secantusAdmin.restoreToTimestamp` command: a restore
-is the `secantusd-mdb restore` subcommand run against a stopped source. (The
-deprecated Python server exposed the same operation as that wire command; it
-is not on the Rust server, and there is no backlog item for it yet.)
+is the `secantusd-mdb restore` subcommand run against a stopped source.
 
 ### Transactions
 
