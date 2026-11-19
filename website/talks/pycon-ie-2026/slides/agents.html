@@ -1,10 +1,17 @@
-<section id="agents" class="dark">
-<p class="eyebrow">Act four · Working with AI agents</p>
-<h2>One developer, many sessions</h2>
-<div class="cards two">
-<div class="card"><h3>What worked</h3><p class="body">Backlog items, end to end</p></div>
-<div class="card"><h3>What it took</h3><p class="body">Written rules</p></div>
+<section id="agents" class="dark" style="gap:44px;">
+<p class="eyebrow">Act four · Working with Claude Code</p>
+<h2>From prompts to plans to goals</h2>
+<div class="flow">
+<div class="box" style="background:transparent;border-color:var(--softdark);"><p class="t">Manual</p><p style="color:var(--softdark);">prompt by prompt</p></div>
+<p class="arrow" style="color:var(--amber);">→</p>
+<div class="box" style="background:transparent;border-color:var(--softdark);"><p class="t">Plans</p><p style="color:var(--softdark);">agree the plan, then build</p></div>
+<p class="arrow" style="color:var(--amber);">→</p>
+<div class="box" style="background:var(--amber);border-color:var(--amber);color:var(--ink);"><p class="t">Goals</p><p>everything is a goal now</p></div>
 </div>
-<p class="lede">Agents follow the rules you write down. The rules are the product.</p>
-<aside><p><b>What worked:</b> Claude Code sessions working backlog items end to end: reproduce against mongod or PostgreSQL, fix, run the gate, open a PR, get CI green. Of the 5,115 commits since 26 April, 3,866, about three quarters, carry a Claude co-author line (19 November; recount before the talk).</p><p><b>What it took:</b> written rules in CLAUDE.md and in skills; one server per session; a pushed branch as the claim on an item; a machine-wide build budget. Two sessions once built the same item twice, hence the claim. Eight agents at cargo's default job count pushed the load average to 66 on 12 cores, hence the budget.</p><p class="time">Time: ~1½ min</p></aside>
+<div class="cards">
+<div class="card" style="background:transparent;border-top-color:var(--amber);padding:28px 32px;"><h3>Goals run for days</h3><p class="body" style="color:var(--softdark);">on end</p></div>
+<div class="card" style="background:transparent;border-top-color:var(--amber);padding:28px 32px;"><h3>Free → Ultra</h3><p class="body" style="color:var(--softdark);">in a couple of weeks</p></div>
+<div class="card" style="background:transparent;border-top-color:var(--amber);padding:28px 32px;"><h3>CLAUDE.md → skills</h3><p class="body" style="color:var(--softdark);">one big file, broken up</p></div>
+</div>
+<aside><p><b>How the way of working changed.</b> It started manually, prompt by prompt. Then it moved to plans: agree a plan, then let Claude Code build it. Now everything is done as a goal, and a goal can run for days on end.</p><p><b>The bill followed:</b> from the free plan to the Ultra plan over a couple of weeks.</p><p><b>The instructions grew up too.</b> It started as one big CLAUDE.md. That is now broken into skills, each loaded only when the work needs it: releases, the backlog, probing against mongod, the website.</p><p>About three quarters of the commits carry a Claude co-author line (3,866 of 5,115 on 19 November).</p><p class="time">Time: ~1½ min</p></aside>
 </section>
