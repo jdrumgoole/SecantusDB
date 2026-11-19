@@ -18,6 +18,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -42,8 +43,10 @@ html,body{{margin:0;height:100%;background:#0B1915;overflow:hidden;}}
 #stage h1,#stage h2,#stage h3,#stage p,#stage ul,#stage ol{{margin:0;}}
 #bar{{position:fixed;right:16px;bottom:10px;color:#BFD3CB;opacity:.7;
   font:14px/1 system-ui,sans-serif;}}
-.nlink{{position:absolute;left:40px;bottom:24px;font:500 18px/1 system-ui,sans-serif;
-  color:inherit;opacity:.35;text-decoration:none;border-bottom:1px dotted currentColor;}}
+.nfoot{{position:absolute;left:40px;bottom:24px;display:flex;gap:16px;align-items:baseline;
+  font:500 18px/1 system-ui,sans-serif;}}
+.nlink{{color:inherit;opacity:.35;text-decoration:none;border-bottom:1px dotted currentColor;}}
+.nver{{opacity:.35;font-variant-numeric:tabular-nums;}}
 .nlink:hover,.nlink:focus{{opacity:.8;}}
 #notes{{position:fixed;inset:0;background:rgba(11,25,21,.72);z-index:10;display:flex;
   align-items:center;justify-content:center;padding:16px;box-sizing:border-box;}}
@@ -78,7 +81,7 @@ html,body{{margin:0;height:100%;background:#0B1915;overflow:hidden;}}
 <p class="nkick">Speaker notes</p><h2 id="notes-h"></h2><div id="nbody"></div></div></div>
 <script>
 (function(){{
-  var READER={reader_js};
+  var READER={reader_js}, VERSION={version_js};
   var s=[].slice.call(document.querySelectorAll('#stage>section'));
   var stage=document.getElementById('stage'), i=0;
   var reader=matchMedia(READER);
@@ -107,9 +110,13 @@ html,body{{margin:0;height:100%;background:#0B1915;overflow:hidden;}}
     document.getElementById('nbody').innerHTML=a.innerHTML;
     last=document.activeElement;notes.hidden=false;document.getElementById('nclose').focus();}}
   function closeNotes(){{notes.hidden=true;if(last)last.focus();}}
-  s.forEach(function(e){{if(!e.querySelector('aside'))return;
-    var l=document.createElement('a');l.href='#';l.className='nlink';l.textContent='Speaker notes';
-    l.onclick=function(ev){{ev.preventDefault();openNotes(e);}};e.appendChild(l);}});
+  s.forEach(function(e){{var f=document.createElement('div');f.className='nfoot';
+    if(e.querySelector('aside')){{
+      var l=document.createElement('a');l.href='#';l.className='nlink';
+      l.textContent='Speaker notes';
+      l.onclick=function(ev){{ev.preventDefault();openNotes(e);}};f.appendChild(l);}}
+    var v=document.createElement('span');v.className='nver';v.textContent=VERSION;f.appendChild(v);
+    e.appendChild(f);}});
   document.getElementById('nclose').onclick=closeNotes;
   notes.onclick=function(ev){{if(ev.target===notes)closeNotes();}};
   fit(); show((parseInt(location.hash.slice(1),10)||1)-1);
@@ -130,7 +137,8 @@ MOBILE_CSS = (
     "#stage>section{position:relative;display:flex!important;inset:auto;"
     "padding:40px 16px!important;gap:20px!important;min-height:0;}"
     "#bar{display:none;}"
-    "#stage .nlink{position:static;align-self:flex-start;font-size:14px;opacity:.6;}"
+    "#stage .nfoot{position:static;align-self:flex-start;font-size:14px;}"
+    "#stage .nlink,#stage .nver{opacity:.6;}"
     "#stage h1{font-size:40px!important;}"
     "#stage h2{font-size:28px!important;}"
     "#stage h3{font-size:20px!important;}"
@@ -152,6 +160,28 @@ MOBILE_CSS = (
     "#stage [style*='width:1400px']{width:auto!important;}"
     "}"
 )
+
+
+def deck_version(src: Path) -> str:
+    """The deck's version: the date and short hash of the last commit that
+    touched its folder, with ``+local`` when the folder has uncommitted edits.
+    Derived from git so it can never go stale; ``unversioned`` outside git."""
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(src), *args], capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    try:
+        stamp = git("log", "-1", "--format=%cs %h", "--", ".")
+        dirty = git("status", "--porcelain", "--", ".")
+    except (OSError, subprocess.CalledProcessError):
+        return "unversioned"
+    if not stamp:
+        return "unversioned"
+    date, sha = stamp.split()
+    return f"v{date} · {sha}" + ("+local" if dirty else "")
+
 
 _SECTION = re.compile(r"^\s*<section\b.*</section>\s*$", re.S)
 
@@ -177,6 +207,7 @@ def build(name: str) -> Path:
             css=css,
             mobile=MOBILE_CSS,
             reader_js=json.dumps(READER_MEDIA),
+            version_js=json.dumps(deck_version(src)),
             slides="\n".join(slides),
         ),
         encoding="utf-8",
