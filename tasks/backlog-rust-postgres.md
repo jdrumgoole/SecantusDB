@@ -2966,3 +2966,20 @@ statement is VALUES-only and runs there as written. The gap test is in
 
 ## Found while working RP-971 (2026-11-17)
 
+
+## The storage model is not mongod's (tasks/mongod-storage-model-plan.md, 2026-11-19)
+
+- [ ] **A store `secantusd-pg` writes is not one mongod can open.** The
+      PostgreSQL server shares `secantus-storage`, so its tables live in the
+      shared `secantus_documents_shN` tables, not in a
+      `collection-<UUID>` table each with an `index-<UUID>` table for the
+      PRIMARY KEY, and mongod 8.2.11 refuses the store's files (version 2.1,
+      from our `WT_STANDALONE_BUILD=ON`). Decided (Joe, 2026-11-19): both
+      servers move to mongod's model (`tasks/mongod-storage-model-plan.md`,
+      decision 3); a table must read back through mongod as the collection
+      it reads back as through `secantusd-mdb` today. Note the second test
+      also asks that mongod see no `__sys_*` system-column fields, which
+      today live inside the stored document (RP-069), so phase 6 must
+      settle where they go.
+      Backlog-ID: RP-1074
+      Verify: tests/backlog/test_rp_storage_model.py::test_a_table_is_its_own_collection_table, tests/backlog/test_rp_storage_model.py::test_mongod_reads_a_table_the_sql_server_wrote

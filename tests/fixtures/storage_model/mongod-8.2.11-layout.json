@@ -1,0 +1,5898 @@
+{
+ "wiredtiger_turtle_version": "WiredTiger 12.0.0: (November 15, 2024)",
+ "storage_bson": {
+  "storage": {
+   "engine": "wiredTiger",
+   "options": {
+    "directoryPerDB": false,
+    "directoryForIndexes": false,
+    "groupCollections": false
+   }
+  }
+ },
+ "tables": [
+  {
+   "uri": "table:_mdb_catalog",
+   "label": "_mdb_catalog",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-09bf3bc6-d5e3-4580-9837-ce3e62a16364",
+   "label": "config.image_collection",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-0ad0aedd-3755-402a-a525-47bd6b341867",
+   "label": "app.system.buckets.ts",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "zstd",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "u",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-0ebb5510-4e85-468b-93be-d634178c8b54",
+   "label": "app.clustered",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "u",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-22457500-f0b6-4bf2-ad99-1ca69cc806aa",
+   "label": "app.kinds",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-2c0317a7-aaa3-49b1-a86b-4174f8cb3833",
+   "label": "config.analyzeShardKeySplitPoints",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-3c60b95b-92bf-4716-8917-a3557e2f16ab",
+   "label": "local.system.rollback.id",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=true)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-42f34386-c14c-4a74-9460-6806103ac160",
+   "label": "collection-42f34386-c14c-4a74-9460-6806103ac160",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-51333350-d55c-4de8-bf6c-a724959d2018",
+   "label": "app.capped",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-5a8d33e5-17e9-4a96-b0fa-47283c714404",
+   "label": "app.ks",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-616832c5-3c5e-4aec-b74d-a0935c1b11db",
+   "label": "admin.system.version",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-6802e734-b846-4089-8055-8218048d0480",
+   "label": "admin.system.keys",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-70eccbf9-28bc-47a4-8330-eeeca529c02e",
+   "label": "local.replset.oplogTruncateAfterPoint",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=true)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-73aaa77a-0398-412e-8fb6-eaf5ad88628b",
+   "label": "local.replset.minvalid",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-803d5305-fde4-43f4-a38e-cec574aff637",
+   "label": "config.system.indexBuilds",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-81379005-73ee-4e53-85bc-43528a0fb4f0",
+   "label": "admin.system.roles",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-82d71be3-7014-4625-a52b-2eac08b468ed",
+   "label": "local.system.replset",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=true)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-9a0eba51-34a8-4ef4-8398-fae5b3820ecf",
+   "label": "config.sampledQueriesDiff",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-9f221ca9-115a-47f6-ae42-8df01a19ea14",
+   "label": "admin.system.users",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-9ff848ef-061f-4f78-95cb-02ebbc137b6f",
+   "label": "local.replset.initialSyncId",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=true)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-a6fd24af-cc7d-4360-8b8e-660859cca027",
+   "label": "local.replset.election",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=true)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-adebbe5c-7131-4740-bdb5-3a9dd25cb405",
+   "label": "local.startup_log",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=true)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-b2059d41-7c0f-425c-af42-36a78d9fef67",
+   "label": "app.c",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-ba00ffca-087c-431c-8957-cff14e07e4e5",
+   "label": "app.pre",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-c8678bfb-9445-4109-be0d-e4a8f955c079",
+   "label": "app.system.views",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-da7d6f84-b231-47c5-906a-5b68d3fdab8c",
+   "label": "config.transactions",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-eb42229c-bbf8-4c08-a0b4-43dc685872a7",
+   "label": "app.coll_ci",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-ecee9547-1aec-49d1-9d9b-dc38398ea3b2",
+   "label": "config.system.preimages",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "u",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-ee163295-5e83-4579-9227-117bdb4b367b",
+   "label": "config.sampledQueries",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-f899cda9-443a-4929-8a0c-ffca5bd61a8d",
+   "label": "local.oplog.rs",
+   "table_config": {
+    "app_metadata": "(formatVersion=1,oplogKeyExtractionVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1,oplogKeyExtractionVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=true)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:collection-fb5fb2c6-9130-4a0d-bdfd-082bf562834c",
+   "label": "app.renamed",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-011c6bcd-cc21-466b-8df9-80f81219d499",
+   "label": "app.renamed/x_1",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-02f563b8-35e1-496c-acdf-a2f065019c10",
+   "label": "app.coll_ci/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-05895278-dcc8-45c0-800a-9f9c0cb32252",
+   "label": "app.kinds/w_wildcard",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-05ee5695-cac6-49bb-8526-dcc876d13cde",
+   "label": "app.ks/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-0e073409-6ec8-4702-830f-964fbc18420a",
+   "label": "app.c/sparse_idx",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-119c54a1-dab6-49e4-83ff-9851de394960",
+   "label": "app.coll_ci/s_1",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-1aba3d23-3d96-468a-947b-9ee8f6331a15",
+   "label": "app.kinds/h_hashed",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-1ac906d8-ccd9-4f72-9813-720dfccf0edc",
+   "label": "app.capped/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-1adda2ae-9054-4976-9680-4b422a427873",
+   "label": "admin.system.users/user_1_db_1",
+   "table_config": {
+    "app_metadata": "(formatVersion=14)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=14)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-28f67131-0ea6-4306-a927-a72d0382d927",
+   "label": "admin.system.version/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-295f65b3-4c85-40fe-bd4e-ee92012e94c2",
+   "label": "app.renamed/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-29924116-98eb-4207-a710-cedb14a43414",
+   "label": "app.c/ttl_idx",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-2d267f5f-cd53-460d-9435-3b31c685c2c8",
+   "label": "config.sampledQueries/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-2f46d0fb-0a4c-4b57-bbdb-66a4fe2e5a36",
+   "label": "local.replset.oplogTruncateAfterPoint/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=true)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-3f6948b6-479f-43c9-b592-bc1549591ddf",
+   "label": "app.c/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-4302c1bc-e9d7-46e2-ae12-3f2513a145f8",
+   "label": "config.transactions/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-43c61878-0c33-4436-a831-a959ead23956",
+   "label": "app.c/t_multikey",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-482c0bd8-d15c-4b72-8614-4ad8c8f969bf",
+   "label": "admin.system.keys/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-49bfcfcd-64d4-4345-8485-a60c893cd4a7",
+   "label": "local.system.rollback.id/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=true)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-4d6bf7fb-c7ad-4892-b000-c2700449cec8",
+   "label": "config.analyzeShardKeySplitPoints/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-5124a368-8a70-4475-8fee-0e15e246c6af",
+   "label": "index-5124a368-8a70-4475-8fee-0e15e246c6af",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-51c0c8dc-fe1c-4b10-b495-8d70cbbfd86d",
+   "label": "app.kinds/loc_2dsphere",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-5c63dcb0-b3bc-4cda-9067-46e1fea6e567",
+   "label": "config.sampledQueriesDiff/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-5c85281a-a5bb-401e-abb9-3b01e72ddd2f",
+   "label": "config.analyzeShardKeySplitPoints/AnalyzeShardKeySplitPointsTTLIndex",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-5f659a9e-2897-4d2a-ada4-5b0b656e57b6",
+   "label": "app.pre/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-64e72346-08ad-42ff-8669-23fd4e141124",
+   "label": "app.system.buckets.ts/m_1_t_1",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-66a2223d-9ae7-4d23-a9b5-8f5008df1b68",
+   "label": "app.system.views/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-6943fa32-c598-402e-90aa-7af330784e24",
+   "label": "app.c/a_1_b_-1",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-69c2bbab-75d7-4bb5-abaf-adb22ce91ae5",
+   "label": "app.ks/v_-1",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-73858b6a-4724-4bfe-8f4a-c73469652765",
+   "label": "app.clustered/x_1",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-73e643c4-e165-4d4b-90ce-084688a380f9",
+   "label": "config.transactions/parent_lsid",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-7eea2ebb-9356-416e-a596-3375db8e14ad",
+   "label": "local.replset.minvalid/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-80875ec6-d9a4-424d-85fa-d3143903b154",
+   "label": "admin.system.roles/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-86da3466-9afb-4ff0-b217-8de623bbd241",
+   "label": "app.ks/v_1",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-890d5059-d708-4810-9f2f-bf5d85d99611",
+   "label": "app.c/a_partial",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-9b98c23c-c0cc-4f2e-8397-9b418dd27915",
+   "label": "app.c/b_unique",
+   "table_config": {
+    "app_metadata": "(formatVersion=14)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=14)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-a4365866-8733-4d5f-91e0-d2397ec3347a",
+   "label": "local.system.replset/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=true)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-ae4d3b96-4ee1-4492-97a8-d35cd4202f4b",
+   "label": "config.sampledQueriesDiff/SampledQueriesDiffTTLIndex",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-d029bc9d-eb87-48be-b4b4-de78ae6f86ae",
+   "label": "app.kinds/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-d31257ba-3998-41be-b546-2130d5c1ec58",
+   "label": "admin.system.roles/role_1_db_1",
+   "table_config": {
+    "app_metadata": "(formatVersion=14)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=14)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-dc4cb89e-fef4-4dcc-aadd-6365133d6a4f",
+   "label": "index-dc4cb89e-fef4-4dcc-aadd-6365133d6a4f",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-dc69b754-01e7-4171-a643-62dabb6f2789",
+   "label": "local.replset.election/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=true)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-dea14282-e225-42c7-b75b-0371422b5649",
+   "label": "config.sampledQueries/SampledQueriesTTLIndex",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-df397e6e-a9df-41d1-85dd-b3d3fe5c3f3c",
+   "label": "admin.system.users/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-e0ef71ad-6165-4eb7-b55f-a49d7fe3695e",
+   "label": "config.image_collection/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-e1eebae4-95fb-46f6-8e19-b6570d6215dd",
+   "label": "config.system.indexBuilds/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-ede3f89e-5934-4dc0-9fb0-c6eee4f5b53e",
+   "label": "app.kinds/flat_2d",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-f204d39f-071f-4601-80c4-d041a44df412",
+   "label": "app.c/b_fr",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-f47b00a1-1ac1-4266-9ceb-2f7738fbcb1c",
+   "label": "local.startup_log/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=true)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-f711849a-19e0-40d2-b1b9-00f75232f37a",
+   "label": "app.kinds/body_text",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:index-f90e781b-a6f3-43e4-aeba-ffe62e786b6a",
+   "label": "local.replset.initialSyncId/_id_",
+   "table_config": {
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=8)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "16k",
+    "key_format": "u",
+    "leaf_page_max": "16k",
+    "leaf_value_max": "0",
+    "log": "(enabled=true)",
+    "prefix_compression": "true",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:internal-616ebd7e-9d56-4904-b59a-5493617267dd",
+   "label": "internal-616ebd7e-9d56-4904-b59a-5493617267dd",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:internal-70116a14-7e76-48ff-be7a-b513cd779384",
+   "label": "internal-70116a14-7e76-48ff-be7a-b513cd779384",
+   "table_config": {
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "(formatVersion=1)",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "snappy",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "64MB",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:sizeStorer",
+   "label": "sizeStorer",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "u",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=true)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  }
+ ],
+ "catalog": [
+  {
+   "recordId": {
+    "$numberInt": "1"
+   },
+   "doc": {
+    "md": {
+     "ns": "local.startup_log",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "Zmfixlz8QUKr3c75VWGcUA==",
+        "subType": "04"
+       }
+      },
+      "capped": true,
+      "size": {
+       "$numberInt": "10485760"
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-f47b00a1-1ac1-4266-9ceb-2f7738fbcb1c"
+    },
+    "ident": "collection-adebbe5c-7131-4740-bdb5-3a9dd25cb405",
+    "ns": "local.startup_log"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "2"
+   },
+   "doc": {
+    "md": {
+     "ns": "local.replset.oplogTruncateAfterPoint",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "jrxtvKXCQwioXhFObeRPDg==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-2f46d0fb-0a4c-4b57-bbdb-66a4fe2e5a36"
+    },
+    "ident": "collection-70eccbf9-28bc-47a4-8330-eeeca529c02e",
+    "ns": "local.replset.oplogTruncateAfterPoint"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "3"
+   },
+   "doc": {
+    "md": {
+     "ns": "local.replset.minvalid",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "JKg5bJXLQqS+ybDw2QzOdA==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-7eea2ebb-9356-416e-a596-3375db8e14ad"
+    },
+    "ident": "collection-73aaa77a-0398-412e-8fb6-eaf5ad88628b",
+    "ns": "local.replset.minvalid"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "4"
+   },
+   "doc": {
+    "md": {
+     "ns": "local.replset.election",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "4030O0iPRx6k826fx/o8iQ==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-dc69b754-01e7-4171-a643-62dabb6f2789"
+    },
+    "ident": "collection-a6fd24af-cc7d-4360-8b8e-660859cca027",
+    "ns": "local.replset.election"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "5"
+   },
+   "doc": {
+    "md": {
+     "ns": "local.system.rollback.id",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "ptJql1inQPWaXLyv3pwqJQ==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-49bfcfcd-64d4-4345-8485-a60c893cd4a7"
+    },
+    "ident": "collection-3c60b95b-92bf-4716-8917-a3557e2f16ab",
+    "ns": "local.system.rollback.id"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "6"
+   },
+   "doc": {
+    "md": {
+     "ns": "admin.system.version",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "IU00rKmyS+mwzJqa0iXbGQ==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-28f67131-0ea6-4306-a927-a72d0382d927"
+    },
+    "ident": "collection-616832c5-3c5e-4aec-b74d-a0935c1b11db",
+    "ns": "admin.system.version"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "7"
+   },
+   "doc": {
+    "ident": "collection-f899cda9-443a-4929-8a0c-ffca5bd61a8d",
+    "idxIdent": {},
+    "md": {
+     "ns": "local.oplog.rs",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "mhU9G8gSQ92iME//VTREBg==",
+        "subType": "04"
+       }
+      },
+      "capped": true,
+      "size": {
+       "$numberInt": "201326592"
+      },
+      "autoIndexId": false
+     },
+     "indexes": []
+    },
+    "ns": "local.oplog.rs"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "8"
+   },
+   "doc": {
+    "md": {
+     "ns": "local.system.replset",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "NwCj+q0kT4aFJn4/d8BU7Q==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-a4365866-8733-4d5f-91e0-d2397ec3347a"
+    },
+    "ident": "collection-82d71be3-7014-4625-a52b-2eac08b468ed",
+    "ns": "local.system.replset"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "9"
+   },
+   "doc": {
+    "md": {
+     "ns": "local.replset.initialSyncId",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "2mULPM9CSL6SmJb5eSBX0Q==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-f90e781b-a6f3-43e4-aeba-ffe62e786b6a"
+    },
+    "ident": "collection-9ff848ef-061f-4f78-95cb-02ebbc137b6f",
+    "ns": "local.replset.initialSyncId"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "10"
+   },
+   "doc": {
+    "md": {
+     "ns": "config.transactions",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "womOP6/QQNeUcj0k+Bvaiw==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "parentLsid": {
+          "$numberInt": "1"
+         },
+         "_id.txnNumber": {
+          "$numberInt": "1"
+         },
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "parent_lsid",
+        "partialFilterExpression": {
+         "parentLsid": {
+          "$exists": true
+         }
+        }
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "parentLsid": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        },
+        "_id.txnNumber": {
+         "$binary": {
+          "base64": "AAA=",
+          "subType": "00"
+         }
+        },
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-4302c1bc-e9d7-46e2-ae12-3f2513a145f8",
+     "parent_lsid": "index-73e643c4-e165-4d4b-90ce-084688a380f9"
+    },
+    "ident": "collection-da7d6f84-b231-47c5-906a-5b68d3fdab8c",
+    "ns": "config.transactions"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "11"
+   },
+   "doc": {
+    "md": {
+     "ns": "config.image_collection",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "yyd1M+YPQ7O3u1o8ikj8oQ==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-e0ef71ad-6165-4eb7-b55f-a49d7fe3695e"
+    },
+    "ident": "collection-09bf3bc6-d5e3-4580-9837-ce3e62a16364",
+    "ns": "config.image_collection"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "12"
+   },
+   "doc": {
+    "md": {
+     "ns": "config.system.indexBuilds",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "dQD+tdoxRu6tjwnDIw671w==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-e1eebae4-95fb-46f6-8e19-b6570d6215dd"
+    },
+    "ident": "collection-803d5305-fde4-43f4-a38e-cec574aff637",
+    "ns": "config.system.indexBuilds"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "13"
+   },
+   "doc": {
+    "ident": "collection-ecee9547-1aec-49d1-9d9b-dc38398ea3b2",
+    "idxIdent": {},
+    "md": {
+     "ns": "config.system.preimages",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "s9Zoyol6SCKJnSF4O+yrUQ==",
+        "subType": "04"
+       }
+      },
+      "clusteredIndex": true
+     },
+     "indexes": []
+    },
+    "ns": "config.system.preimages"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "14"
+   },
+   "doc": {
+    "md": {
+     "ns": "config.analyzeShardKeySplitPoints",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "dlv0Tk8MSEygKOq2vY+1QQ==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "expireAt": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "AnalyzeShardKeySplitPointsTTLIndex",
+        "expireAfterSeconds": {
+         "$numberInt": "0"
+        }
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "expireAt": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-4d6bf7fb-c7ad-4892-b000-c2700449cec8",
+     "AnalyzeShardKeySplitPointsTTLIndex": "index-5c85281a-a5bb-401e-abb9-3b01e72ddd2f"
+    },
+    "ident": "collection-2c0317a7-aaa3-49b1-a86b-4174f8cb3833",
+    "ns": "config.analyzeShardKeySplitPoints"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "15"
+   },
+   "doc": {
+    "md": {
+     "ns": "admin.system.keys",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "n8iVnIdFTKq9DGkyOSoPHw==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-482c0bd8-d15c-4b72-8614-4ad8c8f969bf"
+    },
+    "ident": "collection-6802e734-b846-4089-8055-8218048d0480",
+    "ns": "admin.system.keys"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "16"
+   },
+   "doc": {
+    "md": {
+     "ns": "config.sampledQueries",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "3dsRESWWScCG34UVTPseXQ==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "expireAt": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "SampledQueriesTTLIndex",
+        "expireAfterSeconds": {
+         "$numberInt": "0"
+        }
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "expireAt": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-2d267f5f-cd53-460d-9435-3b31c685c2c8",
+     "SampledQueriesTTLIndex": "index-dea14282-e225-42c7-b75b-0371422b5649"
+    },
+    "ident": "collection-ee163295-5e83-4579-9227-117bdb4b367b",
+    "ns": "config.sampledQueries"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "17"
+   },
+   "doc": {
+    "md": {
+     "ns": "config.sampledQueriesDiff",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "zxeJ/b59Q06rVOOPF76QRw==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "expireAt": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "SampledQueriesDiffTTLIndex",
+        "expireAfterSeconds": {
+         "$numberInt": "0"
+        }
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "expireAt": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-5c63dcb0-b3bc-4cda-9067-46e1fea6e567",
+     "SampledQueriesDiffTTLIndex": "index-ae4d3b96-4ee1-4492-97a8-d35cd4202f4b"
+    },
+    "ident": "collection-9a0eba51-34a8-4ef4-8398-fae5b3820ecf",
+    "ns": "config.sampledQueriesDiff"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "18"
+   },
+   "doc": {
+    "md": {
+     "ns": "app.ks",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "O+EDGFEWQt61RyBc2KUNIA==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "v": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "v_1"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "v": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "v": {
+          "$numberInt": "-1"
+         }
+        },
+        "name": "v_-1"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "v": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-05ee5695-cac6-49bb-8526-dcc876d13cde",
+     "v_1": "index-86da3466-9afb-4ff0-b217-8de623bbd241",
+     "v_-1": "index-69c2bbab-75d7-4bb5-abaf-adb22ce91ae5"
+    },
+    "ident": "collection-5a8d33e5-17e9-4a96-b0fa-47283c714404",
+    "ns": "app.ks"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "19"
+   },
+   "doc": {
+    "md": {
+     "ns": "app.c",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "vq8RAULZQQq/ThTat9McJw==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "a": {
+          "$numberInt": "1"
+         },
+         "b": {
+          "$numberInt": "-1"
+         }
+        },
+        "name": "a_1_b_-1"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "a": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        },
+        "b": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "unique": true,
+        "key": {
+         "b": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "b_unique"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "b": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "t": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "t_multikey"
+       },
+       "ready": true,
+       "multikey": true,
+       "multikeyPaths": {
+        "t": {
+         "$binary": {
+          "base64": "AQ==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "a": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "a_partial",
+        "partialFilterExpression": {
+         "a": {
+          "$gt": {
+           "$numberInt": "0"
+          }
+         }
+        }
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "a": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "missing_field": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "sparse_idx",
+        "sparse": true
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "missing_field": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "created": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "ttl_idx",
+        "expireAfterSeconds": {
+         "$numberInt": "3600"
+        }
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "created": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "b": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "b_fr",
+        "collation": {
+         "locale": "fr",
+         "caseLevel": false,
+         "caseFirst": "off",
+         "strength": {
+          "$numberInt": "3"
+         },
+         "numericOrdering": false,
+         "alternate": "non-ignorable",
+         "maxVariable": "punct",
+         "normalization": false,
+         "backwards": false,
+         "version": "57.1"
+        }
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "b": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-3f6948b6-479f-43c9-b592-bc1549591ddf",
+     "a_1_b_-1": "index-6943fa32-c598-402e-90aa-7af330784e24",
+     "b_unique": "index-9b98c23c-c0cc-4f2e-8397-9b418dd27915",
+     "t_multikey": "index-43c61878-0c33-4436-a831-a959ead23956",
+     "a_partial": "index-890d5059-d708-4810-9f2f-bf5d85d99611",
+     "sparse_idx": "index-0e073409-6ec8-4702-830f-964fbc18420a",
+     "ttl_idx": "index-29924116-98eb-4207-a710-cedb14a43414",
+     "b_fr": "index-f204d39f-071f-4601-80c4-d041a44df412"
+    },
+    "ident": "collection-b2059d41-7c0f-425c-af42-36a78d9fef67",
+    "ns": "app.c"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "20"
+   },
+   "doc": {
+    "md": {
+     "ns": "app.kinds",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "urncGVQpREikXNRU39AiMA==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "h": "hashed"
+        },
+        "name": "h_hashed"
+       },
+       "ready": true,
+       "multikey": false
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "loc": "2dsphere"
+        },
+        "name": "loc_2dsphere",
+        "2dsphereIndexVersion": {
+         "$numberInt": "3"
+        }
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "loc": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "flat": "2d"
+        },
+        "name": "flat_2d"
+       },
+       "ready": true,
+       "multikey": false
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_fts": "text",
+         "_ftsx": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "body_text",
+        "weights": {
+         "body": {
+          "$numberInt": "1"
+         }
+        },
+        "default_language": "english",
+        "language_override": "language",
+        "textIndexVersion": {
+         "$numberInt": "3"
+        }
+       },
+       "ready": true,
+       "multikey": true
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "w.$**": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "w_wildcard"
+       },
+       "ready": true,
+       "multikey": false
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-d029bc9d-eb87-48be-b4b4-de78ae6f86ae",
+     "h_hashed": "index-1aba3d23-3d96-468a-947b-9ee8f6331a15",
+     "loc_2dsphere": "index-51c0c8dc-fe1c-4b10-b495-8d70cbbfd86d",
+     "flat_2d": "index-ede3f89e-5934-4dc0-9fb0-c6eee4f5b53e",
+     "body_text": "index-f711849a-19e0-40d2-b1b9-00f75232f37a",
+     "w_wildcard": "index-05895278-dcc8-45c0-800a-9f9c0cb32252"
+    },
+    "ident": "collection-22457500-f0b6-4bf2-ad99-1ca69cc806aa",
+    "ns": "app.kinds"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "21"
+   },
+   "doc": {
+    "md": {
+     "ns": "app.coll_ci",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "9ZLvwqbmSfOEjdqyUmOkFg==",
+        "subType": "04"
+       }
+      },
+      "collation": {
+       "locale": "en",
+       "caseLevel": false,
+       "caseFirst": "off",
+       "strength": {
+        "$numberInt": "2"
+       },
+       "numericOrdering": false,
+       "alternate": "non-ignorable",
+       "maxVariable": "punct",
+       "normalization": false,
+       "backwards": false,
+       "version": "57.1"
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_",
+        "collation": {
+         "locale": "en",
+         "caseLevel": false,
+         "caseFirst": "off",
+         "strength": {
+          "$numberInt": "2"
+         },
+         "numericOrdering": false,
+         "alternate": "non-ignorable",
+         "maxVariable": "punct",
+         "normalization": false,
+         "backwards": false,
+         "version": "57.1"
+        }
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "s": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "s_1",
+        "collation": {
+         "locale": "en",
+         "caseLevel": false,
+         "caseFirst": "off",
+         "strength": {
+          "$numberInt": "2"
+         },
+         "numericOrdering": false,
+         "alternate": "non-ignorable",
+         "maxVariable": "punct",
+         "normalization": false,
+         "backwards": false,
+         "version": "57.1"
+        }
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "s": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-02f563b8-35e1-496c-acdf-a2f065019c10",
+     "s_1": "index-119c54a1-dab6-49e4-83ff-9851de394960"
+    },
+    "ident": "collection-eb42229c-bbf8-4c08-a0b4-43dc685872a7",
+    "ns": "app.coll_ci"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "22"
+   },
+   "doc": {
+    "md": {
+     "ns": "app.capped",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "W6ar5a6TTzKTgj2bWi+Y4A==",
+        "subType": "04"
+       }
+      },
+      "capped": true,
+      "size": {
+       "$numberInt": "4096"
+      },
+      "max": {
+       "$numberInt": "3"
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-1ac906d8-ccd9-4f72-9813-720dfccf0edc"
+    },
+    "ident": "collection-51333350-d55c-4de8-bf6c-a724959d2018",
+    "ns": "app.capped"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "23"
+   },
+   "doc": {
+    "md": {
+     "ns": "app.clustered",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "fZTcnGE9R+W8e+9ojX2wbg==",
+        "subType": "04"
+       }
+      },
+      "clusteredIndex": {
+       "v": {
+        "$numberInt": "2"
+       },
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_",
+       "unique": true
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "x": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "x_1"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "x": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "x_1": "index-73858b6a-4724-4bfe-8f4a-c73469652765"
+    },
+    "ident": "collection-0ebb5510-4e85-468b-93be-d634178c8b54",
+    "ns": "app.clustered"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "24"
+   },
+   "doc": {
+    "md": {
+     "ns": "app.system.buckets.ts",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "kOGG5pHnRI+rJ54/m4FfnQ==",
+        "subType": "04"
+       }
+      },
+      "validator": {
+       "$jsonSchema": {
+        "bsonType": "object",
+        "required": [
+         "_id",
+         "control",
+         "data"
+        ],
+        "properties": {
+         "_id": {
+          "bsonType": "objectId"
+         },
+         "control": {
+          "bsonType": "object",
+          "required": [
+           "version",
+           "min",
+           "max"
+          ],
+          "properties": {
+           "version": {
+            "bsonType": "number"
+           },
+           "min": {
+            "bsonType": "object",
+            "required": [
+             "t"
+            ],
+            "properties": {
+             "t": {
+              "bsonType": "date"
+             }
+            }
+           },
+           "max": {
+            "bsonType": "object",
+            "required": [
+             "t"
+            ],
+            "properties": {
+             "t": {
+              "bsonType": "date"
+             }
+            }
+           },
+           "closed": {
+            "bsonType": "bool"
+           },
+           "count": {
+            "bsonType": "number",
+            "minimum": {
+             "$numberInt": "1"
+            }
+           }
+          },
+          "additionalProperties": false
+         },
+         "data": {
+          "bsonType": "object"
+         },
+         "meta": {}
+        },
+        "additionalProperties": false
+       }
+      },
+      "clusteredIndex": true,
+      "timeseries": {
+       "timeField": "t",
+       "metaField": "m",
+       "granularity": "seconds",
+       "bucketMaxSpanSeconds": {
+        "$numberInt": "3600"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "meta": {
+          "$numberInt": "1"
+         },
+         "control.min.t": {
+          "$numberInt": "1"
+         },
+         "control.max.t": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "m_1_t_1"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "meta": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        },
+        "control.min.t": {
+         "$binary": {
+          "base64": "AAAA",
+          "subType": "00"
+         }
+        },
+        "control.max.t": {
+         "$binary": {
+          "base64": "AAAA",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ],
+     "timeseriesBucketsMayHaveMixedSchemaData": false
+    },
+    "idxIdent": {
+     "m_1_t_1": "index-64e72346-08ad-42ff-8669-23fd4e141124"
+    },
+    "ident": "collection-0ad0aedd-3755-402a-a525-47bd6b341867",
+    "ns": "app.system.buckets.ts"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "25"
+   },
+   "doc": {
+    "md": {
+     "ns": "app.system.views",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "EtEldFfFRIiBR6sYETWx5g==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-66a2223d-9ae7-4d23-a9b5-8f5008df1b68"
+    },
+    "ident": "collection-c8678bfb-9445-4109-be0d-e4a8f955c079",
+    "ns": "app.system.views"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "26"
+   },
+   "doc": {
+    "md": {
+     "ns": "app.pre",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "Lri4q2b0RQaYRpTdSjchXA==",
+        "subType": "04"
+       }
+      },
+      "changeStreamPreAndPostImages": {
+       "enabled": true
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-5f659a9e-2897-4d2a-ada4-5b0b656e57b6"
+    },
+    "ident": "collection-ba00ffca-087c-431c-8957-cff14e07e4e5",
+    "ns": "app.pre"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "28"
+   },
+   "doc": {
+    "ns": "app.renamed",
+    "md": {
+     "ns": "app.renamed",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "EOurzuRJQkmtogUyUYTAZA==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "x": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "x_1"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "x": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-295f65b3-4c85-40fe-bd4e-ee92012e94c2",
+     "x_1": "index-011c6bcd-cc21-466b-8df9-80f81219d499"
+    },
+    "ident": "collection-fb5fb2c6-9130-4a0d-bdfd-082bf562834c"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "29"
+   },
+   "doc": {
+    "md": {
+     "ns": "admin.system.roles",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "e+frohQ3TWidRkiTq9+Iyg==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "unique": true,
+        "key": {
+         "role": {
+          "$numberInt": "1"
+         },
+         "db": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "role_1_db_1"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "role": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        },
+        "db": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-80875ec6-d9a4-424d-85fa-d3143903b154",
+     "role_1_db_1": "index-d31257ba-3998-41be-b546-2130d5c1ec58"
+    },
+    "ident": "collection-81379005-73ee-4e53-85bc-43528a0fb4f0",
+    "ns": "admin.system.roles"
+   }
+  },
+  {
+   "recordId": {
+    "$numberInt": "30"
+   },
+   "doc": {
+    "md": {
+     "ns": "admin.system.users",
+     "options": {
+      "uuid": {
+       "$binary": {
+        "base64": "OEYuuiCwTm+/IDCitKRC3A==",
+        "subType": "04"
+       }
+      }
+     },
+     "indexes": [
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "_id_"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "_id": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      },
+      {
+       "spec": {
+        "v": {
+         "$numberInt": "2"
+        },
+        "unique": true,
+        "key": {
+         "user": {
+          "$numberInt": "1"
+         },
+         "db": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "user_1_db_1"
+       },
+       "ready": true,
+       "multikey": false,
+       "multikeyPaths": {
+        "user": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        },
+        "db": {
+         "$binary": {
+          "base64": "AA==",
+          "subType": "00"
+         }
+        }
+       }
+      }
+     ]
+    },
+    "idxIdent": {
+     "_id_": "index-df397e6e-a9df-41d1-85dd-b3d3fe5c3f3c",
+     "user_1_db_1": "index-1adda2ae-9054-4976-9680-4b422a427873"
+    },
+    "ident": "collection-9f221ca9-115a-47f6-ae42-8df01a19ea14",
+    "ns": "admin.system.users"
+   }
+  }
+ ],
+ "size_storer": [
+  {
+   "ident": "table:_mdb_catalog",
+   "label": "table:_mdb_catalog",
+   "value": {
+    "numRecords": {
+     "$numberLong": "29"
+    },
+    "dataSize": {
+     "$numberLong": "16334"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-0ad0aedd-3755-402a-a525-47bd6b341867",
+   "label": "table:collection-0ad0aedd-3755-402a-a525-47bd6b341867",
+   "value": {
+    "numRecords": {
+     "$numberLong": "2"
+    },
+    "dataSize": {
+     "$numberLong": "530"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-0ebb5510-4e85-468b-93be-d634178c8b54",
+   "label": "table:collection-0ebb5510-4e85-468b-93be-d634178c8b54",
+   "value": {
+    "numRecords": {
+     "$numberLong": "3"
+    },
+    "dataSize": {
+     "$numberLong": "66"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-22457500-f0b6-4bf2-ad99-1ca69cc806aa",
+   "label": "table:collection-22457500-f0b6-4bf2-ad99-1ca69cc806aa",
+   "value": {
+    "numRecords": {
+     "$numberLong": "2"
+    },
+    "dataSize": {
+     "$numberLong": "347"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-3c60b95b-92bf-4716-8917-a3557e2f16ab",
+   "label": "table:collection-3c60b95b-92bf-4716-8917-a3557e2f16ab",
+   "value": {
+    "numRecords": {
+     "$numberLong": "1"
+    },
+    "dataSize": {
+     "$numberLong": "41"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-42f34386-c14c-4a74-9460-6806103ac160",
+   "label": "table:collection-42f34386-c14c-4a74-9460-6806103ac160",
+   "value": {
+    "numRecords": {
+     "$numberLong": "1"
+    },
+    "dataSize": {
+     "$numberLong": "14"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-51333350-d55c-4de8-bf6c-a724959d2018",
+   "label": "table:collection-51333350-d55c-4de8-bf6c-a724959d2018",
+   "value": {
+    "numRecords": {
+     "$numberLong": "3"
+    },
+    "dataSize": {
+     "$numberLong": "42"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-5a8d33e5-17e9-4a96-b0fa-47283c714404",
+   "label": "table:collection-5a8d33e5-17e9-4a96-b0fa-47283c714404",
+   "value": {
+    "numRecords": {
+     "$numberLong": "38"
+    },
+    "dataSize": {
+     "$numberLong": "1761"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-616832c5-3c5e-4aec-b74d-a0935c1b11db",
+   "label": "table:collection-616832c5-3c5e-4aec-b74d-a0935c1b11db",
+   "value": {
+    "numRecords": {
+     "$numberLong": "1"
+    },
+    "dataSize": {
+     "$numberLong": "59"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-6802e734-b846-4089-8055-8218048d0480",
+   "label": "table:collection-6802e734-b846-4089-8055-8218048d0480",
+   "value": {
+    "numRecords": {
+     "$numberLong": "2"
+    },
+    "dataSize": {
+     "$numberLong": "170"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-70eccbf9-28bc-47a4-8330-eeeca529c02e",
+   "label": "table:collection-70eccbf9-28bc-47a4-8330-eeeca529c02e",
+   "value": {
+    "numRecords": {
+     "$numberLong": "1"
+    },
+    "dataSize": {
+     "$numberLong": "71"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-73aaa77a-0398-412e-8fb6-eaf5ad88628b",
+   "label": "table:collection-73aaa77a-0398-412e-8fb6-eaf5ad88628b",
+   "value": {
+    "numRecords": {
+     "$numberLong": "1"
+    },
+    "dataSize": {
+     "$numberLong": "45"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-803d5305-fde4-43f4-a38e-cec574aff637",
+   "label": "table:collection-803d5305-fde4-43f4-a38e-cec574aff637",
+   "value": {
+    "numRecords": {
+     "$numberLong": "0"
+    },
+    "dataSize": {
+     "$numberLong": "0"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-81379005-73ee-4e53-85bc-43528a0fb4f0",
+   "label": "table:collection-81379005-73ee-4e53-85bc-43528a0fb4f0",
+   "value": {
+    "numRecords": {
+     "$numberLong": "1"
+    },
+    "dataSize": {
+     "$numberLong": "154"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-82d71be3-7014-4625-a52b-2eac08b468ed",
+   "label": "table:collection-82d71be3-7014-4625-a52b-2eac08b468ed",
+   "value": {
+    "numRecords": {
+     "$numberLong": "1"
+    },
+    "dataSize": {
+     "$numberLong": "537"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-9f221ca9-115a-47f6-ae42-8df01a19ea14",
+   "label": "table:collection-9f221ca9-115a-47f6-ae42-8df01a19ea14",
+   "value": {
+    "numRecords": {
+     "$numberLong": "1"
+    },
+    "dataSize": {
+     "$numberLong": "349"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-9ff848ef-061f-4f78-95cb-02ebbc137b6f",
+   "label": "table:collection-9ff848ef-061f-4f78-95cb-02ebbc137b6f",
+   "value": {
+    "numRecords": {
+     "$numberLong": "1"
+    },
+    "dataSize": {
+     "$numberLong": "49"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-a6fd24af-cc7d-4360-8b8e-660859cca027",
+   "label": "table:collection-a6fd24af-cc7d-4360-8b8e-660859cca027",
+   "value": {
+    "numRecords": {
+     "$numberLong": "1"
+    },
+    "dataSize": {
+     "$numberLong": "60"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-adebbe5c-7131-4740-bdb5-3a9dd25cb405",
+   "label": "table:collection-adebbe5c-7131-4740-bdb5-3a9dd25cb405",
+   "value": {
+    "numRecords": {
+     "$numberLong": "1"
+    },
+    "dataSize": {
+     "$numberLong": "3696"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-b2059d41-7c0f-425c-af42-36a78d9fef67",
+   "label": "table:collection-b2059d41-7c0f-425c-af42-36a78d9fef67",
+   "value": {
+    "numRecords": {
+     "$numberLong": "7"
+    },
+    "dataSize": {
+     "$numberLong": "339"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-ba00ffca-087c-431c-8957-cff14e07e4e5",
+   "label": "table:collection-ba00ffca-087c-431c-8957-cff14e07e4e5",
+   "value": {
+    "numRecords": {
+     "$numberLong": "1"
+    },
+    "dataSize": {
+     "$numberLong": "21"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-c8678bfb-9445-4109-be0d-e4a8f955c079",
+   "label": "table:collection-c8678bfb-9445-4109-be0d-e4a8f955c079",
+   "value": {
+    "numRecords": {
+     "$numberLong": "2"
+    },
+    "dataSize": {
+     "$numberLong": "245"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-da7d6f84-b231-47c5-906a-5b68d3fdab8c",
+   "label": "table:collection-da7d6f84-b231-47c5-906a-5b68d3fdab8c",
+   "value": {
+    "numRecords": {
+     "$numberLong": "1"
+    },
+    "dataSize": {
+     "$numberLong": "187"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-eb42229c-bbf8-4c08-a0b4-43dc685872a7",
+   "label": "table:collection-eb42229c-bbf8-4c08-a0b4-43dc685872a7",
+   "value": {
+    "numRecords": {
+     "$numberLong": "3"
+    },
+    "dataSize": {
+     "$numberLong": "83"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-ecee9547-1aec-49d1-9d9b-dc38398ea3b2",
+   "label": "table:collection-ecee9547-1aec-49d1-9d9b-dc38398ea3b2",
+   "value": {
+    "numRecords": {
+     "$numberLong": "1"
+    },
+    "dataSize": {
+     "$numberLong": "133"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-f899cda9-443a-4929-8a0c-ffca5bd61a8d",
+   "label": "table:collection-f899cda9-443a-4929-8a0c-ffca5bd61a8d",
+   "value": {
+    "numRecords": {
+     "$numberLong": "146"
+    },
+    "dataSize": {
+     "$numberLong": "44530"
+    }
+   }
+  },
+  {
+   "ident": "table:collection-fb5fb2c6-9130-4a0d-bdfd-082bf562834c",
+   "label": "table:collection-fb5fb2c6-9130-4a0d-bdfd-082bf562834c",
+   "value": {
+    "numRecords": {
+     "$numberLong": "1"
+    },
+    "dataSize": {
+     "$numberLong": "14"
+    }
+   }
+  }
+ ],
+ "collections": {
+  "admin.system.keys": {
+   "rows": {
+    "$numberInt": "2"
+   },
+   "key_sample": [
+    "81",
+    "82"
+   ]
+  },
+  "admin.system.roles": {
+   "rows": {
+    "$numberInt": "1"
+   },
+   "key_sample": [
+    "81"
+   ]
+  },
+  "admin.system.users": {
+   "rows": {
+    "$numberInt": "1"
+   },
+   "key_sample": [
+    "81"
+   ]
+  },
+  "admin.system.version": {
+   "rows": {
+    "$numberInt": "1"
+   },
+   "key_sample": [
+    "81"
+   ]
+  },
+  "app.c": {
+   "rows": {
+    "$numberInt": "7"
+   },
+   "key_sample": [
+    "81",
+    "82",
+    "83"
+   ]
+  },
+  "app.capped": {
+   "rows": {
+    "$numberInt": "3"
+   },
+   "key_sample": [
+    "83",
+    "84",
+    "85"
+   ]
+  },
+  "app.clustered": {
+   "rows": {
+    "$numberInt": "3"
+   },
+   "key_sample": [
+    "2b02",
+    "3c7300",
+    "64650000000000000000000002"
+   ]
+  },
+  "app.coll_ci": {
+   "rows": {
+    "$numberInt": "3"
+   },
+   "key_sample": [
+    "81",
+    "82",
+    "83"
+   ]
+  },
+  "app.kinds": {
+   "rows": {
+    "$numberInt": "2"
+   },
+   "key_sample": [
+    "81",
+    "82"
+   ]
+  },
+  "app.ks": {
+   "rows": {
+    "$numberInt": "38"
+   },
+   "key_sample": [
+    "81",
+    "82",
+    "83"
+   ]
+  },
+  "app.pre": {
+   "rows": {
+    "$numberInt": "1"
+   },
+   "key_sample": [
+    "81"
+   ]
+  },
+  "app.renamed": {
+   "rows": {
+    "$numberInt": "1"
+   },
+   "key_sample": [
+    "81"
+   ]
+  },
+  "app.system.buckets.ts": {
+   "rows": {
+    "$numberInt": "2"
+   },
+   "key_sample": [
+    "64659200801c79797edb8b326a",
+    "64659200801c79797edb8b326b"
+   ]
+  },
+  "app.system.views": {
+   "rows": {
+    "$numberInt": "2"
+   },
+   "key_sample": [
+    "81",
+    "82"
+   ]
+  },
+  "config.analyzeShardKeySplitPoints": {
+   "rows": {
+    "$numberInt": "0"
+   },
+   "key_sample": []
+  },
+  "config.image_collection": {
+   "rows": {
+    "$numberInt": "0"
+   },
+   "key_sample": []
+  },
+  "config.sampledQueries": {
+   "rows": {
+    "$numberInt": "0"
+   },
+   "key_sample": []
+  },
+  "config.sampledQueriesDiff": {
+   "rows": {
+    "$numberInt": "0"
+   },
+   "key_sample": []
+  },
+  "config.system.indexBuilds": {
+   "rows": {
+    "$numberInt": "0"
+   },
+   "key_sample": []
+  },
+  "config.system.preimages": {
+   "rows": {
+    "$numberInt": "1"
+   },
+   "key_sample": [
+    "465a6e7355554944005a10042eb8b8ab66f44506984694dd4a37215c82747300826afedc9b0000000f1e6170706c794f7073496e646578002900"
+   ]
+  },
+  "config.transactions": {
+   "rows": {
+    "$numberInt": "1"
+   },
+   "key_sample": [
+    "81"
+   ]
+  },
+  "local.oplog.rs": {
+   "rows": {
+    "$numberInt": "146"
+   },
+   "key_sample": [
+    "e86afedc97ffffdfc1",
+    "e86afedc97ffffdfc3",
+    "e86afedc97ffffdfc4"
+   ]
+  },
+  "local.replset.election": {
+   "rows": {
+    "$numberInt": "1"
+   },
+   "key_sample": [
+    "81"
+   ]
+  },
+  "local.replset.initialSyncId": {
+   "rows": {
+    "$numberInt": "1"
+   },
+   "key_sample": [
+    "81"
+   ]
+  },
+  "local.replset.minvalid": {
+   "rows": {
+    "$numberInt": "1"
+   },
+   "key_sample": [
+    "81"
+   ]
+  },
+  "local.replset.oplogTruncateAfterPoint": {
+   "rows": {
+    "$numberInt": "1"
+   },
+   "key_sample": [
+    "81"
+   ]
+  },
+  "local.startup_log": {
+   "rows": {
+    "$numberInt": "1"
+   },
+   "key_sample": [
+    "81"
+   ]
+  },
+  "local.system.replset": {
+   "rows": {
+    "$numberInt": "1"
+   },
+   "key_sample": [
+    "81"
+   ]
+  },
+  "local.system.rollback.id": {
+   "rows": {
+    "$numberInt": "1"
+   },
+   "key_sample": [
+    "81"
+   ]
+  }
+ },
+ "index_tables": {
+  "app.c/_id_": [
+   {
+    "key": "2904",
+    "value": "0008"
+   },
+   {
+    "key": "2b0204",
+    "value": "0010"
+   },
+   {
+    "key": "2b0404",
+    "value": "0018"
+   },
+   {
+    "key": "2b0604",
+    "value": "0020"
+   },
+   {
+    "key": "2b0804",
+    "value": "0028"
+   },
+   {
+    "key": "2b0a04",
+    "value": "0030"
+   },
+   {
+    "key": "2bc604",
+    "value": "0038"
+   }
+  ],
+  "app.c/a_1_b_-1": [
+   {
+    "key": "29c38cccff040020",
+    "value": ""
+   },
+   {
+    "key": "29c38ccfff040008",
+    "value": ""
+   },
+   {
+    "key": "2b02c38ccbff040028",
+    "value": ""
+   },
+   {
+    "key": "2b02c38cceff040010",
+    "value": ""
+   },
+   {
+    "key": "2b04c38ccaff040030",
+    "value": ""
+   },
+   {
+    "key": "2b04c38ccdff040018",
+    "value": ""
+   },
+   {
+    "key": "2b12eb040038",
+    "value": ""
+   }
+  ],
+  "app.c/a_partial": [
+   {
+    "key": "2b02040010",
+    "value": ""
+   },
+   {
+    "key": "2b02040028",
+    "value": ""
+   },
+   {
+    "key": "2b04040018",
+    "value": ""
+   },
+   {
+    "key": "2b04040030",
+    "value": ""
+   },
+   {
+    "key": "2b12040038",
+    "value": ""
+   }
+  ],
+  "app.c/b_fr": [
+   {
+    "key": "14040038",
+    "value": ""
+   },
+   {
+    "key": "3c4d120106010600040008",
+    "value": ""
+   },
+   {
+    "key": "3c4d140106010600040010",
+    "value": ""
+   },
+   {
+    "key": "3c4d160106010600040018",
+    "value": ""
+   },
+   {
+    "key": "3c4d180106010600040020",
+    "value": ""
+   },
+   {
+    "key": "3c4d1a0106010600040028",
+    "value": ""
+   },
+   {
+    "key": "3c4d1c0106010600040030",
+    "value": ""
+   }
+  ],
+  "app.c/b_unique": [
+   {
+    "key": "14040038",
+    "value": ""
+   },
+   {
+    "key": "3c733000040008",
+    "value": ""
+   },
+   {
+    "key": "3c733100040010",
+    "value": ""
+   },
+   {
+    "key": "3c733200040018",
+    "value": ""
+   },
+   {
+    "key": "3c733300040020",
+    "value": ""
+   },
+   {
+    "key": "3c733400040028",
+    "value": ""
+   },
+   {
+    "key": "3c733500040030",
+    "value": ""
+   }
+  ],
+  "app.c/sparse_idx": [],
+  "app.c/t_multikey": [
+   {
+    "key": "14040038",
+    "value": ""
+   },
+   {
+    "key": "29040008",
+    "value": ""
+   },
+   {
+    "key": "2b02040008",
+    "value": ""
+   },
+   {
+    "key": "2b02040010",
+    "value": ""
+   },
+   {
+    "key": "2b04040010",
+    "value": ""
+   },
+   {
+    "key": "2b04040018",
+    "value": ""
+   },
+   {
+    "key": "2b06040018",
+    "value": ""
+   },
+   {
+    "key": "2b06040020",
+    "value": ""
+   },
+   {
+    "key": "2b08040020",
+    "value": ""
+   },
+   {
+    "key": "2b08040028",
+    "value": ""
+   },
+   {
+    "key": "2b0a040028",
+    "value": ""
+   },
+   {
+    "key": "2b0a040030",
+    "value": ""
+   },
+   {
+    "key": "2b0c040030",
+    "value": ""
+   }
+  ],
+  "app.c/ttl_idx": [
+   {
+    "key": "14040008",
+    "value": ""
+   },
+   {
+    "key": "14040010",
+    "value": ""
+   },
+   {
+    "key": "14040018",
+    "value": ""
+   },
+   {
+    "key": "14040020",
+    "value": ""
+   },
+   {
+    "key": "14040028",
+    "value": ""
+   },
+   {
+    "key": "14040030",
+    "value": ""
+   },
+   {
+    "key": "14040038",
+    "value": ""
+   }
+  ],
+  "app.capped/_id_": [
+   {
+    "key": "2b0404",
+    "value": "0018"
+   },
+   {
+    "key": "2b0604",
+    "value": "0020"
+   },
+   {
+    "key": "2b0804",
+    "value": "0028"
+   }
+  ],
+  "app.clustered/x_1": [
+   {
+    "key": "1404646500000000000000000000020d",
+    "value": ""
+   },
+   {
+    "key": "2b02042b0202",
+    "value": ""
+   },
+   {
+    "key": "2b04043c730003",
+    "value": ""
+   }
+  ],
+  "app.coll_ci/_id_": [
+   {
+    "key": "2b0204",
+    "value": "0008"
+   },
+   {
+    "key": "2b0404",
+    "value": "0010"
+   },
+   {
+    "key": "2b0604",
+    "value": "0018"
+   }
+  ],
+  "app.coll_ci/s_1": [
+   {
+    "key": "3c2947473f31010900040008",
+    "value": ""
+   },
+   {
+    "key": "3c2947473f31010900040010",
+    "value": ""
+   },
+   {
+    "key": "3c312b314331014588448a0600040018",
+    "value": ""
+   }
+  ],
+  "app.kinds/_id_": [
+   {
+    "key": "2b0204",
+    "value": "0008"
+   },
+   {
+    "key": "2b0404",
+    "value": "0010"
+   }
+  ],
+  "app.kinds/body_text": [
+   {
+    "key": "3c62726f776e002aff95555555555554040008",
+    "value": "02"
+   },
+   {
+    "key": "3c646f67002aff95555555555554040010",
+    "value": "02"
+   },
+   {
+    "key": "3c666f78002aff95555555555554040008",
+    "value": "02"
+   },
+   {
+    "key": "3c6a756d70002aff95555555555554040010",
+    "value": "02"
+   },
+   {
+    "key": "3c6c617a69002aff95555555555554040010",
+    "value": "02"
+   },
+   {
+    "key": "3c717569636b002aff95555555555554040008",
+    "value": "02"
+   }
+  ],
+  "app.kinds/flat_2d": [
+   {
+    "key": "5a08806ad4ad4ad4ad4000040010",
+    "value": ""
+   },
+   {
+    "key": "5a0880c003521703521000040008",
+    "value": ""
+   }
+  ],
+  "app.kinds/h_hashed": [
+   {
+    "key": "20e5ca5461ec9c7f25040010",
+    "value": "02"
+   },
+   {
+    "key": "32946ab1ba4181b554040008",
+    "value": "02"
+   }
+  ],
+  "app.kinds/loc_2dsphere": [
+   {
+    "key": "201384b1db336fa071040008",
+    "value": "02"
+   },
+   {
+    "key": "328fccdc3d444a7656040010",
+    "value": "02"
+   }
+  ],
+  "app.kinds/w_wildcard": [
+   {
+    "key": "3c772e78002b02040008",
+    "value": ""
+   },
+   {
+    "key": "3c772e78003c7300040010",
+    "value": ""
+   },
+   {
+    "key": "3c772e792e7a002b04040008",
+    "value": ""
+   }
+  ],
+  "app.ks/_id_": [
+   {
+    "key": "2904",
+    "value": "0008"
+   },
+   {
+    "key": "2b0204",
+    "value": "0010"
+   },
+   {
+    "key": "2b0404",
+    "value": "0018"
+   },
+   {
+    "key": "2b0604",
+    "value": "0020"
+   },
+   {
+    "key": "2b0804",
+    "value": "0028"
+   },
+   {
+    "key": "2b0a04",
+    "value": "0030"
+   },
+   {
+    "key": "2b0c04",
+    "value": "0038"
+   },
+   {
+    "key": "2b0e04",
+    "value": "0040"
+   },
+   {
+    "key": "2b1004",
+    "value": "0048"
+   },
+   {
+    "key": "2b1204",
+    "value": "0050"
+   },
+   {
+    "key": "2b1404",
+    "value": "0058"
+   },
+   {
+    "key": "2b1604",
+    "value": "0060"
+   },
+   {
+    "key": "2b1804",
+    "value": "0068"
+   },
+   {
+    "key": "2b1a04",
+    "value": "0070"
+   },
+   {
+    "key": "2b1c04",
+    "value": "0078"
+   },
+   {
+    "key": "2b1e04",
+    "value": "0080"
+   },
+   {
+    "key": "2b2004",
+    "value": "0088"
+   },
+   {
+    "key": "2b2204",
+    "value": "0090"
+   },
+   {
+    "key": "2b2404",
+    "value": "0098"
+   },
+   {
+    "key": "2b2604",
+    "value": "00a0"
+   },
+   {
+    "key": "2b2804",
+    "value": "00a8"
+   },
+   {
+    "key": "2b2a04",
+    "value": "00b0"
+   },
+   {
+    "key": "2b2c04",
+    "value": "00b8"
+   },
+   {
+    "key": "2b2e04",
+    "value": "00c0"
+   },
+   {
+    "key": "2b3004",
+    "value": "00c8"
+   },
+   {
+    "key": "2b3204",
+    "value": "00d0"
+   },
+   {
+    "key": "2b3404",
+    "value": "00d8"
+   },
+   {
+    "key": "2b3604",
+    "value": "00e0"
+   },
+   {
+    "key": "2b3804",
+    "value": "00e8"
+   },
+   {
+    "key": "2b3a04",
+    "value": "00f0"
+   },
+   {
+    "key": "2b3c04",
+    "value": "00f8"
+   },
+   {
+    "key": "2b3e04",
+    "value": "0100"
+   },
+   {
+    "key": "2b4004",
+    "value": "0108"
+   },
+   {
+    "key": "2b4204",
+    "value": "0110"
+   },
+   {
+    "key": "2b4404",
+    "value": "0118"
+   },
+   {
+    "key": "2b4604",
+    "value": "0120"
+   },
+   {
+    "key": "2b4804",
+    "value": "0128"
+   },
+   {
+    "key": "2c07d004",
+    "value": "0130"
+   }
+  ],
+  "app.ks/v_-1": [
+   {
+    "key": "0f040128",
+    "value": ""
+   },
+   {
+    "key": "5f998a919c8b969091d7d68482ff040120",
+    "value": ""
+   },
+   {
+    "key": "739e9dd49cff96ff040118",
+    "value": ""
+   },
+   {
+    "key": "7dfffffffafffffff9040110",
+    "value": ""
+   },
+   {
+    "key": "877ffffe909bca3377040100",
+    "value": ""
+   },
+   {
+    "key": "87800000497c5ecbff040108",
+    "value": ""
+   },
+   {
+    "key": "900400f8",
+    "value": ""
+   },
+   {
+    "key": "910400f0",
+    "value": ""
+   },
+   {
+    "key": "9b9afffffffffffffffffffffe0400e8",
+    "value": ""
+   },
+   {
+    "key": "a5effbcfcecdcccbcac9c8c7c69e9d9c9b9a990400e0",
+    "value": ""
+   },
+   {
+    "key": "a5fdfffefd0400d8",
+    "value": ""
+   },
+   {
+    "key": "b9af9effafffff0400d0",
+    "value": ""
+   },
+   {
+    "key": "b9e187ffd4fdc386ffc385ffff0400c8",
+    "value": ""
+   },
+   {
+    "key": "b9ff0400c0",
+    "value": ""
+   },
+   {
+    "key": "c33c5619435dff0400b8",
+    "value": ""
+   },
+   {
+    "key": "c39eff009dff0400b0",
+    "value": ""
+   },
+   {
+    "key": "c39eff0400a8",
+    "value": ""
+   },
+   {
+    "key": "c3ff0400a0",
+    "value": ""
+   },
+   {
+    "key": "cc0000000000000000040068",
+    "value": "01"
+   },
+   {
+    "key": "cc83903786efff14c7040078",
+    "value": "01"
+   },
+   {
+    "key": "cebffffffffffffd040040",
+    "value": "02"
+   },
+   {
+    "key": "d100000001040030",
+    "value": ""
+   },
+   {
+    "key": "d4fd040028",
+    "value": ""
+   },
+   {
+    "key": "d4fd040038",
+    "value": "02"
+   },
+   {
+    "key": "d4fd040050",
+    "value": "01"
+   },
+   {
+    "key": "d4fd040080",
+    "value": "07"
+   },
+   {
+    "key": "d4fd040088",
+    "value": "81fb"
+   },
+   {
+    "key": "d5007fffffffffffff040048",
+    "value": "01"
+   },
+   {
+    "key": "d50119999999999999040090",
+    "value": "81fb"
+   },
+   {
+    "key": "d6040020",
+    "value": ""
+   },
+   {
+    "key": "d6040058",
+    "value": "03"
+   },
+   {
+    "key": "d80a040018",
+    "value": ""
+   },
+   {
+    "key": "e0ffffffffffffffff040070",
+    "value": "01"
+   },
+   {
+    "key": "e1040060",
+    "value": "01"
+   },
+   {
+    "key": "e1040098",
+    "value": "03"
+   },
+   {
+    "key": "eb040010",
+    "value": ""
+   },
+   {
+    "key": "eb040130",
+    "value": ""
+   },
+   {
+    "key": "f5040008",
+    "value": ""
+   }
+  ],
+  "app.ks/v_1": [
+   {
+    "key": "0a040008",
+    "value": ""
+   },
+   {
+    "key": "14040010",
+    "value": ""
+   },
+   {
+    "key": "14040130",
+    "value": ""
+   },
+   {
+    "key": "1e040060",
+    "value": "01"
+   },
+   {
+    "key": "1e040098",
+    "value": "03"
+   },
+   {
+    "key": "1f0000000000000000040070",
+    "value": "01"
+   },
+   {
+    "key": "27f5040018",
+    "value": ""
+   },
+   {
+    "key": "29040020",
+    "value": ""
+   },
+   {
+    "key": "29040058",
+    "value": "03"
+   },
+   {
+    "key": "2afee6666666666666040090",
+    "value": "81fb"
+   },
+   {
+    "key": "2aff80000000000000040048",
+    "value": "01"
+   },
+   {
+    "key": "2b02040028",
+    "value": ""
+   },
+   {
+    "key": "2b02040038",
+    "value": "02"
+   },
+   {
+    "key": "2b02040050",
+    "value": "01"
+   },
+   {
+    "key": "2b02040080",
+    "value": "07"
+   },
+   {
+    "key": "2b02040088",
+    "value": "81fb"
+   },
+   {
+    "key": "2efffffffe040030",
+    "value": ""
+   },
+   {
+    "key": "3140000000000002040040",
+    "value": "02"
+   },
+   {
+    "key": "337c6fc8791000eb38040078",
+    "value": "01"
+   },
+   {
+    "key": "33ffffffffffffffff040068",
+    "value": "01"
+   },
+   {
+    "key": "3c000400a0",
+    "value": ""
+   },
+   {
+    "key": "3c61000400a8",
+    "value": ""
+   },
+   {
+    "key": "3c6100ff62000400b0",
+    "value": ""
+   },
+   {
+    "key": "3cc3a9e6bca2000400b8",
+    "value": ""
+   },
+   {
+    "key": "46000400c0",
+    "value": ""
+   },
+   {
+    "key": "461e78002b023c79003c7a00000400c8",
+    "value": ""
+   },
+   {
+    "key": "465061005000000400d0",
+    "value": ""
+   },
+   {
+    "key": "5a020001020400d8",
+    "value": ""
+   },
+   {
+    "key": "5a1004303132333435363738396162636465660400e0",
+    "value": ""
+   },
+   {
+    "key": "646500000000000000000000010400e8",
+    "value": ""
+   },
+   {
+    "key": "6e0400f0",
+    "value": ""
+   },
+   {
+    "key": "6f0400f8",
+    "value": ""
+   },
+   {
+    "key": "787fffffb683a13400040108",
+    "value": ""
+   },
+   {
+    "key": "788000016f6435cc88040100",
+    "value": ""
+   },
+   {
+    "key": "820000000500000006040110",
+    "value": ""
+   },
+   {
+    "key": "8c61622b63006900040118",
+    "value": ""
+   },
+   {
+    "key": "a066756e6374696f6e28297b7d00040120",
+    "value": ""
+   },
+   {
+    "key": "f0040128",
+    "value": ""
+   }
+  ],
+  "app.pre/_id_": [
+   {
+    "key": "2b0204",
+    "value": "0008"
+   }
+  ],
+  "app.renamed/_id_": [
+   {
+    "key": "2b0204",
+    "value": "0008"
+   }
+  ],
+  "app.renamed/x_1": [
+   {
+    "key": "14040008",
+    "value": ""
+   }
+  ],
+  "app.system.buckets.ts/m_1_t_1": [
+   {
+    "key": "461e73002900788000018cc251f400788000018cc25203a00464659200801c79797edb8b326b0d",
+    "value": ""
+   },
+   {
+    "key": "461e73002b0200788000018cc251f400788000018cc25207880464659200801c79797edb8b326a0d",
+    "value": ""
+   }
+  ],
+  "app.system.views/_id_": [
+   {
+    "key": "3c6170702e74730004",
+    "value": "0008"
+   },
+   {
+    "key": "3c6170702e765f766965770004",
+    "value": "0010"
+   }
+  ]
+ },
+ "keystring_corpus": [
+  "minkey",
+  "null",
+  "int_neg",
+  "int_zero",
+  "int_one",
+  "int_big",
+  "long_one",
+  "long_big",
+  "double_half",
+  "double_one",
+  "double_neg_zero",
+  "double_nan",
+  "double_inf",
+  "double_ninf",
+  "double_big",
+  "decimal_one",
+  "decimal_onepointzero",
+  "decimal_frac",
+  "decimal_nan",
+  "string_empty",
+  "string_a",
+  "string_nul",
+  "string_utf8",
+  "object_empty",
+  "object",
+  "array_empty_in_obj",
+  "bindata",
+  "bindata_uuid",
+  "objectid",
+  "bool_false",
+  "bool_true",
+  "date",
+  "date_neg",
+  "timestamp",
+  "regex",
+  "code",
+  "maxkey"
+ ],
+ "mongod_version": "db version v8.2.11",
+ "fcv": {
+  "version": "8.2"
+ },
+ "scenario": [
+  "ks: one doc per BSON type, ascending and descending index on v",
+  "c: compound, unique, multikey, partial, sparse, TTL indexes",
+  "kinds: hashed, 2dsphere, 2d, text, wildcard",
+  "coll_ci: collection default collation, collated index",
+  "capped: size 4096, max 3, five inserts",
+  "clustered: clustered on _id, secondary index",
+  "ts: time-series, metaField m, granularity seconds",
+  "pre: changeStreamPreAndPostImages, one update",
+  "v_view: view on c",
+  "todrop dropped; old renamed to renamed",
+  "users: role r1, user u1 (SCRAM-SHA-256)",
+  "txn: one committed transaction"
+ ]
+}

@@ -1,0 +1,936 @@
+{
+ "wiredtiger_turtle_version": "WiredTiger 11.2.0: (November 10, 2022)",
+ "storage_bson": null,
+ "tables": [
+  {
+   "uri": "table:secantus_collections",
+   "label": "secantus_collections",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SS",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SS",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_documents_sh0",
+   "label": "secantus_documents_sh0",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SSq",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "lz4",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SSq",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_documents_sh10",
+   "label": "secantus_documents_sh10",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SSq",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "lz4",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SSq",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_documents_sh11",
+   "label": "secantus_documents_sh11",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SSq",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "lz4",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SSq",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_documents_sh12",
+   "label": "secantus_documents_sh12",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SSq",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "lz4",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SSq",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_documents_sh13",
+   "label": "secantus_documents_sh13",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SSq",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "lz4",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SSq",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_documents_sh14",
+   "label": "secantus_documents_sh14",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SSq",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "lz4",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SSq",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_documents_sh15",
+   "label": "secantus_documents_sh15",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SSq",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "lz4",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SSq",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_documents_sh3",
+   "label": "secantus_documents_sh3",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SSq",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "lz4",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SSq",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_documents_sh4",
+   "label": "secantus_documents_sh4",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SSq",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "lz4",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SSq",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_documents_sh5",
+   "label": "secantus_documents_sh5",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SSq",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "lz4",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SSq",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_documents_sh6",
+   "label": "secantus_documents_sh6",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SSq",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "lz4",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SSq",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_documents_sh7",
+   "label": "secantus_documents_sh7",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SSq",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "lz4",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SSq",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_documents_sh8",
+   "label": "secantus_documents_sh8",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SSq",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "lz4",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SSq",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_documents_sh9",
+   "label": "secantus_documents_sh9",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SSq",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "lz4",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SSq",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_drop_tombstones",
+   "label": "secantus_drop_tombstones",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SS",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SS",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_index_build_side",
+   "label": "secantus_index_build_side",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "u",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_index_builds",
+   "label": "secantus_index_builds",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "u",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "u",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=true)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_index_entries",
+   "label": "secantus_index_entries",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SSSu",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SSSu",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_indexes",
+   "label": "secantus_indexes",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SSS",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SSS",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_natural_seq",
+   "label": "secantus_natural_seq",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SSu",
+    "value_format": "q",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SSu",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "q",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_oplog",
+   "label": "secantus_oplog",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "lz4",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "128KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=true)",
+    "prefix_compression": "false",
+    "split_pct": "100",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_oplog_meta",
+   "label": "secantus_oplog_meta",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "S",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "S",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=true)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_oplog_sh0",
+   "label": "secantus_oplog_sh0",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "lz4",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "128KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=true)",
+    "prefix_compression": "false",
+    "split_pct": "100",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_oplog_sh1",
+   "label": "secantus_oplog_sh1",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "q",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "lz4",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "q",
+    "leaf_page_max": "128KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=true)",
+    "prefix_compression": "false",
+    "split_pct": "100",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_prepared_xacts",
+   "label": "secantus_prepared_xacts",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "S",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "S",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_profile_settings",
+   "label": "secantus_profile_settings",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "S",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "S",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_role_seq",
+   "label": "secantus_role_seq",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SS",
+    "value_format": "q",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SS",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "q",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_roles",
+   "label": "secantus_roles",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SS",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SS",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_size_storer",
+   "label": "secantus_size_storer",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SS",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SS",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=true)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_unique_keys",
+   "label": "secantus_unique_keys",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SSSu",
+    "value_format": "q",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SSSu",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "q",
+    "write_timestamp_usage": "none"
+   }
+  },
+  {
+   "uri": "table:secantus_users",
+   "label": "secantus_users",
+   "table_config": {
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "key_format": "SS",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   },
+   "file_config": {
+    "allocation_size": "4KB",
+    "app_metadata": "",
+    "assert": "(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off)",
+    "block_compressor": "",
+    "checksum": "on",
+    "internal_page_max": "4KB",
+    "key_format": "SS",
+    "leaf_page_max": "32KB",
+    "leaf_value_max": "0",
+    "log": "(enabled=false)",
+    "prefix_compression": "false",
+    "split_pct": "90",
+    "value_format": "u",
+    "write_timestamp_usage": "none"
+   }
+  }
+ ],
+ "catalog": null,
+ "size_storer": null,
+ "collections": null,
+ "index_tables": null,
+ "keystring_corpus": [
+  "minkey",
+  "null",
+  "int_neg",
+  "int_zero",
+  "int_one",
+  "int_big",
+  "long_one",
+  "long_big",
+  "double_half",
+  "double_one",
+  "double_neg_zero",
+  "double_nan",
+  "double_inf",
+  "double_ninf",
+  "double_big",
+  "decimal_one",
+  "decimal_onepointzero",
+  "decimal_frac",
+  "decimal_nan",
+  "string_empty",
+  "string_a",
+  "string_nul",
+  "string_utf8",
+  "object_empty",
+  "object",
+  "array_empty_in_obj",
+  "bindata",
+  "bindata_uuid",
+  "objectid",
+  "bool_false",
+  "bool_true",
+  "date",
+  "date_neg",
+  "timestamp",
+  "regex",
+  "code",
+  "maxkey"
+ ],
+ "server_version": "secantusd-mdb 0.5.3-beta.198",
+ "fcv": {
+  "version": "8.2"
+ },
+ "scenario": [
+  "ks: one doc per BSON type, ascending and descending index on v",
+  "c: compound, unique, multikey, partial, sparse, TTL indexes",
+  "kinds: two documents for the special index kinds",
+  "FAILED kinds: hashed index: OperationFailure: hashed indexes (field \"h\") are not supported by the Rust storage engine yet, full error: {'ok': 0.0, 'errmsg': 'hashed indexes (field \"h\") are not supported by the Rust storage engine yet', 'code': 67",
+  "kinds: 2dsphere index",
+  "kinds: 2d index",
+  "FAILED kinds: text index: OperationFailure: text indexes (field \"body\") are not supported by the Rust storage engine yet, full error: {'ok': 0.0, 'errmsg': 'text indexes (field \"body\") are not supported by the Rust storage engine yet', 'code': ",
+  "kinds: wildcard index",
+  "coll_ci: collection default collation, collated index",
+  "capped: size 4096, max 3, five inserts",
+  "clustered: clustered on _id, secondary index",
+  "ts: time-series, metaField m, granularity seconds",
+  "pre: changeStreamPreAndPostImages, one update",
+  "v_view: view on c",
+  "todrop dropped; old renamed to renamed",
+  "users: role r1, user u1 (SCRAM-SHA-256)",
+  "txn: one committed transaction"
+ ]
+}

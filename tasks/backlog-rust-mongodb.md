@@ -2992,3 +2992,53 @@ change-stream tail), which `tests/conftest.py`'s faulthandler watchdog exists to
 dump. Worth checking whether that watchdog's timeout actually fires INSIDE the
 30-minute job cap on macOS; if it fires later than the cap, it can never
 produce the dump it exists for.
+
+## The storage model is not mongod's (tasks/mongod-storage-model-plan.md, 2026-11-19)
+
+- [ ] **A store is not one mongod can open, and mongod's stores are not ones
+      we can open.** Every collection shares 16 `secantus_documents_shN`
+      tables and every index one `secantus_index_entries` table, with our
+      own catalog and our own index-key bytes; mongod 8.2.11 keeps one
+      `collection-<UUID>` table per collection and one `index-<UUID>` table
+      per index in KeyString, under `_mdb_catalog`, `sizeStorer` and
+      `storage.bson` (the full layout:
+      `tests/fixtures/storage_model/mongod-8.2.11-layout.json`). Also, our
+      WiredTiger is built `WT_STANDALONE_BUILD=ON`, which stamps files
+      version 2.1; mongod refuses them outright. Decided (Joe, 2026-11-19):
+      move to mongod's model, both directions, with mongod started as a
+      replica-set member; the phases are in the plan, and the tests below
+      close one by one as they land (files and catalog: phases 1-2; one
+      table per collection and index: 3-4; both opens: 7).
+      Backlog-ID: RM-723
+      Verify: tests/backlog/test_rm_storage_model.py::test_store_has_mongods_files, tests/backlog/test_rm_storage_model.py::test_one_table_per_collection_and_per_index, tests/backlog/test_rm_storage_model.py::test_mongod_opens_a_secantus_store, tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_mongod_store
+- [ ] **There is no `shutdown` command.** mongod 8.2.11 stops on
+      `db.adminCommand({shutdown: 1})`: the connection closes and the
+      process exits cleanly. `secantusd-mdb` answers CommandNotFound (59)
+      and keeps running, so SIGTERM is its only clean stop; mongod's own
+      tooling (and phase 7 of the storage plan) stops a server this way.
+      Found measuring phase 0c.
+      Backlog-ID: RM-724
+      Verify: tests/backlog/test_rm_storage_model.py::test_shutdown_command_stops_the_server
+
+## Found in CI on 2026-11-19
+
+- [ ] **A killed retryable update batch's retry once disagreed with what
+      the kill left applied (seen once in CI).** `tests/mongod_live/
+      test_interrupts.py::test_a_killed_batch_keeps_the_statements_before`
+      failed on PR #2887's `mdb-binary (live)` job (2026-11-19, run
+      44516075354, job 135532292126; that PR changed no server code). The
+      kill's reply matched mongod 8.2.11's, but after it the retry's
+      `retriedStmtIds` was not the statements already applied, and the
+      collection did not end with each of the fifty statements applied once
+      (`(reply, True, False, False)` against mongod's `(..., True, True,
+      True)`). Either the retry re-ran a statement the killed batch had
+      committed -- a retryable write applied twice -- or it skipped one.
+      Suspected mechanism, not proven: `retry_batch`
+      (`crates/secantus-commands/src/session.rs`) drops the statements a
+      batch noted when its reply is not ok, so a killed batch leaves the
+      in-memory registry without the statements it committed, and only the
+      per-statement `config.transactions` row and the oplog say what ran.
+      Not reproduced here: 6 of 6 passes on a release build, 8 of 8 on the
+      debug build under eight CPU burners (macOS arm64); CI is Linux x86_64.
+      Backlog-ID: RM-725
+      Verify: none -- intermittent: CI's Linux debug build met it once, and twenty local runs did not; the live test above is what catches it
