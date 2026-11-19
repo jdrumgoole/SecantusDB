@@ -12,11 +12,11 @@
 </div>
 <div class="box" style="flex:0.9;align-self:stretch;display:flex;flex-direction:column;justify-content:center;gap:8px;background:var(--ink);border-color:var(--ink);color:var(--paper);padding:24px;"><p class="t" style="font-size:28px;">MongoDB wire protocol</p><p style="color:var(--softdark);font-size:24px;">OP_MSG over TCP</p></div>
 <p class="arrow">→</p>
-<div class="box" style="padding:24px;"><p class="t" style="font-size:28px;">secantus-wire</p><p style="font-size:24px;">commands</p></div>
+<div class="box" style="flex:1;height:180px;box-sizing:border-box;display:flex;flex-direction:column;justify-content:center;gap:4px;padding:24px;"><p class="t" style="font-size:28px;">secantus-wire</p><p style="font-size:24px;">commands</p></div>
 <p class="arrow">→</p>
-<div class="box" style="padding:24px;"><p class="t" style="font-size:28px;">secantus-core</p><p style="font-size:24px;">query, update, aggregate</p></div>
+<div class="box" style="flex:1;height:180px;box-sizing:border-box;display:flex;flex-direction:column;justify-content:center;gap:4px;padding:24px;"><p class="t" style="font-size:28px;">secantus-core</p><p style="font-size:24px;">query, update, aggregate</p></div>
 <p class="arrow">→</p>
-<div class="box wt" style="padding:24px;flex:1.15;"><p class="t" style="font-size:28px;">secantus-storage</p><p style="font-size:24px;">WiredTiger</p></div>
+<div class="box wt" style="flex:1;height:180px;box-sizing:border-box;display:flex;flex-direction:column;justify-content:center;gap:4px;padding:24px;"><p class="t" style="font-size:28px;">secantus-storage</p><p style="font-size:24px;">WiredTiger</p></div>
 </div>
 <aside><p><b>The drivers exist:</b> every official MongoDB driver speaks the same wire protocol. We run the official drivers' own test suites unmodified: Python, Node.js, Rust, Go and C# on the slide, plus Java, Kotlin, C, C++, Ruby and PHP. Their authors have already written thousands of tests describing what a server must do.</p><p><b>The engine exists:</b> WiredTiger gives us checkpoints, transactions and durability. <b>The gap</b> is the server in between, and all the hard work is in being faithful.</p><p><b>Walk the stack, left to right:</b> OP_MSG arrives over TCP; secantus-wire turns it into commands; secantus-core runs the query, update and aggregation engines; secantus-storage talks to WiredTiger.</p><p class="time">Time: ~2½ min</p></aside>
 </section>
