@@ -58,19 +58,27 @@ proven in ONE direction and never concurrently (measured 2026-09-18, pinned in
 
 The import package is `secantus`; the public Python class is `SecantusDBServer`.
 
-**Distribution: crates, tagged binaries, and one PyPI wheel of both Rust
+**Distribution: crates, tagged binaries, and the PyPI wheels of both Rust
 servers.** The `secantus-mdb` crate (`secantusd-mdb`, `secantus_mdb::Server`)
 plus `secantusdb-v*` binaries, and the `secantus-pg` crate plus `secantusd-pg-v*`
 binaries. Since 2026-11-16 (Joe) the `SecantusDB` project on PyPI is back,
 with different contents: `publish-pypi.yml` repackages the released
-`secantusd-mdb` and the newest released `secantusd-pg` into one
-`py3-none` wheel per platform (Linux x86_64, macOS arm64), versioned as the
-MongoDB server (`0.5.3-beta.196` -> `0.5.3b196`), with the `secantusdb`
-launcher (`MongoServer` / `PostgresServer`; `packaging/pypi/`). It runs
+`secantusd-mdb`, the in-process extension `_secantus_server` built beside it,
+and the newest released `secantusd-pg` into two wheels per platform (Linux
+x86_64, macOS arm64), versioned as the MongoDB server (`0.5.3-beta.196` ->
+`0.5.3b196`), with the `secantusdb` launcher (`packaging/pypi/`). It runs
 after every `secantusdb-v*` release; nothing is compiled in it. The wheel
-carries **no Python server**, and no other PyPI project exists. The
-embedded `RustServer` / `PgServer` handles remain a SOURCE-BUILD tool for
-this repo's tests -- never document them as something `pip install` provides.
+carries **no Python server**, and no other PyPI project exists.
+**`MongoServer()` runs the MongoDB server in-process by default** (Joe,
+2026-11-19, `tasks/plan-python-embedded.md`): the `cp310-abi3` wheel installs
+the extension as `secantusdb._secantus_server`; `MongoServer(embedded=False)`
+runs the binary as a child process, and the `py3-none` fallback wheel (for
+free-threaded CPython) raises a named error rather than silently falling
+back. `PostgresServer` stays a child process. This retires the old rule that
+the embedded handles were a source-build tool never to be documented as
+something `pip install` provides: the in-process `MongoServer` is exactly
+that. `RustServer` itself, and `PgServer`, are still documented only for
+source builds.
 
 Internal references to `fongo` or `fongodb` (earlier names, dropped to avoid brand clashes) are stale -- flag and rename to `secantus` (or `SecantusDB` for the brand form).
 

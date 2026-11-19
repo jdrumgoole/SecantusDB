@@ -1,12 +1,21 @@
 """Build the SecantusDB PyPI wheels from the Rust servers' release archives.
 
-The wheel compiles nothing. It repackages the binaries the two release
-workflows already built, smoke-tested and attached to their GitHub Releases:
-``secantusd-mdb`` from a ``secantusdb-v*`` release and ``secantusd-pg`` from a
-``secantusd-pg-v*`` release. One wheel per platform, tagged ``py3-none``
-(the launcher is pure Python), with the platform tag read from the binaries
-themselves: the newest glibc symbol version they need (Linux), or the
-minimum macOS version in their Mach-O header.
+The wheels compile nothing. They repackage what the two release workflows
+already built, smoke-tested and attached to their GitHub Releases:
+``secantusd-mdb`` and the in-process extension ``_secantus_server`` from a
+``secantusdb-v*`` release, and ``secantusd-pg`` from a ``secantusd-pg-v*``
+release. Two wheels per platform:
+
+* ``cp310-abi3-<platform>``: both binaries and the extension, installed as
+  ``secantusdb/_secantus_server.abi3.so``, so ``MongoServer()`` runs in
+  process. pip picks it on every CPython 3.10+ that supports the stable ABI.
+* ``py3-none-<platform>``: both binaries, no extension. pip picks it only
+  where abi3 cannot load (free-threaded CPython), and there ``MongoServer()``
+  raises, naming ``embedded=False``.
+
+The platform tag is read from the native files themselves: the newest glibc
+symbol version they need (Linux), or the minimum macOS version in their
+Mach-O header.
 
 The wheel's version is the MongoDB server's, converted to PEP 440
 (``0.5.3-beta.196`` -> ``0.5.3b196``).
@@ -97,8 +106,14 @@ def platform_tag(target: str, binaries: list[bytes]) -> str:
     return f"macosx_{major}_{minor if major < 11 else 0}_{arch}"
 
 
+# The extension's file name inside its release archive and in the wheel. PyO3
+# names the init function after the last name component, so it imports as
+# `secantusdb._secantus_server` with no rename.
+EXTENSION = "_secantus_server.abi3.so"
+
+
 def read_archive(path: Path, binary_name: str, legacy_name: str | None = None) -> bytes:
-    """The named binary from one release archive, after checking its sha256."""
+    """The named file from one release archive, after checking its sha256."""
     expected_sha = path.with_name(path.name + ".sha256")
     data = path.read_bytes()
     if expected_sha.exists():
@@ -160,13 +175,14 @@ def _zip_add(zf: zipfile.ZipFile, arcname: str, data: bytes, executable: bool = 
     zf.writestr(info, data)
 
 
-def build_wheel(
+def build_wheels(
     target: str,
     assets: Path,
     out: Path,
     mongodb_version: str,
     postgres_version: str,
-) -> Path:
+) -> list[Path]:
+    """The platform's two wheels: with the extension, then the fallback."""
     # Archives before 0.5.3-beta.197 named the MongoDB binary `secantusd-rs`;
     # the wheel installs it as `secantusd-mdb` either way.
     mdb = read_archive(
@@ -175,16 +191,38 @@ def build_wheel(
         legacy_name="secantusd-rs",
     )
     pg = read_archive(assets / f"secantusd-pg-{postgres_version}-{target}.tar.gz", "secantusd-pg")
+    # Required: the launcher runs in process by default, so a release with
+    # no extension archive has no wheel to give CPython.
+    ext = read_archive(assets / f"secantusdb-ext-{mongodb_version}-{target}.tar.gz", EXTENSION)
+    binaries = {"secantusd-mdb": mdb, "secantusd-pg": pg}
+    return [
+        _build_wheel(target, out, mongodb_version, postgres_version, binaries, extension=ext),
+        _build_wheel(target, out, mongodb_version, postgres_version, binaries, extension=None),
+    ]
+
+
+def _build_wheel(
+    target: str,
+    out: Path,
+    mongodb_version: str,
+    postgres_version: str,
+    binaries: dict[str, bytes],
+    extension: bytes | None,
+) -> Path:
     version = pep440(mongodb_version)
-    tag = f"py3-none-{platform_tag(target, [mdb, pg])}"
+    native = [*binaries.values(), *([extension] if extension is not None else [])]
+    python_abi = "cp310-abi3" if extension is not None else "py3-none"
+    tag = f"{python_abi}-{platform_tag(target, native)}"
     dist_info = f"secantusdb-{version}.dist-info"
 
     files: list[tuple[str, bytes, bool]] = []
     for src in sorted(PACKAGE.iterdir()):
         if src.is_file() and src.suffix in (".py", ".typed"):
             files.append((f"secantusdb/{src.name}", src.read_bytes(), False))
-    files.append(("secantusdb/bin/secantusd-mdb", mdb, True))
-    files.append(("secantusdb/bin/secantusd-pg", pg, True))
+    if extension is not None:
+        files.append((f"secantusdb/{EXTENSION}", extension, True))
+    for name, data in binaries.items():
+        files.append((f"secantusdb/bin/{name}", data, True))
     # The licences come from the checkout the workflow runs from: archives
     # before 2026-10 carry no LICENSE-ICU.
     repo = HERE.parent.parent
@@ -232,10 +270,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--target", action="append", choices=sorted(TARGETS))
     args = parser.parse_args(argv)
     for target in args.target or sorted(TARGETS):
-        wheel = build_wheel(
+        for wheel in build_wheels(
             target, args.assets, args.out, args.mongodb_version, args.postgres_version
-        )
-        print(wheel)
+        ):
+            print(wheel)
     return 0
 
 

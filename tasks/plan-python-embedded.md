@@ -1,6 +1,9 @@
 # Plan: an in-process `MongoServer` in the PyPI wheel
 
-Status: **agreed, 2026-11-19** (Joe answered the four open questions the same day; see the end). Asked for by Joe on 2026-11-19: "make it
+Status: **agreed, 2026-11-19** (Joe answered the four open questions the same day; see the end).
+Phases 1-4 built on branch `python-embedded` (2026-11-19); phase 5 is the
+first release through it. See "As built" at the end for where the build
+departs from the text below. Asked for by Joe on 2026-11-19: "make it
 the default for python, the subprocess launcher should be an option".
 
 ## Goal
@@ -241,3 +244,46 @@ All four recommendations taken:
 4. **On-target two-stage PGO** for the extension, sequenced after phase 1.
    Phase 1 ships without PGO (LTO only) rather than wait for it.
 
+
+## As built (2026-11-19)
+
+Phases 1-4 in one PR, since phases 2 and 3 must ship together and phase 1's
+dry run needs the workflow on a branch anyway. Where the build differs from
+the design above, and why:
+
+- **The daemon's defaults, not the handle's.** `RustServer`'s own defaults
+  are the repo tests' (no replica set, test commands on, TTL monitor off).
+  The launcher passes `replica_set_name="secantus"` (Joe, 2026-11-19: "We
+  need it to be a replica set for change streams"),
+  `enable_test_commands=False` (a new `RustServer` argument, default `True`
+  so the repo's tests are unchanged) and `ttl_sweep_seconds=60`, so
+  `embedded=True` and `embedded=False` behave alike.
+- **`stop()` closes the store and raises on failure.** `RustServer.stop()`
+  now closes the WiredTiger connection explicitly, in the daemon's order, and
+  raises if the final checkpoint fails (the daemon's RM-189 behaviour).
+  Without it, an in-process failure would have been a stderr line, and
+  reopening the same path in one process would depend on drop order. It
+  closes only when it holds the last reference: a connection thread that
+  outlived the bounded drain makes `stop()` raise rather than close
+  WiredTiger under it.
+- **Fork.** `uri` stays readable in a forked child, because connecting to
+  the parent's server over TCP is a legitimate use and touches no
+  WiredTiger state. Leaving the parent's `with` block in the child is a
+  no-op, because unwinding a `with` block is not a request to stop. Only an
+  explicit `stop()` (or `start()`) in the child raises `ForkedServerError`.
+  The child's copy of the native handle is leaked with `mem::forget`
+  (`_abandon_after_fork`), so its drop at interpreter exit never joins
+  threads that do not exist.
+- **Old tags cannot be repackaged.** `build_wheels.py` requires the
+  extension archive, so `publish-pypi.yml` dispatched on a tag from before
+  this change fails by name. It used to be able to repackage any tag.
+- **Logging.** The extension installs no Rust logger, so the server's `log`
+  records are not printed in-process. Its `eprintln!` lines and WiredTiger's
+  messages go to the process's stderr. The docstring says only that much.
+  Routing the records into Python's `logging` (pyo3-log) is a follow-on.
+
+Rehearsed locally (macOS arm64, 2026-11-19): `build_wheels.py` over the real
+`secantusdb-v0.5.3-beta.198` and `secantusd-pg-v0.1.0-beta.20` archives plus
+a locally built extension archive. uv resolved CPython 3.10 and 3.12 to the
+abi3 wheel and free-threaded 3.13t to the fallback, and `smoke_test.py`
+passed on all three.

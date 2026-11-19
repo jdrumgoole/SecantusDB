@@ -23,9 +23,10 @@ single-node replica set named `secantus` and enables test commands.
 
 ## From Python
 
-`pip install SecantusDB` provides the `secantusdb` launcher, which starts the
-real `secantusd-mdb` binary as a subprocess on a free port, with a temporary
-data directory unless you pass `storage_path`:
+`pip install SecantusDB` provides the `secantusdb` package. Its
+`MongoServer` runs the MongoDB server **inside your Python process**, the way
+SQLite does, on a free port and with a temporary data directory unless you
+pass `storage_path`:
 
 ```python
 from pymongo import MongoClient
@@ -36,13 +37,55 @@ with MongoServer() as server:
     client["mydb"]["users"].insert_one({"_id": 1, "name": "Joe"})
 ```
 
-### The `RustServer` handle (source builds only; not part of `pip install`)
+"In-process" means no child process, not no socket. The server's threads
+serve a real loopback TCP port, and the driver connects to `server.uri` as it
+would to `mongod`; Python starts and stops the server and is never in the
+request path. The server behaves as the `secantusd-mdb` daemon does by
+default: it advertises the single-node `secantus` replica set (so change
+streams and transactions work), test commands are off, and TTL-indexed
+documents expire every 60 seconds.
 
-A checkout built with the storage-engine flag
+`MongoServer(embedded=False)` runs the bundled `secantusd-mdb` binary as a
+child process instead, with the same API.
+
+What running in-process changes:
+
+1. **One process's fate.** A WiredTiger panic or an abort in the server ends
+   your Python process, where a child process would have died alone. That is
+   what a database inside your process means (SQLite's model too).
+   `embedded=False` is the answer when you need the isolation.
+2. **Fork.** The server's threads do not survive `fork()`. A forked child can
+   still connect to the parent's server through `server.uri`, and leaving the
+   parent's `with` block there does nothing, but `server.stop()` in the child
+   raises `ForkedServerError`. Use the `spawn` start method for
+   `multiprocessing` (the default on macOS), or start the server after
+   forking.
+3. **Several servers** can run in one process on different `storage_path`s,
+   each with its own WiredTiger connection. Two on the same path are refused
+   by WiredTiger's lock, as two daemons are.
+4. **Start-up is a library call**: no process to spawn, no banner to wait for.
+   A server that cannot start (a port in use, a locked store) raises
+   `ServerStartError`. `stop()` closes the store, WiredTiger's final
+   checkpoint, and raises if that fails.
+
+In-process, the server writes its messages to your process's stderr, and
+`server.output` is empty.
+
+The in-process server needs CPython 3.10 or later with the stable ABI. On a
+Python without it, chiefly free-threaded CPython (3.13t, 3.14t), pip installs
+a wheel without the extension: there `MongoServer()` raises
+`ServerStartError` naming `embedded=False`, which works. It never falls back
+to a child process on its own. The PostgreSQL server, `PostgresServer`, runs
+as a child process.
+
+### The `RustServer` handle (source builds)
+
+`MongoServer` drives `RustServer`, the extension's lifecycle handle, which a
+checkout built with the storage-engine flag
 (`SKBUILD_CMAKE_DEFINE=SECANTUS_BUILD_STORAGE_ENGINE=ON uv sync --extra dev`)
-still has the embedded Python handle, which the project's own tests and
-gauges use. The accept loop runs on a GIL-released native thread, and Python
-holds only a thin lifecycle handle:
+exposes as the top-level `_secantus_server` module. The project's own tests
+and gauges use it directly. The accept loop runs on a GIL-released native
+thread, and Python holds only a thin lifecycle handle:
 
 ```python
 import _secantus_server
@@ -86,6 +129,11 @@ RustServer(
                                    # stable checkpoint (mongod's split;
                                    # the default, see below)
     checkpoint_seconds=None,       # stable-checkpoint cadence (default 60)
+    ttl_sweep_seconds=None,        # TTL monitor cadence; None = switched
+                                   # off until setParameter turns it on
+    noop_heartbeat_seconds=None,   # noop oplog heartbeat; None = none
+    enable_test_commands=True,     # configureFailPoint & co.; mongod's
+                                   # default (and MongoServer's) is False
 )
 ```
 
@@ -107,7 +155,7 @@ recorded in the store and always wins on reopen).
 Properties and methods: `srv.address` → `(host, port)` tuple, `srv.version`
 → the embedded crate version (also surfaced over the wire as
 `buildInfo.secantusVersion`), `srv.stop()` → drain connections and close
-storage. The module attribute `_secantus_server.__version__` carries the
+storage, raising `RuntimeError` if WiredTiger's final checkpoint fails. The module attribute `_secantus_server.__version__` carries the
 same version string.
 
 ## Tests under pytest-xdist

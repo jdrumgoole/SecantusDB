@@ -57,7 +57,14 @@ def macos_deps(path: Path) -> list[str]:
         ["otool", "-L", str(path)], capture_output=True, text=True, check=True
     ).stdout
     # First line is the binary's own name; the rest are "\t<path> (compat ...)".
-    return [ln.strip().split(" ", 1)[0] for ln in out.splitlines()[1:] if ln.strip()]
+    deps = [ln.strip().split(" ", 1)[0] for ln in out.splitlines()[1:] if ln.strip()]
+    # A dylib (the in-process Python extension) also lists its OWN install
+    # name, the build directory's path. It is an identity, not a dependency:
+    # nothing loads it by that name (Python dlopens the file it found).
+    own = subprocess.run(
+        ["otool", "-D", str(path)], capture_output=True, text=True, check=True
+    ).stdout.splitlines()[1:]
+    return [d for d in deps if d not in {ln.strip() for ln in own}]
 
 
 def linux_deps(path: Path) -> list[str]:

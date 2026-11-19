@@ -1273,6 +1273,7 @@ jobs:
           tests/test_failpoint_app_name.py
           tests/test_change_stream_open_resume_token.py
           tests/test_max_time_always_timeout.py
+          tests/test_pypi_inprocess_server.py
           -o addopts= -p no:cacheprovider -q
 
       - name: Rust-server concurrency invariants (#451 stress suite)

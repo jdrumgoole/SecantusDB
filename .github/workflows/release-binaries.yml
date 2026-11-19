@@ -14,6 +14,15 @@
 #     links it via `SECANTUS_WT_INCLUDE` / `SECANTUS_WT_LIB`. Reusing that path
 #     (rather than a bespoke WT build) keeps the cmake/*.py patches in force.
 #
+# THE IN-PROCESS EXTENSION: on Linux and macOS the job also builds
+#   `_secantus_server` (crates/secantus-server-py), the PyO3 extension that runs
+#   the same server inside a Python process, from the same commit and the same
+#   WiredTiger, and attaches it as `secantusdb-ext-<version>-<target>.tar.gz`.
+#   publish-pypi.yml packs it into the `cp310-abi3` wheel, where it is the
+#   default `MongoServer()` (tasks/plan-python-embedded.md). MongoDB only
+#   (`--no-default-features` drops the PostgreSQL half), and no PGO yet: LTO
+#   only, as the crate's release profile sets.
+#
 # TAG SCHEME: the Rust server versions from `crates/*/Cargo.toml` (e.g.
 #   `0.5.3-beta.21`), so its binary releases tag as `secantusdb-v<crate-version>`.
 #   (The retired Python package's `vX.Y.Z` tags are a separate namespace.) When
@@ -46,6 +55,10 @@ on:
       tag:
         description: "Existing secantusdb-v* tag to (re)build binaries for"
         required: true
+      dry_run:
+        description: "Build, check and keep the archives on the run only: attach nothing to the Release"
+        type: boolean
+        default: false
 
 permissions:
   contents: write # create / upload assets to the GitHub Release
@@ -451,6 +464,82 @@ jobs:
           py=python3; command -v "$py" >/dev/null 2>&1 || py=python
           "$py" .github/scripts/check_binary_deps.py "${{ matrix.os }}" "$BIN"
 
+      - name: Build the in-process extension (_secantus_server)
+        # The PyPI wheel's in-process MongoServer. Built here, beside the
+        # binary, so the two come from one commit and one WiredTiger build,
+        # and publish-pypi.yml compiles nothing. Its position is load-bearing
+        # for the same reason the static-compressor step's is: on Linux it
+        # must see SECANTUS_WT_STATIC_COMPRESSORS, so the extension, like the
+        # binary, needs nothing beyond libc.
+        #
+        # `--no-default-features`: MongoDB only. The PostgreSQL half would
+        # carry this commit's PostgreSQL server, not the released one the
+        # wheel's secantusd-pg comes from (plan, decision 1).
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          wt=$(ls -d "$PWD"/build/*/wt-build 2>/dev/null | head -1)
+          export SECANTUS_WT_INCLUDE="$wt/include" SECANTUS_WT_LIB="$wt"
+          target=${{ matrix.target }}
+          cargo build --release --locked --no-default-features --target "$target" \
+            --manifest-path crates/secantus-server-py/Cargo.toml
+          if [ "${{ matrix.os }}" = "macos" ]; then
+            built="crates/secantus-server-py/target/$target/release/lib_secantus_server.dylib"
+          else
+            built="crates/secantus-server-py/target/$target/release/lib_secantus_server.so"
+          fi
+          mkdir -p ext-out
+          ext="ext-out/_secantus_server.abi3.so"
+          cp "$built" "$ext"
+          # Local symbols only: the module's exported PyInit__secantus_server
+          # must survive, so neither platform gets a full strip.
+          if [ "${{ matrix.os }}" = "macos" ]; then strip -x "$ext"; else strip --strip-unneeded "$ext"; fi
+          ls -l "$ext"
+          echo "EXT=$ext" >> "$GITHUB_ENV"
+
+      - name: Load-check the extension (import, start, pymongo round trip, stop)
+        # Building a shared library and being able to load it are different
+        # questions: the glibc "cannot allocate memory in static TLS block"
+        # failure only ever showed at import. So import it as the wheel will
+        # (`secantusdb._secantus_server`, inside a package), on the oldest
+        # Python its cp310-abi3 tag claims and a current one, each in a clean
+        # interpreter, and serve one document.
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          check="$RUNNER_TEMP/extcheck"
+          rm -rf "$check"; mkdir -p "$check/secantusdb"
+          : > "$check/secantusdb/__init__.py"
+          cp "$EXT" "$check/secantusdb/"
+          cat > "$check/load_check.py" <<'PY'
+          import sys
+          import tempfile
+
+          sys.path.insert(0, sys.argv[1])
+          import pymongo
+          from secantusdb import _secantus_server
+
+          with tempfile.TemporaryDirectory() as store:
+              server = _secantus_server.RustServer(store, 0, replica_set_name="secantus")
+              client = pymongo.MongoClient(server.uri, serverSelectionTimeoutMS=10000)
+              client.check.things.insert_one({"x": 1})
+              assert client.check.things.find_one({}, {"_id": 0}) == {"x": 1}
+              client.close()
+              server.stop()
+          print(f"extension OK on Python {sys.version.split()[0]}: {_secantus_server.__version__}")
+          PY
+          for py in 3.10 3.13; do
+            uv run --no-project --isolated --python "$py" --with pymongo \
+              python -I "$check/load_check.py" "$check"
+          done
+
+      - name: Check the extension's dynamic dependencies
+        if: matrix.os != 'windows'
+        shell: bash
+        run: python3 .github/scripts/check_binary_deps.py "${{ matrix.os }}" "$EXT"
+
       - name: Package the archive + checksum
         shell: bash
         run: |
@@ -483,6 +572,19 @@ jobs:
           tar -czf "$stem.tar.gz" "$stem"
           sha "$stem.tar.gz" > "$stem.tar.gz.sha256"
 
+          # The in-process extension, in an archive of its own: the binary's
+          # archive is what a user downloads to run a server, and a Python
+          # extension has no business in it. Same licences: it links the same
+          # WiredTiger, ICU, snappy and zstd.
+          if [ -n "${EXT:-}" ]; then
+            ext_stem="secantusdb-ext-${VERSION}-${{ matrix.target }}"
+            mkdir -p "$ext_stem"
+            cp "$EXT" "$ext_stem/_secantus_server.abi3.so"
+            cp "$stem"/LICENSE* "$ext_stem/"
+            tar -czf "$ext_stem.tar.gz" "$ext_stem"
+            sha "$ext_stem.tar.gz" > "$ext_stem.tar.gz.sha256"
+          fi
+
           # Windows also gets a .zip: it's what Explorer opens on a double-click,
           # whereas .tar.gz needs the command line. The .tar.gz is kept for
           # parity with the other targets and for anything globbing the existing
@@ -495,7 +597,8 @@ jobs:
           ls -l "$stem".*
 
       # Keep the artifacts on the run too, so a workflow_dispatch dry-run can be
-      # inspected without (or before) touching a Release.
+      # inspected without (or before) touching a Release. `secantusdb-*` also
+      # matches the extension's `secantusdb-ext-*` archive.
       - name: Upload run artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
@@ -508,6 +611,10 @@ jobs:
           if-no-files-found: error
 
       - name: Attach to the GitHub Release
+        # A dispatched dry run attaches nothing: rebuilding an existing tag
+        # would otherwise replace assets a published wheel was built from.
+        # On a tag push `inputs` is empty, so this always attaches.
+        if: ${{ !inputs.dry_run }}
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
         with:
           tag_name: ${{ env.TAG }}
@@ -519,7 +626,8 @@ jobs:
           # NB `fail_on_unmatched_files: true` above applies per-pattern, so the
           # .zip globs would fail the non-Windows targets that never produce one.
           # Each target attaches only what it built; the Release accumulates all
-          # of them across the matrix.
+          # of them across the matrix. `secantusdb-*.tar.gz` takes the
+          # extension's `secantusdb-ext-*` archive too, where one was built.
           files: |
             secantusdb-*.tar.gz
             secantusdb-*.tar.gz.sha256
@@ -529,7 +637,7 @@ jobs:
       # so until 2026-11-17 no release carried one although the docs promised
       # it. Attach it in a Windows-only step instead.
       - name: Attach the Windows .zip to the GitHub Release
-        if: matrix.os == 'windows'
+        if: matrix.os == 'windows' && !inputs.dry_run
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64  # v3.0.3
         with:
           tag_name: ${{ env.TAG }}

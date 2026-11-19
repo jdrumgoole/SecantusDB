@@ -1,12 +1,19 @@
 name: Publish to PyPI
 
-# The SecantusDB PyPI wheel: both Rust servers, prebuilt, for Linux x86_64 and
-# macOS arm64. Nothing is compiled here. The wheel repackages the archives the
+# The SecantusDB PyPI wheels: both Rust servers, prebuilt, for Linux x86_64 and
+# macOS arm64. Nothing is compiled here. The wheels repackage the archives the
 # two binary-release workflows already built, smoke-tested and attached to
 # their GitHub Releases (packaging/pypi/build_wheels.py):
 #
-#   secantusd-mdb  from the secantusdb-v* release that triggered this run
+#   secantusd-mdb and the in-process extension (_secantus_server)
+#                 from the secantusdb-v* release that triggered this run
 #   secantusd-pg  from the newest secantusd-pg-v* release
+#
+# Two wheels per platform: `cp310-abi3` carries the extension, so
+# `MongoServer()` runs in process; `py3-none` does not, for the Pythons abi3
+# cannot serve (free-threaded CPython), where `MongoServer()` raises and
+# `embedded=False` runs the binary. A release from before the extension
+# archive existed cannot be packaged by this builder.
 #
 # The wheel's version is the MongoDB server's (0.5.3-beta.196 -> 0.5.3b196).
 #
@@ -88,6 +95,7 @@ jobs:
           set -euo pipefail
           mkdir -p assets
           for target in x86_64-unknown-linux-gnu aarch64-apple-darwin; do
+            # `secantusdb-*` takes the extension's `secantusdb-ext-*` archive too.
             gh release download "${{ steps.resolve.outputs.tag }}" -R "$GITHUB_REPOSITORY" -D assets \
               -p "secantusdb-*-$target.tar.gz" -p "secantusdb-*-$target.tar.gz.sha256"
             gh release download "${{ steps.resolve.outputs.pg_tag }}" -R "$GITHUB_REPOSITORY" -D assets \
@@ -134,13 +142,24 @@ jobs:
           path: dist
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
-      - name: Install the wheel into a clean venv and start both servers
+      # Both installs resolve from dist/ by name, as `pip install SecantusDB`
+      # does, rather than naming a file: which of the two wheels the installer
+      # picks is part of what is being tested. The smoke test asserts it.
+      - name: CPython 3.12 picks the abi3 wheel; both modes, both servers
         run: |
           set -euo pipefail
           uv venv --python 3.12 venv
-          uv pip install --python venv/bin/python dist/*-${{ matrix.platform }}*.whl pymongo "psycopg[binary]"
+          uv pip install --python venv/bin/python pymongo "psycopg[binary]"
+          # --no-index: the wheels under test, never a published SecantusDB.
+          uv pip install --python venv/bin/python --no-index --find-links dist SecantusDB
           # From outside the checkout, so the installed package is what imports.
           cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/venv/bin/python" -I "$GITHUB_WORKSPACE/packaging/pypi/smoke_test.py"
+      - name: Free-threaded CPython 3.13t picks the fallback wheel and says why
+        run: |
+          set -euo pipefail
+          uv venv --python 3.13t venv-ft
+          uv pip install --python venv-ft/bin/python --no-index --find-links dist SecantusDB
+          cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/venv-ft/bin/python" -I "$GITHUB_WORKSPACE/packaging/pypi/smoke_test.py" --fallback
 
   # PyPI trusted publisher: bound on the PyPI side to this repository, this
   # workflow file (publish-pypi.yml) and the `pypi` environment. Renaming any

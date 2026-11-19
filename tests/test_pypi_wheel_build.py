@@ -3,8 +3,11 @@
 The wheel repackages the Rust servers' release archives; publish-pypi.yml
 smoke-tests the real wheels on Linux and macOS. These tests pin the parts a
 smoke run cannot see going wrong quietly: the PEP 440 version, the platform
-tag read from the binaries, the RECORD hashes, the executable bits, the
-refusal of an unverified archive, and the launcher's startup handling.
+tag read from the binaries and the extension, the two wheels per platform
+(``cp310-abi3`` with the in-process extension, ``py3-none`` without), the
+RECORD hashes, the executable bits, the refusal of an unverified archive, and
+the launcher's startup handling in both modes. The launcher against the REAL
+extension is tests/test_pypi_inprocess_server.py.
 """
 
 from __future__ import annotations
@@ -122,17 +125,68 @@ def assets(tmp_path: Path) -> Path:
     d.mkdir()
     _archive(d, f"secantusdb-0.5.3-beta.7-{TARGET}", "secantusd-mdb", _elf("2.17", "2.31"))
     _archive(d, f"secantusd-pg-0.1.0-beta.2-{TARGET}", "secantusd-pg", _elf("2.35"))
+    # The extension needs a newer glibc than either binary, so the two
+    # wheels' platform tags differ: each is read from what that wheel holds.
+    _archive(d, f"secantusdb-ext-0.5.3-beta.7-{TARGET}", EXTENSION, _elf("2.17", "2.36"))
     return d
 
 
+EXTENSION = "_secantus_server.abi3.so"
+
+
+def _build_both(assets: Path, out: Path) -> tuple[Path, Path]:
+    abi3, fallback = build_wheels.build_wheels(TARGET, assets, out, "0.5.3-beta.7", "0.1.0-beta.2")
+    return abi3, fallback
+
+
 def _build(assets: Path, out: Path) -> Path:
-    return build_wheels.build_wheel(TARGET, assets, out, "0.5.3-beta.7", "0.1.0-beta.2")
+    return _build_both(assets, out)[0]
 
 
-def test_wheel_contents_tag_and_record(assets: Path, tmp_path: Path) -> None:
-    wheel = _build(assets, tmp_path / "dist")
-    # The tag is the newest glibc EITHER binary needs.
-    assert wheel.name == "secantusdb-0.5.3b7-py3-none-manylinux_2_35_x86_64.whl"
+def test_the_abi3_wheel_carries_the_extension_and_the_fallback_does_not(
+    assets: Path, tmp_path: Path
+) -> None:
+    abi3, fallback = _build_both(assets, tmp_path / "dist")
+    assert abi3.name == "secantusdb-0.5.3b7-cp310-abi3-manylinux_2_36_x86_64.whl"
+    assert fallback.name == "secantusdb-0.5.3b7-py3-none-manylinux_2_35_x86_64.whl"
+    dist_info = "secantusdb-0.5.3b7.dist-info"
+    with zipfile.ZipFile(abi3) as zf:
+        # Inside the package, never at the top of site-packages.
+        assert f"secantusdb/{EXTENSION}" in zf.namelist()
+        assert not any(n.startswith("_secantus_server") for n in zf.namelist())
+        assert zf.read(f"secantusdb/{EXTENSION}").startswith(b"\x7fELF")
+        wheel_file = zf.read(f"{dist_info}/WHEEL").decode()
+        assert "Tag: cp310-abi3-manylinux_2_36_x86_64" in wheel_file
+        assert "Root-Is-Purelib: false" in wheel_file
+    with zipfile.ZipFile(fallback) as zf:
+        assert not any("_secantus_server" in n for n in zf.namelist())
+        assert {"secantusdb/bin/secantusd-mdb", "secantusdb/bin/secantusd-pg"} <= set(zf.namelist())
+        assert "Tag: py3-none-manylinux_2_35_x86_64" in zf.read(f"{dist_info}/WHEEL").decode()
+
+
+def test_a_release_without_the_extension_archive_is_refused(assets: Path, tmp_path: Path) -> None:
+    # The launcher runs in process by default: a wheel set with no extension
+    # would fail every MongoServer() on CPython.
+    (assets / f"secantusdb-ext-0.5.3-beta.7-{TARGET}.tar.gz").unlink()
+    with pytest.raises(FileNotFoundError):
+        _build_both(assets, tmp_path / "dist")
+
+
+def test_an_extension_archive_with_a_bad_checksum_is_refused(assets: Path, tmp_path: Path) -> None:
+    _archive(
+        assets,
+        f"secantusdb-ext-0.5.3-beta.7-{TARGET}",
+        EXTENSION,
+        _elf("2.35"),
+        sha="0" * 64,
+    )
+    with pytest.raises(ValueError, match="sha256"):
+        _build_both(assets, tmp_path / "dist")
+
+
+@pytest.mark.parametrize("which", [0, 1], ids=["abi3", "fallback"])
+def test_wheel_contents_tag_and_record(assets: Path, tmp_path: Path, which: int) -> None:
+    wheel = _build_both(assets, tmp_path / "dist")[which]
     with zipfile.ZipFile(wheel) as zf:
         names = set(zf.namelist())
         dist_info = "secantusdb-0.5.3b7.dist-info"
@@ -154,10 +208,12 @@ def test_wheel_contents_tag_and_record(assets: Path, tmp_path: Path) -> None:
         for binary in ("secantusd-mdb", "secantusd-pg"):
             mode = zf.getinfo(f"secantusdb/bin/{binary}").external_attr >> 16
             assert mode & 0o111, f"{binary} is not executable"
+        # The tag is the newest glibc any native file in THIS wheel needs.
+        tag = wheel.name.removeprefix("secantusdb-0.5.3b7-").removesuffix(".whl")
+        assert f"Tag: {tag}\n" in zf.read(f"{dist_info}/WHEEL").decode()
         metadata = zf.read(f"{dist_info}/METADATA").decode()
         assert "Name: SecantusDB\nVersion: 0.5.3b7\n" in metadata
         assert "| 0.5.3-beta.7 |" in metadata and "| 0.1.0-beta.2 |" in metadata
-        assert "Tag: py3-none-manylinux_2_35_x86_64" in zf.read(f"{dist_info}/WHEEL").decode()
         entry_points = zf.read(f"{dist_info}/entry_points.txt").decode()
         assert "secantusd-mdb = secantusdb._cli:mongodb" in entry_points
         assert "secantusd-pg = secantusdb._cli:postgres" in entry_points
@@ -220,7 +276,7 @@ def test_launcher_reads_the_bound_port_and_cleans_up(
         "time.sleep(60)",
     )
     monkeypatch.setattr(launcher, "_BIN_DIR", bin_dir)
-    server = launcher.MongoServer(startup_timeout=20).start()
+    server = launcher.MongoServer(startup_timeout=20, embedded=False).start()
     try:
         assert (server.host, server.port) == ("127.0.0.1", 41234)
         assert server.uri == "mongodb://127.0.0.1:41234/"
@@ -248,3 +304,136 @@ def test_launcher_reports_a_server_that_exits(
 def test_binary_path_refuses_an_unknown_name() -> None:
     with pytest.raises(ValueError):
         launcher.binary_path("mongod")
+
+
+# --- the in-process mode, against a stand-in for the extension -------------
+#
+# These pin what the launcher does around the extension: the arguments it
+# passes, its errors, and its cleanup. The same paths against the real
+# extension are tests/test_pypi_inprocess_server.py.
+
+
+class _FakeRustServer:
+    instances: list[_FakeRustServer] = []
+
+    def __init__(self, storage_path: str, **kwargs) -> None:
+        self.storage_path = storage_path
+        self.kwargs = kwargs
+        self.address = ("127.0.0.1", 45678)
+        self.stopped = 0
+        self.abandoned = False
+        self.stop_error: Exception | None = None
+        _FakeRustServer.instances.append(self)
+
+    def stop(self) -> None:
+        self.stopped += 1
+        if self.stop_error is not None:
+            raise self.stop_error
+
+    def _abandon_after_fork(self) -> None:
+        self.abandoned = True
+
+
+@pytest.fixture
+def fake_extension(monkeypatch: pytest.MonkeyPatch):
+    import types
+
+    module = types.ModuleType("secantusdb._secantus_server")
+    module.RustServer = _FakeRustServer  # type: ignore[attr-defined]
+    _FakeRustServer.instances = []
+    monkeypatch.setitem(sys.modules, "secantusdb._secantus_server", module)
+    return module
+
+
+def test_in_process_is_the_default_and_passes_the_daemon_defaults(fake_extension) -> None:
+    with launcher.MongoServer() as server:
+        assert server.embedded
+        (handle,) = _FakeRustServer.instances
+        # The daemon's defaults: a replica set (change streams and
+        # transactions need one), mongod's test commands off, TTL on at 60s.
+        assert handle.kwargs == {
+            "port": 0,
+            "replica_set_name": "secantus",
+            "enable_test_commands": False,
+            "ttl_sweep_seconds": 60.0,
+        }
+        assert server.uri == "mongodb://127.0.0.1:45678/"
+        storage = server.storage_path
+        assert storage is not None and storage.is_dir()
+        assert handle.storage_path == str(storage)
+        assert server.output == ""
+    assert handle.stopped == 1
+    assert not storage.exists()
+
+
+def test_a_missing_extension_names_embedded_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    # What the py3-none fallback wheel gives: no silent subprocess.
+    monkeypatch.setitem(sys.modules, "secantusdb._secantus_server", None)
+    with pytest.raises(launcher.ServerStartError, match="embedded=False"):
+        launcher.MongoServer().start()
+
+
+def test_a_start_failure_raises_server_start_error_and_removes_the_temp_dir(
+    fake_extension, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def refuse(storage_path: str, **kwargs):
+        refuse.path = storage_path
+        raise RuntimeError("failed to open storage: WT lock held")
+
+    monkeypatch.setattr(fake_extension, "RustServer", refuse)
+    with pytest.raises(launcher.ServerStartError, match="WT lock held") as info:
+        launcher.MongoServer().start()
+    assert isinstance(info.value.__cause__, RuntimeError)
+    assert not Path(refuse.path).exists()
+    # A directory the caller named is theirs: never removed.
+    kept = tmp_path / "data"
+    with pytest.raises(launcher.ServerStartError):
+        launcher.MongoServer(kept).start()
+    assert kept.is_dir()
+
+
+def test_a_failed_close_raises_and_keeps_the_store(fake_extension) -> None:
+    server = launcher.MongoServer().start()
+    (handle,) = _FakeRustServer.instances
+    handle.stop_error = RuntimeError("closing the store failed: checkpoint")
+    with pytest.raises(RuntimeError, match="did not stop cleanly"):
+        server.stop()
+    storage = server.storage_path
+    assert storage is not None and storage.is_dir()
+    # Stopping again is a no-op, and still never removes the evidence.
+    server.stop()
+    assert storage.is_dir()
+    import shutil
+
+    shutil.rmtree(storage)
+
+
+def test_a_forked_child_disowns_the_server(fake_extension) -> None:
+    server = launcher.MongoServer().start()
+    (handle,) = _FakeRustServer.instances
+    try:
+        # What os.register_at_fork runs in the child.
+        launcher._disown_in_child()
+        assert handle.abandoned
+        # The child can still reach the parent's server over TCP...
+        assert server.uri == "mongodb://127.0.0.1:45678/"
+        # ...but cannot stop it, or start it again.
+        with pytest.raises(launcher.ForkedServerError):
+            server.stop()
+        with pytest.raises(launcher.ForkedServerError):
+            server.start()
+        # Leaving the parent's `with` block in the child stops nothing.
+        server.__exit__(None, None, None)
+        assert handle.stopped == 0
+    finally:
+        # Back to the "parent" for cleanup.
+        server._forked = False
+        server._tempdir = str(server.storage_path)
+        server.stop()
+
+
+def test_postgres_server_has_no_embedded_argument() -> None:
+    # It accepts no argument it cannot honour: PostgreSQL is a child process
+    # until an in-process PostgreSQL server ships.
+    with pytest.raises(TypeError):
+        launcher.PostgresServer(embedded=True)  # type: ignore[call-arg]
