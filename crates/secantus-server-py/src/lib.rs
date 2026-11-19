@@ -53,6 +53,11 @@ struct RustServer {
     /// The TTL monitor's ticker: its stop flag and thread. It holds the
     /// store open, so it is stopped with the server and on drop.
     ttl_monitor: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
+    /// The store, kept so that `stop()` closes it explicitly -- WiredTiger's
+    /// final checkpoint -- and reports a failure as an exception, as the
+    /// `secantusd-mdb` daemon makes it the exit status (RM-189). Left to the
+    /// last `Arc` drop, a failed checkpoint would be a line on stderr.
+    storage: Option<Arc<Storage>>,
 }
 
 impl RustServer {
@@ -64,11 +69,44 @@ impl RustServer {
             }
         }
     }
+
+    /// The daemon's shutdown order: the maintenance thread first (joined, it
+    /// has released the store and is not mid-write), then the listener and
+    /// the connections, then the store. Idempotent.
+    fn shut_down(&mut self) -> Result<(), String> {
+        self.stop_ttl_monitor();
+        if let Some(mut running) = self.running.take() {
+            running.stop();
+            // Dropping it releases the adapter's reference to the store.
+            drop(running);
+        }
+        let Some(storage) = self.storage.take() else {
+            return Ok(());
+        };
+        // `RunningServer::stop` waits a bounded 10 s for the connection
+        // threads. One that outlived it still holds the store, and closing
+        // WiredTiger under it would free what it is using. Leave the store to
+        // close when that thread lets go, and say so, rather than close it.
+        let holders = Arc::strong_count(&storage) - 1;
+        if holders > 0 {
+            return Err(format!(
+                "{holders} connection thread(s) outlived the shutdown drain and still \
+                 hold the store open; it closes when they finish"
+            ));
+        }
+        storage
+            .close()
+            .map_err(|e| format!("closing the store failed: {e:?}"))
+    }
 }
 
 impl Drop for RustServer {
     fn drop(&mut self) {
-        self.stop_ttl_monitor();
+        // A handle dropped without `stop()` still closes the store; there is
+        // no caller left to raise to, so a failure goes to stderr.
+        if let Err(e) = self.shut_down() {
+            eprintln!("_secantus_server: {e}");
+        }
     }
 }
 
@@ -111,6 +149,11 @@ impl RustServer {
     ///   oplog, which keeps a quiet change stream's resume token inside the
     ///   oplog's window and prunes the oplog to its bounds, as the daemon's
     ///   `--noop-heartbeat-seconds` does. `None` (the default) writes none.
+    /// * `enable_test_commands` — accept the test-only commands
+    ///   (`configureFailPoint`, `sleep`, ...). On by default here, because the
+    ///   repo's tests and the driver gauges need failpoints; `False` is
+    ///   mongod's default and the `secantusd-mdb` daemon's, and is what the
+    ///   PyPI package's in-process `MongoServer` passes.
     #[new]
     #[pyo3(signature = (
         storage_path,
@@ -132,6 +175,7 @@ impl RustServer {
         checkpoint_seconds = None,
         ttl_sweep_seconds = None,
         noop_heartbeat_seconds = None,
+        enable_test_commands = true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -154,6 +198,7 @@ impl RustServer {
         checkpoint_seconds: Option<u64>,
         ttl_sweep_seconds: Option<f64>,
         noop_heartbeat_seconds: Option<f64>,
+        enable_test_commands: bool,
     ) -> PyResult<Self> {
         let heartbeat = match noop_heartbeat_seconds {
             Some(secs) if !(secs.is_finite() && secs > 0.0) => {
@@ -207,6 +252,7 @@ impl RustServer {
             storage.set_ttl_monitor(None, Some(false));
         }
         let storage = Arc::new(storage);
+        let storage_for_close = storage.clone();
 
         // TLS: cert + key both required to enable it (matching server.py).
         let tls = match (tls_cert_file, tls_key_file) {
@@ -238,12 +284,11 @@ impl RustServer {
             replica_set_name,
             require_auth,
             tls,
-            // ON for the EMBEDDED handle, mirroring `SecantusDBServer`'s own
-            // default: constructing a server in-process is a test doing it, and
-            // every driver failpoint suite needs `configureFailPoint`. The
-            // standalone `secantusd-mdb` daemon keeps mongod's default of OFF —
-            // that is the one an operator exposes on a port.
-            enable_test_commands: true,
+            // ON by default for the embedded handle: the repo's tests and every
+            // driver failpoint suite need `configureFailPoint`. The standalone
+            // `secantusd-mdb` daemon, and the PyPI package's in-process
+            // `MongoServer`, pass mongod's default of OFF.
+            enable_test_commands,
             ..ServerConfig::default()
         };
         let addr = format!("{host}:{port}");
@@ -284,6 +329,7 @@ impl RustServer {
             host: bound.ip().to_string(),
             port: bound.port(),
             ttl_monitor: Some((stop_ttl, ticker)),
+            storage: Some(storage_for_close),
         })
     }
 
@@ -307,13 +353,35 @@ impl RustServer {
         secantus_server::VERSION
     }
 
-    /// Stop the server (idempotent). The GIL is released while the accept loop
-    /// is joined.
-    fn stop(&mut self, py: Python<'_>) {
-        if let Some(mut running) = self.running.take() {
-            py.detach(|| running.stop());
+    /// Stop the server and close the store (idempotent). The GIL is released
+    /// while the threads are joined and WiredTiger checkpoints. Raises
+    /// `RuntimeError` if the store could not be closed: WiredTiger's final
+    /// checkpoint failed, or a connection thread outlived the drain and still
+    /// holds the store (it then closes when that thread finishes).
+    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.shut_down())
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    /// Forget the server WITHOUT stopping it, for a forked child only.
+    ///
+    /// `fork()` copies this handle into the child but none of the threads
+    /// behind it: the accept loop, the connection threads, WiredTiger's own.
+    /// Stopping or dropping the handle there would join threads that do not
+    /// exist and write to a WiredTiger connection whose threads are gone. This
+    /// leaks the child's copy instead, so nothing ever runs its shutdown; the
+    /// parent's server is untouched and keeps serving. Afterwards `stop()` is a
+    /// no-op and the handle does nothing on drop.
+    fn _abandon_after_fork(&mut self) {
+        if let Some(running) = self.running.take() {
+            std::mem::forget(running);
         }
-        py.detach(|| self.stop_ttl_monitor());
+        if let Some(ttl) = self.ttl_monitor.take() {
+            std::mem::forget(ttl);
+        }
+        if let Some(storage) = self.storage.take() {
+            std::mem::forget(storage);
+        }
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -326,9 +394,9 @@ impl RustServer {
         _exc_type: &Bound<'_, PyAny>,
         _exc_value: &Bound<'_, PyAny>,
         _traceback: &Bound<'_, PyAny>,
-    ) -> bool {
-        self.stop(py);
-        false // don't suppress exceptions
+    ) -> PyResult<bool> {
+        self.stop(py)?;
+        Ok(false) // don't suppress exceptions
     }
 }
 
