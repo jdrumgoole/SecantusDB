@@ -931,7 +931,7 @@ pub(crate) fn generic_ctype(v: &Bson) -> u8 {
 fn db_pointer_parts(v: &Bson) -> Option<(String, [u8; 12])> {
     let mut d = Document::new();
     d.insert("x", v.clone());
-    let raw = bson::to_vec(&d).ok()?;
+    let raw = crate::bsondoc::to_vec(&d).ok()?;
     // doc: i32 len, type byte 0x0c, "x\0", i32 strlen, string + NUL, 12 oid bytes.
     if raw.get(4) != Some(&0x0c) {
         return None;
@@ -958,6 +958,6 @@ pub(crate) fn make_db_pointer(ns: &str, oid: [u8; 12]) -> Option<Bson> {
     let mut doc = Vec::new();
     doc.extend_from_slice(&((body.len() + 4) as i32).to_le_bytes());
     doc.extend_from_slice(&body);
-    let d = Document::from_reader(&mut doc.as_slice()).ok()?;
+    let d = crate::bsondoc::from_bytes(&doc).ok()?;
     d.get("x").cloned()
 }
