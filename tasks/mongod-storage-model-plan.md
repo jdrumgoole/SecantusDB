@@ -1,7 +1,7 @@
 # Plan: move the on-disk layout to mongod's storage model
 
-Status: **reviewed 2026-11-19; three questions open for Joe** (see "Open
-questions"). No code has changed.
+Status: **reviewed, and every open question answered** (Joe, 2026-11-19).
+Next step: phase 0. No code has changed.
 
 ## Why
 
@@ -35,10 +35,11 @@ saves it beside its own.
 4. **KeyString from the start.** The per-index tables are written in mongod's
    KeyString (with TypeBits) when they are created; there is no intermediate
    phase on today's sort-key bytes.
-5. **Oplog: keep the 16 seq-keyed shards for now.** Revisit after the
-   KeyString work, with a `do-perf` concurrency run to decide whether one
-   `local.oplog.rs` table keyed by timestamp holds up. Open question 1 may
-   force this earlier.
+5. **Oplog: it moves to `local.oplog.rs` in this plan** (phase 4b). The
+   first answer was to keep the 16 seq-keyed shards and revisit later;
+   decision 8 replaced it, because a replica-set mongod needs the real
+   oplog. The `do-perf` concurrency run is now phase 4b's gate, not a
+   reason to defer.
 6. **Timeseries: follow mongod's buckets.** Time-series data is stored as
    bucket documents in a `system.buckets.<coll>` collection, as mongod does;
    the framed value goes entirely.
@@ -50,25 +51,19 @@ saves it beside its own.
    the collections a mongod expects in `local`, `admin` and `config`.
    `WiredTiger.turtle` and `WiredTiger.wt` are written by WiredTiger itself
    and are not matched by hand.
-
-## Open questions (for Joe)
-
-1. **How is mongod started on our store: standalone, or as a replica-set
-   member?** Standalone is the smaller claim: mongod ignores tables that are
-   not in its catalog, so the 16 oplog shards can stay (decision 5). Starting
-   with `--replSet` needs a real `local.oplog.rs`, `local.system.replset`
-   and the `local.replset.*` collections, and moves the oplog work into this
-   plan. The store advertises itself as a replica-set primary today, so the
-   answer also decides what `local` holds.
-2. **If mongod 8.2 cannot open files written by the vendored WiredTiger
-   (mongodb-7.0.33), which gives way?** Either the vendored WT is upgraded
-   (a large change: three builds and every `cmake/patch_wt_*.py` patcher), or
-   decision 7 is dropped and the layout only *mirrors* mongod's. Phase 0a
-   measures this before anything else is sized.
-3. **Is the reverse direction a goal: SecantusDB opens a store mongod
-   wrote?** It is a stronger fidelity test (we must read mongod's KeyStrings,
-   not only write our own) and it gives users a migration path that needs no
-   dump.
+8. **mongod starts on our store as a replica-set member.** The phase 7 test
+   starts mongod 8.2.11 with `--replSet`, not standalone. So the store holds
+   a real `local.oplog.rs` keyed by timestamp, `local.system.replset` and the
+   `local.replset.*` collections, and follows mongod's replica-set logging
+   model (user tables not logged; recovery from the stable checkpoint plus
+   the oplog).
+9. **If mongod 8.2 cannot open files the vendored WiredTiger wrote, the
+   vendored WiredTiger is upgraded** to the version mongod 8.2.11 ships
+   (phase 0d). The goal in decision 7 is not dropped.
+10. **The reverse direction is a goal, in this plan.** SecantusDB opens and
+    serves a data directory mongod 8.2.11 wrote. Phase 7 tests both
+    directions. Anything in such a store that SecantusDB cannot serve is
+    refused by name when the store is opened, never skipped.
 
 ## The target: mongod's model
 
@@ -107,9 +102,9 @@ hit counts are word matches across `crates/secantus-storage/src`.
 | Chunked two-phase drop with tombstones (S:14597, S:14853) | WT drop plus a drop-pending ident reaper | drop and recovery code |
 | Rename rewrites every row (S:15012) | Catalog-only rename | rename paths |
 | `secantus_size_storer` keyed `(db, coll)` (sizes.rs:49) | `sizeStorer` keyed by ident | `sizes.rs` |
-| 16 oplog shards keyed by seq (S:1672), `secantus_oplog_meta` (S:2108) | Keep for now (decision 5, open question 1) | oplog code |
+| 16 oplog shards keyed by seq (S:1672), `secantus_oplog_meta` (S:2108) | `local.oplog.rs`, keyed by a RecordId derived from the timestamp (decision 5, phase 4b) | oplog code, change streams, PITR |
 | Tables `block_compressor=lz4` (S:2722, S:2726) | The compressor mongod uses (snappy by default); our CMake already builds snappy and zstd in | `DOC_TABLE_CFG`, `QU_COMPRESSED_CFG`; needs a `do-perf` run |
-| User tables logged; connection `log=(enabled=true)` (S:2673); a non-logged mode exists (S:1676-1716) | To be decided in phase 0 from what mongod accepts in the mode open question 1 picks | table-create configs |
+| User tables logged; connection `log=(enabled=true)` (S:2673); a non-logged mode exists (S:1676-1716) | mongod's replica-set model: user tables not logged, oplog and catalog logged (decision 8); phase 0 confirms the exact configs | table-create configs, recovery |
 | Format markers: `entryFormat` 6, `numberKeys` 2, `idKeys` 2, upgrade-at-open paths (S:8430-8630, `upgrade_number_keys` S:19130, `upgrade_id_keys` S:19309) | One store-format version, and refusal of anything older | `upgrade_*`, `reject_legacy_*` |
 
 Tables the first draft missed. Phase 0 decides, for each, between "becomes
@@ -124,11 +119,11 @@ the default is the mongod collection wherever one exists.
 | `secantus_index_builds`, `secantus_index_build_side` (index_build.rs:41-44) | mongod's index-build state lives in the catalog entry (`ready: false`) plus internal side-write tables (`internal-<n>-<random>`) |
 | `secantus_profile_settings` (S:2122) | none on disk (the profile level is per-process in mongod); likely stays private |
 
-What does not change: the BSON-blob principle, the oplog-backed change
-streams, the per-collection RecordId counter, and the PostgreSQL server's own
+What does not change: the BSON-blob principle, change streams being
+oplog-backed (the oplog's own table does change), the per-collection RecordId counter, and the PostgreSQL server's own
 catalog collections (`__sql_catalog__` and the rest stay ordinary
-collections). The vendored WiredTiger version does not change unless open
-question 2 says so. Table creation configs **do** change (compressor,
+collections). The vendored WiredTiger version changes only if phase 0a
+finds mongod cannot open its files (decision 9). Table creation configs **do** change (compressor,
 logging, `app_metadata`), because decision 7 requires it.
 
 ## Phases
@@ -156,7 +151,7 @@ Each phase lands as its own PR, after all of:
 
 ### Store-format version across phases
 
-Phases 2 to 5 each change the format. Each one **bumps the store-format
+Phases 2 to 5, 4b included, each change the format. Each one **bumps the store-format
 version**, so a store written by an earlier phase is refused by name like any
 other old store. **No release of either Rust server is cut between phase 2
 landing and phase 6 landing**, so no user ever holds an intermediate format.
@@ -168,10 +163,10 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
      WT 7.0.33 holding mongod-shaped tables, and start mongod 8.2.11 on it.
      Record which compressors mongod's WT accepts, what FCV document it
      demands, and whether it then rewrites files so that WT 7.0.33 can no
-     longer open them. If mongod refuses the files, stop and take open
-     question 2 to Joe before any other work.
-   - **0b. The specification.** Create a mongod 8.2.11 store (in the mode
-     open question 1 picks): a collection, a compound index, a unique index,
+     longer open them. If mongod refuses the files, phase 0d runs before
+     phase 1.
+   - **0b. The specification.** Create a mongod 8.2.11 store, started as
+     a one-member replica set: a collection, a compound index, a unique index,
      a TTL index, one index of each kind listed under phase 4, a capped
      collection, a clustered collection, a time-series collection, a user and
      a role, a collection with pre-images, then a drop and a rename. Record
@@ -181,6 +176,13 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
    - **0c. The comparison tool.** A probe that runs one script of operations
      against mongod and against SecantusDB and diffs `wt list`, the table
      configs and the catalog documents.
+   - **0d. WiredTiger upgrade, only if 0a requires it.** Move
+     `vendor/wiredtiger` to the version mongod 8.2.11 ships. All three
+     builds apply the same patch list; every `cmake/patch_wt_*.py` patcher
+     is re-proved against the new source, the two that change group commit
+     under `dsync` / `fsync` with a durability test; the PGO profile is
+     refreshed. It lands as its own PR, with the full per-phase gate and
+     every driver gauge, before phase 1.
    - Output: an appendix here, the probes saved in `tools/probes/`, and the
      logging decision recorded in the "what changes" table.
 1. **Store format version and refusal.** Add one store-format version, written
@@ -232,6 +234,18 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
    placement (`NULLS FIRST` / `LAST`), `numeric`, `text` under a collation,
    descending keys, and the B-tree and hash page models built over them.
    Each is probed against PostgreSQL 15 before and after.
+4b. **The oplog and replica-set state.** The oplog becomes the collection
+   `local.oplog.rs`, keyed by a RecordId derived from the timestamp, with
+   entries in mongod's oplog format; the 16 shards and `secantus_oplog_meta`
+   go. Add `local.system.replset`, the `local.replset.*` collections and
+   whatever else phase 0b found a one-member replica set keeps. User tables
+   move to mongod's logging model: not logged, with a stable timestamp, and
+   recovery that replays the oplog from the stable checkpoint. Change
+   streams, resume tokens, pre-images, PITR and the PostgreSQL server's
+   commit path all read or write the oplog and move with it. This is the
+   phase that PR #594's shards were built to avoid, so its gate is the
+   `do-perf` concurrency run at 1, 4 and 16 writers; a regression there is
+   fixed in this phase, not accepted.
 5. **Timeseries buckets.** Store time-series data as `system.buckets`
    bucket documents in a clustered collection, as mongod does; remove the
    framed value.
@@ -240,11 +254,19 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
    file. Confirm the SQL-to-collection hand-off test still passes.
 7. **mongod opens the store.** A test creates a store with SecantusDB holding
    everything phase 0b created, stops it cleanly, starts mongod 8.2.11 on the
-   directory in the mode open question 1 picks, and runs
-   `validate({full: true})` on every collection, then reads every document
-   and walks every index. The test also states the limits of the claim (for
-   example: standalone only, oplog not carried). If open question 3 is yes,
-   the reverse test lands here too.
+   directory with `--replSet` (decision 8), waits for it to become
+   primary, and runs `validate({full: true})` on every collection, then
+   reads every document, walks every index and opens a change stream from a
+   resume token SecantusDB issued.
+
+   **The reverse test** (decision 10): mongod 8.2.11 writes the phase 0b
+   store and stops cleanly; `secantusd-mdb` opens the directory, reads every
+   collection and index, and writes to it; then mongod opens it again and
+   `validate` passes. What SecantusDB refuses at open is listed here and in
+   the backlog: at least a replica-set config with more than one member,
+   any index kind phase 4 refuses, and any catalog option it does not
+   implement. An unclean mongod shutdown (journal and oplog recovery
+   pending) is tested too, since recovery is now mongod's model.
 8. **Clean-up.** Remove the legacy-table readers, the shard routing and the
    format markers this replaces; rewrite the layout tests below. Update
    CLAUDE.md's "One on-disk format" section, the `python-servers` skill's
@@ -256,7 +278,7 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
   ONE Rust server" rule otherwise forbids. **One session owns the whole plan,
   on the MongoDB side**, and makes the shared-storage and `secantus-pg`
   changes itself; each PR says the other server links the change.
-- **No `fix_many` lane runs while a phase 3 or phase 4 branch is open.** Those
+- **No `fix_many` lane runs while a phase 0d, 3, 4 or 4b branch is open.** Those
   phases rewrite most of a 31,000-line file the lanes also edit. Phases 2, 5
   and 6 are narrower and can run beside one lane.
 - Each phase is filed in both `tasks/backlog-rust-mongodb.md` and
@@ -285,7 +307,9 @@ dump-and-restore round trip for each server.
 ## Risks
 
 - **WiredTiger version.** mongod 8.2 may not open 7.0.33 files, or may
-  upgrade them past what 7.0.33 reads. Phase 0a; open question 2.
+  upgrade them past what 7.0.33 reads. Phase 0a measures it; phase 0d is the
+  answer (decision 9), and is itself a risk to every patcher and to
+  durability under group commit.
 - **Many WT tables.** A store with thousands of collections and indexes holds
   thousands of files and handles. mongod lives with this through WT's handle
   sweep and its session cursor cache; we will need the same settings and a
@@ -298,10 +322,13 @@ dump-and-restore round trip for each server.
 - **Concurrency.** Per-collection files are what PR #594 approximated with 16
   shards; the per-phase `do-perf` run must not regress. The compressor change
   (lz4 to snappy) moves this number on its own, so measure it separately.
-- **Logging mode.** If mongod only accepts non-logged user tables in the
-  chosen mode, durability moves to checkpoints plus the oplog, which is a
-  recovery redesign, not a config flag. Phase 0 must settle this before
-  phase 3 is sized.
+- **Logging and recovery.** Decision 8 moves durability of user tables from
+  the WT log to checkpoints plus oplog replay. That is a recovery redesign,
+  not a config flag, and it is where a mistake loses acknowledged writes.
+  Phase 4b needs kill-at-every-step crash tests before it merges.
+- **Reading mongod's stores.** A mongod store can hold anything mongod can
+  write. The open-time check must be complete: a store opened with one
+  unrecognised catalog option silently ignored is a wrong answer later.
 - **Index kinds.** Matching ICU, S2 and the text format exactly may be out of
   reach for some kinds; those are refused by name, not approximated.
 - **Backup and PITR archives** name tables; `pitr_archive.rs`, `repair.rs` and
@@ -309,7 +336,8 @@ dump-and-restore round trip for each server.
 
 ## Not in scope
 
-- Changing WiredTiger's code. (Its version: open question 2. Table and
-  connection configs: in scope, see "What changes".)
-- Moving the oplog to `local.oplog.rs`, unless open question 1 requires it.
+- Changing WiredTiger's code beyond the existing patchers. (Its version:
+  phase 0d, if needed. Table and connection configs: in scope.)
+- Real replication. The store is a valid one-member replica set; there are
+  still no other members, elections or cross-node oplog.
 - The Python servers, which are deprecated.
