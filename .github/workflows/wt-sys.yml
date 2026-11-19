@@ -16,6 +16,9 @@ on:
     paths:
       - "crates/secantus-wiredtiger-sys/**"
       - "crates/secantus-wt/**"
+      - "crates/secantus-compressors/**"
+      - "vendor/snappy/**"
+      - "vendor/zstandard/**"
       - "scripts/wt_sys_refresh.py"
       - "cmake/patch_wt_*.py"
       - "vendor/wiredtiger"
@@ -25,6 +28,9 @@ on:
     paths:
       - "crates/secantus-wiredtiger-sys/**"
       - "crates/secantus-wt/**"
+      - "crates/secantus-compressors/**"
+      - "vendor/snappy/**"
+      - "vendor/zstandard/**"
       - "scripts/wt_sys_refresh.py"
       - "cmake/patch_wt_*.py"
       - "vendor/wiredtiger"
@@ -63,8 +69,19 @@ jobs:
       - name: Package and build from the tarball, outside the repo
         shell: bash
         run: |
-          stage="$RUNNER_TEMP/wt-sys-src"
+          # Beside it, secantus-compressors (mongo's snappy and zstd, with
+          # the vendored sources a packaged crate carries): it is not on
+          # crates.io until a release publishes it, so the packaged crate's
+          # verify build is pointed at this copy.
+          root="$RUNNER_TEMP/wt-sys-stage"
+          stage="$root/secantus-wiredtiger-sys"
+          mkdir -p "$root/.cargo"
           cp -R crates/secantus-wiredtiger-sys "$stage"
+          cp -R crates/secantus-compressors "$root/secantus-compressors"
+          cp -R vendor/snappy "$root/secantus-compressors/snappy"
+          cp -R vendor/zstandard "$root/secantus-compressors/zstandard"
+          printf '[patch.crates-io]\nsecantus-compressors = { path = "%s" }\n' \
+            "$root/secantus-compressors" > "$root/.cargo/config.toml"
           cd "$stage"
           # `cargo package` verifies by building the extracted .crate.
           CARGO_TARGET_DIR="$RUNNER_TEMP/wt-sys-target" cargo package --allow-dirty

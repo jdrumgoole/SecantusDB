@@ -219,6 +219,11 @@ target_include_directories(secantus_snappy PRIVATE
 target_compile_definitions(secantus_snappy PRIVATE HAVE_CONFIG_H)
 set_target_properties(secantus_snappy PROPERTIES
     POSITION_INDEPENDENT_CODE ON CXX_STANDARD 17)
+# mongo's x86-64 config.h turns on the SSSE3 and CRC32 (SSE4.2) paths, which
+# need the instructions enabled: mongod 8.2 itself requires a CPU with them.
+if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    target_compile_options(secantus_snappy PRIVATE -msse4.2)
+endif()
 file(GLOB _zstd_sources
     ${ZSTD_LIB_DIR}/common/*.c ${ZSTD_LIB_DIR}/compress/*.c
     ${ZSTD_LIB_DIR}/decompress/*.c ${ZSTD_LIB_DIR}/deprecated/*.c
@@ -246,8 +251,10 @@ set(WT_COMPRESSOR_ARG
     -DENABLE_ZSTD=OFF -DHAVE_BUILTIN_EXTENSION_ZSTD=ON
     -DHAVE_LIBZSTD=$<TARGET_FILE:secantus_zstd>
     -DHAVE_LIBZSTD_INCLUDES=${ZSTD_LIB_DIR}
-    "-DCMAKE_MODULE_LINKER_FLAGS=${_wt_cxx_runtime}"
-    "-DCMAKE_SHARED_LINKER_FLAGS=${_wt_cxx_runtime}")
+    # As a standard library, so it lands AFTER the objects and static
+    # libraries on the link line: a linker flag lands before them, and GNU ld
+    # then drops it unused (`undefined symbol ... __si_class_type_info`).
+    "-DCMAKE_C_STANDARD_LIBRARIES=${_wt_cxx_runtime}")
 if(WIN32)
     set(WT_ZLIB_ARG "")
 else()

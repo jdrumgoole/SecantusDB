@@ -110,6 +110,12 @@ fn main() {
         // main() links the static archive instead.
         b.cpp_link_stdlib(None);
     }
+    if target_arch == "x86_64" && !b.get_compiler().is_like_msvc() {
+        // mongo's x86-64 config.h turns on the SSSE3 and CRC32 (SSE4.2)
+        // paths, which need the instructions enabled: mongod 8.2 itself
+        // requires a CPU with them.
+        b.flag("-msse4.2");
+    }
     if b.get_compiler().is_like_msvc() {
         b.flag_if_supported("/wd4018");
     } else {
