@@ -38,6 +38,12 @@ rustdoc-args = ["--cfg", "docsrs"]
 # rustc's -- that mismatch broke the macOS PGO release build. The Linux release
 # lane sets LIBZ_SYS_STATIC=1 to link it statically (gcc, so no flags copied).
 libz-sys = { version = "1", default-features = false, features = ["libc"] }
+# snappy and zstd, mongo's own copies: WiredTiger is built with both as BUILTIN
+# extensions, as mongod's is, because mongod's catalog, collections and journal
+# are snappy-compressed and its time-series buckets zstd-compressed
+# (tasks/mongod-storage-model-plan.md). This crate compiles them and hands the
+# include directories to build.rs (DEP_SECANTUS_COMPRESSORS_*).
+secantus-compressors = { version = "=0.5.3-beta.198", path = "../secantus-compressors" }
 
 [build-dependencies]
 cmake = "0.1"

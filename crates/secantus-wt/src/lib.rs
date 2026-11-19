@@ -40,6 +40,9 @@ mod sys {
 // Named so the bundled WiredTiger and its compressors are actually linked.
 #[cfg(feature = "bundled")]
 extern crate secantus_wiredtiger_sys;
+// mongo's snappy and zstd, for a prebuilt WiredTiger linked without the
+// bundled crate (`--no-default-features`).
+extern crate secantus_compressors;
 
 use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, CString};

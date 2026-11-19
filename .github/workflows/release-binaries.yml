@@ -466,6 +466,9 @@ jobs:
           # ICU 57.1 is linked in (crates/secantus-icu); its licence asks
           # for its notice to travel with the binary.
           cp vendor/icu4c-57.1/LICENSE "$stem/LICENSE-ICU"
+          # So are mongo's snappy and zstd (crates/secantus-compressors).
+          cp vendor/snappy/dist/COPYING "$stem/LICENSE-snappy"
+          cp vendor/zstandard/zstd/LICENSE "$stem/LICENSE-zstd"
 
           # `shasum` ships with macOS/Linux runners but not Git Bash on Windows,
           # which has `sha256sum` instead. Pick whichever exists rather than

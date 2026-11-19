@@ -145,11 +145,10 @@ fn main() {
     // `block_compressor` is recorded at create time, so dropping zlib would
     // make existing data unreadable.
     //
-    // `SECANTUS_WT_EXTRA_COMPRESSORS=1` matches the CMake option of the same
-    // name and adds snappy + zstd, which are opt-in only.
+    // snappy and zstd are mongo's own copies, compiled and linked by the
+    // secantus-compressors dependency on every platform.
     // `SECANTUS_WT_EXTRA_LIBDIR` adds a search path (e.g. Homebrew's
     // /opt/homebrew/lib) for any of them.
-    println!("cargo:rerun-if-env-changed=SECANTUS_WT_EXTRA_COMPRESSORS");
     println!("cargo:rerun-if-env-changed=SECANTUS_WT_EXTRA_LIBDIR");
     let extra_libdir = env::var("SECANTUS_WT_EXTRA_LIBDIR").ok();
     if let Some(dir) = extra_libdir.as_deref() {
@@ -198,12 +197,6 @@ fn main() {
         }
         println!("cargo:rustc-link-lib={kind}=lz4");
     }
-    if env::var_os("SECANTUS_WT_EXTRA_COMPRESSORS").is_some() && target_os != "windows" {
-        for l in ["snappy", "zstd"] {
-            println!("cargo:rustc-link-lib=dylib={l}");
-        }
-    }
-
     generate_bindings(&inc);
 }
 

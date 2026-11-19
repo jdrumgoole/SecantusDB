@@ -3,8 +3,9 @@
 //! Compiles the bundled, pre-patched WiredTiger (`wiredtiger/`, written by
 //! `scripts/wt_sys_refresh.py`) with CMake into a static library, the same
 //! configuration as the wheel's ExternalProject in the top-level
-//! `CMakeLists.txt`: static, PIC, Release, zlib and lz4 built in, Python /
-//! SWIG / cppsuite off. Needs CMake and a C compiler, and nothing else.
+//! `CMakeLists.txt`: static, PIC, Release, `WT_STANDALONE_BUILD=OFF` (as
+//! mongod builds it), snappy, zstd, zlib and lz4 built in, Python / SWIG /
+//! cppsuite off. Needs CMake and a C compiler, and nothing else.
 //!
 //! `SECANTUS_WT_INCLUDE` + `SECANTUS_WT_LIB` link an existing build instead.
 
@@ -67,11 +68,29 @@ fn main() {
         .define("ENABLE_SNAPPY", "OFF")
         .define("ENABLE_ZSTD", "OFF")
         .define("ENABLE_SODIUM", "OFF")
+        // As mongod builds WiredTiger. ON (WiredTiger's own default) stamps
+        // every file btree version 2.1, which mongod's build refuses: the
+        // stores must open in mongod (tasks/mongod-storage-model-plan.md,
+        // phase 0a).
+        .define("WT_STANDALONE_BUILD", "OFF")
         .define("ENABLE_TCMALLOC", "OFF")
         .define("ENABLE_MEMKIND", "OFF")
         .build_target("wiredtiger_static");
+    // snappy and zstd, builtin on every platform: mongod's tables use them.
+    // Only the headers matter at configure time (the HAVE_LIB* "library" is
+    // the header, as for lz4 below); secantus-compressors links the code.
+    let snappy_inc = env::var("DEP_SECANTUS_COMPRESSORS_SNAPPY_INCLUDE")
+        .expect("secantus-compressors publishes snappy's include directory");
+    let zstd_inc = env::var("DEP_SECANTUS_COMPRESSORS_ZSTD_INCLUDE")
+        .expect("secantus-compressors publishes zstd's include directory");
+    cfg.define("HAVE_BUILTIN_EXTENSION_SNAPPY", "ON")
+        .define("HAVE_LIBSNAPPY", Path::new(&snappy_inc).join("snappy-c.h"))
+        .define("HAVE_LIBSNAPPY_INCLUDES", &snappy_inc)
+        .define("HAVE_BUILTIN_EXTENSION_ZSTD", "ON")
+        .define("HAVE_LIBZSTD", Path::new(&zstd_inc).join("zstd.h"))
+        .define("HAVE_LIBZSTD_INCLUDES", &zstd_inc);
     if target_os != "windows" {
-        // Windows builds WiredTiger with no compressors, as the wheel does.
+        // Windows builds WiredTiger without zlib and lz4, as the wheel does.
         // Elsewhere the builtin extensions only need the HEADERS at configure
         // time; the symbols come from libz-sys and compile_lz4 at the link.
         let lz4_inc = manifest.join("lz4");

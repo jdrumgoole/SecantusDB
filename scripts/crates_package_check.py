@@ -42,6 +42,7 @@ CRATES = REPO / "crates"
 
 # Dependency order: every crate comes after everything it depends on.
 MDB_ORDER = (
+    "secantus-compressors",
     "secantus-wiredtiger-sys",
     "secantus-wt",
     "secantus-icu",
@@ -66,6 +67,7 @@ PG_ORDER = (
 # The MongoDB-side crates the PG crates depend on, in MDB_ORDER's order. A PG
 # release resolves them from crates.io; it never publishes them.
 PG_NEEDS = (
+    "secantus-compressors",
     "secantus-wiredtiger-sys",
     "secantus-wt",
     "secantus-icu",
@@ -96,6 +98,10 @@ def _stage(dest: Path, order: tuple[str, ...]) -> None:
             # In a checkout build.rs reads the repository's vendor/ copy; a
             # packaged crate has to carry its own (`include` names it).
             shutil.copytree(REPO / "vendor" / "icu4c-57.1", dest / name / "icu4c-57.1")
+        if name == "secantus-compressors":
+            # Likewise mongo's snappy and zstd.
+            for lib in ("snappy", "zstandard"):
+                shutil.copytree(REPO / "vendor" / lib, dest / name / lib)
         manifest = dest / name / "Cargo.toml"
         # Each WiredTiger-linked crate declares its own empty [workspace] so it
         # stays out of crates/Cargo.toml; inside the staging workspace that

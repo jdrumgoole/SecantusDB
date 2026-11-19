@@ -1,7 +1,10 @@
 # Plan: move the on-disk layout to mongod's storage model
 
-Status: **phase 0 done** (2026-11-19; see "Appendix: phase 0 results").
-Next step: phases 1 and 2, which land together. No server code has changed.
+Status: **phase 0 done** (2026-11-19; see "Appendix: phase 0 results");
+**phase 1 in review** (the WiredTiger build, snappy, `journal/`,
+`storage.bson`, the format check). The release freeze starts when phase 1
+lands: it changes the format, so no release of either Rust server is cut
+until phase 6 has landed.
 
 ## Why
 
@@ -201,6 +204,14 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
    `pg_dump` / `psql`). All existing `upgrade_*` paths are removed. This
    lands with phase 2, not before, or `main` would refuse stores it still
    writes.
+
+   **Landed alone, ahead of phase 2** (2026-11-19): phase 1 also changes
+   the format (below), so it refuses only stores it cannot read, and the
+   freeze starts with it. The `upgrade_*` and `reject_legacy_*` paths stay
+   until phase 8: no store that needs them can reach them any more.
+   The format version lives in a `secantus.format` file beside
+   `storage.bson` (mongod ignores it); a store with `storage.bson` and no
+   such file is mongod's, refused until phase 7's reverse direction.
 
    The same change switches the three WiredTiger builds to
    `WT_STANDALONE_BUILD=OFF` with snappy and zstd built in (phase 0a). That

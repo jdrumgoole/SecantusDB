@@ -397,8 +397,12 @@ def _build_wiredtiger(*, force: bool = False) -> pathlib.Path:
     # library: a library built before a patch was added or edited is rebuilt
     # rather than reused, so this build cannot drift from the wheel's.
     patches = _wt_source_patches()
+    compressor_args = _wt_compressor_args()
+    # The configure options are stamped too: a library built with other
+    # options (before WT_STANDALONE_BUILD=OFF, say) is rebuilt, not reused.
     patch_digest = hashlib.sha256(
         b"".join((_REPO / "cmake" / script).read_bytes() for script, _ in patches)
+        + "\0".join(compressor_args).encode()
     ).hexdigest()
     stamp = build_dir / "secantus-wt-patches.sha256"
     stamped = stamp.read_text().strip() if stamp.exists() else ""
@@ -436,21 +440,6 @@ def _build_wiredtiger(*, force: bool = False) -> pathlib.Path:
             "compiler and the Windows SDK that native linking needs."
         )
 
-    # Compressor flags mirror CMakeLists.txt's WT_ZLIB_ARG: on non-Windows WT is
-    # built with the builtin zlib + lz4 block-compressor extensions (which
-    # secantus-storage's table configs select), so libz / liblz4 must be present
-    # at build time (CI installs liblz4-dev). Windows omits them, matching the
-    # storage layer's Windows path.
-    if os.name == "nt":
-        zlib_args: list[str] = []
-    else:
-        zlib_args = [
-            "-DENABLE_ZLIB=OFF",
-            "-DHAVE_BUILTIN_EXTENSION_ZLIB=ON",
-            "-DENABLE_LZ4=OFF",
-            "-DHAVE_BUILTIN_EXTENSION_LZ4=ON",
-        ]
-
     configure = [
         cmake,
         "-S",
@@ -465,7 +454,7 @@ def _build_wiredtiger(*, force: bool = False) -> pathlib.Path:
         "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
         "-DWITH_PIC=ON",
         "-DHAVE_DIAGNOSTIC=OFF",
-        *zlib_args,
+        *compressor_args,
     ]
     if ninja:
         configure += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}"]
@@ -489,6 +478,41 @@ def _build_wiredtiger(*, force: bool = False) -> pathlib.Path:
     stamp.write_text(patch_digest + "\n")
     print(f"WiredTiger built: {static_lib}")
     return build_dir
+
+
+def _wt_compressor_args() -> list[str]:
+    """The WiredTiger configure options that make it mongod's build.
+
+    ``WT_STANDALONE_BUILD=OFF`` as mongod builds it: ON (WiredTiger's own
+    default) stamps every file btree version 2.1, which mongod refuses
+    (``tasks/mongod-storage-model-plan.md``, phase 0a). snappy and zstd are
+    builtin extensions on every platform, compiled against mongo's own copies
+    in ``vendor/``; only their headers matter here, since this builds the
+    static library alone and ``secantus-compressors`` links the code. zlib and
+    lz4 as before: builtin off Windows (CI installs liblz4-dev), which mirrors
+    CMakeLists.txt's ``WT_ZLIB_ARG``.
+    """
+    snappy = _REPO / "vendor" / "snappy" / "dist"
+    zstd = _REPO / "vendor" / "zstandard" / "zstd" / "lib"
+    args = [
+        "-DWT_STANDALONE_BUILD=OFF",
+        "-DENABLE_SNAPPY=OFF",
+        "-DHAVE_BUILTIN_EXTENSION_SNAPPY=ON",
+        f"-DHAVE_LIBSNAPPY={snappy / 'snappy-c.h'}",
+        f"-DHAVE_LIBSNAPPY_INCLUDES={snappy}",
+        "-DENABLE_ZSTD=OFF",
+        "-DHAVE_BUILTIN_EXTENSION_ZSTD=ON",
+        f"-DHAVE_LIBZSTD={zstd / 'zstd.h'}",
+        f"-DHAVE_LIBZSTD_INCLUDES={zstd}",
+    ]
+    if os.name != "nt":
+        args += [
+            "-DENABLE_ZLIB=OFF",
+            "-DHAVE_BUILTIN_EXTENSION_ZLIB=ON",
+            "-DENABLE_LZ4=OFF",
+            "-DHAVE_BUILTIN_EXTENSION_LZ4=ON",
+        ]
+    return args
 
 
 @task(name="rust-test")

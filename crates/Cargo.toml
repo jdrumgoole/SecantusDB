@@ -32,6 +32,8 @@ resolver = "2"
 members = [
     "secantus-core",
     "secantus-icu",
+    # mongo's snappy and zstd, for WiredTiger's builtin compressors.
+    "secantus-compressors",
     "secantus-core-py",
     "secantus-wire",
     "secantus-commands",

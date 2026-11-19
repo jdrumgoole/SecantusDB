@@ -41,6 +41,9 @@ bundled = ["dep:secantus-wiredtiger-sys"]
 bindgen = ["dep:bindgen"]
 
 [dependencies]
+# mongo's snappy and zstd, which WiredTiger's builtin snappy and zstd
+# extensions call (also linked through secantus-wiredtiger-sys; one copy).
+secantus-compressors = { version = "=0.5.3-beta.198", path = "../secantus-compressors" }
 secantus-wiredtiger-sys = { version = "=0.5.3-beta.198", path = "../secantus-wiredtiger-sys", optional = true }
 
 [build-dependencies]

@@ -22,7 +22,8 @@ fn temp_home() -> PathBuf {
 }
 
 fn log_files(home: &Path) -> usize {
-    std::fs::read_dir(home)
+    // The log lives in `journal/`, as mongod's does.
+    std::fs::read_dir(home.join("journal"))
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| {

@@ -13,3 +13,5 @@
 // Referenced so the linker keeps the zlib WiredTiger's builtin zlib extension
 // calls into. lz4 is compiled by build.rs.
 extern crate libz_sys;
+// And the snappy and zstd its builtin snappy and zstd extensions call.
+extern crate secantus_compressors;

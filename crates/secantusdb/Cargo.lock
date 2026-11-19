@@ -2268,6 +2268,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "secantus-compressors"
+version = "0.5.3-beta.198"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "secantus-core"
 version = "0.5.3-beta.198"
 dependencies = [
@@ -2365,12 +2372,14 @@ dependencies = [
  "cc",
  "cmake",
  "libz-sys",
+ "secantus-compressors",
 ]
 
 [[package]]
 name = "secantus-wt"
 version = "0.5.3-beta.198"
 dependencies = [
+ "secantus-compressors",
  "secantus-wiredtiger-sys",
 ]
 

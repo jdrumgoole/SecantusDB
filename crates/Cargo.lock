@@ -1855,6 +1855,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "secantus-compressors"
+version = "0.5.3-beta.198"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "secantus-core"
 version = "0.5.3-beta.198"
 dependencies = [

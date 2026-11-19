@@ -1,0 +1,24 @@
+[package]
+name = "secantus-compressors"
+version = "0.5.3-beta.198"
+edition = "2021"
+description = "The snappy and zstd libraries mongod 8.2 links, built from mongo's own copies, for WiredTiger's builtin compressors. Internal to SecantusDB: no semver promise."
+license = "BSD-3-Clause"
+repository = "https://github.com/jdrumgoole/SecantusDB"
+links = "secantus_compressors"
+build = "build.rs"
+# In a checkout the sources are the repository's vendor/snappy and
+# vendor/zstandard; a packaged crate carries its own copies
+# (scripts/crates_package_check.py writes them).
+include = ["build.rs", "src/**", "snappy/**", "zstandard/**", "README.md"]
+
+rust-version = "1.98"
+readme = "README.md"
+keywords = ["snappy", "zstd", "wiredtiger", "mongodb", "ffi"]
+categories = ["external-ffi-bindings", "compression"]
+
+[lib]
+name = "secantus_compressors"
+
+[build-dependencies]
+cc = "1"

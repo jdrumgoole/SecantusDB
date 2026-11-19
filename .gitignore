@@ -29,6 +29,8 @@ build/
 # The nightly security review's skill output (scripts/security-review-prompt.md).
 /.security-audit/
 dist/
+# mongo's vendored snappy keeps its sources in dist/ (vendor/snappy/README.md).
+!/vendor/snappy/dist/
 wheelhouse/
 *.egg-info/
 

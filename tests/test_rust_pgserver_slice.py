@@ -210,6 +210,20 @@ def _python_sql(home: Path, *statements: str) -> list[tuple]:
         storage.close()
 
 
+# Retired 2026-11-19 (tasks/mongod-storage-model-plan.md, phase 1): four
+# tests that had the deprecated Python server write a store and a Rust server
+# read it -- `test_the_rust_server_reads_a_python_created_table`,
+# `test_schema_qualified_tables_cross_from_python_to_rust`,
+# `test_a_python_view_and_index_are_read_by_the_rust_server` and
+# `test_a_declared_width_survives_the_hand_off_to_the_other_server`. The Rust
+# servers now write mongod's layout and refuse a store in the earlier one,
+# which is the layout the Python server writes; compatibility with the Python
+# servers, on-disk format included, stopped being a constraint on 2026-10-16
+# (CLAUDE.md). What is lost: a check that a Python-written table, schema,
+# view, index or char(n) width reads back through the Rust server. The
+# Rust-written direction stays covered by the tests beside them.
+
+
 def test_create_insert_select_round_trip(home: Path) -> None:
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
@@ -268,19 +282,6 @@ def test_the_python_server_reads_and_writes_a_rust_created_table(home: Path) -> 
         assert sorted(cur.fetchall()) == [(2, "bob", 20), (3, "carol", 30)]
 
 
-def test_the_rust_server_reads_a_python_created_table(home: Path) -> None:
-    """The same contract in the other direction."""
-    _python_sql(
-        home,
-        "CREATE TABLE py (k int PRIMARY KEY, label text)",
-        "INSERT INTO py VALUES (9, 'made-by-python')",
-    )
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT k, label FROM py WHERE k = 9")
-        assert cur.fetchall() == [(9, "made-by-python")]
-
-
 def test_schema_qualified_tables_cross_from_rust_to_python(home: Path) -> None:
     """A table outside `public` is stored under `schema.name` by BOTH servers.
 
@@ -311,38 +312,6 @@ def test_schema_qualified_tables_cross_from_rust_to_python(home: Path) -> None:
         assert cur.fetchall() == [(1, "sx-1"), (2, "sx-2"), (3, "from-python")]
         cur.execute("SELECT count(*) FROM users")
         assert cur.fetchall() == [(1,)]
-
-
-def test_schema_qualified_tables_cross_from_python_to_rust(home: Path) -> None:
-    """The other direction, resolved through `search_path` as well."""
-    _python_sql(
-        home,
-        "CREATE SCHEMA py",
-        "CREATE TABLE py.items (k int PRIMARY KEY, label text)",
-        "INSERT INTO py.items VALUES (1, 'made-by-python')",
-        "CREATE TABLE items (k int PRIMARY KEY, label text)",
-        "INSERT INTO items VALUES (1, 'public')",
-    )
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT label FROM py.items")
-        assert cur.fetchall() == [("made-by-python",)]
-        cur.execute("SELECT label FROM items")
-        assert cur.fetchall() == [("public",)]
-        cur.execute("SET search_path TO py, public")
-        cur.execute("SELECT label FROM items")
-        assert cur.fetchall() == [("made-by-python",)]
-        cur.execute(
-            "SELECT table_schema FROM information_schema.tables "
-            "WHERE table_name = 'items' ORDER BY 1"
-        )
-        assert cur.fetchall() == [("public",), ("py",)]
-        cur.execute("INSERT INTO py.items VALUES (2, 'made-by-rust')")
-
-    assert _python_sql(home, "SELECT k, label FROM py.items ORDER BY k") == [
-        (1, "made-by-python"),
-        (2, "made-by-rust"),
-    ]
 
 
 def test_duplicate_key_reports_what_postgres_reports(home: Path) -> None:
@@ -12200,31 +12169,6 @@ def test_char_n_comparison_ignores_trailing_blanks(home: Path) -> None:
         assert conn.execute("select id from c where v = 'ab  '").fetchall() == []
 
 
-def test_a_declared_width_survives_the_hand_off_to_the_other_server(home: Path) -> None:
-    """The catalog is shared, and so is a column's DECLARED type.
-
-    The Python server writes a `char(n)` column as `type: "text"` with
-    `decl_oid: 1042` and an `atttypmod`; the Rust side modelled neither, so it
-    read such a column as plain `text` (oid 25) with no width -- and wrote
-    `type: "bpchar"`, which the Python side read as text in turn. The values
-    always survived; the declared type did not, in either direction.
-    """
-    from secantus.sql import engine as sql_engine
-    from secantus.storage import Storage as PyStorage
-
-    store = PyStorage(str(home), durable=True)
-    try:
-        sql_engine.run_sql(store, "postgres", "create table c (id int primary key, c char(4))")
-        sql_engine.run_sql(store, "postgres", "insert into c values (1, 'ab')")
-    finally:
-        store.close()
-
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.execute("select c from c")
-        assert cur.fetchall() == [("ab  ",)]
-        assert (cur.description[0].type_code, cur.description[0].display_size) == (1042, 4)
-
-
 def test_sum_result_types(home: Path) -> None:
     """`sum()`'s result type is PostgreSQL's, which is not a uniform widening.
 
@@ -15272,24 +15216,6 @@ def test_a_rust_view_and_index_are_read_by_the_python_server(home: Path) -> None
     assert _python_sql(home, "SELECT indexname FROM pg_indexes WHERE indexname = 'vt_n'") == [
         ("vt_n",)
     ]
-
-
-def test_a_python_view_and_index_are_read_by_the_rust_server(home: Path) -> None:
-    """The other direction: the Python server's sqlglot-rendered definition
-    has to parse under libpg_query, and its index has to be listed."""
-    _python_sql(
-        home,
-        "CREATE TABLE pt (id int PRIMARY KEY, g text, n int)",
-        "INSERT INTO pt VALUES (1,'a',10),(2,'b',20)",
-        "CREATE VIEW pv AS SELECT id, n * 2 AS dbl FROM pt WHERE g = 'b'",
-        "CREATE INDEX pt_g ON pt (g)",
-    )
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT id, dbl FROM pv")
-        assert cur.fetchall() == [(2, 40)]
-        cur.execute("SELECT indexdef FROM pg_indexes WHERE indexname = 'pt_g'")
-        assert cur.fetchall() == [("CREATE INDEX pt_g ON public.pt USING btree (g)",)]
 
 
 def test_a_unique_index_admits_many_nulls_and_names_itself(home: Path) -> None:
