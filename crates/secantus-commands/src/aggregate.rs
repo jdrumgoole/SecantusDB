@@ -677,7 +677,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // ran through its cursor stage: a `$sort` after a `$group`, or the
     // `$sort` or `$project` of a `$bucket`, `$sortByCount` or `$count`
     // (RM-360).
-    let mut sorted_after_sbe = false;
+    let mut sorted_after_sbe: Option<usize> = None;
     // Fetch the input documents + decide the remaining pipeline.
     let (ns, input, working_pipeline): (String, Vec<Document>, Vec<Bson>) = match &coll {
         Some(c) => {
@@ -925,7 +925,8 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         let _ = crate::explain::summary::plan_summary(doc, ctx);
                         secantus_core::deadline::pipeline_counted();
                     }
-                    // A `$sort` after an SBE `$group` plans its front and
+                    // A `$sort` after an SBE `$group`, or after stages that
+                    // pass one document on for each, plans its front and
                     // counts the same 5; its `getMore` takes no lock of its
                     // own, the cursor stage taking a global IS per buffer
                     // (RM-360, measured 8.2.11 2026-11-18).
@@ -933,14 +934,15 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         && !crate::explain::order::is_uncounted()
                         && !doc.contains_key("autocommit")
                         && crate::ts_buckets::bucketed(storage, &ctx.db_name, c).is_none()
-                        && sort_after_sbe_group(
+                        && sort_after_cursor_stage(
                             storage,
                             &ctx.db_name,
                             c,
                             &read_pipeline,
                             hint,
                             collation.as_ref(),
-                        );
+                        )
+                        .is_some();
                     if sorted_after_sbe {
                         let _ = crate::explain::summary::plan_summary(doc, ctx);
                         secantus_core::deadline::pipeline_counted();
@@ -1099,17 +1101,17 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     collation.as_ref(),
                 ) {
                     secantus_core::deadline::pipeline_counted();
-                } else {
-                    sorted_after_sbe = c == asked
-                        && crate::ts_buckets::bucketed(storage, &ctx.db_name, c).is_none()
-                        && sort_after_sbe_group(
-                            storage,
-                            &ctx.db_name,
-                            c,
-                            &read_pipeline,
-                            hint,
-                            collation.as_ref(),
-                        );
+                } else if c == asked
+                    && crate::ts_buckets::bucketed(storage, &ctx.db_name, c).is_none()
+                {
+                    sorted_after_sbe = sort_after_cursor_stage(
+                        storage,
+                        &ctx.db_name,
+                        c,
+                        &read_pipeline,
+                        hint,
+                        collation.as_ref(),
+                    );
                 }
                 // The plan the pipeline's first read runs uses its indexes
                 // once (a `$lookup`'s reads count none: measured 8.2.11).
@@ -1332,16 +1334,21 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             loads = Some(stage);
         }
     }
-    // A `$sort` after a `$group` mongod's slot-based engine runs reads the
-    // group's output through the cursor stage, which takes the global lock
+    // A `$sort` after a `$group` mongod's slot-based engine runs, or after
+    // stages that pass on one document for each they take, reads its input
+    // through the cursor stage, which takes the global lock
     // for each buffer it loads (32 documents, then twice as many each time,
     // until one comes back short); the `$sort` pulls every document through
     // the cursor stage and one more that finds the end, then passes each on
     // with a `getNext`, and one more finds its end when the batch is not
     // filled -- each `getNext` a tick of the pipeline's interrupt checker
-    // (RM-360, measured 8.2.11 2026-11-17).
+    // (RM-360, measured 8.2.11 2026-11-17). Each classic stage between the
+    // cursor stage and the `$sort` is pulled once for each document and once
+    // more for the end, as the cursor stage is (measured 2026-11-18:
+    // `[{$addFields}, {$sort}]` over 300 documents ticks 703 times).
     let mut ticks_left = None;
-    if sorted_after_sbe && !crate::explain::order::is_uncounted() && !doc.contains_key("autocommit")
+    if let Some(between) = sorted_after_sbe
+        .filter(|_| !crate::explain::order::is_uncounted() && !doc.contains_key("autocommit"))
     {
         let (mut loaded, mut asked) = (0usize, CURSOR_STAGE_FIRST_BUFFER);
         loop {
@@ -1361,7 +1368,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let found_end = first_batch.len() < wanted;
         secantus_core::deadline::resume_ticks(secantus_core::deadline::FRESH_TICKS);
         secantus_core::deadline::tick_stages(
-            (total + 1 + first_batch.len() + usize::from(found_end)) as u64,
+            ((between + 1) * (total + 1) + first_batch.len() + usize::from(found_end)) as u64,
         )?;
         secantus_core::deadline::pipeline_counted();
         ticks_left = Some(secantus_core::deadline::ticks_to_check());
@@ -7381,6 +7388,51 @@ mod documents_argument_tests {
 
 /// The documents mongod's cursor stage loads into its first buffer.
 const CURSOR_STAGE_FIRST_BUFFER: usize = 32;
+
+/// The classic stages between mongod's cursor stage and the stage that
+/// ends `pipeline` (RM-360): none after the stages its slot-based engine
+/// takes ([`sort_after_sbe_group`]), or, over a classic read, the stages
+/// before a closing `$sort` when each passes on one document for each it
+/// takes (measured 8.2.11 2026-11-18: `[{$addFields}, {$sort}]` of 300
+/// documents 14 and a `getMore` of 4; `[{$project}, {$sort}]`, the
+/// `$project` in the plan, 12 and 3).
+fn sort_after_cursor_stage(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    pipeline: &[Bson],
+    hint: Option<&Bson>,
+    collation: Option<&secantus_core::collation::Collation>,
+) -> Option<usize> {
+    if sort_after_sbe_group(storage, db, coll, pipeline, hint, collation) {
+        return Some(0);
+    }
+    let hoisted = crate::explain::hoist::hoist_runnable(pipeline);
+    if crate::explain::sbe_pushdown(storage, db, coll, &hoisted, hint, collation).is_some() {
+        return None;
+    }
+    let query = crate::explain::pipeline_canonical(coll, pipeline);
+    let (sort, between) = query.rest.split_last()?;
+    let name = |s: &Bson| {
+        s.as_document()
+            .and_then(|d| d.keys().next())
+            .map_or(String::new(), String::clone)
+    };
+    let one_for_one = |s: &Bson| {
+        matches!(
+            name(s).as_str(),
+            "$project" | "$unset" | "$addFields" | "$set" | "$replaceRoot" | "$replaceWith"
+        ) && !crate::agg_stream::mentions_meta(s)
+    };
+    (query.skip == 0
+        && query.limit == 0
+        && (!between.is_empty() || query.projection_stage.is_some())
+        && name(sort) == "$sort"
+        && !crate::agg_meta::reads_sort_key(sort)
+        && !crate::agg_stream::mentions_meta(sort)
+        && between.iter().all(one_for_one))
+    .then_some(between.len())
+}
 
 /// Whether `pipeline` ends in a stage the classic engine runs over
 /// mongod's cursor stage after the stages its slot-based engine took
