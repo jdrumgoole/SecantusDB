@@ -99,6 +99,15 @@ fn verifies(home: &Path, table: &str) -> bool {
     ok
 }
 
+/// The WiredTiger table holding `db.coll`'s documents (its own, named by
+/// its ident), read by opening the store and closing it again.
+fn table_of(home: &Path, db: &str, coll: &str, server_like: bool) -> String {
+    let st = Storage::open_with_options(home.to_str().unwrap(), &options(server_like)).unwrap();
+    let table = st.collection_table_name(db, coll).unwrap().unwrap();
+    st.close().unwrap();
+    table
+}
+
 /// The collection's indexes agree with its documents; answers how many
 /// documents it has.
 fn consistent(st: &Storage, db: &str, coll: &str) -> i64 {
@@ -125,7 +134,7 @@ fn repair_of_a_healthy_store_changes_nothing() {
     assert!(report.rebuilt.is_empty(), "{report:?}");
     assert!(report
         .verified
-        .contains(&secantus_storage::collection_table("app", "c")));
+        .contains(&table_of(&home, "app", "c", false)));
     assert!(
         lines.iter().any(|l| l == "Repairing collection app.c"),
         "{lines:?}"
@@ -142,7 +151,7 @@ fn repair_of_a_healthy_store_changes_nothing() {
 fn salvages_a_damaged_document_shard(server_like: bool) {
     let home = temp_home();
     seeded(&home, server_like);
-    let shard = secantus_storage::collection_table("app", "c");
+    let shard = table_of(&home, "app", "c", server_like);
     damage(&home, &shard);
     let mut lines = Vec::new();
     let report = repair(home.to_str().unwrap(), &options(server_like), &mut |l| {

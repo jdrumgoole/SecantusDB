@@ -151,7 +151,10 @@ impl Storage {
             CompactTarget::Collection(db, coll) => {
                 let session = self.conn.open_session()?;
                 let descs = self.index_descs(&session, db, coll)?;
-                let mut tables = vec![doc_table_for(db, coll), NAT_SEQ_TABLE.to_string()];
+                let mut tables: Vec<String> = collection_table(&session, db, coll)?
+                    .into_iter()
+                    .chain([NAT_SEQ_TABLE.to_string()])
+                    .collect();
                 if descs.iter().any(|d| !d.id_claim && d.name != ID_INDEX_NAME) {
                     tables.push(IDX_ENTRIES_TABLE.to_string());
                 }

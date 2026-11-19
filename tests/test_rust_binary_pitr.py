@@ -56,7 +56,6 @@ _TIMEOUT_MARK = pytest.mark.timeout(
 
 pymongo = pytest.importorskip("pymongo")
 
-from secantus.storage import Storage  # noqa: E402
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -177,11 +176,10 @@ def _rust_server(data: pathlib.Path, *extra: str) -> Iterator[pymongo.MongoClien
 
 
 def _docs(path: pathlib.Path, db: str, coll: str) -> list[dict[str, Any]]:
-    s = Storage(str(path), enable_oplog=True)
-    try:
-        return sorted(s.find_matching(db, coll, {}), key=lambda d: d["_id"])
-    finally:
-        s.close()
+    """`db.coll`'s documents in the store at `path`, read through the Rust
+    binary (the deprecated Python `Storage` does not read mongod's layout)."""
+    with _rust_server(path) as client:
+        return sorted(client[db][coll].find({}), key=lambda d: d["_id"])
 
 
 def _restore(
@@ -225,14 +223,10 @@ def test_rust_binary_restore_to_timestamp(tmp_path: pathlib.Path) -> None:
     data = tmp_path / "data"
     with _rust_server(data) as client:
         client["app"]["c"].insert_many([{"_id": 1}, {"_id": 2}])
-
-    # The timestamp after the two inserts, read from the stopped data dir.
-    s = Storage(str(data), enable_oplog=True)
-    try:
-        tail = s.oplog_tail_seq()
-        ts = s.read_oplog(start_seq=tail, limit=1)[0][1]["ts"]
-    finally:
-        s.close()
+        # The timestamp of the second insert: the oplog's last entry for it.
+        ts = next(client["local"]["oplog.rs"].find({"ns": "app.c"}).sort("$natural", -1).limit(1))[
+            "ts"
+        ]
 
     out = tmp_path / "restored"
     res = _restore(data, out, "--to-timestamp", f"{ts.time},{ts.inc}")
@@ -336,11 +330,10 @@ def test_rust_binary_v2_archive_base_snapshot_and_restore(tmp_path: pathlib.Path
 
 
 def _restored_oplog_len(path: pathlib.Path) -> int:
-    s = Storage(str(path), enable_oplog=True)
-    try:
-        return len(s.read_oplog(start_seq=1, limit=1000))
-    finally:
-        s.close()
+    """How many CRUD entries for `app.c` the restored store's oplog holds,
+    read through the Rust binary."""
+    with _rust_server(path) as client:
+        return client["local"]["oplog.rs"].count_documents({"ns": "app.c"})
 
 
 def test_rust_binary_preserve_oplog(tmp_path: pathlib.Path) -> None:

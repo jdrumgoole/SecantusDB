@@ -83,7 +83,9 @@ pub fn repair(
             log(&format!("Repairing collection {ns}"));
             let check = storage.check_collection(&db, &coll)?;
             let inconsistent = check_disagrees(&check);
-            if shared_index_salvaged || salvaged(&doc_table_for(&db, &coll)) || inconsistent {
+            let table = storage.collection_table_name(&db, &coll)?;
+            let table_salvaged = table.as_deref().is_some_and(&salvaged);
+            if shared_index_salvaged || table_salvaged || inconsistent {
                 duplicates += storage.rebuild_indexes(&db, &coll)?;
                 log(&format!("Rebuilt the indexes of {ns}"));
                 rebuilt.push(ns);

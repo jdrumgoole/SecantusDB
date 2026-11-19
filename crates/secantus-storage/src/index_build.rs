@@ -857,6 +857,8 @@ impl Storage {
                         c.set_value_u(&encode_doc(&payload)?);
                         c.insert()?;
                     }
+                    // The catalog mongod reads says what the registry says.
+                    sync_catalog_entry(&session, &b.db, &b.coll)?;
                     let rec = session.open_cursor(BUILDS_TABLE, None)?;
                     rec.set_key_u(&b.uuid);
                     rec.remove()?;
@@ -1304,7 +1306,7 @@ impl Storage {
         b: &ActiveBuild,
         rid: i64,
     ) -> Result<Option<Document>> {
-        let cur = match session.open_cursor(&doc_table_for(&b.db, &b.coll), None) {
+        let cur = match open_doc_cursor(session, &b.db, &b.coll, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok(None),
             Err(e) => return Err(e.into()),

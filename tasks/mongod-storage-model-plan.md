@@ -234,6 +234,35 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
    (byte-string RecordId) land here, since phase 5 needs them. The tables in
    the "missed" inventory that have a mongod home become those collections
    here.
+   **Phases 2 and 3 land together** (2026-11-19): a catalog row naming an
+   ident whose table does not exist yet would be a third intermediate format
+   for nothing. As built:
+   - `_mdb_catalog` is written beside this server's own registry
+     (`secantus_collections`, `secantus_indexes`), in the same WiredTiger
+     transaction, at every registry write (`sync_catalog_entry`), and
+     rewritten whole at each open. The registry stays the working set its
+     transactional machinery (deferred creates, catalog generations) is
+     built on; the catalog is what mongod reads, and phase 7's reverse
+     direction rebuilds the registry from it.
+   - Where a collection's documents live is `secantus_idents`, `(db, coll)
+     -> {ident, catalogId}`, so a lookup is one search in the reader's
+     snapshot; a collection created inside a transaction keeps its
+     placement on the transaction until commit, as its registry row is.
+   - Documents keep the framed value (`[len][id_key][BSON]`) until phase 5,
+     which needs it gone for buckets anyway; the `_id_` and secondary index
+     rows stay in the shared tables, keyed by namespace, until phase 4.
+     A rename therefore still rewrites those rows in chunks, but moves the
+     documents' table whole; a drop unlists the table and drops it once its
+     transaction commits and nothing has it open, and an open drops any
+     `collection-*` table no placement names.
+   - Not yet, and where it goes: clustered collections need KeyString
+     RecordIds (phase 4); views are kept in the registry, not in a
+     `system.views` collection (phase 7, which must read mongod's); a read
+     in a snapshot older than a drop finds the table gone and is refused
+     with mongod's `SnapshotUnavailable` message, but the reaper does not
+     yet wait for the oldest reader before dropping, as mongod's does --
+     phase 4b, when the store keeps mongod's timestamps.
+   - Store format version 2.
 4. **One table per index, in KeyString.** Port mongod's KeyString encoding
    and TypeBits; each index gets its own table keyed by KeyString; `_id_`
    becomes a real unique index and `secantus_natural_seq` and
