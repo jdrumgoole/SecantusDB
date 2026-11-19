@@ -30,6 +30,7 @@ PAGE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
+<link rel="icon" type="image/svg+xml" href="/theme/img/favicon.svg">
 {fonts}
 <style>
 html,body{{margin:0;height:100%;background:#0B1915;overflow:hidden;}}
