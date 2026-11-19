@@ -1127,6 +1127,25 @@ one beside it.
 
 ## Found while working RP-911 (2026-11-15)
 
+## Found while fixing the RP-911 latency test's noise (2026-11-19)
+
+- [ ] **OPEN — the first catalog query after a `CREATE TABLE` still grows
+      with the schema, about 0.9 ms per thousand tables (debug build).**
+      psql's `\d` collation query, run straight after a `CREATE TABLE`:
+      11.5 ms with no other table, 11.8 ms with 800, 13.5 ms with 2,400 and
+      15.9 ms with 4,800 (one debug `secantusd-pg`, arm64 macOS). PostgreSQL
+      15.19 takes the same time at any size: DDL invalidates only the cache
+      entries it changed (`inval.c`) and its scans read one relation's rows
+      by index. A sample at 8,000 tables shows whole-schema walks per
+      statement: `install_user_types` -> `install_session_state`
+      (`committed_table_defs`, `patch_table_defs`) and `publish_user_types`
+      -> `index_relations` -> `derive_index_relations`, which visits every
+      table's columns; and `catalog_rows_keyed` -> `build_catalog_rows`.
+      Which of these grow is not yet split out: profile 0 against 8,000
+      tables before changing one.
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth
+      Backlog-ID: RP-1073
+
 ## Found while working RP-970 (2026-11-18)
 
 - [ ] **OPEN — `'_custom'::regtype` names `custom`'s array, not the type

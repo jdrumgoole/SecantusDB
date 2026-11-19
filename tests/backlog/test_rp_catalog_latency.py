@@ -119,6 +119,9 @@ def pg_pair(tmp_path: Path) -> Iterator[tuple[Any, Any]]:
 #: Rounds each paired timing takes.
 ROUNDS = 15
 
+#: Runs on each server a round takes the fastest of.
+TRIALS = 3
+
 
 def _paired(
     small: Any, large: Any, run: Callable[[Any, str], float], prefix: str
@@ -126,10 +129,31 @@ def _paired(
     """`ROUNDS` timings of `run` on each connection, taken in pairs back to
     back so the machine's load meets both alike: a minimum taken over each
     server's runs apart let a load that rose or fell between them flip the
-    verdict either way (2026-11-13; CI on 2026-11-14, -15 and -17)."""
+    verdict either way (2026-11-13; CI on 2026-11-14, -15 and -17).
+
+    Each round is the fastest of `TRIALS` runs on each server, the two
+    servers' runs interleaved and the one that goes first alternating from
+    round to round, after a round on each that is not counted. One run a
+    pair was not enough on CI (2026-11-18, snapshot PR #2874): the rounds'
+    ratios fell in two clusters, about 0.95 and 1.2, as a stall of a few
+    milliseconds (a runner shared with three other test workers) landed on
+    one server's run or the other's, and the median took whichever cluster
+    held eight of the fifteen. A stall only adds time, so the fastest of
+    runs taken milliseconds apart is the run without one, and it meets the
+    same load as its pair's. The first round, which also pays for the
+    connection's first catalog reads (134 ms against 28 on that run), and a
+    fixed order, which always gave one server the run straight after the
+    other's, are kept out of the verdict too."""
+    run(small, f"{prefix}_s_w")
+    run(large, f"{prefix}_l_w")
     pairs = []
     for i in range(ROUNDS):
-        pairs.append((run(small, f"{prefix}_s_{i}"), run(large, f"{prefix}_l_{i}")))
+        best = [float("inf"), float("inf")]
+        for t in range(TRIALS):
+            order = ((0, small), (1, large)) if (i + t) % 2 == 0 else ((1, large), (0, small))
+            for side, conn in order:
+                best[side] = min(best[side], run(conn, f"{prefix}_{'sl'[side]}_{i}_{t}"))
+        pairs.append((best[0], best[1]))
     return pairs
 
 
@@ -279,6 +303,34 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a
     print(_ratios(pairs, "first query after DDL", 2 * GROWTH_TABLES))
     assert _median_excess(pairs, 1.1) < 0.001, _describe(
         pairs, "first query after DDL", 2 * GROWTH_TABLES
+    )
+
+
+@pytest.mark.backlog("RP-1073")
+def test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth(
+    pg_pair: tuple[Any, Any],
+) -> None:
+    """PostgreSQL 15.19 answers the first collation query after a `CREATE
+    TABLE` in the same time however many other tables there are (0.33 ms
+    with 200, 0.20 ms with 400, private cluster, 2026-11-12).
+
+    A debug `secantusd-pg` on arm64 macOS, one server grown in steps
+    (2026-11-19): a median of 11.5 ms with no other table, 11.8 ms with
+    800, 13.5 ms with 2,400 and 15.9 ms with 4,800, about 0.9 ms more for
+    each thousand tables. At 800 that is inside the previous test's tenth
+    again plus 1 ms; here it is not. A sample at 8,000 tables puts the
+    statement's whole-schema walks in `install_user_types`
+    (`committed_table_defs`, `patch_table_defs`, and `publish_user_types`'
+    `index_relations`, which visits every table's columns) and
+    `catalog_rows_keyed`'s `build_catalog_rows`.
+
+    The same bound as at 800 tables, a tenth again plus 1 ms, with four
+    times as many tables."""
+    small, large = pg_pair
+    _grow(large, "rp_g32", 8 * GROWTH_TABLES)
+    pairs = _paired(small, large, _first_collation, "rp_g32")
+    assert _median_excess(pairs, 1.1) < 0.001, _ratios(
+        pairs, "first query after DDL", 8 * GROWTH_TABLES
     )
 
 
