@@ -50,8 +50,7 @@ with PostgresServer() as pg:        # pg.dsn     -> psycopg.connect(...)
 Pass `storage_path=` to keep the data after the server stops, and `port=` to
 choose the port. The wheel's version is the MongoDB server's; the PostgreSQL
 server in it is the newest `secantusd-pg` release when the wheel was built
-(`secantusd-pg --version` prints it). The wheel does not carry the deprecated
-[Python servers](python-servers.md), and there is no sdist.
+(`secantusd-pg --version` prints it). There is no sdist.
 
 ## From crates.io
 

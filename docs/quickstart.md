@@ -127,5 +127,3 @@ suite wants: start one per test or per session and point the driver at it.
 - [Aggregation](aggregation.md) — what pipeline stages and expression
   operators are supported.
 - [Compatibility](compatibility.md) — known differences from real `mongod`.
-- [Deprecated: Python servers](python-servers.md) — the original Python
-  servers, kept as a record.

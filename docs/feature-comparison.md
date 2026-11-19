@@ -1,51 +1,50 @@
 # Feature comparison
 
-A three-way feature matrix: **MongoDB** (real `mongod`, the conformance
-target — SecantusDB vendors the same WiredTiger storage engine and
-advertises wire version 7.0) against SecantusDB's **Python server** and
-**Rust server** (see [The servers](servers.md)).
+A feature matrix: **MongoDB** (real `mongod`, the conformance target —
+SecantusDB vendors the same WiredTiger storage engine) against SecantusDB's
+**Rust MongoDB server**, `secantusd-mdb` (see [The servers](servers.md)).
 
 The honest, machine-checked statement of conformance is the
 [validation reports](validation-summary.md) — the official driver test
 suites (pymongo, Go, Node, Java, Kotlin, Ruby, Rust, PHP library +
 extension, C, C++, .NET) run unmodified against SecantusDB. This page is
-the human-readable decomposition: which features each server implements,
-where they diverge from `mongod`, and where they diverge from each other.
+the human-readable decomposition: which features the server implements,
+and where it diverges from `mongod`.
 
 Legend: ✅ supported · ⚠️ partial (see note) · ❌ not supported.
 The MongoDB column describes `mongod` 7.0 itself and is the reference.
 
 ## At a glance
 
-| | MongoDB | Python server | Rust server |
-| --- | --- | --- | --- |
-| What it is | the real thing | pure-Python in-process server | self-contained Rust server, GIL-free request path |
-| Install | external `mongod` process | source checkout only (deprecated, not published) | `pip install SecantusDB`, the `secantus-mdb` crate (crates.io), or a release archive |
-| Run | daemon | 1-line embedded (`SecantusDBServer`) or `secantusd-py` daemon | `secantusd-mdb` daemon, or in-process from Rust (`secantus_mdb::Server`) |
-| pymongo's own suite | 100% by definition | **99.5%** (1020 pass / 5 fail) | **99.5%** (1020 pass / 5 fail) |
-| Version line | 7.0.x | `0.5.4bN` (the PyPI package) | `0.5.3-beta.N` (crates, `buildInfo.secantusVersion`) |
+| | MongoDB | Rust server |
+| --- | --- | --- |
+| What it is | the real thing | self-contained Rust server, GIL-free request path |
+| Install | external `mongod` process | `pip install SecantusDB`, the `secantus-mdb` crate (crates.io), or a release archive |
+| Run | daemon | `secantusd-mdb` daemon, or in-process from Rust (`secantus_mdb::Server`) |
+| pymongo's own suite | 100% by definition | **99.5%** (1020 pass / 5 fail) |
+| Version line | 7.0.x | `0.5.3-beta.N` (crates, `buildInfo.secantusVersion`) |
 
 ## Deployment and topology
 
-| Feature | MongoDB | Python server | Rust server |
-| --- | --- | --- | --- |
-| Single-node standalone | ✅ | ✅ | ✅ |
-| Embedded in-process (no external process) | ❌ | ✅ | ✅ (Rust accept loop in-process, Python is only the launcher) |
-| Storage engine | WiredTiger | WiredTiger (vendored, same version line) | WiredTiger (vendored, same version line) |
-| In-memory mode | enterprise only | ✅ (`:memory:`) | ✅ |
-| Replica sets (multi-node, elections) | ✅ | ❌ — single-node primary *persona* only, so drivers accept change streams | ❌ — same persona |
-| Sharding / `mongos` | ✅ | ❌ | ❌ |
-| Windows / macOS / Linux | ✅ | ✅ (prebuilt wheels, no toolchain needed) | ✅ binaries for Linux x86_64, macOS arm64 and Windows x86_64; any platform via `cargo install` |
+| Feature | MongoDB | Rust server |
+| --- | --- | --- |
+| Single-node standalone | ✅ | ✅ |
+| Embedded in-process (no external process) | ❌ | ✅ in-process from Rust (`secantus_mdb::Server`); from Python, `secantusdb.MongoServer` starts the binary |
+| Storage engine | WiredTiger | WiredTiger (vendored, same version line) |
+| In-memory mode | enterprise only | ✅ |
+| Replica sets (multi-node, elections) | ✅ | ❌ — same persona |
+| Sharding / `mongos` | ✅ | ❌ |
+| Windows / macOS / Linux | ✅ | ✅ binaries for Linux x86_64, macOS arm64 and Windows x86_64; any platform via `cargo install` |
 
 ## Wire protocol
 
-| Feature | MongoDB | Python server | Rust server |
-| --- | --- | --- | --- |
-| `OP_MSG` (incl. kind-1 document sequences) | ✅ | ✅ | ✅ |
-| Legacy `OP_QUERY` handshake | ✅ | ✅ | ✅ |
-| `OP_COMPRESSED` (`snappy`, `zstd`, `zlib`) | ✅ | ❌ | ✅ |
-| Wire-valid error replies (`ok: 0`, `code`, `codeName`) | ✅ | ✅ | ✅ |
-| Unknown command → `CommandNotFound` (59), connection survives | ✅ | ✅ | ✅ |
+| Feature | MongoDB | Rust server |
+| --- | --- | --- |
+| `OP_MSG` (incl. kind-1 document sequences) | ✅ | ✅ |
+| Legacy `OP_QUERY` handshake | ✅ | ✅ |
+| `OP_COMPRESSED` (`snappy`, `zstd`, `zlib`) | ✅ | ✅ |
+| Wire-valid error replies (`ok: 0`, `code`, `codeName`) | ✅ | ✅ |
+| Unknown command → `CommandNotFound` (59), connection survives | ✅ | ✅ |
 
 ## Commands
 
@@ -59,21 +58,21 @@ Both servers implement the same core dispatch surface: CRUD
 `configureFailPoint`), sessions / transactions, and the full auth / RBAC
 command set. The divergences:
 
-| Command | MongoDB | Python server | Rust server |
-| --- | --- | --- | --- |
-| `mapReduce` | ⚠️ deprecated | ⚠️ `{out: {inline: 1}}` only; canonical emit/count patterns translated (no JS runtime) | ⚠️ same as the Python server (a case-for-case port) |
-| `top` | ✅ | ⚠️ correct shape, counters always 0 | ⚠️ correct shape, counters always 0 |
-| `serverStatus` | ✅ | ⚠️ version + mostly-zeroed metrics | ⚠️ smaller subset still |
-| `dbStats` / `collStats` | ✅ | ✅ real counts/sizes from the WT tables | ⚠️ `dataSize` used for size fields |
-| `replSetGetStatus` | ✅ | ⚠️ single-node persona reply | ⚠️ single-node persona reply |
-| `replSetStepDown` | ✅ | ⚠️ the single-node behaviour: `force: true` makes the node a secondary for the period (writes `10107`, reads served), then primary again. Election TIMING not reproduced — mongod's return is driven by an election, so a 0-second period takes ~19s there and 0s here | ⚠️ same |
-| `getParameter` / `setParameter` | ✅ | ⚠️ the parameters this server actually has (`logLevel`, `quiet`, and the read-only handshake ones). A name we do not register is refused `72` rather than accepted and ignored | ⚠️ same |
-| Atlas Search index commands (`createSearchIndexes`, …) | Atlas only | ❌ rejected (`CommandNotSupported`) | ❌ rejected |
-| `secantusAdmin.*` (backup / PITR / prune — SecantusDB-proprietary) | — | ✅ | ✅ (`restoreToTimestamp` via the `secantusd-mdb restore` CLI rather than a wire command) |
+| Command | MongoDB | Rust server |
+| --- | --- | --- |
+| `mapReduce` | ⚠️ deprecated | ⚠️ `{out: {inline: 1}}` only; canonical emit/count patterns translated (no JS runtime) |
+| `top` | ✅ | ⚠️ correct shape, counters always 0 |
+| `serverStatus` | ✅ | ⚠️ smaller subset still |
+| `dbStats` / `collStats` | ✅ | ⚠️ `dataSize` used for size fields |
+| `replSetGetStatus` | ✅ | ⚠️ single-node persona reply |
+| `replSetStepDown` | ✅ | ⚠️ same |
+| `getParameter` / `setParameter` | ✅ | ⚠️ same |
+| Atlas Search index commands (`createSearchIndexes`, …) | Atlas only | ❌ rejected |
+| `secantusAdmin.*` (backup / PITR / prune — SecantusDB-proprietary) | — | ✅ (`restoreToTimestamp` via the `secantusd-mdb restore` CLI rather than a wire command) |
 
 ## Query operators
 
-Identical surface on both servers: all comparison (`$eq` `$ne` `$gt` `$gte`
+Supported: all comparison (`$eq` `$ne` `$gt` `$gte`
 `$lt` `$lte` `$in` `$nin`), logical (`$and` `$or` `$nor` `$not`), element
 (`$exists` `$type`), evaluation (`$mod` `$regex` `$expr` `$jsonSchema`
 `$comment`), array (`$all` `$elemMatch` `$size`), bitwise (`$bitsAllSet`
@@ -81,11 +80,11 @@ Identical surface on both servers: all comparison (`$eq` `$ne` `$gt` `$gte`
 `$geoIntersects` `$near` `$nearSphere` with `$geometry` / `$box` / `$center` /
 `$centerSphere` / `$polygon` / `$maxDistance` / `$minDistance`) operators.
 
-| Feature | MongoDB | Python server | Rust server |
-| --- | --- | --- | --- |
-| `$where` (JavaScript) | ✅ | ❌ (no JS runtime — out of scope) | ❌ |
-| `$text` | ✅ | ❌ (no text indexes) | ❌ |
-| `$jsonSchema` | ✅ | ⚠️ full keyword set except `$ref` and metadata keywords | ⚠️ same |
+| Feature | MongoDB | Rust server |
+| --- | --- | --- |
+| `$where` (JavaScript) | ✅ | ❌ |
+| `$text` | ✅ | ❌ |
+| `$jsonSchema` | ✅ | ⚠️ same |
 
 ## Update operators
 
@@ -107,11 +106,11 @@ Both servers: `$match` `$project` `$addFields`/`$set` `$unset` `$replaceRoot`
 `$currentOp` `$listLocalSessions` `$listSessions` (the session/op stages emit
 synthesized rows on both).
 
-| Feature | MongoDB | Python server | Rust server |
-| --- | --- | --- | --- |
-| `$search` / `$searchMeta` / `$vectorSearch` / `$listSearchIndexes` | Atlas only | ❌ rejected cleanly | ❌ rejected cleanly |
-| Leading-`$match` index acceleration | ✅ | ✅ | ✅ |
-| `$lookup` index-driven join | ✅ | ✅ (foreign-field index → IXSCAN, else hash join) | ✅ |
+| Feature | MongoDB | Rust server |
+| --- | --- | --- |
+| `$search` / `$searchMeta` / `$vectorSearch` / `$listSearchIndexes` | Atlas only | ❌ rejected cleanly |
+| Leading-`$match` index acceleration | ✅ | ✅ |
+| `$lookup` index-driven join | ✅ | ✅ |
 
 ## `$group` accumulators and window functions
 
@@ -123,10 +122,10 @@ Both servers: `$sum` `$avg` `$min` `$max` `$first` `$last` `$push` `$addToSet`
 windows (fixed-duration time units; calendar units `month` / `quarter` /
 `year` are not accepted in window bounds on either server).
 
-| Feature | MongoDB | Python server | Rust server |
-| --- | --- | --- | --- |
-| `$median` / `$percentile` | ✅ | ❌ | ❌ |
-| `$accumulator` (JS) | ✅ | ❌ (no JS runtime) | ❌ |
+| Feature | MongoDB | Rust server |
+| --- | --- | --- |
+| `$median` / `$percentile` | ✅ | ❌ |
+| `$accumulator` (JS) | ✅ | ❌ |
 
 ## Expression operators
 
@@ -168,97 +167,93 @@ in expression position (`$sum` / `$avg` / `$min` / `$max` / `$stdDevPop` /
 form, `$toLong` and `$toObjectId`.
 
 Rust-server-only limitations: a handful of edge cases the Rust engine
-rejects rather than risk diverging from the Python oracle — some
+rejects rather than risk diverging from `mongod` — some
 `$dateFromString` / `$dateToString` format directives, Decimal128 arithmetic
 edges, and sorts over non-totally-orderable value mixes (NaN / bool /
 Decimal128).
 
 Unknown expression operators report mongod's error codes: a query `$expr`
-returns `InvalidPipelineOperator` (168) on both servers, and a `$project`
-returns mongod's `Location31325` shape on the Python server (the Rust server
-still returns a generic `BadValue` for the `$project` case).
+returns `InvalidPipelineOperator` (168), as mongod does; a `$project`
+still returns a generic `BadValue` where mongod returns `Location31325`.
 
 ## Indexes
 
-| Feature | MongoDB | Python server | Rust server |
-| --- | --- | --- | --- |
-| Single-field + compound, mixed ASC/DESC | ✅ | ✅ | ✅ |
-| Unique (E11000 dup-key message shape) | ✅ | ✅ | ✅ |
-| Sparse | ✅ | ✅ | ✅ |
-| Partial (`partialFilterExpression` + planner implication) | ✅ | ✅ | ✅ |
-| TTL (`expireAfterSeconds`, background sweeper) | ✅ | ✅ | ✅ |
-| Multikey (array) | ✅ | ✅ | ✅ |
-| Per-index collation | ✅ | ⚠️ matching: strength 1–3 + `caseLevel`; `numericOrdering` → COLLSCAN. Ordering is a three-level key (accents, case, `caseFirst`, `backwards`, `numericOrdering`); locale-specific order (Swedish `ä`) needs ICU | ⚠️ same |
-| Hidden indexes | ✅ | ✅ | ✅ |
-| Geo `2dsphere` (S2 coverings) / `2d` (geohash) | ✅ | ✅ | ✅ |
-| Text | ✅ | ❌ rejected | ❌ rejected |
-| Hashed | ✅ | ❌ rejected | ❌ rejected |
-| Wildcard (`$**`) | ✅ | ❌ | ❌ |
-| `hint` (name, key spec, `{$natural: ±1}`) | ✅ | ✅ | ✅ |
-| `explain` (IXSCAN/COLLSCAN + `winningPlan` shape) | ✅ | ✅ | ✅ |
+| Feature | MongoDB | Rust server |
+| --- | --- | --- |
+| Single-field + compound, mixed ASC/DESC | ✅ | ✅ |
+| Unique (E11000 dup-key message shape) | ✅ | ✅ |
+| Sparse | ✅ | ✅ |
+| Partial (`partialFilterExpression` + planner implication) | ✅ | ✅ |
+| TTL (`expireAfterSeconds`, background sweeper) | ✅ | ✅ |
+| Multikey (array) | ✅ | ✅ |
+| Per-index collation | ✅ | ⚠️ same |
+| Hidden indexes | ✅ | ✅ |
+| Geo `2dsphere` (S2 coverings) / `2d` (geohash) | ✅ | ✅ |
+| Text | ✅ | ❌ rejected |
+| Hashed | ✅ | ❌ rejected |
+| Wildcard (`$**`) | ✅ | ❌ |
+| `hint` (name, key spec, `{$natural: ±1}`) | ✅ | ✅ |
+| `explain` (IXSCAN/COLLSCAN + `winningPlan` shape) | ✅ | ✅ |
 
 ## Collections
 
-| Feature | MongoDB | Python server | Rust server |
-| --- | --- | --- | --- |
-| Capped collections (FIFO eviction, tailable cursors) | ✅ | ✅ | ✅ |
-| Timeseries collections | ✅ | ✅ (duplicate `_id`s handled) | ✅ |
-| Clustered collections (`{_id: 1}`) | ✅ | ✅ | ✅ |
-| Schema validation (`validator`, `validationLevel` / `validationAction`) | ✅ | ✅ | ✅ |
-| Views (`viewOn` + pipeline, incl. views-on-views) | ✅ | ✅ | ✅ |
+| Feature | MongoDB | Rust server |
+| --- | --- | --- |
+| Capped collections (FIFO eviction, tailable cursors) | ✅ | ✅ |
+| Timeseries collections | ✅ | ✅ |
+| Clustered collections (`{_id: 1}`) | ✅ | ✅ |
+| Schema validation (`validator`, `validationLevel` / `validationAction`) | ✅ | ✅ |
+| Views (`viewOn` + pipeline, incl. views-on-views) | ✅ | ✅ |
 
 ## Change streams
 
-| Feature | MongoDB | Python server | Rust server |
-| --- | --- | --- | --- |
-| Collection / database / cluster scope | ✅ | ✅ | ✅ |
-| `fullDocument: updateLookup` / `whenAvailable` / `required` | ✅ | ✅ | ✅ |
-| Pre-images (`fullDocumentBeforeChange`) | ✅ | ✅ | ✅ |
-| `resumeAfter` / `startAfter` / `startAtOperationTime` | ✅ | ✅ | ✅ |
-| `showExpandedEvents` (DDL events) | ✅ | ✅ | ✅ |
-| `splitLargeChangeStreamEvents` / `$changeStreamSplitLargeEvent` | ✅ | ✅ | ✅ |
-| Invalidate on drop / dropDatabase / rename | ✅ | ✅ | ✅ |
-| Resume tokens interchangeable with real mongod | ✅ | ❌ SecantusDB's own `{s,t,n,k}` layout — round-trips within SecantusDB only | ❌ same layout (interchangeable between the two servers) |
+| Feature | MongoDB | Rust server |
+| --- | --- | --- |
+| Collection / database / cluster scope | ✅ | ✅ |
+| `fullDocument: updateLookup` / `whenAvailable` / `required` | ✅ | ✅ |
+| Pre-images (`fullDocumentBeforeChange`) | ✅ | ✅ |
+| `resumeAfter` / `startAfter` / `startAtOperationTime` | ✅ | ✅ |
+| `showExpandedEvents` (DDL events) | ✅ | ✅ |
+| `splitLargeChangeStreamEvents` / `$changeStreamSplitLargeEvent` | ✅ | ✅ |
+| Invalidate on drop / dropDatabase / rename | ✅ | ✅ |
+| Resume tokens interchangeable with real mongod | ✅ | ❌ SecantusDB's own `{s, t, n, k}` layout |
 
 ## Transactions and sessions
 
-| Feature | MongoDB | Python server | Rust server |
-| --- | --- | --- | --- |
-| Multi-document transactions (WT-backed, single-node) | ✅ | ✅ | ✅ |
-| `commitTransaction` / `abortTransaction` (idempotency, error labels, `NoSuchTransaction`, write conflicts) | ✅ | ✅ | ✅ |
-| Read/write concern | ✅ | ⚠️ accepted and ignored (single node — no majority/snapshot semantics) | ⚠️ same |
-| `readConcern: snapshot` timestamp pinning | ✅ | ⚠️ accepted, reads not actually pinned | ⚠️ same |
-| Retryable writes | ✅ | ⚠️ envelope tolerated, no dedup by `txnNumber` | ⚠️ same |
-| Logical sessions (`lsid` tracking, 30-min TTL, kill/refresh) | ✅ | ✅ | ⚠️ `startSession` real; end/refresh/kill acknowledged as no-ops |
+| Feature | MongoDB | Rust server |
+| --- | --- | --- |
+| Multi-document transactions (WT-backed, single-node) | ✅ | ✅ |
+| `commitTransaction` / `abortTransaction` (idempotency, error labels, `NoSuchTransaction`, write conflicts) | ✅ | ✅ |
+| Read/write concern | ✅ | ⚠️ same |
+| `readConcern: snapshot` timestamp pinning | ✅ | ⚠️ same |
+| Retryable writes | ✅ | ⚠️ same |
+| Logical sessions (`lsid` tracking, 30-min TTL, kill/refresh) | ✅ | ⚠️ `startSession` real; end/refresh/kill acknowledged as no-ops |
 
 ## Authentication and transport security
 
-| Feature | MongoDB | Python server | Rust server |
-| --- | --- | --- | --- |
-| SCRAM-SHA-256 / SCRAM-SHA-1 | ✅ | ✅ | ✅ |
-| MONGODB-X509 | ✅ | ✅ | ✅ |
-| TLS / mTLS (client-cert verification) | ✅ | ✅ | ✅ (rustls) |
-| RBAC: built-in roles, custom roles, grant/revoke, privileges | ✅ | ✅ | ✅ |
-| LDAP / Kerberos / PLAIN / MONGODB-AWS / MONGODB-OIDC | ✅ (some enterprise) | ❌ | ❌ |
-| Internal cluster auth (keyfile) | ✅ | ❌ (no cluster) | ❌ |
+| Feature | MongoDB | Rust server |
+| --- | --- | --- |
+| SCRAM-SHA-256 / SCRAM-SHA-1 | ✅ | ✅ |
+| MONGODB-X509 | ✅ | ✅ |
+| TLS / mTLS (client-cert verification) | ✅ | ✅ (rustls) |
+| RBAC: built-in roles, custom roles, grant/revoke, privileges | ✅ | ✅ |
+| LDAP / Kerberos / PLAIN / MONGODB-AWS / MONGODB-OIDC | ✅ (some enterprise) | ❌ |
+| Internal cluster auth (keyfile) | ✅ | ❌ |
 
 ## Backup and point-in-time recovery
 
-| Feature | MongoDB | Python server | Rust server |
-| --- | --- | --- | --- |
-| Oplog (single-node, retention + pruning) | ✅ | ✅ | ✅ |
-| Hot backup archive | ✅ (backup cursor / ops tooling) | ✅ `secantusAdmin.backupArchive` / `archiveBaseSnapshot` | ✅ same commands |
-| Restore an archive | ✅ | ✅ `secantusAdmin.restoreArchive` / `secantus-restore-archive` | ✅ |
-| Point-in-time restore (oplog replay) | ✅ (ops tooling) | ✅ `secantusAdmin.restoreToTimestamp` | ⚠️ `secantusd-mdb restore` CLI; no wire command yet |
-| Archives portable between the two servers | — | ✅ | ✅ |
+| Feature | MongoDB | Rust server |
+| --- | --- | --- |
+| Oplog (single-node, retention + pruning) | ✅ | ✅ |
+| Hot backup archive | ✅ (backup cursor / ops tooling) | ✅ same commands |
+| Restore an archive | ✅ | ✅ |
+| Point-in-time restore (oplog replay) | ✅ (ops tooling) | ⚠️ `secantusd-mdb restore` CLI; no wire command yet |
 
 ## Beyond MongoDB: the SQL/PostgreSQL frontend
 
-**There are TWO PostgreSQL servers, and only one of them is in the table
-below.** The Python server speaks the PostgreSQL wire protocol as
-`secantusd-py-pg`, and the Rust one as **`secantusd-pg`** — both against the
-same WiredTiger data, so `psql`, psycopg or SQLAlchemy connect to the store
-MongoDB clients use. See [SQL / PostgreSQL interface](sql.md).
+The PostgreSQL wire protocol is served by a separate binary,
+**`secantusd-pg`**, over the same WiredTiger storage format. See
+[SQL / PostgreSQL interface](sql.md).
 
 The **"Rust server" column below is the Rust MONGODB server** (`secantusd-mdb`),
 which speaks no SQL — so its ❌ is about that binary, not about the Rust side.
@@ -274,17 +269,17 @@ landed on 2026-09-28. `CREATE INDEX`, `CREATE VIEW`, `EXPLAIN` and correlated
 subqueries are still refused, by name; `tasks/backlog.md` carries the measured
 remainder.
 
-| Feature | MongoDB | Python server | Rust server |
-| --- | --- | --- | --- |
-| PostgreSQL v3 wire protocol (simple + extended query) | ❌ | ✅ | ❌ |
-| SQL engine (planner / executor / catalog / window functions / `EXPLAIN`) | ❌ | ✅ | ❌ |
-| PG types & features (bytea, ranges, intervals, hstore, jsonpath, tsvector/tsquery FTS, LISTEN/NOTIFY, RLS, GRANT/REVOKE, plpgsql functions) | ❌ | ✅ | ❌ |
-| PG SCRAM-SHA-256 auth + TLS | ❌ | ✅ (no channel binding) | ❌ |
+| Feature | MongoDB | Rust server |
+| --- | --- | --- |
+| PostgreSQL v3 wire protocol (simple + extended query) | ❌ | ❌ |
+| SQL engine (planner / executor / catalog / window functions / `EXPLAIN`) | ❌ | ❌ |
+| PG types & features (bytea, ranges, intervals, hstore, jsonpath, tsvector/tsquery FTS, LISTEN/NOTIFY, RLS, GRANT/REVOKE, plpgsql functions) | ❌ | ❌ |
+| PG SCRAM-SHA-256 auth + TLS | ❌ | ❌ |
 
 ## Out of scope for all SecantusDB servers
 
 Anything that depends on real cluster topology or an embedded JavaScript
-runtime is out of scope by design, in both servers: multi-node replica sets,
+runtime is out of scope by design: multi-node replica sets,
 elections, sharding, cross-node oplog; `$where`, `$function`, `$accumulator`,
 JS `mapReduce`; text / hashed / wildcard indexes; Atlas
 Search / Vector Search; LDAP / Kerberos / AWS / OIDC auth. See

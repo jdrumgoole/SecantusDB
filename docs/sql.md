@@ -41,9 +41,6 @@ From Rust, `secantus_pg::PgServer` runs it in-process.
 The connection's **database** selects the SecantusDB storage database; a SQL
 **table** is a collection; a **row** is a document.
 
-The deprecated Python SQL server (`SecantusPGServer`, `secantusd-py-pg`) is
-documented, as a record, on [Deprecated: Python servers](python-servers.md).
-
 ## Connecting
 
 SecantusDB speaks the PostgreSQL v3 wire protocol, so standard clients connect
@@ -991,11 +988,6 @@ Every token has an upper-case and a lower-case spelling (the case you write is
 the case you get: `Month` / `MONTH` / `month`), except `OF`, `TZH` and `TZM`,
 which Postgres registers in upper case only. Because matching is case-sensitive,
 `Ddth` is `D` + `d` + `th`, not `DD` + `th` — exactly as Postgres reads it.
-
-One limitation of the deprecated Python SQL server: Postgres defaults a
-template with no year in it to 1 BC, but its datetimes were Python `datetime`s,
-which have no era, so a year-less template yielded 1 AD. Not measured on
-`secantusd-pg`.
 
 ### Geometric types (`point` / `box` / `circle` / `polygon` / `lseg`)
 
@@ -2957,8 +2949,7 @@ replayed, WiredTiger being unable to refresh a writer's snapshot) — where the
 statement cannot be carried over, `40001` stands as the honest answer.
 Statements *outside* an explicit transaction run each in a transaction of
 their own, so the second writer waits for the first and re-reads the committed
-value, exactly as PostgreSQL does. (The deprecated Python server still returns
-`40001` for the in-block case; the Rust server is the reference.)
+value, exactly as PostgreSQL does.
 
 **`SERIALIZABLE` does not prevent write skew.** Snapshot isolation allows two
 transactions to each read what the other is about to change and both commit:
@@ -2997,11 +2988,9 @@ stating the limitation plainly — here, in the capability matrix, and in the
 `test_known_divergence_*` pins — keeps working clients working and puts the
 risk where someone relying on it will read it.
 
-All four rows of the table above are pinned: the Rust server by
+All four rows of the table above are pinned by
 `tests/test_rust_pgserver_slice.py` (`test_read_committed_block_waits_for_a_row_then_rechecks`
-and its deadlock and `lock_timeout` neighbours), the deprecated Python server
-by `tests/test_sql_isolation_level.py` with the two divergent rows named
-`test_known_divergence_*`.
+and its deadlock and `lock_timeout` neighbours).
 
 ### Savepoints
 
@@ -3096,8 +3085,7 @@ targets a join, view, or subquery leaf, and a target that isn't a relation in
 the query's `FROM` errors with SQLSTATE `42P01`, exactly as Postgres reports it
 (and, as in Postgres, a table's alias masks its real name in `OF`). A cycle of
 row waits is a deadlock: one session gets `40P01`, checked once
-`deadlock_timeout` (1 s) into the wait. (The deprecated Python server accepts
-the clauses as no-ops; the Rust server is the reference.)
+`deadlock_timeout` (1 s) into the wait.
 
 ### Index / constraint reflection for `\d`
 
@@ -3396,10 +3384,6 @@ Out of the box the server is meant to be kept on loopback: with no
 The SQL `GRANT` / `REVOKE`, `SET ROLE` and row-level-security (`CREATE POLICY`)
 surface is not described on this page for the Rust server yet; the open
 divergences from PostgreSQL are tracked in `tasks/backlog-rust-postgres.md`.
-The earlier description, written for the deprecated Python SQL server (whose
-users and RBAC bindings were passed to its constructor and shared the MongoDB
-roles), is kept as a record on
-[Deprecated: Python servers](python-servers.md).
 
 ## Session and catalog introspection
 

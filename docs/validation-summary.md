@@ -77,17 +77,17 @@ These tests fail for documented reasons that have no SecantusDB-side fix (driver
 
 Each gauge ships its own detailed report — per-category breakdown, named failures for triage, and the gauge's own setup notes. Open the one whose pass / fail counts you want to dig into:
 
-- [pymongo](./validation-report.md)
-- [mongo-java-driver](./validation-report-java.md)
-- [mongo-go-driver](./validation-report-go.md)
-- [mongo-node-driver](./validation-report-node.md)
-- [mongo-ruby-driver](./validation-report-ruby.md)
-- [mongo-rust-driver](./validation-report-rust.md)
-- [mongo-php-library](./validation-report-php-lib.md)
-- [mongo-php-driver](./validation-report-php-ext.md)
-- [mongo-c-driver](./validation-report-c.md)
-- [mongo-cxx-driver](./validation-report-cxx.md)
-- [mongo-csharp-driver](./validation-report-dotnet.md)
+- [pymongo](./validation-report-rust-server.md)
+- [mongo-java-driver](./validation-report-java-rust-server.md)
+- [mongo-go-driver](./validation-report-go-rust-server.md)
+- [mongo-node-driver](./validation-report-node-rust-server.md)
+- [mongo-ruby-driver](./validation-report-ruby-rust-server.md)
+- [mongo-rust-driver](./validation-report-rust-rust-server.md)
+- [mongo-php-library](./validation-report-php-lib-rust-server.md)
+- [mongo-php-driver](./validation-report-php-ext-rust-server.md)
+- [mongo-c-driver](./validation-report-c-rust-server.md)
+- [mongo-cxx-driver](./validation-report-cxx-rust-server.md)
+- [mongo-csharp-driver](./validation-report-dotnet-rust-server.md)
 
 ## Refreshing
 

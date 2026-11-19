@@ -72,7 +72,7 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "change-stream surface that test and dev rely on. We run "
             "pymongo's own tests, unmodified, against an embedded SecantusDB."
         ),
-        "report_url": ("https://secantusdb.com/docs/validation-report.html"),
+        "report_url": ("https://secantusdb.com/docs/validation-report-rust-server.html"),
     },
     "pymongo (async)": {
         "title": "pymongo (async)",
@@ -88,7 +88,9 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "indexes, server-side <code>$where</code>) plus a few "
             "timeout-introspection tests."
         ),
-        "report_url": ("https://secantusdb.com/docs/validation-report-pymongo-async.html"),
+        "report_url": (
+            "https://secantusdb.com/docs/validation-report-pymongo-async-rust-server.html"
+        ),
     },
     "mongo-java-driver": {
         "title": "mongo-java-driver",
@@ -103,7 +105,7 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "catch wire-shape divergences pymongo's permissive client accepts "
             "silently."
         ),
-        "report_url": ("https://secantusdb.com/docs/validation-report-java.html"),
+        "report_url": ("https://secantusdb.com/docs/validation-report-java-rust-server.html"),
     },
     "mongo-kotlin-driver": {
         "title": "mongo-kotlin-driver",
@@ -116,7 +118,7 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "against a standalone SecantusDB daemon, through the same "
             "two-phase auth setup the Java gauge uses."
         ),
-        "report_url": ("https://secantusdb.com/docs/validation-report-kotlin.html"),
+        "report_url": ("https://secantusdb.com/docs/validation-report-kotlin-rust-server.html"),
     },
     "mongo-node-driver": {
         "title": "mongo-node-driver",
@@ -128,7 +130,7 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "<code>mocha --config test/mocha_mongodb.js</code> &mdash; real "
             "wire commands against an embedded SecantusDB daemon."
         ),
-        "report_url": ("https://secantusdb.com/docs/validation-report-node.html"),
+        "report_url": ("https://secantusdb.com/docs/validation-report-node-rust-server.html"),
     },
     "mongo-go-driver": {
         "title": "mongo-go-driver",
@@ -141,7 +143,7 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "<code>int64</code>) bugs that pymongo accepts silently fail "
             "loudly here."
         ),
-        "report_url": ("https://secantusdb.com/docs/validation-report-go.html"),
+        "report_url": ("https://secantusdb.com/docs/validation-report-go-rust-server.html"),
     },
     "mongo-ruby-driver": {
         "title": "mongo-ruby-driver",
@@ -154,7 +156,7 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "SCRAM-authenticates as a pre-provisioned <code>root-user</code>, "
             "and exchanges wire commands."
         ),
-        "report_url": ("https://secantusdb.com/docs/validation-report-ruby.html"),
+        "report_url": ("https://secantusdb.com/docs/validation-report-ruby-rust-server.html"),
     },
     "mongo-rust-driver": {
         "title": "mongo-rust-driver",
@@ -169,7 +171,7 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "<code>~/.mongodb_uri</code> &rarr; <code>localhost:27017</code>) "
             "can't accidentally route to a real mongod."
         ),
-        "report_url": ("https://secantusdb.com/docs/validation-report-rust.html"),
+        "report_url": ("https://secantusdb.com/docs/validation-report-rust-rust-server.html"),
     },
     "mongo-php-library": {
         "title": "mongo-php-library",
@@ -184,7 +186,7 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "BSON-comparator units are run but not counted here, since they "
             "never touch the server."
         ),
-        "report_url": ("https://secantusdb.com/docs/validation-report-php-lib.html"),
+        "report_url": ("https://secantusdb.com/docs/validation-report-php-lib-rust-server.html"),
     },
     "mongo-php-driver": {
         "title": "mongo-php-driver",
@@ -198,7 +200,7 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "not counted). Alongside Go, the strictest wire-shape check we "
             "run &mdash; type divergences pymongo accepts silently fail here."
         ),
-        "report_url": ("https://secantusdb.com/docs/validation-report-php-ext.html"),
+        "report_url": ("https://secantusdb.com/docs/validation-report-php-ext-rust-server.html"),
     },
     "mongo-c-driver": {
         "title": "mongo-c-driver",
@@ -213,7 +215,7 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "<code>MONGOC_TEST_URI</code>. A strict C client &mdash; type and "
             "wire-shape divergences surface here that permissive clients accept."
         ),
-        "report_url": ("https://secantusdb.com/docs/validation-report-c.html"),
+        "report_url": ("https://secantusdb.com/docs/validation-report-c-rust-server.html"),
     },
     "mongo-cxx-driver": {
         "title": "mongo-cxx-driver",
@@ -225,7 +227,7 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "against an embedded SecantusDB daemon. mongocxx's tests hard-wire the "
             "driver default port, so the gauge serves them on <code>127.0.0.1:27017</code>."
         ),
-        "report_url": ("https://secantusdb.com/docs/validation-report-cxx.html"),
+        "report_url": ("https://secantusdb.com/docs/validation-report-cxx-rust-server.html"),
     },
     "mongo-csharp-driver": {
         "title": "mongo-csharp-driver",
@@ -239,7 +241,7 @@ PANEL_PROSE: dict[str, dict[str, str]] = {
             "<code>[RequireServer]</code> attribute self-skips version- and "
             "topology-gated cases."
         ),
-        "report_url": ("https://secantusdb.com/docs/validation-report-dotnet.html"),
+        "report_url": ("https://secantusdb.com/docs/validation-report-dotnet-rust-server.html"),
     },
 }
 
