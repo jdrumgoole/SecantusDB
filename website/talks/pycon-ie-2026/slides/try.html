@@ -1,10 +1,11 @@
-<section id="try" class="alt" style="gap:28px;padding-top:88px;padding-bottom:72px;">
+<section id="try" class="alt" style="gap:36px;">
 <p class="eyebrow">Try it</p>
-<h2>Three ways to install</h2>
+<h2>One line to install</h2>
+<p class="code" style="font-size:44px;padding:32px 40px;white-space:nowrap;">pip install SecantusDB</p>
+<p class="lede">Both servers, prebuilt for Linux x86_64 and macOS arm64.</p>
 <div class="cards two">
-<div class="card" style="padding:28px 32px;"><h3>PyPI</h3><p class="code" style="font-size:24px;padding:20px 24px;white-space:nowrap;">pip install SecantusDB</p><p class="body">Linux x86_64, macOS arm64</p></div>
-<div class="card" style="padding:28px 32px;"><h3>crates.io</h3><p class="code" style="font-size:24px;padding:20px 24px;white-space:nowrap;">cargo install secantus-mdb --version 0.5.3-beta.198<br>cargo install secantus-pg&#160;&#160;--version 0.1.0-beta.20</p><p class="body">Builds from source</p></div>
+<div class="card" style="padding:28px 32px;"><h3>crates.io</h3><p class="code" style="font-size:24px;padding:20px 24px;white-space:nowrap;">cargo install secantus-mdb --version 0.5.3-beta.198<br>cargo install secantus-pg&#160;&#160;--version 0.1.0-beta.20</p></div>
+<div class="card" style="padding:28px 32px;"><h3>GitHub Releases</h3><p class="body">Standalone binaries for each release, Windows included for the MongoDB server</p></div>
 </div>
-<div class="card" style="padding:28px 32px;"><h3>GitHub Releases: prebuilt binaries</h3><p class="code" style="font-size:22px;padding:20px 24px;white-space:nowrap;"><span class="c"># macOS arm64 shown; on Linux use x86_64-unknown-linux-gnu</span><br>R=https://github.com/jdrumgoole/SecantusDB/releases/download<br>curl -LO $R/secantusdb-v0.5.3-beta.198/secantusdb-0.5.3-beta.198-aarch64-apple-darwin.tar.gz<br>tar xzf secantusdb-0.5.3-beta.198-aarch64-apple-darwin.tar.gz<br>./secantusdb-0.5.3-beta.198-aarch64-apple-darwin/secantusd-mdb --port 27017</p><p class="body">secantusd-pg: same steps, its own release</p></div>
-<aside><p>Three ways to install.</p><p><b>PyPI:</b> nothing compiles on pip install; the wheel carries prebuilt binaries for Linux x86_64 and macOS arm64.</p><p><b>crates.io:</b> cargo install needs a C toolchain and CMake, because it builds WiredTiger. Both crates are pre-releases, so cargo needs the exact --version.</p><p><b>GitHub Releases:</b> the binary commands were run verbatim on macOS arm64 on 17 November 2026. Check for newer releases before the talk. Windows (MongoDB server only) is a .tar.gz on the same release.</p><p class="time">Time: ~2 min</p></aside>
+<aside><p>Say the pip line and move on; the rest is for the photo.</p><p><b>PyPI:</b> nothing compiles on pip install; the wheel carries prebuilt binaries. <b>crates.io:</b> cargo install builds WiredTiger, so it needs a C toolchain and CMake, and both crates are pre-releases, so cargo needs the exact --version. <b>GitHub Releases:</b> download, untar, run.</p><p>Check for newer releases the day before and update the versions here.</p><p class="time">Time: ~1 min</p></aside>
 </section>

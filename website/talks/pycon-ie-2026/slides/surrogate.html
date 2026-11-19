@@ -1,6 +1,0 @@
-<section id="surrogate" class="accent" style="justify-content:center;">
-<p class="eyebrow">The idea</p>
-<p class="big">A real database. Not a toy.</p>
-<p style="font-size:44px;line-height:1.3;width:1400px;">Real wire protocols. Real storage. Single node.</p>
-<aside><p>The key framing. This is not an in-memory mock pretending to be MongoDB.</p><p>Clients connect over TCP, and for what we support they cannot tell the difference from mongod or PostgreSQL. Data is durable on disk, in WiredTiger.</p><p>It is deliberately single-node. Replica sets, sharding and replication are out of scope by design. The MongoDB server reports itself as a one-member replica-set primary, so change streams work, but there are no other members.</p><p>It's a beta: no production-proven or SLA claims. But it's a real database, and tests are one use among many, not the pitch.</p><p class="time">Time: ~1 min</p></aside>
-</section>
