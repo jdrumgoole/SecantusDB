@@ -1,7 +1,7 @@
 # Plan: move the on-disk layout to mongod's storage model
 
-Status: **reviewed, and every open question answered** (Joe, 2026-11-19).
-Next step: phase 0. No code has changed.
+Status: **phase 0 done** (2026-11-19; see "Appendix: phase 0 results").
+Next step: phases 1 and 2, which land together. No server code has changed.
 
 ## Why
 
@@ -67,23 +67,27 @@ saves it beside its own.
 
 ## The target: mongod's model
 
-To be confirmed in phase 0 by inspecting a real mongod 8.2.11 data directory
-(`wt list` / `wt dump`). These are what is understood today, not yet measured.
+Measured in phase 0 on mongod 8.2.11 (FCV 8.2, one-member replica set); the
+full record is `tests/fixtures/storage_model/mongod-8.2.11-layout.json`,
+written by `tools/probes/mongod_store_layout.py`.
 
-| Part | mongod |
+| Part | mongod 8.2.11 |
 |---|---|
-| Collection | One WT table per collection, named by an *ident* (`collection-<n>-<random>`). Key: RecordId (`q`). Value: the BSON document (`u`). |
-| Clustered collection | Same, but the key is the RecordId as a byte string, derived from `_id`, and there is no separate `_id_` index. `system.buckets.*` collections are clustered. |
-| Index | One WT table per index (`index-<n>-<random>`). Key: KeyString of the indexed values, with the RecordId appended for a non-unique index. Value: KeyString TypeBits (and the RecordId for some unique-index formats). |
-| `_id` | An ordinary unique index table, `_id_`. |
-| Catalog | `_mdb_catalog`: a WT table keyed by RecordId. Each value is a BSON document holding the namespace, the collection options, the index specs and the ident of each table. |
-| Sizes | `sizeStorer`: ident to `{numRecords, dataSize}`. |
-| Oplog | The collection `local.oplog.rs`, keyed by a RecordId derived from the oplog timestamp. |
-| Drop | WT `drop` of the table. A table still in use goes on a drop-pending list (the ident reaper) and is dropped once the timestamp it was dropped at is older than the oldest reader. |
-| Rename | A catalog-only change: the ident and its file stay. |
-| Logging | In a replica set, user tables are not logged; they rely on checkpoints and the oplog. The oplog and catalog are logged. |
-| Compression | Collections `block_compressor=snappy` by default; indexes use prefix compression. mongod's WT build is believed to carry snappy, zlib and zstd, and not lz4 (to be measured in phase 0a). |
-| Server collections | `admin.system.version` (the FCV document), `admin.system.users` / `system.roles`, `local.startup_log`, `config.system.preimages`, `config.transactions` and others a fresh mongod creates. |
+| Collection | One WT table per collection, named by an *ident* `collection-<UUID>` (a random UUID, not `<n>-<random>`). Key: RecordId, `key_format=q`. Value: the BSON document, `value_format=u`. |
+| Clustered collection | Same, but `key_format=u`: the RecordId is the KeyString of `_id` (no type bits, no end byte). No `_id_` index table. `system.buckets.*` and `config.system.preimages` are clustered. |
+| Index | One WT table per index, `index-<UUID>`, `key_format=u,value_format=u`. A non-unique index (`app_metadata=(formatVersion=8)`) keys on the KeyString with the RecordId appended; the value is the TypeBits, empty when there are none. A unique secondary index (`formatVersion=14`) has the same key layout, RecordId appended. |
+| `_id` | Its own table (`formatVersion=8`) in the older unique layout: the key is the KeyString of `_id` alone, and the value is the RecordId followed by the TypeBits. |
+| Catalog | `_mdb_catalog`, `key_format=q`. Each value is `{md: {ns, options, indexes: [{spec, ready, multikey, multikeyPaths}]}, idxIdent: {<index name>: <ident>}, ident, ns}`. `options` holds the collection `uuid` and options such as `capped`, `size`, `max`, `clusteredIndex`, `validator`, `collation`. |
+| Sizes | `sizeStorer`, `key_format=u`: the key is `table:<ident>`, the value `{numRecords, dataSize}`. `_mdb_catalog` has a row of its own. Logged. |
+| Oplog | `local.oplog.rs`: capped (`size` 192 MB on this box), `autoIndexId: false`, no indexes, `app_metadata=(formatVersion=1,oplogKeyExtractionVersion=1)`, logged. |
+| Drop | The dropped collection's tables stay on disk (drop-pending) until the drop timestamp is older than the checkpoint; its catalog entry goes at once. |
+| Rename | Catalog-only: `app.old` renamed to `app.renamed` kept its idents. |
+| Logging | Replicated user and catalog tables are `log=(enabled=false)`, `_mdb_catalog` included. Logged: `local.oplog.rs`, `sizeStorer`, and the unreplicated `local.*` collections except `local.replset.minvalid`. The connection's log lives in `journal/`, snappy-compressed. |
+| Table configs | Collections: `block_compressor=snappy` (`zstd` for time-series buckets), `prefix_compression=false`, `leaf_page_max=32KB`, `leaf_value_max=64MB`, `split_pct=90`, `app_metadata=(formatVersion=1)`. Indexes: no block compressor, `prefix_compression=true`, `internal_page_max=16k`, `leaf_page_max=16k`. |
+| Files | `storage.bson` = `{storage: {engine: "wiredTiger", options: {directoryPerDB: false, directoryForIndexes: false, groupCollections: false}}}`. WiredTiger 12.0.0 writes the turtle. |
+| Server collections | `local`: `oplog.rs`, `startup_log`, `system.replset`, `system.rollback.id`, `replset.{minvalid, election, oplogTruncateAfterPoint, initialSyncId}`. `admin`: `system.version` (FCV), `system.keys`, `system.users`, `system.roles`. `config`: `transactions`, `image_collection`, `system.indexBuilds`, `system.preimages`, `analyzeShardKeySplitPoints`, `sampledQueries`, `sampledQueriesDiff`. |
+| Views | A `<db>.system.views` collection holding the view definitions. |
+| `internal-<UUID>` | Two drop-pending temporary tables left by index builds (`key_format=q`). |
 
 ## What changes, from today's layout
 
@@ -103,8 +107,10 @@ hit counts are word matches across `crates/secantus-storage/src`.
 | Rename rewrites every row (S:15012) | Catalog-only rename | rename paths |
 | `secantus_size_storer` keyed `(db, coll)` (sizes.rs:49) | `sizeStorer` keyed by ident | `sizes.rs` |
 | 16 oplog shards keyed by seq (S:1672), `secantus_oplog_meta` (S:2108) | `local.oplog.rs`, keyed by a RecordId derived from the timestamp (decision 5, phase 4b) | oplog code, change streams, PITR |
-| Tables `block_compressor=lz4` (S:2722, S:2726) | The compressor mongod uses (snappy by default); our CMake already builds snappy and zstd in | `DOC_TABLE_CFG`, `QU_COMPRESSED_CFG`; needs a `do-perf` run |
-| User tables logged; connection `log=(enabled=true)` (S:2673); a non-logged mode exists (S:1676-1716) | mongod's replica-set model: user tables not logged, oplog and catalog logged (decision 8); phase 0 confirms the exact configs | table-create configs, recovery |
+| Tables `block_compressor=lz4` (S:2722, S:2726) | snappy for collections, zstd for buckets, none for indexes; built in by default (`SECANTUS_WT_EXTRA_COMPRESSORS` is off today) | `DOC_TABLE_CFG`, `QU_COMPRESSED_CFG`, `CMakeLists.txt`; needs a `do-perf` run |
+| WiredTiger built with `WT_STANDALONE_BUILD=ON`, which stamps btree files version 2.1 | Built `WT_STANDALONE_BUILD=OFF`, as mongod builds it (version 1.1 files) | the three WT builds; see the appendix |
+| Most tables already `log=(enabled=false)`; logged: the oplog tables, `secantus_oplog_meta`, `secantus_size_storer`, `secantus_index_builds` (measured on 0.5.3-beta.198) | The mongod set listed in the target table (decision 8) | table-create configs, recovery |
+| WiredTiger log in the store's top directory | `journal/`, snappy-compressed | connection config (S:2673) |
 | Format markers: `entryFormat` 6, `numberKeys` 2, `idKeys` 2, upgrade-at-open paths (S:8430-8630, `upgrade_number_keys` S:19130, `upgrade_id_keys` S:19309) | One store-format version, and refusal of anything older | `upgrade_*`, `reject_legacy_*` |
 
 Tables the first draft missed. Phase 0 decides, for each, between "becomes
@@ -186,7 +192,8 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
      refreshed. It lands as its own PR, with the full per-phase gate and
      every driver gauge, before phase 1.
    - Output: an appendix here, the probes saved in `tools/probes/`, and the
-     logging decision recorded in the "what changes" table.
+     logging decision recorded in the "what changes" table. **Done**: see
+     the appendix.
 1. **Store format version and refusal.** Add one store-format version, written
    when a store is created. A build refuses an older store by name. The
    message names the last release that reads the old layout and gives the
@@ -194,6 +201,13 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
    `pg_dump` / `psql`). All existing `upgrade_*` paths are removed. This
    lands with phase 2, not before, or `main` would refuse stores it still
    writes.
+
+   The same change switches the three WiredTiger builds to
+   `WT_STANDALONE_BUILD=OFF` with snappy and zstd built in (phase 0a). That
+   alone makes every existing store unreadable (WiredTiger refuses version
+   2.1 files with `EACCES`), so the format check must run **before**
+   `wiredtiger_open` and recognise an old store by its files, never by
+   letting the open fail.
 
    Before it lands: prove `pg_dump` from `secantusd-pg` and a restore into
    the new build work end to end on a store with real content (open
@@ -286,6 +300,11 @@ exception to CLAUDE.md's one-server rule, limited to this plan.
 - **No `fix_many` lane runs while a phase 0d, 3, 4 or 4b branch is open.** Those
   phases rewrite most of a 31,000-line file the lanes also edit. Phases 2, 5
   and 6 are narrower and can run beside one lane.
+- **Filed (phase 0): RM-723** (the layout, both directions; gap tests in
+  `tests/backlog/test_rm_storage_model.py`) **and RP-1074** (the PostgreSQL
+  server's store; `tests/backlog/test_rp_storage_model.py`). Each phase
+  re-marks the gap tests it makes pass as `backlog_fixed`, and the items
+  close when the last test passes.
 - Each phase is filed in both `tasks/backlog-rust-mongodb.md` and
   `tasks/backlog-rust-postgres.md` with a `Backlog-ID` and a gap test (the
   phase's layout test), per the `backlog` skill, and carries a `changelog.d/`
@@ -346,3 +365,70 @@ dump-and-restore round trip for each server.
 - Real replication. The store is a valid one-member replica set; there are
   still no other members, elections or cross-node oplog.
 - The Python servers, which are deprecated.
+
+## Appendix: phase 0 results (2026-11-19)
+
+### 0a. WiredTiger compatibility: no upgrade needed
+
+Measured with a `wt` utility built from the vendored, patched WiredTiger
+(11.2.0, `mongodb-7.0.33`) with snappy, zstd, zlib and lz4 built in, against
+mongod 8.2.11, which ships WiredTiger 12.0.0:
+
+| Test | Result |
+|---|---|
+| WT 11.2 opens a clean mongod 8.2.11 store, lists its 135 metadata entries, reads `_mdb_catalog` | works |
+| WT 11.2 writes a new table into that store and closes; mongod 8.2.11 starts on it with `--replSet`, reads, `validate({full: true})` is valid, takes writes | works |
+| mongod 8.2.11 killed with `SIGKILL` after 1,000 journaled inserts; WT 11.2 runs recovery on the store | works |
+| A store **created** by today's WT build (`WT_STANDALONE_BUILD=ON`); mongod 8.2.11 starts on it | **refused**: `WiredTiger.wt is an unsupported WiredTiger source file version 2.1; this WiredTiger build only supports versions from 1.1 to 1.1` |
+| The same, with WT 11.2 rebuilt `WT_STANDALONE_BUILD=OFF` | works: replica set initiated, collection and index created, `validate` valid, and WT 11.2 reopens it afterwards |
+| A store created by today's build, opened by the `WT_STANDALONE_BUILD=OFF` build | refused with `EACCES`, the same version check |
+
+So decision 9's upgrade (phase 0d) is **not needed**. What is needed:
+
+- **Build WiredTiger as mongod builds it: `WT_STANDALONE_BUILD=OFF`.** The
+  flag decides more than the file version. With it off, WiredTiger also:
+  does not write fast-truncate page-deletion cells in the 2022 format
+  (`fast_truncate_2022`); tracks an unclean shutdown during recovery; and
+  skips the rollback-under-cache-pressure check for read-only transactions
+  (SERVER-44870). All are mongod's own behaviour, so faithful, but the last
+  two change behaviour under load and need the stress gate.
+- **snappy (and zstd for buckets) built in.** mongod's catalog, collections
+  and journal are snappy-compressed; our builds carry only lz4 and zlib.
+- **The open config mongod uses** for the log: `path=journal`,
+  `compressor=snappy`.
+
+Not measured: whether mongod's WiredTiger accepts an lz4 table (not needed
+once tables are created with snappy); stores larger than a few thousand
+documents; a mongod store with live prepared transactions.
+
+### 0b. The specification
+
+`tools/probes/mongod_store_layout.py` runs a fixed scenario against mongod
+8.2.11 and records the store. Its output is
+`tests/fixtures/storage_model/mongod-8.2.11-layout.json` (85 tables, 29
+catalog entries). The scenario covers: one document per BSON type under an
+ascending and a descending index (the KeyString corpus, 38 keys); compound,
+unique, multikey, partial, sparse and TTL indexes; hashed, 2dsphere, 2d,
+text and wildcard indexes; a collection default collation and a collated
+index; capped, clustered and time-series collections; pre- and post-images
+with one update; a view; a drop and a rename; a role and a user; one
+transaction. The target table above is the summary.
+
+### 0c. The comparison tool
+
+The same probe with `--secantusd <binary>` runs the scenario against
+`secantusd-mdb` and records that store (`--wt` must then be the build that
+wrote it). The baseline from 0.5.3-beta.198 is
+`tests/fixtures/storage_model/secantusd-mdb-0.5.3-beta.198-layout.json`: 32
+`secantus_*` tables, no catalog. Found on the way:
+
+- `secantusd-mdb` has no `shutdown` command (CommandNotFound); `SIGTERM` is
+  its only clean stop. Phase 7's test stops a server the way mongod's
+  tooling does, with `shutdown`, so this goes in the backlog.
+- Hashed and text indexes are refused by the Rust server today ("not
+  supported by the Rust storage engine yet"), so phase 4 starts with those
+  two already in the "refuse by name" column.
+
+The per-phase layout tests compare a SecantusDB capture against the mongod
+fixture through the label view the probe writes (idents replaced by
+namespace and index name).

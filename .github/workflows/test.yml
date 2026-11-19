@@ -1921,6 +1921,26 @@ jobs:
         with:
           packages: postgresql-15
 
+      # RP-1074's gap tests start mongod 8.2 on a store `secantusd-pg` wrote
+      # (the storage-model plan: mongod must open it). Without a mongod they
+      # fail on "no mongod on PATH", which the verifier counts as OPEN: an
+      # item that could never read FIXED. Same repository and key as the
+      # storage-engine job's step of the same name.
+      - name: Register the MongoDB 8.2 apt repository (Linux)
+        if: matrix.shard == 'backlog'
+        shell: bash
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
+            https://www.mongodb.org/static/pgp/server-8.0.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mongodb-server.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.2 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.2.list
+
+      - name: Install mongod 8.2
+        if: matrix.shard == 'backlog'
+        uses: ./.github/actions/apt-install
+        with:
+          packages: mongodb-org-server
+
       - name: Run the login comparisons against PostgreSQL 15
         if: matrix.shard == 'server'
         # SECANTUS_REQUIRE_PG15 makes a missing directory a failure: these
