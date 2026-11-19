@@ -19,7 +19,10 @@ def _without_times(value: Any) -> Any:
         return {
             k: _without_times(v)
             for k, v in value.items()
-            if k not in ("executionTimeMillisEstimate", "executionTimeMillis")
+            # `optimizationTimeMillis` too: a loaded CI runner's mongod took
+            # 1 ms to plan where this server took 0 (PR #2906's CI).
+            if k
+            not in ("executionTimeMillisEstimate", "executionTimeMillis", "optimizationTimeMillis")
         }
     if isinstance(value, list):
         return [_without_times(v) for v in value]
