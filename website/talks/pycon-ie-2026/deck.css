@@ -46,9 +46,9 @@ ul.pts,ol.pts{font-size:36px;line-height:1.45;padding-left:40px;display:flex;fle
 @media (max-width: 820px), (max-height: 500px){.links{gap:14px;}.links .lk{display:block;width:auto;font-size:12px;letter-spacing:2px;}}
 .dviz-wrap{--dv-mongo:#2a78d6;--dv-rust:#eb6834;--dv-ink:#10231E;--dv-ink2:#4A5A55;--dv-grid:#cfc8b6;--dv-ref:#8a8f88;width:100%;}
 .dviz{width:100%;max-height:540px;display:block;}
-.dv-lab{font:500 13px/1 'Inter',sans-serif;fill:var(--dv-ink);}
-.dv-val{font:600 12px/1 'Inter',sans-serif;fill:var(--dv-ink);}
-.dv-tick{font:500 11px/1 'Inter',sans-serif;fill:var(--dv-ink2);}
+.dv-lab{font:500 15px/1 'Inter',sans-serif;fill:var(--dv-ink);}
+.dv-val{font:600 14px/1 'Inter',sans-serif;fill:var(--dv-ink);}
+.dv-tick{font:500 13px/1 'Inter',sans-serif;fill:var(--dv-ink2);}
 .dv-grid{stroke:var(--dv-grid);stroke-width:1;}
 .dv-ref{stroke:var(--dv-ref);stroke-width:1.5;stroke-dasharray:4 3;}
 .dv-x{font-size:0.82em;opacity:0.75;}

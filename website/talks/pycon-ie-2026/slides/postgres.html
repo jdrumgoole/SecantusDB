@@ -7,5 +7,6 @@
 <li>The catalogs psql and SQLAlchemy read</li>
 <li>Always the most faithful model</li>
 </ul>
-<aside><p>Then we did it all again for PostgreSQL.</p><p>The extended query protocol, prepared statements and portals, text and binary formats; transactions, savepoints, two-phase commit, COPY, LISTEN and NOTIFY; and the catalog tables clients introspect, so psql and SQLAlchemy just work.</p><p>The scope is set by what psycopg's own test suite reaches for, not by a feature list.</p><p>The rule: always the most faithful PostgreSQL model. When there's a cheap approximation and a faithful port, we take the port, and sequence the work by cost instead of cutting corners. Serializable isolation is ported from PostgreSQL's own predicate.c.</p><p class="time">Time: ~3 min</p></aside>
+<p class="foot">psycopg’s own test suite: 5,544 pass, 0 fail · 13 October 2026</p>
+<aside><p>Then we did it all again for PostgreSQL: the extended query protocol, prepared statements and portals, binary formats; transactions, savepoints, two-phase commit, COPY, LISTEN and NOTIFY; and the catalog tables psql and SQLAlchemy introspect.</p><p>The scope is set by what psycopg's own test suite reaches for. On 13 October, of the 5,731 psycopg tests that ran, 5,544 passed and none failed; the rest psycopg itself skips or expects to fail.</p><p>The rule: always the most faithful PostgreSQL model. Serializable isolation is ported from PostgreSQL's own predicate.c.</p><p class="time">Time: ~1½ min</p></aside>
 </section>

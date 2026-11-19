@@ -33,8 +33,8 @@ To try it:
 
 ```bash
 pip install SecantusDB
-cargo install secantus-mdb --version 0.5.3-beta.197
-cargo install secantus-pg --version 0.1.0-beta.19
+cargo install secantus-mdb --version 0.5.3-beta.198
+cargo install secantus-pg --version 0.1.0-beta.20
 ```
 
 Prebuilt binaries are on the GitHub releases page.
