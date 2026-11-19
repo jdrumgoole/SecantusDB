@@ -123,7 +123,8 @@ fn compact_gives_a_collections_free_space_back() {
     let target = CompactTarget::Collection("app", "big");
     let tables = st.compact_tables(target).unwrap();
     assert!(tables.iter().any(|t| t.starts_with("table:collection-")));
-    assert!(tables.contains(&"table:secantus_index_entries".to_string()));
+    // The collection's index is a table of its own, after its records.
+    assert!(tables.iter().any(|t| t.starts_with("table:index-")));
     let before = tables_size(&st, &home, target);
 
     // A dry run compacts nothing (mongod 8.2.11 estimated 0 on every shape

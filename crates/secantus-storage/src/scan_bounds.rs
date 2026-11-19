@@ -31,6 +31,23 @@
 use bson::{Bson, Document};
 use secantus_core::sortkey::encode_value;
 
+/// A value as a bound: its ascending sort key (what stretches are compared
+/// and intersected by) and the value itself (what an index's KeyString
+/// bounds are made from, [`to_key_spans`]). Equal when their sort keys are.
+#[derive(Clone, Debug)]
+pub(crate) struct EndKey {
+    pub sort: Vec<u8>,
+    pub value: Bson,
+}
+
+impl PartialEq for EndKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.sort == other.sort
+    }
+}
+
+impl Eq for EndKey {}
+
 /// One end of a stretch, in ASCENDING key order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum End {
@@ -38,7 +55,7 @@ pub(crate) enum End {
     /// above; as a high end, every key below that rank.
     Floor(u8),
     /// A value's ascending key: as either end, inclusive.
-    Key(Vec<u8>),
+    Key(EndKey),
 }
 
 /// A stretch of keys, low to high; `None` is unbounded.
@@ -53,7 +70,7 @@ impl Stretch {
         Stretch { lo: None, hi: None }
     }
 
-    fn point(key: Vec<u8>) -> Self {
+    fn point(key: EndKey) -> Self {
         Stretch {
             lo: Some(End::Key(key.clone())),
             hi: Some(End::Key(key)),
@@ -70,7 +87,7 @@ impl Stretch {
     /// The single key this stretch is, when it is one.
     pub fn as_point(&self) -> Option<&[u8]> {
         match (&self.lo, &self.hi) {
-            (Some(End::Key(a)), Some(End::Key(b))) if a == b => Some(a),
+            (Some(End::Key(a)), Some(End::Key(b))) if a == b => Some(&a.sort),
             _ => None,
         }
     }
@@ -80,7 +97,7 @@ impl Stretch {
         match &self.lo {
             None => Vec::new(),
             Some(End::Floor(r)) => vec![*r],
-            Some(End::Key(k)) => k.clone(),
+            Some(End::Key(k)) => k.sort.clone(),
         }
     }
 
@@ -92,7 +109,7 @@ impl Stretch {
             None => None,
             Some(End::Floor(r)) => Some(vec![*r]),
             Some(End::Key(k)) => {
-                let mut b = k.clone();
+                let mut b = k.sort.clone();
                 b.push(0xFF);
                 Some(b)
             }
@@ -154,13 +171,13 @@ impl Bounds {
     pub fn widen_ranks(&mut self, ranks: &[u8]) {
         for s in &mut self.stretches {
             if let Some(End::Key(k)) = &s.lo {
-                if ranks.contains(&k[0]) {
-                    s.lo = Some(End::Floor(k[0]));
+                if ranks.contains(&k.sort[0]) {
+                    s.lo = Some(End::Floor(k.sort[0]));
                 }
             }
             if let Some(End::Key(k)) = &s.hi {
-                if ranks.contains(&k[0]) {
-                    s.hi = Some(End::Floor(k[0] + 1));
+                if ranks.contains(&k.sort[0]) {
+                    s.hi = Some(End::Floor(k.sort[0] + 1));
                 }
             }
         }
@@ -204,8 +221,11 @@ pub(crate) fn open_ended_rank(r: u8) -> bool {
     r == rank_string() || r == rank_js() || r == rank_regex()
 }
 
-fn key(v: &Bson) -> Option<Vec<u8>> {
-    encode_value(v, None).ok()
+fn key(v: &Bson) -> Option<EndKey> {
+    Some(EndKey {
+        sort: encode_value(v, None).ok()?,
+        value: v.clone(),
+    })
 }
 
 fn is_nan(v: &Bson) -> bool {
@@ -247,7 +267,7 @@ fn range(op: &str, v: &Bson, desc: bool) -> Option<Vec<Stretch>> {
         _ => {}
     }
     let k = key(v)?;
-    let r = k[0];
+    let r = k.sort[0];
     let lower = op == "$gt" || op == "$gte";
     let end = if trusted_end(v, desc) {
         End::Key(k)
@@ -373,7 +393,7 @@ fn not_range(op: &str, v: &Bson, desc: bool) -> Option<Vec<Stretch>> {
         return None;
     }
     let k = key(v)?;
-    let r = k[0];
+    let r = k.sort[0];
     let end = if trusted_end(v, desc) {
         End::Key(k)
     } else {
@@ -657,12 +677,12 @@ pub(crate) fn to_spans(bounds: &Bounds, dir: i32, escape: fn(&[u8]) -> Vec<u8>) 
     };
     let low = |e: &End| match e {
         End::Floor(r) => floor(*r),
-        End::Key(k) => key_bytes(k),
+        End::Key(k) => key_bytes(&k.sort),
     };
     let high = |e: &End| match e {
         End::Floor(r) => floor(*r),
         End::Key(k) => {
-            let mut b = key_bytes(k);
+            let mut b = key_bytes(&k.sort);
             b.push(0xFF);
             b
         }
@@ -710,6 +730,126 @@ pub(crate) fn to_spans(bounds: &Bounds, dir: i32, escape: fn(&[u8]) -> Vec<u8>) 
     out
 }
 
+/// The KeyString byte that starts the keys of sort-key type rank `rank`
+/// (`ctype` in `secantus_core::keystring`), or `0xFF` past the last rank:
+/// the edge of the rank's bracket in an index's KeyString order.
+fn ks_floor_byte(rank: u8) -> u8 {
+    use secantus_core::keystring::ctype;
+    match rank {
+        0 | 1 => ctype::MIN_KEY,
+        2 => ctype::NULLISH,
+        3 => ctype::NUMERIC,
+        4 => ctype::STRING_LIKE,
+        5 => ctype::OBJECT,
+        6 => ctype::ARRAY,
+        7 => ctype::BIN_DATA,
+        8 => ctype::OID,
+        9 => ctype::BOOL,
+        10 => ctype::DATE,
+        11 => ctype::TIMESTAMP,
+        12 => ctype::REGEX,
+        13 => ctype::CODE,
+        14 => ctype::CODE_WITH_SCOPE,
+        15 => ctype::MAX_KEY,
+        _ => 0xFF,
+    }
+}
+
+/// Whether a KeyString type byte starts a key with no terminator of its own
+/// in this store's order -- the ranks [`open_ended_rank`] names.
+pub(crate) fn open_ended_ks(ctype_byte: u8) -> bool {
+    use secantus_core::keystring::ctype;
+    matches!(ctype_byte, ctype::STRING_LIKE | ctype::CODE | ctype::REGEX)
+}
+
+/// The spans of `bounds` on the field at `pos` of an index whose entries are
+/// KeyStrings (`shape`), low to high in the order the entries are stored,
+/// overlaps merged. Each span's bytes are the field's own: the caller puts
+/// the KeyString of the equality columns before it (`KeyShape::prefix`).
+/// A value end is the field's bytes (inverted when it is descending);
+/// a high end takes its extensions too (`+ 0xFF`: no entry holds `0xFF`
+/// after a value's own bytes, whose type byte, escapes and terminators are
+/// all below it). `None` when a bound's value cannot be keyed: the caller
+/// reads another way.
+pub(crate) fn to_key_spans(
+    bounds: &Bounds,
+    dir: i32,
+    shape: &crate::ixkeys::KeyShape,
+    pos: usize,
+) -> Option<Vec<Span>> {
+    let floor = |r: u8| -> Vec<u8> {
+        // An index that keys BinData as `bytea`-ordered text holds it under
+        // the string type byte: its bracket starts there.
+        let c = if r == 7 && shape.bytes_order() {
+            ks_floor_byte(4)
+        } else {
+            ks_floor_byte(r)
+        };
+        if dir == -1 {
+            vec![(!c).wrapping_add(1)]
+        } else {
+            vec![c]
+        }
+    };
+    let low = |e: &End| -> Option<Vec<u8>> {
+        Some(match e {
+            End::Floor(r) => floor(*r),
+            End::Key(k) => shape.field_bytes(pos, &k.value).ok()?,
+        })
+    };
+    let high = |e: &End| -> Option<Vec<u8>> {
+        Some(match e {
+            End::Floor(r) => floor(*r),
+            End::Key(k) => {
+                let mut b = shape.field_bytes(pos, &k.value).ok()?;
+                b.push(0xFF);
+                b
+            }
+        })
+    };
+    let mut spans: Vec<Span> = Vec::with_capacity(bounds.stretches.len());
+    for s in &bounds.stretches {
+        let (lo_end, hi_end) = if dir == -1 {
+            (&s.hi, &s.lo)
+        } else {
+            (&s.lo, &s.hi)
+        };
+        let lo = match lo_end {
+            Some(e) => Some(low(e)?),
+            None => None,
+        };
+        let hi = match hi_end {
+            Some(e) => Some(high(e)?),
+            None => None,
+        };
+        spans.push(Span { lo, hi });
+    }
+    spans.retain(|s| match (&s.lo, &s.hi) {
+        (Some(l), Some(h)) => l < h,
+        _ => true,
+    });
+    spans.sort_by(|a, b| a.lo.cmp(&b.lo));
+    let mut out: Vec<Span> = Vec::new();
+    for s in spans {
+        if let Some(last) = out.last_mut() {
+            let touches = match (&last.hi, &s.lo) {
+                (None, _) => true,
+                (Some(_), None) => true,
+                (Some(h), Some(l)) => l <= h,
+            };
+            if touches {
+                last.hi = match (&last.hi, &s.hi) {
+                    (None, _) | (_, None) => None,
+                    (Some(a), Some(b)) => Some(a.max(b).clone()),
+                };
+                continue;
+            }
+        }
+        out.push(s);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,8 +881,8 @@ mod tests {
     #[test]
     fn a_complement_keeps_the_bound_and_nan() {
         let b = bounds(Bson::Document(doc! {"$not": {"$gt": 2}}));
-        let two = encode_value(&Bson::Int32(2), None).unwrap();
-        let nan = encode_value(&Bson::Double(f64::NAN), None).unwrap();
+        let two = key(&Bson::Int32(2)).unwrap();
+        let nan = key(&Bson::Double(f64::NAN)).unwrap();
         // [open, 2] (2 itself is not > 2), then from the strings on.
         assert!(b.stretches.contains(&Stretch {
             lo: None,
@@ -754,11 +894,11 @@ mod tests {
     #[test]
     fn a_range_end_is_inclusive_at_any_exponent() {
         let b = bounds(Bson::Document(doc! {"$gt": 2}));
-        let two = encode_value(&Bson::Int32(2), None).unwrap();
+        let two = key(&Bson::Int32(2)).unwrap();
         assert_eq!(b.stretches[0].lo, Some(End::Key(two)));
         assert_eq!(b.stretches.len(), 1);
         // Number-key format 2 keys every exponent in order.
-        let big = encode_value(&Bson::Double(1e200), None).unwrap();
+        let big = key(&Bson::Double(1e200)).unwrap();
         let b = bounds(Bson::Document(doc! {"$gt": 1e200}));
         assert_eq!(b.stretches[0].lo, Some(End::Key(big)));
     }
@@ -791,8 +931,8 @@ mod tests {
             false,
         )
         .unwrap();
-        let four = encode_value(&Bson::Int32(4), None).unwrap();
-        let six = encode_value(&Bson::Int32(6), None).unwrap();
+        let four = key(&Bson::Int32(4)).unwrap();
+        let six = key(&Bson::Int32(6)).unwrap();
         assert_eq!(
             b.stretches[0],
             Stretch {
@@ -802,6 +942,72 @@ mod tests {
         );
         let b = for_predicate(&Bson::Document(doc! {"$all": [5, 6]}), true, false).unwrap();
         assert!(b.scalar_points());
+    }
+
+    /// The values (of the entries written for `values`, one each) whose
+    /// KeyString falls inside any of `spans`.
+    fn inside(shape: &crate::ixkeys::KeyShape, spans: &[Span], values: &[Bson]) -> Vec<Bson> {
+        values
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| {
+                let key = shape
+                    .entry(std::slice::from_ref(v), *i as i64 + 1)
+                    .unwrap()
+                    .key;
+                spans.iter().any(|s| {
+                    s.lo.as_ref().is_none_or(|l| key >= *l)
+                        && s.hi.as_ref().is_none_or(|h| key < *h)
+                })
+            })
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    #[test]
+    fn key_spans_hold_the_entries_a_range_reads_in_either_direction() {
+        use crate::ixkeys::KeyShape;
+        use secantus_core::order::BinDataOrder;
+        let values = [
+            Bson::Null,
+            Bson::Int32(3),
+            Bson::Int64(5),
+            Bson::Double(7.5),
+            Bson::String("s".into()),
+            Bson::Boolean(true),
+        ];
+        for dir in [1, -1] {
+            let shape = KeyShape::new(&doc! {"a": dir}, None, BinDataOrder::Mongod);
+            // `$gte 5`: the numbers from 5 up, and none of another type.
+            let b = for_predicate(&Bson::Document(doc! {"$gte": 5}), false, dir == -1).unwrap();
+            let spans = to_key_spans(&b, dir, &shape, 0).unwrap();
+            assert_eq!(
+                inside(&shape, &spans, &values),
+                vec![Bson::Int64(5), Bson::Double(7.5)],
+                "dir {dir}"
+            );
+            // `$lt 5`: the numbers below it.
+            let b = for_predicate(&Bson::Document(doc! {"$lt": 5}), false, dir == -1).unwrap();
+            let spans = to_key_spans(&b, dir, &shape, 0).unwrap();
+            let got = inside(&shape, &spans, &values);
+            // The end is inclusive (the caller re-checks it): 5 itself may be
+            // read, nothing above it is.
+            assert!(got.contains(&Bson::Int32(3)), "dir {dir}: {got:?}");
+            assert!(!got.contains(&Bson::Double(7.5)), "dir {dir}: {got:?}");
+            assert!(!got.contains(&Bson::String("s".into())), "dir {dir}");
+            // An equality is its own key, whatever number type it is.
+            let b = for_predicate(&Bson::Double(5.0), false, dir == -1).unwrap();
+            let spans = to_key_spans(&b, dir, &shape, 0).unwrap();
+            assert_eq!(inside(&shape, &spans, &values), vec![Bson::Int64(5)]);
+            // A range over strings stays among them.
+            let b = for_predicate(&Bson::Document(doc! {"$gt": "a"}), false, dir == -1).unwrap();
+            let spans = to_key_spans(&b, dir, &shape, 0).unwrap();
+            assert_eq!(
+                inside(&shape, &spans, &values),
+                vec![Bson::String("s".into())],
+                "dir {dir}"
+            );
+        }
     }
 
     #[test]

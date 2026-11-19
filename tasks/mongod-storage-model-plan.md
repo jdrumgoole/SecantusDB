@@ -290,6 +290,82 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
    placement (`NULLS FIRST` / `LAST`), `numeric`, `text` under a collation,
    descending keys, and the B-tree and hash page models built over them.
    Each is probed against PostgreSQL 15 before and after.
+   **Phase 4 design (2026-11-19).** Done first: `secantus_core::keystring`,
+   a port of mongo r8.2.11's `key_string.cpp` (V1, TypeBits, RecordIds,
+   decoding), which reproduces every key and TypeBits row of the phase 0
+   fixture and 280 hard numbers recorded from mongod
+   (`tools/probes/mongod_keystring_corpus.py`), and orders as
+   `secantus_core::order` does. The storage work, in this order, each step
+   with the full storage suite green:
+   - **4a. Index idents and tables.** Each index, `_id_` included, gets an
+     ident `index-<UUID>` and a table made with mongod's index config
+     (`key_format=u,value_format=u`, prefix compression, 16k pages,
+     `app_metadata=(formatVersion=8)`, `14` for a unique secondary index).
+     The idents live in the collection's placement (`secantus_idents`) and
+     in `_mdb_catalog`'s `idxIdent`; a rollback's or crash's orphan
+     `index-*` table is dropped as a collection's is.
+   - **4b. Secondary entries in KeyString.** An entry is the KeyString of
+     the index key's values (directions from the key pattern, strings
+     through the index's collation sort key) followed by the RecordId; its
+     value is the TypeBits. The key generation stays (multikey, sparse,
+     partial, the existing value expansion): only the bytes change. Replaces
+     `secantus_index_entries`.
+     **As built (4a and 4b, store format 3):**
+     - Only secondary indexes have a table; `_id_` has none until 4d. The
+       idents are in the placement (`secantus_idents`' `indexes`, name to
+       ident) and in `_mdb_catalog`'s `idxIdent`. A build makes the table
+       first and lists it in the placement in the transaction that writes the
+       registry row, so a crash or an abort leaves an unlisted table, which
+       the next open drops; a rollback drops it through the transaction's end
+       hook (a deferred create keeps it in the transaction's own placement).
+       A drop or rename moves no entries: the table follows the placement.
+     - The reaper drops with `force`, as mongod's ident drop does
+       (`force,checkpoint_wait=false`): without it, a pooled session's
+       cached data handle kept a table from ever being dropped (`EBUSY`),
+       which also meant phase 3's dropped collection tables went only at the
+       next open. A table with a cursor open on it still refuses and waits.
+     - A dropped table goes only once a checkpoint begun after its drop has
+       completed (`DropPending`), as mongod keeps a drop-pending ident until
+       the checkpoint no longer needs it: until then a read of the last
+       checkpoint (a background `validate`) still finds the collection.
+       Dropping at once lost that read about one time in thirteen under load
+       (`diagnostic_commands_wt::background_validate_reads_the_last_checkpoint`).
+     - Still to fix (phase 8): a collection created by a transaction that
+       does not defer its creates (the PostgreSQL server's) and then rolled
+       back leaves its empty `collection-*` table until the next open drops
+       it; `ensure_collection` has no hook into the store's drop list.
+     - Key generation is unchanged, so an array still gets the whole-array
+       entry besides mongod's element keys (`secantus_core::index_keys`).
+       mongod's `validate` would count those as extra keys: phase 7 must
+       drop them or refuse the index.
+     - A geo index's cell is keyed as one BinData value, not mongod's key.
+       The PostgreSQL server's `bytea` order (shorter first) is kept by keying
+       a BinData value of such an index as text that orders so; the decode
+       of such an entry gives the text.
+     - The bounds work of 4c is done here for secondary indexes
+       (`scan_bounds::to_key_spans`, `Storage::index_entries_from` taking an
+       `IndexPos` and returning each entry's decoded `raw` and a `resume`
+       key); the explain stream's own comparisons still run on sort-key
+       parts built from the decoded values. `_id_` keeps its sort-key bytes
+       until 4d.
+   - **4c. Scans and bounds.** `scan_bounds` builds KeyString bounds with
+     mongod's discriminators (`ExclusiveBefore` / `ExclusiveAfter`) in place
+     of sort-key prefixes; the explain stream decodes stored keys with
+     `keystring::to_bson` instead of splitting sort-key parts. In-memory
+     comparisons (sorting, grouping) keep `sortkey`: they never reach disk.
+   - **4d. `_id_` as a real unique index.** Key = KeyString of `_id`; value
+     = RecordId + TypeBits, as mongod's `_id_` stores it. Replaces
+     `secantus_natural_seq`; `find_by_id` and the RecordId lookup read it.
+   - **4e. Uniqueness in the index tables.** A unique secondary index checks
+     for an entry with the same KeyString prefix and another RecordId, as
+     mongod's does; `_id_` checks its key. Replaces `secantus_unique_keys`,
+     its claims (`prepareUnique`, collated `_id`, deferred-create
+     incarnations) moving to the index tables.
+   - **4f. Clean-up.** The number-key, id-key and entry-format upgrade and
+     refusal paths go (no store that needs them opens); store format 3.
+   - **The PostgreSQL server** reaches indexes through the same storage
+     calls; its NULL placement and types are checked by the psycopg, slt and
+     SQLAlchemy gauges after 4b and after 4e.
 4b. **The oplog and replica-set state.** The oplog becomes the collection
    `local.oplog.rs`, keyed by a RecordId derived from the timestamp, with
    entries in mongod's oplog format; the 16 shards and `secantus_oplog_meta`

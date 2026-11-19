@@ -1707,14 +1707,31 @@ impl CmdStorage for StorageAdapter {
         db: &str,
         coll: &str,
         name: &str,
-        from: &[u8],
+        from: secantus_commands::storage::IndexFrom<'_>,
         after: Option<i64>,
         max: usize,
         backward: bool,
     ) -> Result<Option<secantus_commands::storage::IndexEntries>, StorageError> {
+        use secantus_commands::storage::IndexFrom;
+        let pos = match from {
+            IndexFrom::Edge => secantus_storage::IndexPos::Edge,
+            IndexFrom::Raw(k) => secantus_storage::IndexPos::Raw(k),
+            IndexFrom::Values(v) => secantus_storage::IndexPos::Values(v),
+            IndexFrom::Resume(k) => secantus_storage::IndexPos::Resume(k),
+        };
         self.inner
-            .index_entries_from(db, coll, name, from, after, max, backward)
-            .map(Some)
+            .index_entries_from(db, coll, name, pos, after, max, backward)
+            .map(|rows| {
+                Some(
+                    rows.into_iter()
+                        .map(|r| secantus_commands::storage::IndexEntry {
+                            raw: r.raw,
+                            rid: r.rid,
+                            resume: r.resume,
+                        })
+                        .collect(),
+                )
+            })
             .map_err(map_err)
     }
 
@@ -1783,7 +1800,7 @@ impl CmdStorage for StorageAdapter {
     fn index_ident(&self, db: &str, coll: &str, name: &str) -> Option<String> {
         Some(match self.stored_as(db, coll)? {
             Stored::Catalog => secantus_storage::CATALOG_TABLE.to_string(),
-            Stored::Collection(_) => secantus_storage::index_table(name).to_string(),
+            Stored::Collection(coll) => self.inner.index_table_name(db, &coll, name).ok()??,
         })
     }
 

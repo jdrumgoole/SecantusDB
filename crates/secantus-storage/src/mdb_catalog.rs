@@ -16,6 +16,8 @@
 //! crash. Which ident a collection's documents live in is kept in
 //! [`IDENTS_TABLE`], keyed by namespace, so a lookup is one search.
 
+use std::collections::BTreeMap;
+
 use bson::{doc, Bson, Document};
 use secantus_wt::Session;
 
@@ -38,9 +40,30 @@ pub const COLLECTION_TABLE_CFG: &str = "type=file,memory_page_max=10m,split_pct=
      leaf_value_max=64MB,checksum=on,block_compressor=snappy,key_format=q,\
      value_format=u,app_metadata=(formatVersion=1)";
 
+/// The configuration mongod 8.2.11 creates an index's table with (phase 0b):
+/// `key_format=u,value_format=u` (the KeyString and RecordId are the key, the
+/// TypeBits the value), no block compressor, prefix compression, 16k pages,
+/// and `app_metadata=(formatVersion=8)`. The store's data-logging mode is
+/// applied by the caller, as for a collection.
+pub const INDEX_TABLE_CFG: &str = "type=file,internal_page_max=16k,leaf_page_max=16k,\
+     checksum=on,prefix_compression=true,key_format=u,value_format=u,\
+     app_metadata=(formatVersion=8)";
+
+/// A unique secondary index's table: the same, `formatVersion=14` (the
+/// index format mongod 8.2.11 gives a unique index; its key layout is the
+/// same, the RecordId appended).
+pub const UNIQUE_INDEX_TABLE_CFG: &str = "type=file,internal_page_max=16k,leaf_page_max=16k,\
+     checksum=on,prefix_compression=true,key_format=u,value_format=u,\
+     app_metadata=(formatVersion=14)";
+
 /// A collection's ident: `collection-<UUID>`, as mongod 8.2 names them.
 pub fn new_collection_ident() -> String {
     format!("collection-{}", uuid_string(&new_uuid_bytes()))
+}
+
+/// An index's ident: `index-<UUID>`, as mongod 8.2 names them.
+pub fn new_index_ident() -> String {
+    format!("index-{}", uuid_string(&new_uuid_bytes()))
 }
 
 /// The WiredTiger URI of an ident's table.
@@ -60,11 +83,14 @@ fn uuid_string(b: &[u8; 16]) -> String {
     )
 }
 
-/// Where a collection lives: its ident and its `_mdb_catalog` row.
+/// Where a collection lives: its ident, its `_mdb_catalog` row, and the
+/// idents of its secondary indexes' tables (`idxIdent`: index name to
+/// ident). The `_id_` index has no table of its own yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placement {
     pub ident: String,
     pub catalog_id: i64,
+    pub indexes: BTreeMap<String, String>,
 }
 
 impl Placement {
@@ -72,14 +98,30 @@ impl Placement {
         table_uri(&self.ident)
     }
 
+    /// Every ident this placement names: the collection's and each index's.
+    pub fn idents(&self) -> impl Iterator<Item = &String> {
+        std::iter::once(&self.ident).chain(self.indexes.values())
+    }
+
     fn to_doc(&self) -> Document {
-        doc! {"ident": &self.ident, "catalogId": self.catalog_id}
+        let mut indexes = Document::new();
+        for (name, ident) in &self.indexes {
+            indexes.insert(name.clone(), ident.clone());
+        }
+        doc! {"ident": &self.ident, "catalogId": self.catalog_id, "indexes": indexes}
     }
 
     fn from_doc(d: &Document) -> Option<Placement> {
+        let mut indexes = BTreeMap::new();
+        if let Ok(ix) = d.get_document("indexes") {
+            for (name, ident) in ix {
+                indexes.insert(name.clone(), ident.as_str()?.to_string());
+            }
+        }
         Some(Placement {
             ident: d.get_str("ident").ok()?.to_string(),
             catalog_id: d.get_i64("catalogId").ok()?,
+            indexes,
         })
     }
 }

@@ -39,6 +39,7 @@ use s2::region::RegionCoverer;
 use secantus_core::collation::Collation;
 use secantus_core::deadline;
 use secantus_core::diff::compute_update_description_for;
+use secantus_core::keystring;
 use secantus_core::order;
 use secantus_core::order::{with_bindata_order, BinDataOrder};
 use secantus_core::query::matches as query_matches;
@@ -63,6 +64,7 @@ pub mod share_locks;
 pub mod spill;
 
 mod index_build;
+mod ixkeys;
 mod lockfile;
 pub use lockfile::LockFileRecord;
 pub mod mdb_catalog;
@@ -72,6 +74,7 @@ pub mod store_format;
 
 pub use catalog_changes::CatalogChange;
 pub use index_build::{IndexBuildAbort, IndexBuildInfo, IndexBuildSpec};
+use ixkeys::{EntryKey, KeyShape};
 pub use sizes::CollectionSizes;
 use sizes::Delta;
 
@@ -836,6 +839,7 @@ fn place_new_collection(session: &Session, data_nonlogged: bool) -> Result<mdb_c
     let placement = mdb_catalog::Placement {
         ident: mdb_catalog::new_collection_ident(),
         catalog_id: next_catalog_id(),
+        indexes: BTreeMap::new(),
     };
     session.create(
         &placement.table(),
@@ -844,26 +848,198 @@ fn place_new_collection(session: &Session, data_nonlogged: bool) -> Result<mdb_c
     Ok(placement)
 }
 
+/// `(db, coll)`'s placement as `session` sees it: the one a transaction
+/// created the collection with and holds until commit, else the committed
+/// one in `secantus_idents`.
+fn effective_placement(
+    session: &Session,
+    db: &str,
+    coll: &str,
+) -> Result<Option<mdb_catalog::Placement>> {
+    if let Some(hp) = deferring_handle(session) {
+        // SAFETY: as `deferring_handle`; a shared read.
+        if let Some(p) = unsafe { &*hp }
+            .deferred_placements
+            .get(&(db.to_string(), coll.to_string()))
+        {
+            return Ok(Some(p.clone()));
+        }
+    }
+    mdb_catalog::read_placement(session, db, coll)
+}
+
+/// The ident of index `name`'s table on `(db, coll)`, as `session` sees it.
+fn index_ident(session: &Session, db: &str, coll: &str, name: &str) -> Result<Option<String>> {
+    Ok(effective_placement(session, db, coll)?.and_then(|p| p.indexes.get(name).cloned()))
+}
+
+/// A cursor on index `name`'s own table (`index-<UUID>`) of `(db, coll)`.
+/// An index with no ident is a registry row no placement backs, which no
+/// write of this store leaves; a table that is gone is an index dropped
+/// after the reader's snapshot was taken, refused as a collection's is.
+fn open_index_cursor(
+    session: &Session,
+    db: &str,
+    coll: &str,
+    name: &str,
+    config: Option<&str>,
+) -> Result<Cursor> {
+    let Some(ident) = index_ident(session, db, coll, name)? else {
+        return Err(index_gone());
+    };
+    match session.open_cursor(&mdb_catalog::table_uri(&ident), config) {
+        Ok(c) => Ok(c),
+        Err(e) if e.is_missing_table() => Err(index_gone()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The error a read of an index that is not there answers: one the reader
+/// found in the catalog and that was dropped (or whose collection was)
+/// before it was read. A read that can read another way (a collection scan)
+/// does ([`Storage::try_index_id_keys`]); one that cannot is refused as a
+/// collection's is, with mongod's `SnapshotUnavailable`.
+fn index_gone() -> StorageError {
+    WtError {
+        code: SNAPSHOT_UNAVAILABLE,
+        message: "Unable to read from a snapshot due to pending collection catalog \
+                  changes; please retry the operation."
+            .to_string(),
+    }
+    .into()
+}
+
+/// Position `cur` (on an index table) at the first entry whose key is at
+/// or after `seed`; whether there is one. A WiredTiger key cannot be empty,
+/// so an empty seed stands for the start of the table.
+fn seek_ge(cur: &Cursor, seed: &[u8]) -> Result<bool> {
+    cur.set_key_u(if seed.is_empty() { &[0u8] } else { seed });
+    match cur.search_near() {
+        Ok(cmp) if cmp < 0 => Ok(cur.next()?),
+        Ok(_) => Ok(true),
+        Err(e) if e.is_not_found() => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// A new index's table: a fresh `index-<UUID>` made with mongod's index
+/// config. Nothing lists it yet ([`record_index_ident`] does, in the
+/// transaction that commits the index), so a build that dies leaves a table
+/// no placement names, which the next open drops (`reconcile_idents`). A
+/// table is not part of any transaction.
+fn make_index_table(store: &Storage, session: &Session, unique: bool) -> Result<String> {
+    let ident = mdb_catalog::new_index_ident();
+    let cfg = if unique {
+        mdb_catalog::UNIQUE_INDEX_TABLE_CFG
+    } else {
+        mdb_catalog::INDEX_TABLE_CFG
+    };
+    session.create(
+        &mdb_catalog::table_uri(&ident),
+        &data_table_cfg(cfg, store.data_nonlogged),
+    )?;
+    Ok(ident)
+}
+
+/// List index `name`'s table in `(db, coll)`'s placement (the transaction's
+/// own, for a collection it created and has not committed), in `session`'s
+/// transaction. With `drop_on_rollback`, the table is dropped (once nothing
+/// reads it) if that transaction rolls back; a build that retries its commit
+/// manages the table itself.
+fn record_index_ident(
+    store: &Storage,
+    session: &Session,
+    db: &str,
+    coll: &str,
+    name: &str,
+    ident: &str,
+    drop_on_rollback: bool,
+) -> Result<()> {
+    if let Some(hp) = deferring_handle(session) {
+        // SAFETY: as `deferring_handle`; the only writer on this thread.
+        if let Some(p) = unsafe { &mut *hp }
+            .deferred_placements
+            .get_mut(&(db.to_string(), coll.to_string()))
+        {
+            // Dropped with the collection's tables when the transaction rolls
+            // back (`rollback_user_transaction_inner`).
+            if let Some(old) = p.indexes.insert(name.to_string(), ident.to_string()) {
+                // A replay of the transaction made this index before.
+                if old != ident {
+                    store.drop_ident_table(&old);
+                }
+            }
+            return Ok(());
+        }
+    }
+    let Some(mut p) = mdb_catalog::read_placement(session, db, coll)? else {
+        return Err(StorageError::Internal(format!(
+            "{db}.{coll} has no placement to record index {name} in"
+        )));
+    };
+    p.indexes.insert(name.to_string(), ident.to_string());
+    mdb_catalog::write_placement(session, db, coll, &p)?;
+    if drop_on_rollback {
+        let pending = store.drop_pending.clone();
+        let orphan = ident.to_string();
+        session.on_transaction_end(Box::new(move |committed| {
+            if !committed {
+                pending.lock().push(orphan);
+            }
+        }));
+    }
+    Ok(())
+}
+
 /// The WiredTiger table that holds `(db, coll)`'s documents (`$listCatalog`'s
 /// `ident`, `pg_relation_filepath`), if it has one.
 pub(crate) fn collection_table(session: &Session, db: &str, coll: &str) -> Result<Option<String>> {
     Ok(placement_ident(session, db, coll)?.map(|i| mdb_catalog::table_uri(&i)))
 }
 
-/// The WiredTiger table that holds index `name`'s entries (`$listCatalog`'s
-/// `idxIdent`): the `_id` index is the `_id -> RecordId` map, every other
-/// index is in the one shared entries table.
-pub fn index_table(name: &str) -> &'static str {
+/// The WiredTiger table that holds index `name`'s entries on `(db, coll)`
+/// (`$listCatalog`'s `idxIdent`, `pg_relation_filepath`): the `_id` index is
+/// still the `_id -> RecordId` map (the next step of the storage model gives
+/// it a table of its own); every other index is an `index-<UUID>` table.
+pub(crate) fn index_table_of(
+    session: &Session,
+    db: &str,
+    coll: &str,
+    name: &str,
+) -> Result<Option<String>> {
     if name == ID_INDEX_NAME {
-        NAT_SEQ_TABLE
-    } else {
-        IDX_ENTRIES_TABLE
+        return Ok(Some(NAT_SEQ_TABLE.to_string()));
     }
+    Ok(index_ident(session, db, coll, name)?.map(|i| mdb_catalog::table_uri(&i)))
 }
 
 /// The WiredTiger table of the collection registry, which is where a
 /// database's view definitions are kept.
 pub const CATALOG_TABLE: &str = COLL_TABLE;
+
+/// Where an index read starts or resumes ([`Storage::index_entries_from`]).
+#[derive(Clone, Copy, Debug)]
+pub enum IndexPos<'a> {
+    /// The first entry (or the last, reading backward).
+    Edge,
+    /// A raw `_id` key (the `_id` index only).
+    Raw(&'a [u8]),
+    /// The entries holding these leading key values, whatever follows them:
+    /// forward, from the first of them; backward, from the last.
+    Values(&'a [Bson]),
+    /// Just past (before, reading backward) the entry whose `resume` this is.
+    Resume(&'a [u8]),
+}
+
+/// One index entry as [`Storage::index_entries_from`] reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexRow {
+    /// The key's per-field sort-key encodings joined by `COMPOUND_SEP`.
+    pub raw: Vec<u8>,
+    pub rid: i64,
+    /// Where a read resumes after this entry.
+    pub resume: Vec<u8>,
+}
 
 /// A scanned document row: `(RecordId, id_key, blob)`. The RecordId is the
 /// doc-table key; the id_key and blob are unframed from the value (see
@@ -965,11 +1141,11 @@ const INDEX_BUILD_CHUNK_MAX_BYTES: usize = 512 * 1024;
 
 /// `entries` cut into the chunks of an index build, each within
 /// [`INDEX_BUILD_CHUNK_MAX_ENTRIES`] and [`INDEX_BUILD_CHUNK_MAX_BYTES`].
-fn index_build_chunks(entries: &[(Vec<u8>, i64)]) -> Vec<&[(Vec<u8>, i64)]> {
+fn index_build_chunks(entries: &[EntryKey]) -> Vec<&[EntryKey]> {
     let mut out = Vec::new();
     let (mut start, mut bytes) = (0usize, 0usize);
-    for (i, (kb, _)) in entries.iter().enumerate() {
-        let size = kb.len() + 8;
+    for (i, e) in entries.iter().enumerate() {
+        let size = e.key.len() + e.type_bits.len();
         if i > start
             && (i - start >= INDEX_BUILD_CHUNK_MAX_ENTRIES
                 || bytes + size > INDEX_BUILD_CHUNK_MAX_BYTES)
@@ -990,8 +1166,9 @@ fn index_build_chunks(entries: &[(Vec<u8>, i64)]) -> Vec<&[(Vec<u8>, i64)]> {
 struct IndexPlan {
     /// The catalog row.
     payload: Vec<u8>,
-    /// Every entry: the sort key and the document's RecordId.
-    entries: Vec<(Vec<u8>, i64)>,
+    /// Every entry: the KeyString of its values with the document's
+    /// RecordId, and the TypeBits.
+    entries: Vec<EntryKey>,
 }
 
 /// Whether an oplog entry is for something mongod does not replicate, and
@@ -1633,7 +1810,6 @@ fn reject_legacy_index_entry_format(session: &Session) -> Result<()> {
 }
 
 const IDX_TABLE: &str = "table:secantus_indexes";
-const IDX_ENTRIES_TABLE: &str = "table:secantus_index_entries";
 /// Unique-index key claims: `(db, coll, index, escaped_sortkey) -> RecordId`.
 ///
 /// The entries table cannot enforce uniqueness itself — its key carries the
@@ -2142,10 +2318,6 @@ const PROFILE_TABLE: &str = "table:secantus_profile_settings";
 /// in the registry; `list_indexes` synthesises it.
 const ID_INDEX_NAME: &str = "_id_";
 
-/// The entry-key separator between the (escaped) index sort-key bytes and the
-/// document's `id_key`. Mirrors `storage._ENTRY_SEP`.
-const ENTRY_SEP: &[u8] = b"\x00\x00";
-
 /// Index options whose value conflicting with an existing index of the same
 /// name makes `create_index` reject the re-creation (mirrors `storage.py`).
 const CONFLICTING_OPTS: &[&str] = &[
@@ -2271,6 +2443,30 @@ impl IndexDesc {
             index_key_variants_c(doc, &self.key_spec, sparse, self.collation.as_ref())
         })
     }
+
+    /// [`Self::key_variants`] with the values each key is made of.
+    fn key_values(&self, doc: &Document, sparse: bool) -> Result<Vec<(Vec<u8>, Vec<Bson>)>> {
+        with_bindata_order(self.key_order, || {
+            index_key_values_c(doc, &self.key_spec, sparse, self.collation.as_ref())
+        })
+    }
+
+    /// How this index's values become the KeyString its entries are keyed by.
+    fn shape(&self) -> KeyShape {
+        KeyShape::new(&self.key_spec, self.collation.clone(), self.key_order)
+    }
+}
+
+/// A geo index's cell, as the one BinData value its entry is keyed by.
+fn geo_entry(cell: &[u8], recordid: i64) -> Result<EntryKey> {
+    KeyShape::plain().entry(&[geo_cell_value(cell)], recordid)
+}
+
+fn geo_cell_value(cell: &[u8]) -> Bson {
+    Bson::Binary(Binary {
+        subtype: BinarySubtype::Generic,
+        bytes: cell.to_vec(),
+    })
 }
 
 /// A `2d` geohash index's parameters (field + bucketing range / precision).
@@ -2761,10 +2957,6 @@ const BOOTSTRAP: &[(&str, &str)] = &[
     (mdb_catalog::IDENTS_TABLE, "key_format=SS,value_format=u"),
     (TOMB_TABLE, "key_format=SS,value_format=u"),
     ("table:secantus_indexes", "key_format=SSS,value_format=u"),
-    (
-        "table:secantus_index_entries",
-        "key_format=SSSu,value_format=u",
-    ),
     (
         "table:secantus_unique_keys",
         "key_format=SSSu,value_format=q",
@@ -3484,21 +3676,6 @@ fn escape_kb(kb: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The inverse of [`escape_kb`]: `00 ff` back to `00`.
-fn unescape_kb(esc: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(esc.len());
-    let mut i = 0;
-    while i < esc.len() {
-        out.push(esc[i]);
-        i += if esc[i] == 0 && esc.get(i + 1) == Some(&0xff) {
-            2
-        } else {
-            1
-        };
-    }
-    out
-}
-
 /// On-disk index-ENTRY format version, recorded per index as
 /// `options.entryFormat` in the index catalog:
 ///
@@ -3547,46 +3724,19 @@ const ENTRY_FORMAT: i32 = 6;
 /// the deprecated Python servers write is format 4, and opens.
 const OLDEST_REBUILDABLE_ENTRY_FORMAT: i32 = 4;
 
-/// Pack an index-entry payload into a single trailing `u` column:
-/// `escape(kb) + b"\x00\x00" + RecordId(8B big-endian)`. WiredTiger
-/// length-prefixes non-trailing `u` columns, which would break lexicographic
-/// order — so both halves live in one column and the B-tree sorts by
-/// `escape(kb)` first, then by RecordId.
-///
-/// **Step 2 format (`ENTRY_FORMAT` 2).** The trailing half used to be the
-/// doc's `id_key`, which made an IXSCAN fetch pay `id_key → _id index → RecordId
-/// → doc`. Storing the RecordId directly drops that hop (measured at +14.7% on
-/// `find_indexed_range` — see `tasks/rust-recordid-plan.md`). Big-endian is
-/// deliberate: it keeps the B-tree ordering within one key in RecordId
-/// (insertion) order, and it is fixed-width so the trailing half needs no
-/// escaping even though a RecordId's bytes may themselves contain `\x00\x00`
-/// (`unpack_entry` splits at the FIRST separator, and the escaped `kb` half
-/// cannot contain one).
-fn pack_entry(kb: &[u8], recordid: i64) -> Vec<u8> {
-    let mut out = escape_kb(kb);
-    out.extend_from_slice(ENTRY_SEP);
-    out.extend_from_slice(&recordid.to_be_bytes());
-    out
-}
-
-/// Split a packed entry into `(escaped_kb, RecordId)` at the FIRST `\x00\x00`.
-/// Correct because the `kb` half is escaped (no bare `\x00\x00` can occur in
-/// it). A trailing half that is not exactly 8 bytes is a step-1-format entry;
-/// callers must never see one (`reject_legacy_index_entry_format` refuses such a
-/// store at open), so it is reported as `None` rather than silently mis-read.
 /// Whether an index entry's key is a whole-array key rather than an element key.
 ///
-/// The first byte of an encoded value is its type rank; escaping only rewrites
-/// `0x00`, which no rank byte is. A descending column is encoded byte-inverted, so
-/// the rank arrives as `0xFF - rank`.
-fn is_whole_array_key(escaped_key: &[u8], idx_dir: i32) -> bool {
-    match escaped_key.first() {
+/// The first byte of an entry's KeyString is the type byte of its first
+/// value. A descending column is encoded byte-inverted, so it arrives as
+/// `!ctype`.
+fn is_whole_array_key(key: &[u8], idx_dir: i32) -> bool {
+    match key.first() {
         None => false,
         Some(&first) => {
             let expected = if idx_dir >= 0 {
-                sortkey::RANK_ARRAY
+                keystring::ctype::ARRAY
             } else {
-                0xFF - sortkey::RANK_ARRAY
+                !keystring::ctype::ARRAY
             };
             first == expected
         }
@@ -3636,17 +3786,6 @@ fn id_entries_from(
         more = if backward { cur.prev()? } else { cur.next()? };
     }
     Ok(out)
-}
-
-fn unpack_entry(packed: &[u8]) -> (&[u8], Option<i64>) {
-    match packed.windows(2).position(|w| w == ENTRY_SEP) {
-        Some(i) => {
-            let tail = &packed[i + 2..];
-            let rid = <[u8; 8]>::try_from(tail).ok().map(i64::from_be_bytes);
-            (&packed[..i], rid)
-        }
-        None => (packed, None),
-    }
 }
 
 /// Join compound key parts with `COMPOUND_SEP` between components (mirrors
@@ -4540,6 +4679,22 @@ fn index_key_variants_c(
     sparse: bool,
     coll: Option<&Collation>,
 ) -> Result<Vec<Vec<u8>>> {
+    Ok(index_key_values_c(doc, key_spec, sparse, coll)?
+        .into_iter()
+        .map(|(kb, _)| kb)
+        .collect())
+}
+
+/// The keys `doc` contributes to an index, each as its sort-key bytes (what
+/// uniqueness claims and in-memory comparisons are keyed by) and as the
+/// values it is made of, one per key field (what the index's KeyString is
+/// built from).
+fn index_key_values_c(
+    doc: &Document,
+    key_spec: &Document,
+    sparse: bool,
+    coll: Option<&Collation>,
+) -> Result<Vec<(Vec<u8>, Vec<Bson>)>> {
     let fields: Vec<(&String, i32)> = key_spec
         .iter()
         .map(|(k, v)| (k, direction_of(v).unwrap_or(1)))
@@ -4573,11 +4728,11 @@ fn index_key_variants_c(
     if fields.len() == 1 {
         let d = fields[0].1;
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
-        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut keys: Vec<(Vec<u8>, Vec<Bson>)> = Vec::new();
         for val in &per_field[0] {
             let kb = enc_dir_c(val, d, coll)?;
             if seen.insert(kb.clone()) {
-                keys.push(kb);
+                keys.push((kb, vec![val.clone()]));
             }
         }
         return Ok(keys);
@@ -4607,7 +4762,7 @@ fn index_key_variants_c(
         combos = next;
     }
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
-    let mut keys: Vec<Vec<u8>> = Vec::new();
+    let mut keys: Vec<(Vec<u8>, Vec<Bson>)> = Vec::new();
     for combo in &combos {
         let mut parts: Vec<Vec<u8>> = Vec::with_capacity(fields.len());
         for (i, (_f, d)) in fields.iter().enumerate() {
@@ -4615,7 +4770,7 @@ fn index_key_variants_c(
         }
         let kb = compound_join(&parts);
         if seen.insert(kb.clone()) {
-            keys.push(kb);
+            keys.push((kb, combo.iter().map(|v| (*v).clone()).collect()));
         }
     }
     Ok(keys)
@@ -5311,7 +5466,7 @@ fn partition_compound_range_filter(filter: &Document) -> Option<(Document, Strin
 }
 
 /// `(index name, packed entry key)` pairs an update must insert or remove.
-type EntryOps = Vec<(String, Vec<u8>)>;
+type EntryOps = Vec<(String, EntryKey)>;
 
 /// The per-collection write-lock registry: `(db, coll) → lock`.
 /// The per-collection write locks, and the size at which the next new
@@ -5507,7 +5662,7 @@ pub struct Storage {
     /// dropped when nothing has it open; until then it waits here, retried
     /// by each drop, by the checkpoint thread and at close, and an open
     /// drops any its predecessor left (`reconcile_idents`).
-    drop_pending: Arc<Mutex<Vec<String>>>,
+    drop_pending: Arc<DropPending>,
     /// Which collections of one database hold an index of each name: the
     /// relation-name lookup [`Self::index_owners`] answers from, kept
     /// current from the index catalog's change log (RP-928).
@@ -7891,14 +8046,6 @@ fn peek_entry_ts(blob: &[u8]) -> Option<bson::Timestamp> {
 /// greater than any existing doc-table key. The RecordId is now the doc-table key
 /// itself (`(db, coll, RecordId)`); the forward `NAT_TABLE` this used to scan is
 /// gone. Mirrors `storage._scan_max_nat_seq`.
-/// Every collection with its documents table: `(db, coll, table URI)`.
-fn collection_tables(session: &Session) -> Result<Vec<(String, String, String)>> {
-    Ok(mdb_catalog::all_placements(session)?
-        .into_iter()
-        .map(|(db, coll, p)| (db, coll, p.table()))
-        .collect())
-}
-
 fn scan_max_nat_seq(session: &Session) -> i64 {
     // RecordIds are minted from one counter for every collection, so any
     // collection's last row could hold the largest: read each table's last.
@@ -8306,7 +8453,7 @@ impl Storage {
                 // race). A checkpoint failure is logged, never silent: in a
                 // database a close-time write error is a durability signal.
                 if self.durable && !self.in_memory {
-                    if let Err(e) = session.checkpoint(None) {
+                    if let Err(e) = self.drop_pending.checkpoint(&session) {
                         fail("the final checkpoint", e.into());
                     }
                 }
@@ -8589,7 +8736,7 @@ impl Storage {
             desc_cache: std::sync::RwLock::new(HashMap::new()),
             options_cache: std::sync::RwLock::new(HashMap::new()),
             list_cache: std::sync::RwLock::new(HashMap::new()),
-            drop_pending: Arc::new(Mutex::new(Vec::new())),
+            drop_pending: Arc::new(DropPending::new(in_memory)),
             index_names: Mutex::new(None),
             txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
             cache_bytes: parse_cache_bytes(config),
@@ -10164,7 +10311,7 @@ impl Storage {
             advance_timestamps(&self.conn, &self.oplog)?;
         }
         let session = self.conn.open_session()?;
-        session.checkpoint(None)?;
+        self.drop_pending.checkpoint(&session)?;
         Ok(())
     }
 
@@ -10237,10 +10384,9 @@ impl Storage {
             {
                 let pending = self.drop_pending.clone();
                 session.on_transaction_end(Box::new(move |_| {
-                    pending
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(p.ident);
+                    let mut pending = pending.lock();
+                    pending.push(p.ident);
+                    pending.extend(p.indexes.into_values());
                 }));
             }
         }
@@ -10250,19 +10396,56 @@ impl Storage {
         mdb_catalog::remove_entry(session, p.catalog_id)?;
         mdb_catalog::remove_placement(session, db, coll)?;
         let s = self.sizes.get(db, coll);
-        self.sizes.adjust(
-            session,
-            db,
-            coll,
-            Delta::drop_rows(s.records, s.data_size, s.id_index_size),
-        );
+        self.sizes.adjust(session, db, coll, Delta::drop_all(&s));
         let pending = self.drop_pending.clone();
         session.on_transaction_end(Box::new(move |committed| {
             if committed {
-                pending
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(p.ident);
+                let mut pending = pending.lock();
+                pending.push(p.ident);
+                pending.extend(p.indexes.into_values());
+            }
+        }));
+        Ok(())
+    }
+
+    /// Unlist index `name` of `(db, coll)`, in `session`'s transaction: its
+    /// placement entry goes, and its table is dropped once the transaction
+    /// commits and nothing has it open (the drop-pending reaper).
+    fn unplace_index(&self, session: &Session, db: &str, coll: &str, name: &str) -> Result<()> {
+        // Its entries go with its table.
+        if let Some(bytes) = self.sizes.get(db, coll).index_sizes.get(name) {
+            self.sizes
+                .adjust(session, db, coll, Delta::entries(name, -*bytes));
+        }
+        if let Some(hp) = deferring_handle(session) {
+            // SAFETY: as `deferring_handle`; the only writer on this thread.
+            if let Some(p) = unsafe { &mut *hp }
+                .deferred_placements
+                .get_mut(&(db.to_string(), coll.to_string()))
+            {
+                if let Some(ident) = p.indexes.remove(name) {
+                    // The collection is the transaction's own: nobody else
+                    // can hold the table. It has written it, though, so it
+                    // goes once the transaction is over.
+                    let pending = self.drop_pending.clone();
+                    session.on_transaction_end(Box::new(move |_| {
+                        pending.lock().push(ident);
+                    }));
+                }
+                return Ok(());
+            }
+        }
+        let Some(mut p) = mdb_catalog::read_placement(session, db, coll)? else {
+            return Ok(());
+        };
+        let Some(ident) = p.indexes.remove(name) else {
+            return Ok(());
+        };
+        mdb_catalog::write_placement(session, db, coll, &p)?;
+        let pending = self.drop_pending.clone();
+        session.on_transaction_end(Box::new(move |committed| {
+            if committed {
+                pending.lock().push(ident);
             }
         }));
         Ok(())
@@ -10283,18 +10466,9 @@ impl Storage {
         mdb_catalog::remove_placement(session, src.0, src.1)?;
         mdb_catalog::write_placement(session, dst.0, dst.1, &p)?;
         let s = self.sizes.get(src.0, src.1);
-        self.sizes.adjust(
-            session,
-            src.0,
-            src.1,
-            Delta::drop_rows(s.records, s.data_size, s.id_index_size),
-        );
-        self.sizes.adjust(
-            session,
-            dst.0,
-            dst.1,
-            Delta::drop_rows(-s.records, -s.data_size, -s.id_index_size),
-        );
+        self.sizes
+            .adjust(session, src.0, src.1, Delta::drop_all(&s));
+        self.sizes.adjust(session, dst.0, dst.1, Delta::arrive(&s));
         Ok(())
     }
 
@@ -10303,6 +10477,93 @@ impl Storage {
     pub fn collection_table_name(&self, db: &str, coll: &str) -> Result<Option<String>> {
         let session = self.conn.open_session()?;
         collection_table(&session, db, coll)
+    }
+
+    /// Index `name`'s entries as the table holds them: each key (the KeyString
+    /// of the entry's values with its RecordId) and its value (the TypeBits),
+    /// in the table's order. For tests of the on-disk layout.
+    #[doc(hidden)]
+    pub fn index_table_rows(
+        &self,
+        db: &str,
+        coll: &str,
+        name: &str,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let session = self.conn.open_session()?;
+        let cur = open_index_cursor(&session, db, coll, name, None)?;
+        let mut out = Vec::new();
+        while cur.next()? {
+            out.push((cur.get_key_u()?, cur.get_value_u()?));
+        }
+        Ok(out)
+    }
+
+    /// Every table WiredTiger holds (`table:<name>`), sorted. For tests of
+    /// what a drop, a rename or a rollback leaves behind.
+    #[doc(hidden)]
+    pub fn wt_table_names(&self) -> Result<Vec<String>> {
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor("metadata:", None)?;
+        let mut out = Vec::new();
+        while cur.next()? {
+            let uri = cur.get_key_s()?;
+            if uri.starts_with("table:") {
+                out.push(uri);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// The `_mdb_catalog` row listing `(db, coll)`, if it has one. For tests.
+    #[doc(hidden)]
+    pub fn mdb_catalog_entry(&self, db: &str, coll: &str) -> Result<Option<Document>> {
+        let session = self.conn.open_session()?;
+        match mdb_catalog::read_placement(&session, db, coll)? {
+            Some(p) => mdb_catalog::read_entry(&session, p.catalog_id),
+            None => Ok(None),
+        }
+    }
+
+    /// Take a checkpoint and run the drop-pending reaper: drop every table a
+    /// committed drop or a rolled-back create left that nothing has open and
+    /// no checkpoint holds any more -- what the checkpoint thread does on a
+    /// running server. For tests.
+    #[doc(hidden)]
+    pub fn reap_dropped_tables(&self) {
+        if !self.in_memory {
+            if let Ok(session) = self.conn.open_session() {
+                let _cp = self
+                    .checkpoint_gate
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = self.drop_pending.checkpoint(&session) {
+                    eprintln!("secantus-storage: checkpoint before reaping: {e:?}");
+                }
+            }
+        }
+        reap_drop_pending(&self.conn, &self.drop_pending);
+    }
+
+    /// Every WiredTiger table holding an index's entries on `(db, coll)`
+    /// (the placement's `idxIdent`).
+    pub(crate) fn index_table_names(&self, db: &str, coll: &str) -> Result<Vec<String>> {
+        let session = self.conn.open_session()?;
+        Ok(effective_placement(&session, db, coll)?
+            .map(|p| {
+                p.indexes
+                    .values()
+                    .map(|i| mdb_catalog::table_uri(i))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// The WiredTiger table holding index `name`'s entries on `(db, coll)`,
+    /// if the index has one (`$listCatalog`'s `idxIdent`).
+    pub fn index_table_name(&self, db: &str, coll: &str, name: &str) -> Result<Option<String>> {
+        let session = self.conn.open_session()?;
+        index_table_of(&session, db, coll, name)
     }
 
     /// Write every collection's `_mdb_catalog` row from the registry, in one
@@ -10325,10 +10586,7 @@ impl Storage {
     /// Drop `ident`'s table now if nothing has it open, else when the
     /// drop-pending reaper next finds it free (`drop_pending`).
     fn drop_ident_table(&self, ident: &str) {
-        self.drop_pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(ident.to_string());
+        self.drop_pending.lock().push(ident.to_string());
         reap_drop_pending(&self.conn, &self.drop_pending);
     }
 
@@ -10730,7 +10988,8 @@ impl Storage {
                         // MODE, which a logged store must not acquire.
                         let done = {
                             let _cp = gate.lock().unwrap_or_else(|e| e.into_inner());
-                            conn.open_session().and_then(|s| s.checkpoint(None))
+                            conn.open_session()
+                                .and_then(|s| drop_pending.checkpoint(&s))
                         };
                         if let Err(e) = done {
                             eprintln!("secantus-storage: periodic checkpoint failed: {e:?}");
@@ -10760,7 +11019,7 @@ impl Storage {
                         let session = conn.open_session()?;
                         {
                             let _cp = gate.lock().unwrap_or_else(|e| e.into_inner());
-                            session.checkpoint(None)?;
+                            drop_pending.checkpoint(&session)?;
                         }
                         let mut d = Document::new();
                         d.insert("stable_seq", stable);
@@ -10812,7 +11071,7 @@ impl Storage {
         // Durable, consistent snapshot first; the backup cursor enumerates the
         // files that make it up and WiredTiger holds them stable for the cursor's
         // lifetime, so we tar them all before it drops.
-        session.checkpoint(None)?;
+        self.drop_pending.checkpoint(&session)?;
         let manifest = self.pitr_manifest()?;
         let cursor = session.open_cursor("backup:", None)?;
         // Written under a temporary name and renamed once synced, so a
@@ -12511,11 +12770,12 @@ impl Storage {
         // can see: they go when nothing reads them (see `drop_ident_table`).
         let made: Vec<String> = std::mem::take(&mut handle.deferred_placements)
             .into_values()
-            .map(|p| p.ident)
+            .flat_map(|p| {
+                let mut idents = vec![p.ident];
+                idents.extend(p.indexes.into_values());
+                idents
+            })
             .collect();
-        for ident in made {
-            self.drop_ident_table(&ident);
-        }
         if let Some(session) = handle.session.take() {
             {
                 let mut held = handle.held.lock().unwrap_or_else(|e| e.into_inner());
@@ -12536,6 +12796,12 @@ impl Storage {
             handle.deregister_minted();
             handle.pending_async.clear();
             // `session` drops here → the dedicated WT session is closed.
+        }
+        // Dropped only now: a table dropped under a transaction that has
+        // written it (a forced drop does not wait for its updates) would
+        // leave the rollback with rows of a table that is gone.
+        for ident in made {
+            self.drop_ident_table(&ident);
         }
         Ok(())
     }
@@ -14980,17 +15246,6 @@ impl Storage {
             }
         }
         loop {
-            let n = self.retry_write_conflicts("drop_collection purge(idx)", || {
-                let session = self.op_session()?;
-                self.with_statement_txn(&session, || {
-                    self.purge_idx_entries_batch(&session, db, coll, PURGE_CHUNK_MAX_ROWS)
-                })
-            })?;
-            if n < PURGE_CHUNK_MAX_ROWS {
-                break;
-            }
-        }
-        loop {
             let n = self.retry_write_conflicts("drop_collection purge(nat)", || {
                 let session = self.op_session()?;
                 self.with_statement_txn(&session, || {
@@ -15378,8 +15633,8 @@ impl Storage {
                         let recordid =
                             self.write_nat_entry_kept(&session, dst_db, dst_coll, id_k, *src_rid)?;
                         let doc = decode_doc(blob)?;
-                        self.write_index_entries(
-                            &session, dst_db, dst_coll, &doc, &dst_descs, recordid,
+                        self.write_index_rows(
+                            &session, dst_db, dst_coll, &doc, &dst_descs, recordid, false,
                         )?;
                         last = Some(*src_rid);
                     }
@@ -15545,19 +15800,17 @@ impl Storage {
             icur.set_value_u(payload);
             icur.insert()?;
         }
-        // REBUILD the index entries rather than copying the source's packed rows.
-        // Step-2 entries carry the RecordId; rename used to re-mint every RecordId,
-        // so copied entries pointed at rows that did not exist in the destination.
-        // Records keep their RecordIds now, but rebuilding stays the one path
-        // that cannot drift from the documents. The index catalog rows are
-        // written above, so `index_descs`
-        // sees the destination's indexes here.
+        // The index entries are in the indexes' own tables, which moved with
+        // the placement and hold the records' RecordIds, kept; only the
+        // unique claims, keyed by namespace, are written again. The index
+        // catalog rows are written above, so `index_descs` sees the
+        // destination's indexes here.
         let mut dst_descs = self.index_descs(session, dst_db, dst_coll)?;
         if !dst_descs.iter().any(|d| d.id_claim) {
             dst_descs.extend(src_id_claim);
         }
         for (recordid, doc) in &moved {
-            self.write_index_entries(session, dst_db, dst_coll, doc, &dst_descs, *recordid)?;
+            self.write_index_rows(session, dst_db, dst_coll, doc, &dst_descs, *recordid, false)?;
         }
         self.set_next_record_id(dst_db, dst_coll, src_next);
         let rc = session.open_cursor(COLL_TABLE, None)?;
@@ -15727,7 +15980,7 @@ impl Storage {
     /// nothing else writes.
     fn check_sizes_against_walk(&self, session: &Session) -> Result<()> {
         let walked = sizes::SizeStorer::default();
-        walked.recount(session, &collection_tables(session)?, IDX_ENTRIES_TABLE)?;
+        walked.recount(session, &mdb_catalog::all_placements(session)?)?;
         let mut wrong = Vec::new();
         for (db, coll, sizes) in self.sizes.committed_sizes() {
             if walked.get(&db, &coll) != sizes {
@@ -15764,7 +16017,7 @@ impl Storage {
         session.create(sizes::SIZE_STORER_TABLE, sizes::SIZE_STORER_CFG)?;
         if !self.sizes.load(&session, fingerprint)? {
             self.sizes
-                .recount(&session, &collection_tables(&session)?, IDX_ENTRIES_TABLE)?;
+                .recount(&session, &mdb_catalog::all_placements(&session)?)?;
         }
         Ok(())
     }
@@ -16293,51 +16546,46 @@ impl Storage {
         let Some(plan) = plan else {
             return Ok(false);
         };
-        // Entries a build that died part-way left under this name.
-        loop {
-            let removed = self.retry_write_conflicts("create_index", || {
+        // The index's own table, which nothing lists until the commit below:
+        // a build that dies part-way leaves one the next open drops.
+        let ident = {
+            let session = self.op_session()?;
+            make_index_table(self, &session, options.get_bool("unique").unwrap_or(false))?
+        };
+        let built = (|| -> Result<()> {
+            for chunk in index_build_chunks(&plan.entries) {
+                if deadline::check().is_err() {
+                    return Err(StorageError::MaxTimeExpired);
+                }
+                self.retry_write_conflicts("create_index", || {
+                    let session = self.op_session()?;
+                    self.with_statement_txn(&session, || {
+                        self.insert_built_entries(&session, &ident, db, coll, name, chunk)
+                    })
+                })?;
+            }
+            // The catalog row is the commit point of a fully-built index.
+            self.retry_write_conflicts("create_index", || {
                 let session = self.op_session()?;
                 self.with_statement_txn(&session, || {
-                    self.delete_entries_prefix_upto(
+                    record_index_ident(self, &session, db, coll, name, &ident, false)?;
+                    self.commit_index(
                         &session,
                         db,
                         coll,
                         name,
-                        Some(PURGE_CHUNK_MAX_ROWS),
+                        key_spec,
+                        options,
+                        &plan.payload,
+                        true,
                     )
                 })
-            })?;
-            if removed < PURGE_CHUNK_MAX_ROWS {
-                break;
-            }
-        }
-        for chunk in index_build_chunks(&plan.entries) {
-            if deadline::check().is_err() {
-                return Err(StorageError::MaxTimeExpired);
-            }
-            self.retry_write_conflicts("create_index", || {
-                let session = self.op_session()?;
-                self.with_statement_txn(&session, || {
-                    self.insert_built_entries(&session, db, coll, name, chunk)
-                })
-            })?;
-        }
-        // The catalog row is the commit point of a fully-built index.
-        self.retry_write_conflicts("create_index", || {
-            let session = self.op_session()?;
-            self.with_statement_txn(&session, || {
-                self.commit_index(
-                    &session,
-                    db,
-                    coll,
-                    name,
-                    key_spec,
-                    options,
-                    &plan.payload,
-                    true,
-                )
             })
-        })?;
+        })();
+        if let Err(e) = built {
+            self.drop_ident_table(&ident);
+            return Err(e);
+        }
         Ok(true)
     }
 
@@ -16358,33 +16606,51 @@ impl Storage {
         let Some(plan) = self.plan_index(session, db, coll, name, key_spec, options)? else {
             return Ok(false);
         };
-        self.insert_built_entries(session, db, coll, name, &plan.entries)?;
-        self.commit_index(
-            session,
-            db,
-            coll,
-            name,
-            key_spec,
-            options,
-            &plan.payload,
-            logged,
-        )?;
+        let ident = make_index_table(self, session, options.get_bool("unique").unwrap_or(false))?;
+        let mut listed = false;
+        let made = (|| -> Result<()> {
+            self.insert_built_entries(session, &ident, db, coll, name, &plan.entries)?;
+            record_index_ident(self, session, db, coll, name, &ident, true)?;
+            listed = true;
+            self.commit_index(
+                session,
+                db,
+                coll,
+                name,
+                key_spec,
+                options,
+                &plan.payload,
+                logged,
+            )
+        })();
+        if let Err(e) = made {
+            if !listed {
+                // This statement's transaction has written the table: it
+                // goes once that transaction is over. (A table listed has
+                // `record_index_ident`'s own rollback hook.)
+                let pending = self.drop_pending.clone();
+                session.on_transaction_end(Box::new(move |_| {
+                    pending.lock().push(ident);
+                }));
+            }
+            return Err(e);
+        }
         Ok(true)
     }
 
-    /// Write a building index's entry rows.
+    /// Write a building index's entry rows into its table `ident`.
     fn insert_built_entries(
         &self,
         session: &Session,
+        ident: &str,
         db: &str,
         coll: &str,
         name: &str,
-        entries: &[(Vec<u8>, i64)],
+        entries: &[EntryKey],
     ) -> Result<()> {
-        let ec = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
-        for (kb, rid) in entries {
-            let packed = pack_entry(kb, *rid);
-            self.put_index_entry(session, &ec, db, coll, name, &packed)?;
+        let ec = session.open_cursor(&mdb_catalog::table_uri(ident), Some("overwrite=false"))?;
+        for entry in entries {
+            self.put_index_entry(session, &ec, db, coll, name, entry)?;
         }
         Ok(())
     }
@@ -16552,11 +16818,11 @@ impl Storage {
         geo_sphere: Option<GeoSphere>,
         key_coll: Option<Collation>,
     ) -> Result<Option<IndexPlan>> {
-        let entries: Vec<(Vec<u8>, i64)> = if let Some(geo) = &geo {
+        let entries: Vec<EntryKey> = if let Some(geo) = &geo {
             // 2d geo index: one geohash cell per point-valued doc. Always flagged
             // multikey so the regular (numeric) pickers skip it.
             stored_options.insert("multikey", Bson::Boolean(true));
-            let mut out: Vec<(Vec<u8>, i64)> = Vec::new();
+            let mut out: Vec<EntryKey> = Vec::new();
             let rows = self.scan_docs(session, db, coll)?;
             for (scanned, (rid, _id_k, blob)) in rows.into_iter().enumerate() {
                 // The scan itself polls, but building the entries is per-document
@@ -16578,7 +16844,7 @@ impl Storage {
                     .map(|v| geo.cell_kbs(v))
                     .unwrap_or_default()
                 {
-                    out.push((kb, rid));
+                    out.push(geo_entry(&kb, rid)?);
                 }
             }
             out
@@ -16594,7 +16860,7 @@ impl Storage {
             stored_options
                 .entry("2dsphereIndexVersion".to_string())
                 .or_insert(Bson::Int32(3));
-            let mut out: Vec<(Vec<u8>, i64)> = Vec::new();
+            let mut out: Vec<EntryKey> = Vec::new();
             let rows = self.scan_docs(session, db, coll)?;
             for (scanned, (rid, _id_k, blob)) in rows.into_iter().enumerate() {
                 // The scan itself polls, but building the entries is per-document
@@ -16612,7 +16878,7 @@ impl Storage {
                 }
                 if let Some(v) = get_path(&d, &gs.field) {
                     for kb in gs.cell_kbs(v) {
-                        out.push((kb, rid));
+                        out.push(geo_entry(&kb, rid)?);
                     }
                 }
             }
@@ -16631,8 +16897,9 @@ impl Storage {
             let mut multikey = false;
             // Entries carry the doc's RecordId (step 2), which `scan_docs`
             // already hands us — no `id_key -> RecordId` lookup needed here.
-            let mut entries: Vec<(Vec<u8>, i64)> = Vec::new();
+            let mut entries: Vec<EntryKey> = Vec::new();
             let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            let shape = KeyShape::new(key_spec, key_coll.clone(), build_order);
             for (rid, _id_k, blob) in self.scan_docs(session, db, coll)? {
                 // The scan itself polls, but building the entries is per-document
                 // work of its own (decode + sort-key encode), so a large
@@ -16652,8 +16919,8 @@ impl Storage {
                 if !multikey && doc_makes_multikey(&d, key_spec) {
                     multikey = true;
                 }
-                for kb in with_bindata_order(build_order, || {
-                    index_key_variants_c(&d, key_spec, sparse, key_coll.as_ref())
+                for (kb, values) in with_bindata_order(build_order, || {
+                    index_key_values_c(&d, key_spec, sparse, key_coll.as_ref())
                 })? {
                     // Uniqueness is checked against the same key variants the
                     // entries are built from — mongod's unique-multikey rule is
@@ -16675,7 +16942,7 @@ impl Storage {
                             },
                         ))));
                     }
-                    entries.push((kb, rid));
+                    entries.push(shape.entry(&values, rid)?);
                 }
             }
             if multikey {
@@ -17189,7 +17456,9 @@ impl Storage {
                 let key_spec = payload.get_document("key").cloned().unwrap_or_default();
                 let spec = index_event_spec(&payload, name);
                 c.remove()?;
-                self.delete_entries_prefix(&session, db, coll, name)?;
+                // Its entries are in its own table, dropped once this
+                // commits and nothing reads it.
+                self.unplace_index(&session, db, coll, name)?;
                 // The index is gone, so its claims must go too — otherwise
                 // recreating it (or inserting the value again) is refused
                 // against an index that no longer exists.
@@ -17253,7 +17522,7 @@ impl Storage {
                     if c.search().is_ok() {
                         c.remove()?;
                     }
-                    self.delete_entries_prefix(&session, db, coll, name)?;
+                    self.unplace_index(&session, db, coll, name)?;
                     // The catalog mongod reads says what the registry says.
                     sync_catalog_entry(&session, db, coll)?;
                 }
@@ -18078,7 +18347,7 @@ impl Storage {
         doc: &Document,
         desc: &IndexDesc,
         recordid: i64,
-    ) -> Result<Vec<Vec<u8>>> {
+    ) -> Result<Vec<EntryKey>> {
         let mut out = Vec::new();
         if desc.id_claim {
             return Ok(out);
@@ -18089,7 +18358,7 @@ impl Storage {
                 .map(|v| geo.cell_kbs(v))
                 .unwrap_or_default()
             {
-                out.push(pack_entry(&kb, recordid));
+                out.push(geo_entry(&kb, recordid)?);
             }
             return Ok(out);
         }
@@ -18097,7 +18366,7 @@ impl Storage {
         if let Some(gs) = &desc.geo_sphere {
             if let Some(v) = get_path(doc, &gs.field) {
                 for kb in gs.cell_kbs(v) {
-                    out.push(pack_entry(&kb, recordid));
+                    out.push(geo_entry(&kb, recordid)?);
                 }
             }
             return Ok(out);
@@ -18105,8 +18374,9 @@ impl Storage {
         if !self.doc_in_partial(doc, desc)? {
             return Ok(out);
         }
-        for kb in desc.key_variants(doc, desc.sparse)? {
-            out.push(pack_entry(&kb, recordid));
+        let shape = desc.shape();
+        for (_kb, values) in desc.key_values(doc, desc.sparse)? {
+            out.push(shape.entry(&values, recordid)?);
         }
         Ok(out)
     }
@@ -18119,6 +18389,23 @@ impl Storage {
         doc: &Document,
         descs: &[IndexDesc],
         recordid: i64,
+    ) -> Result<()> {
+        self.write_index_rows(session, db, coll, doc, descs, recordid, true)
+    }
+
+    /// [`Self::write_index_entries`]; with `entries` false only the unique
+    /// claims are written (a rename moves the indexes' tables whole, their
+    /// entries with them, but the claims are keyed by the namespace).
+    #[allow(clippy::too_many_arguments)]
+    fn write_index_rows(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        doc: &Document,
+        descs: &[IndexDesc],
+        recordid: i64,
+        entries: bool,
     ) -> Result<()> {
         // An index being built over the collection records the write too.
         self.index_build_side_write(session, db, coll, None, Some(doc), recordid)?;
@@ -18159,7 +18446,7 @@ impl Storage {
             if !claimed || !self.doc_in_partial(doc, desc)? {
                 continue;
             }
-            for kb in desc.key_variants(doc, desc.sparse)? {
+            for (kb, values) in desc.key_values(doc, desc.sparse)? {
                 let esc = escape_kb(&kb);
                 note_unique_claim(db, coll, &desc.name, &esc)?;
                 claims.reset()?;
@@ -18168,7 +18455,7 @@ impl Storage {
                 match claims.insert() {
                     Ok(()) => {}
                     Err(e) if e.is_duplicate_key() => {
-                        if self.take_stale_claim(session, db, coll, desc, &kb, recordid)? {
+                        if self.take_stale_claim(session, db, coll, desc, &kb, &values, recordid)? {
                             continue;
                         }
                         return Err(StorageError::DuplicateKey(Box::new(
@@ -18189,18 +18476,25 @@ impl Storage {
                 }
             }
         }
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
+        if !entries {
+            return Ok(());
+        }
         for desc in descs {
-            for packed in self.packed_entry_keys(doc, desc, recordid)? {
-                self.put_index_entry(session, &cur, db, coll, &desc.name, &packed)?;
+            let keys = self.packed_entry_keys(doc, desc, recordid)?;
+            if keys.is_empty() {
+                continue;
+            }
+            let cur = open_index_cursor(session, db, coll, &desc.name, Some("overwrite=false"))?;
+            for entry in &keys {
+                self.put_index_entry(session, &cur, db, coll, &desc.name, entry)?;
             }
         }
         Ok(())
     }
 
     /// Write one index entry with `cur` (opened `overwrite=false` on the
-    /// entries table), counting its bytes into the index's size when it is
-    /// new. One a document already has (two geo cells sharing an ancestor,
+    /// index's own table), counting its bytes into the index's size when it
+    /// is new. One a document already has (two geo cells sharing an ancestor,
     /// an array repeating a value) is there once and counted once.
     fn put_index_entry(
         &self,
@@ -18209,15 +18503,19 @@ impl Storage {
         db: &str,
         coll: &str,
         name: &str,
-        packed: &[u8],
+        entry: &EntryKey,
     ) -> Result<()> {
         cur.reset()?;
-        cur.set_key_sssu(db, coll, name, packed);
-        cur.set_value_u(b"");
+        cur.set_key_u(&entry.key);
+        cur.set_value_u(&entry.type_bits);
         match cur.insert() {
             Ok(()) => {
-                self.sizes
-                    .adjust(session, db, coll, Delta::entries(name, packed.len() as i64));
+                self.sizes.adjust(
+                    session,
+                    db,
+                    coll,
+                    Delta::entries(name, entry.key.len() as i64),
+                );
                 Ok(())
             }
             Err(e) if e.is_duplicate_key() => Ok(()),
@@ -18235,18 +18533,14 @@ impl Storage {
         db: &str,
         coll: &str,
         name: &str,
-        packed: &[u8],
+        key: &[u8],
     ) -> Result<()> {
         cur.reset()?;
-        cur.set_key_sssu(db, coll, name, packed);
+        cur.set_key_u(key);
         match cur.remove() {
             Ok(()) => {
-                self.sizes.adjust(
-                    session,
-                    db,
-                    coll,
-                    Delta::entries(name, -(packed.len() as i64)),
-                );
+                self.sizes
+                    .adjust(session, db, coll, Delta::entries(name, -(key.len() as i64)));
                 Ok(())
             }
             Err(e) if e.is_not_found() => Ok(()),
@@ -18280,7 +18574,6 @@ impl Storage {
         if descs.is_empty() {
             return Ok(());
         }
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
         // Release the unique claims this RecordId owns. Only its own: a claim
         // the row never held belongs to somebody else, and dropping it would
         // let a genuine duplicate through. The value is the owning RecordId
@@ -18307,8 +18600,13 @@ impl Storage {
                     }
                 }
             }
-            for packed in self.packed_entry_keys(doc, desc, recordid)? {
-                self.drop_index_entry(session, &cur, db, coll, &desc.name, &packed)?;
+            let entries = self.packed_entry_keys(doc, desc, recordid)?;
+            if entries.is_empty() {
+                continue;
+            }
+            let cur = open_index_cursor(session, db, coll, &desc.name, Some("overwrite=false"))?;
+            for entry in &entries {
+                self.drop_index_entry(session, &cur, db, coll, &desc.name, &entry.key)?;
             }
         }
         Ok(())
@@ -18324,6 +18622,7 @@ impl Storage {
     /// without this a value an UPDATE left was refused to every later row.
     /// A claim this transaction cannot see as committed never reaches here:
     /// WiredTiger answers its `overwrite=false` insert with a write conflict.
+    #[allow(clippy::too_many_arguments)]
     fn take_stale_claim(
         &self,
         session: &Session,
@@ -18331,6 +18630,7 @@ impl Storage {
         coll: &str,
         desc: &IndexDesc,
         kb: &[u8],
+        values: &[Bson],
         recordid: i64,
     ) -> Result<bool> {
         let esc = escape_kb(kb);
@@ -18347,8 +18647,8 @@ impl Storage {
             Some(id) if !self.claim_owner_exists(session, db, coll, id)? => true,
             Some(_) if desc.id_claim => false,
             Some(id) => {
-                let entry = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
-                entry.set_key_sssu(db, coll, &desc.name, &pack_entry(kb, id));
+                let entry = open_index_cursor(session, db, coll, &desc.name, None)?;
+                entry.set_key_u(&desc.shape().entry(values, id)?.key);
                 match entry.search() {
                     Ok(()) => false,
                     Err(e) if e.is_not_found() => true,
@@ -18390,22 +18690,29 @@ impl Storage {
             if !(desc.id_claim || (desc.name != "_id_" && (desc.unique || desc.prepare_unique))) {
                 continue;
             }
-            let keys = |doc: &Document| -> Result<Vec<Vec<u8>>> {
+            let keys = |doc: &Document| -> Result<Vec<(Vec<u8>, Vec<Bson>)>> {
                 if !self.doc_in_partial(doc, desc)? {
                     return Ok(Vec::new());
                 }
-                desc.key_variants(doc, desc.sparse)
+                desc.key_values(doc, desc.sparse)
             };
             let old_keys = keys(old_doc)?;
             let new_keys = keys(new_doc)?;
-            if old_keys == new_keys {
+            if old_keys
+                .iter()
+                .map(|k| &k.0)
+                .eq(new_keys.iter().map(|k| &k.0))
+            {
                 continue;
             }
             let claims = match &claims {
                 Some(c) => c,
                 None => claims.insert(session.open_cursor(UNIQ_TABLE, Some("overwrite=false"))?),
             };
-            for kb in new_keys.iter().filter(|k| !old_keys.contains(k)) {
+            for (kb, values) in new_keys
+                .iter()
+                .filter(|(k, _)| !old_keys.iter().any(|(o, _)| o == k))
+            {
                 let esc = escape_kb(kb);
                 note_unique_claim(db, coll, &desc.name, &esc)?;
                 claims.reset()?;
@@ -18414,7 +18721,7 @@ impl Storage {
                 match claims.insert() {
                     Ok(()) => {}
                     Err(e) if e.is_duplicate_key() => {
-                        if !self.take_stale_claim(session, db, coll, desc, kb, recordid)? {
+                        if !self.take_stale_claim(session, db, coll, desc, kb, values, recordid)? {
                             return Err(StorageError::DuplicateKey(Box::new(
                                 with_bindata_order(desc.key_order, || {
                                     UniqueConflict::new(
@@ -18433,7 +18740,10 @@ impl Storage {
                     Err(e) => return Err(e.into()),
                 }
             }
-            for kb in old_keys.iter().filter(|k| !new_keys.contains(k)) {
+            for (kb, _) in old_keys
+                .iter()
+                .filter(|(k, _)| !new_keys.iter().any(|(n, _)| n == k))
+            {
                 let esc = escape_kb(kb);
                 claims.reset()?;
                 claims.set_key_sssu(db, &key_coll(db, coll), &desc.name, &esc);
@@ -18480,11 +18790,11 @@ impl Storage {
         // `_id` is immutable, so an update keeps the SAME RecordId — one value
         // serves both sides of the diff.
         for desc in descs {
-            let old_keys: HashSet<Vec<u8>> = self
+            let old_keys: HashSet<EntryKey> = self
                 .packed_entry_keys(old_doc, desc, recordid)?
                 .into_iter()
                 .collect();
-            let new_keys: HashSet<Vec<u8>> = self
+            let new_keys: HashSet<EntryKey> = self
                 .packed_entry_keys(new_doc, desc, recordid)?
                 .into_iter()
                 .collect();
@@ -18510,7 +18820,11 @@ impl Storage {
             return Ok(HashSet::new());
         }
         if desc.geo_2d.is_some() || desc.geo_sphere.is_some() {
-            return Ok(self.packed_entry_keys(doc, desc, 0)?.into_iter().collect());
+            return Ok(self
+                .packed_entry_keys(doc, desc, 0)?
+                .into_iter()
+                .map(|e| e.key)
+                .collect());
         }
         if !self.doc_in_partial(doc, desc)? {
             return Ok(HashSet::new());
@@ -18605,14 +18919,16 @@ impl Storage {
         session: &Session,
         db: &str,
         coll: &str,
-        items: &[(String, Vec<u8>)],
+        items: &[(String, EntryKey)],
     ) -> Result<()> {
-        if items.is_empty() {
-            return Ok(());
-        }
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
-        for (name, packed) in items {
-            self.put_index_entry(session, &cur, db, coll, name, packed)?;
+        let mut open: Option<(&str, Cursor)> = None;
+        for (name, entry) in items {
+            if open.as_ref().is_none_or(|(n, _)| *n != name.as_str()) {
+                let cur = open_index_cursor(session, db, coll, name, Some("overwrite=false"))?;
+                open = Some((name.as_str(), cur));
+            }
+            let (_, cur) = open.as_ref().expect("just opened");
+            self.put_index_entry(session, cur, db, coll, name, entry)?;
         }
         Ok(())
     }
@@ -18622,14 +18938,16 @@ impl Storage {
         session: &Session,
         db: &str,
         coll: &str,
-        items: &[(String, Vec<u8>)],
+        items: &[(String, EntryKey)],
     ) -> Result<()> {
-        if items.is_empty() {
-            return Ok(());
-        }
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
-        for (name, packed) in items {
-            self.drop_index_entry(session, &cur, db, coll, name, packed)?;
+        let mut open: Option<(&str, Cursor)> = None;
+        for (name, entry) in items {
+            if open.as_ref().is_none_or(|(n, _)| *n != name.as_str()) {
+                let cur = open_index_cursor(session, db, coll, name, Some("overwrite=false"))?;
+                open = Some((name.as_str(), cur));
+            }
+            let (_, cur) = open.as_ref().expect("just opened");
+            self.drop_index_entry(session, cur, db, coll, name, &entry.key)?;
         }
         Ok(())
     }
@@ -19255,7 +19573,7 @@ impl Storage {
                 c.set_key_sss(db, coll, name);
                 c.search()?;
                 c.remove()?;
-                self.delete_entries_prefix(&session, db, coll, name)?;
+                self.unplace_index(&session, db, coll, name)?;
                 self.purge_unique_claims(&session, db, coll, Some(name))?;
                 self.create_index_in_txn(&session, db, coll, name, key, &options, false)?;
                 Ok(())
@@ -19767,7 +20085,6 @@ impl Storage {
         if descs.is_empty() {
             return Ok(None);
         }
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
         for desc in descs {
             // The collated `_id` has no entries to probe: its claim is the
             // record of who holds the key.
@@ -19806,35 +20123,20 @@ impl Storage {
             if (!desc.unique && !desc.prepare_unique) || !self.doc_in_partial(candidate, desc)? {
                 continue;
             }
-            for kb in desc.key_variants(candidate, desc.sparse)? {
-                let esc_kb = escape_kb(&kb);
-                let mut seed = esc_kb.clone();
-                seed.extend_from_slice(ENTRY_SEP);
+            let shape = desc.shape();
+            let cur = open_index_cursor(session, db, coll, &desc.name, None)?;
+            for (kb, values) in desc.key_values(candidate, desc.sparse)? {
+                let exact = shape.exact(&values)?;
                 cur.reset()?;
-                cur.set_key_sssu(db, coll, &desc.name, &seed);
-                let mut more = match cur.search_near() {
-                    Ok(cmp) => {
-                        if cmp < 0 {
-                            cur.next()?
-                        } else {
-                            true
-                        }
-                    }
-                    Err(e) if e.is_not_found() => continue,
-                    Err(e) => return Err(e.into()),
-                };
+                let mut more = seek_ge(&cur, &exact)?;
                 while more {
-                    let (d, c, n, packed) = cur.get_key_sssu()?;
-                    if d != db || c != coll || n != desc.name {
+                    let row = cur.get_key_u()?;
+                    if !row.starts_with(&exact) {
                         break;
                     }
-                    let (row_esc, row_id) = unpack_entry(&packed);
-                    if row_esc != esc_kb.as_slice() {
-                        break;
-                    }
-                    // `row_id` is None only for a step-1-format entry, which a
-                    // step-2 store cannot contain (refused at open) — treat it as
-                    // "not me" rather than silently matching.
+                    let row_id = ixkeys::entry_rid(&row);
+                    // `row_id` is None only for a key that is not an entry's;
+                    // treat it as "not me" rather than silently matching.
                     let is_self = row_id.is_some() && exclude_recordid == row_id;
                     if !is_self {
                         return Ok(Some(with_bindata_order(desc.key_order, || {
@@ -19853,56 +20155,6 @@ impl Storage {
             }
         }
         Ok(None)
-    }
-
-    /// Delete all entries for one index (its `(db, coll, name)` prefix).
-    fn delete_entries_prefix(
-        &self,
-        session: &Session,
-        db: &str,
-        coll: &str,
-        name: &str,
-    ) -> Result<()> {
-        self.delete_entries_prefix_upto(session, db, coll, name, None)
-            .map(|_| ())
-    }
-
-    /// Remove `name`'s entry rows, at most `max` of them; answers how many.
-    fn delete_entries_prefix_upto(
-        &self,
-        session: &Session,
-        db: &str,
-        coll: &str,
-        name: &str,
-        max: Option<usize>,
-    ) -> Result<usize> {
-        let scan = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
-        scan.set_key_sssu(db, coll, name, b"");
-        let mut packs: Vec<Vec<u8>> = Vec::new();
-        let mut more = match scan.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    scan.next()?
-                } else {
-                    true
-                }
-            }
-            Err(e) if e.is_not_found() => false,
-            Err(e) => return Err(e.into()),
-        };
-        while more && max.is_none_or(|m| packs.len() < m) {
-            let (d, c, n, packed) = scan.get_key_sssu()?;
-            if d != db || c != coll || n != name {
-                break;
-            }
-            packs.push(packed);
-            more = scan.next()?;
-        }
-        let del = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
-        for p in &packs {
-            self.drop_index_entry(session, &del, db, coll, name, p)?;
-        }
-        Ok(packs.len())
     }
 
     /// Collection names registered under `db` (no lock, session-scoped — for
@@ -19932,44 +20184,6 @@ impl Storage {
             more = cur.next()?;
         }
         Ok(out)
-    }
-
-    /// Delete up to `limit` index-entry rows across ALL of the collection's
-    /// indexes; returns how many were deleted.
-    fn purge_idx_entries_batch(
-        &self,
-        session: &Session,
-        db: &str,
-        coll: &str,
-        limit: usize,
-    ) -> Result<usize> {
-        let scan = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
-        scan.set_key_sssu(db, coll, "", b"");
-        let mut more = match scan.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    scan.next()?
-                } else {
-                    true
-                }
-            }
-            Err(e) if e.is_not_found() => false,
-            Err(e) => return Err(e.into()),
-        };
-        let mut keys: Vec<(String, Vec<u8>)> = Vec::new();
-        while more && keys.len() < limit {
-            let (d, c, n, packed) = scan.get_key_sssu()?;
-            if d != db || c != coll {
-                break;
-            }
-            keys.push((n, packed));
-            more = scan.next()?;
-        }
-        let del = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
-        for (n, p) in &keys {
-            self.drop_index_entry(session, &del, db, coll, n, p)?;
-        }
-        Ok(keys.len())
     }
 
     /// Delete up to `limit` natural-order rows (forward then reverse tables)
@@ -20126,8 +20340,9 @@ impl Storage {
             Err(e) if e.is_missing_table() => {}
             Err(e) => return Err(e.into()),
         }
+        // The indexes' entries are in tables of their own, which a drop
+        // unlists and drops whole (`unplace_collection`) and a rename moves.
         for (name, _key_spec, _opts) in self.iter_indexes(session, db, coll)? {
-            self.delete_entries_prefix(session, db, coll, &name)?;
             let ic = session.open_cursor(IDX_TABLE, None)?;
             ic.set_key_sss(db, coll, &name);
             match ic.remove() {
@@ -20176,8 +20391,8 @@ impl Storage {
         Ok(out)
     }
 
-    /// Raw `(name, packed)` index-entry rows for `(db, coll)`, for the verbatim
-    /// re-key in `rename_collection`.
+    /// Every index-entry key of `(db, coll)`, with its index's name: the
+    /// keys (KeyString and RecordId) of each index table the placement lists.
     fn collect_entry_rows(
         &self,
         session: &Session,
@@ -20185,15 +20400,16 @@ impl Storage {
         coll: &str,
     ) -> Result<Vec<(String, Vec<u8>)>> {
         let mut out = Vec::new();
-        self.visit_entry_rows(session, db, coll, |name, packed| {
-            out.push((name.to_string(), packed.to_vec()));
+        self.visit_entry_rows(session, db, coll, |name, key| {
+            out.push((name.to_string(), key.to_vec()));
             Ok(())
         })?;
         Ok(out)
     }
 
-    /// Walk every index entry row of `(db, coll)`, handing `f` each
-    /// `(index name, packed key)` without keeping any.
+    /// Walk every index entry of `(db, coll)`, handing `f` each
+    /// `(index name, entry key)` without keeping any: one index table after
+    /// the other, each in its own order.
     fn visit_entry_rows(
         &self,
         session: &Session,
@@ -20201,26 +20417,18 @@ impl Storage {
         coll: &str,
         mut f: impl FnMut(&str, &[u8]) -> Result<()>,
     ) -> Result<()> {
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
-        cur.set_key_sssu(db, coll, "", b"");
-        let mut more = match cur.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    cur.next()?
-                } else {
-                    true
-                }
-            }
-            Err(e) if e.is_not_found() => false,
-            Err(e) => return Err(e.into()),
+        let Some(placement) = effective_placement(session, db, coll)? else {
+            return Ok(());
         };
-        while more {
-            let (d, c, name, packed) = cur.get_key_sssu()?;
-            if d != db || c != coll {
-                break;
+        for (name, ident) in &placement.indexes {
+            let cur = match session.open_cursor(&mdb_catalog::table_uri(ident), None) {
+                Ok(c) => c,
+                Err(e) if e.is_missing_table() => continue,
+                Err(e) => return Err(e.into()),
+            };
+            while cur.next()? {
+                cur.with_key_u(|key| f(name, key))??;
             }
-            f(&name, &packed)?;
-            more = cur.next()?;
         }
         Ok(())
     }
@@ -20381,7 +20589,7 @@ impl Storage {
                 expected
                     .entry(desc.name.clone())
                     .or_default()
-                    .extend(packed);
+                    .extend(packed.into_iter().map(|e| e.key));
             }
         }
         let mut actual: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
@@ -20440,36 +20648,25 @@ impl Storage {
         Ok(bson::doc! { "records": records, "undecodable": undecodable, "indexes": indexes })
     }
 
-    /// Introspection: the entries of index `name` as `(escaped_kb, id_key)`
-    /// pairs in WiredTiger (sorted) order. Primarily for tests and explain-style
-    /// inspection; the lookup paths in later slices read entries directly.
+    /// Introspection: the entries of index `name` as `(key, RecordId)` in the
+    /// index table's order, where `key` is the KeyString of the entry's values
+    /// with its end byte (the RecordId, which is also at the end of the stored
+    /// key, taken off). Primarily for tests and explain-style inspection.
     pub fn index_entries(&self, db: &str, coll: &str, name: &str) -> Result<Vec<(Vec<u8>, i64)>> {
         // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
-        let scan = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
-        scan.set_key_sssu(db, coll, name, b"");
-        let mut out = Vec::new();
-        let mut more = match scan.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    scan.next()?
-                } else {
-                    true
-                }
-            }
-            Err(e) if e.is_not_found() => false,
-            Err(e) => return Err(e.into()),
+        let scan = match open_index_cursor(&session, db, coll, name, None) {
+            Ok(c) => c,
+            // No such index (or collection): no entries.
+            Err(StorageError::Wt(e)) if e.code == SNAPSHOT_UNAVAILABLE => return Ok(Vec::new()),
+            Err(e) => return Err(e),
         };
-        while more {
-            let (d, c, n, packed) = scan.get_key_sssu()?;
-            if d != db || c != coll || n != name {
-                break;
+        let mut out = Vec::new();
+        while scan.next()? {
+            let key = scan.get_key_u()?;
+            if let Ok((prefix, rid)) = keystring::without_record_id_long_at_end(&key) {
+                out.push((prefix.to_vec(), rid));
             }
-            let (kb, idk) = unpack_entry(&packed);
-            if let Some(rid) = idk {
-                out.push((kb.to_vec(), rid));
-            }
-            more = scan.next()?;
         }
         Ok(out)
     }
@@ -20842,88 +21039,140 @@ impl Storage {
         Ok(out)
     }
 
-    /// Up to `max` entries of index `name` from key `from` on, in the
-    /// index's order, as `(key, RecordId)` with the key unescaped (the
-    /// fields' encodings joined by `COMPOUND_SEP`). With `after`, the scan
-    /// resumes strictly after the entry `(from, after)`: where a streaming
-    /// cursor's last batch left it, on this call's snapshot.
+    /// Up to `max` entries of index `name` from position `from` on, in the
+    /// index's order, each as its key's per-field sort-key encodings joined by
+    /// `COMPOUND_SEP` (`raw`), its RecordId, and `resume`, the position just
+    /// after it: where a streaming cursor's last batch left it, on this
+    /// call's snapshot. The entries are decoded from the index table's
+    /// KeyStrings (`keystring::to_bson`); an index with a collation holds
+    /// the collation's sort keys in place of its strings, so those are what
+    /// `raw` is made of.
     ///
-    /// `backward`: in descending order, from the last entry whose key is no
-    /// greater than `from` (strictly before `(from, after)` with `after`).
+    /// `backward`: in descending order, from the last entry at or before
+    /// `from` (before `Resume`).
     ///
     /// The `_id` index (`_id_`) is the `_id` keys every document row holds,
-    /// read in their own order: each entry is a document's `id_key` (not a
-    /// compound key), and with `after` the scan resumes past that key, which
-    /// no other document shares.
+    /// read in their own order: `from` is then [`IndexPos::Raw`] (or
+    /// [`IndexPos::Resume`] of an entry's own `raw`, with `after`), each
+    /// entry is a document's `id_key` (not a compound key), and a resumed
+    /// scan goes past that key, which no other document shares.
     #[allow(clippy::too_many_arguments)]
     pub fn index_entries_from(
         &self,
         db: &str,
         coll: &str,
         name: &str,
-        from: &[u8],
+        from: IndexPos<'_>,
         after: Option<i64>,
         max: usize,
         backward: bool,
-    ) -> Result<Vec<(Vec<u8>, i64)>> {
+    ) -> Result<Vec<IndexRow>> {
         let session = self.op_session()?;
         if name == ID_INDEX_NAME {
-            return id_entries_from(&session, db, coll, from, after.is_some(), max, backward);
+            let (key, past): (&[u8], bool) = match from {
+                IndexPos::Edge if backward => (&[0xFF], false),
+                IndexPos::Edge => (&[], false),
+                IndexPos::Raw(k) => (k, after.is_some()),
+                IndexPos::Resume(k) => (k, true),
+                IndexPos::Values(_) => {
+                    return Err(StorageError::Internal(
+                        "the _id index is read from its raw keys".into(),
+                    ))
+                }
+            };
+            return Ok(
+                id_entries_from(&session, db, coll, key, past, max, backward)?
+                    .into_iter()
+                    .map(|(raw, rid)| IndexRow {
+                        resume: raw.clone(),
+                        raw,
+                        rid,
+                    })
+                    .collect(),
+            );
         }
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
-        let mut seed = escape_kb(from);
-        match (after, backward) {
-            // Past every entry of this key.
-            (None, true) | (Some(i64::MAX), false) => {
-                seed.extend_from_slice(ENTRY_SEP);
-                seed.extend_from_slice(&[0xff; 9]);
-            }
-            (Some(rid), false) => {
-                seed.extend_from_slice(ENTRY_SEP);
-                seed.extend_from_slice(&(rid + 1).to_be_bytes());
-            }
-            // The entry itself: the walk starts before it.
-            (Some(rid), true) => {
-                seed.extend_from_slice(ENTRY_SEP);
-                seed.extend_from_slice(&rid.to_be_bytes());
-            }
-            (None, false) => {}
-        }
-        cur.set_key_sssu(db, coll, name, &seed);
-        // The key columns hold a name's own bytes (RM-222).
-        let key_name =
-            |s: &str| secantus_wt::name_bytes(s).unwrap_or_else(|| s.as_bytes().to_vec());
-        let (db_key, coll_key, name_key) = (key_name(db), key_name(coll), key_name(name));
-        let mut out = Vec::with_capacity(max.min(1024));
-        let mut more = match cur.search_near() {
-            Ok(cmp) if backward => (cmp < 0 || (cmp == 0 && after.is_none())) || cur.prev()?,
-            Ok(cmp) => cmp >= 0 || cur.next()?,
-            Err(e) if e.is_not_found() => false,
-            Err(e) => return Err(e.into()),
+        let cur = match open_index_cursor(&session, db, coll, name, None) {
+            Ok(c) => c,
+            // No such index or collection: nothing to read.
+            Err(StorageError::Wt(e)) if e.code == SNAPSHOT_UNAVAILABLE => return Ok(Vec::new()),
+            Err(e) => return Err(e),
         };
+        let shape = self.index_shape(&session, db, coll, name)?;
+        // Where the walk starts, as a key the table is searched near.
+        let mut more = match (from, backward) {
+            (IndexPos::Edge, false) => seek_ge(&cur, &[])?,
+            (IndexPos::Edge, true) => {
+                cur.reset()?;
+                cur.prev()?
+            }
+            (IndexPos::Raw(_), _) => {
+                return Err(StorageError::Internal(
+                    "a secondary index is read from values or a resume key".into(),
+                ))
+            }
+            (IndexPos::Values(values), false) => seek_ge(&cur, &shape.seek(values, false)?)?,
+            (IndexPos::Values(values), true) => {
+                // Every key of exactly these values is at or before the
+                // position; a key that only starts with them is after it.
+                let whole = values.len() >= shape.dirs().len();
+                Self::seek_le(&cur, &shape.seek(values, whole)?)?
+            }
+            (IndexPos::Resume(key), false) => {
+                let mut more = seek_ge(&cur, key)?;
+                if more && cur.with_key_u(|k| k == key)? {
+                    more = cur.next()?;
+                }
+                more
+            }
+            (IndexPos::Resume(key), true) => {
+                let mut more = Self::seek_le(&cur, key)?;
+                if more && cur.with_key_u(|k| k == key)? {
+                    more = cur.prev()?;
+                }
+                more
+            }
+        };
+        let mut out = Vec::with_capacity(max.min(1024));
         while more && out.len() < max {
             // The streamed reads poll the `maxTimeMS` budget and `killOp`
             // where the whole-collection scan does.
             if deadline::check().is_err() {
                 return Err(StorageError::MaxTimeExpired);
             }
-            // Read in place: copying the three names out of every entry
-            // was most of a short index scan's cost (RM-365).
-            let entry = cur.with_key_sssu(|d, c, n, packed| {
-                if d != db_key.as_slice() || c != coll_key.as_slice() || n != name_key.as_slice() {
-                    return None;
+            let key = cur.get_key_u()?;
+            let type_bits = cur.get_value_u()?;
+            let (values, rid) = shape.decode(&key, &type_bits)?;
+            let mut raw = Vec::new();
+            for (i, v) in values.iter().enumerate() {
+                if i > 0 {
+                    raw.extend_from_slice(COMPOUND_SEP);
                 }
-                let (esc, rid) = unpack_entry(packed);
-                Some(rid.map(|rid| (unescape_kb(esc), rid)))
-            })?;
-            match entry {
-                None => break,
-                Some(Some(e)) => out.push(e),
-                Some(None) => {}
+                raw.extend(enc_dir_c(
+                    v,
+                    shape.dirs().get(i).copied().unwrap_or(1),
+                    None,
+                )?);
             }
+            out.push(IndexRow {
+                raw,
+                rid,
+                resume: key,
+            });
             more = if backward { cur.prev()? } else { cur.next()? };
         }
         Ok(out)
+    }
+
+    /// Position `cur` (on an index table) at the last entry whose key is at
+    /// or before `seed`; whether there is one.
+    fn seek_le(cur: &Cursor, seed: &[u8]) -> Result<bool> {
+        cur.set_key_u(seed);
+        match cur.search_near() {
+            Ok(cmp) if cmp > 0 => Ok(cur.prev()?),
+            Ok(_) => Ok(true),
+            Err(e) if e.is_not_found() => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// [`Self::scan_batch_after`] with a block's rows laid over the snapshot.
@@ -21447,7 +21696,10 @@ impl Storage {
         if !wide_read_allowed(bounds.broad) {
             return Ok(None);
         }
-        let spans = scan_bounds::to_spans(&bounds, dir, escape_kb);
+        let shape = self.index_shape(session, db, coll, name)?;
+        let Some(spans) = scan_bounds::to_key_spans(&bounds, dir, &shape, 0) else {
+            return Ok(None);
+        };
         // What `bounded_id_keys` notes of the read, before it is read; a
         // key out of value order is noted as a page meets it.
         note_routed(name);
@@ -21478,10 +21730,7 @@ impl Storage {
         max: usize,
     ) -> Result<Vec<i64>> {
         let session = self.op_session()?;
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
-        let key_name =
-            |s: &str| secantus_wt::name_bytes(s).unwrap_or_else(|| s.as_bytes().to_vec());
-        let (db_key, coll_key, name_key) = (key_name(db), key_name(coll), key_name(&pages.name));
+        let cur = open_index_cursor(&session, db, coll, &pages.name, None)?;
         let mut out = Vec::new();
         let mut entries = 0usize;
         while pages.at < pages.spans.len() && entries < max {
@@ -21496,20 +21745,12 @@ impl Storage {
                 None => span.lo.clone().unwrap_or_default(),
             };
             cur.reset()?;
-            cur.set_key_sssu(db, coll, &pages.name, &seed);
-            let mut more = match cur.search_near() {
-                Ok(cmp) => {
-                    // Strictly after the last entry read, which is still there
-                    // or has gone; at or after a span's start.
-                    if cmp < 0 || (cmp == 0 && pages.last.is_some()) {
-                        cur.next()?
-                    } else {
-                        true
-                    }
-                }
-                Err(e) if e.is_not_found() => false,
-                Err(e) => return Err(e.into()),
-            };
+            let mut more = seek_ge(&cur, &seed)?;
+            // Strictly after the last entry read, which is still there or
+            // has gone.
+            if more && pages.last.is_some() && cur.with_key_u(|k| k == seed.as_slice())? {
+                more = cur.next()?;
+            }
             let mut span_done = true;
             while more {
                 if deadline::check().is_err() {
@@ -21519,31 +21760,22 @@ impl Storage {
                     span_done = false;
                     break;
                 }
-                let step = cur.with_key_sssu(|d, c, n, packed| {
-                    if d != db_key.as_slice()
-                        || c != coll_key.as_slice()
-                        || n != name_key.as_slice()
-                    {
-                        return None;
-                    }
-                    let (row_esc, row_id) = unpack_entry(packed);
-                    if row_esc >= hi.as_slice() {
+                let step = cur.with_key_u(|key| {
+                    if key >= hi.as_slice() {
                         return None;
                     }
                     let out_of_order = pages.dir == -1
-                        && row_esc
-                            .first()
-                            .is_some_and(|b| scan_bounds::open_ended_rank(0xFF - b));
-                    Some((packed.to_vec(), row_id, out_of_order))
+                        && key.first().is_some_and(|b| scan_bounds::open_ended_ks(!b));
+                    Some((key.to_vec(), ixkeys::entry_rid(key), out_of_order))
                 })?;
-                let Some((packed, row_id, out_of_order)) = step else {
+                let Some((key, row_id, out_of_order)) = step else {
                     break;
                 };
                 if out_of_order {
                     note_unordered();
                 }
                 entries += 1;
-                pages.last = Some(packed);
+                pages.last = Some(key);
                 if let Some(rid) = row_id {
                     if pages.seen.insert(rid) {
                         out.push(rid);
@@ -24561,30 +24793,18 @@ impl Storage {
         reverse: bool,
         idx_dir: i32,
     ) -> Result<Vec<Vec<u8>>> {
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
-        cur.set_key_sssu(db, coll, name, b"");
-        let mut recordids: Vec<i64> = Vec::new();
-        let mut more = match cur.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    cur.next()?
-                } else {
-                    true
-                }
-            }
-            Err(e) if e.is_not_found() => return Ok(Vec::new()),
-            Err(e) => return Err(e.into()),
+        let cur = match open_index_cursor(session, db, coll, name, None) {
+            Ok(c) => c,
+            Err(StorageError::Wt(e)) if e.code == SNAPSHOT_UNAVAILABLE => return Ok(Vec::new()),
+            Err(e) => return Err(e),
         };
-        while more {
+        let mut recordids: Vec<i64> = Vec::new();
+        while cur.next()? {
             // Data-sized loop: honour a `maxTimeMS` budget (see `scan_docs`).
             if deadline::check().is_err() {
                 return Err(StorageError::MaxTimeExpired);
             }
-            let (d, c, n, packed) = cur.get_key_sssu()?;
-            if d != db || c != coll || n != name {
-                break;
-            }
-            let (esc, row_id) = unpack_entry(&packed);
+            let key = cur.get_key_u()?;
             // Skip WHOLE-ARRAY entries. A multikey index writes one entry per
             // element plus one for the whole array, and the whole-array key sorts
             // in the Array slot — after every scalar. Walking backward hits those
@@ -24594,12 +24814,11 @@ impl Storage {
             // element entries come first there. This walk is used only for
             // ordering; whole-array equality lookups take a different path and
             // still need those entries. Mirrors `storage.py::_is_whole_array_key`.
-            if let Some(rid) = row_id {
-                if !is_whole_array_key(esc, idx_dir) {
+            if let Some(rid) = ixkeys::entry_rid(&key) {
+                if !is_whole_array_key(&key, idx_dir) {
                     recordids.push(rid);
                 }
             }
-            more = cur.next()?;
         }
         // A descending column keys a string (JavaScript, regex) by its
         // inverted bytes, which do not reverse a prefix: inverted, "s" still
@@ -24954,6 +25173,22 @@ impl Storage {
         coll: &str,
         filter: &Document,
     ) -> Result<Option<Vec<i64>>> {
+        match self.route_index_id_keys(session, db, coll, filter) {
+            // The index the plan chose was dropped before it was read (the
+            // catalog and the index are read apart, with no lock): the
+            // collection is read instead.
+            Err(StorageError::Wt(e)) if e.code == SNAPSHOT_UNAVAILABLE => Ok(None),
+            routed => routed,
+        }
+    }
+
+    fn route_index_id_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<Vec<i64>>> {
         if filter.is_empty() {
             return Ok(None);
         }
@@ -25086,17 +25321,7 @@ impl Storage {
             secantus_core::geo::covering_2d(min_x, min_y, max_x, max_y, g.bits, g.lo, g.hi);
         let lo_kb = secantus_core::geo::encode_cell(clo);
         let hi_kb = secantus_core::geo::encode_cell(chi);
-        let ids = self.range_scan_index(
-            session,
-            db,
-            coll,
-            &name,
-            Some(&lo_kb[..]),
-            true,
-            Some(&hi_kb[..]),
-            true,
-            None,
-        )?;
+        let ids = self.range_scan_cells(session, db, coll, &name, &lo_kb[..], &hi_kb[..])?;
         Ok(Some(ids))
     }
 
@@ -25160,7 +25385,15 @@ impl Storage {
         let mut seen: HashSet<i64> = HashSet::new();
         for cid in s2_cells_for_bbox(min_x, min_y, max_x, max_y) {
             let kb = secantus_core::geo::encode_cell(cid);
-            for id_k in self.scan_index_for_id_keys(session, db, coll, &name, &kb, false)? {
+            for id_k in self.scan_index_for_id_keys(
+                session,
+                db,
+                coll,
+                &name,
+                &KeyShape::plain(),
+                &[geo_cell_value(&kb)],
+                false,
+            )? {
                 if seen.insert(id_k) {
                     out.push(id_k);
                 }
@@ -25398,9 +25631,19 @@ impl Storage {
         self.bounded_id_keys(session, db, coll, idx, value)
     }
 
+    /// The KeyString shape of index `name` of `(db, coll)`.
+    fn index_shape(&self, session: &Session, db: &str, coll: &str, name: &str) -> Result<KeyShape> {
+        let descs = self.index_descs_cached(session, db, coll)?;
+        descs
+            .iter()
+            .find(|d| d.name == name && !d.id_claim)
+            .map(IndexDesc::shape)
+            .ok_or_else(index_gone)
+    }
+
     /// `id_key`s whose index entry equals `value` on the leading field: an exact
-    /// `kb` scan for a single-field index, or a `kb + COMPOUND_SEP` prefix scan
-    /// for a compound index. Mirrors `storage._eq_id_keys_via_leading`.
+    /// key scan for a single-field index, or a prefix scan on the leading
+    /// value for a compound index. Mirrors `storage._eq_id_keys_via_leading`.
     #[allow(clippy::too_many_arguments)]
     fn eq_id_keys(
         &self,
@@ -25408,73 +25651,56 @@ impl Storage {
         db: &str,
         coll: &str,
         name: &str,
-        direction: i32,
+        _direction: i32,
         is_compound: bool,
         value: &Bson,
     ) -> Result<Vec<i64>> {
-        let kb = enc_dir(value, direction)?;
-        if is_compound {
-            let mut seed = kb;
-            seed.extend_from_slice(COMPOUND_SEP);
-            self.scan_index_for_id_keys(session, db, coll, name, &seed, true)
-        } else {
-            self.scan_index_for_id_keys(session, db, coll, name, &kb, false)
-        }
+        let shape = self.index_shape(session, db, coll, name)?;
+        self.scan_index_for_id_keys(
+            session,
+            db,
+            coll,
+            name,
+            &shape,
+            std::slice::from_ref(value),
+            is_compound,
+        )
     }
 
-    /// Walk index `name`'s entries matching `kb`: exact (`prefix=false`) or
-    /// `escape(kb)`-prefixed (`prefix=true`). Mirrors
-    /// `storage._scan_index_for_id_keys`.
+    /// Walk index `name`'s entries holding `values`: exactly those values
+    /// (`prefix=false`), or those values as the leading ones of a longer key
+    /// (`prefix=true`). Mirrors `storage._scan_index_for_id_keys`.
+    #[allow(clippy::too_many_arguments)]
     fn scan_index_for_id_keys(
         &self,
         session: &Session,
         db: &str,
         coll: &str,
         name: &str,
-        kb: &[u8],
+        shape: &KeyShape,
+        values: &[Bson],
         prefix: bool,
     ) -> Result<Vec<i64>> {
         note_routed(name);
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
-        let esc_kb = escape_kb(kb);
+        let cur = open_index_cursor(session, db, coll, name, None)?;
         let seed = if prefix {
-            esc_kb.clone()
+            shape.prefix(values)?
         } else {
-            let mut s = esc_kb.clone();
-            s.extend_from_slice(ENTRY_SEP);
-            s
+            shape.exact(values)?
         };
-        cur.set_key_sssu(db, coll, name, &seed);
         let mut out = Vec::new();
-        let mut more = match cur.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    cur.next()?
-                } else {
-                    true
-                }
-            }
-            Err(e) if e.is_not_found() => return Ok(out),
-            Err(e) => return Err(e.into()),
-        };
+        let mut more = seek_ge(&cur, &seed)?;
         while more {
             // Data-sized loop: honour a `maxTimeMS` budget (see `scan_docs`).
             if deadline::check().is_err() {
                 return Err(StorageError::MaxTimeExpired);
             }
-            let (d, c, n, packed) = cur.get_key_sssu()?;
-            if d != db || c != coll || n != name {
+            let (starts, rid) =
+                cur.with_key_u(|key| (key.starts_with(&seed), ixkeys::entry_rid(key)))?;
+            if !starts {
                 break;
             }
-            let (row_esc, row_id) = unpack_entry(&packed);
-            if prefix {
-                if !row_esc.starts_with(esc_kb.as_slice()) {
-                    break;
-                }
-            } else if row_esc != esc_kb.as_slice() {
-                break;
-            }
-            if let Some(rid) = row_id {
+            if let Some(rid) = rid {
                 out.push(rid);
             }
             more = cur.next()?;
@@ -25482,83 +25708,35 @@ impl Storage {
         Ok(out)
     }
 
-    /// Range-scan index `name` between optional `lower` / `upper` bounds (on the
-    /// directed, unescaped `kb`). Optional `prefix` constrains the scan to
-    /// entries whose escaped kb starts with `escape(prefix)` — used by compound
-    /// prefix + trailing-operator queries where leading equalities pin part of
-    /// the kb. Mirrors `storage._range_scan_index`.
-    #[allow(clippy::too_many_arguments)]
-    fn range_scan_index(
+    /// Range-scan a geo index `name` between the cells `lower` and `upper`
+    /// (their 8-byte keys), both inclusive. Mirrors `storage._range_scan_index`.
+    fn range_scan_cells(
         &self,
         session: &Session,
         db: &str,
         coll: &str,
         name: &str,
-        lower: Option<&[u8]>,
-        lower_inclusive: bool,
-        upper: Option<&[u8]>,
-        upper_inclusive: bool,
-        prefix: Option<&[u8]>,
+        lower: &[u8],
+        upper: &[u8],
     ) -> Result<Vec<i64>> {
         note_routed(name);
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
-        let esc_prefix = prefix.map(escape_kb);
-        let esc_lower = lower.map(escape_kb);
-        let esc_upper = upper.map(escape_kb);
-        let seed: Vec<u8> = if let Some(el) = &esc_lower {
-            let mut s = el.clone();
-            s.extend_from_slice(ENTRY_SEP);
-            s
-        } else if let Some(ep) = &esc_prefix {
-            ep.clone()
-        } else {
-            Vec::new()
-        };
-        cur.set_key_sssu(db, coll, name, &seed);
+        let cur = open_index_cursor(session, db, coll, name, None)?;
+        let shape = KeyShape::plain();
+        let seed = shape.seek(&[geo_cell_value(lower)], false)?;
+        let end = shape.seek(&[geo_cell_value(upper)], true)?;
         let mut out = Vec::new();
-        let mut more = match cur.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    cur.next()?
-                } else {
-                    true
-                }
-            }
-            Err(e) if e.is_not_found() => return Ok(out),
-            Err(e) => return Err(e.into()),
-        };
+        let mut more = seek_ge(&cur, &seed)?;
         while more {
             // Data-sized loop: honour a `maxTimeMS` budget (see `scan_docs`).
             if deadline::check().is_err() {
                 return Err(StorageError::MaxTimeExpired);
             }
-            let (d, c, n, packed) = cur.get_key_sssu()?;
-            if d != db || c != coll || n != name {
+            let (past, rid) =
+                cur.with_key_u(|key| (key >= end.as_slice(), ixkeys::entry_rid(key)))?;
+            if past {
                 break;
             }
-            let (row_esc, row_id) = unpack_entry(&packed);
-            if let Some(ep) = &esc_prefix {
-                if !row_esc.starts_with(ep.as_slice()) {
-                    break;
-                }
-            }
-            // Exclusive lower: skip rows whose kb equals the lower bound.
-            if let Some(el) = &esc_lower {
-                if !lower_inclusive && row_esc == el.as_slice() {
-                    more = cur.next()?;
-                    continue;
-                }
-            }
-            if let Some(eu) = &esc_upper {
-                if upper_inclusive {
-                    if row_esc > eu.as_slice() {
-                        break;
-                    }
-                } else if row_esc >= eu.as_slice() {
-                    break;
-                }
-            }
-            if let Some(rid) = row_id {
+            if let Some(rid) = rid {
                 out.push(rid);
             }
             more = cur.next()?;
@@ -25566,9 +25744,9 @@ impl Storage {
         Ok(out)
     }
 
-    /// Read index `name` over `spans` (stored bytes, from
-    /// [`scan_bounds::to_spans`]) of one column, each behind `prefix` (the
-    /// escaped equality columns and separator before it in a compound index;
+    /// Read index `name` over `spans` (KeyString bytes, from
+    /// [`scan_bounds::to_key_spans`]) of one column, each behind `prefix` (the
+    /// KeyString of the equality columns before it in a compound index;
     /// empty for a leading column).
     /// The RecordIds come in entry order, span after span. Also whether that
     /// is the order of the values: not once a key that does not sort where
@@ -25586,7 +25764,7 @@ impl Storage {
         dir: i32,
     ) -> Result<(Vec<i64>, bool)> {
         note_routed(name);
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let cur = open_index_cursor(session, db, coll, name, None)?;
         let mut out = Vec::new();
         let mut ordered = true;
         for span in spans {
@@ -25597,57 +25775,34 @@ impl Storage {
             let mut hi = prefix.to_vec();
             match &span.hi {
                 Some(h) => hi.extend_from_slice(h),
-                // No column's first byte is 0xff: it is a type rank, or one
+                // No column's first byte is 0xff: it is a type byte, or one
                 // inverted.
                 None => hi.push(0xFF),
             }
             cur.reset()?;
-            cur.set_key_sssu(db, coll, name, &lo);
-            let mut more_rows = match cur.search_near() {
-                Ok(cmp) => {
-                    if cmp < 0 {
-                        cur.next()?
-                    } else {
-                        true
-                    }
-                }
-                Err(e) if e.is_not_found() => false,
-                Err(e) => return Err(e.into()),
-            };
-            // The key columns hold a name's own bytes, which for a name that
-            // is not UTF-8 are not the escaped string's (RM-222).
-            let key_name =
-                |s: &str| secantus_wt::name_bytes(s).unwrap_or_else(|| s.as_bytes().to_vec());
-            let (db_key, coll_key, name_key) = (key_name(db), key_name(coll), key_name(name));
+            let mut more_rows = seek_ge(&cur, &lo)?;
             while more_rows {
                 if deadline::check().is_err() {
                     return Err(StorageError::MaxTimeExpired);
                 }
                 // Read in place: this loop meets most of an index.
-                let step = cur.with_key_sssu(|d, c, n, packed| {
-                    if d != db_key.as_slice()
-                        || c != coll_key.as_slice()
-                        || n != name_key.as_slice()
-                    {
-                        return None;
-                    }
-                    let (row_esc, row_id) = unpack_entry(packed);
-                    if row_esc >= hi.as_slice() {
-                        return None;
+                let (past, row_id, in_order) = cur.with_key_u(|key| {
+                    if key >= hi.as_slice() {
+                        return (true, None, true);
                     }
                     let mut in_order = true;
                     if ordered && dir == -1 {
-                        if let Some(b) = row_esc.get(prefix.len()) {
-                            if scan_bounds::open_ended_rank(0xFF - b) {
+                        if let Some(b) = key.get(prefix.len()) {
+                            if scan_bounds::open_ended_ks(!b) {
                                 in_order = false;
                             }
                         }
                     }
-                    Some((row_id, in_order))
+                    (false, ixkeys::entry_rid(key), in_order)
                 })?;
-                let Some((row_id, in_order)) = step else {
+                if past {
                     break;
-                };
+                }
                 ordered &= in_order;
                 if let Some(rid) = row_id {
                     out.push(rid);
@@ -25681,7 +25836,10 @@ impl Storage {
         if !wide_read_allowed(bounds.broad) {
             return Ok(None);
         }
-        let spans = scan_bounds::to_spans(&bounds, dir, escape_kb);
+        let shape = self.index_shape(session, db, coll, name)?;
+        let Some(spans) = scan_bounds::to_key_spans(&bounds, dir, &shape, 0) else {
+            return Ok(None);
+        };
         let (ids, mut ordered) = self.scan_spans(session, db, coll, name, &spans, &[], dir)?;
         // On a multikey index a document comes out where its FIRST key in the
         // stretches is, which is mongod's order only for single keys.
@@ -26026,30 +26184,25 @@ impl Storage {
             // silently returned nothing. (The Python server hit the same shape
             // as an `IndexError` out of the command handler; here it was quiet.)
             // An empty prefix matches every entry of this index.
+            let shape = self.index_shape(session, db, coll, &name)?;
             return Ok(Some(self.scan_index_for_id_keys(
                 session,
                 db,
                 coll,
                 &name,
+                &shape,
                 &[],
                 true,
             )?));
         }
-        let mut parts: Vec<Vec<u8>> = Vec::with_capacity(prefix_fields.len());
-        for f in &prefix_fields {
-            let dir = direction_of(key_spec.get(f.as_str()).unwrap()).unwrap();
-            parts.push(enc_dir(filter.get(f.as_str()).unwrap(), dir)?);
-        }
-        let kb = compound_join(&parts);
-        if prefix_fields.len() == idx_fields.len() {
-            return Ok(Some(
-                self.scan_index_for_id_keys(session, db, coll, &name, &kb, false)?,
-            ));
-        }
-        let mut seed = kb;
-        seed.extend_from_slice(COMPOUND_SEP);
+        let shape = self.index_shape(session, db, coll, &name)?;
+        let values: Vec<Bson> = prefix_fields
+            .iter()
+            .map(|f| filter.get(f.as_str()).unwrap().clone())
+            .collect();
+        let exact = prefix_fields.len() == idx_fields.len();
         Ok(Some(self.scan_index_for_id_keys(
-            session, db, coll, &name, &seed, true,
+            session, db, coll, &name, &shape, &values, !exact,
         )?))
     }
 
@@ -26138,23 +26291,18 @@ impl Storage {
         let idx_fields: Vec<&String> = key_spec.keys().collect();
         let target = eq_fields.len();
         let op_dir = direction_of(key_spec.get(operator_field.as_str()).unwrap()).unwrap();
-        let mut eq_parts: Vec<Vec<u8>> = Vec::with_capacity(target);
-        for f in &idx_fields[..target] {
-            let dir = direction_of(key_spec.get(f.as_str()).unwrap()).unwrap();
-            eq_parts.push(enc_dir(eq_fields.get(f.as_str()).unwrap(), dir)?);
-        }
-        let mut prefix_with_sep = compound_join(&eq_parts);
-        prefix_with_sep.extend_from_slice(COMPOUND_SEP);
+        let shape = self.index_shape(session, db, coll, &name)?;
+        let eq_values: Vec<Bson> = idx_fields[..target]
+            .iter()
+            .map(|f| eq_fields.get(f.as_str()).unwrap().clone())
+            .collect();
         let use_prefix = idx_fields.len() > target + 1;
 
-        // Helper: prefix + enc(value), then COMPOUND_SEP if more columns follow.
-        let make_kb = |v: &Bson| -> Result<Vec<u8>> {
-            let mut kb = prefix_with_sep.clone();
-            kb.extend_from_slice(&enc_dir(v, op_dir)?);
-            if use_prefix {
-                kb.extend_from_slice(COMPOUND_SEP);
-            }
-            Ok(kb)
+        // Helper: the pinned columns' values, then this one's.
+        let make_values = |v: &Bson| -> Vec<Bson> {
+            let mut vals = eq_values.clone();
+            vals.push(v.clone());
+            vals
         };
 
         let plain = |v: &Bson| !matches!(v, Bson::Document(_) | Bson::RegularExpression(_));
@@ -26167,10 +26315,10 @@ impl Storage {
                     let mut seen: HashSet<i64> = HashSet::new();
                     let mut out: Vec<i64> = Vec::new();
                     for v in in_index_order(vals, op_dir)? {
-                        let inner = make_kb(v)?;
-                        for id_k in self
-                            .scan_index_for_id_keys(session, db, coll, &name, &inner, use_prefix)?
-                        {
+                        let inner = make_values(v);
+                        for id_k in self.scan_index_for_id_keys(
+                            session, db, coll, &name, &shape, &inner, use_prefix,
+                        )? {
                             if seen.insert(id_k) {
                                 out.push(id_k);
                             }
@@ -26184,9 +26332,9 @@ impl Storage {
             }
             if let Some(v) = operator_ops.get("$eq") {
                 if plain(v) {
-                    let inner = make_kb(v)?;
+                    let inner = make_values(v);
                     return Ok(Some(self.scan_index_for_id_keys(
-                        session, db, coll, &name, &inner, use_prefix,
+                        session, db, coll, &name, &shape, &inner, use_prefix,
                     )?));
                 }
             }
@@ -26201,8 +26349,10 @@ impl Storage {
         ) else {
             return Ok(None);
         };
-        let spans = scan_bounds::to_spans(&bounds, op_dir, escape_kb);
-        let prefix = escape_kb(&prefix_with_sep);
+        let Some(spans) = scan_bounds::to_key_spans(&bounds, op_dir, &shape, target) else {
+            return Ok(None);
+        };
+        let prefix = shape.prefix(&eq_values)?;
         let (ids, mut ordered) =
             self.scan_spans(session, db, coll, &name, &spans, &prefix, op_dir)?;
         if multikey && !bounds.scalar_points() {
@@ -26222,8 +26372,8 @@ impl Storage {
 /// Drop what it can of `pending`: each ident's table nothing has open. A
 /// table still open stays for the next attempt; a table already gone is
 /// done. Any other failure is reported and the ident kept.
-fn reap_drop_pending(conn: &Connection, pending: &Mutex<Vec<String>>) {
-    let idents = std::mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
+fn reap_drop_pending(conn: &Connection, pending: &DropPending) {
+    let idents = pending.take_eligible();
     if idents.is_empty() {
         return;
     }
@@ -26231,29 +26381,107 @@ fn reap_drop_pending(conn: &Connection, pending: &Mutex<Vec<String>>) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("secantus-storage: dropping tables: {e:?}");
-            pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend(idents);
+            pending.put_back(idents);
             return;
         }
     };
     let mut kept = Vec::new();
-    for ident in idents {
-        match session.drop_table(&mdb_catalog::table_uri(&ident), None) {
+    for (ident, at) in idents {
+        // `force`, as mongod's ident drop (`force,checkpoint_wait=false`): a
+        // session that has only a cached cursor or a cached handle of the
+        // table (every pooled session that ever wrote it) must not keep it
+        // from going; one with a cursor open on it still does.
+        match session.drop_table(&mdb_catalog::table_uri(&ident), Some("force=true")) {
             Ok(()) => {}
             Err(e) if e.is_missing_table() || e.is_not_found() => {}
-            Err(e) if e.is_busy() => kept.push(ident),
+            Err(e) if e.is_busy() => kept.push((ident, at)),
             Err(e) => {
                 eprintln!("secantus-storage: dropping table {ident}: {e:?}");
-                kept.push(ident);
+                kept.push((ident, at));
             }
         }
     }
-    pending
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .extend(kept);
+    pending.put_back(kept);
+}
+
+/// mongod's drop-pending idents: the tables of dropped collections and
+/// indexes, each with the number of checkpoints begun when its drop
+/// committed. A table goes only once a checkpoint begun AFTER its drop has
+/// completed: until then the last checkpoint still holds it, and a read of
+/// that checkpoint (a background `validate`) reads it, as mongod's does
+/// (mongod keeps a drop-pending ident until the checkpoint no longer needs
+/// it). A store without checkpoints (in memory) drops at once.
+pub(crate) struct DropPending {
+    idents: Mutex<Vec<(String, u64)>>,
+    /// Checkpoints begun.
+    started: AtomicU64,
+    /// The number (in `started` order) of the latest checkpoint completed.
+    completed: AtomicU64,
+    checkpointless: bool,
+}
+
+/// [`DropPending::lock`]: idents pushed through it are stamped with the
+/// checkpoints begun so far.
+pub(crate) struct PendingGuard<'a> {
+    list: std::sync::MutexGuard<'a, Vec<(String, u64)>>,
+    at: u64,
+}
+
+impl PendingGuard<'_> {
+    pub(crate) fn push(&mut self, ident: String) {
+        let at = self.at;
+        self.list.push((ident, at));
+    }
+
+    pub(crate) fn extend(&mut self, idents: impl IntoIterator<Item = String>) {
+        let at = self.at;
+        self.list.extend(idents.into_iter().map(|i| (i, at)));
+    }
+}
+
+impl DropPending {
+    fn new(checkpointless: bool) -> Self {
+        DropPending {
+            idents: Mutex::new(Vec::new()),
+            started: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            checkpointless,
+        }
+    }
+
+    pub(crate) fn lock(&self) -> PendingGuard<'_> {
+        PendingGuard {
+            at: self.started.load(Ordering::SeqCst),
+            list: self.idents.lock().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+
+    /// The idents a checkpoint begun after their drop has released.
+    fn take_eligible(&self) -> Vec<(String, u64)> {
+        let completed = self.completed.load(Ordering::SeqCst);
+        let mut list = self.idents.lock().unwrap_or_else(|e| e.into_inner());
+        let (ready, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut *list)
+            .into_iter()
+            .partition(|(_, at)| self.checkpointless || completed > *at);
+        *list = wait;
+        ready
+    }
+
+    fn put_back(&self, idents: Vec<(String, u64)>) {
+        self.idents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(idents);
+    }
+
+    /// Take a checkpoint on `session`, counted: what releases drop-pending
+    /// idents.
+    fn checkpoint(&self, session: &Session) -> std::result::Result<(), WtError> {
+        let n = self.started.fetch_add(1, Ordering::SeqCst) + 1;
+        session.checkpoint(None)?;
+        self.completed.fetch_max(n, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 /// At open: drop every collection table no placement names, which a crash
@@ -26266,7 +26494,11 @@ fn reconcile_idents(session: &Session) -> Result<()> {
     NEXT_CATALOG_ID.fetch_max(max_id + 1, Ordering::SeqCst);
     let placed: std::collections::HashSet<String> = mdb_catalog::all_placements(session)?
         .into_iter()
-        .map(|(_, _, p)| p.ident)
+        .flat_map(|(_, _, p)| {
+            let mut idents = vec![p.ident];
+            idents.extend(p.indexes.into_values());
+            idents
+        })
         .collect();
     let mut orphans = Vec::new();
     {
@@ -26274,7 +26506,9 @@ fn reconcile_idents(session: &Session) -> Result<()> {
         while cur.next()? {
             let uri = cur.get_key_s()?;
             if let Some(ident) = uri.strip_prefix("table:") {
-                if ident.starts_with("collection-") && !placed.contains(ident) {
+                if (ident.starts_with("collection-") || ident.starts_with("index-"))
+                    && !placed.contains(ident)
+                {
                     orphans.push(uri);
                 }
             }
@@ -26364,12 +26598,20 @@ fn sync_catalog_entry(session: &Session, db: &str, coll: &str) -> Result<()> {
             multikey_paths: mdb_catalog::multikey_paths(&key, &components),
         });
     }
+    // Each secondary index's table, in the order the indexes are listed.
+    let idx_idents: Vec<(String, String)> = indexes
+        .iter()
+        .filter_map(|ix| {
+            let name = ix.spec.get_str("name").ok()?;
+            Some((name.to_string(), placement.indexes.get(name)?.clone()))
+        })
+        .collect();
     let entry = mdb_catalog::entry_doc(
         &format!("{db}.{coll}"),
         options,
         &indexes,
         &placement.ident,
-        &[],
+        &idx_idents,
     );
     // A row that already says this is left alone: no write, no conflict.
     if mdb_catalog::read_entry(session, placement.catalog_id)?.as_ref() == Some(&entry) {
@@ -27703,9 +27945,15 @@ fn flush_deferred_creates(
     if let Err(e) = written {
         // The transaction will not commit: the tables made for its creates
         // hold nothing anyone will see.
-        for placement in placements.values() {
-            storage.drop_ident_table(&placement.ident);
-        }
+        // Once that transaction is over: it has written these tables.
+        let idents: Vec<String> = placements
+            .values()
+            .flat_map(|p| p.idents().cloned())
+            .collect();
+        let pending = storage.drop_pending.clone();
+        session.on_transaction_end(Box::new(move |_| {
+            pending.lock().extend(idents);
+        }));
         return Err(e);
     }
     COLL_TABLE_GEN.fetch_add(1, Ordering::SeqCst);
@@ -28420,15 +28668,15 @@ mod tests {
         c.set_key_sss("app", coll, name);
         c.set_value_u(&encode_doc(&d).unwrap());
         c.update().unwrap();
-        let scan = sess.open_cursor(IDX_ENTRIES_TABLE, None).unwrap();
-        let del = sess.open_cursor(IDX_ENTRIES_TABLE, None).unwrap();
+        // The index's entries are in its own table.
+        let table = index_table_of(&sess, "app", coll, name).unwrap().unwrap();
+        let scan = sess.open_cursor(&table, None).unwrap();
+        let del = sess.open_cursor(&table, None).unwrap();
         let mut more = scan.next().unwrap();
         while more {
-            let (d, c, n, packed) = scan.get_key_sssu().unwrap();
-            if c == coll && n == name {
-                del.set_key_sssu(&d, &c, &n, &packed);
-                del.remove().unwrap();
-            }
+            let key = scan.get_key_u().unwrap();
+            del.set_key_u(&key);
+            del.remove().unwrap();
             more = scan.next().unwrap();
         }
     }
@@ -28589,16 +28837,24 @@ mod tests {
             assert_eq!(opts.get_i32("entryFormat").ok(), Some(ENTRY_FORMAT));
         }
         let walk = st
-            .index_entries_from("app", "c", "s_-1", &[], None, 10, false)
+            .index_entries_from("app", "c", "s_-1", IndexPos::Edge, None, 10, false)
             .unwrap();
-        let order: Vec<i64> = walk.iter().map(|(_, rid)| *rid).collect();
+        let order: Vec<i64> = walk.iter().map(|row| row.rid).collect();
         // "b", "ab", "a", "": RecordIds 4, 2, 1, 3.
         assert_eq!(order, vec![4, 2, 1, 3]);
         let undefined = sortkey::encode_value(&Bson::Undefined, None).unwrap();
         let walk = st
-            .index_entries_from("app", "c", "t_1", &undefined, None, 10, false)
+            .index_entries_from(
+                "app",
+                "c",
+                "t_1",
+                IndexPos::Values(&[Bson::Undefined]),
+                None,
+                10,
+                false,
+            )
             .unwrap();
-        assert!(walk.iter().take(4).all(|(k, _)| *k == undefined));
+        assert!(walk.iter().take(4).all(|row| row.raw == undefined));
         assert_eq!(ids_of(&st, "c", doc! {"s": {"$lte": "ab"}}), vec![1, 2, 3]);
         assert_eq!(ids_of(&st, "c", doc! {"t": []}), vec![1, 2, 3, 4]);
     }
@@ -28656,10 +28912,10 @@ mod tests {
             sortkey::ID_KEY_FORMAT
         );
         let walk: Vec<i64> = st
-            .index_entries_from("app", "i", ID_INDEX_NAME, &[], None, 10, false)
+            .index_entries_from("app", "i", ID_INDEX_NAME, IndexPos::Edge, None, 10, false)
             .unwrap()
             .into_iter()
-            .map(|(_, rid)| rid)
+            .map(|row| row.rid)
             .collect();
         // Number, string, {a: 2, b: [3]}, {a: 5}, the two UUIDs by bytes,
         // MaxKey: mongod 8.2.11's order of these `_id`s.
@@ -28967,7 +29223,7 @@ mod tests {
         ];
         let options = doc! {"bits": 20.0, "min": -50.0, "max": 50.0};
         // What format 1 wrote for each document: its cell at 26 bits.
-        let mut stale: Vec<Vec<u8>> = Vec::new();
+        let mut stale: Vec<EntryKey> = Vec::new();
         let sphere_entries;
         {
             let st = Storage::open(home).unwrap();
@@ -29003,7 +29259,7 @@ mod tests {
                 let (old, new) = (read_as(26).cell_kbs(&loc), read_as(20).cell_kbs(&loc));
                 // Otherwise the test would not tell the formats apart.
                 assert_ne!(old, new);
-                stale.extend(old.iter().map(|kb| pack_entry(kb, rid)));
+                stale.extend(old.iter().map(|kb| geo_entry(kb, rid).unwrap()));
             }
             sphere_entries = st.check_collection("app", "h").unwrap();
         }
@@ -29015,10 +29271,11 @@ mod tests {
             let conn = Connection::open(home, DEFAULT_CONFIG).unwrap();
             let sess = conn.open_session().unwrap();
             let _raw = untimestamped(&sess);
-            let c = sess.open_cursor(IDX_ENTRIES_TABLE, None).unwrap();
-            for packed in &stale {
-                c.set_key_sssu("app", "g", "geo", packed);
-                c.set_value_u(b"");
+            let table = index_table_of(&sess, "app", "g", "geo").unwrap().unwrap();
+            let c = sess.open_cursor(&table, None).unwrap();
+            for entry in &stale {
+                c.set_key_u(&entry.key);
+                c.set_value_u(&entry.type_bits);
                 c.insert().unwrap();
                 c.reset().unwrap();
             }
@@ -30278,14 +30535,19 @@ mod tests {
             let session = s.conn.open_session().unwrap();
             let _raw = untimestamped(&session);
             let rows = s.collect_entry_rows(&session, "app", "t").unwrap();
-            let (name, packed) = rows.first().unwrap().clone();
-            let entries = session.open_cursor(IDX_ENTRIES_TABLE, None).unwrap();
-            entries.set_key_sssu("app", "t", &name, &packed);
+            let (name, key) = rows.first().unwrap().clone();
+            let table = index_table_of(&session, "app", "t", &name)
+                .unwrap()
+                .unwrap();
+            let entries = session.open_cursor(&table, None).unwrap();
+            entries.set_key_u(&key);
             entries.remove().unwrap();
             entries.reset().unwrap();
-            let stray = pack_entry(&enc_dir_c(&Bson::Int32(99), 1, None).unwrap(), 12345);
-            entries.set_key_sssu("app", "t", "v_1", &stray);
-            entries.set_value_u(b"");
+            let stray = KeyShape::new(&doc! {"v": 1i32}, None, BinDataOrder::Mongod)
+                .entry(&[Bson::Int32(99)], 12345)
+                .unwrap();
+            entries.set_key_u(&stray.key);
+            entries.set_value_u(&stray.type_bits);
             entries.insert().unwrap();
             let id_key = sortkey::encode_value(&Bson::Int32(2), None).unwrap();
             let ids = session.open_cursor(NAT_SEQ_TABLE, None).unwrap();
@@ -30923,19 +31185,6 @@ mod tests {
     }
 
     #[test]
-    fn unescape_kb_undoes_escape_kb() {
-        for kb in [
-            &b""[..],
-            b"abc",
-            b"\x01\x00\x02",
-            b"\x00\x00",
-            b"\x00\xff\x00",
-        ] {
-            assert_eq!(unescape_kb(&escape_kb(kb)), kb.to_vec());
-        }
-    }
-
-    #[test]
     fn escape_kb_doubles_zero_bytes() {
         assert_eq!(escape_kb(b"\x01\x00\x02"), vec![0x01, 0x00, 0xff, 0x02]);
         assert_eq!(escape_kb(b"abc"), b"abc".to_vec());
@@ -30943,52 +31192,42 @@ mod tests {
     }
 
     #[test]
-    fn pack_entry_layout_and_unpack_roundtrip() {
-        // `escape(kb) + \x00\x00 + RecordId(8B big-endian)` (step 2).
-        let kb = b"\x01\x00\x02".as_slice();
-        let packed = pack_entry(kb, 1);
+    fn an_entry_is_the_keystring_then_the_recordid() {
+        // `KeyString(values) + RecordId`, the TypeBits as the value.
+        let shape = KeyShape::new(&doc! {"k": 1i32}, None, BinDataOrder::Mongod);
+        let entry = shape.entry(&[Bson::Int32(7)], 1).unwrap();
+        let mut b =
+            keystring::Builder::new(keystring::Version::V1, keystring::Ordering::all_ascending());
+        b.append_bson_element(&Bson::Int32(7)).unwrap();
+        b.append_record_id_long(1).unwrap();
+        let (key, tb) = b.finish().unwrap();
+        assert_eq!(entry.key, key);
+        assert_eq!(entry.type_bits, tb.serialize());
+        assert_eq!(ixkeys::entry_rid(&entry.key), Some(1));
         assert_eq!(
-            packed,
-            vec![0x01, 0x00, 0xff, 0x02, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 1]
+            ixkeys::entry_prefix(&entry.key),
+            Some(shape.exact(&[Bson::Int32(7)]).unwrap().as_slice())
         );
-        let (esc_kb, rid) = unpack_entry(&packed);
-        assert_eq!(esc_kb, escape_kb(kb).as_slice());
-        assert_eq!(rid, Some(1));
     }
 
     #[test]
-    fn unpack_splits_on_first_separator() {
-        // A RecordId's big-endian bytes routinely contain `\x00\x00` (every small
-        // id does), so the split MUST land at the FIRST separator — correct
-        // because the escaped kb half can never contain a bare `\x00\x00`, and
-        // safe because the trailing half is fixed-width and taken whole.
-        let kb = b"\x00".as_slice();
-        let packed = pack_entry(kb, 1);
-        let (esc_kb, rid) = unpack_entry(&packed);
-        assert_eq!(esc_kb, vec![0x00, 0xff].as_slice());
-        assert_eq!(rid, Some(1));
+    fn an_entry_orders_by_recordid_within_a_key() {
+        // Within one key the RecordId's encoding keeps the B-tree in
+        // RecordId (insertion) order.
+        let shape = KeyShape::new(&doc! {"k": 1i32}, None, BinDataOrder::Mongod);
+        let at = |rid: i64| shape.entry(&[Bson::String("k".into())], rid).unwrap().key;
+        assert!(at(1) < at(2));
+        assert!(at(2) < at(300));
+        assert!(at(300) < at(i64::MAX));
     }
 
     #[test]
-    fn pack_entry_orders_by_recordid_within_a_key() {
-        // Big-endian keeps the B-tree ordered by RecordId (insertion order)
-        // within one index key — little-endian would scramble it.
-        let kb = b"k".as_slice();
-        assert!(pack_entry(kb, 1) < pack_entry(kb, 2));
-        assert!(pack_entry(kb, 2) < pack_entry(kb, 300));
-        assert!(pack_entry(kb, 300) < pack_entry(kb, i64::MAX));
-    }
-
-    #[test]
-    fn unpack_rejects_a_step1_entry() {
-        // A step-1 entry's trailing half is an `id_key`, not an 8-byte RecordId.
-        // It must report None rather than reinterpreting those bytes as a
-        // RecordId — that would silently fetch the wrong document.
-        let mut packed = escape_kb(b"k");
-        packed.extend_from_slice(ENTRY_SEP);
-        packed.extend_from_slice(b"an-id-key");
-        let (_esc, rid) = unpack_entry(&packed);
-        assert_eq!(rid, None);
+    fn a_key_that_is_not_an_entry_has_no_recordid() {
+        // A key too short to hold a RecordId reports None rather than a
+        // RecordId read out of other bytes, which would fetch the wrong
+        // document.
+        assert_eq!(ixkeys::entry_rid(b"k"), None);
+        assert_eq!(ixkeys::entry_rid(b""), None);
     }
 
     /// A dotted sort key walks ONE array level. `x: [{y: 1}]` HAS an `x.y` and

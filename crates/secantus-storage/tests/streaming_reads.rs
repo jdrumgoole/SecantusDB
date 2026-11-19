@@ -5,7 +5,7 @@
 
 use bson::{doc, Bson, Document};
 use secantus_core::sortkey::{encode_value, split_compound};
-use secantus_storage::Storage;
+use secantus_storage::{IndexPos, IndexRow, Storage};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -89,33 +89,56 @@ fn an_index_walk_resumes_after_its_entry() {
         st.create_index("db", "c", "x_1_y_1", &doc! {"x": 1, "y": 1}, &doc! {})
             .unwrap();
         let all = st
-            .index_entries_from("db", "c", "x_1_y_1", b"", None, 100, false)
+            .index_entries_from("db", "c", "x_1_y_1", IndexPos::Edge, None, 100, false)
             .unwrap();
         assert_eq!(all.len(), 6);
-        // In key order, and every key splits into its two fields' encodings.
+        // In key order, and every key's `raw` splits into its two fields'
+        // sort-key encodings (decoded from the entry's KeyString).
         let x0 = encode_value(&Bson::Int32(0), None).unwrap();
-        for (key, _) in &all {
-            let parts = split_compound(key, 2).expect("a compound key");
+        for row in &all {
+            let parts = split_compound(&row.raw, 2).expect("a compound key");
             assert!(parts[0].len() > 1 && parts[1].len() > 1);
         }
-        assert!(all.windows(2).all(|w| w[0].0 <= w[1].0));
-        assert!(all[0].0.starts_with(&x0));
+        assert!(all.windows(2).all(|w| w[0].raw <= w[1].raw));
+        assert!(all[0].raw.starts_with(&x0));
         // From the third entry on, exclusive of it.
-        let (key, rid) = all[2].clone();
         let rest = st
-            .index_entries_from("db", "c", "x_1_y_1", &key, Some(rid), 100, false)
+            .index_entries_from(
+                "db",
+                "c",
+                "x_1_y_1",
+                IndexPos::Resume(&all[2].resume),
+                Some(all[2].rid),
+                100,
+                false,
+            )
             .unwrap();
         assert_eq!(rest, all[3..].to_vec());
         // A seek to a key of the first field alone starts at its first entry.
-        let x1 = encode_value(&Bson::Int32(1), None).unwrap();
         let from_one = st
-            .index_entries_from("db", "c", "x_1_y_1", &x1, None, 100, false)
+            .index_entries_from(
+                "db",
+                "c",
+                "x_1_y_1",
+                IndexPos::Values(&[Bson::Int32(1)]),
+                None,
+                100,
+                false,
+            )
             .unwrap();
         assert_eq!(from_one, all[2..].to_vec());
         // An entry inserted after the position is read; a later one only.
         insert(st, &[doc! {"_id": 7, "x": 2, "y": 0}]);
         let after = st
-            .index_entries_from("db", "c", "x_1_y_1", &key, Some(rid), 100, false)
+            .index_entries_from(
+                "db",
+                "c",
+                "x_1_y_1",
+                IndexPos::Resume(&all[2].resume),
+                Some(all[2].rid),
+                100,
+                false,
+            )
             .unwrap();
         assert_eq!(after.len(), 4);
     });
@@ -161,36 +184,57 @@ fn a_backward_index_walk_resumes_before_its_entry() {
         st.create_index("db", "c", "x_1_y_1", &doc! {"x": 1, "y": 1}, &doc! {})
             .unwrap();
         let all = st
-            .index_entries_from("db", "c", "x_1_y_1", b"", None, 100, false)
+            .index_entries_from("db", "c", "x_1_y_1", IndexPos::Edge, None, 100, false)
             .unwrap();
         let mut reversed = all.clone();
         reversed.reverse();
         // From the highest key down: every entry, last first.
-        let top = encode_value(&Bson::MaxKey, None).unwrap();
         let down = st
-            .index_entries_from("db", "c", "x_1_y_1", &top, None, 100, true)
+            .index_entries_from("db", "c", "x_1_y_1", IndexPos::Edge, None, 100, true)
             .unwrap();
         assert_eq!(down, reversed);
         // Before the fourth entry, exclusive of it.
-        let (key, rid) = all[3].clone();
         let rest = st
-            .index_entries_from("db", "c", "x_1_y_1", &key, Some(rid), 100, true)
+            .index_entries_from(
+                "db",
+                "c",
+                "x_1_y_1",
+                IndexPos::Resume(&all[3].resume),
+                Some(all[3].rid),
+                100,
+                true,
+            )
             .unwrap();
         assert_eq!(rest, reversed[3..].to_vec());
         // A key of the first field alone is below every entry that extends
         // it, so a walk down from it reads only the `x: 0` entries. (A
         // streaming cursor's start names every field.)
-        let x1 = encode_value(&Bson::Int32(1), None).unwrap();
         let from_one = st
-            .index_entries_from("db", "c", "x_1_y_1", &x1, None, 100, true)
+            .index_entries_from(
+                "db",
+                "c",
+                "x_1_y_1",
+                IndexPos::Values(&[Bson::Int32(1)]),
+                None,
+                100,
+                true,
+            )
             .unwrap();
         assert_eq!(from_one, reversed[4..].to_vec());
-        // With every field named, the walk starts at that entry.
-        let (k2, r2) = all[3].clone();
+        // With every field named, the walk starts at that entry: `x: 1`
+        // and the `y` of the fourth entry (`_id` 1, `y` -100).
         let from_entry = st
-            .index_entries_from("db", "c", "x_1_y_1", &k2, None, 100, true)
+            .index_entries_from(
+                "db",
+                "c",
+                "x_1_y_1",
+                IndexPos::Values(&[Bson::Int32(1), Bson::Int32(-100)]),
+                None,
+                100,
+                true,
+            )
             .unwrap();
-        assert_eq!(from_entry.first(), Some(&(k2, r2)));
+        assert_eq!(from_entry.first(), Some(&all[3]));
     });
 }
 
@@ -205,8 +249,8 @@ fn the_id_index_walks_the_documents_id_keys() {
                 .collect::<Vec<_>>(),
         );
         let key = |i: i32| encode_value(&Bson::Int32(i), None).unwrap();
-        let ids = |rows: &[(Vec<u8>, i64)]| -> Vec<i32> {
-            let rids: Vec<i64> = rows.iter().map(|(_, r)| *r).collect();
+        let ids = |rows: &[IndexRow]| -> Vec<i32> {
+            let rids: Vec<i64> = rows.iter().map(|r| r.rid).collect();
             st.records_by_id("db", "c", &rids)
                 .unwrap()
                 .iter()
@@ -214,28 +258,36 @@ fn the_id_index_walks_the_documents_id_keys() {
                 .collect()
         };
         let all = st
-            .index_entries_from("db", "c", "_id_", b"", None, 100, false)
+            .index_entries_from("db", "c", "_id_", IndexPos::Edge, None, 100, false)
             .unwrap();
         assert_eq!(ids(&all), [1, 2, 3, 4, 5]);
-        assert_eq!(all[0].0, key(1));
+        assert_eq!(all[0].raw, key(1));
         let from_three = st
-            .index_entries_from("db", "c", "_id_", &key(3), None, 100, false)
+            .index_entries_from("db", "c", "_id_", IndexPos::Raw(&key(3)), None, 100, false)
             .unwrap();
         assert_eq!(ids(&from_three), [3, 4, 5]);
         let past_three = st
-            .index_entries_from("db", "c", "_id_", &key(3), Some(0), 100, false)
+            .index_entries_from(
+                "db",
+                "c",
+                "_id_",
+                IndexPos::Raw(&key(3)),
+                Some(0),
+                100,
+                false,
+            )
             .unwrap();
         assert_eq!(ids(&past_three), [4, 5]);
         let down_from_three = st
-            .index_entries_from("db", "c", "_id_", &key(3), None, 100, true)
+            .index_entries_from("db", "c", "_id_", IndexPos::Raw(&key(3)), None, 100, true)
             .unwrap();
         assert_eq!(ids(&down_from_three), [3, 2, 1]);
         let below_three = st
-            .index_entries_from("db", "c", "_id_", &key(3), Some(0), 2, true)
+            .index_entries_from("db", "c", "_id_", IndexPos::Raw(&key(3)), Some(0), 2, true)
             .unwrap();
         assert_eq!(ids(&below_three), [2, 1]);
         assert!(st
-            .index_entries_from("db", "nope", "_id_", b"", None, 10, false)
+            .index_entries_from("db", "nope", "_id_", IndexPos::Edge, None, 10, false)
             .unwrap()
             .is_empty());
     });

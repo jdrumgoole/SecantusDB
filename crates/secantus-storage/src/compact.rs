@@ -155,8 +155,11 @@ impl Storage {
                     .into_iter()
                     .chain([NAT_SEQ_TABLE.to_string()])
                     .collect();
-                if descs.iter().any(|d| !d.id_claim && d.name != ID_INDEX_NAME) {
-                    tables.push(IDX_ENTRIES_TABLE.to_string());
+                for d in descs
+                    .iter()
+                    .filter(|d| !d.id_claim && d.name != ID_INDEX_NAME)
+                {
+                    tables.extend(index_table_of(&session, db, coll, &d.name)?);
                 }
                 if descs
                     .iter()

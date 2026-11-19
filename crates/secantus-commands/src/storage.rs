@@ -94,8 +94,35 @@ pub enum AutoCompactReply {
 /// tailable-find producer polls (`scan_docs_after_id_key`).
 pub type IdKeyRows = Vec<(Vec<u8>, Vec<u8>)>;
 
-/// An index's entries as `(key, RecordId)`, the key unescaped.
-pub type IndexEntries = Vec<(Vec<u8>, i64)>;
+/// Where an index read starts or resumes ([`Storage::index_entries_from`]).
+#[derive(Clone, Copy, Debug)]
+pub enum IndexFrom<'a> {
+    /// The first entry (the last, reading backward).
+    Edge,
+    /// A raw `_id` key, for the `_id` index only.
+    Raw(&'a [u8]),
+    /// The entries holding these leading key values, whatever follows them:
+    /// forward, from the first of them; backward, from the last of those
+    /// that hold exactly these values (a bare prefix is before every entry
+    /// that extends it).
+    Values(&'a [Bson]),
+    /// Just past (before, reading backward) the entry whose
+    /// [`IndexEntry::resume`] this is.
+    Resume(&'a [u8]),
+}
+
+/// An index entry: its key's per-field `sortkey` encodings joined by
+/// `COMPOUND_SEP` (`raw`; for the `_id` index, the `_id` key), its RecordId,
+/// and where a read resumes after it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexEntry {
+    pub raw: Vec<u8>,
+    pub rid: i64,
+    pub resume: Vec<u8>,
+}
+
+/// An index's entries, in the index's order.
+pub type IndexEntries = Vec<IndexEntry>;
 
 /// A collection's documents as `(RecordId, BSON)`, in RecordId order.
 pub type Records = Vec<(i64, Vec<u8>)>;
@@ -1501,21 +1528,19 @@ pub trait Storage: Send + Sync {
         Ok(None)
     }
 
-    /// Up to `max` entries of index `name` from key `from` on (strictly
-    /// after `(from, after)` when `after` is given), in the index's order,
-    /// as `(key, RecordId)` with the key the fields' `sortkey` encodings
-    /// joined by `COMPOUND_SEP`: an index scan a streaming cursor resumes.
-    /// `backward`: descending, from the last entry no greater than `from`
-    /// (strictly before `(from, after)`). The `_id` index's entries are the
-    /// documents' `_id` keys, one per document. `None` when the store cannot
-    /// read this way.
+    /// Up to `max` entries of index `name` from `from` on (strictly after
+    /// the entry a resume names), in the index's order: an index scan a
+    /// streaming cursor resumes. `backward`: descending, from the last entry
+    /// no greater than `from` (strictly before a resume's entry). The `_id`
+    /// index's entries are the documents' `_id` keys, one per document.
+    /// `None` when the store cannot read this way.
     #[allow(clippy::too_many_arguments)]
     fn index_entries_from(
         &self,
         _db: &str,
         _coll: &str,
         _name: &str,
-        _from: &[u8],
+        _from: IndexFrom<'_>,
         _after: Option<i64>,
         _max: usize,
         _backward: bool,

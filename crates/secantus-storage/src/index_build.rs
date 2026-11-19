@@ -131,6 +131,9 @@ struct BuildIndex {
     desc: IndexDesc,
     /// Some document written or scanned holds an array on its key path.
     multikey: AtomicBool,
+    /// The index's own table (`index-<UUID>`), made when the scan starts and
+    /// listed in the placement only when the build commits.
+    ident: Mutex<Option<String>>,
 }
 
 impl BuildIndex {
@@ -142,7 +145,20 @@ impl BuildIndex {
             stored,
             desc,
             multikey: AtomicBool::new(false),
+            ident: Mutex::new(None),
         }
+    }
+
+    /// The table the build writes this index's entries to.
+    fn table(&self) -> Result<String> {
+        self.ident
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_deref()
+            .map(mdb_catalog::table_uri)
+            .ok_or_else(|| {
+                StorageError::Internal(format!("index build: index {} has no table yet", self.name))
+            })
     }
 
     fn is_geo(&self) -> bool {
@@ -334,16 +350,37 @@ impl Registry {
 
 /// A side write: what one write did to one index's keys.
 enum SideOp<'a> {
-    Insert(&'a [u8]),
-    Remove(&'a [u8]),
+    Insert(&'a EntryKey),
+    Remove(&'a EntryKey),
     /// The document's keys could not be made; key it again at commit.
     Skipped(i64),
 }
 
+/// An entry as a side write or a sorter holds it: its key, its TypeBits,
+/// and the TypeBits' length (so the two can be told apart).
+fn encode_entry(e: &EntryKey) -> Vec<u8> {
+    let mut out = Vec::with_capacity(e.key.len() + e.type_bits.len() + 4);
+    out.extend_from_slice(&e.key);
+    out.extend_from_slice(&e.type_bits);
+    out.extend_from_slice(&(e.type_bits.len() as u32).to_be_bytes());
+    out
+}
+
+fn decode_entry(bytes: &[u8]) -> Result<EntryKey> {
+    let bad = || StorageError::Internal("index build: an entry too short to read".into());
+    let split = bytes.len().checked_sub(4).ok_or_else(bad)?;
+    let tb_len = u32::from_be_bytes(bytes[split..].try_into().map_err(|_| bad())?) as usize;
+    let key_len = split.checked_sub(tb_len).ok_or_else(bad)?;
+    Ok(EntryKey {
+        key: bytes[..key_len].to_vec(),
+        type_bits: bytes[key_len..split].to_vec(),
+    })
+}
+
 fn encode_side(index: usize, op: &SideOp<'_>) -> Vec<u8> {
     let (tag, payload): (u8, Vec<u8>) = match op {
-        SideOp::Insert(p) => (b'i', p.to_vec()),
-        SideOp::Remove(p) => (b'd', p.to_vec()),
+        SideOp::Insert(p) => (b'i', encode_entry(p)),
+        SideOp::Remove(p) => (b'd', encode_entry(p)),
         SideOp::Skipped(rid) => (b's', rid.to_be_bytes().to_vec()),
     };
     let mut out = Vec::with_capacity(payload.len() + 3);
@@ -613,7 +650,7 @@ impl Storage {
         };
         for b in &builds {
             for (i, ix) in b.indexes.iter().enumerate() {
-                let keys = |d: Option<&Document>| -> Result<Option<Vec<Vec<u8>>>> {
+                let keys = |d: Option<&Document>| -> Result<Option<Vec<EntryKey>>> {
                     let Some(d) = d else {
                         return Ok(Some(Vec::new()));
                     };
@@ -632,8 +669,8 @@ impl Storage {
                 };
                 let (old_keys, new_keys) = (keys(old)?, keys(new)?);
                 if let (Some(o), Some(n)) = (&old_keys, &new_keys) {
-                    let o: HashSet<&Vec<u8>> = o.iter().collect();
-                    let n: HashSet<&Vec<u8>> = n.iter().collect();
+                    let o: HashSet<&EntryKey> = o.iter().collect();
+                    let n: HashSet<&EntryKey> = n.iter().collect();
                     for k in o.difference(&n) {
                         put(&b.uuid, i, SideOp::Remove(k))?;
                     }
@@ -856,6 +893,23 @@ impl Storage {
                         c.set_key_sss(&b.db, &b.coll, &ix.name);
                         c.set_value_u(&encode_doc(&payload)?);
                         c.insert()?;
+                        // Its table is listed with the registry row, in the
+                        // transaction that commits the index; a retry of
+                        // this one keeps the table (the build still owns it).
+                        let ident = ix
+                            .ident
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone()
+                            .ok_or_else(|| {
+                                StorageError::Internal(format!(
+                                    "index build: index {} has no table to commit",
+                                    ix.name
+                                ))
+                            })?;
+                        record_index_ident(
+                            self, &session, &b.db, &b.coll, &ix.name, &ident, false,
+                        )?;
                     }
                     // The catalog mongod reads says what the registry says.
                     sync_catalog_entry(&session, &b.db, &b.coll)?;
@@ -873,6 +927,10 @@ impl Storage {
                     Ok(())
                 })
             })?;
+            // The tables belong to the catalog now, not to the build.
+            for ix in &b.indexes {
+                ix.ident.lock().unwrap_or_else(|e| e.into_inner()).take();
+            }
             // Unregistered under the collection lock: the next write keys
             // the new indexes through the catalog.
             _finishing = self.index_builds.remove(&b.uuid);
@@ -1056,6 +1114,16 @@ impl Storage {
         let per_index = (memory_limit / n).max(1);
         let dir = self.build_tmp_dir();
         let prefix = uuid_text(&b.uuid);
+        // Each index's own table, which nothing lists until the commit.
+        {
+            let session = self.conn.open_session()?;
+            for ix in &b.indexes {
+                let mut ident = ix.ident.lock().unwrap_or_else(|e| e.into_inner());
+                if ident.is_none() {
+                    *ident = Some(make_index_table(self, &session, ix.unique())?);
+                }
+            }
+        }
         let mut sorters: Vec<ExtSorter> = (0..b.indexes.len())
             .map(|i| ExtSorter::new(per_index, dir.clone(), format!("{prefix}-{i}")))
             .collect();
@@ -1101,8 +1169,8 @@ impl Storage {
                     {
                         ix.multikey.store(true, Ordering::Relaxed);
                     }
-                    for packed in self.packed_entry_keys(&d, &ix.desc, *rid)? {
-                        sorters[i].push(packed)?;
+                    for entry in self.packed_entry_keys(&d, &ix.desc, *rid)? {
+                        sorters[i].push(encode_entry(&entry))?;
                     }
                 }
                 scanned += 1;
@@ -1121,37 +1189,41 @@ impl Storage {
                 );
             }
             let mut keys = sorter.finish()?;
-            let mut chunk: Vec<Vec<u8>> = Vec::new();
+            let mut chunk: Vec<EntryKey> = Vec::new();
             let mut bytes = 0usize;
-            let mut prev: Option<Vec<u8>> = None;
+            let mut prev: Option<EntryKey> = None;
             let mut dups = BTreeSet::new();
-            while let Some(packed) = keys.next_key()? {
-                if prev.as_deref() == Some(packed.as_slice()) {
+            while let Some(item) = keys.next_key()? {
+                let entry = decode_entry(&item)?;
+                if prev.as_ref() == Some(&entry) {
                     continue;
                 }
                 if ix.unique() {
                     if let Some(p) = &prev {
-                        let (pk, _) = unpack_entry(p);
-                        let (k, _) = unpack_entry(&packed);
-                        if pk == k {
-                            dups.insert(k.to_vec());
+                        if let (Some(pk), Some(k)) = (
+                            ixkeys::entry_prefix(&p.key),
+                            ixkeys::entry_prefix(&entry.key),
+                        ) {
+                            if pk == k {
+                                dups.insert(k.to_vec());
+                            }
                         }
                     }
                 }
-                bytes += packed.len() + 8;
-                chunk.push(packed.clone());
-                prev = Some(packed);
+                bytes += entry.key.len() + entry.type_bits.len();
+                chunk.push(entry.clone());
+                prev = Some(entry);
                 if chunk.len() >= INDEX_BUILD_CHUNK_MAX_ENTRIES
                     || bytes >= INDEX_BUILD_CHUNK_MAX_BYTES
                 {
-                    self.load_entries(b, &ix.name, &chunk)?;
+                    self.load_entries(b, ix, &chunk)?;
                     chunk.clear();
                     bytes = 0;
                     self.check_build(b)?;
                 }
             }
             if !chunk.is_empty() {
-                self.load_entries(b, &ix.name, &chunk)?;
+                self.load_entries(b, ix, &chunk)?;
             }
             b.dup_candidates.lock().unwrap_or_else(|e| e.into_inner())[i].extend(dups);
         }
@@ -1159,13 +1231,14 @@ impl Storage {
     }
 
     /// One bounded transaction of sorted entries.
-    fn load_entries(&self, b: &ActiveBuild, name: &str, chunk: &[Vec<u8>]) -> Result<()> {
+    fn load_entries(&self, b: &ActiveBuild, ix: &BuildIndex, chunk: &[EntryKey]) -> Result<()> {
+        let table = ix.table()?;
         self.retry_write_conflicts("index_build_load", || {
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                let cur = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
-                for packed in chunk {
-                    self.put_index_entry(&session, &cur, &b.db, &b.coll, name, packed)?;
+                let cur = session.open_cursor(&table, Some("overwrite=false"))?;
+                for entry in chunk {
+                    self.put_index_entry(&session, &cur, &b.db, &b.coll, &ix.name, entry)?;
                 }
                 Ok(())
             })
@@ -1194,8 +1267,8 @@ impl Storage {
                     rows.push((k, scan.get_value_u()?));
                     more = scan.next()?;
                 }
-                let entries = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
                 let del = session.open_cursor(SIDE_TABLE, None)?;
+                let mut tables: HashMap<usize, Cursor> = HashMap::new();
                 for (k, v) in &rows {
                     let (op, i, payload) = decode_side(v)?;
                     let Some(ix) = b.indexes.get(i) else {
@@ -1205,23 +1278,43 @@ impl Storage {
                             b.indexes.len()
                         )));
                     };
+                    if matches!(op, b'i' | b'd') && !tables.contains_key(&i) {
+                        tables.insert(
+                            i,
+                            session.open_cursor(&ix.table()?, Some("overwrite=false"))?,
+                        );
+                    }
                     match op {
                         b'i' => {
+                            let entry = decode_entry(payload)?;
                             self.put_index_entry(
-                                &session, &entries, &b.db, &b.coll, &ix.name, payload,
+                                &session,
+                                &tables[&i],
+                                &b.db,
+                                &b.coll,
+                                &ix.name,
+                                &entry,
                             )?;
                             if ix.unique() {
-                                let (esc, rid) = unpack_entry(payload);
-                                let rid = rid.unwrap_or(i64::MIN);
-                                if self.key_held_by_another(&session, b, &ix.name, esc, rid)? {
-                                    b.dup_candidates.lock().unwrap_or_else(|e| e.into_inner())[i]
-                                        .insert(esc.to_vec());
+                                let rid = ixkeys::entry_rid(&entry.key).unwrap_or(i64::MIN);
+                                if let Some(prefix) = ixkeys::entry_prefix(&entry.key) {
+                                    if self.key_held_by_another(&session, ix, prefix, rid)? {
+                                        b.dup_candidates.lock().unwrap_or_else(|e| e.into_inner())
+                                            [i]
+                                            .insert(prefix.to_vec());
+                                    }
                                 }
                             }
                         }
                         b'd' => {
+                            let entry = decode_entry(payload)?;
                             self.drop_index_entry(
-                                &session, &entries, &b.db, &b.coll, &ix.name, payload,
+                                &session,
+                                &tables[&i],
+                                &b.db,
+                                &b.coll,
+                                &ix.name,
+                                &entry.key,
                             )?;
                         }
                         b's' => {
@@ -1250,48 +1343,40 @@ impl Storage {
         })
     }
 
-    /// Whether an entry of `name` other than RecordId `rid`'s holds the
-    /// escaped key `esc`.
+    /// Whether an entry of `ix` other than RecordId `rid`'s holds the key
+    /// whose KeyString (with its end byte, no RecordId) is `prefix`.
     fn key_held_by_another(
         &self,
         session: &Session,
-        b: &ActiveBuild,
-        name: &str,
-        esc: &[u8],
+        ix: &BuildIndex,
+        prefix: &[u8],
         rid: i64,
     ) -> Result<bool> {
         Ok(self
-            .rids_holding(session, b, name, esc, 2)?
+            .rids_holding(session, ix, prefix, 2)?
             .iter()
             .any(|r| *r != rid))
     }
 
-    /// Up to `max` RecordIds whose entries of `name` hold the escaped key
-    /// `esc`.
+    /// Up to `max` RecordIds whose entries of `ix` hold the key whose
+    /// KeyString is `prefix`.
     fn rids_holding(
         &self,
         session: &Session,
-        b: &ActiveBuild,
-        name: &str,
-        esc: &[u8],
+        ix: &BuildIndex,
+        prefix: &[u8],
         max: usize,
     ) -> Result<Vec<i64>> {
-        let mut prefix = esc.to_vec();
-        prefix.extend_from_slice(ENTRY_SEP);
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
-        cur.set_key_sssu(&b.db, &b.coll, name, &prefix);
-        let mut more = match cur.search_near() {
-            Ok(cmp) => cmp >= 0 || cur.next()?,
-            Err(e) if e.is_not_found() => false,
-            Err(e) => return Err(e.into()),
-        };
+        let cur = session.open_cursor(&ix.table()?, None)?;
+        let mut more = seek_ge(&cur, prefix)?;
         let mut out = Vec::new();
         while more && out.len() < max {
-            let (d, c, n, packed) = cur.get_key_sssu()?;
-            if d != b.db || c != b.coll || n != name || !packed.starts_with(&prefix) {
+            let (starts, rid) =
+                cur.with_key_u(|key| (key.starts_with(prefix), ixkeys::entry_rid(key)))?;
+            if !starts {
                 break;
             }
-            if let (_, Some(r)) = unpack_entry(&packed) {
+            if let Some(r) = rid {
                 out.push(r);
             }
             more = cur.next()?;
@@ -1340,9 +1425,13 @@ impl Storage {
         self.retry_write_conflicts("index_build_skipped", || {
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                let entries = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
+                let mut tables: HashMap<usize, Cursor> = HashMap::new();
                 for &(i, rid) in &skipped {
                     let ix = &b.indexes[i];
+                    if let std::collections::hash_map::Entry::Vacant(slot) = tables.entry(i) {
+                        slot.insert(session.open_cursor(&ix.table()?, Some("overwrite=false"))?);
+                    }
+                    let entries = &tables[&i];
                     let Some(d) = self.build_doc_at(&session, b, rid)? else {
                         continue;
                     };
@@ -1355,15 +1444,14 @@ impl Storage {
                             exec: false,
                         });
                     }
-                    for packed in self.packed_entry_keys(&d, &ix.desc, rid)? {
-                        self.put_index_entry(
-                            &session, &entries, &b.db, &b.coll, &ix.name, &packed,
-                        )?;
+                    for entry in self.packed_entry_keys(&d, &ix.desc, rid)? {
+                        self.put_index_entry(&session, entries, &b.db, &b.coll, &ix.name, &entry)?;
                         if ix.unique() {
-                            let (esc, _) = unpack_entry(&packed);
-                            if self.key_held_by_another(&session, b, &ix.name, esc, rid)? {
-                                b.dup_candidates.lock().unwrap_or_else(|e| e.into_inner())[i]
-                                    .insert(esc.to_vec());
+                            if let Some(prefix) = ixkeys::entry_prefix(&entry.key) {
+                                if self.key_held_by_another(&session, ix, prefix, rid)? {
+                                    b.dup_candidates.lock().unwrap_or_else(|e| e.into_inner())[i]
+                                        .insert(prefix.to_vec());
+                                }
                             }
                         }
                     }
@@ -1385,15 +1473,25 @@ impl Storage {
         let session = self.conn.open_session()?;
         for (i, keys) in candidates.iter().enumerate() {
             let ix = &b.indexes[i];
-            for esc in keys {
-                let rids = self.rids_holding(&session, b, &ix.name, esc, 2)?;
+            let shape = ix.desc.shape();
+            for prefix in keys {
+                let rids = self.rids_holding(&session, ix, prefix, 2)?;
                 if rids.len() < 2 {
                     continue;
                 }
                 let Some(d) = self.build_doc_at(&session, b, rids[0])? else {
                     continue;
                 };
-                let kb = unescape_kb(esc);
+                // The sort key of the document's own key that this entry is.
+                let Some(kb) = ix
+                    .desc
+                    .key_values(&d, ix.desc.sparse)?
+                    .into_iter()
+                    .find(|(_, values)| shape.exact(values).is_ok_and(|e| e == *prefix))
+                    .map(|(kb, _)| kb)
+                else {
+                    continue;
+                };
                 return Err(StorageError::DuplicateKey(Box::new(with_bindata_order(
                     ix.desc.key_order,
                     || {
@@ -1415,23 +1513,10 @@ impl Storage {
     /// Remove an aborted build's entries and recorded writes, in bounded
     /// transactions.
     fn discard_build_rows(&self, b: &ActiveBuild) -> Result<()> {
+        // Each index's entries are in a table of its own, which nothing lists.
         for ix in &b.indexes {
-            loop {
-                let removed = self.retry_write_conflicts("abort_index_build", || {
-                    let session = self.op_session()?;
-                    self.with_statement_txn(&session, || {
-                        self.delete_entries_prefix_upto(
-                            &session,
-                            &b.db,
-                            &b.coll,
-                            &ix.name,
-                            Some(PURGE_CHUNK_MAX_ROWS),
-                        )
-                    })
-                })?;
-                if removed < PURGE_CHUNK_MAX_ROWS {
-                    break;
-                }
+            if let Some(ident) = ix.ident.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                self.drop_ident_table(&ident);
             }
         }
         self.discard_side_rows(&b.uuid)
@@ -1748,10 +1833,13 @@ mod tests {
 
     #[test]
     fn a_side_write_reads_back() {
-        let packed = pack_entry(b"key", 7);
-        let v = encode_side(3, &SideOp::Insert(&packed));
+        let entry = KeyShape::plain()
+            .entry(&[Bson::String("key".into())], 7)
+            .unwrap();
+        let v = encode_side(3, &SideOp::Insert(&entry));
         let (op, i, p) = decode_side(&v).unwrap();
-        assert_eq!((op, i, p), (b'i', 3, packed.as_slice()));
+        assert_eq!((op, i), (b'i', 3));
+        assert_eq!(decode_entry(p).unwrap(), entry);
         let v = encode_side(1, &SideOp::Skipped(42));
         let (op, i, p) = decode_side(&v).unwrap();
         assert_eq!(

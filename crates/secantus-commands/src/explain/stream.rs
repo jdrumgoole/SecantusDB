@@ -60,7 +60,7 @@ use secantus_core::sortkey::{self, COMPOUND_SEP};
 
 use super::exec::{contiguous, outside_of, ranges, reversed_key, Ranges};
 use super::node::{num, IxScan, Node, Stats, WorkCounts};
-use crate::storage::{Storage, StorageError};
+use crate::storage::{IndexEntry, IndexFrom, Storage, StorageError};
 
 /// How many index entries or documents one read of the store takes.
 const CHUNK: usize = 256;
@@ -291,6 +291,8 @@ fn holds_entry(entry: &EntryKey, blob: &[u8]) -> Result<bool, StorageError> {
 /// ascending key and each field's key in SCAN order.
 struct Entry {
     raw: Vec<u8>,
+    /// Where a read resumes after this entry.
+    resume: Vec<u8>,
     rid: i64,
     asc: Vec<Vec<u8>>,
     scan: Vec<Vec<u8>>,
@@ -310,14 +312,22 @@ enum Limits {
     },
 }
 
+/// Where an index scan starts: the index's own edge, a raw `_id` key, or
+/// the values of the first entries it can need.
+enum Start {
+    Edge,
+    Raw(Vec<u8>),
+    Values(Vec<Bson>),
+}
+
 /// An index scan's bounds and position.
 struct IndexScan {
     meta: Arc<IndexMeta>,
     /// Last entry first.
     backward: bool,
     limits: Limits,
-    /// Where the scan starts, as the entries hold it.
-    start: Vec<u8>,
+    /// Where the scan starts.
+    start: Start,
     done: bool,
     /// The last entry the scan consumed: where the next read resumes.
     last: Option<(Vec<u8>, i64)>,
@@ -401,15 +411,17 @@ impl IndexScan {
     }
 
     fn refill(&mut self, cx: &Cx) -> Result<(), StorageError> {
-        let (from, after) = match &self.last {
-            Some((raw, rid)) => (raw.clone(), Some(*rid)),
-            None => (self.start.clone(), None),
+        let (from, after) = match (&self.last, &self.start) {
+            (Some((resume, rid)), _) => (IndexFrom::Resume(resume), Some(*rid)),
+            (None, Start::Edge) => (IndexFrom::Edge, None),
+            (None, Start::Raw(raw)) => (IndexFrom::Raw(raw), None),
+            (None, Start::Values(values)) => (IndexFrom::Values(values), None),
         };
         let Some(rows) = cx.storage.index_entries_from(
             cx.db,
             cx.coll,
             &self.meta.name,
-            &from,
+            from,
             after,
             self.chunk,
             self.backward,
@@ -429,7 +441,7 @@ impl IndexScan {
                 self.meta.name
             ))
         };
-        for (raw, rid) in rows {
+        for IndexEntry { raw, rid, resume } in rows {
             if let Some(read) = self.read.as_mut() {
                 read.push(rid);
             }
@@ -456,6 +468,7 @@ impl IndexScan {
                 .collect();
             self.buf.push_back(Entry {
                 raw,
+                resume,
                 rid,
                 asc,
                 scan,
@@ -467,7 +480,7 @@ impl IndexScan {
     /// Consume the front entry: the scan's position moves past it.
     fn pop(&mut self) -> Option<Entry> {
         let e = self.buf.pop_front()?;
-        self.last = Some((e.raw.clone(), e.rid));
+        self.last = Some((e.resume.clone(), e.rid));
         Some(e)
     }
 
@@ -1826,17 +1839,21 @@ fn index_scan(ix: &IxScan, opts: &Options) -> Result<Option<IndexScan>, StorageE
         let (Ok(min), Ok(max)) = (bound(opts.min), bound(opts.max)) else {
             return Ok(None);
         };
-        let start = if ix.backward {
-            max.clone().unwrap_or_default()
-        } else {
-            min.clone().unwrap_or_default()
-        };
         // Walking down from `max`, the store's seek starts past every entry
         // of that key; with no `max`, at the end of the index.
-        let start = if ix.backward && max.is_none() {
-            vec![0xFF]
-        } else {
-            start
+        let start_doc = if ix.backward { opts.max } else { opts.min };
+        let start = match start_doc {
+            None if id && ix.backward => Start::Raw(vec![0xFF]),
+            None => Start::Edge,
+            Some(_) if id => Start::Raw(
+                if ix.backward {
+                    max.clone()
+                } else {
+                    min.clone()
+                }
+                .unwrap_or_default(),
+            ),
+            Some(d) => Start::Values(d.values().cloned().collect()),
         };
         (Limits::MinMax { min, max }, start, false)
     } else {
@@ -1864,10 +1881,11 @@ fn index_scan(ix: &IxScan, opts: &Options) -> Result<Option<IndexScan>, StorageE
         }
         let done = ranges.iter().any(Vec::is_empty) || firsts.len() != dirs.len();
         let start = if done {
-            Vec::new()
+            Start::Edge
         } else {
             match join(&firsts) {
-                Some(s) => s,
+                Some(raw) if id => Start::Raw(raw),
+                Some(_) => Start::Values(firsts.iter().map(|(v, _)| v.clone()).collect()),
                 None => return Ok(None),
             }
         };
