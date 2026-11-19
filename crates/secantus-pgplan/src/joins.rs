@@ -4038,6 +4038,18 @@ pub fn plain_call_procost(f: &pg_query::protobuf::FuncCall) -> Option<f64> {
     crate::sort_input::builtin_uniform_procost(&name)
 }
 
+/// [`plain_call_procost`] of a planned column call (`ColumnExpr::Call`):
+/// `name` over `nargs` arguments, the column one of them (RP-1036). `None`
+/// for a name that is not a non-volatile built-in of one `procost`.
+pub fn column_call_procost(name: &str, nargs: usize) -> Option<f64> {
+    if !crate::funcsig::is_builtin_function_name(name)
+        || crate::correlated::volatile_builtin(name, nargs)
+    {
+        return None;
+    }
+    crate::sort_input::builtin_uniform_procost(name)
+}
+
 /// What `cost_qual_eval` charges `n`, an index qual's other operand, once
 /// a scan (`index_other_operands_eval_cost`), in `cpu_operator_cost`
 /// units: [`qual_operators`]' operators and each call's `procost`. `None`

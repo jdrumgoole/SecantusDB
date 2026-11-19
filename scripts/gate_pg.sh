@@ -149,7 +149,7 @@ else
         tests/test_rust_pgserver_slice.py tests/test_rust_pgserver_differential.py \
         tests/test_rust_pg_binary_smoke.py tests/test_rust_pg_builtin_coverage.py \
         tests/test_rust_pg_dollar_names.py tests/test_rust_pg_corpora.py \
-        tests/test_rust_pg_rule_trees.py \
+        tests/test_rust_pg_rule_trees.py tests/test_rust_pg_bpchar_key.py \
         -q -n 4 --dist worksteal -rs -p no:cacheprovider
 fi
 

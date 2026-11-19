@@ -36,10 +36,28 @@ pub(crate) fn field_index(field: &str) -> Option<(String, Vec<String>)> {
     FIELDS.with(|f| f.borrow().get(field).cloned())
 }
 
+/// Whether an index key `sql` (planned as `expr`) is a `bpchar`: a bare
+/// `bpchar` column, or an expression of that type. Such a key compares by
+/// `bpcharcmp`, its trailing blanks ignored (RP-693).
+pub(crate) fn is_bpchar_key(def: &TableDef, sql: &str, expr: &secantus_pgplan::ColumnExpr) -> bool {
+    let bare = sql
+        .strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .map_or_else(|| sql.to_string(), |r| r.replace("\"\"", "\""));
+    def.column(&bare).map_or_else(
+        || secantus_pgplan::column_expr_type(expr) == "bpchar",
+        |c| c.pg_type == "bpchar",
+    )
+}
+
 /// One expression index, its expressions planned once.
 pub(crate) struct ExprIndex {
     pub field: String,
     exprs: Vec<secantus_pgplan::ColumnExpr>,
+    /// Per expression, whether its key is a `bpchar`: keyed with its
+    /// trailing blanks trimmed (`bcTruelen`), as `bpcharcmp` compares
+    /// (RP-693).
+    bpchar: Vec<bool>,
     predicate: Option<secantus_pgplan::ColumnExpr>,
     /// `NULLS NOT DISTINCT`: a NULL value is a key like any other.
     nulls_not_distinct: bool,
@@ -56,8 +74,12 @@ impl ExprIndex {
             }
         }
         let mut values = Vec::with_capacity(self.exprs.len());
-        for e in &self.exprs {
+        for (e, bpchar) in self.exprs.iter().zip(&self.bpchar) {
             let v = secantus_pgplan::apply_row_expr(e, row).map_err(|e| PgHandler::err(&e))?;
+            let v = match v {
+                Bson::String(s) if *bpchar => Bson::String(s.trim_end_matches(' ').to_string()),
+                v => v,
+            };
             if v == Bson::Null && !self.nulls_not_distinct {
                 return Ok(None);
             }
@@ -99,6 +121,11 @@ impl PgHandler {
                 .iter()
                 .map(|e| secantus_pgplan::plan_check_expression(e, def).map_err(|e| Self::err(&e)))
                 .collect::<PgWireResult<Vec<_>>>()?;
+            let bpchar = exprs
+                .iter()
+                .zip(&planned)
+                .map(|(sql, e)| is_bpchar_key(def, sql, e))
+                .collect();
             let predicate = ix
                 .get_str("sqlPredicate")
                 .ok()
@@ -112,6 +139,7 @@ impl PgHandler {
             out.push(ExprIndex {
                 field: Self::expression_index_field(&name),
                 exprs: planned,
+                bpchar,
                 predicate,
                 nulls_not_distinct: crate::nulls_not_distinct(ix),
             });
@@ -145,13 +173,17 @@ impl PgHandler {
             return Ok(rows);
         };
         let indexes = self.expr_indexes(&def)?;
-        if indexes.is_empty() {
+        let keyed = def.has_bpchar_key();
+        if indexes.is_empty() && !keyed {
             return Ok(rows);
         }
         rows.into_iter()
             .map(|raw| {
                 let mut d =
                     decode_doc(&raw).map_err(|e| Self::storage_err("could not read a row", e))?;
+                // A `bpchar` key is trimmed however the row was built
+                // (COPY included; RP-693).
+                def.derive_bpchar_keys(&mut d);
                 Self::fill_expr_fields(&indexes, &mut d)?;
                 encode_doc(&d).map_err(|e| Self::storage_err("could not encode a row", e))
             })
@@ -185,20 +217,29 @@ impl PgHandler {
         table: &str,
         rows: impl Iterator<Item = std::borrow::Cow<'a, Document>>,
     ) -> PgWireResult<Vec<(Vec<u8>, Document)>> {
-        let indexes = match self.lookup_ref(table) {
-            Some(def) => self.expr_indexes(&def)?,
+        let def = self.lookup_ref(table);
+        let indexes = match &def {
+            Some(def) => self.expr_indexes(def)?,
             None => Vec::new(),
         };
+        let keyed = def.as_ref().filter(|d| d.has_bpchar_key());
         rows.map(|row| {
             // With expression indexes, the row as `with_expr_fields`
             // reads it back from its encoding, and fills.
             let filled = if indexes.is_empty() {
-                None
+                keyed.map(|def| {
+                    let mut d = row.clone().into_owned();
+                    def.derive_bpchar_keys(&mut d);
+                    d
+                })
             } else {
                 let raw = crate::encode_doc(&row)
                     .map_err(|e| Self::storage_err("could not encode a row", e))?;
                 let mut d =
                     decode_doc(&raw).map_err(|e| Self::storage_err("could not read a row", e))?;
+                if let Some(def) = keyed {
+                    def.derive_bpchar_keys(&mut d);
+                }
                 Self::fill_expr_fields(&indexes, &mut d)?;
                 Some(d)
             };

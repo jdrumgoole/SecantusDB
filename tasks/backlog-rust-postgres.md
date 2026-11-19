@@ -1127,6 +1127,25 @@ one beside it.
 
 ## Found while working RP-911 (2026-11-15)
 
+## Found while fixing the RP-911 latency test's noise (2026-11-19)
+
+- [ ] **OPEN — the first catalog query after a `CREATE TABLE` still grows
+      with the schema, about 0.9 ms per thousand tables (debug build).**
+      psql's `\d` collation query, run straight after a `CREATE TABLE`:
+      11.5 ms with no other table, 11.8 ms with 800, 13.5 ms with 2,400 and
+      15.9 ms with 4,800 (one debug `secantusd-pg`, arm64 macOS). PostgreSQL
+      15.19 takes the same time at any size: DDL invalidates only the cache
+      entries it changed (`inval.c`) and its scans read one relation's rows
+      by index. A sample at 8,000 tables shows whole-schema walks per
+      statement: `install_user_types` -> `install_session_state`
+      (`committed_table_defs`, `patch_table_defs`) and `publish_user_types`
+      -> `index_relations` -> `derive_index_relations`, which visits every
+      table's columns; and `catalog_rows_keyed` -> `build_catalog_rows`.
+      Which of these grow is not yet split out: profile 0 against 8,000
+      tables before changing one.
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth
+      Backlog-ID: RP-1073
+
 ## Found while working RP-970 (2026-11-18)
 
 - [ ] **OPEN — `'_custom'::regtype` names `custom`'s array, not the type
@@ -2281,71 +2300,126 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       KEY / UNIQUE / index is keyed by the value with trailing blanks
       trimmed (`bpchareq` / `bcTruelen`), while the row keeps the value as
       written.** Steps: (1) a `bpchar` PRIMARY KEY's `_id` trimmed, the
-      row's value as written, and every read / lookup path that builds
-      that key; (2) UNIQUE; (3) ON CONFLICT; (4) an indexed and a
-      pushed-down `=`; (5) the write keeping the blanks of every unsized
-      `bpchar` column. None has landed.
-      Probed 2026-11-18 on 15.19 and this server (step-1 session, no code
-      changed): `create table p2 (a bpchar primary key, b int)`, insert
-      `'k  '`, then `'k'` is 23505 on both, `on conflict (a) do update`
-      keeps the stored `'k  '` on 15.19, and `where a = 'k'`, `where a =
-      'k   '::bpchar`, `update ... where a='k'` and `delete ... where a='k '`
-      each find the row on both. The ONE difference: `octet_length(a)` is 3
-      on 15.19 and 1 here. A `char(3)` PRIMARY KEY already answers like
-      15.19 (stored trimmed, padded on output), so step 1 is about unsized
-      `bpchar` (and a `bpchar` member of a composite key) only.
-      Why step 1 is not one session: the PK column's stored field IS `_id`
-      (`field_for`), so a trimmed key and an as-written value need two
-      fields. Design for step 1: such a column gets `field_override` =
-      its name (holding the value as written) and `_id` (`_id.<name>` in a
-      composite key) becomes a derived key, `trim_end(' ')` of it, written
-      by the insert / update / COPY paths. Every site that equates "PK" with
-      "`_id`" then has to read the override: `encode_doc` (34 call sites),
-      `decode_doc` (53) and `row_id` (15) take no `TableDef`; lib.rs ~28847
-      and secantus-pgplan lib.rs ~15840 read `pk && field_override.is_some()`
-      as "composite key"; `heap.rs` and `btree.rs` (the page models) build
-      the key from `_id`; and the PK point lookup (`portal_stream.rs`
-      `primary_key_point`), ON CONFLICT, the FK checks and `insert_key_eq`
-      filter on `_id` with the probe value, which must be trimmed. A
-      pushed-down `=` on the column must go to `_id` with the trimmed
-      literal, since the stored field then holds blanks.
-      Stores written before step 1 (decided in that session): every
-      `bpchar` value this server has written since it gained `char(n)`
-      (#1654) went through `cast_value`'s trim, so an existing `_id` is
-      already the trimmed key and its value has already lost its blanks,
-      which no reader can restore. Such a table keeps its catalog entry
-      without the override and reads back as it always has; only a table
-      created after step 1 gets the two-field layout. An untrimmed `_id`
-      can only come from the MongoDB server writing the collection, which
-      is the MongoDB -> SQL hand-off CLAUDE.md says does not work, so the
-      PG server does not answer for it.
-      **Decision needed (step-2 session, 2026-11-18, no code changed):
-      how step 2 enforces UNIQUE.** The session was asked for UNIQUE
-      through `value_unique` / `check_collated_unique`. That check reads
-      every stored row before the write, and `unique_indexes`' own comment
-      (secantus-pg lib.rs ~28640) says why a read-before-write "cannot
-      uphold a constraint": it misses a value another transaction committed
-      after the snapshot or is inserting now, so the storage unique index
-      is the arbiter. Today that index still catches `'k'` / `'k  '`
-      because every write trims, so the gap opens only at step 5. ON
-      CONFLICT has the same dependency: `insert_on_conflict` finds the
-      conflict from the storage index's E11000 and probes with an exact
-      `find_matching`, so neither path sees a blank-only difference.
-      Options, most faithful first: (a) back a `bpchar` UNIQUE with a
-      storage unique index over a derived field holding the trimmed value
-      (the `expr_index` mechanism a UNIQUE expression index already uses),
-      which is PostgreSQL's btree over `bpcharcmp`, matches step 1's
-      trimmed `_id`, gives ON CONFLICT its E11000 and arbiter probe on that
-      field, and is the index step 4's `=` can use; an on-disk change for
-      tables created after it. (b) `value_unique` as asked: a full scan per
-      write and per row of a COPY, racy under concurrency. Neither changes
-      an answer before step 5. Probed on 15.19: `'k  '` then `'k'` into
-      an unsized `bpchar` UNIQUE is 23505 `Key (a)=(k)`, and `on conflict
-      (a) do update set b = excluded.b` updates the stored row, which
-      keeps `octet_length(a)` 3 (the regression tests for step 2 should
-      pin both).
+      row's value as written -- LANDED 2026-11-18, below; (2) UNIQUE --
+      LANDED 2026-11-18, below; (3)
+      ON CONFLICT on a UNIQUE arbiter -- LANDED 2026-11-18, below; (4) an indexed and a pushed-down
+      `=` -- LANDED 2026-11-18, below; (5) the write keeping the blanks of every unsized `bpchar`
+      column.
+      Step 1 as built (2026-11-18): a single-column unsized `bpchar`
+      PRIMARY KEY made by CREATE TABLE gets `field_override` = its own
+      name (`Column::is_written_bpchar_key`; the catalog's `field` is the
+      name, so it survives a restart), holding the value as written, and
+      `_id` is derived trimmed by `TableDef::derive_bpchar_keys` on every
+      write (`insert_row_typed`, the UPDATE SET list and per-row `after`,
+      `with_expr_fields` / `stored_rows_of`, which COPY reaches). ON
+      CONFLICT's `arbiter_key` and the foreign-key fields (`fk_fields`)
+      use `_id` for such a column; a predicate on it is evaluated per row
+      (`keeps_bpchar_blanks`), so an `=` on it scans until step 4.
+      `derive_bpchar_keys` also trims, in place, every other `bpchar` key
+      field: COPY had written `'w  '` untrimmed into the key of a
+      `char(n)`, a composite or an ALTER-added unsized key, so a later
+      `'w'` did not collide (23505 on 15.19). Still on the old, trimmed
+      layout (key right, value without its blanks): a `bpchar` member of
+      a COMPOSITE key (`primary key (a, b)` over two unsized `bpchar`:
+      `octet_length` of `'a '` is 2 on 15.19, 1 here) and a key added by
+      `ALTER TABLE ... ADD PRIMARY KEY` (its rows move into `_id`); both
+      go with step 5, which keeps the blanks of the non-key column they
+      start from. The page models (`heap.rs`, `btree.rs`) still size a
+      key from `_id`, trimmed, where PostgreSQL's index tuple holds the
+      value as written: unprobed, check with `bt_page_items` at step 4.
+      Tests: `tests/test_rust_pg_bpchar_key.py`, and
+      `bpchar_key_tests` in secantus-pgcatalog.
+      Stores written before step 1: every `bpchar` value this server wrote
+      went through `cast_value`'s trim, so an existing `_id` is already the
+      trimmed key and the value has lost its blanks, which no reader can
+      restore. Such a table's catalog names `_id` as the key's field, so it
+      keeps that layout and reads back as it always has (measured with the
+      pre-change binary's store; pinned by
+      `a_key_stored_before_the_layout_stays_in_id`). An untrimmed `_id`
+      can only come from the MongoDB server writing the collection, the
+      MongoDB -> SQL hand-off CLAUDE.md says does not work.
+      **Decided (Joe, 2026-11-18, replacing the step-2 'Decision needed'):
+      option (a), a storage unique index over a derived field holding the
+      trimmed value (PostgreSQL's btree over `bpcharcmp`)**, not
+      `value_unique`'s read-before-write, which misses a concurrent writer.
+      Step 2 as built (2026-11-18): a UNIQUE constraint (CREATE TABLE or
+      ALTER TABLE ADD) or a CREATE UNIQUE INDEX with an unsized `bpchar`
+      column is an expression index over the bare quoted columns
+      (`unique_needs_expression`, the route a `"dot.s"` column already
+      took), and `ExprIndex` keys every `bpchar` key -- a bare `bpchar`
+      column or a `bpchar`-typed expression (`expr_index::is_bpchar_key`)
+      -- with its trailing blanks trimmed; `sqlKeys` / `sqlExpressions`
+      stay the column, so `pg_index` (`indkey`, no `indexprs`),
+      `pg_indexes` and `\d` match 15.19. The build's pre-checks
+      (`check_existing_unique`, `expression_key`) compare `bpchar` trimmed
+      and report the row stored first, as written (`Key (a)=(k  ) is
+      duplicated.` on 15.19); before, a CREATE UNIQUE INDEX over a COPYed
+      `'k  '` and an inserted `'k'` left the index behind. Tests: the
+      step-2 tests in `tests/test_rust_pg_bpchar_key.py`. A table whose
+      UNIQUE was made before step 2 keeps its plain storage index, which
+      is right while every write trims; step 5 must rebuild such an index
+      as the expression index before the write keeps blanks. ON CONFLICT
+      on such a UNIQUE arbitrated correctly only while the stored value
+      was trimmed. Step 3 as built (2026-11-18): an ON CONFLICT target
+      that is such a UNIQUE -- a column list, `on constraint`, or a column
+      list inferring a (partial) CREATE UNIQUE INDEX -- arbitrates on the
+      expression index's trimmed field (`expression_arbiter`), not on the
+      column's value: over a COPYed `'w  '`, `'w'` had been 23505 under a
+      constraint and 42P10 (no arbiter) under a unique index. A UNIQUE made
+      before step 2 falls back to the column. Tests: the step-3 tests in
+      `tests/test_rust_pg_bpchar_key.py`. Still unpinned until step 5: 15.19's DETAIL for a
+      UNIQUE collision shows the NEW row's key as written (`Key (a)=(k  )
+      already exists.` for `'k'` then `'k  '`), and the ON CONFLICT row
+      keeps `octet_length(a)` 3.
+      Step 4 as built (2026-11-18): a top-level comparison of a bare
+      `bpchar` column against a constant reads its trimmed key when it has
+      one -- `_id` for a written `bpchar` PRIMARY KEY, the step-2
+      expression index's field for a UNIQUE (`expr_where::rewrite`, which
+      already served `lower(t) = 'x'`) -- as a `bpchar` field, so the
+      constant is trimmed (`bpchar_operand`) and the filter is `bpchareq`
+      / `bpcharlt` pushed down, or a text comparison against a `text`
+      constant, the field being exactly `a::text`. EXPLAIN shows `Index
+      Scan using t_pkey` / `t_a_key` as 15.19 does (was `Seq Scan`). An
+      OR, or a column with no trimmed key, is still evaluated per row
+      (`keeps_bpchar_blanks`). Left for step 5: a plain (non-unique)
+      CREATE INDEX on an unsized `bpchar` is a storage index over the
+      value, right only while every write trims; it must become a trimmed
+      key, as a UNIQUE made before step 2 must, before the write keeps
+      blanks. An `=` ANDed with another filter is a Seq Scan in EXPLAIN
+      for every index (RP-1070). Tests: the step-4 test in
+      `tests/test_rust_pg_bpchar_key.py`.
       Verify: tests/backlog/test_rp_found_rp672.py::test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks
       Backlog-ID: RP-693
+
+## Found while working RP-693 (2026-11-18)
+
+Measured on PostgreSQL 15.19 (port 5415) over a scratch table. The gap
+test is in `tests/backlog/test_rp_found_rp693.py`.
+
+- [ ] **OPEN -- COPY in autocommit leaves its xid running, so the next
+      statement shares it.** After `copy t from stdin` the copied row's
+      `xmin` is the xid `txid_current()` then returns (730 and 730 here;
+      15.19 6257 then 6258), and an `insert ... on conflict (a) do update`
+      over the copied row is refused 21000 ("cannot affect row a second
+      time"; 15.19 updates it), because `written_by_this_command` sees its
+      own xid and cid on the row. `on_copy_done` commits the COPY's own
+      storage transaction but does not end the statement's transaction
+      state (`xids::end`, the table locks, `ssi_end`) as the implicit
+      transaction's end does (lib.rs ~35855); the statement after it ends
+      it instead.
+      Verify: tests/backlog/test_rp_found_rp693.py::test_copy_completes_its_own_xid
+      Backlog-ID: RP-1069
+
+- [ ] **OPEN -- EXPLAIN shows a Seq Scan for an indexed `=` ANDed with a
+      filter.** `explain (costs off) select b from tp where a = 'x1' and
+      b < 0` over a 2,000-row `text` PRIMARY KEY (analyzed) is `Seq Scan
+      on tp / Filter: ((b < 0) AND (a = 'x1'::text))` here; 15.19 is `Index
+      Scan using tp_pkey on tp / Index Cond: (a = 'x1'::text) / Filter:
+      (b < 0)`. The `=` alone is an Index Scan on both; an expression index
+      (`lower(t) = 'x1' and b < 0`) and a `bpchar` key (RP-693 step 4) show
+      the same Seq Scan. Only the plan text differs: the rows are right.
+      Verify: tests/backlog/test_rp_found_rp693.py::test_explain_indexed_equality_with_a_filter
+      Backlog-ID: RP-1070
 
 ## Found while working RP-665 (2026-11-10)
 
@@ -2874,54 +2948,47 @@ statement is VALUES-only and runs there as written. The gap test is in
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by on a column only a computed entry reads names the column]
       Backlog-ID: RP-1066
 
-- [ ] **A Sort under a select list that calls a function is not
-      priced.** Since RP-966, RP-1025 and RP-1036 a Sort (and a Limit
-      above it) straight over one relation's scan is priced with computed
-      keys -- operators and built-in calls at their `procost` -- and
-      computed select-list entries made of operators (a key equal to one
-      shares it). Still `cost=0.00..0.00`: a select-list entry that calls
-      a function, `select upper(b) from e order by lower(b)` (PostgreSQL
-      15.19 `Sort (cost=69.83..72.33 rows=1000 width=64)` over `Seq Scan
-      on e (cost=0.00..20.00 rows=1000 width=64)`): `target_cost` prices a
-      select-list entry with `row_expr_ops`, which declines calls (the
-      sort key's `expr_ops(.., true)` prices them). Widening it reaches
-      every plan `target_cost` prices, and `make_sort_input_target`
-      postpones an expensive entry above the Sort under a LIMIT.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sort under a select list calling a function is priced]
-      Backlog-ID: RP-1036
-
 - [ ] **A join on an expression key PostgreSQL prices is unpriced in
-      three shapes.** Since RP-981 a join of two analysed tables on one
+      two shapes.** Since RP-981 a join of two analysed tables on one
       equality between a column and an operator expression over one column
       of the other is a priced Hash Join (inner, LEFT, anti), hashing the
-      side whose key has statistics. Still a `Nested Loop` with `Join
-      Filter` and zero costs: against a unique column, `select * from e join
-      k on k.a = e.a - 1` (PostgreSQL 15.19 `Hash Join (cost=27.50..45.26
-      rows=1000 width=14)` hashing `k`, inner unique; `hash_join_of`'s
-      unique-key paths are not modelled over an expression); where the
-      merge wins, `e.b = e2.b || 'x'` over a ten-value column (`Merge Join
-      (cost=129.66..224.66 rows=5000 width=14)`, the expression's Sort Key
-      `((e2.b || 'x'::text))`; priced with `mergejoinscansel`'s defaults
-      and declined, the plan is not drawn); and across types, `e.a::bigint =
-      e2.a` (`Hash Join (cost=27.50..57.50 rows=1000 width=14)`; declined on
-      `pg_type`). An aggregate over such a join (`select count(*)`) and a
-      LEFT join filtered on a column not its key (`where e2.b is null`, a
-      `Hash Right Join` with `Filter`) stay unpriced as they do over a
-      column key. Measured on the 15.19 reference on port 5415.
-      Where each declines (read 2026-11-18, while working RP-1025/1036/
-      1038/1039): the unique column in `hash_join_of`'s `if unique_key &&
-      (redundant || expr_key) { return None }` -- `unique_key_other_paths`
-      would need the column side's index probed by the expression (its
-      param scan and Memoize keyed on an expression with no statistics,
-      200 distinct) and a merge sorting the expression side against the
-      presorted index; the merge at the end of `hash_join_of` (`expr_key
-      && JoinPick::Merge`), which needs the plan drawn with the
-      expression's Sort Key and `Merge Cond: (e.b = ((e2.b ||
-      'x'::text)))`; the cross-type one at its `a.pg_type != b.pg_type`
-      check, where `int8 = int4` is one integer opfamily's hashable
-      operator.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an expression key against a unique column is a hash join], tests/backlog/test_rp_explain_costs.py::test_plan[an expression key over a column of few values is a merge join]
+      side whose key has statistics, and since RP-1032 an inner one the
+      merge wins is a priced Merge Join (`e.b = e2.b || 'x'`, the
+      expression's Sort Key `((e2.b || 'x'::text))`). Still a `Nested
+      Loop` with `Join Filter` and zero costs: against a unique column,
+      `select * from e join k on k.a = e.a - 1` (PostgreSQL 15.19 `Hash
+      Join (cost=27.50..45.26 rows=1000 width=14)` hashing `k`, inner
+      unique; `hash_join_of`'s unique-key paths are not modelled over an
+      expression); and across types, `e.a::bigint = e2.a` (`Hash Join
+      (cost=27.50..57.50 rows=1000 width=14)`; declined on `pg_type`). A
+      LEFT join the merge wins is declined at the end of `hash_join_of`
+      (`expr_key && left_join && JoinPick::Merge`), its Merge Left/Right
+      Join not drawn. An aggregate over such a join (`select count(*)`)
+      and a LEFT join filtered on a column not its key (`where e2.b is
+      null`, a `Hash Right Join` with `Filter`) stay unpriced as they do
+      over a column key. Measured on the 15.19 reference on port 5415.
+      Where each declines (read 2026-11-18): the unique column in
+      `hash_join_of`'s `if unique_key && (redundant || expr_key) { return
+      None }` -- `unique_key_other_paths` would need the column side's
+      index probed by the expression (its param scan and Memoize keyed on
+      an expression with no statistics, 200 distinct) and a merge sorting
+      the expression side against the presorted index; the cross-type one
+      at its `a.pg_type != b.pg_type` check, where `int8 = int4` is one
+      integer opfamily's hashable operator.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an expression key against a unique column is a hash join]
       Backlog-ID: RP-1032
+- [ ] **VERBOSE of a merge join prints no `Output`.** `explain verbose
+      select * from e join e e2 on e.b = e2.b || 'x'` prints, in
+      PostgreSQL 15.19, `Output:` on the Merge Join, each Sort and each
+      scan, the expression side's Sort and scan carrying the projected
+      value (`Output: e2.a, e2.b, ((e2.b || 'x'::text))` over `Output:
+      e2.a, e2.b, (e2.b || 'x'::text)`), and the scans as `public.e`.
+      Here the plan prints as without VERBOSE: `attach_verbose_join`
+      handles a hash join and a nested loop only, so a merge on a column
+      key is the same. Measured on the 15.19 reference on port 5415
+      (found while working RP-1032).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[verbose of a merge join on an expression key]
+      Backlog-ID: RP-1071
 - [ ] **ANALYZE of a hash join on an expression key counts nothing below
       it.** `explain (analyze, costs off, timing off, summary off) select *
       from e left join e e2 on e.a = e2.a + 1 where e2.a is null` prints,
@@ -2929,7 +2996,10 @@ statement is VALUES-only and runs there as written. The gap test is in
       Hash's `Buckets: 1024  Batches: 1  Memory Usage: 47kB`; here only the
       join's own `actual rows=1`. `join_analyze` reads the `Hash Cond` as
       two columns. Measured on the 15.19 reference on port 5415 (found
-      while working RP-981).
+      while working RP-981). An inner join on an expression key the merge
+      wins (RP-1032) prints its Merge Join's `actual rows` but none on its
+      Sorts and scans, nor PostgreSQL's `Sort Method: quicksort  Memory:
+      71kB` on each Sort.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an anti join on an expression key]
       Backlog-ID: RP-1033
 - [ ] **A hash join written inner side first is not `Inner Unique`.**

@@ -1845,6 +1845,9 @@ jobs:
           files="$files tests/test_rust_pg_catalog_key_log.py"
           files="$files tests/test_rust_pgserver_relation_names.py"
           files="$files tests/test_rust_pg_type_keyed.py"
+          # A `bpchar` PRIMARY KEY keyed trimmed, its row's value as
+          # written (RP-693), with 15.19's answers written in. Binary only.
+          files="$files tests/test_rust_pg_bpchar_key.py"
           else
           files=""
           # The DIFFERENTIAL suite, whole: 836 cases against the PostgreSQL 14
