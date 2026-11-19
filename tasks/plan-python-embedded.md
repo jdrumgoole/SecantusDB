@@ -1,6 +1,6 @@
 # Plan: an in-process `MongoServer` in the PyPI wheel
 
-Status: **proposed, 2026-11-19.** Asked for by Joe on 2026-11-19: "make it
+Status: **agreed, 2026-11-19** (Joe answered the four open questions the same day; see the end). Asked for by Joe on 2026-11-19: "make it
 the default for python, the subprocess launcher should be an option".
 
 ## Goal
@@ -225,3 +225,19 @@ defaults to an extension the wheel does not ship would fail every
    sequenced after phase 1 if it slows the first release. The committed
    wheel profile (`crates/pgo/_secantus_server.profdata.tar.gz`) is the
    cheaper stopgap.
+
+## Decisions (Joe, 2026-11-19)
+
+All four recommendations taken:
+
+1. **MongoDB only in phase 1.** The extension is built with
+   `--no-default-features`, `PostgresServer` stays a subprocess, and
+   in-process PostgreSQL gets its own plan.
+2. **Fallback wheel, explicit error.** Publish the `py3-none` wheel too.
+   Where the extension is absent, `MongoServer()` raises a named
+   `ServerStartError` pointing at `embedded=False`, never a silent
+   subprocess.
+3. **`embedded=True|False`** is the argument.
+4. **On-target two-stage PGO** for the extension, sequenced after phase 1.
+   Phase 1 ships without PGO (LTO only) rather than wait for it.
+
