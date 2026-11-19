@@ -14,7 +14,12 @@ from pathlib import Path
 
 import pytest
 
-from tests.backlog.test_rm_storage_model import _mongod_on, _stop_mongod, _wait_primary
+from tests.backlog.test_rm_storage_model import (
+    _mongod_answers,
+    _mongod_on,
+    _stop_mongod,
+    _wait_primary,
+)
 
 
 def _pg_store(home: Path) -> None:
@@ -60,15 +65,16 @@ def test_mongod_reads_a_table_the_sql_server_wrote(tmp_path: Path) -> None:
     proc, client = _mongod_on(store)
     try:
         assert client is not None, "mongod refused the store (see its log beside the store)"
-        host, port = client.address or ("127.0.0.1", 0)
-        _wait_primary(client, f"{host}:{port}")
-        coll = client["postgres"]["widgets"]
-        docs = sorted(coll.find({}), key=lambda d: d["_id"])
-        assert docs == [
-            {"_id": 1, "name": "bolt", "qty": 40},
-            {"_id": 2, "name": "nut", "qty": 75},
-        ]
-        result = client["postgres"].command("validate", "widgets", full=True)
-        assert (result["valid"], result["nrecords"]) == (True, 2)
+        with _mongod_answers(store):
+            host, port = client.address or ("127.0.0.1", 0)
+            _wait_primary(client, f"{host}:{port}")
+            coll = client["postgres"]["widgets"]
+            docs = sorted(coll.find({}), key=lambda d: d["_id"])
+            assert docs == [
+                {"_id": 1, "name": "bolt", "qty": 40},
+                {"_id": 2, "name": "nut", "qty": 75},
+            ]
+            result = client["postgres"].command("validate", "widgets", full=True)
+            assert (result["valid"], result["nrecords"]) == (True, 2)
     finally:
         _stop_mongod(proc, client)

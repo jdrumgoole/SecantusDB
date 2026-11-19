@@ -14,6 +14,7 @@ import contextlib
 import socket
 import subprocess
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import bson
@@ -78,6 +79,19 @@ def _mongod_on(dbpath: Path) -> tuple[subprocess.Popen, pymongo.MongoClient | No
         f"mongodb://127.0.0.1:{port}/?directConnection=true", serverSelectionTimeoutMS=10_000
     )
     return proc, client
+
+
+@contextlib.contextmanager
+def _mongod_answers(dbpath: Path) -> Iterator[None]:
+    """Turn a mongod that dropped the connection or refused an operation into
+    an assertion, with the end of its log: a gap test fails on an assert, and
+    mongod failing on our store is the gap."""
+    try:
+        yield
+    except pymongo.errors.PyMongoError as exc:
+        logs = sorted(dbpath.parent.glob("mongod-*.log"))
+        tail = logs[-1].read_text(errors="replace")[-3000:] if logs else "(no log)"
+        raise AssertionError(f"mongod failed on the store: {exc}\n{tail}") from exc
 
 
 def _wait_primary(client: pymongo.MongoClient, port_host: str) -> None:
@@ -190,12 +204,13 @@ def test_mongod_opens_a_secantus_store(tmp_path: Path) -> None:
     proc, client = _mongod_on(store)
     try:
         assert client is not None, "mongod refused the store (see its log beside the store)"
-        _wait_primary(client, f"{client.address[0]}:{client.address[1]}")
-        coll = client["app"]["c"]
-        assert sorted(d["_id"] for d in coll.find()) == list(range(10))
-        assert sorted(ix["name"] for ix in coll.list_indexes()) == ["_id_", "a_1"]
-        result = client["app"].command("validate", "c", full=True)
-        assert (result["valid"], result["nrecords"]) == (True, 10)
+        with _mongod_answers(store):
+            _wait_primary(client, f"{client.address[0]}:{client.address[1]}")
+            coll = client["app"]["c"]
+            assert sorted(d["_id"] for d in coll.find()) == list(range(10))
+            assert sorted(ix["name"] for ix in coll.list_indexes()) == ["_id_", "a_1"]
+            result = client["app"].command("validate", "c", full=True)
+            assert (result["valid"], result["nrecords"]) == (True, 10)
     finally:
         _stop_mongod(proc, client)
 
