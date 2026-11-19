@@ -3057,6 +3057,20 @@ produce the dump it exists for.
 
 ## Found while working the storage model (2026-11-19)
 
+- [ ] **RM-610's regression test measures wall time, and failed once on CI.**
+      `tests/backlog/test_rm_found_2026_11_13_contested_reads.py::test_a_contested_find_and_write_of_one_cost_what_they_return`
+      compares how a contested `updateOne`'s time grows from 10,000 to
+      100,000 documents against mongod's (within 3x). On PR #2918's CI (the
+      Linux debug build) this server's `updateOne` grew past 3x; the rerun
+      passed, and locally it is flat (17.0 ms against 16.9 ms, 0 failures in
+      6 runs under eight CPU burners). A checkpoint landing in the timed
+      window is the likely cause, not shown. The test should compare what
+      each server examines (`explain`'s `totalKeysExamined` /
+      `totalDocsExamined` at both sizes), which is mongod's own measure of
+      the cost and does not move with the machine.
+      Backlog-ID: RM-728
+      Verify: none -- a test-quality item: the behaviour is right on every run measured here; what is wrong is that the test can fail on timing alone
+
 - [ ] **A restore to the timestamp of a batched insert applies part of the
       batch.** `insert_many` of two documents is one `applyOps` entry in
       `local.oplog.rs` (as mongod 8.2 logs a batched insert), but
