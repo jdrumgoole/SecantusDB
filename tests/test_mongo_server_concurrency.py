@@ -63,8 +63,11 @@ def server(kind, tmp_path, wt_home):
 
         # The replica-set persona so change streams work, matching the Python
         # server's default hello reply.
+        # A directory of its own: `wt_home` (requested for the Python
+        # server) clones a Python-layout store into `tmp_path / "wt"`, which
+        # the Rust server refuses (it writes mongod's layout).
         srv = _secantus_server.RustServer(
-            str(tmp_path / "wt"), 0, host="127.0.0.1", replica_set_name="secantus"
+            str(tmp_path / "rust-wt"), 0, host="127.0.0.1", replica_set_name="secantus"
         )
         try:
             yield srv
