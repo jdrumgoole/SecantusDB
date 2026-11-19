@@ -589,7 +589,10 @@ These are explicit non-goals. Don't add them without a reason.
       statement takes its own round as it runs and keeps its session's row
       under it; since 2026-11-18 an `$out` on a replica set's primary takes
       its four global IS under the transition lock, and the transition lock
-      alone once for each X round after the first. Still different,
+      alone once for each X round after the first; since 2026-11-18 a
+      collectionless `aggregate`'s `$lookup` and `$unionWith` take the
+      global IS twice for each read of their collection, under no lock of
+      the command's. Still different,
       measured against a one-member replica set:
       - an `insert` of several documents one of which fails: mongod inserts
         them again a document at a time, each under a transition, global,
@@ -607,10 +610,11 @@ These are explicit non-goals. Don't add them without a reason.
       - a statement of a transaction shows the transaction's initial locks
         in its profile entry on mongod (its line prints `{}` here too since
         2026-11-17); the entry is not compared yet;
-      - a collectionless `aggregate` takes no lock of its own since
-        2026-11-09, as on mongod, but one whose `$lookup` or `$unionWith`
-        reads a collection takes the global IS three times on mongod's line
-        (four in its entry, four execution admissions) and once here.
+      - a collectionless `aggregate` whose `$lookup` or `$unionWith` reads
+        a collection takes mongod's global IS on its line since 2026-11-18
+        (once, then twice per read of the collection), but its profile
+        entry (one more on mongod) and its line's execution admissions are
+        not compared yet.
       Backlog-ID: RM-357
       Verify: tests/backlog/test_rm_355_364.py::test_more_writes_report_mongods_locks
 - [ ] **A `$lookup` from `{db: "local", coll: "oplog.rs"}` is refused.**
@@ -738,7 +742,7 @@ These are explicit non-goals. Don't add them without a reason.
       plan with a limit filling one buffer to it) `$limit`, and the `getMore`s of its cursor,
       `listIndexes`, `listCollections`, `collStats`, `ping`, `buildInfo`,
       and an `insert`, `update` or `delete` on a member of a replica set
-      prints mongod's count (93 shapes in
+      prints mongod's count (99 shapes in
       `tests/mongod_live/test_interrupt_checks.py`). Every other line
       prints none, where mongod prints one:
       - a read with more than one candidate plan, a plan from the plan
@@ -748,7 +752,13 @@ These are explicit non-goals. Don't add them without a reason.
         its index intersections' included; three indexes 13) and not at
         all for a cached plan, and this planner's candidates are not its
         enumeration;
-      - the other aggregates: one with a `$match` or `$redact` left after
+      - the other aggregates (since 2026-11-19 a `$sort` closing stages
+        that pass one document on for each, `$addFields`, `$set`, `$unset`,
+        `$project`, `$replaceRoot`, `$replaceWith`, over a classic read is
+        counted): a `$sort` with a `$limit` after it (`[{$addFields},
+        {$sort}, {$limit: 5}]` 12 on mongod), a classic `$group` or
+        `$count` after such stages (12 for 300 documents), a `$sample`
+        (4), one with a `$match` or `$redact` left after
         its read, a `$lookup`,
         `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a `$group`
         run classic over the cursor stage (a `$bucket` of 400 buckets: 16
@@ -915,10 +925,12 @@ These are explicit non-goals. Don't add them without a reason.
   since 2026-11-17), `WiredTiger session cache max value has been set`
   (9086700, since 2026-11-18), the spill engine's `Opening spill
   WiredTiger` (10158000), its own 22430 messages and `Spill WiredTiger
-  opened` (10158001, since 2026-11-18: the engine opens at startup) and,
-  last, `mongod startup complete` (8423403). mongod writes about fifty more
-  there that this server does not: the network lines, the durable catalog
-  (9529901-9529903), `Dropping spill idents` (10682200), the spill
+  opened` (10158001, since 2026-11-18: the engine opens at startup), the
+  durable catalog's `Initializing durable catalog` (9529901), `Retrieving
+  all idents from storage engine` (9529902) and `Initializing all
+  collections in durable catalog` (9529903, since 2026-11-18) and, last,
+  `mongod startup complete` (8423403). mongod writes about fifty more
+  there that this server does not: the network lines, `Dropping spill idents` (10682200), the spill
   engine's shutdown lines (10158003, 10158006, 10158007), FCV, FTDC and
   flow-control lines (measured 2026-10-24,
   2026-11-07, 2026-11-10, 2026-11-13 and 2026-11-16). Two limits on the
@@ -929,7 +941,7 @@ These are explicit non-goals. Don't add them without a reason.
   each. The vendored WiredTiger 7.0 writes four on a new store where
   mongod's newer engine writes fourteen. Found with RM-302.
   Backlog-ID: RM-305
-  Verify: tests/backlog/test_rm_001_028.py::test_startup_initializes_the_durable_catalog_after_the_spill_engine
+  Verify: tests/backlog/test_rm_001_028.py::test_startup_drops_spill_idents_after_the_durable_catalog
 ### 7.091 mongod's slot-based engine (SBE) -- 2026-10-23
 
 mongod 8.2 runs the front of a pipeline in its slot-based engine when it can

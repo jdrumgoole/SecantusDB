@@ -37,7 +37,10 @@ and so reads no storage statistics unless it filled a buffer.
 A `$sort` after a `$group` the slot-based engine runs reads the groups
 through the cursor stage in the same way: a global IS per buffer, and a
 tick for each document the `$sort` pulls from it, each it passes on, and
-each end found.
+each end found; so does a `$sort` after stages that pass one document on
+for each they take (`$addFields`, `$set`, `$unset`, `$project`,
+`$replaceRoot`, `$replaceWith`), each of them pulled once per document and
+once more for the end.
 
 What this server does not count yet prints no field, and is RM-360's
 remainder: plans with several candidates, the pipelines it does not model,
@@ -397,6 +400,49 @@ PIPELINES: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any], tuple[str
     # as a `$sort` after a `$group` is (RM-360, measured 8.2.11 2026-11-17:
     # a `$count` 5 at any size; a `$sortByCount` of 300 groups 12 and a
     # `getMore` of 3).
+    # A `$sort` after stages that pass one document on for each, over a
+    # classic read: each is pulled once per document and once for the end,
+    # as the cursor stage is (measured 8.2.11, 2026-11-18).
+    "aggregate sorting after an $addFields": (
+        _documents(300),
+        _pipeline([_ADD, {"$sort": {"q": 1, "_id": 1}}]),
+        _PIPELINE,
+    ),
+    "aggregate sorting by an index after an $addFields": (
+        _documents(300),
+        _pipeline([_ADD, {"$sort": {"x": 1}}]),
+        _PIPELINE,
+    ),
+    "aggregate sorting after a $project the plan takes": (
+        _documents(300),
+        _pipeline([{"$project": {"y": 1}}, {"$sort": {"y": 1, "_id": 1}}]),
+        _PIPELINE,
+    ),
+    "aggregate sorting after $match, $set and $unset, batches of 40": (
+        _documents(400),
+        _pipeline(
+            [
+                {"$match": {"x": {"$gte": 3}}},
+                {"$set": {"w": 1}},
+                {"$unset": "a"},
+                {"$sort": {"y": -1, "_id": 1}},
+            ],
+            batchSize=40,
+        ),
+        _PIPELINE,
+    ),
+    "aggregate sorting after a $replaceRoot, one buffer": (
+        _documents(20),
+        _pipeline(
+            [{"$replaceRoot": {"newRoot": {"v": "$y", "i": "$_id"}}}, {"$sort": {"v": 1, "i": 1}}]
+        ),
+        _PIPELINE,
+    ),
+    "aggregate sorting after an $addFields, a first batch of none": (
+        _documents(300),
+        _pipeline([_ADD, {"$sort": {"q": 1, "_id": 1}}], batchSize=0),
+        _PIPELINE,
+    ),
     "aggregate counting": (_groups(300), _pipeline([{"$count": "n"}]), _PIPELINE),
     "aggregate counting groups": (
         seed,

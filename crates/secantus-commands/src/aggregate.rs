@@ -677,7 +677,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // ran through its cursor stage: a `$sort` after a `$group`, or the
     // `$sort` or `$project` of a `$bucket`, `$sortByCount` or `$count`
     // (RM-360).
-    let mut sorted_after_sbe = false;
+    let mut sorted_after_sbe: Option<usize> = None;
     // Fetch the input documents + decide the remaining pipeline.
     let (ns, input, working_pipeline): (String, Vec<Document>, Vec<Bson>) = match &coll {
         Some(c) => {
@@ -925,7 +925,8 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         let _ = crate::explain::summary::plan_summary(doc, ctx);
                         secantus_core::deadline::pipeline_counted();
                     }
-                    // A `$sort` after an SBE `$group` plans its front and
+                    // A `$sort` after an SBE `$group`, or after stages that
+                    // pass one document on for each, plans its front and
                     // counts the same 5; its `getMore` takes no lock of its
                     // own, the cursor stage taking a global IS per buffer
                     // (RM-360, measured 8.2.11 2026-11-18).
@@ -933,14 +934,15 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         && !crate::explain::order::is_uncounted()
                         && !doc.contains_key("autocommit")
                         && crate::ts_buckets::bucketed(storage, &ctx.db_name, c).is_none()
-                        && sort_after_sbe_group(
+                        && sort_after_cursor_stage(
                             storage,
                             &ctx.db_name,
                             c,
                             &read_pipeline,
                             hint,
                             collation.as_ref(),
-                        );
+                        )
+                        .is_some();
                     if sorted_after_sbe {
                         let _ = crate::explain::summary::plan_summary(doc, ctx);
                         secantus_core::deadline::pipeline_counted();
@@ -1099,17 +1101,17 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     collation.as_ref(),
                 ) {
                     secantus_core::deadline::pipeline_counted();
-                } else {
-                    sorted_after_sbe = c == asked
-                        && crate::ts_buckets::bucketed(storage, &ctx.db_name, c).is_none()
-                        && sort_after_sbe_group(
-                            storage,
-                            &ctx.db_name,
-                            c,
-                            &read_pipeline,
-                            hint,
-                            collation.as_ref(),
-                        );
+                } else if c == asked
+                    && crate::ts_buckets::bucketed(storage, &ctx.db_name, c).is_none()
+                {
+                    sorted_after_sbe = sort_after_cursor_stage(
+                        storage,
+                        &ctx.db_name,
+                        c,
+                        &read_pipeline,
+                        hint,
+                        collation.as_ref(),
+                    );
                 }
                 // The plan the pipeline's first read runs uses its indexes
                 // once (a `$lookup`'s reads count none: measured 8.2.11).
@@ -1332,16 +1334,21 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             loads = Some(stage);
         }
     }
-    // A `$sort` after a `$group` mongod's slot-based engine runs reads the
-    // group's output through the cursor stage, which takes the global lock
+    // A `$sort` after a `$group` mongod's slot-based engine runs, or after
+    // stages that pass on one document for each they take, reads its input
+    // through the cursor stage, which takes the global lock
     // for each buffer it loads (32 documents, then twice as many each time,
     // until one comes back short); the `$sort` pulls every document through
     // the cursor stage and one more that finds the end, then passes each on
     // with a `getNext`, and one more finds its end when the batch is not
     // filled -- each `getNext` a tick of the pipeline's interrupt checker
-    // (RM-360, measured 8.2.11 2026-11-17).
+    // (RM-360, measured 8.2.11 2026-11-17). Each classic stage between the
+    // cursor stage and the `$sort` is pulled once for each document and once
+    // more for the end, as the cursor stage is (measured 2026-11-18:
+    // `[{$addFields}, {$sort}]` over 300 documents ticks 703 times).
     let mut ticks_left = None;
-    if sorted_after_sbe && !crate::explain::order::is_uncounted() && !doc.contains_key("autocommit")
+    if let Some(between) = sorted_after_sbe
+        .filter(|_| !crate::explain::order::is_uncounted() && !doc.contains_key("autocommit"))
     {
         let (mut loaded, mut asked) = (0usize, CURSOR_STAGE_FIRST_BUFFER);
         loop {
@@ -1361,7 +1368,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let found_end = first_batch.len() < wanted;
         secantus_core::deadline::resume_ticks(secantus_core::deadline::FRESH_TICKS);
         secantus_core::deadline::tick_stages(
-            (total + 1 + first_batch.len() + usize::from(found_end)) as u64,
+            ((between + 1) * (total + 1) + first_batch.len() + usize::from(found_end)) as u64,
         )?;
         secantus_core::deadline::pipeline_counted();
         ticks_left = Some(secantus_core::deadline::ticks_to_check());
@@ -3380,6 +3387,41 @@ impl Drop for InSubPipeline {
     }
 }
 
+/// Whether the running `aggregate` is collectionless (`aggregate: 1`),
+/// which takes no lock of its own while its pipeline runs.
+fn command_holds_no_lock() -> bool {
+    COMMAND_NS.with(|n| {
+        n.borrow()
+            .as_deref()
+            .is_some_and(|ns| ns.ends_with(".$cmd.aggregate"))
+    })
+}
+
+/// A read of a `$lookup`'s or `$unionWith`'s collection under no lock of
+/// the command's: mongod acquires the collection, then its cursor stage
+/// loads a buffer, each taking the global IS (RM-357).
+fn unlocked_foreign_read() -> Result<(), CommandError> {
+    crate::lock_manager::global_read()?;
+    crate::lock_manager::global_read()
+}
+
+/// Whether `stage` refers to one of the `let` variables (`$$name`,
+/// `$$name.path`).
+fn uses_variable(stage: &Bson, let_spec: Option<&Document>) -> bool {
+    let Some(names) = let_spec else {
+        return false;
+    };
+    match stage {
+        Bson::String(s) => s.strip_prefix("$$").is_some_and(|v| {
+            let name = v.split('.').next().unwrap_or(v);
+            names.contains_key(name)
+        }),
+        Bson::Document(d) => d.values().any(|v| uses_variable(v, let_spec)),
+        Bson::Array(items) => items.iter().any(|v| uses_variable(v, let_spec)),
+        _ => false,
+    }
+}
+
 /// While alive, the `aggregate` command on `ns` is running.
 pub(crate) struct InCommand(Option<String>);
 
@@ -3664,6 +3706,25 @@ fn apply_lookup(
         }
         return Ok(out);
     };
+
+    // A collectionless `aggregate` holds no lock, so each read of `from`
+    // takes the global IS of its own, twice (mongod 8.2.11, one-member
+    // replica set, 2026-11-18: `{$documents: [3 docs]}` then an equality
+    // `$lookup` reads `Global: {r: 7}`, the one before the pipeline and two
+    // per document). mongod's sub-pipeline cache reads `from` once for all
+    // the outer documents unless the pipeline's first stage is correlated:
+    // the equality form's `$match` on `foreignField`, or a `let` variable
+    // in that stage (RM-357).
+    if !docs.is_empty() && command_holds_no_lock() {
+        let correlated = (local_field.is_some() && foreign_field.is_some())
+            || written_pipeline
+                .and_then(|p| p.first())
+                .is_some_and(|first| uses_variable(first, let_spec));
+        let reads = if correlated { docs.len() } else { 1 };
+        for _ in 0..reads {
+            unlocked_foreign_read()?;
+        }
+    }
 
     // Index-driven simple form: when there's no sub-pipeline, both fields are
     // present, and the foreign collection has a leading-field index on
@@ -4039,6 +4100,11 @@ fn apply_union_with(
                 shown: Default::default(),
             },
         )?;
+    }
+    // Read under no lock of a collectionless `aggregate`'s own: the global
+    // IS twice, as a `$lookup`'s read (RM-357).
+    if command_holds_no_lock() {
+        unlocked_foreign_read()?;
     }
     let mut foreign: Vec<Document> =
         collection_documents(storage, db, from, &Document::new(), collation)?;
@@ -7144,6 +7210,21 @@ mod query_stats_tests {
         }
     }
 
+    /// A stage is correlated when it names one of the `let` variables,
+    /// alone or with a path; `$$ROOT` and unbound names are not (RM-357).
+    #[test]
+    fn a_stage_uses_a_let_variable_by_name() {
+        let names = doc! {"i": "$_id"};
+        let uses = |stage: Bson| super::uses_variable(&stage, Some(&names));
+        assert!(uses(
+            bson::bson!({"$match": {"$expr": {"$eq": ["$_id", "$$i"]}}})
+        ));
+        assert!(uses(bson::bson!({"$addFields": {"z": "$$i.a"}})));
+        assert!(!uses(bson::bson!({"$addFields": {"z": "$$ROOT"}})));
+        assert!(!uses(bson::bson!({"$addFields": {"z": "$$it"}})));
+        assert!(!super::uses_variable(&bson::bson!({"a": "$$i"}), None));
+    }
+
     /// Only first, only on `admin` with `{aggregate: 1}`; nested, the
     /// sub-pipeline's namespace decides (mongod 8.2.11, RM-215).
     #[test]
@@ -7307,6 +7388,51 @@ mod documents_argument_tests {
 
 /// The documents mongod's cursor stage loads into its first buffer.
 const CURSOR_STAGE_FIRST_BUFFER: usize = 32;
+
+/// The classic stages between mongod's cursor stage and the stage that
+/// ends `pipeline` (RM-360): none after the stages its slot-based engine
+/// takes ([`sort_after_sbe_group`]), or, over a classic read, the stages
+/// before a closing `$sort` when each passes on one document for each it
+/// takes (measured 8.2.11 2026-11-18: `[{$addFields}, {$sort}]` of 300
+/// documents 14 and a `getMore` of 4; `[{$project}, {$sort}]`, the
+/// `$project` in the plan, 12 and 3).
+fn sort_after_cursor_stage(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    pipeline: &[Bson],
+    hint: Option<&Bson>,
+    collation: Option<&secantus_core::collation::Collation>,
+) -> Option<usize> {
+    if sort_after_sbe_group(storage, db, coll, pipeline, hint, collation) {
+        return Some(0);
+    }
+    let hoisted = crate::explain::hoist::hoist_runnable(pipeline);
+    if crate::explain::sbe_pushdown(storage, db, coll, &hoisted, hint, collation).is_some() {
+        return None;
+    }
+    let query = crate::explain::pipeline_canonical(coll, pipeline);
+    let (sort, between) = query.rest.split_last()?;
+    let name = |s: &Bson| {
+        s.as_document()
+            .and_then(|d| d.keys().next())
+            .map_or(String::new(), String::clone)
+    };
+    let one_for_one = |s: &Bson| {
+        matches!(
+            name(s).as_str(),
+            "$project" | "$unset" | "$addFields" | "$set" | "$replaceRoot" | "$replaceWith"
+        ) && !crate::agg_stream::mentions_meta(s)
+    };
+    (query.skip == 0
+        && query.limit == 0
+        && (!between.is_empty() || query.projection_stage.is_some())
+        && name(sort) == "$sort"
+        && !crate::agg_meta::reads_sort_key(sort)
+        && !crate::agg_stream::mentions_meta(sort)
+        && between.iter().all(one_for_one))
+    .then_some(between.len())
+}
 
 /// Whether `pipeline` ends in a stage the classic engine runs over
 /// mongod's cursor stage after the stages its slot-based engine took

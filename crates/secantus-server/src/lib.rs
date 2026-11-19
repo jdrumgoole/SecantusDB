@@ -392,6 +392,17 @@ pub fn bind(
         .open_spill_engine()
         .map_err(|e| io::Error::other(format!("opening the spill engine: {e}")))?;
     let spill_took = step.elapsed();
+    // mongod then loads its durable catalog: one record per collection.
+    let mut catalog_entries = 0i64;
+    for db in storage
+        .list_databases()
+        .map_err(|e| io::Error::other(format!("reading the catalog: {e:?}")))?
+    {
+        catalog_entries += storage
+            .list_collections(&db)
+            .map_err(|e| io::Error::other(format!("reading the catalog: {e:?}")))?
+            .len() as i64;
+    }
     let mut times = secantus_commands::diagnostics::StartupTimes {
         clean: !matches!(&opening, Some(o) if matches!(o.lock_file, Some((_, true, _)))),
         new_store: opening.as_ref().is_some_and(|o| o.new_store),
@@ -530,6 +541,9 @@ pub fn bind(
         for entry in secantus_commands::diagnostics::spill_opening_lines(spill) {
             logs.log(entry);
         }
+    }
+    for entry in secantus_commands::diagnostics::durable_catalog_lines(catalog_entries) {
+        logs.log(entry);
     }
     logs.log(
         LogEntry::new("I", "NETWORK", 23016, "listener", "Waiting for connections").attr(doc! {

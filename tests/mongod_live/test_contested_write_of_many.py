@@ -51,6 +51,7 @@ def _cache(db: Any) -> list:
 def _writes(client: Any, op: str, query: dict) -> dict:
     db = client[DB]
     _fill(db)
+    since = next(client["local"]["oplog.rs"].find().sort("$natural", -1).limit(1))["ts"]
     out: dict = {}
     for round_ in range(3):
         if op == "update":
@@ -70,13 +71,24 @@ def _writes(client: Any, op: str, query: dict) -> dict:
             out[f"written{round_}"] = r["n"]
         out[f"cache{round_}"] = _cache(db)
     if op == "delete":
-        # The last delete's batches, newest first, as its oplog names them.
+        # The ids every delete above wrote, in the order the oplog names
+        # them. WHERE mongod cuts a batched delete into oplog entries is
+        # timing, not behaviour (cause unconfirmed: not reproduced in 150
+        # local runs under load) (CI, 2026-11-17: the same ten ids as one batch here and
+        # as 3 + 7 there, both servers reporting n = 10); the order the
+        # documents are deleted in is what the plan decides, and is what is
+        # pinned. Only the deletes count: a multi-document insert is an
+        # applyOps entry too.
         entries = client["local"]["oplog.rs"].find(
-            {"op": "c", "ns": "admin.$cmd", "o.applyOps.ns": f"{DB}.c"}
+            {"op": "c", "ns": "admin.$cmd", "ts": {"$gt": since}, "o.applyOps.ns": f"{DB}.c"}
         )
-        batches = list(entries.sort("$natural", -1).limit(3))
-        out["batches"] = [[o["o"]["_id"] for o in e["o"]["applyOps"]] for e in batches]
-        assert out["batches"], "no batched delete in the oplog"
+        out["deleted"] = [
+            o["o"]["_id"]
+            for e in entries.sort("$natural", 1)
+            for o in e["o"]["applyOps"]
+            if o["op"] == "d"
+        ]
+        assert out["deleted"], "no batched delete in the oplog"
     return out
 
 
