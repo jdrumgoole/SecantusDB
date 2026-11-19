@@ -1001,8 +1001,9 @@ def rust_stress(c: Context, workers: int = 16, iters: int = 5) -> None:
     """Hammer many concurrent embedded WiredTiger instances and assert no panic.
 
     Runs ``bench/wt_stress.py``: each worker spins up an embedded Rust server,
-    writes CRUD history, stops it, and rebuilds the DB with the Python restore
-    tool — two WT connections per cycle, ``workers`` in parallel. Exercises the
+    writes CRUD history, stops it, reopens it in the same process, rebuilds it
+    with ``secantusd-mdb restore`` and opens the result -- several WT
+    connections per cycle, ``workers`` in parallel. Exercises the
     cross-server load that made WiredTiger's eviction thread panic under
     ``pytest -n auto``. Needs the ``_secantus_server`` extension (run
     ``rust-server-build`` first). Exits non-zero if any cycle fails.

@@ -2,10 +2,18 @@
 
 Reproduces the cross-server PITR load that made WiredTiger's eviction thread
 panic under the parallel test suite: many threads each spin up an embedded Rust
-server (its own WT connection), write CRUD history, stop it, then rebuild the
-database with the Python restore tool (a *second* WT connection over the same
-data dir). Run it with enough workers/iterations to exceed what `pytest -n auto`
-applies, and assert the process survives — no `WT_PANIC`.
+server (its own WT connection), write CRUD history, stop it, reopen the store
+in the same process (a *second* WT connection over the same data dir) and
+check what it holds, rebuild it with ``secantusd-mdb restore``, and open the
+restored store. Run it with enough workers/iterations to exceed what
+`pytest -n auto` applies, and assert the process survives -- no `WT_PANIC` --
+and every store reads back what was written.
+
+The restore used to be the deprecated Python restore tool, a Python store
+opening the Rust server's. Since the Rust servers write mongod's layout
+(tasks/mongod-storage-model-plan.md) the Python store cannot read theirs, so
+the second connection is a Rust one in this process and the restore is the
+Rust binary's.
 
 Usage (via invoke): ``inv rust-stress --workers 16 --iters 5``
 """
@@ -14,6 +22,9 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import os
+import subprocess
+import sys
 import tempfile
 import traceback
 from pathlib import Path
@@ -21,7 +32,21 @@ from pathlib import Path
 import _secantus_server as _server
 import pymongo
 
-from secantus import oplog_replay
+_REPO = Path(__file__).resolve().parent.parent
+
+
+def _binary() -> Path:
+    """The `secantusd-mdb` this checkout built (release first)."""
+    env = os.environ.get("SECANTUSDB_BIN")
+    if env:
+        return Path(env)
+    for profile in ("release", "debug"):
+        p = _REPO / "crates" / "secantusdb" / "target" / profile / "secantusd-mdb"
+        if sys.platform == "win32":
+            p = p.with_suffix(".exe")
+        if p.exists():
+            return p
+    raise SystemExit("secantusd-mdb is not built (./inv rust-binary-build)")
 
 
 def _client(srv: _server.RustServer) -> pymongo.MongoClient:
@@ -41,8 +66,33 @@ def _one_cycle(idx: int) -> None:
             coll.delete_many({"_id": {"$gte": 150}})
         finally:
             srv.stop()
+        # A second WiredTiger connection over the same data dir, in this
+        # process: what the stress is for.
+        _expect(data, 150)
         out = Path(td) / "restored"
-        oplog_replay.restore_to_timestamp(str(data), str(out))
+        done = subprocess.run(
+            [str(_binary()), "restore", "--source", str(data), "--target-dir", str(out)],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        if done.returncode != 0:
+            raise RuntimeError(f"restore exited {done.returncode}: {done.stderr}")
+        _expect(out, 150)
+
+
+def _expect(path: Path, count: int) -> None:
+    """Open the store at `path` in this process and check it holds `count`
+    documents in `app.c`, each touched."""
+    srv = _server.RustServer(str(path), 0)
+    try:
+        coll = _client(srv)["app"]["c"]
+        got = coll.count_documents({})
+        touched = coll.count_documents({"touched": True})
+        if (got, touched) != (count, count):
+            raise AssertionError(f"{path}: {got} documents, {touched} touched; want {count}")
+    finally:
+        srv.stop()
 
 
 def main() -> int:
