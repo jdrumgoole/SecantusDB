@@ -20293,7 +20293,10 @@ pub(crate) fn fit_length(v: Bson, pg_type: &str, typmod: i32) -> Result<Bson> {
     let Bson::String(text) = &v else { return Ok(v) };
     let n = (typmod - 4) as usize;
     if text.chars().count() <= n {
-        return Ok(v);
+        // A `char(n)` value is held without its padding, which comes back
+        // on output and in expressions (`pad_bpchar`); an unsized `bpchar`
+        // keeps its blanks (RP-693).
+        return Ok(if pg_type == "bpchar" { trim_bpchar(v) } else { v });
     }
     let (head, tail): (String, String) = (
         text.chars().take(n).collect(),
@@ -42450,16 +42453,11 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
         domains::check_chain(&chain, &v)?;
         return Ok(v);
     }
-    let out = cast_value_inner(value, target)?;
-    // A `char(n)` value is STORED without its padding: equality lowers to
-    // a filter against the stored value, and `'x  '` must find `'x'`. The
-    // blanks come back where PostgreSQL shows them -- on output, and when
-    // the value takes part in an expression (`pad_bpchar`).
-    Ok(if target == "bpchar" {
-        trim_bpchar(out)
-    } else {
-        out
-    })
+    // A `bpchar` value keeps its blanks as written (`bpcharin`): a sized
+    // column's cell is trimmed where it is stored (`stored_bpchar_cell`),
+    // and a key is trimmed where it is derived (`derive_bpchar_keys`, the
+    // expression indexes); RP-693.
+    cast_value_inner(value, target)
 }
 
 /// An integer cast's result held to smallint's range when the target is
@@ -48648,20 +48646,24 @@ fn references_literal_only_column(node: &pg_query::protobuf::Node, def: &TableDe
 /// A stored table's `char(n)` cell is written trimmed, and so is a
 /// materialised source's sized one (`stored_bpchar_cell`), so an MQL filter
 /// compares it with the constant's blanks dropped (`bpchar_operand`) and
-/// agrees with `bpchareq`. An UNSIZED `bpchar` column of a materialised
-/// source -- a VALUES list or a set operation whose members' modifiers
+/// agrees with `bpchareq`. An UNSIZED `bpchar` column -- of a stored
+/// table (RP-693), or of a materialised source -- a VALUES list or a set operation whose members' modifiers
 /// differ, `(values ('uu'::char(4)), ('tt')) s(f)` -- has no width to pad
 /// the value back to, so its cell keeps the blanks as written (`'uu  '`,
 /// as PostgreSQL shows it), and an MQL comparison read them: `f = 'uu'`
-/// and `f in ('uu  ', 'tt')` found nothing (RP-775). A stored table's def
-/// carries its system columns (`TableDef::from_document`); a materialised
-/// source's does not.
-fn keeps_bpchar_blanks(def: &TableDef, c: &Column) -> bool {
-    (def.system_columns.is_empty() && c.pg_type == "bpchar" && c.typmod <= 4)
-        // A stored unsized `bpchar` PRIMARY KEY keeps the value as written
-        // in its own field; `_id` holds the trimmed key (RP-693).
+/// and `f in ('uu  ', 'tt')` found nothing (RP-775).
+fn keeps_bpchar_blanks(_def: &TableDef, c: &Column) -> bool {
+    // A stored unsized `bpchar` column keeps the value as written too
+    // (RP-693): a PRIMARY KEY in its own field, `_id` holding the trimmed
+    // key; any other in its cell. A store written before that kept every
+    // value trimmed, which a per-row comparison reads the same.
+    (c.pg_type == "bpchar" && c.typmod <= 4 && !c.extra.get_bool(TRIMMED_BPCHAR_KEY).unwrap_or(false))
         || c.is_written_bpchar_key()
 }
+
+/// `Column::extra`'s mark on a planning-only column that reads a `bpchar`
+/// key's trimmed field (`expr_where::rewrite`): its cells hold no blanks.
+pub(crate) const TRIMMED_BPCHAR_KEY: &str = "trimmed_bpchar_key";
 
 /// Whether `node` reads a column of `def` whose `bpchar` cells keep their
 /// trailing blanks (`keeps_bpchar_blanks`). Such a predicate is refused

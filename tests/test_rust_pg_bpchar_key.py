@@ -465,3 +465,59 @@ def test_an_indexed_equality_reads_the_trimmed_key(
     c.execute("update t set b = -10 where a = 'k '")
     c.execute("delete from t where a = 'm   '")
     assert _rows(c, "select octet_length(a), b from t where b < 0") == [(3, -10)]
+
+
+def test_an_unsized_bpchar_column_keeps_its_blanks(connection: psycopg.Connection) -> None:
+    """RP-693 step 5, against PostgreSQL 15.19: a plain unsized `bpchar`
+    column stores the value as written, and every comparison, DISTINCT and
+    grouping still ignores the trailing blanks (`bpchareq`)."""
+    c = connection
+    c.execute("create table p (a bpchar, n int)")
+    c.execute("insert into p values ('xy ', 1), ('xy', 2), ('z', 3)")
+    _copy(c, "p", "xy  \t4\n")
+    assert _rows(c, "select n, octet_length(a) from p order by n") == [
+        (1, 3),
+        (2, 2),
+        (3, 1),
+        (4, 4),
+    ]
+    for where, want in (
+        ("a = 'xy'", [(1,), (2,), (4,)]),
+        ("a = 'xy  '", [(1,), (2,), (4,)]),
+        ("a in ('xy', 'q')", [(1,), (2,), (4,)]),
+        ("a::text = 'xy'", [(1,), (2,), (4,)]),
+        ("a < 'xz'", [(1,), (2,), (4,)]),
+        ("a = 'xy' and n > 1", [(2,), (4,)]),
+    ):
+        assert _rows(c, f"select n from p where {where} order by n") == want, where
+    assert _rows(c, "select distinct a from p order by 1") == [("xy ",), ("z",)]
+    assert _rows(c, "select a, count(*)::int from p group by a order by 1") == [
+        ("xy ", 3),
+        ("z", 1),
+    ]
+    assert _rows(c, "select distinct on (a) a, n from p order by a, n desc") == [
+        ("xy  ", 4),
+        ("z", 3),
+    ]
+    assert _rows(c, "select p.n, q.n from p join p q on p.a = q.a where p.n = 1 order by 2") == [
+        (1, 1),
+        (1, 2),
+        (1, 4),
+    ]
+    c.execute("create table ct as select 'xy '::bpchar a, 'q '::varchar v")
+    assert _rows(c, "select octet_length(a), octet_length(v) from ct") == [(3, 2)]
+    c.execute("create table c3 (a char(3))")
+    c.execute("insert into c3 values ('ab ')")
+    assert _rows(c, "select octet_length(a), a = 'ab' from c3") == [(3, True)]
+
+
+def test_a_plain_index_on_an_unsized_bpchar_keeps_the_right_answer(
+    connection: psycopg.Connection,
+) -> None:
+    c = connection
+    c.execute("create table o (a bpchar, n int)")
+    c.execute("create index o_a on o (a)")
+    c.execute("insert into o values (E'xy\\t', 1), ('xy ', 2), ('xy', 3), ('xy!', 4)")
+    assert _rows(c, "select n from o where a = 'xy' order by n") == [(2,), (3,)]
+    assert _rows(c, "select n from o order by a, n") == [(2,), (3,), (1,), (4,)]
+    assert _rows(c, "select n from o where a > 'xy' order by n") == [(1,), (4,)]

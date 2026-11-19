@@ -2369,6 +2369,24 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       blanks. An `=` ANDed with another filter is a Seq Scan in EXPLAIN
       for every index (RP-1070). Tests: the step-4 test in
       `tests/test_rust_pg_bpchar_key.py`.
+      Step 5 attempted (2026-11-19), WIP on branch `rp-693-step5`, NOT
+      landed: dropping `cast_value`'s trim (sized `char(n)` now trimmed in
+      the typmod fit instead), widening `keeps_bpchar_blanks` to every
+      stored unsized `bpchar` (the step-4 rewrite's key fields marked
+      `TRIMMED_BPCHAR_KEY`) and sending a streamed DISTINCT / DISTINCT ON
+      over one to the materialised path matched 15.19 on every probe and
+      passed the 67 bpchar-touching test files. **Blocker:** a UNIQUE made
+      before step 2 is a plain storage index over the value; once the
+      write keeps blanks it lets `'m'` in beside `'m '` (reproduced with
+      the pre-RP-693 binary's store, constraint and CREATE UNIQUE INDEX,
+      single and composite). Trimming such columns per write path was
+      tried and leaks (per-row UPDATE, ON CONFLICT DO UPDATE). What step 5
+      needs first: rebuild each such index as the step-2 expression index
+      (`create_unique_index`'s expression branch, then
+      `refresh_expr_fields`) once per database before any write, which
+      needs a per-database open hook this server does not have yet
+      (`ensure_catalog_collections` is per connection). A plain index is
+      RP-1072.
       Verify: tests/backlog/test_rp_found_rp672.py::test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks
       Backlog-ID: RP-693
 
@@ -2401,6 +2419,18 @@ test is in `tests/backlog/test_rp_found_rp693.py`.
       the same Seq Scan. Only the plan text differs: the rows are right.
       Verify: tests/backlog/test_rp_found_rp693.py::test_explain_indexed_equality_with_a_filter
       Backlog-ID: RP-1070
+
+- [ ] **OPEN -- a plain index on an unsized `bpchar` is not used for `=`
+      once the cell keeps its blanks.** With RP-693 step 5 a plain CREATE
+      INDEX on an unsized `bpchar` is a storage index over the value as
+      written, so `a = 'k'` is evaluated per row (`keeps_bpchar_blanks`):
+      right rows, but `explain (costs off)` over 2,001 analysed rows is a
+      `Seq Scan` where 15.19 is `Index Scan using ix_a / Index Cond: (a =
+      'k'::bpchar)`. The faithful index is keyed trimmed (`bpcharcmp`), as
+      the step-2 UNIQUE expression index is. (Passes today only because
+      every write still trims; it becomes a gap with step 5.)
+      Verify: tests/backlog/test_rp_found_rp693.py::test_a_plain_index_on_an_unsized_bpchar_serves_equality
+      Backlog-ID: RP-1072
 
 ## Found while working RP-665 (2026-11-10)
 

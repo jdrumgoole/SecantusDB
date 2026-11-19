@@ -149,15 +149,21 @@ pub(crate) fn rewrite(
         if !used.contains(field) || extended.column(field).is_some() {
             continue;
         }
-        if field == "_id" {
-            extended.columns.push(Column::new(field, "bpchar", false));
-            continue;
+        let ty = if field == "_id" {
+            "bpchar".to_string()
+        } else {
+            plan_check_expression(sql, def)
+                .map(|e| column_expr_type(&e).to_string())
+                .ok()
+                .filter(|t| !t.is_empty())?
+        };
+        let mut col = Column::new(field, &ty, false);
+        if ty == "bpchar" {
+            // A `bpchar` key field holds its value trimmed (`bcTruelen`),
+            // so an MQL filter compares it as `bpchareq` (RP-693).
+            col.extra.insert(crate::TRIMMED_BPCHAR_KEY, true);
         }
-        let ty = plan_check_expression(sql, def)
-            .map(|e| column_expr_type(&e).to_string())
-            .ok()
-            .filter(|t| !t.is_empty())?;
-        extended.columns.push(Column::new(field, &ty, false));
+        extended.columns.push(col);
     }
     Some((out, extended))
 }

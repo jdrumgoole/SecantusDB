@@ -401,8 +401,23 @@ impl PgHandler {
             bpchar: false,
             expr: None,
         };
+        // An unsized `bpchar` cell keeps its blanks as written (RP-693), and
+        // the streamed de-duplication compares stored values, where
+        // `bpchareq` ignores them: materialised, which compares by
+        // `typed_ident`.
+        let blank_keeping = |f: &String| {
+            def.columns
+                .iter()
+                .any(|c| c.field() == *f && c.pg_type == "bpchar" && c.typmod <= 4)
+        };
         match &sel.distinct {
             secantus_pgplan::Distinct::None => Some((sel.order.clone(), None)),
+            secantus_pgplan::Distinct::All
+                if sel.columns.iter().any(|(_, f)| blank_keeping(f)) =>
+            {
+                None
+            }
+            secantus_pgplan::Distinct::On(keys) if keys.iter().any(blank_keeping) => None,
             // A DISTINCT with no ORDER BY comes out in the HashAggregate's
             // order, which the materialised path reproduces (RP-028); a
             // sort would hand back the rows ordered. Streamed only past the

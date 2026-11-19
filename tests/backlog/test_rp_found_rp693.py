@@ -74,3 +74,33 @@ def test_explain_indexed_equality_with_a_filter(dsn: str) -> None:
             ]
         finally:
             c.execute(f"drop table {table}")
+
+
+@pytest.mark.backlog("RP-1072")
+def test_a_plain_index_on_an_unsized_bpchar_serves_equality(dsn: str) -> None:
+    """A plain CREATE INDEX on an unsized `bpchar` column is a btree over
+    `bpcharcmp` on PostgreSQL 15.19, so `a = 'k'` is an Index Scan that
+    finds `'k  '`. Here the index is a storage index over the value as
+    written, which keeps its blanks since RP-693 step 5, so `=` is refused
+    to it and runs as a Seq Scan (right answer, wrong plan)."""
+    table = f"ix_bp_{uuid.uuid4().hex[:8]}"
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(f"create table {table} (a bpchar, b int)")
+        try:
+            c.execute(f"insert into {table} select 'k'||i, i from generate_series(1, 2000) i")
+            c.execute(f"insert into {table} values ('k  ', -1)")
+            c.execute(f"create index {table}_a on {table} (a)")
+            c.execute(f"analyze {table}")
+            plan = [
+                r[0]
+                for r in c.execute(
+                    f"explain (costs off) select b from {table} where a = 'k'"
+                ).fetchall()
+            ]
+            assert plan == [
+                f"Index Scan using {table}_a on {table}",
+                "  Index Cond: (a = 'k'::bpchar)",
+            ]
+            assert c.execute(f"select b from {table} where a = 'k'").fetchall() == [(-1,)]
+        finally:
+            c.execute(f"drop table {table}")
