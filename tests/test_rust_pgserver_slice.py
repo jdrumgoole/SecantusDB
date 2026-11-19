@@ -222,6 +222,15 @@ def _python_sql(home: Path, *statements: str) -> list[tuple]:
 # (CLAUDE.md). What is lost: a check that a Python-written table, schema,
 # view, index or char(n) width reads back through the Rust server. The
 # Rust-written direction stays covered by the tests beside them.
+#
+# Retired 2026-11-19 (phases 2-3): the Rust-written direction too, the
+# fourteen tests that had the Python server read or write a store
+# `secantusd-pg` wrote (views and indexes, schemas, grants, enums,
+# composites, identity columns, timestamps, partitions, unique constraints,
+# expression-index rows, composite keys, altered catalogs, table rewrites).
+# Each collection now has a table of its own, which the Python server does
+# not read. What is lost: a check that the two servers agree on those
+# catalog shapes. The Rust server's own tests of each stay.
 
 
 def test_create_insert_select_round_trip(home: Path) -> None:
@@ -255,63 +264,6 @@ def test_predicates_match_postgres(home: Path, where: str, expected: list[int]) 
         cur.execute("INSERT INTO t VALUES (1,'alice',10),(2,'bob',20),(3,'carol',30)")
         cur.execute(f"SELECT id FROM t WHERE {where}")
         assert sorted(r[0] for r in cur.fetchall()) == expected
-
-
-def test_the_python_server_reads_and_writes_a_rust_created_table(home: Path) -> None:
-    """The catalog contract, in the direction that matters most.
-
-    If the Rust server's catalog document diverges, the Python server does not
-    fail loudly -- it sees a table with the wrong columns.
-    """
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("CREATE TABLE t (id int PRIMARY KEY, name text, n int)")
-        cur.execute("INSERT INTO t VALUES (1,'alice',10),(2,'bob',20)")
-
-    # Rust is stopped; Python opens the same store.
-    assert _python_sql(home, "SELECT id, name, n FROM t ORDER BY id") == [
-        (1, "alice", 10),
-        (2, "bob", 20),
-    ]
-    _python_sql(home, "INSERT INTO t VALUES (3, 'carol', 30)")
-
-    # ... and Rust sees what Python wrote.
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT id, name, n FROM t WHERE n > 15")
-        assert sorted(cur.fetchall()) == [(2, "bob", 20), (3, "carol", 30)]
-
-
-def test_schema_qualified_tables_cross_from_rust_to_python(home: Path) -> None:
-    """A table outside `public` is stored under `schema.name` by BOTH servers.
-
-    Two same-named tables in different schemas must stay two tables when the
-    other server opens the store -- a key that drifted would have one server
-    read the other schema's rows, with no error to say so.
-    """
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("CREATE SCHEMA sx")
-        cur.execute("CREATE TABLE users (id serial PRIMARY KEY, name text)")
-        cur.execute("CREATE TABLE sx.users (id serial PRIMARY KEY, name text)")
-        cur.execute("INSERT INTO users (name) VALUES ('public-row')")
-        cur.execute("INSERT INTO sx.users (name) VALUES ('sx-1'), ('sx-2')")
-
-    assert _python_sql(home, "SELECT id, name FROM sx.users ORDER BY id") == [
-        (1, "sx-1"),
-        (2, "sx-2"),
-    ]
-    assert _python_sql(home, "SELECT name FROM users") == [("public-row",)]
-    # Python writes into the Rust-created schema table, drawing on the same
-    # serial sequence the Rust server created for it.
-    _python_sql(home, "INSERT INTO sx.users (name) VALUES ('from-python')")
-
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT id, name FROM sx.users ORDER BY id")
-        assert cur.fetchall() == [(1, "sx-1"), (2, "sx-2"), (3, "from-python")]
-        cur.execute("SELECT count(*) FROM users")
-        assert cur.fetchall() == [(1,)]
 
 
 def test_duplicate_key_reports_what_postgres_reports(home: Path) -> None:
@@ -393,8 +345,11 @@ def test_acknowledged_writes_survive_sigterm(home: Path) -> None:
         assert sorted(r[0] for r in cur.fetchall()) == [1, 2]
 
     # Nothing above ran a checkpoint explicitly; only the signal handler can
-    # have flushed this.
-    assert _python_sql(home, "SELECT id, n FROM durable ORDER BY id") == [(1, 10), (2, 20)]
+    # have flushed this. Read back by the server itself, reopened: the
+    # deprecated Python server no longer reads this layout.
+    with _Server(home) as server, server.connect() as conn:
+        rows = conn.execute("SELECT id, n FROM durable ORDER BY id").fetchall()
+    assert rows == [(1, 10), (2, 20)]
 
 
 def test_order_limit_offset_and_dml(home: Path) -> None:
@@ -1211,25 +1166,6 @@ def test_timestamp_sub_millisecond_invariant(home: Path) -> None:
         cur.execute("UPDATE t SET ts = '2026-09-01 01:02:03.456789' WHERE id = 1")
         cur.execute("SELECT ts FROM t WHERE id = 1")
         assert cur.fetchall() == [(dt.datetime(2026, 9, 1, 1, 2, 3, 456789),)]
-
-
-def test_python_server_reads_rust_timestamps(home: Path) -> None:
-    """The companion contract, across servers.
-
-    Getting this wrong is silent corruption rather than an error: the Python
-    server would read a time the Rust server never wrote.
-    """
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("CREATE TABLE t (id int PRIMARY KEY, ts timestamp)")
-        cur.execute(
-            "INSERT INTO t VALUES (1,'2026-09-01 01:02:03.456789'),(2,'2026-09-01 12:34:56')"
-        )
-
-    assert _python_sql(home, "SELECT id, ts FROM t ORDER BY id") == [
-        (1, dt.datetime(2026, 9, 1, 1, 2, 3, 456789)),
-        (2, dt.datetime(2026, 9, 1, 12, 34, 56)),
-    ]
 
 
 def test_numeric_keeps_its_scale(home: Path) -> None:
@@ -4173,34 +4109,6 @@ def test_enum_column_reports_its_own_oid(home: Path) -> None:
         assert cur.fetchone()[0] == "Xà"
 
 
-def test_an_enum_created_by_one_server_is_the_other_servers_too(home: Path) -> None:
-    """The enum catalog is a SHARED-STORE contract, not an implementation.
-
-    The Rust server writes the Python server's representation — `__sql_enums__`
-    docs with monotonically minted oids — so an enum created on one side must
-    resolve on the other, with the SAME oid.
-    """
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("create type rustmood as enum ('a','b')")
-        cur.execute("select oid from pg_type where typname = 'rustmood'")
-        rust_oid = cur.fetchone()[0]
-
-    # Python opens the same store and sees the type under the same oid…
-    assert _python_sql(home, "SELECT to_regtype('rustmood')::oid") == [(rust_oid,)]
-    # …and a type Python creates next mints the NEXT oid, not a reused one.
-    _python_sql(home, "CREATE TYPE pymood AS ENUM ('x')")
-
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        # The enums themselves; each also has an array type (`_rustmood`).
-        cur.execute(
-            "select typname, oid from pg_type where oid >= 65000 and typtype = 'e' order by oid"
-        )
-        rows = cur.fetchall()
-        assert rows == [("rustmood", rust_oid), ("pymood", rust_oid + 1)]
-
-
 def test_range_info_fetch(home: Path) -> None:
     """psycopg's RangeInfo.fetch — pg_range joined to pg_type in a PLAIN select.
 
@@ -4686,22 +4594,6 @@ def test_composite_type_ddl_and_catalog(home: Path) -> None:
         cur.execute("drop type testcomp")
         cur.execute("select to_regtype('testcomp')")
         assert cur.fetchone()[0] is None
-
-
-def test_a_composite_created_by_one_server_is_the_others_too(home: Path) -> None:
-    """The composite catalog is a shared-store contract, minted like enums."""
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("create type rustcomp as (a int4, b text)")
-        cur.execute("select oid from pg_type where typname = 'rustcomp'")
-        oid = cur.fetchone()[0]
-        assert oid >= 67000
-    assert _python_sql(home, "SELECT to_regtype('rustcomp')::oid") == [(oid,)]
-    _python_sql(home, "CREATE TYPE pycomp AS (c int8)")
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("select attname from pg_attribute where attrelid = to_regtype('pycomp')")
-        assert cur.fetchall() == [("c",)]
 
 
 def test_composite_value_record_cast(home: Path) -> None:
@@ -11481,30 +11373,6 @@ def test_update_into_a_duplicate_is_rejected(home: Path) -> None:
         assert cur.fetchone() == ("b",)
 
 
-def test_the_python_server_sees_the_unique_constraint(home: Path) -> None:
-    """The catalog shape is a cross-server contract.
-
-    A table the Rust server created with a UNIQUE must read back in the Python
-    server with that constraint intact — dropping the key would silently
-    rewrite the other server's catalog, and a later duplicate would land.
-    """
-    with _Server(home) as server, server.connect() as conn:
-        conn.cursor().execute("CREATE TABLE u6 (id int PRIMARY KEY, tag text UNIQUE)")
-
-    from secantus.sql.catalog import Catalog
-    from secantus.storage import Storage
-
-    storage = Storage(str(home))
-    try:
-        table = Catalog(storage).get("postgres", "u6")
-        assert table is not None
-        assert [(u.name, tuple(u.columns)) for u in table.unique_constraints] == [
-            ("u6_tag_key", ("tag",))
-        ]
-    finally:
-        storage.close()
-
-
 # Cross-PROTOCOL contract: the Rust PG server and the Rust MongoDB server over
 # one store. Measured 2026-09-18; before that it was asserted on the website and
 # in CLAUDE.md on the strength of "same secantus-storage, so it must follow",
@@ -14132,31 +14000,6 @@ def test_an_alter_rolls_back_with_its_transaction(home: Path) -> None:
         conn.commit()
 
 
-def test_the_python_server_reads_a_rust_altered_catalog(home: Path) -> None:
-    """The on-disk contract, which an ALTER is a new way to break.
-
-    An added column with a default, a widened type and a renamed column all
-    have to land in the catalog in the shape the PYTHON server reads -- and a
-    row it writes afterwards has to read back through the Rust one.
-    """
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("CREATE TABLE xr (id int PRIMARY KEY, n int)")
-        cur.execute("INSERT INTO xr VALUES (1, 10), (2, 20)")
-        cur.execute("ALTER TABLE xr ADD COLUMN tag text DEFAULT 'hi'")
-        cur.execute("ALTER TABLE xr ALTER COLUMN n TYPE bigint")
-        cur.execute("ALTER TABLE xr RENAME COLUMN n TO num")
-    assert _python_sql(home, "SELECT id, num, tag FROM xr ORDER BY id") == [
-        (1, 10, "hi"),
-        (2, 20, "hi"),
-    ]
-    _python_sql(home, "INSERT INTO xr (id, num, tag) VALUES (3, 30, 'py')")
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT id, num, tag FROM xr ORDER BY id")
-        assert cur.fetchall() == [(1, 10, "hi"), (2, 20, "hi"), (3, 30, "py")]
-
-
 @pytest.mark.parametrize(
     "sql,expected",
     [
@@ -14362,31 +14205,6 @@ def test_a_sequence_reads_as_a_relation(home: Path) -> None:
         cur.execute("SELECT nextval('r1'), nextval('r1')")
         cur.execute("SELECT last_value, is_called FROM r1")
         assert cur.fetchall() == [(12, True)]
-
-
-def test_the_python_server_reads_a_rust_identity_table(home: Path) -> None:
-    """`identity` is a catalog key the PYTHON server owns and this one did
-    not model, so it was written back as NULL and erased on any rewrite.
-
-    Unreachable until `ALTER TABLE` started rewriting catalog rows. Here the
-    Rust server creates an identity table, the Python one writes to it, the
-    Rust one ALTERs it, and the identity has to still be enforced afterwards.
-    """
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("CREATE TABLE ident (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v int)")
-        cur.execute("INSERT INTO ident (v) VALUES (1), (2)")
-    assert _python_sql(home, "SELECT id, v FROM ident ORDER BY id") == [(1, 1), (2, 2)]
-    _python_sql(home, "INSERT INTO ident (v) VALUES (3)")
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("ALTER TABLE ident ADD COLUMN tag text DEFAULT 'x'")
-        cur.execute("SELECT id, v, tag FROM ident ORDER BY id")
-        assert cur.fetchall() == [(1, 1, "x"), (2, 2, "x"), (3, 3, "x")]
-        # Still GENERATED ALWAYS after the rewrite.
-        with pytest.raises(psycopg.Error) as info:
-            cur.execute("INSERT INTO ident (id, v) VALUES (99, 9)")
-        assert info.value.sqlstate == "428C9"
 
 
 def _catalogued(conn: psycopg.Connection) -> None:
@@ -15195,29 +15013,6 @@ def test_normalize_across_all_four_unicode_forms(home: Path) -> None:
         assert cur.fetchall() == [(None, "abc", True)]
 
 
-def test_a_rust_view_and_index_are_read_by_the_python_server(home: Path) -> None:
-    """Views and indexes share the on-disk format across the two SQL servers.
-
-    A view is a `__sql_views__` row holding its SELECT as text, and an index
-    is a storage index over the table's collection, on both servers -- so a
-    store handed from one to the other keeps both. The column-list form is
-    stored as a wrapped subquery, which the Python server has to parse too.
-    """
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("CREATE TABLE vt (id int PRIMARY KEY, g text, n int)")
-        cur.execute("INSERT INTO vt VALUES (1,'a',10),(2,'a',20),(3,'b',NULL)")
-        cur.execute("CREATE VIEW v1 AS SELECT id, n FROM vt WHERE n IS NOT NULL")
-        cur.execute("CREATE VIEW v2 (k, total) AS SELECT g, sum(n) FROM vt GROUP BY g")
-        cur.execute("CREATE INDEX vt_n ON vt (n)")
-
-    assert _python_sql(home, "SELECT id, n FROM v1 ORDER BY id") == [(1, 10), (2, 20)]
-    assert _python_sql(home, "SELECT k, total FROM v2 ORDER BY k") == [("a", 30), ("b", None)]
-    assert _python_sql(home, "SELECT indexname FROM pg_indexes WHERE indexname = 'vt_n'") == [
-        ("vt_n",)
-    ]
-
-
 def test_a_unique_index_admits_many_nulls_and_names_itself(home: Path) -> None:
     """`CREATE UNIQUE INDEX` follows SQL's rule that NULLs are distinct, and a
     duplicate names the INDEX -- not a `<t>_<col>_key` guessed from its
@@ -15444,33 +15239,6 @@ def test_windows_over_aggregates_series_and_inside_expressions(home: Path) -> No
         assert cur.fetchall() == [(1, 1), (2, 3), (3, 6), (4, 10)]
         cur.execute("SELECT id, coalesce(lag(v) OVER (ORDER BY id), 0) FROM w ORDER BY id")
         assert cur.fetchall() == [(1, 0), (2, 10), (3, 20), (4, 5)]
-
-
-def test_a_composite_primary_key_shares_the_pythons_layout(home: Path) -> None:
-    """A composite key is a subdocument `_id` whose fields are the key columns
-    in TABLE order -- the Python server's layout -- so either server reads and
-    enforces the other's. A duplicate names the columns, not `_id`."""
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("CREATE TABLE ck (a int, b text, v int, PRIMARY KEY (a, b))")
-        cur.execute("INSERT INTO ck (b, a, v) VALUES ('x', 1, 10), ('y', 1, 20)")
-        with pytest.raises(psycopg.errors.UniqueViolation) as info:
-            cur.execute("INSERT INTO ck VALUES (1, 'x', 99)")
-        assert info.value.diag.message_detail == "Key (a, b)=(1, x) already exists."
-        with pytest.raises(psycopg.errors.NotNullViolation):
-            cur.execute("INSERT INTO ck VALUES (NULL, 'q', 1)")
-        cur.execute("UPDATE ck SET v = v + 1 WHERE a = 1")
-        cur.execute("SELECT c.a, sum(c.v) FROM ck c GROUP BY c.a")
-        assert cur.fetchall() == [(1, 32)]
-
-    assert _python_sql(home, "SELECT a, b, v FROM ck ORDER BY b") == [(1, "x", 11), (1, "y", 21)]
-    _python_sql(home, "INSERT INTO ck VALUES (2, 'z', 5)")
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT a, b, v FROM ck WHERE a = 2")
-        assert cur.fetchall() == [(2, "z", 5)]
-        with pytest.raises(psycopg.errors.UniqueViolation):
-            cur.execute("INSERT INTO ck VALUES (2, 'z', 6)")
 
 
 def test_a_role_with_a_password_must_prove_it(home: Path) -> None:
@@ -15702,16 +15470,8 @@ def test_full_text_search(home: Path) -> None:
         cur.execute("SELECT id FROM docs WHERE body @@ 'dogs' ORDER BY id")
         assert cur.fetchall() == [(2,)]
 
-    assert _python_sql(
-        home, "SELECT id FROM docs WHERE tv @@ to_tsquery('english', 'dog') ORDER BY id"
-    ) == [(2,)]
-    _python_sql(home, "INSERT INTO docs VALUES (3, 'birds', to_tsvector('english', 'birds fly'))")
-    with _Server(home) as server, server.connect() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT tv FROM docs WHERE id = 3")
-        assert cur.fetchone()[0] == "'bird':1 'fli':2"
-        cur.execute("SELECT id FROM docs WHERE tv @@ to_tsquery('english', 'bird') ORDER BY id")
-        assert cur.fetchall() == [(3,)]
+    # (Its hand-off to the deprecated Python server and back is retired: see
+    # the note after `_python_sql`.)
 
 
 def _fetch(conn, sql: str) -> list[tuple]:
@@ -17334,42 +17094,6 @@ def test_latin1_binary_text_arrays_and_untranslatable_names(home: Path) -> None:
         assert cur.fetchone() == ([["a", "b"], ["c", "d e"]],)
 
 
-def test_column_grants_are_shared_with_the_python_server(home: Path) -> None:
-    """Grants live in the shared catalog, in the Python server's own shape.
-
-    A column grant (`GRANT SELECT (v)`) is a row of `__sql_column_grants__`
-    and a touched ACL a row of `__sql_relation_acl__`, so either server reads
-    what the other wrote: the Python server reports the same `relacl` and
-    `attacl` for a store the Rust server granted on. A column grant used to be
-    recorded as a TABLE grant, which let the grantee read every column.
-    """
-    with _Server(home) as server, server.connect() as c:
-        c.execute("create role cg_r")
-        c.execute("create table cg_t (id int, v text)")
-        c.execute("grant select (v) on cg_t to cg_r")
-        c.execute("grant select on cg_t to cg_r")
-        c.execute("revoke select on cg_t from cg_r")
-        c.execute("grant select (v) on cg_t to cg_r")
-        c.execute("set role cg_r")
-        assert c.execute("select v from cg_t").fetchall() == []
-        with pytest.raises(psycopg.errors.InsufficientPrivilege):
-            c.execute("select id from cg_t")
-        c.execute("reset role")
-        rust_acl = c.execute(
-            "select relacl::text, (select attacl::text from pg_attribute"
-            " where attrelid = 'cg_t'::regclass and attname = 'v')"
-            " from pg_class where relname = 'cg_t'"
-        ).fetchone()
-    owner = rust_acl[0].strip("{}").split("=")[0]
-    assert rust_acl == (f"{{{owner}=arwdDxt/{owner}}}", f"{{cg_r=r/{owner}}}")
-    python_grants = _python_sql(
-        home,
-        "select grantee, privilege_type from information_schema.column_privileges"
-        " where table_name = 'cg_t' and grantee = 'cg_r'",
-    )
-    assert python_grants == [("cg_r", "SELECT")]
-
-
 def test_procedure_transaction_control_and_do_block_atomicity(home: Path) -> None:
     """COMMIT / ROLLBACK in a procedure, and a DO block's writes, as on PG 15.
 
@@ -17472,80 +17196,6 @@ def test_batch45_error_positions_and_hints(
         assert caught.value.sqlstate == sqlstate
         assert caught.value.diag.statement_position == str(position)
         assert caught.value.diag.message_hint == hint
-
-
-def test_expression_index_rows_written_elsewhere_are_reindexed_at_open(home: Path) -> None:
-    """A UNIQUE expression index is a storage index on a computed field.
-
-    The Python server knows no expression indexes, so a row it writes carries
-    no computed field. The Rust server recomputes the fields when it opens the
-    store, so the index still sees that row: a case-insensitive duplicate of
-    it is refused (PostgreSQL's 23505), not silently admitted.
-    """
-    with _Server(home) as server, server.connect() as c:
-        c.execute("create table ex_u (id int primary key, t text)")
-        c.execute("create unique index ex_u_lt on ex_u (lower(t))")
-        c.execute("insert into ex_u values (1, 'Apple')")
-    _python_sql(home, "insert into ex_u (id, t) values (2, 'Pear')")
-    with _Server(home) as server, server.connect() as c:
-        with pytest.raises(psycopg.errors.UniqueViolation) as caught:
-            c.execute("insert into ex_u values (3, 'PEAR')")
-        assert caught.value.diag.message_detail == "Key (lower(t))=(pear) already exists."
-        with pytest.raises(psycopg.errors.UniqueViolation):
-            c.execute("insert into ex_u values (4, 'APPLE')")
-        c.execute("insert into ex_u values (5, 'plum')")
-        assert c.execute("select count(*) from ex_u").fetchone() == (3,)
-
-
-def test_python_server_refuses_what_it_cannot_do_with_rust_partitions(home: Path) -> None:
-    """The Python server knows no partitions; a Rust-partitioned table's rows
-    live in the root's collection. It used to read a partition as EMPTY and
-    to accept a root write no partition covers. Now it reads the root (which
-    is right) and refuses the rest with 0A000."""
-    from secantus.sql.errors import SQLError
-
-    with _Server(home) as server, server.connect() as c:
-        c.execute("create table pp (id int, k int) partition by range (k)")
-        c.execute("create table pp1 partition of pp for values from (0) to (10)")
-        c.execute("insert into pp values (1, 5)")
-    assert _python_sql(home, "select id, k from pp") == [(1, 5)]
-    for sql in (
-        "select * from pp1",
-        "insert into pp values (2, 50)",
-        "delete from pp",
-        "drop table pp1",
-    ):
-        with pytest.raises(SQLError) as caught:
-            _python_sql(home, sql)
-        assert caught.value.sqlstate == "0A000", sql
-    with _Server(home) as server, server.connect() as c:
-        assert c.execute("select id, k from pp1").fetchall() == [(1, 5)]
-
-
-def test_python_rewrite_of_a_table_keeps_the_keys_only_rust_records(home: Path) -> None:
-    """A table's catalog document carries keys only the Rust server models
-    (`owner`, a column's `collation`). The Python server rewrote the
-    document from what IT models on any ALTER, erasing them. They now
-    round-trip verbatim."""
-    from secantus.storage import Storage
-
-    def catalog_doc() -> dict:
-        storage = Storage(str(home))
-        try:
-            return storage.find_matching("postgres", "__sql_catalog__", {"_id": "kk"})[0]
-        finally:
-            storage.close()
-
-    with _Server(home) as server, server.connect() as c:
-        c.execute('create table kk (id int, t text collate "C")')
-    owner = catalog_doc().get("owner")
-    assert owner
-    _python_sql(home, "alter table kk add column z int")
-    doc = catalog_doc()
-    assert doc.get("owner") == owner
-    by_name = {col["name"]: col for col in doc["columns"]}
-    assert by_name["t"].get("collation") == "C"
-    assert "z" in by_name
 
 
 def test_parallel_sessions_resolve_their_own_new_temp_table(home: Path) -> None:

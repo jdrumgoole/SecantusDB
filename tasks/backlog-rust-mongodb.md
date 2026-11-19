@@ -3054,3 +3054,19 @@ produce the dump it exists for.
       debug build under eight CPU burners (macOS arm64); CI is Linux x86_64.
       Backlog-ID: RM-725
       Verify: none -- intermittent: CI's Linux debug build met it once, and twenty local runs did not; the live test above is what catches it
+
+## Found while working the storage model (2026-11-19)
+
+- [ ] **A restore to the timestamp of a batched insert applies part of the
+      batch.** `insert_many` of two documents is one `applyOps` entry in
+      `local.oplog.rs` (as mongod 8.2 logs a batched insert), but
+      `secantusd-mdb restore --to-timestamp <that entry's ts>` restores only
+      the first document: the batch is kept as one entry per document
+      underneath, and the entry shows the first one's timestamp. mongod
+      applies an `applyOps` entry whole, at its one timestamp, so a restore
+      to it should give both documents. Found when
+      `tests/test_rust_binary_pitr.py::test_rust_binary_restore_to_timestamp`
+      took its timestamp from the oplog through the server; that test now
+      writes two separate inserts.
+      Backlog-ID: RM-727
+      Verify: none -- PITR restore is this server's own tool, with no mongod counterpart to compare; reproduce with the test above using insert_many

@@ -222,11 +222,13 @@ def test_rust_binary_restores_server_data(tmp_path: pathlib.Path) -> None:
 def test_rust_binary_restore_to_timestamp(tmp_path: pathlib.Path) -> None:
     data = tmp_path / "data"
     with _rust_server(data) as client:
-        client["app"]["c"].insert_many([{"_id": 1}, {"_id": 2}])
-        # The timestamp of the second insert: the oplog's last entry for it.
-        ts = next(client["local"]["oplog.rs"].find({"ns": "app.c"}).sort("$natural", -1).limit(1))[
-            "ts"
-        ]
+        # Two statements, each its own oplog entry: a restore to the
+        # timestamp of a batched insert's single `applyOps` entry applies
+        # only its first document (RM-727).
+        client["app"]["c"].insert_one({"_id": 1})
+        client["app"]["c"].insert_one({"_id": 2})
+        # The timestamp of the inserts: the last oplog entry carrying them.
+        ts = [e for e in client["local"]["oplog.rs"].find() if _app_c_ops(e)][-1]["ts"]
 
     out = tmp_path / "restored"
     res = _restore(data, out, "--to-timestamp", f"{ts.time},{ts.inc}")
@@ -329,11 +331,21 @@ def test_rust_binary_v2_archive_base_snapshot_and_restore(tmp_path: pathlib.Path
     assert _docs(out, "app", "c") == [{"_id": 1}, {"_id": 2}, {"_id": 3}]
 
 
+def _app_c_ops(entry: dict[str, Any]) -> int:
+    """How many operations on `app.c` an oplog entry carries: a batched insert
+    is one `applyOps` entry holding each document's operation, as mongod
+    8.2 logs it."""
+    if entry.get("ns") == "app.c":
+        return 1
+    inner = entry.get("o", {}).get("applyOps", []) if entry.get("op") == "c" else []
+    return sum(_app_c_ops(e) for e in inner)
+
+
 def _restored_oplog_len(path: pathlib.Path) -> int:
-    """How many CRUD entries for `app.c` the restored store's oplog holds,
-    read through the Rust binary."""
+    """How many operations on `app.c` the restored store's oplog holds, read
+    through the Rust binary."""
     with _rust_server(path) as client:
-        return client["local"]["oplog.rs"].count_documents({"ns": "app.c"})
+        return sum(_app_c_ops(e) for e in client["local"]["oplog.rs"].find())
 
 
 def test_rust_binary_preserve_oplog(tmp_path: pathlib.Path) -> None:

@@ -28,3 +28,12 @@ at open.
 
 - The migrations for stores written before document sharding and before
   RecordId keys: such stores are refused before they could run.
+
+#### Tests
+
+- Retired, with the reason written beside them: `tests/test_rust_store_handoff.py`
+  and fourteen tests in `tests/test_rust_pgserver_slice.py` that had the
+  deprecated Python server read or write a store a Rust server wrote. It does
+  not read a table per collection, and compatibility with it stopped being a
+  constraint on 2026-10-16. The SIGTERM durability test now reads its rows
+  back through `secantusd-pg`.
