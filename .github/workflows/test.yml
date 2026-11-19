@@ -95,7 +95,7 @@ jobs:
           packages: swig liblz4-dev
 
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
           enable-cache: true
           # setup-uv keys its cache on the interpreter at ITS step, not on
@@ -183,7 +183,7 @@ jobs:
 
       - name: Upload faulthandler crash dumps
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: faulthandler-test
           path: ${{ github.workspace }}/faulthandler-dumps/*.log
@@ -228,7 +228,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
           enable-cache: true
           # Two settings, both needed, that fix a cache that has never worked.
@@ -271,7 +271,7 @@ jobs:
       - name: Set up Python 3.12 (Windows tool cache)
         if: runner.os == 'Windows'
         id: setup-python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
       - name: Point uv at the tool-cached interpreter (Windows)
@@ -388,7 +388,7 @@ jobs:
       # third-party crates, so a PR's own copy differed from main's only
       # when the PR changed Cargo.lock.
       - name: Cache cargo registry + target (clean workspace)
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: |
             crates
@@ -518,7 +518,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
           enable-cache: true
           # Two settings, both needed, that fix a cache that has never worked.
@@ -561,7 +561,7 @@ jobs:
       - name: Set up Python 3.12 (Windows tool cache)
         if: runner.os == 'Windows'
         id: setup-python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
       - name: Point uv at the tool-cached interpreter (Windows)
@@ -697,7 +697,7 @@ jobs:
         run: df -h / | tail -1
 
       - name: Cache cargo registry + target (WT-linked crates)
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           # ONE workspace root per lane, never a list. Before saving, rust-cache
           # cleans the target once PER listed workspace, keeping only that
@@ -960,7 +960,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
 
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
           enable-cache: true
           # Two settings, both needed, that fix a cache that has never worked.
@@ -1003,7 +1003,7 @@ jobs:
       - name: Set up Python 3.12 (Windows tool cache)
         if: runner.os == 'Windows'
         id: setup-python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: "3.12"
       - name: Point uv at the tool-cached interpreter (Windows)
@@ -1404,7 +1404,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30  # stable
 
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
           # See the storage-engine job for both settings.
           enable-cache: true
@@ -1465,7 +1465,7 @@ jobs:
           echo "SECANTUS_WT_LIB=$wt" >> "$GITHUB_ENV"
 
       - name: Cache cargo registry + target (secantusdb debug)
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           workspaces: crates/secantusdb -> target
           # Both shards build the same binary: one cache.
@@ -1689,7 +1689,7 @@ jobs:
         uses: ./.github/actions/image-libclang
 
       - name: Install uv
-        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7.6.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
         with:
           enable-cache: true
 
@@ -1738,7 +1738,7 @@ jobs:
       # targets), so only that shard saves, and only on main (see the
       # ``rust`` job's cache step for why not from PRs).
       - name: Cache cargo registry + target (secantus-pg, secantusdb)
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           shared-key: pg-oracle
           workspaces: |
