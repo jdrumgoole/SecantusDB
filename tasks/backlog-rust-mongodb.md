@@ -3019,3 +3019,26 @@ produce the dump it exists for.
       Found measuring phase 0c.
       Backlog-ID: RM-724
       Verify: tests/backlog/test_rm_storage_model.py::test_shutdown_command_stops_the_server
+
+## Found in CI on 2026-11-19
+
+- [ ] **A killed retryable update batch's retry once disagreed with what
+      the kill left applied (seen once in CI).** `tests/mongod_live/
+      test_interrupts.py::test_a_killed_batch_keeps_the_statements_before`
+      failed on PR #2887's `mdb-binary (live)` job (2026-11-19, run
+      44516075354, job 135532292126; that PR changed no server code). The
+      kill's reply matched mongod 8.2.11's, but after it the retry's
+      `retriedStmtIds` was not the statements already applied, and the
+      collection did not end with each of the fifty statements applied once
+      (`(reply, True, False, False)` against mongod's `(..., True, True,
+      True)`). Either the retry re-ran a statement the killed batch had
+      committed -- a retryable write applied twice -- or it skipped one.
+      Suspected mechanism, not proven: `retry_batch`
+      (`crates/secantus-commands/src/session.rs`) drops the statements a
+      batch noted when its reply is not ok, so a killed batch leaves the
+      in-memory registry without the statements it committed, and only the
+      per-statement `config.transactions` row and the oplog say what ran.
+      Not reproduced here: 6 of 6 passes on a release build, 8 of 8 on the
+      debug build under eight CPU burners (macOS arm64); CI is Linux x86_64.
+      Backlog-ID: RM-725
+      Verify: none -- intermittent: CI's Linux debug build met it once, and twenty local runs did not; the live test above is what catches it
