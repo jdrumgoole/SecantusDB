@@ -9,10 +9,10 @@ archive and a capped collection's options with the deprecated Python
 ``test_rust_create_options_survive_restore``. The Rust servers write mongod's
 layout, which the Python store does not read; compatibility with the Python
 servers stopped being a constraint on 2026-10-16 (CLAUDE.md). What is lost: a
-check that the Python tool rebuilds a Rust store, and the only check that a
-capped collection's options and validator survive a restore. The Rust
-restore's own tests (``tests/test_rust_binary_pitr.py``) cover a data
-directory, a timestamp and an archive through ``secantusd-mdb restore``.
+check that the Python tool rebuilds a Rust store. The Rust restore's own
+tests (``tests/test_rust_binary_pitr.py``) cover a data directory, a
+timestamp, an archive and a capped collection's options through
+``secantusd-mdb restore``.
 
 Gated on the WiredTiger-linking ``_secantus_server`` extension.
 """
