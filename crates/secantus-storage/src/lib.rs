@@ -10315,6 +10315,14 @@ impl Storage {
                 next - 1
             );
         }
+        // Nothing above the stable marker (a clean close, or a new store):
+        // the marker already names the tail, and re-anchoring would checkpoint
+        // only to write the same seq back. Skipping it keeps that checkpoint
+        // (~25-40 ms, measured 2026-11-19) off every start; the periodic
+        // stable checkpoint anchors the marker as soon as there is a gap.
+        if next == floor + 1 {
+            return Ok(());
+        }
         // Re-anchor so the next crash replays only its own gap (and the prune
         // clamp releases the window just replayed).
         self.stable_checkpoint()
@@ -19303,9 +19311,14 @@ impl Storage {
         if stored_id_key_format(&session)? >= sortkey::ID_KEY_FORMAT {
             return Ok(());
         }
-        self.rekey_format1_ids(&session)?;
-        if self.data_nonlogged && !self.in_memory {
-            self.checkpoint()?;
+        // A new store holds no format-1 keys: there is nothing to re-key, and
+        // the checkpoint below only guards re-keyed data. Skipping both keeps
+        // a checkpoint (~30-100 ms, measured 2026-11-19) off every cold start.
+        if !self.open_record.new_store {
+            self.rekey_format1_ids(&session)?;
+            if self.data_nonlogged && !self.in_memory {
+                self.checkpoint()?;
+            }
         }
         session.begin_transaction(None)?;
         let outcome = (|| -> Result<()> {
