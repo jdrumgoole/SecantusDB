@@ -315,9 +315,12 @@ Ready for it:
   binding is unconfirmed: the release's `publish crates` run shows it.
 - **Windows WiredTiger under MSVC 19.52** (runner image 20261111 on) failed
   on C4815 under strict `/WX`; `cmake/patch_wt_strict.py` disables that one
-  diagnostic (#2917). Proven harmless on MSVC 19.51; main's first Windows
-  run on a 19.52 image is the proof it fixes the break. The release's
-  Windows binary build depends on it.
+  diagnostic (#2917). Proven harmless on MSVC 19.51 (four runs). Not yet
+  run on 19.52: after #2917 every Windows runner served image 20261103
+  (19.51), and `psycopg-windows.yml` does not run on a `cmake/` change. Read
+  the compiler line of the next Windows run (`C compiler identification`):
+  the first on 19.52 is the proof. The release's Windows binary build
+  depends on it.
 
 Then, at the release: watch `release-binaries.yml` (three binary archives
 plus two `secantusdb-ext-*` archives), `publish-pypi.yml` (four wheels, both
