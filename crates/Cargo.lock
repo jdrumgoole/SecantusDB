@@ -1874,6 +1874,7 @@ dependencies = [
  "regex",
  "regex-automata",
  "secantus-icu",
+ "serde_json",
  "snap",
 ]
 

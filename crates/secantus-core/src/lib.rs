@@ -39,6 +39,7 @@ pub mod geoshape;
 pub mod heap;
 pub mod hybrid;
 pub mod index_keys;
+pub mod keystring;
 pub mod logtime;
 pub mod memlimit;
 pub mod oid;
