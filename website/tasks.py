@@ -285,11 +285,15 @@ def deploy(c: Context) -> None:
     # delete-sweeping S3 sync owns /docs/ and /docs/rust/ (anything the
     # sync doesn't know about it deletes — the docs must ride inside the
     # build, not be uploaded separately). Both trees build via the main
-    # repo's invoke tasks (-W, no WiredTiger build needed).
+    # repo's invoke tasks (-W, no WiredTiger build needed). Built --clean:
+    # Sphinx leaves the HTML of a deleted page in _build, and the graft
+    # below would publish it again (2026-11-19: the removed Python-server
+    # pages stayed live after their sources were deleted).
     main_repo = _main_repo_root() or REPO_ROOT
     print("=== Building docs trees (main + rust) ===")
     c.run(
-        f"cd {shlex.quote(str(main_repo))} && uv run --no-sync python -m invoke docs docs-rust",
+        f"cd {shlex.quote(str(main_repo))} && "
+        "uv run --no-sync python -m invoke docs --clean docs-rust --clean",
         pty=True,
     )
     docs_out = OUTPUT / "docs"
