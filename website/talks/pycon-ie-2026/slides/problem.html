@@ -1,30 +1,22 @@
-<section id="problem" style="gap:32px;">
+<section id="problem" style="gap:48px;">
 <p class="eyebrow">What already exists</p>
 <h2>One protocol every driver already speaks</h2>
-<p class="lede">The drivers exist. The engine exists. The gap is the server in between.</p>
-<div style="display:flex;flex-direction:column;gap:12px;">
-<div class="drivers" style="display:grid;grid-template-columns:repeat(11,1fr);gap:12px;">
-<div style="display:flex;flex-direction:column;align-items:center;gap:6px;"><div class="box" style="flex:none;width:100%;box-sizing:border-box;padding:14px 4px;text-align:center;"><p class="t" style="font-size:26px;">Python</p></div><p class="arrow down" style="font-size:34px;line-height:1;">↓</p></div>
-<div style="display:flex;flex-direction:column;align-items:center;gap:6px;"><div class="box" style="flex:none;width:100%;box-sizing:border-box;padding:14px 4px;text-align:center;"><p class="t" style="font-size:26px;">Node.js</p></div><p class="arrow down" style="font-size:34px;line-height:1;">↓</p></div>
-<div style="display:flex;flex-direction:column;align-items:center;gap:6px;"><div class="box" style="flex:none;width:100%;box-sizing:border-box;padding:14px 4px;text-align:center;"><p class="t" style="font-size:26px;">Java</p></div><p class="arrow down" style="font-size:34px;line-height:1;">↓</p></div>
-<div style="display:flex;flex-direction:column;align-items:center;gap:6px;"><div class="box" style="flex:none;width:100%;box-sizing:border-box;padding:14px 4px;text-align:center;"><p class="t" style="font-size:26px;">Kotlin</p></div><p class="arrow down" style="font-size:34px;line-height:1;">↓</p></div>
-<div style="display:flex;flex-direction:column;align-items:center;gap:6px;"><div class="box" style="flex:none;width:100%;box-sizing:border-box;padding:14px 4px;text-align:center;"><p class="t" style="font-size:26px;">Go</p></div><p class="arrow down" style="font-size:34px;line-height:1;">↓</p></div>
-<div style="display:flex;flex-direction:column;align-items:center;gap:6px;"><div class="box" style="flex:none;width:100%;box-sizing:border-box;padding:14px 4px;text-align:center;"><p class="t" style="font-size:26px;">Rust</p></div><p class="arrow down" style="font-size:34px;line-height:1;">↓</p></div>
-<div style="display:flex;flex-direction:column;align-items:center;gap:6px;"><div class="box" style="flex:none;width:100%;box-sizing:border-box;padding:14px 4px;text-align:center;"><p class="t" style="font-size:26px;">C</p></div><p class="arrow down" style="font-size:34px;line-height:1;">↓</p></div>
-<div style="display:flex;flex-direction:column;align-items:center;gap:6px;"><div class="box" style="flex:none;width:100%;box-sizing:border-box;padding:14px 4px;text-align:center;"><p class="t" style="font-size:26px;">C++</p></div><p class="arrow down" style="font-size:34px;line-height:1;">↓</p></div>
-<div style="display:flex;flex-direction:column;align-items:center;gap:6px;"><div class="box" style="flex:none;width:100%;box-sizing:border-box;padding:14px 4px;text-align:center;"><p class="t" style="font-size:26px;">C#</p></div><p class="arrow down" style="font-size:34px;line-height:1;">↓</p></div>
-<div style="display:flex;flex-direction:column;align-items:center;gap:6px;"><div class="box" style="flex:none;width:100%;box-sizing:border-box;padding:14px 4px;text-align:center;"><p class="t" style="font-size:26px;">Ruby</p></div><p class="arrow down" style="font-size:34px;line-height:1;">↓</p></div>
-<div style="display:flex;flex-direction:column;align-items:center;gap:6px;"><div class="box" style="flex:none;width:100%;box-sizing:border-box;padding:14px 4px;text-align:center;"><p class="t" style="font-size:26px;">PHP</p></div><p class="arrow down" style="font-size:34px;line-height:1;">↓</p></div>
+<div class="flow" style="gap:20px;align-items:center;margin:auto 0;">
+<div style="flex:none;width:230px;display:flex;flex-direction:column;gap:10px;">
+<div style="display:flex;align-items:center;gap:10px;"><div class="box" style="padding:10px 18px;"><p class="t" style="font-size:24px;">Python</p></div><p class="arrow" style="font-size:30px;">→</p></div>
+<div style="display:flex;align-items:center;gap:10px;"><div class="box" style="padding:10px 18px;"><p class="t" style="font-size:24px;">Node.js</p></div><p class="arrow" style="font-size:30px;">→</p></div>
+<div style="display:flex;align-items:center;gap:10px;"><div class="box" style="padding:10px 18px;"><p class="t" style="font-size:24px;">Rust</p></div><p class="arrow" style="font-size:30px;">→</p></div>
+<div style="display:flex;align-items:center;gap:10px;"><div class="box" style="padding:10px 18px;"><p class="t" style="font-size:24px;">Go</p></div><p class="arrow" style="font-size:30px;">→</p></div>
+<div style="display:flex;align-items:center;gap:10px;"><div class="box" style="padding:10px 18px;"><p class="t" style="font-size:24px;">C#</p></div><p class="arrow" style="font-size:30px;">→</p></div>
+<div style="display:flex;align-items:center;gap:10px;"><div class="box" style="padding:10px 18px;border-style:dashed;"><p class="t" style="font-size:24px;">Others</p></div><p class="arrow" style="font-size:30px;">→</p></div>
 </div>
-<div class="box" style="flex:none;background:var(--ink);border-color:var(--ink);color:var(--paper);padding:20px 32px;display:flex;align-items:baseline;gap:24px;"><p class="t">MongoDB wire protocol</p><p style="color:var(--softdark);">OP_MSG over TCP · BSON in, BSON out</p></div>
-<p class="arrow down" style="font-size:34px;line-height:1;margin-left:216px;">↓</p>
-<div class="flow">
-<div class="box"><p class="t">secantus-wire</p><p>commands</p></div>
+<div class="box" style="flex:0.9;align-self:stretch;display:flex;flex-direction:column;justify-content:center;gap:8px;background:var(--ink);border-color:var(--ink);color:var(--paper);padding:24px;"><p class="t" style="font-size:28px;">MongoDB wire protocol</p><p style="color:var(--softdark);font-size:24px;">OP_MSG over TCP</p></div>
 <p class="arrow">→</p>
-<div class="box"><p class="t">secantus-core</p><p>query, update, aggregate</p></div>
+<div class="box" style="padding:24px;"><p class="t" style="font-size:28px;">secantus-wire</p><p style="font-size:24px;">commands</p></div>
 <p class="arrow">→</p>
-<div class="box wt" style="flex:1.2;"><p class="t">secantus-storage</p><p>WiredTiger</p></div>
+<div class="box" style="padding:24px;"><p class="t" style="font-size:28px;">secantus-core</p><p style="font-size:24px;">query, update, aggregate</p></div>
+<p class="arrow">→</p>
+<div class="box wt" style="padding:24px;flex:1.15;"><p class="t" style="font-size:28px;">secantus-storage</p><p style="font-size:24px;">WiredTiger</p></div>
 </div>
-</div>
-<aside><p><b>The drivers exist:</b> every official MongoDB driver speaks the same wire protocol. These are the eleven languages whose official drivers' own test suites we run unmodified: pymongo, Node.js, Java, Kotlin, Go, Rust, C, C++, C#, Ruby and PHP. Their authors have already written thousands of tests describing what a server must do.</p><p><b>The engine exists:</b> WiredTiger gives us checkpoints, transactions and durability. <b>The gap</b> is the server in between, and all the hard work is in being faithful.</p><p><b>Walk the stack:</b> OP_MSG arrives over TCP; secantus-wire turns it into commands; secantus-core runs the query, update and aggregation engines; secantus-storage talks to WiredTiger.</p><p class="time">Time: ~2½ min</p></aside>
+<aside><p><b>The drivers exist:</b> every official MongoDB driver speaks the same wire protocol. We run the official drivers' own test suites unmodified: Python, Node.js, Rust, Go and C# on the slide, plus Java, Kotlin, C, C++, Ruby and PHP. Their authors have already written thousands of tests describing what a server must do.</p><p><b>The engine exists:</b> WiredTiger gives us checkpoints, transactions and durability. <b>The gap</b> is the server in between, and all the hard work is in being faithful.</p><p><b>Walk the stack, left to right:</b> OP_MSG arrives over TCP; secantus-wire turns it into commands; secantus-core runs the query, update and aggregation engines; secantus-storage talks to WiredTiger.</p><p class="time">Time: ~2½ min</p></aside>
 </section>
