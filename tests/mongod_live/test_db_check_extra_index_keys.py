@@ -154,10 +154,26 @@ def _run(client: Any) -> list:
             for o in entries
             if o.get("type") == "batch"
         ]
-        warnings = [
-            (h["msg"], h["data"]["error"].split(" and uuid ")[0])
-            for h in client.local["system.healthlog"].find({"namespace": ns, "severity": "warning"})
-        ]
+
+        # mongod writes its health log through a deferred writer, after the
+        # `stop` entry: read it until two reads half a second apart agree
+        # (PR #2906's CI read it before mongod's warning landed).
+        def health(ns: str = ns) -> list:
+            return [
+                (h["msg"], h["data"]["error"].split(" and uuid ")[0])
+                for h in client.local["system.healthlog"].find(
+                    {"namespace": ns, "severity": "warning"}
+                )
+            ]
+
+        warnings = health()
+        settle = time.monotonic() + 10
+        while time.monotonic() < settle:
+            time.sleep(0.5)
+            again = health()
+            if again == warnings:
+                break
+            warnings = again
         out.append((name, [o.get("type") for o in entries], batches, warnings))
     client.drop_database("rm416live")
     return out
