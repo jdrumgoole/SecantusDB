@@ -80,8 +80,11 @@ jobs:
           cp -R crates/secantus-compressors "$root/secantus-compressors"
           cp -R vendor/snappy "$root/secantus-compressors/snappy"
           cp -R vendor/zstandard "$root/secantus-compressors/zstandard"
-          printf '[patch.crates-io]\nsecantus-compressors = { path = "%s" }\n' \
-            "$root/secantus-compressors" > "$root/.cargo/config.toml"
+          # Relative: a config file's paths resolve from the directory that
+          # holds its `.cargo`, and an absolute Windows path's backslashes
+          # are not valid TOML.
+          printf '[patch.crates-io]\nsecantus-compressors = { path = "secantus-compressors" }\n' \
+            > "$root/.cargo/config.toml"
           cd "$stage"
           # `cargo package` verifies by building the extracted .crate.
           CARGO_TARGET_DIR="$RUNNER_TEMP/wt-sys-target" cargo package --allow-dirty
