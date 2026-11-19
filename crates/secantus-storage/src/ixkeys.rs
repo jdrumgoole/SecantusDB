@@ -60,6 +60,12 @@ impl KeyShape {
         }
     }
 
+    /// Whether BinData values are keyed as `bytea`-ordered text (see
+    /// `bytes_order`): such an index holds them under the string type byte.
+    pub fn bytes_order(&self) -> bool {
+        self.bytes_order
+    }
+
     /// A one-field ascending key with no collation: a geo index's cell.
     pub fn plain() -> Self {
         KeyShape {

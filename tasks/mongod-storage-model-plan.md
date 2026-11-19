@@ -319,8 +319,21 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
        the next open drops; a rollback drops it through the transaction's end
        hook (a deferred create keeps it in the transaction's own placement).
        A drop or rename moves no entries: the table follows the placement.
-     - The reaper drops with `force`: without it, a pooled session's cached
-       data handle kept a table from ever being dropped (`EBUSY`).
+     - The reaper drops with `force`, as mongod's ident drop does
+       (`force,checkpoint_wait=false`): without it, a pooled session's
+       cached data handle kept a table from ever being dropped (`EBUSY`),
+       which also meant phase 3's dropped collection tables went only at the
+       next open. A table with a cursor open on it still refuses and waits.
+     - A dropped table goes only once a checkpoint begun after its drop has
+       completed (`DropPending`), as mongod keeps a drop-pending ident until
+       the checkpoint no longer needs it: until then a read of the last
+       checkpoint (a background `validate`) still finds the collection.
+       Dropping at once lost that read about one time in thirteen under load
+       (`diagnostic_commands_wt::background_validate_reads_the_last_checkpoint`).
+     - Still to fix (phase 8): a collection created by a transaction that
+       does not defer its creates (the PostgreSQL server's) and then rolled
+       back leaves its empty `collection-*` table until the next open drops
+       it; `ensure_collection` has no hook into the store's drop list.
      - Key generation is unchanged, so an array still gets the whole-array
        entry besides mongod's element keys (`secantus_core::index_keys`).
        mongod's `validate` would count those as extra keys: phase 7 must

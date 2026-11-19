@@ -984,10 +984,7 @@ fn record_index_ident(
         let orphan = ident.to_string();
         session.on_transaction_end(Box::new(move |committed| {
             if !committed {
-                pending
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(orphan);
+                pending.lock().push(orphan);
             }
         }));
     }
@@ -5665,7 +5662,7 @@ pub struct Storage {
     /// dropped when nothing has it open; until then it waits here, retried
     /// by each drop, by the checkpoint thread and at close, and an open
     /// drops any its predecessor left (`reconcile_idents`).
-    drop_pending: Arc<Mutex<Vec<String>>>,
+    drop_pending: Arc<DropPending>,
     /// Which collections of one database hold an index of each name: the
     /// relation-name lookup [`Self::index_owners`] answers from, kept
     /// current from the index catalog's change log (RP-928).
@@ -8456,7 +8453,7 @@ impl Storage {
                 // race). A checkpoint failure is logged, never silent: in a
                 // database a close-time write error is a durability signal.
                 if self.durable && !self.in_memory {
-                    if let Err(e) = session.checkpoint(None) {
+                    if let Err(e) = self.drop_pending.checkpoint(&session) {
                         fail("the final checkpoint", e.into());
                     }
                 }
@@ -8739,7 +8736,7 @@ impl Storage {
             desc_cache: std::sync::RwLock::new(HashMap::new()),
             options_cache: std::sync::RwLock::new(HashMap::new()),
             list_cache: std::sync::RwLock::new(HashMap::new()),
-            drop_pending: Arc::new(Mutex::new(Vec::new())),
+            drop_pending: Arc::new(DropPending::new(in_memory)),
             index_names: Mutex::new(None),
             txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
             cache_bytes: parse_cache_bytes(config),
@@ -10314,7 +10311,7 @@ impl Storage {
             advance_timestamps(&self.conn, &self.oplog)?;
         }
         let session = self.conn.open_session()?;
-        session.checkpoint(None)?;
+        self.drop_pending.checkpoint(&session)?;
         Ok(())
     }
 
@@ -10387,7 +10384,7 @@ impl Storage {
             {
                 let pending = self.drop_pending.clone();
                 session.on_transaction_end(Box::new(move |_| {
-                    let mut pending = pending.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut pending = pending.lock();
                     pending.push(p.ident);
                     pending.extend(p.indexes.into_values());
                 }));
@@ -10403,7 +10400,7 @@ impl Storage {
         let pending = self.drop_pending.clone();
         session.on_transaction_end(Box::new(move |committed| {
             if committed {
-                let mut pending = pending.lock().unwrap_or_else(|e| e.into_inner());
+                let mut pending = pending.lock();
                 pending.push(p.ident);
                 pending.extend(p.indexes.into_values());
             }
@@ -10432,10 +10429,7 @@ impl Storage {
                     // goes once the transaction is over.
                     let pending = self.drop_pending.clone();
                     session.on_transaction_end(Box::new(move |_| {
-                        pending
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push(ident);
+                        pending.lock().push(ident);
                     }));
                 }
                 return Ok(());
@@ -10451,10 +10445,7 @@ impl Storage {
         let pending = self.drop_pending.clone();
         session.on_transaction_end(Box::new(move |committed| {
             if committed {
-                pending
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(ident);
+                pending.lock().push(ident);
             }
         }));
         Ok(())
@@ -10534,10 +10525,23 @@ impl Storage {
         }
     }
 
-    /// Run the drop-pending reaper now: drop every table a committed drop or
-    /// a rolled-back create left that nothing has open. For tests.
+    /// Take a checkpoint and run the drop-pending reaper: drop every table a
+    /// committed drop or a rolled-back create left that nothing has open and
+    /// no checkpoint holds any more -- what the checkpoint thread does on a
+    /// running server. For tests.
     #[doc(hidden)]
     pub fn reap_dropped_tables(&self) {
+        if !self.in_memory {
+            if let Ok(session) = self.conn.open_session() {
+                let _cp = self
+                    .checkpoint_gate
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = self.drop_pending.checkpoint(&session) {
+                    eprintln!("secantus-storage: checkpoint before reaping: {e:?}");
+                }
+            }
+        }
         reap_drop_pending(&self.conn, &self.drop_pending);
     }
 
@@ -10582,10 +10586,7 @@ impl Storage {
     /// Drop `ident`'s table now if nothing has it open, else when the
     /// drop-pending reaper next finds it free (`drop_pending`).
     fn drop_ident_table(&self, ident: &str) {
-        self.drop_pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(ident.to_string());
+        self.drop_pending.lock().push(ident.to_string());
         reap_drop_pending(&self.conn, &self.drop_pending);
     }
 
@@ -10987,7 +10988,8 @@ impl Storage {
                         // MODE, which a logged store must not acquire.
                         let done = {
                             let _cp = gate.lock().unwrap_or_else(|e| e.into_inner());
-                            conn.open_session().and_then(|s| s.checkpoint(None))
+                            conn.open_session()
+                                .and_then(|s| drop_pending.checkpoint(&s))
                         };
                         if let Err(e) = done {
                             eprintln!("secantus-storage: periodic checkpoint failed: {e:?}");
@@ -11017,7 +11019,7 @@ impl Storage {
                         let session = conn.open_session()?;
                         {
                             let _cp = gate.lock().unwrap_or_else(|e| e.into_inner());
-                            session.checkpoint(None)?;
+                            drop_pending.checkpoint(&session)?;
                         }
                         let mut d = Document::new();
                         d.insert("stable_seq", stable);
@@ -11069,7 +11071,7 @@ impl Storage {
         // Durable, consistent snapshot first; the backup cursor enumerates the
         // files that make it up and WiredTiger holds them stable for the cursor's
         // lifetime, so we tar them all before it drops.
-        session.checkpoint(None)?;
+        self.drop_pending.checkpoint(&session)?;
         let manifest = self.pitr_manifest()?;
         let cursor = session.open_cursor("backup:", None)?;
         // Written under a temporary name and renamed once synced, so a
@@ -16628,10 +16630,7 @@ impl Storage {
                 // `record_index_ident`'s own rollback hook.)
                 let pending = self.drop_pending.clone();
                 session.on_transaction_end(Box::new(move |_| {
-                    pending
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(ident);
+                    pending.lock().push(ident);
                 }));
             }
             return Err(e);
@@ -26373,8 +26372,8 @@ impl Storage {
 /// Drop what it can of `pending`: each ident's table nothing has open. A
 /// table still open stays for the next attempt; a table already gone is
 /// done. Any other failure is reported and the ident kept.
-fn reap_drop_pending(conn: &Connection, pending: &Mutex<Vec<String>>) {
-    let idents = std::mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
+fn reap_drop_pending(conn: &Connection, pending: &DropPending) {
+    let idents = pending.take_eligible();
     if idents.is_empty() {
         return;
     }
@@ -26382,32 +26381,107 @@ fn reap_drop_pending(conn: &Connection, pending: &Mutex<Vec<String>>) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("secantus-storage: dropping tables: {e:?}");
-            pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend(idents);
+            pending.put_back(idents);
             return;
         }
     };
     let mut kept = Vec::new();
-    for ident in idents {
-        // `force`: a session that has only a cached cursor or a cached handle
-        // of the table (every pooled session that ever wrote it) must not
-        // keep it from going; one with a cursor open on it still does.
+    for (ident, at) in idents {
+        // `force`, as mongod's ident drop (`force,checkpoint_wait=false`): a
+        // session that has only a cached cursor or a cached handle of the
+        // table (every pooled session that ever wrote it) must not keep it
+        // from going; one with a cursor open on it still does.
         match session.drop_table(&mdb_catalog::table_uri(&ident), Some("force=true")) {
             Ok(()) => {}
             Err(e) if e.is_missing_table() || e.is_not_found() => {}
-            Err(e) if e.is_busy() => kept.push(ident),
+            Err(e) if e.is_busy() => kept.push((ident, at)),
             Err(e) => {
                 eprintln!("secantus-storage: dropping table {ident}: {e:?}");
-                kept.push(ident);
+                kept.push((ident, at));
             }
         }
     }
-    pending
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .extend(kept);
+    pending.put_back(kept);
+}
+
+/// mongod's drop-pending idents: the tables of dropped collections and
+/// indexes, each with the number of checkpoints begun when its drop
+/// committed. A table goes only once a checkpoint begun AFTER its drop has
+/// completed: until then the last checkpoint still holds it, and a read of
+/// that checkpoint (a background `validate`) reads it, as mongod's does
+/// (mongod keeps a drop-pending ident until the checkpoint no longer needs
+/// it). A store without checkpoints (in memory) drops at once.
+pub(crate) struct DropPending {
+    idents: Mutex<Vec<(String, u64)>>,
+    /// Checkpoints begun.
+    started: AtomicU64,
+    /// The number (in `started` order) of the latest checkpoint completed.
+    completed: AtomicU64,
+    checkpointless: bool,
+}
+
+/// [`DropPending::lock`]: idents pushed through it are stamped with the
+/// checkpoints begun so far.
+pub(crate) struct PendingGuard<'a> {
+    list: std::sync::MutexGuard<'a, Vec<(String, u64)>>,
+    at: u64,
+}
+
+impl PendingGuard<'_> {
+    pub(crate) fn push(&mut self, ident: String) {
+        let at = self.at;
+        self.list.push((ident, at));
+    }
+
+    pub(crate) fn extend(&mut self, idents: impl IntoIterator<Item = String>) {
+        let at = self.at;
+        self.list.extend(idents.into_iter().map(|i| (i, at)));
+    }
+}
+
+impl DropPending {
+    fn new(checkpointless: bool) -> Self {
+        DropPending {
+            idents: Mutex::new(Vec::new()),
+            started: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            checkpointless,
+        }
+    }
+
+    pub(crate) fn lock(&self) -> PendingGuard<'_> {
+        PendingGuard {
+            at: self.started.load(Ordering::SeqCst),
+            list: self.idents.lock().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+
+    /// The idents a checkpoint begun after their drop has released.
+    fn take_eligible(&self) -> Vec<(String, u64)> {
+        let completed = self.completed.load(Ordering::SeqCst);
+        let mut list = self.idents.lock().unwrap_or_else(|e| e.into_inner());
+        let (ready, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut *list)
+            .into_iter()
+            .partition(|(_, at)| self.checkpointless || completed > *at);
+        *list = wait;
+        ready
+    }
+
+    fn put_back(&self, idents: Vec<(String, u64)>) {
+        self.idents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(idents);
+    }
+
+    /// Take a checkpoint on `session`, counted: what releases drop-pending
+    /// idents.
+    fn checkpoint(&self, session: &Session) -> std::result::Result<(), WtError> {
+        let n = self.started.fetch_add(1, Ordering::SeqCst) + 1;
+        session.checkpoint(None)?;
+        self.completed.fetch_max(n, Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 /// At open: drop every collection table no placement names, which a crash
@@ -27878,10 +27952,7 @@ fn flush_deferred_creates(
             .collect();
         let pending = storage.drop_pending.clone();
         session.on_transaction_end(Box::new(move |_| {
-            pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend(idents);
+            pending.lock().extend(idents);
         }));
         return Err(e);
     }

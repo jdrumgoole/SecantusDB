@@ -778,7 +778,13 @@ pub(crate) fn to_key_spans(
     pos: usize,
 ) -> Option<Vec<Span>> {
     let floor = |r: u8| -> Vec<u8> {
-        let c = ks_floor_byte(r);
+        // An index that keys BinData as `bytea`-ordered text holds it under
+        // the string type byte: its bracket starts there.
+        let c = if r == 7 && shape.bytes_order() {
+            ks_floor_byte(4)
+        } else {
+            ks_floor_byte(r)
+        };
         if dir == -1 {
             vec![(!c).wrapping_add(1)]
         } else {
