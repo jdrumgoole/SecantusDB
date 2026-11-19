@@ -151,7 +151,7 @@ impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// The canonical type bytes (`CType`). 0-9 and 246-255 are reserved.
-pub(crate) mod ctype {
+pub mod ctype {
     pub const MIN_KEY: u8 = 10;
     pub const UNDEFINED: u8 = 15;
     pub const NULLISH: u8 = 20;

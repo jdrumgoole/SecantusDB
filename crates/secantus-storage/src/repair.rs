@@ -72,7 +72,7 @@ pub fn repair(
 
     let storage = Storage::open_with_options(home, opts)?;
     let salvaged = |t: &str| report.salvaged.iter().any(|s| s == t);
-    let shared_index_salvaged = [NAT_SEQ_TABLE, IDX_ENTRIES_TABLE, UNIQ_TABLE, IDX_TABLE]
+    let shared_index_salvaged = [NAT_SEQ_TABLE, UNIQ_TABLE, IDX_TABLE]
         .iter()
         .any(|t| salvaged(t));
     let mut rebuilt = Vec::new();
@@ -84,7 +84,11 @@ pub fn repair(
             let check = storage.check_collection(&db, &coll)?;
             let inconsistent = check_disagrees(&check);
             let table = storage.collection_table_name(&db, &coll)?;
-            let table_salvaged = table.as_deref().is_some_and(&salvaged);
+            let table_salvaged = table.as_deref().is_some_and(&salvaged)
+                || storage
+                    .index_table_names(&db, &coll)?
+                    .iter()
+                    .any(|t| salvaged(t));
             if shared_index_salvaged || table_salvaged || inconsistent {
                 duplicates += storage.rebuild_indexes(&db, &coll)?;
                 log(&format!("Rebuilt the indexes of {ns}"));
@@ -316,34 +320,15 @@ impl Storage {
             }
         }
         for (name, key, options) in &indexes {
-            loop {
-                session.begin_transaction(None)?;
-                let removed = self.delete_entries_prefix_upto(
-                    &session,
-                    db,
-                    coll,
-                    name,
-                    Some(PURGE_CHUNK_MAX_ROWS),
-                );
-                match removed {
-                    Ok(n) => {
-                        commit_stamped(&session, &self.oplog, self.timestamped)?;
-                        if n < PURGE_CHUNK_MAX_ROWS {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        session.rollback_transaction(None)?;
-                        return Err(e);
-                    }
-                }
-            }
             session.begin_transaction(None)?;
             let outcome = (|| -> Result<()> {
                 let c = session.open_cursor(IDX_TABLE, None)?;
                 c.set_key_sss(db, coll, name);
                 c.search()?;
                 c.remove()?;
+                // Its entries are in a table of its own: dropped (once this
+                // commits), and a new one built.
+                self.unplace_index(&session, db, coll, name)?;
                 self.purge_unique_claims(&session, db, coll, Some(name))?;
                 self.create_index_in_txn(&session, db, coll, name, key, options, false)?;
                 Ok(())

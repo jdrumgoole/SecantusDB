@@ -203,18 +203,31 @@ fn repair_salvages_a_store_opened_as_the_server_opens_it() {
 fn repair_rebuilds_the_indexes_from_a_damaged_index_table() {
     let home = temp_home();
     seeded(&home, false);
-    damage(&home, "table:secantus_index_entries");
+    // An index with big keys, in a table of its own (`index-<UUID>`) large
+    // enough to damage.
+    let table = {
+        let st = Storage::open_with_options(home.to_str().unwrap(), &options(false)).unwrap();
+        st.create_index("app", "c", "p_1", &doc! {"p": 1}, &doc! {})
+            .unwrap();
+        let table = st.index_table_name("app", "c", "p_1").unwrap().unwrap();
+        st.close().unwrap();
+        table
+    };
+    assert!(table.starts_with("table:index-"), "{table}");
+    damage(&home, &table);
     let report = repair(home.to_str().unwrap(), &options(false), &mut |_| {}).unwrap();
-    assert_eq!(
-        report.salvaged,
-        vec!["table:secantus_index_entries".to_string()]
-    );
+    assert_eq!(report.salvaged, vec![table.clone()]);
     assert_eq!(report.rebuilt, vec!["app.c".to_string()]);
     let st = Storage::open_with_options(home.to_str().unwrap(), &options(false)).unwrap();
     // No document was in the damaged table: all of them are there, and the
-    // index has every entry again.
+    // index has every entry again, in a table made anew.
     assert_eq!(consistent(&st, "app", "c"), 5_000);
     assert_eq!(st.index_entries("app", "c", "k_1").unwrap().len(), 5_000);
+    assert_eq!(st.index_entries("app", "c", "p_1").unwrap().len(), 5_000);
+    assert_ne!(
+        st.index_table_name("app", "c", "p_1").unwrap().unwrap(),
+        table
+    );
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }

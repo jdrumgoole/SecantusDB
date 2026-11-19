@@ -17,6 +17,7 @@ use std::cmp::Ordering;
 use bson::spec::BinarySubtype;
 use bson::{doc, Binary, Bson, Document};
 
+use crate::storage::{IndexEntry, IndexFrom};
 use crate::CommandError;
 
 /// The storage namespace of a time-series collection's buckets.
@@ -378,7 +379,7 @@ impl BucketScan {
             return Ok(None);
         }
         if storage
-            .index_entries_from(&self.db, &ns, name, &[], None, 0, false)?
+            .index_entries_from(&self.db, &ns, name, IndexFrom::Edge, None, 0, false)?
             .is_none()
         {
             return Ok(None);
@@ -486,11 +487,11 @@ impl BucketScan {
                 return Ok(out);
             };
             let (from, after) = match &pos.last {
-                Some((k, rid)) => (k.clone(), Some(*rid)),
-                None => (Vec::new(), None),
+                Some((k, rid)) => (IndexFrom::Resume(k), Some(*rid)),
+                None => (IndexFrom::Edge, None),
             };
             let entries = storage
-                .index_entries_from(&self.db, &ns, &pos.name, &from, after, CHUNK, false)
+                .index_entries_from(&self.db, &ns, &pos.name, from, after, CHUNK, false)
                 .map_err(err)?
                 .unwrap_or_default();
             if entries.is_empty() {
@@ -498,13 +499,13 @@ impl BucketScan {
                 return Ok(out);
             }
             let mut stopped = false;
-            for (key, rid) in entries {
+            for IndexEntry { resume, rid, .. } in entries {
                 if count >= want || (count > 0 && bytes > max_bytes) {
                     stopped = true;
                     break;
                 }
                 let pos = self.index.as_mut().expect("indexed scan");
-                pos.last = Some((key, rid));
+                pos.last = Some((resume, rid));
                 if !pos.seen.insert(rid) {
                     continue;
                 }

@@ -349,11 +349,17 @@ fn to_bson_value(
         }
         ctype::STRING_LIKE => {
             let original = tb.read_string_like()?;
-            let s = reader.string_like(inverted)?;
-            if original == K_SYMBOL {
-                Ok(Bson::Symbol(s))
+            let raw = if inverted {
+                reader.inverted_cstring_with_nuls()?
             } else {
-                Ok(Bson::String(s))
+                reader.cstring_with_nuls()?
+            };
+            if original == K_SYMBOL {
+                Ok(Bson::Symbol(utf8(raw)?))
+            } else {
+                // Bytes that are not UTF-8 (a collation's sort key, say)
+                // come back as the carrier of such a string.
+                Ok(crate::bsondoc::string_from_bytes(raw))
             }
         }
         ctype::CODE => Ok(Bson::JavaScriptCode(reader.string_like(inverted)?)),

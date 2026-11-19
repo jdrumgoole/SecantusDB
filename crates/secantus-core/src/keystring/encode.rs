@@ -322,6 +322,20 @@ impl Builder {
             self.put_bytes(n.as_bytes(), invert);
             self.put(0, invert);
         }
+        // A string whose bytes are not UTF-8 travels as a carrier document
+        // (`bsondoc::invalid_utf8`); mongod keys its bytes as a string.
+        if let Some(bytes) = crate::bsondoc::as_invalid_utf8(elem) {
+            self.type_bits.append_string();
+            self.put(ctype::STRING_LIKE, invert);
+            match f {
+                Some(t) => {
+                    let b = t(&String::from_utf8_lossy(bytes));
+                    self.append_string_like(&b, invert);
+                }
+                None => self.append_string_like(bytes, invert),
+            }
+            return Ok(());
+        }
         match elem {
             Bson::MinKey => self.put(ctype::MIN_KEY, invert),
             Bson::MaxKey => self.put(ctype::MAX_KEY, invert),

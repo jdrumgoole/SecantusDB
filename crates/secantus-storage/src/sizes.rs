@@ -155,15 +155,23 @@ impl Delta {
         }
     }
 
-    /// `records` rows of `data_size` and `id_index_size` bytes went with
-    /// their table (negative: arrived with it, as a rename moves them).
-    pub(crate) fn drop_rows(records: i64, data_size: i64, id_index_size: i64) -> Delta {
-        Delta {
-            records: -records,
-            data_size: -data_size,
-            id_index_size: -id_index_size,
-            entries: Vec::new(),
+    /// Everything `sizes` counts went with the tables that held it: the
+    /// documents' table and each index's.
+    pub(crate) fn drop_all(sizes: &CollectionSizes) -> Delta {
+        let mut d = Delta::from_sizes(sizes);
+        d.records = -d.records;
+        d.data_size = -d.data_size;
+        d.id_index_size = -d.id_index_size;
+        for (_, bytes) in &mut d.entries {
+            *bytes = -*bytes;
         }
+        d
+    }
+
+    /// Everything `sizes` counts arrived with the tables that hold it, as a
+    /// rename moves them.
+    pub(crate) fn arrive(sizes: &CollectionSizes) -> Delta {
+        Delta::from_sizes(sizes)
     }
 
     /// A document row was rewritten in place.
@@ -393,34 +401,36 @@ impl SizeStorer {
     pub(crate) fn recount(
         &self,
         session: &Session,
-        doc_tables: &[(String, String, String)],
-        entries_table: &str,
+        placements: &[(String, String, crate::mdb_catalog::Placement)],
     ) -> crate::Result<()> {
         let mut sizes: HashMap<(String, String), CollectionSizes> = HashMap::new();
-        // Each collection's own table (`collection-<UUID>`), keyed by RecordId.
-        for (db, coll, table) in doc_tables {
-            let cur = match session.open_cursor(table, None) {
-                Ok(c) => c,
-                Err(e) if e.is_missing_table() => continue,
+        for (db, coll, placement) in placements {
+            // The collection's own table (`collection-<UUID>`), keyed by RecordId.
+            let cur = match session.open_cursor(&placement.table(), None) {
+                Ok(c) => Some(c),
+                Err(e) if e.is_missing_table() => None,
                 Err(e) => return Err(e.into()),
             };
-            while cur.next()? {
-                let value = cur.get_value_u()?;
-                let (idk, blob) = crate::unframe_doc_value(&value)?;
-                let s = sizes.entry((db.clone(), coll.clone())).or_default();
-                s.apply(&Delta::insert(idk.len(), blob.len()), 1);
+            if let Some(cur) = cur {
+                while cur.next()? {
+                    let value = cur.get_value_u()?;
+                    let (idk, blob) = crate::unframe_doc_value(&value)?;
+                    let s = sizes.entry((db.clone(), coll.clone())).or_default();
+                    s.apply(&Delta::insert(idk.len(), blob.len()), 1);
+                }
             }
-        }
-        let cur = match session.open_cursor(entries_table, None) {
-            Ok(c) => Some(c),
-            Err(e) if e.is_missing_table() => None,
-            Err(e) => return Err(e.into()),
-        };
-        if let Some(cur) = cur {
-            while cur.next()? {
-                let (db, coll, name, packed) = cur.get_key_sssu()?;
-                let s = sizes.entry((db, coll)).or_default();
-                s.apply(&Delta::entries(&name, packed.len() as i64), 1);
+            // Each secondary index's own table (`index-<UUID>`).
+            for (name, ident) in &placement.indexes {
+                let cur = match session.open_cursor(&crate::mdb_catalog::table_uri(ident), None) {
+                    Ok(c) => c,
+                    Err(e) if e.is_missing_table() => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                while cur.next()? {
+                    let len = cur.with_key_u(<[u8]>::len)?;
+                    let s = sizes.entry((db.clone(), coll.clone())).or_default();
+                    s.apply(&Delta::entries(name, len as i64), 1);
+                }
             }
         }
         self.replace_all(sizes);

@@ -22673,7 +22673,15 @@ impl PgHandler {
                 };
                 let table =
                     if let Some(ix) = self.index_relations().into_iter().find(|ix| ix.oid == oid) {
-                        secantus_storage::index_table(&ix.name).to_string()
+                        // The index's own WiredTiger table (`index-<UUID>`);
+                        // the primary key is still the `_id` index.
+                        match self
+                            .storage
+                            .index_table_name(self.db(), &ix.table.name, &ix.name)
+                        {
+                            Ok(Some(t)) => t,
+                            _ => return Ok(Bson::Null),
+                        }
                     } else if self.sequence_names().contains(&rel) {
                         match self
                             .storage

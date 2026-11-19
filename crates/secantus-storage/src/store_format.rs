@@ -29,7 +29,7 @@ use crate::{Result, StorageError};
 /// The layout version this build writes and reads. Every change to the
 /// on-disk layout moves it on (each phase of the storage-model plan does),
 /// and a store at any other version is refused.
-pub const STORE_FORMAT_VERSION: u32 = 2;
+pub const STORE_FORMAT_VERSION: u32 = 3;
 
 /// The file holding [`STORE_FORMAT_VERSION`] in a SecantusDB-written store.
 pub const FORMAT_FILE: &str = "secantus.format";
@@ -293,5 +293,19 @@ mod tests {
         fs::write(dir.path().join(FORMAT_FILE), "0\n").unwrap();
         let err = prepare(dir.path()).unwrap_err().to_string();
         assert!(err.contains("store format 0"), "{err}");
+    }
+
+    #[test]
+    fn the_previous_layout_is_refused_and_this_one_is_format_3() {
+        // Format 2 kept every index in one shared table; format 3 gives
+        // each secondary index a table of its own, in KeyString.
+        assert_eq!(STORE_FORMAT_VERSION, 3);
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("WiredTiger.wt"), b"").unwrap();
+        fs::write(dir.path().join(STORAGE_BSON), mongod_storage_bson()).unwrap();
+        fs::write(dir.path().join(FORMAT_FILE), "2\n").unwrap();
+        let err = prepare(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("store format 2"), "{err}");
+        assert!(err.contains("format 3 only"), "{err}");
     }
 }

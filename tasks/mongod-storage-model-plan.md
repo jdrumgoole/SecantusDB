@@ -310,6 +310,31 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
      value is the TypeBits. The key generation stays (multikey, sparse,
      partial, the existing value expansion): only the bytes change. Replaces
      `secantus_index_entries`.
+     **As built (4a and 4b, store format 3):**
+     - Only secondary indexes have a table; `_id_` has none until 4d. The
+       idents are in the placement (`secantus_idents`' `indexes`, name to
+       ident) and in `_mdb_catalog`'s `idxIdent`. A build makes the table
+       first and lists it in the placement in the transaction that writes the
+       registry row, so a crash or an abort leaves an unlisted table, which
+       the next open drops; a rollback drops it through the transaction's end
+       hook (a deferred create keeps it in the transaction's own placement).
+       A drop or rename moves no entries: the table follows the placement.
+     - The reaper drops with `force`: without it, a pooled session's cached
+       data handle kept a table from ever being dropped (`EBUSY`).
+     - Key generation is unchanged, so an array still gets the whole-array
+       entry besides mongod's element keys (`secantus_core::index_keys`).
+       mongod's `validate` would count those as extra keys: phase 7 must
+       drop them or refuse the index.
+     - A geo index's cell is keyed as one BinData value, not mongod's key.
+       The PostgreSQL server's `bytea` order (shorter first) is kept by keying
+       a BinData value of such an index as text that orders so; the decode
+       of such an entry gives the text.
+     - The bounds work of 4c is done here for secondary indexes
+       (`scan_bounds::to_key_spans`, `Storage::index_entries_from` taking an
+       `IndexPos` and returning each entry's decoded `raw` and a `resume`
+       key); the explain stream's own comparisons still run on sort-key
+       parts built from the decoded values. `_id_` keeps its sort-key bytes
+       until 4d.
    - **4c. Scans and bounds.** `scan_bounds` builds KeyString bounds with
      mongod's discriminators (`ExclusiveBefore` / `ExclusiveAfter`) in place
      of sort-key prefixes; the explain stream decodes stored keys with

@@ -129,14 +129,22 @@ fn list_catalog_lists_collections_then_views() {
                 ("b_1".to_string(), false, vec!["spec", "ready", "multikey"]),
             ]
         );
+        // The `_id` index is still the one `_id -> RecordId` map; every other
+        // index is a table of its own, named by its ident as mongod names
+        // them.
+        let idx_ident = coll.get_document("idxIdent").unwrap();
+        assert_eq!(idx_ident.keys().collect::<Vec<_>>(), ["_id_", "a_1", "b_1"]);
         assert_eq!(
-            coll.get_document("idxIdent").unwrap(),
-            &doc! {
-                "_id_": "table:secantus_natural_seq",
-                "a_1": "table:secantus_index_entries",
-                "b_1": "table:secantus_index_entries",
-            }
+            idx_ident.get_str("_id_").unwrap(),
+            "table:secantus_natural_seq"
         );
+        let (a, b) = (
+            idx_ident.get_str("a_1").unwrap(),
+            idx_ident.get_str("b_1").unwrap(),
+        );
+        assert!(a.starts_with("table:index-"), "{a}");
+        assert!(b.starts_with("table:index-"), "{b}");
+        assert_ne!(a, b);
         // Each collection's documents are in a table of their own, named by
         // its ident as mongod names them.
         let coll_ident = coll.get_str("ident").unwrap().to_string();

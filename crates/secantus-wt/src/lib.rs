@@ -1013,6 +1013,18 @@ impl Cursor {
         check(unsafe { cur_fn!(self, get_key)(self.ptr, &mut it as *mut sys::WT_ITEM) })?;
         Ok(unsafe { item_bytes(&it) })
     }
+    /// [`Self::get_key_u`] without copying: `f` sees the key where it sits in
+    /// the cursor's buffer, which holds it only until the cursor next moves.
+    pub fn with_key_u<T>(&self, f: impl FnOnce(&[u8]) -> T) -> Result<T> {
+        let mut it: sys::WT_ITEM = unsafe { std::mem::zeroed() };
+        check(unsafe { cur_fn!(self, get_key)(self.ptr, &mut it as *mut sys::WT_ITEM) })?;
+        let key: &[u8] = if it.data.is_null() || it.size == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(it.data as *const u8, it.size) }
+        };
+        Ok(f(key))
+    }
     pub fn get_key_q(&self) -> Result<i64> {
         let mut v: i64 = 0;
         check(unsafe { cur_fn!(self, get_key)(self.ptr, &mut v as *mut i64) })?;
