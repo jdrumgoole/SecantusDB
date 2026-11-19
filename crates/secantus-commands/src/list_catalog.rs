@@ -8,9 +8,9 @@
 //! `{db, name, type, _id, viewOn, pipeline, ns}`. Here:
 //!
 //! - `ident` names the WiredTiger table that really holds the collection's
-//!   documents: one of the shared `table:secantus_documents_sh<N>` shards,
-//!   picked by a hash of `(db, collection)`. A `system.buckets.<name>` is the
-//!   time-series collection's own table, and `system.views` the collection
+//!   documents: its own `table:collection-<UUID>`, named by its ident as
+//!   mongod names it. A `system.buckets.<name>` is the time-series
+//!   collection's own table, and `system.views` the collection
 //!   registry, which is where view definitions are kept. A set member's
 //!   `local.oplog.rs` spans the oplog's shard tables, so no one table names
 //!   it and it has no `ident`.

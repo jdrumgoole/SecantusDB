@@ -29,7 +29,7 @@ use crate::{Result, StorageError};
 /// The layout version this build writes and reads. Every change to the
 /// on-disk layout moves it on (each phase of the storage-model plan does),
 /// and a store at any other version is refused.
-pub const STORE_FORMAT_VERSION: u32 = 1;
+pub const STORE_FORMAT_VERSION: u32 = 2;
 
 /// The file holding [`STORE_FORMAT_VERSION`] in a SecantusDB-written store.
 pub const FORMAT_FILE: &str = "secantus.format";
@@ -263,7 +263,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(dir.path().join(FORMAT_FILE)).unwrap(),
-            "1\n"
+            format!("{STORE_FORMAT_VERSION}\n")
         );
     }
 

@@ -22675,9 +22675,20 @@ impl PgHandler {
                     if let Some(ix) = self.index_relations().into_iter().find(|ix| ix.oid == oid) {
                         secantus_storage::index_table(&ix.name).to_string()
                     } else if self.sequence_names().contains(&rel) {
-                        secantus_storage::collection_table(self.db(), SEQUENCE_COLLECTION)
+                        match self
+                            .storage
+                            .collection_table_name(self.db(), SEQUENCE_COLLECTION)
+                        {
+                            Ok(Some(t)) => t,
+                            _ => return Ok(Bson::Null),
+                        }
                     } else if self.lookup(&rel).is_some() && Self::virtual_table(&rel).is_none() {
-                        secantus_storage::collection_table(self.db(), &rel)
+                        // The table's own WiredTiger table, named by its ident
+                        // (`collection-<UUID>`), as mongod names a collection's.
+                        match self.storage.collection_table_name(self.db(), &rel) {
+                            Ok(Some(t)) => t,
+                            _ => return Ok(Bson::Null),
+                        }
                     } else {
                         return Ok(Bson::Null);
                     };

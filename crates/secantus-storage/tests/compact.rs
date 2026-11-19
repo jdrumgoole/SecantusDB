@@ -122,9 +122,7 @@ fn compact_gives_a_collections_free_space_back() {
     mostly_deleted(&st, "app", "big", 20_000);
     let target = CompactTarget::Collection("app", "big");
     let tables = st.compact_tables(target).unwrap();
-    assert!(tables
-        .iter()
-        .any(|t| t.starts_with("table:secantus_documents_sh")));
+    assert!(tables.iter().any(|t| t.starts_with("table:collection-")));
     assert!(tables.contains(&"table:secantus_index_entries".to_string()));
     let before = tables_size(&st, &home, target);
 
@@ -208,7 +206,7 @@ fn compact_of_an_empty_store_or_an_in_memory_one_frees_nothing() {
 }
 
 /// Compaction is online: writers to the collection, and to another
-/// collection in the same document shard, carry on while it runs, and
+/// collection, carry on while it runs, and
 /// every document either wrote is there afterwards with its indexes whole.
 #[test]
 fn compact_runs_while_the_collection_and_its_neighbours_are_written() {
@@ -224,12 +222,10 @@ fn written_during_compaction(open: fn(&std::path::Path) -> Storage) {
     let home = temp_home();
     let st = Arc::new(open(&home));
     mostly_deleted(&st, "app", "big", 20_000);
-    // A neighbour: a collection whose documents live in the same shard.
-    let shard = secantus_storage::collection_table("app", "big");
-    let neighbour = (0..10_000)
-        .map(|i| format!("n{i}"))
-        .find(|c| secantus_storage::collection_table("app", c) == shard)
-        .unwrap();
+    // A neighbour: another collection written while the compaction runs.
+    // (Its documents shared a table with `big`'s until each collection got
+    // a table of its own, as mongod keeps them.)
+    let neighbour = "neighbour".to_string();
     st.create_index("app", &neighbour, "k_1", &doc! {"k": 1}, &doc! {})
         .unwrap();
 

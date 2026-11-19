@@ -155,6 +155,17 @@ impl Delta {
         }
     }
 
+    /// `records` rows of `data_size` and `id_index_size` bytes went with
+    /// their table (negative: arrived with it, as a rename moves them).
+    pub(crate) fn drop_rows(records: i64, data_size: i64, id_index_size: i64) -> Delta {
+        Delta {
+            records: -records,
+            data_size: -data_size,
+            id_index_size: -id_index_size,
+            entries: Vec::new(),
+        }
+    }
+
     /// A document row was rewritten in place.
     pub(crate) fn replace(old: (usize, usize), new: (usize, usize)) -> Delta {
         Delta {
@@ -382,21 +393,21 @@ impl SizeStorer {
     pub(crate) fn recount(
         &self,
         session: &Session,
-        doc_tables: &[String],
+        doc_tables: &[(String, String, String)],
         entries_table: &str,
     ) -> crate::Result<()> {
         let mut sizes: HashMap<(String, String), CollectionSizes> = HashMap::new();
-        for table in doc_tables {
+        // Each collection's own table (`collection-<UUID>`), keyed by RecordId.
+        for (db, coll, table) in doc_tables {
             let cur = match session.open_cursor(table, None) {
                 Ok(c) => c,
                 Err(e) if e.is_missing_table() => continue,
                 Err(e) => return Err(e.into()),
             };
             while cur.next()? {
-                let (db, coll, _recordid) = cur.get_key_ssq()?;
                 let value = cur.get_value_u()?;
                 let (idk, blob) = crate::unframe_doc_value(&value)?;
-                let s = sizes.entry((db, coll)).or_default();
+                let s = sizes.entry((db.clone(), coll.clone())).or_default();
                 s.apply(&Delta::insert(idk.len(), blob.len()), 1);
             }
         }

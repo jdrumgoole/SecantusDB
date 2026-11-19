@@ -1776,7 +1776,7 @@ impl CmdStorage for StorageAdapter {
     fn collection_ident(&self, db: &str, coll: &str) -> Option<String> {
         Some(match self.stored_as(db, coll)? {
             Stored::Catalog => secantus_storage::CATALOG_TABLE.to_string(),
-            Stored::Collection(name) => secantus_storage::collection_table(db, &name),
+            Stored::Collection(name) => self.inner.collection_table_name(db, &name).ok()??,
         })
     }
 

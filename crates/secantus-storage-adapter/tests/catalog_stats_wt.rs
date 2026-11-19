@@ -137,10 +137,10 @@ fn list_catalog_lists_collections_then_views() {
                 "b_1": "table:secantus_index_entries",
             }
         );
-        assert_eq!(
-            coll.get_str("ident"),
-            Ok(secantus_storage::collection_table("t", "c").as_str())
-        );
+        // Each collection's documents are in a table of their own, named by
+        // its ident as mongod names them.
+        let coll_ident = coll.get_str("ident").unwrap().to_string();
+        assert!(coll_ident.starts_with("table:collection-"), "{coll_ident}");
 
         // The time-series collection's buckets are a collection of their own.
         let buckets = entry("system.buckets.ts");
@@ -169,10 +169,12 @@ fn list_catalog_lists_collections_then_views() {
             bucket_index.get_document("key").unwrap(),
             &doc! {"meta": 1, "control.min.t": 1, "control.max.t": 1}
         );
-        assert_eq!(
-            buckets.get_str("ident"),
-            Ok(secantus_storage::collection_table("t", "system.buckets.ts").as_str())
+        let buckets_ident = buckets.get_str("ident").unwrap();
+        assert!(
+            buckets_ident.starts_with("table:collection-"),
+            "{buckets_ident}"
         );
+        assert_ne!(buckets_ident, coll_ident);
         // View definitions are rows of the collection registry.
         assert_eq!(
             entry("system.views").get_str("ident"),

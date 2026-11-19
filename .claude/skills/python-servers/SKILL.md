@@ -186,7 +186,8 @@ match, and a Rust fix is never ported back.
   Every Rust job builds WiredTiger through the package's CMake build
   (`uv build --wheel` / `uv sync`), and several Rust tests import its
   `Storage` or SQL layer (`test_rust_pgserver_slice.py`,
-  `test_rust_store_handoff.py`, `test_rust_pitr_cross_server.py`). Removing
+  `test_rust_pitr_cross_server.py`; `test_rust_store_handoff.py` was retired
+  with the storage-model change of 2026-11-19). Removing
   the code is a later decision for Joe, and needs a standalone WiredTiger
   build first.
 - **Compatibility with them is no longer a constraint, on-disk format

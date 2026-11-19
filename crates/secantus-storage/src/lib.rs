@@ -65,6 +65,7 @@ pub mod spill;
 mod index_build;
 mod lockfile;
 pub use lockfile::LockFileRecord;
+pub mod mdb_catalog;
 mod scan_bounds;
 mod sizes;
 pub mod store_format;
@@ -400,6 +401,10 @@ pub struct UserTransactionHandle {
     /// collection and stored one `_id` would conflict at the second insert,
     /// where mongod fails the second COMMIT.
     deferred_keys: BTreeMap<(String, String), String>,
+    /// For each of `deferred_creates`, the table its documents went into
+    /// (`mdb_catalog::Placement`), recorded in `secantus_idents` and
+    /// `_mdb_catalog` when the commit writes the registry row.
+    deferred_placements: BTreeMap<(String, String), mdb_catalog::Placement>,
     /// The `(db, collection)`s its oplog entries name, and whether it wrote
     /// anything an entry does not attribute to one collection (a command
     /// entry): what its commit is recorded as touching ([`NS_COMMITS`]).
@@ -686,45 +691,163 @@ const COLL_TABLE: &str = "table:secantus_collections";
 /// Additive to the shared on-disk layout (an older store simply lacks the
 /// table; nothing else reads it), same precedent as the unique-keys table.
 const TOMB_TABLE: &str = "table:secantus_drop_tombstones";
-/// Legacy single documents table. Retained for the on-disk upgrade read/migration
-/// (a store written by an older build has its rows here). New writes go to the
-/// per-collection shard tables — see `DOC_SHARDS` / `doc_table_for`.
-const DOC_TABLE: &str = "table:secantus_documents";
-/// The documents table is sharded across `DOC_SHARDS` WT tables, routed by a
-/// deterministic hash of `(db, coll)`. Every collection lives ENTIRELY in one
-/// shard, so per-collection ops (insert / find / scan / update / delete) touch a
-/// single shard with no merge — the point is that concurrent writers to different
-/// collections land on different WT files, and thus different block-manager locks
-/// and cache regions, instead of all serialising on one `secantus_documents` file
-/// (the 8-writer scaling bottleneck; `tasks/rust-mongodb-parity-redesign.md`).
-const DOC_SHARDS: u64 = 16;
+/// Each collection's documents are in a WiredTiger table of their own, named
+/// by the collection's ident (`collection-<UUID>`) and keyed by RecordId, as
+/// mongod keeps them (`tasks/mongod-storage-model-plan.md`, phase 3; see
+/// [`mdb_catalog`]). Until then every collection shared sixteen tables keyed
+/// `(db, coll, RecordId)`.
+///
+/// A cursor on one collection's table. Its `set_key_ssq` / `get_key_ssq`
+/// keep the call shape the shared tables had, over the RecordId key alone,
+/// so a scan's `(db, coll)` prefix check always holds; every other method is
+/// the WiredTiger cursor's.
+struct DocCursor {
+    cur: Cursor,
+    db: String,
+    coll: String,
+}
 
-/// Deterministic FNV-1a hash of `(db, coll)` — stable across process restarts (a
-/// collection must always resolve to the same shard). `std`'s DefaultHasher is
-/// randomised per run, so it can't be used here.
-fn doc_shard_hash(db: &str, coll: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in db.bytes().chain(std::iter::once(0u8)).chain(coll.bytes()) {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+impl std::ops::Deref for DocCursor {
+    type Target = Cursor;
+    fn deref(&self) -> &Cursor {
+        &self.cur
     }
-    h
 }
 
-/// Shard table name for shard index `s` (0..DOC_SHARDS).
-fn doc_shard_name(s: u64) -> String {
-    format!("table:secantus_documents_sh{s}")
+impl DocCursor {
+    /// Position on RecordId `recordid` (`db` and `coll` are the cursor's own).
+    #[inline]
+    fn set_key_ssq(&self, db: &str, coll: &str, recordid: i64) {
+        debug_assert!(
+            db == self.db && coll == self.coll,
+            "a cursor on {}.{} keyed for {db}.{coll}",
+            self.db,
+            self.coll
+        );
+        self.cur.set_key_q(recordid);
+    }
+
+    /// `(db, coll, RecordId)` of the row under the cursor.
+    #[inline]
+    fn get_key_ssq(&self) -> std::result::Result<(&str, &str, i64), WtError> {
+        Ok((&self.db, &self.coll, self.cur.get_key_q()?))
+    }
 }
 
-/// The documents shard table a `(db, coll)` lives in.
-fn doc_table_for(db: &str, coll: &str) -> String {
-    doc_shard_name(doc_shard_hash(db, coll) % DOC_SHARDS)
+/// The error a cursor on a collection with no table answers: WiredTiger's
+/// own for a missing table, so the callers that read a missing collection as
+/// empty keep doing so.
+fn no_collection_table() -> WtError {
+    WtError {
+        code: 2,
+        message: "the collection has no table".to_string(),
+    }
+}
+
+/// A cursor on `(db, coll)`'s documents table, as `session` sees it: the
+/// placement a transaction created and holds until commit, else the
+/// committed one in `secantus_idents`.
+fn open_doc_cursor(
+    session: &Session,
+    db: &str,
+    coll: &str,
+    config: Option<&str>,
+) -> std::result::Result<DocCursor, WtError> {
+    let Some(ident) = placement_ident(session, db, coll)? else {
+        return Err(no_collection_table());
+    };
+    let cur = match session.open_cursor(&mdb_catalog::table_uri(&ident), config) {
+        Ok(c) => c,
+        // The placement is in this reader's snapshot but its table is gone:
+        // the collection was dropped after the snapshot was taken. Reading
+        // it as empty would be a wrong answer; mongod refuses such a read
+        // with `SnapshotUnavailable` (246). Not a missing-table error, so no
+        // caller reads it as an empty collection.
+        Err(e) if e.is_missing_table() => {
+            return Err(WtError {
+                code: SNAPSHOT_UNAVAILABLE,
+                message: "Unable to read from a snapshot due to pending collection catalog \
+                          changes; please retry the operation."
+                    .to_string(),
+            })
+        }
+        Err(e) => return Err(e),
+    };
+    Ok(DocCursor {
+        cur,
+        db: db.to_string(),
+        coll: coll.to_string(),
+    })
+}
+
+/// The error code a read of a collection dropped after its snapshot was
+/// taken answers with: mongod's `SnapshotUnavailable`, negated so it can
+/// never be mistaken for a WiredTiger or errno code.
+const SNAPSHOT_UNAVAILABLE: i32 = -246;
+
+/// The ident `(db, coll)`'s documents live in, as `session` sees it.
+fn placement_ident(
+    session: &Session,
+    db: &str,
+    coll: &str,
+) -> std::result::Result<Option<String>, WtError> {
+    if let Some(hp) = deferring_handle(session) {
+        // SAFETY: as `deferring_handle`; a shared read.
+        if let Some(p) = unsafe { &*hp }
+            .deferred_placements
+            .get(&(db.to_string(), coll.to_string()))
+        {
+            return Ok(Some(p.ident.clone()));
+        }
+    }
+    let cur = match session.open_cursor(mdb_catalog::IDENTS_TABLE, None) {
+        Ok(c) => c,
+        Err(e) if e.is_missing_table() => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    cur.set_key_ss(db, coll);
+    match cur.search() {
+        Ok(()) => {
+            let value = cur.get_value_u()?;
+            Ok(bson::RawDocument::from_bytes(&value)
+                .ok()
+                .and_then(|d| d.get_str("ident").ok())
+                .map(str::to_string))
+        }
+        Err(e) if e.is_not_found() => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The next `_mdb_catalog` RecordId. Raised at every open past the store's
+/// largest, so ids stay unique within a store; one process can hold several
+/// stores, which only leaves gaps.
+static NEXT_CATALOG_ID: AtomicI64 = AtomicI64::new(1);
+
+fn next_catalog_id() -> i64 {
+    NEXT_CATALOG_ID.fetch_add(1, Ordering::SeqCst)
+}
+
+/// A new collection's placement: a fresh ident, its table made, and the
+/// `_mdb_catalog` row it will be listed under. A table is not part of any
+/// transaction: one a rollback orphans is dropped when nothing reads it
+/// (`Storage::drop_ident_table`), or at the next open.
+fn place_new_collection(session: &Session, data_nonlogged: bool) -> Result<mdb_catalog::Placement> {
+    let placement = mdb_catalog::Placement {
+        ident: mdb_catalog::new_collection_ident(),
+        catalog_id: next_catalog_id(),
+    };
+    session.create(
+        &placement.table(),
+        &data_table_cfg(mdb_catalog::COLLECTION_TABLE_CFG, data_nonlogged),
+    )?;
+    Ok(placement)
 }
 
 /// The WiredTiger table that holds `(db, coll)`'s documents (`$listCatalog`'s
-/// `ident`): one of the shared shard tables.
-pub fn collection_table(db: &str, coll: &str) -> String {
-    doc_table_for(db, coll)
+/// `ident`, `pg_relation_filepath`), if it has one.
+pub(crate) fn collection_table(session: &Session, db: &str, coll: &str) -> Result<Option<String>> {
+    Ok(placement_ident(session, db, coll)?.map(|i| mdb_catalog::table_uri(&i)))
 }
 
 /// The WiredTiger table that holds index `name`'s entries (`$listCatalog`'s
@@ -1460,113 +1583,6 @@ fn unframe_doc_value(value: &[u8]) -> Result<(&[u8], &[u8])> {
         ));
     }
     Ok((&rest[..len], &rest[len..]))
-}
-
-/// One-time migration: move every row in the legacy single `secantus_documents`
-/// table to its per-collection shard (a store written before doc-sharding). A
-/// born-sharded store's legacy table is empty, so this is a quick no-op scan on
-/// open. Runs on the bootstrap session before the connection serves requests.
-fn migrate_legacy_docs(session: &Session, data_nonlogged: bool) -> Result<()> {
-    // Never created on a born-sharded store: nothing to fold in.
-    let src = match session.open_cursor(DOC_TABLE, None) {
-        Ok(c) => c,
-        Err(e) if e.is_missing_table() => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    let mut rows: Vec<(String, String, Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut more = src.next()?;
-    while more {
-        let (db, coll, id_key) = src.get_key_ssu()?;
-        let blob = src.get_value_u()?;
-        rows.push((db, coll, id_key, blob));
-        more = src.next()?;
-    }
-    if rows.is_empty() {
-        return Ok(());
-    }
-    // The legacy single table predates both sharding AND RecordId keying: its rows
-    // are `(db, coll, id_key) -> raw blob`. Re-key each into its shard by a fresh
-    // RecordId (framed value carries the id_key), and write the `_id` index row
-    // (id_key -> RecordId). A global counter keeps RecordIds unique per collection;
-    // `scan_max_nat_seq` (run just after, in `load_oplog_meta`) recovers the
-    // counter from the shards so freshly minted seqs stay strictly greater.
-    let idx = session.open_cursor(NAT_SEQ_TABLE, None)?;
-    let mut made_shards: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (recordid, (db, coll, id_key, blob)) in (1i64..).zip(&rows) {
-        let shard = doc_table_for(db, coll);
-        // Lazy shards: the target shard isn't created eagerly at open, so make it
-        // before folding a legacy row into it (idempotent per shard).
-        if made_shards.insert(shard.clone()) {
-            session.create(&shard, &data_table_cfg(DOC_TABLE_CFG, data_nonlogged))?;
-        }
-        let dst = session.open_cursor(&shard, None)?;
-        dst.set_key_ssq(db, coll, recordid);
-        dst.set_value_u(&frame_doc_value(id_key, blob));
-        dst.insert()?;
-        idx.reset()?;
-        idx.set_key_ssu(db, coll, id_key);
-        idx.set_value_q(recordid);
-        idx.insert()?;
-    }
-    let del = session.open_cursor(DOC_TABLE, None)?;
-    for (db, coll, id_key, _) in &rows {
-        del.reset()?;
-        del.set_key_ssu(db, coll, id_key);
-        match del.remove() {
-            Ok(()) => {}
-            Err(e) if e.is_not_found() => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(())
-}
-
-/// Parse the `key_format=<fmt>` value out of a WiredTiger config / `metadata:`
-/// string (`fmt` is a simple token — `SSq`, `SSu`, … — so it stops at the next
-/// comma). Returns `None` if the string has no `key_format` clause.
-fn extract_key_format(cfg: &str) -> Option<&str> {
-    let start = cfg.find("key_format=")? + "key_format=".len();
-    let rest = &cfg[start..];
-    let end = rest.find(',').unwrap_or(rest.len());
-    Some(rest[..end].trim())
-}
-
-/// Refuse to open a store whose document shards were written by a build BEFORE
-/// the RecordId doc-table change (see `tasks/backlog-rust-mongodb.md` §7.8). Those tables are
-/// keyed `SSu` (`(db, coll, id_key)`) with unframed blob values; this build keys
-/// them `SSq` (`(db, coll, RecordId)`) with framed values (see [`frame_doc_value`]).
-/// WiredTiger fixes a table's `key_format` at CREATE time and preserves it across
-/// reopen — the bootstrap `create` is a no-op for an existing table, which is
-/// exactly what lets [`migrate_legacy_docs`] read the legacy table as `SSu` — so
-/// the on-disk schema read here from the `metadata:` cursor is the ground truth.
-///
-/// There is deliberately **no in-place migration**: the two Rust servers are
-/// pre-1.0 beta with no upgrading users, so the correct response to an
-/// incompatible on-disk format is to refuse to open rather than silently mis-read
-/// stored data with `SSq` cursor ops against an `SSu` btree. (A pre-*shard* store
-/// is the separate, supported case — its legacy single `secantus_documents` table
-/// is folded in by [`migrate_legacy_docs`] — so only the sharded doc tables are
-/// inspected here.)
-fn reject_pre_recordid_doc_format(session: &Session) -> Result<()> {
-    let meta = session.open_cursor("metadata:", None)?;
-    for s in 0..DOC_SHARDS {
-        let name = doc_shard_name(s);
-        meta.reset()?;
-        meta.set_key_s(&name);
-        if meta.search().is_ok() {
-            let cfg = meta.get_value_s()?;
-            if extract_key_format(&cfg) == Some("SSu") {
-                return Err(StorageError::Internal(format!(
-                    "SecantusDB storage at this path was written by a build before \
-                     the RecordId doc-table change: '{name}' is keyed 'SSu' but this \
-                     build requires 'SSq'. There is no in-place upgrade (pre-1.0 \
-                     beta, no migration) — start from a fresh data directory or \
-                     downgrade to the build that wrote it."
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Refuse to open a store whose index entries predate the RecordId entry format
@@ -2723,7 +2739,6 @@ pub fn wt_config(
 // (crates/secantus-compressors), so a store's tables are the ones mongod
 // writes (tasks/mongod-storage-model-plan.md). lz4 and zlib stay linked for
 // the reasons above; no table this build creates uses them.
-const DOC_TABLE_CFG: &str = "key_format=SSq,value_format=u,block_compressor=snappy";
 const QU_COMPRESSED_CFG: &str = "key_format=q,value_format=u,block_compressor=snappy";
 
 // The full table set `storage.py` bootstraps. Sub-phase 1 only reads/writes the
@@ -2738,6 +2753,12 @@ const BOOTSTRAP: &[(&str, &str)] = &[
     // drops correctly -- every reader treats an absent table as empty.
     // Mirrors the Python `Storage` bootstrap.
     (COLL_TABLE, "key_format=SS,value_format=u"),
+    // mongod's catalog, and where each collection's documents live.
+    (
+        mdb_catalog::CATALOG_TABLE,
+        mdb_catalog::COLLECTION_TABLE_CFG,
+    ),
+    (mdb_catalog::IDENTS_TABLE, "key_format=SS,value_format=u"),
     (TOMB_TABLE, "key_format=SS,value_format=u"),
     ("table:secantus_indexes", "key_format=SSS,value_format=u"),
     (
@@ -5481,6 +5502,12 @@ pub struct Storage {
     desc_cache: std::sync::RwLock<CatalogCache<Vec<IndexDesc>>>,
     options_cache: std::sync::RwLock<CatalogCache<Document>>,
     list_cache: std::sync::RwLock<CatalogCache<Vec<Document>>>,
+    /// Idents whose tables are to be dropped (a dropped collection's, one a
+    /// rolled-back create made): mongod's drop-pending idents. A table is
+    /// dropped when nothing has it open; until then it waits here, retried
+    /// by each drop, by the checkpoint thread and at close, and an open
+    /// drops any its predecessor left (`reconcile_idents`).
+    drop_pending: Arc<Mutex<Vec<String>>>,
     /// Which collections of one database hold an index of each name: the
     /// relation-name lookup [`Self::index_owners`] answers from, kept
     /// current from the index catalog's change log (RP-928).
@@ -7864,20 +7891,28 @@ fn peek_entry_ts(blob: &[u8]) -> Option<bson::Timestamp> {
 /// greater than any existing doc-table key. The RecordId is now the doc-table key
 /// itself (`(db, coll, RecordId)`); the forward `NAT_TABLE` this used to scan is
 /// gone. Mirrors `storage._scan_max_nat_seq`.
+/// Every collection with its documents table: `(db, coll, table URI)`.
+fn collection_tables(session: &Session) -> Result<Vec<(String, String, String)>> {
+    Ok(mdb_catalog::all_placements(session)?
+        .into_iter()
+        .map(|(db, coll, p)| (db, coll, p.table()))
+        .collect())
+}
+
 fn scan_max_nat_seq(session: &Session) -> i64 {
-    // Doc-table keys are (db, coll, RecordId); RecordIds are global-monotonic so
-    // any row's RecordId could be the max across collections/shards — scan every
-    // shard and take the max.
+    // RecordIds are minted from one counter for every collection, so any
+    // collection's last row could hold the largest: read each table's last.
     let mut max_seq = 0i64;
-    for s in 0..DOC_SHARDS {
-        let Ok(c) = session.open_cursor(&doc_shard_name(s), None) else {
+    let Ok(placements) = mdb_catalog::all_placements(session) else {
+        return 0;
+    };
+    for (_, _, p) in placements {
+        let Ok(c) = session.open_cursor(&p.table(), None) else {
             continue;
         };
-        while c.next().unwrap_or(false) {
-            if let Ok((_db, _coll, seq)) = c.get_key_ssq() {
-                if seq > max_seq {
-                    max_seq = seq;
-                }
+        if c.prev().unwrap_or(false) {
+            if let Ok(seq) = c.get_key_q() {
+                max_seq = max_seq.max(seq);
             }
         }
     }
@@ -8432,13 +8467,10 @@ impl Storage {
             // preserves an existing table's key_format, so the on-disk schema is
             // intact for this check. (Runs before `migrate_legacy_docs` — that
             // path is the pre-*shard* case, which this check does not touch.)
-            reject_pre_recordid_doc_format(&boot)?;
+            reconcile_idents(&boot)?;
             // Same fail-fast for the index-ENTRY format (step 2). Runs after the
             // doc-table check so the more fundamental mismatch is reported first.
             reject_legacy_index_entry_format(&boot)?;
-            // One-time: fold a pre-shard store's legacy documents rows into the
-            // per-collection shards (no-op for a born-sharded store).
-            migrate_legacy_docs(&boot, data_create_mode)?;
             // Recover the oplog seq / timestamp counters from the meta row, or
             // reconstruct them by scanning the oplog table.
             load_oplog_meta(&boot)?
@@ -8557,6 +8589,7 @@ impl Storage {
             desc_cache: std::sync::RwLock::new(HashMap::new()),
             options_cache: std::sync::RwLock::new(HashMap::new()),
             list_cache: std::sync::RwLock::new(HashMap::new()),
+            drop_pending: Arc::new(Mutex::new(Vec::new())),
             index_names: Mutex::new(None),
             txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
             cache_bytes: parse_cache_bytes(config),
@@ -8640,6 +8673,11 @@ impl Storage {
         storage.note_existing_timeseries()?;
         storage.backfill_document_id_claims()?;
         storage.backfill_collated_id_claims()?;
+        // `_mdb_catalog` from the registry, after everything above that can
+        // rewrite index rows.
+        if !storage.in_memory {
+            storage.resync_catalog()?;
+        }
         storage.load_user_write_block()?;
         // Index builds a crash or shutdown interrupted run again from the
         // start, as mongod restarts them (RM-187).
@@ -10185,6 +10223,115 @@ impl Storage {
         }
     }
 
+    /// Unlist `(db, coll)`'s documents table, in `session`'s transaction:
+    /// its `_mdb_catalog` row and its placement go, its sizes go to zero, and
+    /// the table itself is dropped once the transaction commits and nothing
+    /// has it open (mongod's drop-pending ident). A collection created in
+    /// the same transaction loses the table it was holding until commit.
+    fn unplace_collection(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
+        if let Some(hp) = deferring_handle(session) {
+            // SAFETY: as `deferring_handle`; the only writer on this thread.
+            if let Some(p) = unsafe { &mut *hp }
+                .deferred_placements
+                .remove(&(db.to_string(), coll.to_string()))
+            {
+                let pending = self.drop_pending.clone();
+                session.on_transaction_end(Box::new(move |_| {
+                    pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(p.ident);
+                }));
+            }
+        }
+        let Some(p) = mdb_catalog::read_placement(session, db, coll)? else {
+            return Ok(());
+        };
+        mdb_catalog::remove_entry(session, p.catalog_id)?;
+        mdb_catalog::remove_placement(session, db, coll)?;
+        let s = self.sizes.get(db, coll);
+        self.sizes.adjust(
+            session,
+            db,
+            coll,
+            Delta::drop_rows(s.records, s.data_size, s.id_index_size),
+        );
+        let pending = self.drop_pending.clone();
+        session.on_transaction_end(Box::new(move |committed| {
+            if committed {
+                pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(p.ident);
+            }
+        }));
+        Ok(())
+    }
+
+    /// Move `(src_db, src_coll)`'s documents table to `(dst_db, dst_coll)`,
+    /// in `session`'s transaction: the table stays, its placement and its
+    /// `_mdb_catalog` row are renamed (mongod's rename is catalog-only).
+    fn move_placement(
+        &self,
+        session: &Session,
+        src: (&str, &str),
+        dst: (&str, &str),
+    ) -> Result<()> {
+        let Some(p) = mdb_catalog::read_placement(session, src.0, src.1)? else {
+            return Ok(());
+        };
+        mdb_catalog::remove_placement(session, src.0, src.1)?;
+        mdb_catalog::write_placement(session, dst.0, dst.1, &p)?;
+        let s = self.sizes.get(src.0, src.1);
+        self.sizes.adjust(
+            session,
+            src.0,
+            src.1,
+            Delta::drop_rows(s.records, s.data_size, s.id_index_size),
+        );
+        self.sizes.adjust(
+            session,
+            dst.0,
+            dst.1,
+            Delta::drop_rows(-s.records, -s.data_size, -s.id_index_size),
+        );
+        Ok(())
+    }
+
+    /// The WiredTiger table holding `(db, coll)`'s documents, if it has one
+    /// (`$listCatalog`'s `ident`, `pg_relation_filepath`).
+    pub fn collection_table_name(&self, db: &str, coll: &str) -> Result<Option<String>> {
+        let session = self.conn.open_session()?;
+        collection_table(&session, db, coll)
+    }
+
+    /// Write every collection's `_mdb_catalog` row from the registry, in one
+    /// statement transaction (timestamped as the store's writes are): what
+    /// an open does after the work that can rewrite index rows (format
+    /// rebuilds, claim backfills). A row that already says the same is left
+    /// alone.
+    fn resync_catalog(&self) -> Result<()> {
+        self.retry_write_conflicts("resync _mdb_catalog", || {
+            let session = self.op_session()?;
+            self.with_statement_txn(&session, || {
+                for (db, coll, _) in mdb_catalog::all_placements(&session)? {
+                    sync_catalog_entry(&session, &db, &coll)?;
+                }
+                Ok(())
+            })
+        })
+    }
+
+    /// Drop `ident`'s table now if nothing has it open, else when the
+    /// drop-pending reaper next finds it free (`drop_pending`).
+    fn drop_ident_table(&self, ident: &str) {
+        self.drop_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(ident.to_string());
+        reap_drop_pending(&self.conn, &self.drop_pending);
+    }
+
     pub fn checkpoint_now(&self) -> Result<()> {
         if self.in_memory {
             return Ok(());
@@ -10542,6 +10689,7 @@ impl Storage {
         let stable_seq = self.stable_seq.clone();
         let gate = self.checkpoint_gate.clone();
         let timestamped = self.timestamped;
+        let drop_pending = self.drop_pending.clone();
         let handle = thread::Builder::new()
             .name(
                 if stable {
@@ -10561,6 +10709,7 @@ impl Storage {
                     }
                     std::thread::sleep(tick);
                     waited += tick;
+                    reap_drop_pending(&conn, &drop_pending);
                     if timestamped {
                         // The oldest timestamp trails the clock by the
                         // snapshot window, not by a checkpoint interval.
@@ -11032,7 +11181,7 @@ impl Storage {
             ensure_collection(session, db, coll, self.data_nonlogged)?;
             write_coll_options(session, db, coll, &bson::doc! {"clusteredIndex": true})?;
         }
-        let doc_cur = session.open_cursor(&doc_table_for(db, coll), Some("overwrite=false"))?;
+        let doc_cur = open_doc_cursor(session, db, coll, Some("overwrite=false"))?;
         let nat_cur = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
         for blob in records {
             let id = bson::RawDocument::from_bytes(blob)
@@ -11828,6 +11977,7 @@ impl Storage {
             defer_creates: false,
             deferred_creates: BTreeMap::new(),
             deferred_keys: BTreeMap::new(),
+            deferred_placements: BTreeMap::new(),
             written_ns: Vec::new(),
             unattributed: false,
             catalog_docs: CatalogDocWrites::default(),
@@ -12174,7 +12324,8 @@ impl Storage {
             if !handle.deferred_creates.is_empty() {
                 let creates = std::mem::take(&mut handle.deferred_creates);
                 let keys = std::mem::take(&mut handle.deferred_keys);
-                if let Err(e) = flush_deferred_creates(&session, creates, keys) {
+                let placed = std::mem::take(&mut handle.deferred_placements);
+                if let Err(e) = flush_deferred_creates(self, &session, creates, keys, placed) {
                     // Nothing of it is committed: `session` drops below and
                     // rolls it back.
                     handle.deregister_minted();
@@ -12356,6 +12507,15 @@ impl Storage {
         let _registry = RegistryEnd(std::mem::take(&mut handle.wrote_registry));
         handle.deferred_creates.clear();
         handle.deferred_keys.clear();
+        // The tables made for the collections it created hold nothing anyone
+        // can see: they go when nothing reads them (see `drop_ident_table`).
+        let made: Vec<String> = std::mem::take(&mut handle.deferred_placements)
+            .into_values()
+            .map(|p| p.ident)
+            .collect();
+        for ident in made {
+            self.drop_ident_table(&ident);
+        }
         if let Some(session) = handle.session.take() {
             {
                 let mut held = handle.held.lock().unwrap_or_else(|e| e.into_inner());
@@ -12541,6 +12701,7 @@ impl Storage {
         fresh.defer_creates = handle.defer_creates;
         fresh.deferred_creates = handle.deferred_creates.clone();
         fresh.deferred_keys = handle.deferred_keys.clone();
+        fresh.deferred_placements = handle.deferred_placements.clone();
         // The guard and the rollback are made holding the write lock of every
         // collection the transaction has written a row of (sorted, as the
         // other multi-collection takers do). A writer holds its collection's
@@ -12820,11 +12981,12 @@ impl Storage {
         if !handle.deferred_creates.is_empty() {
             let creates = std::mem::take(&mut handle.deferred_creates);
             let keys = std::mem::take(&mut handle.deferred_keys);
+            let placed = std::mem::take(&mut handle.deferred_placements);
             let session = handle
                 .session
                 .as_ref()
                 .ok_or_else(|| StorageError::Internal("transaction already closed".into()))?;
-            flush_deferred_creates(session, creates, keys)?;
+            flush_deferred_creates(self, session, creates, keys, placed)?;
         }
         let ops = self.transaction_write_set(&mut handle)?;
         // A transaction id for `pg_prepared_xacts.transaction`: one oplog seq,
@@ -12996,7 +13158,7 @@ impl Storage {
         if ids.is_empty() {
             return Ok(Some(TableOverlay { rows }));
         }
-        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+        let cur = open_doc_cursor(session, db, coll, None)?;
         for k in ids {
             let found = match self.doc_recordid(session, db, coll, &k)? {
                 None => None,
@@ -13410,7 +13572,7 @@ impl Storage {
                 // this overwrite=false insert is where a duplicate `_id` is caught.
                 let recordid = self.write_nat_entry(&session, db, coll, &key)?;
                 // Doc table keyed by the (unique) RecordId.
-                let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+                let cur = open_doc_cursor(&session, db, coll, None)?;
                 note_row(db, coll, recordid)?;
                 undo_note_row(db, coll, &key, None, blob)?;
                 cur.set_key_ssq(db, coll, recordid);
@@ -13654,8 +13816,7 @@ impl Storage {
                 // Each document's outcome, for mongod's insert groups: its
                 // size, and its entry's position when it was written.
                 let mut outcomes: Vec<(usize, Option<usize>)> = Vec::with_capacity(docs.len());
-                let doc_cur =
-                    session.open_cursor(&doc_table_for(db, coll), Some("overwrite=false"))?;
+                let doc_cur = open_doc_cursor(&session, db, coll, Some("overwrite=false"))?;
                 let nat_cur = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
                 for (offset, doc_bytes) in docs.iter().enumerate() {
                     let index = base_index + offset;
@@ -14003,7 +14164,7 @@ impl Storage {
         let Some(recordid) = self.doc_recordid(&session, db, coll, &key)? else {
             return Ok(None);
         };
-        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+        let cur = open_doc_cursor(&session, db, coll, None)?;
         cur.set_key_ssq(db, coll, recordid);
         match cur.search() {
             Ok(()) => {
@@ -14049,7 +14210,7 @@ impl Storage {
                 let Some(recordid) = self.doc_recordid(&session, db, coll, &key)? else {
                     return Ok(false);
                 };
-                let probe = session.open_cursor(&doc_table_for(db, coll), None)?;
+                let probe = open_doc_cursor(&session, db, coll, None)?;
                 probe.set_key_ssq(db, coll, recordid);
                 let (old_idk_len, old_blob) = match probe.search() {
                     Ok(()) => {
@@ -14082,7 +14243,7 @@ impl Storage {
                     return Err(StorageError::DuplicateKey(Box::new(c)));
                 }
 
-                let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+                let cur = open_doc_cursor(&session, db, coll, None)?;
                 note_row(db, coll, recordid)?;
                 undo_note_row(db, coll, &key, Some((recordid, &old_blob)), &old_blob)?;
                 cur.set_key_ssq(db, coll, recordid);
@@ -14159,7 +14320,7 @@ impl Storage {
                 let Some(recordid) = self.doc_recordid(&session, db, coll, &key)? else {
                     return Ok(false);
                 };
-                let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+                let cur = open_doc_cursor(&session, db, coll, None)?;
                 cur.set_key_ssq(db, coll, recordid);
                 // Read the doc first so we can retract its index entries, then remove.
                 let (old_idk_len, old_blob) = match cur.search() {
@@ -14677,6 +14838,7 @@ impl Storage {
                         Err(e) if e.is_not_found() => {}
                         Err(e) => return Err(e.into()),
                     }
+                    self.unplace_collection(&session, db, coll)?;
                     if let Some(ui) = ui {
                         self.emit_drop_oplog(&session, db, coll, &ui, records)?;
                     }
@@ -14732,8 +14894,13 @@ impl Storage {
                 t.set_key_ss(db, coll);
                 t.set_value_u(b"");
                 t.insert()?;
+                let records = if ui.is_some() {
+                    self.count_records(&session, db, coll)?
+                } else {
+                    0
+                };
+                self.unplace_collection(&session, db, coll)?;
                 if let Some(ui) = ui {
-                    let records = self.count_records(&session, db, coll)?;
                     self.emit_drop_oplog(&session, db, coll, &ui, records)?;
                 }
                 Ok(true)
@@ -14806,17 +14973,6 @@ impl Storage {
                 let session = self.op_session()?;
                 self.with_statement_txn(&session, || {
                     self.purge_uniq_batch(&session, db, coll, PURGE_CHUNK_MAX_ROWS)
-                })
-            })?;
-            if n < PURGE_CHUNK_MAX_ROWS {
-                break;
-            }
-        }
-        loop {
-            let n = self.retry_write_conflicts("drop_collection purge(docs)", || {
-                let session = self.op_session()?;
-                self.with_statement_txn(&session, || {
-                    self.purge_docs_batch(&session, db, coll, PURGE_CHUNK_MAX_ROWS)
                 })
             })?;
             if n < PURGE_CHUNK_MAX_ROWS {
@@ -14963,6 +15119,7 @@ impl Storage {
                             Err(e) if e.is_not_found() => {}
                             Err(e) => return Err(e.into()),
                         }
+                        self.unplace_collection(&session, db, c)?;
                         if let Some(ui) = &ui {
                             self.emit_drop_oplog(&session, db, c, ui, records)?;
                         }
@@ -14997,8 +15154,13 @@ impl Storage {
                     t.set_key_ss(db, c);
                     t.set_value_u(b"");
                     t.insert()?;
+                    let records = if ui.is_some() {
+                        self.count_records(&session, db, c)?
+                    } else {
+                        0
+                    };
+                    self.unplace_collection(&session, db, c)?;
                     if let Some(ui) = &ui {
-                        let records = self.count_records(&session, db, c)?;
                         self.emit_drop_oplog(&session, db, c, ui, records)?;
                     }
                     Ok(())
@@ -15157,6 +15319,7 @@ impl Storage {
                     t.set_key_ss(dst_db, dst_coll);
                     t.set_value_u(b"");
                     t.insert()?;
+                    self.unplace_collection(&session, dst_db, dst_coll)?;
                     // The replaced target gets no `drop` entry of its own:
                     // mongod records it as the rename's `dropTarget`, and a
                     // stream on it sees the rename, then an invalidate.
@@ -15186,15 +15349,6 @@ impl Storage {
                 Ok(())
             })
         })?;
-        // Lazy shards: the destination's doc shard may not exist yet (schema
-        // op, runs on WiredTiger's internal session — idempotent).
-        {
-            let session = self.op_session()?;
-            session.create(
-                &doc_table_for(dst_db, dst_coll),
-                &data_table_cfg(DOC_TABLE_CFG, self.data_nonlogged),
-            )?;
-        }
         // Phase B: copy in bounded batches, resuming by source RecordId.
         // Each record keeps its RecordId (so insertion order too), and the
         // destination numbers on from where the source would have; index
@@ -15214,23 +15368,15 @@ impl Storage {
                     )?;
                     let dst_descs =
                         self.rename_descs(&session, (src_db, src_coll), (dst_db, dst_coll))?;
-                    let dcur = session.open_cursor(&doc_table_for(dst_db, dst_coll), None)?;
+                    // The documents stay in their table (it moves to the
+                    // new name at the switch); their `_id` and index entries
+                    // are written under it, RecordIds kept.
                     let mut last = after;
                     for (src_rid, id_k, blob) in &batch {
                         // The record keeps its RecordId, as mongod's renamed
                         // collection keeps its records (measured 8.2.11).
                         let recordid =
                             self.write_nat_entry_kept(&session, dst_db, dst_coll, id_k, *src_rid)?;
-                        dcur.reset()?;
-                        dcur.set_key_ssq(dst_db, dst_coll, recordid);
-                        dcur.set_value_u(&frame_doc_value(id_k, blob));
-                        dcur.insert()?;
-                        self.sizes.adjust(
-                            &session,
-                            dst_db,
-                            dst_coll,
-                            Delta::insert(id_k.len(), blob.len()),
-                        );
                         let doc = decode_doc(blob)?;
                         self.write_index_entries(
                             &session, dst_db, dst_coll, &doc, &dst_descs, recordid,
@@ -15262,7 +15408,9 @@ impl Storage {
         self.retry_write_conflicts("rename_collection switch", || {
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                ensure_collection(&session, dst_db, dst_coll, self.data_nonlogged)?;
+                // The table moves to the new name (mongod's rename is
+                // catalog-only), and with it its `_mdb_catalog` row.
+                self.move_placement(&session, (src_db, src_coll), (dst_db, dst_coll))?;
                 let rc = session.open_cursor(COLL_TABLE, None)?;
                 // Options and UUID travel with the collection (see the note
                 // in `rename_collection_in_txn`).
@@ -15281,6 +15429,9 @@ impl Storage {
                     Err(e) if e.is_not_found() => {}
                     Err(e) => return Err(e.into()),
                 }
+                note_coll_table_write(dst_db, dst_coll);
+                // The catalog row the table kept now names the new namespace.
+                sync_catalog_entry(&session, dst_db, dst_coll)?;
                 let t = session.open_cursor(TOMB_TABLE, None)?;
                 t.set_key_ss(dst_db, dst_coll);
                 match t.search() {
@@ -15370,6 +15521,7 @@ impl Storage {
                 Err(e) if e.is_not_found() => {}
                 Err(e) => return Err(e.into()),
             }
+            self.unplace_collection(session, dst_db, dst_coll)?;
         }
         // Collect every src row, drop the src tables, then re-key into dst.
         let docs = self.scan_docs(session, src_db, src_coll)?;
@@ -15377,33 +15529,13 @@ impl Storage {
         let src_id_claim = self.id_claim_desc(session, src_db, src_coll)?;
         let src_next = self.next_record_id(src_db, src_coll)?;
         self.purge_collection_tables(session, src_db, src_coll)?;
-        // Sharded: dst rows go to the dst collection's shard (may differ from the
-        // src shard — the src rows were already read into `docs` and purged above).
-        // Each doc keeps its RecordId in dst (preserving insertion order) and
-        // the dst `_id` index is written (id_key -> RecordId); the doc-table
-        // value carries the id_key in-band (framed).
-        // Lazy shards: the rename target's shard may not exist yet — make it.
-        session.create(
-            &doc_table_for(dst_db, dst_coll),
-            &data_table_cfg(DOC_TABLE_CFG, self.data_nonlogged),
-        )?;
-        let dcur = session.open_cursor(&doc_table_for(dst_db, dst_coll), None)?;
-        // Remember each doc against its RecordId in the destination.
+        // The documents stay in their table, under their RecordIds: the
+        // table moves to the new name (mongod's rename is catalog-only), and
+        // the `_id` index rows are written under it.
+        self.move_placement(session, (src_db, src_coll), (dst_db, dst_coll))?;
         let mut moved: Vec<(i64, Document)> = Vec::with_capacity(docs.len());
         for (src_rid, id_k, blob) in &docs {
-            // The record keeps its RecordId, as mongod's renamed collection
-            // keeps its records (measured 8.2.11).
             let recordid = self.write_nat_entry_kept(session, dst_db, dst_coll, id_k, *src_rid)?;
-            dcur.reset()?;
-            dcur.set_key_ssq(dst_db, dst_coll, recordid);
-            dcur.set_value_u(&frame_doc_value(id_k, blob));
-            dcur.insert()?;
-            self.sizes.adjust(
-                session,
-                dst_db,
-                dst_coll,
-                Delta::insert(id_k.len(), blob.len()),
-            );
             moved.push((recordid, decode_doc(blob)?));
         }
         let icur = session.open_cursor(IDX_TABLE, None)?;
@@ -15428,7 +15560,6 @@ impl Storage {
             self.write_index_entries(session, dst_db, dst_coll, doc, &dst_descs, *recordid)?;
         }
         self.set_next_record_id(dst_db, dst_coll, src_next);
-        ensure_collection(session, dst_db, dst_coll, self.data_nonlogged)?;
         let rc = session.open_cursor(COLL_TABLE, None)?;
         // The collection keeps its options and its UUID under the new name:
         // validator, capped limits, default collation. Until 2026-10-10 the
@@ -15450,6 +15581,9 @@ impl Storage {
             Err(e) if e.is_not_found() => {}
             Err(e) => return Err(e.into()),
         }
+        note_coll_table_write(dst_db, dst_coll);
+        // The catalog row the table kept now names the new namespace.
+        sync_catalog_entry(session, dst_db, dst_coll)?;
         if self.enable_oplog {
             let mut entries: Vec<Document> = Vec::new();
             if let Some(du) = &dst_ui {
@@ -15592,9 +15726,8 @@ impl Storage {
     /// moves a row without counting it shows up here). Runs at close, when
     /// nothing else writes.
     fn check_sizes_against_walk(&self, session: &Session) -> Result<()> {
-        let doc_tables: Vec<String> = (0..DOC_SHARDS).map(doc_shard_name).collect();
         let walked = sizes::SizeStorer::default();
-        walked.recount(session, &doc_tables, IDX_ENTRIES_TABLE)?;
+        walked.recount(session, &collection_tables(session)?, IDX_ENTRIES_TABLE)?;
         let mut wrong = Vec::new();
         for (db, coll, sizes) in self.sizes.committed_sizes() {
             if walked.get(&db, &coll) != sizes {
@@ -15630,9 +15763,8 @@ impl Storage {
         // not roll back with them.
         session.create(sizes::SIZE_STORER_TABLE, sizes::SIZE_STORER_CFG)?;
         if !self.sizes.load(&session, fingerprint)? {
-            let doc_tables: Vec<String> = (0..DOC_SHARDS).map(doc_shard_name).collect();
             self.sizes
-                .recount(&session, &doc_tables, IDX_ENTRIES_TABLE)?;
+                .recount(&session, &collection_tables(&session)?, IDX_ENTRIES_TABLE)?;
         }
         Ok(())
     }
@@ -16583,6 +16715,8 @@ impl Storage {
         c.set_key_sss(db, coll, name);
         c.set_value_u(payload);
         c.insert()?;
+        // The catalog mongod reads says what the registry says.
+        sync_catalog_entry(session, db, coll)?;
         // Oplog: a DDL `op: "c"` `createIndexes` entry so a `showExpandedEvents`
         // change stream surfaces a `createIndexes` event (the projector reads
         // `o.createIndexes` + `o.indexes[].{v,key,name}`).
@@ -16914,6 +17048,8 @@ impl Storage {
             wcur.set_key_sss(db, coll, name);
             wcur.set_value_u(&blob);
             wcur.update()?;
+            // The catalog mongod reads says what the registry says.
+            sync_catalog_entry(session, db, coll)?;
             Ok(true)
         })
     }
@@ -16959,6 +17095,8 @@ impl Storage {
             wcur.set_key_sss(db, coll, name);
             wcur.set_value_u(&blob);
             wcur.update()?;
+            // The catalog mongod reads says what the registry says.
+            sync_catalog_entry(session, db, coll)?;
             Ok(true)
         })
     }
@@ -17056,6 +17194,8 @@ impl Storage {
                 // recreating it (or inserting the value again) is refused
                 // against an index that no longer exists.
                 self.purge_unique_claims(&session, db, coll, Some(name))?;
+                // The catalog mongod reads says what the registry says.
+                sync_catalog_entry(&session, db, coll)?;
                 // Oplog: a DDL `op: "c"` `dropIndexes` entry so a `showExpandedEvents`
                 // change stream surfaces a `dropIndexes` event (the projector reads
                 // `o.dropIndexes` + `o.index` + `o.key`).
@@ -17114,6 +17254,8 @@ impl Storage {
                         c.remove()?;
                     }
                     self.delete_entries_prefix(&session, db, coll, name)?;
+                    // The catalog mongod reads says what the registry says.
+                    sync_catalog_entry(&session, db, coll)?;
                 }
                 // Oplog: one `dropIndexes` "c" entry per dropped index (mongod emits
                 // per-index events for `dropIndexes: "*"` too), each carrying the key
@@ -17257,7 +17399,7 @@ impl Storage {
     ) -> Result<()> {
         COLLECTION_WALKS.with(|w| w.set(w.get() + 1));
         // Lazy shards: an absent shard (empty / never-created collection) is empty.
-        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+        let cur = match open_doc_cursor(session, db, coll, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok(()),
             Err(e) => return Err(e.into()),
@@ -17305,7 +17447,7 @@ impl Storage {
         after: Option<i64>,
         limit: usize,
     ) -> Result<Vec<ScannedDoc>> {
-        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+        let cur = match open_doc_cursor(session, db, coll, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
@@ -17393,7 +17535,7 @@ impl Storage {
     /// the last key of its range in its doc shard.
     fn largest_record_id(&self, db: &str, coll: &str) -> Result<i64> {
         let session = self.conn.open_session()?;
-        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+        let cur = match open_doc_cursor(&session, db, coll, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok(0),
             Err(e) => return Err(e.into()),
@@ -17410,7 +17552,7 @@ impl Storage {
             if d == db && c == coll {
                 return Ok(rid);
             }
-            if (d.as_str(), c.as_str()) < (db, coll) {
+            if (d, c) < (db, coll) {
                 return Ok(0);
             }
             more = cur.prev()?;
@@ -17643,7 +17785,7 @@ impl Storage {
         // row's `id_key` (for the write/index paths), a per-document allocation
         // wasted on a full scan of N documents.
         // Lazy shards: an absent shard (empty / never-created collection) is empty.
-        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+        let cur = match open_doc_cursor(session, db, coll, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
@@ -17773,7 +17915,7 @@ impl Storage {
         };
         if over(total, count) {
             let preimages_on = oplog_on && pre_post_images_enabled(session, db, coll)?;
-            let doc_cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+            let doc_cur = open_doc_cursor(session, db, coll, None)?;
             const EVICT_BATCH: usize = 64;
             let mut after: Option<i64> = None;
             'evict: loop {
@@ -17920,6 +18062,8 @@ impl Storage {
             wcur.set_key_sss(db, coll, name);
             wcur.set_value_u(&blob);
             wcur.update()?;
+            // The catalog mongod reads says what the registry says.
+            sync_catalog_entry(session, db, coll)?;
         }
         Ok(())
     }
@@ -18794,7 +18938,7 @@ impl Storage {
             if rows.is_empty() {
                 continue;
             }
-            let docs = match session.open_cursor(&doc_table_for(db, coll), None) {
+            let docs = match open_doc_cursor(&session, db, coll, None) {
                 Ok(c) => c,
                 Err(e) if e.is_missing_table() => continue,
                 Err(e) => return Err(e.into()),
@@ -19234,7 +19378,7 @@ impl Storage {
                             t
                         }
                     };
-                    let docs = match session.open_cursor(&doc_table_for(db, coll), None) {
+                    let docs = match open_doc_cursor(session, db, coll, None) {
                         Ok(c) => c,
                         Err(e) if e.is_missing_table() => continue,
                         Err(e) => return Err(e.into()),
@@ -19412,7 +19556,7 @@ impl Storage {
                             t
                         }
                     };
-                    let docs = match session.open_cursor(&doc_table_for(db, coll), None) {
+                    let docs = match open_doc_cursor(session, db, coll, None) {
                         Ok(c) => c,
                         Err(e) if e.is_missing_table() => continue,
                         Err(e) => return Err(e.into()),
@@ -19580,7 +19724,7 @@ impl Storage {
         coll: &str,
         recordid: i64,
     ) -> Result<bool> {
-        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+        let cur = match open_doc_cursor(session, db, coll, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok(false),
             Err(e) => return Err(e.into()),
@@ -19790,60 +19934,6 @@ impl Storage {
         Ok(out)
     }
 
-    /// Delete a collection's document / index-registry / index-entry rows
-    /// (everything except its `secantus_collections` registry row). Shared by
-    /// `drop_collection` / `drop_database` / `rename_collection`.
-    /// Delete up to `limit` doc rows with the `(db, coll)` prefix; returns
-    /// how many were deleted. Collect-then-remove, same as the whole-purge
-    /// loops. The prefix keys are consecutive, so a batch dirties few pages.
-    fn purge_docs_batch(
-        &self,
-        session: &Session,
-        db: &str,
-        coll: &str,
-        limit: usize,
-    ) -> Result<usize> {
-        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
-            Ok(c) => c,
-            Err(e) if e.is_missing_table() => return Ok(0),
-            Err(e) => return Err(e.into()),
-        };
-        cur.set_key_ssq(db, coll, i64::MIN);
-        let mut more = match cur.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    cur.next()?
-                } else {
-                    true
-                }
-            }
-            Err(e) if e.is_not_found() => false,
-            Err(e) => return Err(e.into()),
-        };
-        // Each row's RecordId and its `_id`-key and document lengths, for
-        // the collection's sizes.
-        let mut ids: Vec<(i64, usize, usize)> = Vec::new();
-        while more && ids.len() < limit {
-            let (d, c, recordid) = cur.get_key_ssq()?;
-            if d != db || c != coll {
-                break;
-            }
-            let value = cur.get_value_u()?;
-            let (idk, blob) = unframe_doc_value(&value)?;
-            ids.push((recordid, idk.len(), blob.len()));
-            more = cur.next()?;
-        }
-        for &(recordid, idk_len, blob_len) in &ids {
-            cur.reset()?;
-            note_row(db, coll, recordid)?;
-            cur.set_key_ssq(db, coll, recordid);
-            cur.remove()?;
-            self.sizes
-                .adjust(session, db, coll, Delta::remove(idk_len, blob_len));
-        }
-        Ok(ids.len())
-    }
-
     /// Delete up to `limit` index-entry rows across ALL of the collection's
     /// indexes; returns how many were deleted.
     fn purge_idx_entries_batch(
@@ -20021,19 +20111,16 @@ impl Storage {
         // a surviving claim would reject a later insert of the same value
         // against a row that no longer exists.
         self.purge_unique_claims(session, db, coll, None)?;
-        // Lazy shards: a collection whose shard was never written (dropping an
-        // empty / never-created collection — a no-op in MongoDB) has no doc rows
-        // to purge, so an absent shard is simply skipped.
-        match session.open_cursor(&doc_table_for(db, coll), None) {
-            Ok(doc_cur) => {
+        // The documents are not purged row by row: they are in the
+        // collection's own table, which a drop unlists and drops whole
+        // (`unplace_collection`) and a rename moves (`move_placement`). Each
+        // row is still recorded as the transaction's, as a delete would be:
+        // a savepoint's rollback restores them from that record (RP-018).
+        match open_doc_cursor(session, db, coll, None) {
+            Ok(_) => {
                 for (recordid, id_k, blob) in self.scan_docs(session, db, coll)? {
-                    doc_cur.reset()?;
                     note_row(db, coll, recordid)?;
                     undo_note_row(db, coll, &id_k, Some((recordid, &blob)), &blob)?;
-                    doc_cur.set_key_ssq(db, coll, recordid);
-                    doc_cur.remove()?;
-                    self.sizes
-                        .adjust(session, db, coll, Delta::remove(id_k.len(), blob.len()));
                 }
             }
             Err(e) if e.is_missing_table() => {}
@@ -20443,7 +20530,7 @@ impl Storage {
                 buf.push(blob);
                 !(buf.len() >= batch && !sink(std::mem::take(buf)))
             };
-            let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            let cur = match open_doc_cursor(&session, db, coll, None) {
                 Ok(c) => Some(c),
                 Err(e) if e.is_missing_table() => None,
                 Err(e) => return Err(e.into()),
@@ -20542,7 +20629,7 @@ impl Storage {
             }
         };
         let out = (|| -> Result<()> {
-            let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+            let cur = match open_doc_cursor(&session, db, coll, None) {
                 Ok(c) => c,
                 Err(e) if e.is_missing_table() => return Ok(()),
                 Err(e) => return Err(e.into()),
@@ -20606,7 +20693,7 @@ impl Storage {
         if let Some(ov) = overlay_for(db, coll) {
             return self.scan_batch_after_overlaid(&session, db, coll, filter, after, batch, &ov);
         }
-        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+        let cur = match open_doc_cursor(&session, db, coll, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok((Vec::new(), None)),
             Err(e) => return Err(e.into()),
@@ -20676,7 +20763,7 @@ impl Storage {
         backward: bool,
     ) -> Result<Vec<(i64, Vec<u8>)>> {
         let session = self.op_session()?;
-        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+        let cur = match open_doc_cursor(&session, db, coll, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
@@ -20728,7 +20815,7 @@ impl Storage {
         recordids: &[i64],
     ) -> Result<Vec<Option<Vec<u8>>>> {
         let session = self.op_session()?;
-        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+        let cur = match open_doc_cursor(&session, db, coll, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok(vec![None; recordids.len()]),
             Err(e) => return Err(e.into()),
@@ -20877,7 +20964,7 @@ impl Storage {
         if after == Some(i64::MAX) {
             return Ok((out, None));
         }
-        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+        let cur = match open_doc_cursor(session, db, coll, None) {
             Ok(c) => Some(c),
             Err(e) if e.is_missing_table() => None,
             Err(e) => return Err(e.into()),
@@ -21599,7 +21686,7 @@ impl Storage {
         // Lazy shards: an absent shard holds no documents. Without this a
         // count or delete by `_id` on a collection that was never written
         // failed with WiredTiger's ENOENT where it should find nothing.
-        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+        let cur = match open_doc_cursor(session, db, coll, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
@@ -21795,7 +21882,7 @@ impl Storage {
             // once it is known to be kept.
             None => {
                 let mut scanned = 0usize;
-                let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+                let cur = match open_doc_cursor(&session, db, coll, None) {
                     Ok(c) => c,
                     Err(e) if e.is_missing_table() => {
                         return Ok(Some(MatchedRows::default()));
@@ -21890,7 +21977,7 @@ impl Storage {
             return Ok(None);
         }
         let session = self.op_session()?;
-        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+        let cur = match open_doc_cursor(&session, db, coll, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok(Some(0)),
             Err(e) => return Err(e.into()),
@@ -21936,7 +22023,7 @@ impl Storage {
             return Ok(None);
         }
         let session = self.op_session()?;
-        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+        let cur = match open_doc_cursor(&session, db, coll, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok(Some(Vec::new())),
             Err(e) => return Err(e.into()),
@@ -22328,7 +22415,7 @@ impl Storage {
     /// unchanged (see `lock_matching`); a row that is gone holds nothing.
     fn relock_row(&self, db: &str, coll: &str, recordid: i64) -> Result<()> {
         let session = self.op_session()?;
-        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+        let cur = match open_doc_cursor(&session, db, coll, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok(()),
             Err(e) => return Err(e.into()),
@@ -22386,7 +22473,7 @@ impl Storage {
                 rows.push((recordid, id_k, blob));
             }
         }
-        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+        let cur = open_doc_cursor(&session, db, coll, None)?;
         if !rows.is_empty() {
             LOCKED_ONLY.with(|l| l.set(true));
         }
@@ -22961,7 +23048,7 @@ impl Storage {
         // leaves the third). This chunk commits what it did and hands the
         // error back; it used to roll the chunk back, so nothing was updated.
         let mut stopped: Option<StorageError> = None;
-        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+        let cur = open_doc_cursor(session, db, coll, None)?;
         for (recordid, scanned) in rids {
             let recordid = *recordid;
             if modified >= WRITE_CHUNK_MAX_DOCS || chunk_bytes >= WRITE_CHUNK_MAX_BYTES {
@@ -23227,7 +23314,7 @@ impl Storage {
                         self.insert_index_entries(&session, db, coll, &additions)?;
                         // The doc stays at its RecordId (unchanged — `_id` is immutable);
                         // the framed value carries the id_key in-band.
-                        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+                        let cur = open_doc_cursor(&session, db, coll, None)?;
                         note_row(db, coll, recordid)?;
                         undo_note_row(db, coll, &id_k, Some((recordid, &blob)), &blob)?;
                         cur.set_key_ssq(db, coll, recordid);
@@ -23471,7 +23558,7 @@ impl Storage {
                         }
                         Err(e) => return Err(e),
                     };
-                    let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+                    let cur = open_doc_cursor(&session, db, coll, None)?;
                     note_row(db, coll, recordid)?;
                     undo_note_row(db, coll, &new_id_key, None, &new_blob)?;
                     cur.set_key_ssq(db, coll, recordid);
@@ -23909,7 +23996,7 @@ impl Storage {
         let mut oplog_entries: Vec<OplogEntry> = Vec::new();
         let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
         let mut stopped = None;
-        let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+        let cur = open_doc_cursor(session, db, coll, None)?;
         for (recordid, scanned, yielded) in rids {
             let recordid = *recordid;
             if deleted >= WRITE_CHUNK_MAX_DOCS || chunk_bytes >= WRITE_CHUNK_MAX_BYTES {
@@ -24035,7 +24122,7 @@ impl Storage {
                     let doc = decode_doc(&blob)?;
                     // Doc row first, entries after — see prune_ttl for the lock-free
                     // reader ordering rationale.
-                    let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
+                    let cur = open_doc_cursor(&session, db, coll, None)?;
                     note_row(db, coll, recordid)?;
                     undo_note_row(db, coll, &id_k, Some((recordid, &blob)), &blob)?;
                     cur.set_key_ssq(db, coll, recordid);
@@ -25705,7 +25792,7 @@ impl Storage {
         // index -> RecordId` first; deleting that hop is the point of step 2
         // (it measured +14.7% on `find_indexed_range`).
         // Lazy shards: an absent shard yields no docs.
-        let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+        let cur = match open_doc_cursor(session, db, coll, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
@@ -26132,6 +26219,165 @@ impl Storage {
 }
 
 /// True if `(db, coll)` is registered in the collections table.
+/// Drop what it can of `pending`: each ident's table nothing has open. A
+/// table still open stays for the next attempt; a table already gone is
+/// done. Any other failure is reported and the ident kept.
+fn reap_drop_pending(conn: &Connection, pending: &Mutex<Vec<String>>) {
+    let idents = std::mem::take(&mut *pending.lock().unwrap_or_else(|e| e.into_inner()));
+    if idents.is_empty() {
+        return;
+    }
+    let session = match conn.open_session() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("secantus-storage: dropping tables: {e:?}");
+            pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(idents);
+            return;
+        }
+    };
+    let mut kept = Vec::new();
+    for ident in idents {
+        match session.drop_table(&mdb_catalog::table_uri(&ident), None) {
+            Ok(()) => {}
+            Err(e) if e.is_missing_table() || e.is_not_found() => {}
+            Err(e) if e.is_busy() => kept.push(ident),
+            Err(e) => {
+                eprintln!("secantus-storage: dropping table {ident}: {e:?}");
+                kept.push(ident);
+            }
+        }
+    }
+    pending
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(kept);
+}
+
+/// At open: drop every collection table no placement names, which a crash
+/// left between a table's creation and its transaction's commit or between
+/// a drop's commit and the table's drop (mongod reconciles its idents with
+/// its catalog at startup the same way). Also raises the next
+/// `_mdb_catalog` id past the store's.
+fn reconcile_idents(session: &Session) -> Result<()> {
+    let max_id = mdb_catalog::max_catalog_id(session)?;
+    NEXT_CATALOG_ID.fetch_max(max_id + 1, Ordering::SeqCst);
+    let placed: std::collections::HashSet<String> = mdb_catalog::all_placements(session)?
+        .into_iter()
+        .map(|(_, _, p)| p.ident)
+        .collect();
+    let mut orphans = Vec::new();
+    {
+        let cur = session.open_cursor("metadata:", None)?;
+        while cur.next()? {
+            let uri = cur.get_key_s()?;
+            if let Some(ident) = uri.strip_prefix("table:") {
+                if ident.starts_with("collection-") && !placed.contains(ident) {
+                    orphans.push(uri);
+                }
+            }
+        }
+    }
+    for uri in orphans {
+        session.drop_table(&uri, None)?;
+    }
+    Ok(())
+}
+
+/// Write `(db, coll)`'s `_mdb_catalog` row from the registry, in `session`'s
+/// transaction: the collection's options and index specs as mongod lists
+/// them, and its ident. Called at every registry write that changes either,
+/// so the catalog mongod reads says what the registry says. A collection
+/// without a placement (a view: mongod keeps those in `system.views`) has
+/// no row; a placement whose registry row is gone loses its row.
+fn sync_catalog_entry(session: &Session, db: &str, coll: &str) -> Result<()> {
+    let Some(placement) = mdb_catalog::read_placement(session, db, coll)? else {
+        return Ok(());
+    };
+    let options = {
+        let cur = session.open_cursor(COLL_TABLE, None)?;
+        cur.set_key_ss(db, coll);
+        match cur.search() {
+            Ok(()) => decode_doc(&cur.get_value_u()?)?,
+            Err(e) if e.is_not_found() => {
+                return mdb_catalog::remove_entry(session, placement.catalog_id);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
+    let mut indexes = Vec::new();
+    if coll != PROFILE_COLLECTION {
+        let id_key = bson::doc! {"_id": 1i32};
+        indexes.push(mdb_catalog::CatalogIndex {
+            spec: bson::doc! {"v": 2i32, "key": id_key.clone(), "name": ID_INDEX_NAME},
+            ready: true,
+            multikey: false,
+            multikey_paths: mdb_catalog::multikey_paths(&id_key, &[]),
+        });
+    }
+    let mut rows = Vec::new();
+    {
+        let cur = session.open_cursor(IDX_TABLE, None)?;
+        cur.set_key_sss(db, coll, "");
+        let mut more = match cur.search_near() {
+            Ok(cmp) if cmp < 0 => cur.next()?,
+            Ok(_) => true,
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            let (d, c, name) = cur.get_key_sss()?;
+            if d != db || c != coll {
+                break;
+            }
+            rows.push((name, decode_doc(&cur.get_value_u()?)?));
+            more = cur.next()?;
+        }
+    }
+    rows.sort_by_key(|(name, payload)| {
+        let opts = payload.get_document("options").cloned().unwrap_or_default();
+        (build_seq(&opts), name.clone())
+    });
+    for (name, payload) in rows {
+        let key = payload.get_document("key").cloned().unwrap_or_default();
+        let opts = payload.get_document("options").cloned().unwrap_or_default();
+        let mut spec = bson::doc! {"v": 2i32, "key": key.clone(), "name": name.as_str()};
+        for (k, v) in index_event_spec(&payload, &name) {
+            if !matches!(k.as_str(), "v" | "key" | "name") {
+                spec.insert(k, v);
+            }
+        }
+        // Per key field, the array prefixes recorded for it: a prefix of n
+        // components marks component n - 1 (mongod's `MultikeyPaths`).
+        let mut components = Vec::new();
+        for (field, prefixes) in key.keys().zip(stored_multikey_paths(&opts, &key)) {
+            for prefix in prefixes {
+                components.push((field.clone(), prefix.split('.').count() - 1));
+            }
+        }
+        indexes.push(mdb_catalog::CatalogIndex {
+            spec,
+            ready: true,
+            multikey: opts.get_bool("multikey").unwrap_or(false),
+            multikey_paths: mdb_catalog::multikey_paths(&key, &components),
+        });
+    }
+    let entry = mdb_catalog::entry_doc(
+        &format!("{db}.{coll}"),
+        options,
+        &indexes,
+        &placement.ident,
+        &[],
+    );
+    // A row that already says this is left alone: no write, no conflict.
+    if mdb_catalog::read_entry(session, placement.catalog_id)?.as_ref() == Some(&entry) {
+        return Ok(());
+    }
+    mdb_catalog::write_entry(session, placement.catalog_id, &entry)
+}
+
 fn collection_registered(session: &Session, db: &str, coll: &str) -> Result<bool> {
     let cur = session.open_cursor(COLL_TABLE, None)?;
     cur.set_key_ss(db, coll);
@@ -26212,10 +26458,12 @@ fn ensure_collection(
             );
             // Its commit changes what other sessions see in the registry.
             handle.wrote_registry = true;
-            session.create(
-                &doc_table_for(db, coll),
-                &data_table_cfg(DOC_TABLE_CFG, data_nonlogged),
-            )?;
+            // Its documents' table is made now (a table is not part of any
+            // transaction); the commit records where it is.
+            let placement = place_new_collection(session, data_nonlogged)?;
+            handle
+                .deferred_placements
+                .insert((db.to_string(), coll.to_string()), placement);
             Ok(true)
         }
         Err(e) if e.is_not_found() => {
@@ -26229,16 +26477,11 @@ fn ensure_collection(
             cur.insert()?;
             undo_note_collection(db, coll, false);
             note_coll_table_write(db, coll);
-            // Lazy shard creation: make the collection's documents shard on first
-            // creation (not all DOC_SHARDS at open). This branch runs only when the
-            // collection is new, so it is the natural once-per-collection hook that
-            // covers every write caller (create / auto-create-on-insert / rename).
-            // Read / scan paths tolerate an absent shard, keeping a lazily-sharded
-            // store byte-compatible with an eager one (missing shard reads empty).
-            session.create(
-                &doc_table_for(db, coll),
-                &data_table_cfg(DOC_TABLE_CFG, data_nonlogged),
-            )?;
+            // The collection's own documents table, as mongod makes it, and
+            // its `_mdb_catalog` row, in this transaction.
+            let placement = place_new_collection(session, data_nonlogged)?;
+            mdb_catalog::write_placement(session, db, coll, &placement)?;
+            sync_catalog_entry(session, db, coll)?;
             Ok(true)
         }
         Err(e) => Err(e.into()),
@@ -26662,7 +26905,7 @@ fn pre_image_record_by_id(session: &Session, id: &Document) -> Result<Option<Vec
         Err(e) if e.is_not_found() => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+    let cur = match open_doc_cursor(session, db, coll, None) {
         Ok(c) => c,
         Err(e) if e.is_missing_table() => return Ok(None),
         Err(e) => return Err(e.into()),
@@ -26694,7 +26937,7 @@ fn remove_expired_pre_images(
     commit: &dyn Fn(&Session) -> Result<()>,
 ) -> Result<usize> {
     let (db, coll) = (PRE_IMAGES_DB, PRE_IMAGES_COLL);
-    let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+    let cur = match open_doc_cursor(session, db, coll, None) {
         Ok(c) => c,
         Err(e) if e.is_missing_table() => return Ok(0),
         Err(e) => return Err(e.into()),
@@ -26738,7 +26981,7 @@ fn remove_expired_pre_images(
     if doomed.is_empty() {
         return Ok(0);
     }
-    let docs = session.open_cursor(&doc_table_for(db, coll), None)?;
+    let docs = open_doc_cursor(session, db, coll, None)?;
     let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
     for batch in doomed.chunks(PRUNE_DELETE_BATCH) {
         session.begin_transaction(None)?;
@@ -27285,7 +27528,8 @@ fn write_coll_options(session: &Session, db: &str, coll: &str, opts: &Document) 
     cur.set_value_u(&blob);
     cur.insert()?; // overwrite cursor (default) -> upsert
     note_coll_table_write(db, coll);
-    Ok(())
+    // The catalog mongod reads says what the registry says.
+    sync_catalog_entry(session, db, coll)
 }
 
 /// The collection's UUID (16 bytes), minting + persisting one into the options on
@@ -27413,38 +27657,56 @@ fn deferred_row(session: &Session, db: &str, coll: &str) -> Option<Vec<u8>> {
 /// in that transaction. One somebody else committed meanwhile, or holds
 /// uncommitted, is mongod's 112 `Collection namespace ... is already in use`.
 fn flush_deferred_creates(
+    storage: &Storage,
     session: &Session,
     creates: BTreeMap<(String, String), Vec<u8>>,
     keys: BTreeMap<(String, String), String>,
+    placements: BTreeMap<(String, String), mdb_catalog::Placement>,
 ) -> Result<()> {
-    // The `_id` index rows and unique claims, from the name they were kept
-    // under to the collection's own. One somebody else holds is the same
-    // conflict as the registry row.
-    for ((db, coll), held) in &keys {
-        move_keyed_rows(session, NAT_SEQ_TABLE, db, held, coll, |c| {
-            let (_, _, k) = c.get_key_ssu()?;
-            Ok((None, k))
-        })?;
-        move_keyed_rows(session, UNIQ_TABLE, db, held, coll, |c| {
-            let (_, _, n, k) = c.get_key_sssu()?;
-            Ok((Some(n), k))
-        })?;
-    }
-    let cur = session.open_cursor(COLL_TABLE, Some("overwrite=false"))?;
-    for ((db, coll), blob) in &creates {
-        cur.reset()?;
-        cur.set_key_ss(db, coll);
-        cur.set_value_u(blob);
-        match cur.insert() {
-            Ok(()) => {}
-            Err(e) if e.is_duplicate_key() || e.is_rollback() => {
-                return Err(namespace_in_use(db, coll));
+    let written = (|| -> Result<()> {
+        // The `_id` index rows and unique claims, from the name they were kept
+        // under to the collection's own. One somebody else holds is the same
+        // conflict as the registry row.
+        for ((db, coll), held) in &keys {
+            move_keyed_rows(session, NAT_SEQ_TABLE, db, held, coll, |c| {
+                let (_, _, k) = c.get_key_ssu()?;
+                Ok((None, k))
+            })?;
+            move_keyed_rows(session, UNIQ_TABLE, db, held, coll, |c| {
+                let (_, _, n, k) = c.get_key_sssu()?;
+                Ok((Some(n), k))
+            })?;
+        }
+        let cur = session.open_cursor(COLL_TABLE, Some("overwrite=false"))?;
+        for ((db, coll), blob) in &creates {
+            cur.reset()?;
+            cur.set_key_ss(db, coll);
+            cur.set_value_u(blob);
+            match cur.insert() {
+                Ok(()) => {}
+                Err(e) if e.is_duplicate_key() || e.is_rollback() => {
+                    return Err(namespace_in_use(db, coll));
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
+            if blob_names_timeseries(blob) {
+                TIMESERIES_SEEN.store(true, Ordering::SeqCst);
+            }
         }
-        if blob_names_timeseries(blob) {
-            TIMESERIES_SEEN.store(true, Ordering::SeqCst);
+        // Where each one's documents went, and its `_mdb_catalog` row.
+        for ((db, coll), placement) in &placements {
+            mdb_catalog::write_placement(session, db, coll, placement)?;
+            sync_catalog_entry(session, db, coll)?;
         }
+        Ok(())
+    })();
+    if let Err(e) = written {
+        // The transaction will not commit: the tables made for its creates
+        // hold nothing anyone will see.
+        for placement in placements.values() {
+            storage.drop_ident_table(&placement.ident);
+        }
+        return Err(e);
     }
     COLL_TABLE_GEN.fetch_add(1, Ordering::SeqCst);
     Ok(())
@@ -28055,18 +28317,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `doc_shard_hash` must be byte-for-byte identical to the Python
-    /// `storage._doc_shard_hash` so a collection routes to the same documents
-    /// shard in both servers (cross-server backup / PITR portability). Values
-    /// computed by the Python FNV-1a over `db + b"\0" + coll`.
-    #[test]
-    fn doc_shard_hash_matches_python() {
-        assert_eq!(doc_shard_hash("harness", "w1"), 9941274063389089977);
-        assert_eq!(doc_shard_hash("harness", "w8"), 9941281759970487454);
-        assert_eq!(doc_shard_hash("test", "users"), 16319205138020980013);
-        assert_eq!(doc_shard_hash("", ""), 12638153115695167455);
-    }
-
     /// `wt_config` with the engine defaults must produce the exact
     /// `DEFAULT_CONFIG` string so `Storage::open` behaviour is unchanged.
     #[test]
@@ -28078,7 +28328,7 @@ mod tests {
     /// on every platform (tasks/mongod-storage-model-plan.md).
     #[test]
     fn value_heavy_tables_use_mongods_snappy() {
-        for cfg in [DOC_TABLE_CFG, QU_COMPRESSED_CFG] {
+        for cfg in [mdb_catalog::COLLECTION_TABLE_CFG, QU_COMPRESSED_CFG] {
             assert!(cfg.contains("block_compressor=snappy"), "{cfg}");
         }
     }
@@ -28097,21 +28347,6 @@ mod tests {
         // contract the storage layer depends on: nothing here pins the engine
         // to a single compressor, so a mixed zlib/lz4 store stays openable.
         assert!(!cfg.contains("block_compressor"), "{cfg}");
-    }
-
-    /// `extract_key_format` pulls the format token out of a WT metadata line,
-    /// regardless of what other clauses precede it.
-    #[test]
-    fn extract_key_format_parses_the_token() {
-        assert_eq!(
-            extract_key_format("key_format=SSq,value_format=u"),
-            Some("SSq")
-        );
-        assert_eq!(
-            extract_key_format("app_metadata=(x=1),key_format=SSu,value_format=u"),
-            Some("SSu")
-        );
-        assert_eq!(extract_key_format("value_format=u"), None);
     }
 
     /// A store whose document shards were written before the RecordId keying
@@ -29113,9 +29348,14 @@ mod tests {
         {
             let conn = Connection::open(home_s, DEFAULT_CONFIG).unwrap();
             let sess = conn.open_session().unwrap();
-            sess.create(&doc_shard_name(0), "key_format=SSu,value_format=u")
+            sess.create(
+                "table:secantus_documents_sh0",
+                "key_format=SSu,value_format=u",
+            )
+            .unwrap();
+            let c = sess
+                .open_cursor("table:secantus_documents_sh0", None)
                 .unwrap();
-            let c = sess.open_cursor(&doc_shard_name(0), None).unwrap();
             c.set_key_ssu("app", "c", b"\x2bid-key");
             c.set_value_u(b"raw-unframed-blob");
             c.insert().unwrap();
