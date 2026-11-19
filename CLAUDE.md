@@ -198,8 +198,11 @@ Secondary indexes are WT indexes over typed sort-key columns derived from BSON v
 A user runs **one** server -- never a per-operator / per-`Storage` selection
 inside one request path. The Rust MongoDB server is self-contained Rust; its
 Python handle is only a launcher, never an operator. The Rust PG server parses
-SQL with `libpg_query`, lowers it via `secantus-pgplan` to the MQL filters
-`secantus-core` evaluates, and builds from **its own directory**
+SQL with `libpg_query`, plans it in `secantus-pgplan` and executes it in
+`secantus-pg`: expressions, joins, aggregates and functions are its own. It
+borrows only `secantus-core`'s filter matcher (`query::matches`, for the
+filters its scans evaluate) and BSON ordering; what the two servers really
+share is `secantus-storage`. It builds from **its own directory**
 (`./inv rust-pgserver-build`). **Before any work on it, read the
 `rust-pg-server` skill.**
 

@@ -32,12 +32,13 @@ the crates that do link it are built from their own directories.
 | --- | --- |
 | `secantus-pgwire` | SecantusDB's fork of `pgwire`: the PostgreSQL v3 wire protocol as a library. |
 | `secantus-pg-query` | SecantusDB's fork of `pg_query`: PostgreSQL's own parser (libpg_query). |
-| `secantus-pgplan` | Lowers PostgreSQL parse trees to the MQL filters `secantus-core` evaluates. |
+| `secantus-pgplan` | Plans PostgreSQL parse trees, including the filters its scans pass to `secantus-core`'s matcher. |
 | `secantus-pgcatalog` | The SQL catalog documents (`pg_catalog` and friends). |
 | `secantus-pg` | The server: executor, catalogs, roles and authentication, TLS, and the `secantusd-pg` binary and `secantus_pg::PgServer` library. |
 
-Because SQL is lowered onto the same engines and the same storage layer, the
-PostgreSQL server inherits their index acceleration and type handling.
+The PostgreSQL server shares the storage layer with the MongoDB server. From
+`secantus-core` it borrows only the filter matcher and BSON ordering; its
+expression evaluation, joins, aggregates and functions are its own.
 
 ## Storage
 

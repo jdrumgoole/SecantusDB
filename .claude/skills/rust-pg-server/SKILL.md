@@ -7,9 +7,11 @@ description: Working on the Rust PostgreSQL server (`secantusd-pg`; crates `seca
 
 `secantusd-pg` speaks the PostgreSQL wire protocol over the same
 `secantus-storage` the Rust MongoDB server uses. SQL is parsed by
-`libpg_query` (`pg_query`, the real PostgreSQL grammar), lowered by
-`secantus-pgplan` to MQL filters `secantus-core` evaluates, against the
-catalog in `secantus-pgcatalog`. **Its exemplar is PostgreSQL, never the
+`libpg_query` (`pg_query`, the real PostgreSQL grammar), planned by
+`secantus-pgplan` against the catalog in `secantus-pgcatalog`, and executed
+by `secantus-pg` itself: expressions, joins, aggregates and functions live
+there. From `secantus-core` it borrows only the filter matcher
+(`query::matches`, for scan filters) and BSON ordering. **Its exemplar is PostgreSQL, never the
 Python PG server** (CLAUDE.md, "Design constraints"), and when PostgreSQL
 answers from state this server does not keep, build PostgreSQL's mechanism
 (`xids.rs` is the model case) or refuse by name with `0A000`.
