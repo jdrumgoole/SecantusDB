@@ -170,7 +170,7 @@ def test_store_has_mongods_files(tmp_path: Path) -> None:
     assert bson.decode((store / "storage.bson").read_bytes()) == MONGOD_STORAGE_BSON
 
 
-@pytest.mark.backlog("RM-723")
+@pytest.mark.backlog_fixed("RM-723")
 def test_one_table_per_collection_and_per_index(tmp_path: Path) -> None:
     """mongod 8.2.11 gives a collection one `collection-<UUID>.wt` table and
     each of its indexes, `_id_` included, one `index-<UUID>.wt` table; no

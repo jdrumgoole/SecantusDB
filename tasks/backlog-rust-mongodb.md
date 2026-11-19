@@ -868,52 +868,6 @@ These are explicit non-goals. Don't add them without a reason.
       cache). (Its other half, `txnNumUpdates`, closed 2026-11-07.)
       Backlog-ID: RM-364
       Verify: none -- no test drives mongod's eviction into an interruptible wait on demand
-- [ ] **A transaction's insert counts more dirty bytes than mongod's.**
-      mongod 8.2.11's line for an insert of `{_id: 700, y: 1}` inside a
-      transaction, into a collection indexed on `_id` and `x`, counts
-      `txnBytesDirty` 305-345 over its 3 updates; this server's about 391.
-      Over fifty documents in one `insert` the mean is 70-71 bytes more per
-      document here, every run. An update or a delete of the same document
-      counts the same on both (96 and 192), so the surplus is in what an
-      insert links into a page: the record and its index keys, whose layout
-      here is not mongod's KeyString. (An insert's count varies by 8 bytes a
-      skiplist level on both servers: WiredTiger draws each new key's depth
-      at random.) Measured 2026-11-10. Found while working RM-385.
-      The surplus is this store's shared
-      tables. Every key an insert writes carries the namespace as strings,
-      because collections shared sixteen document shards
-      (`key_format=SSq`), every `_id` index was a row in
-      `secantus_natural_seq` (`SSu`), and every secondary index was a row in
-      `secantus_index_entries` (`SSSu`, plus the index name). mongod keeps
-      one WiredTiger table per collection (`key_format=q`) and one per
-      index (KeyString keys), so no key names its namespace; since store
-      format 4 so does this store (storage-model phases 3, 4a and 4d). Measured with
-      the gap test's insert of fifty documents into `c`, with the `_id` and
-      `x` indexes (`secantusd-mdb` from `rm-batch` at 6bcd8f41, mongod
-      8.2.11): a 9-character database name gives 362.8 bytes per document
-      here against 311.6 on mongod. A 49-character name gives 481.4 here
-      against 313.8: 40 more characters cost 118.6 bytes here (three keys
-      times 40) and nothing on mongod. Of the 51 bytes left at 9
-      characters, about 40 are the prefixes (`db\0c\0` three times, plus
-      `x_1\0`). The remaining ~11 are the encodings: the `_id` sort key
-      against KeyString, and the index entry's value.
-      **Decided (Joe, 2026-11-13): mongod's layout.** A WiredTiger table
-      per collection keyed by RecordId (`key_format=q`) and a table per
-      index keyed by KeyString, with the catalog mapping each namespace to
-      its ident, as mongod does. It closes this item and the per-table half
-      of RM-040 (`collStats.wiredTiger` / `indexDetails`, real
-      `storageSize` / `indexSize`, `$listCatalog` idents), and makes the
-      RM-192 `compact` scope decision unnecessary. It changes the on-disk
-      format both Rust servers share: a format bump that refuses an old
-      store or a migration, replacing `DOC_SHARDS`, and the KeyString keys
-      change the on-disk sort-key rank (`sortkey.rs`, `entryFormat`).
-      Several PRs, storage first, then KeyString; each says in its PR that
-      the Rust PG server links it, and the PG session is told before the
-      format changes.
-      Verify: tests/backlog/test_rm_355_364.py::test_an_insert_in_a_transaction_counts_mongods_dirty_bytes
-      **Decided (Joe, 2026-11-16): go ahead, staged as above -- storage first, then KeyString; a format bump that refuses an old store; the PG session told before the format changes.**
-      Backlog-ID: RM-499
-
 - [ ] **mongod's startup lines this server does not write.** Since RM-302
   the log is mongod's structured log, and since 2026-11-13 this server
   starts it as mongod 8.2.11 does on `initandlisten`: `MongoDB starting`,
@@ -3019,7 +2973,7 @@ produce the dump it exists for.
       close one by one as they land (files and catalog: phases 1-2; one
       table per collection and index: 3-4; both opens: 7).
       Backlog-ID: RM-723
-      Verify: tests/backlog/test_rm_storage_model.py::test_store_has_mongods_files, tests/backlog/test_rm_storage_model.py::test_one_table_per_collection_and_per_index, tests/backlog/test_rm_storage_model.py::test_mongod_opens_a_secantus_store, tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_mongod_store
+      Verify: tests/backlog/test_rm_storage_model.py::test_store_has_mongods_files, tests/backlog/test_rm_storage_model.py::test_mongod_opens_a_secantus_store, tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_mongod_store
 - [ ] **There is no `shutdown` command.** mongod 8.2.11 stops on
       `db.adminCommand({shutdown: 1})`: the connection closes and the
       process exits cleanly. `secantusd-mdb` answers CommandNotFound (59)

@@ -45,3 +45,10 @@ before it is refused at open.
 - `crates/secantus-storage/tests/unique_in_index_tables.rs`: a unique, a
   `prepareUnique`, a partial and a collated unique index refuse a duplicate
   with mongod's error, and two transactions cannot both commit one value.
+
+#### Fixed
+
+- Fixes RM-499 (`tests/backlog/test_rm_355_364.py::test_an_insert_in_a_transaction_counts_mongods_dirty_bytes`):
+  an insert inside a transaction now dirties as many cache bytes as
+  mongod's. The surplus was every key of the shared tables naming its
+  namespace; with a table per collection and per index, no key does.

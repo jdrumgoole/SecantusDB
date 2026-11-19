@@ -2107,7 +2107,7 @@ def test_an_update_in_a_transaction_counts_no_dirty_bytes(rust_mongo: Any, mongo
 # ------------------------------------------------------------- RM-499 --
 
 
-@pytest.mark.backlog("RM-499")
+@pytest.mark.backlog_fixed("RM-499")
 def test_an_insert_in_a_transaction_counts_mongods_dirty_bytes(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
