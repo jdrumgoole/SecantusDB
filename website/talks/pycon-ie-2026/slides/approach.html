@@ -1,9 +1,12 @@
 <section id="approach" class="alt">
 <h2>How to Approach The Problem</h2>
 <ol class="pts">
-<li>Build a complete server in Python, focus on correctness</li>
-<li>Rewrite the server in Rust to improve performance</li>
-<li>Make the Rust Server canonical, drop the Python version</li>
+<li>Claude all the Way</li>
+<li>Vendored in WiredTiger</li>
+<li>Vendored in Driver Test Suites</li>
+<li>First build in Python for correctness</li>
+<li>Then build in Rust for performance</li>
+<li>Make the Rust version canonical</li>
 </ol>
-<aside><p>Three steps.</p><p><b>Python first, for correctness.</b> The first commit, on 26 April 2026, was a MongoDB wire server in Python. Python was the fastest way to learn the protocol, and pymongo is the client we measure against. The scope came from one question: what does pymongo actually send?</p><p><b>Then Rust, for performance.</b> Same design, same storage engine, rewritten for latency and concurrency.</p><p><b>Then Rust only.</b> In October 2026 the Rust server became canonical and the Python servers were deprecated.</p><p class="time">Time: ~1½ min</p></aside>
+<aside><p><b>Python first, for correctness.</b> The first commit, on 26 April 2026, was a MongoDB wire server in Python. Python was the fastest way to learn the protocol, and pymongo is the client we measure against. The scope came from one question: what does pymongo actually send?</p><p><b>Then Rust, for performance.</b> Same design, same storage engine, rewritten for latency and concurrency.</p><p><b>Then Rust only.</b> In October 2026 the Rust server became canonical and the Python servers were deprecated.</p><p class="time">Time: ~1½ min</p></aside>
 </section>
