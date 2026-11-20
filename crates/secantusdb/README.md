@@ -9,7 +9,7 @@ WiredTiger from bundled source, which needs **CMake and a C compiler**; nothing
 else (no Python, no libclang). The first build takes a minute or so.
 
 ```sh
-cargo install secantus-mdb --version 0.5.3-beta.198   # a pre-release: cargo needs the version
+cargo install secantus-mdb --version 0.5.3-beta.199   # a pre-release: cargo needs the version
 secantusd-mdb --port 27018
 ```
 

@@ -12,7 +12,7 @@ carries the PostgreSQL server, `secantusd-pg`):
 
 ```bash
 pip install SecantusDB     # prebuilt secantusd-mdb + secantusd-pg on PATH, nothing to compile
-# or: cargo install secantus-mdb --version 0.5.3-beta.198   (builds WiredTiger)
+# or: cargo install secantus-mdb --version 0.5.3-beta.199   (builds WiredTiger)
 secantusd-mdb --port 27017 --storage-path ./secantus-data
 ```
 

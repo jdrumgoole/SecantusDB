@@ -62,8 +62,8 @@ Each server is a crate that installs a daemon and is also a Rust library:
 | [`secantus-pg`](https://crates.io/crates/secantus-pg) | `secantusd-pg` | `secantus_pg::PgServer` |
 
 ```bash
-cargo install secantus-mdb --version 0.5.3-beta.198   # MongoDB: the `secantusd-mdb` daemon
-cargo install secantus-pg  --version 0.1.0-beta.20   # PostgreSQL: the `secantusd-pg` daemon
+cargo install secantus-mdb --version 0.5.3-beta.199   # MongoDB: the `secantusd-mdb` daemon
+cargo install secantus-pg  --version 0.1.0-beta.21   # PostgreSQL: the `secantusd-pg` daemon
 secantusd-mdb --version
 ```
 
@@ -85,7 +85,7 @@ it in-process:
 
 ```toml
 [dependencies]
-secantus-mdb = "0.5.3-beta.198"     # or secantus-pg = { version = "0.1.0-beta.19", default-features = false }
+secantus-mdb = "0.5.3-beta.199"     # or secantus-pg = { version = "0.1.0-beta.19", default-features = false }
 ```
 
 ```rust
