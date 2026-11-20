@@ -6,9 +6,11 @@
 //! `ns`, `documentKey`, and (per-op) `fullDocument` / `fullDocumentBeforeChange`
 //! / `updateDescription`.
 //!
-//! Resume tokens are `{"_data": "<hex>"}` where the hex bytes are a BSON document
-//! carrying `{s: seq, t: ts, n: ns, k: documentKey._id}` — opaque to drivers,
-//! enough state for us to resume / detect the invalidate boundary.
+//! Resume tokens are mongod 8.2.11's own: `{_data: "<hex>", _typeBits?}`, the
+//! KeyString of `{clusterTime, version, tokenType, txnOpIndex, fromInvalidate,
+//! uuid, eventIdentifier, fragmentNum?}` ([`ResumeTokenData`]). A position in
+//! the oplog is a timestamp, so `clusterTime` is the position, and a resume
+//! finds the event by it, `txnOpIndex`, the collection and the identifier.
 //!
 //! Pre-image / post-image lookup is the only I/O: [`project`] takes a [`Storage`]
 //! and may call `find_matching` for `fullDocument: "updateLookup"` or
@@ -37,23 +39,101 @@ pub enum Scope {
     Coll { db: String, coll: String },
 }
 
-/// The decoded contents of a resume token.
+/// `tokenType` of the token of an event: it names a place in the stream, and
+/// the event there must be the first one a resumed stream finds.
+pub const TOKEN_TYPE_EVENT: i32 = 128;
+/// `tokenType` of a high-water mark: only a time (`postBatchResumeToken` of a
+/// batch that ended on no event of the stream).
+pub const TOKEN_TYPE_HIGH_WATER_MARK: i32 = 0;
+/// The version of the tokens mongod 8.2 makes.
+pub const TOKEN_VERSION: i32 = 2;
+
+/// The contents of a resume token, as mongod 8.2.11's `ResumeTokenData`
+/// (`src/mongo/db/pipeline/resume_token.cpp`): its `_data` is the KeyString
+/// (V1, all ascending) of these fields in this order, and `_typeBits` beside
+/// it is that KeyString's TypeBits when they are not all zero.
+///
+/// ```text
+/// clusterTime  Timestamp   the oplog entry's `ts`: a stream position
+/// version      int         2
+/// tokenType    int         128 an event, 0 a high-water mark
+/// txnOpIndex   int         the event's place in its `applyOps` entry
+/// fromInvalidate  bool     true for the token of an `invalidate`
+/// uuid         BinData 4   the collection's UUID, or null (none for a
+///                          high-water mark or `dropDatabase`)
+/// eventIdentifier  object  {operationType, documentKey | operationDescription},
+///                          of an event token only
+/// fragmentNum  int         a fragment of a split event, numbered from 0
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResumeTokenData {
-    pub seq: i64,
-    pub ts: Timestamp,
-    pub ns: String,
-    pub document_key: Document,
-    /// True for the token of an `invalidate` event. `resumeAfter` on such a token
-    /// is rejected (the stream it came from is over); `startAfter` is required.
+    pub cluster_time: Timestamp,
+    pub version: i32,
+    pub token_type: i32,
+    pub op_index: i64,
     pub from_invalidate: bool,
-    /// For one fragment of a split event, its number from 0 (mongod's
-    /// `fragmentNum`): resuming from it skips the fragments up to it.
+    pub uuid: Option<Vec<u8>>,
+    pub event_identifier: Option<Document>,
     pub fragment: Option<i32>,
-    /// For an event of a write inside an `applyOps` entry (a transaction's, a
-    /// batch's), its place in the entry -- mongod's `txnOpIndex`: events of
-    /// one entry share its position and are told apart by it.
-    pub op_index: Option<i64>,
+}
+
+impl ResumeTokenData {
+    /// The token of an event of the entry `cluster_time`.
+    pub fn event(
+        cluster_time: Timestamp,
+        op_index: Option<i64>,
+        uuid: Option<Vec<u8>>,
+        event_identifier: Document,
+    ) -> ResumeTokenData {
+        ResumeTokenData {
+            cluster_time,
+            version: TOKEN_VERSION,
+            token_type: TOKEN_TYPE_EVENT,
+            op_index: op_index.unwrap_or(0),
+            from_invalidate: false,
+            uuid,
+            event_identifier: Some(event_identifier),
+            fragment: None,
+        }
+    }
+
+    /// A high-water mark at `cluster_time`.
+    pub fn high_water_mark(cluster_time: Timestamp) -> ResumeTokenData {
+        ResumeTokenData {
+            cluster_time,
+            version: TOKEN_VERSION,
+            token_type: TOKEN_TYPE_HIGH_WATER_MARK,
+            op_index: 0,
+            from_invalidate: false,
+            uuid: None,
+            event_identifier: None,
+            fragment: None,
+        }
+    }
+
+    /// Whether this is the token of an event (not a high-water mark).
+    pub fn is_event(&self) -> bool {
+        self.token_type == TOKEN_TYPE_EVENT
+    }
+
+    /// The stream position of the oplog entry the token names: its `ts` as
+    /// the oplog's RecordId.
+    pub fn position(&self) -> i64 {
+        ts_position(self.cluster_time)
+    }
+}
+
+/// An oplog position (a row's RecordId, `secs << 32 | inc`) from its time.
+pub fn ts_position(t: Timestamp) -> i64 {
+    (((t.time as u64) << 32) | t.increment as u64).min(i64::MAX as u64) as i64
+}
+
+/// The time of an oplog position.
+pub fn position_ts(position: i64) -> Timestamp {
+    Timestamp {
+        time: (position as u64 >> 32) as u32,
+        increment: position as u32,
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -74,56 +154,158 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// Build a `{"_data": "<hex>"}` resume token. Mirrors `make_resume_token`.
+fn token_err(msg: impl Into<String>) -> StorageError {
+    StorageError::Bson(msg.into())
+}
+
+/// Build a resume token, `{_data: "<hex>", _typeBits?: BinData}`, as mongod's
+/// `ResumeToken::toDocument` does.
 pub fn make_resume_token(data: &ResumeTokenData) -> Result<Document> {
-    let mut inner = Document::new();
-    inner.insert("s", data.seq);
-    inner.insert("t", Bson::Timestamp(data.ts));
-    inner.insert("n", data.ns.clone());
-    inner.insert("k", Bson::Document(data.document_key.clone()));
-    if data.from_invalidate {
-        inner.insert("i", true);
+    use secantus_core::keystring::{Builder, Ordering, Version};
+    let mut b = Builder::new(Version::V1, Ordering::all_ascending());
+    let k = |e: secantus_core::keystring::Error| token_err(format!("resume token: {e}"));
+    b.append_bson_element(&Bson::Timestamp(data.cluster_time))
+        .map_err(k)?;
+    b.append_bson_element(&Bson::Int32(data.version))
+        .map_err(k)?;
+    b.append_bson_element(&Bson::Int32(data.token_type))
+        .map_err(k)?;
+    b.append_bson_element(&Bson::Int32(data.op_index as i32))
+        .map_err(k)?;
+    b.append_bson_element(&Bson::Boolean(data.from_invalidate))
+        .map_err(k)?;
+    b.append_bson_element(&match &data.uuid {
+        Some(u) => Bson::Binary(bson::Binary {
+            subtype: bson::spec::BinarySubtype::Uuid,
+            bytes: u.clone(),
+        }),
+        None => Bson::Null,
+    })
+    .map_err(k)?;
+    if let Some(ident) = &data.event_identifier {
+        b.append_bson_element(&Bson::Document(ident.clone()))
+            .map_err(k)?;
     }
     if let Some(f) = data.fragment {
-        inner.insert("f", f);
+        b.append_bson_element(&Bson::Int32(f)).map_err(k)?;
     }
-    if let Some(x) = data.op_index {
-        inner.insert("x", x);
-    }
-    let bytes = encode_doc(&inner)?;
+    let (key, type_bits) = b.finish().map_err(k)?;
     let mut out = Document::new();
-    out.insert("_data", hex_encode(&bytes));
+    out.insert("_data", hex_encode(&key));
+    if !type_bits.is_all_zeros() {
+        out.insert(
+            "_typeBits",
+            Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: type_bits.serialize(),
+            }),
+        );
+    }
     Ok(out)
 }
 
-/// Decode a `{"_data": "<hex>"}` resume token. Mirrors `parse_resume_token`.
+/// Decode a resume token in mongod 8.2's form (version 2). An older version,
+/// or bytes that are not a token, are an error: mongod's own answer for those
+/// is `secantus-commands`' `resume_keystring`.
 pub fn parse_resume_token(token: &Document) -> Result<ResumeTokenData> {
+    use secantus_core::keystring::{to_bson, Ordering, TypeBits, Version};
     let raw = token
         .get_str("_data")
-        .map_err(|_| StorageError::Bson("resume token missing _data".into()))?;
-    let bytes =
-        hex_decode(raw).ok_or_else(|| StorageError::Bson("resume token _data not hex".into()))?;
-    let inner = decode_doc(&bytes)?;
-    let ts = match inner.get("t") {
-        Some(Bson::Timestamp(t)) => *t,
-        _ => {
-            return Err(StorageError::Bson(
-                "resume token has invalid timestamp".into(),
-            ))
-        }
+        .map_err(|_| token_err("resume token missing _data"))?;
+    let bytes = hex_decode(raw).ok_or_else(|| token_err("resume token _data not hex"))?;
+    let type_bits = match token.get("_typeBits") {
+        None => TypeBits::new(Version::V1),
+        Some(Bson::Binary(b)) => TypeBits::from_buffer(Version::V1, &b.bytes)
+            .map_err(|e| token_err(format!("resume token _typeBits: {e}")))?,
+        Some(_) => return Err(token_err("resume token _typeBits of wrong type")),
     };
+    let elems = to_bson(&bytes, Ordering::all_ascending(), &type_bits)
+        .map_err(|e| token_err(format!("resume token: {e}")))?;
+    let int = |e: Option<&Bson>| match e {
+        Some(Bson::Int32(n)) => Some(i64::from(*n)),
+        _ => None,
+    };
+    let mut it = elems.iter();
+    let bad = || token_err("resume token is not a version 2 token");
+    let Some(Bson::Timestamp(cluster_time)) = it.next() else {
+        return Err(bad());
+    };
+    if int(it.next()) != Some(i64::from(TOKEN_VERSION)) {
+        return Err(bad());
+    }
+    let token_type = int(it.next()).ok_or_else(bad)? as i32;
+    if token_type != TOKEN_TYPE_EVENT && token_type != TOKEN_TYPE_HIGH_WATER_MARK {
+        return Err(bad());
+    }
+    let op_index = int(it.next()).ok_or_else(bad)?;
+    let Some(Bson::Boolean(from_invalidate)) = it.next() else {
+        return Err(bad());
+    };
+    let uuid = match it.next() {
+        Some(Bson::Null) => None,
+        Some(Bson::Binary(b))
+            if b.subtype == bson::spec::BinarySubtype::Uuid && b.bytes.len() == 16 =>
+        {
+            Some(b.bytes.clone())
+        }
+        _ => return Err(bad()),
+    };
+    let event_identifier = match (token_type, it.next()) {
+        (TOKEN_TYPE_HIGH_WATER_MARK, None) => None,
+        (TOKEN_TYPE_EVENT, Some(Bson::Document(d))) => Some(d.clone()),
+        _ => return Err(bad()),
+    };
+    let fragment = match it.next() {
+        None => None,
+        Some(Bson::Int32(n)) if *n >= 0 && event_identifier.is_some() => Some(*n),
+        _ => return Err(bad()),
+    };
+    if it.next().is_some() {
+        return Err(bad());
+    }
     Ok(ResumeTokenData {
-        seq: inner
-            .get_i64("s")
-            .or_else(|_| inner.get_i32("s").map(i64::from))
-            .unwrap_or(0),
-        ts,
-        ns: inner.get_str("n").unwrap_or("").to_string(),
-        document_key: inner.get_document("k").cloned().unwrap_or_default(),
-        from_invalidate: inner.get_bool("i").unwrap_or(false),
-        fragment: inner.get_i32("f").ok(),
-        op_index: inner.get_i64("x").ok(),
+        cluster_time: *cluster_time,
+        version: TOKEN_VERSION,
+        token_type,
+        op_index,
+        from_invalidate: *from_invalidate,
+        uuid,
+        event_identifier,
+        fragment,
     })
+}
+
+/// mongod's `eventIdentifier`: the event's `operationType` and what tells
+/// the event from its neighbours: the `documentKey` of a write, the
+/// `operationDescription` of a command (the one `showExpandedEvents` shows,
+/// which a token carries whether or not the stream does).
+fn event_identifier(
+    op_type: &str,
+    document_key: Option<&Document>,
+    op_description: Option<&Document>,
+) -> Document {
+    let mut d = Document::new();
+    d.insert("operationType", op_type);
+    if let Some(k) = document_key {
+        d.insert("documentKey", Bson::Document(k.clone()));
+    }
+    if let Some(o) = op_description {
+        d.insert("operationDescription", Bson::Document(o.clone()));
+    }
+    d
+}
+
+/// The collection UUID an entry names: its `ui`, as a token holds it.
+fn entry_uuid(entry: &Document) -> Option<Vec<u8>> {
+    match entry.get("ui") {
+        Some(Bson::Binary(b)) if b.bytes.len() == 16 => Some(b.bytes.clone()),
+        _ => None,
+    }
+}
+
+/// A high-water-mark token at `position` (an oplog position, a time).
+pub fn make_high_water_mark_token(position: i64) -> Result<Document> {
+    make_resume_token(&ResumeTokenData::high_water_mark(position_ts(position)))
 }
 
 /// The place of `op` (an unwound operation) in its `applyOps` entry, when it
@@ -481,15 +663,12 @@ fn project_unordered(
                 }
             }
         }
-        let token = make_resume_token(&ResumeTokenData {
-            seq,
+        let token = make_resume_token(&ResumeTokenData::event(
             ts,
-            ns: ns.clone(),
-            document_key: document_key.clone(),
-            from_invalidate: false,
-            fragment: None,
-            op_index: op_index_of(oplog_entry),
-        })?;
+            op_index_of(oplog_entry),
+            entry_uuid(oplog_entry),
+            event_identifier(op_type, Some(&document_key), None),
+        ))?;
         let mut event = Document::new();
         // A write made in a transaction names it, ahead of the token (mongod
         // 8.2.11). A retryable write's session is not shown.
@@ -571,14 +750,13 @@ fn project_unordered(
     }
 
     if op == "c" {
-        return project_command(seq, oplog_entry, &ns, ts, wall, scope, show_expanded_events);
+        return project_command(oplog_entry, &ns, ts, wall, scope, show_expanded_events);
     }
     Ok((None, false))
 }
 
 /// The `op: "c"` (command) branch of [`project`] — DDL events.
 fn project_command(
-    seq: i64,
     oplog_entry: &Document,
     ns: &str,
     ts: Timestamp,
@@ -589,16 +767,25 @@ fn project_command(
     let cmd = oplog_entry.get_document("o").cloned().unwrap_or_default();
     let cmd_db = split_ns(ns).0;
 
-    let base = |op_type: &str, affected_ns: &str, extra: &[(&str, Bson)]| -> Result<Document> {
-        let token = make_resume_token(&ResumeTokenData {
-            seq,
+    // `ident_description`: the `operationDescription` the token's identifier
+    // names, when the event does not show it (a rename's, on a stream that
+    // does not ask for expanded events); else the event's own.
+    let base = |op_type: &str,
+                extra: &[(&str, Bson)],
+                ident_description: Option<&Document>|
+     -> Result<Document> {
+        let description = ident_description.or_else(|| {
+            extra.iter().find_map(|(k, v)| match (*k, v) {
+                ("operationDescription", Bson::Document(d)) => Some(d),
+                _ => None,
+            })
+        });
+        let token = make_resume_token(&ResumeTokenData::event(
             ts,
-            ns: affected_ns.to_string(),
-            document_key: Document::new(),
-            from_invalidate: false,
-            fragment: None,
-            op_index: op_index_of(oplog_entry),
-        })?;
+            op_index_of(oplog_entry),
+            entry_uuid(oplog_entry),
+            event_identifier(op_type, None, description),
+        ))?;
         let mut event = Document::new();
         event.insert("_id", Bson::Document(token));
         event.insert("operationType", op_type);
@@ -619,8 +806,8 @@ fn project_command(
         }
         let event = base(
             "drop",
-            &affected_ns,
             &[("ns", Bson::Document(ns_doc(&affected_ns)))],
+            None,
         )?;
         let invalidates = matches!(scope, Scope::Coll { .. });
         return Ok((Some(event), invalidates));
@@ -633,7 +820,7 @@ fn project_command(
         }
         let mut nsd = Document::new();
         nsd.insert("db", cmd_db.clone());
-        let event = base("dropDatabase", ns, &[("ns", Bson::Document(nsd))])?;
+        let event = base("dropDatabase", &[("ns", Bson::Document(nsd))], None)?;
         let invalidates = matches!(scope, Scope::Db(_));
         return Ok((Some(event), invalidates));
     }
@@ -654,18 +841,19 @@ fn project_command(
             ("ns", Bson::Document(ns_doc(from_ns))),
             ("to", Bson::Document(to.clone())),
         ];
-        if show_expanded_events {
-            // mongod 6.0+ attaches `operationDescription` to expanded rename
-            // events: the `to` namespace plus `dropTarget` (the dropped target
-            // collection's UUID) when the rename replaced an existing collection.
-            let mut op_desc = Document::new();
-            op_desc.insert("to", Bson::Document(to));
-            if let Some(dt) = cmd.get("dropTarget") {
-                op_desc.insert("dropTarget", dt.clone());
-            }
-            fields.push(("operationDescription", Bson::Document(op_desc)));
+        // mongod 6.0+ attaches `operationDescription` to expanded rename
+        // events: the `to` namespace plus `dropTarget` (the dropped target
+        // collection's UUID) when the rename replaced an existing collection.
+        // The token's identifier names it on every stream (measured 8.2.11).
+        let mut op_desc = Document::new();
+        op_desc.insert("to", Bson::Document(to));
+        if let Some(dt) = cmd.get("dropTarget") {
+            op_desc.insert("dropTarget", dt.clone());
         }
-        let event = base("rename", from_ns, &fields)?;
+        if show_expanded_events {
+            fields.push(("operationDescription", Bson::Document(op_desc.clone())));
+        }
+        let event = base("rename", &fields, Some(&op_desc))?;
         let invalidates = matches!(scope, Scope::Coll { .. });
         return Ok((Some(event), invalidates));
     }
@@ -698,12 +886,12 @@ fn project_command(
         };
         let event = base(
             "create",
-            &affected_ns,
             &[
                 ("ns", Bson::Document(ns_doc(&affected_ns))),
                 ("operationDescription", Bson::Document(op_desc)),
                 ("nsType", Bson::String(ns_type.to_string())),
             ],
+            None,
         )?;
         return Ok((Some(event), false));
     }
@@ -767,11 +955,11 @@ fn project_command(
         op_desc.insert("indexes", Bson::Array(indexes));
         let event = base(
             "createIndexes",
-            &affected_ns,
             &[
                 ("ns", Bson::Document(ns_doc(&affected_ns))),
                 ("operationDescription", Bson::Document(op_desc)),
             ],
+            None,
         )?;
         return Ok((Some(event), false));
     }
@@ -802,11 +990,11 @@ fn project_command(
         op_desc.insert("indexes", Bson::Array(vec![Bson::Document(idx)]));
         let event = base(
             "dropIndexes",
-            &affected_ns,
             &[
                 ("ns", Bson::Document(ns_doc(&affected_ns))),
                 ("operationDescription", Bson::Document(op_desc)),
             ],
+            None,
         )?;
         return Ok((Some(event), false));
     }
@@ -827,11 +1015,11 @@ fn project_command(
         }
         let event = base(
             "modify",
-            &affected_ns,
             &[
                 ("ns", Bson::Document(ns_doc(&affected_ns))),
                 ("operationDescription", Bson::Document(op_desc)),
             ],
+            None,
         )?;
         // The collection's options as they were BEFORE this collMod. mongod
         // keeps them in the oplog entry's `o2.collectionOptions_old` and renames
@@ -857,8 +1045,11 @@ fn project_command(
 }
 
 /// The final `invalidate` event a cursor emits after a drop / rename /
-/// dropDatabase on its watched scope. Mirrors `changestreams.invalidate_event`.
-pub fn invalidate_event(seq: i64, oplog_entry: &Document) -> Result<Document> {
+/// dropDatabase on its watched scope. Its token is the token of the event it
+/// follows with `fromInvalidate` set: the same time, collection and event
+/// identifier (measured 8.2.11: the `invalidate` after a `drop` has the
+/// `drop`'s). `trigger` is that event.
+pub fn invalidate_event(trigger: &Document, oplog_entry: &Document) -> Result<Document> {
     let ts = match oplog_entry.get("ts") {
         Some(Bson::Timestamp(t)) => *t,
         _ => Timestamp {
@@ -866,24 +1057,12 @@ pub fn invalidate_event(seq: i64, oplog_entry: &Document) -> Result<Document> {
             increment: 0,
         },
     };
-    let ns = oplog_entry.get_str("ns").unwrap_or("");
-    let cmd = oplog_entry.get_document("o").cloned().unwrap_or_default();
-    let affected_ns = if let Ok(coll) = cmd.get_str("drop") {
-        format!("{}.{}", split_ns(ns).0, coll)
-    } else if let Ok(from) = cmd.get_str("renameCollection") {
-        from.to_string()
-    } else {
-        ns.to_string()
+    let mut data = match trigger.get("_id") {
+        Some(Bson::Document(t)) => parse_resume_token(t)?,
+        _ => return Err(token_err("invalidate: the event has no resume token")),
     };
-    let token = make_resume_token(&ResumeTokenData {
-        seq,
-        ts,
-        ns: affected_ns,
-        document_key: Document::new(),
-        from_invalidate: true,
-        fragment: None,
-        op_index: op_index_of(oplog_entry),
-    })?;
+    data.from_invalidate = true;
+    let token = make_resume_token(&data)?;
     let mut event = Document::new();
     event.insert("_id", Bson::Document(token));
     event.insert("operationType", "invalidate");

@@ -91,6 +91,8 @@ struct ChangeStreamProducer {
     /// through; it is then not delivered. A stream on another namespace, or a
     /// pipeline that drops the event, cannot resume (280).
     expect_token: Option<String>,
+    /// The resume token's own event was found, as the first one, and left out.
+    matched_token: bool,
 }
 
 /// What mongod says when the token's event is not the first one seen:
@@ -128,6 +130,14 @@ fn token_data(event: &[u8]) -> Option<String> {
     let raw = bson::RawDocument::from_bytes(event).ok()?;
     let id = raw.get_document("_id").ok()?;
     id.get_str("_data").ok().map(str::to_string)
+}
+
+impl ChangeStreamProducer {
+    /// Whether the token the stream resumed from was found, as mongod
+    /// requires, and left out of the events.
+    fn matched_token(&self) -> bool {
+        self.matched_token
+    }
 }
 
 impl CursorProducer for ChangeStreamProducer {
@@ -216,6 +226,7 @@ impl CursorProducer for ChangeStreamProducer {
                             .position(|e| token_data(e).as_deref() == Some(expected.as_str()));
                         if let Some(at) = at {
                             events.drain(..=at);
+                            self.matched_token = true;
                         } else {
                             // mongod names the token of the event it found
                             // in its place (8.2.11), not the one asked for.
@@ -384,15 +395,22 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
         resume_skip: None,
     };
 
-    // Start position (events read are strictly after it):
-    //   resumeAfter / startAfter — the token's seq (resume just past it)
-    //   startAtOperationTime     — one before the first seq at/after the ts
-    //   neither                  — the current oplog tail (fresh stream)
-    // `resumeAfter` cannot point at an invalidate event's token — the stream it
+    // Start position (events read are strictly after it). A position is an
+    // oplog timestamp, so a resume token (mongod's own form, which ours is)
+    // and `startAtOperationTime` name theirs directly:
+    //   resumeAfter / startAfter -- the token's clusterTime: the entry is read
+    //                               again, and the event the token names must
+    //                               be the first one found (`expect_token`);
+    //                               a high-water mark names no event, and an
+    //                               invalidate's starts after its entry
+    //   startAtOperationTime     -- the entries at or after the time
+    //   neither                  -- the current oplog tail (fresh stream)
+    // `resumeAfter` cannot point at an invalidate event's token -- the stream it
     // came from is over; mongod requires `startAfter` for that (InvalidResumeToken,
     // 260). `startAfter` with the same token is allowed.
+    let token_info = |tok: &Document| storage.resume_token_info(tok);
     if let Some(tok) = cs_spec.get("resumeAfter").and_then(Bson::as_document) {
-        if storage.resume_token_from_invalidate(tok) {
+        if token_info(tok).is_some_and(|i| i.from_invalidate) {
             return Ok(CommandError::new(
                 260,
                 "InvalidResumeToken",
@@ -406,22 +424,35 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
         .get("resumeAfter")
         .or_else(|| cs_spec.get("startAfter"))
         .and_then(Bson::as_document);
-    // The token's own event is read again and must be the first seen: so the
-    // stream starts one before it (see `expect_token`). A token that names
-    // only a position (an empty batch's), or an invalidate, starts after it.
+    let tail = storage.oplog_tail_seq();
+    // How the stream starts, for its first `postBatchResumeToken`.
+    enum Start {
+        Fresh,
+        At(i64),
+        Token(Document),
+    }
+    let mut start = Start::Fresh;
     let mut expect_token = None;
+    let mut resumed_at = None;
     let position = if let Some(tok) = resume_token {
-        match storage.resume_token_seq(tok) {
+        // The token's time, as a position, and whether its event is expected.
+        let (at, expects, from_invalidate) = match token_info(tok) {
+            Some(info) => {
+                if info.event && !info.has_uuid && matches!(scope, ChangeStreamScope::Coll { .. }) {
+                    return Err(unreadable_token_error(tok, &scope));
+                }
+                (info.position, info.event, info.from_invalidate)
+            }
             None => {
-                // A token in mongod's own format that decodes: mongod reads
-                // its oplog from the token's time and requires the token's
-                // event to be the first it finds (8.2.11). None of this
-                // server's events is that event, so the first found fails the
-                // resume with 280, as on mongod; with none yet, the stream
-                // waits for one.
+                // A token in mongod's own format of another version that
+                // decodes: mongod reads its oplog from the token's time and
+                // requires the token's event to be the first it finds
+                // (8.2.11). None of this server's events is that event, so
+                // the first found fails the resume with 280, as on mongod;
+                // with none yet, the stream waits for one.
                 let foreign = match crate::resume_keystring::mongod_verdict(tok) {
-                    crate::resume_keystring::Verdict::Decoded { has_uuid } => {
-                        has_uuid || !matches!(scope, ChangeStreamScope::Coll { .. })
+                    crate::resume_keystring::Verdict::Decoded { has_uuid, event } => {
+                        has_uuid || !event || !matches!(scope, ChangeStreamScope::Coll { .. })
                     }
                     _ => false,
                 };
@@ -429,36 +460,39 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
                 let Some(at) = at else {
                     return Err(unreadable_token_error(tok, &scope));
                 };
-                expect_token = tok.get_str("_data").ok().map(str::to_string);
-                match storage.seq_for_timestamp(at) {
-                    0 => storage.oplog_tail_seq(),
-                    seq => seq - 1,
-                }
+                (crate::storage::ts_position(at), true, false)
             }
-            Some(seq)
-                if storage.resume_token_is_event(tok)
-                    && !storage.resume_token_from_invalidate(tok) =>
-            {
+        };
+        resumed_at = Some(at);
+        start = Start::Token(tok.clone());
+        if from_invalidate {
+            // The stream ended at the entry: it starts after it.
+            opts.start_ts = Some(crate::storage::position_ts(at.saturating_add(1)));
+            at.min(tail)
+        } else {
+            // Events are read from the token's time; an event of an earlier
+            // time is none (the stream may be resumed from a time not
+            // reached yet).
+            opts.start_ts = Some(crate::storage::position_ts(at));
+            if expects {
                 expect_token = tok.get_str("_data").ok().map(str::to_string);
                 // An event inside an `applyOps` entry: the entry is read
                 // again from its start and what precedes the token's event in
                 // it is passed over.
-                if let Some(x) = storage.resume_token_op_index(tok) {
-                    opts.resume_skip = Some((seq, x));
+                if let Some(x) = token_info(tok).map(|i| i.op_index).filter(|x| *x > 0) {
+                    opts.resume_skip = Some((at, x));
                 }
-                seq - 1
             }
-            Some(seq) => seq,
+            (at - 1).min(tail)
         }
     } else if let Some(Bson::Timestamp(ts)) = cs_spec.get("startAtOperationTime") {
-        // The first entry at or after the time, or the tail when there is
-        // none yet; the poll leaves out anything before the time.
-        match storage.seq_for_timestamp(*ts) {
-            0 => storage.oplog_tail_seq(),
-            seq => seq - 1,
-        }
+        // The entries at or after the time, or the tail when there is none
+        // yet; the poll leaves out anything before the time.
+        let at = crate::storage::ts_position(*ts);
+        start = Start::At(at);
+        (at - 1).min(tail)
     } else {
-        storage.oplog_tail_seq()
+        tail
     };
 
     // An explicit resume point that has already fallen off the back of the
@@ -503,6 +537,7 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
         pipeline: user_pipeline,
         fatal_error: None,
         expect_token,
+        matched_token: false,
     });
 
     // Poll once so events already available at the start position (the common
@@ -516,7 +551,6 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
     let mut initial = producer.produce();
     // A start far back in the oplog scans forward until something is found
     // or the tail is reached, as mongod's first batch does.
-    let tail = storage.oplog_tail_seq();
     let mut polls = 0;
     while initial.is_empty()
         && !producer.invalidated()
@@ -567,6 +601,7 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
                 .map(Bson::Document)
         }
     };
+    let matched_token = producer.matched_token();
     // Events held back for getMore (`batchSize` trimmed the poll) are NOT yet
     // delivered, so the token must not move past them.
     let held_back = !remainder.is_empty();
@@ -611,21 +646,56 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
     // mongod's order: the batch, its token, `invalidated` when the stream
     // ended in it, the id, the namespace.
     let mut cursor_doc = doc! { "firstBatch": Bson::Array(first_batch) };
-    // `postBatchResumeToken`. With nothing held back it is the high-water mark
-    // at the post-poll position -- mongod returns one even for an empty batch
-    // so a client always has a token to resume from. With events held back it
-    // is the last SENT event's `_id` (every change event's `_id` is its resume
-    // token), or the pre-poll position if nothing was sent. The post-poll mark
-    // pointed PAST the held-back events: a driver that resumed after draining
-    // the first batch skipped them -- pymongo's "Test consecutive resume" lost
-    // two of three inserts (2026-09-25). Mirrors `commands.py`'s rule that a
-    // non-empty batch's token is its last event's `_id`.
+    // `postBatchResumeToken` (measured 8.2.11). A resume from a token starts
+    // at the entry it names and a high-water mark is read from its own time,
+    // so a token is the one of the last entry read when that was an event:
+    //   - events were sent and the last entry read was the last of them:
+    //     that event's token; past it, a high-water mark at the last entry
+    //     read (events at or after it are read again, and none of the stream
+    //     is among them);
+    //   - the token the stream resumed from, when its event is the last
+    //     entry read;
+    //   - nothing read: a new stream's mark is the next time (the entry read
+    //     last is before the stream); a stream started at a time beyond the
+    //     oplog's, that time; a resumed one, its token.
+    // With events held back (`batchSize` trimmed the poll) the token must
+    // not move past them: the last SENT event's, or where the stream began.
+    // The post-poll mark pointed PAST the held-back events: a driver that
+    // resumed after draining the first batch skipped them -- pymongo's "Test
+    // consecutive resume" lost two of three inserts (2026-09-25).
+    let start_pbrt = || match &start {
+        Start::Fresh => hwm_token(start_position + 1),
+        Start::At(at) => hwm_token(*at),
+        Start::Token(tok) => Some(Bson::Document(tok.clone())),
+    };
+    let last_sent_at = last_sent_id
+        .as_ref()
+        .and_then(Bson::as_document)
+        .and_then(crate::resume_keystring::cluster_time)
+        .map(crate::storage::ts_position);
     let open_pbrt = if held_back {
-        last_sent_id.or_else(|| hwm_token(start_position))
+        last_sent_id.or_else(start_pbrt)
+    } else if last_sent_at.is_some_and(|at| at >= open_position) {
+        last_sent_id
+    } else if last_sent_at.is_none()
+        && matched_token
+        && resumed_at.is_some_and(|at| at == open_position)
+    {
+        match &start {
+            Start::Token(tok) => Some(Bson::Document(tok.clone())),
+            _ => None,
+        }
+    } else if open_position == start_position && last_sent_at.is_none() {
+        // Nothing was read.
+        start_pbrt()
     } else {
         hwm_token(open_position)
     };
     if let Some(tok) = open_pbrt {
+        // A later empty batch moves the token only forward from this one.
+        if cursor_id != 0 {
+            cursors.remember_last_token(cursor_id, &tok);
+        }
         cursor_doc.insert("postBatchResumeToken", tok);
     }
     if invalidated_at_open {
@@ -825,14 +895,15 @@ fn unreadable_token_error(tok: &Document, scope: &ChangeStreamScope) -> CommandE
             };
             CommandError::new(code, name, msg)
         }
-        Verdict::Decoded { has_uuid: false } if matches!(scope, ChangeStreamScope::Coll { .. }) => {
-            CommandError::new(
-                260,
-                "InvalidResumeToken",
-                "Attempted to resume a single-collection stream, but the resume token does not \
+        Verdict::Decoded {
+            has_uuid: false,
+            event: true,
+        } if matches!(scope, ChangeStreamScope::Coll { .. }) => CommandError::new(
+            260,
+            "InvalidResumeToken",
+            "Attempted to resume a single-collection stream, but the resume token does not \
                  include a UUID",
-            )
-        }
+        ),
         Verdict::Decoded { .. } | Verdict::Unmodelled => CommandError::new(
             40647,
             "Location40647",

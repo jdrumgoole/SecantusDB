@@ -22,9 +22,9 @@ use std::sync::{Arc, Mutex};
 use bson::{Bson, Document};
 use secantus_commands::storage::{
     ChangeStreamBatch, ChangeStreamOptions, ChangeStreamScope, Collation, DuplicateKey, IdKeyRows,
-    MatchedRows, RawHint, Storage as CmdStorage, StorageError, UpdateOutcome,
+    MatchedRows, RawHint, ResumeTokenInfo, Storage as CmdStorage, StorageError, UpdateOutcome,
 };
-use secantus_storage::changestreams::{self, ResumeTokenData, Scope as WtScope};
+use secantus_storage::changestreams::{self, Scope as WtScope};
 use secantus_storage::oplog_entry as wt_oplog_entry;
 use secantus_storage::{
     ExplainPlan, Hint, Storage as WtStorage, StorageError as WtError, UserTransactionHandle,
@@ -419,13 +419,15 @@ impl CmdStorage for StorageAdapter {
                     Err(e) => return Err(map_err(e)),
                 };
                 if let Some(ev) = event {
+                    let trigger = invalidates.then(|| ev.clone());
                     push_event(&mut events, ev, opts.split_large_events)?;
-                    if invalidates {
+                    if let Some(trigger) = trigger {
                         // An invalidating event (drop / rename / dropDatabase on the
                         // watched scope) is followed by a synthesized terminal
                         // `invalidate` event, then the cursor closes — mirroring
                         // `commands.py`'s producer (project → invalidate_event → break).
-                        let inv = changestreams::invalidate_event(seq, &entry).map_err(map_err)?;
+                        let inv =
+                            changestreams::invalidate_event(&trigger, &entry).map_err(map_err)?;
                         push_event(&mut events, inv, opts.split_large_events)?;
                         invalidated = true;
                         break;
@@ -464,27 +466,25 @@ impl CmdStorage for StorageAdapter {
     }
 
     fn oplog_floor_seq(&self) -> i64 {
-        self.inner.oplog_floor_seq().unwrap_or(0)
+        // History is lost only once entries have been pruned: until then the
+        // oplog reaches its first entry, and a resume from before that finds
+        // no token, as mongod's does (280; 8.2.11 gives 280 for every time
+        // before its oplog's first entry).
+        match self.inner.oplog_pruned_through() {
+            Ok(0) => 0,
+            _ => self.inner.oplog_floor_seq().unwrap_or(0),
+        }
     }
 
-    fn seq_for_timestamp(&self, ts: bson::Timestamp) -> i64 {
-        self.inner.find_seq_for_ts(ts).unwrap_or(0)
-    }
-
-    fn resume_token_seq(&self, token: &Document) -> Option<i64> {
-        changestreams::parse_resume_token(token).ok().map(|d| d.seq)
-    }
-
-    fn resume_token_op_index(&self, token: &Document) -> Option<i64> {
-        changestreams::parse_resume_token(token)
-            .ok()
-            .and_then(|d| d.op_index)
-    }
-
-    fn resume_token_from_invalidate(&self, token: &Document) -> bool {
-        changestreams::parse_resume_token(token)
-            .map(|d| d.from_invalidate)
-            .unwrap_or(false)
+    fn resume_token_info(&self, token: &Document) -> Option<ResumeTokenInfo> {
+        let data = changestreams::parse_resume_token(token).ok()?;
+        Some(ResumeTokenInfo {
+            position: data.position(),
+            op_index: data.op_index,
+            event: data.is_event(),
+            from_invalidate: data.from_invalidate,
+            has_uuid: data.uuid.is_some(),
+        })
     }
 
     fn coll_mod_recording(
@@ -500,12 +500,6 @@ impl CmdStorage for StorageAdapter {
             .map_err(map_err)?;
         change.committed();
         Ok(())
-    }
-
-    fn resume_token_is_event(&self, token: &Document) -> bool {
-        changestreams::parse_resume_token(token)
-            .map(|d| !d.ns.is_empty())
-            .unwrap_or(false)
     }
 
     fn set_oplog_session(&self, session: Option<(Vec<u8>, i64)>) {
@@ -559,20 +553,7 @@ impl CmdStorage for StorageAdapter {
     }
 
     fn high_water_mark_token(&self, seq: i64) -> Vec<u8> {
-        let ts = self.inner.peek_cluster_time().unwrap_or(bson::Timestamp {
-            time: 0,
-            increment: 0,
-        });
-        let data = ResumeTokenData {
-            seq,
-            ts,
-            ns: String::new(),
-            document_key: Document::new(),
-            from_invalidate: false,
-            fragment: None,
-            op_index: None,
-        };
-        match changestreams::make_resume_token(&data) {
+        match changestreams::make_high_water_mark_token(seq) {
             Ok(doc) => {
                 let mut buf = Vec::new();
                 if secantus_commands::bsondoc::write(&doc, &mut buf).is_ok() {

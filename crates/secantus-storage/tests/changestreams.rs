@@ -390,28 +390,39 @@ fn drop_event_invalidates_collection_scope() {
             &doc! {"db": "app", "coll": "c"}
         );
         assert!(inv); // a drop on the watched collection ends the stream
-        let invalidate = changestreams::invalidate_event(7, &entry).unwrap();
+        let invalidate = changestreams::invalidate_event(&ev, &entry).unwrap();
         assert_eq!(invalidate.get_str("operationType").unwrap(), "invalidate");
+        // Its token is the drop's, with `fromInvalidate` set.
+        let drop_token =
+            changestreams::parse_resume_token(ev.get_document("_id").unwrap()).unwrap();
+        let inv_token =
+            changestreams::parse_resume_token(invalidate.get_document("_id").unwrap()).unwrap();
+        assert!(inv_token.from_invalidate && !drop_token.from_invalidate);
+        assert_eq!(
+            changestreams::ResumeTokenData {
+                from_invalidate: false,
+                ..inv_token
+            },
+            drop_token
+        );
     });
 }
 
 #[test]
 fn resume_token_round_trips() {
-    let data = changestreams::ResumeTokenData {
-        seq: 42,
-        ts: Timestamp {
+    let data = changestreams::ResumeTokenData::event(
+        Timestamp {
             time: 123,
             increment: 4,
         },
-        ns: "app.c".into(),
-        document_key: doc! {"_id": 7},
-        from_invalidate: false,
-        fragment: None,
-        op_index: None,
-    };
+        Some(2),
+        Some(vec![7; 16]),
+        doc! {"operationType": "insert", "documentKey": doc! {"_id": 7}},
+    );
     let token = changestreams::make_resume_token(&data).unwrap();
     let parsed = changestreams::parse_resume_token(&token).unwrap();
     assert_eq!(parsed, data);
+    assert_eq!(parsed.position(), (123i64 << 32) | 4);
 }
 
 #[test]
@@ -430,18 +441,15 @@ fn over_16mb_event_splits_as_mongod_splits_it() {
     // two fragments, as pymongo's `test_split_large_change` expects. Each
     // field is in one fragment only, and each fragment has its own token.
     let big = "q".repeat(10 * 1024 * 1024);
-    let token = changestreams::make_resume_token(&changestreams::ResumeTokenData {
-        seq: 7,
-        ts: bson::Timestamp {
+    let token = changestreams::make_resume_token(&changestreams::ResumeTokenData::event(
+        bson::Timestamp {
             time: 1,
             increment: 1,
         },
-        ns: "d.c".to_string(),
-        document_key: doc! {"_id": 1},
-        from_invalidate: false,
-        fragment: None,
-        op_index: None,
-    })
+        None,
+        Some(vec![1; 16]),
+        doc! {"operationType": "update", "documentKey": doc! {"_id": 1}},
+    ))
     .unwrap();
     let event = doc! {
         "_id": token,
@@ -458,7 +466,10 @@ fn over_16mb_event_splits_as_mongod_splits_it() {
             &doc! {"fragment": i as i32 + 1, "of": 2}
         );
         let data = changestreams::parse_resume_token(f.get_document("_id").unwrap()).unwrap();
-        assert_eq!((data.seq, data.fragment), (7, Some(i as i32)));
+        assert_eq!(
+            (data.position(), data.fragment),
+            ((1i64 << 32) | 1, Some(i as i32))
+        );
         // `_id` and `splitEvent` lead every fragment.
         let keys: Vec<&str> = f.keys().map(String::as_str).collect();
         assert_eq!(&keys[..2], &["_id", "splitEvent"]);

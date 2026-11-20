@@ -1,0 +1,962 @@
+{
+ "mongod_version": "db version v8.2.11",
+ "cases": [
+  {
+   "name": "insert id=1",
+   "scope": "collection",
+   "data": "826B0096EA000000042B042C0100296E5A10044247CE608D744FCE92499E04EA1B0523463C6F7065726174696F6E54797065003C696E736572740046646F63756D656E744B657900461E5F6964002B02000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    4
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "4247ce608d744fce92499e04ea1b0523",
+   "eventIdentifier": {
+    "operationType": "insert",
+    "documentKey": {
+     "_id": {
+      "$numberInt": "1"
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "insert id=1099511627776",
+   "scope": "collection",
+   "data": "826B0096EA000000052B042C0100296E5A10044247CE608D744FCE92499E04EA1B0523463C6F7065726174696F6E54797065003C696E736572740046646F63756D656E744B657900461E5F69640030020000000000000004",
+   "typeBits": "820001",
+   "clusterTime": [
+    1795200746,
+    5
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "4247ce608d744fce92499e04ea1b0523",
+   "eventIdentifier": {
+    "operationType": "insert",
+    "documentKey": {
+     "_id": {
+      "$numberLong": "1099511627776"
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "insert id=1.5",
+   "scope": "collection",
+   "data": "826B0096EA000000062B042C0100296E5A10044247CE608D744FCE92499E04EA1B0523463C6F7065726174696F6E54797065003C696E736572740046646F63756D656E744B657900461E5F6964002B0380000000000000000004",
+   "typeBits": "828000",
+   "clusterTime": [
+    1795200746,
+    6
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "4247ce608d744fce92499e04ea1b0523",
+   "eventIdentifier": {
+    "operationType": "insert",
+    "documentKey": {
+     "_id": {
+      "$numberDouble": "1.5"
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "insert id='str'",
+   "scope": "collection",
+   "data": "826B0096EA000000072B042C0100296E5A10044247CE608D744FCE92499E04EA1B0523463C6F7065726174696F6E54797065003C696E736572740046646F63756D656E744B657900463C5F6964003C73747200000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    7
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "4247ce608d744fce92499e04ea1b0523",
+   "eventIdentifier": {
+    "operationType": "insert",
+    "documentKey": {
+     "_id": "str"
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "insert id={'a': 1, 'b': 2}",
+   "scope": "collection",
+   "data": "826B0096EA000000082B042C0100296E5A10044247CE608D744FCE92499E04EA1B0523463C6F7065726174696F6E54797065003C696E736572740046646F63756D656E744B65790046465F696400461E61002B021E62002B0400000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    8
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "4247ce608d744fce92499e04ea1b0523",
+   "eventIdentifier": {
+    "operationType": "insert",
+    "documentKey": {
+     "_id": {
+      "a": {
+       "$numberInt": "1"
+      },
+      "b": {
+       "$numberInt": "2"
+      }
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "insert id={'a': 5, 'b': 2.5}",
+   "scope": "collection",
+   "data": "826B0096EA000000092B042C0100296E5A10044247CE608D744FCE92499E04EA1B0523463C6F7065726174696F6E54797065003C696E736572740046646F63756D656E744B65790046465F696400461E61002B0A1E62002B058000000000000000000004",
+   "typeBits": "820003",
+   "clusterTime": [
+    1795200746,
+    9
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "4247ce608d744fce92499e04ea1b0523",
+   "eventIdentifier": {
+    "operationType": "insert",
+    "documentKey": {
+     "_id": {
+      "a": {
+       "$numberLong": "5"
+      },
+      "b": {
+       "$numberDouble": "2.5"
+      }
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "insert id=None",
+   "scope": "collection",
+   "data": "826B0096EA0000000A2B042C0100296E5A10044247CE608D744FCE92499E04EA1B0523463C6F7065726174696F6E54797065003C696E736572740046646F63756D656E744B65790046145F69640014000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    10
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "4247ce608d744fce92499e04ea1b0523",
+   "eventIdentifier": {
+    "operationType": "insert",
+    "documentKey": {
+     "_id": null
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "update",
+   "scope": "collection",
+   "data": "826B0096EA0000000B2B042C0100296E5A10044247CE608D744FCE92499E04EA1B0523463C6F7065726174696F6E54797065003C7570646174650046646F63756D656E744B657900461E5F6964002B02000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    11
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "4247ce608d744fce92499e04ea1b0523",
+   "eventIdentifier": {
+    "operationType": "update",
+    "documentKey": {
+     "_id": {
+      "$numberInt": "1"
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "replace",
+   "scope": "collection",
+   "data": "826B0096EA0000000C2B042C0100296E5A10044247CE608D744FCE92499E04EA1B0523463C6F7065726174696F6E54797065003C7265706C6163650046646F63756D656E744B657900461E5F6964002B02000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    12
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "4247ce608d744fce92499e04ea1b0523",
+   "eventIdentifier": {
+    "operationType": "replace",
+    "documentKey": {
+     "_id": {
+      "$numberInt": "1"
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "delete",
+   "scope": "collection",
+   "data": "826B0096EA0000000D2B042C0100296E5A10044247CE608D744FCE92499E04EA1B0523463C6F7065726174696F6E54797065003C64656C6574650046646F63756D656E744B657900461E5F6964002B02000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    13
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "4247ce608d744fce92499e04ea1b0523",
+   "eventIdentifier": {
+    "operationType": "delete",
+    "documentKey": {
+     "_id": {
+      "$numberInt": "1"
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "delete (database scope)",
+   "scope": "database",
+   "data": "826B0096EA0000000D2B042C0100296E5A10044247CE608D744FCE92499E04EA1B0523463C6F7065726174696F6E54797065003C64656C6574650046646F63756D656E744B657900461E5F6964002B02000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    13
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "4247ce608d744fce92499e04ea1b0523",
+   "eventIdentifier": {
+    "operationType": "delete",
+    "documentKey": {
+     "_id": {
+      "$numberInt": "1"
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "delete (cluster scope)",
+   "scope": "cluster",
+   "data": "826B0096EA0000000D2B042C0100296E5A10044247CE608D744FCE92499E04EA1B0523463C6F7065726174696F6E54797065003C64656C6574650046646F63756D656E744B657900461E5F6964002B02000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    13
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "4247ce608d744fce92499e04ea1b0523",
+   "eventIdentifier": {
+    "operationType": "delete",
+    "documentKey": {
+     "_id": {
+      "$numberInt": "1"
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "batched insert op 0",
+   "scope": "collection",
+   "data": "826B0096EA0000000E2B042C0100296E5A10044247CE608D744FCE92499E04EA1B0523463C6F7065726174696F6E54797065003C696E736572740046646F63756D656E744B657900461E5F6964002BC8000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    14
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "4247ce608d744fce92499e04ea1b0523",
+   "eventIdentifier": {
+    "operationType": "insert",
+    "documentKey": {
+     "_id": {
+      "$numberInt": "100"
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "batched insert op 1",
+   "scope": "collection",
+   "data": "826B0096EA0000000E2B042C01002B026E5A10044247CE608D744FCE92499E04EA1B0523463C6F7065726174696F6E54797065003C696E736572740046646F63756D656E744B657900461E5F6964002BCA000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    14
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 1,
+   "fromInvalidate": false,
+   "uuid": "4247ce608d744fce92499e04ea1b0523",
+   "eventIdentifier": {
+    "operationType": "insert",
+    "documentKey": {
+     "_id": {
+      "$numberInt": "101"
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "batched insert op 2",
+   "scope": "collection",
+   "data": "826B0096EA0000000E2B042C01002B046E5A10044247CE608D744FCE92499E04EA1B0523463C6F7065726174696F6E54797065003C696E736572740046646F63756D656E744B657900461E5F6964002BCC000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    14
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 2,
+   "fromInvalidate": false,
+   "uuid": "4247ce608d744fce92499e04ea1b0523",
+   "eventIdentifier": {
+    "operationType": "insert",
+    "documentKey": {
+     "_id": {
+      "$numberInt": "102"
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "transaction op 0",
+   "scope": "collection",
+   "data": "826B0096EA0000000F2B042C0100296E5A10044247CE608D744FCE92499E04EA1B0523463C6F7065726174696F6E54797065003C696E736572740046646F63756D656E744B657900461E5F6964002C0190000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    15
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "4247ce608d744fce92499e04ea1b0523",
+   "eventIdentifier": {
+    "operationType": "insert",
+    "documentKey": {
+     "_id": {
+      "$numberInt": "200"
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "transaction op 1",
+   "scope": "collection",
+   "data": "826B0096EA0000000F2B042C01002B026E5A10044247CE608D744FCE92499E04EA1B0523463C6F7065726174696F6E54797065003C7570646174650046646F63756D656E744B657900461E5F6964002C0190000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    15
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 1,
+   "fromInvalidate": false,
+   "uuid": "4247ce608d744fce92499e04ea1b0523",
+   "eventIdentifier": {
+    "operationType": "update",
+    "documentKey": {
+     "_id": {
+      "$numberInt": "200"
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "transaction op 2",
+   "scope": "collection",
+   "data": "826B0096EA0000000F2B042C01002B046E5A10044247CE608D744FCE92499E04EA1B0523463C6F7065726174696F6E54797065003C64656C6574650046646F63756D656E744B657900461E5F6964002C0190000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    15
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 2,
+   "fromInvalidate": false,
+   "uuid": "4247ce608d744fce92499e04ea1b0523",
+   "eventIdentifier": {
+    "operationType": "delete",
+    "documentKey": {
+     "_id": {
+      "$numberInt": "200"
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "ddl create",
+   "scope": "database",
+   "data": "826B0096EA000000102B042C0100296E5A100440479373D93042989BFD0F2E10880BBD463C6F7065726174696F6E54797065003C63726561746500466F7065726174696F6E4465736372697074696F6E00466E636170706564006F1E73697A65002D030D40466964496E64657800461E76002B04466B657900461E5F6964002B02003C6E616D65003C5F69645F0000000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    16
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "40479373d93042989bfd0f2e10880bbd",
+   "eventIdentifier": {
+    "operationType": "create",
+    "operationDescription": {
+     "capped": true,
+     "size": {
+      "$numberInt": "100000"
+     },
+     "idIndex": {
+      "v": {
+       "$numberInt": "2"
+      },
+      "key": {
+       "_id": {
+        "$numberInt": "1"
+       }
+      },
+      "name": "_id_"
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "ddl create",
+   "scope": "database",
+   "data": "826B0096EA000000112B042C0100296E5A1004821B42AC528E422095FDE495D2B48363463C6F7065726174696F6E54797065003C63726561746500466F7065726174696F6E4465736372697074696F6E00464676616C696461746F720046467800461E24677400290000466964496E64657800461E76002B04466B657900461E5F6964002B02003C6E616D65003C5F69645F0000000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    17
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "821b42ac528e422095fde495d2b48363",
+   "eventIdentifier": {
+    "operationType": "create",
+    "operationDescription": {
+     "validator": {
+      "x": {
+       "$gt": {
+        "$numberInt": "0"
+       }
+      }
+     },
+     "idIndex": {
+      "v": {
+       "$numberInt": "2"
+      },
+      "key": {
+       "_id": {
+        "$numberInt": "1"
+       }
+      },
+      "name": "_id_"
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "ddl createIndexes",
+   "scope": "database",
+   "data": "826B0096EA000000122B042C0100296E5A100440479373D93042989BFD0F2E10880BBD463C6F7065726174696F6E54797065003C637265617465496E646578657300466F7065726174696F6E4465736372697074696F6E004650696E64657865730050461E76002B046E756E69717565006F466B657900461E61002B02003C6E616D65003C615F31000000000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    18
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "40479373d93042989bfd0f2e10880bbd",
+   "eventIdentifier": {
+    "operationType": "createIndexes",
+    "operationDescription": {
+     "indexes": [
+      {
+       "v": {
+        "$numberInt": "2"
+       },
+       "unique": true,
+       "key": {
+        "a": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "a_1"
+      }
+     ]
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "ddl createIndexes",
+   "scope": "database",
+   "data": "826B0096EA000000132B042C0100296E5A100440479373D93042989BFD0F2E10880BBD463C6F7065726174696F6E54797065003C637265617465496E646578657300466F7065726174696F6E4465736372697074696F6E004650696E64657865730050461E76002B04466B657900461E62002B021E630027FD003C6E616D65003C625F315F635F2D31000000000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    19
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "40479373d93042989bfd0f2e10880bbd",
+   "eventIdentifier": {
+    "operationType": "createIndexes",
+    "operationDescription": {
+     "indexes": [
+      {
+       "v": {
+        "$numberInt": "2"
+       },
+       "key": {
+        "b": {
+         "$numberInt": "1"
+        },
+        "c": {
+         "$numberInt": "-1"
+        }
+       },
+       "name": "b_1_c_-1"
+      }
+     ]
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "ddl modify",
+   "scope": "database",
+   "data": "826B0096EA000000142B042C0100296E5A1004821B42AC528E422095FDE495D2B48363463C6F7065726174696F6E54797065003C6D6F6469667900466F7065726174696F6E4465736372697074696F6E00464676616C696461746F720046467900461E246774002900003C76616C69646174696F6E4C6576656C003C6D6F64657261746500000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    20
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "821b42ac528e422095fde495d2b48363",
+   "eventIdentifier": {
+    "operationType": "modify",
+    "operationDescription": {
+     "validator": {
+      "y": {
+       "$gt": {
+        "$numberInt": "0"
+       }
+      }
+     },
+     "validationLevel": "moderate"
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "ddl modify",
+   "scope": "database",
+   "data": "826B0096EA000000152B042C0100296E5A100440479373D93042989BFD0F2E10880BBD463C6F7065726174696F6E54797065003C6D6F6469667900466F7065726174696F6E4465736372697074696F6E004646696E64657800463C6E616D65003C615F31006E68696464656E006F00000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    21
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "40479373d93042989bfd0f2e10880bbd",
+   "eventIdentifier": {
+    "operationType": "modify",
+    "operationDescription": {
+     "index": {
+      "name": "a_1",
+      "hidden": true
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "ddl dropIndexes",
+   "scope": "database",
+   "data": "826B0096EA000000162B042C0100296E5A100440479373D93042989BFD0F2E10880BBD463C6F7065726174696F6E54797065003C64726F70496E646578657300466F7065726174696F6E4465736372697074696F6E004650696E64657865730050461E76002B04466B657900461E62002B021E630027FD003C6E616D65003C625F315F635F2D31000000000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    22
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "40479373d93042989bfd0f2e10880bbd",
+   "eventIdentifier": {
+    "operationType": "dropIndexes",
+    "operationDescription": {
+     "indexes": [
+      {
+       "v": {
+        "$numberInt": "2"
+       },
+       "key": {
+        "b": {
+         "$numberInt": "1"
+        },
+        "c": {
+         "$numberInt": "-1"
+        }
+       },
+       "name": "b_1_c_-1"
+      }
+     ]
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "ddl dropIndexes",
+   "scope": "database",
+   "data": "826B0096EA000000172B042C0100296E5A100440479373D93042989BFD0F2E10880BBD463C6F7065726174696F6E54797065003C64726F70496E646578657300466F7065726174696F6E4465736372697074696F6E004650696E64657865730050461E76002B046E756E69717565006F466B657900461E61002B02003C6E616D65003C615F31006E68696464656E006F0000000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    23
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "40479373d93042989bfd0f2e10880bbd",
+   "eventIdentifier": {
+    "operationType": "dropIndexes",
+    "operationDescription": {
+     "indexes": [
+      {
+       "v": {
+        "$numberInt": "2"
+       },
+       "unique": true,
+       "key": {
+        "a": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "a_1",
+       "hidden": true
+      }
+     ]
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "ddl rename",
+   "scope": "database",
+   "data": "826B0096EA000000182B042C0100296E5A100440479373D93042989BFD0F2E10880BBD463C6F7065726174696F6E54797065003C72656E616D6500466F7065726174696F6E4465736372697074696F6E004646746F00463C6462003C727432003C636F6C6C003C65330000000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    24
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "40479373d93042989bfd0f2e10880bbd",
+   "eventIdentifier": {
+    "operationType": "rename",
+    "operationDescription": {
+     "to": {
+      "db": "rt2",
+      "coll": "e3"
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "ddl create",
+   "scope": "database",
+   "data": "826B0096EA000000192B042C0100296E5A10041307C431413E44B5AFE552334AE0365E463C6F7065726174696F6E54797065003C63726561746500466F7065726174696F6E4465736372697074696F6E0046466964496E64657800461E76002B04466B657900461E5F6964002B02003C6E616D65003C5F69645F0000000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    25
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "1307c431413e44b5afe552334ae0365e",
+   "eventIdentifier": {
+    "operationType": "create",
+    "operationDescription": {
+     "idIndex": {
+      "v": {
+       "$numberInt": "2"
+      },
+      "key": {
+       "_id": {
+        "$numberInt": "1"
+       }
+      },
+      "name": "_id_"
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "ddl rename",
+   "scope": "database",
+   "data": "826B0096EA0000001A2B042C0100296E5A100440479373D93042989BFD0F2E10880BBD463C6F7065726174696F6E54797065003C72656E616D6500466F7065726174696F6E4465736372697074696F6E004646746F00463C6462003C727432003C636F6C6C003C653400005A64726F70546172676574005A10041307C431413E44B5AFE552334AE0365E000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    26
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "40479373d93042989bfd0f2e10880bbd",
+   "eventIdentifier": {
+    "operationType": "rename",
+    "operationDescription": {
+     "to": {
+      "db": "rt2",
+      "coll": "e4"
+     },
+     "dropTarget": {
+      "$binary": {
+       "base64": "EwfEMUE+RLWv5VIzSuA2Xg==",
+       "subType": "04"
+      }
+     }
+    }
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "ddl drop",
+   "scope": "database",
+   "data": "826B0096EA0000001B2B042C0100296E5A100440479373D93042989BFD0F2E10880BBD463C6F7065726174696F6E54797065003C64726F70000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    27
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "40479373d93042989bfd0f2e10880bbd",
+   "eventIdentifier": {
+    "operationType": "drop"
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "ddl drop",
+   "scope": "database",
+   "data": "826B0096EA0000001C2B042C0100296E5A1004821B42AC528E422095FDE495D2B48363463C6F7065726174696F6E54797065003C64726F70000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    28
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "821b42ac528e422095fde495d2b48363",
+   "eventIdentifier": {
+    "operationType": "drop"
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "ddl dropDatabase",
+   "scope": "database",
+   "data": "826B0096EA0000001D2B042C0100296E14463C6F7065726174696F6E54797065003C64726F704461746162617365000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    29
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": null,
+   "eventIdentifier": {
+    "operationType": "dropDatabase"
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "drop (collection scope)",
+   "scope": "collection",
+   "data": "826B0096EA000000202B042C0100296E5A10044DA7149EC0F44A009653A69676C86705463C6F7065726174696F6E54797065003C64726F70000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    32
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "4da7149ec0f44a009653a69676c86705",
+   "eventIdentifier": {
+    "operationType": "drop"
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "invalidate (collection drop)",
+   "scope": "collection",
+   "data": "826B0096EA000000202B042C0100296F5A10044DA7149EC0F44A009653A69676C86705463C6F7065726174696F6E54797065003C64726F70000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    32
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": true,
+   "uuid": "4da7149ec0f44a009653a69676c86705",
+   "eventIdentifier": {
+    "operationType": "drop"
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "invalidate (dropDatabase)",
+   "scope": "database",
+   "data": "826B0096EA000000232B042C0100296F14463C6F7065726174696F6E54797065003C64726F704461746162617365000004",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    35
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": true,
+   "uuid": null,
+   "eventIdentifier": {
+    "operationType": "dropDatabase"
+   },
+   "fragmentNum": null
+  },
+  {
+   "name": "split fragment 0",
+   "scope": "collection",
+   "data": "826B0096EA000000272B042C0100296E5A1004ABCCF5DB456F48AFAA035B1B21D24AB2463C6F7065726174696F6E54797065003C7570646174650046646F63756D656E744B657900461E5F6964002B0200002904",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    39
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "abccf5db456f48afaa035b1b21d24ab2",
+   "eventIdentifier": {
+    "operationType": "update",
+    "documentKey": {
+     "_id": {
+      "$numberInt": "1"
+     }
+    }
+   },
+   "fragmentNum": 0
+  },
+  {
+   "name": "split fragment 1",
+   "scope": "collection",
+   "data": "826B0096EA000000272B042C0100296E5A1004ABCCF5DB456F48AFAA035B1B21D24AB2463C6F7065726174696F6E54797065003C7570646174650046646F63756D656E744B657900461E5F6964002B0200002B0204",
+   "typeBits": null,
+   "clusterTime": [
+    1795200746,
+    39
+   ],
+   "tokenType": 128,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": "abccf5db456f48afaa035b1b21d24ab2",
+   "eventIdentifier": {
+    "operationType": "update",
+    "documentKey": {
+     "_id": {
+      "$numberInt": "1"
+     }
+    }
+   },
+   "fragmentNum": 1
+  },
+  {
+   "name": "high water mark, open",
+   "scope": "collection",
+   "data": "826B0096EB000000042B0429296E1404",
+   "typeBits": null,
+   "clusterTime": [
+    1795200747,
+    4
+   ],
+   "tokenType": 0,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": null,
+   "eventIdentifier": null,
+   "fragmentNum": null
+  },
+  {
+   "name": "high water mark, after a write elsewhere",
+   "scope": "collection",
+   "data": "826B0096EB000000052B0429296E1404",
+   "typeBits": null,
+   "clusterTime": [
+    1795200747,
+    5
+   ],
+   "tokenType": 0,
+   "txnOpIndex": 0,
+   "fromInvalidate": false,
+   "uuid": null,
+   "eventIdentifier": null,
+   "fragmentNum": null
+  }
+ ]
+}

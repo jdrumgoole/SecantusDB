@@ -27,8 +27,10 @@ pub enum Verdict {
     /// mongod fails with this code, code name and message.
     Error(i32, &'static str, String),
     /// mongod decodes the token: `has_uuid` says whether it names a
-    /// collection, which a single-collection stream requires (260).
-    Decoded { has_uuid: bool },
+    /// collection, which a single-collection stream requires of an event's
+    /// token (260), and `event` whether it is an event's (a high-water mark
+    /// names none and is read by a stream on any scope).
+    Decoded { has_uuid: bool, event: bool },
     /// mongod's answer depends on what is not transcribed here.
     Unmodelled,
 }
@@ -688,7 +690,10 @@ fn check_fields(elems: &[Elem]) -> Verdict {
         if version > 1 {
             return fail(6189500, "Expected UUID or null");
         }
-        return Verdict::Decoded { has_uuid: false };
+        return Verdict::Decoded {
+            has_uuid: false,
+            event: event_token,
+        };
     };
     let has_uuid = match uuid {
         Elem::Null => false,
@@ -712,7 +717,10 @@ fn check_fields(elems: &[Elem]) -> Verdict {
                 "Expected an eventIdentifier for an event resume token",
             );
         }
-        return Verdict::Decoded { has_uuid };
+        return Verdict::Decoded {
+            has_uuid,
+            event: event_token,
+        };
     };
     if **event_id != Elem::Object {
         return fail(6189503, "Resume Token eventIdentifier is not an object");
@@ -731,7 +739,10 @@ fn check_fields(elems: &[Elem]) -> Verdict {
     if more.next().is_some() {
         return fail(40646, "invalid oversized resume token");
     }
-    Verdict::Decoded { has_uuid }
+    Verdict::Decoded {
+        has_uuid,
+        event: event_token,
+    }
 }
 
 /// mongod's answer for the resume token `tok`, which this server could not
@@ -997,13 +1008,19 @@ mod tests {
     fn a_token_that_decodes_says_whether_it_names_a_collection() {
         assert_eq!(
             mongod_verdict(&doc! { "_data": "8200000000000000012B022C0100296E" }),
-            Verdict::Decoded { has_uuid: false }
+            Verdict::Decoded {
+                has_uuid: false,
+                event: true
+            }
         );
         assert_eq!(
             mongod_verdict(
                 &doc! { "_data": "8200000000000000012B042C0100296E5A1004000102030405060708090A0B0C0D0E0F4600" }
             ),
-            Verdict::Decoded { has_uuid: true }
+            Verdict::Decoded {
+                has_uuid: true,
+                event: true
+            }
         );
     }
 }

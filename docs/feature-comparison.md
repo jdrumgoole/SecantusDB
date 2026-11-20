@@ -216,7 +216,7 @@ still returns a generic `BadValue` where mongod returns `Location31325`.
 | `showExpandedEvents` (DDL events) | ✅ | ✅ |
 | `splitLargeChangeStreamEvents` / `$changeStreamSplitLargeEvent` | ✅ | ✅ |
 | Invalidate on drop / dropDatabase / rename | ✅ | ✅ |
-| Resume tokens interchangeable with real mongod | ✅ | ❌ SecantusDB's own `{s, t, n, k}` layout |
+| Resume tokens interchangeable with real mongod | ✅ | ⚠️ mongod 8.2's own KeyString form, byte for byte; this server resumes from mongod's, mongod resuming from ours is not yet tested (it needs mongod to open the store) |
 
 ## Transactions and sessions
 
