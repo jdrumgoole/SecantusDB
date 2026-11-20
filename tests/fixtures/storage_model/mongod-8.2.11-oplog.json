@@ -1,0 +1,4367 @@
+{
+ "mongod_version": "db version v8.2.11",
+ "catalog_entry": {
+  "ident": "collection-b35eafb4-32b9-42bf-999a-9f613c0a5434",
+  "idxIdent": {},
+  "md": {
+   "ns": "local.oplog.rs",
+   "options": {
+    "uuid": {
+     "$binary": {
+      "base64": "bKkitCDfTzmSa3eq429WAg==",
+      "subType": "04"
+     }
+    },
+    "capped": true,
+    "size": {
+     "$numberInt": "201326592"
+    },
+    "autoIndexId": false
+   },
+   "indexes": []
+  },
+  "ns": "local.oplog.rs"
+ },
+ "steps": [
+  {
+   "name": "create",
+   "entries": [
+    {
+     "op": "c",
+     "ns": "config.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "zCY2DZUpTiCIL574YALhOQ==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "create": "sampledQueriesDiff",
+      "idIndex": {
+       "v": {
+        "$numberInt": "2"
+       },
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 16
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789619"
+      }
+     }
+    },
+    {
+     "op": "c",
+     "ns": "config.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "zCY2DZUpTiCIL574YALhOQ==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "createIndexes": "sampledQueriesDiff",
+      "v": {
+       "$numberInt": "2"
+      },
+      "key": {
+       "expireAt": {
+        "$numberInt": "1"
+       }
+      },
+      "name": "SampledQueriesDiffTTLIndex",
+      "expireAfterSeconds": {
+       "$numberInt": "0"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 17
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789619"
+      }
+     }
+    },
+    {
+     "op": "c",
+     "ns": "app.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "create": "c",
+      "idIndex": {
+       "v": {
+        "$numberInt": "2"
+       },
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 18
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789656"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "insert one",
+   "entries": [
+    {
+     "lsid": {
+      "id": {
+       "$binary": {
+        "base64": "SHvcuMVeSC+Mtci9/mk5pA==",
+        "subType": "04"
+       }
+      },
+      "uid": {
+       "$binary": {
+        "base64": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "subType": "00"
+       }
+      }
+     },
+     "txnNumber": {
+      "$numberLong": "1"
+     },
+     "op": "i",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "_id": {
+       "$numberInt": "1"
+      },
+      "a": {
+       "$numberInt": "1"
+      }
+     },
+     "o2": {
+      "_id": {
+       "$numberInt": "1"
+      }
+     },
+     "stmtId": {
+      "$numberInt": "0"
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 19
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789874"
+      }
+     },
+     "prevOpTime": {
+      "ts": {
+       "$timestamp": {
+        "t": 0,
+        "i": 0
+       }
+      },
+      "t": {
+       "$numberLong": "-1"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "insert many",
+   "entries": [
+    {
+     "lsid": {
+      "id": {
+       "$binary": {
+        "base64": "SHvcuMVeSC+Mtci9/mk5pA==",
+        "subType": "04"
+       }
+      },
+      "uid": {
+       "$binary": {
+        "base64": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "subType": "00"
+       }
+      }
+     },
+     "txnNumber": {
+      "$numberLong": "2"
+     },
+     "op": "c",
+     "ns": "admin.$cmd",
+     "o": {
+      "applyOps": [
+       {
+        "op": "i",
+        "ns": "app.c",
+        "ui": {
+         "$binary": {
+          "base64": "pYPVTYC0RbicYvhvM17XYg==",
+          "subType": "04"
+         }
+        },
+        "o": {
+         "_id": {
+          "$numberInt": "2"
+         },
+         "a": {
+          "$numberInt": "2"
+         }
+        },
+        "o2": {
+         "_id": {
+          "$numberInt": "2"
+         }
+        },
+        "stmtId": {
+         "$numberInt": "0"
+        }
+       },
+       {
+        "op": "i",
+        "ns": "app.c",
+        "ui": {
+         "$binary": {
+          "base64": "pYPVTYC0RbicYvhvM17XYg==",
+          "subType": "04"
+         }
+        },
+        "o": {
+         "_id": {
+          "$numberInt": "3"
+         },
+         "a": {
+          "$numberInt": "3"
+         }
+        },
+        "o2": {
+         "_id": {
+          "$numberInt": "3"
+         }
+        },
+        "stmtId": {
+         "$numberInt": "1"
+        }
+       },
+       {
+        "op": "i",
+        "ns": "app.c",
+        "ui": {
+         "$binary": {
+          "base64": "pYPVTYC0RbicYvhvM17XYg==",
+          "subType": "04"
+         }
+        },
+        "o": {
+         "_id": {
+          "$numberInt": "4"
+         },
+         "a": {
+          "$numberInt": "4"
+         }
+        },
+        "o2": {
+         "_id": {
+          "$numberInt": "4"
+         }
+        },
+        "stmtId": {
+         "$numberInt": "2"
+        }
+       }
+      ]
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132790,
+       "i": 1
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132790089"
+      }
+     },
+     "prevOpTime": {
+      "ts": {
+       "$timestamp": {
+        "t": 0,
+        "i": 0
+       }
+      },
+      "t": {
+       "$numberLong": "-1"
+      }
+     },
+     "multiOpType": {
+      "$numberInt": "1"
+     }
+    }
+   ]
+  },
+  {
+   "name": "update one ($set)",
+   "entries": [
+    {
+     "lsid": {
+      "id": {
+       "$binary": {
+        "base64": "SHvcuMVeSC+Mtci9/mk5pA==",
+        "subType": "04"
+       }
+      },
+      "uid": {
+       "$binary": {
+        "base64": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "subType": "00"
+       }
+      }
+     },
+     "txnNumber": {
+      "$numberLong": "3"
+     },
+     "op": "u",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "$v": {
+       "$numberInt": "2"
+      },
+      "diff": {
+       "u": {
+        "a": {
+         "$numberInt": "10"
+        }
+       }
+      }
+     },
+     "o2": {
+      "_id": {
+       "$numberInt": "1"
+      }
+     },
+     "stmtId": {
+      "$numberInt": "0"
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132790,
+       "i": 2
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132790305"
+      }
+     },
+     "prevOpTime": {
+      "ts": {
+       "$timestamp": {
+        "t": 0,
+        "i": 0
+       }
+      },
+      "t": {
+       "$numberLong": "-1"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "update many ($inc)",
+   "entries": [
+    {
+     "op": "u",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "$v": {
+       "$numberInt": "2"
+      },
+      "diff": {
+       "u": {
+        "a": {
+         "$numberInt": "3"
+        }
+       }
+      }
+     },
+     "o2": {
+      "_id": {
+       "$numberInt": "2"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132790,
+       "i": 3
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132790516"
+      }
+     }
+    },
+    {
+     "op": "u",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "$v": {
+       "$numberInt": "2"
+      },
+      "diff": {
+       "u": {
+        "a": {
+         "$numberInt": "4"
+        }
+       }
+      }
+     },
+     "o2": {
+      "_id": {
+       "$numberInt": "3"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132790,
+       "i": 4
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132790516"
+      }
+     }
+    },
+    {
+     "op": "u",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "$v": {
+       "$numberInt": "2"
+      },
+      "diff": {
+       "u": {
+        "a": {
+         "$numberInt": "5"
+        }
+       }
+      }
+     },
+     "o2": {
+      "_id": {
+       "$numberInt": "4"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132790,
+       "i": 5
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132790516"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "replace one",
+   "entries": [
+    {
+     "lsid": {
+      "id": {
+       "$binary": {
+        "base64": "SHvcuMVeSC+Mtci9/mk5pA==",
+        "subType": "04"
+       }
+      },
+      "uid": {
+       "$binary": {
+        "base64": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "subType": "00"
+       }
+      }
+     },
+     "txnNumber": {
+      "$numberLong": "4"
+     },
+     "op": "u",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "_id": {
+       "$numberInt": "2"
+      },
+      "b": "x"
+     },
+     "o2": {
+      "_id": {
+       "$numberInt": "2"
+      }
+     },
+     "stmtId": {
+      "$numberInt": "0"
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132790,
+       "i": 6
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132790731"
+      }
+     },
+     "prevOpTime": {
+      "ts": {
+       "$timestamp": {
+        "t": 0,
+        "i": 0
+       }
+      },
+      "t": {
+       "$numberLong": "-1"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "upsert",
+   "entries": [
+    {
+     "lsid": {
+      "id": {
+       "$binary": {
+        "base64": "SHvcuMVeSC+Mtci9/mk5pA==",
+        "subType": "04"
+       }
+      },
+      "uid": {
+       "$binary": {
+        "base64": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "subType": "00"
+       }
+      }
+     },
+     "txnNumber": {
+      "$numberLong": "5"
+     },
+     "op": "i",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "_id": {
+       "$numberInt": "9"
+      },
+      "a": {
+       "$numberInt": "9"
+      }
+     },
+     "o2": {
+      "_id": {
+       "$numberInt": "9"
+      }
+     },
+     "stmtId": {
+      "$numberInt": "0"
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132790,
+       "i": 7
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132790950"
+      }
+     },
+     "prevOpTime": {
+      "ts": {
+       "$timestamp": {
+        "t": 0,
+        "i": 0
+       }
+      },
+      "t": {
+       "$numberLong": "-1"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "delete one",
+   "entries": [
+    {
+     "lsid": {
+      "id": {
+       "$binary": {
+        "base64": "SHvcuMVeSC+Mtci9/mk5pA==",
+        "subType": "04"
+       }
+      },
+      "uid": {
+       "$binary": {
+        "base64": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "subType": "00"
+       }
+      }
+     },
+     "txnNumber": {
+      "$numberLong": "6"
+     },
+     "op": "d",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "_id": {
+       "$numberInt": "3"
+      }
+     },
+     "stmtId": {
+      "$numberInt": "0"
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132791,
+       "i": 1
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132791171"
+      }
+     },
+     "prevOpTime": {
+      "ts": {
+       "$timestamp": {
+        "t": 0,
+        "i": 0
+       }
+      },
+      "t": {
+       "$numberLong": "-1"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "delete many",
+   "entries": [
+    {
+     "op": "c",
+     "ns": "admin.$cmd",
+     "o": {
+      "applyOps": [
+       {
+        "op": "d",
+        "ns": "app.c",
+        "ui": {
+         "$binary": {
+          "base64": "pYPVTYC0RbicYvhvM17XYg==",
+          "subType": "04"
+         }
+        },
+        "o": {
+         "_id": {
+          "$numberInt": "9"
+         }
+        }
+       },
+       {
+        "op": "d",
+        "ns": "app.c",
+        "ui": {
+         "$binary": {
+          "base64": "pYPVTYC0RbicYvhvM17XYg==",
+          "subType": "04"
+         }
+        },
+        "o": {
+         "_id": {
+          "$numberInt": "4"
+         }
+        }
+       }
+      ]
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132791,
+       "i": 2
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132791392"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "findAndModify",
+   "entries": [
+    {
+     "lsid": {
+      "id": {
+       "$binary": {
+        "base64": "SHvcuMVeSC+Mtci9/mk5pA==",
+        "subType": "04"
+       }
+      },
+      "uid": {
+       "$binary": {
+        "base64": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "subType": "00"
+       }
+      }
+     },
+     "txnNumber": {
+      "$numberLong": "7"
+     },
+     "op": "u",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "$v": {
+       "$numberInt": "2"
+      },
+      "diff": {
+       "i": {
+        "f": {
+         "$numberInt": "1"
+        }
+       }
+      }
+     },
+     "o2": {
+      "_id": {
+       "$numberInt": "1"
+      }
+     },
+     "needsRetryImage": "preImage",
+     "stmtId": {
+      "$numberInt": "0"
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132791,
+       "i": 4
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132791610"
+      }
+     },
+     "prevOpTime": {
+      "ts": {
+       "$timestamp": {
+        "t": 0,
+        "i": 0
+       }
+      },
+      "t": {
+       "$numberLong": "-1"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "create d",
+   "entries": [
+    {
+     "op": "c",
+     "ns": "app.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "MCxMGnWURCim18oEkO2/UA==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "create": "d",
+      "idIndex": {
+       "v": {
+        "$numberInt": "2"
+       },
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132791,
+       "i": 5
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132791859"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "transaction (insert, update, insert into another collection)",
+   "entries": [
+    {
+     "lsid": {
+      "id": {
+       "$binary": {
+        "base64": "SHvcuMVeSC+Mtci9/mk5pA==",
+        "subType": "04"
+       }
+      },
+      "uid": {
+       "$binary": {
+        "base64": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "subType": "00"
+       }
+      }
+     },
+     "txnNumber": {
+      "$numberLong": "8"
+     },
+     "op": "c",
+     "ns": "admin.$cmd",
+     "o": {
+      "applyOps": [
+       {
+        "op": "i",
+        "ns": "app.c",
+        "ui": {
+         "$binary": {
+          "base64": "pYPVTYC0RbicYvhvM17XYg==",
+          "subType": "04"
+         }
+        },
+        "o": {
+         "_id": {
+          "$numberInt": "20"
+         }
+        },
+        "o2": {
+         "_id": {
+          "$numberInt": "20"
+         }
+        }
+       },
+       {
+        "op": "u",
+        "ns": "app.c",
+        "ui": {
+         "$binary": {
+          "base64": "pYPVTYC0RbicYvhvM17XYg==",
+          "subType": "04"
+         }
+        },
+        "o": {
+         "$v": {
+          "$numberInt": "2"
+         },
+         "diff": {
+          "i": {
+           "t": {
+            "$numberInt": "1"
+           }
+          }
+         }
+        },
+        "o2": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        }
+       },
+       {
+        "op": "i",
+        "ns": "app.d",
+        "ui": {
+         "$binary": {
+          "base64": "MCxMGnWURCim18oEkO2/UA==",
+          "subType": "04"
+         }
+        },
+        "o": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "o2": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        }
+       }
+      ]
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132792,
+       "i": 1
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132792075"
+      }
+     },
+     "prevOpTime": {
+      "ts": {
+       "$timestamp": {
+        "t": 0,
+        "i": 0
+       }
+      },
+      "t": {
+       "$numberLong": "-1"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "retryable insert",
+   "entries": [
+    {
+     "lsid": {
+      "id": {
+       "$binary": {
+        "base64": "SHvcuMVeSC+Mtci9/mk5pA==",
+        "subType": "04"
+       }
+      },
+      "uid": {
+       "$binary": {
+        "base64": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "subType": "00"
+       }
+      }
+     },
+     "txnNumber": {
+      "$numberLong": "9"
+     },
+     "op": "i",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "_id": {
+       "$numberInt": "30"
+      }
+     },
+     "o2": {
+      "_id": {
+       "$numberInt": "30"
+      }
+     },
+     "stmtId": {
+      "$numberInt": "0"
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132792,
+       "i": 2
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132792296"
+      }
+     },
+     "prevOpTime": {
+      "ts": {
+       "$timestamp": {
+        "t": 0,
+        "i": 0
+       }
+      },
+      "t": {
+       "$numberLong": "-1"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "createIndexes",
+   "entries": [
+    {
+     "op": "i",
+     "ns": "config.system.indexBuilds",
+     "ui": {
+      "$binary": {
+       "base64": "xgfvaW8mSuezyhKMGcAeGQ==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "_id": {
+       "$binary": {
+        "base64": "LDfnACiXT6+YQgmd0vS7cA==",
+        "subType": "04"
+       }
+      },
+      "collectionUUID": {
+       "$binary": {
+        "base64": "pYPVTYC0RbicYvhvM17XYg==",
+        "subType": "04"
+       }
+      },
+      "commitQuorum": "votingMembers",
+      "indexNames": [
+       "a_1"
+      ]
+     },
+     "o2": {
+      "_id": {
+       "$binary": {
+        "base64": "LDfnACiXT6+YQgmd0vS7cA==",
+        "subType": "04"
+       }
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132792,
+       "i": 3
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132792517"
+      }
+     }
+    },
+    {
+     "op": "c",
+     "ns": "app.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "startIndexBuild": "c",
+      "indexBuildUUID": {
+       "$binary": {
+        "base64": "LDfnACiXT6+YQgmd0vS7cA==",
+        "subType": "04"
+       }
+      },
+      "indexes": [
+       {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "a": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "a_1"
+       }
+      ]
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132792,
+       "i": 4
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132792517"
+      }
+     }
+    },
+    {
+     "op": "u",
+     "ns": "config.system.indexBuilds",
+     "ui": {
+      "$binary": {
+       "base64": "xgfvaW8mSuezyhKMGcAeGQ==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "$v": {
+       "$numberInt": "2"
+      },
+      "diff": {
+       "i": {
+        "commitReadyMembers": [
+         "127.0.0.1:59786"
+        ]
+       }
+      }
+     },
+     "o2": {
+      "_id": {
+       "$binary": {
+        "base64": "LDfnACiXT6+YQgmd0vS7cA==",
+        "subType": "04"
+       }
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132792,
+       "i": 5
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132792637"
+      }
+     }
+    },
+    {
+     "op": "c",
+     "ns": "app.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "commitIndexBuild": "c",
+      "indexBuildUUID": {
+       "$binary": {
+        "base64": "LDfnACiXT6+YQgmd0vS7cA==",
+        "subType": "04"
+       }
+      },
+      "indexes": [
+       {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "a": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "a_1"
+       }
+      ]
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132792,
+       "i": 6
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132792638"
+      }
+     }
+    },
+    {
+     "op": "d",
+     "ns": "config.system.indexBuilds",
+     "ui": {
+      "$binary": {
+       "base64": "xgfvaW8mSuezyhKMGcAeGQ==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "_id": {
+       "$binary": {
+        "base64": "LDfnACiXT6+YQgmd0vS7cA==",
+        "subType": "04"
+       }
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132792,
+       "i": 7
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132792638"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "collMod",
+   "entries": [
+    {
+     "op": "c",
+     "ns": "app.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "collMod": "c",
+      "validator": {
+       "a": {
+        "$exists": true
+       }
+      }
+     },
+     "o2": {
+      "collectionOptions_old": {
+       "uuid": {
+        "$binary": {
+         "base64": "pYPVTYC0RbicYvhvM17XYg==",
+         "subType": "04"
+        }
+       }
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132792,
+       "i": 8
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132792856"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "dropIndexes",
+   "entries": [
+    {
+     "op": "c",
+     "ns": "app.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "dropIndexes": "c",
+      "index": "a_1"
+     },
+     "o2": {
+      "v": {
+       "$numberInt": "2"
+      },
+      "key": {
+       "a": {
+        "$numberInt": "1"
+       }
+      },
+      "name": "a_1"
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132793,
+       "i": 1
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132793075"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "rename",
+   "entries": [
+    {
+     "op": "c",
+     "ns": "app.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "renameCollection": "app.c",
+      "to": "app.c2",
+      "stayTemp": false
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132793,
+       "i": 2
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132793294"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "drop",
+   "entries": [
+    {
+     "op": "c",
+     "ns": "app.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "MCxMGnWURCim18oEkO2/UA==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "drop": "d"
+     },
+     "o2": {
+      "numRecords": {
+       "$numberInt": "1"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132793,
+       "i": 3
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132793513"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "dropDatabase",
+   "entries": [
+    {
+     "op": "c",
+     "ns": "app.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "drop": "c2"
+     },
+     "o2": {
+      "numRecords": {
+       "$numberInt": "4"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132793,
+       "i": 4
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132793730"
+      }
+     }
+    },
+    {
+     "op": "c",
+     "ns": "app.$cmd",
+     "o": {
+      "dropDatabase": {
+       "$numberInt": "1"
+      }
+     },
+     "fromMigrate": false,
+     "ts": {
+      "$timestamp": {
+       "t": 1795132793,
+       "i": 5
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132793743"
+      }
+     }
+    }
+   ]
+  }
+ ],
+ "table": {
+  "config": "access_pattern_hint=none,allocation_size=4KB,app_metadata=(formatVersion=1,oplogKeyExtractionVersion=1),assert=(commit_timestamp=none,durable_timestamp=none,read_timestamp=none,write_timestamp=off),block_allocation=best,block_compressor=snappy,cache_resident=false,checksum=on,collator=,columns=,dictionary=0,encryption=(keyid=,name=),format=btree,huffman_key=,huffman_value=,id=16,ignore_in_memory_cache_size=false,internal_item_max=0,internal_key_max=0,internal_key_truncate=true,internal_page_max=4KB,key_format=q,key_gap=10,leaf_item_max=0,leaf_key_max=0,leaf_page_max=32KB,leaf_value_max=64MB,log=(enabled=true),memory_page_image_max=0,memory_page_max=10m,os_cache_dirty_max=0,os_cache_max=0,prefix_compression=false,prefix_compression_min=4,readonly=false,split_deepen_min_child=0,split_deepen_per_child=0,split_pct=90,tiered_object=false,tiered_storage=(auth_token=,bucket=,bucket_prefix=,cache_directory=,local_retention=300,name=,object_target_size=0),value_format=u,verbose=[],version=(major=1,minor=1),write_timestamp_usage=none,checkpoint=(WiredTigerCheckpoint.3=(addr=\"018581e4ce29dcf18681e4424107b48781e44f675396808080e26fc0cfc0\",order=3,time=1795132794,size=8192,newest_start_durable_ts=0,oldest_start_ts=0,newest_txn=0,newest_stop_durable_ts=0,newest_stop_ts=-1,newest_stop_txn=-11,prepare=0,write_gen=6,run_write_gen=1)),checkpoint_backup_info=,checkpoint_lsn=(1,108800)",
+  "rows": [
+   {
+    "key_hex": "e86aff8d74ffffdfc1",
+    "record_id": {
+     "$numberLong": "7710036620732268545"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132789"
+     },
+     {
+      "$numberInt": "1"
+     }
+    ],
+    "doc": {
+     "op": "n",
+     "ns": "",
+     "o": {
+      "msg": "initiating set"
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 1
+      }
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789260"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d74ffffdfc3",
+    "record_id": {
+     "$numberLong": "7710036620732268547"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132789"
+     },
+     {
+      "$numberInt": "3"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "config.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "NDcpOlrGTjCvuI6NlyItuQ==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "create": "transactions",
+      "idIndex": {
+       "v": {
+        "$numberInt": "2"
+       },
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 3
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789432"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d74ffffdfc4",
+    "record_id": {
+     "$numberLong": "7710036620732268548"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132789"
+     },
+     {
+      "$numberInt": "4"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "config.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "NDcpOlrGTjCvuI6NlyItuQ==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "createIndexes": "transactions",
+      "v": {
+       "$numberInt": "2"
+      },
+      "key": {
+       "parentLsid": {
+        "$numberInt": "1"
+       },
+       "_id.txnNumber": {
+        "$numberInt": "1"
+       },
+       "_id": {
+        "$numberInt": "1"
+       }
+      },
+      "name": "parent_lsid",
+      "partialFilterExpression": {
+       "parentLsid": {
+        "$exists": true
+       }
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 4
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789432"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d74ffffdfc5",
+    "record_id": {
+     "$numberLong": "7710036620732268549"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132789"
+     },
+     {
+      "$numberInt": "5"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "config.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "n6rBlLjcS0Wj19T4+VRThw==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "create": "image_collection",
+      "idIndex": {
+       "v": {
+        "$numberInt": "2"
+       },
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 5
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789468"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d74ffffdfc6",
+    "record_id": {
+     "$numberLong": "7710036620732268550"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132789"
+     },
+     {
+      "$numberInt": "6"
+     }
+    ],
+    "doc": {
+     "op": "n",
+     "ns": "",
+     "o": {
+      "msg": "new primary"
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 6
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789469"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d74ffffdfc7",
+    "record_id": {
+     "$numberLong": "7710036620732268551"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132789"
+     },
+     {
+      "$numberInt": "7"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "config.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "xgfvaW8mSuezyhKMGcAeGQ==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "create": "system.indexBuilds",
+      "idIndex": {
+       "v": {
+        "$numberInt": "2"
+       },
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 7
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789491"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d74ffffdfc8",
+    "record_id": {
+     "$numberLong": "7710036620732268552"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132789"
+     },
+     {
+      "$numberInt": "8"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "config.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "A97r156jTiusmjQzC2gfTA==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "create": "system.preimages",
+      "clusteredIndex": true
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 8
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789491"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d74ffffdfc9",
+    "record_id": {
+     "$numberLong": "7710036620732268553"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132789"
+     },
+     {
+      "$numberInt": "9"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "config.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "iFR5IEO5Tcu0ebCDbGZU5A==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "create": "analyzeShardKeySplitPoints",
+      "idIndex": {
+       "v": {
+        "$numberInt": "2"
+       },
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 9
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789541"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d74ffffdfca",
+    "record_id": {
+     "$numberLong": "7710036620732268554"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132789"
+     },
+     {
+      "$numberInt": "10"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "admin.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "5WgvLKGhQM6NfEghAZDhnQ==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "create": "system.keys",
+      "idIndex": {
+       "v": {
+        "$numberInt": "2"
+       },
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 10
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789551"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d74ffffdfcb",
+    "record_id": {
+     "$numberLong": "7710036620732268555"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132789"
+     },
+     {
+      "$numberInt": "11"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "config.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "iFR5IEO5Tcu0ebCDbGZU5A==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "createIndexes": "analyzeShardKeySplitPoints",
+      "v": {
+       "$numberInt": "2"
+      },
+      "key": {
+       "expireAt": {
+        "$numberInt": "1"
+       }
+      },
+      "name": "AnalyzeShardKeySplitPointsTTLIndex",
+      "expireAfterSeconds": {
+       "$numberInt": "0"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 11
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789541"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d74ffffdfcc",
+    "record_id": {
+     "$numberLong": "7710036620732268556"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132789"
+     },
+     {
+      "$numberInt": "12"
+     }
+    ],
+    "doc": {
+     "op": "i",
+     "ns": "admin.system.keys",
+     "ui": {
+      "$binary": {
+       "base64": "5WgvLKGhQM6NfEghAZDhnQ==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "_id": {
+       "$numberLong": "7710036620732268550"
+      },
+      "purpose": "HMAC",
+      "key": {
+       "$binary": {
+        "base64": "aTZNd1CdLNYyJhxVwFOCZlcyd0g=",
+        "subType": "00"
+       }
+      },
+      "expiresAt": {
+       "$timestamp": {
+        "t": 1802908789,
+        "i": 0
+       }
+      }
+     },
+     "o2": {
+      "_id": {
+       "$numberLong": "7710036620732268550"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 12
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789551"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d74ffffdfcd",
+    "record_id": {
+     "$numberLong": "7710036620732268557"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132789"
+     },
+     {
+      "$numberInt": "13"
+     }
+    ],
+    "doc": {
+     "op": "i",
+     "ns": "admin.system.keys",
+     "ui": {
+      "$binary": {
+       "base64": "5WgvLKGhQM6NfEghAZDhnQ==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "_id": {
+       "$numberLong": "7710036620732268551"
+      },
+      "purpose": "HMAC",
+      "key": {
+       "$binary": {
+        "base64": "2eDzVfdnC925qdKIBS9hDnhP2t8=",
+        "subType": "00"
+       }
+      },
+      "expiresAt": {
+       "$timestamp": {
+        "t": 1810684789,
+        "i": 0
+       }
+      }
+     },
+     "o2": {
+      "_id": {
+       "$numberLong": "7710036620732268551"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 13
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789551"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d74ffffdfce",
+    "record_id": {
+     "$numberLong": "7710036620732268558"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132789"
+     },
+     {
+      "$numberInt": "14"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "config.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "GSsk420yT1G5zeTqZSxo4Q==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "create": "sampledQueries",
+      "idIndex": {
+       "v": {
+        "$numberInt": "2"
+       },
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 14
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789584"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d74ffffdfcf",
+    "record_id": {
+     "$numberLong": "7710036620732268559"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132789"
+     },
+     {
+      "$numberInt": "15"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "config.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "GSsk420yT1G5zeTqZSxo4Q==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "createIndexes": "sampledQueries",
+      "v": {
+       "$numberInt": "2"
+      },
+      "key": {
+       "expireAt": {
+        "$numberInt": "1"
+       }
+      },
+      "name": "SampledQueriesTTLIndex",
+      "expireAfterSeconds": {
+       "$numberInt": "0"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 15
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789584"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d74ffffdfd0",
+    "record_id": {
+     "$numberLong": "7710036620732268560"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132789"
+     },
+     {
+      "$numberInt": "16"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "config.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "zCY2DZUpTiCIL574YALhOQ==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "create": "sampledQueriesDiff",
+      "idIndex": {
+       "v": {
+        "$numberInt": "2"
+       },
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 16
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789619"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d74ffffdfd1",
+    "record_id": {
+     "$numberLong": "7710036620732268561"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132789"
+     },
+     {
+      "$numberInt": "17"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "config.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "zCY2DZUpTiCIL574YALhOQ==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "createIndexes": "sampledQueriesDiff",
+      "v": {
+       "$numberInt": "2"
+      },
+      "key": {
+       "expireAt": {
+        "$numberInt": "1"
+       }
+      },
+      "name": "SampledQueriesDiffTTLIndex",
+      "expireAfterSeconds": {
+       "$numberInt": "0"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 17
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789619"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d74ffffdfd2",
+    "record_id": {
+     "$numberLong": "7710036620732268562"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132789"
+     },
+     {
+      "$numberInt": "18"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "app.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "create": "c",
+      "idIndex": {
+       "v": {
+        "$numberInt": "2"
+       },
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 18
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789656"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d74ffffdfd3",
+    "record_id": {
+     "$numberLong": "7710036620732268563"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132789"
+     },
+     {
+      "$numberInt": "19"
+     }
+    ],
+    "doc": {
+     "lsid": {
+      "id": {
+       "$binary": {
+        "base64": "SHvcuMVeSC+Mtci9/mk5pA==",
+        "subType": "04"
+       }
+      },
+      "uid": {
+       "$binary": {
+        "base64": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "subType": "00"
+       }
+      }
+     },
+     "txnNumber": {
+      "$numberLong": "1"
+     },
+     "op": "i",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "_id": {
+       "$numberInt": "1"
+      },
+      "a": {
+       "$numberInt": "1"
+      }
+     },
+     "o2": {
+      "_id": {
+       "$numberInt": "1"
+      }
+     },
+     "stmtId": {
+      "$numberInt": "0"
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132789,
+       "i": 19
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132789874"
+      }
+     },
+     "prevOpTime": {
+      "ts": {
+       "$timestamp": {
+        "t": 0,
+        "i": 0
+       }
+      },
+      "t": {
+       "$numberLong": "-1"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d75ffffdfc1",
+    "record_id": {
+     "$numberLong": "7710036625027235841"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132790"
+     },
+     {
+      "$numberInt": "1"
+     }
+    ],
+    "doc": {
+     "lsid": {
+      "id": {
+       "$binary": {
+        "base64": "SHvcuMVeSC+Mtci9/mk5pA==",
+        "subType": "04"
+       }
+      },
+      "uid": {
+       "$binary": {
+        "base64": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "subType": "00"
+       }
+      }
+     },
+     "txnNumber": {
+      "$numberLong": "2"
+     },
+     "op": "c",
+     "ns": "admin.$cmd",
+     "o": {
+      "applyOps": [
+       {
+        "op": "i",
+        "ns": "app.c",
+        "ui": {
+         "$binary": {
+          "base64": "pYPVTYC0RbicYvhvM17XYg==",
+          "subType": "04"
+         }
+        },
+        "o": {
+         "_id": {
+          "$numberInt": "2"
+         },
+         "a": {
+          "$numberInt": "2"
+         }
+        },
+        "o2": {
+         "_id": {
+          "$numberInt": "2"
+         }
+        },
+        "stmtId": {
+         "$numberInt": "0"
+        }
+       },
+       {
+        "op": "i",
+        "ns": "app.c",
+        "ui": {
+         "$binary": {
+          "base64": "pYPVTYC0RbicYvhvM17XYg==",
+          "subType": "04"
+         }
+        },
+        "o": {
+         "_id": {
+          "$numberInt": "3"
+         },
+         "a": {
+          "$numberInt": "3"
+         }
+        },
+        "o2": {
+         "_id": {
+          "$numberInt": "3"
+         }
+        },
+        "stmtId": {
+         "$numberInt": "1"
+        }
+       },
+       {
+        "op": "i",
+        "ns": "app.c",
+        "ui": {
+         "$binary": {
+          "base64": "pYPVTYC0RbicYvhvM17XYg==",
+          "subType": "04"
+         }
+        },
+        "o": {
+         "_id": {
+          "$numberInt": "4"
+         },
+         "a": {
+          "$numberInt": "4"
+         }
+        },
+        "o2": {
+         "_id": {
+          "$numberInt": "4"
+         }
+        },
+        "stmtId": {
+         "$numberInt": "2"
+        }
+       }
+      ]
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132790,
+       "i": 1
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132790089"
+      }
+     },
+     "prevOpTime": {
+      "ts": {
+       "$timestamp": {
+        "t": 0,
+        "i": 0
+       }
+      },
+      "t": {
+       "$numberLong": "-1"
+      }
+     },
+     "multiOpType": {
+      "$numberInt": "1"
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d75ffffdfc2",
+    "record_id": {
+     "$numberLong": "7710036625027235842"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132790"
+     },
+     {
+      "$numberInt": "2"
+     }
+    ],
+    "doc": {
+     "lsid": {
+      "id": {
+       "$binary": {
+        "base64": "SHvcuMVeSC+Mtci9/mk5pA==",
+        "subType": "04"
+       }
+      },
+      "uid": {
+       "$binary": {
+        "base64": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "subType": "00"
+       }
+      }
+     },
+     "txnNumber": {
+      "$numberLong": "3"
+     },
+     "op": "u",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "$v": {
+       "$numberInt": "2"
+      },
+      "diff": {
+       "u": {
+        "a": {
+         "$numberInt": "10"
+        }
+       }
+      }
+     },
+     "o2": {
+      "_id": {
+       "$numberInt": "1"
+      }
+     },
+     "stmtId": {
+      "$numberInt": "0"
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132790,
+       "i": 2
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132790305"
+      }
+     },
+     "prevOpTime": {
+      "ts": {
+       "$timestamp": {
+        "t": 0,
+        "i": 0
+       }
+      },
+      "t": {
+       "$numberLong": "-1"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d75ffffdfc3",
+    "record_id": {
+     "$numberLong": "7710036625027235843"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132790"
+     },
+     {
+      "$numberInt": "3"
+     }
+    ],
+    "doc": {
+     "op": "u",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "$v": {
+       "$numberInt": "2"
+      },
+      "diff": {
+       "u": {
+        "a": {
+         "$numberInt": "3"
+        }
+       }
+      }
+     },
+     "o2": {
+      "_id": {
+       "$numberInt": "2"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132790,
+       "i": 3
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132790516"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d75ffffdfc4",
+    "record_id": {
+     "$numberLong": "7710036625027235844"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132790"
+     },
+     {
+      "$numberInt": "4"
+     }
+    ],
+    "doc": {
+     "op": "u",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "$v": {
+       "$numberInt": "2"
+      },
+      "diff": {
+       "u": {
+        "a": {
+         "$numberInt": "4"
+        }
+       }
+      }
+     },
+     "o2": {
+      "_id": {
+       "$numberInt": "3"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132790,
+       "i": 4
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132790516"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d75ffffdfc5",
+    "record_id": {
+     "$numberLong": "7710036625027235845"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132790"
+     },
+     {
+      "$numberInt": "5"
+     }
+    ],
+    "doc": {
+     "op": "u",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "$v": {
+       "$numberInt": "2"
+      },
+      "diff": {
+       "u": {
+        "a": {
+         "$numberInt": "5"
+        }
+       }
+      }
+     },
+     "o2": {
+      "_id": {
+       "$numberInt": "4"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132790,
+       "i": 5
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132790516"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d75ffffdfc6",
+    "record_id": {
+     "$numberLong": "7710036625027235846"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132790"
+     },
+     {
+      "$numberInt": "6"
+     }
+    ],
+    "doc": {
+     "lsid": {
+      "id": {
+       "$binary": {
+        "base64": "SHvcuMVeSC+Mtci9/mk5pA==",
+        "subType": "04"
+       }
+      },
+      "uid": {
+       "$binary": {
+        "base64": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "subType": "00"
+       }
+      }
+     },
+     "txnNumber": {
+      "$numberLong": "4"
+     },
+     "op": "u",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "_id": {
+       "$numberInt": "2"
+      },
+      "b": "x"
+     },
+     "o2": {
+      "_id": {
+       "$numberInt": "2"
+      }
+     },
+     "stmtId": {
+      "$numberInt": "0"
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132790,
+       "i": 6
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132790731"
+      }
+     },
+     "prevOpTime": {
+      "ts": {
+       "$timestamp": {
+        "t": 0,
+        "i": 0
+       }
+      },
+      "t": {
+       "$numberLong": "-1"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d75ffffdfc7",
+    "record_id": {
+     "$numberLong": "7710036625027235847"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132790"
+     },
+     {
+      "$numberInt": "7"
+     }
+    ],
+    "doc": {
+     "lsid": {
+      "id": {
+       "$binary": {
+        "base64": "SHvcuMVeSC+Mtci9/mk5pA==",
+        "subType": "04"
+       }
+      },
+      "uid": {
+       "$binary": {
+        "base64": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "subType": "00"
+       }
+      }
+     },
+     "txnNumber": {
+      "$numberLong": "5"
+     },
+     "op": "i",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "_id": {
+       "$numberInt": "9"
+      },
+      "a": {
+       "$numberInt": "9"
+      }
+     },
+     "o2": {
+      "_id": {
+       "$numberInt": "9"
+      }
+     },
+     "stmtId": {
+      "$numberInt": "0"
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132790,
+       "i": 7
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132790950"
+      }
+     },
+     "prevOpTime": {
+      "ts": {
+       "$timestamp": {
+        "t": 0,
+        "i": 0
+       }
+      },
+      "t": {
+       "$numberLong": "-1"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d76ffffdfc1",
+    "record_id": {
+     "$numberLong": "7710036629322203137"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132791"
+     },
+     {
+      "$numberInt": "1"
+     }
+    ],
+    "doc": {
+     "lsid": {
+      "id": {
+       "$binary": {
+        "base64": "SHvcuMVeSC+Mtci9/mk5pA==",
+        "subType": "04"
+       }
+      },
+      "uid": {
+       "$binary": {
+        "base64": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "subType": "00"
+       }
+      }
+     },
+     "txnNumber": {
+      "$numberLong": "6"
+     },
+     "op": "d",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "_id": {
+       "$numberInt": "3"
+      }
+     },
+     "stmtId": {
+      "$numberInt": "0"
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132791,
+       "i": 1
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132791171"
+      }
+     },
+     "prevOpTime": {
+      "ts": {
+       "$timestamp": {
+        "t": 0,
+        "i": 0
+       }
+      },
+      "t": {
+       "$numberLong": "-1"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d76ffffdfc2",
+    "record_id": {
+     "$numberLong": "7710036629322203138"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132791"
+     },
+     {
+      "$numberInt": "2"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "admin.$cmd",
+     "o": {
+      "applyOps": [
+       {
+        "op": "d",
+        "ns": "app.c",
+        "ui": {
+         "$binary": {
+          "base64": "pYPVTYC0RbicYvhvM17XYg==",
+          "subType": "04"
+         }
+        },
+        "o": {
+         "_id": {
+          "$numberInt": "9"
+         }
+        }
+       },
+       {
+        "op": "d",
+        "ns": "app.c",
+        "ui": {
+         "$binary": {
+          "base64": "pYPVTYC0RbicYvhvM17XYg==",
+          "subType": "04"
+         }
+        },
+        "o": {
+         "_id": {
+          "$numberInt": "4"
+         }
+        }
+       }
+      ]
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132791,
+       "i": 2
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132791392"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d76ffffdfc4",
+    "record_id": {
+     "$numberLong": "7710036629322203140"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132791"
+     },
+     {
+      "$numberInt": "4"
+     }
+    ],
+    "doc": {
+     "lsid": {
+      "id": {
+       "$binary": {
+        "base64": "SHvcuMVeSC+Mtci9/mk5pA==",
+        "subType": "04"
+       }
+      },
+      "uid": {
+       "$binary": {
+        "base64": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "subType": "00"
+       }
+      }
+     },
+     "txnNumber": {
+      "$numberLong": "7"
+     },
+     "op": "u",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "$v": {
+       "$numberInt": "2"
+      },
+      "diff": {
+       "i": {
+        "f": {
+         "$numberInt": "1"
+        }
+       }
+      }
+     },
+     "o2": {
+      "_id": {
+       "$numberInt": "1"
+      }
+     },
+     "needsRetryImage": "preImage",
+     "stmtId": {
+      "$numberInt": "0"
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132791,
+       "i": 4
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132791610"
+      }
+     },
+     "prevOpTime": {
+      "ts": {
+       "$timestamp": {
+        "t": 0,
+        "i": 0
+       }
+      },
+      "t": {
+       "$numberLong": "-1"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d76ffffdfc5",
+    "record_id": {
+     "$numberLong": "7710036629322203141"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132791"
+     },
+     {
+      "$numberInt": "5"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "app.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "MCxMGnWURCim18oEkO2/UA==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "create": "d",
+      "idIndex": {
+       "v": {
+        "$numberInt": "2"
+       },
+       "key": {
+        "_id": {
+         "$numberInt": "1"
+        }
+       },
+       "name": "_id_"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132791,
+       "i": 5
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132791859"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d77ffffdfc1",
+    "record_id": {
+     "$numberLong": "7710036633617170433"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132792"
+     },
+     {
+      "$numberInt": "1"
+     }
+    ],
+    "doc": {
+     "lsid": {
+      "id": {
+       "$binary": {
+        "base64": "SHvcuMVeSC+Mtci9/mk5pA==",
+        "subType": "04"
+       }
+      },
+      "uid": {
+       "$binary": {
+        "base64": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "subType": "00"
+       }
+      }
+     },
+     "txnNumber": {
+      "$numberLong": "8"
+     },
+     "op": "c",
+     "ns": "admin.$cmd",
+     "o": {
+      "applyOps": [
+       {
+        "op": "i",
+        "ns": "app.c",
+        "ui": {
+         "$binary": {
+          "base64": "pYPVTYC0RbicYvhvM17XYg==",
+          "subType": "04"
+         }
+        },
+        "o": {
+         "_id": {
+          "$numberInt": "20"
+         }
+        },
+        "o2": {
+         "_id": {
+          "$numberInt": "20"
+         }
+        }
+       },
+       {
+        "op": "u",
+        "ns": "app.c",
+        "ui": {
+         "$binary": {
+          "base64": "pYPVTYC0RbicYvhvM17XYg==",
+          "subType": "04"
+         }
+        },
+        "o": {
+         "$v": {
+          "$numberInt": "2"
+         },
+         "diff": {
+          "i": {
+           "t": {
+            "$numberInt": "1"
+           }
+          }
+         }
+        },
+        "o2": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        }
+       },
+       {
+        "op": "i",
+        "ns": "app.d",
+        "ui": {
+         "$binary": {
+          "base64": "MCxMGnWURCim18oEkO2/UA==",
+          "subType": "04"
+         }
+        },
+        "o": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        },
+        "o2": {
+         "_id": {
+          "$numberInt": "1"
+         }
+        }
+       }
+      ]
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132792,
+       "i": 1
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132792075"
+      }
+     },
+     "prevOpTime": {
+      "ts": {
+       "$timestamp": {
+        "t": 0,
+        "i": 0
+       }
+      },
+      "t": {
+       "$numberLong": "-1"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d77ffffdfc2",
+    "record_id": {
+     "$numberLong": "7710036633617170434"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132792"
+     },
+     {
+      "$numberInt": "2"
+     }
+    ],
+    "doc": {
+     "lsid": {
+      "id": {
+       "$binary": {
+        "base64": "SHvcuMVeSC+Mtci9/mk5pA==",
+        "subType": "04"
+       }
+      },
+      "uid": {
+       "$binary": {
+        "base64": "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
+        "subType": "00"
+       }
+      }
+     },
+     "txnNumber": {
+      "$numberLong": "9"
+     },
+     "op": "i",
+     "ns": "app.c",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "_id": {
+       "$numberInt": "30"
+      }
+     },
+     "o2": {
+      "_id": {
+       "$numberInt": "30"
+      }
+     },
+     "stmtId": {
+      "$numberInt": "0"
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132792,
+       "i": 2
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132792296"
+      }
+     },
+     "prevOpTime": {
+      "ts": {
+       "$timestamp": {
+        "t": 0,
+        "i": 0
+       }
+      },
+      "t": {
+       "$numberLong": "-1"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d77ffffdfc3",
+    "record_id": {
+     "$numberLong": "7710036633617170435"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132792"
+     },
+     {
+      "$numberInt": "3"
+     }
+    ],
+    "doc": {
+     "op": "i",
+     "ns": "config.system.indexBuilds",
+     "ui": {
+      "$binary": {
+       "base64": "xgfvaW8mSuezyhKMGcAeGQ==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "_id": {
+       "$binary": {
+        "base64": "LDfnACiXT6+YQgmd0vS7cA==",
+        "subType": "04"
+       }
+      },
+      "collectionUUID": {
+       "$binary": {
+        "base64": "pYPVTYC0RbicYvhvM17XYg==",
+        "subType": "04"
+       }
+      },
+      "commitQuorum": "votingMembers",
+      "indexNames": [
+       "a_1"
+      ]
+     },
+     "o2": {
+      "_id": {
+       "$binary": {
+        "base64": "LDfnACiXT6+YQgmd0vS7cA==",
+        "subType": "04"
+       }
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132792,
+       "i": 3
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132792517"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d77ffffdfc4",
+    "record_id": {
+     "$numberLong": "7710036633617170436"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132792"
+     },
+     {
+      "$numberInt": "4"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "app.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "startIndexBuild": "c",
+      "indexBuildUUID": {
+       "$binary": {
+        "base64": "LDfnACiXT6+YQgmd0vS7cA==",
+        "subType": "04"
+       }
+      },
+      "indexes": [
+       {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "a": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "a_1"
+       }
+      ]
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132792,
+       "i": 4
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132792517"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d77ffffdfc5",
+    "record_id": {
+     "$numberLong": "7710036633617170437"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132792"
+     },
+     {
+      "$numberInt": "5"
+     }
+    ],
+    "doc": {
+     "op": "u",
+     "ns": "config.system.indexBuilds",
+     "ui": {
+      "$binary": {
+       "base64": "xgfvaW8mSuezyhKMGcAeGQ==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "$v": {
+       "$numberInt": "2"
+      },
+      "diff": {
+       "i": {
+        "commitReadyMembers": [
+         "127.0.0.1:59786"
+        ]
+       }
+      }
+     },
+     "o2": {
+      "_id": {
+       "$binary": {
+        "base64": "LDfnACiXT6+YQgmd0vS7cA==",
+        "subType": "04"
+       }
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132792,
+       "i": 5
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132792637"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d77ffffdfc6",
+    "record_id": {
+     "$numberLong": "7710036633617170438"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132792"
+     },
+     {
+      "$numberInt": "6"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "app.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "commitIndexBuild": "c",
+      "indexBuildUUID": {
+       "$binary": {
+        "base64": "LDfnACiXT6+YQgmd0vS7cA==",
+        "subType": "04"
+       }
+      },
+      "indexes": [
+       {
+        "v": {
+         "$numberInt": "2"
+        },
+        "key": {
+         "a": {
+          "$numberInt": "1"
+         }
+        },
+        "name": "a_1"
+       }
+      ]
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132792,
+       "i": 6
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132792638"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d77ffffdfc7",
+    "record_id": {
+     "$numberLong": "7710036633617170439"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132792"
+     },
+     {
+      "$numberInt": "7"
+     }
+    ],
+    "doc": {
+     "op": "d",
+     "ns": "config.system.indexBuilds",
+     "ui": {
+      "$binary": {
+       "base64": "xgfvaW8mSuezyhKMGcAeGQ==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "_id": {
+       "$binary": {
+        "base64": "LDfnACiXT6+YQgmd0vS7cA==",
+        "subType": "04"
+       }
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132792,
+       "i": 7
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132792638"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d77ffffdfc8",
+    "record_id": {
+     "$numberLong": "7710036633617170440"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132792"
+     },
+     {
+      "$numberInt": "8"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "app.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "collMod": "c",
+      "validator": {
+       "a": {
+        "$exists": true
+       }
+      }
+     },
+     "o2": {
+      "collectionOptions_old": {
+       "uuid": {
+        "$binary": {
+         "base64": "pYPVTYC0RbicYvhvM17XYg==",
+         "subType": "04"
+        }
+       }
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132792,
+       "i": 8
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132792856"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d78ffffdfc1",
+    "record_id": {
+     "$numberLong": "7710036637912137729"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132793"
+     },
+     {
+      "$numberInt": "1"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "app.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "dropIndexes": "c",
+      "index": "a_1"
+     },
+     "o2": {
+      "v": {
+       "$numberInt": "2"
+      },
+      "key": {
+       "a": {
+        "$numberInt": "1"
+       }
+      },
+      "name": "a_1"
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132793,
+       "i": 1
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132793075"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d78ffffdfc2",
+    "record_id": {
+     "$numberLong": "7710036637912137730"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132793"
+     },
+     {
+      "$numberInt": "2"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "app.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "renameCollection": "app.c",
+      "to": "app.c2",
+      "stayTemp": false
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132793,
+       "i": 2
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132793294"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d78ffffdfc3",
+    "record_id": {
+     "$numberLong": "7710036637912137731"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132793"
+     },
+     {
+      "$numberInt": "3"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "app.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "MCxMGnWURCim18oEkO2/UA==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "drop": "d"
+     },
+     "o2": {
+      "numRecords": {
+       "$numberInt": "1"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132793,
+       "i": 3
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132793513"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d78ffffdfc4",
+    "record_id": {
+     "$numberLong": "7710036637912137732"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132793"
+     },
+     {
+      "$numberInt": "4"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "app.$cmd",
+     "ui": {
+      "$binary": {
+       "base64": "pYPVTYC0RbicYvhvM17XYg==",
+       "subType": "04"
+      }
+     },
+     "o": {
+      "drop": "c2"
+     },
+     "o2": {
+      "numRecords": {
+       "$numberInt": "4"
+      }
+     },
+     "ts": {
+      "$timestamp": {
+       "t": 1795132793,
+       "i": 4
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132793730"
+      }
+     }
+    }
+   },
+   {
+    "key_hex": "e86aff8d78ffffdfc5",
+    "record_id": {
+     "$numberLong": "7710036637912137733"
+    },
+    "ts": [
+     {
+      "$numberInt": "1795132793"
+     },
+     {
+      "$numberInt": "5"
+     }
+    ],
+    "doc": {
+     "op": "c",
+     "ns": "app.$cmd",
+     "o": {
+      "dropDatabase": {
+       "$numberInt": "1"
+      }
+     },
+     "fromMigrate": false,
+     "ts": {
+      "$timestamp": {
+       "t": 1795132793,
+       "i": 5
+      }
+     },
+     "t": {
+      "$numberLong": "1"
+     },
+     "v": {
+      "$numberLong": "2"
+     },
+     "wall": {
+      "$date": {
+       "$numberLong": "1795132793743"
+      }
+     }
+    }
+   }
+  ]
+ }
+}

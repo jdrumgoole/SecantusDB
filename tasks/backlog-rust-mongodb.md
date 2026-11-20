@@ -3008,14 +3008,20 @@ produce the dump it exists for.
 
 ## Found while working the storage model (2026-11-19)
 
-- [ ] **RM-610's regression test measures wall time, and failed once on CI.**
+- [ ] **RM-610's regression test measures wall time, and fails on Linux CI
+      about one run in two since storage-model phase 4a-4b.**
       `tests/backlog/test_rm_found_2026_11_13_contested_reads.py::test_a_contested_find_and_write_of_one_cost_what_they_return`
-      compares how a contested `updateOne`'s time grows from 10,000 to
-      100,000 documents against mongod's (within 3x). On PR #2918's CI (the
-      Linux debug build) this server's `updateOne` grew past 3x; the rerun
-      passed, and locally it is flat (17.0 ms against 16.9 ms, 0 failures in
-      6 runs under eight CPU burners). A checkpoint landing in the timed
-      window is the likely cause, not shown. The test should compare what
+      compares how a contested `find` with a limit and a contested
+      `updateOne` grow in time from 10,000 to 100,000 documents against
+      mongod's (within 3x). On the Linux debug build it failed on PR #2918,
+      on `main` after it (a70d23e2, the `find` this time) and on PR #2920
+      twice (the `updateOne`); it passed on every rerun, on #2920's last
+      commit included. Locally it is flat: 16-17 ms at both sizes, 4 runs of
+      3 on 2026-11-20, and 0 failures in 6 runs under eight CPU burners. It
+      does not fail on one operation, so a checkpoint or eviction landing in
+      the timed window is the likely cause, not shown. Since 2026-11-20 a
+      failure's message carries both servers' milliseconds at both sizes:
+      read those before changing anything. The test should compare what
       each server examines (`explain`'s `totalKeysExamined` /
       `totalDocsExamined` at both sizes), which is mongod's own measure of
       the cost and does not move with the machine.
