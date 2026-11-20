@@ -81,6 +81,9 @@ fn data_nonlogged_option_engages_and_reopen_keeps_mode() {
             &StorageOptions {
                 data_nonlogged: Some(true),
                 checkpoint_seconds: Some(3600), // cadence far away; anchor manually
+                // The oplog that recovers unlogged data is logged (RM-731),
+                // whatever the async CI lane's SECANTUS_OPLOG_NONLOGGED says.
+                oplog_nonlogged: Some(false),
                 ..StorageOptions::default()
             },
         )
@@ -100,10 +103,18 @@ fn data_nonlogged_option_engages_and_reopen_keeps_mode() {
         drop(st);
     }
     {
-        // Reopen with NO options: the recorded mode must win and the data
-        // must be intact (clean close in the nonlogged mode).
-        let st =
-            Storage::open_with_options(home.to_str().unwrap(), &StorageOptions::default()).unwrap();
+        // Reopen with NO data-mode option: the recorded mode must win and the
+        // data must be intact (clean close in the nonlogged mode). The oplog
+        // mode is named only so the async lane's SECANTUS_OPLOG_NONLOGGED does
+        // not ask for the refused combination (RM-731).
+        let st = Storage::open_with_options(
+            home.to_str().unwrap(),
+            &StorageOptions {
+                oplog_nonlogged: Some(false),
+                ..StorageOptions::default()
+            },
+        )
+        .unwrap();
         let docs = st.scan_collection("app", "c").unwrap();
         assert_eq!(docs.len(), 10);
         assert!(
@@ -152,6 +163,70 @@ fn oplog_open_seq_covers_acked_writes_in_async_mode() {
             rows[199].0
         );
         drop(st);
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// RM-731: a non-logged oplog on a store whose data tables are not logged
+/// leaves nothing in WiredTiger's log, and a crash loses every write since
+/// the last checkpoint. Refused, on a new store before WiredTiger writes a
+/// file of it, and on an existing one from its recorded mode; allowed where
+/// the data tables are logged.
+#[test]
+fn a_non_logged_oplog_needs_logged_data_tables() {
+    let refused = |home: &PathBuf, data_nonlogged: Option<bool>| match Storage::open_with_options(
+        home.to_str().unwrap(),
+        &StorageOptions {
+            data_nonlogged,
+            oplog_nonlogged: Some(true),
+            ..StorageOptions::default()
+        },
+    ) {
+        Ok(_) => panic!("a non-logged oplog opened over unlogged data"),
+        Err(e) => format!("{e:?}"),
+    };
+    // A new store: refused before WiredTiger creates anything.
+    let home = temp_home();
+    let msg = refused(&home, Some(true));
+    assert!(msg.contains("--data-logged"), "{msg}");
+    assert!(!home.join("WiredTiger.wt").exists());
+    let _ = std::fs::remove_dir_all(&home);
+
+    // An existing unlogged store: refused from its recorded mode, even with
+    // no data-mode option asked for.
+    let home = temp_home();
+    {
+        let st = Storage::open_with_options(
+            home.to_str().unwrap(),
+            &StorageOptions {
+                data_nonlogged: Some(true),
+                oplog_nonlogged: Some(false),
+                ..StorageOptions::default()
+            },
+        )
+        .unwrap();
+        insert_row(&st, "app", "c", 1);
+        st.flush_oplog();
+        st.stable_checkpoint().unwrap();
+    }
+    let msg = refused(&home, None);
+    assert!(msg.contains("--data-logged"), "{msg}");
+    let _ = std::fs::remove_dir_all(&home);
+
+    // Logged data tables: the documented stack opens and serves.
+    let home = temp_home();
+    {
+        let st = Storage::open_with_options(
+            home.to_str().unwrap(),
+            &StorageOptions {
+                data_nonlogged: Some(false),
+                oplog_nonlogged: Some(true),
+                ..StorageOptions::default()
+            },
+        )
+        .unwrap();
+        insert_row(&st, "app", "c", 1);
+        assert_eq!(st.scan_collection("app", "c").unwrap().len(), 1);
     }
     let _ = std::fs::remove_dir_all(&home);
 }

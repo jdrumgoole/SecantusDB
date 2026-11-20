@@ -548,8 +548,10 @@ OPTIONS:
                                  SECANTUS_OPLOG_ASYNC)
     --oplog-nonlogged            Create oplog tables log=(enabled=false) —
                                  checkpoint-durable only. Measurement/ephemeral
-                                 use; a crash can lose the oplog tail (default:
-                                 off, or SECANTUS_OPLOG_NONLOGGED)
+                                 use; a crash can lose the oplog tail. Needs
+                                 --data-logged: refused on the default store,
+                                 whose data is recovered from the oplog
+                                 (default: off, or SECANTUS_OPLOG_NONLOGGED)
     --data-nonlogged             mongod's split: WAL-log only the oplog; data
                                  tables recover by oplog replay from the last
                                  stable checkpoint, and keep the history a

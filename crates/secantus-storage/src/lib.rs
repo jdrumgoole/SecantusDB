@@ -1808,8 +1808,30 @@ fn oplog_shard_name(shard: i64) -> String {
 /// the oplog's share of WAL bandwidth, the dominant write-path cost under
 /// concurrent load (`tasks/rust-perf-findings.md` Finding 5). Applies at table
 /// CREATE time — an existing store keeps whatever its tables were created with.
+///
+/// Only on a store whose data tables are logged: see
+/// [`unlogged_oplog_refused`].
 fn oplog_tables_nonlogged() -> bool {
     std::env::var_os("SECANTUS_OPLOG_NONLOGGED").is_some()
+}
+
+/// The refusal of a non-logged oplog on a store whose data tables are not
+/// logged either (RM-731). Such a store recovers its data by replaying the
+/// oplog from WiredTiger's log; with the oplog out of the log too, nothing is
+/// logged at all, and a hard crash loses every write since the last
+/// checkpoint, `j: true` acknowledged or not (measured 2026-11-20: 2000 of
+/// 2000 acknowledged inserts gone after SIGKILL). mongod's oplog is always
+/// journaled, so there is no mode of mongod's to model; the combination is
+/// refused rather than allowed to acknowledge writes it cannot keep.
+fn unlogged_oplog_refused() -> StorageError {
+    StorageError::Internal(
+        "a non-logged oplog (--oplog-nonlogged / oplog_nonlogged / \
+         SECANTUS_OPLOG_NONLOGGED) needs a store whose data tables are logged \
+         (--data-logged / data_nonlogged=False): this store's data tables are \
+         not logged, so they are recovered from the oplog, and a crash would \
+         lose every write since the last checkpoint"
+            .to_string(),
+    )
 }
 
 /// Phase A' (`SECANTUS_DATA_NONLOGGED=1`): create the DATA tables (doc
@@ -8358,6 +8380,11 @@ impl Storage {
             .unwrap_or_else(|| std::env::var_os("SECANTUS_OPLOG_ASYNC").is_some());
         let in_memory = config.contains("in_memory=true");
         let new_store = in_memory || !std::path::Path::new(home).join("WiredTiger.wt").exists();
+        // A new store is refused before WiredTiger writes a file of it; an
+        // existing one once its recorded mode is read, below (RM-731).
+        if new_store && !in_memory && oplog_nonlogged && data_create_mode {
+            return Err(unlogged_oplog_refused());
+        }
         // mongod's layout (tasks/mongod-storage-model-plan.md): check the
         // store's format and lay out a new one BEFORE WiredTiger opens it,
         // which would refuse an earlier layout's files with a bare EACCES;
@@ -8384,6 +8411,9 @@ impl Storage {
             let session = conn.open_session()?;
             stored_data_logging(&session)?
         };
+        if !in_memory && oplog_nonlogged && stored_mode.unwrap_or(data_create_mode) {
+            return Err(unlogged_oplog_refused());
+        }
         let mut state = {
             let boot = conn.open_session()?;
             for (name, fmt) in BOOTSTRAP {

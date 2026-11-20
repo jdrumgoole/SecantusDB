@@ -145,9 +145,14 @@ exception is `data_nonlogged`, which is on unless set to `False`, as
 `secantusd-mdb` creates its stores: data tables that are not logged keep the
 history a snapshot read at a past time (`readConcern: {level: "snapshot",
 atClusterTime: ...}`) reads, which WiredTiger keeps for no logged table. A
-store created with `data_nonlogged=False` refuses such a read (246). It
-also keeps the synchronous oplog, whatever `oplog_async` says: its writes
-carry their oplog timestamps. The table-config modes (`oplog_nonlogged`,
+store created with `data_nonlogged=False` refuses such a read (246).
+A store whose data tables are not logged (the default) keeps the
+synchronous oplog, whatever `oplog_async` says: its writes carry their oplog
+timestamps. It also refuses `oplog_nonlogged=True`, because its data is
+recovered by replaying the logged oplog; with the oplog out of the log too,
+a crash would lose every write since the last checkpoint (RM-731). The
+async + non-logged oplog stack is `data_nonlogged=False, oplog_async=True,
+oplog_nonlogged=True`. The table-config modes (`oplog_nonlogged`,
 `data_nonlogged`) are create-time-sticky: they shape fresh stores, and an
 existing store keeps the mode it was created with (`data_nonlogged` is
 recorded in the store and always wins on reopen).
