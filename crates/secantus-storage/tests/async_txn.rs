@@ -102,11 +102,12 @@ fn committed_txn_entries_land_exactly_once_after_commit() {
             .iter()
             .map(|(_, b)| decode(b).get_str("op").unwrap().to_string())
             .collect();
-        // The collection's creation, then the transaction: one `applyOps`
-        // entry holding the two inserts, each exactly once.
-        assert_eq!(ops, vec!["c", "c"], "the creation and one entry");
+        // One entry: the transaction's `applyOps`, which holds the
+        // collection's creation (made inside it) and the two inserts, each
+        // exactly once.
+        assert_eq!(ops, vec!["c"], "one entry");
         let rows = st.read_oplog(1, 100).unwrap();
-        let txn = decode(&rows[1].1);
+        let txn = decode(&rows[0].1);
         let inner: Vec<String> = txn
             .get_document("o")
             .unwrap()
@@ -117,8 +118,8 @@ fn committed_txn_entries_land_exactly_once_after_commit() {
             .collect();
         assert_eq!(
             inner,
-            vec!["i", "i"],
-            "exactly the two inserts, exactly once"
+            vec!["c", "i", "i"],
+            "the creation and the two inserts"
         );
     });
 }

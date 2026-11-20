@@ -215,6 +215,10 @@ fn a_kill_before_the_first_checkpoint_keeps_the_oplog_and_replays_it() {
         for i in 0..20 {
             st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
         }
+        // An index built over them: logged as a two-phase build, and brought
+        // back by replaying its `commitIndexBuild`.
+        st.create_index("app", "c", "a_1", &doc! {"_id": 1}, &Document::new())
+            .unwrap();
         std::fs::write(format!("{home}.uri"), st.oplog_table()).unwrap();
         // The journal on disk, as the flusher puts it; then the process ends
         // with no close and no checkpoint.
@@ -240,6 +244,17 @@ fn a_kill_before_the_first_checkpoint_keeps_the_oplog_and_replays_it() {
         20,
         "every acknowledged write came back"
     );
+    assert!(
+        st.list_indexes("app", "c")
+            .unwrap()
+            .iter()
+            .any(|ix| ix.get_str("name") == Ok("a_1")),
+        "the replayed build's index"
+    );
+    assert!(st
+        .find_matching("config", "system.indexBuilds", &doc! {})
+        .unwrap()
+        .is_empty());
     // The catalog names it again, with the uuid the store recorded.
     let entry = st.mdb_catalog_entry("local", "oplog.rs").unwrap().unwrap();
     assert_eq!(
@@ -317,5 +332,157 @@ fn a_transaction_over_the_entry_limit_is_a_partial_txn_chain() {
             .map(|e| secantus_storage::oplog_entry::unwind(e).len())
             .sum();
         assert_eq!(unwound, 20);
+    });
+}
+
+fn ops_of(rows: &[(i64, Vec<u8>)]) -> Vec<(String, String)> {
+    rows.iter()
+        .map(|(_, b)| {
+            let e: Document = bson::from_slice(b).unwrap();
+            let o = e.get_document("o").unwrap();
+            let first = o.keys().next().cloned().unwrap_or_default();
+            (
+                e.get_str("op").unwrap().to_string(),
+                format!("{} {}", e.get_str("ns").unwrap(), first),
+            )
+        })
+        .collect()
+}
+
+/// An index on a collection that has documents is built in two phases, as
+/// mongod logs it (the fixture's `createIndexes` step): the build's row into
+/// `config.system.indexBuilds`, `startIndexBuild`, the row updated,
+/// `commitIndexBuild`, the row deleted. The collection is a real one.
+#[test]
+fn an_index_build_is_logged_in_two_phases() {
+    with_db(|st| {
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "a": 1}))
+            .unwrap();
+        let before = st.oplog_tail_seq();
+        st.create_index("app", "c", "a_1", &doc! {"a": 1}, &Document::new())
+            .unwrap();
+        let rows = st.read_oplog(before + 1, 100).unwrap();
+        assert_eq!(
+            ops_of(&rows),
+            vec![
+                ("i".to_string(), "config.system.indexBuilds _id".to_string()),
+                ("c".to_string(), "app.$cmd startIndexBuild".to_string()),
+                ("u".to_string(), "config.system.indexBuilds $v".to_string()),
+                ("c".to_string(), "app.$cmd commitIndexBuild".to_string()),
+                ("d".to_string(), "config.system.indexBuilds _id".to_string()),
+            ]
+        );
+        assert!(st
+            .collection_exists("config", "system.indexBuilds")
+            .unwrap());
+        assert!(st
+            .find_matching("config", "system.indexBuilds", &doc! {})
+            .unwrap()
+            .is_empty());
+        // The build's row says which members are ready to commit.
+        let update: Document = bson::from_slice(&rows[2].1).unwrap();
+        assert!(update
+            .get_document("o")
+            .unwrap()
+            .get_document("diff")
+            .unwrap()
+            .get_document("i")
+            .unwrap()
+            .contains_key("commitReadyMembers"));
+        // The same entries read as the one `createIndexes` they were.
+        let commit: Document = bson::from_slice(&rows[3].1).unwrap();
+        let unwound = secantus_storage::oplog_entry::unwind(&commit);
+        assert_eq!(
+            unwound[0]
+                .get_document("o")
+                .unwrap()
+                .get_str("createIndexes"),
+            Ok("c")
+        );
+    });
+}
+
+/// An index on an empty collection is one `createIndexes` entry (measured).
+#[test]
+fn an_index_on_an_empty_collection_is_one_entry() {
+    with_db(|st| {
+        st.create_collection("app", "e").unwrap();
+        let before = st.oplog_tail_seq();
+        st.create_index("app", "e", "a_1", &doc! {"a": 1}, &Document::new())
+            .unwrap();
+        let rows = st.read_oplog(before + 1, 100).unwrap();
+        assert_eq!(
+            ops_of(&rows),
+            vec![("c".to_string(), "app.$cmd createIndexes".to_string())]
+        );
+        let e: Document = bson::from_slice(&rows[0].1).unwrap();
+        let o = e.get_document("o").unwrap();
+        assert_eq!(
+            o.keys().collect::<Vec<_>>(),
+            ["createIndexes", "v", "key", "name"]
+        );
+    });
+}
+
+/// A collection a transaction creates is logged as a member of its `applyOps`,
+/// beside the insert (measured 8.2.11, the fixture's transaction steps).
+#[test]
+fn a_collection_a_transaction_creates_is_a_member_of_its_apply_ops() {
+    with_db(|st| {
+        let before = st.oplog_tail_seq();
+        let mut txn = st.begin_user_transaction().unwrap();
+        st.with_user_transaction(&mut txn, || {
+            st.create_collection("app", "t1").unwrap();
+            st.insert_one("app", "t1", &enc(&doc! {"_id": 1})).unwrap();
+        })
+        .unwrap();
+        st.commit_user_transaction(&mut txn).unwrap();
+        let rows = st.read_oplog(before + 1, 100).unwrap();
+        assert_eq!(rows.len(), 1, "{:?}", ops_of(&rows));
+        let e: Document = bson::from_slice(&rows[0].1).unwrap();
+        let members: Vec<(String, String)> = e
+            .get_document("o")
+            .unwrap()
+            .get_array("applyOps")
+            .unwrap()
+            .iter()
+            .map(|m| {
+                let m = m.as_document().unwrap();
+                (
+                    m.get_str("op").unwrap().into(),
+                    m.get_str("ns").unwrap().into(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            members,
+            vec![
+                ("c".to_string(), "app.$cmd".to_string()),
+                ("i".to_string(), "app.t1".to_string())
+            ]
+        );
+    });
+}
+
+/// A database or collection name that is not UTF-8 is held escaped inside the
+/// server and logged as the bytes it stands for, as mongod logs it (RM-222);
+/// the engine's readers get it escaped again.
+#[test]
+fn a_name_that_is_not_utf8_is_logged_as_its_bytes() {
+    with_db(|st| {
+        let name = secantus_core::bsondoc::escape_key(b"c\xff");
+        let before = st.oplog_tail_seq();
+        st.insert_one("u8", &name, &enc(&doc! {"_id": 1})).unwrap();
+        let rows = st.read_oplog(before + 1, 100).unwrap();
+        let blob = &rows.last().unwrap().1;
+        assert!(
+            blob.windows(5).any(|w| w == b"u8.c\xff"),
+            "the entry names the collection by its bytes"
+        );
+        assert!(!blob.contains(&0u8) || !blob.windows(2).any(|w| w == b"c\0"));
+        // The engine reads it escaped.
+        let entry = secantus_core::bsondoc::from_bytes(blob).unwrap();
+        let op = &secantus_storage::oplog_entry::unwind(&entry)[0];
+        assert_eq!(op.get_str("ns").unwrap(), format!("u8.{name}"));
     });
 }

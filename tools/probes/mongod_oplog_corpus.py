@@ -110,6 +110,27 @@ def steps(client: MongoClient) -> list[tuple[str, object]]:
     step("dropIndexes", lambda: db.c.drop_index("a_1"))
     step("rename", lambda: db.c.rename("c2"))
     step("drop", lambda: db.d.drop())
+
+    def txn_explicit_create() -> None:
+        with client.start_session() as s:
+            s.with_transaction(
+                lambda sess: (
+                    db.create_collection("t1", session=sess),
+                    db.t1.insert_one({"_id": 1}, session=sess),
+                )
+            )
+
+    def txn_implicit_create() -> None:
+        with client.start_session() as s:
+            s.with_transaction(lambda sess: db.t2.insert_one({"_id": 1}, session=sess))
+
+    def empty_index() -> None:
+        db.create_collection("e")
+        db.e.create_index("a", name="a_1")
+
+    step("createIndexes on an empty collection", empty_index)
+    step("transaction (create a collection, insert into it)", txn_explicit_create)
+    step("transaction (insert into a collection that does not exist)", txn_implicit_create)
     step("dropDatabase", lambda: client.drop_database("app"))
     return out
 

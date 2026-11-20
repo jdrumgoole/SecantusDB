@@ -33,6 +33,10 @@ usual message.
   and image in mongod's fields, and `find` on `local.oplog.rs` returns what is
   stored. Change-stream events of one transaction have their own resume tokens
   (`txnOpIndex`), and a stream resumes from any of them.
+- An index on a collection that has documents is logged as mongod logs a two-phase build
+  (`config.system.indexBuilds` insert, `startIndexBuild`, update, `commitIndexBuild`, delete); on an
+  empty collection, as the one `createIndexes`. A collection a transaction creates is a member of
+  its `applyOps`, beside the insert.
 - A prepared transaction (PostgreSQL's `PREPARE TRANSACTION`) is logged in
   mongod's prepare form: an `applyOps` with `prepare: true`, then
   `commitTransaction` or `abortTransaction` linked to it by `prevOpTime`. A

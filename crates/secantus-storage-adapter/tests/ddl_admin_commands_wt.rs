@@ -698,7 +698,9 @@ fn sessions_collection_makes_config_a_database() {
             .clone();
         assert_eq!(config.get_bool("empty"), Ok(false));
         c.db_name = "config".to_string();
-        assert_eq!(names(c), ["system.sessions"]);
+        // Beside it `config.system.indexBuilds`, which the sessions index's
+        // build makes (mongod has it from its start).
+        assert_eq!(names(c), ["system.indexBuilds", "system.sessions"]);
         let ix = dispatch_full(&doc! { "listIndexes": "system.sessions" }, c);
         let batch = ix
             .get_document("cursor")

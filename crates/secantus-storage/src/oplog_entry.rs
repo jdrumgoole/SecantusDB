@@ -120,8 +120,40 @@ fn add_session(op: &mut Document, entry: &Document, element: Option<&Document>) 
     }
 }
 
+/// A name the oplog holds as the bytes mongod holds -- a database or
+/// collection name that is not UTF-8 -- as the engine holds it: escaped
+/// (`secantus_core::bsondoc::escape_key`).
+fn escape_name(v: &mut Bson) {
+    if let Some(bytes) = secantus_core::bsondoc::as_invalid_utf8(v) {
+        *v = Bson::String(secantus_core::bsondoc::escape_key(bytes));
+    }
+}
+
+/// [`escape_name`] for the names of an operation: `ns`, and, in a command,
+/// the collection it names and a rename's `to`.
+fn escape_names(op: &mut Document) {
+    if let Some(v) = op.get_mut("ns") {
+        escape_name(v);
+    }
+    if op.get_str("op") != Ok("c") {
+        return;
+    }
+    let Some(Bson::Document(o)) = op.get_mut("o") else {
+        return;
+    };
+    if let Some(first) = o.keys().next().cloned() {
+        if let Some(v) = o.get_mut(&first) {
+            escape_name(v);
+        }
+    }
+    if let Some(v) = o.get_mut("to") {
+        escape_name(v);
+    }
+}
+
 /// An operation in the shape the engine reads: see [`unwind`].
 fn normalise(op: &mut Document) {
+    escape_names(op);
     match op.get_str("op") {
         Ok("u") => {
             let Some(Bson::Document(o)) = op.get("o") else {
@@ -162,6 +194,22 @@ fn normalise_command(op: &mut Document) {
     let Some(Bson::Document(o)) = op.get("o").cloned() else {
         return;
     };
+    // A two-phase index build: mongod logs `startIndexBuild`, then
+    // `commitIndexBuild` once the index is ready, and replay builds it at the
+    // commit. The engine reads the commit as the one `createIndexes` it was,
+    // and the start as nothing.
+    if o.contains_key("startIndexBuild") {
+        op.insert("op", "n");
+        op.insert("o", bson::doc! {"msg": "startIndexBuild"});
+        return;
+    }
+    if let (Ok(coll), Ok(indexes)) = (o.get_str("commitIndexBuild"), o.get_array("indexes")) {
+        op.insert(
+            "o",
+            bson::doc! {"createIndexes": coll, "indexes": indexes.clone()},
+        );
+        return;
+    }
     if let Ok(coll) = o.get_str("createIndexes") {
         if !o.contains_key("indexes") {
             let mut spec = Document::new();

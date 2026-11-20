@@ -644,12 +644,23 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
      each with `prevOpTime` the prepare entry. "Already committed" is the
      presence of that commit entry.
    - DDL: `dropDatabase` has `fromMigrate: false`; `create`, `collMod`,
-     `dropIndexes`, `rename`, `drop` and a one-index `createIndexes` were
-     already in the measured shapes. **Not done: two-phase index builds** --
-     the `config.system.indexBuilds` insert, `startIndexBuild`, its update,
-     `commitIndexBuild` and its delete; the corpus test names the step.
-     Names that are not UTF-8 are stored as mongod stores them and not
-     re-escaped for the engine's readers.
+     `dropIndexes`, `rename` and `drop` were already in the measured shapes.
+     **An index on a collection that has documents is a two-phase build**, as
+     measured: the build's row inserted into `config.system.indexBuilds`,
+     `startIndexBuild`, the row updated with `commitReadyMembers`,
+     `commitIndexBuild`, the row deleted -- five entries, the rows real writes
+     to a real collection made before the first index is (unlogged, as mongod
+     has it from its start). An index on an **empty** collection is the one
+     `createIndexes` entry (probed 8.2.11, 2026-11-21). Replay reads the commit
+     as the `createIndexes` it was and the start as nothing. **DDL inside a
+     transaction** (probed 8.2.11: an explicit `create`, and the implicit one
+     of an insert into a new collection) is a member of the transaction's
+     `applyOps`, `{op: "c", ns: "app.$cmd", ui, o: {create, idIndex}}` before
+     the insert; here a transaction's DDL entries are stamped with its session
+     like its writes and grouped the same way. A name that is not UTF-8 is
+     logged as its bytes (also on the plain-insert fast path, which now leaves
+     an escaped name to the builder) and escaped again for the engine's readers
+     (`oplog_entry::unwind`).
 
    **Landing:** 4b-1 to 4b-3 cannot land apart (the table, what is in it
    and every reader of it), so they land together as store format 5, with

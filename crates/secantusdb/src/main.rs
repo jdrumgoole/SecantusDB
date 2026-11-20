@@ -242,6 +242,9 @@ fn run(cli: CliArgs) -> Result<(), String> {
     let mut running = bind(&addr, cli.server_config(), adapter, cursors)
         .map_err(|e| format!("failed to bind {addr}: {e}"))?;
 
+    // Where this member is, for an index build's `commitReadyMembers`.
+    storage.set_member_host(&running.address().to_string());
+
     // Background maintenance threads observe this flag and exit promptly (they
     // sleep in small increments) once shutdown is signalled.
     let shutdown = Arc::new(AtomicBool::new(false));

@@ -1442,7 +1442,9 @@ fn with_retryable_session(
 
 /// The session and transaction number a transaction's write carries.
 fn txn_of(entry: &Document) -> Option<(Document, i64)> {
-    if !matches!(entry.get_str("op"), Ok("i" | "u" | "d")) {
+    // A command too: mongod logs a collection a transaction creates (or any
+    // DDL it does) as a member of its `applyOps`.
+    if !matches!(entry.get_str("op"), Ok("i" | "u" | "d" | "c")) {
         return None;
     }
     Some((
@@ -5268,6 +5270,10 @@ pub struct Storage {
     cache_bytes: u64,
     /// The WiredTiger URI of `local.oplog.rs`'s table (`table:collection-<UUID>`).
     oplog_uri: String,
+    /// This member's host and port as the replica set names it
+    /// (`commitReadyMembers` of an index build's `config.system.indexBuilds`
+    /// row); the server sets it once it has bound.
+    member_host: Mutex<String>,
     /// The time of the last entry logged for each retryable write's session
     /// and transaction number: the `prevOpTime` of the next one. A key it
     /// does not hold is read from the session's `config.transactions` row.
@@ -7732,6 +7738,7 @@ impl Storage {
             txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
             cache_bytes: parse_cache_bytes(config),
             oplog_uri,
+            member_host: Mutex::new("127.0.0.1:27017".to_string()),
             retry_chains: Mutex::new(HashMap::new()),
             ttl: TtlMonitor::default(),
             enable_oplog: true,
@@ -15363,6 +15370,9 @@ impl Storage {
     ) -> Result<bool> {
         // Planner writes made here are released once they are visible.
         let _planner = PlannerScope::new();
+        if name != ID_INDEX_NAME && (db, coll) != ("config", "system.indexBuilds") {
+            self.ensure_index_builds_collection()?;
+        }
         // It writes the index catalog.
         note_planner_write_of(db, coll);
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -15867,16 +15877,117 @@ impl Storage {
                     idx.insert(k.clone(), v.clone());
                 }
             }
+            self.log_index_build(session, db, coll, &ui, oplog_index_spec(&idx))?;
+        }
+        Ok(())
+    }
+
+    /// mongod keeps `config.system.indexBuilds` from its start; here it is
+    /// made before the first index is, unlogged. Not under the DDL locks,
+    /// which making a collection takes.
+    fn ensure_index_builds_collection(&self) -> Result<()> {
+        if self.enable_oplog
+            && ACTIVE_TXN_SESSION.with(|c| c.get()).is_null()
+            && !self.collection_exists("config", "system.indexBuilds")?
+        {
+            // Outside any transaction the index is being made in: the
+            // collection is not part of it, and mongod's was there before it.
+            let _unlogged = unreplicated();
+            self.outside_user_transaction(|| {
+                self.create_collection("config", "system.indexBuilds")
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Say where this member is for an index build's `commitReadyMembers`.
+    pub fn set_member_host(&self, host: &str) {
+        *self.member_host.lock().unwrap_or_else(|e| e.into_inner()) = host.to_string();
+    }
+
+    /// Log a built index as mongod logs a two-phase build (measured 8.2.11,
+    /// `tests/fixtures/storage_model/mongod-8.2.11-oplog.json`): the build's
+    /// row inserted into `config.system.indexBuilds`, `startIndexBuild`, the
+    /// row updated with the members ready to commit, `commitIndexBuild`, the
+    /// row deleted. The rows are real writes to a real collection, as
+    /// mongod's are. `spec` is the index as the oplog names it.
+    fn log_index_build(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        ui: &[u8],
+        spec: Document,
+    ) -> Result<()> {
+        const BUILDS: (&str, &str) = ("config", "system.indexBuilds");
+        // An index on an empty collection is built at once and logged as the
+        // one `createIndexes` (measured 8.2.11): there is no build to start.
+        // (mongod allows an index inside a transaction only on a collection
+        // the transaction made, so there is no build there either; and a
+        // transaction could not write `config.system.indexBuilds` were it
+        // made after its snapshot.)
+        if self.sizes.get(db, coll).records == 0 || !ACTIVE_TXN_SESSION.with(|c| c.get()).is_null()
+        {
             let mut o = Document::new();
             o.insert("createIndexes", coll);
-            o.insert("indexes", Bson::Array(vec![Bson::Document(idx)]));
+            o.insert("indexes", Bson::Array(vec![Bson::Document(spec)]));
             let mut entry = Document::new();
             entry.insert("op", "c");
             entry.insert("ns", format!("{db}.$cmd"));
-            entry.insert("ui", uuid_binary(&ui));
+            entry.insert("ui", uuid_binary(ui));
             entry.insert("o", Bson::Document(o));
             self.emit_oplog(session, vec![entry], vec![None])?;
+            return Ok(());
         }
+        let build = uuid_binary(&new_uuid_bytes());
+        let name = spec.get_str("name").unwrap_or("").to_string();
+        let row = bson::doc! {
+            "_id": build.clone(),
+            "collectionUUID": uuid_binary(ui),
+            "commitQuorum": "votingMembers",
+            "indexNames": [name],
+        };
+        self.insert(BUILDS.0, BUILDS.1, vec![encode_doc(&row)?], true)?;
+        let command = |key: &str| {
+            let mut o = Document::new();
+            o.insert(key, coll);
+            o.insert("indexBuildUUID", build.clone());
+            o.insert("indexes", Bson::Array(vec![Bson::Document(spec.clone())]));
+            let mut entry = Document::new();
+            entry.insert("op", "c");
+            entry.insert("ns", format!("{db}.$cmd"));
+            entry.insert("ui", uuid_binary(ui));
+            entry.insert("o", Bson::Document(o));
+            entry
+        };
+        self.emit_oplog(session, vec![command("startIndexBuild")], vec![None])?;
+        let member = self
+            .member_host
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        self.update_matching(
+            BUILDS.0,
+            BUILDS.1,
+            &bson::doc! {"_id": build.clone()},
+            &bson::doc! {"$set": {"commitReadyMembers": [member]}},
+            false,
+            false,
+            &[],
+            &Document::new(),
+            None,
+            None,
+            false,
+        )?;
+        self.emit_oplog(session, vec![command("commitIndexBuild")], vec![None])?;
+        self.delete_matching(
+            BUILDS.0,
+            BUILDS.1,
+            &bson::doc! {"_id": build},
+            0,
+            &Document::new(),
+            None,
+        )?;
         Ok(())
     }
 
@@ -24560,7 +24671,14 @@ fn raw_is_plain_insert(buf: &bson::RawDocumentBuf) -> bool {
         let Ok((key, value)) = el else { return false };
         match key {
             "op" => is_insert = matches!(value, bson::RawBsonRef::String("i")),
-            "ns" | "ui" | "o" | "o2" => {}
+            // A name that holds a NUL is an escaped one: logged as the bytes
+            // it stands for, by the builder.
+            "ns" => {
+                if matches!(value, bson::RawBsonRef::String(s) if s.contains('\0')) {
+                    return false;
+                }
+            }
+            "ui" | "o" | "o2" => {}
             _ => return false,
         }
     }
@@ -24596,7 +24714,7 @@ fn oplog_entry_group(e: &OplogEntry) -> Option<EntryGroup> {
         OplogEntry::Raw(buf) => {
             if buf
                 .get_str("op")
-                .is_ok_and(|op| matches!(op, "i" | "u" | "d"))
+                .is_ok_and(|op| matches!(op, "i" | "u" | "d" | "c"))
             {
                 if let (Ok(lsid), Ok(txn)) = (buf.get_document("lsid"), buf.get_i64("txnNumber")) {
                     return Some(EntryGroup::Txn(lsid.as_bytes().to_vec(), txn));
@@ -24971,7 +25089,7 @@ fn stamp_retryable(entries: Vec<OplogEntry>) -> Vec<OplogEntry> {
 fn stamp_oplog_session(entry: OplogEntry, lsid: &Document, txn: i64) -> Result<OplogEntry> {
     Ok(match entry {
         OplogEntry::Doc(mut d) => {
-            if matches!(d.get_str("op"), Ok("i" | "u" | "d")) {
+            if matches!(d.get_str("op"), Ok("i" | "u" | "d" | "c")) {
                 d.insert("lsid", Bson::Document(lsid.clone()));
                 d.insert("txnNumber", txn);
             }
@@ -24980,7 +25098,7 @@ fn stamp_oplog_session(entry: OplogEntry, lsid: &Document, txn: i64) -> Result<O
         OplogEntry::Raw(mut buf) => {
             if buf
                 .get_str("op")
-                .is_ok_and(|op| matches!(op, "i" | "u" | "d"))
+                .is_ok_and(|op| matches!(op, "i" | "u" | "d" | "c"))
             {
                 let lsid_raw = secantus_core::bsondoc::to_raw(lsid)
                     .map_err(|e| StorageError::Bson(e.to_string()))?;

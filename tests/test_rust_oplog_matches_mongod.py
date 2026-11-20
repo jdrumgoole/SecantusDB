@@ -1,7 +1,7 @@
 """`secantusd-mdb` logs what mongod 8.2.11 logs, field for field.
 
 Phase 4b of ``tasks/mongod-storage-model-plan.md``: ``local.oplog.rs`` holds
-mongod's entries. ``tools/probes/mongod_oplog_corpus.py`` ran 19 operations on
+mongod's entries. ``tools/probes/mongod_oplog_corpus.py`` ran 22 operations on
 a one-member mongod 8.2.11 replica set and recorded the entries each wrote
 (``tests/fixtures/storage_model/mongod-8.2.11-oplog.json``); this runs the same
 operations against the standalone binary and holds what ``find`` on
@@ -11,7 +11,8 @@ inside ``o``, the same field names. The values that differ run to run -- the
 timestamps, the wall clock, the UUIDs, the session -- are the only ones not
 compared, and they are compared by type.
 
-Steps not held to the fixture are listed in ``_NOT_YET`` with what is lost.
+Steps not held to the fixture would be listed in ``_NOT_YET`` with what is lost;
+none is.
 """
 
 from __future__ import annotations
@@ -54,15 +55,9 @@ pytestmark = [
     pytest.mark.skipif(sys.platform == "win32", reason="POSIX only"),
 ]
 
-#: Steps whose entries are not yet mongod's, and what that loses. Each is one
-#: backlog item; this file holds every other step to the fixture.
-_NOT_YET = {
-    "createIndexes": (
-        "mongod builds an index in two phases: an insert into config.system.indexBuilds, "
-        "startIndexBuild, an update of that row, commitIndexBuild and a delete of it (five "
-        "entries); this server logs the one createIndexes entry"
-    ),
-}
+#: Steps whose entries are not yet mongod's, and what that loses. None: every
+#: step of the corpus is held to the fixture.
+_NOT_YET: dict[str, str] = {}
 
 
 def _corpus() -> Any:
