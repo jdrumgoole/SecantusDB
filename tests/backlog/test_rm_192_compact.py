@@ -30,7 +30,7 @@ from bson.codec_options import CodecOptions
 from bson.raw_bson import RawBSONDocument
 from pymongo.errors import PyMongoError
 
-from tests.backlog.conftest import _RS_BANNER, RS_BINARY, drain_output
+from tests.backlog.conftest import _RS_BANNER, RS_BINARY, drain_output, rust_mongo_server
 from tests.backlog.test_rm_057_084 import mongod_rs  # noqa: F401 - fixture
 
 _RAW = CodecOptions(document_class=RawBSONDocument)
@@ -332,13 +332,22 @@ def _gives_back(client: Any) -> dict:
 
 @pytest.mark.backlog_fixed("RM-192")
 def test_compact_gives_a_mostly_deleted_collections_space_back(
-    rust_mongo: Any,
+    tmp_path: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
     """20,000 documents of 2 KB, 90% deleted: mongod 8.2.11 gives back about
     36 MB (the default target is 20 MB), estimates 0 on a dry run, and frees
-    nothing above the target; a second compact has little left."""
-    assert _gives_back(rust_mongo) == _gives_back(mongod_rs)
+    nothing above the target; a second compact has little left.
+
+    The Rust side gets a server of its own. On the module's shared one, the
+    large files this leaves made a later `autoCompact` pass run for 40 s or
+    more, and WiredTiger 11.2 cannot interrupt it (RM-317), so the
+    `autoCompact` tests, which assume small files, failed whenever
+    pytest-randomly ran this first: 2 of 2 in that order, on the build
+    before phase 4b as well."""
+    with rust_mongo_server(tmp_path / "store") as rust:
+        ours = _gives_back(rust)
+    assert ours == _gives_back(mongod_rs)
 
 
 # ------------------------------------------------------------- --repair --
