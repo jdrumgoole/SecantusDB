@@ -330,8 +330,15 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 set_option(&mut cmd_line, &["config"], v.clone().into());
                 config_path = Some(PathBuf::from(v));
             }
-            "--host" => {
-                let v = take_value("--host")?;
+            // `--bind_ip` is mongod's spelling. This server binds one
+            // address, so a list mongod would take is refused by name.
+            "--host" | "--bind_ip" => {
+                let v = take_value(flag)?;
+                if flag == "--bind_ip" && v.contains(',') {
+                    return Err(format!(
+                        "--bind_ip takes one address here (secantusd-mdb binds one), got {v:?}"
+                    ));
+                }
                 set_option(&mut cmd_line, &["net", "bindIp"], v.clone().into());
                 o.host = Some(v);
             }
@@ -347,8 +354,9 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                     bson::Bson::Int32(i32::from(o.port.unwrap_or_default())),
                 );
             }
-            "--storage-path" => {
-                let v = take_value("--storage-path")?;
+            // `--dbpath` is mongod's spelling.
+            "--storage-path" | "--dbpath" => {
+                let v = take_value(flag)?;
                 set_option(&mut cmd_line, &["storage", "dbPath"], v.clone().into());
                 o.storage_path = Some(v);
             }
@@ -494,6 +502,12 @@ defaults.
 
 USAGE:
     secantusd-mdb [OPTIONS]
+    secantusd-mdb service install|uninstall|status [...]
+                                 Run the server as a background service for
+                                 this user (launchd on macOS, systemd on
+                                 Linux); see secantusd-mdb service --help
+    secantusd-mdb restore [...]  Point-in-time recovery; see
+                                 secantusd-mdb restore --help
 
 OPTIONS:
     --config PATH                Path to a secantusd.toml config file. When
@@ -502,12 +516,14 @@ OPTIONS:
                                  /etc/secantus/secantusd.toml (and the legacy
                                  secantusdb.toml at each). Passing this flag
                                  disables auto-discovery.
-    --host HOST                  Bind address (default: 127.0.0.1)
+    --host HOST                  Bind address (default: 127.0.0.1); also
+                                 --bind_ip, mongod's spelling (one address)
     --port PORT                  Bind port; 0 picks an ephemeral port and
                                  prints it on startup (default: 27017)
     --storage-path PATH          WiredTiger home directory; created if missing,
                                  reopened intact across restarts
-                                 (default: ./secantus-data)
+                                 (default: ./secantus-data); also --dbpath,
+                                 mongod's spelling
     --log-level LEVEL            One of DEBUG/INFO/WARNING/ERROR (default: INFO)
     --auth                       Require SCRAM-SHA-256 authentication for
                                  non-handshake commands
@@ -637,6 +653,28 @@ mod tests {
                 "storage": {"dbPath": "D"},
             }
         );
+    }
+
+    #[test]
+    fn mongods_dbpath_and_bind_ip_spellings() {
+        let a = run(&["--dbpath", "/d", "--bind_ip=127.0.0.2"]);
+        assert_eq!(a.storage_path, "/d");
+        assert_eq!(a.host, "127.0.0.2");
+        let pr = match parse(&["--dbpath=/d", "--bind_ip", "127.0.0.2"]).unwrap() {
+            Parsed::Run(pr) => pr,
+            other => panic!("expected Run, got {other:?}"),
+        };
+        // Reported under the same mongod paths as --storage-path / --host.
+        assert_eq!(
+            pr.cmd_line,
+            bson::doc! {"net": {"bindIp": "127.0.0.2"}, "storage": {"dbPath": "/d"}}
+        );
+        // One address: a list mongod would bind is refused by name.
+        let err = parse(&["--bind_ip", "127.0.0.1,::1"]).unwrap_err();
+        assert!(err.contains("--bind_ip takes one address"), "{err}");
+        assert!(parse(&["--dbpath"])
+            .unwrap_err()
+            .contains("--dbpath requires a value"));
     }
 
     /// Parse into a [`ParsedRun`], then resolve with no TOML file so the result

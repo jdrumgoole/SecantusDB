@@ -16,9 +16,9 @@ Both `--flag value` and `--flag=value` spellings work.
 | Flag | Meaning | Default |
 | --- | --- | --- |
 | `--config PATH` | Explicit `secantusd.toml` (see below) | auto-discovered |
-| `--host HOST` | Bind address | `127.0.0.1` |
+| `--host HOST` | Bind address; also `--bind_ip`, mongod's spelling (one address) | `127.0.0.1` |
 | `--port N` | TCP port (`0` = OS-assigned) | `27017` |
-| `--storage-path PATH` | WiredTiger home directory (created if absent) | `./secantus-data` |
+| `--storage-path PATH` | WiredTiger home directory (created if absent); also `--dbpath`, mongod's spelling | `./secantus-data` |
 | `--log-level LEVEL` | `DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` |
 | `--cache-size SIZE` | WiredTiger cache, unit-suffixed (`256M`, `1G`, `8G`) | `4G` |
 | `--session-max N` | Max concurrent WiredTiger sessions (≈ client connections) | `1000` |
@@ -42,6 +42,47 @@ Both `--flag value` and `--flag=value` spellings work.
 TLS pairing rules are enforced: setting one of `cert-file` / `key-file`
 without the other is a startup error, and the client-cert flags are only
 meaningful with server TLS configured. See [Security](security.md).
+
+## Running it as a service
+
+`secantusd-mdb service install` runs the server in the background for your
+user, started at login, under the operating system's own service manager:
+a launchd LaunchAgent on macOS, a systemd user unit on Linux. That is how
+mongod's packages run mongod too; the server itself stays a foreground
+process, and the service manager stops it with SIGTERM, so WiredTiger
+closes cleanly.
+
+```bash
+secantusd-mdb service install --port 27017      # start it, now and at every login
+secantusd-mdb service status                     # running? listening where?
+secantusd-mdb service uninstall                  # stop it; keeps the data
+```
+
+`install` copies the binary it was run as to `~/.secantus/bin`, so the
+service keeps working after the virtualenv or download it came from is
+gone, writes the service file, starts the service and waits until the
+server says it is listening. The options after `install` are the server's
+own (any flag in the table above); without `--storage-path` or `--dbpath`
+the store is `~/.secantus/data`, and `~/.secantus/secantusd.toml` is read
+as usual. Running `install` again replaces the service (a new binary, new
+options) and keeps the data. `--dry-run` prints the service file and the
+commands without doing anything.
+
+| What | Where |
+| --- | --- |
+| The binary the service runs | `~/.secantus/bin/secantusd-mdb` |
+| The store (default) | `~/.secantus/data` |
+| The server's output | `~/.secantus/secantusd-mdb.log` |
+| The service file (macOS) | `~/Library/LaunchAgents/com.secantusdb.secantusd-mdb.plist` |
+| The service file (Linux) | `~/.config/systemd/user/secantusd-mdb.service` |
+
+As with mongod's own unit and Homebrew's plist, the service does **not**
+restart a server that exits: a database that stopped on an error stays
+down where its log can be read. The service raises the open-file limit to
+64000 (mongod's packaged value; launchd's default is 256) and allows 90
+seconds for a clean stop. `status` exits 0 when the service is running and
+3 when it is not. On Linux a user service stops at logout unless lingering
+is on (`loginctl enable-linger $USER`). Windows is not supported yet.
 
 ## Slow operations
 

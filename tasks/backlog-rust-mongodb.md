@@ -57,6 +57,22 @@ These work end-to-end but cut corners.
   `docs/indexes.md` "Per-index collation".
   Backlog-ID: RM-003
   Verify: none -- storage-internal COLLSCAN (performance); results, order and explain executionStats under numericOrdering already match mongod
+- [ ] **`--bind_ip` with more than one address is refused.** mongod 8.2.11
+  binds every address in `--bind_ip 127.0.0.1,::1` (without `--ipv6` it
+  binds 127.0.0.1, warns "Found no addresses for peer" for ::1 and serves;
+  measured 2026-11-20). `secantusd-mdb` binds one address, so a list is
+  refused at parse time by name ("--bind_ip takes one address here"). The
+  fix is a listener per address in `secantus_server::bind`.
+  Backlog-ID: RM-729
+  Verify: tests/backlog/test_rm_found_2026_11_20_bind_ip.py::test_a_bind_ip_list_serves_as_mongod_serves_it
+- [ ] **`secantusd-mdb service install` has no Windows support.** On macOS
+  it writes a launchd LaunchAgent and on Linux a systemd user unit; on
+  Windows it refuses ("supports launchd (macOS) and systemd (Linux)"). A
+  Windows service needs the Service Control Manager: the binary answering
+  its start / stop control requests (the `windows-service` crate) or a
+  wrapper, registered with `sc.exe create`.
+  Backlog-ID: RM-730
+  Verify: none -- needs the Windows Service Control Manager, and no backlog lane runs on Windows
 
 ## 3. Deferred work (skipped from a slice, ready to come back)
 
