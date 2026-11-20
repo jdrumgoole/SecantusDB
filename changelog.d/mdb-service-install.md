@@ -21,8 +21,9 @@ under `~/.secantus`. The server also takes mongod's spellings `--dbpath` and
 - Like mongod's packaged unit and Homebrew's mongod plist, the service does
   not restart a server that exits, raises the open-file limit to 64000
   (launchd's default is 256, too few for a store with a table per
-  collection and per index), and allows 90 seconds for a clean stop
-  (launchd's default is 20).
+  collection and per index), and gives the server time to close cleanly
+  before it is killed: 60 seconds under launchd (the most it allows; its
+  default for an agent is 5) and 90 under systemd.
 - `--dbpath` and `--bind_ip`, mongod's names for `--storage-path` and
   `--host`, reported by `getCmdLineOpts` under the same paths. `--bind_ip`
   takes one address: a list, which mongod binds, is refused by name.

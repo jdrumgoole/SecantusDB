@@ -42,10 +42,15 @@ pub const SYSTEMD_UNIT: &str = "secantusd-mdb.service";
 /// Homebrew's mongod plist both set 64000. launchd's own default is 256, too
 /// few for a store with a table per collection and per index.
 pub const OPEN_FILES: u32 = 64000;
-/// Seconds the service manager waits for a clean stop before SIGKILL:
-/// systemd's default. launchd's own default is 20, which a large final
-/// checkpoint can outlast.
-pub const STOP_TIMEOUT_SECS: u32 = 90;
+/// Seconds launchd waits for a clean stop before SIGKILL. Its default for
+/// a user agent is 5 (measured 2026-11-20: an agent without `ExitTimeOut`
+/// prints `exit timeout = 5`), too short for a final checkpoint, and it caps
+/// `ExitTimeOut` at 60 (Homebrew's postgresql@15 plist asks for 120 and
+/// `launchctl print` reports 60), so 60 is the most there is.
+pub const LAUNCHD_STOP_SECS: u32 = 60;
+/// Seconds systemd waits for a clean stop before SIGKILL: its own default,
+/// written out so the unit says it.
+pub const SYSTEMD_STOP_SECS: u32 = 90;
 /// How long `install` waits for the server to report it is listening.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// The line the server prints once it accepts connections.
@@ -209,7 +214,7 @@ pub fn launchd_plist(layout: &Layout, args: &[String]) -> String {
     <key>StandardErrorPath</key>
     <string>{log}</string>
     <key>ExitTimeOut</key>
-    <integer>{STOP_TIMEOUT_SECS}</integer>
+    <integer>{LAUNCHD_STOP_SECS}</integer>
     <key>HardResourceLimits</key>
     <dict>
         <key>NumberOfFiles</key>
@@ -277,7 +282,7 @@ WorkingDirectory={root}
 StandardOutput=append:{log}
 StandardError=append:{log}
 KillSignal=SIGTERM
-TimeoutStopSec={STOP_TIMEOUT_SECS}
+TimeoutStopSec={SYSTEMD_STOP_SECS}
 LimitNOFILE={OPEN_FILES}
 
 [Install]
@@ -402,6 +407,10 @@ pub enum Step {
     /// Run a command; `may_fail` when failing only means there was nothing
     /// to stop.
     Run { argv: Vec<String>, may_fail: bool },
+    /// Wait until launchd no longer knows `target`: `launchctl bootout`
+    /// returns while the job is still stopping, and a `bootstrap` of the
+    /// same label before it is gone fails with `5: Input/output error`.
+    WaitUnloaded(String),
 }
 
 impl std::fmt::Display for Step {
@@ -414,6 +423,12 @@ impl std::fmt::Display for Step {
             }
             Step::Remove(p) => write!(f, "rm -f {}", p.display()),
             Step::Run { argv, .. } => write!(f, "{}", argv.join(" ")),
+            Step::WaitUnloaded(target) => {
+                write!(
+                    f,
+                    "wait until `launchctl print {target}` no longer finds it"
+                )
+            }
         }
     }
 }
@@ -468,6 +483,7 @@ pub fn install_steps(
             let plist = layout.service_file.to_string_lossy().into_owned();
             // An installed service is stopped first: install replaces it.
             steps.push(run_argv(&["launchctl", "bootout", &target], true));
+            steps.push(Step::WaitUnloaded(target.clone()));
             steps.push(Step::Write {
                 path: layout.service_file.clone(),
                 contents: launchd_plist(layout, args),
@@ -504,6 +520,7 @@ pub fn uninstall_steps(manager: Manager, layout: &Layout, uid: &str) -> Vec<Step
         Manager::Launchd => {
             let target = format!("{}/{LAUNCHD_LABEL}", launchd_domain(uid));
             steps.push(run_argv(&["launchctl", "bootout", &target], true));
+            steps.push(Step::WaitUnloaded(target.clone()));
             steps.push(Step::Remove(layout.service_file.clone()));
         }
         Manager::Systemd => {
@@ -588,6 +605,27 @@ fn execute(step: &Step) -> Result<(), String> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(format!("removing {}: {e}", p.display())),
         },
+        Step::WaitUnloaded(target) => {
+            // launchd sends SIGTERM and allows the job LAUNCHD_STOP_SECS to
+            // close before SIGKILL; wait that long and a margin.
+            let deadline = Instant::now() + Duration::from_secs(u64::from(LAUNCHD_STOP_SECS) + 15);
+            loop {
+                let found = Command::new("launchctl")
+                    .args(["print", target])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map_err(|e| format!("running launchctl: {e}"))?
+                    .success();
+                if !found {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!("launchd still has {target} after it was stopped"));
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
         Step::Run { argv, may_fail } => {
             let out = Command::new(&argv[0])
                 .args(&argv[1..])
@@ -741,7 +779,15 @@ pub fn parse_launchd_state(out: &str) -> State {
     let mut running = false;
     let mut pid = None;
     for line in out.lines() {
-        let line = line.trim();
+        // The service's own properties are indented one tab; nested blocks
+        // (its endpoints, sockets) carry `state = active` lines of their own
+        // two tabs in, which are not the service's state.
+        let Some(line) = line.strip_prefix('\t') else {
+            continue;
+        };
+        if line.starts_with('\t') {
+            continue;
+        }
         if let Some(v) = line.strip_prefix("state = ") {
             running = v.trim() == "running";
         } else if let Some(v) = line.strip_prefix("pid = ") {
@@ -935,7 +981,7 @@ mod tests {
         assert!(p.contains("<string>/a&amp;b</string>"));
         assert!(p.contains("<key>KeepAlive</key>\n    <false/>"));
         assert!(p.contains("<key>RunAtLoad</key>\n    <true/>"));
-        assert!(p.contains("<key>ExitTimeOut</key>\n    <integer>90</integer>"));
+        assert!(p.contains("<key>ExitTimeOut</key>\n    <integer>60</integer>"));
         assert_eq!(p.matches("<integer>64000</integer>").count(), 2);
         assert_eq!(
             p.matches("<string>/Users/ada/.secantus/secantusd-mdb.log</string>")
@@ -993,6 +1039,26 @@ mod tests {
                 "launchctl bootstrap gui/501 /Users/ada/Library/LaunchAgents/com.secantusdb.secantusd-mdb.plist",
             ]
         );
+        // The old job is gone before the new one is bootstrapped: a bootstrap
+        // of a label still stopping fails with `5: Input/output error`.
+        let order: Vec<usize> = [
+            |s: &Step| matches!(s, Step::Run { argv, .. } if argv[1] == "bootout"),
+            |s: &Step| matches!(s, Step::WaitUnloaded(_)),
+            |s: &Step| matches!(s, Step::Write { .. }),
+            |s: &Step| matches!(s, Step::Run { argv, .. } if argv[1] == "bootstrap"),
+        ]
+        .iter()
+        .map(|f| steps.iter().position(f).expect("step present"))
+        .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+        assert!(steps.contains(&Step::WaitUnloaded(
+            "gui/501/com.secantusdb.secantusd-mdb".to_string()
+        )));
+        assert!(
+            uninstall_steps(Manager::Launchd, &l, "501").contains(&Step::WaitUnloaded(
+                "gui/501/com.secantusdb.secantusd-mdb".to_string()
+            ))
+        );
         // Installing from the installed binary copies nothing.
         let again = install_steps(Manager::Launchd, &l, &l.binary.clone(), &args, "501");
         assert!(!again.iter().any(|s| matches!(s, Step::CopyBinary { .. })));
@@ -1022,6 +1088,21 @@ mod tests {
             State {
                 running: false,
                 pid: None
+            }
+        );
+        // `launchctl print` as macOS 26 writes it: nested blocks carry their
+        // own `state = active` after the service's, which must not win.
+        let s = parse_launchd_state(
+            "gui/501/com.secantusdb.secantusd-mdb = {\n\tactive count = 1\n\
+             \tstate = running\n\texit timeout = 60\n\tpid = 14405\n\
+             \tendpoints = {\n\t\t\"x\" = {\n\t\t\tstate = active\n\t\t}\n\t}\n\
+             \tevent channels = {\n\t\tstate = active\n\t}\n}\n",
+        );
+        assert_eq!(
+            s,
+            State {
+                running: true,
+                pid: Some(14405)
             }
         );
         let s = parse_systemd_state("MainPID=77\nActiveState=active\n");

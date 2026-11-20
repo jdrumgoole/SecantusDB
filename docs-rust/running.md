@@ -79,8 +79,9 @@ commands without doing anything.
 As with mongod's own unit and Homebrew's plist, the service does **not**
 restart a server that exits: a database that stopped on an error stays
 down where its log can be read. The service raises the open-file limit to
-64000 (mongod's packaged value; launchd's default is 256) and allows 90
-seconds for a clean stop. `status` exits 0 when the service is running and
+64000 (mongod's packaged value; launchd's default is 256) and gives the
+server time to close cleanly before it is killed: 60 seconds under launchd
+(the most launchd allows; its default is 5) and 90 under systemd. `status` exits 0 when the service is running and
 3 when it is not. On Linux a user service stops at logout unless lingering
 is on (`loginctl enable-linger $USER`). Windows is not supported yet.
 
