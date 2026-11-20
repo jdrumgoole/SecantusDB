@@ -14,7 +14,7 @@ import shutil
 from pathlib import Path
 
 import pytest
-from bench.concurrency import assemble_results
+from bench.concurrency import assemble_results, parse_mongod_version, parse_rust_version
 from bench.concurrency_chart import (
     DEFAULT_RESULTS,
     DOCS_MD,
@@ -60,26 +60,30 @@ def test_scaling_ratios() -> None:
 
 
 def test_render_viz_structure(results: dict) -> None:
-    # Neither surface draws the deprecated Python series, even when the
-    # results carry it.
-    for style, prefix, lines in [("website", "viz", 3), ("docs", "dv", 3)]:
+    # Neither surface draws the deprecated Python series or the withdrawn
+    # async stack (RM-731), even when the results carry them.
+    for style, prefix, lines in [("website", "viz", 2), ("docs", "dv", 2)]:
         svg = render_viz(results, style)
         assert svg.count("<path ") == lines
         assert svg.count("<circle ") == 4 * lines
-        assert svg.count('stroke-dasharray="6 4"') == 1
+        assert 'stroke-dasharray="6 4"' not in svg
+        assert "async" not in svg
         assert svg.count(f'class="{prefix}-val"') == lines
-        # the 1x reference line plus 2x/3x/4x gridlines for this data
-        assert f'class="{prefix}-ref"' in svg
-        assert svg.count(f'class="{prefix}-grid"') == 3
+        # Absolute docs/s on a zero-based axis: gridlines at 0, 200k, 400k
+        # and 600k for this data, no ratio scale.
+        assert svg.count(f'class="{prefix}-grid"') == 4
+        assert ">200k<" in svg and ">600k<" in svg and ">docs/s<" in svg
+        assert f'class="{prefix}-x"' not in svg
+        assert "mongod 481k" in svg and "Rust 96.4k" in svg
 
 
 def test_render_viz_tooltips(results: dict) -> None:
     website = render_viz(results, "website")
-    assert 'data-tip="mongod — 2 writers: 1.92x its 1-writer rate"' in website
+    assert 'data-tip="mongod — 2 writers: 203,300 docs/s"' in website
     assert "Python" not in website
     assert "<title>" not in website
     docs = render_viz(results, "docs")
-    assert "<title>Rust server — 8 writers: 2.72x its single-writer rate</title>" in docs
+    assert "<title>Rust server — 8 writers: 96,400 docs/s</title>" in docs
     assert "data-tip" not in docs
     assert "Python" not in docs
 
@@ -92,10 +96,12 @@ def test_render_viz_singular_writer_phrase(results: dict) -> None:
 
 def test_render_tables(results: dict) -> None:
     website = render_website_table(results)
-    row = "<tr><th>1</th><td>105,700</td><td>35,400</td><td>50,400</td></tr>"
+    row = "<tr><th>1</th><td>105,700</td><td>35,400</td></tr>"
     assert row in website
+    assert "async" not in website
     docs = render_docs_table(results)
-    assert "| 8 | 96,400 | 119,200 | 481,000 |" in docs
+    assert "| 8 | 96,400 | 481,000 |" in docs
+    assert "async" not in docs
     assert "Python" not in docs
 
 
@@ -169,3 +175,29 @@ def test_assemble_results_medians() -> None:
     assert payload["meta"]["writers"] == [1, 2]
     assert payload["servers"]["python"]["docs_per_sec"] == [20.0, 6.0]
     assert payload["servers"]["python"]["runs_docs_per_sec"][0] == [10.0, 30.0, 20.0]
+
+
+def test_results_name_the_builds_they_measured() -> None:
+    """The 2026-11-18 file recorded no version of either server; a run now
+    names each build, the host and the date."""
+    assert parse_rust_version(["secantusd-mdb 0.5.3-beta.199", "tree: abc123"]) == {
+        "version": "0.5.3-beta.199",
+        "tree": "abc123",
+    }
+    assert parse_rust_version([]) == {"version": "unknown"}
+    assert parse_mongod_version(["db version v8.0.38", "Build Info: {"]) == {"version": "8.0.38"}
+    assert parse_mongod_version(["nonsense"]) == {"version": "unknown"}
+    payload = assemble_results(
+        writers_list=[1],
+        duration=5.0,
+        batch=100,
+        shared_collection=False,
+        runs=1,
+        runs_rates={"rust": [[10.0]]},
+        versions={"rust": {"version": "0.5.3-beta.199", "tree": "abc123"}},
+        host={"machine": "x86_64", "cpus": 8},
+        generated="2026-11-20",
+    )
+    assert payload["meta"]["versions"]["rust"]["tree"] == "abc123"
+    assert payload["meta"]["host"]["cpus"] == 8
+    assert payload["meta"]["generated"] == "2026-11-20"

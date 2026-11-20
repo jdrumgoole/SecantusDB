@@ -1,7 +1,7 @@
 """Regenerate the concurrency scaling graphs from benchmark results.
 
-Reads the JSON written by ``bench.concurrency --json`` (servers rust,
-rust-async and mongod; a python entry from an older run is ignored) and
+Reads the JSON written by ``bench.concurrency --json`` (servers rust and
+mongod; a python or rust-async entry is kept in the file but not drawn) and
 rewrites the
 marker-delimited chart + data-table blocks in the two surfaces that
 show the N-writer scaling story:
@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -41,17 +42,22 @@ VIZ_END = "<!-- concurrency-viz:end -->"
 TABLE_BEGIN = "<!-- concurrency-table:begin -->"
 TABLE_END = "<!-- concurrency-table:end -->"
 
-# Draw order matches the hand-authored original: solid lines first,
-# the dashed async variant on top.
+# Draw order matches the hand-authored original.
 # The deprecated Python server is not drawn on either surface (Joe,
 # 2026-11-17 for the site, 2026-11-18 for the docs).
-DRAW_ORDER = ["mongod", "rust", "rust-async"]
+# Nor is the "async stack" (`rust-async`) any more (Joe, 2026-11-20): the run
+# of 2026-11-18 used --oplog-async --oplog-nonlogged on a store whose data
+# tables are not logged, where the drainer is not used and nothing reaches
+# WiredTiger's log -- a crash lost every acknowledged write (RM-731). Its
+# numbers stay in the results file as a record; it is drawn again only once
+# re-measured on logged data tables, as bench/concurrency.py now runs it.
+DRAW_ORDER = ["mongod", "rust"]
 REQUIRED_SERVERS = frozenset(DRAW_ORDER)
 
 # Chart geometry (identical to the original hand-authored SVG).
 X0, X1 = 56.0, 668.0
-Y_REF = 214.0  # the 1x reference line
-Y_TOP = 21.0  # highest allowed data point
+Y_ZERO = 270.0  # 0 docs/s, just above the x-axis ticks at 290
+Y_TOP = 36.0  # highest gridline: room above it for the "docs/s" axis heading
 Y_BOTTOM = 250.0  # lowest allowed data point (x-axis ticks sit at 290)
 LABEL_X = 674
 LABEL_MIN_GAP = 14.0
@@ -86,7 +92,7 @@ STYLES = {
         },
         "rate_phrase": "its 1-writer rate",
         "tooltip": "data-tip",
-        "aria": "Throughput scaling relative to each server’s own single-writer rate",
+        "aria": "Write throughput in documents per second as concurrent writers are added",
     },
     "docs": {
         "prefix": "dv",
@@ -117,7 +123,7 @@ STYLES = {
         },
         "rate_phrase": "its single-writer rate",
         "tooltip": "title",
-        "aria": "Throughput scaling relative to each server single-writer rate",
+        "aria": "Write throughput in documents per second as concurrent writers are added",
     },
 }
 
@@ -129,15 +135,23 @@ def scaling_ratios(rates: list[float]) -> list[float]:
     return [r / base for r in rates]
 
 
-def _y_scale(all_ratios: list[float]) -> float:
-    """Pixels per 1.0x of scaling, fitted so every point stays on-chart."""
-    max_r, min_r = max(all_ratios), min(all_ratios)
-    scale = 120.0
-    if max_r > 1:
-        scale = min(scale, (Y_REF - Y_TOP) / (max_r - 1))
-    if min_r < 1:
-        scale = min(scale, (Y_BOTTOM - Y_REF) / (1 - min_r))
-    return scale
+def _nice_step(top: float, lines: int = 4) -> float:
+    """A round gridline step (1, 2, 2.5 or 5 times a power of ten) giving
+    about ``lines`` gridlines up to ``top``."""
+    raw = top / lines
+    mag = 10 ** math.floor(math.log10(raw))
+    for m in (1, 2, 2.5, 5, 10):
+        if m * mag >= raw:
+            return m * mag
+    return 10 * mag
+
+
+def _k(rate: float, digits: int = 1) -> str:
+    """``19713`` -> ``19.7k``; a whole thousand loses its decimal."""
+    s = f"{rate / 1000:.{digits}f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return f"{s}k"
 
 
 def _nudge_labels(entries: list[tuple[str, float]]) -> dict[str, float]:
@@ -155,55 +169,54 @@ def _nudge_labels(entries: list[tuple[str, float]]) -> dict[str, float]:
 
 
 def render_viz(results: dict, style_name: str) -> str:
+    """Write throughput, documents per second, against concurrent writers:
+    absolute rates, so the two servers compare at a glance (Joe,
+    2026-11-20: a chart of each server against its own one-writer rate,
+    labelled 3.4x and 2.6x, read as meaningless)."""
     st = STYLES[style_name]
     p = st["prefix"]
     writers: list[int] = results["meta"]["writers"]
     series = [s for s in DRAW_ORDER if s in st["series"]]
     rates = {s: results["servers"][s]["docs_per_sec"] for s in series}
-    ratios = {s: scaling_ratios(rates[s]) for s in series}
+    for s in series:
+        if any(r <= 0 for r in rates[s]):
+            raise ValueError(f"{s}: every rate must be positive, got {rates[s]}")
 
     span = max(writers) - min(writers)
     if span <= 0:
         raise ValueError("need at least two writer counts to draw a scaling chart")
     xs = [X0 + (n - min(writers)) / span * (X1 - X0) for n in writers]
-    scale = _y_scale([r for rs in ratios.values() for r in rs])
+    peak = max(r for rs in rates.values() for r in rs)
+    step = _nice_step(peak)
+    top = math.ceil(peak / step) * step
 
-    def y(ratio: float) -> float:
-        return Y_REF - (ratio - 1) * scale
+    def y(rate: float) -> float:
+        return Y_ZERO - rate / top * (Y_ZERO - Y_TOP)
 
     parts: list[str] = []
     legend = "".join(
         f'<span><span class="chip" style="background:var({st["var"][s]})"></span>'
         f"{st['legend_names'][s]}</span>"
-        if s != "rust-async"
-        else f'<span><span class="chip" style="background:transparent;'
-        f'border:2px dashed var({st["var"][s]});box-sizing:border-box"></span>'
-        f"{st['legend_names'][s]}</span>"
         for s in series
     )
     parts.append(
         f'<div class="{st["wrap_class"]}"><div class="{st["legend_class"]}">{legend}</div>'
-    )  # noqa: E501
+    )
     parts.append(
         f'<svg viewBox="0 0 790 320" role="img" aria-label="{st["aria"]}" class="{st["svg_class"]}">'  # noqa: E501
     )
-
-    parts.append(
-        f'<line x1="{X0:.0f}" y1="{Y_REF:.0f}" x2="{X1:.0f}" y2="{Y_REF:.0f}" class="{p}-ref"/>'
-    )  # noqa: E501
-    parts.append(
-        f'<text x="48" y="{Y_REF + 4:.0f}" text-anchor="end" class="{p}-tick">1<tspan class="{p}-x">x</tspan></text>'  # noqa: E501
-    )
-    k = 2
-    while y(k) >= 35:
+    parts.append(f'<text x="48" y="12" text-anchor="end" class="{p}-tick">docs/s</text>')
+    k = 0.0
+    while k <= top + 1e-9:
         gy = y(k)
         parts.append(
             f'<line x1="{X0:.0f}" y1="{gy:.0f}" x2="{X1:.0f}" y2="{gy:.0f}" class="{p}-grid"/>'
-        )  # noqa: E501
-        parts.append(
-            f'<text x="48" y="{gy + 4:.0f}" text-anchor="end" class="{p}-tick">{k}<tspan class="{p}-x">x</tspan></text>'  # noqa: E501
         )
-        k += 1
+        label = "0" if k == 0 else _k(k)
+        parts.append(
+            f'<text x="48" y="{gy + 4:.0f}" text-anchor="end" class="{p}-tick">{label}</text>'
+        )
+        k += step
 
     for n, x in zip(writers, xs, strict=True):
         parts.append(f'<text x="{x:.0f}" y="290" text-anchor="middle" class="{p}-tick">{n}</text>')
@@ -213,15 +226,11 @@ def render_viz(results: dict, style_name: str) -> str:
 
     for s in series:
         var = f"var({st['var'][s]})"
-        pts = [(x, y(r)) for x, r in zip(xs, ratios[s], strict=True)]
+        pts = [(x, y(r)) for x, r in zip(xs, rates[s], strict=True)]
         d = "M" + " L".join(f"{x:.1f},{py:.1f}" for x, py in pts)
-        dash = ' stroke-dasharray="6 4"' if s == "rust-async" else ""
-        parts.append(f'<path d="{d}" fill="none" stroke="{var}" stroke-width="2"{dash}/>')
-        for (x, py), n, r in zip(pts, writers, ratios[s], strict=True):
-            tip = (
-                f"{st['names'][s]} — {n} writer{'s' if n != 1 else ''}: "
-                f"{r:.2f}x {st['rate_phrase']}"
-            )
+        parts.append(f'<path d="{d}" fill="none" stroke="{var}" stroke-width="2"/>')
+        for (x, py), n, r in zip(pts, writers, rates[s], strict=True):
+            tip = f"{st['names'][s]} — {n} writer{'s' if n != 1 else ''}: {_fmt_rate(r)} docs/s"
             if st["tooltip"] == "data-tip":
                 parts.append(
                     f'<circle cx="{x:.1f}" cy="{py:.1f}" r="4.5" fill="{var}"'
@@ -233,11 +242,11 @@ def render_viz(results: dict, style_name: str) -> str:
                     f"{st['dot_class']}><title>{tip}</title></circle>"
                 )
 
-    label_pos = _nudge_labels([(s, y(ratios[s][-1]) + 4) for s in series])
+    label_pos = _nudge_labels([(s, y(rates[s][-1]) + 4) for s in series])
     for s in series:
         parts.append(
             f'<text x="{LABEL_X}" y="{label_pos[s]:.0f}" class="{p}-val" fill="var({st["var"][s]})">'  # noqa: E501
-            f'{st["label_names"][s]} {ratios[s][-1]:.1f}<tspan class="{p}-x">x</tspan></text>'
+            f"{st['label_names'][s]} {_k(rates[s][-1])}</text>"
         )
 
     parts.append("</svg></div>")
@@ -250,7 +259,7 @@ def _fmt_rate(rate: float) -> str:
 
 def render_website_table(results: dict) -> str:
     writers: list[int] = results["meta"]["writers"]
-    order = ["mongod", "rust", "rust-async"]
+    order = ["mongod", "rust"]
     rows = []
     for i, n in enumerate(writers):
         cells = "".join(
@@ -264,8 +273,7 @@ def render_website_table(results: dict) -> str:
         '    <div class="compare-wrap">\n'
         '      <table class="compare-table">\n'
         "        <thead>\n"
-        "          <tr><th>Writers</th><th>mongod</th><th>Rust DB</th>"
-        "<th>Rust DB &mdash; async stack</th></tr>\n"
+        "          <tr><th>Writers</th><th>mongod</th><th>Rust DB</th></tr>\n"
         "        </thead>\n"
         "        <tbody>\n"
         f"{body}\n"
@@ -278,10 +286,10 @@ def render_website_table(results: dict) -> str:
 
 def render_docs_table(results: dict) -> str:
     writers: list[int] = results["meta"]["writers"]
-    order = ["rust", "rust-async", "mongod"]
+    order = ["rust", "mongod"]
     lines = [
-        "| N writers | Rust server (docs/s) | Rust — async stack (docs/s) | mongod (docs/s) |",
-        "|---|---:|---:|---:|",
+        "| N writers | Rust server (docs/s) | mongod (docs/s) |",
+        "|---|---:|---:|",
     ]
     for i, n in enumerate(writers):
         cells = " | ".join(_fmt_rate(results["servers"][s]["docs_per_sec"][i]) for s in order)
