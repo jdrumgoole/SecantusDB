@@ -199,5 +199,6 @@ for the canonical list of open gaps. Highlights:
   opt-in, the v1 spec's stable event set
   (insert / update / delete / replace / drop / dropDatabase /
   rename / invalidate) is what surfaces.
-- Resume-token internals are not wire-compatible with real `mongod`
-  keystring tokens (round-trip through `pymongo` is fine).
+- The Rust MongoDB server's resume tokens are `mongod` 8.2's own KeyString
+  tokens, and it resumes from a token `mongod` made. (The deprecated Python
+  server keeps a private layout.)

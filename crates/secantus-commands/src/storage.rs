@@ -283,6 +283,34 @@ pub struct ChangeStreamOptions {
     pub resume_skip: Option<(i64, i64)>,
 }
 
+/// What a resume token in mongod 8.2's form says (`ResumeTokenData`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResumeTokenInfo {
+    /// Its `clusterTime`: the oplog position (RecordId) of the entry it names.
+    pub position: i64,
+    /// `txnOpIndex`: the event's place in its `applyOps` entry.
+    pub op_index: i64,
+    /// An event's token, as against a high-water mark (`tokenType`).
+    pub event: bool,
+    /// The token of an `invalidate` event.
+    pub from_invalidate: bool,
+    /// Whether it names a collection (`uuid` is not null).
+    pub has_uuid: bool,
+}
+
+/// An oplog position (a row's RecordId, `secs << 32 | inc`) from its time.
+pub fn ts_position(t: bson::Timestamp) -> i64 {
+    (((t.time as u64) << 32) | t.increment as u64).min(i64::MAX as u64) as i64
+}
+
+/// The time of an oplog position.
+pub fn position_ts(position: i64) -> bson::Timestamp {
+    bson::Timestamp {
+        time: (position as u64 >> 32) as u32,
+        increment: position as u32,
+    }
+}
+
 /// One poll of the oplog tail for a change-stream cursor: the projected event
 /// documents (as `bson::encode` bytes), the new oplog position consumed (the
 /// seq of the last entry read), and whether an invalidating event
@@ -502,31 +530,13 @@ pub trait Storage: Send + Sync {
         0
     }
 
-    /// The smallest oplog seq whose entry timestamp is `>= ts` (for
-    /// `startAtOperationTime`); tail+1 if none qualify. Default: 0.
-    fn seq_for_timestamp(&self, _ts: bson::Timestamp) -> i64 {
-        0
-    }
-
-    /// Decode a change-stream resume token (`{_data: "<hex>"}`) to the oplog
-    /// `seq` it points at, for `resumeAfter` / `startAfter`. `None` if the token
-    /// is malformed. Kept on the seam so the token format stays in the
-    /// WiredTiger-linked `changestreams` module. Default: `None`.
-    fn resume_token_seq(&self, _token: &Document) -> Option<i64> {
+    /// Read a change-stream resume token in mongod 8.2's form (version 2) for
+    /// `resumeAfter` / `startAfter`. `None` when it is not one this server
+    /// can read (the caller then gives mongod's answer for it). Kept on the
+    /// seam so the token format stays in the WiredTiger-linked `changestreams`
+    /// module. Default: `None`.
+    fn resume_token_info(&self, _token: &Document) -> Option<ResumeTokenInfo> {
         None
-    }
-
-    /// The place of a token's event in its `applyOps` entry (`txnOpIndex`),
-    /// when it names one inside an entry. Default: `None`.
-    fn resume_token_op_index(&self, _token: &Document) -> Option<i64> {
-        None
-    }
-
-    /// Whether a resume token is for an `invalidate` event. `resumeAfter` on such
-    /// a token is rejected (the stream it came from is over) — mongod requires
-    /// `startAfter` instead (`InvalidResumeToken`, 260). Default: `false`.
-    fn resume_token_from_invalidate(&self, _token: &Document) -> bool {
-        false
     }
 
     /// [`Self::coll_mod`], with `given` (what the command said) recorded for
@@ -539,12 +549,6 @@ pub trait Storage: Send + Sync {
         _given: &Document,
     ) -> Result<(), StorageError> {
         self.coll_mod(db, coll, opts)
-    }
-
-    /// Whether the token names an event (as against the high-water mark of
-    /// an empty batch, which names only a position). Default: `true`.
-    fn resume_token_is_event(&self, _token: &Document) -> bool {
-        true
     }
 
     /// Name the transaction the writes on this thread belong to, so its
@@ -595,11 +599,12 @@ pub trait Storage: Send + Sync {
         None
     }
 
-    /// A high-water-mark resume token at oplog `seq` and the current cluster
-    /// time, encoded as `bson::encode({_data: "<hex>"})`. Returned as the
-    /// `postBatchResumeToken` of an empty change-stream batch so the client can
-    /// resume past a quiet stretch. Built via the same encoder as event tokens.
-    /// Default: empty (no token).
+    /// A high-water-mark resume token at the oplog position `seq` (a
+    /// timestamp), encoded as `bson::encode({_data: "<hex>"})`. Returned as
+    /// the `postBatchResumeToken` of a change-stream batch that ended on no
+    /// event, so the client can resume past a quiet stretch: a stream resumed
+    /// from it reads the entries at or after that time. Built via the same
+    /// encoder as event tokens. Default: empty (no token).
     fn high_water_mark_token(&self, _seq: i64) -> Vec<u8> {
         Vec::new()
     }

@@ -892,21 +892,10 @@ fn transform_options(spec: &Spec, start: Timestamp) -> Document {
     out
 }
 
-/// The time a resume token resumes from: this server's own token, or
-/// mongod's.
+/// The time a resume token resumes from: its `clusterTime`, the first
+/// element of its KeyString.
 fn token_time(token: &Document) -> Option<Timestamp> {
-    let hex = token.get_str("_data").ok()?;
-    let bytes: Option<Vec<u8>> = (0..hex.len())
-        .step_by(2)
-        .map(|i| {
-            hex.get(i..i + 2)
-                .and_then(|b| u8::from_str_radix(b, 16).ok())
-        })
-        .collect();
-    bytes
-        .and_then(|b| secantus_core::bsondoc::from_bytes(&b).ok())
-        .and_then(|d| d.get_timestamp("t").ok())
-        .or_else(|| crate::resume_keystring::cluster_time(token))
+    crate::resume_keystring::cluster_time(token)
 }
 
 /// The stages after the read, as mongod lists them: the user's `$match`es
@@ -1154,9 +1143,9 @@ pub(super) fn reply(
     let (start, token, from_seq) = match (spec.resume(), raw.get_timestamp("startAtOperationTime"))
     {
         (Some((_, token)), _) => {
-            let from_seq = match storage.resume_token_seq(token) {
-                Some(seq) if storage.resume_token_is_event(token) => seq - 1,
-                Some(seq) => seq,
+            let from_seq = match storage.resume_token_info(token) {
+                Some(info) if info.event && !info.from_invalidate => info.position - 1,
+                Some(info) => info.position,
                 None => storage.oplog_tail_seq(),
             };
             (
@@ -1169,11 +1158,8 @@ pub(super) fn reply(
             )
         }
         (None, Ok(ts)) => {
-            let seq = match storage.seq_for_timestamp(ts) {
-                0 => storage.oplog_tail_seq(),
-                seq => seq - 1,
-            };
-            (ts, at_seq(seq), seq)
+            let at = crate::storage::ts_position(ts);
+            (ts, at_seq(at), (at - 1).min(storage.oplog_tail_seq()))
         }
         (None, Err(_)) => {
             let now = storage.peek_cluster_time();
@@ -1183,7 +1169,7 @@ pub(super) fn reply(
                     time: now.time,
                     increment: now.increment + 1,
                 },
-                at_seq(tail),
+                at_seq(tail + 1),
                 tail,
             )
         }
@@ -1592,11 +1578,10 @@ mod tests {
 
     #[test]
     fn a_token_of_this_server_gives_its_time() {
-        let inner = doc! { "s": 3_i64, "t": Timestamp { time: 7, increment: 2 }, "n": "", "k": {} };
-        let bytes = secantus_core::bsondoc::to_vec(&inner).expect("bytes");
-        let hex: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
+        // A high-water mark at (7, 2): the time, then the version, the type,
+        // `txnOpIndex`, `fromInvalidate` and a null uuid.
         assert_eq!(
-            token_time(&doc! { "_data": hex }),
+            token_time(&doc! { "_data": "8200000007000000022B0429296E1404" }),
             Some(Timestamp {
                 time: 7,
                 increment: 2

@@ -1472,7 +1472,7 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 match (hwm, cursors.last_token(cursor_id)) {
                     // Only move forward: a high-water mark at or behind the
                     // last delivered event would rewind the client's token.
-                    (Some(h), Some(l)) if token_seq(&h) > token_seq(&l) => Some(h),
+                    (Some(h), Some(l)) if token_position(&h) > token_position(&l) => Some(h),
                     (_, Some(l)) => Some(l),
                     (h, None) => h,
                 }
@@ -1898,29 +1898,18 @@ fn int64_array(ids: Vec<i64>) -> Vec<Bson> {
     ids.into_iter().map(Bson::Int64).collect()
 }
 
-/// The `postBatchResumeToken` for a tailable batch: the `_id` (resume token) of
-/// the last event in the batch. `None` for an empty batch — R3b-a omits the
-/// PBRT then; pymongo falls back to the last seen event's `_id`, which is
-/// correct when no new events were delivered. Empty-batch high-water-mark
-/// advancement (and noop-heartbeat tracking) is R3b-b.
-/// The `s` (oplog seq) inside a `{"_data": "<hex>"}` resume token, or -1 when it
-/// can't be read — an unreadable token must never look newer than a real one.
-fn token_seq(tok: &Bson) -> i64 {
-    let Some(d) = tok.as_document() else {
-        return -1;
-    };
-    let Ok(hex) = d.get_str("_data") else {
-        return -1;
-    };
-    let bytes: Vec<u8> = (0..hex.len() / 2)
-        .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
-        .collect();
-    secantus_core::bsondoc::from_bytes(bytes.as_slice())
-        .ok()
-        .and_then(|d| d.get_i64("s").ok())
-        .unwrap_or(-1)
+/// The oplog position (the `clusterTime`, as a RecordId) a resume token starts
+/// with, or -1 when it can't be read -- an unreadable token must never look
+/// newer than a real one.
+fn token_position(tok: &Bson) -> i64 {
+    tok.as_document()
+        .and_then(crate::resume_keystring::cluster_time)
+        .map_or(-1, crate::storage::ts_position)
 }
 
+/// The `postBatchResumeToken` for a tailable batch: the `_id` (resume token) of
+/// the last event in the batch. `None` for an empty batch: the token is then
+/// the one remembered, or a high-water mark newer than it.
 fn post_batch_resume_token(batch: &[Vec<u8>]) -> Option<Bson> {
     let last = batch.last()?;
     let doc = secantus_core::bsondoc::from_bytes(last.as_slice()).ok()?;

@@ -138,14 +138,6 @@ Single-node change streams are implemented and conformant for typical pymongo `w
       and never reads `MONGOC_TEST_URI`, so no server-side change reaches it
       (it still shows as the gauge's failures). Multi-node is out of scope.
 
-- **OUT OF SCOPE (recorded): resume-token cross-server identity.**
-      Tokens are opaque to drivers and round-trip fine, but the inner layout is
-      `{s, t, n, k}` (BSON-encoded, hex-stringed) rather than mongod's
-      keystring format, so a SecantusDB token cannot be presented to a real
-      `mongod` or vice versa. Reproducing the keystring layout is a MIGRATION
-      property, not a conformance one -- no driver reads inside the token.
-      `tools/probes/change_streams.py` is at 0 of 41 with the current layout.
-
 ### 3.4 Multi-document transaction limitations
 
 Known divergences, all deliberate:
@@ -2237,6 +2229,25 @@ would see them. What is left:
       counts of the entries the stream keeps match since RM-453, 2026-11-15).
       Verify: none -- mongod writes its no-ops on a timer, so no test can pin how many a scan reads
       Backlog-ID: RM-700
+- [ ] **RUST MongoDB server: a `collMod` of an index makes a `modify` event
+      with an empty description.** mongod 8.2.11 gives `operationDescription:
+      {index: {name: "a_1", hidden: true}}` and adds `indexOptions: {hidden:
+      false}` to `stateBeforeChange` (the index as it was). This server's event
+      has `operationDescription: {}` and only the collection's options, so its
+      resume token (whose identifier holds the description) differs as well
+      (2026-11-21, found working the 4b-4 resume tokens).
+      Verify: tests/backlog/test_rm_found_2026_11_21_resume_tokens.py::test_a_collmod_of_an_index_is_a_modify_event_with_the_index
+      Backlog-ID: RM-733
+- [ ] **RUST MongoDB server: `dropIndexes: "*"` logs its entries oldest
+      first, with `hidden` before `key`.** mongod 8.2.11 drops the indexes
+      newest first, one entry (and change event) each, and writes a hidden
+      index's spec as `v`, the options other than `hidden`, `key`, `name`,
+      then `hidden`; this server drops them in creation order and puts
+      `hidden` after `unique` and before `key` (2026-11-21, found working the
+      4b-4 resume tokens: the order of the events, and the identifier of a
+      token, differ).
+      Verify: tests/backlog/test_rm_found_2026_11_21_resume_tokens.py::test_dropping_every_index_is_one_event_each_newest_first_with_mongods_spec_order
+      Backlog-ID: RM-734
 
 ### 7.073 The cursor commands -- 2026-10-11
 

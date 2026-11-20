@@ -267,10 +267,6 @@ The Rust MongoDB server passes 99.5% of pymongo's suite. The remaining *feature*
 - **Thinner diagnostics** — `serverStatus` / `dbStats` / `collStats` return a
   smaller subset of fields than mongod's replies.
 
-The server mints resume tokens in SecantusDB's own `{s, t, n, k}` layout
-rather than mongod's keystring format — tokens round-trip within SecantusDB but
-cannot be presented to a real `mongod` (or vice versa).
-
 The current Rust-server pass rate, and the exact set of failing pymongo tests,
 is regenerated each run into the
 [Rust-server validation report](validation-report-rust-server.md).

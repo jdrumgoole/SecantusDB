@@ -664,6 +664,41 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
      an escaped name to the builder) and escaped again for the engine's readers
      (`oplog_entry::unwind`).
 
+   **As built (4b-4, still format 5; no stored byte changes):** a token is
+   mongod 8.2.11's, measured (`tests/fixtures/storage_model/mongod-8.2.11-resume-tokens.json`,
+   from `tools/probes/resume_tokens_fixture.py`).
+   - `_data` is the hex KeyString (V1, all ascending) of `clusterTime`
+     (Timestamp, the entry's `ts`), `version` (int 2), `tokenType` (int: 128 an
+     event, 0 a high-water mark), `txnOpIndex` (int, the `applyOpsIndex`; 0
+     for a plain entry), `fromInvalidate` (bool), `uuid` (BinData 4 of the
+     entry's `ui`, null for none: a high-water mark, `dropDatabase`),
+     `eventIdentifier` (an event's only: `{operationType, documentKey}` of a
+     write, `{operationType, operationDescription}` of a command that has one
+     -- a rename's `{to, dropTarget?}` also on a stream that does not show
+     it; `{operationType}` for `drop`, `dropDatabase`) and `fragmentNum` (int
+     from 0, a fragment of a split event). `_typeBits` is the KeyString's
+     TypeBits, present when not all zero (`820001` for a long `_id`, `828000`
+     a double). The `invalidate` event's token is the event it follows with
+     `fromInvalidate` true. The same inputs give mongod's bytes
+     (`crates/secantus-storage/tests/resume_tokens.rs`); the live comparison
+     is `tests/mongod_live/test_resume_tokens.py`.
+   - A resume reads from the token's `clusterTime`; an event token's event
+     (found by its bytes and `txnOpIndex`) must be the first the stream
+     finds, else 280; a high-water mark names no event and reads entries at
+     or after its time; an `invalidate` token (`startAfter` only) starts after
+     its entry; `resumeAfter` it is 260. An event token with a null `uuid`
+     on a single-collection stream is 260, a high-water mark's is accepted.
+     A token of another version, or that does not decode, takes
+     `resume_keystring`'s answer (mongod's own for garbage), as before: the
+     file keeps its job for what this server cannot read, no longer for what
+     it writes.
+   - mongod's `postBatchResumeToken`, measured: a new stream's mark is the
+     entry after the oplog's last (`ts + 1`); one that has read on is the
+     last entry read; when that entry was an event it is the event's token
+     (a resume's own token included).
+   - Nothing stores a token (pre-images and `config.transactions` hold
+     none), so there is no format bump.
+
    **Landing:** 4b-1 to 4b-3 cannot land apart (the table, what is in it
    and every reader of it), so they land together as store format 5, with
    the crash tests: kill -9 at random points of a write burst, many times,
