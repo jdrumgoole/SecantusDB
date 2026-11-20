@@ -36,7 +36,7 @@ from pathlib import Path
 
 import bson
 from bson import json_util
-from pymongo import MongoClient
+from pymongo import IndexModel, MongoClient
 
 DEFAULT_MONGOD = "/opt/homebrew/Cellar/mongodb-community@8.2/8.2.11/bin/mongod"
 WT_CFG = "log=(enabled=true,path=journal,compressor=snappy)"
@@ -128,6 +128,14 @@ def steps(client: MongoClient) -> list[tuple[str, object]]:
         db.create_collection("e")
         db.e.create_index("a", name="a_1")
 
+    def multi_index() -> None:
+        db.create_collection("m")
+        db.m.insert_one({"_id": 1, "a": 1, "b": 2})
+        db.m.create_indexes(
+            [IndexModel("a", name="a_1"), IndexModel([("b", -1)], name="b_-1", unique=True)]
+        )
+
+    step("createIndexes with two indexes on a collection that has documents", multi_index)
     step("createIndexes on an empty collection", empty_index)
     step("transaction (create a collection, insert into it)", txn_explicit_create)
     step("transaction (insert into a collection that does not exist)", txn_implicit_create)

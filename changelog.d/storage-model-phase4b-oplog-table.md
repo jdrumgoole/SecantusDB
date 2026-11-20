@@ -34,7 +34,8 @@ usual message.
   stored. Change-stream events of one transaction have their own resume tokens
   (`txnOpIndex`), and a stream resumes from any of them.
 - An index on a collection that has documents is logged as mongod logs a two-phase build
-  (`config.system.indexBuilds` insert, `startIndexBuild`, update, `commitIndexBuild`, delete); on an
+  (`config.system.indexBuilds` insert, `startIndexBuild`, update, `commitIndexBuild`, delete), and
+  one `createIndexes` of several indexes is ONE build whose entries list every spec; on an
   empty collection, as the one `createIndexes`. A collection a transaction creates is a member of
   its `applyOps`, beside the insert.
 - A prepared transaction (PostgreSQL's `PREPARE TRANSACTION`) is logged in

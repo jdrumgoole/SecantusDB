@@ -402,6 +402,73 @@ fn an_index_build_is_logged_in_two_phases() {
     });
 }
 
+/// A `createIndexes` of two indexes over documents is ONE build: one
+/// `config.system.indexBuilds` row, one `startIndexBuild` and one
+/// `commitIndexBuild`, each listing both specs (measured, mongod 8.2.11).
+#[test]
+fn two_indexes_over_documents_are_one_build() {
+    with_db(|st| {
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "a": 1, "b": 2}))
+            .unwrap();
+        let before = st.oplog_tail_seq();
+        let uuid = [9u8; 16];
+        let spec = |name: &str, key: Document| secantus_storage::IndexBuildSpec {
+            name: name.to_string(),
+            key,
+            options: Document::new(),
+        };
+        st.begin_index_build(
+            "app",
+            "c",
+            uuid,
+            &[spec("a_1", doc! {"a": 1}), spec("b_-1", doc! {"b": -1})],
+            "localhost:27017",
+        )
+        .unwrap();
+        st.run_index_build(&uuid, 64 << 20).unwrap();
+        st.index_build_ready(&uuid, "localhost:27017").unwrap();
+        st.commit_index_build(&uuid).unwrap();
+        let rows = st.read_oplog(before + 1, 100).unwrap();
+        // The first build ever creates `config.system.indexBuilds` first.
+        assert_eq!(ops_of(&rows)[0].1, "config.$cmd create");
+        let rows = rows[1..].to_vec();
+        assert_eq!(
+            ops_of(&rows)
+                .iter()
+                .map(|o| o.1.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "config.system.indexBuilds _id",
+                "app.$cmd startIndexBuild",
+                "config.system.indexBuilds $v",
+                "app.$cmd commitIndexBuild",
+                "config.system.indexBuilds _id",
+            ]
+        );
+        let row: Document = bson::from_slice(&rows[0].1).unwrap();
+        let names: Vec<&str> = row
+            .get_document("o")
+            .unwrap()
+            .get_array("indexNames")
+            .unwrap()
+            .iter()
+            .filter_map(Bson::as_str)
+            .collect();
+        assert_eq!(names, ["a_1", "b_-1"]);
+        for at in [1, 3] {
+            let e: Document = bson::from_slice(&rows[at].1).unwrap();
+            assert_eq!(
+                e.get_document("o")
+                    .unwrap()
+                    .get_array("indexes")
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+    });
+}
+
 /// An index on an empty collection is one `createIndexes` entry (measured).
 #[test]
 fn an_index_on_an_empty_collection_is_one_entry() {

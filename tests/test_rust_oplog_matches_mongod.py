@@ -1,7 +1,7 @@
 """`secantusd-mdb` logs what mongod 8.2.11 logs, field for field.
 
 Phase 4b of ``tasks/mongod-storage-model-plan.md``: ``local.oplog.rs`` holds
-mongod's entries. ``tools/probes/mongod_oplog_corpus.py`` ran 22 operations on
+mongod's entries. ``tools/probes/mongod_oplog_corpus.py`` ran 23 operations on
 a one-member mongod 8.2.11 replica set and recorded the entries each wrote
 (``tests/fixtures/storage_model/mongod-8.2.11-oplog.json``); this runs the same
 operations against the standalone binary and holds what ``find`` on

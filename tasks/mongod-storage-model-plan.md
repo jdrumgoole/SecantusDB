@@ -650,7 +650,9 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
      `startIndexBuild`, the row updated with `commitReadyMembers`,
      `commitIndexBuild`, the row deleted -- five entries, the rows real writes
      to a real collection made before the first index is (unlogged, as mongod
-     has it from its start). An index on an **empty** collection is the one
+     has it from its start). Several indexes of one `createIndexes` are ONE
+     build: one row, one start and one commit listing every spec (probed 8.2.11;
+     fixture step "two indexes"). An index on an **empty** collection is the one
      `createIndexes` entry (probed 8.2.11, 2026-11-21). Replay reads the commit
      as the `createIndexes` it was and the start as nothing. **DDL inside a
      transaction** (probed 8.2.11: an explicit `create`, and the implicit one
