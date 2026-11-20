@@ -23,6 +23,9 @@ fn options(server_like: bool) -> StorageOptions {
     StorageOptions {
         wt_config: Some(secantus_storage::wt_config("256M", 1000, false, "10MB")),
         data_nonlogged: Some(server_like),
+        // Unlogged data is recovered from a logged oplog: a non-logged one is
+        // refused there (RM-731), whatever the async CI lane's env asks.
+        oplog_nonlogged: server_like.then_some(false),
         durable: Some(true),
         ..Default::default()
     }

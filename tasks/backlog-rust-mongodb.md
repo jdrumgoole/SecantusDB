@@ -57,6 +57,22 @@ These work end-to-end but cut corners.
   `docs/indexes.md` "Per-index collation".
   Backlog-ID: RM-003
   Verify: none -- storage-internal COLLSCAN (performance); results, order and explain executionStats under numericOrdering already match mongod
+- [ ] **`--bind_ip` with more than one address is refused.** mongod 8.2.11
+  binds every address in `--bind_ip 127.0.0.1,::1` (without `--ipv6` it
+  binds 127.0.0.1, warns "Found no addresses for peer" for ::1 and serves;
+  measured 2026-11-20). `secantusd-mdb` binds one address, so a list is
+  refused at parse time by name ("--bind_ip takes one address here"). The
+  fix is a listener per address in `secantus_server::bind`.
+  Backlog-ID: RM-729
+  Verify: tests/backlog/test_rm_found_2026_11_20_bind_ip.py::test_a_bind_ip_list_serves_as_mongod_serves_it
+- [ ] **`secantusd-mdb service install` has no Windows support.** On macOS
+  it writes a launchd LaunchAgent and on Linux a systemd user unit; on
+  Windows it refuses ("supports launchd (macOS) and systemd (Linux)"). A
+  Windows service needs the Service Control Manager: the binary answering
+  its start / stop control requests (the `windows-service` crate) or a
+  wrapper, registered with `sc.exe create`.
+  Backlog-ID: RM-730
+  Verify: none -- needs the Windows Service Control Manager, and no backlog lane runs on Windows
 
 ## 3. Deferred work (skipped from a slice, ready to come back)
 
@@ -2295,7 +2311,7 @@ masks only the write-conflict cause. What is left:
 `tools/probes/time_series.py`, mongod 8.2.11: 191 scenarios on a fresh
 database each (what `create` accepts, inserts, reads, where measurements are
 placed, the restricted writes, indexes, `collMod`, rename and the rest). The
-Rust server differs on 2 (2026-11-11): a `hashed` index (a scope decision)
+Rust server differs on 2 (2026-11-11): a `hashed` index (RM-732)
 and `collStats`' sizes -- its storage size, as on every collection (RM-040),
 and its index sizes, 0 while the indexes are not built over the buckets
 (RM-457); a third, `listCollections` order, differs in the runs where
@@ -2360,8 +2376,6 @@ compressed column, placed by mongod's bucket catalog
       go-ahead.)
       Verify: tests/backlog/test_rm_bucket_catalog.py::test_idle_buckets_expire_past_the_memory_threshold
       Backlog-ID: RM-711
-- **Scope decision — a `hashed` index on a time-series collection** is
-  refused as on any collection: hashed indexes are out of scope.
 - **Scope decision — `listCollections` order around time-series buckets.**
   This server puts each bucket namespace after its collection and
   `system.views` last; mongod's order is not stable between two runs of the
@@ -2372,8 +2386,9 @@ compressed column, placed by mongod's bucket catalog
 `tools/probes/collation.py`, mongod 8.2.11: 764 scenarios (reads under 29
 collations, 39 malformed specs on every command, the expression and query
 operators, and a fresh database per scenario for defaults, indexes, views and
-writes). The Rust server differs on 2 (2026-11-09): hashed and text
-indexes, which it does not build. It compares through the ICU
+writes). The Rust server differs on 2 (2026-11-09): hashed indexes (the
+hashed-index item, RM-732) and text indexes, which it does not build. It
+compares through the ICU
 57.1 mongod links, built from mongo's own copy (`crates/secantus-icu`,
 `vendor/icu4c-57.1`), so locales, per-locale defaults, order and sort-key
 bytes are ICU's. What is left, there and beside it:
@@ -2469,8 +2484,31 @@ wording filed under 7.067) and 2 TTL results
 ### 7.067 Index management -- 2026-10-10
 
 `tools/probes/index_admin.py`, mongod 8.2.11: the Rust server differs on 5
-of 90: `text` and `hashed` are not built (out of scope) and so cannot be
-dropped (four), and `listIndexes` lists by name.
+of 90: `text` (out of scope) and `hashed` (below) are not built and so
+cannot be dropped (four), and `listIndexes` lists by name.
+
+- [ ] **Hashed indexes are refused: `createIndex({a: "hashed"})` answers 67
+      CannotCreateIndex ("not supported by the Rust storage engine yet").**
+      mongod 8.2.11 builds them on a single node, where applications use
+      them for equality lookups; they are not a sharding-only feature, so
+      the 2026-10-14 plan's "out of scope" (no recorded reason, no decision
+      by Joe) was wrong, and Joe asked for the item (2026-11-20). What mongod
+      does, measured 2026-11-20: the key is `hash64` of the value
+      (`secantus-core/src/hashed.rs` already has it, checked on 140 values
+      for `$toHashedIndexKey`); an equality or `$in` is a FETCH over an
+      IXSCAN with point bounds on the hash (`{a: 3}` gives
+      `[-1529429926180645992, -1529429926180645992]`); a range or a sort
+      cannot use it (COLLSCAN); one hashed field may sit in a compound index
+      (`{x: 1, y: "hashed"}`); `unique` is refused with 16764, two hashed
+      fields with 31303, and an array value under the hashed path with the
+      write error 16766 ("Error: hashed indexes do not currently support
+      array values. Found array at path: a"). The same refusal reaches
+      time-series collections, where mongod also accepts one. The key goes
+      in the storage plan's phase-4 KeyString layout ("mongod's hash
+      function", `tasks/mongod-storage-model-plan.md`), so build it after
+      phase 4b lands.
+      Backlog-ID: RM-732
+      Verify: tests/backlog/test_rm_hashed_index.py::test_a_hashed_index_is_built_and_serves_equality, tests/backlog/test_rm_hashed_index.py::test_hashed_index_refusals_are_mongods, tests/backlog/test_rm_hashed_index.py::test_a_compound_index_with_one_hashed_field_is_built
 
 `listIndexes` order is RM-081 (RM-107 was the same item, folded in 2026-10-16).
 

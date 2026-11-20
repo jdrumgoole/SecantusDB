@@ -78,6 +78,17 @@ fn reset_stop_signals() {}
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // `service install|uninstall|status`: run this binary as a per-user
+    // background service under launchd / systemd (secantus_server::service).
+    if argv.first().map(String::as_str) == Some("service") {
+        return match secantus_server::service::run(&argv[1..]) {
+            Ok(code) => ExitCode::from(code),
+            Err(msg) => {
+                eprintln!("secantusd-mdb service: {msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if argv.first().map(String::as_str) == Some("restore") {
         return match run_restore(&argv[1..]) {
             Ok(()) => ExitCode::SUCCESS,

@@ -367,6 +367,117 @@ def test_help_exits_zero() -> None:
     res = subprocess.run([str(_BIN), "--help"], capture_output=True, text=True, timeout=30)
     assert res.returncode == 0
     assert "--storage-path" in res.stdout
+    assert "service install" in res.stdout
+
+
+def test_mongods_dbpath_and_bind_ip_spellings_serve(tmp_path: pathlib.Path) -> None:
+    """``--dbpath`` and ``--bind_ip`` are mongod's names for ``--storage-path``
+    and ``--host``; ``getCmdLineOpts`` reports them where mongod does."""
+    data = tmp_path / "data"
+    proc = _start(["--port", "0", "--dbpath", str(data), "--bind_ip", "127.0.0.1"], **_SPAWN_KWARGS)
+    try:
+        host, port = _bound_address(proc)
+        assert host == "127.0.0.1"
+        client: pymongo.MongoClient = pymongo.MongoClient(
+            host=host, port=port, serverSelectionTimeoutMS=10_000
+        )
+        try:
+            parsed = client.admin.command("getCmdLineOpts")["parsed"]
+            assert parsed["storage"]["dbPath"] == str(data)
+            assert parsed["net"]["bindIp"] == "127.0.0.1"
+            client.t.c.insert_one({"x": 1})
+        finally:
+            client.close()
+        _request_shutdown(proc)
+        assert proc.wait(timeout=15) == 0, _stderr(proc)
+        assert data.is_dir()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def _service(home: pathlib.Path, *words: str) -> subprocess.CompletedProcess[str]:
+    """``secantusd-mdb service ...`` with ``home`` as the user's home, so no
+    test touches the real ~/.secantus, LaunchAgents or systemd units."""
+    assert _BIN is not None
+    env = {k: v for k, v in os.environ.items() if k != "XDG_CONFIG_HOME"}
+    env["HOME"] = str(home)
+    return subprocess.run(
+        [str(_BIN), "service", *words], capture_output=True, text=True, timeout=60, env=env
+    )
+
+
+def _service_file(home: pathlib.Path) -> pathlib.Path:
+    if sys.platform == "darwin":
+        return home / "Library" / "LaunchAgents" / "com.secantusdb.secantusd-mdb.plist"
+    return home / ".config" / "systemd" / "user" / "secantusd-mdb.service"
+
+
+@pytest.mark.skipif(_WINDOWS, reason="no service manager support on Windows yet")
+def test_service_install_dry_run_shows_the_service_and_writes_nothing(
+    tmp_path: pathlib.Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    res = _service(home, "install", "--dry-run", "--port", "27999")
+    assert res.returncode == 0, res.stderr
+    out = res.stdout
+    service_file = _service_file(home)
+    binary = home / ".secantus" / "bin" / "secantusd-mdb"
+    data = home / ".secantus" / "data"
+    log = home / ".secantus" / "secantusd-mdb.log"
+    assert f"write {service_file}:" in out
+    assert f"cp {_BIN.resolve()} {binary}" in out
+    assert f"mkdir -p {data}" in out
+    if sys.platform == "darwin":
+        # The server runs as the copied binary with the given options and the
+        # default store; mongod's open-file limit; no restart after an exit.
+        assert (
+            f"<string>{binary}</string>\n        <string>--port</string>\n"
+            f"        <string>27999</string>\n        <string>--storage-path</string>\n"
+            f"        <string>{data}</string>"
+        ) in out
+        assert f"<string>{log}</string>" in out
+        assert "<key>KeepAlive</key>\n    <false/>" in out
+        assert "<integer>64000</integer>" in out
+        assert "launchctl bootstrap gui/" in out
+    else:
+        assert f"ExecStart={binary} --port 27999 --storage-path {data}\n" in out
+        assert f"StandardOutput=append:{log}\n" in out
+        assert "LimitNOFILE=64000\n" in out
+        assert "Restart=" not in out
+        assert "systemctl --user restart secantusd-mdb.service" in out
+    # A dry run creates nothing.
+    assert list(home.iterdir()) == []
+
+
+@pytest.mark.skipif(_WINDOWS, reason="no service manager support on Windows yet")
+def test_service_uninstall_dry_run_keeps_the_data(tmp_path: pathlib.Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    res = _service(home, "uninstall", "--dry-run")
+    assert res.returncode == 0, res.stderr
+    assert f"rm -f {_service_file(home)}" in res.stdout
+    assert f"rm -f {home / '.secantus' / 'bin' / 'secantusd-mdb'}" in res.stdout
+    assert str(home / ".secantus" / "data") not in res.stdout
+    assert str(home / ".secantus" / "secantusd-mdb.log") not in res.stdout
+
+
+@pytest.mark.skipif(_WINDOWS, reason="no service manager support on Windows yet")
+def test_service_status_when_not_installed_exits_3(tmp_path: pathlib.Path) -> None:
+    res = _service(tmp_path, "status")
+    assert res.returncode == 3, res.stderr
+    assert "not installed" in res.stdout
+
+
+def test_service_bad_action_exits_2(tmp_path: pathlib.Path) -> None:
+    res = _service(tmp_path, "start")
+    assert res.returncode == 2
+    assert "install, uninstall or status" in res.stderr
+    res = _service(tmp_path, "install", "--port", "nope")
+    assert res.returncode == 2
+    assert "--port" in res.stderr
 
 
 def test_binary_was_built_from_this_tree() -> None:
