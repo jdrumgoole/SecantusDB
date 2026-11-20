@@ -2472,6 +2472,9 @@ def test_storage_mode_kwargs_end_to_end(tmp_path, monkeypatch) -> None:
         replica_set_name="secantus",  # change streams need the replset persona
         oplog_async=True,
         oplog_nonlogged=True,
+        # The stack needs logged data tables: on the default unlogged ones the
+        # drainer is not used and a non-logged oplog is refused (RM-731).
+        data_nonlogged=False,
     )
     try:
         coll = _client(srv)["t"]["c"]

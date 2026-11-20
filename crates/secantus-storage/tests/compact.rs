@@ -35,6 +35,10 @@ fn open_like_the_server(home: &std::path::Path) -> Storage {
     let opts = secantus_storage::StorageOptions {
         wt_config: Some(secantus_storage::wt_config("256M", 1000, false, "10MB")),
         data_nonlogged: Some(true),
+        // The server's oplog is logged: it is what recovers the unlogged
+        // data, and a non-logged one is refused on this store (RM-731),
+        // whatever SECANTUS_OPLOG_NONLOGGED the async CI lane sets.
+        oplog_nonlogged: Some(false),
         transactions_logged_at_commit: true,
         ..Default::default()
     };
