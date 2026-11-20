@@ -1325,6 +1325,7 @@ jobs:
             --with "$(ls dist-storage/*.whl)" \
             python -m pytest tests/test_rust_binary_smoke.py tests/test_rust_binary_pitr.py \
             tests/test_rust_binary_crash_durability.py \
+            tests/test_rust_crash_kill_loop.py \
             -o addopts= -p no:cacheprovider -q -rs
 
       - name: Disk watchdog report (RP-312)
@@ -1492,6 +1493,7 @@ jobs:
           cargo build --manifest-path crates/secantusdb/Cargo.toml
           uv run python -m pytest tests/test_rust_binary_smoke.py tests/test_rust_binary_pitr.py \
             tests/test_rust_binary_crash_durability.py \
+            tests/test_rust_crash_kill_loop.py \
             -o addopts= -p no:cacheprovider -p no:randomly -q -rs
 
       - name: Rust MongoDB server against mongod (the backlog's tests)
@@ -1860,6 +1862,11 @@ jobs:
           # anywhere else it silently collects nothing -- a release gate that
           # runs in no lane is not a gate.
           files="$files tests/test_rust_pg_binary_smoke.py"
+          # kill -9 under a write burst, then every acknowledged write must
+          # be there and no transaction half applied (its MongoDB half
+          # skips here: no secantusd-mdb in this lane; it runs beside
+          # test_rust_binary_crash_durability.py).
+          files="$files tests/test_rust_crash_kill_loop.py"
           # The built-in functions, held to PostgreSQL 15's recorded answers
           # (it needs the binary and no PostgreSQL). Same reasoning: it skips
           # wherever the binary is not built, so it is named where it is.

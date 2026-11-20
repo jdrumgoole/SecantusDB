@@ -436,6 +436,54 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
      `o2.numRecords`; `dropDatabase` is a `drop` per collection, then
      `dropDatabase`.
 
+   **Measured 2026-11-20 (batching, `partialTxn`, prepare; mongod 8.2.11,
+   one-member set).** `tools/probes/mongod_oplog_batching.py` and
+   `tools/probes/mongod_oplog_prepare.py` write
+   `tests/fixtures/storage_model/mongod-8.2.11-oplog-batching.json` and
+   `...-oplog-prepare.json`:
+
+   - **Insert.** `insertMany` (ordered or not, retryable or not) is ONE
+     `applyOps` entry at one ts, whatever the count (200 documents: one
+     entry, 18,795 bytes); a one-document `insertMany` is a plain insert
+     entry. It is cut by size: five 1 MB documents are five plain entries.
+     `bulkWrite` is one entry per operation.
+   - **Delete.** `deleteMany` is `applyOps` of deletes, in batches of ten
+     (200 matches: 20 entries at consecutive ts, each ten elements); one
+     match is a plain delete entry; five 1 MB documents split 3 + 2. A
+     retryable `deleteMany` carries no `lsid`/`txnNumber` (the command is not
+     retryable); a retryable `insertMany` has `lsid`, `txnNumber`,
+     `prevOpTime: {ts: Timestamp(0,0), t: -1}` and `multiOpType: 1`, and its
+     elements carry `stmtId`. `updateMany` is one plain entry per document
+     (no `applyOps`), even in a retryable session. An `applyOps` element is
+     `op, ns, ui, o, o2` (insert; `o2` = `{_id}`), `op, ns, ui, o` (delete),
+     with `stmtId` last when retryable.
+   - **Transaction.** One `applyOps` entry at the commit ts, fields `lsid,
+     txnNumber, op:"c", ns:"admin.$cmd", o:{applyOps}, ts, t, v, wall,
+     prevOpTime` (no `multiOpType`); inserts, deletes and updates of a
+     transaction (11 ops across `insertMany`, `deleteMany`, `updateMany`) are
+     all elements of the one entry. An aborted or empty transaction writes
+     nothing.
+   - **`partialTxn` chain.** Twenty 1 MB inserts: two entries at consecutive
+     ts (`t.1`, `t.2`). The first is `o: {applyOps: [16 ops], partialTxn:
+     true}`, 16,001,861 bytes, `prevOpTime` `{Timestamp(0,0), -1}`; the last
+     is `o: {applyOps: [4 ops], count: 20}`, 4,000,657 bytes, its
+     `prevOpTime` the first entry's `{ts, t}`. An entry takes whole
+     operations while it stays under about 16 MB (BSON's internal limit
+     16,793,600).
+   - **Prepare** (needs `--shardsvr` and a `shardIdentity`, which the probe
+     builds; a plain replica set answers `prepareTransaction` with "Cannot
+     accept sharding commands"). `prepareTransaction` writes the `applyOps`
+     entry with `o: {applyOps, prepare: true}` at the PREPARE ts (the
+     transaction's operations all in it); `commitTransaction` writes
+     `{op:"c", ns:"admin.$cmd", o:{commitTransaction: 1, commitTimestamp:
+     <prepare ts>}, prevOpTime: <the prepare entry's {ts, t}>}` at a later
+     ts; `abortTransaction` writes `o:{abortTransaction: 1}` with the same
+     `prevOpTime`. Both carry `lsid` and `txnNumber` (the probe strips `wall`, which
+     every entry has).
+   - **Not yet measured:** the two-phase index build entries beyond the
+     existing fixture; a prepared transaction over 16 MB; recovery from a
+     crash between prepare and commit.
+
    Today's store differs in all of these: one row per operation, each at its
    own timestamp, keyed by a seq over two to sixteen shards, with private
    fields (`rw`, `bg`, `pi`) and a view (`oplog_view_entries`) that collapses
