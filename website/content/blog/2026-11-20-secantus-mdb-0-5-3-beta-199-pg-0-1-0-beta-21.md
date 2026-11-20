@@ -5,7 +5,7 @@ Author: Joe Drumgoole
 Category: Releases
 Tags: release
 
-Summary: secantus-mdb 0.5.3-beta.199 and secantus-pg 0.1.0-beta.21 ship together: stores now use mongod's on-disk layout (a format change), the MongoDB server runs inside your Python process, and it installs as a background service.
+Summary: secantus-mdb 0.5.3-beta.199 and secantus-pg 0.1.0-beta.21 ship together: stores now use mongod's on-disk layout, the MongoDB server runs inside your Python process, and it installs as a background service.
 
 Both Rust servers have a new release, on PyPI, crates.io and the GitHub
 releases page:
@@ -16,16 +16,9 @@ cargo install secantus-mdb --version 0.5.3-beta.199
 cargo install secantus-pg --version 0.1.0-beta.21
 ```
 
-**This release changes the on-disk format.** A store written by an earlier
-release is refused when it is opened, with a message saying what to do: dump
-it with the release that wrote it (`mongodump`, or `pg_dump` for the
-PostgreSQL server) and restore it into a new store. There is no in-place
-migration.
-
 ## mongod's storage layout
 
-The format change is the start of moving the stores to the layout `mongod`
-itself writes, so that one day a `mongod` can open a SecantusDB store and
+The stores are moving to the layout `mongod` itself writes, so that one day a `mongod` can open a SecantusDB store and
 SecantusDB can open a `mongod` one:
 
 - WiredTiger is built as `mongod` builds it, compresses with snappy, and
