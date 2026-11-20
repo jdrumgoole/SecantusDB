@@ -712,9 +712,14 @@ fn project_command(
     if cmd.contains_key("startIndexBuild") || cmd.contains_key("abortIndexBuild") {
         return Ok((None, false));
     }
+    // A commit reaches here as the `createIndexes` replay reads, marked
+    // (`oplog_entry::INDEX_BUILD_COMMIT`), or as the entry itself.
+    let commit = oplog_entry
+        .get_bool(crate::oplog_entry::INDEX_BUILD_COMMIT)
+        .unwrap_or(false);
     let created = cmd
         .get_str("createIndexes")
-        .map(|c| (c, false))
+        .map(|c| (c, commit))
         .or_else(|_| cmd.get_str("commitIndexBuild").map(|c| (c, true)));
     if let Ok((coll, whole_build)) = created {
         if !show_expanded_events {

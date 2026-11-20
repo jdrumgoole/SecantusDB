@@ -22,6 +22,13 @@ pub const APPLY_OPS_INDEX: &str = "applyOpsIndex";
 /// `txnOpIndex` of its own in the resume token.
 pub const IN_APPLY_OPS: &str = "inApplyOps";
 
+/// The field of an unwound operation that says it is a two-phase index
+/// build's `commitIndexBuild`, rewritten to the `createIndexes` replay reads:
+/// change streams give it one `createIndexes` event listing every index the
+/// build made, each spec as the entry has it, where a `createIndexes` entry
+/// of mongod's is one index.
+pub const INDEX_BUILD_COMMIT: &str = "indexBuildCommit";
+
 /// Whether `entry` is an `applyOps` entry: a command on `admin.$cmd` whose
 /// `o.applyOps` is an array.
 pub fn is_apply_ops(entry: &Document) -> bool {
@@ -208,6 +215,7 @@ fn normalise_command(op: &mut Document) {
             "o",
             bson::doc! {"createIndexes": coll, "indexes": indexes.clone()},
         );
+        op.insert(INDEX_BUILD_COMMIT, true);
         return;
     }
     if let Ok(coll) = o.get_str("createIndexes") {

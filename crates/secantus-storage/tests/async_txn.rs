@@ -29,6 +29,9 @@ fn with_db(body: impl FnOnce(&Storage)) {
         home.to_str().unwrap(),
         &StorageOptions {
             data_nonlogged: Some(true),
+            // Unlogged data is recovered from a logged oplog (RM-731), whatever
+            // the non-logged-oplog CI lane asks.
+            oplog_nonlogged: Some(false),
             ..StorageOptions::default()
         },
     )

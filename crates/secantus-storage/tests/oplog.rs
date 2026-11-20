@@ -598,6 +598,9 @@ fn reopening_a_timestamped_store_again_and_again_never_commits_behind_wiredtiger
     let opts = secantus_storage::StorageOptions {
         durable: Some(true),
         data_nonlogged: Some(true),
+        // Unlogged data is recovered from a logged oplog (RM-731), whatever
+        // the non-logged-oplog CI lane asks.
+        oplog_nonlogged: Some(false),
         ..secantus_storage::StorageOptions::default()
     };
     let mut last_tail = 0;

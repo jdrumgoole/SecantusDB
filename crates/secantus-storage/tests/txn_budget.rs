@@ -94,6 +94,9 @@ fn async_transaction_dirty_budget_bounds_pending_async() {
         &StorageOptions {
             wt_config: Some(secantus_storage::wt_config("128M", 1000, false, "10MB")),
             data_nonlogged: Some(true),
+            // Unlogged data is recovered from a logged oplog (RM-731), whatever
+            // the non-logged-oplog CI lane asks.
+            oplog_nonlogged: Some(false),
             ..StorageOptions::default()
         },
     )
