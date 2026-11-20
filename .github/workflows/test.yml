@@ -1325,6 +1325,7 @@ jobs:
             python -m pytest tests/test_rust_binary_smoke.py tests/test_rust_binary_pitr.py \
             tests/test_rust_binary_crash_durability.py \
             tests/test_rust_crash_kill_loop.py \
+            tests/test_rust_oplog_matches_mongod.py \
             -o addopts= -p no:cacheprovider -q -rs
 
       - name: Disk watchdog report (RP-312)
@@ -1493,6 +1494,7 @@ jobs:
           uv run python -m pytest tests/test_rust_binary_smoke.py tests/test_rust_binary_pitr.py \
             tests/test_rust_binary_crash_durability.py \
             tests/test_rust_crash_kill_loop.py \
+            tests/test_rust_oplog_matches_mongod.py \
             -o addopts= -p no:cacheprovider -p no:randomly -q -rs
 
       - name: Rust MongoDB server against mongod (the backlog's tests)

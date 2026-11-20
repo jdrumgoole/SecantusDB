@@ -277,6 +277,10 @@ pub struct ChangeStreamOptions {
     pub split_large_events: bool,
     /// `startAtOperationTime`: an entry before it is not an event.
     pub start_ts: Option<bson::Timestamp>,
+    /// Resuming from the token of an event inside an `applyOps` entry:
+    /// `(position of the entry, place of that event in it)`. The entry's
+    /// events before that place were delivered already.
+    pub resume_skip: Option<(i64, i64)>,
 }
 
 /// One poll of the oplog tail for a change-stream cursor: the projected event
@@ -509,6 +513,12 @@ pub trait Storage: Send + Sync {
     /// is malformed. Kept on the seam so the token format stays in the
     /// WiredTiger-linked `changestreams` module. Default: `None`.
     fn resume_token_seq(&self, _token: &Document) -> Option<i64> {
+        None
+    }
+
+    /// The place of a token's event in its `applyOps` entry (`txnOpIndex`),
+    /// when it names one inside an entry. Default: `None`.
+    fn resume_token_op_index(&self, _token: &Document) -> Option<i64> {
         None
     }
 

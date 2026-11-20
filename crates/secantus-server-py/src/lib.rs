@@ -235,7 +235,6 @@ impl RustServer {
                 // mongod's split by default, as `secantusd-mdb` (RM-210).
                 data_nonlogged: Some(data_nonlogged.unwrap_or(true)),
                 checkpoint_seconds,
-                transactions_logged_at_commit: true,
                 // mongod's lock file: a clean shutdown empties it, and the next
                 // start reads an unclean one from it (RM-305).
                 lock_file: Some("mongod.lock".to_string()),

@@ -29,7 +29,6 @@ fn with_db(body: impl FnOnce(&Storage)) {
         home.to_str().unwrap(),
         &StorageOptions {
             data_nonlogged: Some(true),
-            transactions_logged_at_commit: true,
             ..StorageOptions::default()
         },
     )
@@ -103,10 +102,22 @@ fn committed_txn_entries_land_exactly_once_after_commit() {
             .iter()
             .map(|(_, b)| decode(b).get_str("op").unwrap().to_string())
             .collect();
-        // The collection's creation, then the two inserts, each exactly once.
+        // The collection's creation, then the transaction: one `applyOps`
+        // entry holding the two inserts, each exactly once.
+        assert_eq!(ops, vec!["c", "c"], "the creation and one entry");
+        let rows = st.read_oplog(1, 100).unwrap();
+        let txn = decode(&rows[1].1);
+        let inner: Vec<String> = txn
+            .get_document("o")
+            .unwrap()
+            .get_array("applyOps")
+            .unwrap()
+            .iter()
+            .map(|o| o.as_document().unwrap().get_str("op").unwrap().to_string())
+            .collect();
         assert_eq!(
-            ops,
-            vec!["c", "i", "i"],
+            inner,
+            vec!["i", "i"],
             "exactly the two inserts, exactly once"
         );
     });

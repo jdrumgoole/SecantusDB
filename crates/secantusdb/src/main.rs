@@ -369,7 +369,6 @@ fn storage_options(cli: &CliArgs) -> StorageOptions {
         // past time reads by (RM-210); `--data-logged` opts out.
         data_nonlogged: Some(cli.data_nonlogged.unwrap_or(true)),
         checkpoint_seconds: cli.checkpoint_seconds,
-        transactions_logged_at_commit: true,
         // mongod's lock file: a clean shutdown empties it, and the next
         // start reads an unclean one from it (RM-305).
         lock_file: Some("mongod.lock".to_string()),

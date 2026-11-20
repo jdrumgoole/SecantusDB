@@ -312,16 +312,23 @@ pub fn restore_from_archive_dir(
     // entry's timestamp is immutable). `claims` says, for the first row of
     // each segment and of the live oplog, which entry it directly follows.
     let mut rows: BTreeMap<i64, Document> = BTreeMap::new();
-    let mut pre_map: std::collections::HashMap<i64, Vec<u8>> = std::collections::HashMap::new();
+    let mut pre_map: std::collections::HashMap<(i64, i64), Vec<u8>> =
+        std::collections::HashMap::new();
     let mut claims = segment_claims(archive_dir);
     for (seq, entry, pre) in iter_archived_oplog(archive_dir)? {
         if seq > base_head {
             rows.entry(seq).or_insert(entry);
+            // `p`: each write's pre-image by its place in the entry.
             if let Some(p) = pre {
-                let mut buf = Vec::new();
-                secantus_core::bsondoc::write(&p, &mut buf)
-                    .map_err(|e| StorageError::Bson(e.to_string()))?;
-                pre_map.entry(seq).or_insert(buf);
+                for (index, v) in &p {
+                    let (Ok(index), Bson::Document(v)) = (index.parse::<i64>(), v) else {
+                        continue;
+                    };
+                    let mut buf = Vec::new();
+                    secantus_core::bsondoc::write(v, &mut buf)
+                        .map_err(|e| StorageError::Bson(e.to_string()))?;
+                    pre_map.entry((seq, index)).or_insert(buf);
+                }
             }
         }
     }
@@ -348,9 +355,9 @@ pub fn restore_from_archive_dir(
                         let entry = secantus_core::bsondoc::from_bytes(blob)
                             .map_err(|e| StorageError::Bson(e.to_string()))?;
                         rows.entry(*seq).or_insert(entry);
-                        if carry_oplog && !pre_map.contains_key(seq) {
-                            if let Some(pre) = src.read_preimage(*seq)? {
-                                pre_map.insert(*seq, pre);
+                        if carry_oplog {
+                            for (index, pre) in src.read_preimages_of(*seq)? {
+                                pre_map.entry((*seq, index)).or_insert(pre);
                             }
                         }
                     }
@@ -394,9 +401,10 @@ pub fn restore_from_archive_dir(
     let (stats, carried) =
         crate::replay::replay_entries(&target, &contiguous, to_ts, to_wall_ms, carry_oplog)?;
     if carry_oplog && !carried.is_empty() {
-        let carried_pre: std::collections::HashMap<i64, Vec<u8>> = carried
+        let carried_pre: std::collections::HashMap<(i64, i64), Vec<u8>> = pre_map
             .iter()
-            .filter_map(|(seq, _)| pre_map.get(seq).map(|p| (*seq, p.clone())))
+            .filter(|((seq, _), _)| carried.iter().any(|(c, _)| c == seq))
+            .map(|(k, v)| (*k, v.clone()))
             .collect();
         target.import_oplog_segment(&carried, &carried_pre)?;
     }

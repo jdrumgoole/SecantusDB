@@ -49,13 +49,20 @@ fn project_op(
     // Async lane: wait out the drainer so the emitted entry is readable
     // (no-op in sync mode).
     st.flush_oplog();
-    let (seq, blob) = st
+    // The entry's operations, one at a time (an `applyOps` entry holds
+    // several): what the change stream projects.
+    let (seq, entry) = st
         .read_oplog(1, 100)
         .unwrap()
         .into_iter()
-        .find(|(_, b)| decode(b).get_str("op").unwrap() == op)
+        .find_map(|(seq, b)| {
+            secantus_storage::oplog_entry::unwind(&decode(&b))
+                .into_iter()
+                .find(|o| o.get_str("op") == Ok(op))
+                .map(|o| (seq, o))
+        })
         .expect("oplog entry");
-    changestreams::project(seq, &decode(&blob), st, full_doc, before, scope, false).unwrap()
+    changestreams::project(seq, &entry, st, full_doc, before, scope, false).unwrap()
 }
 
 fn coll_scope() -> Scope {
@@ -400,6 +407,7 @@ fn resume_token_round_trips() {
         document_key: doc! {"_id": 7},
         from_invalidate: false,
         fragment: None,
+        op_index: None,
     };
     let token = changestreams::make_resume_token(&data).unwrap();
     let parsed = changestreams::parse_resume_token(&token).unwrap();
@@ -432,6 +440,7 @@ fn over_16mb_event_splits_as_mongod_splits_it() {
         document_key: doc! {"_id": 1},
         from_invalidate: false,
         fragment: None,
+        op_index: None,
     })
     .unwrap();
     let event = doc! {

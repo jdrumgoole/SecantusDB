@@ -290,6 +290,9 @@ def _burst(
         time.sleep(0.01)
     time.sleep(rng.uniform(0.0, 0.8))
     killed_at = time.monotonic()
+    # Still running at the moment of the kill? A server that went before it
+    # was not killed by this test.
+    exited_before = server.proc.poll()
     server.kill()
     stop.set()
     for t in threads:
@@ -298,7 +301,9 @@ def _burst(
     for w in writers:
         if w.error is not None and w.error[0] < killed_at - 0.05:
             raise AssertionError(
-                f"writer {w.k} failed BEFORE the kill (not a crash artefact): {w.error[1]!r}\n"
+                f"writer {w.k} failed BEFORE the kill (not a crash artefact): {w.error[1]!r} "
+                f"({killed_at - w.error[0]:.3f}s before it, running {w.inflight}, "
+                f"seed {_SEED}, server exit status before the kill: {exited_before})\n"
                 + "".join(server.tail)
             )
     return killed_at

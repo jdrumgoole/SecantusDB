@@ -250,3 +250,72 @@ fn a_kill_before_the_first_checkpoint_keeps_the_oplog_and_replays_it() {
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_file(format!("{}.uri", home.to_str().unwrap()));
 }
+
+/// A transaction too large for one entry is logged as mongod logs it
+/// (`tests/fixtures/storage_model/mongod-8.2.11-oplog-batching.json`, twenty 1 MB
+/// inserts): a chain of `applyOps` entries, the first `partialTxn: true` with
+/// sixteen operations, the last `count: 20` with four, each after the one
+/// before by `prevOpTime`.
+#[test]
+fn a_transaction_over_the_entry_limit_is_a_partial_txn_chain() {
+    with_db(|st| {
+        st.create_collection("app", "big").unwrap();
+        let before = st.oplog_tail_seq();
+        let mut txn = st.begin_user_transaction().unwrap();
+        st.with_user_transaction(&mut txn, || {
+            for i in 0..20 {
+                st.insert_one(
+                    "app",
+                    "big",
+                    &enc(&doc! {"_id": i, "p": "x".repeat(1_000_000)}),
+                )
+                .unwrap();
+            }
+        })
+        .unwrap();
+        st.commit_user_transaction(&mut txn).unwrap();
+        let rows = st.read_oplog(before + 1, 100).unwrap();
+        assert_eq!(rows.len(), 2, "two entries");
+        let entries: Vec<Document> = rows
+            .iter()
+            .map(|(_, b)| bson::from_slice(b).unwrap())
+            .collect();
+        let ops = |e: &Document| {
+            e.get_document("o")
+                .unwrap()
+                .get_array("applyOps")
+                .unwrap()
+                .len()
+        };
+        assert_eq!((ops(&entries[0]), ops(&entries[1])), (16, 4));
+        assert_eq!(
+            entries[0].get_document("o").unwrap().get_bool("partialTxn"),
+            Ok(true)
+        );
+        assert_eq!(
+            entries[1].get_document("o").unwrap().get_i32("count"),
+            Ok(20)
+        );
+        let prev = |e: &Document| {
+            e.get_document("prevOpTime")
+                .unwrap()
+                .get_timestamp("ts")
+                .unwrap()
+        };
+        assert_eq!(
+            prev(&entries[0]),
+            bson::Timestamp {
+                time: 0,
+                increment: 0
+            }
+        );
+        assert_eq!(prev(&entries[1]), entries[0].get_timestamp("ts").unwrap());
+        assert!(rows[1].0 > rows[0].0);
+        // All twenty are in the collection, and a replay reads all twenty.
+        let unwound: usize = entries
+            .iter()
+            .map(|e| secantus_storage::oplog_entry::unwind(e).len())
+            .sum();
+        assert_eq!(unwound, 20);
+    });
+}

@@ -25,6 +25,19 @@ usual message.
 
 #### Changed
 
+- The oplog holds mongod's entries, as `mongod` 8.2.11 logged them in the
+  measured corpus (`tests/test_rust_oplog_matches_mongod.py`): a batched
+  insert or delete and a transaction are one `applyOps` entry (a transaction
+  over the size limit a `partialTxn` chain), an update is mongod's `$v: 2`
+  delta, a delete has no `o2`, a retryable write names its session, statement
+  and image in mongod's fields, and `find` on `local.oplog.rs` returns what is
+  stored. Change-stream events of one transaction have their own resume tokens
+  (`txnOpIndex`), and a stream resumes from any of them.
+- A prepared transaction (PostgreSQL's `PREPARE TRANSACTION`) is logged in
+  mongod's prepare form: an `applyOps` with `prepare: true`, then
+  `commitTransaction` or `abortTransaction` linked to it by `prevOpTime`. A
+  user transaction logs nothing until it commits.
+
 - Store format 5: `local.oplog.rs` replaces `secantus_oplog_sh*`,
   `secantus_oplog` and the oplog `state` row; the clock resumes from the
   newest entry at open.

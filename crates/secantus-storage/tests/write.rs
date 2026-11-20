@@ -321,14 +321,9 @@ fn update_operator_emits_v2_diff_oplog() {
         assert_eq!(e.get_str("op").unwrap(), "u");
         let o = e.get_document("o").unwrap();
         assert_eq!(o.get_i32("$v").unwrap(), 2);
+        // mongod's `$v: 2` delta: `y` is a field the document did not have, so `i`.
         let diff = o.get_document("diff").unwrap();
-        assert_eq!(
-            diff.get_document("updatedFields")
-                .unwrap()
-                .get_i32("y")
-                .unwrap(),
-            7
-        );
+        assert_eq!(diff.get_document("i").unwrap().get_i32("y").unwrap(), 7);
         assert_eq!(e.get_document("o2").unwrap().get_i32("_id").unwrap(), 1);
     });
 }
@@ -444,7 +439,7 @@ fn delete_emits_oplog_delete_entry() {
         let e = decode(&rows[0].1);
         assert_eq!(e.get_str("op").unwrap(), "d");
         assert_eq!(e.get_document("o").unwrap().get_i32("_id").unwrap(), 42);
-        assert_eq!(e.get_document("o2").unwrap().get_i32("_id").unwrap(), 42);
+        assert!(!e.contains_key("o2"), "mongod's delete entry has no o2");
     });
 }
 

@@ -604,6 +604,53 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
      is still entries x 16 KiB (4b-5); `oplog_pruned_through` and the
      retention cap are entry-count based (4b-5).
 
+   **As built (4b-2, still format 5):** what is stored is what mongod logs.
+   - The entries are built when they are written (`oplog_view_entries`, now
+     the writer's, not a view): a plain insert as it is, `ts, t, v, wall`
+     appended; a batched insert or delete, and a transaction, as one `applyOps`
+     entry at the first of the timestamps they were minted; an update's `o` is
+     mongod's `$v: 2` delta; a delete has no `o2`; a retryable write names
+     `lsid, txnNumber, stmtId, needsRetryImage, prevOpTime` (the chain kept in
+     memory and, after a restart, read from the session's
+     `config.transactions` row). `rw`, `bg` and `pi` are gone, and
+     `find` on `local.oplog.rs` returns the stored rows. A transaction over
+     16 MiB less 16 KiB is mongod's `partialTxn` chain (16 + 4 of twenty 1 MB
+     inserts, as measured), `count` on the last.
+   - Readers take one operation at a time through `oplog_entry::unwind`: an
+     entry's operations (an `applyOps`' elements), each with its entry's
+     fields, its place in the entry (`applyOpsIndex`) and, for an update, the
+     `updateDescription` its delta describes -- `secantus_core::diff`
+     reads the delta back with the code that makes the descriptions
+     (`update_description_from_oplog_diff`, `apply_oplog_diff`), as mongod's
+     change stream builds its event from the delta alone. Change streams,
+     replay, crash recovery, the pre-image lookup and the PITR carry-over use
+     it. A pre-image is found by `(ui, entry ts, applyOpsIndex)`, so the `pi`
+     field was never needed.
+   - A change-stream event inside an `applyOps` has `txnOpIndex` in its resume
+     token (`x`); a resume from it reads the entry again and skips the events
+     before it.
+   - Every user transaction, the PostgreSQL server's included, holds its
+     entries on its handle to its commit (`pending_async`, which is also its
+     write set and the READ COMMITTED overlay's source), then logs them as one
+     entry under a session of its own (`oplog_session`: a synthetic lsid, as
+     mongod's entry names one). `transactions_logged_at_commit` is gone: it is
+     always so. An open transaction therefore mints nothing and pins nothing.
+   - PREPARE TRANSACTION writes mongod's prepare entry (`o: {applyOps,
+     prepare: true}`) at the prepare, in a transaction of its own, and records
+     its position (`prepareTs`) and session in the prepared-xact row, which
+     keeps the write set for a restart; COMMIT PREPARED writes
+     `{commitTransaction: 1, commitTimestamp: <prepare ts>}` in the
+     transaction that commits, ROLLBACK PREPARED writes `abortTransaction`,
+     each with `prevOpTime` the prepare entry. "Already committed" is the
+     presence of that commit entry.
+   - DDL: `dropDatabase` has `fromMigrate: false`; `create`, `collMod`,
+     `dropIndexes`, `rename`, `drop` and a one-index `createIndexes` were
+     already in the measured shapes. **Not done: two-phase index builds** --
+     the `config.system.indexBuilds` insert, `startIndexBuild`, its update,
+     `commitIndexBuild` and its delete; the corpus test names the step.
+     Names that are not UTF-8 are stored as mongod stores them and not
+     re-escaped for the engine's readers.
+
    **Landing:** 4b-1 to 4b-3 cannot land apart (the table, what is in it
    and every reader of it), so they land together as store format 5, with
    the crash tests: kill -9 at random points of a write burst, many times,

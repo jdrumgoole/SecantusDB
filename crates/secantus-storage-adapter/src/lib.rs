@@ -25,6 +25,7 @@ use secantus_commands::storage::{
     MatchedRows, RawHint, Storage as CmdStorage, StorageError, UpdateOutcome,
 };
 use secantus_storage::changestreams::{self, ResumeTokenData, Scope as WtScope};
+use secantus_storage::oplog_entry as wt_oplog_entry;
 use secantus_storage::{
     ExplainPlan, Hint, Storage as WtStorage, StorageError as WtError, UserTransactionHandle,
 };
@@ -372,50 +373,67 @@ impl CmdStorage for StorageAdapter {
             // projects to nothing (noop heartbeats / other-scope writes) — that
             // keeps the resume token moving and the next poll cheap.
             new_position = seq;
-            let entry = secantus_commands::bsondoc::from_bytes(blob.as_slice())
+            let stored = secantus_commands::bsondoc::from_bytes(blob.as_slice())
                 .map_err(|e| StorageError::Internal(format!("oplog decode: {e}")))?;
-            // `startAtOperationTime`: nothing before it is an event.
-            if let Some(start) = opts.start_ts {
-                if matches!(entry.get("ts"), Some(bson::Bson::Timestamp(t)) if *t < start) {
-                    continue;
+            // An `applyOps` entry (a transaction's writes, a batch's) is
+            // several events, each told apart by its place in the entry
+            // (`txnOpIndex`).
+            for entry in wt_oplog_entry::unwind(&stored) {
+                // `startAtOperationTime`: nothing before it is an event.
+                if let Some(start) = opts.start_ts {
+                    if matches!(entry.get("ts"), Some(bson::Bson::Timestamp(t)) if *t < start) {
+                        continue;
+                    }
+                }
+                // Resuming from an event inside an entry: the ones before it
+                // were delivered.
+                if let Some((at, index)) = opts.resume_skip {
+                    if at == seq
+                        && entry.get_i64(wt_oplog_entry::APPLY_OPS_INDEX).unwrap_or(0) < index
+                    {
+                        continue;
+                    }
+                }
+                let projected = changestreams::project(
+                    seq,
+                    &entry,
+                    &self.inner,
+                    &opts.full_document,
+                    &opts.full_document_before_change,
+                    &wt_scope,
+                    opts.show_expanded_events,
+                );
+                // A fatal projection error (e.g. fullDocument: required with
+                // changeStreamPreAndPostImages disabled) ends the stream with an
+                // ok: 0 reply rather than tearing down the poll — surface it via the
+                // batch so the producer/getMore can report it. mongod 6.0.16 answers
+                // a missing required pre-/post-image with 47 `NoMatchingDocument`
+                // (measured 2026-08-29), NOT the 280 it uses when a pipeline strips
+                // the resume token — every storage-side fatal here is the former.
+                let (event, invalidates) = match projected {
+                    Ok(v) => v,
+                    Err(WtError::ChangeStreamFatal(m)) => {
+                        fatal = Some((47, m));
+                        break;
+                    }
+                    Err(e) => return Err(map_err(e)),
+                };
+                if let Some(ev) = event {
+                    push_event(&mut events, ev, opts.split_large_events)?;
+                    if invalidates {
+                        // An invalidating event (drop / rename / dropDatabase on the
+                        // watched scope) is followed by a synthesized terminal
+                        // `invalidate` event, then the cursor closes — mirroring
+                        // `commands.py`'s producer (project → invalidate_event → break).
+                        let inv = changestreams::invalidate_event(seq, &entry).map_err(map_err)?;
+                        push_event(&mut events, inv, opts.split_large_events)?;
+                        invalidated = true;
+                        break;
+                    }
                 }
             }
-            let projected = changestreams::project(
-                seq,
-                &entry,
-                &self.inner,
-                &opts.full_document,
-                &opts.full_document_before_change,
-                &wt_scope,
-                opts.show_expanded_events,
-            );
-            // A fatal projection error (e.g. fullDocument: required with
-            // changeStreamPreAndPostImages disabled) ends the stream with an
-            // ok: 0 reply rather than tearing down the poll — surface it via the
-            // batch so the producer/getMore can report it. mongod 6.0.16 answers
-            // a missing required pre-/post-image with 47 `NoMatchingDocument`
-            // (measured 2026-08-29), NOT the 280 it uses when a pipeline strips
-            // the resume token — every storage-side fatal here is the former.
-            let (event, invalidates) = match projected {
-                Ok(v) => v,
-                Err(WtError::ChangeStreamFatal(m)) => {
-                    fatal = Some((47, m));
-                    break;
-                }
-                Err(e) => return Err(map_err(e)),
-            };
-            if let Some(ev) = event {
-                push_event(&mut events, ev, opts.split_large_events)?;
-                if invalidates {
-                    // An invalidating event (drop / rename / dropDatabase on the
-                    // watched scope) is followed by a synthesized terminal
-                    // `invalidate` event, then the cursor closes — mirroring
-                    // `commands.py`'s producer (project → invalidate_event → break).
-                    let inv = changestreams::invalidate_event(seq, &entry).map_err(map_err)?;
-                    push_event(&mut events, inv, opts.split_large_events)?;
-                    invalidated = true;
-                    break;
-                }
+            if fatal.is_some() || invalidated {
+                break;
             }
         }
         Ok(ChangeStreamBatch {
@@ -455,6 +473,12 @@ impl CmdStorage for StorageAdapter {
 
     fn resume_token_seq(&self, token: &Document) -> Option<i64> {
         changestreams::parse_resume_token(token).ok().map(|d| d.seq)
+    }
+
+    fn resume_token_op_index(&self, token: &Document) -> Option<i64> {
+        changestreams::parse_resume_token(token)
+            .ok()
+            .and_then(|d| d.op_index)
     }
 
     fn resume_token_from_invalidate(&self, token: &Document) -> bool {
@@ -546,6 +570,7 @@ impl CmdStorage for StorageAdapter {
             document_key: Document::new(),
             from_invalidate: false,
             fragment: None,
+            op_index: None,
         };
         match changestreams::make_resume_token(&data) {
             Ok(doc) => {

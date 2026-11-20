@@ -158,9 +158,19 @@ fn batch_insert_emits_oplog_inserts() {
         .unwrap();
         st.flush_oplog();
         let rows = st.read_oplog(floor + 1, 100).unwrap();
-        let inserts = rows
+        // mongod logs a batch of inserts as one `applyOps` entry.
+        // The collection's creation, then the batch.
+        assert_eq!(rows.len(), 2);
+        let entry = decode(&rows[1].1);
+        assert_eq!(entry.get_str("op").unwrap(), "c");
+        assert_eq!(entry.get_str("ns").unwrap(), "admin.$cmd");
+        let inserts = entry
+            .get_document("o")
+            .unwrap()
+            .get_array("applyOps")
+            .unwrap()
             .iter()
-            .filter(|(_s, b)| decode(b).get_str("op").ok() == Some("i"))
+            .filter(|o| o.as_document().unwrap().get_str("op") == Ok("i"))
             .count();
         assert_eq!(inserts, 2);
     });

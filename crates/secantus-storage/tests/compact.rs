@@ -35,7 +35,6 @@ fn open_like_the_server(home: &std::path::Path) -> Storage {
     let opts = secantus_storage::StorageOptions {
         wt_config: Some(secantus_storage::wt_config("256M", 1000, false, "10MB")),
         data_nonlogged: Some(true),
-        transactions_logged_at_commit: true,
         ..Default::default()
     };
     Storage::open_with_options(home.to_str().unwrap(), &opts).unwrap()

@@ -43,51 +43,31 @@ fn enc(d: &Document) -> Vec<u8> {
     bson::to_vec(d).unwrap()
 }
 
-/// A minted-but-uncommitted entry (open user transaction) must pin the
-/// visible tail below it: `wait_for_oplog` must not report past the hole and
-/// `read_oplog` must not serve later-committed rows across it. Once the
-/// transaction commits, everything becomes visible in position order. (A
-/// position is the entry's timestamp: `tail` below is the position of the
-/// newest entry minted, committed or not.)
+/// A user transaction's writes are held to its commit, as mongod holds a
+/// transaction's operations: an open transaction has minted nothing, so it
+/// pins nothing and a write committed beside it is visible at once; at its
+/// commit the transaction is one entry, after those. (A position is the
+/// entry's timestamp: `tail` is the position of the newest entry minted.)
 #[test]
-fn in_flight_txn_pins_visible_tail() {
+fn an_open_transaction_logs_nothing_until_it_commits() {
     with_db(|st| {
-        // p1: plain committed insert (baseline position).
         st.insert_one("app", "x", &enc(&doc! {"_id": 0})).unwrap();
         let p1 = st.oplog_tail_seq();
         assert_eq!(st.wait_for_oplog(0, 10), p1);
 
-        // p2: minted inside an OPEN user transaction -- uncommitted.
         let mut txn = st.begin_user_transaction().unwrap();
         st.with_user_transaction(&mut txn, || {
             st.insert_one("app", "x", &enc(&doc! {"_id": 1}))
         })
         .unwrap()
         .unwrap();
-        let p2 = st.oplog_tail_seq();
-        assert!(p2 > p1);
+        // Nothing minted, so nothing in flight.
+        assert_eq!(st.oplog_tail_seq(), p1);
 
-        // p3: a different collection commits AFTER the in-flight mint.
+        // A different write commits beside it and is visible at once.
         st.insert_one("app", "y", &enc(&doc! {"_id": 2})).unwrap();
         let p3 = st.oplog_tail_seq();
-
-        // The visible tail must stay below p2: it is in flight, so
-        // reporting p3 would let a reader advance past the hole and lose it.
-        let tail = st.wait_for_oplog(p1, 10);
-        assert!(
-            (p1..p2).contains(&tail),
-            "tail {tail} passed a minted-but-uncommitted entry at {p2}"
-        );
-        // And the scan must not serve p3 across the in-flight hole.
-        let rows = st.read_oplog(p1 + 1, 100).unwrap();
-        assert!(
-            rows.is_empty(),
-            "read_oplog served rows past an in-flight mint: {:?}",
-            rows.iter().map(|(s, _)| *s).collect::<Vec<_>>()
-        );
-
-        // Commit resolves the hole: everything visible, in order.
-        st.commit_user_transaction(&mut txn).unwrap();
+        assert!(p3 > p1);
         assert_eq!(st.wait_for_oplog(p1, 10), p3);
         let seqs: Vec<i64> = st
             .read_oplog(p1 + 1, 100)
@@ -95,7 +75,27 @@ fn in_flight_txn_pins_visible_tail() {
             .iter()
             .map(|(s, _)| *s)
             .collect();
-        assert_eq!(seqs, vec![p2, p3]);
+        assert_eq!(seqs, vec![p3], "the insert only");
+        let before = seqs.len();
+
+        // The commit logs the transaction, after those, as one entry.
+        st.commit_user_transaction(&mut txn).unwrap();
+        let rows = st.read_oplog(p1 + 1, 100).unwrap();
+        assert_eq!(rows.len(), before + 1);
+        let (seq, blob) = rows.last().unwrap();
+        assert!(*seq > p3);
+        assert_eq!(st.wait_for_oplog(p1, 10), *seq);
+        let entry: Document = bson::from_slice(blob).unwrap();
+        assert_eq!(entry.get_str("op"), Ok("c"));
+        assert_eq!(
+            entry
+                .get_document("o")
+                .unwrap()
+                .get_array("applyOps")
+                .unwrap()
+                .len(),
+            1
+        );
     });
 }
 
@@ -144,49 +144,36 @@ fn ts_of(blob: &[u8]) -> bson::Timestamp {
     }
 }
 
-/// `find_seq_for_ts` (the startAtOperationTime mapping) must not finalise a
-/// position past an in-flight mint whose entry also qualifies: it waits for
-/// the in-flight window to drain past its committed-view answer and rescans,
-/// so a commit that lands mid-wait surfaces the earlier seq.
+/// `find_seq_for_ts` (the startAtOperationTime mapping) answers from what is
+/// committed at once while a user transaction is open: its writes are held to
+/// its commit and mint nothing, so there is no in-flight window to wait out.
 #[test]
-fn find_seq_for_ts_waits_for_in_flight_mint() {
+fn find_seq_for_ts_does_not_wait_on_an_open_transaction() {
     with_db(|st| {
-        // seq 1 (committed): gives us a readable ts to anchor the target.
         st.insert_one("app", "x", &enc(&doc! {"_id": 0})).unwrap();
         let rows = st.read_oplog(1, 1).unwrap();
         let ts1 = ts_of(&rows[0].1);
-        let _p1 = rows[0].0;
-        // Target: strictly after seq 1's ts, at or before every later mint.
         let target = bson::Timestamp {
             time: ts1.time,
             increment: ts1.increment + 1,
         };
 
-        // seq 2: minted in an OPEN transaction — its ts satisfies the target,
-        // but the committed view's first match is seq 3.
         let mut txn = st.begin_user_transaction().unwrap();
         st.with_user_transaction(&mut txn, || {
             st.insert_one("app", "x", &enc(&doc! {"_id": 1}))
         })
         .unwrap()
         .unwrap();
-        let p2 = st.oplog_tail_seq();
-        // seq 3: committed after the in-flight mint.
         st.insert_one("app", "y", &enc(&doc! {"_id": 2})).unwrap();
+        let p3 = st.oplog_tail_seq();
 
-        // Commit the transaction from another thread while find_seq_for_ts
-        // waits on the in-flight window.
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                std::thread::sleep(std::time::Duration::from_millis(120));
-                st.commit_user_transaction(&mut txn).unwrap();
-            });
-            let seq = st.find_seq_for_ts(target).unwrap();
-            assert_eq!(
-                seq, p2,
-                "startAtOperationTime finalised past an in-flight mint"
-            );
-        });
+        let started = std::time::Instant::now();
+        assert_eq!(st.find_seq_for_ts(target).unwrap(), p3);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "it waited on a transaction that minted nothing"
+        );
+        st.commit_user_transaction(&mut txn).unwrap();
     });
 }
 
@@ -225,10 +212,10 @@ fn find_seq_for_ts_rolled_back_mint_returns_committed_answer() {
     });
 }
 
-/// Multi-statement transaction: every statement's mint joins the same
-/// in-flight window; nothing leaks visible until the single commit.
+/// A multi-statement transaction is one entry, at its commit, holding every
+/// statement's writes; nothing of it shows before.
 #[test]
-fn multi_statement_txn_holds_all_mints_until_commit() {
+fn a_multi_statement_txn_is_one_entry_at_its_commit() {
     with_db(|st| {
         st.insert_one("app", "x", &enc(&doc! {"_id": 0})).unwrap();
         let p1 = st.oplog_tail_seq();
@@ -239,29 +226,27 @@ fn multi_statement_txn_holds_all_mints_until_commit() {
         })
         .unwrap()
         .unwrap();
-        let p2 = st.oplog_tail_seq();
         st.with_user_transaction(&mut txn, || {
             st.insert_one("app", "y", &enc(&doc! {"_id": 2}))
         })
         .unwrap()
         .unwrap();
-        let p3 = st.oplog_tail_seq();
-
-        // Concurrent autocommit writer lands the fourth.
-        st.insert_one("app", "z", &enc(&doc! {"_id": 3})).unwrap();
-        let p4 = st.oplog_tail_seq();
-
-        assert!((p1..p2).contains(&st.wait_for_oplog(p1, 10)));
+        assert_eq!(st.oplog_tail_seq(), p1);
         assert!(st.read_oplog(p1 + 1, 100).unwrap().is_empty());
 
         st.commit_user_transaction(&mut txn).unwrap();
-        assert_eq!(st.wait_for_oplog(p1, 10), p4);
-        let seqs: Vec<i64> = st
-            .read_oplog(p1 + 1, 100)
+        let rows = st.read_oplog(p1 + 1, 100).unwrap();
+        assert_eq!(rows.len(), 1, "one entry");
+        let entry: Document = bson::from_slice(&rows[0].1).unwrap();
+        let ops: Vec<&str> = entry
+            .get_document("o")
+            .unwrap()
+            .get_array("applyOps")
             .unwrap()
             .iter()
-            .map(|(s, _)| *s)
+            .map(|o| o.as_document().unwrap().get_str("ns").unwrap())
             .collect();
-        assert_eq!(seqs, vec![p2, p3, p4]);
+        assert_eq!(ops, vec!["app.x", "app.y"]);
+        assert!(entry.contains_key("lsid") && entry.contains_key("txnNumber"));
     });
 }

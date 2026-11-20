@@ -58,6 +58,7 @@ mod auto_compact;
 mod catalog_changes;
 pub mod changestreams;
 pub mod compact;
+pub mod oplog_entry;
 pub mod pitr_archive;
 pub mod repair;
 pub mod replay;
@@ -205,14 +206,6 @@ pub struct StorageOptions {
     /// Stable-checkpoint cadence in seconds for the data-nonlogged mode
     /// (`SECANTUS_CHECKPOINT_SECONDS`, default 60).
     pub checkpoint_seconds: Option<u64>,
-    /// Log a user transaction's writes as mongod does: held to its commit,
-    /// then minted together and committed at their first timestamp, so a
-    /// read at a time before the commit never sees it (RM-210, RM-314).
-    /// Only in a timestamped store; the MongoDB server asks for it. Without
-    /// it each statement mints its own entries as it runs (the PostgreSQL
-    /// server's prepared transactions and read-committed rebases rely on
-    /// that), and its writes commit at the first of them.
-    pub transactions_logged_at_commit: bool,
     /// Take mongod's lock file of this name (`mongod.lock`) in the home
     /// before WiredTiger opens, and empty it on a clean close (see
     /// `lockfile.rs`). The MongoDB server asks for it; `None` takes none.
@@ -338,15 +331,19 @@ pub struct UserTransactionHandle {
     /// How many seqs `minted_ranges` holds (kept, not summed: a transaction
     /// of 50,000 statements would sum 50,000 ranges per statement).
     minted_total: usize,
-    /// Async-mode oplog entries buffered by this transaction's statements
+    /// The oplog entries this transaction's statements emitted
     /// (`IN_ASYNC_STMT` is held across every `with_user_transaction` scope, so
-    /// emits park in `PENDING_OPLOG` and are harvested here instead of
-    /// reaching the drainer mid-transaction). Minted + enqueued only after
-    /// the WT commit succeeds; discarded on rollback / commit-failure / Drop
-    /// — a rolled-back transaction must never surface a change event or PITR
-    /// entry (it would be a ghost: an oplog row for data that never
-    /// committed). Always empty in sync mode.
+    /// emits park in `PENDING_OPLOG` and are harvested here), held to its
+    /// commit as mongod holds a transaction's operations
+    /// (`TransactionOperations`): minted then, together, and logged as one
+    /// `applyOps`. Discarded on rollback / commit failure / Drop -- a
+    /// rolled-back transaction leaves no entry. It is also the write set a
+    /// prepared transaction records and a read-committed block overlays.
     pending_async: Vec<(OplogEntry, Option<Vec<u8>>)>,
+    /// The session and transaction number the transaction's entries carry when
+    /// no command layer names one (the PostgreSQL server's transactions):
+    /// mongod's `applyOps` entry of a transaction names its session.
+    oplog_session: Option<(Document, i64)>,
     /// Clones of the storage's oplog state + condvar so deregistration works
     /// from `Drop` without a `Storage` borrow.
     oplog: Arc<Mutex<OplogState>>,
@@ -535,6 +532,7 @@ impl UserTransactionHandle {
         self.snapshot_fixed
             || self.dirty_bytes > 0
             || !self.minted_ranges.is_empty()
+            || !self.pending_async.is_empty()
             || self.lock_only
     }
 }
@@ -1289,16 +1287,19 @@ fn update_oplog_o(desc: Document, pre: &Document, post: &Document, pipeline: boo
     o
 }
 
-/// The `local.oplog.rs` view of the stored entries, in order: each entry in
-/// mongod's shape ([`oplog_view_shape`]), the inserts of one group
-/// (`bg.g`, see `mark_insert_groups`) as the one `applyOps` entry mongod
-/// writes for them, and every entry carrying mongod's `t` (the term, 1 here)
-/// and `v` (2) after its `ts`.
-fn oplog_view_entries(entries: Vec<Document>) -> Vec<Document> {
+/// The entries a write logs, as mongod logs them: each in mongod's shape
+/// ([`oplog_view_shape`]), the inserts and deletes of one group (`bg.g`, see
+/// `mark_insert_groups`) as the one `applyOps` entry mongod writes for them, a
+/// transaction's writes as its one `applyOps`, and every entry carrying
+/// mongod's `t` (the term, 1 here) and `v` (2) after its `ts`. What is stored
+/// is what `find` on `local.oplog.rs` returns.
+fn oplog_view_entries(
+    entries: Vec<Document>,
+    chains: &mut HashMap<(Vec<u8>, i64), Bson>,
+) -> Vec<Document> {
     let mut out = Vec::with_capacity(entries.len());
-    // The last entry of each retryable write's session and transaction
-    // number, for its `prevOpTime` chain.
-    let mut chains: HashMap<(Vec<u8>, i64), Bson> = HashMap::new();
+    // `chains`: the last entry of each retryable write's session and
+    // transaction number, for its `prevOpTime` chain.
     let mut iter = entries.into_iter().peekable();
     while let Some(entry) = iter.next() {
         let rw = entry.get_document("rw").ok().cloned();
@@ -1336,7 +1337,7 @@ fn oplog_view_entries(entries: Vec<Document>) -> Vec<Document> {
         };
         let shaped = with_term_and_version(shaped);
         let mut shaped = match rw {
-            Some(rw) => with_retryable_session(shaped, &rw, group.is_some(), &mut chains),
+            Some(rw) => with_retryable_session(shaped, &rw, group.is_some(), chains),
             None => shaped,
         };
         view_names(&mut shaped);
@@ -1982,10 +1983,6 @@ fn count_oplog_entries(session: &Session, table: &str) -> i64 {
     }
     total
 }
-/// Where builds before RM-366 kept change stream pre-images: oplog seq ->
-/// the pre-image's bytes. Read once, at open, into
-/// `config.system.preimages` (`migrate_legacy_pre_images`) and emptied.
-const PREIMAGE_TABLE: &str = "table:secantus_preimages";
 /// The collection mongod 8.2.11 keeps change stream pre-images in: a
 /// clustered `config.system.preimages`, one document per pre-image, `{_id:
 /// {nsUUID, ts, applyOpsIndex}, operationTime, preImage}` (RM-366).
@@ -5271,6 +5268,10 @@ pub struct Storage {
     cache_bytes: u64,
     /// The WiredTiger URI of `local.oplog.rs`'s table (`table:collection-<UUID>`).
     oplog_uri: String,
+    /// The time of the last entry logged for each retryable write's session
+    /// and transaction number: the `prevOpTime` of the next one. A key it
+    /// does not hold is read from the session's `config.transactions` row.
+    retry_chains: Mutex<HashMap<(Vec<u8>, i64), bson::Timestamp>>,
     /// The TTL monitor's runtime settings and counters.
     ttl: TtlMonitor,
     /// Whether writes emit oplog entries (and the oplog tables are live). Mirrors
@@ -5340,8 +5341,6 @@ pub struct Storage {
     /// whose data tables are not logged: WiredTiger ignores timestamps on a
     /// logged table.
     timestamped: bool,
-    /// See [`StorageOptions::transactions_logged_at_commit`].
-    oplog_at_commit: bool,
     /// Highest oplog seq covered by the last stable checkpoint: the replay
     /// floor after a crash and the prune clamp (entries above it are the
     /// recovery source and must not be pruned). 0 until the first checkpoint.
@@ -7733,6 +7732,7 @@ impl Storage {
             txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
             cache_bytes: parse_cache_bytes(config),
             oplog_uri,
+            retry_chains: Mutex::new(HashMap::new()),
             ttl: TtlMonitor::default(),
             enable_oplog: true,
             oplog,
@@ -7750,7 +7750,6 @@ impl Storage {
             checkpoint_seconds: opts.checkpoint_seconds,
             data_nonlogged,
             timestamped: data_nonlogged,
-            oplog_at_commit: data_nonlogged && opts.transactions_logged_at_commit,
             stable_seq,
             checkpoint_stop: Arc::new(AtomicBool::new(false)),
             checkpoint_requested,
@@ -7778,9 +7777,6 @@ impl Storage {
         // Before the store takes any write -- crash recovery's replay and the
         // upgrades below write documents, and each write moves the counts.
         storage.open_size_storer(&size_fingerprint)?;
-        // Before recovery's replay, which records the pre-images of the
-        // writes it replays beside them.
-        storage.migrate_legacy_pre_images()?;
         if storage.data_nonlogged {
             // Crash recovery: the data tables rolled back to the last stable
             // checkpoint; the (WAL-logged) oplog has everything. Replay the
@@ -8672,6 +8668,20 @@ impl Storage {
         pre_images: Vec<Option<Vec<u8>>>,
         deferred: bool,
     ) -> Result<i64> {
+        self.mint_and_write_ext(session, entries, pre_images, deferred, false)
+    }
+
+    /// [`Self::mint_and_write`]; with `prepare`, the transaction's one
+    /// `applyOps` entry is mongod's prepare form (`o: {applyOps, prepare:
+    /// true}`).
+    fn mint_and_write_ext(
+        &self,
+        session: &Session,
+        entries: Vec<OplogEntry>,
+        pre_images: Vec<Option<Vec<u8>>>,
+        deferred: bool,
+        prepare: bool,
+    ) -> Result<i64> {
         let n = entries.len() as i64;
         let rw_at = entries.iter().rposition(has_retryable_stamp);
         let (start, ts) = self.mint_seq_and_ts(entries.len(), true);
@@ -8686,35 +8696,74 @@ impl Storage {
         let wall = Bson::DateTime(bson::DateTime::from_millis(wall_millis));
         let slots = pre_image_slots(&entries, &ts, &pre_images);
         let mut records: Vec<Vec<u8>> = Vec::new();
-        let mut last = 0i64;
-        for (i, entry) in entries.into_iter().enumerate() {
-            let seq = start + i as i64;
+        for (i, entry) in entries.iter().enumerate() {
             if let (Some(pre), Some(slot)) = (&pre_images[i], slots[i]) {
                 records.push(pre_image_record(
-                    &oplog_entry_ui(&entry, seq)?,
+                    &oplog_entry_ui(entry, start + i as i64)?,
                     slot,
                     wall_millis,
                     pre,
                 )?);
             }
-            let entry = stamp_pre_image_slot(entry, slots[i]);
-            // Stamp `ts` + `wall` (appended last, matching the historical field
-            // order `[…, o2, ts, wall]`) and produce the entry's BSON bytes. The
-            // `Raw` path splices the pre-encoded body straight through; the `Doc`
-            // path re-encodes the owned document as before.
-            let blob = match entry {
-                OplogEntry::Doc(mut d) => {
-                    d.insert("ts", Bson::Timestamp(ts[i]));
-                    d.insert("wall", wall.clone());
-                    encode_doc(&d)?
+        }
+        // What is stored is what mongod logs (`oplog_view_entries`): a plain
+        // insert as it is, with its `ts`, `t`, `v` and `wall`; anything else
+        // through the builder, which makes one entry of each batch and each
+        // transaction, at the first of the timestamps they were minted.
+        let mut finals: Vec<(i64, Vec<u8>)> = Vec::with_capacity(entries.len());
+        if entries
+            .iter()
+            .all(|e| matches!(e, OplogEntry::Raw(b) if raw_is_plain_insert(b)))
+        {
+            for (i, entry) in entries.into_iter().enumerate() {
+                let OplogEntry::Raw(buf) = entry else {
+                    unreachable!("checked above")
+                };
+                finals.push((
+                    ts_u64(ts[i]) as i64,
+                    append_ts_t_v_wall(buf.into_bytes(), ts[i], wall_millis),
+                ));
+            }
+        } else {
+            let mut docs: Vec<Document> = Vec::with_capacity(entries.len());
+            for (i, entry) in entries.into_iter().enumerate() {
+                let mut d = match entry {
+                    OplogEntry::Doc(d) => d,
+                    OplogEntry::Raw(buf) => decode_doc(buf.as_bytes())?,
+                };
+                d.insert("ts", Bson::Timestamp(ts[i]));
+                d.insert("wall", wall.clone());
+                docs.push(d);
+            }
+            let mut chains = self.retry_chains_for(&docs);
+            let mut shaped = oplog_view_entries(docs, &mut chains);
+            self.remember_retry_chains(chains);
+            if prepare {
+                for d in &mut shaped {
+                    if let Some(Bson::Document(o)) = d.get_mut("o") {
+                        if o.contains_key("applyOps") {
+                            o.insert("prepare", true);
+                        }
+                    }
                 }
-                OplogEntry::Raw(buf) => append_ts_wall(buf.into_bytes(), ts[i], wall_millis),
-            };
+            }
+            for d in shaped {
+                for part in split_partial_txn(d)? {
+                    let at = part
+                        .get_timestamp("ts")
+                        .map_err(|e| StorageError::Bson(e.to_string()))?;
+                    finals.push((ts_u64(at) as i64, encode_doc(&part)?));
+                }
+            }
+        }
+        let mut last = 0i64;
+        let written = finals.len() as i64;
+        for (seq, blob) in &finals {
             cur.reset()?;
-            cur.set_key_q(seq);
-            cur.set_value_u(&blob);
+            cur.set_key_q(*seq);
+            cur.set_value_u(blob);
             cur.insert()?;
-            last = seq;
+            last = *seq;
         }
         // In the write's own transaction, as mongod records a pre-image.
         self.write_pre_image_records(session, &records)?;
@@ -8739,8 +8788,8 @@ impl Storage {
                 note_oplog_slot_held(removed.map_or(0, |r| r.held_micros()));
                 self.oplog_cv.notify_all();
             }
-            g.emit_count += n;
-            g.live_count += n;
+            g.emit_count += written;
+            g.live_count += written;
             if g.emit_count >= OPLOG_PRUNE_INTERVAL {
                 g.emit_count = 0;
                 true
@@ -8901,6 +8950,67 @@ impl Storage {
         self.oplog_visible_tail_seq()
     }
 
+    /// The `prevOpTime` chain of each retryable write in `docs` (internal
+    /// entries about to be logged): the time of the session's last entry for
+    /// the transaction number, from memory or, after a restart, the session's
+    /// `config.transactions` row.
+    fn retry_chains_for(&self, docs: &[Document]) -> HashMap<(Vec<u8>, i64), Bson> {
+        let mut out = HashMap::new();
+        for d in docs {
+            let Some(rw) = d.get_document("rw").ok() else {
+                continue;
+            };
+            let (Ok(lsid), Ok(txn)) = (rw.get_document("lsid"), rw.get_i64("txnNumber")) else {
+                continue;
+            };
+            let key = (
+                secantus_core::bsondoc::to_vec(lsid).unwrap_or_default(),
+                txn,
+            );
+            if out.contains_key(&key) {
+                continue;
+            }
+            let held = self
+                .retry_chains
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .copied();
+            let last = held.or_else(|| {
+                let row = self
+                    .find_by_id("config", "transactions", &Bson::Document(lsid.clone()))
+                    .ok()
+                    .flatten()
+                    .and_then(|b| decode_doc(&b).ok())?;
+                let same = row.get("txnNum").and_then(Bson::as_i64) == Some(txn)
+                    || row.get_i32("txnNum").ok().map(i64::from) == Some(txn);
+                if !same {
+                    return None;
+                }
+                row.get_document("lastWriteOpTime")
+                    .ok()
+                    .and_then(|o| o.get_timestamp("ts").ok())
+            });
+            if let Some(ts) = last {
+                out.insert(key, Bson::Timestamp(ts));
+            }
+        }
+        out
+    }
+
+    /// Keep the chains a batch of entries advanced.
+    fn remember_retry_chains(&self, chains: HashMap<(Vec<u8>, i64), Bson>) {
+        let mut held = self.retry_chains.lock().unwrap_or_else(|e| e.into_inner());
+        if held.len() > 50_000 {
+            held.clear();
+        }
+        for (key, ts) in chains {
+            if let Bson::Timestamp(ts) = ts {
+                held.insert(key, ts);
+            }
+        }
+    }
+
     /// Whether `(db, coll)` is the synthetic `local.oplog.rs` view.
     fn is_oplog_rs(&self, db: &str, coll: &str) -> bool {
         self.enable_oplog && db == "local" && coll == "oplog.rs"
@@ -8933,12 +9043,9 @@ impl Storage {
         }
         let rows = self.read_oplog(0, usize::MAX)?;
         let mut out: Vec<(Document, Vec<u8>)> = Vec::with_capacity(rows.len());
-        let mut decoded = Vec::with_capacity(rows.len());
+        // What is stored is mongod's entry: no view over it.
         for (_seq, blob) in rows {
-            decoded.push(decode_doc(&blob)?);
-        }
-        for d in oplog_view_entries(decoded) {
-            let blob = encode_doc(&d)?;
+            let d = decode_doc(&blob)?;
             if filter.is_empty()
                 || query_matches(&d, filter, vars, coll_opt).map_err(query_fault)?
             {
@@ -9426,31 +9533,37 @@ impl Storage {
                 }
                 // The replayed write commits at its entry's own timestamp.
                 REPLAY_TS.with(|c| c.set(if self.timestamped { ts } else { 0 }));
-                // The pre-image the write recorded: its document as it stands
-                // before the replay, as mongod's oplog application records one.
-                let before = if was_enabled {
-                    self.replayed_pre_image(*seq, &entry)
-                } else {
-                    Ok(None)
-                };
-                let outcome = before.and_then(|before| {
-                    let retry_before = self.replayed_retry_pre_image(&entry)?;
-                    let applied = self.apply_replay_entry_idempotent(&entry)?;
-                    if let (true, Some(record)) = (applied, before) {
-                        self.write_pre_image_records_alone(&[record])?;
-                    }
-                    self.replay_session_state(&entry, applied, retry_before)?;
-                    Ok(applied)
-                });
-                REPLAY_TS.with(|c| c.set(0));
-                match outcome {
-                    Ok(true) => applied += 1,
-                    Ok(false) => skipped += 1,
-                    Err(e) => {
-                        self.enable_oplog = was_enabled;
-                        return Err(e);
+                // One operation at a time: an `applyOps` entry (a batch, a
+                // transaction) holds several.
+                for op in oplog_entry::unwind(&entry) {
+                    // The pre-image the write recorded: its document as it
+                    // stands before the replay, as mongod's oplog application
+                    // records one.
+                    let before = if was_enabled {
+                        self.replayed_pre_image(&op)
+                    } else {
+                        Ok(None)
+                    };
+                    let outcome = before.and_then(|before| {
+                        let retry_before = self.replayed_retry_pre_image(&op)?;
+                        let applied = self.apply_replay_entry_idempotent(&op)?;
+                        if let (true, Some(record)) = (applied, before) {
+                            self.write_pre_image_records_alone(&[record])?;
+                        }
+                        self.replay_session_state(&op, applied, retry_before)?;
+                        Ok(applied)
+                    });
+                    match outcome {
+                        Ok(true) => applied += 1,
+                        Ok(false) => skipped += 1,
+                        Err(e) => {
+                            REPLAY_TS.with(|c| c.set(0));
+                            self.enable_oplog = was_enabled;
+                            return Err(e);
+                        }
                     }
                 }
+                REPLAY_TS.with(|c| c.set(0));
             }
         };
         self.enable_oplog = was_enabled;
@@ -9585,7 +9698,7 @@ impl Storage {
     /// The `config.system.preimages` document crash recovery records for
     /// the update or delete stored at `seq`, when its collection records
     /// pre-images: the document it changes, as it is before the replay.
-    fn replayed_pre_image(&self, seq: i64, entry: &Document) -> Result<Option<Vec<u8>>> {
+    fn replayed_pre_image(&self, entry: &Document) -> Result<Option<Vec<u8>>> {
         let id = match entry.get_str("op") {
             Ok("u") => entry.get_document("o2").ok().and_then(|o2| o2.get("_id")),
             Ok("d") => entry.get_document("o").ok().and_then(|o| o.get("_id")),
@@ -9603,15 +9716,7 @@ impl Storage {
         let Some(pre) = self.find_by_id(db, coll, id)? else {
             return Ok(None);
         };
-        let slot = if entry.contains_key(PRE_IMAGE_SLOT_FIELD) {
-            None
-        } else {
-            Some(legacy_pre_image_slot(seq, entry, &mut |s| {
-                self.stored_entry(s)
-            })?)
-        };
-        let (Some(id), Ok(wall)) = (pre_image_id_of(entry, slot), entry.get_datetime("wall"))
-        else {
+        let (Some(id), Ok(wall)) = (pre_image_id_of(entry), entry.get_datetime("wall")) else {
             return Ok(None);
         };
         let slot = (
@@ -9933,11 +10038,15 @@ impl Storage {
         let mut rows: Vec<(i64, Document, Option<Document>)> = Vec::new();
         for &seq in doomed_sorted {
             let Some(entry) = read_at(seq)? else { continue };
-            let pre = match pre_image_of_entry(session, seq, &entry, &mut |s| read_at(s))? {
-                Some(pb) => Some(decode_doc(&pb)?),
-                None => None,
-            };
-            rows.push((seq, entry, pre));
+            // Each write's pre-image, by its place in the entry.
+            let mut pre = Document::new();
+            for op in oplog_entry::unwind(&entry) {
+                let index = op.get_i64(oplog_entry::APPLY_OPS_INDEX).unwrap_or(0);
+                if let Some(pb) = pre_image_of_entry(session, &op)? {
+                    pre.insert(index.to_string(), decode_doc(&pb)?);
+                }
+            }
+            rows.push((seq, entry, (!pre.is_empty()).then_some(pre)));
         }
         pitr_archive::write_segment(archive_dir, &rows, prev)?;
         Ok(())
@@ -10130,17 +10239,45 @@ impl Storage {
     /// `config.system.preimages` by the `_id` the entry names (RM-366).
     /// Fresh session for cross-thread visibility.
     pub fn read_preimage(&self, seq: i64) -> Result<Option<Vec<u8>>> {
+        self.read_preimage_at(seq, 0)
+    }
+
+    /// [`Self::read_preimage`] for the operation at `index` of an `applyOps`
+    /// entry (0 for an entry that is not one).
+    pub fn read_preimage_at(&self, seq: i64, index: i64) -> Result<Option<Vec<u8>>> {
         let Some(entry) = self.stored_entry(seq)? else {
             return Ok(None);
         };
-        self.read_pre_image_of(seq, &entry)
+        let ops = oplog_entry::unwind(&entry);
+        match ops.get(index as usize) {
+            Some(op) => self.read_pre_image_of(seq, op),
+            None => Ok(None),
+        }
     }
 
-    /// [`Self::read_preimage`] for the entry stored at `seq`, already read.
-    pub fn read_pre_image_of(&self, seq: i64, entry: &Document) -> Result<Option<Vec<u8>>> {
+    /// Every pre-image the entry stored at `seq` recorded, by the place of its
+    /// write in the entry.
+    pub fn read_preimages_of(&self, seq: i64) -> Result<Vec<(i64, Vec<u8>)>> {
+        let Some(entry) = self.stored_entry(seq)? else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for op in oplog_entry::unwind(&entry) {
+            let index = op.get_i64(oplog_entry::APPLY_OPS_INDEX).unwrap_or(0);
+            if let Some(pre) = self.read_pre_image_of(seq, &op)? {
+                out.push((index, pre));
+            }
+        }
+        Ok(out)
+    }
+
+    /// [`Self::read_preimage`] for a write already read: `op` is an unwound
+    /// operation ([`oplog_entry::unwind`]). `seq` is its entry's position.
+    pub fn read_pre_image_of(&self, seq: i64, op: &Document) -> Result<Option<Vec<u8>>> {
+        let _ = seq;
         // Lock-free cross-thread read on a fresh MVCC session (see `read_oplog`).
         let session = self.conn.open_session()?;
-        pre_image_of_entry(&session, seq, entry, &mut |s| self.stored_entry(s))
+        pre_image_of_entry(&session, op)
     }
 
     /// The oplog entry stored at `seq`, decoded, or `None`.
@@ -10231,112 +10368,36 @@ impl Storage {
     }
 
     /// The `config.system.preimages` documents of `rows`' pre-images,
-    /// `pre_images` holding each one's bytes by the seq of its entry.
+    /// `pre_images` holding each one's bytes by the position of its entry and
+    /// its place in the entry (`applyOpsIndex`).
     fn pre_image_records_of(
         rows: &[(i64, Document)],
-        pre_images: &std::collections::HashMap<i64, Vec<u8>>,
+        pre_images: &std::collections::HashMap<(i64, i64), Vec<u8>>,
     ) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
-        let mut run: Option<(EntryGroup, i64, PreImageSlot)> = None;
         for (seq, entry) in rows {
-            let group = entry_group_of(entry);
-            let ts = entry.get_timestamp("ts").ok();
-            // A run of one group's entries, consecutive in seq, shares its
-            // first entry's time.
-            let slot = match (&group, &run, ts) {
-                (Some(g), Some((cur, last, (first, i))), _) if g == cur && *last + 1 == *seq => {
-                    Some((*first, i + 1))
-                }
-                (_, _, Some(ts)) => Some((ts, 0)),
-                _ => None,
-            };
-            run = match (group, slot) {
-                (Some(g), Some(slot)) => Some((g, *seq, slot)),
-                _ => None,
-            };
-            let Some(pre) = pre_images.get(seq) else {
-                continue;
-            };
-            let id = pre_image_id_of(entry, slot);
-            let (Some(id), Ok(wall)) = (id, entry.get_datetime("wall")) else {
-                return Err(StorageError::Internal(format!(
-                    "the oplog entry at seq {seq} has a pre-image but no ui, ts or wall"
-                )));
-            };
-            let ui = id.get("nsUUID").cloned().unwrap_or(Bson::Null);
-            let slot = (
-                id.get_timestamp("ts").unwrap_or(bson::Timestamp {
-                    time: 0,
-                    increment: 0,
-                }),
-                id.get_i64("applyOpsIndex").unwrap_or(0),
-            );
-            out.push(pre_image_record(&ui, slot, wall.timestamp_millis(), pre)?);
+            for op in oplog_entry::unwind(entry) {
+                let index = op.get_i64(oplog_entry::APPLY_OPS_INDEX).unwrap_or(0);
+                let Some(pre) = pre_images.get(&(*seq, index)) else {
+                    continue;
+                };
+                let (Some(id), Ok(wall)) = (pre_image_id_of(&op), op.get_datetime("wall")) else {
+                    return Err(StorageError::Internal(format!(
+                        "the oplog entry at {seq} has a pre-image but no ui, ts or wall"
+                    )));
+                };
+                let ui = id.get("nsUUID").cloned().unwrap_or(Bson::Null);
+                let slot = (
+                    id.get_timestamp("ts").unwrap_or(bson::Timestamp {
+                        time: 0,
+                        increment: 0,
+                    }),
+                    index,
+                );
+                out.push(pre_image_record(&ui, slot, wall.timestamp_millis(), pre)?);
+            }
         }
         Ok(out)
-    }
-
-    /// One-time: move the pre-images a build before RM-366 kept in
-    /// [`PREIMAGE_TABLE`] (by oplog seq) into `config.system.preimages`,
-    /// then empty the table. A checkpoint sits between the two, so the
-    /// documents are on disk -- in a store whose data tables are not logged
-    /// too -- before the rows they came from go.
-    fn migrate_legacy_pre_images(&self) -> Result<()> {
-        let session = self.conn.open_session()?;
-        let cur = match session.open_cursor(PREIMAGE_TABLE, None) {
-            Ok(c) => c,
-            Err(e) if e.is_missing_table() => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
-        let mut legacy: Vec<(i64, Vec<u8>)> = Vec::new();
-        while cur.next()? {
-            let seq = cur.get_key_q()?;
-            let pre = cur.get_value_u()?;
-            if !pre.is_empty() {
-                legacy.push((seq, pre));
-            }
-        }
-        drop(cur);
-        if legacy.is_empty() {
-            return Ok(());
-        }
-        let mut records = Vec::with_capacity(legacy.len());
-        for (seq, pre) in &legacy {
-            // An entry pruned already took its pre-image's reason to be kept.
-            let Some(entry) = self.stored_entry(*seq)? else {
-                continue;
-            };
-            let slot = legacy_pre_image_slot(*seq, &entry, &mut |s| self.stored_entry(s))?;
-            let (Some(ui), Ok(wall)) = (entry.get("ui"), entry.get_datetime("wall")) else {
-                continue;
-            };
-            records.push(pre_image_record(ui, slot, wall.timestamp_millis(), pre)?);
-        }
-        for chunk in records.chunks(1000) {
-            self.write_pre_image_records_alone(chunk)?;
-        }
-        self.checkpoint_now()?;
-        let del = session.open_cursor(PREIMAGE_TABLE, None)?;
-        session.begin_transaction(None)?;
-        let removed = (|| -> Result<()> {
-            for (seq, _) in &legacy {
-                del.reset()?;
-                del.set_key_q(*seq);
-                match del.remove() {
-                    Ok(()) => {}
-                    Err(e) if e.is_not_found() => {}
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            Ok(())
-        })();
-        match removed {
-            Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped),
-            Err(e) => {
-                let _ = session.rollback_transaction(None);
-                Err(e)
-            }
-        }
     }
 
     /// Write **verbatim** oplog rows `(seq, entry)` (carrying their original seq /
@@ -10351,7 +10412,7 @@ impl Storage {
     pub fn import_oplog_segment(
         &self,
         rows: &[(i64, Document)],
-        pre_images: &std::collections::HashMap<i64, Vec<u8>>,
+        pre_images: &std::collections::HashMap<(i64, i64), Vec<u8>>,
     ) -> Result<i64> {
         if rows.is_empty() {
             return Ok(0);
@@ -10913,6 +10974,7 @@ impl Storage {
             minted_ranges: Vec::new(),
             minted_total: 0,
             pending_async: Vec::new(),
+            oplog_session: None,
             oplog: Arc::clone(&self.oplog),
             oplog_cv: Arc::clone(&self.oplog_cv),
             dirty_bytes: 0,
@@ -11024,7 +11086,11 @@ impl Storage {
         }
         // A write that emitted an oplog entry is known without asking; asking
         // anyway would have WiredTiger log an error for every statement.
-        if handle.snapshot_fixed || handle.dirty_bytes > 0 || !handle.minted_ranges.is_empty() {
+        if handle.snapshot_fixed
+            || handle.dirty_bytes > 0
+            || !handle.minted_ranges.is_empty()
+            || !handle.pending_async.is_empty()
+        {
             handle.snapshot_fixed = true;
             return Ok(false);
         }
@@ -11089,6 +11155,44 @@ impl Storage {
         // writes through `ACTIVE_HANDLE`), and the guards must then harvest
         // into the new one.
         let hp: *mut UserTransactionHandle = handle;
+        // A transaction whose statements the command layer did not name a
+        // session for (the PostgreSQL server's) gets one of its own: its
+        // entries are one `applyOps` under it.
+        struct SessionScope(bool);
+        impl Drop for SessionScope {
+            fn drop(&mut self) {
+                if self.0 {
+                    OPLOG_SESSION.with(|s| *s.borrow_mut() = None);
+                }
+            }
+        }
+        let own_session = OPLOG_SESSION.with(|s| s.borrow().is_none());
+        if own_session {
+            // SAFETY: `hp` is the handle this call borrows.
+            let named = unsafe { &mut *hp }
+                .oplog_session
+                .get_or_insert_with(|| {
+                    let mut uid = [0u8; 32];
+                    // sha256 of the empty user name, as mongod's `uid` of a
+                    // session no user opened.
+                    uid.copy_from_slice(&[
+                        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8,
+                        0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+                        0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+                    ]);
+                    let lsid = bson::doc! {
+                        "id": uuid_binary(&new_uuid_bytes()),
+                        "uid": Bson::Binary(Binary {
+                            subtype: BinarySubtype::Generic,
+                            bytes: uid.to_vec(),
+                        }),
+                    };
+                    (lsid, 1)
+                })
+                .clone();
+            OPLOG_SESSION.with(|s| *s.borrow_mut() = Some(named));
+        }
+        let _session_scope = SessionScope(own_session);
         // Emits inside this statement park their minted seq ranges in
         // `PENDING_MINTED` (they see the active txn session). Move them onto
         // the handle — on normal return AND on unwind — so the transaction's
@@ -11162,9 +11266,9 @@ impl Storage {
         let async_scope = AsyncHarvest {
             handle: hp,
             prev: IN_ASYNC_STMT.with(|f| f.get()),
-            // A store logging transactions at their commit holds its
-            // entries to the commit too.
-            active: self.oplog_at_commit,
+            // A transaction's entries are held to its commit, as mongod's
+            // are: minted together then, and logged as one `applyOps`.
+            active: true,
         };
         if async_scope.active {
             IN_ASYNC_STMT.with(|f| f.set(true));
@@ -11570,7 +11674,11 @@ impl Storage {
         }
         // A write the oplog did not record cannot be replayed -- except a
         // row lock (`lock_matching`), which is taken again below.
-        if handle.snapshot_fixed && handle.minted_ranges.is_empty() && !handle.lock_only {
+        if handle.snapshot_fixed
+            && handle.minted_ranges.is_empty()
+            && handle.pending_async.is_empty()
+            && !handle.lock_only
+        {
             return Ok(false);
         }
         let blobs = self.transaction_write_set(handle)?;
@@ -11786,13 +11894,10 @@ impl Storage {
         let hp = Self::active_handle()?;
         // SAFETY: see `active_handle`; a shared read.
         let handle = unsafe { &*hp };
-        let pending: usize = PENDING_MINTED.with(|p| {
-            p.borrow()
-                .iter()
-                .map(|(s, e)| (e - s).max(0) as usize)
-                .sum()
-        });
-        Some(handle.minted_total + pending)
+        // What the statement running now has held so far, and what the
+        // transaction's earlier ones did.
+        let pending = PENDING_OPLOG.with(|p| p.borrow().len());
+        Some(handle.write_set_len() + pending)
     }
 
     /// [`UserTransactionHandle::locked_len`] of the transaction whose
@@ -11911,6 +12016,23 @@ impl Storage {
             flush_deferred_creates(self, session, creates, placed)?;
         }
         let ops = self.transaction_write_set(&mut handle)?;
+        // mongod writes a prepared transaction's `applyOps` entry, with
+        // `prepare: true`, at the prepare, and `commitTransaction` or
+        // `abortTransaction` after it, linked by `prevOpTime`; the write set
+        // is then the prepare entry's. Nothing of the transaction is logged
+        // at its commit.
+        // (A transaction that logged nothing has no session and no entry.)
+        let (lsid, txn) = handle
+            .oplog_session
+            .clone()
+            .unwrap_or_else(|| (Document::new(), 0));
+        let pending = std::mem::take(&mut handle.pending_async);
+        let prepare_pos = if pending.is_empty() {
+            0
+        } else {
+            let (entries, pres): (Vec<_>, Vec<_>) = pending.into_iter().unzip();
+            self.write_entries_autocommit(entries, pres, true)?
+        };
         // A transaction id for `pg_prepared_xacts.transaction`: one oplog seq,
         // monotonic across restarts, never written (the merge tolerates the
         // hole exactly as it does a rolled-back mint's).
@@ -11934,6 +12056,9 @@ impl Storage {
             "prepared": record.prepared,
             "xid": xid,
             "minted": minted,
+            "prepareTs": prepare_pos,
+            "lsid": lsid,
+            "txnNumber": txn,
             "ops": ops
                 .into_iter()
                 .map(|blob| Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: blob }))
@@ -11947,6 +12072,103 @@ impl Storage {
         drop(cur);
         live.insert(gid.to_string(), handle);
         Ok(record)
+    }
+
+    /// Log `entries` as they would be at a transaction's commit, on a
+    /// transaction of their own, committed here; with `prepare` as the
+    /// prepare entry of a prepared transaction. Returns the position of the
+    /// last entry written.
+    fn write_entries_autocommit(
+        &self,
+        entries: Vec<OplogEntry>,
+        pre_images: Vec<Option<Vec<u8>>>,
+        prepare: bool,
+    ) -> Result<i64> {
+        let ws = self.conn.open_session()?;
+        ws.begin_transaction(None)?;
+        let written = self.mint_and_write_ext(&ws, entries, pre_images, true, prepare);
+        let ranges = PENDING_MINTED.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        let out = match written {
+            Ok(last) => commit_stamped(&ws, &self.oplog, self.timestamped).map(|()| last),
+            Err(e) => {
+                let _ = ws.rollback_transaction(None);
+                Err(e)
+            }
+        };
+        self.deregister_in_flight(&ranges);
+        out
+    }
+
+    /// The entry mongod writes for the end of a prepared transaction: `o`
+    /// is `{commitTransaction: 1, commitTimestamp: <prepare ts>}` or
+    /// `{abortTransaction: 1}`, `prevOpTime` the prepare entry.
+    fn prepared_end_entry(row: &Document, commit: bool) -> Result<Document> {
+        let (Ok(lsid), Ok(txn), Ok(prepare)) = (
+            row.get_document("lsid"),
+            row.get_i64("txnNumber"),
+            row.get_i64("prepareTs"),
+        ) else {
+            return Err(StorageError::Internal(
+                "prepared transaction record lacks its session".into(),
+            ));
+        };
+        let prepare_ts = u64_ts(prepare as u64);
+        let o = if commit {
+            bson::doc! {"commitTransaction": 1i32, "commitTimestamp": Bson::Timestamp(prepare_ts)}
+        } else {
+            bson::doc! {"abortTransaction": 1i32}
+        };
+        Ok(bson::doc! {
+            "lsid": lsid.clone(),
+            "txnNumber": txn,
+            "op": "c",
+            "ns": "admin.$cmd",
+            "o": o,
+            "prevOpTime": {"ts": Bson::Timestamp(prepare_ts), "t": 1_i64},
+        })
+    }
+
+    /// Write `entry` (from [`Self::prepared_end_entry`]) as the oplog entry
+    /// it is, at a timestamp minted now: `ts`, `t`, `v` and `wall` go before
+    /// its `prevOpTime`, as mongod's order has them. On `session`, in its
+    /// transaction (`deferred`: the caller's commit deregisters the mint).
+    fn write_prepared_end(&self, session: &Session, entry: Document, deferred: bool) -> Result<()> {
+        let (start, ts) = self.mint_seq_and_ts(1, true);
+        if deferred {
+            PENDING_MINTED.with(|p| p.borrow_mut().push((start, start + 1)));
+        }
+        let mut out = Document::new();
+        for (k, v) in entry {
+            if k == "prevOpTime" {
+                out.insert("ts", Bson::Timestamp(ts[0]));
+                out.insert("t", 1_i64);
+                out.insert("v", 2_i64);
+                out.insert(
+                    "wall",
+                    Bson::DateTime(bson::DateTime::from_millis(now_millis())),
+                );
+            }
+            out.insert(k, v);
+        }
+        let cur = session.open_cursor(&self.oplog_uri, None)?;
+        cur.set_key_q(start);
+        cur.set_value_u(&encode_doc(&out)?);
+        cur.insert()?;
+        if !deferred {
+            let removed = self
+                .oplog
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .in_flight
+                .remove(&start);
+            note_oplog_slot_held(removed.map_or(0, |r| r.held_micros()));
+            self.oplog_cv.notify_all();
+        }
+        {
+            let mut g = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+            g.live_count += 1;
+        }
+        Ok(())
     }
 
     /// The transaction's oplog entries, in emit order, read back through its
@@ -12017,7 +12239,11 @@ impl Storage {
         }
         // Rows locked by an unchanged rewrite carry no oplog entry, but they
         // are unchanged, so the fresh snapshot already has them right.
-        if handle.snapshot_fixed && handle.minted_ranges.is_empty() && !handle.lock_only {
+        if handle.snapshot_fixed
+            && handle.minted_ranges.is_empty()
+            && handle.pending_async.is_empty()
+            && !handle.lock_only
+        {
             return Ok(None);
         }
         let ns = format!("{db}.{coll}");
@@ -12127,29 +12353,62 @@ impl Storage {
         Ok(out)
     }
 
-    /// Whether any of the sync-mode oplog seqs a prepared transaction minted
-    /// is readable: its rows commit with its data, so a visible one means the
-    /// transaction committed (a crash landed between that commit and the
-    /// row's removal).
+    /// Whether the prepared transaction `row` records was committed: its
+    /// `commitTransaction` entry (naming the prepare entry in `prevOpTime`)
+    /// is in the oplog, written in the transaction that committed it. A
+    /// record left behind by a crash between that commit and the record's
+    /// removal says so.
     fn prepared_already_committed(&self, row: &Document) -> Result<bool> {
-        let Ok(minted) = row.get_array("minted") else {
+        let Ok(prepare) = row.get_i64("prepareTs") else {
             return Ok(false);
         };
-        let Some(Bson::Int64(start)) = minted.first() else {
+        if prepare <= 0 {
             return Ok(false);
-        };
-        let session = self.conn.open_session()?;
-        let cur = match session.open_cursor(&self.oplog_uri, None) {
-            Ok(c) => c,
-            Err(e) if e.is_not_found() => return Ok(false),
-            Err(e) => return Err(e.into()),
-        };
-        cur.set_key_q(*start);
-        match cur.search() {
-            Ok(()) => Ok(true),
-            Err(e) if e.is_not_found() => Ok(false),
-            Err(e) => Err(e.into()),
         }
+        let mut from = prepare + 1;
+        loop {
+            let rows = self.read_oplog(from, 1000)?;
+            let Some(last) = rows.last().map(|r| r.0) else {
+                return Ok(false);
+            };
+            for (_, blob) in &rows {
+                let entry = decode_doc(blob)?;
+                let committed = entry
+                    .get_document("o")
+                    .is_ok_and(|o| o.contains_key("commitTransaction"))
+                    && entry
+                        .get_document("prevOpTime")
+                        .and_then(|p| p.get_timestamp("ts"))
+                        .is_ok_and(|ts| ts_u64(ts) as i64 == prepare);
+                if committed {
+                    return Ok(true);
+                }
+            }
+            from = last + 1;
+        }
+    }
+
+    /// Log the end of the prepared transaction `row` records, on a
+    /// transaction of its own: `abortTransaction`, as a rollback leaves no
+    /// other transaction to write it in.
+    fn log_prepared_abort(&self, row: &Document) -> Result<()> {
+        if row.get_i64("prepareTs").unwrap_or(0) <= 0 {
+            return Ok(());
+        }
+        let entry = Self::prepared_end_entry(row, false)?;
+        let ws = self.conn.open_session()?;
+        ws.begin_transaction(None)?;
+        let written = self.write_prepared_end(&ws, entry, true);
+        let ranges = PENDING_MINTED.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        let out = match written {
+            Ok(()) => commit_stamped(&ws, &self.oplog, self.timestamped),
+            Err(e) => {
+                let _ = ws.rollback_transaction(None);
+                Err(e)
+            }
+        };
+        self.deregister_in_flight(&ranges);
+        out
     }
 
     /// Bring every prepared transaction recorded by a previous run of the
@@ -12176,7 +12435,7 @@ impl Storage {
                 rows.push(decode_doc(&cur.get_value_u()?)?);
             }
         }
-        for mut row in rows {
+        for row in rows {
             let gid = row.get_str("gid").unwrap_or_default().to_string();
             // It committed before the crash that left its record behind.
             if self.prepared_already_committed(&row)? {
@@ -12207,20 +12466,9 @@ impl Storage {
                 self.rollback_user_transaction(&mut handle)?;
                 return Err(e);
             }
-            // The revived transaction minted its own oplog seqs; the record
-            // points at those now, so a crash after its commit is still
-            // recognised as committed on the next open.
-            let minted: Vec<Bson> = handle
-                .minted_ranges
-                .iter()
-                .flat_map(|(start, end)| [Bson::Int64(*start), Bson::Int64(*end)])
-                .collect();
-            row.insert("minted", minted);
-            let cur = session.open_cursor(PREPARED_XACT_TABLE, None)?;
-            cur.set_key_s(&gid);
-            cur.set_value_u(&encode_doc(&row)?);
-            cur.update()?;
-            drop(cur);
+            // Its entries were logged when it was prepared: the revived
+            // transaction logs none of its own.
+            handle.pending_async.clear();
             self.prepared_xacts
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -12241,6 +12489,19 @@ impl Storage {
             .unwrap_or_else(|e| e.into_inner())
             .remove(gid);
         if let Some(mut handle) = live {
+            // `commitTransaction` is logged in the transaction that commits.
+            if let Some(row) = self.read_prepared_row(gid)? {
+                if row.get_i64("prepareTs").unwrap_or(0) > 0 {
+                    let entry = Self::prepared_end_entry(&row, true)?;
+                    let session = handle.session.as_ref().ok_or_else(|| {
+                        StorageError::Internal("transaction already closed".into())
+                    })?;
+                    self.write_prepared_end(session, entry, true)?;
+                    handle
+                        .minted_ranges
+                        .extend(PENDING_MINTED.with(|p| std::mem::take(&mut *p.borrow_mut())));
+                }
+            }
             // A failed commit is the transaction's death (see
             // `commit_user_transaction`); the record stays, and the next
             // COMMIT PREPARED replays it from there.
@@ -12276,7 +12537,21 @@ impl Storage {
             Self::delete_prepared_row(&*self.op_session()?, gid)
         });
         match applied.and_then(|r| r) {
-            Ok(()) => self.commit_user_transaction(&mut handle),
+            Ok(()) => {
+                // Logged when it was prepared; the commit logs the end.
+                handle.pending_async.clear();
+                if row.get_i64("prepareTs").unwrap_or(0) > 0 {
+                    let entry = Self::prepared_end_entry(&row, true)?;
+                    let session = handle.session.as_ref().ok_or_else(|| {
+                        StorageError::Internal("transaction already closed".into())
+                    })?;
+                    self.write_prepared_end(session, entry, true)?;
+                    handle
+                        .minted_ranges
+                        .extend(PENDING_MINTED.with(|p| std::mem::take(&mut *p.borrow_mut())));
+                }
+                self.commit_user_transaction(&mut handle)
+            }
             Err(e) => {
                 self.rollback_user_transaction(&mut handle)?;
                 Err(e)
@@ -12294,6 +12569,9 @@ impl Storage {
         let session = self.conn.open_session()?;
         if let Some(mut handle) = live {
             self.rollback_user_transaction(&mut handle)?;
+            if let Some(row) = self.read_prepared_row(gid)? {
+                self.log_prepared_abort(&row)?;
+            }
             return Self::delete_prepared_row(&session, gid);
         }
         let Some(row) = self.read_prepared_row(gid)? else {
@@ -12305,6 +12583,7 @@ impl Storage {
                  COMMIT PREPARED clears it"
             )));
         }
+        self.log_prepared_abort(&row)?;
         Self::delete_prepared_row(&session, gid)
     }
 
@@ -14054,6 +14333,8 @@ impl Storage {
                     dd.insert("op", "c");
                     dd.insert("ns", format!("{db}.$cmd"));
                     dd.insert("o", Bson::Document(dd_o));
+                    // mongod 8.2.11 says so (measured, `mongod_oplog_corpus.py`).
+                    dd.insert("fromMigrate", false);
                     self.emit_oplog(&session, vec![dd], vec![None])?;
                     Ok(())
                 })
@@ -14691,26 +14972,10 @@ impl Storage {
     }
 
     /// The entries of `local.oplog.rs` after position `after` (a RecordId: the
-    /// `ts` of an entry, as `i64`), as the view shows them, each with the
-    /// position a cursor resumes after it from: the last row it covers. Only
-    /// what no write in flight can still precede (the visible tail).
+    /// `ts` of an entry, as `i64`), as stored, each with its own position.
+    /// Only what no write in flight can still precede (the visible tail).
     fn scan_oplog_rs_after(&self, after: Option<i64>) -> Result<Vec<(i64, Vec<u8>)>> {
-        let rows = self.read_oplog(after.map_or(1, |a| a + 1), usize::MAX)?;
-        let mut decoded = Vec::with_capacity(rows.len());
-        for (_seq, blob) in &rows {
-            decoded.push(decode_doc(blob)?);
-        }
-        let last_row = rows.last().map_or(0, |r| r.0);
-        let view = oplog_view_entries(decoded);
-        let mut out = Vec::with_capacity(view.len());
-        for (i, d) in view.iter().enumerate() {
-            let resume = match view.get(i + 1).and_then(|n| n.get_timestamp("ts").ok()) {
-                Some(next) => ts_u64(next) as i64 - 1,
-                None => last_row,
-            };
-            out.push((resume, encode_doc(d)?));
-        }
-        Ok(out)
+        self.read_oplog(after.map_or(1, |a| a + 1), usize::MAX)
     }
 
     /// The smallest **RecordId** currently in a collection, or `None` if empty. A
@@ -24155,14 +24420,129 @@ pub fn take_last_retryable_ts() -> Option<bson::Timestamp> {
 /// whole stored document among them) to find none (RP-014).
 static RW_STAMPED: AtomicBool = AtomicBool::new(false);
 
-/// A raw entry's bytes with `ts` and `wall` appended, as
-/// `RawDocumentBuf::append` writes them, at once (RP-014).
-fn append_ts_wall(mut b: Vec<u8>, ts: bson::Timestamp, wall_millis: i64) -> Vec<u8> {
+/// The size an `applyOps` entry of a transaction is held to: the operations a
+/// transaction holds go into one entry while they fit and are otherwise cut
+/// into a chain of them. mongod 8.2.11 put sixteen 1 MB inserts in the first
+/// entry of a twenty-insert transaction and four in the second
+/// (`tests/fixtures/storage_model/mongod-8.2.11-oplog-batching.json`), so the
+/// limit lies between 16.0 and 17.0 MB: BSON's 16 MiB less the entry's own
+/// header.
+const APPLY_OPS_ENTRY_LIMIT: usize = 16 * 1024 * 1024 - 16 * 1024;
+
+/// The size of `op` as an element of an array.
+fn element_size(op: &Bson) -> Result<usize> {
+    Ok(encode_doc(&bson::doc! {"": op.clone()})?.len() - 5)
+}
+
+/// A transaction's one `applyOps` entry, or -- when its operations do not fit
+/// one -- mongod's chain of them (`partialTxn`): each entry holds what fits,
+/// at the next of the timestamps the transaction minted, linked to the one
+/// before by `prevOpTime` (the first to nothing), every one but the last
+/// `o: {applyOps, partialTxn: true}` and the last `o: {applyOps, count}`,
+/// `count` being the operations of the whole transaction. Any other entry,
+/// and a transaction that fits, is returned as it is.
+fn split_partial_txn(entry: Document) -> Result<Vec<Document>> {
+    let is_txn = entry.contains_key("lsid")
+        && entry.contains_key("txnNumber")
+        && !entry.contains_key("stmtId")
+        && entry.get_str("op") == Ok("c")
+        && entry
+            .get_document("o")
+            .is_ok_and(|o| matches!(o.get("applyOps"), Some(Bson::Array(_))) && o.len() == 1);
+    if !is_txn {
+        return Ok(vec![entry]);
+    }
+    let whole = encode_doc(&entry)?.len();
+    if whole <= APPLY_OPS_ENTRY_LIMIT {
+        return Ok(vec![entry]);
+    }
+    let Some(Bson::Array(ops)) = entry
+        .get_document("o")
+        .ok()
+        .and_then(|o| o.get("applyOps"))
+        .cloned()
+    else {
+        return Ok(vec![entry]);
+    };
+    // The entry less its operations, and room for what a part adds: what
+    // every part carries.
+    let mut ops_size = 0;
+    for op in &ops {
+        ops_size += element_size(op)?;
+    }
+    let overhead = whole.saturating_sub(ops_size) + 256;
+    let mut parts: Vec<Vec<Bson>> = vec![Vec::new()];
+    let mut size = overhead;
+    for op in &ops {
+        let n = element_size(op)?;
+        if size + n > APPLY_OPS_ENTRY_LIMIT && !parts.last().is_some_and(Vec::is_empty) {
+            parts.push(Vec::new());
+            size = overhead;
+        }
+        parts.last_mut().expect("a part").push(op.clone());
+        size += n;
+    }
+    let first_ts = entry
+        .get_timestamp("ts")
+        .map_err(|e| StorageError::Bson(e.to_string()))?;
+    let count = ops.len() as i32;
+    let last = parts.len() - 1;
+    let mut out = Vec::with_capacity(parts.len());
+    let mut prev: Option<bson::Timestamp> = None;
+    for (k, part) in parts.into_iter().enumerate() {
+        let ts = u64_ts(ts_u64(first_ts) + k as u64);
+        let mut o = bson::doc! {"applyOps": part};
+        if k == last {
+            o.insert("count", count);
+        } else {
+            o.insert("partialTxn", true);
+        }
+        let mut d = Document::new();
+        for key in ["lsid", "txnNumber", "op", "ns"] {
+            if let Some(v) = entry.get(key) {
+                d.insert(key, v.clone());
+            }
+        }
+        d.insert("o", o);
+        d.insert("ts", Bson::Timestamp(ts));
+        d.insert("t", 1_i64);
+        d.insert("v", 2_i64);
+        if let Some(wall) = entry.get("wall") {
+            d.insert("wall", wall.clone());
+        }
+        let (prev_ts, prev_t) = match prev {
+            Some(p) => (p, 1_i64),
+            None => (
+                bson::Timestamp {
+                    time: 0,
+                    increment: 0,
+                },
+                -1_i64,
+            ),
+        };
+        d.insert(
+            "prevOpTime",
+            bson::doc! {"ts": Bson::Timestamp(prev_ts), "t": prev_t},
+        );
+        prev = Some(ts);
+        out.push(d);
+    }
+    Ok(out)
+}
+
+/// A plain insert's bytes with `ts`, `t`, `v` and `wall` appended, in mongod's
+/// order (`..., o2, ts, t, v, wall`).
+fn append_ts_t_v_wall(mut b: Vec<u8>, ts: bson::Timestamp, wall_millis: i64) -> Vec<u8> {
     b.pop();
     b.push(0x11);
     b.extend_from_slice(b"ts\0");
     b.extend_from_slice(&ts.increment.to_le_bytes());
     b.extend_from_slice(&ts.time.to_le_bytes());
+    for name in [&b"t\0"[..], &b"v\0"[..]] {
+        b.push(0x12);
+        b.extend_from_slice(name);
+        b.extend_from_slice(&(if name[0] == b't' { 1i64 } else { 2i64 }).to_le_bytes());
+    }
     b.push(0x09);
     b.extend_from_slice(b"wall\0");
     b.extend_from_slice(&wall_millis.to_le_bytes());
@@ -24170,6 +24550,21 @@ fn append_ts_wall(mut b: Vec<u8>, ts: bson::Timestamp, wall_millis: i64) -> Vec<
     let len = b.len() as i32;
     b[..4].copy_from_slice(&len.to_le_bytes());
     b
+}
+
+/// Whether a raw entry is a plain insert (`op: "i"` and only the fields an
+/// insert has), which is logged as it is, `ts`, `t`, `v` and `wall` appended.
+fn raw_is_plain_insert(buf: &bson::RawDocumentBuf) -> bool {
+    let mut is_insert = false;
+    for el in buf.iter() {
+        let Ok((key, value)) = el else { return false };
+        match key {
+            "op" => is_insert = matches!(value, bson::RawBsonRef::String("i")),
+            "ns" | "ui" | "o" | "o2" => {}
+            _ => return false,
+        }
+    }
+    is_insert
 }
 
 /// The group of stored entries the oplog view shows as one `applyOps`
@@ -24221,12 +24616,6 @@ fn oplog_entry_group(e: &OplogEntry) -> Option<EntryGroup> {
 /// write's place among the `applyOps`' operations (0 outside one).
 type PreImageSlot = (bson::Timestamp, i64);
 
-/// The field of a stored entry in a group that names its pre-image's
-/// [`PreImageSlot`]: `{ts, i}`. Only such an entry carries it, since the
-/// slot of one is not its own `ts`; the oplog view, which shows a group as
-/// one `applyOps` entry of chosen fields, never shows it.
-const PRE_IMAGE_SLOT_FIELD: &str = "pi";
-
 /// The [`PreImageSlot`] of each entry minted together with a pre-image (the
 /// others' are `None`): a run of entries of one [`EntryGroup`] shares the
 /// first one's time, as the one `applyOps` entry mongod writes for it does.
@@ -24264,33 +24653,6 @@ fn pre_image_slots(
     out
 }
 
-/// `entry` with its pre-image's slot recorded on it when it is in a group
-/// (see [`PRE_IMAGE_SLOT_FIELD`]).
-fn stamp_pre_image_slot(entry: OplogEntry, slot: Option<PreImageSlot>) -> OplogEntry {
-    let Some((ts, index)) = slot else {
-        return entry;
-    };
-    if oplog_entry_group(&entry).is_none() {
-        return entry;
-    }
-    match entry {
-        OplogEntry::Doc(mut d) => {
-            d.insert(
-                PRE_IMAGE_SLOT_FIELD,
-                bson::doc! {"ts": Bson::Timestamp(ts), "i": index},
-            );
-            OplogEntry::Doc(d)
-        }
-        OplogEntry::Raw(mut buf) => {
-            let mut slot = bson::RawDocumentBuf::new();
-            slot.append("ts", bson::RawBson::Timestamp(ts));
-            slot.append("i", bson::RawBson::Int64(index));
-            buf.append(PRE_IMAGE_SLOT_FIELD, bson::RawBson::Document(slot));
-            OplogEntry::Raw(buf)
-        }
-    }
-}
-
 /// A `config.system.preimages` document as mongod 8.2.11 writes it:
 /// `{_id: {nsUUID, ts, applyOpsIndex}, operationTime, preImage}`, the
 /// operation time being the oplog entry's `wall`.
@@ -24319,18 +24681,13 @@ fn pre_image_record(
     Ok(out.into_bytes())
 }
 
-/// The `config.system.preimages` `_id` of the pre-image a stored entry's
-/// write recorded, when the entry carries what it needs: its collection's
-/// `ui` and its time, or its group's slot ([`PRE_IMAGE_SLOT_FIELD`]).
-fn pre_image_id_of(entry: &Document, slot: Option<PreImageSlot>) -> Option<Document> {
-    let ui = entry.get("ui")?.clone();
-    let (ts, index) = match entry.get_document(PRE_IMAGE_SLOT_FIELD) {
-        Ok(stamped) => (
-            stamped.get_timestamp("ts").ok()?,
-            stamped.get_i64("i").ok()?,
-        ),
-        Err(_) => slot.or_else(|| Some((entry.get_timestamp("ts").ok()?, 0)))?,
-    };
+/// The `config.system.preimages` `_id` of the pre-image the write `op` (an
+/// unwound operation, see [`oplog_entry::unwind`]) recorded: its collection's
+/// `ui`, its entry's time and its place in the entry.
+fn pre_image_id_of(op: &Document) -> Option<Document> {
+    let ui = op.get("ui")?.clone();
+    let ts = op.get_timestamp("ts").ok()?;
+    let index = op.get_i64(oplog_entry::APPLY_OPS_INDEX).unwrap_or(0);
     Some(bson::doc! {"nsUUID": ui, "ts": Bson::Timestamp(ts), "applyOpsIndex": index})
 }
 
@@ -24352,59 +24709,17 @@ fn oplog_entry_ui(entry: &OplogEntry, seq: i64) -> Result<Bson> {
     })
 }
 
-/// The [`PreImageSlot`] of a stored entry in a group that carries none (a
-/// build before RM-366 wrote it): the time of the group's first entry, read
-/// back through `read_at` seq by seq, and the entry's place after it.
-fn legacy_pre_image_slot(
-    seq: i64,
-    entry: &Document,
-    read_at: &mut dyn FnMut(i64) -> Result<Option<Document>>,
-) -> Result<PreImageSlot> {
-    let group = entry_group_of(entry);
-    let mut first = entry
-        .get_timestamp("ts")
-        .map_err(|e| StorageError::Bson(e.to_string()))?;
-    let mut index = 0i64;
-    if group.is_some() {
-        let mut s = seq - 1;
-        while s > 0 {
-            let Some(prev) = read_at(s)? else { break };
-            if entry_group_of(&prev) != group {
-                break;
-            }
-            let Ok(ts) = prev.get_timestamp("ts") else {
-                break;
-            };
-            first = ts;
-            index += 1;
-            s -= 1;
-        }
-    }
-    Ok((first, index))
-}
-
-/// The pre-image the write stored at `seq` (`entry`) recorded in
+/// The pre-image the write `op` (an unwound operation) recorded in
 /// `config.system.preimages`, as the bytes of the document it changed, or
-/// `None`. `read_at` reads other stored entries, which only an entry a
-/// build before RM-366 wrote in a group needs.
-fn pre_image_of_entry(
-    session: &Session,
-    seq: i64,
-    entry: &Document,
-    read_at: &mut dyn FnMut(i64) -> Result<Option<Document>>,
-) -> Result<Option<Vec<u8>>> {
-    if entry
+/// `None`.
+fn pre_image_of_entry(session: &Session, op: &Document) -> Result<Option<Vec<u8>>> {
+    if op
         .get_str("op")
         .is_ok_and(|op| op == "i" || op == "c" || op == "n")
     {
         return Ok(None);
     }
-    let slot = if entry.contains_key(PRE_IMAGE_SLOT_FIELD) || entry_group_of(entry).is_none() {
-        None
-    } else {
-        Some(legacy_pre_image_slot(seq, entry, read_at)?)
-    };
-    let Some(id) = pre_image_id_of(entry, slot) else {
+    let Some(id) = pre_image_id_of(op) else {
         return Ok(None);
     };
     let Some(record) = pre_image_record_by_id(session, &id)? else {
@@ -25565,71 +25880,6 @@ mod tests {
     //! `test_indexes.py` sees identical bytes. No WiredTiger needed.
     use super::*;
     use bson::doc;
-
-    /// A build before RM-366 kept a pre-image in `table:secantus_preimages`
-    /// by oplog seq. Opening such a store moves it into
-    /// `config.system.preimages` under the `_id` its entry names, where it
-    /// is read from, and empties the table.
-    #[test]
-    fn a_legacy_pre_image_moves_to_config_system_preimages() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().to_str().unwrap();
-        let enc = |d: &Document| encode_doc(d).unwrap();
-        let seq;
-        {
-            let mut st = Storage::open(home).unwrap();
-            st.set_enable_oplog(true);
-            st.create_collection("app", "c").unwrap();
-            st.set_collection_options(
-                "app",
-                "c",
-                &doc! {"changeStreamPreAndPostImages": {"enabled": true}},
-            )
-            .unwrap();
-            st.insert_one("app", "c", &enc(&doc! {"_id": 1, "v": "old"}))
-                .unwrap();
-            st.replace_by_id("app", "c", &Bson::Int32(1), &enc(&doc! {"v": "new"}))
-                .unwrap();
-            st.flush_oplog();
-            seq = st.oplog_tail_seq();
-            let pre = st.read_preimage(seq).unwrap().expect("recorded");
-            // The store as the old build left it.
-            st.set_enable_oplog(false);
-            st.delete_matching(
-                PRE_IMAGES_DB,
-                PRE_IMAGES_COLL,
-                &Document::new(),
-                0,
-                &Document::new(),
-                None,
-            )
-            .unwrap();
-            assert!(st.read_preimage(seq).unwrap().is_none());
-            let session = st.conn.open_session().unwrap();
-            session
-                .create(PREIMAGE_TABLE, &oplog_table_cfg(false))
-                .unwrap();
-            let cur = session.open_cursor(PREIMAGE_TABLE, None).unwrap();
-            cur.set_key_q(seq);
-            cur.set_value_u(&pre);
-            cur.insert().unwrap();
-            drop(cur);
-            drop(session);
-            st.close().unwrap();
-        }
-        let st = Storage::open(home).unwrap();
-        let pre = st.read_preimage(seq).unwrap().expect("moved");
-        assert_eq!(decode_doc(&pre).unwrap(), doc! {"_id": 1, "v": "old"});
-        assert_eq!(
-            st.scan_collection(PRE_IMAGES_DB, PRE_IMAGES_COLL)
-                .unwrap()
-                .len(),
-            1
-        );
-        let session = st.conn.open_session().unwrap();
-        let cur = session.open_cursor(PREIMAGE_TABLE, None).unwrap();
-        assert!(!cur.next().unwrap(), "the legacy table was emptied");
-    }
 
     /// A fixture's raw writes, as one transaction committed without a
     /// timestamp when dropped: they stand for a store an older build wrote,
@@ -27315,17 +27565,19 @@ mod tests {
             s.set_oplog_max_entries(2);
             // The first insert also records the collection's creation.
             s.insert("app", "c", vec![enc(1), enc(2)], true).unwrap();
-            s.archive_base_snapshot(&archive_s).unwrap(); // base head = the third entry
+            s.archive_base_snapshot(&archive_s).unwrap(); // base head = the batch's entry
             s.insert("app", "c", vec![enc(3)], true).unwrap();
             s.insert("app", "c", vec![enc(4)], true).unwrap();
             s.insert("app", "c", vec![enc(5)], true).unwrap();
             let all: Vec<i64> = s.read_oplog(1, 100).unwrap().iter().map(|r| r.0).collect();
-            assert_eq!(all.len(), 6);
-            let pruned = s.prune_oplog(None).unwrap(); // cap=2 -> archive the first four
-            assert!(pruned >= 4, "pruned {pruned}");
-            // The live oplog no longer reaches the fourth entry.
-            assert_eq!(s.oplog_floor_seq().unwrap(), all[4]);
-            assert_eq!(s.oplog_pruned_through().unwrap(), all[3]);
+            // The creation, the one `applyOps` of the first batch, then three
+            // inserts.
+            assert_eq!(all.len(), 5);
+            let pruned = s.prune_oplog(None).unwrap(); // cap=2 -> archive the first three
+            assert!(pruned >= 3, "pruned {pruned}");
+            // The live oplog no longer reaches the third entry.
+            assert_eq!(s.oplog_floor_seq().unwrap(), all[3]);
+            assert_eq!(s.oplog_pruned_through().unwrap(), all[2]);
         }
 
         // v1 can't restore the src (floor past genesis); v2 stitches base + segments.
@@ -27346,7 +27598,7 @@ mod tests {
             .map(|b| decode_doc(b).unwrap().get_i32("_id").unwrap())
             .collect();
         ids.sort();
-        assert_eq!(ids, vec![1, 2, 3]); // base (1,2) + archived seq 4
+        assert_eq!(ids, vec![1, 2, 3]); // base (1,2) + the archived third insert
     }
 
     #[test]
@@ -27802,14 +28054,17 @@ mod oplog_entry_bytes_tests {
             time: 1_700_000_000,
             increment: 7,
         };
+        // mongod's order: `ts`, `t`, `v`, then `wall`.
         let mut appended = entry.clone();
         appended.append("ts", bson::RawBsonRef::Timestamp(ts).to_raw_bson());
+        appended.append("t", bson::RawBson::Int64(1));
+        appended.append("v", bson::RawBson::Int64(2));
         appended.append(
             "wall",
             bson::RawBsonRef::DateTime(bson::DateTime::from_millis(-5)).to_raw_bson(),
         );
         assert_eq!(
-            append_ts_wall(entry.into_bytes(), ts, -5),
+            append_ts_t_v_wall(entry.into_bytes(), ts, -5),
             appended.into_bytes()
         );
     }

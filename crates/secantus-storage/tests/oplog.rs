@@ -210,7 +210,8 @@ fn delete_emits_delete_entry() {
         assert_eq!(d.get_str("op").unwrap(), "d");
         assert_eq!(d.get_str("ns").unwrap(), "app.c");
         assert_eq!(d.get_document("o").unwrap().get_i32("_id").unwrap(), 7);
-        assert_eq!(d.get_document("o2").unwrap().get_i32("_id").unwrap(), 7);
+        // mongod's delete entry has no `o2`.
+        assert!(!d.contains_key("o2"));
     });
 }
 

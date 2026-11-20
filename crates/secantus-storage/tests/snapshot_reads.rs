@@ -22,7 +22,6 @@ fn open(home: &std::path::Path, nonlogged: bool) -> Storage {
         home.to_str().unwrap(),
         &StorageOptions {
             data_nonlogged: Some(nonlogged),
-            transactions_logged_at_commit: true,
             ..StorageOptions::default()
         },
     )

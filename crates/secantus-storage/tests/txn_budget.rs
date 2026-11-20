@@ -94,7 +94,6 @@ fn async_transaction_dirty_budget_bounds_pending_async() {
         &StorageOptions {
             wt_config: Some(secantus_storage::wt_config("128M", 1000, false, "10MB")),
             data_nonlogged: Some(true),
-            transactions_logged_at_commit: true,
             ..StorageOptions::default()
         },
     )

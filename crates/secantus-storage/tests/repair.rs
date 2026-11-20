@@ -24,7 +24,6 @@ fn options(server_like: bool) -> StorageOptions {
         wt_config: Some(secantus_storage::wt_config("256M", 1000, false, "10MB")),
         data_nonlogged: Some(server_like),
         durable: Some(true),
-        transactions_logged_at_commit: server_like,
         ..Default::default()
     }
 }

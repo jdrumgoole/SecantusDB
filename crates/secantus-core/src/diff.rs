@@ -864,6 +864,163 @@ pub fn apply_update_description(mut doc: Document, diff: &Document) -> R<Documen
     Ok(doc)
 }
 
+/// A `$v: 2` oplog diff read back into its tree: `d` / `u` / `i` and the
+/// `s<field>` sub-diffs of a document, `a: true`, `l`, `u<i>` and `s<i>` of an
+/// array. `None` for a diff that is not one.
+fn parse_oplog_diff(diff: &Document, array: bool) -> Option<Node> {
+    if array {
+        let mut a = ArrDiff::default();
+        for (k, v) in diff {
+            if k == "a" {
+                continue;
+            }
+            if k == "l" {
+                a.new_len = Some(v.as_i64().or(v.as_i32().map(i64::from))? as usize);
+                continue;
+            }
+            let (kind, idx) = k.split_at(1);
+            let i: usize = idx.parse().ok()?;
+            match kind {
+                "u" => a.entries.push((i, ArrEntry::Update(v.clone()))),
+                "s" => {
+                    let sub = v.as_document()?;
+                    let sub_array = sub.get_bool("a").unwrap_or(false);
+                    a.entries
+                        .push((i, ArrEntry::Sub(parse_oplog_diff(sub, sub_array)?)));
+                }
+                _ => return None,
+            }
+        }
+        Some(Node::Arr(a))
+    } else {
+        let mut d = DocDiff::default();
+        for (k, v) in diff {
+            match k.as_str() {
+                "d" => d.deletes = v.as_document()?.keys().cloned().collect(),
+                "u" => {
+                    d.updates = v
+                        .as_document()?
+                        .iter()
+                        .map(|(f, x)| (f.clone(), x.clone()))
+                        .collect()
+                }
+                "i" => {
+                    d.inserts = v
+                        .as_document()?
+                        .iter()
+                        .map(|(f, x)| (f.clone(), x.clone()))
+                        .collect()
+                }
+                other if other.starts_with('s') && other.len() > 1 => {
+                    let sub = v.as_document()?;
+                    let sub_array = sub.get_bool("a").unwrap_or(false);
+                    d.subs
+                        .push((other[1..].to_string(), parse_oplog_diff(sub, sub_array)?));
+                }
+                _ => return None,
+            }
+        }
+        Some(Node::Doc(d))
+    }
+}
+
+/// The `updateDescription` of an update whose oplog entry holds `diff` (its
+/// `o.diff`, mongod's `$v: 2` delta): what mongod builds a change event's
+/// description from, the diff itself and nothing else. `None` for a diff this
+/// does not read.
+pub fn update_description_from_oplog_diff(diff: &Document) -> Option<Document> {
+    let node = parse_oplog_diff(diff, false)?;
+    let mut acc = Acc {
+        updated: Document::new(),
+        removed: Vec::new(),
+        truncated: Vec::new(),
+        disambiguated: Document::new(),
+        elementwise: None,
+        push_targets: BTreeSet::new(),
+    };
+    describe(&node, "", &[], &mut acc);
+    let mut out = Document::new();
+    out.insert("updatedFields", Bson::Document(acc.updated));
+    out.insert("removedFields", Bson::Array(acc.removed));
+    out.insert("truncatedArrays", Bson::Array(acc.truncated));
+    if !acc.disambiguated.is_empty() {
+        out.insert("disambiguatedPaths", Bson::Document(acc.disambiguated));
+    }
+    Some(out)
+}
+
+fn apply_doc_node(doc: &mut Document, d: &DocDiff) -> bool {
+    for f in &d.deletes {
+        doc.remove(f.as_str());
+    }
+    for (f, v) in &d.updates {
+        match doc.get_mut(f.as_str()) {
+            Some(slot) => *slot = v.clone(),
+            None => {
+                doc.insert(f.clone(), v.clone());
+            }
+        }
+    }
+    for (f, v) in &d.inserts {
+        doc.insert(f.clone(), v.clone());
+    }
+    for (f, sub) in &d.subs {
+        let Some(slot) = doc.get_mut(f.as_str()) else {
+            return false;
+        };
+        if !apply_node(slot, sub) {
+            return false;
+        }
+    }
+    true
+}
+
+fn apply_node(value: &mut Bson, node: &Node) -> bool {
+    match (value, node) {
+        (Bson::Document(doc), Node::Doc(d)) => apply_doc_node(doc, d),
+        (Bson::Array(arr), Node::Arr(a)) => {
+            if let Some(n) = a.new_len {
+                arr.truncate(n);
+            }
+            for (i, e) in &a.entries {
+                match e {
+                    ArrEntry::Update(v) => {
+                        if *i < arr.len() {
+                            arr[*i] = v.clone();
+                        } else {
+                            // An append past the end fills in order.
+                            while arr.len() < *i {
+                                arr.push(Bson::Null);
+                            }
+                            arr.push(v.clone());
+                        }
+                    }
+                    ArrEntry::Sub(sub) => {
+                        let Some(slot) = arr.get_mut(*i) else {
+                            return false;
+                        };
+                        if !apply_node(slot, sub) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Apply an oplog entry's `$v: 2` delta to `doc`: what mongod's oplog
+/// application does with an update entry. `None` if the diff does not fit the
+/// document (a replay of an entry against the wrong state).
+pub fn apply_oplog_diff(mut doc: Document, diff: &Document) -> Option<Document> {
+    let Node::Doc(d) = parse_oplog_diff(diff, false)? else {
+        return None;
+    };
+    apply_doc_node(&mut doc, &d).then_some(doc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1461,5 +1618,69 @@ mod oplog_diff_tests {
             oplog_diff(&truncated, &pre),
             doc! {"sarr": {"a": true, "l": 2}}
         );
+    }
+
+    /// The description read back from the oplog diff is the description the
+    /// diff was made from (mongod derives its change events from the diff),
+    /// and applying the diff takes `pre` to `post`.
+    #[test]
+    fn an_oplog_diff_reads_back_to_its_description_and_applies() {
+        let cases: Vec<(Document, Document, Document)> = vec![
+            (
+                doc! {"_id": 1, "a": 1, "b": [1, 2, 3], "c": {"x": 1, "y": 2}},
+                doc! {"_id": 1, "a": 2, "b": [1, 2, 3], "c": {"x": 1, "y": 2}},
+                doc! {"$set": {"a": 2}},
+            ),
+            (
+                doc! {"_id": 1, "a": 1, "c": {"x": 1, "y": 2}},
+                doc! {"_id": 1, "a": 1, "c": {"x": 1}},
+                doc! {"$unset": {"c.y": ""}},
+            ),
+            (
+                doc! {"_id": 1, "b": [1, 2, 3, 4]},
+                doc! {"_id": 1, "b": [1, 2]},
+                doc! {"$pop": {"b": 1}},
+            ),
+            (
+                doc! {"_id": 1, "b": [1, 2, 3]},
+                doc! {"_id": 1, "b": [1, 9, 3]},
+                doc! {"$set": {"b.1": 9}},
+            ),
+            (
+                doc! {"_id": 1, "a": 1},
+                doc! {"_id": 1, "a": 1, "n": {"m": 5}},
+                doc! {"$set": {"n.m": 5}},
+            ),
+            (
+                doc! {"_id": 1, "a": [{"k": 1}, {"k": 2}]},
+                doc! {"_id": 1, "a": [{"k": 1}, {"k": 3}]},
+                doc! {"$set": {"a.1.k": 3}},
+            ),
+        ];
+        for (pre, post, update) in cases {
+            let desc = compute_update_description_for(&pre, &post, Some(&update)).unwrap();
+            let diff = oplog_diff(&desc, &pre);
+            let back = update_description_from_oplog_diff(&diff).expect("a diff reads");
+            assert_eq!(
+                back.get_document("updatedFields"),
+                desc.get_document("updatedFields"),
+                "{update:?}"
+            );
+            assert_eq!(
+                back.get_array("removedFields"),
+                desc.get_array("removedFields"),
+                "{update:?}"
+            );
+            assert_eq!(
+                back.get_array("truncatedArrays"),
+                desc.get_array("truncatedArrays"),
+                "{update:?}"
+            );
+            assert_eq!(
+                apply_oplog_diff(pre.clone(), &diff),
+                Some(post),
+                "{update:?}"
+            );
+        }
     }
 }
