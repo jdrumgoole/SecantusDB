@@ -28,6 +28,7 @@ import argparse
 import contextlib
 import json
 import os
+import platform
 import re
 import shutil
 import signal
@@ -150,6 +151,66 @@ def _rust_binary() -> str:
     )
 
 
+def _mongod_binary() -> str | None:
+    """The mongod the mongod arm runs: $SECANTUS_MONGOD_BIN, else PATH."""
+    return os.environ.get("SECANTUS_MONGOD_BIN") or shutil.which("mongod")
+
+
+def _version_lines(argv: list[str]) -> list[str]:
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [f"unavailable: {exc}"]
+    return [line.strip() for line in out.stdout.splitlines() if line.strip()]
+
+
+def parse_rust_version(lines: list[str]) -> dict[str, str]:
+    """``secantusd-mdb --version``: ``secantusd-mdb 0.5.3-beta.198`` then
+    ``tree: <hash>`` (the source tree it was built from) or ``source: ...``."""
+    info = {"version": lines[0].split()[-1] if lines else "unknown"}
+    for line in lines[1:]:
+        key, _, value = line.partition(":")
+        if value:
+            info[key.strip()] = value.strip()
+    return info
+
+
+def parse_mongod_version(lines: list[str]) -> dict[str, str]:
+    """``mongod --version``: ``db version v8.0.38`` first."""
+    for line in lines:
+        if line.startswith("db version v"):
+            return {"version": line.removeprefix("db version v")}
+    return {"version": "unknown"}
+
+
+def server_versions(servers: list[str]) -> dict[str, dict[str, str]]:
+    """What each measured server was, so a published number names its build:
+    the Rust arms' version and source tree, mongod's version. Recorded in the
+    results file's ``meta`` (the 2026-11-18 run recorded neither)."""
+    versions: dict[str, dict[str, str]] = {}
+    for server in servers:
+        if server in ("rust", "rust-async"):
+            versions[server] = parse_rust_version(_version_lines([_rust_binary(), "--version"]))
+        elif server == "mongod":
+            mongod = _mongod_binary()
+            versions[server] = (
+                parse_mongod_version(_version_lines([mongod, "--version"]))
+                if mongod
+                else {"version": "unknown"}
+            )
+    return versions
+
+
+def host_description() -> dict[str, object]:
+    """The machine the run measured on."""
+    return {
+        "system": platform.system(),
+        "release": platform.release(),
+        "machine": platform.machine(),
+        "cpus": os.cpu_count(),
+    }
+
+
 def _server_argv(server: str, port: int, storage_path: Path) -> list[str]:
     if server == "python":
         return [
@@ -180,14 +241,19 @@ def _server_argv(server: str, port: int, storage_path: Path) -> list[str]:
             "INFO",
         ]
         if server == "rust-async":
-            argv += ["--oplog-async", "--oplog-nonlogged"]
+            # The documented stack: logged data tables. On the default
+            # unlogged ones the drainer is not used, and a non-logged oplog
+            # left nothing in the log -- the 2026-11-18 run measured that,
+            # and a crash lost acknowledged writes. The server refuses it
+            # now (RM-731).
+            argv += ["--data-logged", "--oplog-async", "--oplog-nonlogged"]
         return argv
     if server == "mongod":
         # SECANTUS_MONGOD_BIN pins a specific mongod, mirroring SECANTUSDB_BIN
         # for the Rust arm. `which("mongod")` on this box resolves to a 2024
         # symlink to mongodb-community@6.0 (6.0.16) while 8.3.4 is installed and
         # unlinked, so the default arm silently measures a two-year-old server.
-        mongod = os.environ.get("SECANTUS_MONGOD_BIN") or shutil.which("mongod")
+        mongod = _mongod_binary()
         if not mongod:
             raise SystemExit(
                 "mongod not on PATH — install Community Server or skip --server mongod"
@@ -494,7 +560,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["python", "rust", "rust-async", "mongod", "all"],
         help="Which server to drive (default: python). "
         "'rust-async' is the Rust server's opt-in async + "
-        "non-logged oplog stack. 'all' sweeps python, rust, "
+        "non-logged oplog stack, on logged data tables. 'all' sweeps python, rust, "
         "rust-async, and mongod back-to-back and prints a "
         "combined table.",
     )
@@ -524,21 +590,32 @@ def assemble_results(
     shared_collection: bool,
     runs: int,
     runs_rates: dict[str, list[list[float]]],
+    versions: dict[str, dict[str, str]] | None = None,
+    host: dict[str, object] | None = None,
+    generated: str | None = None,
 ) -> dict:
     """Shape the per-run rates into the JSON payload ``concurrency_chart`` reads.
 
     ``runs_rates[server][i]`` is the list of docs/s observed for
     ``writers_list[i]`` across runs; the payload records both the raw
-    per-run rates and their median.
+    per-run rates and their median, and, when given, the date, the host and
+    each server's version.
     """
+    meta: dict[str, object] = {
+        "duration": duration,
+        "batch": batch,
+        "writers": writers_list,
+        "shared_collection": shared_collection,
+        "runs": runs,
+    }
+    if generated is not None:
+        meta["generated"] = generated
+    if host is not None:
+        meta["host"] = host
+    if versions is not None:
+        meta["versions"] = versions
     return {
-        "meta": {
-            "duration": duration,
-            "batch": batch,
-            "writers": writers_list,
-            "shared_collection": shared_collection,
-            "runs": runs,
-        },
+        "meta": meta,
         "servers": {
             server: {
                 "runs_docs_per_sec": [[round(r, 1) for r in per_n] for per_n in rates],
@@ -598,6 +675,9 @@ def main(argv: list[str] | None = None) -> int:
             shared_collection=args.shared_collection,
             runs=runs,
             runs_rates=runs_rates,
+            versions=server_versions(servers),
+            host=host_description(),
+            generated=time.strftime("%Y-%m-%d", time.gmtime()),
         )
         out = Path(args.json)
         out.parent.mkdir(parents=True, exist_ok=True)

@@ -10,9 +10,10 @@ default write path scales monotonically, 1.5× at two writers, 2.1× at four
 and 2.6× at eight (10.2k docs/s), and has no cliff. `mongod` 8.0.38 scales
 further, to 3.4× (19.7k docs/s). It starts 1.5× ahead with one writer and
 is 1.9× ahead at eight. The opt-in async + non-logged oplog stack
-(mitigations 5–6 below) starts 1.9× higher than the default with one writer.
-It stays level with `mongod` up to four writers, at the cost of an oplog tail
-that is only as durable as the last checkpoint. If your
+(mitigations 5–6 below) is not charted: the run of 2026-11-18 used it on a
+store whose data tables were not logged, which is not the documented stack
+and which lost acknowledged writes in a crash (RM-731, now refused). It is
+shown again once re-measured on logged data tables. If your
 workload depends on write throughput that keeps climbing past eight
 writers, run a real `mongod` instead.
 
@@ -123,25 +124,22 @@ body[data-theme="dark"] .dviz-wrap {
 .dv-legend .chip { display:inline-block; width:12px; height:12px; border-radius:3px; margin-right:6px; vertical-align:-1px; }
 </style>
 <!-- concurrency-viz:begin -->
-<div class="dviz-wrap"><div class="dv-legend"><span><span class="chip" style="background:var(--dv-mongo)"></span>mongod</span><span><span class="chip" style="background:var(--dv-rust)"></span>Rust server</span><span><span class="chip" style="background:transparent;border:2px dashed var(--dv-rust);box-sizing:border-box"></span>Rust server — async stack</span></div><svg viewBox="0 0 790 320" role="img" aria-label="Throughput scaling relative to each server single-writer rate" class="dviz"><line x1="56" y1="214" x2="668" y2="214" class="dv-ref"/><text x="48" y="218" text-anchor="end" class="dv-tick">1<tspan class="dv-x">x</tspan></text><line x1="56" y1="132" x2="668" y2="132" class="dv-grid"/><text x="48" y="136" text-anchor="end" class="dv-tick">2<tspan class="dv-x">x</tspan></text><line x1="56" y1="50" x2="668" y2="50" class="dv-grid"/><text x="48" y="54" text-anchor="end" class="dv-tick">3<tspan class="dv-x">x</tspan></text><text x="56" y="290" text-anchor="middle" class="dv-tick">1</text><text x="143" y="290" text-anchor="middle" class="dv-tick">2</text><text x="318" y="290" text-anchor="middle" class="dv-tick">4</text><text x="668" y="290" text-anchor="middle" class="dv-tick">8</text><text x="362" y="310" text-anchor="middle" class="dv-lab">concurrent writers</text><path d="M56.0,214.0 L143.4,159.9 L318.3,81.4 L668.0,21.0" fill="none" stroke="var(--dv-mongo)" stroke-width="2"/><circle cx="56.0" cy="214.0" r="4.5" fill="var(--dv-mongo)"><title>mongod — 1 writer: 1.00x its single-writer rate</title></circle><circle cx="143.4" cy="159.9" r="4.5" fill="var(--dv-mongo)"><title>mongod — 2 writers: 1.66x its single-writer rate</title></circle><circle cx="318.3" cy="81.4" r="4.5" fill="var(--dv-mongo)"><title>mongod — 4 writers: 2.62x its single-writer rate</title></circle><circle cx="668.0" cy="21.0" r="4.5" fill="var(--dv-mongo)"><title>mongod — 8 writers: 3.35x its single-writer rate</title></circle><path d="M56.0,214.0 L143.4,170.0 L318.3,123.2 L668.0,84.9" fill="none" stroke="var(--dv-rust)" stroke-width="2"/><circle cx="56.0" cy="214.0" r="4.5" fill="var(--dv-rust)"><title>Rust server — 1 writer: 1.00x its single-writer rate</title></circle><circle cx="143.4" cy="170.0" r="4.5" fill="var(--dv-rust)"><title>Rust server — 2 writers: 1.54x its single-writer rate</title></circle><circle cx="318.3" cy="123.2" r="4.5" fill="var(--dv-rust)"><title>Rust server — 4 writers: 2.11x its single-writer rate</title></circle><circle cx="668.0" cy="84.9" r="4.5" fill="var(--dv-rust)"><title>Rust server — 8 writers: 2.57x its single-writer rate</title></circle><path d="M56.0,214.0 L143.4,162.1 L318.3,122.6 L668.0,104.2" fill="none" stroke="var(--dv-rust)" stroke-width="2" stroke-dasharray="6 4"/><circle cx="56.0" cy="214.0" r="4.5" fill="var(--dv-rust)"><title>Rust server (async + non-logged oplog) — 1 writer: 1.00x its single-writer rate</title></circle><circle cx="143.4" cy="162.1" r="4.5" fill="var(--dv-rust)"><title>Rust server (async + non-logged oplog) — 2 writers: 1.63x its single-writer rate</title></circle><circle cx="318.3" cy="122.6" r="4.5" fill="var(--dv-rust)"><title>Rust server (async + non-logged oplog) — 4 writers: 2.11x its single-writer rate</title></circle><circle cx="668.0" cy="104.2" r="4.5" fill="var(--dv-rust)"><title>Rust server (async + non-logged oplog) — 8 writers: 2.34x its single-writer rate</title></circle><text x="674" y="25" class="dv-val" fill="var(--dv-mongo)">mongod 3.4<tspan class="dv-x">x</tspan></text><text x="674" y="89" class="dv-val" fill="var(--dv-rust)">Rust 2.6<tspan class="dv-x">x</tspan></text><text x="674" y="108" class="dv-val" fill="var(--dv-rust)">async 2.3<tspan class="dv-x">x</tspan></text></svg></div>
+<div class="dviz-wrap"><div class="dv-legend"><span><span class="chip" style="background:var(--dv-mongo)"></span>mongod</span><span><span class="chip" style="background:var(--dv-rust)"></span>Rust server</span></div><svg viewBox="0 0 790 320" role="img" aria-label="Write throughput in documents per second as concurrent writers are added" class="dviz"><text x="48" y="12" text-anchor="end" class="dv-tick">docs/s</text><line x1="56" y1="270" x2="668" y2="270" class="dv-grid"/><text x="48" y="274" text-anchor="end" class="dv-tick">0</text><line x1="56" y1="212" x2="668" y2="212" class="dv-grid"/><text x="48" y="216" text-anchor="end" class="dv-tick">5k</text><line x1="56" y1="153" x2="668" y2="153" class="dv-grid"/><text x="48" y="157" text-anchor="end" class="dv-tick">10k</text><line x1="56" y1="94" x2="668" y2="94" class="dv-grid"/><text x="48" y="98" text-anchor="end" class="dv-tick">15k</text><line x1="56" y1="36" x2="668" y2="36" class="dv-grid"/><text x="48" y="40" text-anchor="end" class="dv-tick">20k</text><text x="56" y="290" text-anchor="middle" class="dv-tick">1</text><text x="143" y="290" text-anchor="middle" class="dv-tick">2</text><text x="318" y="290" text-anchor="middle" class="dv-tick">4</text><text x="668" y="290" text-anchor="middle" class="dv-tick">8</text><text x="362" y="310" text-anchor="middle" class="dv-lab">concurrent writers</text><path d="M56.0,201.2 L143.4,155.8 L318.3,90.0 L668.0,39.4" fill="none" stroke="var(--dv-mongo)" stroke-width="2"/><circle cx="56.0" cy="201.2" r="4.5" fill="var(--dv-mongo)"><title>mongod — 1 writer: 5,900 docs/s</title></circle><circle cx="143.4" cy="155.8" r="4.5" fill="var(--dv-mongo)"><title>mongod — 2 writers: 9,800 docs/s</title></circle><circle cx="318.3" cy="90.0" r="4.5" fill="var(--dv-mongo)"><title>mongod — 4 writers: 15,400 docs/s</title></circle><circle cx="668.0" cy="39.4" r="4.5" fill="var(--dv-mongo)"><title>mongod — 8 writers: 19,700 docs/s</title></circle><path d="M56.0,223.6 L143.4,198.8 L318.3,172.3 L668.0,150.7" fill="none" stroke="var(--dv-rust)" stroke-width="2"/><circle cx="56.0" cy="223.6" r="4.5" fill="var(--dv-rust)"><title>Rust server — 1 writer: 4,000 docs/s</title></circle><circle cx="143.4" cy="198.8" r="4.5" fill="var(--dv-rust)"><title>Rust server — 2 writers: 6,100 docs/s</title></circle><circle cx="318.3" cy="172.3" r="4.5" fill="var(--dv-rust)"><title>Rust server — 4 writers: 8,300 docs/s</title></circle><circle cx="668.0" cy="150.7" r="4.5" fill="var(--dv-rust)"><title>Rust server — 8 writers: 10,200 docs/s</title></circle><text x="674" y="43" class="dv-val" fill="var(--dv-mongo)">mongod 19.7k</text><text x="674" y="155" class="dv-val" fill="var(--dv-rust)">Rust 10.2k</text></svg></div>
 <!-- concurrency-viz:end -->
 ```
 
 <!-- concurrency-table:begin -->
-| N writers | Rust server (docs/s) | Rust — async stack (docs/s) | mongod (docs/s) |
-|---|---:|---:|---:|
-| 1 | 4,000 | 7,400 | 5,900 |
-| 2 | 6,100 | 12,000 | 9,800 |
-| 4 | 8,300 | 15,500 | 15,400 |
-| 8 | 10,200 | 17,200 | 19,700 |
+| N writers | Rust server (docs/s) | mongod (docs/s) |
+|---|---:|---:|
+| 1 | 4,000 | 5,900 |
+| 2 | 6,100 | 9,800 |
+| 4 | 8,300 | 15,400 |
+| 8 | 10,200 | 19,700 |
 <!-- concurrency-table:end -->
 
-(The async-stack column is the opt-in async-oplog + non-logged-oplog
-configuration, mitigations 5–6 below — first-class options since Phase C:
-`RustServer(oplog_async=True, oplog_nonlogged=True)`, or `secantusd-mdb
---oplog-async --oplog-nonlogged`, or the `SECANTUS_OPLOG_ASYNC=1` +
-`SECANTUS_OPLOG_NONLOGGED=1` env vars. Scaling in the chart is relative
-to each series' own single-writer rate.)
+(The chart is each server's aggregate write throughput in documents per
+second. The async + non-logged oplog stack, mitigations 5–6 below, is left out until
+it is re-measured on logged data tables: see "The async stack" below.)
 
 Three different shapes, from one droplet run of three interleaved passes
 (2026-11-18, DigitalOcean `s-8vcpu-16gb`, medians shown):
@@ -162,13 +160,14 @@ Three different shapes, from one droplet run of three interleaved passes
   The flattening that remains between four and eight writers is
   **WiredTiger itself**: cache eviction and checkpoint pressure inside one
   embedded WiredTiger connection, not a SecantusDB lock.
-- **The async stack has the highest single-writer rate** (dashed line).
-  This opt-in configuration (mitigations 5–6 below) moves the oplog write off
-  the writers' critical path and out of the WAL. It starts at 7.4k docs/s,
-  against 4.0k for the default and 5.9k for `mongod`, and reaches 17.2k at
-  eight writers. The trade is that a hard crash loses the oplog tail since the
-  last checkpoint. Data stays fully durable, and change streams remain
-  exactly-once.
+- **The async stack is not shown.** The 2026-11-18 run started this opt-in
+  configuration (mitigations 5–6 below) with `--oplog-async
+  --oplog-nonlogged` on the default store, whose data tables are not logged.
+  There the drainer is not used, and with the oplog out of WiredTiger's log
+  too, nothing is logged at all: a SIGKILL after 2,000 `j: true` inserts left
+  none of them (measured 2026-11-20, RM-731). The server now refuses that
+  combination, `bench/concurrency.py` runs the stack with `--data-logged` as
+  documented, and it returns to the chart once re-measured that way.
 
 **Passes are noisy on a shared-CPU droplet.** At eight writers the three
 passes gave 9.8k–14.6k docs/s for the Rust server and 16.2k–29.1k for
@@ -238,7 +237,8 @@ concurrency.
 - **Many connections doing concurrent writes** scale monotonically on
   the Rust server — ~2.7× the single-writer rate at eight writers
   (~96k docs/s aggregate) with no cliff, fully durable. The opt-in async + non-logged oplog
-  stack (mitigations 5–6) buys another ~1.2× (~119k docs/s at eight
+  stack (mitigations 5–6), on a store whose data tables are logged
+  (`--data-logged`), buys another ~1.2× (~119k docs/s at eight
   writers) if a checkpoint-durable oplog tail is acceptable. Run a
   real `mongod` if you need write throughput that keeps climbing
   steeply past a handful of writers.
@@ -266,7 +266,10 @@ SecantusDB, the levers are:
 5. **Async oplog (Rust server, opt-in).** `RustServer(oplog_async=True)`,
    `secantusd-mdb --oplog-async` (or `[storage] oplog_async = true` in
    `secantusd.toml`), or `SECANTUS_OPLOG_ASYNC=1` — the option wins over
-   the env var for that store. Moves oplog writes off the writer's
+   the env var for that store. Takes effect only on a store whose data
+   tables are logged (`--data-logged`); on the default unlogged ones each
+   write carries its oplog timestamp, so the drainer is not used and the
+   server says so at startup. Moves oplog writes off the writer's
    critical path onto a background drainer — ~1.6× multi-writer write
    throughput while keeping change streams (validated exactly-once
    under concurrency; a fresh change stream opens only after the
@@ -292,7 +295,13 @@ SecantusDB, the levers are:
    oplog becomes checkpoint-durable only — a hard crash loses the
    oplog tail since the last checkpoint (change-stream resume / PITR
    granularity), while the data tables stay fully logged and durable;
-   a clean shutdown checkpoints a complete oplog. Alone it buys little
+   a clean shutdown checkpoints a complete oplog. **Only on a store whose
+   data tables are logged** (`--data-logged` / `data_nonlogged=False`):
+   on the default unlogged data tables the data is recovered by replaying
+   the oplog, so a non-logged oplog would leave nothing in the log and a
+   crash would lose every write since the last checkpoint. The server
+   refuses that combination at open, naming `--data-logged` (RM-731).
+   Alone it buys little
    (~4% in sync mode), but **stacked with the async oplog it removes
    the oplog's WAL volume from the writers' path entirely: ~2.2× the
    default 8-writer throughput** (measured 56k → 125k docs/s of 8 KiB
