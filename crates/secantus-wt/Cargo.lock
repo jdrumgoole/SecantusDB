@@ -236,14 +236,14 @@ checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "secantus-compressors"
-version = "0.5.3-beta.198"
+version = "0.5.3-beta.199"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "secantus-wiredtiger-sys"
-version = "0.5.3-beta.198"
+version = "0.5.3-beta.199"
 dependencies = [
  "cc",
  "cmake",
@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wt"
-version = "0.5.3-beta.198"
+version = "0.5.3-beta.199"
 dependencies = [
  "bindgen",
  "secantus-compressors",

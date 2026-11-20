@@ -45,7 +45,7 @@ A change that touches only one server bumps only that server's version.
 
 ```bash
 pip install SecantusDB      # prebuilt secantusd-mdb and secantusd-pg on PATH
-# or: cargo install secantus-mdb --version 0.5.3-beta.198
+# or: cargo install secantus-mdb --version 0.5.3-beta.199
 secantusd-mdb --host 127.0.0.1 --port 27017 --storage-path ./secantus-data
 ```
 
@@ -60,7 +60,7 @@ and its own docs are in the
 ### PostgreSQL server
 
 The PostgreSQL server is the `secantus-pg` crate on crates.io (`cargo
-install secantus-pg --version 0.1.0-beta.20`), is in the PyPI wheel, and also ships as a standalone
+install secantus-pg --version 0.1.0-beta.21`), is in the PyPI wheel, and also ships as a standalone
 `secantusd-pg` archive on
 the `secantusd-pg-v*` tags on
 [GitHub Releases](https://github.com/jdrumgoole/SecantusDB/releases):

@@ -855,14 +855,14 @@ dependencies = [
 
 [[package]]
 name = "secantus-compressors"
-version = "0.5.3-beta.198"
+version = "0.5.3-beta.199"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "secantus-core"
-version = "0.5.3-beta.198"
+version = "0.5.3-beta.199"
 dependencies = [
  "bson",
  "chrono",
@@ -878,14 +878,14 @@ dependencies = [
 
 [[package]]
 name = "secantus-icu"
-version = "0.5.3-beta.198"
+version = "0.5.3-beta.199"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "secantus-storage"
-version = "0.5.3-beta.198"
+version = "0.5.3-beta.199"
 dependencies = [
  "bson",
  "flate2",
@@ -899,7 +899,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wiredtiger-sys"
-version = "0.5.3-beta.198"
+version = "0.5.3-beta.199"
 dependencies = [
  "cc",
  "cmake",
@@ -909,7 +909,7 @@ dependencies = [
 
 [[package]]
 name = "secantus-wt"
-version = "0.5.3-beta.198"
+version = "0.5.3-beta.199"
 dependencies = [
  "secantus-compressors",
  "secantus-wiredtiger-sys",
