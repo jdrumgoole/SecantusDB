@@ -46,9 +46,8 @@ fn data_nonlogged_option_engages_and_reopen_keeps_mode() {
         for i in 0..10 {
             insert_row(&st, "app", "c", i);
         }
-        // Under an ambient SECANTUS_OPLOG_ASYNC lane the inserts' oplog rows
-        // may still be queued at the drainer; the stable anchor covers only
-        // persisted rows, so drain first (no-op in sync mode).
+        // Every insert's oplog row commits with it, so this is a no-op; it
+        // stays as the barrier the stable anchor below relies on.
         st.flush_oplog();
         st.stable_checkpoint().unwrap();
         assert!(

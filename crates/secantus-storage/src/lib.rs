@@ -7610,7 +7610,7 @@ impl Storage {
         // Mode resolution: explicit option, else the env var each mode has
         // always honoured. `oplog_nonlogged` / the data create-mode govern
         // CREATE-time table configs (fresh stores; creates on existing tables
-        // are no-ops), `oplog_async` selects the drainer at every open.
+        // are no-ops).
         let oplog_nonlogged = opts.oplog_nonlogged.unwrap_or_else(oplog_tables_nonlogged);
         let data_create_mode = opts.data_nonlogged.unwrap_or_else(data_tables_nonlogged);
         let in_memory = config.contains("in_memory=true");
