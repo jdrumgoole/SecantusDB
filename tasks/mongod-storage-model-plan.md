@@ -330,10 +330,10 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
        checkpoint (a background `validate`) still finds the collection.
        Dropping at once lost that read about one time in thirteen under load
        (`diagnostic_commands_wt::background_validate_reads_the_last_checkpoint`).
-     - Still to fix (phase 8): a collection created by a transaction that
-       does not defer its creates (the PostgreSQL server's) and then rolled
-       back leaves its empty `collection-*` table until the next open drops
-       it; `ensure_collection` has no hook into the store's drop list.
+     - A collection created by a transaction that does not defer its creates
+       (the PostgreSQL server's) and then rolled back no longer leaves its
+       tables: `ensure_collection` lists them for the drop-pending reaper
+       when the transaction ends without committing (4d).
      - Key generation is unchanged, so an array still gets the whole-array
        entry besides mongod's element keys (`secantus_core::index_keys`).
        mongod's `validate` would count those as extra keys: phase 7 must
@@ -363,6 +363,36 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
      incarnations) moving to the index tables.
    - **4f. Clean-up.** The number-key, id-key and entry-format upgrade and
      refusal paths go (no store that needs them opens); store format 3.
+     **As built (4d, 4e and 4f, store format 4):**
+     - `_id_` is an `index-<UUID>` table made with the collection
+       (`INDEX_TABLE_CFG`, `formatVersion=8`), listed in the placement and in
+       `idxIdent`. Key = KeyString of `_id` alone, value = the RecordId
+       (`append_record_id_long`'s bytes) then the TypeBits; the tables of the
+       phase 0 fixture (`app.c`, `app.ks`, `app.system.views`) are rebuilt
+       byte for byte (`tests/id_index_table.rs`). A collection's default
+       collation is the key's string transform. `system.profile` and a
+       time-series collection have no `_id_` (a measurement repeats `_id`; a
+       profile entry has none); a clustered collection (still not mongod's:
+       its RecordId is not the `_id`) keeps an `_id_` table.
+     - `idIndexSize` counts the `_id_` entries' key bytes
+       (`Delta::entries("_id_", ..)`); `Delta::insert/remove/replace` no
+       longer carry a key length.
+     - Uniqueness (4e): a unique or `prepareUnique` secondary index claims the
+       KeyString of the value alone (insert with `overwrite=false`, remove
+       in the same transaction: mongod's `WiredTigerIndex::_checkDups`
+       phase 1) and then looks for another RecordId's entry under that
+       prefix (phase 2); `_id_` is the plain `overwrite=false` insert of
+       `WiredTigerIdIndex::_insert`. `secantus_unique_keys` and its
+       take-over of stale claims, `deferred_keys` and `move_keyed_rows`, the
+       collated and document `_id` claims and their backfills, and the
+       rename's copy are gone.
+     - Cleanup (4f): the number-key, `_id`-key and entry-format markers and
+       their upgrade, re-key, refusal and rebuild paths, `NAT_SEQ_TABLE`,
+       `UNIQ_TABLE`, `to_spans` and `widen_ranks` (an `_id` range is
+       `to_key_spans` over the `_id_` table), `IndexPos::Raw` /
+       `IndexFrom::Raw`; the explain stream reads `_id_` as any other
+       index. `migrate_legacy_pre_images` (a pre-RM-366 table) stays: not
+       one of the formats listed.
    - **The PostgreSQL server** reaches indexes through the same storage
      calls; its NULL placement and types are checked by the psycopg, slt and
      SQLAlchemy gauges after 4b and after 4e.

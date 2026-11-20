@@ -22673,8 +22673,8 @@ impl PgHandler {
                 };
                 let table =
                     if let Some(ix) = self.index_relations().into_iter().find(|ix| ix.oid == oid) {
-                        // The index's own WiredTiger table (`index-<UUID>`);
-                        // the primary key is still the `_id` index.
+                        // The index's own WiredTiger table (`index-<UUID>`),
+                        // the primary key's (the `_id` index) included.
                         match self
                             .storage
                             .index_table_name(self.db(), &ix.table.name, &ix.name)

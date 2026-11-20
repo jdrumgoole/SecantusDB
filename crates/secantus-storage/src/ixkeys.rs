@@ -25,6 +25,15 @@ pub(crate) struct EntryKey {
     pub type_bits: Vec<u8>,
 }
 
+/// An `_id_` entry as mongod 8.2.11 writes it: the KeyString of `_id` alone
+/// as the key, and as the value the RecordId (`append_record_id_long`'s
+/// bytes) followed by the TypeBits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IdEntry {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
 /// How an index's values become KeyString bytes.
 #[derive(Clone)]
 pub(crate) struct KeyShape {
@@ -116,6 +125,35 @@ impl KeyShape {
         })
     }
 
+    /// The `_id_` entry of document `id` held by `rid` (see [`IdEntry`]).
+    pub fn id_entry(&self, id: &Bson, rid: i64) -> Result<IdEntry> {
+        let e = self.entry(std::slice::from_ref(id), rid)?;
+        let (key, _) = keystring::without_record_id_long_at_end(&e.key).map_err(unsupported)?;
+        let mut value = e.key[key.len()..].to_vec();
+        value.extend_from_slice(&e.type_bits);
+        Ok(IdEntry {
+            key: key.to_vec(),
+            value,
+        })
+    }
+
+    /// The `_id_` key of document `id`: what a lookup of it seeks.
+    pub fn id_key(&self, id: &Bson) -> Result<Vec<u8>> {
+        self.exact(std::slice::from_ref(id))
+    }
+
+    /// An `_id_` entry's `_id` and RecordId.
+    pub fn decode_id(&self, key: &[u8], value: &[u8]) -> Result<(Bson, i64)> {
+        let bad = || StorageError::Internal("an _id index entry is not a KeyString".into());
+        let (rid, used) = keystring::decode_record_id_long(value).map_err(|_| bad())?;
+        let tb = TypeBits::from_buffer(Version::V1, &value[used..]).map_err(|_| bad())?;
+        let mut values = keystring::to_bson(key, self.ordering, &tb).map_err(|_| bad())?;
+        if values.len() != 1 {
+            return Err(bad());
+        }
+        Ok((values.remove(0), rid))
+    }
+
     /// The bytes every entry of `values` starts with, end byte included and
     /// no RecordId: a seek for the first of them, and the prefix the rest
     /// share.
@@ -175,6 +213,13 @@ impl KeyShape {
         let values = keystring::to_bson(without_rid, self.ordering, &tb).map_err(|_| bad())?;
         Ok((values, rid))
     }
+}
+
+/// The RecordId an `_id_` entry's value starts with.
+pub(crate) fn id_entry_rid(value: &[u8]) -> Option<i64> {
+    keystring::decode_record_id_long(value)
+        .ok()
+        .map(|(rid, _)| rid)
 }
 
 /// The RecordId at the end of an entry's key.
@@ -247,6 +292,17 @@ mod tests {
         let (values, rid) = shape.decode(&e.key, &e.type_bits).unwrap();
         assert_eq!(values, vec![Bson::Int32(1), Bson::String("x".into())]);
         assert_eq!(rid, 7);
+    }
+
+    #[test]
+    fn an_id_entry_holds_the_record_id_in_its_value() {
+        let shape = KeyShape::new(&doc! {"_id": 1}, None, BinDataOrder::Mongod);
+        let id = Bson::Double(0.5);
+        let e = shape.id_entry(&id, 7).unwrap();
+        assert_eq!(e.key, shape.id_key(&id).unwrap());
+        assert_eq!(id_entry_rid(&e.value), Some(7));
+        let (back, rid) = shape.decode_id(&e.key, &e.value).unwrap();
+        assert_eq!((back, rid), (id, 7));
     }
 
     #[test]

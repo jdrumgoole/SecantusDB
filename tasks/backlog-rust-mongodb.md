@@ -868,51 +868,6 @@ These are explicit non-goals. Don't add them without a reason.
       cache). (Its other half, `txnNumUpdates`, closed 2026-11-07.)
       Backlog-ID: RM-364
       Verify: none -- no test drives mongod's eviction into an interruptible wait on demand
-- [ ] **A transaction's insert counts more dirty bytes than mongod's.**
-      mongod 8.2.11's line for an insert of `{_id: 700, y: 1}` inside a
-      transaction, into a collection indexed on `_id` and `x`, counts
-      `txnBytesDirty` 305-345 over its 3 updates; this server's about 391.
-      Over fifty documents in one `insert` the mean is 70-71 bytes more per
-      document here, every run. An update or a delete of the same document
-      counts the same on both (96 and 192), so the surplus is in what an
-      insert links into a page: the record and its index keys, whose layout
-      here is not mongod's KeyString. (An insert's count varies by 8 bytes a
-      skiplist level on both servers: WiredTiger draws each new key's depth
-      at random.) Measured 2026-11-10. Found while working RM-385.
-      The surplus is this store's shared
-      tables. Every key an insert writes carries the namespace as strings,
-      because collections share sixteen document shards
-      (`key_format=SSq`), every `_id` index is a row in
-      `secantus_natural_seq` (`SSu`), and every secondary index is a row in
-      `secantus_index_entries` (`SSSu`, plus the index name). mongod keeps
-      one WiredTiger table per collection (`key_format=q`) and one per
-      index (KeyString keys), so no key names its namespace. Measured with
-      the gap test's insert of fifty documents into `c`, with the `_id` and
-      `x` indexes (`secantusd-mdb` from `rm-batch` at 6bcd8f41, mongod
-      8.2.11): a 9-character database name gives 362.8 bytes per document
-      here against 311.6 on mongod. A 49-character name gives 481.4 here
-      against 313.8: 40 more characters cost 118.6 bytes here (three keys
-      times 40) and nothing on mongod. Of the 51 bytes left at 9
-      characters, about 40 are the prefixes (`db\0c\0` three times, plus
-      `x_1\0`). The remaining ~11 are the encodings: the `_id` sort key
-      against KeyString, and the index entry's value.
-      **Decided (Joe, 2026-11-13): mongod's layout.** A WiredTiger table
-      per collection keyed by RecordId (`key_format=q`) and a table per
-      index keyed by KeyString, with the catalog mapping each namespace to
-      its ident, as mongod does. It closes this item and the per-table half
-      of RM-040 (`collStats.wiredTiger` / `indexDetails`, real
-      `storageSize` / `indexSize`, `$listCatalog` idents), and makes the
-      RM-192 `compact` scope decision unnecessary. It changes the on-disk
-      format both Rust servers share: a format bump that refuses an old
-      store or a migration, replacing `DOC_SHARDS`, and the KeyString keys
-      change the on-disk sort-key rank (`sortkey.rs`, `entryFormat`).
-      Several PRs, storage first, then KeyString; each says in its PR that
-      the Rust PG server links it, and the PG session is told before the
-      format changes.
-      Verify: tests/backlog/test_rm_355_364.py::test_an_insert_in_a_transaction_counts_mongods_dirty_bytes
-      **Decided (Joe, 2026-11-16): go ahead, staged as above -- storage first, then KeyString; a format bump that refuses an old store; the PG session told before the format changes.**
-      Backlog-ID: RM-499
-
 - [ ] **mongod's startup lines this server does not write.** Since RM-302
   the log is mongod's structured log, and since 2026-11-13 this server
   starts it as mongod 8.2.11 does on `initandlisten`: `MongoDB starting`,
@@ -2048,13 +2003,9 @@ behind, in the order the collection holds them. The Rust server differs on
 32. Pinned by
 `crates/secantus-storage-adapter/tests/insert_delete_count_distinct_wt.rs`.
 
-A document `_id` takes a claim by value in `UNIQ_TABLE`
-(`Storage::document_id_claim`), on top of the `_id` index keyed by BSON
-bytes (`encode_id_key`, on disk and shared with the Python server). A
-document stored before that is given its claim the first time this version
-opens the store (`backfill_document_id_claims`, once for a store; a row in
-`UNIQ_TABLE` under an empty namespace records it). Two stored documents
-already equal by value both stay, and the older holds the claim.
+A document `_id` is compared by value: the `_id_` index is keyed by the
+KeyString of `_id` (store format 4), where `{a: 1}` and `{a: 1.0}` are one
+key, so there is no claim beside it.
 
 Still different, of those 32 (the other four are the items below):
 
@@ -3022,7 +2973,7 @@ produce the dump it exists for.
       close one by one as they land (files and catalog: phases 1-2; one
       table per collection and index: 3-4; both opens: 7).
       Backlog-ID: RM-723
-      Verify: tests/backlog/test_rm_storage_model.py::test_store_has_mongods_files, tests/backlog/test_rm_storage_model.py::test_one_table_per_collection_and_per_index, tests/backlog/test_rm_storage_model.py::test_mongod_opens_a_secantus_store, tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_mongod_store
+      Verify: tests/backlog/test_rm_storage_model.py::test_store_has_mongods_files, tests/backlog/test_rm_storage_model.py::test_mongod_opens_a_secantus_store, tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_mongod_store
 - [ ] **There is no `shutdown` command.** mongod 8.2.11 stops on
       `db.adminCommand({shutdown: 1})`: the connection closes and the
       process exits cleanly. `secantusd-mdb` answers CommandNotFound (59)
@@ -3056,6 +3007,20 @@ produce the dump it exists for.
       Verify: none -- intermittent: CI's Linux debug build met it once, and twenty local runs did not; the live test above is what catches it
 
 ## Found while working the storage model (2026-11-19)
+
+- [ ] **RM-610's regression test measures wall time, and failed once on CI.**
+      `tests/backlog/test_rm_found_2026_11_13_contested_reads.py::test_a_contested_find_and_write_of_one_cost_what_they_return`
+      compares how a contested `updateOne`'s time grows from 10,000 to
+      100,000 documents against mongod's (within 3x). On PR #2918's CI (the
+      Linux debug build) this server's `updateOne` grew past 3x; the rerun
+      passed, and locally it is flat (17.0 ms against 16.9 ms, 0 failures in
+      6 runs under eight CPU burners). A checkpoint landing in the timed
+      window is the likely cause, not shown. The test should compare what
+      each server examines (`explain`'s `totalKeysExamined` /
+      `totalDocsExamined` at both sizes), which is mongod's own measure of
+      the cost and does not move with the machine.
+      Backlog-ID: RM-728
+      Verify: none -- a test-quality item: the behaviour is right on every run measured here; what is wrong is that the test can fail on timing alone
 
 - [ ] **A restore to the timestamp of a batched insert applies part of the
       batch.** `insert_many` of two documents is one `applyOps` entry in

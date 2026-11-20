@@ -103,7 +103,7 @@ impl Stretch {
 
     /// Where it ends, as bytes every key it holds is below (`None`: never).
     /// A key end takes the key's extensions too (`k` then `0xff`): no key
-    /// holds `0xff` after a value's own bytes, see `to_spans`.
+    /// holds `0xff` after a value's own bytes, see `to_key_spans`.
     fn hi_pos(&self) -> Option<Vec<u8>> {
         match &self.hi {
             None => None,
@@ -163,24 +163,6 @@ impl Bounds {
                     |k| !matches!(k.first(), Some(r) if *r == null || *r == doc || *r == arr),
                 )
             })
-    }
-
-    /// Replace every key end of `ranks` -- points included -- by the edges
-    /// of its rank. For the `_id` index, where a document `_id` re-keyed from
-    /// `_id` key format 1 may keep its raw-BSON key (`Storage::upgrade_id_keys`).
-    pub fn widen_ranks(&mut self, ranks: &[u8]) {
-        for s in &mut self.stretches {
-            if let Some(End::Key(k)) = &s.lo {
-                if ranks.contains(&k.sort[0]) {
-                    s.lo = Some(End::Floor(k.sort[0]));
-                }
-            }
-            if let Some(End::Key(k)) = &s.hi {
-                if ranks.contains(&k.sort[0]) {
-                    s.hi = Some(End::Floor(k.sort[0] + 1));
-                }
-            }
-        }
     }
 }
 
@@ -641,93 +623,11 @@ pub(crate) fn for_predicate(pred: &Bson, multikey: bool, desc: bool) -> Option<B
 }
 
 /// One stretch of an index's entries as stored: from `lo` (inclusive) to
-/// `hi` (exclusive), on the escaped (or, for the `_id` index, raw) bytes.
+/// `hi` (exclusive), on the KeyString bytes of the field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Span {
     pub lo: Option<Vec<u8>>,
     pub hi: Option<Vec<u8>>,
-}
-
-/// The stored spans of `bounds` on a field of direction `dir`, low to high
-/// in the order the entries are stored, overlaps merged. `escape` is the
-/// entry escaping (`None` for raw keys).
-///
-/// A key end's high side is `key + 0xff`: that takes the key itself in a
-/// compound index (where `0x00 0x00` and the next field follow it) and the
-/// keys that extend it, none of which holds `0xff` next (no UTF-8 text does,
-/// and every other key is terminated).
-pub(crate) fn to_spans(bounds: &Bounds, dir: i32, escape: fn(&[u8]) -> Vec<u8>) -> Vec<Span> {
-    let floor = |r: u8| -> Vec<u8> {
-        if dir == -1 {
-            vec![0xFFu8 - r + 1]
-        } else {
-            vec![r]
-        }
-    };
-    // A descending field stores the inverted key and its terminator
-    // (`sortkey::encode_value_directed`, entry format 6).
-    let key_bytes = |k: &[u8]| -> Vec<u8> {
-        if dir == -1 {
-            let mut inverted: Vec<u8> = k.iter().map(|b| b ^ 0xFF).collect();
-            inverted.extend_from_slice(secantus_core::sortkey::DESC_END);
-            escape(&inverted)
-        } else {
-            escape(k)
-        }
-    };
-    let low = |e: &End| match e {
-        End::Floor(r) => floor(*r),
-        End::Key(k) => key_bytes(&k.sort),
-    };
-    let high = |e: &End| match e {
-        End::Floor(r) => floor(*r),
-        End::Key(k) => {
-            let mut b = key_bytes(&k.sort);
-            b.push(0xFF);
-            b
-        }
-    };
-    let mut spans: Vec<Span> = bounds
-        .stretches
-        .iter()
-        .map(|s| {
-            if dir == -1 {
-                Span {
-                    lo: s.hi.as_ref().map(low),
-                    hi: s.lo.as_ref().map(high),
-                }
-            } else {
-                Span {
-                    lo: s.lo.as_ref().map(low),
-                    hi: s.hi.as_ref().map(high),
-                }
-            }
-        })
-        .filter(|s| match (&s.lo, &s.hi) {
-            (Some(l), Some(h)) => l < h,
-            _ => true,
-        })
-        .collect();
-    spans.sort_by(|a, b| a.lo.cmp(&b.lo));
-    let mut out: Vec<Span> = Vec::new();
-    for s in spans {
-        if let Some(last) = out.last_mut() {
-            let touches = match (&last.hi, &s.lo) {
-                (None, _) => true,
-                (Some(_), None) => true,
-                (Some(h), Some(l)) => l <= h,
-            };
-            if touches {
-                last.hi = match (&last.hi, &s.hi) {
-                    (None, _) | (_, None) => None,
-                    (Some(a), Some(b)) => Some(a.max(b).clone()),
-                };
-                continue;
-            }
-        }
-        out.push(s);
-    }
-    out
 }
 
 /// The KeyString byte that starts the keys of sort-key type rank `rank`
@@ -859,10 +759,6 @@ mod tests {
         for_predicate(&pred, false, false).expect("bounds")
     }
 
-    fn plain(k: &[u8]) -> Vec<u8> {
-        k.to_vec()
-    }
-
     #[test]
     fn negations_read_everything() {
         for pred in [
@@ -874,7 +770,15 @@ mod tests {
         ] {
             let b = bounds(pred);
             assert!(b.broad);
-            assert_eq!(to_spans(&b, 1, plain), vec![Span { lo: None, hi: None }]);
+            let shape = crate::ixkeys::KeyShape::new(
+                &doc! {"a": 1},
+                None,
+                secantus_core::order::BinDataOrder::Mongod,
+            );
+            assert_eq!(
+                to_key_spans(&b, 1, &shape, 0).unwrap(),
+                vec![Span { lo: None, hi: None }]
+            );
         }
     }
 
@@ -1013,11 +917,15 @@ mod tests {
     #[test]
     fn descending_spans_run_high_to_low() {
         let b = bounds(Bson::Document(doc! {"$in": [1, 3]}));
-        let spans = to_spans(&b, -1, plain);
+        let shape = crate::ixkeys::KeyShape::new(
+            &doc! {"a": -1},
+            None,
+            secantus_core::order::BinDataOrder::Mongod,
+        );
+        let spans = to_key_spans(&b, -1, &shape, 0).unwrap();
         assert_eq!(spans.len(), 2);
-        // The stored key of 3 (inverted, terminated) comes first.
-        let three =
-            secantus_core::sortkey::encode_value_directed(&Bson::Int32(3), -1, None).unwrap();
+        // The stored key of 3 (inverted) comes first.
+        let three = shape.field_bytes(0, &Bson::Int32(3)).unwrap();
         assert_eq!(spans[0].lo, Some(three));
     }
 }

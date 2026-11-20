@@ -72,6 +72,10 @@ impl CollectionSizes {
         self.data_size += sign * d.data_size;
         self.id_index_size += sign * d.id_index_size;
         for (name, bytes) in &d.entries {
+            if name == crate::ID_INDEX_NAME {
+                self.id_index_size += sign * bytes;
+                continue;
+            }
             let slot = self.index_sizes.entry(name.clone()).or_insert(0);
             *slot += sign * bytes;
             if *slot == 0 {
@@ -135,23 +139,21 @@ pub(crate) struct Delta {
 }
 
 impl Delta {
-    /// A document row of `id_key` and `blob` bytes was written where none was.
-    pub(crate) fn insert(id_key: usize, blob: usize) -> Delta {
+    /// A document row of `blob` bytes was written where none was.
+    pub(crate) fn insert(blob: usize) -> Delta {
         Delta {
             records: 1,
             data_size: blob as i64,
-            id_index_size: id_key as i64,
-            entries: Vec::new(),
+            ..Delta::default()
         }
     }
 
-    /// A document row of `id_key` and `blob` bytes was removed.
-    pub(crate) fn remove(id_key: usize, blob: usize) -> Delta {
+    /// A document row of `blob` bytes was removed.
+    pub(crate) fn remove(blob: usize) -> Delta {
         Delta {
             records: -1,
             data_size: -(blob as i64),
-            id_index_size: -(id_key as i64),
-            entries: Vec::new(),
+            ..Delta::default()
         }
     }
 
@@ -175,16 +177,15 @@ impl Delta {
     }
 
     /// A document row was rewritten in place.
-    pub(crate) fn replace(old: (usize, usize), new: (usize, usize)) -> Delta {
+    pub(crate) fn replace(old: usize, new: usize) -> Delta {
         Delta {
-            records: 0,
-            data_size: new.1 as i64 - old.1 as i64,
-            id_index_size: new.0 as i64 - old.0 as i64,
-            entries: Vec::new(),
+            data_size: new as i64 - old as i64,
+            ..Delta::default()
         }
     }
 
     /// Index `name` gained (`bytes > 0`) or lost entries of that many bytes.
+    /// The `_id` index's are counted as `idIndexSize`.
     pub(crate) fn entries(name: &str, bytes: i64) -> Delta {
         Delta {
             entries: vec![(name.to_string(), bytes)],
@@ -414,9 +415,9 @@ impl SizeStorer {
             if let Some(cur) = cur {
                 while cur.next()? {
                     let value = cur.get_value_u()?;
-                    let (idk, blob) = crate::unframe_doc_value(&value)?;
+                    let (_idk, blob) = crate::unframe_doc_value(&value)?;
                     let s = sizes.entry((db.clone(), coll.clone())).or_default();
-                    s.apply(&Delta::insert(idk.len(), blob.len()), 1);
+                    s.apply(&Delta::insert(blob.len()), 1);
                 }
             }
             // Each secondary index's own table (`index-<UUID>`).
@@ -496,7 +497,7 @@ mod tests {
     #[test]
     fn a_delta_and_its_negation_cancel() {
         let mut s = CollectionSizes::default();
-        let doc = Delta::insert(3, 40);
+        let doc = Delta::insert(40);
         let entry = Delta::entries("a_1", 12);
         s.apply(&doc, 1);
         s.apply(&entry, 1);

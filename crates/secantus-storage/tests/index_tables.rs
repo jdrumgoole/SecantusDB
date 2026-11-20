@@ -105,8 +105,19 @@ fn tables_named(st: &Storage, prefix: &str) -> Vec<String> {
     last.unwrap()
 }
 
+/// The secondary indexes' tables: every `index-<UUID>` table but the `_id_`
+/// index's of each collection (an index table of its own since phase 4d).
 fn index_tables(st: &Storage) -> Vec<String> {
+    let id_tables: BTreeSet<String> = st
+        .list_collections("app")
+        .unwrap()
+        .iter()
+        .filter_map(|c| st.index_table_name("app", c, "_id_").unwrap())
+        .collect();
     tables_named(st, "table:index-")
+        .into_iter()
+        .filter(|t| !id_tables.contains(t))
+        .collect()
 }
 
 fn collection_tables(st: &Storage) -> Vec<String> {
@@ -357,6 +368,8 @@ fn dropping_an_index_or_its_collection_drops_the_table() {
         assert!(st.drop_collection("app", "c").unwrap());
         assert!(index_tables(st).is_empty());
         assert!(collection_tables(st).is_empty());
+        // Its `_id` index's table included.
+        assert!(tables_named(st, "table:index-").is_empty());
     });
 }
 

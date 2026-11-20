@@ -6,7 +6,13 @@ detached connection threads had released their storage refs, so the connection's
 final close-checkpoint raced the data-dir reopen (``WT_PANIC: ... the system must
 restart`` once ``WiredTigerHS.wt`` vanished mid-checkpoint). ``stop()`` now drains
 the live connection count before the WiredTiger connection closes; this test pins
-that — concurrent write/stop/restore cycles must all succeed, no panic.
+that — concurrent write/stop/reopen cycles must all succeed, no panic.
+
+The reopen used to be the deprecated Python restore tool over the stopped
+store; since the Rust servers write mongod's layout (tasks/
+mongod-storage-model-plan.md) the Python store cannot read theirs, so each
+cycle reopens the store with a second embedded Rust server, in this process,
+and checks it holds what was written.
 
 Kept light (a handful of cycles) so it is safe under ``pytest -n auto``; the
 heavier sweep lives in ``bench/wt_stress.py`` (``invoke rust-stress``).
@@ -25,8 +31,6 @@ _server = pytest.importorskip("_secantus_server")
 # tables are not logged (secantusd-mdb's default since RM-210) refuses once a
 # key has one: the hand-off is tested on a store created with them logged.
 pymongo = pytest.importorskip("pymongo")
-
-from secantus import oplog_replay  # noqa: E402
 
 
 def _cycle(idx: int) -> None:
@@ -51,8 +55,19 @@ def _cycle(idx: int) -> None:
             client.close()
         finally:
             srv.stop()  # must fully close WT before the dir is reopened/removed
-        out = Path(td) / "restored"
-        oplog_replay.restore_to_timestamp(str(data), str(out))
+        # A second WiredTiger connection over the same data dir, in this
+        # process, while the other workers' servers start and stop.
+        again = _server.RustServer(str(data), 0, data_nonlogged=False)
+        try:
+            host, port = again.address
+            client = pymongo.MongoClient(
+                host, port, directConnection=True, serverSelectionTimeoutMS=30000
+            )
+            coll = client["app"]["c"]
+            assert (coll.count_documents({}), coll.count_documents({"touched": True})) == (40, 40)
+            client.close()
+        finally:
+            again.stop()
 
 
 def test_concurrent_server_lifecycle_no_panic() -> None:

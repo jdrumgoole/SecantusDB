@@ -362,3 +362,28 @@ def test_rust_binary_preserve_oplog(tmp_path: pathlib.Path) -> None:
     fresh = tmp_path / "fresh"
     assert _restore(data, fresh).returncode == 0
     assert _restored_oplog_len(fresh) == 0  # fresh timeline by default
+
+
+def test_rust_binary_restore_keeps_a_capped_collections_options(tmp_path: pathlib.Path) -> None:
+    """A capped collection with a validator, created through the Rust
+    server, keeps its options and documents through `secantusd-mdb restore`.
+    (This check went through the deprecated Python restore tool until
+    2026-11-20; see tests/test_rust_pitr_cross_server.py.)"""
+    data = tmp_path / "data"
+    validator = {"$jsonSchema": {"required": ["k"]}}
+    with _rust_server(data) as client:
+        db = client["app"]
+        db.create_collection("capped", capped=True, size=4096, max=3, validator=validator)
+        db["capped"].insert_many([{"_id": i, "k": i} for i in range(5)])
+    out = tmp_path / "restored"
+    res = _restore(data, out)
+    assert res.returncode == 0, res.stderr
+    with _rust_server(out) as client:
+        info = client["app"].command("listCollections", filter={"name": "capped"})["cursor"][
+            "firstBatch"
+        ]
+        options = info[0]["options"]
+        assert (options["capped"], options["size"], options["max"]) == (True, 4096, 3)
+        assert options["validator"] == validator
+        docs = sorted(d["_id"] for d in client["app"]["capped"].find())
+    assert docs == [2, 3, 4]

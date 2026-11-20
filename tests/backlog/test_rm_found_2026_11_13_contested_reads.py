@@ -44,7 +44,12 @@ def _best_ms(call: Callable[[], Any]) -> float:
     return best * 1000
 
 
-def _growth(client: Any, names: tuple[str, ...]) -> dict[str, bool]:
+#: Each server's measured milliseconds, `{server: {n: {name: ms}}}`, so a
+#: failure says what was measured (RM-728).
+_TIMES: dict[str, dict[int, dict[str, float]]] = {}
+
+
+def _growth(client: Any, names: tuple[str, ...], label: str = "") -> dict[str, bool]:
     """For each operation `names` picks over the contested query: whether
     its time over 100,000 documents is within `_RATIO` of its time over
     10,000."""
@@ -66,6 +71,7 @@ def _growth(client: Any, names: tuple[str, ...]) -> dict[str, bool]:
             times[n] = {name: _best_ms(call) for name, call in reads.items()}
     finally:
         client.drop_database("rm_found_contested_reads")
+    _TIMES[label] = {n: {k: round(v, 2) for k, v in t.items()} for n, t in times.items()}
     # A floor of 1 ms keeps a sub-millisecond read's jitter from counting
     # as growth.
     return {
@@ -83,9 +89,9 @@ def test_a_contested_find_and_write_of_one_cost_what_they_return(
     plans reach, and their cost is flat in the collection's size, as
     mongod's is."""
     names = ("find with a limit", "updateOne")
-    theirs = _growth(mongod_rs, names)
-    assert all(theirs.values()), theirs
-    assert _growth(rust_mongo, names) == theirs
+    theirs = _growth(mongod_rs, names, "mongod")
+    assert all(theirs.values()), (theirs, _TIMES)
+    assert _growth(rust_mongo, names, "secantusd-mdb") == theirs, _TIMES
 
 
 @pytest.mark.backlog_fixed("RM-610")
@@ -95,6 +101,6 @@ def test_a_contested_read_costs_what_it_returns(rust_mongo: Any, mongod_rs: Any)
     whole collection first, until RM-610 tried its plans over what they
     reach."""
     names = ("explain at queryPlanner",)
-    theirs = _growth(mongod_rs, names)
-    assert all(theirs.values()), theirs
-    assert _growth(rust_mongo, names) == theirs
+    theirs = _growth(mongod_rs, names, "mongod")
+    assert all(theirs.values()), (theirs, _TIMES)
+    assert _growth(rust_mongo, names, "secantusd-mdb") == theirs, _TIMES
