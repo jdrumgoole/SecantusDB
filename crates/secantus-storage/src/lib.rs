@@ -8731,6 +8731,20 @@ impl Storage {
                     append_ts_t_v_wall(buf.into_bytes(), ts[i], wall_millis),
                 ));
             }
+        } else if let Some(fast) = {
+            let mut chains = {
+                let (missing, mut have) = rw_seed_chains(&self.retry_chains, &entries);
+                have.extend(self.retry_chains_for(&missing));
+                have
+            };
+            let made = if prepare {
+                None
+            } else {
+                fast_insert_view(&entries, &ts, wall_millis, &mut chains)
+            };
+            made.inspect(|_| self.remember_retry_chains(chains))
+        } {
+            finals = fast;
         } else {
             let mut docs: Vec<Document> = Vec::with_capacity(entries.len());
             for (i, entry) in entries.into_iter().enumerate() {
@@ -8772,6 +8786,7 @@ impl Storage {
             cur.insert()?;
             last = *seq;
         }
+        keep_entry_buffer(finals);
         // In the write's own transaction, as mongod records a pre-image.
         self.write_pre_image_records(session, &records)?;
         // Bare autocommit emit: every cursor insert above committed on its own,
@@ -24685,6 +24700,373 @@ fn raw_is_plain_insert(buf: &bson::RawDocumentBuf) -> bool {
     is_insert
 }
 
+/// One element of a raw document: its whole bytes (type, key, value), its
+/// key, and its value's bytes.
+struct RawElem<'a> {
+    whole: &'a [u8],
+    key: &'a str,
+    value: &'a [u8],
+}
+
+/// The elements of a raw document of the few types an insert entry holds
+/// (string, document, binary, int32, int64), or `None` for any other.
+fn raw_elems(doc: &[u8]) -> Option<Vec<RawElem<'_>>> {
+    let total = i32::from_le_bytes(doc.get(..4)?.try_into().ok()?) as usize;
+    if total != doc.len() || *doc.last()? != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(8);
+    let mut pos = 4;
+    while pos < total - 1 {
+        let ty = doc[pos];
+        let key_end = pos + 1 + doc[pos + 1..].iter().position(|b| *b == 0)?;
+        let key = std::str::from_utf8(&doc[pos + 1..key_end]).ok()?;
+        let v = key_end + 1;
+        let len = match ty {
+            0x02 => 4 + i32::from_le_bytes(doc.get(v..v + 4)?.try_into().ok()?) as usize,
+            0x03 | 0x04 => i32::from_le_bytes(doc.get(v..v + 4)?.try_into().ok()?) as usize,
+            0x05 => 5 + i32::from_le_bytes(doc.get(v..v + 4)?.try_into().ok()?) as usize,
+            0x10 => 4,
+            0x12 => 8,
+            _ => return None,
+        };
+        let end = v.checked_add(len)?;
+        if end > total - 1 {
+            return None;
+        }
+        out.push(RawElem {
+            whole: &doc[pos..end],
+            key,
+            value: &doc[v..end],
+        });
+        pos = end;
+    }
+    Some(out)
+}
+
+/// One raw insert entry taken apart for [`fast_insert_view`].
+struct RawInsertParts<'a> {
+    /// `op`, `ns`, `ui`, `o`, `o2` as they stand, in the view's order.
+    fields: Vec<&'a [u8]>,
+    /// The `ns` value is a name that holds no NUL (checked).
+    rw_lsid: Option<&'a [u8]>,
+    rw_txn: Option<i64>,
+    rw_stmt: Option<&'a [u8]>,
+    has_rw: bool,
+    group: Option<i64>,
+}
+
+fn raw_insert_parts(buf: &bson::RawDocumentBuf) -> Option<RawInsertParts<'_>> {
+    let elems = raw_elems(buf.as_bytes())?;
+    let (mut op, mut ns, mut ui, mut o, mut o2) = (None, None, None, None, None);
+    let (mut rw_lsid, mut rw_txn, mut rw_stmt, mut has_rw, mut group) =
+        (None, None, None, false, None);
+    for e in &elems {
+        match e.key {
+            "op" => op = Some(e),
+            "ns" => {
+                if e.value.len() < 5 || e.value[4..e.value.len() - 1].contains(&0) {
+                    return None;
+                }
+                ns = Some(e)
+            }
+            "ui" => ui = Some(e),
+            "o" => o = Some(e),
+            "o2" => o2 = Some(e),
+            "rw" => {
+                has_rw = true;
+                for r in raw_elems(e.value)? {
+                    match r.key {
+                        "lsid" => rw_lsid = Some(r.whole),
+                        "txnNumber" => {
+                            if r.whole[0] != 0x12 {
+                                return None;
+                            }
+                            rw_txn = Some(i64::from_le_bytes(r.value.try_into().ok()?))
+                        }
+                        "stmtId" => rw_stmt = Some(r.whole),
+                        _ => return None,
+                    }
+                }
+            }
+            "bg" => {
+                for r in raw_elems(e.value)? {
+                    if r.key == "g" {
+                        if r.whole[0] != 0x12 {
+                            return None;
+                        }
+                        group = Some(i64::from_le_bytes(r.value.try_into().ok()?));
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    let op = op?;
+    if op.whole[0] != 0x02 || &op.value[4..] != b"i\0" {
+        return None;
+    }
+    let mut fields = vec![op.whole, ns?.whole];
+    if let Some(u) = ui {
+        fields.push(u.whole);
+    }
+    fields.push(o?.whole);
+    if let Some(o2) = o2 {
+        fields.push(o2.whole);
+    }
+    if has_rw && (rw_lsid.is_none() || rw_txn.is_none()) {
+        return None;
+    }
+    Some(RawInsertParts {
+        fields,
+        rw_lsid,
+        rw_txn,
+        rw_stmt,
+        has_rw,
+        group,
+    })
+}
+
+thread_local! {
+    /// A buffer a batch's entry is written into, kept between batches: a
+    /// fresh one of some 100 KB costs page faults every time.
+    static ENTRY_BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+fn take_entry_buffer(size: usize) -> Vec<u8> {
+    let mut b = ENTRY_BUFFER.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    b.clear();
+    b.reserve(size);
+    b
+}
+
+/// Keep the largest of `finals`' buffers for the next batch.
+fn keep_entry_buffer(finals: Vec<(i64, Vec<u8>)>) {
+    if let Some((_, b)) = finals.into_iter().max_by_key(|f| f.1.capacity()) {
+        if b.capacity() <= 4 << 20 {
+            ENTRY_BUFFER.with(|k| *k.borrow_mut() = b);
+        }
+    }
+}
+
+type RetryChains = HashMap<(Vec<u8>, i64), Bson>;
+
+/// The chains of the retryable batches among `entries`, for
+/// [`fast_insert_view`]: from memory where held, else from the session's
+/// `config.transactions` row ([`Storage::retry_chains_for`]).
+fn rw_seed_chains(
+    held: &Mutex<HashMap<(Vec<u8>, i64), bson::Timestamp>>,
+    entries: &[OplogEntry],
+) -> (Vec<Document>, RetryChains) {
+    let mut missing: Vec<Document> = Vec::new();
+    let mut have: HashMap<(Vec<u8>, i64), Bson> = HashMap::new();
+    let mut seen: Vec<(Vec<u8>, i64)> = Vec::new();
+    for e in entries {
+        let OplogEntry::Raw(buf) = e else { continue };
+        let Some(rw) = buf.get("rw").ok().flatten().and_then(|v| v.as_document()) else {
+            continue;
+        };
+        let Ok(Some(bson::RawBsonRef::Document(lsid_raw))) = rw.get("lsid") else {
+            continue;
+        };
+        let Ok(Some(bson::RawBsonRef::Int64(txn))) = rw.get("txnNumber") else {
+            continue;
+        };
+        let key = (lsid_raw.as_bytes().to_vec(), txn);
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key.clone());
+        let found = held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied();
+        match found {
+            Some(ts) => {
+                have.insert(key, Bson::Timestamp(ts));
+            }
+            None => {
+                if let Ok(lsid) = Document::try_from(lsid_raw) {
+                    missing.push(bson::doc! {"rw": {"lsid": lsid, "txnNumber": txn}});
+                }
+            }
+        }
+    }
+    (missing, have)
+}
+
+fn put_str(b: &mut Vec<u8>, key: &[u8], value: &str) {
+    b.push(0x02);
+    b.extend_from_slice(key);
+    b.push(0);
+    b.extend_from_slice(&(value.len() as i32 + 1).to_le_bytes());
+    b.extend_from_slice(value.as_bytes());
+    b.push(0);
+}
+
+fn put_ts(b: &mut Vec<u8>, key: &[u8], ts: bson::Timestamp) {
+    b.push(0x11);
+    b.extend_from_slice(key);
+    b.push(0);
+    b.extend_from_slice(&ts.increment.to_le_bytes());
+    b.extend_from_slice(&ts.time.to_le_bytes());
+}
+
+fn put_i64(b: &mut Vec<u8>, key: &[u8], v: i64) {
+    b.push(0x12);
+    b.extend_from_slice(key);
+    b.push(0);
+    b.extend_from_slice(&v.to_le_bytes());
+}
+
+/// Open a nested document or array element, returning where its length goes.
+fn open_nested(b: &mut Vec<u8>, ty: u8, key: &[u8]) -> usize {
+    b.push(ty);
+    b.extend_from_slice(key);
+    b.push(0);
+    let at = b.len();
+    b.extend_from_slice(&[0; 4]);
+    at
+}
+
+fn close_nested(b: &mut Vec<u8>, at: usize) {
+    b.push(0);
+    let len = (b.len() - at) as i32;
+    b[at..at + 4].copy_from_slice(&len.to_le_bytes());
+}
+
+/// What [`oplog_view_entries`] makes of entries that are all raw inserts --
+/// a plain insert as it is, a batch group as one `applyOps` (under its
+/// session, for a retryable write) -- written straight into one buffer
+/// from the entries' bytes, with no `Document` between. `None` when
+/// anything is not that, and the builder does it. `chains` must hold the
+/// seeds of [`rw_seed_chains`]; on `Some` it has advanced as the builder's
+/// would.
+fn fast_insert_view(
+    entries: &[OplogEntry],
+    ts: &[bson::Timestamp],
+    wall_millis: i64,
+    chains: &mut HashMap<(Vec<u8>, i64), Bson>,
+) -> Option<Vec<(i64, Vec<u8>)>> {
+    let mut parts: Vec<RawInsertParts> = Vec::with_capacity(entries.len());
+    for e in entries {
+        let OplogEntry::Raw(buf) = e else { return None };
+        parts.push(raw_insert_parts(buf)?);
+    }
+    let mut local = chains.clone();
+    let mut finals: Vec<(i64, Vec<u8>)> = Vec::new();
+    let mut i = 0;
+    while i < parts.len() {
+        let Some(g) = parts[i].group else {
+            // Alone: logged as it is, which a retryable write's is not.
+            let OplogEntry::Raw(buf) = &entries[i] else {
+                return None;
+            };
+            if parts[i].has_rw || !raw_is_plain_insert(buf) {
+                return None;
+            }
+            finals.push((
+                ts_u64(ts[i]) as i64,
+                append_ts_t_v_wall(buf.as_bytes().to_vec(), ts[i], wall_millis),
+            ));
+            i += 1;
+            continue;
+        };
+        let mut end = i + 1;
+        while end < parts.len() && parts[end].group == Some(g) {
+            end += 1;
+        }
+        let run = &parts[i..end];
+        let retryable = run[0].has_rw;
+        let (lsid_whole, txn) = (run[0].rw_lsid, run[0].rw_txn);
+        for p in run {
+            if p.has_rw != retryable || p.rw_lsid != lsid_whole || p.rw_txn != txn {
+                return None;
+            }
+        }
+        let first_ts = ts[i];
+        let size: usize = run
+            .iter()
+            .map(|p| p.fields.iter().map(|f| f.len()).sum::<usize>() + 32)
+            .sum::<usize>()
+            + 384
+            + lsid_whole.map_or(0, <[u8]>::len);
+        let mut out: Vec<u8> = take_entry_buffer(size);
+        out.extend_from_slice(&[0; 4]);
+        let mut prev = None;
+        if retryable {
+            let (lsid_whole, txn) = (lsid_whole?, txn?);
+            // `lsid` as stored, then the number.
+            out.extend_from_slice(lsid_whole);
+            put_i64(&mut out, b"txnNumber", txn);
+            let key = (lsid_whole[1 + b"lsid\0".len()..].to_vec(), txn);
+            let before = local
+                .get(&key)
+                .cloned()
+                .unwrap_or(Bson::Timestamp(bson::Timestamp {
+                    time: 0,
+                    increment: 0,
+                }));
+            local.insert(key, Bson::Timestamp(first_ts));
+            let Bson::Timestamp(before) = before else {
+                return None;
+            };
+            prev = Some(before);
+        }
+        put_str(&mut out, b"op", "c");
+        put_str(&mut out, b"ns", "admin.$cmd");
+        let o_at = open_nested(&mut out, 0x03, b"o");
+        let ops_at = open_nested(&mut out, 0x04, b"applyOps");
+        for (n, p) in run.iter().enumerate() {
+            let at = open_nested(&mut out, 0x03, n.to_string().as_bytes());
+            for f in &p.fields {
+                out.extend_from_slice(f);
+            }
+            if let Some(stmt) = p.rw_stmt {
+                out.extend_from_slice(stmt);
+            }
+            close_nested(&mut out, at);
+        }
+        close_nested(&mut out, ops_at);
+        close_nested(&mut out, o_at);
+        put_ts(&mut out, b"ts", first_ts);
+        put_i64(&mut out, b"t", 1);
+        put_i64(&mut out, b"v", 2);
+        out.push(0x09);
+        out.extend_from_slice(b"wall\0");
+        out.extend_from_slice(&wall_millis.to_le_bytes());
+        if let Some(prev) = prev {
+            let at = open_nested(&mut out, 0x03, b"prevOpTime");
+            put_ts(&mut out, b"ts", prev);
+            put_i64(
+                &mut out,
+                b"t",
+                if prev.time == 0 && prev.increment == 0 {
+                    -1
+                } else {
+                    1
+                },
+            );
+            close_nested(&mut out, at);
+            out.push(0x10);
+            out.extend_from_slice(b"multiOpType\0");
+            out.extend_from_slice(&1_i32.to_le_bytes());
+        }
+        out.push(0);
+        let len = out.len() as i32;
+        out[..4].copy_from_slice(&len.to_le_bytes());
+        // A transaction this big is split into parts by the builder.
+        if out.len() > APPLY_OPS_ENTRY_LIMIT / 2 {
+            return None;
+        }
+        finals.push((ts_u64(first_ts) as i64, out));
+        i = end;
+    }
+    *chains = local;
+    Some(finals)
+}
+
 /// The group of stored entries the oplog view shows as one `applyOps`
 /// entry ([`oplog_view_entries`]): a transaction's writes, by session and
 /// transaction number, or the inserts or deletes of one batch.
@@ -25998,6 +26380,109 @@ mod tests {
     //! `test_indexes.py` sees identical bytes. No WiredTiger needed.
     use super::*;
     use bson::doc;
+
+    /// The raw fast path for batched inserts makes the bytes the builder does
+    /// (`oplog_view_entries`), for a plain batch, a retryable batch with a
+    /// chain behind it, a lone insert, and the shapes it hands back.
+    #[test]
+    fn the_fast_insert_view_is_the_builders_bytes() {
+        fn entry(i: i32, g: Option<i64>, rw: Option<(i64, i32)>) -> OplogEntry {
+            let o = bson::to_vec(&doc! {"_id": i, "v": "x"}).unwrap();
+            let o2 = bson::to_vec(&doc! {"_id": i}).unwrap();
+            let mut b = Storage::oplog_entry_crud("i", "app.c", Some(&[7u8; 16]), &o, &o2).unwrap();
+            if let Some((txn, stmt)) = rw {
+                let lsid = doc! {"id": bson::Binary { subtype: bson::spec::BinarySubtype::Uuid, bytes: vec![5u8; 16] }};
+                let mut stamp = bson::RawDocumentBuf::new();
+                stamp.append("lsid", secantus_core::bsondoc::to_raw(&lsid).unwrap());
+                stamp.append("txnNumber", txn);
+                stamp.append("stmtId", stmt);
+                b.append("rw", stamp);
+            }
+            if let Some(g) = g {
+                let mut bg = bson::RawDocumentBuf::new();
+                bg.append("g", g);
+                bg.append("s", i);
+                b.append("bg", bg);
+            }
+            OplogEntry::Raw(b)
+        }
+        let ts: Vec<bson::Timestamp> = (0..6)
+            .map(|i| bson::Timestamp {
+                time: 1_800_000_000,
+                increment: 10 + i,
+            })
+            .collect();
+        let wall_millis = 1_800_000_000_123_i64;
+        let cases: Vec<Vec<OplogEntry>> = vec![
+            (0..4).map(|i| entry(i, Some(3), None)).collect(),
+            (0..4).map(|i| entry(i, Some(3), Some((9, i)))).collect(),
+            vec![
+                entry(0, Some(1), Some((9, 0))),
+                entry(1, Some(1), Some((9, 1))),
+                entry(2, None, None),
+            ],
+            vec![
+                entry(0, Some(1), None),
+                entry(1, Some(1), None),
+                entry(2, Some(2), None),
+                entry(3, Some(2), None),
+            ],
+        ];
+        for (n, entries) in cases.into_iter().enumerate() {
+            // A chain already behind the retryable session, to be linked.
+            let mut seeded: HashMap<(Vec<u8>, i64), Bson> = HashMap::new();
+            if n == 1 || n == 2 {
+                let lsid = doc! {"id": bson::Binary { subtype: bson::spec::BinarySubtype::Uuid, bytes: vec![5u8; 16] }};
+                seeded.insert(
+                    (secantus_core::bsondoc::to_vec(&lsid).unwrap(), 9),
+                    Bson::Timestamp(bson::Timestamp {
+                        time: 1_700_000_000,
+                        increment: 4,
+                    }),
+                );
+            }
+            let mut fast_chains = seeded.clone();
+            let fast = fast_insert_view(&entries, &ts, wall_millis, &mut fast_chains);
+            // The builder's answer, as `mint_and_write_ext` makes it.
+            let wall = Bson::DateTime(bson::DateTime::from_millis(wall_millis));
+            let docs: Vec<Document> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let OplogEntry::Raw(b) = e else {
+                        unreachable!()
+                    };
+                    let mut d = decode_doc(b.as_bytes()).unwrap();
+                    d.insert("ts", Bson::Timestamp(ts[i]));
+                    d.insert("wall", wall.clone());
+                    d
+                })
+                .collect();
+            let mut slow_chains = seeded;
+            let shaped = oplog_view_entries(docs, &mut slow_chains);
+            let slow: Vec<(i64, Vec<u8>)> = shaped
+                .iter()
+                .map(|d| {
+                    (
+                        ts_u64(d.get_timestamp("ts").unwrap()) as i64,
+                        encode_doc(d).unwrap(),
+                    )
+                })
+                .collect();
+            let fast = fast.unwrap_or_else(|| panic!("case {n} fell back"));
+            assert_eq!(fast.len(), slow.len(), "case {n}");
+            for (f, s) in fast.iter().zip(&slow) {
+                assert_eq!(f.0, s.0, "case {n} ts");
+                assert_eq!(
+                    decode_doc(&f.1).unwrap(),
+                    decode_doc(&s.1).unwrap(),
+                    "case {n} entry"
+                );
+                assert_eq!(f.1, s.1, "case {n} bytes");
+            }
+            assert_eq!(fast_chains, slow_chains, "case {n} chains");
+        }
+    }
 
     /// A fixture's raw writes, as one transaction committed without a
     /// timestamp when dropped: they stand for a store an older build wrote,
