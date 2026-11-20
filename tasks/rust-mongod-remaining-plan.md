@@ -374,7 +374,7 @@ RM-072).
 
 ## Out of scope or accepted
 
-- Out of scope: a second replica-set member, sharding, `text` and `hashed`
+- Out of scope: a second replica-set member, sharding, `text`
   indexes, `$meta` inside aggregation stages (it needs mongod's
   `DepsTracker`).
 - Accepted: the Decimal128 transcendentals' last digit (Joe, 2026-10-06), a
