@@ -34,14 +34,14 @@ PAGE = """<!doctype html>
 <link rel="icon" type="image/svg+xml" href="/theme/img/favicon.svg">
 {fonts}
 <style>
-html,body{{margin:0;height:100%;background:#0B1915;overflow:hidden;}}
+html,body{{margin:0;height:100%;background:#020617;overflow:hidden;}}
 #stage{{position:absolute;left:50%;top:calc(50% - 24px);
   width:1920px;height:1080px;transform-origin:0 0;}}
 #stage>section{{position:absolute;inset:0;box-sizing:border-box;display:none;}}
 #stage>section.on{{display:flex;}}
 #stage>section>aside{{display:none;}}
 #stage h1,#stage h2,#stage h3,#stage p,#stage ul,#stage ol{{margin:0;}}
-#bar{{position:fixed;right:16px;bottom:10px;color:#BFD3CB;opacity:.7;
+#bar{{position:fixed;right:16px;bottom:10px;color:#cbd5e1;opacity:.7;
   font:14px/1 system-ui,sans-serif;}}
 .nfoot{{position:absolute;left:40px;bottom:24px;display:flex;gap:16px;align-items:baseline;
   font:500 18px/1 system-ui,sans-serif;}}
@@ -51,19 +51,19 @@ html,body{{margin:0;height:100%;background:#0B1915;overflow:hidden;}}
 #notes{{position:fixed;inset:0;background:rgba(11,25,21,.72);z-index:10;display:flex;
   align-items:center;justify-content:center;padding:16px;box-sizing:border-box;}}
 #notes[hidden]{{display:none;}}
-#notes .nbox{{position:relative;background:#F5F2EA;color:#10231E;max-width:760px;width:100%;
+#notes .nbox{{position:relative;background:#f8fafc;color:#0f172a;max-width:760px;width:100%;
   max-height:86vh;overflow:auto;border-radius:8px;padding:32px 36px;box-sizing:border-box;
   font:17px/1.6 'Inter',system-ui,sans-serif;}}
-#notes h2{{font:600 24px/1.25 'Space Grotesk',system-ui,sans-serif;margin:0 0 16px;}}
+#notes h2{{font:600 24px/1.25 'Inter',system-ui,sans-serif;margin:0 0 16px;}}
 #notes .nkick{{font:600 12px/1 system-ui,sans-serif;letter-spacing:2px;text-transform:uppercase;
-  color:#1F6B4F;margin:0 0 8px;}}
+  color:#0e7490;margin:0 0 8px;}}
 #notes p{{margin:0 0 12px;font-size:17px!important;line-height:1.6!important;
-  color:#10231E!important;width:auto!important;}}
+  color:#0f172a!important;width:auto!important;}}
 #notes ul{{margin:0 0 12px;padding-left:20px;}}
-#notes .time{{color:#4A5A55;font-size:14px;}}
+#notes .time{{color:#475569;font-size:14px;}}
 #nclose{{position:absolute;right:12px;top:10px;background:none;border:0;font-size:28px;
-  cursor:pointer;color:#4A5A55;}}
-#bar button{{background:none;border:1px solid #BFD3CB;color:inherit;
+  cursor:pointer;color:#475569;}}
+#bar button{{background:none;border:1px solid #cbd5e1;color:inherit;
   border-radius:4px;padding:4px 10px;margin-left:6px;cursor:pointer;}}
 {css}
 {mobile}
