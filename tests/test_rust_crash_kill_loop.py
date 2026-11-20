@@ -441,7 +441,10 @@ def test_mdb_kill_loop(tmp_path: pathlib.Path) -> None:
             c.crash.create_collection(coll)
         c.close()
     finally:
-        boot.stop()
+        # Killed, not stopped: a new store's first life ends with no
+        # checkpoint at all, and what the first cycle opens is what recovery
+        # makes of the oplog and the creates alone.
+        boot.kill()
     token: Any = None
     watched: set[int] = set()
     cycle_inserts: list[int] = []
@@ -578,7 +581,8 @@ def test_pg_kill_loop(tmp_path: pathlib.Path) -> None:
             conn.execute(f"CREATE TABLE {t} (id int PRIMARY KEY, v int, g int)")
         conn.close()
     finally:
-        server.stop()
+        # Killed, not stopped (see the MongoDB test).
+        server.kill()
 
     for cycle in range(_KILLS):
         server = _Server(argv, banner)

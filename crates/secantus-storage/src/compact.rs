@@ -159,10 +159,7 @@ impl Storage {
                 }
                 tables
             }
-            CompactTarget::Oplog => (0..OPLOG_SHARDS)
-                .map(oplog_shard_name)
-                .chain(std::iter::once(OPLOG_TABLE.to_string()))
-                .collect(),
+            CompactTarget::Oplog => vec![self.oplog_uri.clone()],
             CompactTarget::Catalog => vec![COLL_TABLE.to_string()],
         };
         let home = self.home.clone();

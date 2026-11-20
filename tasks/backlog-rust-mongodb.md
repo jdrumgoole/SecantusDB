@@ -2515,7 +2515,7 @@ dropped (four), and `listIndexes` lists by name.
   CI job**: cost decisions.
 - **.NET gauge on this box**: a stale `gpg` lock -- environment, not code.
 - **Performance items** (droplet comparison, write amplification,
-  `--oplog-async` default, cache defaulting, `log_file_max`, the writer-scaling
+  cache defaulting, `log_file_max`, the writer-scaling
   chart, `concurrency-refresh` on a quiet box): need droplet runs and
   durability decisions, not code.
 - **`test_tmp_retention_guard` timeout**: not reproduced; a watch item.
@@ -2756,8 +2756,8 @@ random`, 8 writers, 1G cache, 8 KiB docs, medians of two passes:
 | uncompressed (today) | 36,285 | 0.19 | 8.45 |
 | `compressor=zlib` | 34,365 | 0.20 | **6.62** |
 
-**-22% p99.9 for -5% throughput**, composing with `--oplog-async` (-24%) since
-they attack different parts of the write path. Those numbers were taken under
+**-22% p99.9 for -5% throughput**, (it composed with `--oplog-async` then; that option is gone)
+since they attacked different parts of the write path. Those numbers were taken under
 the zlib block compressor; re-measure under the current lz4 default.
 
 - [ ] **Configure a WAL compressor.** `zlib` is already linked into the
@@ -2832,12 +2832,6 @@ above was of a fixed limit; the tail under probing is not yet measured.
 
 ### Where to go next
 
-- [ ] **`--oplog-async` as a default** — worth 24% of the tail and 42% of the
-  stalls on its own, independently of the cache story. Every write currently
-  passes through one process-wide `Arc<Mutex<OplogState>>`.
-  **Decided (Joe, 2026-11-16): match mongod's model -- probe how mongod 8.2 orders the oplog and data writes and what a crash keeps, and make the default whatever reproduces that; no speed-only default.**
-  Backlog-ID: RM-135
-  Verify: none -- --oplog-async default decision
 - [ ] **Cache defaulting** — the daemon caps at 4G; the sweep shows the tail is
   governed by cache headroom versus write rate, so the default deserves
   revisiting (and documenting) rather than being a fixed number.

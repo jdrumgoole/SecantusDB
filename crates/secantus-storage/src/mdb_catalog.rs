@@ -216,6 +216,24 @@ pub fn read_entry(session: &Session, id: i64) -> Result<Option<Document>> {
     }
 }
 
+/// The ident of the catalog row for `ns` (a namespace this server keeps no
+/// placement for, as `local.oplog.rs`), read in `session`'s snapshot.
+pub fn ident_of_ns(session: &Session, ns: &str) -> Result<Option<String>> {
+    Ok(entry_of_ns(session, ns)?.and_then(|e| e.get_str("ident").ok().map(str::to_string)))
+}
+
+/// The whole catalog row for `ns`, found by scanning the catalog.
+pub fn entry_of_ns(session: &Session, ns: &str) -> Result<Option<Document>> {
+    let cur = session.open_cursor(CATALOG_TABLE, None)?;
+    while cur.next()? {
+        let entry = decode_doc(&cur.get_value_u()?)?;
+        if entry.get_str("ns") == Ok(ns) {
+            return Ok(Some(entry));
+        }
+    }
+    Ok(None)
+}
+
 /// One index as mongod lists it in `md.indexes`: `{spec, ready, multikey,
 /// multikeyPaths}`. `multikey_paths` holds, per key field, one byte per
 /// path component, 1 where that component is an array (mongod's

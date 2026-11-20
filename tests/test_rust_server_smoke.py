@@ -2461,16 +2461,15 @@ def test_multikey_dotted_array_index_against_rust_server(tmp_path) -> None:
 
 
 def test_storage_mode_kwargs_end_to_end(tmp_path, monkeypatch) -> None:
-    """Phase C: the async/nonlogged stack engages from RustServer kwargs alone —
+    """Phase C: the nonlogged-oplog mode engages from RustServer kwargs alone —
     no SECANTUS_* env vars — and stays pymongo-clean end-to-end (writes, reads,
-    and a change stream whose events surface once the drainer persists them)."""
-    for var in ("SECANTUS_OPLOG_ASYNC", "SECANTUS_OPLOG_NONLOGGED"):
+    and a change stream)."""
+    for var in ("SECANTUS_OPLOG_NONLOGGED",):
         monkeypatch.delenv(var, raising=False)
     srv = _server.RustServer(
         str(tmp_path / "wt"),
         0,
         replica_set_name="secantus",  # change streams need the replset persona
-        oplog_async=True,
         oplog_nonlogged=True,
     )
     try:

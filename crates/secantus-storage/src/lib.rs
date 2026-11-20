@@ -25,8 +25,8 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -196,8 +196,6 @@ pub struct StorageOptions {
     pub wt_config: Option<String>,
     /// Close-time checkpoint durability (`None` = env/test resolution).
     pub durable: Option<bool>,
-    /// Async oplog drainer (`SECANTUS_OPLOG_ASYNC`).
-    pub oplog_async: Option<bool>,
     /// Non-logged oplog/preimage tables (`SECANTUS_OPLOG_NONLOGGED`).
     pub oplog_nonlogged: Option<bool>,
     /// Log-only-the-oplog data tables with replay-on-open recovery
@@ -1771,35 +1769,17 @@ const IDX_TABLE: &str = "table:secantus_indexes";
 /// when more than one indexed field is array-valued (the cartesian product).
 const MAX_COMPOUND_KEYS: usize = 10_000;
 
-// Oplog / change-stream tables (Phase 4 sub-phase 3). `q`-keyed (int64 seq) for
-// the oplog + pre-images; a single `S` key ("state") for the recovery metadata.
-/// Legacy single-table oplog name. Retained only for the pre-shard on-disk
-/// upgrade read (a store written by an older build still has its entries here);
-/// all new writes go to the shard tables. See `OPLOG_SHARDS`.
-const OPLOG_TABLE: &str = "table:secantus_oplog";
-/// The oplog is sharded across `OPLOG_SHARDS` btrees so concurrent writers don't
-/// all rendezvous on one table's rightmost append page — the A/B-proven scaling
-/// bottleneck (a single append point serialised every writer; sharding recovered
-/// 8-writer scaling 0.60x -> 2.47x and single-writer 16k -> 28.9k docs/s, both
-/// approaching the oplog-off ceiling; `tasks/rust-mongodb-parity-redesign.md`).
-///
-/// Routing is **per batch**: a whole `emit_oplog` call's run of seqs goes to one
-/// shard (`start_seq % OPLOG_SHARDS`). This is deliberate — routing per *entry*
-/// (`seq % N`) scatters a 100-doc batch's contiguous seqs across all N btrees,
-/// destroying the sequential-append locality even the single table had (measured:
-/// per-entry regressed single-writer to ~8.6k docs/s, *below* the 16k baseline).
-/// Per-batch keeps each batch a contiguous append to one tree (fast) while
-/// concurrent writers, minting different `start_seq`s, spread across trees (the
-/// scaling win). The cost: a seq's shard is NOT a function of the seq, so ordered
-/// reads use a k-way merge (`read_oplog_shards`) and per-seq point-ops
-/// (prune-delete via the merge's shard tag; archive / recovery-ts) consider all
-/// tables.
-const OPLOG_SHARDS: i64 = 16;
-
-/// Shard table name for shard index `shard` (0..OPLOG_SHARDS).
-fn oplog_shard_name(shard: i64) -> String {
-    format!("table:secantus_oplog_sh{shard}")
-}
+// The oplog is `local.oplog.rs`, one WiredTiger table in its own
+// `collection-<UUID>` ident, as mongod keeps it (phase 4b of
+// `tasks/mongod-storage-model-plan.md`): `key_format=q`, the RecordId of an
+// entry is its `ts` (`secs << 32 | inc`), the value is the entry's BSON. The
+// store's catalog row names its ident; `Storage::oplog_uri` is the table.
+/// The namespace of the oplog.
+const OPLOG_NS: &str = "local.oplog.rs";
+/// The size mongod 8.2.11 gave `local.oplog.rs` on the box it was measured on
+/// (`tests/fixtures/storage_model/mongod-8.2.11-oplog.json`): its catalog
+/// entry's `options.size`. Phase 4b-5 holds the oplog to it.
+const OPLOG_CATALOG_SIZE: i64 = 201_326_592;
 
 /// `SECANTUS_OPLOG_NONLOGGED=1` creates the oplog + preimage tables with WAL
 /// logging disabled (`log=(enabled=false)`): oplog rows become checkpoint-durable
@@ -1879,18 +1859,16 @@ fn bootstrap_table_cfg(name: &str, base: &str, data_nonlogged: bool) -> String {
 /// `SECANTUS_WT_CONFIG_EXTRA` on the connection config). Create-time only:
 /// benchmarks start on fresh datadirs, existing stores keep their config.
 fn oplog_table_cfg(nonlogged: bool) -> String {
-    // Append-workload btree tuning (Finding-13 winner, +19% at 8 writers):
-    // rows arrive in strictly-ascending seq order and are never updated, so
-    // fill pages fully before splitting (`split_pct=100`) and use larger
-    // leaves (fewer splits/reconciliations per MB appended). zlib stays ON —
-    // the sweep measured compression-off cratering to 19% retention (bigger
-    // uncompressed pages = more eviction IO; the constraint is IO volume,
-    // not CPU). Create-time only: existing stores keep their config.
-    let mut cfg = if nonlogged {
-        format!("{QU_COMPRESSED_CFG},split_pct=100,leaf_page_max=128KB,log=(enabled=false)")
-    } else {
-        format!("{QU_COMPRESSED_CFG},split_pct=100,leaf_page_max=128KB")
-    };
+    // mongod 8.2.11's own: a collection table's config with the oplog's
+    // `oplogKeyExtractionVersion` in its metadata (measured, phase 4b). Logged
+    // unless this store opted out. Create-time only.
+    let mut cfg = mdb_catalog::COLLECTION_TABLE_CFG.replace(
+        "app_metadata=(formatVersion=1)",
+        "app_metadata=(formatVersion=1,oplogKeyExtractionVersion=1)",
+    );
+    if nonlogged {
+        cfg.push_str(",log=(enabled=false)");
+    }
     if let Ok(extra) = std::env::var("SECANTUS_OPLOG_TABLE_EXTRA") {
         if !extra.is_empty() {
             cfg.push(',');
@@ -1900,327 +1878,106 @@ fn oplog_table_cfg(nonlogged: bool) -> String {
     cfg
 }
 
-/// Default write-path oplog routing width. Two, not [`OPLOG_SHARDS`]: the
-/// 16-way split was built against rightmost-page append contention that no
-/// longer binds post-RecordId (#613-640) and post-prune-fix (#700) — the
-/// Finding-13 sweep measured every lower shard count beating 16 at eight
-/// writers (+12-16%), with 1 ≈ 2 ≈ 8. Two keeps a second append point as
-/// cheap insurance against pathological single-tree stalls while shedding
-/// the merge/cache overhead of sixteen.
-const OPLOG_ROUTE_SHARDS_DEFAULT: i64 = 2;
-
-/// How many oplog shard tables the WRITE path routes across — default
-/// [`OPLOG_ROUTE_SHARDS_DEFAULT`], overridable to 1..=OPLOG_SHARDS via
-/// `SECANTUS_OPLOG_SHARDS` (the Finding-13 sweep hook). Routing-only: the
-/// read side always considers all `OPLOG_SHARDS` tables + the legacy table,
-/// so a store written under any width stays fully readable.
-fn oplog_route_shards() -> i64 {
-    static N: OnceLock<i64> = OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("SECANTUS_OPLOG_SHARDS")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
-            .filter(|n| (1..=OPLOG_SHARDS).contains(n))
-            .unwrap_or(OPLOG_ROUTE_SHARDS_DEFAULT)
-    })
-}
-
-/// The shard table a batch starting at `start_seq` is routed to. `rem_euclid`
-/// keeps it correct for any i64 (seqs are always >= 1 in practice, but never
-/// route to a negative index).
-fn oplog_shard_for_batch(start_seq: i64) -> String {
-    oplog_shard_name(start_seq.rem_euclid(oplog_route_shards()))
-}
-
-/// Ensure the oplog shard table for `start_seq`'s batch exists — creating it on
-/// FIRST touch only — and return its name. `session.create` is idempotent, but
-/// it still takes WiredTiger's schema lock on every call, and the old emit path
-/// paid that on every batch. The bitmask is process-lifetime sticky (shard
-/// tables are never dropped while the store is open); a stale-false bit merely
-/// re-runs the idempotent create, so races between writers are harmless.
-fn ensure_oplog_shard(
-    shards_created: &AtomicU32,
+/// Read the oplog in ascending ts order, starting at the first entry at or
+/// after `start_seq` (a `ts` as `i64`), up to `limit` non-empty entries.
+/// Handles gaps in the position space (prune removes a low prefix; a
+/// timestamp consumed without an entry, or a rolled-back mint, leaves a hole):
+/// it never assumes contiguity, so a missing position can't truncate a read.
+fn read_oplog_table(
     session: &Session,
-    start_seq: i64,
-    oplog_nonlogged: bool,
-) -> Result<String> {
-    // Same modulus as `oplog_shard_for_batch` (honours SECANTUS_OPLOG_SHARDS).
-    let idx = start_seq.rem_euclid(oplog_route_shards());
-    let shard = oplog_shard_name(idx);
-    let bit = 1u32 << (idx as u32);
-    if shards_created.load(Ordering::Relaxed) & bit == 0 {
-        session.create(&shard, &oplog_table_cfg(oplog_nonlogged))?;
-        shards_created.fetch_or(bit, Ordering::Relaxed);
-    }
-    Ok(shard)
-}
-
-/// Merge-read the sharded oplog in ascending seq order, starting at the first
-/// seq >= `start_seq`, up to `limit` non-empty entries. A k-way merge across the
-/// `OPLOG_SHARDS` shard cursors (each shard is seq-sorted): repeatedly emit the
-/// smallest head seq and advance that shard. Handles gaps in the seq space
-/// (prune removes a low prefix; a rolled-back mint would leave a hole) — it never
-/// assumes contiguity, so a missing seq can't truncate a change-stream read.
-/// Empty-blob rows (defensive) are skipped but still advance, exactly like the
-/// old single-table walk.
-fn read_oplog_shards(
-    session: &Session,
-    existing: u32,
+    table: &str,
     start_seq: i64,
     limit: usize,
 ) -> Result<Vec<(i64, Vec<u8>)>> {
-    Ok(
-        read_oplog_shards_tagged(session, existing, start_seq, limit)?
-            .into_iter()
-            .map(|(seq, _tbl, blob)| (seq, blob))
-            .collect(),
-    )
-}
-
-/// Every table an oplog reader / point-op must consider: the N shards followed by
-/// the legacy single table. A batch's whole run of seqs lives in one of these
-/// (routing is per-batch, so a seq's shard is NOT derivable from the seq — hence
-/// the merge and the all-table point-ops).
-fn oplog_all_tables() -> Vec<String> {
-    (0..OPLOG_SHARDS)
-        .map(oplog_shard_name)
-        .chain(std::iter::once(OPLOG_TABLE.to_string()))
-        .collect()
-}
-
-/// Probe which oplog shard tables actually exist, as a bitmask (bit i = shard
-/// i). Run once at open to seed `oplog_shards_created`: shards are created
-/// lazily on first write and the routing default touches only
-/// [`oplog_route_shards`] of the [`OPLOG_SHARDS`] possible tables, so on a
-/// typical store 14+ of the 17 tables an oplog merge "considers" do not
-/// exist. Pre-seeding lets every merge skip the absent ones outright instead
-/// of paying a failed `open_cursor` (a WT schema-table lookup + error build)
-/// per absent table per call — on the tailable-getMore read path and every
-/// prune sweep. The store is single-process, so a 0 bit after seeding means
-/// definitively absent until THIS process creates it (`ensure_oplog_shard`
-/// sets the bit).
-fn probe_existing_oplog_shards(session: &Session) -> u32 {
-    let mut mask = 0u32;
-    for i in 0..OPLOG_SHARDS {
-        if session.open_cursor(&oplog_shard_name(i), None).is_ok() {
-            mask |= 1u32 << (i as u32);
-        }
-    }
-    mask
-}
-
-/// Whether table index `i` of [`oplog_all_tables`] is known absent under
-/// `existing` (the shard-existence bitmask). The legacy table (index
-/// [`OPLOG_SHARDS`]) is boot-created unconditionally, so it is never skipped.
-fn oplog_table_absent(existing: u32, i: usize) -> bool {
-    i < OPLOG_SHARDS as usize && existing & (1u32 << (i as u32)) == 0
-}
-
-/// Like `read_oplog_shards` but also returns each row's source table index into
-/// `oplog_all_tables()` (0..OPLOG_SHARDS = shard, OPLOG_SHARDS = legacy). Prune
-/// uses the tag to delete each doomed row from its exact table instead of probing
-/// all of them.
-fn read_oplog_shards_tagged(
-    session: &Session,
-    existing: u32,
-    start_seq: i64,
-    limit: usize,
-) -> Result<Vec<(i64, usize, Vec<u8>)>> {
-    // seq ranges across tables are disjoint (recovery clamps new seqs strictly
-    // above any legacy seq), so a plain min-seq merge needs no dedup.
-    let tables = oplog_all_tables();
-    // `Option<Cursor>` per table so a lazily-absent shard keeps its slot (index
-    // alignment with `tables` / the returned shard index): a missing shard parks
-    // a `None` cursor whose head stays `None`, so it is never selected.
-    let mut cursors: Vec<Option<Cursor>> = Vec::with_capacity(tables.len());
-    // Current head seq of each shard cursor, or None once exhausted.
-    let mut heads: Vec<Option<i64>> = Vec::with_capacity(tables.len());
-    for (i, tbl) in tables.iter().enumerate() {
-        if oplog_table_absent(existing, i) {
-            // Known-absent shard (existence mask): skip without the failed
-            // open_cursor probe; reads as empty, index alignment kept.
-            cursors.push(None);
-            heads.push(None);
-            continue;
-        }
-        let cur = match session.open_cursor(tbl, None) {
-            Ok(c) => c,
-            Err(e) if e.is_missing_table() => {
-                // Lazy shards: absent shard reads as empty; keep index alignment.
-                cursors.push(None);
-                heads.push(None);
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        };
-        cur.set_key_q(start_seq);
-        let positioned = match cur.search_near() {
-            Ok(cmp) => {
-                if cmp < 0 {
-                    // search_near landed just below start_seq; step to the first >=.
-                    cur.next()?
-                } else {
-                    true
-                }
-            }
-            Err(e) if e.is_not_found() => false,
-            Err(e) => return Err(e.into()),
-        };
-        heads.push(if positioned {
-            Some(cur.get_key_q()?)
-        } else {
-            None
-        });
-        cursors.push(Some(cur));
-    }
-    let mut out: Vec<(i64, usize, Vec<u8>)> = Vec::new();
-    while out.len() < limit {
-        // Pick the shard whose head is the smallest seq.
-        let mut best: Option<usize> = None;
-        let mut best_seq = i64::MAX;
-        for (i, h) in heads.iter().enumerate() {
-            if let Some(seq) = *h {
-                if seq < best_seq {
-                    best_seq = seq;
-                    best = Some(i);
-                }
+    let cur = session.open_cursor(table, None)?;
+    cur.set_key_q(start_seq);
+    let mut more = match cur.search_near() {
+        Ok(cmp) => {
+            if cmp < 0 {
+                // search_near landed just below start_seq; step to the first >=.
+                cur.next()?
+            } else {
+                true
             }
         }
-        let Some(i) = best else { break };
-        // `heads[i]` is Some ⇒ this slot holds a real cursor.
-        let cur = cursors[i].as_ref().expect("selected shard has a cursor");
+        Err(e) if e.is_not_found() => false,
+        Err(e) => return Err(e.into()),
+    };
+    let mut out = Vec::new();
+    while more && out.len() < limit {
+        let seq = cur.get_key_q()?;
         let blob = cur.get_value_u()?;
         if !blob.is_empty() {
-            out.push((best_seq, i, blob));
+            out.push((seq, blob));
         }
-        heads[i] = if cur.next()? {
-            Some(cur.get_key_q()?)
-        } else {
-            None
-        };
+        more = cur.next()?;
     }
     Ok(out)
 }
 
-/// Key-only doomed-row scan for the prune sweep: a k-way merge of the oldest
-/// rows' KEYS across the shard tables, reading a row's VALUE only where the
-/// retention check needs its `ts` (rows inside the cap `excess` are doomed by
-/// position alone). `read_oplog_shards_tagged` materialises every row's full
-/// blob — at a sustained 8 KiB write load that made each opportunistic sweep
-/// copy ~8 MB just to learn which seqs to delete, ~36% of the whole sync
-/// insert path (Finding 12). Returns `(seq, table_index)` in ascending seq
-/// order, stopping at the first row that is neither cap-doomed nor past
-/// retention (the doomed set is always a seq-ordered prefix), bounded by
-/// `excess.max(retention_batch)` rows exactly like the sweep it replaces.
+/// Key-only doomed-row scan for the prune sweep: the oldest rows' KEYS,
+/// reading a row's VALUE only where the retention check needs its `ts` (rows
+/// inside the cap `excess` are doomed by position alone). Returns the
+/// positions in ascending order, stopping at the first row that is neither
+/// cap-doomed nor past retention (the doomed set is always a prefix), bounded
+/// by `excess.max(retention_batch)` rows.
 fn scan_doomed_oplog_keys(
     session: &Session,
-    existing: u32,
+    table: &str,
     excess: usize,
     cutoff: i64,
     retention_batch: usize,
     ceiling: i64,
-) -> Result<Vec<(i64, usize)>> {
-    let tables = oplog_all_tables();
-    let mut cursors: Vec<Option<Cursor>> = Vec::with_capacity(tables.len());
-    let mut heads: Vec<Option<i64>> = Vec::with_capacity(tables.len());
-    for (i, tbl) in tables.iter().enumerate() {
-        if oplog_table_absent(existing, i) {
-            cursors.push(None);
-            heads.push(None);
-            continue;
-        }
-        let cur = match session.open_cursor(tbl, None) {
-            Ok(c) => c,
-            Err(e) if e.is_missing_table() => {
-                // Lazy shards: absent shard reads as empty; keep index alignment.
-                cursors.push(None);
-                heads.push(None);
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        };
-        heads.push(if cur.next()? {
-            Some(cur.get_key_q()?)
-        } else {
-            None
-        });
-        cursors.push(Some(cur));
-    }
+) -> Result<Vec<i64>> {
+    let cur = session.open_cursor(table, None)?;
     let limit = excess.max(retention_batch);
-    let mut doomed: Vec<(i64, usize)> = Vec::new();
-    while doomed.len() < limit {
-        let mut best: Option<usize> = None;
-        let mut best_seq = i64::MAX;
-        for (i, h) in heads.iter().enumerate() {
-            if let Some(seq) = *h {
-                if seq < best_seq {
-                    best_seq = seq;
-                    best = Some(i);
-                }
-            }
-        }
-        let Some(i) = best else { break };
-        if best_seq >= ceiling {
-            // Phase A' clamp: entries at/above the stable-checkpoint seq are
-            // the crash-recovery source for a data-nonlogged store — never
+    let mut doomed: Vec<i64> = Vec::new();
+    let mut more = cur.next()?;
+    while more && doomed.len() < limit {
+        let seq = cur.get_key_q()?;
+        if seq >= ceiling {
+            // Phase A' clamp: entries at/above the stable-checkpoint position
+            // are the crash-recovery source for a data-nonlogged store -- never
             // doomed, whatever the cap says. (ceiling is i64::MAX otherwise.)
             break;
         }
-        let cur = cursors[i].as_ref().expect("selected shard has a cursor");
         if doomed.len() < excess {
-            // Cap-doomed by position alone — no value read.
-            doomed.push((best_seq, i));
+            // Cap-doomed by position alone -- no value read.
+            doomed.push(seq);
         } else {
             // Retention tail: peek the ts; the first in-window (or undatable)
-            // row ends the doomed prefix — keep what we can't date.
+            // row ends the doomed prefix -- keep what we can't date.
             let blob = cur.get_value_u()?;
             let past_retention =
                 matches!(peek_entry_ts(&blob), Some(ts) if i64::from(ts.time) < cutoff);
             if !past_retention {
                 break;
             }
-            doomed.push((best_seq, i));
+            doomed.push(seq);
         }
-        heads[i] = if cur.next()? {
-            Some(cur.get_key_q()?)
-        } else {
-            None
-        };
+        more = cur.next()?;
     }
     Ok(doomed)
 }
 
-/// Largest seq present across all oplog shards (0 if all empty). A single
-/// `prev()` from each shard's end lands on that shard's max; the answer is the
-/// max of those. Includes the legacy single table so recovery of a pre-shard
-/// store still finds its tail.
-fn scan_max_oplog_seq(session: &Session) -> i64 {
-    let mut max = 0i64;
-    for s in 0..OPLOG_SHARDS {
-        if let Ok(c) = session.open_cursor(&oplog_shard_name(s), None) {
-            if c.prev().unwrap_or(false) {
-                max = max.max(c.get_key_q().unwrap_or(0));
-            }
-        }
-    }
-    if let Ok(c) = session.open_cursor(OPLOG_TABLE, None) {
+/// The newest position in the oplog (0 if empty): the key of its last row.
+fn scan_max_oplog_seq(session: &Session, table: &str) -> i64 {
+    if let Ok(c) = session.open_cursor(table, None) {
         if c.prev().unwrap_or(false) {
-            max = max.max(c.get_key_q().unwrap_or(0));
+            return c.get_key_q().unwrap_or(0);
         }
     }
-    max
+    0
 }
 
-/// Total live oplog rows across all shards + the legacy table. Key-only walk (no
-/// value fetch), run once on open to seed `OplogState.live_count` so the
-/// opportunistic prune can early-out instead of re-scanning the whole oplog.
-fn count_oplog_entries(session: &Session) -> i64 {
+/// Total live oplog rows. Key-only walk (no value fetch), run once on open to
+/// seed `OplogState.live_count` so the opportunistic prune can early-out
+/// instead of re-scanning the whole oplog.
+fn count_oplog_entries(session: &Session, table: &str) -> i64 {
     let mut total = 0i64;
-    for tbl in oplog_all_tables() {
-        if let Ok(c) = session.open_cursor(&tbl, None) {
-            while c.next().unwrap_or(false) {
-                total += 1;
-            }
+    if let Ok(c) = session.open_cursor(table, None) {
+        while c.next().unwrap_or(false) {
+            total += 1;
         }
     }
     total
@@ -2932,7 +2689,6 @@ pub fn wt_config(
 // (crates/secantus-compressors), so a store's tables are the ones mongod
 // writes (tasks/mongod-storage-model-plan.md). lz4 and zlib stay linked for
 // the reasons above; no table this build creates uses them.
-const QU_COMPRESSED_CFG: &str = "key_format=q,value_format=u,block_compressor=snappy";
 
 // The full table set `storage.py` bootstraps. Sub-phase 1 only reads/writes the
 // collections + documents tables, but creating the rest keeps the on-disk schema
@@ -4149,13 +3905,6 @@ fn note_oplog_slot_held(micros: i64) {
 /// Whole microseconds since `t`.
 fn micros_since(t: Instant) -> i64 {
     i64::try_from(t.elapsed().as_micros()).unwrap_or(i64::MAX)
-}
-
-/// The asynchronous oplog's buffered write did not commit: its entries and
-/// the slots they would have held are dropped, uncounted (RM-379).
-fn clear_pending_oplog() {
-    PENDING_OPLOG.with(|p| p.borrow_mut().clear());
-    PENDING_SLOTS.with(|s| s.borrow_mut().clear());
 }
 
 /// Index keys inserted and deleted; `None`: no write of that kind.
@@ -5520,9 +5269,8 @@ pub struct Storage {
     txn_dirty_limit: u64,
     /// The WiredTiger cache size the connection was opened with, in bytes.
     cache_bytes: u64,
-    /// Which oplog shard tables this process has already created (bit per shard
-    /// index) — see [`ensure_oplog_shard`]. Shared with the async drainers.
-    oplog_shards_created: Arc<AtomicU32>,
+    /// The WiredTiger URI of `local.oplog.rs`'s table (`table:collection-<UUID>`).
+    oplog_uri: String,
     /// The TTL monitor's runtime settings and counters.
     ttl: TtlMonitor,
     /// Whether writes emit oplog entries (and the oplog tables are live). Mirrors
@@ -5578,20 +5326,6 @@ pub struct Storage {
     /// log line), so the close-time checkpoint is skipped for it — mirroring
     /// Python `Storage._in_memory`.
     in_memory: bool,
-    /// PROTOTYPE (opt-in via `SECANTUS_OPLOG_ASYNC=1`): when `Some`, oplog entries
-    /// are NOT written inside the write's transaction. Instead the committed
-    /// write's entries are minted a seq and handed to a background drainer thread
-    /// that persists them off the writer's critical path — so concurrent writers
-    /// stop contending on the shared oplog btrees/WAL (`tasks/rust-perf-findings.md`
-    /// Finding 5). Trade: the oplog is no longer atomic with the data and a hard
-    /// crash loses entries the drainer had not yet written (data stays durable;
-    /// clean close flushes the drainer before the checkpoint). `None` = the
-    /// synchronous, atomic default.
-    async_oplog: Option<Arc<AsyncOplog>>,
-    /// The store's resolved oplog-nonlogged mode: oplog/preimage shard
-    /// CREATEs use `log=(enabled=false)` when set (create-time-sticky, so it
-    /// only shapes shards this store is first to touch).
-    oplog_nonlogged: bool,
     /// Phase A' checkpoint cadence override (`StorageOptions.checkpoint_seconds`);
     /// `None` = `SECANTUS_CHECKPOINT_SECONDS` / 60.
     checkpoint_seconds: Option<u64>,
@@ -5667,44 +5401,24 @@ pub struct Storage {
 /// `Timestamp(secs, ord)` handed out. Recovered on open so post-restart mints
 /// are strictly greater than anything previously emitted.
 struct OplogState {
+    /// One past the newest timestamp minted, as a 64-bit WiredTiger timestamp
+    /// (`secs << 32 | inc`): an entry's position in the oplog IS its
+    /// timestamp, as mongod's RecordId is (phase 4b of
+    /// `tasks/mongod-storage-model-plan.md`), so "the next seq" and "the next
+    /// timestamp" are the same number. A run of entries takes consecutive
+    /// timestamps, so `start + i` names the i-th of them.
     next_seq: i64,
     last_ts_secs: i64,
     last_ts_ord: i64,
-    /// Next monotonic insertion `seq` for the natural-order index (independent of
-    /// the oplog `seq`; advances on every doc insert even when the oplog is off).
-    next_nat_seq: i64,
     /// Oplog rows emitted since the last opportunistic prune. In-memory only
-    /// (resets on open, like `storage._oplog_emit_count`); never persisted.
-    /// Drives the SYNC emit path's prune cadence; async mode uses
-    /// `persisted_count` instead (see [`record_persisted`]).
+    /// (resets on open); never persisted. Drives the prune cadence.
     emit_count: i64,
-    /// Async mode: oplog rows the drainer pool has persisted since the last
-    /// opportunistic prune. The cadence must follow rows LANDING, not rows
-    /// minting — a mint-side trigger can only doom already-persisted rows, so
-    /// drainer-queue lag escapes the sweep and the counter reset defers the
-    /// retry a whole interval, leaving the oplog unbounded when writes stop.
-    /// Always 0 in sync mode.
-    persisted_count: i64,
-    /// Live oplog row count across all shards + the legacy table. Counted once on
-    /// open, `+= n` on every `emit_oplog` / import, `-= doomed` on prune. Lets the
-    /// opportunistic prune early-out (one ts read) when under the cap instead of
-    /// walking the whole oplog every 1000 emits — the write-path bottleneck.
+    /// Live oplog row count. Counted once on open, `+= n` on every
+    /// `emit_oplog` / import, `-= doomed` on prune. Lets the opportunistic
+    /// prune early-out (one ts read) when under the cap instead of walking
+    /// the whole oplog every 1000 emits -- the write-path bottleneck.
     live_count: i64,
-    /// Async-oplog visibility watermark: the highest seq the background drainer
-    /// has durably committed to the oplog tables. In synchronous mode this stays
-    /// `next_seq - 1` (writes land inline). In async mode change-stream tailers
-    /// (`wait_for_oplog`) block on this, NOT the minted `next_seq`, so a tailer
-    /// never reads past what the drainer has actually written. Advanced by the
-    /// drainer(s) under the `oplog` mutex, paired with `oplog_cv`.
-    written_seq: i64,
-    /// Async-oplog completion tracker: persisted-but-not-yet-contiguous seq ranges
-    /// (`start -> end_exclusive`) reported by the parallel drainers. With a pool of
-    /// shard-affine drainers, batches finish out of global seq order; a range that
-    /// begins exactly at `written_seq + 1` (and any that chain onto it) is absorbed
-    /// to advance `written_seq`, so the watermark still only ever covers a gapless
-    /// prefix. Empty in synchronous mode. See [`advance_written_seq`].
-    done_ranges: BTreeMap<i64, i64>,
-    /// Sync-mode in-flight mint window: `start_seq -> end_seq` (exclusive) for
+    /// In-flight mint window: `start_ts -> end_ts` (exclusive) for
     /// every batch minted by `mint_seq_and_ts` whose transaction has not yet
     /// committed or rolled back. The **visible tail** — the largest seq below
     /// which nothing can still appear — is `min_key - 1` when non-empty, else
@@ -5727,38 +5441,7 @@ struct OplogState {
     ts_reserved: BTreeMap<u64, i64>,
 }
 
-/// Record that the seq range `[start, start + n)` is durably persisted and advance
-/// `written_seq` over any newly-contiguous prefix. Returns `true` if the watermark
-/// moved (the caller then notifies `oplog_cv`). Caller holds the `oplog` mutex.
-fn advance_written_seq(st: &mut OplogState, start: i64, n: i64) -> bool {
-    st.done_ranges.insert(start, start + n);
-    let mut advanced = false;
-    // Absorb the range beginning at `written_seq + 1`, then any that chain onto it.
-    while let Some(&end) = st.done_ranges.get(&(st.written_seq + 1)) {
-        let next = st.written_seq + 1;
-        st.written_seq = end - 1;
-        st.done_ranges.remove(&next);
-        advanced = true;
-    }
-    advanced
-}
-
-/// Record `n` drainer-persisted entries and report whether the opportunistic
-/// prune cadence is due (every [`OPLOG_PRUNE_INTERVAL`] persisted rows) — the
-/// async-mode analogue of the sync emit path's `emit_count` trigger. Caller
-/// holds the `oplog` mutex; the drainer that crosses the boundary runs the
-/// sweep after releasing it.
-fn record_persisted(st: &mut OplogState, n: i64) -> bool {
-    st.persisted_count += n;
-    if st.persisted_count >= OPLOG_PRUNE_INTERVAL {
-        st.persisted_count = 0;
-        true
-    } else {
-        false
-    }
-}
-
-// --- async oplog (prototype) ---------------------------------------------
+// --- statement-scoped oplog buffers -----------------------------------------
 
 thread_local! {
     /// Oplog entries emitted during the current write statement, buffered until
@@ -7043,95 +6726,6 @@ pub fn last_row_written() -> Option<WrittenRow> {
     LAST_ROW.with(|l| l.borrow().clone())
 }
 
-/// A contiguous run of oplog entries (one minted seq range, one shard) handed to
-/// the drainer. The blobs are fully built (ts/wall already stamped) — only the
-/// WiredTiger write remains.
-struct DrainBatch {
-    start_seq: i64,
-    shard: String,
-    blobs: Vec<Vec<u8>>,
-    /// Total bytes this batch holds — the amount reserved
-    /// against [`Backpressure`] at enqueue and released after it is persisted.
-    bytes: usize,
-}
-
-enum DrainMsg {
-    Batch(DrainBatch),
-    /// Flush everything buffered/queued and exit (clean shutdown).
-    Shutdown,
-}
-
-/// Cap on oplog bytes queued to the drainer but not yet persisted (in the channel
-/// or the reorder buffer). A sustained writer burst that outpaces the drainer
-/// blocks at the enqueue point once this much is in flight — bounding memory
-/// instead of growing the queue without limit. Generous: in steady state the
-/// drainer keeps up and the queue stays near empty, so this only bites a
-/// pathological burst or a drainer stall (e.g. a checkpoint).
-const ASYNC_OPLOG_MAX_PENDING_BYTES: usize = 128 * 1024 * 1024;
-
-/// Byte budget bounding oplog work queued to the drainer. `acquire` blocks a
-/// just-committed writer while granting `n` more would exceed the cap, unless
-/// nothing is outstanding (a lone oversized batch always proceeds rather than
-/// deadlock); the drainer `release`s after persisting each batch. Same shape as
-/// the server's `AllocBudget`. Poison-tolerant so a panicked peer can't wedge it.
-struct Backpressure {
-    used: Mutex<usize>,
-    available: Condvar,
-    cap: usize,
-}
-
-impl Backpressure {
-    fn acquire(&self, n: usize) {
-        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
-        while *used != 0 && *used + n > self.cap {
-            used = self.available.wait(used).unwrap_or_else(|e| e.into_inner());
-        }
-        *used += n;
-    }
-
-    fn release(&self, n: usize) {
-        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
-        *used = used.saturating_sub(n);
-        self.available.notify_all();
-    }
-}
-
-/// Number of background oplog drainer threads. A single drainer's write
-/// throughput (~71k entries/s here) caps sustainable async throughput below the
-/// rate concurrent writers can produce (~103k/s); a pool spreads oplog writes
-/// across cores (each drainer owns a disjoint set of the `OPLOG_SHARDS` btrees, so
-/// no two ever write the same tree) so the drainers out-run the writers and the
-/// queue stays small. Overridable via `SECANTUS_OPLOG_ASYNC_DRAINERS`.
-const ASYNC_OPLOG_DRAINERS: usize = 4;
-
-/// The drainer index that owns the shard a batch starting at `start_seq` routes to
-/// (`shard % num_drainers`) — a fixed mapping, so each shard is written by exactly
-/// one drainer and concurrent drainers never contend on the same btree.
-fn drainer_for_batch(start_seq: i64, num_drainers: usize) -> usize {
-    (start_seq.rem_euclid(OPLOG_SHARDS) as usize) % num_drainers
-}
-
-/// Handle to the background oplog drainer pool: a per-drainer channel a committed
-/// write routes its entries to (by shard), the shared [`Backpressure`] budget, and
-/// the drainers' join handles (joined on `Storage` drop after `Shutdown`, so a
-/// clean close persists every entry before the close-time checkpoint).
-struct AsyncOplog {
-    txs: Vec<mpsc::Sender<DrainMsg>>,
-    backpressure: Arc<Backpressure>,
-    joins: Mutex<Vec<JoinHandle<()>>>,
-    /// Committed entries the async oplog failed to keep, each a sentence:
-    /// written by the drainers and the mint path, reported by
-    /// [`Storage::close`] (RM-193). Each was a storage error turned into
-    /// silence.
-    faults: Arc<Mutex<Vec<String>>>,
-}
-
-/// Record an async oplog fault: logged now, and reported by `close`.
-fn async_oplog_fault(faults: &Mutex<Vec<String>>, what: String) {
-    eprintln!("secantus-storage: async oplog: {what}");
-    faults.lock().unwrap_or_else(|e| e.into_inner()).push(what);
-}
-
 /// Everything a prune sweep needs, shared between `Storage` (explicit
 /// `prune_oplog`, the sync emit path's opportunistic trigger) and the async
 /// drainer pool (which owns the opportunistic cadence in async mode — the
@@ -7168,9 +6762,8 @@ struct PruneCtx {
     data_nonlogged: bool,
     stable_seq: Arc<AtomicI64>,
     checkpoint_requested: Arc<AtomicBool>,
-    /// Shard-existence mask (shared with `Storage.oplog_shards_created`) so
-    /// the sweep's merges skip known-absent shard tables.
-    shards_created: Arc<AtomicU32>,
+    /// The oplog's table (`Storage.oplog_uri`).
+    oplog_uri: String,
     /// Background-pruner wakeup: the write paths set the flag + notify when
     /// the opportunistic cadence crosses (sync emit path and async drainers
     /// alike — Finding 12 measured the inline sweep at ~36% of the sync
@@ -7227,348 +6820,6 @@ fn spawn_oplog_pruner(ctx: Arc<PruneCtx>) -> JoinHandle<()> {
             }
         })
         .expect("spawn secantus-oplog-pruner")
-}
-
-/// Shared state a drainer advances so change-stream tailers can observe progress:
-/// the `oplog` mutex (for `written_seq` + the completion tracker) + its condvar,
-/// plus the [`Backpressure`] budget it releases as batches land.
-#[derive(Clone)]
-struct DrainerShared {
-    conn: Arc<Connection>,
-    oplog: Arc<Mutex<OplogState>>,
-    oplog_cv: Arc<Condvar>,
-    backpressure: Arc<Backpressure>,
-    /// Shared with `Storage.oplog_shards_created` — see [`ensure_oplog_shard`].
-    shards_created: Arc<AtomicU32>,
-    /// The store's resolved oplog-nonlogged mode (table create config).
-    oplog_nonlogged: bool,
-    /// The opportunistic-prune context: the drainer that crosses the
-    /// persisted-rows cadence boundary runs the sweep (best-effort).
-    prune: Arc<PruneCtx>,
-    /// Shared with `AsyncOplog::faults`.
-    faults: Arc<Mutex<Vec<String>>>,
-}
-
-/// Spawn the background oplog drainer pool and return the handle committed writes
-/// route their entries to. The [`Backpressure`] budget is shared across all
-/// drainers (one global cap on queued bytes).
-fn spawn_oplog_drainer(
-    conn: Arc<Connection>,
-    oplog: Arc<Mutex<OplogState>>,
-    oplog_cv: Arc<Condvar>,
-    shards_created: Arc<AtomicU32>,
-    oplog_nonlogged: bool,
-    prune: Arc<PruneCtx>,
-) -> Arc<AsyncOplog> {
-    // The cap is overridable via `SECANTUS_OPLOG_ASYNC_CAP_BYTES` (tuning + tests
-    // that force backpressure with a tiny cap); a 0/invalid value keeps the default.
-    let cap = std::env::var("SECANTUS_OPLOG_ASYNC_CAP_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(ASYNC_OPLOG_MAX_PENDING_BYTES);
-    let num_drainers = std::env::var("SECANTUS_OPLOG_ASYNC_DRAINERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(ASYNC_OPLOG_DRAINERS)
-        // Never more drainers than shards (a shard is owned by one drainer).
-        .min(OPLOG_SHARDS as usize);
-    let backpressure = Arc::new(Backpressure {
-        used: Mutex::new(0),
-        available: Condvar::new(),
-        cap,
-    });
-    let faults = Arc::new(Mutex::new(Vec::new()));
-    let shared = DrainerShared {
-        conn,
-        oplog,
-        oplog_cv,
-        backpressure: backpressure.clone(),
-        shards_created,
-        oplog_nonlogged,
-        prune,
-        faults: faults.clone(),
-    };
-    let mut txs = Vec::with_capacity(num_drainers);
-    let mut joins = Vec::with_capacity(num_drainers);
-    for _ in 0..num_drainers {
-        let (tx, rx) = mpsc::channel::<DrainMsg>();
-        let s = shared.clone();
-        txs.push(tx);
-        joins.push(thread::spawn(move || drainer_loop(s, rx)));
-    }
-    Arc::new(AsyncOplog {
-        txs,
-        backpressure,
-        joins: Mutex::new(joins),
-        faults,
-    })
-}
-
-/// Write one contiguous batch of oplog entries to its shard, in a
-/// single WT transaction so a partial batch never becomes visible.
-fn write_drain_batch(
-    session: &Session,
-    shards_created: &AtomicU32,
-    oplog_nonlogged: bool,
-    batch: &DrainBatch,
-) -> Result<()> {
-    session.begin_transaction(None)?;
-    let res = (|| -> Result<()> {
-        // Lazy shards: created on first touch only (bitmask; see
-        // `ensure_oplog_shard`).
-        ensure_oplog_shard(shards_created, session, batch.start_seq, oplog_nonlogged)?;
-        let cur = session.open_cursor(&batch.shard, None)?;
-        for (i, blob) in batch.blobs.iter().enumerate() {
-            let seq = batch.start_seq + i as i64;
-            cur.reset()?;
-            cur.set_key_q(seq);
-            cur.set_value_u(blob);
-            cur.insert()?;
-        }
-        Ok(())
-    })();
-    match res {
-        Ok(()) => session.commit_transaction(None).map_err(Into::into),
-        Err(e) => {
-            let _ = session.rollback_transaction(None);
-            Err(e)
-        }
-    }
-}
-
-/// Persist one batch and record its completion. On success: release the batch's
-/// backpressure reservation and advance `written_seq` over any now-contiguous
-/// prefix (waking tailers). On failure: return the batch so the caller retries it
-/// (a drainer write failure is a durability signal, never silently dropped — the
-/// watermark simply doesn't advance past the hole until it succeeds).
-fn persist_and_record(
-    session: &Session,
-    shared: &DrainerShared,
-    batch: DrainBatch,
-) -> Option<DrainBatch> {
-    let start = batch.start_seq;
-    let n = batch.blobs.len() as i64;
-    let bytes = batch.bytes;
-    if let Err(e) = write_drain_batch(
-        session,
-        &shared.shards_created,
-        shared.oplog_nonlogged,
-        &batch,
-    ) {
-        eprintln!(
-            "secantus-storage: async oplog drainer write failed at seq {start}: {e:?} (will retry)"
-        );
-        return Some(batch);
-    }
-    shared.backpressure.release(bytes);
-    let (advanced, prune_due) = {
-        let mut st = shared.oplog.lock().unwrap_or_else(|e| e.into_inner());
-        (
-            advance_written_seq(&mut st, start, n),
-            record_persisted(&mut st, n),
-        )
-    };
-    if advanced {
-        shared.oplog_cv.notify_all();
-    }
-    if prune_due {
-        run_drainer_prune(shared);
-    }
-    None
-}
-
-/// Opportunistic prune signal from a drainer that just crossed the
-/// persisted-rows cadence boundary — hand the sweep to the background
-/// pruner so the drainer stays on its persist loop (a sweep here delayed
-/// draining and cost ~6% at 8 writers, Finding 17).
-fn run_drainer_prune(shared: &DrainerShared) {
-    signal_oplog_prune(&shared.prune);
-}
-
-/// Write a coalesced group of batches (possibly spanning several of this
-/// drainer's shards) in ONE WT transaction. One cursor per distinct shard.
-fn write_drain_batches(
-    session: &Session,
-    shards_created: &AtomicU32,
-    oplog_nonlogged: bool,
-    batches: &[DrainBatch],
-) -> Result<()> {
-    session.begin_transaction(None)?;
-    let res = (|| -> Result<()> {
-        let mut curs: HashMap<&str, Cursor> = HashMap::new();
-        for batch in batches {
-            let cur = match curs.entry(batch.shard.as_str()) {
-                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    // Lazy shards: created on first touch only (bitmask).
-                    ensure_oplog_shard(shards_created, session, batch.start_seq, oplog_nonlogged)?;
-                    e.insert(session.open_cursor(&batch.shard, None)?)
-                }
-            };
-            for (i, blob) in batch.blobs.iter().enumerate() {
-                let seq = batch.start_seq + i as i64;
-                cur.reset()?;
-                cur.set_key_q(seq);
-                cur.set_value_u(blob);
-                cur.insert()?;
-            }
-        }
-        Ok(())
-    })();
-    match res {
-        Ok(()) => session.commit_transaction(None).map_err(Into::into),
-        Err(e) => {
-            let _ = session.rollback_transaction(None);
-            Err(e)
-        }
-    }
-}
-
-/// Persist a coalesced group in one transaction; on success release + record every
-/// batch (one lock acquisition, one notify). On failure fall back to per-batch
-/// writes so a single poison batch can't hold the rest hostage; per-batch failures
-/// land in `retry`.
-fn persist_group(
-    session: &Session,
-    shared: &DrainerShared,
-    group: Vec<DrainBatch>,
-    retry: &mut Vec<DrainBatch>,
-) {
-    if group.len() == 1 {
-        let b = group.into_iter().next().unwrap();
-        if let Some(b) = persist_and_record(session, shared, b) {
-            retry.push(b);
-        }
-        return;
-    }
-    match write_drain_batches(
-        session,
-        &shared.shards_created,
-        shared.oplog_nonlogged,
-        &group,
-    ) {
-        Ok(()) => {
-            let bytes: usize = group.iter().map(|b| b.bytes).sum();
-            let (advanced, prune_due) = {
-                let mut st = shared.oplog.lock().unwrap_or_else(|e| e.into_inner());
-                let mut adv = false;
-                let mut n = 0i64;
-                for b in &group {
-                    adv |= advance_written_seq(&mut st, b.start_seq, b.blobs.len() as i64);
-                    n += b.blobs.len() as i64;
-                }
-                (adv, record_persisted(&mut st, n))
-            };
-            shared.backpressure.release(bytes);
-            if advanced {
-                shared.oplog_cv.notify_all();
-            }
-            if prune_due {
-                run_drainer_prune(shared);
-            }
-        }
-        Err(e) => {
-            eprintln!(
-                "secantus-storage: async oplog coalesced drain failed: {e:?} (retrying per-batch)"
-            );
-            for b in group {
-                if let Some(b) = persist_and_record(session, shared, b) {
-                    retry.push(b);
-                }
-            }
-        }
-    }
-}
-
-/// Coalescing caps: stop greedily pulling more queued batches into one drain
-/// transaction past this many batches / bytes. Bounds both transaction size (WT
-/// txn memory) and the visibility latency a coalesced commit adds.
-const COALESCE_MAX_BATCHES: usize = 32;
-const COALESCE_MAX_BYTES: usize = 16 * 1024 * 1024;
-
-/// One drainer thread of the pool. It owns a disjoint subset of the oplog shards
-/// (routing guarantees it only receives batches for its shards), so it writes each
-/// batch immediately — no reorder needed; global seq contiguity is reconstructed
-/// across all drainers by `advance_written_seq`'s completion tracker. When the
-/// queue is deep it coalesces up to [`COALESCE_MAX_BATCHES`] queued batches into
-/// one WT transaction (fewer commits — disable with
-/// `SECANTUS_OPLOG_ASYNC_COALESCE=0`). A batch whose write fails is retried on the
-/// next iteration (bounded in-thread buffer). On `Shutdown` it drains everything
-/// still queued before returning, so a clean close checkpoints a complete oplog.
-fn drainer_loop(shared: DrainerShared, rx: mpsc::Receiver<DrainMsg>) {
-    let session = match shared.conn.open_session() {
-        Ok(s) => s,
-        Err(e) => {
-            async_oplog_fault(
-                &shared.faults,
-                format!(
-                    "a drainer could not open a session, so its entries are not written: {e:?}"
-                ),
-            );
-            return;
-        }
-    };
-    let coalesce = std::env::var("SECANTUS_OPLOG_ASYNC_COALESCE")
-        .map(|v| v != "0")
-        .unwrap_or(true);
-    // Batches whose write failed, retried before processing new messages.
-    let mut retry: Vec<DrainBatch> = Vec::new();
-    let mut shutting_down = false;
-    loop {
-        // Retry any previously-failed batches first (durability before progress).
-        if !retry.is_empty() {
-            let mut still: Vec<DrainBatch> = Vec::new();
-            for b in std::mem::take(&mut retry) {
-                if let Some(b) = persist_and_record(&session, &shared, b) {
-                    still.push(b);
-                }
-            }
-            retry = still;
-        }
-        let msg = if shutting_down {
-            rx.try_recv().ok()
-        } else {
-            rx.recv().ok()
-        };
-        match msg {
-            Some(DrainMsg::Batch(b)) => {
-                let mut group = vec![b];
-                if coalesce {
-                    let mut bytes = group[0].bytes;
-                    while group.len() < COALESCE_MAX_BATCHES && bytes < COALESCE_MAX_BYTES {
-                        match rx.try_recv() {
-                            Ok(DrainMsg::Batch(nb)) => {
-                                bytes += nb.bytes;
-                                group.push(nb);
-                            }
-                            Ok(DrainMsg::Shutdown) => {
-                                shutting_down = true;
-                                break;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                }
-                persist_group(&session, &shared, group, &mut retry);
-            }
-            Some(DrainMsg::Shutdown) => shutting_down = true,
-            // recv error (sender dropped) or, while shutting down, queue drained.
-            None => break,
-        }
-    }
-    // Final flush: retry anything still failing. What still fails is lost,
-    // and that is reported, not dropped (RM-193).
-    for b in std::mem::take(&mut retry) {
-        let (start, n) = (b.start_seq, b.blobs.len());
-        if persist_and_record(&session, &shared, b).is_some() {
-            async_oplog_fault(
-                &shared.faults,
-                format!("{n} committed entries from seq {start} could not be written at shutdown"),
-            );
-        }
-    }
 }
 
 /// Emit this many oplog rows between opportunistic `prune_oplog` sweeps on the
@@ -7663,8 +6914,9 @@ fn advance_timestamps(conn: &Connection, oplog: &Mutex<OplogState>) -> Result<i6
 fn reserve_stamp(oplog: &Mutex<OplogState>) -> u64 {
     let mut st = oplog.lock().unwrap_or_else(|e| e.into_inner());
     let ts = ts_u64(Storage::mint_ts(&mut st));
-    let floor = st.next_seq;
-    st.ts_reserved.insert(ts, floor);
+    // The position of an entry is its timestamp: every entry at or after
+    // `ts` is later in time than the reservation.
+    st.ts_reserved.insert(ts, ts as i64);
     ts
 }
 
@@ -7749,82 +7001,129 @@ fn load_stable_marker(session: &Session) -> Option<(i64, bool)> {
     None
 }
 
-fn load_oplog_meta(session: &Session) -> Result<OplogState> {
-    let c = session.open_cursor(OPLOG_META_TABLE, None)?;
-    c.set_key_s("state");
+/// The oplog's counters as the table leaves them: the clock resumes after the
+/// newest entry (mongod reads the top of its oplog), and never below what was
+/// already minted -- the caller bumps it past what cluster-time and
+/// commit-timestamp mints that left no entry can have used.
+/// The newest oplog position ever pruned (0: none, the oplog still begins at
+/// the store's first entry -- "genesis"). Kept in the oplog meta table, in the
+/// transaction that removes the rows, so it is never behind the oplog.
+fn read_pruned_marker(session: &Session) -> i64 {
+    let Ok(c) = session.open_cursor(OPLOG_META_TABLE, None) else {
+        return 0;
+    };
+    c.set_key_s("pruned");
     if c.search().is_ok() {
-        let blob = c.get_value_u()?;
-        if !blob.is_empty() {
-            if let Ok(st) = decode_doc(&blob) {
-                let g = |k: &str| {
-                    st.get_i64(k)
-                        .ok()
-                        .or_else(|| st.get_i32(k).ok().map(i64::from))
-                };
-                // The persisted counters are a *hint*, not the source of
-                // truth: the meta row is written at close, not per emit, so
-                // after a crash its `next_seq` / `next_nat_seq` lag the
-                // tables. Trusting a stale value would re-mint an
-                // already-used seq — a duplicate oplog key (lost change
-                // events) or a nat-entry collision that corrupts
-                // capped-collection FIFO eviction. Clamp each counter UP to
-                // the table maxima; the hint only ever saves a scan, never
-                // lowers us.
-                return Ok(OplogState {
-                    next_seq: g("next_seq")
-                        .unwrap_or(1)
-                        .max(scan_max_oplog_seq(session) + 1),
-                    last_ts_secs: g("last_ts_secs").unwrap_or(0),
-                    last_ts_ord: g("last_ts_ord").unwrap_or(0),
-                    next_nat_seq: g("next_nat_seq")
-                        .unwrap_or(1)
-                        .max(scan_max_nat_seq(session) + 1),
-                    emit_count: 0,
-                    persisted_count: 0,
-                    live_count: count_oplog_entries(session),
-                    written_seq: 0, // set to next_seq-1 by the caller (open)
-                    done_ranges: BTreeMap::new(),
-                    in_flight: BTreeMap::new(),
-                    ts_reserved: BTreeMap::new(),
-                });
-            }
+        if let Ok(d) = c
+            .get_value_u()
+            .map_err(StorageError::from)
+            .and_then(|b| decode_doc(&b))
+        {
+            return d.get_i64("through").unwrap_or(0);
         }
     }
-    // Fallback: reconstruct from the newest oplog row. Sharded — the max seq can
-    // be in any shard (`scan_max_oplog_seq` takes the max across shards + the
-    // legacy table); routing is per-batch so its table isn't a function of the
-    // seq — probe each table for that seq's ts.
-    let last_seq = scan_max_oplog_seq(session);
-    let mut last_secs = 0i64;
-    let mut last_ord = 0i64;
-    if last_seq > 0 {
-        for tbl in oplog_all_tables() {
-            let Ok(oc) = session.open_cursor(&tbl, None) else {
-                continue;
-            };
-            oc.set_key_q(last_seq);
-            if oc.search().is_ok() {
-                if let Some(ts) = peek_entry_ts(&oc.get_value_u()?) {
-                    last_secs = i64::from(ts.time);
-                    last_ord = i64::from(ts.increment);
-                }
-                break;
-            }
-        }
-    }
+    0
+}
+
+fn write_pruned_marker(session: &Session, through: i64) -> Result<()> {
+    let blob = encode_doc(&bson::doc! {"through": through})?;
+    let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
+    cur.set_key_s("pruned");
+    cur.set_value_u(&blob);
+    cur.insert()?;
+    Ok(())
+}
+
+fn load_oplog_state(session: &Session, table: &str) -> Result<OplogState> {
+    let last_seq = scan_max_oplog_seq(session, table);
+    let (last_secs, last_ord) = if last_seq > 0 {
+        (last_seq >> 32, last_seq & 0xffff_ffff)
+    } else {
+        (0, 0)
+    };
     Ok(OplogState {
         next_seq: last_seq + 1,
         last_ts_secs: last_secs,
         last_ts_ord: last_ord,
-        next_nat_seq: scan_max_nat_seq(session) + 1,
         emit_count: 0,
-        persisted_count: 0,
-        live_count: count_oplog_entries(session),
-        written_seq: 0, // set to next_seq-1 by the caller (open)
-        done_ranges: BTreeMap::new(),
+        live_count: count_oplog_entries(session, table),
         in_flight: BTreeMap::new(),
         ts_reserved: BTreeMap::new(),
     })
+}
+
+/// Where the store records which table is `local.oplog.rs`: the oplog meta
+/// table's `oplog` row, `{ident, uuid}`. That table is always WAL-logged, and
+/// the catalog is not (a store whose data tables are not logged loses its
+/// catalog rows back to the last checkpoint and rebuilds them by replaying
+/// the oplog), so the catalog alone cannot be what finds the oplog after a
+/// crash: opening would take its row's absence for "no oplog yet", make a new
+/// empty one, and drop the real one as an orphan with every acknowledged write
+/// the replay needs. The catalog row is derived from this one.
+const OPLOG_IDENT_KEY: &str = "oplog";
+
+/// `(ident, uuid)` of the oplog as the meta table records them.
+fn read_oplog_ident(session: &Session) -> Result<Option<(String, Vec<u8>)>> {
+    let cur = match session.open_cursor(OPLOG_META_TABLE, None) {
+        Ok(c) => c,
+        Err(e) if e.is_not_found() => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    cur.set_key_s(OPLOG_IDENT_KEY);
+    match cur.search() {
+        Ok(()) => {
+            let d = decode_doc(&cur.get_value_u()?)?;
+            let ident = d.get_str("ident").ok().map(str::to_string);
+            let uuid = match d.get("uuid") {
+                Some(Bson::Binary(b)) => Some(b.bytes.clone()),
+                _ => None,
+            };
+            Ok(ident.zip(uuid))
+        }
+        Err(e) if e.is_not_found() => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Make `local.oplog.rs`'s table if the store has none, and return its URI.
+/// A new store makes the table, then records it in the meta table (which
+/// survives a crash), then writes mongod's `_mdb_catalog` row for it --
+/// `{md: {ns, options: {uuid, capped, size, autoIndexId}, indexes: []},
+/// idxIdent: {}, ident, ns}`. A crash between the table and its record leaves
+/// a table no row names: empty, since nothing is written to it before the
+/// store is open, and dropped by the next open's `reconcile_idents`. An open
+/// that finds the record and no catalog row writes the row again.
+fn ensure_oplog_table(session: &Session, nonlogged: bool) -> Result<String> {
+    let (ident, uuid, recorded) = match read_oplog_ident(session)? {
+        Some((ident, uuid)) => (ident, uuid, true),
+        None => (
+            mdb_catalog::new_collection_ident(),
+            new_uuid_bytes().to_vec(),
+            false,
+        ),
+    };
+    let uri = mdb_catalog::table_uri(&ident);
+    // A no-op on an existing table.
+    session.create(&uri, &oplog_table_cfg(nonlogged))?;
+    if !recorded {
+        let blob = encode_doc(&bson::doc! {"ident": &ident, "uuid": uuid_binary(&uuid)})?;
+        let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
+        cur.set_key_s(OPLOG_IDENT_KEY);
+        cur.set_value_u(&blob);
+        cur.insert()?;
+    }
+    if mdb_catalog::ident_of_ns(session, OPLOG_NS)?.is_none() {
+        let options = bson::doc! {
+            "uuid": uuid_binary(&uuid),
+            "capped": true,
+            "size": OPLOG_CATALOG_SIZE,
+            "autoIndexId": false,
+        };
+        let entry = mdb_catalog::entry_doc(OPLOG_NS, options, &[], &ident, &[]);
+        let id = NEXT_CATALOG_ID.fetch_add(1, Ordering::SeqCst);
+        mdb_catalog::write_entry(session, id, &entry)?;
+    }
+    Ok(uri)
 }
 
 /// Peek the `ts` Timestamp out of a raw oplog-entry blob without materialising
@@ -7837,31 +7136,6 @@ fn peek_entry_ts(blob: &[u8]) -> Option<bson::Timestamp> {
         Ok(Some(bson::RawBsonRef::Timestamp(ts))) => Some(ts),
         _ => None,
     }
-}
-
-/// Largest RecordId present across the document shard tables (0 if empty) — used
-/// to recover the natural-order counter on open, so minted RecordIds stay strictly
-/// greater than any existing doc-table key. The RecordId is now the doc-table key
-/// itself (`(db, coll, RecordId)`); the forward `NAT_TABLE` this used to scan is
-/// gone. Mirrors `storage._scan_max_nat_seq`.
-fn scan_max_nat_seq(session: &Session) -> i64 {
-    // RecordIds are minted from one counter for every collection, so any
-    // collection's last row could hold the largest: read each table's last.
-    let mut max_seq = 0i64;
-    let Ok(placements) = mdb_catalog::all_placements(session) else {
-        return 0;
-    };
-    for (_, _, p) in placements {
-        let Ok(c) = session.open_cursor(&p.table(), None) else {
-            continue;
-        };
-        if c.prev().unwrap_or(false) {
-            if let Ok(seq) = c.get_key_q() {
-                max_seq = max_seq.max(seq);
-            }
-        }
-    }
-    max_seq
 }
 
 /// What `create_archive` produced: the absolute-ish output path and its size.
@@ -8093,17 +7367,12 @@ impl Storage {
         CatalogChange::begin(self as *const Storage as usize, colls)
     }
 
-    /// Close the store: stop the background threads, persist the oplog meta
-    /// row and take the final checkpoint. Answers the FIRST failure (each is
+    /// Close the store: stop the background threads, persist the size
+    /// counters and take the final checkpoint. Answers the FIRST failure (each is
     /// also logged): a close-time write error is a durability signal, and a
     /// daemon whose last checkpoint failed must not exit 0 (RM-189). Runs
     /// once; a later call, and the `Drop` after it, do nothing. The store is
     /// not used after this.
-    ///
-    /// The oplog meta row is the Rust analogue of `storage.close`'s
-    /// `_persist_oplog_meta`. Recovery clamps against the tables anyway
-    /// (`load_oplog_meta`), so losing it costs only a tail-row scan plus a 1s
-    /// clock bump on the next open.
     pub fn close(&self) -> Result<()> {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
@@ -8185,45 +7454,12 @@ impl Storage {
                 fail("the stable checkpoint", e);
             }
         }
-        // Async oplog: flush the drainer pool BEFORE persisting meta / checkpointing,
-        // so every committed write's oplog entry is on disk when the checkpoint
-        // snapshots the tables (clean-close durability is preserved — only a hard
-        // crash loses undrained entries). Signal Shutdown to every drainer and join
-        // them all; each drains its queue, then exits.
-        if let Some(async_h) = &self.async_oplog {
-            for tx in &async_h.txs {
-                let _ = tx.send(DrainMsg::Shutdown);
-            }
-            let handles =
-                std::mem::take(&mut *async_h.joins.lock().unwrap_or_else(|e| e.into_inner()));
-            for handle in handles {
-                if handle.join().is_err() {
-                    fail(
-                        "joining an async oplog drainer",
-                        StorageError::Internal("the drainer panicked".to_string()),
-                    );
-                }
-            }
-            let faults =
-                std::mem::take(&mut *async_h.faults.lock().unwrap_or_else(|e| e.into_inner()));
-            for what in faults {
-                fail("the async oplog", StorageError::Internal(what));
-            }
-        }
-        let meta = {
-            let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
-            (
-                st.next_seq,
-                st.last_ts_secs,
-                st.last_ts_ord,
-                st.next_nat_seq,
-            )
-        };
         match self.conn.open_session() {
             Ok(session) => {
                 // The committed counts, beside the oplog state they go with:
-                // the next open trusts them only if it finds that state.
-                let fingerprint = [meta.0, meta.1, meta.2];
+                // the next open trusts them only if it finds that state --
+                // the position after the oplog's newest entry.
+                let fingerprint = [scan_max_oplog_seq(&session, &self.oplog_uri) + 1, 0, 0];
                 if std::env::var_os("SECANTUS_CHECK_SIZES").is_some() {
                     if let Err(e) = self.check_sizes_against_walk(&session) {
                         fail("checking the collection sizes", e);
@@ -8231,9 +7467,6 @@ impl Storage {
                 }
                 if let Err(e) = self.sizes.persist(&session, &fingerprint) {
                     fail("persisting the collection sizes", e);
-                }
-                if let Err(e) = self.persist_oplog_meta(&session, meta) {
-                    fail("persisting the oplog meta", e);
                 }
                 // Close-time checkpoint (durable mode) — the Rust analogue of
                 // Python `Storage.close`'s final checkpoint. WiredTiger's
@@ -8353,9 +7586,6 @@ impl Storage {
         // are no-ops), `oplog_async` selects the drainer at every open.
         let oplog_nonlogged = opts.oplog_nonlogged.unwrap_or_else(oplog_tables_nonlogged);
         let data_create_mode = opts.data_nonlogged.unwrap_or_else(data_tables_nonlogged);
-        let oplog_async_on = opts
-            .oplog_async
-            .unwrap_or_else(|| std::env::var_os("SECANTUS_OPLOG_ASYNC").is_some());
         let in_memory = config.contains("in_memory=true");
         let new_store = in_memory || !std::path::Path::new(home).join("WiredTiger.wt").exists();
         // mongod's layout (tasks/mongod-storage-model-plan.md): check the
@@ -8384,45 +7614,26 @@ impl Storage {
             let session = conn.open_session()?;
             stored_data_logging(&session)?
         };
-        let mut state = {
+        let state = {
             let boot = conn.open_session()?;
             for (name, fmt) in BOOTSTRAP {
                 boot.create(name, &bootstrap_table_cfg(name, fmt, data_create_mode))?;
             }
-            // The oplog is sharded across OPLOG_SHARDS btrees to spread append
-            // contention (see OPLOG_SHARDS); the legacy single table stays
-            // so a pre-shard store's entries remain readable. Config honours
-            // SECANTUS_OPLOG_NONLOGGED (see `oplog_table_cfg`).
-            let opcfg = oplog_table_cfg(oplog_nonlogged);
-            boot.create(OPLOG_TABLE, &opcfg)?;
-            // The documents shards (DOC_SHARDS) and oplog shards (OPLOG_SHARDS) are
-            // NO LONGER created eagerly here. A documents shard is made on first
-            // creation of a collection that hashes to it (`ensure_collection`); an
-            // oplog shard is made on first write to it (the drain / emit path). This
-            // is the open-cost cut — a fresh store created ~37 tables, most unused by
-            // an ephemeral server; now only the base tables plus the shards actually
-            // touched. Every read / merge / scan path tolerates an absent shard
-            // (`is_not_found`), so a store written with a subset of shards stays
-            // byte-compatible with an eager store and with the Python server (a
-            // missing shard reads as empty). The legacy single tables above stay in
-            // BOOTSTRAP so a pre-shard store's rows remain reachable for migration.
-            // Fail fast on a store whose doc shards predate the RecordId keying
-            // change (`SSu` on disk vs the `SSq` this build needs): no in-place
-            // upgrade, refuse to open rather than mis-read. WT `create` above
-            // preserves an existing table's key_format, so the on-disk schema is
-            // intact for this check. (Runs before `migrate_legacy_docs` — that
-            // path is the pre-*shard* case, which this check does not touch.)
+            // Drop any table a crash or a rollback left that no catalog row
+            // or placement names; then `local.oplog.rs`'s own: the catalog's
+            // row names its ident, a new store makes both.
             reconcile_idents(&boot)?;
-            // Recover the oplog seq / timestamp counters from the meta row, or
-            // reconstruct them by scanning the oplog table.
-            load_oplog_meta(&boot)?
+            let oplog_uri = ensure_oplog_table(&boot, oplog_nonlogged)?;
+            // Recover the timestamp counters from the oplog's last entry.
+            (load_oplog_state(&boot, &oplog_uri)?, oplog_uri)
         };
+        let (mut state, oplog_uri) = state;
         // The oplog state as the last close left it: the size storer's
         // counts are trusted only when it is the state they were saved with.
         // (`next_nat_seq` is not part of it: the open raises it to the
         // largest RecordId held, so it can differ from what the close saved
         // with nothing written in between.)
-        let size_fingerprint = [state.next_seq, state.last_ts_secs, state.last_ts_ord];
+        let size_fingerprint = [state.next_seq, 0, 0];
         // Cluster-time mints are not persisted per call (see
         // `current_cluster_time`), so the recovered (last_ts_secs, last_ts_ord)
         // can lag mints issued right before a crash. Bump one full second past
@@ -8431,24 +7642,33 @@ impl Storage {
         // strictly greater than all of them. Costs at most a 1s forward jump of
         // the (already logical) cluster clock per restart; never applied to a
         // virgin store. Mirrors `storage.__init__`'s recovery bump.
+        // ... and past the timestamps WiredTiger already holds: the checkpoint's
+        // (`recovery`), and its stable and oldest, which writes of this life
+        // without an entry (a catalog write, a cluster-time mint) moved on
+        // and a commit may not go behind.
+        for query in [
+            "get=recovery",
+            "get=stable_timestamp",
+            "get=oldest_timestamp",
+        ] {
+            let held = conn
+                .query_timestamp(query)
+                .ok()
+                .and_then(|hex| u64::from_str_radix(&hex, 16).ok())
+                .unwrap_or(0);
+            if (held >> 32, held & 0xffff_ffff)
+                > (state.last_ts_secs as u64, state.last_ts_ord as u64)
+            {
+                state.last_ts_secs = (held >> 32) as i64;
+                state.last_ts_ord = (held & 0xffff_ffff) as i64;
+            }
+        }
         if state.last_ts_secs > 0 {
             state.last_ts_secs = state.last_ts_secs.max(now_secs()) + 1;
             state.last_ts_ord = 0;
         }
-        // The async drainer starts caught up to the recovered tail: nothing is
-        // in flight yet, so every seq < next_seq is already durably on disk.
-        state.written_seq = state.next_seq - 1;
         let oplog = Arc::new(Mutex::new(state));
         let oplog_cv = Arc::new(Condvar::new());
-        // Seed the shard-existence mask by probing once at open (shards are
-        // lazy-created; on a typical store most of the 16 never exist), so
-        // every oplog merge skips the absent tables without a failed
-        // open_cursor per table per call. Single-process store: a 0 bit
-        // stays honest until this process itself creates the shard.
-        let oplog_shards_created = {
-            let session = conn.open_session()?;
-            Arc::new(AtomicU32::new(probe_existing_oplog_shards(&session)))
-        };
         // Phase A': resolve the data-logging mode. The stable marker (written
         // at every stable checkpoint) is authoritative for an existing store —
         // table logging config is create-time-sticky, so flipping the env var
@@ -8483,35 +7703,12 @@ impl Storage {
             data_nonlogged,
             stable_seq: stable_seq.clone(),
             checkpoint_requested: checkpoint_requested.clone(),
-            shards_created: oplog_shards_created.clone(),
+            oplog_uri: oplog_uri.clone(),
             wake_flag: Mutex::new(false),
             wake_cv: Condvar::new(),
             stop: AtomicBool::new(false),
         });
         let prune_join = Mutex::new(Some(spawn_oplog_pruner(prune_ctx.clone())));
-        // Opt-in: spawn the background drainer pool (option, else
-        // SECANTUS_OPLOG_ASYNC). The synchronous, atomic path is the default.
-        // A timestamped store stamps each write with its oplog timestamp,
-        // which the async drainer mints only after the write commits: it
-        // keeps the synchronous oplog.
-        if oplog_async_on && data_nonlogged {
-            eprintln!(
-                "secantus-storage: the asynchronous oplog is not used on a store whose data \
-                 tables are not logged (its writes carry their oplog timestamps)"
-            );
-        }
-        let async_oplog = if oplog_async_on && !data_nonlogged {
-            Some(spawn_oplog_drainer(
-                conn.clone(),
-                oplog.clone(),
-                oplog_cv.clone(),
-                oplog_shards_created.clone(),
-                oplog_nonlogged,
-                prune_ctx.clone(),
-            ))
-        } else {
-            None
-        };
         let mut storage = Storage {
             conn,
             home: home.to_string(),
@@ -8535,7 +7732,7 @@ impl Storage {
             index_names: Mutex::new(None),
             txn_dirty_limit: (parse_cache_bytes(config) as f64 * 0.20 * 0.75) as u64,
             cache_bytes: parse_cache_bytes(config),
-            oplog_shards_created,
+            oplog_uri,
             ttl: TtlMonitor::default(),
             enable_oplog: true,
             oplog,
@@ -8550,8 +7747,6 @@ impl Storage {
             // acknowledged writes with no crash involved. Force it.
             durable: durable || data_nonlogged,
             in_memory,
-            async_oplog,
-            oplog_nonlogged,
             checkpoint_seconds: opts.checkpoint_seconds,
             data_nonlogged,
             timestamped: data_nonlogged,
@@ -8892,16 +8087,6 @@ impl Storage {
         }
         // Released after the commit or rollback below.
         let _planner = PlannerScope::new();
-        // Async oplog: mark this statement so `emit_oplog_entries` buffers its
-        // entries instead of writing them in-transaction. The buffer is minted +
-        // handed to the drainer only on a successful commit (below), and cleared
-        // on rollback/retry — so a rolled-back write neither mints a seq (no gap)
-        // nor enqueues an entry (no duplicate change event).
-        let async_mode = self.async_oplog.is_some();
-        if async_mode {
-            IN_ASYNC_STMT.with(|f| f.set(true));
-            clear_pending_oplog();
-        }
         // Sync mode: emits inside this statement park their minted seq ranges
         // in `PENDING_MINTED`; this guard deregisters them from the in-flight
         // window on EVERY exit — after the commit (rows visible: the tail may
@@ -8930,9 +8115,7 @@ impl Storage {
                 }
             }
         }
-        let mut sync_scope = if async_mode {
-            None
-        } else {
+        let mut sync_scope = {
             IN_SYNC_STMT.with(|f| f.set(true));
             // Any leftover ranges belong to a dead scope (the guards harvest
             // on every exit, so this is a defensive no-op in practice) —
@@ -8968,7 +8151,7 @@ impl Storage {
         session.begin_transaction(None)?;
         match f() {
             Ok(v) => {
-                if !async_mode {
+                {
                     let minted = PENDING_MINTED.with(|p| p.borrow().clone());
                     if let Some((ts, reserved)) = self.commit_stamp(&minted) {
                         if reserved {
@@ -8985,13 +8168,12 @@ impl Storage {
                 }
                 // A write that noted no row (a registry or index change, a
                 // write of no document) is recorded as touching everything.
-                let written = (self.enable_oplog
-                    && self.async_oplog.is_none()
-                    && !STMT_UNATTRIBUTED.with(|u| u.get()))
-                .then(|| {
-                    STMT_OPLOG_NS
-                        .with(|o| STMT_WRITTEN.with(|w| merge_written(&o.borrow(), &w.borrow())))
-                });
+                let written =
+                    (self.enable_oplog && !STMT_UNATTRIBUTED.with(|u| u.get())).then(|| {
+                        STMT_OPLOG_NS.with(|o| {
+                            STMT_WRITTEN.with(|w| merge_written(&o.borrow(), &w.borrow()))
+                        })
+                    });
                 if let Err(e) =
                     counted_commit(written.as_deref(), || session.commit_transaction(None))
                 {
@@ -9000,10 +8182,6 @@ impl Storage {
                     // call on this session.
                     let why = session.rollback_reason();
                     let _ = session.rollback_transaction(None);
-                    if async_mode {
-                        IN_ASYNC_STMT.with(|f| f.set(false));
-                        clear_pending_oplog();
-                    }
                     const EINVAL: i32 = 22;
                     if e.is_rollback() || e.code == EINVAL {
                         return Err(classify_rollback(why));
@@ -9015,15 +8193,9 @@ impl Storage {
                 STMT_CATALOG_DOCS
                     .with(|c| std::mem::take(&mut *c.borrow_mut()))
                     .log_committed(
-                        self.enable_oplog && self.async_oplog.is_none(),
+                        self.enable_oplog,
                         &STMT_WRITTEN.with(|w| w.borrow().clone()),
                     );
-                if async_mode {
-                    // Committed: mint seqs for the buffered entries and hand them
-                    // to the drainer (which persists them + wakes tailers).
-                    IN_ASYNC_STMT.with(|f| f.set(false));
-                    self.drain_pending_oplog();
-                }
                 if let Some(scope) = sync_scope.as_mut() {
                     scope.1 = true;
                 }
@@ -9035,10 +8207,6 @@ impl Storage {
             }
             Err(e) => {
                 let _ = session.rollback_transaction(None);
-                if async_mode {
-                    IN_ASYNC_STMT.with(|f| f.set(false));
-                    clear_pending_oplog();
-                }
                 Err(e)
             }
         }
@@ -9046,37 +8214,42 @@ impl Storage {
 
     // --- oplog (Phase 4 sub-phase 3) ---
 
-    /// Mint a strictly-monotonic `Timestamp(secs, ord)`. `ord` increments within
-    /// a wall-clock second and resets to 1 on a new second. Caller holds the
-    /// oplog mutex (`state`). Mirrors `storage._mint_ts`.
+    /// Mint a strictly-monotonic `Timestamp(secs, ord)`. Caller holds the
+    /// oplog mutex (`state`).
     fn mint_ts(state: &mut OplogState) -> bson::Timestamp {
-        let now = now_secs();
-        if now > state.last_ts_secs {
-            state.last_ts_secs = now;
-            state.last_ts_ord = 1;
-        } else {
-            state.last_ts_ord += 1;
-        }
-        bson::Timestamp {
-            time: state.last_ts_secs as u32,
-            increment: state.last_ts_ord as u32,
-        }
+        u64_ts(Self::mint_run(state, 1, false))
     }
 
-    /// Atomically reserve `n` consecutive seqs and mint `n` monotonic timestamps.
-    /// With `track_in_flight` (the sync path) the range is registered in the
+    /// Mint `n` consecutive timestamps and return the first as a 64-bit
+    /// WiredTiger timestamp: the current second with increment 1, or the one
+    /// after the newest minted, whichever is later. An oplog entry's position
+    /// is its timestamp, so the run `start..start + n` is also the positions
+    /// of `n` entries. Caller holds the oplog mutex.
+    fn mint_run(state: &mut OplogState, n: usize, entries: bool) -> u64 {
+        let last = ((state.last_ts_secs as u64) << 32) | state.last_ts_ord as u64;
+        let first = (((now_secs() as u64) << 32) | 1).max(last + 1);
+        let newest = first + n.max(1) as u64 - 1;
+        state.last_ts_secs = (newest >> 32) as i64;
+        state.last_ts_ord = (newest & 0xffff_ffff) as i64;
+        if entries {
+            // Only entries move the position of the oplog's tail: a timestamp
+            // consumed without one (cluster time, a commit stamp) leaves it.
+            state.next_seq = newest as i64 + 1;
+        }
+        first
+    }
+
+    /// Atomically mint `n` consecutive timestamps, which are also the oplog
+    /// positions of `n` entries; returns the first as a position and the
+    /// timestamps. With `track_in_flight` the run is registered in the
     /// in-flight window under the same mutex acquisition, pinning the visible
-    /// tail below it until the minting transaction commits or rolls back. The
-    /// async drain path passes `false`: it mints after the data commit and its
-    /// visibility is governed by `written_seq`. Mirrors
-    /// `storage._mint_oplog_seq_and_ts`.
+    /// tail below it until the minting transaction commits or rolls back.
     fn mint_seq_and_ts(&self, n: usize, track_in_flight: bool) -> (i64, Vec<bson::Timestamp>) {
         let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
-        let start = st.next_seq;
-        st.next_seq += n as i64;
-        let ts: Vec<bson::Timestamp> = (0..n).map(|_| Self::mint_ts(&mut st)).collect();
+        let first = Self::mint_run(&mut st, n, true);
+        let start = first as i64;
+        let ts: Vec<bson::Timestamp> = (0..n as u64).map(|i| u64_ts(first + i)).collect();
         if track_in_flight {
-            let first = ts.first().map_or(0, |t| ts_u64(*t));
             st.in_flight.insert(
                 start,
                 InFlight {
@@ -9449,13 +8622,11 @@ impl Storage {
                 .collect::<Result<Vec<_>>>()?,
             None => stamp_retryable(entries),
         };
-        // User-transaction dirty accounting — BEFORE the async-oplog branch,
-        // which early-returns after buffering (in async mode the guard never
-        // saw the bytes and the CI async-oplog lane hit the raw cache error
-        // the budget exists to prevent). The entries carry the full
+        // User-transaction dirty accounting -- BEFORE the held-entries branch,
+        // which early-returns after buffering. The entries carry the full
         // documents, so their byte volume is the budget input; harvested by
-        // `with_user_transaction`. Pre-image bytes are charged too: in async
-        // mode they ride the same per-handle `pending_async` buffer, so
+        // `with_user_transaction`. Pre-image bytes are charged too: they ride
+        // the same per-handle `pending_async` buffer, so
         // without this the buffer (and heap) could grow unbounded for the
         // life of a pre-image-enabled transaction even though the entries
         // themselves stay within budget (#750).
@@ -9465,39 +8636,18 @@ impl Storage {
             let preimage_sz: u64 = pre_images.iter().flatten().map(|p| p.len() as u64).sum();
             PENDING_DIRTY_BYTES.with(|c| c.set(c.get() + entry_sz + preimage_sz));
         }
-        // Async oplog (prototype): inside an autocommit write statement, buffer
-        // the entries instead of writing them in this transaction. They are minted
-        // a seq and handed to the drainer by `with_statement_txn` after the data
-        // transaction commits (`drain_pending_oplog`). In async mode ALL emission
-        // must go through the drainer: a synchronous WT write here would mint a
-        // seq the drainer never sees, leaving a permanent hole in its contiguous
-        // `written_seq` run (a stall). So an emit outside a wrapped statement
-        // (IN_ASYNC_STMT false — e.g. the noop heartbeat) buffers and drains
-        // immediately, treating itself as its own committed unit.
-        // A timestamped store holds a user transaction's entries the same way
-        // (`with_user_transaction` sets `IN_ASYNC_STMT` across its statements)
-        // and writes them all at its commit, under one run of timestamps
-        // taken then -- mongod's single `applyOps` at the commit timestamp.
-        if self.async_oplog.is_some() || IN_ASYNC_STMT.with(|f| f.get()) {
+        // A store that logs a user transaction at its commit holds its entries
+        // (`with_user_transaction` sets `IN_ASYNC_STMT` across its
+        // statements) and writes them all at the commit, under one run of
+        // timestamps taken then -- mongod's single `applyOps` at the commit
+        // timestamp.
+        if IN_ASYNC_STMT.with(|f| f.get()) {
             PENDING_OPLOG.with(|p| {
                 let mut p = p.borrow_mut();
                 for pair in entries.into_iter().zip(pre_images) {
                     p.push(pair);
                 }
             });
-            // Where mongod reserves this emit's slots. A user transaction's
-            // are reserved at its commit (`commit_user_transaction`).
-            if self.async_oplog.is_some() && ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
-                PENDING_SLOTS.with(|s| s.borrow_mut().push(Instant::now()));
-            }
-            if !IN_ASYNC_STMT.with(|f| f.get()) {
-                // Self-draining emit (noop heartbeat, DDL on a bare session):
-                // the mint happens right here, so the real seq is known and
-                // returned — matching the sync path's contract. Deferred
-                // emits (statement / user txn) mint at their commit and
-                // return 0.
-                return Ok(self.drain_pending_oplog());
-            }
             return Ok(0);
         }
         // Whose commit resolves this mint? Inside a `with_statement_txn` scope
@@ -9531,20 +8681,7 @@ impl Storage {
         if deferred {
             PENDING_MINTED.with(|p| p.borrow_mut().push((start, start + n)));
         }
-        // Route the WHOLE batch to one shard (`start % OPLOG_SHARDS`) so concurrent
-        // writers — minting different start seqs — spread across N append points
-        // instead of contending on one table's rightmost page (the scaling fix),
-        // while each batch stays a contiguous sequential append to a single tree
-        // (the locality that per-entry scatter destroyed). One cursor for the run.
-        // Lazy shards: created on first touch only (the bitmask skips the
-        // per-batch schema-lock `create` the old path paid on every emit).
-        let op_shard = ensure_oplog_shard(
-            &self.oplog_shards_created,
-            session,
-            start,
-            self.oplog_nonlogged,
-        )?;
-        let cur = session.open_cursor(&op_shard, None)?;
+        let cur = session.open_cursor(&self.oplog_uri, None)?;
         let wall_millis = now_millis();
         let wall = Bson::DateTime(bson::DateTime::from_millis(wall_millis));
         let slots = pre_image_slots(&entries, &ts, &pre_images);
@@ -9623,145 +8760,6 @@ impl Storage {
         Ok(last)
     }
 
-    /// Async oplog (prototype): mint seqs + timestamps for this thread's buffered
-    /// entries (from a write that just committed) and hand them to the drainer as
-    /// one contiguous batch. Minting here — AFTER the data commit — is what keeps
-    /// the seq space gapless: a rolled-back/retried write cleared its buffer
-    /// before reaching this point, so it never minted. `wait_for_oplog` waits on
-    /// the drainer's `written_seq`, so a tailer never reads past what is on disk.
-    fn drain_pending_oplog(&self) -> i64 {
-        if self.async_oplog.is_none() {
-            return 0;
-        }
-        // Their write has just committed: the time from each emit to here is
-        // how long mongod would have held its slots (RM-379).
-        let slots = PENDING_SLOTS.with(|s| std::mem::take(&mut *s.borrow_mut()));
-        note_oplog_slot_held(
-            slots
-                .into_iter()
-                .map(micros_since)
-                .fold(0, i64::saturating_add),
-        );
-        let pending: Vec<(OplogEntry, Option<Vec<u8>>)> =
-            PENDING_OPLOG.with(|p| std::mem::take(&mut *p.borrow_mut()));
-        self.mint_and_enqueue(pending)
-    }
-
-    /// The mint-and-hand-off half of [`Self::drain_pending_oplog`], callable
-    /// with an explicit entry list — `commit_user_transaction` feeds it the
-    /// entries a transaction's statements buffered on the handle. MUST only be
-    /// called after the entries' data transaction has committed. Returns the
-    /// highest seq minted (0 when nothing was pending), so a self-draining
-    /// emit (noop heartbeat, DDL) can report its entry's real seq like the
-    /// sync path does.
-    fn mint_and_enqueue(&self, pending: Vec<(OplogEntry, Option<Vec<u8>>)>) -> i64 {
-        let Some(async_h) = self.async_oplog.clone() else {
-            return 0;
-        };
-        if pending.is_empty() {
-            return 0;
-        }
-        let n = pending.len();
-        // No in-flight tracking: this mint happens AFTER the data commit and
-        // its visibility is governed by the drainer's `written_seq` watermark.
-        let rw_at = pending.iter().rposition(|(e, _)| has_retryable_stamp(e));
-        let (start, ts) = self.mint_seq_and_ts(n, false);
-        LAST_ENQUEUED_TS.with(|t| t.set(ts.first().copied()));
-        // Minted after the data committed: the entries are the write's.
-        note_logged(start + n as i64);
-        if let Some(i) = rw_at {
-            LAST_RETRYABLE_TS.with(|t| t.set(Some(ts[i])));
-        }
-        let wall_millis = now_millis();
-        let (entries, pre_images): (Vec<OplogEntry>, Vec<Option<Vec<u8>>>) =
-            pending.into_iter().unzip();
-        let slots = pre_image_slots(&entries, &ts, &pre_images);
-        let mut records: Vec<Vec<u8>> = Vec::new();
-        let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(n);
-        for (i, entry) in entries.into_iter().enumerate() {
-            if let (Some(pre), Some(slot)) = (&pre_images[i], slots[i]) {
-                let seq = start + i as i64;
-                match oplog_entry_ui(&entry, seq)
-                    .and_then(|ui| pre_image_record(&ui, slot, wall_millis, pre))
-                {
-                    Ok(record) => records.push(record),
-                    Err(e) => async_oplog_fault(
-                        &async_h.faults,
-                        format!("the pre-image of the entry at seq {seq} was not recorded: {e:?}"),
-                    ),
-                }
-            }
-            let entry = stamp_pre_image_slot(entry, slots[i]);
-            let blob = match entry {
-                OplogEntry::Doc(mut d) => {
-                    d.insert("ts", Bson::Timestamp(ts[i]));
-                    d.insert(
-                        "wall",
-                        Bson::DateTime(bson::DateTime::from_millis(wall_millis)),
-                    );
-                    // A failed oplog encode is a bug (our own docs); keep the seq
-                    // filled with a valid empty document so the drainer's
-                    // contiguity (and thus every later entry) is never stalled.
-                    encode_doc(&d).unwrap_or_else(|e| {
-                        async_oplog_fault(
-                            &async_h.faults,
-                            format!(
-                                "the entry at seq {} could not be encoded and is stored \
-                                 empty: {e:?}",
-                                start + i as i64
-                            ),
-                        );
-                        vec![5, 0, 0, 0, 0]
-                    })
-                }
-                OplogEntry::Raw(buf) => append_ts_wall(buf.into_bytes(), ts[i], wall_millis),
-            };
-            blobs.push(blob);
-        }
-        // Recorded before the drainer can make the entries visible, so a
-        // change stream that reads one finds its pre-image.
-        if let Err(e) = self.write_pre_image_records_alone(&records) {
-            async_oplog_fault(
-                &async_h.faults,
-                format!("the pre-images of the entries from seq {start} were not recorded: {e:?}"),
-            );
-        }
-        // The opportunistic prune cadence lives with the DRAINERS in async
-        // mode (`record_persisted` — the sweep can only doom persisted rows,
-        // so a mint-side trigger lets queue lag escape it); here only the
-        // live-count is maintained.
-        {
-            let mut g = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
-            g.live_count += n as i64;
-        }
-        let bytes: usize = blobs.iter().map(Vec::len).sum::<usize>();
-        let batch = DrainBatch {
-            start_seq: start,
-            shard: oplog_shard_for_batch(start),
-            blobs,
-            bytes,
-        };
-        // Backpressure: reserve this batch's bytes before enqueuing. If the
-        // drainers have fallen behind and too much is already in flight, this blocks
-        // the committing writer until they catch up — bounding memory rather than
-        // letting the queue grow without limit. Reserve BEFORE send so the in-flight
-        // budget always covers what's queued.
-        async_h.backpressure.acquire(bytes);
-        // Route to the drainer that owns this batch's shard (fixed mapping — the
-        // shard is written by exactly one drainer, so drainers never collide).
-        let d = drainer_for_batch(start, async_h.txs.len());
-        if async_h.txs[d].send(DrainMsg::Batch(batch)).is_err() {
-            // Drainer gone (shutdown race): release the reservation we just took
-            // so the budget doesn't leak, and report the dropped entries loudly.
-            async_h.backpressure.release(bytes);
-            async_oplog_fault(
-                &async_h.faults,
-                format!("the drainer is gone; {n} committed entries were not written"),
-            );
-        }
-        start + n as i64 - 1
-    }
-
     /// Block until the oplog tail seq exceeds `after_seq` (a new entry landed),
     /// or `timeout_ms` elapses, or a waiter is woken (`notify_oplog_waiters`).
     /// Returns the current tail seq. One bounded wait — a spurious wake returns
@@ -9770,51 +8768,32 @@ impl Storage {
     /// mutex, so there's no lost-wakeup; the wait releases that mutex so writers
     /// can still mint seqs. Used by the change-stream tailable getMore path.
     pub fn wait_for_oplog(&self, after_seq: i64, timeout_ms: u64) -> i64 {
-        // In async mode the visible tail is what the drainer has DURABLY written
-        // (`written_seq`), not the minted `next_seq` — a tailer must never read
-        // past a not-yet-persisted entry. In sync mode the tail is the
-        // in-flight-window floor (`visible_tail`), NOT the minted
-        // `next_seq - 1`: a mint whose transaction has not committed yet is a
-        // hole below the minted tail, and a tailer that advanced past it
-        // would permanently lose the entry when the transaction commits.
-        let async_mode = self.async_oplog.is_some();
-        let tail = |st: &OplogState| {
-            if async_mode {
-                st.written_seq
-            } else {
-                Self::visible_tail(st)
-            }
-        };
+        // The tail is the in-flight-window floor (`visible_tail`), NOT the
+        // minted `next_seq - 1`: a mint whose transaction has not committed
+        // yet is a hole below the minted tail, and a tailer that advanced
+        // past it would permanently lose the entry when the transaction
+        // commits.
         let guard = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
-        if tail(&guard) > after_seq {
-            return tail(&guard);
+        if Self::visible_tail(&guard) > after_seq {
+            return Self::visible_tail(&guard);
         }
         let (guard, _timed_out) = self
             .oplog_cv
             .wait_timeout(guard, Duration::from_millis(timeout_ms))
             .unwrap();
-        tail(&guard)
+        Self::visible_tail(&guard)
     }
 
-    /// Block until every entry minted so far is durably readable. Async mode:
-    /// the drainer has persisted the minted tail (`written_seq ==
-    /// next_seq - 1`). Sync mode: the in-flight window is empty (every
-    /// minting transaction has committed or rolled back), so the visible tail
-    /// has caught the minted tail. Gives a caller read-after-write oplog
-    /// visibility — a consistency checkpoint, a test, or a drain before
-    /// backup. Must not be called while THIS thread holds an open statement /
-    /// user transaction that emitted entries (it would wait on itself).
+    /// Block until every entry minted so far is durably readable: the
+    /// in-flight window is empty (every minting transaction has committed or
+    /// rolled back), so the visible tail has caught the minted tail. Gives a
+    /// caller read-after-write oplog visibility -- a consistency checkpoint, a
+    /// test, or a drain before backup. Must not be called while THIS thread
+    /// holds an open statement / user transaction that emitted entries (it
+    /// would wait on itself).
     pub fn flush_oplog(&self) {
-        let async_mode = self.async_oplog.is_some();
-        let caught_up = |st: &OplogState| {
-            if async_mode {
-                st.written_seq >= st.next_seq - 1
-            } else {
-                st.in_flight.is_empty()
-            }
-        };
         let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
-        while !caught_up(&st) {
+        while !st.in_flight.is_empty() {
             let (g, _timed_out) = self
                 .oplog_cv
                 .wait_timeout(st, Duration::from_millis(100))
@@ -9869,24 +8848,6 @@ impl Storage {
         self.current_cluster_time()
     }
 
-    /// Persist the recovery meta row (`next_seq` / `last_ts_*`). Best-effort
-    /// optimisation — `load_oplog_meta` reconstructs from the oplog table if the
-    /// row is stale or missing. Mirrors `storage._persist_oplog_meta`.
-    fn persist_oplog_meta(&self, session: &Session, meta: (i64, i64, i64, i64)) -> Result<()> {
-        let (next_seq, last_ts_secs, last_ts_ord, next_nat_seq) = meta;
-        let mut d = Document::new();
-        d.insert("next_seq", next_seq);
-        d.insert("last_ts_secs", last_ts_secs);
-        d.insert("last_ts_ord", last_ts_ord);
-        d.insert("next_nat_seq", next_nat_seq);
-        let blob = encode_doc(&d)?;
-        let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
-        cur.set_key_s("state");
-        cur.set_value_u(&blob);
-        cur.insert()?; // overwrite cursor (default) -> upsert
-        Ok(())
-    }
-
     /// Forward-scan the oplog from `start_seq` (inclusive), up to `limit` entries,
     /// as `(seq, bson_bytes)` pairs. Each public call opens a fresh session, so
     /// the read view always reflects rows committed by other threads' writers.
@@ -9902,11 +8863,7 @@ impl Storage {
         // contains every seq <= the bound.
         let max_seq = {
             let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
-            if self.async_oplog.is_some() {
-                st.written_seq
-            } else {
-                Self::visible_tail(&st)
-            }
+            Self::visible_tail(&st)
         };
         if start_seq > max_seq {
             return Ok(Vec::new());
@@ -9916,66 +8873,32 @@ impl Storage {
         // change-stream getMore path, so serialising it against every write
         // would needlessly throttle throughput.
         let session = self.conn.open_session()?;
-        let mut rows = read_oplog_shards(
-            &session,
-            self.oplog_shards_created.load(Ordering::Relaxed),
-            start_seq,
-            limit,
-        )?;
+        let mut rows = read_oplog_table(&session, &self.oplog_uri, start_seq, limit)?;
         if let Some(cut) = rows.iter().position(|(seq, _)| *seq > max_seq) {
             rows.truncate(cut);
         }
         Ok(rows)
     }
 
-    /// The highest seq a reader may consume or name in a resume position:
-    /// everything at or below it is either committed-and-visible or a
-    /// permanent hole. Sync mode: the in-flight-window floor; async mode: the
-    /// drainer's durable watermark. Change-stream open positions and
-    /// post-batch resume tokens must use THIS, not the minted
+    /// The highest position a reader may consume or name in a resume
+    /// position: everything at or below it is either committed-and-visible or
+    /// a permanent hole -- the in-flight-window floor. Change-stream open
+    /// positions and post-batch resume tokens must use THIS, not the minted
     /// [`Self::oplog_tail_seq`], or they can name a position past an entry
     /// that has not committed yet and lose it.
     pub fn oplog_visible_tail_seq(&self) -> i64 {
         let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
-        if self.async_oplog.is_some() {
-            st.written_seq
-        } else {
-            Self::visible_tail(&st)
-        }
+        Self::visible_tail(&st)
     }
 
-    /// The seq a fresh change stream opens at: every write acknowledged
-    /// BEFORE this call resolves to a seq `<=` the returned value, so a watch
-    /// seeded here never surfaces pre-open events. Sync mode: the visible
-    /// tail as-is (an open transaction's in-flight mint pins it, and that is
-    /// correct — those events are post-open whenever the transaction
-    /// commits; waiting on them here would block opens behind long
-    /// transactions). Async mode: an acked write has *minted* (the writer
-    /// thread mints in `drain_pending_oplog` before replying) but may still
-    /// be queued at the drainer below `written_seq` — seeding at the raw
-    /// watermark surfaces those pre-open events after the open (observed as
-    /// pymongo's `test_kill_cursors` failing async-only). Wait for the
-    /// drainer to reach the minted tail captured at entry; bounded (5s) so a
-    /// dead drainer (already reported loudly) degrades an open instead of
-    /// hanging it.
+    /// The position a fresh change stream opens at: every write acknowledged
+    /// BEFORE this call resolves to a position `<=` the returned value, so a
+    /// watch seeded here never surfaces pre-open events. The visible tail
+    /// as-is: an open transaction's in-flight mint pins it, and that is
+    /// correct -- those events are post-open whenever the transaction commits;
+    /// waiting on them here would block opens behind long transactions.
     pub fn oplog_open_seq(&self) -> i64 {
-        if self.async_oplog.is_none() {
-            return self.oplog_visible_tail_seq();
-        }
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
-        let target = st.next_seq - 1;
-        while st.written_seq < target && std::time::Instant::now() < deadline {
-            let (g, _timed_out) = self
-                .oplog_cv
-                .wait_timeout(st, Duration::from_millis(100))
-                .unwrap_or_else(|e| e.into_inner());
-            st = g;
-        }
-        // `target`, not `written_seq`: entries the drainer landed past the
-        // captured tail while we waited are concurrent-with-open writes, and
-        // a watch should deliver them.
-        target.min(st.written_seq).max(0)
+        self.oplog_visible_tail_seq()
     }
 
     /// Whether `(db, coll)` is the synthetic `local.oplog.rs` view.
@@ -10044,36 +8967,45 @@ impl Storage {
         Ok(out.into_iter().map(|(_, b)| b).collect())
     }
 
+    /// The WiredTiger URI of `local.oplog.rs`'s table (`table:collection-<UUID>`).
+    pub fn oplog_table(&self) -> &str {
+        &self.oplog_uri
+    }
+
+    /// The newest oplog position ever pruned (0: nothing yet, so the oplog
+    /// still reaches the store's first entry).
+    pub fn oplog_pruned_through(&self) -> Result<i64> {
+        let session = self.conn.open_session()?;
+        Ok(read_pruned_marker(&session))
+    }
+
+    /// The position of the newest entry at or before `at` (0 if none): the
+    /// head a backup taken at `at` holds.
+    pub fn oplog_entry_at_or_before(&self, at: i64) -> Result<i64> {
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(&self.oplog_uri, None)?;
+        cur.set_key_q(at);
+        match cur.search_near() {
+            Ok(cmp) => {
+                if cmp > 0 {
+                    // Landed above: the previous row, if any, is at or before.
+                    Ok(if cur.prev()? { cur.get_key_q()? } else { 0 })
+                } else {
+                    Ok(cur.get_key_q()?)
+                }
+            }
+            Err(e) if e.is_not_found() => Ok(0),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// The smallest seq currently present (0 if empty) — the retention floor a
     /// resume token must stay at or above. Mirrors `storage.oplog_floor_seq`.
     pub fn oplog_floor_seq(&self) -> Result<i64> {
         // Lock-free cross-thread read on a fresh MVCC session (see `read_oplog`).
-        // Sharded: the global floor is the smallest first-key across all shards
-        // (+ the legacy table). Each shard's `next()` from the start lands on its
-        // minimum.
         let session = self.conn.open_session()?;
-        let existing = self.oplog_shards_created.load(Ordering::Relaxed);
-        let mut floor: Option<i64> = None;
-        for s in 0..OPLOG_SHARDS {
-            if oplog_table_absent(existing, s as usize) {
-                continue; // existence mask: known-absent shard
-            }
-            let cur = match session.open_cursor(&oplog_shard_name(s), None) {
-                Ok(c) => c,
-                Err(e) if e.is_missing_table() => continue, // lazy shards: absent = empty
-                Err(e) => return Err(e.into()),
-            };
-            if cur.next()? {
-                let seq = cur.get_key_q()?;
-                floor = Some(floor.map_or(seq, |f: i64| f.min(seq)));
-            }
-        }
-        let cur = session.open_cursor(OPLOG_TABLE, None)?;
-        if cur.next()? {
-            let seq = cur.get_key_q()?;
-            floor = Some(floor.map_or(seq, |f: i64| f.min(seq)));
-        }
-        Ok(floor.unwrap_or(0))
+        let cur = session.open_cursor(&self.oplog_uri, None)?;
+        Ok(if cur.next()? { cur.get_key_q()? } else { 0 })
     }
 
     /// The highest seq emitted (`next_seq - 1`), 0 if none. Mirrors
@@ -10308,7 +9240,23 @@ impl Storage {
         let session = self.conn.open_session()?;
         match mdb_catalog::read_placement(&session, db, coll)? {
             Some(p) => mdb_catalog::read_entry(&session, p.catalog_id),
-            None => Ok(None),
+            // A namespace the catalog keeps without a placement
+            // (`local.oplog.rs`).
+            None => mdb_catalog::entry_of_ns(&session, &format!("{db}.{coll}")),
+        }
+    }
+
+    /// WiredTiger's own configuration string of the table at `uri`, from its
+    /// metadata. For tests.
+    #[doc(hidden)]
+    pub fn table_file_config(&self, uri: &str) -> Result<Option<String>> {
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor("metadata:", None)?;
+        cur.set_key_s(&format!("{}.wt", uri.replacen("table:", "file:", 1)));
+        match cur.search() {
+            Ok(()) => Ok(Some(cur.get_value_s()?)),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -10949,7 +9897,7 @@ impl Storage {
     /// `set_oplog_archive_dir(archive_dir)` and call periodically (no background
     /// scheduler). Mirrors `storage.archive_base_snapshot`.
     pub fn archive_base_snapshot(&self, archive_dir: &str) -> Result<ArchiveInfo> {
-        let head = self.oplog_tail_seq();
+        let head = self.oplog_entry_at_or_before(self.oplog_visible_tail_seq())?;
         std::fs::create_dir_all(archive_dir)
             .map_err(|e| archive_err("archive_base_snapshot", e))?;
         let out = std::path::Path::new(archive_dir).join(pitr_archive::base_name(head));
@@ -10961,42 +9909,24 @@ impl Storage {
     /// reads — a row that vanished concurrently is skipped.
     fn archive_doomed_oplog(
         session: &Session,
-        existing: u32,
+        table: &str,
         archive_dir: &str,
         doomed_sorted: &[i64],
+        prev: i64,
     ) -> Result<()> {
-        // Sharded: routing is per-batch, so a doomed seq's table isn't a function
-        // of the seq — probe every table (shards + legacy) for the row. Lazy
-        // cursor cache; `search()` (a read) reports not-found honestly regardless
-        // of overwrite mode.
-        let tables = oplog_all_tables();
-        // Pre-open one cursor per table; a known-absent (existence mask) or
-        // lazily-absent shard parks a `None` (reads as empty) — index stays
-        // aligned with `tables`.
-        let mut op_curs: Vec<Option<Cursor>> = Vec::with_capacity(tables.len());
-        for (i, name) in tables.iter().enumerate() {
-            if oplog_table_absent(existing, i) {
-                op_curs.push(None);
-                continue;
-            }
-            op_curs.push(match session.open_cursor(name, None) {
-                Ok(c) => Some(c),
-                Err(e) if e.is_missing_table() => None,
-                Err(e) => return Err(e.into()),
-            });
-        }
+        let op_cur = session.open_cursor(table, None)?;
+        // `search()` (a read) reports not-found honestly regardless of
+        // overwrite mode.
         let read_at = |s: i64| -> Result<Option<Document>> {
-            for op_cur in op_curs.iter().flatten() {
-                op_cur.reset()?;
-                op_cur.set_key_q(s);
-                if op_cur.search().is_ok() {
-                    let blob = op_cur.get_value_u()?;
-                    return if blob.is_empty() {
-                        Ok(None)
-                    } else {
-                        Ok(Some(decode_doc(&blob)?))
-                    };
-                }
+            op_cur.reset()?;
+            op_cur.set_key_q(s);
+            if op_cur.search().is_ok() {
+                let blob = op_cur.get_value_u()?;
+                return if blob.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(decode_doc(&blob)?))
+                };
             }
             Ok(None)
         };
@@ -11009,7 +9939,7 @@ impl Storage {
             };
             rows.push((seq, entry, pre));
         }
-        pitr_archive::write_segment(archive_dir, &rows)?;
+        pitr_archive::write_segment(archive_dir, &rows, prev)?;
         Ok(())
     }
 
@@ -11020,7 +9950,7 @@ impl Storage {
     /// oplog reads it uses are lock-free.
     fn pitr_manifest(&self) -> Result<serde_json::Value> {
         let floor = self.oplog_floor_seq()?;
-        let head = self.oplog_tail_seq();
+        let head = self.oplog_entry_at_or_before(self.oplog_visible_tail_seq())?;
         let row_of = |seq: i64| -> Option<Document> {
             if seq <= 0 {
                 return None;
@@ -11048,7 +9978,8 @@ impl Storage {
             "oplogEnabled": self.enable_oplog,
             "oplogFloorSeq": floor,
             "oplogHeadSeq": head,
-            "genesisIntact": floor == 1,
+            "genesisIntact": self.oplog_pruned_through()? == 0,
+            "oplogPrunedThrough": self.oplog_pruned_through()?,
             "oplogFloorTs": ts_of(&floor_row),
             "oplogHeadTs": ts_of(&head_row),
             "oplogFloorWall": wall_of(&floor_row),
@@ -11154,6 +10085,14 @@ impl Storage {
     /// The collection's 16-byte UUID (minting + persisting one on first use).
     /// Mirrors `storage.collection_uuid`.
     pub fn collection_uuid(&self, db: &str, coll: &str) -> Result<Vec<u8>> {
+        // `local.oplog.rs` is never a registry collection: its UUID is the one
+        // the store recorded for it (and its `_mdb_catalog` row carries).
+        if self.is_oplog_rs(db, coll) {
+            let session = self.conn.open_session()?;
+            return read_oplog_ident(&session)?
+                .map(|(_, uuid)| uuid)
+                .ok_or_else(|| StorageError::Internal("the store records no oplog uuid".into()));
+        }
         // Planner writes made here are released once they are visible.
         let _planner = PlannerScope::new();
         // Fast path: already minted — plain lock-free read (this runs on
@@ -11419,18 +10358,8 @@ impl Storage {
         }
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
-        // Restored rows keep their original seq identity. Route the whole import
-        // to one shard (by its first seq) — any shard is fine since the merge-read
-        // and all-table point-ops find rows regardless of placement; a single
-        // contiguous append keeps the restore fast (per-seq routing would scatter).
-        // Lazy shards: created on first touch only (bitmask).
-        let op_shard = ensure_oplog_shard(
-            &self.oplog_shards_created,
-            &session,
-            rows[0].0,
-            self.oplog_nonlogged,
-        )?;
-        let cur = session.open_cursor(&op_shard, None)?;
+        // Restored rows keep their original position: the entry's own `ts`.
+        let cur = session.open_cursor(&self.oplog_uri, None)?;
         // The pre-images go to `config.system.preimages` under the `_id`s
         // the rows name, before the rows are visible.
         self.write_pre_image_records_alone(&Self::pre_image_records_of(rows, pre_images)?)?;
@@ -11474,20 +10403,6 @@ impl Storage {
     /// the wall clock). Returns the number of rows pruned. No background sweeper —
     /// the caller drives it. Mirrors `storage.prune_oplog` / `_prune_oplog_locked`.
     pub fn prune_oplog(&self, now: Option<i64>) -> Result<usize> {
-        // Async oplog: the sweep considers only PERSISTED rows, so an explicit
-        // prune racing the drainer dooms a timing-dependent subset of the
-        // acknowledged writes (observed as `v2_restore_reaches_before_pruned_floor`
-        // flaking on the async CI lane: cap-excess rows still queued at the
-        // drainer escaped the sweep, shifting the pruned count and the
-        // resulting floor). Drain first so an explicit prune — an admin op,
-        // never on the write path — deterministically covers every
-        // acknowledged write. The drainers' own opportunistic cadence calls
-        // the sweep directly, not this entry point, so they never self-wait
-        // here; async entries mint post-commit, so a user-transaction thread
-        // cannot self-wait either.
-        if self.async_oplog.is_some() {
-            self.flush_oplog();
-        }
         self.prune_oplog_inner(now)
     }
 
@@ -11512,20 +10427,12 @@ impl Storage {
 /// younger too.
 fn keep_younger_than(
     session: &Session,
-    existing: u32,
-    doomed: &mut Vec<(i64, usize)>,
+    table: &str,
+    doomed: &mut Vec<i64>,
     floor: i64,
 ) -> Result<()> {
-    let tables = oplog_all_tables();
-    let mut curs: Vec<Option<Cursor>> = tables.iter().map(|_| None).collect();
-    for (at, (seq, tbl)) in doomed.iter().enumerate() {
-        if oplog_table_absent(existing, *tbl) {
-            continue;
-        }
-        if curs[*tbl].is_none() {
-            curs[*tbl] = Some(session.open_cursor(&tables[*tbl], None)?);
-        }
-        let cur = curs[*tbl].as_ref().expect("opened above");
+    let cur = session.open_cursor(table, None)?;
+    for (at, seq) in doomed.iter().enumerate() {
         cur.reset()?;
         cur.set_key_q(*seq);
         if cur.search().is_err() {
@@ -11573,7 +10480,6 @@ fn prune_pre_images(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
 
 /// The oplog half of [`prune_oplog_sweep`]. Caller holds `prune_lock`.
 fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
-    let existing = ctx.shards_created.load(Ordering::Relaxed);
     let session = ctx.conn.open_session()?;
     let when = now.unwrap_or_else(now_secs);
     let cutoff = when - ctx.retention_seconds.load(Ordering::Relaxed);
@@ -11586,7 +10492,6 @@ fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     // prefix on top of that. A fresh MVCC session reads consistently without
     // blocking writers; prune is best-effort, so a slightly stale count/view is
     // fine — writers only append *higher* seqs, never touch the old rows here.
-    let tables = oplog_all_tables();
     let live_count = ctx
         .oplog
         .lock()
@@ -11599,9 +10504,9 @@ fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     // in-window, nothing is doomed. One bounded merge read of a single row
     // replaces the whole-oplog walk in the common steady state.
     if excess == 0 {
-        match read_oplog_shards_tagged(&session, existing, 0, 1)?.first() {
+        match read_oplog_table(&session, &ctx.oplog_uri, 0, 1)?.first() {
             None => return Ok(0),
-            Some((_, _, blob)) => {
+            Some((_, blob)) => {
                 if matches!(peek_entry_ts(blob), Some(ts) if i64::from(ts.time) >= cutoff) {
                     return Ok(0);
                 }
@@ -11632,7 +10537,7 @@ fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     };
     let doomed = scan_doomed_oplog_keys(
         &session,
-        existing,
+        &ctx.oplog_uri,
         excess,
         cutoff,
         RETENTION_SCAN_BATCH,
@@ -11648,12 +10553,12 @@ fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     let mut doomed = doomed;
     let floor = ctx.min_retention_seconds.load(Ordering::Relaxed);
     if floor > 0 {
-        keep_younger_than(&session, existing, &mut doomed, when - floor)?;
+        keep_younger_than(&session, &ctx.oplog_uri, &mut doomed, when - floor)?;
     }
     if doomed.is_empty() {
         return Ok(0);
     }
-    let doomed_seqs: Vec<i64> = doomed.iter().map(|(s, _)| *s).collect();
+    let doomed_seqs: &[i64] = &doomed;
 
     // PITR v2: archive the soon-to-be-dropped rows to a durable segment
     // *before* deleting them, so recovery can still reach a time before the
@@ -11664,7 +10569,10 @@ fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     if let Some(archive_dir) = archive_dir {
-        Storage::archive_doomed_oplog(&session, existing, &archive_dir, &doomed_seqs)?;
+        // The newest entry before this segment's first: the position the
+        // segment chains onto (0: the oplog's own start).
+        let prev = read_pruned_marker(&session);
+        Storage::archive_doomed_oplog(&session, &ctx.oplog_uri, &archive_dir, doomed_seqs, prev)?;
     }
 
     // Phase 2: the deletes. Sweep exclusivity is already held
@@ -11683,12 +10591,12 @@ fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     // 2026-10-07 (batch 70). Durability is unchanged -- a crash mid-sweep
     // leaves whole batches undone, and those rows are doomed again by the
     // next sweep; the archive above is written before any batch commits.
-    let mut del_curs: Vec<Option<Cursor>> = tables.iter().map(|_| None).collect();
+    let op_del = session.open_cursor(&ctx.oplog_uri, None)?;
     // The time of the newest doomed entry, for the pre-images of the
     // entries going (`prune_pre_images`): read before it goes.
-    let doomed_through = match doomed.iter().max_by_key(|(seq, _)| *seq) {
-        Some((seq, tbl)) => {
-            let cur = session.open_cursor(&tables[*tbl], None)?;
+    let doomed_through = match doomed.last() {
+        Some(seq) => {
+            let cur = session.open_cursor(&ctx.oplog_uri, None)?;
             cur.set_key_q(*seq);
             match cur.search() {
                 Ok(()) => peek_entry_ts(&cur.get_value_u()?).map_or(0, ts_u64),
@@ -11702,11 +10610,7 @@ fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     for batch in doomed.chunks(PRUNE_DELETE_BATCH) {
         session.begin_transaction(None)?;
         let removed = (|| -> Result<()> {
-            for (seq, tbl) in batch {
-                if del_curs[*tbl].is_none() {
-                    del_curs[*tbl] = Some(session.open_cursor(&tables[*tbl], None)?);
-                }
-                let op_del = del_curs[*tbl].as_ref().unwrap();
+            for seq in batch {
                 op_del.reset()?;
                 op_del.set_key_q(*seq);
                 match op_del.remove() {
@@ -11714,6 +10618,10 @@ fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
                     Err(e) if e.is_not_found() => {}
                     Err(e) => return Err(e.into()),
                 }
+            }
+            // The newest position pruned moves with the rows that go.
+            if let Some(last) = batch.last() {
+                write_pruned_marker(&session, *last)?;
             }
             Ok(())
         })();
@@ -11870,18 +10778,13 @@ impl Storage {
     /// committed row qualifies. Lock-free cross-thread read on a fresh MVCC
     /// session (see `read_oplog`).
     fn find_seq_for_ts_scan(&self, ts: bson::Timestamp) -> Result<i64> {
+        // A position is a timestamp: the first entry at or after `ts` is the
+        // first row at or after `ts` as a key.
         let session = self.conn.open_session()?;
-        for (seq, blob) in read_oplog_shards(
-            &session,
-            self.oplog_shards_created.load(Ordering::Relaxed),
-            0,
-            usize::MAX,
-        )? {
-            if let Some(e) = peek_entry_ts(&blob) {
-                if e.time > ts.time || (e.time == ts.time && e.increment >= ts.increment) {
-                    return Ok(seq);
-                }
-            }
+        // (A position is a timestamp as `i64`; the largest timestamps clamp.)
+        let at = ts_u64(ts).min(i64::MAX as u64) as i64;
+        if let Some((seq, _)) = read_oplog_table(&session, &self.oplog_uri, at, 1)?.first() {
+            return Ok(*seq);
         }
         Ok(self
             .oplog
@@ -12261,7 +11164,7 @@ impl Storage {
             prev: IN_ASYNC_STMT.with(|f| f.get()),
             // A store logging transactions at their commit holds its
             // entries to the commit too.
-            active: self.async_oplog.is_some() || self.oplog_at_commit,
+            active: self.oplog_at_commit,
         };
         if async_scope.active {
             IN_ASYNC_STMT.with(|f| f.set(true));
@@ -12353,11 +11256,8 @@ impl Storage {
                 // Every collection it wrote a document row of -- unless it
                 // also wrote something no row records (the registry, an
                 // index), when it counts as having written every one.
-                let written = (!wrote_registry
-                    && !handle.unattributed
-                    && self.enable_oplog
-                    && self.async_oplog.is_none())
-                .then(|| merge_written(&handle.written_ns, &held.collections));
+                let written = (!wrote_registry && !handle.unattributed && self.enable_oplog)
+                    .then(|| merge_written(&handle.written_ns, &held.collections));
                 (
                     wrote || handle.has_written() || !handle.pending_async.is_empty(),
                     written,
@@ -12380,13 +11280,7 @@ impl Storage {
             let began = handle.began;
             handle.began = false;
             if began {
-                // mongod reserves a transaction's slots as it commits: the
-                // asynchronous oplog mints them only after, so the commit is
-                // timed from here (RM-379).
-                let slots_reserved = (self.async_oplog.is_some()
-                    && !handle.pending_async.is_empty())
-                .then(Instant::now);
-                if wrote && self.async_oplog.is_none() && !handle.pending_async.is_empty() {
+                if wrote && !handle.pending_async.is_empty() {
                     // A timestamped store's transaction held its entries
                     // (`emit_oplog_entries`): they are minted now, together,
                     // and written in the transaction, so its data commits at
@@ -12407,7 +11301,7 @@ impl Storage {
                 }
                 // The time of its first entry, for its `config.transactions`
                 // row (`take_last_commit_ts`).
-                let first_ts = if wrote && self.async_oplog.is_none() {
+                let first_ts = if wrote {
                     let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
                     handle
                         .minted_ranges
@@ -12418,7 +11312,7 @@ impl Storage {
                     None
                 };
                 let mut _reserved: Option<ReleaseStamp<'_>> = None;
-                if wrote && self.async_oplog.is_none() {
+                if wrote {
                     if let Some((ts, reserved)) = self.commit_stamp(&handle.minted_ranges) {
                         if reserved {
                             // Released after the commit, whatever its outcome.
@@ -12484,7 +11378,7 @@ impl Storage {
                         .collections
                         .clone();
                     std::mem::take(&mut handle.catalog_docs)
-                        .log_committed(self.enable_oplog && self.async_oplog.is_none(), &rows);
+                        .log_committed(self.enable_oplog, &rows);
                 }
                 if let Some(end) = handle.minted_ranges.iter().map(|r| r.1).max() {
                     note_logged(end);
@@ -12494,20 +11388,6 @@ impl Storage {
                 // visible tail and waking tailable change-stream waiters. The
                 // time they held their slots is the committing operation's.
                 note_oplog_slot_held(handle.deregister_minted());
-                // Async mode: the transaction's buffered entries mint + reach
-                // the drainer only NOW, after the data commit — the user-txn
-                // analogue of `with_statement_txn`'s post-commit drain. An
-                // acked commitTransaction therefore has its entries minted
-                // before the reply, which `oplog_open_seq` relies on.
-                if let Some(t) = slots_reserved {
-                    note_oplog_slot_held(micros_since(t));
-                }
-                let pending = std::mem::take(&mut handle.pending_async);
-                if !pending.is_empty() {
-                    self.mint_and_enqueue(pending);
-                    // In async mode its entries are minted only now.
-                    LAST_COMMIT_TS.with(|t| t.set(LAST_ENQUEUED_TS.with(Cell::take)));
-                }
             }
             // The transaction is over and the session holds nothing: park it
             // for the next one rather than closing it. Only reached on a
@@ -12685,7 +11565,7 @@ impl Storage {
         keep_locks: usize,
         unchanged_since: Option<Option<u64>>,
     ) -> Result<bool> {
-        if self.async_oplog.is_some() || !self.enable_oplog || handle.session.is_none() {
+        if !self.enable_oplog || handle.session.is_none() {
             return Ok(false);
         }
         // A write the oplog did not record cannot be replayed -- except a
@@ -12903,9 +11783,6 @@ impl Storage {
     /// statement is running on this thread (counting what the statement has
     /// written so far); `None` outside one, or in async oplog mode.
     pub fn active_write_set_len(&self) -> Option<usize> {
-        if self.async_oplog.is_some() {
-            return None;
-        }
         let hp = Self::active_handle()?;
         // SAFETY: see `active_handle`; a shared read.
         let handle = unsafe { &*hp };
@@ -12955,9 +11832,6 @@ impl Storage {
         keep_locks: usize,
         require_unchanged: bool,
     ) -> Result<bool> {
-        if self.async_oplog.is_some() {
-            return Ok(false);
-        }
         let Some(hp) = Self::active_handle() else {
             return Ok(false);
         };
@@ -13079,48 +11953,38 @@ impl Storage {
     /// own session (the rows are uncommitted, so no other session can see
     /// them). Async oplog mode buffers them on the handle instead.
     fn transaction_write_set(&self, handle: &mut UserTransactionHandle) -> Result<Vec<Vec<u8>>> {
-        if self.async_oplog.is_some() {
-            let mut out = Vec::with_capacity(handle.pending_async.len());
-            for (entry, _pre) in &handle.pending_async {
-                out.push(match entry {
-                    OplogEntry::Doc(d) => encode_doc(d)?,
-                    OplogEntry::Raw(buf) => buf.as_bytes().to_vec(),
-                });
-            }
-            return Ok(out);
-        }
         let Some(session) = handle.session.as_ref() else {
             return Err(StorageError::Internal("transaction already closed".into()));
         };
         let mut ranges = handle.minted_ranges.clone();
         ranges.sort_unstable();
         let mut out = Vec::new();
-        for (start, end) in ranges {
-            // Same routing as the emit: a batch lives whole in the shard its
-            // first seq selects.
-            let shard = oplog_shard_name(start.rem_euclid(oplog_route_shards()));
-            let cur = session.open_cursor(&shard, None)?;
-            for seq in start..end {
-                cur.reset()?;
-                cur.set_key_q(seq);
-                // Every seq of a minted range was written by the emit that
-                // minted it, so a miss is corruption, not a hole.
-                cur.search().map_err(|e| {
-                    StorageError::Internal(format!(
-                        "prepared transaction: oplog seq {seq} missing from {shard}: {e}"
-                    ))
-                })?;
-                out.push(cur.get_value_u()?);
+        if !ranges.is_empty() {
+            let cur = session.open_cursor(&self.oplog_uri, None)?;
+            for (start, end) in ranges {
+                for seq in start..end {
+                    cur.reset()?;
+                    cur.set_key_q(seq);
+                    // Every position of a minted range was written by the emit
+                    // that minted it, so a miss is corruption, not a hole.
+                    cur.search().map_err(|e| {
+                        StorageError::Internal(format!(
+                            "prepared transaction: oplog position {seq} missing: {e}"
+                        ))
+                    })?;
+                    out.push(cur.get_value_u()?);
+                }
             }
         }
+        // A store that logs a transaction at its commit holds its entries on
+        // the handle until then.
+        for (entry, _pre) in &handle.pending_async {
+            out.push(match entry {
+                OplogEntry::Doc(d) => encode_doc(d)?,
+                OplogEntry::Raw(buf) => buf.as_bytes().to_vec(),
+            });
+        }
         Ok(out)
-    }
-
-    /// Whether this store runs the asynchronous (drainer) oplog, where a
-    /// transaction's write set lives on its handle rather than in readable
-    /// oplog rows.
-    pub fn oplog_async(&self) -> bool {
-        self.async_oplog.is_some()
     }
 
     /// A user transaction's own versions of the rows it wrote in `(db, coll)`,
@@ -13148,7 +12012,7 @@ impl Storage {
         if handle.session.is_none() {
             return Err(StorageError::Internal("transaction already closed".into()));
         }
-        if self.async_oplog.is_some() || !self.enable_oplog {
+        if !self.enable_oplog {
             return Ok(None);
         }
         // Rows locked by an unchanged rewrite carry no oplog entry, but they
@@ -13268,9 +12132,6 @@ impl Storage {
     /// transaction committed (a crash landed between that commit and the
     /// row's removal).
     fn prepared_already_committed(&self, row: &Document) -> Result<bool> {
-        if self.async_oplog.is_some() {
-            return Ok(false);
-        }
         let Ok(minted) = row.get_array("minted") else {
             return Ok(false);
         };
@@ -13278,8 +12139,7 @@ impl Storage {
             return Ok(false);
         };
         let session = self.conn.open_session()?;
-        let shard = oplog_shard_name(start.rem_euclid(oplog_route_shards()));
-        let cur = match session.open_cursor(&shard, None) {
+        let cur = match session.open_cursor(&self.oplog_uri, None) {
             Ok(c) => c,
             Err(e) if e.is_not_found() => return Ok(false),
             Err(e) => return Err(e.into()),
@@ -15815,6 +14675,9 @@ impl Storage {
         coll: &str,
         after: Option<i64>,
     ) -> Result<Vec<(i64, Vec<u8>)>> {
+        if self.is_oplog_rs(db, coll) {
+            return self.scan_oplog_rs_after(after);
+        }
         // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         let rows = self
@@ -15827,6 +14690,29 @@ impl Storage {
         })
     }
 
+    /// The entries of `local.oplog.rs` after position `after` (a RecordId: the
+    /// `ts` of an entry, as `i64`), as the view shows them, each with the
+    /// position a cursor resumes after it from: the last row it covers. Only
+    /// what no write in flight can still precede (the visible tail).
+    fn scan_oplog_rs_after(&self, after: Option<i64>) -> Result<Vec<(i64, Vec<u8>)>> {
+        let rows = self.read_oplog(after.map_or(1, |a| a + 1), usize::MAX)?;
+        let mut decoded = Vec::with_capacity(rows.len());
+        for (_seq, blob) in &rows {
+            decoded.push(decode_doc(blob)?);
+        }
+        let last_row = rows.last().map_or(0, |r| r.0);
+        let view = oplog_view_entries(decoded);
+        let mut out = Vec::with_capacity(view.len());
+        for (i, d) in view.iter().enumerate() {
+            let resume = match view.get(i + 1).and_then(|n| n.get_timestamp("ts").ok()) {
+                Some(next) => ts_u64(next) as i64 - 1,
+                None => last_row,
+            };
+            out.push((resume, encode_doc(d)?));
+        }
+        Ok(out)
+    }
+
     /// The smallest **RecordId** currently in a collection, or `None` if empty. A
     /// tailable cursor uses this to detect capped rollover: capped eviction is
     /// FIFO by RecordId (`enforce_capped_bounds`), so if the min RecordId now
@@ -15835,6 +14721,9 @@ impl Storage {
     /// `id_key`-based `collection_min_id_key` mis-detects this for non-monotonic
     /// `_id`s, since the evicted doc need not hold the min `id_key`.)
     pub fn collection_min_recordid(&self, db: &str, coll: &str) -> Result<Option<i64>> {
+        if self.is_oplog_rs(db, coll) {
+            return Ok(Some(self.oplog_floor_seq()?).filter(|f| *f > 0));
+        }
         // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         // `scan_docs` yields RecordId-ascending, so the first row is the minimum.
@@ -15857,6 +14746,13 @@ impl Storage {
     /// no `_id` or not stored under it. `showRecordId` and
     /// `{$meta: "recordId"}` report it.
     pub fn record_ids_of(&self, db: &str, coll: &str, docs: &[&[u8]]) -> Result<Vec<Option<i64>>> {
+        if self.is_oplog_rs(db, coll) {
+            // An oplog entry's RecordId is its timestamp.
+            return Ok(docs
+                .iter()
+                .map(|bytes| peek_entry_ts(bytes).map(|ts| ts_u64(ts) as i64))
+                .collect());
+        }
         let session = self.op_session()?;
         let mut out = Vec::with_capacity(docs.len());
         for bytes in docs {
@@ -15873,6 +14769,11 @@ impl Storage {
     }
 
     pub fn collection_max_recordid(&self, db: &str, coll: &str) -> Result<Option<i64>> {
+        if self.is_oplog_rs(db, coll) {
+            // The newest entry a reader may see.
+            let at = self.oplog_entry_at_or_before(self.oplog_visible_tail_seq())?;
+            return Ok(Some(at).filter(|a| *a > 0));
+        }
         // Lock-free read (see the `lock` field's invariants).
         let session = self.conn.open_session()?;
         // `scan_docs` yields RecordId-ascending, so the last row is the maximum.
@@ -18940,23 +17841,12 @@ impl Storage {
         }
         check.insert("listed", listed);
         check.insert("options", options);
-        // The checkpoint's last operation: the highest seq across the oplog
-        // shards (and the legacy unsharded table) it holds.
+        // The checkpoint's last operation: the newest entry the oplog holds.
         let mut last: Option<(i64, Vec<u8>)> = None;
-        let tables = (0..OPLOG_SHARDS)
-            .map(oplog_shard_name)
-            .chain(std::iter::once(OPLOG_TABLE.to_string()));
-        for table in tables {
-            let cur = match session.open_cursor(&table, None) {
-                Ok(c) => c,
-                Err(e) if e.is_missing_table() => continue,
-                Err(e) => return Err(e.into()),
-            };
+        {
+            let cur = session.open_cursor(&self.oplog_uri, None)?;
             if cur.prev()? {
-                let seq = cur.get_key_q()?;
-                if last.as_ref().is_none_or(|(s, _)| seq > *s) {
-                    last = Some((seq, cur.get_value_u()?));
-                }
+                last = Some((cur.get_key_q()?, cur.get_value_u()?));
             }
         }
         if let Some((_, blob)) = last {
@@ -24893,6 +23783,11 @@ fn reconcile_idents(session: &Session) -> Result<()> {
             idents
         })
         .collect();
+    let mut placed = placed;
+    // `local.oplog.rs` is kept by the catalog alone: no registry row, no
+    // placement.
+    placed.extend(mdb_catalog::ident_of_ns(session, OPLOG_NS)?);
+    placed.extend(read_oplog_ident(session)?.map(|(ident, _)| ident));
     let mut orphans = Vec::new();
     {
         let cur = session.open_cursor("metadata:", None)?;
@@ -26862,7 +25757,10 @@ mod tests {
     /// on every platform (tasks/mongod-storage-model-plan.md).
     #[test]
     fn value_heavy_tables_use_mongods_snappy() {
-        for cfg in [mdb_catalog::COLLECTION_TABLE_CFG, QU_COMPRESSED_CFG] {
+        for cfg in [
+            mdb_catalog::COLLECTION_TABLE_CFG,
+            oplog_table_cfg(false).as_str(),
+        ] {
             assert!(cfg.contains("block_compressor=snappy"), "{cfg}");
         }
     }
@@ -27052,35 +25950,6 @@ mod tests {
             Err(other) => panic!("expected Internal fatal, got: {other:?}"),
             Ok(_) => panic!("expected open to be refused for an SSu doc shard"),
         }
-    }
-
-    /// A fault the async oplog recorded -- an entry it could not keep -- is
-    /// what `close` answers, not a line on stderr (RM-193).
-    #[test]
-    fn close_reports_an_async_oplog_fault() {
-        let dir = tempfile::tempdir().unwrap();
-        let opts = StorageOptions {
-            durable: Some(true),
-            oplog_async: Some(true),
-            // The asynchronous oplog needs logged data tables: a store whose
-            // writes carry timestamps keeps the synchronous one.
-            data_nonlogged: Some(false),
-            ..StorageOptions::default()
-        };
-        let st = Storage::open_with_options(dir.path().to_str().unwrap(), &opts).unwrap();
-        st.insert(
-            "app",
-            "c",
-            vec![encode_doc(&doc! {"_id": 1i32}).unwrap()],
-            true,
-        )
-        .unwrap();
-        let faults = st.async_oplog.as_ref().unwrap().faults.clone();
-        async_oplog_fault(&faults, "an injected fault".to_string());
-        let err = st.close().unwrap_err();
-        assert!(format!("{err}").contains("an injected fault"), "{err}");
-        // Reported once: the store is closed.
-        st.close().unwrap();
     }
 
     /// `close` answers once and is then a no-op (the `Drop` after it does
@@ -28393,7 +27262,8 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(r.oplog_tail_seq(), tail + 1); // a fresh write continues the timeline
+        // A fresh write continues the timeline, after everything carried.
+        assert!(r.oplog_tail_seq() > tail);
         drop(r);
 
         // ... while the default (no carry) leaves the restored oplog empty.
@@ -28443,15 +27313,19 @@ mod tests {
             let mut s = Storage::open(src.to_str().unwrap()).unwrap();
             s.set_oplog_archive_dir(Some(archive_s.clone()));
             s.set_oplog_max_entries(2);
-            // The first insert also records the collection's creation (seq 1).
+            // The first insert also records the collection's creation.
             s.insert("app", "c", vec![enc(1), enc(2)], true).unwrap();
-            s.archive_base_snapshot(&archive_s).unwrap(); // base head = seq 3
+            s.archive_base_snapshot(&archive_s).unwrap(); // base head = the third entry
             s.insert("app", "c", vec![enc(3)], true).unwrap();
             s.insert("app", "c", vec![enc(4)], true).unwrap();
             s.insert("app", "c", vec![enc(5)], true).unwrap();
-            let pruned = s.prune_oplog(None).unwrap(); // cap=2 -> archive seq 1..4
+            let all: Vec<i64> = s.read_oplog(1, 100).unwrap().iter().map(|r| r.0).collect();
+            assert_eq!(all.len(), 6);
+            let pruned = s.prune_oplog(None).unwrap(); // cap=2 -> archive the first four
             assert!(pruned >= 4, "pruned {pruned}");
-            assert_eq!(s.oplog_floor_seq().unwrap(), 5); // live oplog no longer reaches seq 4
+            // The live oplog no longer reaches the fourth entry.
+            assert_eq!(s.oplog_floor_seq().unwrap(), all[4]);
+            assert_eq!(s.oplog_pruned_through().unwrap(), all[3]);
         }
 
         // v1 can't restore the src (floor past genesis); v2 stitches base + segments.
@@ -28532,7 +27406,7 @@ mod tests {
                 Some(doc! {"_id": 2i32, "old": true}),
             ),
         ];
-        pitr_archive::write_segment(archive, &rows).unwrap();
+        pitr_archive::write_segment(archive, &rows, 0).unwrap();
         let got = pitr_archive::iter_archived_oplog(archive).unwrap();
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].0, 1);

@@ -16,9 +16,6 @@ use bson::{Bson, Document, Timestamp};
 
 use crate::{Storage, StorageError};
 
-/// Genesis is seq 1: an empty-base replay is exact only when the source oplog
-/// still reaches it (hasn't been pruned from the front). Mirrors Python `_GENESIS_SEQ`.
-const GENESIS_SEQ: i64 = 1;
 const READ_CHUNK: usize = 2000;
 
 type Result<T> = std::result::Result<T, StorageError>;
@@ -384,10 +381,13 @@ pub fn restore_to_timestamp(
             "source has no oplog to replay (was it created with enable_oplog?)".into(),
         ));
     }
-    if floor > GENESIS_SEQ {
+    // An empty-base replay is exact only when the source oplog still reaches
+    // its first entry (nothing was pruned from the front).
+    let pruned = source.oplog_pruned_through()?;
+    if pruned > 0 {
         return Err(StorageError::Internal(format!(
-            "source oplog floor is seq {floor}, past genesis (seq {GENESIS_SEQ}): it has been \
-             pruned from the front, so an empty-base replay would be partial"
+            "source oplog floor is position {floor}, past genesis (entries up to {pruned} were \
+             pruned): it has been pruned from the front, so an empty-base replay would be partial"
         )));
     }
     std::fs::create_dir_all(target_dir)

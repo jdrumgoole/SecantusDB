@@ -59,9 +59,9 @@ STORAGE_ENGINE_STEPS = (
 )
 
 
-#: The environment of CI's "Cargo test (secantus-storage, async-oplog lane)"
+#: The environment of CI's "Cargo test (secantus-storage, non-logged oplog lane)"
 #: step in `.github/workflows/test.yml`.
-ASYNC_OPLOG_ENV = {"SECANTUS_OPLOG_ASYNC": "1", "SECANTUS_OPLOG_NONLOGGED": "1"}
+NONLOGGED_OPLOG_ENV = {"SECANTUS_OPLOG_NONLOGGED": "1"}
 
 
 def rust_env(root: Path) -> dict[str, str]:
@@ -310,18 +310,17 @@ def main() -> int:
     if storage:
         g.step("storage-test", ["./inv", "rust-storage-test"])
         # CI's rust-storage job runs the storage crate's tests a second time
-        # on the asynchronous oplog (2026-11-07: RM-361's slot timing passed
-        # this gate and failed only there).
+        # with a non-logged oplog table.
         g.step(
-            "storage-async-oplog",
+            "storage-nonlogged-oplog",
             ["cargo", "test"],
             cwd=root / "crates/secantus-storage",
-            env={**rust_env(root), **ASYNC_OPLOG_ENV},
+            env={**rust_env(root), **NONLOGGED_OPLOG_ENV},
         )
     else:
         why = f"nothing under {', '.join(STORAGE_PATHS)} changed since {base}"
         g.skip("storage-test", why)
-        g.skip("storage-async-oplog", why)
+        g.skip("storage-nonlogged-oplog", why)
     g.step("adapter-test", ["./inv", "rust-adapter-test"])
     if not args.no_build:
         # What the suites below launch, from HEAD; tools/provenance.py aborts

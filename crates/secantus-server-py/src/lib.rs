@@ -131,9 +131,9 @@ impl RustServer {
     ///   `--sync-on-commit`), threaded into `wt_config`. Defaults match
     ///   `python -m secantus` and the standalone `secantusd-mdb` binary
     ///   (4G cache cap — WiredTiger fills it lazily, so idle test servers stay small — 1000 sessions, no per-commit fsync).
-    /// * `oplog_async` / `oplog_nonlogged` / `data_nonlogged` /
+    /// * `oplog_nonlogged` / `data_nonlogged` /
     ///   `checkpoint_seconds` — the storage write-path modes, per store:
-    ///   background oplog drainer, non-logged oplog tables, and the
+    ///   non-logged oplog tables, and the
     ///   log-only-the-oplog data mode with its stable-checkpoint cadence.
     ///   `None` (the default) defers to the matching `SECANTUS_*` env var,
     ///   except `data_nonlogged`, which defaults to on as `secantusd-mdb` does
@@ -169,7 +169,6 @@ impl RustServer {
         cache_size = "4G".to_string(),
         session_max = 1000,
         sync_on_commit = false,
-        oplog_async = None,
         oplog_nonlogged = None,
         data_nonlogged = None,
         checkpoint_seconds = None,
@@ -192,7 +191,6 @@ impl RustServer {
         cache_size: String,
         session_max: u32,
         sync_on_commit: bool,
-        oplog_async: Option<bool>,
         oplog_nonlogged: Option<bool>,
         data_nonlogged: Option<bool>,
         checkpoint_seconds: Option<u64>,
@@ -233,7 +231,6 @@ impl RustServer {
                 // 128MB, the standalone daemon's default too since 2026-10-13: a
                 // log file is allocated in full, and a test suite opens many stores.
                 wt_config: Some(wt_config(&cache_size, session_max, sync_on_commit, "128MB")),
-                oplog_async,
                 oplog_nonlogged,
                 // mongod's split by default, as `secantusd-mdb` (RM-210).
                 data_nonlogged: Some(data_nonlogged.unwrap_or(true)),

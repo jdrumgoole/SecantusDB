@@ -53,6 +53,13 @@ fn ts_of(blob: &[u8]) -> (u32, u32) {
     }
 }
 
+/// An entry's position in the oplog is its `ts`, `secs << 32 | inc`: the
+/// RecordId of `local.oplog.rs` is derived from the timestamp, as mongod's is.
+fn pos_of(blob: &[u8]) -> i64 {
+    let (secs, inc) = ts_of(blob);
+    (i64::from(secs) << 32) | i64::from(inc)
+}
+
 #[test]
 fn insert_emits_oplog_insert_entry() {
     with_db(|st| {
@@ -62,7 +69,7 @@ fn insert_emits_oplog_insert_entry() {
         let rows = st.read_oplog(1, 100).unwrap();
         assert_eq!(rows.len(), 1);
         let (seq, blob) = &rows[0];
-        assert_eq!(*seq, 1);
+        assert_eq!(*seq, pos_of(blob), "the key of a row is its timestamp");
         let e = decode(blob);
         assert_eq!(e.get_str("op").unwrap(), "i");
         assert_eq!(e.get_str("ns").unwrap(), "app.c");
@@ -81,18 +88,18 @@ fn seqs_and_timestamps_monotonic() {
         }
         st.flush_oplog();
         let rows = st.read_oplog(1, 100).unwrap();
-        assert_eq!(
-            rows.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
-            vec![1, 2, 3]
-        );
+        assert_eq!(rows.len(), 3);
+        for (seq, blob) in &rows {
+            assert_eq!(*seq, pos_of(blob), "RecordId = ts on every row");
+        }
         for w in rows.windows(2) {
             assert!(
                 ts_of(&w[1].1) > ts_of(&w[0].1),
                 "timestamps must strictly increase"
             );
         }
-        assert_eq!(st.oplog_tail_seq(), 3);
-        assert_eq!(st.oplog_floor_seq().unwrap(), 1);
+        assert_eq!(st.oplog_tail_seq(), rows[2].0);
+        assert_eq!(st.oplog_floor_seq().unwrap(), rows[0].0);
     });
 }
 
@@ -103,15 +110,20 @@ fn read_oplog_honours_start_and_limit() {
             st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
         }
         st.flush_oplog();
-        let from3 = st.read_oplog(3, 100).unwrap();
+        let all = st.read_oplog(1, 100).unwrap();
+        assert_eq!(all.len(), 5);
+        let from3 = st.read_oplog(all[2].0, 100).unwrap();
         assert_eq!(
             from3.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
-            vec![3, 4, 5]
+            all[2..].iter().map(|(s, _)| *s).collect::<Vec<_>>()
         );
+        // A start between two entries reads from the next one.
+        let between = st.read_oplog(all[1].0 + 1, 100).unwrap();
+        assert_eq!(between[0].0, all[2].0);
         st.flush_oplog();
         let limited = st.read_oplog(1, 2).unwrap();
         assert_eq!(limited.len(), 2);
-        assert_eq!(limited[0].0, 1);
+        assert_eq!(limited[0].0, all[0].0);
     });
 }
 
@@ -137,23 +149,29 @@ fn empty_oplog_reads_are_empty() {
 #[test]
 fn reopen_recovers_seq_counter() {
     let home = temp_home();
-    {
+    let tail = {
         let st = open_quiet(&home);
         for i in 1..=3 {
             st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
         }
-        assert_eq!(st.oplog_tail_seq(), 3);
-    }
+        let tail = st.oplog_tail_seq();
+        assert_eq!(tail, st.read_oplog(1, 10).unwrap()[2].0);
+        tail
+    };
     {
-        // The clean drop persisted the meta row; recovery reads it clamped
-        // against the tables and continues past the last minted seq.
+        // The clock resumes from the oplog's newest entry (as mongod reads
+        // the top of its oplog) and continues past it.
         let st = Storage::open(home.to_str().unwrap()).unwrap();
-        assert_eq!(st.oplog_tail_seq(), 3);
+        assert_eq!(st.oplog_tail_seq(), tail);
         st.insert_one("app", "c", &enc(&doc! {"_id": 4})).unwrap();
         st.flush_oplog();
-        let rows = st.read_oplog(4, 10).unwrap();
+        let rows = st.read_oplog(tail + 1, 10).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, 4); // continues at seq 4, no collision
+        assert!(
+            rows[0].0 > tail,
+            "continues past the last entry, no collision"
+        );
+        assert_eq!(rows[0].0, pos_of(&rows[0].1));
     }
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -252,7 +270,7 @@ fn entries_carry_stable_collection_uuid() {
         st.insert_one("app", "other", &enc(&doc! {"_id": 1}))
             .unwrap();
         st.flush_oplog();
-        let other = st.read_oplog(3, 1).unwrap();
+        let other = st.read_oplog(rows[1].0 + 1, 1).unwrap();
         assert_ne!(ui_of(&other[0].1), u1);
     });
 }
@@ -313,12 +331,15 @@ fn prune_oplog_by_retention() {
         for i in 1..=3 {
             st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
         }
+        let tail = st.oplog_tail_seq();
         // `now` far in the future -> every entry is past the retention window.
         assert_eq!(st.prune_oplog(Some(10_000_000_000)).unwrap(), 3);
         st.flush_oplog();
         assert!(st.read_oplog(1, 10).unwrap().is_empty());
         assert_eq!(st.oplog_floor_seq().unwrap(), 0);
-        assert_eq!(st.oplog_tail_seq(), 3); // tail (next_seq-1) unaffected
+        assert_eq!(st.oplog_tail_seq(), tail); // the tail is unaffected
+                                               // The oplog remembers that its front is gone.
+        assert_eq!(st.oplog_pruned_through().unwrap(), tail);
     });
 }
 
@@ -342,12 +363,23 @@ fn prune_oplog_entry_cap() {
         for i in 1..=5 {
             st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
         }
+        let before: Vec<i64> = st
+            .read_oplog(1, 100)
+            .unwrap()
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        assert_eq!(before.len(), 5);
         // Retention drops nothing (now=0); the cap forces the 3 oldest out.
         assert_eq!(st.prune_oplog(Some(0)).unwrap(), 3);
         st.flush_oplog();
         let rows = st.read_oplog(1, 100).unwrap();
-        assert_eq!(rows.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![4, 5]);
-        assert_eq!(st.oplog_floor_seq().unwrap(), 4);
+        assert_eq!(
+            rows.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            before[3..].to_vec()
+        );
+        assert_eq!(st.oplog_floor_seq().unwrap(), before[3]);
+        assert_eq!(st.oplog_pruned_through().unwrap(), before[2]);
     });
 }
 
@@ -375,9 +407,10 @@ fn prune_removes_paired_pre_images() {
 fn noop_heartbeat_entry() {
     with_db(|st| {
         let seq = st.emit_noop_heartbeat().unwrap();
-        assert_eq!(seq, 1);
         st.flush_oplog();
         let rows = st.read_oplog(1, 10).unwrap();
+        assert_eq!(seq, rows[0].0);
+        assert_eq!(seq, pos_of(&rows[0].1));
         let e = decode(&rows[0].1);
         assert_eq!(e.get_str("op").unwrap(), "n");
         assert_eq!(e.get_str("ns").unwrap(), "");
@@ -385,7 +418,7 @@ fn noop_heartbeat_entry() {
             e.get_document("o").unwrap().get_str("msg").unwrap(),
             "periodic noop"
         );
-        assert_eq!(st.oplog_tail_seq(), 1);
+        assert_eq!(st.oplog_tail_seq(), seq);
     });
 }
 
@@ -401,83 +434,46 @@ fn find_seq_for_ts_locates_entry() {
             Some(Bson::Timestamp(t)) => *t,
             _ => panic!("no ts"),
         };
-        assert_eq!(st.find_seq_for_ts(ts2).unwrap(), 2);
+        assert_eq!(st.find_seq_for_ts(ts2).unwrap(), rows[1].0);
         // A timestamp past the tail resolves to next_seq (= tail + 1).
         let beyond = bson::Timestamp {
             time: u32::MAX,
             increment: u32::MAX,
         };
-        assert_eq!(st.find_seq_for_ts(beyond).unwrap(), 4);
+        assert_eq!(st.find_seq_for_ts(beyond).unwrap(), st.oplog_tail_seq() + 1);
     });
 }
 
 #[test]
-fn reopen_clamps_stale_meta_next_seq() {
+fn reopen_mints_past_the_newest_entry() {
+    // Nothing is persisted for the oplog's counters: the clock resumes from
+    // the table's newest row, so a new entry can never take a position an
+    // existing one holds (re-minting one would overwrite a live row).
     let home = temp_home();
-    {
+    let first = {
         let st = open_quiet(&home);
         for i in 1..=3 {
             st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
         }
-    } // clean drop persists meta {next_seq: 4, ...}
+        st.read_oplog(1, 10)
+            .unwrap()
+            .iter()
+            .map(|(s, _)| *s)
+            .collect::<Vec<_>>()
+    };
     {
-        // Rewrite the meta row with a stale hint — the on-disk state a crash
-        // leaves behind when emits outran the last persisted snapshot.
-        let conn = secantus_wt::Connection::open(home.to_str().unwrap(), "create").unwrap();
-        let session = conn.open_session().unwrap();
-        let cur = session
-            .open_cursor("table:secantus_oplog_meta", None)
-            .unwrap();
-        let stale = bson::to_vec(&doc! {
-            "next_seq": 2i64, "last_ts_secs": 1i64,
-            "last_ts_ord": 1i64, "next_nat_seq": 2i64,
-        })
-        .unwrap();
-        cur.set_key_s("state");
-        cur.set_value_u(&stale);
-        cur.insert().unwrap();
-    }
-    {
-        // The stale hint (next_seq 2) must be clamped past the table max (3):
-        // re-minting seq 2 would overwrite a live oplog row.
         let st = Storage::open(home.to_str().unwrap()).unwrap();
         st.insert_one("app", "c", &enc(&doc! {"_id": 4})).unwrap();
         st.flush_oplog();
-        let rows = st.read_oplog(1, 10).unwrap();
-        assert_eq!(
-            rows.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
-            vec![1, 2, 3, 4]
-        );
-    }
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-#[test]
-fn reopen_without_meta_row_recovers_from_oplog_tail() {
-    let home = temp_home();
-    {
-        let st = open_quiet(&home);
-        for i in 1..=3 {
-            st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
-        }
-    }
-    {
-        // Delete the meta row so recovery exercises the fallback: a single
-        // prev() onto the newest oplog row.
-        let conn = secantus_wt::Connection::open(home.to_str().unwrap(), "create").unwrap();
-        let session = conn.open_session().unwrap();
-        let cur = session
-            .open_cursor("table:secantus_oplog_meta", None)
-            .unwrap();
-        cur.set_key_s("state");
-        cur.remove().unwrap();
-    }
-    {
-        let st = Storage::open(home.to_str().unwrap()).unwrap();
-        assert_eq!(st.oplog_tail_seq(), 3);
-        st.insert_one("app", "c", &enc(&doc! {"_id": 4})).unwrap();
-        st.flush_oplog();
-        assert_eq!(st.read_oplog(4, 10).unwrap()[0].0, 4);
+        let rows: Vec<i64> = st
+            .read_oplog(1, 10)
+            .unwrap()
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[..3], first[..]);
+        assert!(rows[3] > first[2]);
     }
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -513,34 +509,19 @@ fn slot_micros(scope: &secantus_storage::OperationScope) -> i64 {
     scope.counts().oplog_slot_micros
 }
 
-/// `with_db` on each oplog in turn, synchronous then asynchronous. The
-/// synchronous one times the in-flight window from mint to commit; the
-/// asynchronous one mints after the commit and times each emit to it
-/// instead (RM-379). Pinned with the option, which beats the env var, so
-/// the CI lane that sets `SECANTUS_OPLOG_ASYNC=1` still checks both, as
-/// `oplog_visibility.rs` does.
+/// `with_db`, with the oplog on and the collections the tests write made
+/// first. The oplog slot is timed from mint to commit (RM-361).
 fn with_each_oplog(body: impl Fn(&Storage)) {
-    for oplog_async in [false, true] {
-        let home = temp_home();
-        let mut st = Storage::open_with_options(
-            home.to_str().unwrap(),
-            &StorageOptions {
-                oplog_async: Some(oplog_async),
-                // A store with unlogged data keeps the synchronous oplog.
-                data_nonlogged: oplog_async.then_some(false),
-                ..StorageOptions::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(st.oplog_async(), oplog_async);
-        st.set_enable_oplog(false);
-        st.create_collection("app", "c").unwrap();
-        st.create_collection("app", "other").unwrap();
-        st.set_enable_oplog(true);
-        body(&st);
-        drop(st);
-        let _ = std::fs::remove_dir_all(&home);
-    }
+    let home = temp_home();
+    let mut st =
+        Storage::open_with_options(home.to_str().unwrap(), &StorageOptions::default()).unwrap();
+    st.set_enable_oplog(false);
+    st.create_collection("app", "c").unwrap();
+    st.create_collection("app", "other").unwrap();
+    st.set_enable_oplog(true);
+    body(&st);
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 #[test]
@@ -603,4 +584,28 @@ fn an_operation_inside_another_adds_its_slots_to_it() {
         }
         assert!(slot_micros(&outer) > 0);
     });
+}
+
+#[test]
+fn reopening_a_timestamped_store_again_and_again_never_commits_behind_wiredtiger() {
+    // A write with no oplog entry of its own (a catalog write at open) commits
+    // at a timestamp, and the next checkpoint's stable timestamp covers it. The
+    // clock cannot resume from the newest entry alone: a commit older than the
+    // stable timestamp is refused (EINVAL). Reopen within one wall second,
+    // several times, each time with a write.
+    let home = temp_home();
+    let opts = secantus_storage::StorageOptions {
+        durable: Some(true),
+        data_nonlogged: Some(true),
+        ..secantus_storage::StorageOptions::default()
+    };
+    let mut last_tail = 0;
+    for i in 0..6 {
+        let st = Storage::open_with_options(home.to_str().unwrap(), &opts).unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
+        let tail = st.oplog_tail_seq();
+        assert!(tail > last_tail, "the oplog's tail moves on at every open");
+        last_tail = tail;
+    }
+    let _ = std::fs::remove_dir_all(&home);
 }

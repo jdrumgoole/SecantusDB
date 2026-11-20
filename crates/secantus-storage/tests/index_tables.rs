@@ -120,8 +120,13 @@ fn index_tables(st: &Storage) -> Vec<String> {
         .collect()
 }
 
+/// The tables of user collections: `local.oplog.rs`'s own is a
+/// `collection-<UUID>` table too, and is not one of them.
 fn collection_tables(st: &Storage) -> Vec<String> {
     tables_named(st, "table:collection-")
+        .into_iter()
+        .filter(|t| t != st.oplog_table())
+        .collect()
 }
 
 #[test]

@@ -359,12 +359,11 @@ fn storage_options(cli: &CliArgs) -> StorageOptions {
         ),
         mongod_message_config()
     );
-    // Storage write-path modes (--oplog-async / --oplog-nonlogged /
+    // Storage write-path modes (--oplog-nonlogged /
     // --data-nonlogged / --checkpoint-seconds): `None` defers to the matching
     // SECANTUS_* env var, so env-driven runs are unchanged.
     StorageOptions {
         wt_config: Some(wt),
-        oplog_async: cli.oplog_async,
         oplog_nonlogged: cli.oplog_nonlogged,
         // mongod's split, so writes carry the timestamps a snapshot read at a
         // past time reads by (RM-210); `--data-logged` opts out.

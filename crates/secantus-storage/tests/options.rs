@@ -23,51 +23,6 @@ fn insert_row(st: &Storage, db: &str, coll: &str, id: i32) {
         .unwrap();
 }
 
-/// `oplog_async: Some(true)` engages the drainer pool with no
-/// `SECANTUS_OPLOG_ASYNC` in the environment: entries are minted post-commit
-/// and become readable once drained (`flush_oplog` waits for that).
-#[test]
-fn oplog_async_option_engages_without_env() {
-    // The whole point is option-without-env; under the async CI lane
-    // (SECANTUS_OPLOG_ASYNC=1 for the entire suite) that premise is gone —
-    // skip rather than fail the lane.
-    if std::env::var_os("SECANTUS_OPLOG_ASYNC").is_some() {
-        eprintln!("skipping: SECANTUS_OPLOG_ASYNC is set in the environment");
-        return;
-    }
-    let home = temp_home();
-    {
-        let st = Storage::open_with_options(
-            home.to_str().unwrap(),
-            &StorageOptions {
-                oplog_async: Some(true),
-                // The asynchronous oplog needs logged data tables: a store whose
-                // writes carry timestamps keeps the synchronous one.
-                data_nonlogged: Some(false),
-                ..StorageOptions::default()
-            },
-        )
-        .unwrap();
-        for i in 0..5 {
-            insert_row(&st, "app", "c", i);
-        }
-        st.flush_oplog();
-        let rows = st.read_oplog(1, 100).unwrap();
-        // The collection's creation, then the five inserts.
-        assert_eq!(
-            rows.len(),
-            6,
-            "drained oplog should hold the create and all 5 inserts"
-        );
-        drop(st);
-    }
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-/// `data_nonlogged: Some(true)` selects the log-only-the-oplog mode from the
-/// option alone: the store records the mode in its stable marker, spawns the
-/// checkpoint machinery, and a reopen WITHOUT the option keeps the recorded
-/// mode (create-time-sticky, marker authoritative).
 #[test]
 fn data_nonlogged_option_engages_and_reopen_keeps_mode() {
     if std::env::var_os("SECANTUS_DATA_NONLOGGED").is_some() {
@@ -121,15 +76,12 @@ fn data_nonlogged_option_engages_and_reopen_keeps_mode() {
 /// still be queued below `written_seq`; pymongo's `test_kill_cursors`
 /// failed exactly this way, async-only.)
 #[test]
-fn oplog_open_seq_covers_acked_writes_in_async_mode() {
+fn oplog_open_seq_covers_acked_writes() {
     let home = temp_home();
     {
         let st = Storage::open_with_options(
             home.to_str().unwrap(),
             &StorageOptions {
-                oplog_async: Some(true),
-                // The asynchronous oplog needs logged data tables: a store whose
-                // writes carry timestamps keeps the synchronous one.
                 data_nonlogged: Some(false),
                 ..StorageOptions::default()
             },

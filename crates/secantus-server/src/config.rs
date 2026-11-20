@@ -82,7 +82,6 @@ pub struct ResolvedConfig {
     /// `config.py` has no equivalents). `None` defers to the matching
     /// `SECANTUS_*` env var via `StorageOptions`; a set value wins for this
     /// daemon only.
-    pub oplog_async: Option<bool>,
     pub oplog_nonlogged: Option<bool>,
     pub data_nonlogged: Option<bool>,
     pub checkpoint_seconds: Option<u64>,
@@ -122,7 +121,6 @@ impl Default for ResolvedConfig {
             session_max: 1000,
             ttl_sweep_seconds: 60.0,
             sync_on_commit: false,
-            oplog_async: None,
             oplog_nonlogged: None,
             data_nonlogged: None,
             checkpoint_seconds: None,
@@ -159,7 +157,6 @@ pub struct ConfigOverrides {
     pub session_max: Option<u32>,
     pub ttl_sweep_seconds: Option<f64>,
     pub sync_on_commit: Option<bool>,
-    pub oplog_async: Option<bool>,
     pub oplog_nonlogged: Option<bool>,
     pub data_nonlogged: Option<bool>,
     pub checkpoint_seconds: Option<u64>,
@@ -210,9 +207,6 @@ impl ConfigOverrides {
         set_copy!(ttl_sweep_seconds);
         set_copy!(sync_on_commit);
         // Option-valued in the base too: `Some(v)` sets, `None` defers.
-        if let Some(v) = self.oplog_async {
-            base.oplog_async = Some(v);
-        }
         if let Some(v) = self.oplog_nonlogged {
             base.oplog_nonlogged = Some(v);
         }
@@ -408,7 +402,6 @@ pub fn parse_str(text: &str, label: &str) -> Result<ConfigOverrides, String> {
                     out.ttl_sweep_seconds = Some(as_f64(val, "storage", key, label)?)
                 }
                 "sync_on_commit" => out.sync_on_commit = Some(as_bool(val, "storage", key, label)?),
-                "oplog_async" => out.oplog_async = Some(as_bool(val, "storage", key, label)?),
                 "oplog_nonlogged" => {
                     out.oplog_nonlogged = Some(as_bool(val, "storage", key, label)?)
                 }
@@ -695,11 +688,10 @@ mod tests {
     #[test]
     fn storage_mode_keys_parse() {
         let o = parse(
-            "[storage]\noplog_async = true\noplog_nonlogged = true\n\
+            "[storage]\noplog_nonlogged = true\n\
              data_nonlogged = false\ncheckpoint_seconds = 30\n",
         )
         .unwrap();
-        assert_eq!(o.oplog_async, Some(true));
         assert_eq!(o.oplog_nonlogged, Some(true));
         assert_eq!(o.data_nonlogged, Some(false));
         assert_eq!(o.checkpoint_seconds, Some(30));
@@ -707,7 +699,7 @@ mod tests {
 
     #[test]
     fn storage_mode_keys_reject_bad_types() {
-        assert!(parse("[storage]\noplog_async = \"yes\"\n").is_err());
+        assert!(parse("[storage]\noplog_nonlogged = \"yes\"\n").is_err());
         assert!(parse("[storage]\ncheckpoint_seconds = -1\n").is_err());
         assert!(parse("[storage]\ncheckpoint_seconds = 1.5\n").is_err());
     }

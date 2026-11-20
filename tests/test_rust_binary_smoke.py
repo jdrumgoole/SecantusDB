@@ -20,6 +20,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
@@ -227,6 +228,42 @@ def test_binary_serves_pymongo_and_exits_cleanly(
     finally:
         client.close()
 
+    _request_shutdown(daemon)
+    assert daemon.wait(timeout=15) == 0, _stderr(daemon)
+
+
+def test_a_tailable_cursor_on_the_oplog_sees_a_new_entry(
+    daemon: subprocess.Popen[str],
+) -> None:
+    """`local.oplog.rs` is a capped collection of its own table (phase 4b of
+    the storage-model plan): a tailable awaitData cursor on it returns the
+    entries there are, and then one a later write adds. Each entry's `ts` is
+    its RecordId."""
+    host, port = _bound_address(daemon)
+    client: pymongo.MongoClient = pymongo.MongoClient(
+        host=host, port=port, serverSelectionTimeoutMS=10_000
+    )
+    try:
+        client.tail.c.insert_one({"_id": 1})
+        oplog = client.local["oplog.rs"]
+        cursor = oplog.find(
+            {"ns": "tail.c", "op": "i"},
+            cursor_type=pymongo.CursorType.TAILABLE_AWAIT,
+        ).max_await_time_ms(500)
+        first = list(cursor)
+        assert [e["o"]["_id"] for e in first] == [1]
+        ts = first[0]["ts"]
+        (with_id,) = oplog.find({"ns": "tail.c", "op": "i"}, show_record_id=True)
+        assert with_id["$recordId"] == (ts.time << 32) | ts.inc
+        client.tail.c.insert_one({"_id": 2})
+        seen: list[int] = []
+        deadline = time.monotonic() + 10
+        while not seen and time.monotonic() < deadline:
+            seen = [e["o"]["_id"] for e in cursor]
+        assert seen == [2]
+        assert cursor.alive
+    finally:
+        client.close()
     _request_shutdown(daemon)
     assert daemon.wait(timeout=15) == 0, _stderr(daemon)
 

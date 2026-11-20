@@ -551,6 +551,59 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
      is measured in phase 7 (RP-1074), and a change to it is a decision for
      Joe then.
 
+   **As built (4b-1 and 4b-3, store format 5; entries still one row per
+   operation, so 4b-2 is the next stage):**
+   - `local.oplog.rs` is a `collection-<UUID>` table made with mongod's
+     config (`COLLECTION_TABLE_CFG` with `oplogKeyExtractionVersion=1`, snappy,
+     logged, `split_pct=90`: measured, not the old shard tuning) and an
+     `_mdb_catalog` row `{md: {ns, options: {uuid, capped, size, autoIndexId},
+     indexes: []}, idxIdent: {}, ident, ns}`. The registry and `secantus_idents`
+     do not list it. **The catalog row alone cannot find it**: `_mdb_catalog`
+     is not logged in a store whose data tables are not (the server's mode), so
+     after a kill -9 before the first checkpoint the row is gone while the
+     logged oplog holds every acknowledged write; an open that trusted the
+     catalog made a new empty oplog and dropped the real one as an orphan
+     (`tests/test_crash_recovery.py` and `test_rust_binary_crash_durability.py`
+     caught it; the kill harness now kills a store's first life too). The ident
+     and uuid are therefore recorded in the always-logged oplog meta table
+     (`oplog` row), the catalog row is derived from it (written again at open
+     if absent), and `reconcile_idents` keeps the recorded ident.
+     `Storage::oplog_table` is its URI. The
+     sixteen shards, the legacy `secantus_oplog`, the `state` row of
+     `secantus_oplog_meta` and the asynchronous drainer (`--oplog-async`,
+     `SECANTUS_OPLOG_ASYNC`, `StorageOptions::oplog_async`) are gone.
+   - **A position is a timestamp.** The RecordId of a row is its `ts`
+     (`secs << 32 | inc`), and every reader that took a seq now takes that
+     position as an `i64`: change-stream resume tokens (`s` is the position),
+     `awaitData`, `find_seq_for_ts`, pre-images, retryable history, replay,
+     `import_oplog_segment`, the stable marker, the write set of a prepared
+     transaction. A run of entries takes consecutive timestamps (`mint_run`,
+     as mongod's `reserveOpTimes`), so `start + i` still names the i-th of
+     them and the in-flight window is keyed by the first. A timestamp consumed
+     without an entry (cluster time, a commit stamp) leaves the tail where it
+     was. At open the clock resumes from the newest row and from WiredTiger's
+     recovery, stable and oldest timestamps (a commit may not go behind them: a
+     reopen within the second of the last write, with only catalog writes since
+     the last entry, refused to open with EINVAL) and is then bumped one second
+     past `max(those, now)`: cluster-time and commit-stamp mints leave
+     no row, and a write at a timestamp older than one a data table already
+     holds is refused by WiredTiger.
+   - The sync/in-flight visibility floor is unchanged in kind and keyed by
+     timestamp. The pruner deletes from the one table and records the newest
+     position it pruned (`secantus_oplog_meta`'s `pruned` row, written in the
+     transaction that removes the rows; 4b-6 must find it a home). That marker
+     replaces `floor == 1` as "the oplog still reaches genesis": v1 restore
+     refuses a pruned source, and a PITR segment's file name carries `prev`,
+     the position it follows (`oplog-<first>-<last>-<prev>.seg`), so segments
+     chain by abutting and a missing one is a named gap.
+   - `find` and a tailable cursor on `local.oplog.rs` scan the real table
+     (`scan_docs_after_recordid`, `collection_min/max_recordid`), a view
+     entry's resume position being the last row it covers.
+   - Not done here, left to the next stage: the stored fields (`rw`, `bg`,
+     `pi`) and the `oplog_view_entries` collapse; `options.size` of the oplog
+     is still entries x 16 KiB (4b-5); `oplog_pruned_through` and the
+     retention cap are entry-count based (4b-5).
+
    **Landing:** 4b-1 to 4b-3 cannot land apart (the table, what is in it
    and every reader of it), so they land together as store format 5, with
    the crash tests: kill -9 at random points of a write burst, many times,

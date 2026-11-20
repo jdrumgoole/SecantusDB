@@ -65,11 +65,6 @@ fn overlay_merges_the_blocks_rows_over_a_fresh_snapshot() {
             .unwrap();
 
         let ov = st.block_overlay(&mut block, "app", "t").unwrap();
-        if st.oplog_async() {
-            assert!(ov.is_none(), "async oplog has no readable write set rows");
-            st.rollback_user_transaction(&mut block).unwrap();
-            return;
-        }
         let ov = ov.expect("a row-only write set gives an overlay");
         assert_eq!(ov.rows.len(), 3);
         assert_eq!(ov.rows.values().filter(|r| r.is_none()).count(), 1);
@@ -158,11 +153,10 @@ fn every_read_path_honours_the_overlay_inside_a_fresh_transaction() {
         .unwrap();
         st.insert_one("app", "t", &enc(&doc! {"_id": 5, "v": 50}))
             .unwrap();
-        let Some(ov) = st.block_overlay(&mut block, "app", "t").unwrap() else {
-            assert!(st.oplog_async());
-            st.rollback_user_transaction(&mut block).unwrap();
-            return;
-        };
+        let ov = st
+            .block_overlay(&mut block, "app", "t")
+            .unwrap()
+            .expect("a row-only write set gives an overlay");
         let mut m = HashMap::new();
         m.insert(("app".to_string(), "t".to_string()), ov);
         let m = Arc::new(m);

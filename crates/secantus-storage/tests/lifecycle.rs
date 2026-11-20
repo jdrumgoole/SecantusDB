@@ -305,6 +305,7 @@ fn rename_keeps_secondary_index_reachable_through_the_index() {
 #[test]
 fn stable_checkpoint_marker_roundtrips() {
     let home = temp_home();
+    let anchored;
     {
         let st = Storage::open(home.to_str().unwrap()).unwrap();
         st.insert_one("app", "c", &enc(&bson::doc! {"_id": 1}))
@@ -312,15 +313,18 @@ fn stable_checkpoint_marker_roundtrips() {
         // Async lane: the anchor covers only drained rows (no-op sync).
         st.flush_oplog();
         st.stable_checkpoint().unwrap();
+        anchored = st.oplog_tail_seq();
         st.insert_one("app", "c", &enc(&bson::doc! {"_id": 2}))
             .unwrap();
+        assert!(st.oplog_tail_seq() > anchored);
     }
-    // Reopen: the marker must read back as the seq the checkpoint anchored
-    // (2: the collection's creation, then the first insert; the second insert
-    // happened after), via the same load path open uses.
+    // Reopen: the marker must read back as the position the checkpoint
+    // anchored (the newest entry then: the collection's creation and the
+    // first insert; the second insert happened after), via the same load
+    // path open uses.
     {
         let st = Storage::open(home.to_str().unwrap()).unwrap();
-        assert_eq!(st.stable_checkpoint_seq(), 2);
+        assert_eq!(st.stable_checkpoint_seq(), anchored);
     } // close BEFORE deleting the home — a live connection's close checkpoint
       // over a removed directory is a guaranteed WT panic.
     let _ = std::fs::remove_dir_all(&home);

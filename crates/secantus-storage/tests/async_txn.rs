@@ -1,6 +1,6 @@
-//! Async-oplog user-transaction correctness: a transaction's statements
-//! buffer their oplog entries on the handle, and they reach the drainer only
-//! after the WT commit succeeds. A rolled-back transaction must leave NO
+//! User-transaction oplog correctness on a store that logs a transaction at
+//! its commit: a transaction's statements buffer their oplog entries on the
+//! handle, and they are written only once the WT commit is under way. A rolled-back transaction must leave NO
 //! oplog trace — before the fix, `emit_oplog_entries` saw `IN_ASYNC_STMT`
 //! false inside a user transaction (the `with_statement_txn` early-return
 //! skips the flag) and minted + enqueued mid-transaction, so a rollback left
@@ -23,15 +23,13 @@ fn temp_home() -> PathBuf {
     dir
 }
 
-fn with_async_db(body: impl FnOnce(&Storage)) {
+fn with_db(body: impl FnOnce(&Storage)) {
     let home = temp_home();
     let st = Storage::open_with_options(
         home.to_str().unwrap(),
         &StorageOptions {
-            oplog_async: Some(true),
-            // The asynchronous oplog needs logged data tables: a store whose
-            // writes carry timestamps keeps the synchronous one.
-            data_nonlogged: Some(false),
+            data_nonlogged: Some(true),
+            transactions_logged_at_commit: true,
             ..StorageOptions::default()
         },
     )
@@ -51,7 +49,7 @@ fn decode(b: &[u8]) -> Document {
 
 #[test]
 fn rolled_back_txn_leaves_no_oplog_trace() {
-    with_async_db(|st| {
+    with_db(|st| {
         // Baseline committed write so the assertion below can tell
         // "rollback left nothing" apart from "nothing works at all". The
         // first insert also records the collection's creation: two entries.
@@ -78,7 +76,7 @@ fn rolled_back_txn_leaves_no_oplog_trace() {
 
 #[test]
 fn committed_txn_entries_land_exactly_once_after_commit() {
-    with_async_db(|st| {
+    with_db(|st| {
         let mut txn = st.begin_user_transaction().unwrap();
         st.with_user_transaction(&mut txn, || {
             st.insert_one("app", "c", &enc(&doc! {"_id": 1}))

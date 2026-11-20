@@ -456,7 +456,8 @@ jobs:
   # takes as long as its slowest lane. Every gate the serial job ran still
   # runs, in exactly one lane:
   #   storage        fmt / clippy / test of secantus-storage
-  #   storage-async  secantus-storage's tests again under the async oplog
+  #   storage-nonlogged  secantus-storage's tests again with the oplog table
+  #                  created log=(enabled=false)
   #   adapter        fmt / clippy / test of secantus-storage-adapter
   #   mdb            fmt / clippy of secantus-wt, secantus-storage-py and
   #                  secantusdb, and the tests of secantusdb and secantus-wt
@@ -472,7 +473,7 @@ jobs:
         include:
           - lane: storage
             cache-root: crates/secantus-storage
-          - lane: storage-async
+          - lane: storage-nonlogged
             cache-root: crates/secantus-storage
           - lane: adapter
             cache-root: crates/secantus-storage-adapter
@@ -725,19 +726,17 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test
 
-      # The async/decoupled-oplog parity lane: the whole storage suite again
-      # with the drainer pool live (SECANTUS_OPLOG_ASYNC=1, stacked with the
-      # non-logged oplog tables the mode ships with — the Finding-9 pairing).
-      # tasks/rust-async-oplog-prototype.md names this lane as the
-      # precondition for the mode ever becoming a default. Mode-specific
-      # tests pin their own mode via StorageOptions (the option beats the env
-      # var), so sync-only invariants stay covered by the `storage` lane
-      # while everything else exercises the async path.
-      - name: Cargo test (secantus-storage, async-oplog lane)
-        if: matrix.lane == 'storage-async'
+      # The non-logged oplog lane: the whole storage suite again with
+      # `local.oplog.rs` created log=(enabled=false) (SECANTUS_OPLOG_NONLOGGED=1,
+      # the measurement / ephemeral mode). Mode-specific tests pin their own
+      # mode via StorageOptions (the option beats the env var), so logged-only
+      # invariants stay covered by the `storage` lane. (The asynchronous
+      # drainer this lane once also ran is gone: phase 4b of
+      # tasks/mongod-storage-model-plan.md.)
+      - name: Cargo test (secantus-storage, non-logged oplog lane)
+        if: matrix.lane == 'storage-nonlogged'
         working-directory: crates/secantus-storage
         env:
-          SECANTUS_OPLOG_ASYNC: "1"
           SECANTUS_OPLOG_NONLOGGED: "1"
         run: cargo test
 
