@@ -1,6 +1,6 @@
 :root{--ink:#10231E;--paper:#F5F2EA;--paper2:#E9E4D6;--green:#1F6B4F;--amber:#E5A53A;--soft:#4A5A55;--softdark:#BFD3CB;}
 body{font-family:'Inter',Arial,sans-serif;color:var(--ink);}
-section{padding:128px;background:var(--paper);display:flex;flex-direction:column;gap:48px;counter-increment:page;}
+section{padding:72px 128px 128px;background:var(--paper);display:flex;flex-direction:column;gap:48px;counter-increment:page;}
 section.dark{background:var(--ink);color:var(--paper);}
 section.alt{background:var(--paper2);}
 section.accent{background:var(--amber);color:var(--ink);}
