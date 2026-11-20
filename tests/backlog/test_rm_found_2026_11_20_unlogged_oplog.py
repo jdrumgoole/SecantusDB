@@ -49,11 +49,14 @@ def _start(store: pathlib.Path, *flags: str) -> tuple[subprocess.Popen, int | No
 
 
 @pytest.mark.backlog_fixed("RM-731")
-@pytest.mark.parametrize("flags", [("--oplog-nonlogged",), ("--oplog-async", "--oplog-nonlogged")])
+@pytest.mark.parametrize("flags", [("--oplog-nonlogged",)])
 def test_a_non_logged_oplog_keeps_or_refuses(tmp_path: pathlib.Path, flags: tuple) -> None:
     """On a default store a non-logged oplog is refused by name, or every
     `j: true` write it acknowledged survives SIGKILL -- never acknowledged
-    and lost."""
+    and lost. (The `--oplog-async --oplog-nonlogged` stack this also ran is
+    gone: the asynchronous oplog was removed with storage-model phase 4b,
+    and `secantusd-mdb` refuses `--oplog-async` as an unknown argument,
+    pinned in `crates/secantus-server/src/args.rs`.)"""
     store = tmp_path / "store"
     proc, port, output = _start(store, *flags)
     if port is None:

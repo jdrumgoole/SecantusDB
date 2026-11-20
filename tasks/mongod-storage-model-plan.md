@@ -408,6 +408,269 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
    phase that PR #594's shards were built to avoid, so its gate is the
    `do-perf` concurrency run at 1, 4 and 16 writers; a regression there is
    fixed in this phase, not accepted.
+
+   **Phase 4b design (2026-11-20).** Measured with
+   `tools/probes/mongod_oplog_corpus.py` on a one-member mongod 8.2.11
+   replica set (`tests/fixtures/storage_model/mongod-8.2.11-oplog.json`, 19
+   operations, 42 stored rows):
+
+   - **The key is the timestamp.** Every row's RecordId is `(secs << 32) |
+     inc` of its `ts` (42 of 42). The table is `key_format=q`, snappy,
+     logged, `app_metadata=(formatVersion=1,oplogKeyExtractionVersion=1)`;
+     the catalog entry's options are `{uuid, capped: true, size: 201326592,
+     autoIndexId: false}`, with no indexes. `find` returns the stored
+     documents unchanged: mongod has no view over its oplog.
+   - **One entry per mongod entry.** A single write, and each document of an
+     `updateMany`, is its own entry. An `insertMany` and a `deleteMany` are
+     one `applyOps` at one timestamp; so is a transaction. A retryable
+     batched insert carries `lsid`, `txnNumber`, `prevOpTime` and
+     `multiOpType: 1`; a non-retryable `deleteMany` carries none of them.
+   - **Field order:** `lsid, txnNumber, op, ns, ui, o, o2, needsRetryImage,
+     stmtId, ts, t, v, wall, prevOpTime` (an `applyOps` element: `op, ns,
+     ui, o, o2, stmtId`). A `findAndModify` stores `needsRetryImage:
+     "preImage"` and keeps its image in `config.image_collection`.
+   - **DDL:** `create` carries `idIndex`. `createIndexes` is a two-phase
+     build: `config.system.indexBuilds` insert, `startIndexBuild`, an update,
+     `commitIndexBuild`, a delete. `collMod` has `o2.collectionOptions_old`;
+     `dropIndexes` has `o2` = the dropped spec; `drop` has
+     `o2.numRecords`; `dropDatabase` is a `drop` per collection, then
+     `dropDatabase`.
+
+   **Measured 2026-11-20 (batching, `partialTxn`, prepare; mongod 8.2.11,
+   one-member set).** `tools/probes/mongod_oplog_batching.py` and
+   `tools/probes/mongod_oplog_prepare.py` write
+   `tests/fixtures/storage_model/mongod-8.2.11-oplog-batching.json` and
+   `...-oplog-prepare.json`:
+
+   - **Insert.** `insertMany` (ordered or not, retryable or not) is ONE
+     `applyOps` entry at one ts, whatever the count (200 documents: one
+     entry, 18,795 bytes); a one-document `insertMany` is a plain insert
+     entry. It is cut by size: five 1 MB documents are five plain entries.
+     `bulkWrite` is one entry per operation.
+   - **Delete.** `deleteMany` is `applyOps` of deletes, in batches of ten
+     (200 matches: 20 entries at consecutive ts, each ten elements); one
+     match is a plain delete entry; five 1 MB documents split 3 + 2. A
+     retryable `deleteMany` carries no `lsid`/`txnNumber` (the command is not
+     retryable); a retryable `insertMany` has `lsid`, `txnNumber`,
+     `prevOpTime: {ts: Timestamp(0,0), t: -1}` and `multiOpType: 1`, and its
+     elements carry `stmtId`. `updateMany` is one plain entry per document
+     (no `applyOps`), even in a retryable session. An `applyOps` element is
+     `op, ns, ui, o, o2` (insert; `o2` = `{_id}`), `op, ns, ui, o` (delete),
+     with `stmtId` last when retryable.
+   - **Transaction.** One `applyOps` entry at the commit ts, fields `lsid,
+     txnNumber, op:"c", ns:"admin.$cmd", o:{applyOps}, ts, t, v, wall,
+     prevOpTime` (no `multiOpType`); inserts, deletes and updates of a
+     transaction (11 ops across `insertMany`, `deleteMany`, `updateMany`) are
+     all elements of the one entry. An aborted or empty transaction writes
+     nothing.
+   - **`partialTxn` chain.** Twenty 1 MB inserts: two entries at consecutive
+     ts (`t.1`, `t.2`). The first is `o: {applyOps: [16 ops], partialTxn:
+     true}`, 16,001,861 bytes, `prevOpTime` `{Timestamp(0,0), -1}`; the last
+     is `o: {applyOps: [4 ops], count: 20}`, 4,000,657 bytes, its
+     `prevOpTime` the first entry's `{ts, t}`. An entry takes whole
+     operations while it stays under about 16 MB (BSON's internal limit
+     16,793,600).
+   - **Prepare** (needs `--shardsvr` and a `shardIdentity`, which the probe
+     builds; a plain replica set answers `prepareTransaction` with "Cannot
+     accept sharding commands"). `prepareTransaction` writes the `applyOps`
+     entry with `o: {applyOps, prepare: true}` at the PREPARE ts (the
+     transaction's operations all in it); `commitTransaction` writes
+     `{op:"c", ns:"admin.$cmd", o:{commitTransaction: 1, commitTimestamp:
+     <prepare ts>}, prevOpTime: <the prepare entry's {ts, t}>}` at a later
+     ts; `abortTransaction` writes `o:{abortTransaction: 1}` with the same
+     `prevOpTime`. Both carry `lsid` and `txnNumber` (the probe strips `wall`, which
+     every entry has).
+   - **Not yet measured:** the two-phase index build entries beyond the
+     existing fixture; a prepared transaction over 16 MB; recovery from a
+     crash between prepare and commit.
+
+   Today's store differs in all of these: one row per operation, each at its
+   own timestamp, keyed by a seq over two to sixteen shards, with private
+   fields (`rw`, `bg`, `pi`) and a view (`oplog_view_entries`) that collapses
+   rows into `applyOps` for `find`. The steps:
+
+   - **4b-1. The table.** `local.oplog.rs` is a capped collection in its own
+     `collection-<UUID>` table, with the measured config and catalog entry,
+     created with the store. RecordId = timestamp. The shards, the legacy
+     `secantus_oplog` table and `secantus_oplog_meta`'s `state` row go: at
+     open the next timestamp follows the last entry, as mongod reads the top
+     of its oplog. The asynchronous drainer (`SECANTUS_OPLOG_ASYNC`) goes:
+     mongod writes the oplog in the writer's transaction, and the drainer
+     wrote it after.
+   - **4b-2. Entries in mongod's form.** What is stored is what `find`
+     returns, in the measured field order. A batched insert or delete, and a
+     transaction, store one `applyOps` at the commit timestamp; one over
+     mongod's size limit becomes mongod's `partialTxn` chain linked by
+     `prevOpTime` (measure the limit and the chain). A transaction's
+     operations collect on its handle until commit, as mongod's
+     `TransactionOperations` do, so the PostgreSQL server's write set and
+     READ COMMITTED overlay (`transaction_write_set`, `block_overlay`) read
+     the handle rather than uncommitted rows. A prepared transaction
+     (PostgreSQL's two-phase commit) writes mongod's prepare form, an
+     `applyOps` with `prepare: true` and then `commitTransaction` or
+     `abortTransaction` (measure them). The private fields go: `rw` becomes
+     `lsid`/`txnNumber`/`stmtId`/`needsRetryImage` with
+     `config.image_collection`; `bg` becomes the `applyOps`; `pi` is
+     already `config.system.preimages`' `{nsUUID, ts, applyOpsIndex}`. DDL
+     entries take the measured shapes, index builds included.
+   - **4b-3. Positions are timestamps.** Every reader moves from seq to `ts`,
+     or `(ts, applyOpsIndex)` inside an `applyOps`: change streams (which
+     unwind `applyOps` with `txnOpIndex`, as mongod's do), `awaitData`,
+     retryable-write history, pre-images, replay and restore, the PITR
+     archive (segments name a first and last timestamp and chain by
+     abutting, not by seq arithmetic), sizes and `lastOp`. `find` and
+     tailable cursors on `local.oplog.rs` become ordinary scans of a capped
+     collection, which also gives a tailable cursor there new entries (it
+     sees none today). Oplog readers still see only up to the point with
+     no uncommitted entry below it (mongod reads WiredTiger's
+     `all_durable`); the in-flight floor that computes it is kept, keyed by
+     timestamp, because the PostgreSQL store is not timestamped.
+   - **4b-4. Resume tokens in mongod's form.** `_data` becomes mongod's
+     KeyString of `{clusterTime, version, tokenType, txnOpIndex,
+     fromInvalidate, uuid, eventIdentifier}`, built with
+     `secantus_core::keystring`, so mongod resumes from our token (phase 7)
+     and we resume from mongod's. Measured per event kind against mongod.
+     `resume_keystring.rs` already decodes mongod's tokens.
+   - **4b-5. Truncation as mongod's.** The oplog is held to its `size` in
+     bytes (mongod's default rule; 192 MB on this box), truncated from the
+     oldest end in whole entries, never past the stable checkpoint's
+     timestamp, and `replSetResizeOplog` changes it. The entry-count cap
+     (`max_entries`, 100,000) goes.
+   - **4b-6. Replica-set state and recovery.** `secantus_oplog_meta` goes.
+     The store keeps what phase 0b found a one-member set keeps:
+     `local.replset.minvalid` (not logged), `local.replset.oplogTruncateAfterPoint`,
+     `local.replset.election`, `local.replset.initialSyncId`,
+     `local.system.rollback.id` and `local.system.replset`, plus
+     `config.system.indexBuilds` for 4b-2's index builds. The recovery point is WiredTiger's checkpoint
+     timestamp (`get=recovery`, as now); recovery truncates the oplog after
+     `oplogTruncateAfterPoint` and replays what follows the recovery point,
+     as mongod's `ReplicationRecovery` does.
+   - **The PostgreSQL store keeps logged, untimestamped tables for now.**
+     Its durability model is PostgreSQL's, and nothing in 4b needs it to
+     change. Whether mongod can open such a store as a replica-set member
+     is measured in phase 7 (RP-1074), and a change to it is a decision for
+     Joe then.
+
+   **As built (4b-1 and 4b-3, store format 5; entries still one row per
+   operation, so 4b-2 is the next stage):**
+   - `local.oplog.rs` is a `collection-<UUID>` table made with mongod's
+     config (`COLLECTION_TABLE_CFG` with `oplogKeyExtractionVersion=1`, snappy,
+     logged, `split_pct=90`: measured, not the old shard tuning) and an
+     `_mdb_catalog` row `{md: {ns, options: {uuid, capped, size, autoIndexId},
+     indexes: []}, idxIdent: {}, ident, ns}`. The registry and `secantus_idents`
+     do not list it. **The catalog row alone cannot find it**: `_mdb_catalog`
+     is not logged in a store whose data tables are not (the server's mode), so
+     after a kill -9 before the first checkpoint the row is gone while the
+     logged oplog holds every acknowledged write; an open that trusted the
+     catalog made a new empty oplog and dropped the real one as an orphan
+     (`tests/test_crash_recovery.py` and `test_rust_binary_crash_durability.py`
+     caught it; the kill harness now kills a store's first life too). The ident
+     and uuid are therefore recorded in the always-logged oplog meta table
+     (`oplog` row), the catalog row is derived from it (written again at open
+     if absent), and `reconcile_idents` keeps the recorded ident.
+     `Storage::oplog_table` is its URI. The
+     sixteen shards, the legacy `secantus_oplog`, the `state` row of
+     `secantus_oplog_meta` and the asynchronous drainer (`--oplog-async`,
+     `SECANTUS_OPLOG_ASYNC`, `StorageOptions::oplog_async`) are gone.
+   - **A position is a timestamp.** The RecordId of a row is its `ts`
+     (`secs << 32 | inc`), and every reader that took a seq now takes that
+     position as an `i64`: change-stream resume tokens (`s` is the position),
+     `awaitData`, `find_seq_for_ts`, pre-images, retryable history, replay,
+     `import_oplog_segment`, the stable marker, the write set of a prepared
+     transaction. A run of entries takes consecutive timestamps (`mint_run`,
+     as mongod's `reserveOpTimes`), so `start + i` still names the i-th of
+     them and the in-flight window is keyed by the first. A timestamp consumed
+     without an entry (cluster time, a commit stamp) leaves the tail where it
+     was. At open the clock resumes from the newest row and from WiredTiger's
+     recovery, stable and oldest timestamps (a commit may not go behind them: a
+     reopen within the second of the last write, with only catalog writes since
+     the last entry, refused to open with EINVAL) and is then bumped one second
+     past `max(those, now)`: cluster-time and commit-stamp mints leave
+     no row, and a write at a timestamp older than one a data table already
+     holds is refused by WiredTiger.
+   - The sync/in-flight visibility floor is unchanged in kind and keyed by
+     timestamp. The pruner deletes from the one table and records the newest
+     position it pruned (`secantus_oplog_meta`'s `pruned` row, written in the
+     transaction that removes the rows; 4b-6 must find it a home). That marker
+     replaces `floor == 1` as "the oplog still reaches genesis": v1 restore
+     refuses a pruned source, and a PITR segment's file name carries `prev`,
+     the position it follows (`oplog-<first>-<last>-<prev>.seg`), so segments
+     chain by abutting and a missing one is a named gap.
+   - `find` and a tailable cursor on `local.oplog.rs` scan the real table
+     (`scan_docs_after_recordid`, `collection_min/max_recordid`), a view
+     entry's resume position being the last row it covers.
+   - Not done here, left to the next stage: the stored fields (`rw`, `bg`,
+     `pi`) and the `oplog_view_entries` collapse; `options.size` of the oplog
+     is still entries x 16 KiB (4b-5); `oplog_pruned_through` and the
+     retention cap are entry-count based (4b-5).
+
+   **As built (4b-2, still format 5):** what is stored is what mongod logs.
+   - The entries are built when they are written (`oplog_view_entries`, now
+     the writer's, not a view): a plain insert as it is, `ts, t, v, wall`
+     appended; a batched insert or delete, and a transaction, as one `applyOps`
+     entry at the first of the timestamps they were minted; an update's `o` is
+     mongod's `$v: 2` delta; a delete has no `o2`; a retryable write names
+     `lsid, txnNumber, stmtId, needsRetryImage, prevOpTime` (the chain kept in
+     memory and, after a restart, read from the session's
+     `config.transactions` row). `rw`, `bg` and `pi` are gone, and
+     `find` on `local.oplog.rs` returns the stored rows. A transaction over
+     16 MiB less 16 KiB is mongod's `partialTxn` chain (16 + 4 of twenty 1 MB
+     inserts, as measured), `count` on the last.
+   - Readers take one operation at a time through `oplog_entry::unwind`: an
+     entry's operations (an `applyOps`' elements), each with its entry's
+     fields, its place in the entry (`applyOpsIndex`) and, for an update, the
+     `updateDescription` its delta describes -- `secantus_core::diff`
+     reads the delta back with the code that makes the descriptions
+     (`update_description_from_oplog_diff`, `apply_oplog_diff`), as mongod's
+     change stream builds its event from the delta alone. Change streams,
+     replay, crash recovery, the pre-image lookup and the PITR carry-over use
+     it. A pre-image is found by `(ui, entry ts, applyOpsIndex)`, so the `pi`
+     field was never needed.
+   - A change-stream event inside an `applyOps` has `txnOpIndex` in its resume
+     token (`x`); a resume from it reads the entry again and skips the events
+     before it.
+   - Every user transaction, the PostgreSQL server's included, holds its
+     entries on its handle to its commit (`pending_async`, which is also its
+     write set and the READ COMMITTED overlay's source), then logs them as one
+     entry under a session of its own (`oplog_session`: a synthetic lsid, as
+     mongod's entry names one). `transactions_logged_at_commit` is gone: it is
+     always so. An open transaction therefore mints nothing and pins nothing.
+   - PREPARE TRANSACTION writes mongod's prepare entry (`o: {applyOps,
+     prepare: true}`) at the prepare, in a transaction of its own, and records
+     its position (`prepareTs`) and session in the prepared-xact row, which
+     keeps the write set for a restart; COMMIT PREPARED writes
+     `{commitTransaction: 1, commitTimestamp: <prepare ts>}` in the
+     transaction that commits, ROLLBACK PREPARED writes `abortTransaction`,
+     each with `prevOpTime` the prepare entry. "Already committed" is the
+     presence of that commit entry.
+   - DDL: `dropDatabase` has `fromMigrate: false`; `create`, `collMod`,
+     `dropIndexes`, `rename` and `drop` were already in the measured shapes.
+     **An index on a collection that has documents is a two-phase build**, as
+     measured: the build's row inserted into `config.system.indexBuilds`,
+     `startIndexBuild`, the row updated with `commitReadyMembers`,
+     `commitIndexBuild`, the row deleted -- five entries, the rows real writes
+     to a real collection made before the first index is (unlogged, as mongod
+     has it from its start). Several indexes of one `createIndexes` are ONE
+     build: one row, one start and one commit listing every spec (probed 8.2.11;
+     fixture step "two indexes"). An index on an **empty** collection is the one
+     `createIndexes` entry (probed 8.2.11, 2026-11-21). Replay reads the commit
+     as the `createIndexes` it was and the start as nothing. **DDL inside a
+     transaction** (probed 8.2.11: an explicit `create`, and the implicit one
+     of an insert into a new collection) is a member of the transaction's
+     `applyOps`, `{op: "c", ns: "app.$cmd", ui, o: {create, idIndex}}` before
+     the insert; here a transaction's DDL entries are stamped with its session
+     like its writes and grouped the same way. A name that is not UTF-8 is
+     logged as its bytes (also on the plain-insert fast path, which now leaves
+     an escaped name to the builder) and escaped again for the engine's readers
+     (`oplog_entry::unwind`).
+
+   **Landing:** 4b-1 to 4b-3 cannot land apart (the table, what is in it
+   and every reader of it), so they land together as store format 5, with
+   the crash tests: kill -9 at random points of a write burst, many times,
+   then reopen and check that every acknowledged write is present and that
+   no unacknowledged one is half-applied. 4b-4 lands alone; it changes no
+   stored byte. 4b-5 and 4b-6 land together as format 6. Each PR runs the
+   phase gate plus `do-perf` at 1, 4 and 16 writers against `main`.
 5. **Timeseries buckets.** Store time-series data as `system.buckets`
    bucket documents in a clustered collection, as mongod does; remove the
    framed value.

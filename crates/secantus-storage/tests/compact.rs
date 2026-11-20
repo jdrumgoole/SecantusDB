@@ -37,9 +37,8 @@ fn open_like_the_server(home: &std::path::Path) -> Storage {
         data_nonlogged: Some(true),
         // The server's oplog is logged: it is what recovers the unlogged
         // data, and a non-logged one is refused on this store (RM-731),
-        // whatever SECANTUS_OPLOG_NONLOGGED the async CI lane sets.
+        // whatever SECANTUS_OPLOG_NONLOGGED the non-logged-oplog CI lane sets.
         oplog_nonlogged: Some(false),
-        transactions_logged_at_commit: true,
         ..Default::default()
     };
     Storage::open_with_options(home.to_str().unwrap(), &opts).unwrap()

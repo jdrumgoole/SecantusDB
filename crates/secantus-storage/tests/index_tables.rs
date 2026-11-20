@@ -108,20 +108,34 @@ fn tables_named(st: &Storage, prefix: &str) -> Vec<String> {
 /// The secondary indexes' tables: every `index-<UUID>` table but the `_id_`
 /// index's of each collection (an index table of its own since phase 4d).
 fn index_tables(st: &Storage) -> Vec<String> {
-    let id_tables: BTreeSet<String> = st
+    let mut id_tables: BTreeSet<String> = st
         .list_collections("app")
         .unwrap()
         .iter()
         .filter_map(|c| st.index_table_name("app", c, "_id_").unwrap())
         .collect();
+    // `config.system.indexBuilds`, which mongod keeps and a build writes to.
+    id_tables.extend(
+        st.index_table_name("config", "system.indexBuilds", "_id_")
+            .unwrap(),
+    );
     tables_named(st, "table:index-")
         .into_iter()
         .filter(|t| !id_tables.contains(t))
         .collect()
 }
 
+/// The tables of user collections: `local.oplog.rs`'s own is a
+/// `collection-<UUID>` table too, and so is `config.system.indexBuilds`'s,
+/// which the first index build makes; neither is one of them.
 fn collection_tables(st: &Storage) -> Vec<String> {
+    let builds = st
+        .collection_table_name("config", "system.indexBuilds")
+        .unwrap();
     tables_named(st, "table:collection-")
+        .into_iter()
+        .filter(|t| t != st.oplog_table() && Some(t) != builds.as_ref())
+        .collect()
 }
 
 #[test]
@@ -368,8 +382,15 @@ fn dropping_an_index_or_its_collection_drops_the_table() {
         assert!(st.drop_collection("app", "c").unwrap());
         assert!(index_tables(st).is_empty());
         assert!(collection_tables(st).is_empty());
-        // Its `_id` index's table included.
-        assert!(tables_named(st, "table:index-").is_empty());
+        // Its `_id` index's table included (`config.system.indexBuilds`'s
+        // stays: the builds above made it).
+        let builds = st
+            .index_table_name("config", "system.indexBuilds", "_id_")
+            .unwrap();
+        assert_eq!(
+            tables_named(st, "table:index-"),
+            builds.into_iter().collect::<Vec<_>>()
+        );
     });
 }
 

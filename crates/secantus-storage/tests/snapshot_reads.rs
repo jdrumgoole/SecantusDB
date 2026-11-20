@@ -23,11 +23,10 @@ fn open(home: &std::path::Path, nonlogged: bool) -> Storage {
         &StorageOptions {
             data_nonlogged: Some(nonlogged),
             // Unlogged data is recovered from a logged oplog: a non-logged
-            // one is refused there (RM-731), whatever the async CI lane asks.
+            // one is refused there (RM-731), whatever the non-logged-oplog CI lane asks.
             // Always logged here, since a reopen may ask for one mode and
             // find the other recorded in the store.
             oplog_nonlogged: Some(false),
-            transactions_logged_at_commit: true,
             ..StorageOptions::default()
         },
     )

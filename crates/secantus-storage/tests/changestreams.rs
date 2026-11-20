@@ -49,13 +49,20 @@ fn project_op(
     // Async lane: wait out the drainer so the emitted entry is readable
     // (no-op in sync mode).
     st.flush_oplog();
-    let (seq, blob) = st
+    // The entry's operations, one at a time (an `applyOps` entry holds
+    // several): what the change stream projects.
+    let (seq, entry) = st
         .read_oplog(1, 100)
         .unwrap()
         .into_iter()
-        .find(|(_, b)| decode(b).get_str("op").unwrap() == op)
+        .find_map(|(seq, b)| {
+            secantus_storage::oplog_entry::unwind(&decode(&b))
+                .into_iter()
+                .find(|o| o.get_str("op") == Ok(op))
+                .map(|o| (seq, o))
+        })
         .expect("oplog entry");
-    changestreams::project(seq, &decode(&blob), st, full_doc, before, scope, false).unwrap()
+    changestreams::project(seq, &entry, st, full_doc, before, scope, false).unwrap()
 }
 
 fn coll_scope() -> Scope {
@@ -400,6 +407,7 @@ fn resume_token_round_trips() {
         document_key: doc! {"_id": 7},
         from_invalidate: false,
         fragment: None,
+        op_index: None,
     };
     let token = changestreams::make_resume_token(&data).unwrap();
     let parsed = changestreams::parse_resume_token(&token).unwrap();
@@ -432,6 +440,7 @@ fn over_16mb_event_splits_as_mongod_splits_it() {
         document_key: doc! {"_id": 1},
         from_invalidate: false,
         fragment: None,
+        op_index: None,
     })
     .unwrap();
     let event = doc! {
@@ -463,4 +472,52 @@ fn over_16mb_event_splits_as_mongod_splits_it() {
             1
         );
     }
+}
+
+#[test]
+fn a_two_index_build_is_one_create_indexes_event_with_both_specs() {
+    // mongod 8.2.11: a build of two indexes over documents logs one
+    // `commitIndexBuild` with both specs, and a change stream with
+    // showExpandedEvents gives one `createIndexes` event listing both, each
+    // spec in the entry's field order (`tests/mongod_live/test_index_builds.py`
+    // compares it with mongod). The unwound commit is the `createIndexes`
+    // replay reads, which once lost every spec but the first.
+    with_db(|st| {
+        let a = doc! {"v": 2, "key": {"a": 1}, "name": "a_1"};
+        let b = doc! {"v": 2, "unique": true, "key": {"b": -1}, "name": "b_-1", "sparse": true};
+        let entry = doc! {
+            "op": "c",
+            "ns": "app.$cmd",
+            "o": {
+                "commitIndexBuild": "c",
+                "indexBuildUUID": Bson::Binary(bson::Binary {
+                    subtype: bson::spec::BinarySubtype::Uuid,
+                    bytes: vec![9u8; 16],
+                }),
+                "indexes": [a.clone(), b.clone()],
+            },
+            "ts": Bson::Timestamp(Timestamp { time: 300, increment: 1 }),
+        };
+        let ops = secantus_storage::oplog_entry::unwind(&entry);
+        assert_eq!(ops.len(), 1);
+        let (ev, inv) = changestreams::project(
+            7,
+            &ops[0],
+            st,
+            FULL_DOC_DEFAULT,
+            FULL_DOC_DEFAULT,
+            &coll_scope(),
+            true, // show_expanded_events
+        )
+        .unwrap();
+        let ev = ev.expect("a createIndexes event");
+        assert!(!inv);
+        assert_eq!(ev.get_str("operationType").unwrap(), "createIndexes");
+        let indexes = ev
+            .get_document("operationDescription")
+            .unwrap()
+            .get_array("indexes")
+            .unwrap();
+        assert_eq!(indexes, &vec![Bson::Document(a), Bson::Document(b)]);
+    });
 }

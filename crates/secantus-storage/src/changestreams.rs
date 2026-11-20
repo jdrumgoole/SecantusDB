@@ -50,6 +50,10 @@ pub struct ResumeTokenData {
     /// For one fragment of a split event, its number from 0 (mongod's
     /// `fragmentNum`): resuming from it skips the fragments up to it.
     pub fragment: Option<i32>,
+    /// For an event of a write inside an `applyOps` entry (a transaction's, a
+    /// batch's), its place in the entry -- mongod's `txnOpIndex`: events of
+    /// one entry share its position and are told apart by it.
+    pub op_index: Option<i64>,
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -83,6 +87,9 @@ pub fn make_resume_token(data: &ResumeTokenData) -> Result<Document> {
     if let Some(f) = data.fragment {
         inner.insert("f", f);
     }
+    if let Some(x) = data.op_index {
+        inner.insert("x", x);
+    }
     let bytes = encode_doc(&inner)?;
     let mut out = Document::new();
     out.insert("_data", hex_encode(&bytes));
@@ -115,7 +122,16 @@ pub fn parse_resume_token(token: &Document) -> Result<ResumeTokenData> {
         document_key: inner.get_document("k").cloned().unwrap_or_default(),
         from_invalidate: inner.get_bool("i").unwrap_or(false),
         fragment: inner.get_i32("f").ok(),
+        op_index: inner.get_i64("x").ok(),
     })
+}
+
+/// The place of `op` (an unwound operation) in its `applyOps` entry, when it
+/// came out of one.
+fn op_index_of(op: &Document) -> Option<i64> {
+    op.get_bool(crate::oplog_entry::IN_APPLY_OPS)
+        .unwrap_or(false)
+        .then(|| op.get_i64(crate::oplog_entry::APPLY_OPS_INDEX).unwrap_or(0))
 }
 
 fn split_ns(ns: &str) -> (String, String) {
@@ -472,6 +488,7 @@ fn project_unordered(
             document_key: document_key.clone(),
             from_invalidate: false,
             fragment: None,
+            op_index: op_index_of(oplog_entry),
         })?;
         let mut event = Document::new();
         // A write made in a transaction names it, ahead of the token (mongod
@@ -580,6 +597,7 @@ fn project_command(
             document_key: Document::new(),
             from_invalidate: false,
             fragment: None,
+            op_index: op_index_of(oplog_entry),
         })?;
         let mut event = Document::new();
         event.insert("_id", Bson::Document(token));
@@ -694,9 +712,14 @@ fn project_command(
     if cmd.contains_key("startIndexBuild") || cmd.contains_key("abortIndexBuild") {
         return Ok((None, false));
     }
+    // A commit reaches here as the `createIndexes` replay reads, marked
+    // (`oplog_entry::INDEX_BUILD_COMMIT`), or as the entry itself.
+    let commit = oplog_entry
+        .get_bool(crate::oplog_entry::INDEX_BUILD_COMMIT)
+        .unwrap_or(false);
     let created = cmd
         .get_str("createIndexes")
-        .map(|c| (c, false))
+        .map(|c| (c, commit))
         .or_else(|_| cmd.get_str("commitIndexBuild").map(|c| (c, true)));
     if let Ok((coll, whole_build)) = created {
         if !show_expanded_events {
@@ -859,6 +882,7 @@ pub fn invalidate_event(seq: i64, oplog_entry: &Document) -> Result<Document> {
         document_key: Document::new(),
         from_invalidate: true,
         fragment: None,
+        op_index: op_index_of(oplog_entry),
     })?;
     let mut event = Document::new();
     event.insert("_id", Bson::Document(token));

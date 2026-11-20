@@ -253,6 +253,9 @@ fn run(cli: CliArgs) -> Result<(), String> {
     let mut running = bind(&addr, cli.server_config(), adapter, cursors)
         .map_err(|e| format!("failed to bind {addr}: {e}"))?;
 
+    // Where this member is, for an index build's `commitReadyMembers`.
+    storage.set_member_host(&running.address().to_string());
+
     // Background maintenance threads observe this flag and exit promptly (they
     // sleep in small increments) once shutdown is signalled.
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -370,18 +373,16 @@ fn storage_options(cli: &CliArgs) -> StorageOptions {
         ),
         mongod_message_config()
     );
-    // Storage write-path modes (--oplog-async / --oplog-nonlogged /
+    // Storage write-path modes (--oplog-nonlogged /
     // --data-nonlogged / --checkpoint-seconds): `None` defers to the matching
     // SECANTUS_* env var, so env-driven runs are unchanged.
     StorageOptions {
         wt_config: Some(wt),
-        oplog_async: cli.oplog_async,
         oplog_nonlogged: cli.oplog_nonlogged,
         // mongod's split, so writes carry the timestamps a snapshot read at a
         // past time reads by (RM-210); `--data-logged` opts out.
         data_nonlogged: Some(cli.data_nonlogged.unwrap_or(true)),
         checkpoint_seconds: cli.checkpoint_seconds,
-        transactions_logged_at_commit: true,
         // mongod's lock file: a clean shutdown empties it, and the next
         // start reads an unclean one from it (RM-305).
         lock_file: Some("mongod.lock".to_string()),

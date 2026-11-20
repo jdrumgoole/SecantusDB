@@ -115,21 +115,6 @@ fn a_pre_image_is_a_document_of_config_system_preimages() {
     with_store(StorageOptions::default(), check_one_update_pre_image);
 }
 
-/// The same through the asynchronous oplog, where the writer records the
-/// pre-image after its write commits and before the drainer writes the
-/// entry.
-#[test]
-fn a_pre_image_is_recorded_on_the_asynchronous_oplog() {
-    with_store(
-        StorageOptions {
-            oplog_async: Some(true),
-            data_nonlogged: Some(false),
-            ..StorageOptions::default()
-        },
-        check_one_update_pre_image,
-    );
-}
-
 /// A collection that records pre-images is not deleted in batches: mongod
 /// 8.2.11 writes each document of a `deleteMany` as its own `d` entry, in
 /// its read order, each pre-image under its entry's time at
@@ -282,7 +267,6 @@ fn crash_recovery_records_the_pre_images_it_replays() {
         durable: Some(true),
         data_nonlogged: Some(true),
         oplog_nonlogged: Some(false),
-        oplog_async: Some(false),
         ..StorageOptions::default()
     };
     if let Ok(home) = std::env::var(CHILD) {

@@ -366,7 +366,7 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
         }
     };
 
-    let opts = ChangeStreamOptions {
+    let mut opts = ChangeStreamOptions {
         full_document: cs_spec
             .get_str("fullDocument")
             .unwrap_or("default")
@@ -381,6 +381,7 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
             Some(Bson::Timestamp(ts)) => Some(*ts),
             _ => None,
         },
+        resume_skip: None,
     };
 
     // Start position (events read are strictly after it):
@@ -439,6 +440,12 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
                     && !storage.resume_token_from_invalidate(tok) =>
             {
                 expect_token = tok.get_str("_data").ok().map(str::to_string);
+                // An event inside an `applyOps` entry: the entry is read
+                // again from its start and what precedes the token's event in
+                // it is passed over.
+                if let Some(x) = storage.resume_token_op_index(tok) {
+                    opts.resume_skip = Some((seq, x));
+                }
                 seq - 1
             }
             Some(seq) => seq,

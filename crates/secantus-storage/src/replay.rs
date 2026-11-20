@@ -16,9 +16,6 @@ use bson::{Bson, Document, Timestamp};
 
 use crate::{Storage, StorageError};
 
-/// Genesis is seq 1: an empty-base replay is exact only when the source oplog
-/// still reaches it (hasn't been pruned from the front). Mirrors Python `_GENESIS_SEQ`.
-const GENESIS_SEQ: i64 = 1;
 const READ_CHUNK: usize = 2000;
 
 type Result<T> = std::result::Result<T, StorageError>;
@@ -327,8 +324,10 @@ fn replay(
             if carry {
                 carried.push((*seq, entry.clone()));
             }
-            if apply_entry(target, &entry)? {
-                stats.ops_applied += 1;
+            for op in crate::oplog_entry::unwind(&entry) {
+                if apply_entry(target, &op)? {
+                    stats.ops_applied += 1;
+                }
             }
         }
         start = batch[batch.len() - 1].0 + 1;
@@ -358,8 +357,10 @@ pub fn replay_entries(
         if carry {
             carried.push((*seq, entry.clone()));
         }
-        if apply_entry(target, entry)? {
-            stats.ops_applied += 1;
+        for op in crate::oplog_entry::unwind(entry) {
+            if apply_entry(target, &op)? {
+                stats.ops_applied += 1;
+            }
         }
     }
     Ok((stats, carried))
@@ -384,10 +385,13 @@ pub fn restore_to_timestamp(
             "source has no oplog to replay (was it created with enable_oplog?)".into(),
         ));
     }
-    if floor > GENESIS_SEQ {
+    // An empty-base replay is exact only when the source oplog still reaches
+    // its first entry (nothing was pruned from the front).
+    let pruned = source.oplog_pruned_through()?;
+    if pruned > 0 {
         return Err(StorageError::Internal(format!(
-            "source oplog floor is seq {floor}, past genesis (seq {GENESIS_SEQ}): it has been \
-             pruned from the front, so an empty-base replay would be partial"
+            "source oplog floor is position {floor}, past genesis (entries up to {pruned} were \
+             pruned): it has been pruned from the front, so an empty-base replay would be partial"
         )));
     }
     std::fs::create_dir_all(target_dir)
@@ -400,11 +404,11 @@ pub fn restore_to_timestamp(
         // (with pre-images) so a change stream on the restored server resumes
         // from a token minted before the restore point. Default (no carry) leaves
         // a fresh empty timeline, like mongorestore.
-        let mut pre_images: std::collections::HashMap<i64, Vec<u8>> =
+        let mut pre_images: std::collections::HashMap<(i64, i64), Vec<u8>> =
             std::collections::HashMap::new();
         for (seq, _) in &carried {
-            if let Some(pre) = source.read_preimage(*seq)? {
-                pre_images.insert(*seq, pre);
+            for (index, pre) in source.read_preimages_of(*seq)? {
+                pre_images.insert((*seq, index), pre);
             }
         }
         target.import_oplog_segment(&carried, &pre_images)?;

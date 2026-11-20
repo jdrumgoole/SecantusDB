@@ -1,0 +1,232 @@
+{
+ "mongod": "8.2.11",
+ "steps": [
+  {
+   "name": "prepare + commit",
+   "error": null,
+   "entries": [
+    {
+     "lsid": {
+      "id": "<bin4:16>",
+      "uid": "b\"\\xe3\\xb0\\xc4B\\x98\\xfc\\x1c\\x14\\x9a\\xfb\\xf4\\xc8\\x99o\\xb9$'\\xaeA\\xe4d\\x9b\\x93L\\xa4\\x95\\x99\\x1bxR\\xb8U\""
+     },
+     "txnNumber": 1,
+     "op": "c",
+     "ns": "admin.$cmd",
+     "o": {
+      "applyOps": [
+       {
+        "op": "i",
+        "ns": "app.c",
+        "ui": "<bin4:16>",
+        "o": {
+         "_id": 0
+        },
+        "o2": {
+         "_id": 0
+        }
+       },
+       {
+        "op": "i",
+        "ns": "app.c",
+        "ui": "<bin4:16>",
+        "o": {
+         "_id": 1
+        },
+        "o2": {
+         "_id": 1
+        }
+       },
+       {
+        "op": "i",
+        "ns": "app.c",
+        "ui": "<bin4:16>",
+        "o": {
+         "_id": 2
+        },
+        "o2": {
+         "_id": 2
+        }
+       },
+       {
+        "op": "u",
+        "ns": "app.c",
+        "ui": "<bin4:16>",
+        "o": {
+         "$v": 2,
+         "diff": {
+          "i": {
+           "a": 1
+          }
+         }
+        },
+        "o2": {
+         "_id": 0
+        }
+       }
+      ],
+      "prepare": true
+     },
+     "ts": [
+      "ts",
+      1795136722,
+      6
+     ],
+     "t": 2,
+     "v": 2,
+     "prevOpTime": {
+      "ts": [
+       "ts",
+       0,
+       0
+      ],
+      "t": -1
+     }
+    },
+    {
+     "lsid": {
+      "id": "<bin4:16>",
+      "uid": "b\"\\xe3\\xb0\\xc4B\\x98\\xfc\\x1c\\x14\\x9a\\xfb\\xf4\\xc8\\x99o\\xb9$'\\xaeA\\xe4d\\x9b\\x93L\\xa4\\x95\\x99\\x1bxR\\xb8U\""
+     },
+     "txnNumber": 1,
+     "op": "c",
+     "ns": "admin.$cmd",
+     "o": {
+      "commitTransaction": 1,
+      "commitTimestamp": [
+       "ts",
+       1795136722,
+       6
+      ]
+     },
+     "ts": [
+      "ts",
+      1795136722,
+      7
+     ],
+     "t": 2,
+     "v": 2,
+     "prevOpTime": {
+      "ts": [
+       "ts",
+       1795136722,
+       6
+      ],
+      "t": 2
+     }
+    }
+   ]
+  },
+  {
+   "name": "prepare + abort",
+   "error": null,
+   "entries": [
+    {
+     "lsid": {
+      "id": "<bin4:16>",
+      "uid": "b\"\\xe3\\xb0\\xc4B\\x98\\xfc\\x1c\\x14\\x9a\\xfb\\xf4\\xc8\\x99o\\xb9$'\\xaeA\\xe4d\\x9b\\x93L\\xa4\\x95\\x99\\x1bxR\\xb8U\""
+     },
+     "txnNumber": 1,
+     "op": "c",
+     "ns": "admin.$cmd",
+     "o": {
+      "applyOps": [
+       {
+        "op": "i",
+        "ns": "app.c",
+        "ui": "<bin4:16>",
+        "o": {
+         "_id": 0
+        },
+        "o2": {
+         "_id": 0
+        }
+       },
+       {
+        "op": "i",
+        "ns": "app.c",
+        "ui": "<bin4:16>",
+        "o": {
+         "_id": 1
+        },
+        "o2": {
+         "_id": 1
+        }
+       },
+       {
+        "op": "i",
+        "ns": "app.c",
+        "ui": "<bin4:16>",
+        "o": {
+         "_id": 2
+        },
+        "o2": {
+         "_id": 2
+        }
+       },
+       {
+        "op": "u",
+        "ns": "app.c",
+        "ui": "<bin4:16>",
+        "o": {
+         "$v": 2,
+         "diff": {
+          "i": {
+           "a": 1
+          }
+         }
+        },
+        "o2": {
+         "_id": 0
+        }
+       }
+      ],
+      "prepare": true
+     },
+     "ts": [
+      "ts",
+      1795136723,
+      2
+     ],
+     "t": 2,
+     "v": 2,
+     "prevOpTime": {
+      "ts": [
+       "ts",
+       0,
+       0
+      ],
+      "t": -1
+     }
+    },
+    {
+     "lsid": {
+      "id": "<bin4:16>",
+      "uid": "b\"\\xe3\\xb0\\xc4B\\x98\\xfc\\x1c\\x14\\x9a\\xfb\\xf4\\xc8\\x99o\\xb9$'\\xaeA\\xe4d\\x9b\\x93L\\xa4\\x95\\x99\\x1bxR\\xb8U\""
+     },
+     "txnNumber": 1,
+     "op": "c",
+     "ns": "admin.$cmd",
+     "o": {
+      "abortTransaction": 1
+     },
+     "ts": [
+      "ts",
+      1795136723,
+      3
+     ],
+     "t": 2,
+     "v": 2,
+     "prevOpTime": {
+      "ts": [
+       "ts",
+       1795136723,
+       2
+      ],
+      "t": 2
+     }
+    }
+   ]
+  }
+ ]
+}

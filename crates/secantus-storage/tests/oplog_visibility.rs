@@ -25,18 +25,8 @@ fn temp_home() -> PathBuf {
 
 fn with_db(body: impl FnOnce(&Storage)) {
     let home = temp_home();
-    // These tests pin SYNC-mode semantics (the in-flight mint window); async
-    // mode mints post-commit, so there is no window to test. Pin the mode
-    // explicitly so the SECANTUS_OPLOG_ASYNC=1 CI lane still exercises the
-    // sync invariants (the option beats the env var).
-    let mut st = Storage::open_with_options(
-        home.to_str().unwrap(),
-        &StorageOptions {
-            oplog_async: Some(false),
-            ..StorageOptions::default()
-        },
-    )
-    .unwrap();
+    let mut st =
+        Storage::open_with_options(home.to_str().unwrap(), &StorageOptions::default()).unwrap();
     // The collections written below exist before the first counted write:
     // a write that creates its collection records the creation too.
     st.set_enable_oplog(false);
@@ -53,53 +43,59 @@ fn enc(d: &Document) -> Vec<u8> {
     bson::to_vec(d).unwrap()
 }
 
-/// A minted-but-uncommitted entry (open user transaction) must pin the
-/// visible tail below it: `wait_for_oplog` must not report past the hole and
-/// `read_oplog` must not serve later-committed rows across it. Once the
-/// transaction commits, everything becomes visible in seq order.
+/// A user transaction's writes are held to its commit, as mongod holds a
+/// transaction's operations: an open transaction has minted nothing, so it
+/// pins nothing and a write committed beside it is visible at once; at its
+/// commit the transaction is one entry, after those. (A position is the
+/// entry's timestamp: `tail` is the position of the newest entry minted.)
 #[test]
-fn in_flight_txn_pins_visible_tail() {
+fn an_open_transaction_logs_nothing_until_it_commits() {
     with_db(|st| {
-        // seq 1: plain committed insert (baseline position).
         st.insert_one("app", "x", &enc(&doc! {"_id": 0})).unwrap();
-        assert_eq!(st.wait_for_oplog(0, 10), 1);
+        let p1 = st.oplog_tail_seq();
+        assert_eq!(st.wait_for_oplog(0, 10), p1);
 
-        // seq 2: minted inside an OPEN user transaction — uncommitted.
         let mut txn = st.begin_user_transaction().unwrap();
         st.with_user_transaction(&mut txn, || {
             st.insert_one("app", "x", &enc(&doc! {"_id": 1}))
         })
         .unwrap()
         .unwrap();
+        // Nothing minted, so nothing in flight.
+        assert_eq!(st.oplog_tail_seq(), p1);
 
-        // seq 3: a different collection commits AFTER the in-flight mint.
+        // A different write commits beside it and is visible at once.
         st.insert_one("app", "y", &enc(&doc! {"_id": 2})).unwrap();
-
-        // The visible tail must stay pinned at 1: seq 2 is in flight, so
-        // reporting 3 would let a reader advance past the hole and lose 2.
-        assert_eq!(
-            st.wait_for_oplog(1, 10),
-            1,
-            "tail passed a minted-but-uncommitted entry"
-        );
-        // And the scan must not serve seq 3 across the in-flight hole.
-        let rows = st.read_oplog(2, 100).unwrap();
-        assert!(
-            rows.is_empty(),
-            "read_oplog served rows past an in-flight mint: {:?}",
-            rows.iter().map(|(s, _)| *s).collect::<Vec<_>>()
-        );
-
-        // Commit resolves the hole: everything visible, in order.
-        st.commit_user_transaction(&mut txn).unwrap();
-        assert_eq!(st.wait_for_oplog(1, 10), 3);
+        let p3 = st.oplog_tail_seq();
+        assert!(p3 > p1);
+        assert_eq!(st.wait_for_oplog(p1, 10), p3);
         let seqs: Vec<i64> = st
-            .read_oplog(2, 100)
+            .read_oplog(p1 + 1, 100)
             .unwrap()
             .iter()
             .map(|(s, _)| *s)
             .collect();
-        assert_eq!(seqs, vec![2, 3]);
+        assert_eq!(seqs, vec![p3], "the insert only");
+        let before = seqs.len();
+
+        // The commit logs the transaction, after those, as one entry.
+        st.commit_user_transaction(&mut txn).unwrap();
+        let rows = st.read_oplog(p1 + 1, 100).unwrap();
+        assert_eq!(rows.len(), before + 1);
+        let (seq, blob) = rows.last().unwrap();
+        assert!(*seq > p3);
+        assert_eq!(st.wait_for_oplog(p1, 10), *seq);
+        let entry: Document = bson::from_slice(blob).unwrap();
+        assert_eq!(entry.get_str("op"), Ok("c"));
+        assert_eq!(
+            entry
+                .get_document("o")
+                .unwrap()
+                .get_array("applyOps")
+                .unwrap()
+                .len(),
+            1
+        );
     });
 }
 
@@ -109,8 +105,9 @@ fn in_flight_txn_pins_visible_tail() {
 fn rolled_back_mint_does_not_stall_tail() {
     with_db(|st| {
         st.insert_one("app", "x", &enc(&doc! {"_id": 0})).unwrap();
+        let p1 = st.oplog_tail_seq();
 
-        // seq 2 minted in a txn that rolls back — never becomes visible.
+        // p2 minted in a txn that rolls back -- never becomes visible.
         let mut txn = st.begin_user_transaction().unwrap();
         st.with_user_transaction(&mut txn, || {
             st.insert_one("app", "x", &enc(&doc! {"_id": 1}))
@@ -119,22 +116,23 @@ fn rolled_back_mint_does_not_stall_tail() {
         .unwrap();
         st.rollback_user_transaction(&mut txn).unwrap();
 
-        // seq 3: committed after the abandoned mint.
+        // p3: committed after the abandoned mint.
         st.insert_one("app", "y", &enc(&doc! {"_id": 2})).unwrap();
+        let p3 = st.oplog_tail_seq();
 
         // The abandoned range must not pin the tail forever.
         assert_eq!(
-            st.wait_for_oplog(1, 10),
-            3,
+            st.wait_for_oplog(p1, 10),
+            p3,
             "tail stalled on a rolled-back mint"
         );
         let seqs: Vec<i64> = st
-            .read_oplog(2, 100)
+            .read_oplog(p1 + 1, 100)
             .unwrap()
             .iter()
             .map(|(s, _)| *s)
             .collect();
-        assert_eq!(seqs, vec![3]);
+        assert_eq!(seqs, vec![p3]);
     });
 }
 
@@ -146,47 +144,36 @@ fn ts_of(blob: &[u8]) -> bson::Timestamp {
     }
 }
 
-/// `find_seq_for_ts` (the startAtOperationTime mapping) must not finalise a
-/// position past an in-flight mint whose entry also qualifies: it waits for
-/// the in-flight window to drain past its committed-view answer and rescans,
-/// so a commit that lands mid-wait surfaces the earlier seq.
+/// `find_seq_for_ts` (the startAtOperationTime mapping) answers from what is
+/// committed at once while a user transaction is open: its writes are held to
+/// its commit and mint nothing, so there is no in-flight window to wait out.
 #[test]
-fn find_seq_for_ts_waits_for_in_flight_mint() {
+fn find_seq_for_ts_does_not_wait_on_an_open_transaction() {
     with_db(|st| {
-        // seq 1 (committed): gives us a readable ts to anchor the target.
         st.insert_one("app", "x", &enc(&doc! {"_id": 0})).unwrap();
         let rows = st.read_oplog(1, 1).unwrap();
         let ts1 = ts_of(&rows[0].1);
-        // Target: strictly after seq 1's ts, at or before every later mint.
         let target = bson::Timestamp {
             time: ts1.time,
             increment: ts1.increment + 1,
         };
 
-        // seq 2: minted in an OPEN transaction — its ts satisfies the target,
-        // but the committed view's first match is seq 3.
         let mut txn = st.begin_user_transaction().unwrap();
         st.with_user_transaction(&mut txn, || {
             st.insert_one("app", "x", &enc(&doc! {"_id": 1}))
         })
         .unwrap()
         .unwrap();
-        // seq 3: committed after the in-flight mint.
         st.insert_one("app", "y", &enc(&doc! {"_id": 2})).unwrap();
+        let p3 = st.oplog_tail_seq();
 
-        // Commit the transaction from another thread while find_seq_for_ts
-        // waits on the in-flight window.
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                std::thread::sleep(std::time::Duration::from_millis(120));
-                st.commit_user_transaction(&mut txn).unwrap();
-            });
-            let seq = st.find_seq_for_ts(target).unwrap();
-            assert_eq!(
-                seq, 2,
-                "startAtOperationTime finalised past an in-flight mint"
-            );
-        });
+        let started = std::time::Instant::now();
+        assert_eq!(st.find_seq_for_ts(target).unwrap(), p3);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "it waited on a transaction that minted nothing"
+        );
+        st.commit_user_transaction(&mut txn).unwrap();
     });
 }
 
@@ -209,6 +196,7 @@ fn find_seq_for_ts_rolled_back_mint_returns_committed_answer() {
         .unwrap()
         .unwrap();
         st.insert_one("app", "y", &enc(&doc! {"_id": 2})).unwrap();
+        let p3 = st.oplog_tail_seq();
 
         std::thread::scope(|s| {
             s.spawn(|| {
@@ -216,17 +204,21 @@ fn find_seq_for_ts_rolled_back_mint_returns_committed_answer() {
                 st.rollback_user_transaction(&mut txn).unwrap();
             });
             let seq = st.find_seq_for_ts(target).unwrap();
-            assert_eq!(seq, 3, "rolled-back mint should leave the committed answer");
+            assert_eq!(
+                seq, p3,
+                "rolled-back mint should leave the committed answer"
+            );
         });
     });
 }
 
-/// Multi-statement transaction: every statement's mint joins the same
-/// in-flight window; nothing leaks visible until the single commit.
+/// A multi-statement transaction is one entry, at its commit, holding every
+/// statement's writes; nothing of it shows before.
 #[test]
-fn multi_statement_txn_holds_all_mints_until_commit() {
+fn a_multi_statement_txn_is_one_entry_at_its_commit() {
     with_db(|st| {
         st.insert_one("app", "x", &enc(&doc! {"_id": 0})).unwrap();
+        let p1 = st.oplog_tail_seq();
 
         let mut txn = st.begin_user_transaction().unwrap();
         st.with_user_transaction(&mut txn, || {
@@ -239,21 +231,22 @@ fn multi_statement_txn_holds_all_mints_until_commit() {
         })
         .unwrap()
         .unwrap();
-
-        // Concurrent autocommit writer lands seq 4.
-        st.insert_one("app", "z", &enc(&doc! {"_id": 3})).unwrap();
-
-        assert_eq!(st.wait_for_oplog(1, 10), 1);
-        assert!(st.read_oplog(2, 100).unwrap().is_empty());
+        assert_eq!(st.oplog_tail_seq(), p1);
+        assert!(st.read_oplog(p1 + 1, 100).unwrap().is_empty());
 
         st.commit_user_transaction(&mut txn).unwrap();
-        assert_eq!(st.wait_for_oplog(1, 10), 4);
-        let seqs: Vec<i64> = st
-            .read_oplog(2, 100)
+        let rows = st.read_oplog(p1 + 1, 100).unwrap();
+        assert_eq!(rows.len(), 1, "one entry");
+        let entry: Document = bson::from_slice(&rows[0].1).unwrap();
+        let ops: Vec<&str> = entry
+            .get_document("o")
+            .unwrap()
+            .get_array("applyOps")
             .unwrap()
             .iter()
-            .map(|(s, _)| *s)
+            .map(|o| o.as_document().unwrap().get_str("ns").unwrap())
             .collect();
-        assert_eq!(seqs, vec![2, 3, 4]);
+        assert_eq!(ops, vec!["app.x", "app.y"]);
+        assert!(entry.contains_key("lsid") && entry.contains_key("txnNumber"));
     });
 }

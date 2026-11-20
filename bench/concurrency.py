@@ -1,7 +1,7 @@
 """N-writer concurrency benchmark — Python server, Rust server, or mongod.
 
 Spawns one server with on-disk WT storage (``--server python`` /
-``rust`` / ``rust-async`` / ``mongod``, or ``all`` to sweep the four
+``rust`` / ``mongod``, or ``all`` to sweep the three
 back-to-back with a combined scaling table), then runs a
 configurable list of writer counts (default ``1,2,4,8``) one after
 another. For each count, ``N`` ``bench.load_writer`` processes write
@@ -49,7 +49,7 @@ DEFAULT_COLLECTION_PREFIX = "inserts_8k_w"
 # ``--server all`` sweep order. One full pass over every server per run,
 # so multi-run medians interleave the servers (thermal / background
 # drift lands on all of them, not just the last one measured).
-ALL_SERVERS = ["python", "rust", "rust-async", "mongod"]
+ALL_SERVERS = ["python", "rust", "mongod"]
 
 # Final summary line from ``bench/load_writer.py``:
 #   ``finished: 80,000 attempts in 30.01s (2,665 attempts/s avg) — 80,000 succeeded, 0 failed``
@@ -189,7 +189,7 @@ def server_versions(servers: list[str]) -> dict[str, dict[str, str]]:
     results file's ``meta`` (the 2026-11-18 run recorded neither)."""
     versions: dict[str, dict[str, str]] = {}
     for server in servers:
-        if server in ("rust", "rust-async"):
+        if server == "rust":
             versions[server] = parse_rust_version(_version_lines([_rust_binary(), "--version"]))
         elif server == "mongod":
             mongod = _mongod_binary()
@@ -226,7 +226,7 @@ def _server_argv(server: str, port: int, storage_path: Path) -> list[str]:
             "--log-level",
             "WARNING",
         ]
-    if server in ("rust", "rust-async"):
+    if server == "rust":
         argv = [
             _rust_binary(),
             "--host",
@@ -240,13 +240,6 @@ def _server_argv(server: str, port: int, storage_path: Path) -> list[str]:
             "--log-level",
             "INFO",
         ]
-        if server == "rust-async":
-            # The documented stack: logged data tables. On the default
-            # unlogged ones the drainer is not used, and a non-logged oplog
-            # left nothing in the log -- the 2026-11-18 run measured that,
-            # and a crash lost acknowledged writes. The server refuses it
-            # now (RM-731).
-            argv += ["--data-logged", "--oplog-async", "--oplog-nonlogged"]
         return argv
     if server == "mongod":
         # SECANTUS_MONGOD_BIN pins a specific mongod, mirroring SECANTUSDB_BIN
@@ -557,12 +550,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--server",
         default="python",
-        choices=["python", "rust", "rust-async", "mongod", "all"],
+        choices=["python", "rust", "mongod", "all"],
         help="Which server to drive (default: python). "
-        "'rust-async' is the Rust server's opt-in async + "
-        "non-logged oplog stack, on logged data tables. 'all' sweeps python, rust, "
-        "rust-async, and mongod back-to-back and prints a "
-        "combined table.",
+        "'all' sweeps python, rust and mongod back-to-back and "
+        "prints a combined table.",
     )
     p.add_argument(
         "--runs",

@@ -209,6 +209,7 @@ impl AutoCompactor {
             gate: self.gate.clone(),
             files: HashMap::new(),
             ema: 0,
+            oplog_file: None,
         };
         let handle = std::thread::Builder::new()
             .name("secantus-compact-server".into())
@@ -273,9 +274,22 @@ struct Server {
     gate: Arc<Mutex<()>>,
     files: HashMap<String, FileRecord>,
     ema: u64,
+    /// The file of `local.oplog.rs`'s table, once looked up.
+    oplog_file: Option<Option<String>>,
 }
 
 impl Server {
+    /// The files `autoCompact` leaves alone: the oplog's, as mongod excludes
+    /// its oplog table. Its file is named by the ident `_mdb_catalog` gives
+    /// `local.oplog.rs`.
+    fn excluded(&mut self, session: &Session, file: &str) -> Result<bool> {
+        if self.oplog_file.is_none() {
+            let ident = crate::mdb_catalog::ident_of_ns(session, crate::OPLOG_NS)?;
+            self.oplog_file = Some(ident.map(|i| format!("{i}.wt")));
+        }
+        Ok(self.oplog_file.as_ref().and_then(|f| f.as_deref()) == Some(file))
+    }
+
     fn run(mut self) {
         if let Err(e) = self.serve() {
             // 11.3 panics the connection here ("compact server error"). A
@@ -420,7 +434,7 @@ impl Server {
             if !key.starts_with("file:") {
                 return Ok(None);
             }
-            if !self.should_skip(&key, config)? {
+            if !self.should_skip(session, &key, config)? {
                 return Ok(Some(key));
             }
             more = cursor.next()?;
@@ -429,14 +443,14 @@ impl Server {
     }
 
     /// 11.3's `__background_compact_should_skip`.
-    fn should_skip(&mut self, uri: &str, config: &Config) -> Result<bool> {
+    fn should_skip(&mut self, session: &Session, uri: &str, config: &Config) -> Result<bool> {
         let name = uri.trim_start_matches("file:");
         // WiredTiger's own files (its history store, its metadata) are not
         // a session's to compact.
         if name.starts_with("WiredTiger") {
             return Ok(true);
         }
-        if excluded(name) {
+        if self.excluded(session, name)? {
             self.counters.excluded.fetch_add(1, Ordering::Relaxed);
             return Ok(true);
         }
@@ -522,12 +536,6 @@ impl Server {
             .tracked
             .store(self.files.len() as i64, Ordering::Relaxed);
     }
-}
-
-/// The files `autoCompact` leaves alone: the oplog's, as mongod excludes its
-/// oplog table.
-fn excluded(file: &str) -> bool {
-    file == "secantus_oplog.wt" || file.starts_with("secantus_oplog_sh")
 }
 
 const ENOENT: i32 = 2;

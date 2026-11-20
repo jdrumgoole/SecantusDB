@@ -23,7 +23,6 @@ Both `--flag value` and `--flag=value` spellings work.
 | `--cache-size SIZE` | WiredTiger cache, unit-suffixed (`256M`, `1G`, `8G`) | `4G` |
 | `--session-max N` | Max concurrent WiredTiger sessions (≈ client connections) | `1000` |
 | `--sync-on-commit` | fsync every commit (closes the `j: true` gap; large throughput cost) | off |
-| `--oplog-async` | Persist oplog entries via a background drainer pool instead of inside each write's commit (higher write throughput; change-stream events surface once drained). Only for a store created with `--data-logged`: a store whose data tables are not logged keeps the synchronous oplog | off, or `SECANTUS_OPLOG_ASYNC` |
 | `--oplog-nonlogged` | Create oplog tables `log=(enabled=false)` — checkpoint-durable only; a crash can lose the oplog tail. Only with `--data-logged`: on the default unlogged data tables the data is recovered from the oplog, so the server refuses it there (a crash would lose every write since the last checkpoint) | off, or `SECANTUS_OPLOG_NONLOGGED` |
 | `--data-nonlogged` | mongod's split: WAL-log only the oplog; data tables recover by oplog replay from the last stable checkpoint (see [Recovery](recovery.md)), and keep the history a snapshot read at a past time (`atClusterTime`) reads. Decided when a store is created; an existing store keeps its mode | on |
 | `--data-logged` | WAL-log the data tables too. No history: a snapshot read at a past time is refused (246) | off |
@@ -140,7 +139,6 @@ cache_size = "1G"
 session_max = 1000
 sync_on_commit = false
 # Storage modes:
-# oplog_async = true
 # oplog_nonlogged = true
 # data_nonlogged = true
 # checkpoint_seconds = 60

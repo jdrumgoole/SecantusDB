@@ -57,12 +57,12 @@ def test_rebuilds_the_pg_binary_provenance_checks() -> None:
     assert f'"{prov.PGSERVER_REL}"' in (ROOT / "scripts/gate_rm.py").read_text()
 
 
-def test_runs_ci_async_oplog_storage_step_with_its_environment() -> None:
-    """The gate's async-oplog storage step uses the environment CI's does."""
+def test_runs_ci_nonlogged_oplog_storage_step_with_its_environment() -> None:
+    """The gate's non-logged oplog storage step uses the environment CI's does."""
     wf = (ROOT / ".github/workflows/test.yml").read_text()
-    start = wf.index("- name: Cargo test (secantus-storage, async-oplog lane)")
+    start = wf.index("- name: Cargo test (secantus-storage, non-logged oplog lane)")
     block = wf[start : wf.index("- name: ", start + 1)]
-    for key, value in _gate_rm().ASYNC_OPLOG_ENV.items():
+    for key, value in _gate_rm().NONLOGGED_OPLOG_ENV.items():
         assert f'{key}: "{value}"' in block
     assert "working-directory: crates/secantus-storage" in block
 

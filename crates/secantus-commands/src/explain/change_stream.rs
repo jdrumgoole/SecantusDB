@@ -1051,6 +1051,7 @@ fn run_read(
             .iter()
             .any(|s| s.contains_key("$changeStreamSplitLargeEvent")),
         start_ts: raw.get_timestamp("startAtOperationTime").ok(),
+        resume_skip: None,
     };
     let tail = storage.oplog_tail_seq();
     let mut position = after;

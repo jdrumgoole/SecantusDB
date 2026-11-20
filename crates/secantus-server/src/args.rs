@@ -95,10 +95,9 @@ pub struct CliArgs {
     pub oplog_retention_seconds: f64,
     pub oplog_max_entries: usize,
     pub ttl_sweep_seconds: f64,
-    /// Storage write-path modes (`--oplog-async` / `--oplog-nonlogged` /
+    /// Storage write-path modes (`--oplog-nonlogged` /
     /// `--data-nonlogged` / `--checkpoint-seconds`). `None` defers to the
     /// matching `SECANTUS_*` env var via `StorageOptions`.
-    pub oplog_async: Option<bool>,
     pub oplog_nonlogged: Option<bool>,
     pub data_nonlogged: Option<bool>,
     pub checkpoint_seconds: Option<u64>,
@@ -172,7 +171,6 @@ impl CliArgs {
             oplog_retention_seconds: cfg.oplog_retention_seconds,
             oplog_max_entries: cfg.oplog_max_entries,
             ttl_sweep_seconds: cfg.ttl_sweep_seconds,
-            oplog_async: cfg.oplog_async,
             oplog_nonlogged: cfg.oplog_nonlogged,
             data_nonlogged: cfg.data_nonlogged,
             checkpoint_seconds: cfg.checkpoint_seconds,
@@ -383,7 +381,6 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 })?);
             }
             "--sync-on-commit" => o.sync_on_commit = Some(true),
-            "--oplog-async" => o.oplog_async = Some(true),
             "--oplog-nonlogged" => o.oplog_nonlogged = Some(true),
             "--data-nonlogged" => o.data_nonlogged = Some(true),
             "--data-logged" => o.data_nonlogged = Some(false),
@@ -452,7 +449,6 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                     | "--repair"
                     | "--enable-test-commands"
                     | "--sync-on-commit"
-                    | "--oplog-async"
                     | "--oplog-nonlogged"
                     | "--data-nonlogged"
                     | "--data-logged"
@@ -557,11 +553,6 @@ OPTIONS:
     --sync-on-commit             Fsync the WT log on every transaction commit
                                  (closes the writeConcern j:true durability gap
                                  at a throughput cost; off by default)
-    --oplog-async                Persist oplog entries via a background drainer
-                                 pool instead of inside each write's commit
-                                 (higher write throughput; change-stream events
-                                 become visible when drained. Default: off, or
-                                 SECANTUS_OPLOG_ASYNC)
     --oplog-nonlogged            Create oplog tables log=(enabled=false) —
                                  checkpoint-durable only. Measurement/ephemeral
                                  use; a crash can lose the oplog tail. Needs
@@ -640,7 +631,7 @@ mod tests {
             "D",
             "--port=27031",
             "--auth",
-            "--oplog-async",
+            "--oplog-nonlogged",
         ])
         .unwrap()
         {
@@ -753,7 +744,10 @@ mod tests {
         assert!(parse(&["--auth=yes"]).is_err());
         assert!(parse(&["--standalone=1"]).is_err());
         assert!(parse(&["--sync-on-commit=1"]).is_err());
-        assert!(parse(&["--oplog-async=1"]).is_err());
+        assert!(
+            parse(&["--oplog-async"]).is_err(),
+            "the asynchronous oplog is gone"
+        );
         assert!(parse(&["--oplog-nonlogged=1"]).is_err());
         assert!(parse(&["--data-nonlogged=1"]).is_err());
     }
@@ -762,7 +756,6 @@ mod tests {
     fn storage_mode_flags_default_to_env_deferral() {
         // No flag passed → None → StorageOptions defers to the SECANTUS_* env.
         let a = run(&[]);
-        assert_eq!(a.oplog_async, None);
         assert_eq!(a.oplog_nonlogged, None);
         assert_eq!(a.data_nonlogged, None);
         assert_eq!(a.checkpoint_seconds, None);
@@ -771,13 +764,11 @@ mod tests {
     #[test]
     fn storage_mode_flags_resolve() {
         let a = run(&[
-            "--oplog-async",
             "--oplog-nonlogged",
             "--data-nonlogged",
             "--checkpoint-seconds",
             "15",
         ]);
-        assert_eq!(a.oplog_async, Some(true));
         assert_eq!(a.oplog_nonlogged, Some(true));
         assert_eq!(a.data_nonlogged, Some(true));
         assert_eq!(a.checkpoint_seconds, Some(15));

@@ -122,7 +122,6 @@ RustServer(
     cache_size="4G",               # WiredTiger cache cap (filled lazily)
     session_max=1000,              # WiredTiger session cap
     sync_on_commit=False,          # fsync every commit (j:true semantics)
-    oplog_async=None,              # background oplog drainer pool
     oplog_nonlogged=None,          # oplog tables log=(enabled=false)
     data_nonlogged=None,           # WAL-log only the oplog; data tables
                                    # recover by replay from the last
@@ -138,7 +137,7 @@ RustServer(
 ```
 
 The storage-mode kwargs default to `None` = defer to the matching
-`SECANTUS_*` env var (`SECANTUS_OPLOG_ASYNC`, `SECANTUS_OPLOG_NONLOGGED`,
+`SECANTUS_*` env var (`SECANTUS_OPLOG_NONLOGGED`,
 `SECANTUS_CHECKPOINT_SECONDS`), so env-driven workflows are unchanged; an
 explicit value wins over the environment for this server only. The
 exception is `data_nonlogged`, which is on unless set to `False`, as
@@ -146,13 +145,13 @@ exception is `data_nonlogged`, which is on unless set to `False`, as
 history a snapshot read at a past time (`readConcern: {level: "snapshot",
 atClusterTime: ...}`) reads, which WiredTiger keeps for no logged table. A
 store created with `data_nonlogged=False` refuses such a read (246).
-A store whose data tables are not logged (the default) keeps the
-synchronous oplog, whatever `oplog_async` says: its writes carry their oplog
-timestamps. It also refuses `oplog_nonlogged=True`, because its data is
+Every write's oplog entry is written inside the write's own transaction, as
+mongod writes it (the asynchronous oplog drainer was removed, 2026-11-20). A
+store whose data tables are not logged (the default) refuses
+`oplog_nonlogged=True`, because its data is
 recovered by replaying the logged oplog; with the oplog out of the log too,
-a crash would lose every write since the last checkpoint (RM-731). The
-async + non-logged oplog stack is `data_nonlogged=False, oplog_async=True,
-oplog_nonlogged=True`. The table-config modes (`oplog_nonlogged`,
+a crash would lose every write since the last checkpoint (RM-731). A
+non-logged oplog needs `data_nonlogged=False`. The table-config modes (`oplog_nonlogged`,
 `data_nonlogged`) are create-time-sticky: they shape fresh stores, and an
 existing store keeps the mode it was created with (`data_nonlogged` is
 recorded in the store and always wins on reopen).

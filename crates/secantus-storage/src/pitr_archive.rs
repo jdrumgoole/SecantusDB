@@ -38,10 +38,23 @@ fn io_err(ctx: &str, e: impl std::fmt::Display) -> StorageError {
     StorageError::Internal(format!("{ctx}: {e}"))
 }
 
-/// Filename for a segment covering `[start, end]` (zero-padded so a lexical
-/// listing is also seq order).
-pub fn segment_name(start: i64, end: i64) -> String {
-    format!("{SEG_PREFIX}{start:020}-{end:020}{SEG_SUFFIX}")
+/// Filename for a segment covering `[start, end]` (positions are oplog
+/// timestamps; zero-padded so a lexical listing is also in order). `prev` is
+/// the position of the entry just before the segment's first -- 0 when the
+/// segment starts the oplog -- so segments chain by abutting: a segment
+/// follows another when its `prev` is the other's `end`.
+pub fn segment_name(start: i64, end: i64, prev: i64) -> String {
+    format!("{SEG_PREFIX}{start:020}-{end:020}-{prev:020}{SEG_SUFFIX}")
+}
+
+/// `(start, end, prev)` from a segment's file name.
+fn parse_segment_name(name: &str) -> Option<(i64, i64, i64)> {
+    let inner = name.strip_prefix(SEG_PREFIX)?.strip_suffix(SEG_SUFFIX)?;
+    let mut it = inner.split('-');
+    let start = it.next()?.parse().ok()?;
+    let end = it.next()?.parse().ok()?;
+    let prev = it.next()?.parse().ok()?;
+    it.next().is_none().then_some((start, end, prev))
 }
 
 /// Filename for a base snapshot whose oplog head is `head`.
@@ -49,12 +62,14 @@ pub fn base_name(head: i64) -> String {
     format!("{BASE_PREFIX}{head:020}{BASE_SUFFIX}")
 }
 
-/// Append `rows` (`(seq, entry, pre_image)` in seq order) as one segment file in
+/// Append `rows` (`(position, entry, pre_image)` in order; `prev` as for
+/// [`segment_name`]) as one segment file in
 /// `archive_dir`. Returns the path, or `None` if no rows. Writes to a temp file
 /// then atomically renames so a crash never leaves a half-segment.
 pub fn write_segment(
     archive_dir: &str,
     rows: &[(i64, Document, Option<Document>)],
+    prev: i64,
 ) -> Result<Option<String>> {
     let (Some((first, _, _)), Some((last, _, _))) = (rows.first(), rows.last()) else {
         return Ok(None);
@@ -74,8 +89,8 @@ pub fn write_segment(
         framed.extend_from_slice(&blob);
     }
     std::fs::create_dir_all(archive_dir).map_err(|e| io_err("write_segment", e))?;
-    let path = Path::new(archive_dir).join(segment_name(*first, *last));
-    let tmp = Path::new(archive_dir).join(format!(".{}.part", segment_name(*first, *last)));
+    let path = Path::new(archive_dir).join(segment_name(*first, *last, prev));
+    let tmp = Path::new(archive_dir).join(format!(".{}.part", segment_name(*first, *last, prev)));
     // The rows this segment holds are deleted from WiredTiger once it is
     // written, and the next checkpoint makes that delete durable: the
     // segment must be on disk first, its name included, or a power loss
@@ -156,6 +171,22 @@ pub fn iter_archived_oplog(archive_dir: &str) -> Result<Vec<(i64, Document, Opti
         out.extend(read_segment_file(Path::new(&path))?);
     }
     Ok(out)
+}
+
+/// Each archived segment's first position and the position its first entry
+/// follows (`prev`), read from the file names: `first -> prev`.
+pub fn segment_claims(archive_dir: &str) -> BTreeMap<i64, i64> {
+    let mut out = BTreeMap::new();
+    for path in glob_suffixed(archive_dir, SEG_PREFIX, SEG_SUFFIX) {
+        let name = Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Some((start, _end, prev)) = parse_segment_name(&name) {
+            out.insert(start, prev);
+        }
+    }
+    out
 }
 
 /// `[(head_seq, path), ...]` for the base snapshots in `archive_dir`, ascending.
@@ -276,18 +307,28 @@ pub fn restore_from_archive_dir(
         extract_backup_archive(path, target_dir)?;
     }
 
-    // Gather post-base oplog rows (seq > base_head): archived segments plus the
-    // newest snapshot's still-live oplog. Deduped by seq (every seq is immutable).
+    // Gather post-base oplog rows (position > base_head): archived segments
+    // plus the newest snapshot's still-live oplog. Deduped by position (an
+    // entry's timestamp is immutable). `claims` says, for the first row of
+    // each segment and of the live oplog, which entry it directly follows.
     let mut rows: BTreeMap<i64, Document> = BTreeMap::new();
-    let mut pre_map: std::collections::HashMap<i64, Vec<u8>> = std::collections::HashMap::new();
+    let mut pre_map: std::collections::HashMap<(i64, i64), Vec<u8>> =
+        std::collections::HashMap::new();
+    let mut claims = segment_claims(archive_dir);
     for (seq, entry, pre) in iter_archived_oplog(archive_dir)? {
         if seq > base_head {
             rows.entry(seq).or_insert(entry);
+            // `p`: each write's pre-image by its place in the entry.
             if let Some(p) = pre {
-                let mut buf = Vec::new();
-                secantus_core::bsondoc::write(&p, &mut buf)
-                    .map_err(|e| StorageError::Bson(e.to_string()))?;
-                pre_map.entry(seq).or_insert(buf);
+                for (index, v) in &p {
+                    let (Ok(index), Bson::Document(v)) = (index.parse::<i64>(), v) else {
+                        continue;
+                    };
+                    let mut buf = Vec::new();
+                    secantus_core::bsondoc::write(v, &mut buf)
+                        .map_err(|e| StorageError::Bson(e.to_string()))?;
+                    pre_map.entry((seq, index)).or_insert(buf);
+                }
             }
         }
     }
@@ -299,6 +340,10 @@ pub fn restore_from_archive_dir(
             let tmp_path = tmp.path().to_string_lossy().into_owned();
             extract_backup_archive(newest_path, &tmp_path)?;
             let src = Storage::open(&tmp_path)?;
+            let floor = src.oplog_floor_seq()?;
+            if floor > 0 {
+                claims.insert(floor, src.oplog_pruned_through()?);
+            }
             let mut start = base_head + 1;
             loop {
                 let batch = src.read_oplog(start, 2000)?;
@@ -310,9 +355,9 @@ pub fn restore_from_archive_dir(
                         let entry = secantus_core::bsondoc::from_bytes(blob)
                             .map_err(|e| StorageError::Bson(e.to_string()))?;
                         rows.entry(*seq).or_insert(entry);
-                        if carry_oplog && !pre_map.contains_key(seq) {
-                            if let Some(pre) = src.read_preimage(*seq)? {
-                                pre_map.insert(*seq, pre);
+                        if carry_oplog {
+                            for (index, pre) in src.read_preimages_of(*seq)? {
+                                pre_map.entry((*seq, index)).or_insert(pre);
                             }
                         }
                     }
@@ -322,17 +367,33 @@ pub fn restore_from_archive_dir(
         }
     }
 
-    // Contiguous run from base_head+1 — replay can't skip a missing seq.
+    // The run of rows that chains from the base's head: a row follows the
+    // last one taken when it is the next of its segment (no claim of its own)
+    // or its segment's `prev` names the last one taken. The first row only
+    // needs its `prev` at or before the base head (nothing lies between).
+    // Replay can't skip a missing entry.
     let mut contiguous: Vec<(i64, Document)> = Vec::new();
-    let mut expected = base_head + 1;
+    let mut last_taken = base_head;
+    let mut gap_after = base_head;
     for (seq, entry) in &rows {
-        if *seq != expected {
+        if let Some(prev) = claims.get(seq) {
+            let chains = if contiguous.is_empty() {
+                *prev <= base_head
+            } else {
+                *prev == last_taken
+            };
+            if !chains {
+                break;
+            }
+        } else if contiguous.is_empty() && base_head == 0 {
+            // From genesis the first row must start the oplog: it has to
+            // carry a claim of `prev == 0`.
             break;
         }
         contiguous.push((*seq, entry.clone()));
-        expected += 1;
+        last_taken = *seq;
+        gap_after = *seq;
     }
-    let gap_after = expected - 1;
     let has_more_past_gap = rows.keys().last().map(|m| *m > gap_after).unwrap_or(false);
 
     let mut target = Storage::open(target_dir)?;
@@ -340,9 +401,10 @@ pub fn restore_from_archive_dir(
     let (stats, carried) =
         crate::replay::replay_entries(&target, &contiguous, to_ts, to_wall_ms, carry_oplog)?;
     if carry_oplog && !carried.is_empty() {
-        let carried_pre: std::collections::HashMap<i64, Vec<u8>> = carried
+        let carried_pre: std::collections::HashMap<(i64, i64), Vec<u8>> = pre_map
             .iter()
-            .filter_map(|(seq, _)| pre_map.get(seq).map(|p| (*seq, p.clone())))
+            .filter(|((seq, _), _)| carried.iter().any(|(c, _)| c == seq))
+            .map(|(k, v)| (*k, v.clone()))
             .collect();
         target.import_oplog_segment(&carried, &carried_pre)?;
     }
@@ -354,7 +416,7 @@ pub fn restore_from_archive_dir(
     let reached = (stats.entries_seen as usize) < contiguous.len() || !bound_set;
     if bound_set && !reached && has_more_past_gap {
         return Err(StorageError::Internal(format!(
-            "archived oplog has a gap after seq {gap_after}: cannot reach the requested recovery \
+            "archived oplog has a gap after position {gap_after}: cannot reach the requested recovery \
              time — take more frequent base snapshots"
         )));
     }

@@ -27,7 +27,6 @@ fn options(server_like: bool) -> StorageOptions {
         // refused there (RM-731), whatever the async CI lane's env asks.
         oplog_nonlogged: server_like.then_some(false),
         durable: Some(true),
-        transactions_logged_at_commit: server_like,
         ..Default::default()
     }
 }
