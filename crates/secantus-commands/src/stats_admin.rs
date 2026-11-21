@@ -314,8 +314,13 @@ pub(crate) fn storage_stats(
         }
     }
     let index_total: i64 = sizes.values().filter_map(as_i64).sum();
+    // A clustered collection counts its clustering key among `nindexes` but
+    // has no index of that name to size (measured 8.2.11: `indexSizes` is
+    // empty of it).
+    let clustered = options.contains_key("clusteredIndex");
     let scaled: Document = sizes
         .iter()
+        .filter(|(k, _)| !(clustered && k.as_str() == "_id_"))
         .map(|(k, v)| (k.clone(), int(as_i64(v).unwrap_or(0) / scale)))
         .collect();
     let mut out = doc! { "size": int(size / scale) };

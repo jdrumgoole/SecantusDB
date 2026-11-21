@@ -456,11 +456,14 @@ def read_store(wt: str, home: Path) -> dict:
             ident_label[ident] = f"{ns}/{name}"
 
     size_storer = []
-    for k, v in _dump_hex(wt, home, "table:sizeStorer"):
-        ident = bytes.fromhex(k).rstrip(b"\x00").decode()
-        size_storer.append(
-            {"ident": ident, "label": ident_label.get(ident, ident), "value": _bson(v)}
-        )
+    # A SecantusDB store keeps its sizes in `secantus_size_storer` until phase
+    # 6 of the plan makes them mongod's `sizeStorer`: none is recorded then.
+    if "table:sizeStorer" in meta:
+        for k, v in _dump_hex(wt, home, "table:sizeStorer"):
+            ident = bytes.fromhex(k).rstrip(b"\x00").decode()
+            size_storer.append(
+                {"ident": ident, "label": ident_label.get(ident, ident), "value": _bson(v)}
+            )
 
     tables = []
     for uri, cfg in sorted(meta.items()):

@@ -17,12 +17,12 @@
 //! trailing fields under anything but an equality.
 
 use crate::near::Found;
-use crate::storage::{Storage, StorageError};
+use crate::storage::{RecordId, Storage, StorageError};
 use bson::{Bson, Document};
 use secantus_core::geoorder::near::{near_order, Measure};
 use secantus_core::geoorder::{FieldBounds, GeoIndex};
 
-type Rows = Vec<(i64, Vec<u8>)>;
+type Rows = Vec<(RecordId, Vec<u8>)>;
 
 /// The largest collection a `$near` replays mongod's search over (the
 /// search reads every index entry for its density estimate).
@@ -334,7 +334,7 @@ impl Scan {
 /// `rows` in `order` (indexes into it), then, when `keep_rest`, the rows
 /// it leaves out, in their own order.
 fn arrange(rows: Rows, order: Vec<usize>, keep_rest: bool) -> Rows {
-    let mut slots: Vec<Option<(i64, Vec<u8>)>> = rows.into_iter().map(Some).collect();
+    let mut slots: Vec<Option<(RecordId, Vec<u8>)>> = rows.into_iter().map(Some).collect();
     let mut out: Rows = order
         .into_iter()
         .filter_map(|i| slots.get_mut(i).and_then(Option::take))
@@ -375,7 +375,7 @@ fn collection(
     storage: &dyn Storage,
     db: &str,
     coll: &str,
-) -> Result<Option<Vec<(i64, Document)>>, StorageError> {
+) -> Result<Option<Vec<(RecordId, Document)>>, StorageError> {
     let Some(all) = storage.collection_at_most(db, coll, NEAR_COLLECTION)? else {
         return Ok(None);
     };
@@ -434,10 +434,10 @@ pub(crate) fn near_rows(
     let Some(order) = near_order(index, &base, &near.near, &docs, &passes) else {
         return Ok(Err(rows));
     };
-    let place: std::collections::HashMap<i64, usize> = order
+    let place: std::collections::HashMap<RecordId, usize> = order
         .iter()
         .enumerate()
-        .map(|(at, &i)| (all[i].0, at))
+        .map(|(at, &i)| (all[i].0.clone(), at))
         .collect();
     let (mut placed, rest_rows): (Rows, Rows) = rows
         .into_iter()

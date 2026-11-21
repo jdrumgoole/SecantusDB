@@ -428,7 +428,7 @@ impl SizeStorer {
             if let Some(cur) = cur {
                 while cur.next()? {
                     let value = cur.get_value_u()?;
-                    let (_idk, blob) = crate::unframe_doc_value(&value)?;
+                    let blob = value.as_slice();
                     let s = sizes.entry((db.clone(), coll.clone())).or_default();
                     s.apply(&Delta::insert(blob.len()), 1);
                 }

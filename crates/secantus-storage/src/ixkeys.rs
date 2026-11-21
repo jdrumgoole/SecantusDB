@@ -14,6 +14,7 @@ use bson::{Bson, Document};
 use secantus_core::collation::{self, Collation};
 use secantus_core::keystring::{self, Builder, Discriminator, Ordering, TypeBits, Version};
 use secantus_core::order::BinDataOrder;
+use secantus_core::recordid::RecordId;
 
 use crate::{Result, StorageError};
 
@@ -44,6 +45,10 @@ pub(crate) struct KeyShape {
     /// the subtype) where mongod orders BinData by length first: a
     /// BinData value is keyed as the text that orders so.
     bytes_order: bool,
+    /// The collection is clustered: an entry ends in the RecordId as the
+    /// bytes of the KeyString of `_id` (`appendRecordId` of a string), not
+    /// a long.
+    clustered: bool,
 }
 
 fn unsupported(_: keystring::Error) -> StorageError {
@@ -66,7 +71,14 @@ impl KeyShape {
             dirs,
             collation,
             bytes_order: order == BinDataOrder::Bytes,
+            clustered: false,
         }
+    }
+
+    /// This shape for the entries of a clustered collection's index.
+    pub fn clustered(mut self, clustered: bool) -> Self {
+        self.clustered = clustered;
+        self
     }
 
     /// Whether BinData values are keyed as `bytea`-ordered text (see
@@ -82,6 +94,7 @@ impl KeyShape {
             ordering: Ordering::all_ascending(),
             collation: None,
             bytes_order: false,
+            clustered: false,
         }
     }
 
@@ -112,12 +125,16 @@ impl KeyShape {
     }
 
     /// The entry for `values` held by `rid`.
-    pub fn entry(&self, values: &[Bson], rid: i64) -> Result<EntryKey> {
+    pub fn entry(&self, values: &[Bson], rid: &RecordId) -> Result<EntryKey> {
         let mut b = self.builder(Discriminator::Inclusive);
         for v in values {
             self.append(&mut b, v)?;
         }
-        b.append_record_id_long(rid).map_err(unsupported)?;
+        match rid {
+            RecordId::Long(n) => b.append_record_id_long(*n),
+            RecordId::Bytes(k) => b.append_record_id_bytes(k),
+        }
+        .map_err(unsupported)?;
         let (key, tb) = b.finish().map_err(unsupported)?;
         Ok(EntryKey {
             key,
@@ -127,7 +144,7 @@ impl KeyShape {
 
     /// The `_id_` entry of document `id` held by `rid` (see [`IdEntry`]).
     pub fn id_entry(&self, id: &Bson, rid: i64) -> Result<IdEntry> {
-        let e = self.entry(std::slice::from_ref(id), rid)?;
+        let e = self.entry(std::slice::from_ref(id), &RecordId::Long(rid))?;
         let (key, _) = keystring::without_record_id_long_at_end(&e.key).map_err(unsupported)?;
         let mut value = e.key[key.len()..].to_vec();
         value.extend_from_slice(&e.type_bits);
@@ -205,11 +222,16 @@ impl KeyShape {
     }
 
     /// An entry's values and RecordId.
-    pub fn decode(&self, key: &[u8], type_bits: &[u8]) -> Result<(Vec<Bson>, i64)> {
+    pub fn decode(&self, key: &[u8], type_bits: &[u8]) -> Result<(Vec<Bson>, RecordId)> {
         let bad = || StorageError::Internal("an index entry is not a KeyString".into());
         let tb = TypeBits::from_buffer(Version::V1, type_bits).map_err(|_| bad())?;
-        let (without_rid, rid) =
-            keystring::without_record_id_long_at_end(key).map_err(|_| bad())?;
+        let (without_rid, rid) = if self.clustered {
+            let (p, r) = keystring::without_record_id_str_at_end(key).map_err(|_| bad())?;
+            (p, RecordId::Bytes(r.to_vec()))
+        } else {
+            let (p, r) = keystring::without_record_id_long_at_end(key).map_err(|_| bad())?;
+            (p, RecordId::Long(r))
+        };
         let values = keystring::to_bson(without_rid, self.ordering, &tb).map_err(|_| bad())?;
         Ok((values, rid))
     }
@@ -223,18 +245,30 @@ pub(crate) fn id_entry_rid(value: &[u8]) -> Option<i64> {
 }
 
 /// The RecordId at the end of an entry's key.
-pub(crate) fn entry_rid(key: &[u8]) -> Option<i64> {
-    keystring::without_record_id_long_at_end(key)
-        .ok()
-        .map(|(_, rid)| rid)
+pub(crate) fn entry_rid(key: &[u8], clustered: bool) -> Option<RecordId> {
+    if clustered {
+        keystring::without_record_id_str_at_end(key)
+            .ok()
+            .map(|(_, rid)| RecordId::Bytes(rid.to_vec()))
+    } else {
+        keystring::without_record_id_long_at_end(key)
+            .ok()
+            .map(|(_, rid)| RecordId::Long(rid))
+    }
 }
 
 /// An entry's key without its RecordId: the KeyString of its values and the
 /// end byte.
-pub(crate) fn entry_prefix(key: &[u8]) -> Option<&[u8]> {
-    keystring::without_record_id_long_at_end(key)
-        .ok()
-        .map(|(p, _)| p)
+pub(crate) fn entry_prefix(key: &[u8], clustered: bool) -> Option<&[u8]> {
+    if clustered {
+        keystring::without_record_id_str_at_end(key)
+            .ok()
+            .map(|(p, _)| p)
+    } else {
+        keystring::without_record_id_long_at_end(key)
+            .ok()
+            .map(|(p, _)| p)
+    }
 }
 
 fn has_binary(v: &Bson) -> bool {
@@ -279,7 +313,10 @@ mod tests {
     fn an_entry_is_the_keystring_then_the_record_id() {
         let shape = KeyShape::new(&doc! {"a": 1, "b": -1}, None, BinDataOrder::Mongod);
         let e = shape
-            .entry(&[Bson::Int32(1), Bson::String("x".into())], 7)
+            .entry(
+                &[Bson::Int32(1), Bson::String("x".into())],
+                &RecordId::Long(7),
+            )
             .unwrap();
         let mut b = Builder::new(Version::V1, Ordering::from_directions(&[1, -1]));
         b.append_bson_element(&Bson::Int32(1)).unwrap();
@@ -288,10 +325,10 @@ mod tests {
         let (key, tb) = b.finish().unwrap();
         assert_eq!(e.key, key);
         assert_eq!(e.type_bits, tb.serialize());
-        assert_eq!(entry_rid(&e.key), Some(7));
+        assert_eq!(entry_rid(&e.key, false), Some(RecordId::Long(7)));
         let (values, rid) = shape.decode(&e.key, &e.type_bits).unwrap();
         assert_eq!(values, vec![Bson::Int32(1), Bson::String("x".into())]);
-        assert_eq!(rid, 7);
+        assert_eq!(rid, RecordId::Long(7));
     }
 
     #[test]
@@ -310,10 +347,12 @@ mod tests {
         let shape = KeyShape::new(&doc! {"a": 1}, None, BinDataOrder::Mongod);
         let exact = shape.exact(&[Bson::Int32(5)]).unwrap();
         for rid in [1, 300, i64::MAX] {
-            let e = shape.entry(&[Bson::Int32(5)], rid).unwrap();
+            let e = shape
+                .entry(&[Bson::Int32(5)], &RecordId::Long(rid))
+                .unwrap();
             assert!(e.key.starts_with(&exact));
         }
-        let other = shape.entry(&[Bson::Int32(6)], 1).unwrap();
+        let other = shape.entry(&[Bson::Int32(6)], &RecordId::Long(1)).unwrap();
         assert!(!other.key.starts_with(&exact));
         assert!(shape.seek(&[Bson::Int32(5)], false).unwrap() < exact);
         assert!(shape.seek(&[Bson::Int32(5)], true).unwrap() > exact);
@@ -328,7 +367,12 @@ mod tests {
                 bytes: b.to_vec(),
             })
         };
-        let key = |shape: &KeyShape, v: &Bson| shape.entry(std::slice::from_ref(v), 1).unwrap().key;
+        let key = |shape: &KeyShape, v: &Bson| {
+            shape
+                .entry(std::slice::from_ref(v), &RecordId::Long(1))
+                .unwrap()
+                .key
+        };
         let pg = KeyShape::new(&doc! {"b": 1}, None, BinDataOrder::Bytes);
         let mongod = KeyShape::new(&doc! {"b": 1}, None, BinDataOrder::Mongod);
         // PostgreSQL: the bytes, a shorter value first when it is a prefix.
@@ -342,8 +386,29 @@ mod tests {
     fn a_collated_string_is_keyed_by_its_sort_key() {
         let c = collation::parse(&doc! {"locale": "en", "strength": 2}).unwrap();
         let shape = KeyShape::new(&doc! {"s": 1}, Some(c), BinDataOrder::Mongod);
-        let a = shape.entry(&[Bson::String("Abc".into())], 1).unwrap();
-        let b = shape.entry(&[Bson::String("aBC".into())], 1).unwrap();
+        let a = shape
+            .entry(&[Bson::String("Abc".into())], &RecordId::Long(1))
+            .unwrap();
+        let b = shape
+            .entry(&[Bson::String("aBC".into())], &RecordId::Long(1))
+            .unwrap();
         assert_eq!(a.key, b.key);
+    }
+
+    #[test]
+    fn a_clustered_entry_ends_in_the_key_bytes_of_its_record_id() {
+        // The RecordId of a clustered collection is the KeyString of `_id`;
+        // an entry appends it as `appendRecordId` does a string RecordId:
+        // the bytes, then their length (measured on mongod 8.2.11: `x: 1`
+        // of `_id: 1` is `2b02 04 2b02 02`).
+        let shape = KeyShape::new(&doc! {"x": 1}, None, BinDataOrder::Mongod).clustered(true);
+        let rid = RecordId::Bytes(vec![0x2b, 0x02]);
+        let e = shape.entry(&[Bson::Int32(1)], &rid).unwrap();
+        assert_eq!(e.key, vec![0x2b, 0x02, 0x04, 0x2b, 0x02, 0x02]);
+        assert_eq!(entry_rid(&e.key, true), Some(rid.clone()));
+        assert_eq!(entry_prefix(&e.key, true), Some(&[0x2b, 0x02, 0x04][..]));
+        let (values, back) = shape.decode(&e.key, &e.type_bits).unwrap();
+        assert_eq!(values, vec![Bson::Int32(1)]);
+        assert_eq!(back, rid);
     }
 }

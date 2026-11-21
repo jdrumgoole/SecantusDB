@@ -795,6 +795,55 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
 5. **Timeseries buckets.** Store time-series data as `system.buckets`
    bucket documents in a clustered collection, as mongod does; remove the
    framed value.
+
+   **As built (phase 5, store format 7):** measured on mongod 8.2.11
+   (fixture `mongod-8.2.11-layout.json`, probes `tools/probes/` and the live
+   test `tests/mongod_live/test_clustered_collections.py`).
+   - **The value is the document.** `frame_doc_value`, `unframe_doc_value`
+     and the time-series key suffix are gone. The frame's `id_key` served
+     only the transaction undo log and the PostgreSQL read overlay's keys;
+     both derive it from `_id` when they write (`id_key_of_blob`), so a read
+     pays nothing and a scan strips nothing.
+   - **A clustered collection** (`clusteredIndex`, `system.buckets.*`,
+     `config.system.preimages`) has a table with `key_format=u` whose key is
+     the KeyString of `_id` (no TypeBits, no end byte), the document as the
+     value, and no `_id_` table, `idxIdent` entry or `md.indexes` row. The
+     placement (`secantus_idents`) records `clustered`; the table is made
+     with it. `system.buckets.*` is `block_compressor=zstd`.
+   - **`RecordId`** (`secantus_core::recordid`) is `Long(i64)` or
+     `Bytes(Vec<u8>)` wherever a collection's rows are named: the doc table
+     cursor, scans, candidates, index entries (a clustered collection's end
+     in `append_record_id_bytes`: key, end byte, the bytes and their size),
+     the `Storage` trait, the explain stream, `$recordId` (`Int64` or BinData)
+     and the spill members of a sort (`RID_AND_OBJ` holds the format byte, a
+     four-byte length and the bytes; measured by `spilledBytes`). Capped and
+     oplog positions remain counters.
+   - **Behaviour:** a duplicate `_id` is the row that already holds the key;
+     an `_id` range reads the table between the span's keys; pre-images are
+     read by `{nsUUID, ts, applyOpsIndex}` and expire per collection run;
+     the clustered `create` oplog entry carries `clusteredIndex` and no
+     `idIndex`; `collStats.indexSizes` leaves out the clustering key while
+     `nindexes` counts it.
+   - **Comparison tool** (`tools/probes/mongod_store_layout.py --secantusd`,
+     2026-11-21, now tolerant of a store with no `sizeStorer`): every table
+     both stores hold has the same file config, `app.clustered`,
+     `app.system.buckets.ts` and `config.system.preimages` among them
+     (`key_format=u`, snappy / zstd / snappy), their row counts agree, and
+     the clustered keys are mongod's byte for byte (`2b02`, `3c7300`,
+     `64`+ObjectId; the pre-image key's layout). Tables only mongod has:
+     `admin.system.{keys,users,roles}`, `<db>.system.views`, `sizeStorer`
+     and the build's `internal-*`; tables only this server has: the
+     `secantus_*` private tables, `app.ts` (and its index), the view `app.v_view`'s
+     `_id_`.
+   - **Still different from mongod after this phase** (for 6, 7 and the
+     backlog): the time-series collection's own namespace still has a table
+     and registry entry (mongod has the view and the buckets only); the
+     buckets collection's catalog options lack the `validator`,
+     `timeseries` and `timeseriesBucketsMayHaveMixedSchemaData` mongod
+     keeps; explain names `IXSCAN _id_` for a clustered collection where
+     mongod says `CLUSTERED_IXSCAN` / `EXPRESS_CLUSTERED_IXSCAN`; views are
+     still in the registry (phase 7); the size storer is still keyed by
+     namespace (phase 6).
 6. **Size storer and the PostgreSQL server.** Key sizes by ident.
    `pg_relation_filepath` (secantus-pg/src/lib.rs:22636) returns the ident's
    file. Confirm the SQL-to-collection hand-off test still passes.

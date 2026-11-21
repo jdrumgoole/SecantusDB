@@ -285,7 +285,11 @@ fn tailable_recordid_scan_follows_insertion_order_for_nonmonotonic_ids() {
 fn rids(st: &Storage, db: &str, coll: &str, wanted: &[i32]) -> Vec<Option<i64>> {
     let docs: Vec<Vec<u8>> = wanted.iter().map(|i| enc(&doc! {"_id": *i})).collect();
     let refs: Vec<&[u8]> = docs.iter().map(Vec::as_slice).collect();
-    st.record_ids_of(db, coll, &refs).unwrap()
+    st.record_ids_of(db, coll, &refs)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.and_then(|r| r.as_long()))
+        .collect()
 }
 
 fn insert_ids(st: &Storage, db: &str, coll: &str, ids: std::ops::Range<i32>) {
