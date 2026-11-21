@@ -455,6 +455,7 @@ pub(crate) fn find_examined_marks(
         returns: false,
         known: None,
         query: Some(&s.filter),
+        clustered: false,
     };
     let (marks, stats) = super::exec::run_marks(&node, &env);
     Some((marks, stats.totals()))

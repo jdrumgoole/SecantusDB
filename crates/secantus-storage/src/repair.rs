@@ -240,10 +240,10 @@ impl Storage {
                 }
             }
         }
-        let mut rows: Vec<(i64, Document)> = Vec::new();
-        self.visit_docs(&session, db, coll, |recordid, _idk, blob| {
+        let mut rows: Vec<(RecordId, Document)> = Vec::new();
+        self.visit_docs(&session, db, coll, |recordid, blob| {
             if id_table.is_some() {
-                rows.push((recordid, decode_doc(blob)?));
+                rows.push((recordid.clone(), decode_doc(blob)?));
             }
             Ok(())
         })?;
@@ -260,8 +260,12 @@ impl Storage {
                 let mut dup = 0u64;
                 for (recordid, doc) in chunk {
                     let id = doc.get("_id").unwrap_or(&Bson::Null);
+                    // A clustered collection has no `_id_` table to rebuild.
+                    let Some(long) = recordid.as_long() else {
+                        continue;
+                    };
                     let entry = shape
-                        .id_entry(id, *recordid)
+                        .id_entry(id, long)
                         .map_err(|_| StorageError::UnsupportedId)?;
                     if !seen.insert(entry.key.clone()) {
                         dup += 1;

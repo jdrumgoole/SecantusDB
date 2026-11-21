@@ -472,6 +472,8 @@ pub(crate) struct Docs<'a> {
     /// How many documents the collection holds; `None` when not counted,
     /// which serves a trial shorter than `internalQueryPlanEvaluationWorks`.
     pub total: Option<usize>,
+    /// The collection is clustered (`Env::clustered`).
+    pub clustered: bool,
 }
 
 impl Docs<'_> {
@@ -486,6 +488,7 @@ impl Docs<'_> {
             returns: false,
             known: self.known.as_deref(),
             query: None,
+            clustered: self.clustered,
         }
     }
 }

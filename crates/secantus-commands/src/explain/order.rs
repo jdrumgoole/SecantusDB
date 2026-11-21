@@ -34,7 +34,7 @@ use super::geo;
 use super::node::Node;
 use super::plan::{self, Query};
 use super::{catalog, parsed, resolve_hint};
-use crate::storage::{Pulled, RawHint, Storage, StorageError};
+use crate::storage::{Pulled, RawHint, RecordId, Storage, StorageError};
 use bson::{doc, Bson, Document};
 use secantus_core::collation::Collation;
 use std::borrow::Cow;
@@ -64,7 +64,7 @@ pub(crate) struct Ask<'a> {
 /// ([`Lazy::reached`]).
 const TRIAL_COLLECTION: usize = 2000;
 
-type Rows = Vec<(i64, Vec<u8>)>;
+type Rows = Vec<(RecordId, Vec<u8>)>;
 
 /// The stage under the ones that only pass documents along.
 fn access(node: &Node) -> &Node {
@@ -280,7 +280,7 @@ fn merge_ranks(
     storage: &dyn Storage,
     ask: &Ask,
     plan: &Node,
-) -> Result<Option<std::collections::HashMap<i64, usize>>, StorageError> {
+) -> Result<Option<std::collections::HashMap<RecordId, usize>>, StorageError> {
     let Some(all) = storage.collection_at_most(ask.db, ask.coll, TRIAL_COLLECTION)? else {
         return Ok(None);
     };
@@ -301,12 +301,13 @@ fn merge_ranks(
         returns: false,
         known: None,
         query: None,
+        clustered: exec::is_clustered(storage, ask.db, ask.coll),
     };
     Ok(Some(
         reached(plan, &env, docs.len())
             .into_iter()
             .enumerate()
-            .map(|(rank, at)| (all[at].0, rank))
+            .map(|(rank, at)| (all[at].0.clone(), rank))
             .collect(),
     ))
 }
@@ -407,7 +408,7 @@ impl<'a> Lazy<'a> {
 
 impl Lazy<'_> {
     /// `all` (RecordId, document) decoded as the trial reads them.
-    fn decode(&self, all: &[(i64, Vec<u8>)]) -> Option<Loaded> {
+    fn decode(&self, all: &[(RecordId, Vec<u8>)]) -> Option<Loaded> {
         let docs: Option<Vec<Document>> = all
             .iter()
             .map(|(_, blob)| {
@@ -421,11 +422,11 @@ impl Lazy<'_> {
         if self.partial {
             return Some((docs?, None));
         }
-        let matched: BTreeSet<i64> = self
+        let matched: BTreeSet<RecordId> = self
             .rows
             .into_iter()
             .flatten()
-            .map(|(recordid, _)| *recordid)
+            .map(|(recordid, _)| recordid.clone())
             .collect();
         let known: Vec<bool> = all.iter().map(|(r, _)| matched.contains(r)).collect();
         Some((docs?, Some(known)))
@@ -454,6 +455,7 @@ impl Lazy<'_> {
             collation: self.ask.collation,
             reach: None,
             total: Some(loaded.0.len()),
+            clustered: super::exec::is_clustered(self.storage, self.ask.db, self.ask.coll),
         }
     }
 
@@ -469,7 +471,7 @@ impl Lazy<'_> {
             return Ok(None);
         }
         let mut ended = true;
-        let mut blobs: std::collections::BTreeMap<i64, Option<Vec<u8>>> = Default::default();
+        let mut blobs: std::collections::BTreeMap<RecordId, Option<Vec<u8>>> = Default::default();
         for leaf in leaves {
             let (ix, width) = match leaf {
                 Node::CollScan { backward, .. } => {
@@ -500,10 +502,10 @@ impl Lazy<'_> {
                 Err(_) => return Ok(None),
             }
         }
-        let missing: Vec<i64> = blobs
+        let missing: Vec<RecordId> = blobs
             .iter()
             .filter(|(_, b)| b.is_none())
-            .map(|(rid, _)| *rid)
+            .map(|(rid, _)| rid.clone())
             .collect();
         if !missing.is_empty() {
             let Ok(Some(found)) = self.storage.records_by_id(db, coll, &missing) else {
@@ -511,12 +513,12 @@ impl Lazy<'_> {
             };
             for (rid, blob) in missing.iter().zip(found) {
                 match blob {
-                    Some(blob) => blobs.insert(*rid, Some(blob)),
+                    Some(blob) => blobs.insert(rid.clone(), Some(blob)),
                     None => blobs.remove(rid),
                 };
             }
         }
-        let all: Vec<(i64, Vec<u8>)> = blobs
+        let all: Vec<(RecordId, Vec<u8>)> = blobs
             .into_iter()
             .filter_map(|(rid, blob)| Some((rid, blob?)))
             .collect();
@@ -539,6 +541,7 @@ impl Lazy<'_> {
             collation: self.ask.collation,
             reach: (!ended).then_some(works),
             total,
+            clustered: super::exec::is_clustered(self.storage, self.ask.db, self.ask.coll),
         }))
     }
 }
@@ -587,6 +590,11 @@ impl plan::Whole for Lazy<'_> {
                         collation: self.ask.collation,
                         reach: None,
                         total: Some(docs),
+                        clustered: super::exec::is_clustered(
+                            self.storage,
+                            self.ask.db,
+                            self.ask.coll,
+                        ),
                     })
                 }
                 _ => None,
@@ -1092,7 +1100,7 @@ pub(crate) fn through_cache(
 
 /// `rows` in the order `order` names them.
 fn placed(rows: Rows, order: Vec<usize>) -> Rows {
-    let mut slots: Vec<Option<(i64, Vec<u8>)>> = rows.into_iter().map(Some).collect();
+    let mut slots: Vec<Option<(RecordId, Vec<u8>)>> = rows.into_iter().map(Some).collect();
     order
         .into_iter()
         .filter_map(|r| slots.get_mut(r).and_then(Option::take))
@@ -1497,7 +1505,7 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
     // sort over what it returns.
     if let Some(near) = &near {
         if via.take().is_some() {
-            rows.sort_unstable_by_key(|(recordid, _)| *recordid);
+            rows.sort_unstable_by_key(|(recordid, _)| recordid.clone());
         }
         let index = match near_index {
             Some(ix) => Some(ix),
@@ -1515,7 +1523,7 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         return Ok(Some(sorted_over(storage, rows, ask)?));
     }
     if let Some(index) = hinted_geo {
-        rows.sort_unstable_by_key(|(recordid, _)| *recordid);
+        rows.sort_unstable_by_key(|(recordid, _)| recordid.clone());
         let scan = geo::scan(storage, ask.db, ask.coll, ask.filter, Some(index), true)?;
         if let Some(ordered) = scan.and_then(|scan| scan.order(rows.clone())) {
             return Ok(Some(sorted_over(storage, ordered, ask)?));
@@ -1534,7 +1542,7 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
     let mut sorted: Option<(Vec<usize>, Vec<bool>)> = None;
     if let Some(sort) = ask.sort {
         if via.take().is_some() {
-            rows.sort_unstable_by_key(|(recordid, _)| *recordid);
+            rows.sort_unstable_by_key(|(recordid, _)| recordid.clone());
         }
         let blobs: Vec<&[u8]> = rows.iter().map(|(_, b)| b.as_slice()).collect();
         let (order, tied) = storage.sort_permutation(&blobs, sort, ask.collation)?;
@@ -1581,13 +1589,13 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
             .is_some_and(|h| !matches!(h, Bson::Document(d) if d.is_empty()));
     if ask.hint.is_none() && ask.filter.contains_key("$or") {
         let mut inserted = rows.clone();
-        inserted.sort_unstable_by_key(|(recordid, _)| *recordid);
+        inserted.sort_unstable_by_key(|(recordid, _)| recordid.clone());
         if let Some(ordered) = geo_or_rows(storage, ask, &inserted)? {
             return Ok(Some(sorted_over(storage, ordered, ask)?));
         }
     }
     if let Some(scan) = geo::scan(storage, ask.db, ask.coll, ask.filter, None, elsewhere)? {
-        rows.sort_unstable_by_key(|(recordid, _)| *recordid);
+        rows.sort_unstable_by_key(|(recordid, _)| recordid.clone());
         if let Some(ordered) = scan.order(rows.clone()) {
             return Ok(Some(sorted_over(storage, ordered, ask)?));
         }
@@ -1622,7 +1630,7 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         if already_in_order(&plan, via) {
             return Ok(Some(rows));
         }
-        rows.sort_unstable_by_key(|(recordid, _)| *recordid);
+        rows.sort_unstable_by_key(|(recordid, _)| recordid.clone());
     }
     // A scan of the collection is the order the rows are in.
     if sorted.is_none() {
@@ -1716,6 +1724,7 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
             returns: false,
             known: None,
             query: None,
+            clustered: super::exec::is_clustered(storage, ask.db, ask.coll),
         };
         // Where the plan puts each row among those it places. One it does not
         // reach goes after the rest, in insertion order: the plan never selects.
@@ -1836,7 +1845,7 @@ fn geo_or_rows(
         let Some(ordered) = ordered_rows(storage, &sub)? else {
             return Ok(None);
         };
-        let keep: BTreeSet<i64> = matching.iter().map(|(r, _)| *r).collect();
+        let keep: BTreeSet<RecordId> = matching.iter().map(|(r, _)| r.clone()).collect();
         scans.push((
             at,
             ordered
@@ -1853,7 +1862,7 @@ fn geo_or_rows(
     let mut out: Rows = Vec::with_capacity(rows.len());
     for (_, list) in scans {
         for row in list {
-            if seen.insert(row.0) {
+            if seen.insert(row.0.clone()) {
                 out.push(row);
             }
         }
@@ -2230,7 +2239,10 @@ pub(crate) fn pinned<T>(
 ) -> Result<T, StorageError> {
     let (mut order, matched) = match pin {
         Pin::Store(matched) => (None, matched),
-        Pin::Rows(rows) => (Some(rows.iter().map(|(rid, _)| *rid).collect()), rows),
+        Pin::Rows(rows) => (
+            Some(rows.iter().map(|(rid, _)| rid.clone()).collect()),
+            rows,
+        ),
         Pin::Read(read) => return streamed(storage, *read, f),
     };
     let mut f = Some(f);
@@ -2260,7 +2272,7 @@ pub(crate) fn pinned<T>(
 /// again, as mongod tests a write's filter once per document (RM-391).
 pub(crate) fn with_matched<T>(
     storage: &dyn Storage,
-    rows: Vec<(i64, Vec<u8>)>,
+    rows: Vec<(RecordId, Vec<u8>)>,
     f: impl FnOnce() -> T,
 ) -> T {
     let mut f = Some(f);
@@ -2705,12 +2717,12 @@ pub(crate) struct Selection {
     /// match for a write of many, the first (and a few after it, which the
     /// write takes should the first no longer match when it runs) for a
     /// write of one.
-    pub rids: Vec<i64>,
+    pub rids: Vec<RecordId>,
     /// The first match itself, for a `findAndModify`.
     pub first: Option<Vec<u8>>,
     /// Every row the read matched, in its order, each with the bytes it
     /// matched as: the write does not test them again (RM-391).
-    pub matched: Vec<(i64, Vec<u8>)>,
+    pub matched: Vec<(RecordId, Vec<u8>)>,
     pub keys_examined: i64,
     pub docs_examined: i64,
     pub summary: String,
@@ -2746,16 +2758,16 @@ fn write_read(plan: &Node) -> &Node {
 pub(crate) enum Pin {
     /// The store's own candidates, those of them read as these bytes
     /// matched already.
-    Store(Vec<(i64, Vec<u8>)>),
+    Store(Vec<(RecordId, Vec<u8>)>),
     /// These rows, in this order, each with the bytes it matched as.
-    Rows(Vec<(i64, Vec<u8>)>),
+    Rows(Vec<(RecordId, Vec<u8>)>),
     /// What this read returns, as the write reaches it.
     Read(Box<PendingRead>),
 }
 
 impl Pin {
     /// The rows `rows` names, or the store's candidates when there are none.
-    pub(crate) fn rows(rows: Option<Vec<(i64, Vec<u8>)>>) -> Self {
+    pub(crate) fn rows(rows: Option<Vec<(RecordId, Vec<u8>)>>) -> Self {
         match rows {
             Some(rows) if !rows.is_empty() => Pin::Rows(rows),
             _ => Pin::Store(Vec::new()),
@@ -2901,7 +2913,7 @@ pub(crate) fn write_selection(
     let mut rids = batch.rids.clone();
     // What the read matched, so that the write does not test it again: mongod
     // tests a write's filter once per document (RM-391).
-    let mut matched: Vec<(i64, Vec<u8>)> = batch.rids.into_iter().zip(batch.docs).collect();
+    let mut matched: Vec<(RecordId, Vec<u8>)> = batch.rids.into_iter().zip(batch.docs).collect();
     if !rids.is_empty() && store_order_is_the_plans(storage, ask)? {
         // The store, left to pick, takes the same document (RM-056): the
         // write reads as it did, and no candidates are read for it.
@@ -2911,7 +2923,7 @@ pub(crate) fn write_selection(
         // takes the next: read, and not counted, as the store's own read
         // of its candidates was.
         let more = stream.next_batch(storage, WRITE_CANDIDATES - 1, usize::MAX)?;
-        rids.extend(more.rids.iter().copied());
+        rids.extend(more.rids.iter().cloned());
         matched.extend(more.rids.into_iter().zip(more.docs));
     }
     Ok(Some(Selection {

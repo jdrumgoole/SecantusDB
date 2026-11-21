@@ -81,7 +81,7 @@ pub(crate) fn scan_values(
     };
     // The entries of one key are in RecordId order.
     let mut rows = matched.rows;
-    rows.sort_unstable_by_key(|(recordid, _)| *recordid);
+    rows.sort_unstable_by_key(|(recordid, _)| recordid.clone());
     let mut docs = Vec::with_capacity(rows.len());
     for (_, blob) in &rows {
         docs.push(
@@ -99,6 +99,7 @@ pub(crate) fn scan_values(
         returns: false,
         known: None,
         query: None,
+        clustered: false,
     };
     let mut values = Vec::new();
     for (row, value) in exec::distinct_entries(ix, *width, &env) {

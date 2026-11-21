@@ -856,7 +856,10 @@ mod tests {
             .enumerate()
             .filter(|(i, v)| {
                 let key = shape
-                    .entry(std::slice::from_ref(v), *i as i64 + 1)
+                    .entry(
+                        std::slice::from_ref(v),
+                        &crate::RecordId::Long(*i as i64 + 1),
+                    )
                     .unwrap()
                     .key;
                 spans.iter().any(|s| {

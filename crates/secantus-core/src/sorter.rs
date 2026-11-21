@@ -1067,7 +1067,7 @@ pub struct IndexKeyMember<'a> {
     /// The index's place among those the plan's scans registered with its
     /// working set (`WorkingSet::registerIndexIdent`), from 0.
     pub index_id: u32,
-    pub rid: i64,
+    pub rid: crate::recordid::RecordId,
 }
 
 /// mongod 8.2's `SORT` of index keys (`type: "default"`, below the FETCH)
@@ -1096,7 +1096,7 @@ pub fn sort_index_keys(
             &m.index_key,
             m.index_id,
             SNAPSHOT_ID,
-            m.rid,
+            &m.rid,
             &mut bytes,
         )
         .map_err(|e| Fallback::mongo(1, format!("the sort could not {}: {}", e.what, e.detail)))?;
@@ -1174,7 +1174,7 @@ pub fn rid_obj_size(doc: &Document) -> usize {
 /// was read at, in the order they came; `spec` a plain sort pattern. As
 /// [`sort_index_keys`], the caller orders the documents itself.
 pub fn sort_rid_objs(
-    docs: Vec<(Document, i64)>,
+    docs: Vec<(Document, crate::recordid::RecordId)>,
     spec: &Document,
     budget: usize,
     limit: Option<usize>,
@@ -1187,7 +1187,7 @@ pub fn sort_rid_objs(
         let key = crate::aggregate::sort_key_values(&doc, &sort)?;
         sizes.push(rid_obj_size(&doc));
         let mut bytes = Vec::new();
-        spill_file::write_rid_and_obj_member(&doc, SNAPSHOT_ID, rid, &mut bytes).map_err(|e| {
+        spill_file::write_rid_and_obj_member(&doc, SNAPSHOT_ID, &rid, &mut bytes).map_err(|e| {
             Fallback::mongo(1, format!("the sort could not {}: {}", e.what, e.detail))
         })?;
         items.push((key, member_doc(bytes)));
@@ -1364,10 +1364,38 @@ mod tests {
         let d = doc! { "_id": 1, "z": 1 };
         assert_eq!(key_size(&[Bson::Int32(1)]) + rid_obj_size(&d), 173);
         let mut member = Vec::new();
-        spill_file::write_rid_and_obj_member(&d, 0, 7, &mut member).unwrap();
+        spill_file::write_rid_and_obj_member(
+            &d,
+            0,
+            &crate::recordid::RecordId::Long(7),
+            &mut member,
+        )
+        .unwrap();
         let mut alone = Vec::new();
         spill_file::write_document(&d, &mut alone).unwrap();
         assert_eq!(member.len(), alone.len() + 19);
+    }
+
+    /// A clustered collection's RecordId is its key bytes: a spilled member
+    /// holds the format byte, their length as four bytes and them (mongod
+    /// 8.2.11: an `_id` of two key bytes spills 7 bytes of RecordId where an
+    /// ordinary collection's 8-byte one spills 9). A stub RecordId of the
+    /// same size for every row would not tell them apart.
+    #[test]
+    fn a_clustered_members_record_id_is_its_key_bytes() {
+        use crate::recordid::RecordId;
+        let d = doc! { "_id": 1, "z": 1 };
+        let size = |rid: RecordId| {
+            let mut member = Vec::new();
+            spill_file::write_rid_and_obj_member(&d, 0, &rid, &mut member).unwrap();
+            member.len()
+        };
+        let long = size(RecordId::Long(7));
+        assert_eq!(
+            size(RecordId::Bytes(vec![0x2b, 0x02])),
+            long - 9 + 1 + 4 + 2
+        );
+        assert_eq!(size(RecordId::Bytes(vec![0; 13])), long - 9 + 1 + 4 + 13);
     }
 
     /// RM-423: a `searchScore` key ties every document, leaving the order
@@ -1630,7 +1658,7 @@ mod tests {
                     key_pattern: &pattern,
                     index_key: vec![Bson::Int32(i % 3), Bson::Int32(i)],
                     index_id: 0,
-                    rid: i64::from(i) + 1,
+                    rid: crate::recordid::RecordId::Long(i64::from(i) + 1),
                 })
                 .collect()
         };
@@ -1746,7 +1774,7 @@ mod tests {
                 key_pattern: &pattern,
                 index_key: vec![Bson::Int32(i % 3), Bson::Int32(i)],
                 index_id: 0,
-                rid: i64::from(i) + 1,
+                rid: crate::recordid::RecordId::Long(i64::from(i) + 1),
             })
             .collect();
         let _on = memlimit::allow_disk_use(true);
@@ -1769,7 +1797,7 @@ mod tests {
             &[Bson::String("ab".into()), Bson::Null],
             1,
             7,
-            42,
+            &crate::recordid::RecordId::Long(42),
             &mut out,
         )
         .unwrap();

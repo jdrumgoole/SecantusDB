@@ -45,7 +45,7 @@ fn documents(st: &Storage, coll: &str) -> Vec<(i64, Document)> {
     st.records_after("app", coll, None, 1000, false)
         .unwrap()
         .into_iter()
-        .map(|(rid, blob)| (rid, bson::from_slice(&blob).unwrap()))
+        .map(|(rid, blob)| (rid.as_long().unwrap(), bson::from_slice(&blob).unwrap()))
         .collect()
 }
 

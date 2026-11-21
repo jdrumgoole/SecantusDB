@@ -334,7 +334,11 @@ fn the_id_index_reads_in_id_order_by_value() {
             .index_entries_from("app", "c", "_id_", IndexPos::Edge, None, 10, false)
             .unwrap();
         let ids: Vec<Document> = st
-            .records_by_id("app", "c", &rows.iter().map(|r| r.rid).collect::<Vec<_>>())
+            .records_by_id(
+                "app",
+                "c",
+                &rows.iter().map(|r| r.rid.clone()).collect::<Vec<_>>(),
+            )
             .unwrap()
             .into_iter()
             .map(|d| bson::from_slice(&d.unwrap()).unwrap())

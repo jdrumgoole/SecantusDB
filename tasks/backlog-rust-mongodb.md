@@ -3132,3 +3132,36 @@ produce the dump it exists for.
       writes two separate inserts.
       Backlog-ID: RM-727
       Verify: none -- PITR restore is this server's own tool, with no mongod counterpart to compare; reproduce with the test above using insert_many
+
+- [ ] **`explain` of a clustered collection names `IXSCAN` on `_id_`, where mongod
+      names `EXPRESS_CLUSTERED_IXSCAN` / `CLUSTERED_IXSCAN`.** On a collection
+      made with `clusteredIndex` mongod 8.2.11 explains `{_id: 3}` as
+      `EXPRESS_CLUSTERED_IXSCAN` and `{_id: {$gt: 1}}` as `CLUSTERED_IXSCAN`
+      with `direction`, `minRecord` and `maxRecord` (null for none): the scan
+      reads the table, the RecordId being the `_id`. This server's planner
+      still treats the clustering key as an `_id_` index (`FETCH` over
+      `IXSCAN`, `indexBounds`). The rows come back right since storage-model
+      phase 5 keys the table by `_id` itself; only the plan's shape differs,
+      the work counters with it. Found by the phase 5 smoke test.
+      Backlog-ID: pending
+      Verify: tests/backlog/test_rm_clustered_explain.py::test_an_id_point_read_is_an_express_clustered_scan, tests/backlog/test_rm_clustered_explain.py::test_an_id_range_is_a_bounded_clustered_scan
+      Backlog-ID: RM-739
+
+- [ ] **A time-series collection's own namespace still has a table and a
+      registry entry, and its buckets collection's catalog options are
+      short.** mongod keeps `app.ts` as a view (one `system.views` document)
+      over `app.system.buckets.ts`, with no table of its own; the buckets
+      entry in `_mdb_catalog` has `options.validator` (the `$jsonSchema` of
+      the bucket shape), `options.timeseries` (the time-series options with
+      `bucketMaxSpanSeconds`), `clusteredIndex: true` and
+      `md.timeseriesBucketsMayHaveMixedSchemaData: false`, and its `create`
+      oplog entry logs the same (`create: system.buckets.ts` with those, then
+      `createIndexes` for `m_1_t_1`, then the `system.views` `create` and
+      insert). This server creates `app.ts` with a table, and the buckets
+      with `{clusteredIndex: true}` alone. Compare with
+      `tools/probes/mongod_store_layout.py --secantusd <binary>`; it belongs
+      with phase 7's views.
+      Backlog-ID: pending
+      Verify: none -- a layout and catalog comparison with the phase 0 fixture (`tests/fixtures/storage_model/mongod-8.2.11-layout.json`), made by the phase 0c comparison tool; no client call shows it
+      Backlog-ID: RM-740
+

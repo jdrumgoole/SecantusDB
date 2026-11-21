@@ -202,13 +202,21 @@ pub(crate) struct ActiveBuild {
     dup_candidates: Mutex<Vec<BTreeSet<Vec<u8>>>>,
     /// `(index, RecordId)` of documents whose keys could not be made when
     /// they were written: keyed again at commit.
-    skipped: Mutex<BTreeSet<(usize, i64)>>,
+    skipped: Mutex<BTreeSet<(usize, RecordId)>>,
     /// The member (`host:port`) that started it, which a restarted build
     /// records as ready to commit, as mongod's restarted builds do.
     member: String,
 }
 
 impl ActiveBuild {
+    /// Shape every index's entries for a clustered collection's RecordIds.
+    fn with_rid_bytes(mut self, rid_bytes: bool) -> Self {
+        for ix in &mut self.indexes {
+            ix.desc.rid_bytes = rid_bytes;
+        }
+        self
+    }
+
     fn new(uuid: [u8; 16], db: &str, coll: &str, indexes: Vec<BuildIndex>) -> Self {
         let n = indexes.len();
         ActiveBuild {
@@ -353,7 +361,7 @@ enum SideOp<'a> {
     Insert(&'a EntryKey),
     Remove(&'a EntryKey),
     /// The document's keys could not be made; key it again at commit.
-    Skipped(i64),
+    Skipped(&'a RecordId),
 }
 
 /// An entry as a side write or a sorter holds it: its key, its TypeBits,
@@ -381,7 +389,15 @@ fn encode_side(index: usize, op: &SideOp<'_>) -> Vec<u8> {
     let (tag, payload): (u8, Vec<u8>) = match op {
         SideOp::Insert(p) => (b'i', encode_entry(p)),
         SideOp::Remove(p) => (b'd', encode_entry(p)),
-        SideOp::Skipped(rid) => (b's', rid.to_be_bytes().to_vec()),
+        // A counter's eight bytes, or a clustered collection's key bytes: the
+        // build knows which its collection has.
+        SideOp::Skipped(rid) => (
+            b's',
+            match rid {
+                RecordId::Long(n) => n.to_be_bytes().to_vec(),
+                RecordId::Bytes(k) => k.clone(),
+            },
+        ),
     };
     let mut out = Vec::with_capacity(payload.len() + 3);
     out.push(tag);
@@ -630,7 +646,7 @@ impl Storage {
         coll: &str,
         old: Option<&Document>,
         new: Option<&Document>,
-        recordid: i64,
+        recordid: &RecordId,
     ) -> Result<()> {
         if self.index_builds.active.load(Ordering::Acquire) == 0 {
             return Ok(());
@@ -790,7 +806,8 @@ impl Storage {
                     let stored = with_geo_options(stored, &s.key, &s.options);
                     indexes.push(BuildIndex::new(s.name.clone(), s.key.clone(), stored));
                 }
-                let mut build = ActiveBuild::new(uuid, db, coll, indexes);
+                let mut build = ActiveBuild::new(uuid, db, coll, indexes)
+                    .with_rid_bytes(is_clustered(&session, db, coll)?);
                 build.member = member.to_string();
                 let rec = session.open_cursor(BUILDS_TABLE, None)?;
                 rec.set_key_u(&uuid);
@@ -1127,19 +1144,19 @@ impl Storage {
         let mut sorters: Vec<ExtSorter> = (0..b.indexes.len())
             .map(|i| ExtSorter::new(per_index, dir.clone(), format!("{prefix}-{i}")))
             .collect();
-        let mut after: Option<i64> = None;
+        let mut after: Option<RecordId> = None;
         let mut scanned = 0usize;
         loop {
             self.check_build(b)?;
             let batch = {
                 let session = self.conn.open_session()?;
-                self.scan_docs_batch(&session, &b.db, &b.coll, after, SCAN_BATCH)?
+                self.scan_docs_batch(&session, &b.db, &b.coll, after.clone(), SCAN_BATCH)?
             };
             let Some(last) = batch.last() else {
                 break;
             };
-            after = Some(last.0);
-            for (rid, _id_k, blob) in &batch {
+            after = Some(last.0.clone());
+            for (rid, blob) in &batch {
                 if deadline::check().is_err() {
                     return Err(StorageError::MaxTimeExpired);
                 }
@@ -1169,7 +1186,7 @@ impl Storage {
                     {
                         ix.multikey.store(true, Ordering::Relaxed);
                     }
-                    for entry in self.packed_entry_keys(&d, &ix.desc, *rid)? {
+                    for entry in self.packed_entry_keys(&d, &ix.desc, rid)? {
                         sorters[i].push(encode_entry(&entry))?;
                     }
                 }
@@ -1201,8 +1218,8 @@ impl Storage {
                 if ix.unique() {
                     if let Some(p) = &prev {
                         if let (Some(pk), Some(k)) = (
-                            ixkeys::entry_prefix(&p.key),
-                            ixkeys::entry_prefix(&entry.key),
+                            ixkeys::entry_prefix(&p.key, ix.desc.rid_bytes),
+                            ixkeys::entry_prefix(&entry.key, ix.desc.rid_bytes),
                         ) {
                             if pk == k {
                                 dups.insert(k.to_vec());
@@ -1296,9 +1313,12 @@ impl Storage {
                                 &entry,
                             )?;
                             if ix.unique() {
-                                let rid = ixkeys::entry_rid(&entry.key).unwrap_or(i64::MIN);
-                                if let Some(prefix) = ixkeys::entry_prefix(&entry.key) {
-                                    if self.key_held_by_another(&session, ix, prefix, rid)? {
+                                let rid = ixkeys::entry_rid(&entry.key, ix.desc.rid_bytes)
+                                    .unwrap_or(RecordId::Long(i64::MIN));
+                                if let Some(prefix) =
+                                    ixkeys::entry_prefix(&entry.key, ix.desc.rid_bytes)
+                                {
+                                    if self.key_held_by_another(&session, ix, prefix, &rid)? {
                                         b.dup_candidates.lock().unwrap_or_else(|e| e.into_inner())
                                             [i]
                                             .insert(prefix.to_vec());
@@ -1318,15 +1338,20 @@ impl Storage {
                             )?;
                         }
                         b's' => {
-                            let rid = <[u8; 8]>::try_from(payload).map_err(|_| {
-                                StorageError::Internal(
-                                    "index build: a skipped record without its RecordId".into(),
-                                )
-                            })?;
+                            let rid = if ix.desc.rid_bytes {
+                                RecordId::Bytes(payload.to_vec())
+                            } else {
+                                let long = <[u8; 8]>::try_from(payload).map_err(|_| {
+                                    StorageError::Internal(
+                                        "index build: a skipped record without its RecordId".into(),
+                                    )
+                                })?;
+                                RecordId::Long(i64::from_be_bytes(long))
+                            };
                             b.skipped
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
-                                .insert((i, i64::from_be_bytes(rid)));
+                                .insert((i, rid));
                         }
                         other => {
                             return Err(StorageError::Internal(format!(
@@ -1350,12 +1375,12 @@ impl Storage {
         session: &Session,
         ix: &BuildIndex,
         prefix: &[u8],
-        rid: i64,
+        rid: &RecordId,
     ) -> Result<bool> {
         Ok(self
             .rids_holding(session, ix, prefix, 2)?
             .iter()
-            .any(|r| *r != rid))
+            .any(|r| r != rid))
     }
 
     /// Up to `max` RecordIds whose entries of `ix` hold the key whose
@@ -1366,13 +1391,17 @@ impl Storage {
         ix: &BuildIndex,
         prefix: &[u8],
         max: usize,
-    ) -> Result<Vec<i64>> {
+    ) -> Result<Vec<RecordId>> {
         let cur = session.open_cursor(&ix.table()?, None)?;
         let mut more = seek_ge(&cur, prefix)?;
         let mut out = Vec::new();
         while more && out.len() < max {
-            let (starts, rid) =
-                cur.with_key_u(|key| (key.starts_with(prefix), ixkeys::entry_rid(key)))?;
+            let (starts, rid) = cur.with_key_u(|key| {
+                (
+                    key.starts_with(prefix),
+                    ixkeys::entry_rid(key, ix.desc.rid_bytes),
+                )
+            })?;
             if !starts {
                 break;
             }
@@ -1389,7 +1418,7 @@ impl Storage {
         &self,
         session: &Session,
         b: &ActiveBuild,
-        rid: i64,
+        rid: &RecordId,
     ) -> Result<Option<Document>> {
         let cur = match open_doc_cursor(session, &b.db, &b.coll, None) {
             Ok(c) => c,
@@ -1400,7 +1429,7 @@ impl Storage {
         match cur.search() {
             Ok(()) => {
                 let value = cur.get_value_u()?;
-                let (_idk, blob) = unframe_doc_value(&value)?;
+                let blob = value.as_slice();
                 Ok(Some(decode_doc(blob)?))
             }
             Err(e) if e.is_not_found() => Ok(None),
@@ -1412,12 +1441,12 @@ impl Storage {
     /// written: a document still there that still cannot be fails the
     /// build, as mongod's skipped-record check does.
     fn rekey_skipped(&self, b: &ActiveBuild) -> Result<()> {
-        let skipped: Vec<(usize, i64)> = b
+        let skipped: Vec<(usize, RecordId)> = b
             .skipped
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .copied()
+            .cloned()
             .collect();
         if skipped.is_empty() {
             return Ok(());
@@ -1426,13 +1455,13 @@ impl Storage {
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
                 let mut tables: HashMap<usize, Cursor> = HashMap::new();
-                for &(i, rid) in &skipped {
+                for (i, rid) in skipped.iter().map(|(i, r)| (*i, r.clone())) {
                     let ix = &b.indexes[i];
                     if let std::collections::hash_map::Entry::Vacant(slot) = tables.entry(i) {
                         slot.insert(session.open_cursor(&ix.table()?, Some("overwrite=false"))?);
                     }
                     let entries = &tables[&i];
-                    let Some(d) = self.build_doc_at(&session, b, rid)? else {
+                    let Some(d) = self.build_doc_at(&session, b, &rid)? else {
                         continue;
                     };
                     if let Some((code, errmsg)) =
@@ -1444,11 +1473,13 @@ impl Storage {
                             exec: false,
                         });
                     }
-                    for entry in self.packed_entry_keys(&d, &ix.desc, rid)? {
+                    for entry in self.packed_entry_keys(&d, &ix.desc, &rid)? {
                         self.put_index_entry(&session, entries, &b.db, &b.coll, &ix.name, &entry)?;
                         if ix.unique() {
-                            if let Some(prefix) = ixkeys::entry_prefix(&entry.key) {
-                                if self.key_held_by_another(&session, ix, prefix, rid)? {
+                            if let Some(prefix) =
+                                ixkeys::entry_prefix(&entry.key, ix.desc.rid_bytes)
+                            {
+                                if self.key_held_by_another(&session, ix, prefix, &rid)? {
                                     b.dup_candidates.lock().unwrap_or_else(|e| e.into_inner())[i]
                                         .insert(prefix.to_vec());
                                 }
@@ -1479,7 +1510,7 @@ impl Storage {
                 if rids.len() < 2 {
                     continue;
                 }
-                let Some(d) = self.build_doc_at(&session, b, rids[0])? else {
+                let Some(d) = self.build_doc_at(&session, b, &rids[0])? else {
                     continue;
                 };
                 // The sort key of the document's own key that this entry is.
@@ -1630,11 +1661,14 @@ impl Storage {
                 self.forget_build_record(&uuid)?;
                 continue;
             };
-            let exists = {
+            let (exists, clustered) = {
                 let session = self.conn.open_session()?;
-                collection_registered(&session, &build.db, &build.coll)?
+                (
+                    collection_registered(&session, &build.db, &build.coll)?,
+                    is_clustered(&session, &build.db, &build.coll)?,
+                )
             };
-            let b = Arc::new(build);
+            let b = Arc::new(build.with_rid_bytes(clustered));
             self.index_builds.insert(Arc::clone(&b));
             if !exists {
                 // Its collection is gone: nothing to build, nothing to log.
@@ -1746,7 +1780,8 @@ impl Storage {
                     let stored = with_geo_options(stored, key, &options);
                     built.push(BuildIndex::new(name.to_string(), key.clone(), stored));
                 }
-                let build = ActiveBuild::new(*uuid, db, coll, built);
+                let build = ActiveBuild::new(*uuid, db, coll, built)
+                    .with_rid_bytes(is_clustered(&session, db, coll)?);
                 rec.reset()?;
                 rec.set_key_u(uuid);
                 rec.set_value_u(&build_record(&build)?);
@@ -1834,13 +1869,13 @@ mod tests {
     #[test]
     fn a_side_write_reads_back() {
         let entry = KeyShape::plain()
-            .entry(&[Bson::String("key".into())], 7)
+            .entry(&[Bson::String("key".into())], &RecordId::Long(7))
             .unwrap();
         let v = encode_side(3, &SideOp::Insert(&entry));
         let (op, i, p) = decode_side(&v).unwrap();
         assert_eq!((op, i), (b'i', 3));
         assert_eq!(decode_entry(p).unwrap(), entry);
-        let v = encode_side(1, &SideOp::Skipped(42));
+        let v = encode_side(1, &SideOp::Skipped(&RecordId::Long(42)));
         let (op, i, p) = decode_side(&v).unwrap();
         assert_eq!(
             (op, i, i64::from_be_bytes(p.try_into().unwrap())),

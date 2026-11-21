@@ -195,6 +195,33 @@ def test_one_table_per_collection_and_per_index(tmp_path: Path) -> None:
     assert count(store, "index-") >= 3
 
 
+@pytest.mark.backlog_fixed("RM-723")
+def test_a_clustered_collection_has_no_id_index_table(tmp_path: Path) -> None:
+    """mongod 8.2.11 keys a clustered collection by the KeyString of `_id`
+    and gives it no `_id_` table: it adds a `collection-<UUID>.wt` table and
+    no `index-<UUID>.wt` one (an ordinary collection adds both)."""
+
+    def tables(store: Path) -> tuple[int, int]:
+        names = [p.name for p in store.iterdir() if p.suffix == ".wt"]
+        return (
+            sum(n.startswith("collection-") for n in names),
+            sum(n.startswith("index-") for n in names),
+        )
+
+    base = tmp_path / "base"
+    with rust_mongo_server(base) as client:
+        client["app"]["plain"].insert_one({"_id": 1})
+    store = tmp_path / "store"
+    with rust_mongo_server(store) as client:
+        client["app"]["plain"].insert_one({"_id": 1})
+        client["app"].create_collection(
+            "clustered", clusteredIndex={"key": {"_id": 1}, "unique": True}
+        )
+        client["app"]["clustered"].insert_many([{"_id": i} for i in range(5)])
+    (c0, i0), (c1, i1) = tables(base), tables(store)
+    assert (c1 - c0, i1 - i0) == (1, 0)
+
+
 @pytest.mark.backlog("RM-723")
 def test_mongod_opens_a_secantus_store(tmp_path: Path) -> None:
     """mongod 8.2.11 started with `--replSet` on a store `secantusd-mdb`

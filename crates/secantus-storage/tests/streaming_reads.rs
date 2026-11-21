@@ -5,7 +5,7 @@
 
 use bson::{doc, Bson, Document};
 use secantus_core::sortkey::{encode_value, split_compound};
-use secantus_storage::{IndexPos, IndexRow, Storage};
+use secantus_storage::{IndexPos, IndexRow, RecordId, Storage};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -44,7 +44,7 @@ fn a_collection_scan_resumes_after_its_record_id() {
             first.iter().map(|(_, b)| id_of(b)).collect::<Vec<_>>(),
             [0, 1]
         );
-        let last = first[1].0;
+        let last = first[1].0.clone();
         // A document deleted ahead of the position is not read; one inserted
         // after it is.
         st.delete_matching("db", "c", &doc! {"_id": 3}, 1, &Document::new(), None)
@@ -67,7 +67,7 @@ fn a_fetch_reads_each_document_as_it_is_now() {
     with_db(|st| {
         insert(st, &[doc! {"_id": 1, "v": 1}, doc! {"_id": 2, "v": 1}]);
         let rows = st.records_after("db", "c", None, 10, false).unwrap();
-        let rids: Vec<i64> = rows.iter().map(|(r, _)| *r).collect();
+        let rids: Vec<RecordId> = rows.iter().map(|(r, _)| r.clone()).collect();
         st.delete_matching("db", "c", &doc! {"_id": 2}, 1, &Document::new(), None)
             .unwrap();
         let got = st.records_by_id("db", "c", &rids).unwrap();
@@ -108,7 +108,7 @@ fn an_index_walk_resumes_after_its_entry() {
                 "c",
                 "x_1_y_1",
                 IndexPos::Resume(&all[2].resume),
-                Some(all[2].rid),
+                Some(all[2].rid.clone()),
                 100,
                 false,
             )
@@ -135,7 +135,7 @@ fn an_index_walk_resumes_after_its_entry() {
                 "c",
                 "x_1_y_1",
                 IndexPos::Resume(&all[2].resume),
-                Some(all[2].rid),
+                Some(all[2].rid.clone()),
                 100,
                 false,
             )
@@ -159,7 +159,7 @@ fn a_backward_collection_scan_resumes_before_its_record_id() {
             .unwrap();
         insert(st, &[doc! {"_id": 9}]);
         let rest = st
-            .records_after("db", "c", Some(first[1].0), 100, true)
+            .records_after("db", "c", Some(first[1].0.clone()), 100, true)
             .unwrap();
         assert_eq!(
             rest.iter().map(|(_, b)| id_of(b)).collect::<Vec<_>>(),
@@ -200,7 +200,7 @@ fn a_backward_index_walk_resumes_before_its_entry() {
                 "c",
                 "x_1_y_1",
                 IndexPos::Resume(&all[3].resume),
-                Some(all[3].rid),
+                Some(all[3].rid.clone()),
                 100,
                 true,
             )
@@ -251,7 +251,7 @@ fn the_id_index_walks_the_documents_in_id_order() {
         let key = |i: i32| encode_value(&Bson::Int32(i), None).unwrap();
         let three = [Bson::Int32(3)];
         let ids = |rows: &[IndexRow]| -> Vec<i32> {
-            let rids: Vec<i64> = rows.iter().map(|r| r.rid).collect();
+            let rids: Vec<RecordId> = rows.iter().map(|r| r.rid.clone()).collect();
             st.records_by_id("db", "c", &rids)
                 .unwrap()
                 .iter()
@@ -281,7 +281,7 @@ fn the_id_index_walks_the_documents_in_id_order() {
                 "c",
                 "_id_",
                 IndexPos::Resume(&all[2].resume),
-                Some(all[2].rid),
+                Some(all[2].rid.clone()),
                 100,
                 false,
             )
@@ -297,7 +297,7 @@ fn the_id_index_walks_the_documents_in_id_order() {
                 "c",
                 "_id_",
                 IndexPos::Resume(&all[2].resume),
-                Some(all[2].rid),
+                Some(all[2].rid.clone()),
                 2,
                 true,
             )

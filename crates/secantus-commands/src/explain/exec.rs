@@ -10,6 +10,7 @@
 
 use super::bounds::{sort_key, Interval};
 use super::node::{num, IndexInfo, IxScan, Node, Stats, WorkCounts};
+use crate::storage::RecordId;
 use bson::{Bson, Document};
 use secantus_core::collation::Collation;
 use secantus_core::geoorder::near::{Candidate, IntervalCounts, NearSearch, Source};
@@ -39,6 +40,9 @@ pub(crate) struct Env<'a> {
     /// The command's filter, which a positional projection below a sort
     /// reads; `None` where no sort over one reports what it sorted.
     pub query: Option<&'a Document>,
+    /// The collection is clustered: a row's RecordId is the KeyString of its
+    /// `_id`, whose length a sort that spills its members reports.
+    pub clustered: bool,
 }
 
 impl Env<'_> {
@@ -1402,6 +1406,34 @@ pub(crate) fn fetched(node: &Node, returned: i64, extra: &mut Document) -> Optio
 /// sort key's values, under `pattern`, and the values of the index key it
 /// was found at. `found`: the scan below that returned a row, and that
 /// key. `None`: some row has no such key, a sort of documents.
+/// Whether `db.coll` is clustered: its rows' RecordIds are `_id` KeyStrings.
+pub(crate) fn is_clustered(storage: &dyn crate::storage::Storage, db: &str, coll: &str) -> bool {
+    storage
+        .get_collection_options(db, coll)
+        .is_ok_and(|o| o.contains_key("clusteredIndex"))
+}
+
+/// The RecordId row `row` of `env` stands for: its place, or for a clustered
+/// collection the KeyString of its `_id` as mongod's `keyForObj` makes it.
+fn record_id_of(env: &Env, row: usize) -> RecordId {
+    use secantus_core::keystring::{Builder, Ordering, Version};
+    if env.clustered {
+        let id = env.docs[row].get("_id").cloned().unwrap_or(Bson::Null);
+        let mut b = Builder::new(Version::V1, Ordering::all_ascending());
+        let appended = match env.collation {
+            Some(c) => b.append_bson_element_with(
+                &id,
+                Some(&|s: &str| secantus_core::collation::sort_key(s, c)),
+            ),
+            None => b.append_bson_element(&id),
+        };
+        if appended.is_ok() {
+            return RecordId::Bytes(b.buffer().to_vec());
+        }
+    }
+    RecordId::Long(row as i64 + 1)
+}
+
 pub(crate) fn key_members<'s>(
     pattern: &Document,
     rows: &[usize],
@@ -1446,8 +1478,9 @@ pub(crate) fn key_members<'s>(
                 // The rows are the collection's documents in the order
                 // they are stored: each one's place stands for its
                 // RecordId, which moves only what a spilled run
-                // compresses to (RM-556).
-                rid: row as i64 + 1,
+                // compresses to (RM-556). A clustered collection's is the
+                // KeyString of `_id`, whose length is in the member's size.
+                rid: record_id_of(env, row),
             })
         })
         .collect()
@@ -1460,7 +1493,7 @@ pub(crate) struct KeyMember {
     index_key: Vec<Bson>,
     key_pattern: Document,
     index: String,
-    rid: i64,
+    rid: RecordId,
 }
 
 /// A `SORT`'s memory and spill counters (RM-315): the rows it sorts, run
@@ -1539,7 +1572,7 @@ pub(crate) fn sort_stats(
                     key_pattern: &m.key_pattern,
                     index_key: m.index_key.clone(),
                     index_id: index_id as u32,
-                    rid: m.rid,
+                    rid: m.rid.clone(),
                 }
             })
             .collect();
@@ -1564,7 +1597,7 @@ pub(crate) fn sort_stats(
         // row's place standing for its RecordId, as `key_members`' do.
         let docs = rows
             .iter()
-            .map(|&r| (env.docs[r].clone(), r as i64 + 1))
+            .map(|&r| (env.docs[r].clone(), record_id_of(env, r)))
             .collect();
         let (ran, report) = secantus_core::memlimit::captured(|| {
             let _disk = secantus_core::memlimit::allow_disk_use(true);
