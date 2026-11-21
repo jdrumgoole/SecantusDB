@@ -442,7 +442,20 @@ fn the_configuration_is_stored() {
             .iter()
             .filter_map(|d| d.get_str("name").ok())
             .collect();
-        assert_eq!(names, ["oplog.rs", "system.replset"]);
+        // What mongod's one-member set keeps in `local` (the server records
+        // `startup_log` as it starts; this harness does not).
+        assert_eq!(
+            names,
+            [
+                "oplog.rs",
+                "replset.election",
+                "replset.initialSyncId",
+                "replset.minvalid",
+                "replset.oplogTruncateAfterPoint",
+                "system.replset",
+                "system.rollback.id"
+            ]
+        );
     });
 }
 

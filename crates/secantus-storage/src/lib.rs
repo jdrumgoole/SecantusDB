@@ -210,6 +210,11 @@ pub struct StorageOptions {
     /// before WiredTiger opens, and empty it on a clean close (see
     /// `lockfile.rs`). The MongoDB server asks for it; `None` takes none.
     pub lock_file: Option<String>,
+    /// The size in bytes of `local.oplog.rs` in a NEW store (mongod's
+    /// `--oplogSize`); `None` takes mongod's default (see
+    /// [`default_oplog_size`]). An existing store keeps the size its catalog
+    /// entry holds, which `replSetResizeOplog` changes.
+    pub oplog_size_bytes: Option<i64>,
 }
 
 /// What opening the store did and how long it took, for the startup lines
@@ -562,6 +567,16 @@ impl UserTransactionHandle {
     /// Returns how long, in microseconds, the ranges held their slots open,
     /// for the caller to credit when the transaction committed.
     fn deregister_minted(&mut self) -> i64 {
+        self.resolve_minted(false)
+    }
+
+    /// [`Self::deregister_minted`] for a transaction that committed: its
+    /// entries join the oplog's size.
+    fn deregister_committed(&mut self) -> i64 {
+        self.resolve_minted(true)
+    }
+
+    fn resolve_minted(&mut self, committed: bool) -> i64 {
         if self.minted_ranges.is_empty() {
             return 0;
         }
@@ -576,6 +591,10 @@ impl UserTransactionHandle {
                 "in-flight window out of sync"
             );
             held += removed.map_or(0, |r| r.held_micros());
+            if let (true, Some(r)) = (committed, removed) {
+                st.live_count += r.records;
+                st.live_bytes += r.bytes;
+            }
         }
         self.oplog_cv.notify_all();
         held
@@ -820,6 +839,15 @@ static NEXT_CATALOG_ID: AtomicI64 = AtomicI64::new(1);
 
 fn next_catalog_id() -> i64 {
     NEXT_CATALOG_ID.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Whether mongod keeps `db.coll`'s table in the journal although its data
+/// tables are not logged: the unreplicated `local` collections, whose writes
+/// have no oplog entry to replay them from (measured 8.2.11: every
+/// `local.replset.*` and `local.system.*` table is `log=(enabled=true)`,
+/// `local.replset.minvalid` `false`).
+fn table_logged_by_mongod(db: &str, coll: &str) -> bool {
+    db == "local" && coll != "replset.minvalid"
 }
 
 /// A new collection's placement: a fresh ident, its table made, and the
@@ -1779,11 +1807,6 @@ const MAX_COMPOUND_KEYS: usize = 10_000;
 // store's catalog row names its ident; `Storage::oplog_uri` is the table.
 /// The namespace of the oplog.
 const OPLOG_NS: &str = "local.oplog.rs";
-/// The size mongod 8.2.11 gave `local.oplog.rs` on the box it was measured on
-/// (`tests/fixtures/storage_model/mongod-8.2.11-oplog.json`): its catalog
-/// entry's `options.size`. Phase 4b-5 holds the oplog to it.
-const OPLOG_CATALOG_SIZE: i64 = 201_326_592;
-
 /// `SECANTUS_OPLOG_NONLOGGED=1` creates the oplog + preimage tables with WAL
 /// logging disabled (`log=(enabled=false)`): oplog rows become checkpoint-durable
 /// only — a hard crash loses the tail written since the last checkpoint (data
@@ -1817,13 +1840,14 @@ fn unlogged_oplog_refused() -> StorageError {
     )
 }
 
-/// Phase A' (`SECANTUS_DATA_NONLOGGED=1`): create the DATA tables (doc
-/// shards + the bootstrap set, except the always-logged oplog-meta) with
+/// Phase A' (`SECANTUS_DATA_NONLOGGED=1`): create the DATA tables (the
+/// bootstrap set and every collection, except the always-logged index
+/// builds' table and the `local` collections mongod logs) with
 /// `log=(enabled=false)` — the mongod architecture, which journals ONLY the
 /// oplog and recovers data by checkpoint + oplog replay. **Crash recovery is
-/// implemented**: a periodic stable checkpoint anchors a marker
-/// (`stable_seq`) in the logged meta table, and `Storage::open` replays the
-/// (WAL-logged) oplog above the marker through the ordinary write paths,
+/// implemented**: a periodic stable checkpoint stores its stable timestamp
+/// with itself (WiredTiger's recovery timestamp), and `Storage::open` replays
+/// the (WAL-logged) oplog above it through the ordinary write paths,
 /// idempotently — proven by the hard-kill harness
 /// (`tests/test_crash_recovery.py`). The durability contract matches the
 /// logged default at each `sync_on_commit` setting: with per-commit fsync
@@ -1861,16 +1885,11 @@ fn data_table_cfg(base: &str, nonlogged: bool) -> String {
 }
 
 /// Bootstrap-create config for `name`. Everything follows [`data_table_cfg`]
-/// EXCEPT the oplog-meta table, which must stay WAL-logged even in
-/// `SECANTUS_DATA_NONLOGGED` mode: it carries the **stable checkpoint marker**
-/// (`stable_seq` + the mode flag) that crash recovery replays from — a marker
-/// that rolled back with the data tables would be useless. It is a single tiny
-/// row per checkpoint; its logging cost is nil.
+/// EXCEPT the index builds' table, which is always logged, like the oplog it
+/// is logged beside: a crash of a non-logged store must not lose the member a
+/// restarted build records itself as (RM-187).
 fn bootstrap_table_cfg(name: &str, base: &str, data_nonlogged: bool) -> String {
-    // The index builds' records are always logged, like the oplog they are
-    // logged beside: a crash of a non-logged store must not lose the member
-    // a restarted build records itself as (RM-187).
-    if name == OPLOG_META_TABLE || name == index_build::BUILDS_TABLE {
+    if name == index_build::BUILDS_TABLE {
         base.to_string()
     } else {
         data_table_cfg(base, data_nonlogged)
@@ -1940,45 +1959,54 @@ fn read_oplog_table(
     Ok(out)
 }
 
-/// Key-only doomed-row scan for the prune sweep: the oldest rows' KEYS,
-/// reading a row's VALUE only where the retention check needs its `ts` (rows
-/// inside the cap `excess` are doomed by position alone). Returns the
-/// positions in ascending order, stopping at the first row that is neither
-/// cap-doomed nor past retention (the doomed set is always a prefix), bounded
-/// by `excess.max(retention_batch)` rows.
-fn scan_doomed_oplog_keys(
+/// The doomed prefix of the oplog for a prune sweep: the oldest entries, as
+/// `(position, bytes)`, whole, oldest first. Enough of them to take `excess`
+/// bytes off the oplog (the entry that crosses it goes too, so the oplog is at
+/// or under its size afterwards), then, past those, every entry older than
+/// `cutoff` (the retention window; at most `retention_batch` of them, the rest
+/// drain on later sweeps). The prefix stops at `ceiling`: an entry at or above
+/// it is what a crash of a store whose data tables are not logged replays from
+/// the stable checkpoint, so it is never doomed.
+fn scan_doomed_oplog(
     session: &Session,
     table: &str,
-    excess: usize,
+    excess: i64,
     cutoff: i64,
     retention_batch: usize,
     ceiling: i64,
-) -> Result<Vec<i64>> {
+) -> Result<Vec<(i64, i64)>> {
     let cur = session.open_cursor(table, None)?;
-    let limit = excess.max(retention_batch);
-    let mut doomed: Vec<i64> = Vec::new();
+    let mut doomed: Vec<(i64, i64)> = Vec::new();
+    let mut taken = 0i64;
+    let mut retention_rows = 0usize;
     let mut more = cur.next()?;
-    while more && doomed.len() < limit {
-        let seq = cur.get_key_q()?;
-        if seq >= ceiling {
-            // Phase A' clamp: entries at/above the stable-checkpoint position
-            // are the crash-recovery source for a data-nonlogged store -- never
-            // doomed, whatever the cap says. (ceiling is i64::MAX otherwise.)
+    while more {
+        let pos = cur.get_key_q()?;
+        if pos >= ceiling {
             break;
         }
-        if doomed.len() < excess {
-            // Cap-doomed by position alone -- no value read.
-            doomed.push(seq);
+        if taken < excess {
+            // Cap-doomed: its size is all that is read.
+            let len = cur.with_value_u(|v| v.len() as i64)?;
+            taken += len;
+            doomed.push((pos, len));
         } else {
-            // Retention tail: peek the ts; the first in-window (or undatable)
-            // row ends the doomed prefix -- keep what we can't date.
-            let blob = cur.get_value_u()?;
-            let past_retention =
-                matches!(peek_entry_ts(&blob), Some(ts) if i64::from(ts.time) < cutoff);
-            if !past_retention {
+            if retention_rows >= retention_batch {
                 break;
             }
-            doomed.push(seq);
+            // Retention tail: the first in-window (or undatable) entry ends
+            // the doomed prefix -- keep what cannot be dated.
+            let (len, past) = cur.with_value_u(|v| {
+                (
+                    v.len() as i64,
+                    matches!(peek_entry_ts(v), Some(ts) if i64::from(ts.time) < cutoff),
+                )
+            })?;
+            if !past {
+                break;
+            }
+            retention_rows += 1;
+            doomed.push((pos, len));
         }
         more = cur.next()?;
     }
@@ -1995,24 +2023,25 @@ fn scan_max_oplog_seq(session: &Session, table: &str) -> i64 {
     0
 }
 
-/// Total live oplog rows. Key-only walk (no value fetch), run once on open to
-/// seed `OplogState.live_count` so the opportunistic prune can early-out
-/// instead of re-scanning the whole oplog.
-fn count_oplog_entries(session: &Session, table: &str) -> i64 {
-    let mut total = 0i64;
-    if let Ok(c) = session.open_cursor(table, None) {
-        while c.next().unwrap_or(false) {
-            total += 1;
-        }
+/// The oplog's entries and their BSON bytes, by one walk of the table: what
+/// an open reads when the size storer has no trusted count (a crash, a store
+/// that never kept one), as mongod builds its truncate markers by scanning
+/// when it has none to read.
+fn count_oplog_entries(session: &Session, table: &str) -> Result<(i64, i64)> {
+    let mut records = 0i64;
+    let mut bytes = 0i64;
+    let c = session.open_cursor(table, None)?;
+    while c.next()? {
+        records += 1;
+        bytes += c.with_value_u(|v| v.len() as i64)?;
     }
-    total
+    Ok((records, bytes))
 }
 /// The collection mongod 8.2.11 keeps change stream pre-images in: a
 /// clustered `config.system.preimages`, one document per pre-image, `{_id:
 /// {nsUUID, ts, applyOpsIndex}, operationTime, preImage}` (RM-366).
 pub const PRE_IMAGES_DB: &str = "config";
 pub const PRE_IMAGES_COLL: &str = "system.preimages";
-const OPLOG_META_TABLE: &str = "table:secantus_oplog_meta";
 
 // Auth / profiling tables. Users + roles are `(db, name) -> bson(record)` (key
 // `SS`); per-database profile settings are `db -> bson({level, slowms,
@@ -2733,7 +2762,6 @@ const BOOTSTRAP: &[(&str, &str)] = &[
     ("table:secantus_indexes", "key_format=SSS,value_format=u"),
     // NOTE: table:secantus_oplog is created in `open_with_config_durable`
     // (its config depends on `oplog_table_cfg()`).
-    ("table:secantus_oplog_meta", "key_format=S,value_format=u"),
     ("table:secantus_users", "key_format=SS,value_format=u"),
     ("table:secantus_roles", "key_format=SS,value_format=u"),
     (ROLE_SEQ_TABLE, "key_format=SS,value_format=q"),
@@ -3901,6 +3929,11 @@ struct InFlight {
     /// The timestamp of its first entry.
     first_ts: u64,
     minted_at: Instant,
+    /// The entries it wrote and their BSON bytes, once they are written: they
+    /// join the oplog's size when the transaction commits, as mongod's
+    /// truncate markers count a record on its commit.
+    records: i64,
+    bytes: i64,
 }
 
 impl InFlight {
@@ -5360,9 +5393,9 @@ pub struct Storage {
     checkpoint_seconds: Option<u64>,
     /// Phase A': whether THIS store's data tables were created
     /// `log=(enabled=false)` (checkpoint-durable, recovered by oplog replay).
-    /// Resolved from the stable marker for existing stores — the table config
+    /// Read from WiredTiger's metadata for existing stores — the table config
     /// is create-time-sticky, so the env var is only consulted for fresh
-    /// stores — and recorded in the marker at first checkpoint.
+    /// stores.
     data_nonlogged: bool,
     /// Whether this store's writes carry WiredTiger commit timestamps, so a
     /// read can be made at a past one (snapshot reads, RM-210). Only a store
@@ -5440,11 +5473,14 @@ struct OplogState {
     /// Oplog rows emitted since the last opportunistic prune. In-memory only
     /// (resets on open); never persisted. Drives the prune cadence.
     emit_count: i64,
-    /// Live oplog row count. Counted once on open, `+= n` on every
-    /// `emit_oplog` / import, `-= doomed` on prune. Lets the opportunistic
-    /// prune early-out (one ts read) when under the cap instead of walking
-    /// the whole oplog every 1000 emits -- the write-path bottleneck.
+    /// The oplog's entries and their BSON bytes, as mongod's oplog truncate
+    /// markers keep them: read back at open (the size storer's, else one
+    /// walk), added to when a write COMMITS (a rolled-back statement, a
+    /// retried write conflict, adds nothing) and taken from by a truncation.
+    /// The sweep holds the oplog to its `size` from `live_bytes` alone, so
+    /// no write and no sweep counts the table.
     live_count: i64,
+    live_bytes: i64,
     /// In-flight mint window: `start_ts -> end_ts` (exclusive) for
     /// every batch minted by `mint_seq_and_ts` whose transaction has not yet
     /// committed or rolled back. The **visible tail** — the largest seq below
@@ -6767,22 +6803,17 @@ struct PruneCtx {
     /// Sweep exclusivity (NOT the storage global lock — see
     /// [`prune_oplog_sweep`]'s lock-order note).
     prune_lock: Mutex<()>,
-    /// Mirrors `storage.oplog_retention_seconds` / `oplog_max_entries` /
-    /// `oplog_archive_dir`.
+    /// Mirrors `storage.oplog_retention_seconds` / `oplog_archive_dir`.
     retention_seconds: AtomicI64,
-    max_entries: AtomicUsize,
+    /// The oplog's `size`: the bytes it is held to (its catalog entry's
+    /// `options.size`, which `replSetResizeOplog` changes).
+    max_bytes: AtomicI64,
     /// `replSetResizeOplog`'s `minRetentionHours`, in seconds: no entry
-    /// younger than this is pruned, whatever the entry cap (0: no floor).
+    /// younger than this is pruned, whatever the size (0: no floor).
     min_retention_seconds: AtomicI64,
     /// `changeStreamOptions.preAndPostImages.expireAfterSeconds`; -1 when
     /// `"off"`, mongod's default.
     pre_image_expire_after_seconds: AtomicI64,
-    /// The time of the newest oplog entry a sweep has removed (0: none
-    /// yet): every pre-image at or before it is of an entry gone. A seq and
-    /// its time are minted together, so the removed prefix is a time prefix
-    /// too -- unlike "older than the oldest entry left", which an entry the
-    /// asynchronous oplog has not written yet would fool.
-    pruned_through_ts: AtomicU64,
     archive_dir: Mutex<Option<String>>,
     /// Phase A' pieces: the sweep clamp below the stable checkpoint marker and
     /// the demand-checkpoint signal when the clamp blocks a cap excess.
@@ -6856,7 +6887,7 @@ fn spawn_oplog_pruner(ctx: Arc<PruneCtx>) -> JoinHandle<()> {
 const OPLOG_PRUNE_INTERVAL: i64 = 1000;
 
 /// Upper bound on how many oldest oplog rows a single retention sweep inspects
-/// when the store is under the entry cap (so an undatable/old prefix can't force a
+/// when the store is under its size (so an undatable/old prefix can't force a
 /// whole-oplog walk on the write path). Comfortably above OPLOG_PRUNE_INTERVAL so
 /// a steady-state sweep still reaches every row that aged out since the last one;
 /// any excess drains on the next sweep.
@@ -6903,9 +6934,6 @@ fn now_secs() -> i64 {
     now_millis() / 1000
 }
 
-/// Recover the oplog counters on open: the persisted meta row clamped UP to
-/// what the tables actually contain, else reconstruct from the newest oplog
-/// row. Mirrors `storage._load_oplog_meta`.
 /// How far back a read at a past timestamp can reach: mongod's
 /// `minSnapshotHistoryWindowInSeconds` default.
 const SNAPSHOT_HISTORY_SECONDS: i64 = 300;
@@ -7008,59 +7036,10 @@ fn stored_data_logging(session: &Session) -> Result<Option<bool>> {
     }
 }
 
-/// Read the Phase-A' stable-checkpoint marker row: `(stable_seq,
-/// data_nonlogged)`, or `None` for a store that has never written one. The
-/// row lives in the (always WAL-logged) oplog-meta table under its own key so
-/// it never races the close-time "state" row.
-fn load_stable_marker(session: &Session) -> Option<(i64, bool)> {
-    let c = session.open_cursor(OPLOG_META_TABLE, None).ok()?;
-    c.set_key_s("stable");
-    if c.search().is_ok() {
-        let blob = c.get_value_u().ok()?;
-        let d = decode_doc(&blob).ok()?;
-        let seq = d
-            .get_i64("stable_seq")
-            .or_else(|_| d.get_i32("stable_seq").map(i64::from))
-            .ok()?;
-        let mode = d.get_bool("data_nonlogged").unwrap_or(false);
-        return Some((seq, mode));
-    }
-    None
-}
-
 /// The oplog's counters as the table leaves them: the clock resumes after the
 /// newest entry (mongod reads the top of its oplog), and never below what was
 /// already minted -- the caller bumps it past what cluster-time and
 /// commit-timestamp mints that left no entry can have used.
-/// The newest oplog position ever pruned (0: none, the oplog still begins at
-/// the store's first entry -- "genesis"). Kept in the oplog meta table, in the
-/// transaction that removes the rows, so it is never behind the oplog.
-fn read_pruned_marker(session: &Session) -> i64 {
-    let Ok(c) = session.open_cursor(OPLOG_META_TABLE, None) else {
-        return 0;
-    };
-    c.set_key_s("pruned");
-    if c.search().is_ok() {
-        if let Ok(d) = c
-            .get_value_u()
-            .map_err(StorageError::from)
-            .and_then(|b| decode_doc(&b))
-        {
-            return d.get_i64("through").unwrap_or(0);
-        }
-    }
-    0
-}
-
-fn write_pruned_marker(session: &Session, through: i64) -> Result<()> {
-    let blob = encode_doc(&bson::doc! {"through": through})?;
-    let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
-    cur.set_key_s("pruned");
-    cur.set_value_u(&blob);
-    cur.insert()?;
-    Ok(())
-}
-
 fn load_oplog_state(session: &Session, table: &str) -> Result<OplogState> {
     let last_seq = scan_max_oplog_seq(session, table);
     let (last_secs, last_ord) = if last_seq > 0 {
@@ -7073,84 +7052,130 @@ fn load_oplog_state(session: &Session, table: &str) -> Result<OplogState> {
         last_ts_secs: last_secs,
         last_ts_ord: last_ord,
         emit_count: 0,
-        live_count: count_oplog_entries(session, table),
+        live_count: 0,
+        live_bytes: 0,
         in_flight: BTreeMap::new(),
         ts_reserved: BTreeMap::new(),
     })
 }
 
-/// Where the store records which table is `local.oplog.rs`: the oplog meta
-/// table's `oplog` row, `{ident, uuid}`. That table is always WAL-logged, and
-/// the catalog is not (a store whose data tables are not logged loses its
-/// catalog rows back to the last checkpoint and rebuilds them by replaying
-/// the oplog), so the catalog alone cannot be what finds the oplog after a
-/// crash: opening would take its row's absence for "no oplog yet", make a new
-/// empty one, and drop the real one as an orphan with every acknowledged write
-/// the replay needs. The catalog row is derived from this one.
-const OPLOG_IDENT_KEY: &str = "oplog";
+/// What [`ensure_oplog_table`] found or made.
+struct OplogTable {
+    uri: String,
+    /// The table was made by this open: a new store, or one whose catalog
+    /// row a crash took before its first checkpoint (see [`genesis`]).
+    created: bool,
+    /// The oplog's size in bytes: the catalog entry's `options.size`.
+    max_bytes: i64,
+}
 
-/// `(ident, uuid)` of the oplog as the meta table records them.
-fn read_oplog_ident(session: &Session) -> Result<Option<(String, Vec<u8>)>> {
-    let cur = match session.open_cursor(OPLOG_META_TABLE, None) {
-        Ok(c) => c,
-        Err(e) if e.is_not_found() => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    cur.set_key_s(OPLOG_IDENT_KEY);
-    match cur.search() {
-        Ok(()) => {
-            let d = decode_doc(&cur.get_value_u()?)?;
-            let ident = d.get_str("ident").ok().map(str::to_string);
-            let uuid = match d.get("uuid") {
-                Some(Bson::Binary(b)) => Some(b.bytes.clone()),
-                _ => None,
-            };
-            Ok(ident.zip(uuid))
-        }
-        Err(e) if e.is_not_found() => Ok(None),
-        Err(e) => Err(e.into()),
+/// The oplog's size when none is asked for, as mongod 8.2.11 picks it
+/// (`getNewOplogSizeBytes`). macOS: 192 MB, "typically a desktop" (measured:
+/// a fresh `--replSet` mongod 8.2.11 on this box gives `maxSize` 201326592).
+/// Elsewhere: 5% of the free space of the data directory's filesystem, at
+/// least 990 MB and at most 50 GB.
+fn default_oplog_size(home: &str) -> i64 {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = home;
+        192 * 1024 * 1024
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        const MIN: i64 = 990 * 1024 * 1024;
+        const MAX: i64 = 50 * 1024 * 1024 * 1024;
+        let five_percent = free_space(home).map_or(0, |free| (free as f64 * 0.05) as i64);
+        five_percent.clamp(MIN, MAX)
     }
 }
 
-/// Make `local.oplog.rs`'s table if the store has none, and return its URI.
-/// A new store makes the table, then records it in the meta table (which
-/// survives a crash), then writes mongod's `_mdb_catalog` row for it --
-/// `{md: {ns, options: {uuid, capped, size, autoIndexId}, indexes: []},
-/// idxIdent: {}, ident, ns}`. A crash between the table and its record leaves
-/// a table no row names: empty, since nothing is written to it before the
-/// store is open, and dropped by the next open's `reconcile_idents`. An open
-/// that finds the record and no catalog row writes the row again.
-fn ensure_oplog_table(session: &Session, nonlogged: bool) -> Result<String> {
-    let (ident, uuid, recorded) = match read_oplog_ident(session)? {
-        Some((ident, uuid)) => (ident, uuid, true),
-        None => (
-            mdb_catalog::new_collection_ident(),
-            new_uuid_bytes().to_vec(),
-            false,
-        ),
-    };
+/// Bytes free on the filesystem holding `path`, for a non-privileged user.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[allow(clippy::unnecessary_cast)] // the field types differ by platform
+fn free_space(path: &str) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(std::path::Path::new(path).as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a NUL-terminated path and `st` a valid out-parameter.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_bavail as u64 * st.f_frsize as u64)
+}
+
+#[cfg(all(not(unix), not(target_os = "macos")))]
+fn free_space(_path: &str) -> Option<u64> {
+    None
+}
+
+/// Find `local.oplog.rs`'s table, or make it. The catalog row names its
+/// ident and holds the oplog's `options` (`{uuid, capped, size,
+/// autoIndexId}`), as mongod's does. A new store makes the table and writes
+/// the row, `{md: {ns, options, indexes: []}, idxIdent: {}, ident, ns}`; the
+/// store is then taken through [`genesis`], which ends in a checkpoint that
+/// makes the row durable. A crash before that leaves a table no row names,
+/// empty -- nothing is written to it before the store is open -- dropped by
+/// the next open's `reconcile_idents`, which then makes a new one.
+fn ensure_oplog_table(session: &Session, nonlogged: bool, size_if_new: i64) -> Result<OplogTable> {
+    if let Some(entry) = mdb_catalog::entry_of_ns(session, OPLOG_NS)? {
+        let ident = entry
+            .get_str("ident")
+            .map_err(|e| StorageError::Bson(e.to_string()))?
+            .to_string();
+        let max_bytes = entry
+            .get_document("md")
+            .and_then(|md| md.get_document("options"))
+            .ok()
+            .and_then(|o| o.get("size").and_then(Bson::as_i64))
+            .unwrap_or(size_if_new);
+        let uri = mdb_catalog::table_uri(&ident);
+        // A no-op on an existing table.
+        session.create(&uri, &oplog_table_cfg(nonlogged))?;
+        return Ok(OplogTable {
+            uri,
+            created: false,
+            max_bytes,
+        });
+    }
+    let ident = mdb_catalog::new_collection_ident();
+    let uuid = new_uuid_bytes().to_vec();
     let uri = mdb_catalog::table_uri(&ident);
-    // A no-op on an existing table.
     session.create(&uri, &oplog_table_cfg(nonlogged))?;
-    if !recorded {
-        let blob = encode_doc(&bson::doc! {"ident": &ident, "uuid": uuid_binary(&uuid)})?;
-        let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
-        cur.set_key_s(OPLOG_IDENT_KEY);
-        cur.set_value_u(&blob);
-        cur.insert()?;
-    }
-    if mdb_catalog::ident_of_ns(session, OPLOG_NS)?.is_none() {
-        let options = bson::doc! {
-            "uuid": uuid_binary(&uuid),
-            "capped": true,
-            "size": OPLOG_CATALOG_SIZE,
-            "autoIndexId": false,
-        };
-        let entry = mdb_catalog::entry_doc(OPLOG_NS, options, &[], &ident, &[]);
-        let id = NEXT_CATALOG_ID.fetch_add(1, Ordering::SeqCst);
-        mdb_catalog::write_entry(session, id, &entry)?;
-    }
-    Ok(uri)
+    let options = bson::doc! {
+        "uuid": uuid_binary(&uuid),
+        "capped": true,
+        "size": size_if_new,
+        "autoIndexId": false,
+    };
+    let entry = mdb_catalog::entry_doc(OPLOG_NS, options, &[], &ident, &[]);
+    let id = NEXT_CATALOG_ID.fetch_add(1, Ordering::SeqCst);
+    mdb_catalog::write_entry(session, id, &entry)?;
+    Ok(OplogTable {
+        uri,
+        created: true,
+        max_bytes: size_if_new,
+    })
+}
+
+/// Whether an oplog entry is one a store writes when it is made: the
+/// `initiating set` no-op, or the creation of `config.system.indexBuilds`.
+fn oplog_entry_is_genesis(entry: &Document) -> bool {
+    oplog_entry_is_initiating_set(entry)
+        || (entry.get_str("ns") == Ok("config.$cmd")
+            && entry
+                .get_document("o")
+                .is_ok_and(|o| o.get_str("create") == Ok("system.indexBuilds")))
+}
+
+/// Whether an oplog entry is the one that begins a replica set's oplog,
+/// `{op: "n", o: {msg: "initiating set"}}`. mongod writes it first, at
+/// `replSetInitiate`; an oplog whose oldest entry it is has lost nothing from
+/// the front.
+fn oplog_entry_is_initiating_set(entry: &Document) -> bool {
+    entry.get_str("op") == Ok("n")
+        && entry
+            .get_document("o")
+            .is_ok_and(|o| o.get_str("msg") == Ok("initiating set"))
 }
 
 /// Peek the `ts` Timestamp out of a raw oplog-entry blob without materialising
@@ -7457,8 +7482,8 @@ impl Storage {
         // Phase A': stop the periodic stable-checkpoint thread before any
         // teardown (it holds no locks between ticks; a 250ms tick bounds the
         // join). The close path below takes its own final checkpoint, and for
-        // a data-nonlogged store we anchor the stable marker with it so a
-        // clean close reopens with an empty replay gap.
+        // a data-nonlogged store a stable checkpoint, so a clean close reopens
+        // with an empty replay gap.
         self.checkpoint_stop.store(true, Ordering::Release);
         if let Some(h) = self
             .checkpoint_join
@@ -7480,6 +7505,8 @@ impl Storage {
             if let Err(e) = self.stable_checkpoint() {
                 fail("the stable checkpoint", e);
             }
+        } else if let Err(e) = self.refresh_oplog_truncate_after_point() {
+            fail("moving the oplog truncate-after point", e);
         }
         match self.conn.open_session() {
             Ok(session) => {
@@ -7492,7 +7519,11 @@ impl Storage {
                         fail("checking the collection sizes", e);
                     }
                 }
-                if let Err(e) = self.sizes.persist(&session, &fingerprint) {
+                let oplog_sizes = {
+                    let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+                    (st.live_count, st.live_bytes)
+                };
+                if let Err(e) = self.sizes.persist(&session, &fingerprint, oplog_sizes) {
                     fail("persisting the collection sizes", e);
                 }
                 // Close-time checkpoint (durable mode) — the Rust analogue of
@@ -7500,7 +7531,7 @@ impl Storage {
                 // connection close does NOT implicitly checkpoint while logging
                 // is enabled, so without this a clean shutdown leaves the log
                 // un-truncated and the next open replays the full retained log.
-                // Run it AFTER persisting the oplog-meta row so that row is
+                // Run it AFTER persisting the size counts so they are
                 // included in the snapshot. Skipped in fast/test mode
                 // (`durable=false`) — the journal is still on, so data stays
                 // recoverable via log replay, just not checkpoint-bounded — and
@@ -7658,17 +7689,24 @@ impl Storage {
             // or placement names; then `local.oplog.rs`'s own: the catalog's
             // row names its ident, a new store makes both.
             reconcile_idents(&boot)?;
-            let oplog_uri = ensure_oplog_table(&boot, oplog_nonlogged)?;
+            let oplog = ensure_oplog_table(
+                &boot,
+                oplog_nonlogged,
+                opts.oplog_size_bytes
+                    .unwrap_or_else(|| default_oplog_size(home)),
+            )?;
             // Recover the timestamp counters from the oplog's last entry.
-            (load_oplog_state(&boot, &oplog_uri)?, oplog_uri)
+            (load_oplog_state(&boot, &oplog.uri)?, oplog)
         };
-        let (mut state, oplog_uri) = state;
+        let (mut state, oplog_table) = state;
+        let oplog_uri = oplog_table.uri.clone();
         // The oplog state as the last close left it: the size storer's
         // counts are trusted only when it is the state they were saved with.
         // (`next_nat_seq` is not part of it: the open raises it to the
         // largest RecordId held, so it can differ from what the close saved
         // with nothing written in between.)
         let size_fingerprint = [state.next_seq, 0, 0];
+        let oplog_created = oplog_table.created;
         // Cluster-time mints are not persisted per call (see
         // `current_cluster_time`), so the recovered (last_ts_secs, last_ts_ord)
         // can lag mints issued right before a crash. Bump one full second past
@@ -7704,24 +7742,26 @@ impl Storage {
         }
         let oplog = Arc::new(Mutex::new(state));
         let oplog_cv = Arc::new(Condvar::new());
-        // Phase A': resolve the data-logging mode. The stable marker (written
-        // at every stable checkpoint) is authoritative for an existing store —
-        // table logging config is create-time-sticky, so flipping the env var
-        // on an existing store must not change the mode. A fresh store (no
-        // marker) takes the env var. In-memory stores have no crash story and
-        // stay in the plain mode. Resolved BEFORE the drainer pool spawns —
-        // the drainers' prune context needs the mode and the stable-marker
-        // pieces.
-        let marker = {
-            let session = conn.open_session()?;
-            load_stable_marker(&session)
-        };
+        // Resolve the data-logging mode: table logging config is
+        // create-time-sticky, so an existing store's tables (WiredTiger's own
+        // metadata) are authoritative and flipping the env var on an existing
+        // store must not change the mode; a fresh store takes the env var.
+        // In-memory stores have no crash story and stay in the plain mode.
+        // Resolved BEFORE the pruner spawns -- its context needs the mode.
         let data_nonlogged = if in_memory {
             false
         } else {
             stored_mode.unwrap_or(data_create_mode)
         };
-        let stable_seq = Arc::new(AtomicI64::new(marker.map(|(s, _)| s).unwrap_or(0)));
+        // The stable checkpoint's position is its timestamp: WiredTiger's
+        // recovery timestamp, which a checkpoint stores atomically with
+        // itself (the checkpoint-then-marker order of an earlier format could
+        // be crashed between).
+        let stable_seq = Arc::new(AtomicI64::new(if data_nonlogged {
+            recovery_timestamp as i64
+        } else {
+            0
+        }));
         let checkpoint_requested = Arc::new(AtomicBool::new(false));
         let sizes = Arc::new(sizes::SizeStorer::default());
         let prune_ctx = Arc::new(PruneCtx {
@@ -7730,10 +7770,9 @@ impl Storage {
             oplog: oplog.clone(),
             prune_lock: Mutex::new(()),
             retention_seconds: AtomicI64::new(3600),
-            max_entries: AtomicUsize::new(100_000),
+            max_bytes: AtomicI64::new(oplog_table.max_bytes),
             min_retention_seconds: AtomicI64::new(0),
             pre_image_expire_after_seconds: AtomicI64::new(-1),
-            pruned_through_ts: AtomicU64::new(0),
             archive_dir: Mutex::new(None),
             data_nonlogged,
             stable_seq: stable_seq.clone(),
@@ -7814,6 +7853,11 @@ impl Storage {
         // Before the store takes any write -- crash recovery's replay and the
         // upgrades below write documents, and each write moves the counts.
         storage.open_size_storer(&size_fingerprint)?;
+        // A new store is initiated (see `genesis`) before recovery or any
+        // write: there is nothing to recover in it.
+        if oplog_created || storage.needs_genesis()? {
+            storage.genesis(oplog_created)?;
+        }
         if storage.data_nonlogged {
             // Crash recovery: the data tables rolled back to the last stable
             // checkpoint; the (WAL-logged) oplog has everything. Replay the
@@ -7830,6 +7874,7 @@ impl Storage {
         if storage.durable && !storage.in_memory {
             storage.spawn_journal_flusher();
         }
+        storage.count_unclean_shutdown(oplog_created)?;
         // Finish any chunked drop a crash interrupted (registry row already
         // gone; the leftover rows must not resurface under a re-created name).
         storage.recover_pending_drops()?;
@@ -7887,7 +7932,7 @@ impl Storage {
             .store(secs.map_or(-1, |s| s.max(0)), Ordering::Relaxed);
     }
 
-    /// Keep every oplog entry younger than `secs`, whatever the entry cap
+    /// Keep every oplog entry younger than `secs`, whatever the size
     /// and the retention window: `replSetResizeOplog`'s `minRetentionHours`
     /// (0 removes the floor). The next sweep applies it.
     pub fn set_oplog_min_retention_seconds(&self, secs: i64) {
@@ -7896,11 +7941,47 @@ impl Storage {
             .store(secs.max(0), Ordering::Relaxed);
     }
 
-    /// Set the oplog hard entry cap (default 100_000). Mirrors
-    /// `oplog_max_entries`. Takes `&self` because `replSetResizeOplog`
-    /// changes it while the server runs; the next sweep applies it.
-    pub fn set_oplog_max_entries(&self, n: usize) {
-        self.prune_ctx.max_entries.store(n, Ordering::Relaxed);
+    /// Hold the oplog to `bytes` (mongod's `size` of `local.oplog.rs`):
+    /// `replSetResizeOplog`. The size is the oplog's catalog entry's
+    /// `options.size`, as mongod keeps it, so it outlives the process; in a
+    /// store whose catalog is not logged a checkpoint makes it durable at
+    /// once. Takes `&self` because the command changes it while the server
+    /// runs; the next sweep applies it.
+    pub fn set_oplog_max_bytes(&self, bytes: i64) -> Result<()> {
+        {
+            let session = self.conn.open_session()?;
+            let entry = mdb_catalog::entry_of_ns(&session, OPLOG_NS)?
+                .ok_or_else(|| StorageError::Internal("the oplog has no catalog entry".into()))?;
+            let id = mdb_catalog::catalog_id_of_ns(&session, OPLOG_NS)?
+                .ok_or_else(|| StorageError::Internal("the oplog has no catalog entry".into()))?;
+            let mut entry = entry;
+            if let Some(Bson::Document(md)) = entry.get_mut("md") {
+                if let Some(Bson::Document(options)) = md.get_mut("options") {
+                    options.insert("size", bytes);
+                }
+            }
+            session.begin_transaction(None)?;
+            let wrote = mdb_catalog::write_entry(&session, id, &entry);
+            match wrote {
+                Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped)?,
+                Err(e) => {
+                    let _ = session.rollback_transaction(None);
+                    return Err(e);
+                }
+            }
+        }
+        self.prune_ctx.max_bytes.store(bytes, Ordering::Relaxed);
+        // Truncation is the pruner's job: wake it to apply a smaller size.
+        signal_oplog_prune(&self.prune_ctx);
+        if self.data_nonlogged && !self.in_memory {
+            self.checkpoint_now()?;
+        }
+        Ok(())
+    }
+
+    /// The size, in bytes, the oplog is held to.
+    pub fn oplog_max_bytes(&self) -> i64 {
+        self.prune_ctx.max_bytes.load(Ordering::Relaxed)
     }
 
     /// The number of the last committed change of a catalog document
@@ -8135,7 +8216,7 @@ impl Storage {
             fn drop(&mut self) {
                 IN_SYNC_STMT.with(|f| f.set(false));
                 let ranges = PENDING_MINTED.with(|p| std::mem::take(&mut *p.borrow_mut()));
-                let held = self.0.deregister_in_flight(&ranges);
+                let held = self.0.deregister_in_flight(&ranges, self.1);
                 if self.1 {
                     note_oplog_slot_held(held);
                     if let Some(end) = ranges.iter().map(|r| r.1).max() {
@@ -8154,7 +8235,7 @@ impl Storage {
             // on every exit, so this is a defensive no-op in practice) —
             // deregister rather than drop them, or they'd pin the tail.
             let stale = PENDING_MINTED.with(|p| std::mem::take(&mut *p.borrow_mut()));
-            self.deregister_in_flight(&stale);
+            self.deregister_in_flight(&stale, false);
             Some(SyncMintScope(self, false))
         };
         // The collections this statement writes, for `NS_COMMITS`: the
@@ -8289,6 +8370,8 @@ impl Storage {
                     end: start + n as i64,
                     first_ts: first,
                     minted_at: Instant::now(),
+                    records: 0,
+                    bytes: 0,
                 },
             );
         }
@@ -8441,7 +8524,7 @@ impl Storage {
     /// tail may have advanced.
     /// Returns how long, in microseconds, the ranges held their slots
     /// open, for the caller to credit when their transaction committed.
-    fn deregister_in_flight(&self, ranges: &[(i64, i64)]) -> i64 {
+    fn deregister_in_flight(&self, ranges: &[(i64, i64)], committed: bool) -> i64 {
         if ranges.is_empty() {
             return 0;
         }
@@ -8455,6 +8538,10 @@ impl Storage {
                 "in-flight window out of sync"
             );
             held += removed.map_or(0, |r| r.held_micros());
+            if let (true, Some(r)) = (committed, removed) {
+                st.live_count += r.records;
+                st.live_bytes += r.bytes;
+            }
         }
         self.oplog_cv.notify_all();
         held
@@ -8809,6 +8896,7 @@ impl Storage {
         }
         let mut last = 0i64;
         let written = finals.len() as i64;
+        let written_bytes: i64 = finals.iter().map(|(_, b)| b.len() as i64).sum();
         for (seq, blob) in &finals {
             cur.reset()?;
             cur.set_key_q(*seq);
@@ -8839,9 +8927,14 @@ impl Storage {
                 // Its rows committed as they were written.
                 note_oplog_slot_held(removed.map_or(0, |r| r.held_micros()));
                 self.oplog_cv.notify_all();
+                g.live_count += written;
+                g.live_bytes += written_bytes;
+            } else if let Some(r) = g.in_flight.get_mut(&start) {
+                // The commit adds them (`deregister_in_flight`).
+                r.records = written;
+                r.bytes = written_bytes;
             }
             g.emit_count += written;
-            g.live_count += written;
             if g.emit_count >= OPLOG_PRUNE_INTERVAL {
                 g.emit_count = 0;
                 true
@@ -8913,9 +9006,9 @@ impl Storage {
 
     /// A strictly-monotonic `Timestamp` advancing the cluster clock (used for
     /// `hello`'s `lastWrite` / the `aggregate` reply's `operationTime`).
-    /// Deliberately does NOT persist the oplog meta row: this runs on every
+    /// Deliberately persists nothing: this runs on every
     /// `hello` reply under the replica-set persona (driver heartbeats) and on
-    /// change-stream high-water-mark minting, so a per-call meta write is a
+    /// change-stream high-water-mark minting, so a per-call write is a
     /// single-row WT hotspot every concurrent writer contends on. Restart
     /// monotonicity is guaranteed structurally instead: recovery bumps the
     /// clock one second past everything it can see (see `open_with_config`),
@@ -9131,11 +9224,19 @@ impl Storage {
         &self.oplog_uri
     }
 
-    /// The newest oplog position ever pruned (0: nothing yet, so the oplog
-    /// still reaches the store's first entry).
-    pub fn oplog_pruned_through(&self) -> Result<i64> {
+    /// Whether the oplog still begins where the set did: its oldest entry is
+    /// the `initiating set` no-op mongod writes first. An oplog that has
+    /// been truncated from the front no longer reaches genesis, so a replay
+    /// of it from an empty store would be partial. mongod's own mark of
+    /// where an oplog begins; nothing is kept apart from the oplog.
+    pub fn oplog_reaches_genesis(&self) -> Result<bool> {
         let session = self.conn.open_session()?;
-        Ok(read_pruned_marker(&session))
+        let cur = session.open_cursor(&self.oplog_uri, None)?;
+        if !cur.next()? {
+            return Ok(false);
+        }
+        let entry = decode_doc(&cur.get_value_u()?)?;
+        Ok(oplog_entry_is_initiating_set(&entry))
     }
 
     /// The position of the newest entry at or before `at` (0 if none): the
@@ -9193,13 +9294,13 @@ impl Storage {
         Ok(())
     }
 
-    /// Phase A': write the stable marker at the CURRENT visible tail, then
-    /// checkpoint. Marker-before-checkpoint makes the marker conservative —
-    /// the checkpoint's data state covers at least every seq <= marker — and
-    /// conservative is safe because replay is idempotent (re-applied inserts
-    /// skip on duplicate `_id`, `$v:2` diffs are idempotent transformations,
-    /// deletes of absent docs are no-ops). Public so tests and tools can
-    /// force an anchor; the periodic thread calls it on the mongod cadence.
+    /// Phase A': set the stable timestamp to the all-committed point, then
+    /// checkpoint: the checkpoint keeps every write at or below it and
+    /// stores it as its recovery timestamp. Replay from there is idempotent
+    /// (re-applied inserts skip on duplicate `_id`, `$v:2` diffs are
+    /// idempotent transformations, deletes of absent docs are no-ops).
+    /// Public so tests and tools can force an anchor; the periodic thread
+    /// does the same on the mongod cadence.
     /// A checkpoint now, as `fsync` asks for one: for a data-nonlogged store
     /// the stable checkpoint (with its marker), for a logged one the plain
     /// checkpoint. Nothing for a store held in memory, which has none.
@@ -9501,45 +9602,229 @@ impl Storage {
     }
 
     pub fn stable_checkpoint(&self) -> Result<()> {
-        // ORDER IS LOAD-BEARING: capture the seq, CHECKPOINT, then write the
-        // marker. The marker row lives in the always-logged oplog-meta table,
-        // so it becomes crash-durable the moment its transaction hits the WAL
-        // — independently of the checkpoint. Written marker-first (as this
-        // used to be), a kill -9 in the window between the marker's WAL write
-        // and the checkpoint's completion recovers with a marker ABOVE the
-        // data the last checkpoint actually contained, and replay starts too
-        // high: every acked write between the old checkpoint and the marker
-        // is silently lost (caught live by the hard-kill harness, 2026-08-01
-        // — a mid-history hole, oplog rows all present). Checkpoint-first,
-        // the crash window leaves the OLD marker: replay covers extra
-        // already-applied entries, which `apply_replay_entry_idempotent`
-        // exists to absorb. Stale-marker is safe; eager-marker loses data.
+        // The stable timestamp is set, then the checkpoint taken: the
+        // checkpoint keeps every write committed at or below it and stores
+        // that timestamp with itself (`get=recovery`), which is where a crash
+        // replays the oplog from. Nothing is written beside it, so no crash
+        // can leave a recovery point that the data does not match (the
+        // checkpoint-then-marker row of an earlier format could be crashed
+        // between, and had to be written second).
+        self.refresh_oplog_truncate_after_point()?;
         let stable = if self.timestamped {
             advance_timestamps(&self.conn, &self.oplog)?
         } else {
             self.oplog_visible_tail_seq()
         };
         self.checkpoint()?;
-        {
-            let session = self.conn.open_session()?;
-            let mut d = Document::new();
-            d.insert("stable_seq", stable);
-            d.insert("data_nonlogged", self.data_nonlogged);
-            let blob = encode_doc(&d)?;
-            let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
-            cur.set_key_s("stable");
-            cur.set_value_u(&blob);
-            cur.insert()?;
-        }
         self.stable_seq.store(stable, Ordering::Release);
         Ok(())
     }
 
-    /// Phase A' crash recovery: replay oplog entries above the stable marker
-    /// into the data tables through the ordinary write paths (oplog emission
-    /// suppressed — the entries are already there), tolerating already-applied
-    /// work: the marker is deliberately conservative, so the window's prefix
-    /// may be present in the checkpointed data. Runs before the store serves.
+    /// Write the oplog's first entry, `{op: "n", ns: "", o: {msg: "initiating
+    /// set"}}`, as mongod's `replSetInitiate` does (measured 8.2.11: field
+    /// order `op, ns, o, ts, v, wall`, and no `t`: no election has happened
+    /// yet). Returns its position.
+    fn write_initiating_entry(&self) -> Result<i64> {
+        let (start, ts) = self.mint_seq_and_ts(1, true);
+        let entry = bson::doc! {
+            "op": "n",
+            "ns": "",
+            "o": {"msg": "initiating set"},
+            "ts": Bson::Timestamp(ts[0]),
+            "v": 2_i64,
+            "wall": Bson::DateTime(bson::DateTime::from_millis(now_millis())),
+        };
+        let blob = encode_doc(&entry)?;
+        let ws = self.conn.open_session()?;
+        ws.begin_transaction(None)?;
+        let wrote = (|| -> Result<()> {
+            let cur = ws.open_cursor(&self.oplog_uri, None)?;
+            cur.set_key_q(start);
+            cur.set_value_u(&blob);
+            cur.insert()?;
+            Ok(())
+        })();
+        let out = match wrote {
+            Ok(()) => commit_stamped(&ws, &self.oplog, self.timestamped),
+            Err(e) => {
+                let _ = ws.rollback_transaction(None);
+                Err(e)
+            }
+        };
+        {
+            let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(r) = st.in_flight.get_mut(&start) {
+                r.records = 1;
+                r.bytes = blob.len() as i64;
+            }
+        }
+        self.deregister_in_flight(&[(start, start + 1)], out.is_ok());
+        out.map(|()| start)
+    }
+
+    /// Put `doc` into `local.<coll>` unless the collection already holds a
+    /// document, unreplicated as mongod's `local` writes are.
+    fn put_local_singleton(&self, coll: &str, doc: Document) -> Result<()> {
+        if self.collection_exists("local", coll)?
+            && self.count_matching("local", coll, &Document::new(), None)? > 0
+        {
+            return Ok(());
+        }
+        let bytes = encode_doc(&doc)?;
+        self.insert("local", coll, vec![bytes], true).map(|_| ())
+    }
+
+    /// What mongod's one-member replica set keeps at its initiation (phase
+    /// 0b, measured 8.2.11 in `tests/fixtures/storage_model/mongod-8.2.11-
+    /// replset-state.json`), and the checkpoint that makes it durable. A new
+    /// store is taken through it before it serves: the oplog and its first
+    /// entry, the `local.replset.*` and `local.system.rollback.id`
+    /// collections, and `config.system.indexBuilds`, then a checkpoint, as
+    /// mongod takes at the end of `replSetInitiate`. That checkpoint is what
+    /// the crash tests require of a store whose catalog is not logged: the
+    /// catalog row naming the oplog is in it, so a kill -9 before the first
+    /// periodic checkpoint still finds the oplog, whose entries are logged.
+    fn genesis(&self, created: bool) -> Result<()> {
+        // `local` writes have no entry anyway; the guard makes it so for the
+        // helpers that might not know.
+        let unlogged = unreplicated();
+        let first =
+            if created && scan_max_oplog_seq(&self.conn.open_session()?, &self.oplog_uri) == 0 {
+                Some(self.write_initiating_entry()?)
+            } else {
+                None
+            };
+        let tail = {
+            let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+            Self::all_committed_ts_locked(&st)
+        };
+        self.put_local_singleton(
+            "replset.minvalid",
+            bson::doc! {
+                "_id": bson::oid::ObjectId::new(),
+                "t": -1_i64,
+                "ts": Bson::Timestamp(bson::Timestamp { time: 0, increment: 0 }),
+            },
+        )?;
+        self.put_local_singleton(
+            "replset.oplogTruncateAfterPoint",
+            bson::doc! {
+                "_id": "oplogTruncateAfterPoint",
+                "oplogTruncateAfterPoint": Bson::Timestamp(u64_ts(first.map_or(tail, |f| f as u64))),
+            },
+        )?;
+        self.put_local_singleton(
+            "replset.election",
+            bson::doc! {
+                "_id": bson::oid::ObjectId::new(),
+                "term": 1_i64,
+                "candidateIndex": 0_i64,
+            },
+        )?;
+        self.put_local_singleton(
+            "replset.initialSyncId",
+            bson::doc! {
+                "_id": uuid_binary(&new_uuid_bytes()),
+                "wallTime": Bson::DateTime(bson::DateTime::from_millis(now_millis())),
+            },
+        )?;
+        self.put_local_singleton(
+            "system.rollback.id",
+            bson::doc! {"_id": "rollbackId", "rollbackId": 1_i32},
+        )?;
+        drop(unlogged);
+        // `config.system.indexBuilds` is there from the start, as mongod's,
+        // and its creation is an oplog entry, as mongod's is.
+        self.create_collection("config", "system.indexBuilds")?;
+        if !self.in_memory && self.data_nonlogged {
+            self.checkpoint_now()?;
+        }
+        Ok(())
+    }
+
+    /// A store that was not shut down cleanly has rolled back to its last
+    /// checkpoint, and mongod's `local.system.rollback.id` counts it
+    /// (measured 8.2.11: 1 at initiation, 2 after the first kill -9, 3 after
+    /// the second; a clean restart leaves it). Run on every open of an
+    /// existing store; only a store with a lock file (the servers) can tell.
+    fn count_unclean_shutdown(&self, created: bool) -> Result<()> {
+        let unclean = self
+            .open_record
+            .lock_file
+            .as_ref()
+            .is_some_and(|l| l.unclean);
+        if !unclean || created {
+            return Ok(());
+        }
+        let _unlogged = unreplicated();
+        let filter = bson::doc! {"_id": "rollbackId"};
+        let found = self.find_matching("local", "system.rollback.id", &filter)?;
+        let Some(blob) = found.first() else {
+            return Ok(());
+        };
+        let id = decode_doc(blob)?.get_i32("rollbackId").unwrap_or(1);
+        self.update_matching(
+            "local",
+            "system.rollback.id",
+            &filter,
+            &bson::doc! {"_id": "rollbackId", "rollbackId": id + 1},
+            false,
+            false,
+            &[],
+            &Document::new(),
+            None,
+            None,
+            false,
+        )
+        .map(|_| ())
+    }
+
+    /// Whether the store lacks something its initiation makes: a new store,
+    /// or one a crash interrupted before the initiation's last document.
+    fn needs_genesis(&self) -> Result<bool> {
+        let session = self.conn.open_session()?;
+        Ok(mdb_catalog::read_placement(&session, "local", "system.rollback.id")?.is_none())
+    }
+
+    /// Move `local.replset.oplogTruncateAfterPoint` to the all-committed
+    /// point, where mongod's journal flusher keeps it: every entry at or
+    /// below it is whole. Moved here with each stable checkpoint and at
+    /// close, not every 100 ms.
+    fn refresh_oplog_truncate_after_point(&self) -> Result<()> {
+        if self.in_memory || !self.collection_exists("local", "replset.oplogTruncateAfterPoint")? {
+            return Ok(());
+        }
+        let _unlogged = unreplicated();
+        let at = {
+            let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+            Self::all_committed_ts_locked(&st)
+        };
+        self.update_matching(
+            "local",
+            "replset.oplogTruncateAfterPoint",
+            &bson::doc! {"_id": "oplogTruncateAfterPoint"},
+            &bson::doc! {
+                "_id": "oplogTruncateAfterPoint",
+                "oplogTruncateAfterPoint": Bson::Timestamp(u64_ts(at)),
+            },
+            false,
+            true,
+            &[],
+            &Document::new(),
+            None,
+            None,
+            false,
+        )
+        .map(|_| ())
+    }
+
+    /// Crash recovery: replay oplog entries above the stable checkpoint
+    /// (WiredTiger's recovery timestamp, `get=recovery`: where the data
+    /// tables rolled back to) into the data tables through the ordinary write
+    /// paths (oplog emission suppressed -- the entries are already there),
+    /// tolerating already-applied work, as mongod's `ReplicationRecovery`
+    /// applies the oplog from its stable timestamp. Runs before the store
+    /// serves.
     fn recover_from_oplog(&mut self) -> Result<()> {
         let floor = self.stable_seq.load(Ordering::Acquire);
         let was_enabled = self.enable_oplog;
@@ -9628,11 +9913,11 @@ impl Storage {
                 next - 1
             );
         }
-        // Nothing above the stable marker (a clean close, or a new store):
-        // the marker already names the tail, and re-anchoring would checkpoint
-        // only to write the same seq back. Skipping it keeps that checkpoint
-        // (~25-40 ms, measured 2026-11-19) off every start; the periodic
-        // stable checkpoint anchors the marker as soon as there is a gap.
+        // Nothing above the recovery timestamp (a clean close, or a new
+        // store): re-anchoring would checkpoint only to store the same
+        // timestamp again. Skipping it keeps that checkpoint (~25-40 ms,
+        // measured 2026-11-19) off every start; the periodic stable
+        // checkpoint moves it as soon as there is a gap.
         if next == floor + 1 {
             return Ok(());
         }
@@ -9811,8 +10096,8 @@ impl Storage {
     /// + joined in `Drop` before the close checkpoint.
     ///
     /// `stable` is the data-nonlogged mode: the checkpoint is what makes the
-    /// unlogged tables durable, and the thread records the stable marker
-    /// after it. Without it (a logged store) the checkpoint is what lets
+    /// unlogged tables durable, and the stable timestamp is set before it.
+    /// Without it (a logged store) the checkpoint is what lets
     /// WiredTiger REMOVE LOG FILES, and nothing else is written: until
     /// 2026-10-13 a logged store checkpointed only when it closed, so its log
     /// was never trimmed while it ran. Measured on `secantusd-pg` at 13,000
@@ -9875,9 +10160,7 @@ impl Storage {
                     }
                     waited = std::time::Duration::ZERO;
                     if !stable {
-                        // A logged store: the checkpoint alone. No stable
-                        // marker -- that row records the data-nonlogged
-                        // MODE, which a logged store must not acquire.
+                        // A logged store: the checkpoint alone.
                         let done = {
                             let _cp = gate.lock().unwrap_or_else(|e| e.into_inner());
                             conn.open_session()
@@ -9888,13 +10171,8 @@ impl Storage {
                         }
                         continue;
                     }
-                    // Checkpoint-BEFORE-marker, same as stable_checkpoint()
-                    // (see the invariant comment there): the marker is
-                    // WAL-durable the moment it is written, so writing it
-                    // ahead of the checkpoint opens a kill window where
-                    // recovery trusts a marker above the checkpointed data
-                    // and replay skips acked writes. Stale marker = safe
-                    // (idempotent over-replay); eager marker = data loss.
+                    // The stable timestamp first, then the checkpoint that
+                    // keeps it (see `stable_checkpoint`).
                     let stable = if timestamped {
                         match advance_timestamps(&conn, &oplog) {
                             Ok(seq) => seq,
@@ -9913,14 +10191,6 @@ impl Storage {
                             let _cp = gate.lock().unwrap_or_else(|e| e.into_inner());
                             drop_pending.checkpoint(&session)?;
                         }
-                        let mut d = Document::new();
-                        d.insert("stable_seq", stable);
-                        d.insert("data_nonlogged", true);
-                        let blob = encode_doc(&d)?;
-                        let cur = session.open_cursor(OPLOG_META_TABLE, None)?;
-                        cur.set_key_s("stable");
-                        cur.set_value_u(&blob);
-                        cur.insert()?;
                         Ok(())
                     })();
                     match write {
@@ -10069,7 +10339,6 @@ impl Storage {
         table: &str,
         archive_dir: &str,
         doomed_sorted: &[i64],
-        prev: i64,
     ) -> Result<()> {
         let op_cur = session.open_cursor(table, None)?;
         // `search()` (a read) reports not-found honestly regardless of
@@ -10100,6 +10369,23 @@ impl Storage {
             }
             rows.push((seq, entry, (!pre.is_empty()).then_some(pre)));
         }
+        let Some((first, first_entry, _)) = rows.first() else {
+            return Ok(());
+        };
+        // The position the segment follows. The oplog's oldest entry is the
+        // first doomed one: when it is the set's initiating no-op (mongod's
+        // own mark of where an oplog begins) nothing precedes it. Otherwise
+        // what precedes it was pruned, and the segment chains onto the one
+        // the archive already holds; with none there, the chain's start is
+        // unknown, which is claimed as just before the segment, so that no
+        // base older than it can pretend the two abut.
+        let prev = if oplog_entry_is_initiating_set(first_entry) {
+            0
+        } else {
+            pitr_archive::newest_segment_end(archive_dir)
+                .filter(|end| end < first)
+                .unwrap_or(first - 1)
+        };
         pitr_archive::write_segment(archive_dir, &rows, prev)?;
         Ok(())
     }
@@ -10139,8 +10425,7 @@ impl Storage {
             "oplogEnabled": self.enable_oplog,
             "oplogFloorSeq": floor,
             "oplogHeadSeq": head,
-            "genesisIntact": self.oplog_pruned_through()? == 0,
-            "oplogPrunedThrough": self.oplog_pruned_through()?,
+            "genesisIntact": self.oplog_reaches_genesis()?,
             "oplogFloorTs": ts_of(&floor_row),
             "oplogHeadTs": ts_of(&head_row),
             "oplogFloorWall": wall_of(&floor_row),
@@ -10250,9 +10535,21 @@ impl Storage {
         // the store recorded for it (and its `_mdb_catalog` row carries).
         if self.is_oplog_rs(db, coll) {
             let session = self.conn.open_session()?;
-            return read_oplog_ident(&session)?
-                .map(|(_, uuid)| uuid)
-                .ok_or_else(|| StorageError::Internal("the store records no oplog uuid".into()));
+            return mdb_catalog::entry_of_ns(&session, OPLOG_NS)?
+                .and_then(|entry| {
+                    let options = entry
+                        .get_document("md")
+                        .ok()?
+                        .get_document("options")
+                        .ok()?;
+                    match options.get("uuid") {
+                        Some(Bson::Binary(b)) => Some(b.bytes.clone()),
+                        _ => None,
+                    }
+                })
+                .ok_or_else(|| {
+                    StorageError::Internal("the oplog's catalog entry has no uuid".into())
+                });
         }
         // Planner writes made here are released once they are visible.
         let _planner = PlannerScope::new();
@@ -10471,6 +10768,40 @@ impl Storage {
         }
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
+        // The timeline carried over is the source's, and begins where the
+        // source's does: what this store wrote when it was made (the
+        // `initiating set` no-op and the creation of `config.system.
+        // indexBuilds`), dated after everything carried, is not part of it.
+        // The oplog then reaches genesis only if what is carried does.
+        {
+            let existing = session.open_cursor(&self.oplog_uri, None)?;
+            let mut own: Vec<(i64, i64)> = Vec::new();
+            while existing.next()? {
+                let pos = existing.get_key_q()?;
+                if rows.iter().any(|(seq, _)| *seq == pos) {
+                    continue;
+                }
+                let blob = existing.get_value_u()?;
+                if oplog_entry_is_genesis(&decode_doc(&blob)?) {
+                    own.push((pos, blob.len() as i64));
+                }
+            }
+            drop(existing);
+            if !own.is_empty() {
+                session.begin_transaction(None)?;
+                let del = session.open_cursor(&self.oplog_uri, None)?;
+                for (pos, _) in &own {
+                    del.reset()?;
+                    del.set_key_q(*pos);
+                    del.remove()?;
+                }
+                drop(del);
+                commit_stamped(&session, &self.oplog, self.timestamped)?;
+                let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+                st.live_count -= own.len() as i64;
+                st.live_bytes -= own.iter().map(|o| o.1).sum::<i64>();
+            }
+        }
         // Restored rows keep their original position: the entry's own `ts`.
         let cur = session.open_cursor(&self.oplog_uri, None)?;
         // The pre-images go to `config.system.preimages` under the `_id`s
@@ -10478,8 +10809,10 @@ impl Storage {
         self.write_pre_image_records_alone(&Self::pre_image_records_of(rows, pre_images)?)?;
         let mut max_seq = 0i64;
         let mut best = (0i64, 0i64);
+        let mut imported_bytes = 0i64;
         for (seq, entry) in rows {
             let blob = encode_doc(entry)?;
+            imported_bytes += blob.len() as i64;
             cur.reset()?;
             cur.set_key_q(*seq);
             cur.set_value_u(&blob);
@@ -10503,16 +10836,17 @@ impl Storage {
                 st.last_ts_secs = best.0;
                 st.last_ts_ord = best.1;
             }
-            // Imported rows are live oplog entries too — keep the prune's count honest.
+            // Imported rows are live oplog entries too: the size counts them.
             st.live_count += rows.len() as i64;
+            st.live_bytes += imported_bytes;
             self.oplog_cv.notify_all();
         }
         Ok(max_seq)
     }
 
     /// Drop oplog rows older than the retention window (`ts.time < now -
-    /// retention`) and, if more than `oplog_max_entries` remain, the oldest
-    /// surplus; paired pre-images go too. `now` is injected seconds (defaults to
+    /// retention`) and, if the oplog holds more bytes than its size, the
+    /// oldest whole entries that surplus covers; paired pre-images go too. `now` is injected seconds (defaults to
     /// the wall clock). Returns the number of rows pruned. No background sweeper —
     /// the caller drives it. Mirrors `storage.prune_oplog` / `_prune_oplog_locked`.
     pub fn prune_oplog(&self, now: Option<i64>) -> Result<usize> {
@@ -10534,25 +10868,27 @@ impl Storage {
 /// half-pruned range (`read_oplog`, resume) tolerate missing rows. A free
 /// function over the shared context so the async drainer pool can run the
 /// sweep without a `Storage` borrow.
-/// Cut `doomed`, a seq-ordered prefix of the oplog, at its first row dated
-/// at or after `floor` (seconds): the rows `minRetentionHours` keeps. The
-/// oplog's timestamps rise with its seqs, so the rows past that one are
-/// younger too.
+/// Cut `doomed`, a position-ordered prefix of the oplog (`(position, bytes)`),
+/// at its first entry dated at or after `floor` (seconds): the entries
+/// `minRetentionHours` keeps. The oplog's timestamps rise with its
+/// positions, so the entries past that one are younger too.
 fn keep_younger_than(
     session: &Session,
     table: &str,
-    doomed: &mut Vec<i64>,
+    doomed: &mut Vec<(i64, i64)>,
     floor: i64,
 ) -> Result<()> {
     let cur = session.open_cursor(table, None)?;
-    for (at, seq) in doomed.iter().enumerate() {
+    for (at, (pos, _)) in doomed.iter().enumerate() {
         cur.reset()?;
-        cur.set_key_q(*seq);
+        cur.set_key_q(*pos);
         if cur.search().is_err() {
             continue;
         }
-        let blob = cur.get_value_u()?;
-        if matches!(peek_entry_ts(&blob), Some(ts) if i64::from(ts.time) >= floor) {
+        let young = cur.with_value_u(
+            |v| matches!(peek_entry_ts(v), Some(ts) if i64::from(ts.time) >= floor),
+        )?;
+        if young {
             doomed.truncate(at);
             break;
         }
@@ -10571,17 +10907,31 @@ fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
 }
 
 /// Expire `config.system.preimages` as mongod's pre-image remover does:
-/// each pre-image of an oplog entry the sweeps have removed (its `_id.ts`
-/// at or before the newest one removed), and, under
+/// each pre-image of an oplog entry the oplog no longer holds (its `_id.ts`
+/// before the oldest entry left, and at or below the all-committed point, so
+/// an entry still being written keeps its own), and, under
 /// `changeStreamOptions.preAndPostImages.expireAfterSeconds`, each recorded
 /// longer ago than that. Caller holds `prune_lock`.
 fn prune_pre_images(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
-    let through = ctx.pruned_through_ts.load(Ordering::Relaxed);
     let expire = ctx.pre_image_expire_after_seconds.load(Ordering::Relaxed);
+    let session = ctx.conn.open_session()?;
+    // The oldest entry the oplog holds: nothing earlier can be read back.
+    let oldest = read_oplog_table(&session, &ctx.oplog_uri, 0, 1)?
+        .first()
+        .and_then(|(pos, _)| u64::try_from(*pos).ok());
+    let committed = {
+        let st = ctx.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        Storage::all_committed_ts_locked(&st)
+    };
+    let through = match oldest {
+        Some(first) if first > 1 => (first - 1).min(committed),
+        // An oplog with nothing left holds the entry of no pre-image.
+        None => committed,
+        _ => 0,
+    };
     if through == 0 && expire < 0 {
         return Ok(0);
     }
-    let session = ctx.conn.open_session()?;
     let before = (expire >= 0).then(|| {
         let now_ms = now.map_or_else(now_millis, |secs| secs * 1000);
         now_ms - expire * 1000
@@ -10591,31 +10941,31 @@ fn prune_pre_images(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     })
 }
 
-/// The oplog half of [`prune_oplog_sweep`]. Caller holds `prune_lock`.
+/// The oplog half of [`prune_oplog_sweep`]: hold the oplog to its size in
+/// bytes, oldest whole entries first. Caller holds `prune_lock`.
 fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     let session = ctx.conn.open_session()?;
     let when = now.unwrap_or_else(now_secs);
     let cutoff = when - ctx.retention_seconds.load(Ordering::Relaxed);
 
-    // Phase 1 (lock-free): identify the doomed rows WITHOUT scanning the whole
-    // oplog — that full scan, every OPLOG_PRUNE_INTERVAL emits, was 77% of the
-    // single-writer write-path CPU (profile: scratchpad/profile_insert.sh). The
-    // live-count lets us size the sweep: `excess` is how many oldest rows must
-    // drop to get back under the entry cap; retention dooms a seq-ordered
-    // prefix on top of that. A fresh MVCC session reads consistently without
-    // blocking writers; prune is best-effort, so a slightly stale count/view is
-    // fine — writers only append *higher* seqs, never touch the old rows here.
-    let live_count = ctx
+    // Phase 1 (lock-free): identify the doomed entries WITHOUT counting the
+    // table. `live_bytes` is kept as writes commit (as mongod's truncate
+    // markers keep their total), so `excess` -- how many bytes must go to get
+    // back to the size -- is known without a read, and the walk below reads
+    // only the entries that go. A fresh MVCC session reads consistently
+    // without blocking writers; the sweep is best-effort, so a slightly stale
+    // total is fine -- writers only append *higher* positions.
+    let live_bytes = ctx
         .oplog
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .live_count;
-    let excess = (live_count - ctx.max_entries.load(Ordering::Relaxed) as i64).max(0) as usize;
+        .live_bytes;
+    let excess = (live_bytes - ctx.max_bytes.load(Ordering::Relaxed)).max(0);
 
-    // Cheap early-out: under the cap, the only reason to prune is retention,
-    // which dooms a seq-ordered prefix — so if the OLDEST live row is still
-    // in-window, nothing is doomed. One bounded merge read of a single row
-    // replaces the whole-oplog walk in the common steady state.
+    // Cheap early-out: under the size, the only reason to prune is retention,
+    // which dooms a prefix -- so if the OLDEST entry is still in-window,
+    // nothing is doomed. One bounded read replaces the walk in the common
+    // steady state.
     if excess == 0 {
         match read_oplog_table(&session, &ctx.oplog_uri, 0, 1)?.first() {
             None => return Ok(0),
@@ -10623,32 +10973,23 @@ fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
                 if matches!(peek_entry_ts(blob), Some(ts) if i64::from(ts.time) >= cutoff) {
                     return Ok(0);
                 }
-                // oldest is out-of-window (or undatable) — fall through to walk.
+                // oldest is out-of-window (or undatable) -- fall through to walk.
             }
         }
     }
 
-    // Bounded KEY-ONLY walk of the oldest rows: a row is doomed if it's
-    // within the cap excess (position alone — no value read) OR past
-    // retention (its `ts` peeked only in the tail beyond the excess). Both
-    // doom a seq-ordered prefix, so the scan stops at the first row that is
-    // neither, bounded by max(excess, RETENTION_SCAN_BATCH); retention rows
-    // beyond that drain on later sweeps. The merge carries each row's
-    // source table so phase 2 deletes from exactly that table. At a
-    // sustained write load past the cap the old full-value merge
-    // (`read_oplog_shards_tagged`) copied ~8 MB of blobs per sweep just to
-    // learn the doomed seqs — ~36% of the whole sync insert path
-    // (Finding 12); keys are all the cap trim needs.
-    // Phase A': for a data-nonlogged store, entries at/above the stable
-    // checkpoint are the only path back to the acknowledged data after a
-    // hard crash — clamp the sweep below them. The periodic checkpoint
-    // thread advances the clamp on the mongod cadence, releasing backlog.
+    // For a store whose data tables are not logged, the entries from the
+    // stable checkpoint's timestamp on are the only path back to the
+    // acknowledged data after a hard crash (mongod never truncates past its
+    // stable checkpoint either): clamp the sweep below them. The periodic
+    // checkpoint thread moves the clamp on the mongod cadence, releasing the
+    // backlog.
     let ceiling = if ctx.data_nonlogged {
         ctx.stable_seq.load(Ordering::Acquire).max(0) + 1
     } else {
         i64::MAX
     };
-    let doomed = scan_doomed_oplog_keys(
+    let mut doomed = scan_doomed_oplog(
         &session,
         &ctx.oplog_uri,
         excess,
@@ -10656,14 +10997,13 @@ fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
         RETENTION_SCAN_BATCH,
         ceiling,
     )?;
-    if ctx.data_nonlogged && excess > 0 && doomed.len() < excess {
-        // The clamp blocked part of a genuine cap excess: demand an anchor
-        // so the stable seq advances and the next sweep can trim. Without
-        // this, a sustained writer outruns the periodic cadence and the
-        // oplog grows without bound.
+    if ctx.data_nonlogged && excess > 0 && doomed.iter().map(|d| d.1).sum::<i64>() < excess {
+        // The clamp blocked part of a genuine excess: demand a checkpoint so
+        // the stable timestamp advances and the next sweep can trim. Without
+        // this, a sustained writer outruns the periodic cadence and the oplog
+        // grows without bound.
         ctx.checkpoint_requested.store(true, Ordering::Release);
     }
-    let mut doomed = doomed;
     let floor = ctx.min_retention_seconds.load(Ordering::Relaxed);
     if floor > 0 {
         keep_younger_than(&session, &ctx.oplog_uri, &mut doomed, when - floor)?;
@@ -10671,9 +11011,9 @@ fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     if doomed.is_empty() {
         return Ok(0);
     }
-    let doomed_seqs: &[i64] = &doomed;
+    let positions: Vec<i64> = doomed.iter().map(|d| d.0).collect();
 
-    // PITR v2: archive the soon-to-be-dropped rows to a durable segment
+    // PITR v2: archive the soon-to-be-dropped entries to a durable segment
     // *before* deleting them, so recovery can still reach a time before the
     // new oplog floor.
     let archive_dir = ctx
@@ -10682,59 +11022,37 @@ fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     if let Some(archive_dir) = archive_dir {
-        // The newest entry before this segment's first: the position the
-        // segment chains onto (0: the oplog's own start).
-        let prev = read_pruned_marker(&session);
-        Storage::archive_doomed_oplog(&session, &ctx.oplog_uri, &archive_dir, doomed_seqs, prev)?;
+        Storage::archive_doomed_oplog(&session, &ctx.oplog_uri, &archive_dir, &positions)?;
     }
 
     // Phase 2: the deletes. Sweep exclusivity is already held
-    // (`prune_lock`, taken at the top); no other lock is needed —
-    // concurrent writers only ever append higher seqs. Each doomed row is
-    // removed from its exact source table (the phase-1 tag). Their
+    // (`prune_lock`, taken at the top); no other lock is needed --
+    // concurrent writers only ever append higher positions. Their
     // pre-images go after (`prune_pre_images`).
     //
     // The deletes are grouped into transactions of `PRUNE_DELETE_BATCH`
     // rows. Run one autocommit remove at a time they were one LOGGED commit
     // each -- and with `transaction_sync` on (every durable store) one
     // journal write + sync each, two per oplog entry written. Under a
-    // sustained writer at the entry cap the pruner then spent its whole life
+    // sustained writer at the size the pruner then spent its whole life
     // in `__wt_log_write` -> `pwrite`, holding the journal against the
     // commits clients were waiting on: the INSERT scaling ceiling measured
     // 2026-10-07 (batch 70). Durability is unchanged -- a crash mid-sweep
-    // leaves whole batches undone, and those rows are doomed again by the
+    // leaves whole batches undone, and those entries are doomed again by the
     // next sweep; the archive above is written before any batch commits.
     let op_del = session.open_cursor(&ctx.oplog_uri, None)?;
-    // The time of the newest doomed entry, for the pre-images of the
-    // entries going (`prune_pre_images`): read before it goes.
-    let doomed_through = match doomed.last() {
-        Some(seq) => {
-            let cur = session.open_cursor(&ctx.oplog_uri, None)?;
-            cur.set_key_q(*seq);
-            match cur.search() {
-                Ok(()) => peek_entry_ts(&cur.get_value_u()?).map_or(0, ts_u64),
-                Err(e) if e.is_not_found() => 0,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        None => 0,
-    };
     let mut pruned = 0usize;
     for batch in doomed.chunks(PRUNE_DELETE_BATCH) {
         session.begin_transaction(None)?;
         let removed = (|| -> Result<()> {
-            for seq in batch {
+            for (pos, _) in batch {
                 op_del.reset()?;
-                op_del.set_key_q(*seq);
+                op_del.set_key_q(*pos);
                 match op_del.remove() {
                     Ok(()) => {}
                     Err(e) if e.is_not_found() => {}
                     Err(e) => return Err(e.into()),
                 }
-            }
-            // The newest position pruned moves with the rows that go.
-            if let Some(last) = batch.last() {
-                write_pruned_marker(&session, *last)?;
             }
             Ok(())
         })();
@@ -10748,15 +11066,12 @@ fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
         }
         commit_stamped(&session, &ctx.oplog, ctx.data_nonlogged)?;
         pruned += batch.len();
-        // Keep the live-count honest for the next sweep's sizing -- per
-        // committed batch, so a later batch's failure leaves it exact.
-        ctx.oplog
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .live_count -= batch.len() as i64;
+        // Take the batch off the oplog's size -- per committed batch, so a
+        // later batch's failure leaves it exact.
+        let mut st = ctx.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        st.live_count -= batch.len() as i64;
+        st.live_bytes -= batch.iter().map(|d| d.1).sum::<i64>();
     }
-    ctx.pruned_through_ts
-        .fetch_max(doomed_through, Ordering::Relaxed);
     Ok(pruned)
 }
 
@@ -11543,7 +11858,7 @@ impl Storage {
                 // became visible at this commit, not at emit — advancing the
                 // visible tail and waking tailable change-stream waiters. The
                 // time they held their slots is the committing operation's.
-                note_oplog_slot_held(handle.deregister_minted());
+                note_oplog_slot_held(handle.deregister_committed());
             }
             // The transaction is over and the session holds nothing: park it
             // for the next one rather than closing it. Only reached on a
@@ -12147,7 +12462,7 @@ impl Storage {
                 Err(e)
             }
         };
-        self.deregister_in_flight(&ranges);
+        self.deregister_in_flight(&ranges, out.is_ok());
         out
     }
 
@@ -12203,22 +12518,20 @@ impl Storage {
             out.insert(k, v);
         }
         let cur = session.open_cursor(&self.oplog_uri, None)?;
+        let blob = encode_doc(&out)?;
         cur.set_key_q(start);
-        cur.set_value_u(&encode_doc(&out)?);
+        cur.set_value_u(&blob);
         cur.insert()?;
+        let mut g = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
         if !deferred {
-            let removed = self
-                .oplog
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .in_flight
-                .remove(&start);
+            let removed = g.in_flight.remove(&start);
             note_oplog_slot_held(removed.map_or(0, |r| r.held_micros()));
             self.oplog_cv.notify_all();
-        }
-        {
-            let mut g = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
             g.live_count += 1;
+            g.live_bytes += blob.len() as i64;
+        } else if let Some(r) = g.in_flight.get_mut(&start) {
+            r.records = 1;
+            r.bytes = blob.len() as i64;
         }
         Ok(())
     }
@@ -12459,7 +12772,7 @@ impl Storage {
                 Err(e)
             }
         };
-        self.deregister_in_flight(&ranges);
+        self.deregister_in_flight(&ranges, out.is_ok());
         out
     }
 
@@ -14763,10 +15076,8 @@ impl Storage {
             let mut o = Document::new();
             o.insert("capped", true);
             // mongod's options for its oplog: capped to a size in bytes, and
-            // no `_id` index. The cap here is counted in entries, at 16 KiB
-            // an entry.
-            let max_entries = self.prune_ctx.max_entries.load(Ordering::Relaxed) as i64;
-            o.insert("size", max_entries * 16 * 1024);
+            // no `_id` index.
+            o.insert("size", self.oplog_max_bytes());
             o.insert("autoIndexId", false);
             return Ok(o);
         }
@@ -14820,9 +15131,8 @@ impl Storage {
     /// its entries live in the oplog tables, not the document tables a
     /// collection's sizes are read from (RM-419: the oplog's size read 0).
     fn oplog_rs_sizes(&self) -> Result<(i64, i64)> {
-        let blobs = self.find_oplog_rs(&Document::new(), None, None, &Document::new())?;
-        let size = blobs.iter().map(|b| b.len() as i64).sum();
-        Ok((blobs.len() as i64, size))
+        let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        Ok((st.live_count, st.live_bytes))
     }
 
     /// `(db, coll)`'s sizes counted by reading every document and index
@@ -14900,10 +15210,21 @@ impl Storage {
         // Logged whatever the data tables are: the clean-close marker must
         // not roll back with them.
         session.create(sizes::SIZE_STORER_TABLE, sizes::SIZE_STORER_CFG)?;
-        if !self.sizes.load(&session, fingerprint)? {
+        let trusted = self.sizes.load(&session, fingerprint)?;
+        if !trusted {
             self.sizes
                 .recount(&session, &mdb_catalog::all_placements(&session)?)?;
         }
+        // The oplog's own entries and bytes: the clean close's, else one walk
+        // (as mongod builds its truncate markers by scanning when it has no
+        // size storer to read).
+        let (records, bytes) = match trusted.then(|| self.sizes.take_oplog_sizes()).flatten() {
+            Some(sizes) => sizes,
+            None => count_oplog_entries(&session, &self.oplog_uri)?,
+        };
+        let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        st.live_count = records;
+        st.live_bytes = bytes;
         Ok(())
     }
 
@@ -24208,7 +24529,6 @@ fn reconcile_idents(session: &Session) -> Result<()> {
     // `local.oplog.rs` is kept by the catalog alone: no registry row, no
     // placement.
     placed.extend(mdb_catalog::ident_of_ns(session, OPLOG_NS)?);
-    placed.extend(read_oplog_ident(session)?.map(|(ident, _)| ident));
     let mut orphans = Vec::new();
     {
         let cur = session.open_cursor("metadata:", None)?;
@@ -24380,7 +24700,9 @@ fn index_event_spec(payload: &Document, name: &str) -> Document {
 /// Register the collection if it is not registered, answering whether it was
 /// created here.
 fn ensure_collection(store: &Storage, session: &Session, db: &str, coll: &str) -> Result<bool> {
-    let data_nonlogged = store.data_nonlogged;
+    // mongod logs the tables of its unreplicated `local` collections whatever
+    // the rest are (measured 8.2.11), `local.replset.minvalid` excepted.
+    let data_nonlogged = store.data_nonlogged && !table_logged_by_mongod(db, coll);
     let probe = session.open_cursor(COLL_TABLE, None)?;
     probe.set_key_ss(db, coll);
     match probe.search() {
@@ -28160,7 +28482,10 @@ mod tests {
         )
         .unwrap();
         let f = Storage::open(fresh.to_str().unwrap()).unwrap();
-        assert!(f.read_oplog(1, 100).unwrap().is_empty());
+        // Only what the new store wrote when it was made.
+        let own = f.read_oplog(1, 100).unwrap();
+        assert_eq!(own.len(), 2);
+        assert!(f.oplog_reaches_genesis().unwrap());
     }
 
     #[test]
@@ -28170,10 +28495,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Storage::open(dir.path().to_str().unwrap()).unwrap();
         let enc = |id: i32| encode_doc(&doc! {"_id": id}).unwrap();
-        s.set_oplog_max_entries(2);
         for id in 0..6 {
             s.insert("app", "c", vec![enc(id)], true).unwrap();
         }
+        // Sized to hold two entries.
+        let held = s.read_oplog(1, 100).unwrap();
+        let two: usize = held[held.len() - 2..].iter().map(|(_, b)| b.len()).sum();
+        s.set_oplog_max_bytes(two as i64).unwrap();
         s.set_oplog_min_retention_seconds(3600);
         assert_eq!(s.prune_oplog(None).unwrap(), 0);
         assert!(s.read_oplog(1, 100).unwrap().len() >= 6);
@@ -28195,22 +28523,26 @@ mod tests {
         {
             let mut s = Storage::open(src.to_str().unwrap()).unwrap();
             s.set_oplog_archive_dir(Some(archive_s.clone()));
-            s.set_oplog_max_entries(2);
             // The first insert also records the collection's creation.
             s.insert("app", "c", vec![enc(1), enc(2)], true).unwrap();
             s.archive_base_snapshot(&archive_s).unwrap(); // base head = the batch's entry
             s.insert("app", "c", vec![enc(3)], true).unwrap();
             s.insert("app", "c", vec![enc(4)], true).unwrap();
             s.insert("app", "c", vec![enc(5)], true).unwrap();
-            let all: Vec<i64> = s.read_oplog(1, 100).unwrap().iter().map(|r| r.0).collect();
-            // The creation, the one `applyOps` of the first batch, then three
-            // inserts.
-            assert_eq!(all.len(), 5);
-            let pruned = s.prune_oplog(None).unwrap(); // cap=2 -> archive the first three
-            assert!(pruned >= 3, "pruned {pruned}");
+            let rows = s.read_oplog(1, 100).unwrap();
+            let all: Vec<i64> = rows.iter().map(|r| r.0).collect();
+            // The initiating no-op and the creation of
+            // `config.system.indexBuilds`, the creation, the one `applyOps`
+            // of the first batch, then three inserts.
+            assert_eq!(all.len(), 7);
+            // Sized to hold the last two entries: the first five are archived.
+            let two: usize = rows[rows.len() - 2..].iter().map(|(_, b)| b.len()).sum();
+            s.set_oplog_max_bytes(two as i64).unwrap();
+            let pruned = s.prune_oplog(None).unwrap();
+            assert_eq!(pruned, 5, "pruned {pruned}");
             // The live oplog no longer reaches the third entry.
-            assert_eq!(s.oplog_floor_seq().unwrap(), all[3]);
-            assert_eq!(s.oplog_pruned_through().unwrap(), all[2]);
+            assert_eq!(s.oplog_floor_seq().unwrap(), all[5]);
+            assert!(!s.oplog_reaches_genesis().unwrap());
         }
 
         // v1 can't restore the src (floor past genesis); v2 stitches base + segments.
@@ -28241,7 +28573,8 @@ mod tests {
         // explicit prune_oplog call and NO noop-heartbeat sweeper (the default).
         let dir = tempfile::tempdir().unwrap();
         let s = Storage::open(dir.path().to_str().unwrap()).unwrap();
-        s.set_oplog_max_entries(10);
+        // Ten entries' worth of bytes, about.
+        s.set_oplog_max_bytes(10 * 100).unwrap();
         let enc = |id: i32| encode_doc(&doc! {"_id": id}).unwrap();
         let total = OPLOG_PRUNE_INTERVAL as i32 + 1; // cross the threshold once
         for i in 0..total {

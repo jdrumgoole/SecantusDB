@@ -30,3 +30,8 @@ serde_json = "1"
 # Restore extracts a base snapshot to a temp dir while stitching its oplog (also
 # used by tests).
 tempfile = "3"
+
+# Free space of the data directory's filesystem, for the oplog's default size
+# (mongod's rule outside macOS: 5% of it).
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+libc = "0.2"

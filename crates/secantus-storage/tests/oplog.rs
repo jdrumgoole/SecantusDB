@@ -38,6 +38,22 @@ fn with_db(body: impl FnOnce(&Storage)) {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Where the entries these tests write begin: a store's oplog starts with the
+/// set's initiating no-op and the creation of `config.system.indexBuilds`,
+/// which mongod writes too.
+fn after_init(st: &Storage) -> i64 {
+    let rows = st.read_oplog(1, 2).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        decode(&rows[1].1)
+            .get_document("o")
+            .unwrap()
+            .get_str("create"),
+        Ok("system.indexBuilds")
+    );
+    rows[1].0 + 1
+}
+
 fn enc(d: &Document) -> Vec<u8> {
     bson::to_vec(d).unwrap()
 }
@@ -66,7 +82,7 @@ fn insert_emits_oplog_insert_entry() {
         st.insert_one("app", "c", &enc(&doc! {"_id": 1, "x": 7}))
             .unwrap();
         st.flush_oplog();
-        let rows = st.read_oplog(1, 100).unwrap();
+        let rows = st.read_oplog(after_init(st), 100).unwrap();
         assert_eq!(rows.len(), 1);
         let (seq, blob) = &rows[0];
         assert_eq!(*seq, pos_of(blob), "the key of a row is its timestamp");
@@ -87,7 +103,7 @@ fn seqs_and_timestamps_monotonic() {
             st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
         }
         st.flush_oplog();
-        let rows = st.read_oplog(1, 100).unwrap();
+        let rows = st.read_oplog(after_init(st), 100).unwrap();
         assert_eq!(rows.len(), 3);
         for (seq, blob) in &rows {
             assert_eq!(*seq, pos_of(blob), "RecordId = ts on every row");
@@ -99,7 +115,10 @@ fn seqs_and_timestamps_monotonic() {
             );
         }
         assert_eq!(st.oplog_tail_seq(), rows[2].0);
-        assert_eq!(st.oplog_floor_seq().unwrap(), rows[0].0);
+        assert_eq!(
+            st.oplog_floor_seq().unwrap(),
+            st.read_oplog(1, 1).unwrap()[0].0
+        );
     });
 }
 
@@ -110,7 +129,7 @@ fn read_oplog_honours_start_and_limit() {
             st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
         }
         st.flush_oplog();
-        let all = st.read_oplog(1, 100).unwrap();
+        let all = st.read_oplog(after_init(st), 100).unwrap();
         assert_eq!(all.len(), 5);
         let from3 = st.read_oplog(all[2].0, 100).unwrap();
         assert_eq!(
@@ -121,7 +140,7 @@ fn read_oplog_honours_start_and_limit() {
         let between = st.read_oplog(all[1].0 + 1, 100).unwrap();
         assert_eq!(between[0].0, all[2].0);
         st.flush_oplog();
-        let limited = st.read_oplog(1, 2).unwrap();
+        let limited = st.read_oplog(after_init(st), 2).unwrap();
         assert_eq!(limited.len(), 2);
         assert_eq!(limited[0].0, all[0].0);
     });
@@ -140,9 +159,13 @@ fn current_cluster_time_is_monotonic() {
 fn empty_oplog_reads_are_empty() {
     with_db(|st| {
         st.flush_oplog();
-        assert!(st.read_oplog(1, 10).unwrap().is_empty());
-        assert_eq!(st.oplog_floor_seq().unwrap(), 0);
-        assert_eq!(st.oplog_tail_seq(), 0);
+        // Only the initiating no-op.
+        assert!(st.read_oplog(after_init(st), 10).unwrap().is_empty());
+        assert_eq!(
+            st.oplog_floor_seq().unwrap(),
+            st.read_oplog(1, 1).unwrap()[0].0
+        );
+        assert_eq!(st.oplog_tail_seq(), after_init(st) - 1);
     });
 }
 
@@ -155,7 +178,7 @@ fn reopen_recovers_seq_counter() {
             st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
         }
         let tail = st.oplog_tail_seq();
-        assert_eq!(tail, st.read_oplog(1, 10).unwrap()[2].0);
+        assert_eq!(tail, st.read_oplog(after_init(&st), 10).unwrap()[2].0);
         tail
     };
     {
@@ -184,7 +207,7 @@ fn replace_emits_update_entry_with_full_doc() {
         st.replace_by_id("app", "c", &Bson::Int32(1), &enc(&doc! {"x": 2}))
             .unwrap();
         st.flush_oplog();
-        let rows = st.read_oplog(1, 100).unwrap();
+        let rows = st.read_oplog(after_init(st), 100).unwrap();
         assert_eq!(rows.len(), 2);
         // seq 1 = insert, seq 2 = the replacement.
         let u = decode(&rows[1].1);
@@ -204,7 +227,7 @@ fn delete_emits_delete_entry() {
         st.insert_one("app", "c", &enc(&doc! {"_id": 7})).unwrap();
         assert!(st.delete_by_id("app", "c", &Bson::Int32(7)).unwrap());
         st.flush_oplog();
-        let rows = st.read_oplog(1, 100).unwrap();
+        let rows = st.read_oplog(after_init(st), 100).unwrap();
         assert_eq!(rows.len(), 2);
         let d = decode(&rows[1].1);
         assert_eq!(d.get_str("op").unwrap(), "d");
@@ -225,7 +248,7 @@ fn insert_replace_delete_sequence() {
         st.delete_by_id("app", "c", &Bson::Int32(1)).unwrap();
         st.flush_oplog();
         let ops: Vec<String> = st
-            .read_oplog(1, 100)
+            .read_oplog(after_init(st), 100)
             .unwrap()
             .iter()
             .map(|(_, b)| decode(b).get_str("op").unwrap().to_string())
@@ -248,7 +271,7 @@ fn ui_of(blob: &[u8]) -> Vec<u8> {
 
 fn seq_of_op(st: &Storage, op: &str) -> i64 {
     st.flush_oplog();
-    st.read_oplog(1, 100)
+    st.read_oplog(after_init(st), 100)
         .unwrap()
         .into_iter()
         .find(|(_, b)| decode(b).get_str("op").unwrap() == op)
@@ -262,7 +285,7 @@ fn entries_carry_stable_collection_uuid() {
         st.insert_one("app", "c", &enc(&doc! {"_id": 1})).unwrap();
         st.insert_one("app", "c", &enc(&doc! {"_id": 2})).unwrap();
         st.flush_oplog();
-        let rows = st.read_oplog(1, 100).unwrap();
+        let rows = st.read_oplog(after_init(st), 100).unwrap();
         let u1 = ui_of(&rows[0].1);
         // Same collection -> same ui, matching the public accessor.
         assert_eq!(u1, ui_of(&rows[1].1));
@@ -333,14 +356,17 @@ fn prune_oplog_by_retention() {
             st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
         }
         let tail = st.oplog_tail_seq();
+        // The initiating no-op begins every oplog.
+        assert!(st.oplog_reaches_genesis().unwrap());
+        let held = st.read_oplog(1, 100).unwrap().len();
         // `now` far in the future -> every entry is past the retention window.
-        assert_eq!(st.prune_oplog(Some(10_000_000_000)).unwrap(), 3);
+        assert_eq!(st.prune_oplog(Some(10_000_000_000)).unwrap(), held);
         st.flush_oplog();
         assert!(st.read_oplog(1, 10).unwrap().is_empty());
         assert_eq!(st.oplog_floor_seq().unwrap(), 0);
         assert_eq!(st.oplog_tail_seq(), tail); // the tail is unaffected
-                                               // The oplog remembers that its front is gone.
-        assert_eq!(st.oplog_pruned_through().unwrap(), tail);
+                                               // The oplog no longer begins at the initiating no-op.
+        assert!(!st.oplog_reaches_genesis().unwrap());
     });
 }
 
@@ -351,36 +377,40 @@ fn prune_oplog_keeps_recent() {
             st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
         }
         // `now`=0 -> negative cutoff -> nothing is old enough to drop.
+        let held = st.read_oplog(1, 100).unwrap().len();
         assert_eq!(st.prune_oplog(Some(0)).unwrap(), 0);
         st.flush_oplog();
-        assert_eq!(st.read_oplog(1, 10).unwrap().len(), 3);
+        assert_eq!(st.read_oplog(1, 100).unwrap().len(), held);
+        assert!(st.oplog_reaches_genesis().unwrap());
     });
 }
 
 #[test]
-fn prune_oplog_entry_cap() {
+fn prune_oplog_size_cap() {
     with_db_mut(|st| {
-        st.set_oplog_max_entries(2);
         for i in 1..=5 {
             st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
         }
-        let before: Vec<i64> = st
-            .read_oplog(1, 100)
-            .unwrap()
-            .iter()
-            .map(|(s, _)| *s)
-            .collect();
-        assert_eq!(before.len(), 5);
-        // Retention drops nothing (now=0); the cap forces the 3 oldest out.
-        assert_eq!(st.prune_oplog(Some(0)).unwrap(), 3);
+        let rows = st.read_oplog(1, 100).unwrap();
+        let before: Vec<i64> = rows.iter().map(|(s, _)| *s).collect();
+        assert!(before.len() >= 6, "{before:?}");
+        // Size the oplog to hold its last two entries, whole: the oldest
+        // entries go, however many that is, and the oplog stays under it.
+        let keep = 2;
+        let size: usize = rows[rows.len() - keep..].iter().map(|(_, b)| b.len()).sum();
+        st.set_oplog_max_bytes(size as i64).unwrap();
+        // Retention drops nothing (now=0); the size takes the older ones out.
+        assert_eq!(st.prune_oplog(Some(0)).unwrap(), before.len() - keep);
         st.flush_oplog();
         let rows = st.read_oplog(1, 100).unwrap();
         assert_eq!(
             rows.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
-            before[3..].to_vec()
+            before[before.len() - keep..].to_vec()
         );
-        assert_eq!(st.oplog_floor_seq().unwrap(), before[3]);
-        assert_eq!(st.oplog_pruned_through().unwrap(), before[2]);
+        assert_eq!(st.oplog_floor_seq().unwrap(), before[before.len() - keep]);
+        assert!(!st.oplog_reaches_genesis().unwrap());
+        // The held bytes are the size: a further sweep removes nothing.
+        assert_eq!(st.prune_oplog(Some(0)).unwrap(), 0);
     });
 }
 
@@ -409,7 +439,7 @@ fn noop_heartbeat_entry() {
     with_db(|st| {
         let seq = st.emit_noop_heartbeat().unwrap();
         st.flush_oplog();
-        let rows = st.read_oplog(1, 10).unwrap();
+        let rows = st.read_oplog(after_init(st), 10).unwrap();
         assert_eq!(seq, rows[0].0);
         assert_eq!(seq, pos_of(&rows[0].1));
         let e = decode(&rows[0].1);
@@ -430,7 +460,7 @@ fn find_seq_for_ts_locates_entry() {
             st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
         }
         st.flush_oplog();
-        let rows = st.read_oplog(1, 100).unwrap();
+        let rows = st.read_oplog(after_init(st), 100).unwrap();
         let ts2 = match decode(&rows[1].1).get("ts") {
             Some(Bson::Timestamp(t)) => *t,
             _ => panic!("no ts"),
@@ -456,7 +486,7 @@ fn reopen_mints_past_the_newest_entry() {
         for i in 1..=3 {
             st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
         }
-        st.read_oplog(1, 10)
+        st.read_oplog(after_init(&st), 10)
             .unwrap()
             .iter()
             .map(|(s, _)| *s)
@@ -467,7 +497,7 @@ fn reopen_mints_past_the_newest_entry() {
         st.insert_one("app", "c", &enc(&doc! {"_id": 4})).unwrap();
         st.flush_oplog();
         let rows: Vec<i64> = st
-            .read_oplog(1, 10)
+            .read_oplog(after_init(&st), 10)
             .unwrap()
             .iter()
             .map(|(s, _)| *s)

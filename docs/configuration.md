@@ -53,7 +53,7 @@ standalone = false        # true drops the single-node replica-set advertisement
 
 [oplog]
 retention_seconds = 3600.0      # oldest entry kept; resume tokens older than this fail
-max_entries = 100000            # whichever cap (this or retention) hits first wins
+# size_mb = 192                 # a new store's oplog size in MB (mongod's --oplogSize); the oplog is held to it in bytes
 noop_heartbeat_seconds = 0.0    # 10.0 to advance cluster time during quiet stretches
 
 [storage]
@@ -222,7 +222,7 @@ overrides. The mapping:
 | `[server] auth` | `--auth` |
 | `[server] standalone` | `--standalone` |
 | `[oplog] retention_seconds` | `--oplog-retention-seconds` |
-| `[oplog] max_entries` | `--oplog-max-entries` |
+| `[oplog] size_mb` | `--oplog-size-mb` |
 | `[oplog] noop_heartbeat_seconds` | `--noop-heartbeat-seconds` |
 | `[storage] cache_size` | `--cache-size` |
 | `[storage] session_max` | `--session-max` |

@@ -144,12 +144,12 @@ point never lands in the middle of one.
 ### Live oplog (the simple case)
 
 The simplest restore replays onto an **empty** base, which is exact whenever the
-source oplog still reaches genesis — i.e. it hasn't been pruned from the front.
+source oplog still reaches genesis — i.e. it still begins with the `initiating set` entry, so nothing was truncated from the front.
 The recovery window is then the **oplog retention window**. Tune it for the
 horizon you need:
 
 ```bash
-secantusd-mdb --oplog-retention-seconds 604800 --oplog-max-entries 5000000   # ~1 week
+secantusd-mdb --oplog-retention-seconds 604800 --oplog-size-mb 20480   # ~1 week, if 20 GB holds it
 ```
 
 (or the `[oplog]` section of `secantusd.toml`). The rule of thumb: *keep enough

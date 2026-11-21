@@ -156,6 +156,15 @@ non-logged oplog needs `data_nonlogged=False`. The table-config modes (`oplog_no
 existing store keeps the mode it was created with (`data_nonlogged` is
 recorded in the store and always wins on reopen).
 
+A new store is initiated as mongod initiates a one-member replica set: the
+oplog (held to its size in bytes, 192 MB on macOS and otherwise 5% of the
+free disk; `replSetResizeOplog` changes it) begins with the `initiating set`
+no-op, the `local.replset.*` and `local.system.rollback.id` collections are
+written, and a checkpoint makes the oplog's catalog entry durable before any
+write is accepted. Crash recovery replays the oplog from WiredTiger's
+recovery timestamp, the stable timestamp of the last checkpoint, as
+mongod's does.
+
 Properties and methods: `srv.address` → `(host, port)` tuple, `srv.version`
 → the embedded crate version (also surfaced over the wire as
 `buildInfo.secantusVersion`), `srv.stop()` → drain connections and close

@@ -55,6 +55,8 @@ fn rolled_back_txn_leaves_no_oplog_trace() {
         // Baseline committed write so the assertion below can tell
         // "rollback left nothing" apart from "nothing works at all". The
         // first insert also records the collection's creation: two entries.
+        // The oplog begins with the set's initiating no-op: count from there.
+        let initiated = st.read_oplog(1, 100).unwrap().len();
         st.insert_one("app", "c", &enc(&doc! {"_id": 0})).unwrap();
         let mut txn = st.begin_user_transaction().unwrap();
         st.with_user_transaction(&mut txn, || {
@@ -66,7 +68,7 @@ fn rolled_back_txn_leaves_no_oplog_trace() {
         st.flush_oplog();
         let rows = st.read_oplog(1, 100).unwrap();
         assert_eq!(
-            rows.len(),
+            rows.len() - initiated,
             2,
             "rolled-back transaction must not surface an oplog entry"
         );
@@ -79,6 +81,7 @@ fn rolled_back_txn_leaves_no_oplog_trace() {
 #[test]
 fn committed_txn_entries_land_exactly_once_after_commit() {
     with_db(|st| {
+        let initiated = st.read_oplog(1, 100).unwrap().len();
         let mut txn = st.begin_user_transaction().unwrap();
         st.with_user_transaction(&mut txn, || {
             st.insert_one("app", "c", &enc(&doc! {"_id": 1}))
@@ -93,8 +96,9 @@ fn committed_txn_entries_land_exactly_once_after_commit() {
         // Mid-transaction: nothing minted, nothing at the drainer — the
         // oplog must be empty even after a flush.
         st.flush_oplog();
-        assert!(
-            st.read_oplog(1, 100).unwrap().is_empty(),
+        assert_eq!(
+            st.read_oplog(1, 100).unwrap().len(),
+            initiated,
             "entries must not reach the oplog before the commit"
         );
         st.commit_user_transaction(&mut txn).unwrap();
@@ -103,6 +107,7 @@ fn committed_txn_entries_land_exactly_once_after_commit() {
             .read_oplog(1, 100)
             .unwrap()
             .iter()
+            .skip(initiated)
             .map(|(_, b)| decode(b).get_str("op").unwrap().to_string())
             .collect();
         // One entry: the transaction's `applyOps`, which holds the
@@ -110,7 +115,7 @@ fn committed_txn_entries_land_exactly_once_after_commit() {
         // exactly once.
         assert_eq!(ops, vec!["c"], "one entry");
         let rows = st.read_oplog(1, 100).unwrap();
-        let txn = decode(&rows[0].1);
+        let txn = decode(&rows[initiated].1);
         let inner: Vec<String> = txn
             .get_document("o")
             .unwrap()

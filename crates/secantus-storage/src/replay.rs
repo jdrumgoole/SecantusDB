@@ -378,6 +378,16 @@ pub fn restore_to_timestamp(
     up_to_wall_ms: Option<i64>,
     carry_oplog: bool,
 ) -> Result<ReplayStats> {
+    // A directory that holds no store has no oplog: opening it would make a
+    // new store (whose own initiating no-op would then read as a history).
+    if !std::path::Path::new(source_dir)
+        .join("WiredTiger.wt")
+        .exists()
+    {
+        return Err(StorageError::Internal(format!(
+            "source has no oplog to replay: {source_dir} holds no store"
+        )));
+    }
     let source = Storage::open(source_dir)?;
     let floor = source.oplog_floor_seq()?;
     if floor == 0 {
@@ -387,11 +397,11 @@ pub fn restore_to_timestamp(
     }
     // An empty-base replay is exact only when the source oplog still reaches
     // its first entry (nothing was pruned from the front).
-    let pruned = source.oplog_pruned_through()?;
-    if pruned > 0 {
+    if !source.oplog_reaches_genesis()? {
         return Err(StorageError::Internal(format!(
-            "source oplog floor is position {floor}, past genesis (entries up to {pruned} were \
-             pruned): it has been pruned from the front, so an empty-base replay would be partial"
+            "source oplog floor is position {floor}, past genesis (its oldest entry is not the \
+             initiating set): it has been truncated from the front, so an empty-base replay \
+             would be partial"
         )));
     }
     std::fs::create_dir_all(target_dir)

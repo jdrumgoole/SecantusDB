@@ -1300,9 +1300,9 @@ pub trait Storage: Send + Sync {
         ))
     }
 
-    /// Cap the oplog at `n` entries (`replSetResizeOplog`). Default:
+    /// Hold the oplog to `bytes` (`replSetResizeOplog`). Default:
     /// unsupported, a backend with no oplog.
-    fn set_oplog_max_entries(&self, _n: usize) -> Result<(), StorageError> {
+    fn set_oplog_max_bytes(&self, _bytes: i64) -> Result<(), StorageError> {
         Err(StorageError::Internal(
             "replSetResizeOplog: this storage backend has no oplog".into(),
         ))

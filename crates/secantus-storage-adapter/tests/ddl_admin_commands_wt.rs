@@ -681,7 +681,9 @@ fn sessions_collection_makes_config_a_database() {
                 })
                 .collect()
         };
-        assert!(!listed(c).contains(&"config".to_string()));
+        // A new store is initiated with `config.system.indexBuilds`, as
+        // mongod's is, so `config` is there before the sessions collection.
+        assert!(listed(c).contains(&"config".to_string()));
         for _ in 0..2 {
             secantus_commands::cluster_admin::record_sessions_collection(c.storage().unwrap())
                 .unwrap();

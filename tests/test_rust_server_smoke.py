@@ -533,7 +533,11 @@ def test_noop_heartbeat_is_written_only_when_asked(tmp_path) -> None:
     and none without one."""
 
     def noops(srv) -> int:
-        return _client(srv)["local"]["oplog.rs"].count_documents({"op": "n"})
+        # The oplog begins with the set's own `initiating set` no-op, which is
+        # not a heartbeat.
+        return _client(srv)["local"]["oplog.rs"].count_documents(
+            {"op": "n", "o.msg": "periodic noop"}
+        )
 
     srv = _server.RustServer(str(tmp_path / "beat"), 0, noop_heartbeat_seconds=0.2)
     try:

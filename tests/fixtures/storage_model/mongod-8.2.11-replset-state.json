@@ -1,0 +1,2639 @@
+{
+  "mongod": "db version v8.2.11",
+  "after_initiate": {
+    "local.replset.minvalid": {
+      "docs": [
+        {
+          "_id": {
+            "$oid": "6b00c4e231c5694a9a890929"
+          },
+          "t": {
+            "$numberLong": "-1"
+          },
+          "ts": {
+            "$timestamp": {
+              "t": 0,
+              "i": 0
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "false"
+      },
+      "options": {}
+    },
+    "local.replset.oplogTruncateAfterPoint": {
+      "docs": [
+        {
+          "_id": "oplogTruncateAfterPoint",
+          "oplogTruncateAfterPoint": {
+            "$timestamp": {
+              "t": 1795212515,
+              "i": 17
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.replset.election": {
+      "docs": [
+        {
+          "_id": {
+            "$oid": "6b00c4e231c5694a9a89092a"
+          },
+          "term": {
+            "$numberLong": "1"
+          },
+          "candidateIndex": {
+            "$numberLong": "0"
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.replset.initialSyncId": {
+      "docs": [
+        {
+          "_id": {
+            "$binary": {
+              "base64": "PDIng50SRfGuFPWSutyHDA==",
+              "subType": "04"
+            }
+          },
+          "wallTime": {
+            "$date": {
+              "$numberLong": "1795212515402"
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.system.rollback.id": {
+      "docs": [
+        {
+          "_id": "rollbackId",
+          "rollbackId": {
+            "$numberInt": "1"
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.system.replset": {
+      "docs": [
+        {
+          "_id": "rs0",
+          "version": {
+            "$numberInt": "1"
+          },
+          "term": {
+            "$numberInt": "1"
+          },
+          "members": [
+            {
+              "_id": {
+                "$numberInt": "0"
+              },
+              "host": "127.0.0.1:51524",
+              "arbiterOnly": false,
+              "buildIndexes": true,
+              "hidden": false,
+              "priority": {
+                "$numberDouble": "1.0"
+              },
+              "tags": {},
+              "secondaryDelaySecs": {
+                "$numberLong": "0"
+              },
+              "votes": {
+                "$numberInt": "1"
+              }
+            }
+          ],
+          "protocolVersion": {
+            "$numberLong": "1"
+          },
+          "writeConcernMajorityJournalDefault": true,
+          "settings": {
+            "chainingAllowed": true,
+            "heartbeatIntervalMillis": {
+              "$numberInt": "2000"
+            },
+            "heartbeatTimeoutSecs": {
+              "$numberInt": "10"
+            },
+            "electionTimeoutMillis": {
+              "$numberInt": "10000"
+            },
+            "catchUpTimeoutMillis": {
+              "$numberInt": "-1"
+            },
+            "catchUpTakeoverDelayMillis": {
+              "$numberInt": "30000"
+            },
+            "getLastErrorModes": {},
+            "getLastErrorDefaults": {
+              "w": {
+                "$numberInt": "1"
+              },
+              "wtimeout": {
+                "$numberInt": "0"
+              }
+            },
+            "replicaSetId": {
+              "$oid": "6b00c4e331c5694a9a89092d"
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "config.system.indexBuilds": {
+      "docs": [],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "false"
+      },
+      "options": {}
+    },
+    "oplog": {
+      "maxSize": 201326592,
+      "first": [
+        {
+          "op": "n",
+          "ns": "",
+          "o": {
+            "msg": "initiating set"
+          },
+          "ts": {
+            "$timestamp": {
+              "t": 1795212515,
+              "i": 1
+            }
+          },
+          "v": {
+            "$numberLong": "2"
+          }
+        },
+        {
+          "op": "c",
+          "ns": "config.$cmd",
+          "ui": {
+            "$binary": {
+              "base64": "2tII1NuTSduWpKJwJsk66Q==",
+              "subType": "04"
+            }
+          },
+          "o": {
+            "create": "transactions",
+            "idIndex": {
+              "v": {
+                "$numberInt": "2"
+              },
+              "key": {
+                "_id": {
+                  "$numberInt": "1"
+                }
+              },
+              "name": "_id_"
+            }
+          },
+          "ts": {
+            "$timestamp": {
+              "t": 1795212515,
+              "i": 3
+            }
+          },
+          "t": {
+            "$numberLong": "1"
+          },
+          "v": {
+            "$numberLong": "2"
+          }
+        }
+      ],
+      "last": {
+        "op": "c",
+        "ns": "config.$cmd",
+        "ui": {
+          "$binary": {
+            "base64": "fj+NJxxDTMqIGBQN2DW+5g==",
+            "subType": "04"
+          }
+        },
+        "o": {
+          "createIndexes": "sampledQueriesDiff",
+          "v": {
+            "$numberInt": "2"
+          },
+          "key": {
+            "expireAt": {
+              "$numberInt": "1"
+            }
+          },
+          "name": "SampledQueriesDiffTTLIndex",
+          "expireAfterSeconds": {
+            "$numberInt": "0"
+          }
+        },
+        "ts": {
+          "$timestamp": {
+            "t": 1795212515,
+            "i": 17
+          }
+        },
+        "t": {
+          "$numberLong": "1"
+        },
+        "v": {
+          "$numberLong": "2"
+        }
+      },
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1,oplogKeyExtractionVersion=1)",
+        "log_enabled": "true"
+      }
+    }
+  },
+  "after_writes": {
+    "local.replset.minvalid": {
+      "docs": [
+        {
+          "_id": {
+            "$oid": "6b00c4e231c5694a9a890929"
+          },
+          "t": {
+            "$numberLong": "-1"
+          },
+          "ts": {
+            "$timestamp": {
+              "t": 0,
+              "i": 0
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "false"
+      },
+      "options": {}
+    },
+    "local.replset.oplogTruncateAfterPoint": {
+      "docs": [
+        {
+          "_id": "oplogTruncateAfterPoint",
+          "oplogTruncateAfterPoint": {
+            "$timestamp": {
+              "t": 1795212518,
+              "i": 2
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.replset.election": {
+      "docs": [
+        {
+          "_id": {
+            "$oid": "6b00c4e231c5694a9a89092a"
+          },
+          "term": {
+            "$numberLong": "1"
+          },
+          "candidateIndex": {
+            "$numberLong": "0"
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.replset.initialSyncId": {
+      "docs": [
+        {
+          "_id": {
+            "$binary": {
+              "base64": "PDIng50SRfGuFPWSutyHDA==",
+              "subType": "04"
+            }
+          },
+          "wallTime": {
+            "$date": {
+              "$numberLong": "1795212515402"
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.system.rollback.id": {
+      "docs": [
+        {
+          "_id": "rollbackId",
+          "rollbackId": {
+            "$numberInt": "1"
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.system.replset": {
+      "docs": [
+        {
+          "_id": "rs0",
+          "version": {
+            "$numberInt": "1"
+          },
+          "term": {
+            "$numberInt": "1"
+          },
+          "members": [
+            {
+              "_id": {
+                "$numberInt": "0"
+              },
+              "host": "127.0.0.1:51524",
+              "arbiterOnly": false,
+              "buildIndexes": true,
+              "hidden": false,
+              "priority": {
+                "$numberDouble": "1.0"
+              },
+              "tags": {},
+              "secondaryDelaySecs": {
+                "$numberLong": "0"
+              },
+              "votes": {
+                "$numberInt": "1"
+              }
+            }
+          ],
+          "protocolVersion": {
+            "$numberLong": "1"
+          },
+          "writeConcernMajorityJournalDefault": true,
+          "settings": {
+            "chainingAllowed": true,
+            "heartbeatIntervalMillis": {
+              "$numberInt": "2000"
+            },
+            "heartbeatTimeoutSecs": {
+              "$numberInt": "10"
+            },
+            "electionTimeoutMillis": {
+              "$numberInt": "10000"
+            },
+            "catchUpTimeoutMillis": {
+              "$numberInt": "-1"
+            },
+            "catchUpTakeoverDelayMillis": {
+              "$numberInt": "30000"
+            },
+            "getLastErrorModes": {},
+            "getLastErrorDefaults": {
+              "w": {
+                "$numberInt": "1"
+              },
+              "wtimeout": {
+                "$numberInt": "0"
+              }
+            },
+            "replicaSetId": {
+              "$oid": "6b00c4e331c5694a9a89092d"
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "config.system.indexBuilds": {
+      "docs": [],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "false"
+      },
+      "options": {}
+    },
+    "oplog": {
+      "maxSize": 201326592,
+      "first": [
+        {
+          "op": "n",
+          "ns": "",
+          "o": {
+            "msg": "initiating set"
+          },
+          "ts": {
+            "$timestamp": {
+              "t": 1795212515,
+              "i": 1
+            }
+          },
+          "v": {
+            "$numberLong": "2"
+          }
+        },
+        {
+          "op": "c",
+          "ns": "config.$cmd",
+          "ui": {
+            "$binary": {
+              "base64": "2tII1NuTSduWpKJwJsk66Q==",
+              "subType": "04"
+            }
+          },
+          "o": {
+            "create": "transactions",
+            "idIndex": {
+              "v": {
+                "$numberInt": "2"
+              },
+              "key": {
+                "_id": {
+                  "$numberInt": "1"
+                }
+              },
+              "name": "_id_"
+            }
+          },
+          "ts": {
+            "$timestamp": {
+              "t": 1795212515,
+              "i": 3
+            }
+          },
+          "t": {
+            "$numberLong": "1"
+          },
+          "v": {
+            "$numberLong": "2"
+          }
+        }
+      ],
+      "last": {
+        "op": "c",
+        "ns": "admin.$cmd",
+        "o": {
+          "applyOps": [
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aac5"
+                },
+                "i": {
+                  "$numberInt": "0"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aac5"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aac6"
+                },
+                "i": {
+                  "$numberInt": "1"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aac6"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aac7"
+                },
+                "i": {
+                  "$numberInt": "2"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aac7"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aac8"
+                },
+                "i": {
+                  "$numberInt": "3"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aac8"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aac9"
+                },
+                "i": {
+                  "$numberInt": "4"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aac9"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaca"
+                },
+                "i": {
+                  "$numberInt": "5"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaca"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aacb"
+                },
+                "i": {
+                  "$numberInt": "6"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aacb"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aacc"
+                },
+                "i": {
+                  "$numberInt": "7"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aacc"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aacd"
+                },
+                "i": {
+                  "$numberInt": "8"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aacd"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aace"
+                },
+                "i": {
+                  "$numberInt": "9"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aace"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aacf"
+                },
+                "i": {
+                  "$numberInt": "10"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aacf"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad0"
+                },
+                "i": {
+                  "$numberInt": "11"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad0"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad1"
+                },
+                "i": {
+                  "$numberInt": "12"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad1"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad2"
+                },
+                "i": {
+                  "$numberInt": "13"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad2"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad3"
+                },
+                "i": {
+                  "$numberInt": "14"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad3"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad4"
+                },
+                "i": {
+                  "$numberInt": "15"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad4"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad5"
+                },
+                "i": {
+                  "$numberInt": "16"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad5"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad6"
+                },
+                "i": {
+                  "$numberInt": "17"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad6"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad7"
+                },
+                "i": {
+                  "$numberInt": "18"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad7"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad8"
+                },
+                "i": {
+                  "$numberInt": "19"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad8"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad9"
+                },
+                "i": {
+                  "$numberInt": "20"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aad9"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aada"
+                },
+                "i": {
+                  "$numberInt": "21"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aada"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aadb"
+                },
+                "i": {
+                  "$numberInt": "22"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aadb"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aadc"
+                },
+                "i": {
+                  "$numberInt": "23"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aadc"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aadd"
+                },
+                "i": {
+                  "$numberInt": "24"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aadd"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aade"
+                },
+                "i": {
+                  "$numberInt": "25"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aade"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aadf"
+                },
+                "i": {
+                  "$numberInt": "26"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aadf"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae0"
+                },
+                "i": {
+                  "$numberInt": "27"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae0"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae1"
+                },
+                "i": {
+                  "$numberInt": "28"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae1"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae2"
+                },
+                "i": {
+                  "$numberInt": "29"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae2"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae3"
+                },
+                "i": {
+                  "$numberInt": "30"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae3"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae4"
+                },
+                "i": {
+                  "$numberInt": "31"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae4"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae5"
+                },
+                "i": {
+                  "$numberInt": "32"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae5"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae6"
+                },
+                "i": {
+                  "$numberInt": "33"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae6"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae7"
+                },
+                "i": {
+                  "$numberInt": "34"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae7"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae8"
+                },
+                "i": {
+                  "$numberInt": "35"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae8"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae9"
+                },
+                "i": {
+                  "$numberInt": "36"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aae9"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaea"
+                },
+                "i": {
+                  "$numberInt": "37"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaea"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaeb"
+                },
+                "i": {
+                  "$numberInt": "38"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaeb"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaec"
+                },
+                "i": {
+                  "$numberInt": "39"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaec"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaed"
+                },
+                "i": {
+                  "$numberInt": "40"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaed"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaee"
+                },
+                "i": {
+                  "$numberInt": "41"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaee"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaef"
+                },
+                "i": {
+                  "$numberInt": "42"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaef"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaf0"
+                },
+                "i": {
+                  "$numberInt": "43"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaf0"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaf1"
+                },
+                "i": {
+                  "$numberInt": "44"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaf1"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaf2"
+                },
+                "i": {
+                  "$numberInt": "45"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaf2"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaf3"
+                },
+                "i": {
+                  "$numberInt": "46"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaf3"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaf4"
+                },
+                "i": {
+                  "$numberInt": "47"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaf4"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaf5"
+                },
+                "i": {
+                  "$numberInt": "48"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaf5"
+                }
+              }
+            },
+            {
+              "op": "i",
+              "ns": "t.x",
+              "ui": {
+                "$binary": {
+                  "base64": "FnDNczTITHW8g6Y9ALrLhg==",
+                  "subType": "04"
+                }
+              },
+              "o": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaf6"
+                },
+                "i": {
+                  "$numberInt": "49"
+                }
+              },
+              "o2": {
+                "_id": {
+                  "$oid": "6b00c4e62a3b5e9df162aaf6"
+                }
+              }
+            }
+          ]
+        },
+        "ts": {
+          "$timestamp": {
+            "t": 1795212518,
+            "i": 2
+          }
+        },
+        "t": {
+          "$numberLong": "1"
+        },
+        "v": {
+          "$numberLong": "2"
+        }
+      },
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1,oplogKeyExtractionVersion=1)",
+        "log_enabled": "true"
+      }
+    }
+  },
+  "after_clean_restart": {
+    "local.replset.minvalid": {
+      "docs": [
+        {
+          "_id": {
+            "$oid": "6b00c4e231c5694a9a890929"
+          },
+          "t": {
+            "$numberLong": "-1"
+          },
+          "ts": {
+            "$timestamp": {
+              "t": 0,
+              "i": 0
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "false"
+      },
+      "options": {}
+    },
+    "local.replset.oplogTruncateAfterPoint": {
+      "docs": [
+        {
+          "_id": "oplogTruncateAfterPoint",
+          "oplogTruncateAfterPoint": {
+            "$timestamp": {
+              "t": 1795212521,
+              "i": 2
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.replset.election": {
+      "docs": [
+        {
+          "_id": {
+            "$oid": "6b00c4e231c5694a9a89092a"
+          },
+          "term": {
+            "$numberLong": "2"
+          },
+          "candidateIndex": {
+            "$numberLong": "0"
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.replset.initialSyncId": {
+      "docs": [
+        {
+          "_id": {
+            "$binary": {
+              "base64": "PDIng50SRfGuFPWSutyHDA==",
+              "subType": "04"
+            }
+          },
+          "wallTime": {
+            "$date": {
+              "$numberLong": "1795212515402"
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.system.rollback.id": {
+      "docs": [
+        {
+          "_id": "rollbackId",
+          "rollbackId": {
+            "$numberInt": "1"
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.system.replset": {
+      "docs": [
+        {
+          "_id": "rs0",
+          "version": {
+            "$numberInt": "1"
+          },
+          "term": {
+            "$numberInt": "2"
+          },
+          "members": [
+            {
+              "_id": {
+                "$numberInt": "0"
+              },
+              "host": "127.0.0.1:51524",
+              "arbiterOnly": false,
+              "buildIndexes": true,
+              "hidden": false,
+              "priority": {
+                "$numberDouble": "1.0"
+              },
+              "tags": {},
+              "secondaryDelaySecs": {
+                "$numberLong": "0"
+              },
+              "votes": {
+                "$numberInt": "1"
+              }
+            }
+          ],
+          "protocolVersion": {
+            "$numberLong": "1"
+          },
+          "writeConcernMajorityJournalDefault": true,
+          "settings": {
+            "chainingAllowed": true,
+            "heartbeatIntervalMillis": {
+              "$numberInt": "2000"
+            },
+            "heartbeatTimeoutSecs": {
+              "$numberInt": "10"
+            },
+            "electionTimeoutMillis": {
+              "$numberInt": "10000"
+            },
+            "catchUpTimeoutMillis": {
+              "$numberInt": "-1"
+            },
+            "catchUpTakeoverDelayMillis": {
+              "$numberInt": "30000"
+            },
+            "getLastErrorModes": {},
+            "getLastErrorDefaults": {
+              "w": {
+                "$numberInt": "1"
+              },
+              "wtimeout": {
+                "$numberInt": "0"
+              }
+            },
+            "replicaSetId": {
+              "$oid": "6b00c4e331c5694a9a89092d"
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "config.system.indexBuilds": {
+      "docs": [],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "false"
+      },
+      "options": {}
+    },
+    "oplog": {
+      "maxSize": 201326592,
+      "first": [
+        {
+          "op": "n",
+          "ns": "",
+          "o": {
+            "msg": "initiating set"
+          },
+          "ts": {
+            "$timestamp": {
+              "t": 1795212515,
+              "i": 1
+            }
+          },
+          "v": {
+            "$numberLong": "2"
+          }
+        },
+        {
+          "op": "c",
+          "ns": "config.$cmd",
+          "ui": {
+            "$binary": {
+              "base64": "2tII1NuTSduWpKJwJsk66Q==",
+              "subType": "04"
+            }
+          },
+          "o": {
+            "create": "transactions",
+            "idIndex": {
+              "v": {
+                "$numberInt": "2"
+              },
+              "key": {
+                "_id": {
+                  "$numberInt": "1"
+                }
+              },
+              "name": "_id_"
+            }
+          },
+          "ts": {
+            "$timestamp": {
+              "t": 1795212515,
+              "i": 3
+            }
+          },
+          "t": {
+            "$numberLong": "1"
+          },
+          "v": {
+            "$numberLong": "2"
+          }
+        }
+      ],
+      "last": {
+        "op": "n",
+        "ns": "",
+        "o": {
+          "msg": "new primary"
+        },
+        "ts": {
+          "$timestamp": {
+            "t": 1795212521,
+            "i": 2
+          }
+        },
+        "t": {
+          "$numberLong": "2"
+        },
+        "v": {
+          "$numberLong": "2"
+        }
+      },
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1,oplogKeyExtractionVersion=1)",
+        "log_enabled": "true"
+      }
+    }
+  },
+  "after_kill9_restart": {
+    "local.replset.minvalid": {
+      "docs": [
+        {
+          "_id": {
+            "$oid": "6b00c4e231c5694a9a890929"
+          },
+          "t": {
+            "$numberLong": "-1"
+          },
+          "ts": {
+            "$timestamp": {
+              "t": 0,
+              "i": 0
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "false"
+      },
+      "options": {}
+    },
+    "local.replset.oplogTruncateAfterPoint": {
+      "docs": [
+        {
+          "_id": "oplogTruncateAfterPoint",
+          "oplogTruncateAfterPoint": {
+            "$timestamp": {
+              "t": 1795212526,
+              "i": 2
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.replset.election": {
+      "docs": [
+        {
+          "_id": {
+            "$oid": "6b00c4e231c5694a9a89092a"
+          },
+          "term": {
+            "$numberLong": "3"
+          },
+          "candidateIndex": {
+            "$numberLong": "0"
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.replset.initialSyncId": {
+      "docs": [
+        {
+          "_id": {
+            "$binary": {
+              "base64": "PDIng50SRfGuFPWSutyHDA==",
+              "subType": "04"
+            }
+          },
+          "wallTime": {
+            "$date": {
+              "$numberLong": "1795212515402"
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.system.rollback.id": {
+      "docs": [
+        {
+          "_id": "rollbackId",
+          "rollbackId": {
+            "$numberInt": "2"
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.system.replset": {
+      "docs": [
+        {
+          "_id": "rs0",
+          "version": {
+            "$numberInt": "1"
+          },
+          "term": {
+            "$numberInt": "3"
+          },
+          "members": [
+            {
+              "_id": {
+                "$numberInt": "0"
+              },
+              "host": "127.0.0.1:51524",
+              "arbiterOnly": false,
+              "buildIndexes": true,
+              "hidden": false,
+              "priority": {
+                "$numberDouble": "1.0"
+              },
+              "tags": {},
+              "secondaryDelaySecs": {
+                "$numberLong": "0"
+              },
+              "votes": {
+                "$numberInt": "1"
+              }
+            }
+          ],
+          "protocolVersion": {
+            "$numberLong": "1"
+          },
+          "writeConcernMajorityJournalDefault": true,
+          "settings": {
+            "chainingAllowed": true,
+            "heartbeatIntervalMillis": {
+              "$numberInt": "2000"
+            },
+            "heartbeatTimeoutSecs": {
+              "$numberInt": "10"
+            },
+            "electionTimeoutMillis": {
+              "$numberInt": "10000"
+            },
+            "catchUpTimeoutMillis": {
+              "$numberInt": "-1"
+            },
+            "catchUpTakeoverDelayMillis": {
+              "$numberInt": "30000"
+            },
+            "getLastErrorModes": {},
+            "getLastErrorDefaults": {
+              "w": {
+                "$numberInt": "1"
+              },
+              "wtimeout": {
+                "$numberInt": "0"
+              }
+            },
+            "replicaSetId": {
+              "$oid": "6b00c4e331c5694a9a89092d"
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "config.system.indexBuilds": {
+      "docs": [],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "false"
+      },
+      "options": {}
+    },
+    "oplog": {
+      "maxSize": 201326592,
+      "first": [
+        {
+          "op": "n",
+          "ns": "",
+          "o": {
+            "msg": "initiating set"
+          },
+          "ts": {
+            "$timestamp": {
+              "t": 1795212515,
+              "i": 1
+            }
+          },
+          "v": {
+            "$numberLong": "2"
+          }
+        },
+        {
+          "op": "c",
+          "ns": "config.$cmd",
+          "ui": {
+            "$binary": {
+              "base64": "2tII1NuTSduWpKJwJsk66Q==",
+              "subType": "04"
+            }
+          },
+          "o": {
+            "create": "transactions",
+            "idIndex": {
+              "v": {
+                "$numberInt": "2"
+              },
+              "key": {
+                "_id": {
+                  "$numberInt": "1"
+                }
+              },
+              "name": "_id_"
+            }
+          },
+          "ts": {
+            "$timestamp": {
+              "t": 1795212515,
+              "i": 3
+            }
+          },
+          "t": {
+            "$numberLong": "1"
+          },
+          "v": {
+            "$numberLong": "2"
+          }
+        }
+      ],
+      "last": {
+        "op": "n",
+        "ns": "",
+        "o": {
+          "msg": "new primary"
+        },
+        "ts": {
+          "$timestamp": {
+            "t": 1795212526,
+            "i": 2
+          }
+        },
+        "t": {
+          "$numberLong": "3"
+        },
+        "v": {
+          "$numberLong": "2"
+        }
+      },
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1,oplogKeyExtractionVersion=1)",
+        "log_enabled": "true"
+      }
+    },
+    "data_rows": 70
+  },
+  "after_second_kill9_restart": {
+    "local.replset.minvalid": {
+      "docs": [
+        {
+          "_id": {
+            "$oid": "6b00c4e231c5694a9a890929"
+          },
+          "t": {
+            "$numberLong": "-1"
+          },
+          "ts": {
+            "$timestamp": {
+              "t": 0,
+              "i": 0
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "false"
+      },
+      "options": {}
+    },
+    "local.replset.oplogTruncateAfterPoint": {
+      "docs": [
+        {
+          "_id": "oplogTruncateAfterPoint",
+          "oplogTruncateAfterPoint": {
+            "$timestamp": {
+              "t": 1795212531,
+              "i": 2
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.replset.election": {
+      "docs": [
+        {
+          "_id": {
+            "$oid": "6b00c4e231c5694a9a89092a"
+          },
+          "term": {
+            "$numberLong": "4"
+          },
+          "candidateIndex": {
+            "$numberLong": "0"
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.replset.initialSyncId": {
+      "docs": [
+        {
+          "_id": {
+            "$binary": {
+              "base64": "PDIng50SRfGuFPWSutyHDA==",
+              "subType": "04"
+            }
+          },
+          "wallTime": {
+            "$date": {
+              "$numberLong": "1795212515402"
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.system.rollback.id": {
+      "docs": [
+        {
+          "_id": "rollbackId",
+          "rollbackId": {
+            "$numberInt": "3"
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "local.system.replset": {
+      "docs": [
+        {
+          "_id": "rs0",
+          "version": {
+            "$numberInt": "1"
+          },
+          "term": {
+            "$numberInt": "4"
+          },
+          "members": [
+            {
+              "_id": {
+                "$numberInt": "0"
+              },
+              "host": "127.0.0.1:51524",
+              "arbiterOnly": false,
+              "buildIndexes": true,
+              "hidden": false,
+              "priority": {
+                "$numberDouble": "1.0"
+              },
+              "tags": {},
+              "secondaryDelaySecs": {
+                "$numberLong": "0"
+              },
+              "votes": {
+                "$numberInt": "1"
+              }
+            }
+          ],
+          "protocolVersion": {
+            "$numberLong": "1"
+          },
+          "writeConcernMajorityJournalDefault": true,
+          "settings": {
+            "chainingAllowed": true,
+            "heartbeatIntervalMillis": {
+              "$numberInt": "2000"
+            },
+            "heartbeatTimeoutSecs": {
+              "$numberInt": "10"
+            },
+            "electionTimeoutMillis": {
+              "$numberInt": "10000"
+            },
+            "catchUpTimeoutMillis": {
+              "$numberInt": "-1"
+            },
+            "catchUpTakeoverDelayMillis": {
+              "$numberInt": "30000"
+            },
+            "getLastErrorModes": {},
+            "getLastErrorDefaults": {
+              "w": {
+                "$numberInt": "1"
+              },
+              "wtimeout": {
+                "$numberInt": "0"
+              }
+            },
+            "replicaSetId": {
+              "$oid": "6b00c4e331c5694a9a89092d"
+            }
+          }
+        }
+      ],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "true"
+      },
+      "options": {}
+    },
+    "config.system.indexBuilds": {
+      "docs": [],
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1)",
+        "log_enabled": "false"
+      },
+      "options": {}
+    },
+    "oplog": {
+      "maxSize": 201326592,
+      "first": [
+        {
+          "op": "n",
+          "ns": "",
+          "o": {
+            "msg": "initiating set"
+          },
+          "ts": {
+            "$timestamp": {
+              "t": 1795212515,
+              "i": 1
+            }
+          },
+          "v": {
+            "$numberLong": "2"
+          }
+        },
+        {
+          "op": "c",
+          "ns": "config.$cmd",
+          "ui": {
+            "$binary": {
+              "base64": "2tII1NuTSduWpKJwJsk66Q==",
+              "subType": "04"
+            }
+          },
+          "o": {
+            "create": "transactions",
+            "idIndex": {
+              "v": {
+                "$numberInt": "2"
+              },
+              "key": {
+                "_id": {
+                  "$numberInt": "1"
+                }
+              },
+              "name": "_id_"
+            }
+          },
+          "ts": {
+            "$timestamp": {
+              "t": 1795212515,
+              "i": 3
+            }
+          },
+          "t": {
+            "$numberLong": "1"
+          },
+          "v": {
+            "$numberLong": "2"
+          }
+        }
+      ],
+      "last": {
+        "op": "n",
+        "ns": "",
+        "o": {
+          "msg": "new primary"
+        },
+        "ts": {
+          "$timestamp": {
+            "t": 1795212531,
+            "i": 2
+          }
+        },
+        "t": {
+          "$numberLong": "4"
+        },
+        "v": {
+          "$numberLong": "2"
+        }
+      },
+      "table": {
+        "key_format": "q",
+        "value_format": "u",
+        "block_compressor": "snappy",
+        "split_pct": "90",
+        "app_metadata": "(formatVersion=1,oplogKeyExtractionVersion=1)",
+        "log_enabled": "true"
+      }
+    },
+    "data_rows": 90
+  }
+}

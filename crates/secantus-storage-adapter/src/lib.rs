@@ -470,8 +470,8 @@ impl CmdStorage for StorageAdapter {
         // oplog reaches its first entry, and a resume from before that finds
         // no token, as mongod's does (280; 8.2.11 gives 280 for every time
         // before its oplog's first entry).
-        match self.inner.oplog_pruned_through() {
-            Ok(0) => 0,
+        match self.inner.oplog_reaches_genesis() {
+            Ok(true) => 0,
             _ => self.inner.oplog_floor_seq().unwrap_or(0),
         }
     }
@@ -1491,9 +1491,8 @@ impl CmdStorage for StorageAdapter {
             .map_err(map_err)
     }
 
-    fn set_oplog_max_entries(&self, n: usize) -> Result<(), StorageError> {
-        self.inner.set_oplog_max_entries(n);
-        Ok(())
+    fn set_oplog_max_bytes(&self, bytes: i64) -> Result<(), StorageError> {
+        self.inner.set_oplog_max_bytes(bytes).map_err(map_err)
     }
 
     fn set_pre_image_expire_after_seconds(&self, secs: Option<i64>) {

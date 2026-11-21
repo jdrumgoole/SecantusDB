@@ -31,7 +31,7 @@ Both `--flag value` and `--flag=value` spellings work.
 | `--standalone` | Advertise a plain standalone `hello` instead of the single-node replica-set persona (disables change-stream topology, matters for drivers that gate on `isReplicaSet`) | off |
 | `--noop-heartbeat-seconds N` | Periodic oplog no-op so cluster time advances while idle (mongod default is 10s) | `0` (disabled) |
 | `--oplog-retention-seconds N` | Oplog retention window | `3600` |
-| `--oplog-max-entries N` | Oplog entry cap (whichever cap hits first prunes oldest) | `100000` |
+| `--oplog-size-mb N` | The oplog's size in megabytes, for a new store (mongod's `--oplogSize`). The oplog is held to it in bytes, truncated oldest whole entries first and never past the stable checkpoint; `replSetResizeOplog` changes it afterwards. An existing store keeps the size it has | 192 on macOS; elsewhere 5% of the free disk, at least 990 and at most 51200 |
 | `--oplog-archive-dir PATH` | Archive pruned oplog rows for [point-in-time recovery](recovery.md) beyond the live window | off |
 | `--tls-cert-file PATH` | Server certificate (PEM); pair with `--tls-key-file` | off |
 | `--tls-key-file PATH` | Server private key (PEM) | off |
@@ -130,7 +130,7 @@ standalone = false
 
 [oplog]
 retention_seconds = 3600.0
-max_entries = 100000
+# size_mb = 192            # a new store's oplog size (mongod's --oplogSize)
 noop_heartbeat_seconds = 0.0
 # archive_dir = "/var/lib/secantus/pitr-archive"
 

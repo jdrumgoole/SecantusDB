@@ -29,7 +29,7 @@ use crate::{Result, StorageError};
 /// The layout version this build writes and reads. Every change to the
 /// on-disk layout moves it on (each phase of the storage-model plan does),
 /// and a store at any other version is refused.
-pub const STORE_FORMAT_VERSION: u32 = 5;
+pub const STORE_FORMAT_VERSION: u32 = 6;
 
 /// The file holding [`STORE_FORMAT_VERSION`] in a SecantusDB-written store.
 pub const FORMAT_FILE: &str = "secantus.format";
@@ -296,17 +296,23 @@ mod tests {
     }
 
     #[test]
-    fn the_previous_layout_is_refused_and_this_one_is_format_5() {
-        // Format 4 kept the oplog in sixteen shard tables keyed by a
-        // sequence number; format 5 keeps it as `local.oplog.rs`, one
-        // capped-collection table keyed by the entry's timestamp.
-        assert_eq!(STORE_FORMAT_VERSION, 5);
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("WiredTiger.wt"), b"").unwrap();
-        fs::write(dir.path().join(STORAGE_BSON), mongod_storage_bson()).unwrap();
-        fs::write(dir.path().join(FORMAT_FILE), "4\n").unwrap();
-        let err = prepare(dir.path()).unwrap_err().to_string();
-        assert!(err.contains("store format 4"), "{err}");
-        assert!(err.contains("format 5 only"), "{err}");
+    fn the_previous_layout_is_refused_and_this_one_is_format_6() {
+        // Format 5 kept the oplog as `local.oplog.rs` but held it to an
+        // entry count, kept its ident, its pruned mark and the stable
+        // checkpoint's position in `secantus_oplog_meta`, and began empty;
+        // format 6 holds it to its size in bytes, begins it with mongod's
+        // `initiating set` no-op and keeps the replica-set state in
+        // mongod's `local` collections, with WiredTiger's own recovery
+        // timestamp as the recovery point.
+        assert_eq!(STORE_FORMAT_VERSION, 6);
+        for old in ["4", "5"] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("WiredTiger.wt"), b"").unwrap();
+            fs::write(dir.path().join(STORAGE_BSON), mongod_storage_bson()).unwrap();
+            fs::write(dir.path().join(FORMAT_FILE), format!("{old}\n")).unwrap();
+            let err = prepare(dir.path()).unwrap_err().to_string();
+            assert!(err.contains(&format!("store format {old}")), "{err}");
+            assert!(err.contains("format 6 only"), "{err}");
+        }
     }
 }

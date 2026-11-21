@@ -228,6 +228,10 @@ pub(crate) struct SizeStorer {
     slots: Mutex<Slots>,
     /// How many times the counts were made by walking the store.
     recounts: AtomicU64,
+    /// The oplog's `(entries, bytes)` the last clean close left, read by
+    /// [`Self::load`] when the counts are trusted: mongod's size storer keeps
+    /// the oplog's record count and data size beside every collection's.
+    oplog: Mutex<Option<(i64, i64)>>,
 }
 
 impl SizeStorer {
@@ -351,6 +355,7 @@ impl SizeStorer {
     pub(crate) fn load(&self, session: &Session, fingerprint: &[i64]) -> crate::Result<bool> {
         let cur = session.open_cursor(SIZE_STORER_TABLE, None)?;
         cur.set_key_ss(MARKER.0, MARKER.1);
+        let mut oplog_sizes = None;
         let trusted = match cur.search() {
             Ok(()) => {
                 let marker = crate::decode_doc(&cur.get_value_u()?)?;
@@ -358,7 +363,14 @@ impl SizeStorer {
                     .get_array("oplog")
                     .map(|a| a.iter().filter_map(Bson::as_i64).collect())
                     .unwrap_or_default();
-                left == fingerprint
+                let sizes: Vec<i64> = marker
+                    .get_array("oplogSize")
+                    .map(|a| a.iter().filter_map(Bson::as_i64).collect())
+                    .unwrap_or_default();
+                if let [records, bytes] = sizes[..] {
+                    oplog_sizes = Some((records, bytes));
+                }
+                left == fingerprint && oplog_sizes.is_some()
             }
             Err(e) if e.is_not_found() => false,
             Err(e) => return Err(e.into()),
@@ -393,6 +405,7 @@ impl SizeStorer {
         drop(del);
         session.commit_transaction(None)?;
         self.replace_all(sizes);
+        *self.oplog.lock().unwrap_or_else(|e| e.into_inner()) = oplog_sizes;
         Ok(true)
     }
 
@@ -441,7 +454,17 @@ impl SizeStorer {
 
     /// Write the committed counts and the clean-close marker, replacing what
     /// the table held, in one transaction.
-    pub(crate) fn persist(&self, session: &Session, fingerprint: &[i64]) -> crate::Result<()> {
+    /// The oplog's `(entries, bytes)` that [`Self::load`] trusted, once.
+    pub(crate) fn take_oplog_sizes(&self) -> Option<(i64, i64)> {
+        self.oplog.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    pub(crate) fn persist(
+        &self,
+        session: &Session,
+        fingerprint: &[i64],
+        oplog_sizes: (i64, i64),
+    ) -> crate::Result<()> {
         let committed = self.committed_sizes();
         session.begin_transaction(None)?;
         let written = (|| -> crate::Result<()> {
@@ -464,6 +487,7 @@ impl SizeStorer {
             let marker = bson::doc! {
                 "clean": true,
                 "oplog": fingerprint.iter().map(|n| Bson::Int64(*n)).collect::<Vec<_>>(),
+                "oplogSize": [Bson::Int64(oplog_sizes.0), Bson::Int64(oplog_sizes.1)],
             };
             cur.reset()?;
             cur.set_key_ss(MARKER.0, MARKER.1);

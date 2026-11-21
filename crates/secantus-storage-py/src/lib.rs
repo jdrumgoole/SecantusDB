@@ -145,8 +145,8 @@ impl RustStorage {
         self.inner.set_oplog_retention_seconds(secs);
     }
 
-    fn set_oplog_max_entries(&mut self, n: usize) {
-        self.inner.set_oplog_max_entries(n);
+    fn set_oplog_max_bytes(&mut self, bytes: i64) -> PyResult<()> {
+        self.inner.set_oplog_max_bytes(bytes).map_err(to_pyerr)
     }
 
     // --- CRUD core ---

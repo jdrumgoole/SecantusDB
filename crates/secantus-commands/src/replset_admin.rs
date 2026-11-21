@@ -17,11 +17,6 @@ use bson::{doc, Bson, Document};
 
 use crate::{CommandContext, CommandError, HandlerResult};
 
-/// The oplog cap is counted in entries; `collStats` reports it as 16 KiB an
-/// entry (`Storage::get_collection_options`), so a size in megabytes is 64
-/// entries a megabyte.
-const ENTRIES_PER_MB: f64 = 64.0;
-
 fn type_name(v: &Bson) -> &'static str {
     secantus_core::query::bson_type_name(v)
 }
@@ -191,9 +186,10 @@ pub fn repl_set_resize_oplog(doc: &Document, ctx: &mut CommandContext) -> Handle
         }
     }
     if let Some(mb) = size {
-        let entries = (mb * ENTRIES_PER_MB).round().min(usize::MAX as f64) as usize;
+        // mongod's: megabytes times 1048576, the fraction kept
+        // (`size: 1000.5` gives `maxSize` 1049100288, measured 8.2.11).
         ctx.storage()?
-            .set_oplog_max_entries(entries)
+            .set_oplog_max_bytes((mb * 1_048_576.0) as i64)
             .map_err(storage_error)?;
     }
     // No entry younger than this goes, whatever the size (mongod 8.2.11).

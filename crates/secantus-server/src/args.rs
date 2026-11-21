@@ -93,7 +93,9 @@ pub struct CliArgs {
     pub sync_on_commit: bool,
     pub noop_heartbeat_seconds: f64,
     pub oplog_retention_seconds: f64,
-    pub oplog_max_entries: usize,
+    /// The oplog's size in megabytes (mongod's `--oplogSize`); `None` takes
+    /// mongod's default for the platform.
+    pub oplog_size_mb: Option<u64>,
     pub ttl_sweep_seconds: f64,
     /// Storage write-path modes (`--oplog-nonlogged` /
     /// `--data-nonlogged` / `--checkpoint-seconds`). `None` defers to the
@@ -169,7 +171,7 @@ impl CliArgs {
             sync_on_commit: cfg.sync_on_commit,
             noop_heartbeat_seconds: cfg.noop_heartbeat_seconds,
             oplog_retention_seconds: cfg.oplog_retention_seconds,
-            oplog_max_entries: cfg.oplog_max_entries,
+            oplog_size_mb: cfg.oplog_size_mb,
             ttl_sweep_seconds: cfg.ttl_sweep_seconds,
             oplog_nonlogged: cfg.oplog_nonlogged,
             data_nonlogged: cfg.data_nonlogged,
@@ -406,11 +408,21 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                     format!("--oplog-retention-seconds expects a number, got {raw:?}")
                 })?);
             }
-            "--oplog-max-entries" => {
-                let raw = take_value("--oplog-max-entries")?;
-                o.oplog_max_entries = Some(raw.parse::<usize>().map_err(|_| {
-                    format!("--oplog-max-entries expects a non-negative integer, got {raw:?}")
-                })?);
+            "--oplog-size-mb" => {
+                let raw = take_value("--oplog-size-mb")?;
+                let mb = raw
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|mb| *mb > 0)
+                    .ok_or_else(|| {
+                        format!("--oplog-size-mb expects a positive integer, got {raw:?}")
+                    })?;
+                o.oplog_size_mb = Some(mb);
+                set_option(
+                    &mut cmd_line,
+                    &["replication", "oplogSizeMB"],
+                    bson::Bson::Int32(i32::try_from(mb).unwrap_or(i32::MAX)),
+                );
             }
             "--auth" => {
                 set_option(
@@ -578,8 +590,9 @@ OPTIONS:
                                  0 = disabled (default)
     --oplog-retention-seconds S  Oplog wall-clock retention; entries older than
                                  this are pruned opportunistically (default: 3600)
-    --oplog-max-entries N        Oplog count cap; whichever bound hits first
-                                 prunes the oldest entries (default: 100000)
+    --oplog-size-mb N            Oplog size in megabytes, a new store's only
+                                 (mongod's --oplogSize; default: 192 on macOS,
+                                 else 5% of the free disk, 990 to 51200)
     --oplog-archive-dir DIR      PITR v2: archive pruned oplog rows here before
                                  they are dropped, so recovery can reach a time
                                  before the live oplog floor (off by default)
@@ -708,7 +721,7 @@ mod tests {
         assert!(!a.sync_on_commit);
         assert_eq!(a.noop_heartbeat_seconds, 0.0);
         assert_eq!(a.oplog_retention_seconds, 3600.0);
-        assert_eq!(a.oplog_max_entries, 100_000);
+        assert_eq!(a.oplog_size_mb, None);
         assert_eq!(a.ttl_sweep_seconds, 60.0);
     }
 
@@ -810,7 +823,7 @@ mod tests {
             "1.5",
             "--oplog-retention-seconds",
             "60",
-            "--oplog-max-entries",
+            "--oplog-size-mb",
             "500",
         ]);
         assert_eq!(a.log_level, "DEBUG");
@@ -819,7 +832,7 @@ mod tests {
         assert!(a.sync_on_commit);
         assert_eq!(a.noop_heartbeat_seconds, 1.5);
         assert_eq!(a.oplog_retention_seconds, 60.0);
-        assert_eq!(a.oplog_max_entries, 500);
+        assert_eq!(a.oplog_size_mb, Some(500));
     }
 
     #[test]
@@ -830,7 +843,8 @@ mod tests {
     #[test]
     fn bad_numeric_flags_rejected() {
         assert!(parse(&["--session-max", "-1"]).is_err());
-        assert!(parse(&["--oplog-max-entries", "x"]).is_err());
+        assert!(parse(&["--oplog-size-mb", "x"]).is_err());
+        assert!(parse(&["--oplog-size-mb", "0"]).is_err());
         assert!(parse(&["--noop-heartbeat-seconds", "abc"]).is_err());
     }
 

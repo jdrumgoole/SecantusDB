@@ -60,7 +60,7 @@ pub struct ResolvedConfig {
 
     // ---- [oplog] -----------------------------------------------------
     pub oplog_retention_seconds: f64,
-    pub oplog_max_entries: usize,
+    pub oplog_size_mb: Option<u64>,
     pub oplog_archive_dir: Option<String>,
     pub noop_heartbeat_seconds: f64,
 
@@ -113,7 +113,7 @@ impl Default for ResolvedConfig {
             // OFF by default, as mongod is. See the field's doc comment.
             enable_test_commands: false,
             oplog_retention_seconds: 3600.0,
-            oplog_max_entries: 100_000,
+            oplog_size_mb: None,
             oplog_archive_dir: None,
             noop_heartbeat_seconds: 0.0,
             cache_size: "4G".to_string(),
@@ -149,7 +149,7 @@ pub struct ConfigOverrides {
     pub standalone: Option<bool>,
     pub enable_test_commands: Option<bool>,
     pub oplog_retention_seconds: Option<f64>,
-    pub oplog_max_entries: Option<usize>,
+    pub oplog_size_mb: Option<u64>,
     pub oplog_archive_dir: Option<String>,
     pub noop_heartbeat_seconds: Option<f64>,
     pub cache_size: Option<String>,
@@ -195,7 +195,10 @@ impl ConfigOverrides {
         set_copy!(standalone);
         set_copy!(enable_test_commands);
         set_copy!(oplog_retention_seconds);
-        set_copy!(oplog_max_entries);
+        // Option-valued in the base too: `Some(v)` sets, `None` defers.
+        if let Some(v) = self.oplog_size_mb {
+            base.oplog_size_mb = Some(v);
+        }
         // oplog_archive_dir is Option-valued; `Some(dir)` sets it.
         if let Some(v) = &self.oplog_archive_dir {
             base.oplog_archive_dir = Some(v.clone());
@@ -382,7 +385,13 @@ pub fn parse_str(text: &str, label: &str) -> Result<ConfigOverrides, String> {
                 "retention_seconds" => {
                     out.oplog_retention_seconds = Some(as_f64(val, "oplog", key, label)?)
                 }
-                "max_entries" => out.oplog_max_entries = Some(as_usize(val, "oplog", key, label)?),
+                "size_mb" => {
+                    let mb = as_usize(val, "oplog", key, label)? as u64;
+                    if mb == 0 {
+                        return Err(format!("{label}: [oplog].size_mb must be positive"));
+                    }
+                    out.oplog_size_mb = Some(mb)
+                }
                 "noop_heartbeat_seconds" => {
                     out.noop_heartbeat_seconds = Some(as_f64(val, "oplog", key, label)?)
                 }
@@ -573,7 +582,7 @@ mod tests {
         assert!(!c.auth);
         assert!(!c.standalone);
         assert_eq!(c.oplog_retention_seconds, 3600.0);
-        assert_eq!(c.oplog_max_entries, 100_000);
+        assert_eq!(c.oplog_size_mb, None);
         assert_eq!(c.oplog_archive_dir, None);
         assert_eq!(c.noop_heartbeat_seconds, 0.0);
         assert_eq!(c.cache_size, "4G");
@@ -651,13 +660,13 @@ mod tests {
     #[test]
     fn renames_applied() {
         let o = parse(
-            "[oplog]\nretention_seconds = 120\nmax_entries = 42\n\
+            "[oplog]\nretention_seconds = 120\nsize_mb = 42\n\
              [tls]\ncert_file = \"c.pem\"\nkey_file = \"k.pem\"\n\
              ca_file = \"ca.pem\"\nrequire_client_cert = true\n",
         )
         .unwrap();
         assert_eq!(o.oplog_retention_seconds, Some(120.0));
-        assert_eq!(o.oplog_max_entries, Some(42));
+        assert_eq!(o.oplog_size_mb, Some(42));
         assert_eq!(o.tls_cert_file.as_deref(), Some("c.pem"));
         assert_eq!(o.tls_key_file.as_deref(), Some("k.pem"));
         assert_eq!(o.tls_ca_file.as_deref(), Some("ca.pem"));

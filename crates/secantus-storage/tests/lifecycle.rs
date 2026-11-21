@@ -298,33 +298,39 @@ fn rename_keeps_secondary_index_reachable_through_the_index() {
     });
 }
 
-/// Phase A': the stable-checkpoint marker round-trips across a close/reopen
-/// (logged-mode store — the marker machinery is mode-independent; the
-/// crash/replay path itself is exercised by the Python hard-kill harness,
-/// where the data-nonlogged env can be subprocess-scoped).
+/// The stable checkpoint's position is WiredTiger's own recovery timestamp, the
+/// stable timestamp the checkpoint stored with itself: a store that is opened
+/// again reads it back from WiredTiger, with no row of ours to keep in step
+/// with the checkpoint. (The crash/replay path itself is exercised by the
+/// hard-kill harnesses.)
 #[test]
-fn stable_checkpoint_marker_roundtrips() {
+fn the_stable_checkpoint_position_is_the_recovery_timestamp() {
     let home = temp_home();
+    let options = secantus_storage::StorageOptions {
+        data_nonlogged: Some(true),
+        oplog_nonlogged: Some(false),
+        ..secantus_storage::StorageOptions::default()
+    };
     let anchored;
     {
-        let st = Storage::open(home.to_str().unwrap()).unwrap();
+        let st = Storage::open_with_options(home.to_str().unwrap(), &options).unwrap();
         st.insert_one("app", "c", &enc(&bson::doc! {"_id": 1}))
             .unwrap();
-        // Async lane: the anchor covers only drained rows (no-op sync).
-        st.flush_oplog();
         st.stable_checkpoint().unwrap();
-        anchored = st.oplog_tail_seq();
+        anchored = st.stable_checkpoint_seq();
+        assert!(anchored >= st.oplog_tail_seq(), "{anchored}");
         st.insert_one("app", "c", &enc(&bson::doc! {"_id": 2}))
             .unwrap();
         assert!(st.oplog_tail_seq() > anchored);
     }
-    // Reopen: the marker must read back as the position the checkpoint
-    // anchored (the newest entry then: the collection's creation and the
-    // first insert; the second insert happened after), via the same load
-    // path open uses.
     {
-        let st = Storage::open(home.to_str().unwrap()).unwrap();
-        assert_eq!(st.stable_checkpoint_seq(), anchored);
+        // The close took one more, past the second insert.
+        let st = Storage::open_with_options(home.to_str().unwrap(), &options).unwrap();
+        assert_eq!(
+            st.stable_checkpoint_seq(),
+            st.open_record().recovery_timestamp as i64
+        );
+        assert!(st.stable_checkpoint_seq() >= st.oplog_tail_seq());
     } // close BEFORE deleting the home — a live connection's close checkpoint
       // over a removed directory is a guaranteed WT panic.
     let _ = std::fs::remove_dir_all(&home);
