@@ -3053,3 +3053,30 @@ statement is VALUES-only and runs there as written. The gap test is in
       settle where they go.
       Backlog-ID: RP-1074
       Verify: tests/backlog/test_rp_storage_model.py::test_a_table_is_its_own_collection_table, tests/backlog/test_rp_storage_model.py::test_mongod_reads_a_table_the_sql_server_wrote
+- [ ] **`pg_relation_filepath` of a system catalog is NULL.** PostgreSQL
+      15.19 gives every catalog a file (`pg_class` is `base/5/1259`,
+      `pg_database` `global/1262`); this server computes its catalogs, keeps
+      no file for them, and answers NULL, the answer for a relation with no
+      storage. Naming a file the catalog is not read from would be a
+      stand-in; which file, if any, is Joe's call (RP-112 decided only that
+      a relation's file is WiredTiger's). Found working phase 6 of
+      `tasks/mongod-storage-model-plan.md`.
+      Backlog-ID: RP-1075
+      Verify: tests/backlog/test_rp_storage_model.py::test_a_catalog_has_a_file
+- [ ] **Every sequence names the same file.** A sequence is a relation of
+      its own in PostgreSQL 15.19, with its own file
+      (`pg_relation_filepath` differs for two sequences); here every
+      sequence's state is a row of one shared collection, so
+      `pg_relation_filepath` gives that collection's `collection-<UUID>.wt`
+      for all of them. The faithful fix stores each sequence as a relation
+      of its own (a collection per sequence). Found working phase 6.
+      Backlog-ID: RP-1076
+      Verify: tests/backlog/test_rp_storage_model.py::test_each_sequence_has_its_own_file
+- [ ] **`pg_relation_filenode` is refused** (0A000, "not supported yet").
+      PostgreSQL 15.19 answers the relation's `pg_class.relfilenode` (an
+      `oid`), NULL for a view. Here `relfilenode` is a number of this
+      server's own while a relation's file is named by a UUID ident, so the
+      function needs a decision on what number names that file. Found
+      working phase 6.
+      Backlog-ID: RP-1077
+      Verify: tests/backlog/test_rp_storage_model.py::test_relation_filenode

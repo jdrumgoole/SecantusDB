@@ -11,9 +11,11 @@ through `secantusd-mdb`).
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from tests.backlog.conftest import pg_answer
 from tests.backlog.test_rm_storage_model import (
     _mongod_answers,
     _mongod_on,
@@ -78,3 +80,56 @@ def test_mongod_reads_a_table_the_sql_server_wrote(tmp_path: Path) -> None:
             assert (result["valid"], result["nrecords"]) == (True, 2)
     finally:
         _stop_mongod(proc, client)
+
+
+# Found working phase 6 of the storage-model plan (2026-11-21): what
+# `pg_relation_filepath` and `pg_relation_filenode` give, against
+# PostgreSQL 15.19 (measured on port 5415). As decided for RP-112 (Joe,
+# 2026-10-22), a relation's file is WiredTiger's, so what is compared is what
+# PostgreSQL also guarantees, not its numbers.
+
+
+@pytest.mark.backlog("RP-1075")
+def test_a_catalog_has_a_file(pg: Any) -> None:
+    """PostgreSQL 15.19 gives every catalog a file (`pg_class`'s is
+    `base/5/1259`, `pg_database`'s `global/1262`); this server computes its
+    catalogs and answers NULL, the answer for a relation with no storage."""
+    assert pg_answer(
+        pg,
+        "select pg_relation_filepath('pg_class') is not null,"
+        " pg_relation_filepath('pg_database') is not null",
+    ) == ("ok", [(True, True)])
+
+
+@pytest.mark.backlog("RP-1076")
+def test_each_sequence_has_its_own_file(pg: Any) -> None:
+    """A sequence is a relation of its own in PostgreSQL 15.19, with its own
+    file; here every sequence's state is a row of one shared collection, so
+    two sequences name the same file."""
+    pg.execute("create sequence fp_s1")
+    pg.execute("create sequence fp_s2")
+    try:
+        assert pg_answer(
+            pg, "select pg_relation_filepath('fp_s1') <> pg_relation_filepath('fp_s2')"
+        ) == ("ok", [(True,)])
+    finally:
+        pg.execute("drop sequence fp_s1, fp_s2")
+
+
+@pytest.mark.backlog("RP-1077")
+def test_relation_filenode(pg: Any) -> None:
+    """PostgreSQL 15.19's `pg_relation_filenode` is the relation's
+    `pg_class.relfilenode` (an `oid`), NULL for a view; this server refuses
+    the function."""
+    pg.execute("create table fp_t (id int primary key)")
+    pg.execute("create view fp_v as select 1")
+    try:
+        assert pg_answer(
+            pg,
+            "select pg_relation_filenode('fp_t')"
+            " = (select relfilenode from pg_class where relname = 'fp_t'),"
+            " pg_relation_filenode('fp_v') is null",
+        ) == ("ok", [(True, True)])
+    finally:
+        pg.execute("drop view fp_v")
+        pg.execute("drop table fp_t")

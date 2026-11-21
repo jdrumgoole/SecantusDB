@@ -77,8 +77,8 @@ pub mod store_format;
 pub use catalog_changes::CatalogChange;
 pub use index_build::{IndexBuildAbort, IndexBuildInfo, IndexBuildSpec};
 use ixkeys::{EntryKey, KeyShape};
-pub use sizes::CollectionSizes;
 use sizes::Delta;
+pub use sizes::{size_storer_value, CollectionSizes};
 
 thread_local! {
     /// How many whole-collection document walks (`Storage::visit_docs`)
@@ -7626,7 +7626,15 @@ impl Storage {
                     let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
                     (st.live_count, st.live_bytes)
                 };
-                if let Err(e) = self.sizes.persist(&session, &fingerprint, oplog_sizes) {
+                let persisted = mdb_catalog::all_placements(&session).and_then(|placements| {
+                    self.sizes.persist(
+                        &session,
+                        &fingerprint,
+                        &placements,
+                        (&self.oplog_uri, oplog_sizes.0, oplog_sizes.1),
+                    )
+                });
+                if let Err(e) = persisted {
                     fail("persisting the collection sizes", e);
                 }
                 // Close-time checkpoint (durable mode) — the Rust analogue of
@@ -9606,6 +9614,20 @@ impl Storage {
             }
         }
         out.sort();
+        Ok(out)
+    }
+
+    /// The rows of the raw-keyed table at `uri` (`key_format=u,
+    /// value_format=u`, as `sizeStorer`), in key order. For tests of the
+    /// on-disk layout.
+    #[doc(hidden)]
+    pub fn raw_table_rows(&self, uri: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(uri, None)?;
+        let mut out = Vec::new();
+        while cur.next()? {
+            out.push((cur.get_key_u()?, cur.get_value_u()?));
+        }
         Ok(out)
     }
 
@@ -15298,13 +15320,16 @@ impl Storage {
     /// one walk of the store when there are none to trust.
     fn open_size_storer(&self, fingerprint: &[i64]) -> Result<()> {
         let session = self.conn.open_session()?;
-        // Logged whatever the data tables are: the clean-close marker must
-        // not roll back with them.
+        // Logged whatever the data tables are, as mongod's `sizeStorer` is:
+        // the clean-close marker must not roll back with them.
         session.create(sizes::SIZE_STORER_TABLE, sizes::SIZE_STORER_CFG)?;
-        let trusted = self.sizes.load(&session, fingerprint)?;
+        session.create(sizes::PRIVATE_TABLE, sizes::PRIVATE_CFG)?;
+        let placements = mdb_catalog::all_placements(&session)?;
+        let trusted = self
+            .sizes
+            .load(&session, fingerprint, &placements, &self.oplog_uri)?;
         if !trusted {
-            self.sizes
-                .recount(&session, &mdb_catalog::all_placements(&session)?)?;
+            self.sizes.recount(&session, &placements)?;
         }
         // The oplog's own entries and bytes: the clean close's, else one walk
         // (as mongod builds its truncate markers by scanning when it has no

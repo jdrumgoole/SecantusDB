@@ -843,10 +843,80 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
      keeps; explain names `IXSCAN _id_` for a clustered collection where
      mongod says `CLUSTERED_IXSCAN` / `EXPRESS_CLUSTERED_IXSCAN`; views are
      still in the registry (phase 7); the size storer is still keyed by
-     namespace (phase 6).
+     namespace (phase 6, done).
 6. **Size storer and the PostgreSQL server.** Key sizes by ident.
    `pg_relation_filepath` (secantus-pg/src/lib.rs:22636) returns the ident's
    file. Confirm the SQL-to-collection hand-off test still passes.
+
+   **As built (phase 6, store format 8):** measured on mongod 8.2.11 with
+   `wt dump -x table:sizeStorer` on stores it left after a clean stop, a
+   rename and two `kill -9` runs (the fixture's rows, and four more stores).
+   - **mongod's form.** `table:sizeStorer` is created `key_format=u,
+     value_format=u` and otherwise WiredTiger's defaults (no compressor,
+     4KB internal / 32KB leaf pages, `prefix_compression=false`,
+     `split_pct=90`, empty `app_metadata`, logged). The key is the ident's
+     table URI as raw bytes, no terminator (`table:collection-<UUID>`,
+     `table:_mdb_catalog`); the value is the 43-byte BSON `{numRecords:
+     Int64, dataSize: Int64}` (3 documents of 69 bytes are
+     `2b000000126e756d5265636f726473000300000000000000126461746153697a6500450000000000000000`).
+     A row exists for each record store whose sizes ever moved: a
+     collection created and never written has none, one written and
+     emptied keeps `0, 0`; the oplog and `_mdb_catalog` have one; **no
+     index ident has one** (mongod reports an index's size from its file).
+     A rename keeps the ident and so the row, unchanged (`app.a` renamed
+     `app.a2`: same key, same value, same row count); a drop takes the row
+     away when the ident is dropped (a drop-pending ident keeps its row).
+   - **When mongod writes it:** at its checkpoints and at a clean stop. Killed
+     3 s after 1,000 inserts, its size storer had no row for the collection
+     or the oplog; after the restart it counted 1,001 (replication recovery
+     adjusts a collection's counts as it replays), but its **oplog** row
+     said 1 entry / 101 bytes while the oplog held 21 / 127,650: mongod does
+     not correct the oplog's own count after a crash. Killed 75 s later (a
+     checkpoint between), the rows were current.
+   - **This server** (`sizes.rs`) keeps the counts in memory by namespace,
+     as before (transactional adjust, rollback undo, a rename moves them
+     inside its transaction), and at a clean close writes them to
+     `sizeStorer` by ident through the placements: a row for every
+     collection with a slot or an existing row, the oplog's, and
+     `_mdb_catalog`'s (counted at close); rows of idents the catalog no
+     longer names go. What mongod's table does not hold is in
+     `secantus_size_storer` (`key_format=u`): each index's entry bytes keyed
+     by the index's ident URI (`collStats.indexSizes` reports entry bytes,
+     RM-040), and the clean-close marker with the oplog fingerprint. Both
+     tables are written in one transaction. An unclean open still walks
+     every table once (exact for the oplog too, where mongod's count is
+     stale); sizes for a namespace or index with no ident leave the marker
+     out, so the next open walks rather than trust them.
+   - **Store format 8**; formats 4-7 are refused by name.
+   - **Comparison tool** (`--secantusd`, 2026-11-21; the phase 5 tolerance of
+     a store without `sizeStorer` is gone, and rows are labelled by
+     namespace): `sizeStorer` has the same table and file config in both
+     stores, and every collection both stores hold has the same row
+     (`app.c` 7 / 339, `app.ks` 38 / 1,761, `app.system.buckets.ts` 2 / 530,
+     `config.system.preimages`, `config.system.indexBuilds` 0 / 0, the
+     `local.replset.*` rows and the rest). Rows only mongod has: the
+     collections only it has (`admin.system.{keys,users,roles}`,
+     `app.system.views`) and the drop-pending `todrop` (this server had
+     reaped its table before the stop). Rows that differ: `local.oplog.rs`,
+     `local.startup_log`, `local.system.replset` and `_mdb_catalog`, whose
+     contents differ.
+   - **`pg_relation_filepath`** already named the ident's file
+     (`collection-<UUID>.wt`, `index-<UUID>.wt`, relative to the data
+     directory, as RP-112 decided). PostgreSQL 15.19 answers
+     `base/<dboid>/<relfilenode>` (`base/5/1438623`); the form stays ours.
+     Two bugs fixed: the primary key answered NULL (it is the storage's
+     `_id_` index), and a name was resolved only among tables and views, so
+     an index's, a sequence's or a catalog's name was 42P01 (the argument is
+     a `regclass`, read now as `regclassin` reads it). Filed: a catalog's
+     file is NULL (RP-1075, PostgreSQL gives `base/5/1259`), every sequence
+     names one shared file (RP-1076), `pg_relation_filenode` is refused
+     (RP-1077).
+   - **Still different from mongod after this phase:** the size storer is
+     written only at a clean close, not at checkpoints, so a store that
+     crashed holds the last clean close's rows until it is opened again; an
+     emptied collection that is dropped and re-created under the same name
+     in one run gets a `0, 0` row mongod would not write; the oplog's count
+     after a crash is exact here and stale on mongod.
 7. **mongod opens the store.** A test creates a store with SecantusDB holding
    everything phase 0b created, stops it cleanly, starts mongod 8.2.11 on the
    directory with `--replSet` (decision 8), waits for it to become
