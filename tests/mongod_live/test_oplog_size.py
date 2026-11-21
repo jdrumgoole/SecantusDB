@@ -12,11 +12,30 @@ is compared only where the two servers run on one platform: here, always.
 
 from __future__ import annotations
 
+import re
 import sys
 from typing import Any
 
 from tests.backlog.conftest import mongo_answer
 from tests.mongod_live.conftest import same
+
+# mongod's wrong-type message lists the accepted types in an order that
+# differs between builds (this Mac's 8.2.11 and CI's Linux 8.2 disagree, and
+# 8.2.1 differed again). It is a set; compare it as one. Everything else about
+# the message, type names included, is compared exactly.
+_TYPE_LIST = re.compile(r"(expected types ')\[([^\]]*)\]")
+
+
+def _sorted_type_list(answer: Any) -> Any:
+    if isinstance(answer, tuple) and len(answer) == 3 and isinstance(answer[2], str):
+        msg = _TYPE_LIST.sub(
+            lambda m: (
+                f"{m.group(1)}[{', '.join(sorted(p.strip() for p in m.group(2).split(',')))}]"
+            ),
+            answer[2],
+        )
+        return (*answer[:2], msg)
+    return answer
 
 
 def _oplog_size(client: Any) -> tuple:
@@ -52,8 +71,8 @@ def test_resize_errors(rust_mongo: Any, mongod_rs: Any) -> None:
         {"replSetResizeOplog": 1, "foo": 1},
     ):
         same(
-            mongo_answer(lambda cmd=cmd: rust_mongo.admin.command(cmd)),
-            mongo_answer(lambda cmd=cmd: mongod_rs.admin.command(cmd)),
+            _sorted_type_list(mongo_answer(lambda cmd=cmd: rust_mongo.admin.command(cmd))),
+            _sorted_type_list(mongo_answer(lambda cmd=cmd: mongod_rs.admin.command(cmd))),
         )
 
 
