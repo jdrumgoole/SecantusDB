@@ -157,7 +157,7 @@ def test_shutdown_command_stops_the_server(tmp_path: Path) -> None:
             time.sleep(0.2)
 
 
-@pytest.mark.backlog("RM-723")
+@pytest.mark.backlog_fixed("RM-723")
 def test_store_has_mongods_files(tmp_path: Path) -> None:
     """A mongod 8.2.11 store holds `_mdb_catalog.wt`, `sizeStorer.wt`,
     `storage.bson` (with the content above) and its log in `journal/`."""

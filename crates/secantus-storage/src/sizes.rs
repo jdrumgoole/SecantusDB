@@ -27,30 +27,78 @@
 //! index's bytes (its entries), in the units the walk they replace measured
 //! (`Storage::collection_data_size`, `Storage::index_sizes`).
 //!
-//! Persistence: [`SIZE_STORER_TABLE`] holds a row per collection, written at
-//! a clean close with the committed counts, beside a marker saying the close
-//! was clean. Opening a store takes the marker away before any write, so a
-//! store that did not close cleanly has none, and its counts are made again
-//! by one walk of its tables. That is the answer a mongod replica-set member
-//! reaches after a crash (its recovery replays the oplog from the last
-//! checkpoint and adjusts the counts as it goes; measured 8.2.11: 1,300
-//! documents written, the process killed, 1,300 counted after the restart),
-//! and this server presents itself as one. A store written before the size
-//! storer existed has no marker either.
+//! Persistence is mongod's `sizeStorer` (phase 6 of
+//! `tasks/mongod-storage-model-plan.md`, measured on mongod 8.2.11): a table
+//! [`SIZE_STORER_TABLE`] (`key_format=u,value_format=u`, otherwise
+//! WiredTiger's defaults, logged), keyed by the ident's table URI as raw
+//! bytes (`table:collection-<UUID>`, `table:_mdb_catalog`, no terminator),
+//! the value the 43-byte BSON `{numRecords: Int64, dataSize: Int64}`. It has
+//! a row for every record store whose sizes ever moved -- collections, the
+//! oplog and `_mdb_catalog` itself; one created and never written has none,
+//! one emptied keeps `0, 0` -- and none for an index. A rename keeps the
+//! ident, so it keeps the row; a drop takes the row away with the ident.
+//!
+//! What mongod's size storer does not hold lives in this server's own
+//! [`PRIVATE_TABLE`], keyed the same way: each index's entry bytes, by the
+//! index's ident (mongod reports an index's size from its file instead,
+//! RM-040), and a clean-close marker. Both are written at a clean close, in
+//! one transaction. Opening a store takes the marker away before any write,
+//! so a store that did not close cleanly has none, and its counts are made
+//! again by one walk of its tables. That is the answer a mongod replica-set
+//! member reaches for a collection after a crash (its recovery replays the
+//! oplog from the last checkpoint and adjusts the counts as it goes; measured
+//! 8.2.11: 1,001 documents written, the process killed before the size
+//! storer was flushed, 1,001 counted after the restart), and this server
+//! presents itself as one. (mongod flushes the table at its checkpoints as
+//! well; this server only at a clean close, which is the only state the
+//! next open trusts.)
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use bson::{Bson, Document};
+use bson::Bson;
 use secantus_wt::Session;
 
-/// The table the counts are kept in at rest: `(db, coll) -> BSON`.
-pub(crate) const SIZE_STORER_TABLE: &str = "table:secantus_size_storer";
-pub(crate) const SIZE_STORER_CFG: &str = "key_format=SS,value_format=u";
+/// mongod's size storer: ident URI -> `{numRecords, dataSize}`.
+pub(crate) const SIZE_STORER_TABLE: &str = "table:sizeStorer";
+/// The configuration mongod 8.2.11 creates it with: raw keys and values,
+/// WiredTiger's defaults for the rest (no compressor, 4KB internal and 32KB
+/// leaf pages, no prefix compression, logged).
+pub(crate) const SIZE_STORER_CFG: &str = "key_format=u,value_format=u";
 
-/// The marker row's key: no collection has an empty database name.
-const MARKER: (&str, &str) = ("", "");
+/// This server's own sizes, beside mongod's: index ident URI -> `{size}`,
+/// and the clean-close marker.
+pub(crate) const PRIVATE_TABLE: &str = "table:secantus_size_storer";
+pub(crate) const PRIVATE_CFG: &str = "key_format=u,value_format=u";
+
+/// The marker row's key in [`PRIVATE_TABLE`]: no ident URI has this form.
+const MARKER_KEY: &[u8] = b"secantus:cleanClose";
+
+/// The ident URI of `_mdb_catalog`, as its size-storer row is keyed.
+const CATALOG_KEY: &str = crate::mdb_catalog::CATALOG_TABLE;
+
+/// A size-storer value as mongod 8.2.11 writes it: `{numRecords: Int64,
+/// dataSize: Int64}`, 43 bytes.
+pub fn size_storer_value(records: i64, data_size: i64) -> Vec<u8> {
+    let d = bson::doc! {"numRecords": records, "dataSize": data_size};
+    secantus_core::bsondoc::to_vec(&d).expect("a fixed document always encodes")
+}
+
+/// `(numRecords, dataSize)` from a size-storer value; `None` for one that is
+/// not in that form.
+fn parse_size_storer_value(bytes: &[u8]) -> Option<(i64, i64)> {
+    let d = crate::decode_doc(bytes).ok()?;
+    Some((num(d.get("numRecords")?)?, num(d.get("dataSize")?)?))
+}
+
+fn num(v: &Bson) -> Option<i64> {
+    match v {
+        Bson::Int64(n) => Some(*n),
+        Bson::Int32(n) => Some(i64::from(*n)),
+        _ => None,
+    }
+}
 
 /// One collection's sizes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -95,37 +143,6 @@ impl CollectionSizes {
         let mut out = self.clone();
         out.apply(&Delta::from_sizes(other), -1);
         out
-    }
-
-    fn to_bson(&self) -> Document {
-        let mut indexes = Document::new();
-        for (name, bytes) in &self.index_sizes {
-            indexes.insert(name.clone(), Bson::Int64(*bytes));
-        }
-        bson::doc! {
-            "numRecords": self.records,
-            "dataSize": self.data_size,
-            "idIndexSize": self.id_index_size,
-            "indexSizes": indexes,
-        }
-    }
-
-    fn from_bson(d: &Document) -> Option<CollectionSizes> {
-        let num = |v: &Bson| match v {
-            Bson::Int64(n) => Some(*n),
-            Bson::Int32(n) => Some(i64::from(*n)),
-            _ => None,
-        };
-        let mut out = CollectionSizes {
-            records: num(d.get("numRecords")?)?,
-            data_size: num(d.get("dataSize")?)?,
-            id_index_size: num(d.get("idIndexSize")?)?,
-            index_sizes: BTreeMap::new(),
-        };
-        for (name, v) in d.get_document("indexSizes").ok()? {
-            out.index_sizes.insert(name.clone(), num(v)?);
-        }
-        Some(out)
     }
 }
 
@@ -346,31 +363,38 @@ impl SizeStorer {
         self.recounts.load(Ordering::Relaxed)
     }
 
+    /// Whether `(db, coll)` has a slot: its sizes moved since the open, or
+    /// were loaded. mongod writes a size-storer row for such a record store
+    /// even when its counts are back to zero.
+    fn has_slot(&self, db: &str, coll: &str) -> bool {
+        let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        slots.get(db).is_some_and(|m| m.contains_key(coll))
+    }
+
     /// Load the counts a clean close left, taking its marker away in the
     /// same transaction so that a crash from here on is noticed at the next
     /// open. `fingerprint` is the oplog state this open recovered: a store
     /// some other build wrote since (one that kept no counts) has moved it,
-    /// and its counts are not trusted. `false` when there is nothing to
-    /// trust and the caller must count.
-    pub(crate) fn load(&self, session: &Session, fingerprint: &[i64]) -> crate::Result<bool> {
-        let cur = session.open_cursor(SIZE_STORER_TABLE, None)?;
-        cur.set_key_ss(MARKER.0, MARKER.1);
-        let mut oplog_sizes = None;
-        let trusted = match cur.search() {
+    /// and its counts are not trusted. `placements` maps each collection to
+    /// the ident its row is keyed by, and `oplog_uri` names the oplog's.
+    /// `false` when there is nothing to trust and the caller must count.
+    pub(crate) fn load(
+        &self,
+        session: &Session,
+        fingerprint: &[i64],
+        placements: &[(String, String, crate::mdb_catalog::Placement)],
+        oplog_uri: &str,
+    ) -> crate::Result<bool> {
+        let private = session.open_cursor(PRIVATE_TABLE, None)?;
+        private.set_key_u(MARKER_KEY);
+        let trusted = match private.search() {
             Ok(()) => {
-                let marker = crate::decode_doc(&cur.get_value_u()?)?;
+                let marker = crate::decode_doc(&private.get_value_u()?)?;
                 let left: Vec<i64> = marker
                     .get_array("oplog")
                     .map(|a| a.iter().filter_map(Bson::as_i64).collect())
                     .unwrap_or_default();
-                let sizes: Vec<i64> = marker
-                    .get_array("oplogSize")
-                    .map(|a| a.iter().filter_map(Bson::as_i64).collect())
-                    .unwrap_or_default();
-                if let [records, bytes] = sizes[..] {
-                    oplog_sizes = Some((records, bytes));
-                }
-                left == fingerprint && oplog_sizes.is_some()
+                left == fingerprint
             }
             Err(e) if e.is_not_found() => false,
             Err(e) => return Err(e.into()),
@@ -378,26 +402,69 @@ impl SizeStorer {
         if !trusted {
             return Ok(false);
         }
-        let mut sizes = HashMap::new();
-        cur.reset()?;
-        while cur.next()? {
-            let (db, coll) = cur.get_key_ss()?;
-            if (db.as_str(), coll.as_str()) == MARKER {
-                continue;
+        let mongods = session.open_cursor(SIZE_STORER_TABLE, None)?;
+        // `table`'s row, if it has one.
+        let row = |cur: &secantus_wt::Cursor, table: &str| -> crate::Result<Option<Vec<u8>>> {
+            cur.reset()?;
+            cur.set_key_u(table.as_bytes());
+            match cur.search() {
+                Ok(()) => Ok(Some(cur.get_value_u()?)),
+                Err(e) if e.is_not_found() => Ok(None),
+                Err(e) => Err(e.into()),
             }
-            let row = crate::decode_doc(&cur.get_value_u()?)?;
-            let Some(s) = CollectionSizes::from_bson(&row) else {
-                return Ok(false);
+        };
+        let mut sizes = HashMap::new();
+        for (db, coll, placement) in placements {
+            // A collection with no row never had a size move: it is empty.
+            let mut s = CollectionSizes::default();
+            let has_row = match row(&mongods, &placement.table())? {
+                Some(v) => {
+                    let Some((records, data_size)) = parse_size_storer_value(&v) else {
+                        return Ok(false);
+                    };
+                    s.records = records;
+                    s.data_size = data_size;
+                    true
+                }
+                None => false,
             };
-            sizes.insert((db, coll), s);
+            for (name, ident) in &placement.indexes {
+                // A clean close writes every index's row, zero or not.
+                let Some(v) = row(&private, &crate::mdb_catalog::table_uri(ident))? else {
+                    return Ok(false);
+                };
+                let Some(bytes) = crate::decode_doc(&v)
+                    .ok()
+                    .and_then(|d| d.get("size").and_then(num))
+                else {
+                    return Ok(false);
+                };
+                if name == crate::ID_INDEX_NAME {
+                    s.id_index_size = bytes;
+                } else if bytes != 0 {
+                    s.index_sizes.insert(name.clone(), bytes);
+                }
+            }
+            if has_row || !s.is_empty() {
+                sizes.insert((db.clone(), coll.clone()), s);
+            }
         }
-        drop(cur);
+        let oplog_sizes = match row(&mongods, oplog_uri)? {
+            Some(v) => match parse_size_storer_value(&v) {
+                Some(s) => s,
+                None => return Ok(false),
+            },
+            None => (0, 0),
+        };
+        drop(mongods);
+        private.reset()?;
+        drop(private);
         // The marker goes in its own committed transaction, before the store
         // takes any write: every later commit is behind it in the log and in
         // any checkpoint, so no crash can keep the marker and lose it.
         session.begin_transaction(None)?;
-        let del = session.open_cursor(SIZE_STORER_TABLE, None)?;
-        del.set_key_ss(MARKER.0, MARKER.1);
+        let del = session.open_cursor(PRIVATE_TABLE, None)?;
+        del.set_key_u(MARKER_KEY);
         if let Err(e) = del.remove() {
             rollback_after(session, "taking the clean-close marker away");
             return Err(e.into());
@@ -405,7 +472,7 @@ impl SizeStorer {
         drop(del);
         session.commit_transaction(None)?;
         self.replace_all(sizes);
-        *self.oplog.lock().unwrap_or_else(|e| e.into_inner()) = oplog_sizes;
+        *self.oplog.lock().unwrap_or_else(|e| e.into_inner()) = Some(oplog_sizes);
         Ok(true)
     }
 
@@ -452,47 +519,139 @@ impl SizeStorer {
         Ok(())
     }
 
-    /// Write the committed counts and the clean-close marker, replacing what
-    /// the table held, in one transaction.
     /// The oplog's `(entries, bytes)` that [`Self::load`] trusted, once.
     pub(crate) fn take_oplog_sizes(&self) -> Option<(i64, i64)> {
         self.oplog.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 
+    /// Write the committed counts to mongod's size storer, each index's
+    /// bytes and the clean-close marker to [`PRIVATE_TABLE`], in one
+    /// transaction. Runs at a clean close, when nothing else writes.
+    ///
+    /// A row goes in for every ident whose sizes moved (a slot), every one
+    /// that has a row already, and the oplog and `_mdb_catalog`; rows of
+    /// idents the catalog no longer names go. Sizes kept for a namespace or
+    /// an index with no ident to key them by cannot be written: the marker
+    /// is then left out, so the next open counts again rather than trust
+    /// counts that lost something.
     pub(crate) fn persist(
         &self,
         session: &Session,
         fingerprint: &[i64],
-        oplog_sizes: (i64, i64),
+        placements: &[(String, String, crate::mdb_catalog::Placement)],
+        oplog: (&str, i64, i64),
     ) -> crate::Result<()> {
-        let committed = self.committed_sizes();
+        let catalog = catalog_sizes(session)?;
+        let mut unkeyed = Vec::new();
+        {
+            let placed: HashMap<(&str, &str), &crate::mdb_catalog::Placement> = placements
+                .iter()
+                .map(|(db, coll, p)| ((db.as_str(), coll.as_str()), p))
+                .collect();
+            for (db, coll, sizes) in self.committed_sizes() {
+                match placed.get(&(db.as_str(), coll.as_str())) {
+                    None => unkeyed.push(format!("{db}.{coll}")),
+                    Some(p) => {
+                        if sizes.id_index_size != 0 && !p.indexes.contains_key(crate::ID_INDEX_NAME)
+                        {
+                            unkeyed.push(format!("{db}.{coll} index {}", crate::ID_INDEX_NAME));
+                        }
+                        for name in sizes.index_sizes.keys() {
+                            if !p.indexes.contains_key(name) {
+                                unkeyed.push(format!("{db}.{coll} index {name}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !unkeyed.is_empty() {
+            eprintln!(
+                "secantus-storage: sizes kept for {} have no ident to be saved under; \
+                 the next open counts the store again",
+                unkeyed.join(", ")
+            );
+        }
         session.begin_transaction(None)?;
         let written = (|| -> crate::Result<()> {
-            let cur = session.open_cursor(SIZE_STORER_TABLE, None)?;
-            let mut stale = Vec::new();
-            while cur.next()? {
-                stale.push(cur.get_key_ss()?);
-            }
-            for (db, coll) in stale {
-                cur.reset()?;
-                cur.set_key_ss(&db, &coll);
-                cur.remove()?;
-            }
-            for (db, coll, sizes) in &committed {
-                cur.reset()?;
-                cur.set_key_ss(db, coll);
-                cur.set_value_u(&crate::encode_doc(&sizes.to_bson())?);
-                cur.insert()?;
-            }
-            let marker = bson::doc! {
-                "clean": true,
-                "oplog": fingerprint.iter().map(|n| Bson::Int64(*n)).collect::<Vec<_>>(),
-                "oplogSize": [Bson::Int64(oplog_sizes.0), Bson::Int64(oplog_sizes.1)],
+            let mongods = session.open_cursor(SIZE_STORER_TABLE, None)?;
+            let had: std::collections::HashSet<Vec<u8>> = {
+                let mut had = std::collections::HashSet::new();
+                while mongods.next()? {
+                    had.insert(mongods.get_key_u()?);
+                }
+                had
             };
-            cur.reset()?;
-            cur.set_key_ss(MARKER.0, MARKER.1);
-            cur.set_value_u(&crate::encode_doc(&marker)?);
-            cur.insert()?;
+            let mut rows: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+            let mut private_rows: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+            for (db, coll, p) in placements {
+                let key = p.table().into_bytes();
+                let committed = self.committed_of(db, coll);
+                if self.has_slot(db, coll) || had.contains(&key) || !committed.is_empty() {
+                    rows.insert(
+                        key,
+                        size_storer_value(committed.records, committed.data_size),
+                    );
+                }
+                for (name, ident) in &p.indexes {
+                    let bytes = if name == crate::ID_INDEX_NAME {
+                        committed.id_index_size
+                    } else {
+                        committed.index_sizes.get(name).copied().unwrap_or(0)
+                    };
+                    private_rows.insert(
+                        crate::mdb_catalog::table_uri(ident).into_bytes(),
+                        crate::encode_doc(&bson::doc! {"size": bytes})?,
+                    );
+                }
+            }
+            let (oplog_uri, oplog_records, oplog_bytes) = oplog;
+            rows.insert(
+                oplog_uri.as_bytes().to_vec(),
+                size_storer_value(oplog_records, oplog_bytes),
+            );
+            rows.insert(
+                CATALOG_KEY.as_bytes().to_vec(),
+                size_storer_value(catalog.0, catalog.1),
+            );
+            for key in had.iter().filter(|k| !rows.contains_key(*k)) {
+                mongods.reset()?;
+                mongods.set_key_u(key);
+                mongods.remove()?;
+            }
+            for (key, value) in &rows {
+                mongods.reset()?;
+                mongods.set_key_u(key);
+                mongods.set_value_u(value);
+                mongods.insert()?;
+            }
+            drop(mongods);
+            let private = session.open_cursor(PRIVATE_TABLE, None)?;
+            let mut stale = Vec::new();
+            while private.next()? {
+                stale.push(private.get_key_u()?);
+            }
+            for key in stale {
+                private.reset()?;
+                private.set_key_u(&key);
+                private.remove()?;
+            }
+            for (key, value) in &private_rows {
+                private.reset()?;
+                private.set_key_u(key);
+                private.set_value_u(value);
+                private.insert()?;
+            }
+            if unkeyed.is_empty() {
+                let marker = bson::doc! {
+                    "clean": true,
+                    "oplog": fingerprint.iter().map(|n| Bson::Int64(*n)).collect::<Vec<_>>(),
+                };
+                private.reset()?;
+                private.set_key_u(MARKER_KEY);
+                private.set_value_u(&crate::encode_doc(&marker)?);
+                private.insert()?;
+            }
             Ok(())
         })();
         match written {
@@ -503,6 +662,19 @@ impl SizeStorer {
             }
         }
     }
+}
+
+/// `_mdb_catalog`'s own `(records, bytes)`, for its size-storer row: mongod
+/// keeps the catalog's counts like any record store's. Read at a clean close;
+/// the catalog holds a row per collection.
+fn catalog_sizes(session: &Session) -> crate::Result<(i64, i64)> {
+    let cur = session.open_cursor(CATALOG_KEY, None)?;
+    let (mut records, mut bytes) = (0i64, 0i64);
+    while cur.next()? {
+        records += 1;
+        bytes += cur.with_value_u(|v| v.len() as i64)?;
+    }
+    Ok((records, bytes))
 }
 
 /// Roll back a transaction a failed `what` leaves open. The failure is what
@@ -533,14 +705,20 @@ mod tests {
     }
 
     #[test]
-    fn sizes_round_trip_through_bson() {
-        let mut s = CollectionSizes {
-            records: 7,
-            data_size: 700,
-            id_index_size: 21,
-            index_sizes: BTreeMap::new(),
-        };
-        s.index_sizes.insert("a_1".into(), 99);
-        assert_eq!(CollectionSizes::from_bson(&s.to_bson()), Some(s));
+    fn a_size_storer_value_is_mongods() {
+        // mongod 8.2.11's row for a collection of 3 documents, 69 bytes
+        // (measured, phase 6): `{numRecords: NumberLong(3), dataSize:
+        // NumberLong(69)}`.
+        let measured = "2b000000126e756d5265636f726473000300000000000000\
+                        126461746153697a6500450000000000000000";
+        let hex: String = size_storer_value(3, 69)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(hex, measured);
+        assert_eq!(
+            parse_size_storer_value(&size_storer_value(3, 69)),
+            Some((3, 69))
+        );
     }
 }

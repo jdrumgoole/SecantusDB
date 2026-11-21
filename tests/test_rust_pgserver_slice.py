@@ -21510,3 +21510,44 @@ def test_a_limit_over_a_join_with_a_joined_right_side_stops_early(tmp_path: Path
         assert len(rows) == 7
         # Bounded rows built: tens of megabytes at most, never gigabytes.
         assert rss_kb() - before < 512 * 1024
+
+
+def test_relation_filepath_names_each_relations_own_file(home: Path) -> None:
+    """`pg_relation_filepath` gives a relation's file, relative to the data
+    directory, as PostgreSQL 15.19 does (`base/5/1438623` for a table there;
+    here, as decided for RP-112, the WiredTiger file: mongod's
+    `collection-<UUID>.wt` for a table, `index-<UUID>.wt` for an index, the
+    primary key's included). Its argument is a `regclass`, so an index's or
+    a sequence's name resolves as a table's does; a view has no file (NULL),
+    a missing name is 42P01 and an unused oid is NULL, as in PostgreSQL.
+    (Storage-model plan, phase 6: the primary key answered NULL, and an
+    index's or sequence's name was 42P01.)"""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE fp (id int PRIMARY KEY, name text)")
+        cur.execute("CREATE INDEX fp_name ON fp (name)")
+        cur.execute("CREATE SEQUENCE fp_seq")
+        cur.execute("CREATE VIEW fp_v AS SELECT 1")
+        by_name = {}
+        for rel in ("fp", "fp_pkey", "fp_name", "fp_seq", "fp_v"):
+            cur.execute("SELECT pg_relation_filepath(%s)", (rel,))
+            by_name[rel] = cur.fetchone()[0]
+        cur.execute(
+            "SELECT relname, pg_relation_filepath(oid) FROM pg_class"
+            " WHERE relname IN ('fp', 'fp_pkey', 'fp_name', 'fp_seq', 'fp_v')"
+        )
+        by_oid = dict(cur.fetchall())
+        cur.execute("SELECT pg_relation_filepath(1)")
+        unused = cur.fetchone()[0]
+        with pytest.raises(psycopg.errors.UndefinedTable):
+            cur.execute("SELECT pg_relation_filepath('fp_missing')")
+    assert by_oid == by_name
+    assert by_name["fp_v"] is None
+    assert unused is None
+    assert by_name["fp"].startswith("collection-")
+    assert by_name["fp_pkey"].startswith("index-")
+    assert by_name["fp_name"].startswith("index-")
+    assert len({by_name["fp"], by_name["fp_pkey"], by_name["fp_name"]}) == 3
+    for rel in ("fp", "fp_pkey", "fp_name", "fp_seq"):
+        assert by_name[rel].endswith(".wt"), by_name
+        assert (home / by_name[rel]).is_file(), by_name[rel]

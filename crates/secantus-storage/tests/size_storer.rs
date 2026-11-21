@@ -456,3 +456,212 @@ fn reading_the_counts_walks_nothing() {
         assert_eq!(secantus_storage::collection_walks(), walks);
     });
 }
+
+/// The ident URI the size storer keys `(db, coll)`'s row by.
+fn ident_key(st: &Storage, db: &str, coll: &str) -> Vec<u8> {
+    st.collection_table_name(db, coll)
+        .unwrap()
+        .unwrap()
+        .into_bytes()
+}
+
+fn size_storer_rows(st: &Storage) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+    st.raw_table_rows("table:sizeStorer")
+        .unwrap()
+        .into_iter()
+        .collect()
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// The sizes are kept at rest as mongod 8.2.11 keeps them (measured, phase 6
+/// of the storage-model plan): `table:sizeStorer`, created `key_format=u,
+/// value_format=u` with WiredTiger's defaults otherwise, keyed by the ident's
+/// table URI as raw bytes, the value `{numRecords: Int64, dataSize: Int64}`.
+/// A row for each record store whose sizes moved (an emptied collection
+/// keeps `0, 0`; one never written has none), the oplog's and
+/// `_mdb_catalog`'s; none for an index.
+#[test]
+fn the_size_storer_is_mongods() {
+    let home = temp_home();
+    let st = durable(&home);
+    // mongod's measured `app.a` and `app.b`: 3 documents of 69 bytes, 2 of 28.
+    let docs: Vec<Vec<u8>> = (0..3)
+        .map(|i| enc(&doc! {"_id": i, "x": "a".repeat(i as usize)}))
+        .collect();
+    st.insert("app", "a", docs, true).unwrap();
+    st.create_index("app", "a", "x_1", &doc! {"x": 1}, &Document::new())
+        .unwrap();
+    let docs: Vec<Vec<u8>> = (0..2).map(|i| enc(&doc! {"_id": i})).collect();
+    st.insert("app", "b", docs, true).unwrap();
+    st.create_collection("app", "e").unwrap();
+    st.insert_one("app", "f", &enc(&doc! {"_id": 1})).unwrap();
+    st.delete_matching("app", "f", &doc! {}, 0, &Document::new(), None)
+        .unwrap();
+    st.close().unwrap();
+    drop(st);
+
+    let st = durable(&home);
+    let rows = size_storer_rows(&st);
+    // mongod's own row for `app.a`, byte for byte.
+    assert_eq!(
+        hex(&rows[&ident_key(&st, "app", "a")]),
+        "2b000000126e756d5265636f726473000300000000000000\
+         126461746153697a6500450000000000000000"
+    );
+    assert_eq!(
+        rows[&ident_key(&st, "app", "b")],
+        secantus_storage::size_storer_value(2, 28)
+    );
+    assert_eq!(
+        rows[&ident_key(&st, "app", "f")],
+        secantus_storage::size_storer_value(0, 0)
+    );
+    assert!(!rows.contains_key(&ident_key(&st, "app", "e")));
+    assert!(rows.contains_key(b"table:_mdb_catalog".as_slice()));
+    let oplog = st.mdb_catalog_entry("local", "oplog.rs").unwrap().unwrap();
+    let oplog_key = format!("table:{}", oplog.get_str("ident").unwrap());
+    assert!(rows.contains_key(oplog_key.as_bytes()));
+    for key in rows.keys() {
+        let key = std::str::from_utf8(key).unwrap();
+        assert!(
+            key == "table:_mdb_catalog" || key.starts_with("table:collection-"),
+            "a size-storer row keyed {key:?}"
+        );
+    }
+    let cfg = st.table_file_config("table:sizeStorer").unwrap().unwrap();
+    for part in [
+        "allocation_size=4KB",
+        "app_metadata=,",
+        "block_compressor=,",
+        "checksum=on",
+        "internal_page_max=4KB",
+        "key_format=u",
+        "leaf_page_max=32KB",
+        "leaf_value_max=0",
+        "log=(enabled=true)",
+        "prefix_compression=false",
+        "split_pct=90",
+        "value_format=u",
+    ] {
+        assert!(cfg.contains(part), "{part} not in {cfg}");
+    }
+    assert_eq!(st.size_recounts(), 0);
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A rename keeps the collection's ident, so its size-storer row stays
+/// where it was, as mongod's does (measured 8.2.11: `app.a` renamed to
+/// `app.a2` kept its row, unchanged); a drop takes the row away with the
+/// ident.
+#[test]
+fn a_rename_keeps_the_row_and_a_drop_removes_it() {
+    let home = temp_home();
+    let st = durable(&home);
+    let docs: Vec<Vec<u8>> = (0..5).map(|i| enc(&doc! {"_id": i})).collect();
+    st.insert("app", "a", docs, true).unwrap();
+    st.insert_one("app", "gone", &enc(&doc! {"_id": 1}))
+        .unwrap();
+    st.close().unwrap();
+    drop(st);
+
+    let st = durable(&home);
+    let key = ident_key(&st, "app", "a");
+    let gone = ident_key(&st, "app", "gone");
+    let before = size_storer_rows(&st);
+    st.rename_collection("app", "a", "app", "a2", false)
+        .unwrap();
+    st.drop_collection("app", "gone").unwrap();
+    assert_eq!(ident_key(&st, "app", "a2"), key);
+    st.close().unwrap();
+    drop(st);
+
+    let st = durable(&home);
+    let after = size_storer_rows(&st);
+    assert_eq!(after[&key], before[&key]);
+    assert_eq!(after[&key], secantus_storage::size_storer_value(5, 5 * 14));
+    assert!(!after.contains_key(&gone));
+    assert_eq!(st.size_recounts(), 0);
+    assert_eq!(kept(&st, "app", "a2").records, 5);
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A process killed with SIGKILL after a clean close, with writes since:
+/// the next open finds no clean-close marker, walks the store once, and
+/// counts what the store holds -- the size storer's rows from the earlier
+/// close (5 documents) are not believed.
+#[test]
+fn a_killed_process_is_recounted_at_open() {
+    const CHILD: &str = "SECANTUS_SIZES_KILL_CHILD";
+    if let Ok(home) = std::env::var(CHILD) {
+        let st = durable(std::path::Path::new(&home));
+        let docs: Vec<Vec<u8>> = (100..400)
+            .map(|i| enc(&doc! {"_id": i, "p": "x".repeat(20)}))
+            .collect();
+        st.insert("app", "c", docs, true).unwrap();
+        st.create_index("app", "c", "p_1", &doc! {"p": 1}, &Document::new())
+            .unwrap();
+        st.delete_matching(
+            "app",
+            "c",
+            &doc! {"_id": {"$lt": 150}},
+            0,
+            &Document::new(),
+            None,
+        )
+        .unwrap();
+        st.checkpoint_now().unwrap();
+        // SIGKILL: no destructor, no close, no flush.
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &std::process::id().to_string()])
+            .status();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+    let home = temp_home();
+    {
+        let st = durable(&home);
+        let docs: Vec<Vec<u8>> = (0..5).map(|i| enc(&doc! {"_id": i})).collect();
+        st.insert("app", "c", docs, true).unwrap();
+        st.close().unwrap();
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_killed_process_is_recounted_at_open",
+            "--test-threads=1",
+        ])
+        .env(CHILD, home.to_str().unwrap())
+        .status()
+        .unwrap();
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "the child was not killed: {status:?}"
+        );
+    }
+    let st = durable(&home);
+    assert_eq!(st.size_recounts(), 1, "the kill was not noticed");
+    let sizes = kept(&st, "app", "c");
+    assert_eq!(sizes.records, 250);
+    assert!(sizes.index_sizes.contains_key("p_1"), "{sizes:?}");
+    // The next clean close writes the walked counts in mongod's form.
+    st.close().unwrap();
+    drop(st);
+    let st = durable(&home);
+    assert_eq!(st.size_recounts(), 0);
+    let rows = size_storer_rows(&st);
+    assert_eq!(
+        rows[&ident_key(&st, "app", "c")],
+        secantus_storage::size_storer_value(250, sizes.data_size)
+    );
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}

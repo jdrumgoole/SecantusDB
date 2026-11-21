@@ -3064,7 +3064,7 @@ produce the dump it exists for.
       close one by one as they land (files and catalog: phases 1-2; one
       table per collection and index: 3-4; both opens: 7).
       Backlog-ID: RM-723
-      Verify: tests/backlog/test_rm_storage_model.py::test_store_has_mongods_files, tests/backlog/test_rm_storage_model.py::test_mongod_opens_a_secantus_store, tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_mongod_store
+      Verify: tests/backlog/test_rm_storage_model.py::test_mongod_opens_a_secantus_store, tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_mongod_store
 - [ ] **There is no `shutdown` command.** mongod 8.2.11 stops on
       `db.adminCommand({shutdown: 1})`: the connection closes and the
       process exits cleanly. `secantusd-mdb` answers CommandNotFound (59)
