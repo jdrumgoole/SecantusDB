@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bson::{Bson, Document};
+use secantus_commands::storage::RecordId;
 use secantus_commands::storage::{
     ChangeStreamBatch, ChangeStreamOptions, ChangeStreamScope, Collation, DuplicateKey, IdKeyRows,
     MatchedRows, RawHint, ResumeTokenInfo, Storage as CmdStorage, StorageError, UpdateOutcome,
@@ -986,7 +987,7 @@ impl CmdStorage for StorageAdapter {
         db: &str,
         coll: &str,
         cap: usize,
-    ) -> Result<Option<Vec<(i64, Vec<u8>)>>, StorageError> {
+    ) -> Result<Option<Vec<(RecordId, Vec<u8>)>>, StorageError> {
         self.inner
             .collection_at_most(db, coll, cap)
             .map(|rows| {
@@ -1031,11 +1032,11 @@ impl CmdStorage for StorageAdapter {
             .map_err(map_err)
     }
 
-    fn with_candidate_order(&self, order: Vec<i64>, f: &mut dyn FnMut()) {
+    fn with_candidate_order(&self, order: Vec<RecordId>, f: &mut dyn FnMut()) {
         secantus_storage::with_candidate_order(order, f)
     }
 
-    fn with_matched_rows(&self, rows: Vec<(i64, Vec<u8>)>, f: &mut dyn FnMut()) {
+    fn with_matched_rows(&self, rows: Vec<(RecordId, Vec<u8>)>, f: &mut dyn FnMut()) {
         secantus_storage::with_matched_rows(rows, f)
     }
 
@@ -1680,7 +1681,7 @@ impl CmdStorage for StorageAdapter {
         &self,
         db: &str,
         coll: &str,
-        after: Option<i64>,
+        after: Option<RecordId>,
         max: usize,
         backward: bool,
     ) -> Result<Option<secantus_commands::storage::Records>, StorageError> {
@@ -1696,7 +1697,7 @@ impl CmdStorage for StorageAdapter {
         &self,
         db: &str,
         coll: &str,
-        recordids: &[i64],
+        recordids: &[RecordId],
     ) -> Result<Option<Vec<Option<Vec<u8>>>>, StorageError> {
         let rows = self
             .inner
@@ -1713,7 +1714,7 @@ impl CmdStorage for StorageAdapter {
         coll: &str,
         name: &str,
         from: secantus_commands::storage::IndexFrom<'_>,
-        after: Option<i64>,
+        after: Option<RecordId>,
         max: usize,
         backward: bool,
     ) -> Result<Option<secantus_commands::storage::IndexEntries>, StorageError> {
@@ -1756,7 +1757,7 @@ impl CmdStorage for StorageAdapter {
         db: &str,
         coll: &str,
         docs: &[&[u8]],
-    ) -> Result<Option<Vec<Option<i64>>>, StorageError> {
+    ) -> Result<Option<Vec<Option<RecordId>>>, StorageError> {
         self.inner
             .record_ids_of(db, coll, docs)
             .map(Some)

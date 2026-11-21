@@ -29,6 +29,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::recordid::RecordId;
 use bson::{Bson, Document};
 
 /// `kSortedFileBufferSize`.
@@ -97,7 +98,7 @@ pub(crate) fn write_index_key_member(
     index_key: &[Bson],
     index_id: u32,
     snapshot_id: u64,
-    rid: i64,
+    rid: &RecordId,
     out: &mut Vec<u8>,
 ) -> R<()> {
     /// `WorkingSetMember::RID_AND_IDX`.
@@ -116,11 +117,29 @@ pub(crate) fn write_index_key_member(
     finish_doc(out, start)?;
     out.extend_from_slice(&index_id.to_le_bytes());
     out.extend_from_slice(&snapshot_id.to_le_bytes());
-    // `RecordIdFormat::Long`.
-    out.push(0);
-    out.extend_from_slice(&rid.to_le_bytes());
+    write_record_id(rid, out);
     out.push(0);
     Ok(())
+}
+
+/// A RecordId as a working-set member holds it: its format (`Long`, `0`: the
+/// eight bytes; a clustered collection's key bytes, `1`: their length as four
+/// bytes, then them). The sizes are mongod 8.2.11's: a sort that spills
+/// `showRecordId` documents of a clustered collection reports 7 bytes of
+/// RecordId for an `_id` of two key bytes where an ordinary one reports 9
+/// (`spilledBytes`, `tests/mongod_live/test_clustered_collections.py`).
+fn write_record_id(rid: &RecordId, out: &mut Vec<u8>) {
+    match rid {
+        RecordId::Long(n) => {
+            out.push(0);
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+        RecordId::Bytes(b) => {
+            out.push(1);
+            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            out.extend_from_slice(b);
+        }
+    }
 }
 
 /// `WorkingSetMember::OWNED_OBJ`.
@@ -154,15 +173,13 @@ const RID_AND_OBJ: u8 = 2;
 pub(crate) fn write_rid_and_obj_member(
     doc: &Document,
     snapshot_id: u64,
-    rid: i64,
+    rid: &RecordId,
     out: &mut Vec<u8>,
 ) -> R<()> {
     out.push(RID_AND_OBJ);
     out.extend_from_slice(&snapshot_id.to_le_bytes());
     write_document(doc, out)?;
-    // `RecordIdFormat::Long`.
-    out.push(0);
-    out.extend_from_slice(&rid.to_le_bytes());
+    write_record_id(rid, out);
     out.push(0);
     Ok(())
 }
@@ -180,10 +197,16 @@ pub(crate) fn read_member(at: &mut Cursor) -> R<Vec<u8>> {
     let mut bson = Vec::new();
     document_to_bson(at, &mut bson)?;
     if state == RID_AND_OBJ {
-        if at.byte()? != 0 {
-            return Err(corrupt("a RecordId not of the long format"));
+        match at.byte()? {
+            0 => {
+                at.take(8)?;
+            }
+            1 => {
+                let n = at.len()?;
+                at.take(n)?;
+            }
+            _ => return Err(corrupt("a RecordId of no format")),
         }
-        at.take(8)?;
     }
     if at.byte()? != 0 {
         return Err(corrupt("a working-set member with metadata"));

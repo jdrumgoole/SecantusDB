@@ -13,6 +13,7 @@
 //! `delete_matching` / `count_matching`).
 
 use bson::{Bson, Document};
+pub use secantus_core::recordid::RecordId;
 pub use secantus_core::spill_table::SpillTables;
 // Re-exported so trait implementors (the WT adapter) can name the collation type
 // without a direct `secantus-core` dependency.
@@ -30,7 +31,7 @@ pub type RawHint<'a> = &'a Bson;
 pub struct Pulled {
     /// The rows the read matched, in its order, each with the bytes it
     /// matched it as.
-    pub rows: Vec<(i64, Vec<u8>)>,
+    pub rows: Vec<(RecordId, Vec<u8>)>,
     /// The statement's yields (`secantus_core::deadline::yields`) when each
     /// row was read, beside `rows`.
     pub yields: Vec<i64>,
@@ -47,7 +48,7 @@ pub struct Pulled {
 #[derive(Debug, Default)]
 pub struct MatchedRows {
     /// `(RecordId, document)`.
-    pub rows: Vec<(i64, Vec<u8>)>,
+    pub rows: Vec<(RecordId, Vec<u8>)>,
     /// The one index whose entries gave the rows their order; `None` when
     /// they are in insertion order.
     pub via: Option<String>,
@@ -114,7 +115,7 @@ pub enum IndexFrom<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexEntry {
     pub raw: Vec<u8>,
-    pub rid: i64,
+    pub rid: RecordId,
     pub resume: Vec<u8>,
 }
 
@@ -122,7 +123,7 @@ pub struct IndexEntry {
 pub type IndexEntries = Vec<IndexEntry>;
 
 /// A collection's documents as `(RecordId, BSON)`, in RecordId order.
-pub type Records = Vec<(i64, Vec<u8>)>;
+pub type Records = Vec<(RecordId, Vec<u8>)>;
 
 /// A collection's record count and sizes as mongod keeps them in its size
 /// storer, current with every write (uncommitted ones included) rather than
@@ -902,7 +903,7 @@ pub trait Storage: Send + Sync {
         _db: &str,
         _coll: &str,
         _cap: usize,
-    ) -> Result<Option<Vec<(i64, Vec<u8>)>>, StorageError> {
+    ) -> Result<Option<Vec<(RecordId, Vec<u8>)>>, StorageError> {
         Ok(None)
     }
 
@@ -942,7 +943,7 @@ pub trait Storage: Send + Sync {
 
     /// Run `f` with the write it makes testing the rows `order` names, in
     /// that order, in place of the candidates the store would pick.
-    fn with_candidate_order(&self, _order: Vec<i64>, f: &mut dyn FnMut()) {
+    fn with_candidate_order(&self, _order: Vec<RecordId>, f: &mut dyn FnMut()) {
         f()
     }
 
@@ -950,7 +951,7 @@ pub trait Storage: Send + Sync {
     /// its filter as the bytes given, so a candidate it reads as those
     /// bytes is not tested again: mongod tests a write's filter once per
     /// document (RM-391). Default: every candidate is tested.
-    fn with_matched_rows(&self, _rows: Vec<(i64, Vec<u8>)>, f: &mut dyn FnMut()) {
+    fn with_matched_rows(&self, _rows: Vec<(RecordId, Vec<u8>)>, f: &mut dyn FnMut()) {
         f()
     }
 
@@ -1521,7 +1522,7 @@ pub trait Storage: Send + Sync {
         &self,
         _db: &str,
         _coll: &str,
-        _after: Option<i64>,
+        _after: Option<RecordId>,
         _max: usize,
         _backward: bool,
     ) -> Result<Option<Records>, StorageError> {
@@ -1535,7 +1536,7 @@ pub trait Storage: Send + Sync {
         &self,
         _db: &str,
         _coll: &str,
-        _recordids: &[i64],
+        _recordids: &[RecordId],
     ) -> Result<Option<Vec<Option<Vec<u8>>>>, StorageError> {
         Ok(None)
     }
@@ -1553,7 +1554,7 @@ pub trait Storage: Send + Sync {
         _coll: &str,
         _name: &str,
         _from: IndexFrom<'_>,
-        _after: Option<i64>,
+        _after: Option<RecordId>,
         _max: usize,
         _backward: bool,
     ) -> Result<Option<IndexEntries>, StorageError> {
@@ -1582,7 +1583,7 @@ pub trait Storage: Send + Sync {
         _db: &str,
         _coll: &str,
         _docs: &[&[u8]],
-    ) -> Result<Option<Vec<Option<i64>>>, StorageError> {
+    ) -> Result<Option<Vec<Option<RecordId>>>, StorageError> {
         Ok(None)
     }
 

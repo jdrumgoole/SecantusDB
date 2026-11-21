@@ -704,6 +704,7 @@ impl plan::Whole for Held<'_> {
             collation: self.collation,
             reach: None,
             total: Some(docs.len()),
+            clustered: exec::is_clustered(self.storage, &self.t.db, &self.t.coll),
         })
     }
 }
@@ -2250,6 +2251,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             returns,
             known: None,
             query: Some(&s.filter),
+            clustered: exec::is_clustered(storage, &t.db, &t.coll),
         };
         let mut run = exec::run(&plan, &env);
         // The winner's stages are the ones the trial worked: what they

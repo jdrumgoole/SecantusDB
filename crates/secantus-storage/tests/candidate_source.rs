@@ -18,7 +18,7 @@ fn temp_home() -> PathBuf {
     dir
 }
 
-fn seeded(home: &std::path::Path, n: i64) -> (Storage, Vec<(i64, Vec<u8>)>) {
+fn seeded(home: &std::path::Path, n: i64) -> (Storage, Vec<(secantus_storage::RecordId, Vec<u8>)>) {
     let st = Storage::open(home.to_str().unwrap()).unwrap();
     let docs: Vec<Vec<u8>> = (0..n)
         .map(|i| bson::to_vec(&doc! {"_id": i, "n": 0}).unwrap())
@@ -33,7 +33,7 @@ fn seeded(home: &std::path::Path, n: i64) -> (Storage, Vec<(i64, Vec<u8>)>) {
 /// A source over `rows` that hands out `want` at a time and stops after
 /// `pulls` pulls, recording each `want` it was asked for.
 fn source(
-    rows: Vec<(i64, Vec<u8>)>,
+    rows: Vec<(secantus_storage::RecordId, Vec<u8>)>,
     pulls: usize,
     asked: &RefCell<Vec<usize>>,
 ) -> impl FnMut(usize, usize, bool) -> Pulled + '_ {

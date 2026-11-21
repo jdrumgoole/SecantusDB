@@ -22,7 +22,7 @@ fn temp_home() -> PathBuf {
 }
 
 /// Three documents, and the first row as it is stored.
-fn seeded(home: &std::path::Path) -> (Storage, (i64, Vec<u8>)) {
+fn seeded(home: &std::path::Path) -> (Storage, (secantus_storage::RecordId, Vec<u8>)) {
     let st = Storage::open(home.to_str().unwrap()).unwrap();
     let docs: Vec<Vec<u8>> = (0..3)
         .map(|i| bson::to_vec(&doc! {"_id": i, "n": 0}).unwrap())

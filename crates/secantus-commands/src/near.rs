@@ -5,7 +5,7 @@
 //! the query's distance bounds. mongod also SORTS them, nearest first, and
 //! refuses the query when no geo index on the field could be read for it.
 
-use crate::storage::{Storage, StorageError};
+use crate::storage::{RecordId, Storage, StorageError};
 use bson::{Bson, Document};
 use secantus_core::fallback::Fallback;
 use secantus_core::geoshape::{near_condition, Near};
@@ -261,8 +261,8 @@ impl Found {
 
     /// `rows` nearest first. Documents at one distance keep the order given,
     /// points ahead of lines and polygons.
-    pub(crate) fn nearest_first(&self, rows: Vec<(i64, Vec<u8>)>) -> Vec<(i64, Vec<u8>)> {
-        let mut keyed: Vec<(f64, bool, (i64, Vec<u8>))> = rows
+    pub(crate) fn nearest_first(&self, rows: Vec<(RecordId, Vec<u8>)>) -> Vec<(RecordId, Vec<u8>)> {
+        let mut keyed: Vec<(f64, bool, (RecordId, Vec<u8>))> = rows
             .into_iter()
             .map(|row| {
                 let value = bson::RawDocument::from_bytes(&row.1)

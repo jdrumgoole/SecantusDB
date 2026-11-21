@@ -879,12 +879,12 @@ pub(crate) fn rewrite_sort_metadata(
 /// Give each of `docs` its record id and index key, where known.
 pub(crate) fn attach(
     docs: &mut [Document],
-    record_ids: Option<&[Option<i64>]>,
+    record_ids: Option<&[Option<crate::storage::RecordId>]>,
     index_keys: Option<&[Document]>,
 ) {
     for (i, doc) in docs.iter_mut().enumerate() {
-        if let Some(Some(rid)) = record_ids.map(|r| r[i]) {
-            doc.insert(RECORD_ID, Bson::Int64(rid));
+        if let Some(Some(rid)) = record_ids.map(|r| &r[i]) {
+            doc.insert(RECORD_ID, rid.to_bson());
         }
         if let Some(key) = index_keys.map(|k| &k[i]) {
             doc.insert(INDEX_KEY, Bson::Document(key.clone()));

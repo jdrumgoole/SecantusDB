@@ -46,6 +46,7 @@ pub mod oid;
 pub mod projection;
 pub mod query;
 pub mod rawstr;
+pub mod recordid;
 pub mod s2legacy;
 pub mod sbe;
 mod snappy;

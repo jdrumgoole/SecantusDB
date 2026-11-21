@@ -40,6 +40,27 @@ pub const COLLECTION_TABLE_CFG: &str = "type=file,memory_page_max=10m,split_pct=
      leaf_value_max=64MB,checksum=on,block_compressor=snappy,key_format=q,\
      value_format=u,app_metadata=(formatVersion=1)";
 
+/// A clustered collection's table (a time-series collection's buckets,
+/// `config.system.preimages`, one made with `clusteredIndex`): the same, with
+/// `key_format=u`, because the RecordId is the KeyString of `_id`, and, for
+/// the buckets of a time-series collection, zstd where a collection has
+/// snappy (measured on mongod 8.2.11, phase 0b).
+pub fn clustered_collection_table_cfg(buckets: bool) -> String {
+    let cfg = COLLECTION_TABLE_CFG.replace("key_format=q", "key_format=u");
+    if buckets {
+        cfg.replace("block_compressor=snappy", "block_compressor=zstd")
+    } else {
+        cfg
+    }
+}
+
+/// Whether `coll` is the bucket collection of a time-series collection:
+/// mongod's `isTimeseriesBucketsCollection`, a name that begins
+/// `system.buckets.`.
+pub fn is_buckets_collection(coll: &str) -> bool {
+    coll.starts_with("system.buckets.")
+}
+
 /// The configuration mongod 8.2.11 creates an index's table with (phase 0b):
 /// `key_format=u,value_format=u` (the KeyString and RecordId are the key, the
 /// TypeBits the value), no block compressor, prefix compression, 16k pages,
@@ -91,6 +112,9 @@ pub struct Placement {
     pub ident: String,
     pub catalog_id: i64,
     pub indexes: BTreeMap<String, String>,
+    /// The collection is clustered: its table is keyed by the KeyString of
+    /// `_id` (`key_format=u`) and it has no `_id_` table.
+    pub clustered: bool,
 }
 
 impl Placement {
@@ -108,7 +132,11 @@ impl Placement {
         for (name, ident) in &self.indexes {
             indexes.insert(name.clone(), ident.clone());
         }
-        doc! {"ident": &self.ident, "catalogId": self.catalog_id, "indexes": indexes}
+        let mut d = doc! {"ident": &self.ident, "catalogId": self.catalog_id, "indexes": indexes};
+        if self.clustered {
+            d.insert("clustered", true);
+        }
+        d
     }
 
     fn from_doc(d: &Document) -> Option<Placement> {
@@ -122,6 +150,7 @@ impl Placement {
             ident: d.get_str("ident").ok()?.to_string(),
             catalog_id: d.get_i64("catalogId").ok()?,
             indexes,
+            clustered: d.get_bool("clustered").unwrap_or(false),
         })
     }
 }

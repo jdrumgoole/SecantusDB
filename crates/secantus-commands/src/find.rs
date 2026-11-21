@@ -28,7 +28,7 @@ use bson::{doc, Bson, Document};
 
 use crate::argtypes;
 use crate::cursors::{CursorProducer, CursorRegistry, TailableOptions};
-use crate::storage::Storage;
+use crate::storage::{RecordId, Storage};
 use crate::util::{
     as_i64, bool_field, coll_arg, command_error, doc_field, docs_to_bson, encode_docs_ref,
 };
@@ -1131,7 +1131,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let wants_index_key = uses("indexKey", crate::agg_meta::INDEX_KEY);
     // Each document's RecordId, as the store numbers its records (per
     // collection from 1, as mongod does); `None` when the store cannot say.
-    let record_ids: Option<Vec<Option<i64>>> = if wants_record_id {
+    let record_ids: Option<Vec<Option<crate::storage::RecordId>>> = if wants_record_id {
         let refs: Vec<&[u8]> = docs.iter().map(Vec::as_slice).collect();
         storage
             .record_ids_of(&ctx.db_name, &coll, &refs)
@@ -1198,7 +1198,10 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         for (i, out) in projected.iter_mut().enumerate() {
             for (field, meta) in &metas {
                 let value = match *meta {
-                    "recordId" => record_ids.as_ref().and_then(|r| r[i]).map(Bson::Int64),
+                    "recordId" => record_ids
+                        .as_ref()
+                        .and_then(|r| r[i].as_ref())
+                        .map(|r| r.to_bson()),
                     "sortKey" => sort_keys.as_ref().map(|k| k[i].clone()),
                     _ => index_keys.as_ref().map(|k| Bson::Document(k[i].clone())),
                 };
@@ -1268,11 +1271,11 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // four is deleted, 2, 3, 4 -- not its place in the reply).
                 let mut o = d;
                 let rid = match &record_ids {
-                    Some(ids) => ids[i],
-                    None => Some((i + 1) as i64),
+                    Some(ids) => ids[i].clone(),
+                    None => Some(RecordId::Long((i + 1) as i64)),
                 };
                 if let Some(rid) = rid {
-                    o.insert("$recordId", Bson::Int64(rid));
+                    o.insert("$recordId", rid.to_bson());
                 }
                 rewritten.push(o);
             }
@@ -1620,7 +1623,8 @@ fn shape_streamed(
                     .map(|b| secantus_core::bsondoc::from_bytes(b.as_slice()))
                     .collect::<Result<_, _>>()
                     .map_err(|e| CommandError::new(1, "InternalError", e.to_string()))?;
-                let ids: Vec<Option<i64>> = rids.iter().copied().map(Some).collect();
+                let ids: Vec<Option<crate::storage::RecordId>> =
+                    rids.iter().cloned().map(Some).collect();
                 for (doc, key) in originals.iter_mut().zip(&keys) {
                     if let Some(key) = key {
                         doc.insert(crate::agg_meta::INDEX_KEY, Bson::Document(key.clone()));
@@ -1645,7 +1649,7 @@ fn shape_streamed(
             for (i, out) in projected.iter_mut().enumerate() {
                 for (field, meta) in &metas {
                     let value = match *meta {
-                        "recordId" => Some(Bson::Int64(rids[i])),
+                        "recordId" => Some(rids[i].to_bson()),
                         "sortKey" => sort_keys.as_ref().map(|k| k[i].clone()),
                         _ => keys[i].clone().map(Bson::Document),
                     };
@@ -1670,7 +1674,7 @@ fn shape_streamed(
     }
     if cursor.show_record_id {
         for (doc, rid) in out.iter_mut().zip(&rids) {
-            doc.insert("$recordId", Bson::Int64(*rid));
+            doc.insert("$recordId", rid.to_bson());
         }
     }
     crate::util::encode_docs(out)

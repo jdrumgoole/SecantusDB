@@ -838,7 +838,7 @@ pub(crate) struct BlockScan {
     table: String,
     filter: Document,
     /// Resume after this RecordId (`None`: from the start).
-    after: Option<i64>,
+    after: Option<secantus_storage::RecordId>,
     /// The collection is exhausted (or OFFSET / LIMIT is satisfied).
     done: bool,
     /// Rows read by a drain, handed out before anything else.
@@ -944,11 +944,18 @@ impl BlockScan {
         let mut docs = Vec::new();
         while docs.is_empty() && !self.done {
             let (blobs, next) = storage
-                .scan_batch_after(&self.db, &self.table, &self.filter, self.after, BATCH)
+                .scan_batch_after(
+                    &self.db,
+                    &self.table,
+                    &self.filter,
+                    self.after.clone(),
+                    BATCH,
+                )
                 .map_err(|e| PgHandler::storage_err("could not read", e))?;
-            self.after = next;
             self.scanned += blobs.len() as i64;
-            if next.is_none() {
+            let finished = next.is_none();
+            self.after = next;
+            if finished {
                 self.done = true;
             }
             for blob in blobs {

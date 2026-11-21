@@ -1092,7 +1092,7 @@ impl AggStream {
                     let mut decoded = crate::util::decode_docs(read.docs)?;
                     for (i, doc) in decoded.iter_mut().enumerate() {
                         if record_id {
-                            doc.insert(crate::agg_meta::RECORD_ID, Bson::Int64(read.rids[i]));
+                            doc.insert(crate::agg_meta::RECORD_ID, read.rids[i].to_bson());
                         }
                         if let (true, Some(key)) = (index_key, &read.keys[i]) {
                             doc.insert(crate::agg_meta::INDEX_KEY, Bson::Document(key.clone()));

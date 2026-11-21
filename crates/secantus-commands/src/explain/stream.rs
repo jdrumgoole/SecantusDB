@@ -60,7 +60,7 @@ use secantus_core::sortkey::{self, COMPOUND_SEP};
 
 use super::exec::{contiguous, outside_of, ranges, reversed_key, Ranges};
 use super::node::{num, IxScan, Node, Stats, WorkCounts};
-use crate::storage::{IndexEntry, IndexFrom, Storage, StorageError};
+use crate::storage::{IndexEntry, IndexFrom, RecordId, Storage, StorageError};
 
 /// How many index entries or documents one read of the store takes.
 const CHUNK: usize = 256;
@@ -152,7 +152,7 @@ fn undecodable(e: impl std::fmt::Display) -> StorageError {
 /// the end, and what it examined to fill this batch.
 pub(crate) struct Batch {
     pub docs: Vec<Vec<u8>>,
-    pub rids: Vec<i64>,
+    pub rids: Vec<RecordId>,
     pub keys: Vec<Option<Document>>,
     /// Per document, the key pattern of the index a covered plan answered
     /// it from: mongod builds that row of the key, in the pattern's order
@@ -170,7 +170,7 @@ pub(crate) struct Batch {
 #[derive(Default)]
 pub(crate) struct ReadAll {
     pub docs: Vec<Vec<u8>>,
-    pub rids: Vec<i64>,
+    pub rids: Vec<RecordId>,
     pub keys: Vec<Option<Document>>,
     pub keys_examined: i64,
     pub docs_examined: i64,
@@ -218,7 +218,7 @@ struct EntryKey {
 /// A document on its way up the plan (mongod's working set member): its
 /// RecordId, the entry that found it, and the document once fetched.
 struct Member {
-    rid: i64,
+    rid: RecordId,
     doc: Option<Vec<u8>>,
     entry: Option<EntryKey>,
     /// Found before the last yield and not fetched since.
@@ -231,7 +231,7 @@ struct Member {
 /// One result, with what a caller may want of it.
 struct Found {
     doc: Vec<u8>,
-    rid: i64,
+    rid: RecordId,
     entry: Option<EntryKey>,
     /// The statement's yields when the plan returned it.
     yields: i64,
@@ -254,7 +254,7 @@ struct Cx<'a> {
 
 impl Cx<'_> {
     /// The document behind `rid` as it is now, `None` when it is gone.
-    fn read(&self, rid: i64) -> Result<Option<Vec<u8>>, StorageError> {
+    fn read(&self, rid: RecordId) -> Result<Option<Vec<u8>>, StorageError> {
         let Some(mut found) = self.storage.records_by_id(self.db, self.coll, &[rid])? else {
             return Err(StorageError::Internal("this store cannot stream".into()));
         };
@@ -288,7 +288,7 @@ struct Entry {
     raw: Vec<u8>,
     /// Where a read resumes after this entry.
     resume: Vec<u8>,
-    rid: i64,
+    rid: RecordId,
     asc: Vec<Vec<u8>>,
     scan: Vec<Vec<u8>>,
 }
@@ -324,13 +324,13 @@ struct IndexScan {
     start: Start,
     done: bool,
     /// The last entry the scan consumed: where the next read resumes.
-    last: Option<(Vec<u8>, i64)>,
+    last: Option<(Vec<u8>, RecordId)>,
     /// Entries read ahead of the position, dropped at a yield.
     buf: VecDeque<Entry>,
     /// The store has nothing after `buf`.
     end: bool,
     /// A multikey scan's documents returned so far.
-    seen: HashSet<i64>,
+    seen: HashSet<RecordId>,
     /// A DISTINCT_SCAN: the first entry of each run of this many leading
     /// keys, and the last such run returned.
     distinct: Option<usize>,
@@ -345,7 +345,7 @@ struct IndexScan {
     /// How many entries the next read of the store takes.
     chunk: usize,
     /// Every RecordId read from the store, when asked for ([`scan_reach`]).
-    read: Option<Vec<i64>>,
+    read: Option<Vec<RecordId>>,
     t: Tally,
 }
 
@@ -360,7 +360,7 @@ enum Step {
 /// that read ahead rewinds it to at a yield, so the next batch reads on from
 /// the last entry handed out, as mongod's scan does.
 struct Snap {
-    last: Option<(Vec<u8>, i64)>,
+    last: Option<(Vec<u8>, RecordId)>,
     done: bool,
     run: Option<Vec<Vec<u8>>>,
     /// The batch's keys examined at that point.
@@ -382,7 +382,7 @@ impl IndexScan {
 
     /// Back to `snap`: the entries produced since are read again by the
     /// next batch, and a multikey scan forgets it returned them.
-    fn rewind(&mut self, snap: Snap, unread: &[i64]) {
+    fn rewind(&mut self, snap: Snap, unread: &[RecordId]) {
         self.last = snap.last;
         self.done = snap.done;
         self.run = snap.run;
@@ -406,7 +406,7 @@ impl IndexScan {
 
     fn refill(&mut self, cx: &Cx) -> Result<(), StorageError> {
         let (from, after) = match (&self.last, &self.start) {
-            (Some((resume, rid)), _) => (IndexFrom::Resume(resume), Some(*rid)),
+            (Some((resume, rid)), _) => (IndexFrom::Resume(resume), Some(rid.clone())),
             (None, Start::Edge) => (IndexFrom::Edge, None),
             (None, Start::Values(values)) => (IndexFrom::Values(values), None),
         };
@@ -436,7 +436,7 @@ impl IndexScan {
         };
         for IndexEntry { raw, rid, resume } in rows {
             if let Some(read) = self.read.as_mut() {
-                read.push(rid);
+                read.push(rid.clone());
             }
             let asc: Vec<Vec<u8>> = sortkey::split_directed(&raw, &self.meta.dirs)
                 .ok_or_else(unreadable)?
@@ -469,7 +469,7 @@ impl IndexScan {
     /// Consume the front entry: the scan's position moves past it.
     fn pop(&mut self) -> Option<Entry> {
         let e = self.buf.pop_front()?;
-        self.last = Some((e.resume.clone(), e.rid));
+        self.last = Some((e.resume.clone(), e.rid.clone()));
         Some(e)
     }
 
@@ -527,7 +527,7 @@ impl IndexScan {
         if arrays.is_empty() {
             return Ok(false);
         }
-        let Some(blob) = cx.read(e.rid)? else {
+        let Some(blob) = cx.read(e.rid.clone())? else {
             return Ok(true);
         };
         let doc = secantus_core::bsondoc::from_bytes(blob.as_slice()).map_err(undecodable)?;
@@ -571,7 +571,7 @@ impl IndexScan {
                 // holds it: a document is returned once by any other scan.
                 if self.meta.multikey && self.distinct.is_none() {
                     self.t.dups_tested += 1;
-                    if !self.seen.insert(e.rid) {
+                    if !self.seen.insert(e.rid.clone()) {
                         // mongod's scan spends the work and needs more time.
                         self.t.dups_dropped += 1;
                         continue;
@@ -579,7 +579,7 @@ impl IndexScan {
                 }
                 self.t.advanced += 1;
                 return Ok(Step::Entry(Member {
-                    rid: e.rid,
+                    rid: e.rid.clone(),
                     doc: None,
                     entry: Some(EntryKey {
                         meta: self.meta.clone(),
@@ -676,10 +676,10 @@ impl IndexScan {
 /// A collection scan's position.
 struct CollScan {
     /// After this RecordId (before it, backward).
-    after: Option<i64>,
+    after: Option<RecordId>,
     backward: bool,
     filter: Option<Document>,
-    buf: VecDeque<(i64, Vec<u8>)>,
+    buf: VecDeque<(RecordId, Vec<u8>)>,
     end: bool,
     t: Tally,
 }
@@ -722,9 +722,13 @@ impl CollScan {
                 if self.end {
                     return Ok(None);
                 }
-                let Some(rows) =
-                    cx.storage
-                        .records_after(cx.db, cx.coll, self.after, CHUNK, self.backward)?
+                let Some(rows) = cx.storage.records_after(
+                    cx.db,
+                    cx.coll,
+                    self.after.clone(),
+                    CHUNK,
+                    self.backward,
+                )?
                 else {
                     return Err(StorageError::Internal("this store cannot stream".into()));
                 };
@@ -735,7 +739,7 @@ impl CollScan {
                 }
             }
             let (rid, blob) = self.buf.pop_front().expect("a row is buffered");
-            self.after = Some(rid);
+            self.after = Some(rid.clone());
             cx.docs += 1;
             self.t.docs += 1;
             self.t.own += 1;
@@ -785,7 +789,7 @@ struct Merge {
     /// The children without a head, in the order they are worked.
     queue: Option<VecDeque<usize>>,
     heads: Heap<Head>,
-    seen: HashSet<i64>,
+    seen: HashSet<RecordId>,
     /// mongod tests each result for a duplicate only when a scan below can
     /// return one: over a multikey index.
     dedup: bool,
@@ -879,7 +883,7 @@ impl Merge {
                     if self.dedup {
                         self.t.dups_tested += 1;
                     }
-                    if !self.seen.insert(m.rid) {
+                    if !self.seen.insert(m.rid.clone()) {
                         if self.dedup {
                             self.t.dups_dropped += 1;
                         }
@@ -912,7 +916,7 @@ impl Merge {
 /// A `$near`'s search: mongod's `GeoNear2DStage` / `GeoNear2DSphereStage`,
 /// run as the batches ask.
 struct NearStage {
-    search: NearSearch<Vec<u8>>,
+    search: NearSearch<(RecordId, Vec<u8>)>,
     measure: Measure,
     /// The command's filter, which each document the search hands out is
     /// matched against (the rest of the query is a filter over what the
@@ -920,22 +924,25 @@ struct NearStage {
     filter: Option<Document>,
     /// The collection as this batch's rings read it: read when the batch
     /// first reaches a ring, dropped at its end.
-    held: Option<Vec<Candidate<Vec<u8>>>>,
+    held: Option<NearRows>,
     t: Tally,
 }
+
+/// What a `$near` ring reads: each document with its RecordId as payload.
+type NearRows = Vec<Candidate<(RecordId, Vec<u8>)>>;
 
 /// The collection as a `$near` ring reads it: every document as it is now,
 /// read once a batch (nothing writes to it while a batch reads).
 struct NearSource<'s, 'c, 'a> {
     cx: &'c Cx<'a>,
     measure: &'s Measure,
-    held: &'s mut Option<Vec<Candidate<Vec<u8>>>>,
+    held: &'s mut Option<NearRows>,
 }
 
-impl Source<Vec<u8>> for NearSource<'_, '_, '_> {
+impl Source<(RecordId, Vec<u8>)> for NearSource<'_, '_, '_> {
     type Error = StorageError;
 
-    fn candidates(&mut self) -> Result<&[Candidate<Vec<u8>>], StorageError> {
+    fn candidates(&mut self) -> Result<&[Candidate<(RecordId, Vec<u8>)>], StorageError> {
         if self.held.is_none() {
             let Some(rows) =
                 self.cx
@@ -945,9 +952,17 @@ impl Source<Vec<u8>> for NearSource<'_, '_, '_> {
                 return Err(StorageError::Internal("this store cannot stream".into()));
             };
             let mut out = Vec::with_capacity(rows.len());
-            for (rid, blob) in rows {
+            for (place, (rid, blob)) in rows.into_iter().enumerate() {
                 let doc = secantus_core::bsondoc::from_bytes(&blob).map_err(undecodable)?;
-                out.push(self.measure.candidate(rid, &doc, true, blob));
+                // The search orders ties and drops repeats by an integer
+                // (`Candidate::rid`); the rows come in RecordId order, so
+                // their place orders and distinguishes them exactly as
+                // their RecordIds do, whatever kind they are. The real
+                // RecordId rides in the payload to the member it makes.
+                out.push(
+                    self.measure
+                        .candidate(place as i64 + 1, &doc, true, (rid, blob)),
+                );
             }
             *self.held = Some(out);
         }
@@ -986,7 +1001,7 @@ enum Stage {
     Or {
         inputs: Vec<Stage>,
         pos: usize,
-        seen: HashSet<i64>,
+        seen: HashSet<RecordId>,
         t: Tally,
     },
     Merge(Box<Merge>),
@@ -1145,7 +1160,10 @@ fn sort_members(
             .collect::<Result<_, _>>()?;
         if keeps_metadata && project.is_none() && super::order::plain_sort(pattern) {
             // A `default` sort: RID_AND_OBJ members (RM-577).
-            let rids = all.iter().filter(|m| m.doc.is_some()).map(|m| m.rid);
+            let rids = all
+                .iter()
+                .filter(|m| m.doc.is_some())
+                .map(|m| m.rid.clone());
             secantus_core::sorter::sort_rid_objs(
                 decoded.into_iter().zip(rids).collect(),
                 pattern,
@@ -1350,7 +1368,7 @@ impl Stage {
                     };
                     loop {
                         t.own += 1;
-                        let Some((rid, blob)) = search.next(&mut source)? else {
+                        let Some((_place, (rid, blob))) = search.next(&mut source)? else {
                             t.eof_work = true;
                             break None;
                         };
@@ -1411,7 +1429,8 @@ impl Stage {
                                 ended(t, input);
                                 return Ok(None);
                             }
-                            let rids: Vec<i64> = members.iter().map(|(m, _)| m.rid).collect();
+                            let rids: Vec<RecordId> =
+                                members.iter().map(|(m, _)| m.rid.clone()).collect();
                             let Some(found) = cx.storage.records_by_id(cx.db, cx.coll, &rids)?
                             else {
                                 return Err(StorageError::Internal(
@@ -1455,7 +1474,7 @@ impl Stage {
                         // The FETCH a covered plan has here reads what
                         // mongod answers from the key (RM-569).
                         m.from_keys = !*counted;
-                        let Some(blob) = cx.read(m.rid)? else {
+                        let Some(blob) = cx.read(m.rid.clone())? else {
                             continue;
                         };
                         // An entry held over a yield is fetched only if the
@@ -1510,7 +1529,7 @@ impl Stage {
                         Some(m) => {
                             // mongod's OR tests every result for a duplicate.
                             t.dups_tested += 1;
-                            if seen.insert(m.rid) {
+                            if seen.insert(m.rid.clone()) {
                                 return Ok(Some(m));
                             }
                             t.dups_dropped += 1;
@@ -1546,7 +1565,7 @@ impl Stage {
                         // here does not keep its value's type), which is
                         // no FETCH of mongod's, so not counted.
                         let blob = if collation.is_some() || budget.is_some() {
-                            cx.read(m.rid)?
+                            cx.read(m.rid.clone())?
                         } else {
                             None
                         };
@@ -1623,7 +1642,7 @@ impl Stage {
                                         key_pattern,
                                         index_key,
                                         index_id,
-                                        rid: m.rid,
+                                        rid: m.rid.clone(),
                                     }
                                 })
                                 .collect();
@@ -1677,7 +1696,7 @@ impl Stage {
                     while let Some(mut m) = input.next(cx)? {
                         if m.doc.is_none() {
                             // Read to sort, by a stage below that did not.
-                            match cx.read(m.rid)? {
+                            match cx.read(m.rid.clone())? {
                                 Some(blob) => m.doc = Some(blob),
                                 None => continue,
                             }
@@ -1718,7 +1737,7 @@ impl Stage {
         {
             if let (Some(first), Stage::Ix(scan)) = (queue.pop_front(), input.as_mut()) {
                 let keys = first.snap.keys;
-                let unread: Vec<i64> = std::iter::once(first.member.rid)
+                let unread: Vec<RecordId> = std::iter::once(first.member.rid)
                     .chain(queue.drain(..).map(|a| a.member.rid))
                     .collect();
                 scan.rewind(first.snap, &unread);
@@ -1903,7 +1922,7 @@ pub(crate) fn scan_reach(
     ix: &IxScan,
     width: Option<usize>,
     works: i64,
-) -> Result<Option<(Vec<i64>, bool)>, StorageError> {
+) -> Result<Option<(Vec<RecordId>, bool)>, StorageError> {
     if !ix.index.plain {
         return Ok(None);
     }

@@ -17,7 +17,7 @@ use std::cmp::Ordering;
 use bson::spec::BinarySubtype;
 use bson::{doc, Binary, Bson, Document};
 
-use crate::storage::{IndexEntry, IndexFrom};
+use crate::storage::{IndexEntry, IndexFrom, RecordId};
 use crate::CommandError;
 
 /// The storage namespace of a time-series collection's buckets.
@@ -314,8 +314,8 @@ pub(crate) struct BucketScan {
 
 struct IndexPosition {
     name: String,
-    last: Option<(Vec<u8>, i64)>,
-    seen: std::collections::HashSet<i64>,
+    last: Option<(Vec<u8>, RecordId)>,
+    seen: std::collections::HashSet<RecordId>,
 }
 
 /// What one refill of a [`BucketScan`] buffered.
@@ -487,7 +487,7 @@ impl BucketScan {
                 return Ok(out);
             };
             let (from, after) = match &pos.last {
-                Some((k, rid)) => (IndexFrom::Resume(k), Some(*rid)),
+                Some((k, rid)) => (IndexFrom::Resume(k), Some(rid.clone())),
                 None => (IndexFrom::Edge, None),
             };
             let entries = storage
@@ -505,8 +505,8 @@ impl BucketScan {
                     break;
                 }
                 let pos = self.index.as_mut().expect("indexed scan");
-                pos.last = Some((resume, rid));
-                if !pos.seen.insert(rid) {
+                pos.last = Some((resume, rid.clone()));
+                if !pos.seen.insert(rid.clone()) {
                     continue;
                 }
                 let Some(Some(raw)) = storage
