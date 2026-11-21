@@ -76,6 +76,54 @@ These work end-to-end but cut corners.
 
 ## 3. Deferred work (skipped from a slice, ready to come back)
 
+- [ ] **Each start of the member is an election in mongod, not here.**
+  mongod 8.2.11 raises `local.replset.election.term` on every start (1 at
+  `replSetInitiate`, 2 after the first clean restart, 3 after a kill -9 and a
+  restart, measured 2026-11-20, `tests/fixtures/storage_model/mongod-8.2.11-
+  replset-state.json`) and logs a `{op: "n", o: {msg: "new primary"}}` entry
+  with `t` the new term; its entries carry that term. This store writes
+  `term: 1` once and every entry has `t: 1`. The fix moves the term in the
+  oplog entries, `replSetGetStatus` and `hello` with it.
+  Verify: tests/backlog/test_rm_storage_model.py::test_a_restart_raises_the_election_term
+  Backlog-ID: RM-735
+- [ ] **`local.replset.oplogTruncateAfterPoint` is refreshed at a checkpoint,
+  not every 100 ms, and recovery does not truncate after it.** mongod's
+  journal flusher moves it to the all-durable timestamp each cycle (measured
+  2026-11-20: equal to the oplog's last entry two seconds after a write) and a
+  recovery truncates the oplog after it. Here it moves with each stable
+  checkpoint and at close, and recovery replays every entry. Truncating would
+  lose acknowledged writes unless acknowledgement waits for the flusher's
+  cycle as mongod's does (here a write is acknowledged after its own commit's
+  sync): the two change together, and the second is a decision for Joe.
+  Verify: tests/backlog/test_rm_storage_model.py::test_the_truncate_after_point_follows_the_oplog
+  Backlog-ID: RM-736
+- [ ] **A PITR archive cannot prove that nothing was truncated between two
+  segments.** The oplog's own mark of where it begins is mongod's, the
+  `initiating set` entry (`oplog_reaches_genesis`); a segment's `prev` is 0
+  for an oldest entry that is it, else the end of the newest segment in the
+  archive, else `first - 1`. When the archive was off for a truncation (a
+  restart without `--oplog-archive-dir`) and on again, the chain claims an
+  abutment it cannot know, and a restore across the gap replays without the
+  truncated entries. The marker that said so (`secantus_oplog_meta`'s
+  `pruned` row) has no mongod equivalent and went with format 6. Options:
+  (a) the archive records, in its own directory, the position its last
+  segment ended at and each truncation made while it was off; (b) segments
+  overlap by one entry, which proves abutment from the entries alone but
+  keeps the newest archived entry in the oplog; (c) restore refuses a base
+  older than the first segment unless the oplog reaches genesis. A decision
+  for Joe.
+  Verify: none -- a design decision about the PITR archive's chain; no mongod behaviour to compare
+  Backlog-ID: RM-737
+- [ ] **`--oplog-retention-seconds` (default 3600) truncates entries mongod
+  would keep.** mongod holds its oplog to its size and a `minRetentionHours`
+  floor; it has no age limit. This server also deletes entries older than the
+  retention window whatever the size, so an idle store loses its oplog's
+  history in an hour. Removing the default (or the knob) is a decision for
+  Joe: `docs/recovery.md` and the change-stream pages describe it as the
+  recovery window.
+  Verify: none -- a design decision; the difference needs an hour of idle time to observe
+  Backlog-ID: RM-738
+
 - [ ] **OPEN — Rust MongoDB server on Linux under `--sync-on-commit`: not
       measured.** It runs the same patched WiredTiger as the Rust PostgreSQL
       server (`cmake/patch_wt_fsync_group.py`, one `fsync` credited with

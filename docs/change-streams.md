@@ -107,13 +107,15 @@ The oplog is a real WiredTiger table. With a persistent store
 `MongoServer(storage_path=...)`), oplog rows survive process restart and
 resume tokens minted before a restart can be presented after.
 
-Retention defaults: **1 hour** by wall-clock and **100 000 entries** by
-count. Whichever cap kicks in first prunes the oldest entries plus
-their paired pre-images. Tune with daemon flags (or the matching
+Retention defaults: **1 hour** by wall-clock, and the oplog's **size in
+bytes** as mongod holds it (`--oplog-size-mb`; 192 MB on macOS, else 5% of the
+free disk). Whichever kicks in first truncates the oldest whole entries plus
+their paired pre-images; `replSetResizeOplog` changes the size while the
+server runs. Tune with daemon flags (or the matching
 `[oplog]` keys in `secantusd.toml`):
 
 ```bash
-secantusd-mdb --oplog-retention-seconds 5 --oplog-max-entries 1000
+secantusd-mdb --oplog-retention-seconds 5 --oplog-size-mb 64
 ```
 
 The storage engine prunes as it writes, and the `secantusAdmin.pruneOplog`

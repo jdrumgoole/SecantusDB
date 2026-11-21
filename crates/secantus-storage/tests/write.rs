@@ -493,7 +493,9 @@ fn update_skips_oplog_when_disabled() {
         assert_eq!(out.modified, 1);
         assert_eq!(get_doc(&st, 1).get_i32("x").unwrap(), 2);
         st.flush_oplog();
-        assert_eq!(st.read_oplog(1, 100).unwrap().len(), 0);
+        // Only what every store begins with: the initiating no-op and the
+        // creation of `config.system.indexBuilds`.
+        assert_eq!(st.read_oplog(1, 100).unwrap().len(), 2);
     }
     let _ = std::fs::remove_dir_all(&home);
 }

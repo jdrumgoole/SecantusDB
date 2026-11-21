@@ -197,10 +197,11 @@ fn the_oplogs_uuid_is_the_catalogs_and_it_is_not_a_registry_collection() {
 
 /// A server's store (unlogged data tables over a logged oplog) that is killed
 /// before its first checkpoint comes back with its oplog, and replays it. The
-/// `_mdb_catalog` is not logged, so the catalog row that names the oplog's table
-/// is gone with the crash: the store must find the table by what it records in
-/// the (logged) oplog meta table, or it makes a new empty oplog, drops the old
-/// as an orphan, and every acknowledged write is lost.
+/// `_mdb_catalog` is not logged, so a catalog row written after the last
+/// checkpoint is gone with the crash: the one that names the oplog's table is
+/// written at the store's creation, which ends in a checkpoint, as mongod's
+/// `replSetInitiate` does. Without that the store would make a new empty oplog,
+/// drop the old as an orphan, and every acknowledged write would be lost.
 #[test]
 fn a_kill_before_the_first_checkpoint_keeps_the_oplog_and_replays_it() {
     const CHILD: &str = "SECANTUS_OPLOG_TABLE_CRASH_CHILD";
@@ -255,7 +256,7 @@ fn a_kill_before_the_first_checkpoint_keeps_the_oplog_and_replays_it() {
         .find_matching("config", "system.indexBuilds", &doc! {})
         .unwrap()
         .is_empty());
-    // The catalog names it again, with the uuid the store recorded.
+    // The catalog names it, with the uuid it was created with.
     let entry = st.mdb_catalog_entry("local", "oplog.rs").unwrap().unwrap();
     assert_eq!(
         format!("table:{}", entry.get_str("ident").unwrap()),
@@ -429,9 +430,7 @@ fn two_indexes_over_documents_are_one_build() {
         st.index_build_ready(&uuid, "localhost:27017").unwrap();
         st.commit_index_build(&uuid).unwrap();
         let rows = st.read_oplog(before + 1, 100).unwrap();
-        // The first build ever creates `config.system.indexBuilds` first.
-        assert_eq!(ops_of(&rows)[0].1, "config.$cmd create");
-        let rows = rows[1..].to_vec();
+        // `config.system.indexBuilds` was created with the store.
         assert_eq!(
             ops_of(&rows)
                 .iter()

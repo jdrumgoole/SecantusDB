@@ -239,3 +239,29 @@ def test_secantus_opens_a_mongod_store(tmp_path: Path) -> None:
         assert answer == ("ok", list(range(10)))
         indexes = mongo_answer(lambda: sorted(ix["name"] for ix in coll.list_indexes()))
         assert indexes == ("ok", ["_id_", "a_1"])
+
+
+@pytest.mark.backlog("RM-735")
+def test_a_restart_raises_the_election_term(tmp_path: Path) -> None:
+    """mongod 8.2.11 (measured 2026-11-20,
+    `tests/fixtures/storage_model/mongod-8.2.11-replset-state.json`): the
+    election document's `term` is 1 at initiation and 2 after the first clean
+    restart of the store."""
+    store = tmp_path / "store"
+    with rust_mongo_server(store) as client:
+        assert client.local["replset.election"].find_one()["term"] == 1
+    with rust_mongo_server(store) as client:
+        assert client.local["replset.election"].find_one()["term"] == 2
+
+
+@pytest.mark.backlog("RM-736")
+def test_the_truncate_after_point_follows_the_oplog(tmp_path: Path) -> None:
+    """mongod 8.2.11 (measured 2026-11-20): two seconds after a write,
+    `local.replset.oplogTruncateAfterPoint` is the timestamp of the oplog's
+    last entry."""
+    with rust_mongo_server(tmp_path / "store") as client:
+        client.t.x.insert_many([{"i": i} for i in range(5)])
+        time.sleep(2)
+        point = client.local["replset.oplogTruncateAfterPoint"].find_one()
+        last = next(client.local["oplog.rs"].find().sort("$natural", -1).limit(1))
+        assert point["oplogTruncateAfterPoint"] == last["ts"]

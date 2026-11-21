@@ -231,10 +231,10 @@ fn run(cli: CliArgs) -> Result<(), String> {
     // streams / PITR — the "drop the oplog for ~2× multi-writer throughput"
     // lever from docs/concurrency.md, previously embedded-only).
     storage.set_enable_oplog(std::env::var_os("SECANTUS_DISABLE_OPLOG").is_none());
-    // Oplog retention window + hard entry cap (--oplog-retention-seconds /
-    // --oplog-max-entries). Retention is seconds; truncate the float.
+    // Oplog retention window (--oplog-retention-seconds), seconds; truncate
+    // the float. The oplog's size is `StorageOptions::oplog_size_bytes`,
+    // read from its catalog entry once the store exists.
     storage.set_oplog_retention_seconds(cli.oplog_retention_seconds as i64);
-    storage.set_oplog_max_entries(cli.oplog_max_entries);
     if let Some(dir) = &cli.oplog_archive_dir {
         storage.set_oplog_archive_dir(Some(dir.clone()));
     }
@@ -383,6 +383,7 @@ fn storage_options(cli: &CliArgs) -> StorageOptions {
         // past time reads by (RM-210); `--data-logged` opts out.
         data_nonlogged: Some(cli.data_nonlogged.unwrap_or(true)),
         checkpoint_seconds: cli.checkpoint_seconds,
+        oplog_size_bytes: cli.oplog_size_mb.map(|mb| mb as i64 * 1024 * 1024),
         // mongod's lock file: a clean shutdown empties it, and the next
         // start reads an unclean one from it (RM-305).
         lock_file: Some("mongod.lock".to_string()),

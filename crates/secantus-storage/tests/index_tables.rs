@@ -114,10 +114,17 @@ fn index_tables(st: &Storage) -> Vec<String> {
         .iter()
         .filter_map(|c| st.index_table_name("app", c, "_id_").unwrap())
         .collect();
-    // `config.system.indexBuilds`, which mongod keeps and a build writes to.
+    // `config.system.indexBuilds`, which mongod keeps and a build writes to,
+    // and the `local` collections a new store holds from its initiation.
     id_tables.extend(
         st.index_table_name("config", "system.indexBuilds", "_id_")
             .unwrap(),
+    );
+    id_tables.extend(
+        st.list_collections("local")
+            .unwrap()
+            .iter()
+            .filter_map(|c| st.index_table_name("local", c, "_id_").unwrap()),
     );
     tables_named(st, "table:index-")
         .into_iter()
@@ -126,15 +133,18 @@ fn index_tables(st: &Storage) -> Vec<String> {
 }
 
 /// The tables of user collections: `local.oplog.rs`'s own is a
-/// `collection-<UUID>` table too, and so is `config.system.indexBuilds`'s,
-/// which the first index build makes; neither is one of them.
+/// `collection-<UUID>` table too, and so is `config.system.indexBuilds`'s and
+/// each `local` collection's, which a new store holds; none is one of them.
 fn collection_tables(st: &Storage) -> Vec<String> {
-    let builds = st
+    let mut held: Vec<Option<String>> = vec![st
         .collection_table_name("config", "system.indexBuilds")
-        .unwrap();
+        .unwrap()];
+    for c in st.list_collections("local").unwrap() {
+        held.push(st.collection_table_name("local", &c).unwrap());
+    }
     tables_named(st, "table:collection-")
         .into_iter()
-        .filter(|t| t != st.oplog_table() && Some(t) != builds.as_ref())
+        .filter(|t| t != st.oplog_table() && !held.contains(&Some(t.clone())))
         .collect()
 }
 
@@ -387,8 +397,17 @@ fn dropping_an_index_or_its_collection_drops_the_table() {
         let builds = st
             .index_table_name("config", "system.indexBuilds", "_id_")
             .unwrap();
+        let local: Vec<String> = st
+            .list_collections("local")
+            .unwrap()
+            .iter()
+            .filter_map(|c| st.index_table_name("local", c, "_id_").unwrap())
+            .collect();
         assert_eq!(
-            tables_named(st, "table:index-"),
+            tables_named(st, "table:index-")
+                .into_iter()
+                .filter(|t| !local.contains(t))
+                .collect::<Vec<_>>(),
             builds.into_iter().collect::<Vec<_>>()
         );
     });

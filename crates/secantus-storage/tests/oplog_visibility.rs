@@ -151,7 +151,7 @@ fn ts_of(blob: &[u8]) -> bson::Timestamp {
 fn find_seq_for_ts_does_not_wait_on_an_open_transaction() {
     with_db(|st| {
         st.insert_one("app", "x", &enc(&doc! {"_id": 0})).unwrap();
-        let rows = st.read_oplog(1, 1).unwrap();
+        let rows = st.read_oplog(st.oplog_tail_seq(), 1).unwrap();
         let ts1 = ts_of(&rows[0].1);
         let target = bson::Timestamp {
             time: ts1.time,
@@ -183,7 +183,7 @@ fn find_seq_for_ts_does_not_wait_on_an_open_transaction() {
 fn find_seq_for_ts_rolled_back_mint_returns_committed_answer() {
     with_db(|st| {
         st.insert_one("app", "x", &enc(&doc! {"_id": 0})).unwrap();
-        let ts1 = ts_of(&st.read_oplog(1, 1).unwrap()[0].1);
+        let ts1 = ts_of(&st.read_oplog(st.oplog_tail_seq(), 1).unwrap()[0].1);
         let target = bson::Timestamp {
             time: ts1.time,
             increment: ts1.increment + 1,

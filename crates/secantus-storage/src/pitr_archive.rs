@@ -189,6 +189,17 @@ pub fn segment_claims(archive_dir: &str) -> BTreeMap<i64, i64> {
     out
 }
 
+/// The last position the archive's segments reach, if it holds any.
+pub fn newest_segment_end(archive_dir: &str) -> Option<i64> {
+    glob_suffixed(archive_dir, SEG_PREFIX, SEG_SUFFIX)
+        .iter()
+        .filter_map(|path| {
+            let name = Path::new(path).file_name()?.to_string_lossy().into_owned();
+            parse_segment_name(&name).map(|(_, end, _)| end)
+        })
+        .max()
+}
+
 /// `[(head_seq, path), ...]` for the base snapshots in `archive_dir`, ascending.
 pub fn list_base_snapshots(archive_dir: &str) -> Vec<(i64, String)> {
     let mut out: Vec<(i64, String)> = Vec::new();
@@ -342,7 +353,17 @@ pub fn restore_from_archive_dir(
             let src = Storage::open(&tmp_path)?;
             let floor = src.oplog_floor_seq()?;
             if floor > 0 {
-                claims.insert(floor, src.oplog_pruned_through()?);
+                // What precedes the floor: nothing when the snapshot's oplog
+                // still begins at the initiating set; otherwise what was
+                // truncated is not known, claimed as just before the floor.
+                claims.insert(
+                    floor,
+                    if src.oplog_reaches_genesis()? {
+                        0
+                    } else {
+                        floor - 1
+                    },
+                );
             }
             let mut start = base_head + 1;
             loop {

@@ -1136,6 +1136,20 @@ impl Cursor {
         Ok(f(text(a), text(b), text(c), packed))
     }
 
+    /// [`Self::get_value_u`] without copying: `f` sees the value where it
+    /// sits in the cursor's buffer, which holds it only until the cursor
+    /// next moves.
+    pub fn with_value_u<T>(&self, f: impl FnOnce(&[u8]) -> T) -> Result<T> {
+        let mut it: sys::WT_ITEM = unsafe { std::mem::zeroed() };
+        check(unsafe { cur_fn!(self, get_value)(self.ptr, &mut it as *mut sys::WT_ITEM) })?;
+        let value: &[u8] = if it.data.is_null() || it.size == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(it.data as *const u8, it.size) }
+        };
+        Ok(f(value))
+    }
+
     pub fn get_value_u(&self) -> Result<Vec<u8>> {
         let mut it: sys::WT_ITEM = unsafe { std::mem::zeroed() };
         check(unsafe { cur_fn!(self, get_value)(self.ptr, &mut it as *mut sys::WT_ITEM) })?;

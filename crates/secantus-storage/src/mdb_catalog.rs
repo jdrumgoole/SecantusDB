@@ -222,6 +222,18 @@ pub fn ident_of_ns(session: &Session, ns: &str) -> Result<Option<String>> {
     Ok(entry_of_ns(session, ns)?.and_then(|e| e.get_str("ident").ok().map(str::to_string)))
 }
 
+/// The catalog id (RecordId) of `ns`'s row, found by scanning the catalog.
+pub fn catalog_id_of_ns(session: &Session, ns: &str) -> Result<Option<i64>> {
+    let cur = session.open_cursor(CATALOG_TABLE, None)?;
+    while cur.next()? {
+        let entry = decode_doc(&cur.get_value_u()?)?;
+        if entry.get_str("ns") == Ok(ns) {
+            return Ok(Some(cur.get_key_q()?));
+        }
+    }
+    Ok(None)
+}
+
 /// The whole catalog row for `ns`, found by scanning the catalog.
 pub fn entry_of_ns(session: &Session, ns: &str) -> Result<Option<Document>> {
     let cur = session.open_cursor(CATALOG_TABLE, None)?;

@@ -699,6 +699,92 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
    - Nothing stores a token (pre-images and `config.transactions` hold
      none), so there is no format bump.
 
+   **As built (4b-5 and 4b-6, store format 6):** measured on mongod 8.2.11
+   (`tools/probes/mongod_replset_state.py`, fixture
+   `tests/fixtures/storage_model/mongod-8.2.11-replset-state.json`).
+   - **The oplog is held to its size in bytes.** `options.size` of
+     `local.oplog.rs` in its `_mdb_catalog` entry is the size: 201,326,592 on
+     this box, mongod's macOS default (`getNewOplogSizeBytes`: 192 MB there;
+     elsewhere 5% of the free space of the data directory's filesystem, at
+     least 990 MB and at most 50 GB -- that branch is mongod's source, not
+     measured here, and `default_oplog_size` carries it). A new store takes
+     `--oplog-size-mb` (mongod's `--oplogSize`, `[oplog] size_mb`); an
+     existing store keeps what its entry holds. `replSetResizeOplog` rewrites
+     the entry (`size` megabytes times 1,048,576, the fraction kept: `1000.5`
+     gives `maxSize` 1049100288), which `collStats.maxSize` and
+     `listCollections` read. The entry-count cap (`max_entries`,
+     `--oplog-max-entries`, `[oplog] max_entries`, the 16 KiB-an-entry
+     arithmetic) is gone.
+   - **No write counts the table.** `OplogState.live_count` / `live_bytes`
+     are mongod's truncate-marker totals: read at open (the size storer's
+     `oplogSize` beside its clean-close marker, else one walk, as mongod
+     builds its markers by scanning when it has no size storer), added to when
+     a write COMMITS (each in-flight window carries the entries and bytes it
+     wrote and `deregister_in_flight(.., committed)` / `resolve_minted` add
+     them: a rolled-back statement or a retried write conflict adds nothing)
+     and taken from by a truncation. The sweep reads `live_bytes` for the
+     excess, then walks the oldest entries reading only their sizes
+     (`with_value_u`, no copy) until the entry that crosses the excess, so
+     the oplog ends at or under its size, in whole entries. Behind it, as
+     before, the retention window and `minRetentionHours`; the sweep never
+     goes past the stable checkpoint's timestamp in a store whose data tables
+     are not logged. Measured: mongod keeps entries past its size until a
+     stable checkpoint passes them (a 1 MB oplog held 4.9 MB for the first
+     minute), then holds 972,645 bytes of a 1,048,576 oplog, whole entries.
+   - **Pre-images** expire against the oplog's oldest entry, as mongod's
+     remover does (`_id.ts` before it, and at or below the all-committed
+     point), not against a position remembered from the sweeps of this run.
+   - **`secantus_oplog_meta` is gone, all three rows.** `oplog` (ident and
+     uuid): the oplog is created at store creation, its catalog entry made
+     durable by a checkpoint taken before the store serves
+     (`Storage::genesis`), which is what mongod's `replSetInitiate` does
+     (measured: the oplog's first entry is `{op: "n", ns: "", o: {msg:
+     "initiating set"}, ts, v, wall}`, no `t`, then the `local.replset.*`
+     collections, a checkpoint). The catalog is not logged in a store whose
+     data tables are not; with the entry in the first checkpoint, a kill -9
+     before the next one finds the oplog by its catalog entry and replays its
+     logged entries. `pruned` (newest position pruned): mongod has no such
+     mark. What it has is the first entry, `initiating set`; an oplog whose
+     oldest entry it is has lost nothing from the front
+     (`oplog_reaches_genesis`, replacing `oplog_pruned_through`). A PITR
+     segment's `prev` is 0 for that oldest entry, else the end of the newest
+     segment in the archive, else `first - 1` (not known); see the open item
+     in the backlog. `stable` (`stable_seq`, `data_nonlogged`): the recovery
+     point is WiredTiger's `get=recovery`, the stable timestamp stored by the
+     checkpoint itself, which `stable_seq` is initialised from and which a
+     stable checkpoint moves; the mode is read from the tables' own metadata
+     (it already was; the row's copy was never the authority).
+   - **The replica-set state** a new store writes at its initiation, shaped
+     and typed as measured (fixture): `local.replset.minvalid` `{_id: ObjectId,
+     t: -1 (long), ts: Timestamp(0, 0)}` (not logged),
+     `local.replset.oplogTruncateAfterPoint` `{_id:
+     "oplogTruncateAfterPoint", oplogTruncateAfterPoint: Timestamp}`,
+     `local.replset.election` `{_id: ObjectId, term: 1 (long),
+     candidateIndex: 0 (long)}`, `local.replset.initialSyncId` `{_id: UUID,
+     wallTime}`, `local.system.rollback.id` `{_id: "rollbackId", rollbackId: 1
+     (int)}`, and `config.system.indexBuilds` (a `create` entry follows the
+     initiating no-op, as mongod's does; 4b-2 made it lazily, unreplicated). `local.system.replset` is the server's
+     (`record_replset_config`), which has the set's name and address. Their
+     tables are logged in a store whose data tables are not, except `minvalid`
+     (measured: every `local.replset.*` and `local.system.*` table
+     `log=(enabled=true)`, `minvalid` `false`). `rollbackId` is 1 higher
+     after an unclean shutdown (measured: 2 after the first kill -9, 3 after
+     the second; a clean restart leaves it); here only a store with a lock
+     file (the servers) can tell.
+   - **Restore with the oplog carried over** (`import_oplog_segment`) takes
+     the source's timeline as it is: the target's own initiating no-op and
+     `indexBuilds` creation, which it wrote when it was made and are dated
+     after everything carried, are removed first, so the carried oplog reaches
+     genesis exactly when the source's did.
+   - **Left open (backlog):** the election `term` and a `new primary` entry
+     on each start; `oplogTruncateAfterPoint` is refreshed at each stable
+     checkpoint and at close, not every 100 ms, and recovery does not
+     truncate after it (mongod's acknowledgement waits for the journal
+     flusher's cycle, ours for the commit's own sync, so truncating would lose
+     acknowledged writes); `--oplog-retention-seconds` (default 3600) is a
+     time limit mongod does not have; a PITR chain cannot prove that nothing
+     was truncated between two archived segments without a mark of its own.
+
    **Landing:** 4b-1 to 4b-3 cannot land apart (the table, what is in it
    and every reader of it), so they land together as store format 5, with
    the crash tests: kill -9 at random points of a write burst, many times,
