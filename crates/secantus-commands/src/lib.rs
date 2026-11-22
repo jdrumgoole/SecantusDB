@@ -1050,7 +1050,10 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
             let waited = std::time::Instant::now();
             let wait_locks = lock_manager::journal_wait(ctx.locks.as_ref());
             let mut flushed = None;
-            let mut flush = || flushed = Some(storage.flush_journal());
+            // The wait is for the connection's last op (mongod's
+            // `ReplClientInfo::getLastOp`), not the newest entry.
+            let last_op = ctx.last_op_seq;
+            let mut flush = || flushed = Some(storage.flush_journal_for(last_op));
             if counted_write {
                 lastop::write_concern_checks(wait_shape, logged, &mut flush);
             }
@@ -1058,7 +1061,7 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
             // is in the journal, interrupted or not.
             let flushed = match flushed {
                 Some(flushed) => flushed,
-                None => storage.flush_journal(),
+                None => storage.flush_journal_for(last_op),
             };
             drop(wait_locks);
             if let Err(e) = flushed {

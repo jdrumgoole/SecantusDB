@@ -1632,6 +1632,13 @@ pub trait Storage: Send + Sync {
         Ok(())
     }
 
+    /// [`Self::flush_journal`] for a write whose connection's last op is
+    /// `last_op_seq`: it waits only for the entries minted before it.
+    fn flush_journal_for(&self, last_op_seq: i64) -> Result<(), StorageError> {
+        let _ = last_op_seq;
+        self.flush_journal()
+    }
+
     /// Whether every commit syncs the journal (`--sync-on-commit`), so that
     /// every acknowledged write must be journaled, its wait included.
     fn syncs_every_commit(&self) -> bool {

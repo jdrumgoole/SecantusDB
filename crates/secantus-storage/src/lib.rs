@@ -598,6 +598,7 @@ impl UserTransactionHandle {
             if let (true, Some(r)) = (committed, removed) {
                 st.live_count += r.records;
                 st.live_bytes += r.bytes;
+                note_logged_at(r.end, r.first_ts);
             }
         }
         self.oplog_cv.notify_all();
@@ -1339,6 +1340,25 @@ thread_local! {
     /// The seq of the latest oplog entry a write on this thread logged and
     /// committed since [`take_last_logged_seq`] last read it.
     static LAST_LOGGED_SEQ: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+    /// The last seq, and its first entry's timestamp, of the latest range of
+    /// oplog entries a write on this thread committed: how far a journaled
+    /// write's wait for earlier entries runs ([`Storage::flush_journal_for`]).
+    static LAST_LOGGED_AT: std::cell::Cell<Option<(i64, u64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// A write on this thread committed the in-flight range ending at `end`,
+/// whose first entry is at `first_ts`.
+fn note_logged_at(end: i64, first_ts: u64) {
+    LAST_LOGGED_AT.with(|l| {
+        let newer = match l.get() {
+            Some((seq, _)) => end - 1 > seq,
+            None => true,
+        };
+        if newer {
+            l.set(Some((end - 1, first_ts)));
+        }
+    });
 }
 
 /// A write on this thread committed the oplog entries `start..end`.
@@ -7324,6 +7344,9 @@ thread_local! {
 /// entry commit at.
 struct OpScopeState {
     oplog: Arc<Mutex<OplogState>>,
+    /// The oplog's condition: a journaled write waiting for the
+    /// all-committed point wakes when a hold ends.
+    cv: Arc<Condvar>,
     holds: Vec<u64>,
     last: u64,
 }
@@ -7344,6 +7367,8 @@ impl Drop for OpScope {
                 for ts in &state.holds {
                     st.scope_holds.remove(ts);
                 }
+                drop(st);
+                state.cv.notify_all();
             }
         }
     }
@@ -9076,6 +9101,7 @@ impl Storage {
             }
             *s = Some(OpScopeState {
                 oplog: self.oplog.clone(),
+                cv: self.oplog_cv.clone(),
                 holds: Vec::new(),
                 last: 0,
             });
@@ -9136,6 +9162,7 @@ impl Storage {
             if let (true, Some(r)) = (committed, removed) {
                 st.live_count += r.records;
                 st.live_bytes += r.bytes;
+                note_logged_at(r.end, r.first_ts);
             }
         }
         self.oplog_cv.notify_all();
@@ -9911,6 +9938,25 @@ impl Storage {
     /// log buffer is written out without the sync: a killed process still
     /// keeps the write. An in-memory store has no log.
     pub fn flush_journal(&self) -> Result<()> {
+        self.flush_journal_through(None)
+    }
+
+    /// [`Self::flush_journal`] for a write whose client's last op is the
+    /// entry `last_op_seq`: as mongod's write concern waits for the client's
+    /// last op (`ReplClientInfo::getLastOp`) to be durable with no hole
+    /// before it, the wait is for the entries minted before this thread's
+    /// latest range, not for those other writers minted after it. A last op
+    /// this thread did not commit (the system's, when the write logged
+    /// nothing) waits for every entry minted so far.
+    pub fn flush_journal_for(&self, last_op_seq: i64) -> Result<()> {
+        let own = LAST_LOGGED_AT
+            .with(std::cell::Cell::get)
+            .filter(|(seq, _)| *seq == last_op_seq)
+            .map(|(_, first_ts)| first_ts);
+        self.flush_journal_through(own)
+    }
+
+    fn flush_journal_through(&self, through: Option<u64>) -> Result<()> {
         if self.in_memory {
             return Ok(());
         }
@@ -9926,7 +9972,7 @@ impl Storage {
         // journal listener's token names): every entry minted before this
         // wait commits or rolls back first, so the point moved below covers
         // the caller's write, and a crash's truncation cannot take it.
-        self.wait_until_all_committed_through_minted();
+        self.wait_until_all_committed_through(through);
         // mongod's `waitUntilDurable` runs a journal flusher round, which
         // moves the truncate point first (RM-736).
         refresh_truncate_point(
@@ -9945,17 +9991,17 @@ impl Storage {
         Ok(self.op_session()?.log_flush(Some(config))?)
     }
 
-    /// Wait until every oplog entry minted before the call has committed or
-    /// rolled back (the all-committed point has reached the newest minted
-    /// timestamp), as a journaled write's wait does. A thread inside an
-    /// operation's scope ([`Storage::op_scope`]) holds the point itself and
-    /// does not wait for its own hold.
-    fn wait_until_all_committed_through_minted(&self) {
+    /// Wait until the all-committed point reaches `through` (every entry
+    /// minted before it has committed or rolled back), or, given none, the
+    /// newest timestamp minted before the call, as a journaled write's wait
+    /// does. A thread inside an operation's scope ([`Storage::op_scope`])
+    /// holds the point itself and does not wait for its own hold.
+    fn wait_until_all_committed_through(&self, through: Option<u64>) {
         if OP_SCOPE.with(|s| s.borrow().is_some()) {
             return;
         }
         let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
-        let target = ((st.last_ts_secs as u64) << 32) | st.last_ts_ord as u64;
+        let target = through.unwrap_or(((st.last_ts_secs as u64) << 32) | st.last_ts_ord as u64);
         let started = Instant::now();
         let mut warned = started;
         while Self::all_committed_ts_locked(&st) < target

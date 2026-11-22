@@ -1859,6 +1859,10 @@ impl CmdStorage for StorageAdapter {
         self.inner.flush_journal().map_err(map_err)
     }
 
+    fn flush_journal_for(&self, last_op_seq: i64) -> Result<(), StorageError> {
+        self.inner.flush_journal_for(last_op_seq).map_err(map_err)
+    }
+
     fn syncs_every_commit(&self) -> bool {
         self.inner.syncs_every_commit()
     }
