@@ -13,6 +13,11 @@ After the restart every document must hold exactly the value its last
 acknowledged write gave it. The one write each client had in flight at the
 kill may have landed or not, but only whole: its document holds either the
 value before it or the value after it.
+
+The same holds for `{w: 1}` writes under `--sync-on-commit`, where every
+commit syncs the journal: since the recovery truncates the oplog after
+`oplogTruncateAfterPoint` (RM-736), every write such a server acknowledges
+moves the point first, as a journaled write's wait does.
 """
 
 from __future__ import annotations
@@ -59,10 +64,10 @@ _SEED = 200  # ids 0.._SEED-1 exist at the start; client k owns ids with id % _C
 
 
 class _Server:
-    def __init__(self, store: pathlib.Path) -> None:
+    def __init__(self, store: pathlib.Path, *extra: str) -> None:
         assert _BIN is not None
         self.proc = subprocess.Popen(
-            [str(_BIN), "--port", "0", "--storage-path", str(store)],
+            [str(_BIN), "--port", "0", "--storage-path", str(store), *extra],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -149,13 +154,20 @@ def store(tmp_path: pathlib.Path) -> Iterator[pathlib.Path]:
     yield tmp_path / "store"
 
 
-def test_acknowledged_journaled_writes_survive_sigkill_mid_load(store: pathlib.Path) -> None:
-    server = _Server(store)
+@pytest.mark.parametrize(
+    ("extra", "concern"),
+    [((), WriteConcern(w=1, j=True)), (("--sync-on-commit",), WriteConcern(w=1))],
+    ids=["j-true", "sync-on-commit-w1"],
+)
+def test_acknowledged_journaled_writes_survive_sigkill_mid_load(
+    store: pathlib.Path, extra: tuple[str, ...], concern: Any
+) -> None:
+    server = _Server(store, *extra)
     try:
         # retryWrites off: a retry after the kill would re-send the in-flight
         # write to nothing and blur which attempt the ack belonged to.
         client = server.client(retryWrites=False, socketTimeoutMS=10_000)
-        coll = client.crash.c.with_options(write_concern=WriteConcern(w=1, j=True))
+        coll = client.crash.c.with_options(write_concern=concern)
         coll.insert_many([{"_id": i, "v": 0} for i in range(_SEED)])
         stop = threading.Event()
         writers = [_Writer(k, coll, stop) for k in range(_CLIENTS)]
@@ -177,7 +189,7 @@ def test_acknowledged_journaled_writes_survive_sigkill_mid_load(store: pathlib.P
     finally:
         server.stop()
 
-    server = _Server(store)
+    server = _Server(store, *extra)
     try:
         client = server.client()
         found = {d["_id"]: d["v"] for d in client.crash.c.find({}, {"v": 1})}

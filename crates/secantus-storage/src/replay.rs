@@ -50,15 +50,26 @@ fn build_uuid(o: &Document) -> Option<[u8; 16]> {
 /// Apply a `c` (command) oplog entry's `o` to the matching Storage DDL. Mirrors
 /// the `c` shapes Storage emits (create / drop / dropDatabase / createIndexes /
 /// dropIndexes / collMod / renameCollection).
-fn apply_command(storage: &Storage, db: &str, o: &Document) -> Result<()> {
+fn apply_command(storage: &Storage, db: &str, o: &Document, ui: Option<&Bson>) -> Result<()> {
     if let Ok(coll) = o.get_str("create") {
         // Collection options (capped / size / max / validator / viewOn / …) ride
-        // the create entry as siblings of `create`; reconstruct them.
-        let options: Document = o
-            .iter()
-            .filter(|(k, _)| k.as_str() != "create" && k.as_str() != "idIndex")
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        // the create entry as siblings of `create`; reconstruct them. The
+        // collection keeps the UUID its entry names (`ui`), as mongod's
+        // oplog application creates it: its catalog entry needs one (mongod
+        // 8.2.11 refuses a store whose collection has none, "MustDowngrade:
+        // Collection does not have UUID in KVCatalog"), and change events
+        // and resume tokens name it.
+        let mut options = Document::new();
+        if let Some(Bson::Binary(b)) = ui {
+            if !o.contains_key("uuid") && o.get("viewOn").is_none() {
+                options.insert("uuid", Bson::Binary(b.clone()));
+            }
+        }
+        for (k, v) in o {
+            if k.as_str() != "create" && k.as_str() != "idIndex" {
+                options.insert(k.clone(), v.clone());
+            }
+        }
         storage.create_collection_with_options(db, coll, &options)?;
     } else if let Ok(coll) = o.get_str("drop") {
         storage.drop_collection(db, coll)?;
@@ -183,7 +194,7 @@ fn apply_entry_with(storage: &Storage, entry: &Document, strict: bool) -> Result
     if op == "c" {
         let (db, _) = ns_split(ns);
         if let Ok(o) = entry.get_document("o") {
-            apply_command(storage, &db, o)?;
+            apply_command(storage, &db, o, entry.get("ui"))?;
         }
         return Ok(true);
     }

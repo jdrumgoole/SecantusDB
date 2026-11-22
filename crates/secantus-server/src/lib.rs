@@ -377,11 +377,25 @@ fn now_secs_f64() -> f64 {
 
 pub fn bind(
     addr: &str,
-    config: ServerConfig,
+    mut config: ServerConfig,
     storage: Arc<dyn Storage>,
     cursors: Arc<CursorRegistry>,
 ) -> io::Result<RunningServer> {
     let bind_started = Instant::now();
+    // A store whose set has a name of its own (one mongod initiated) is
+    // served as that set's member, under its name: the store's
+    // configuration is the set's (storage-model phase 7c).
+    if let Some(configured) = config.replica_set_name.clone() {
+        if let Some(stored) = secantus_commands::serverinfo::stored_set_name(storage.as_ref()) {
+            if stored != configured {
+                eprintln!(
+                    "secantusd-mdb: the store's replica set is {stored:?}: serving it under \
+                     that name, not {configured:?}"
+                );
+                config.replica_set_name = Some(stored);
+            }
+        }
+    }
     let listener = TcpListener::bind(addr)?;
     let address = listener.local_addr()?;
     listener.set_nonblocking(true)?;

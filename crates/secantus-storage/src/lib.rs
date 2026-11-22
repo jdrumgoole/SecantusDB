@@ -65,6 +65,7 @@ pub mod replay;
 pub mod share_locks;
 pub mod spill;
 
+mod adopt;
 mod index_build;
 mod ixkeys;
 mod lockfile;
@@ -243,6 +244,9 @@ pub struct OpenRecord {
     /// open: the stable timestamp of the checkpoint it opened from, 0 when
     /// none (mongod's `WiredTiger recoveryTimestamp`, 23987).
     pub recovery_timestamp: u64,
+    /// The oplog truncated after `local.replset.oplogTruncateAfterPoint`
+    /// as the store opened (RM-736), when its point was set.
+    pub oplog_truncation: Option<OplogTruncation>,
     /// How long the whole open took after the lock file: WiredTiger, the
     /// tables, the recovery and the upgrades (mongod's
     /// `createStorageEngineMillis`).
@@ -594,6 +598,7 @@ impl UserTransactionHandle {
             if let (true, Some(r)) = (committed, removed) {
                 st.live_count += r.records;
                 st.live_bytes += r.bytes;
+                note_logged_at(r.end, r.first_ts);
             }
         }
         self.oplog_cv.notify_all();
@@ -1335,6 +1340,25 @@ thread_local! {
     /// The seq of the latest oplog entry a write on this thread logged and
     /// committed since [`take_last_logged_seq`] last read it.
     static LAST_LOGGED_SEQ: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+    /// The last seq, and its first entry's timestamp, of the latest range of
+    /// oplog entries a write on this thread committed: how far a journaled
+    /// write's wait for earlier entries runs ([`Storage::flush_journal_for`]).
+    static LAST_LOGGED_AT: std::cell::Cell<Option<(i64, u64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// A write on this thread committed the in-flight range ending at `end`,
+/// whose first entry is at `first_ts`.
+fn note_logged_at(end: i64, first_ts: u64) {
+    LAST_LOGGED_AT.with(|l| {
+        let newer = match l.get() {
+            Some((seq, _)) => end - 1 > seq,
+            None => true,
+        };
+        if newer {
+            l.set(Some((end - 1, first_ts)));
+        }
+    });
 }
 
 /// A write on this thread committed the oplog entries `start..end`.
@@ -5479,6 +5503,9 @@ pub struct Storage {
     /// `local.replset.oplogTruncateAfterPoint`, as the journal flusher
     /// moves it (RM-736).
     truncate_point: Arc<TruncatePoint>,
+    /// Every commit syncs the log (`transaction_sync=(enabled=true)`): see
+    /// [`Storage::syncs_every_commit`]. Read once, from the open's config.
+    syncs_every_commit: bool,
     stable_seq: Arc<AtomicI64>,
     /// Periodic checkpoint thread (WT does not checkpoint on its own under
     /// our config). For a data-nonlogged store it is the durability cadence
@@ -7105,6 +7132,15 @@ fn newest_entry_at_or_below(session: &Session, oplog_uri: &str, bound: u64) -> R
 struct TruncatePoint {
     row: Mutex<Option<(String, i64)>>,
     written: AtomicU64,
+    /// mongod's `pauseJournalFlusherBeforeFlush` failpoint: the journal
+    /// flusher neither moves the point nor syncs while it is set, and a
+    /// journaled write waits for it, as on mongod.
+    paused: AtomicBool,
+    /// The session each refresh reads and writes with, kept between
+    /// refreshes (they are serialised by `row`): opening one per journaled
+    /// write was 40% of the refresh's cost (measured 2026-11-22). Closed by
+    /// `Storage::close` before the connection.
+    session: Mutex<Option<Session>>,
 }
 
 /// Move `local.replset.oplogTruncateAfterPoint` to the newest oplog entry at
@@ -7129,8 +7165,12 @@ fn refresh_truncate_point(
         let st = oplog.lock().unwrap_or_else(|e| e.into_inner());
         Storage::all_committed_ts_locked(&st)
     };
-    let session = conn.open_session()?;
-    let Some(at) = newest_entry_at_or_below(&session, oplog_uri, bound)? else {
+    let mut kept = point.session.lock().unwrap_or_else(|e| e.into_inner());
+    if kept.is_none() {
+        *kept = Some(conn.open_session()?);
+    }
+    let session = kept.as_ref().expect("just made");
+    let Some(at) = newest_entry_at_or_below(session, oplog_uri, bound)? else {
         return Ok(());
     };
     if point.written.load(Ordering::Acquire) == at {
@@ -7153,6 +7193,141 @@ fn refresh_truncate_point(
     }
 }
 
+/// `local.replset.oplogTruncateAfterPoint`'s document as a store holds it:
+/// its table, RecordId and point (`0` for `Timestamp(0, 0)`), or `None`
+/// for a store without one.
+fn read_truncate_point(session: &Session) -> Result<Option<(String, i64, u64)>> {
+    // Found through the catalog, which a store mongod made has before this
+    // server's registry does.
+    let Some(ident) = mdb_catalog::ident_of_ns(session, "local.replset.oplogTruncateAfterPoint")?
+    else {
+        return Ok(None);
+    };
+    let uri = mdb_catalog::table_uri(&ident);
+    let cur = session.open_cursor(&uri, None)?;
+    while cur.next()? {
+        let doc = decode_doc(&cur.get_value_u()?)?;
+        if doc.get_str("_id") == Ok("oplogTruncateAfterPoint") {
+            let at = match doc.get("oplogTruncateAfterPoint") {
+                Some(Bson::Timestamp(t)) => ts_u64(*t),
+                _ => 0,
+            };
+            return Ok(Some((uri, cur.get_key_q()?, at)));
+        }
+    }
+    Ok(None)
+}
+
+/// What [`truncate_oplog_after_point`] did, for the open's log lines.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OplogTruncation {
+    /// The point the store held.
+    pub point: u64,
+    /// The newest entry at or below the point (or the stable timestamp,
+    /// when the point was at or below it): nothing after it is kept.
+    pub after: u64,
+    /// The entries removed.
+    pub removed: u64,
+}
+
+/// mongod's `ReplicationRecovery::_truncateOplogIfNeededAndThenClearOplog
+/// TruncateAfterPoint` (decided by Joe, 2026-11-22: "Truncate as mongod",
+/// RM-736), run as a store whose data tables are not logged opens, before
+/// the oplog is read or replayed. A point of `Timestamp(0, 0)` (a clean
+/// stop) truncates nothing. A point at or below the stable timestamp
+/// `recovery` truncates after the stable timestamp instead. Every entry
+/// after the newest one at or below the point goes: one a crash can have
+/// left after a hole (an earlier timestamp that never committed), and one
+/// acknowledged without waiting for the journal (`w: 1, j: false`) since
+/// the journal flusher last moved the point, as on mongod. When the stable
+/// timestamp is past the entry kept last (a hole right after it), the
+/// stable and oldest timestamps are moved back to that entry with `force`,
+/// as mongod moves them. Then the point is cleared and the journal synced,
+/// so a crash during the open does not truncate later entries. Returns the
+/// stable timestamp the replay starts from, and what was truncated.
+fn truncate_oplog_after_point(
+    conn: &Connection,
+    session: &Session,
+    oplog_uri: &str,
+    recovery: u64,
+) -> Result<(u64, Option<OplogTruncation>)> {
+    let Some((uri, rid, point)) = read_truncate_point(session)? else {
+        return Ok((recovery, None));
+    };
+    if point == 0 {
+        // There are no holes in the oplog that need truncating.
+        return Ok((recovery, None));
+    }
+    let mut stable = recovery;
+    let truncate_point = if recovery != 0 && point <= recovery {
+        recovery
+    } else {
+        point
+    };
+    let Some(after) = newest_entry_at_or_below(session, oplog_uri, truncate_point)? else {
+        // mongod's fatal 40296.
+        return Err(StorageError::Internal(format!(
+            "Reached end of oplog looking for an oplog entry lte to oplogTruncateAfterPoint \
+             but did not find one (oplogTruncateAfterPoint {:?})",
+            u64_ts(truncate_point)
+        )));
+    };
+    if stable != 0 && stable > after {
+        // Truncating sets the newest durable timestamp to the oplog's new
+        // last entry, which may not be below the oldest: both move back.
+        conn.set_timestamp(&format!(
+            "force=true,oldest_timestamp={after:x},durable_timestamp={after:x},\
+             stable_timestamp={after:x}"
+        ))?;
+        stable = after;
+    }
+    let mut removed = 0u64;
+    begin_untimestamped(session, true)?;
+    let wrote = (|| -> Result<()> {
+        let cur = session.open_cursor(oplog_uri, None)?;
+        cur.set_key_q((after.min(i64::MAX as u64 - 1) + 1) as i64);
+        let mut more = match cur.search_near() {
+            Ok(cmp) if cmp < 0 => cur.next()?,
+            Ok(_) => true,
+            Err(e) if e.is_not_found() => false,
+            Err(e) => return Err(e.into()),
+        };
+        while more {
+            cur.remove()?;
+            removed += 1;
+            more = cur.next()?;
+        }
+        // The point, cleared: the document's size does not change.
+        let pc = session.open_cursor(&uri, None)?;
+        let doc = bson::doc! {
+            "_id": "oplogTruncateAfterPoint",
+            "oplogTruncateAfterPoint": Bson::Timestamp(u64_ts(0)),
+        };
+        let blob = encode_doc(&doc)?;
+        pc.set_key_q(rid);
+        pc.set_value_u(&blob);
+        pc.insert()?;
+        Ok(())
+    })();
+    match wrote {
+        Ok(()) => commit_untimestamped(session)?,
+        Err(e) => {
+            let _ = session.rollback_transaction(None);
+            return Err(e);
+        }
+    }
+    // mongod waits for a journal flush once the point is cleared.
+    session.log_flush(Some("sync=on"))?;
+    Ok((
+        stable,
+        Some(OplogTruncation {
+            point,
+            after,
+            removed,
+        }),
+    ))
+}
+
 thread_local! {
     /// The operation this thread is running, as one mongod unit of work
     /// (RM-746): see [`Storage::op_scope`].
@@ -7169,6 +7344,9 @@ thread_local! {
 /// entry commit at.
 struct OpScopeState {
     oplog: Arc<Mutex<OplogState>>,
+    /// The oplog's condition: a journaled write waiting for the
+    /// all-committed point wakes when a hold ends.
+    cv: Arc<Condvar>,
     holds: Vec<u64>,
     last: u64,
 }
@@ -7189,6 +7367,8 @@ impl Drop for OpScope {
                 for ts in &state.holds {
                     st.scope_holds.remove(ts);
                 }
+                drop(st);
+                state.cv.notify_all();
             }
         }
     }
@@ -7264,16 +7444,22 @@ fn u64_ts(t: u64) -> bson::Timestamp {
 /// store that has none yet.
 fn stored_data_logging(session: &Session) -> Result<Option<bool>> {
     let cur = session.open_cursor("metadata:", None)?;
-    let file = COLL_TABLE.replacen("table:", "file:", 1) + ".wt";
-    cur.set_key_s(&file);
-    match cur.search() {
-        Ok(()) => {
-            let config = cur.get_value_s()?;
-            Ok(Some(config.contains("log=(enabled=false)")))
+    // This server's registry, else mongod's catalog, which a store mongod
+    // made has alone (unlogged in a replica set's store, measured 8.2.11).
+    for table in [COLL_TABLE, mdb_catalog::CATALOG_TABLE] {
+        let file = table.replacen("table:", "file:", 1) + ".wt";
+        cur.reset()?;
+        cur.set_key_s(&file);
+        match cur.search() {
+            Ok(()) => {
+                let config = cur.get_value_s()?;
+                return Ok(Some(config.contains("log=(enabled=false)")));
+            }
+            Err(e) if e.is_not_found() => {}
+            Err(e) => return Err(e.into()),
         }
-        Err(e) if e.is_not_found() => Ok(None),
-        Err(e) => Err(e.into()),
     }
+    Ok(None)
 }
 
 /// The oplog's counters as the table leaves them: the clock resumes after the
@@ -7802,7 +7988,12 @@ impl Storage {
         }
         // Again, now nothing else runs: a background thread stopped above may
         // have parked a session after the first clear, and every one must
-        // close before the connection does.
+        // close before the connection does; the truncate point's too.
+        self.truncate_point
+            .session
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         self.op_pool
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -7906,9 +8097,9 @@ impl Storage {
         // store's format and lay out a new one BEFORE WiredTiger opens it,
         // which would refuse an earlier layout's files with a bare EACCES;
         // and keep the log where mongod does, snappy-compressed.
-        if !in_memory {
-            store_format::prepare(std::path::Path::new(home))?;
-        }
+        let mongod_store = !in_memory
+            && store_format::prepare(std::path::Path::new(home))?
+                == store_format::StoreKind::Mongod;
         let config = store_format::mongod_log_config(config);
         let config = config.as_str();
         let wt_started = Instant::now();
@@ -7933,23 +8124,73 @@ impl Storage {
         }
         let state = {
             let boot = conn.open_session()?;
+            // An existing store's tables are made in the mode its own are.
+            let table_mode = stored_mode.unwrap_or(data_create_mode);
             for (name, fmt) in BOOTSTRAP {
-                boot.create(name, &bootstrap_table_cfg(name, fmt, data_create_mode))?;
+                boot.create(name, &bootstrap_table_cfg(name, fmt, table_mode))?;
             }
-            // Drop any table a crash or a rollback left that no catalog row
-            // or placement names; then `local.oplog.rs`'s own: the catalog's
-            // row names its ident, a new store makes both.
-            reconcile_idents(&boot)?;
+            // `local.oplog.rs`: the catalog's row names its ident, a new
+            // store makes both.
             let oplog = ensure_oplog_table(
                 &boot,
                 oplog_nonlogged,
                 opts.oplog_size_bytes
                     .unwrap_or_else(|| default_oplog_size(home)),
             )?;
+            // mongod's recovery truncates the oplog after the point first,
+            // in a store whose data is recovered by replaying it (RM-736).
+            let (replay_from, truncation) = if !in_memory && stored_mode.unwrap_or(data_create_mode)
+            {
+                truncate_oplog_after_point(&conn, &boot, &oplog.uri, recovery_timestamp)?
+            } else {
+                (recovery_timestamp, None)
+            };
+            if let Some(t) = truncation {
+                eprintln!(
+                    "secantus-storage: Removing unapplied oplog entries after \
+                     oplogTruncateAfterPoint {:?}: truncated after {:?}, {} entries removed",
+                    u64_ts(t.point),
+                    u64_ts(t.after),
+                    t.removed
+                );
+            }
             // Recover the timestamp counters from the oplog's last entry.
-            (load_oplog_state(&boot, &oplog.uri)?, oplog)
+            let state = load_oplog_state(&boot, &oplog.uri)?;
+            // The registry from mongod's catalog, where another server wrote
+            // the store (storage-model phase 7c): a store mongod made, or
+            // one of this server's mongod wrote to since its last close.
+            let last = if mongod_store {
+                adopt::LastWriter::Mongod
+            } else {
+                match sizes::SizeStorer::clean_close_marker(&boot)? {
+                    Some(left) if left == [state.next_seq, 0, 0] => adopt::LastWriter::ThisServer,
+                    Some(_) => adopt::LastWriter::AnotherServer,
+                    None => adopt::LastWriter::Unknown,
+                }
+            };
+            let reconciled = adopt::reconcile(&boot, last, table_mode && !in_memory, |found| {
+                if mongod_store {
+                    store_format::mongod_store(std::path::Path::new(home), found)
+                } else {
+                    store_format::written_by_mongod_since(std::path::Path::new(home), found)
+                }
+            })?;
+            if !reconciled.adopted.is_empty() || !reconciled.removed.is_empty() {
+                eprintln!(
+                    "secantus-storage: the catalog was written by another server: took {} \
+                     namespace(s) from it ({}), and dropped {} it no longer lists ({})",
+                    reconciled.adopted.len(),
+                    reconciled.adopted.join(", "),
+                    reconciled.removed.len(),
+                    reconciled.removed.join(", ")
+                );
+            }
+            // Drop any table a crash or a rollback left that no catalog row
+            // or placement names.
+            reconcile_idents(&boot)?;
+            (state, oplog, replay_from, truncation)
         };
-        let (mut state, oplog_table) = state;
+        let (mut state, oplog_table, replay_from, truncation) = state;
         let oplog_uri = oplog_table.uri.clone();
         // The oplog state as the last close left it: the size storer's
         // counts are trusted only when it is the state they were saved with.
@@ -8009,7 +8250,7 @@ impl Storage {
         // itself (the checkpoint-then-marker order of an earlier format could
         // be crashed between).
         let stable_seq = Arc::new(AtomicI64::new(if data_nonlogged {
-            recovery_timestamp as i64
+            replay_from as i64
         } else {
             0
         }));
@@ -8078,6 +8319,7 @@ impl Storage {
             timestamped: data_nonlogged,
             stable_seq,
             truncate_point: Arc::default(),
+            syncs_every_commit: !in_memory && config.contains("transaction_sync=(enabled=true"),
             checkpoint_stop: Arc::new(AtomicBool::new(false)),
             checkpoint_requested,
             checkpoint_join: Mutex::new(None),
@@ -8097,6 +8339,7 @@ impl Storage {
                 wt_open,
                 wt_messages,
                 recovery_timestamp,
+                oplog_truncation: truncation,
                 open: Duration::ZERO,
             },
             lock_file,
@@ -8151,6 +8394,10 @@ impl Storage {
         // Index builds a crash or shutdown interrupted run again from the
         // start, as mongod restarts them (RM-187).
         storage.restart_index_builds()?;
+        // A store mongod made is one of this format once it has opened.
+        if mongod_store {
+            store_format::mark_opened(std::path::Path::new(home))?;
+        }
         storage.open_record.open = engine_started.elapsed();
         Ok(storage)
     }
@@ -8854,6 +9101,7 @@ impl Storage {
             }
             *s = Some(OpScopeState {
                 oplog: self.oplog.clone(),
+                cv: self.oplog_cv.clone(),
                 holds: Vec::new(),
                 last: 0,
             });
@@ -8914,6 +9162,7 @@ impl Storage {
             if let (true, Some(r)) = (committed, removed) {
                 st.live_count += r.records;
                 st.live_bytes += r.bytes;
+                note_logged_at(r.end, r.first_ts);
             }
         }
         self.oplog_cv.notify_all();
@@ -9689,9 +9938,41 @@ impl Storage {
     /// log buffer is written out without the sync: a killed process still
     /// keeps the write. An in-memory store has no log.
     pub fn flush_journal(&self) -> Result<()> {
+        self.flush_journal_through(None)
+    }
+
+    /// [`Self::flush_journal`] for a write whose client's last op is the
+    /// entry `last_op_seq`: as mongod's write concern waits for the client's
+    /// last op (`ReplClientInfo::getLastOp`) to be durable with no hole
+    /// before it, the wait is for the entries minted before this thread's
+    /// latest range, not for those other writers minted after it. A last op
+    /// this thread did not commit (the system's, when the write logged
+    /// nothing) waits for every entry minted so far.
+    pub fn flush_journal_for(&self, last_op_seq: i64) -> Result<()> {
+        let own = LAST_LOGGED_AT
+            .with(std::cell::Cell::get)
+            .filter(|(seq, _)| *seq == last_op_seq)
+            .map(|(_, first_ts)| first_ts);
+        self.flush_journal_through(own)
+    }
+
+    fn flush_journal_through(&self, through: Option<u64>) -> Result<()> {
         if self.in_memory {
             return Ok(());
         }
+        // A journaled write waits for the journal flusher, which a paused
+        // flusher keeps it waiting for (mongod's `waitForJournalFlush`).
+        while self.truncate_point.paused.load(Ordering::Acquire)
+            && !self.checkpoint_stop.load(Ordering::Acquire)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // mongod acknowledges a journaled write once its optime is durable
+        // with no hole before it (`lastDurable` is the all-durable point the
+        // journal listener's token names): every entry minted before this
+        // wait commits or rolls back first, so the point moved below covers
+        // the caller's write, and a crash's truncation cannot take it.
+        self.wait_until_all_committed_through(through);
         // mongod's `waitUntilDurable` runs a journal flusher round, which
         // moves the truncate point first (RM-736).
         refresh_truncate_point(
@@ -9701,7 +9982,63 @@ impl Storage {
             &self.truncate_point,
         )?;
         let config = if self.durable { "sync=on" } else { "sync=off" };
-        Ok(self.conn.open_session()?.log_flush(Some(config))?)
+        // A pooled session (a fresh one inside a user transaction, whose
+        // own session the pool would hand back): concurrent waiters each
+        // flush with their own, which WiredTiger groups into one sync.
+        if self.in_user_txn() {
+            return Ok(self.conn.open_session()?.log_flush(Some(config))?);
+        }
+        Ok(self.op_session()?.log_flush(Some(config))?)
+    }
+
+    /// Wait until the all-committed point reaches `through` (every entry
+    /// minted before it has committed or rolled back), or, given none, the
+    /// newest timestamp minted before the call, as a journaled write's wait
+    /// does. A thread inside an operation's scope ([`Storage::op_scope`])
+    /// holds the point itself and does not wait for its own hold.
+    fn wait_until_all_committed_through(&self, through: Option<u64>) {
+        if OP_SCOPE.with(|s| s.borrow().is_some()) {
+            return;
+        }
+        let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        let target = through.unwrap_or(((st.last_ts_secs as u64) << 32) | st.last_ts_ord as u64);
+        let started = Instant::now();
+        let mut warned = started;
+        while Self::all_committed_ts_locked(&st) < target
+            && !self.checkpoint_stop.load(Ordering::Acquire)
+        {
+            let (g, _) = self
+                .oplog_cv
+                .wait_timeout(st, Duration::from_millis(20))
+                .unwrap_or_else(|e| e.into_inner());
+            st = g;
+            if warned.elapsed() >= Duration::from_secs(5) {
+                warned = Instant::now();
+                eprintln!(
+                    "secantus-storage: a journaled write has waited {:.1}s for earlier oplog \
+                     entries to commit",
+                    started.elapsed().as_secs_f64()
+                );
+            }
+        }
+    }
+
+    /// Whether every commit syncs the log (`--sync-on-commit`:
+    /// `transaction_sync=(enabled=true)`), a durability mode mongod does not
+    /// have. Every write such a store acknowledges is in the journal, so
+    /// its acknowledgement moves the truncate point first, as a journaled
+    /// write's wait does: else the recovery's truncation (RM-736) would take
+    /// a `w: 1` write the commit's own sync made durable.
+    /// Pause or resume the journal flusher: mongod's
+    /// `pauseJournalFlusherBeforeFlush` failpoint (`configureFailPoint`).
+    /// While it is paused the truncate point does not move and the journal
+    /// is not synced but by a commit of its own.
+    pub fn pause_journal_flusher(&self, paused: bool) {
+        self.truncate_point.paused.store(paused, Ordering::Release);
+    }
+
+    pub fn syncs_every_commit(&self) -> bool {
+        self.syncs_every_commit
     }
 
     /// Find `local.replset.oplogTruncateAfterPoint`'s document, for the
@@ -9751,6 +10088,9 @@ impl Storage {
                 let interval = std::time::Duration::from_millis(JOURNAL_COMMIT_INTERVAL_MS);
                 while !stop.load(Ordering::Acquire) {
                     std::thread::sleep(interval);
+                    if point.paused.load(Ordering::Acquire) {
+                        continue;
+                    }
                     // The truncate point first, then the sync that makes it
                     // durable with the entries it covers, as mongod's
                     // journal flusher does (RM-736).
@@ -10475,6 +10815,13 @@ impl Storage {
                         }
                     }
                 }
+                // A transaction's commit leaves its session's row, as the
+                // commit itself wrote it (RM-760).
+                if let Err(e) = self.replay_transaction_state(&entry) {
+                    REPLAY_TS.with(|c| c.set(0));
+                    self.enable_oplog = was_enabled;
+                    return Err(e);
+                }
                 REPLAY_TS.with(|c| c.set(0));
             }
         };
@@ -10529,6 +10876,75 @@ impl Storage {
             Some(bytes) => Ok(Some(decode_doc(&bytes)?)),
             None => Ok(None),
         }
+    }
+
+    /// What mongod's `SessionUpdateTracker` rebuilds as recovery applies a
+    /// transaction's terminal entry: its session's `config.transactions`
+    /// row, `{_id: lsid, txnNum, lastWriteOpTime, lastWriteDate, state}`,
+    /// `state` `"committed"` for an `applyOps` that commits (neither part of a
+    /// larger transaction, `partialTxn`, nor `prepare`d) or a
+    /// `commitTransaction`, `"aborted"` for an `abortTransaction`. The commit
+    /// wrote it without an oplog entry of its own, into a table a crash rolls
+    /// back to the checkpoint, so replay is where it comes back from.
+    fn replay_transaction_state(&self, entry: &Document) -> Result<()> {
+        if entry.get_str("op") != Ok("c") {
+            return Ok(());
+        }
+        let (Ok(lsid), Ok(txn), Ok(o)) = (
+            entry.get_document("lsid"),
+            entry.get_i64("txnNumber"),
+            entry.get_document("o"),
+        ) else {
+            return Ok(());
+        };
+        // A retryable write's batch (`multiOpType`) is no transaction: its
+        // statements' rows are `replay_session_state`'s.
+        if entry.get("multiOpType").is_some() {
+            return Ok(());
+        }
+        let state = if o.contains_key("applyOps") {
+            if o.get_bool("prepare").unwrap_or(false)
+                || entry.get_bool("partialTxn").unwrap_or(false)
+                || o.get_bool("partialTxn").unwrap_or(false)
+            {
+                return Ok(());
+            }
+            "committed"
+        } else if o.contains_key("commitTransaction") {
+            "committed"
+        } else if o.contains_key("abortTransaction") {
+            "aborted"
+        } else {
+            return Ok(());
+        };
+        let Some(Bson::Timestamp(ts)) = entry.get("ts").cloned() else {
+            return Ok(());
+        };
+        let wall = entry
+            .get_datetime("wall")
+            .copied()
+            .unwrap_or_else(|_| bson::DateTime::now());
+        let term = entry.get_i64("t").unwrap_or(1);
+        self.update_matching(
+            "config",
+            "transactions",
+            &bson::doc! {"_id": lsid.clone()},
+            &bson::doc! {
+                "_id": lsid.clone(),
+                "txnNum": txn,
+                "lastWriteOpTime": {"ts": ts, "t": term},
+                "lastWriteDate": wall,
+                "state": state,
+            },
+            false,
+            true,
+            &[],
+            &Document::new(),
+            None,
+            None,
+            false,
+        )
+        .map(|_| ())
     }
 
     /// What mongod's `SessionUpdateTracker` rebuilds as recovery applies a
@@ -22784,7 +23200,6 @@ impl Storage {
         // has run `batchedDeletesTargetBatchTimeMS` (5 ms), commits what it
         // deleted and finishes the rest in its next `work()` call (RM-609).
         const TARGET_BATCH_TIME: std::time::Duration = std::time::Duration::from_millis(5);
-        let started = std::time::Instant::now();
         // Large scalar `$in` / `$nin` lists hashed once for the scan.
         let in_sets = secantus_core::query::InSets::prepare(filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
@@ -22808,6 +23223,10 @@ impl Storage {
         let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
         let mut stopped = None;
         let cur = open_doc_cursor(session, db, coll, None)?;
+        // The batch's clock starts at its first delete, as mongod's
+        // `batchTimer` does: what is looked up above, mongod looks up once
+        // as it builds the stage, not in each batch's time.
+        let started = std::time::Instant::now();
         for (recordid, scanned, yielded) in rids {
             let recordid = recordid.clone();
             if deleted >= WRITE_CHUNK_MAX_DOCS || chunk_bytes >= WRITE_CHUNK_MAX_BYTES {

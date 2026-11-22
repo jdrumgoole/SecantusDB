@@ -216,6 +216,24 @@ pub(crate) fn stored_replset_config(
     secantus_core::bsondoc::from_bytes(bytes).ok()
 }
 
+/// The name of the set the store's one configuration in
+/// `local.system.replset` names, when it holds exactly one: a store mongod
+/// initiated under a set name of its own keeps it here, as the member mongod
+/// would start it as.
+pub fn stored_set_name(storage: &dyn crate::storage::Storage) -> Option<String> {
+    let rows = storage
+        .find("local", "system.replset", &doc! {}, None, None)
+        .ok()?;
+    let [only] = rows.as_slice() else {
+        return None;
+    };
+    secantus_core::bsondoc::from_bytes(only)
+        .ok()?
+        .get_str("_id")
+        .ok()
+        .map(str::to_string)
+}
+
 /// The oplog's collection UUID. mongod mints one when the set is initiated
 /// and keeps it; here it is derived from the stored `replicaSetId`, so it
 /// too is the same after a restart.

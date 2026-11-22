@@ -37,6 +37,9 @@ pub const FORMAT_FILE: &str = "secantus.format";
 /// mongod's `storage.bson` file name.
 pub const STORAGE_BSON: &str = "storage.bson";
 
+/// mongod's lock file in its `--dbpath`.
+const MONGOD_LOCK: &str = "mongod.lock";
+
 /// The directory WiredTiger keeps its log in, as mongod's `--dbpath` does.
 pub const JOURNAL_DIR: &str = "journal";
 
@@ -67,14 +70,21 @@ pub enum StoreKind {
     Created,
     /// A store this build wrote, at [`STORE_FORMAT_VERSION`].
     Current,
+    /// A store mongod wrote (`storage.bson`, no [`FORMAT_FILE`]) holding
+    /// nothing [`catalog_findings`] refuses, or one whose log needs
+    /// recovery first (a killed mongod), which is checked once WiredTiger
+    /// has recovered it. The open builds this server's registry from
+    /// mongod's catalog, and [`mark_opened`] writes the format file once
+    /// it has succeeded (mongod ignores the file).
+    Mongod,
 }
 
 /// Check the store at `home` before WiredTiger opens it, and lay out a new
 /// one: `journal/`, `storage.bson` and [`FORMAT_FILE`].
 ///
 /// Refuses, with what to do, a store in the earlier SecantusDB layout, one
-/// at another layout version, and (until SecantusDB reads mongod's catalog,
-/// backlog item RM-723) one mongod wrote.
+/// at another layout version, and one mongod wrote that holds something
+/// this server cannot serve, named ([`catalog_findings`]).
 pub fn prepare(home: &Path) -> Result<StoreKind> {
     let has_wt = home.join("WiredTiger.wt").exists();
     let has_storage_bson = home.join(STORAGE_BSON).exists();
@@ -83,8 +93,9 @@ pub fn prepare(home: &Path) -> Result<StoreKind> {
     if !has_wt {
         if has_storage_bson && !format.exists() {
             // mongod writes storage.bson before WiredTiger's files; a
-            // directory holding only that is still mongod's.
-            return Err(mongod_store(home));
+            // directory holding only that is still mongod's, and holds no
+            // store to open.
+            return Err(mongod_store(home, &[]));
         }
         fs::create_dir_all(home.join(JOURNAL_DIR)).map_err(|e| io_error(home, e))?;
         if !has_storage_bson {
@@ -105,7 +116,20 @@ pub fn prepare(home: &Path) -> Result<StoreKind> {
         )));
     }
     if !format.exists() {
-        return Err(mongod_store(home));
+        // mongod empties its lock file as it stops cleanly and leaves its
+        // pid in it otherwise (its "Detected unclean shutdown"): a store it
+        // was killed on needs log recovery, which read-only WiredTiger
+        // refuses, so it is checked once it has been opened and recovered.
+        let unclean = fs::metadata(home.join(MONGOD_LOCK)).is_ok_and(|m| m.len() > 0);
+        if unclean {
+            return Ok(StoreKind::Mongod);
+        }
+        return match mongod_store_findings(home) {
+            Ok(findings) if !findings.is_empty() => Err(mongod_store(home, &findings)),
+            // Nothing refused; or a log WiredTiger must recover before the
+            // catalog can be read, checked again once it has.
+            _ => Ok(StoreKind::Mongod),
+        };
     }
     let text = fs::read_to_string(&format).map_err(|e| io_error(home, e))?;
     match text.trim().parse::<u32>() {
@@ -182,10 +206,11 @@ pub fn mongod_log_config(config: &str) -> String {
     out
 }
 
-fn mongod_store(home: &Path) -> StorageError {
-    let findings = mongod_store_findings(home);
+/// The refusal of a store mongod wrote, naming what in it this server
+/// cannot serve.
+pub(crate) fn mongod_store(home: &Path, findings: &[String]) -> StorageError {
     let what = if findings.is_empty() {
-        String::new()
+        " It holds no WiredTiger store yet.".to_string()
     } else {
         format!(
             " It holds what this server cannot serve: {}.",
@@ -193,11 +218,31 @@ fn mongod_store(home: &Path) -> StorageError {
         )
     };
     StorageError::Internal(format!(
-        "the store at {} was written by mongod.{what} Opening mongod's stores is not \
-         supported yet (backlog item RM-723); move the data with mongodump / \
+        "the store at {} was written by mongod.{what} Move the data with mongodump / \
          mongorestore.",
         home.display()
     ))
+}
+
+/// The refusal of a store this server wrote and mongod wrote to since,
+/// naming what mongod added that this server cannot serve.
+pub(crate) fn written_by_mongod_since(home: &Path, findings: &[String]) -> StorageError {
+    StorageError::Internal(format!(
+        "the store at {} was written by mongod since this server last closed it, and \
+         holds what this server cannot serve: {}. Open it with mongod, or move the data \
+         with mongodump / mongorestore.",
+        home.display(),
+        findings.join("; ")
+    ))
+}
+
+/// Write [`FORMAT_FILE`] into a store mongod wrote, once this server has
+/// opened it: from then on it is a store of this format.
+pub fn mark_opened(home: &Path) -> Result<()> {
+    write_atomically(
+        &home.join(FORMAT_FILE),
+        format!("{STORE_FORMAT_VERSION}\n").as_bytes(),
+    )
 }
 
 /// The index kinds whose keys this server does not write as mongod does
@@ -259,120 +304,176 @@ const SERVED_INDEX_OPTIONS: &[&str] = &[
 /// decision 10: refused by name when the store is opened, never skipped),
 /// read without writing anything: WiredTiger is opened read-only, which it
 /// refuses for a store whose log still needs recovery (a mongod that was
-/// killed). Each finding names what it is about: a replica-set
-/// configuration of more than one member, an index of a kind this server
-/// does not key as mongod does, a collection or index option it does not
-/// keep, a feature compatibility version other than 8.2, users and roles
-/// (RM-744).
-pub fn mongod_store_findings(home: &Path) -> Vec<String> {
+/// killed): `Err` with WiredTiger's answer then, and the store is checked
+/// again once it has been opened and recovered ([`catalog_findings`]).
+pub fn mongod_store_findings(home: &Path) -> std::result::Result<Vec<String>, String> {
     let config = mongod_log_config("readonly=true,cache_size=64M,log=(enabled=true)");
-    let conn = match secantus_wt::Connection::open(&home.to_string_lossy(), &config) {
-        Ok(c) => c,
-        Err(e) => {
-            return vec![format!(
-                "a catalog this server could not read without recovering it ({e})"
-            )]
-        }
-    };
+    let conn = secantus_wt::Connection::open(&home.to_string_lossy(), &config)
+        .map_err(|e| e.to_string())?;
+    let found = conn
+        .open_session()
+        .map_err(StorageError::from)
+        .and_then(|session| catalog_findings(&session));
+    Ok(match found {
+        Ok(found) => found,
+        Err(e) => vec![format!("a catalog this server could not read ({e})")],
+    })
+}
+
+/// What in the store `session` reads this server cannot serve, named: a
+/// replica-set configuration of more than one member, an index of a kind
+/// this server does not key as mongod does, an index of another version
+/// than 2 or one whose build has not finished, a collection or index option
+/// it does not keep, a time-series collection (RM-754), a feature
+/// compatibility version other than 8.2, users and roles (RM-744). Checked
+/// whenever another server (mongod) wrote the store, before this server
+/// writes to it.
+pub(crate) fn catalog_findings(session: &secantus_wt::Session) -> Result<Vec<String>> {
     let mut out = Vec::new();
-    let read = (|| -> Result<()> {
-        let session = conn.open_session()?;
-        let mut idents: Vec<(String, String)> = Vec::new();
-        let cur = session.open_cursor("table:_mdb_catalog", None)?;
-        let mut more = cur.next()?;
-        while more {
-            let entry = secantus_core::bsondoc::from_bytes(&cur.get_value_u()?)
-                .map_err(|e| StorageError::Internal(format!("_mdb_catalog: {e}")))?;
-            more = cur.next()?;
-            let Ok(md) = entry.get_document("md") else {
+    let mut idents: Vec<(String, String)> = Vec::new();
+    let cur = session.open_cursor("table:_mdb_catalog", None)?;
+    let mut more = cur.next()?;
+    while more {
+        let entry = secantus_core::bsondoc::from_bytes(&cur.get_value_u()?)
+            .map_err(|e| StorageError::Internal(format!("_mdb_catalog: {e}")))?;
+        more = cur.next()?;
+        let Ok(md) = entry.get_document("md") else {
+            continue;
+        };
+        let ns = md.get_str("ns").unwrap_or("").to_string();
+        if let Ok(ident) = entry.get_str("ident") {
+            idents.push((ns.clone(), ident.to_string()));
+        }
+        if ns
+            .split_once('.')
+            .is_some_and(|(_, c)| c.starts_with(secantus_core::viewdefs::BUCKETS_PREFIX))
+        {
+            out.push(format!(
+                "{ns}, a time-series collection's buckets, which this server does not open \
+                 yet (RM-754)"
+            ));
+            continue;
+        }
+        if let Ok(options) = md.get_document("options") {
+            for (option, _) in options {
+                if !SERVED_COLLECTION_OPTIONS.contains(&option.as_str()) {
+                    out.push(format!("{ns}'s collection option {option}"));
+                }
+            }
+        }
+        for ix in md.get_array("indexes").into_iter().flatten() {
+            let Some(ix) = ix.as_document() else {
                 continue;
             };
-            let ns = md.get_str("ns").unwrap_or("").to_string();
-            if let Ok(ident) = entry.get_str("ident") {
-                idents.push((ns.clone(), ident.to_string()));
-            }
-            if let Ok(options) = md.get_document("options") {
-                for (option, _) in options {
-                    if !SERVED_COLLECTION_OPTIONS.contains(&option.as_str()) {
-                        out.push(format!("{ns}'s collection option {option}"));
-                    }
-                }
-            }
-            for ix in md.get_array("indexes").into_iter().flatten() {
-                let Some(spec) = ix.as_document().and_then(|i| i.get_document("spec").ok()) else {
-                    continue;
-                };
-                let name = spec.get_str("name").unwrap_or("");
-                let Ok(key) = spec.get_document("key") else {
-                    continue;
-                };
-                let kind = key.iter().find_map(|(field, v)| {
-                    if field == "$**" || field.ends_with(".$**") {
-                        return Some("wildcard".to_string());
-                    }
-                    v.as_str()
-                        .filter(|k| UNSERVED_INDEX_KINDS.contains(k))
-                        .map(str::to_string)
-                });
-                if let Some(kind) = kind {
-                    out.push(format!("{ns}'s index {name} ({kind})"));
-                }
-                for (option, _) in spec {
-                    if !SERVED_INDEX_OPTIONS.contains(&option.as_str()) {
-                        out.push(format!("{ns}'s index {name}'s option {option}"));
-                    }
-                }
-            }
-        }
-        let docs = |ns: &str| -> Result<Vec<bson::Document>> {
-            let Some((_, ident)) = idents.iter().find(|(n, _)| n == ns) else {
-                return Ok(Vec::new());
+            let Ok(spec) = ix.get_document("spec") else {
+                continue;
             };
-            let cur = session.open_cursor(&format!("table:{ident}"), None)?;
-            let mut docs = Vec::new();
-            let mut more = cur.next()?;
-            while more {
-                if let Ok(d) = secantus_core::bsondoc::from_bytes(&cur.get_value_u()?) {
-                    docs.push(d);
+            let name = spec.get_str("name").unwrap_or("");
+            if ix.get_bool("ready") == Ok(false) {
+                out.push(format!(
+                    "{ns}'s index {name}, whose build has not finished (this server does not \
+                     resume mongod's index builds yet, RM-755)"
+                ));
+            }
+            let version = spec.get("v").and_then(|v| match v {
+                bson::Bson::Int32(n) => Some(i64::from(*n)),
+                bson::Bson::Int64(n) => Some(*n),
+                bson::Bson::Double(d) => Some(*d as i64),
+                _ => None,
+            });
+            if version != Some(2) {
+                out.push(format!(
+                    "{ns}'s index {name} of version {:?} (this server keys version 2)",
+                    spec.get("v")
+                ));
+            }
+            let Ok(key) = spec.get_document("key") else {
+                continue;
+            };
+            let kind = key.iter().find_map(|(field, v)| {
+                if field == "$**" || field.ends_with(".$**") {
+                    return Some("wildcard".to_string());
                 }
-                more = cur.next()?;
+                v.as_str()
+                    .filter(|k| UNSERVED_INDEX_KINDS.contains(k))
+                    .map(str::to_string)
+            });
+            if let Some(kind) = kind {
+                out.push(format!("{ns}'s index {name} ({kind})"));
             }
-            Ok(docs)
-        };
-        for config in docs("local.system.replset")? {
-            let members = config.get_array("members").map_or(0, Vec::len);
-            if members != 1 {
-                out.push(format!(
-                    "a local.system.replset configuration of {members} members (set {:?}); a \
-                     single-node server serves a set of one",
-                    config.get_str("_id").unwrap_or("")
-                ));
-            }
-        }
-        for v in docs("admin.system.version")? {
-            if v.get_str("_id") == Ok("featureCompatibilityVersion")
-                && (v.get_str("version") != Ok("8.2") || v.contains_key("targetVersion"))
-            {
-                out.push(format!(
-                    "a featureCompatibilityVersion of {:?} (this server serves 8.2)",
-                    v.get_str("version").unwrap_or("")
-                ));
+            for (option, _) in spec {
+                if !SERVED_INDEX_OPTIONS.contains(&option.as_str()) {
+                    out.push(format!("{ns}'s index {name}'s option {option}"));
+                }
             }
         }
-        for ns in ["admin.system.users", "admin.system.roles"] {
-            let n = docs(ns)?.len();
-            if n > 0 {
-                out.push(format!(
-                    "{n} documents of {ns}, which this server does not read (RM-744)"
-                ));
-            }
-        }
-        Ok(())
-    })();
-    if let Err(e) = read {
-        out.push(format!("a catalog this server could not read ({e})"));
     }
-    out
+    let docs = |ns: &str| -> Result<Vec<bson::Document>> {
+        let Some((_, ident)) = idents.iter().find(|(n, _)| n == ns) else {
+            return Ok(Vec::new());
+        };
+        let cur = session.open_cursor(&format!("table:{ident}"), None)?;
+        let mut docs = Vec::new();
+        let mut more = cur.next()?;
+        while more {
+            if let Ok(d) = secantus_core::bsondoc::from_bytes(&cur.get_value_u()?) {
+                docs.push(d);
+            }
+            more = cur.next()?;
+        }
+        Ok(docs)
+    };
+    for config in docs("local.system.replset")? {
+        let members = config.get_array("members").map_or(0, Vec::len);
+        if members != 1 {
+            out.push(format!(
+                "a local.system.replset configuration of {members} members (set {:?}); a \
+                 single-node server serves a set of one",
+                config.get_str("_id").unwrap_or("")
+            ));
+        }
+    }
+    for v in docs("admin.system.version")? {
+        if v.get_str("_id") == Ok("featureCompatibilityVersion")
+            && (v.get_str("version") != Ok("8.2") || v.contains_key("targetVersion"))
+        {
+            out.push(format!(
+                "a featureCompatibilityVersion of {:?} (this server serves 8.2)",
+                v.get_str("version").unwrap_or("")
+            ));
+        }
+    }
+    for ns in ["admin.system.users", "admin.system.roles"] {
+        let n = docs(ns)?.len();
+        if n > 0 {
+            out.push(format!(
+                "{n} documents of {ns}, which this server does not read (RM-744)"
+            ));
+        }
+    }
+    for (ns, _) in &idents {
+        let Some((db, "system.views")) = ns.split_once('.') else {
+            continue;
+        };
+        for view in docs(ns)? {
+            let unpacks = view
+                .get_array("pipeline")
+                .ok()
+                .and_then(|p| p.first())
+                .and_then(|s| {
+                    s.as_document()
+                        .map(|s| s.contains_key("$_internalUnpackBucket"))
+                });
+            if unpacks == Some(true) {
+                out.push(format!(
+                    "{}, a time-series collection of {db}, which this server does not open \
+                     yet (RM-754)",
+                    view.get_str("_id").unwrap_or("")
+                ));
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn io_error(home: &Path, e: std::io::Error) -> StorageError {
@@ -461,9 +562,15 @@ mod tests {
     }
 
     #[test]
-    fn a_mongod_store_is_refused_for_now() {
+    fn a_mongod_store_is_opened_and_gets_no_format_file_before_it_opens() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("WiredTiger.wt"), b"").unwrap();
+        fs::write(dir.path().join(STORAGE_BSON), mongod_storage_bson()).unwrap();
+        // Read-only WiredTiger cannot read it: checked again once opened.
+        assert_eq!(prepare(dir.path()).unwrap(), StoreKind::Mongod);
+        assert!(!dir.path().join(FORMAT_FILE).exists());
+        // A directory with mongod's storage.bson and nothing else.
+        let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(STORAGE_BSON), mongod_storage_bson()).unwrap();
         let err = prepare(dir.path()).unwrap_err().to_string();
         assert!(err.contains("written by mongod"), "{err}");

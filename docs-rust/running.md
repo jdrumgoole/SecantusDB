@@ -22,7 +22,7 @@ Both `--flag value` and `--flag=value` spellings work.
 | `--log-level LEVEL` | `DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` |
 | `--cache-size SIZE` | WiredTiger cache, unit-suffixed (`256M`, `1G`, `8G`) | `4G` |
 | `--session-max N` | Max concurrent WiredTiger sessions (≈ client connections) | `1000` |
-| `--sync-on-commit` | fsync every commit (closes the `j: true` gap; large throughput cost) | off |
+| `--sync-on-commit` | fsync every commit, and acknowledge every write as a journaled one (large throughput cost) | off |
 | `--oplog-nonlogged` | Create oplog tables `log=(enabled=false)` — checkpoint-durable only; a crash can lose the oplog tail. Only with `--data-logged`: on the default unlogged data tables the data is recovered from the oplog, so the server refuses it there (a crash would lose every write since the last checkpoint) | off, or `SECANTUS_OPLOG_NONLOGGED` |
 | `--data-nonlogged` | mongod's split: WAL-log only the oplog; data tables recover by oplog replay from the last stable checkpoint (see [Recovery](recovery.md)), and keep the history a snapshot read at a past time (`atClusterTime`) reads. Decided when a store is created; an existing store keeps its mode | on |
 | `--data-logged` | WAL-log the data tables too. No history: a snapshot read at a past time is refused (246) | off |
