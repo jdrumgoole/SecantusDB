@@ -1166,6 +1166,15 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       joins null's group, and one on `[undefined]` is refused (code 2, "not
       supported by the Rust server"). The fix gives MISSING a representation
       of its own, apart from every BSON value. Found 2026-11-13 (RM-525).
+      Sized 2026-11-22 (reproduced, both gap tests OPEN): no `Bson` variant
+      is unstorable, so a sentinel cannot work; the expression result type
+      `R = Result<Bson, Fallback>` (`expressions.rs:52`) must become a value
+      with its own MISSING case, through `expressions.rs` (57 sites),
+      `sbe_ops.rs` (25), `windowfields.rs`, `aggregate.rs`, `group.rs`,
+      `sbe_hashagg.rs`, `group_spill.rs` -- 187 `Bson::Undefined` sites in 30
+      files, each deciding "missing" or "missing or undefined". More than one
+      session: split it (expression engine first, then group/window) before
+      working it.
       Verify: tests/backlog/test_rm_found_2026_11_13_rm525.py::test_a_stored_undefined_is_not_missing, tests/backlog/test_rm_found_2026_11_13_rm525.py::test_a_group_keeps_undefined_apart_from_null
       Backlog-ID: RM-635
 - [ ] **A leading `$match` on `{$size: "$$REMOVE"}` is an executor error.**
