@@ -1319,6 +1319,10 @@ fn retryable_write(
             s.set_retry_image(Some(doc.get("new").is_some_and(crate::util::truthy)));
         }
     }
+    // The write and its session's row (and a `findAndModify`'s image) are
+    // one operation: the row commits at the timestamp of the write's entry,
+    // as mongod writes it in the write's unit of work (RM-746).
+    let _op = ctx.storage.as_ref().and_then(|s| s.op_scope());
     let per_statement = matches!(name, "update" | "delete");
     if per_statement {
         STATEMENT_ROW.with(|r| {

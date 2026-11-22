@@ -125,9 +125,17 @@ def _until_primary(client: pymongo.MongoClient) -> None:
 
 def _stop_mongod(proc: subprocess.Popen, client: pymongo.MongoClient | None) -> None:
     if client is not None:
-        # The connection drops as mongod stops.
-        with contextlib.suppress(pymongo.errors.PyMongoError):
+        # The connection drops as mongod stops. A primary whose set names
+        # another member refuses a plain `shutdown` ("No electable
+        # secondaries caught up", mongod 8.2.11, 2026-11-22) and keeps
+        # running; `force` stops it cleanly all the same.
+        try:
             client.admin.command("shutdown")
+        except pymongo.errors.OperationFailure:
+            with contextlib.suppress(pymongo.errors.PyMongoError):
+                client.admin.command("shutdown", force=True)
+        except pymongo.errors.PyMongoError:
+            pass
         client.close()
     try:
         proc.wait(timeout=60)
@@ -439,7 +447,7 @@ def test_a_restart_raises_the_election_term(tmp_path: Path) -> None:
         assert client.local["replset.election"].find_one()["term"] == 2
 
 
-@pytest.mark.backlog("RM-736")
+@pytest.mark.backlog_fixed("RM-736")
 def test_the_truncate_after_point_follows_the_oplog(tmp_path: Path) -> None:
     """mongod 8.2.11 (measured 2026-11-20): two seconds after a write,
     `local.replset.oplogTruncateAfterPoint` is the timestamp of the oplog's
@@ -627,18 +635,20 @@ def test_a_views_ddl_is_logged_as_mongod_logs_it() -> None:
 ID_INDEX_SPEC = {"v": 2, "key": {"_id": 1}, "name": "_id_"}
 
 
-@pytest.mark.backlog("RM-746")
+@pytest.mark.backlog_fixed("RM-746")
 def test_mongod_opens_a_killed_secantus_store(tmp_path: Path) -> None:
     """mongod 8.2.11's stable timestamp is always an oplog entry's (its
     commit point), so after a crash its checkpoint's recovery timestamp is at
-    or below the oplog's last entry. This server's stable timestamp is its
-    all-committed point, which timestamps minted without an entry move past
-    the last entry; killed, its store has a recovery timestamp and an
-    `oplogTruncateAfterPoint` past the oplog's end, and mongod, opening it,
-    truncates, forces the stable and oldest timestamps back, then aborts on
-    its next `oldest_timestamp` ("set_timestamp: oldest timestamp ... must
-    not be older than current oldest timestamp", invariant in
-    `WiredTigerKVEngine::setOldestTimestamp`; measured 2026-11-21)."""
+    or below the oplog's last entry, and its `oplogTruncateAfterPoint` names
+    an entry it moved there before the journal's last sync. A store killed
+    while this server's stable timestamp was its all-committed point (moved
+    past the last entry by timestamps minted without one) made mongod
+    truncate, force the stable and oldest timestamps back, then abort on its
+    next `oldest_timestamp` (invariant in `WiredTigerKVEngine::
+    setOldestTimestamp`; measured 2026-11-21). Since phase 7b (RM-746) the
+    stable timestamp and the truncate point are entries', and mongod opening
+    the killed store replays the oplog after its stable checkpoint and serves
+    every document."""
 
     def setup(c: pymongo.MongoClient) -> None:
         c.app.c.insert_many([{"_id": i, "a": i % 3} for i in range(100)])
@@ -648,6 +658,10 @@ def test_mongod_opens_a_killed_secantus_store(tmp_path: Path) -> None:
     with _mongod_on_secantus_store(tmp_path, setup, kill=True) as mongod:
         time.sleep(2)  # mongod moves its oldest timestamp as it serves
         assert mongod.app.c.count_documents({}) == 100
+        # A table recovery wrote to is "actively in use" until a checkpoint
+        # takes it: mongod's own killed store warns so too, and validates
+        # clean after an `fsync` (measured 8.2.11, 2026-11-22).
+        mongod.admin.command("fsync")
         assert _validation(mongod, "app", "c") == (True, [], [])
 
 
@@ -717,7 +731,7 @@ def test_secantus_opens_a_killed_mongod_store(tmp_path: Path) -> None:
         assert answer == ("ok", list(range(50)))
 
 
-@pytest.mark.backlog("RM-723")
+@pytest.mark.backlog_fixed("RM-723")
 def test_secantus_refuses_a_set_of_two_members_by_name(tmp_path: Path) -> None:
     """A mongod store whose `local.system.replset` names two members is not
     one a single-node server can serve: `secantusd-mdb` refuses it when it
@@ -739,7 +753,7 @@ def test_secantus_refuses_a_set_of_two_members_by_name(tmp_path: Path) -> None:
     ), said
 
 
-@pytest.mark.backlog("RM-723")
+@pytest.mark.backlog_fixed("RM-723")
 def test_secantus_refuses_an_index_kind_it_does_not_serve_by_name(tmp_path: Path) -> None:
     """A mongod store holding an index this server does not write as mongod
     does (here `hashed`, which it refuses to create) is refused when
@@ -752,3 +766,43 @@ def test_secantus_refuses_an_index_kind_it_does_not_serve_by_name(tmp_path: Path
     store = _mongod_store(tmp_path, setup)
     outcome, said = _secantus_open(store)
     assert (outcome, "app.c" in said, "h_hashed" in said) == ("refused", True, True), said
+
+
+# ------------------------------------------------ storage-model phase 7b --
+# Found comparing the entries mongod 8.2.11 and `secantusd-mdb` log for the
+# same writes (2026-11-22), working RM-746.
+
+
+@pytest.mark.backlog("RM-747")
+def test_a_read_only_transaction_logs_its_majority_no_op(tmp_path: Path) -> None:
+    """mongod 8.2.11 commits a read-only transaction under its implicit
+    `w: "majority"` by logging a no-op, `{op: "n", o: {msg: "read-only
+    transaction with writeConcern { w: \\"majority\\", ... }"}}` (measured
+    2026-11-22), so the commit waits on a write of its own. This server logs
+    nothing for it."""
+    with rust_mongo_server(tmp_path / "store") as client:
+        client.app.c.insert_one({"_id": 1})
+        start = next(client.local["oplog.rs"].find().sort("$natural", -1).limit(1))["ts"]
+        with client.start_session() as session, session.start_transaction():
+            client.app.c.find_one({"_id": 1}, session=session)
+        entries = [
+            (e["op"], str(e.get("o", {}).get("msg", ""))[:39])
+            for e in client.local["oplog.rs"].find({"ts": {"$gt": start}})
+        ]
+    assert entries == [("n", "read-only transaction with writeConcern")]
+
+
+@pytest.mark.backlog("RM-748")
+def test_the_initiation_logs_the_pre_images_collection(tmp_path: Path) -> None:
+    """mongod 8.2.11's initiation logs the creation of
+    `config.system.preimages` (`{op: "c", ns: "config.$cmd", o: {create:
+    "system.preimages", clusteredIndex: ...}}`, measured 2026-11-22), as it
+    logs every collection it creates then. This server creates it
+    unreplicated, with no entry."""
+    with rust_mongo_server(tmp_path / "store") as client:
+        creates = [
+            e["o"]["create"]
+            for e in client.local["oplog.rs"].find({"op": "c", "ns": "config.$cmd"})
+            if "create" in e["o"]
+        ]
+    assert "system.preimages" in creates, creates

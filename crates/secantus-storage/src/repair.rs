@@ -200,13 +200,16 @@ impl Storage {
         let ns_lock = self.coll_lock(db, coll);
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _gen = self.ddl_generation_scope();
+        // Every write here logs no entry and is untimestamped, as mongod's
+        // repair writes (RM-746).
+        let _untimestamped = untimestamped();
         let session = self.conn.open_session()?;
 
         // The `_id` index: emptied, then one entry per document.
         let id_table = index_table_of(&session, db, coll, ID_INDEX_NAME)?;
         if let Some(table) = &id_table {
             loop {
-                session.begin_transaction(None)?;
+                begin_untimestamped(&session, self.timestamped)?;
                 let removed = (|| -> Result<usize> {
                     let cur = session.open_cursor(table, None)?;
                     let mut keys = Vec::new();
@@ -228,7 +231,7 @@ impl Storage {
                 })();
                 match removed {
                     Ok(n) => {
-                        commit_stamped(&session, &self.oplog, self.timestamped)?;
+                        commit_untimestamped(&session)?;
                         if n < PURGE_CHUNK_MAX_ROWS {
                             break;
                         }
@@ -251,7 +254,7 @@ impl Storage {
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
         let mut duplicates = 0u64;
         for chunk in rows.chunks(PURGE_CHUNK_MAX_ROWS) {
-            session.begin_transaction(None)?;
+            begin_untimestamped(&session, self.timestamped)?;
             let written = (|| -> Result<u64> {
                 let Some(table) = &id_table else {
                     return Ok(0);
@@ -285,7 +288,7 @@ impl Storage {
             })();
             match written {
                 Ok(dup) => {
-                    commit_stamped(&session, &self.oplog, self.timestamped)?;
+                    commit_untimestamped(&session)?;
                     duplicates += dup;
                 }
                 Err(e) => {
@@ -326,7 +329,7 @@ impl Storage {
             }
         }
         for (name, key, options) in &indexes {
-            session.begin_transaction(None)?;
+            begin_untimestamped(&session, self.timestamped)?;
             let outcome = (|| -> Result<()> {
                 let c = session.open_cursor(IDX_TABLE, None)?;
                 c.set_key_sss(db, coll, name);
@@ -339,7 +342,7 @@ impl Storage {
                 Ok(())
             })();
             match outcome {
-                Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped)?,
+                Ok(()) => commit_untimestamped(&session)?,
                 Err(e) => {
                     session.rollback_transaction(None)?;
                     return Err(e);

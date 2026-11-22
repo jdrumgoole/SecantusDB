@@ -86,16 +86,19 @@ These work end-to-end but cut corners.
   oplog entries, `replSetGetStatus` and `hello` with it.
   Verify: tests/backlog/test_rm_storage_model.py::test_a_restart_raises_the_election_term
   Backlog-ID: RM-735
-- [ ] **`local.replset.oplogTruncateAfterPoint` is refreshed at a checkpoint,
-  not every 100 ms, and recovery does not truncate after it.** mongod's
-  journal flusher moves it to the all-durable timestamp each cycle (measured
-  2026-11-20: equal to the oplog's last entry two seconds after a write) and a
-  recovery truncates the oplog after it. Here it moves with each stable
-  checkpoint and at close, and recovery replays every entry. Truncating would
-  lose acknowledged writes unless acknowledgement waits for the flusher's
-  cycle as mongod's does (here a write is acknowledged after its own commit's
-  sync): the two change together, and the second is a decision for Joe.
-  Verify: tests/backlog/test_rm_storage_model.py::test_the_truncate_after_point_follows_the_oplog
+- [ ] **Recovery does not truncate the oplog after
+  `local.replset.oplogTruncateAfterPoint`.** mongod's recovery truncates the
+  oplog after the point first (`ReplicationRecovery::
+  _truncateOplogIfNeededAndThenClearOplogTruncateAfterPoint`), then replays
+  from the stable timestamp. Since phase 7b the point moves as mongod's does
+  (the newest entry at or below the all-committed point, before every
+  journal flush: every 100 ms, and before a journaled write's sync), but this
+  server's recovery still replays every entry the journal holds. Truncating
+  would lose a write acknowledged in the last 100 ms (here a write is
+  acknowledged after its own commit's sync; on mongod a `w: 1` write is
+  acknowledged before the flusher's cycle and is lost too): that is the
+  decision for Joe.
+  Verify: none -- a decision: whether this server's own recovery truncates as mongod's does, losing what it now acknowledges as durable
   Backlog-ID: RM-736
 - [ ] **A PITR archive cannot prove that nothing was truncated between two
   segments.** The oplog's own mark of where it begins is mongod's, the
@@ -3057,8 +3060,14 @@ produce the dump it exists for.
       filed below excepted). The reverse is still refused, by name, at
       `store_format::prepare`: `secantusd-mdb` on a store mongod wrote (it
       has `storage.bson` and no `secantus.format`) exits with "written by
-      mongod ... not supported yet". What opening one needs (measured, plan
-      phase 7's "As built"): the registry, placements and index rows rebuilt
+      mongod ... not supported yet". Since phase 7b the refusal also names,
+      read with WiredTiger opened read-only, what in the store this server
+      could not serve were it opened: a set of more than one member, an
+      index of a kind it does not key as mongod does, a collection or index
+      option it does not keep, an FCV other than 8.2, users and roles; a
+      killed mongod's store, whose log needs recovery, is refused without
+      that list. What opening one needs (measured, plan phase 7's and 7b's
+      "As built"): the registry, placements and index rows rebuilt
       from `_mdb_catalog` and `system.views`; the refusals by name of a set
       with more than one member, of an index kind this server does not key
       as mongod does (`2d`, `2dsphere`, `hashed`, text, wildcard) and of a
@@ -3068,7 +3077,7 @@ produce the dump it exists for.
       the oplog after the stable checkpoint. Decided (Joe, 2026-11-19): both
       directions, with mongod started as a replica-set member.
       Backlog-ID: RM-723
-      Verify: tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_mongod_store, tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_killed_mongod_store, tests/backlog/test_rm_storage_model.py::test_secantus_refuses_a_set_of_two_members_by_name, tests/backlog/test_rm_storage_model.py::test_secantus_refuses_an_index_kind_it_does_not_serve_by_name
+      Verify: tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_mongod_store, tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_killed_mongod_store
 - [ ] **There is no `shutdown` command.** mongod 8.2.11 stops on
       `db.adminCommand({shutdown: 1})`: the connection closes and the
       process exits cleanly. `secantusd-mdb` answers CommandNotFound (59)
@@ -3127,27 +3136,35 @@ wrote and stopped (the forward direction of RM-723).
       the pipeline) and `drop`, and writes the `system.views` document
       unreplicated beside them. Change streams read those commands, so a fix
       also derives their view events from the `system.views` writes, as
-      mongod's change stream does.
+      mongod's change stream does. Since a killed store opens in mongod
+      (RM-746, phase 7b), this is what still stops one: mongod replaying a
+      view's `create` entry from our oplog fails it ("'viewPipeline' is not a
+      valid collection option", InvalidOptions) and aborts its recovery
+      (measured 2026-11-22, a kill probe whose workload makes views).
       Backlog-ID: RM-745
       Verify: tests/backlog/test_rm_storage_model.py::test_a_views_ddl_is_logged_as_mongod_logs_it
-- [ ] **After a crash, our checkpoint's recovery timestamp can be past the
-      oplog's last entry, and mongod aborts on such a store.** mongod's
-      stable timestamp is always an oplog entry's; this server's is its
-      all-committed point, which timestamps minted without an entry (a
-      cluster-time mint, a write with no entry of its own stamped by
-      `reserve_stamp`) move past the last entry. Killed, its store's
-      `oplogTruncateAfterPoint` and recovery timestamp are past the oplog's
-      end; mongod truncates, forces its stable and oldest timestamps back to
-      the last entry, keeps its own oldest from the checkpoint, and aborts
-      on the next `oldest_timestamp` (invariant in
-      `WiredTigerKVEngine::setOldestTimestamp`). A clean close is fine
-      (phase 7 clears the truncate point, as mongod's clean stop does).
-      **Decided (Joe, 2026-11-21): option A** -- every timestamped write to
-      an unlogged table gets an oplog entry at its timestamp (or becomes an
-      untimestamped write to a logged table), as mongod; the stable
-      timestamp is the newest committed entry.
-      Backlog-ID: RM-746
-      Verify: tests/backlog/test_rm_storage_model.py::test_mongod_opens_a_killed_secantus_store
+
+## Found working RM-746 (storage-model phase 7b, 2026-11-22)
+
+Each was measured by running the same writes on mongod 8.2.11 and on
+`secantusd-mdb`, one-member sets, and reading what each logged.
+
+- [ ] **A read-only transaction's commit logs nothing.** mongod 8.2.11
+      commits a read-only transaction under its implicit `w: "majority"` by
+      logging a no-op, `{op: "n", o: {msg: "read-only transaction with
+      writeConcern { w: \"majority\", ... }"}}`, so the commit waits on a
+      write of its own; this server logs no entry.
+      Verify: tests/backlog/test_rm_storage_model.py::test_a_read_only_transaction_logs_its_majority_no_op
+      Backlog-ID: RM-747
+- [ ] **The initiation logs no creation of `config.system.preimages`.**
+      mongod's initiation logs every collection it creates, the pre-images
+      collection's as `{op: "c", ns: "config.$cmd", o: {create:
+      "system.preimages", clusteredIndex: ...}}`; this server creates it
+      unreplicated, with no entry, so a mongod replaying this oplog from
+      genesis has no such `create`. (The initiation's other differences:
+      no `new primary` no-op, RM-735; no `admin.system.keys` documents.)
+      Verify: tests/backlog/test_rm_storage_model.py::test_the_initiation_logs_the_pre_images_collection
+      Backlog-ID: RM-748
 
 ## Found in CI on 2026-11-19
 

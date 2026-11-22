@@ -553,6 +553,10 @@ impl CmdStorage for StorageAdapter {
         Some(Box::new(secantus_storage::unreplicated()))
     }
 
+    fn op_scope(&self) -> Option<Box<dyn std::any::Any>> {
+        Some(Box::new(self.inner.op_scope()))
+    }
+
     fn high_water_mark_token(&self, seq: i64) -> Vec<u8> {
         match changestreams::make_high_water_mark_token(seq) {
             Ok(doc) => {

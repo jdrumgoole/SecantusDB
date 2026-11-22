@@ -1038,6 +1038,109 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
    `::test_secantus_opens_a_killed_mongod_store`,
    `::test_secantus_refuses_a_set_of_two_members_by_name`,
    `::test_secantus_refuses_an_index_kind_it_does_not_serve_by_name`.
+
+   **As built (phase 7b, RM-746 and the reverse refusals; store format 9,
+   unchanged).** The layout did not change, so the format stays 9; what
+   changed is which timestamp each write commits at, and the timestamps a
+   checkpoint and the truncate point name.
+   - **What mongod logs an entry for** (8.2.11, measured 2026-11-22 on a
+     one-member set): every DDL (`create`, `createIndexes`, a build's
+     `startIndexBuild` / `commitIndexBuild` with its `config.system.
+     indexBuilds` insert, update and delete, `collMod`, `dropIndexes`,
+     `drop`, a view's insert into `system.views`), every replicated
+     document write (a retryable one with `lsid`, `txnNumber`, `stmtId`), a
+     transaction's `applyOps`, `config.system.sessions` inserts. No entry
+     for: the FCV document at initiation, a session's `config.transactions`
+     row, `config.image_collection`, `system.profile`, `replSetResizeOplog`,
+     a `setFeatureCompatibilityVersion` to the version it has, a retryable
+     update that matched nothing. mongod writes the first group at their
+     entries' timestamps (one unit of work) and the second untimestamped.
+   - **The stable timestamp is the newest oplog entry at or below the
+     all-committed point** (`advance_timestamps`, one cursor `search_near`
+     on the oplog per 250 ms tick; nothing on the write path). A
+     cluster-time mint and a write without an entry no longer move it, so
+     a checkpoint's recovery timestamp is always an entry's.
+   - **`oplogTruncateAfterPoint` is the newest entry at or below the
+     all-committed point, moved before every journal sync** (the 100 ms
+     flusher, a journaled write's wait and each stable checkpoint), as
+     mongod's journal flusher moves it; written in place into its logged
+     `local` table. mongod truncating after it after a kill keeps every
+     entry the journal held. (RM-736's other half, this server's own
+     recovery truncating after the point, stays a decision.)
+   - **`reserve_stamp` is gone.** A write that logs no entry commits
+     untimestamped (`begin_transaction(no_timestamp=true)` where it is
+     known in advance: `unreplicated()`, the new `untimestamped()` guard,
+     the oplog off), except inside an operation's scope (`Storage::
+     op_scope`): there it commits at the newest timestamp the operation's
+     entries committed at, which each entry holds above the stable
+     timestamp until the operation ends. Scopes: a retryable write (its
+     `config.transactions` row and `findAndModify` image), `commitTransaction`
+     (its row), `drop`, `dropDatabase`, `renameCollection`, a view's create
+     and `collMod`, an index build's begin, commit and abort. Untimestamped:
+     what the store writes as it opens, catalog and user-record writes
+     (`catalog_write_on`), an index build's keys and side-write drains (as
+     mongod's bulk load; a cut-short build restarts from an empty table),
+     `system.profile` (now `unreplicated()`), `replSetResizeOplog`, oplog
+     and pre-image pruning, a PITR import's deletions, `repair`. The oplog
+     entries a transaction of their own writes (the initiating entry, a
+     prepared transaction's entries and abort) commit at their own
+     timestamp. A replicated statement that ends with no entry and wrote a
+     row an earlier write timestamped is refused by WiredTiger; that is
+     reported as an internal error naming RM-746's rule, never a retried
+     write conflict.
+   - **Found on the way: a nested statement transaction dropped the outer
+     one's minted ranges.** `log_index_build` inserts its `config.system.
+     indexBuilds` row through the public API inside its own statement; the
+     inner statement deregistered the outer one's oplog ranges before the
+     outer transaction committed (the visible tail could pass entries not
+     yet committed) and the outer one then committed with no entry of its
+     own. The inner statement now keeps the outer ranges aside and gives
+     them back.
+   - **Killed under load, mongod opens the store**: twelve rounds of eight
+     concurrent workloads (inserts, `j: true` inserts, updates, retryable
+     `findAndModify`, transactions, collection and index DDL, deletes, bulk
+     inserts with index builds), SIGKILL at 0.5-4 s or past the first
+     stable checkpoint: mongod 8.2.11 primary every time, `validate` clean
+     after an `fsync` (before it, a table recovery wrote warns "actively in
+     use" on mongod's own killed store too, measured), no `j: true` write
+     lost. Views excepted: mongod's recovery fails on our view `create`
+     entry (RM-745).
+   - **The reverse refusals.** `store_format::prepare`, finding a mongod
+     store, opens WiredTiger read-only and names in its refusal what this
+     server could not serve: a `local.system.replset` of more than one
+     member, an index of a kind it does not key as mongod does (`2d`,
+     `2dsphere`, `hashed`, text, wildcard, columnstore), a collection or
+     index option outside what it keeps, an FCV other than 8.2, documents
+     of `admin.system.users` / `roles` (RM-744: this server does not read
+     them, so they are refused, not skipped). A killed mongod's store needs
+     log recovery, which read-only WiredTiger will not run: it is refused
+     without the list. `test_secantus_refuses_a_set_of_two_members_by_name`
+     and `test_secantus_refuses_an_index_kind_it_does_not_serve_by_name`
+     pass (the helper's mongod stop now falls back to `shutdown` with
+     `force`: mongod refuses a plain one while its set names another
+     member, and the test had been killing it after 60 s).
+   - **Filed** (the same writes run on both, what each logged compared):
+     a read-only transaction's commit logs no `w: "majority"` no-op
+     (RM-747); the initiation logs no `create` of `config.system.preimages`
+     (RM-748). RM-745 now names what it costs a killed store; RM-736 keeps
+     only its decision (this server's own recovery truncating).
+   - **Not built: opening and serving a mongod store, clean or killed.**
+     What remains is the list above ("What opening one needs"), unchanged,
+     plus: the format file is written only once the open has succeeded
+     (mongod ignores it, so the store stays mongod-openable). Still to
+     measure when it is built: whether mongod's `admin.system.keys` and
+     `config.system.sessions` serve as ordinary collections here; whether
+     its drop-pending idents (tables no catalog row names, which this
+     server's `reconcile_idents` drops at open) are what mongod's own
+     restart drops; whether mongod's `local.replset.*` and `minvalid`
+     documents read as this server's (mongod reads ours, phase 7). The
+     killed store's recovery is mongod's
+     `ReplicationRecovery` on our replay: truncate after the point, then
+     replay from the stable timestamp every entry form mongod writes (the
+     `create` with `idIndex`, `startIndexBuild` / `commitIndexBuild` with
+     their `config.system.indexBuilds` writes, `applyOps`, the `new
+     primary` and periodic no-ops), compared document for document with
+     mongod's own restart on a copy of the same store.
 8. **Clean-up.** Remove the legacy-table readers, the shard routing and the
    format markers this replaces; rewrite the layout tests below. Update
    CLAUDE.md's "One on-disk format" section, the `python-servers` skill's

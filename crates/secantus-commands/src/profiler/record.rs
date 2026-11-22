@@ -467,6 +467,9 @@ fn write(ctx: &CommandContext, db: &str, entry: &Document) {
     let Some(storage) = ctx.storage.as_ref() else {
         return;
     };
+    // `system.profile` is not replicated: mongod logs no entry for it and
+    // writes it untimestamped (RM-746).
+    let _unreplicated = storage.unreplicated();
     let result = (|| -> Result<(), String> {
         if !storage
             .collection_exists(db, PROFILE_COLLECTION)

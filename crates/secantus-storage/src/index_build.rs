@@ -756,6 +756,10 @@ impl Storage {
         specs: &[IndexBuildSpec],
         member: &str,
     ) -> Result<()> {
+        // One operation: what it writes after its entry shares the entry's
+        // timestamp, and what it writes before it is untimestamped, over
+        // rows earlier writes timestamped (RM-746).
+        let _op = self.ddl_scope();
         // A type this engine does not build is refused before anything is
         // written, as the one-step build refuses it. The build over documents
         // (#2191) skipped the check, and a text index came back created.
@@ -906,6 +910,10 @@ impl Storage {
     /// `commitIndexBuild`. An error leaves the build registered, for
     /// [`Self::abort_index_build`].
     pub fn commit_index_build(&self, uuid: &[u8; 16]) -> Result<()> {
+        // One operation: what it writes after its entry shares the entry's
+        // timestamp, and what it writes before it is untimestamped, over
+        // rows earlier writes timestamped (RM-746).
+        let _op = self.ddl_scope();
         let b = self.registered_build(uuid)?;
         let _finishing;
         {
@@ -991,6 +999,10 @@ impl Storage {
     /// removed, `abortIndexBuild` is logged, and it is unregistered. A
     /// build no longer registered is a no-op.
     pub fn abort_index_build(&self, uuid: &[u8; 16], cause: &IndexBuildAbort) -> Result<()> {
+        // One operation: what it writes after its entry shares the entry's
+        // timestamp, and what it writes before it is untimestamped, over
+        // rows earlier writes timestamped (RM-746).
+        let _op = self.ddl_scope();
         let Some(b) = self.index_builds.get(uuid) else {
             return Ok(());
         };
@@ -1277,6 +1289,10 @@ impl Storage {
 
     /// One bounded transaction of sorted entries.
     fn load_entries(&self, b: &ActiveBuild, ix: &BuildIndex, chunk: &[EntryKey]) -> Result<()> {
+        // A build writes its keys untimestamped, as mongod's bulk load
+        // does: the index is not ready, and a build cut short by a crash
+        // starts again from an empty table (RM-746).
+        let _untimestamped = untimestamped();
         let table = ix.table()?;
         self.retry_write_conflicts("index_build_load", || {
             let session = self.op_session()?;
@@ -1293,6 +1309,8 @@ impl Storage {
     /// Apply up to [`DRAIN_BATCH`] recorded writes, oldest first, in one
     /// transaction that also removes them. Answers how many.
     fn drain_side_writes(&self, b: &ActiveBuild) -> Result<usize> {
+        // Untimestamped, as the build's keys are (RM-746).
+        let _untimestamped = untimestamped();
         self.retry_write_conflicts("index_build_drain", || {
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
@@ -1583,6 +1601,8 @@ impl Storage {
 
     /// Remove every recorded write of build `uuid`.
     fn discard_side_rows(&self, uuid: &[u8; 16]) -> Result<()> {
+        // Untimestamped, as the build's keys are (RM-746).
+        let _untimestamped = untimestamped();
         loop {
             let removed = self.retry_write_conflicts("index_build_side_purge", || {
                 let session = self.op_session()?;

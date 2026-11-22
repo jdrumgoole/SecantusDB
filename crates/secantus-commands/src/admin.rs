@@ -5481,6 +5481,8 @@ pub fn profile(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     if level.is_some_and(|l| l > 0) {
         let storage = ctx.storage()?;
+        // Not replicated: no entry, and untimestamped (RM-746).
+        let _unreplicated = storage.unreplicated();
         if !storage
             .collection_exists(&db, crate::profiler::PROFILE_COLLECTION)
             .map_err(command_error)?
