@@ -61,11 +61,11 @@ def _answers(client: Any, pipelines: dict[str, list]) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-635")
+@pytest.mark.backlog_fixed("RM-635")
 def test_a_stored_undefined_is_not_missing(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `$type` of a stored `undefined` reads "undefined",
     read as a field, an array element, a `$let` variable or a field an
-    `$addFields` copied it to. This server reads "missing" in each."""
+    `$addFields` copied it to. This server read "missing" in each (RM-635)."""
     pipelines = {
         "field": [SORT, {"$project": {"t": {"$type": "$a"}}}],
         "array element": [

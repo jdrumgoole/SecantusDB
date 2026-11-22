@@ -811,9 +811,11 @@ fn computed_value(expr: &Bson, root: &Document, input: Option<&Stored>, vars: &D
             }
         }
     }
-    match crate::expressions::evaluate_or_missing(root, expr, vars) {
-        Ok(Bson::Undefined) | Err(_) => Built::Missing,
-        Ok(v) => Built::Leaf(Held::Bytes(produced_held(expr, &v))),
+    match crate::expressions::evaluate_field(root, expr, vars) {
+        Ok(crate::expressions::Field::Missing) | Err(_) => Built::Missing,
+        Ok(crate::expressions::Field::Value(v)) => {
+            Built::Leaf(Held::Bytes(produced_held(expr, &v)))
+        }
     }
 }
 

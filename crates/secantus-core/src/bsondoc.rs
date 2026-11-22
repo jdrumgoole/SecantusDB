@@ -210,6 +210,33 @@ pub fn string_from_bytes(bytes: Vec<u8>) -> Bson {
     }
 }
 
+/// The key of the one field of a held `undefined`'s carrier. Not the escape
+/// of a name either: an escaped byte is a NUL and two hex digits.
+pub const HELD_UNDEFINED_KEY: &str = "\0undefined";
+
+/// A BSON `undefined` VALUE, held as an expression's result (RM-635).
+///
+/// The expression engine spells MISSING `Bson::Undefined`, so a result that
+/// is the real `undefined` -- a stored field, an array element, a variable
+/// bound from one -- cannot also be `Bson::Undefined`, or `$type` reads it as
+/// "missing" and a `$project` drops it. An expression result that must tell
+/// the two apart holds the real one as this carrier, a document no client can
+/// send (a BSON key is a NUL-terminated C string) and no encoder writes: the
+/// crate's own refuses its NUL key, so a carrier that is not turned back
+/// (`expressions::stored`) fails its write loudly instead of storing a
+/// document. It lives only between the expression engine's own functions;
+/// nothing stored or sent ever holds one.
+pub fn held_undefined() -> Bson {
+    let mut d = Document::new();
+    d.insert(HELD_UNDEFINED_KEY, Bson::Null);
+    Bson::Document(d)
+}
+
+/// Whether `v` is [`held_undefined`]'s carrier.
+pub fn is_held_undefined(v: &Bson) -> bool {
+    matches!(v, Bson::Document(d) if d.len() == 1 && d.contains_key(HELD_UNDEFINED_KEY))
+}
+
 /// The bytes `v` carries when it is an invalid-UTF-8 string's carrier.
 pub fn as_invalid_utf8(v: &Bson) -> Option<&[u8]> {
     let Bson::Document(d) = v else {

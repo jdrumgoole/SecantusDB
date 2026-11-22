@@ -612,10 +612,11 @@ fn with_computed(
     vars: &Document,
 ) -> R<()> {
     for (key, expr) in computed {
-        let value = crate::expressions::evaluate_or_missing(doc, expr, vars)?;
-        if matches!(value, Bson::Undefined) {
+        let crate::expressions::Field::Value(value) =
+            crate::expressions::evaluate_field(doc, expr, vars)?
+        else {
             continue; // the bare-reference case: leave the field out entirely
-        }
+        };
         set(result, key, value)?;
     }
     Ok(())
