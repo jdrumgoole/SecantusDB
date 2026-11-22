@@ -932,6 +932,112 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
    any index kind phase 4 refuses, and any catalog option it does not
    implement. An unclean mongod shutdown (journal and oplog recovery
    pending) is tested too, since recovery is now mongod's model.
+
+   **As built (phase 7, forward direction, store format 9).** mongod 8.2.11
+   on a store `secantusd-mdb` wrote and stopped cleanly, what it refused, in
+   order (each read from its log, fixed, then the next):
+   - **The set's name and address.** Started `--replSet rs0` on another
+     port, mongod leaves the store REMOVED ("NodeNotFound", "set name
+     differs"): its own store does the same. The test starts it as the
+     store's set (`secantus`) on the port its one member names. Not a store
+     difference.
+   - **`oplogTruncateAfterPoint` left set by a clean close** (the
+     all-committed point, one past the last oplog entry). mongod's clean
+     stop leaves `Timestamp(0, 0)` (measured). Set, mongod truncates after
+     the last entry, forces stable and oldest back to it, keeps its own
+     oldest from the checkpoint (stable minus 300 s), and its next
+     `oldest_timestamp` goes backwards: invariant, abort. `Storage::close`
+     now clears it (`clear_oplog_truncate_after_point`).
+   - **A view in `_mdb_catalog`** ("'viewPipeline' is not a valid
+     collection option"): a view had a placement, a table and an `_id_`
+     table. On mongod a view, and a time-series collection, is a
+     `<db>.system.views` document and nothing else (measured: `{_id, viewOn,
+     pipeline, collation?}`; a time-series one `{viewOn:
+     "system.buckets.<n>", pipeline: [{$_internalUnpackBucket: {timeField,
+     metaField?, bucketMaxSpanSeconds}}]}`). Now a view-defining namespace
+     keeps its registry row (the working set) and is unplaced at create;
+     `system.views` is a real collection written beside each view DDL and
+     brought in line at every open (`sync_system_views`; the shapes are
+     `secantus_core::viewdefs`); `system.buckets.<n>`'s catalog entry has
+     mongod's options (`uuid, validator, clusteredIndex: true,
+     expireAfterSeconds?, timeseries`) and
+     `md.timeseriesBucketsMayHaveMixedSchemaData: false`.
+   - **A multikey index** failed `validate`: six extra entries (the
+     whole-array keys, phase 4b's note) and "multikey paths do not cover"
+     (an index built over existing documents recorded the flag, not the
+     paths). Entries are mongod's keys alone now; an equality to an array
+     probes the array and its first element (`undefined` for an empty one),
+     the points of mongod's bounds, in `scan_bounds::equality` and in the
+     prefix scans (`scan_index_for_id_keys`). Builds record `multikeyPaths`
+     (`BuildIndex::note_multikey`, `plan_index_entries`). A `2d`, `hashed`,
+     text or wildcard index's catalog entry has no `multikeyPaths` and
+     mongod's flag: a wildcard index with paths made mongod's planner trip
+     on every query of its collection.
+   - **A killed store** (found probing the same forward direction after a
+     SIGKILL): its checkpoint lacked the feature-compatibility version
+     (written by the server after the initiation's checkpoint; fassert
+     40652) and `local.system.replset` (made at bind; mongod started
+     uninitiated and dropped every collection made since as unknown idents).
+     The store's initiation now writes the FCV before its checkpoint, and
+     recording a new set configuration takes a checkpoint, as
+     `replSetInitiate` does.
+
+   With these, `test_mongod_opens_the_phase_0b_store` passes: phase 0b's
+   scenario written by `secantusd-mdb`, mongod primary on it, `validate`
+   clean on every collection (the `local` ones mongod itself keeps busy
+   warn as they do on its own store, measured), every document and hinted
+   index walk byte for byte as SecantusDB served it, and a change stream
+   resumed from a SecantusDB token. Store format 9 (views, whole-array keys).
+
+   **Still different from mongod, filed:** `2d` keys (RM-741), `2dsphere`
+   keys (RM-742) and wildcard keys (RM-743), which the scenario's indexes of
+   those kinds are dropped for (hashed and text are refused at create);
+   users and roles in private tables (RM-744); a view's DDL logged as
+   commands, its `system.views` writes unreplicated (RM-745); after a crash
+   the recovery timestamp can pass the oplog's end, which aborts mongod
+   (RM-746). **Decided (Joe, 2026-11-21): option A** -- every timestamped
+   write to an unlogged table gets an oplog entry at its timestamp (or
+   becomes an untimestamped write to a logged table), as mongod; the
+   stable timestamp is the newest committed entry. Built in the next
+   slice, with the reverse direction. The SQL server's
+   store opens in mongod too now; its documents carry the `__sys_*` columns
+   (RP-1074).
+
+   **The reverse direction is not built** (RM-723 stays open). Today
+   `store_format::prepare` refuses a mongod store by name and touches
+   nothing. What opening one needs, measured on mongod 8.2.11 stores
+   (`tools/probes/mongod_store_layout.py`, the fixtures):
+   - accept a store with `storage.bson` and no `secantus.format`, and write
+     the format file only once the open has succeeded;
+   - rebuild this server's registry from `_mdb_catalog`: a
+     `secantus_collections` row per catalog entry (its options), a
+     `secantus_idents` placement per entry (`ident`, its row id,
+     `idxIdent`, clustered from `clusteredIndex`), a `secantus_indexes` row
+     per `md.indexes` element with the stored options this server keeps
+     (`multikey`, `multikeyPaths` as path strings, the build stamps),
+     view and time-series rows from `system.views`, and the time-series
+     collection's own index rows from its buckets' (the inverse of
+     `ts_buckets::bucket_key`);
+   - refuse by name, before writing anything: a `local.system.replset`
+     with more than one member; an index of a kind this server does not key
+     as mongod does (`2d`, `2dsphere`, wildcard until RM-741 to RM-743,
+     `hashed`, text); any catalog option or index option it does not
+     implement; a store at an FCV other than 8.2;
+   - size counts from mongod's `sizeStorer` with no clean-close marker (one
+     walk, as an unclean open does now);
+   - users and roles from `admin.system.users` and `admin.system.roles`
+     (RM-744);
+   - recovery of a killed mongod's store: WiredTiger recovers the logged
+     tables; the oplog after `get=recovery` is replayed, mongod's
+     `ReplicationRecovery` (truncating after `oplogTruncateAfterPoint`
+     first), which needs replay of every entry form mongod writes
+     (`startIndexBuild`/`commitIndexBuild`, `new primary` and periodic
+     no-ops, `applyOps`, `create` with `idIndex`);
+   - a set name other than `secantus`: the server takes the stored one.
+   Gap tests: `test_secantus_opens_a_mongod_store`,
+   `::test_secantus_opens_a_killed_mongod_store`,
+   `::test_secantus_refuses_a_set_of_two_members_by_name`,
+   `::test_secantus_refuses_an_index_kind_it_does_not_serve_by_name`.
 8. **Clean-up.** Remove the legacy-table readers, the shard routing and the
    format markers this replaces; rewrite the layout tests below. Update
    CLAUDE.md's "One on-disk format" section, the `python-servers` skill's

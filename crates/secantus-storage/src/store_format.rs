@@ -29,7 +29,7 @@ use crate::{Result, StorageError};
 /// The layout version this build writes and reads. Every change to the
 /// on-disk layout moves it on (each phase of the storage-model plan does),
 /// and a store at any other version is refused.
-pub const STORE_FORMAT_VERSION: u32 = 8;
+pub const STORE_FORMAT_VERSION: u32 = 9;
 
 /// The file holding [`STORE_FORMAT_VERSION`] in a SecantusDB-written store.
 pub const FORMAT_FILE: &str = "secantus.format";
@@ -296,22 +296,27 @@ mod tests {
     }
 
     #[test]
-    fn the_previous_layouts_are_refused_and_this_one_is_format_8() {
+    fn the_previous_layouts_are_refused_and_this_one_is_format_9() {
+        // Format 8 kept a view (and a time-series collection's own
+        // namespace) as a collection with tables and an `_mdb_catalog` row,
+        // and a multikey index held the whole leaf array as an entry besides
+        // its elements; format 9 keeps a view as a `system.views` document
+        // and an index holds mongod's keys only.
         // Format 7 kept the collection sizes in `secantus_size_storer`, keyed
         // by namespace (`key_format=SS`); format 8 keeps them in mongod's
         // `sizeStorer`, keyed by the ident's table URI, with only the index
         // bytes and the clean-close marker in this server's own table.
         // Format 6 held a document in its table as `[id_key length][id_key]
         // [BSON]`; format 7 stores the document alone, as mongod does.
-        assert_eq!(STORE_FORMAT_VERSION, 8);
-        for old in ["4", "5", "6", "7"] {
+        assert_eq!(STORE_FORMAT_VERSION, 9);
+        for old in ["4", "5", "6", "7", "8"] {
             let dir = tempfile::tempdir().unwrap();
             fs::write(dir.path().join("WiredTiger.wt"), b"").unwrap();
             fs::write(dir.path().join(STORAGE_BSON), mongod_storage_bson()).unwrap();
             fs::write(dir.path().join(FORMAT_FILE), format!("{old}\n")).unwrap();
             let err = prepare(dir.path()).unwrap_err().to_string();
             assert!(err.contains(&format!("store format {old}")), "{err}");
-            assert!(err.contains("format 8 only"), "{err}");
+            assert!(err.contains("format 9 only"), "{err}");
         }
     }
 }

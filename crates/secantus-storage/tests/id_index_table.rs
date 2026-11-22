@@ -306,13 +306,11 @@ fn a_time_series_collection_and_the_profile_have_no_id_index() {
     with_db(|st| {
         st.create_collection_with_options("app", "ts", &doc! {"timeseries": {"timeField": "t"}})
             .unwrap();
+        // A time-series collection is mongod's view over its buckets (a
+        // `system.views` document, storage-model phase 7): no table of its
+        // own, so no `_id_` table either.
+        assert_eq!(st.collection_table_name("app", "ts").unwrap(), None);
         assert_eq!(st.index_table_name("app", "ts", "_id_").unwrap(), None);
-        // Its measurements may repeat an `_id`.
-        insert(
-            st,
-            "ts",
-            &[doc! {"_id": 1, "t": 1}, doc! {"_id": 1, "t": 2}],
-        );
         insert(st, "system.profile", &[doc! {"op": "query"}]);
         assert_eq!(
             st.index_table_name("app", "system.profile", "_id_")

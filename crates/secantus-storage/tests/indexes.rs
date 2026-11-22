@@ -120,11 +120,10 @@ fn multikey_array_writes_per_element_entries() {
             .unwrap();
         st.insert_one("app", "c", &enc(&doc! {"_id": 1, "tags": ["py", "go"]}))
             .unwrap();
-        // Two per-element entries + one whole-array entry — the multikey layout.
-        // (Lazily flagging the index `multikey` on *insert* is slice 2d; here we
-        // only assert the entry variants are written. Create-time detection is
-        // covered by `create_index_detects_multikey_on_existing_data`.)
-        assert_eq!(st.index_entries("app", "c", "tags_1").unwrap().len(), 3);
+        // Two per-element entries, mongod's multikey layout (no whole-array
+        // entry). Create-time detection is covered by
+        // `create_index_detects_multikey_on_existing_data`.
+        assert_eq!(st.index_entries("app", "c", "tags_1").unwrap().len(), 2);
     });
 }
 

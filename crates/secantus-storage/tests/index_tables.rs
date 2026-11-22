@@ -120,12 +120,16 @@ fn index_tables(st: &Storage) -> Vec<String> {
         st.index_table_name("config", "system.indexBuilds", "_id_")
             .unwrap(),
     );
-    id_tables.extend(
-        st.list_collections("local")
-            .unwrap()
-            .iter()
-            .filter_map(|c| st.index_table_name("local", c, "_id_").unwrap()),
-    );
+    // So do `admin.system.version`'s (the FCV a new store is initiated
+    // with, storage-model phase 7).
+    for db in ["local", "admin"] {
+        id_tables.extend(
+            st.list_collections(db)
+                .unwrap()
+                .iter()
+                .filter_map(|c| st.index_table_name(db, c, "_id_").unwrap()),
+        );
+    }
     tables_named(st, "table:index-")
         .into_iter()
         .filter(|t| !id_tables.contains(t))
@@ -134,13 +138,16 @@ fn index_tables(st: &Storage) -> Vec<String> {
 
 /// The tables of user collections: `local.oplog.rs`'s own is a
 /// `collection-<UUID>` table too, and so is `config.system.indexBuilds`'s and
-/// each `local` collection's, which a new store holds; none is one of them.
+/// each `local` and `admin` collection's, which a new store holds; none is
+/// one of them.
 fn collection_tables(st: &Storage) -> Vec<String> {
     let mut held: Vec<Option<String>> = vec![st
         .collection_table_name("config", "system.indexBuilds")
         .unwrap()];
-    for c in st.list_collections("local").unwrap() {
-        held.push(st.collection_table_name("local", &c).unwrap());
+    for db in ["local", "admin"] {
+        for c in st.list_collections(db).unwrap() {
+            held.push(st.collection_table_name(db, &c).unwrap());
+        }
     }
     tables_named(st, "table:collection-")
         .into_iter()
@@ -233,9 +240,8 @@ fn a_multikey_index_holds_an_entry_per_element() {
         let mut want = BTreeSet::new();
         for (rid, d) in documents(st, "c") {
             match d.get("t").unwrap() {
-                // One entry per distinct element, and the whole array: the
-                // key this store writes besides mongod's, so that an
-                // equality to the array finds it.
+                // One entry per distinct element and nothing else: mongod's
+                // keys (its `validate` counts any other entry as extra).
                 Bson::Array(items) => {
                     let mut seen = Vec::new();
                     for v in items {
@@ -244,12 +250,6 @@ fn a_multikey_index_holds_an_entry_per_element() {
                             want.insert(expected_entry(&[1], std::slice::from_ref(v), rid, None));
                         }
                     }
-                    want.insert(expected_entry(
-                        &[1],
-                        &[Bson::Array(items.clone())],
-                        rid,
-                        None,
-                    ));
                 }
                 v => {
                     want.insert(expected_entry(&[1], std::slice::from_ref(v), rid, None));
@@ -397,11 +397,15 @@ fn dropping_an_index_or_its_collection_drops_the_table() {
         let builds = st
             .index_table_name("config", "system.indexBuilds", "_id_")
             .unwrap();
-        let local: Vec<String> = st
-            .list_collections("local")
-            .unwrap()
+        // As are the `local` collections' and `admin.system.version`'s.
+        let local: Vec<String> = ["local", "admin"]
             .iter()
-            .filter_map(|c| st.index_table_name("local", c, "_id_").unwrap())
+            .flat_map(|db| {
+                st.list_collections(db)
+                    .unwrap()
+                    .into_iter()
+                    .filter_map(|c| st.index_table_name(db, &c, "_id_").unwrap())
+            })
             .collect();
         assert_eq!(
             tables_named(st, "table:index-")

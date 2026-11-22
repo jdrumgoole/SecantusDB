@@ -118,7 +118,15 @@ fn totals(ctx: &CommandContext, db: &str) -> Result<Totals, CommandError> {
     // The views are documents in `system.views`, a collection with an `_id` index.
     // Their bytes are the definitions' (measured 8.2.11, 2026-10-15: a view
     // over five `$match` stages adds the 238 bytes of its definition).
-    if t.views > 0 {
+    // A store keeps them as a collection of its own since storage-model
+    // phase 7, counted above with the rest; this derives it for one that
+    // does not.
+    let stored = storage
+        .list_collections(db)
+        .map_err(command_error)?
+        .iter()
+        .any(|c| c == "system.views");
+    if t.views > 0 && !stored {
         t.collections += 1;
         t.objects += t.views;
         t.indexes += 1;

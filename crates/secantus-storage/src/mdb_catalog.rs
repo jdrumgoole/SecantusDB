@@ -278,12 +278,14 @@ pub fn entry_of_ns(session: &Session, ns: &str) -> Result<Option<Document>> {
 /// One index as mongod lists it in `md.indexes`: `{spec, ready, multikey,
 /// multikeyPaths}`. `multikey_paths` holds, per key field, one byte per
 /// path component, 1 where that component is an array (mongod's
-/// `MultikeyPaths` as `binData`).
+/// `MultikeyPaths` as `binData`); `None` for an index kind mongod tracks no
+/// paths for (`2d`, `hashed`, text, wildcard: measured 8.2.11, the entry has
+/// no `multikeyPaths` field).
 pub struct CatalogIndex {
     pub spec: Document,
     pub ready: bool,
     pub multikey: bool,
-    pub multikey_paths: Vec<(String, Vec<u8>)>,
+    pub multikey_paths: Option<Vec<(String, Vec<u8>)>>,
 }
 
 /// A collection's `_mdb_catalog` value, field for field as mongod 8.2.11
@@ -298,22 +300,25 @@ pub fn entry_doc(
     let indexes: Vec<Bson> = indexes
         .iter()
         .map(|ix| {
-            let mut paths = Document::new();
-            for (field, bytes) in &ix.multikey_paths {
-                paths.insert(
-                    field.clone(),
-                    Bson::Binary(bson::Binary {
-                        subtype: bson::spec::BinarySubtype::Generic,
-                        bytes: bytes.clone(),
-                    }),
-                );
-            }
-            Bson::Document(doc! {
+            let mut out = doc! {
                 "spec": ix.spec.clone(),
                 "ready": ix.ready,
                 "multikey": ix.multikey,
-                "multikeyPaths": paths,
-            })
+            };
+            if let Some(fields) = &ix.multikey_paths {
+                let mut paths = Document::new();
+                for (field, bytes) in fields {
+                    paths.insert(
+                        field.clone(),
+                        Bson::Binary(bson::Binary {
+                            subtype: bson::spec::BinarySubtype::Generic,
+                            bytes: bytes.clone(),
+                        }),
+                    );
+                }
+                out.insert("multikeyPaths", paths);
+            }
+            Bson::Document(out)
         })
         .collect();
     let mut idx_ident = Document::new();
@@ -372,7 +377,7 @@ mod tests {
                 spec: doc! {"v": 2, "key": {"_id": 1}, "name": "_id_"},
                 ready: true,
                 multikey: false,
-                multikey_paths: multikey_paths(&doc! {"_id": 1}, &[]),
+                multikey_paths: Some(multikey_paths(&doc! {"_id": 1}, &[])),
             }],
             "collection-x",
             &[("_id_".into(), "index-y".into())],

@@ -286,6 +286,15 @@ pub fn record_replset_config(
             let bytes = crate::bsondoc::to_vec(&config)
                 .map_err(|e| crate::storage::StorageError::Internal(e.to_string()))?;
             storage.insert("local", "system.replset", vec![bytes], true)?;
+            // mongod's `replSetInitiate` writes the configuration and then
+            // takes a stable checkpoint, so the collection's catalog entry
+            // (in `_mdb_catalog`, which is not logged) is durable before the
+            // set serves. Without it, a store killed before its next
+            // checkpoint had no `local.system.replset` for mongod 8.2.11,
+            // which then started uninitiated, did not replay the oplog, and
+            // dropped the tables of every collection made since as unknown
+            // idents (measured, storage-model phase 7).
+            storage.checkpoint_now()?;
         }
     }
     Ok(())

@@ -131,20 +131,51 @@ struct BuildIndex {
     desc: IndexDesc,
     /// Some document written or scanned holds an array on its key path.
     multikey: AtomicBool,
+    /// Per key field, the array components seen on its path: the catalog's
+    /// `multikeyPaths` (`crate::array_components`).
+    paths: Mutex<Vec<Vec<String>>>,
     /// The index's own table (`index-<UUID>`), made when the scan starts and
     /// listed in the placement only when the build commits.
     ident: Mutex<Option<String>>,
 }
 
 impl BuildIndex {
+    /// `d` makes the index multikey: flag it, and add the array components
+    /// on its key paths to what the catalog will record.
+    fn note_multikey(&self, d: &Document) {
+        self.multikey.store(true, Ordering::Relaxed);
+        let mut paths = self.paths.lock().unwrap_or_else(|e| e.into_inner());
+        for (field, parts) in self.key.keys().zip(paths.iter_mut()) {
+            crate::array_components(d, field, parts);
+        }
+    }
+
+    /// The catalog's `multikeyPaths` option: per key field, its array
+    /// components, sorted.
+    fn recorded_paths(&self) -> Bson {
+        let paths = self.paths.lock().unwrap_or_else(|e| e.into_inner());
+        let mut recorded = Document::new();
+        for (field, parts) in self.key.keys().zip(paths.iter()) {
+            let mut parts = parts.clone();
+            parts.sort();
+            recorded.insert(
+                field.clone(),
+                Bson::Array(parts.into_iter().map(Bson::String).collect()),
+            );
+        }
+        Bson::Document(recorded)
+    }
+
     fn new(name: String, key: Document, stored: Document) -> Self {
         let desc = index_desc_from(name.clone(), key.clone(), &stored);
+        let fields = key.len();
         BuildIndex {
             name,
             key,
             stored,
             desc,
             multikey: AtomicBool::new(false),
+            paths: Mutex::new(vec![Vec::new(); fields]),
             ident: Mutex::new(None),
         }
     }
@@ -702,11 +733,8 @@ impl Storage {
                     put(&b.uuid, i, SideOp::Skipped(recordid))?;
                 }
                 if let Some(d) = new {
-                    if !ix.is_geo()
-                        && !ix.multikey.load(Ordering::Relaxed)
-                        && doc_makes_multikey(d, &ix.key)
-                    {
-                        ix.multikey.store(true, Ordering::Relaxed);
+                    if !ix.is_geo() && doc_makes_multikey(d, &ix.key) {
+                        ix.note_multikey(d);
                     }
                 }
             }
@@ -902,6 +930,7 @@ impl Storage {
                         let mut stored = ix.stored.clone();
                         if ix.multikey.load(Ordering::Relaxed) {
                             stored.insert("multikey", Bson::Boolean(true));
+                            stored.insert(crate::MULTIKEY_PATHS, ix.recorded_paths());
                         }
                         let mut payload = Document::new();
                         payload.insert("key", Bson::Document(ix.key.clone()));
@@ -1180,11 +1209,10 @@ impl Storage {
                         }
                     }
                     if !ix.is_geo()
-                        && !ix.multikey.load(Ordering::Relaxed)
                         && doc_makes_multikey(&d, &ix.key)
                         && self.doc_in_partial(&d, &ix.desc)?
                     {
-                        ix.multikey.store(true, Ordering::Relaxed);
+                        ix.note_multikey(&d);
                     }
                     for entry in self.packed_entry_keys(&d, &ix.desc, rid)? {
                         sorters[i].push(encode_entry(&entry))?;

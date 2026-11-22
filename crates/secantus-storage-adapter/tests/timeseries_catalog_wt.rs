@@ -195,58 +195,9 @@ fn a_restart_reopens_the_stored_bucket() {
     });
 }
 
-/// A store written before buckets were stored keeps a time-series
-/// collection's measurements as documents of its own table. Opening it
-/// places them into buckets, in the order they were stored, and empties the
-/// table; a conversion cut short (a bucket collection beside measurements)
-/// is done again from the start.
-#[test]
-fn an_old_store_is_converted_on_open() {
-    with_store(|wt| {
-        let (adapter, mut c) = server(wt);
-        create(&mut c);
-        // As the old server left it: no bucket collection, the measurements
-        // in the collection's table, in the order it placed them.
-        assert!(adapter.drop_collection("t", "system.buckets.w").unwrap());
-        let legacy: Vec<Vec<u8>> = [
-            doc! {"_id": 1, "t": at(0.0), "m": "a", "v": 1},
-            doc! {"_id": 2, "t": at(1.0), "m": "b", "v": 2},
-            doc! {"_id": 3, "t": at(2.0), "m": "a", "v": 3},
-            doc! {"_id": 4, "t": at(90.0), "m": "a", "v": 4},
-        ]
-        .iter()
-        .map(|d| bson::to_vec(d).unwrap())
-        .collect();
-        adapter.insert("t", "w", legacy.clone(), true).unwrap();
-        // ... and a conversion that stopped after writing one stray bucket.
-        adapter
-            .create_collection_with_options("t", "system.buckets.w", &doc! {"clusteredIndex": true})
-            .unwrap();
-        adapter
-            .insert(
-                "t",
-                "system.buckets.w",
-                vec![
-                    bson::to_vec(&doc! {"_id": bson::oid::ObjectId::new(), "control": {}}).unwrap(),
-                ],
-                true,
-            )
-            .unwrap();
-
-        assert_eq!(
-            secantus_commands::upgrade_time_series(adapter.as_ref()).unwrap(),
-            4
-        );
-        assert!(adapter
-            .find("t", "w", &Document::new(), None, None)
-            .unwrap()
-            .is_empty());
-        assert_eq!(placed(&mut c), (vec![1, 3, 2, 4], vec![2, 1, 1]));
-        // Done once: opening again converts nothing.
-        assert_eq!(
-            secantus_commands::upgrade_time_series(adapter.as_ref()).unwrap(),
-            0
-        );
-        assert_eq!(placed(&mut c), (vec![1, 3, 2, 4], vec![2, 1, 1]));
-    });
-}
+// Retired at storage-model phase 7 (store format 9): `an_old_store_is_converted_on_open`
+// built a pre-phase-5 store by inserting measurements into a time-series
+// collection's own table. A time-series collection is now mongod's view
+// over its buckets, with no table, so no store this build opens can hold
+// one; stores of formats 4 to 8 are refused by name at open
+// (`store_format.rs`). The conversion path goes in phase 8's clean-up.

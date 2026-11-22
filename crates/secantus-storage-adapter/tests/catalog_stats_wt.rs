@@ -182,10 +182,13 @@ fn list_catalog_lists_collections_then_views() {
             "{buckets_ident}"
         );
         assert_ne!(buckets_ident, coll_ident);
-        // View definitions are rows of the collection registry.
-        assert_eq!(
-            entry("system.views").get_str("ident"),
-            Ok("table:secantus_collections")
+        // View definitions are the documents of `system.views`, a
+        // collection with a table of its own, as on mongod (storage-model
+        // phase 7).
+        let views_ident = entry("system.views").get_str("ident").unwrap().to_string();
+        assert!(
+            views_ident.starts_with("table:collection-"),
+            "{views_ident}"
         );
 
         // Views come after every collection.

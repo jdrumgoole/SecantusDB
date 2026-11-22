@@ -1294,13 +1294,18 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .into_iter()
             .filter(|c| crate::views::is_view(storage, &ctx.db_name, c))
             .collect();
-        if views.is_empty() {
-            return Ok(doc! { "ok": 1.0 });
-        }
         for view in &views {
             storage
                 .drop_collection(&ctx.db_name, view)
                 .map_err(command_error)?;
+        }
+        // The definitions are a stored collection of their own since
+        // storage-model phase 7; it goes too, as mongod's does.
+        let stored = storage
+            .drop_collection(&ctx.db_name, "system.views")
+            .map_err(command_error)?;
+        if views.is_empty() && !stored {
+            return Ok(doc! { "ok": 1.0 });
         }
         return Ok(doc! { "nIndexesWas": 1_i32, "ns": ns, "ok": 1.0 });
     }
@@ -1797,9 +1802,14 @@ pub(crate) fn collection_entries(
             "info": info,
         });
     }
+    // A store keeps it as a collection (storage-model phase 7), listed
+    // above; only one without it gets the derived entry.
     if entries
         .iter()
         .any(|e| matches!(e.get_str("type"), Ok("view" | "timeseries")))
+        && !entries
+            .iter()
+            .any(|e| e.get_str("name") == Ok("system.views"))
     {
         derived.push(doc! {
             "name": "system.views",

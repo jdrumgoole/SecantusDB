@@ -130,6 +130,8 @@ const FCV_ID: &str = "featureCompatibilityVersion";
 /// `{_id: "featureCompatibilityVersion", version: "8.2"}` in
 /// `admin.system.version`. That document is why mongod always lists the
 /// `admin` database. A stored FCV is left as it is.
+/// A store this server made already holds it: the storage writes it at the
+/// store's initiation, in its first checkpoint (`Storage::genesis`).
 pub fn record_initial_fcv(
     storage: &dyn crate::storage::Storage,
 ) -> Result<(), crate::storage::StorageError> {
