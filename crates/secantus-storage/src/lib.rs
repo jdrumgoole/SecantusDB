@@ -5476,6 +5476,9 @@ pub struct Storage {
     /// Highest oplog seq covered by the last stable checkpoint: the replay
     /// floor after a crash and the prune clamp (entries above it are the
     /// recovery source and must not be pruned). 0 until the first checkpoint.
+    /// `local.replset.oplogTruncateAfterPoint`, as the journal flusher
+    /// moves it (RM-736).
+    truncate_point: Arc<TruncatePoint>,
     stable_seq: Arc<AtomicI64>,
     /// Periodic checkpoint thread (WT does not checkpoint on its own under
     /// our config). For a data-nonlogged store it is the durability cadence
@@ -5567,12 +5570,12 @@ struct OplogState {
     /// its write holds the slot open is mongod's
     /// `totalOplogSlotDurationMicros` (RM-361).
     in_flight: BTreeMap<i64, InFlight>,
-    /// Commit timestamps reserved for transactions that mint no oplog entry
-    /// of their own (`reserve_stamp`), each with the next seq when it was
-    /// taken: every entry from that seq on is later in time. They hold the
-    /// all-committed point, and the stable checkpoint's marker, below them
-    /// until their transaction resolves (RM-210).
-    ts_reserved: BTreeMap<u64, i64>,
+    /// The timestamps of entries an operation still running committed at
+    /// ([`Storage::op_scope`]), each keyed by itself: its writes without an
+    /// entry of their own commit at the newest of them, so each holds the
+    /// all-committed point, and the stable timestamp, below it until the
+    /// operation ends (RM-746).
+    scope_holds: BTreeMap<u64, i64>,
 }
 
 // --- statement-scoped oplog buffers -----------------------------------------
@@ -5615,9 +5618,6 @@ thread_local! {
     /// While crash recovery replays an oplog entry: that entry's timestamp,
     /// which the replayed write commits at (RM-210). 0 otherwise.
     static REPLAY_TS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// The commit timestamp reserved for the statement transaction running
-    /// on this thread (`reserve_stamp`), released when it resolves. 0: none.
-    static STMT_RESERVED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Bytes of oplog-entry payload emitted by the current user-transaction
     /// statement — harvested onto the handle by `with_user_transaction` (the
     /// same pattern as `PENDING_MINTED`) to enforce the transaction dirty
@@ -7033,21 +7033,31 @@ const FCV_AT_INITIATION: &str = "8.2";
 /// `minSnapshotHistoryWindowInSeconds` default.
 const SNAPSHOT_HISTORY_SECONDS: i64 = 300;
 
-/// Move a timestamped store's WiredTiger clocks on (RM-210): the stable
-/// timestamp to the all-committed point -- what a checkpoint keeps of the
-/// data tables, and the replay floor after a crash -- and the oldest to
-/// `min(now - 300 s, stable)`, below which history is let go. Returns the
-/// oplog seq that matches the stable timestamp: every entry at or below it
-/// is at or below it in time, and committed. Neither clock moves backwards.
-fn advance_timestamps(conn: &Connection, oplog: &Mutex<OplogState>) -> Result<i64> {
-    let (seq, stable) = {
+/// Move a timestamped store's WiredTiger clocks on (RM-210, RM-746): the
+/// stable timestamp to the newest oplog entry at or below the
+/// all-committed point -- what a checkpoint keeps of the data tables, and
+/// the replay floor after a crash -- and the oldest to `min(now - 300 s,
+/// stable)`, below which history is let go. Returns the stable timestamp,
+/// which is also the position of that entry: every entry at or below it is
+/// committed. Neither clock moves backwards.
+///
+/// mongod's stable timestamp is always an oplog entry's (its stable optime
+/// candidates are the entries it wrote, `ReplicationCoordinatorImpl::
+/// _setStableTimestampForStorage`), so the recovery timestamp a checkpoint
+/// keeps names an entry and is never past the oplog's end. A timestamp
+/// consumed without an entry -- a cluster-time mint -- never moves it: no
+/// write commits at such a timestamp (see [`Storage::commit_stamp`]).
+fn advance_timestamps(
+    conn: &Connection,
+    oplog: &Mutex<OplogState>,
+    oplog_uri: &str,
+) -> Result<i64> {
+    let bound = {
         let st = oplog.lock().unwrap_or_else(|e| e.into_inner());
-        (
-            Storage::all_committed_seq_locked(&st),
-            Storage::all_committed_ts_locked(&st),
-        )
+        Storage::all_committed_ts_locked(&st)
     };
-    if stable > 0 {
+    let session = conn.open_session()?;
+    if let Some(stable) = newest_entry_at_or_below(&session, oplog_uri, bound)? {
         conn.set_timestamp(&format!("stable_timestamp={stable:x}"))?;
         let floor = ((now_secs() - SNAPSHOT_HISTORY_SECONDS).max(0) as u64) << 32;
         let oldest = floor.min(stable);
@@ -7055,50 +7065,185 @@ fn advance_timestamps(conn: &Connection, oplog: &Mutex<OplogState>) -> Result<i6
             conn.set_timestamp(&format!("oldest_timestamp={oldest:x}"))?;
         }
     }
-    Ok(seq)
+    // WiredTiger keeps the larger of the stable timestamp it held and the
+    // one given: a store opened from a checkpoint holds its recovery
+    // timestamp until an entry passes it.
+    let held = conn
+        .query_timestamp("get=stable_timestamp")
+        .ok()
+        .and_then(|hex| u64::from_str_radix(&hex, 16).ok())
+        .unwrap_or(0);
+    Ok(held as i64)
 }
 
-/// Reserve a commit timestamp for a transaction that mints no oplog entry of
-/// its own, with a seq that stays in flight -- holding the all-committed
-/// point below it -- until [`release_stamp`] (RM-210).
-fn reserve_stamp(oplog: &Mutex<OplogState>) -> u64 {
-    let mut st = oplog.lock().unwrap_or_else(|e| e.into_inner());
-    let ts = ts_u64(Storage::mint_ts(&mut st));
-    // The position of an entry is its timestamp: every entry at or after
-    // `ts` is later in time than the reservation.
-    st.ts_reserved.insert(ts, ts as i64);
-    ts
+/// The newest entry of the oplog at `oplog_uri` at or below `bound` (a
+/// 64-bit timestamp, which is also an entry's position), as mongod's
+/// `findOplogOpTimeLessThanOrEqualToTimestamp` finds it; `None` when there
+/// is none. Read at the latest snapshot: every entry at or below the
+/// all-committed point has committed, so none of them can still appear.
+fn newest_entry_at_or_below(session: &Session, oplog_uri: &str, bound: u64) -> Result<Option<u64>> {
+    if bound == 0 {
+        return Ok(None);
+    }
+    let cur = session.open_cursor(oplog_uri, None)?;
+    cur.set_key_q(bound.min(i64::MAX as u64) as i64);
+    let cmp = match cur.search_near() {
+        Ok(cmp) => cmp,
+        Err(e) if e.is_not_found() => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if cmp > 0 && !cur.prev()? {
+        return Ok(None);
+    }
+    Ok(Some(cur.get_key_q()? as u64))
 }
 
-/// The end of a [`reserve_stamp`] reservation: its transaction committed or
-/// rolled back.
-fn release_stamp(oplog: &Mutex<OplogState>, ts: u64) {
-    let mut st = oplog.lock().unwrap_or_else(|e| e.into_inner());
-    st.ts_reserved.remove(&ts);
+/// `local.replset.oplogTruncateAfterPoint`'s one document, as the journal
+/// flusher moves it (RM-736, RM-746): its table and RecordId, found once the
+/// store's genesis has written it, and the point last written.
+#[derive(Default)]
+struct TruncatePoint {
+    row: Mutex<Option<(String, i64)>>,
+    written: AtomicU64,
 }
 
-/// Releases a [`reserve_stamp`] reservation when dropped.
-struct ReleaseStamp<'a>(&'a Mutex<OplogState>, u64);
+/// Move `local.replset.oplogTruncateAfterPoint` to the newest oplog entry at
+/// or below the all-committed point, as mongod's journal flusher does before
+/// each sync of the journal (`refreshOplogTruncateAfterPointIfPrimary`):
+/// every entry at or below it is whole, and an entry after it, which a crash
+/// can leave with a hole before it, is what recovery truncates. The table is
+/// logged, so the write is untimestamped and the sync that follows makes it
+/// durable with the entries it covers. Written in place (the document's
+/// size never changes); a write conflict leaves it for the next refresh.
+fn refresh_truncate_point(
+    conn: &Connection,
+    oplog: &Mutex<OplogState>,
+    oplog_uri: &str,
+    point: &TruncatePoint,
+) -> Result<()> {
+    let row = point.row.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((uri, rid)) = row.as_ref() else {
+        return Ok(());
+    };
+    let bound = {
+        let st = oplog.lock().unwrap_or_else(|e| e.into_inner());
+        Storage::all_committed_ts_locked(&st)
+    };
+    let session = conn.open_session()?;
+    let Some(at) = newest_entry_at_or_below(&session, oplog_uri, bound)? else {
+        return Ok(());
+    };
+    if point.written.load(Ordering::Acquire) == at {
+        return Ok(());
+    }
+    let doc = bson::doc! {
+        "_id": "oplogTruncateAfterPoint",
+        "oplogTruncateAfterPoint": Bson::Timestamp(u64_ts(at)),
+    };
+    let cur = session.open_cursor(uri, None)?;
+    cur.set_key_q(*rid);
+    cur.set_value_u(&encode_doc(&doc)?);
+    match cur.insert() {
+        Ok(()) => {
+            point.written.store(at, Ordering::Release);
+            Ok(())
+        }
+        Err(e) if e.is_rollback() => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
 
-impl Drop for ReleaseStamp<'_> {
+thread_local! {
+    /// The operation this thread is running, as one mongod unit of work
+    /// (RM-746): see [`Storage::op_scope`].
+    static OP_SCOPE: std::cell::RefCell<Option<OpScopeState>> =
+        const { std::cell::RefCell::new(None) };
+    /// This thread's writes are untimestamped while set: see
+    /// [`untimestamped`].
+    static UNTIMESTAMPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// What an operation's scope holds: the timestamps its writes with oplog
+/// entries committed at, each holding the stable timestamp below it until
+/// the operation ends, and the newest of them, which its writes without an
+/// entry commit at.
+struct OpScopeState {
+    oplog: Arc<Mutex<OplogState>>,
+    holds: Vec<u64>,
+    last: u64,
+}
+
+/// An operation's scope ([`Storage::op_scope`]); its end releases what its
+/// writes held.
+#[must_use = "the operation's writes stop sharing its timestamp when this guard drops"]
+pub struct OpScope(bool);
+
+impl Drop for OpScope {
     fn drop(&mut self) {
-        release_stamp(self.0, self.1);
+        if !self.0 {
+            return;
+        }
+        if let Some(state) = OP_SCOPE.with(|s| s.borrow_mut().take()) {
+            if !state.holds.is_empty() {
+                let mut st = state.oplog.lock().unwrap_or_else(|e| e.into_inner());
+                for ts in &state.holds {
+                    st.scope_holds.remove(ts);
+                }
+            }
+        }
     }
 }
 
-/// Commit `session`'s transaction: at a timestamp of its own when the store
-/// is timestamped (WiredTiger refuses a write without one to a key that has
-/// had one), as is when it is not.
-fn commit_stamped(session: &Session, oplog: &Mutex<OplogState>, timestamped: bool) -> Result<()> {
-    if !timestamped {
-        return session.commit_transaction(None).map_err(Into::into);
+/// Lets this thread's writes that log no oplog entry commit without a
+/// timestamp while it lives, over rows earlier writes timestamped, as
+/// mongod writes what it logs no entry for (`RecoveryUnit::
+/// allowUntimestampedWrite`): an index build's keys, what the store writes
+/// as it opens, a catalog row written beside its entry. A write that logs
+/// an entry still commits at its entry's timestamp.
+#[must_use = "the writes are timestamped again when this guard drops"]
+pub struct Untimestamped(bool);
+
+impl Drop for Untimestamped {
+    fn drop(&mut self) {
+        UNTIMESTAMPED.with(|u| u.set(self.0));
     }
-    let ts = reserve_stamp(oplog);
-    let out = session
-        .timestamp_transaction(&format!("commit_timestamp={ts:x}"))
-        .and_then(|()| session.commit_transaction(None));
-    release_stamp(oplog, ts);
-    out.map_err(Into::into)
+}
+
+/// Write this thread's writes without a timestamp until the guard drops.
+pub fn untimestamped() -> Untimestamped {
+    Untimestamped(UNTIMESTAMPED.with(|u| u.replace(true)))
+}
+
+/// The configuration a write transaction that may commit without a
+/// timestamp begins with in a timestamped store: WiredTiger refuses, at
+/// commit, a write without one to a key of an unlogged table that has had
+/// one, unless the transaction says so when it begins (`no_timestamp`),
+/// as mongod's untimestamped writes do.
+const NO_TIMESTAMP: &str = "no_timestamp=true";
+
+/// Begin `session`'s transaction for a write that commits without a
+/// timestamp ([`commit_untimestamped`]).
+fn begin_untimestamped(session: &Session, timestamped: bool) -> Result<()> {
+    session
+        .begin_transaction(timestamped.then_some(NO_TIMESTAMP))
+        .map_err(Into::into)
+}
+
+/// Commit `session`'s transaction without a timestamp: a write mongod logs
+/// no entry for and does not timestamp (an oplog truncation, a pre-image
+/// sweep, the oplog's size), begun by [`begin_untimestamped`]. On an
+/// unlogged table it is durable once a checkpoint has taken it.
+fn commit_untimestamped(session: &Session) -> Result<()> {
+    session.commit_transaction(None).map_err(Into::into)
+}
+
+/// Commit `session`'s transaction of oplog entries at the first entry's
+/// timestamp `first`, as mongod commits an entry: at its own timestamp.
+fn commit_entries_at(session: &Session, first: u64, timestamped: bool) -> Result<()> {
+    if timestamped {
+        session.timestamp_transaction(&format!("commit_timestamp={first:x}"))?;
+    }
+    session.commit_transaction(None).map_err(Into::into)
 }
 
 /// A BSON timestamp as WiredTiger's 64-bit one: seconds high, increment low.
@@ -7150,7 +7295,7 @@ fn load_oplog_state(session: &Session, table: &str) -> Result<OplogState> {
         live_count: 0,
         live_bytes: 0,
         in_flight: BTreeMap::new(),
-        ts_reserved: BTreeMap::new(),
+        scope_holds: BTreeMap::new(),
     })
 }
 
@@ -7932,6 +8077,7 @@ impl Storage {
             data_nonlogged,
             timestamped: data_nonlogged,
             stable_seq,
+            truncate_point: Arc::default(),
             checkpoint_stop: Arc::new(AtomicBool::new(false)),
             checkpoint_requested,
             checkpoint_join: Mutex::new(None),
@@ -7958,6 +8104,11 @@ impl Storage {
         // Before the store takes any write -- crash recovery's replay and the
         // upgrades below write documents, and each write moves the counts.
         storage.open_size_storer(&size_fingerprint)?;
+        // What the store writes as it opens -- its genesis, the catalog and
+        // views brought in line, drops a crash interrupted -- logs no
+        // entry and is untimestamped, as mongod's startup writes are; a
+        // replayed entry still commits at its own timestamp (RM-746).
+        let _untimestamped = untimestamped();
         // A new store is initiated (see `genesis`) before recovery or any
         // write: there is nothing to recover in it.
         if oplog_created || storage.needs_genesis()? {
@@ -7976,6 +8127,7 @@ impl Storage {
             // seconds and skip the close checkpoint for the same reason.
             storage.spawn_checkpoint_thread(false);
         }
+        storage.find_truncate_point()?;
         if storage.durable && !storage.in_memory {
             storage.spawn_journal_flusher();
         }
@@ -8070,10 +8222,13 @@ impl Storage {
                     options.insert("size", bytes);
                 }
             }
-            session.begin_transaction(None)?;
+            // mongod's `replSetResizeOplog` logs no entry and writes the
+            // catalog untimestamped (RM-746); the checkpoint below makes it
+            // durable.
+            begin_untimestamped(&session, self.timestamped)?;
             let wrote = mdb_catalog::write_entry(&session, id, &entry);
             match wrote {
-                Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped)?,
+                Ok(()) => commit_untimestamped(&session)?,
                 Err(e) => {
                     let _ = session.rollback_transaction(None);
                     return Err(e);
@@ -8321,10 +8476,16 @@ impl Storage {
         // `committed`: the statement's transaction committed, so the time
         // its ranges held their slots is the operation's (RM-361); a
         // rolled-back one's is not, as on mongod.
-        struct SyncMintScope<'a>(&'a Storage, bool);
+        // A statement transaction nested in another's (a write the outer
+        // statement makes through the public API, on a session of its own:
+        // `log_index_build`'s `config.system.indexBuilds` row) keeps the
+        // outer one's ranges aside and gives them back, with the outer one's
+        // sync mode, when it ends: they are the outer transaction's to
+        // resolve, at its commit (RM-746: the outer one lost them, and
+        // committed its entries without their timestamp).
+        struct SyncMintScope<'a>(&'a Storage, bool, Option<Vec<(i64, i64)>>);
         impl Drop for SyncMintScope<'_> {
             fn drop(&mut self) {
-                IN_SYNC_STMT.with(|f| f.set(false));
                 let ranges = PENDING_MINTED.with(|p| std::mem::take(&mut *p.borrow_mut()));
                 let held = self.0.deregister_in_flight(&ranges, self.1);
                 if self.1 {
@@ -8333,20 +8494,26 @@ impl Storage {
                         note_logged(end);
                     }
                 }
-                let reserved = STMT_RESERVED.with(|r| r.replace(0));
-                if reserved != 0 {
-                    release_stamp(&self.0.oplog, reserved);
+                match self.2.take() {
+                    Some(outer) => PENDING_MINTED.with(|p| *p.borrow_mut() = outer),
+                    None => IN_SYNC_STMT.with(|f| f.set(false)),
                 }
             }
         }
         let mut sync_scope = {
-            IN_SYNC_STMT.with(|f| f.set(true));
-            // Any leftover ranges belong to a dead scope (the guards harvest
-            // on every exit, so this is a defensive no-op in practice) —
-            // deregister rather than drop them, or they'd pin the tail.
-            let stale = PENDING_MINTED.with(|p| std::mem::take(&mut *p.borrow_mut()));
-            self.deregister_in_flight(&stale, false);
-            Some(SyncMintScope(self, false))
+            let nested = IN_SYNC_STMT.with(|f| f.replace(true));
+            let pending = PENDING_MINTED.with(|p| std::mem::take(&mut *p.borrow_mut()));
+            let outer = if nested {
+                Some(pending)
+            } else {
+                // Any leftover ranges belong to a dead scope (the guards
+                // harvest on every exit, so this is a defensive no-op in
+                // practice) — deregister rather than drop them, or they'd
+                // pin the tail.
+                self.deregister_in_flight(&pending, false);
+                None
+            };
+            Some(SyncMintScope(self, false, outer))
         };
         // The collections this statement writes, for `NS_COMMITS`: the
         // enclosing scope's are kept aside and put back after.
@@ -8372,16 +8539,17 @@ impl Storage {
             STMT_UNATTRIBUTED.with(|u| u.replace(false)),
             STMT_CATALOG_DOCS.with(|c| std::mem::take(&mut *c.borrow_mut())),
         );
-        session.begin_transaction(None)?;
+        let begin = self.statement_begin_config();
+        session.begin_transaction(begin)?;
         match f() {
             Ok(v) => {
+                // Committed without a timestamp: a statement that logged no
+                // entry, outside an operation that did (RM-746).
+                let mut untimestamped = self.timestamped;
                 {
                     let minted = PENDING_MINTED.with(|p| p.borrow().clone());
-                    if let Some((ts, reserved)) = self.commit_stamp(&minted) {
-                        if reserved {
-                            // Released after the commit or rollback below.
-                            STMT_RESERVED.with(|r| r.set(ts));
-                        }
+                    if let Some(ts) = self.commit_stamp(&minted) {
+                        untimestamped = false;
                         if let Err(e) =
                             session.timestamp_transaction(&format!("commit_timestamp={ts:x}"))
                         {
@@ -8407,6 +8575,16 @@ impl Storage {
                     let why = session.rollback_reason();
                     let _ = session.rollback_transaction(None);
                     const EINVAL: i32 = 22;
+                    if untimestamped && begin.is_none() && e.code == EINVAL && why.is_none() {
+                        // A write with no oplog entry to a key an earlier
+                        // write timestamped: WiredTiger refuses to commit it
+                        // without a timestamp. mongod logs an entry for every
+                        // write it timestamps (RM-746), so this is a write
+                        // that should have one -- loud, never a retry.
+                        return Err(StorageError::Internal(format!(
+                            "a write with no oplog entry was refused without a timestamp: {e}"
+                        )));
+                    }
                     if e.is_rollback() || e.code == EINVAL {
                         return Err(classify_rollback(why));
                     }
@@ -8494,21 +8672,10 @@ impl Storage {
     /// mutex.
     fn all_committed_ts_locked(st: &OplogState) -> u64 {
         let minted = st.in_flight.values().next().map(|r| r.first_ts);
-        let reserved = st.ts_reserved.keys().next().copied();
+        let reserved = st.scope_holds.keys().next().copied();
         match minted.into_iter().chain(reserved).min() {
             Some(first) => first.saturating_sub(1),
             None => ((st.last_ts_secs as u64) << 32) | st.last_ts_ord as u64,
-        }
-    }
-
-    /// The oplog seq that matches [`Self::all_committed_ts_locked`]: the
-    /// visible tail, and below every entry minted after a timestamp still
-    /// reserved. Caller holds the oplog mutex.
-    fn all_committed_seq_locked(st: &OplogState) -> i64 {
-        let tail = Self::visible_tail(st);
-        match st.ts_reserved.values().min() {
-            Some(floor) => tail.min(floor - 1),
-            None => tail,
         }
     }
 
@@ -8587,36 +8754,132 @@ impl Storage {
         if !self.timestamped {
             return f(&op);
         }
+        // A catalog or user-record write that logs no entry of its own is
+        // untimestamped, and may change a row an earlier write timestamped
+        // (RM-746).
+        let _untimestamped = untimestamped();
         self.with_statement_txn(&op, || f(&op))
     }
 
     /// The commit timestamp of a write transaction in a timestamped store
-    /// (RM-210): the earliest timestamp it minted for its oplog entries, so
-    /// all of it becomes visible at once and a stable checkpoint at or after
-    /// that timestamp holds all of it; else a timestamp reserved for it now
-    /// (with a seq of its own, which stays in flight until it resolves --
-    /// returned as the second value, for the caller to deregister); during
-    /// crash recovery, the replayed entry's own. `None` in a store that is
-    /// not timestamped.
-    fn commit_stamp(&self, minted: &[(i64, i64)]) -> Option<(u64, bool)> {
+    /// (RM-210, RM-746), as mongod timestamps a unit of work: the earliest
+    /// timestamp it minted for its oplog entries, so all of it becomes
+    /// visible at once and a stable checkpoint at or after that timestamp
+    /// holds all of it; during crash recovery, the replayed entry's own;
+    /// inside an operation whose earlier writes logged entries
+    /// ([`Self::op_scope`]), the newest of their timestamps, which the
+    /// operation holds above the stable timestamp. Otherwise `None`: the
+    /// write commits without a timestamp, as mongod writes what it logs no
+    /// entry for -- every timestamp a write commits at is an oplog entry's,
+    /// so the stable timestamp, which is always an entry's, covers it. `None`
+    /// too in a store that is not timestamped.
+    fn commit_stamp(&self, minted: &[(i64, i64)]) -> Option<u64> {
         if !self.timestamped {
             return None;
         }
         let replay = REPLAY_TS.with(|c| c.get());
         if replay != 0 {
-            return Some((replay, false));
+            return Some(replay);
         }
-        {
-            let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        if !minted.is_empty() {
+            let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
             let first = minted
                 .iter()
                 .filter_map(|(start, _)| st.in_flight.get(start).map(|r| r.first_ts))
                 .min();
             if let Some(ts) = first {
-                return Some((ts, false));
+                // Still in flight, so the stable timestamp is below it: the
+                // hold keeps it there until the operation ends.
+                self.hold_in_scope(&mut st, ts);
+                return Some(ts);
             }
         }
-        Some((reserve_stamp(&self.oplog), true))
+        self.scope_stamp()
+    }
+
+    /// Hold the stable timestamp below `ts` until the operation this thread
+    /// is running ends, when it has a scope on this store. Caller holds the
+    /// oplog mutex, with the entries at `ts` still in flight.
+    fn hold_in_scope(&self, st: &mut OplogState, ts: u64) {
+        OP_SCOPE.with(|s| {
+            if let Some(state) = s.borrow_mut().as_mut() {
+                if Arc::ptr_eq(&state.oplog, &self.oplog) {
+                    st.scope_holds.insert(ts, ts as i64);
+                    state.holds.push(ts);
+                    state.last = state.last.max(ts);
+                }
+            }
+        });
+    }
+
+    /// The timestamp a write without an entry of its own commits at inside
+    /// the operation this thread is running: the newest its writes with
+    /// entries committed at. `None` outside one, or before such a write.
+    fn scope_stamp(&self) -> Option<u64> {
+        OP_SCOPE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .filter(|state| state.last > 0 && Arc::ptr_eq(&state.oplog, &self.oplog))
+                .map(|state| state.last)
+        })
+    }
+
+    /// Commit `session`'s transaction, which wrote the oplog entries of
+    /// `ranges` (still in flight) and what goes with them, at the first
+    /// entry's timestamp, as mongod commits an entry (RM-746).
+    fn commit_minted_entries(&self, session: &Session, ranges: &[(i64, i64)]) -> Result<()> {
+        match self.commit_stamp(ranges) {
+            Some(ts) => commit_entries_at(session, ts, true),
+            None => session.commit_transaction(None).map_err(Into::into),
+        }
+    }
+
+    /// Run what follows, until the guard drops, as one operation: as mongod
+    /// runs a command's writes in one unit of work at the timestamp of its
+    /// oplog entry, a write of the operation that logs no entry of its own
+    /// (a retryable write's `config.transactions` row and
+    /// `config.image_collection` image, a collection drop's catalog purge)
+    /// commits at the timestamp of the operation's entry before it, which
+    /// the operation holds above the stable timestamp until it ends
+    /// (RM-746). Nested scopes are the outer one's. A no-op in a store that
+    /// is not timestamped.
+    pub fn op_scope(&self) -> OpScope {
+        if !self.timestamped {
+            return OpScope(false);
+        }
+        OP_SCOPE.with(|s| {
+            let mut s = s.borrow_mut();
+            if s.is_some() {
+                return OpScope(false);
+            }
+            *s = Some(OpScopeState {
+                oplog: self.oplog.clone(),
+                holds: Vec::new(),
+                last: 0,
+            });
+            OpScope(true)
+        })
+    }
+
+    /// [`Self::op_scope`] for a DDL operation, which writes in several
+    /// statements of its own around its entry (a rename's tombstone and
+    /// target drop before it, a drop's catalog purge after it): those before
+    /// the entry commit untimestamped, as nothing is logged for them yet.
+    fn ddl_scope(&self) -> (OpScope, Untimestamped) {
+        (self.op_scope(), untimestamped())
+    }
+
+    /// How a statement's transaction begins: in a timestamped store, a
+    /// write known to log no entry -- unreplicated ([`unreplicated`]),
+    /// untimestamped ([`untimestamped`]) or with the oplog off -- says so
+    /// (`no_timestamp`), since it commits without a timestamp unless an
+    /// operation's scope gives it one (RM-746).
+    fn statement_begin_config(&self) -> Option<&'static str> {
+        (self.timestamped
+            && (UNREPLICATED.with(|u| u.get())
+                || UNTIMESTAMPED.with(|u| u.get())
+                || !self.enable_oplog))
+            .then_some(NO_TIMESTAMP)
     }
 
     /// The sync-mode visible tail: the largest seq below which nothing can
@@ -9401,7 +9664,7 @@ impl Storage {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.timestamped {
             // A checkpoint keeps the data tables as of the stable timestamp.
-            advance_timestamps(&self.conn, &self.oplog)?;
+            advance_timestamps(&self.conn, &self.oplog, &self.oplog_uri)?;
         }
         let session = self.conn.open_session()?;
         self.drop_pending.checkpoint(&session)?;
@@ -9429,8 +9692,48 @@ impl Storage {
         if self.in_memory {
             return Ok(());
         }
+        // mongod's `waitUntilDurable` runs a journal flusher round, which
+        // moves the truncate point first (RM-736).
+        refresh_truncate_point(
+            &self.conn,
+            &self.oplog,
+            &self.oplog_uri,
+            &self.truncate_point,
+        )?;
         let config = if self.durable { "sync=on" } else { "sync=off" };
         Ok(self.conn.open_session()?.log_flush(Some(config))?)
+    }
+
+    /// Find `local.replset.oplogTruncateAfterPoint`'s document, for the
+    /// journal flusher to move ([`refresh_truncate_point`]): in a store
+    /// whose data tables are not logged, once its genesis has written it.
+    fn find_truncate_point(&self) -> Result<()> {
+        if self.in_memory || !self.data_nonlogged {
+            return Ok(());
+        }
+        let session = self.conn.open_session()?;
+        let Some(p) =
+            mdb_catalog::read_placement(&session, "local", "replset.oplogTruncateAfterPoint")?
+        else {
+            return Ok(());
+        };
+        let uri = p.table();
+        let cur = session.open_cursor(&uri, None)?;
+        let mut more = cur.next()?;
+        while more {
+            let doc = decode_doc(&cur.get_value_u()?)?;
+            if doc.get_str("_id") == Ok("oplogTruncateAfterPoint") {
+                let rid = cur.get_key_q()?;
+                *self
+                    .truncate_point
+                    .row
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some((uri, rid));
+                return Ok(());
+            }
+            more = cur.next()?;
+        }
+        Ok(())
     }
 
     /// mongod's journal flusher: sync the log every 100 ms
@@ -9439,12 +9742,21 @@ impl Storage {
     fn spawn_journal_flusher(&self) {
         let stop = self.checkpoint_stop.clone();
         let conn = self.conn.clone();
+        let oplog = self.oplog.clone();
+        let oplog_uri = self.oplog_uri.clone();
+        let point = self.truncate_point.clone();
         let handle = thread::Builder::new()
             .name("secantus-journal".into())
             .spawn(move || {
                 let interval = std::time::Duration::from_millis(JOURNAL_COMMIT_INTERVAL_MS);
                 while !stop.load(Ordering::Acquire) {
                     std::thread::sleep(interval);
+                    // The truncate point first, then the sync that makes it
+                    // durable with the entries it covers, as mongod's
+                    // journal flusher does (RM-736).
+                    if let Err(e) = refresh_truncate_point(&conn, &oplog, &oplog_uri, &point) {
+                        eprintln!("secantus-storage: moving oplogTruncateAfterPoint failed: {e:?}");
+                    }
                     if let Err(e) = conn
                         .open_session()
                         .and_then(|s| s.log_flush(Some("sync=on")))
@@ -9748,7 +10060,7 @@ impl Storage {
         // between, and had to be written second).
         self.refresh_oplog_truncate_after_point()?;
         let stable = if self.timestamped {
-            advance_timestamps(&self.conn, &self.oplog)?
+            advance_timestamps(&self.conn, &self.oplog, &self.oplog_uri)?
         } else {
             self.oplog_visible_tail_seq()
         };
@@ -9782,7 +10094,7 @@ impl Storage {
             Ok(())
         })();
         let out = match wrote {
-            Ok(()) => commit_stamped(&ws, &self.oplog, self.timestamped),
+            Ok(()) => commit_entries_at(&ws, start as u64, self.timestamped),
             Err(e) => {
                 let _ = ws.rollback_transaction(None);
                 Err(e)
@@ -10032,16 +10344,18 @@ impl Storage {
         Ok(())
     }
 
-    /// Move `local.replset.oplogTruncateAfterPoint` to the all-committed
-    /// point, where mongod's journal flusher keeps it: every entry at or
-    /// below it is whole. Moved here with each stable checkpoint, not every
-    /// 100 ms.
+    /// Move `local.replset.oplogTruncateAfterPoint` to the newest entry at
+    /// or below the all-committed point, where mongod's journal flusher
+    /// keeps it: every entry at or below it is whole. Moved with each stable
+    /// checkpoint, each journal flush and each journaled write's wait
+    /// (RM-736).
     fn refresh_oplog_truncate_after_point(&self) -> Result<()> {
-        let at = {
-            let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
-            Self::all_committed_ts_locked(&st)
-        };
-        self.write_oplog_truncate_after_point(at)
+        refresh_truncate_point(
+            &self.conn,
+            &self.oplog,
+            &self.oplog_uri,
+            &self.truncate_point,
+        )
     }
 
     /// Clear `local.replset.oplogTruncateAfterPoint` (`Timestamp(0, 0)`), as
@@ -10382,6 +10696,7 @@ impl Storage {
         // the visible tail + the atomics), mirroring DrainerShared.
         let conn = self.conn.clone();
         let oplog = self.oplog.clone();
+        let oplog_uri = self.oplog_uri.clone();
         let stable_seq = self.stable_seq.clone();
         let gate = self.checkpoint_gate.clone();
         let timestamped = self.timestamped;
@@ -10409,7 +10724,7 @@ impl Storage {
                     if timestamped {
                         // The oldest timestamp trails the clock by the
                         // snapshot window, not by a checkpoint interval.
-                        if let Err(e) = advance_timestamps(&conn, &oplog) {
+                        if let Err(e) = advance_timestamps(&conn, &oplog, &oplog_uri) {
                             eprintln!(
                                 "secantus-storage: moving the stable timestamp failed: {e:?}"
                             );
@@ -10435,7 +10750,7 @@ impl Storage {
                     // The stable timestamp first, then the checkpoint that
                     // keeps it (see `stable_checkpoint`).
                     let stable = if timestamped {
-                        match advance_timestamps(&conn, &oplog) {
+                        match advance_timestamps(&conn, &oplog, &oplog_uri) {
                             Ok(seq) => seq,
                             Err(e) => {
                                 eprintln!("secantus-storage: stable checkpoint failed: {e:?}");
@@ -10488,7 +10803,7 @@ impl Storage {
         // The drainers never take `self.lock`, so waiting here cannot deadlock.
         self.flush_oplog();
         if self.timestamped {
-            advance_timestamps(&self.conn, &self.oplog)?;
+            advance_timestamps(&self.conn, &self.oplog, &self.oplog_uri)?;
         }
         let session = self.conn.open_session()?;
         // Durable, consistent snapshot first; the backup cursor enumerates the
@@ -10735,6 +11050,10 @@ impl Storage {
         opts: &Document,
         given: &Document,
     ) -> Result<()> {
+        // One operation: what it writes after its entry shares the entry's
+        // timestamp, and what it writes before it is untimestamped, over
+        // rows earlier writes timestamped (RM-746).
+        let _op = self.ddl_scope();
         self.coll_mod_recording_inner(db, coll, opts, given)?;
         let defined = {
             let session = self.conn.open_session()?;
@@ -10966,21 +11285,15 @@ impl Storage {
         let session = self.conn.open_session()?;
         let mut attempt = 0u32;
         loop {
-            session.begin_transaction(None)?;
+            // A replayed one commits at its entry's timestamp; an imported
+            // one, whose entry is older than the stable timestamp, without
+            // one (RM-746).
+            begin_untimestamped(&session, self.timestamped)?;
             let res = self.write_pre_image_records(&session, records);
             let res = match res {
                 Ok(()) => match self.commit_stamp(&[]) {
-                    Some((ts, reserved)) => {
-                        let out = session
-                            .timestamp_transaction(&format!("commit_timestamp={ts:x}"))
-                            .and_then(|()| session.commit_transaction(None))
-                            .map_err(Into::into);
-                        if reserved {
-                            release_stamp(&self.oplog, ts);
-                        }
-                        out
-                    }
-                    None => session.commit_transaction(None).map_err(Into::into),
+                    Some(ts) => commit_entries_at(&session, ts, true),
+                    None => commit_untimestamped(&session),
                 },
                 Err(e) => {
                     let _ = session.rollback_transaction(None);
@@ -11066,7 +11379,9 @@ impl Storage {
             }
             drop(existing);
             if !own.is_empty() {
-                session.begin_transaction(None)?;
+                // A deletion from the oplog is untimestamped, as mongod's
+                // truncation of it is (RM-746).
+                begin_untimestamped(&session, self.timestamped)?;
                 let del = session.open_cursor(&self.oplog_uri, None)?;
                 for (pos, _) in &own {
                     del.reset()?;
@@ -11074,7 +11389,7 @@ impl Storage {
                     del.remove()?;
                 }
                 drop(del);
-                commit_stamped(&session, &self.oplog, self.timestamped)?;
+                commit_untimestamped(&session)?;
                 let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
                 st.live_count -= own.len() as i64;
                 st.live_bytes -= own.iter().map(|o| o.1).sum::<i64>();
@@ -11214,8 +11529,9 @@ fn prune_pre_images(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
         let now_ms = now.map_or_else(now_millis, |secs| secs * 1000);
         now_ms - expire * 1000
     });
+    // Untimestamped, as mongod's removal of expired pre-images is (RM-746).
     remove_expired_pre_images(&session, &ctx.sizes, u64_ts(through), before, &|s| {
-        commit_stamped(s, &ctx.oplog, ctx.data_nonlogged)
+        commit_untimestamped(s)
     })
 }
 
@@ -11321,7 +11637,7 @@ fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     let op_del = session.open_cursor(&ctx.oplog_uri, None)?;
     let mut pruned = 0usize;
     for batch in doomed.chunks(PRUNE_DELETE_BATCH) {
-        session.begin_transaction(None)?;
+        begin_untimestamped(&session, ctx.data_nonlogged)?;
         let removed = (|| -> Result<()> {
             for (pos, _) in batch {
                 op_del.reset()?;
@@ -11342,7 +11658,7 @@ fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
             }
             return Err(e);
         }
-        commit_stamped(&session, &ctx.oplog, ctx.data_nonlogged)?;
+        commit_untimestamped(&session)?;
         pruned += batch.len();
         // Take the batch off the oplog's size -- per committed batch, so a
         // later batch's failure leaves it exact.
@@ -12060,13 +12376,8 @@ impl Storage {
                 } else {
                     None
                 };
-                let mut _reserved: Option<ReleaseStamp<'_>> = None;
                 if wrote {
-                    if let Some((ts, reserved)) = self.commit_stamp(&handle.minted_ranges) {
-                        if reserved {
-                            // Released after the commit, whatever its outcome.
-                            _reserved = Some(ReleaseStamp(&self.oplog, ts));
-                        }
+                    if let Some(ts) = self.commit_stamp(&handle.minted_ranges) {
                         if let Err(e) =
                             session.timestamp_transaction(&format!("commit_timestamp={ts:x}"))
                         {
@@ -12734,7 +13045,7 @@ impl Storage {
         let written = self.mint_and_write_ext(&ws, entries, pre_images, true, prepare);
         let ranges = PENDING_MINTED.with(|p| std::mem::take(&mut *p.borrow_mut()));
         let out = match written {
-            Ok(last) => commit_stamped(&ws, &self.oplog, self.timestamped).map(|()| last),
+            Ok(last) => self.commit_minted_entries(&ws, &ranges).map(|()| last),
             Err(e) => {
                 let _ = ws.rollback_transaction(None);
                 Err(e)
@@ -13045,7 +13356,7 @@ impl Storage {
         let written = self.write_prepared_end(&ws, entry, true);
         let ranges = PENDING_MINTED.with(|p| std::mem::take(&mut *p.borrow_mut()));
         let out = match written {
-            Ok(()) => commit_stamped(&ws, &self.oplog, self.timestamped),
+            Ok(()) => self.commit_minted_entries(&ws, &ranges),
             Err(e) => {
                 let _ = ws.rollback_transaction(None);
                 Err(e)
@@ -14534,6 +14845,10 @@ impl Storage {
         coll: &str,
         options: &Document,
     ) -> Result<bool> {
+        // One operation: what it writes after its entry shares the entry's
+        // timestamp, and what it writes before it is untimestamped, over
+        // rows earlier writes timestamped (RM-746).
+        let _op = self.ddl_scope();
         let created = self.create_collection_with_options_inner(db, coll, options)?;
         if created && defines_view(options) {
             self.after_view_ddl(db, coll)?;
@@ -14606,6 +14921,10 @@ impl Storage {
     /// its registry row. Returns whether it existed. Emits an `op: "c"` `drop`
     /// oplog entry when it existed. Mirrors `storage.drop_collection`.
     pub fn drop_collection(&self, db: &str, coll: &str) -> Result<bool> {
+        // One operation: what it writes after its entry shares the entry's
+        // timestamp, and what it writes before it is untimestamped, over
+        // rows earlier writes timestamped (RM-746).
+        let _op = self.ddl_scope();
         let defined = {
             let session = self.conn.open_session()?;
             coll_options(&session, db, coll)?.is_some_and(|o| defines_view(&o))
@@ -14865,6 +15184,10 @@ impl Storage {
     /// Emits one `op: "c"` `drop` per collection plus a final `dropDatabase: 1`
     /// command oplog entry (no `ui`). Mirrors `storage.drop_database`.
     pub fn drop_database(&self, db: &str) -> Result<()> {
+        // One operation: what it writes after its entry shares the entry's
+        // timestamp, and what it writes before it is untimestamped, over
+        // rows earlier writes timestamped (RM-746).
+        let _op = self.ddl_scope();
         // Its index builds are aborted first, as mongod's dropDatabase does
         // (RM-187).
         self.abort_index_builds_and_wait(
@@ -15010,6 +15333,10 @@ impl Storage {
         dst_coll: &str,
         drop_target: bool,
     ) -> Result<(bool, Option<String>)> {
+        // One operation: what it writes after its entry shares the entry's
+        // timestamp, and what it writes before it is untimestamped, over
+        // rows earlier writes timestamped (RM-746).
+        let _op = self.ddl_scope();
         // Planner writes made here are released once they are visible.
         let _planner = PlannerScope::new();
         // It writes the index catalog.
@@ -16032,6 +16359,8 @@ impl Storage {
         key_spec: &Document,
         options: &Document,
     ) -> Result<bool> {
+        // One operation (RM-746), as the other DDL.
+        let _op = self.ddl_scope();
         // Planner writes made here are released once they are visible.
         let _planner = PlannerScope::new();
         if name != ID_INDEX_NAME && (db, coll) != ("config", "system.indexBuilds") {
@@ -17076,6 +17405,8 @@ impl Storage {
     /// Drop the index named `name` (and all its entries). Returns `false` if no
     /// such index, or `name == "_id_"`. Mirrors `storage.drop_index`.
     pub fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<bool> {
+        // One operation (RM-746), as the other DDL.
+        let _op = self.ddl_scope();
         // Planner writes made here are released once they are visible.
         let _planner = PlannerScope::new();
         // It writes the index catalog.
@@ -17139,6 +17470,8 @@ impl Storage {
     /// Drop every (non-`_id_`) index on `(db, coll)`. Returns how many were
     /// dropped. Mirrors `storage.drop_all_indexes` (used by drop-collection).
     pub fn drop_all_indexes(&self, db: &str, coll: &str) -> Result<usize> {
+        // One operation (RM-746), as the other DDL.
+        let _op = self.ddl_scope();
         // Planner writes made here are released once they are visible.
         let _planner = PlannerScope::new();
         // It writes the index catalog.
@@ -26044,7 +26377,7 @@ fn remove_expired_pre_images(
     let docs = open_doc_cursor(session, db, coll, None)?;
     let ix = open_id_index(session, db, coll, None, id_key_shape(None))?;
     for batch in doomed.chunks(PRUNE_DELETE_BATCH) {
-        session.begin_transaction(None)?;
+        begin_untimestamped(session, true)?;
         let removed = (|| -> Result<()> {
             for (rid, id, len) in batch {
                 docs.reset()?;

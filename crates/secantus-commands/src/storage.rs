@@ -600,6 +600,17 @@ pub trait Storage: Send + Sync {
         None
     }
 
+    /// Run this thread's writes, while the returned guard lives, as one
+    /// operation: as mongod runs a write and what it keeps beside it (a
+    /// retryable write's `config.transactions` row and retry image, a
+    /// transaction's row) in one unit of work at the timestamp of its oplog
+    /// entry, a write of the operation that logs no entry of its own commits
+    /// at the timestamp of the operation's entry before it, held above the
+    /// stable timestamp until the guard drops (RM-746).
+    fn op_scope(&self) -> Option<Box<dyn std::any::Any>> {
+        None
+    }
+
     /// A high-water-mark resume token at the oplog position `seq` (a
     /// timestamp), encoded as `bson::encode({_data: "<hex>"})`. Returned as
     /// the `postBatchResumeToken` of a change-stream batch that ended on no

@@ -2209,6 +2209,9 @@ fn commit_transaction(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             if let Some(s) = ctx.storage.as_ref() {
                 s.take_last_commit_ts();
             }
+            // The commit and its session's row are one operation: the row
+            // commits at the timestamp of the commit's entry (RM-746).
+            let _op = ctx.storage.as_ref().and_then(|s| s.op_scope());
             match reg.commit(&lsid, n) {
                 None => {
                     let mut reply = doc! { "ok": 1.0 };
