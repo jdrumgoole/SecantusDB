@@ -2027,15 +2027,11 @@ pub(crate) fn listed_indexes(
     // equivalent in the durable catalog and never echoes it from `listIndexes`
     // (probed 6.0.16) — drivers see it only as explain's `isMultiKey`. Keep it
     // off the wire. Mirrors commands.py.
-    // `entryFormat` is likewise internal — the on-disk index-entry layout
-    // version (see `ENTRY_FORMAT_RECORDID`). mongod has no such field.
+    // `collationKeys`, `buildSeq`, `binDataOrder` and `multikeyPaths` are
+    // likewise this catalog's own; mongod has no such fields.
     for ix in &mut indexes {
         ix.remove("multikey");
-        ix.remove("entryFormat");
         ix.remove("collationKeys");
-        ix.remove("geoKeys");
-        ix.remove("numberKeys");
-        ix.remove("pythonKeys");
         ix.remove("buildSeq");
         ix.remove("binDataOrder");
         ix.remove("multikeyPaths");
@@ -4065,12 +4061,8 @@ pub(crate) const INDEX_CATALOG_ONLY: &[&str] = &[
     TS_ORIGINAL_SPEC,
     // `createIndexes`'s own mark on an index still being built (RM-187).
     BUILDING_MARK,
-    "entryFormat",
     "multikey",
     "collationKeys",
-    "geoKeys",
-    "numberKeys",
-    "pythonKeys",
     "buildSeq",
     "binDataOrder",
     "multikeyPaths",

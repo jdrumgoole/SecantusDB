@@ -1,26 +1,30 @@
-//! SecantusDB's storage layer, in Rust — Phase 4 sub-phase 1 (the CRUD core).
+//! SecantusDB's storage layer, in Rust: mongod's storage model on WiredTiger,
+//! at store format 10 (`store_format.rs`; the layout and how it was reached:
+//! `tasks/mongod-storage-model-plan.md`), built on `secantus-wt` (the
+//! WiredTiger FFI) and `secantus-core`'s `keystring` and `sortkey` (the
+//! index keys, and the in-memory identity and `$sort` bytes).
 //!
-//! This is the first vertical of the storage keystone: the collections and
-//! documents tables (`secantus_collections` / `secantus_documents`) and their
-//! CRUD operations (insert, find-by-`_id`,
-//! natural-order scan, replace, delete, collection registry), built on
-//! `secantus-wt` (the WiredTiger FFI) and `secantus-core`'s `sortkey` (the
-//! byte-sortable `id_key` encoding). It mirrors the behaviour of the relevant
-//! slice of `src/secantus/storage.py`:
-//!
-//! * documents live at `RecordId -> bson(doc)` in a table of their own, the
-//!   value being the document as mongod stores it, with no frame around it.
-//!   The RecordId is a monotonic per-insertion counter — so iterating the
-//!   table yields insertion (natural / RecordId) order. The `_id` index
-//!   (`_id_`, a table
-//!   of its own, `index-<UUID>`: the KeyString of `_id` -> the RecordId, as
-//!   mongod's) resolves an `_id` to its RecordId;
+//! * `_mdb_catalog` lists each collection and its indexes with their idents,
+//!   as mongod's does. Beside it this store keeps its own registry
+//!   (`secantus_collections` / `secantus_indexes`, the working set its
+//!   transactional machinery is built on) and `secantus_idents`, which
+//!   places a collection by name; a registry write rewrites the catalog row
+//!   in the same transaction;
+//! * documents live at `RecordId -> bson(doc)` in a table of their own
+//!   (`collection-<UUID>`), the value being the document as mongod stores
+//!   it, with no frame around it. The RecordId is a monotonic per-insertion
+//!   counter, so iterating the table yields insertion (natural / RecordId)
+//!   order. The `_id` index (`_id_`, a table of its own, `index-<UUID>`: the
+//!   KeyString of `_id` -> the RecordId, as mongod's) resolves an `_id` to
+//!   its RecordId, and every other index is a table of its own too;
 //! * inserts write the `_id` index with a non-overwriting cursor so a duplicate
 //!   `_id` surfaces as a duplicate-key error;
-//! * a global lock serialises public methods (1:1 with `storage.py`'s `RLock`).
-//!
-//! Later sub-phases add indexes, geo, and the oplog (see
-//! `tasks/rust-rewrite-phase4-scoping.md`).
+//! * dropping or renaming a collection is catalog-only, as in mongod: one
+//!   transaction moves or removes the registry rows, the placement and the
+//!   catalog row (with the oplog entry), and a dropped table goes to the
+//!   drop-pending reaper;
+//! * a global lock serialises DDL; reads and writes take per-collection
+//!   locks.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -248,7 +252,7 @@ pub struct OpenRecord {
     /// as the store opened (RM-736), when its point was set.
     pub oplog_truncation: Option<OplogTruncation>,
     /// How long the whole open took after the lock file: WiredTiger, the
-    /// tables, the recovery and the upgrades (mongod's
+    /// tables, the recovery and the catalog work (mongod's
     /// `createStorageEngineMillis`).
     pub open: Duration,
 }
@@ -611,7 +615,7 @@ impl Drop for UserTransactionHandle {
         // The dedicated session's own Drop rolls the WT transaction back;
         // uncommitted rows were never MVCC-visible, so deregistering before
         // that rollback completes is safe — the ranges just become permanent
-        // seq holes, which the shard merge tolerates.
+        // seq holes, which the oplog merge tolerates.
         self.deregister_minted();
         // Its planner writes are undone, so none of them is in flight.
         let pending = std::mem::take(&mut self.planner_pending);
@@ -702,18 +706,10 @@ fn too_large_write_error(index: usize, size: usize) -> Document {
 }
 
 const COLL_TABLE: &str = "table:secantus_collections";
-/// Pending-drop tombstones: `(db, coll) -> b""`. Written in the same small
-/// transaction that unregisters a collection (phase 1 of a chunked drop);
-/// removed when the batched row purge (phase 2) completes. A tombstone left
-/// by a crash is finished at the next open — see `recover_pending_drops`.
-/// Additive to the shared on-disk layout (an older store simply lacks the
-/// table; nothing else reads it), same precedent as the unique-keys table.
-const TOMB_TABLE: &str = "table:secantus_drop_tombstones";
 /// Each collection's documents are in a WiredTiger table of their own, named
 /// by the collection's ident (`collection-<UUID>`) and keyed by RecordId, as
 /// mongod keeps them (`tasks/mongod-storage-model-plan.md`, phase 3; see
-/// [`mdb_catalog`]). Until then every collection shared sixteen tables keyed
-/// `(db, coll, RecordId)`.
+/// [`mdb_catalog`]).
 ///
 /// A cursor on one collection's table. Its `set_key_ssq` / `get_key_ssq`
 /// keep the call shape the shared tables had, over the RecordId key alone,
@@ -1973,7 +1969,7 @@ fn bootstrap_table_cfg(name: &str, base: &str, data_nonlogged: bool) -> String {
     }
 }
 
-/// Table-create config for the oplog shard / legacy-oplog / preimage tables,
+/// Table-create config for the oplog and preimage tables,
 /// honouring [`oplog_tables_nonlogged`] and the `SECANTUS_OPLOG_TABLE_EXTRA`
 /// experiment hook (appended last — WiredTiger takes the last occurrence of a
 /// duplicated key, so an appended clause overrides the default; same trick as
@@ -2155,11 +2151,12 @@ const RANGE_OPS: &[&str] = &["$eq", "$gt", "$gte", "$lt", "$lte", "$in"];
 /// Whether an operator document can be answered from index BOUNDS: every
 /// operator is in `RANGE_OPS`.
 ///
-/// Until entry format 4 a range bounded by a document or an array was refused
-/// here too: the entries ordered those keys by raw BSON, which leads with a
-/// little-endian LENGTH, so with an index on `x`, `find({x: {$gt: [1, 2, 3]}})`
-/// dropped `{x: [9]}` (measured against mongod 8.2.11, 2026-09-30). Format 4
-/// keys them by value, so byte bounds are value bounds for every type.
+/// A range bounded by a document or an array is answered from bounds too:
+/// the entries are KeyStrings, which order a document or an array by value,
+/// so byte bounds are value bounds for every type. (An order by raw BSON
+/// leads with a little-endian LENGTH, so with an index on `x`,
+/// `find({x: {$gt: [1, 2, 3]}})` would drop `{x: [9]}`; measured against
+/// mongod 8.2.11, 2026-09-30.)
 fn index_can_bound(opd: &Document) -> bool {
     opd.iter().all(|(k, _)| RANGE_OPS.contains(&k.as_str()))
 }
@@ -2857,17 +2854,12 @@ pub fn wt_config(
 // writes (tasks/mongod-storage-model-plan.md). lz4 and zlib stay linked for
 // the reasons above; no table this build creates uses them.
 
-// The full table set `storage.py` bootstraps. Sub-phase 1 only reads/writes the
-// collections + documents tables, but creating the rest keeps the on-disk schema
-// identical so later sub-phases don't need a migration.
+// The tables a new store is created with, besides the collection and index
+// tables made as collections and indexes are created.
 const BOOTSTRAP: &[(&str, &str)] = &[
-    // NOTE: DOC_TABLE (the pre-shard single documents table) and
-    // table:secantus_natural (the old forward seq -> id_key index) are LEGACY
-    // formats nothing writes any more, so they are NOT created here. Creating
-    // them cost ~9.7 ms each on every open just so the migration and the drop
-    // paths could find them empty. A store that HAS them still migrates and
-    // drops correctly -- every reader treats an absent table as empty.
-    // Mirrors the Python `Storage` bootstrap.
+    // The tables a store of this format holds besides one per collection
+    // and per index: the registry, mongod's catalog and this store's
+    // placements, then the rest below.
     (COLL_TABLE, "key_format=SS,value_format=u"),
     // mongod's catalog, and where each collection's documents live.
     (
@@ -2875,7 +2867,6 @@ const BOOTSTRAP: &[(&str, &str)] = &[
         mdb_catalog::COLLECTION_TABLE_CFG,
     ),
     (mdb_catalog::IDENTS_TABLE, "key_format=SS,value_format=u"),
-    (TOMB_TABLE, "key_format=SS,value_format=u"),
     ("table:secantus_indexes", "key_format=SSS,value_format=u"),
     // NOTE: table:secantus_oplog is created in `open_with_config_durable`
     // (its config depends on `oplog_table_cfg()`).
@@ -3209,10 +3200,9 @@ fn encode_id_doc(id: &Bson) -> Result<Vec<u8>> {
     }
 }
 
-/// `id_key = sortkey.encode_id_key(_id)` — the byte-sortable key for the `_id`.
-/// Not `encode_value`: an `_id` key is stored in every document row, so it keeps
-/// formats 1-3's document encoding when index entries moved to format 4 (see
-/// `sortkey::encode_id_key`).
+/// The byte-sortable key for an `_id` (`sortkey::encode_id_key`), in mongod's
+/// order. Held in memory only, for identity, uniqueness and ordering; no
+/// document row stores it.
 fn id_key(id: &Bson) -> Result<Vec<u8>> {
     sortkey::encode_id_key(id).map_err(|_| StorageError::UnsupportedId)
 }
@@ -3375,7 +3365,7 @@ fn shell_value(v: &Bson) -> String {
             )
         }
         // An empty array has no element to index, and its key is `undefined`
-        // (entry format 6 holds that key itself).
+        // (the index holds that key itself, as mongod's does).
         Bson::Array(a) if a.is_empty() => "undefined".to_string(),
         Bson::Undefined => "undefined".to_string(),
         // Every other type as mongod prints it: `new Date(<ms>)`,
@@ -3461,29 +3451,14 @@ fn enc_dir_c(v: &Bson, direction: i32, coll: Option<&Collation>) -> Result<Vec<u
 /// Catalog marker on an index whose entries hold COLLATION sort keys: the
 /// `collation::KEY_FORMAT` they were written with. Set at build for an index
 /// with a collation; an index without the marker holds plain value keys
-/// whatever its `collation` option says, which is how every index built
-/// before 2026-10-10 reads. Not a user option: `listIndexes` strips it.
+/// whatever its `collation` option says. Not a user option: `listIndexes`
+/// strips it.
 const COLLATION_KEYS: &str = "collationKeys";
-
-/// Catalog marker on a `2d` or `2dsphere` index: the rules its entries were
-/// written by. Before 2026-10-13 a value with several locations, and a point
-/// written as a document other than `{lng, lat}`, got no entry, so a query
-/// through an index built then misses those documents. An index without the
-/// marker is rebuilt when the store opens (`rebuild_outdated_indexes`). Not a
-/// user option: `listIndexes` strips it.
-///
-/// Format 2 (2026-10-15) is a `2d` index whose `bits` was given as a double
-/// or a decimal: mongod truncates it (`bits: 20.0` is 20 bits), where format
-/// 1 read it as the default 26. A `2dsphere` index of format 1 is current.
-const GEO_KEYS: &str = "geoKeys";
-/// The value of [`GEO_KEYS`] this build writes.
-const GEO_KEY_FORMAT: i32 = 2;
 
 /// The order an index was built in, among its collection's (RM-081): mongod
 /// lists indexes, and tries their plans, in build order. One more than the
-/// collection's highest; an index built before this was recorded has none
-/// and counts as 0, so a store's existing indexes keep name order, ahead of
-/// any built later. Not a user option: `listIndexes` strips it. A rebuild
+/// collection's highest; an index without it counts as 0, so it keeps name
+/// order, ahead of any built later. Not a user option: `listIndexes` strips it. A rebuild
 /// keeps it (it is not a `BUILD_STAMPS` entry).
 const BUILD_SEQ: &str = "buildSeq";
 
@@ -3497,7 +3472,7 @@ fn build_seq(opts: &Document) -> i64 {
 
 /// Options only this server's catalog carries, which a rebuild leaves out of
 /// the options it builds from: `create_index_in_txn` stamps them again.
-const BUILD_STAMPS: &[&str] = &["multikey", MULTIKEY_PATHS, COLLATION_KEYS, GEO_KEYS];
+const BUILD_STAMPS: &[&str] = &["multikey", MULTIKEY_PATHS, COLLATION_KEYS];
 
 /// The catalog option recording an index whose keys put BinData in
 /// PostgreSQL's byte order (`"bytes"`): one the PG server built. Absent means
@@ -4381,8 +4356,8 @@ fn doc_makes_multikey(doc: &Document, key_spec: &Document) -> bool {
 /// How many keys mongod holds for `doc` in an index on `key_spec`: for each
 /// field, one per distinct value (an array's elements, or one for an empty
 /// array or a missing field, and a null for an element on the way that does
-/// not reach the leaf), and their product across the fields. The
-/// whole-array entry this store also keeps is not one of mongod's keys.
+/// not reach the leaf), and their product across the fields. An index holds
+/// no whole-array entry: that is not one of mongod's keys.
 fn reference_key_count(doc: &Document, key_spec: &Document, coll: Option<&Collation>) -> i64 {
     key_spec
         .keys()
@@ -4403,8 +4378,8 @@ fn reference_key_count(doc: &Document, key_spec: &Document, coll: Option<&Collat
 }
 
 /// All byte-keys `doc` contributes to an index under `key_spec`. Scalars give
-/// one key; arrays give one key per (deduped) element *plus* the whole-array
-/// key (the multikey layout); compound indexes take the cartesian product
+/// one key; arrays give one key per (deduped) element and no whole-array key
+/// (mongod's keys); compound indexes take the cartesian product
 /// across each field's candidate values. A `sparse` index produces no keys only
 /// when the doc has NONE of the indexed fields (see `sparse_covers`). Missing
 /// fields otherwise encode as `null`. Mirrors `storage._index_key_variants`.
@@ -4699,9 +4674,9 @@ fn op_implies_bound(qop: &str, qv: &Bson, pop: &str, pv: &Bson) -> bool {
     if pop != "$eq" && type_bracket(&a) != type_bracket(&b) {
         return false;
     }
-    // Documents and arrays used to need their own refusal here (raw-BSON bytes
-    // ordered them by length); since entry format 4 they order by value like
-    // every other type, so the bracket check above is the whole story.
+    // Documents and arrays need no refusal of their own here: KeyStrings
+    // order them by value like every other type, so the bracket check above
+    // is the whole story.
     let (le, lt, ge, gt, eq) = (a <= b, a < b, a >= b, a > b, a == b);
     match pop {
         // query upper-bounds the field; need its max <= / < pv.
@@ -4892,10 +4867,10 @@ fn multi_sort_spec(sort: Option<&Document>) -> Option<Vec<(String, i32)>> {
 /// documents was wrong on 5 of 7 measured shapes (8.2.11, 2026-09-30) while the
 /// aggregation `$sort`, which compares values, was right on all 7. So a
 /// document or array also carries its value, compared with the same
-/// `order::cmp` the `$sort` stage uses. (Since entry format 4 the bytes order a
-/// document by value too, so for documents this is belt and braces; for arrays
-/// it is not, because a sort orders an array by its smallest or largest
-/// element, not by the whole array -- see `sort_values_are_nested`.)
+/// `order::cmp` the `$sort` stage uses. (The index keys order a document by
+/// value too, so for documents this is belt and braces; for arrays it is
+/// not, because a sort orders an array by its smallest or largest element,
+/// not by the whole array -- see `sort_values_are_nested`.)
 struct SortPart {
     bytes: Vec<u8>,
     nested: Option<Bson>,
@@ -5076,10 +5051,10 @@ fn is_nested_rank(bytes: &[u8]) -> bool {
 
 /// Whether any of these documents sorts by an ARRAY value under `spec` -- the
 /// one kind of value whose index order is not its sort order (a sort takes an
-/// array's smallest or largest element; the index keys the whole array), so an
-/// index walk over them is not a sort. A document at the sort path used to
-/// count too, when the entries keyed documents by raw BSON; entry format 4
-/// keys them by value. Reads raw BSON, only the sort paths.
+/// array's smallest or largest element; an index holds an entry per element),
+/// so an index walk over them is not a sort. A document at the sort path does
+/// not count: the entries key documents by value. Reads raw BSON, only the
+/// sort paths.
 fn sort_values_are_nested(blobs: &[Vec<u8>], spec: &[(String, i32)]) -> bool {
     blobs.iter().any(|blob| {
         let Ok(raw) = bson::RawDocument::from_bytes(blob) else {
@@ -5591,7 +5566,7 @@ struct OplogState {
     /// a later commit materialises an entry behind a resume position and the
     /// event is lost). A rolled-back batch simply deregisters: the abandoned
     /// range vanishes and `min` moves on — a permanent seq hole, which the
-    /// shard merge already tolerates. Empty in async mode (async mints
+    /// oplog's readers already tolerate. Empty in async mode (async mints
     /// post-commit; `written_seq` governs visibility there). Each range
     /// keeps its end, its first timestamp and when it was minted: the time
     /// its write holds the slot open is mongod's
@@ -8194,7 +8169,7 @@ impl Storage {
         let oplog_uri = oplog_table.uri.clone();
         // The oplog state as the last close left it: the size storer's
         // counts are trusted only when it is the state they were saved with.
-        // (`next_nat_seq` is not part of it: the open raises it to the
+        // (The next RecordId is not part of it: the open raises it to the
         // largest RecordId held, so it can differ from what the close saved
         // with nothing written in between.)
         let size_fingerprint = [state.next_seq, 0, 0];
@@ -8345,7 +8320,7 @@ impl Storage {
             lock_file,
         };
         // Before the store takes any write -- crash recovery's replay and the
-        // upgrades below write documents, and each write moves the counts.
+        // catalog work below write documents, and each write moves the counts.
         storage.open_size_storer(&size_fingerprint)?;
         // What the store writes as it opens -- its genesis, the catalog and
         // views brought in line, drops a crash interrupted -- logs no
@@ -8375,9 +8350,6 @@ impl Storage {
             storage.spawn_journal_flusher();
         }
         storage.count_unclean_shutdown(oplog_created)?;
-        // Finish any chunked drop a crash interrupted (registry row already
-        // gone; the leftover rows must not resurface under a re-created name).
-        storage.recover_pending_drops()?;
         storage.revive_prepared_xacts()?;
         storage.note_existing_timeseries()?;
         // `_mdb_catalog` from the registry, after everything above that can
@@ -9110,9 +9082,9 @@ impl Storage {
     }
 
     /// [`Self::op_scope`] for a DDL operation, which writes in several
-    /// statements of its own around its entry (a rename's tombstone and
-    /// target drop before it, a drop's catalog purge after it): those before
-    /// the entry commit untimestamped, as nothing is logged for them yet.
+    /// statements of its own around its entry (a drop's or rename's
+    /// registry rows before it): those before the entry commit
+    /// untimestamped, as nothing is logged for them yet.
     fn ddl_scope(&self) -> (OpScope, Untimestamped) {
         (self.op_scope(), untimestamped())
     }
@@ -10352,9 +10324,9 @@ impl Storage {
 
     /// Write every collection's `_mdb_catalog` row from the registry, in one
     /// statement transaction (timestamped as the store's writes are): what
-    /// an open does after the work that can rewrite index rows (format
-    /// rebuilds, claim backfills). A row that already says the same is left
-    /// alone.
+    /// an open does after the work that can rewrite index rows (a mongod
+    /// store's adoption, recovery's replay). A row that already says the same
+    /// is left alone.
     fn resync_catalog(&self) -> Result<()> {
         self.retry_write_conflicts("resync _mdb_catalog", || {
             let session = self.op_session()?;
@@ -12210,7 +12182,7 @@ impl Storage {
         }
     }
 
-    /// One committed-view scan for `find_seq_for_ts`: the shard merge yields
+    /// One committed-view scan for `find_seq_for_ts`: the oplog table yields
     /// entries in ts order (ts is monotone in the global seq order), so the
     /// first at/after `target` is the answer; the minted tail + 1 when no
     /// committed row qualifies. Lock-free cross-thread read on a fresh MVCC
@@ -14112,9 +14084,9 @@ impl Storage {
                 cur.insert()?;
                 self.sizes
                     .adjust(&session, db, coll, Delta::insert(blob.len()));
-                // Maintain secondary indexes: write this doc's entries (still carrying
-                // id_key as the fetch pointer in step 1; IXSCAN resolves id_key ->
-                // RecordId -> doc), and lazily flag any index this doc makes multikey.
+                // Maintain secondary indexes: write this doc's entries (each
+                // carries the RecordId an IXSCAN fetches by), and lazily flag
+                // any index this doc makes multikey.
                 self.write_index_entries(&session, db, coll, &doc, &descs, &recordid)?;
                 self.count_index_keys(&session, db, coll, None, Some(&doc), &descs)?;
                 self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
@@ -15422,23 +15394,18 @@ impl Storage {
             }
             return Ok(existed);
         }
-        // Chunked two-phase drop. A whole-collection purge in ONE statement
-        // transaction is unbounded dirty content — the WT livelock class the
-        // chunked insert / updateMany / deleteMany work closed. A drop of a
-        // collection larger than the cache's dirty budget got a cache-pressure
-        // WT_ROLLBACK, which the WriteConflict retry loop re-ran forever while
-        // the eviction threads spun (the 2026-08-11 wedge; `tests/drop_chunk.rs`
-        // reproduces it deterministically at a small cache).
-        //
-        // Phase 1 (small transaction): unregister the collection, write a drop
-        // tombstone, emit the drop oplog entry. After this commit the namespace
-        // no longer exists for every reader/writer (all routing goes through
-        // the registry), so the batched purge is unobservable.
-        // Phase 2 (bounded transactions): delete the rows table-by-table in
-        // PURGE_CHUNK_MAX_ROWS batches, then clear the tombstone. A crash
-        // mid-purge leaves rows behind an unregistered name plus the
-        // tombstone; `recover_pending_drops` finishes the purge at next open,
-        // before any traffic can re-create the name.
+        // A drop is catalog-only, as mongod's is: one transaction removes the
+        // registry rows (the collection's and its indexes'), the placement
+        // and the `_mdb_catalog` row, and emits the drop oplog entry, at
+        // the entry's timestamp. The documents' and the indexes' tables are
+        // not purged row by row: they go to the drop-pending reaper once the
+        // transaction commits and nothing has them open
+        // (`unplace_collection`), so the work is bounded by the number of
+        // indexes however large the collection is. A crash after the commit
+        // leaves tables no placement names, which the next open drops
+        // (`reconcile_idents`); a crash before it leaves the collection.
+        // It writes the index catalog.
+        note_planner_write_of(db, coll);
         let defined = Cell::new(false);
         let existed = self.retry_write_conflicts("drop_collection", || {
             let session = self.op_session()?;
@@ -15462,10 +15429,7 @@ impl Storage {
                     Err(e) if e.is_not_found() => {}
                     Err(e) => return Err(e.into()),
                 }
-                let t = session.open_cursor(TOMB_TABLE, None)?;
-                t.set_key_ss(db, coll);
-                t.set_value_u(b"");
-                t.insert()?;
+                self.remove_index_registry_rows(&session, db, coll)?;
                 let records = if ui.is_some() {
                     self.count_records(&session, db, coll)?
                 } else {
@@ -15484,7 +15448,7 @@ impl Storage {
         if defined.get() {
             note_index_keys(None, Some(1));
         }
-        self.purge_dropped_collection(db, coll)?;
+        self.forget_record_ids(db, coll);
         Ok(true)
     }
 
@@ -15528,72 +15492,6 @@ impl Storage {
             Ok(())
         })?;
         Ok(n)
-    }
-
-    /// Phase 2 of a chunked drop: the unregistered collection's rows are in
-    /// tables a drop has unlisted and drops whole, so what is left is its
-    /// index catalog rows; then clear the tombstone. Caller holds whatever exclusion it needs (the drop path holds
-    /// the global + namespace locks; open-time recovery runs single-threaded).
-    fn purge_dropped_collection(&self, db: &str, coll: &str) -> Result<()> {
-        // Planner writes made here are released once they are visible.
-        let _planner = PlannerScope::new();
-        self.forget_record_ids(db, coll);
-        // It writes the index catalog.
-        note_planner_write_of(db, coll);
-        // Final small transaction: the index catalog rows (a handful) and the
-        // tombstone itself.
-        self.retry_write_conflicts("drop_collection purge(final)", || {
-            let session = self.op_session()?;
-            self.with_statement_txn(&session, || {
-                for (name, _key_spec, _opts) in self.iter_indexes(&session, db, coll)? {
-                    let ic = session.open_cursor(IDX_TABLE, None)?;
-                    ic.set_key_sss(db, coll, &name);
-                    match ic.remove() {
-                        Ok(()) => {}
-                        Err(e) if e.is_not_found() => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-                let t = session.open_cursor(TOMB_TABLE, None)?;
-                t.set_key_ss(db, coll);
-                match t.search() {
-                    Ok(()) => t.remove()?,
-                    Err(e) if e.is_not_found() => {}
-                    Err(e) => return Err(e.into()),
-                }
-                Ok(())
-            })
-        })
-    }
-
-    /// Finish any drop whose batched purge a crash interrupted: the registry
-    /// row is already gone (phase 1 committed), so the leftover rows belong to
-    /// an unregistered name and must be purged before traffic can re-create
-    /// it. Runs at open, single-threaded.
-    fn recover_pending_drops(&self) -> Result<()> {
-        let pending: Vec<(String, String)> = {
-            let session = self.conn.open_session()?;
-            let cur = match session.open_cursor(TOMB_TABLE, None) {
-                Ok(c) => c,
-                Err(e) if e.is_missing_table() => return Ok(()),
-                Err(e) => return Err(e.into()),
-            };
-            let mut out = Vec::new();
-            let mut more = cur.next()?;
-            while more {
-                let (d, c) = cur.get_key_ss()?;
-                out.push((d, c));
-                more = cur.next()?;
-            }
-            out
-        };
-        for (db, coll) in pending {
-            eprintln!(
-                "secantus-storage: finishing interrupted drop of {db}.{coll} (crash-left tombstone)"
-            );
-            self.purge_dropped_collection(&db, &coll)?;
-        }
-        Ok(())
     }
 
     /// Drop an entire database: delete every collection's data + registry rows.
@@ -15671,10 +15569,10 @@ impl Storage {
                 })?;
                 continue;
             }
-            // Chunked two-phase drop, same as drop_collection: unregister +
-            // tombstone + drop entry in a small transaction, then the batched
-            // row purge (one unbounded purge transaction per collection was
-            // the same WT-livelock class — see the drop_collection comment).
+            // Catalog-only, same as drop_collection: the registry rows, the
+            // placement and the drop entry in one small transaction, the
+            // tables to the drop-pending reaper.
+            note_planner_write_of(db, c);
             self.retry_write_conflicts("drop_database", || {
                 let session = self.op_session()?;
                 self.with_statement_txn(&session, || {
@@ -15693,10 +15591,7 @@ impl Storage {
                         Err(e) if e.is_not_found() => {}
                         Err(e) => return Err(e.into()),
                     }
-                    let t = session.open_cursor(TOMB_TABLE, None)?;
-                    t.set_key_ss(db, c);
-                    t.set_value_u(b"");
-                    t.insert()?;
+                    self.remove_index_registry_rows(&session, db, c)?;
                     let records = if ui.is_some() {
                         self.count_records(&session, db, c)?
                     } else {
@@ -15709,7 +15604,7 @@ impl Storage {
                     Ok(())
                 })
             })?;
-            self.purge_dropped_collection(db, c)?;
+            self.forget_record_ids(db, c);
         }
         // A database with no collections does not exist, and mongod writes no
         // oplog entry for dropping it (measured 8.2.11): a change stream sees
@@ -15788,27 +15683,12 @@ impl Storage {
                 })
             });
         }
-        // Chunked two-phase rename. The single-transaction move re-keyed every
-        // row at once — unbounded dirty content, the same WT-livelock class as
-        // the (fixed) one-transaction drop purge. The phases reuse the drop
-        // tombstones so BOTH crash windows recover through the existing
-        // `recover_pending_drops`, on both servers:
-        //
-        //   0. validation (+ chunked drop of the target under drop_target);
-        //   A. small txn: tombstone DST — a crash mid-copy leaves partial rows
-        //      behind an unregistered name with a plain drop tombstone, which
-        //      open-time recovery purges (the rename simply never happened);
-        //   B. (nothing: the tables move with the placement at the switch);
-        //   C. small txn — THE SWITCH: register dst, unregister src, move the
-        //      tombstone dst -> src, emit the rename oplog entry. After this
-        //      commit the rename has happened; a crash leaves src's rows
-        //      behind an unregistered name with a plain tombstone (recovered
-        //      as a drop);
-        //   D. batched purge of src rows + tombstone clear
-        //      (`purge_dropped_collection`).
-        //
-        // The namespace locks are held throughout, so no reader or writer can
-        // observe the intermediate states on a live server.
+        // A rename is catalog-only, as mongod's is: the documents' table and
+        // every index's table stay where they are and move to the new name
+        // with their placement, so one transaction does it all (replaced
+        // target, index registry rows, collection row, `_mdb_catalog` row,
+        // oplog entry) and the work does not grow with the collection. The
+        // namespace locks are held throughout.
         {
             let session = self.op_session()?;
             if coll_options(&session, src_db, src_coll)?.is_none() {
@@ -15835,24 +15715,28 @@ impl Storage {
         } else {
             None
         };
-        // Phase 0: drop an existing target the chunked way (unregister +
-        // tombstone + drop oplog entry, then batched purge) — mongod's oplog
-        // order is drop-target then rename.
-        let mut dst_ui: Option<Vec<u8>> = None;
+        // A replaced target is dropped in the same transaction (mongod's
+        // oplog order is drop-target then rename; the replaced target gets
+        // no `drop` entry of its own: mongod records it as the rename's
+        // `dropTarget`, and a stream on it sees the rename, then an
+        // invalidate).
         let dst_existed = {
             let session = self.op_session()?;
             coll_options(&session, dst_db, dst_coll)?.is_some()
         };
-        if dst_existed {
-            dst_ui = if self.enable_oplog {
-                let session = self.op_session()?;
-                Some(collection_uuid(&session, dst_db, dst_coll)?)
-            } else {
-                None
-            };
-            self.retry_write_conflicts("rename_collection drop-target", || {
-                let session = self.op_session()?;
-                self.with_statement_txn(&session, || {
+        let dst_ui: Option<Vec<u8>> = if dst_existed && self.enable_oplog {
+            let session = self.op_session()?;
+            Some(collection_uuid(&session, dst_db, dst_coll)?)
+        } else {
+            None
+        };
+        note_planner_write_of(src_db, src_coll);
+        note_planner_write_of(dst_db, dst_coll);
+        let src_next = self.next_record_id(src_db, src_coll)?;
+        self.retry_write_conflicts("rename_collection", || {
+            let session = self.op_session()?;
+            self.with_statement_txn(&session, || {
+                if dst_existed {
                     let c = session.open_cursor(COLL_TABLE, None)?;
                     c.set_key_ss(dst_db, dst_coll);
                     match c.search() {
@@ -15863,30 +15747,12 @@ impl Storage {
                         Err(e) if e.is_not_found() => {}
                         Err(e) => return Err(e.into()),
                     }
-                    let t = session.open_cursor(TOMB_TABLE, None)?;
-                    t.set_key_ss(dst_db, dst_coll);
-                    t.set_value_u(b"");
-                    t.insert()?;
+                    self.remove_index_registry_rows(&session, dst_db, dst_coll)?;
                     self.unplace_collection(&session, dst_db, dst_coll)?;
-                    // The replaced target gets no `drop` entry of its own:
-                    // mongod records it as the rename's `dropTarget`, and a
-                    // stream on it sees the rename, then an invalidate.
-                    Ok(())
-                })
-            })?;
-            self.purge_dropped_collection(dst_db, dst_coll)?;
-        }
-        // Phase A: tombstone the destination before any row lands there.
-        self.retry_write_conflicts("rename_collection tombstone", || {
-            let session = self.op_session()?;
-            self.with_statement_txn(&session, || {
-                let t = session.open_cursor(TOMB_TABLE, None)?;
-                t.set_key_ss(dst_db, dst_coll);
-                t.set_value_u(b"");
-                t.insert()?;
-                // The index catalog rows ride in this small transaction so
-                // every copy batch sees the destination's indexes.
+                }
+                // The index registry rows follow the collection.
                 let idx_rows = self.collect_idx_rows(&session, src_db, src_coll)?;
+                self.remove_index_registry_rows(&session, src_db, src_coll)?;
                 let icur = session.open_cursor(IDX_TABLE, None)?;
                 for (name, payload) in &idx_rows {
                     icur.reset()?;
@@ -15894,20 +15760,6 @@ impl Storage {
                     icur.set_value_u(payload);
                     icur.insert()?;
                 }
-                Ok(())
-            })
-        })?;
-        // Phase B: nothing to copy. The documents stay in their table, which
-        // moves to the new name at the switch with every index's table, the
-        // `_id` index and the unique indexes' entries among them, each
-        // holding its RecordIds (mongod's rename is catalog-only). The
-        // destination numbers on from where the source would have.
-        let src_next = self.next_record_id(src_db, src_coll)?;
-        self.set_next_record_id(dst_db, dst_coll, src_next);
-        // Phase C — the switch.
-        self.retry_write_conflicts("rename_collection switch", || {
-            let session = self.op_session()?;
-            self.with_statement_txn(&session, || {
                 // The table moves to the new name (mongod's rename is
                 // catalog-only), and with it its `_mdb_catalog` row.
                 self.move_placement(&session, (src_db, src_coll), (dst_db, dst_coll))?;
@@ -15932,17 +15784,6 @@ impl Storage {
                 note_coll_table_write(dst_db, dst_coll);
                 // The catalog row the table kept now names the new namespace.
                 sync_catalog_entry(&session, dst_db, dst_coll)?;
-                let t = session.open_cursor(TOMB_TABLE, None)?;
-                t.set_key_ss(dst_db, dst_coll);
-                match t.search() {
-                    Ok(()) => t.remove()?,
-                    Err(e) if e.is_not_found() => {}
-                    Err(e) => return Err(e.into()),
-                }
-                let ts = session.open_cursor(TOMB_TABLE, None)?;
-                ts.set_key_ss(src_db, src_coll);
-                ts.set_value_u(b"");
-                ts.insert()?;
                 if self.enable_oplog {
                     let mut o = Document::new();
                     o.insert("renameCollection", format!("{src_db}.{src_coll}"));
@@ -15962,8 +15803,9 @@ impl Storage {
                 Ok(())
             })
         })?;
-        // Phase D: purge the source's rows and clear its tombstone.
-        self.purge_dropped_collection(src_db, src_coll)?;
+        // The destination numbers on from where the source would have.
+        self.forget_record_ids(src_db, src_coll);
+        self.set_next_record_id(dst_db, dst_coll, src_next);
         Ok((true, None))
     }
 
@@ -16873,8 +16715,8 @@ impl Storage {
     }
 
     /// The body of [`create_index`], run inside its statement transaction.
-    /// `logged` is false for a rebuild at open (`rebuild_outdated_indexes`),
-    /// which is not a `createIndexes` a change stream should see.
+    /// `logged` is false for a rebuild that is not a `createIndexes` a change
+    /// stream should see (an index rebuilt by `repair`).
     #[allow(clippy::too_many_arguments)]
     fn create_index_in_txn(
         &self,
@@ -16983,7 +16825,7 @@ impl Storage {
     }
 
     /// The catalog `options` a new index `name` is recorded with -- its
-    /// user options plus the entry formats, its build sequence (`seq_after`
+    /// user options plus its build sequence (`seq_after`
     /// further on for the later indexes of one build) and its key markers --
     /// registering the collection if it is not. `None` when an identical
     /// index exists already; a conflicting one is an error.
@@ -17043,10 +16885,11 @@ impl Storage {
         }
 
         let mut stored_options = options.clone();
-        // Stamp the entry format so a later build can tell step-2 entries from
-        // step-1 ones. Not a user option: `listIndexes` strips it (like
-        // `multikey`), and the options-conflict check compares only the
-        // enumerated user-facing options, so it never provokes a false conflict.
+        // The catalog-only options stamped here (`binDataOrder`,
+        // `collationKeys`, `buildSeq`) are not user options: `listIndexes`
+        // strips them (like `multikey`), and the options-conflict check
+        // compares only the enumerated user-facing options, so they never
+        // provoke a false conflict.
         // The PG server's index keeps PostgreSQL's BinData order; a rebuild
         // passes the recorded order back in and keeps it.
         if !stored_options.contains_key(BINDATA_ORDER_OPT)
@@ -17075,9 +16918,6 @@ impl Storage {
         };
         if key_coll.is_some() {
             stored_options.insert(COLLATION_KEYS, secantus_core::collation::KEY_FORMAT);
-        }
-        if geo.is_some() || geo_sphere.is_some() {
-            stored_options.insert(GEO_KEYS, GEO_KEY_FORMAT);
         }
         Ok(Some(stored_options))
     }
@@ -17177,8 +17017,8 @@ impl Storage {
             // probe uniqueness on the canonical key, build all entry-key variants.
             let mut multikey = false;
             let mut paths: Vec<Vec<String>> = vec![Vec::new(); key_spec.len()];
-            // Entries carry the doc's RecordId (step 2), which `scan_docs`
-            // already hands us — no `id_key -> RecordId` lookup needed here.
+            // Entries carry the doc's RecordId, which `scan_docs` already
+            // hands us — no `_id` index lookup needed here.
             let mut entries: Vec<EntryKey> = Vec::new();
             let mut seen: HashSet<Vec<u8>> = HashSet::new();
             let shape = KeyShape::new(key_spec, key_coll.clone(), build_order);
@@ -18062,7 +17902,8 @@ impl Storage {
         mut f: impl FnMut(&RecordId, &[u8]) -> Result<()>,
     ) -> Result<()> {
         COLLECTION_WALKS.with(|w| w.set(w.get() + 1));
-        // Lazy shards: an absent shard (empty / never-created collection) is empty.
+        // A collection's table is made lazily: an absent table (empty or
+        // never-created collection) is empty.
         let cur = match open_doc_cursor(session, db, coll, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok(()),
@@ -18174,7 +18015,7 @@ impl Storage {
     }
 
     /// The largest RecordId `(db, coll)` holds as committed (0 when none):
-    /// the last key of its range in its doc shard.
+    /// the last key of its documents table.
     fn largest_record_id(&self, db: &str, coll: &str) -> Result<i64> {
         let session = self.conn.open_session()?;
         let cur = match open_doc_cursor(&session, db, coll, None) {
@@ -18417,7 +18258,8 @@ impl Storage {
     fn scan_blobs_natural(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<Vec<u8>>> {
         // The read path only needs the document blobs, so walk the doc table
         // directly.
-        // Lazy shards: an absent shard (empty / never-created collection) is empty.
+        // A collection's table is made lazily: an absent table (empty or
+        // never-created collection) is empty.
         let cur = match open_doc_cursor(session, db, coll, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok(Vec::new()),
@@ -18797,9 +18639,9 @@ impl Storage {
     /// 2. look at the entries that start with that prefix: one held by
     ///    another RecordId is a duplicate.
     ///
-    /// Two writers racing one value collide in step 1, and one takes a write
-    /// conflict, which the retry wrapper turns into a clean duplicate-key
-    /// error (the retry finds the other's entry in step 2).
+    /// Two writers racing one value collide in the first step, and one takes
+    /// a write conflict, which the retry wrapper turns into a clean
+    /// duplicate-key error (the retry finds the other's entry in the second).
     #[allow(clippy::too_many_arguments)]
     fn claim_unique_key(
         &self,
@@ -19098,8 +18940,8 @@ impl Storage {
     /// field's distinct keys (an array's elements, `undefined` for an empty
     /// one, a null for a missing field or an element that does not reach the
     /// leaf) and their product across the fields, none when the document is
-    /// outside a partial index or holds none of a sparse index's fields. The
-    /// whole-array key this store writes besides is not one of mongod's. A
+    /// outside a partial index or holds none of a sparse index's fields. An
+    /// index holds no whole-array key, which is not one of mongod's. A
     /// geo index: its entries.
     fn reference_keys(&self, doc: &Document, desc: &IndexDesc) -> Result<HashSet<Vec<u8>>> {
         if desc.geo_2d.is_some() || desc.geo_sphere.is_some() {
@@ -19445,6 +19287,13 @@ impl Storage {
         // The indexes' entries, the `_id` index's among them and uniqueness
         // with them, are in tables of their own, which a drop unlists and
         // drops whole (`unplace_collection`) and a rename moves.
+        self.remove_index_registry_rows(session, db, coll)
+    }
+
+    /// Remove `(db, coll)`'s index registry rows, in `session`'s transaction.
+    /// A drop's and a rename's own: the tables themselves go with the
+    /// placement (`unplace_collection`), and nothing else is left to purge.
+    fn remove_index_registry_rows(&self, session: &Session, db: &str, coll: &str) -> Result<()> {
         for (name, _key_spec, _opts) in self.iter_indexes(session, db, coll)? {
             let ic = session.open_cursor(IDX_TABLE, None)?;
             ic.set_key_sss(db, coll, &name);
@@ -19458,7 +19307,7 @@ impl Storage {
     }
 
     /// Raw `(name, payload_bytes)` index-registry rows for `(db, coll)`, for the
-    /// verbatim re-key in `rename_collection`.
+    /// verbatim re-key under the new name in `rename_collection`.
     fn collect_idx_rows(
         &self,
         session: &Session,
@@ -19545,8 +19394,7 @@ impl Storage {
     /// The answer is a document, `{records, undecodable, indexes: [{name,
     /// keys, missing, extra}]}`, `_id_` first. `keys` is the number of keys
     /// mongod holds for the documents (an array gives one per distinct
-    /// element; this store also keeps the whole array as an entry, which is
-    /// not counted). `missing` are entries a document should have and the
+    /// element, and no whole-array entry). `missing` are entries a document should have and the
     /// index lacks; `extra` are entries that belong to no document.
     pub fn check_collection(&self, db: &str, coll: &str) -> Result<Document> {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -20909,7 +20757,7 @@ impl Storage {
     /// element as null and matches `{"p.q": null}` on it. So a predicate a
     /// missing value satisfies, on such a field of a multikey index, is not
     /// read from the entries: `find({"p.q": null})` left that document out.
-    /// Entry format 6 writes that null in an index that is not sparse; the
+    /// The index holds that null when it is not sparse (mongod's keys); the
     /// guard stays, which costs a collection scan and never an answer.
     fn holds_missing_leaves(
         &self,
@@ -20954,10 +20802,11 @@ impl Storage {
         coll: &str,
         recordids: Vec<RecordId>,
     ) -> Result<Vec<ScannedDoc>> {
-        // Index entries carry the RecordId (step 2), so this reads the doc row
-        // directly — no `id_key -> _id index -> RecordId` hop. The doc's own
-        // id_key is derived from the document where a write needs it.
-        // Lazy shards: an absent shard holds no documents. Without this a
+        // Index entries carry the RecordId, so this reads the doc row
+        // directly — no `_id` index hop. The doc's own id_key is derived from
+        // the document where a write needs it.
+        // A collection's table is made lazily: an absent table holds no
+        // documents. Without this a
         // count or delete by `_id` on a collection that was never written
         // failed with WiredTiger's ENOENT where it should find nothing.
         let cur = match open_doc_cursor(session, db, coll, None) {
@@ -24204,9 +24053,8 @@ impl Storage {
             if let Some(spec) = filter.get("_id") {
                 if let Some(ids) = id_point_lookup_keys(spec)? {
                     // Callers want RecordIds. For an `_id` lookup the `_id` index IS
-                    // the primary access path (not the secondary-index hop step 2
-                    // removed), so resolve each key through it; a key with no row
-                    // simply matches nothing.
+                    // the primary access path, so resolve each key through it; a
+                    // key with no row simply matches nothing.
                     let ix = self.id_index(session, db, coll, None)?;
                     let mut rids = Vec::with_capacity(ids.len());
                     let mut seen = HashSet::new();
@@ -25032,11 +24880,10 @@ impl Storage {
         coll: &str,
         recordids: &[RecordId],
     ) -> Result<Vec<Vec<u8>>> {
-        // Index entries carry the RecordId directly (step 2), so an IXSCAN fetch
-        // reads the doc row straight away. This used to resolve `id_key -> _id
-        // index -> RecordId` first; deleting that hop is the point of step 2
-        // (it measured +14.7% on `find_indexed_range`).
-        // Lazy shards: an absent shard yields no docs.
+        // Index entries carry the RecordId directly, so an IXSCAN fetch reads
+        // the doc row straight away (no `_id` index hop first; it measured
+        // +14.7% on `find_indexed_range`).
+        // A collection's table is made lazily: an absent table yields no docs.
         let cur = match open_doc_cursor(session, db, coll, None) {
             Ok(c) => c,
             Err(e) if e.is_missing_table() => return Ok(Vec::new()),
@@ -25766,12 +25613,8 @@ fn index_event_spec(payload: &Document, name: &str) -> Document {
                     | "name"
                     | "ns"
                     | "multikey"
-                    | "entryFormat"
                     | "binDataOrder"
                     | "collationKeys"
-                    | "numberKeys"
-                    | "geoKeys"
-                    | "pythonKeys"
                     | "buildSeq"
                     | "multikeyPaths"
                     | "timeseriesOriginalSpec"
@@ -25815,7 +25658,7 @@ fn ensure_collection_as(
         Err(e) if e.is_not_found() && deferring_handle(session).is_some() => {
             // Held by the transaction until it commits (see
             // `UserTransactionHandle::deferred_creates`). The documents'
-            // shard is made now: a table is not part of any transaction, and
+            // table is made now: a table is not part of any transaction, and
             // an empty one reads as no documents.
             let hp = deferring_handle(session).expect("just checked");
             // SAFETY: as `deferring_handle`; the only writer on this thread.
@@ -28012,65 +27855,6 @@ mod tests {
         }
     }
 
-    /// A tombstone left by a crash mid-purge (phase 1 committed: registry row
-    /// gone, rows orphaned) is finished at the next open — the orphan rows
-    /// must not resurface under a re-created name. WT-backed (the only test
-    /// in this module that is): forging the crash-left state needs direct
-    /// access to the private tables.
-    #[test]
-    fn interrupted_drop_recovers_at_open() {
-        let dir = std::env::temp_dir().join(format!(
-            "secantus-droprecover-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("t").len()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let home = dir.to_str().unwrap().to_string();
-        {
-            let st = Storage::open(&home).unwrap();
-            let docs: Vec<Vec<u8>> = (0..50i64)
-                .map(|i| bson::to_vec(&doc! {"_id": i, "x": i}).unwrap())
-                .collect();
-            st.insert("app", "c", docs, true).unwrap();
-            st.create_index("app", "c", "x_1", &doc! {"x": 1i32}, &Document::new())
-                .unwrap();
-            // Forge the crash-left state: phase 1's effects (registry row
-            // removed, tombstone written) without the phase-2 purge.
-            let session = st.conn.open_session().unwrap();
-            let _raw = untimestamped(&session);
-            let rc = session.open_cursor(COLL_TABLE, None).unwrap();
-            rc.set_key_ss("app", "c");
-            rc.search().unwrap();
-            rc.remove().unwrap();
-            let t = session.open_cursor(TOMB_TABLE, None).unwrap();
-            t.set_key_ss("app", "c");
-            t.set_value_u(b"");
-            t.insert().unwrap();
-        }
-        let st = Storage::open(&home).unwrap();
-        // Recovery purged the orphans: a re-created collection sees only its
-        // own rows (orphaned doc rows would inflate the scan), and the
-        // tombstone is gone.
-        st.insert(
-            "app",
-            "c",
-            vec![bson::to_vec(&doc! {"_id": 100i64}).unwrap()],
-            true,
-        )
-        .unwrap();
-        assert_eq!(st.count_matching("app", "c", &doc! {}, None).unwrap(), 1);
-        {
-            let session = st.conn.open_session().unwrap();
-            let _raw = untimestamped(&session);
-            let t = session.open_cursor(TOMB_TABLE, None).unwrap();
-            t.set_key_ss("app", "c");
-            assert!(t.search().is_err(), "tombstone must be cleared");
-        }
-        drop(st);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// `wt_config` with the engine defaults must produce the exact
     /// `DEFAULT_CONFIG` string so `Storage::open` behaviour is unchanged.
     #[test]
@@ -29967,14 +29751,14 @@ mod tests {
     fn variants_single_descending_inverts() {
         let v = index_key_variants(&doc! {"a": 5i32}, &doc! {"a": -1}, false).unwrap();
         assert_eq!(v.len(), 1);
-        // Entry format 6: inverted, then terminated.
+        // A descending field: inverted, then terminated.
         let mut want = sortkey::invert_bytes(&ev(&Bson::Int32(5)));
         want.extend_from_slice(sortkey::DESC_END);
         assert_eq!(v[0], want);
         assert_ne!(v[0], ev(&Bson::Int32(5)));
     }
 
-    /// Entry format 6 keys an empty leaf array by `undefined` and an element
+    /// An index keys an empty leaf array by `undefined` and an element
     /// on a dotted path that lacks the leaf by null, as mongod 8.2.11 does;
     /// a sparse index gives that element nothing.
     #[test]

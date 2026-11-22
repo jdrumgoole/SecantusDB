@@ -44,13 +44,10 @@ const RANK_MAXKEY: u8 = 15;
 
 const NUM_NAN: u8 = 0x00;
 const NUM_NEG_INF: u8 = 0x20;
-/// A finite negative. Number-key format 1 wrote 0x40, so a key of either
-/// format says which it is, and no key of one format equals a key of the
-/// other: a store is re-keyed in place without a new key ever landing on
-/// an old one.
+/// A finite negative.
 const NUM_NEG: u8 = 0x41;
 const NUM_ZERO: u8 = 0x80;
-/// A finite positive (format 1: 0xC0; see [`NUM_NEG`]).
+/// A finite positive.
 const NUM_POS: u8 = 0xC1;
 const NUM_POS_INF: u8 = 0xFF;
 
@@ -153,27 +150,6 @@ fn parts_from_int(mut n: i128) -> Option<DecimalParts> {
     Some(DecimalParts { sign, digits, exp })
 }
 
-/// The number-key format this encoder writes. Stores record it (the Rust
-/// server's `numberKeys` marker, the Python server's `_NUMBER_KEY_FORMAT`) and
-/// rebuild the keys of a store written by another.
-///
-/// * 1 (no marker) -- a double keyed by its SHORTEST decimal (`format!("{d}")`,
-///   Python's `Decimal(repr(d))`), so the double `0.1` and `Decimal128("0.1")`
-///   shared a key, and a one-byte decimal exponent, so every number whose
-///   exponent fell outside -128..=127 shared ONE key per sign, which sorted
-///   above every other positive (below every other negative).
-/// * 2 -- a double keyed by its EXACT binary value, and a two-byte exponent,
-///   enough for every double and every Decimal128. The sign markers moved
-///   (0x40 -> 0x41, 0xC0 -> 0xC1), so a finite number's key names its format.
-pub const NUMBER_KEY_FORMAT: i32 = 2;
-
-/// Whether `key`, an encoded value, is a finite number keyed by a number-key
-/// format before 2 (its marker is the old one). NaN, the infinities and
-/// zero are keyed alike by both formats.
-pub fn is_format1_number_key(key: &[u8]) -> bool {
-    matches!(key, [RANK_NUMBER, 0x40 | 0xC0, ..])
-}
-
 /// `[sign][exponent, 2 bytes][digit pairs][terminator]`. The exponent is the
 /// scientific one (`d.ddd * 10^e`) biased by 0x8000, big-endian; the digits
 /// are packed two to a byte as `pair + 1` (1..=100), so a shorter mantissa
@@ -200,75 +176,7 @@ fn encode_number_from_parts(p: &DecimalParts) -> Vec<u8> {
     out
 }
 
-thread_local! {
-    static FORMAT_1: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Run `f` with this thread's number keys written in number-key format 1, as
-/// a build before 2026-10-15 wrote them. For tests that build a store as an
-/// earlier version left it, to check it is brought up to date; nothing else
-/// may call it.
-#[doc(hidden)]
-pub fn with_number_key_format_1<T>(f: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            FORMAT_1.with(|c| c.set(self.0));
-        }
-    }
-    let _r = Restore(FORMAT_1.with(|c| c.replace(true)));
-    f()
-}
-
-/// A finite nonzero number's key in number-key format 1: the shortest
-/// decimal of a double, a one-byte exponent, one key per sign beyond it.
-fn encode_number_format_1(b: &Bson) -> Option<Vec<u8>> {
-    let text = match b {
-        Bson::Double(d) if d.is_finite() && *d != 0.0 => format!("{d}"),
-        Bson::Int32(n) if *n != 0 => n.to_string(),
-        Bson::Int64(n) if *n != 0 => n.to_string(),
-        Bson::Decimal128(d) => {
-            let t = d.to_string();
-            let low = t.to_lowercase();
-            if low.contains("nan") || low.contains("inf") {
-                return None;
-            }
-            t
-        }
-        _ => return None,
-    };
-    let p = parse_decimal_str(&text)?;
-    let sci_exp = p.exp + p.digits.len() as i64 - 1;
-    let mut bias_e = 128 + sci_exp;
-    if !(0..=255).contains(&bias_e) {
-        return Some(if p.sign > 0 {
-            vec![0xC0, 0xFF, 0xFF]
-        } else {
-            vec![0x40, 0x00, 0x00]
-        });
-    }
-    if p.sign < 0 {
-        bias_e = 0xFF - bias_e;
-    }
-    let mut digits = p.digits.clone();
-    if digits.len() % 2 == 1 {
-        digits.push(0);
-    }
-    let mut out = vec![if p.sign > 0 { 0xC0 } else { 0x40 }, bias_e as u8];
-    for pair in digits.as_chunks::<2>().0 {
-        let b = pair[0] * 10 + pair[1] + 1;
-        out.push(if p.sign < 0 { 0x64 - b } else { b });
-    }
-    out.push(if p.sign > 0 { 0x00 } else { 0xff });
-    Some(out)
-}
-
 fn encode_number(b: &Bson) -> Vec<u8> {
-    if FORMAT_1.with(|c| c.get()) {
-        if let Some(key) = encode_number_format_1(b) {
-            return key;
-        }
-    }
     let parts = match b {
         Bson::Int32(n) => parts_from_int(*n as i128),
         Bson::Int64(n) => parts_from_int(*n as i128),
@@ -317,25 +225,6 @@ fn encode_number(b: &Bson) -> Vec<u8> {
 
 fn signed_int64_sortable(n: i64) -> [u8; 8] {
     ((n as u64) ^ 0x8000_0000_0000_0000).to_be_bytes()
-}
-
-/// Formats 1-3's array encoding (a BSON document with positional keys) -- kept
-/// only for [`encode_id_key`].
-fn legacy_array_bytes(arr: &[Bson]) -> Result<Vec<u8>, UnsupportedValue> {
-    let mut doc = Document::new();
-    for (i, v) in arr.iter().enumerate() {
-        doc.insert(i.to_string(), v.clone());
-    }
-    legacy_doc_bytes(&doc)
-}
-
-/// Formats 1-3's document encoding (the escaped raw BSON) -- kept only for
-/// [`encode_id_key`].
-fn legacy_doc_bytes(doc: &Document) -> Result<Vec<u8>, UnsupportedValue> {
-    let mut buf = Vec::new();
-    crate::bsondoc::write(doc, &mut buf)
-        .map_err(|e| UnsupportedValue(format!("doc encode failed: {e}")))?;
-    Ok(escape(&buf))
 }
 
 /// The end of a document's or array's elements. Every element starts with its
@@ -387,97 +276,14 @@ fn encode_array(a: &[Bson], coll: Option<&Collation>) -> Result<Vec<u8>, Unsuppo
     Ok(out)
 }
 
-/// The format of the `_id` keys a store holds (its oplog-meta row `idKeys`;
-/// none recorded is 1). An `_id` key is stored in every document row and keys
-/// the `_id` index, so a store is re-keyed when it opens with an older one.
-///
-/// * 1 -- [`encode_value`] with formats 1-3's document / array encoding (the
-///   raw BSON, whose leading length made byte order SIZE order) and entry
-///   format 4's BinData (no subtype), JavaScript-with-scope (JavaScript's
-///   rank, code only) and MaxKey (rank 14) keys. The `_id` index was not in
-///   mongod's order for those types.
-/// * 2 -- [`encode_value`] in mongod's order for every type (RM-080,
-///   2026-10-27): a cursor walking the `_id` index returns what mongod's
-///   walk returns.
-pub const ID_KEY_FORMAT: i32 = 2;
-
-thread_local! {
-    static ID_FORMAT_1: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Run `f` with this thread's `_id` keys written in `_id` key format 1, as a
-/// build before 2026-10-27 wrote them. For tests that build a store as an
-/// earlier version left it, to check it is brought up to date; nothing else
-/// may call it.
-#[doc(hidden)]
-pub fn with_id_key_format_1<T>(f: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            ID_FORMAT_1.with(|c| c.set(self.0));
-        }
-    }
-    let _r = Restore(ID_FORMAT_1.with(|c| c.replace(true)));
-    f()
-}
-
-/// Whether `key`, a stored `_id` key, may be one `_id` key format 1 wrote
-/// differently from format 2: a document, BinData, JavaScript (with a scope,
-/// format 1's) or MaxKey (format 1's rank 14).
-pub fn may_be_format1_id_key(key: &[u8]) -> bool {
-    matches!(
-        key.first(),
-        Some(
-            &RANK_DOCUMENT
-                | &RANK_ARRAY
-                | &RANK_BINDATA
-                | &RANK_JAVASCRIPT
-                | &RANK_JAVASCRIPT_SCOPE
-        )
-    )
-}
-
-/// The `_id` key (`_id` key format 2): [`encode_value`] in mongod's order,
+/// The `_id` key: [`encode_value`] in mongod's order,
 /// BinData by length, subtype and bytes whichever server writes. `undefined`
 /// is refused, as it always was.
 pub fn encode_id_key(v: &Bson) -> Result<Vec<u8>, UnsupportedValue> {
-    if ID_FORMAT_1.with(|c| c.get()) {
-        return encode_id_key_format_1(v);
-    }
     if matches!(v, Bson::Undefined) {
         return Err(UnsupportedValue("undefined".into()));
     }
     crate::order::with_bindata_order(crate::order::BinDataOrder::Mongod, || encode_value(v, None))
-}
-
-/// The `_id` key `_id` key format 1 wrote: [`encode_value`] with formats
-/// 1-3's document / array encoding and entry format 4's BinData,
-/// JavaScript-with-scope and MaxKey keys (`order::BinDataOrder::Format4`).
-pub fn encode_id_key_format_1(v: &Bson) -> Result<Vec<u8>, UnsupportedValue> {
-    crate::order::with_bindata_order(crate::order::BinDataOrder::Format4, || {
-        encode_id_key_inner(v)
-    })
-}
-
-fn encode_id_key_inner(v: &Bson) -> Result<Vec<u8>, UnsupportedValue> {
-    match v {
-        // A string that is not UTF-8 keys as the string it is (RM-222).
-        Bson::Document(_) if crate::bsondoc::as_invalid_utf8(v).is_some() => encode_value(v, None),
-        Bson::Document(d) => {
-            let mut out = vec![RANK_DOCUMENT];
-            out.extend(legacy_doc_bytes(d)?);
-            Ok(out)
-        }
-        Bson::Array(a) => {
-            let mut out = vec![RANK_ARRAY];
-            out.extend(legacy_array_bytes(a)?);
-            Ok(out)
-        }
-        // `undefined` has an index key since entry format 6; an `_id` key
-        // keeps refusing it, as it did before.
-        Bson::Undefined => Err(UnsupportedValue("undefined".into())),
-        other => encode_value(other, None),
-    }
 }
 
 /// MaxKey's rank before entry format 5 gave JavaScript-with-scope its own;
@@ -627,11 +433,10 @@ pub fn encode_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, Unsup
             out.extend_from_slice(COMPOUND_SEP);
             // Normalised, so these index bytes order regexes exactly as
             // `order::cmp` does -- two functions disagreeing about a sort key is
-            // how an index comes to change the sort answer. No stored bytes
-            // move: a driver's BSON encoder already emits options
-            // alphabetically (pymongo renders `/a/mi` as `im` on the wire), so
-            // this only corrects a hand-built value no encoder produces, and
-            // needs no `entryFormat` bump.
+            // how an index comes to change the sort answer. A driver's BSON
+            // encoder already emits options alphabetically (pymongo renders
+            // `/a/mi` as `im` on the wire), so this only corrects a
+            // hand-built value no encoder produces.
             let (_, options) = crate::regexutil::regex_sort_key(r);
             out.extend(escape(options.as_bytes()));
         }
@@ -1102,25 +907,12 @@ mod tests {
         assert_eq!(ev(bson!({"a": 1})), ev(bson!({"a": 1.0})));
     }
 
-    /// `_id` key format 1 kept formats 1-3's document encoding; format 2
-    /// keys every `_id` in mongod's order, BinData with its subtype whichever
-    /// server's thread writes it.
+    /// Every `_id` is keyed in mongod's order, BinData with its subtype
+    /// whichever server's thread writes it.
     #[test]
     fn id_keys_follow_mongods_order() {
         use bson::doc;
         let d = doc! {"b": 2, "a": [1, "x"]};
-        let mut raw = Vec::new();
-        d.to_writer(&mut raw).unwrap();
-        let mut old = vec![RANK_DOCUMENT];
-        old.extend(escape(&raw));
-        assert_eq!(
-            encode_id_key_format_1(&Bson::Document(d.clone())).unwrap(),
-            old
-        );
-        assert_eq!(
-            with_id_key_format_1(|| encode_id_key(&Bson::Document(d.clone()))).unwrap(),
-            old
-        );
         assert_eq!(
             encode_id_key(&Bson::Document(d.clone())).unwrap(),
             ev(Bson::Document(d))
@@ -1139,10 +931,6 @@ mod tests {
             encode_id_key(&bin).unwrap()
         });
         assert_eq!(mongod, pg);
-        assert!(may_be_format1_id_key(
-            &encode_id_key_format_1(&bin).unwrap()
-        ));
-        assert!(!may_be_format1_id_key(&ev(Bson::Int32(5))));
     }
 
     #[test]

@@ -1568,7 +1568,10 @@ pub(crate) fn stamp(doc: &mut Document, xmin: i64, cid: i64, ctid: i64) {
 }
 
 /// Stored rows in heap order, as a sequential scan reads them: by ctid,
-/// a row without one (written before ctids were kept) first.
+/// a row without one first. This server stamps every row it writes; one
+/// without a ctid was written into the table by another server (the
+/// SQL-to-MongoDB hand-off, which can return), so it is kept, not an
+/// old-store path.
 pub(crate) fn in_ctid_order(mut rows: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
     rows.sort_by_cached_key(|b| {
         bson::RawDocument::from_bytes(b)

@@ -19703,52 +19703,12 @@ impl PgHandler {
         format!("oid\0{}", ix.oid)
     }
 
-    /// The key a comment was recorded under before comments were keyed by
-    /// oid: the bare index name in `public`, `schema.name` elsewhere. Read
-    /// when the index has no oid key, and moved to one by a rename.
-    fn legacy_index_comment_key(ix: &IndexRelation) -> String {
-        match secantus_pgplan::schemas::split_key(&ix.table.name) {
-            (s, _) if s != "public" => format!("{s}.{}", ix.name),
-            _ => ix.name.clone(),
-        }
-    }
-
-    /// The comment `docs` hold for `ix`: its oid key's, else its name key's.
+    /// The comment `docs` hold for `ix`, under its oid key.
     fn index_comment_in<'a>(docs: &'a [Document], ix: &IndexRelation) -> Option<&'a str> {
-        let find = |key: String| {
-            docs.iter()
-                .find(|d| d.get_str("_id") == Ok(key.as_str()))
-                .and_then(|d| d.get_str("comment").ok())
-        };
-        find(Self::index_comment_key(ix)).or_else(|| find(Self::legacy_index_comment_key(ix)))
-    }
-
-    /// Move a comment recorded under `ix`'s name to its oid key, before a
-    /// rename takes the name away.
-    fn rekey_legacy_index_comment(&self, ix: &IndexRelation) -> PgWireResult<()> {
-        let legacy = Self::legacy_index_comment_key(ix);
-        let docs: Vec<Document> = self
-            .storage
-            .find_matching(
-                self.db(),
-                Self::INDEX_COMMENT_COLLECTION,
-                &bson::doc! {"_id": {"$in": [&legacy, Self::index_comment_key(ix)]}},
-            )
-            .map_err(|e| Self::storage_err("could not read the index comments", e))?
-            .iter()
-            .filter_map(|b| decode_doc(b).ok())
-            .collect();
-        if !docs.iter().any(|d| d.get_str("_id") == Ok(legacy.as_str())) {
-            return Ok(());
-        }
-        let comment = Self::index_comment_in(&docs, ix).map(str::to_string);
-        self.put_comment_doc(Self::INDEX_COMMENT_COLLECTION, &legacy, None)?;
         let key = Self::index_comment_key(ix);
-        self.put_comment_doc(
-            Self::INDEX_COMMENT_COLLECTION,
-            &key,
-            comment.map(|c| bson::doc! {"_id": &key, "comment": c}),
-        )
+        docs.iter()
+            .find(|d| d.get_str("_id") == Ok(key.as_str()))
+            .and_then(|d| d.get_str("comment").ok())
     }
 
     /// A relation name from a `COMMENT ON` object's name parts: `public` is
@@ -20593,12 +20553,6 @@ impl PgHandler {
                 let Some(ix) = found else {
                     return Err(missing_relation(&Self::comment_relation(names)));
                 };
-                // A comment recorded under the name goes: this one replaces it.
-                self.put_comment_doc(
-                    Self::INDEX_COMMENT_COLLECTION,
-                    &Self::legacy_index_comment_key(ix),
-                    None,
-                )?;
                 let key = Self::index_comment_key(ix);
                 self.put_comment_doc(
                     Self::INDEX_COMMENT_COLLECTION,

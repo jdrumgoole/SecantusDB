@@ -15,12 +15,13 @@ coll.create_index("status", partialFilterExpression={"active": True})
 coll.create_index("createdAt", expireAfterSeconds=3600)
 ```
 
-The `_id` index always exists — it's the document table itself, walked by
-WT-key order.
+The `_id` index always exists — a WiredTiger table of its own, as in
+`mongod`, mapping each `_id` to its document's RecordId. Documents themselves
+are in the collection's table, walked in RecordId (insertion) order.
 
 ## What `find()` accelerates
 
-`find()` routes through the index entries table for:
+`find()` routes through each index's own table for:
 
 ### Single-field filters
 
@@ -58,7 +59,7 @@ trailing field.
 
 Compound indexes accept any per-field direction (`{a: 1, b: -1}`,
 `{a: -1, b: -1}`, etc.). Each field is byte-encoded with
-`encode_value_directed(value, dir)` so the entries table sorts in the
+`encode_value_directed(value, dir)` so the index's table sorts in the
 index's natural order. When the trailing field is DESC, the operator
 semantics flip (`$gt` becomes upper-exclusive in byte order).
 
@@ -309,7 +310,7 @@ without `sort` walk in this order, matching `mongod`.
 ## Per-index collation
 
 A collation set at `createIndexes` time normalises string entries
-before they're written to the entries table — strings that
+before they're written to the index's table — strings that
 collation-equal each other land at the same byte key, so a query
 carrying a matching `collation` hits the same row. Strength 1/2/3
 and `caseLevel` are supported; `numericOrdering` is not (would
@@ -328,7 +329,7 @@ data rather than something character decomposition can derive, and
 needs an ICU dependency.
 
 One consequence worth knowing: **a collated sort is never served by an
-index walk.** The entries table stores one normalised byte string per
+index walk.** The index's table stores one normalised byte string per
 value, which cannot express the three levels, so the index is still
 used to fetch (and `explain` still reports IXSCAN) but the ordering is
 applied afterwards. Before that rule, the same query returned a

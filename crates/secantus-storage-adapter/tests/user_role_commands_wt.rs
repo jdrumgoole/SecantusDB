@@ -891,42 +891,9 @@ fn update_grant_revoke_and_drop_roles() {
     });
 }
 
-/// A user stored before records carried a `userId` gets one when the server
-/// starts, after `_id` as mongod keeps it, and `usersInfo` lists it (RM-031).
-#[test]
-fn a_stored_user_without_a_user_id_gets_one() {
-    with_wt(|c| {
-        let old = doc! {
-            "_id": "test.old",
-            "user": "old",
-            "db": "test",
-            "credentials": {},
-            "roles": [],
-        };
-        let storage = c.storage.clone().expect("a store");
-        storage
-            .add_user("test", "old", &bson::to_vec(&old).unwrap(), false)
-            .unwrap();
-        assert_eq!(
-            secantus_commands::auth::backfill_user_ids(storage.as_ref()).unwrap(),
-            1
-        );
-        assert_eq!(
-            secantus_commands::auth::backfill_user_ids(storage.as_ref()).unwrap(),
-            0
-        );
-        let record = bson::Document::from_reader(
-            &mut &storage.get_user("test", "old").unwrap().unwrap()[..],
-        )
-        .unwrap();
-        let keys: Vec<&str> = record.keys().map(String::as_str).take(3).collect();
-        assert_eq!(keys, ["_id", "userId", "user"]);
-        c.db_name = "test".into();
-        let reply = secantus_commands::dispatch(&doc! {"usersInfo": "old"}, c);
-        let user = reply.get_array("users").unwrap()[0]
-            .as_document()
-            .unwrap()
-            .clone();
-        assert!(user.get_binary_generic("userId").is_err() && user.contains_key("userId"));
-    });
-}
+// Retired at storage-model phase 8: `a_stored_user_without_a_user_id_gets_one`
+// built a user record from before users carried a `userId` (RM-031) and
+// checked the open-time backfill minted one. A store that old is in the
+// layout the format check refuses (format 10 only; the backfill
+// was added 2026-10-20, the refusal 2026-11-19), and every user this build
+// creates carries a `userId`, so the backfill is gone.

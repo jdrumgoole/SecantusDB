@@ -150,21 +150,21 @@ fn repair_of_a_healthy_store_changes_nothing() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-fn salvages_a_damaged_document_shard(server_like: bool) {
+fn salvages_a_damaged_collection_table(server_like: bool) {
     let home = temp_home();
     seeded(&home, server_like);
-    let shard = table_of(&home, "app", "c", server_like);
-    damage(&home, &shard);
+    let table = table_of(&home, "app", "c", server_like);
+    damage(&home, &table);
     let mut lines = Vec::new();
     let report = repair(home.to_str().unwrap(), &options(server_like), &mut |l| {
         lines.push(l.to_string())
     })
     .unwrap();
-    assert_eq!(report.salvaged, vec![shard.clone()], "{lines:?}");
+    assert_eq!(report.salvaged, vec![table.clone()], "{lines:?}");
     assert_eq!(report.rebuilt, vec!["app.c".to_string()]);
     assert!(lines
         .iter()
-        .any(|l| l.starts_with("Verify failed") && l.ends_with(&shard)));
+        .any(|l| l.starts_with("Verify failed") && l.ends_with(&table)));
 
     let st = Storage::open_with_options(home.to_str().unwrap(), &options(server_like)).unwrap();
     let kept = consistent(&st, "app", "c");
@@ -192,13 +192,13 @@ fn salvages_a_damaged_document_shard(server_like: bool) {
 }
 
 #[test]
-fn repair_salvages_a_damaged_document_shard_and_rebuilds_its_indexes() {
-    salvages_a_damaged_document_shard(false);
+fn repair_salvages_a_damaged_collection_table_and_rebuilds_its_indexes() {
+    salvages_a_damaged_collection_table(false);
 }
 
 #[test]
 fn repair_salvages_a_store_opened_as_the_server_opens_it() {
-    salvages_a_damaged_document_shard(true);
+    salvages_a_damaged_collection_table(true);
 }
 
 #[test]

@@ -929,31 +929,18 @@ impl PgHandler {
     }
 
     /// `pg_largeobject`: each page a write reached, as long as its furthest
-    /// byte (the object's page map). An older store's object, which has no
-    /// map, shows its bytes in contiguous `LOBLKSIZE` pages.
+    /// byte (the object's page map, which every object this build creates
+    /// carries).
     fn largeobject_rows(&self, def: &TableDef) -> Vec<Document> {
         let f = |n: &str| def.field_of(n).expect("column");
         let mut out = Vec::new();
         for (oid, data) in self.large_objects() {
-            if let Ok(Some(pages)) = self.lo_pages(oid) {
-                for (pageno, len) in pages {
-                    let start = (pageno as usize) * LOBLKSIZE;
-                    let end = (start + len as usize).min(data.len());
-                    let mut d = Document::new();
-                    d.insert(f("loid"), Bson::Int64(oid));
-                    d.insert(f("pageno"), Bson::Int32(pageno as i32));
-                    d.insert(
-                        f("data"),
-                        Bson::Binary(bson::Binary {
-                            subtype: bson::spec::BinarySubtype::Generic,
-                            bytes: data.get(start..end).unwrap_or_default().to_vec(),
-                        }),
-                    );
-                    out.push(d);
-                }
+            let Ok(Some(pages)) = self.lo_pages(oid) else {
                 continue;
-            }
-            for (pageno, page) in data.chunks(LOBLKSIZE).enumerate() {
+            };
+            for (pageno, len) in pages {
+                let start = (pageno as usize) * LOBLKSIZE;
+                let end = (start + len as usize).min(data.len());
                 let mut d = Document::new();
                 d.insert(f("loid"), Bson::Int64(oid));
                 d.insert(f("pageno"), Bson::Int32(pageno as i32));
@@ -961,7 +948,7 @@ impl PgHandler {
                     f("data"),
                     Bson::Binary(bson::Binary {
                         subtype: bson::spec::BinarySubtype::Generic,
-                        bytes: page.to_vec(),
+                        bytes: data.get(start..end).unwrap_or_default().to_vec(),
                     }),
                 );
                 out.push(d);

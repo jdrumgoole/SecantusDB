@@ -185,19 +185,25 @@ impl StorageAdapter {
         );
     }
 
-    /// Where the namespace `db.coll` is kept. `None`: in no one table (a
-    /// set member's oplog is spread over the oplog's shard tables).
+    /// Where the namespace `db.coll` is kept. `None`: not in a collection
+    /// of the registry (a set member's `local.oplog.rs` is a table of its
+    /// own that no registry row names).
     fn stored_as(&self, db: &str, coll: &str) -> Option<Stored> {
         if (db, coll) == ("local", "oplog.rs") {
             return None;
         }
-        // `system.views` is not stored: a database's view definitions are
-        // rows of the collection registry.
+        // A `system.views` that is not a collection is answered from the
+        // collection registry's view rows. A store of this format keeps a
+        // view as a document of a `system.views` collection, so it is a
+        // collection whenever the database has a view.
         if coll == "system.views" && !self.inner.collection_exists(db, coll).unwrap_or(false) {
             return Some(Stored::Catalog);
         }
-        // `system.buckets.<name>` is not stored either: the buckets are
-        // derived from the time-series collection's own documents.
+        // A `system.buckets.<name>` that is not a collection of its own is
+        // answered as the time-series collection it belongs to. Its buckets
+        // are a collection of their own, so this holds only for a
+        // time-series collection a kill left without its bucket collection
+        // (`create_missing_buckets` makes it as the store opens).
         if let Some(base) = coll.strip_prefix(secantus_commands::BUCKETS_PREFIX) {
             let derived = self
                 .inner

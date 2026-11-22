@@ -9,17 +9,15 @@
 //!
 //! - `ident` names the WiredTiger table that really holds the collection's
 //!   documents: its own `table:collection-<UUID>`, named by its ident as
-//!   mongod names it. A `system.buckets.<name>` is the time-series
-//!   collection's own table, and `system.views` the collection
-//!   registry, which is where view definitions are kept. A set member's
-//!   `local.oplog.rs` spans the oplog's shard tables, so no one table names
-//!   it and it has no `ident`.
-//! - `idxIdent` maps each index to the table of its entries: the `_id`
-//!   index is the `_id -> RecordId` map, every other index the one shared
-//!   entries table.
-//! - `multikeyPaths` is left out: the store keeps a multikey flag per index,
-//!   not mongod's durable record of which paths held an array. `multikey`
-//!   is that flag.
+//!   mongod names it; a `system.buckets.<name>` and `system.views` are
+//!   collections like any other, with a table each. A set member's
+//!   `local.oplog.rs` is a table that no registry row names, so it has no
+//!   `ident`.
+//! - `idxIdent` maps each index to the table of its entries, `index-<UUID>`,
+//!   the `_id` index's among them.
+//! - `multikeyPaths` is left out of each index's entry here, though the
+//!   store records the paths in `_mdb_catalog` as mongod does; `multikey`
+//!   is the flag.
 //! - Collections come in this catalog's order (by database, then name), not
 //!   mongod's creation order.
 

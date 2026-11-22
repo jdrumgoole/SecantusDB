@@ -84,7 +84,6 @@ impl PgHandler {
             ));
         };
         self.relation_name_free(to)?;
-        self.rekey_legacy_index_comment(&ix)?;
         let mut def = TableDef::clone(&ix.table);
         let table = def.name.clone();
         if ix.primary {

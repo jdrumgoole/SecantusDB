@@ -29,7 +29,7 @@ use crate::{Result, StorageError};
 /// The layout version this build writes and reads. Every change to the
 /// on-disk layout moves it on (each phase of the storage-model plan does),
 /// and a store at any other version is refused.
-pub const STORE_FORMAT_VERSION: u32 = 9;
+pub const STORE_FORMAT_VERSION: u32 = 10;
 
 /// The file holding [`STORE_FORMAT_VERSION`] in a SecantusDB-written store.
 pub const FORMAT_FILE: &str = "secantus.format";
@@ -587,7 +587,11 @@ mod tests {
     }
 
     #[test]
-    fn the_previous_layouts_are_refused_and_this_one_is_format_9() {
+    fn the_previous_layouts_are_refused_and_this_one_is_format_10() {
+        // Format 9 kept a drop's and a rename's pending work in
+        // `secantus_drop_tombstones` and finished it at the next open; format
+        // 10 does both in one transaction over the catalog, as mongod does,
+        // and the table is gone.
         // Format 8 kept a view (and a time-series collection's own
         // namespace) as a collection with tables and an `_mdb_catalog` row,
         // and a multikey index held the whole leaf array as an entry besides
@@ -599,15 +603,15 @@ mod tests {
         // bytes and the clean-close marker in this server's own table.
         // Format 6 held a document in its table as `[id_key length][id_key]
         // [BSON]`; format 7 stores the document alone, as mongod does.
-        assert_eq!(STORE_FORMAT_VERSION, 9);
-        for old in ["4", "5", "6", "7", "8"] {
+        assert_eq!(STORE_FORMAT_VERSION, 10);
+        for old in ["4", "5", "6", "7", "8", "9"] {
             let dir = tempfile::tempdir().unwrap();
             fs::write(dir.path().join("WiredTiger.wt"), b"").unwrap();
             fs::write(dir.path().join(STORAGE_BSON), mongod_storage_bson()).unwrap();
             fs::write(dir.path().join(FORMAT_FILE), format!("{old}\n")).unwrap();
             let err = prepare(dir.path()).unwrap_err().to_string();
             assert!(err.contains(&format!("store format {old}")), "{err}");
-            assert!(err.contains("format 9 only"), "{err}");
+            assert!(err.contains("format 10 only"), "{err}");
         }
     }
 }

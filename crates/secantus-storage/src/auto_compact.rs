@@ -10,7 +10,7 @@
 //! * The server walks every `file:` in WiredTiger's metadata in key order,
 //!   one file per step, and after a full pass waits 10 seconds (or a
 //!   signal). It skips a file in the exclude list (mongod excludes the
-//!   oplog: here its shard tables), a file of 1 MB or less, and a file it
+//!   oplog: here its table), a file of 1 MB or less, and a file it
 //!   compacted within the last hour whose last pass gave nothing back or
 //!   rewrote less than the moving average -- and with `runOnce` it compacts
 //!   every file once and stops.

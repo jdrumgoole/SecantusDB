@@ -468,11 +468,6 @@ pub fn bind(
     secantus_commands::cluster_params::apply_change_stream_options(storage.as_ref())
         .map_err(|e| io::Error::other(format!("reading changeStreamOptions: {e:?}")))?;
     times.standalone_cluster_params = step.elapsed();
-    // Users stored before they carried a `userId` get one (RM-031).
-    let step = Instant::now();
-    secantus_commands::auth::backfill_user_ids(storage.as_ref())
-        .map_err(|e| io::Error::other(format!("minting user ids: {e:?}")))?;
-    times.user_and_roles_graph = step.elapsed();
     // A set member keeps its configuration in `local.system.replset`, as
     // mongod does, so its `replicaSetId` outlives the process.
     if let Some(set_name) = &config.replica_set_name {

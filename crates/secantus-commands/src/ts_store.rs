@@ -676,20 +676,18 @@ pub(crate) fn delete(
     Ok(deleted)
 }
 
-/// Bring a store written before time-series buckets were stored up to
-/// date: a time-series collection whose measurements are still documents
-/// of its own table has them placed into buckets, one at a time in the
-/// order they were stored (the order this server placed them in when it
-/// derived its buckets), then taken out of the table. Run as the store is
-/// opened, before the server answers anyone; nothing it writes is logged.
+/// Create the bucket collection of every time-series collection that has
+/// none, as the store is opened, before the server answers anyone.
 ///
-/// The buckets are written before a measurement is removed, and a
-/// collection that still holds measurements has its bucket collection
-/// rebuilt from them, so a conversion cut short is done again from the
-/// start the next time the store opens. The measurements converted.
-pub fn upgrade_time_series(storage: &dyn Storage) -> Result<usize, CommandError> {
+/// A time-series collection is created as two commits, the collection
+/// (mongod's view) and then its bucket collection, so a process killed
+/// between them leaves a collection with no buckets. An insert makes the
+/// missing bucket collection itself and a read of one that is missing
+/// finds nothing, but `listCollections` and the bucket namespace would
+/// disagree with mongod until then. The number of bucket collections made.
+pub fn create_missing_buckets(storage: &dyn Storage) -> Result<usize, CommandError> {
     let _quiet = storage.unreplicated();
-    let mut converted = 0;
+    let mut created = 0;
     for db in storage
         .list_databases()
         .map_err(crate::util::command_error)?
@@ -701,59 +699,14 @@ pub fn upgrade_time_series(storage: &dyn Storage) -> Result<usize, CommandError>
             if layout_of(storage, &db, &coll).is_none() {
                 continue;
             }
-            let stored = storage
-                .find(&db, &coll, &Document::new(), None, None)
-                .map_err(crate::util::command_error)?;
-            let ns = buckets_ns(&coll);
-            let has_buckets = storage
-                .collection_exists(&db, &ns)
-                .map_err(crate::util::command_error)?;
-            if stored.is_empty() {
-                if !has_buckets {
-                    create_buckets(storage, &db, &coll)?;
-                }
-                continue;
+            if !storage
+                .collection_exists(&db, &buckets_ns(&coll))
+                .map_err(crate::util::command_error)?
+            {
+                create_buckets(storage, &db, &coll)?;
+                created += 1;
             }
-            if has_buckets {
-                storage
-                    .drop_collection(&db, &ns)
-                    .map_err(crate::util::command_error)?;
-            }
-            create_buckets(storage, &db, &coll)?;
-            let batches: Vec<Vec<crate::bucket_catalog::Measurement>> = stored
-                .iter()
-                .enumerate()
-                .map(|(index, raw)| {
-                    decode(raw).map(|doc| vec![crate::bucket_catalog::Measurement { index, doc }])
-                })
-                .collect::<Result<_, _>>()?;
-            let layout = layout_of(storage, &db, &coll).expect("checked above");
-            let target = crate::bucket_catalog::Target {
-                storage,
-                db: &db,
-                coll: &coll,
-                layout: &layout,
-            };
-            // A catalog of its own: the server's starts empty, as it would
-            // after a restart.
-            let catalog = crate::bucket_catalog::BucketCatalog::new();
-            let outcomes = crate::bucket_catalog::insert(&catalog, &target, batches)?;
-            if let Some((_, Err(e))) = outcomes.iter().find(|(_, o)| o.is_err()) {
-                return Err(CommandError::new(
-                    e.code,
-                    "TimeseriesUpgradeFailed",
-                    format!(
-                        "converting {db}.{coll} to stored buckets: {}; its measurements are \
-                         kept",
-                        e.errmsg
-                    ),
-                ));
-            }
-            storage
-                .delete_matching(&db, &coll, &Document::new(), 0)
-                .map_err(crate::util::command_error)?;
-            converted += stored.len();
         }
     }
-    Ok(converted)
+    Ok(created)
 }

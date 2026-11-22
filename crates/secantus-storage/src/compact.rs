@@ -1,5 +1,5 @@
 //! Giving disk space back: `compact`, as mongod runs it, over this store's
-//! shared tables.
+//! collection and index tables.
 //!
 //! mongod's `compact` runs WiredTiger's compaction (`WT_SESSION::compact`)
 //! over the collection's own table and then each of its indexes', and
@@ -11,15 +11,14 @@
 //! 20 MB) of it is free, and WiredTiger then needs 1 MB and a tenth or a
 //! fifth of the file free in its first 90% or 80%.
 //!
-//! Here a collection has no table of its own: its documents are rows in one
-//! of the sixteen document shards ([`super::doc_table_for`]), its `_id`
-//! index rows in the shared `_id` table, its other indexes' in the shared
-//! entries table (and its unique keys in the claims table). Those are the
-//! files `compact` compacts, so what it gives back is the free space in
-//! files other collections share -- a dropped or emptied neighbour's pages
-//! included -- and `bytesFreed` is what those files shrank by. That is
-//! mongod's measure (file sizes before and after) over the files this store
-//! keeps the collection in.
+//! Here, as in mongod, a collection's documents are in a table of its own
+//! (`collection-<UUID>`, keyed by RecordId) and each of its indexes' entries,
+//! the `_id` index's and the unique indexes' among them, in a table of its
+//! own (`index-<UUID>`, keyed by KeyString). Those are the files `compact`
+//! compacts, so what it gives back is the free space in the collection's own
+//! files, and `bytesFreed` is what those files shrank by. That is mongod's
+//! measure (file sizes before and after) over the files the collection is
+//! kept in.
 //!
 //! Two parts of mongod's command are WiredTiger 11.3 features the vendored
 //! WiredTiger (11.2, mongodb-7.0) does not have, and are modelled on the
@@ -50,7 +49,7 @@ use crate::auto_compact::AutoCompactor;
 pub enum CompactTarget<'a> {
     /// A collection: the tables its documents and indexes are kept in.
     Collection(&'a str, &'a str),
-    /// The oplog (`local.oplog.rs`): its shard tables.
+    /// The oplog (`local.oplog.rs`): its table.
     Oplog,
     /// The catalog, where a database's view definitions are kept
     /// (`system.views`).
@@ -96,7 +95,7 @@ pub(crate) fn table_file(home: &str, table: &str) -> std::path::PathBuf {
     Path::new(home).join(format!("{}.wt", table.trim_start_matches("table:")))
 }
 
-/// The size of a table's file, 0 when it has none (a shard nothing has
+/// The size of a table's file, 0 when it has none (a table nothing has
 /// written to yet).
 pub(crate) fn file_size(home: &str, table: &str) -> Result<u64> {
     match std::fs::metadata(table_file(home, table)) {

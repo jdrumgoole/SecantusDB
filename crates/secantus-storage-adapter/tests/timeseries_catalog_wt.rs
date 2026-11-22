@@ -199,5 +199,6 @@ fn a_restart_reopens_the_stored_bucket() {
 // built a pre-phase-5 store by inserting measurements into a time-series
 // collection's own table. A time-series collection is now mongod's view
 // over its buckets, with no table, so no store this build opens can hold
-// one; stores of formats 4 to 8 are refused by name at open
-// (`store_format.rs`). The conversion path goes in phase 8's clean-up.
+// one; stores of formats 4 to 9 are refused by name at open
+// (`store_format.rs`). The conversion path (`upgrade_time_series`) went
+// in phase 8, leaving only `create_missing_buckets`.

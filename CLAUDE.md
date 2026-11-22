@@ -43,10 +43,19 @@ carries the Rust servers instead).
 **Reach for Rust.** The marketing site already leads with the two Rust servers;
 do not "restore" a Python-first framing in docs or on the site.
 
-**One on-disk format.** Between the two RUST servers it is a compatibility
-promise -- breaking it is silent data loss. Cross-protocol between them is
-proven in ONE direction and never concurrently (measured 2026-09-18, pinned in
-`tests/test_rust_pgserver_slice.py`):
+**One on-disk format: mongod 8.2's own** (store format 10, from
+`tasks/mongod-storage-model-plan.md`): `_mdb_catalog`, a WiredTiger table per
+collection and per index (`collection-<UUID>`, `index-<UUID>`, KeyString
+keys), `local.oplog.rs`, `sizeStorer`, `journal/` and `storage.bson`, with
+`secantus.format` recording the version. Between the two RUST servers it is a
+compatibility promise -- breaking it is silent data loss -- and a store in an
+older layout is refused by name, with dump-and-restore advice (a layout change
+moves the format number). Both directions with `mongod` are proven as a
+hand-off, never at once: `mongod` 8.2 opens a store `secantusd-mdb` wrote, and
+`secantusd-mdb` opens one `mongod` wrote, stopped cleanly or killed, refusing
+by name what it cannot serve (time series, some index kinds). Cross-protocol
+between the Rust servers is proven in ONE direction and never concurrently
+(measured 2026-09-18, pinned in `tests/test_rust_pgserver_slice.py`):
   - SQL -> MongoDB **works**: a `secantusd-pg` table reads back through
     `secantusd-mdb` as a collection, with the `PRIMARY KEY` as `_id`.
   - MongoDB -> SQL **does not**: the Rust PG server resolves names through
