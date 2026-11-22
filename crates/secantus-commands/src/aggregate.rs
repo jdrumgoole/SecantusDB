@@ -3572,7 +3572,7 @@ fn apply_storage_stage(
             })
         }
         "$geoNear" => apply_geo_near(spec, docs, db, coll, vars, storage),
-        "$unionWith" => apply_union_with(spec, docs, db, storage, collation),
+        "$unionWith" => apply_union_with(spec, docs, db, vars, storage, collation),
         _ => Err(bad_value(format!(
             "unsupported storage-backed stage {name}"
         ))),
@@ -4027,16 +4027,26 @@ fn apply_facet(
 /// `$unionWith` — concatenate docs from another collection, optionally after a
 /// sub-pipeline. The spec is a bare collection name (`{$unionWith: "coll"}`) or
 /// `{coll, pipeline}`. The sub-pipeline runs in a *fresh* context (outer `let` /
-/// vars are not visible — mongod's `$unionWith` has no `let`), and the union docs
+/// vars are not visible — mongod's `$unionWith` has no `let`; the system
+/// variables `$$NOW` / `$$CLUSTER_TIME` are), and the union docs
 /// are appended after the input docs (no dedup). Mirrors
 /// `aggregate._stage_union_with`.
 fn apply_union_with(
     spec: Option<&Bson>,
     mut docs: Vec<Document>,
     db: &str,
+    vars: &Document,
     storage: &dyn crate::storage::Storage,
     collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
+    // The sub-pipeline sees no outer `let`, but the system variables are the
+    // command's: mongod 8.2.11 binds `$$NOW` (and `$$CLUSTER_TIME`) there
+    // with the command's values (RM-655).
+    let sys: Document = vars
+        .iter()
+        .filter(|(k, _)| matches!(k.as_str(), "NOW" | "CLUSTER_TIME"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let (from, sub_pipeline): (Option<&str>, Option<&Vec<Bson>>) = match spec {
         // An EMPTY collection name is not a namespace. This used to return the
         // outer documents unchanged -- a wrong ANSWER. mongod renders the
@@ -4082,7 +4092,7 @@ fn apply_union_with(
             sub,
             db,
             None,
-            &Document::new(),
+            &sys,
             storage,
             collation,
             &Document::new(),
@@ -4143,7 +4153,7 @@ fn apply_union_with(
             &sub,
             db,
             Some(from),
-            &Document::new(),
+            &sys,
             storage,
             collation,
             &Document::new(),

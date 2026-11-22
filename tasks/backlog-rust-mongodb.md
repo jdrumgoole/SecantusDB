@@ -1399,14 +1399,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       discarding the evaluator's own error. Found 2026-11-14 working RM-531.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_a_documents_expression_error_is_the_expressions
       Backlog-ID: RM-654
-- [ ] **`$$NOW` is unbound inside a `$unionWith` pipeline.** mongod 8.2.11
-      runs `{$unionWith: {pipeline: [{$documents: [{t: "$$NOW"}]}]}}` (and a
-      later stage reading `$$NOW` there) with the command's date. This
-      server answers 2 "$documents expression not supported", or "not
-      supported by the Rust server" from a later stage. Found 2026-11-14
-      working RM-531.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_now_is_bound_in_a_union_with_pipeline
-      Backlog-ID: RM-655
 - [ ] **A run-time error in a sub-pipeline or after `$documents` names the
       wrong namespace.** mongod 8.2.11 names the COMMAND's namespace under
       "Executor error during aggregate command on namespace:" wherever the
