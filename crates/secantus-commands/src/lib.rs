@@ -904,6 +904,13 @@ fn configure_fail_point(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
     if let Some(reg) = &ctx.failpoints {
         reg.configure(&name, &mode, &data);
     }
+    // mongod's journal flusher pauses before its next flush (its point
+    // stops moving), and resumes when the failpoint is off.
+    if name == "pauseJournalFlusherBeforeFlush" {
+        if let Some(storage) = &ctx.storage {
+            storage.pause_journal_flusher(!matches!(&mode, Bson::String(m) if m == "off"));
+        }
+    }
     Ok(doc! { "ok": 1.0 })
 }
 
@@ -1028,7 +1035,17 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     // mongod's `waitUntilDurable`. Before this, `j` was echoed and no sync
     // followed, and a SIGKILL lost writes acknowledged with `j: true`.
     let standalone = ctx.replica_set_name.is_none();
-    if wants_journal(name, doc, client_wc, default_wc.as_ref(), standalone) {
+    // A store that syncs every commit acknowledges every write journaled,
+    // so it waits as a journaled write does (RM-736).
+    let every_commit_synced = ctx.storage.as_ref().is_some_and(|s| s.syncs_every_commit());
+    if wants_journal(
+        name,
+        doc,
+        client_wc,
+        default_wc.as_ref(),
+        standalone,
+        every_commit_synced,
+    ) {
         if let Some(storage) = &ctx.storage {
             let waited = std::time::Instant::now();
             let wait_locks = lock_manager::journal_wait(ctx.locks.as_ref());
@@ -1348,6 +1365,7 @@ fn wants_journal(
     client_wc: Option<&Document>,
     default_wc: Option<&Document>,
     standalone: bool,
+    every_commit_synced: bool,
 ) -> bool {
     let in_transaction = doc.contains_key("autocommit");
     let takes = matches!(name, "commitTransaction" | "abortTransaction")
@@ -1356,6 +1374,12 @@ fn wants_journal(
         return false;
     }
     let wc = client_wc.filter(|wc| !wc.is_empty()).or(default_wc);
+    if every_commit_synced {
+        // Every acknowledged write; an unacknowledged one waits for nothing.
+        return !wc
+            .and_then(|wc| wc.get("w"))
+            .is_some_and(|w| crate::util::as_i64(w) == Some(0));
+    }
     let Some(wc) = wc else {
         // A replica set's implicit `{w: "majority"}`; a standalone's
         // implicit `{w: 1}` waits for nothing (RM-551).

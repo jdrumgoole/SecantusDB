@@ -1632,6 +1632,16 @@ pub trait Storage: Send + Sync {
         Ok(())
     }
 
+    /// Whether every commit syncs the journal (`--sync-on-commit`), so that
+    /// every acknowledged write must be journaled, its wait included.
+    fn syncs_every_commit(&self) -> bool {
+        false
+    }
+
+    /// mongod's `pauseJournalFlusherBeforeFlush` failpoint, on a store that
+    /// has a journal flusher.
+    fn pause_journal_flusher(&self, _paused: bool) {}
+
     /// Take a checkpoint now, as `fsync` does. `false` from a store that
     /// keeps no checkpoints.
     fn checkpoint_now(&self) -> Result<bool, StorageError> {

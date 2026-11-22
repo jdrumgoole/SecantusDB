@@ -1859,6 +1859,14 @@ impl CmdStorage for StorageAdapter {
         self.inner.flush_journal().map_err(map_err)
     }
 
+    fn syncs_every_commit(&self) -> bool {
+        self.inner.syncs_every_commit()
+    }
+
+    fn pause_journal_flusher(&self, paused: bool) {
+        self.inner.pause_journal_flusher(paused)
+    }
+
     fn checkpoint_now(&self) -> Result<bool, StorageError> {
         if self.inner.in_memory() {
             return Ok(false);

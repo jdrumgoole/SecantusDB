@@ -11,6 +11,7 @@ after its server has stopped, and the `shutdown` test stops its server.
 from __future__ import annotations
 
 import contextlib
+import shutil
 import signal
 import socket
 import subprocess
@@ -50,7 +51,7 @@ SECANTUS_SET = "secantus"
 
 
 def _mongod_on(
-    dbpath: Path, port: int | None = None, set_name: str = "rs0"
+    dbpath: Path, port: int | None = None, set_name: str = "rs0", *extra: str
 ) -> tuple[subprocess.Popen, pymongo.MongoClient | None]:
     """Start mongod as a one-member replica set on `dbpath`, which may already
     hold a store. Returns the process and a client to the primary, or `None`
@@ -75,6 +76,8 @@ def _mongod_on(
             set_name,
             "--logpath",
             str(dbpath.parent / f"mongod-{port}.log"),
+            "--logappend",
+            *extra,
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -408,7 +411,7 @@ def test_mongod_opens_the_phase_0b_store(tmp_path: Path) -> None:
         _stop_mongod(proc, mongod)
 
 
-@pytest.mark.backlog("RM-723")
+@pytest.mark.backlog_fixed("RM-723")
 def test_secantus_opens_a_mongod_store(tmp_path: Path) -> None:
     """A store mongod 8.2.11 wrote, opened by `secantusd-mdb`, serves the
     collection mongod wrote: its documents and its index."""
@@ -460,6 +463,86 @@ def test_the_truncate_after_point_follows_the_oplog(tmp_path: Path) -> None:
         assert point["oplogTruncateAfterPoint"] == last["ts"]
 
 
+def _truncation_shape() -> Any:
+    """The writes of the truncation comparison: one with the default write
+    concern (`w: "majority"`, journaled: its wait moves the point), then
+    two at `w: 1, j: false`, then a second for the journal flusher."""
+
+    def run(client: pymongo.MongoClient, pause: bool) -> None:
+        coll = client.app.c
+        coll.insert_one({"_id": "A"})
+        if pause:
+            client.admin.command(
+                "configureFailPoint", "pauseJournalFlusherBeforeFlush", mode="alwaysOn"
+            )
+            time.sleep(0.3)
+        w1 = coll.with_options(write_concern=pymongo.WriteConcern(w=1, j=False))
+        w1.insert_one({"_id": "B"})
+        w1.insert_one({"_id": "C"})
+        time.sleep(1)
+
+    return run
+
+
+def _after_a_kill(server: str, tmp_path: Path, pause: bool) -> tuple:
+    """The truncation comparison's shape on `server` (`"mongod"` or
+    `"secantus"`), SIGKILL, a restart: the documents left and the oplog's
+    entries for them."""
+    run = _truncation_shape()
+    store = tmp_path / server / "store"
+    store.mkdir(parents=True)
+    if server == "mongod":
+        port = _free_port()
+        proc, client = _mongod_on(store, port, "rs0", "--setParameter", "enableTestCommands=1")
+        assert client is not None
+        try:
+            _wait_primary(client, f"127.0.0.1:{port}")
+            run(client, pause)
+        finally:
+            proc.send_signal(signal.SIGKILL)
+            proc.wait()
+            client.close()
+        proc, client = _mongod_on(store, port, "rs0")
+        assert client is not None
+        try:
+            with _mongod_answers(store):
+                _until_primary(client)
+                return _survivors(client)
+        finally:
+            _stop_mongod(proc, client)
+    _killed_secantus_store(store, lambda c: run(c, pause), "--enable-test-commands")
+    with rust_mongo_server(store) as client:
+        return _survivors(client)
+
+
+def _survivors(client: pymongo.MongoClient) -> tuple:
+    return (
+        sorted(d["_id"] for d in client.app.c.find()),
+        [e["o"]["_id"] for e in client.local["oplog.rs"].find({"ns": "app.c", "op": "i"})],
+    )
+
+
+@pytest.mark.backlog_fixed("RM-736")
+@pytest.mark.parametrize("pause", [True, False], ids=["flusher-paused", "flusher-running"])
+def test_recovery_truncates_the_oplog_after_the_point_as_mongod(
+    tmp_path: Path, pause: bool
+) -> None:
+    """RM-736 (decided by Joe, 2026-11-22: "Truncate as mongod"). A write
+    acknowledged at `w: 1, j: false` is in the journal file a SIGKILL leaves,
+    but mongod 8.2.11's recovery truncates the oplog after
+    `oplogTruncateAfterPoint`, which only its journal flusher (every 100 ms)
+    and a journaled write's wait move: with the flusher paused
+    (`pauseJournalFlusherBeforeFlush`) the two `w: 1` writes are gone after
+    the restart, entries and documents ("Removing unapplied oplog entries
+    after oplogTruncateAfterPoint", 21557), and the journaled one stays; with
+    it running, a second later, all three stay (measured 2026-11-22). This
+    server's recovery replayed every entry the journal held until phase 7c;
+    now it gives mongod's answer in both shapes."""
+    expected = (["A"], ["A"]) if pause else (["A", "B", "C"], ["A", "B", "C"])
+    assert _after_a_kill("mongod", tmp_path, pause) == expected
+    assert _after_a_kill("secantus", tmp_path, pause) == expected
+
+
 # ------------------------------------------------- storage-model phase 7 --
 # Found making `secantusd-mdb`'s stores ones mongod 8.2.11 opens, and
 # measured against it (2026-11-21). Each forward test writes a store with
@@ -490,11 +573,11 @@ def _mongod_on_secantus_store(
         _stop_mongod(proc, mongod)
 
 
-def _killed_secantus_store(store: Path, setup: Any) -> int:
+def _killed_secantus_store(store: Path, setup: Any, *extra: str) -> int:
     """`setup(client)` on a new `secantusd-mdb` store, then SIGKILL: the port
     it bound."""
     proc = subprocess.Popen(
-        [str(RS_BINARY), "--port", "0", "--storage-path", str(store)],
+        [str(RS_BINARY), "--port", "0", "--storage-path", str(store), *extra],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -668,9 +751,17 @@ def test_mongod_opens_a_killed_secantus_store(tmp_path: Path) -> None:
 def _mongod_store(tmp_path: Path, setup: Any, kill: bool = False) -> Path:
     """`setup(client)` on a new mongod 8.2.11 one-member set, then a clean
     stop (or SIGKILL with `kill`, its journal and oplog recovery pending)."""
+    return _mongod_store_at(tmp_path, setup, kill)[0]
+
+
+def _mongod_store_at(
+    tmp_path: Path, setup: Any, kill: bool = False, *extra: str
+) -> tuple[Path, int]:
+    """`_mongod_store`, and the port its one member is configured at."""
     store = tmp_path / "store"
     store.mkdir()
-    proc, client = _mongod_on(store)
+    port = _free_port()
+    proc, client = _mongod_on(store, port, "rs0", *extra)
     assert client is not None, "mongod did not start on an empty directory"
     try:
         host, port = client.address or ("127.0.0.1", 0)
@@ -688,7 +779,7 @@ def _mongod_store(tmp_path: Path, setup: Any, kill: bool = False) -> Path:
             _stop_mongod(proc, client)
         elif client is not None:
             client.close()
-    return store
+    return store, port
 
 
 def _secantus_open(store: Path) -> tuple[str, str]:
@@ -713,22 +804,382 @@ def _secantus_open(store: Path) -> tuple[str, str]:
         proc.wait(timeout=30)
 
 
-@pytest.mark.backlog("RM-723")
-def test_secantus_opens_a_killed_mongod_store(tmp_path: Path) -> None:
-    """A store mongod 8.2.11 was killed on (SIGKILL: journal and oplog
-    recovery pending), opened by `secantusd-mdb`, serves every acknowledged
-    write: WiredTiger recovers the logged tables, and the oplog after the
-    stable checkpoint is replayed, as mongod's own restart does."""
+#: The index kinds this server does not key as mongod does (refused by name
+#: when a store holds one), which the servable scenario drops.
+_MONGOD_ONLY_KINDS = ("h_hashed", "loc_2dsphere", "flat_2d", "body_text", "w_wildcard")
+
+#: What both servers rewrite as they run, whoever wrote the store: each
+#: server's logical session cache refreshes the sessions it has seen into
+#: `config.system.sessions`.
+_LIVE_NAMESPACES = {"config.system.sessions"}
+
+
+def _servable_scenario(rs: pymongo.MongoClient) -> None:
+    """Phase 0b's scenario on mongod (every collection and index kind,
+    capped, clustered, collated, pre-images, a view, a drop, a rename, a
+    transaction), less what this server refuses by name in a store: the index
+    kinds it keys otherwise (RM-741 to RM-743, hashed, text), the
+    time-series collection (RM-754) and the user and role (RM-744)."""
+    from tools.probes.mongod_store_layout import run_scenario
+
+    run_scenario(rs, strict=True)
+    for name in _MONGOD_ONLY_KINDS:
+        rs.app.kinds.drop_index(name)
+    rs.app.ts.drop()
+    rs.app.command("dropUser", "u1")
+    rs.app.command("dropRole", "r1")
+
+
+def _comparable(contents: dict) -> dict:
+    return {ns: v for ns, v in contents.items() if ns not in _LIVE_NAMESPACES}
+
+
+@pytest.mark.backlog_fixed("RM-723")
+def test_secantus_serves_the_phase_0b_store_mongod_wrote(tmp_path: Path) -> None:
+    """Storage-model phase 7c, the reverse of
+    `test_mongod_opens_the_phase_0b_store`: mongod 8.2.11 writes phase 0b's
+    scenario (less what this server refuses by name) and stops cleanly;
+    `secantusd-mdb` opens the store and serves every document and every
+    hinted index walk byte for byte as mongod served them, resumes a change
+    stream from a token mongod issued, and writes to it; mongod opens the
+    store again, `validate({full: true})` passes on every collection and it
+    reads what this server wrote."""
+    served: dict = {}
+    token: Any = None
 
     def setup(rs: pymongo.MongoClient) -> None:
-        rs["app"]["c"].insert_many([{"_id": i, "a": i % 3} for i in range(50)])
-        rs["app"]["c"].create_index("a", name="a_1")
+        nonlocal served, token
+        _servable_scenario(rs)
+        with rs.app.c.watch() as stream:
+            rs.app.c.insert_one({"_id": 500, "a": 1, "b": "x500"})
+            token = next(stream)["_id"]
+        rs.app.c.insert_one({"_id": 501, "a": 2, "b": "x501"})
+        rs.app.c.update_one({"_id": 501}, {"$set": {"a": 3}})
+        served = _store_contents(rs)
 
-    store = _mongod_store(tmp_path, setup, kill=True)
+    store, _ = _mongod_store_at(tmp_path, setup)
     with rust_mongo_server(store) as rust:
-        coll = rust["app"]["c"]
-        answer = mongo_answer(lambda: sorted(d["_id"] for d in coll.find()))
-        assert answer == ("ok", list(range(50)))
+        assert _comparable(_store_contents(rust)) == _comparable(served)
+        assert rust.admin.command("hello").get("setName") == "rs0"
+        with rust.app.c.watch(resume_after=token) as stream:
+            events = [next(stream), next(stream)]
+        assert [(e["operationType"], e["documentKey"]) for e in events] == [
+            ("insert", {"_id": 501}),
+            ("update", {"_id": 501}),
+        ]
+        rust.app.c.insert_one({"_id": 700, "a": 7, "b": "x700", "t": [7, 8]})
+        rust.app.made_here.insert_many([{"_id": i, "y": i % 2} for i in range(4)])
+        rust.app.made_here.create_index("y", name="y_1")
+        rust.app.renamed.drop()
+        written = _store_contents(rust)
+        port = rust.address[1]
+    proc, mongod = _mongod_on(store, port, "rs0")
+    try:
+        assert mongod is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            _until_primary(mongod)
+            namespaces = [
+                (db, info["name"])
+                for db in mongod.list_database_names()
+                for info in mongod[db].list_collections()
+                if info.get("type") != "view"
+            ]
+            findings = {
+                f"{db}.{name}": _validation_findings(mongod, db, name) for db, name in namespaces
+            }
+            assert {ns: f for ns, f in findings.items() if f is not None} == {}
+            assert _comparable(_store_contents(mongod)) == _comparable(written)
+    finally:
+        _stop_mongod(proc, mongod)
+
+
+def _after_the_stable_checkpoint(rs: pymongo.MongoClient) -> None:
+    """Writes made after mongod's stable checkpoint (an `fsync`), which a
+    restart after a kill replays from the oplog: a `create` with `idIndex`
+    (an implicit one), a two-phase index build (`startIndexBuild`,
+    `commitIndexBuild` and their `config.system.indexBuilds` writes), a
+    transaction (`applyOps`), updates (`$v: 2` diffs), a delete, an index
+    drop and a capped insert."""
+    rs.admin.command("fsync")
+    rs.app.after.insert_many([{"_id": i, "z": i % 2} for i in range(20)])
+    rs.app.after.create_index("z", name="z_1")
+    with rs.start_session() as s:
+        s.with_transaction(
+            lambda sess: (
+                rs.app.c.insert_one({"_id": 98, "a": 8, "b": "x98"}, session=sess),
+                rs.app.after.update_one({"_id": 1}, {"$set": {"z": 9}}, session=sess),
+            )
+        )
+    rs.app.c.update_many({"a": 1}, {"$inc": {"n": 1}})
+    rs.app.c.delete_one({"_id": 5})
+    rs.app.ks.drop_index("v_-1")
+    rs.app.capped.insert_one({"_id": 10})
+
+
+@pytest.mark.backlog_fixed("RM-723")
+def test_secantus_opens_a_killed_mongod_store(tmp_path: Path) -> None:
+    """A store mongod 8.2.11 was killed on (SIGKILL: journal and oplog
+    recovery pending), opened by `secantusd-mdb`, serves what mongod's own
+    restart on a copy of the same killed store serves, document for document
+    and index walk for index walk: WiredTiger recovers the logged tables,
+    the oplog is truncated after `oplogTruncateAfterPoint`, and every entry
+    after the stable checkpoint is replayed (`ReplicationRecovery`). Then
+    mongod opens what this server wrote, and validates it."""
+
+    def setup(rs: pymongo.MongoClient) -> None:
+        _servable_scenario(rs)
+        _after_the_stable_checkpoint(rs)
+
+    store, port = _mongod_store_at(tmp_path, setup, kill=True)
+    copy = tmp_path / "copy" / "store"
+    shutil.copytree(store, copy)
+    proc, mongod = _mongod_on(copy, port, "rs0")
+    try:
+        assert mongod is not None, "mongod refused its own killed store"
+        with _mongod_answers(copy):
+            _until_primary(mongod)
+            restarted = _store_contents(mongod)
+    finally:
+        _stop_mongod(proc, mongod)
+    with rust_mongo_server(store) as rust:
+        assert _comparable(_store_contents(rust)) == _comparable(restarted)
+        replayed = {
+            (e["op"], next(iter(e.get("o", {})), None))
+            for e in rust.local["oplog.rs"].find({"op": {"$in": ["c", "n"]}})
+        }
+        assert {("c", "create"), ("c", "startIndexBuild"), ("c", "commitIndexBuild")} <= replayed
+        assert ("c", "applyOps") in replayed
+        port = rust.address[1]
+    proc, mongod = _mongod_on(store, port, "rs0")
+    try:
+        assert mongod is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            _until_primary(mongod)
+            mongod.admin.command("fsync")
+            assert _validation(mongod, "app", "after") == (True, [], [])
+            assert _validation(mongod, "app", "c") == (True, [], [])
+    finally:
+        _stop_mongod(proc, mongod)
+
+
+def _served_after_mongods_restart(store: Path, port: int, tmp_path: Path) -> dict:
+    """What mongod 8.2.11 serves restarted on a copy of `store` (killed, or
+    stopped), as `_store_contents`."""
+    copy = tmp_path / "copy" / "store"
+    shutil.copytree(store, copy)
+    proc, mongod = _mongod_on(copy, port, "rs0")
+    try:
+        assert mongod is not None, "mongod refused its own store"
+        with _mongod_answers(copy):
+            _until_primary(mongod)
+            return _store_contents(mongod)
+    finally:
+        _stop_mongod(proc, mongod)
+
+
+@pytest.mark.backlog("RM-754")
+def test_secantus_opens_a_mongod_time_series_collection(tmp_path: Path) -> None:
+    """A store mongod 8.2.11 wrote holding a time-series collection (a view
+    in `system.views` over `system.buckets.<name>`, a clustered collection
+    with zstd blocks and its own catalog options, measured in phase 0b):
+    `secantusd-mdb` serves its measurements as mongod does. It refuses the
+    store by name instead: the registry rows of a time-series collection
+    (its options, its buckets' catalog options and the indexes listed on it)
+    are not rebuilt from mongod's catalog."""
+
+    def setup(rs: pymongo.MongoClient) -> None:
+        import datetime as dt
+
+        rs.app.create_collection("ts", timeseries={"timeField": "t", "metaField": "m"})
+        base = dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)
+        rs.app.ts.insert_many(
+            [{"t": base + dt.timedelta(seconds=i), "m": i % 2, "v": i} for i in range(6)]
+        )
+
+    store, port = _mongod_store_at(tmp_path, setup)
+    served = _served_after_mongods_restart(store, port, tmp_path)
+    outcome, said = _secantus_open(store)
+    assert outcome == "served", said
+    with rust_mongo_server(store) as rust:
+        assert _comparable(_store_contents(rust)) == _comparable(served)
+
+
+@pytest.mark.backlog("RM-755")
+def test_secantus_finishes_an_index_build_mongod_left(tmp_path: Path) -> None:
+    """mongod 8.2.11 stopped cleanly during an index build (held by
+    `hangAfterStartingIndexBuild`) leaves the index in its catalog with
+    `ready: false` and its build in `config.system.indexBuilds`; its restart
+    finishes the build. `secantusd-mdb` refuses the store by name ("whose
+    build has not finished") instead of finishing it."""
+    import threading
+
+    def setup(rs: pymongo.MongoClient) -> None:
+        rs.app.c.insert_many([{"_id": i, "a": i % 7} for i in range(200)])
+        rs.admin.command("configureFailPoint", "hangAfterStartingIndexBuild", mode="alwaysOn")
+        building = threading.Thread(target=_build_quietly, args=(rs,), daemon=True)
+        building.start()
+        deadline = time.monotonic() + 30
+        while not list(rs.config["system.indexBuilds"].find()):
+            assert time.monotonic() < deadline, "the build never started"
+            time.sleep(0.1)
+
+    store, port = _mongod_store_at(tmp_path, setup, False, "--setParameter", "enableTestCommands=1")
+    served = _served_after_mongods_restart(store, port, tmp_path)
+    assert "a_1" in served["app.c"], "mongod's restart did not finish the build"
+    outcome, said = _secantus_open(store)
+    assert outcome == "served", said
+    with rust_mongo_server(store) as rust:
+        assert _comparable(_store_contents(rust)) == _comparable(served)
+
+
+def _build_quietly(rs: pymongo.MongoClient) -> None:
+    with contextlib.suppress(pymongo.errors.PyMongoError):
+        rs.app.c.create_index("a", name="a_1")
+
+
+@pytest.mark.backlog("RM-756")
+def test_secantus_opens_a_killed_mongod_store_whose_oplog_drops_what_it_refuses(
+    tmp_path: Path,
+) -> None:
+    """A killed mongod 8.2.11 store whose stable checkpoint lists a `hashed`
+    index that the oplog after it drops: mongod's restart replays the drop
+    and serves the collection without it. `secantusd-mdb` judges the store
+    at the checkpoint, before its replay, and refuses it by name."""
+
+    def setup(rs: pymongo.MongoClient) -> None:
+        rs.app.c.insert_many([{"_id": i, "h": i} for i in range(5)])
+        rs.app.c.create_index([("h", "hashed")], name="h_hashed")
+        rs.admin.command("fsync")
+        rs.app.c.drop_index("h_hashed")
+        rs.app.c.insert_one({"_id": 5, "h": 5})
+
+    store, port = _mongod_store_at(tmp_path, setup, kill=True)
+    served = _served_after_mongods_restart(store, port, tmp_path)
+    outcome, said = _secantus_open(store)
+    assert outcome == "served", said
+    with rust_mongo_server(store) as rust:
+        assert _comparable(_store_contents(rust)) == _comparable(served)
+
+
+@pytest.mark.backlog_fixed("RM-757")
+def test_secantus_keeps_what_mongod_wrote_to_its_store(tmp_path: Path) -> None:
+    """A store `secantusd-mdb` wrote and stopped, opened by mongod 8.2.11,
+    which makes a collection and an index, writes to an existing collection
+    (arrays, making an index multikey), changes a validator and drops a
+    collection and an index; `secantusd-mdb` opening the store again serves
+    what mongod served, byte for byte, index walks included. Until phase 7c
+    it served its own registry: mongod's new collection was gone (its tables
+    dropped at the open as orphans) and the dropped one was still served,
+    from its drop-pending table (measured 2026-11-22)."""
+    store = tmp_path / "store"
+    with rust_mongo_server(store) as client:
+        client.app.keep.insert_many([{"_id": i, "t": i} for i in range(3)])
+        client.app.keep.create_index("t", name="t_1")
+        client.app.keep.create_index("u", name="u_1")
+        client.app.gone.insert_one({"_id": 1})
+        port = client.address[1]
+    proc, mongod = _mongod_on(store, port, SECANTUS_SET)
+    try:
+        assert mongod is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            _until_primary(mongod)
+            mongod.app.made.insert_many([{"_id": i, "x": i % 2} for i in range(5)])
+            mongod.app.made.create_index("x", name="x_1")
+            mongod.app.keep.insert_one({"_id": 9, "t": [1, 2, 3]})
+            mongod.app.keep.drop_index("u_1")
+            mongod.app.command("collMod", "keep", validator={"t": {"$exists": True}})
+            mongod.app.gone.drop()
+            served = _store_contents(mongod)
+            options = {i["name"]: i["options"] for i in mongod.app.list_collections()}
+    finally:
+        _stop_mongod(proc, mongod)
+    with rust_mongo_server(store) as rust:
+        assert _comparable(_store_contents(rust)) == _comparable(served)
+        assert {i["name"]: i["options"] for i in rust.app.list_collections()} == options
+        # The multikey index answers as mongod's does: one document, once.
+        assert [d["_id"] for d in rust.app.keep.find({"t": {"$gt": 1}}, hint="t_1")] == [2, 9]
+
+
+@pytest.mark.backlog_fixed("RM-758")
+@pytest.mark.parametrize("server", ["mongod", "secantus"])
+def test_a_collection_keeps_its_uuid_through_crash_recovery(tmp_path: Path, server: str) -> None:
+    """A collection made after the stable checkpoint, then a SIGKILL: the
+    restart replays its `create` entry, and the collection has the UUID the
+    entry names (`ui`), as before the kill (mongod 8.2.11, measured
+    2026-11-22). This server's replay made it with no UUID, so its catalog
+    entry had none (mongod refused the recovered store, "MustDowngrade:
+    Collection does not have UUID in KVCatalog") and the next write minted a
+    new one."""
+
+    def setup(c: pymongo.MongoClient) -> None:
+        c.app.fresh.insert_one({"_id": 1})
+        setup.uuid = next(c.app.list_collections(filter={"name": "fresh"}))["info"]["uuid"]
+
+    store = tmp_path / server / "store"
+    store.parent.mkdir(parents=True)
+    if server == "mongod":
+        store, port = _mongod_store_at(store.parent, setup, kill=True)
+        proc, client = _mongod_on(store, port, "rs0")
+        assert client is not None
+        try:
+            with _mongod_answers(store):
+                _until_primary(client)
+                after = next(client.app.list_collections(filter={"name": "fresh"}))
+        finally:
+            _stop_mongod(proc, client)
+    else:
+        _killed_secantus_store(store, setup)
+        with rust_mongo_server(store) as client:
+            after = next(client.app.list_collections(filter={"name": "fresh"}))
+    assert after["info"]["uuid"] == setup.uuid
+
+
+@pytest.mark.backlog_fixed("RM-760")
+@pytest.mark.parametrize("server", ["mongod", "secantus"])
+def test_crash_recovery_keeps_a_transactions_session_row(tmp_path: Path, server: str) -> None:
+    """A transaction committed after the stable checkpoint, then a SIGKILL:
+    the restart's replay of its `applyOps` entry writes its session's
+    `config.transactions` row, `{_id, txnNum, lastWriteOpTime: {ts, t},
+    lastWriteDate, state: "committed"}`, with the entry's timestamp and wall
+    time (mongod 8.2.11, measured 2026-11-22 comparing its recovery with this
+    server's in the phase 7c kill-stress probe). This server's replay rebuilt
+    a retryable write's row but not a transaction's: after a crash the
+    session had no row."""
+
+    def setup(c: pymongo.MongoClient) -> None:
+        c.app.t.insert_one({"_id": 0})
+        with c.start_session() as s:
+            s.with_transaction(lambda sess: c.app.t.insert_one({"_id": 1}, session=sess))
+            setup.lsid = s.session_id
+
+    store = tmp_path / server / "store"
+    store.parent.mkdir(parents=True)
+    if server == "mongod":
+        store, port = _mongod_store_at(store.parent, setup, kill=True)
+        proc, client = _mongod_on(store, port, "rs0")
+        assert client is not None
+        try:
+            with _mongod_answers(store):
+                _until_primary(client)
+                rows = list(client.config.transactions.find({"_id.id": setup.lsid["id"]}))
+                entry = client.local["oplog.rs"].find_one({"o.applyOps": {"$exists": True}})
+        finally:
+            _stop_mongod(proc, client)
+    else:
+        _killed_secantus_store(store, setup)
+        with rust_mongo_server(store) as client:
+            rows = list(client.config.transactions.find({"_id.id": setup.lsid["id"]}))
+            entry = client.local["oplog.rs"].find_one({"o.applyOps": {"$exists": True}})
+    assert [list(r) for r in rows] == [
+        ["_id", "txnNum", "lastWriteOpTime", "lastWriteDate", "state"]
+    ]
+    row = rows[0]
+    assert (row["txnNum"], row["state"], row["lastWriteOpTime"], row["lastWriteDate"]) == (
+        entry["txnNumber"],
+        "committed",
+        {"ts": entry["ts"], "t": entry["t"]},
+        entry["wall"],
+    )
 
 
 @pytest.mark.backlog_fixed("RM-723")

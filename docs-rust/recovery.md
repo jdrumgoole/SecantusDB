@@ -60,7 +60,26 @@ secantusd-mdb --port 27017 --storage-path ./secantus-data-restored
 
 ## Durability knobs
 
-WiredTiger journals every commit; `--sync-on-commit` additionally fsyncs
-per commit (the `writeConcern j: true` guarantee) at a substantial
-throughput cost. Crash recovery is WiredTiger log replay on startup — the
-same storage engine `mongod` ships.
+WiredTiger journals every commit and syncs the journal every 100 ms, as
+`mongod`'s journal flusher does; a journaled write (`j: true`, or the
+default `w: "majority"` of the one-member replica set) waits for that sync.
+After a crash the server recovers as `mongod` does: WiredTiger replays its
+journal, the oplog is truncated after `local.replset.oplogTruncateAfterPoint`,
+and the oplog after the last stable checkpoint is replayed into the data.
+So, as on `mongod`, a write acknowledged with `{w: 1, j: false}` in the
+last ~100 ms before a crash can be lost; a journaled one never is.
+`--sync-on-commit` fsyncs every commit and acknowledges every write as a
+journaled one, at a substantial throughput cost.
+
+## A data directory `mongod` wrote
+
+`secantusd-mdb` opens a data directory `mongod` 8.2 wrote as a one-member
+replica set, stopped cleanly or killed: a killed one is recovered as
+`mongod`'s own restart recovers it. It serves the set under the set's own
+name, and `mongod` can open the directory again afterwards (and opens one
+SecantusDB wrote). Never both at once: WiredTiger's lock makes the second
+server exit. What it cannot serve yet is refused by name before anything is
+written: a set of more than one member, a time-series collection, an index
+build `mongod` left unfinished, `2d`, `2dsphere`, `hashed`, text and
+wildcard indexes, users and roles, and a feature compatibility version
+other than 8.2.

@@ -371,6 +371,33 @@ impl SizeStorer {
         slots.get(db).is_some_and(|m| m.contains_key(coll))
     }
 
+    /// The oplog state this server's last clean close recorded with its
+    /// marker, read without taking it away: `None` when the store has no
+    /// marker (a crash, a store this server never closed, or no
+    /// [`PRIVATE_TABLE`] yet). A marker whose state is not the store's now
+    /// means another server (mongod) wrote the store after that close.
+    pub(crate) fn clean_close_marker(session: &Session) -> crate::Result<Option<Vec<i64>>> {
+        let private = match session.open_cursor(PRIVATE_TABLE, None) {
+            Ok(c) => c,
+            Err(e) if e.is_not_found() || e.is_missing_table() => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        private.set_key_u(MARKER_KEY);
+        match private.search() {
+            Ok(()) => {
+                let marker = crate::decode_doc(&private.get_value_u()?)?;
+                Ok(Some(
+                    marker
+                        .get_array("oplog")
+                        .map(|a| a.iter().filter_map(Bson::as_i64).collect())
+                        .unwrap_or_default(),
+                ))
+            }
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Load the counts a clean close left, taking its marker away in the
     /// same transaction so that a crash from here on is noticed at the next
     /// open. `fingerprint` is the oplog state this open recovered: a store

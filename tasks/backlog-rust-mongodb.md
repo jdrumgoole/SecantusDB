@@ -83,23 +83,13 @@ These work end-to-end but cut corners.
   replset-state.json`) and logs a `{op: "n", o: {msg: "new primary"}}` entry
   with `t` the new term; its entries carry that term. This store writes
   `term: 1` once and every entry has `t: 1`. The fix moves the term in the
-  oplog entries, `replSetGetStatus` and `hello` with it.
+  oplog entries, `replSetGetStatus` and `hello` with it. Since phase 7c
+  this server opens stores mongod wrote, whose term mongod has raised (2
+  after one restart): its entries there say `t: 1` after mongod's `t: 2`
+  ones (mongod 8.2.11 opened such a store again, became primary and
+  validated it, measured 2026-11-22).
   Verify: tests/backlog/test_rm_storage_model.py::test_a_restart_raises_the_election_term
   Backlog-ID: RM-735
-- [ ] **Recovery does not truncate the oplog after
-  `local.replset.oplogTruncateAfterPoint`.** mongod's recovery truncates the
-  oplog after the point first (`ReplicationRecovery::
-  _truncateOplogIfNeededAndThenClearOplogTruncateAfterPoint`), then replays
-  from the stable timestamp. Since phase 7b the point moves as mongod's does
-  (the newest entry at or below the all-committed point, before every
-  journal flush: every 100 ms, and before a journaled write's sync), but this
-  server's recovery still replays every entry the journal holds. Truncating
-  would lose a write acknowledged in the last 100 ms (here a write is
-  acknowledged after its own commit's sync; on mongod a `w: 1` write is
-  acknowledged before the flusher's cycle and is lost too): that is the
-  decision for Joe.
-  Verify: none -- a decision: whether this server's own recovery truncates as mongod's does, losing what it now acknowledges as durable
-  Backlog-ID: RM-736
 - [ ] **A PITR archive cannot prove that nothing was truncated between two
   segments.** The oplog's own mark of where it begins is mongod's, the
   `initiating set` entry (`oplog_reaches_genesis`); a segment's `prev` is 0
@@ -3052,32 +3042,36 @@ produce the dump it exists for.
 
 ## The storage model is not mongod's (tasks/mongod-storage-model-plan.md, 2026-11-19)
 
-- [ ] **mongod's stores are not ones we can open.** Since storage-model
-      phase 7 (2026-11-21) mongod 8.2.11 opens a store `secantusd-mdb` wrote
-      (as the set's one member, under the store's set name and address),
-      becomes primary and validates every collection of phase 0b's scenario
-      (`test_mongod_opens_the_phase_0b_store`; the index kinds and the users
-      filed below excepted). The reverse is still refused, by name, at
-      `store_format::prepare`: `secantusd-mdb` on a store mongod wrote (it
-      has `storage.bson` and no `secantus.format`) exits with "written by
-      mongod ... not supported yet". Since phase 7b the refusal also names,
-      read with WiredTiger opened read-only, what in the store this server
-      could not serve were it opened: a set of more than one member, an
-      index of a kind it does not key as mongod does, a collection or index
-      option it does not keep, an FCV other than 8.2, users and roles; a
-      killed mongod's store, whose log needs recovery, is refused without
-      that list. What opening one needs (measured, plan phase 7's and 7b's
-      "As built"): the registry, placements and index rows rebuilt
-      from `_mdb_catalog` and `system.views`; the refusals by name of a set
-      with more than one member, of an index kind this server does not key
-      as mongod does (`2d`, `2dsphere`, `hashed`, text, wildcard) and of a
-      catalog option it does not implement; users and roles read from
-      `admin.system.{users,roles}`; mongod's size storer without this
-      server's marker; and a killed mongod's store recovered by replaying
-      the oplog after the stable checkpoint. Decided (Joe, 2026-11-19): both
-      directions, with mongod started as a replica-set member.
-      Backlog-ID: RM-723
-      Verify: tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_mongod_store, tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_killed_mongod_store
+- [ ] **A time-series collection in a store mongod wrote is refused.**
+      `secantusd-mdb` opens a store mongod 8.2.11 wrote (storage-model
+      phase 7c), but one holding a time-series collection (mongod's view in
+      `system.views` over `system.buckets.<name>`, whose catalog options
+      this server derives from its own registry rows) is refused by name:
+      the registry rows of the collection, of its buckets and of the indexes
+      listed on it (the inverse of `ts_buckets::bucket_key`) are not
+      rebuilt from mongod's catalog.
+      Verify: tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_mongod_time_series_collection
+      Backlog-ID: RM-754
+- [ ] **An index build mongod left unfinished is refused, not finished.**
+      mongod 8.2.11 stopped cleanly during an index build leaves the index
+      in `_mdb_catalog` with `ready: false` and the build in
+      `config.system.indexBuilds`, and its restart finishes it (measured
+      2026-11-22, the build held by `hangAfterStartingIndexBuild`).
+      `secantusd-mdb` refuses such a store by name ("whose build has not
+      finished"): its own builds restart from `secantus_index_builds`
+      records (RM-187), which mongod's store does not have.
+      Verify: tests/backlog/test_rm_storage_model.py::test_secantus_finishes_an_index_build_mongod_left
+      Backlog-ID: RM-755
+- [ ] **A killed mongod store is judged at its stable checkpoint, before
+      its replay.** What `secantusd-mdb` refuses by name in a store mongod
+      wrote (an index kind it keys otherwise, a time-series collection,
+      users) is read from the catalog as WiredTiger recovers it, which is
+      the stable checkpoint's: a store whose oplog after the checkpoint
+      drops what is refused (a `hashed` index dropped after an `fsync`) is
+      refused, where mongod's restart replays the drop and serves it
+      (measured 2026-11-22).
+      Verify: tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_killed_mongod_store_whose_oplog_drops_what_it_refuses
+      Backlog-ID: RM-756
 - [ ] **There is no `shutdown` command.** mongod 8.2.11 stops on
       `db.adminCommand({shutdown: 1})`: the connection closes and the
       process exits cleanly. `secantusd-mdb` answers CommandNotFound (59)

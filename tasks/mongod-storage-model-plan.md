@@ -1141,6 +1141,138 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
      their `config.system.indexBuilds` writes, `applyOps`, the `new
      primary` and periodic no-ops), compared document for document with
      mongod's own restart on a copy of the same store.
+   **As built (phase 7c: RM-736, and mongod's stores opened; store format
+   9, unchanged).** The layout did not change; a store mongod made gets
+   `secantus.format` once this server has opened it.
+   - **Recovery truncates the oplog after the point** (RM-736, decided by
+     Joe 2026-11-22: "Truncate as mongod"). A store whose data tables are
+     not logged, opening, reads `local.replset.oplogTruncateAfterPoint`
+     before it reads the oplog: `Timestamp(0, 0)` truncates nothing; a
+     point at or below the stable timestamp truncates after the stable
+     timestamp; otherwise every entry after the newest one at or below the
+     point goes, and when the stable timestamp is past that entry the
+     stable and oldest timestamps move back to it with `force`. Then the
+     point is cleared and the journal synced, and the replay runs from the
+     stable timestamp (mongod's `_truncateOplogIfNeededAndThenClearOplog
+     TruncateAfterPoint`; its fatal 40296 when no entry is at or below the
+     point). Measured on mongod 8.2.11 with the journal flusher paused
+     (`pauseJournalFlusherBeforeFlush`, which this server now honours under
+     `--enable-test-commands`): after a SIGKILL two `w: 1, j: false`
+     writes are gone, entries and documents, and the journaled one stays;
+     with the flusher running a second, all three stay. This server gives
+     both answers. A journaled or majority write's wait moves the point
+     first (phase 7b), and now waits first for every entry minted before it
+     to commit, as mongod's acknowledgement waits for its durable point
+     (`lastDurable`) to pass the write with no hole before it: else the
+     point it moved could sit below a write a concurrent earlier entry had
+     not yet committed under. So does every acknowledged write of a store
+     started with `--sync-on-commit`, a mode mongod does not have, whose
+     acknowledgement means the journal holds the write (without it, a kill
+     under load lost 7 to 19 of about 200 acknowledged `w: 1` writes, three
+     runs of three). The PostgreSQL server syncs every commit but its
+     store's data tables are logged (no truncation) unless
+     `SECANTUS_DATA_NONLOGGED` asks otherwise; with it, a commit is not
+     waited for as a journaled write is.
+   - **The registry follows the catalog.** `store_format::prepare` answers
+     `StoreKind::Mongod` for a store with `storage.bson` and no format file
+     (judged read-only first when mongod stopped cleanly, i.e. left
+     `mongod.lock` empty; a killed one is judged once WiredTiger has
+     recovered it). As any store opens, `adopt::reconcile` compares this
+     server's registry with `_mdb_catalog` where another server may have
+     written it: always for a store mongod made, for one of this server's
+     whose clean-close marker no longer matches the oplog (mongod opened it
+     since), and, after an unclean close, when the placements and the
+     catalog's idents disagree. Then the catalog wins: each namespace it
+     lists gets its registry row (its options), placement (`ident`, the row
+     id, `idxIdent`, clustered from `clusteredIndex`) and index rows (the
+     spec's options, `buildSeq` from the listing order, `collationKeys` for
+     a collated index, `multikey` and the `multikeyPaths` bytes as path
+     prefixes); an index whose listed spec is unchanged keeps what this
+     server recorded (a PostgreSQL index's BinData order, say) with
+     mongod's multikey paths added; a namespace or index the catalog no
+     longer lists goes; view rows come from each `system.views`. Before
+     writing, `store_format::catalog_findings` refuses by name what this
+     server cannot serve (the 7b list, plus an index whose build has not
+     finished, an index of another version than 2, and a time-series
+     collection). Found on the way, and the reason this runs for this
+     server's stores too: **mongod's writes to a store this server wrote
+     were lost when this server opened it again** (RM-757, measured: the
+     collection mongod made had its tables dropped as orphans, the one it
+     dropped was still served).
+   - **Opening and serving a mongod store, clean.** Phase 0b's scenario
+     written by mongod (less the index kinds RM-741 to RM-743, hashed and
+     text, the time-series collection, users and roles) and stopped
+     cleanly: every document and every hinted index walk of its 22
+     namespaces reads byte for byte as mongod served them, a change stream
+     resumes from a token mongod issued, the server serves the store's set
+     under its own name (`rs0`), and mongod opening the store again after
+     this server wrote to it becomes primary and validates every
+     collection (`test_secantus_serves_the_phase_0b_store_mongod_wrote`).
+     The open questions, measured: `admin.system.keys` (two HMAC keys) and
+     `config.system.sessions` (made by mongod's session refresh,
+     `logicalSessionRefreshMillis`) serve as ordinary collections; each
+     server's session cache rewrites `config.system.sessions` as it runs,
+     so the comparisons leave it out. mongod's drop-pending idents (a
+     dropped collection's tables) survive mongod's own clean restart (it
+     drops only `internal-*` idents at startup, log 22257); this server's
+     `reconcile_idents` drops them, which changes nothing either server
+     reads. `local.replset.minvalid`, `.oplogTruncateAfterPoint`,
+     `.election`, `.initialSyncId` and `local.system.rollback.id` hold the
+     documents this server writes, field for field. mongod's restarts raise
+     the term (2 after one); this server's entries there say `t: 1`
+     (RM-735), and mongod opened such a store again without complaint.
+   - **Opening a killed mongod store.** WiredTiger recovers the logged
+     tables, the oplog is truncated after the point, and the entries after
+     the stable checkpoint are replayed through the ordinary write paths:
+     the `create` (with `idIndex`), the two-phase build's `startIndexBuild`
+     / `commitIndexBuild` and its `config.system.indexBuilds` writes, a
+     transaction's `applyOps`, `$v: 2` updates, deletes, an index drop, a
+     capped insert and the `new primary` no-op (mongod 8.2.11 wrote no
+     periodic no-op on an idle one-member set in 12 s, measured). The
+     store serves what mongod's own restart on a copy of it serves,
+     document for document and index walk for index walk, and mongod opens
+     what this server wrote after it
+     (`test_secantus_opens_a_killed_mongod_store`). Found on the way: **a
+     replayed `create` made the collection without the entry's UUID**
+     (RM-758), in this server's own crash recovery too: mongod refused the
+     store ("MustDowngrade: Collection does not have UUID in KVCatalog") and
+     the collection's next write minted another one. And, comparing the two
+     servers' recoveries of the same killed store (the phase 7b kill-stress
+     probe, extended): **a replayed transaction left no `config.transactions`
+     row for its session** (RM-760; mongod's recovery writes `state:
+     "committed"` with the entry's timestamp and wall time).
+   - **RM-723 is closed**: its last two gap tests
+     (`test_secantus_opens_a_mongod_store`,
+     `test_secantus_opens_a_killed_mongod_store`) pass, and are
+     `backlog_fixed`.
+   - **Still refused, filed:** a time-series collection (RM-754); an index
+     build mongod left unfinished, which mongod's restart finishes
+     (RM-755); a killed mongod store is judged at its stable checkpoint, so
+     one whose oplog drops what is refused after the checkpoint is refused
+     where mongod serves it (RM-756). Users and roles (RM-744) and the
+     index kinds (RM-741 to RM-743) as before. Not covered: a store of
+     this server's that crashed and was then written by mongod, where
+     mongod changed only options or views (its idents unchanged): the open
+     cannot tell that from this server's own crash.
+   - **Performance** (local, macOS arm64, release builds, 2026-11-22; the
+     droplet A/B is Joe's). Phase 7b's -1.1% / -1.6% (droplet, journaled
+     inserts): `sample` of one writer's default-write-concern inserts puts
+     `refresh_truncate_point` at 85 of 7,067 samples of `flush_journal`
+     (1.2% of a journaled write's wait, 40% of it opening a WiredTiger
+     session per write) on a 51bde76f3 build, nothing on 96dcf2fa6; the
+     rest of 7b's write path (`no_timestamp` begins, `advance_timestamps`,
+     op scopes) is under 0.1% of `dispatch` at `w: 1`. Phase 7c keeps the
+     refresh's session between refreshes and flushes with a pooled one:
+     14 samples of 7,021. Throughput, five interleaved rounds of 15 s:
+     journaled, 1 writer 208.0 / 206.4 / 210.6 ops/s (96dcf2fa6 /
+     51bde76f3 / 7c), 4 writers 242.8 / 239.2 / 238.2, within the runs'
+     spread (macOS's `F_FULLFSYNC` is ~5 ms a write); `w: 1`, four rounds,
+     1 writer about 7,300 and 4 writers about 14,200 ops/s on all three.
+     Per-operation paths 7c changed: a journaled write's wait (waits for
+     the in-flight entries minted before it, the paused-flusher check, the
+     cached refresh session, a pooled session for the flush); every command
+     reads `syncs_every_commit` (a field); nothing on the `w: 1` write path.
+
 8. **Clean-up.** Remove the legacy-table readers, the shard routing and the
    format markers this replaces; rewrite the layout tests below. Update
    CLAUDE.md's "One on-disk format" section, the `python-servers` skill's
