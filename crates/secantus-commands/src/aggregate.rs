@@ -407,6 +407,11 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // Every `$sort` has parsed: one a later `$sort` overrides goes, as
     // mongod's optimizer erases it (RM-524).
     crate::explain::hoist::drop_overridden_sorts_everywhere(&mut pipeline);
+    // A time-series `$group` on the meta field that only counts sums each
+    // bucket's `control.count` on mongod (RM-719).
+    if let (Ok(storage), Some(c)) = (ctx.storage(), coll.as_deref()) {
+        crate::agg_stream::count_bucket_controls(storage, &ctx.db_name, c, &mut pipeline);
+    }
     // The command's `let`, which mongod substitutes before it folds.
     let fold_vars = crate::util::command_let_vars(doc.get("let"), ctx);
     // An operator the query language does not have is a parse error, whether

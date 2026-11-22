@@ -897,14 +897,6 @@ These are explicit non-goals. Don't add them without a reason.
       Measured 2026-10-27, 2026-11-07, 2026-11-10 and 2026-11-13.
       Backlog-ID: RM-363
       Verify: tests/backlog/test_rm_355_364.py::test_a_group_after_a_measurement_match_counts_what_it_examined
-- [ ] **A time-series `$group` on the meta field that sums `1.0` answers a
-      double.** mongod 8.2.11 rewrites `{$group: {_id: "$m", n: {$sum:
-      1.0}}}` over a time-series collection to a sum of each bucket's
-      `control.count`, and answers `n: 60` (an int); this server sums 1.0
-      per measurement and answers `60.0`. Measured 2026-11-18. Found while
-      working RM-363.
-      Verify: tests/backlog/test_rm_355_364.py::test_a_meta_group_summing_one_point_zero_answers_an_int
-      Backlog-ID: RM-719
 - [ ] **WiredTiger 11's interruptible cache wait is not on the line.**
       mongod 8.2.11's WiredTiger splits a cache wait into the share spent
       in interruptible eviction (`timeWaitingMicros.cacheInterruptibleMicros`)

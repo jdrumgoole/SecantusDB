@@ -423,6 +423,51 @@ const TIME_SERIES_STAGES: &[&str] = &[
     "$sort",
 ];
 
+/// mongod 8.2.11 rewrites a time-series `$group` on the meta field that
+/// only counts (see [`groups_on_meta`]) to a `$sum` of each bucket's
+/// `control.count`, an int32: `{$sum: 1.0}` and `{$sum: Long(1)}` answer an
+/// int (or a long past int32), never a double (measured 2026-11-18, RM-719).
+/// Summing `Int32(1)` per measurement gives the same total and type.
+pub(crate) fn count_bucket_controls(
+    storage: &dyn Storage,
+    db: &str,
+    coll: &str,
+    pipeline: &mut [Bson],
+) {
+    let Some(meta) = storage
+        .get_collection_options(db, coll)
+        .ok()
+        .and_then(|o| crate::timeseries::Fields::of(&o))
+        .and_then(|f| f.meta)
+    else {
+        return;
+    };
+    let lead = pipeline
+        .iter()
+        .take_while(|s| {
+            matches!(s.as_document().and_then(|d| d.get("$match")), Some(Bson::Document(m)) if m.is_empty())
+        })
+        .count();
+    let Some(stage) = pipeline.get_mut(lead) else {
+        return;
+    };
+    if !groups_on_meta(stage, Some(&meta)) {
+        return;
+    }
+    let Some(Bson::Document(spec)) = stage.as_document_mut().and_then(|d| d.get_mut("$group"))
+    else {
+        return;
+    };
+    for (key, acc) in spec.iter_mut() {
+        if key == "_id" {
+            continue;
+        }
+        if let Some(arg) = acc.as_document_mut().and_then(|a| a.get_mut("$sum")) {
+            *arg = Bson::Int32(1);
+        }
+    }
+}
+
 /// A `$group` mongod 8.2.11 runs over the buckets, in the classic engine
 /// behind a `$cursor` stage: keyed on the meta field (or a path in it), with
 /// only `{$count: {}}` and `{$sum: 1}` accumulators (measured 2026-11-18;

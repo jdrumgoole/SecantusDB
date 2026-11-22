@@ -1704,13 +1704,14 @@ def test_a_group_after_a_measurement_match_counts_what_it_examined(
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-719")
+@pytest.mark.backlog_fixed("RM-719")
 def test_a_meta_group_summing_one_point_zero_answers_an_int(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11 rewrites a `$group` on the meta field that sums `1.0`
     to a sum of each bucket's `control.count`, and answers an int (60);
-    this server sums 1.0 per measurement and answers a double (60.0)."""
+    this server summed 1.0 per measurement and answered a double (60.0)
+    until it made the same rewrite (RM-719)."""
     pipeline = [{"$group": {"_id": "$m", "n": {"$sum": 1.0}}}, {"$sort": {"_id": 1}}]
     got = {}
     for side, client in (("rust", rust_mongo), ("mongod", mongod_rs)):
