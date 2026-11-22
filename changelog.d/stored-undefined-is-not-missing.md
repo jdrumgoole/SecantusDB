@@ -26,6 +26,8 @@ and `$group` keys it apart from null.
   `$first` and `$addToSet` keep it; `$min` and `$max` skip it as they skip null.
 - A `$setField` value and a document literal's member that is a stored
   `undefined` is written, not removed.
+- `{$meta: "sortKey"}` gives an empty array's key as `undefined`, not null.
 
 Fixes RM-635 (tests/backlog/test_rm_found_2026_11_13_rm525.py::test_a_stored_undefined_is_not_missing,
 tests/backlog/test_rm_found_2026_11_13_rm525.py::test_a_group_keeps_undefined_apart_from_null)
+Fixes RM-525 (tests/backlog/test_rm_found_2026_11_10_rm410.py::test_an_empty_arrays_sort_key_is_undefined)

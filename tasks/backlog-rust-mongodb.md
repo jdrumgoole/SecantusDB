@@ -1137,17 +1137,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       document. Found 2026-11-13 (RM-522).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_graph_lookup_and_a_fill_keep_the_sort_key
       Backlog-ID: RM-632
-- [ ] **`{$meta: "sortKey"}` gives an empty array's key as null.**
-      mongod 8.2.11's key for an empty array is `undefined`, which pymongo
-      decodes as `None`: `$type` reads `"undefined"`, and a `$group` on the
-      key keeps the empty array's document and a null's apart. This server
-      reads the key through `$ifNull` (`agg_meta::sort_key_read`), since its
-      expressions take `undefined` for MISSING. The ranks already tell the
-      two apart (RM-410). Found 2026-11-10. RM-635 landed the real `undefined` the key needs:
-      only `agg_meta::sort_key_read` is left, which still reads the key
-      through `$ifNull`.
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_an_empty_arrays_sort_key_is_undefined
-      Backlog-ID: RM-525
 - [ ] **A leading `$match` on `{$size: "$$REMOVE"}` is an executor error.**
       mongod 8.2.11 folds it: 17124 "Failed to optimize pipeline :: caused
       by :: The argument to $size must be an array, but was of type:

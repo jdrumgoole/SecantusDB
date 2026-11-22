@@ -247,9 +247,9 @@ pub(crate) fn mentions(v: &Bson, kind: &str) -> bool {
 }
 
 /// A `{$meta: "sortKey"}` read of [`SORT_KEY`]. The field holds the key as
-/// a `$_internalSetWindowFields` compares it, an empty array's part
-/// `undefined`, which this engine's expressions take for MISSING; `$meta`
-/// gives that part as null, as it was before RM-410 kept the key whole.
+/// a `$_internalSetWindowFields` compares it, an empty array's part the real
+/// `undefined` mongod gives it (RM-525: this engine used to read that part
+/// as MISSING, and gave it as null).
 ///
 /// A document with no key (one a `$densify` made, RM-631) gives it missing.
 fn sort_key_read() -> Bson {
@@ -257,7 +257,7 @@ fn sort_key_read() -> Bson {
     Bson::Document(bson::doc! { "$cond": [
         { "$eq": [{ "$type": &key }, "missing"] },
         "$$REMOVE",
-        { "$map": { "input": &key, "in": { "$ifNull": ["$$this", null] } } },
+        &key,
     ] })
 }
 
