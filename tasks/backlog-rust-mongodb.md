@@ -1192,12 +1192,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       they run. Found 2026-11-13 (RM-520).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_a_windows_output_reads_the_sort_key
       Backlog-ID: RM-621
-- [ ] **A missing `newRoot` is named null, not MISSING.** mongod 8.2.11's
-      40228 for `$replaceRoot: {newRoot: "$nope"}` (and `$replaceWith`) reads
-      "resulting value was: MISSING. Type of resulting value: 'missing'";
-      this server's reads "null" and 'null'. Found 2026-11-13 (RM-520).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_a_missing_new_root_is_missing
-      Backlog-ID: RM-622
 - [ ] **A `newRoot` error names a pruned document when a later stage
       reads the sort key.** In `$sort, $replaceRoot: {newRoot: "$n"}, $addFields:
       {m: {$meta: "sortKey"}}`, mongod 8.2.11's 40228 names the whole input
