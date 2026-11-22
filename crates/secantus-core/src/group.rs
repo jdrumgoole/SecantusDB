@@ -58,19 +58,9 @@ fn eval_or_missing(expr: &Bson, doc: &Document, vars: &Document) -> R<Option<Bso
         }
     }
     // An expression can evaluate to MISSING too (`$ifNull` of two missing
-    // fields, a `$meta` with no metadata): the engine's marker for it is
-    // `Undefined`, and `$push` / `$addToSet` skip it as mongod does.
-    expressions::evaluate_or_missing(doc, expr, vars)
-        .map(|v| (!matches!(v, Bson::Undefined)).then_some(v))
-}
-
-/// A missing value where a value must be written (`$first`, `$last`, a
-/// group key) is null.
-fn missing_as_null(v: Bson) -> Bson {
-    match v {
-        Bson::Undefined => Bson::Null,
-        other => other,
-    }
+    // fields, a `$meta` with no metadata), and `$push` / `$addToSet` skip it
+    // as mongod does. A real `undefined` is a value (RM-635).
+    Ok(expressions::evaluate_field(doc, expr, vars)?.into_value())
 }
 
 /// The group key for `d`. A missing key is null. So is the missing field
@@ -83,12 +73,21 @@ fn group_key(id_expr: &Bson, d: &Document, vars: &Document) -> R<Bson> {
         if spec.len() == 1 {
             let (k, e) = spec.iter().next().unwrap();
             if !k.starts_with('$') {
-                let v = expressions::evaluate_or_missing(d, e, vars)?;
-                return Ok(Bson::Document(bson::doc! { k.clone(): missing_as_null(v) }));
+                let v = key_value(e, d, vars)?;
+                return Ok(Bson::Document(bson::doc! { k.clone(): v }));
             }
         }
     }
-    eval(id_expr, d, vars).map(missing_as_null)
+    key_value(id_expr, d, vars)
+}
+
+/// A key expression's value: null when it is MISSING, and a real `undefined`
+/// as itself, a key of its own apart from null (RM-635).
+fn key_value(expr: &Bson, d: &Document, vars: &Document) -> R<Bson> {
+    Ok(match expressions::evaluate_field(d, expr, vars)? {
+        expressions::Field::Missing => Bson::Null,
+        expressions::Field::Value(v) => v,
+    })
 }
 
 /// Canonical, hashable group-key.
@@ -147,6 +146,9 @@ pub enum GKey {
     /// also meant the STANDALONE Rust server, which has no Python behind a
     /// defer, could not group a NaN at all.
     Nan,
+    /// A BSON `undefined`: a key of its own, apart from null and MISSING
+    /// (RM-635).
+    Undefined,
 }
 
 /// Canonicalise a key value, or `Err(Fallback::Defer)` for a type we don't bucket faithfully
@@ -195,7 +197,8 @@ pub fn gkey(v: &Bson) -> R<GKey> {
         Bson::Binary(b) => Ok(GKey::Binary(b.subtype.into(), b.bytes.clone())),
         Bson::RegularExpression(r) => Ok(GKey::Regex(r.pattern.clone(), r.options.clone())),
         Bson::JavaScriptCode(c) => Ok(GKey::Code(c.clone())),
-        // Undefined / DbPointer / Symbol / CodeWithScope remain unbucketed --
+        Bson::Undefined => Ok(GKey::Undefined),
+        // DbPointer / Symbol / CodeWithScope remain unbucketed --
         // nobody has measured them.
         _ => Err(Fallback::Defer),
     }
@@ -564,7 +567,14 @@ impl Capped {
     /// [`Capped::add`] of a value the classic engine counts at `size`.
     pub(crate) fn add_sized(&mut self, v: Bson, size: usize) -> R<()> {
         for existing in self.items.iter() {
-            if expressions::py_eq(&v, existing).map_err(|_| Fallback::Defer)? {
+            // A BSON `undefined` is its own value: equal to another one and
+            // to nothing else, null included (RM-635).
+            let same = if matches!(v, Bson::Undefined) || matches!(existing, Bson::Undefined) {
+                matches!((&v, existing), (Bson::Undefined, Bson::Undefined))
+            } else {
+                expressions::py_eq(&v, existing).map_err(|_| Fallback::Defer)?
+            };
+            if same {
                 return Ok(());
             }
         }
@@ -929,10 +939,10 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
             if slot.is_none() {
                 // `if field not in bucket` — set once (even to null or
                 // missing).
-                *slot = Some(eval_or_missing(arg, doc, vars)?.map(missing_as_null));
+                *slot = Some(eval_or_missing(arg, doc, vars)?);
             }
         }
-        Acc::Last(slot) => *slot = Some(eval_or_missing(arg, doc, vars)?.map(missing_as_null)),
+        Acc::Last(slot) => *slot = Some(eval_or_missing(arg, doc, vars)?),
         Acc::Push(list) => {
             if let Some(v) = eval_or_missing(arg, doc, vars)? {
                 let size = crate::docstore::produced_size(arg, &v);
@@ -1654,7 +1664,8 @@ pub(crate) fn std_dev(values: &[f64], pop: bool) -> Option<f64> {
 /// uses — bool > string > number > …). `None` defers only a genuinely
 /// unorderable pair (DBPointer, an unclassifiable Decimal128).
 pub(crate) fn update_extreme(cur: &mut Option<Bson>, v: Bson, want: Ordering) -> R<()> {
-    if is_null(&v) {
+    // Null, missing and `undefined` alike: mongod's `nullish`.
+    if is_null(&v) || matches!(v, Bson::Undefined) {
         return Ok(()); // null never updates and never "unsets"
     }
     match cur {
@@ -4150,6 +4161,38 @@ mod tests {
         assert_eq!(
             out[0].get("s"),
             Some(&Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)]))
+        );
+    }
+
+    #[test]
+    fn a_stored_undefined_is_a_key_of_its_own() {
+        // RM-635, mongod 8.2.11: undefined is neither null nor missing as a
+        // key, a key's array of one groups, and `$addToSet` keeps it apart
+        // from null.
+        let docs = vec![
+            doc! {"k": Bson::Undefined, "b": [Bson::Undefined]},
+            doc! {"k": Bson::Null, "b": [Bson::Null]},
+            doc! {},
+            doc! {"k": Bson::Undefined, "b": [Bson::Undefined]},
+        ];
+        let by_k = g(bson::bson!({"_id": "$k", "n": {"$sum": 1}}), docs.clone());
+        let n = |id: &Bson| {
+            by_k.iter()
+                .find(|d| d.get("_id") == Some(id))
+                .map(|d| d.get_i32("n").unwrap())
+        };
+        assert_eq!(by_k.len(), 2);
+        assert_eq!(n(&Bson::Undefined), Some(2));
+        assert_eq!(n(&Bson::Null), Some(2));
+        let by_b = g(bson::bson!({"_id": "$b"}), docs.clone());
+        assert_eq!(by_b.len(), 3); // [undefined], [null], missing (null)
+        let set = g(
+            bson::bson!({"_id": Bson::Null, "s": {"$addToSet": "$k"}}),
+            docs,
+        );
+        assert_eq!(
+            set[0].get("s"),
+            Some(&Bson::Array(vec![Bson::Undefined, Bson::Null]))
         );
     }
 
