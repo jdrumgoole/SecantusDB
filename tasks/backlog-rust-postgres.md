@@ -3051,6 +3051,13 @@ statement is VALUES-only and runs there as written. The gap test is in
       also asks that mongod see no `__sys_*` system-column fields, which
       today live inside the stored document (RP-069), so phase 6 must
       settle where they go.
+      Measured at storage-model phase 7 (2026-11-21, mongod 8.2.11): mongod
+      now opens the store `secantusd-pg` writes, initiates as a one-member
+      set (the store holds no `local.system.replset`) and reads the table
+      as a collection, but each document carries `__sys_xmin`, `__sys_cid`,
+      `__sys_xmax` and `__sys_ctid`; and the first `CREATE TABLE` of a store
+      adds four collections and four index tables, not one each (the
+      server's own catalog collections are made with it).
       Backlog-ID: RP-1074
       Verify: tests/backlog/test_rp_storage_model.py::test_a_table_is_its_own_collection_table, tests/backlog/test_rp_storage_model.py::test_mongod_reads_a_table_the_sql_server_wrote
 - [ ] **`pg_relation_filepath` of a system catalog is NULL.** PostgreSQL

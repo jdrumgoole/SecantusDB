@@ -15,7 +15,7 @@
 use std::cmp::Ordering;
 
 use bson::spec::BinarySubtype;
-use bson::{doc, Binary, Bson, Document};
+use bson::{Binary, Bson, Document};
 
 use crate::storage::{IndexEntry, IndexFrom, RecordId};
 use crate::CommandError;
@@ -664,26 +664,9 @@ pub(crate) fn view_definitions(
         let options = storage
             .get_collection_options(db, &name)
             .map_err(crate::util::command_error)?;
-        let mut entry = doc! { "_id": format!("{db}.{name}") };
-        if let Ok(view_on) = options.get_str("viewOn") {
-            entry.insert("viewOn", view_on);
-            entry.insert(
-                "pipeline",
-                options
-                    .get_array("viewPipeline")
-                    .cloned()
-                    .unwrap_or_default(),
-            );
-            if let Ok(collation) = options.get_document("collation") {
-                entry.insert("collation", collation.clone());
-            }
-        } else if let Ok(ts) = options.get_document("timeseries") {
-            entry.insert("viewOn", format!("{BUCKETS_PREFIX}{name}"));
-            entry.insert("pipeline", vec![unpack_stage(ts)]);
-        } else {
-            continue;
+        if let Some(entry) = secantus_core::viewdefs::view_definition(db, &name, &options) {
+            out.push(entry);
         }
-        out.push(entry);
     }
     Ok(out)
 }
@@ -691,44 +674,12 @@ pub(crate) fn view_definitions(
 /// The stage `mongod`'s view of a time-series collection with the options
 /// `ts` unpacks its buckets with.
 pub(crate) fn unpack_stage(ts: &Document) -> Document {
-    let mut unpack = Document::new();
-    for field in ["timeField", "metaField", "bucketMaxSpanSeconds"] {
-        if let Some(v) = ts.get(field) {
-            unpack.insert(field, v.clone());
-        }
-    }
-    doc! { "$_internalUnpackBucket": unpack }
+    secantus_core::viewdefs::unpack_stage(ts)
 }
 
 /// The validator `mongod` gives `system.buckets.<name>`.
 pub(crate) fn validator(time: &str) -> Document {
-    let bound = doc! {
-        "bsonType": "object",
-        "required": [time],
-        "properties": { time: { "bsonType": "date" } },
-    };
-    doc! { "$jsonSchema": {
-        "bsonType": "object",
-        "required": ["_id", "control", "data"],
-        "properties": {
-            "_id": { "bsonType": "objectId" },
-            "control": {
-                "bsonType": "object",
-                "required": ["version", "min", "max"],
-                "properties": {
-                    "version": { "bsonType": "number" },
-                    "min": bound.clone(),
-                    "max": bound,
-                    "closed": { "bsonType": "bool" },
-                    "count": { "bsonType": "number", "minimum": 1 },
-                },
-                "additionalProperties": false,
-            },
-            "data": { "bsonType": "object" },
-            "meta": {},
-        },
-        "additionalProperties": false,
-    } }
+    secantus_core::viewdefs::buckets_validator(time)
 }
 
 /// An index key on the collection as `mongod` keeps it on the buckets: the
@@ -796,6 +747,7 @@ pub(crate) fn measurement_key(key: &Document, layout: &Layout) -> Option<Documen
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bson::doc;
 
     fn layout() -> Layout {
         Layout::of(&doc! {"timeseries": {"timeField": "t", "metaField": "m",

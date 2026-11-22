@@ -343,9 +343,12 @@ fn equality(v: &Bson, desc: bool) -> Option<(Vec<Stretch>, bool)> {
             // The whole array, and (as mongod bounds it) its first element:
             // `{"p.q": [1, 2]}` can match an array the path makes from
             // `{p: [{q: 1}, {q: 2}]}`, whose entries are 1 and 2.
+            // An empty array's entry is `undefined` (mongod's key for one),
+            // which its bounds name in the place of a first element.
             let mut out = vec![Stretch::point(key(v)?)];
-            if let Some(first) = items.first() {
-                out.push(Stretch::point(key(first)?));
+            match items.first() {
+                Some(first) => out.push(Stretch::point(key(first)?)),
+                None => out.push(Stretch::point(key(&Bson::Undefined)?)),
             }
             Some((out, false))
         }

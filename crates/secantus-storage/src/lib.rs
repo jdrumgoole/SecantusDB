@@ -1088,6 +1088,13 @@ fn record_index_ident(
         }
     }
     let Some(mut p) = mdb_catalog::read_placement(session, db, coll)? else {
+        // A time-series collection is a view over its buckets, as on mongod:
+        // it has no table, so an index listed on it has none either (its
+        // entries are the buckets' index's). The table made for it goes.
+        if coll_options(session, db, coll)?.is_some_and(|o| defines_view(&o)) {
+            store.drop_pending.lock().push(ident.to_string());
+            return Ok(());
+        }
         return Err(StorageError::Internal(format!(
             "{db}.{coll} has no placement to record index {name} in"
         )));
@@ -3500,25 +3507,6 @@ fn index_key_collation(opts: &Document) -> Option<Collation> {
     secantus_core::collation::parse(opts.get_document("collation").ok()?)
 }
 
-/// Whether an index entry's key is a whole-array key rather than an element key.
-///
-/// The first byte of an entry's KeyString is the type byte of its first
-/// value. A descending column is encoded byte-inverted, so it arrives as
-/// `!ctype`.
-fn is_whole_array_key(key: &[u8], idx_dir: i32) -> bool {
-    match key.first() {
-        None => false,
-        Some(&first) => {
-            let expected = if idx_dir >= 0 {
-                keystring::ctype::ARRAY
-            } else {
-                !keystring::ctype::ARRAY
-            };
-            first == expected
-        }
-    }
-}
-
 /// Join compound key parts with `COMPOUND_SEP` between components (mirrors
 /// Python's `COMPOUND_SEP.join(parts)`).
 fn compound_join(parts: &[Vec<u8>]) -> Vec<u8> {
@@ -3536,13 +3524,13 @@ fn compound_join(parts: &[Vec<u8>]) -> Vec<u8> {
 /// the index multikey: mongod's keys (`secantus_core::index_keys`: an array
 /// leaf's elements, `undefined` for an empty one, null for an element on the
 /// way that does not reach the leaf unless the index is `sparse`, null for a
-/// missing path) *plus* each whole leaf array, the key a whole-array
-/// equality probes (entry format 6).
+/// missing path), and nothing else: mongod's `validate` counts any other
+/// entry as an extra key (storage-model phase 7, which dropped the
+/// whole-array key this store also wrote; an equality on an array probes the
+/// array and its first element, as mongod's bounds do).
 fn index_field_values(doc: &Document, field: &str, sparse: bool) -> (Vec<Bson>, bool) {
     let keys = secantus_core::index_keys::field_keys(doc, field, sparse);
-    let mut out = keys.mongod;
-    out.extend(keys.whole_arrays);
-    (out, keys.multikey)
+    (keys.mongod, keys.multikey)
 }
 
 /// `has_path` that descends into arrays — the sparse-index gate. A sparse index
@@ -7037,6 +7025,10 @@ fn now_secs() -> i64 {
     now_millis() / 1000
 }
 
+/// The feature compatibility version a new store is initiated at: mongod
+/// 8.2.11's on a new data directory.
+const FCV_AT_INITIATION: &str = "8.2";
+
 /// How far back a read at a past timestamp can reach: mongod's
 /// `minSnapshotHistoryWindowInSeconds` default.
 const SNAPSHOT_HISTORY_SECONDS: i64 = 300;
@@ -7608,8 +7600,11 @@ impl Storage {
             if let Err(e) = self.stable_checkpoint() {
                 fail("the stable checkpoint", e);
             }
-        } else if let Err(e) = self.refresh_oplog_truncate_after_point() {
-            fail("moving the oplog truncate-after point", e);
+        }
+        // A clean stop leaves no oplog hole: mongod clears the point here,
+        // before its final checkpoint, and so does this close.
+        if let Err(e) = self.clear_oplog_truncate_after_point() {
+            fail("clearing the oplog truncate-after point", e);
         }
         match self.conn.open_session() {
             Ok(session) => {
@@ -7994,6 +7989,11 @@ impl Storage {
         // rewrite index rows.
         if !storage.in_memory {
             storage.resync_catalog()?;
+        }
+        // Each database's `system.views` from the registry, which a crash
+        // between a view's DDL and its document can leave behind.
+        for db in storage.list_databases()? {
+            storage.sync_system_views(&db)?;
         }
         storage.load_user_write_block()?;
         // Index builds a crash or shutdown interrupted run again from the
@@ -9869,6 +9869,24 @@ impl Storage {
             "system.rollback.id",
             bson::doc! {"_id": "rollbackId", "rollbackId": 1_i32},
         )?;
+        // The feature compatibility version, which mongod writes as it starts
+        // on a new store, before it initiates the set: its first stable
+        // checkpoint holds it, and mongod reads it before it replays the
+        // oplog. A store whose checkpoint lacks it (this server wrote it
+        // after its first checkpoint, and was killed before the next) is
+        // one mongod 8.2.11 refuses: "missing featureCompatibilityVersion
+        // document", fassert 40652 (measured, storage-model phase 7).
+        let fcv = Bson::String("featureCompatibilityVersion".into());
+        if self.find_by_id("admin", "system.version", &fcv)?.is_none() {
+            let doc = bson::doc! {"_id": fcv, "version": FCV_AT_INITIATION};
+            let (_, errors) =
+                self.insert("admin", "system.version", vec![encode_doc(&doc)?], true)?;
+            if let Some(e) = errors.first() {
+                return Err(StorageError::Internal(format!(
+                    "writing the feature compatibility version: {e}"
+                )));
+            }
+        }
         drop(unlogged);
         // `config.system.indexBuilds` is there from the start, as mongod's,
         // and its creation is an oplog entry, as mongod's is.
@@ -9923,19 +9941,125 @@ impl Storage {
         Ok(mdb_catalog::read_placement(&session, "local", "system.rollback.id")?.is_none())
     }
 
-    /// Move `local.replset.oplogTruncateAfterPoint` to the all-committed
-    /// point, where mongod's journal flusher keeps it: every entry at or
-    /// below it is whole. Moved here with each stable checkpoint and at
-    /// close, not every 100 ms.
-    fn refresh_oplog_truncate_after_point(&self) -> Result<()> {
-        if self.in_memory || !self.collection_exists("local", "replset.oplogTruncateAfterPoint")? {
+    /// After a view's or a time-series collection's DDL: its database's
+    /// `system.views` says what the registry says, and a time-series
+    /// collection's buckets have mongod's catalog options.
+    fn after_view_ddl(&self, db: &str, coll: &str) -> Result<()> {
+        self.sync_system_views(db)?;
+        let buckets = format!("{}{coll}", secantus_core::viewdefs::BUCKETS_PREFIX);
+        if self.collection_exists(db, &buckets)? {
+            self.catalog_write(|session| sync_catalog_entry(session, db, &buckets))?;
+        }
+        Ok(())
+    }
+
+    /// Bring `<db>.system.views` in line with the registry: one document per
+    /// view and per time-series collection, as mongod 8.2.11 keeps them
+    /// (`secantus_core::viewdefs`), inserted, replaced or deleted by `_id`.
+    /// mongod writes these as the view's DDL; here they follow it, without
+    /// an oplog entry of their own (the DDL's entry is the one this server
+    /// logs), and are brought in line again at every open, so a crash
+    /// between the two leaves nothing a reopen does not mend. The
+    /// collection is made with the first view and stays when the last goes,
+    /// as mongod's does.
+    pub(crate) fn sync_system_views(&self, db: &str) -> Result<()> {
+        let mut want: Vec<Document> = Vec::new();
+        {
+            let session = self.conn.open_session()?;
+            for name in self.list_collections(db)? {
+                if let Some(opts) = coll_options(&session, db, &name)? {
+                    if let Some(def) = secantus_core::viewdefs::view_definition(db, &name, &opts) {
+                        want.push(def);
+                    }
+                }
+            }
+        }
+        let views = secantus_core::viewdefs::SYSTEM_VIEWS;
+        let have: Vec<Document> = if self.collection_exists(db, views)? {
+            self.find_matching(db, views, &Document::new())?
+                .iter()
+                .map(|b| decode_doc(b))
+                .collect::<Result<_>>()?
+        } else {
+            Vec::new()
+        };
+        if want.is_empty() && have.is_empty() {
             return Ok(());
         }
         let _unlogged = unreplicated();
+        for doc in &have {
+            let id = doc.get("_id").cloned().unwrap_or(Bson::Null);
+            if !want.iter().any(|w| w.get("_id") == Some(&id)) {
+                self.delete_matching(
+                    db,
+                    views,
+                    &bson::doc! {"_id": id},
+                    1,
+                    &Document::new(),
+                    None,
+                )?;
+            }
+        }
+        let mut missing = Vec::new();
+        for def in want {
+            let id = def.get("_id").cloned().unwrap_or(Bson::Null);
+            match have.iter().find(|h| h.get("_id") == Some(&id)) {
+                Some(h) if *h == def => {}
+                Some(_) => {
+                    self.update_matching(
+                        db,
+                        views,
+                        &bson::doc! {"_id": id},
+                        &def,
+                        false,
+                        false,
+                        &[],
+                        &Document::new(),
+                        None,
+                        None,
+                        false,
+                    )?;
+                }
+                None => missing.push(encode_doc(&def)?),
+            }
+        }
+        if !missing.is_empty() {
+            let (_, errors) = self.insert(db, views, missing, true)?;
+            if let Some(e) = errors.first() {
+                return Err(StorageError::Internal(format!("writing {db}.{views}: {e}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Move `local.replset.oplogTruncateAfterPoint` to the all-committed
+    /// point, where mongod's journal flusher keeps it: every entry at or
+    /// below it is whole. Moved here with each stable checkpoint, not every
+    /// 100 ms.
+    fn refresh_oplog_truncate_after_point(&self) -> Result<()> {
         let at = {
             let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
             Self::all_committed_ts_locked(&st)
         };
+        self.write_oplog_truncate_after_point(at)
+    }
+
+    /// Clear `local.replset.oplogTruncateAfterPoint` (`Timestamp(0, 0)`), as
+    /// mongod 8.2.11 does when it stops cleanly (measured: the row a clean
+    /// stop leaves is `Timestamp(0, 0)`), so the next open has no oplog
+    /// hole to truncate. A point left set by a clean close sent mongod
+    /// down its truncation path, which moves the stable and oldest
+    /// timestamps back with `force` and then aborted the server on its next
+    /// `oldest_timestamp` (storage-model phase 7).
+    fn clear_oplog_truncate_after_point(&self) -> Result<()> {
+        self.write_oplog_truncate_after_point(0)
+    }
+
+    fn write_oplog_truncate_after_point(&self, at: u64) -> Result<()> {
+        if self.in_memory || !self.collection_exists("local", "replset.oplogTruncateAfterPoint")? {
+            return Ok(());
+        }
+        let _unlogged = unreplicated();
         self.update_matching(
             "local",
             "replset.oplogTruncateAfterPoint",
@@ -10605,6 +10729,24 @@ impl Storage {
     /// describes what the command said, not every option the server wrote
     /// out with it.
     pub fn coll_mod_recording(
+        &self,
+        db: &str,
+        coll: &str,
+        opts: &Document,
+        given: &Document,
+    ) -> Result<()> {
+        self.coll_mod_recording_inner(db, coll, opts, given)?;
+        let defined = {
+            let session = self.conn.open_session()?;
+            coll_options(&session, db, coll)?.is_some_and(|o| defines_view(&o))
+        };
+        if defined {
+            self.after_view_ddl(db, coll)?;
+        }
+        Ok(())
+    }
+
+    fn coll_mod_recording_inner(
         &self,
         db: &str,
         coll: &str,
@@ -13695,7 +13837,13 @@ impl Storage {
                     // and a capped collection's evictions -- so whether one
                     // is a `local` entry is its namespace's answer. A
                     // namespace that could hold one is read entry by entry.
-                    let any_local = (!ns_may_hold_local_entry(&ns)).then_some(false);
+                    // An unreplicated write (`unreplicated()`) is read
+                    // entry by entry too, whatever its namespace: the FCV
+                    // document a new store is initiated with, a view's
+                    // `system.views` document.
+                    let any_local = (!ns_may_hold_local_entry(&ns)
+                        && !UNREPLICATED.with(std::cell::Cell::get))
+                    .then_some(false);
                     self.emit_oplog_entries_of(&session, oplog_entries, pre_images, any_local)?;
                 }
                 // A retryable insert checks for interrupt before its batch
@@ -14386,6 +14534,19 @@ impl Storage {
         coll: &str,
         options: &Document,
     ) -> Result<bool> {
+        let created = self.create_collection_with_options_inner(db, coll, options)?;
+        if created && defines_view(options) {
+            self.after_view_ddl(db, coll)?;
+        }
+        Ok(created)
+    }
+
+    fn create_collection_with_options_inner(
+        &self,
+        db: &str,
+        coll: &str,
+        options: &Document,
+    ) -> Result<bool> {
         // Planner writes made here are released once they are visible.
         let _planner = PlannerScope::new();
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -14419,12 +14580,13 @@ impl Storage {
                         current.insert(k.clone(), v.clone());
                     }
                     write_coll_options(&session, db, coll, &current)?;
-                    // A time-series collection keeps measurements that repeat
-                    // an `_id`, so it has no `_id` index to hold them
-                    // unique (`is_timeseries`).
-                    if options.contains_key("timeseries") {
-                        self.unplace_index(&session, db, coll, ID_INDEX_NAME)?;
-                        sync_catalog_entry(&session, db, coll)?;
+                    // A view, and a time-series collection (mongod's view
+                    // over its buckets), is a document of its database's
+                    // `system.views`, not a collection: no table and no
+                    // `_mdb_catalog` row (measured 8.2.11). The registry
+                    // keeps its row; `after_view_ddl` writes the document.
+                    if defines_view(options) {
+                        self.unplace_collection(&session, db, coll)?;
                     }
                 }
                 if self.enable_oplog {
@@ -14444,6 +14606,18 @@ impl Storage {
     /// its registry row. Returns whether it existed. Emits an `op: "c"` `drop`
     /// oplog entry when it existed. Mirrors `storage.drop_collection`.
     pub fn drop_collection(&self, db: &str, coll: &str) -> Result<bool> {
+        let defined = {
+            let session = self.conn.open_session()?;
+            coll_options(&session, db, coll)?.is_some_and(|o| defines_view(&o))
+        };
+        let existed = self.drop_collection_inner(db, coll)?;
+        if existed && defined {
+            self.after_view_ddl(db, coll)?;
+        }
+        Ok(existed)
+    }
+
+    fn drop_collection_inner(&self, db: &str, coll: &str) -> Result<bool> {
         // An index build over it is aborted first, as mongod's drop does
         // (RM-187); the command layer asks before taking its locks, with
         // the same cause, so this only finds builds a caller below it left.
@@ -16257,6 +16431,7 @@ impl Storage {
             // One doc-table walk: gate by the partial filter, detect multikey,
             // probe uniqueness on the canonical key, build all entry-key variants.
             let mut multikey = false;
+            let mut paths: Vec<Vec<String>> = vec![Vec::new(); key_spec.len()];
             // Entries carry the doc's RecordId (step 2), which `scan_docs`
             // already hands us — no `id_key -> RecordId` lookup needed here.
             let mut entries: Vec<EntryKey> = Vec::new();
@@ -16278,8 +16453,14 @@ impl Storage {
                         continue;
                     }
                 }
-                if !multikey && doc_makes_multikey(&d, key_spec) {
+                if doc_makes_multikey(&d, key_spec) {
                     multikey = true;
+                    // The array components the catalog's `multikeyPaths`
+                    // records, as a write that makes the index multikey
+                    // records them (`maybe_mark_multikey`).
+                    for (field, parts) in key_spec.keys().zip(paths.iter_mut()) {
+                        array_components(&d, field, parts);
+                    }
                 }
                 for (kb, values) in with_bindata_order(build_order, || {
                     index_key_values_c(&d, key_spec, sparse, key_coll.as_ref())
@@ -16309,6 +16490,15 @@ impl Storage {
             }
             if multikey {
                 stored_options.insert("multikey", Bson::Boolean(true));
+                let mut recorded = Document::new();
+                for (field, mut parts) in key_spec.keys().zip(paths) {
+                    parts.sort();
+                    recorded.insert(
+                        field.clone(),
+                        Bson::Array(parts.into_iter().map(Bson::String).collect()),
+                    );
+                }
+                stored_options.insert(MULTIKEY_PATHS, recorded);
             }
             entries
         };
@@ -19516,7 +19706,6 @@ impl Storage {
                             coll,
                             &idx_name,
                             sort_dir != idx_dir,
-                            idx_dir,
                         )?
                     }
                     None => self.scan_blobs_natural(&session, db, coll)?,
@@ -19526,7 +19715,7 @@ impl Storage {
                 match self.compound_index_for_sort(&session, db, coll, &multi, filter)? {
                     Some((idx_name, reverse)) => {
                         in_sort_order = true;
-                        self.walk_index_in_order(&session, db, coll, &idx_name, reverse, 1)?
+                        self.walk_index_in_order(&session, db, coll, &idx_name, reverse)?
                     }
                     None => self.scan_blobs_natural(&session, db, coll)?,
                 }
@@ -22758,7 +22947,7 @@ impl Storage {
                         return Ok((docs, in_order));
                     }
                 }
-                let mut docs = self.walk_index_in_order(session, db, coll, name, false, 1)?;
+                let mut docs = self.walk_index_in_order(session, db, coll, name, false)?;
                 // The entries order a document / array key by its raw BSON
                 // bytes (see `SortPart`), not by value, so a hinted walk over
                 // such keys came back in a different order from mongod's
@@ -22858,7 +23047,6 @@ impl Storage {
         coll: &str,
         name: &str,
         reverse: bool,
-        idx_dir: i32,
     ) -> Result<Vec<Vec<u8>>> {
         let cur = match open_index_cursor(session, db, coll, name, None) {
             Ok(c) => c,
@@ -22872,19 +23060,10 @@ impl Storage {
                 return Err(StorageError::MaxTimeExpired);
             }
             let key = cur.get_key_u()?;
-            // Skip WHOLE-ARRAY entries. A multikey index writes one entry per
-            // element plus one for the whole array, and the whole-array key sorts
-            // in the Array slot — after every scalar. Walking backward hits those
-            // first, and the first-occurrence dedup in `docs_by_recordids` then
-            // picks documents by their whole-array key instead of by their maximum
-            // element, which is what mongod orders by. Ascending never showed it:
-            // element entries come first there. This walk is used only for
-            // ordering; whole-array equality lookups take a different path and
-            // still need those entries. Mirrors `storage.py::_is_whole_array_key`.
+            // Every entry is one of mongod's keys (a nested array element
+            // included), so every one counts toward the order.
             if let Some(rid) = ixkeys::entry_rid(&key, is_clustered(session, db, coll)?) {
-                if !is_whole_array_key(&key, idx_dir) {
-                    recordids.push(rid);
-                }
+                recordids.push(rid);
             }
         }
         // A descending column keys a string (JavaScript, regex) by its
@@ -23743,6 +23922,61 @@ impl Storage {
     /// (`prefix=true`). Mirrors `storage._scan_index_for_id_keys`.
     #[allow(clippy::too_many_arguments)]
     fn scan_index_for_id_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        shape: &KeyShape,
+        values: &[Bson],
+        prefix: bool,
+    ) -> Result<Vec<RecordId>> {
+        // An array value is held by mongod's keys as its elements (an empty
+        // one as `undefined`), and by an element that is itself that array:
+        // the entries equal to it are those of the array and of its first
+        // element (or `undefined`), the points mongod's bounds name. Each
+        // combination is read in turn, the RecordIds kept once.
+        if values.iter().any(|v| matches!(v, Bson::Array(_))) {
+            let mut probes: Vec<Vec<Bson>> = vec![Vec::new()];
+            for v in values {
+                let alternatives = match v {
+                    Bson::Array(items) => {
+                        vec![v.clone(), items.first().cloned().unwrap_or(Bson::Undefined)]
+                    }
+                    other => vec![other.clone()],
+                };
+                probes = probes
+                    .into_iter()
+                    .flat_map(|p| {
+                        alternatives.iter().map(move |a| {
+                            let mut p = p.clone();
+                            p.push(a.clone());
+                            p
+                        })
+                    })
+                    .collect();
+            }
+            let mut seen: HashSet<RecordId> = HashSet::new();
+            let mut out = Vec::new();
+            for probe in probes {
+                for rid in
+                    self.scan_index_holding(session, db, coll, name, shape, &probe, prefix)?
+                {
+                    if seen.insert(rid.clone()) {
+                        out.push(rid);
+                    }
+                }
+            }
+            note_unordered();
+            return Ok(out);
+        }
+        self.scan_index_holding(session, db, coll, name, shape, values, prefix)
+    }
+
+    /// [`Self::scan_index_for_id_keys`] of `values` as they are, an array
+    /// included: the entries keyed by exactly those values.
+    #[allow(clippy::too_many_arguments)]
+    fn scan_index_holding(
         &self,
         session: &Session,
         db: &str,
@@ -24655,7 +24889,7 @@ fn sync_catalog_entry(session: &Session, db: &str, coll: &str) -> Result<()> {
             spec: bson::doc! {"v": 2i32, "key": id_key.clone(), "name": ID_INDEX_NAME},
             ready: true,
             multikey: false,
-            multikey_paths: mdb_catalog::multikey_paths(&id_key, &[]),
+            multikey_paths: Some(mdb_catalog::multikey_paths(&id_key, &[])),
         });
     }
     let mut rows = Vec::new();
@@ -24698,11 +24932,24 @@ fn sync_catalog_entry(session: &Session, db: &str, coll: &str) -> Result<()> {
                 components.push((field.clone(), prefix.split('.').count() - 1));
             }
         }
+        // mongod tracks no paths for a `2d`, `hashed`, text or wildcard
+        // index, and keeps a `2d`, hashed or wildcard index's flag false (a
+        // wildcard index records multikey paths in its own entries); this
+        // store's flag on a `2d` index only steers its planner (measured
+        // 8.2.11, phase 0b).
+        let pathless = key.iter().any(|(field, kind)| {
+            field.ends_with("$**") || matches!(kind.as_str(), Some("2d" | "hashed" | "text"))
+        });
+        let text = key.values().any(|kind| kind.as_str() == Some("text"));
         indexes.push(mdb_catalog::CatalogIndex {
             spec,
             ready: true,
-            multikey: opts.get_bool("multikey").unwrap_or(false),
-            multikey_paths: mdb_catalog::multikey_paths(&key, &components),
+            multikey: if pathless {
+                text
+            } else {
+                opts.get_bool("multikey").unwrap_or(false)
+            },
+            multikey_paths: (!pathless).then(|| mdb_catalog::multikey_paths(&key, &components)),
         });
     }
     // Each secondary index's table, in the order the indexes are listed.
@@ -24713,13 +24960,29 @@ fn sync_catalog_entry(session: &Session, db: &str, coll: &str) -> Result<()> {
             Some((name.to_string(), placement.indexes.get(name)?.clone()))
         })
         .collect();
-    let entry = mdb_catalog::entry_doc(
+    // A time-series collection's buckets: the catalog options mongod keeps
+    // for them, from the collection's own (measured 8.2.11), and the md flag
+    // it writes for every buckets collection it creates.
+    let ts_options = match coll.strip_prefix(secantus_core::viewdefs::BUCKETS_PREFIX) {
+        Some(name) => coll_options(session, db, name)?,
+        None => None,
+    };
+    let buckets_options = ts_options
+        .as_ref()
+        .and_then(|ts| secantus_core::viewdefs::buckets_catalog_options(&options, ts));
+    let is_buckets = buckets_options.is_some();
+    let mut entry = mdb_catalog::entry_doc(
         &format!("{db}.{coll}"),
-        options,
+        buckets_options.unwrap_or(options),
         &indexes,
         &placement.ident,
         &idx_idents,
     );
+    if is_buckets {
+        if let Ok(md) = entry.get_document_mut("md") {
+            md.insert("timeseriesBucketsMayHaveMixedSchemaData", false);
+        }
+    }
     // A row that already says this is left alone: no write, no conflict.
     if mdb_catalog::read_entry(session, placement.catalog_id)?.as_ref() == Some(&entry) {
         return Ok(());
@@ -28965,8 +29228,7 @@ mod tests {
     #[test]
     fn variants_hold_mongods_undefined_and_null_keys() {
         let v = index_key_variants(&doc! {"t": []}, &doc! {"t": 1}, false).unwrap();
-        assert!(v.contains(&ev(&Bson::Undefined)));
-        assert!(v.contains(&ev(&Bson::Array(vec![]))));
+        assert_eq!(v, vec![ev(&Bson::Undefined)]);
         let d = doc! {"a": [{"c": 1}, {"b": 3}]};
         let v = index_key_variants(&d, &doc! {"a.b": 1}, false).unwrap();
         assert_eq!(v.len(), 2);
@@ -28982,19 +29244,14 @@ mod tests {
     }
 
     #[test]
-    fn variants_array_multikey_per_element_plus_whole() {
+    fn variants_array_multikey_per_element_only() {
+        // mongod's keys only (storage-model phase 7): "py" deduped, then "go";
+        // no whole-array key, which mongod's `validate` counts as extra.
         let d = doc! {"tags": ["py", "go", "py"]};
         let v = index_key_variants(&d, &doc! {"tags": 1}, false).unwrap();
-        // "py" deduped: element keys py, go, plus the whole-array key = 3.
-        assert_eq!(v.len(), 3);
+        assert_eq!(v.len(), 2);
         assert!(v.contains(&ev(&Bson::String("py".into()))));
         assert!(v.contains(&ev(&Bson::String("go".into()))));
-        let whole = ev(&Bson::Array(vec![
-            Bson::String("py".into()),
-            Bson::String("go".into()),
-            Bson::String("py".into()),
-        ]));
-        assert!(v.contains(&whole));
     }
 
     #[test]
@@ -29010,11 +29267,10 @@ mod tests {
 
     #[test]
     fn variants_compound_array_cartesian_product() {
-        // a = [1, 2] (array), b = 9: products (1,9), (2,9), plus the whole-array
-        // (([1,2]),9) combo = 3 distinct compound keys.
+        // a = [1, 2] (array), b = 9: products (1,9) and (2,9), mongod's keys.
         let d = doc! {"a": [1i32, 2i32], "b": 9i32};
         let v = index_key_variants(&d, &doc! {"a": 1, "b": 1}, false).unwrap();
-        assert_eq!(v.len(), 3);
+        assert_eq!(v.len(), 2);
         assert!(v.contains(&compound_join(&[ev(&Bson::Int32(1)), ev(&Bson::Int32(9))])));
         assert!(v.contains(&compound_join(&[ev(&Bson::Int32(2)), ev(&Bson::Int32(9))])));
     }

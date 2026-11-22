@@ -3049,22 +3049,26 @@ produce the dump it exists for.
 
 ## The storage model is not mongod's (tasks/mongod-storage-model-plan.md, 2026-11-19)
 
-- [ ] **A store is not one mongod can open, and mongod's stores are not ones
-      we can open.** Every collection shares 16 `secantus_documents_shN`
-      tables and every index one `secantus_index_entries` table, with our
-      own catalog and our own index-key bytes; mongod 8.2.11 keeps one
-      `collection-<UUID>` table per collection and one `index-<UUID>` table
-      per index in KeyString, under `_mdb_catalog`, `sizeStorer` and
-      `storage.bson` (the full layout:
-      `tests/fixtures/storage_model/mongod-8.2.11-layout.json`). Also, our
-      WiredTiger is built `WT_STANDALONE_BUILD=ON`, which stamps files
-      version 2.1; mongod refuses them outright. Decided (Joe, 2026-11-19):
-      move to mongod's model, both directions, with mongod started as a
-      replica-set member; the phases are in the plan, and the tests below
-      close one by one as they land (files and catalog: phases 1-2; one
-      table per collection and index: 3-4; both opens: 7).
+- [ ] **mongod's stores are not ones we can open.** Since storage-model
+      phase 7 (2026-11-21) mongod 8.2.11 opens a store `secantusd-mdb` wrote
+      (as the set's one member, under the store's set name and address),
+      becomes primary and validates every collection of phase 0b's scenario
+      (`test_mongod_opens_the_phase_0b_store`; the index kinds and the users
+      filed below excepted). The reverse is still refused, by name, at
+      `store_format::prepare`: `secantusd-mdb` on a store mongod wrote (it
+      has `storage.bson` and no `secantus.format`) exits with "written by
+      mongod ... not supported yet". What opening one needs (measured, plan
+      phase 7's "As built"): the registry, placements and index rows rebuilt
+      from `_mdb_catalog` and `system.views`; the refusals by name of a set
+      with more than one member, of an index kind this server does not key
+      as mongod does (`2d`, `2dsphere`, `hashed`, text, wildcard) and of a
+      catalog option it does not implement; users and roles read from
+      `admin.system.{users,roles}`; mongod's size storer without this
+      server's marker; and a killed mongod's store recovered by replaying
+      the oplog after the stable checkpoint. Decided (Joe, 2026-11-19): both
+      directions, with mongod started as a replica-set member.
       Backlog-ID: RM-723
-      Verify: tests/backlog/test_rm_storage_model.py::test_mongod_opens_a_secantus_store, tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_mongod_store
+      Verify: tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_mongod_store, tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_killed_mongod_store, tests/backlog/test_rm_storage_model.py::test_secantus_refuses_a_set_of_two_members_by_name, tests/backlog/test_rm_storage_model.py::test_secantus_refuses_an_index_kind_it_does_not_serve_by_name
 - [ ] **There is no `shutdown` command.** mongod 8.2.11 stops on
       `db.adminCommand({shutdown: 1})`: the connection closes and the
       process exits cleanly. `secantusd-mdb` answers CommandNotFound (59)
@@ -3073,6 +3077,77 @@ produce the dump it exists for.
       Found measuring phase 0c.
       Backlog-ID: RM-724
       Verify: tests/backlog/test_rm_storage_model.py::test_shutdown_command_stops_the_server
+
+## Found making mongod open our stores (storage-model phase 7, 2026-11-21)
+
+Each was measured by starting mongod 8.2.11 on a store `secantusd-mdb`
+wrote and stopped (the forward direction of RM-723).
+
+- [ ] **A `2d` index's keys are not mongod's.** mongod keys a point by its
+      GeoHash at the index's `bits` (x then y interleaved, in the high bits)
+      as BinData subtype 128, and keeps the index non-multikey with no
+      multikey paths; this server keys it by a cell of its own (y first, in
+      the low bits, BinData subtype 0), so mongod's `validate` on our store
+      reports every entry missing and an extra one each. The query side
+      (`try_geo_2d_id_keys`, `range_scan_cells`) reads the same cells, so a
+      fix moves both, using `secantus_core::geohash2d`'s converter.
+      Backlog-ID: RM-741
+      Verify: tests/backlog/test_rm_storage_model.py::test_mongod_validates_a_2d_index_secantus_wrote
+- [ ] **A `2dsphere` index's keys are not mongod's.** mongod (index version
+      3) keys a point by one S2 cell id as a NumberLong, and a shape by its
+      covering at mongod's levels; this server writes its own covering
+      (levels 4 to 16, 64 cells, every ancestor of each cell, BinData) and
+      always flags the index multikey, so mongod's `validate` reports the
+      entries missing and dozens extra. `secantus_core::s2legacy` is
+      mongod's coverer; the index and the query side both move to it.
+      Backlog-ID: RM-742
+      Verify: tests/backlog/test_rm_storage_model.py::test_mongod_validates_a_2dsphere_index_secantus_wrote
+- [ ] **A wildcard index's keys are not mongod's.** mongod keys a wildcard
+      index by `($_path, value)` for each leaf path under it; this server
+      writes one null entry per document, so mongod's `validate` reports
+      the entries missing and the nulls extra (its catalog entry is mongod's
+      since phase 7: non-multikey, no multikey paths, without which mongod's
+      planner tripped `multikeyPaths must be empty for Wildcard Indexes` on
+      any query of the collection).
+      Backlog-ID: RM-743
+      Verify: tests/backlog/test_rm_storage_model.py::test_mongod_validates_a_wildcard_index_secantus_wrote
+- [ ] **Users and roles are not in `admin.system.users` and
+      `admin.system.roles`.** This server keeps them in tables of its own
+      (`secantus_users`, `secantus_roles`, `secantus_role_seq`); mongod
+      opening our store finds neither, so a user made here cannot
+      authenticate there (and, in the reverse, mongod's would not be read).
+      Backlog-ID: RM-744
+      Verify: tests/backlog/test_rm_storage_model.py::test_mongod_finds_the_users_and_roles_secantus_made
+- [ ] **A view's DDL is logged as commands, not as mongod logs it.** mongod
+      8.2.11 logs creating a view as an insert into `<db>.system.views` (the
+      first one preceded by `create: "system.views"`), a `collMod` of it as
+      an update replacing the document and a drop as its delete; it logs no
+      command naming the view. This server logs `create` (carrying its
+      internal `viewPipeline` option and an `idIndex`), `collMod` (without
+      the pipeline) and `drop`, and writes the `system.views` document
+      unreplicated beside them. Change streams read those commands, so a fix
+      also derives their view events from the `system.views` writes, as
+      mongod's change stream does.
+      Backlog-ID: RM-745
+      Verify: tests/backlog/test_rm_storage_model.py::test_a_views_ddl_is_logged_as_mongod_logs_it
+- [ ] **After a crash, our checkpoint's recovery timestamp can be past the
+      oplog's last entry, and mongod aborts on such a store.** mongod's
+      stable timestamp is always an oplog entry's; this server's is its
+      all-committed point, which timestamps minted without an entry (a
+      cluster-time mint, a write with no entry of its own stamped by
+      `reserve_stamp`) move past the last entry. Killed, its store's
+      `oplogTruncateAfterPoint` and recovery timestamp are past the oplog's
+      end; mongod truncates, forces its stable and oldest timestamps back to
+      the last entry, keeps its own oldest from the checkpoint, and aborts
+      on the next `oldest_timestamp` (invariant in
+      `WiredTigerKVEngine::setOldestTimestamp`). A clean close is fine
+      (phase 7 clears the truncate point, as mongod's clean stop does).
+      **Decided (Joe, 2026-11-21): option A** -- every timestamped write to
+      an unlogged table gets an oplog entry at its timestamp (or becomes an
+      untimestamped write to a logged table), as mongod; the stable
+      timestamp is the newest committed entry.
+      Backlog-ID: RM-746
+      Verify: tests/backlog/test_rm_storage_model.py::test_mongod_opens_a_killed_secantus_store
 
 ## Found in CI on 2026-11-19
 

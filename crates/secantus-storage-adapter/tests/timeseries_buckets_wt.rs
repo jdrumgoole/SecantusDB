@@ -137,11 +137,14 @@ fn the_buckets_are_listed() {
         let listed = dispatch_full(&doc! {"listCollections": 1}, c);
         let entries = batch(&listed);
         let names: Vec<&str> = entries.iter().map(|e| e.get_str("name").unwrap()).collect();
+        // `system.views` is a stored collection since storage-model phase 7,
+        // listed where the catalog has it (mongod's order is the catalog's
+        // too, and no client can rely on it).
         assert_eq!(
             names,
-            vec!["plain", "w", "system.buckets.w", "system.views"]
+            vec!["plain", "system.views", "w", "system.buckets.w"]
         );
-        let buckets = &entries[2];
+        let buckets = &entries[3];
         assert_eq!(buckets.get_str("type").ok(), Some("collection"));
         let options = buckets.get_document("options").unwrap();
         assert_eq!(options.get_bool("clusteredIndex").ok(), Some(true));
@@ -217,8 +220,14 @@ fn the_buckets_take_no_document_by_hand() {
         assert_eq!(count.get_i32("n").ok(), Some(4));
         let dropped = dispatch(&doc! {"drop": "system.buckets.w"}, c);
         assert_eq!(dropped, doc! {"nIndexesWas": 1, "ok": 1.0});
+        // The collection's definition goes with it; `system.views` stays, as
+        // mongod 8.2.11 keeps it once its last view is gone (measured
+        // 2026-11-21: after every view and time-series collection was
+        // dropped, `listCollectionNames` was `["c", "system.views"]`).
         let listed = dispatch_full(&doc! {"listCollections": 1}, c);
-        assert!(batch(&listed).is_empty(), "{listed}");
+        let entries = batch(&listed);
+        let names: Vec<&str> = entries.iter().map(|e| e.get_str("name").unwrap()).collect();
+        assert_eq!(names, vec!["system.views"], "{listed}");
     });
 }
 
