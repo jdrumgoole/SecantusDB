@@ -21,14 +21,15 @@
 //!
 //! - COLLSCAN, either way;
 //! - IXSCAN of any plain index, either way: ascending and descending fields
-//!   (entry format 6 keeps a descending field in mongod's order), collated
-//!   ones (their entries hold the collation's sort keys, as mongod's do), the
-//!   `_id` index (`_id` key format 2 keeps every `_id` in mongod's order),
-//!   bounds or `min` / `max`. A multikey scan returns each
+//!   (an index table holds mongod's KeyString, which keeps a descending
+//!   field in mongod's order), collated ones (their entries hold the
+//!   collation's sort keys, as mongod's do), the `_id` index (every `_id` in
+//!   mongod's order), bounds or `min` / `max`. A multikey scan returns each
 //!   document once, remembering across batches what it returned, as mongod's
-//!   does; it passes over the whole-array keys this store writes besides
-//!   mongod's, which it tells from an element that is an array by the
-//!   document's own keys. A DISTINCT_SCAN is the same scan, one entry a run;
+//!   does. It still passes over an entry that is a whole array rather than
+//!   an element that is one, which it tells by the document's own keys;
+//!   an index holds mongod's keys only since format 9, so a store of this
+//!   format has none. A DISTINCT_SCAN is the same scan, one entry a run;
 //! - FETCH, which reads each document as it is now, and drops an entry held
 //!   over a yield whose document no longer has that key (mongod's
 //!   `isIndexKeyConsistent`);
@@ -509,8 +510,9 @@ impl IndexScan {
         }
     }
 
-    /// Whether the front entry is a key of mongod's: not a whole-array key
-    /// this store writes besides them. Only an array-ranked key in a
+    /// Whether the front entry is not a key of mongod's: a whole-array key
+    /// besides its elements', which an index of this store's format does not
+    /// hold (kept as a check, not a repair). Only an array-ranked key in a
     /// multikey index can be one; the document says.
     fn foreign(&self, cx: &Cx) -> Result<bool, StorageError> {
         if !self.meta.multikey {

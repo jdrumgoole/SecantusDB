@@ -43,21 +43,29 @@ expression evaluation, joins, aggregates and functions are its own.
 ## Storage
 
 Both servers share one storage format on WiredTiger, the same engine `mongod`
-ships:
+ships, laid out as `mongod` 8.2 lays it out (store format 10):
 
-- **Documents are opaque BSON blobs**, keyed by a byte-sortable encoding of
-  `_id` (so walking the table gives MongoDB's natural cross-type order).
-  Filtering, projection, sorting and updates happen in the engines after
-  decoding; the storage layer never inspects a document. Any lossy
-  intermediate form (JSON, native column types) would show a client the
-  difference for `ObjectId`, `Decimal128`, int32 versus int64, dates,
-  `Binary` and regexes.
-- **Secondary indexes are WiredTiger indexes over typed sort-key columns**
-  derived from BSON values, not JSON and not coerced numerics. The byte order
-  of the keys matches BSON's cross-type sort order, so numbers of different
-  types that compare equal collide and order correctly.
-- **The oplog and pre-image tables** back change streams and point-in-time
-  recovery.
+- **`_mdb_catalog` lists every collection and index with its ident.** Each
+  collection is a table of its own, keyed by RecordId (so walking it gives
+  insertion order), and each index is a table of its own, keyed by `mongod`'s
+  KeyString. Dropping or renaming a collection changes the catalog only.
+- **Documents are opaque BSON blobs.** Filtering, projection, sorting and
+  updates happen in the engines after decoding; the storage layer never
+  inspects a document. Any lossy intermediate form (JSON, native column
+  types) would show a client the difference for `ObjectId`, `Decimal128`,
+  int32 versus int64, dates, `Binary` and regexes.
+- **Index keys are KeyStrings**, whose byte order matches BSON's cross-type
+  sort order, so numbers of different types that compare equal collide and
+  order correctly.
+- **The oplog is `local.oplog.rs`, beside a pre-image table.** They back
+  change streams and point-in-time recovery. Sizes are kept in `sizeStorer`
+  and the write-ahead log is in `journal/`, with `storage.bson` naming the
+  engine, as in a `mongod` data directory.
+
+`mongod` 8.2 opens a store `secantusd-mdb` wrote, and `secantusd-mdb` opens a
+store `mongod` wrote (refusing by name what it cannot serve), as a hand-off
+and never at the same time. A store in an older SecantusDB layout is refused by
+name, with dump-and-restore advice.
 
 A data directory written by `secantusd-pg` opens in `secantusd-mdb` (a table
 reads back as a collection, with the `PRIMARY KEY` as `_id`), but not at the

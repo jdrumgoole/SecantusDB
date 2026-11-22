@@ -28,10 +28,17 @@ with a clean error rather than return a subtly different answer.
 
 ## Storage
 
-Documents are stored as opaque BSON blobs keyed by byte-sortable `_id`
-encodings, with secondary indexes over typed sort-key columns, a natural-order
-(insertion) index, and the oplog/pre-image tables that back change streams and
-point-in-time recovery.
+The store is `mongod` 8.2's own layout on WiredTiger (store format 10), so
+`mongod` opens a store this server wrote and this server opens one `mongod`
+wrote, as a hand-off and never at once. `_mdb_catalog` lists every collection
+and index with its ident; each collection is a table of its own, holding its
+documents as opaque BSON blobs keyed by RecordId (insertion order), and each
+index is a table of its own, keyed by `mongod`'s KeyString. The oplog is
+`local.oplog.rs`, with the pre-image table, and backs change streams and
+point-in-time recovery; sizes are kept in `sizeStorer`, and the log is in
+`journal/`. Dropping or renaming a collection changes the catalog only. A
+store in an older SecantusDB layout is refused by name, with dump-and-restore
+advice.
 
 ## Versioning
 

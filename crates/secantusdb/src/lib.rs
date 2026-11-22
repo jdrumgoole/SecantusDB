@@ -365,9 +365,9 @@ impl Builder {
         let storage = Arc::new(storage);
         let weak = Arc::downgrade(&storage);
         let adapter: Arc<dyn CmdStorage> = Arc::new(StorageAdapter::new(storage.clone()));
-        // A store whose time-series measurements predate stored buckets is
-        // converted before anyone is answered.
-        secantus_commands::upgrade_time_series(adapter.as_ref())
+        // A time-series collection whose bucket collection a kill left
+        // uncreated gets it before anyone is answered.
+        secantus_commands::create_missing_buckets(adapter.as_ref())
             .map_err(|e| Error::Storage(format!("{e:?}")))?;
         let config = ServerConfig {
             replica_set_name: self.replica_set.clone(),

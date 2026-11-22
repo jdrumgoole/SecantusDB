@@ -105,7 +105,7 @@ hit counts are word matches across `crates/secantus-storage/src`.
 | One shared `secantus_index_entries` table, key `(db, coll, index, entry)` (S:1619) | One table per index | `IDX_ENTRIES_TABLE` (33), `pack_entry` (S:3545) |
 | Uniqueness in `secantus_unique_keys` (S:1630) | The unique index table itself | `UNIQ_TABLE` (40) |
 | Index keys in our sort-key bytes (`secantus-core/src/sortkey.rs`) | KeyString (decision 4) | 89 `sortkey::` uses across `crates/`: 44 in S, 12 in `secantus-commands/src/explain/stream.rs`, 4 in `scan_bounds.rs`, the rest in `secantus-core` |
-| Catalog tables `secantus_collections`, `secantus_indexes`, tombstones (S:680-687, S:1618) | `_mdb_catalog` with idents | `COLL_TABLE` (29), `IDX_TABLE` (30) |
+| Catalog tables `secantus_collections`, `secantus_indexes`, tombstones (S:680-687, S:1618) | `_mdb_catalog` with idents, written beside the registry. **The two registry tables stay by design** (phases 2 and 3: "the registry stays the working set its transactional machinery (deferred creates, catalog generations) is built on; the catalog is what mongod reads"); the tombstones went in phase 8 | `COLL_TABLE` (29), `IDX_TABLE` (30) |
 | Chunked two-phase drop with tombstones (S:14597, S:14853) | WT drop plus a drop-pending ident reaper | drop and recovery code |
 | Rename rewrites every row (S:15012) | Catalog-only rename | rename paths |
 | `secantus_size_storer` keyed `(db, coll)` (sizes.rs:49) | `sizeStorer` keyed by ident | `sizes.rs` |
@@ -1292,6 +1292,59 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
    format markers this replaces; rewrite the layout tests below. Update
    CLAUDE.md's "One on-disk format" section, the `python-servers` skill's
    layout description, and the docs pages that describe the store.
+
+   **As built (phase 8, store format 10).** The legacy readers and markers
+   were already gone as each phase landed; what was left, found by an
+   inventory of the code and verified by reading it:
+   - **Drop and rename are catalog-only, as mongod's.** A drop is one
+     transaction: the collection's registry row, its index registry rows,
+     its placement and its `_mdb_catalog` row, and the drop's oplog entry;
+     the tables go to the drop-pending reaper once it commits. A rename is
+     one transaction: a replaced target's rows, the index registry rows
+     moved to the new name, the placement, the collection row, the catalog
+     row and the entry (it was four transactions, with a tombstone
+     bracketing the copy of rows that no longer moves). `secantus_drop_
+     tombstones`, `purge_dropped_collection` and `recover_pending_drops` are
+     gone: a kill after the commit leaves tables no placement names, which
+     `reconcile_idents` drops at the next open, and no registry row. Tests:
+     `a_kill_after_a_drop_commits_leaves_no_registry_row` and
+     `a_kill_after_a_rename_commits_leaves_no_registry_row`, which
+     SIGKILL a child after the journal holds the commit and before a
+     checkpoint lets the reaper run. A drop and its entry stay one commit at
+     the entry's timestamp (the registry rows were already written in the
+     entry's transaction). **Store format 10**: a format-9 store, with the
+     tombstone table, is refused by name like the earlier ones.
+   - **Removed, each unreachable by a store this build opens (format 10
+     only; the format check landed 2026-11-19):** `upgrade_time_series`
+     (a format-9 store cannot hold measurements as documents; what remains
+     is `create_missing_buckets`, because creating a time-series
+     collection and its bucket collection are two commits, so a kill between
+     them leaves one without the other); the `entryFormat`, `numberKeys`,
+     `pythonKeys` and `geoKeys` index-option filters, and the `geoKeys`
+     stamp (written, never read, and filtered from every `_mdb_catalog`
+     spec, so mongod never saw it); `sortkey`'s number-key and `_id`-key
+     format 1 (`with_number_key_format_1`, `with_id_key_format_1`,
+     `may_be_format1_id_key`, the `NUMBER_KEY_FORMAT` and `ID_KEY_FORMAT`
+     constants and the legacy document/array encoding; no caller outside
+     the file, and `secantus-core-py` exposes none of them); `backfill_user_
+     ids` (RM-031, 2026-10-20: every user this build creates has a
+     `userId`); the PostgreSQL server's `rekey_legacy_index_comment` and
+     name-keyed index comments (RP-923, 2026-11-13) and the page-map-less
+     large-object listing (2026-10-22).
+   - **Kept, though the inventory suggested removing them:** the PG heap's
+     handling of a row without a ctid (`heap::in_ctid_order`), because a
+     table written through the SQL-to-MongoDB hand-off and edited by
+     `secantusd-mdb` holds such rows and can return to SQL; the refusal
+     tests (`open_rejects_pre_recordid_doc_shard`, `store_format.rs`,
+     `zlib_must_remain_available_for_legacy_tables`); `collationKeys` and
+     `binDataOrder`, which are live; `PURGE_CHUNK_MAX_ROWS`, which index
+     builds and `repair` still use; `BinDataOrder::Format4`, which a
+     default-collation `_id` index still keys by.
+   - **Stale comments** describing shards, frames, `entryFormat` and the
+     shared tables now describe the format-10 layout, as do CLAUDE.md's
+     "One on-disk format" section, the `python-servers` skill (which now says
+     its layout is the deprecated Python servers' only) and the architecture,
+     indexes and concurrency pages.
 
 ## Ownership and parallel work
 

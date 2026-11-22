@@ -148,10 +148,8 @@ impl PgHandler {
             }))
     }
 
-    /// The object's record: its size and, for one this server has kept them
-    /// for, the length of each `LOBLKSIZE` page a write reached
-    /// (`pg_largeobject`'s rows). A record without the map is an older
-    /// store's.
+    /// The object's record: its size and the length of each `LOBLKSIZE` page
+    /// a write reached (`pg_largeobject`'s rows).
     fn lo_store_meta(
         &self,
         oid: i64,
@@ -170,7 +168,7 @@ impl PgHandler {
         self.lo_insert(LO_COLLECTION, doc)
     }
 
-    /// The page map (`None` for an older store's object, which has none).
+    /// The page map (`None` for a record that has none).
     pub(crate) fn lo_pages(
         &self,
         oid: i64,

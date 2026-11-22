@@ -155,7 +155,8 @@ Three different shapes, from one droplet run of three interleaved passes
     write path. Every sweep re-read the full value of every doomed row; it
     now scans keys only.
   - The oplog's 16-way shard split had outlived the append hotspot it was
-    built for. Writes now route across two append-tuned btrees.
+    built for. It is one append-tuned table now, `local.oplog.rs` as in
+    `mongod`.
 
   The flattening that remains between four and eight writers is
   **WiredTiger itself**: cache eviction and checkpoint pressure inside one
@@ -298,10 +299,10 @@ SecantusDB, the levers are:
    ceiling, because bigger uncompressed pages mean more eviction IO
    and IO volume, not CPU, is the constraint.
 
-The defaults already carry the measured winners: oplog writes route
-across two shard tables (sixteen existed to spread an append hotspot
-that the RecordId + prune work eliminated; the read side still scans
-all sixteen, so any store stays readable), and the oplog/preimage
+The defaults already carry the measured winners: the oplog is one table
+(`local.oplog.rs`, keyed by a RecordId from the entry's timestamp, as
+`mongod`'s; sixteen shard tables once existed to spread an append hotspot
+that the RecordId + prune work eliminated), and the oplog/preimage
 btrees are created append-tuned (`split_pct=100,leaf_page_max=128KB`).
 With those defaults a fully-durable eight-writer load sustains ~half
 of the no-oplog ceiling (~96k docs/s of 8 KiB documents on the

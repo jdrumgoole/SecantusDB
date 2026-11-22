@@ -1773,12 +1773,12 @@ Still different:
   no driver compares a whole `buildInfo` reply.
 - [ ] `buildInfo` has no per-OS block; `collStats` has no `wiredTiger` or
       `indexDetails` (they are WiredTiger statistics of the collection's
-      and each index's own table, and here collections share a documents
-      shard table and every index one entries table, so no per-collection
-      statistics exist -- which is also why `storageSize` in `collStats` /
-      `dbStats` is `dataSize` copied rather than the bytes on disk, and
-      `indexSize` an estimate; the shard table's own would count other
-      collections too); `latencyStats` is zeros; `config.system.sessions`
+      and each index's own table; since storage-model phase 5 each
+      collection and index has its own `collection-<UUID>` /
+      `index-<UUID>` table, as on mongod, so the statistics exist but are
+      not yet read -- and `storageSize` in `collStats` / `dbStats` is still
+      `dataSize` copied rather than the table's bytes on disk, and
+      `indexSize` an estimate); `latencyStats` is zeros; `config.system.sessions`
       exists but holds no sessions (mongod writes them there; here they are
       kept in memory), so `dbHash` on `config` differs, as on `admin` does (`admin.system.keys` holds random signing keys there, a
       digest no server could match); `connectionStatus` lists no
@@ -1924,16 +1924,6 @@ Still different, all 77:
   and `tests/backlog/test_rm_planner_text.py`. `$jsonSchema` prints as the
   predicates it parses into (since 2026-10-20); `$near` is refused in
   words of its own before any plan.
-- [ ] **A build before number-key format 2 writing into a store already at
-      format 2.** An older build of either server (the PyPI wheel included)
-      that inserts a document with a numeric `_id` writes a format-1 `_id`
-      key, which the store never re-keys: a lookup by that `_id` misses the
-      document. An index such a build adds is caught, because it has no
-      `numberKeys` stamp and is rebuilt on the next open; the `_id` keys
-      have nothing to stamp. Format-1 keys are recognisable
-      (`sortkey::is_format1_number_key`), so a sweep on open would close it.
-      Backlog-ID: RM-153
-      Verify: none -- needs an older build to write the store
 - [ ] **The cost of the plan trial.** Release builds against 43463aa6
       (2026-10-15): a query two indexes could serve costs about 5 times as
       much on 2,000 documents (`{a: 5, b: 3}` over `a_1` and `b_1`), 2
