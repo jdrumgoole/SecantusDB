@@ -23200,7 +23200,6 @@ impl Storage {
         // has run `batchedDeletesTargetBatchTimeMS` (5 ms), commits what it
         // deleted and finishes the rest in its next `work()` call (RM-609).
         const TARGET_BATCH_TIME: std::time::Duration = std::time::Duration::from_millis(5);
-        let started = std::time::Instant::now();
         // Large scalar `$in` / `$nin` lists hashed once for the scan.
         let in_sets = secantus_core::query::InSets::prepare(filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
@@ -23224,6 +23223,10 @@ impl Storage {
         let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
         let mut stopped = None;
         let cur = open_doc_cursor(session, db, coll, None)?;
+        // The batch's clock starts at its first delete, as mongod's
+        // `batchTimer` does: what is looked up above, mongod looks up once
+        // as it builds the stage, not in each batch's time.
+        let started = std::time::Instant::now();
         for (recordid, scanned, yielded) in rids {
             let recordid = recordid.clone();
             if deleted >= WRITE_CHUNK_MAX_DOCS || chunk_bytes >= WRITE_CHUNK_MAX_BYTES {

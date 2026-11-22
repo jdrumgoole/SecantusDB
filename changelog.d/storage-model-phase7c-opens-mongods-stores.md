@@ -49,10 +49,13 @@ session's `config.transactions` row. The store format is unchanged (9).
   (decided by Joe, 2026-11-22: "Truncate as mongod")
   (`crates/secantus-storage/tests/oplog_truncate_after_point.rs`,
   `tests/backlog/test_rm_storage_model.py::test_recovery_truncates_the_oplog_after_the_point_as_mongod`).
-  A journaled write's wait now also waits for every oplog entry minted before
-  it to commit, as mongod's acknowledgement waits for its durable point to
-  pass the write with no hole before it, so the point it moves covers the
-  write. Under `--sync-on-commit` every acknowledged write waits as a
+  A journaled write's wait now also waits for the oplog entries minted
+  before its connection's last op to commit, as mongod's acknowledgement
+  waits for its durable point to pass the client's last op
+  (`ReplClientInfo::getLastOp`) with no hole before it, so the point it
+  moves covers the write. It does not wait for entries other writers minted
+  after it: a first build that did cost 8-30% at 4 writers on the droplet
+  A/B, and the end of an operation's scope did not wake the waiters. Under `--sync-on-commit` every acknowledged write waits as a
   journaled one does, moving the point first
   (`tests/test_rust_binary_crash_durability.py::test_acknowledged_journaled_writes_survive_sigkill_mid_load[sync-on-commit-w1]`).
 - Fixes RM-757: a store SecantusDB wrote, then mongod wrote to, kept mongod's
@@ -68,3 +71,8 @@ session's `config.transactions` row. The store format is unchanged (9).
   timestamp and wall time), as mongod's does; found comparing the two
   servers' recoveries of one killed store
   (`tests/backlog/test_rm_storage_model.py::test_crash_recovery_keeps_a_transactions_session_row`).
+- A batched delete's 5 ms batch time (`batchedDeletesTargetBatchTimeMS`,
+  RM-609) starts at the batch's first delete, as mongod's `batchTimer`
+  does; it counted the collection's index and option lookups too, so a slow
+  machine split a batch of ten after its first delete
+  (`tests/backlog/test_rm_219_apply_ops.py::test_oplog_batched_delete_is_apply_ops`).

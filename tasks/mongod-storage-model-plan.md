@@ -1161,9 +1161,10 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
      writes are gone, entries and documents, and the journaled one stays;
      with the flusher running a second, all three stay. This server gives
      both answers. A journaled or majority write's wait moves the point
-     first (phase 7b), and now waits first for every entry minted before it
-     to commit, as mongod's acknowledgement waits for its durable point
-     (`lastDurable`) to pass the write with no hole before it: else the
+     first (phase 7b), and now waits first for the entries minted before
+     its connection's last op to commit, as mongod's acknowledgement waits
+     for its durable point (`lastDurable`) to pass the client's last op
+     with no hole before it: else the
      point it moved could sit below a write a concurrent earlier entry had
      not yet committed under. So does every acknowledged write of a store
      started with `--sync-on-commit`, a mode mongod does not have, whose
@@ -1272,6 +1273,20 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
      the in-flight entries minted before it, the paused-flusher check, the
      cached refresh session, a pooled session for the flush); every command
      reads `syncs_every_commit` (a field); nothing on the `w: 1` write path.
+     **The droplet A/B found what the local runs could not.** The first
+     build waited for every entry minted before the call, so each of four
+     writers waited for the others' writes in flight, and an operation
+     scope's end released its holds without waking the waiters: on c-16
+     (ams3, `bench.concurrency` at `w: "majority"`, five interleaved
+     rounds) 4 writers ran 5.4% below 7b and 8.4% below 7a, and on a second
+     droplet 29.5% below 7a. The wait now runs only to the first entry of
+     the thread's latest committed range when that is the connection's
+     last op (`Storage::flush_journal_for`), else to the newest minted, and
+     a scope's end notifies: on that second droplet 4 writers 58,770 vs
+     7a's 58,300 docs/s (median paired +0.0%, -1.7%..+3.5%), 1 writer
+     19,227 vs 17,980, mongod 66,260 and 19,240. Local runs with the sync
+     off (`SECANTUS_TEST_FAST_STORAGE=1`) showed 7c only 0.6% below 7b:
+     the gap needs Linux's real `fdatasync`.
 
 8. **Clean-up.** Remove the legacy-table readers, the shard routing and the
    format markers this replaces; rewrite the layout tests below. Update
