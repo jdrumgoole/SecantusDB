@@ -377,7 +377,10 @@ one beside it.
   spec runs, and the gate before the rebase passed it. On the same commit
   it then passed 4 of 4 runs alone and 24 of 24 runs six at a time. On a
   recurrence, record which GIN pages `ra1` locked (`pg_locks` of s1 before
-  `c1`) and how many rows its scan read.
+  `c1`) and how many rows its scan read. It reproduced on Linux CI on
+  2026-11-23 (PR #2958, run 45090485822, job 137418770491), in permutation
+  `rc1 ro2 wo1 c1 wa2 c2`, where `wa2` got the same 40001 "Canceled on
+  identification as a pivot, during write" and PostgreSQL inserts and commits.
   Verify: none -- intermittent, not reproduced; RP-254's isolation test is the check
   Backlog-ID: RP-848
 - [ ] **NOT REPRODUCED -- left open as a watch item. A cancel during the

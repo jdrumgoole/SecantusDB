@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import json
+import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -391,7 +392,19 @@ def test_the_bypass_list_reads_back_and_exempts_its_clients(
             extra = pymongo.MongoClient(host, port, directConnection=True)
             extra.admin.command("ping")
             extra.close()
+            # pymongo's RTT monitor opens a third connection in the
+            # background, and mongod bumps the two counters at different
+            # moments of a handshake (mid-flight reads differ by one,
+            # measured 2026-11-23), so read them once they have settled.
             after = counts()
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                time.sleep(0.2)
+                again = counts()
+                settled = again == after and again[0] - before[0] == again[1] - before[1]
+                after = again
+                if settled:
+                    break
         finally:
             admin.command("setParameter", 1, ingressConnectionEstablishmentRateLimiterEnabled=False)
             admin.command("setParameter", 1, **{name: {"ranges": []}})
