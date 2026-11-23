@@ -128,16 +128,17 @@ def _now_in_union(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-655")
+@pytest.mark.backlog_fixed("RM-655")
 def test_now_is_bound_in_a_union_with_pipeline(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
     """mongod 8.2.11 binds `$$NOW` inside a `$unionWith` pipeline, in a
     `$documents` and in a later stage alike: both return the outer document
-    and one whose `t` is a date. This server answers 2 "$documents
+    and one whose `t` is a date. This server answered 2 "$documents
     expression not supported" to the first and "not supported by the Rust
-    server" to the second."""
+    server" to the second, until RM-655 passed the command's system
+    variables into the sub-pipeline."""
     expected = ("ok", [{"_id": 1, "d": False}, {"d": True}])
     assert _now_in_union(mongod_rs) == {"in_documents": expected, "in_a_later_stage": expected}
     assert _now_in_union(rust_mongo) == _now_in_union(mongod_rs)

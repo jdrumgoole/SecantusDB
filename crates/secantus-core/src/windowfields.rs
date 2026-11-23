@@ -1425,9 +1425,9 @@ pub(crate) fn reads_sort_key(spec: &Bson) -> bool {
 /// `doc`'s partition key as `PartitionKeyComparator` holds it: missing is
 /// null.
 fn partition_key(doc: &Document, by: &Bson, vars: &Document) -> Bson {
-    match expressions::evaluate(doc, by, vars) {
-        Ok(Bson::Undefined) | Err(_) => Bson::Null,
-        Ok(v) => v,
+    match expressions::evaluate_field(doc, by, vars) {
+        Ok(expressions::Field::Value(v)) => v,
+        Ok(expressions::Field::Missing) | Err(_) => Bson::Null,
     }
 }
 
@@ -2590,8 +2590,9 @@ fn shift_value(
     let output = spec.get("output").ok_or(Fallback::Defer)?;
     let idx = pos as i64 + by;
     if idx >= 0 && (idx as usize) < slots.len() {
-        let v = expressions::evaluate_or_missing(&docs[slots[idx as usize]], output, vars)?;
-        if !matches!(v, Bson::Undefined) {
+        if let expressions::Field::Value(v) =
+            expressions::evaluate_field(&docs[slots[idx as usize]], output, vars)?
+        {
             return Ok(v);
         }
     }

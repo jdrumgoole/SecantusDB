@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import json
+import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -391,7 +392,19 @@ def test_the_bypass_list_reads_back_and_exempts_its_clients(
             extra = pymongo.MongoClient(host, port, directConnection=True)
             extra.admin.command("ping")
             extra.close()
+            # pymongo's RTT monitor opens a third connection in the
+            # background, and mongod bumps the two counters at different
+            # moments of a handshake (mid-flight reads differ by one,
+            # measured 2026-11-23), so read them once they have settled.
             after = counts()
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                time.sleep(0.2)
+                again = counts()
+                settled = again == after and again[0] - before[0] == again[1] - before[1]
+                after = again
+                if settled:
+                    break
         finally:
             admin.command("setParameter", 1, ingressConnectionEstablishmentRateLimiterEnabled=False)
             admin.command("setParameter", 1, **{name: {"ranges": []}})
@@ -1704,13 +1717,14 @@ def test_a_group_after_a_measurement_match_counts_what_it_examined(
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-719")
+@pytest.mark.backlog_fixed("RM-719")
 def test_a_meta_group_summing_one_point_zero_answers_an_int(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11 rewrites a `$group` on the meta field that sums `1.0`
     to a sum of each bucket's `control.count`, and answers an int (60);
-    this server sums 1.0 per measurement and answers a double (60.0)."""
+    this server summed 1.0 per measurement and answered a double (60.0)
+    until it made the same rewrite (RM-719)."""
     pipeline = [{"$group": {"_id": "$m", "n": {"$sum": 1.0}}}, {"$sort": {"_id": 1}}]
     got = {}
     for side, client in (("rust", rust_mongo), ("mongod", mongod_rs)):

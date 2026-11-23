@@ -37,13 +37,6 @@ fn evaluate(expr: &Bson, doc: &Document, vars: &Document) -> R<Bson> {
     expressions::evaluate(doc, expr, vars)
 }
 
-/// [`evaluate`] in *field-value* position: an absent field path yields the
-/// missing marker so `$project` / `$addFields` omit the key instead of writing
-/// null.
-fn evaluate_or_missing(expr: &Bson, doc: &Document, vars: &Document) -> R<Bson> {
-    expressions::evaluate_or_missing(doc, expr, vars)
-}
-
 pub fn apply_pipeline(
     mut docs: Vec<Document>,
     pipeline: &[Bson],
@@ -2481,16 +2474,16 @@ fn add_fields_one(mut doc: Document, spec: &Document, vars: &Document) -> R<Docu
     // Every field is evaluated against the ORIGINAL doc (matching Python — a
     // computed field doesn't see another set in the same stage), so evaluate all
     // expressions first, then mutate `doc` in place rather than cloning it.
-    let mut computed: Vec<(String, Bson)> = Vec::with_capacity(spec.len());
+    let mut computed: Vec<(String, expressions::Field)> = Vec::with_capacity(spec.len());
     add_fields_collect(spec, "", &doc, vars, &mut computed)?;
     for (path, v) in computed {
-        // A computed value of `Bson::Undefined` is the "missing" marker (e.g. a
-        // `$getField` on an absent field): mongod omits the field. Unset any
-        // existing value at the path rather than writing the marker.
-        if matches!(v, Bson::Undefined) {
+        // A MISSING value (e.g. a `$getField` on an absent field): mongod omits
+        // the field. Unset any existing value at the path rather than writing
+        // one. A real `undefined` is a value, and is written (RM-635).
+        let expressions::Field::Value(v) = v else {
             paths::unset_path(&mut doc, &path);
             continue;
-        }
+        };
         let parts: Vec<&str> = path.split('.').collect();
         add_field_at(&mut doc, &parts, &v);
     }
@@ -2507,7 +2500,7 @@ fn add_fields_collect(
     prefix: &str,
     doc: &Document,
     vars: &Document,
-    out: &mut Vec<(String, Bson)>,
+    out: &mut Vec<(String, expressions::Field)>,
 ) -> R<()> {
     for (name, expr) in spec {
         let path = if prefix.is_empty() {
@@ -2525,7 +2518,7 @@ fn add_fields_collect(
             }
             // `evaluate_or_missing`: a direct field path that doesn't exist is
             // MISSING, not null, and mongod omits the key rather than adding it.
-            _ => out.push((path, evaluate_or_missing(expr, doc, vars)?)),
+            _ => out.push((path, expressions::evaluate_field(doc, expr, vars)?)),
         }
     }
     Ok(())
@@ -2780,12 +2773,11 @@ fn project_one(doc: &Document, spec: &Document, vars: &Document) -> R<Document> 
             }
         }
         for (key, expr) in computed {
-            let v = evaluate_or_missing(expr, doc, vars)?;
-            // `Bson::Undefined` is the "missing" marker (e.g. `$getField` on an
-            // absent field): mongod omits the field rather than emitting null.
-            if matches!(v, Bson::Undefined) {
+            // MISSING (e.g. `$getField` on an absent field): mongod omits the
+            // field rather than emitting null. A real `undefined` is written.
+            let expressions::Field::Value(v) = expressions::evaluate_field(doc, expr, vars)? else {
                 continue;
-            }
+            };
             paths::set_path(&mut result, key, v).map_err(|_| Fallback::Defer)?;
         }
         return Ok(result);
@@ -2799,8 +2791,7 @@ fn project_one(doc: &Document, spec: &Document, vars: &Document) -> R<Document> 
         result.remove("_id");
     }
     for (key, expr) in metas {
-        let v = evaluate_or_missing(expr, doc, vars)?;
-        if !matches!(v, Bson::Undefined) {
+        if let expressions::Field::Value(v) = expressions::evaluate_field(doc, expr, vars)? {
             paths::set_path(&mut result, key, v).map_err(|_| Fallback::Defer)?;
         }
     }

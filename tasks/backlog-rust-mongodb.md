@@ -897,14 +897,6 @@ These are explicit non-goals. Don't add them without a reason.
       Measured 2026-10-27, 2026-11-07, 2026-11-10 and 2026-11-13.
       Backlog-ID: RM-363
       Verify: tests/backlog/test_rm_355_364.py::test_a_group_after_a_measurement_match_counts_what_it_examined
-- [ ] **A time-series `$group` on the meta field that sums `1.0` answers a
-      double.** mongod 8.2.11 rewrites `{$group: {_id: "$m", n: {$sum:
-      1.0}}}` over a time-series collection to a sum of each bucket's
-      `control.count`, and answers `n: 60` (an int); this server sums 1.0
-      per measurement and answers `60.0`. Measured 2026-11-18. Found while
-      working RM-363.
-      Verify: tests/backlog/test_rm_355_364.py::test_a_meta_group_summing_one_point_zero_answers_an_int
-      Backlog-ID: RM-719
 - [ ] **WiredTiger 11's interruptible cache wait is not on the line.**
       mongod 8.2.11's WiredTiger splits a cache wait into the share spent
       in interruptible eviction (`timeWaitingMicros.cacheInterruptibleMicros`)
@@ -1145,29 +1137,27 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       document. Found 2026-11-13 (RM-522).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_graph_lookup_and_a_fill_keep_the_sort_key
       Backlog-ID: RM-632
-- [ ] **`{$meta: "sortKey"}` gives an empty array's key as null.**
-      mongod 8.2.11's key for an empty array is `undefined`, which pymongo
-      decodes as `None`: `$type` reads `"undefined"`, and a `$group` on the
-      key keeps the empty array's document and a null's apart. This server
-      reads the key through `$ifNull` (`agg_meta::sort_key_read`), since its
-      expressions take `undefined` for MISSING. The ranks already tell the
-      two apart (RM-410). Found 2026-11-10. **Blocked on RM-635**
-      (measured 2026-11-13): handing `$meta` the real `undefined` still
-      reads "missing" in `$type` of `$$this` and folds into null's
-      `$group`, so this closes with that one, not before.
-      Verify: tests/backlog/test_rm_found_2026_11_10_rm410.py::test_an_empty_arrays_sort_key_is_undefined
-      Backlog-ID: RM-525
-- [ ] **A stored `undefined` reads as MISSING in aggregation
-      expressions.** The expression engine spells MISSING `Bson::Undefined`
-      (`secantus-core` `expressions.rs`, `sbe_ops.rs`; ~145 sites in 22
-      files), so a real `undefined` -- a field, an array element, a `$let`
-      variable -- gives `$type` "missing" where mongod 8.2.11 gives
-      "undefined"; an `$addFields` copy of it is dropped; a `$group` on it
-      joins null's group, and one on `[undefined]` is refused (code 2, "not
-      supported by the Rust server"). The fix gives MISSING a representation
-      of its own, apart from every BSON value. Found 2026-11-13 (RM-525).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm525.py::test_a_stored_undefined_is_not_missing, tests/backlog/test_rm_found_2026_11_13_rm525.py::test_a_group_keeps_undefined_apart_from_null
-      Backlog-ID: RM-635
+- [ ] **A stored `undefined` is carried through the expression engine as a
+      stand-in document, not as a value apart from MISSING.** Filed
+      2026-11-23 on Joe's decision: replace RM-635's `held_undefined`
+      carrier with a MISSING case of the expression engine's own, as
+      mongod's EOO / SBE `Nothing`. The engine still uses `Bson::Undefined`
+      to mean MISSING, and RM-635 carries a real `undefined` as a one-key
+      document with a NUL-led key (`secantus-core` `bsondoc.rs`:
+      `held_undefined()` / `is_held_undefined()`; `eval_field_value_keep`
+      keeps it, the other entry points normalise it back). The answers RM-635
+      and RM-525 pin are right; the structure is not mongod's, which gives
+      MISSING a case apart from every BSON value, so an operator that does
+      not normalise sees an object. Two symptoms stay open until the
+      carrier goes: (This was RM-761.) `$add` / `$multiply` over a stored
+      `undefined` gives code 14 ("$add only supports numeric or date
+      types") where mongod 8.2.11 gives null. (This was RM-762.) A `$lookup`
+      `let` variable bound from a stored `undefined` reads "missing" in
+      `$type` and one bound from an absent field "null", where mongod binds
+      the value it came from ("undefined" and "missing"; `secantus-commands`
+      `aggregate.rs`, the `bind` closure of `$lookup`).
+      Verify: tests/backlog/test_rm_found_2026_11_22_rm635.py::test_arithmetic_over_a_stored_undefined_is_null, tests/backlog/test_rm_found_2026_11_22_rm635.py::test_a_lookup_let_variable_keeps_a_stored_undefined
+      Backlog-ID: RM-763
 - [ ] **A leading `$match` on `{$size: "$$REMOVE"}` is an executor error.**
       mongod 8.2.11 folds it: 17124 "Failed to optimize pipeline :: caused
       by :: The argument to $size must be an array, but was of type:
@@ -1345,16 +1335,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       element". Found 2026-11-14 working RM-530.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_facet_element_refusal_names_the_element
       Backlog-ID: RM-647
-- [ ] **A collectionless `$unionWith` without a `$documents` runs when it
-      is nested.** mongod 8.2.11 refuses a `$unionWith` naming no `coll`
-      whose pipeline does not begin with `$documents` (9, "$unionWith stage
-      without explicit collection must have a pipeline with $documents as
-      first stage") wherever it stands. This server refuses it at the top
-      level, but inside a `$facet`, `$lookup` or `$unionWith` runs its
-      pipeline over the collection the outer stage reads and unions those
-      documents in. Found 2026-11-14 working RM-530.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_nested_union_with_no_collection_must_make_its_documents
-      Backlog-ID: RM-648
 - [ ] **A nested `$lookup`'s bad `let` runs.** mongod 8.2.11 refuses a
       `$lookup` whose `let` is not a document (14) or that has `localField`
       without `foreignField` (9) inside a `$facet` or `$unionWith` as at
@@ -1413,14 +1393,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       discarding the evaluator's own error. Found 2026-11-14 working RM-531.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_a_documents_expression_error_is_the_expressions
       Backlog-ID: RM-654
-- [ ] **`$$NOW` is unbound inside a `$unionWith` pipeline.** mongod 8.2.11
-      runs `{$unionWith: {pipeline: [{$documents: [{t: "$$NOW"}]}]}}` (and a
-      later stage reading `$$NOW` there) with the command's date. This
-      server answers 2 "$documents expression not supported", or "not
-      supported by the Rust server" from a later stage. Found 2026-11-14
-      working RM-531.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_now_is_bound_in_a_union_with_pipeline
-      Backlog-ID: RM-655
 - [ ] **A run-time error in a sub-pipeline or after `$documents` names the
       wrong namespace.** mongod 8.2.11 names the COMMAND's namespace under
       "Executor error during aggregate command on namespace:" wherever the

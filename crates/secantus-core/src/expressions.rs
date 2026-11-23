@@ -106,6 +106,66 @@ pub fn evaluate_or_missing(doc: &Document, expr: &Bson, vars: &Document) -> R {
     )
 }
 
+/// What a field-value expression came to: nothing at all, or a value. The
+/// value can be a real `Bson::Undefined` -- a stored `undefined` the expression
+/// read, which is not MISSING (RM-635).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Field {
+    Missing,
+    Value(Bson),
+}
+
+impl Field {
+    /// The value, `None` for MISSING.
+    pub fn into_value(self) -> Option<Bson> {
+        match self {
+            Field::Missing => None,
+            Field::Value(v) => Some(v),
+        }
+    }
+}
+
+/// [`evaluate_or_missing`], telling a real `undefined` value apart from MISSING:
+/// `$addFields` and `$project` write the one and omit the other.
+pub fn evaluate_field(doc: &Document, expr: &Bson, vars: &Document) -> Result<Field, Fallback> {
+    field_of(eval_field_value_keep(
+        expr,
+        &Ctx {
+            doc,
+            vars,
+            per_doc: &[],
+        },
+    )?)
+}
+
+fn field_of(v: Bson) -> Result<Field, Fallback> {
+    Ok(match v {
+        Bson::Undefined => Field::Missing,
+        v => Field::Value(stored(v)),
+    })
+}
+
+/// A result held as [`crate::bsondoc::held_undefined`] turned back into the
+/// BSON value it stands for. A shallow turn: the carrier only ever is a whole
+/// result, never a part of a container.
+pub(crate) fn stored(v: Bson) -> Bson {
+    if crate::bsondoc::is_held_undefined(&v) {
+        Bson::Undefined
+    } else {
+        v
+    }
+}
+
+/// An element read out of a container, ready to bind to a variable: a real
+/// `undefined` is held, so it is not mistaken for MISSING there.
+fn held(v: Bson) -> Bson {
+    if matches!(v, Bson::Undefined) {
+        crate::bsondoc::held_undefined()
+    } else {
+        v
+    }
+}
+
 /// MongoDB truthiness (`secantus.expressions._bool` / `query._truthy`): null is
 /// false, numbers are nonzero, everything else (incl. strings/arrays/docs/
 /// Decimal128) is true.
@@ -303,9 +363,12 @@ fn eval(expr: &Bson, ctx: &Ctx) -> R {
             // `{$project: {z: {w: "$nope"}}}`, not `{z: {w: null}}`.
             let mut out = Document::new();
             for (k, v) in d {
-                let value = eval_field_value(v, ctx)?;
-                if !matches!(value, Bson::Undefined) {
-                    out.insert(k.clone(), value);
+                // A member that is a real `undefined` is written; MISSING is not.
+                match eval_field_value_keep(v, ctx)? {
+                    Bson::Undefined => {}
+                    value => {
+                        out.insert(k.clone(), stored(value));
+                    }
                 }
             }
             Ok(Bson::Document(out))
@@ -353,13 +416,34 @@ fn stamp_folded(fault: Fallback, arg: &Bson, ctx: &Ctx) -> Fallback {
 }
 
 fn eval_field_value(expr: &Bson, ctx: &Ctx) -> R {
+    eval_field_value_keep(expr, ctx).map(stored)
+}
+
+/// [`eval_field_value`] keeping a real `undefined` apart from MISSING: it is
+/// held ([`crate::bsondoc::held_undefined`]) where `eval_field_value` gives
+/// `Bson::Undefined`. The result is for a caller that knows the carrier -- the
+/// ones that read or write a value's own type (`$type`, a variable binding, a
+/// stage's write) -- and the rest take [`eval_field_value`].
+fn eval_field_value_keep(expr: &Bson, ctx: &Ctx) -> R {
     if let Some(v) = eval_invalid_utf8(expr, ctx, Bson::Undefined) {
         return Ok(v);
     }
     if let Bson::String(s) = expr {
         if !s.starts_with("$$") {
             if let Some(path) = s.strip_prefix('$') {
-                return Ok(expr_path(ctx.doc, path).unwrap_or(Bson::Undefined));
+                return Ok(match expr_path(ctx.doc, path) {
+                    Some(v) => held(v),
+                    None => Bson::Undefined,
+                });
+            }
+        }
+        // A variable holds its own result as it was bound: a held real
+        // `undefined`, MISSING, or a value.
+        if let Some(name) = s.strip_prefix("$$") {
+            if !name.contains('.') {
+                if let Some(v) = ctx.vars.get(name) {
+                    return Ok(v.clone());
+                }
             }
         }
         // `$$REMOVE` IS the missing value -- probed 9-for-9 against mongod
@@ -385,6 +469,9 @@ fn eval_field_value(expr: &Bson, ctx: &Ctx) -> R {
                 Some(Bson::Document(d)) if expr_path(&d, rest).is_none() => {
                     return Ok(Bson::Undefined)
                 }
+                Some(Bson::Document(d)) if matches!(expr_path(&d, rest), Some(Bson::Undefined)) => {
+                    return Ok(held(Bson::Undefined))
+                }
                 Some(Bson::Document(_) | Bson::Array(_)) | None => {}
                 // A scalar has no fields.
                 Some(_) => return Ok(Bson::Undefined),
@@ -409,10 +496,28 @@ fn eval_field_value(expr: &Bson, ctx: &Ctx) -> R {
                     check_required_fields(op, arg).map_err(|f| stamp_folded(f, arg, ctx))?;
                 }
                 match op.as_str() {
-                    "$cond" => return op_cond(arg, ctx, eval_field_value),
-                    "$switch" => return op_switch(arg, ctx, eval_field_value),
-                    "$let" => return op_let(arg, ctx, eval_field_value),
-                    "$ifNull" => return op_if_null(arg, ctx, eval_field_value),
+                    "$cond" => return op_cond(arg, ctx, eval_field_value_keep),
+                    "$switch" => return op_switch(arg, ctx, eval_field_value_keep),
+                    "$let" => return op_let(arg, ctx, eval_field_value_keep),
+                    "$ifNull" => return op_if_null(arg, ctx, eval_field_value_keep),
+                    // These read an element out of an array: a real `undefined`
+                    // element answers `Bson::Undefined`, as MISSING does, so the
+                    // answer is told apart here.
+                    "$arrayElemAt" | "$first" | "$last" | "$getField" => {
+                        let v = apply_op(op, arg, ctx).map_err(|f| stamp_folded(f, expr, ctx))?;
+                        return Ok(match v {
+                            Bson::Undefined
+                                if match op.as_str() {
+                                    "$arrayElemAt" => elem_in_range(arg, ctx),
+                                    "$getField" => field_present(arg, ctx),
+                                    _ => true,
+                                } =>
+                            {
+                                held(v)
+                            }
+                            v => v,
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -421,13 +526,55 @@ fn eval_field_value(expr: &Bson, ctx: &Ctx) -> R {
     eval(expr, ctx)
 }
 
+/// Whether `{$getField: arg}` named a field its input holds: the one case it
+/// answers `Bson::Undefined` for that is not MISSING.
+fn field_present(arg: &Bson, ctx: &Ctx) -> bool {
+    let (field, input) = match arg {
+        Bson::Document(d)
+            if !(d.len() == 1 && d.keys().next().is_some_and(|k| k.starts_with('$'))) =>
+        {
+            let (Some(f), Some(i)) = (d.get("field"), d.get("input")) else {
+                return false;
+            };
+            let Ok(Bson::Document(input)) = eval(i, ctx) else {
+                return false;
+            };
+            (eval(f, ctx), input)
+        }
+        _ => (eval(arg, ctx), ctx.doc.clone()),
+    };
+    matches!(field, Ok(Bson::String(name)) if input.contains_key(&name))
+}
+
+/// Whether `{$arrayElemAt: [array, index]}` named an element of the array:
+/// the one case it answers `Bson::Undefined` for that is not MISSING.
+fn elem_in_range(arg: &Bson, ctx: &Ctx) -> bool {
+    let Bson::Array(pair) = arg else { return false };
+    let [array, index] = pair.as_slice() else {
+        return false;
+    };
+    let (Ok(Bson::Array(a)), Ok(idx)) = (eval(array, ctx), eval(index, ctx)) else {
+        return false;
+    };
+    match coerce_index(&idx) {
+        IdxCoerce::Int(i) => {
+            let len = a.len() as i128;
+            let i = i as i128;
+            (0..len).contains(&(if i < 0 { i + len } else { i }))
+        }
+        _ => false,
+    }
+}
+
 fn resolve_var(name: &str, ctx: &Ctx) -> R {
     let (base, rest) = match name.split_once('.') {
         Some((b, r)) => (b, Some(r)),
         None => (name, None),
     };
     let value = if let Some(v) = ctx.vars.get(base) {
-        v.clone()
+        // A variable can hold a real `undefined` as its carrier (a binding of
+        // `eval_field_value_keep`); here it is the value itself.
+        stored(v.clone())
     } else if base == "ROOT" || base == "CURRENT" {
         Bson::Document(ctx.doc.clone())
     } else if base == "REMOVE" {
@@ -1870,7 +2017,7 @@ fn op_if_null(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
         let v = ret(check, ctx)?;
         // A MISSING check is skipped exactly like a null one: `$ifNull` looks
         // for the first argument that HAS a value.
-        if !is_null(&v) && !matches!(v, Bson::Undefined) {
+        if !is_null(&v) && !matches!(v, Bson::Undefined) && !crate::bsondoc::is_held_undefined(&v) {
             return Ok(v);
         }
     }
@@ -4125,11 +4272,14 @@ fn op_set_field(arg: &Bson, ctx: &Ctx) -> R {
     // absent path (`value: "$nosuch"` -- probed 8.2.11), while an explicit null
     // writes a null. This used to use `eval`, where `$$REMOVE` deferred to
     // Python and an absent path wrote a null.
-    let value = eval_field_value(ve, ctx)?;
-    if matches!(value, Bson::Undefined) {
-        doc.remove(&field);
-    } else {
-        doc.insert(field, value);
+    // A real `undefined` is a value and is written (RM-635).
+    match eval_field_value_keep(ve, ctx)? {
+        Bson::Undefined => {
+            doc.remove(&field);
+        }
+        value => {
+            doc.insert(field, stored(value));
+        }
     }
     Ok(Bson::Document(doc))
 }
@@ -4279,7 +4429,7 @@ fn op_let(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
         // FIELD-VALUE position, so a var bound from an absent field stays
         // missing rather than collapsing to null: mongod's `$eq: ["$$v", null]`
         // is false when `$$v` came from a field the document does not have.
-        let v = eval_field_value(vexpr, ctx)?;
+        let v = eval_field_value_keep(vexpr, ctx)?;
         vars.insert(name.clone(), v);
         // A constant definition is inlined by mongod's optimizer; any other
         // is bound per document, and hides an outer constant of that name.
@@ -4320,7 +4470,7 @@ fn op_map(arg: &Bson, ctx: &Ctx) -> R {
     let in_expr = d.get("in").unwrap_or(&null);
     let mut out = Vec::with_capacity(arr.len());
     for (i, elem) in arr.into_iter().enumerate() {
-        out.push(eval_with_vars(in_expr, ctx, &[(&var, elem)])?);
+        out.push(eval_with_vars(in_expr, ctx, &[(&var, held(elem))])?);
         crate::deadline::check_expression(i + 1)?;
     }
     Ok(Bson::Array(out))
@@ -4358,7 +4508,7 @@ fn op_filter(arg: &Bson, ctx: &Ctx) -> R {
     };
     let mut out: Vec<Bson> = Vec::new();
     for (i, elem) in arr.into_iter().enumerate() {
-        let keep = truthy(&eval_with_vars(cond, ctx, &[(&var, elem.clone())])?);
+        let keep = truthy(&eval_with_vars(cond, ctx, &[(&var, held(elem.clone()))])?);
         crate::deadline::check_expression(i + 1)?;
         if keep {
             out.push(elem);
@@ -4417,7 +4567,7 @@ fn op_reduce(arg: &Bson, ctx: &Ctx) -> R {
     let null = Bson::Null;
     let in_expr = d.get("in").unwrap_or(&null);
     for (i, elem) in arr.into_iter().enumerate() {
-        acc = eval_with_vars(in_expr, ctx, &[("value", acc), ("this", elem)])?;
+        acc = eval_with_vars(in_expr, ctx, &[("value", acc), ("this", held(elem))])?;
         crate::deadline::check_expression(i + 1)?;
     }
     Ok(acc)
@@ -9921,8 +10071,9 @@ fn op_type(arg: &Bson, ctx: &Ctx) -> R {
     }
     // Any other operand that evaluates to missing -- a `$meta` mongod has no
     // value for, a `$getField` of an absent field -- is "missing" too.
-    match eval_field_value(arg, ctx)? {
+    match eval_field_value_keep(arg, ctx)? {
         Bson::Undefined => Ok(Bson::String("missing".into())),
+        v if crate::bsondoc::is_held_undefined(&v) => Ok(Bson::String("undefined".into())),
         v => Ok(Bson::String(type_name(&v).into())),
     }
 }
@@ -12786,5 +12937,86 @@ mod find_all_values_at_path_tests {
         assert_eq!(code(values(&doc! {}, bson!(""))), 40352);
         assert_eq!(code(values(&doc! {}, bson!("a..b"))), 15998);
         assert_eq!(code(values(&doc! {}, bson!("a.$b"))), 16410);
+    }
+}
+
+#[cfg(test)]
+mod stored_undefined_tests {
+    //! RM-635: a stored `undefined` is a value, not MISSING. mongod 8.2.11's
+    //! `$type` says "undefined" for it where it says "missing" for an absent
+    //! field, and a stage that writes a field writes one and omits the other.
+
+    use super::*;
+    use bson::{doc, Bson};
+
+    fn ty(d: &Document, expr: Bson) -> Bson {
+        evaluate(d, &bson::bson!({ "$type": expr }), &Document::new()).unwrap()
+    }
+
+    fn name(s: &str) -> Bson {
+        Bson::String(s.into())
+    }
+
+    #[test]
+    fn type_tells_undefined_from_missing_on_every_route_to_the_value() {
+        let d = doc! {"a": Bson::Undefined, "b": [Bson::Undefined, 1], "o": {"x": Bson::Undefined}};
+        assert_eq!(ty(&d, "$a".into()), name("undefined"));
+        assert_eq!(ty(&d, "$o.x".into()), name("undefined"));
+        assert_eq!(ty(&d, "$nope".into()), name("missing"));
+        assert_eq!(
+            ty(&d, bson::bson!({"$arrayElemAt": ["$b", 0]})),
+            name("undefined")
+        );
+        assert_eq!(
+            ty(&d, bson::bson!({"$arrayElemAt": ["$b", 9]})),
+            name("missing")
+        );
+        assert_eq!(ty(&d, bson::bson!({"$first": "$b"})), name("undefined"));
+        assert_eq!(
+            ty(&d, bson::bson!({"$cond": [true, "$a", 1]})),
+            name("undefined")
+        );
+        assert_eq!(ty(&d, bson::bson!({"$getField": "a"})), name("undefined"));
+        assert_eq!(ty(&d, bson::bson!({"$getField": "zz"})), name("missing"));
+        assert_eq!(
+            evaluate(
+                &d,
+                &bson::bson!({"$let": {"vars": {"v": "$a"}, "in": {"$type": "$$v"}}}),
+                &Document::new()
+            )
+            .unwrap(),
+            name("undefined")
+        );
+        assert_eq!(
+            evaluate(
+                &d,
+                &bson::bson!({"$map": {"input": "$b", "in": {"$type": "$$this"}}}),
+                &Document::new()
+            )
+            .unwrap(),
+            Bson::Array(vec![name("undefined"), name("int")])
+        );
+    }
+
+    #[test]
+    fn a_field_value_writes_undefined_and_omits_missing() {
+        let d = doc! {"a": Bson::Undefined};
+        let vars = Document::new();
+        assert_eq!(
+            evaluate_field(&d, &"$a".into(), &vars).unwrap(),
+            Field::Value(Bson::Undefined)
+        );
+        assert_eq!(
+            evaluate_field(&d, &"$nope".into(), &vars).unwrap(),
+            Field::Missing
+        );
+        // The carrier never leaves the engine: a member of a document literal
+        // is written as the `undefined` it holds.
+        assert_eq!(
+            evaluate(&d, &bson::bson!({"w": "$a", "m": "$nope"}), &vars).unwrap(),
+            Bson::Document(doc! {"w": Bson::Undefined})
+        );
+        // Where the value is an operand, it is what it was before: not a number.
+        assert_eq!(evaluate(&d, &"$a".into(), &vars).unwrap(), Bson::Undefined);
     }
 }

@@ -396,12 +396,12 @@ def test_a_views_sort_is_overridden(rust_mongo: Any, mongod: Any) -> None:
     assert answers(rust_mongo) == answers(mongod)
 
 
-@pytest.mark.backlog("RM-525")
+@pytest.mark.backlog_fixed("RM-525")
 def test_an_empty_arrays_sort_key_is_undefined(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's sort key for an empty array is `undefined` (pymongo
     decodes it as `None`, so `$type` and a `$group` show it): a `$group` on
     `{$meta: "sortKey"}` keeps the empty array's document and the null's
-    apart. This server gives the empty array's key as null."""
+    apart. This server gave the empty array's key as null (RM-525)."""
     pipelines = {
         "$type": [
             {"$sort": {"a": 1}},
