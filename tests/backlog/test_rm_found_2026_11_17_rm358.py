@@ -26,9 +26,10 @@ def _outcome(client: Any, pipeline: list) -> Any:
         client.drop_database(DB)
 
 
-@pytest.mark.backlog("RM-717")
+@pytest.mark.backlog_fixed("RM-717")
 def test_a_lookup_from_the_oplog_runs(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
-    """mongod runs a `$lookup` from `{db: "local", coll: "oplog.rs"}`."""
+    """mongod ran a `$lookup` from `{db: "local", coll: "oplog.rs"}` that this
+    server refused (FailedToParse)."""
     pipeline = [
         {
             "$lookup": {
@@ -40,6 +41,18 @@ def test_a_lookup_from_the_oplog_runs(rust_mongo: Any, mongod_rs: Any) -> None: 
     ]
     assert _outcome(mongod_rs, pipeline) == ("ok", 2)
     assert _outcome(rust_mongo, pipeline) == ("ok", 2)
+
+
+@pytest.mark.backlog_fixed("RM-717")
+@pytest.mark.parametrize(
+    ("on_db", "coll"),
+    [("config", "cache.chunks.a.b"), ("local", "startup_log"), ("config", "transactions")],
+)
+def test_lookup_db_coll_namespaces(rust_mongo: Any, mongod_rs: Any, on_db: str, coll: str) -> None:  # noqa: F811
+    """Only `local.oplog.rs` and `config.cache.chunks.*` are read through
+    `from: {db, coll}`; every other namespace is FailedToParse (9)."""
+    pipeline = [{"$lookup": {"from": {"db": on_db, "coll": coll}, "as": "j", "pipeline": []}}]
+    assert _outcome(mongod_rs, pipeline) == _outcome(rust_mongo, pipeline)
 
 
 @pytest.mark.backlog_fixed("RM-718")

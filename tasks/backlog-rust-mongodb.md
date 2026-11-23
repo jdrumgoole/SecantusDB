@@ -666,13 +666,6 @@ These are explicit non-goals. Don't add them without a reason.
         not compared yet.
       Backlog-ID: RM-357
       Verify: tests/backlog/test_rm_355_364.py::test_more_writes_report_mongods_locks
-- [ ] **A `$lookup` from `{db: "local", coll: "oplog.rs"}` is refused.**
-      mongod 8.2.11 runs a `$lookup` whose `from` is `{db, coll}` naming a
-      collection in `local` or `config`; this server answers FailedToParse
-      (9), as mongod does only for any other database. Found 2026-11-17
-      (RM-358).
-      Verify: tests/backlog/test_rm_found_2026_11_17_rm358.py::test_a_lookup_from_the_oplog_runs
-      Backlog-ID: RM-717
 - [ ] **Some queries have no `queryShapeHash`.** Since 2026-11-07 a
       `find`'s, `distinct`'s and `aggregate`'s line, profile entry and
       `explain` carry mongod's `queryShapeHash` (`secantus-commands`
