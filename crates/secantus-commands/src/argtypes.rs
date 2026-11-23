@@ -1227,7 +1227,8 @@ pub(crate) fn normalise_pipeline_sorts(pipeline: &mut [Bson]) {
 /// sub-pipeline, at any depth. `stage_spec_error` checks the top level only,
 /// so a nested one surfaced as "stage not supported" (2) instead of mongod's
 /// 15975 / 15974 / ... (measured 8.2.11, 2026-10-05). It also refuses a
-/// nested `$unionWith` with no `coll` and no `$documents` (9, RM-648).
+/// nested `$unionWith` with no `coll` and no `$documents` (9, RM-648),
+/// and a nested `$lookup` spec as `stage_field_problem` does (RM-649).
 pub(crate) fn nested_sort_problem(pipeline: &[Bson]) -> Option<(i32, String)> {
     let check = |sub: &[Bson]| -> Option<(i32, String)> {
         for stage in sub {
@@ -1237,6 +1238,13 @@ pub(crate) fn nested_sort_problem(pipeline: &[Bson]) -> Option<(i32, String)> {
                 // top level.
                 if let Some(spec @ Bson::Document(_)) = st.get("$unionWith") {
                     if let Some(p) = stage_field_problem("$unionWith", spec) {
+                        return Some(p);
+                    }
+                }
+                // So is a `$lookup` whose fields mis-type or whose join
+                // fields do not pair (RM-649), as at the top level (RM-528).
+                if let Some(spec @ Bson::Document(_)) = st.get("$lookup") {
+                    if let Some(p) = stage_field_problem("$lookup", spec) {
                         return Some(p);
                     }
                 }
@@ -4990,6 +4998,13 @@ mod write_and_sort_validation_tests {
             doc! {"$facet": {"a": [{"$unionWith": {"pipeline": [{"$documents": []}]}}]}},
         )];
         assert!(nested_sort_problem(&ok).is_none());
+        // RM-649: a nested `$lookup` is checked as it is at the top level.
+        let bad_let = doc! {"$lookup": {"from": "c", "pipeline": [], "let": 5, "as": "z"}};
+        let facet = vec![Bson::Document(doc! {"$facet": {"a": [bad_let]}})];
+        assert_eq!(nested_sort_problem(&facet).map(|p| p.0), Some(14));
+        let lone = doc! {"$lookup": {"from": "c", "localField": "a", "as": "z"}};
+        let facet = vec![Bson::Document(doc! {"$facet": {"a": [lone]}})];
+        assert_eq!(nested_sort_problem(&facet).map(|p| p.0), Some(9));
     }
 
     #[test]

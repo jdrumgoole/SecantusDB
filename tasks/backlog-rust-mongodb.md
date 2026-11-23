@@ -1329,14 +1329,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       element". Found 2026-11-14 working RM-530.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_facet_element_refusal_names_the_element
       Backlog-ID: RM-647
-- [ ] **A nested `$lookup`'s bad `let` runs.** mongod 8.2.11 refuses a
-      `$lookup` whose `let` is not a document (14) or that has `localField`
-      without `foreignField` (9) inside a `$facet` or `$unionWith` as at
-      the top level (RM-528). This server runs the first there and answers
-      the second 2 ("$lookup requires localField+foreignField or
-      pipeline"). Found 2026-11-14 working RM-530.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_nested_lookup_spec_is_checked_as_it_is_parsed
-      Backlog-ID: RM-649
 - [ ] **`{$project: {}}` drops its envelope, and is "not supported" when
       nested.** mongod 8.2.11 answers 51272 "Invalid $project :: caused by
       :: projection specification must have at least one field" at the top
