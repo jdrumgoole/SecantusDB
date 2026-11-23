@@ -1246,17 +1246,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-530.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_an_empty_projection_is_an_invalid_project
       Backlog-ID: RM-650
-- [ ] **A `$facet`'s 40600 comes after a later stage's parse error.**
-      mongod 8.2.11 parses a pipeline a stage at a time, so a `$facet`
-      holding a stage it refuses is refused before a later stage's
-      refusal: `[{$facet: {a: [<$documents>]}}, {$project: {}}]` is 40600,
-      and so is a facet's `$out` before a later `$match`'s `$where`. This
-      server checks every stage's expressions, projections and `$where`
-      in passes over the whole pipeline before the nested-pipeline pass
-      (`nested_stage_problem`), and answers the later stage's refusal.
-      Found 2026-11-14 working RM-530.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_facet_refusal_comes_before_a_later_stage
-      Backlog-ID: RM-652
 - [ ] **A `$documents` element that is not a document answers 2.**
       mongod 8.2.11 refuses `$documents: [{a: 1}, 2]` at run time with 40228
       "Executor error during aggregate command on namespace:

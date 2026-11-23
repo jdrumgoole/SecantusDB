@@ -298,6 +298,20 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         Some(Bson::Array(a)) => a.clone(),
         _ => Vec::new(),
     };
+    // mongod parses a pipeline a stage at a time, and a `$facet` refuses
+    // what its facets hold (40600 and the rest of `nested_stage_problem`)
+    // as it parses, so no later stage is parsed at all:
+    // `[{$facet: {a: [<$documents>]}}, {$project: {}}]` is 40600, not
+    // 51272 (RM-652, 8.2.11). Every parse check below then sees only the
+    // stages up to that `$facet`, and the facet's refusal is answered once
+    // they have parsed.
+    let facet_cutoff = pipeline.iter().position(|stage| {
+        stage_name(stage) == "$facet" && nested_stage_problem(std::slice::from_ref(stage)).is_some()
+    });
+    let pipeline = match facet_cutoff {
+        Some(k) => pipeline[..=k].to_vec(),
+        None => pipeline,
+    };
 
     // Validate stage names up-front (mongod parses before running): an
     // unrecognised stage is Location40324, an Atlas-only stage is
@@ -402,6 +416,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // Every stage has parsed; a `$queryStats` nested in one is refused now.
     if let Some(e) = nested_query_stats_problem(&pipeline, &ctx.db_name, coll.is_some()) {
         return Ok(e.into_reply());
+    }
+    // A `$facet` refused as it parsed: nothing after it was parsed, and
+    // nothing is optimized or run (RM-652).
+    if facet_cutoff.is_some() {
+        if let Some(problem) = nested_stage_problem(&pipeline) {
+            return Ok(problem.into_reply());
+        }
     }
     let mut pipeline = pipeline;
     argtypes::normalise_pipeline_sorts(&mut pipeline);
