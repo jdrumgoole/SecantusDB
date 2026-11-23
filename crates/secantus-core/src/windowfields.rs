@@ -378,8 +378,22 @@ fn window_fields_each(
     // before it are emitted first (8.2.11, 2026-11-13, RM-522).
     let keyless = presorted && needs_rank;
     let mut docs = docs;
+    // A `{$meta: "sortKey"}` in an output reads the key of each document in
+    // the window (mongod 8.2.11, RM-621); the command layer rewrites it to a
+    // read of the hidden field, which then stays on the documents.
+    let output_reads_key = output.values().any(|f| {
+        f.as_document()
+            .is_some_and(|f| f.iter().any(|(k, v)| k != "window" && reads_key_field(v)))
+    });
+    let mut take_key = |d: &mut Document| {
+        if output_reads_key {
+            d.get(SORT_KEY_FIELD).cloned()
+        } else {
+            d.remove(SORT_KEY_FIELD)
+        }
+    };
     let metadata: Option<Vec<Option<Bson>>> =
-        presorted.then(|| docs.iter_mut().map(|d| d.remove(SORT_KEY_FIELD)).collect());
+        presorted.then(|| docs.iter_mut().map(&mut take_key).collect());
     // A `$setWindowFields` passes on the key it was handed, or (sorting)
     // the key of the `$sort` it runs behind, which the command layer writes
     // in front (RM-520). It ranks by its own `sortBy`, so the key is only
@@ -387,7 +401,7 @@ fn window_fields_each(
     // the partition cache would see it as a field, and back on as it leaves.
     let carried: Option<Vec<Option<Bson>>> = (!presorted
         && docs.iter().any(|d| d.contains_key(SORT_KEY_FIELD)))
-    .then(|| docs.iter_mut().map(|d| d.remove(SORT_KEY_FIELD)).collect());
+    .then(|| docs.iter_mut().map(&mut take_key).collect());
     // Range windows, `$linearFill`, and `$derivative`/`$integral` all need the
     // single-ascending-numeric sortBy values (window bounds / interp / rate x-axis).
     let needs_range = compiled.iter().any(|c| {
@@ -1417,6 +1431,16 @@ pub(crate) fn reads_sort_key(spec: &Bson) -> bool {
                     .is_some_and(|f| f.keys().any(|op| RANK_FUNCS.contains(&op.as_str())))
             })
         })
+}
+
+/// Whether `value` reads the hidden sort-key field (`$<SORT_KEY_FIELD>`).
+fn reads_key_field(value: &Bson) -> bool {
+    match value {
+        Bson::String(s) => s.strip_prefix('$') == Some(SORT_KEY_FIELD),
+        Bson::Document(d) => d.values().any(reads_key_field),
+        Bson::Array(a) => a.iter().any(reads_key_field),
+        _ => false,
+    }
 }
 
 /// `doc`'s partition key as `PartitionKeyComparator` holds it: missing is

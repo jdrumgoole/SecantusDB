@@ -648,14 +648,23 @@ pub(crate) fn rewrite_sort_metadata(
             replace_with(&mut stage, "sortKey", &Bson::String("$$REMOVE".into()));
         }
         // A `$lookup`'s sub-pipeline reads its own documents' metadata
-        // (RM-521); a `$setWindowFields` holds the sort key off its
-        // documents while it runs, so a `$meta` in it is left to refuse.
+        // (RM-521). A `$setWindowFields` reads the key of the `$sort` it
+        // runs behind, or the one it was handed (RM-621); with none in
+        // reach its `$meta` is left to refuse.
         let reads_here = !matches!(name.as_str(), "$lookup" | "$unionWith");
-        let reads_sort_here = name != "$setWindowFields";
+        // A sorting one sets the key itself, in front of it (below).
+        let window_keys = name == "$setWindowFields"
+            && stage
+                .as_document()
+                .and_then(|d| d.get("$setWindowFields"))
+                .and_then(window_sort_key)
+                .is_some();
+        let key_here = sort_live || window_keys;
+        let reads_sort_here = name != "$setWindowFields" || key_here;
         if (keeps && reads_here) || name == "$group" {
             if !reads_sort_here {
                 // Left as it is.
-            } else if sort_live {
+            } else if key_here {
                 replace_with(&mut stage, "sortKey", &sort_key_read());
             } else if matches!(name.as_str(), "$addFields" | "$set" | "$group") {
                 replace_with(
@@ -1111,9 +1120,9 @@ mod tests {
             piped,
             stages(vec![
                 doc! { "$_secantusSortKey": { "into": SORT_KEY, "by": { "n": 1 } } },
-                // The key is off the documents while the stage runs: its
-                // own `$meta` is left as it was.
-                window,
+                // Its own `$meta` reads the key it sets (RM-621).
+                doc! { "$setWindowFields": { "sortBy": { "n": 1 },
+                "output": { "x": { "$push": sort_key_read() } } } },
                 doc! { "$addFields": { "m": sort_key_read() } },
                 doc! { "$unset": [SORT_KEY] },
             ])

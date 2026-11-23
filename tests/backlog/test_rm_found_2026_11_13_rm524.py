@@ -27,12 +27,18 @@ def test_a_match_reads_a_missing_sort_key(rust_mongo: Any, mongod: Any) -> None:
     assert _answer(rust_mongo, pipeline) == _answer(mongod, pipeline)
 
 
-@pytest.mark.backlog("RM-634")
-def test_a_sort_key_projection_without_a_sort(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 refuses a `$project` of `{$meta: "sortKey"}` with no
-    `$sort` ahead of it, code 2 "... cannot use sortKey $meta projection
-    without a sort"; this server's code 2 calls the pipeline unsupported."""
-    pipeline = [{"$project": {"t": {"$type": {"$meta": "sortKey"}}}}]
+@pytest.mark.backlog_fixed("RM-634")
+@pytest.mark.parametrize(
+    "front",
+    [[], [{"$match": {"_id": 1}}], [{"$skip": 0}]],
+    ids=["leading", "behind-a-match", "behind-a-no-op-skip"],
+)
+def test_a_sort_key_projection_without_a_sort(rust_mongo: Any, mongod: Any, front: list) -> None:
+    """mongod 8.2.11 refuses a `$project` of `{$meta: "sortKey"}` its query
+    layer takes (behind nothing but `$match`es) with no `$sort`, code 2
+    "... cannot use sortKey $meta projection without a sort"; this server's
+    code 2 called the pipeline unsupported."""
+    pipeline = [*front, {"$project": {"t": {"$type": {"$meta": "sortKey"}}}}]
     assert _answer(rust_mongo, pipeline) == _answer(mongod, pipeline)
 
 

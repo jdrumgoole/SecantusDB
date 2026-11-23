@@ -611,19 +611,6 @@ These are explicit non-goals. Don't add them without a reason.
       **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08, the ticket pools 2026-11-09, and the per-command admission counts on the line 2026-11-09; what is left is above.
       Backlog-ID: RM-355
       Verify: none -- the yield's second admission is RM-360's; the second exempt ingress admission and an index build's `queues` have no gap test yet
-- [ ] **A filtered `awaitData` getMore a rejected write wakes sometimes
-      counts 8 execution admissions, not 6.** mongod 8.2.11 counts 6 (two
-      yields per wait, two waits). This server counted 8 in 1 of 3 runs of
-      `test_an_await_data_get_more_woken_twice_takes_mongods_tickets` and
-      in the RM-650 lane gate's backlog step (2026-11-23, load ~6 on 12
-      cores), and 6 in the others: a wait is woken, or rescans, once more
-      than mongod's under some interleaving of the writer's insert and the
-      wait. Reproduce by running that test in a loop. Found 2026-11-23
-      working RM-650 (whose change does not reach getMore).
-      Verify: none -- intermittent (1 run in 3), so no gap test fails
-      reliably; RM-355's regression test, the one named above, shows it
-      when run in a loop
-      Backlog-ID: RM-764
 - [ ] **mongod's `validate` sometimes warns on `config.image_collection`'s
       `_id_` after this server served a mongod-written store.** In
       `test_secantus_serves_the_phase_0b_store_mongod_wrote` (RM-723's
@@ -1084,6 +1071,18 @@ about forty such points; these are the ones measured.
       stream does not yet read), or to page each of those reads into the
       write as `bounded_span_pages` does; none of those shapes is probed
       against mongod yet.
+      A `backlog_fixed` RM-390 test regressed once in an RM gate at high
+      load (2026-11-23), unrecorded as to which. Not reproduced: 44 loops
+      of all nine tests (four in parallel, load up to 54, debug build, mongod
+      8.2.11), none failing; mongod alone wrote 5,210-9,064 of 100,000
+      (30 ms, 25 repeats, load ~27) and stopped within 68 ms; this server
+      always wrote 1,000 (one page, 153-185 ms, deadline checked per
+      page), so the one-index shapes cannot write nothing. The suspect is
+      the contested pair (a plan trial of about 30 ms before the first
+      write, against 150 / 400 ms), already widened twice for CI load. The
+      tests now put the plan, budget, written count, elapsed time and
+      load average in their assertion message; read that on the next
+      failure before changing a budget.
       Backlog-ID: RM-390
       Verify: none -- the compound residual and `$in` reads this item's
       gap tests measured are paged
@@ -1154,23 +1153,14 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       document. Found 2026-11-13 (RM-522).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_graph_lookup_and_a_fill_keep_the_sort_key
       Backlog-ID: RM-632
-- [ ] **A `$project` of `{$meta: "sortKey"}` with no `$sort` is refused as
-      unsupported.** mongod 8.2.11 refuses `{$project: {t: {$type: {$meta:
-      "sortKey"}}}}` with code 2 "Failed to determine whether query system
-      can provide a DISTINCT_SCAN grouping :: caused by :: cannot use
-      sortKey $meta projection without a sort"; this server's code 2 says
+- [ ] **A `{$meta: "sortKey"}` with no `$sort` is refused where the query
+      layer does not take it.** mongod 8.2.11 gives `[]` in a `$project`
+      behind a `$limit` or another `$project`, and in a `$replaceWith`, as
+      it does in `$addFields`; this server refuses each with code 2
       "aggregation pipeline uses a stage or operator not supported by the
-      Rust server". Found 2026-11-13 (RM-524).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm524.py::test_a_sort_key_projection_without_a_sort
-      Backlog-ID: RM-634
-- [ ] **A `{$meta: "sortKey"}` in a window's output reads no key.** Behind
-      a `$sort`, mongod 8.2.11 gives each document's key to a `$push: {$meta:
-      "sortKey"}` in a `$setWindowFields` or `$_internalSetWindowFields`;
-      this server refuses it in `$setWindowFields` (code 2) and gives null in
-      `$_internalSetWindowFields`, which hold the key off the documents while
-      they run. Found 2026-11-13 (RM-520).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_a_windows_output_reads_the_sort_key
-      Backlog-ID: RM-621
+      Rust server". Found 2026-11-23 (RM-634).
+      Verify: tests/backlog/test_rm_found_rm634.py::test_an_unpushed_sort_key_read_with_no_sort_is_empty
+      Backlog-ID: RM-766
 - [ ] **A document inside an array a stage reads or writes into is sized
       as if it were read.** mongod 8.2.11 gives each document in an array a
       cache of its own when a stage reads a field through the array

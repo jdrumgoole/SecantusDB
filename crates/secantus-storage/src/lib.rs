@@ -4002,6 +4002,14 @@ thread_local! {
 #[derive(Clone, Copy, Debug)]
 struct InFlight {
     end: i64,
+    /// The position of the last entry minted before this run (`next_seq - 1`
+    /// when it was minted): every entry at or below it has resolved, and
+    /// nothing sits between it and `start`, whose timestamps a gap (a new
+    /// second restarts the counter, a commit stamp consumes one) may leave
+    /// unused. The visible tail is this, never `start - 1`, which can name a
+    /// position no entry holds and would wake a tailing `awaitData` wait
+    /// for a write that has not committed (RM-764).
+    below: i64,
     /// The timestamp of its first entry.
     first_ts: u64,
     minted_at: Instant,
@@ -8869,6 +8877,7 @@ impl Storage {
     /// tail below it until the minting transaction commits or rolls back.
     fn mint_seq_and_ts(&self, n: usize, track_in_flight: bool) -> (i64, Vec<bson::Timestamp>) {
         let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        let below = st.next_seq - 1;
         let first = Self::mint_run(&mut st, n, true);
         let start = first as i64;
         let ts: Vec<bson::Timestamp> = (0..n as u64).map(|i| u64_ts(first + i)).collect();
@@ -8877,6 +8886,7 @@ impl Storage {
                 start,
                 InFlight {
                     end: start + n as i64,
+                    below,
                     first_ts: first,
                     minted_at: Instant::now(),
                     records: 0,
@@ -9107,8 +9117,8 @@ impl Storage {
     /// The sync-mode visible tail: the largest seq below which nothing can
     /// still appear. Caller holds the oplog mutex.
     fn visible_tail(st: &OplogState) -> i64 {
-        match st.in_flight.keys().next() {
-            Some(&start) => start - 1,
+        match st.in_flight.values().next() {
+            Some(run) => run.below,
             None => st.next_seq - 1,
         }
     }
@@ -29973,5 +29983,32 @@ mod oplog_entry_bytes_tests {
                 "{d}"
             );
         }
+    }
+
+    /// RM-764: a write in flight pins the visible tail at the last entry
+    /// before it, not at `start - 1`. A timestamp consumed without an entry
+    /// (a commit stamp; a new second restarting the counter) leaves a gap
+    /// there, and a tailing `awaitData` wait woken by a timeout read the gap
+    /// as an advance, rescanned for a write that had not committed, and took
+    /// a third pair of execution admissions (8, not mongod's 6).
+    #[test]
+    fn an_in_flight_write_does_not_move_the_visible_tail_across_a_timestamp_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::open(dir.path().to_str().unwrap()).unwrap();
+        let before = s.oplog_visible_tail_seq();
+        {
+            // A timestamp no entry holds, as a commit stamp consumes.
+            let mut st = s.oplog.lock().unwrap();
+            Storage::mint_run(&mut st, 3, false);
+        }
+        let (start, _) = s.mint_seq_and_ts(1, true);
+        assert!(
+            start - 1 > before,
+            "the stamp must leave a gap below the run"
+        );
+        assert_eq!(s.oplog_visible_tail_seq(), before);
+        assert_eq!(s.wait_for_oplog(before, 20), before);
+        s.deregister_in_flight(&[(start, start + 1)], true);
+        assert_eq!(s.oplog_visible_tail_seq(), start);
     }
 }

@@ -15,6 +15,8 @@ replica set); the Rust server is `secantusd-mdb` (`rust_mongo`).
 
 from __future__ import annotations
 
+import os
+import time
 from typing import Any
 
 import pytest
@@ -22,6 +24,12 @@ import pytest
 from tests.backlog.conftest import mongo_answer
 
 DOCS = 100_000
+
+# What the last `_write_out_of_time` saw, for an assertion's message: a run
+# that regressed under load (RM gate, 2026-11-23, not reproduced in 44 loops
+# of these tests at load up to 54, nor in 25 repeats of mongod) left only
+# `REGRESSED RM-390`, with no word of which test or how far its write got.
+SEEN: dict[str, Any] = {}
 
 
 def _write_out_of_time(client: Any, plan: str, op: str, budget: int = 30) -> tuple:
@@ -61,9 +69,20 @@ def _write_out_of_time(client: Any, plan: str, op: str, budget: int = 30) -> tup
         }
     else:
         command = {"delete": "c", "deletes": [{"q": query, "limit": 0}], "maxTimeMS": budget}
+    started = time.monotonic()
     answer = mongo_answer(lambda: db.command(command))
+    elapsed_ms = round((time.monotonic() - started) * 1000)
     left = db.c.count_documents({"n": 0} if op == "update" else {})
     written = DOCS - left
+    SEEN[type(client).__name__ + str(id(client))] = {
+        "plan": plan,
+        "op": op,
+        "budget_ms": budget,
+        "answer": answer,
+        "written": written,
+        "elapsed_ms": elapsed_ms,
+        "loadavg": os.getloadavg(),
+    }
     return answer[:2], 0 < written < DOCS
 
 
@@ -80,8 +99,8 @@ def test_a_write_of_many_out_of_time_keeps_what_it_wrote_whatever_its_plan(
     budget spent there wrote nothing; a bounded read of one field's index
     now reads a page at a time into the write."""
     theirs = _write_out_of_time(mongod_rs, "clustered-index", op)
-    assert theirs == (("err", 50), True), theirs
-    assert _write_out_of_time(rust_mongo, "clustered-index", op) == theirs
+    assert theirs == (("err", 50), True), (theirs, SEEN)
+    assert _write_out_of_time(rust_mongo, "clustered-index", op) == theirs, SEEN
 
 
 @pytest.mark.backlog_fixed("RM-390")
@@ -104,12 +123,12 @@ def test_a_contested_write_of_many_out_of_time_keeps_what_it_wrote(
     # build, so 150 ms still tells the two apart; mongod 8.2.11 stops
     # part-way at 150 ms too.
     theirs = _write_out_of_time(mongod_rs, "contested", op, budget=150)
-    assert theirs == (("err", 50), True), theirs
+    assert theirs == (("err", 50), True), (theirs, SEEN)
     # This server gets 400 ms: at 150 CI's debug build still wrote nothing
     # (PR #2764, 2026-11-15). 400 is about 13 times its first write here and
     # under a third of reading every match first, which costs 1.25 s here
     # and more on CI.
-    assert _write_out_of_time(rust_mongo, "contested", op, budget=400) == theirs
+    assert _write_out_of_time(rust_mongo, "contested", op, budget=400) == theirs, SEEN
 
 
 @pytest.mark.backlog_fixed("RM-390")
@@ -124,8 +143,8 @@ def test_a_write_of_many_through_a_compound_index_out_of_time_keeps_what_it_wrot
     nothing; a filter no index covers whole now reads its one field's
     index a page at a time into the write."""
     theirs = _write_out_of_time(mongod_rs, "clustered-compound", op)
-    assert theirs == (("err", 50), True), theirs
-    assert _write_out_of_time(rust_mongo, "clustered-compound", op) == theirs
+    assert theirs == (("err", 50), True), (theirs, SEEN)
+    assert _write_out_of_time(rust_mongo, "clustered-compound", op) == theirs, SEEN
 
 
 @pytest.mark.backlog_fixed("RM-390")
@@ -140,5 +159,5 @@ def test_a_write_of_many_through_an_in_out_of_time_keeps_what_it_wrote(
     nothing; an `$in` of plain scalars is now read a page at a time into
     the write."""
     theirs = _write_out_of_time(mongod_rs, "clustered-in", op)
-    assert theirs == (("err", 50), True), theirs
-    assert _write_out_of_time(rust_mongo, "clustered-in", op) == theirs
+    assert theirs == (("err", 50), True), (theirs, SEEN)
+    assert _write_out_of_time(rust_mongo, "clustered-in", op) == theirs, SEEN

@@ -368,6 +368,9 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Err(e) = validate_stage_expr_args(&pipeline) {
         return Ok(e.into_reply());
     }
+    if let Some(e) = pushed_project_sort_key_problem(&pipeline) {
+        return Ok(e.into_reply());
+    }
     // A genuinely unknown expression operator inside a `$project` spec is
     // mongod's stage-specific Location31325, not the generic BadValue the
     // engine fallback produces. Parse-time, like the stage-name check.
@@ -2016,6 +2019,31 @@ pub(crate) fn recognized_stage(name: &str) -> bool {
 /// `$expr` or `$redact` is reported BARE (measured 8.2.11, 2026-09-07), which
 /// is why only these three stages are walked here; the evaluator carries the
 /// same check for every other context and produces the bare form.
+/// mongod 8.2.11 hands the query layer the first `$project` behind nothing
+/// but `$match`es (a `{$skip: 0}` optimized away), and its planner refuses a
+/// `{$meta: "sortKey"}` in that projection with no sort, before reading any
+/// document and on a missing collection too (RM-634, measured 2026-11-23).
+/// A `$project` behind any other stage is not pushed down and reads `[]`.
+fn pushed_project_sort_key_problem(pipeline: &[Bson]) -> Option<CommandError> {
+    let first = pipeline.iter().find(|s| {
+        let Some(d) = s.as_document() else {
+            return true;
+        };
+        !(d.contains_key("$match")
+            || d.get("$skip")
+                .is_some_and(|n| matches!(n, Bson::Int32(0) | Bson::Int64(0))))
+    })?;
+    let spec = first.as_document()?.get("$project")?;
+    crate::agg_meta::mentions(spec, "sortKey").then(|| {
+        CommandError::new(
+            2,
+            "BadValue",
+            "Failed to determine whether query system can provide a DISTINCT_SCAN grouping \
+             :: caused by :: cannot use sortKey $meta projection without a sort",
+        )
+    })
+}
+
 fn validate_stage_expr_args(pipeline: &[Bson]) -> Result<(), CommandError> {
     const WRAPPED_STAGES: [&str; 3] = ["$addFields", "$project", "$set"];
     for stage in pipeline {
