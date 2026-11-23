@@ -624,7 +624,7 @@ def test_mongod_validates_a_2d_index_secantus_wrote(tmp_path: Path) -> None:
         assert _validation(mongod, "app", "k") == (True, [], [])
 
 
-@pytest.mark.backlog("RM-742")
+@pytest.mark.backlog_fixed("RM-742")
 def test_mongod_validates_a_2dsphere_index_secantus_wrote(tmp_path: Path) -> None:
     """mongod 8.2.11 keys a point of a `2dsphere` (version 3) index by one S2
     cell id as a NumberLong (phase 0b: two points, two entries,
@@ -867,6 +867,16 @@ def test_mongod_validates_each_kind_of_2d_index_secantus_wrote(tmp_path: Path) -
     locations, compound with array fields, the `bits` / `min` / `max`
     options) hold the keys mongod 8.2.11 makes."""
     cases = {n: c for n, c in _GEO_CASES.items() if n.startswith("flat_")}
+    assert _validate_cases(tmp_path, cases) == {name: (True, [], []) for name in cases}
+
+
+@pytest.mark.backlog_fixed("RM-742")
+def test_mongod_validates_each_kind_of_2dsphere_index_secantus_wrote(tmp_path: Path) -> None:
+    """RM-742: `2dsphere` indexes of every shape this server writes (every
+    GeoJSON kind, the covering levels, the geo field first or last or
+    nested, array fields beside it) hold the keys, and the multikey flag and
+    paths, mongod 8.2.11 makes."""
+    cases = {n: c for n, c in _GEO_CASES.items() if n.startswith("sphere_")}
     assert _validate_cases(tmp_path, cases) == {name: (True, [], []) for name in cases}
 
 

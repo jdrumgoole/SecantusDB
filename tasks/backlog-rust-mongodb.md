@@ -2932,15 +2932,6 @@ produce the dump it exists for.
 Each was measured by starting mongod 8.2.11 on a store `secantusd-mdb`
 wrote and stopped (the forward direction of RM-723).
 
-- [ ] **A `2dsphere` index's keys are not mongod's.** mongod (index version
-      3) keys a point by one S2 cell id as a NumberLong, and a shape by its
-      covering at mongod's levels; this server writes its own covering
-      (levels 4 to 16, 64 cells, every ancestor of each cell, BinData) and
-      always flags the index multikey, so mongod's `validate` reports the
-      entries missing and dozens extra. `secantus_core::s2legacy` is
-      mongod's coverer; the index and the query side both move to it.
-      Backlog-ID: RM-742
-      Verify: tests/backlog/test_rm_storage_model.py::test_mongod_validates_a_2dsphere_index_secantus_wrote
 - [ ] **A wildcard index's keys are not mongod's.** mongod keys a wildcard
       index by `($_path, value)` for each leaf path under it; this server
       writes one null entry per document, so mongod's `validate` reports
