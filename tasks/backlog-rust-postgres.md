@@ -383,6 +383,28 @@ one beside it.
   identification as a pivot, during write" and PostgreSQL inserts and commits.
   Verify: none -- intermittent, not reproduced; RP-254's isolation test is the check
   Backlog-ID: RP-848
+- [ ] **RP-911's regression test failed twice on `main`'s Linux CI on
+  2026-11-23; regression or noise not yet known.**
+  `tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth`
+  (the `pg-oracle (backlog)` job) asserts that the first catalog query
+  after DDL on a server with 800 more tables costs no more than 1.1 times
+  its pair's plus 1 ms, as the median of 15 paired rounds. Its 2026-11-17
+  rewrite (paired rounds instead of each server's minimum) followed four
+  PRs whose verdicts CI noise had flipped. On 2026-11-23 it failed on two
+  consecutive MongoDB-only merges to `main`, which do not reach the PG
+  server's catalog code: run 45100149143 (`daad5bf1d`, PR #2958), median
+  42.3 ms with no other table against 53.7 ms with 800; and run
+  45150181851 (`4953e53be`, PR #2963), 31.6 ms against 37.3 ms. That is
+  18-27% over, not a borderline miss, and both were in the same job. The
+  run between them (`fc60922b9`) passed. Next step: run the test 20 times
+  on Linux x86_64 (or on CI with `workflow_dispatch`) against the PG
+  server built at `cce0bb9cd` and at the current `main`, to tell whether
+  the first query after DDL now grows with the schema again (a real
+  RP-911 regression) or the bound sits inside the runner's noise. If it
+  is noise, the fix is the measurement, not the bound. Filed by the
+  MongoDB session; nothing on the PG side was changed.
+  Verify: none -- intermittent on Linux CI; RP-911's regression test is the check
+  Backlog-ID: RP-1078
 - [ ] **NOT REPRODUCED -- left open as a watch item. A cancel during the
   parse was honoured late on Linux CI twice, in both of RP-002's
   regression tests (2026-11-08, 2026-11-10).** `tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_with_user_code_present`
