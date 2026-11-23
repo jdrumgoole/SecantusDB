@@ -16,9 +16,9 @@ from typing import Any
 import pytest
 
 
-def _explain(client: Any, match: dict) -> dict:
+def _explain(client: Any, match: dict, name: str | None = None) -> dict:
     db = client["rm452"]
-    name = "c" + uuid.uuid4().hex[:8]
+    name = name or "c" + uuid.uuid4().hex[:8]
     db[name].insert_one({"a": 1})
     pipeline = [{"$changeStream": {}}, {"$match": match}]
     return db.command("aggregate", name, pipeline=pipeline, explain=True)
@@ -86,8 +86,8 @@ def test_a_match_on_another_event_field_joins_the_oplog_filter(
     assert _query_hash(rust_mongo, match) == want
 
 
-def _unwind(client: Any, match: dict) -> dict:
-    return _explain(client, match)["stages"][1]["$changeStream"]["filter"]
+def _unwind(client: Any, match: dict, name: str) -> dict:
+    return _explain(client, match, name)["stages"][1]["$changeStream"]["filter"]
 
 
 @pytest.mark.backlog("RM-699")
@@ -98,7 +98,9 @@ def test_the_unwind_filter_is_simplified(rust_mongo: Any, mongod_rs: Any, op_typ
     commands) and the event-type `$or` fall away, since only a command can
     match."""
     match = {"operationType": op_type}
-    want = _unwind(mongod_rs, match)
+    # One collection name on both sides: the filter spells it out.
+    name = "c" + uuid.uuid4().hex[:8]
+    want = _unwind(mongod_rs, match, name)
     assert "$nor" not in str(want)
-    got = _unwind(rust_mongo, match)
+    got = _unwind(rust_mongo, match, name)
     assert got == want

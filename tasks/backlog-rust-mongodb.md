@@ -2094,9 +2094,31 @@ would see them. What is left:
       `operationType: "drop"` (`rename`, `dropDatabase`) the writes branch
       and the event-type `$or` fall away, as only a command can match. This
       server prints the unsimplified `$and`, which matches the same entries
-      (2026-11-15, found working RM-452).
+      (2026-11-15, found working RM-452). The simplifier treats each
+      distinct leaf as a Boolean variable (`op: "c"` and `op: "i"` are
+      unrelated to it), so `insert` / `update` print unchanged on both; for
+      `rename` its output re-sorts the `$or`'s regexes by path, `o.to`
+      last. Sizing (2026-11-23): this server has no Boolean simplifier
+      anywhere -- the fix is the port of mongod's
+      `query/boolean_simplification/` (bitset algebra, Quine-McCluskey,
+      Petrick, the tree restore and its size guards) the item below needs,
+      then applying it to the unwind filter. Do it after that item. (The
+      gap test compared two different collection names until 2026-11-23.)
       Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_the_unwind_filter_is_simplified
       Backlog-ID: RM-699
+- [ ] **RUST MongoDB server: a `find`'s filter is not Boolean-simplified.**
+      mongod 8.2.11 runs its Boolean expression simplifier
+      (`internalQueryEnableBooleanExpressionsSimplifier`, true by default)
+      in normalizing every query: `{$or: [{a: 1, b: 1}, {a: 1}]}` and
+      `{$and: [{a: 1}, {$or: [{a: 1}, {b: 2}]}]}` print as `{a: {$eq: 1}}`,
+      `{a: 1, $nor: [{a: 1}]}` as `{$alwaysFalse: 1}`. This server has no
+      simplifier and prints each as given, so `parsedQuery`, and whatever
+      the planner and the query shape derive from the filter, differ. The
+      faithful fix ports `src/mongo/db/query/boolean_simplification/` and
+      its call in the canonicalizer, with mongod's size limits; several
+      PRs, and the plan-cache keys move (2026-11-23, found working RM-699).
+      Verify: tests/backlog/test_rm_found_2026_11_23_rm699.py::test_a_find_filter_is_boolean_simplified
+      Backlog-ID: RM-774
 - [ ] **RUST MongoDB server: a change stream's `docsExamined` leaves out
       mongod's own oplog entries.** mongod 8.2.11's `executionStats` of a
       change stream counts every oplog entry its scan reads from the start
