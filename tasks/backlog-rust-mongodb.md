@@ -2071,16 +2071,20 @@ mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
 - [ ] **RUST MongoDB server: a `$match` after a `$changeStream` on an
-      event field other than `operationType` is not rewritten into the
-      oplog filter.** mongod 8.2.11 rewrites predicates on `fullDocument`,
-      `documentKey`, `ns`, `to`, `updateDescription`,
+      event field other than `operationType`, `documentKey` or
+      `fullDocument` is not rewritten into the oplog filter.** mongod 8.2.11
+      rewrites predicates on `ns`, `to`, `updateDescription`,
       `fullDocumentBeforeChange`, the renamed `clusterTime` / `lsid` /
       `txnNumber` (also into the transaction filter), and an `$expr` over
-      them, and adds them to the read's filter (`fullDocument.a: 1`:
-      `queryHash` 193DCAB5, not 90A52575; 2026-11-15). RM-452 ported the
-      `operationType` rewrite only; the rest of
-      `change_stream_rewrite_helpers.cpp` is to transcribe (found working
-      RM-452).
+      them, and adds them to the read's filter (`ns.coll: "c"`: `queryHash`
+      D801EB4B, not 90A52575; 2026-11-15). RM-452 ported the
+      `operationType` rewrite, RM-698's first slice (2026-11-23)
+      `documentKey` and `fullDocument` for `$eq` / `$in` / `$exists` /
+      `$lt(e)` / `$gt(e)`; a `$regex`, `$type`, `$size`, ... on those
+      paths is still dropped, not renamed. The rest of
+      `change_stream_rewrite_helpers.cpp` (`matchRewriteGenericNamespace`,
+      `matchRewriteUpdateDescription`, `rewriteAggExpressionTree`) is to
+      transcribe (found working RM-452).
       Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_a_match_on_another_event_field_joins_the_oplog_filter
       Backlog-ID: RM-698
 - [ ] **RUST MongoDB server: the unwind filter of a change stream is not

@@ -2,8 +2,9 @@
 `$changeStream` into the oplog filter) left on 2026-11-15, comparing with
 mongod 8.2.11 as a one-member replica set.
 
-RM-452 ported mongod's rewrite of `operationType`; the rewrites of the
-other event fields and of `$expr`, and the Boolean simplifier mongod runs
+RM-452 ported mongod's rewrite of `operationType`, RM-698's first slice
+those of `documentKey` and `fullDocument`; the rewrites of the other event
+fields and of `$expr`, and the Boolean simplifier mongod runs
 over the unwind's filter, are still to come.
 """
 
@@ -27,12 +28,49 @@ def _query_hash(client: Any, match: dict) -> str:
     return _explain(client, match)["stages"][0]["$cursor"]["queryPlanner"]["queryHash"]
 
 
+def _read_and_unwind(client: Any, match: dict) -> tuple:
+    db = client["rm452"]
+    db["cfixed"].insert_one({"a": 1})
+    pipeline = [{"$changeStream": {}}, {"$match": match}]
+    stages = db.command("aggregate", "cfixed", pipeline=pipeline, explain=True)["stages"]
+    return (
+        stages[0]["$cursor"]["queryPlanner"]["queryHash"],
+        stages[1]["$changeStream"].get("filter"),
+    )
+
+
+@pytest.mark.backlog_fixed("RM-698")
+@pytest.mark.parametrize(
+    "match",
+    [
+        {"fullDocument.a": 1},
+        {"fullDocument.a": None},
+        {"fullDocument.a": {"$gt": 3}},
+        {"fullDocument.a": {"$in": [1, 2]}},
+        {"fullDocument.a": {"$ne": 3}},
+        {"fullDocument": {"$exists": False}},
+        {"documentKey._id": 1},
+        {"documentKey._id": None},
+        {"documentKey._id": {"$lte": 3}},
+        {"documentKey._id": {"$ne": 3}},
+        {"documentKey": {"$exists": True}},
+        {"$or": [{"documentKey._id": 1}, {"operationType": "drop"}]},
+    ],
+)
+def test_a_match_on_the_document_joins_the_oplog_filter(
+    rust_mongo: Any, mongod_rs: Any, match: dict
+) -> None:
+    """mongod 8.2.11 rewrites a `$match` on `documentKey` (`o2` of an update
+    or insert, `o` of a delete) and, inexactly, on `fullDocument` (`o` of an
+    insert or replacement, every other update) into the oplog filter and the
+    unwind's; this server left them out, reading with hash 90A52575."""
+    assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)
+
+
 @pytest.mark.backlog("RM-698")
 @pytest.mark.parametrize(
     ("match", "want"),
     [
-        ({"fullDocument.a": 1}, "193DCAB5"),
-        ({"documentKey._id": 1}, "97E310BC"),
         ({"ns.coll": "c"}, "D801EB4B"),
         ({"$expr": {"$eq": ["$operationType", "insert"]}}, "6F8558DD"),
     ],
@@ -40,8 +78,8 @@ def _query_hash(client: Any, match: dict) -> str:
 def test_a_match_on_another_event_field_joins_the_oplog_filter(
     rust_mongo: Any, mongod_rs: Any, match: dict, want: str
 ) -> None:
-    """mongod 8.2.11 rewrites a `$match` on `fullDocument`, `documentKey`,
-    `ns` (and `to`, `updateDescription`, `fullDocumentBeforeChange`,
+    """mongod 8.2.11 rewrites a `$match` on `ns` (and `to`,
+    `updateDescription`, `fullDocumentBeforeChange`,
     `clusterTime`, `lsid`, `txnNumber`), and an `$expr` on those, into the
     oplog filter, which changes the read's `queryHash` from 90A52575."""
     assert _query_hash(mongod_rs, match) == want
