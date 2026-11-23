@@ -1085,19 +1085,18 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       to run. Found 2026-11-13 working RM-325.
       Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_a_window_spill_the_engine_writes_out_is_mongods_size
       Backlog-ID: RM-611
-- [ ] **An approximate `$median` / `$percentile` ranks the values, where
-      mongod interpolates its t-digest.** mongod 8.2.11 answers from
-      `TDigest` (delta 2000, a flush every 6000 values that merges
-      centroids, then interpolation between them): over 5999 values of
-      `(i * 7919) % 30011 * 0.37` it answers 5552.219999999999 and over
-      20000 5551.609969919785, where this server answers the discrete rank
-      of the values it keeps (5552.22, 5551.48). The port also owes the
-      memory a flush's centroids take (`group::tdigest_buffer` counts only
-      the buffer) and the merged centroids a spill writes
-      (`group_spill::tdigest_state` writes every value as a centroid of
-      weight one, mongod's format while its flush leaves values alone).
-      Found 2026-11-18 working RM-613.
-      Verify: tests/backlog/test_rm_found_2026_11_18_rm613.py::test_an_approximate_median_is_mongods_tdigest
+- [ ] **A `$group` `$median` / `$percentile` t-digest counts only its
+      buffer's memory, and spills every value.** The answer is mongod's
+      t-digest since RM-720's first slice (`secantus_core::tdigest`, a port of
+      8.2's `percentile_algo_tdigest`), but the digest is rebuilt at finalize
+      from every value kept: `group::tdigest_buffer` counts only the buffer,
+      not the centroids a flush leaves (`TDigest::memUsageBytes`), and
+      `group_spill::tdigest_state` writes every value as a weight-one
+      centroid, sorted, where mongod writes its merged centroids. A group that
+      spilled is then rebuilt from sorted values, which flush at other points
+      than mongod's arrival order, so its approximate answer can differ.
+      Found 2026-11-18 working RM-613; trimmed 2026-11-23.
+      Verify: none -- needs a spill-point / spilled-answer probe against mongod 8.2.11 to pin; the unspilled answer is pinned by tests/backlog/test_rm_found_2026_11_18_rm613.py
       Backlog-ID: RM-720
 - [ ] **An upsert's field order sometimes repeats for all twelve
       upserts.** `tests/backlog/test_rm_057_084.py::test_upsert_field_order_from_several_equalities`

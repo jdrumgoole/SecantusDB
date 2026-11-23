@@ -885,6 +885,29 @@ pub(crate) fn percentile_rank(sorted_values: &[f64], p: f64) -> Bson {
     Bson::Double(sorted_values[idx.min(sorted_values.len() - 1)])
 }
 
+/// A `$group`'s `$median` / `$percentile` finalize: mongod's t-digest
+/// ([`crate::tdigest`]), fed the values in the order the group saw them, so
+/// its buffer flushes where mongod's does. Null (per `p`, null for the whole
+/// array) when no value was seen, as `computePercentiles` answers `{}`.
+fn percentile_tdigest(is_median: bool, ps: Option<Vec<f64>>, values: &[f64]) -> Bson {
+    let mut digest = crate::tdigest::TDigest::new();
+    for v in values {
+        digest.incorporate(*v);
+    }
+    if is_median {
+        return digest.percentile(0.5).map_or(Bson::Null, Bson::Double);
+    }
+    let ps = ps.unwrap_or_default();
+    match ps
+        .iter()
+        .map(|p| digest.percentile(*p))
+        .collect::<Option<Vec<_>>>()
+    {
+        Some(out) => Bson::Array(out.into_iter().map(Bson::Double).collect()),
+        None => Bson::Array(ps.iter().map(|_| Bson::Null).collect()),
+    }
+}
+
 /// Shared `$median` / `$percentile` finalize: sort (no NaN was collected) and
 /// rank; a percentile with no parsed `ps` (impossible for a non-empty group)
 /// yields an empty array.
@@ -1760,7 +1783,7 @@ pub(crate) fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
             } => {
                 out.insert(
                     field.to_string(),
-                    percentile_finalize(is_median, ps, values),
+                    percentile_tdigest(is_median, ps, &values),
                 );
             }
             Acc::NElem { kind, n, vals, .. } => {
