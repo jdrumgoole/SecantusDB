@@ -925,7 +925,12 @@ fn apply_event_pipeline(events: Vec<Vec<u8>>, pipeline: &[Bson]) -> (Vec<Vec<u8>
     };
     // The resume tokens going in, to compare against what comes out.
     let tokens_in: Vec<Option<Bson>> = decoded.iter().map(|d| d.get("_id").cloned()).collect();
-    match secantus_core::aggregate::apply_pipeline(decoded, pipeline, &Document::new(), None) {
+    match secantus_core::aggregate::apply_pipeline(
+        decoded,
+        pipeline,
+        &secantus_core::vars::Vars::new(),
+        None,
+    ) {
         Ok(out) => {
             // mongod allows "only transformations that retain the unmodified
             // `_id`" — so a pipeline that *changes* the resume token is as

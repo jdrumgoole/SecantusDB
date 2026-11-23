@@ -165,7 +165,7 @@ pub fn db_hash(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 Some(&doc! {"_id": 1}),
                 None,
                 collation.as_ref(),
-                &Document::new(),
+                &secantus_core::vars::Vars::new(),
             )
         }
         .map_err(crate::util::command_error)?;

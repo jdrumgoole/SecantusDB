@@ -19,6 +19,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
+use crate::vars::Vars;
 use bson::{doc, Bson, Document};
 
 use crate::fallback::Fallback;
@@ -122,7 +123,7 @@ fn f64_field(spec: &Document, key: &str) -> R<f64> {
 }
 
 /// `$_secantusScore {score, normalization, weight, details, text}`.
-pub fn score_stage(docs: Vec<Document>, spec: &Bson, vars: &Document) -> R<Vec<Document>> {
+pub fn score_stage(docs: Vec<Document>, spec: &Bson, vars: &Vars) -> R<Vec<Document>> {
     let spec = spec.as_document().ok_or(Fallback::Defer)?;
     let expr = spec.get("score").ok_or(Fallback::Defer)?;
     let normalization = str_field(spec, "normalization")?;
@@ -280,7 +281,7 @@ fn reduced(v: f64) -> Bson {
 
 /// `$_secantusFuse {kind, names, weights, normalization?, expression?,
 /// text?, details}`.
-pub fn fuse_stage(docs: Vec<Document>, spec: &Bson, vars: &Document) -> R<Vec<Document>> {
+pub fn fuse_stage(docs: Vec<Document>, spec: &Bson, vars: &Vars) -> R<Vec<Document>> {
     let spec = spec.as_document().ok_or(Fallback::Defer)?;
     let rank_fusion = str_field(spec, "kind")? == "rank";
     let names: Vec<String> = spec

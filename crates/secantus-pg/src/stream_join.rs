@@ -1178,7 +1178,7 @@ impl PgHandler {
         };
         let mut runs = crate::external_sort::RunBuilder::new(&sel.order, top_k, JOIN_BATCH);
         let mut pushed = 0usize;
-        let empty = Document::new();
+        let empty = secantus_core::vars::Vars::new();
         let in_sets = secantus_core::query::InSets::prepare(&sel.filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         let mut sink = |docs: Vec<Document>| -> PgWireResult<bool> {
@@ -1267,7 +1267,7 @@ impl PgHandler {
             return Ok(());
         };
         let filter = feed.filter;
-        let empty = Document::new();
+        let empty = secantus_core::vars::Vars::new();
         let in_sets = secantus_core::query::InSets::prepare(filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         self.feed_join(prepared, &mut |mut docs| {

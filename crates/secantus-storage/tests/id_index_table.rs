@@ -245,7 +245,7 @@ fn deleting_a_document_removes_its_id_entry_and_updating_leaves_it() {
             false,
             false,
             &[],
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
             None,
             false,

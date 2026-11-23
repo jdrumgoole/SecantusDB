@@ -441,7 +441,7 @@ pub(crate) fn find_examined_marks(
             None,
             None,
             None,
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
         )
         .ok()?;
     let docs = crate::util::decode_docs(raw).ok()?;

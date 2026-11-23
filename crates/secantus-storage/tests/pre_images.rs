@@ -127,8 +127,15 @@ fn a_delete_many_s_pre_images_are_one_per_entry() {
         let docs: Vec<Vec<u8>> = (1..=3).map(|i| enc(&doc! {"_id": i, "v": i})).collect();
         st.insert("app", "c", docs, true).unwrap();
         secantus_storage::with_reversed_delete_batches(10, || {
-            st.delete_matching("app", "c", &Document::new(), 0, &Document::new(), None)
-                .unwrap();
+            st.delete_matching(
+                "app",
+                "c",
+                &Document::new(),
+                0,
+                &secantus_core::vars::Vars::new(),
+                None,
+            )
+            .unwrap();
         });
         let deletes = entries_of(st, "d");
         let ids: Vec<Bson> = deletes
@@ -185,8 +192,15 @@ fn a_failing_delete_many_over_pre_images_keeps_what_it_deleted() {
                 .collect();
             st.insert("app", coll, docs, true).unwrap();
             secantus_storage::with_reversed_delete_batches(10, || {
-                st.delete_matching("app", coll, &filter, 0, &Document::new(), None)
-                    .expect_err("$add of a string fails");
+                st.delete_matching(
+                    "app",
+                    coll,
+                    &filter,
+                    0,
+                    &secantus_core::vars::Vars::new(),
+                    None,
+                )
+                .expect_err("$add of a string fails");
             });
         }
         let left = |coll: &str| -> Vec<Bson> {

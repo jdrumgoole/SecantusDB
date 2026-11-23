@@ -1579,7 +1579,8 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
     }
     if let Some(f) = filter {
         entries.retain(|e| {
-            secantus_core::query::matches(e, f, &Document::new(), None).unwrap_or(false)
+            secantus_core::query::matches(e, f, &secantus_core::vars::Vars::new(), None)
+                .unwrap_or(false)
         });
     }
     let ns = format!("{}.$cmd.listCollections", ctx.db_name);
@@ -5046,8 +5047,13 @@ pub fn current_op(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .into_iter()
         .filter(|op| {
             filter.is_empty()
-                || secantus_core::query::matches(op, &filter, &Document::new(), None)
-                    .unwrap_or(false)
+                || secantus_core::query::matches(
+                    op,
+                    &filter,
+                    &secantus_core::vars::Vars::new(),
+                    None,
+                )
+                .unwrap_or(false)
         })
         .map(Bson::Document)
         .collect();

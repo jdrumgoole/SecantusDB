@@ -57,6 +57,7 @@ pub mod spill_table;
 mod stl;
 pub(crate) mod timelib;
 pub mod update;
+pub mod vars;
 pub mod viewdefs;
 
 // Internal shared helpers — implementation details of the engines above, not

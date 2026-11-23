@@ -36,6 +36,7 @@
 //! cache. A `$sort` that `$setWindowFields` runs on attaches each document's
 //! sort key as metadata, which the document then carries.
 
+use crate::vars::Vars;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -660,7 +661,7 @@ impl Inclusion {
     /// with room for every field it names (`MutableDocument(n)`), copying
     /// each field it keeps in the input's order and then setting each
     /// computed one (measured 8.2.11).
-    pub fn apply(&self, input: &Document, s: &Stored, out: &Document, vars: &Document) -> Stored {
+    pub fn apply(&self, input: &Document, s: &Stored, out: &Document, vars: &Vars) -> Stored {
         let mut built = if !self.computed() && !s.modified() {
             Stored::read(memlimit::bson_len(out))
         } else {
@@ -746,7 +747,7 @@ impl Inclusion {
         fields: &mut Vec<(String, Built)>,
         root: &Document,
         input: Option<&Stored>,
-        vars: &Document,
+        vars: &Vars,
     ) {
         for name in &self.order {
             let v = match self.child(name) {
@@ -773,7 +774,7 @@ impl Inclusion {
     }
 
     /// `applyExpressionsToValue`.
-    fn expressions_to_value(&self, v: Built, root: &Document, vars: &Document) -> Built {
+    fn expressions_to_value(&self, v: Built, root: &Document, vars: &Vars) -> Built {
         match v {
             Built::Doc(mut st, mut fields) => {
                 self.apply_expressions(&mut st, &mut fields, root, None, vars);
@@ -800,7 +801,7 @@ impl Inclusion {
 /// What a computed field's expression gives over `root`: a field path to
 /// a value the input caches is that value, sharing a sub-document's
 /// storage.
-fn computed_value(expr: &Bson, root: &Document, input: Option<&Stored>, vars: &Document) -> Built {
+fn computed_value(expr: &Bson, root: &Document, input: Option<&Stored>, vars: &Vars) -> Built {
     if let (Bson::String(p), Some(s)) = (expr, input) {
         if let Some(path) = p.strip_prefix('$').filter(|f| !f.starts_with('$')) {
             if let Some(sub) = s.shared(path) {
@@ -954,7 +955,7 @@ mod tests {
         let out = Document::new(); // unused: the input was written to
         Inclusion::parse(&spec)
             .expect("an inclusion")
-            .apply(input, &s, &out, &Document::new())
+            .apply(input, &s, &out, &Vars::new())
             .for_sorter()
     }
 
@@ -1001,12 +1002,12 @@ mod tests {
         let out = doc! { "_id": 1, "t": 5, "n": 1 };
         let inc = Inclusion::parse(&doc! {"t": 1, "n": 1}).expect("an inclusion");
         assert_eq!(
-            inc.apply(&d, &s, &out, &Document::new()).for_sorter(),
+            inc.apply(&d, &s, &out, &Vars::new()).for_sorter(),
             memlimit::bson_len(&out) + STORAGE
         );
         // With something to compute it builds the document all the same.
         let inc = Inclusion::parse(&doc! {"t": 1, "x": {"$add": [1, 1]}}).expect("an inclusion");
-        assert_eq!(inc.apply(&d, &s, &out, &Document::new()).for_sorter(), 261);
+        assert_eq!(inc.apply(&d, &s, &out, &Vars::new()).for_sorter(), 261);
     }
 
     #[test]

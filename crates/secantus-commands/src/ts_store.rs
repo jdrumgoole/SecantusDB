@@ -12,6 +12,7 @@
 use bson::spec::BinarySubtype;
 use bson::{doc, Bson, Document};
 use secantus_core::collation::Collation;
+use secantus_core::vars::Vars;
 
 use crate::storage::Storage;
 use crate::ts_buckets::{Layout, BUCKETS_PREFIX};
@@ -190,7 +191,7 @@ pub(crate) fn measurements(
     db: &str,
     coll: &str,
     filter: &Document,
-    vars: &Document,
+    vars: &Vars,
     collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
     let Some(layout) = layout_of(storage, db, coll) else {
@@ -354,7 +355,7 @@ pub(crate) fn find(
     filter: &Document,
     sort: Option<&Document>,
     collation: Option<&Collation>,
-    vars: &Document,
+    vars: &Vars,
 ) -> Result<Option<Vec<Vec<u8>>>, crate::storage::StorageError> {
     if layout_of(storage, db, coll).is_none() {
         return Ok(None);
@@ -469,7 +470,7 @@ pub(crate) fn update_meta(
     db: &str,
     coll: &str,
     statement: &Document,
-    let_vars: &Document,
+    let_vars: &Vars,
     collation: Option<&Collation>,
 ) -> Result<(i32, i32), CommandError> {
     let Some(layout) = layout_of(storage, db, coll) else {
@@ -630,7 +631,7 @@ pub(crate) fn delete(
     coll: &str,
     filter: &Document,
     just_one: bool,
-    vars: &Document,
+    vars: &Vars,
     collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
     let Some(layout) = layout_of(storage, db, coll) else {

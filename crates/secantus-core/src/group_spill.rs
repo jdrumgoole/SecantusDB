@@ -27,6 +27,7 @@
 //! still this server's: a small BSON document per accumulator, read back
 //! into the same state.
 
+use crate::vars::Vars;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
@@ -413,7 +414,7 @@ enum Merging {
 }
 
 impl Merging {
-    fn new(op: &str, arg: &Bson, vars: &Document) -> R<Merging> {
+    fn new(op: &str, arg: &Bson, vars: &Vars) -> R<Merging> {
         Ok(match op {
             // A constant sum is turned into a double-double one to merge.
             "$sum" | "$count" => Merging::Acc(Acc::Sum(Num::zero())),
@@ -655,7 +656,7 @@ fn merge_classic(
     mut spills: Spills,
     accs: &[(&str, &str, &Bson)],
     shape: &IdShape,
-    vars: &Document,
+    vars: &Vars,
 ) -> R<Vec<Document>> {
     let mut readers = Vec::with_capacity(spills.runs.len());
     for run in &spills.runs {
@@ -736,7 +737,7 @@ pub(crate) fn merge(
     spills: Spills,
     accs: &[(&str, &str, &Bson)],
     shape: &IdShape,
-    vars: &Document,
+    vars: &Vars,
 ) -> R<Vec<Document>> {
     if spills.sbe {
         let fields: Vec<&str> = accs.iter().map(|(f, _, _)| *f).collect();
@@ -1514,7 +1515,7 @@ mod tests {
         let _b = memlimit::with_budgets(budgets);
         let _d = memlimit::allow_disk_use(allow);
         let _e = crate::sbe::enter(sbe);
-        crate::group::group_stage(&spec, &docs(400), &Document::new())
+        crate::group::group_stage(&spec, &docs(400), &crate::vars::Vars::new())
     }
 
     fn by_key(mut out: Vec<Document>) -> Vec<Document> {
@@ -1607,7 +1608,7 @@ mod tests {
             ("p", "$push", &push),
             ("f", "$first", &first),
         ];
-        let out = merge(spills, &accs, &shape, &Document::new()).unwrap();
+        let out = merge(spills, &accs, &shape, &crate::vars::Vars::new()).unwrap();
         assert_eq!(
             out,
             vec![doc! {"_id": {"b": 2}, "t": 8, "p": ["x", "y"], "f": null}]
@@ -1686,7 +1687,7 @@ mod tests {
             .collect();
         let expected = {
             let _e = crate::sbe::enter(true);
-            crate::group::group_stage(&spec, &input, &Document::new()).unwrap()
+            crate::group::group_stage(&spec, &input, &crate::vars::Vars::new()).unwrap()
         };
         let seen = Arc::new(Mutex::new(Seen::default()));
         let (out, report) = memlimit::captured(|| {
@@ -1696,7 +1697,7 @@ mod tests {
             });
             let _e = crate::sbe::enter(true);
             let _t = crate::spill_table::with_tables(Some(Arc::new(Engine(seen.clone()))));
-            crate::group::group_stage(&spec, &input, &Document::new()).unwrap()
+            crate::group::group_stage(&spec, &input, &crate::vars::Vars::new()).unwrap()
         });
         let mut sorted = expected;
         sorted.sort_by_key(|d| d.get_i32("_id").unwrap());
@@ -1724,11 +1725,12 @@ mod tests {
         let _d = memlimit::allow_disk_use(false);
         {
             let _e = crate::sbe::enter(true);
-            let out = crate::group::group_stage(&spec, &docs(50), &Document::new()).unwrap();
+            let out =
+                crate::group::group_stage(&spec, &docs(50), &crate::vars::Vars::new()).unwrap();
             assert_eq!(out[0].get_array("p").unwrap().len(), 50);
         }
         // The classic engine counts it, and refuses.
-        assert!(crate::group::group_stage(&spec, &docs(50), &Document::new()).is_err());
+        assert!(crate::group::group_stage(&spec, &docs(50), &crate::vars::Vars::new()).is_err());
     }
 
     #[test]
@@ -1742,7 +1744,8 @@ mod tests {
         {
             // SBE: each 100-byte string is 114; the ninth would reach 1000.
             let _e = crate::sbe::enter(true);
-            let e = crate::group::group_stage(&spec, &docs(50), &Document::new()).unwrap_err();
+            let e =
+                crate::group::group_stage(&spec, &docs(50), &crate::vars::Vars::new()).unwrap_err();
             assert_eq!(
                 e.as_mongo(),
                 Some((
@@ -1753,7 +1756,7 @@ mod tests {
                 ))
             );
         }
-        let e = crate::group::group_stage(&spec, &docs(50), &Document::new()).unwrap_err();
+        let e = crate::group::group_stage(&spec, &docs(50), &crate::vars::Vars::new()).unwrap_err();
         assert_eq!(
             e.as_mongo(),
             Some((
@@ -1775,7 +1778,7 @@ mod tests {
             let _d = memlimit::allow_disk_use(allow);
             let mut pipeline = vec![Bson::Document(doc! {"$setWindowFields": spec.clone()})];
             pipeline.extend_from_slice(rest);
-            crate::aggregate::apply_pipeline(docs(20), &pipeline, &Document::new(), None)
+            crate::aggregate::apply_pipeline(docs(20), &pipeline, &crate::vars::Vars::new(), None)
         };
         let e = run(1_000, false, &[]).unwrap_err();
         assert_eq!(e.as_mongo().map(|(c, _)| c), Some(5643011));

@@ -21,6 +21,7 @@
 //! **Deferred:** `arrayFilters`; `writeConcern`; `_reject_oplog_rs_write`.
 
 use bson::{doc, Bson, Document};
+use secantus_core::vars::Vars;
 
 use crate::argtypes;
 use crate::util::{bool_field, command_error, command_error_during, doc_field};
@@ -714,8 +715,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                 if let Ok(post) = secantus_core::update::apply_update(&matched_doc, &upd, false) {
                     // A validator no interrupt reaches (RM-313).
                     let _opaque = secantus_core::deadline::opaque();
-                    if !secantus_core::query::matches(&post, v, &Document::new(), None)
-                        .unwrap_or(true)
+                    if !secantus_core::query::matches(&post, v, &Vars::new(), None).unwrap_or(true)
                     {
                         return Ok(doc! {
                             "ok": 0.0,
@@ -855,7 +855,7 @@ fn project_value(
     value: Document,
     fields: Option<&Document>,
     query: &Document,
-    vars: &Document,
+    vars: &Vars,
 ) -> Result<Bson, CommandError> {
     let q = if query.is_empty() { None } else { Some(query) };
     match fields {

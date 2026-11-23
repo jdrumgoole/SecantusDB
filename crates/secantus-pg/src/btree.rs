@@ -203,7 +203,7 @@ impl IndexShape {
 
     pub(crate) fn key_of(&self, doc: &Document) -> Option<Vec<Bson>> {
         if let Some(p) = &self.predicate {
-            let empty = Document::new();
+            let empty = secantus_core::vars::Vars::new();
             if !secantus_core::query::matches(doc, p, &empty, None).unwrap_or(false) {
                 return None;
             }
@@ -1111,7 +1111,14 @@ pub(crate) fn flush_store(storage: &Arc<secantus_storage::Storage>, force: bool)
                     Some(ids) => bson::doc! { "_id": { "$in": ids.clone() } },
                 };
                 storage
-                    .delete_matching(&db, COLLECTION, &which, 0, &Document::new(), None)
+                    .delete_matching(
+                        &db,
+                        COLLECTION,
+                        &which,
+                        0,
+                        &secantus_core::vars::Vars::new(),
+                        None,
+                    )
                     .map_err(err)?;
                 storage
                     .insert(&db, COLLECTION, encoded, true)

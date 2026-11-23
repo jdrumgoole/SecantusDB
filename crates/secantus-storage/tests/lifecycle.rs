@@ -273,7 +273,7 @@ fn rename_keeps_secondary_index_reachable_through_the_index() {
                     None,
                     Some(&hint),
                     None,
-                    &Document::new(),
+                    &secantus_core::vars::Vars::new(),
                 )
                 .unwrap()
                 .iter()

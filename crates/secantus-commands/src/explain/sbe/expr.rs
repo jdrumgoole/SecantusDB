@@ -183,7 +183,7 @@ pub(crate) fn add(a: &Bson, b: &Bson) -> Value {
                 &Bson::Document(bson::doc! { "$add": [
                     { "$literal": a.clone() }, { "$literal": b.clone() }
                 ] }),
-                &Document::new(),
+                &secantus_core::vars::Vars::new(),
             )
             .ok()
         }

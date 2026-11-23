@@ -41,6 +41,7 @@
 
 use std::cmp::Ordering;
 
+use crate::vars::Vars;
 use bson::{Bson, Document};
 
 use crate::numeric::{self, as_float_like, as_int_like, int_result, int_to_bson, is_int64};
@@ -76,17 +77,12 @@ mod sbe_ops;
 
 struct Ctx<'a> {
     doc: &'a Document,
-    vars: &'a Document,
+    vars: &'a Vars,
     /// The variables in `vars` that are bound per document: `$map`'s and
     /// `$filter`'s `as`, `$reduce`'s `this` and `value`, and a `$let`
     /// variable that is not constant. mongod folds the rest while optimizing,
     /// so they decide which wrapper an error carries (RM-293).
     per_doc: &'a [String],
-    /// The variables bound to MISSING: a `$let` variable whose expression is
-    /// an absent field. Not in `vars`, which holds values only (a stored
-    /// `undefined` among them): MISSING is a case of its own, as mongod's EOO
-    /// `Value` is, not a BSON value (RM-763).
-    missing: &'a [String],
 }
 
 impl Ctx<'_> {
@@ -101,14 +97,13 @@ impl Ctx<'_> {
 }
 
 /// Evaluate an aggregation expression against `doc` with the given user vars.
-pub fn evaluate(doc: &Document, expr: &Bson, vars: &Document) -> R {
+pub fn evaluate(doc: &Document, expr: &Bson, vars: &Vars) -> R {
     eval(
         expr,
         &Ctx {
             doc,
             vars,
             per_doc: &[],
-            missing: &[],
         },
     )
 }
@@ -116,14 +111,13 @@ pub fn evaluate(doc: &Document, expr: &Bson, vars: &Document) -> R {
 /// [`evaluate`] in *field-value* position — an absent field path yields the
 /// missing marker (`Bson::Undefined`) so `$project` / `$addFields` omit the key
 /// instead of writing null. Mirrors `expressions.py::evaluate_or_missing`.
-pub fn evaluate_or_missing(doc: &Document, expr: &Bson, vars: &Document) -> R {
+pub fn evaluate_or_missing(doc: &Document, expr: &Bson, vars: &Vars) -> R {
     eval_field_value(
         expr,
         &Ctx {
             doc,
             vars,
             per_doc: &[],
-            missing: &[],
         },
     )
 }
@@ -158,14 +152,13 @@ impl Field {
 
 /// [`evaluate_or_missing`], telling a real `undefined` value apart from MISSING:
 /// `$addFields` and `$project` write the one and omit the other.
-pub fn evaluate_field(doc: &Document, expr: &Bson, vars: &Document) -> Result<Field, Fallback> {
+pub fn evaluate_field(doc: &Document, expr: &Bson, vars: &Vars) -> Result<Field, Fallback> {
     eval_field(
         expr,
         &Ctx {
             doc,
             vars,
             per_doc: &[],
-            missing: &[],
         },
     )
 }
@@ -450,11 +443,8 @@ fn eval_field(expr: &Bson, ctx: &Ctx) -> Result<Field, Fallback> {
         // `undefined` among them, or MISSING.
         if let Some(name) = s.strip_prefix("$$") {
             if !name.contains('.') {
-                if ctx.missing.iter().any(|m| m == name) {
-                    return Ok(Field::Missing);
-                }
-                if let Some(v) = ctx.vars.get(name) {
-                    return Ok(Field::Value(v.clone()));
+                if let Some(f) = ctx.vars.get(name) {
+                    return Ok(f.clone());
                 }
             }
         }
@@ -471,7 +461,9 @@ fn eval_field(expr: &Bson, ctx: &Ctx) -> Result<Field, Fallback> {
         // (measured 8.2.11, 2026-10-13). It wrote a null.
         if let Some((base, rest)) = s.strip_prefix("$$").and_then(|v| v.split_once('.')) {
             let root = match ctx.vars.get(base) {
-                Some(v) => Some(v.clone()),
+                Some(Field::Value(v)) => Some(v.clone()),
+                // Bound to MISSING: a path into nothing.
+                Some(Field::Missing) => return Ok(Field::Missing),
                 None if base == "ROOT" || base == "CURRENT" => {
                     Some(Bson::Document(ctx.doc.clone()))
                 }
@@ -539,12 +531,10 @@ fn resolve_var(name: &str, ctx: &Ctx) -> R {
         Some((b, r)) => (b, Some(r)),
         None => (name, None),
     };
-    let value = if ctx.missing.iter().any(|m| m == base) {
+    let value = if let Some(f) = ctx.vars.get(base) {
         // Bound to MISSING: no value, as an absent path is none (null for a
         // path into it, as for any other missing input).
-        Bson::Undefined
-    } else if let Some(v) = ctx.vars.get(base) {
-        v.clone()
+        f.clone().operand()
     } else if base == "ROOT" || base == "CURRENT" {
         Bson::Document(ctx.doc.clone())
     } else if base == "REMOVE" {
@@ -4389,10 +4379,9 @@ fn op_object_to_array(arg: &Bson, ctx: &Ctx) -> R {
 /// bare `$field` paths) is unchanged — only the var scope grows.
 fn eval_with_vars(expr: &Bson, ctx: &Ctx, extra: &[(&str, Bson)]) -> R {
     let mut vars = ctx.vars.clone();
-    let mut missing = ctx.missing.to_vec();
     let mut per_doc = ctx.per_doc.to_vec();
     for (name, value) in extra {
-        bind(&mut vars, &mut missing, name, Field::Value(value.clone()));
+        vars.insert(name.to_string(), Field::Value(value.clone()));
         per_doc.push((*name).to_string());
     }
     eval(
@@ -4401,7 +4390,6 @@ fn eval_with_vars(expr: &Bson, ctx: &Ctx, extra: &[(&str, Bson)]) -> R {
             doc: ctx.doc,
             vars: &vars,
             per_doc: &per_doc,
-            missing: &missing,
         },
     )
 }
@@ -4430,14 +4418,13 @@ fn op_let<T>(
     // Each binding is evaluated against the *original* scope (bindings don't see
     // each other), then all are layered for the `in` expression.
     let mut vars = ctx.vars.clone();
-    let mut missing = ctx.missing.to_vec();
     let constant = ctx.constant_vars();
     let mut per_doc = ctx.per_doc.to_vec();
     for (name, vexpr) in bindings {
         // FIELD-VALUE position, so a var bound from an absent field stays
         // missing rather than collapsing to null: mongod's `$eq: ["$$v", null]`
         // is false when `$$v` came from a field the document does not have.
-        bind(&mut vars, &mut missing, name, eval_field(vexpr, ctx)?);
+        vars.insert(name.clone(), eval_field(vexpr, ctx)?);
         // A constant definition is inlined by mongod's optimizer; any other
         // is bound per document, and hides an outer constant of that name.
         let folded = crate::aggregate::is_constant_expression(vexpr, &constant);
@@ -4452,24 +4439,8 @@ fn op_let<T>(
             doc: ctx.doc,
             vars: &vars,
             per_doc: &per_doc,
-            missing: &missing,
         },
     )
-}
-
-/// Bind `name` to what a variable's expression came to: a value in `vars`, or
-/// MISSING in `missing`, never both, and hiding an outer binding of the name.
-fn bind(vars: &mut Document, missing: &mut Vec<String>, name: &str, answer: Field) {
-    missing.retain(|m| m != name);
-    match answer {
-        Field::Value(v) => {
-            vars.insert(name.to_string(), v);
-        }
-        Field::Missing => {
-            vars.remove(name);
-            missing.push(name.to_string());
-        }
-    }
 }
 
 fn op_map(arg: &Bson, ctx: &Ctx) -> R {
@@ -6319,7 +6290,7 @@ fn optimize_date_args(op: &str, arg: &Bson, d: &Document, ctx: &Ctx) -> Result<b
 /// constant `timezone` of the other date operators), with `vars` the
 /// constant variables in scope. `None` for anything else, a wholly constant
 /// expression included: that is evaluated, not checked.
-pub fn optimize_date_fault(expr: &Bson, vars: &Document) -> Option<Fallback> {
+pub fn optimize_date_fault(expr: &Bson, vars: &Vars) -> Option<Fallback> {
     let Bson::Document(outer) = expr else {
         return None;
     };
@@ -6334,7 +6305,6 @@ pub fn optimize_date_fault(expr: &Bson, vars: &Document) -> Option<Fallback> {
         doc: &empty,
         vars,
         per_doc: &[],
-        missing: &[],
     };
     let bound: Vec<String> = vars.keys().cloned().collect();
     if crate::aggregate::is_constant_expression(expr, &bound) {
@@ -11024,7 +10994,7 @@ mod tests {
             Bson::DateTime(t) => t.timestamp_millis() - base.timestamp_millis(),
             other => panic!("not a date: {other:?}"),
         };
-        let eval = |e: Bson| evaluate(&d, &e, &Document::new());
+        let eval = |e: Bson| evaluate(&d, &e, &Vars::new());
         assert_eq!(
             ms(eval(bson::bson!({"$add": ["$d", 1.5, 1.5]})).unwrap()),
             4
@@ -11068,7 +11038,7 @@ mod tests {
     use bson::doc;
 
     fn ev(doc: Document, expr: Bson) -> Bson {
-        evaluate(&doc, &expr, &Document::new()).expect("should not fall back")
+        evaluate(&doc, &expr, &Vars::new()).expect("should not fall back")
     }
 
     #[test]
@@ -11171,19 +11141,14 @@ mod tests {
     #[test]
     fn rand_returns_double_in_unit_interval() {
         for _ in 0..256 {
-            match evaluate(&doc! {}, &bson::bson!({"$rand": {}}), &Document::new()).unwrap() {
+            match evaluate(&doc! {}, &bson::bson!({"$rand": {}}), &Vars::new()).unwrap() {
                 Bson::Double(v) => assert!((0.0..1.0).contains(&v), "out of range: {v}"),
                 other => panic!("$rand returned non-double: {other:?}"),
             }
         }
         // Non-empty / wrong-typed argument defers (Python raises a parse error).
-        assert!(evaluate(
-            &doc! {},
-            &bson::bson!({"$rand": {"x": 1}}),
-            &Document::new()
-        )
-        .is_err());
-        assert!(evaluate(&doc! {}, &bson::bson!({"$rand": 5}), &Document::new()).is_err());
+        assert!(evaluate(&doc! {}, &bson::bson!({"$rand": {"x": 1}}), &Vars::new()).is_err());
+        assert!(evaluate(&doc! {}, &bson::bson!({"$rand": 5}), &Vars::new()).is_err());
     }
 
     #[test]
@@ -11331,13 +11296,13 @@ mod tests {
         assert!(evaluate(
             &doc! {"a": 5i32},
             &bson::bson!({"$tsSecond": "$a"}),
-            &Document::new()
+            &Vars::new()
         )
         .is_err());
         assert!(evaluate(
             &doc! {},
             &bson::bson!({"$replaceOne": {"input": "a", "find": 5, "replacement": "b"}}),
-            &Document::new()
+            &Vars::new()
         )
         .is_err());
     }
@@ -11407,7 +11372,7 @@ mod tests {
         assert!(evaluate(
             &doc! {},
             &bson::bson!({"$setUnion": [[1], 5]}),
-            &Document::new()
+            &Vars::new()
         )
         .is_err());
     }
@@ -11439,7 +11404,7 @@ mod tests {
             bson::bson!({"$cos": "hi"}),          // non-numeric
             bson::bson!({"$atan2": ["hi", 1]}),   // atan2 non-numeric
         ] {
-            assert!(evaluate(&doc! {}, &expr, &Document::new()).is_err());
+            assert!(evaluate(&doc! {}, &expr, &Vars::new()).is_err());
         }
     }
 
@@ -11488,7 +11453,7 @@ mod tests {
             evaluate(
                 &doc! {},
                 &bson::bson!({"$dateFromParts": {"year": 2023, "timezone": "America/New_York"}}),
-                &Document::new()
+                &Vars::new()
             )
             .unwrap(),
             Bson::DateTime(bson::DateTime::from_millis(1_672_549_200_000))
@@ -11499,14 +11464,14 @@ mod tests {
             bson::bson!({"$dateFromParts": {"month": 6}}),
             bson::bson!({"$dateFromParts": {"year": 10000}}),
         ] {
-            assert!(evaluate(&doc! {}, &bad, &Document::new()).is_err());
+            assert!(evaluate(&doc! {}, &bad, &Vars::new()).is_err());
         }
     }
 
     /// The code and message `spec` fails with; mongod 8.2.11's are in the
     /// callers (probed 2026-10-16, RM-139 / RM-126).
     fn dfp_error(d: Document, spec: Bson) -> (i32, String) {
-        let e = evaluate(&d, &bson::bson!({"$dateFromParts": spec}), &Document::new()).unwrap_err();
+        let e = evaluate(&d, &bson::bson!({"$dateFromParts": spec}), &Vars::new()).unwrap_err();
         let (code, msg) = e.as_mongo().expect("a mongod error, not a defer");
         (code, msg.to_string())
     }
@@ -11566,7 +11531,7 @@ mod tests {
             evaluate(
                 &doc! {"n": Bson::Null},
                 &bson::bson!({"$dateFromParts": spec}),
-                &Document::new(),
+                &Vars::new(),
             )
         };
         // A null year short-circuits the month's type error ...
@@ -11611,7 +11576,7 @@ mod tests {
     #[test]
     fn a_date_operators_timezone_is_an_expression() {
         let d = doc! {"d": bson::DateTime::from_millis(1_710_052_200_000), "tz": "+05:00", "n": Bson::Null};
-        let ev = |e: Bson| evaluate(&d, &e, &Document::new()).unwrap();
+        let ev = |e: Bson| evaluate(&d, &e, &Vars::new()).unwrap();
         assert_eq!(
             ev(bson::bson!({"$hour": {"date": "$d", "timezone": "$tz"}})),
             Bson::Int32(11)
@@ -11636,7 +11601,7 @@ mod tests {
         let e = evaluate(
             &d,
             &bson::bson!({"$hour": {"date": "$d", "timezone": {"$concat": ["$tz", "x"]}}}),
-            &Document::new(),
+            &Vars::new(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -11650,7 +11615,7 @@ mod tests {
         let e = evaluate(
             &d,
             &bson::bson!({"$hour": {"date": "$n", "timezone": 5}}),
-            &Document::new(),
+            &Vars::new(),
         )
         .unwrap_err();
         assert!(matches!(
@@ -11775,15 +11740,14 @@ mod tests {
     /// 2026-09-01) — non-ASCII input is handled natively, NOT deferred.
     #[test]
     fn ascii_case_and_trim_are_native() {
-        let up =
-            |s: &str| evaluate(&doc! {}, &bson::bson!({"$toUpper": s}), &Document::new()).unwrap();
+        let up = |s: &str| evaluate(&doc! {}, &bson::bson!({"$toUpper": s}), &Vars::new()).unwrap();
         assert_eq!(up("Ünïcodé"), Bson::String("ÜNïCODé".into()));
         assert_eq!(up("straße"), Bson::String("STRAßE".into()));
         assert_eq!(
             evaluate(
                 &doc! {},
                 &bson::bson!({"$toLower": "ΣΊΣΥΦΟΣ"}),
-                &Document::new()
+                &Vars::new()
             )
             .unwrap(),
             Bson::String("ΣΊΣΥΦΟΣ".into())
@@ -11793,7 +11757,7 @@ mod tests {
             evaluate(
                 &doc! {},
                 &bson::bson!({"$strcasecmp": ["ß", "SS"]}),
-                &Document::new()
+                &Vars::new()
             )
             .unwrap(),
             Bson::Int32(1)
@@ -11803,7 +11767,7 @@ mod tests {
             evaluate(
                 &doc! {},
                 &bson::bson!({"$trim": {"input": s}}),
-                &Document::new(),
+                &Vars::new(),
             )
             .unwrap()
         };
@@ -11826,15 +11790,10 @@ mod tests {
         assert!(evaluate(
             &doc! {"d": d},
             &bson::bson!({"$dateToString": {"date": "$d", "timezone": "Not/AZone"}}),
-            &Document::new()
+            &Vars::new()
         )
         .is_err());
-        assert!(evaluate(
-            &doc! {},
-            &bson::bson!({"$add": ["a", "b"]}),
-            &Document::new()
-        )
-        .is_err());
+        assert!(evaluate(&doc! {}, &bson::bson!({"$add": ["a", "b"]}), &Vars::new()).is_err());
     }
 
     #[test]
@@ -11863,19 +11822,19 @@ mod tests {
         assert!(evaluate(
             &d,
             &bson::bson!({"$maxN": {"n": 2, "input": "$missing"}}),
-            &Document::new()
+            &Vars::new()
         )
         .is_err());
         assert!(evaluate(
             &d,
             &bson::bson!({"$maxN": {"n": 2, "input": Bson::Null}}),
-            &Document::new()
+            &Vars::new()
         )
         .is_err());
         assert!(evaluate(
             &d,
             &bson::bson!({"$maxN": {"n": 0, "input": "$a"}}),
-            &Document::new()
+            &Vars::new()
         )
         .is_err());
         // Booleans are ordered (rank 90, above the numerics at 30), so this
@@ -11887,7 +11846,7 @@ mod tests {
             evaluate(
                 &db,
                 &bson::bson!({"$maxN": {"n": 1, "input": "$a"}}),
-                &Document::new()
+                &Vars::new()
             )
             .unwrap(),
             Bson::Array(vec![Bson::Boolean(true)])
@@ -11931,31 +11890,31 @@ mod tests {
         assert!(evaluate(
             &d,
             &bson::bson!({"$firstN": {"n": 2, "input": "$missing"}}),
-            &Document::new()
+            &Vars::new()
         )
         .is_err());
         assert!(evaluate(
             &d,
             &bson::bson!({"$firstN": {"n": 2, "input": Bson::Null}}),
-            &Document::new()
+            &Vars::new()
         )
         .is_err());
         assert!(evaluate(
             &d,
             &bson::bson!({"$firstN": {"n": 0, "input": "$a"}}),
-            &Document::new()
+            &Vars::new()
         )
         .is_err());
         assert!(evaluate(
             &d,
             &bson::bson!({"$lastN": {"n": 1.5, "input": "$a"}}),
-            &Document::new()
+            &Vars::new()
         )
         .is_err());
         assert!(evaluate(
             &d,
             &bson::bson!({"$firstN": {"n": 2, "input": 5}}),
-            &Document::new()
+            &Vars::new()
         )
         .is_err());
     }
@@ -11996,8 +11955,8 @@ mod tests {
             Bson::Null
         );
         // Non-integer operand defers (Python raises the type error).
-        assert!(evaluate(&d, &bson::bson!({"$bitAnd": ["$a", 1.5]}), &Document::new()).is_err());
-        assert!(evaluate(&d, &bson::bson!({"$bitNot": true}), &Document::new()).is_err());
+        assert!(evaluate(&d, &bson::bson!({"$bitAnd": ["$a", 1.5]}), &Vars::new()).is_err());
+        assert!(evaluate(&d, &bson::bson!({"$bitNot": true}), &Vars::new()).is_err());
     }
 
     #[test]
@@ -12220,7 +12179,7 @@ mod set_equals_arity_tests {
     use bson::{doc, Bson};
 
     fn eval_expr(expr: Bson) -> Result<Bson, Fallback> {
-        evaluate(&doc! {}, &expr, &Document::new())
+        evaluate(&doc! {}, &expr, &Vars::new())
     }
 
     #[test]
@@ -12271,7 +12230,7 @@ mod std_dev_expression_tests {
     use bson::{doc, Bson};
 
     fn eval_expr(expr: Bson) -> Bson {
-        evaluate(&doc! {}, &expr, &Document::new()).expect("should evaluate")
+        evaluate(&doc! {}, &expr, &Vars::new()).expect("should evaluate")
     }
 
     fn approx(v: Bson) -> f64 {
@@ -12358,7 +12317,7 @@ mod timestamp_bearing_date_tests {
     }
 
     fn eval_expr(expr: Bson) -> Bson {
-        evaluate(&doc! {}, &expr, &Document::new()).expect("should evaluate")
+        evaluate(&doc! {}, &expr, &Vars::new()).expect("should evaluate")
     }
 
     #[test]
@@ -12397,7 +12356,7 @@ mod timestamp_bearing_date_tests {
     fn the_unwrapped_element_is_an_operand_and_an_array_value_is_refused() {
         let t = Bson::DateTime(bson::DateTime::from_millis(1_578_528_000_000));
         let row = doc! {"t": t.clone(), "a": [t]};
-        let eval_in = |expr: Bson| evaluate(&row, &expr, &Document::new());
+        let eval_in = |expr: Bson| evaluate(&row, &expr, &Vars::new());
         assert_eq!(
             eval_in(bson::bson!({"$isoWeek": ["$t"]})).unwrap(),
             Bson::Int32(2)
@@ -12444,7 +12403,7 @@ mod timestamp_bearing_date_tests {
             Bson::Boolean(true),
         ] {
             let expr = bson::bson!({"$year": bad});
-            assert!(evaluate(&doc! {}, &expr, &Document::new()).is_err());
+            assert!(evaluate(&doc! {}, &expr, &Vars::new()).is_err());
         }
     }
 }
@@ -12466,7 +12425,7 @@ mod decimal_conversion_tests {
     }
 
     fn eval_expr(expr: Bson) -> Result<Bson, Fallback> {
-        evaluate(&doc! {}, &expr, &Document::new())
+        evaluate(&doc! {}, &expr, &Vars::new())
     }
 
     fn ok(expr: Bson) -> Bson {
@@ -12687,7 +12646,7 @@ mod int32_argument_tests {
     use std::str::FromStr;
 
     fn run(expr: Bson) -> Result<Bson, (i32, String)> {
-        evaluate(&Document::new(), &expr, &Document::new()).map_err(|f| match f.as_mongo() {
+        evaluate(&Document::new(), &expr, &Vars::new()).map_err(|f| match f.as_mongo() {
             Some((c, m)) => (c, m.to_string()),
             None => (0, "defer".into()),
         })
@@ -12817,7 +12776,7 @@ mod log_decimal_tests {
     use std::str::FromStr;
 
     fn run(expr: Bson) -> Bson {
-        evaluate(&Document::new(), &expr, &Document::new()).expect("evaluates")
+        evaluate(&Document::new(), &expr, &Vars::new()).expect("evaluates")
     }
 
     fn dec(s: &str) -> Bson {
@@ -12854,7 +12813,7 @@ mod added_in_82_tests {
     use bson::doc;
 
     fn value(expr: Bson) -> Result<Bson, Option<(i32, String)>> {
-        evaluate(&doc! {"x": 2, "v": [1, 2]}, &expr, &Document::new())
+        evaluate(&doc! {"x": 2, "v": [1, 2]}, &expr, &Vars::new())
             .map_err(|e| e.as_mongo().map(|(c, m)| (c, m.to_string())))
     }
 
@@ -12920,7 +12879,7 @@ mod find_all_values_at_path_tests {
         evaluate(
             doc,
             &bson!({"$_internalFindAllValuesAtPath": arg}),
-            &Document::new(),
+            &Vars::new(),
         )
     }
 
@@ -12973,7 +12932,7 @@ mod stored_undefined_tests {
     use bson::{doc, Bson};
 
     fn ty(d: &Document, expr: Bson) -> Bson {
-        evaluate(d, &bson::bson!({ "$type": expr }), &Document::new()).unwrap()
+        evaluate(d, &bson::bson!({ "$type": expr }), &Vars::new()).unwrap()
     }
 
     fn name(s: &str) -> Bson {
@@ -13005,7 +12964,7 @@ mod stored_undefined_tests {
             evaluate(
                 &d,
                 &bson::bson!({"$let": {"vars": {"v": "$a"}, "in": {"$type": "$$v"}}}),
-                &Document::new()
+                &Vars::new()
             )
             .unwrap(),
             name("undefined")
@@ -13014,7 +12973,7 @@ mod stored_undefined_tests {
             evaluate(
                 &d,
                 &bson::bson!({"$map": {"input": "$b", "in": {"$type": "$$this"}}}),
-                &Document::new()
+                &Vars::new()
             )
             .unwrap(),
             Bson::Array(vec![name("undefined"), name("int")])
@@ -13029,7 +12988,7 @@ mod stored_undefined_tests {
             evaluate(
                 &d,
                 &bson::bson!({"$let": {"vars": {"v": bound}, "in": body}}),
-                &vars,
+                &Vars::from(&vars),
             )
             .unwrap()
         };
@@ -13065,11 +13024,16 @@ mod stored_undefined_tests {
         );
         // Arithmetic takes a stored `undefined` for null, as MISSING is (RM-761).
         assert_eq!(
-            evaluate(&d, &bson::bson!({"$add": ["$a", 1]}), &vars).unwrap(),
+            evaluate(&d, &bson::bson!({"$add": ["$a", 1]}), &Vars::from(&vars)).unwrap(),
             Bson::Null
         );
         assert_eq!(
-            evaluate(&d, &bson::bson!({"$multiply": ["$a", 2]}), &vars).unwrap(),
+            evaluate(
+                &d,
+                &bson::bson!({"$multiply": ["$a", 2]}),
+                &Vars::from(&vars)
+            )
+            .unwrap(),
             Bson::Null
         );
     }
@@ -13079,20 +13043,28 @@ mod stored_undefined_tests {
         let d = doc! {"a": Bson::Undefined};
         let vars = Document::new();
         assert_eq!(
-            evaluate_field(&d, &"$a".into(), &vars).unwrap(),
+            evaluate_field(&d, &"$a".into(), &Vars::from(&vars)).unwrap(),
             Field::Value(Bson::Undefined)
         );
         assert_eq!(
-            evaluate_field(&d, &"$nope".into(), &vars).unwrap(),
+            evaluate_field(&d, &"$nope".into(), &Vars::from(&vars)).unwrap(),
             Field::Missing
         );
         // The carrier never leaves the engine: a member of a document literal
         // is written as the `undefined` it holds.
         assert_eq!(
-            evaluate(&d, &bson::bson!({"w": "$a", "m": "$nope"}), &vars).unwrap(),
+            evaluate(
+                &d,
+                &bson::bson!({"w": "$a", "m": "$nope"}),
+                &Vars::from(&vars)
+            )
+            .unwrap(),
             Bson::Document(doc! {"w": Bson::Undefined})
         );
         // Where the value is an operand, it is what it was before: not a number.
-        assert_eq!(evaluate(&d, &"$a".into(), &vars).unwrap(), Bson::Undefined);
+        assert_eq!(
+            evaluate(&d, &"$a".into(), &Vars::from(&vars)).unwrap(),
+            Bson::Undefined
+        );
     }
 }

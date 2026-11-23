@@ -2018,8 +2018,13 @@ mod tests {
             };
             let _b = memlimit::with_budgets(budgets);
             let _d = memlimit::allow_disk_use(false);
-            crate::aggregate::apply_pipeline(docs.to_vec(), pipeline, &Document::new(), None)
-                .is_ok()
+            crate::aggregate::apply_pipeline(
+                docs.to_vec(),
+                pipeline,
+                &crate::vars::Vars::new(),
+                None,
+            )
+            .is_ok()
         };
         let (mut lo, mut hi) = (1, 100_000_000);
         while hi - lo > 1 {

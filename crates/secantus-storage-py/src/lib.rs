@@ -290,7 +290,7 @@ impl RustStorage {
                 sort.as_ref(),
                 hint.as_ref(),
                 None,
-                &Document::new(),
+                &secantus_storage::vars::Vars::new(),
             )
             .map(|docs| doc_list(py, docs))
             .map_err(to_pyerr)
@@ -347,7 +347,7 @@ impl RustStorage {
                 multi,
                 upsert,
                 &[],
-                &Document::new(),
+                &secantus_storage::vars::Vars::new(),
                 None,
                 None,
                 false,
@@ -373,7 +373,14 @@ impl RustStorage {
     ) -> PyResult<usize> {
         let filter = decode_doc(filter_bytes)?;
         self.inner
-            .delete_matching(db, coll, &filter, limit, &Document::new(), None)
+            .delete_matching(
+                db,
+                coll,
+                &filter,
+                limit,
+                &secantus_storage::vars::Vars::new(),
+                None,
+            )
             .map_err(to_pyerr)
     }
 

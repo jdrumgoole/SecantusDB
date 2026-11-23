@@ -1083,7 +1083,7 @@ fn pass(events: Vec<Document>, stage: &Document) -> Vec<Document> {
     match secantus_core::aggregate::apply_pipeline(
         events.clone(),
         &[Bson::Document(run)],
-        &Document::new(),
+        &secantus_core::vars::Vars::new(),
         None,
     ) {
         Ok(out) => out,

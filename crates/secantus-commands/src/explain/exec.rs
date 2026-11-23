@@ -63,10 +63,13 @@ impl Env<'_> {
     fn evaluate(&self, row: usize, filter: &Option<Document>) -> bool {
         match filter {
             None => true,
-            Some(f) => {
-                secantus_core::query::matches(&self.docs[row], f, &Document::new(), self.collation)
-                    .unwrap_or(false)
-            }
+            Some(f) => secantus_core::query::matches(
+                &self.docs[row],
+                f,
+                &secantus_core::vars::Vars::new(),
+                self.collation,
+            )
+            .unwrap_or(false),
         }
     }
 }

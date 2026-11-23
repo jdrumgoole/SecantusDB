@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 
+use crate::vars::Vars;
 use bson::{doc, Bson, Document};
 
 use crate::decimal;
@@ -482,7 +483,7 @@ fn first_array_match(doc: &Document, leaf: &PositionalLeaf) -> Option<usize> {
                     for outer in parts[..i].iter().rev() {
                         one = doc! { *outer: one };
                     }
-                    if query::matches(&one, &leaf.clause, &Document::new(), None).unwrap_or(false) {
+                    if query::matches(&one, &leaf.clause, &Vars::new(), None).unwrap_or(false) {
                         return Some(j);
                     }
                 }
@@ -565,7 +566,7 @@ fn walk_positional(
             if let Some((name, sub)) = sub {
                 let mut elem_doc = Document::new();
                 elem_doc.insert(name.to_string(), elem.clone());
-                if !query::matches(&elem_doc, sub, &Document::new(), None)? {
+                if !query::matches(&elem_doc, sub, &Vars::new(), None)? {
                     continue;
                 }
             }
@@ -1063,17 +1064,17 @@ fn pull_matches(element: &Bson, criterion: &Bson) -> R<bool> {
         {
             let d = doc! { "__e": element.clone() };
             let q = doc! { "__e": criterion.clone() };
-            crate::query::matches(&d, &q, &Document::new(), None)
+            crate::query::matches(&d, &q, &Vars::new(), None)
         }
         // `{$pull: {o: {$or: [...]}}}` is a filter over each element, like any
         // other document condition. It was read as a test of the value and
         // refused as an unknown operator (measured 8.2.11, 2026-10-12).
         Bson::Document(c) => match element {
-            Bson::Document(ed) => crate::query::matches(ed, c, &Document::new(), None),
+            Bson::Document(ed) => crate::query::matches(ed, c, &Vars::new(), None),
             _ => {
                 // Still parsed, so a condition mongod refuses is refused for
                 // an array of scalars too.
-                crate::query::matches(&Document::new(), c, &Document::new(), None)?;
+                crate::query::matches(&Document::new(), c, &Vars::new(), None)?;
                 Ok(false)
             }
         },
@@ -1081,7 +1082,7 @@ fn pull_matches(element: &Bson, criterion: &Bson) -> R<bool> {
         Bson::RegularExpression(_) => {
             let d = doc! { "__e": element.clone() };
             let q = doc! { "__e": criterion.clone() };
-            crate::query::matches(&d, &q, &Document::new(), None)
+            crate::query::matches(&d, &q, &Vars::new(), None)
         }
         // Every other scalar is EXACT equality against the element -- no
         // implicit array traversal, so `{$pull: {v: 1}}` leaves `{v: [[1, 2]]}`

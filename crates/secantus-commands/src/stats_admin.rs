@@ -715,8 +715,13 @@ pub fn list_databases(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             doc! { "name": name }
         } else {
             if name_leaf.is_some_and(|f| {
-                !secantus_core::query::matches(&doc! { "name": &name }, f, &Document::new(), None)
-                    .unwrap_or(false)
+                !secantus_core::query::matches(
+                    &doc! { "name": &name },
+                    f,
+                    &secantus_core::vars::Vars::new(),
+                    None,
+                )
+                .unwrap_or(false)
             }) {
                 continue;
             }
@@ -730,7 +735,8 @@ pub fn list_databases(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             }
         };
         let keep = filter.is_none_or(|f| {
-            secantus_core::query::matches(&entry, f, &Document::new(), None).unwrap_or(false)
+            secantus_core::query::matches(&entry, f, &secantus_core::vars::Vars::new(), None)
+                .unwrap_or(false)
         });
         if keep {
             total += entry.get("sizeOnDisk").and_then(as_i64).unwrap_or(0);

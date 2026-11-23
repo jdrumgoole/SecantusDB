@@ -1104,23 +1104,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       document. Found 2026-11-13 (RM-522).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_graph_lookup_and_a_fill_keep_the_sort_key
       Backlog-ID: RM-632
-- [ ] **A variable bound to MISSING cannot cross into a `$lookup`
-      sub-pipeline.** Filed 2026-11-23 on Joe's decision: replace RM-635's
-      `held_undefined` carrier with a MISSING case of the expression engine's
-      own, as mongod's EOO / SBE `Nothing`. Done inside an expression:
-      `expressions::Field` is `Missing` or `Value`, `$let` and the
-      `$map` / `$filter` / `$reduce` variables bind one (`Ctx::missing` names
-      the ones bound to MISSING), and the carrier is gone. Left: the variables
-      a stage hands its sub-pipeline are a `&Document` of values
-      (`vars: &Document` in about 150 signatures), which has no MISSING, so
-      `secantus-commands` `aggregate.rs`'s `$lookup` `let` binds an absent
-      field as null where mongod 8.2.11 binds MISSING and `$type` reads
-      "missing". The faithful fix is a variables type that holds a `Field`
-      per name, threaded where `vars: &Document` is today, not a reserved key
-      in the document. (This was RM-762's absent-field half; its
-      stored-`undefined` half, and RM-761, closed with the carrier.)
-      Verify: tests/backlog/test_rm_found_2026_11_22_rm635.py::test_a_lookup_let_variable_bound_from_an_absent_field_is_missing
-      Backlog-ID: RM-763
 - [ ] **A `$project` of `{$meta: "sortKey"}` with no `$sort` is refused as
       unsupported.** mongod 8.2.11 refuses `{$project: {t: {$type: {$meta:
       "sortKey"}}}}` with code 2 "Failed to determine whether query system

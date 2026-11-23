@@ -2,6 +2,7 @@
 //! seam, and storage-error → reply mapping). Kept `pub(crate)`.
 
 use bson::{doc, Bson, Document};
+use secantus_core::vars::{Field, Vars};
 
 use secantus_core::collation::{Collation, Context as CollationContext};
 
@@ -12,14 +13,14 @@ use crate::{CommandError, StorageError};
 /// aggregation expression against an empty doc (so `{n: {$add: [1, 2]}}` binds
 /// `$$n` to 3; scalars pass through). Mirrors `commands._resolve_let_vars`. A
 /// value the expression engine can't evaluate is kept raw (best-effort).
-pub(crate) fn resolve_let_vars(let_field: Option<&Bson>) -> Document {
+pub(crate) fn resolve_let_vars(let_field: Option<&Bson>) -> Vars {
     resolve_let_vars_at(let_field, None)
 }
 
 /// [`resolve_let_vars`] for a command run by `ctx`: on a replica-set member
 /// `$$CLUSTER_TIME` is the cluster time the operation starts at, as on
 /// mongod (8.2.11 sets a field to a Timestamp through it).
-pub(crate) fn command_let_vars(let_field: Option<&Bson>, ctx: &crate::CommandContext) -> Document {
+pub(crate) fn command_let_vars(let_field: Option<&Bson>, ctx: &crate::CommandContext) -> Vars {
     resolve_let_vars_at(let_field, operation_cluster_time(ctx))
 }
 
@@ -55,16 +56,19 @@ pub(crate) fn cluster_time_unavailable(standalone: bool, values: &[Bson]) -> Opt
 pub(crate) fn resolve_let_vars_at(
     let_field: Option<&Bson>,
     cluster_time: Option<bson::Timestamp>,
-) -> Document {
-    let mut vars = Document::new();
+) -> Vars {
+    let mut vars = Vars::new();
     vars.insert("NOW", bson::DateTime::now());
     if let Some(ts) = cluster_time {
         vars.insert("CLUSTER_TIME", ts);
     }
     if let Some(Bson::Document(d)) = let_field {
         for (name, value) in d {
-            let resolved = secantus_core::expressions::evaluate(&Document::new(), value, &vars)
-                .unwrap_or_else(|_| value.clone());
+            // What the expression came to: `$$REMOVE` is MISSING, which the
+            // statement's stages then read as mongod's do (RM-763).
+            let resolved =
+                secantus_core::expressions::evaluate_field(&Document::new(), value, &vars)
+                    .unwrap_or_else(|_| Field::Value(value.clone()));
             vars.insert(name.clone(), resolved);
         }
     }
@@ -73,7 +77,7 @@ pub(crate) fn resolve_let_vars_at(
 
 /// [`resolve_let_vars`], refusing a `let` expression that reads a field: the
 /// variables are bound before any document is looked at.
-pub(crate) fn checked_let_vars(let_field: Option<&Bson>) -> Result<Document, CommandError> {
+pub(crate) fn checked_let_vars(let_field: Option<&Bson>) -> Result<Vars, CommandError> {
     fn reads_a_field(v: &Bson) -> bool {
         match v {
             Bson::String(s) => s.starts_with('$') && !s.starts_with("$$"),

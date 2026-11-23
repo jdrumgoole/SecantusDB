@@ -896,7 +896,7 @@ impl Storage {
             false,
             false,
             &[],
-            &Document::new(),
+            &Vars::new(),
             None,
             None,
             false,

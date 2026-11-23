@@ -402,7 +402,7 @@ impl PgHandler {
             })
             .collect();
         tuples.sort_unstable();
-        let empty = Document::new();
+        let empty = secantus_core::vars::Vars::new();
         let examined = |_: i64, doc: Option<&Document>| {
             doc.is_some_and(|d| {
                 secantus_core::query::matches(d, &index_filter, &empty, None).unwrap_or(false)
@@ -799,7 +799,7 @@ impl PgHandler {
             })
             .collect();
         tuples.sort_unstable();
-        let empty = Document::new();
+        let empty = secantus_core::vars::Vars::new();
         let examined = |_: i64, doc: Option<&Document>| {
             doc.is_some_and(|d| {
                 secantus_core::query::matches(d, &index_filter, &empty, None).unwrap_or(false)

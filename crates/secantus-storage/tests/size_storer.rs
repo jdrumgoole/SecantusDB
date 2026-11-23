@@ -61,7 +61,7 @@ fn update(st: &Storage, coll: &str, filter: Document, spec: Document, multi: boo
         multi,
         upsert,
         &[],
-        &Document::new(),
+        &secantus_core::vars::Vars::new(),
         None,
         None,
         false,
@@ -138,7 +138,7 @@ fn inserts_updates_and_deletes_move_the_counts() {
             "c",
             &doc! {"_id": {"$lt": 10}},
             1,
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
         )
         .unwrap();
@@ -147,13 +147,20 @@ fn inserts_updates_and_deletes_move_the_counts() {
             "c",
             &doc! {"a": {"$gte": 4}},
             0,
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
         )
         .unwrap();
         kept(st, "app", "c");
-        st.delete_matching("app", "c", &doc! {}, 0, &Document::new(), None)
-            .unwrap();
+        st.delete_matching(
+            "app",
+            "c",
+            &doc! {},
+            0,
+            &secantus_core::vars::Vars::new(),
+            None,
+        )
+        .unwrap();
         let s = kept(st, "app", "c");
         assert_eq!(s, CollectionSizes::default());
     });
@@ -392,7 +399,7 @@ fn an_unclean_shutdown_is_recounted_at_open() {
             "c",
             &doc! {"_id": {"$lt": 50}},
             0,
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
         )
         .unwrap();
@@ -498,8 +505,15 @@ fn the_size_storer_is_mongods() {
     st.insert("app", "b", docs, true).unwrap();
     st.create_collection("app", "e").unwrap();
     st.insert_one("app", "f", &enc(&doc! {"_id": 1})).unwrap();
-    st.delete_matching("app", "f", &doc! {}, 0, &Document::new(), None)
-        .unwrap();
+    st.delete_matching(
+        "app",
+        "f",
+        &doc! {},
+        0,
+        &secantus_core::vars::Vars::new(),
+        None,
+    )
+    .unwrap();
     st.close().unwrap();
     drop(st);
 
@@ -610,7 +624,7 @@ fn a_killed_process_is_recounted_at_open() {
             "c",
             &doc! {"_id": {"$lt": 150}},
             0,
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
         )
         .unwrap();

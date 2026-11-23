@@ -29,6 +29,7 @@
 //! Output preserves the *original* input order (only per-partition ordering
 //! drives the windows).
 
+use crate::vars::Vars;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -77,11 +78,7 @@ struct OutField<'a> {
 }
 
 /// `$setWindowFields` over `docs`, every output document collected.
-pub fn set_window_fields_stage(
-    spec: &Bson,
-    docs: Vec<Document>,
-    vars: &Document,
-) -> R<Vec<Document>> {
+pub fn set_window_fields_stage(spec: &Bson, docs: Vec<Document>, vars: &Vars) -> R<Vec<Document>> {
     let mut out = Vec::with_capacity(docs.len());
     set_window_fields_each(spec, docs, vars, None, None, None, &mut |d| {
         out.push(d);
@@ -112,7 +109,7 @@ pub fn set_window_fields_stage(
 pub(crate) fn set_window_fields_each(
     spec: &Bson,
     docs: Vec<Document>,
-    vars: &Document,
+    vars: &Vars,
     downstream: Option<&std::collections::BTreeSet<String>>,
     sizes: Option<&[usize]>,
     reads: Option<&mut Vec<usize>>,
@@ -135,7 +132,7 @@ pub fn set_window_fields_spec_refusal(spec: &Bson, presorted: bool) -> Option<Fa
     match window_fields_each(
         spec,
         Vec::new(),
-        &Document::new(),
+        &Vars::new(),
         None,
         None,
         presorted,
@@ -156,7 +153,7 @@ pub fn set_window_fields_spec_refusal(spec: &Bson, presorted: bool) -> Option<Fa
 pub(crate) fn internal_set_window_fields_each(
     spec: &Bson,
     docs: Vec<Document>,
-    vars: &Document,
+    vars: &Vars,
     downstream: Option<&std::collections::BTreeSet<String>>,
     sizes: Option<&[usize]>,
     reads: Option<&mut Vec<usize>>,
@@ -171,7 +168,7 @@ pub(crate) fn internal_set_window_fields_each(
 fn window_fields_each(
     spec: &Bson,
     docs: Vec<Document>,
-    vars: &Document,
+    vars: &Vars,
     downstream: Option<&std::collections::BTreeSet<String>>,
     sizes: Option<&[usize]>,
     presorted: bool,
@@ -969,7 +966,7 @@ const COVARIANCE: usize = 568;
 /// mongod's executors build it: `$integral`'s point is `[sortBy value,
 /// input]`, the others' their argument evaluated (a covariance's is the
 /// `[x, y]` array). An error is sized as `null`: the answer pass reports it.
-fn function_input(c: &OutField, doc: &Document, sort_field: Option<&str>, vars: &Document) -> Bson {
+fn function_input(c: &OutField, doc: &Document, sort_field: Option<&str>, vars: &Vars) -> Bson {
     if c.op == "$integral" {
         let input = c
             .arg
@@ -1081,7 +1078,7 @@ impl FunctionMemory {
         slots: &[usize],
         docs: &[Document],
         sort_field: Option<&str>,
-        vars: &Document,
+        vars: &Vars,
         sizer: &CacheSize,
         ranks: Option<&Ranks>,
     ) -> R<(usize, usize)> {
@@ -1334,7 +1331,7 @@ enum CacheSize<'a> {
     SortKey {
         partition_by: Option<&'a Bson>,
         sort_by: &'a Document,
-        vars: &'a Document,
+        vars: &'a Vars,
     },
     /// `$_internalSetWindowFields`' rank functions read the sort key the
     /// documents came with, by their index in the stage's input: one value
@@ -1392,7 +1389,7 @@ pub(crate) fn sort_key(
     doc: &Document,
     partition_by: Option<&Bson>,
     sort_by: Option<&Document>,
-    vars: &Document,
+    vars: &Vars,
 ) -> Bson {
     let mut parts = Vec::new();
     if let Some(by) = partition_by {
@@ -1424,7 +1421,7 @@ pub(crate) fn reads_sort_key(spec: &Bson) -> bool {
 
 /// `doc`'s partition key as `PartitionKeyComparator` holds it: missing is
 /// null.
-fn partition_key(doc: &Document, by: &Bson, vars: &Document) -> Bson {
+fn partition_key(doc: &Document, by: &Bson, vars: &Vars) -> Bson {
     match expressions::evaluate_field(doc, by, vars) {
         Ok(expressions::Field::Value(v)) => v,
         Ok(expressions::Field::Missing) | Err(_) => Bson::Null,
@@ -1510,7 +1507,7 @@ fn run_cache(
     token: PartitionToken,
     range_vals: Option<&[f64]>,
     range_dates: Option<&[f64]>,
-    vars: &Document,
+    vars: &Vars,
     spill: &mut CacheSpill,
     stats: &mut WindowMemory,
 ) -> R<()> {
@@ -1831,7 +1828,7 @@ fn removable_window(
     range_vals: Option<&[f64]>,
     range_dates: Option<&[f64]>,
     sort_field: Option<&str>,
-    vars: &Document,
+    vars: &Vars,
 ) -> R<Vec<Bson>> {
     let n = slots.len();
     let mut values: Vec<Bson> = Vec::with_capacity(n);
@@ -2063,7 +2060,7 @@ fn value_arith(op: &str, a: &Bson, b: &Bson) -> R<Bson> {
         ],
     );
     // Every window function runs per document; nothing here is folded.
-    expressions::evaluate(&Document::new(), &Bson::Document(args), &Document::new())
+    expressions::evaluate(&Document::new(), &Bson::Document(args), &Vars::new())
         .map_err(|f| f.with_folded(false))
 }
 
@@ -2196,7 +2193,7 @@ fn derivative_value(
     slots: &[usize],
     docs: &[Document],
     sort_field: &str,
-    vars: &Document,
+    vars: &Vars,
 ) -> R<Bson> {
     if high < low {
         return Ok(Bson::Null);
@@ -2580,7 +2577,7 @@ fn shift_value(
     pos: usize,
     slots: &[usize],
     docs: &[Document],
-    vars: &Document,
+    vars: &Vars,
 ) -> R<Bson> {
     let by = match spec.get("by") {
         Some(Bson::Int32(n)) => *n as i64,
@@ -2649,12 +2646,7 @@ fn ema_alpha(spec: &Document) -> R<f64> {
 ///
 /// The double output path is unchanged IEEE arithmetic, so the common case
 /// stays bit-for-bit with the oracle; the decimal accumulator runs beside it.
-fn ema_values(
-    slots: &[usize],
-    docs: &[Document],
-    spec: &Document,
-    vars: &Document,
-) -> R<Vec<Bson>> {
+fn ema_values(slots: &[usize], docs: &[Document], spec: &Document, vars: &Vars) -> R<Vec<Bson>> {
     ema_alpha(spec)?; // validates exactly-one-of N/alpha and their ranges
     let alpha_dec = ema_alpha_decimal(spec)?;
     let one_minus_dec = decimal::add(
@@ -2744,7 +2736,7 @@ fn window_vector(
     docs: &[Document],
     arg: &Bson,
     sort_field: Option<&str>,
-    vars: &Document,
+    vars: &Vars,
 ) -> R<Vec<Bson>> {
     match op {
         "$expMovingAvg" => ema_values(slots, docs, arg.as_document().ok_or(Fallback::Defer)?, vars),
@@ -2758,7 +2750,7 @@ fn window_vector(
 
 /// `$locf` — last observation of `expr` carried forward over the sorted
 /// partition; leading nulls (before the first non-null) stay null.
-fn locf_values(slots: &[usize], docs: &[Document], expr: &Bson, vars: &Document) -> R<Vec<Bson>> {
+fn locf_values(slots: &[usize], docs: &[Document], expr: &Bson, vars: &Vars) -> R<Vec<Bson>> {
     let mut out = Vec::with_capacity(slots.len());
     let mut last: Option<Bson> = None;
     for &i in slots {
@@ -2782,7 +2774,7 @@ fn linear_fill_values(
     docs: &[Document],
     expr: &Bson,
     sort_field: &str,
-    vars: &Document,
+    vars: &Vars,
 ) -> R<Vec<Bson>> {
     let mut ys: Vec<Bson> = Vec::with_capacity(slots.len());
     let mut xs: Vec<Bson> = Vec::with_capacity(slots.len());
@@ -3036,7 +3028,7 @@ mod budget_tests {
         set_window_fields_each(
             spec,
             docs(),
-            &Document::new(),
+            &Vars::new(),
             Some(&downstream),
             None,
             None,
@@ -3081,7 +3073,7 @@ mod budget_tests {
             set_window_fields_each(
                 &window(output, partitioned),
                 docs.clone(),
-                &Document::new(),
+                &Vars::new(),
                 None,
                 None,
                 Some(&mut reads),
@@ -3113,18 +3105,10 @@ mod budget_tests {
             "output": {"t": {"$sum": "$n"}},
         });
         let mut out = Vec::new();
-        internal_set_window_fields_each(
-            &spec,
-            docs,
-            &Document::new(),
-            None,
-            None,
-            None,
-            &mut |d| {
-                out.push(d);
-                Ok(())
-            },
-        )
+        internal_set_window_fields_each(&spec, docs, &Vars::new(), None, None, None, &mut |d| {
+            out.push(d);
+            Ok(())
+        })
         .unwrap();
         let totals: Vec<(i32, i32)> = out
             .iter()
@@ -3160,7 +3144,7 @@ mod budget_tests {
             internal_set_window_fields_each(
                 &spec,
                 docs,
-                &Document::new(),
+                &Vars::new(),
                 None,
                 None,
                 None,
@@ -3219,7 +3203,7 @@ mod budget_tests {
             let r = internal_set_window_fields_each(
                 &spec,
                 docs,
-                &Document::new(),
+                &Vars::new(),
                 None,
                 None,
                 None,
@@ -3271,9 +3255,7 @@ mod budget_tests {
                 true,
             );
             let (_, report) = memlimit::captured(|| {
-                set_window_fields_each(&spec, docs, &Document::new(), None, None, None, &mut |_| {
-                    Ok(())
-                })
+                set_window_fields_each(&spec, docs, &Vars::new(), None, None, None, &mut |_| Ok(()))
             });
             (report.windows[0].max_total_memory, size)
         };
@@ -3299,7 +3281,7 @@ mod budget_tests {
             "output": {"all": {"$push": "$$ROOT"}},
         });
         let mut out = Vec::new();
-        set_window_fields_each(&spec, docs, &Document::new(), None, None, None, &mut |d| {
+        set_window_fields_each(&spec, docs, &Vars::new(), None, None, None, &mut |d| {
             out.push(d);
             Ok(())
         })
@@ -3325,15 +3307,9 @@ mod budget_tests {
     fn a_window_reports_its_memory_at_its_peak() {
         let spec = window(bson!({"$first": "$n"}), false);
         let (_, report) = memlimit::captured(|| {
-            set_window_fields_each(
-                &spec,
-                docs(),
-                &Document::new(),
-                None,
-                None,
-                None,
-                &mut |_| Ok(()),
-            )
+            set_window_fields_each(&spec, docs(), &Vars::new(), None, None, None, &mut |_| {
+                Ok(())
+            })
         });
         let total: usize = docs().iter().map(memlimit::document_size).sum();
         let stats = &report.windows[0];
@@ -3345,15 +3321,9 @@ mod budget_tests {
                 window_fields: 10_000,
                 ..Default::default()
             });
-            set_window_fields_each(
-                &spec,
-                docs(),
-                &Document::new(),
-                None,
-                None,
-                None,
-                &mut |_| Ok(()),
-            )
+            set_window_fields_each(&spec, docs(), &Vars::new(), None, None, None, &mut |_| {
+                Ok(())
+            })
         });
         let stats = &report.windows[0];
         assert!(stats.spills > 0);
@@ -3407,15 +3377,9 @@ mod budget_tests {
                 ..Default::default()
             });
             let _t = crate::spill_table::with_tables(Some(Arc::new(Engine(seen.clone()))));
-            set_window_fields_each(
-                &spec,
-                docs(),
-                &Document::new(),
-                None,
-                None,
-                None,
-                &mut |_| Ok(()),
-            )
+            set_window_fields_each(&spec, docs(), &Vars::new(), None, None, None, &mut |_| {
+                Ok(())
+            })
         });
         let stats = &report.windows[0];
         let seen = seen.lock().unwrap();
@@ -3526,7 +3490,7 @@ mod budget_tests {
                     set_window_fields_each(
                         &window(Bson::Document(output), false),
                         docs,
-                        &Document::new(),
+                        &Vars::new(),
                         None,
                         None,
                         None,
@@ -3547,7 +3511,7 @@ mod budget_tests {
                 set_window_fields_each(
                     &window(output, false),
                     docs,
-                    &Document::new(),
+                    &Vars::new(),
                     None,
                     None,
                     None,
@@ -3622,7 +3586,7 @@ mod range_current_tests {
             "c": {"$count": {}, "window": w},
         }});
         let mut out = Vec::new();
-        set_window_fields_each(&spec, docs, &Document::new(), None, None, None, &mut |d| {
+        set_window_fields_each(&spec, docs, &Vars::new(), None, None, None, &mut |d| {
             let t = d.get_array("t").unwrap();
             let t = t.iter().map(|v| v.as_i32().unwrap()).collect();
             out.push((

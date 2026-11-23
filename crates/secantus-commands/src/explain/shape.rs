@@ -673,7 +673,7 @@ fn listed_window_output(spec: &Document) -> Document {
                 let as_decimal = secantus_core::expressions::evaluate(
                     &Document::new(),
                     &Bson::Document(doc! { "$toDecimal": alpha.clone() }),
-                    &Document::new(),
+                    &secantus_core::vars::Vars::new(),
                 )
                 .unwrap_or_else(|_| alpha.clone());
                 out.insert("alpha", as_decimal);

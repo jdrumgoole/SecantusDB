@@ -7,6 +7,7 @@
 //! non-numeric/non-date value under `linear`, and on a `partitionBy` expression
 //! the evaluator can't reproduce.
 
+use crate::vars::Vars;
 use std::collections::HashMap;
 
 use bson::{Bson, Document};
@@ -48,7 +49,7 @@ fn field_value(doc: &Document, field: &str) -> Bson {
     paths::get_path(doc, field).cloned().unwrap_or(Bson::Null)
 }
 
-pub fn fill_stage(spec: &Bson, docs: Vec<Document>, vars: &Document) -> R<Vec<Document>> {
+pub fn fill_stage(spec: &Bson, docs: Vec<Document>, vars: &Vars) -> R<Vec<Document>> {
     let spec = spec.as_document().ok_or(Fallback::Defer)?;
     let output = spec
         .get("output")
@@ -154,7 +155,7 @@ fn partition_key(
     doc: &Document,
     fields: Option<&[String]>,
     by: Option<&Bson>,
-    vars: &Document,
+    vars: &Vars,
 ) -> R<Vec<u8>> {
     let key_val = partition_value(doc, fields, by, vars)?;
     let mut wrap = Document::new();
@@ -167,7 +168,7 @@ fn partition_value(
     doc: &Document,
     fields: Option<&[String]>,
     by: Option<&Bson>,
-    vars: &Document,
+    vars: &Vars,
 ) -> R<Bson> {
     Ok(if let Some(fields) = fields {
         let mut d = Document::new();

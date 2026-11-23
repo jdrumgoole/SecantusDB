@@ -57,12 +57,19 @@ fn prepare_mixed(st: &Storage, gid: &str) {
             false,
             false,
             &[],
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
             None,
             false,
         )?;
-        st.delete_matching("app", "t", &doc! {"_id": 3}, 0, &Document::new(), None)?;
+        st.delete_matching(
+            "app",
+            "t",
+            &doc! {"_id": 3},
+            0,
+            &secantus_core::vars::Vars::new(),
+            None,
+        )?;
         st.create_collection("app", "made")?;
         st.insert_one("app", "made", &enc(&doc! {"_id": 9}))?;
         Ok::<(), StorageError>(())

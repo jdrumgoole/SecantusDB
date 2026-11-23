@@ -14,7 +14,8 @@ fn strength(n: i32) -> Collation {
 
 fn run(docs: Vec<Document>, pipeline: Vec<Document>, coll: Option<&Collation>) -> Vec<Document> {
     let stages: Vec<Bson> = pipeline.into_iter().map(Bson::Document).collect();
-    aggregate::apply_pipeline(docs, &stages, &Document::new(), coll).expect("pipeline")
+    aggregate::apply_pipeline(docs, &stages, &secantus_core::vars::Vars::new(), coll)
+        .expect("pipeline")
 }
 
 fn eval(expr: Bson, coll: Option<&Collation>) -> Bson {
@@ -175,7 +176,9 @@ fn expr_in_against_constants_never_widens_under_a_collation() {
     let matched = |filter: Document| -> Vec<i32> {
         letters()
             .iter()
-            .filter(|d| query::matches(d, &filter, &Document::new(), Some(&s2)).unwrap())
+            .filter(|d| {
+                query::matches(d, &filter, &secantus_core::vars::Vars::new(), Some(&s2)).unwrap()
+            })
             .map(|d| d.get_i32("_id").unwrap())
             .collect()
     };
@@ -200,7 +203,7 @@ fn expr_in_against_constants_never_widens_under_a_collation() {
 #[test]
 fn always_true_and_always_false() {
     let d = doc! {"a": 1};
-    let m = |f: Document| query::matches(&d, &f, &Document::new(), None);
+    let m = |f: Document| query::matches(&d, &f, &secantus_core::vars::Vars::new(), None);
     assert_eq!(m(doc! {"$alwaysTrue": 1}).ok(), Some(true));
     assert_eq!(m(doc! {"$alwaysFalse": 1}).ok(), Some(false));
     assert!(m(doc! {"$alwaysTrue": 0}).is_err());

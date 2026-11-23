@@ -115,7 +115,7 @@ impl ProfileFilter {
     /// Whether the profile entry `entry` passes the filter, or why the
     /// filter could not be evaluated against it.
     pub fn matches(&self, entry: &Document) -> Result<bool, String> {
-        secantus_core::query::matches(entry, &self.query, &Document::new(), None)
+        secantus_core::query::matches(entry, &self.query, &secantus_core::vars::Vars::new(), None)
             .map_err(|e| format!("{e:?}"))
     }
 }
@@ -414,7 +414,12 @@ impl Parser {
     /// The matcher's own refusal of one clause, found without a document.
     fn leaf(&self, key: &str, value: &Bson) -> Result<(), CommandError> {
         let clause = one(key, value.clone());
-        match secantus_core::query::matches(&Document::new(), &clause, &Document::new(), None) {
+        match secantus_core::query::matches(
+            &Document::new(),
+            &clause,
+            &secantus_core::vars::Vars::new(),
+            None,
+        ) {
             Ok(_) => Ok(()),
             Err(refusal) => match refusal.as_mongo() {
                 Some((code, msg)) => Err(error(code, msg)),

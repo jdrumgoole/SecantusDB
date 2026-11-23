@@ -37,6 +37,7 @@ use super::{catalog, parsed, resolve_hint};
 use crate::storage::{Pulled, RawHint, RecordId, Storage, StorageError};
 use bson::{doc, Bson, Document};
 use secantus_core::collation::Collation;
+use secantus_core::vars::Vars;
 use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::collections::BTreeSet;
@@ -50,7 +51,7 @@ pub(crate) struct Ask<'a> {
     pub sort: Option<&'a Document>,
     pub hint: Option<RawHint<'a>>,
     pub collation: Option<&'a Collation>,
-    pub vars: &'a Document,
+    pub vars: &'a Vars,
     /// How many documents the caller takes from the front (`skip` plus
     /// `limit`); 0 is all of them. It is part of which plan mongod keeps.
     pub limit: i64,

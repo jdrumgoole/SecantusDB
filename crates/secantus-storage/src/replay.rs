@@ -13,6 +13,7 @@
 //! restores a Python-written backup and vice versa.
 
 use bson::{Bson, Document, Timestamp};
+use secantus_core::vars::Vars;
 
 use crate::{Storage, StorageError};
 
@@ -35,8 +36,8 @@ fn ns_split(ns: &str) -> (String, String) {
     }
 }
 
-fn empty_doc() -> Document {
-    Document::new()
+fn empty_doc() -> Vars {
+    secantus_core::vars::Vars::new()
 }
 
 /// An index build entry's `indexBuildUUID`.

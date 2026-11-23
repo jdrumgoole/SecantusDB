@@ -575,14 +575,13 @@ pub(crate) fn bucket_matches(bucket: &Document, filter: &Document) -> Result<boo
             _ => {
                 let mut one = Document::new();
                 one.insert(key.clone(), value.clone());
-                secantus_core::query::matches(bucket, &one, &Document::new(), None).map_err(
-                    |f| match f {
+                secantus_core::query::matches(bucket, &one, &secantus_core::vars::Vars::new(), None)
+                    .map_err(|f| match f {
                         secantus_core::fallback::Fallback::Mongo { code, message, .. } => {
                             CommandError::new(code, crate::util::error_code_name(code), message)
                         }
                         _ => CommandError::new(2, "BadValue", "unsupported bucket filter"),
-                    },
-                )?
+                    })?
             }
         };
         if !ok {

@@ -1601,7 +1601,7 @@ impl crate::PgHandler {
                 .map(|x| x as u64);
             visible.insert(c as u64, (xmin, d));
         }
-        let empty = Document::new();
+        let empty = secantus_core::vars::Vars::new();
         let passes = |d: &Document| {
             secantus_core::query::matches(d, filter, &empty, None).unwrap_or(false)
                 && plan.residual.as_ref().is_none_or(|r| {

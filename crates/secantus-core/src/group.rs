@@ -19,6 +19,7 @@
 //! Any unported / deferring construct returns `Err(Fallback::Defer)` and the pure-Python
 //! `$group` runs instead.
 
+use crate::vars::Vars;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -40,7 +41,7 @@ use crate::summation::DoubleDoubleSum;
 /// signal the unit `()` used to be, so every site that had one behaves as before.
 type R<T> = Result<T, Fallback>;
 
-fn eval(expr: &Bson, doc: &Document, vars: &Document) -> R<Bson> {
+fn eval(expr: &Bson, doc: &Document, vars: &Vars) -> R<Bson> {
     expressions::evaluate(doc, expr, vars)
 }
 
@@ -49,7 +50,7 @@ fn eval(expr: &Bson, doc: &Document, vars: &Document) -> R<Bson> {
 /// (incl. a present null) yields `Some(value)`. Mirrors
 /// `expressions.evaluate_or_missing`; `$push` / `$addToSet` skip missing values as
 /// mongod does.
-fn eval_or_missing(expr: &Bson, doc: &Document, vars: &Document) -> R<Option<Bson>> {
+fn eval_or_missing(expr: &Bson, doc: &Document, vars: &Vars) -> R<Option<Bson>> {
     if let Bson::String(s) = expr {
         if let Some(path) = s.strip_prefix('$') {
             if !path.starts_with('$') {
@@ -68,7 +69,7 @@ fn eval_or_missing(expr: &Bson, doc: &Document, vars: &Document) -> R<Option<Bso
 /// while a document of several fields drops a missing one as any object
 /// expression does (`{a: "$nope", b: "$b"}` groups under `{b: ..}`):
 /// measured 8.2.11.
-fn group_key(id_expr: &Bson, d: &Document, vars: &Document) -> R<Bson> {
+fn group_key(id_expr: &Bson, d: &Document, vars: &Vars) -> R<Bson> {
     if let Bson::Document(spec) = id_expr {
         if spec.len() == 1 {
             let (k, e) = spec.iter().next().unwrap();
@@ -83,7 +84,7 @@ fn group_key(id_expr: &Bson, d: &Document, vars: &Document) -> R<Bson> {
 
 /// A key expression's value: null when it is MISSING, and a real `undefined`
 /// as itself, a key of its own apart from null (RM-635).
-fn key_value(expr: &Bson, d: &Document, vars: &Document) -> R<Bson> {
+fn key_value(expr: &Bson, d: &Document, vars: &Vars) -> R<Bson> {
     Ok(match expressions::evaluate_field(d, expr, vars)? {
         expressions::Field::Missing => Bson::Null,
         expressions::Field::Value(v) => v,
@@ -816,7 +817,7 @@ pub(crate) fn new_acc(op: &str) -> R<Acc> {
 
 /// A fresh accumulator to merge spilled states into: mongod's
 /// `startNewGroup`, whose initializer gives the N accumulators their `n`.
-pub(crate) fn merging_acc(op: &str, arg: &Bson, vars: &Document) -> R<Acc> {
+pub(crate) fn merging_acc(op: &str, arg: &Bson, vars: &Vars) -> R<Acc> {
     let mut acc = new_acc(op)?;
     match &mut acc {
         Acc::NElem { n, .. } => {
@@ -927,7 +928,7 @@ fn percentile_finalize(is_median: bool, ps: Option<Vec<f64>>, mut values: Vec<f6
 
 /// `arg == 1 and not isinstance(arg, bool)` in Python — the literal-count
 /// fast path. A bool operand is *not* one here (mongod ignores it in `$sum`).
-pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Document) -> R<()> {
+pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Vars) -> R<()> {
     match acc {
         Acc::Sum(running) => {
             // A numeric literal is mongod's constant sum; the first document
@@ -1205,7 +1206,7 @@ fn validate_n(v: &Bson) -> R<usize> {
 /// An N-accumulator's `n`: an initializer, evaluated against an EMPTY
 /// document -- not the group's documents, and not its key either: `n: "$k"`
 /// and `n: "$_id"` are both missing (measured 8.2.11, 2026-10-22).
-fn group_n(n_expr: &Bson, vars: &Document) -> R<usize> {
+fn group_n(n_expr: &Bson, vars: &Vars) -> R<usize> {
     // A constant double mongod cannot make a long fails while it optimizes
     // the pipeline, before any group starts.
     if let Bson::Double(d) = n_expr {
@@ -1247,7 +1248,7 @@ fn group_n(n_expr: &Bson, vars: &Document) -> R<usize> {
 /// when the stage is built, so its error has no executor wrapper (7548606);
 /// any other is evaluated, against an empty document as the classic engine
 /// does, when a group starts (7548607). Measured 8.2.11, 2026-10-23.
-fn sbe_n(n_expr: &Bson, vars: &Document) -> R<usize> {
+fn sbe_n(n_expr: &Bson, vars: &Vars) -> R<usize> {
     const MSG: &str = "parameter 'n' must be coercible to a positive 64-bit integer";
     let constant =
         crate::aggregate::is_constant_expression(n_expr, &vars.keys().cloned().collect::<Vec<_>>());
@@ -2603,7 +2604,7 @@ fn run_group(
     id_expr: &Bson,
     accumulators: &[(String, Bson)],
     docs: &[Document],
-    vars: &Document,
+    vars: &Vars,
 ) -> R<Vec<Document>> {
     // Every accumulator is parsed before any document is read.
     expression_object_check(id_expr)?;
@@ -2862,7 +2863,7 @@ pub(crate) fn output_stores(spec: &Bson, out: &[Document]) -> Vec<crate::docstor
 }
 
 /// `$group` stage entry point.
-pub fn group_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Document>> {
+pub fn group_stage(spec: &Bson, docs: &[Document], vars: &Vars) -> R<Vec<Document>> {
     let Bson::Document(s) = spec else {
         return Err(Fallback::Defer);
     };
@@ -2880,7 +2881,7 @@ pub fn group_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Doc
 /// `$sortByCount` — `group({_id: spec, count: {$sum: 1}})` then a stable sort by
 /// `count` descending (ties keep group insertion order, matching Python's
 /// `list.sort(reverse=True)` stability).
-pub fn sort_by_count_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Document>> {
+pub fn sort_by_count_stage(spec: &Bson, docs: &[Document], vars: &Vars) -> R<Vec<Document>> {
     // mongod: a $-prefixed path string, or a single-`$`-key expression object;
     // anything else (number/bool/array/null -> 40149, bare string -> 40148,
     // non-expression object -> 40147) defers so Python raises the exact code.
@@ -2910,7 +2911,7 @@ fn accumulate_into(
     id: Bson,
     output_spec: &Document,
     docs: &[&Document],
-    vars: &Document,
+    vars: &Vars,
 ) -> R<Document> {
     let mut compiled: Vec<(&str, &Bson, Acc)> = Vec::with_capacity(output_spec.len());
     for (field, spec) in output_spec {
@@ -2952,7 +2953,7 @@ fn bucket_ctype(v: &Bson) -> &'static str {
 ///   `default`; with no default an unplaced document is 7158303;
 /// - the buckets come out sorted by `_id`, so a string `default` comes before
 ///   date buckets and a numeric one below the boundaries first.
-pub fn bucket_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Document>> {
+pub fn bucket_stage(spec: &Bson, docs: &[Document], vars: &Vars) -> R<Vec<Document>> {
     let Bson::Document(s) = spec else {
         return Err(Fallback::Defer);
     };
@@ -3438,7 +3439,7 @@ fn bucket_auto_granular(
     n_buckets: usize,
     granularity: &str,
     output_spec: &Document,
-    vars: &Document,
+    vars: &Vars,
 ) -> R<Vec<Document>> {
     let n = keyed.len();
     let mut values: Vec<Bson> = Vec::with_capacity(n);
@@ -3535,7 +3536,7 @@ fn bucket_auto_granular(
     Ok(out)
 }
 
-pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<Vec<Document>> {
+pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Vars) -> R<Vec<Document>> {
     // `DocumentSourceBucketAuto::createFromBson`: the arguments are checked
     // in the order they are written, every error bare (measured 8.2.11,
     // 2026-10-22).
@@ -3878,7 +3879,7 @@ fn percentile_ps(raw: &Bson) -> Result<Vec<f64>, Fallback> {
             ),
         ));
     }
-    let value = crate::expressions::evaluate(&Document::new(), raw, &Document::new())?;
+    let value = crate::expressions::evaluate(&Document::new(), raw, &Vars::new())?;
     let items = match &value {
         Bson::Array(items) if !items.is_empty() => items,
         other => {
@@ -3949,7 +3950,7 @@ mod tests {
     use bson::doc;
 
     fn g(spec: bson::Bson, docs: Vec<Document>) -> Vec<Document> {
-        group_stage(&spec, &docs, &Document::new()).expect("should not defer")
+        group_stage(&spec, &docs, &Vars::new()).expect("should not defer")
     }
 
     #[test]
@@ -4055,7 +4056,7 @@ mod tests {
             bson::bson!({"$topN": {"n": 0, "sortBy": {"score": -1}, "output": "$s"}}),
         ] {
             let spec = bson::bson!({"_id": Bson::Null, "r": bad});
-            assert!(group_stage(&spec, &d, &Document::new()).is_err());
+            assert!(group_stage(&spec, &d, &Vars::new()).is_err());
         }
     }
 
@@ -4139,7 +4140,7 @@ mod tests {
         let out = group_stage(
             &bson::bson!({"_id": Bson::Null, "mn": {"$min": "$v"}, "mx": {"$max": "$v"}}),
             &docs,
-            &Document::new(),
+            &Vars::new(),
         )
         .unwrap();
         assert_eq!(out[0].get("mn"), Some(&Bson::Int32(10))); // smallest = number
@@ -4158,7 +4159,7 @@ mod tests {
         let out = group_stage(
             &bson::bson!({"_id": Bson::Null, "s": {"$sum": "$v"}, "a": {"$avg": "$v"}}),
             &docs,
-            &Document::new(),
+            &Vars::new(),
         )
         .unwrap();
         assert_eq!(out[0].get("s"), Some(&Bson::Double(12.5))); // 10 + 2.5
@@ -4167,7 +4168,7 @@ mod tests {
         let out2 = group_stage(
             &bson::bson!({"_id": Bson::Null, "s": {"$sum": "$v"}, "a": {"$avg": "$v"}}),
             &[doc! {"v": "x"}, doc! {"v": true}],
-            &Document::new(),
+            &Vars::new(),
         )
         .unwrap();
         assert_eq!(out2[0].get("s"), Some(&Bson::Int32(0)));
@@ -4228,7 +4229,7 @@ mod tests {
             doc! {"k": "c"},
             doc! {"k": "b"},
         ];
-        let out = sort_by_count_stage(&bson::bson!("$k"), &docs, &Document::new()).unwrap();
+        let out = sort_by_count_stage(&bson::bson!("$k"), &docs, &Vars::new()).unwrap();
         // a:2, b:2, c:1 -> a, b (insertion-order tie), c
         assert_eq!(out[0].get("_id"), Some(&Bson::String("a".into())));
         assert_eq!(out[1].get("_id"), Some(&Bson::String("b".into())));
@@ -4354,7 +4355,7 @@ mod held_value_memory_tests {
         let arg = Bson::Document(doc! {"n": 2, "input": "$s"});
         for i in 0..50 {
             let d = doc! {"s": "x".repeat(i)};
-            apply_acc(&mut acc, &arg, &d, &Document::new()).unwrap();
+            apply_acc(&mut acc, &arg, &d, &Vars::new()).unwrap();
         }
         // The last two strings, 48 and 49 bytes: n + 40 each.
         assert_eq!(acc_memory(&acc), memlimit::LAYOUT.first_last_n + 88 + 89);
@@ -4372,7 +4373,7 @@ mod bucket_auto_granularity_type_tests {
     fn bounds(values: Vec<Bson>, gran: &str, buckets: i32) -> Vec<(Bson, Bson)> {
         let docs: Vec<Document> = values.into_iter().map(|v| doc! {"x": v}).collect();
         let spec = bson!({"groupBy": "$x", "buckets": buckets, "granularity": gran});
-        bucket_auto_stage(&spec, &docs, &Document::new())
+        bucket_auto_stage(&spec, &docs, &Vars::new())
             .unwrap()
             .into_iter()
             .map(|d| {
@@ -4434,7 +4435,7 @@ mod bucket_auto_granularity_type_tests {
     fn refusal(values: Vec<Bson>) -> Option<(i32, String)> {
         let docs: Vec<Document> = values.into_iter().map(|v| doc! {"x": v}).collect();
         let spec = bson!({"groupBy": "$x", "buckets": 2, "granularity": "R5"});
-        bucket_auto_stage(&spec, &docs, &Document::new())
+        bucket_auto_stage(&spec, &docs, &Vars::new())
             .err()
             .and_then(|e| e.as_mongo().map(|(c, m)| (c, m.to_string())))
     }
@@ -4481,7 +4482,7 @@ mod bucket_auto_granularity_type_tests {
         // A missing field is named as such.
         let docs = vec![doc! {"y": 1}, doc! {"x": 1}];
         let spec = bson!({"groupBy": "$x", "buckets": 2, "granularity": "R5"});
-        let err = bucket_auto_stage(&spec, &docs, &Document::new()).unwrap_err();
+        let err = bucket_auto_stage(&spec, &docs, &Vars::new()).unwrap_err();
         assert_eq!(
             err.as_mongo().map(|(c, m)| (c, m.to_string())),
             typed("missing")

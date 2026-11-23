@@ -295,8 +295,15 @@ fn deleting_the_owner_frees_its_unique_key() {
             .unwrap();
         st.insert_one("app", "c", &enc(&doc! {"_id": 1, "k": "v"}))
             .unwrap();
-        st.delete_matching("app", "c", &doc! {"_id": 1}, 0, &doc! {}, None)
-            .unwrap();
+        st.delete_matching(
+            "app",
+            "c",
+            &doc! {"_id": 1},
+            0,
+            &secantus_core::vars::Vars::new(),
+            None,
+        )
+        .unwrap();
         st.insert_one("app", "c", &enc(&doc! {"_id": 2, "k": "v"}))
             .expect("the freed key must be reusable");
     });

@@ -1136,7 +1136,14 @@ impl PgHandler {
         def.extra.insert("partition_bound", bound);
         self.rewrite_catalog(name, &def)?;
         self.storage
-            .delete_matching(self.db(), name, &Document::new(), 0, &Document::new(), None)
+            .delete_matching(
+                self.db(),
+                name,
+                &Document::new(),
+                0,
+                &secantus_core::vars::Vars::new(),
+                None,
+            )
             .map_err(|e| Self::storage_err("could not attach the partition", e))?;
         self.insert_shaped(&root.name, rows)?;
         self.publish_user_types();

@@ -27,6 +27,7 @@
 
 use bson::{Bson, Document};
 use secantus_core::query::bson_type_name;
+use secantus_core::vars::Vars;
 
 use crate::CommandError;
 
@@ -1764,8 +1765,7 @@ pub fn unknown_operator_in_filter(filter: &Document) -> Option<(i32, String)> {
         }
         let mut clause = Document::new();
         clause.insert(key.clone(), value.clone());
-        let tried =
-            secantus_core::query::matches(&Document::new(), &clause, &Document::new(), None);
+        let tried = secantus_core::query::matches(&Document::new(), &clause, &Vars::new(), None);
         if let Err(refusal) = tried {
             if let Some((2, msg)) = refusal.as_mongo() {
                 if msg.starts_with("unknown operator") || msg.starts_with("unknown top level") {
@@ -1783,7 +1783,7 @@ pub fn unknown_operator_in_filter(filter: &Document) -> Option<(i32, String)> {
 }
 
 pub fn expression_problem_in_filter(filter: &Document, bound: &[String]) -> Option<(i32, String)> {
-    expression_problem_in_filter_with(filter, bound, &Document::new())
+    expression_problem_in_filter_with(filter, bound, &Vars::new())
 }
 
 /// [`expression_problem_in_filter`] with the values of the command's `let`,
@@ -1794,7 +1794,7 @@ pub fn expression_problem_in_filter(filter: &Document, bound: &[String]) -> Opti
 pub fn expression_problem_in_filter_with(
     filter: &Document,
     bound: &[String],
-    vars: &Document,
+    vars: &Vars,
 ) -> Option<(i32, String)> {
     if let Some(found) = unknown_operator_in_filter(filter) {
         return Some(found);

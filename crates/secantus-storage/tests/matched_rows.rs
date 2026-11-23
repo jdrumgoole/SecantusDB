@@ -48,7 +48,7 @@ fn update(st: &Storage, multi: bool) -> usize {
         multi,
         false,
         &[],
-        &Document::new(),
+        &secantus_core::vars::Vars::new(),
         None,
         None,
         false,
@@ -58,8 +58,15 @@ fn update(st: &Storage, multi: bool) -> usize {
 }
 
 fn delete(st: &Storage, limit: usize) -> usize {
-    st.delete_matching("app", "c", &none(), limit, &Document::new(), None)
-        .unwrap()
+    st.delete_matching(
+        "app",
+        "c",
+        &none(),
+        limit,
+        &secantus_core::vars::Vars::new(),
+        None,
+    )
+    .unwrap()
 }
 
 type Write = fn(&Storage) -> usize;

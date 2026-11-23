@@ -15,6 +15,7 @@
 //! that is found by testing the leaf with the array replaced by each element in
 //! turn, which is the same element-by-element walk the leaf makes.
 
+use crate::vars::Vars;
 use bson::{Bson, Document};
 
 use crate::fallback::Fallback;
@@ -218,7 +219,7 @@ fn first_array(doc: &Document, path: &str) -> Option<(String, usize)> {
 
 /// The position `leaf` records in `doc`: the first element of the first array
 /// on its path at which it matches.
-fn leaf_key(doc: &Document, leaf: &Leaf, vars: &Document) -> Result<Option<usize>, Fallback> {
+fn leaf_key(doc: &Document, leaf: &Leaf, vars: &Vars) -> Result<Option<usize>, Fallback> {
     if !leaf.records {
         return Ok(None);
     }
@@ -252,7 +253,7 @@ fn leaf_key(doc: &Document, leaf: &Leaf, vars: &Document) -> Result<Option<usize
 pub fn elem_match_key(
     doc: &Document,
     filter: &Document,
-    vars: &Document,
+    vars: &Vars,
 ) -> Result<Option<usize>, Fallback> {
     let mut all = Vec::new();
     leaves(filter, &mut all);
@@ -276,7 +277,7 @@ mod tests {
     fn key(filter: Document) -> Option<usize> {
         let d = doc! {"_id": 1, "arr": [10, 20, 30], "o": [{"k": 1}, {"k": 2}, {"k": 3}],
         "m": [[1, 2], [3, 4]]};
-        elem_match_key(&d, &filter, &Document::new()).unwrap()
+        elem_match_key(&d, &filter, &Vars::new()).unwrap()
     }
 
     /// Measured 8.2.11, 2026-10-24.

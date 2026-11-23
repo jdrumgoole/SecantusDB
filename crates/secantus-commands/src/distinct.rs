@@ -7,6 +7,7 @@
 //! collapse to one).
 
 use bson::{doc, Bson, Document};
+use secantus_core::vars::Vars;
 
 use crate::argtypes;
 use crate::util::{coll_arg, doc_field};
@@ -189,7 +190,7 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             sort: None,
             hint,
             collation: collation.as_ref(),
-            vars: &Document::new(),
+            vars: &Vars::new(),
             limit: 0,
             asked: crate::near::Asked {
                 cached: true,

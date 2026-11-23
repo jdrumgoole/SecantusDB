@@ -16,6 +16,7 @@
 //!   hints / unsupported query constructs become a `BadValue` (2) write error,
 //!   and engine/IO faults become `Internal`.
 
+use secantus_commands::vars::Vars;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -619,7 +620,7 @@ impl CmdStorage for StorageAdapter {
                 multi,
                 upsert,
                 &[],
-                &Document::new(),
+                &secantus_commands::vars::Vars::new(),
                 None,
                 None,
                 false,
@@ -643,7 +644,7 @@ impl CmdStorage for StorageAdapter {
         multi: bool,
         upsert: bool,
         array_filters: &[Document],
-        let_vars: &Document,
+        let_vars: &Vars,
         collation: Option<&Collation>,
         validator: Option<&Document>,
         validator_moderate: bool,
@@ -683,7 +684,7 @@ impl CmdStorage for StorageAdapter {
         pipeline: &[Bson],
         multi: bool,
         upsert: bool,
-        let_vars: &Document,
+        let_vars: &Vars,
         collation: Option<&Collation>,
         validator: Option<&Document>,
         validator_moderate: bool,
@@ -723,7 +724,7 @@ impl CmdStorage for StorageAdapter {
         multi: bool,
         upsert: bool,
         supplied: Option<&Document>,
-        let_vars: &Document,
+        let_vars: &Vars,
         collation: Option<&Collation>,
         validator: Option<&Document>,
         validator_moderate: bool,
@@ -762,7 +763,14 @@ impl CmdStorage for StorageAdapter {
         limit: usize,
     ) -> Result<usize, StorageError> {
         self.inner
-            .delete_matching(db, coll, filter, limit, &Document::new(), None)
+            .delete_matching(
+                db,
+                coll,
+                filter,
+                limit,
+                &secantus_commands::vars::Vars::new(),
+                None,
+            )
             .map_err(map_err)
     }
 
@@ -773,7 +781,7 @@ impl CmdStorage for StorageAdapter {
         coll: &str,
         filter: &Document,
         limit: usize,
-        let_vars: &Document,
+        let_vars: &Vars,
         collation: Option<&Collation>,
     ) -> Result<usize, StorageError> {
         self.inner
@@ -787,7 +795,7 @@ impl CmdStorage for StorageAdapter {
         coll: &str,
         filter: &Document,
         limit: usize,
-        let_vars: &Document,
+        let_vars: &Vars,
         collation: Option<&Collation>,
         hint: Option<RawHint<'_>>,
     ) -> Result<usize, StorageError> {
@@ -845,7 +853,7 @@ impl CmdStorage for StorageAdapter {
                 sort,
                 resolved.as_ref(),
                 None,
-                &Document::new(),
+                &secantus_commands::vars::Vars::new(),
             )
             .map(|docs| docs.into_iter().map(self.sql_view(db, coll)).collect())
             .map_err(map_err)
@@ -860,7 +868,7 @@ impl CmdStorage for StorageAdapter {
         sort: Option<&Document>,
         hint: Option<RawHint<'_>>,
         collation: Option<&Collation>,
-        let_vars: &Document,
+        let_vars: &Vars,
     ) -> Result<Vec<Vec<u8>>, StorageError> {
         let resolved = hint.map(to_hint);
         self.inner
@@ -964,7 +972,7 @@ impl CmdStorage for StorageAdapter {
         filter: &Document,
         hint: Option<RawHint<'_>>,
         collation: Option<&Collation>,
-        let_vars: &Document,
+        let_vars: &Vars,
     ) -> Result<Option<MatchedRows>, StorageError> {
         let resolved = hint.map(to_hint);
         self.inner

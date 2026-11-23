@@ -15,6 +15,7 @@
 use bson::{Bson, Document};
 pub use secantus_core::recordid::RecordId;
 pub use secantus_core::spill_table::SpillTables;
+use secantus_core::vars::Vars;
 // Re-exported so trait implementors (the WT adapter) can name the collation type
 // without a direct `secantus-core` dependency.
 pub use secantus_core::collation::Collation;
@@ -674,7 +675,7 @@ pub trait Storage: Send + Sync {
         multi: bool,
         upsert: bool,
         _array_filters: &[Document],
-        _let_vars: &Document,
+        _let_vars: &Vars,
         _collation: Option<&Collation>,
         _validator: Option<&Document>,
         // `validationLevel: "moderate"` — exempt docs that ALREADY failed the
@@ -700,7 +701,7 @@ pub trait Storage: Send + Sync {
         _pipeline: &[Bson],
         _multi: bool,
         _upsert: bool,
-        _let_vars: &Document,
+        _let_vars: &Vars,
         _collation: Option<&Collation>,
         _validator: Option<&Document>,
         // `validationLevel: "moderate"` — exempt docs that ALREADY failed the
@@ -728,7 +729,7 @@ pub trait Storage: Send + Sync {
         multi: bool,
         upsert: bool,
         supplied: Option<&Document>,
-        let_vars: &Document,
+        let_vars: &Vars,
         collation: Option<&Collation>,
         validator: Option<&Document>,
         validator_moderate: bool,
@@ -776,7 +777,7 @@ pub trait Storage: Send + Sync {
         coll: &str,
         filter: &Document,
         limit: usize,
-        _let_vars: &Document,
+        _let_vars: &Vars,
         _collation: Option<&Collation>,
     ) -> Result<usize, StorageError> {
         self.delete_matching(db, coll, filter, limit)
@@ -792,7 +793,7 @@ pub trait Storage: Send + Sync {
         coll: &str,
         filter: &Document,
         limit: usize,
-        let_vars: &Document,
+        let_vars: &Vars,
         collation: Option<&Collation>,
         _hint: Option<RawHint<'_>>,
     ) -> Result<usize, StorageError> {
@@ -850,7 +851,7 @@ pub trait Storage: Send + Sync {
         sort: Option<&Document>,
         hint: Option<RawHint<'_>>,
         _collation: Option<&Collation>,
-        _let_vars: &Document,
+        _let_vars: &Vars,
     ) -> Result<Vec<Vec<u8>>, StorageError> {
         self.find(db, coll, filter, sort, hint)
     }
@@ -891,7 +892,7 @@ pub trait Storage: Send + Sync {
         _filter: &Document,
         _hint: Option<RawHint<'_>>,
         _collation: Option<&Collation>,
-        _let_vars: &Document,
+        _let_vars: &Vars,
     ) -> Result<Option<MatchedRows>, StorageError> {
         Ok(None)
     }

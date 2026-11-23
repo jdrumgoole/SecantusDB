@@ -62,7 +62,7 @@ fn update_operator_single_match() {
                 false,
                 false,
                 &[],
-                &bson::Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
                 None,
                 true,
@@ -100,7 +100,7 @@ fn update_operator_multi() {
                 true,
                 false,
                 &[],
-                &bson::Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
                 None,
                 false,
@@ -128,7 +128,7 @@ fn update_no_op_when_unchanged() {
                 false,
                 false,
                 &[],
-                &bson::Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
                 None,
                 false,
@@ -154,7 +154,7 @@ fn update_replacement_preserves_id() {
                 false,
                 false,
                 &[],
-                &bson::Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
                 None,
                 false,
@@ -180,7 +180,7 @@ fn update_upsert_inserts_when_no_match() {
                 false,
                 true,
                 &[],
-                &bson::Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
                 None,
                 true,
@@ -217,7 +217,7 @@ fn update_upsert_uses_subdocument_id_from_filter() {
                 false,
                 true,
                 &[],
-                &bson::Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
                 None,
                 false,
@@ -251,7 +251,7 @@ fn update_maintains_index_entries() {
             false,
             false,
             &[],
-            &bson::Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
             None,
             false,
@@ -284,7 +284,7 @@ fn update_rejects_unique_conflict() {
             false,
             false,
             &[],
-            &bson::Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
             None,
             false,
@@ -308,7 +308,7 @@ fn update_operator_emits_v2_diff_oplog() {
             false,
             false,
             &[],
-            &bson::Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
             None,
             false,
@@ -341,7 +341,7 @@ fn update_replacement_emits_full_doc_oplog() {
             false,
             false,
             &[],
-            &bson::Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
             None,
             false,
@@ -372,8 +372,15 @@ fn delete_matching_single_and_multi() {
         );
         // limit=1 deletes one of the two x:1 docs.
         assert_eq!(
-            st.delete_matching("app", "c", &doc! {"x": 1}, 1, &bson::Document::new(), None)
-                .unwrap(),
+            st.delete_matching(
+                "app",
+                "c",
+                &doc! {"x": 1},
+                1,
+                &secantus_core::vars::Vars::new(),
+                None
+            )
+            .unwrap(),
             1
         );
         assert_eq!(
@@ -382,8 +389,15 @@ fn delete_matching_single_and_multi() {
         );
         // limit=0 deletes the rest of the x:1 docs.
         assert_eq!(
-            st.delete_matching("app", "c", &doc! {"x": 1}, 0, &bson::Document::new(), None)
-                .unwrap(),
+            st.delete_matching(
+                "app",
+                "c",
+                &doc! {"x": 1},
+                0,
+                &secantus_core::vars::Vars::new(),
+                None
+            )
+            .unwrap(),
             1
         );
         assert_eq!(
@@ -406,8 +420,15 @@ fn delete_maintains_index_entries() {
             1
         );
         assert_eq!(
-            st.delete_matching("app", "c", &doc! {"x": 7}, 0, &bson::Document::new(), None)
-                .unwrap(),
+            st.delete_matching(
+                "app",
+                "c",
+                &doc! {"x": 7},
+                0,
+                &secantus_core::vars::Vars::new(),
+                None
+            )
+            .unwrap(),
             1
         );
         // No stale index entry survives the delete.
@@ -429,7 +450,7 @@ fn delete_emits_oplog_delete_entry() {
             "c",
             &doc! {"_id": 42},
             0,
-            &bson::Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
         )
         .unwrap();
@@ -484,7 +505,7 @@ fn update_skips_oplog_when_disabled() {
                 false,
                 false,
                 &[],
-                &bson::Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
                 None,
                 false,

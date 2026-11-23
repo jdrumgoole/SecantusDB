@@ -779,7 +779,7 @@ impl PgHandler {
         if filter.is_empty() {
             return None;
         }
-        let empty = Document::new();
+        let empty = secantus_core::vars::Vars::new();
         let in_sets = secantus_core::query::InSets::prepare(&filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         let mut kept = Vec::new();
