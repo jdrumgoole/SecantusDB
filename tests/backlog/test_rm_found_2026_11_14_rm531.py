@@ -76,7 +76,7 @@ def _expression_error(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-654")
+@pytest.mark.backlog_fixed("RM-654")
 def test_a_documents_expression_error_is_the_expressions(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -85,7 +85,7 @@ def test_a_documents_expression_error_is_the_expressions(
     `$documents: [{x: {$divide: [1, 0]}}]` with 2 "Failed to optimize
     pipeline :: caused by :: can't $divide by zero", and the same inside a
     `$lookup` reading a `let` variable under the executor prefix too. This
-    server answers 2 "$documents expression not supported" to all three."""
+    server answered 2 "$documents expression not supported" to all three."""
     assert _expression_error(rust_mongo) == _expression_error(mongod_rs)
 
 

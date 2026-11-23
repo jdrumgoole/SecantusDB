@@ -1280,15 +1280,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-532.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm532.py::test_a_hybrid_search_names_the_collection_it_unions
       Backlog-ID: RM-644
-- [ ] **A `$documents` expression that fails answers "expression not
-      supported".** mongod 8.2.11 answers `$documents: {$divide: [1, 0]}`
-      (or an element `{x: {$divide: [1, 0]}}`) with 2 "Failed to optimize
-      pipeline :: caused by :: can't $divide by zero", and one reading a
-      `$lookup` `let` variable under the executor prefix as well. This
-      server answers 2 "$documents expression not supported" to all three,
-      discarding the evaluator's own error. Found 2026-11-14 working RM-531.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_a_documents_expression_error_is_the_expressions
-      Backlog-ID: RM-654
 - [ ] **A FETCH's residual `$or` lists its branches in `parsedQuery`'s
       order.** mongod 8.2.11 lists the `$or` a FETCH filters by behind an
       IXSCAN (`{k: {$gte: 2}, $or: [{"x.a": 1}, {x: {$type: [4]}}, {x: {$not:

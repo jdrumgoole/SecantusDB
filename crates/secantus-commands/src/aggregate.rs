@@ -3159,8 +3159,28 @@ fn documents_stage(
         ));
     }
     let empty = Document::new();
-    let value = secantus_core::expressions::evaluate(&empty, spec, vars)
-        .map_err(|_| bad_value("$documents expression not supported"))?;
+    // An expression that fails is reported with its own error. mongod
+    // optimizes the stage's argument as it builds the pipeline, so the error
+    // carries the optimizer's wrapper; a top-level constant is refused that
+    // way by `stage_fold_error` before a document is read, and one reaching
+    // here (a sub-pipeline's, reading a `let` variable) is optimized per
+    // outer document, under the executor prefix of the running command
+    // (RM-654, probed 8.2.11).
+    let value = secantus_core::expressions::evaluate(&empty, spec, vars).map_err(|f| {
+        let Some((code, msg)) = f.as_mongo() else {
+            return bad_value("$documents expression not supported");
+        };
+        let ns = COMMAND_NS.with(|n| n.borrow().clone());
+        CommandError::new(
+            code,
+            crate::util::error_code_name(code),
+            wrap_pipeline_error(
+                format!("Failed to optimize pipeline :: caused by :: {msg}"),
+                false,
+                ns.as_deref(),
+            ),
+        )
+    })?;
     let arr = match value {
         Bson::Array(a) => a,
         // mongod desugars `$documents` into a `$queue` the executor fills, so
@@ -7157,6 +7177,8 @@ fn stage_fold_error(stage: &bson::Document, vars: &Vars) -> Option<(i32, String)
             d.get("newRoot").and_then(|e| expression_fault(e, vars))
         }
         ("$redact" | "$sortByCount" | "$replaceWith", e) => expression_fault(e, vars),
+        // `$documents`' argument, or one of its elements (RM-654).
+        ("$documents", e) => expression_fault(e, vars),
         _ => None,
     };
     fault
@@ -7510,6 +7532,23 @@ mod documents_argument_tests {
         assert_eq!(err.code, 40602);
         let err = documents_stage(Some(&arr), &Vars::new(), Some("c"), 0).unwrap_err();
         assert_eq!(err.code, 73);
+    }
+
+    /// mongod 8.2.11 answers a `$documents` expression that fails inside a
+    /// `$lookup` with the expression's own error, optimized per outer
+    /// document under the executor prefix (RM-654). This answered 2
+    /// "$documents expression not supported".
+    #[test]
+    fn a_failing_expression_is_its_own_error() {
+        let _command = InCommand::enter("db.outer");
+        let spec = Bson::Document(doc! {"$divide": [1, 0]});
+        let err = documents_stage(Some(&spec), &Vars::new(), None, 0).unwrap_err();
+        assert_eq!(err.code, 2);
+        assert_eq!(
+            err.errmsg,
+            "Executor error during aggregate command on namespace: db.outer :: caused by :: \
+             Failed to optimize pipeline :: caused by :: can't $divide by zero"
+        );
     }
 
     #[test]
