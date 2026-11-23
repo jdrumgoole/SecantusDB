@@ -3013,7 +3013,7 @@ pub(crate) fn run_segmented(
                 buffer.clear();
             }
             let spec = stage.as_document().and_then(|d| d.get(name));
-            docs = documents_stage(spec, vars, coll)?;
+            docs = documents_stage(spec, vars, coll, at)?;
         } else if name == crate::list_catalog::STAGE {
             if !buffer.is_empty() {
                 let _ = core_run(docs, &buffer, vars, collation, Some(&ns))?;
@@ -3098,16 +3098,28 @@ fn documents_stage(
     spec: Option<&Bson>,
     vars: &Vars,
     coll: Option<&str>,
+    at: usize,
 ) -> Result<Vec<Document>, CommandError> {
     let spec = spec.ok_or_else(|| bad_value("$documents requires an array"))?;
     // An EMPTY document spec is rejected while the stage is desugared into a
     // projection, so it answers 51270 even against a collection; every other
-    // argument gets the namespace error below (probed 8.2.11).
+    // argument gets the namespace error below (probed 8.2.11), under the
+    // stage's "Invalid $documents" parse envelope (RM-651).
     if matches!(spec, Bson::Document(d) if d.is_empty()) {
         return Err(CommandError::new(
             51270,
             "Location51270",
-            "Invalid empty sub-projection: _tempDocumentsField",
+            "Invalid $documents :: caused by :: Invalid empty sub-projection: _tempDocumentsField",
+        ));
+    }
+    // A `$documents` that is not its pipeline's first stage is refused for
+    // its position before the namespace is looked at: 40602 under a
+    // `$lookup` / `$unionWith` that reads a collection (RM-651, 8.2.11).
+    if at > 0 {
+        return Err(CommandError::new(
+            40602,
+            "Location40602",
+            "$documents is only valid as the first stage in a pipeline",
         ));
     }
     // The NAMESPACE check comes before the argument is looked at at all:
@@ -7431,6 +7443,25 @@ mod documents_argument_tests {
     /// mongod 8.2.11 refuses a `$documents` argument that is not an array at
     /// RUN time, under the executor prefix of the command running it (RM-531).
     /// This answered 2 "$documents argument must evaluate to an array".
+    /// mongod 8.2.11 refuses an empty spec under the stage's parse envelope,
+    /// and a `$documents` past the first stage with 40602 before the
+    /// namespace check's 73 (RM-651).
+    #[test]
+    fn parse_and_position_refusals() {
+        let err = documents_stage(Some(&Bson::Document(doc! {})), &Vars::new(), Some("c"), 0)
+            .unwrap_err();
+        assert_eq!(err.code, 51270);
+        assert_eq!(
+            err.errmsg,
+            "Invalid $documents :: caused by :: Invalid empty sub-projection: _tempDocumentsField"
+        );
+        let arr = Bson::Array(vec![Bson::Document(doc! {"b": 1})]);
+        let err = documents_stage(Some(&arr), &Vars::new(), Some("c"), 1).unwrap_err();
+        assert_eq!(err.code, 40602);
+        let err = documents_stage(Some(&arr), &Vars::new(), Some("c"), 0).unwrap_err();
+        assert_eq!(err.code, 73);
+    }
+
     #[test]
     fn a_non_array_is_an_executor_error_naming_the_command() {
         for (ns, spec) in [
@@ -7440,7 +7471,7 @@ mod documents_argument_tests {
             ("db.$cmd.aggregate", Bson::Document(doc! {"a": 1})),
         ] {
             let _command = InCommand::enter(ns);
-            let err = documents_stage(Some(&spec), &Vars::new(), None).unwrap_err();
+            let err = documents_stage(Some(&spec), &Vars::new(), None, 0).unwrap_err();
             assert_eq!(err.code, 5858203, "{spec:?}");
             assert_eq!(err.code_name, "Location5858203", "{spec:?}");
             assert_eq!(

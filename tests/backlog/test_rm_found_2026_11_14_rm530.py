@@ -152,7 +152,7 @@ def _documents_refusals(client: Any) -> dict:
     )
 
 
-@pytest.mark.backlog("RM-651")
+@pytest.mark.backlog_fixed("RM-651")
 def test_documents_refusals_in_a_sub_pipeline(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -162,8 +162,9 @@ def test_documents_refusals_in_a_sub_pipeline(
     pipeline", under a `$unionWith` that reads a collection too, and an
     empty `{$documents: {}}` with 51270, "Invalid $documents :: caused by
     :: Invalid empty sub-projection: _tempDocumentsField". This server
-    answers the first 73 ("can only be run with {aggregate: 1}") and drops
-    the second's "Invalid $documents :: caused by ::" envelope."""
+    answered the first 73 ("can only be run with {aggregate: 1}") and
+    dropped the second's "Invalid $documents :: caused by ::" envelope
+    (RM-651)."""
     assert _documents_refusals(rust_mongo) == _documents_refusals(mongod_rs)
 
 

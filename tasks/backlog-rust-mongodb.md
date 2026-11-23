@@ -1246,16 +1246,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-530.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_an_empty_projection_is_an_invalid_project
       Backlog-ID: RM-650
-- [ ] **`$documents`'s parse refusals in a sub-pipeline.** mongod 8.2.11
-      refuses a `$documents` that is not its pipeline's first stage with
-      40602 ("$documents is only valid as the first stage in a pipeline")
-      under a `$unionWith` that reads a collection, and `{$documents: {}}`
-      with 51270 "Invalid $documents :: caused by :: Invalid empty
-      sub-projection: _tempDocumentsField". This server answers the first
-      73 ("'$documents' can only be run with {aggregate: 1}") and drops
-      the second's envelope. Found 2026-11-14 working RM-530.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_documents_refusals_in_a_sub_pipeline
-      Backlog-ID: RM-651
 - [ ] **A `$facet`'s 40600 comes after a later stage's parse error.**
       mongod 8.2.11 parses a pipeline a stage at a time, so a `$facet`
       holding a stage it refuses is refused before a later stage's
