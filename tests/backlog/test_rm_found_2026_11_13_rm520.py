@@ -24,10 +24,10 @@ def _answers(client: Any, pipelines: dict[str, list]) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-620")
+@pytest.mark.backlog_fixed("RM-620")
 def test_root_does_not_show_the_sort_key(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 keeps the sort key as metadata, which `$$ROOT` does not
-    show; this server's hidden field shows in an `$addFields` and a
+    show; this server's hidden field showed in an `$addFields` and a
     `$lookup`'s `let`."""
     meta = {"$meta": "sortKey"}
     pipelines = {

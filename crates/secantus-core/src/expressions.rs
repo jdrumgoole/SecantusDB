@@ -536,7 +536,16 @@ fn resolve_var(name: &str, ctx: &Ctx) -> R {
         // path into it, as for any other missing input).
         f.clone().operand()
     } else if base == "ROOT" || base == "CURRENT" {
-        Bson::Document(ctx.doc.clone())
+        // The metadata this server keeps as hidden `__secantus_meta_*` fields
+        // (a sort key, a geoNear distance) is metadata on mongod, which
+        // `$$ROOT` never shows (RM-620, measured 8.2.11).
+        Bson::Document(
+            ctx.doc
+                .iter()
+                .filter(|(k, _)| !k.starts_with("__secantus_meta_"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        )
     } else if base == "REMOVE" {
         // Value position: an absent field path is `null` here, and `$$REMOVE`
         // is exactly an absent field path. `eval_field_value` returns the

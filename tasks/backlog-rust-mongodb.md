@@ -1163,15 +1163,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Rust server". Found 2026-11-13 (RM-524).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm524.py::test_a_sort_key_projection_without_a_sort
       Backlog-ID: RM-634
-- [ ] **`$$ROOT` shows a document's hidden sort key.** Behind a `$sort`
-      whose key a later stage reads, `{$addFields: {r: "$$ROOT"}}` and a
-      `$lookup` `let: {r: "$$ROOT"}` give the document with a
-      `__secantus_meta_sortKey` field, which mongod 8.2.11 keeps as
-      metadata and never shows. The key is a field of the document here
-      (`agg_meta`); the `$geoNear` fields are alike. Found 2026-11-13
-      (RM-520).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_root_does_not_show_the_sort_key
-      Backlog-ID: RM-620
 - [ ] **A `{$meta: "sortKey"}` in a window's output reads no key.** Behind
       a `$sort`, mongod 8.2.11 gives each document's key to a `$push: {$meta:
       "sortKey"}` in a `$setWindowFields` or `$_internalSetWindowFields`;
