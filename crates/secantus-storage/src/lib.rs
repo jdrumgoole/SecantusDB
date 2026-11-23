@@ -30002,7 +30002,10 @@ mod oplog_entry_bytes_tests {
             Storage::mint_run(&mut st, 3, false);
         }
         let (start, _) = s.mint_seq_and_ts(1, true);
-        assert!(start - 1 > before, "the stamp must leave a gap below the run");
+        assert!(
+            start - 1 > before,
+            "the stamp must leave a gap below the run"
+        );
         assert_eq!(s.oplog_visible_tail_seq(), before);
         assert_eq!(s.wait_for_oplog(before, 20), before);
         s.deregister_in_flight(&[(start, start + 1)], true);
