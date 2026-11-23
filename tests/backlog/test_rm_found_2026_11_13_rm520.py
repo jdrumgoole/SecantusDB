@@ -73,15 +73,33 @@ def test_a_windows_output_reads_the_sort_key(rust_mongo: Any, mongod: Any) -> No
     assert _answers(rust_mongo, pipelines) == _answers(mongod, pipelines)
 
 
-@pytest.mark.backlog("RM-622")
+@pytest.mark.backlog_fixed("RM-622")
 def test_a_missing_new_root_is_missing(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 names a `newRoot` that resolves to nothing MISSING in
-    its 40228; this server names it null."""
+    its 40228; this server named it null."""
     pipelines = {
         "$replaceRoot": [{"$replaceRoot": {"newRoot": "$nope"}}],
         "$replaceWith": [{"$replaceWith": "$nope"}],
     }
     assert _answers(rust_mongo, pipelines) == _answers(mongod, pipelines)
+
+
+@pytest.mark.backlog_fixed("RM-622")
+def test_a_stored_undefined_new_root_is_undefined(rust_mongo: Any, mongod: Any) -> None:
+    """A `newRoot` that is a stored `undefined` is a value, not MISSING, in
+    mongod 8.2.11's 40228."""
+    from bson.raw_bson import RawBSONDocument
+
+    def answer(client: Any) -> Any:
+        client.drop_database("rmfound1113rm622")
+        db = client.rmfound1113rm622
+        # _id 1, u: undefined (type 0x06) -- no Python value encodes it.
+        db.c.insert_one(
+            RawBSONDocument(b"\x11\x00\x00\x00\x10_id\x00\x01\x00\x00\x00\x06u\x00\x00")
+        )
+        return mongo_answer(lambda: list(db.c.aggregate([{"$replaceRoot": {"newRoot": "$u"}}])))
+
+    assert answer(rust_mongo) == answer(mongod)
 
 
 @pytest.mark.backlog("RM-623")

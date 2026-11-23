@@ -1137,35 +1137,23 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       document. Found 2026-11-13 (RM-522).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_graph_lookup_and_a_fill_keep_the_sort_key
       Backlog-ID: RM-632
-- [ ] **A stored `undefined` is carried through the expression engine as a
-      stand-in document, not as a value apart from MISSING.** Filed
-      2026-11-23 on Joe's decision: replace RM-635's `held_undefined`
-      carrier with a MISSING case of the expression engine's own, as
-      mongod's EOO / SBE `Nothing`. The engine still uses `Bson::Undefined`
-      to mean MISSING, and RM-635 carries a real `undefined` as a one-key
-      document with a NUL-led key (`secantus-core` `bsondoc.rs`:
-      `held_undefined()` / `is_held_undefined()`; `eval_field_value_keep`
-      keeps it, the other entry points normalise it back). The answers RM-635
-      and RM-525 pin are right; the structure is not mongod's, which gives
-      MISSING a case apart from every BSON value, so an operator that does
-      not normalise sees an object. Two symptoms stay open until the
-      carrier goes: (This was RM-761.) `$add` / `$multiply` over a stored
-      `undefined` gives code 14 ("$add only supports numeric or date
-      types") where mongod 8.2.11 gives null. (This was RM-762.) A `$lookup`
-      `let` variable bound from a stored `undefined` reads "missing" in
-      `$type` and one bound from an absent field "null", where mongod binds
-      the value it came from ("undefined" and "missing"; `secantus-commands`
-      `aggregate.rs`, the `bind` closure of `$lookup`).
-      Verify: tests/backlog/test_rm_found_2026_11_22_rm635.py::test_arithmetic_over_a_stored_undefined_is_null, tests/backlog/test_rm_found_2026_11_22_rm635.py::test_a_lookup_let_variable_keeps_a_stored_undefined
+- [ ] **A variable bound to MISSING cannot cross into a `$lookup`
+      sub-pipeline.** Filed 2026-11-23 on Joe's decision: replace RM-635's
+      `held_undefined` carrier with a MISSING case of the expression engine's
+      own, as mongod's EOO / SBE `Nothing`. Done inside an expression:
+      `expressions::Field` is `Missing` or `Value`, `$let` and the
+      `$map` / `$filter` / `$reduce` variables bind one (`Ctx::missing` names
+      the ones bound to MISSING), and the carrier is gone. Left: the variables
+      a stage hands its sub-pipeline are a `&Document` of values
+      (`vars: &Document` in about 150 signatures), which has no MISSING, so
+      `secantus-commands` `aggregate.rs`'s `$lookup` `let` binds an absent
+      field as null where mongod 8.2.11 binds MISSING and `$type` reads
+      "missing". The faithful fix is a variables type that holds a `Field`
+      per name, threaded where `vars: &Document` is today, not a reserved key
+      in the document. (This was RM-762's absent-field half; its
+      stored-`undefined` half, and RM-761, closed with the carrier.)
+      Verify: tests/backlog/test_rm_found_2026_11_22_rm635.py::test_a_lookup_let_variable_bound_from_an_absent_field_is_missing
       Backlog-ID: RM-763
-- [ ] **A leading `$match` on `{$size: "$$REMOVE"}` is an executor error.**
-      mongod 8.2.11 folds it: 17124 "Failed to optimize pipeline :: caused
-      by :: The argument to $size must be an array, but was of type:
-      missing"; this server's says "Executor error during aggregate command
-      on namespace: ...". `$addFields` folds on both. Found 2026-11-18
-      (RM-633).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm524.py::test_a_match_on_a_constant_remove_fails_to_optimize
-      Backlog-ID: RM-722
 - [ ] **A `$project` of `{$meta: "sortKey"}` with no `$sort` is refused as
       unsupported.** mongod 8.2.11 refuses `{$project: {t: {$type: {$meta:
       "sortKey"}}}}` with code 2 "Failed to determine whether query system
@@ -1192,12 +1180,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       they run. Found 2026-11-13 (RM-520).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_a_windows_output_reads_the_sort_key
       Backlog-ID: RM-621
-- [ ] **A missing `newRoot` is named null, not MISSING.** mongod 8.2.11's
-      40228 for `$replaceRoot: {newRoot: "$nope"}` (and `$replaceWith`) reads
-      "resulting value was: MISSING. Type of resulting value: 'missing'";
-      this server's reads "null" and 'null'. Found 2026-11-13 (RM-520).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_a_missing_new_root_is_missing
-      Backlog-ID: RM-622
 - [ ] **A `newRoot` error names a pruned document when a later stage
       reads the sort key.** In `$sort, $replaceRoot: {newRoot: "$n"}, $addFields:
       {m: {$meta: "sortKey"}}`, mongod 8.2.11's 40228 names the whole input
@@ -1335,14 +1317,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       element". Found 2026-11-14 working RM-530.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_facet_element_refusal_names_the_element
       Backlog-ID: RM-647
-- [ ] **A nested `$lookup`'s bad `let` runs.** mongod 8.2.11 refuses a
-      `$lookup` whose `let` is not a document (14) or that has `localField`
-      without `foreignField` (9) inside a `$facet` or `$unionWith` as at
-      the top level (RM-528). This server runs the first there and answers
-      the second 2 ("$lookup requires localField+foreignField or
-      pipeline"). Found 2026-11-14 working RM-530.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_nested_lookup_spec_is_checked_as_it_is_parsed
-      Backlog-ID: RM-649
 - [ ] **`{$project: {}}` drops its envelope, and is "not supported" when
       nested.** mongod 8.2.11 answers 51272 "Invalid $project :: caused by
       :: projection specification must have at least one field" at the top

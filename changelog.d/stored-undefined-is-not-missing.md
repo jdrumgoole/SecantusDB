@@ -14,10 +14,7 @@ and `$group` keys it apart from null.
   `$first` or `$last`, a `$getField` result, what `$cond`, `$switch` and
   `$ifNull` return, a `$let` variable, and a `$map`, `$filter` or `$reduce`
   element. An absent field, and an index out of range, still read `"missing"`.
-- A real `undefined` is carried through the engine as a held value
-  (`bsondoc::held_undefined`, a document no client can send and no encoder
-  writes) between the functions that need to tell it from MISSING, and turned
-  back where a value leaves them. `expressions::evaluate_field` returns it as
+- `expressions::evaluate_field` returns a stored `undefined` as
   `Field::Value(Bson::Undefined)` beside `Field::Missing`, which `$addFields`,
   `$project`, a computed field of the document store, and `$shift` use.
 - `$group` keys a stored `undefined` apart from null and missing (`GKey::Undefined`),

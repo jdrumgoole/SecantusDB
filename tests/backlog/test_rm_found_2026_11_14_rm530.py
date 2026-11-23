@@ -96,15 +96,15 @@ def _nested_lookup_spec(client: Any) -> dict:
     )
 
 
-@pytest.mark.backlog("RM-649")
+@pytest.mark.backlog_fixed("RM-649")
 def test_a_nested_lookup_spec_is_checked_as_it_is_parsed(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
     """mongod 8.2.11 refuses a `$lookup` whose `let` is not a document (14)
     or that has `localField` without `foreignField` (9) wherever it stands,
-    in a `$facet` or a `$unionWith` too. This server refuses them at the top
-    level (RM-528) and runs them, or answers otherwise, inside one."""
+    in a `$facet` or a `$unionWith` too. This server refused them at the top
+    level (RM-528) but ran them, or answered otherwise, inside one."""
     assert _nested_lookup_spec(rust_mongo) == _nested_lookup_spec(mongod_rs)
 
 

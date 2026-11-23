@@ -1452,6 +1452,8 @@ pub fn render_value_compact(v: &Bson) -> String {
         Bson::Symbol(sym) => format!("\"{sym}\""),
         Bson::MinKey => "MinKey".to_string(),
         Bson::MaxKey => "MaxKey".to_string(),
+        // mongod 8.2.11's `Value` rendering (RM-622).
+        Bson::Undefined => "undefined".to_string(),
         other => format!("{other:?}"),
     }
 }
@@ -2561,19 +2563,25 @@ fn add_field_into(holder: &mut Bson, rest: &[&str], value: &Bson) {
 }
 
 fn replace_root_one(doc: &Document, expr: &Bson, vars: &Document, subject: &str) -> R<Document> {
-    match evaluate(expr, doc, vars)? {
-        Bson::Document(d) => Ok(d),
-        other => Err(Fallback::mongo(
-            40228,
-            format!(
-                "{subject}  must evaluate to an object, but resulting value was: {}. \
-                 Type of resulting value: '{}'. Input document: {}",
-                render_value_compact(&other),
-                crate::query::bson_type_name(&other),
-                render_value_compact(&Bson::Document(input_document(doc, expr)))
-            ),
-        )),
-    }
+    // A `newRoot` that resolves to nothing stays missing, which mongod
+    // 8.2.11 names `MISSING` / 'missing'; a stored `undefined` is a value
+    // (RM-622).
+    let (rendered, type_name) = match crate::expressions::evaluate_field(doc, expr, vars)? {
+        crate::expressions::Field::Value(Bson::Document(d)) => return Ok(d),
+        crate::expressions::Field::Value(other) => (
+            render_value_compact(&other),
+            crate::query::bson_type_name(&other),
+        ),
+        crate::expressions::Field::Missing => ("MISSING".to_string(), "missing"),
+    };
+    Err(Fallback::mongo(
+        40228,
+        format!(
+            "{subject}  must evaluate to an object, but resulting value was: {rendered}. \
+             Type of resulting value: '{type_name}'. Input document: {}",
+            render_value_compact(&Bson::Document(input_document(doc, expr)))
+        ),
+    ))
 }
 
 thread_local! {

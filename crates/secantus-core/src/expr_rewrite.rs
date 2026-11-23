@@ -135,7 +135,12 @@ fn is_constant(e: &Bson) -> bool {
 fn is_constant_in(e: &Bson, vars: &Document) -> bool {
     match e {
         Bson::String(s) => match s.strip_prefix("$$") {
-            Some(var) => vars.contains_key(var.split('.').next().unwrap_or(var)),
+            // `$$REMOVE` is a constant (missing) mongod folds as it does a
+            // bound one (RM-722).
+            Some(var) => {
+                let name = var.split('.').next().unwrap_or(var);
+                name == "REMOVE" || vars.contains_key(name)
+            }
             None => !s.starts_with('$'),
         },
         Bson::Array(a) => a.iter().all(|e| is_constant_in(e, vars)),
@@ -149,8 +154,10 @@ fn is_constant_in(e: &Bson, vars: &Document) -> bool {
 
 /// Whether mongod folds `e` while optimizing, `vars` substituted.
 fn folds(e: &Bson, vars: &Document) -> bool {
-    is_constant_in(e, vars)
-        && crate::aggregate::is_constant_expression(e, &vars.keys().cloned().collect::<Vec<_>>())
+    let mut bound: Vec<String> = vars.keys().cloned().collect();
+    // mongod's optimizer turns `$$REMOVE` into a constant missing (RM-722).
+    bound.push("REMOVE".to_string());
+    is_constant_in(e, vars) && crate::aggregate::is_constant_expression(e, &bound)
 }
 
 fn evaluate_constant(e: &Bson) -> Option<Bson> {
@@ -582,6 +589,20 @@ fn in_list(args: &[Bson]) -> Option<Document> {
 mod tests {
     use crate::{canonical_match, residual_key};
     use bson::{bson, doc, Bson};
+
+    /// `$$REMOVE` folds as a constant missing, so a `$size` of it fails
+    /// while mongod 8.2.11 optimizes the `$match` (RM-722).
+    #[test]
+    fn a_size_of_remove_fails_to_optimize() {
+        let filter = doc! {"$expr": {"$gt": [{"$size": "$$REMOVE"}, 0]}};
+        let (code, msg) = super::constant_expr_error_in_filter(&filter).expect("folds");
+        assert_eq!(code, 17124);
+        assert_eq!(
+            msg,
+            "Failed to optimize expression :: caused by :: The argument to $size \
+             must be an array, but was of type: missing"
+        );
+    }
 
     fn parsed(filter: Bson) -> Bson {
         Bson::Document(canonical_match(&filter))

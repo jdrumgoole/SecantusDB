@@ -36,10 +36,10 @@ def test_a_sort_key_projection_without_a_sort(rust_mongo: Any, mongod: Any) -> N
     assert _answer(rust_mongo, pipeline) == _answer(mongod, pipeline)
 
 
-@pytest.mark.backlog("RM-722")
+@pytest.mark.backlog_fixed("RM-722")
 def test_a_match_on_a_constant_remove_fails_to_optimize(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 folds `{$size: "$$REMOVE"}` in a leading `$match`'s
     `$expr` and fails under "Failed to optimize pipeline"; this server
-    reports it as an executor error."""
+    reported it as an executor error: `$$REMOVE` did not fold."""
     pipeline = [{"$match": {"$expr": {"$gt": [{"$size": "$$REMOVE"}, 0]}}}]
     assert _answer(rust_mongo, pipeline) == _answer(mongod, pipeline)
