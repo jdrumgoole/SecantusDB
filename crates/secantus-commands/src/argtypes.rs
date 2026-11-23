@@ -1226,11 +1226,20 @@ pub(crate) fn normalise_pipeline_sorts(pipeline: &mut [Bson]) {
 /// The first bad `$sort` spec inside a `$facet`, `$lookup` or `$unionWith`
 /// sub-pipeline, at any depth. `stage_spec_error` checks the top level only,
 /// so a nested one surfaced as "stage not supported" (2) instead of mongod's
-/// 15975 / 15974 / ... (measured 8.2.11, 2026-10-05).
+/// 15975 / 15974 / ... (measured 8.2.11, 2026-10-05). It also refuses a
+/// nested `$unionWith` with no `coll` and no `$documents` (9, RM-648).
 pub(crate) fn nested_sort_problem(pipeline: &[Bson]) -> Option<(i32, String)> {
     let check = |sub: &[Bson]| -> Option<(i32, String)> {
         for stage in sub {
             if let Bson::Document(st) = stage {
+                // A collectionless `$unionWith` is refused by name wherever
+                // it stands (RM-648), as `stage_field_problem` does at the
+                // top level.
+                if let Some(spec @ Bson::Document(_)) = st.get("$unionWith") {
+                    if let Some(p) = stage_field_problem("$unionWith", spec) {
+                        return Some(p);
+                    }
+                }
                 if let Some(Bson::Document(spec)) = st.get("$sort") {
                     if spec.is_empty() {
                         return Some((15976, "$sort stage must have at least one sort key".into()));
@@ -4971,6 +4980,14 @@ mod write_and_sort_validation_tests {
         assert_eq!(nested_sort_problem(&lookup).map(|p| p.0), Some(15976));
         let ok = vec![Bson::Document(
             doc! {"$facet": {"x": [{"$sort": {"a": -1}}]}},
+        )];
+        assert!(nested_sort_problem(&ok).is_none());
+        // RM-648: a nested `$unionWith` with no `coll` must make its documents.
+        let union = doc! {"$unionWith": {"pipeline": [{"$match": {}}]}};
+        let facet = vec![Bson::Document(doc! {"$facet": {"a": [union.clone()]}})];
+        assert_eq!(nested_sort_problem(&facet).map(|p| p.0), Some(9));
+        let ok = vec![Bson::Document(
+            doc! {"$facet": {"a": [{"$unionWith": {"pipeline": [{"$documents": []}]}}]}},
         )];
         assert!(nested_sort_problem(&ok).is_none());
     }

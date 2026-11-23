@@ -1335,16 +1335,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       element". Found 2026-11-14 working RM-530.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_facet_element_refusal_names_the_element
       Backlog-ID: RM-647
-- [ ] **A collectionless `$unionWith` without a `$documents` runs when it
-      is nested.** mongod 8.2.11 refuses a `$unionWith` naming no `coll`
-      whose pipeline does not begin with `$documents` (9, "$unionWith stage
-      without explicit collection must have a pipeline with $documents as
-      first stage") wherever it stands. This server refuses it at the top
-      level, but inside a `$facet`, `$lookup` or `$unionWith` runs its
-      pipeline over the collection the outer stage reads and unions those
-      documents in. Found 2026-11-14 working RM-530.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_nested_union_with_no_collection_must_make_its_documents
-      Backlog-ID: RM-648
 - [ ] **A nested `$lookup`'s bad `let` runs.** mongod 8.2.11 refuses a
       `$lookup` whose `let` is not a document (14) or that has `localField`
       without `foreignField` (9) inside a `$facet` or `$unionWith` as at

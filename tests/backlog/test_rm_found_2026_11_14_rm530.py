@@ -65,7 +65,7 @@ def _union_without_documents(client: Any) -> dict:
     )
 
 
-@pytest.mark.backlog("RM-648")
+@pytest.mark.backlog_fixed("RM-648")
 def test_a_nested_union_with_no_collection_must_make_its_documents(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -73,9 +73,9 @@ def test_a_nested_union_with_no_collection_must_make_its_documents(
     """mongod 8.2.11 refuses a `$unionWith` that names no `coll` and whose
     pipeline does not begin with `$documents` (9, "$unionWith stage without
     explicit collection must have a pipeline with $documents as first
-    stage") wherever it stands. This server refuses it at the top level
-    but, inside a `$facet`, `$lookup` or `$unionWith`, runs its pipeline
-    over the documents of the collection it stands over and unions them in."""
+    stage") wherever it stands. This server refused it at the top level
+    but, inside a `$facet`, `$lookup` or `$unionWith`, ran its pipeline
+    over the documents of the collection it stood over and unioned them in."""
     assert _union_without_documents(rust_mongo) == _union_without_documents(mongod_rs)
 
 
