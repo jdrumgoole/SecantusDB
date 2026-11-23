@@ -611,19 +611,6 @@ These are explicit non-goals. Don't add them without a reason.
       **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08, the ticket pools 2026-11-09, and the per-command admission counts on the line 2026-11-09; what is left is above.
       Backlog-ID: RM-355
       Verify: none -- the yield's second admission is RM-360's; the second exempt ingress admission and an index build's `queues` have no gap test yet
-- [ ] **A filtered `awaitData` getMore a rejected write wakes sometimes
-      counts 8 execution admissions, not 6.** mongod 8.2.11 counts 6 (two
-      yields per wait, two waits). This server counted 8 in 1 of 3 runs of
-      `test_an_await_data_get_more_woken_twice_takes_mongods_tickets` and
-      in the RM-650 lane gate's backlog step (2026-11-23, load ~6 on 12
-      cores), and 6 in the others: a wait is woken, or rescans, once more
-      than mongod's under some interleaving of the writer's insert and the
-      wait. Reproduce by running that test in a loop. Found 2026-11-23
-      working RM-650 (whose change does not reach getMore).
-      Verify: none -- intermittent (1 run in 3), so no gap test fails
-      reliably; RM-355's regression test, the one named above, shows it
-      when run in a loop
-      Backlog-ID: RM-764
 - [ ] **mongod's `validate` sometimes warns on `config.image_collection`'s
       `_id_` after this server served a mongod-written store.** In
       `test_secantus_serves_the_phase_0b_store_mongod_wrote` (RM-723's
