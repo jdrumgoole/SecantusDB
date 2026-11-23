@@ -123,16 +123,16 @@ def _empty_projection(client: Any) -> dict:
     )
 
 
-@pytest.mark.backlog("RM-650")
+@pytest.mark.backlog_fixed("RM-650")
 def test_an_empty_projection_is_an_invalid_project(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
     """mongod 8.2.11 refuses `{$project: {}}` with 51272, "Invalid $project
     :: caused by :: projection specification must have at least one field",
-    at the top level and in a `$facet` or `$unionWith`. This server drops
+    at the top level and in a `$facet` or `$unionWith`. This server dropped
     the "Invalid $project :: caused by ::" envelope at the top level and
-    answers BadValue (2, "not supported by the Rust server") inside one."""
+    answered BadValue (2, "not supported by the Rust server") inside one."""
     assert _empty_projection(rust_mongo) == _empty_projection(mongod_rs)
 
 
@@ -182,7 +182,7 @@ def _facet_before_later_stage(client: Any) -> dict:
     )
 
 
-@pytest.mark.backlog("RM-652")
+@pytest.mark.backlog_fixed("RM-652")
 def test_a_facet_refusal_comes_before_a_later_stage(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -190,7 +190,7 @@ def test_a_facet_refusal_comes_before_a_later_stage(
     """mongod 8.2.11 parses a pipeline stage by stage, so a `$facet` that
     holds a stage it refuses (40600) is refused before a later stage's
     parse error: `[{$facet: {a: [<$documents>]}}, {$project: {}}]` is
-    40600. This server checks every stage's expressions and projections
-    first, in passes over the whole pipeline, and answers the later
-    stage's 51272 (or `$where`'s refusal)."""
+    40600. This server checked every stage's expressions and projections
+    first, in passes over the whole pipeline, and answered the later
+    stage's 51272 (or `$where`'s refusal) (RM-652)."""
     assert _facet_before_later_stage(rust_mongo) == _facet_before_later_stage(mongod_rs)

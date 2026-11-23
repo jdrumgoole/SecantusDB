@@ -31,7 +31,7 @@ def _element_not_a_document(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-653")
+@pytest.mark.backlog_fixed("RM-653")
 def test_a_documents_element_that_is_not_a_document_is_40228(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -41,7 +41,7 @@ def test_a_documents_element_that_is_not_a_document_is_40228(
     caused by :: elements within the array passed to $documents must
     evaluate to an object, but resulting value was: 2. Type of resulting
     value: 'int'. Input document: {_tempDocumentsField: 2}" (the outer
-    collection inside a `$lookup`). This server answers 2 "each $documents
+    collection inside a `$lookup`). This server answered 2 "each $documents
     element must be an object"."""
     assert _element_not_a_document(rust_mongo) == _element_not_a_document(mongod_rs)
 

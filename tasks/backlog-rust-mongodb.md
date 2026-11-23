@@ -611,6 +611,36 @@ These are explicit non-goals. Don't add them without a reason.
       **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08, the ticket pools 2026-11-09, and the per-command admission counts on the line 2026-11-09; what is left is above.
       Backlog-ID: RM-355
       Verify: none -- the yield's second admission is RM-360's; the second exempt ingress admission and an index build's `queues` have no gap test yet
+- [ ] **A filtered `awaitData` getMore a rejected write wakes sometimes
+      counts 8 execution admissions, not 6.** mongod 8.2.11 counts 6 (two
+      yields per wait, two waits). This server counted 8 in 1 of 3 runs of
+      `test_an_await_data_get_more_woken_twice_takes_mongods_tickets` and
+      in the RM-650 lane gate's backlog step (2026-11-23, load ~6 on 12
+      cores), and 6 in the others: a wait is woken, or rescans, once more
+      than mongod's under some interleaving of the writer's insert and the
+      wait. Reproduce by running that test in a loop. Found 2026-11-23
+      working RM-650 (whose change does not reach getMore).
+      Verify: none -- intermittent (1 run in 3), so no gap test fails
+      reliably; RM-355's regression test, the one named above, shows it
+      when run in a loop
+      Backlog-ID: RM-764
+- [ ] **mongod's `validate` sometimes warns on `config.image_collection`'s
+      `_id_` after this server served a mongod-written store.** In
+      `test_secantus_serves_the_phase_0b_store_mongod_wrote` (RM-723's
+      regression test) mongod 8.2.11 reopens the store `secantusd-mdb`
+      wrote to and `validate({full: true})` on `config.image_collection`
+      answered `valid: true` with warnings `["Found warnings in _id_"]`
+      once in the RM-650 lane gate (2026-11-23, load ~6 on 12 cores); the
+      gate before it and two isolated reruns passed. A warning on an index
+      this server maintains (retryable `findAndModify` images) is a storage
+      signal: capture the full `validate` reply (its `keysPerIndex`,
+      `indexDetails` and the mongod log's index-entry lines) on a failing
+      run and find which key is missing or extra. Found 2026-11-23 working
+      RM-650, whose change does not reach storage.
+      Verify: none -- intermittent (1 run in 4), so no gap test fails
+      reliably; RM-723's regression test, named above, shows it when run in
+      a loop
+      Backlog-ID: RM-765
 - [ ] **Some writes' `locks` are not mongod's.** Since 2026-11-07 a write
       counts mongod's flow control tickets (one per global IX taken apart)
       and a retryable write's session checkout and session row, and a
@@ -1237,37 +1267,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-532.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm532.py::test_a_hybrid_search_names_the_collection_it_unions
       Backlog-ID: RM-644
-- [ ] **`{$project: {}}` drops its envelope, and is "not supported" when
-      nested.** mongod 8.2.11 answers 51272 "Invalid $project :: caused by
-      :: projection specification must have at least one field" at the top
-      level and in a `$facet` or `$unionWith`. This server drops the
-      "Invalid $project :: caused by ::" at the top level and answers
-      BadValue (2, "not supported by the Rust server") nested. Found
-      2026-11-14 working RM-530.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_an_empty_projection_is_an_invalid_project
-      Backlog-ID: RM-650
-- [ ] **A `$facet`'s 40600 comes after a later stage's parse error.**
-      mongod 8.2.11 parses a pipeline a stage at a time, so a `$facet`
-      holding a stage it refuses is refused before a later stage's
-      refusal: `[{$facet: {a: [<$documents>]}}, {$project: {}}]` is 40600,
-      and so is a facet's `$out` before a later `$match`'s `$where`. This
-      server checks every stage's expressions, projections and `$where`
-      in passes over the whole pipeline before the nested-pipeline pass
-      (`nested_stage_problem`), and answers the later stage's refusal.
-      Found 2026-11-14 working RM-530.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_facet_refusal_comes_before_a_later_stage
-      Backlog-ID: RM-652
-- [ ] **A `$documents` element that is not a document answers 2.**
-      mongod 8.2.11 refuses `$documents: [{a: 1}, 2]` at run time with 40228
-      "Executor error during aggregate command on namespace:
-      <db>.$cmd.aggregate :: caused by :: elements within the array passed
-      to $documents must evaluate to an object, but resulting value was: 2.
-      Type of resulting value: 'int'. Input document: {_tempDocumentsField:
-      2}" (the outer collection's namespace inside a `$lookup`). This server
-      answers 2 "each $documents element must be an object". Found
-      2026-11-14 working RM-531.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_a_documents_element_that_is_not_a_document_is_40228
-      Backlog-ID: RM-653
 - [ ] **A `$documents` expression that fails answers "expression not
       supported".** mongod 8.2.11 answers `$documents: {$divide: [1, 0]}`
       (or an element `{x: {$divide: [1, 0]}}`) with 2 "Failed to optimize
