@@ -637,7 +637,27 @@ These are explicit non-goals. Don't add them without a reason.
       `indexDetails` and the mongod log's index-entry lines) on a failing
       run and find which key is missing or extra. Found 2026-11-23 working
       RM-650, whose change does not reach storage.
-      Verify: none -- intermittent (1 run in 4), so no gap test fails
+      Measured 2026-11-23 (RM-765 lane, mongod 8.2.11, debug `secantusd-mdb`):
+      NOT reproduced in 192 further runs of that test (12 serial; 40 and 60
+      in 4 and 6 parallel loops at load ~12; 80 in 8 loops beside 4 CPU
+      burners), nor in 40 restarts of a store only mongod wrote with
+      `validate({full: true})` of `config.image_collection`,
+      `config.transactions` and `app.c` three times after each step-up, nor
+      in ~130 validates of them beside a loop of `fsync` (checkpoints). What
+      is known: the scenario writes no retryable `findAndModify`, so
+      `config.image_collection` has `nrecords: 0`, `keysPerIndex: {_id_:
+      0}` in every run measured, and this server writes a record there only
+      for a retryable `findAndModify` or a replay of one
+      (`replay_session_state`), so no key of ours can be missing or extra in
+      an empty table. The same warning, with "transient issue", is what
+      mongod gives a table it is using as validate runs
+      (`_BUSY_WHILE_MONGOD_RUNS`). The test now returns the whole `validate`
+      reply with a failing finding, so the next failure shows its
+      `warnings`, `keysPerIndex` and `nrecords`: if `nrecords` is 0 and the
+      warning is "Found warnings in _id_" alone, it is the busy-table case
+      and `config.image_collection` belongs in that set; a non-empty table
+      or an `extraIndexEntries` / `missingIndexEntries` is ours.
+      Verify: none -- intermittent (1 run in ~200), so no gap test fails
       reliably; RM-723's regression test, named above, shows it when run in
       a loop
       Backlog-ID: RM-765
@@ -1143,15 +1163,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Rust server". Found 2026-11-13 (RM-524).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm524.py::test_a_sort_key_projection_without_a_sort
       Backlog-ID: RM-634
-- [ ] **`$$ROOT` shows a document's hidden sort key.** Behind a `$sort`
-      whose key a later stage reads, `{$addFields: {r: "$$ROOT"}}` and a
-      `$lookup` `let: {r: "$$ROOT"}` give the document with a
-      `__secantus_meta_sortKey` field, which mongod 8.2.11 keeps as
-      metadata and never shows. The key is a field of the document here
-      (`agg_meta`); the `$geoNear` fields are alike. Found 2026-11-13
-      (RM-520).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_root_does_not_show_the_sort_key
-      Backlog-ID: RM-620
 - [ ] **A `{$meta: "sortKey"}` in a window's output reads no key.** Behind
       a `$sort`, mongod 8.2.11 gives each document's key to a `$push: {$meta:
       "sortKey"}` in a `$setWindowFields` or `$_internalSetWindowFields`;
@@ -1160,13 +1171,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       they run. Found 2026-11-13 (RM-520).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_a_windows_output_reads_the_sort_key
       Backlog-ID: RM-621
-- [ ] **A `newRoot` error names a pruned document when a later stage
-      reads the sort key.** In `$sort, $replaceRoot: {newRoot: "$n"}, $addFields:
-      {m: {$meta: "sortKey"}}`, mongod 8.2.11's 40228 names the whole input
-      document; this server names only the fields the `newRoot` reads, as
-      both do with no reader of the key after. Found 2026-11-13 (RM-520).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_a_new_root_error_behind_a_sort_names_the_document
-      Backlog-ID: RM-623
 - [ ] **A document inside an array a stage reads or writes into is sized
       as if it were read.** mongod 8.2.11 gives each document in an array a
       cache of its own when a stage reads a field through the array
@@ -1267,27 +1271,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-532.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm532.py::test_a_hybrid_search_names_the_collection_it_unions
       Backlog-ID: RM-644
-- [ ] **A `$documents` expression that fails answers "expression not
-      supported".** mongod 8.2.11 answers `$documents: {$divide: [1, 0]}`
-      (or an element `{x: {$divide: [1, 0]}}`) with 2 "Failed to optimize
-      pipeline :: caused by :: can't $divide by zero", and one reading a
-      `$lookup` `let` variable under the executor prefix as well. This
-      server answers 2 "$documents expression not supported" to all three,
-      discarding the evaluator's own error. Found 2026-11-14 working RM-531.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_a_documents_expression_error_is_the_expressions
-      Backlog-ID: RM-654
-- [ ] **A run-time error in a sub-pipeline or after `$documents` names the
-      wrong namespace.** mongod 8.2.11 names the COMMAND's namespace under
-      "Executor error during aggregate command on namespace:" wherever the
-      failing stage runs: `<db>.$cmd.aggregate` for a collectionless
-      aggregate, the outer collection inside a `$lookup` / `$unionWith`
-      (with or without `from`). This server names `<db>.` (an empty
-      collection) after `$documents` and the FOREIGN collection inside a
-      `$lookup` / `$unionWith` with one: `run_segmented` builds the prefix
-      from its own `coll`, not from `COMMAND_NS`. Found 2026-11-14 working
-      RM-531.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_a_run_time_error_names_the_commands_namespace
-      Backlog-ID: RM-656
 - [ ] **A FETCH's residual `$or` lists its branches in `parsedQuery`'s
       order.** mongod 8.2.11 lists the `$or` a FETCH filters by behind an
       IXSCAN (`{k: {$gte: 2}, $or: [{"x.a": 1}, {x: {$type: [4]}}, {x: {$not:

@@ -92,6 +92,20 @@ pub fn apply_pipeline(
             return Err(Fallback::Defer); // Python raises; defer so it raises there
         }
         let (name, spec) = s.iter().next().unwrap();
+        // A later stage that reads the sort key keeps mongod 8.2.11 from
+        // pruning the documents a `$replaceRoot` / `$replaceWith` reads, so
+        // its 40228 names the WHOLE input document (RM-623).
+        let replaces_root = |name: &str, spec: &Bson| match name {
+            "$replaceRoot" | "$replaceWith" => true,
+            "$_secantusCarry" => spec
+                .as_document()
+                .and_then(|c| c.get_document("stage").ok())
+                .and_then(|inner| inner.keys().next())
+                .is_some_and(|n| n == "$replaceRoot" || n == "$replaceWith"),
+            _ => false,
+        };
+        let _whole = (replaces_root(name, spec) && pipeline[i + 1..].iter().any(reads_sort_key))
+            .then(WholeInput::set);
         // `maxTimeMS` bounds the whole pipeline: between stages is the one
         // point every stage passes through, including those (a `$sort`) that
         // are a single call with no per-document loop to poll from.
@@ -2591,17 +2605,42 @@ thread_local! {
     static WHOLE_INPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Sets [`WHOLE_INPUT`] while alive, restoring the previous value on drop.
+struct WholeInput(bool);
+
+impl WholeInput {
+    fn set() -> Self {
+        WholeInput(WHOLE_INPUT.with(|w| w.replace(true)))
+    }
+}
+
+impl Drop for WholeInput {
+    fn drop(&mut self) {
+        WHOLE_INPUT.with(|w| w.set(self.0));
+    }
+}
+
+/// Whether a stage reads `{$meta: "sortKey"}` anywhere in its spec: as
+/// written, or as the command layer's rewrite to the hidden field.
+fn reads_sort_key(value: &Bson) -> bool {
+    match value {
+        Bson::String(s) => s
+            .strip_prefix('$')
+            .is_some_and(|p| p == crate::windowfields::SORT_KEY_FIELD),
+        Bson::Document(d) => {
+            (d.len() == 1 && matches!(d.get("$meta"), Some(Bson::String(m)) if m == "sortKey"))
+                || d.values().any(reads_sort_key)
+        }
+        Bson::Array(a) => a.iter().any(reads_sort_key),
+        _ => false,
+    }
+}
+
 /// Run `f`, an update's pipeline: mongod runs no dependency analysis over
 /// an update pipeline, so a `$replaceWith` that fails names the WHOLE input
 /// document (measured 8.2.11), where an `aggregate` names the fields it read.
 pub fn with_whole_input_documents<T>(f: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            WHOLE_INPUT.with(|w| w.set(self.0));
-        }
-    }
-    let _r = Restore(WHOLE_INPUT.with(|w| w.replace(true)));
+    let _r = WholeInput::set();
     f()
 }
 
@@ -2616,7 +2655,13 @@ pub fn with_whole_input_documents<T>(f: impl FnOnce() -> T) -> T {
 /// subsumes a referenced child. Mirrors `aggregate._input_document`.
 fn input_document(doc: &Document, expr: &Bson) -> Document {
     if WHOLE_INPUT.with(std::cell::Cell::get) {
-        return doc.clone();
+        // The metadata this server keeps as hidden fields is not part of
+        // the document mongod names.
+        return doc
+            .iter()
+            .filter(|(k, _)| !k.starts_with("__secantus_meta_"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
     }
     let mut paths = Vec::new();
     if expression_field_paths(expr, &mut paths).is_none() {

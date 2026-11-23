@@ -76,7 +76,7 @@ def _expression_error(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-654")
+@pytest.mark.backlog_fixed("RM-654")
 def test_a_documents_expression_error_is_the_expressions(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -85,7 +85,7 @@ def test_a_documents_expression_error_is_the_expressions(
     `$documents: [{x: {$divide: [1, 0]}}]` with 2 "Failed to optimize
     pipeline :: caused by :: can't $divide by zero", and the same inside a
     `$lookup` reading a `let` variable under the executor prefix too. This
-    server answers 2 "$documents expression not supported" to all three."""
+    server answered 2 "$documents expression not supported" to all three."""
     assert _expression_error(rust_mongo) == _expression_error(mongod_rs)
 
 
@@ -173,7 +173,7 @@ def _run_time_error_namespace(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-656")
+@pytest.mark.backlog_fixed("RM-656")
 def test_a_run_time_error_names_the_commands_namespace(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -182,6 +182,6 @@ def test_a_run_time_error_names_the_commands_namespace(
     aggregate command on namespace: ... :: caused by :: can't $divide by
     zero" wherever the stage runs: `rm531s.$cmd.aggregate` after a
     `$documents`, `rm531s.o` inside a `$lookup` or `$unionWith` on `o`, with
-    or without `from` / `coll`. This server names `rm531s.` after
+    or without `from` / `coll`. This server named `rm531s.` after
     `$documents` and `rm531s.c` inside a stage reading `c`."""
     assert _run_time_error_namespace(rust_mongo) == _run_time_error_namespace(mongod_rs)

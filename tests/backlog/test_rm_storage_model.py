@@ -171,6 +171,12 @@ def test_shutdown_command_stops_the_server(tmp_path: Path) -> None:
     network error, not a reply) and the process exits. `secantusd-mdb`
     answered CommandNotFound (59) and kept running."""
     with rust_mongo_server(tmp_path / "store") as client:
+        # Read the address while the server is up: after `shutdown` the
+        # driver marks the server Unknown, and `client.address` then runs
+        # server selection, which fails with "Connection refused" once the
+        # process has gone (main's CI, run 45200250631, 2026-11-23).
+        address = client.address
+        assert address is not None
         try:
             client.admin.command("shutdown")
             answer: tuple = ("replied",)
@@ -179,8 +185,6 @@ def test_shutdown_command_stops_the_server(tmp_path: Path) -> None:
         except pymongo.errors.ConnectionFailure:
             answer = ("closed",)
         assert answer == ("closed",)
-        address = client.address
-        assert address is not None
         deadline = time.monotonic() + 30
         while True:
             try:
@@ -351,7 +355,7 @@ def _validation_findings(client: pymongo.MongoClient, db: str, name: str) -> Any
         ]
     if result["valid"] and not result.get("errors") and not warnings:
         return None
-    return (result["valid"], result.get("errors"), warnings)
+    return (result["valid"], result.get("errors"), warnings, result)
 
 
 @pytest.mark.backlog_fixed("RM-723")
