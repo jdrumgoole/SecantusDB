@@ -1084,6 +1084,18 @@ about forty such points; these are the ones measured.
       stream does not yet read), or to page each of those reads into the
       write as `bounded_span_pages` does; none of those shapes is probed
       against mongod yet.
+      A `backlog_fixed` RM-390 test regressed once in an RM gate at high
+      load (2026-11-23), unrecorded as to which. Not reproduced: 44 loops
+      of all nine tests (four in parallel, load up to 54, debug build, mongod
+      8.2.11), none failing; mongod alone wrote 5,210-9,064 of 100,000
+      (30 ms, 25 repeats, load ~27) and stopped within 68 ms; this server
+      always wrote 1,000 (one page, 153-185 ms, deadline checked per
+      page), so the one-index shapes cannot write nothing. The suspect is
+      the contested pair (a plan trial of about 30 ms before the first
+      write, against 150 / 400 ms), already widened twice for CI load. The
+      tests now put the plan, budget, written count, elapsed time and
+      load average in their assertion message; read that on the next
+      failure before changing a budget.
       Backlog-ID: RM-390
       Verify: none -- the compound residual and `$in` reads this item's
       gap tests measured are paged

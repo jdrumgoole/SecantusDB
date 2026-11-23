@@ -8,6 +8,7 @@ replica set); the Rust server is `secantusd-mdb` (`rust_mongo`).
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import uuid
@@ -18,6 +19,8 @@ from bson import Binary
 
 from tests.backlog.conftest import mongo_answer
 from tests.mongod_live.test_interrupts import DB, SLOW, Slow
+
+SEEN: dict[str, Any] = {}
 
 
 def _fails_part_way(client: Any) -> tuple:
@@ -153,6 +156,14 @@ def _update_many_out_of_time(client: Any, clustered: bool = False) -> tuple:
     }
     answer = mongo_answer(lambda: db.command(command))
     updated = db.c.count_documents({"n": 1})
+    # For an assertion's message: what decided the answer, should it differ
+    # on a loaded machine (RM-390's regression, RM gate 2026-11-23).
+    SEEN[type(client).__name__ + str(id(client))] = {
+        "clustered": clustered,
+        "answer": answer,
+        "updated": updated,
+        "loadavg": os.getloadavg(),
+    }
     return answer[:2], 0 < updated < 100_000
 
 
@@ -183,8 +194,8 @@ def test_an_update_many_of_a_clustered_collection_out_of_time_keeps_its_updates(
     nothing updated. The store's candidates are now read a page at a time,
     each written before the next is read."""
     theirs = _update_many_out_of_time(mongod_rs, clustered=True)
-    assert theirs == (("err", 50), True), theirs
-    assert _update_many_out_of_time(rust_mongo, clustered=True) == theirs
+    assert theirs == (("err", 50), True), (theirs, SEEN)
+    assert _update_many_out_of_time(rust_mongo, clustered=True) == theirs, SEEN
 
 
 def _running_bulk_write(client: Any) -> list:
