@@ -51,11 +51,26 @@ pub use crate::fallback::Fallback;
 
 type R = Result<Bson, Fallback>;
 
-/// The evaluator to use for a sub-expression whose value is RETURNED unchanged.
-/// The four operators below take one so the caller chooses the position:
-/// [`eval`] (an absent path is null) or [`eval_field_value`] (it stays missing).
-/// Mirrors `expressions.py::_Eval`.
-type Ret = fn(&Bson, &Ctx) -> R;
+/// A sub-expression's answer, as `$ifNull` reads it: null, `undefined` and
+/// MISSING all have no value for it to return.
+trait Answer {
+    fn has_no_value(&self) -> bool;
+}
+
+impl Answer for Bson {
+    fn has_no_value(&self) -> bool {
+        matches!(self, Bson::Null | Bson::Undefined)
+    }
+}
+
+impl Answer for Field {
+    fn has_no_value(&self) -> bool {
+        match self {
+            Field::Missing => true,
+            Field::Value(v) => v.has_no_value(),
+        }
+    }
+}
 
 mod sbe_ops;
 
@@ -67,6 +82,11 @@ struct Ctx<'a> {
     /// variable that is not constant. mongod folds the rest while optimizing,
     /// so they decide which wrapper an error carries (RM-293).
     per_doc: &'a [String],
+    /// The variables bound to MISSING: a `$let` variable whose expression is
+    /// an absent field. Not in `vars`, which holds values only (a stored
+    /// `undefined` among them): MISSING is a case of its own, as mongod's EOO
+    /// `Value` is, not a BSON value (RM-763).
+    missing: &'a [String],
 }
 
 impl Ctx<'_> {
@@ -88,6 +108,7 @@ pub fn evaluate(doc: &Document, expr: &Bson, vars: &Document) -> R {
             doc,
             vars,
             per_doc: &[],
+            missing: &[],
         },
     )
 }
@@ -102,6 +123,7 @@ pub fn evaluate_or_missing(doc: &Document, expr: &Bson, vars: &Document) -> R {
             doc,
             vars,
             per_doc: &[],
+            missing: &[],
         },
     )
 }
@@ -116,6 +138,15 @@ pub enum Field {
 }
 
 impl Field {
+    /// The answer in operand position, where MISSING and a stored `undefined`
+    /// are alike no value: `Bson::Undefined`.
+    pub fn operand(self) -> Bson {
+        match self {
+            Field::Missing => Bson::Undefined,
+            Field::Value(v) => v,
+        }
+    }
+
     /// The value, `None` for MISSING.
     pub fn into_value(self) -> Option<Bson> {
         match self {
@@ -128,42 +159,15 @@ impl Field {
 /// [`evaluate_or_missing`], telling a real `undefined` value apart from MISSING:
 /// `$addFields` and `$project` write the one and omit the other.
 pub fn evaluate_field(doc: &Document, expr: &Bson, vars: &Document) -> Result<Field, Fallback> {
-    field_of(eval_field_value_keep(
+    eval_field(
         expr,
         &Ctx {
             doc,
             vars,
             per_doc: &[],
+            missing: &[],
         },
-    )?)
-}
-
-fn field_of(v: Bson) -> Result<Field, Fallback> {
-    Ok(match v {
-        Bson::Undefined => Field::Missing,
-        v => Field::Value(stored(v)),
-    })
-}
-
-/// A result held as [`crate::bsondoc::held_undefined`] turned back into the
-/// BSON value it stands for. A shallow turn: the carrier only ever is a whole
-/// result, never a part of a container.
-pub(crate) fn stored(v: Bson) -> Bson {
-    if crate::bsondoc::is_held_undefined(&v) {
-        Bson::Undefined
-    } else {
-        v
-    }
-}
-
-/// An element read out of a container, ready to bind to a variable: a real
-/// `undefined` is held, so it is not mistaken for MISSING there.
-fn held(v: Bson) -> Bson {
-    if matches!(v, Bson::Undefined) {
-        crate::bsondoc::held_undefined()
-    } else {
-        v
-    }
+    )
 }
 
 /// MongoDB truthiness (`secantus.expressions._bool` / `query._truthy`): null is
@@ -364,11 +368,8 @@ fn eval(expr: &Bson, ctx: &Ctx) -> R {
             let mut out = Document::new();
             for (k, v) in d {
                 // A member that is a real `undefined` is written; MISSING is not.
-                match eval_field_value_keep(v, ctx)? {
-                    Bson::Undefined => {}
-                    value => {
-                        out.insert(k.clone(), stored(value));
-                    }
+                if let Field::Value(value) = eval_field(v, ctx)? {
+                    out.insert(k.clone(), value);
                 }
             }
             Ok(Bson::Document(out))
@@ -416,33 +417,44 @@ fn stamp_folded(fault: Fallback, arg: &Bson, ctx: &Ctx) -> Fallback {
 }
 
 fn eval_field_value(expr: &Bson, ctx: &Ctx) -> R {
-    eval_field_value_keep(expr, ctx).map(stored)
+    eval_field(expr, ctx).map(Field::operand)
 }
 
-/// [`eval_field_value`] keeping a real `undefined` apart from MISSING: it is
-/// held ([`crate::bsondoc::held_undefined`]) where `eval_field_value` gives
-/// `Bson::Undefined`. The result is for a caller that knows the carrier -- the
-/// ones that read or write a value's own type (`$type`, a variable binding, a
-/// stage's write) -- and the rest take [`eval_field_value`].
-fn eval_field_value_keep(expr: &Bson, ctx: &Ctx) -> R {
-    if let Some(v) = eval_invalid_utf8(expr, ctx, Bson::Undefined) {
-        return Ok(v);
+/// Evaluate in *field-value* position, telling MISSING from every value: an
+/// absent path, `$$REMOVE` and an operator's MISSING are [`Field::Missing`], a
+/// stored `undefined` is the value `Bson::Undefined` (RM-635). mongod's own
+/// engine keeps the two apart the same way, an EOO `Value` in the classic
+/// engine and `Nothing` in SBE (RM-763).
+fn eval_field(expr: &Bson, ctx: &Ctx) -> Result<Field, Fallback> {
+    if let Some(b) = crate::bsondoc::as_invalid_utf8(expr) {
+        return Ok(match b {
+            [b'$', rest @ ..] if rest.first() != Some(&b'$') => {
+                match expr_path(ctx.doc, &crate::bsondoc::escape_key(rest)) {
+                    Some(v) => Field::Value(v),
+                    None => Field::Missing,
+                }
+            }
+            _ => Field::Value(expr.clone()),
+        });
     }
     if let Bson::String(s) = expr {
         if !s.starts_with("$$") {
             if let Some(path) = s.strip_prefix('$') {
                 return Ok(match expr_path(ctx.doc, path) {
-                    Some(v) => held(v),
-                    None => Bson::Undefined,
+                    Some(v) => Field::Value(v),
+                    None => Field::Missing,
                 });
             }
         }
-        // A variable holds its own result as it was bound: a held real
-        // `undefined`, MISSING, or a value.
+        // A variable holds its own result as it was bound: a value, a stored
+        // `undefined` among them, or MISSING.
         if let Some(name) = s.strip_prefix("$$") {
             if !name.contains('.') {
+                if ctx.missing.iter().any(|m| m == name) {
+                    return Ok(Field::Missing);
+                }
                 if let Some(v) = ctx.vars.get(name) {
-                    return Ok(v.clone());
+                    return Ok(Field::Value(v.clone()));
                 }
             }
         }
@@ -452,7 +464,7 @@ fn eval_field_value_keep(expr: &Bson, ctx: &Ctx) -> R {
         // here, `null` in `eval`. This whole variable used to defer to Python,
         // which on a server with no Python is a generic BadValue.
         if s == "$$REMOVE" {
-            return Ok(Bson::Undefined);
+            return Ok(Field::Missing);
         }
         // A path into a variable that leads nowhere is missing too:
         // `{$set: {m: "$$new.a"}}` REMOVES `m` when `new` has no `a`
@@ -466,15 +478,14 @@ fn eval_field_value_keep(expr: &Bson, ctx: &Ctx) -> R {
                 None => None,
             };
             match root {
-                Some(Bson::Document(d)) if expr_path(&d, rest).is_none() => {
-                    return Ok(Bson::Undefined)
-                }
-                Some(Bson::Document(d)) if matches!(expr_path(&d, rest), Some(Bson::Undefined)) => {
-                    return Ok(held(Bson::Undefined))
-                }
-                Some(Bson::Document(_) | Bson::Array(_)) | None => {}
+                Some(Bson::Document(d)) => match expr_path(&d, rest) {
+                    None => return Ok(Field::Missing),
+                    Some(v @ Bson::Undefined) => return Ok(Field::Value(v)),
+                    Some(_) => {}
+                },
+                Some(Bson::Array(_)) | None => {}
                 // A scalar has no fields.
-                Some(_) => return Ok(Bson::Undefined),
+                Some(_) => return Ok(Field::Missing),
             }
         }
     }
@@ -496,74 +507,22 @@ fn eval_field_value_keep(expr: &Bson, ctx: &Ctx) -> R {
                     check_required_fields(op, arg).map_err(|f| stamp_folded(f, arg, ctx))?;
                 }
                 match op.as_str() {
-                    "$cond" => return op_cond(arg, ctx, eval_field_value_keep),
-                    "$switch" => return op_switch(arg, ctx, eval_field_value_keep),
-                    "$let" => return op_let(arg, ctx, eval_field_value_keep),
-                    "$ifNull" => return op_if_null(arg, ctx, eval_field_value_keep),
-                    // These read an element out of an array: a real `undefined`
-                    // element answers `Bson::Undefined`, as MISSING does, so the
-                    // answer is told apart here.
-                    "$arrayElemAt" | "$first" | "$last" | "$getField" => {
-                        let v = apply_op(op, arg, ctx).map_err(|f| stamp_folded(f, expr, ctx))?;
-                        return Ok(match v {
-                            Bson::Undefined
-                                if match op.as_str() {
-                                    "$arrayElemAt" => elem_in_range(arg, ctx),
-                                    "$getField" => field_present(arg, ctx),
-                                    _ => true,
-                                } =>
-                            {
-                                held(v)
-                            }
-                            v => v,
-                        });
+                    "$cond" => return op_cond(arg, ctx, eval_field),
+                    "$switch" => return op_switch(arg, ctx, eval_field),
+                    "$let" => return op_let(arg, ctx, eval_field),
+                    "$ifNull" => return op_if_null(arg, ctx, eval_field),
+                    // These can answer MISSING, which is not an element that is
+                    // a stored `undefined`: out of range, a field the input
+                    // lacks, a `$meta` there is no value for.
+                    "$arrayElemAt" | "$first" | "$last" | "$getField" | "$meta" => {
+                        return apply_op_field(op, arg, ctx).map_err(|f| stamp_folded(f, expr, ctx))
                     }
                     _ => {}
                 }
             }
         }
     }
-    eval(expr, ctx)
-}
-
-/// Whether `{$getField: arg}` named a field its input holds: the one case it
-/// answers `Bson::Undefined` for that is not MISSING.
-fn field_present(arg: &Bson, ctx: &Ctx) -> bool {
-    let (field, input) = match arg {
-        Bson::Document(d)
-            if !(d.len() == 1 && d.keys().next().is_some_and(|k| k.starts_with('$'))) =>
-        {
-            let (Some(f), Some(i)) = (d.get("field"), d.get("input")) else {
-                return false;
-            };
-            let Ok(Bson::Document(input)) = eval(i, ctx) else {
-                return false;
-            };
-            (eval(f, ctx), input)
-        }
-        _ => (eval(arg, ctx), ctx.doc.clone()),
-    };
-    matches!(field, Ok(Bson::String(name)) if input.contains_key(&name))
-}
-
-/// Whether `{$arrayElemAt: [array, index]}` named an element of the array:
-/// the one case it answers `Bson::Undefined` for that is not MISSING.
-fn elem_in_range(arg: &Bson, ctx: &Ctx) -> bool {
-    let Bson::Array(pair) = arg else { return false };
-    let [array, index] = pair.as_slice() else {
-        return false;
-    };
-    let (Ok(Bson::Array(a)), Ok(idx)) = (eval(array, ctx), eval(index, ctx)) else {
-        return false;
-    };
-    match coerce_index(&idx) {
-        IdxCoerce::Int(i) => {
-            let len = a.len() as i128;
-            let i = i as i128;
-            (0..len).contains(&(if i < 0 { i + len } else { i }))
-        }
-        _ => false,
-    }
+    eval(expr, ctx).map(Field::Value)
 }
 
 fn resolve_var(name: &str, ctx: &Ctx) -> R {
@@ -571,10 +530,12 @@ fn resolve_var(name: &str, ctx: &Ctx) -> R {
         Some((b, r)) => (b, Some(r)),
         None => (name, None),
     };
-    let value = if let Some(v) = ctx.vars.get(base) {
-        // A variable can hold a real `undefined` as its carrier (a binding of
-        // `eval_field_value_keep`); here it is the value itself.
-        stored(v.clone())
+    let value = if ctx.missing.iter().any(|m| m == base) {
+        // Bound to MISSING: no value, as an absent path is none (null for a
+        // path into it, as for any other missing input).
+        Bson::Undefined
+    } else if let Some(v) = ctx.vars.get(base) {
+        v.clone()
     } else if base == "ROOT" || base == "CURRENT" {
         Bson::Document(ctx.doc.clone())
     } else if base == "REMOVE" {
@@ -1172,6 +1133,13 @@ pub fn check_required_fields(op: &str, arg: &Bson) -> Result<(), Fallback> {
 }
 
 fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
+    apply_op_field(op, arg, ctx).map(Field::operand)
+}
+
+/// [`apply_op`] telling MISSING from a value: the operators that can answer
+/// MISSING (an element out of range, a field the input lacks) do so as
+/// [`Field::Missing`], which an element that is a stored `undefined` is not.
+fn apply_op_field(op: &str, arg: &Bson, ctx: &Ctx) -> Result<Field, Fallback> {
     // mongod's expression parser treats `{$op: [x]}` as ONE argument for the
     // single-argument operators, unwrapping the list. Passing the list through
     // produced silent WRONG VALUES rather than errors: `{$size: [[1, 2]]}`
@@ -1199,10 +1167,17 @@ fn apply_op(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         )
     {
         if let Some(answer) = sbe_ops::apply(op, arg, ctx) {
-            return answer;
+            return answer.map(Field::Value);
         }
     }
-    apply_classic(op, arg, ctx)
+    match op {
+        "$arrayElemAt" => op_array_elem_at_field(arg, ctx),
+        "$first" => op_first_last_field(arg, ctx, true),
+        "$last" => op_first_last_field(arg, ctx, false),
+        "$getField" => op_get_field_field(arg, ctx),
+        "$meta" => op_meta_field(arg),
+        _ => apply_classic(op, arg, ctx).map(Field::Value),
+    }
 }
 
 /// An operator by the classic engine's rules, its argument already unwrapped.
@@ -1237,9 +1212,9 @@ fn apply_classic(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$divide" => op_divide(arg, ctx),
         "$mod" => op_mod(arg, ctx),
         "$size" => op_size(arg, ctx),
-        "$arrayElemAt" => op_array_elem_at(arg, ctx),
-        "$first" => op_first_last(arg, ctx, true),
-        "$last" => op_first_last(arg, ctx, false),
+        "$arrayElemAt" => op_array_elem_at_field(arg, ctx).map(Field::operand),
+        "$first" => op_first_last_field(arg, ctx, true).map(Field::operand),
+        "$last" => op_first_last_field(arg, ctx, false).map(Field::operand),
         "$firstN" => op_first_last_n(arg, ctx, true),
         "$lastN" => op_first_last_n(arg, ctx, false),
         "$maxN" => op_max_min_n(arg, ctx, true),
@@ -1276,7 +1251,7 @@ fn apply_classic(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         "$median" => op_percentile_expr(arg, ctx, true),
         "$percentile" => op_percentile_expr(arg, ctx, false),
         "$objectToArray" => op_object_to_array(arg, ctx),
-        "$getField" => op_get_field(arg, ctx),
+        "$getField" => op_get_field_field(arg, ctx).map(Field::operand),
         "$setField" => op_set_field(arg, ctx),
         "$unsetField" => op_unset_field(arg, ctx),
         "$zip" => op_zip(arg, ctx),
@@ -1394,7 +1369,7 @@ fn apply_classic(op: &str, arg: &Bson, ctx: &Ctx) -> R {
         // non-deterministic: a fresh uniform double in [0, 1) (mirrors
         // `expressions._op_rand` / `random.random()`; not byte-pinned to it).
         "$rand" => op_rand(arg),
-        "$meta" => op_meta(arg),
+        "$meta" => op_meta_field(arg).map(Field::operand),
         _ => Err(Fallback::Defer),
     }
 }
@@ -1684,7 +1659,7 @@ fn in_query_filter() -> bool {
 /// (`agg_meta::rewrite_sort_metadata`); with no `$sort` in reach `sortKey`
 /// becomes `[]` in `$addFields` and `$group` there, is missing in a query
 /// filter's `$expr`, and is refused here otherwise.
-fn op_meta(arg: &Bson) -> R {
+fn op_meta_field(arg: &Bson) -> Result<Field, Fallback> {
     let unavailable = |what: &str| {
         Err(Fallback::mongo(
             40218,
@@ -1704,9 +1679,9 @@ fn op_meta(arg: &Bson) -> R {
             // A query filter never sees a sort key: in a `find` filter's or
             // a `$match`'s `$expr` it is missing (mongod 8.2.11,
             // 2026-10-22; RM-252). Elsewhere the command layer rewrites it.
-            "sortKey" if in_query_filter() => Ok(Bson::Undefined),
+            "sortKey" if in_query_filter() => Ok(Field::Missing),
             "sortKey" => Err(Fallback::Defer),
-            known if crate::projection::META_KEYWORDS.contains(&known) => Ok(Bson::Undefined),
+            known if crate::projection::META_KEYWORDS.contains(&known) => Ok(Field::Missing),
             _ => Err(Fallback::Defer),
         },
         _ => Err(Fallback::Defer),
@@ -1981,7 +1956,11 @@ fn logic(arg: &Bson, ctx: &Ctx, all: bool) -> R {
     Ok(Bson::Boolean(all))
 }
 
-fn op_cond(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
+fn op_cond<T>(
+    arg: &Bson,
+    ctx: &Ctx,
+    ret: fn(&Bson, &Ctx) -> Result<T, Fallback>,
+) -> Result<T, Fallback> {
     match arg {
         Bson::Document(d) => {
             let (cond, then, els) = (d.get("if"), d.get("then"), d.get("else"));
@@ -2005,7 +1984,11 @@ fn op_cond(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
     }
 }
 
-fn op_if_null(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
+fn op_if_null<T: Answer>(
+    arg: &Bson,
+    ctx: &Ctx,
+    ret: fn(&Bson, &Ctx) -> Result<T, Fallback>,
+) -> Result<T, Fallback> {
     let Bson::Array(items) = arg else {
         return Err(Fallback::Defer);
     };
@@ -2017,7 +2000,7 @@ fn op_if_null(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
         let v = ret(check, ctx)?;
         // A MISSING check is skipped exactly like a null one: `$ifNull` looks
         // for the first argument that HAS a value.
-        if !is_null(&v) && !matches!(v, Bson::Undefined) && !crate::bsondoc::is_held_undefined(&v) {
+        if !v.has_no_value() {
             return Ok(v);
         }
     }
@@ -2094,7 +2077,11 @@ fn switch_parse(arg: &Bson) -> Result<(), Fallback> {
     Ok(())
 }
 
-fn op_switch(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
+fn op_switch<T>(
+    arg: &Bson,
+    ctx: &Ctx,
+    ret: fn(&Bson, &Ctx) -> Result<T, Fallback>,
+) -> Result<T, Fallback> {
     // `switch_parse` has checked the shape; a malformed `$switch` never gets here.
     let (Bson::Document(d), Some(Bson::Array(branches))) =
         (arg, arg.as_document().and_then(|d| d.get("branches")))
@@ -2200,7 +2187,12 @@ fn arith_nary(arg: &Bson, ctx: &Ctx, mul: bool) -> R {
     if !mul && vals.is_empty() {
         return Ok(Bson::Int32(0));
     }
-    if vals.iter().any(is_null) {
+    // `Value::nullish()`: null, MISSING and a stored `undefined` alike answer
+    // null (RM-761).
+    if vals
+        .iter()
+        .any(|v| matches!(v, Bson::Null | Bson::Undefined))
+    {
         return Ok(Bson::Null);
     }
     // BSON arithmetic rejects bool, and every other non-numeric type. mongod
@@ -2547,7 +2539,7 @@ fn op_size(arg: &Bson, ctx: &Ctx) -> R {
     ))
 }
 
-fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
+fn op_array_elem_at_field(arg: &Bson, ctx: &Ctx) -> Result<Field, Fallback> {
     let Bson::Array(pair) = arg else {
         return Err(Fallback::Defer);
     };
@@ -2560,7 +2552,7 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
     // array is checked before the index: `{$arrayElemAt: [null, "x"]}` is
     // null and `[5, "x"]` is 28689 (measured 8.2.11, 2026-10-22).
     if is_null(&arr) || is_null(&idx) {
-        return Ok(Bson::Null);
+        return Ok(Field::Value(Bson::Null));
     }
     let a = match &arr {
         Bson::Array(a) => a,
@@ -2650,7 +2642,7 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
             // silent WRONG VALUE rather than an error. `bool` had its own check
             // above, which is why only that one type behaved.
             if matches!(idx, Bson::Null | Bson::Undefined) {
-                return Ok(Bson::Null);
+                return Ok(Field::Value(Bson::Null));
             }
             return Err(Fallback::mongo(
                 28690,
@@ -2664,7 +2656,7 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
     let len = a.len() as i128;
     let resolved = if i < 0 { i + len } else { i };
     if (0..len).contains(&resolved) {
-        Ok(a[resolved as usize].clone())
+        Ok(Field::Value(a[resolved as usize].clone()))
     } else {
         // Out of range evaluates to MISSING, not null, so `$project` omits the
         // field. `Bson::Undefined` is this engine's missing marker and the
@@ -2672,20 +2664,20 @@ fn op_array_elem_at(arg: &Bson, ctx: &Ctx) -> R {
         // `[1, 2]`: index 9 and index -9 both give `{_id: 1}` with no field,
         // while a missing/null input array really is null. Mirrors
         // `expressions.py::_array_elem_at`.
-        Ok(Bson::Undefined)
+        Ok(Field::Missing)
     }
 }
 
-fn op_first_last(arg: &Bson, ctx: &Ctx, first: bool) -> R {
+fn op_first_last_field(arg: &Bson, ctx: &Ctx, first: bool) -> Result<Field, Fallback> {
     match eval(arg, ctx)? {
-        Bson::Null => Ok(Bson::Null),
-        Bson::Array(a) => Ok(if a.is_empty() {
+        Bson::Null => Ok(Field::Value(Bson::Null)),
+        Bson::Array(a) => Ok(Field::Value(if a.is_empty() {
             Bson::Null
         } else if first {
             a[0].clone()
         } else {
             a[a.len() - 1].clone()
-        }),
+        })),
         other => Err(wrong_type(
             28689,
             &format!(
@@ -4020,7 +4012,7 @@ fn get_field_type_error(type_name: &str) -> Fallback {
     .with_folded(false)
 }
 
-fn op_get_field(arg: &Bson, ctx: &Ctx) -> R {
+fn op_get_field_field(arg: &Bson, ctx: &Ctx) -> Result<Field, Fallback> {
     // `field` is an EXPRESSION that must evaluate to a string; `input` defaults
     // to $$CURRENT (the doc).
     let (field, input) = match arg {
@@ -4064,14 +4056,14 @@ fn op_get_field(arg: &Bson, ctx: &Ctx) -> R {
                 Some(Bson::String(s)) if s.starts_with('$') && !s.starts_with("$$") => {
                     match expr_path(ctx.doc, &s[1..]) {
                         Some(v) => v,
-                        None => return Ok(Bson::Undefined), // input missing -> missing
+                        None => return Ok(Field::Missing), // input missing -> missing
                     }
                 }
                 // Any other input that evaluates to missing -- `$$REMOVE` --
                 // is missing too (measured 8.2.11, 2026-10-22).
-                Some(e) => match eval_field_value(e, ctx)? {
-                    Bson::Undefined => return Ok(Bson::Undefined),
-                    v => v,
+                Some(e) => match eval_field(e, ctx)? {
+                    Field::Missing => return Ok(Field::Missing),
+                    Field::Value(v) => v,
                 },
                 None => Bson::Document(ctx.doc.clone()),
             };
@@ -4103,14 +4095,14 @@ fn op_get_field(arg: &Bson, ctx: &Ctx) -> R {
         // null returns null.
         Bson::Document(doc) if crate::bsondoc::carrier_bytes(&doc).is_none() => {
             match doc.get(&field) {
-                Some(v) => Ok(v.clone()),
-                None => Ok(Bson::Undefined),
+                Some(v) => Ok(Field::Value(v.clone())),
+                None => Ok(Field::Missing),
             }
         }
         // A null input is null; any other non-document is MISSING, as an
         // absent field is. Measured 8.2.11, 2026-10-20 -- this answered null.
-        Bson::Null => Ok(Bson::Null),
-        _ => Ok(Bson::Undefined),
+        Bson::Null => Ok(Field::Value(Bson::Null)),
+        _ => Ok(Field::Missing),
     }
 }
 
@@ -4273,12 +4265,12 @@ fn op_set_field(arg: &Bson, ctx: &Ctx) -> R {
     // writes a null. This used to use `eval`, where `$$REMOVE` deferred to
     // Python and an absent path wrote a null.
     // A real `undefined` is a value and is written (RM-635).
-    match eval_field_value_keep(ve, ctx)? {
-        Bson::Undefined => {
+    match eval_field(ve, ctx)? {
+        Field::Missing => {
             doc.remove(&field);
         }
-        value => {
-            doc.insert(field, stored(value));
+        Field::Value(value) => {
+            doc.insert(field, value);
         }
     }
     Ok(Bson::Document(doc))
@@ -4388,9 +4380,10 @@ fn op_object_to_array(arg: &Bson, ctx: &Ctx) -> R {
 /// bare `$field` paths) is unchanged — only the var scope grows.
 fn eval_with_vars(expr: &Bson, ctx: &Ctx, extra: &[(&str, Bson)]) -> R {
     let mut vars = ctx.vars.clone();
+    let mut missing = ctx.missing.to_vec();
     let mut per_doc = ctx.per_doc.to_vec();
     for (name, value) in extra {
-        vars.insert((*name).to_string(), value.clone());
+        bind(&mut vars, &mut missing, name, Field::Value(value.clone()));
         per_doc.push((*name).to_string());
     }
     eval(
@@ -4399,6 +4392,7 @@ fn eval_with_vars(expr: &Bson, ctx: &Ctx, extra: &[(&str, Bson)]) -> R {
             doc: ctx.doc,
             vars: &vars,
             per_doc: &per_doc,
+            missing: &missing,
         },
     )
 }
@@ -4413,7 +4407,11 @@ fn as_var_name(spec: Option<&Bson>) -> Result<String, Fallback> {
     }
 }
 
-fn op_let(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
+fn op_let<T>(
+    arg: &Bson,
+    ctx: &Ctx,
+    ret: fn(&Bson, &Ctx) -> Result<T, Fallback>,
+) -> Result<T, Fallback> {
     let Bson::Document(d) = arg else {
         return Err(Fallback::Defer);
     };
@@ -4423,14 +4421,14 @@ fn op_let(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
     // Each binding is evaluated against the *original* scope (bindings don't see
     // each other), then all are layered for the `in` expression.
     let mut vars = ctx.vars.clone();
+    let mut missing = ctx.missing.to_vec();
     let constant = ctx.constant_vars();
     let mut per_doc = ctx.per_doc.to_vec();
     for (name, vexpr) in bindings {
         // FIELD-VALUE position, so a var bound from an absent field stays
         // missing rather than collapsing to null: mongod's `$eq: ["$$v", null]`
         // is false when `$$v` came from a field the document does not have.
-        let v = eval_field_value_keep(vexpr, ctx)?;
-        vars.insert(name.clone(), v);
+        bind(&mut vars, &mut missing, name, eval_field(vexpr, ctx)?);
         // A constant definition is inlined by mongod's optimizer; any other
         // is bound per document, and hides an outer constant of that name.
         let folded = crate::aggregate::is_constant_expression(vexpr, &constant);
@@ -4445,8 +4443,24 @@ fn op_let(arg: &Bson, ctx: &Ctx, ret: Ret) -> R {
             doc: ctx.doc,
             vars: &vars,
             per_doc: &per_doc,
+            missing: &missing,
         },
     )
+}
+
+/// Bind `name` to what a variable's expression came to: a value in `vars`, or
+/// MISSING in `missing`, never both, and hiding an outer binding of the name.
+fn bind(vars: &mut Document, missing: &mut Vec<String>, name: &str, answer: Field) {
+    missing.retain(|m| m != name);
+    match answer {
+        Field::Value(v) => {
+            vars.insert(name.to_string(), v);
+        }
+        Field::Missing => {
+            vars.remove(name);
+            missing.push(name.to_string());
+        }
+    }
 }
 
 fn op_map(arg: &Bson, ctx: &Ctx) -> R {
@@ -4470,7 +4484,7 @@ fn op_map(arg: &Bson, ctx: &Ctx) -> R {
     let in_expr = d.get("in").unwrap_or(&null);
     let mut out = Vec::with_capacity(arr.len());
     for (i, elem) in arr.into_iter().enumerate() {
-        out.push(eval_with_vars(in_expr, ctx, &[(&var, held(elem))])?);
+        out.push(eval_with_vars(in_expr, ctx, &[(&var, elem)])?);
         crate::deadline::check_expression(i + 1)?;
     }
     Ok(Bson::Array(out))
@@ -4508,7 +4522,7 @@ fn op_filter(arg: &Bson, ctx: &Ctx) -> R {
     };
     let mut out: Vec<Bson> = Vec::new();
     for (i, elem) in arr.into_iter().enumerate() {
-        let keep = truthy(&eval_with_vars(cond, ctx, &[(&var, held(elem.clone()))])?);
+        let keep = truthy(&eval_with_vars(cond, ctx, &[(&var, elem.clone())])?);
         crate::deadline::check_expression(i + 1)?;
         if keep {
             out.push(elem);
@@ -4567,7 +4581,7 @@ fn op_reduce(arg: &Bson, ctx: &Ctx) -> R {
     let null = Bson::Null;
     let in_expr = d.get("in").unwrap_or(&null);
     for (i, elem) in arr.into_iter().enumerate() {
-        acc = eval_with_vars(in_expr, ctx, &[("value", acc), ("this", held(elem))])?;
+        acc = eval_with_vars(in_expr, ctx, &[("value", acc), ("this", elem)])?;
         crate::deadline::check_expression(i + 1)?;
     }
     Ok(acc)
@@ -6311,6 +6325,7 @@ pub fn optimize_date_fault(expr: &Bson, vars: &Document) -> Option<Fallback> {
         doc: &empty,
         vars,
         per_doc: &[],
+        missing: &[],
     };
     let bound: Vec<String> = vars.keys().cloned().collect();
     if crate::aggregate::is_constant_expression(expr, &bound) {
@@ -10071,10 +10086,9 @@ fn op_type(arg: &Bson, ctx: &Ctx) -> R {
     }
     // Any other operand that evaluates to missing -- a `$meta` mongod has no
     // value for, a `$getField` of an absent field -- is "missing" too.
-    match eval_field_value_keep(arg, ctx)? {
-        Bson::Undefined => Ok(Bson::String("missing".into())),
-        v if crate::bsondoc::is_held_undefined(&v) => Ok(Bson::String("undefined".into())),
-        v => Ok(Bson::String(type_name(&v).into())),
+    match eval_field(arg, ctx)? {
+        Field::Missing => Ok(Bson::String("missing".into())),
+        Field::Value(v) => Ok(Bson::String(type_name(&v).into())),
     }
 }
 
@@ -12995,6 +13009,59 @@ mod stored_undefined_tests {
             )
             .unwrap(),
             Bson::Array(vec![name("undefined"), name("int")])
+        );
+    }
+
+    #[test]
+    fn a_variable_bound_to_missing_stays_apart_from_every_value() {
+        let d = doc! {"a": Bson::Undefined, "n": Bson::Null};
+        let vars = Document::new();
+        let let_in = |bound: &str, body: Bson| {
+            evaluate(
+                &d,
+                &bson::bson!({"$let": {"vars": {"v": bound}, "in": body}}),
+                &vars,
+            )
+            .unwrap()
+        };
+        // MISSING is a case of its own: neither null nor `undefined`.
+        assert_eq!(
+            let_in("$nope", bson::bson!({"$type": "$$v"})),
+            name("missing")
+        );
+        assert_eq!(
+            let_in("$a", bson::bson!({"$type": "$$v"})),
+            name("undefined")
+        );
+        assert_eq!(let_in("$n", bson::bson!({"$type": "$$v"})), name("null"));
+        assert_eq!(
+            let_in("$nope", bson::bson!({"$eq": ["$$v", Bson::Null]})),
+            Bson::Boolean(false)
+        );
+        // A binding of a value hides an outer binding of MISSING, and the
+        // other way about.
+        assert_eq!(
+            let_in(
+                "$nope",
+                bson::bson!({"$let": {"vars": {"v": "$a"}, "in": {"$type": "$$v"}}})
+            ),
+            name("undefined")
+        );
+        assert_eq!(
+            let_in(
+                "$a",
+                bson::bson!({"$let": {"vars": {"v": "$nope"}, "in": {"$type": "$$v"}}})
+            ),
+            name("missing")
+        );
+        // Arithmetic takes a stored `undefined` for null, as MISSING is (RM-761).
+        assert_eq!(
+            evaluate(&d, &bson::bson!({"$add": ["$a", 1]}), &vars).unwrap(),
+            Bson::Null
+        );
+        assert_eq!(
+            evaluate(&d, &bson::bson!({"$multiply": ["$a", 2]}), &vars).unwrap(),
+            Bson::Null
         );
     }
 

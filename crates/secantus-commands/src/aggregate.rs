@@ -3665,8 +3665,16 @@ fn apply_lookup(
         let mut sub_vars = vars.clone();
         if let Some(ls) = let_spec {
             for (k, expr) in ls.iter() {
-                let v = secantus_core::expressions::evaluate(doc, expr, vars)
-                    .map_err(|_| bad_value("$lookup let expression not supported"))?;
+                // A variable binds the value its expression came to, a stored
+                // `undefined` among them (RM-763). One that came to MISSING
+                // binds null: `vars` holds values only, and the sub-pipeline's
+                // stages take it as a document of them.
+                let v = match secantus_core::expressions::evaluate_field(doc, expr, vars)
+                    .map_err(|_| bad_value("$lookup let expression not supported"))?
+                {
+                    secantus_core::expressions::Field::Value(v) => v,
+                    secantus_core::expressions::Field::Missing => Bson::Null,
+                };
                 sub_vars.insert(k.clone(), v);
             }
         }
