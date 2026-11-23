@@ -42,7 +42,7 @@ def _nested_stage_specs(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-645")
+@pytest.mark.backlog_fixed("RM-645")
 def test_stage_specs_in_a_sub_pipeline_are_checked_as_it_parses(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -50,7 +50,7 @@ def test_stage_specs_in_a_sub_pipeline_are_checked_as_it_parses(
     """mongod 8.2.11 refuses a malformed stage spec inside a `$facet` or a
     `$lookup` pipeline as the pipeline parses, over an empty collection:
     15959 for `$match: 5`, 14 for a `$lookup` `let` that is not a document,
-    9 for a lone `localField`. This server answers 2 to the first and runs
+    9 for a lone `localField`. This server answered 2 to the first and ran
     the other two."""
     assert _nested_stage_specs(rust_mongo) == _nested_stage_specs(mongod_rs)
 

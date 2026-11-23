@@ -3114,14 +3114,61 @@ pub fn stage_spec_error(pipeline: &[Bson]) -> Option<(i32, String)> {
         if err.is_some() {
             return err;
         }
+        // mongod parses a sub-pipeline as it parses the stage that holds it,
+        // so a malformed stage inside a `$facet`, `$lookup` or `$unionWith`
+        // pipeline is refused before anything runs, even over an empty
+        // collection (RM-645, measured 8.2.11).
+        if let Some(err) = sub_pipelines(name, spec)
+            .into_iter()
+            .find_map(stage_spec_error)
+        {
+            return Some(err);
+        }
     }
     None
+}
+
+/// The sub-pipelines a stage spec holds, in the order mongod parses them.
+fn sub_pipelines<'a>(name: &str, spec: &'a Bson) -> Vec<&'a [Bson]> {
+    let Bson::Document(d) = spec else {
+        return Vec::new();
+    };
+    match name {
+        "$facet" => d
+            .values()
+            .filter_map(|v| match v {
+                Bson::Array(a) => Some(a.as_slice()),
+                _ => None,
+            })
+            .collect(),
+        "$lookup" | "$unionWith" => match d.get("pipeline") {
+            Some(Bson::Array(a)) => vec![a.as_slice()],
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]
 mod stage_tests {
     use super::*;
     use bson::doc;
+
+    #[test]
+    fn a_sub_pipeline_stage_is_checked_as_the_outer_one_parses() {
+        // RM-645: mongod 8.2.11 refuses these over an empty collection.
+        let facet = doc! {"$facet": {"a": [{"$match": 5}]}};
+        assert_eq!(
+            stage_spec_error(&[Bson::Document(facet)]).map(|e| e.0),
+            Some(15959)
+        );
+        let nested = doc! {"$lookup": {"from": "c", "as": "q",
+        "pipeline": [{"$lookup": {"from": "c", "localField": "a", "as": "z"}}]}};
+        assert_eq!(
+            stage_spec_error(&[Bson::Document(nested)]).map(|e| e.0),
+            Some(9)
+        );
+    }
 
     fn err_for(stage: &str, spec: Bson) -> (i32, String) {
         let mut d = bson::Document::new();

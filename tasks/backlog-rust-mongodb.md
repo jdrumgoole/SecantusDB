@@ -1221,17 +1221,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       have, mongod's `otherNss` order is its hash set's, and the rest is
       unmeasured: a probe must find a difference before a test can assert it
       Backlog-ID: RM-532
-- [ ] **A malformed stage spec inside a sub-pipeline is not refused as the
-      pipeline parses.** mongod 8.2.11 checks the stages of a `$facet`'s
-      and a `$lookup`'s pipelines as it parses the outer one, so over an
-      empty collection it refuses `{$facet: {a: [{$match: 5}]}}` with
-      15959, a `$lookup` in a facet whose `let` is `5` with 14, and a
-      `$lookup` in a `$lookup` pipeline with a lone `localField` with 9.
-      This server's `argtypes::stage_spec_error` reads the top level only:
-      it answers 2 to the first and runs the other two. Found 2026-11-14
-      working RM-528.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm528.py::test_stage_specs_in_a_sub_pipeline_are_checked_as_it_parses
-      Backlog-ID: RM-645
 - [ ] **A `find` sorted on `$natural` is recorded with the sort, not as a
       hint.** mongod 8.2.11's `$queryStats` key for `{find: "c", sort:
       {$natural: -1}}` has no `sort` in its shape and `hint: {$natural:
