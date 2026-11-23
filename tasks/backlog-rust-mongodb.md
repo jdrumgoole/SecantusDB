@@ -2101,15 +2101,6 @@ would see them. What is left:
       counts of the entries the stream keeps match since RM-453, 2026-11-15).
       Verify: none -- mongod writes its no-ops on a timer, so no test can pin how many a scan reads
       Backlog-ID: RM-700
-- [ ] **RUST MongoDB server: a `collMod` of an index makes a `modify` event
-      with an empty description.** mongod 8.2.11 gives `operationDescription:
-      {index: {name: "a_1", hidden: true}}` and adds `indexOptions: {hidden:
-      false}` to `stateBeforeChange` (the index as it was). This server's event
-      has `operationDescription: {}` and only the collection's options, so its
-      resume token (whose identifier holds the description) differs as well
-      (2026-11-21, found working the 4b-4 resume tokens).
-      Verify: tests/backlog/test_rm_found_2026_11_21_resume_tokens.py::test_a_collmod_of_an_index_is_a_modify_event_with_the_index
-      Backlog-ID: RM-733
 - [ ] **RUST MongoDB server: `dropIndexes: "*"` does not log an index a
       `collMod` changed last, with the option it set after `name`.** mongod
       8.2.11 drops in its in-memory catalog order: build order, except that

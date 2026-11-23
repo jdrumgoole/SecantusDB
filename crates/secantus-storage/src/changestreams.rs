@@ -1025,19 +1025,16 @@ fn project_command(
         // keeps them in the oplog entry's `o2.collectionOptions_old` and renames
         // the key on the event to `collectionOptions` (probed 8.2.11).
         let mut event = event;
-        if let Some(old_opts) = oplog_entry
-            .get_document("o2")
-            .ok()
-            .and_then(|o2| o2.get("collectionOptions_old"))
-        {
-            event.insert(
-                "stateBeforeChange",
-                Bson::Document({
-                    let mut d = Document::new();
-                    d.insert("collectionOptions", old_opts.clone());
-                    d
-                }),
-            );
+        // An index change adds what its options were, `o2.indexOptions_old`,
+        // as `indexOptions`.
+        let o2 = oplog_entry.get_document("o2").ok();
+        if let Some(old_opts) = o2.and_then(|o2| o2.get("collectionOptions_old")) {
+            let mut d = Document::new();
+            d.insert("collectionOptions", old_opts.clone());
+            if let Some(old_index) = o2.and_then(|o2| o2.get("indexOptions_old")) {
+                d.insert("indexOptions", old_index.clone());
+            }
+            event.insert("stateBeforeChange", Bson::Document(d));
         }
         return Ok((Some(event), false));
     }

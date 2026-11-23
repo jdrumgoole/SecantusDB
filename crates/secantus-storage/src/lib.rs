@@ -11492,8 +11492,15 @@ impl Storage {
                 let ui = collection_uuid(session, db, coll)?;
                 let mut o = Document::new();
                 o.insert("collMod", coll);
+                // `indexOptions_old` is not part of the command: it is what an
+                // index's changed options were, kept in `o2` (mongod 8.2.11).
+                let mut index_old = None;
                 for (k, v) in given {
-                    o.insert(k.clone(), v.clone());
+                    if k == "indexOptions_old" {
+                        index_old = Some(v.clone());
+                    } else {
+                        o.insert(k.clone(), v.clone());
+                    }
                 }
                 // `uuid` is set explicitly and any inbound one dropped, so the
                 // stored value is the BSON binary form and leads the document --
@@ -11507,6 +11514,9 @@ impl Storage {
                 }
                 let mut o2 = Document::new();
                 o2.insert("collectionOptions_old", Bson::Document(old_opts));
+                if let Some(old) = index_old {
+                    o2.insert("indexOptions_old", old);
+                }
                 let mut entry = Document::new();
                 entry.insert("op", "c");
                 entry.insert("ns", format!("{db}.$cmd"));

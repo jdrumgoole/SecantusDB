@@ -913,6 +913,11 @@ fn coll_mod_inner(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         None => {}
     }
     let mut reply = doc! { "ok": 1.0 };
+    // What an index change logs: `o.index` names the index and each option
+    // that changed, `o2.indexOptions_old` what each was (`{}` for a
+    // conversion to unique), and nothing at all when nothing changed
+    // (mongod 8.2.11).
+    let mut index_logged: Option<(Document, Document)> = None;
     // Index modification: `collMod {index: {keyPattern|name, prepareUnique|unique|expireAfterSeconds}}`.
     if let Some(Bson::Document(index_spec)) = doc.get("index") {
         // The fields `collMod.index` takes; anything else is refused before
@@ -988,6 +993,14 @@ fn coll_mod_inner(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .into_reply());
         }
         let target_name = target.get_str("name").unwrap_or("").to_string();
+        let mut log_change = |field: &str, new: Bson, old: Option<Bson>| {
+            let (new_doc, old_doc) = index_logged
+                .get_or_insert_with(|| (doc! {"name": target_name.clone()}, Document::new()));
+            new_doc.insert(field, new);
+            if let Some(old) = old {
+                old_doc.insert(field, old);
+            }
+        };
         // `hidden` was accepted and ignored: the reply said ok and the index
         // stayed as it was. The reply names the change only when there is one.
         if let Some(hide) = index_spec.get("hidden").and_then(Bson::as_bool) {
@@ -998,6 +1011,7 @@ fn coll_mod_inner(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             if hidden != hide {
                 reply.insert("hidden_old", hidden);
                 reply.insert("hidden_new", hide);
+                log_change("hidden", Bson::Boolean(hide), Some(Bson::Boolean(hidden)));
                 storage
                     .set_index_options(&ctx.db_name, &coll, &target_name, &doc! {"hidden": hide})
                     .map_err(command_error)?;
@@ -1046,6 +1060,11 @@ fn coll_mod_inner(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 reply.insert("expireAfterSeconds_old", old);
             }
             reply.insert("expireAfterSeconds_new", seconds);
+            log_change(
+                "expireAfterSeconds",
+                Bson::Int32(seconds as i32),
+                target.get("expireAfterSeconds").cloned(),
+            );
             storage
                 .set_index_options(
                     &ctx.db_name,
@@ -1066,6 +1085,11 @@ fn coll_mod_inner(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             if !already_unique && prep != prepared {
                 reply.insert("prepareUnique_old", prepared);
                 reply.insert("prepareUnique_new", prep);
+                log_change(
+                    "prepareUnique",
+                    Bson::Boolean(prep),
+                    Some(Bson::Boolean(prepared)),
+                );
                 storage
                     .set_index_options(
                         &ctx.db_name,
@@ -1125,6 +1149,7 @@ fn coll_mod_inner(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 return Ok(reply);
             }
             reply.insert("unique_new", true);
+            log_change("unique", Bson::Boolean(true), None);
             storage
                 .set_index_options(
                     &ctx.db_name,
@@ -1208,6 +1233,11 @@ fn coll_mod_inner(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             if let (true, Some(n)) = (set, doc.get(field)) {
                 recorded.insert(field, Bson::Int64(as_i64(n).unwrap_or(0)));
             }
+        }
+        if let Some((new, old)) = index_logged {
+            recorded.insert("index", new);
+            // Not an option of the command: the storage moves it to `o2`.
+            recorded.insert("indexOptions_old", old);
         }
         recorded.extend(given);
         recorded

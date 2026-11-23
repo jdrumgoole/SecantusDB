@@ -45,14 +45,14 @@ def _collmod_index(client: Any) -> list:
     return [_strip({k: v for k, v in e.items() if k not in _PER_SERVER | {"ns"}}) for e in events]
 
 
-@pytest.mark.backlog("RM-733")
+@pytest.mark.backlog_fixed("RM-733")
 def test_a_collmod_of_an_index_is_a_modify_event_with_the_index(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """`collMod` with `index` makes a `modify` event whose
     `operationDescription` is `{index: {name, hidden}}` and whose
     `stateBeforeChange` adds `indexOptions: {hidden: false}` to the
-    collection's options (mongod 8.2.11). This server's event has an empty
+    collection's options (mongod 8.2.11). This server's event had an empty
     description and no `indexOptions`, and so a different resume token."""
     theirs = _collmod_index(mongod_rs)
     assert theirs
