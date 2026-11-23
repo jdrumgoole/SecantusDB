@@ -673,12 +673,6 @@ These are explicit non-goals. Don't add them without a reason.
       (RM-358).
       Verify: tests/backlog/test_rm_found_2026_11_17_rm358.py::test_a_lookup_from_the_oplog_runs
       Backlog-ID: RM-717
-- [ ] **`$out` to a new time-series collection does not check the time
-      field.** mongod 8.2.11 fails the `aggregate` (BadValue, 2) when a
-      document it writes has no `timeField` date; this server writes it.
-      Found 2026-11-17 (RM-358).
-      Verify: tests/backlog/test_rm_found_2026_11_17_rm358.py::test_out_to_time_series_needs_the_time_field
-      Backlog-ID: RM-718
 - [ ] **Some queries have no `queryShapeHash`.** Since 2026-11-07 a
       `find`'s, `distinct`'s and `aggregate`'s line, profile entry and
       `explain` carry mongod's `queryShapeHash` (`secantus-commands`

@@ -305,6 +305,28 @@ pub(crate) fn insert_or_fail(
     coll: &str,
     docs: Vec<Document>,
 ) -> Result<(), CommandError> {
+    // mongod's `$out` checks each measurement's time field as an insert
+    // does, and fails the whole stage (BadValue) on the first that has no
+    // date (RM-718).
+    if let Some(fields) = storage
+        .get_collection_options(db, coll)
+        .ok()
+        .and_then(|o| crate::timeseries::Fields::of(&o))
+    {
+        if let Some(problem) = docs
+            .iter()
+            .find_map(|d| crate::timeseries::measurement_problem(d, &fields))
+        {
+            return Err(CommandError::new(
+                2,
+                "BadValue",
+                format!(
+                    "time-series insert failed: {db}.{} :: caused by :: {problem}",
+                    buckets_ns(coll)
+                ),
+            ));
+        }
+    }
     let batch = docs
         .into_iter()
         .enumerate()
