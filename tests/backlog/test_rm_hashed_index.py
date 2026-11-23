@@ -201,6 +201,9 @@ def _plans(client: Any) -> dict:
         "in": {"a": {"$in": [1, 2]}},
         "eq_b": {"a": 3, "b": 0},
         "range": {"a": {"$gt": 25}},
+        "or_hashed": {"$or": [{"a": 1}, {"b": 2}]},
+        "or_hashed_and": {"$or": [{"a": 1, "b": 1}, {"b": 2}]},
+        "or_null_branch": {"$or": [{"a": None}, {"b": 2}]},
     }.items():
         out["multi " + n] = _explained(db, "q", q)
     for n, q in {

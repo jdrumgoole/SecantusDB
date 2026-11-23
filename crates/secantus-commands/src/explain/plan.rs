@@ -1303,8 +1303,12 @@ fn or_access(
                     .iter()
                     .map(|(_, _, doc)| Bson::Document(doc.clone()))
                     .collect();
+                // A lone branch of a larger `$or` keeps the `$or` around its
+                // clause, as the filter of its FETCH (measured 8.2.11,
+                // 2026-11-23: `{$or: [{a: null}, {b: 2}]}` filters `{$or:
+                // [{a: {$eq: null}}]}`).
                 match all.as_slice() {
-                    [Bson::Document(one)] => one.clone(),
+                    [Bson::Document(one)] if branches.len() == 1 => one.clone(),
                     _ => doc! { "$or": all },
                 }
             });

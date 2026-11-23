@@ -234,16 +234,6 @@ RUBY: list[ExpectedFailure] = [
 
 PYMONGO: list[ExpectedFailure] = [
     ExpectedFailure(
-        pattern="test_index_hashed",
-        rationale=(
-            "Hashed indexes are intentionally out of scope per CLAUDE.md. "
-            "`createIndexes` rejects them explicitly with "
-            "`CannotCreateIndex` (67) 'hashed indexes are not supported by "
-            "SecantusDB' — a faithful not-supported error, which is the "
-            "documented preference over a half-implemented index type."
-        ),
-    ),
-    ExpectedFailure(
         pattern="test_index_text",
         rationale=(
             "Text indexes are intentionally out of scope per CLAUDE.md "
