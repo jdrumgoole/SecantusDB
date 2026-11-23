@@ -2110,15 +2110,21 @@ would see them. What is left:
       (2026-11-21, found working the 4b-4 resume tokens).
       Verify: tests/backlog/test_rm_found_2026_11_21_resume_tokens.py::test_a_collmod_of_an_index_is_a_modify_event_with_the_index
       Backlog-ID: RM-733
-- [ ] **RUST MongoDB server: `dropIndexes: "*"` logs its entries oldest
-      first, with `hidden` before `key`.** mongod 8.2.11 drops the indexes
-      newest first, one entry (and change event) each, and writes a hidden
-      index's spec as `v`, the options other than `hidden`, `key`, `name`,
-      then `hidden`; this server drops them in creation order and puts
-      `hidden` after `unique` and before `key` (2026-11-21, found working the
-      4b-4 resume tokens: the order of the events, and the identifier of a
-      token, differ).
-      Verify: tests/backlog/test_rm_found_2026_11_21_resume_tokens.py::test_dropping_every_index_is_one_event_each_newest_first_with_mongods_spec_order
+- [ ] **RUST MongoDB server: `dropIndexes: "*"` does not log an index a
+      `collMod` changed last, with the option it set after `name`.** mongod
+      8.2.11 drops in its in-memory catalog order: build order, except that
+      an index a `collMod` touched moves to the end (`listIndexes` keeps
+      build order), and an option `collMod` added (`hidden`,
+      `prepareUnique`) is written after `name`, while one given at create
+      keeps its place before `key`. Created `a_1` (unique), `b_1_c_-1`,
+      `d_1` (hidden), then `collMod` hid `a_1`: mongod drops `b_1_c_-1`,
+      `d_1`, `a_1` with `a_1` as `{v, unique, key, name, hidden}`; this
+      server drops `d_1`, `b_1_c_-1`, `a_1` with `hidden` before `key`. The
+      fix needs the spec's field order kept in the catalog and an entry
+      order a `collMod` moves (2026-11-21, found working the 4b-4 resume
+      tokens; corrected 2026-11-23 by probe: the first text said "newest
+      first", which mongod does not do).
+      Verify: tests/backlog/test_rm_found_2026_11_21_resume_tokens.py::test_dropping_every_index_lists_a_collmodded_index_last_with_hidden_after_name
       Backlog-ID: RM-734
 
 ### 7.073 The cursor commands -- 2026-10-11
