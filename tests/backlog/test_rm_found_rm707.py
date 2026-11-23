@@ -16,12 +16,14 @@ def _explain(client: Any, docs: list, index: list, find: dict) -> dict:
         client.drop_database(db.name)
 
 
-@pytest.mark.backlog("RM-712")
+@pytest.mark.backlog_fixed("RM-712")
 def test_a_multipoint_2dsphere_near_ring_scan_is_multikey(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 marks a 2dsphere index multikey once a MultiPoint gives
     a document several keys: each GEO_NEAR_2DSPHERE ring's IXSCAN reports
     `isMultiKey: true` and `multiKeyPaths: {loc: ["loc"]}`. This server's
-    catalog does not, so its ring scans report `false` and `[]`."""
+    catalog did not (it flagged a `2dsphere` index by its own rule), so its
+    ring scans reported `false` and `[]`; the catalog now says what the keys
+    do (RM-742)."""
     docs = [
         {"_id": n, "loc": {"type": "MultiPoint", "coordinates": [[n, n], [n + 0.5, 0]]}}
         for n in range(6)

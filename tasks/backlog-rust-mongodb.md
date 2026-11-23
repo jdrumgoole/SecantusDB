@@ -741,14 +741,6 @@ These are explicit non-goals. Don't add them without a reason.
       falls within mongod's own run-to-run spread of its answer.
       Verify: none -- mongod's own answer varies between runs; no test can pin it
       Backlog-ID: RM-556
-- [ ] **A 2dsphere index a MultiPoint gives several keys is not multikey.**
-      mongod 8.2.11 marks it multikey: the IXSCAN of each GEO_NEAR_2DSPHERE
-      ring (and of a `$geoWithin`) reports `isMultiKey: true` and
-      `multiKeyPaths: {loc: ["loc"]}`. This server's catalog records the
-      index as not multikey, so its ring scans report `false` and `[]`.
-      Found 2026-11-17 (RM-707).
-      Verify: tests/backlog/test_rm_found_rm707.py::test_a_multipoint_2dsphere_near_ring_scan_is_multikey
-      Backlog-ID: RM-712
 - [ ] **A `$near` with a predicate on a compound 2d index's trailing field
       is not planned as GEO_NEAR_2D.** mongod 8.2.11 answers `{loc: {$near:
       [0, 0]}, z: 1}` over `{loc: "2d", z: 1}` with GEO_NEAR_2D, the `z`
