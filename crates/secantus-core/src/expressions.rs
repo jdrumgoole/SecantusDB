@@ -514,6 +514,8 @@ fn eval_field(expr: &Bson, ctx: &Ctx) -> Result<Field, Fallback> {
                     // These can answer MISSING, which is not an element that is
                     // a stored `undefined`: out of range, a field the input
                     // lacks, a `$meta` there is no value for.
+                    // A literal is the value it holds, `undefined` among them.
+                    "$literal" | "$const" => return Ok(Field::Value(arg.clone())),
                     "$arrayElemAt" | "$first" | "$last" | "$getField" | "$meta" => {
                         return apply_op_field(op, arg, ctx).map_err(|f| stamp_folded(f, expr, ctx))
                     }
@@ -522,7 +524,14 @@ fn eval_field(expr: &Bson, ctx: &Ctx) -> Result<Field, Fallback> {
             }
         }
     }
-    eval(expr, ctx).map(Field::Value)
+    // Every other operator COMPUTES its answer, and one that has none (`$convert`
+    // with an `onError` that is MISSING, a date operator over a MISSING
+    // operand) answers `Bson::Undefined` in `eval`: that is MISSING, as `Nothing`
+    // is in SBE. A real `undefined` reaches here only through the routes above.
+    Ok(match eval(expr, ctx)? {
+        Bson::Undefined => Field::Missing,
+        v => Field::Value(v),
+    })
 }
 
 fn resolve_var(name: &str, ctx: &Ctx) -> R {
