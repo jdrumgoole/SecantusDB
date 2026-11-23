@@ -3928,6 +3928,40 @@ fn lookup_join_fields_problem(d: &Document) -> Option<(i32, String)> {
             "$lookup with a 'let' argument must also specify 'pipeline'".to_string(),
         ));
     }
+    lookup_names_problem(d)
+}
+
+/// The names `$lookup` builds as it constructs: `localField`, `foreignField`
+/// and `as` are `FieldPath`s (40352 empty, 16410 a `$` component, ...), and
+/// each `let` name is a user variable (9). Measured 8.2.11 (RM-646): these
+/// ran, and an empty `as` wrote a field named "".
+fn lookup_names_problem(d: &Document) -> Option<(i32, String)> {
+    use secantus_core::fallback::Fallback;
+    let as_pair = |f: Fallback| match f {
+        Fallback::Mongo { code, message, .. } => Some((code, message)),
+        _ => None,
+    };
+    for key in ["localField", "foreignField"] {
+        if let Some(Bson::String(s)) = d.get(key) {
+            if !s.is_empty() {
+                if let Some(f) = secantus_core::expr_parse::field_path_error(s) {
+                    return as_pair(f);
+                }
+            }
+        }
+    }
+    if let Some(Bson::String(s)) = d.get("as") {
+        if let Some(f) = secantus_core::expr_parse::field_path_error(s) {
+            return as_pair(f);
+        }
+    }
+    if let Some(Bson::Document(vars)) = d.get("let") {
+        for name in vars.keys() {
+            if let Err(f) = secantus_core::expressions::user_var_name_parse(name) {
+                return as_pair(f);
+            }
+        }
+    }
     None
 }
 
@@ -4131,6 +4165,22 @@ mod stage_validation_order_tests {
     }
 
     /// RM-528, every answer measured on mongod 8.2.11 (2026-11-14).
+    #[test]
+    fn lookup_refuses_a_bad_path_and_a_bad_let_name() {
+        // Measured 8.2.11 (RM-646).
+        let local = doc! {"from": "c", "localField": "$a", "foreignField": "a", "as": "z"};
+        assert_eq!(err("$lookup", Bson::Document(local)).0, 16410);
+        let as_empty = doc! {"from": "c", "localField": "a", "foreignField": "a", "as": ""};
+        assert_eq!(err("$lookup", Bson::Document(as_empty)).0, 40352);
+        let bad_let = doc! {"from": "c", "let": {"X": 1}, "pipeline": [], "as": "z"};
+        let (code, msg) = err("$lookup", Bson::Document(bad_let));
+        assert_eq!(code, 9);
+        assert_eq!(
+            msg,
+            "'X' starts with an invalid character for a user variable name"
+        );
+    }
+
     #[test]
     fn lookup_types_its_fields_in_order_then_pairs_the_join_fields() {
         let lookup =

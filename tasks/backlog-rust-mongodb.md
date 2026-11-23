@@ -1282,17 +1282,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       working RM-528.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm528.py::test_stage_specs_in_a_sub_pipeline_are_checked_as_it_parses
       Backlog-ID: RM-645
-- [ ] **`$lookup` runs a `$`-prefixed join field, an empty `as` and a bad
-      `let` name.** mongod 8.2.11 refuses `localField: "$a"` with 16410
-      "Consider using $getField or $setField for a field path with '.' or
-      '$'. :: caused by :: FieldPath field names may not start with '$',
-      given '$a'.", `as: ""` with 40352 "FieldPath cannot be constructed
-      with empty string", and `let: {X: 1}` with 9 "'X' starts with an
-      invalid character for a user variable name". This server runs all
-      three (the empty `as` writes a field named ""). Found 2026-11-14
-      working RM-528.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm528.py::test_lookup_refuses_a_bad_path_and_a_bad_let_name
-      Backlog-ID: RM-646
 - [ ] **A `find` sorted on `$natural` is recorded with the sort, not as a
       hint.** mongod 8.2.11's `$queryStats` key for `{find: "c", sort:
       {$natural: -1}}` has no `sort` in its shape and `hint: {$natural:
