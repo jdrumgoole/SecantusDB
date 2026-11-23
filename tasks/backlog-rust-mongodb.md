@@ -1154,14 +1154,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       stored-`undefined` half, and RM-761, closed with the carrier.)
       Verify: tests/backlog/test_rm_found_2026_11_22_rm635.py::test_a_lookup_let_variable_bound_from_an_absent_field_is_missing
       Backlog-ID: RM-763
-- [ ] **A leading `$match` on `{$size: "$$REMOVE"}` is an executor error.**
-      mongod 8.2.11 folds it: 17124 "Failed to optimize pipeline :: caused
-      by :: The argument to $size must be an array, but was of type:
-      missing"; this server's says "Executor error during aggregate command
-      on namespace: ...". `$addFields` folds on both. Found 2026-11-18
-      (RM-633).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm524.py::test_a_match_on_a_constant_remove_fails_to_optimize
-      Backlog-ID: RM-722
 - [ ] **A `$project` of `{$meta: "sortKey"}` with no `$sort` is refused as
       unsupported.** mongod 8.2.11 refuses `{$project: {t: {$type: {$meta:
       "sortKey"}}}}` with code 2 "Failed to determine whether query system
