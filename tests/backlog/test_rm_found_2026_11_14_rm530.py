@@ -123,16 +123,16 @@ def _empty_projection(client: Any) -> dict:
     )
 
 
-@pytest.mark.backlog("RM-650")
+@pytest.mark.backlog_fixed("RM-650")
 def test_an_empty_projection_is_an_invalid_project(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
     """mongod 8.2.11 refuses `{$project: {}}` with 51272, "Invalid $project
     :: caused by :: projection specification must have at least one field",
-    at the top level and in a `$facet` or `$unionWith`. This server drops
+    at the top level and in a `$facet` or `$unionWith`. This server dropped
     the "Invalid $project :: caused by ::" envelope at the top level and
-    answers BadValue (2, "not supported by the Rust server") inside one."""
+    answered BadValue (2, "not supported by the Rust server") inside one."""
     assert _empty_projection(rust_mongo) == _empty_projection(mongod_rs)
 
 

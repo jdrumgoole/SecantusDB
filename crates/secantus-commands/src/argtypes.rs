@@ -2934,7 +2934,7 @@ pub fn stage_spec_error(pipeline: &[Bson]) -> Option<(i32, String)> {
             // just adopted, with each stage's own code and wording.
             "$project" if matches!(spec, Bson::Document(d) if d.is_empty()) => Some((
                 51272,
-                "projection specification must have at least one field".to_string(),
+                "Invalid $project :: caused by :: projection specification must have at least one field".to_string(),
             )),
             "$sort" if matches!(spec, Bson::Document(d) if d.is_empty()) => Some((
                 15976,
@@ -3153,6 +3153,24 @@ fn sub_pipelines<'a>(name: &str, spec: &'a Bson) -> Vec<&'a [Bson]> {
 mod stage_tests {
     use super::*;
     use bson::doc;
+
+    #[test]
+    fn an_empty_project_in_a_sub_pipeline_is_51272_with_its_envelope() {
+        // RM-650: mongod 8.2.11, top level and nested alike.
+        let want = Some((
+            51272,
+            "Invalid $project :: caused by :: projection specification must have at \
+             least one field"
+                .to_string(),
+        ));
+        for stage in [
+            doc! {"$facet": {"a": [{"$project": {}}]}},
+            doc! {"$unionWith": {"coll": "c", "pipeline": [{"$project": {}}]}},
+            doc! {"$lookup": {"from": "c", "as": "x", "pipeline": [{"$project": {}}]}},
+        ] {
+            assert_eq!(stage_spec_error(&[Bson::Document(stage)]), want);
+        }
+    }
 
     #[test]
     fn a_sub_pipeline_stage_is_checked_as_the_outer_one_parses() {
@@ -4445,7 +4463,7 @@ mod stage_validation_order_tests {
             err("$project", Bson::Document(bson::Document::new())),
             (
                 51272,
-                "projection specification must have at least one field".to_string()
+                "Invalid $project :: caused by :: projection specification must have at least one field".to_string()
             )
         );
         assert_eq!(

@@ -1237,15 +1237,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-532.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm532.py::test_a_hybrid_search_names_the_collection_it_unions
       Backlog-ID: RM-644
-- [ ] **`{$project: {}}` drops its envelope, and is "not supported" when
-      nested.** mongod 8.2.11 answers 51272 "Invalid $project :: caused by
-      :: projection specification must have at least one field" at the top
-      level and in a `$facet` or `$unionWith`. This server drops the
-      "Invalid $project :: caused by ::" at the top level and answers
-      BadValue (2, "not supported by the Rust server") nested. Found
-      2026-11-14 working RM-530.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_an_empty_projection_is_an_invalid_project
-      Backlog-ID: RM-650
 - [ ] **A `$documents` element that is not a document answers 2.**
       mongod 8.2.11 refuses `$documents: [{a: 1}, 2]` at run time with 40228
       "Executor error during aggregate command on namespace:
