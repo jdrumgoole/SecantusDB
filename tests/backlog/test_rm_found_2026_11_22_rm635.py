@@ -23,7 +23,7 @@ def _answers(client: Any, pipelines: dict[str, list]) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-761")
+@pytest.mark.backlog("RM-763")
 def test_arithmetic_over_a_stored_undefined_is_null(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 treats a stored `undefined` as null in `$add`: the sum
     is null. This server refuses it with code 14 ("$add only supports
@@ -35,7 +35,7 @@ def test_arithmetic_over_a_stored_undefined_is_null(rust_mongo: Any, mongod: Any
     assert _answers(rust_mongo, pipelines) == _answers(mongod, pipelines)
 
 
-@pytest.mark.backlog("RM-762")
+@pytest.mark.backlog("RM-763")
 def test_a_lookup_let_variable_keeps_a_stored_undefined(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `$lookup` `let` variable bound from a stored
     `undefined` reads "undefined" in `$type`, and one bound from an absent

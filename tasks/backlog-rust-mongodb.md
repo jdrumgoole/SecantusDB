@@ -1137,23 +1137,27 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       document. Found 2026-11-13 (RM-522).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_graph_lookup_and_a_fill_keep_the_sort_key
       Backlog-ID: RM-632
-- [ ] **Arithmetic over a stored `undefined` is an executor error.**
-      mongod 8.2.11 takes a stored `undefined` for null in `$add` and
-      `$multiply`: the answer is null. This server's is code 14, "$add only
-      supports numeric or date types". Found 2026-11-22 (RM-635).
-      Verify: tests/backlog/test_rm_found_2026_11_22_rm635.py::test_arithmetic_over_a_stored_undefined_is_null
-      Backlog-ID: RM-761
-- [ ] **A `$lookup` `let` variable loses a stored `undefined`.** mongod
-      8.2.11 binds the variable as the value it came from, so `$type` of one
-      bound from a stored `undefined` reads "undefined" and from an absent
-      field "missing"; this server binds `evaluate`'s answer, which reads
-      "missing" and "null" (`secantus-commands` `aggregate.rs`, the `bind`
-      closure of `$lookup`). A `$let` variable already keeps both (RM-635);
-      the work is binding the `let` map as `evaluate_field` does, and
-      checking what else reads a variable's value from the map directly.
-      Found 2026-11-22 (RM-635).
-      Verify: tests/backlog/test_rm_found_2026_11_22_rm635.py::test_a_lookup_let_variable_keeps_a_stored_undefined
-      Backlog-ID: RM-762
+- [ ] **A stored `undefined` is carried through the expression engine as a
+      stand-in document, not as a value apart from MISSING.** Filed
+      2026-11-23 on Joe's decision: replace RM-635's `held_undefined`
+      carrier with a MISSING case of the expression engine's own, as
+      mongod's EOO / SBE `Nothing`. The engine still uses `Bson::Undefined`
+      to mean MISSING, and RM-635 carries a real `undefined` as a one-key
+      document with a NUL-led key (`secantus-core` `bsondoc.rs`:
+      `held_undefined()` / `is_held_undefined()`; `eval_field_value_keep`
+      keeps it, the other entry points normalise it back). The answers RM-635
+      and RM-525 pin are right; the structure is not mongod's, which gives
+      MISSING a case apart from every BSON value, so an operator that does
+      not normalise sees an object. Two symptoms stay open until the
+      carrier goes: (This was RM-761.) `$add` / `$multiply` over a stored
+      `undefined` gives code 14 ("$add only supports numeric or date
+      types") where mongod 8.2.11 gives null. (This was RM-762.) A `$lookup`
+      `let` variable bound from a stored `undefined` reads "missing" in
+      `$type` and one bound from an absent field "null", where mongod binds
+      the value it came from ("undefined" and "missing"; `secantus-commands`
+      `aggregate.rs`, the `bind` closure of `$lookup`).
+      Verify: tests/backlog/test_rm_found_2026_11_22_rm635.py::test_arithmetic_over_a_stored_undefined_is_null, tests/backlog/test_rm_found_2026_11_22_rm635.py::test_a_lookup_let_variable_keeps_a_stored_undefined
+      Backlog-ID: RM-763
 - [ ] **A leading `$match` on `{$size: "$$REMOVE"}` is an executor error.**
       mongod 8.2.11 folds it: 17124 "Failed to optimize pipeline :: caused
       by :: The argument to $size must be an array, but was of type:
