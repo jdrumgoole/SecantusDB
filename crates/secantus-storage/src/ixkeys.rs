@@ -49,6 +49,9 @@ pub(crate) struct KeyShape {
     /// bytes of the KeyString of `_id` (`appendRecordId` of a string), not
     /// a long.
     clustered: bool,
+    /// Key slots whose strings are never put through the collation (a
+    /// wildcard index's `$_path`).
+    uncollated: Vec<usize>,
 }
 
 fn unsupported(_: keystring::Error) -> StorageError {
@@ -72,7 +75,25 @@ impl KeyShape {
             collation,
             bytes_order: order == BinDataOrder::Bytes,
             clustered: false,
+            uncollated: Vec::new(),
         }
+    }
+
+    /// This shape with the strings of key slot `at` kept out of the
+    /// collation too.
+    pub fn uncollated_at(mut self, at: usize) -> Self {
+        self.uncollated.push(at);
+        self
+    }
+
+    /// This shape for a wildcard index, whose `$**` field at `at` is two
+    /// key slots: `$_path`, always ascending and never collated, then the
+    /// value under it in the field's direction.
+    pub fn wildcard_at(mut self, at: usize) -> Self {
+        self.dirs.insert(at, 1);
+        self.ordering = Ordering::from_directions(&self.dirs);
+        self.uncollated.push(at);
+        self
     }
 
     /// This shape for the entries of a clustered collection's index.
@@ -87,17 +108,6 @@ impl KeyShape {
         self.bytes_order
     }
 
-    /// A one-field ascending key with no collation: a geo index's cell.
-    pub fn plain() -> Self {
-        KeyShape {
-            dirs: vec![1],
-            ordering: Ordering::all_ascending(),
-            collation: None,
-            bytes_order: false,
-            clustered: false,
-        }
-    }
-
     /// Each key field's direction, `1` or `-1`.
     pub fn dirs(&self) -> &[i32] {
         &self.dirs
@@ -108,6 +118,10 @@ impl KeyShape {
     }
 
     fn append(&self, b: &mut Builder, v: &Bson) -> Result<()> {
+        self.append_at(b, usize::MAX, v)
+    }
+
+    fn append_at(&self, b: &mut Builder, slot: usize, v: &Bson) -> Result<()> {
         let mapped;
         let v = if self.bytes_order && has_binary(v) {
             mapped = bytes_ordered(v);
@@ -115,7 +129,11 @@ impl KeyShape {
         } else {
             v
         };
-        match &self.collation {
+        match self
+            .collation
+            .as_ref()
+            .filter(|_| !self.uncollated.contains(&slot))
+        {
             Some(c) => {
                 let f = |s: &str| collation::sort_key(s, c);
                 b.append_bson_element_with(v, Some(&f)).map_err(unsupported)
@@ -127,8 +145,8 @@ impl KeyShape {
     /// The entry for `values` held by `rid`.
     pub fn entry(&self, values: &[Bson], rid: &RecordId) -> Result<EntryKey> {
         let mut b = self.builder(Discriminator::Inclusive);
-        for v in values {
-            self.append(&mut b, v)?;
+        for (slot, v) in values.iter().enumerate() {
+            self.append_at(&mut b, slot, v)?;
         }
         match rid {
             RecordId::Long(n) => b.append_record_id_long(*n),

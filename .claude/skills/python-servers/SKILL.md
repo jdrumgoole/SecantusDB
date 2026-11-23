@@ -16,7 +16,7 @@ ported most of what it describes: the index pickers and their sound-not-complete
 partial-index implication, the sparse-index gate, multikey handling and the
 oplog and resume tokens. **The WiredTiger table layout described below is the
 deprecated Python servers' only.** The Rust servers moved to mongod 8.2's own
-layout (store format 10: `_mdb_catalog`, a table per collection and index,
+layout (store format 11: `_mdb_catalog`, a table per collection and index,
 `local.oplog.rs`, `sizeStorer`, `journal/`; see
 `tasks/mongod-storage-model-plan.md`), so the shards, the frame, the
 `secantus_natural_seq`, `secantus_index_entries`, `secantus_oplog` and

@@ -989,9 +989,16 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
    index walk byte for byte as SecantusDB served it, and a change stream
    resumed from a SecantusDB token. Store format 9 (views, whole-array keys).
 
-   **Still different from mongod, filed:** `2d` keys (RM-741), `2dsphere`
-   keys (RM-742) and wildcard keys (RM-743), which the scenario's indexes of
-   those kinds are dropped for (hashed and text are refused at create);
+   **Closed since (store format 11):** `2d` keys (RM-741), `2dsphere` keys
+   (RM-742) and wildcard keys (RM-743) are mongod's, measured by reading the
+   `index-<UUID>` tables of a mongod store: a `2d` key is the GeoHash as
+   BinData 128 then the other fields (arrays kept whole as the set of their
+   elements), a `2dsphere` key a NumberLong cell id from the core's
+   `s2legacy` covering, a wildcard key the other fields, `$_path`, the value,
+   with multikey metadata keys under a reserved RecordId; each matches
+   mongod's `validate` (`tests/backlog/test_rm_storage_model.py`). Hashed and
+   text are refused at create.
+   **Still different from mongod, filed:**
    users and roles in private tables (RM-744); a view's DDL logged as
    commands, its `system.views` writes unreplicated (RM-745); after a crash
    the recovery timestamp can pass the oplog's end, which aborts mongod

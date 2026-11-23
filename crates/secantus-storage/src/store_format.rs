@@ -29,7 +29,7 @@ use crate::{Result, StorageError};
 /// The layout version this build writes and reads. Every change to the
 /// on-disk layout moves it on (each phase of the storage-model plan does),
 /// and a store at any other version is refused.
-pub const STORE_FORMAT_VERSION: u32 = 10;
+pub const STORE_FORMAT_VERSION: u32 = 11;
 
 /// The file holding [`STORE_FORMAT_VERSION`] in a SecantusDB-written store.
 pub const FORMAT_FILE: &str = "secantus.format";
@@ -246,7 +246,9 @@ pub fn mark_opened(home: &Path) -> Result<()> {
 }
 
 /// The index kinds whose keys this server does not write as mongod does
-/// (storage-model plan, phase 4 and RM-741 to RM-743), by the value naming
+/// (storage-model plan, phase 4; mongod's own `2d`, `2dsphere` and wildcard indexes are
+/// refused until a store of its is adopted with them, not for their keys, which are
+/// the ones this server writes since format 11), by the value naming
 /// them in an index's key pattern.
 const UNSERVED_INDEX_KINDS: &[&str] = &[
     "2d",
@@ -587,7 +589,11 @@ mod tests {
     }
 
     #[test]
-    fn the_previous_layouts_are_refused_and_this_one_is_format_10() {
+    fn the_previous_layouts_are_refused_and_this_one_is_format_11() {
+        // Format 10 keyed a `2d` index by a cell of its own (BinData subtype
+        // 0, y first), a `2dsphere` index by a covering of every ancestor of
+        // each cell (BinData) and a wildcard index by one null entry per
+        // document; format 11 writes mongod's keys for all three.
         // Format 9 kept a drop's and a rename's pending work in
         // `secantus_drop_tombstones` and finished it at the next open; format
         // 10 does both in one transaction over the catalog, as mongod does,
@@ -603,15 +609,15 @@ mod tests {
         // bytes and the clean-close marker in this server's own table.
         // Format 6 held a document in its table as `[id_key length][id_key]
         // [BSON]`; format 7 stores the document alone, as mongod does.
-        assert_eq!(STORE_FORMAT_VERSION, 10);
-        for old in ["4", "5", "6", "7", "8", "9"] {
+        assert_eq!(STORE_FORMAT_VERSION, 11);
+        for old in ["4", "5", "6", "7", "8", "9", "10"] {
             let dir = tempfile::tempdir().unwrap();
             fs::write(dir.path().join("WiredTiger.wt"), b"").unwrap();
             fs::write(dir.path().join(STORAGE_BSON), mongod_storage_bson()).unwrap();
             fs::write(dir.path().join(FORMAT_FILE), format!("{old}\n")).unwrap();
             let err = prepare(dir.path()).unwrap_err().to_string();
             assert!(err.contains(&format!("store format {old}")), "{err}");
-            assert!(err.contains("format 10 only"), "{err}");
+            assert!(err.contains("format 11 only"), "{err}");
         }
     }
 }

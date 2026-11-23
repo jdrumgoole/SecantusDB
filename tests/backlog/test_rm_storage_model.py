@@ -607,14 +607,14 @@ def _validation(mongod: pymongo.MongoClient, db: str, coll: str) -> tuple:
     return (result["valid"], result.get("errors"), result.get("warnings"))
 
 
-@pytest.mark.backlog("RM-741")
+@pytest.mark.backlog_fixed("RM-741")
 def test_mongod_validates_a_2d_index_secantus_wrote(tmp_path: Path) -> None:
     """mongod 8.2.11 keys a `2d` index by the point's GeoHash at the index's
     `bits`, x then y interleaved in the high bits, as BinData subtype 128
-    (phase 0b: `[-10, 20]` is `6ad4ad4ad4ad4000`) and keeps it non-multikey
-    with no multikey paths. This server keys it by a cell of its own (y
-    first, in the low bits, BinData subtype 0), so mongod's `validate` finds
-    every entry missing and one extra each."""
+    (phase 0b: `[-10, 20]` is `6ad4ad4ad4ad4000`). This server keyed it by a
+    cell of its own (y first, in the low bits, BinData subtype 0), so
+    mongod's `validate` found every entry missing and one extra each; it now
+    writes mongod's."""
 
     def setup(c: pymongo.MongoClient) -> None:
         c.app.k.insert_many([{"_id": 1, "flat": [1.5, 2.5]}, {"_id": 2, "flat": [-10, 20]}])
@@ -628,9 +628,10 @@ def test_mongod_validates_a_2d_index_secantus_wrote(tmp_path: Path) -> None:
 def test_mongod_validates_a_2dsphere_index_secantus_wrote(tmp_path: Path) -> None:
     """mongod 8.2.11 keys a point of a `2dsphere` (version 3) index by one S2
     cell id as a NumberLong (phase 0b: two points, two entries,
-    `201384b1db336fa071` and `328fccdc3d444a7656`). This server writes its
+    `201384b1db336fa071` and `328fccdc3d444a7656`). This server wrote its
     own covering (levels 4 to 16, every ancestor of each cell, BinData), so
-    mongod's `validate` finds the entries missing and dozens extra."""
+    mongod's `validate` found the entries missing and dozens extra; it now
+    writes mongod's."""
 
     def setup(c: pymongo.MongoClient) -> None:
         c.app.k.insert_many(
@@ -649,8 +650,9 @@ def test_mongod_validates_a_2dsphere_index_secantus_wrote(tmp_path: Path) -> Non
 def test_mongod_validates_a_wildcard_index_secantus_wrote(tmp_path: Path) -> None:
     """mongod 8.2.11 keys a wildcard index by `($_path, value)` for each leaf
     path under it (phase 0b: `{w: {x: 1, y: {z: 2}}}` gives `w.x`/1 and
-    `w.y.z`/2). This server writes one null entry per document, so mongod's
-    `validate` finds the entries missing and the nulls extra."""
+    `w.y.z`/2). This server wrote one null entry per document, so mongod's
+    `validate` found the entries missing and the nulls extra; it now writes
+    mongod's, multikey metadata keys included."""
 
     def setup(c: pymongo.MongoClient) -> None:
         c.app.k.insert_many([{"_id": 1, "w": {"x": 1, "y": {"z": 2}}}, {"_id": 2, "w": {"x": "s"}}])
@@ -658,6 +660,214 @@ def test_mongod_validates_a_wildcard_index_secantus_wrote(tmp_path: Path) -> Non
 
     with _mongod_on_secantus_store(tmp_path, setup) as mongod:
         assert _validation(mongod, "app", "k") == (True, [], [])
+
+
+def _pt(x: float, y: float) -> dict:
+    return {"type": "Point", "coordinates": [x, y]}
+
+
+_SQUARE = {"type": "Polygon", "coordinates": [[[0, 0], [3, 0], [3, 3], [0, 3], [0, 0]]]}
+_BIG = {
+    "type": "Polygon",
+    "coordinates": [[[-100, -60], [100, -60], [100, 60], [-100, 60], [-100, -60]]],
+}
+
+# Each case: collection -> (documents, key pattern, index options). Measured on
+# mongod 8.2.11 (2026-11-23) by reading the index tables it wrote: every one
+# is a store `validate` passes on mongod.
+_GEO_CASES = {
+    "flat_many": (
+        [
+            {"_id": 1, "loc": [1.5, 2.5]},
+            {"_id": 2, "loc": [[1, 1], [30, 30]]},
+            {"_id": 3, "loc": {"x": -50.25, "y": 80}},
+            {"_id": 4},
+        ],
+        [("loc", "2d")],
+        {},
+    ),
+    "flat_compound": (
+        [
+            {"_id": 1, "loc": [1, 1], "z": [2, 1, 2]},
+            {"_id": 2, "loc": [1, 1]},
+            {"_id": 3, "loc": [1, 1], "z": {"k": [7, 8]}},
+            {"_id": 4, "loc": [1, 1], "z": [{"q": 1}, {"q": 2}]},
+            {"_id": 5, "loc": [1, 1], "z": []},
+        ],
+        [("loc", "2d"), ("z", 1), ("q", -1)],
+        {},
+    ),
+    "flat_bits": (
+        [{"_id": 1, "loc": [3, -4]}, {"_id": 2, "loc": [-10, 10]}],
+        [("loc", "2d")],
+        {"bits": 10, "min": -10, "max": 10},
+    ),
+    "flat_bits32": (
+        [{"_id": 1, "loc": [3, -4]}],
+        [("loc", "2d")],
+        {"bits": 32, "min": -100, "max": 100},
+    ),
+    "sphere_shapes": (
+        [
+            {"_id": 1, "loc": _pt(1.5, 2.5)},
+            {"_id": 2, "loc": [10, 20]},
+            {"_id": 3, "loc": {"type": "MultiPoint", "coordinates": [[1, 1], [2, 2]]}},
+            {"_id": 4, "loc": _SQUARE},
+            {"_id": 5, "loc": {"type": "LineString", "coordinates": [[0, 0], [1, 1]]}},
+            {"_id": 6, "loc": _BIG},
+            {"_id": 7},
+            {"_id": 8, "loc": _pt(-179.9, 89.9)},
+        ],
+        [("loc", "2dsphere")],
+        {},
+    ),
+    "sphere_collection": (
+        [
+            {
+                "_id": 1,
+                "loc": {
+                    "type": "GeometryCollection",
+                    "geometries": [
+                        _pt(1, 1),
+                        {"type": "LineString", "coordinates": [[0, 0], [1, 1]]},
+                    ],
+                },
+            },
+            {
+                "_id": 2,
+                "loc": {
+                    "type": "MultiPolygon",
+                    "coordinates": [
+                        [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
+                        [[[5, 5], [6, 5], [6, 6], [5, 6], [5, 5]]],
+                    ],
+                },
+            },
+            {
+                "_id": 3,
+                "loc": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [[0, 0], [3, 0], [3, 3], [0, 3], [0, 0]],
+                        [[1, 1], [1, 2], [2, 2], [2, 1], [1, 1]],
+                    ],
+                },
+            },
+        ],
+        [("loc", "2dsphere")],
+        {},
+    ),
+    "sphere_levels": (
+        [{"_id": 1, "loc": _SQUARE}, {"_id": 2, "loc": _BIG}],
+        [("loc", "2dsphere")],
+        {"finestIndexedLevel": 10, "coarsestIndexedLevel": 6},
+    ),
+    "sphere_geo_first": (
+        [
+            {"_id": 1, "loc": _pt(1, 1), "z": [1, 2]},
+            {"_id": 2, "loc": _pt(1, 1)},
+            {"_id": 3, "loc": _pt(1, 1), "z": "s"},
+            {"_id": 4, "loc": _SQUARE, "z": 4},
+        ],
+        [("loc", "2dsphere"), ("z", 1)],
+        {},
+    ),
+    "sphere_geo_last": (
+        [
+            {"_id": 1, "loc": _pt(1, 1), "z": [1, 2]},
+            {"_id": 2, "z": 2},
+            {"_id": 3, "loc": [], "z": 3},
+        ],
+        [("z", 1), ("loc", "2dsphere")],
+        {},
+    ),
+    "sphere_nested": (
+        [{"_id": 1, "a": {"loc": _SQUARE}}, {"_id": 2, "a": {"loc": _pt(1, 1)}}],
+        [("a.loc", "2dsphere")],
+        {},
+    ),
+}
+
+_WILDCARD_CASES = {
+    "path": (
+        [
+            {"_id": 1, "w": {"x": 1, "y": [1, [2, 3]]}},
+            {"_id": 2, "w": [{"a": 1}, {"a": 2}]},
+            {"_id": 3, "w": [[1, 2], [3]]},
+            {"_id": 4, "w": {"a": {"b": [{"c": 1}]}}},
+            {"_id": 5, "w": 5, "o": 9},
+            {"_id": 6, "w": {}},
+            {"_id": 7, "w": []},
+            {"_id": 8, "w": None},
+            {"_id": 9},
+        ],
+        [("w.$**", 1)],
+        {},
+    ),
+    "descending": (
+        [{"_id": 1, "w": {"x": 1, "y": [1, [2, 3]]}}, {"_id": 2, "w": [{"a": 1}, {"a": 2}]}],
+        [("w.$**", -1)],
+        {},
+    ),
+    "all_fields": (
+        [
+            {"_id": 1, "a": None, "b": {"d": 1.5}, "c": [], "d": [[]], "e": [{}], "f": [None]},
+            {"_id": 2, "a": {"b": {}}, "s": "Abc", "n": {"$numberDecimal": "1"}},
+            {"_id": 3, "a": [1, 1, 2]},
+        ],
+        [("$**", 1)],
+        {},
+    ),
+    "collated": (
+        [{"_id": 1, "a": 1, "b": [1, 2], "s": "Abc"}],
+        [("$**", 1)],
+        {"collation": {"locale": "en", "strength": 2}},
+    ),
+    "projection_in": (
+        [{"_id": 1, "a": 1, "b": [1, 2], "c": {"d": [3]}}],
+        [("$**", 1)],
+        {"wildcardProjection": {"a": 1, "c": 1}},
+    ),
+    "projection_out": (
+        [{"_id": 1, "a": 1, "b": {"c": 2}}],
+        [("$**", 1)],
+        {"wildcardProjection": {"b": 0}},
+    ),
+    "projection_id": (
+        [{"_id": 1, "a": 1, "b": {"c": 2}, "z": 1}],
+        [("$**", -1)],
+        {"wildcardProjection": {"b": 1, "_id": 1}},
+    ),
+    "compound": (
+        [{"_id": 1, "a": 1, "b": [1, 2]}, {"_id": 2, "a": 2, "b": 3}],
+        [("a", 1), ("$**", 1)],
+        {"wildcardProjection": {"b": 1}},
+    ),
+    "partial": (
+        [{"_id": 1, "a": 1, "b": 1}, {"_id": 2, "a": 3, "b": [1]}],
+        [("$**", 1)],
+        {"partialFilterExpression": {"a": {"$gt": 1}}},
+    ),
+}
+
+
+def _validate_cases(tmp_path: Path, cases: dict) -> dict:
+    def setup(c: pymongo.MongoClient) -> None:
+        for name, (docs, keys, opts) in cases.items():
+            c.app[name].insert_many(docs)
+            c.app[name].create_index(keys, name="i", **opts)
+
+    with _mongod_on_secantus_store(tmp_path, setup) as mongod:
+        return {name: _validation(mongod, "app", name) for name in cases}
+
+
+@pytest.mark.backlog_fixed("RM-741")
+def test_mongod_validates_each_kind_of_2d_index_secantus_wrote(tmp_path: Path) -> None:
+    """RM-741: `2d` indexes of every shape this server writes (several
+    locations, compound with array fields, the `bits` / `min` / `max`
+    options) hold the keys mongod 8.2.11 makes."""
+    cases = {n: c for n, c in _GEO_CASES.items() if n.startswith("flat_")}
+    assert _validate_cases(tmp_path, cases) == {name: (True, [], []) for name in cases}
 
 
 @pytest.mark.backlog("RM-744")

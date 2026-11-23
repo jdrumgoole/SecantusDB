@@ -28,7 +28,7 @@ with a clean error rather than return a subtly different answer.
 
 ## Storage
 
-The store is `mongod` 8.2's own layout on WiredTiger (store format 10), so
+The store is `mongod` 8.2's own layout on WiredTiger (store format 11), so
 `mongod` opens a store this server wrote and this server opens one `mongod`
 wrote, as a hand-off and never at once. `_mdb_catalog` lists every collection
 and index with its ident; each collection is a table of its own, holding its

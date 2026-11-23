@@ -119,6 +119,24 @@ fn as_f64(v: &Bson) -> Option<f64> {
     }
 }
 
+/// A `2dsphere` index's covering parameters, from its options: the levels
+/// and the cell budget (mongod's defaults where it is not given).
+pub fn sphere_kind(spec: &Document) -> Kind {
+    let level = |k: &str, default: i32| spec.get(k).and_then(as_i64).map_or(default, |v| v as i32);
+    let radius = crate::geoshape::EARTH_RADIUS_METERS;
+    Kind::Sphere {
+        finest: level(
+            "finestIndexedLevel",
+            crate::s2legacy::AVG_EDGE.closest_level(110.0 / radius),
+        ),
+        coarsest: level(
+            "coarsestIndexedLevel",
+            crate::s2legacy::AVG_EDGE.closest_level(2_000_000.0 / radius),
+        ),
+        max_cells: level("maxCellsInCovering", 20),
+    }
+}
+
 impl GeoIndex {
     /// The index an index spec (as `listIndexes` gives it) describes, when
     /// it is a geo index this module reads: a `2d` index, or a version 3
@@ -142,20 +160,7 @@ impl GeoIndex {
             if version != 3 {
                 return None;
             }
-            let level =
-                |k: &str, default: i32| spec.get(k).and_then(as_i64).map_or(default, |v| v as i32);
-            let radius = crate::geoshape::EARTH_RADIUS_METERS;
-            Kind::Sphere {
-                finest: level(
-                    "finestIndexedLevel",
-                    crate::s2legacy::AVG_EDGE.closest_level(110.0 / radius),
-                ),
-                coarsest: level(
-                    "coarsestIndexedLevel",
-                    crate::s2legacy::AVG_EDGE.closest_level(2_000_000.0 / radius),
-                ),
-                max_cells: level("maxCellsInCovering", 20),
-            }
+            sphere_kind(spec)
         } else {
             if geo_at != 0 {
                 return None;

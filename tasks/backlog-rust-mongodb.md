@@ -2932,16 +2932,6 @@ produce the dump it exists for.
 Each was measured by starting mongod 8.2.11 on a store `secantusd-mdb`
 wrote and stopped (the forward direction of RM-723).
 
-- [ ] **A `2d` index's keys are not mongod's.** mongod keys a point by its
-      GeoHash at the index's `bits` (x then y interleaved, in the high bits)
-      as BinData subtype 128, and keeps the index non-multikey with no
-      multikey paths; this server keys it by a cell of its own (y first, in
-      the low bits, BinData subtype 0), so mongod's `validate` on our store
-      reports every entry missing and an extra one each. The query side
-      (`try_geo_2d_id_keys`, `range_scan_cells`) reads the same cells, so a
-      fix moves both, using `secantus_core::geohash2d`'s converter.
-      Backlog-ID: RM-741
-      Verify: tests/backlog/test_rm_storage_model.py::test_mongod_validates_a_2d_index_secantus_wrote
 - [ ] **A `2dsphere` index's keys are not mongod's.** mongod (index version
       3) keys a point by one S2 cell id as a NumberLong, and a shape by its
       covering at mongod's levels; this server writes its own covering

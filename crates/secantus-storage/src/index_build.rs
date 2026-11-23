@@ -143,10 +143,18 @@ impl BuildIndex {
     /// `d` makes the index multikey: flag it, and add the array components
     /// on its key paths to what the catalog will record.
     fn note_multikey(&self, d: &Document) {
+        let (makes, doc_paths) = self.desc.multikey_paths_of(d);
+        if !makes {
+            return;
+        }
         self.multikey.store(true, Ordering::Relaxed);
         let mut paths = self.paths.lock().unwrap_or_else(|e| e.into_inner());
-        for (field, parts) in self.key.keys().zip(paths.iter_mut()) {
-            crate::array_components(d, field, parts);
+        for (parts, add) in paths.iter_mut().zip(&doc_paths) {
+            for path in add {
+                if !parts.contains(path) {
+                    parts.push(path.clone());
+                }
+            }
         }
     }
 
@@ -190,10 +198,6 @@ impl BuildIndex {
             .ok_or_else(|| {
                 StorageError::Internal(format!("index build: index {} has no table yet", self.name))
             })
-    }
-
-    fn is_geo(&self) -> bool {
-        self.desc.geo_2d.is_some() || self.desc.geo_sphere.is_some()
     }
 
     fn unique(&self) -> bool {
@@ -718,7 +722,7 @@ impl Storage {
                 if let (Some(o), Some(n)) = (&old_keys, &new_keys) {
                     let o: HashSet<&EntryKey> = o.iter().collect();
                     let n: HashSet<&EntryKey> = n.iter().collect();
-                    for k in o.difference(&n) {
+                    for k in o.difference(&n).filter(|k| !is_metadata_entry(k)) {
                         put(&b.uuid, i, SideOp::Remove(k))?;
                     }
                     for k in n.difference(&o) {
@@ -726,16 +730,14 @@ impl Storage {
                     }
                 } else {
                     if let Some(o) = &old_keys {
-                        for k in o {
+                        for k in o.iter().filter(|k| !is_metadata_entry(k)) {
                             put(&b.uuid, i, SideOp::Remove(k))?;
                         }
                     }
                     put(&b.uuid, i, SideOp::Skipped(recordid))?;
                 }
                 if let Some(d) = new {
-                    if !ix.is_geo() && doc_makes_multikey(d, &ix.key) {
-                        ix.note_multikey(d);
-                    }
+                    ix.note_multikey(d);
                 }
             }
         }
@@ -1220,10 +1222,7 @@ impl Storage {
                             return Err(scan_stopped(scanned, 16755, &no_geo_keys(&d, &why)));
                         }
                     }
-                    if !ix.is_geo()
-                        && doc_makes_multikey(&d, &ix.key)
-                        && self.doc_in_partial(&d, &ix.desc)?
-                    {
+                    if self.doc_in_partial(&d, &ix.desc)? {
                         ix.note_multikey(&d);
                     }
                     for entry in self.packed_entry_keys(&d, &ix.desc, rid)? {
@@ -1863,7 +1862,7 @@ fn with_geo_options(mut stored: Document, key: &Document, options: &Document) ->
     if parse_geo_2d(key, options).is_some() {
         stored.insert("multikey", Bson::Boolean(true));
     }
-    if parse_geo_sphere(key).is_some() {
+    if parse_geo_sphere(key, options).is_some() {
         stored.insert("multikey", Bson::Boolean(true));
         stored
             .entry("2dsphereIndexVersion".to_string())
@@ -1916,7 +1915,7 @@ mod tests {
 
     #[test]
     fn a_side_write_reads_back() {
-        let entry = KeyShape::plain()
+        let entry = KeyShape::new(&bson::doc! {"k": 1}, None, BinDataOrder::Mongod)
             .entry(&[Bson::String("key".into())], &RecordId::Long(7))
             .unwrap();
         let v = encode_side(3, &SideOp::Insert(&entry));
