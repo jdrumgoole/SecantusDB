@@ -102,11 +102,11 @@ def test_a_stored_undefined_new_root_is_undefined(rust_mongo: Any, mongod: Any) 
     assert answer(rust_mongo) == answer(mongod)
 
 
-@pytest.mark.backlog("RM-623")
+@pytest.mark.backlog_fixed("RM-623")
 def test_a_new_root_error_behind_a_sort_names_the_document(rust_mongo: Any, mongod: Any) -> None:
     """When a later stage reads the sort key, mongod 8.2.11's 40228 names
-    the whole input document; this server names the fields the `newRoot`
-    reads, as both do with no reader of the key after."""
+    the whole input document; this server named only the fields the
+    `newRoot` reads, as both do with no reader of the key after."""
     pipelines = {
         "$sort, $replaceRoot, $meta": [
             SORT,

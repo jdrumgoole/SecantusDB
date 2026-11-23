@@ -1180,13 +1180,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       they run. Found 2026-11-13 (RM-520).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_a_windows_output_reads_the_sort_key
       Backlog-ID: RM-621
-- [ ] **A `newRoot` error names a pruned document when a later stage
-      reads the sort key.** In `$sort, $replaceRoot: {newRoot: "$n"}, $addFields:
-      {m: {$meta: "sortKey"}}`, mongod 8.2.11's 40228 names the whole input
-      document; this server names only the fields the `newRoot` reads, as
-      both do with no reader of the key after. Found 2026-11-13 (RM-520).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_a_new_root_error_behind_a_sort_names_the_document
-      Backlog-ID: RM-623
 - [ ] **A document inside an array a stage reads or writes into is sized
       as if it were read.** mongod 8.2.11 gives each document in an array a
       cache of its own when a stage reads a field through the array
