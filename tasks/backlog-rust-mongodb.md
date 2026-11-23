@@ -1174,14 +1174,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Rust server". Found 2026-11-23 (RM-634).
       Verify: tests/backlog/test_rm_found_rm634.py::test_an_unpushed_sort_key_read_with_no_sort_is_empty
       Backlog-ID: RM-766
-- [ ] **A `{$meta: "sortKey"}` in a window's output reads no key.** Behind
-      a `$sort`, mongod 8.2.11 gives each document's key to a `$push: {$meta:
-      "sortKey"}` in a `$setWindowFields` or `$_internalSetWindowFields`;
-      this server refuses it in `$setWindowFields` (code 2) and gives null in
-      `$_internalSetWindowFields`, which hold the key off the documents while
-      they run. Found 2026-11-13 (RM-520).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm520.py::test_a_windows_output_reads_the_sort_key
-      Backlog-ID: RM-621
 - [ ] **A document inside an array a stage reads or writes into is sized
       as if it were read.** mongod 8.2.11 gives each document in an array a
       cache of its own when a stage reads a field through the array

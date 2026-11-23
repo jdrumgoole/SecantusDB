@@ -52,16 +52,22 @@ def test_root_does_not_show_the_sort_key(rust_mongo: Any, mongod: Any) -> None:
     assert _answers(rust_mongo, pipelines) == _answers(mongod, pipelines)
 
 
-@pytest.mark.backlog("RM-621")
+@pytest.mark.backlog_fixed("RM-621")
 def test_a_windows_output_reads_the_sort_key(rust_mongo: Any, mongod: Any) -> None:
     """Behind a `$sort`, mongod 8.2.11 pushes each document's sort key in a
-    window's output; this server refuses it in `$setWindowFields` and reads
-    null in `$_internalSetWindowFields`."""
+    window's output; this server refused it in `$setWindowFields` and read
+    nothing in `$_internalSetWindowFields`. A sorting `$setWindowFields`
+    reads the key of the `$sort` it runs behind."""
     push = {"x": {"$push": {"$meta": "sortKey"}}}
     pipelines = {
         "$setWindowFields": [
             SORT,
             {"$setWindowFields": {"output": push}},
+            {"$project": {"x": 1}},
+        ],
+        "$setWindowFields sortBy": [
+            SORT,
+            {"$setWindowFields": {"partitionBy": "$k", "sortBy": {"n": -1}, "output": push}},
             {"$project": {"x": 1}},
         ],
         "$_internalSetWindowFields": [
