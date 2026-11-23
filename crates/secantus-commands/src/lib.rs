@@ -238,6 +238,10 @@ pub struct CommandContext {
     /// server drops the socket after dispatch instead of replying, so the driver
     /// sees a network error (the drivers' retryability / socket-error tests).
     pub close_connection: bool,
+    /// What `shutdown` calls to stop the process (mongod's
+    /// `shutdownServer`): the binary wires one that runs its clean stop.
+    /// `None` (an embedded server, unit tests) leaves `shutdown` refused.
+    pub shutdown_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     /// The server's live-connection registry, so `killOp` can close a connection
     /// by its `conn_id`. `None` until the server wires one in (and in unit-test
     /// contexts).
@@ -426,6 +430,7 @@ impl CommandContext {
             peer_cert_dn: None,
             failpoints: None,
             close_connection: false,
+            shutdown_hook: None,
             conn_killer: None,
             cert_rotator: None,
             ops: None,
@@ -503,6 +508,12 @@ impl CommandContext {
 
     /// Attach the server's live-connection registry (builder-style). `killOp`
     /// uses it to close a connection by its `conn_id`.
+    /// Attach what `shutdown` calls to stop the server (builder-style).
+    pub fn with_shutdown_hook(mut self, hook: Option<Arc<dyn Fn() + Send + Sync>>) -> Self {
+        self.shutdown_hook = hook;
+        self
+    }
+
     pub fn with_conn_killer(mut self, conn_killer: Arc<dyn ConnectionKiller>) -> Self {
         self.conn_killer = Some(conn_killer);
         self
@@ -846,6 +857,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "shardingState" => serverinfo::sharding_state,
         "fsyncUnlock" => serverinfo::fsync_unlock,
         "fsync" => diagnostics::fsync,
+        "shutdown" => serverinfo::shutdown,
         "hostInfo" => diagnostics::host_info,
         "top" => diagnostics::top,
         "getLog" => serverinfo::get_log,

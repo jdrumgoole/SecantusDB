@@ -2972,14 +2972,6 @@ produce the dump it exists for.
       (measured 2026-11-22).
       Verify: tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_killed_mongod_store_whose_oplog_drops_what_it_refuses
       Backlog-ID: RM-756
-- [ ] **There is no `shutdown` command.** mongod 8.2.11 stops on
-      `db.adminCommand({shutdown: 1})`: the connection closes and the
-      process exits cleanly. `secantusd-mdb` answers CommandNotFound (59)
-      and keeps running, so SIGTERM is its only clean stop; mongod's own
-      tooling (and phase 7 of the storage plan) stops a server this way.
-      Found measuring phase 0c.
-      Backlog-ID: RM-724
-      Verify: tests/backlog/test_rm_storage_model.py::test_shutdown_command_stops_the_server
 
 ## Found making mongod open our stores (storage-model phase 7, 2026-11-21)
 

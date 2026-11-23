@@ -214,6 +214,8 @@ fn run(cli: CliArgs) -> Result<(), String> {
     // requested during startup is honoured once the server is up.
     reset_stop_signals();
     let (tx, rx) = mpsc::channel::<()>();
+    // The `shutdown` command stops the server the way a signal does (RM-724).
+    let command_tx = tx.clone();
     ctrlc::set_handler(move || {
         let _ = tx.send(());
     })
@@ -250,8 +252,12 @@ fn run(cli: CliArgs) -> Result<(), String> {
         .map_err(|e| format!("repairing the store's time-series collections: {e:?}"))?;
     let cursors = Arc::new(CursorRegistry::new());
     let addr = cli.bind_addr();
-    let mut running = bind(&addr, cli.server_config(), adapter, cursors)
-        .map_err(|e| format!("failed to bind {addr}: {e}"))?;
+    let mut config = cli.server_config();
+    config.shutdown_hook = Some(Arc::new(move || {
+        let _ = command_tx.send(());
+    }));
+    let mut running =
+        bind(&addr, config, adapter, cursors).map_err(|e| format!("failed to bind {addr}: {e}"))?;
 
     // Where this member is, for an index build's `commitReadyMembers`.
     storage.set_member_host(&running.address().to_string());

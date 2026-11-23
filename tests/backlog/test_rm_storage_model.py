@@ -165,11 +165,11 @@ def _secantus_store_at(tmp_path: Path) -> tuple[Path, int]:
     return store, port
 
 
-@pytest.mark.backlog("RM-724")
+@pytest.mark.backlog_fixed("RM-724")
 def test_shutdown_command_stops_the_server(tmp_path: Path) -> None:
     """mongod 8.2.11: `shutdown` closes the connection (the driver sees a
     network error, not a reply) and the process exits. `secantusd-mdb`
-    answers CommandNotFound (59) and keeps running."""
+    answered CommandNotFound (59) and kept running."""
     with rust_mongo_server(tmp_path / "store") as client:
         try:
             client.admin.command("shutdown")

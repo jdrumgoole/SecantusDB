@@ -158,6 +158,9 @@ pub struct ServerConfig {
     /// Server parameters given at startup (mongod's `--setParameter`),
     /// already checked by `secantus_commands::params::parse_startup_parameter`.
     pub startup_parameters: Vec<(String, bson::Bson)>,
+    /// What the `shutdown` command calls to stop the process cleanly (the
+    /// binary's SIGTERM path). `None` leaves `shutdown` unregistered.
+    pub shutdown_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Default for ServerConfig {
@@ -165,6 +168,7 @@ impl Default for ServerConfig {
         Self {
             db_path: None,
             startup_parameters: Vec::new(),
+            shutdown_hook: None,
             replica_set_name: None,
             require_auth: false,
             enable_test_commands: false,
@@ -1473,6 +1477,7 @@ fn make_context(
         .with_failpoints_opt(shared.failpoints.clone())
         .with_conn_auth(conn_auth.clone())
         .with_conn_killer(shared.conn_killer.clone())
+        .with_shutdown_hook(shared.config.shutdown_hook.clone())
         .with_cert_rotator(
             shared
                 .tls

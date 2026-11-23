@@ -1020,9 +1020,40 @@ pub fn get_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     Ok(out)
 }
 
+/// `shutdown`: mongod 8.2.11 answers nothing -- it closes the connection
+/// (the driver sees a network error) and the process stops cleanly (RM-724).
+/// The server's hook runs the same stop a SIGTERM does. Without one (an
+/// embedded server, whose embedder owns its lifetime) the command stays
+/// unregistered, as before.
+pub fn shutdown(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let Some(hook) = ctx.shutdown_hook.clone() else {
+        return Err(CommandError::command_not_found("shutdown"));
+    };
+    ctx.close_connection = true;
+    hook();
+    Ok(doc! { "ok": 1.0 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_calls_the_hook_and_closes_the_connection() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let called = Arc::new(AtomicBool::new(false));
+        let seen = called.clone();
+        let mut ctx = CommandContext::new(1)
+            .with_shutdown_hook(Some(Arc::new(move || seen.store(true, Ordering::SeqCst))));
+        shutdown(&doc! {"shutdown": 1}, &mut ctx).unwrap();
+        assert!(called.load(Ordering::SeqCst) && ctx.close_connection);
+        let mut bare = CommandContext::new(1);
+        assert_eq!(
+            shutdown(&doc! {"shutdown": 1}, &mut bare).unwrap_err().code,
+            59
+        );
+    }
 
     #[test]
     fn startup_log_time_is_ctime_to_the_millisecond_without_the_year() {
