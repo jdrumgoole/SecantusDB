@@ -382,7 +382,7 @@ fn a_build_over_documents_refuses_a_text_index() {
     let home = temp_home();
     let st = Storage::open(home.to_str().unwrap()).unwrap();
     load(&st, 3);
-    for key in [doc! {"s": "text"}, doc! {"s": "hashed"}] {
+    for key in [doc! {"s": "text"}] {
         let refused = st.begin_index_build(
             "app",
             "c",

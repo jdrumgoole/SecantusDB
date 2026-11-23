@@ -688,7 +688,12 @@ fn use_index(index: &Arc<IndexInfo>, leaves: &[Leaf], parts: &[Document], q: &Qu
             if multikey && !leaf.derived && list.is_some() {
                 continue;
             }
-            let Some((part, tight)) = leaf_bounds(&leaf.pred, ctx) else {
+            let found = if index.is_hashed(pos) {
+                super::bounds::hashed_leaf_bounds(&leaf.pred, ctx, index.collation.as_ref())
+            } else {
+                leaf_bounds(&leaf.pred, ctx)
+            };
+            let Some((part, tight)) = found else {
                 continue;
             };
             list = Some(match list {
@@ -887,6 +892,10 @@ fn serves_sort(index: &IndexInfo, bounds: &[Vec<Interval>], sort: &Document) -> 
             pos += 1;
         }
         if pos < fields.len() && fields[pos].0 == name {
+            // The keys of a hashed field are hashes: they order nothing.
+            if index.is_hashed(pos) {
+                return None;
+            }
             let this = (fields[pos].1 < 0) != (dir < 0);
             if backward.is_some_and(|b| b != this) {
                 return None;
@@ -906,7 +915,7 @@ fn sort_of<'a>(q: &'a Query) -> Option<&'a Document> {
 
 /// Whether an index may be read at all for this query.
 fn eligible(index: &IndexInfo, q: &Query) -> bool {
-    index.plain && index.partial.as_ref().is_none_or(|p| (q.implies)(p))
+    (index.plain || index.has_hashed()) && index.partial.as_ref().is_none_or(|p| (q.implies)(p))
 }
 
 fn scan_of(u: &IndexUse, parts: &[Document], backward: bool) -> IxScan {
@@ -1626,6 +1635,11 @@ fn candidates(
         }
     }
     let covered: Vec<BTreeSet<usize>> = uses.iter().map(|u| u.covered.clone()).collect();
+    // What a hashed index decides is nothing outright (its bounds are the
+    // hashes, rechecked on the document); it is intersected with the index of
+    // another predicate all the same (measured 8.2.11, 2026-11-23), by the
+    // predicates it was tagged with.
+    let tagged: Vec<BTreeSet<usize>> = uses.iter().map(|u| u.tagged.clone()).collect();
     let mut out: Vec<(Access, Option<Preference>)> = uses
         .into_iter()
         .map(|u| {
@@ -1717,8 +1731,20 @@ fn candidates(
             if same {
                 continue;
             }
-            let both: BTreeSet<usize> = covered[x].union(&covered[y]).copied().collect();
-            if covered.iter().any(|c| c.is_superset(&both)) {
+            // A hashed index decides nothing outright, so the predicates it
+            // was tagged with stand in for the ones it decides, for every
+            // index (measured 8.2.11, 2026-11-23: `{a: 3, b: 0}` over
+            // `a_1`, `b_1` and `{b: 1, a: "hashed"}` adds no AND_SORTED).
+            let decided = if out
+                .iter()
+                .any(|(a, _)| a.index.as_ref().is_some_and(|ix| ix.has_hashed()))
+            {
+                &tagged
+            } else {
+                &covered
+            };
+            let both: BTreeSet<usize> = decided[x].union(&decided[y]).copied().collect();
+            if decided.iter().any(|c| c.is_superset(&both)) {
                 continue;
             }
             let scans = vec![out[x].0.scan.clone(), out[y].0.scan.clone()];
@@ -2541,8 +2567,9 @@ fn wrap(a: Access, q: &Query) -> Node {
     // `{x: 1}` on the keys below the FETCH).
     let in_key = |s: &Document, ix: &IndexInfo| {
         s.keys().all(|f| {
-            ix.position(f)
-                .is_some_and(|at| ix.multikey_paths.get(at).is_none_or(Vec::is_empty))
+            ix.position(f).is_some_and(|at| {
+                !ix.is_hashed(at) && ix.multikey_paths.get(at).is_none_or(Vec::is_empty)
+            })
         })
     };
     // A sort on fields the index holds runs on the keys, below the fetch;

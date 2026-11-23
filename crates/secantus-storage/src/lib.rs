@@ -3913,7 +3913,7 @@ pub(crate) fn unsupported_index_type(
         return None;
     }
     for (field, v) in key_spec {
-        if direction_of(v).is_none() {
+        if direction_of(v).is_none() && !secantus_core::hashed::is_hashed_spec(v) {
             let ty = match v {
                 Bson::String(s) => s.clone(),
                 other => format!("{other:?}"),
@@ -3977,6 +3977,9 @@ fn named(why: String, names: bool, doc: &Document) -> String {
 /// message, or `None` when every one can.
 fn geo_key_problem(doc: &Document, descs: &[IndexDesc]) -> Option<(i32, String)> {
     for desc in descs {
+        if let Some(why) = hashed_array_problem(doc, &desc.key_spec) {
+            return Some((16766, why));
+        }
         if let Some(gs) = &desc.geo_sphere {
             let why =
                 secantus_core::geoshape::sphere_key_problem(&gs.field, get_path(doc, &gs.field));
@@ -3993,6 +3996,22 @@ fn geo_key_problem(doc: &Document, descs: &[IndexDesc]) -> Option<(i32, String)>
         }
     }
     None
+}
+
+/// Why a hashed index cannot hold `doc`: one of the index's key fields holds
+/// an array (mongod's `ExpressionKeysPrivate::getHashKeys`, code 16766).
+/// The check is of every key field in order, the ascending ones of a
+/// compound hashed index too (measured 8.2.11, 2026-11-23). `None` when the
+/// index is not hashed or the document is fine.
+fn hashed_array_problem(doc: &Document, key_spec: &Document) -> Option<String> {
+    if !key_spec.values().any(secantus_core::hashed::is_hashed_spec) {
+        return None;
+    }
+    key_spec.keys().find_map(|field| {
+        secantus_core::hashed::array_along_path(doc, field).map(|at| {
+            format!("Error: hashed indexes do not currently support array values. Found array at path: {at}")
+        })
+    })
 }
 
 /// An index build that met a document it cannot index, after `scanned` it
@@ -4652,7 +4671,23 @@ fn index_key_values_c(
     // encoded bytes so a repeated array element doesn't inflate the compound
     // cartesian product below.
     let mut per_field: Vec<Vec<Bson>> = Vec::with_capacity(fields.len());
-    for (f, d) in &fields {
+    if let Some(why) = hashed_array_problem(doc, key_spec) {
+        return Err(StorageError::QueryError {
+            code: 16766,
+            errmsg: why,
+            exec: false,
+        });
+    }
+    for ((f, d), spec) in fields.iter().zip(key_spec.values()) {
+        if secantus_core::hashed::is_hashed_spec(spec) {
+            // The key is the value's hash: a `NumberLong`, a missing field
+            // hashed as null.
+            per_field.push(vec![secantus_core::hashed::index_key(
+                get_path(doc, f),
+                coll,
+            )]);
+            continue;
+        }
         let (cands, _multikey) = index_field_values(doc, f, sparse);
         if cands.len() == 1 {
             per_field.push(cands);
@@ -17290,7 +17325,8 @@ impl Storage {
             let mut entries: Vec<EntryKey> = Vec::new();
             let mut seen: HashSet<Vec<u8>> = HashSet::new();
             let shape = KeyShape::new(key_spec, key_coll.clone(), build_order);
-            for (rid, blob) in self.scan_docs(session, db, coll)? {
+            for (scanned, (rid, blob)) in self.scan_docs(session, db, coll)?.into_iter().enumerate()
+            {
                 // The scan itself polls, but building the entries is per-document
                 // work of its own (decode + sort-key encode), so a large
                 // collection can outlive its budget here even after the read
@@ -17299,6 +17335,9 @@ impl Storage {
                     return Err(StorageError::MaxTimeExpired);
                 }
                 let d = decode_doc(&blob)?;
+                if let Some(why) = hashed_array_problem(&d, key_spec) {
+                    return Err(scan_stopped(scanned, 16766, &why));
+                }
                 if let Some(pf) = &partial {
                     if !query_matches(&d, pf, &Vars::new(), key_coll.as_ref())
                         .map_err(query_fault)?
@@ -23822,7 +23861,12 @@ impl Storage {
                 let mut found: Option<(Document, Document)> = None;
                 for (n, key_spec, o) in self.visible_indexes(session, db, coll)? {
                     if &n == name {
-                        if let Some((f, dv)) = key_spec.iter().next() {
+                        // The keys of a hashed field order nothing.
+                        if let Some((f, dv)) = key_spec
+                            .iter()
+                            .next()
+                            .filter(|(_, dv)| !secantus_core::hashed::is_hashed_spec(dv))
+                        {
                             leading = Some((f.clone(), direction_of(dv).unwrap_or(1)));
                         }
                         found = Some((key_spec, o));
@@ -24374,6 +24418,10 @@ impl Storage {
         if let Some(r) = self.try_geo_sphere_id_keys(session, db, coll, filter)? {
             return Ok(Some(r));
         }
+        // An equality or `$in` on a field a single-field hashed index keys.
+        if let Some(r) = self.try_hashed_id_keys(session, db, coll, filter)? {
+            return Ok(Some(r));
+        }
         // Bare-equality filters of any size can use a compound (or single-field)
         // index whose leading fields cover them.
         // (A regex is a pattern, not a key.)
@@ -24410,6 +24458,89 @@ impl Storage {
                 None => return Ok(None),
             };
         self.lookup_id_keys_via_leading_field(session, db, coll, &idx_match, &value)
+    }
+
+    /// The RecordIds of the documents a single-field HASHED index holds under
+    /// the hash of each value an equality or `$in` on its field names: the
+    /// candidates of that predicate, which the caller rechecks. `None` when no
+    /// field of the filter is one this reads (a range cannot use the hash).
+    /// An array operand, a regex or an operator other than `$eq` / `$in` is
+    /// left to the scan, and so is a null on a sparse index, which holds no
+    /// entry for a missing field.
+    fn try_hashed_id_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<Vec<RecordId>>> {
+        let scalar = |v: &Bson| {
+            !matches!(
+                v,
+                Bson::Array(_) | Bson::RegularExpression(_) | Bson::Undefined
+            )
+        };
+        let mut descs: Option<Vec<IndexDesc>> = None;
+        for (field, pred) in filter {
+            // The values the predicate names, or not a predicate to read.
+            let values: Vec<&Bson> = match pred {
+                Bson::Document(d) if d.keys().any(|k| k.starts_with('$')) => {
+                    if d.len() != 1 {
+                        continue;
+                    }
+                    match d.iter().next() {
+                        Some((op, v)) if op == "$eq" && scalar(v) => vec![v],
+                        Some((op, Bson::Array(vs))) if op == "$in" && vs.iter().all(scalar) => {
+                            vs.iter().collect()
+                        }
+                        _ => continue,
+                    }
+                }
+                v if scalar(v) => vec![v],
+                _ => continue,
+            };
+            if descs.is_none() {
+                descs = Some(self.planner_descs(session, db, coll)?);
+            }
+            let found = descs.iter().flatten().find(|d| {
+                d.key_spec.len() == 1
+                    && d.key_spec
+                        .get(field)
+                        .is_some_and(secantus_core::hashed::is_hashed_spec)
+                    && d.partial.is_none()
+                    && (!d.sparse || values.iter().all(|v| !matches!(v, Bson::Null)))
+            });
+            let Some(desc) = found else {
+                continue;
+            };
+            let shape = self.index_shape(session, db, coll, &desc.name)?;
+            let mut seen: HashSet<i64> = HashSet::new();
+            let mut rids: Vec<RecordId> = Vec::new();
+            let mut got: HashSet<RecordId> = HashSet::new();
+            for v in values {
+                let Bson::Int64(h) = secantus_core::hashed::index_key(Some(v), None) else {
+                    continue;
+                };
+                if !seen.insert(h) {
+                    continue;
+                }
+                for rid in self.scan_index_for_id_keys(
+                    session,
+                    db,
+                    coll,
+                    &desc.name,
+                    &shape,
+                    &[Bson::Int64(h)],
+                    false,
+                )? {
+                    if got.insert(rid.clone()) {
+                        rids.push(rid);
+                    }
+                }
+            }
+            return Ok(Some(rids));
+        }
+        Ok(None)
     }
 
     /// Find the `2d` index covering `field`, as `(index_name, params)`.

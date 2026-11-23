@@ -283,8 +283,8 @@ def test_mongod_opens_a_secantus_store(tmp_path: Path) -> None:
 
 #: Index kinds whose keys this server does not write as mongod does: a
 #: store holding one is not yet a store mongod validates (each has its
-#: backlog item and a gap test below). `hashed` and text indexes are refused
-#: by name when created, so the scenario's store never holds one.
+#: backlog item and a gap test below). Text indexes are refused by name
+#: when created, so the scenario's store never holds one.
 _KINDS_NOT_MONGODS = ("flat_2d", "loc_2dsphere", "w_wildcard")
 
 
@@ -373,9 +373,10 @@ def test_mongod_opens_the_phase_0b_store(tmp_path: Path) -> None:
     store = tmp_path / "store"
     with rust_mongo_server(store) as client:
         steps = run_scenario(client, strict=False)
-        # Refused by name when created (phase 4), so the store has none.
+        # Refused by name when created (phase 4), so the store has none:
+        # the text index (the hashed index is built, RM-732, and mongod
+        # validates its keys below).
         assert [s.split(":")[0] for s in steps if s.startswith("FAILED")] == [
-            "FAILED kinds",
             "FAILED kinds",
         ], steps
         for name in _KINDS_NOT_MONGODS:
@@ -1041,7 +1042,7 @@ def _secantus_open(store: Path) -> tuple[str, str]:
 
 #: The index kinds this server does not key as mongod does (refused by name
 #: when a store holds one), which the servable scenario drops.
-_MONGOD_ONLY_KINDS = ("h_hashed", "loc_2dsphere", "flat_2d", "body_text", "w_wildcard")
+_MONGOD_ONLY_KINDS = ("loc_2dsphere", "flat_2d", "body_text", "w_wildcard")
 
 #: What both servers rewrite as they run, whoever wrote the store: each
 #: server's logical session cache refreshes the sessions it has seen into
@@ -1053,7 +1054,7 @@ def _servable_scenario(rs: pymongo.MongoClient) -> None:
     """Phase 0b's scenario on mongod (every collection and index kind,
     capped, clustered, collated, pre-images, a view, a drop, a rename, a
     transaction), less what this server refuses by name in a store: the index
-    kinds it keys otherwise (RM-741 to RM-743, hashed, text), the
+    kinds it keys otherwise (RM-741 to RM-743, text), the
     time-series collection (RM-754) and the user and role (RM-744)."""
     from tools.probes.mongod_store_layout import run_scenario
 
@@ -1276,17 +1277,17 @@ def _build_quietly(rs: pymongo.MongoClient) -> None:
 def test_secantus_opens_a_killed_mongod_store_whose_oplog_drops_what_it_refuses(
     tmp_path: Path,
 ) -> None:
-    """A killed mongod 8.2.11 store whose stable checkpoint lists a `hashed`
+    """A killed mongod 8.2.11 store whose stable checkpoint lists a `text`
     index that the oplog after it drops: mongod's restart replays the drop
     and serves the collection without it. `secantusd-mdb` judges the store
     at the checkpoint, before its replay, and refuses it by name."""
 
     def setup(rs: pymongo.MongoClient) -> None:
-        rs.app.c.insert_many([{"_id": i, "h": i} for i in range(5)])
-        rs.app.c.create_index([("h", "hashed")], name="h_hashed")
+        rs.app.c.insert_many([{"_id": i, "h": f"word {i}"} for i in range(5)])
+        rs.app.c.create_index([("h", "text")], name="h_text")
         rs.admin.command("fsync")
-        rs.app.c.drop_index("h_hashed")
-        rs.app.c.insert_one({"_id": 5, "h": 5})
+        rs.app.c.drop_index("h_text")
+        rs.app.c.insert_one({"_id": 5, "h": "word 5"})
 
     store, port = _mongod_store_at(tmp_path, setup, kill=True)
     served = _served_after_mongods_restart(store, port, tmp_path)
@@ -1442,16 +1443,16 @@ def test_secantus_refuses_a_set_of_two_members_by_name(tmp_path: Path) -> None:
 @pytest.mark.backlog_fixed("RM-723")
 def test_secantus_refuses_an_index_kind_it_does_not_serve_by_name(tmp_path: Path) -> None:
     """A mongod store holding an index this server does not write as mongod
-    does (here `hashed`, which it refuses to create) is refused when
+    does (here `text`, which it refuses to create) is refused when
     `secantusd-mdb` opens it, naming the index, never served without it."""
 
     def setup(rs: pymongo.MongoClient) -> None:
         rs["app"]["c"].insert_one({"_id": 1, "h": "x"})
-        rs["app"]["c"].create_index([("h", "hashed")], name="h_hashed")
+        rs["app"]["c"].create_index([("h", "text")], name="h_text")
 
     store = _mongod_store(tmp_path, setup)
     outcome, said = _secantus_open(store)
-    assert (outcome, "app.c" in said, "h_hashed" in said) == ("refused", True, True), said
+    assert (outcome, "app.c" in said, "h_text" in said) == ("refused", True, True), said
 
 
 # ------------------------------------------------ storage-model phase 7b --

@@ -1222,6 +1222,9 @@ impl Storage {
                             return Err(scan_stopped(scanned, 16755, &no_geo_keys(&d, &why)));
                         }
                     }
+                    if let Some(why) = hashed_array_problem(&d, &ix.key) {
+                        return Err(scan_stopped(scanned, 16766, &why));
+                    }
                     if self.doc_in_partial(&d, &ix.desc)? {
                         ix.note_multikey(&d);
                     }

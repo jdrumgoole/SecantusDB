@@ -449,6 +449,34 @@ pub(crate) fn index_problem(spec: &Document, fields: &Fields) -> Option<CommandE
             "Text indexes are not supported on time-series collections",
         ));
     }
+    // A hashed index is of the metaField (mongod 8.2.11, 2026-11-23): on the
+    // time field or a measurement it is refused, quoting the key.
+    for (field, value) in key {
+        if !secantus_core::hashed::is_hashed_spec(value) {
+            continue;
+        }
+        if fields
+            .meta
+            .as_deref()
+            .is_some_and(|meta| in_meta(field, meta))
+        {
+            continue;
+        }
+        let which = if in_meta(field, &fields.time) {
+            "the time field must be ascending or descending (numbers only)"
+        } else {
+            "measurement fields must be ascending or descending (numbers only), or '2dsphere'"
+        };
+        let shown = secantus_core::query::bson_value_repr(&Bson::Document(key.clone()));
+        return Some(CommandError::new(
+            67,
+            "CannotCreateIndex",
+            format!(
+                "BadValue: Invalid index spec for time-series collection: {shown}. Indexes on \
+                 {which}: {field}: \"hashed\""
+            ),
+        ));
+    }
     if spec.contains_key("expireAfterSeconds") {
         let on_meta = |filter: &Document| {
             fields

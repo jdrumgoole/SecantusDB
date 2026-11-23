@@ -250,14 +250,7 @@ pub fn mark_opened(home: &Path) -> Result<()> {
 /// refused until a store of its is adopted with them, not for their keys, which are
 /// the ones this server writes since format 11), by the value naming
 /// them in an index's key pattern.
-const UNSERVED_INDEX_KINDS: &[&str] = &[
-    "2d",
-    "2dsphere",
-    "2dsphere_bucket",
-    "hashed",
-    "text",
-    "columnstore",
-];
+const UNSERVED_INDEX_KINDS: &[&str] = &["2d", "2dsphere", "2dsphere_bucket", "text", "columnstore"];
 
 /// The collection options of a `_mdb_catalog` entry this server keeps and
 /// serves: mongod's own (`uuid`, the oplog's `autoIndexId`), what `create`

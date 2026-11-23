@@ -2209,10 +2209,9 @@ masks only the write-conflict cause. What is left:
 `tools/probes/time_series.py`, mongod 8.2.11: 191 scenarios on a fresh
 database each (what `create` accepts, inserts, reads, where measurements are
 placed, the restricted writes, indexes, `collMod`, rename and the rest). The
-Rust server differs on 2 (2026-11-11): a `hashed` index (RM-732)
-and `collStats`' sizes -- its storage size, as on every collection (RM-040),
-and its index sizes, 0 while the indexes are not built over the buckets
-(RM-457); a third, `listCollections` order, differs in the runs where
+Rust server differs on 1 (2026-11-11): `collStats`' sizes -- its storage size,
+as on every collection (RM-040), and its index sizes, 0 while the indexes are
+not built over the buckets (RM-457); a second, `listCollections` order, differs in the runs where
 mongod's own order comes out the other way.
 Since 2026-11-11 this server keeps a time-series collection as mongod does:
 bucket documents in `system.buckets.<name>`, each data field mongod's
@@ -2284,8 +2283,8 @@ compressed column, placed by mongod's bucket catalog
 `tools/probes/collation.py`, mongod 8.2.11: 764 scenarios (reads under 29
 collations, 39 malformed specs on every command, the expression and query
 operators, and a fresh database per scenario for defaults, indexes, views and
-writes). The Rust server differs on 2 (2026-11-09): hashed indexes (the
-hashed-index item, RM-732) and text indexes, which it does not build. It
+writes). The Rust server differs on 1 (2026-11-09): text indexes, which it does not
+build (hashed indexes are built since RM-732). It
 compares through the ICU
 57.1 mongod links, built from mongo's own copy (`crates/secantus-icu`,
 `vendor/icu4c-57.1`), so locales, per-locale defaults, order and sort-key
@@ -2381,32 +2380,10 @@ wording filed under 7.067) and 2 TTL results
 
 ### 7.067 Index management -- 2026-10-10
 
-`tools/probes/index_admin.py`, mongod 8.2.11: the Rust server differs on 5
-of 90: `text` (out of scope) and `hashed` (below) are not built and so
-cannot be dropped (four), and `listIndexes` lists by name.
-
-- [ ] **Hashed indexes are refused: `createIndex({a: "hashed"})` answers 67
-      CannotCreateIndex ("not supported by the Rust storage engine yet").**
-      mongod 8.2.11 builds them on a single node, where applications use
-      them for equality lookups; they are not a sharding-only feature, so
-      the 2026-10-14 plan's "out of scope" (no recorded reason, no decision
-      by Joe) was wrong, and Joe asked for the item (2026-11-20). What mongod
-      does, measured 2026-11-20: the key is `hash64` of the value
-      (`secantus-core/src/hashed.rs` already has it, checked on 140 values
-      for `$toHashedIndexKey`); an equality or `$in` is a FETCH over an
-      IXSCAN with point bounds on the hash (`{a: 3}` gives
-      `[-1529429926180645992, -1529429926180645992]`); a range or a sort
-      cannot use it (COLLSCAN); one hashed field may sit in a compound index
-      (`{x: 1, y: "hashed"}`); `unique` is refused with 16764, two hashed
-      fields with 31303, and an array value under the hashed path with the
-      write error 16766 ("Error: hashed indexes do not currently support
-      array values. Found array at path: a"). The same refusal reaches
-      time-series collections, where mongod also accepts one. The key goes
-      in the storage plan's phase-4 KeyString layout ("mongod's hash
-      function", `tasks/mongod-storage-model-plan.md`), so build it after
-      phase 4b lands.
-      Backlog-ID: RM-732
-      Verify: tests/backlog/test_rm_hashed_index.py::test_a_hashed_index_is_built_and_serves_equality, tests/backlog/test_rm_hashed_index.py::test_hashed_index_refusals_are_mongods, tests/backlog/test_rm_hashed_index.py::test_a_compound_index_with_one_hashed_field_is_built
+`tools/probes/index_admin.py`, mongod 8.2.11: the Rust server differed on 5
+of 90 (2026-10-10): `text` (out of scope) is not built and so cannot be
+dropped, `hashed` was not built either (it is, since RM-732), and
+`listIndexes` lists by name.
 
 `listIndexes` order is RM-081 (RM-107 was the same item, folded in 2026-10-16).
 
@@ -2913,7 +2890,7 @@ produce the dump it exists for.
       wrote (an index kind it keys otherwise, a time-series collection,
       users) is read from the catalog as WiredTiger recovers it, which is
       the stable checkpoint's: a store whose oplog after the checkpoint
-      drops what is refused (a `hashed` index dropped after an `fsync`) is
+      drops what is refused (a `text` index dropped after an `fsync`) is
       refused, where mongod's restart replays the drop and serves it
       (measured 2026-11-22).
       Verify: tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_killed_mongod_store_whose_oplog_drops_what_it_refuses
@@ -3074,3 +3051,58 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       Verify: none -- a layout and catalog comparison with the phase 0 fixture (`tests/fixtures/storage_model/mongod-8.2.11-layout.json`), made by the phase 0c comparison tool; no client call shows it
       Backlog-ID: RM-740
 
+## Found working RM-732, hashed indexes (2026-11-23)
+
+Each was measured against mongod 8.2.11 beside a hashed-index probe
+(`tests/backlog/test_rm_found_rm732.py`).
+
+- [ ] **A time-series collection with a hashed index on its `metaField`
+      accepts a measurement whose meta is an array.** mongod refuses it with
+      the write error 16766 ("Error: hashed indexes do not currently support
+      array values. Found array at path: meta") and stores nothing; this
+      server stores the measurement, its bucket holding `meta: [1, 2]`, under
+      an index that lists as built. The hashed index itself is built and
+      served on the buckets as `meta` (RM-732); the bucket write does not
+      check it.
+      Verify: tests/backlog/test_rm_found_rm732.py::test_a_hashed_meta_index_refuses_an_array_meta_field
+      Backlog-ID: RM-769
+
+- [ ] **A `sort` by the field of a hashed index the query is hinted to
+      leaves documents that compare equal in the wrong order.** The plan is
+      right (SORT over FETCH over IXSCAN, as mongod's), and so is every
+      other order the hashed scan gives; over 41 values and a document
+      missing the field, mongod's sorter leaves the missing-field document
+      before the null one and the NaN Decimal128 before the NaN double
+      (`std::sort` over documents arriving in hash order), where this server
+      leaves them as it read them. Plain indexes sorted this way match, so it
+      is the hashed scan's arrival order or key reaching the sorter's
+      emulation (`explain/order.rs`, `std_sorted`), not a general sort bug.
+      Verify: tests/backlog/test_rm_found_rm732.py::test_a_sort_by_a_hashed_field_leaves_ties_as_mongods_sorter_does
+      Backlog-ID: RM-770
+
+- [ ] **`createIndexes` validates its options unlike mongod.** On a plain
+      key `{a: 1}`: `prepareUnique` is accepted by mongod and refused here
+      (197); `weights` and `default_language` are refused by mongod on a key
+      that is not `text` (67) and accepted here; `wildcardProjection` on a
+      non-wildcard key is 2 BadValue ("The field 'wildcardProjection' is
+      only allowed in 'wildcard' indexes") and 67 here, with the key printed
+      as `Document({...})`; a `storageEngine` option WiredTiger rejects (2,
+      with WiredTiger's own text) is accepted here and stored.
+      Verify: tests/backlog/test_rm_found_rm732.py::test_create_indexes_validates_its_options_as_mongod_does
+      Backlog-ID: RM-771
+
+- [ ] **An `IndexKeySpecsConflict` quotes the requested spec's options in
+      the wrong place.** mongod 8.2.11 writes `{ v: 2, unique: true, key:
+      ..., name: ... }` and `{ v: 2, key: ..., name: ..., sparse: true }`
+      whatever order the client sent them in; this server writes every
+      option before `key`.
+      Verify: tests/backlog/test_rm_found_rm732.py::test_an_index_conflict_quotes_the_requested_spec_in_mongods_order
+      Backlog-ID: RM-772
+
+- [ ] **An equality to a DBRef is planned as a collection scan.**
+      `{a: DBRef("c", 1)}` is an equality to the document `{$ref: "c", $id:
+      1}`; mongod 8.2.11 reads an index on `a` with the bounds `[{ $ref: "c",
+      $id: 1 }, { $ref: "c", $id: 1 }]`, and this server takes the `$ref`
+      for an operator and plans a COLLSCAN (the rows come back right).
+      Verify: tests/backlog/test_rm_found_rm732.py::test_an_equality_to_a_dbref_reads_the_index
+      Backlog-ID: RM-773
