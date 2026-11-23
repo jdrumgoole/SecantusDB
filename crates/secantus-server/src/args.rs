@@ -330,15 +330,10 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 set_option(&mut cmd_line, &["config"], v.clone().into());
                 config_path = Some(PathBuf::from(v));
             }
-            // `--bind_ip` is mongod's spelling. This server binds one
-            // address, so a list mongod would take is refused by name.
+            // `--bind_ip` is mongod's spelling; a list binds each of its
+            // addresses (`bind_listeners`).
             "--host" | "--bind_ip" => {
                 let v = take_value(flag)?;
-                if flag == "--bind_ip" && v.contains(',') {
-                    return Err(format!(
-                        "--bind_ip takes one address here (secantusd-mdb binds one), got {v:?}"
-                    ));
-                }
                 set_option(&mut cmd_line, &["net", "bindIp"], v.clone().into());
                 o.host = Some(v);
             }
@@ -525,7 +520,7 @@ OPTIONS:
                                  secantusdb.toml at each). Passing this flag
                                  disables auto-discovery.
     --host HOST                  Bind address (default: 127.0.0.1); also
-                                 --bind_ip, mongod's spelling (one address)
+                                 --bind_ip, mongod's spelling (a comma list)
     --port PORT                  Bind port; 0 picks an ephemeral port and
                                  prints it on startup (default: 27017)
     --storage-path PATH          WiredTiger home directory; created if missing,
@@ -675,9 +670,8 @@ mod tests {
             pr.cmd_line,
             bson::doc! {"net": {"bindIp": "127.0.0.2"}, "storage": {"dbPath": "/d"}}
         );
-        // One address: a list mongod would bind is refused by name.
-        let err = parse(&["--bind_ip", "127.0.0.1,::1"]).unwrap_err();
-        assert!(err.contains("--bind_ip takes one address"), "{err}");
+        // A list is taken whole, as mongod takes it; `bind` binds each.
+        assert_eq!(run(&["--bind_ip", "127.0.0.1,::1"]).host, "127.0.0.1,::1");
         assert!(parse(&["--dbpath"])
             .unwrap_err()
             .contains("--dbpath requires a value"));

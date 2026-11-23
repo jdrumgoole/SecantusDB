@@ -400,9 +400,8 @@ pub fn bind(
             }
         }
     }
-    let listener = TcpListener::bind(addr)?;
-    let address = listener.local_addr()?;
-    listener.set_nonblocking(true)?;
+    let (listeners, skipped) = bind_listeners(addr)?;
+    let address = listeners[0].local_addr()?;
     // How long each step of the start took, for `mongod startup complete`.
     let opening = storage.opening();
     // mongod opens its spill engine as it creates the storage engine.
@@ -528,6 +527,27 @@ pub fn bind(
         conns: conns.clone(),
     });
     let logs = Arc::new(LogBuffer::new());
+    for host in &skipped {
+        logs.log(
+            LogEntry::new(
+                "W",
+                "NETWORK",
+                23021,
+                "initandlisten",
+                "Found no addresses for peer",
+            )
+            .attr(doc! {"peer": {
+                "code": 7,
+                "codeName": "HostNotFound",
+                "errmsg": format!(
+                    "Could not find address for [{}]:{}: SocketException: resolve :: \
+                     caused by :: Host not found (authoritative)",
+                    host.trim_matches(['[', ']']),
+                    address.port()
+                ),
+            }}),
+        );
+    }
     // mongod's first lines (measured 8.2.11, 2026-10-24): what it is starting
     // on, and the port it then waits on.
     let mut starting = doc! {
@@ -611,7 +631,7 @@ pub fn bind(
 
     let step = Instant::now();
     let accept_shared = shared.clone();
-    let accept = thread::spawn(move || accept_loop(listener, accept_shared));
+    let accept = thread::spawn(move || accept_loop(listeners, accept_shared));
     times.start_up_transport_layer = step.elapsed();
     // mongod ends its start with a summary of each step's time (RM-305).
     times.total = start_of_start.elapsed();
@@ -661,7 +681,49 @@ fn ftdc_loop(shared: Arc<Shared>) {
     shared.ftdc.close();
 }
 
-fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
+/// Bind every address of `addr`, `host[,host...]:port`, as mongod binds
+/// each address of a `--bind_ip` list. The first binds `port` (an
+/// ephemeral one under 0) and the rest the port it got. Without `--ipv6`,
+/// which this server does not take, mongod resolves only IPv4 addresses:
+/// an IPv6 address in a list of more than one is passed over, and its
+/// "Found no addresses for peer" warning is returned to be logged
+/// (mongod 8.2.11 with `--bind_ip 127.0.0.1,::1`, measured 2026-11-20).
+/// A lone address is bound whatever its family, as before.
+fn bind_listeners(addr: &str) -> io::Result<(Vec<TcpListener>, Vec<String>)> {
+    let Some((hosts, port)) = addr.rsplit_once(':').filter(|(h, _)| h.contains(',')) else {
+        let listener = TcpListener::bind(addr)?;
+        listener.set_nonblocking(true)?;
+        return Ok((vec![listener], Vec::new()));
+    };
+    let mut listeners: Vec<TcpListener> = Vec::new();
+    let mut skipped = Vec::new();
+    for host in hosts.split(',').map(str::trim).filter(|h| !h.is_empty()) {
+        if host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok()
+        {
+            skipped.push(host.to_string());
+            continue;
+        }
+        let port = match listeners.first() {
+            Some(l) => l.local_addr()?.port().to_string(),
+            None => port.to_string(),
+        };
+        let listener = TcpListener::bind(format!("{host}:{port}"))?;
+        listener.set_nonblocking(true)?;
+        listeners.push(listener);
+    }
+    if listeners.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("no IPv4 address to bind in {hosts:?}"),
+        ));
+    }
+    Ok((listeners, skipped))
+}
+
+fn accept_loop(listeners: Vec<TcpListener>, shared: Arc<Shared>) {
     let mut reaped = std::time::Instant::now();
     let mut sessions_refreshed = std::time::Instant::now();
     while !shared.stop.load(Ordering::SeqCst) {
@@ -693,50 +755,57 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                 );
             }
         }
-        match listener.accept() {
-            Ok((stream, peer)) => {
-                // Disable Nagle: reply paths write small frames back-to-back
-                // and with Nagle on the second write waits for the peer's
-                // delayed ACK — ~40ms per round trip on Linux CI, invisible
-                // on macOS loopback. The Python servers' identical fix took
-                // pgjdbc's generated-keys batch tests from 41.5s to 0.2s
-                // each; mongod and PostgreSQL both set TCP_NODELAY
-                // unconditionally. Best-effort: a failed setsockopt on an
-                // already-dying socket must not kill the accept loop.
-                let _ = stream.set_nodelay(true);
-                let conn_shared = shared.clone();
-                // Counter Arc is independent of `Shared`, so the guard can outlive
-                // `conn_shared`'s drop (which releases this thread's storage ref).
-                let active = shared.active.clone();
-                // Detached: the thread exits on EOF or when the stop flag is set
-                // (its blocking reads use READ_POLL timeouts). `stop` waits on the
-                // count, not a JoinHandle.
-                thread::spawn(move || {
-                    let guard = ConnGuard::new(active);
-                    // mongod's connection-establishment rate limiter: a
-                    // connection over the rate waits its turn or is closed
-                    // unanswered (`ServerParams::admit_connection`); one
-                    // whose client goes while it waits is let go.
-                    if !conn_shared
-                        .server_params
-                        .admit_connection(Some(peer.ip()), &mut || client_disconnected(&stream))
-                    {
-                        refuse_unanswered(stream);
-                        drop(conn_shared);
+        // Every listener is polled in turn; the loop sleeps only when none
+        // had a connection waiting.
+        let mut idle = true;
+        for listener in &listeners {
+            match listener.accept() {
+                Ok((stream, peer)) => {
+                    idle = false;
+                    // Disable Nagle: reply paths write small frames back-to-back
+                    // and with Nagle on the second write waits for the peer's
+                    // delayed ACK — ~40ms per round trip on Linux CI, invisible
+                    // on macOS loopback. The Python servers' identical fix took
+                    // pgjdbc's generated-keys batch tests from 41.5s to 0.2s
+                    // each; mongod and PostgreSQL both set TCP_NODELAY
+                    // unconditionally. Best-effort: a failed setsockopt on an
+                    // already-dying socket must not kill the accept loop.
+                    let _ = stream.set_nodelay(true);
+                    let conn_shared = shared.clone();
+                    // Counter Arc is independent of `Shared`, so the guard can outlive
+                    // `conn_shared`'s drop (which releases this thread's storage ref).
+                    let active = shared.active.clone();
+                    // Detached: the thread exits on EOF or when the stop flag is set
+                    // (its blocking reads use READ_POLL timeouts). `stop` waits on the
+                    // count, not a JoinHandle.
+                    thread::spawn(move || {
+                        let guard = ConnGuard::new(active);
+                        // mongod's connection-establishment rate limiter: a
+                        // connection over the rate waits its turn or is closed
+                        // unanswered (`ServerParams::admit_connection`); one
+                        // whose client goes while it waits is let go.
+                        if !conn_shared
+                            .server_params
+                            .admit_connection(Some(peer.ip()), &mut || client_disconnected(&stream))
+                        {
+                            refuse_unanswered(stream);
+                            drop(conn_shared);
+                            drop(guard);
+                            return;
+                        }
+                        let _ = handle_connection(stream, conn_shared);
+                        // `conn_shared` (and every per-request storage clone) is now
+                        // dropped; only then decrement, so a zero count guarantees no
+                        // connection thread still references storage.
                         drop(guard);
-                        return;
-                    }
-                    let _ = handle_connection(stream, conn_shared);
-                    // `conn_shared` (and every per-request storage clone) is now
-                    // dropped; only then decrement, so a zero count guarantees no
-                    // connection thread still references storage.
-                    drop(guard);
-                });
+                    });
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => return,
             }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(ACCEPT_POLL);
-            }
-            Err(_) => break,
+        }
+        if idle {
+            thread::sleep(ACCEPT_POLL);
         }
     }
 }

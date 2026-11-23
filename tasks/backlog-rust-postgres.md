@@ -2453,7 +2453,10 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
       2026-11-10 (RP-831's `--fast` gate, again the run after a rebase):
       `4.21637575s`, with the load average at 15-17 and a second lane's
       gate running; the test alone then passed six times running at load
-      8-10.
+      8-10. A third time on 2026-11-23, through the Python handle
+      (`tests/test_pgserver_embedded.py::test_stop_does_not_wait_on_an_open_connection`,
+      `stop() waited 3.4s`, in RM-729's `gate_rm.py` storage-engine step
+      at load 8.6-9.6); alone it then passed three times at load ~14.
       Backlog-ID: RP-690
       Verify: none -- seen once, under load; a timing that does not fail on demand
 
