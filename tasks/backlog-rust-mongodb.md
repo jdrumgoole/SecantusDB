@@ -1166,15 +1166,14 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       document. Found 2026-11-13 (RM-522).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_graph_lookup_and_a_fill_keep_the_sort_key
       Backlog-ID: RM-632
-- [ ] **A `$project` of `{$meta: "sortKey"}` with no `$sort` is refused as
-      unsupported.** mongod 8.2.11 refuses `{$project: {t: {$type: {$meta:
-      "sortKey"}}}}` with code 2 "Failed to determine whether query system
-      can provide a DISTINCT_SCAN grouping :: caused by :: cannot use
-      sortKey $meta projection without a sort"; this server's code 2 says
+- [ ] **A `{$meta: "sortKey"}` with no `$sort` is refused where the query
+      layer does not take it.** mongod 8.2.11 gives `[]` in a `$project`
+      behind a `$limit` or another `$project`, and in a `$replaceWith`, as
+      it does in `$addFields`; this server refuses each with code 2
       "aggregation pipeline uses a stage or operator not supported by the
-      Rust server". Found 2026-11-13 (RM-524).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm524.py::test_a_sort_key_projection_without_a_sort
-      Backlog-ID: RM-634
+      Rust server". Found 2026-11-23 (RM-634).
+      Verify: tests/backlog/test_rm_found_rm634.py::test_an_unpushed_sort_key_read_with_no_sort_is_empty
+      Backlog-ID: RM-766
 - [ ] **A `{$meta: "sortKey"}` in a window's output reads no key.** Behind
       a `$sort`, mongod 8.2.11 gives each document's key to a `$push: {$meta:
       "sortKey"}` in a `$setWindowFields` or `$_internalSetWindowFields`;
