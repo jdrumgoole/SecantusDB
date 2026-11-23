@@ -10,14 +10,12 @@
 //!
 //! ## Stored user record
 //!
-//! Identical shape to the Python server's, so both servers read the same
-//! `secantus_users` table:
+//! mongod's own `admin.system.users` document (RM-744), where it is kept:
 //!
 //! ```text
 //! { _id: "<db>.<user>", user, db,
 //!   credentials: { "SCRAM-SHA-256": { iterationCount, salt, storedKey, serverKey } },
-//!   roles: [{ role, db }, ...],
-//!   mechanisms: ["SCRAM-SHA-256"] }
+//!   roles: [{ role, db }, ...] }
 //! ```
 //!
 //! `--auth` gating + RBAC privilege checks run in the dispatcher (see
@@ -699,10 +697,10 @@ fn new_user_id() -> Bson {
     })
 }
 
-/// Put `mechanisms` at the end of a record, from its credentials.
-fn restamp_mechanisms(record: &mut Document) {
+/// Drop a stored `mechanisms` field: mongod's `system.users` document has
+/// none (RM-744); `usersInfo` computes it from the credentials.
+fn strip_mechanisms(record: &mut Document) {
     record.remove("mechanisms");
-    record.insert("mechanisms", umc::mechanisms_of(record));
 }
 
 const CREATE_USER_FIELDS: &[(&str, Field, bool)] = &[
@@ -789,7 +787,7 @@ pub fn create_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         "roles",
         roles.iter().map(umc::role_name_doc).collect::<Vec<_>>(),
     );
-    restamp_mechanisms(&mut record);
+    strip_mechanisms(&mut record);
     let mut record_bytes = Vec::new();
     crate::bsondoc::write(&record, &mut record_bytes)
         .map_err(|e| CommandError::new(1, "InternalError", format!("encode user record: {e}")))?;
@@ -994,7 +992,7 @@ pub fn update_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             record.insert("authenticationRestrictions", r);
         }
     }
-    restamp_mechanisms(&mut record);
+    strip_mechanisms(&mut record);
     save_user_record(ctx, &db_name, &username, &record)?;
     if roles.is_some() {
         refresh_effective_roles(ctx);

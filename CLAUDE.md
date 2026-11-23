@@ -43,7 +43,7 @@ carries the Rust servers instead).
 **Reach for Rust.** The marketing site already leads with the two Rust servers;
 do not "restore" a Python-first framing in docs or on the site.
 
-**One on-disk format: mongod 8.2's own** (store format 11, from
+**One on-disk format: mongod 8.2's own** (store format 12, from
 `tasks/mongod-storage-model-plan.md`): `_mdb_catalog`, a WiredTiger table per
 collection and per index (`collection-<UUID>`, `index-<UUID>`, KeyString
 keys), `local.oplog.rs`, `sizeStorer`, `journal/` and `storage.bson`, with

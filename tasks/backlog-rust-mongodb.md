@@ -2914,13 +2914,6 @@ produce the dump it exists for.
 Each was measured by starting mongod 8.2.11 on a store `secantusd-mdb`
 wrote and stopped (the forward direction of RM-723).
 
-- [ ] **Users and roles are not in `admin.system.users` and
-      `admin.system.roles`.** This server keeps them in tables of its own
-      (`secantus_users`, `secantus_roles`, `secantus_role_seq`); mongod
-      opening our store finds neither, so a user made here cannot
-      authenticate there (and, in the reverse, mongod's would not be read).
-      Backlog-ID: RM-744
-      Verify: tests/backlog/test_rm_storage_model.py::test_mongod_finds_the_users_and_roles_secantus_made
 - [ ] **A view's DDL is logged as commands, not as mongod logs it.** mongod
       8.2.11 logs creating a view as an insert into `<db>.system.views` (the
       first one preceded by `create: "system.views"`), a `collMod` of it as

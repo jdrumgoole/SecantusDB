@@ -11,9 +11,7 @@
 //! as given), because `usersInfo` lists the record's fields in stored order
 //! and a field `updateUser` adds goes LAST, after `roles`. `mechanisms` is
 //! not a field of mongod's record at all -- it is the credential names,
-//! computed on the way out -- but this server has always stored it after
-//! the rest, and keeps doing so for the other servers that read the table;
-//! it is dropped and recomputed on output. A role record holds its
+//! computed on the way out -- and is not stored (RM-744). A role record holds its
 //! `authenticationRestrictions` as given; `rolesInfo` wraps them once more,
 //! as mongod does.
 

@@ -29,7 +29,7 @@ use crate::{Result, StorageError};
 /// The layout version this build writes and reads. Every change to the
 /// on-disk layout moves it on (each phase of the storage-model plan does),
 /// and a store at any other version is refused.
-pub const STORE_FORMAT_VERSION: u32 = 11;
+pub const STORE_FORMAT_VERSION: u32 = 12;
 
 /// The file holding [`STORE_FORMAT_VERSION`] in a SecantusDB-written store.
 pub const FORMAT_FILE: &str = "secantus.format";
@@ -320,7 +320,7 @@ pub fn mongod_store_findings(home: &Path) -> std::result::Result<Vec<String>, St
 /// this server does not key as mongod does, an index of another version
 /// than 2 or one whose build has not finished, a collection or index option
 /// it does not keep, a time-series collection (RM-754), a feature
-/// compatibility version other than 8.2, users and roles (RM-744). Checked
+/// compatibility version other than 8.2. Checked
 /// whenever another server (mongod) wrote the store, before this server
 /// writes to it.
 pub(crate) fn catalog_findings(session: &secantus_wt::Session) -> Result<Vec<String>> {
@@ -435,14 +435,6 @@ pub(crate) fn catalog_findings(session: &secantus_wt::Session) -> Result<Vec<Str
             out.push(format!(
                 "a featureCompatibilityVersion of {:?} (this server serves 8.2)",
                 v.get_str("version").unwrap_or("")
-            ));
-        }
-    }
-    for ns in ["admin.system.users", "admin.system.roles"] {
-        let n = docs(ns)?.len();
-        if n > 0 {
-            out.push(format!(
-                "{n} documents of {ns}, which this server does not read (RM-744)"
             ));
         }
     }
@@ -582,7 +574,10 @@ mod tests {
     }
 
     #[test]
-    fn the_previous_layouts_are_refused_and_this_one_is_format_11() {
+    fn the_previous_layouts_are_refused_and_this_one_is_format_12() {
+        // Format 11 kept users and roles in `secantus_users` /
+        // `secantus_roles`; format 12 keeps them in `admin.system.users` /
+        // `admin.system.roles`, as mongod does (RM-744).
         // Format 10 keyed a `2d` index by a cell of its own (BinData subtype
         // 0, y first), a `2dsphere` index by a covering of every ancestor of
         // each cell (BinData) and a wildcard index by one null entry per
@@ -602,15 +597,15 @@ mod tests {
         // bytes and the clean-close marker in this server's own table.
         // Format 6 held a document in its table as `[id_key length][id_key]
         // [BSON]`; format 7 stores the document alone, as mongod does.
-        assert_eq!(STORE_FORMAT_VERSION, 11);
-        for old in ["4", "5", "6", "7", "8", "9", "10"] {
+        assert_eq!(STORE_FORMAT_VERSION, 12);
+        for old in ["4", "5", "6", "7", "8", "9", "10", "11"] {
             let dir = tempfile::tempdir().unwrap();
             fs::write(dir.path().join("WiredTiger.wt"), b"").unwrap();
             fs::write(dir.path().join(STORAGE_BSON), mongod_storage_bson()).unwrap();
             fs::write(dir.path().join(FORMAT_FILE), format!("{old}\n")).unwrap();
             let err = prepare(dir.path()).unwrap_err().to_string();
             assert!(err.contains(&format!("store format {old}")), "{err}");
-            assert!(err.contains("format 11 only"), "{err}");
+            assert!(err.contains("format 12 only"), "{err}");
         }
     }
 }

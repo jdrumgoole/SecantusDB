@@ -892,12 +892,13 @@ def test_mongod_validates_each_kind_of_wildcard_index_secantus_wrote(tmp_path: P
     }
 
 
-@pytest.mark.backlog("RM-744")
+@pytest.mark.backlog_fixed("RM-744")
 def test_mongod_finds_the_users_and_roles_secantus_made(tmp_path: Path) -> None:
     """mongod 8.2.11 keeps users and roles as documents of
     `admin.system.users` and `admin.system.roles` (phase 0b). This server
-    keeps them in tables of its own (`secantus_users`, `secantus_roles`), so
-    mongod on its store has neither the user nor the role."""
+    kept them in tables of its own (`secantus_users`, `secantus_roles`), so
+    mongod on its store had neither the user nor the role; it now keeps
+    them where mongod does."""
 
     def setup(c: pymongo.MongoClient) -> None:
         c.app.command(
@@ -1054,16 +1055,16 @@ def _servable_scenario(rs: pymongo.MongoClient) -> None:
     """Phase 0b's scenario on mongod (every collection and index kind,
     capped, clustered, collated, pre-images, a view, a drop, a rename, a
     transaction), less what this server refuses by name in a store: the index
-    kinds it keys otherwise (RM-741 to RM-743, text), the
-    time-series collection (RM-754) and the user and role (RM-744)."""
+    kinds it keys otherwise (RM-741 to RM-743, text) and the
+    time-series collection (RM-754). Its user and role stay: this server
+    keeps them in `admin.system.users` / `system.roles`, as mongod does
+    (RM-744)."""
     from tools.probes.mongod_store_layout import run_scenario
 
     run_scenario(rs, strict=True)
     for name in _MONGOD_ONLY_KINDS:
         rs.app.kinds.drop_index(name)
     rs.app.ts.drop()
-    rs.app.command("dropUser", "u1")
-    rs.app.command("dropRole", "r1")
 
 
 def _comparable(contents: dict) -> dict:
