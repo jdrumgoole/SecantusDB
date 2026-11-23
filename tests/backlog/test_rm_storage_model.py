@@ -646,7 +646,7 @@ def test_mongod_validates_a_2dsphere_index_secantus_wrote(tmp_path: Path) -> Non
         assert _validation(mongod, "app", "k") == (True, [], [])
 
 
-@pytest.mark.backlog("RM-743")
+@pytest.mark.backlog_fixed("RM-743")
 def test_mongod_validates_a_wildcard_index_secantus_wrote(tmp_path: Path) -> None:
     """mongod 8.2.11 keys a wildcard index by `($_path, value)` for each leaf
     path under it (phase 0b: `{w: {x: 1, y: {z: 2}}}` gives `w.x`/1 and
@@ -878,6 +878,17 @@ def test_mongod_validates_each_kind_of_2dsphere_index_secantus_wrote(tmp_path: P
     paths, mongod 8.2.11 makes."""
     cases = {n: c for n, c in _GEO_CASES.items() if n.startswith("sphere_")}
     assert _validate_cases(tmp_path, cases) == {name: (True, [], []) for name in cases}
+
+
+@pytest.mark.backlog_fixed("RM-743")
+def test_mongod_validates_each_kind_of_wildcard_index_secantus_wrote(tmp_path: Path) -> None:
+    """RM-743: wildcard indexes of every shape this server writes (a path,
+    descending, arrays and nested arrays, empty objects and arrays, a
+    collation, an inclusion or exclusion projection, compound, partial) hold
+    the keys and the multikey metadata keys mongod 8.2.11 makes."""
+    assert _validate_cases(tmp_path, _WILDCARD_CASES) == {
+        name: (True, [], []) for name in _WILDCARD_CASES
+    }
 
 
 @pytest.mark.backlog("RM-744")
