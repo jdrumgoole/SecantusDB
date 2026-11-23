@@ -3902,6 +3902,7 @@ pub(crate) fn unsupported_index_type(
         return match options.get("2dsphereIndexVersion") {
             None | Some(Bson::Int32(3)) | Some(Bson::Int64(3)) => None,
             Some(Bson::Double(v)) if *v == 3.0 => None,
+            Some(Bson::Decimal128(d)) if d.to_string().parse::<f64>() == Ok(3.0) => None,
             Some(v) => Some(StorageError::CreateIndexUnsupported(format!(
                 "2dsphere indexes of version {v} are not supported by the Rust storage engine \
                  yet; version 3 is"
