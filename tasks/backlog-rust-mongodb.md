@@ -1147,12 +1147,25 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-18 (RM-625).
       Verify: none -- intermittent, about 1 run in 30; no deterministic gap test until the cause is known
       Backlog-ID: RM-721
-- [ ] **The sort key is lost at a `$graphLookup` or a `$fill`.** mongod
-      8.2.11 keeps it through both, as it does through the stages RM-520
-      names; this server ends it at each, so a rank behind ties every
-      document. Found 2026-11-13 (RM-522).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_graph_lookup_and_a_fill_keep_the_sort_key
-      Backlog-ID: RM-632
+- [ ] **RM-434's distinct-scan work counters differed once under load.**
+      `tests/backlog/test_rm_found_2026_11_08_rm310.py::test_a_distinct_scan_run_reports_its_work_counters`
+      (RM-434's regression test) failed in one RM-632 gate run on
+      2026-11-23 (load ~10 on 12 cores) and passed in 12 reruns, serial and
+      `-n 6`: a `distinct` stage's counters differed (the assertion output
+      was truncated, so which counter and which side is not known). A
+      candidate: mongod's time-based yields moving `saveState` /
+      `restoreState`, or this server modelling them by count. Found
+      2026-11-23 (RM-632).
+      Verify: none -- intermittent, once in 13 runs; no deterministic gap test until the differing counter is known
+      Backlog-ID: RM-768
+- [ ] **A `$fill` with a `sortBy` passes ties on in a different order.**
+      Among documents with equal `sortBy` keys, mongod 8.2.11 passes them
+      on in an order this server does not reproduce (behind `{$sort: {k:
+      1}}`, `{$fill: {sortBy: {n: 1}, ...}}` gives `_id` 1, 3, 0, 2, 4, 5
+      with values only, where this server gives 1, 3, 2, 0, 5, 4); by a
+      `method` too. Found 2026-11-23 (RM-632).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_fill_passes_ties_on_in_mongods_order
+      Backlog-ID: RM-767
 - [ ] **A `{$meta: "sortKey"}` with no `$sort` is refused where the query
       layer does not take it.** mongod 8.2.11 gives `[]` in a `$project`
       behind a `$limit` or another `$project`, and in a `$replaceWith`, as
