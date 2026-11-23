@@ -94,7 +94,7 @@ impl PgHandler {
                     Self::ROLE_SETTINGS_COLLECTION,
                     &filter,
                     0,
-                    &Document::new(),
+                    &secantus_core::vars::Vars::new(),
                     None,
                 )
                 .map_err(err)?;
@@ -163,7 +163,7 @@ impl PgHandler {
                 Self::ROLE_SETTINGS_COLLECTION,
                 &filter,
                 0,
-                &Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
             )
             .map_err(err)?;
@@ -224,7 +224,7 @@ impl PgHandler {
                 Self::DB_SETTINGS_COLLECTION,
                 &filter,
                 0,
-                &Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
             )
             .map_err(|e| Self::storage_err("could not change the database setting", e))?;

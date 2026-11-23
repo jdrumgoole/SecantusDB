@@ -530,7 +530,7 @@ impl crate::PgHandler {
                 .count_matching(self.db(), table, &keyed, None)
                 .unwrap_or(0);
         };
-        let empty = Document::new();
+        let empty = secantus_core::vars::Vars::new();
         self.table_docs(table)
             .unwrap_or_default()
             .iter()

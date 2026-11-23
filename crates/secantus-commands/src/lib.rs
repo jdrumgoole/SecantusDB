@@ -33,6 +33,7 @@
 
 /// The literal BSON decoder, for the crates that depend on this one.
 pub use secantus_core::bsondoc;
+pub use secantus_core::vars;
 
 pub mod admin;
 pub mod admission;

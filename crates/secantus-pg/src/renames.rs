@@ -349,7 +349,7 @@ impl PgHandler {
                 SEQUENCE_COLLECTION,
                 &bson::doc! {"_id": name},
                 0,
-                &Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
             )
             .map_err(|e| Self::storage_err("could not rename the sequence", e))?;

@@ -1286,7 +1286,12 @@ pub fn users_info(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Some(filter) = filter {
         let mut kept = Vec::with_capacity(users.len());
         for user in users {
-            match secantus_core::query::matches(&user, filter, &Document::new(), None) {
+            match secantus_core::query::matches(
+                &user,
+                filter,
+                &secantus_core::vars::Vars::new(),
+                None,
+            ) {
                 Ok(true) => kept.push(user),
                 Ok(false) => {}
                 Err(secantus_core::fallback::Fallback::Mongo { code, message, .. }) => {

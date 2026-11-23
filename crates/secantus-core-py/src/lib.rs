@@ -119,7 +119,8 @@ fn query_matches(
         .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
     let query: Document = secantus_core::bsondoc::from_bytes(query_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid query BSON: {e}")))?;
-    let vars: Document = secantus_core::bsondoc::from_bytes(vars_bytes)
+    let vars: secantus_core::vars::Vars = secantus_core::bsondoc::from_bytes(vars_bytes)
+        .map(secantus_core::vars::Vars::from)
         .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
     let coll = parse_collation(collation_bytes)?;
     // Ok(b) -> Some(b) (a real result); Err(Fallback) -> None (defer to Python).
@@ -143,7 +144,8 @@ fn query_matches_raw(
 ) -> PyResult<Option<bool>> {
     let query: Document = secantus_core::bsondoc::from_bytes(query_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid query BSON: {e}")))?;
-    let vars: Document = secantus_core::bsondoc::from_bytes(vars_bytes)
+    let vars: secantus_core::vars::Vars = secantus_core::bsondoc::from_bytes(vars_bytes)
+        .map(secantus_core::vars::Vars::from)
         .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
     let coll = parse_collation(collation_bytes)?;
     let raw = bson::RawDocument::from_bytes(doc_bytes)
@@ -171,7 +173,8 @@ fn query_matches_batch(
         .map_err(|e| PyValueError::new_err(format!("invalid docs BSON: {e}")))?;
     let query: Document = secantus_core::bsondoc::from_bytes(query_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid query BSON: {e}")))?;
-    let vars: Document = secantus_core::bsondoc::from_bytes(vars_bytes)
+    let vars: secantus_core::vars::Vars = secantus_core::bsondoc::from_bytes(vars_bytes)
+        .map(secantus_core::vars::Vars::from)
         .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
     let coll = parse_collation(collation_bytes)?;
     let Some(Bson::Array(arr)) = docs_wrap.get("d") else {
@@ -216,7 +219,8 @@ fn evaluate(
         .map_err(|e| PyValueError::new_err(format!("invalid doc BSON: {e}")))?;
     let expr_wrap: Document = secantus_core::bsondoc::from_bytes(expr_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid expr BSON: {e}")))?;
-    let vars: Document = secantus_core::bsondoc::from_bytes(vars_bytes)
+    let vars: secantus_core::vars::Vars = secantus_core::bsondoc::from_bytes(vars_bytes)
+        .map(secantus_core::vars::Vars::from)
         .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
     let expr = expr_wrap
         .get("e")
@@ -552,7 +556,8 @@ fn apply_pipeline(
         .map_err(|e| PyValueError::new_err(format!("invalid docs BSON: {e}")))?;
     let pipe_wrap: Document = secantus_core::bsondoc::from_bytes(pipeline_bytes)
         .map_err(|e| PyValueError::new_err(format!("invalid pipeline BSON: {e}")))?;
-    let vars: Document = secantus_core::bsondoc::from_bytes(vars_bytes)
+    let vars: secantus_core::vars::Vars = secantus_core::bsondoc::from_bytes(vars_bytes)
+        .map(secantus_core::vars::Vars::from)
         .map_err(|e| PyValueError::new_err(format!("invalid vars BSON: {e}")))?;
     let coll = parse_collation(collation_bytes)?;
 

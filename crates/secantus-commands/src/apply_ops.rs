@@ -485,8 +485,13 @@ fn apply_entry(
             if let (Some(diff), true) = (diff, exists_doc) {
                 if let Some(v) = &validator {
                     let _opaque = secantus_core::deadline::opaque();
-                    if !secantus_core::query::matches(&post, v, &Document::new(), None)
-                        .unwrap_or(true)
+                    if !secantus_core::query::matches(
+                        &post,
+                        v,
+                        &secantus_core::vars::Vars::new(),
+                        None,
+                    )
+                    .unwrap_or(true)
                     {
                         return Ok(Outcome::NotApplied);
                     }
@@ -580,7 +585,9 @@ fn write_document(
     if let Some(v) = validator {
         // A validator no interrupt reaches (RM-313).
         let _opaque = secantus_core::deadline::opaque();
-        if !secantus_core::query::matches(&doc, v, &Document::new(), None).unwrap_or(true) {
+        if !secantus_core::query::matches(&doc, v, &secantus_core::vars::Vars::new(), None)
+            .unwrap_or(true)
+        {
             return Ok(Outcome::NotApplied);
         }
     }

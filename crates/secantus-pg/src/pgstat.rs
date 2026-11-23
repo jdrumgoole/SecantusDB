@@ -72,7 +72,7 @@ pub(crate) fn restore_store(
             STATS_COLLECTION,
             &Document::new(),
             0,
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
         )
         .map_err(|e| e.to_string())?;
@@ -104,7 +104,7 @@ pub(crate) fn save_store(
             STATS_COLLECTION,
             &Document::new(),
             0,
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
         )
         .map_err(|e| e.to_string())?;

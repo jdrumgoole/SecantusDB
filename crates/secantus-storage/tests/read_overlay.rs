@@ -166,8 +166,16 @@ fn every_read_path_honours_the_overlay_inside_a_fresh_transaction() {
                 // The index still holds v=20 for row 2 and v=30 for row 3.
                 let f = |q: Document| {
                     decode_all(
-                        st.find_matching_with("app", "t", &q, None, None, None, &doc! {})
-                            .unwrap(),
+                        st.find_matching_with(
+                            "app",
+                            "t",
+                            &q,
+                            None,
+                            None,
+                            None,
+                            &secantus_core::vars::Vars::new(),
+                        )
+                        .unwrap(),
                     )
                 };
                 assert!(f(doc! {"v": 20}).is_empty());
@@ -182,7 +190,7 @@ fn every_read_path_honours_the_overlay_inside_a_fresh_transaction() {
                         Some(&doc! {"v": -1}),
                         None,
                         None,
-                        &doc! {},
+                        &secantus_core::vars::Vars::new(),
                     )
                     .unwrap(),
                 );

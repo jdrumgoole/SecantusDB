@@ -1104,23 +1104,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       document. Found 2026-11-13 (RM-522).
       Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_graph_lookup_and_a_fill_keep_the_sort_key
       Backlog-ID: RM-632
-- [ ] **A variable bound to MISSING cannot cross into a `$lookup`
-      sub-pipeline.** Filed 2026-11-23 on Joe's decision: replace RM-635's
-      `held_undefined` carrier with a MISSING case of the expression engine's
-      own, as mongod's EOO / SBE `Nothing`. Done inside an expression:
-      `expressions::Field` is `Missing` or `Value`, `$let` and the
-      `$map` / `$filter` / `$reduce` variables bind one (`Ctx::missing` names
-      the ones bound to MISSING), and the carrier is gone. Left: the variables
-      a stage hands its sub-pipeline are a `&Document` of values
-      (`vars: &Document` in about 150 signatures), which has no MISSING, so
-      `secantus-commands` `aggregate.rs`'s `$lookup` `let` binds an absent
-      field as null where mongod 8.2.11 binds MISSING and `$type` reads
-      "missing". The faithful fix is a variables type that holds a `Field`
-      per name, threaded where `vars: &Document` is today, not a reserved key
-      in the document. (This was RM-762's absent-field half; its
-      stored-`undefined` half, and RM-761, closed with the carrier.)
-      Verify: tests/backlog/test_rm_found_2026_11_22_rm635.py::test_a_lookup_let_variable_bound_from_an_absent_field_is_missing
-      Backlog-ID: RM-763
 - [ ] **A `$project` of `{$meta: "sortKey"}` with no `$sort` is refused as
       unsupported.** mongod 8.2.11 refuses `{$project: {t: {$type: {$meta:
       "sortKey"}}}}` with code 2 "Failed to determine whether query system
@@ -1238,17 +1221,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       have, mongod's `otherNss` order is its hash set's, and the rest is
       unmeasured: a probe must find a difference before a test can assert it
       Backlog-ID: RM-532
-- [ ] **A malformed stage spec inside a sub-pipeline is not refused as the
-      pipeline parses.** mongod 8.2.11 checks the stages of a `$facet`'s
-      and a `$lookup`'s pipelines as it parses the outer one, so over an
-      empty collection it refuses `{$facet: {a: [{$match: 5}]}}` with
-      15959, a `$lookup` in a facet whose `let` is `5` with 14, and a
-      `$lookup` in a `$lookup` pipeline with a lone `localField` with 9.
-      This server's `argtypes::stage_spec_error` reads the top level only:
-      it answers 2 to the first and runs the other two. Found 2026-11-14
-      working RM-528.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm528.py::test_stage_specs_in_a_sub_pipeline_are_checked_as_it_parses
-      Backlog-ID: RM-645
 - [ ] **A `find` sorted on `$natural` is recorded with the sort, not as a
       hint.** mongod 8.2.11's `$queryStats` key for `{find: "c", sort:
       {$natural: -1}}` has no `sort` in its shape and `hint: {$natural:
@@ -1265,14 +1237,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-532.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm532.py::test_a_hybrid_search_names_the_collection_it_unions
       Backlog-ID: RM-644
-- [ ] **A `$facet` element that is not a stage is refused without naming
-      it.** mongod 8.2.11's 40171 names the element: "elements of arrays in
-      $facet spec must be non-empty objects, b argument contained an
-      element of type int: 0: 5" (its type, its index and its value). This
-      server ends the message "... b argument contained an invalid
-      element". Found 2026-11-14 working RM-530.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_facet_element_refusal_names_the_element
-      Backlog-ID: RM-647
 - [ ] **`{$project: {}}` drops its envelope, and is "not supported" when
       nested.** mongod 8.2.11 answers 51272 "Invalid $project :: caused by
       :: projection specification must have at least one field" at the top
@@ -1282,16 +1246,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-530.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_an_empty_projection_is_an_invalid_project
       Backlog-ID: RM-650
-- [ ] **`$documents`'s parse refusals in a sub-pipeline.** mongod 8.2.11
-      refuses a `$documents` that is not its pipeline's first stage with
-      40602 ("$documents is only valid as the first stage in a pipeline")
-      under a `$unionWith` that reads a collection, and `{$documents: {}}`
-      with 51270 "Invalid $documents :: caused by :: Invalid empty
-      sub-projection: _tempDocumentsField". This server answers the first
-      73 ("'$documents' can only be run with {aggregate: 1}") and drops
-      the second's envelope. Found 2026-11-14 working RM-530.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_documents_refusals_in_a_sub_pipeline
-      Backlog-ID: RM-651
 - [ ] **A `$facet`'s 40600 comes after a later stage's parse error.**
       mongod 8.2.11 parses a pipeline a stage at a time, so a `$facet`
       holding a stage it refuses is refused before a later stage's

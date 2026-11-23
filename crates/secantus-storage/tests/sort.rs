@@ -47,7 +47,7 @@ fn ids(st: &Storage, filter: Document, sort: Option<Document>, hint: Option<Hint
         sort.as_ref(),
         hint.as_ref(),
         None,
-        &bson::Document::new(),
+        &secantus_core::vars::Vars::new(),
     )
     .unwrap()
     .iter()
@@ -306,7 +306,7 @@ fn bad_hint_errors_in_find_collscans_in_explain() {
                 None,
                 Some(&Hint::Name("nope".into())),
                 None,
-                &bson::Document::new(),
+                &secantus_core::vars::Vars::new(),
             )
             .unwrap_err();
         assert!(matches!(err, StorageError::BadHint(_)));

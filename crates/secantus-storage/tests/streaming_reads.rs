@@ -47,8 +47,15 @@ fn a_collection_scan_resumes_after_its_record_id() {
         let last = first[1].0.clone();
         // A document deleted ahead of the position is not read; one inserted
         // after it is.
-        st.delete_matching("db", "c", &doc! {"_id": 3}, 1, &Document::new(), None)
-            .unwrap();
+        st.delete_matching(
+            "db",
+            "c",
+            &doc! {"_id": 3},
+            1,
+            &secantus_core::vars::Vars::new(),
+            None,
+        )
+        .unwrap();
         insert(st, &[doc! {"_id": 9}]);
         let rest = st.records_after("db", "c", Some(last), 100, false).unwrap();
         assert_eq!(
@@ -68,8 +75,15 @@ fn a_fetch_reads_each_document_as_it_is_now() {
         insert(st, &[doc! {"_id": 1, "v": 1}, doc! {"_id": 2, "v": 1}]);
         let rows = st.records_after("db", "c", None, 10, false).unwrap();
         let rids: Vec<RecordId> = rows.iter().map(|(r, _)| r.clone()).collect();
-        st.delete_matching("db", "c", &doc! {"_id": 2}, 1, &Document::new(), None)
-            .unwrap();
+        st.delete_matching(
+            "db",
+            "c",
+            &doc! {"_id": 2},
+            1,
+            &secantus_core::vars::Vars::new(),
+            None,
+        )
+        .unwrap();
         let got = st.records_by_id("db", "c", &rids).unwrap();
         assert_eq!(got.len(), 2);
         assert_eq!(id_of(got[0].as_deref().unwrap()), 1);
@@ -155,8 +169,15 @@ fn a_backward_collection_scan_resumes_before_its_record_id() {
         );
         // A document deleted ahead of the position is not read; one inserted
         // since lands behind it, at the end of the collection.
-        st.delete_matching("db", "c", &doc! {"_id": 1}, 1, &Document::new(), None)
-            .unwrap();
+        st.delete_matching(
+            "db",
+            "c",
+            &doc! {"_id": 1},
+            1,
+            &secantus_core::vars::Vars::new(),
+            None,
+        )
+        .unwrap();
         insert(st, &[doc! {"_id": 9}]);
         let rest = st
             .records_after("db", "c", Some(first[1].0.clone()), 100, true)

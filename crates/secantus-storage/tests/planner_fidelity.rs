@@ -42,7 +42,7 @@ fn ids(st: &Storage, filter: Document, sort: Option<Document>, hint: Option<Hint
         sort.as_ref(),
         hint.as_ref(),
         None,
-        &Document::new(),
+        &secantus_core::vars::Vars::new(),
     )
     .unwrap()
     .iter()

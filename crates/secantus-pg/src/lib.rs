@@ -3411,7 +3411,7 @@ impl DatabaseRegistry {
                 Self::COLLECTION,
                 &bson::doc! {"_id": name},
                 0,
-                &Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
             )
             .map_err(|e| PgHandler::storage_err("could not record the database", e))?;
@@ -3440,7 +3440,7 @@ impl DatabaseRegistry {
                     Self::COLLECTION,
                     &bson::doc! {"_id": name},
                     0,
-                    &Document::new(),
+                    &secantus_core::vars::Vars::new(),
                     None,
                 )
                 .map_err(|e| PgHandler::storage_err("could not drop the database", e))?;
@@ -3810,7 +3810,7 @@ impl PgHandler {
                 Self::ROLE_COLLECTION,
                 &bson::doc! {"_id": name},
                 0,
-                &Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
             )
             .map_err(|e| Self::storage_err("could not drop the role", e))?;
@@ -8226,7 +8226,7 @@ impl PgHandler {
         agg: &secantus_pgplan::Aggregate,
         max_rows: usize,
     ) -> PgWireResult<Vec<(Vec<Option<Bson>>, Vec<Bson>)>> {
-        let empty = Document::new();
+        let empty = secantus_core::vars::Vars::new();
         // Large scalar `$in` / `$nin` lists hashed once for these rows.
         let in_sets = secantus_core::query::InSets::prepare(&agg.filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
@@ -11651,7 +11651,7 @@ impl PgHandler {
         if filter.is_empty() {
             return Ok(docs);
         }
-        let empty = Document::new();
+        let empty = secantus_core::vars::Vars::new();
         // Large scalar `$in` / `$nin` lists hashed once for these rows.
         let in_sets = secantus_core::query::InSets::prepare(filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
@@ -13850,7 +13850,7 @@ impl PgHandler {
         }
         let mut quals = Document::new();
         quals.insert("$and", arms);
-        let empty = Document::new();
+        let empty = secantus_core::vars::Vars::new();
         let mut ctids = Vec::new();
         for d in self.table_docs(table).ok()? {
             if secantus_core::query::matches(&d, &quals, &empty, None).ok()? {
@@ -18358,7 +18358,7 @@ impl PgHandler {
                 Self::VIEW_COLLECTION,
                 &bson::doc! { "_id": name },
                 0,
-                &Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
             )
             .map_err(|e| Self::storage_err("could not drop the view", e))?;
@@ -19506,7 +19506,7 @@ impl PgHandler {
                     Self::VIEW_COLLECTION,
                     &bson::doc! { "_id": &name },
                     0,
-                    &Document::new(),
+                    &secantus_core::vars::Vars::new(),
                     None,
                 )
                 .map_err(|e| Self::storage_err("could not replace the view", e))?;
@@ -19553,7 +19553,7 @@ impl PgHandler {
                 Self::VIEW_COLLECTION,
                 &bson::doc! { "_id": name },
                 0,
-                &Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
             )
             .map_err(|e| Self::storage_err("could not replace the view", e))?;
@@ -19690,7 +19690,14 @@ impl PgHandler {
         self.ensure_collection(collection)?;
         let filter = bson::doc! {"_id": id};
         self.storage
-            .delete_matching(self.db(), collection, &filter, 0, &Document::new(), None)
+            .delete_matching(
+                self.db(),
+                collection,
+                &filter,
+                0,
+                &secantus_core::vars::Vars::new(),
+                None,
+            )
             .map_err(|e| Self::storage_err("could not drop the catalog row", e))?;
         self.note_uncommitted_type(collection, id, None);
         Ok(())
@@ -20306,7 +20313,7 @@ impl PgHandler {
                 collection,
                 &bson::doc! {"_id": id},
                 0,
-                &Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
             )
             .map_err(|e| Self::storage_err("could not record the comment", e))?;
@@ -21415,7 +21422,7 @@ impl PgHandler {
                         Self::ROLE_MEMBER_COLLECTION,
                         &bson::doc! {"_id": id},
                         0,
-                        &Document::new(),
+                        &secantus_core::vars::Vars::new(),
                         None,
                     )
                     .map_err(err)?;
@@ -22289,7 +22296,14 @@ impl PgHandler {
             )));
         };
         self.storage
-            .delete_matching(self.db(), name, &Document::new(), 0, &Document::new(), None)
+            .delete_matching(
+                self.db(),
+                name,
+                &Document::new(),
+                0,
+                &secantus_core::vars::Vars::new(),
+                None,
+            )
             .map_err(|e| Self::storage_err("could not refresh the materialized view", e))?;
         if with_data {
             let host = PlHost { h: self };
@@ -23230,7 +23244,7 @@ impl PgHandler {
                     coll,
                     &bson::doc! {"_id": "next"},
                     0,
-                    &Document::new(),
+                    &secantus_core::vars::Vars::new(),
                     None,
                 )
                 .map_err(err)?;
@@ -32831,7 +32845,7 @@ impl PgHandler {
                     coll,
                     &bson::doc! { "_id": { "$eq": id.clone() } },
                     1,
-                    &Document::new(),
+                    &secantus_core::vars::Vars::new(),
                     None,
                 )
                 .map_err(|e| Self::storage_err("could not restore the table", e))?;
@@ -33763,7 +33777,7 @@ impl PgHandler {
                     table,
                     &Document::new(),
                     0,
-                    &Document::new(),
+                    &secantus_core::vars::Vars::new(),
                     None,
                 )
             })
@@ -34261,7 +34275,7 @@ impl PgHandler {
                 Self::COMPOSITE_COLLECTION,
                 &filter,
                 0,
-                &Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
             )
             .map_err(|e| Self::storage_err("could not update the row type", e))?;
@@ -34293,7 +34307,7 @@ impl PgHandler {
                 Self::COMPOSITE_COLLECTION,
                 &bson::doc! { "_id": old, "relation": true },
                 0,
-                &Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
             )
             .map_err(|e| Self::storage_err("could not rename the row type", e))?;
@@ -34319,7 +34333,7 @@ impl PgHandler {
                 CATALOG_COLLECTION,
                 &bson::doc! { "_id": name },
                 0,
-                &Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
             )
             .map_err(|e| Self::storage_err("could not update the catalog entry", e))?;
@@ -34632,7 +34646,7 @@ impl PgHandler {
                 false,
                 false,
                 &[],
-                &Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
                 None,
                 false,
@@ -34927,7 +34941,7 @@ impl PgHandler {
                 false,
                 false,
                 &[],
-                &Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
                 None,
                 false,
@@ -40596,7 +40610,7 @@ impl PgHandler {
                     false,
                     false,
                     &[],
-                    &Document::new(),
+                    &secantus_core::vars::Vars::new(),
                     None,
                     None,
                     false,
@@ -41121,7 +41135,7 @@ impl PgHandler {
             }
             (Some(series), _) => {
                 let column = series.column.clone();
-                let empty = Document::new();
+                let empty = secantus_core::vars::Vars::new();
                 // Large scalar `$in` / `$nin` lists hashed once for these rows.
                 let in_sets = secantus_core::query::InSets::prepare(&sel.filter);
                 let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
@@ -44044,7 +44058,7 @@ impl PgHandler {
                                 SEQUENCE_COLLECTION,
                                 &bson::doc! { "_id": seq },
                                 0,
-                                &Document::new(),
+                                &secantus_core::vars::Vars::new(),
                                 None,
                             )
                             .map_err(|e| Self::storage_err("could not reset a sequence", e))?;
@@ -46181,7 +46195,7 @@ impl PgHandler {
                             Self::ENUM_COLLECTION,
                             &filter,
                             0,
-                            &Document::new(),
+                            &secantus_core::vars::Vars::new(),
                             None,
                         )
                         .map_err(|e| Self::storage_err("could not drop the type", e))?;
@@ -46192,7 +46206,7 @@ impl PgHandler {
                             Self::COMPOSITE_COLLECTION,
                             &filter,
                             0,
-                            &Document::new(),
+                            &secantus_core::vars::Vars::new(),
                             None,
                         )
                         .map_err(|e| Self::storage_err("could not drop the type", e))?;
@@ -46203,7 +46217,7 @@ impl PgHandler {
                             Self::RANGE_COLLECTION,
                             &filter,
                             0,
-                            &Document::new(),
+                            &secantus_core::vars::Vars::new(),
                             None,
                         )
                         .map_err(|e| Self::storage_err("could not drop the type", e))?;
@@ -46598,7 +46612,7 @@ impl PgHandler {
                         SEQUENCE_COLLECTION,
                         &bson::doc! { "_id": &name },
                         0,
-                        &Document::new(),
+                        &secantus_core::vars::Vars::new(),
                         None,
                     )
                     .map_err(|e| Self::storage_err("could not alter the sequence", e))?;
@@ -46640,7 +46654,7 @@ impl PgHandler {
                             SEQUENCE_COLLECTION,
                             &bson::doc! { "_id": name },
                             0,
-                            &Document::new(),
+                            &secantus_core::vars::Vars::new(),
                             None,
                         )
                         .map_err(|e| Self::storage_err("could not drop the sequence", e))?;
@@ -48650,7 +48664,7 @@ impl PgHandler {
                                 SEQUENCE_COLLECTION,
                                 &bson::doc! { "_id": seq },
                                 0,
-                                &Document::new(),
+                                &secantus_core::vars::Vars::new(),
                                 None,
                             )
                             .map_err(|e| Self::storage_err("could not drop a sequence", e))?;
@@ -48670,7 +48684,7 @@ impl PgHandler {
                             CATALOG_COLLECTION,
                             &bson::doc! { "_id": table },
                             0,
-                            &Document::new(),
+                            &secantus_core::vars::Vars::new(),
                             None,
                         )
                         .map_err(|e| Self::storage_err("could not drop the catalog entry", e))?;
@@ -48684,7 +48698,7 @@ impl PgHandler {
                             Self::COMPOSITE_COLLECTION,
                             &bson::doc! { "_id": table, "relation": true },
                             0,
-                            &Document::new(),
+                            &secantus_core::vars::Vars::new(),
                             None,
                         )
                         .map_err(|e| Self::storage_err("could not drop the row type", e))?;
@@ -51195,7 +51209,7 @@ impl PgHandler {
                                 &del.table,
                                 &bson::doc! {"_id": {"$eq": row_id(row)}},
                                 1,
-                                &Document::new(),
+                                &secantus_core::vars::Vars::new(),
                                 None,
                             )
                             .map_err(|e| Self::storage_err("could not delete", e))?;
@@ -51247,7 +51261,7 @@ impl PgHandler {
                         &del.table,
                         &del.filter,
                         0,
-                        &Document::new(),
+                        &secantus_core::vars::Vars::new(),
                         None,
                     )
                     .map_err(|e| Self::storage_err("could not delete", e))?;
@@ -51307,7 +51321,7 @@ impl PgHandler {
                             table,
                             &Document::new(),
                             0,
-                            &Document::new(),
+                            &secantus_core::vars::Vars::new(),
                             None,
                         )
                     })
@@ -51418,7 +51432,7 @@ impl PgHandler {
                         false,
                         false,
                         &[],
-                        &Document::new(),
+                        &secantus_core::vars::Vars::new(),
                         None,
                         None,
                         false,
@@ -51529,7 +51543,7 @@ impl PgHandler {
                     false,
                     false,
                     &[],
-                    &Document::new(),
+                    &secantus_core::vars::Vars::new(),
                     None,
                     None,
                     false,
@@ -51582,7 +51596,7 @@ impl PgHandler {
                 &[Bson::Document(bson::doc! { "$replaceWith": expr })],
                 true,
                 false,
-                &Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
                 None,
                 false,
@@ -51605,7 +51619,7 @@ impl PgHandler {
                 true,  // multi: SQL UPDATE has no single-row default
                 false, // upsert: never; PostgreSQL UPDATE does not insert
                 &[],
-                &Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
                 None,
                 false,
@@ -51958,7 +51972,7 @@ impl PgHandler {
                     table,
                     &bson::doc! {"_id": {"$eq": row_id(old)}},
                     1,
-                    &Document::new(),
+                    &secantus_core::vars::Vars::new(),
                     None,
                 )
                 .map_err(|e| Self::storage_err("could not update", e))?;
@@ -52686,7 +52700,7 @@ impl PgHandler {
                             &child.name,
                             child_filter,
                             0,
-                            &Document::new(),
+                            &secantus_core::vars::Vars::new(),
                             None,
                         )
                         .map_err(|e| Self::storage_err("could not delete", e))?;
@@ -55112,7 +55126,7 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> PgWireResult<Bson> {
     let mut rows: Vec<Document> = match item.filter.as_ref() {
         None => rows.to_vec(),
         Some(filter) => {
-            let empty = Document::new();
+            let empty = secantus_core::vars::Vars::new();
             // Large scalar `$in` / `$nin` lists hashed once for these rows.
             let in_sets = secantus_core::query::InSets::prepare(filter);
             let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
@@ -55168,7 +55182,7 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
     let rows = match item.filter.as_ref() {
         None => rows,
         Some(filter) => {
-            let empty = Document::new();
+            let empty = secantus_core::vars::Vars::new();
             // Large scalar `$in` / `$nin` lists hashed once for these rows.
             let in_sets = secantus_core::query::InSets::prepare(filter);
             let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
@@ -59833,7 +59847,7 @@ impl CatalogRows {
         if filter.is_empty() {
             return self.iter().cloned().collect();
         }
-        let empty = Document::new();
+        let empty = secantus_core::vars::Vars::new();
         // Large scalar `$in` / `$nin` lists hashed once for these rows.
         let in_sets = secantus_core::query::InSets::prepare(filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);

@@ -603,8 +603,8 @@ fn doc_keys(
     out: &mut Vec<(Vec<u8>, Document)>,
 ) -> Result<(), CommandError> {
     if let Some(filter) = partial {
-        let hit =
-            secantus_core::query::matches(d, filter, &Document::new(), None).map_err(|_| {
+        let hit = secantus_core::query::matches(d, filter, &secantus_core::vars::Vars::new(), None)
+            .map_err(|_| {
                 error(
                     1,
                     "dbCheck could not evaluate the index's partialFilterExpression",

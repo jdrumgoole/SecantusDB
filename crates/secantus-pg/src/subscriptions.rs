@@ -588,7 +588,7 @@ impl PgHandler {
                     SUBSCRIPTION_COLLECTION,
                     &bson::doc! {"_id": &key},
                     0,
-                    &Document::new(),
+                    &secantus_core::vars::Vars::new(),
                     None,
                 )
                 .map_err(err)?;

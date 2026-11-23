@@ -531,7 +531,7 @@ impl Target {
                     None,
                     None,
                     None,
-                    &Document::new(),
+                    &secantus_core::vars::Vars::new(),
                 )
                 .map_err(command_error)?;
             decode_docs(raw)?
@@ -769,7 +769,7 @@ fn plan_for(
         }
     }
     let held = Held::new(t, ctx.storage()?, collation);
-    let no_vars = Document::new();
+    let no_vars = secantus_core::vars::Vars::new();
     let ask = order::Ask {
         db: &ctx.db_name,
         coll: &s.coll,

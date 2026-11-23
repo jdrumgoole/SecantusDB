@@ -26,6 +26,7 @@
 //! * a global lock serialises DDL; reads and writes take per-collection
 //!   locks.
 
+use secantus_core::vars::Vars;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -57,6 +58,7 @@ use secantus_wt::{Connection, Cursor, Session};
 
 /// The literal BSON decoder, for the crates that depend on this one.
 pub use secantus_core::bsondoc;
+pub use secantus_core::vars;
 
 mod auto_compact;
 mod catalog_changes;
@@ -4250,7 +4252,7 @@ fn write_matches(
     recordid: &RecordId,
     blob: &[u8],
     filter: &Document,
-    vars: &Document,
+    vars: &Vars,
     coll_opt: Option<&Collation>,
 ) -> Result<bool> {
     if matched_before(recordid, blob) {
@@ -9771,7 +9773,7 @@ impl Storage {
         filter: &Document,
         sort: Option<&Document>,
         coll_opt: Option<&Collation>,
-        vars: &Document,
+        vars: &Vars,
     ) -> Result<Vec<Vec<u8>>> {
         // Async oplog: an acknowledged write's entry may still be queued at
         // the drainer; a mongod client that just got its ack and reads
@@ -10550,7 +10552,7 @@ impl Storage {
             false,
             false,
             &[],
-            &Document::new(),
+            &Vars::new(),
             None,
             None,
             false,
@@ -10614,14 +10616,7 @@ impl Storage {
         for doc in &have {
             let id = doc.get("_id").cloned().unwrap_or(Bson::Null);
             if !want.iter().any(|w| w.get("_id") == Some(&id)) {
-                self.delete_matching(
-                    db,
-                    views,
-                    &bson::doc! {"_id": id},
-                    1,
-                    &Document::new(),
-                    None,
-                )?;
+                self.delete_matching(db, views, &bson::doc! {"_id": id}, 1, &Vars::new(), None)?;
             }
         }
         let mut missing = Vec::new();
@@ -10638,7 +10633,7 @@ impl Storage {
                         false,
                         false,
                         &[],
-                        &Document::new(),
+                        &Vars::new(),
                         None,
                         None,
                         false,
@@ -10697,7 +10692,7 @@ impl Storage {
             false,
             true,
             &[],
-            &Document::new(),
+            &Vars::new(),
             None,
             None,
             false,
@@ -10911,7 +10906,7 @@ impl Storage {
             false,
             true,
             &[],
-            &Document::new(),
+            &Vars::new(),
             None,
             None,
             false,
@@ -10948,7 +10943,7 @@ impl Storage {
             .get_datetime("wall")
             .copied()
             .unwrap_or_else(|_| bson::DateTime::now());
-        let no_vars = Document::new();
+        let no_vars = Vars::new();
         let upsert = |coll: &str, row: Document| -> Result<()> {
             self.update_matching(
                 "config",
@@ -14963,7 +14958,7 @@ impl Storage {
         }
         let mut pruned = 0usize;
         for filter in filters {
-            pruned += self.delete_matching(db, coll, &filter, 0, &Document::new(), None)?;
+            pruned += self.delete_matching(db, coll, &filter, 0, &Vars::new(), None)?;
         }
         Ok(pruned)
     }
@@ -15046,7 +15041,7 @@ impl Storage {
         drop(session);
         let mut pruned = 0usize;
         for filter in filters {
-            pruned += self.delete_matching(db, &buckets, &filter, 0, &Document::new(), None)?;
+            pruned += self.delete_matching(db, &buckets, &filter, 0, &Vars::new(), None)?;
         }
         Ok(Some(pruned))
     }
@@ -17032,7 +17027,7 @@ impl Storage {
                 }
                 let d = decode_doc(&blob)?;
                 if let Some(pf) = &partial {
-                    if !query_matches(&d, pf, &Document::new(), key_coll.as_ref())
+                    if !query_matches(&d, pf, &Vars::new(), key_coll.as_ref())
                         .map_err(query_fault)?
                     {
                         continue;
@@ -17239,7 +17234,7 @@ impl Storage {
             false,
             false,
             &[],
-            &Document::new(),
+            &Vars::new(),
             None,
             None,
             false,
@@ -17250,7 +17245,7 @@ impl Storage {
             BUILDS.1,
             &bson::doc! {"_id": build},
             0,
-            &Document::new(),
+            &Vars::new(),
             None,
         )?;
         Ok(())
@@ -19087,8 +19082,9 @@ impl Storage {
         match &desc.partial {
             None => Ok(true),
             // A partial filter is read under the index's own collation.
-            Some(pf) => query_matches(doc, pf, &Document::new(), desc.collation.as_ref())
-                .map_err(query_fault),
+            Some(pf) => {
+                query_matches(doc, pf, &Vars::new(), desc.collation.as_ref()).map_err(query_fault)
+            }
         }
     }
 
@@ -19629,7 +19625,7 @@ impl Storage {
     ) -> Result<()> {
         let in_sets = secantus_core::query::InSets::prepare(filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
-        let vars = Document::new();
+        let vars = Vars::new();
         let keep = |blob: &[u8]| -> Result<bool> {
             if filter.is_empty() {
                 return Ok(true);
@@ -19732,7 +19728,7 @@ impl Storage {
         }
         let in_sets = secantus_core::query::InSets::prepare(filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
-        let vars = Document::new();
+        let vars = Vars::new();
         let session = self.conn.open_session()?;
         session.begin_transaction(None)?;
         let routed = (|| -> Result<Option<Vec<RecordId>>> {
@@ -19826,7 +19822,7 @@ impl Storage {
             Err(e) if e.is_missing_table() => return Ok((Vec::new(), None)),
             Err(e) => return Err(e.into()),
         };
-        let vars = Document::new();
+        let vars = Vars::new();
         let batch = batch.max(1);
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(batch);
         let mut more = match &after {
@@ -20090,7 +20086,7 @@ impl Storage {
         batch: usize,
         ov: &TableOverlay,
     ) -> Result<(Vec<Vec<u8>>, Option<RecordId>)> {
-        let vars = Document::new();
+        let vars = Vars::new();
         let keep = |blob: &[u8]| -> Result<bool> {
             if filter.is_empty() {
                 return Ok(true);
@@ -20157,7 +20153,7 @@ impl Storage {
     }
 
     pub fn find_matching(&self, db: &str, coll: &str, filter: &Document) -> Result<Vec<Vec<u8>>> {
-        self.find_matching_with(db, coll, filter, None, None, None, &Document::new())
+        self.find_matching_with(db, coll, filter, None, None, None, &Vars::new())
     }
 
     /// Documents matching `filter`, as BSON bytes, ordered per `sort` and routed
@@ -20180,7 +20176,7 @@ impl Storage {
         sort: Option<&Document>,
         hint: Option<&Hint>,
         coll_opt: Option<&Collation>,
-        vars: &Document,
+        vars: &Vars,
     ) -> Result<Vec<Vec<u8>>> {
         read_fault(db, coll)?;
         if self.is_oplog_rs(db, coll) {
@@ -20208,7 +20204,7 @@ impl Storage {
         sort: Option<&Document>,
         hint: Option<&Hint>,
         coll_opt: Option<&Collation>,
-        vars: &Document,
+        vars: &Vars,
     ) -> Result<Vec<Vec<u8>>> {
         // Large scalar `$in` / `$nin` lists hashed once for the scan.
         let in_sets = secantus_core::query::InSets::prepare(filter);
@@ -20851,7 +20847,7 @@ impl Storage {
         filter: &Document,
         hint: Option<&Hint>,
         coll_opt: Option<&Collation>,
-        vars: &Document,
+        vars: &Vars,
     ) -> Result<Option<MatchedRows>> {
         if self.is_oplog_rs(db, coll) || overlay_for(db, coll).is_some() {
             return Ok(None);
@@ -20909,7 +20905,7 @@ impl Storage {
         filter: &Document,
         hint: Option<&Hint>,
         coll_opt: Option<&Collation>,
-        vars: &Document,
+        vars: &Vars,
     ) -> Result<Option<MatchedRows>> {
         let in_sets = secantus_core::query::InSets::prepare(filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
@@ -20962,7 +20958,7 @@ impl Storage {
                     return Ok(false);
                 }
                 if let Some(pf) = partial {
-                    if !query_matches(&d, pf, &Document::new(), None).map_err(query_fault)? {
+                    if !query_matches(&d, pf, &Vars::new(), None).map_err(query_fault)? {
                         return Ok(false);
                     }
                 }
@@ -21415,12 +21411,12 @@ impl Storage {
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         if self.is_oplog_rs(db, coll) {
             return Ok(self
-                .find_oplog_rs(filter, None, coll_opt, &Document::new())?
+                .find_oplog_rs(filter, None, coll_opt, &Vars::new())?
                 .len());
         }
         if overlay_for(db, coll).is_some() {
             return Ok(self
-                .find_matching_with(db, coll, filter, None, None, coll_opt, &Document::new())?
+                .find_matching_with(db, coll, filter, None, None, coll_opt, &Vars::new())?
                 .len());
         }
         self.with_ddl_generation_check(|| {
@@ -21434,7 +21430,7 @@ impl Storage {
                 })?;
                 return Ok(n);
             }
-            let vars = Document::new();
+            let vars = Vars::new();
             let mut n = 0usize;
             for (_rid, blob) in
                 self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?
@@ -21471,7 +21467,7 @@ impl Storage {
         multi: bool,
         upsert: bool,
         array_filters: &[Document],
-        let_vars: &Document,
+        let_vars: &Vars,
         coll_opt: Option<&Collation>,
         validator: Option<&Document>,
         want_post_image: bool,
@@ -21552,7 +21548,7 @@ impl Storage {
         let lock = self.coll_lock(db, coll);
         let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.op_session()?;
-        let vars = Document::new();
+        let vars = Vars::new();
         let mut rows = Vec::new();
         for (recordid, blob) in self.candidate_docs(&session, db, coll, filter, false)? {
             let raw =
@@ -21596,7 +21592,7 @@ impl Storage {
         multi: bool,
         upsert: bool,
         array_filters: &[Document],
-        let_vars: &Document,
+        let_vars: &Vars,
         coll_opt: Option<&Collation>,
         validator: Option<&Document>,
         validator_moderate: bool,
@@ -21698,7 +21694,7 @@ impl Storage {
         pipeline: &[Bson],
         multi: bool,
         upsert: bool,
-        let_vars: &Document,
+        let_vars: &Vars,
         coll_opt: Option<&Collation>,
         validator: Option<&Document>,
         // `validationLevel: "moderate"` — exempt documents that ALREADY failed
@@ -21738,7 +21734,7 @@ impl Storage {
         multi: bool,
         upsert: bool,
         supplied: Option<&Document>,
-        let_vars: &Document,
+        let_vars: &Vars,
         coll_opt: Option<&Collation>,
         validator: Option<&Document>,
         validator_moderate: bool,
@@ -21836,7 +21832,7 @@ impl Storage {
         db: &str,
         coll: &str,
         filter: &Document,
-        vars: &Document,
+        vars: &Vars,
         coll_opt: Option<&Collation>,
         multi: bool,
         upsert: bool,
@@ -21909,7 +21905,7 @@ impl Storage {
         db: &str,
         coll: &str,
         filter: &Document,
-        vars: &Document,
+        vars: &Vars,
         coll_opt: Option<&Collation>,
         upsert: bool,
         is_replacement: bool,
@@ -22099,7 +22095,7 @@ impl Storage {
         coll: &str,
         rids: &[(RecordId, Vec<u8>)],
         filter: &Document,
-        vars: &Document,
+        vars: &Vars,
         coll_opt: Option<&Collation>,
         is_replacement: bool,
         // The operator update that produced the post-image, so the change-stream
@@ -22290,7 +22286,7 @@ impl Storage {
         db: &str,
         coll: &str,
         filter: &Document,
-        vars: &Document,
+        vars: &Vars,
         coll_opt: Option<&Collation>,
         multi: bool,
         upsert: bool,
@@ -22708,7 +22704,7 @@ impl Storage {
         coll: &str,
         filter: &Document,
         limit: usize,
-        let_vars: &Document,
+        let_vars: &Vars,
         coll_opt: Option<&Collation>,
     ) -> Result<usize> {
         self.delete_matching_hinted(db, coll, filter, limit, let_vars, coll_opt, None)
@@ -22727,7 +22723,7 @@ impl Storage {
         coll: &str,
         filter: &Document,
         limit: usize,
-        let_vars: &Document,
+        let_vars: &Vars,
         coll_opt: Option<&Collation>,
         hint: Option<&Hint>,
     ) -> Result<usize> {
@@ -22813,7 +22809,7 @@ impl Storage {
         db: &str,
         coll: &str,
         filter: &Document,
-        let_vars: &Document,
+        let_vars: &Vars,
         coll_opt: Option<&Collation>,
         hint: Option<&Hint>,
     ) -> Result<usize> {
@@ -23041,7 +23037,7 @@ impl Storage {
         coll: &str,
         rids: &[(RecordId, Vec<u8>, bool)],
         filter: &Document,
-        let_vars: &Document,
+        let_vars: &Vars,
         coll_opt: Option<&Collation>,
         batched: bool,
     ) -> Result<(usize, usize, Option<StorageError>)> {
@@ -23163,7 +23159,7 @@ impl Storage {
         coll: &str,
         filter: &Document,
         limit: usize,
-        let_vars: &Document,
+        let_vars: &Vars,
         coll_opt: Option<&Collation>,
         hint: Option<&Hint>,
     ) -> Result<usize> {
@@ -23628,7 +23624,7 @@ impl Storage {
                 continue;
             }
             if let Some(pf) = partial {
-                if !query_matches(&d, pf, &Document::new(), None).map_err(query_fault)? {
+                if !query_matches(&d, pf, &Vars::new(), None).map_err(query_fault)? {
                     continue;
                 }
             }
@@ -25727,7 +25723,7 @@ fn validator_holds(
     // mongod evaluates a validator where no interrupt reaches it (RM-313):
     // an error here passes, and an interrupt must not read as one.
     let _opaque = secantus_core::deadline::opaque();
-    Ok(query_matches(doc, validator, &Document::new(), None).unwrap_or(true))
+    Ok(query_matches(doc, validator, &Vars::new(), None).unwrap_or(true))
 }
 
 fn default_collation(session: &Session, db: &str, coll: &str) -> Result<Option<(Collation, bool)>> {
@@ -28187,7 +28183,7 @@ mod tests {
             assert_eq!(s.find_matching("app", "c", &doc! {}).unwrap().len(), 4);
             // Deleting the document that holds the value frees it.
             assert_eq!(
-                s.delete_matching("app", "c", &doc! {"v": 1i32}, 0, &doc! {}, None)
+                s.delete_matching("app", "c", &doc! {"v": 1i32}, 0, &Vars::new(), None)
                     .unwrap(),
                 1
             );
@@ -28487,7 +28483,7 @@ mod tests {
                     false,
                     true,
                     &[],
-                    &Document::new(),
+                    &Vars::new(),
                     None,
                     None,
                     false,
@@ -28539,7 +28535,7 @@ mod tests {
             false,
             true,
             &[],
-            &Document::new(),
+            &Vars::new(),
             None,
             None,
             false,
@@ -28570,7 +28566,7 @@ mod tests {
             false,
             true,
             &[],
-            &Document::new(),
+            &Vars::new(),
             None,
             None,
             false,
@@ -28652,7 +28648,7 @@ mod tests {
                     false,
                     false,
                     &[],
-                    &Document::new(),
+                    &Vars::new(),
                     None,
                     None,
                     false,
@@ -28698,7 +28694,7 @@ mod tests {
                 false,
                 false,
                 &[],
-                &Document::new(),
+                &Vars::new(),
                 None,
                 None,
                 false,
@@ -28745,7 +28741,7 @@ mod tests {
             true,
         )
         .unwrap();
-        let empty = Document::new();
+        let empty = Vars::new();
         for f in [
             doc! {"$or": [{"a": 5i32}, {"b": 7i32}]},
             doc! {"$or": [{"a": {"$gt": 4i32}}, {"b": {"$gte": 3i32}}]},
@@ -28838,7 +28834,7 @@ mod tests {
             assert_eq!((missing, extra), (0, 0), "{name}");
         }
         // And after the documents change.
-        s.delete_matching("app", "t", &doc! {"_id": 2i32}, 0, &doc! {}, None)
+        s.delete_matching("app", "t", &doc! {"_id": 2i32}, 0, &Vars::new(), None)
             .unwrap();
         let check = s.check_collection("app", "t").unwrap();
         assert_eq!(index_check(&check, "v_1"), (3, 0, 0));
@@ -29240,13 +29236,13 @@ mod tests {
                 false,
                 false,
                 &[],
-                &empty,
+                &Vars::new(),
                 None,
                 None,
                 false,
             )
             .unwrap();
-            s.delete_matching("app", "c", &doc! {"_id": 2i32}, 1, &empty, None)
+            s.delete_matching("app", "c", &doc! {"_id": 2i32}, 1, &Vars::new(), None)
                 .unwrap();
             s.insert(
                 "app",

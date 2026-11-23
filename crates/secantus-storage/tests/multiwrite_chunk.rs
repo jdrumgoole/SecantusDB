@@ -46,7 +46,7 @@ fn update_and_delete_many_survive_a_small_cache() {
             true,
             false,
             &[],
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
             None,
             false,
@@ -59,7 +59,14 @@ fn update_and_delete_many_survive_a_small_cache() {
         35_000
     );
     let deleted = st
-        .delete_matching("app", "c", &doc! {"x": 2}, 0, &Document::new(), None)
+        .delete_matching(
+            "app",
+            "c",
+            &doc! {"x": 2},
+            0,
+            &secantus_core::vars::Vars::new(),
+            None,
+        )
         .unwrap();
     assert_eq!(deleted, 35_000);
     assert_eq!(st.count_matching("app", "c", &doc! {}, None).unwrap(), 0);
@@ -88,7 +95,7 @@ fn multi_update_inc_applies_exactly_once_across_chunks() {
             true,
             false,
             &[],
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
             None,
             false,
@@ -112,7 +119,7 @@ fn multi_update_inc_applies_exactly_once_across_chunks() {
             true,
             false,
             &[],
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
             None,
             false,
@@ -144,7 +151,7 @@ fn bounded_paths_unchanged() {
             false,
             false,
             &[],
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
             None,
             true,
@@ -153,8 +160,15 @@ fn bounded_paths_unchanged() {
     assert_eq!((out.matched, out.modified), (1, 1));
     assert!(out.post_image.is_some());
     assert_eq!(
-        st.delete_matching("app", "c", &doc! {"x": 1}, 1, &Document::new(), None)
-            .unwrap(),
+        st.delete_matching(
+            "app",
+            "c",
+            &doc! {"x": 1},
+            1,
+            &secantus_core::vars::Vars::new(),
+            None
+        )
+        .unwrap(),
         1
     );
     assert_eq!(st.count_matching("app", "c", &doc! {}, None).unwrap(), 9);
@@ -168,7 +182,7 @@ fn bounded_paths_unchanged() {
             true,
             true,
             &[],
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
             None,
             false,
@@ -218,7 +232,7 @@ fn multi_update_failing_part_way_keeps_the_documents_before() {
         true,
         false,
         &[],
-        &Document::new(),
+        &secantus_core::vars::Vars::new(),
         None,
         None,
         false,
@@ -244,7 +258,14 @@ fn multi_delete_failing_part_way_keeps_the_batches_before() {
             .map(|i| enc(&doc! {"_id": i, "d": if i == fails_at { 0 } else { 1 }}))
             .collect();
         st.insert("app", "c", docs, true).unwrap();
-        let out = st.delete_matching("app", "c", &divides(), 0, &Document::new(), None);
+        let out = st.delete_matching(
+            "app",
+            "c",
+            &divides(),
+            0,
+            &secantus_core::vars::Vars::new(),
+            None,
+        );
         assert!(out.is_err(), "the filter's error is the statement's");
         assert_eq!(
             st.count_matching("app", "c", &doc! {}, None).unwrap(),
@@ -280,7 +301,7 @@ fn multi_update_interrupted_in_an_expression_writes_nothing() {
         true,
         false,
         &[],
-        &Document::new(),
+        &secantus_core::vars::Vars::new(),
         None,
         None,
         false,
@@ -318,7 +339,7 @@ fn a_write_of_many_reads_every_page_of_its_candidates_once() {
             true,
             false,
             &[],
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
             None,
             false,
@@ -347,7 +368,7 @@ fn a_write_of_many_reads_every_page_of_its_candidates_once() {
             "c",
             &doc! {"n": 2},
             0,
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
             Some(&reverse),
         )
@@ -360,7 +381,14 @@ fn a_write_of_many_reads_every_page_of_its_candidates_once() {
     assert_eq!(st.count_matching("app", "c", &doc! {}, None).unwrap(), 1250);
     // A forward scan of what is left.
     let deleted = st
-        .delete_matching("app", "c", &doc! {"n": 1}, 0, &Document::new(), None)
+        .delete_matching(
+            "app",
+            "c",
+            &doc! {"n": 1},
+            0,
+            &secantus_core::vars::Vars::new(),
+            None,
+        )
         .unwrap();
     assert_eq!(deleted, 1250);
     assert_eq!(st.count_matching("app", "c", &doc! {}, None).unwrap(), 0);
@@ -391,7 +419,7 @@ fn paged_index_write_moves_each_document_once() {
             true,
             false,
             &[],
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
             None,
             false,
@@ -409,7 +437,7 @@ fn paged_index_write_moves_each_document_once() {
             "c",
             &doc! {"a": {"$gte": 1000}},
             0,
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
         )
         .unwrap();
@@ -440,7 +468,7 @@ fn paged_compound_residual_write_moves_each_matching_document_once() {
             true,
             false,
             &[],
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
             None,
             false,
@@ -459,7 +487,7 @@ fn paged_compound_residual_write_moves_each_matching_document_once() {
             "c",
             &doc! {"a": {"$gte": 1000}, "b": {"$gte": 3}},
             0,
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
         )
         .unwrap();
@@ -490,7 +518,7 @@ fn paged_in_write_moves_each_matching_document_once() {
             true,
             false,
             &[],
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
             None,
             false,
@@ -511,7 +539,7 @@ fn paged_in_write_moves_each_matching_document_once() {
             "c",
             &doc! {"b": {"$eq": 105}},
             0,
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
         )
         .unwrap();

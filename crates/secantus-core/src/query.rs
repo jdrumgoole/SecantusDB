@@ -28,6 +28,7 @@
 
 use std::cmp::Ordering;
 
+use crate::vars::Vars;
 use bson::{Bson, Document, RawBsonRef, RawDocument};
 
 use crate::collation::{self, Collation};
@@ -41,7 +42,7 @@ type R = Result<bool, Fallback>;
 /// Entry point. `Ok(b)` is the match result; `Err(Fallback::Defer)` means defer to
 /// Python (the query uses something not ported yet). `vars` carries user vars
 /// for `$expr`; `coll` is the active collation (or `None`).
-pub fn matches(doc: &Document, query: &Document, vars: &Document, coll: Option<&Collation>) -> R {
+pub fn matches(doc: &Document, query: &Document, vars: &Vars, coll: Option<&Collation>) -> R {
     // A caller with no collation of its own inherits the active one: an
     // `arrayFilters` or `$pull` condition inside a collated update, a
     // `$match` inside a collated pipeline.
@@ -72,7 +73,7 @@ pub fn matches(doc: &Document, query: &Document, vars: &Document, coll: Option<&
 pub fn matches_raw(
     raw: &RawDocument,
     query: &Document,
-    vars: &Document,
+    vars: &Vars,
     coll: Option<&Collation>,
 ) -> R {
     let inherited = if coll.is_none() {
@@ -111,7 +112,7 @@ fn match_clause_raw(
     raw: &RawDocument,
     key: &str,
     cond: &Bson,
-    vars: &Document,
+    vars: &Vars,
     coll: Option<&Collation>,
 ) -> R {
     match key {
@@ -267,7 +268,7 @@ fn resolve_path_raw_strict(
 /// `$literal` array) of scalars, at the top of the `$expr` or under its
 /// `$and`. Under `$or` / `$not`, with a computed left side, or with an array
 /// among the constants, the collation applies and this is not reached.
-fn expr_in_by_value(doc: &Document, expr: &Bson, vars: &Document, coll: Option<&Collation>) -> R {
+fn expr_in_by_value(doc: &Document, expr: &Bson, vars: &Vars, coll: Option<&Collation>) -> R {
     if coll.is_none() {
         return Ok(true);
     }
@@ -314,7 +315,7 @@ fn expr_in_by_value(doc: &Document, expr: &Bson, vars: &Document, coll: Option<&
 }
 
 /// `matches` with no collation at all, the active one included.
-fn match_field_binary(doc: &Document, query: &Document, vars: &Document) -> R {
+fn match_field_binary(doc: &Document, query: &Document, vars: &Vars) -> R {
     for (k, v) in query.iter() {
         if !match_clause(doc, k, v, vars, None)? {
             return Ok(false);
@@ -337,7 +338,7 @@ fn match_clause(
     doc: &Document,
     key: &str,
     cond: &Bson,
-    vars: &Document,
+    vars: &Vars,
     coll: Option<&Collation>,
 ) -> R {
     match key {
@@ -2374,7 +2375,7 @@ fn op_elem_match(values: &[Cand], cond: &Bson, field: &str) -> R {
                 }
             } else if let Bson::Document(ed) = elem {
                 // Python's $elemMatch recurses with no vars and no collation.
-                if matches(ed, condd, &Document::new(), coll)? {
+                if matches(ed, condd, &Vars::new(), coll)? {
                     return Ok(true);
                 }
             } else if let Bson::Array(ea) = elem {
@@ -2389,7 +2390,7 @@ fn op_elem_match(values: &[Cand], cond: &Bson, field: &str) -> R {
                     .enumerate()
                     .map(|(i, e)| (i.to_string(), e.clone()))
                     .collect();
-                if matches(&as_doc, condd, &Document::new(), coll)? {
+                if matches(&as_doc, condd, &Vars::new(), coll)? {
                     return Ok(true);
                 }
             }
@@ -2869,7 +2870,7 @@ mod tests {
             (doc! {"x": {"$gt": Bson::MaxKey}}, false),
         ] {
             assert_eq!(
-                matches(&absent, &q, &empty, None).unwrap(),
+                matches(&absent, &q, &Vars::from(&empty), None).unwrap(),
                 want,
                 "absent field vs {q:?}"
             );
@@ -2896,13 +2897,25 @@ mod tests {
             doc! {"x": {"$lt": Bson::Null}},
         ] {
             assert!(
-                !matches(&absent, &q, &empty, None).unwrap(),
+                !matches(&absent, &q, &Vars::from(&empty), None).unwrap(),
                 "absent field must not match {q:?}"
             );
         }
         // `$gte` / `$lte` null DO match it -- their own rule, unchanged.
-        assert!(matches(&absent, &doc! {"x": {"$gte": Bson::Null}}, &empty, None).unwrap());
-        assert!(matches(&absent, &doc! {"x": {"$lte": Bson::Null}}, &empty, None).unwrap());
+        assert!(matches(
+            &absent,
+            &doc! {"x": {"$gte": Bson::Null}},
+            &Vars::from(&empty),
+            None
+        )
+        .unwrap());
+        assert!(matches(
+            &absent,
+            &doc! {"x": {"$lte": Bson::Null}},
+            &Vars::from(&empty),
+            None
+        )
+        .unwrap());
     }
 
     /// `$elemMatch` traverses an array ONCE. The operator form used to look
@@ -2920,27 +2933,57 @@ mod tests {
         // must not match through it.
         for d in [&nested, &ragged] {
             assert!(
-                !matches(d, &q(bson::bson!({"$gt": 1})), &empty, None).unwrap(),
+                !matches(d, &q(bson::bson!({"$gt": 1})), &Vars::from(&empty), None).unwrap(),
                 "{d:?} must not match $elemMatch {{$gt: 1}}"
             );
         }
-        assert!(matches(&flat, &q(bson::bson!({"$gt": 1})), &empty, None).unwrap());
+        assert!(matches(
+            &flat,
+            &q(bson::bson!({"$gt": 1})),
+            &Vars::from(&empty),
+            None
+        )
+        .unwrap());
         // ...but `$type` still sees the element as the array it is.
-        assert!(matches(&nested, &q(bson::bson!({"$type": "array"})), &empty, None).unwrap());
-        assert!(!matches(&flat, &q(bson::bson!({"$type": "array"})), &empty, None).unwrap());
+        assert!(matches(
+            &nested,
+            &q(bson::bson!({"$type": "array"})),
+            &Vars::from(&empty),
+            None
+        )
+        .unwrap());
+        assert!(!matches(
+            &flat,
+            &q(bson::bson!({"$type": "array"})),
+            &Vars::from(&empty),
+            None
+        )
+        .unwrap());
 
         // The CRITERIA form: an empty criteria asks nothing, so an array
         // element satisfies it; a named field cannot.
-        assert!(matches(&nested, &q(bson::bson!({})), &empty, None).unwrap());
-        assert!(!matches(&flat, &q(bson::bson!({})), &empty, None).unwrap());
+        assert!(matches(&nested, &q(bson::bson!({})), &Vars::from(&empty), None).unwrap());
+        assert!(!matches(&flat, &q(bson::bson!({})), &Vars::from(&empty), None).unwrap());
         let arr_of_doc = doc! {"x": [[{"y": 5}]]};
-        assert!(matches(&arr_of_doc, &q(bson::bson!({})), &empty, None).unwrap());
+        assert!(matches(&arr_of_doc, &q(bson::bson!({})), &Vars::from(&empty), None).unwrap());
         assert!(
-            !matches(&arr_of_doc, &q(bson::bson!({"y": 5})), &empty, None).unwrap(),
+            !matches(
+                &arr_of_doc,
+                &q(bson::bson!({"y": 5})),
+                &Vars::from(&empty),
+                None
+            )
+            .unwrap(),
             "an ARRAY element has no field `y` for the criteria to name"
         );
         let doc_elem = doc! {"x": [{"y": 5}]};
-        assert!(matches(&doc_elem, &q(bson::bson!({"y": 5})), &empty, None).unwrap());
+        assert!(matches(
+            &doc_elem,
+            &q(bson::bson!({"y": 5})),
+            &Vars::from(&empty),
+            None
+        )
+        .unwrap());
     }
 
     /// The one-level descent OUTSIDE `$elemMatch` is untouched -- the flag
@@ -2949,10 +2992,16 @@ mod tests {
     fn the_ordinary_one_level_descent_is_unchanged() {
         let empty = Document::new();
         let d = doc! {"x": [5]};
-        assert!(matches(&d, &doc! {"x": 5}, &empty, None).unwrap());
-        assert!(matches(&d, &doc! {"x": {"$gt": 4}}, &empty, None).unwrap());
-        assert!(matches(&d, &doc! {"x": {"$in": [5]}}, &empty, None).unwrap());
-        assert!(matches(&d, &doc! {"x": {"$type": "number"}}, &empty, None).unwrap());
+        assert!(matches(&d, &doc! {"x": 5}, &Vars::from(&empty), None).unwrap());
+        assert!(matches(&d, &doc! {"x": {"$gt": 4}}, &Vars::from(&empty), None).unwrap());
+        assert!(matches(&d, &doc! {"x": {"$in": [5]}}, &Vars::from(&empty), None).unwrap());
+        assert!(matches(
+            &d,
+            &doc! {"x": {"$type": "number"}},
+            &Vars::from(&empty),
+            None
+        )
+        .unwrap());
     }
 
     /// A NaN range bound. mongod treats NaN as EQUAL to NaN in its comparison
@@ -3073,7 +3122,7 @@ mod tests {
             let err = matches(
                 &doc! {"a": 1},
                 &doc! {"a": {"$all": [2, {first: 1}]}},
-                &Document::new(),
+                &Vars::new(),
                 None,
             )
             .unwrap_err();
@@ -3086,13 +3135,13 @@ mod tests {
     }
 
     fn m(doc: Document, query: Document) -> bool {
-        let owned = matches(&doc, &query, &Document::new(), None).expect("should not fall back");
+        let owned = matches(&doc, &query, &Vars::new(), None).expect("should not fall back");
         // The raw-BSON matcher must agree with the owned one bool-for-bool
         // wherever the owned matcher succeeds — every query test here doubles as
         // a `matches_raw` parity check.
         let bytes = bson::to_vec(&doc).unwrap();
         let raw = RawDocument::from_bytes(&bytes).unwrap();
-        let raw_res = matches_raw(raw, &query, &Document::new(), None)
+        let raw_res = matches_raw(raw, &query, &Vars::new(), None)
             .expect("matches_raw fell back where matches succeeded");
         assert_eq!(
             raw_res, owned,
@@ -3319,7 +3368,7 @@ mod tests {
         // Backreferences / lookaround aren't compilable by the linear `regex`
         // crate, so they fall back to fancy-regex and evaluate (no Fallback).
         let m = |doc: Document, q: Document| {
-            matches(&doc, &q, &Document::new(), None).expect("fancy-regex should evaluate")
+            matches(&doc, &q, &Vars::new(), None).expect("fancy-regex should evaluate")
         };
         // backreference
         assert!(m(doc! {"x": "aa"}, doc! {"x": {"$regex": r"(a)\1"}}));
@@ -3350,7 +3399,7 @@ mod tests {
         assert!(matches(
             &doc! {"n": "PING"},
             &doc! {"n": "ping"},
-            &Document::new(),
+            &Vars::new(),
             Some(&coll)
         )
         .unwrap());
@@ -3360,7 +3409,7 @@ mod tests {
         assert!(matches(
             &doc! {"n": "café"},
             &doc! {"n": "CAFÉ"},
-            &Document::new(),
+            &Vars::new(),
             Some(&coll)
         )
         .unwrap());
@@ -3476,10 +3525,10 @@ mod in_set_tests {
             let mut docs: Vec<Document> = values.iter().map(|v| doc! { "a": v.clone() }).collect();
             docs.push(doc! { "b": 1 });
             for d in &docs {
-                let plain = matches(d, &filter, &empty, None).unwrap();
+                let plain = matches(d, &filter, &Vars::from(&empty), None).unwrap();
                 let hashed = {
                     let _g = InSetsGuard::install(&sets);
-                    matches(d, &filter, &empty, None).unwrap()
+                    matches(d, &filter, &Vars::from(&empty), None).unwrap()
                 };
                 assert_eq!(plain, hashed, "{op} over {d:?}");
             }

@@ -36,7 +36,7 @@ fn set_v(st: &Storage, id: i32, v: i32) {
         true,
         false,
         &[],
-        &Document::new(),
+        &secantus_core::vars::Vars::new(),
         None,
         None,
         false,
@@ -45,8 +45,15 @@ fn set_v(st: &Storage, id: i32, v: i32) {
 }
 
 fn delete(st: &Storage, id: i32) {
-    st.delete_matching("app", "c", &doc! {"_id": id}, 0, &Document::new(), None)
-        .unwrap();
+    st.delete_matching(
+        "app",
+        "c",
+        &doc! {"_id": id},
+        0,
+        &secantus_core::vars::Vars::new(),
+        None,
+    )
+    .unwrap();
 }
 
 /// `(id, prior v)` of a frame's row records, `None` for a row that did not

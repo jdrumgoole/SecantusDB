@@ -106,8 +106,13 @@ pub fn map_reduce(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let stages = vec![Bson::Document(doc! {
         "$group": { "_id": format!("${field}"), "value": { "$sum": 1 } }
     })];
-    let grouped = secantus_core::aggregate::apply_pipeline(docs, &stages, &Document::new(), None)
-        .map_err(|_| {
+    let grouped = secantus_core::aggregate::apply_pipeline(
+        docs,
+        &stages,
+        &secantus_core::vars::Vars::new(),
+        None,
+    )
+    .map_err(|_| {
         CommandError::new(
             2,
             "BadValue",

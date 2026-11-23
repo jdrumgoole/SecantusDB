@@ -64,7 +64,14 @@ fn index(s: &Store, coll: &str, name: &str, key: Document, options: Document) {
 fn ids(s: &Store, coll: &str, filter: &Document) -> Vec<Bson> {
     let rows = s
         .wt()
-        .matching_rows("t", coll, filter, None, None, &Document::new())
+        .matching_rows(
+            "t",
+            coll,
+            filter,
+            None,
+            None,
+            &secantus_commands::vars::Vars::new(),
+        )
         .unwrap()
         .expect("a plain collection gives its matched rows");
     rows.rows
@@ -517,7 +524,7 @@ fn walked(s: &Store, coll: &str, sort: Option<Document>, hint: Option<&str>) -> 
             sort.as_ref(),
             hint.as_ref(),
             None,
-            &Document::new(),
+            &secantus_commands::vars::Vars::new(),
         )
         .unwrap()
         .iter()

@@ -22,6 +22,7 @@
 //! (`explainVersion` "2" is SBE), 2026-10-23.
 
 use crate::fallback::Fallback;
+use crate::vars::Vars;
 use bson::{Bson, Document};
 use std::cell::Cell;
 
@@ -472,7 +473,7 @@ pub fn mark(pipeline: Vec<Bson>, start: usize, end: usize) -> Vec<Bson> {
 /// stages, before any document is read: so they fail on an empty collection
 /// too, and their errors have no executor wrapper (measured 8.2.11,
 /// 2026-10-23). `stages` are those [`pushdown`] puts in SBE.
-pub fn build_check(stages: &[Bson], vars: &Document) -> Result<(), Fallback> {
+pub fn build_check(stages: &[Bson], vars: &Vars) -> Result<(), Fallback> {
     let b = Build { vars };
     for s in stages {
         let Some((name, spec)) = stage(s) else {
@@ -508,7 +509,7 @@ pub fn build_check(stages: &[Bson], vars: &Document) -> Result<(), Fallback> {
 }
 
 struct Build<'a> {
-    vars: &'a Document,
+    vars: &'a Vars,
 }
 
 impl Build<'_> {

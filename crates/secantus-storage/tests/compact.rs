@@ -6,7 +6,7 @@
 //! nothing; and the background server compacts, reports itself in the
 //! engine statistics and refuses a second configuration while it runs.
 
-use bson::{doc, spec::BinarySubtype, Binary, Bson, Document};
+use bson::{doc, spec::BinarySubtype, Binary, Bson};
 use secantus_storage::compact::{AutoCompactOutcome, CompactOutcome, CompactTarget};
 use secantus_storage::Storage;
 use std::path::PathBuf;
@@ -82,7 +82,7 @@ fn mostly_deleted(st: &Storage, db: &str, coll: &str, n: i64) {
             coll,
             &doc! {"$expr": {"$ne": [{"$mod": ["$_id", 10]}, 0]}},
             0,
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
         )
         .unwrap();

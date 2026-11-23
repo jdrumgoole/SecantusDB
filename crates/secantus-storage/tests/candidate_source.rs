@@ -2,7 +2,7 @@
 //! them (`with_candidate_source`, RM-323): what a read that stops part-way
 //! leaves written. Against real WiredTiger.
 
-use bson::{doc, Document};
+use bson::doc;
 use secantus_storage::{Pulled, Storage};
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -69,7 +69,7 @@ fn update_all(st: &Storage) -> secantus_storage::Result<secantus_storage::Update
         true,
         false,
         &[],
-        &Document::new(),
+        &secantus_core::vars::Vars::new(),
         None,
         None,
         false,
@@ -132,7 +132,14 @@ fn a_delete_many_keeps_the_batches_staged_before_its_read_stopped() {
     let mut src = source(rows, 2, &asked);
     let out = secantus_storage::with_reversed_delete_batches(10, || {
         secantus_storage::with_candidate_source(&mut src, || {
-            st.delete_matching("app", "c", &doc! {}, 0, &Document::new(), None)
+            st.delete_matching(
+                "app",
+                "c",
+                &doc! {},
+                0,
+                &secantus_core::vars::Vars::new(),
+                None,
+            )
         })
     });
     assert!(out.is_err(), "a read that stopped fails the delete");
@@ -152,7 +159,14 @@ fn a_write_of_one_takes_the_sources_rows_as_its_candidates() {
     let asked = RefCell::new(Vec::new());
     let mut src = source(rows, 1, &asked);
     let deleted = secantus_storage::with_candidate_source(&mut src, || {
-        st.delete_matching("app", "c", &doc! {}, 1, &Document::new(), None)
+        st.delete_matching(
+            "app",
+            "c",
+            &doc! {},
+            1,
+            &secantus_core::vars::Vars::new(),
+            None,
+        )
     })
     .unwrap();
     assert_eq!(deleted, 1);

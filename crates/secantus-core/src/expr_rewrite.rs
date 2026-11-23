@@ -8,6 +8,7 @@
 //! Every rule below was measured against mongod 8.2.11 (2026-10-16); what was
 //! not measured is left as written, which is how this server answered before.
 
+use crate::vars::Vars;
 use bson::{Bson, Document};
 
 /// What `$expr`'s argument becomes.
@@ -132,7 +133,7 @@ fn is_constant(e: &Bson) -> bool {
 /// substitutes a command's `let`, `$$NOW` and a constant `$let` binding
 /// before it folds, so `{$divide: [1, "$$z"]}` with `z` bound to 0 fails
 /// while optimizing (measured 8.2.11, 2026-10-24).
-fn is_constant_in(e: &Bson, vars: &Document) -> bool {
+fn is_constant_in(e: &Bson, vars: &Vars) -> bool {
     match e {
         Bson::String(s) => match s.strip_prefix("$$") {
             // `$$REMOVE` is a constant (missing) mongod folds as it does a
@@ -153,7 +154,7 @@ fn is_constant_in(e: &Bson, vars: &Document) -> bool {
 }
 
 /// Whether mongod folds `e` while optimizing, `vars` substituted.
-fn folds(e: &Bson, vars: &Document) -> bool {
+fn folds(e: &Bson, vars: &Vars) -> bool {
     let mut bound: Vec<String> = vars.keys().cloned().collect();
     // mongod's optimizer turns `$$REMOVE` into a constant missing (RM-722).
     bound.push("REMOVE".to_string());
@@ -161,7 +162,7 @@ fn folds(e: &Bson, vars: &Document) -> bool {
 }
 
 fn evaluate_constant(e: &Bson) -> Option<Bson> {
-    crate::expressions::evaluate(&Document::new(), e, &Document::new()).ok()
+    crate::expressions::evaluate(&Document::new(), e, &Vars::new()).ok()
 }
 
 /// The error mongod raises while it optimizes an expression: the first
@@ -179,13 +180,13 @@ fn evaluate_constant(e: &Bson) -> Option<Bson> {
 /// of `$function` / `$accumulator` are not expressions to visit, and
 /// `$switch` folds its own way (`switch_fault`).
 pub fn constant_expr_fault(arg: &Bson) -> Option<crate::fallback::Fallback> {
-    fault_in(arg, &Document::new())
+    fault_in(arg, &Vars::new())
 }
 
 /// [`constant_expr_fault`] under a command's `let`: mongod substitutes those
 /// variables while it optimizes, so `{$divide: [1, "$$z"]}` with `let: {z:
 /// 0}` fails before any document is read (measured 8.2.11, 2026-10-24).
-pub fn constant_expr_fault_with(arg: &Bson, vars: &Document) -> Option<crate::fallback::Fallback> {
+pub fn constant_expr_fault_with(arg: &Bson, vars: &Vars) -> Option<crate::fallback::Fallback> {
     fault_in(arg, vars)
 }
 
@@ -194,7 +195,7 @@ pub fn constant_expr_fault_with(arg: &Bson, vars: &Document) -> Option<crate::fa
 /// has substituted them by the time it checks a date operator's `timezone`
 /// (`{$let: {vars: {z: "Mars"}, in: {$year: {date: "$t", timezone:
 /// "$$z"}}}}` is 40485 on an empty collection, measured 8.2.11, 2026-10-23).
-fn fault_in(arg: &Bson, vars: &Document) -> Option<crate::fallback::Fallback> {
+fn fault_in(arg: &Bson, vars: &Vars) -> Option<crate::fallback::Fallback> {
     let visit = |e: &Bson| fault_in(e, vars);
     let child = match arg {
         Bson::Array(items) => items.iter().find_map(visit),
@@ -258,7 +259,7 @@ fn fault_in(arg: &Bson, vars: &Document) -> Option<crate::fallback::Fallback> {
 /// document has its `then` optimized and the walk goes on. So
 /// `{branches: [{case: true, then: 1}, {case: {$divide: [1, 0]}, then: 2}]}`
 /// answers 1, while an erroring `default` beside it does not.
-fn switch_fault(spec: &Bson, vars: &Document) -> Option<crate::fallback::Fallback> {
+fn switch_fault(spec: &Bson, vars: &Vars) -> Option<crate::fallback::Fallback> {
     let constant_expr_fault = |e: &Bson| fault_in(e, vars);
     let Bson::Document(spec) = spec else {
         return constant_expr_fault(spec);
@@ -297,7 +298,7 @@ fn switch_fault(spec: &Bson, vars: &Document) -> Option<crate::fallback::Fallbac
 /// each constant one added and each one that reads the document hiding any
 /// outer variable of its name (measured 8.2.11, 2026-10-23: one constant
 /// variable beside one read from a field is still substituted).
-fn let_fault(spec: &Document, vars: &Document) -> Option<crate::fallback::Fallback> {
+fn let_fault(spec: &Document, vars: &Vars) -> Option<crate::fallback::Fallback> {
     let (Some(Bson::Document(defs)), Some(body)) = (spec.get("vars"), spec.get("in")) else {
         return spec.values().find_map(|e| fault_in(e, vars));
     };
@@ -312,7 +313,9 @@ fn let_fault(spec: &Document, vars: &Document) -> Option<crate::fallback::Fallba
             .flatten();
         match value {
             Some(v) => inner.insert(name.clone(), v),
-            None => inner.remove(name),
+            None => {
+                inner.remove(name);
+            }
         };
     }
     fault_in(body, &inner)
@@ -321,15 +324,12 @@ fn let_fault(spec: &Document, vars: &Document) -> Option<crate::fallback::Fallba
 /// [`constant_expr_fault`] over every `$expr` in a query filter, as mongod's
 /// `(code, message)`.
 pub fn constant_expr_error_in_filter(filter: &Document) -> Option<(i32, String)> {
-    constant_expr_error_in_filter_with(filter, &Document::new())
+    constant_expr_error_in_filter_with(filter, &Vars::new())
 }
 
 /// [`constant_expr_error_in_filter`] under a command's `let`
 /// ([`constant_expr_fault_with`]).
-pub fn constant_expr_error_in_filter_with(
-    filter: &Document,
-    vars: &Document,
-) -> Option<(i32, String)> {
+pub fn constant_expr_error_in_filter_with(filter: &Document, vars: &Vars) -> Option<(i32, String)> {
     for (key, value) in filter {
         let found = match (key.as_str(), value) {
             ("$expr", arg) => fault_in(arg, vars).and_then(|f| {

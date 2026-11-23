@@ -53,6 +53,7 @@
 
 use crate::util::ReplyOk;
 use bson::{doc, Bson, Document};
+use secantus_core::vars::Vars;
 
 use crate::argtypes;
 use crate::find::split_docs_into_cursor_checked;
@@ -757,16 +758,21 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     .and_then(|m| m.get_document("$match").ok());
                 let port = ctx.server_address.as_ref().map_or(27017, |(_, p)| *p);
                 let host = format!("{}:{port}", crate::dbhash::host_name());
-                let matched = |entry: &Document| match absorbed {
-                    None => Ok(true),
-                    Some(q) => secantus_core::query::matches(entry, q, &Document::new(), None)
-                        .map_err(|f| match f {
-                            secantus_core::fallback::Fallback::Mongo { code, message, .. } => {
-                                CommandError::new(code, crate::util::error_code_name(code), message)
-                            }
-                            _ => CommandError::new(2, "BadValue", "unsupported $match"),
-                        }),
-                };
+                let matched =
+                    |entry: &Document| match absorbed {
+                        None => Ok(true),
+                        Some(q) => secantus_core::query::matches(entry, q, &Vars::new(), None)
+                            .map_err(|f| match f {
+                                secantus_core::fallback::Fallback::Mongo {
+                                    code, message, ..
+                                } => CommandError::new(
+                                    code,
+                                    crate::util::error_code_name(code),
+                                    message,
+                                ),
+                                _ => CommandError::new(2, "BadValue", "unsupported $match"),
+                            }),
+                    };
                 let entries = crate::explain::plan_cache::stats_stage(
                     storage,
                     &ctx.db_name,
@@ -2322,6 +2328,12 @@ fn lite_parse_pipeline(pipeline: &[Bson], db: &str) -> Result<(), CommandError> 
         if name == "$unionWith" {
             union_with_lite_parse(d.get(name))?;
         }
+        // `$facet`'s lite parse reads its spec's shape first (40169-40171),
+        // so a facet element that is not a stage is named, not the bare 14
+        // of a pipeline element (RM-647).
+        if name == "$facet" {
+            facet_pipelines(d.get(name))?;
+        }
         // A `$facet`'s, a `$lookup`'s and a `$unionWith`'s pipeline is a
         // `LiteParsedPipeline` of its own, built as its stage is read: an
         // unknown stage there is 40324 as the command parses (RM-603).
@@ -2979,7 +2991,7 @@ pub(crate) fn run_segmented(
     pipeline: &[Bson],
     db: &str,
     coll: Option<&str>,
-    vars: &Document,
+    vars: &Vars,
     storage: &dyn crate::storage::Storage,
     collation: Option<&Collation>,
     cmd_doc: &Document,
@@ -3001,7 +3013,7 @@ pub(crate) fn run_segmented(
                 buffer.clear();
             }
             let spec = stage.as_document().and_then(|d| d.get(name));
-            docs = documents_stage(spec, vars, coll)?;
+            docs = documents_stage(spec, vars, coll, at)?;
         } else if name == crate::list_catalog::STAGE {
             if !buffer.is_empty() {
                 let _ = core_run(docs, &buffer, vars, collation, Some(&ns))?;
@@ -3084,18 +3096,30 @@ pub(crate) fn run_segmented(
 /// that resolves to an array of documents.
 fn documents_stage(
     spec: Option<&Bson>,
-    vars: &Document,
+    vars: &Vars,
     coll: Option<&str>,
+    at: usize,
 ) -> Result<Vec<Document>, CommandError> {
     let spec = spec.ok_or_else(|| bad_value("$documents requires an array"))?;
     // An EMPTY document spec is rejected while the stage is desugared into a
     // projection, so it answers 51270 even against a collection; every other
-    // argument gets the namespace error below (probed 8.2.11).
+    // argument gets the namespace error below (probed 8.2.11), under the
+    // stage's "Invalid $documents" parse envelope (RM-651).
     if matches!(spec, Bson::Document(d) if d.is_empty()) {
         return Err(CommandError::new(
             51270,
             "Location51270",
-            "Invalid empty sub-projection: _tempDocumentsField",
+            "Invalid $documents :: caused by :: Invalid empty sub-projection: _tempDocumentsField",
+        ));
+    }
+    // A `$documents` that is not its pipeline's first stage is refused for
+    // its position before the namespace is looked at: 40602 under a
+    // `$lookup` / `$unionWith` that reads a collection (RM-651, 8.2.11).
+    if at > 0 {
+        return Err(CommandError::new(
+            40602,
+            "Location40602",
+            "$documents is only valid as the first stage in a pipeline",
         ));
     }
     // The NAMESPACE check comes before the argument is looked at at all:
@@ -3144,7 +3168,7 @@ fn documents_stage(
 fn core_run(
     docs: Vec<Document>,
     stages: &[Bson],
-    vars: &Document,
+    vars: &Vars,
     collation: Option<&Collation>,
     ns: Option<&str>,
 ) -> Result<Vec<Document>, CommandError> {
@@ -3269,7 +3293,7 @@ fn nested_stage_problem(pipeline: &[Bson]) -> Option<CommandError> {
 
 /// A `$facet` spec's pipelines, in order, once the whole spec has the shape
 /// mongod reads before it parses any of them: a non-empty object (40169),
-/// each value an array (40170) of non-empty objects (40171).
+/// each value an array (40170) of objects (40171, which names the element).
 fn facet_pipelines(spec: Option<&Bson>) -> Result<Vec<(&str, &[Bson])>, CommandError> {
     let s = spec
         .and_then(Bson::as_document)
@@ -3299,16 +3323,23 @@ fn facet_pipelines(spec: Option<&Bson>) -> Result<Vec<(&str, &[Bson])>, CommandE
                 ),
             )
         })?;
-        if !stages
+        // mongod names the element as `BSONElement::toString` prints it:
+        // its type, its index in the array and its value (RM-647, 8.2.11).
+        if let Some((index, bad)) = stages
             .iter()
-            .all(|stage| matches!(stage, Bson::Document(d) if !d.is_empty()))
+            .enumerate()
+            // Despite its wording, an empty object passes here and is the
+            // pipeline's 40323 (measured 8.2.11).
+            .find(|(_, stage)| !matches!(stage, Bson::Document(_)))
         {
             return Err(CommandError::new(
                 40171,
                 "Location40171",
                 format!(
                     "elements of arrays in $facet spec must be non-empty objects, \
-                     {name} argument contained an invalid element"
+                     {name} argument contained an element of type {}: {index}: {}",
+                    secantus_core::query::bson_type_name(bad),
+                    argtypes::render_stage_value(bad)
                 ),
             ));
         }
@@ -3503,7 +3534,7 @@ fn apply_storage_stage(
     docs: Vec<Document>,
     db: &str,
     coll: Option<&str>,
-    vars: &Document,
+    vars: &Vars,
     storage: &dyn crate::storage::Storage,
     collation: Option<&Collation>,
     bypass_validation: bool,
@@ -3518,7 +3549,7 @@ fn apply_storage_stage(
                 .and_then(Bson::as_document)
                 .and_then(|l| l.get("pipeline"));
             if let (Some(sub), false) = (sub, docs.is_empty()) {
-                if let Some((code, msg)) = pipeline_fold_error(sub, &Document::new()) {
+                if let Some((code, msg)) = pipeline_fold_error(sub, &Vars::new()) {
                     return Err(CommandError::new(
                         code,
                         crate::util::error_code_name(code),
@@ -3599,7 +3630,7 @@ fn apply_lookup(
     spec: Option<&Bson>,
     docs: Vec<Document>,
     db: &str,
-    vars: &Document,
+    vars: &Vars,
     storage: &dyn crate::storage::Storage,
     collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
@@ -3682,20 +3713,15 @@ fn apply_lookup(
     });
     let sub_pipeline = rewritten.as_ref();
     let let_spec = spec.get("let").and_then(Bson::as_document);
-    let bind = |doc: &Document| -> Result<Document, CommandError> {
+    let bind = |doc: &Document| -> Result<Vars, CommandError> {
         let mut sub_vars = vars.clone();
         if let Some(ls) = let_spec {
             for (k, expr) in ls.iter() {
-                // A variable binds the value its expression came to, a stored
-                // `undefined` among them (RM-763). One that came to MISSING
-                // binds null: `vars` holds values only, and the sub-pipeline's
-                // stages take it as a document of them.
-                let v = match secantus_core::expressions::evaluate_field(doc, expr, vars)
-                    .map_err(|_| bad_value("$lookup let expression not supported"))?
-                {
-                    secantus_core::expressions::Field::Value(v) => v,
-                    secantus_core::expressions::Field::Missing => Bson::Null,
-                };
+                // A variable binds what its expression came to: a value, a
+                // stored `undefined` among them, or MISSING, which the
+                // sub-pipeline reads as mongod's EOO `Value` does (RM-763).
+                let v = secantus_core::expressions::evaluate_field(doc, expr, vars)
+                    .map_err(|_| bad_value("$lookup let expression not supported"))?;
                 sub_vars.insert(k.clone(), v);
             }
         }
@@ -3925,7 +3951,7 @@ fn apply_graph_lookup(
     spec: Option<&Bson>,
     docs: Vec<Document>,
     db: &str,
-    vars: &Document,
+    vars: &Vars,
     storage: &dyn crate::storage::Storage,
 ) -> Result<Vec<Document>, CommandError> {
     let spec = spec
@@ -3991,6 +4017,7 @@ fn apply_graph_lookup(
             max_depth,
             depth_field,
             restrict,
+            vars,
         )?;
         let mut new = doc;
         set_field_path(
@@ -4015,7 +4042,7 @@ fn apply_facet(
     docs: Vec<Document>,
     db: &str,
     coll: Option<&str>,
-    vars: &Document,
+    vars: &Vars,
     storage: &dyn crate::storage::Storage,
     collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
@@ -4055,27 +4082,24 @@ fn apply_facet(
 
 /// `$unionWith` — concatenate docs from another collection, optionally after a
 /// sub-pipeline. The spec is a bare collection name (`{$unionWith: "coll"}`) or
-/// `{coll, pipeline}`. The sub-pipeline runs in a *fresh* context (outer `let` /
-/// vars are not visible — mongod's `$unionWith` has no `let`; the system
-/// variables `$$NOW` / `$$CLUSTER_TIME` are), and the union docs
+/// `{coll, pipeline}`. The sub-pipeline sees the stage's variables (the
+/// command's `let`, an enclosing `$lookup`'s; mongod's `$unionWith` has no
+/// `let` of its own, 8.2.11), and the union docs
 /// are appended after the input docs (no dedup). Mirrors
 /// `aggregate._stage_union_with`.
 fn apply_union_with(
     spec: Option<&Bson>,
     mut docs: Vec<Document>,
     db: &str,
-    vars: &Document,
+    vars: &Vars,
     storage: &dyn crate::storage::Storage,
     collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
-    // The sub-pipeline sees no outer `let`, but the system variables are the
-    // command's: mongod 8.2.11 binds `$$NOW` (and `$$CLUSTER_TIME`) there
-    // with the command's values (RM-655).
-    let sys: Document = vars
-        .iter()
-        .filter(|(k, _)| matches!(k.as_str(), "NOW" | "CLUSTER_TIME"))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    // The sub-pipeline sees every variable of the stage's scope: the
+    // command's `let`, `$$NOW` and `$$CLUSTER_TIME` (RM-655), and an
+    // enclosing `$lookup`'s `let`, MISSING ones MISSING (RM-763; probed
+    // 8.2.11, which gives `$unionWith` no `let` of its own).
+    let sys = vars.clone();
     let (from, sub_pipeline): (Option<&str>, Option<&Vec<Bson>>) = match spec {
         // An EMPTY collection name is not a namespace. This used to return the
         // outer documents unchanged -- a wrong ANSWER. mongod renders the
@@ -4170,7 +4194,7 @@ fn apply_union_with(
         let sub = match crate::explain::sbe_pushdown(storage, db, from, &hoisted, None, collation) {
             Some(end) => {
                 if storage.collection_exists(db, from).unwrap_or(false) {
-                    secantus_core::sbe::build_check(&hoisted[..end], &Document::new())
+                    secantus_core::sbe::build_check(&hoisted[..end], &Vars::new())
                         .map_err(|f| parse_error(None, &f))?;
                 }
                 mark_sbe(hoisted, end)
@@ -4204,6 +4228,7 @@ fn graph_walk(
     max_depth: i64,
     depth_field: Option<&str>,
     restrict: Option<&Document>,
+    vars: &Vars,
 ) -> Result<Vec<Document>, CommandError> {
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
     let mut out: Vec<Document> = Vec::new();
@@ -4216,8 +4241,7 @@ fn graph_walk(
         for fdoc in foreign {
             // restrictSearchWithMatch (mongod): only traverse matching docs.
             if let Some(r) = restrict {
-                if !secantus_core::query::matches(fdoc, r, &Document::new(), None).unwrap_or(false)
-                {
+                if !secantus_core::query::matches(fdoc, r, vars, None).unwrap_or(false) {
                     continue;
                 }
             }
@@ -4442,14 +4466,7 @@ pub(crate) fn collection_documents(
     collation: Option<&Collation>,
 ) -> Result<Vec<Document>, CommandError> {
     if crate::ts_store::layout_of(storage, db, coll).is_some() {
-        return crate::ts_store::measurements(
-            storage,
-            db,
-            coll,
-            filter,
-            &Document::new(),
-            collation,
-        );
+        return crate::ts_store::measurements(storage, db, coll, filter, &Vars::new(), collation);
     }
     if !crate::views::is_view(storage, db, coll) {
         let found = storage
@@ -4474,7 +4491,7 @@ pub(crate) fn collection_documents(
         &pipeline,
         db,
         Some(&base),
-        &Document::new(),
+        &Vars::new(),
         storage,
         collation,
         &Document::new(),
@@ -4824,7 +4841,7 @@ fn apply_geo_near(
     docs: Vec<Document>,
     db: &str,
     coll: Option<&str>,
-    vars: &Document,
+    vars: &Vars,
     storage: &dyn crate::storage::Storage,
 ) -> Result<Vec<Document>, CommandError> {
     let within = SUB_PIPELINE.with(|s| s.borrow().last().cloned());
@@ -4846,7 +4863,7 @@ fn near_stage(
     docs: Vec<Document>,
     db: &str,
     coll: Option<&str>,
-    vars: &Document,
+    vars: &Vars,
     storage: &dyn crate::storage::Storage,
     within: Option<&(SubPipeline, Option<String>)>,
 ) -> Result<Vec<Document>, CommandError> {
@@ -5035,7 +5052,7 @@ pub(crate) fn geo_near_read(
         Vec::new(),
         db,
         Some(coll),
-        &Document::new(),
+        &Vars::new(),
         storage,
         None,
     )
@@ -5509,7 +5526,7 @@ fn enforce_target_validator(
     // A validator no interrupt reaches (RM-313).
     let _opaque = secantus_core::deadline::opaque();
     for d in docs {
-        if !secantus_core::query::matches(d, &validator, &Document::new(), None).unwrap_or(false) {
+        if !secantus_core::query::matches(d, &validator, &Vars::new(), None).unwrap_or(false) {
             // The `errInfo` an insert carries.
             let mut e = CommandError::new(
                 121,
@@ -5829,7 +5846,7 @@ fn apply_merge(
     docs: Vec<Document>,
     db: &str,
     source: Option<&str>,
-    vars: &Document,
+    vars: &Vars,
     storage: &dyn crate::storage::Storage,
     collation: Option<&Collation>,
     bypass_validation: bool,
@@ -6011,14 +6028,17 @@ fn apply_merge(
                 let mut constants = vars.clone();
                 if let Some(bindings) = &merge.let_vars {
                     for (name, expr) in bindings {
-                        let value = secantus_core::expressions::evaluate(doc, expr, vars)
+                        let value = secantus_core::expressions::evaluate_field(doc, expr, vars)
                             .map_err(|_| bad_value("$merge could not evaluate a 'let' variable"))?;
                         constants.insert(name.clone(), value);
                     }
                 }
                 constants.insert("new", doc.clone());
                 st.insert("u", pipeline.clone());
-                st.insert("c", constants);
+                // The update's `c` is a document, which has no MISSING: a
+                // variable bound to it is left out, and reads as undefined
+                // there, as mongod's does (probed 8.2.11).
+                st.insert("c", constants.values());
                 st.insert("upsert", upsert);
                 st.insert("upsertSupplied", upsert);
             }
@@ -6695,7 +6715,7 @@ fn lift_leading_match(pipeline: &[Bson]) -> (Document, Vec<Bson>) {
 fn reduce_raw_prefix(
     mut bytes: Vec<Vec<u8>>,
     pipeline: &[Bson],
-    vars: &Document,
+    vars: &Vars,
     collation: Option<&Collation>,
 ) -> (Vec<Vec<u8>>, Vec<Bson>) {
     let mut consumed = 0;
@@ -7046,7 +7066,7 @@ mod geo_near_candidate_tests {
 /// `$unionWith` holds, whose own optimizer adds its own prefix (measured
 /// 8.2.11, 2026-10-22). A `$lookup`'s pipeline is optimized per outer
 /// document, at run time, so it is not checked here.
-fn stage_fold_error(stage: &bson::Document, vars: &Document) -> Option<(i32, String)> {
+fn stage_fold_error(stage: &bson::Document, vars: &Vars) -> Option<(i32, String)> {
     let (name, spec) = stage.iter().next()?;
     let nested = |pipeline: &Bson| {
         pipeline_fold_error(pipeline, vars).map(|(c, m)| {
@@ -7097,7 +7117,7 @@ fn stage_fold_error(stage: &bson::Document, vars: &Document) -> Option<(i32, Str
 
 /// [`stage_fold_error`] over a whole pipeline, `$match` filters included:
 /// the first stage's error, without the optimizer's own prefix.
-fn pipeline_fold_error(pipeline: &Bson, vars: &Document) -> Option<(i32, String)> {
+fn pipeline_fold_error(pipeline: &Bson, vars: &Vars) -> Option<(i32, String)> {
     let Bson::Array(stages) = pipeline else {
         return None;
     };
@@ -7127,7 +7147,7 @@ fn filter_has_text(filter: &Document) -> bool {
 /// [`secantus_core::expr_rewrite::constant_expr_fault`], less an error the
 /// evaluator marks as per-document: that is not mongod's to raise while
 /// optimizing, constant arguments or not.
-fn expression_fault(e: &Bson, vars: &Document) -> Option<secantus_core::fallback::Fallback> {
+fn expression_fault(e: &Bson, vars: &Vars) -> Option<secantus_core::fallback::Fallback> {
     secantus_core::expr_rewrite::constant_expr_fault_with(e, vars)
         .filter(|f| f.folded_verdict() != Some(false))
 }
@@ -7136,7 +7156,7 @@ fn expression_fault(e: &Bson, vars: &Document) -> Option<secantus_core::fallback
 /// sortBy, output}}`, a window function beside its `window`): the
 /// accumulator itself is not an expression, and neither is a `sortBy` or a
 /// `window` spec.
-fn accumulator_fault(v: &Bson, vars: &Document) -> Option<secantus_core::fallback::Fallback> {
+fn accumulator_fault(v: &Bson, vars: &Vars) -> Option<secantus_core::fallback::Fallback> {
     let Bson::Document(d) = v else {
         return None;
     };
@@ -7381,6 +7401,23 @@ mod nested_stage_tests {
         // Every facet's shape before any facet's stages.
         let shape = bson!([{"$facet": {"a": [d.clone()], "b": [5]}}]);
         assert_eq!(problem(shape).map(|p| p.0), Some(40171));
+        // 40171 names the element, and comes before the pipeline's own 14
+        // as the command parses (RM-647, mongod 8.2.11).
+        let err = lite_parse_pipeline(
+            &[Bson::Document(
+                doc! {"$facet": {"a": [{"$match": {}}, "x"]}},
+            )],
+            "db",
+        )
+        .unwrap_err();
+        assert_eq!(
+            (err.code, err.errmsg.as_str()),
+            (
+                40171,
+                "elements of arrays in $facet spec must be non-empty objects, \
+                 a argument contained an element of type string: 1: \"x\""
+            )
+        );
         // A sub-pipeline's own refusal before the facet's.
         let first = bson!([{"$facet": {"a": [d.clone(), writes_in_lookup.clone()]}}]);
         assert_eq!(problem(first).map(|p| p.0), Some(51047));
@@ -7406,6 +7443,25 @@ mod documents_argument_tests {
     /// mongod 8.2.11 refuses a `$documents` argument that is not an array at
     /// RUN time, under the executor prefix of the command running it (RM-531).
     /// This answered 2 "$documents argument must evaluate to an array".
+    /// mongod 8.2.11 refuses an empty spec under the stage's parse envelope,
+    /// and a `$documents` past the first stage with 40602 before the
+    /// namespace check's 73 (RM-651).
+    #[test]
+    fn parse_and_position_refusals() {
+        let err = documents_stage(Some(&Bson::Document(doc! {})), &Vars::new(), Some("c"), 0)
+            .unwrap_err();
+        assert_eq!(err.code, 51270);
+        assert_eq!(
+            err.errmsg,
+            "Invalid $documents :: caused by :: Invalid empty sub-projection: _tempDocumentsField"
+        );
+        let arr = Bson::Array(vec![Bson::Document(doc! {"b": 1})]);
+        let err = documents_stage(Some(&arr), &Vars::new(), Some("c"), 1).unwrap_err();
+        assert_eq!(err.code, 40602);
+        let err = documents_stage(Some(&arr), &Vars::new(), Some("c"), 0).unwrap_err();
+        assert_eq!(err.code, 73);
+    }
+
     #[test]
     fn a_non_array_is_an_executor_error_naming_the_command() {
         for (ns, spec) in [
@@ -7415,7 +7471,7 @@ mod documents_argument_tests {
             ("db.$cmd.aggregate", Bson::Document(doc! {"a": 1})),
         ] {
             let _command = InCommand::enter(ns);
-            let err = documents_stage(Some(&spec), &Document::new(), None).unwrap_err();
+            let err = documents_stage(Some(&spec), &Vars::new(), None, 0).unwrap_err();
             assert_eq!(err.code, 5858203, "{spec:?}");
             assert_eq!(err.code_name, "Location5858203", "{spec:?}");
             assert_eq!(

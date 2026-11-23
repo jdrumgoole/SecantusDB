@@ -18,6 +18,7 @@
 //! without raising), `$facet` (recursive sub-pipelines), and `$densify` (numeric
 //! path; date-unit densify defers — see `densify.rs`).
 
+use crate::vars::Vars;
 use bson::{Bson, Document};
 
 use std::cmp::Ordering;
@@ -33,14 +34,14 @@ pub use crate::fallback::Fallback;
 
 type R<T> = Result<T, Fallback>;
 
-fn evaluate(expr: &Bson, doc: &Document, vars: &Document) -> R<Bson> {
+fn evaluate(expr: &Bson, doc: &Document, vars: &Vars) -> R<Bson> {
     expressions::evaluate(doc, expr, vars)
 }
 
 pub fn apply_pipeline(
     mut docs: Vec<Document>,
     pipeline: &[Bson],
-    vars: &Document,
+    vars: &Vars,
     coll: Option<&Collation>,
 ) -> R<Vec<Document>> {
     // Every comparison a stage makes -- an expression's `$eq`, a `$group`
@@ -496,7 +497,7 @@ fn apply_stage(
     name: &str,
     spec: &Bson,
     mut docs: Vec<Document>,
-    vars: &Document,
+    vars: &Vars,
     coll: Option<&Collation>,
 ) -> R<Vec<Document>> {
     match name {
@@ -675,7 +676,7 @@ fn apply_stage(
 fn window_sort_budget(
     docs: &[Document],
     spec: &Bson,
-    vars: &Document,
+    vars: &Vars,
     source: crate::sorter::SortSource,
     fields: Option<&std::collections::BTreeSet<String>>,
     sizes: Option<&[usize]>,
@@ -754,7 +755,7 @@ fn window_storage(
     before: &[Bson],
     source: Option<crate::sorter::SortSource>,
     computed: bool,
-    vars: &Document,
+    vars: &Vars,
     stores: Option<Vec<docstore::Stored>>,
     read_stores: &dyn Fn(&[Document]) -> Vec<docstore::Stored>,
 ) -> Option<(Vec<usize>, Vec<usize>)> {
@@ -878,7 +879,7 @@ fn stored_stage(
     spec: &Bson,
     docs: Vec<Document>,
     mut stores: Vec<docstore::Stored>,
-    vars: &Document,
+    vars: &Vars,
     coll: Option<&Collation>,
     tracks: Option<usize>,
 ) -> R<(Vec<Document>, Vec<docstore::Stored>)> {
@@ -1164,7 +1165,7 @@ fn window_fields_streamed(
     docs: Vec<Document>,
     pipeline: &[Bson],
     at: usize,
-    vars: &Document,
+    vars: &Vars,
     coll: Option<&Collation>,
     presorted: bool,
     sizes: Option<&[usize]>,
@@ -1259,7 +1260,7 @@ fn window_fields_streamed(
 /// `$$DESCEND` (recurse into nested docs / arrays-of-docs). Mirrors
 /// `aggregate._stage_redact`; a missing/empty expression or a non-sentinel result
 /// defers (Python raises).
-fn redact_stage(spec: &Bson, docs: Vec<Document>, vars: &Document) -> R<Vec<Document>> {
+fn redact_stage(spec: &Bson, docs: Vec<Document>, vars: &Vars) -> R<Vec<Document>> {
     // No empty-spec special case: mongod evaluates `{}` (and `null`) like any
     // other expression and reports the RESULT as a non-sentinel, not the spec
     // as missing. Probed on 8.2.11.
@@ -1290,7 +1291,7 @@ fn redact_marker(name: &str) -> Bson {
     })
 }
 
-fn redact_vars(vars: &Document) -> Document {
+fn redact_vars(vars: &Vars) -> Vars {
     let mut v = vars.clone();
     for name in ["KEEP", "PRUNE", "DESCEND"] {
         v.insert(name, redact_marker(name));
@@ -1306,7 +1307,7 @@ enum Decision {
     Other(Bson),
 }
 
-fn redact_decide(doc: &Document, spec: &Bson, vars: &Document) -> R<Decision> {
+fn redact_decide(doc: &Document, spec: &Bson, vars: &Vars) -> R<Decision> {
     let v = evaluate(spec, doc, vars)?;
     Ok(if v == redact_marker("KEEP") {
         Decision::Keep
@@ -1319,7 +1320,7 @@ fn redact_decide(doc: &Document, spec: &Bson, vars: &Document) -> R<Decision> {
     })
 }
 
-fn redact_subdoc(doc: &Document, spec: &Bson, vars: &Document) -> R<Option<Document>> {
+fn redact_subdoc(doc: &Document, spec: &Bson, vars: &Vars) -> R<Option<Document>> {
     match redact_decide(doc, spec, vars)? {
         Decision::Keep => Ok(Some(doc.clone())),
         Decision::Prune => Ok(None),
@@ -1330,7 +1331,7 @@ fn redact_subdoc(doc: &Document, spec: &Bson, vars: &Document) -> R<Option<Docum
     }
 }
 
-fn redact_descend(doc: &Document, spec: &Bson, vars: &Document) -> R<Document> {
+fn redact_descend(doc: &Document, spec: &Bson, vars: &Vars) -> R<Document> {
     let mut out = Document::new();
     for (k, v) in doc {
         match v {
@@ -1355,7 +1356,7 @@ fn redact_descend(doc: &Document, spec: &Bson, vars: &Document) -> R<Document> {
 /// This walked only the top level, so a sub-document one array deeper —
 /// `[[{lvl: 9}]]` — was passed through untouched and returned to the caller.
 /// mongod prunes it and leaves the inner array in place (`[[]]`).
-fn redact_list(values: &[Bson], spec: &Bson, vars: &Document) -> R<Vec<Bson>> {
+fn redact_list(values: &[Bson], spec: &Bson, vars: &Vars) -> R<Vec<Bson>> {
     let mut out = Vec::with_capacity(values.len());
     for elem in values {
         match elem {
@@ -1474,7 +1475,7 @@ pub fn render_value_compact(v: &Bson) -> String {
 pub fn redact_runtime_error(
     docs: &[Document],
     stages: &[Bson],
-    vars: &Document,
+    vars: &Vars,
     collation: Option<&Collation>,
 ) -> Option<(i32, String)> {
     for (i, stage) in stages.iter().enumerate() {
@@ -1711,7 +1712,7 @@ pub fn is_constant_expression(expr: &Bson, bound: &[String]) -> bool {
 fn numeric_guard_error(
     docs: &[Document],
     stages: &[Bson],
-    vars: &Document,
+    vars: &Vars,
     collation: Option<&Collation>,
 ) -> Option<(i32, String, bool)> {
     for (i, stage) in stages.iter().enumerate() {
@@ -1790,7 +1791,7 @@ fn collect_numeric_guard(expr: &Bson, found: &mut Option<(String, i32, Bson)>) {
 pub fn runtime_error(
     docs: &[Document],
     stages: &[Bson],
-    vars: &Document,
+    vars: &Vars,
     collation: Option<&Collation>,
 ) -> Option<(i32, String, bool)> {
     if let Some((code, msg)) = redact_runtime_error(docs, stages, vars, collation) {
@@ -1859,7 +1860,7 @@ fn densify_field_type_fault(spec: &Bson, docs: &[Document]) -> bool {
 
 /// True when `$bucket` has no usable `default` and some document's `groupBy`
 /// value falls outside every bucket -- the arm `bucket_stage` gives up on.
-fn bucket_unmatched_fault(spec: &Bson, docs: &[Document], vars: &Document) -> bool {
+fn bucket_unmatched_fault(spec: &Bson, docs: &[Document], vars: &Vars) -> bool {
     let Bson::Document(s) = spec else {
         return false;
     };
@@ -1892,8 +1893,8 @@ fn bucket_unmatched_fault(spec: &Bson, docs: &[Document], vars: &Document) -> bo
 
 /// True when a `$switch` anywhere in a projection-style spec matches no branch
 /// for some document and declares no `default`.
-fn switch_unmatched_fault(spec: &Bson, docs: &[Document], vars: &Document) -> bool {
-    fn walk(expr: &Bson, doc: &Document, vars: &Document) -> bool {
+fn switch_unmatched_fault(spec: &Bson, docs: &[Document], vars: &Vars) -> bool {
+    fn walk(expr: &Bson, doc: &Document, vars: &Vars) -> bool {
         match expr {
             Bson::Document(d) => {
                 if let Some(Bson::Document(sw)) = d.get("$switch") {
@@ -1924,7 +1925,7 @@ fn switch_unmatched_fault(spec: &Bson, docs: &[Document], vars: &Document) -> bo
 fn facet_stage(
     spec: &Bson,
     mut docs: Vec<Document>,
-    vars: &Document,
+    vars: &Vars,
     coll: Option<&Collation>,
 ) -> R<Vec<Document>> {
     let Bson::Document(s) = spec else {
@@ -2086,7 +2087,7 @@ pub fn sort_key_values(d: &Document, fields: &[(String, bool)]) -> R<Vec<Bson>> 
 /// runs that stage behind: a computed `partitionBy`, which mongod sorts on
 /// as a field it sets first, and then `by`, the partition's path and the
 /// `sortBy` (RM-520).
-fn sort_key_stage(docs: Vec<Document>, spec: &Bson, vars: &Document) -> R<Vec<Document>> {
+fn sort_key_stage(docs: Vec<Document>, spec: &Bson, vars: &Vars) -> R<Vec<Document>> {
     /// Where a computed partition is held while its key is taken.
     const PARTITION: &str = "__secantus_meta_partitionKey";
     let spec = spec.as_document().ok_or(Fallback::Defer)?;
@@ -2472,7 +2473,7 @@ fn unset_paths(spec: &Bson) -> R<Vec<String>> {
     }
 }
 
-fn add_fields_one(mut doc: Document, spec: &Document, vars: &Document) -> R<Document> {
+fn add_fields_one(mut doc: Document, spec: &Document, vars: &Vars) -> R<Document> {
     // Every field is evaluated against the ORIGINAL doc (matching Python — a
     // computed field doesn't see another set in the same stage), so evaluate all
     // expressions first, then mutate `doc` in place rather than cloning it.
@@ -2501,7 +2502,7 @@ fn add_fields_collect(
     spec: &Document,
     prefix: &str,
     doc: &Document,
-    vars: &Document,
+    vars: &Vars,
     out: &mut Vec<(String, expressions::Field)>,
 ) -> R<()> {
     for (name, expr) in spec {
@@ -2562,7 +2563,7 @@ fn add_field_into(holder: &mut Bson, rest: &[&str], value: &Bson) {
     }
 }
 
-fn replace_root_one(doc: &Document, expr: &Bson, vars: &Document, subject: &str) -> R<Document> {
+fn replace_root_one(doc: &Document, expr: &Bson, vars: &Vars, subject: &str) -> R<Document> {
     // A `newRoot` that resolves to nothing stays missing, which mongod
     // 8.2.11 names `MISSING` / 'missing'; a stored `undefined` is a value
     // (RM-622).
@@ -2691,7 +2692,7 @@ fn is_metadata(v: &Bson) -> bool {
         || matches!(v, Bson::String(s) if s.starts_with("$__secantus_meta_"))
 }
 
-fn project_one(doc: &Document, spec: &Document, vars: &Document) -> R<Document> {
+fn project_one(doc: &Document, spec: &Document, vars: &Vars) -> R<Document> {
     // A sub-document is a sub-projection, classified leaf by leaf:
     // `{a: {b: 1}}` includes `a.b`, `{a: {b: 0}}` excludes it, and
     // `{a: {z: "$x"}}` computes `a.z` (mongod 8.2.11, 2026-10-23). It used to
@@ -2812,7 +2813,7 @@ mod tests {
     use bson::doc;
 
     fn run(docs: Vec<Document>, pipeline: Vec<Bson>) -> Vec<Document> {
-        apply_pipeline(docs, &pipeline, &Document::new(), None).expect("should not fall back")
+        apply_pipeline(docs, &pipeline, &Vars::new(), None).expect("should not fall back")
     }
 
     /// A `$setWindowFields` takes its documents in the order of the
@@ -3079,7 +3080,7 @@ mod tests {
         assert!(apply_pipeline(
             vec![doc! {"a": 1}],
             &[bson::bson!({"$sample": {"size": 1}})],
-            &Document::new(),
+            &Vars::new(),
             None
         )
         .is_err());
@@ -3131,7 +3132,7 @@ mod redact_tests {
     use bson::doc;
 
     fn run(spec: Bson, doc_in: Document) -> R<Vec<Document>> {
-        redact_stage(&spec, vec![doc_in], &Document::new())
+        redact_stage(&spec, vec![doc_in], &Vars::new())
     }
 
     /// The bug this whole slice exists for: a STORED string must not be
@@ -3165,7 +3166,7 @@ mod redact_tests {
     #[test]
     fn the_decision_names_are_undefined_outside_redact() {
         // Not bound globally: evaluating them without the redact bindings defers.
-        let r = expressions::evaluate(&doc! {}, &Bson::String("$$KEEP".into()), &Document::new());
+        let r = expressions::evaluate(&doc! {}, &Bson::String("$$KEEP".into()), &Vars::new());
         assert!(r.is_err());
     }
 
@@ -3201,13 +3202,13 @@ mod redact_tests {
     #[test]
     fn the_runtime_error_names_mongods_code_and_value() {
         let stages = vec![Bson::Document(doc! {"$redact": 5})];
-        let (code, msg) = redact_runtime_error(&[doc! {"_id": 1}], &stages, &Document::new(), None)
+        let (code, msg) = redact_runtime_error(&[doc! {"_id": 1}], &stages, &Vars::new(), None)
             .expect("expected a named error");
         assert_eq!(code, 17053);
         assert!(msg.ends_with("but returned 5"), "{msg}");
         // A well-formed $redact names nothing.
         let ok = vec![Bson::Document(doc! {"$redact": "$$KEEP"})];
-        assert!(redact_runtime_error(&[doc! {"_id": 1}], &ok, &Document::new(), None).is_none());
+        assert!(redact_runtime_error(&[doc! {"_id": 1}], &ok, &Vars::new(), None).is_none());
     }
 
     /// Each message here was copied from mongod 8.2.11 (2026-08-31), not
@@ -3266,13 +3267,23 @@ mod redact_tests {
         let stages = vec![Bson::Document(
             doc! {"$densify": {"field": "s", "range": {"step": 1, "bounds": "full"}}},
         )];
-        let (code, msg, _folded) =
-            runtime_error(&[doc! {"_id": 1, "s": "x"}], &stages, &vars, None)
-                .expect("densify should be named");
+        let (code, msg, _folded) = runtime_error(
+            &[doc! {"_id": 1, "s": "x"}],
+            &stages,
+            &Vars::from(&vars),
+            None,
+        )
+        .expect("densify should be named");
         assert_eq!(code, 5733201);
         assert_eq!(msg, "Densify field type must be numeric or a date");
         // A numeric field is fine, and names nothing.
-        assert!(runtime_error(&[doc! {"_id": 1, "s": 1}], &stages, &vars, None).is_none());
+        assert!(runtime_error(
+            &[doc! {"_id": 1, "s": 1}],
+            &stages,
+            &Vars::from(&vars),
+            None
+        )
+        .is_none());
 
         // $bucket with a value outside every boundary and no default. mongod
         // implements $bucket over $switch, so it reports the $switch sentence
@@ -3280,24 +3291,46 @@ mod redact_tests {
         let stages = vec![Bson::Document(
             doc! {"$bucket": {"groupBy": "$n", "boundaries": [0, 10]}},
         )];
-        let (code, msg, _folded) = runtime_error(&[doc! {"_id": 1, "n": 99}], &stages, &vars, None)
-            .expect("bucket should be named");
+        let (code, msg, _folded) = runtime_error(
+            &[doc! {"_id": 1, "n": 99}],
+            &stages,
+            &Vars::from(&vars),
+            None,
+        )
+        .expect("bucket should be named");
         assert_eq!(code, 7158303);
         assert_eq!(msg, NO_MATCHING_BRANCH_MESSAGE);
         // In range, so nothing to name.
-        assert!(runtime_error(&[doc! {"_id": 1, "n": 5}], &stages, &vars, None).is_none());
+        assert!(runtime_error(
+            &[doc! {"_id": 1, "n": 5}],
+            &stages,
+            &Vars::from(&vars),
+            None
+        )
+        .is_none());
         // An explicit default absorbs it.
         let with_default = vec![Bson::Document(
             doc! {"$bucket": {"groupBy": "$n", "boundaries": [0, 10], "default": "other"}},
         )];
-        assert!(runtime_error(&[doc! {"_id": 1, "n": 99}], &with_default, &vars, None).is_none());
+        assert!(runtime_error(
+            &[doc! {"_id": 1, "n": 99}],
+            &with_default,
+            &Vars::from(&vars),
+            None
+        )
+        .is_none());
 
         // $switch inside a projection, no branch matching and no default.
         let stages = vec![Bson::Document(doc! {"$project": {
             "v": {"$switch": {"branches": [{"case": {"$eq": ["$n", 99]}, "then": 1}]}}
         }})];
-        let (code, msg, _folded) = runtime_error(&[doc! {"_id": 1, "n": 1}], &stages, &vars, None)
-            .expect("switch should be named");
+        let (code, msg, _folded) = runtime_error(
+            &[doc! {"_id": 1, "n": 1}],
+            &stages,
+            &Vars::from(&vars),
+            None,
+        )
+        .expect("switch should be named");
         assert_eq!(code, 40066);
         assert_eq!(msg, NO_MATCHING_BRANCH_MESSAGE);
         // A default means there is nothing to name.
@@ -3306,7 +3339,13 @@ mod redact_tests {
                 "branches": [{"case": {"$eq": ["$n", 99]}, "then": 1}], "default": 0
             }}
         }})];
-        assert!(runtime_error(&[doc! {"_id": 1, "n": 1}], &defaulted, &vars, None).is_none());
+        assert!(runtime_error(
+            &[doc! {"_id": 1, "n": 1}],
+            &defaulted,
+            &Vars::from(&vars),
+            None
+        )
+        .is_none());
     }
 }
 
@@ -3317,7 +3356,7 @@ mod project_id_only_tests {
 
     fn project(spec: Bson) -> Document {
         let docs = vec![doc! {"_id": 1, "v": true, "w": 2}];
-        apply_pipeline(docs, &[bson!({"$project": spec})], &Document::new(), None)
+        apply_pipeline(docs, &[bson!({"$project": spec})], &Vars::new(), None)
             .unwrap()
             .remove(0)
     }

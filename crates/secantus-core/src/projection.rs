@@ -5,6 +5,7 @@
 //! inclusion/exclusion which Python raises on, nested-document specs, unusual
 //! `$slice` argument types, or a `$elemMatch` sub-filter the matcher defers).
 
+use crate::vars::Vars;
 use bson::{Bson, Document, RawDocument};
 
 use crate::{paths, query};
@@ -472,7 +473,7 @@ fn first_match(doc: &Document, path: &str, sub_filter: &Document) -> R<Option<Bs
     let Some(Bson::Array(arr)) = paths::get_path(doc, path) else {
         return Ok(None);
     };
-    let empty = Document::new();
+    let empty = Vars::new();
     let value_predicate = !sub_filter.is_empty() && sub_filter.keys().all(|k| k.starts_with('$'));
     let cond = Bson::Document(sub_filter.clone());
     for elem in arr {
@@ -609,7 +610,7 @@ fn with_computed(
     result: &mut Document,
     doc: &Document,
     computed: &[(String, Bson)],
-    vars: &Document,
+    vars: &Vars,
 ) -> R<()> {
     for (key, expr) in computed {
         let crate::expressions::Field::Value(value) =
@@ -666,7 +667,7 @@ mod covered_tests {
 /// Apply a projection spec to a document. `Err(Fallback::Defer)` => defer to the
 /// pure-Python `apply_projection` (which also raises the mixed-mode error).
 pub fn apply_projection(doc: &Document, spec: &Document, query: Option<&Document>) -> R<Document> {
-    apply_projection_with(doc, spec, query, &Document::new())
+    apply_projection_with(doc, spec, query, &Vars::new())
 }
 
 /// [`apply_projection`] with the command's variables (its `let`, `$$NOW`),
@@ -675,7 +676,7 @@ pub fn apply_projection_with(
     doc: &Document,
     spec: &Document,
     query: Option<&Document>,
-    vars: &Document,
+    vars: &Vars,
 ) -> R<Document> {
     if spec.is_empty() {
         return Ok(doc.clone());

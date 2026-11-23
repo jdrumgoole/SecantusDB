@@ -1822,7 +1822,7 @@ fn flush_changed(storage: &std::sync::Arc<secantus_storage::Storage>, force: boo
                     crate::heap_store::COLLECTION,
                     &bson::doc! { "_id": oid.to_string() },
                     0,
-                    &Document::new(),
+                    &secantus_core::vars::Vars::new(),
                     None,
                 )?;
                 storage.insert(

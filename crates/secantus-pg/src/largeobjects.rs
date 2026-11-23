@@ -123,7 +123,14 @@ impl PgHandler {
         }
         let n = self
             .storage
-            .delete_matching(self.db(), coll, &filter, 0, &Document::new(), None)
+            .delete_matching(
+                self.db(),
+                coll,
+                &filter,
+                0,
+                &secantus_core::vars::Vars::new(),
+                None,
+            )
             .map_err(|e| Self::storage_err("could not write the large object", e))?;
         Ok(n as u64)
     }

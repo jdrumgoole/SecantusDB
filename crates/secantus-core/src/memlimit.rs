@@ -931,12 +931,13 @@ mod tests {
         // Linux, 184 on macOS arm64).
         let docs: Vec<Document> = (0..300).map(|i| doc! {"_id": i, "k": i % 7}).collect();
         let spec = Bson::Document(doc! {"_id": "$k", "n": {"$sum": 1}});
-        let (out, report) =
-            captured(|| crate::group::group_stage(&spec, &docs, &Document::new()).unwrap());
+        let (out, report) = captured(|| {
+            crate::group::group_stage(&spec, &docs, &crate::vars::Vars::new()).unwrap()
+        });
         assert_eq!(out.len(), 7);
         // Kept only while explain reads them.
         reset_report();
-        crate::group::group_stage(&spec, &docs, &Document::new()).unwrap();
+        crate::group::group_stage(&spec, &docs, &crate::vars::Vars::new()).unwrap();
         assert!(super::report().groups.is_empty());
         assert_eq!(
             report.groups,

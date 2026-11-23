@@ -15,6 +15,7 @@
 //! (`$group`, an unindexed `$sort`) reads everything for its first batch,
 //! and is not streamed here.
 
+use secantus_core::vars::Vars;
 use std::collections::VecDeque;
 
 use bson::{doc, Bson, Document};
@@ -84,7 +85,7 @@ pub(crate) struct Ask<'a> {
     pub ns: &'a str,
     pub pipeline: &'a [Bson],
     pub hint: Option<&'a Bson>,
-    pub vars: &'a Document,
+    pub vars: &'a Vars,
     pub batch_size: i64,
     pub command: &'a Document,
     /// The command's collation (a view's own, through a view).
@@ -884,7 +885,7 @@ struct AggStream {
     db: String,
     coll: String,
     ns: String,
-    vars: Document,
+    vars: Vars,
     command: Document,
     /// The plan, as every batch's line repeats it.
     summary: Option<String>,
@@ -1057,7 +1058,7 @@ impl AggStream {
                 ns: &self.ns,
                 pipeline: &pipeline,
                 hint: None,
-                vars: &Document::new(),
+                vars: &self.vars,
                 batch_size: 0,
                 command: &self.command,
                 collation: self.collation.as_ref(),

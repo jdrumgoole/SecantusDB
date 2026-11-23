@@ -256,7 +256,8 @@ fn insert(
     let passes: Vec<bool> = documents
         .iter()
         .map(|d| {
-            secantus_core::query::matches(d, &validator, &Document::new(), None).unwrap_or(true)
+            secantus_core::query::matches(d, &validator, &secantus_core::vars::Vars::new(), None)
+                .unwrap_or(true)
         })
         .collect();
     if passes.iter().all(|p| *p) {

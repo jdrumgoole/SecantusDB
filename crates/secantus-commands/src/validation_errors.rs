@@ -198,7 +198,8 @@ fn parse_field(field: &str, value: &Bson) -> Vec<Node> {
 }
 
 fn filter_matches(doc: &Document, filter: &Document) -> bool {
-    secantus_core::query::matches(doc, filter, &Document::new(), None).unwrap_or(false)
+    secantus_core::query::matches(doc, filter, &secantus_core::vars::Vars::new(), None)
+        .unwrap_or(false)
 }
 
 fn node_matches(node: &Node, doc: &Document) -> bool {
@@ -257,8 +258,9 @@ fn explain_node(node: &Node, doc: &Document, inverted: bool) -> Option<Document>
             field, op, spec, ..
         } => leaf_details(doc, field, op, spec, inverted),
         Node::Expr(e) => {
-            let result = secantus_core::expressions::evaluate(doc, e, &Document::new())
-                .unwrap_or(Bson::Null);
+            let result =
+                secantus_core::expressions::evaluate(doc, e, &secantus_core::vars::Vars::new())
+                    .unwrap_or(Bson::Null);
             let reason = if inverted {
                 "expression did match"
             } else {

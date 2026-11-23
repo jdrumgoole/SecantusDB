@@ -37,15 +37,15 @@ def _facet_element(client: Any) -> dict:
     )
 
 
-@pytest.mark.backlog("RM-647")
+@pytest.mark.backlog_fixed("RM-647")
 def test_a_facet_element_refusal_names_the_element(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
     """mongod 8.2.11 names the element a `$facet` pipeline holds that is not
     a non-empty object (40171): "... b argument contained an element of type
-    int: 0: 5". This server says "... b argument contained an invalid
-    element"."""
+    int: 0: 5". This server said "... b argument contained an invalid
+    element", and answered 14 for a non-object element (RM-647)."""
     assert _facet_element(rust_mongo) == _facet_element(mongod_rs)
 
 
@@ -152,7 +152,7 @@ def _documents_refusals(client: Any) -> dict:
     )
 
 
-@pytest.mark.backlog("RM-651")
+@pytest.mark.backlog_fixed("RM-651")
 def test_documents_refusals_in_a_sub_pipeline(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -162,8 +162,9 @@ def test_documents_refusals_in_a_sub_pipeline(
     pipeline", under a `$unionWith` that reads a collection too, and an
     empty `{$documents: {}}` with 51270, "Invalid $documents :: caused by
     :: Invalid empty sub-projection: _tempDocumentsField". This server
-    answers the first 73 ("can only be run with {aggregate: 1}") and drops
-    the second's "Invalid $documents :: caused by ::" envelope."""
+    answered the first 73 ("can only be run with {aggregate: 1}") and
+    dropped the second's "Invalid $documents :: caused by ::" envelope
+    (RM-651)."""
     assert _documents_refusals(rust_mongo) == _documents_refusals(mongod_rs)
 
 

@@ -717,7 +717,8 @@ mod tests {
             (doc! { "s": { "$regex": "a" } }, false),
         ] {
             assert_eq!(
-                crate::query::matches(&doc, &filter, &no_vars, None).unwrap(),
+                crate::query::matches(&doc, &filter, &crate::vars::Vars::from(&no_vars), None)
+                    .unwrap(),
                 hit,
                 "{filter}"
             );

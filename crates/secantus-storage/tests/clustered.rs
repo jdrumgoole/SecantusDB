@@ -176,7 +176,7 @@ fn update_delete_and_a_secondary_index_work_on_the_keys() {
             false,
             false,
             &[],
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
             None,
             None,
             false,
@@ -193,8 +193,15 @@ fn update_delete_and_a_secondary_index_work_on_the_keys() {
         assert_eq!(by_x9.len(), 1);
         // A delete removes the row and its entries.
         assert_eq!(
-            st.delete_matching("app", "c", &doc! {"_id": 1}, 1, &Document::new(), None)
-                .unwrap(),
+            st.delete_matching(
+                "app",
+                "c",
+                &doc! {"_id": 1},
+                1,
+                &secantus_core::vars::Vars::new(),
+                None
+            )
+            .unwrap(),
             1
         );
         assert_eq!(st.index_table_rows("app", "c", "x_1").unwrap().len(), 19);

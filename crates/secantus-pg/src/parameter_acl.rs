@@ -108,7 +108,7 @@ impl PgHandler {
                 PARAMETER_ACL_COLLECTION,
                 &bson::doc! {"_id": &acl.name},
                 0,
-                &Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
             )
             .map_err(err)?;

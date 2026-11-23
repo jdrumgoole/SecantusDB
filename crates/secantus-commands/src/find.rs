@@ -22,6 +22,7 @@
 //!   `collation` IS applied — filter matching + sort order are collation-aware
 //!   (COLLSCAN-forced); a non-ASCII / numericOrdering collation → `BadValue`.
 
+use secantus_core::vars::Vars;
 use std::sync::Arc;
 
 use bson::{doc, Bson, Document};
@@ -56,7 +57,7 @@ struct TailableFindProducer {
     /// first batch, so a filtered tail returned every new document whole.
     filter: Document,
     projection: Option<Document>,
-    let_vars: Document,
+    let_vars: Vars,
     collation: Option<secantus_core::collation::Collation>,
     /// The oplog tail when the last scan began. Every insert into the
     /// collection logs an entry, so a document the scan missed has a later
@@ -457,7 +458,7 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             sort: doc.get_document("sort").ok(),
             hint: argtypes::given_hint(doc),
             collation: collation.as_ref(),
-            vars: &Document::new(),
+            vars: &Vars::new(),
             limit: 0,
             asked: Default::default(),
         };
@@ -1425,7 +1426,7 @@ fn is_clustered(storage: &dyn crate::storage::Storage, db: &str, coll: &str) -> 
 /// 2026-10-16).
 fn validate_empty_result(
     filter: &Document,
-    let_vars: &Document,
+    let_vars: &Vars,
     collation: Option<&secantus_core::collation::Collation>,
 ) -> Result<(), CommandError> {
     if filter.is_empty() {
@@ -1458,7 +1459,7 @@ struct StreamAsk<'a> {
     limit: usize,
     batch_size: i64,
     single_batch: bool,
-    let_vars: &'a Document,
+    let_vars: &'a Vars,
     ns: &'a str,
     collation: Option<&'a secantus_core::collation::Collation>,
     min: Option<&'a Document>,
@@ -1475,7 +1476,7 @@ struct FindStream {
     stream: crate::explain::stream::Stream,
     projection: Option<Document>,
     filter: Document,
-    vars: Document,
+    vars: Vars,
     ns: String,
     summary: Option<String>,
     command: Document,
@@ -2568,7 +2569,7 @@ fn project_to_docs(
     docs: Vec<Vec<u8>>,
     spec: &Document,
     filter: &Document,
-    vars: &Document,
+    vars: &Vars,
     ns: &str,
 ) -> Result<Vec<Document>, CommandError> {
     let query = if filter.is_empty() {

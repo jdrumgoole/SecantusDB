@@ -59,7 +59,7 @@ fn set_n(st: &Storage, id: i32, n: i32) {
         false,
         false,
         &[],
-        &Document::new(),
+        &secantus_core::vars::Vars::new(),
         None,
         None,
         false,

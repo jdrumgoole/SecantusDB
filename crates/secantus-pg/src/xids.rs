@@ -100,7 +100,7 @@ fn reserve(storage: &Storage, upto: u64) -> Result<(), String> {
                 false,
                 true,
                 &[],
-                &bson::Document::new(),
+                &secantus_core::vars::Vars::new(),
                 None,
                 None,
                 false,

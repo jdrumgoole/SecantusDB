@@ -82,8 +82,15 @@ fn prepare_unique_arms_index_then_find_duplicates_groups() {
         st.insert_one("app", "c", &enc(&doc! {"_id": 4, "x": 2}))
             .unwrap();
         // Once the duplicates are gone, there are no more violations.
-        st.delete_matching("app", "c", &doc! {"_id": 2}, 0, &doc! {}, None)
-            .unwrap();
+        st.delete_matching(
+            "app",
+            "c",
+            &doc! {"_id": 2},
+            0,
+            &secantus_core::vars::Vars::new(),
+            None,
+        )
+        .unwrap();
         assert!(st
             .find_index_duplicates("app", "c", "x_1")
             .unwrap()

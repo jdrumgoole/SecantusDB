@@ -25,6 +25,7 @@
 //! (`aggregate::resolve_view`).
 
 use bson::{doc, Bson, Document};
+use secantus_core::vars::Vars;
 
 /// The `errInfo` body for a failed document validation: `failingDocumentId`
 /// (when the doc has an `_id`) plus mongod's explanation of every rule it broke
@@ -715,7 +716,7 @@ fn insert_raw_path(
             if let Ok(d) = secantus_core::bsondoc::from_bytes(&raw[..]) {
                 // Where no interrupt reaches it, as mongod runs it (RM-313).
                 let _opaque = secantus_core::deadline::opaque();
-                if !secantus_core::query::matches(&d, v, &Document::new(), None).unwrap_or(true) {
+                if !secantus_core::query::matches(&d, v, &Vars::new(), None).unwrap_or(true) {
                     pre_errors.push(doc! {
                         "index": index as i32,
                         "code": 121,
@@ -1133,7 +1134,7 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         if let Some(v) = &validator {
             // Where no interrupt reaches it, as mongod runs it (RM-313).
             let _opaque = secantus_core::deadline::opaque();
-            if !secantus_core::query::matches(d, v, &Document::new(), None).unwrap_or(true) {
+            if !secantus_core::query::matches(d, v, &Vars::new(), None).unwrap_or(true) {
                 pre_errors.push(doc! {
                     "index": index as i32,
                     "code": 121,
@@ -1710,7 +1711,7 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             &ctx.db_name,
             &coll,
             &filter,
-            &Document::new(),
+            &Vars::new(),
             collation.as_ref(),
         )?
         .len() as i64
@@ -1776,7 +1777,7 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 None,
                 Some(hint),
                 collation.as_ref(),
-                &Document::new(),
+                &Vars::new(),
             )
             .map_err(|e| {
                 crate::util::read_error_on_namespace(e, "count", &format!("{}.{coll}", ctx.db_name))
@@ -1829,7 +1830,7 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     sort: None,
                     hint: None,
                     collation: collation.as_ref(),
-                    vars: &Document::new(),
+                    vars: &Vars::new(),
                     limit: 0,
                     asked: Default::default(),
                 },
@@ -1889,7 +1890,7 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 sort: None,
                 hint: argtypes::given_hint(doc),
                 collation: collation.as_ref(),
-                vars: &Document::new(),
+                vars: &Vars::new(),
                 limit: 0,
                 asked: crate::near::Asked {
                     skip,
@@ -1912,7 +1913,7 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 sort: None,
                 hint: argtypes::given_hint(doc),
                 collation: collation.as_ref(),
-                vars: &Document::new(),
+                vars: &Vars::new(),
                 limit: 0,
                 asked: Default::default(),
             },
@@ -2388,7 +2389,7 @@ pub(crate) fn update_in(
             }
             continue;
         }
-        let stmt_vars: std::borrow::Cow<Document> = match constants {
+        let stmt_vars: std::borrow::Cow<Vars> = match constants {
             Some(c) => {
                 let mut vars = let_vars.clone();
                 for (name, value) in c {
@@ -2648,7 +2649,7 @@ pub(crate) fn update_in(
                         sort: Some(sort),
                         hint: None,
                         collation: collation.as_ref(),
-                        vars: &Document::new(),
+                        vars: &Vars::new(),
                         limit: 1,
                         // An update of one document under a sort: mongod's
                         // query has a limit of one.

@@ -160,7 +160,7 @@ pub(crate) fn rows_matching(
             built?
         }
     };
-    let empty = Document::new();
+    let empty = secantus_core::vars::Vars::new();
     let mut out = Vec::new();
     for &i in part.buckets.get(&want).map_or(&[][..], Vec::as_slice) {
         let raw = &part.rows[i];

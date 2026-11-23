@@ -60,7 +60,7 @@ fn set_a(st: &Storage, id: i64, a: i64) {
         false,
         false,
         &[],
-        &Document::new(),
+        &secantus_core::vars::Vars::new(),
         None,
         None,
         false,

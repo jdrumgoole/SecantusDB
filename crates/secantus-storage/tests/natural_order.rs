@@ -163,7 +163,7 @@ fn natural_hint_walks_insertion_order() {
             None,
             Some(&hint),
             None,
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
         )
         .unwrap()
         .iter()
@@ -184,7 +184,7 @@ fn natural_hint_walks_insertion_order() {
             None,
             Some(&rev),
             None,
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
         )
         .unwrap()
         .iter()
@@ -204,7 +204,7 @@ fn natural_hint_walks_insertion_order() {
             None,
             Some(&secantus_storage::Hint::Name("$natural".to_string())),
             None,
-            &Document::new(),
+            &secantus_core::vars::Vars::new(),
         )
         .is_err());
     drop(st);

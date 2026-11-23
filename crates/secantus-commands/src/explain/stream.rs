@@ -49,6 +49,7 @@
 //! documents (mongod reads it whole for the first batch too), plans that
 //! intersect, and a geo read other than a `$near`, or a text read.
 
+use secantus_core::vars::Vars;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -245,7 +246,7 @@ struct Cx<'a> {
     storage: &'a dyn Storage,
     db: &'a str,
     coll: &'a str,
-    vars: &'a Document,
+    vars: &'a Vars,
     keys: i64,
     docs: i64,
     /// How many more results the batch takes (0: as many as its bytes
@@ -1933,7 +1934,7 @@ pub(crate) fn scan_reach(
     };
     scan.distinct = width;
     scan.read = Some(Vec::new());
-    let vars = Document::new();
+    let vars = secantus_core::vars::Vars::new();
     let mut cx = Cx {
         storage,
         db,
@@ -2171,7 +2172,7 @@ pub(crate) struct Stream {
     db: String,
     coll: String,
     root: Stage,
-    vars: Document,
+    vars: Vars,
     /// Results still to skip, and still to return.
     skip: i64,
     limit: Option<i64>,
@@ -2263,7 +2264,7 @@ impl Stream {
         db: &str,
         coll: &str,
         filter: &Document,
-        vars: &Document,
+        vars: &Vars,
     ) -> Result<Option<Stream>, StorageError> {
         Stream::of_plan_with(plan, db, coll, filter, vars, &Options::default())
     }
@@ -2274,7 +2275,7 @@ impl Stream {
         db: &str,
         coll: &str,
         filter: &Document,
-        vars: &Document,
+        vars: &Vars,
         opts: &Options,
     ) -> Result<Option<Stream>, StorageError> {
         // A LIMIT over a SKIP, and the projection at any level of them (a
@@ -2431,7 +2432,7 @@ impl Stream {
         db: &str,
         coll: &str,
         filter: &Document,
-        vars: &Document,
+        vars: &Vars,
         measure: Measure,
         base: Vec<FieldBounds>,
         skip: i64,
@@ -2480,7 +2481,7 @@ impl Stream {
         db: &str,
         coll: &str,
         filter: &Document,
-        vars: &Document,
+        vars: &Vars,
         opts: &Options,
     ) -> Result<Option<Stream>, StorageError> {
         let Node::CountScan(ix) = input else {

@@ -1239,7 +1239,9 @@ fn rehydrate(
         return None;
     }
     let validator = crate::ts_buckets::validator(&layout.time);
-    if !secantus_core::query::matches(doc, &validator, &Document::new(), None).unwrap_or(true) {
+    if !secantus_core::query::matches(doc, &validator, &secantus_core::vars::Vars::new(), None)
+        .unwrap_or(true)
+    {
         stats.inc(Stat::ReopenFailedValidator);
         return None;
     }
