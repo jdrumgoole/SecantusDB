@@ -3177,7 +3177,31 @@ fn documents_stage(
     for elem in arr {
         match elem {
             Bson::Document(d) => out.push(d),
-            _ => return Err(bad_value("each $documents element must be an object")),
+            // mongod unwinds the array into `_tempDocumentsField` and makes
+            // each element the root, so an element that is not a document
+            // fails at RUN time with `$replaceRoot`'s 40228, under the
+            // executor prefix of the command running it (RM-653, 8.2.11).
+            other => {
+                let rendered = secantus_core::aggregate::render_value_compact(&other);
+                let type_name = secantus_core::query::bson_type_name(&other);
+                let input = secantus_core::aggregate::render_value_compact(&Bson::Document(
+                    bson::doc! {"_tempDocumentsField": other},
+                ));
+                let ns = COMMAND_NS.with(|n| n.borrow().clone());
+                return Err(CommandError::new(
+                    40228,
+                    crate::util::error_code_name(40228),
+                    wrap_pipeline_error(
+                        format!(
+                            "elements within the array passed to $documents must evaluate to \
+                             an object, but resulting value was: {rendered}. Type of resulting \
+                             value: '{type_name}'. Input document: {input}"
+                        ),
+                        false,
+                        ns.as_deref(),
+                    ),
+                ));
+            }
         }
     }
     Ok(out)

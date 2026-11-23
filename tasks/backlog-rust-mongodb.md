@@ -1267,17 +1267,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-532.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm532.py::test_a_hybrid_search_names_the_collection_it_unions
       Backlog-ID: RM-644
-- [ ] **A `$documents` element that is not a document answers 2.**
-      mongod 8.2.11 refuses `$documents: [{a: 1}, 2]` at run time with 40228
-      "Executor error during aggregate command on namespace:
-      <db>.$cmd.aggregate :: caused by :: elements within the array passed
-      to $documents must evaluate to an object, but resulting value was: 2.
-      Type of resulting value: 'int'. Input document: {_tempDocumentsField:
-      2}" (the outer collection's namespace inside a `$lookup`). This server
-      answers 2 "each $documents element must be an object". Found
-      2026-11-14 working RM-531.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_a_documents_element_that_is_not_a_document_is_40228
-      Backlog-ID: RM-653
 - [ ] **A `$documents` expression that fails answers "expression not
       supported".** mongod 8.2.11 answers `$documents: {$divide: [1, 0]}`
       (or an element `{x: {$divide: [1, 0]}}`) with 2 "Failed to optimize
