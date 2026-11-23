@@ -2328,6 +2328,12 @@ fn lite_parse_pipeline(pipeline: &[Bson], db: &str) -> Result<(), CommandError> 
         if name == "$unionWith" {
             union_with_lite_parse(d.get(name))?;
         }
+        // `$facet`'s lite parse reads its spec's shape first (40169-40171),
+        // so a facet element that is not a stage is named, not the bare 14
+        // of a pipeline element (RM-647).
+        if name == "$facet" {
+            facet_pipelines(d.get(name))?;
+        }
         // A `$facet`'s, a `$lookup`'s and a `$unionWith`'s pipeline is a
         // `LiteParsedPipeline` of its own, built as its stage is read: an
         // unknown stage there is 40324 as the command parses (RM-603).
@@ -3275,7 +3281,7 @@ fn nested_stage_problem(pipeline: &[Bson]) -> Option<CommandError> {
 
 /// A `$facet` spec's pipelines, in order, once the whole spec has the shape
 /// mongod reads before it parses any of them: a non-empty object (40169),
-/// each value an array (40170) of non-empty objects (40171).
+/// each value an array (40170) of objects (40171, which names the element).
 fn facet_pipelines(spec: Option<&Bson>) -> Result<Vec<(&str, &[Bson])>, CommandError> {
     let s = spec
         .and_then(Bson::as_document)
@@ -3305,16 +3311,23 @@ fn facet_pipelines(spec: Option<&Bson>) -> Result<Vec<(&str, &[Bson])>, CommandE
                 ),
             )
         })?;
-        if !stages
+        // mongod names the element as `BSONElement::toString` prints it:
+        // its type, its index in the array and its value (RM-647, 8.2.11).
+        if let Some((index, bad)) = stages
             .iter()
-            .all(|stage| matches!(stage, Bson::Document(d) if !d.is_empty()))
+            .enumerate()
+            // Despite its wording, an empty object passes here and is the
+            // pipeline's 40323 (measured 8.2.11).
+            .find(|(_, stage)| !matches!(stage, Bson::Document(_)))
         {
             return Err(CommandError::new(
                 40171,
                 "Location40171",
                 format!(
                     "elements of arrays in $facet spec must be non-empty objects, \
-                     {name} argument contained an invalid element"
+                     {name} argument contained an element of type {}: {index}: {}",
+                    secantus_core::query::bson_type_name(bad),
+                    argtypes::render_stage_value(bad)
                 ),
             ));
         }
@@ -7376,6 +7389,23 @@ mod nested_stage_tests {
         // Every facet's shape before any facet's stages.
         let shape = bson!([{"$facet": {"a": [d.clone()], "b": [5]}}]);
         assert_eq!(problem(shape).map(|p| p.0), Some(40171));
+        // 40171 names the element, and comes before the pipeline's own 14
+        // as the command parses (RM-647, mongod 8.2.11).
+        let err = lite_parse_pipeline(
+            &[Bson::Document(
+                doc! {"$facet": {"a": [{"$match": {}}, "x"]}},
+            )],
+            "db",
+        )
+        .unwrap_err();
+        assert_eq!(
+            (err.code, err.errmsg.as_str()),
+            (
+                40171,
+                "elements of arrays in $facet spec must be non-empty objects, \
+                 a argument contained an element of type string: 1: \"x\""
+            )
+        );
         // A sub-pipeline's own refusal before the facet's.
         let first = bson!([{"$facet": {"a": [d.clone(), writes_in_lookup.clone()]}}]);
         assert_eq!(problem(first).map(|p| p.0), Some(51047));

@@ -37,15 +37,15 @@ def _facet_element(client: Any) -> dict:
     )
 
 
-@pytest.mark.backlog("RM-647")
+@pytest.mark.backlog_fixed("RM-647")
 def test_a_facet_element_refusal_names_the_element(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
     """mongod 8.2.11 names the element a `$facet` pipeline holds that is not
     a non-empty object (40171): "... b argument contained an element of type
-    int: 0: 5". This server says "... b argument contained an invalid
-    element"."""
+    int: 0: 5". This server said "... b argument contained an invalid
+    element", and answered 14 for a non-object element (RM-647)."""
     assert _facet_element(rust_mongo) == _facet_element(mongod_rs)
 
 

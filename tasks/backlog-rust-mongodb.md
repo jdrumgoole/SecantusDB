@@ -1237,14 +1237,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-532.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm532.py::test_a_hybrid_search_names_the_collection_it_unions
       Backlog-ID: RM-644
-- [ ] **A `$facet` element that is not a stage is refused without naming
-      it.** mongod 8.2.11's 40171 names the element: "elements of arrays in
-      $facet spec must be non-empty objects, b argument contained an
-      element of type int: 0: 5" (its type, its index and its value). This
-      server ends the message "... b argument contained an invalid
-      element". Found 2026-11-14 working RM-530.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm530.py::test_a_facet_element_refusal_names_the_element
-      Backlog-ID: RM-647
 - [ ] **`{$project: {}}` drops its envelope, and is "not supported" when
       nested.** mongod 8.2.11 answers 51272 "Invalid $project :: caused by
       :: projection specification must have at least one field" at the top
