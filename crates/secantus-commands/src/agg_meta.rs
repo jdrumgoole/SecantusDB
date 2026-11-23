@@ -56,6 +56,11 @@ const KEEPS_SORT_METADATA: &[&str] = &[
     // The outer documents keep theirs; the ones it adds carry their
     // sub-pipeline's (8.2.11, 2026-11-18, RM-630; see `key_union_documents`).
     "$unionWith",
+    // Each keeps the key it is handed; a `$fill` that fills by a `method`
+    // runs a window and sets that window's key (8.2.11, 2026-11-23, RM-632;
+    // see `fill_sort_key`).
+    "$graphLookup",
+    "$fill",
     // Where the stages move between mongod's engines: no stage of its own.
     secantus_core::sbe::ENGINE_STAGE,
     // Passes each document on as it is.
@@ -104,6 +109,37 @@ fn window_sort_key(spec: &Bson) -> Option<Bson> {
         stage.insert("partitionBy", expr);
     }
     Some(Bson::Document(bson::doc! { "$_secantusSortKey": stage }))
+}
+
+/// The `$_secantusSortKey` for a `$fill`: mongod runs one that fills an
+/// output by a `method` as a `$setWindowFields` on its `partitionBy` (or
+/// `partitionByFields`, as `{f: "$f", ...}`) and `sortBy`, which sets that
+/// window's key; a `$fill` of values only is an `$addFields` and keeps the
+/// key it is handed (measured 8.2.11, 2026-11-23, RM-632).
+fn fill_sort_key(spec: &Bson) -> Option<Bson> {
+    let spec = spec.as_document()?;
+    let output = spec.get_document("output").ok()?;
+    let windowed = output
+        .values()
+        .any(|o| o.as_document().is_some_and(|o| o.contains_key("method")));
+    if !windowed {
+        return None;
+    }
+    let mut window = Document::new();
+    if let Some(by) = spec.get("partitionBy") {
+        window.insert("partitionBy", by.clone());
+    } else if let Ok(fields) = spec.get_array("partitionByFields") {
+        let mut by = Document::new();
+        for f in fields {
+            let f = f.as_str()?;
+            by.insert(f, format!("${f}"));
+        }
+        window.insert("partitionBy", by);
+    }
+    if let Some(by) = spec.get("sortBy") {
+        window.insert("sortBy", by.clone());
+    }
+    window_sort_key(&Bson::Document(window))
 }
 
 /// The stages whose documents carry no sort key at all, not even the empty
@@ -843,6 +879,16 @@ pub(crate) fn rewrite_sort_metadata(
                     sort_live = true;
                 }
             }
+            "$fill" => {
+                if let Some(key) = stage
+                    .as_document()
+                    .and_then(|d| d.get("$fill"))
+                    .and_then(fill_sort_key)
+                {
+                    out.push(key);
+                    sort_live = true;
+                }
+            }
             _ => {}
         }
         let ranks = ranks_by_sort_key(&stage);
@@ -1155,6 +1201,32 @@ mod tests {
                 doc! { "$set": { NO_SORT_KEY: true } },
                 rank,
             ])
+        );
+    }
+
+    /// A `$fill` by a `method` keys its documents as the window it runs as;
+    /// one of values only keeps the key it is handed (RM-632).
+    #[test]
+    fn a_fill_by_a_method_keys_as_its_window() {
+        let fill = |spec: Document| fill_sort_key(&Bson::Document(spec));
+        assert_eq!(
+            fill(bson::doc! { "sortBy": { "n": 1 }, "output": { "a": { "value": 0 } } }),
+            None
+        );
+        assert_eq!(
+            fill(bson::doc! { "sortBy": { "n": 1 }, "output": { "a": { "method": "locf" } } }),
+            window_sort_key(&Bson::Document(bson::doc! { "sortBy": { "n": 1 } }))
+        );
+        assert_eq!(
+            fill(bson::doc! {
+                "partitionByFields": ["p"],
+                "sortBy": { "n": 1 },
+                "output": { "a": { "method": "linear" } },
+            }),
+            window_sort_key(&Bson::Document(bson::doc! {
+                "partitionBy": { "p": "$p" },
+                "sortBy": { "n": 1 },
+            }))
         );
     }
 

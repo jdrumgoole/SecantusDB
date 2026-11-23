@@ -57,11 +57,11 @@ def test_a_densify_sets_the_sort_key(rust_mongo: Any, mongod: Any) -> None:
     assert _answers(rust_mongo, pipelines) == _answers(mongod, pipelines)
 
 
-@pytest.mark.backlog("RM-632")
+@pytest.mark.backlog_fixed("RM-632")
 def test_a_graph_lookup_and_a_fill_keep_the_sort_key(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 keeps a document's sort key through a `$graphLookup`
     and a `$fill`, so a rank behind either ranks by the `$sort` in front.
-    This server ends the key at each and ties them."""
+    This server ended the key at each and tied them."""
     sort = {"$sort": {"k": 1}}
     graph = {
         "$graphLookup": {
@@ -80,5 +80,55 @@ def test_a_graph_lookup_and_a_fill_keep_the_sort_key(rust_mongo: Any, mongod: An
             RANK_ID,
             {"$project": {"r": 1}},
         ],
+    }
+    assert _answers(rust_mongo, pipelines) == _answers(mongod, pipelines)
+
+
+@pytest.mark.backlog_fixed("RM-632")
+def test_a_fill_by_a_method_sets_its_windows_sort_key(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 runs a `$fill` that fills by a `method` as a window on
+    its partition and `sortBy`, and `{$meta: "sortKey"}` behind it reads that
+    window's key; a `$fill` of values only keeps the `$sort`'s. This server
+    ended the key at every `$fill`. Compared by `_id`: the order among
+    equal keys behind a `$fill` is RM-767's."""
+    sort = {"$sort": {"k": 1}}
+    project = {"$project": {"m": 1}}
+    fills = {
+        "sortBy": {"sortBy": {"n": 1}, "output": {"a": {"method": "locf"}}},
+        "partitionByFields": {
+            "partitionByFields": ["n"],
+            "sortBy": {"_id": -1},
+            "output": {"a": {"method": "locf"}},
+        },
+        "partitionBy": {
+            "partitionBy": {"$mod": ["$n", 2]},
+            "sortBy": {"_id": 1},
+            "output": {"a": {"method": "locf"}},
+        },
+        "values only": {"sortBy": {"n": 1}, "output": {"a": {"value": 1}}},
+    }
+    pipelines = {name: [sort, {"$fill": f}, META, project] for name, f in fills.items()}
+
+    def by_id(client: Any) -> dict:
+        return {
+            name: (status, sorted(docs, key=lambda d: d["_id"]) if status == "ok" else docs)
+            for name, (status, docs) in _answers(client, pipelines).items()
+        }
+
+    assert by_id(rust_mongo) == by_id(mongod)
+
+
+@pytest.mark.backlog("RM-767")
+def test_a_fill_passes_ties_on_in_mongods_order(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 passes the documents a `$fill` fills on, among equal
+    `sortBy` keys, in the order it was handed them; this server gives a
+    different order among the ties (with values only and by a `method`)."""
+    fills = {
+        "values only": {"sortBy": {"n": 1}, "output": {"a": {"value": 1}}},
+        "locf": {"sortBy": {"n": 1}, "output": {"a": {"method": "locf"}}},
+    }
+    pipelines = {
+        name: [{"$sort": {"k": 1}}, {"$fill": f}, {"$project": {"_id": 1}}]
+        for name, f in fills.items()
     }
     assert _answers(rust_mongo, pipelines) == _answers(mongod, pipelines)

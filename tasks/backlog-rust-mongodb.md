@@ -1147,12 +1147,25 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-18 (RM-625).
       Verify: none -- intermittent, about 1 run in 30; no deterministic gap test until the cause is known
       Backlog-ID: RM-721
-- [ ] **The sort key is lost at a `$graphLookup` or a `$fill`.** mongod
-      8.2.11 keeps it through both, as it does through the stages RM-520
-      names; this server ends it at each, so a rank behind ties every
-      document. Found 2026-11-13 (RM-522).
-      Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_graph_lookup_and_a_fill_keep_the_sort_key
-      Backlog-ID: RM-632
+- [ ] **RM-434's distinct-scan work counters differed once under load.**
+      `tests/backlog/test_rm_found_2026_11_08_rm310.py::test_a_distinct_scan_run_reports_its_work_counters`
+      (RM-434's regression test) failed in one RM-632 gate run on
+      2026-11-23 (load ~10 on 12 cores) and passed in 12 reruns, serial and
+      `-n 6`: a `distinct` stage's counters differed (the assertion output
+      was truncated, so which counter and which side is not known). A
+      candidate: mongod's time-based yields moving `saveState` /
+      `restoreState`, or this server modelling them by count. Found
+      2026-11-23 (RM-632).
+      Verify: none -- intermittent, once in 13 runs; no deterministic gap test until the differing counter is known
+      Backlog-ID: RM-768
+- [ ] **A `$fill` with a `sortBy` passes ties on in a different order.**
+      Among documents with equal `sortBy` keys, mongod 8.2.11 passes them
+      on in an order this server does not reproduce (behind `{$sort: {k:
+      1}}`, `{$fill: {sortBy: {n: 1}, ...}}` gives `_id` 1, 3, 0, 2, 4, 5
+      with values only, where this server gives 1, 3, 2, 0, 5, 4); by a
+      `method` too. Found 2026-11-23 (RM-632).
+      Verify: tests/backlog/test_rm_found_2026_11_13_rm522.py::test_a_fill_passes_ties_on_in_mongods_order
+      Backlog-ID: RM-767
 - [ ] **A `{$meta: "sortKey"}` with no `$sort` is refused where the query
       layer does not take it.** mongod 8.2.11 gives `[]` in a `$project`
       behind a `$limit` or another `$project`, and in a `$replaceWith`, as
@@ -2058,16 +2071,20 @@ mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
 - [ ] **RUST MongoDB server: a `$match` after a `$changeStream` on an
-      event field other than `operationType` is not rewritten into the
-      oplog filter.** mongod 8.2.11 rewrites predicates on `fullDocument`,
-      `documentKey`, `ns`, `to`, `updateDescription`,
+      event field other than `operationType`, `documentKey` or
+      `fullDocument` is not rewritten into the oplog filter.** mongod 8.2.11
+      rewrites predicates on `ns`, `to`, `updateDescription`,
       `fullDocumentBeforeChange`, the renamed `clusterTime` / `lsid` /
       `txnNumber` (also into the transaction filter), and an `$expr` over
-      them, and adds them to the read's filter (`fullDocument.a: 1`:
-      `queryHash` 193DCAB5, not 90A52575; 2026-11-15). RM-452 ported the
-      `operationType` rewrite only; the rest of
-      `change_stream_rewrite_helpers.cpp` is to transcribe (found working
-      RM-452).
+      them, and adds them to the read's filter (`ns.coll: "c"`: `queryHash`
+      D801EB4B, not 90A52575; 2026-11-15). RM-452 ported the
+      `operationType` rewrite, RM-698's first slice (2026-11-23)
+      `documentKey` and `fullDocument` for `$eq` / `$in` / `$exists` /
+      `$lt(e)` / `$gt(e)`; a `$regex`, `$type`, `$size`, ... on those
+      paths is still dropped, not renamed. The rest of
+      `change_stream_rewrite_helpers.cpp` (`matchRewriteGenericNamespace`,
+      `matchRewriteUpdateDescription`, `rewriteAggExpressionTree`) is to
+      transcribe (found working RM-452).
       Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_a_match_on_another_event_field_joins_the_oplog_filter
       Backlog-ID: RM-698
 - [ ] **RUST MongoDB server: the unwind filter of a change stream is not
@@ -2077,9 +2094,31 @@ would see them. What is left:
       `operationType: "drop"` (`rename`, `dropDatabase`) the writes branch
       and the event-type `$or` fall away, as only a command can match. This
       server prints the unsimplified `$and`, which matches the same entries
-      (2026-11-15, found working RM-452).
+      (2026-11-15, found working RM-452). The simplifier treats each
+      distinct leaf as a Boolean variable (`op: "c"` and `op: "i"` are
+      unrelated to it), so `insert` / `update` print unchanged on both; for
+      `rename` its output re-sorts the `$or`'s regexes by path, `o.to`
+      last. Sizing (2026-11-23): this server has no Boolean simplifier
+      anywhere -- the fix is the port of mongod's
+      `query/boolean_simplification/` (bitset algebra, Quine-McCluskey,
+      Petrick, the tree restore and its size guards) the item below needs,
+      then applying it to the unwind filter. Do it after that item. (The
+      gap test compared two different collection names until 2026-11-23.)
       Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_the_unwind_filter_is_simplified
       Backlog-ID: RM-699
+- [ ] **RUST MongoDB server: a `find`'s filter is not Boolean-simplified.**
+      mongod 8.2.11 runs its Boolean expression simplifier
+      (`internalQueryEnableBooleanExpressionsSimplifier`, true by default)
+      in normalizing every query: `{$or: [{a: 1, b: 1}, {a: 1}]}` and
+      `{$and: [{a: 1}, {$or: [{a: 1}, {b: 2}]}]}` print as `{a: {$eq: 1}}`,
+      `{a: 1, $nor: [{a: 1}]}` as `{$alwaysFalse: 1}`. This server has no
+      simplifier and prints each as given, so `parsedQuery`, and whatever
+      the planner and the query shape derive from the filter, differ. The
+      faithful fix ports `src/mongo/db/query/boolean_simplification/` and
+      its call in the canonicalizer, with mongod's size limits; several
+      PRs, and the plan-cache keys move (2026-11-23, found working RM-699).
+      Verify: tests/backlog/test_rm_found_2026_11_23_rm699.py::test_a_find_filter_is_boolean_simplified
+      Backlog-ID: RM-774
 - [ ] **RUST MongoDB server: a change stream's `docsExamined` leaves out
       mongod's own oplog entries.** mongod 8.2.11's `executionStats` of a
       change stream counts every oplog entry its scan reads from the start
@@ -2088,24 +2127,21 @@ would see them. What is left:
       counts of the entries the stream keeps match since RM-453, 2026-11-15).
       Verify: none -- mongod writes its no-ops on a timer, so no test can pin how many a scan reads
       Backlog-ID: RM-700
-- [ ] **RUST MongoDB server: a `collMod` of an index makes a `modify` event
-      with an empty description.** mongod 8.2.11 gives `operationDescription:
-      {index: {name: "a_1", hidden: true}}` and adds `indexOptions: {hidden:
-      false}` to `stateBeforeChange` (the index as it was). This server's event
-      has `operationDescription: {}` and only the collection's options, so its
-      resume token (whose identifier holds the description) differs as well
-      (2026-11-21, found working the 4b-4 resume tokens).
-      Verify: tests/backlog/test_rm_found_2026_11_21_resume_tokens.py::test_a_collmod_of_an_index_is_a_modify_event_with_the_index
-      Backlog-ID: RM-733
-- [ ] **RUST MongoDB server: `dropIndexes: "*"` logs its entries oldest
-      first, with `hidden` before `key`.** mongod 8.2.11 drops the indexes
-      newest first, one entry (and change event) each, and writes a hidden
-      index's spec as `v`, the options other than `hidden`, `key`, `name`,
-      then `hidden`; this server drops them in creation order and puts
-      `hidden` after `unique` and before `key` (2026-11-21, found working the
-      4b-4 resume tokens: the order of the events, and the identifier of a
-      token, differ).
-      Verify: tests/backlog/test_rm_found_2026_11_21_resume_tokens.py::test_dropping_every_index_is_one_event_each_newest_first_with_mongods_spec_order
+- [ ] **RUST MongoDB server: `dropIndexes: "*"` does not log an index a
+      `collMod` changed last, with the option it set after `name`.** mongod
+      8.2.11 drops in its in-memory catalog order: build order, except that
+      an index a `collMod` touched moves to the end (`listIndexes` keeps
+      build order), and an option `collMod` added (`hidden`,
+      `prepareUnique`) is written after `name`, while one given at create
+      keeps its place before `key`. Created `a_1` (unique), `b_1_c_-1`,
+      `d_1` (hidden), then `collMod` hid `a_1`: mongod drops `b_1_c_-1`,
+      `d_1`, `a_1` with `a_1` as `{v, unique, key, name, hidden}`; this
+      server drops `d_1`, `b_1_c_-1`, `a_1` with `hidden` before `key`. The
+      fix needs the spec's field order kept in the catalog and an entry
+      order a `collMod` moves (2026-11-21, found working the 4b-4 resume
+      tokens; corrected 2026-11-23 by probe: the first text said "newest
+      first", which mongod does not do).
+      Verify: tests/backlog/test_rm_found_2026_11_21_resume_tokens.py::test_dropping_every_index_lists_a_collmodded_index_last_with_hidden_after_name
       Backlog-ID: RM-734
 
 ### 7.073 The cursor commands -- 2026-10-11

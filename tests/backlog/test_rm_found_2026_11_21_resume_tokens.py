@@ -45,14 +45,14 @@ def _collmod_index(client: Any) -> list:
     return [_strip({k: v for k, v in e.items() if k not in _PER_SERVER | {"ns"}}) for e in events]
 
 
-@pytest.mark.backlog("RM-733")
+@pytest.mark.backlog_fixed("RM-733")
 def test_a_collmod_of_an_index_is_a_modify_event_with_the_index(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """`collMod` with `index` makes a `modify` event whose
     `operationDescription` is `{index: {name, hidden}}` and whose
     `stateBeforeChange` adds `indexOptions: {hidden: false}` to the
-    collection's options (mongod 8.2.11). This server's event has an empty
+    collection's options (mongod 8.2.11). This server's event had an empty
     description and no `indexOptions`, and so a different resume token."""
     theirs = _collmod_index(mongod_rs)
     assert theirs
@@ -70,6 +70,9 @@ def _drop_all_indexes(client: Any) -> list:
         [pymongo.IndexModel("a", unique=True), pymongo.IndexModel([("b", 1), ("c", -1)])]
     )
     coll.create_index("d", name="d_1", hidden=True)
+    # A collMod rewrites the index's catalog entry: mongod then lists (and
+    # drops) it last, with `hidden` after `name`.
+    db.command("collMod", name, index={"name": "a_1", "hidden": True})
     with db.watch(show_expanded_events=True, max_await_time_ms=200) as stream:
         coll.drop_indexes()
         events = _events(stream, 3)
@@ -81,14 +84,15 @@ def _drop_all_indexes(client: Any) -> list:
 
 
 @pytest.mark.backlog("RM-734")
-def test_dropping_every_index_is_one_event_each_newest_first_with_mongods_spec_order(
+def test_dropping_every_index_lists_a_collmodded_index_last_with_hidden_after_name(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
-    """`dropIndexes: "*"` logs one entry per index, the last created first,
-    and a spec in the order `v`, the options other than `hidden`, `key`,
-    `name`, then `hidden` (mongod 8.2.11). This server drops them in creation
-    order and puts `hidden` before `key`."""
+    """`dropIndexes: "*"` logs one entry per index in catalog order: build
+    order, except that an index a `collMod` changed moves to the end, its
+    spec then `v`, the other options, `key`, `name`, `hidden` (mongod
+    8.2.11; an index created hidden keeps `hidden` before `key`)."""
     theirs = _drop_all_indexes(mongod_rs)
-    assert [list(s)[-1] for s in theirs][:1] == ["hidden"]
+    assert [s["name"] for s in theirs] == ["b_1_c_-1", "d_1", "a_1"]
+    assert list(theirs[-1])[-1] == "hidden"
     ours = _drop_all_indexes(rust_mongo)
     assert [(s["name"], list(s)) for s in ours] == [(s["name"], list(s)) for s in theirs]

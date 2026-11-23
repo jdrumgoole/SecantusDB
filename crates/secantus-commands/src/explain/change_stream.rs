@@ -24,8 +24,10 @@
 //! joins the read's filter and the unwind's (RM-452), as mongod's
 //! `change_stream_rewrite_helpers.cpp` rewrites it.
 //!
-//! Not reproduced: the rewrites of the other event fields and of `$expr`
-//! (RM-698), the Boolean simplifier mongod runs over the unwind's filter
+//! So are a `$match` on `documentKey` and (inexactly) on `fullDocument`
+//! (RM-698). Not reproduced: the rewrites of `ns`, `to`,
+//! `updateDescription`, `fullDocumentBeforeChange`, the renamed
+//! `clusterTime` / `lsid` / `txnNumber`, and of `$expr` (RM-698), the Boolean simplifier mongod runs over the unwind's filter
 //! (RM-699), and the change stream's `queryShapeHash` (RM-454).
 
 use bson::{doc, Bson, Document, Timestamp};
@@ -83,6 +85,9 @@ impl<'a> Spec<'a> {
 #[derive(Clone, Copy)]
 enum Leaf {
     Eq,
+    Lte,
+    Lt,
+    Gt,
     Gte,
     Regex,
     Exists,
@@ -94,6 +99,9 @@ impl Leaf {
     fn rank(self) -> u8 {
         match self {
             Leaf::Eq => 5,
+            Leaf::Lte => 6,
+            Leaf::Lt => 7,
+            Leaf::Gt => 8,
             Leaf::Gte => 9,
             Leaf::Regex => 10,
             Leaf::Exists => 12,
@@ -105,6 +113,9 @@ impl Leaf {
     fn op(self) -> &'static str {
         match self {
             Leaf::Eq => "$eq",
+            Leaf::Lte => "$lte",
+            Leaf::Lt => "$lt",
+            Leaf::Gt => "$gt",
             Leaf::Gte => "$gte",
             Leaf::Regex => "$regex",
             Leaf::Exists => "$exists",
@@ -541,18 +552,90 @@ fn is_crud(name: &str) -> bool {
     matches!(name, "insert" | "update" | "replace" | "delete")
 }
 
+/// Whether a predicate on a path matches a document without it
+/// (mongod's `matchesSingleElement(predicate, {})`).
+fn matches_missing(u: &U) -> bool {
+    match u {
+        U::Eq(_, v) => matches!(v, Bson::Null),
+        U::In(_, vs, _) => vs.iter().any(|v| matches!(v, Bson::Null)),
+        U::Other(_, op, v) => matches!(op.as_str(), "$gte" | "$lte") && matches!(v, Bson::Null),
+        _ => false,
+    }
+}
+
+/// A predicate on a path, its first part renamed (mongod's
+/// `cloneWithSubstitution`); `None` for a predicate this filter cannot
+/// print.
+fn renamed(u: &U, to: &str) -> Option<M> {
+    let path = |p: &str| match p.split_once('.') {
+        Some((_, rest)) => format!("{to}.{rest}"),
+        None => to.to_string(),
+    };
+    Some(match u {
+        U::Eq(p, v) => M::Leaf(path(p), Leaf::Eq, v.clone()),
+        U::In(p, vs, false) => M::Leaf(path(p), Leaf::In, Bson::Array(vs.clone())),
+        U::Exists(p) => M::Leaf(path(p), Leaf::Exists, Bson::Boolean(true)),
+        U::Other(p, op, v) => {
+            let kind = match op.as_str() {
+                "$lt" => Leaf::Lt,
+                "$lte" => Leaf::Lte,
+                "$gt" => Leaf::Gt,
+                "$gte" => Leaf::Gte,
+                _ => return None,
+            };
+            M::Leaf(path(p), kind, v.clone())
+        }
+        _ => return None,
+    })
+}
+
+/// `{$nor: [{op: "i"}, {op: "u"}, {op: "d"}]}`: an entry that is no CRUD
+/// event.
+fn not_crud() -> M {
+    M::Nor(vec![op_is("i"), op_is("u"), op_is("d")])
+}
+
+/// mongod's `matchRewriteDocumentKey`: `o2` of an update or an insert, `o`
+/// of a delete, and missing from every other event.
+fn rewrite_document_key(u: &U) -> Option<M> {
+    let mut any = Vec::new();
+    if matches_missing(u) {
+        any.push(not_crud());
+    }
+    for (op, to) in [("u", "o2"), ("d", "o"), ("i", "o2")] {
+        any.push(M::And(vec![op_is(op), renamed(u, to)?]));
+    }
+    Some(M::Or(any))
+}
+
+/// mongod's `matchRewriteFullDocument`, inexact only: an update's
+/// document may be looked up later, so every update passes; an insert's
+/// or a replacement's is `o`; a delete and a command have none.
+fn rewrite_full_document(u: &U) -> Option<M> {
+    let mut any = vec![
+        M::And(vec![op_is("u"), M::Not(Box::new(exists("o._id")))]),
+        M::And(vec![
+            M::Or(vec![op_is("i"), M::And(vec![op_is("u"), exists("o._id")])]),
+            renamed(u, "o")?,
+        ]),
+    ];
+    if matches_missing(u) {
+        any.push(op_is("d"));
+        any.push(not_crud());
+    }
+    Some(M::Or(any))
+}
+
 /// mongod's `matchRewriteOperationType`.
 fn rewrite_operation_type(u: &U, path: &str) -> Option<M> {
     // A subfield of `operationType` is always missing: the predicate is
     // what it says of a missing field.
     if path != "operationType" {
-        let on_missing = match u {
-            U::Eq(_, v) => matches!(v, Bson::Null),
-            U::In(_, vs, _) => vs.iter().any(|v| matches!(v, Bson::Null)),
-            U::Other(_, op, v) => matches!(op.as_str(), "$gte" | "$lte") && matches!(v, Bson::Null),
-            _ => false,
-        };
-        return Some(if on_missing { M::True } else { M::False });
+        return Some(if matches_missing(u) {
+            M::True
+        } else {
+            M::False
+        });
     }
     let named = |v: &Bson| match v {
         Bson::String(s) => op_type_rewrite(s).map(|m| (s.clone(), m)),
@@ -583,7 +666,8 @@ fn rewrite_operation_type(u: &U, path: &str) -> Option<M> {
 }
 
 /// mongod's `rewriteMatchExpressionTree`, for the fields this server
-/// rewrites: `operationType`. `None` is no rewrite.
+/// rewrites: `operationType`, `documentKey` and `fullDocument`. `None` is
+/// no rewrite.
 fn rewrite(u: &U, inexact: bool) -> Option<M> {
     match u {
         U::And(c) => {
@@ -616,6 +700,8 @@ fn rewrite(u: &U, inexact: bool) -> Option<M> {
         U::Not(c) => rewrite(c, false).map(|m| M::Not(Box::new(m))),
         U::Eq(p, _) | U::In(p, ..) | U::Exists(p) | U::Other(p, ..) => match p.split('.').next() {
             Some("operationType") => rewrite_operation_type(u, p),
+            Some("documentKey") => rewrite_document_key(u),
+            Some("fullDocument") if inexact => rewrite_full_document(u),
             _ => None,
         },
         U::Opaque | U::False => None,
@@ -1555,6 +1641,9 @@ mod tests {
             (doc! { "operationType": { "$exists": true } }, "90A52575"),
             (doc! { "operationType": { "$gt": "a" } }, "90A52575"),
             (doc! { "x": 1 }, "90A52575"),
+            // RM-698: `documentKey` and, inexactly, `fullDocument`.
+            (doc! { "fullDocument.a": 1 }, "193DCAB5"),
+            (doc! { "documentKey._id": 1 }, "97E310BC"),
         ];
         for (user, want) in cases {
             let (q, _) = hashes_after(&coll, doc! {}, Some(user.clone()));

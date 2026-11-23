@@ -11492,8 +11492,15 @@ impl Storage {
                 let ui = collection_uuid(session, db, coll)?;
                 let mut o = Document::new();
                 o.insert("collMod", coll);
+                // `indexOptions_old` is not part of the command: it is what an
+                // index's changed options were, kept in `o2` (mongod 8.2.11).
+                let mut index_old = None;
                 for (k, v) in given {
-                    o.insert(k.clone(), v.clone());
+                    if k == "indexOptions_old" {
+                        index_old = Some(v.clone());
+                    } else {
+                        o.insert(k.clone(), v.clone());
+                    }
                 }
                 // `uuid` is set explicitly and any inbound one dropped, so the
                 // stored value is the BSON binary form and leads the document --
@@ -11507,6 +11514,9 @@ impl Storage {
                 }
                 let mut o2 = Document::new();
                 o2.insert("collectionOptions_old", Bson::Document(old_opts));
+                if let Some(old) = index_old {
+                    o2.insert("indexOptions_old", old);
+                }
                 let mut entry = Document::new();
                 entry.insert("op", "c");
                 entry.insert("ns", format!("{db}.$cmd"));
@@ -29408,11 +29418,16 @@ mod tests {
         for id in 0..6 {
             s.insert("app", "c", vec![enc(id)], true).unwrap();
         }
-        // Sized to hold two entries.
+        // Sized to hold two entries. The floor goes in first, as
+        // `replSetResizeOplog` applies both at once: `set_oplog_max_bytes`
+        // wakes the background pruner, which would otherwise apply the cap
+        // before the floor exists (main's CI, `rust-storage
+        // (storage-nonlogged)`, 2026-11-23, where the setter's checkpoint
+        // widens that window).
         let held = s.read_oplog(1, 100).unwrap();
         let two: usize = held[held.len() - 2..].iter().map(|(_, b)| b.len()).sum();
-        s.set_oplog_max_bytes(two as i64).unwrap();
         s.set_oplog_min_retention_seconds(3600);
+        s.set_oplog_max_bytes(two as i64).unwrap();
         assert_eq!(s.prune_oplog(None).unwrap(), 0);
         assert!(s.read_oplog(1, 100).unwrap().len() >= 6);
         // An hour and more later, the cap applies again.
@@ -29448,8 +29463,12 @@ mod tests {
             // Sized to hold the last two entries: the first five are archived.
             let two: usize = rows[rows.len() - 2..].iter().map(|(_, b)| b.len()).sum();
             s.set_oplog_max_bytes(two as i64).unwrap();
+            // `set_oplog_max_bytes` wakes the background pruner, which runs
+            // the same sweep (archive included) and may drop some or all of
+            // the five first: this call's count is an upper bound, and the
+            // state below is what the cap must leave.
             let pruned = s.prune_oplog(None).unwrap();
-            assert_eq!(pruned, 5, "pruned {pruned}");
+            assert!(pruned <= 5, "pruned {pruned}");
             // The live oplog no longer reaches the third entry.
             assert_eq!(s.oplog_floor_seq().unwrap(), all[5]);
             assert!(!s.oplog_reaches_genesis().unwrap());
