@@ -850,17 +850,6 @@ These are explicit non-goals. Don't add them without a reason.
       Found while working RM-589, 2026-11-17.
       Verify: tests/backlog/test_rm_view_namespaces.py::test_a_transaction_statement_counts_the_transactions_locks
       Backlog-ID: RM-715
-- [ ] **An empty `$densify.range` or `$fill.output` is refused with the
-      wrong answer.** mongod 8.2.11 parses `range` as it reads it, so
-      `{$densify: {range: {}}}` is 40414 "BSON field
-      '$densify.range.bounds' is missing but a required field" (before the
-      missing `field`), and `{$fill: {output: {}}}` is 6050203 "The output
-      field in '$fill' must contain an object with at least one element".
-      This server names the missing `field` for the first and answers
-      BadValue (2), "not supported by the Rust server", for the second.
-      Found while working RM-604, 2026-11-17.
-      Verify: tests/backlog/test_rm_found_rm604.py::test_an_empty_densify_range_or_fill_output_is_refused_as_mongod_refuses_it
-      Backlog-ID: RM-716
 - [ ] **Operations this server runs another way than mongod's plan say
       less.** Since RM-023 a read or a write's read that a stream runs as
       mongod's plan counts its keys and documents examined, and since

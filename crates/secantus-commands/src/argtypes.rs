@@ -3734,6 +3734,14 @@ fn stage_field_problem(name: &str, spec: &Bson) -> Option<(i32, String)> {
         if let Some(problem) = window_stage_field_type_problem(name, field, value) {
             return Some(problem);
         }
+        // mongod's IDL parses `$densify.range` as it reads it, so its own
+        // unknown and missing fields are named in document order (8.2.11,
+        // RM-716).
+        if let ("$densify", "range", Bson::Document(range)) = (name, field.as_str(), value) {
+            if let Some(problem) = densify_range_problem(range) {
+                return Some(problem);
+            }
+        }
         // `$merge` reads its fields in order and names an unknown one when
         // it reaches it (`aggregate::merge_spec`).
         if known.contains(&field.as_str()) || name == "$merge" {
@@ -3828,10 +3836,40 @@ fn stage_field_problem(name: &str, spec: &Bson) -> Option<(i32, String)> {
             ));
         }
     }
+    if name == "$fill" && matches!(d.get("output"), Some(Bson::Document(o)) if o.is_empty()) {
+        return Some((
+            6050203,
+            "The output field in '$fill' must contain an object with at least one element"
+                .to_string(),
+        ));
+    }
     if name == "$lookup" {
         return lookup_join_fields_problem(d);
     }
     None
+}
+
+/// `$densify.range` as mongod 8.2.11's IDL reads it: an unknown field when
+/// reached, then a missing `bounds`, then a missing `step` (RM-716).
+fn densify_range_problem(range: &bson::Document) -> Option<(i32, String)> {
+    if let Some(field) = range
+        .keys()
+        .find(|k| !matches!(k.as_str(), "step" | "unit" | "bounds"))
+    {
+        return Some((
+            40415,
+            format!("BSON field '$densify.range.{field}' is an unknown field."),
+        ));
+    }
+    ["bounds", "step"]
+        .into_iter()
+        .find(|f| !range.contains_key(*f))
+        .map(|f| {
+            (
+                40414,
+                format!("BSON field '$densify.range.{f}' is missing but a required field"),
+            )
+        })
 }
 
 /// A `$setWindowFields`, `$densify` or `$fill` field of the wrong type, as
@@ -4083,6 +4121,35 @@ mod stage_validation_order_tests {
     fn it_wins_even_when_a_required_field_is_also_missing() {
         // `$bucket` here is missing BOTH `groupBy` and `boundaries`.
         assert_eq!(err("$bucket", doc_of(&[("a", Bson::Int32(1))])).0, 40197);
+    }
+
+    #[test]
+    fn an_empty_densify_range_or_fill_output_is_refused_as_mongod_does() {
+        let empty = || Bson::Document(bson::Document::new());
+        assert_eq!(
+            err("$densify", doc_of(&[("range", empty())])),
+            (
+                40414,
+                "BSON field '$densify.range.bounds' is missing but a required field".to_string()
+            )
+        );
+        assert_eq!(
+            err(
+                "$densify",
+                doc_of(&[("range", doc_of(&[("bounds", Bson::String("full".into()))]))])
+            )
+            .1,
+            "BSON field '$densify.range.step' is missing but a required field"
+        );
+        assert_eq!(
+            err(
+                "$densify",
+                doc_of(&[("range", doc_of(&[("x", Bson::Int32(1))]))])
+            )
+            .0,
+            40415
+        );
+        assert_eq!(err("$fill", doc_of(&[("output", empty())])).0, 6050203);
     }
 
     #[test]
