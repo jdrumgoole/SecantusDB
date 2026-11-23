@@ -624,6 +624,23 @@ These are explicit non-goals. Don't add them without a reason.
       reliably; RM-355's regression test, the one named above, shows it
       when run in a loop
       Backlog-ID: RM-764
+- [ ] **mongod's `validate` sometimes warns on `config.image_collection`'s
+      `_id_` after this server served a mongod-written store.** In
+      `test_secantus_serves_the_phase_0b_store_mongod_wrote` (RM-723's
+      regression test) mongod 8.2.11 reopens the store `secantusd-mdb`
+      wrote to and `validate({full: true})` on `config.image_collection`
+      answered `valid: true` with warnings `["Found warnings in _id_"]`
+      once in the RM-650 lane gate (2026-11-23, load ~6 on 12 cores); the
+      gate before it and two isolated reruns passed. A warning on an index
+      this server maintains (retryable `findAndModify` images) is a storage
+      signal: capture the full `validate` reply (its `keysPerIndex`,
+      `indexDetails` and the mongod log's index-entry lines) on a failing
+      run and find which key is missing or extra. Found 2026-11-23 working
+      RM-650, whose change does not reach storage.
+      Verify: none -- intermittent (1 run in 4), so no gap test fails
+      reliably; RM-723's regression test, named above, shows it when run in
+      a loop
+      Backlog-ID: RM-765
 - [ ] **Some writes' `locks` are not mongod's.** Since 2026-11-07 a write
       counts mongod's flow control tickets (one per global IX taken apart)
       and a retryable write's session checkout and session row, and a
