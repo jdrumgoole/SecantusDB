@@ -3734,6 +3734,14 @@ fn stage_field_problem(name: &str, spec: &Bson) -> Option<(i32, String)> {
         if let Some(problem) = window_stage_field_type_problem(name, field, value) {
             return Some(problem);
         }
+        // mongod's IDL parses `$densify.range` as it reads it, so its own
+        // unknown and missing fields are named in document order (8.2.11,
+        // RM-716).
+        if let ("$densify", "range", Bson::Document(range)) = (name, field.as_str(), value) {
+            if let Some(problem) = densify_range_problem(range) {
+                return Some(problem);
+            }
+        }
         // `$merge` reads its fields in order and names an unknown one when
         // it reaches it (`aggregate::merge_spec`).
         if known.contains(&field.as_str()) || name == "$merge" {
@@ -3828,10 +3836,40 @@ fn stage_field_problem(name: &str, spec: &Bson) -> Option<(i32, String)> {
             ));
         }
     }
+    if name == "$fill" && matches!(d.get("output"), Some(Bson::Document(o)) if o.is_empty()) {
+        return Some((
+            6050203,
+            "The output field in '$fill' must contain an object with at least one element"
+                .to_string(),
+        ));
+    }
     if name == "$lookup" {
         return lookup_join_fields_problem(d);
     }
     None
+}
+
+/// `$densify.range` as mongod 8.2.11's IDL reads it: an unknown field when
+/// reached, then a missing `bounds`, then a missing `step` (RM-716).
+fn densify_range_problem(range: &bson::Document) -> Option<(i32, String)> {
+    if let Some(field) = range
+        .keys()
+        .find(|k| !matches!(k.as_str(), "step" | "unit" | "bounds"))
+    {
+        return Some((
+            40415,
+            format!("BSON field '$densify.range.{field}' is an unknown field."),
+        ));
+    }
+    ["bounds", "step"]
+        .into_iter()
+        .find(|f| !range.contains_key(*f))
+        .map(|f| {
+            (
+                40414,
+                format!("BSON field '$densify.range.{f}' is missing but a required field"),
+            )
+        })
 }
 
 /// A `$setWindowFields`, `$densify` or `$fill` field of the wrong type, as
@@ -3927,6 +3965,40 @@ fn lookup_join_fields_problem(d: &Document) -> Option<(i32, String)> {
             9,
             "$lookup with a 'let' argument must also specify 'pipeline'".to_string(),
         ));
+    }
+    lookup_names_problem(d)
+}
+
+/// The names `$lookup` builds as it constructs: `localField`, `foreignField`
+/// and `as` are `FieldPath`s (40352 empty, 16410 a `$` component, ...), and
+/// each `let` name is a user variable (9). Measured 8.2.11 (RM-646): these
+/// ran, and an empty `as` wrote a field named "".
+fn lookup_names_problem(d: &Document) -> Option<(i32, String)> {
+    use secantus_core::fallback::Fallback;
+    let as_pair = |f: Fallback| match f {
+        Fallback::Mongo { code, message, .. } => Some((code, message)),
+        _ => None,
+    };
+    for key in ["localField", "foreignField"] {
+        if let Some(Bson::String(s)) = d.get(key) {
+            if !s.is_empty() {
+                if let Some(f) = secantus_core::expr_parse::field_path_error(s) {
+                    return as_pair(f);
+                }
+            }
+        }
+    }
+    if let Some(Bson::String(s)) = d.get("as") {
+        if let Some(f) = secantus_core::expr_parse::field_path_error(s) {
+            return as_pair(f);
+        }
+    }
+    if let Some(Bson::Document(vars)) = d.get("let") {
+        for name in vars.keys() {
+            if let Err(f) = secantus_core::expressions::user_var_name_parse(name) {
+                return as_pair(f);
+            }
+        }
     }
     None
 }
@@ -4052,6 +4124,35 @@ mod stage_validation_order_tests {
     }
 
     #[test]
+    fn an_empty_densify_range_or_fill_output_is_refused_as_mongod_does() {
+        let empty = || Bson::Document(bson::Document::new());
+        assert_eq!(
+            err("$densify", doc_of(&[("range", empty())])),
+            (
+                40414,
+                "BSON field '$densify.range.bounds' is missing but a required field".to_string()
+            )
+        );
+        assert_eq!(
+            err(
+                "$densify",
+                doc_of(&[("range", doc_of(&[("bounds", Bson::String("full".into()))]))])
+            )
+            .1,
+            "BSON field '$densify.range.step' is missing but a required field"
+        );
+        assert_eq!(
+            err(
+                "$densify",
+                doc_of(&[("range", doc_of(&[("x", Bson::Int32(1))]))])
+            )
+            .0,
+            40415
+        );
+        assert_eq!(err("$fill", doc_of(&[("output", empty())])).0, 6050203);
+    }
+
+    #[test]
     fn a_missing_required_field_is_reported_after_that_pass() {
         let empty = Bson::Document(bson::Document::new());
         assert_eq!(
@@ -4131,6 +4232,22 @@ mod stage_validation_order_tests {
     }
 
     /// RM-528, every answer measured on mongod 8.2.11 (2026-11-14).
+    #[test]
+    fn lookup_refuses_a_bad_path_and_a_bad_let_name() {
+        // Measured 8.2.11 (RM-646).
+        let local = doc! {"from": "c", "localField": "$a", "foreignField": "a", "as": "z"};
+        assert_eq!(err("$lookup", Bson::Document(local)).0, 16410);
+        let as_empty = doc! {"from": "c", "localField": "a", "foreignField": "a", "as": ""};
+        assert_eq!(err("$lookup", Bson::Document(as_empty)).0, 40352);
+        let bad_let = doc! {"from": "c", "let": {"X": 1}, "pipeline": [], "as": "z"};
+        let (code, msg) = err("$lookup", Bson::Document(bad_let));
+        assert_eq!(code, 9);
+        assert_eq!(
+            msg,
+            "'X' starts with an invalid character for a user variable name"
+        );
+    }
+
     #[test]
     fn lookup_types_its_fields_in_order_then_pairs_the_join_fields() {
         let lookup =

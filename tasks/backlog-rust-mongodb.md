@@ -57,14 +57,6 @@ These work end-to-end but cut corners.
   `docs/indexes.md` "Per-index collation".
   Backlog-ID: RM-003
   Verify: none -- storage-internal COLLSCAN (performance); results, order and explain executionStats under numericOrdering already match mongod
-- [ ] **`--bind_ip` with more than one address is refused.** mongod 8.2.11
-  binds every address in `--bind_ip 127.0.0.1,::1` (without `--ipv6` it
-  binds 127.0.0.1, warns "Found no addresses for peer" for ::1 and serves;
-  measured 2026-11-20). `secantusd-mdb` binds one address, so a list is
-  refused at parse time by name ("--bind_ip takes one address here"). The
-  fix is a listener per address in `secantus_server::bind`.
-  Backlog-ID: RM-729
-  Verify: tests/backlog/test_rm_found_2026_11_20_bind_ip.py::test_a_bind_ip_list_serves_as_mongod_serves_it
 - [ ] **`secantusd-mdb service install` has no Windows support.** On macOS
   it writes a launchd LaunchAgent and on Linux a systemd user unit; on
   Windows it refuses ("supports launchd (macOS) and systemd (Linux)"). A
@@ -666,19 +658,6 @@ These are explicit non-goals. Don't add them without a reason.
         not compared yet.
       Backlog-ID: RM-357
       Verify: tests/backlog/test_rm_355_364.py::test_more_writes_report_mongods_locks
-- [ ] **A `$lookup` from `{db: "local", coll: "oplog.rs"}` is refused.**
-      mongod 8.2.11 runs a `$lookup` whose `from` is `{db, coll}` naming a
-      collection in `local` or `config`; this server answers FailedToParse
-      (9), as mongod does only for any other database. Found 2026-11-17
-      (RM-358).
-      Verify: tests/backlog/test_rm_found_2026_11_17_rm358.py::test_a_lookup_from_the_oplog_runs
-      Backlog-ID: RM-717
-- [ ] **`$out` to a new time-series collection does not check the time
-      field.** mongod 8.2.11 fails the `aggregate` (BadValue, 2) when a
-      document it writes has no `timeField` date; this server writes it.
-      Found 2026-11-17 (RM-358).
-      Verify: tests/backlog/test_rm_found_2026_11_17_rm358.py::test_out_to_time_series_needs_the_time_field
-      Backlog-ID: RM-718
 - [ ] **Some queries have no `queryShapeHash`.** Since 2026-11-07 a
       `find`'s, `distinct`'s and `aggregate`'s line, profile entry and
       `explain` carry mongod's `queryShapeHash` (`secantus-commands`
@@ -850,17 +829,6 @@ These are explicit non-goals. Don't add them without a reason.
       Found while working RM-589, 2026-11-17.
       Verify: tests/backlog/test_rm_view_namespaces.py::test_a_transaction_statement_counts_the_transactions_locks
       Backlog-ID: RM-715
-- [ ] **An empty `$densify.range` or `$fill.output` is refused with the
-      wrong answer.** mongod 8.2.11 parses `range` as it reads it, so
-      `{$densify: {range: {}}}` is 40414 "BSON field
-      '$densify.range.bounds' is missing but a required field" (before the
-      missing `field`), and `{$fill: {output: {}}}` is 6050203 "The output
-      field in '$fill' must contain an object with at least one element".
-      This server names the missing `field` for the first and answers
-      BadValue (2), "not supported by the Rust server", for the second.
-      Found while working RM-604, 2026-11-17.
-      Verify: tests/backlog/test_rm_found_rm604.py::test_an_empty_densify_range_or_fill_output_is_refused_as_mongod_refuses_it
-      Backlog-ID: RM-716
 - [ ] **Operations this server runs another way than mongod's plan say
       less.** Since RM-023 a read or a write's read that a stream runs as
       mongod's plan counts its keys and documents examined, and since
@@ -1102,19 +1070,18 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       to run. Found 2026-11-13 working RM-325.
       Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_a_window_spill_the_engine_writes_out_is_mongods_size
       Backlog-ID: RM-611
-- [ ] **An approximate `$median` / `$percentile` ranks the values, where
-      mongod interpolates its t-digest.** mongod 8.2.11 answers from
-      `TDigest` (delta 2000, a flush every 6000 values that merges
-      centroids, then interpolation between them): over 5999 values of
-      `(i * 7919) % 30011 * 0.37` it answers 5552.219999999999 and over
-      20000 5551.609969919785, where this server answers the discrete rank
-      of the values it keeps (5552.22, 5551.48). The port also owes the
-      memory a flush's centroids take (`group::tdigest_buffer` counts only
-      the buffer) and the merged centroids a spill writes
-      (`group_spill::tdigest_state` writes every value as a centroid of
-      weight one, mongod's format while its flush leaves values alone).
-      Found 2026-11-18 working RM-613.
-      Verify: tests/backlog/test_rm_found_2026_11_18_rm613.py::test_an_approximate_median_is_mongods_tdigest
+- [ ] **A `$group` `$median` / `$percentile` t-digest counts only its
+      buffer's memory, and spills every value.** The answer is mongod's
+      t-digest since RM-720's first slice (`secantus_core::tdigest`, a port of
+      8.2's `percentile_algo_tdigest`), but the digest is rebuilt at finalize
+      from every value kept: `group::tdigest_buffer` counts only the buffer,
+      not the centroids a flush leaves (`TDigest::memUsageBytes`), and
+      `group_spill::tdigest_state` writes every value as a weight-one
+      centroid, sorted, where mongod writes its merged centroids. A group that
+      spilled is then rebuilt from sorted values, which flush at other points
+      than mongod's arrival order, so its approximate answer can differ.
+      Found 2026-11-18 working RM-613; trimmed 2026-11-23.
+      Verify: none -- needs a spill-point / spilled-answer probe against mongod 8.2.11 to pin; the unspilled answer is pinned by tests/backlog/test_rm_found_2026_11_18_rm613.py
       Backlog-ID: RM-720
 - [ ] **An upsert's field order sometimes repeats for all twelve
       upserts.** `tests/backlog/test_rm_057_084.py::test_upsert_field_order_from_several_equalities`
@@ -1282,17 +1249,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       working RM-528.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm528.py::test_stage_specs_in_a_sub_pipeline_are_checked_as_it_parses
       Backlog-ID: RM-645
-- [ ] **`$lookup` runs a `$`-prefixed join field, an empty `as` and a bad
-      `let` name.** mongod 8.2.11 refuses `localField: "$a"` with 16410
-      "Consider using $getField or $setField for a field path with '.' or
-      '$'. :: caused by :: FieldPath field names may not start with '$',
-      given '$a'.", `as: ""` with 40352 "FieldPath cannot be constructed
-      with empty string", and `let: {X: 1}` with 9 "'X' starts with an
-      invalid character for a user variable name". This server runs all
-      three (the empty `as` writes a field named ""). Found 2026-11-14
-      working RM-528.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm528.py::test_lookup_refuses_a_bad_path_and_a_bad_let_name
-      Backlog-ID: RM-646
 - [ ] **A `find` sorted on `$natural` is recorded with the sort, not as a
       hint.** mongod 8.2.11's `$queryStats` key for `{find: "c", sort:
       {$natural: -1}}` has no `sort` in its shape and `hint: {$natural:
@@ -3008,14 +2964,6 @@ produce the dump it exists for.
       (measured 2026-11-22).
       Verify: tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_killed_mongod_store_whose_oplog_drops_what_it_refuses
       Backlog-ID: RM-756
-- [ ] **There is no `shutdown` command.** mongod 8.2.11 stops on
-      `db.adminCommand({shutdown: 1})`: the connection closes and the
-      process exits cleanly. `secantusd-mdb` answers CommandNotFound (59)
-      and keeps running, so SIGTERM is its only clean stop; mongod's own
-      tooling (and phase 7 of the storage plan) stops a server this way.
-      Found measuring phase 0c.
-      Backlog-ID: RM-724
-      Verify: tests/backlog/test_rm_storage_model.py::test_shutdown_command_stops_the_server
 
 ## Found making mongod open our stores (storage-model phase 7, 2026-11-21)
 

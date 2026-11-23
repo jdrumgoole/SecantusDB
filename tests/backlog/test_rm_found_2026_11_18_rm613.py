@@ -32,10 +32,10 @@ def _medians(client: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-720")
+@pytest.mark.backlog_fixed("RM-720")
 def test_an_approximate_median_is_mongods_tdigest(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 answers an approximate `$median` from its t-digest,
     interpolating between centroids: 5552.219999999999 over 5999 values and
-    5551.609969919785 over 20000. This server ranks the exact values
-    (5552.22, 5551.48)."""
+    5551.609969919785 over 20000. This server ranked the exact values
+    (5552.22, 5551.48) until it ported the t-digest."""
     assert _medians(rust_mongo) == _medians(mongod)

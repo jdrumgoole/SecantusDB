@@ -78,6 +78,7 @@ mod paths;
 mod regexutil;
 mod sbe_hashagg;
 mod summation;
+mod tdigest;
 mod tzdb;
 mod windowfields;
 pub use windowfields::{set_window_fields_spec_refusal, NO_SORT_KEY_FIELD, SORT_KEY_FIELD};

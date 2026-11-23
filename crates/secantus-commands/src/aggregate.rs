@@ -3564,6 +3564,9 @@ fn apply_storage_stage(
                     e.code,
                     121 | 166 | 7406103 | 7268700 | 11000 | 17152 | 20 | 52 | 53
                 ) && !e.errmsg.starts_with("Collection names cannot start")
+                    // A measurement with no time field is the executor's
+                    // error on mongod 8.2.11 (RM-718).
+                    || (e.code == 2 && e.errmsg.starts_with("time-series insert failed"))
                 {
                     let ns = format!("{db}.{}", coll.unwrap_or(""));
                     e.errmsg = wrap_pipeline_error(e.errmsg, false, Some(&ns));
@@ -3622,6 +3625,24 @@ fn apply_lookup(
             }
         };
         let (on_db, on_coll) = (part("db")?, part("coll")?);
+        // The two namespaces mongod reads through this syntax (measured
+        // 8.2.11, RM-717): `local.oplog.rs` and `config.cache.chunks.*`.
+        // Every other one, `local` and `config` collections among them, is
+        // refused below.
+        if (on_db == "local" && on_coll == "oplog.rs")
+            || (on_db == "config" && on_coll.starts_with("cache.chunks."))
+        {
+            let mut local = spec.clone();
+            local.insert("from", on_coll);
+            return apply_lookup(
+                Some(&Bson::Document(local)),
+                docs,
+                &on_db,
+                vars,
+                storage,
+                collation,
+            );
+        }
         return Err(CommandError::new(
             9,
             "FailedToParse",

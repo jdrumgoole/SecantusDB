@@ -4119,7 +4119,7 @@ fn op_get_field_field(arg: &Bson, ctx: &Ctx) -> Result<Field, Fallback> {
 /// lower-case ASCII letter or any non-ASCII character first, then letters,
 /// digits, `_` or non-ASCII. `$let` may also rebind `CURRENT`. Measured
 /// 8.2.11, 2026-10-20 -- these bound anything.
-fn user_var_name_parse(name: &str) -> Result<(), Fallback> {
+pub fn user_var_name_parse(name: &str) -> Result<(), Fallback> {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return Err(Fallback::mongo(9, "empty variable names are not allowed").bare());

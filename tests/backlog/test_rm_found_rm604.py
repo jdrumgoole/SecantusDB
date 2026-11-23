@@ -25,14 +25,14 @@ def _empty_nested_specs(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-716")
+@pytest.mark.backlog_fixed("RM-716")
 def test_an_empty_densify_range_or_fill_output_is_refused_as_mongod_refuses_it(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11 parses `$densify.range` as it reads it, so `range: {}`
-    is "'$densify.range.bounds' is missing" before the missing `field`, and
-    refuses `$fill` `output: {}` with 6050203; this server names the missing
-    `field` for the first and answers BadValue (2), "not supported by the
+    was "'$densify.range.bounds' is missing" before the missing `field`, and
+    refuses `$fill` `output: {}` with 6050203; this server named the missing
+    `field` for the first and answered BadValue (2), "not supported by the
     Rust server", for the second."""
     expected = {
         "densify-range-empty": (

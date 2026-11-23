@@ -16,7 +16,7 @@ Both `--flag value` and `--flag=value` spellings work.
 | Flag | Meaning | Default |
 | --- | --- | --- |
 | `--config PATH` | Explicit `secantusd.toml` (see below) | auto-discovered |
-| `--host HOST` | Bind address; also `--bind_ip`, mongod's spelling (one address) | `127.0.0.1` |
+| `--host HOST` | Bind address; also `--bind_ip`, mongod's spelling; a comma list binds each IPv4 address, as mongod does without `--ipv6` | `127.0.0.1` |
 | `--port N` | TCP port (`0` = OS-assigned) | `27017` |
 | `--storage-path PATH` | WiredTiger home directory (created if absent); also `--dbpath`, mongod's spelling | `./secantus-data` |
 | `--log-level LEVEL` | `DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` |

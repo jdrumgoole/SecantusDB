@@ -75,7 +75,7 @@ def _lookup_names(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-646")
+@pytest.mark.backlog_fixed("RM-646")
 def test_lookup_refuses_a_bad_path_and_a_bad_let_name(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -84,6 +84,6 @@ def test_lookup_refuses_a_bad_path_and_a_bad_let_name(
     "... FieldPath field names may not start with '$', given '$a'."), an
     empty `as` (40352 "FieldPath cannot be constructed with empty string")
     and a `let` variable that is not a user variable name (9 "'X' starts
-    with an invalid character for a user variable name"). This server runs
-    all three."""
+    with an invalid character for a user variable name"). This server ran
+    all three until RM-646."""
     assert _lookup_names(rust_mongo) == _lookup_names(mongod_rs)

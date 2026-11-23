@@ -400,7 +400,15 @@ fn prune_oplog_size_cap() {
         let size: usize = rows[rows.len() - keep..].iter().map(|(_, b)| b.len()).sum();
         st.set_oplog_max_bytes(size as i64).unwrap();
         // Retention drops nothing (now=0); the size takes the older ones out.
-        assert_eq!(st.prune_oplog(Some(0)).unwrap(), before.len() - keep);
+        //
+        // `set_oplog_max_bytes` wakes the background pruner (mongod's
+        // OplogCapMaintainerThread), which applies the same size at once, so
+        // it can take some or all of the doomed entries before this sweep
+        // runs. Sweeps are exclusive and each entry goes exactly once, so
+        // this call's count is only a bound; what the size demands is the
+        // oplog held afterwards, asserted exactly below.
+        let dropped = st.prune_oplog(Some(0)).unwrap();
+        assert!(dropped <= before.len() - keep, "{dropped} of {before:?}");
         st.flush_oplog();
         let rows = st.read_oplog(1, 100).unwrap();
         assert_eq!(
@@ -410,6 +418,45 @@ fn prune_oplog_size_cap() {
         assert_eq!(st.oplog_floor_seq().unwrap(), before[before.len() - keep]);
         assert!(!st.oplog_reaches_genesis().unwrap());
         // The held bytes are the size: a further sweep removes nothing.
+        assert_eq!(st.prune_oplog(Some(0)).unwrap(), 0);
+    });
+}
+
+/// The flake `prune_oplog_size_cap` once was: `set_oplog_max_bytes` wakes the
+/// background pruner, which holds the oplog to the new size with no call from
+/// the caller. A caller whose own sweep runs after that finds nothing left to
+/// drop, so the size is enforced either way -- this pins the background half.
+#[test]
+fn oplog_size_cap_is_applied_by_the_background_pruner() {
+    with_db_mut(|st| {
+        for i in 1..=5 {
+            st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
+        }
+        let rows = st.read_oplog(1, 100).unwrap();
+        let before: Vec<i64> = rows.iter().map(|(s, _)| *s).collect();
+        let keep = 2;
+        let size: usize = rows[rows.len() - keep..].iter().map(|(_, b)| b.len()).sum();
+        st.set_oplog_max_bytes(size as i64).unwrap();
+        let want = before[before.len() - keep..].to_vec();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            st.flush_oplog();
+            let held: Vec<i64> = st
+                .read_oplog(1, 100)
+                .unwrap()
+                .iter()
+                .map(|(s, _)| *s)
+                .collect();
+            if held == want {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the background pruner left {held:?}, wanted {want:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Nothing is left for an explicit sweep: it is the same cap.
         assert_eq!(st.prune_oplog(Some(0)).unwrap(), 0);
     });
 }

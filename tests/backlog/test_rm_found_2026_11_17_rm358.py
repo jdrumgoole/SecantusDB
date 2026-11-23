@@ -26,9 +26,10 @@ def _outcome(client: Any, pipeline: list) -> Any:
         client.drop_database(DB)
 
 
-@pytest.mark.backlog("RM-717")
+@pytest.mark.backlog_fixed("RM-717")
 def test_a_lookup_from_the_oplog_runs(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
-    """mongod runs a `$lookup` from `{db: "local", coll: "oplog.rs"}`."""
+    """mongod ran a `$lookup` from `{db: "local", coll: "oplog.rs"}` that this
+    server refused (FailedToParse)."""
     pipeline = [
         {
             "$lookup": {
@@ -42,10 +43,49 @@ def test_a_lookup_from_the_oplog_runs(rust_mongo: Any, mongod_rs: Any) -> None: 
     assert _outcome(rust_mongo, pipeline) == ("ok", 2)
 
 
-@pytest.mark.backlog("RM-718")
+@pytest.mark.backlog_fixed("RM-717")
+@pytest.mark.parametrize(
+    ("on_db", "coll"),
+    [("config", "cache.chunks.a.b"), ("local", "startup_log"), ("config", "transactions")],
+)
+def test_lookup_db_coll_namespaces(rust_mongo: Any, mongod_rs: Any, on_db: str, coll: str) -> None:  # noqa: F811
+    """Only `local.oplog.rs` and `config.cache.chunks.*` are read through
+    `from: {db, coll}`; every other namespace is FailedToParse (9)."""
+    pipeline = [{"$lookup": {"from": {"db": on_db, "coll": coll}, "as": "j", "pipeline": []}}]
+    assert _outcome(mongod_rs, pipeline) == _outcome(rust_mongo, pipeline)
+
+
+@pytest.mark.backlog_fixed("RM-718")
 def test_out_to_time_series_needs_the_time_field(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
     """mongod refuses (BadValue) to `$out` a document with no `timeField`
-    date to a new time-series collection."""
+    date to a new time-series collection; this server wrote it until
+    2026-11-23."""
     pipeline = [{"$out": {"db": DB, "coll": "ts", "timeseries": {"timeField": "t"}}}]
     assert _outcome(mongod_rs, pipeline) == ("err", 2)
     assert _outcome(rust_mongo, pipeline) == ("err", 2)
+
+
+def _message_and_target(client: Any) -> Any:
+    client.drop_database(DB)
+    db = client[DB]
+    db.c.insert_many([{"x": 1}, {"x": 2}])
+    db.create_collection("ts", timeseries={"timeField": "t"})
+    pipeline = [{"$out": {"db": DB, "coll": "ts", "timeseries": {"timeField": "t"}}}]
+    try:
+        with pytest.raises(pymongo.errors.OperationFailure) as e:
+            list(db.c.aggregate(pipeline))
+        # The temporary bucket namespace's name is random on both servers.
+        head, _, tail = e.value.details["errmsg"].partition(f"{DB}.system.buckets.tmp.agg_out.")
+        return head, tail.split(" ", 1)[1], db.ts.count_documents({})
+    finally:
+        client.drop_database(DB)
+
+
+@pytest.mark.backlog_fixed("RM-718")
+def test_out_to_an_existing_time_series_names_the_time_field(
+    rust_mongo: Any,
+    mongod_rs: Any,  # noqa: F811
+) -> None:
+    """An existing time-series target is refused with mongod's message and
+    left as it was."""
+    assert _message_and_target(rust_mongo) == _message_and_target(mongod_rs)
