@@ -351,7 +351,7 @@ def _validation_findings(client: pymongo.MongoClient, db: str, name: str) -> Any
         ]
     if result["valid"] and not result.get("errors") and not warnings:
         return None
-    return (result["valid"], result.get("errors"), warnings)
+    return (result["valid"], result.get("errors"), warnings, result)
 
 
 @pytest.mark.backlog_fixed("RM-723")

@@ -637,7 +637,27 @@ These are explicit non-goals. Don't add them without a reason.
       `indexDetails` and the mongod log's index-entry lines) on a failing
       run and find which key is missing or extra. Found 2026-11-23 working
       RM-650, whose change does not reach storage.
-      Verify: none -- intermittent (1 run in 4), so no gap test fails
+      Measured 2026-11-23 (RM-765 lane, mongod 8.2.11, debug `secantusd-mdb`):
+      NOT reproduced in 192 further runs of that test (12 serial; 40 and 60
+      in 4 and 6 parallel loops at load ~12; 80 in 8 loops beside 4 CPU
+      burners), nor in 40 restarts of a store only mongod wrote with
+      `validate({full: true})` of `config.image_collection`,
+      `config.transactions` and `app.c` three times after each step-up, nor
+      in ~130 validates of them beside a loop of `fsync` (checkpoints). What
+      is known: the scenario writes no retryable `findAndModify`, so
+      `config.image_collection` has `nrecords: 0`, `keysPerIndex: {_id_:
+      0}` in every run measured, and this server writes a record there only
+      for a retryable `findAndModify` or a replay of one
+      (`replay_session_state`), so no key of ours can be missing or extra in
+      an empty table. The same warning, with "transient issue", is what
+      mongod gives a table it is using as validate runs
+      (`_BUSY_WHILE_MONGOD_RUNS`). The test now returns the whole `validate`
+      reply with a failing finding, so the next failure shows its
+      `warnings`, `keysPerIndex` and `nrecords`: if `nrecords` is 0 and the
+      warning is "Found warnings in _id_" alone, it is the busy-table case
+      and `config.image_collection` belongs in that set; a non-empty table
+      or an `extraIndexEntries` / `missingIndexEntries` is ours.
+      Verify: none -- intermittent (1 run in ~200), so no gap test fails
       reliably; RM-723's regression test, named above, shows it when run in
       a loop
       Backlog-ID: RM-765
