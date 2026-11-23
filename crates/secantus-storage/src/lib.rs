@@ -24468,17 +24468,21 @@ impl Storage {
             Some(b) => b,
             None => return Ok(None),
         };
-        // Both corners of the box, brought inside the index's range: every
+        // Both corners of the box: every
         // point of the box hashes between them (the hash is interleaved
         // coordinate bits, which only grow with either coordinate).
-        let clamp = |v: f64| v.clamp(g.lo, g.hi);
+        // A box reaching past the range (a `$centerSphere` over the
+        // antimeridian wraps round it) is the whole range.
         if [min_x, min_y, max_x, max_y].iter().any(|v| v.is_nan()) {
             return Ok(None);
         }
-        let (Some(lo), Some(hi)) = (
-            conv.hash(clamp(min_x), clamp(min_y)),
-            conv.hash(clamp(max_x), clamp(max_y)),
-        ) else {
+        let inside = |v: f64| v >= g.lo && v <= g.hi;
+        let (min_x, min_y, max_x, max_y) = if [min_x, min_y, max_x, max_y].into_iter().all(inside) {
+            (min_x, min_y, max_x, max_y)
+        } else {
+            (g.lo, g.lo, g.hi, g.hi)
+        };
+        let (Some(lo), Some(hi)) = (conv.hash(min_x, min_y), conv.hash(max_x, max_y)) else {
             return Ok(None);
         };
         let lo = geo_part_value(&secantus_core::geoorder::KeyPart::Hash(lo.hash_min()));
