@@ -173,7 +173,7 @@ def _run_time_error_namespace(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-656")
+@pytest.mark.backlog_fixed("RM-656")
 def test_a_run_time_error_names_the_commands_namespace(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -182,6 +182,6 @@ def test_a_run_time_error_names_the_commands_namespace(
     aggregate command on namespace: ... :: caused by :: can't $divide by
     zero" wherever the stage runs: `rm531s.$cmd.aggregate` after a
     `$documents`, `rm531s.o` inside a `$lookup` or `$unionWith` on `o`, with
-    or without `from` / `coll`. This server names `rm531s.` after
+    or without `from` / `coll`. This server named `rm531s.` after
     `$documents` and `rm531s.c` inside a stage reading `c`."""
     assert _run_time_error_namespace(rust_mongo) == _run_time_error_namespace(mongod_rs)

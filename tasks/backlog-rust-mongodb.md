@@ -1296,18 +1296,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       discarding the evaluator's own error. Found 2026-11-14 working RM-531.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_a_documents_expression_error_is_the_expressions
       Backlog-ID: RM-654
-- [ ] **A run-time error in a sub-pipeline or after `$documents` names the
-      wrong namespace.** mongod 8.2.11 names the COMMAND's namespace under
-      "Executor error during aggregate command on namespace:" wherever the
-      failing stage runs: `<db>.$cmd.aggregate` for a collectionless
-      aggregate, the outer collection inside a `$lookup` / `$unionWith`
-      (with or without `from`). This server names `<db>.` (an empty
-      collection) after `$documents` and the FOREIGN collection inside a
-      `$lookup` / `$unionWith` with one: `run_segmented` builds the prefix
-      from its own `coll`, not from `COMMAND_NS`. Found 2026-11-14 working
-      RM-531.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm531.py::test_a_run_time_error_names_the_commands_namespace
-      Backlog-ID: RM-656
 - [ ] **A FETCH's residual `$or` lists its branches in `parsedQuery`'s
       order.** mongod 8.2.11 lists the `$or` a FETCH filters by behind an
       IXSCAN (`{k: {$gte: 2}, $or: [{"x.a": 1}, {x: {$type: [4]}}, {x: {$not:

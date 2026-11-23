@@ -3018,8 +3018,13 @@ pub(crate) fn run_segmented(
     cmd_doc: &Document,
     client_metadata: Option<&Document>,
 ) -> Result<Vec<Document>, CommandError> {
-    // mongod names the namespace in an execution-time aggregate error.
-    let ns = format!("{db}.{}", coll.unwrap_or(""));
+    // mongod names the COMMAND's namespace in an execution-time aggregate
+    // error, wherever the failing stage runs: `<db>.$cmd.aggregate` after a
+    // `$documents`, the outer collection inside a `$lookup` / `$unionWith`
+    // (RM-656, 8.2.11).
+    let ns = COMMAND_NS
+        .with(|n| n.borrow().clone())
+        .unwrap_or_else(|| format!("{db}.{}", coll.unwrap_or("")));
     let mut docs = input;
     let mut buffer: Vec<Bson> = Vec::new();
     for (at, stage) in pipeline.iter().enumerate() {
