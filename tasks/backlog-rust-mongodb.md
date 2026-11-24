@@ -2928,13 +2928,6 @@ wrote and stopped (the forward direction of RM-723).
 Each was measured by running the same writes on mongod 8.2.11 and on
 `secantusd-mdb`, one-member sets, and reading what each logged.
 
-- [ ] **A read-only transaction's commit logs nothing.** mongod 8.2.11
-      commits a read-only transaction under its implicit `w: "majority"` by
-      logging a no-op, `{op: "n", o: {msg: "read-only transaction with
-      writeConcern { w: \"majority\", ... }"}}`, so the commit waits on a
-      write of its own; this server logs no entry.
-      Verify: tests/backlog/test_rm_storage_model.py::test_a_read_only_transaction_logs_its_majority_no_op
-      Backlog-ID: RM-747
 - [ ] **The initiation logs no creation of `config.system.preimages`.**
       mongod's initiation logs every collection it creates, the pre-images
       collection's as `{op: "c", ns: "config.$cmd", o: {create:

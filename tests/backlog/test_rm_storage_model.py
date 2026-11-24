@@ -1461,23 +1461,47 @@ def test_secantus_refuses_an_index_kind_it_does_not_serve_by_name(tmp_path: Path
 # same writes (2026-11-22), working RM-746.
 
 
-@pytest.mark.backlog("RM-747")
+@pytest.mark.backlog_fixed("RM-747")
 def test_a_read_only_transaction_logs_its_majority_no_op(tmp_path: Path) -> None:
-    """mongod 8.2.11 commits a read-only transaction under its implicit
-    `w: "majority"` by logging a no-op, `{op: "n", o: {msg: "read-only
-    transaction with writeConcern { w: \\"majority\\", ... }"}}` (measured
-    2026-11-22), so the commit waits on a write of its own. This server logs
-    nothing for it."""
-    with rust_mongo_server(tmp_path / "store") as client:
-        client.app.c.insert_one({"_id": 1})
+    """mongod 8.2.11 commits a read-only transaction by logging a no-op naming
+    the commit's write concern (measured 2026-11-22 and 2026-11-24, the
+    implicit default and a client-supplied `w: 1`), so the commit waits on a
+    write of its own. This server logged nothing for it."""
+    from pymongo.write_concern import WriteConcern
+
+    def logged(client, wc):
         start = next(client.local["oplog.rs"].find().sort("$natural", -1).limit(1))["ts"]
-        with client.start_session() as session, session.start_transaction():
+        with client.start_session() as session, session.start_transaction(write_concern=wc):
             client.app.c.find_one({"_id": 1}, session=session)
-        entries = [
-            (e["op"], str(e.get("o", {}).get("msg", ""))[:39])
+        return [
+            (e["op"], e["ns"], e["o"])
             for e in client.local["oplog.rs"].find({"ts": {"$gt": start}})
         ]
-    assert entries == [("n", "read-only transaction with writeConcern")]
+
+    with rust_mongo_server(tmp_path / "store") as client:
+        client.app.c.insert_one({"_id": 1})
+        implicit = logged(client, None)
+        w1 = logged(client, WriteConcern(w=1))
+    assert implicit == [
+        (
+            "n",
+            "",
+            {
+                "msg": 'read-only transaction with writeConcern { w: "majority", wtimeout: 0, '
+                'provenance: "implicitDefault" }'
+            },
+        )
+    ]
+    assert w1 == [
+        (
+            "n",
+            "",
+            {
+                "msg": "read-only transaction with writeConcern { w: 1, wtimeout: 0, "
+                'provenance: "clientSupplied" }'
+            },
+        )
+    ]
 
 
 @pytest.mark.backlog("RM-748")
