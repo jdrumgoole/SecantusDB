@@ -2837,16 +2837,6 @@ produce the dump it exists for.
 
 ## The storage model is not mongod's (tasks/mongod-storage-model-plan.md, 2026-11-19)
 
-- [ ] **A time-series collection in a store mongod wrote is refused.**
-      `secantusd-mdb` opens a store mongod 8.2.11 wrote (storage-model
-      phase 7c), but one holding a time-series collection (mongod's view in
-      `system.views` over `system.buckets.<name>`, whose catalog options
-      this server derives from its own registry rows) is refused by name:
-      the registry rows of the collection, of its buckets and of the indexes
-      listed on it (the inverse of `ts_buckets::bucket_key`) are not
-      rebuilt from mongod's catalog.
-      Verify: tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_mongod_time_series_collection
-      Backlog-ID: RM-754
 - [ ] **An index build mongod left unfinished is refused, not finished.**
       mongod 8.2.11 stopped cleanly during an index build leaves the index
       in `_mdb_catalog` with `ready: false` and the build in

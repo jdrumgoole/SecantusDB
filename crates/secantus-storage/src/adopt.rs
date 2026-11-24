@@ -277,7 +277,15 @@ fn remove(session: &Session, table: &str, key: (&str, &str, Option<&str>)) -> Re
 fn adopt_row(session: &Session, row: &CatalogRow) -> Result<bool> {
     let (db, coll) = (row.db.as_str(), row.coll.as_str());
     let md = row.entry.get_document("md").cloned().unwrap_or_default();
-    let options = md.get_document("options").cloned().unwrap_or_default();
+    let mut options = md.get_document("options").cloned().unwrap_or_default();
+    // A time-series collection's buckets: the catalog's options are derived
+    // from the collection's (`buckets_catalog_options`); the registry keeps
+    // the buckets' own.
+    if coll.starts_with(secantus_core::viewdefs::BUCKETS_PREFIX) {
+        if let Some((_, own)) = secantus_core::viewdefs::split_buckets_catalog_options(&options) {
+            options = own;
+        }
+    }
     let mut changed = false;
     if crate::coll_options(session, db, coll)?.as_ref() != Some(&options) {
         put(session, COLL_TABLE, (db, coll, None), &options)?;
@@ -356,6 +364,88 @@ fn adopt_row(session: &Session, row: &CatalogRow) -> Result<bool> {
     Ok(changed)
 }
 
+/// The registry rows of the time-series collection whose buckets `row` is
+/// (`system.buckets.<name>`): its row, with the options the buckets' catalog
+/// options carry for it, and the indexes listed on it, one per index of the
+/// buckets, keyed on its own fields (as `createIndexes` on it writes them).
+/// An index it no longer has goes; one whose spec is unchanged keeps the
+/// stamps this server keeps for it. Whether it changed anything.
+fn adopt_time_series(session: &Session, row: &CatalogRow) -> Result<bool> {
+    let Some(name) = row
+        .coll
+        .strip_prefix(secantus_core::viewdefs::BUCKETS_PREFIX)
+    else {
+        return Ok(false);
+    };
+    let md = row.entry.get_document("md").cloned().unwrap_or_default();
+    let catalog = md.get_document("options").cloned().unwrap_or_default();
+    let Some((options, _)) = secantus_core::viewdefs::split_buckets_catalog_options(&catalog)
+    else {
+        return Ok(false);
+    };
+    let ts = options
+        .get_document("timeseries")
+        .cloned()
+        .unwrap_or_default();
+    let db = row.db.as_str();
+    let mut changed = false;
+    let current = crate::coll_options(session, db, name)?;
+    // What this server keeps beside the definition (the uuid it minted).
+    let mut want = current.clone().unwrap_or_default();
+    want.remove("expireAfterSeconds");
+    want.remove("timeseries");
+    for (k, v) in options {
+        want.insert(k, v);
+    }
+    if current.as_ref() != Some(&want) {
+        put(session, COLL_TABLE, (db, name, None), &want)?;
+        changed = true;
+    }
+    let ours: HashMap<String, Document> = index_rows(session, db, name)?.into_iter().collect();
+    let built_before = ours
+        .values()
+        .map(|p| crate::build_seq(&p.get_document("options").cloned().unwrap_or_default()))
+        .max()
+        .unwrap_or(0);
+    let mut listed: HashSet<String> = HashSet::new();
+    let mut seq = 0i64;
+    for ix in md.get_array("indexes").into_iter().flatten() {
+        let Some(spec) = ix.as_document().and_then(|ix| ix.get_document("spec").ok()) else {
+            continue;
+        };
+        if spec.get_str("name") == Ok(ID_INDEX_NAME) {
+            continue;
+        }
+        // Refused by name before this runs when there is none.
+        let Some(on_collection) = secantus_core::viewdefs::collection_index_spec(spec, &ts) else {
+            continue;
+        };
+        let Ok(ix_name) = on_collection.get_str("name").map(str::to_string) else {
+            continue;
+        };
+        seq += 1;
+        listed.insert(ix_name.clone());
+        let want = match ours.get(&ix_name) {
+            Some(payload) if listed_spec(payload, &ix_name) == on_collection => payload.clone(),
+            _ => match index_payload(&bson::doc! {"spec": on_collection}, built_before + seq) {
+                Some((_, payload)) => payload,
+                None => continue,
+            },
+        };
+        if ours.get(&ix_name) != Some(&want) {
+            put(session, IDX_TABLE, (db, name, Some(&ix_name)), &want)?;
+            changed = true;
+        }
+    }
+    for ix_name in ours.keys() {
+        if !listed.contains(ix_name) {
+            remove(session, IDX_TABLE, (db, name, Some(ix_name)))?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 /// Remove `(db, coll)` from the registry: its row, placement and index rows.
 fn forget(session: &Session, db: &str, coll: &str) -> Result<()> {
     for (name, _) in index_rows(session, db, coll)? {
@@ -395,8 +485,8 @@ fn table_docs(session: &Session, ident: &str) -> Result<Vec<Document>> {
 /// The registry's view rows from each database's `system.views`, the
 /// catalog mongod keeps them in: `{_id: "<db>.<name>", viewOn, pipeline,
 /// collation?}` is a row `{viewOn, viewPipeline, collation?}`; a view row
-/// no document names goes. (A time-series collection's document is
-/// refused before this runs.)
+/// no document names goes. (A time-series collection's document is left
+/// to [`adopt_time_series`].)
 fn adopt_views(session: &Session, rows: &[CatalogRow]) -> Result<(Vec<String>, Vec<String>)> {
     let mut want: HashMap<(String, String), Document> = HashMap::new();
     for row in rows
@@ -411,6 +501,14 @@ fn adopt_views(session: &Session, rows: &[CatalogRow]) -> Result<(Vec<String>, V
                 continue;
             };
             if db != row.db {
+                continue;
+            }
+            // A time-series collection's row is its buckets' to write
+            // (`adopt_time_series`).
+            if view
+                .get_str("viewOn")
+                .is_ok_and(|on| on.starts_with(secantus_core::viewdefs::BUCKETS_PREFIX))
+            {
                 continue;
             }
             let mut opts = Document::new();
@@ -498,6 +596,12 @@ pub(crate) fn reconcile(
             listed.insert((row.db.clone(), row.coll.clone()));
             if adopt_row(session, row)? {
                 out.adopted.push(format!("{}.{}", row.db, row.coll));
+            }
+            if adopt_time_series(session, row)? {
+                let name = row
+                    .coll
+                    .trim_start_matches(secantus_core::viewdefs::BUCKETS_PREFIX);
+                out.adopted.push(format!("{}.{name}", row.db));
             }
         }
         for (db, coll) in placements.keys() {

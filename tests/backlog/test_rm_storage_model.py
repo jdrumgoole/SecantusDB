@@ -1221,8 +1221,8 @@ def _servable_scenario(rs: pymongo.MongoClient) -> None:
     """Phase 0b's scenario on mongod (every collection and index kind,
     capped, clustered, collated, pre-images, a view, a drop, a rename, a
     transaction), less what this server refuses by name in a store: the index
-    kinds it keys otherwise (RM-741 to RM-743, text) and the
-    time-series collection (RM-754). Its user and role stay: this server
+    kinds it keys otherwise (RM-741 to RM-743, text). Its time-series
+    collection stays (RM-754), and its user and role: this server
     keeps them in `admin.system.users` / `system.roles`, as mongod does
     (RM-744)."""
     from tools.probes.mongod_store_layout import run_scenario
@@ -1230,7 +1230,6 @@ def _servable_scenario(rs: pymongo.MongoClient) -> None:
     run_scenario(rs, strict=True)
     for name in _MONGOD_ONLY_KINDS:
         rs.app.kinds.drop_index(name)
-    rs.app.ts.drop()
 
 
 def _comparable(contents: dict) -> dict:
@@ -1380,15 +1379,15 @@ def _served_after_mongods_restart(store: Path, port: int, tmp_path: Path) -> dic
         _stop_mongod(proc, mongod)
 
 
-@pytest.mark.backlog("RM-754")
+@pytest.mark.backlog_fixed("RM-754")
 def test_secantus_opens_a_mongod_time_series_collection(tmp_path: Path) -> None:
     """A store mongod 8.2.11 wrote holding a time-series collection (a view
     in `system.views` over `system.buckets.<name>`, a clustered collection
     with zstd blocks and its own catalog options, measured in phase 0b):
-    `secantusd-mdb` serves its measurements as mongod does. It refuses the
-    store by name instead: the registry rows of a time-series collection
-    (its options, its buckets' catalog options and the indexes listed on it)
-    are not rebuilt from mongod's catalog."""
+    `secantusd-mdb` serves its measurements as mongod does, lists the index
+    mongod made on it (`m_1_t_1`, from the buckets' key) and takes a new
+    measurement. It refused the store by name until the registry rows of a
+    time-series collection were rebuilt from mongod's catalog."""
 
     def setup(rs: pymongo.MongoClient) -> None:
         import datetime as dt
@@ -1405,6 +1404,12 @@ def test_secantus_opens_a_mongod_time_series_collection(tmp_path: Path) -> None:
     assert outcome == "served", said
     with rust_mongo_server(store) as rust:
         assert _comparable(_store_contents(rust)) == _comparable(served)
+        listed = [(ix["name"], dict(ix["key"])) for ix in rust.app.ts.list_indexes()]
+        assert listed == [("m_1_t_1", {"m": 1, "t": 1})]
+        import datetime as dt
+
+        rust.app.ts.insert_one({"t": dt.datetime(2024, 1, 1, 0, 0, 9), "m": 0, "v": 9})
+        assert rust.app.ts.count_documents({"m": 0}) == 4
 
 
 @pytest.mark.backlog("RM-755")
