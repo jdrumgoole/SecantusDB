@@ -402,7 +402,13 @@ one beside it.
   the first query after DDL now grows with the schema again (a real
   RP-911 regression) or the bound sits inside the runner's noise. If it
   is noise, the fix is the measurement, not the bound. Filed by the
-  MongoDB session; nothing on the PG side was changed.
+  MongoDB session; nothing on the PG side was changed. A worse failure of
+  the same test, on 2026-11-24 in a local `gate_pg.sh --storage --fast`
+  backlog step at a load average of about 25: REGRESSED with `relation
+  "rp911c_l_14_2" does not exist`, a relation the test had just created,
+  not a latency miss. Three reruns alone passed. Undiagnosed; a relation
+  that DDL created and a later query cannot find is a correctness bug until
+  shown otherwise, so treat it as the first thing to reproduce here.
   Verify: none -- intermittent on Linux CI; RP-911's regression test is the check
   Backlog-ID: RP-1078
 - [ ] **NOT REPRODUCED -- left open as a watch item. A cancel during the
