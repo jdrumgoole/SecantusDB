@@ -411,6 +411,22 @@ one beside it.
   shown otherwise, so treat it as the first thing to reproduce here.
   Verify: none -- intermittent on Linux CI; RP-911's regression test is the check
   Backlog-ID: RP-1078
+- [ ] **`stop_does_not_wait_on_an_idle_connection` overruns its 3 s bound
+  under contention (2026-11-24).** `crates/secantus-pg/tests/embedded.rs`
+  (the embedded server's `stop` with an idle client connected) took 3.7 s,
+  5.0 s and 3.96 s in three `gate_pg.sh --storage --fast` runs of the
+  `pgserver-test` step on this Mac at a load average of about 10. At
+  cargo's default test-thread count it failed 3 of 3 on the RM-732 branch
+  and 2 of 3 with `crates/` restored to `5bfb9fb82`, so it predates that
+  change; it passes with `--test-threads=4`. Its sibling
+  `tests/test_pgserver_embedded.py::test_stop_does_not_wait_on_an_open_connection`
+  took 3.05 s against 3.0 s once in the same session. A stop that waits on
+  an idle connection is the behaviour the test forbids, so find what the
+  stop path waits for under contention (a poll interval, a join on the
+  connection thread, a checkpoint) before touching the bound. Filed by the
+  MongoDB session; nothing on the PG side was changed.
+  Verify: none -- intermittent under load; the test itself is the check
+  Backlog-ID: RP-1079
 - [ ] **NOT REPRODUCED -- left open as a watch item. A cancel during the
   parse was honoured late on Linux CI twice, in both of RP-002's
   regression tests (2026-11-08, 2026-11-10).** `tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_with_user_code_present`
