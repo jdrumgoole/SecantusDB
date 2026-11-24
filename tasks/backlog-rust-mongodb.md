@@ -2919,6 +2919,20 @@ wrote and stopped (the forward direction of RM-723).
       mongod, as here.
       Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_create_indexes_keeps_a_false_sparse_as_mongod_does, tests/backlog/test_rm_index_spec_fidelity.py::test_create_indexes_drops_the_options_mongod_parses_away
       Backlog-ID: RM-788
+- [ ] **`createIndexes` coerces a flag's type, accepts a `hidden` that is
+      no bool, and refuses `prepareUnique: true`.** Found closing RM-788
+      (2026-11-24, mongod 8.2.11). mongod's catalog keeps `sparse` and
+      `background` as given (`sparse: 1.0` stays a double, `background: 1`
+      an int, where `listIndexes` shows both as booleans), refuses a
+      `background` that is a string ("not convertible to bool", 2) and a
+      `hidden` that is not a bool ("The field 'hidden' must be a bool, but
+      got int"), and takes `prepareUnique: true` at creation, an index armed
+      as `collMod` arms one (`v, prepareUnique, key, name`). `secantusd-mdb`
+      writes every number as a bool (and drops a `sparse: 0.0`), keeps a
+      string `background`, takes `hidden: 1` and `hidden: "x"` as hidden
+      indexes, and refuses `prepareUnique: true` as an unknown field.
+      Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_create_indexes_keeps_a_flag_as_given_and_refuses_a_hidden_that_is_no_bool
+      Backlog-ID: RM-791
 - [ ] **`reIndex` rebuilds nothing, so a `collMod`'d index's spec keeps
       the order `collMod` made.** mongod 8.2.11's `reIndex` (standalone)
       drops and builds every index from its spec, so the spec comes back

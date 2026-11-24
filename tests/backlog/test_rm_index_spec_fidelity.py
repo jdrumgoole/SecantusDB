@@ -114,6 +114,73 @@ def test_create_indexes_drops_the_options_mongod_parses_away(rust_mongo: Any, mo
     assert not differences, differences
 
 
+@pytest.mark.backlog("RM-791")
+def test_create_indexes_keeps_a_flag_as_given_and_refuses_a_hidden_that_is_no_bool(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """The catalog keeps `sparse` and `background` as given (a `1.0` stays a
+    double, a `1` an int, where `listIndexes` shows them as booleans), a
+    `background` that is no number or bool is refused, `hidden` must be a
+    bool, and `prepareUnique: true` is an index armed at creation (mongod
+    8.2.11, 2026-11-24)."""
+    differences = {}
+    for label, options in [
+        ("sparse-double", {"sparse": 1.0}),
+        ("sparse-zero-double", {"sparse": 0.0}),
+        ("sparse-int", {"sparse": 1}),
+        ("sparse-zero", {"sparse": 0}),
+        ("background-int", {"background": 1}),
+        ("background-string", {"background": "x"}),
+        ("hidden-int", {"hidden": 1}),
+        ("hidden-string", {"hidden": "x"}),
+        ("prepare-unique", {"prepareUnique": True}),
+    ]:
+        theirs = mongo_answer(lambda lb=label, op=options: _legacy(mongod, "spec_opts", lb, op))
+        ours = mongo_answer(lambda lb=label, op=options: _legacy(rust_mongo, "spec_opts", lb, op))
+        if ours != theirs:
+            differences[label] = {"secantusd-mdb": ours, "mongod": theirs}
+    assert not differences, differences
+
+
+def _twice(client: Any, label: str, first: dict, second: dict) -> Any:
+    db = client["spec_opts"]
+    db.drop_collection(label)
+    base = {"key": {"a": 1}}
+    db.command("createIndexes", label, indexes=[{"name": "a", **base, **first}])
+    reply = db.command(
+        "createIndexes",
+        label,
+        indexes=[{"name": "a" if "name" not in second else "b", **base, **second}],
+    )
+    return reply.get("note"), reply["numIndexesAfter"]
+
+
+@pytest.mark.backlog("RM-788")
+def test_create_indexes_compares_a_spec_without_sparse_false_and_background(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """A spec with `sparse: false` is the index one without `sparse` is, and
+    `background` takes no part in the comparison: asked for again they are
+    "all indexes already exist"; another name for the same key is 85
+    (mongod 8.2.11, 2026-11-24)."""
+    differences = {}
+    for label, first, second in [
+        ("none-then-false", {}, {"sparse": False}),
+        ("false-then-none", {"sparse": False}, {}),
+        ("false-then-false", {"sparse": False}, {"sparse": False}),
+        ("false-then-other-name", {"sparse": False}, {"name": "b"}),
+        ("none-then-background", {}, {"background": True}),
+        ("background-then-none", {"background": True}, {}),
+        ("false-then-true", {"sparse": False}, {"sparse": True}),
+        ("ttl-zero-then-none", {"expireAfterSeconds": 0}, {}),
+    ]:
+        theirs = mongo_answer(lambda lb=label, a=first, b=second: _twice(mongod, lb, a, b))
+        ours = mongo_answer(lambda lb=label, a=first, b=second: _twice(rust_mongo, lb, a, b))
+        if ours != theirs:
+            differences[label] = {"secantusd-mdb": ours, "mongod": theirs}
+    assert not differences, differences
+
+
 # ------------------------------------------------- an index is rebuilt --
 
 
