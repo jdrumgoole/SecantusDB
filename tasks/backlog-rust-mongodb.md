@@ -2877,16 +2877,6 @@ produce the dump it exists for.
       mongod's.
       Verify: tests/backlog/test_rm_geo_wildcard_plans.py::test_a_near_stage_reports_its_inner_scans_and_counts_their_keys
       Backlog-ID: RM-780
-- [ ] **A hint to a wildcard index no predicate can use is planned, not
-      refused.** Found closing RM-777 (2026-11-24, mongod 8.2.11). mongod
-      refuses a find hinted to `$**` when no predicate of the query bounds
-      a path the index keys, since it will not build a whole-index scan of
-      a wildcard index (code 291, NoQueryExecutionPlans, "$hint: refusing to
-      build whole-index solution, because it's a wildcard index"): `{"w.a":
-      {$ne: 3}}`, or a `$geoWithin`, hinted to it. `secantusd-mdb` plans an
-      IXSCAN of the whole `$**` index, bounds `[MinKey, MaxKey]`.
-      Verify: tests/backlog/test_rm_geo_wildcard_plans.py::test_a_hint_to_a_wildcard_index_no_predicate_can_use_is_refused
-      Backlog-ID: RM-781
 - [ ] **A hinted `$near` over a compound `2dsphere` index whose leading
       field no predicate bounds is read nearest first, not in the index's
       key order.** Found closing RM-783 (2026-11-24, mongod 8.2.11). Hinted

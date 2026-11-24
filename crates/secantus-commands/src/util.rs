@@ -225,13 +225,64 @@ pub(crate) fn validate_hint(
     query: &crate::explain::CanonicalQuery,
 ) -> Result<(), CommandError> {
     if hint_is_known(storage, db, coll, hint) {
-        return Ok(());
+        return wildcard_hint(storage, db, coll, hint, query);
     }
     Err(CommandError::new(
         2,
         "BadValue",
         query.planner_error("hint provided does not correspond to an existing index"),
     ))
+}
+
+/// mongod's refusal of a hint to a wildcard index that no predicate of the
+/// query bounds (`explain::plan::wildcard_hint_refusal`).
+fn wildcard_hint(
+    storage: &dyn crate::Storage,
+    db: &str,
+    coll: &str,
+    hint: Option<&Bson>,
+    query: &crate::explain::CanonicalQuery,
+) -> Result<(), CommandError> {
+    let name = match hint {
+        Some(Bson::String(name)) => Some(name.clone()),
+        Some(Bson::Document(key)) if !key.is_empty() => storage
+            .list_indexes(db, coll)
+            .unwrap_or_default()
+            .iter()
+            .find(|i| i.get_document("key").is_ok_and(|k| k == key))
+            .and_then(|i| i.get_str("name").ok().map(str::to_string)),
+        _ => None,
+    };
+    let Some(name) = name else { return Ok(()) };
+    if !storage.collection_exists(db, coll).unwrap_or(false) {
+        return Ok(());
+    }
+    // Only a wildcard index is planned this way.
+    let wildcard = storage
+        .list_indexes(db, coll)
+        .unwrap_or_default()
+        .iter()
+        .any(|i| {
+            i.get_str("name") == Ok(name.as_str())
+                && i.get_document("key")
+                    .is_ok_and(|k| k.keys().any(|f| f == "$**" || f.ends_with(".$**")))
+        });
+    if !wildcard {
+        return Ok(());
+    }
+    let Ok(catalog) = crate::explain::catalog_of_collection(storage, db, coll) else {
+        return Ok(());
+    };
+    let canonical = crate::explain::parsed_query(query.filter);
+    let implies = |partial: &Document| storage.query_implies_partial(query.filter, partial);
+    match crate::explain::wildcard_hint_refusal(&canonical, &name, &catalog, &implies) {
+        Some(why) => Err(CommandError::new(
+            291,
+            "NoQueryExecutionPlans",
+            query.planner_error(why.message()),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Whether `hint` names an index of `db.coll` (or is no hint at all).

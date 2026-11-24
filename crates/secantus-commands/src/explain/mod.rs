@@ -53,6 +53,7 @@ use node::{num, Stats};
 pub(crate) use parsed::parsed_query;
 pub(crate) use plan::{
     begin_operation, near_refusal, planned_apart, planning_scope, planning_spent, plans_nothing,
+    wildcard_hint_refusal,
 };
 use plan::{Hint, Query};
 use secantus_core::collation::Collation;
@@ -809,6 +810,16 @@ fn plan_for(
                     collation,
                 )
                 .map_err(crate::util::command_error)?;
+        }
+    }
+    // A hint to a wildcard index no predicate bounds is refused.
+    if let (Hint::Index(name), None) = (&hint, s.min_max) {
+        if let Some(why) = plan::wildcard_hint_refusal(canonical, name, &t.catalog, &implies) {
+            return Err(err(
+                291,
+                "NoQueryExecutionPlans",
+                planner_error(&ns, s, why.message()),
+            ));
         }
     }
     if let Some(which) = s.min_max {

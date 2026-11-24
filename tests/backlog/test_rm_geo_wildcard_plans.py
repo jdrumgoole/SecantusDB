@@ -221,27 +221,60 @@ def test_a_near_stage_reports_its_inner_scans_and_counts_their_keys(
     assert answers[1] == answers[0]
 
 
-@pytest.mark.backlog("RM-781")
+@pytest.mark.backlog_fixed("RM-781")
 def test_a_hint_to_a_wildcard_index_no_predicate_can_use_is_refused(
     mongod: Any, rust_mongo: Any
 ) -> None:
-    """mongod 8.2.11 refuses (NoQueryExecutionPlans, 291) a hint to a wildcard
-    index when no predicate of the query bounds a path it keys, since it
-    will not build a whole-index scan of one: `{"w.a": {$ne: 3}}` and a
-    `$geoWithin` hinted to `$**`. `secantusd-mdb` plans a scan of the whole
-    `$**` index."""
+    """mongod 8.2.11 refuses (NoQueryExecutionPlans, 291) a hint to a
+    wildcard index when no predicate of the query bounds a path it keys,
+    since it will not build a whole-index scan of one: "$hint: refusing to
+    build whole-index solution, because it's a wildcard index" when the
+    query names one path the index expands to, "No query solutions" when it
+    names none or several. `{"w.a": {$ne: 3}}` and a `$geoWithin` hinted to
+    `$**` are the first. A query that bounds a path is planned."""
     queries = [
         {"w.a": {"$ne": 3}},
         {"poly": {"$geoWithin": {"$geometry": NEAR_PT_POLY}}},
+        {},
+        {"_id": 5},
+        {"z": {"$ne": 3}, "w.a": {"$ne": 3}},
+        {"$or": [{"w.a": {"$ne": 1}}, {"z": 2}]},
+        {"$or": [{"w.a": 1}, {"z": 2}]},
+        {"w.a": {"$size": 1}},
+        {"w.a": None},
+        {"w.a": 3},
+        {"w.a": {"$gt": 1, "$ne": 2}},
+        {"z": {"$mod": [2, 0]}},
+        {"w.a": {"$in": []}},
+        {"$expr": {"$eq": ["$z", 3]}},
     ]
+    hints = ["all_w", "w_w", "proj_w", "excl_w", "part_w"]
+
+    def read(coll: Any, flt: dict, hint: str) -> list:
+        out: list = []
+        for fn in (
+            lambda: len(list(coll.find(flt).hint(hint))),
+            lambda: len(list(coll.find(flt, {"z": 1}).hint(hint).sort("z", 1).limit(3).skip(1))),
+            lambda: coll.database.command("count", coll.name, query=flt, hint=hint)["n"],
+            lambda: coll.database.command(
+                {
+                    "explain": {"find": coll.name, "filter": flt, "hint": hint},
+                    "verbosity": "queryPlanner",
+                }
+            )["queryPlanner"]["winningPlan"]["stage"],
+            lambda: len(list(coll.aggregate([{"$match": flt}], hint=hint))),
+            lambda: coll.database.command(
+                "update", coll.name, updates=[{"q": flt, "u": {"$set": {"u": 1}}, "hint": hint}]
+            ).get("writeErrors"),
+        ):
+            got = mongo_answer(fn)
+            out.append(got if got[0] == "err" else got[:1] + (None,))
+        return out
+
     answers = []
     for client in (mongod, rust_mongo):
         coll = _load(client)
-        one = []
-        for flt in queries:
-            got = mongo_answer(lambda flt=flt, coll=coll: list(coll.find(flt).hint("all_w")))
-            one.append((got[0], got[1] if got[0] == "err" else None))
-        answers.append(one)
+        answers.append([[read(coll, q, h) for h in hints] for q in queries])
     assert answers[1] == answers[0]
 
 
