@@ -2883,19 +2883,23 @@ produce the dump it exists for.
       (measured 2026-11-22).
       Verify: tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_killed_mongod_store_whose_oplog_drops_what_it_refuses
       Backlog-ID: RM-756
-- [ ] **A mongod store holding a `2d`, `2dsphere` or wildcard index is
-      refused on adoption, never probed for whether it is served right.**
-      `secantusd-mdb` writes these indexes' keys as mongod 8.2.11 does since
-      store format 11, but `UNSERVED_INDEX_KINDS` (`store_format.rs`) and
-      the wildcard check still refuse a store mongod wrote with one, by
-      name. The reverse hand-off needs the adopted index (its spec, bits /
-      min / max, version 3, multikey paths, `wildcardProjection`, partial
-      filter) to be served by the same key generators and scans, with its
-      `$near` / `$geoWithin` / `$geoIntersects` and wildcard answers and
-      winning plans those of mongod on the same data, and the store handed
-      back to mongod to `validate` after this server's own writes.
-      Verify: tests/backlog/test_rm_storage_model.py::test_secantus_serves_mongods_geo_and_wildcard_indexes
-      Backlog-ID: RM-775
+- [ ] **`$geoWithin` / `$geoIntersects` and wildcard predicates are not planned
+      onto their indexes, and a compound `$near` plans its equality
+      differently.** Found adopting mongod's geo and wildcard indexes
+      (RM-775, measured 2026-11-24, mongod 8.2.11, on a store this server
+      wrote as much as on one mongod did). mongod plans `{flat: {$geoWithin:
+      {$box: ...}}}` and `{poly: {$geoIntersects: ...}}` as FETCH over IXSCAN
+      of the `2d` / `2dsphere` index, `{"w.a": 3}` and a range on a wildcard
+      index's path as FETCH over IXSCAN of it, and a `$near` with an equality
+      on the index's other field as the near stage alone (the equality is its
+      bounds). `secantusd-mdb` answers each with a COLLSCAN (a FETCH above
+      GEO_NEAR for the equality; a COLLSCAN when the equality field comes
+      before the geo one), and a wildcard index named in a `hint` reads as an
+      error ("index all_w holds an entry this server cannot read": the
+      explain stream does not know a wildcard key's `$_path` slot). The
+      answers are right: only the plan and the hint differ.
+      Verify: tests/backlog/test_rm_storage_model.py::test_geo_within_and_wildcard_indexes_are_planned
+      Backlog-ID: RM-777
 
 ## Found making mongod open our stores (storage-model phase 7, 2026-11-21)
 

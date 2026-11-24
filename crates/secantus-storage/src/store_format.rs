@@ -245,12 +245,12 @@ pub fn mark_opened(home: &Path) -> Result<()> {
     )
 }
 
-/// The index kinds whose keys this server does not write as mongod does
-/// (storage-model plan, phase 4; mongod's own `2d`, `2dsphere` and wildcard indexes are
-/// refused until a store of its is adopted with them, not for their keys, which are
-/// the ones this server writes since format 11), by the value naming
-/// them in an index's key pattern.
-const UNSERVED_INDEX_KINDS: &[&str] = &["2d", "2dsphere", "2dsphere_bucket", "text", "columnstore"];
+/// The index kinds this server does not key as mongod does (storage-model
+/// plan, phase 4), by the value naming them in an index's key pattern: a
+/// store mongod wrote holding one is refused by name. `2d`, `2dsphere`
+/// (version 3) and wildcard indexes are keyed as mongod keys them since
+/// format 11 and adopted (RM-775).
+const UNSERVED_INDEX_KINDS: &[&str] = &["2dsphere_bucket", "text", "columnstore"];
 
 /// The collection options of a `_mdb_catalog` entry this server keeps and
 /// serves: mongod's own (`uuid`, the oplog's `autoIndexId`), what `create`
@@ -292,6 +292,8 @@ const SERVED_INDEX_OPTIONS: &[&str] = &[
     "bits",
     "min",
     "max",
+    "finestIndexedLevel",
+    "coarsestIndexedLevel",
     "wildcardProjection",
 ];
 
@@ -385,16 +387,20 @@ pub(crate) fn catalog_findings(session: &secantus_wt::Session) -> Result<Vec<Str
             let Ok(key) = spec.get_document("key") else {
                 continue;
             };
-            let kind = key.iter().find_map(|(field, v)| {
-                if field == "$**" || field.ends_with(".$**") {
-                    return Some("wildcard".to_string());
-                }
+            let kind = key.iter().find_map(|(_, v)| {
                 v.as_str()
                     .filter(|k| UNSERVED_INDEX_KINDS.contains(k))
                     .map(str::to_string)
             });
             if let Some(kind) = kind {
                 out.push(format!("{ns}'s index {name} ({kind})"));
+            }
+            // A `2dsphere` index of a version this server does not key (1 and
+            // 2 key by strings of their own).
+            if key.values().any(|v| v.as_str() == Some("2dsphere")) {
+                if let Some(e) = crate::unsupported_index_type(key, spec) {
+                    out.push(format!("{ns}'s index {name} ({e})"));
+                }
             }
             for (option, _) in spec {
                 if !SERVED_INDEX_OPTIONS.contains(&option.as_str()) {

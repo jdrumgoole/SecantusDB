@@ -1500,7 +1500,10 @@ def _geo_wildcard_docs() -> list[dict]:
     """The documents of the geo / wildcard hand-off store (RM-775)."""
     docs: list[dict] = []
     for i in range(60):
-        x, y = (i * 7) % 40 - 20, (i * 11) % 30 - 15
+        # Jittered, so no two documents are at one distance: mongod's order at
+        # a tie is its platform's heap (the Linux build is the exemplar).
+        x = (i * 7) % 40 - 20 + ((i * 37) % 101) / 1009
+        y = (i * 11) % 30 - 15 + ((i * 53) % 103) / 1013
         docs.append(
             {
                 "_id": i,
@@ -1540,6 +1543,12 @@ def _geo_wildcard_indexes(coll: Any) -> None:
     coll.create_index([("places.loc", "2dsphere"), ("t", -1)], name="pl_s")
     coll.create_index(
         [("poly", "2dsphere")], name="poly_s", partialFilterExpression={"t": {"$gte": 1}}
+    )
+    coll.create_index(
+        [("poly", "2dsphere"), ("z", 1)],
+        name="poly_lv",
+        finestIndexedLevel=14,
+        coarsestIndexedLevel=6,
     )
     coll.create_index([("$**", 1)], name="all_w")
     coll.create_index([("w.$**", 1)], name="w_w")
@@ -1639,6 +1648,12 @@ _GEO_QUERIES: list[tuple[str, dict, str | None, list | None]] = [
         None,
     ),
     ("within_places", {"places.loc": {"$geoWithin": {"$geometry": _sq(8, -8)}}}, "pl_s", None),
+    (
+        "intersects_lv",
+        {"poly": {"$geoIntersects": {"$geometry": _sq(7, -3)}}, "z": {"$lt": 6}},
+        "poly_lv",
+        None,
+    ),
     ("w_eq", {"w.a": 3}, "all_w", None),
     ("w_eq_arr", {"w.b": 2}, "all_w", None),
     ("w_str", {"w.b": "s1"}, "w_w", None),
@@ -1660,10 +1675,14 @@ def _geo_answers(coll: Any) -> dict:
     """Each query's ids (in order where mongod defines one) and count."""
     out: dict = {}
     for name, flt, hint, sort in _GEO_QUERIES:
+        # A wildcard index is not planned yet (RM-777): its queries are asked
+        # without a hint, as the answer is the same whatever plan serves it.
+        hint = None if name.startswith("w_") else hint
+        kw = {"hint": hint} if hint else {}
         ordered = "near" in name.lower()
 
-        def run(flt=flt, hint=hint, sort=sort, ordered=ordered):
-            cur = coll.find(flt, hint=hint)
+        def run(flt=flt, kw=kw, sort=sort, ordered=ordered):
+            cur = coll.find(flt, **kw)
             if sort:
                 cur = cur.sort(sort)
             ids = [d["_id"] for d in cur]
@@ -1672,28 +1691,45 @@ def _geo_answers(coll: Any) -> dict:
         out[name] = mongo_answer(run)
         if "near" not in name.lower():
             out["count:" + name] = mongo_answer(
-                lambda flt=flt, hint=hint: coll.count_documents(flt, hint=hint)
+                lambda flt=flt, kw=kw: coll.count_documents(flt, **kw)
             )
     return out
 
 
-def _winning(plan: dict | None) -> list:
-    """The winning plan's stage and index names, root first."""
+def _winning(plan: dict | None, root_only: bool = False) -> list:
+    """The winning plan's stage and index names, root first, down the
+    `inputStage` chain (`root_only`: the root alone)."""
     out: list = []
     while plan:
         out.append((plan.get("stage"), plan.get("indexName")))
-        plan = plan.get("inputStage") or (plan.get("inputStages") or [None])[0]
+        if root_only:
+            break
+        plan = plan.get("inputStage")
     return out
 
 
+#: `$near` queries with an equality on the index's other field: mongod plans
+#: the equality as the near stage's bounds, this server as a FETCH above it,
+#: or (the field before the geo one) a COLLSCAN (RM-777).
+_PLANS_NOT_MATCHED = {"near2d_max", "nearSphere_pt_t", "near_pts_array"}
+
+
 def _geo_plans(coll: Any) -> dict:
-    # No hint: the planner chooses, as it does on mongod.
-    return {
-        name: mongo_answer(
-            lambda flt=flt: _winning(coll.find(flt).explain()["queryPlanner"]["winningPlan"])
+    """A `$near` is planned by the planner (stage and index); the other geo
+    queries are asked their plan under their hint, as the planner does not
+    yet choose a `$geoWithin` / `$geoIntersects` index scan (RM-777)."""
+    out: dict = {}
+    for name, flt, hint, _sort in _GEO_QUERIES:
+        if name.startswith("w_") or name in _PLANS_NOT_MATCHED:
+            continue
+        near = "near" in name.lower()
+        kw = {} if near else {"hint": hint}
+        out[name] = mongo_answer(
+            lambda flt=flt, kw=kw, near=near: _winning(
+                coll.find(flt, **kw).explain()["queryPlanner"]["winningPlan"], near
+            )
         )
-        for name, flt, _hint, _sort in _GEO_QUERIES
-    }
+    return out
 
 
 _GEO_WRITES_DOC = {
@@ -1717,7 +1753,7 @@ def _geo_writes(coll: Any) -> None:
     coll.delete_one({"_id": 6})
 
 
-@pytest.mark.backlog("RM-775")
+@pytest.mark.backlog_fixed("RM-775")
 def test_secantus_serves_mongods_geo_and_wildcard_indexes(tmp_path: Path) -> None:
     """A store mongod 8.2.11 wrote holding `2d`, `2dsphere` (compound, array,
     partial) and wildcard (whole, subtree, `wildcardProjection` both ways,
@@ -1755,7 +1791,7 @@ def test_secantus_serves_mongods_geo_and_wildcard_indexes(tmp_path: Path) -> Non
     finally:
         _stop_mongod(proc, client)
     names = ["_id_", "flat_t", "flat_b", "pt_t", "t_pts", "pl_s", "poly_s"]
-    names += ["all_w", "w_w", "proj_w", "excl_w", "part_w"]
+    names += ["poly_lv", "all_w", "w_w", "proj_w", "excl_w", "part_w"]
     with rust_mongo_server(store) as rust:
         coll = rust["app"]["g"]
         listed = mongo_answer(lambda: sorted(ix["name"] for ix in coll.list_indexes()))
@@ -1765,7 +1801,9 @@ def test_secantus_serves_mongods_geo_and_wildcard_indexes(tmp_path: Path) -> Non
         _geo_writes(coll)
         assert _geo_answers(coll) == expected["after"]
         rust_port = rust.address[1]
-    proc, mongod = _mongod_on(store, rust_port, SECANTUS_SET)
+    # The store keeps the set mongod made (rs0), at the port the adopting
+    # server listened on.
+    proc, mongod = _mongod_on(store, rust_port, "rs0")
     try:
         assert mongod is not None, "mongod refused the store (see its log beside the store)"
         with _mongod_answers(store):
@@ -1774,3 +1812,80 @@ def test_secantus_serves_mongods_geo_and_wildcard_indexes(tmp_path: Path) -> Non
             assert _geo_answers(mongod["app"]["g"]) == expected["after"]
     finally:
         _stop_mongod(proc, mongod)
+
+
+def _plans_of(client: pymongo.MongoClient) -> dict:
+    coll = client["app"]["p"]
+    cases = {
+        "near_eq": ({"flat": {"$near": [3, 4]}, "t": 1}, None),
+        "near_lead_eq": (
+            {"pts": {"$near": {"$geometry": {"type": "Point", "coordinates": [5, 5]}}}, "t": 3},
+            None,
+        ),
+        "within_box": ({"flat": {"$geoWithin": {"$box": [[-5, -5], [8, 9]]}}}, None),
+        "intersects": ({"poly": {"$geoIntersects": {"$geometry": _sq(9)}}}, None),
+        "wild_eq": ({"w.a": 3}, None),
+        "wild_range": ({"w.c.d": {"$gt": 2, "$lte": 5}}, None),
+        "wild_hinted": ({"w.a": 3}, "all_w"),
+    }
+    out: dict = {}
+    for name, (flt, hint) in cases.items():
+        kw = {"hint": hint} if hint else {}
+        out[name] = mongo_answer(
+            lambda flt=flt, kw=kw: (
+                _winning(coll.find(flt, **kw).explain()["queryPlanner"]["winningPlan"]),
+                sorted(d["_id"] for d in coll.find(flt, **kw)),
+            )
+        )
+    return out
+
+
+def _plan_collection(coll: Any) -> None:
+    coll.insert_many(_geo_wildcard_docs())
+    coll.create_index([("flat", "2d"), ("t", 1)], name="flat_t")
+    coll.create_index([("t", 1), ("pts", "2dsphere")], name="t_pts")
+    coll.create_index([("poly", "2dsphere")], name="poly_s")
+    coll.create_index([("$**", 1)], name="all_w")
+
+
+@pytest.mark.backlog("RM-777")
+def test_geo_within_and_wildcard_indexes_are_planned(tmp_path: Path) -> None:
+    """mongod 8.2.11 plans a `$geoWithin` / `$geoIntersects` onto its
+    `2d` / `2dsphere` index (FETCH over IXSCAN), a wildcard predicate onto
+    the wildcard index, an equality on another field of a compound `$near`
+    index as the near stage's bounds, and reads a wildcard index under a
+    hint. `secantusd-mdb` answers each of these with a COLLSCAN, or (a
+    wildcard index named in a hint) an error."""
+    store = tmp_path / "ref"
+    store.mkdir()
+    proc, client = _mongod_on(store)
+    assert client is not None, "mongod did not start on an empty directory"
+    try:
+        host, port = client.address or ("127.0.0.1", 0)
+        _wait_primary(client, f"{host}:{port}")
+        with pymongo.MongoClient(
+            host, port, replicaSet="rs0", serverSelectionTimeoutMS=10_000
+        ) as rs:
+            _plan_collection(rs["app"]["p"])
+            expected = _plans_of(rs)
+    finally:
+        _stop_mongod(proc, client)
+    with rust_mongo_server(tmp_path / "rust") as rust:
+        _plan_collection(rust["app"]["p"])
+        assert _plans_of(rust) == expected
+
+
+@pytest.mark.backlog_fixed("RM-775")
+def test_secantus_refuses_a_2dsphere_version_it_does_not_key_by_name(tmp_path: Path) -> None:
+    """A mongod store holding a version 2 `2dsphere` index (keyed by strings
+    this server does not write) is refused on adoption, naming the index;
+    the version 3 indexes beside it are what is adopted."""
+
+    def setup(rs: pymongo.MongoClient) -> None:
+        coll = rs["app"]["c"]
+        coll.insert_one({"_id": 1, "loc": {"type": "Point", "coordinates": [1, 2]}})
+        coll.create_index([("loc", "2dsphere")], name="loc_v2", **{"2dsphereIndexVersion": 2})
+
+    store = _mongod_store(tmp_path, setup)
+    outcome, said = _secantus_open(store)
+    assert (outcome, "app.c" in said, "loc_v2" in said) == ("refused", True, True), said

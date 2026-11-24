@@ -2564,12 +2564,10 @@ fn geo_part_value(part: &secantus_core::geoorder::KeyPart) -> Bson {
 /// the covering gave them.
 fn geo_cells(index: &secantus_core::geoorder::GeoIndex, doc: &Document) -> Vec<Bson> {
     let mut out: Vec<Bson> = Vec::new();
-    if let Some(v) = get_path(doc, index.geo_field()) {
-        for part in index.geo_keys(v) {
-            let cell = geo_part_value(&part);
-            if !out.contains(&cell) {
-                out.push(cell);
-            }
+    for part in index.geo_key_parts(doc) {
+        let cell = geo_part_value(&part);
+        if !out.contains(&cell) {
+            out.push(cell);
         }
     }
     out
@@ -18773,6 +18771,11 @@ impl Storage {
         recordid: &RecordId,
     ) -> Result<Vec<EntryKey>> {
         let mut out = Vec::new();
+        // A partial index holds a document only while it matches the filter
+        // (a geo index and a wildcard one among them).
+        if !self.doc_in_partial(doc, desc)? {
+            return Ok(out);
+        }
         // A geo index: its keys, as mongod's `get2DKeys` / `getS2Keys` make them.
         if let Some(geo) = &desc.geo_2d {
             let shape = desc.shape();
@@ -18786,9 +18789,6 @@ impl Storage {
             for values in gs.key_values(doc) {
                 out.push(shape.entry(&values, recordid)?);
             }
-            return Ok(out);
-        }
-        if !self.doc_in_partial(doc, desc)? {
             return Ok(out);
         }
         let shape = desc.shape();

@@ -129,9 +129,11 @@ impl Measure {
     /// `doc` (RecordId `rid`) as the search sees it; `passes`: the near
     /// stage's own filter lets it through.
     pub fn candidate<P>(&self, rid: i64, doc: &Document, passes: bool, payload: P) -> Candidate<P> {
-        let value = crate::get_path(doc, self.index.geo_field());
+        // The values along the geo field's path (an array of documents on
+        // the way holds several): the nearest measures the document.
+        let values = super::elements_along_path(doc, self.index.geo_field(), false);
         let in_annulus = !self.flat
-            || value.is_some_and(|v| {
+            || values.iter().any(|v| {
                 super::flat_points(v)
                     .into_iter()
                     .any(|p| self.full.contains(p))
@@ -140,8 +142,10 @@ impl Measure {
             rid,
             keys: self.index.keys(doc),
             fetched: passes && in_annulus,
-            distance: value
-                .and_then(|v| distance(&self.near, self.flat, v))
+            distance: values
+                .iter()
+                .filter_map(|v| distance(&self.near, self.flat, v))
+                .min_by(f64::total_cmp)
                 .unwrap_or(-1.0),
             payload,
         }

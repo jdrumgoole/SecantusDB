@@ -101,6 +101,37 @@ pub struct GeoIndex {
     pub geo_at: usize,
 }
 
+/// The values at `path` the way `dps::extractAllElementsAlongPath` finds
+/// them: an array on the way contributes each of its documents' values; one
+/// at the end contributes its elements when `expand_trailing`, else itself.
+pub fn elements_along_path(doc: &Document, path: &str, expand_trailing: bool) -> Vec<Bson> {
+    fn walk(d: &Document, parts: &[&str], expand_trailing: bool, out: &mut Vec<Bson>) {
+        let Some(v) = d.get(parts[0]) else { return };
+        if parts.len() == 1 {
+            match v {
+                Bson::Array(items) if expand_trailing => out.extend(items.iter().cloned()),
+                other => out.push(other.clone()),
+            }
+            return;
+        }
+        match v {
+            Bson::Document(inner) => walk(inner, &parts[1..], expand_trailing, out),
+            Bson::Array(items) => {
+                for item in items {
+                    if let Bson::Document(inner) = item {
+                        walk(inner, &parts[1..], expand_trailing, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut out = Vec::new();
+    walk(doc, &parts, expand_trailing, &mut out);
+    out
+}
+
 fn as_i64(v: &Bson) -> Option<i64> {
     match v {
         Bson::Int32(i) => Some(i64::from(*i)),
@@ -218,24 +249,41 @@ impl GeoIndex {
         }
     }
 
+    /// The geo field's keys for a document: those of each value along the
+    /// path (mongod's `extractAllElementsAlongPath`: an array on the way
+    /// contributes each of its documents' values, a trailing array is one
+    /// value, a legacy coordinate pair), distinct and in the order found.
+    pub fn geo_key_parts(&self, doc: &Document) -> Vec<KeyPart> {
+        let mut out: Vec<KeyPart> = Vec::new();
+        for value in elements_along_path(doc, self.geo_field(), false) {
+            for part in self.geo_keys(&value) {
+                if !out.contains(&part) {
+                    out.push(part);
+                }
+            }
+        }
+        out
+    }
+
     /// Every key a document holds in the index: its geo keys, each with the
     /// values of the other fields (one key per value of a field holding an
     /// array). None when the geo field holds nothing the index keys.
     pub fn keys(&self, doc: &Document) -> Vec<Key> {
-        let Some(geo) = crate::get_path(doc, self.geo_field()) else {
-            return Vec::new();
-        };
         let mut keys: Vec<Key> = vec![Vec::new()];
         for (at, field) in self.fields.iter().enumerate() {
             let parts: Vec<KeyPart> = if at == self.geo_at {
-                self.geo_keys(geo)
+                self.geo_key_parts(doc)
             } else {
-                let values = match crate::get_path(doc, field) {
-                    None => vec![Bson::Null],
-                    Some(Bson::Array(a)) if a.is_empty() => vec![Bson::Undefined],
-                    Some(Bson::Array(a)) => a.clone(),
-                    Some(v) => vec![v.clone()],
-                };
+                let mut values = elements_along_path(doc, field, true);
+                if values.is_empty() {
+                    values = if crate::get_path(doc, field)
+                        .is_some_and(|v| matches!(v, Bson::Array(a) if a.is_empty()))
+                    {
+                        vec![Bson::Undefined]
+                    } else {
+                        vec![Bson::Null]
+                    };
+                }
                 values
                     .iter()
                     .map(|v| {

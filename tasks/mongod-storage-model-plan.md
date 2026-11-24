@@ -998,6 +998,14 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
    with multikey metadata keys under a reserved RecordId; each matches
    mongod's `validate` (`tests/backlog/test_rm_storage_model.py`). Hashed and
    text are refused at create.
+
+   **Closed since (RM-775):** the reverse hand-off serves them: a store
+   mongod wrote with `2d`, version 3 `2dsphere` (covering levels included)
+   and wildcard indexes (whole, subtree, `wildcardProjection`, partial) is
+   adopted, answers as mongod does on the same data, and passes mongod's
+   `validate` after this server's writes. Still refused by name: a
+   `2dsphere` of version 1 or 2, `2dsphere_bucket`, text and
+   columnstore.
    **Still different from mongod, filed:**
    users and roles in private tables (RM-744); a view's DDL logged as
    commands, its `system.views` writes unreplicated (RM-745); after a crash
