@@ -455,13 +455,13 @@ pub(crate) enum Acc {
     // finalize. `ps` parses from the spec on the first apply (None = $median).
     // An invalid spec defers to Python, which raises mongod's exact error.
     //
-    // `buffered` counts the values mongod's t-digest buffers (finite ones;
-    // an infinity is only counted), for its memory.
+    // `digest` is mongod's t-digest, fed as the values arrive: a `$group`
+    // answers, counts its memory and spills from it, a window from `values`.
     Percentile {
         is_median: bool,
         ps: Option<Vec<f64>>,
         values: Vec<f64>,
-        buffered: usize,
+        digest: crate::tdigest::TDigest,
     },
     // `$top` / `$bottom` / `$topN` / `$bottomN`: collect `(sortBy-values, output)`
     // per doc; at finalize stable-sort by the `sortBy` directions and take the
@@ -800,13 +800,13 @@ pub(crate) fn new_acc(op: &str) -> R<Acc> {
             is_median: true,
             ps: None,
             values: Vec::new(),
-            buffered: 0,
+            digest: crate::tdigest::TDigest::new(),
         },
         "$percentile" => Acc::Percentile {
             is_median: false,
             ps: None,
             values: Vec::new(),
-            buffered: 0,
+            digest: crate::tdigest::TDigest::new(),
         },
         "$concatArrays" => Acc::ConcatArrays(Capped::default()),
         "$setUnion" => Acc::SetUnion(Capped::default()),
@@ -888,13 +888,14 @@ pub(crate) fn percentile_rank(sorted_values: &[f64], p: f64) -> Bson {
 
 /// A `$group`'s `$median` / `$percentile` finalize: mongod's t-digest
 /// ([`crate::tdigest`]), fed the values in the order the group saw them, so
-/// its buffer flushes where mongod's does. Null (per `p`, null for the whole
+/// its buffer flushes where mongod's does, and merged with the digests a
+/// spill wrote. Null (per `p`, null for the whole
 /// array) when no value was seen, as `computePercentiles` answers `{}`.
-fn percentile_tdigest(is_median: bool, ps: Option<Vec<f64>>, values: &[f64]) -> Bson {
-    let mut digest = crate::tdigest::TDigest::new();
-    for v in values {
-        digest.incorporate(*v);
-    }
+fn percentile_tdigest(
+    is_median: bool,
+    ps: Option<Vec<f64>>,
+    mut digest: crate::tdigest::TDigest,
+) -> Bson {
     if is_median {
         return digest.percentile(0.5).map_or(Bson::Null, Bson::Double);
     }
@@ -1053,7 +1054,7 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Vars) 
             is_median,
             ps,
             values,
-            buffered,
+            digest,
         } => {
             let op = if *is_median { "$median" } else { "$percentile" };
             let (input, parsed) = percentile_spec(arg, op)?;
@@ -1063,9 +1064,7 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Vars) 
             let v = eval(input, doc, vars)?;
             if let Some(f) = percentile_f64(&v) {
                 values.push(f);
-                if f.is_finite() {
-                    *buffered += 1;
-                }
+                digest.incorporate(f);
             }
         }
         Acc::NElem { kind, n, vals, mem } => {
@@ -1779,13 +1778,10 @@ pub(crate) fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
             Acc::Percentile {
                 is_median,
                 ps,
-                values,
+                digest,
                 ..
             } => {
-                out.insert(
-                    field.to_string(),
-                    percentile_tdigest(is_median, ps, &values),
-                );
+                out.insert(field.to_string(), percentile_tdigest(is_median, ps, digest));
             }
             Acc::NElem { kind, n, vals, .. } => {
                 out.insert(
@@ -2530,7 +2526,7 @@ fn acc_memory(acc: &Acc) -> usize {
         }
         // The values a classic N accumulator keeps (RM-502).
         Acc::NElem { mem, .. } | Acc::TopN { mem, .. } if !sbe => *mem,
-        Acc::Percentile { buffered, .. } => tdigest_buffer(*buffered),
+        Acc::Percentile { digest, .. } => digest.mem_bytes(),
         Acc::MergeObjects(d) if sbe && !d.is_empty() => {
             memlimit::sbe_size(&Bson::Null) + memlimit::bson_len(d)
         }
@@ -2540,22 +2536,6 @@ fn acc_memory(acc: &Acc) -> usize {
 
 /// `sizeof(AccumulatorPercentile) + sizeof(TDigest)`, before its buffer.
 const PERCENTILE_BASE: usize = 256;
-
-/// `TDigest::flushBuffer` runs when the buffer reaches `bufferCoeff * delta`
-/// (3 x `internalQueryTdigestDelta`'s 2000).
-const TDIGEST_BUFFER: usize = 6000;
-
-/// What mongod's t-digest counts for its buffer of `buffered` values
-/// (`TDigest::memUsageBytes`, 8.2): the vector's capacity in doubles, which
-/// doubles from one as values arrive (macOS 8.2.11: one value 8 bytes, three
-/// 32) and keeps the capacity it reached when a flush empties it. The
-/// centroids a flush makes are not counted yet (RM-720).
-fn tdigest_buffer(buffered: usize) -> usize {
-    if buffered == 0 {
-        return 0;
-    }
-    buffered.min(TDIGEST_BUFFER).next_power_of_two() * std::mem::size_of::<f64>()
-}
 
 /// What mongod's classic accumulator object counts for itself (its
 /// `sizeof`), read from 8.2.11's `explain` (`maxAccumulatorMemoryUsageBytes`
@@ -4336,16 +4316,26 @@ mod held_value_memory_tests {
 
     #[test]
     fn the_tdigest_buffer_doubles_and_keeps_its_capacity() {
+        let mem = |n: usize| {
+            let mut d = crate::tdigest::TDigest::new();
+            for i in 0..n {
+                d.incorporate(i as f64);
+            }
+            PERCENTILE_BASE + d.mem_bytes()
+        };
         // macOS 8.2.11: 256 over no value, 264 over one, 288 over three, 320
         // over five, 768 over forty.
-        let sizes: Vec<usize> = [0, 1, 3, 5, 40]
-            .into_iter()
-            .map(|n| PERCENTILE_BASE + tdigest_buffer(n))
-            .collect();
+        let sizes: Vec<usize> = [0, 1, 3, 5, 40].into_iter().map(mem).collect();
         assert_eq!(sizes, vec![256, 264, 288, 320, 768]);
-        // Past the flush at 6000 the buffer keeps the 8192 it grew to.
-        assert_eq!(tdigest_buffer(6000), 8192 * 8);
-        assert_eq!(tdigest_buffer(50_000), 8192 * 8);
+        // The flush at 6000 keeps the 8192 doubles the buffer grew to, and
+        // adds 16 bytes for each centroid it leaves (`memUsageBytes`).
+        let mut d = crate::tdigest::TDigest::new();
+        for i in 0..6000 {
+            d.incorporate(i as f64);
+        }
+        let centroids = d.serialize().len() / 2 - 2;
+        assert!(centroids > 0 && centroids < 6000);
+        assert_eq!(d.mem_bytes(), 8192 * 8 + 16 * centroids);
     }
 
     #[test]

@@ -1120,19 +1120,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       to run. Found 2026-11-13 working RM-325.
       Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_a_window_spill_the_engine_writes_out_is_mongods_size
       Backlog-ID: RM-611
-- [ ] **A `$group` `$median` / `$percentile` t-digest counts only its
-      buffer's memory, and spills every value.** The answer is mongod's
-      t-digest since RM-720's first slice (`secantus_core::tdigest`, a port of
-      8.2's `percentile_algo_tdigest`), but the digest is rebuilt at finalize
-      from every value kept: `group::tdigest_buffer` counts only the buffer,
-      not the centroids a flush leaves (`TDigest::memUsageBytes`), and
-      `group_spill::tdigest_state` writes every value as a weight-one
-      centroid, sorted, where mongod writes its merged centroids. A group that
-      spilled is then rebuilt from sorted values, which flush at other points
-      than mongod's arrival order, so its approximate answer can differ.
-      Found 2026-11-18 working RM-613; trimmed 2026-11-23.
-      Verify: none -- needs a spill-point / spilled-answer probe against mongod 8.2.11 to pin; the unspilled answer is pinned by tests/backlog/test_rm_found_2026_11_18_rm613.py
-      Backlog-ID: RM-720
 - [ ] **An upsert's field order sometimes repeats for all twelve
       upserts.** `tests/backlog/test_rm_057_084.py::test_upsert_field_order_from_several_equalities`
       (RM-059's regression test) failed in one RM-625 gate run on
