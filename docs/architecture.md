@@ -43,7 +43,7 @@ expression evaluation, joins, aggregates and functions are its own.
 ## Storage
 
 Both servers share one storage format on WiredTiger, the same engine `mongod`
-ships, laid out as `mongod` 8.2 lays it out (store format 11):
+ships, laid out as `mongod` 8.2 lays it out (store format 12):
 
 - **`_mdb_catalog` lists every collection and index with its ident.** Each
   collection is a table of its own, keyed by RecordId (so walking it gives

@@ -53,6 +53,11 @@ struct Style {
     /// Whether siblings are sorted (`MatchExpression::sortTree`), as in
     /// `parsedQuery`; a pipeline `$match` keeps them as written.
     sorted: bool,
+    /// Whether an `$in` of one value that an `$or` of equalities made
+    /// stays an `$in` (as the Boolean simplifier reads it, where it is a
+    /// predicate of its own); the `$in` of a `$nin` is its equality either
+    /// way.
+    keep_one_in: bool,
 }
 
 /// One operator document, rewritten as mongod prints it.
@@ -68,7 +73,7 @@ fn operator(mut d: Document, style: Style) -> Document {
         items.dedup_by(|a, b| sort_key(a) == sort_key(b));
     }
     // `{$in: [x]}` is `{$eq: x}`, under a `$not` as at the top.
-    if let (1, Some(Bson::Array(items))) = (d.len(), d.get("$in")) {
+    if let (1, Some(Bson::Array(items)), false) = (d.len(), d.get("$in"), style.keep_one_in) {
         if let [one] = items.as_slice() {
             if !matches!(one, Bson::RegularExpression(_)) {
                 return doc! { "$eq": one.clone() };
@@ -136,6 +141,20 @@ fn operator(mut d: Document, style: Style) -> Document {
                     branches.sort_by_key(branch_rank);
                 }
                 Bson::Array(branches)
+            }
+            // A `$nin` of one value is a `$not` of its equality.
+            ("$not", Bson::Document(inner))
+                if style.keep_one_in
+                    && inner.len() == 1
+                    && matches!(inner.get("$in"), Some(Bson::Array(a)) if a.len() == 1) =>
+            {
+                tidy(
+                    Bson::Document(inner),
+                    Style {
+                        keep_one_in: false,
+                        ..style
+                    },
+                )
             }
             (_, other) => tidy(other, style),
         };
@@ -205,6 +224,7 @@ pub(crate) fn parsed_match_stage(filter: &Document) -> Document {
     let style = Style {
         sorted_in: true,
         sorted: false,
+        keep_one_in: false,
     };
     match tidy(Bson::Document(written), style) {
         Bson::Document(d) => d,
@@ -212,7 +232,50 @@ pub(crate) fn parsed_match_stage(filter: &Document) -> Document {
     }
 }
 
+/// The query's tree as mongod's Boolean simplifier leaves it
+/// (`simplify`), where the simplifier changes it. It reads the tree the
+/// optimiser built and has not sorted (`match_as_written`), so the order
+/// it numbers the predicates in is the order they were written in; the
+/// find path only (a pipeline `$match` is not simplified, measured
+/// 8.2.11, 2026-11-24).
+fn simplified(filter: &Document, sorted_in: bool) -> Option<Document> {
+    // `{$nin: []}` excludes nothing, and mongod says so its own way (below).
+    fn empty_nin(value: &Bson) -> bool {
+        match value {
+            Bson::Document(d) => d.iter().any(|(k, v)| {
+                (k == "$nin" && matches!(v, Bson::Array(a) if a.is_empty())) || empty_nin(v)
+            }),
+            Bson::Array(a) => a.iter().any(empty_nin),
+            _ => false,
+        }
+    }
+    if empty_nin(&Bson::Document(filter.clone())) {
+        return None;
+    }
+    let written = secantus_core::match_as_written(&Bson::Document(with_schemas_parsed(filter)));
+    let style = Style {
+        sorted_in,
+        sorted: false,
+        keep_one_in: true,
+    };
+    let Bson::Document(tree) = tidy(Bson::Document(written), style) else {
+        return None;
+    };
+    // A single predicate is no Boolean expression: the rewrites of the
+    // path below it (`$nin: []`, an `$in` of equal values) are its own.
+    if !matches!(
+        tree.keys().next().map(String::as_str),
+        Some("$and" | "$or" | "$nor")
+    ) {
+        return None;
+    }
+    Some(sort_tree(super::simplify::simplify(&tree).unwrap_or(tree)))
+}
+
 fn parsed(filter: &Document, sorted_in: bool) -> Document {
+    if let Some(simpler) = simplified(filter, sorted_in) {
+        return simpler;
+    }
     let lone = filter.len() == 1 && !filter.contains_key("$and");
     let canonical = drop_always_true(
         secantus_core::canonical_match(&Bson::Document(with_schemas_parsed(filter))),
@@ -232,11 +295,58 @@ fn parsed(filter: &Document, sorted_in: bool) -> Document {
     let style = Style {
         sorted_in,
         sorted: true,
+        keep_one_in: false,
     };
     match tidy(Bson::Document(canonical), style) {
         Bson::Document(d) => optimize(d, sorted_in),
         _ => Document::new(),
     }
+}
+
+/// `MatchExpression::sortTree` over a tree built unsorted: every `$and`,
+/// `$or` and `$nor` lists its children in mongod's order.
+pub(super) fn sort_tree(node: Document) -> Document {
+    // A predicate that holds a tree of its own sorts it too.
+    if let [(path, Bson::Document(pred))] = node.iter().collect::<Vec<_>>()[..] {
+        if !path.starts_with('$') && pred.len() == 1 {
+            if let Some((op, Bson::Document(inner))) = pred.iter().next() {
+                if matches!(op.as_str(), "$elemMatch" | "$_internalSchemaObjectMatch") {
+                    let mut kept = Document::new();
+                    kept.insert(op.clone(), sort_tree(inner.clone()));
+                    let mut out = Document::new();
+                    out.insert(path.clone(), kept);
+                    return out;
+                }
+            }
+        }
+    }
+    let [(key, Bson::Array(children))] = node.iter().collect::<Vec<_>>()[..] else {
+        return node;
+    };
+    if !matches!(key.as_str(), "$and" | "$or" | "$nor") {
+        return node;
+    }
+    let mut kept: Vec<Document> = children
+        .iter()
+        .filter_map(Bson::as_document)
+        .cloned()
+        .map(sort_tree)
+        .collect();
+    // An `$alwaysTrue` child prints `{}` and sorts as the empty `$and` it is.
+    let rank = |d: &Document| {
+        if d.is_empty() {
+            doc! { "$and": [] }
+        } else {
+            d.clone()
+        }
+    };
+    kept.sort_by(|a, b| compare_clauses(&rank(a), &rank(b)));
+    let mut out = Document::new();
+    out.insert(
+        key.clone(),
+        kept.into_iter().map(Bson::Document).collect::<Vec<_>>(),
+    );
+    out
 }
 
 /// mongod's optimisation of the parsed tree (8.2.11, measured 2026-10-20):
@@ -325,7 +435,19 @@ fn with_schemas_parsed(filter: &Document) -> Document {
 /// `$exists` comes before `$not` of a type test, and of two `$or`s the one
 /// whose first differing child sorts first.
 fn compare_clauses(a: &Document, b: &Document) -> std::cmp::Ordering {
-    let order = secantus_core::clause_rank(a).cmp(&secantus_core::clause_rank(b));
+    // A `$not` is a node with no path of its own: it sorts by what it
+    // negates (`{a: {$not: {$in: ..}}}` after `{d: {$not: {$gt: ..}}}`,
+    // measured 8.2.11, 2026-11-24).
+    let rank = |d: &Document| {
+        let (kind, path, extra) = secantus_core::clause_rank(d);
+        let negated = d
+            .values()
+            .next()
+            .and_then(Bson::as_document)
+            .is_some_and(|p| d.len() == 1 && p.len() == 1 && p.contains_key("$not"));
+        (kind, if negated { String::new() } else { path }, extra)
+    };
+    let order = rank(a).cmp(&rank(b));
     if order != std::cmp::Ordering::Equal {
         return order;
     }
@@ -464,7 +586,7 @@ fn single_in(clause: Document) -> Document {
 
 /// Whether two clauses are one predicate: the same shape, values equal as
 /// mongod compares them.
-fn same_clause(a: &Document, b: &Document) -> bool {
+pub(super) fn same_clause(a: &Document, b: &Document) -> bool {
     fn same(a: &Bson, b: &Bson) -> bool {
         match (a, b) {
             (Bson::Document(x), Bson::Document(y)) => {

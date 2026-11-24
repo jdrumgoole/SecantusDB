@@ -27,8 +27,9 @@
 //! So are a `$match` on `documentKey` and (inexactly) on `fullDocument`
 //! (RM-698). Not reproduced: the rewrites of `ns`, `to`,
 //! `updateDescription`, `fullDocumentBeforeChange`, the renamed
-//! `clusterTime` / `lsid` / `txnNumber`, and of `$expr` (RM-698), the Boolean simplifier mongod runs over the unwind's filter
-//! (RM-699), and the change stream's `queryShapeHash` (RM-454).
+//! `clusterTime` / `lsid` / `txnNumber`, and of `$expr` (RM-698), and the
+//! change stream's `queryShapeHash` (RM-454). The unwind's filter goes through
+//! mongod's Boolean simplifier (`simplify.rs`, RM-699).
 
 use bson::{doc, Bson, Document, Timestamp};
 
@@ -891,10 +892,17 @@ fn filters(
     oplog.extend(not_from_migration(&n, spec));
     let mut unwind = vec![events(scope, &n, spec, user)];
     unwind.extend(not_from_migration(&n, spec));
-    (
-        M::And(oplog).normalized().to_doc(),
-        M::And(unwind).normalized().to_doc(),
-    )
+    // The unwind's filter goes through mongod's Boolean simplifier
+    // (`internalUnwindTransaction` optimises it as a query is; the oplog
+    // filter is read as it is): after `operationType: "drop"` the writes
+    // branch and the event-type `$or` fall away, as only a command can
+    // match (RM-699).
+    let unwind = M::And(unwind).normalized().to_doc();
+    let unwind = match super::simplify::simplify(&unwind) {
+        Some(simpler) => super::parsed::sort_tree(simpler),
+        None => unwind,
+    };
+    (M::And(oplog).normalized().to_doc(), unwind)
 }
 
 // ------------------------------------------------------------- stages --

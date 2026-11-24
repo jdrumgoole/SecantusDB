@@ -4,8 +4,8 @@ mongod 8.2.11 as a one-member replica set.
 
 RM-452 ported mongod's rewrite of `operationType`, RM-698's first slice
 those of `documentKey` and `fullDocument`; the rewrites of the other event
-fields and of `$expr`, and the Boolean simplifier mongod runs
-over the unwind's filter, are still to come.
+fields and of `$expr` are still to come; the Boolean simplifier mongod runs
+over the unwind's filter came with RM-699 (2026-11-24).
 """
 
 from __future__ import annotations
@@ -90,7 +90,7 @@ def _unwind(client: Any, match: dict, name: str) -> dict:
     return _explain(client, match, name)["stages"][1]["$changeStream"]["filter"]
 
 
-@pytest.mark.backlog("RM-699")
+@pytest.mark.backlog_fixed("RM-699")
 @pytest.mark.parametrize("op_type", ["drop", "rename", "dropDatabase"])
 def test_the_unwind_filter_is_simplified(rust_mongo: Any, mongod_rs: Any, op_type: str) -> None:
     """mongod 8.2.11 runs its Boolean simplifier over the unwind's filter:

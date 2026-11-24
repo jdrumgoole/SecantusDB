@@ -2079,38 +2079,26 @@ would see them. What is left:
       transcribe (found working RM-452).
       Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_a_match_on_another_event_field_joins_the_oplog_filter
       Backlog-ID: RM-698
-- [ ] **RUST MongoDB server: the unwind filter of a change stream is not
-      Boolean-simplified.** mongod 8.2.11 optimizes
-      `internalUnwindTransaction`'s filter with its Boolean expression
-      simplifier (the oplog filter it optimizes without): after
-      `operationType: "drop"` (`rename`, `dropDatabase`) the writes branch
-      and the event-type `$or` fall away, as only a command can match. This
-      server prints the unsimplified `$and`, which matches the same entries
-      (2026-11-15, found working RM-452). The simplifier treats each
-      distinct leaf as a Boolean variable (`op: "c"` and `op: "i"` are
-      unrelated to it), so `insert` / `update` print unchanged on both; for
-      `rename` its output re-sorts the `$or`'s regexes by path, `o.to`
-      last. Sizing (2026-11-23): this server has no Boolean simplifier
-      anywhere -- the fix is the port of mongod's
-      `query/boolean_simplification/` (bitset algebra, Quine-McCluskey,
-      Petrick, the tree restore and its size guards) the item below needs,
-      then applying it to the unwind filter. Do it after that item. (The
-      gap test compared two different collection names until 2026-11-23.)
-      Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_the_unwind_filter_is_simplified
-      Backlog-ID: RM-699
-- [ ] **RUST MongoDB server: a `find`'s filter is not Boolean-simplified.**
-      mongod 8.2.11 runs its Boolean expression simplifier
-      (`internalQueryEnableBooleanExpressionsSimplifier`, true by default)
-      in normalizing every query: `{$or: [{a: 1, b: 1}, {a: 1}]}` and
-      `{$and: [{a: 1}, {$or: [{a: 1}, {b: 2}]}]}` print as `{a: {$eq: 1}}`,
-      `{a: 1, $nor: [{a: 1}]}` as `{$alwaysFalse: 1}`. This server has no
-      simplifier and prints each as given, so `parsedQuery`, and whatever
-      the planner and the query shape derive from the filter, differ. The
-      faithful fix ports `src/mongo/db/query/boolean_simplification/` and
-      its call in the canonicalizer, with mongod's size limits; several
-      PRs, and the plan-cache keys move (2026-11-23, found working RM-699).
-      Verify: tests/backlog/test_rm_found_2026_11_23_rm699.py::test_a_find_filter_is_boolean_simplified
-      Backlog-ID: RM-774
+- [ ] **RUST MongoDB server: the Boolean simplifier differs from mongod's
+      on about 0.3 percent of random trees, and on nested `$nor`.** The
+      simplifier (`crates/secantus-commands/src/explain/simplify.rs`, RM-774)
+      is built from what mongod 8.2.11 was measured to do -- a DNF and
+      Quine-McCluskey at every node (no Petrick: a term a merge made does
+      not absorb its neighbours, except after an `$and`'s product), the
+      common predicates of an `$and`'s terms taken out, the result kept
+      only if smaller -- not from a port of
+      `query/boolean_simplification/`, which is not on this box. A seeded
+      run of 4,000 random `$and` / `$or` trees over nine predicates differs
+      on 13 (the smallest are the gap tests), and one with nested `$nor`
+      on about 1 in 140: mongod keeps a `b` a merge here removes, simplifies
+      a contained `$or` in its `$and`'s context where this server does not,
+      and does not simplify a tree whose `$nor` holds a contradiction this
+      server folds. The residue points at a rule not yet found (how a
+      negated node is converted, and what its size counts), not at noise.
+      Reproduce with `tests/mongod_live/test_boolean_simplifier.py`'s
+      random run at other seeds (2026-11-24, found working RM-774).
+      Verify: tests/backlog/test_rm_found_2026_11_24_rm774.py::test_a_random_tree_is_simplified_as_mongod_does
+      Backlog-ID: RM-778
 - [ ] **RUST MongoDB server: a change stream's `docsExamined` leaves out
       mongod's own oplog entries.** mongod 8.2.11's `executionStats` of a
       change stream counts every oplog entry its scan reads from the start
@@ -2895,32 +2883,29 @@ produce the dump it exists for.
       (measured 2026-11-22).
       Verify: tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_killed_mongod_store_whose_oplog_drops_what_it_refuses
       Backlog-ID: RM-756
-- [ ] **A mongod store holding a `2d`, `2dsphere` or wildcard index is
-      refused on adoption, never probed for whether it is served right.**
-      `secantusd-mdb` writes these indexes' keys as mongod 8.2.11 does since
-      store format 11, but `UNSERVED_INDEX_KINDS` (`store_format.rs`) and
-      the wildcard check still refuse a store mongod wrote with one, by
-      name. The reverse hand-off needs the adopted index (its spec, bits /
-      min / max, version 3, multikey paths, `wildcardProjection`, partial
-      filter) to be served by the same key generators and scans, with its
-      `$near` / `$geoWithin` / `$geoIntersects` and wildcard answers and
-      winning plans those of mongod on the same data, and the store handed
-      back to mongod to `validate` after this server's own writes.
-      Verify: tests/backlog/test_rm_storage_model.py::test_secantus_serves_mongods_geo_and_wildcard_indexes
-      Backlog-ID: RM-775
+- [ ] **`$geoWithin` / `$geoIntersects` and wildcard predicates are not planned
+      onto their indexes, and a compound `$near` plans its equality
+      differently.** Found adopting mongod's geo and wildcard indexes
+      (RM-775, measured 2026-11-24, mongod 8.2.11, on a store this server
+      wrote as much as on one mongod did). mongod plans `{flat: {$geoWithin:
+      {$box: ...}}}` and `{poly: {$geoIntersects: ...}}` as FETCH over IXSCAN
+      of the `2d` / `2dsphere` index, `{"w.a": 3}` and a range on a wildcard
+      index's path as FETCH over IXSCAN of it, and a `$near` with an equality
+      on the index's other field as the near stage alone (the equality is its
+      bounds). `secantusd-mdb` answers each with a COLLSCAN (a FETCH above
+      GEO_NEAR for the equality; a COLLSCAN when the equality field comes
+      before the geo one), and a wildcard index named in a `hint` reads as an
+      error ("index all_w holds an entry this server cannot read": the
+      explain stream does not know a wildcard key's `$_path` slot). The
+      answers are right: only the plan and the hint differ.
+      Verify: tests/backlog/test_rm_storage_model.py::test_geo_within_and_wildcard_indexes_are_planned
+      Backlog-ID: RM-777
 
 ## Found making mongod open our stores (storage-model phase 7, 2026-11-21)
 
 Each was measured by starting mongod 8.2.11 on a store `secantusd-mdb`
 wrote and stopped (the forward direction of RM-723).
 
-- [ ] **Users and roles are not in `admin.system.users` and
-      `admin.system.roles`.** This server keeps them in tables of its own
-      (`secantus_users`, `secantus_roles`, `secantus_role_seq`); mongod
-      opening our store finds neither, so a user made here cannot
-      authenticate there (and, in the reverse, mongod's would not be read).
-      Backlog-ID: RM-744
-      Verify: tests/backlog/test_rm_storage_model.py::test_mongod_finds_the_users_and_roles_secantus_made
 - [ ] **A view's DDL is logged as commands, not as mongod logs it.** mongod
       8.2.11 logs creating a view as an insert into `<db>.system.views` (the
       first one preceded by `create: "system.views"`), a `collMod` of it as

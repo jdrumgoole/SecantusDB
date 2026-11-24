@@ -2116,18 +2116,34 @@ fn count_oplog_entries(session: &Session, table: &str) -> Result<(i64, i64)> {
 pub const PRE_IMAGES_DB: &str = "config";
 pub const PRE_IMAGES_COLL: &str = "system.preimages";
 
-// Auth / profiling tables. Users + roles are `(db, name) -> bson(record)` (key
-// `SS`); per-database profile settings are `db -> bson({level, slowms,
+/// Where mongod keeps users and roles (RM-744): `admin.system.users` and
+/// `admin.system.roles`, one document per `_id: "<db>.<name>"`, each with
+/// mongod's unique `{user|role: 1, db: 1}` index.
+const AUTH_DB: &str = "admin";
+type AuthColl = (&'static str, &'static str, &'static str);
+const AUTH_USERS: AuthColl = ("system.users", "user", "user_1_db_1");
+const AUTH_ROLES: AuthColl = ("system.roles", "role", "role_1_db_1");
+
+fn auth_id(db: &str, name: &str) -> Bson {
+    Bson::String(format!("{db}.{name}"))
+}
+
+/// `skip` then at most `limit` (0 or over 1000 means 1000) of `rows`' blobs.
+fn page(rows: Vec<(String, String, Vec<u8>)>, skip: usize, limit: usize) -> Vec<Vec<u8>> {
+    let limit = if limit == 0 || limit > 1000 {
+        1000
+    } else {
+        limit
+    };
+    rows.into_iter()
+        .skip(skip)
+        .take(limit)
+        .map(|r| r.2)
+        .collect()
+}
+// Profiling table: profile settings are `db -> bson({level, slowms,
 // sampleRate})` (key `S`). Records are opaque BSON blobs (the command layer owns
 // their shape), stored / returned verbatim across the byte seam.
-const USERS_TABLE: &str = "table:secantus_users";
-const ROLES_TABLE: &str = "table:secantus_roles";
-/// `(db, role) -> creation sequence`, written only by the Rust server
-/// (RM-029, as Joe decided on 2026-10-16): mongod's `rolesInfo` lists roles
-/// in the order they were created, and the role table, which the Python
-/// server shares, is keyed by name. A role with no row (created before this,
-/// or by the Python server) counts as 0 and keeps name order.
-const ROLE_SEQ_TABLE: &str = "table:secantus_role_seq";
 const PROFILE_TABLE: &str = "table:secantus_profile_settings";
 
 /// The synthetic `_id` index name. The `_id_` index is virtual — never stored
@@ -2548,12 +2564,10 @@ fn geo_part_value(part: &secantus_core::geoorder::KeyPart) -> Bson {
 /// the covering gave them.
 fn geo_cells(index: &secantus_core::geoorder::GeoIndex, doc: &Document) -> Vec<Bson> {
     let mut out: Vec<Bson> = Vec::new();
-    if let Some(v) = get_path(doc, index.geo_field()) {
-        for part in index.geo_keys(v) {
-            let cell = geo_part_value(&part);
-            if !out.contains(&cell) {
-                out.push(cell);
-            }
+    for part in index.geo_key_parts(doc) {
+        let cell = geo_part_value(&part);
+        if !out.contains(&cell) {
+            out.push(cell);
         }
     }
     out
@@ -3075,9 +3089,6 @@ const BOOTSTRAP: &[(&str, &str)] = &[
     ("table:secantus_indexes", "key_format=SSS,value_format=u"),
     // NOTE: table:secantus_oplog is created in `open_with_config_durable`
     // (its config depends on `oplog_table_cfg()`).
-    ("table:secantus_users", "key_format=SS,value_format=u"),
-    ("table:secantus_roles", "key_format=SS,value_format=u"),
-    (ROLE_SEQ_TABLE, "key_format=SS,value_format=q"),
     (
         "table:secantus_profile_settings",
         "key_format=S,value_format=u",
@@ -16575,115 +16586,124 @@ impl Storage {
 
     // --- users / roles / profiling (auth + profiling surface) ---
 
-    /// Persist a user record (opaque BSON blob). Returns `true` if added,
-    /// `false` if it already existed and `replace` is false. Mirrors
-    /// `storage.add_user`.
+    /// Persist a user record (opaque BSON blob) as a document of
+    /// `admin.system.users`, where mongod keeps it (RM-744), under `_id:
+    /// "<db>.<user>"`. Returns `true` if written, `false` if it already
+    /// existed and `replace` is false.
     pub fn add_user(&self, db: &str, username: &str, record: &[u8], replace: bool) -> Result<bool> {
-        self.put_ss_record(USERS_TABLE, db, username, record, replace)
+        self.put_auth_doc(AUTH_USERS, db, username, record, replace)
     }
 
-    /// Fetch a user record (BSON blob) or `None`. Mirrors `storage.get_user`.
+    /// Fetch a user record (BSON blob) or `None`.
     pub fn get_user(&self, db: &str, username: &str) -> Result<Option<Vec<u8>>> {
-        self.get_ss_record(USERS_TABLE, db, username)
+        self.find_by_id(AUTH_DB, AUTH_USERS.0, &auth_id(db, username))
     }
 
-    /// Delete a user. Returns `false` if absent. Mirrors `storage.drop_user`.
+    /// Delete a user. Returns `false` if absent.
     pub fn drop_user(&self, db: &str, username: &str) -> Result<bool> {
-        self.drop_ss_record(USERS_TABLE, db, username)
+        self.drop_auth_doc(AUTH_USERS, db, username)
     }
 
-    /// Paginated user listing (`db = None` spans every database). Mirrors
-    /// `storage.list_users`.
+    /// Paginated user listing (`db = None` spans every database), by
+    /// database and name.
     pub fn list_users(&self, db: Option<&str>, skip: usize, limit: usize) -> Result<Vec<Vec<u8>>> {
-        self.list_ss_records(USERS_TABLE, db, skip, limit)
+        let mut rows = self.auth_docs(AUTH_USERS, db)?;
+        rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        Ok(page(rows, skip, limit))
     }
 
-    /// Persist a custom-role record (opaque BSON blob). Mirrors
-    /// `storage.add_role`.
+    /// Persist a custom-role record (opaque BSON blob) as a document of
+    /// `admin.system.roles` (RM-744).
     pub fn add_role(&self, db: &str, name: &str, record: &[u8], replace: bool) -> Result<bool> {
-        let existed = self.get_ss_record(ROLES_TABLE, db, name)?.is_some();
-        let written = self.put_ss_record(ROLES_TABLE, db, name, record, replace)?;
-        if written && !existed {
-            self.stamp_role_seq(db, name)?;
-        }
-        Ok(written)
+        self.put_auth_doc(AUTH_ROLES, db, name, record, replace)
     }
 
-    /// Give a newly created role the next creation sequence.
-    fn stamp_role_seq(&self, db: &str, name: &str) -> Result<()> {
-        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.catalog_write(|session| {
-            let cur = session.open_cursor(ROLE_SEQ_TABLE, None)?;
-            let mut last = 0i64;
-            let mut more = cur.next()?;
-            while more {
-                last = last.max(cur.get_value_q()?);
-                more = cur.next()?;
-            }
-            let put = session.open_cursor(ROLE_SEQ_TABLE, None)?;
-            put.set_key_ss(db, name);
-            put.set_value_q(last + 1);
-            put.insert()?;
-            Ok(())
-        })
-    }
-
-    /// Fetch a custom-role record (BSON blob) or `None`. Mirrors
-    /// `storage.get_role`.
+    /// Fetch a custom-role record (BSON blob) or `None`.
     pub fn get_role(&self, db: &str, name: &str) -> Result<Option<Vec<u8>>> {
-        self.get_ss_record(ROLES_TABLE, db, name)
+        self.find_by_id(AUTH_DB, AUTH_ROLES.0, &auth_id(db, name))
     }
 
-    /// Delete a custom role. Returns `false` if absent. Mirrors
-    /// `storage.drop_role`.
+    /// Delete a custom role. Returns `false` if absent.
     pub fn drop_role(&self, db: &str, name: &str) -> Result<bool> {
-        self.drop_ss_record(ROLE_SEQ_TABLE, db, name)?;
-        self.drop_ss_record(ROLES_TABLE, db, name)
+        self.drop_auth_doc(AUTH_ROLES, db, name)
     }
 
     /// Paginated custom-role listing (`db = None` spans every database).
-    /// Mirrors `storage.list_roles`.
     ///
-    /// In creation order (RM-029), then database and name.
+    /// In creation order (RM-029): `admin.system.roles`' natural order, as
+    /// mongod lists them (a replacement keeps its record).
     pub fn list_roles(&self, db: Option<&str>, skip: usize, limit: usize) -> Result<Vec<Vec<u8>>> {
-        let limit = if limit == 0 || limit > 1000 {
-            1000
-        } else {
-            limit
-        };
-        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let session = self.conn.open_session()?;
-        let mut seqs: HashMap<(String, String), i64> = HashMap::new();
-        let sc = session.open_cursor(ROLE_SEQ_TABLE, None)?;
-        let mut more = sc.next()?;
-        while more {
-            seqs.insert(sc.get_key_ss()?, sc.get_value_q()?);
-            more = sc.next()?;
+        Ok(page(self.auth_docs(AUTH_ROLES, db)?, skip, limit))
+    }
+
+    /// Write `(db, name)`'s document into one of the two auth collections,
+    /// creating it first with mongod's unique `{<name field>: 1, db: 1}`
+    /// index.
+    fn put_auth_doc(
+        &self,
+        (coll, field, index): AuthColl,
+        db: &str,
+        name: &str,
+        record: &[u8],
+        replace: bool,
+    ) -> Result<bool> {
+        let id = auth_id(db, name);
+        if !self.collection_exists(AUTH_DB, coll)? {
+            self.create_collection(AUTH_DB, coll)?;
+            self.create_index(
+                AUTH_DB,
+                coll,
+                index,
+                &bson::doc! {field: 1_i32, "db": 1_i32},
+                &bson::doc! {"unique": true},
+            )?;
         }
-        let cur = session.open_cursor(ROLES_TABLE, None)?;
-        let mut rows: Vec<(i64, String, String, Vec<u8>)> = Vec::new();
-        let mut more = cur.next()?;
-        while more {
-            let (row_db, row_name) = cur.get_key_ss()?;
-            if db.is_none() || db == Some(row_db.as_str()) {
-                let blob = cur.get_value_u()?;
-                if !blob.is_empty() {
-                    let seq = seqs
-                        .get(&(row_db.clone(), row_name.clone()))
-                        .copied()
-                        .unwrap_or(0);
-                    rows.push((seq, row_db, row_name, blob));
-                }
+        let mut doc = decode_doc(record)?;
+        doc.insert("_id", id.clone());
+        let bytes = encode_doc(&doc)?;
+        if self.find_by_id(AUTH_DB, coll, &id)?.is_some() {
+            if !replace {
+                return Ok(false);
             }
-            more = cur.next()?;
+            return self.replace_by_id(AUTH_DB, coll, &id, &bytes);
         }
-        rows.sort_by(|a, b| (a.0, &a.1, &a.2).cmp(&(b.0, &b.1, &b.2)));
-        Ok(rows
-            .into_iter()
-            .skip(skip)
-            .take(limit)
-            .map(|r| r.3)
-            .collect())
+        let (_, errors) = self.insert(AUTH_DB, coll, vec![bytes], true)?;
+        if let Some(e) = errors.first() {
+            return Err(StorageError::Internal(format!(
+                "writing {AUTH_DB}.{coll} {id}: {e}"
+            )));
+        }
+        Ok(true)
+    }
+
+    fn drop_auth_doc(&self, (coll, _, _): AuthColl, db: &str, name: &str) -> Result<bool> {
+        if !self.collection_exists(AUTH_DB, coll)? {
+            return Ok(false);
+        }
+        self.delete_by_id(AUTH_DB, coll, &auth_id(db, name))
+    }
+
+    /// `(db, name, blob)` of every document of an auth collection in
+    /// natural order, `db` filtered.
+    fn auth_docs(
+        &self,
+        (coll, _, _): AuthColl,
+        db: Option<&str>,
+    ) -> Result<Vec<(String, String, Vec<u8>)>> {
+        if !self.collection_exists(AUTH_DB, coll)? {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for blob in self.scan_collection(AUTH_DB, coll)? {
+            // `_id` is `"<db>.<name>"`, and a database name holds no dot.
+            let doc = decode_doc(&blob)?;
+            let id = doc.get_str("_id").unwrap_or_default();
+            let (row_db, name) = id.split_once('.').unwrap_or((id, ""));
+            if db.is_none() || db == Some(row_db) {
+                out.push((row_db.to_string(), name.to_string(), blob));
+            }
+        }
+        Ok(out)
     }
 
     /// The active profile settings for `db` (`{level, slowms, sampleRate}`),
@@ -16762,110 +16782,6 @@ impl Storage {
         opts.insert("capped", true);
         opts.insert("size", size_bytes);
         self.set_collection_options(db, "system.profile", &opts)
-    }
-
-    /// Insert-or-replace a `(db, name) -> blob` record in an `SS`-keyed table.
-    /// Returns `false` (no write) if the key exists and `replace` is false.
-    fn put_ss_record(
-        &self,
-        table: &str,
-        db: &str,
-        name: &str,
-        record: &[u8],
-        replace: bool,
-    ) -> Result<bool> {
-        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.catalog_write(|session| {
-            let probe = session.open_cursor(table, None)?;
-            probe.set_key_ss(db, name);
-            let exists = match probe.search() {
-                Ok(()) => true,
-                Err(e) if e.is_not_found() => false,
-                Err(e) => return Err(e.into()),
-            };
-            if exists && !replace {
-                return Ok(false);
-            }
-            let cur = session.open_cursor(table, None)?;
-            cur.set_key_ss(db, name);
-            cur.set_value_u(record);
-            cur.insert()?;
-            Ok(true)
-        })
-    }
-
-    /// Point-fetch a `(db, name)` blob from an `SS`-keyed table (`None` when
-    /// absent or empty).
-    fn get_ss_record(&self, table: &str, db: &str, name: &str) -> Result<Option<Vec<u8>>> {
-        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        // Fresh session for cross-thread visibility (mirrors `get_role`).
-        let session = self.conn.open_session()?;
-        let cur = session.open_cursor(table, None)?;
-        cur.set_key_ss(db, name);
-        match cur.search() {
-            Ok(()) => {
-                let blob = cur.get_value_u()?;
-                Ok(if blob.is_empty() { None } else { Some(blob) })
-            }
-            Err(e) if e.is_not_found() => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Delete a `(db, name)` row from an `SS`-keyed table (`false` if absent).
-    fn drop_ss_record(&self, table: &str, db: &str, name: &str) -> Result<bool> {
-        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.catalog_write(|session| {
-            let cur = session.open_cursor(table, None)?;
-            cur.set_key_ss(db, name);
-            match cur.search() {
-                Ok(()) => {
-                    cur.remove()?;
-                    Ok(true)
-                }
-                Err(e) if e.is_not_found() => Ok(false),
-                Err(e) => Err(e.into()),
-            }
-        })
-    }
-
-    /// Paginated walk of an `SS`-keyed table (`db = None` spans all dbs),
-    /// returning the non-empty value blobs in natural key order.
-    fn list_ss_records(
-        &self,
-        table: &str,
-        db: Option<&str>,
-        skip: usize,
-        limit: usize,
-    ) -> Result<Vec<Vec<u8>>> {
-        let limit = if limit == 0 || limit > 1000 {
-            1000
-        } else {
-            limit
-        };
-        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        let session = self.conn.open_session()?;
-        let cur = session.open_cursor(table, None)?;
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        let mut seen = 0usize;
-        let mut more = cur.next()?;
-        while more {
-            let (row_db, _name) = cur.get_key_ss()?;
-            if db.is_none() || db == Some(row_db.as_str()) {
-                if seen >= skip {
-                    let blob = cur.get_value_u()?;
-                    if !blob.is_empty() {
-                        out.push(blob);
-                    }
-                    if out.len() >= limit {
-                        break;
-                    }
-                }
-                seen += 1;
-            }
-            more = cur.next()?;
-        }
-        Ok(out)
     }
 
     // --- secondary indexes (Phase 4 sub-phase 2) ---
@@ -18855,6 +18771,11 @@ impl Storage {
         recordid: &RecordId,
     ) -> Result<Vec<EntryKey>> {
         let mut out = Vec::new();
+        // A partial index holds a document only while it matches the filter
+        // (a geo index and a wildcard one among them).
+        if !self.doc_in_partial(doc, desc)? {
+            return Ok(out);
+        }
         // A geo index: its keys, as mongod's `get2DKeys` / `getS2Keys` make them.
         if let Some(geo) = &desc.geo_2d {
             let shape = desc.shape();
@@ -18868,9 +18789,6 @@ impl Storage {
             for values in gs.key_values(doc) {
                 out.push(shape.entry(&values, recordid)?);
             }
-            return Ok(out);
-        }
-        if !self.doc_in_partial(doc, desc)? {
             return Ok(out);
         }
         let shape = desc.shape();

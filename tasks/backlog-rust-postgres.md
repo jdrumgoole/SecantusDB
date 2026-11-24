@@ -427,6 +427,28 @@ one beside it.
   MongoDB session; nothing on the PG side was changed.
   Verify: none -- intermittent under load; the test itself is the check
   Backlog-ID: RP-1079
+- [ ] **Under load, a query does not find a table the same test just
+  created (`42P01`), twice in two tests on 2026-11-24.** Both were in
+  local `gate_pg.sh --storage --fast` backlog steps on this Mac, run by
+  the MongoDB session's agents at load averages of about 25 and 14:
+  `tests/backlog/test_rp_catalog_latency.py` RP-911's
+  `..._at_800_tables_within_a_tenth` (REGRESSED, `relation
+  "rp911c_l_14_2" does not exist`, see RP-1078) and RP-1073's
+  `..._at_3200_tables_within_a_tenth` (BROKEN, `relation "rp_g32_l_7_1"
+  does not exist`). Alone, each failed only on its latency assertion or
+  passed. Both tests grow a schema of hundreds of tables, then query the
+  newest ones from a paired server, so the suspect is the catalog's
+  visibility of a just-committed `CREATE TABLE` to a later statement under
+  contention: a catalog cache that is filled before the commit is visible,
+  a snapshot taken too early, or a name lookup that races the catalog
+  write. In PostgreSQL a committed table is visible to every later
+  statement; a `42P01` here is a wrong answer, not noise. Reproduce under
+  load first (the two tests in a loop beside CPU burners), capture which
+  statement failed and the catalog state at that moment, then fix the
+  visibility. Filed by the MongoDB session; nothing on the PG side was
+  changed.
+  Verify: none -- intermittent under load; reproduce with the two catalog-latency tests
+  Backlog-ID: RP-1080
 - [ ] **NOT REPRODUCED -- left open as a watch item. A cancel during the
   parse was honoured late on Linux CI twice, in both of RP-002's
   regression tests (2026-11-08, 2026-11-10).** `tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_with_user_code_present`

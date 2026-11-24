@@ -29,7 +29,7 @@ use crate::{Result, StorageError};
 /// The layout version this build writes and reads. Every change to the
 /// on-disk layout moves it on (each phase of the storage-model plan does),
 /// and a store at any other version is refused.
-pub const STORE_FORMAT_VERSION: u32 = 11;
+pub const STORE_FORMAT_VERSION: u32 = 12;
 
 /// The file holding [`STORE_FORMAT_VERSION`] in a SecantusDB-written store.
 pub const FORMAT_FILE: &str = "secantus.format";
@@ -245,12 +245,12 @@ pub fn mark_opened(home: &Path) -> Result<()> {
     )
 }
 
-/// The index kinds whose keys this server does not write as mongod does
-/// (storage-model plan, phase 4; mongod's own `2d`, `2dsphere` and wildcard indexes are
-/// refused until a store of its is adopted with them, not for their keys, which are
-/// the ones this server writes since format 11), by the value naming
-/// them in an index's key pattern.
-const UNSERVED_INDEX_KINDS: &[&str] = &["2d", "2dsphere", "2dsphere_bucket", "text", "columnstore"];
+/// The index kinds this server does not key as mongod does (storage-model
+/// plan, phase 4), by the value naming them in an index's key pattern: a
+/// store mongod wrote holding one is refused by name. `2d`, `2dsphere`
+/// (version 3) and wildcard indexes are keyed as mongod keys them since
+/// format 11 and adopted (RM-775).
+const UNSERVED_INDEX_KINDS: &[&str] = &["2dsphere_bucket", "text", "columnstore"];
 
 /// The collection options of a `_mdb_catalog` entry this server keeps and
 /// serves: mongod's own (`uuid`, the oplog's `autoIndexId`), what `create`
@@ -292,6 +292,8 @@ const SERVED_INDEX_OPTIONS: &[&str] = &[
     "bits",
     "min",
     "max",
+    "finestIndexedLevel",
+    "coarsestIndexedLevel",
     "wildcardProjection",
 ];
 
@@ -320,7 +322,7 @@ pub fn mongod_store_findings(home: &Path) -> std::result::Result<Vec<String>, St
 /// this server does not key as mongod does, an index of another version
 /// than 2 or one whose build has not finished, a collection or index option
 /// it does not keep, a time-series collection (RM-754), a feature
-/// compatibility version other than 8.2, users and roles (RM-744). Checked
+/// compatibility version other than 8.2. Checked
 /// whenever another server (mongod) wrote the store, before this server
 /// writes to it.
 pub(crate) fn catalog_findings(session: &secantus_wt::Session) -> Result<Vec<String>> {
@@ -385,16 +387,20 @@ pub(crate) fn catalog_findings(session: &secantus_wt::Session) -> Result<Vec<Str
             let Ok(key) = spec.get_document("key") else {
                 continue;
             };
-            let kind = key.iter().find_map(|(field, v)| {
-                if field == "$**" || field.ends_with(".$**") {
-                    return Some("wildcard".to_string());
-                }
+            let kind = key.iter().find_map(|(_, v)| {
                 v.as_str()
                     .filter(|k| UNSERVED_INDEX_KINDS.contains(k))
                     .map(str::to_string)
             });
             if let Some(kind) = kind {
                 out.push(format!("{ns}'s index {name} ({kind})"));
+            }
+            // A `2dsphere` index of a version this server does not key (1 and
+            // 2 key by strings of their own).
+            if key.values().any(|v| v.as_str() == Some("2dsphere")) {
+                if let Some(e) = crate::unsupported_index_type(key, spec) {
+                    out.push(format!("{ns}'s index {name} ({e})"));
+                }
             }
             for (option, _) in spec {
                 if !SERVED_INDEX_OPTIONS.contains(&option.as_str()) {
@@ -435,14 +441,6 @@ pub(crate) fn catalog_findings(session: &secantus_wt::Session) -> Result<Vec<Str
             out.push(format!(
                 "a featureCompatibilityVersion of {:?} (this server serves 8.2)",
                 v.get_str("version").unwrap_or("")
-            ));
-        }
-    }
-    for ns in ["admin.system.users", "admin.system.roles"] {
-        let n = docs(ns)?.len();
-        if n > 0 {
-            out.push(format!(
-                "{n} documents of {ns}, which this server does not read (RM-744)"
             ));
         }
     }
@@ -582,7 +580,10 @@ mod tests {
     }
 
     #[test]
-    fn the_previous_layouts_are_refused_and_this_one_is_format_11() {
+    fn the_previous_layouts_are_refused_and_this_one_is_format_12() {
+        // Format 11 kept users and roles in `secantus_users` /
+        // `secantus_roles`; format 12 keeps them in `admin.system.users` /
+        // `admin.system.roles`, as mongod does (RM-744).
         // Format 10 keyed a `2d` index by a cell of its own (BinData subtype
         // 0, y first), a `2dsphere` index by a covering of every ancestor of
         // each cell (BinData) and a wildcard index by one null entry per
@@ -602,15 +603,15 @@ mod tests {
         // bytes and the clean-close marker in this server's own table.
         // Format 6 held a document in its table as `[id_key length][id_key]
         // [BSON]`; format 7 stores the document alone, as mongod does.
-        assert_eq!(STORE_FORMAT_VERSION, 11);
-        for old in ["4", "5", "6", "7", "8", "9", "10"] {
+        assert_eq!(STORE_FORMAT_VERSION, 12);
+        for old in ["4", "5", "6", "7", "8", "9", "10", "11"] {
             let dir = tempfile::tempdir().unwrap();
             fs::write(dir.path().join("WiredTiger.wt"), b"").unwrap();
             fs::write(dir.path().join(STORAGE_BSON), mongod_storage_bson()).unwrap();
             fs::write(dir.path().join(FORMAT_FILE), format!("{old}\n")).unwrap();
             let err = prepare(dir.path()).unwrap_err().to_string();
             assert!(err.contains(&format!("store format {old}")), "{err}");
-            assert!(err.contains("format 11 only"), "{err}");
+            assert!(err.contains("format 12 only"), "{err}");
         }
     }
 }

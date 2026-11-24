@@ -265,14 +265,18 @@ impl Found {
         let mut keyed: Vec<(f64, bool, (RecordId, Vec<u8>))> = rows
             .into_iter()
             .map(|row| {
-                let value = bson::RawDocument::from_bytes(&row.1)
-                    .ok()
-                    .and_then(|raw| at_path(raw, &self.field));
-                let distance = value
-                    .as_ref()
-                    .and_then(|v| self.near.distance(v))
-                    .unwrap_or(f64::INFINITY);
-                let shaped = value.as_ref().is_some_and(|v| {
+                let values = secantus_core::bsondoc::from_bytes(&row.1)
+                    .map(|doc| {
+                        secantus_core::geoorder::elements_along_path(&doc, &self.field, false)
+                    })
+                    .unwrap_or_default();
+                // The nearest value along the path measures the document.
+                let nearest = values
+                    .iter()
+                    .filter_map(|v| self.near.distance(v).map(|d| (d, v)))
+                    .min_by(|a, b| a.0.total_cmp(&b.0));
+                let distance = nearest.map_or(f64::INFINITY, |(d, _)| d);
+                let shaped = nearest.is_some_and(|(_, v)| {
                     matches!(v, Bson::Document(d) if d.get_str("type").is_ok_and(|t| t != "Point"))
                 });
                 (distance, shaped, row)
@@ -315,25 +319,6 @@ pub(crate) fn centre_hashes(
 /// mongod's prefix on an error met while it tries candidate plans.
 pub(crate) const MULTIPLANNER: &str =
     "error while multiplanner was selecting best plan :: caused by :: ";
-
-/// The value at a dotted path of a stored document.
-fn at_path(raw: &bson::RawDocument, path: &str) -> Option<Bson> {
-    let (head, rest) = match path.split_once('.') {
-        Some((head, rest)) => (head, Some(rest)),
-        None => (path, None),
-    };
-    let value = Bson::try_from(raw.get(head).ok()??).ok()?;
-    match rest {
-        None => Some(value),
-        Some(rest) => {
-            let mut at = &value;
-            for part in rest.split('.') {
-                at = at.as_document()?.get(part)?;
-            }
-            Some(at.clone())
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
