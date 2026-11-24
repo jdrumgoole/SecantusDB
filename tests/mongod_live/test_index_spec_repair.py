@@ -14,4 +14,6 @@ def test_repair_writes_a_collmodded_spec_in_creation_order(tmp_path: Path) -> No
     before `key`, as at creation (mongod 8.2.11, 2026-11-24)."""
     theirs = _mongod_after(tmp_path, "repair")
     assert [f for f, _ in theirs["a_1"][0][1]] == ["v", "hidden", "key", "name"]
-    assert _ours_after(tmp_path, "repair") == theirs
+    ours = _ours_after(tmp_path, "repair")
+    assert list(ours) == list(theirs)
+    assert ours == theirs

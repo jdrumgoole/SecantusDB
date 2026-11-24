@@ -561,6 +561,76 @@ def test_secantus_keeps_the_catalog_order_of_collmodded_indexes_mongod_wrote(
         assert names == ["b_1", "d_1", "e_1", "a_1"]
 
 
+def _spec_options(client: Any) -> None:
+    """Indexes made with the options mongod keeps (`sparse: false`,
+    `background`, a TTL of 0) and one a `collMod` changed (RM-788, RM-789)."""
+    db = client["app"]
+    db["c"].insert_many([{"_id": i, "a": i, "b": i, "d": i} for i in range(5)])
+    db.command(
+        "createIndexes",
+        "c",
+        indexes=[
+            {"name": "a_1", "key": {"a": 1}, "sparse": False},
+            {"name": "b_1", "key": {"b": 1}, "unique": False, "background": True},
+            {"name": "d_1", "key": {"d": 1}, "expireAfterSeconds": 0, "hidden": False},
+            {"name": "e_1", "key": {"e": 1}, "sparse": False, "dropDups": True},
+        ],
+    )
+    db.command("collMod", "c", index={"name": "b_1", "hidden": True})
+
+
+def _specs_and_listing(client: Any) -> tuple[list, list]:
+    return _catalog_specs(client), [list(i.items()) for i in client["app"]["c"].list_indexes()]
+
+
+@pytest.mark.backlog_fixed("RM-788")
+def test_mongod_opens_the_index_specs_secantus_wrote_and_reindexed(tmp_path: Path) -> None:
+    """A store `secantusd-mdb` wrote, its indexes made with `sparse: false`
+    and the like and then rebuilt by `reIndex`, is a store mongod 8.2.11
+    validates, with the same specs in the same order (RM-788, RM-789)."""
+    store = tmp_path / "store"
+    with rust_mongo_server(store, "--standalone") as client:
+        _spec_options(client)
+        client["app"].command("reIndex", "c")
+        ours = _specs_and_listing(client)
+    assert {
+        dict(spec)["name"]: [k for k, _ in spec] for spec in ours[0] if dict(spec)["name"] != "_id_"
+    } == {
+        "a_1": ["v", "key", "name", "sparse"],
+        "b_1": ["v", "hidden", "key", "name", "background"],
+        "d_1": ["v", "key", "name", "expireAfterSeconds"],
+        "e_1": ["v", "key", "name", "sparse"],
+    }
+    proc, client = _mongod_on(store, None, "rs0")
+    try:
+        assert client is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            host, port = client.address or ("127.0.0.1", 0)
+            _wait_primary(client, f"{host}:{port}")
+            assert _specs_and_listing(client) == ours
+            result = client["app"].command("validate", "c", full=True)
+            assert (result["valid"], result["nrecords"]) == (True, 5)
+    finally:
+        _stop_mongod(proc, client)
+
+
+@pytest.mark.backlog_fixed("RM-788")
+def test_secantus_keeps_the_index_specs_mongod_wrote(tmp_path: Path) -> None:
+    """A store mongod 8.2.11 wrote, its indexes made with `sparse: false` and
+    the like, opened by `secantusd-mdb`: the same specs, and the same ones
+    once `reIndex` has built them again (RM-788, RM-789)."""
+    seen: dict[str, Any] = {}
+
+    def setup(client: Any) -> None:
+        _spec_options(client)
+        seen["both"] = _specs_and_listing(client)
+
+    store = _mongod_store(tmp_path, setup)
+    with rust_mongo_server(store) as rust:
+        assert _specs_and_listing(rust) == seen["both"]
+    assert [k for k, _ in seen["both"][0][1]] == ["v", "key", "name", "sparse"]
+
+
 @pytest.mark.backlog("RM-735")
 def test_a_restart_raises_the_election_term(tmp_path: Path) -> None:
     """mongod 8.2.11 (measured 2026-11-20,

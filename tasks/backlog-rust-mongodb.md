@@ -2912,21 +2912,6 @@ wrote and stopped (the forward direction of RM-723).
       indexes, and refuses `prepareUnique: true` as an unknown field.
       Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_create_indexes_keeps_a_flag_as_given_and_refuses_a_hidden_that_is_no_bool
       Backlog-ID: RM-791
-- [ ] **`reIndex` rebuilds nothing, so a `collMod`'d index's spec keeps
-      the order `collMod` made.** mongod 8.2.11's `reIndex` (standalone)
-      drops and builds every index from its spec, so the spec comes back
-      in creation order: `v`, `unique`, `hidden`, `prepareUnique`, `key`,
-      `name`, the rest as held, a changed TTL last (an index `collMod`'d
-      with `hidden` lists `v, hidden, key, name`, not `v, key, name,
-      hidden`). `secantusd-mdb` answers from the registry and leaves the
-      specs as they were. (Measured with it: a plain `--repair` rebuilds
-      nothing in either server and leaves the specs; one that salvages
-      index files builds them again in creation order in both, pinned by
-      `tests/mongod_live/test_index_spec_repair.py`. Index builds restarted
-      after a crash, and a store opened from mongod, take their spec from
-      the log or the catalog and have no `collMod`'d order to lose.)
-      Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_reindex_writes_a_collmodded_spec_in_creation_order
-      Backlog-ID: RM-789
 - [ ] **A planner tie goes by build order, not by mongod's in-memory index
       order.** Three single-field indexes cost the same for `{a: 3, b: 3,
       c: 3}`: mongod 8.2.11 takes the first in the collection's in-memory

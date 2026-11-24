@@ -296,14 +296,16 @@ def _ours_after(tmp_path: Path, rebuild: str) -> Any:
         return _specs(client, "app", "c")
 
 
-@pytest.mark.backlog("RM-789")
+@pytest.mark.backlog_fixed("RM-789")
 def test_reindex_writes_a_collmodded_spec_in_creation_order(tmp_path: Path) -> None:
-    """`reIndex` drops and builds every index again from its spec: an option
+    """`reIndex` left the specs as `collMod` made them; mongod drops and builds every index again from its spec: an option
     `collMod` added after `name` is written before `key`, as at creation
     (`unique`, `hidden`, `prepareUnique`; mongod 8.2.11, 2026-11-24)."""
     theirs = _mongod_after(tmp_path, "reindex")
     assert [f for f, _ in theirs["a_1"][0][1]] == ["v", "hidden", "key", "name"]
-    assert _ours_after(tmp_path, "reindex") == theirs
+    ours = _ours_after(tmp_path, "reindex")
+    assert list(ours) == list(theirs)
+    assert ours == theirs
 
 
 # ------------------------------------------------------- planner ties --

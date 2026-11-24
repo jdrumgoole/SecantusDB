@@ -194,6 +194,18 @@ impl Storage {
     /// of the `_id` index for sharing an `_id` with an earlier one (lowest
     /// RecordId first). Not oplogged: nothing a change stream should see.
     pub fn rebuild_indexes(&self, db: &str, coll: &str) -> Result<u64> {
+        self.rebuild_indexes_of(db, coll, true)
+    }
+
+    /// `reIndex`'s rebuild: every index but `_id`, which is emptied and
+    /// filled again in several transactions and so cannot be rebuilt under
+    /// readers (a repair has none). Each is dropped and built again from its
+    /// options, its spec written in creation order, as mongod writes it.
+    pub fn rebuild_secondary_indexes(&self, db: &str, coll: &str) -> Result<()> {
+        self.rebuild_indexes_of(db, coll, false).map(|_| ())
+    }
+
+    fn rebuild_indexes_of(&self, db: &str, coll: &str, with_id: bool) -> Result<u64> {
         let _planner = PlannerScope::new();
         note_planner_write();
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -206,7 +218,11 @@ impl Storage {
         let session = self.conn.open_session()?;
 
         // The `_id` index: emptied, then one entry per document.
-        let id_table = index_table_of(&session, db, coll, ID_INDEX_NAME)?;
+        let id_table = if with_id {
+            index_table_of(&session, db, coll, ID_INDEX_NAME)?
+        } else {
+            None
+        };
         if let Some(table) = &id_table {
             loop {
                 begin_untimestamped(&session, self.timestamped)?;
@@ -244,12 +260,12 @@ impl Storage {
             }
         }
         let mut rows: Vec<(RecordId, Document)> = Vec::new();
-        self.visit_docs(&session, db, coll, |recordid, blob| {
-            if id_table.is_some() {
+        if id_table.is_some() {
+            self.visit_docs(&session, db, coll, |recordid, blob| {
                 rows.push((recordid.clone(), decode_doc(blob)?));
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })?;
+        }
         let shape = self.id_shape(&session, db, coll)?;
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
         let mut duplicates = 0u64;

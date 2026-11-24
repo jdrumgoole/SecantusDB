@@ -357,7 +357,7 @@ pub fn auto_compact(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
 }
 
-/// `reIndex`. The indexes are always current, so the reply lists them.
+/// `reIndex`: every index but `_id` is built again, and the reply lists them.
 pub fn re_index(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = named(doc, "reIndex")?;
     if ctx.replica_set_name.is_some() {
@@ -389,6 +389,11 @@ pub fn re_index(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             "collection does not exist",
         ));
     }
+    // The indexes but `_id` are built again from their options, which
+    // writes each spec in creation order (mongod 8.2.11, RM-789).
+    storage
+        .rebuild_secondary_indexes(&ctx.db_name, &coll)
+        .map_err(command_error)?;
     let indexes: Vec<Bson> = storage
         .list_indexes(&ctx.db_name, &coll)
         .map_err(command_error)?
