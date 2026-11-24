@@ -1001,22 +1001,9 @@ fn coll_mod_inner(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 old_doc.insert(field, old);
             }
         };
-        // `hidden` was accepted and ignored: the reply said ok and the index
-        // stayed as it was. The reply names the change only when there is one.
-        if let Some(hide) = index_spec.get("hidden").and_then(Bson::as_bool) {
-            if target_name == "_id_" {
-                return Ok(CommandError::new(2, "BadValue", "can't hide _id index").into_reply());
-            }
-            let hidden = target.get_bool("hidden").unwrap_or(false);
-            if hidden != hide {
-                reply.insert("hidden_old", hidden);
-                reply.insert("hidden_new", hide);
-                log_change("hidden", Bson::Boolean(hide), Some(Bson::Boolean(hidden)));
-                storage
-                    .set_index_options(&ctx.db_name, &coll, &target_name, &doc! {"hidden": hide})
-                    .map_err(command_error)?;
-            }
-        }
+        // mongod applies `expireAfterSeconds`, then `hidden`, then `unique`,
+        // whatever order the command gives them (measured 8.2.11, RM-734): the
+        // order the spec lists the fields they add.
         if let Some(new_expiry) = index_spec.get("expireAfterSeconds") {
             // Checked as mongod checks it (measured 8.2.11, 2026-10-10). Every
             // one of these used to be stored: a string, a negative number, and
@@ -1073,6 +1060,22 @@ fn coll_mod_inner(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     &doc! {"expireAfterSeconds": seconds as i32},
                 )
                 .map_err(command_error)?;
+        }
+        // `hidden` was accepted and ignored: the reply said ok and the index
+        // stayed as it was. The reply names the change only when there is one.
+        if let Some(hide) = index_spec.get("hidden").and_then(Bson::as_bool) {
+            if target_name == "_id_" {
+                return Ok(CommandError::new(2, "BadValue", "can't hide _id index").into_reply());
+            }
+            let hidden = target.get_bool("hidden").unwrap_or(false);
+            if hidden != hide {
+                reply.insert("hidden_old", hidden);
+                reply.insert("hidden_new", hide);
+                log_change("hidden", Bson::Boolean(hide), Some(Bson::Boolean(hidden)));
+                storage
+                    .set_index_options(&ctx.db_name, &coll, &target_name, &doc! {"hidden": hide})
+                    .map_err(command_error)?;
+            }
         }
         // `prepareUnique` arms the index: new dup writes are rejected (11000)
         // while pre-existing duplicates are tolerated — the staging step before

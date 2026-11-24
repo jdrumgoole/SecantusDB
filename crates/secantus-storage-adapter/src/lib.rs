@@ -1827,6 +1827,13 @@ impl CmdStorage for StorageAdapter {
         })
     }
 
+    fn index_catalog_spec(&self, db: &str, coll: &str, name: &str) -> Option<Document> {
+        match self.stored_as(db, coll)? {
+            Stored::Catalog => None,
+            Stored::Collection(coll) => self.inner.index_catalog_spec(db, &coll, name).ok()?,
+        }
+    }
+
     fn record_index_use(&self, db: &str, coll: &str, names: &[String]) {
         if names.is_empty() {
             return;

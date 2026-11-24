@@ -2107,22 +2107,6 @@ would see them. What is left:
       counts of the entries the stream keeps match since RM-453, 2026-11-15).
       Verify: none -- mongod writes its no-ops on a timer, so no test can pin how many a scan reads
       Backlog-ID: RM-700
-- [ ] **RUST MongoDB server: `dropIndexes: "*"` does not log an index a
-      `collMod` changed last, with the option it set after `name`.** mongod
-      8.2.11 drops in its in-memory catalog order: build order, except that
-      an index a `collMod` touched moves to the end (`listIndexes` keeps
-      build order), and an option `collMod` added (`hidden`,
-      `prepareUnique`) is written after `name`, while one given at create
-      keeps its place before `key`. Created `a_1` (unique), `b_1_c_-1`,
-      `d_1` (hidden), then `collMod` hid `a_1`: mongod drops `b_1_c_-1`,
-      `d_1`, `a_1` with `a_1` as `{v, unique, key, name, hidden}`; this
-      server drops `d_1`, `b_1_c_-1`, `a_1` with `hidden` before `key`. The
-      fix needs the spec's field order kept in the catalog and an entry
-      order a `collMod` moves (2026-11-21, found working the 4b-4 resume
-      tokens; corrected 2026-11-23 by probe: the first text said "newest
-      first", which mongod does not do).
-      Verify: tests/backlog/test_rm_found_2026_11_21_resume_tokens.py::test_dropping_every_index_lists_a_collmodded_index_last_with_hidden_after_name
-      Backlog-ID: RM-734
 
 ### 7.073 The cursor commands -- 2026-10-11
 

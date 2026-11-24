@@ -83,7 +83,7 @@ def _drop_all_indexes(client: Any) -> list:
     ]
 
 
-@pytest.mark.backlog("RM-734")
+@pytest.mark.backlog_fixed("RM-734")
 def test_dropping_every_index_lists_a_collmodded_index_last_with_hidden_after_name(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
