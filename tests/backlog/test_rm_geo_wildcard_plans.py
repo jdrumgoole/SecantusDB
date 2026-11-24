@@ -116,7 +116,7 @@ def test_a_near_over_a_multikey_trailing_field_bounds_it_by_one_predicate(
         assert sorted(d["_id"] for d in read(got)) == sorted(d["_id"] for d in read(ref)), label
 
 
-@pytest.mark.backlog("RM-782")
+@pytest.mark.backlog("RM-783")
 def test_a_near_over_a_compound_2dsphere_index_without_a_single_interval_is_refused(
     mongod: Any, rust_mongo: Any
 ) -> None:

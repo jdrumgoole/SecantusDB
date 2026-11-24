@@ -2898,7 +2898,7 @@ produce the dump it exists for.
       documents. A compound `2d` index (`{flat: "2d", t: 1}`) answers all of
       them on mongod too.
       Verify: tests/backlog/test_rm_geo_wildcard_plans.py::test_a_near_over_a_compound_2dsphere_index_without_a_single_interval_is_refused
-      Backlog-ID: RM-782
+      Backlog-ID: RM-783
 
 ## Found making mongod open our stores (storage-model phase 7, 2026-11-21)
 
