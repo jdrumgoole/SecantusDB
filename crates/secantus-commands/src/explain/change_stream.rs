@@ -283,9 +283,10 @@ fn merge_equalities(children: Vec<M>) -> Vec<M> {
     let mut paths: Vec<String> = Vec::new();
     for c in children.iter().filter(|m| mergeable(m)) {
         let p = c.path().to_string();
+        // Two equalities make the `$in`; `$in`s alone stay as they are.
         let many = children
             .iter()
-            .filter(|m| mergeable(m) && m.path() == p)
+            .filter(|m| matches!(m, M::Leaf(_, Leaf::Eq, _)) && mergeable(m) && m.path() == p)
             .count()
             > 1;
         if many && !paths.contains(&p) {
@@ -313,7 +314,12 @@ fn merge_equalities(children: Vec<M>) -> Vec<M> {
     for (p, mut vs) in values {
         vs.sort_by(secantus_core::order::cmp);
         vs.dedup();
-        out.push(M::Leaf(p, Leaf::In, Bson::Array(vs)));
+        // An `$in` of one value is its `$eq`.
+        out.push(if vs.len() == 1 {
+            M::Leaf(p, Leaf::Eq, vs.pop().expect("one"))
+        } else {
+            M::Leaf(p, Leaf::In, Bson::Array(vs))
+        });
     }
     out
 }
@@ -627,6 +633,139 @@ fn rewrite_full_document(u: &U) -> Option<M> {
     Some(M::Or(any))
 }
 
+/// The commands that name a collection in a string field of `o`.
+const COLL_COMMANDS: [&str; 8] = [
+    "abortIndexBuild",
+    "collMod",
+    "commitIndexBuild",
+    "create",
+    "createIndexes",
+    "drop",
+    "dropIndexes",
+    "startIndexBuild",
+];
+
+/// A predicate on one oplog field: an `$eq` of the one value, an `$in` of
+/// several.
+fn on(path: &str, values: &[Bson], many: bool) -> M {
+    if many {
+        leaf(path, Leaf::In, Bson::Array(values.to_vec()))
+    } else {
+        leaf(path, Leaf::Eq, values[0].clone())
+    }
+}
+
+/// As [`on`], of regexes: a `$regex` of one, an `$in` of several.
+fn on_regex(path: &str, patterns: &[String], many: bool) -> M {
+    if many {
+        let rs = patterns
+            .iter()
+            .map(|p| {
+                Bson::RegularExpression(bson::Regex {
+                    pattern: p.clone(),
+                    options: String::new(),
+                })
+            })
+            .collect();
+        leaf(path, Leaf::In, Bson::Array(rs))
+    } else {
+        regex(path, &patterns[0])
+    }
+}
+
+/// mongod's `matchRewriteGenericNamespace` for `ns`, `$eq` and `$in`: the
+/// commands' `o` fields that name the namespace, and a write's `ns`.
+/// A regex (which mongod rewrites into an `$expr`) is not rewritten here.
+fn rewrite_namespace(u: &U, path: &str) -> Option<M> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let (values, many): (Vec<Bson>, bool) = match u {
+        U::Eq(_, v) => (vec![v.clone()], false),
+        U::In(_, _, true) => return None,
+        U::In(_, vs, false) => (vs.clone(), true),
+        _ => return None,
+    };
+    let (mut cmd, mut crud) = (Vec::new(), Vec::new());
+    match parts.as_slice() {
+        ["ns"] => {
+            // A whole namespace: `{db}` or `{db, coll}`, in that order.
+            for v in &values {
+                let Bson::Document(d) = v else { continue };
+                let keys: Vec<&str> = d.keys().map(String::as_str).collect();
+                let db = match d.get("db") {
+                    Some(Bson::String(s)) => s.clone(),
+                    _ => continue,
+                };
+                let cmd_ns = Bson::String(format!("{db}.$cmd"));
+                match (keys.as_slice(), d.get("coll")) {
+                    (["db"], _) => cmd.push(M::And(vec![
+                        leaf("ns", Leaf::Eq, cmd_ns),
+                        leaf("o.dropDatabase", Leaf::Eq, 1),
+                    ])),
+                    (["db", "coll"], Some(Bson::String(coll))) => {
+                        for f in COLL_COMMANDS {
+                            cmd.push(M::And(vec![
+                                leaf("ns", Leaf::Eq, cmd_ns.clone()),
+                                leaf(&format!("o.{f}"), Leaf::Eq, coll.as_str()),
+                            ]));
+                        }
+                        let full = format!("{db}.{coll}");
+                        cmd.push(leaf("o.renameCollection", Leaf::Eq, full.as_str()));
+                        crud.push(leaf("ns", Leaf::Eq, full));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        ["ns", field @ ("db" | "coll")] => {
+            if !values.iter().all(|v| matches!(v, Bson::String(_))) {
+                return None;
+            }
+            let names: Vec<&str> = values.iter().filter_map(Bson::as_str).collect();
+            if *field == "coll" {
+                let patterns: Vec<String> = names
+                    .iter()
+                    .map(|c| format!("{ANY_DB}\\.{}$", escaped(c)))
+                    .collect();
+                for f in COLL_COMMANDS {
+                    cmd.push(on(&format!("o.{f}"), &values, many));
+                }
+                cmd.push(on_regex("o.renameCollection", &patterns, many));
+                crud.push(on_regex("ns", &patterns, many));
+            } else {
+                let cmd_ns: Vec<Bson> = names
+                    .iter()
+                    .map(|d| Bson::String(format!("{d}.$cmd")))
+                    .collect();
+                let patterns: Vec<String> = names
+                    .iter()
+                    .map(|d| format!("^{}\\.(?!(\\$|system\\.))", escaped(d)))
+                    .collect();
+                cmd.push(M::And(vec![
+                    leaf("o.dropDatabase", Leaf::Eq, 1),
+                    on("ns", &cmd_ns, many),
+                ]));
+                for _ in COLL_COMMANDS {
+                    cmd.push(on("ns", &cmd_ns, many));
+                }
+                cmd.push(on_regex("o.renameCollection", &patterns, many));
+                crud.push(on_regex("ns", &patterns, many));
+            }
+        }
+        // `ns` holds only `db` and `coll`: anything else is missing.
+        _ => {
+            return if matches_missing(u) {
+                None
+            } else {
+                Some(M::False)
+            }
+        }
+    }
+    Some(M::Or(vec![
+        M::And(vec![M::Or(cmd), op_is("c")]),
+        M::And(vec![M::Or(crud), M::Not(Box::new(op_is("c")))]),
+    ]))
+}
+
 /// mongod's `matchRewriteOperationType`.
 fn rewrite_operation_type(u: &U, path: &str) -> Option<M> {
     // A subfield of `operationType` is always missing: the predicate is
@@ -702,6 +841,7 @@ fn rewrite(u: &U, inexact: bool) -> Option<M> {
         U::Eq(p, _) | U::In(p, ..) | U::Exists(p) | U::Other(p, ..) => match p.split('.').next() {
             Some("operationType") => rewrite_operation_type(u, p),
             Some("documentKey") => rewrite_document_key(u),
+            Some("ns") => rewrite_namespace(u, p),
             Some("fullDocument") if inexact => rewrite_full_document(u),
             _ => None,
         },
