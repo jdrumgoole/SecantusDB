@@ -2838,16 +2838,6 @@ produce the dump it exists for.
 
 ## The storage model is not mongod's (tasks/mongod-storage-model-plan.md, 2026-11-19)
 
-- [ ] **A killed mongod store is judged at its stable checkpoint, before
-      its replay.** What `secantusd-mdb` refuses by name in a store mongod
-      wrote (an index kind it keys otherwise, a time-series collection,
-      users) is read from the catalog as WiredTiger recovers it, which is
-      the stable checkpoint's: a store whose oplog after the checkpoint
-      drops what is refused (a `text` index dropped after an `fsync`) is
-      refused, where mongod's restart replays the drop and serves it
-      (measured 2026-11-22).
-      Verify: tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_killed_mongod_store_whose_oplog_drops_what_it_refuses
-      Backlog-ID: RM-756
 - [ ] **A `$near`'s `executionStats` leave out its inner scans and count
       other keys.** Found closing RM-777 (2026-11-24, mongod 8.2.11). For
       `{flat: {$near: [3, 4]}, t: 1}` over `{flat: "2d", t: 1}` mongod's

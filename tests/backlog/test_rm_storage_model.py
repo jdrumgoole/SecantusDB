@@ -1588,14 +1588,14 @@ def _build_quietly(rs: pymongo.MongoClient) -> None:
         rs.app.c.create_index("a", name="a_1")
 
 
-@pytest.mark.backlog("RM-756")
+@pytest.mark.backlog_fixed("RM-756")
 def test_secantus_opens_a_killed_mongod_store_whose_oplog_drops_what_it_refuses(
     tmp_path: Path,
 ) -> None:
     """A killed mongod 8.2.11 store whose stable checkpoint lists a `text`
     index that the oplog after it drops: mongod's restart replays the drop
-    and serves the collection without it. `secantusd-mdb` judges the store
-    at the checkpoint, before its replay, and refuses it by name."""
+    and serves the collection without it. `secantusd-mdb` judged the store
+    at the checkpoint, before its replay, and refused it by name."""
 
     def setup(rs: pymongo.MongoClient) -> None:
         rs.app.c.insert_many([{"_id": i, "h": f"word {i}"} for i in range(5)])

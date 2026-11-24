@@ -8417,13 +8417,23 @@ impl Storage {
                     None => adopt::LastWriter::Unknown,
                 }
             };
-            let reconciled = adopt::reconcile(&boot, last, table_mode && !in_memory, |found| {
-                if mongod_store {
-                    store_format::mongod_store(std::path::Path::new(home), found)
-                } else {
-                    store_format::written_by_mongod_since(std::path::Path::new(home), found)
-                }
-            })?;
+            // What the replay below drops is judged and adopted as gone, as
+            // mongod's restart replays it first (RM-756). Only a store whose
+            // data is recovered by replaying the oplog replays it.
+            let replayed = if !in_memory && stored_mode.unwrap_or(data_create_mode) {
+                let rows = read_oplog_table(&boot, &oplog.uri, replay_from as i64 + 1, usize::MAX)?;
+                adopt::Replayed::from_entries(rows.iter().map(|(_, b)| b.as_slice()))
+            } else {
+                adopt::Replayed::default()
+            };
+            let reconciled =
+                adopt::reconcile(&boot, last, table_mode && !in_memory, replayed, |found| {
+                    if mongod_store {
+                        store_format::mongod_store(std::path::Path::new(home), found)
+                    } else {
+                        store_format::written_by_mongod_since(std::path::Path::new(home), found)
+                    }
+                })?;
             if !reconciled.adopted.is_empty() || !reconciled.removed.is_empty() {
                 eprintln!(
                     "secantus-storage: the catalog was written by another server: took {} \

@@ -36,6 +36,80 @@ struct CatalogRow {
     entry: Document,
 }
 
+/// What crash recovery's replay drops: the indexes and collections an oplog
+/// entry after the recovery point drops, and that no later entry makes
+/// again. mongod's restart replays the oplog over the catalog of its stable
+/// checkpoint before it serves anything, so what it drops there is judged
+/// and adopted as gone (RM-756).
+#[derive(Debug, Default)]
+pub(crate) struct Replayed {
+    indexes: HashSet<(String, String)>,
+    collections: HashSet<String>,
+}
+
+impl Replayed {
+    /// The drops in the oplog entries `entries` (in order, each the BSON of
+    /// one entry), an `applyOps` entry's operations included.
+    pub(crate) fn from_entries<'a>(entries: impl IntoIterator<Item = &'a [u8]>) -> Self {
+        let mut out = Replayed::default();
+        for blob in entries {
+            let Ok(entry) = decode_doc(blob) else {
+                continue;
+            };
+            for op in crate::oplog_entry::unwind(&entry) {
+                if op.get_str("op") != Ok("c") {
+                    continue;
+                }
+                let (Ok(ns), Ok(o)) = (op.get_str("ns"), op.get_document("o")) else {
+                    continue;
+                };
+                let db = ns.split_once('.').map_or(ns, |(db, _)| db);
+                out.apply(db, o);
+            }
+        }
+        out
+    }
+
+    fn apply(&mut self, db: &str, o: &Document) {
+        if let Ok(coll) = o.get_str("dropIndexes") {
+            if let Ok(name) = o.get_str("index") {
+                self.indexes
+                    .insert((format!("{db}.{coll}"), name.to_string()));
+            }
+        } else if let Ok(coll) = o.get_str("drop") {
+            let ns = format!("{db}.{coll}");
+            self.indexes.retain(|(n, _)| *n != ns);
+            self.collections.insert(ns);
+        } else if let Ok(coll) = o.get_str("create") {
+            self.collections.remove(&format!("{db}.{coll}"));
+        } else if let Some(coll) = ["createIndexes", "startIndexBuild", "commitIndexBuild"]
+            .iter()
+            .find_map(|k| o.get_str(k).ok())
+        {
+            // An index made again under its name is not gone.
+            let ns = format!("{db}.{coll}");
+            let mut names: Vec<String> =
+                o.get_str("name").map(str::to_string).into_iter().collect();
+            for spec in o.get_array("indexes").into_iter().flatten() {
+                if let Some(n) = spec.as_document().and_then(|s| s.get_str("name").ok()) {
+                    names.push(n.to_string());
+                }
+            }
+            for name in names {
+                self.indexes.remove(&(ns.clone(), name));
+            }
+        }
+    }
+
+    pub(crate) fn drops_collection(&self, ns: &str) -> bool {
+        self.collections.contains(ns)
+    }
+
+    pub(crate) fn drops_index(&self, ns: &str, name: &str) -> bool {
+        self.collections.contains(ns) || self.indexes.contains(&(ns.to_string(), name.to_string()))
+    }
+}
+
 /// Who wrote the store last, as the open finds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LastWriter {
@@ -282,6 +356,7 @@ fn remove(session: &Session, table: &str, key: (&str, &str, Option<&str>)) -> Re
 fn adopt_row(
     session: &Session,
     row: &CatalogRow,
+    replayed: &Replayed,
     unfinished: &mut Vec<(String, String, [u8; 16], Document)>,
 ) -> Result<bool> {
     let (db, coll) = (row.db.as_str(), row.coll.as_str());
@@ -325,6 +400,11 @@ fn adopt_row(
             continue;
         };
         if name == ID_INDEX_NAME {
+            continue;
+        }
+        // An index the replay drops is not taken: the replay ends without
+        // it, and its drop then finds nothing to do (RM-756).
+        if replayed.drops_index(&format!("{db}.{coll}"), name) {
             continue;
         }
         // A build mongod left unfinished is not an index yet: the open
@@ -593,6 +673,7 @@ pub(crate) fn reconcile(
     session: &Session,
     last: LastWriter,
     timestamped: bool,
+    replayed: Replayed,
     refuse: impl FnOnce(&[String]) -> crate::StorageError,
 ) -> Result<Reconciled> {
     if last == LastWriter::ThisServer {
@@ -606,7 +687,7 @@ pub(crate) fn reconcile(
     if last == LastWriter::Unknown && idents_agree(&rows, &placements) {
         return Ok(Reconciled::default());
     }
-    let findings = crate::store_format::catalog_findings(session)?;
+    let findings = crate::store_format::catalog_findings_after(session, &replayed)?;
     if !findings.is_empty() {
         return Err(refuse(&findings));
     }
@@ -619,7 +700,7 @@ pub(crate) fn reconcile(
             .filter(|r| format!("{}.{}", r.db, r.coll) != OPLOG_NS)
         {
             listed.insert((row.db.clone(), row.coll.clone()));
-            if adopt_row(session, row, &mut out.unfinished)? {
+            if adopt_row(session, row, &replayed, &mut out.unfinished)? {
                 out.adopted.push(format!("{}.{}", row.db, row.coll));
             }
             if adopt_time_series(session, row)? {
@@ -662,6 +743,27 @@ pub(crate) fn reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_replay_drops_what_its_entries_drop_and_not_what_they_make_again() {
+        let entries: Vec<Vec<u8>> = [
+            bson::doc! {"op": "c", "ns": "app.$cmd", "o": {"dropIndexes": "c", "index": "h_text"}},
+            bson::doc! {"op": "c", "ns": "app.$cmd", "o": {"dropIndexes": "c", "index": "k_1"}},
+            bson::doc! {"op": "c", "ns": "app.$cmd",
+            "o": {"createIndexes": "c", "name": "k_1", "key": {"k": 1}, "v": 2}},
+            bson::doc! {"op": "c", "ns": "app.$cmd", "o": {"drop": "gone"}},
+            bson::doc! {"op": "i", "ns": "app.c", "o": {"_id": 1}},
+        ]
+        .iter()
+        .map(|d| encode_doc(d).unwrap())
+        .collect();
+        let r = Replayed::from_entries(entries.iter().map(Vec::as_slice));
+        assert!(r.drops_index("app.c", "h_text"));
+        assert!(!r.drops_index("app.c", "k_1"));
+        assert!(r.drops_collection("app.gone"));
+        assert!(r.drops_index("app.gone", "anything"));
+        assert!(!r.drops_collection("app.c"));
+    }
 
     #[test]
     fn multikey_path_bytes_become_prefixes() {
