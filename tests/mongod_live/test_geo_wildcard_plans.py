@@ -47,7 +47,11 @@ CASES: dict[str, tuple[dict, str | None, bool]] = {
         None,
         True,
     ),
-    "2dsphere $geoIntersects polygon": ({"poly": {"$geoIntersects": {"$geometry": SQUARE}}}, None, True),
+    "2dsphere $geoIntersects polygon": (
+        {"poly": {"$geoIntersects": {"$geometry": SQUARE}}},
+        None,
+        True,
+    ),
     "2dsphere $geoIntersects point, hinted": (
         {"poly": {"$geoIntersects": {"$geometry": POINT}}},
         "poly_s",
@@ -63,7 +67,11 @@ CASES: dict[str, tuple[dict, str | None, bool]] = {
         None,
         True,
     ),
-    "$near with an equality on the trailing field": ({"flat": {"$near": [3, 4]}, "t": 1}, None, False),
+    "$near with an equality on the trailing field": (
+        {"flat": {"$near": [3, 4]}, "t": 1},
+        None,
+        False,
+    ),
     "$near with a range on the trailing field": (
         {"flat": {"$near": [3, 4]}, "t": {"$gte": 1}},
         None,

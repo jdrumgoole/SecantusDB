@@ -1903,19 +1903,12 @@ def _winning(plan: dict | None, root_only: bool = False) -> list:
     return out
 
 
-#: `$near` queries with an equality on the index's other field: mongod plans
-#: the equality as the near stage's bounds, this server as a FETCH above it,
-#: or (the field before the geo one) a COLLSCAN (RM-777).
-_PLANS_NOT_MATCHED = {"near2d_max", "nearSphere_pt_t", "near_pts_array"}
-
-
 def _geo_plans(coll: Any) -> dict:
-    """A `$near` is planned by the planner (stage and index); the other geo
-    queries are asked their plan under their hint, as the planner does not
-    yet choose a `$geoWithin` / `$geoIntersects` index scan (RM-777)."""
+    """A `$near` is compared at its root (stage and index), the other geo
+    queries by the whole chain of stages and indexes the planner chooses."""
     out: dict = {}
     for name, flt, hint, _sort in _GEO_QUERIES:
-        if name.startswith("w_") or name in _PLANS_NOT_MATCHED:
+        if name.startswith("w_"):
             continue
         near = "near" in name.lower()
         kw = {} if near else {"hint": hint}
@@ -2043,7 +2036,7 @@ def _plan_collection(coll: Any) -> None:
     coll.create_index([("$**", 1)], name="all_w")
 
 
-@pytest.mark.backlog("RM-777")
+@pytest.mark.backlog_fixed("RM-777")
 def test_geo_within_and_wildcard_indexes_are_planned(tmp_path: Path) -> None:
     """mongod 8.2.11 plans a `$geoWithin` / `$geoIntersects` onto its
     `2d` / `2dsphere` index (FETCH over IXSCAN), a wildcard predicate onto
