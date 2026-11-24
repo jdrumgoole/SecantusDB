@@ -3060,14 +3060,6 @@ Each was measured against mongod 8.2.11 beside a hashed-index probe
       Verify: tests/backlog/test_rm_found_rm732.py::test_create_indexes_validates_its_options_as_mongod_does
       Backlog-ID: RM-771
 
-- [ ] **An `IndexKeySpecsConflict` quotes the requested spec's options in
-      the wrong place.** mongod 8.2.11 writes `{ v: 2, unique: true, key:
-      ..., name: ... }` and `{ v: 2, key: ..., name: ..., sparse: true }`
-      whatever order the client sent them in; this server writes every
-      option before `key`.
-      Verify: tests/backlog/test_rm_found_rm732.py::test_an_index_conflict_quotes_the_requested_spec_in_mongods_order
-      Backlog-ID: RM-772
-
 - [ ] **An equality to a DBRef is planned as a collection scan.**
       `{a: DBRef("c", 1)}` is an equality to the document `{$ref: "c", $id:
       1}`; mongod 8.2.11 reads an index on `a` with the bounds `[{ $ref: "c",

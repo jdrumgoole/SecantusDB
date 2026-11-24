@@ -127,14 +127,14 @@ def _conflict(client: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-772")
+@pytest.mark.backlog_fixed("RM-772")
 def test_an_index_conflict_quotes_the_requested_spec_in_mongods_order(
     rust_mongo: Any,  # noqa: F811
     mongod_rs: Any,  # noqa: F811
 ) -> None:
     """The requested spec of an `IndexKeySpecsConflict` is quoted as mongod
     8.2.11 writes it: `v`, then `unique` when it is set, then `key` and
-    `name`, then `sparse`. This server writes `sparse` before `key`."""
+    `name`, then `sparse`. This server wrote `sparse` before `key`."""
     theirs = _conflict(mongod_rs)
     assert "sparse: true }" in theirs[0], theirs
     assert _conflict(rust_mongo) == theirs
