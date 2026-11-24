@@ -442,6 +442,125 @@ def test_secantus_opens_a_mongod_store(tmp_path: Path) -> None:
         assert indexes == ("ok", ["_id_", "a_1"])
 
 
+def _collmodded_indexes(client: Any) -> None:
+    """Indexes a `collMod` has changed, which mongod keeps in its catalog in
+    build order with the spec fields as it wrote them (RM-734)."""
+    db = client["app"]
+    coll = db.create_collection("c")
+    coll.insert_many([{"_id": i, "a": i, "b": i, "d": i} for i in range(5)])
+    db.command(
+        "createIndexes",
+        "c",
+        indexes=[
+            {"name": "a_1", "key": {"a": 1}, "unique": True},
+            {"name": "b_1", "key": {"b": 1}},
+            {"name": "d_1", "key": {"d": 1}, "hidden": True},
+            {"name": "e_1", "key": {"e": 1}},
+        ],
+    )
+    db.command("collMod", "c", index={"name": "e_1", "prepareUnique": True})
+    db.command("collMod", "c", index={"name": "a_1", "hidden": True})
+    db.command("collMod", "c", index={"name": "b_1", "expireAfterSeconds": 100})
+    db.command("collMod", "c", index={"name": "d_1", "hidden": False})
+
+
+def _catalog_specs(client: Any) -> list[list[tuple[str, Any]]]:
+    out = []
+    for entry in client["app"]["c"].aggregate([{"$listCatalog": {}}]):
+        for ix in entry["md"]["indexes"]:
+            out.append(list(ix["spec"].items()))
+    return out
+
+
+def _drop_order_after_a_restart(store: Path, port: int | None) -> list[str]:
+    """The `dropIndexes: "*"` entries of the oplog, in the order logged, once
+    `store` is opened by mongod (so with no in-memory order moved)."""
+    proc, client = _mongod_on(store, port, SECANTUS_SET if port else "rs0")
+    try:
+        assert client is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            _until_primary(client)
+            client["app"]["c"].drop_indexes()
+            rows = client["local"]["oplog.rs"].find({"o.dropIndexes": "c"}).sort("$natural", 1)
+            return [r["o"]["index"] for r in rows][-4:]
+    finally:
+        _stop_mongod(proc, client)
+
+
+@pytest.mark.backlog_fixed("RM-734")
+def test_mongod_opens_the_collmodded_indexes_secantus_wrote(tmp_path: Path) -> None:
+    """A store `secantusd-mdb` wrote, with indexes a `collMod` changed, is a
+    store mongod 8.2.11 validates and reads in the same catalog order (build
+    order), the spec fields as they were written."""
+    store = tmp_path / "store"
+    with rust_mongo_server(store) as client:
+        _collmodded_indexes(client)
+        ours = _catalog_specs(client)
+        port = client.address[1]
+    assert [[k for k, _ in spec] for spec in ours] == [
+        ["v", "key", "name"],
+        ["v", "unique", "key", "name", "hidden"],
+        ["v", "key", "name", "expireAfterSeconds"],
+        ["v", "key", "name"],
+        ["v", "key", "name", "prepareUnique"],
+    ]
+    proc, client = _mongod_on(store, port, SECANTUS_SET)
+    try:
+        assert client is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            _until_primary(client)
+            assert _catalog_specs(client) == ours
+            result = client["app"].command("validate", "c", full=True)
+            assert (result["valid"], result["nrecords"]) == (True, 5)
+    finally:
+        _stop_mongod(proc, client)
+    assert _drop_order_after_a_restart(store, port) == ["a_1", "b_1", "d_1", "e_1"]
+
+
+@pytest.mark.backlog_fixed("RM-734")
+def test_secantus_keeps_the_catalog_order_of_collmodded_indexes_mongod_wrote(
+    tmp_path: Path,
+) -> None:
+    """A store mongod 8.2.11 wrote, with indexes a `collMod` changed, opened
+    by `secantusd-mdb`: the same specs in the same field order, `dropIndexes:
+    "*"` in build order, and a `collMod` of its own moves one to the end."""
+    seen: dict[str, Any] = {}
+
+    def setup(client: Any) -> None:
+        _collmodded_indexes(client)
+        seen["catalog"] = _catalog_specs(client)
+
+    store = _mongod_store(tmp_path, setup)
+    with rust_mongo_server(store) as rust:
+        assert _catalog_specs(rust) == seen["catalog"]
+        assert [i["name"] for i in rust["app"]["c"].list_indexes()] == [
+            "_id_",
+            "a_1",
+            "b_1",
+            "d_1",
+            "e_1",
+        ]
+    # This server's own `collMod` of what mongod wrote unhides `a_1` (its
+    # field goes) and moves it to the end of the drop order.
+    with rust_mongo_server(store) as rust:
+        rust["app"].command("collMod", "c", index={"name": "a_1", "hidden": False})
+        assert _catalog_specs(rust)[1] == [
+            ("v", 2),
+            ("unique", True),
+            ("key", {"a": 1}),
+            ("name", "a_1"),
+        ]
+        with rust["app"].watch(show_expanded_events=True, max_await_time_ms=200) as stream:
+            rust["app"]["c"].drop_indexes()
+            names = []
+            end = time.monotonic() + 10
+            while len(names) < 4 and time.monotonic() < end:
+                ev = stream.try_next()
+                if ev is not None and ev["operationType"] == "dropIndexes":
+                    names.append(ev["operationDescription"]["indexes"][0]["name"])
+        assert names == ["b_1", "d_1", "e_1", "a_1"]
+
+
 @pytest.mark.backlog("RM-735")
 def test_a_restart_raises_the_election_term(tmp_path: Path) -> None:
     """mongod 8.2.11 (measured 2026-11-20,
@@ -915,14 +1034,16 @@ def test_mongod_finds_the_users_and_roles_secantus_made(tmp_path: Path) -> None:
         assert (users, roles) == (["u1"], ["r1"])
 
 
-@pytest.mark.backlog("RM-745")
+@pytest.mark.backlog_fixed("RM-745")
 def test_a_views_ddl_is_logged_as_mongod_logs_it() -> None:
     """mongod 8.2.11 logs a view's DDL as writes to `system.views`, not as
     commands (measured 2026-11-21): the first view's database gets
     `{op: c, o: {create: "system.views", idIndex}}`, then each create is an
     insert of the definition, a `collMod` an update replacing it and a drop
-    its delete. This server logs `create` (with its internal `viewPipeline`
-    and an `idIndex`), `collMod` and `drop` commands naming the view."""
+    its delete. This server logged `create` (with its internal `viewPipeline`
+    and an `idIndex`), `collMod` and `drop` commands naming the view, which
+    mongod replaying a killed store's oplog refused ("'viewPipeline' is not
+    a valid collection option"), aborting its recovery (RM-745)."""
     import tempfile
 
     with tempfile.TemporaryDirectory() as home, rust_mongo_server(Path(home) / "s") as c:
@@ -949,6 +1070,51 @@ def test_a_views_ddl_is_logged_as_mongod_logs_it() -> None:
         ),
         ("d", "app.system.views", {"_id": "app.v1"}),
     ]
+
+
+@pytest.mark.backlog_fixed("RM-745")
+def test_mongod_opens_a_killed_store_whose_workload_made_views(tmp_path: Path) -> None:
+    """The kill probe RM-745 was measured with (2026-11-22): views made,
+    changed and dropped, then SIGKILL. mongod 8.2.11 replays the oplog after
+    the stable checkpoint, and a view's `create` command carrying
+    `viewPipeline` aborted its recovery. Logged as `system.views` writes,
+    the views replay as mongod's own do, and the live one reads back."""
+
+    def setup(c: pymongo.MongoClient) -> None:
+        c.app.c.insert_many([{"_id": i, "a": i % 3} for i in range(30)])
+        c.app.command("create", "v1", viewOn="c", pipeline=[{"$match": {"a": 1}}])
+        c.app.command("create", "gone", viewOn="c", pipeline=[])
+        c.app.command("collMod", "v1", viewOn="c", pipeline=[{"$match": {"a": 2}}])
+        c.app.gone.drop()
+
+    with _mongod_on_secantus_store(tmp_path, setup, kill=True) as mongod:
+        names = sorted(
+            (i["name"], i["type"]) for i in mongod.app.list_collections() if i["name"] != "c"
+        )
+        assert names == [("system.views", "collection"), ("v1", "view")]
+        assert mongod.app.v1.count_documents({}) == 10
+
+
+@pytest.mark.backlog_fixed("RM-745")
+def test_a_killed_store_replays_its_views(tmp_path: Path) -> None:
+    """The same workload, SIGKILLed, reopened by this server: its recovery
+    replays the `system.views` writes as the views' DDL (RM-745)."""
+    store = tmp_path / "store"
+
+    def setup(c: pymongo.MongoClient) -> None:
+        c.app.c.insert_many([{"_id": i, "a": i % 3} for i in range(30)])
+        c.app.command("create", "v1", viewOn="c", pipeline=[{"$match": {"a": 1}}])
+        c.app.command("create", "gone", viewOn="c", pipeline=[])
+        c.app.command("collMod", "v1", viewOn="c", pipeline=[{"$match": {"a": 2}}])
+        c.app.gone.drop()
+
+    _killed_secantus_store(store, setup)
+    with rust_mongo_server(store) as c:
+        views = {i["name"]: i["options"] for i in c.app.list_collections() if i["type"] == "view"}
+        assert views == {"v1": {"viewOn": "c", "pipeline": [{"$match": {"a": 2}}]}}
+        assert c.app.v1.count_documents({}) == 10
+        defs = list(c.app.system.views.find())
+        assert defs == [{"_id": "app.v1", "viewOn": "c", "pipeline": [{"$match": {"a": 2}}]}]
 
 
 #: The `_id` index spec an oplog `create` entry carries.
@@ -1461,32 +1627,56 @@ def test_secantus_refuses_an_index_kind_it_does_not_serve_by_name(tmp_path: Path
 # same writes (2026-11-22), working RM-746.
 
 
-@pytest.mark.backlog("RM-747")
+@pytest.mark.backlog_fixed("RM-747")
 def test_a_read_only_transaction_logs_its_majority_no_op(tmp_path: Path) -> None:
-    """mongod 8.2.11 commits a read-only transaction under its implicit
-    `w: "majority"` by logging a no-op, `{op: "n", o: {msg: "read-only
-    transaction with writeConcern { w: \\"majority\\", ... }"}}` (measured
-    2026-11-22), so the commit waits on a write of its own. This server logs
-    nothing for it."""
-    with rust_mongo_server(tmp_path / "store") as client:
-        client.app.c.insert_one({"_id": 1})
+    """mongod 8.2.11 commits a read-only transaction by logging a no-op naming
+    the commit's write concern (measured 2026-11-22 and 2026-11-24, the
+    implicit default and a client-supplied `w: 1`), so the commit waits on a
+    write of its own. This server logged nothing for it."""
+    from pymongo.write_concern import WriteConcern
+
+    def logged(client, wc):
         start = next(client.local["oplog.rs"].find().sort("$natural", -1).limit(1))["ts"]
-        with client.start_session() as session, session.start_transaction():
+        with client.start_session() as session, session.start_transaction(write_concern=wc):
             client.app.c.find_one({"_id": 1}, session=session)
-        entries = [
-            (e["op"], str(e.get("o", {}).get("msg", ""))[:39])
+        return [
+            (e["op"], e["ns"], e["o"])
             for e in client.local["oplog.rs"].find({"ts": {"$gt": start}})
         ]
-    assert entries == [("n", "read-only transaction with writeConcern")]
+
+    with rust_mongo_server(tmp_path / "store") as client:
+        client.app.c.insert_one({"_id": 1})
+        implicit = logged(client, None)
+        w1 = logged(client, WriteConcern(w=1))
+    assert implicit == [
+        (
+            "n",
+            "",
+            {
+                "msg": 'read-only transaction with writeConcern { w: "majority", wtimeout: 0, '
+                'provenance: "implicitDefault" }'
+            },
+        )
+    ]
+    assert w1 == [
+        (
+            "n",
+            "",
+            {
+                "msg": "read-only transaction with writeConcern { w: 1, wtimeout: 0, "
+                'provenance: "clientSupplied" }'
+            },
+        )
+    ]
 
 
-@pytest.mark.backlog("RM-748")
+@pytest.mark.backlog_fixed("RM-748")
 def test_the_initiation_logs_the_pre_images_collection(tmp_path: Path) -> None:
     """mongod 8.2.11's initiation logs the creation of
     `config.system.preimages` (`{op: "c", ns: "config.$cmd", o: {create:
     "system.preimages", clusteredIndex: ...}}`, measured 2026-11-22), as it
-    logs every collection it creates then. This server creates it
-    unreplicated, with no entry."""
+    logs every collection it creates then. This server created it
+    unreplicated, with no entry, until RM-748 was fixed."""
     with rust_mongo_server(tmp_path / "store") as client:
         creates = [
             e["o"]["create"]

@@ -409,6 +409,11 @@ one beside it.
   not a latency miss. Three reruns alone passed. Undiagnosed; a relation
   that DDL created and a later query cannot find is a correctness bug until
   shown otherwise, so treat it as the first thing to reproduce here.
+  Again on 2026-11-24 in RM-745's `gate_pg.sh --storage --fast` (load
+  10-15): both 800-table tests, `relation "rp911a_l_3_0"` and
+  `"rp911c_l_1_2" does not exist`; the file run alone right after passed
+  both. RM-745 changed only plain views' `system.views` logging in the
+  shared storage, which a `CREATE TABLE` does not reach.
   Verify: none -- intermittent on Linux CI; RP-911's regression test is the check
   Backlog-ID: RP-1078
 - [ ] **`stop_does_not_wait_on_an_idle_connection` overruns its 3 s bound

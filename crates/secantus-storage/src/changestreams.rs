@@ -592,6 +592,7 @@ pub fn project(
         // `src/secantus/changestreams.py`.
         if show_expanded_events
             && ev.get_str("operationType") != Ok("invalidate")
+            && !is_system_views(oplog_entry.get_str("ns").unwrap_or(""))
             && !ev.contains_key("collectionUUID")
         {
             if let Some(ui) = oplog_entry.get("ui") {
@@ -639,6 +640,9 @@ fn project_unordered(
         return Ok((None, false));
     }
 
+    if (op == "i" || op == "u" || op == "d") && is_system_views(&ns) {
+        return project_view_write(oplog_entry, op, &ns, ts, wall, scope, show_expanded_events);
+    }
     if op == "i" || op == "u" || op == "d" {
         if !scope_matches(&ns, scope) {
             return Ok((None, false));
@@ -755,6 +759,73 @@ fn project_unordered(
     Ok((None, false))
 }
 
+/// Whether `ns` is a database's `system.views`.
+fn is_system_views(ns: &str) -> bool {
+    split_ns(ns).1 == secantus_core::viewdefs::SYSTEM_VIEWS
+}
+
+/// A write to `<db>.system.views`, which is how a view's DDL is logged
+/// (RM-745). mongod 8.2.11 shows it only under `showExpandedEvents`, on a
+/// database or cluster stream (a stream on the view itself sees none), as
+/// the view's `create` (`nsType: "view"`), `modify` or `drop`, with the
+/// definition as `operationDescription: {viewOn, pipeline}` and no
+/// `collectionUUID` (measured 2026-11-23). It is never a CRUD event.
+fn project_view_write(
+    oplog_entry: &Document,
+    op: &str,
+    ns: &str,
+    ts: Timestamp,
+    wall: Option<Bson>,
+    scope: &Scope,
+    show_expanded_events: bool,
+) -> Result<(Option<Document>, bool)> {
+    if !show_expanded_events || !scope_matches(ns, scope) {
+        return Ok((None, false));
+    }
+    let o = oplog_entry.get_document("o").cloned().unwrap_or_default();
+    let id = oplog_entry
+        .get_document("o2")
+        .ok()
+        .and_then(|o2| o2.get_str("_id").ok())
+        .or_else(|| o.get_str("_id").ok())
+        .unwrap_or("");
+    let (op_type, description) = match op {
+        "i" => ("create", true),
+        "u" if !o.contains_key("$v") => ("modify", true),
+        "d" => ("drop", false),
+        _ => return Ok((None, false)),
+    };
+    let mut op_desc = Document::new();
+    if description {
+        for (k, v) in &o {
+            if k != "_id" {
+                op_desc.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    let token = make_resume_token(&ResumeTokenData::event(
+        ts,
+        op_index_of(oplog_entry),
+        None,
+        event_identifier(op_type, None, description.then_some(&op_desc)),
+    ))?;
+    let mut event = Document::new();
+    event.insert("_id", Bson::Document(token));
+    event.insert("operationType", op_type);
+    event.insert("clusterTime", Bson::Timestamp(ts));
+    if let Some(w) = wall {
+        event.insert("wallTime", w);
+    }
+    event.insert("ns", Bson::Document(ns_doc(id)));
+    if description {
+        event.insert("operationDescription", Bson::Document(op_desc));
+    }
+    if op_type == "create" {
+        event.insert("nsType", "view");
+    }
+    Ok((Some(event), false))
+}
+
 /// The `op: "c"` (command) branch of [`project`] — DDL events.
 fn project_command(
     oplog_entry: &Document,
@@ -858,7 +929,9 @@ fn project_command(
         return Ok((Some(event), invalidates));
     }
     if let Ok(coll) = cmd.get_str("create") {
-        if !show_expanded_events {
+        // `system.views` is made with a database's first view, and shows no
+        // event of its own (measured 8.2.11).
+        if !show_expanded_events || coll == secantus_core::viewdefs::SYSTEM_VIEWS {
             return Ok((None, false));
         }
         let affected_ns = format!("{cmd_db}.{coll}");

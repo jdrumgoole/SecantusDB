@@ -228,7 +228,8 @@ const STEP_UP_TTL_COLLECTIONS: [(&str, &str); 3] = [
 /// `config.system.indexBuilds`, where it records the index builds it would
 /// resume, and the query sampler's three, each with its `expireAt` TTL
 /// index; and `config.system.preimages`, where it keeps change stream
-/// pre-images, clustered by `_id` in the legacy form and not replicated.
+/// pre-images, clustered by `_id` in the legacy form; its creation is
+/// logged, its documents are not replicated.
 /// Here that is when the server starts on a store that lacks them; one
 /// already there is left as it is.
 pub fn record_session_state_collections(
@@ -248,7 +249,8 @@ pub fn record_session_state_collections(
         storage.create_collection(SESSIONS_DB, "image_collection")?;
     }
     if !storage.collection_exists(SESSIONS_DB, "system.preimages")? {
-        let _unreplicated = storage.unreplicated();
+        // Its creation is logged, as mongod 8.2.11's initiation logs it
+        // (RM-748); the pre-images written into it are not replicated.
         storage.create_collection_with_options(
             SESSIONS_DB,
             "system.preimages",

@@ -150,16 +150,15 @@ fn index_rows(session: &Session, db: &str, coll: &str) -> Result<Vec<(String, Do
 }
 
 /// The spec an index row lists in `_mdb_catalog` (what `sync_catalog_entry`
-/// writes): `v`, `key`, `name`, then its user options.
+/// writes): its fields in the order the row recorded.
 fn listed_spec(payload: &Document, name: &str) -> Document {
-    let key = payload.get_document("key").cloned().unwrap_or_default();
-    let mut spec = bson::doc! {"v": 2i32, "key": key, "name": name};
-    for (k, v) in crate::index_event_spec(payload, name) {
-        if !matches!(k.as_str(), "v" | "key" | "name") {
-            spec.insert(k, v);
-        }
-    }
-    spec
+    crate::index_event_spec(payload, name)
+}
+
+/// Whether two specs are the same, field order included: `Document`'s own
+/// equality ignores it, and the order is part of what the catalog keeps.
+fn same_spec(a: &Document, b: &Document) -> bool {
+    a == b && a.keys().eq(b.keys())
 }
 
 /// mongod's `multikeyPaths` (per key field, a byte per path component, 1
@@ -231,7 +230,12 @@ fn index_payload(ix: &Document, build_seq: i64) -> Option<(String, Document)> {
             options.insert(crate::MULTIKEY_PATHS, prefixes);
         }
     }
-    Some((name, bson::doc! {"key": key, "options": options}))
+    // The spec's field order, as mongod wrote it.
+    let order: Vec<Bson> = spec.keys().map(|k| Bson::String(k.clone())).collect();
+    Some((
+        name,
+        bson::doc! {"key": key, "options": options, "specOrder": order},
+    ))
 }
 
 fn put(
@@ -315,7 +319,7 @@ fn adopt_row(session: &Session, row: &CatalogRow) -> Result<bool> {
             .unwrap_or_default();
         let theirs_multikey = ix.get_bool("multikey").unwrap_or(false);
         let want = match ours.get(name) {
-            Some(payload) if listed_spec(payload, name) == spec => {
+            Some(payload) if same_spec(&listed_spec(payload, name), &spec) => {
                 // Ours: keep its stamps, and what mongod learnt since.
                 let mut payload = payload.clone();
                 let mut opts = payload.get_document("options").cloned().unwrap_or_default();

@@ -2107,22 +2107,6 @@ would see them. What is left:
       counts of the entries the stream keeps match since RM-453, 2026-11-15).
       Verify: none -- mongod writes its no-ops on a timer, so no test can pin how many a scan reads
       Backlog-ID: RM-700
-- [ ] **RUST MongoDB server: `dropIndexes: "*"` does not log an index a
-      `collMod` changed last, with the option it set after `name`.** mongod
-      8.2.11 drops in its in-memory catalog order: build order, except that
-      an index a `collMod` touched moves to the end (`listIndexes` keeps
-      build order), and an option `collMod` added (`hidden`,
-      `prepareUnique`) is written after `name`, while one given at create
-      keeps its place before `key`. Created `a_1` (unique), `b_1_c_-1`,
-      `d_1` (hidden), then `collMod` hid `a_1`: mongod drops `b_1_c_-1`,
-      `d_1`, `a_1` with `a_1` as `{v, unique, key, name, hidden}`; this
-      server drops `d_1`, `b_1_c_-1`, `a_1` with `hidden` before `key`. The
-      fix needs the spec's field order kept in the catalog and an entry
-      order a `collMod` moves (2026-11-21, found working the 4b-4 resume
-      tokens; corrected 2026-11-23 by probe: the first text said "newest
-      first", which mongod does not do).
-      Verify: tests/backlog/test_rm_found_2026_11_21_resume_tokens.py::test_dropping_every_index_lists_a_collmodded_index_last_with_hidden_after_name
-      Backlog-ID: RM-734
 
 ### 7.073 The cursor commands -- 2026-10-11
 
@@ -2906,44 +2890,12 @@ produce the dump it exists for.
 Each was measured by starting mongod 8.2.11 on a store `secantusd-mdb`
 wrote and stopped (the forward direction of RM-723).
 
-- [ ] **A view's DDL is logged as commands, not as mongod logs it.** mongod
-      8.2.11 logs creating a view as an insert into `<db>.system.views` (the
-      first one preceded by `create: "system.views"`), a `collMod` of it as
-      an update replacing the document and a drop as its delete; it logs no
-      command naming the view. This server logs `create` (carrying its
-      internal `viewPipeline` option and an `idIndex`), `collMod` (without
-      the pipeline) and `drop`, and writes the `system.views` document
-      unreplicated beside them. Change streams read those commands, so a fix
-      also derives their view events from the `system.views` writes, as
-      mongod's change stream does. Since a killed store opens in mongod
-      (RM-746, phase 7b), this is what still stops one: mongod replaying a
-      view's `create` entry from our oplog fails it ("'viewPipeline' is not a
-      valid collection option", InvalidOptions) and aborts its recovery
-      (measured 2026-11-22, a kill probe whose workload makes views).
-      Backlog-ID: RM-745
-      Verify: tests/backlog/test_rm_storage_model.py::test_a_views_ddl_is_logged_as_mongod_logs_it
 
 ## Found working RM-746 (storage-model phase 7b, 2026-11-22)
 
 Each was measured by running the same writes on mongod 8.2.11 and on
 `secantusd-mdb`, one-member sets, and reading what each logged.
 
-- [ ] **A read-only transaction's commit logs nothing.** mongod 8.2.11
-      commits a read-only transaction under its implicit `w: "majority"` by
-      logging a no-op, `{op: "n", o: {msg: "read-only transaction with
-      writeConcern { w: \"majority\", ... }"}}`, so the commit waits on a
-      write of its own; this server logs no entry.
-      Verify: tests/backlog/test_rm_storage_model.py::test_a_read_only_transaction_logs_its_majority_no_op
-      Backlog-ID: RM-747
-- [ ] **The initiation logs no creation of `config.system.preimages`.**
-      mongod's initiation logs every collection it creates, the pre-images
-      collection's as `{op: "c", ns: "config.$cmd", o: {create:
-      "system.preimages", clusteredIndex: ...}}`; this server creates it
-      unreplicated, with no entry, so a mongod replaying this oplog from
-      genesis has no such `create`. (The initiation's other differences:
-      no `new primary` no-op, RM-735; no `admin.system.keys` documents.)
-      Verify: tests/backlog/test_rm_storage_model.py::test_the_initiation_logs_the_pre_images_collection
-      Backlog-ID: RM-748
 
 ## Found in CI on 2026-11-19
 

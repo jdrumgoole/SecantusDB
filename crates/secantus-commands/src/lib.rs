@@ -2252,13 +2252,17 @@ fn commit_transaction(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             // The commit and its session's row are one operation: the row
             // commits at the timestamp of the commit's entry (RM-746).
             let _op = ctx.storage.as_ref().and_then(|s| s.op_scope());
-            match reg.commit(&lsid, n) {
-                None => {
+            match reg.commit_noting_first(&lsid, n) {
+                (None, first) => {
                     let mut reply = doc! { "ok": 1.0 };
                     // A transaction that logged its writes leaves its
                     // session's `config.transactions` row, as mongod's does.
                     if let Some(s) = ctx.storage.as_ref() {
-                        if let Some(ts) = s.take_last_commit_ts() {
+                        let ts = s.take_last_commit_ts();
+                        if first && ts.is_none() {
+                            log_read_only_commit(doc, ctx, s.as_ref())?;
+                        }
+                        if let Some(ts) = ts {
                             session::pin_operation_time(
                                 &mut reply,
                                 ctx.replica_set_name.is_some(),
@@ -2277,11 +2281,62 @@ fn commit_transaction(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
                     }
                     Ok(reply)
                 }
-                Some(reply) => Ok(reply),
+                (Some(reply), _) => Ok(reply),
             }
         }
         _ => Ok(doc! { "ok": 1.0 }),
     }
+}
+
+/// A read-only transaction's commit: mongod 8.2.11 logs a no-op naming the
+/// commit's write concern, `{op: "n", ns: "", o: {msg: "read-only
+/// transaction with writeConcern { w: \"majority\", wtimeout: 0,
+/// provenance: \"implicitDefault\" }"}}`, whatever that concern is (measured
+/// 2026-11-24 with the implicit default and with `w: 1`), so the commit
+/// waits on a write of its own. A transaction that wrote logged its entry
+/// already, and logs none.
+fn log_read_only_commit(
+    doc: &Document,
+    ctx: &CommandContext,
+    s: &dyn crate::Storage,
+) -> Result<(), CommandError> {
+    if ctx.replica_set_name.is_none() {
+        return Ok(());
+    }
+    let given = doc
+        .get_document("writeConcern")
+        .ok()
+        .filter(|wc| !wc.is_empty());
+    let (wc, provenance) = match given {
+        Some(wc) => (wc.clone(), "clientSupplied"),
+        None => match rwconcern::default_write_concern(ctx) {
+            Some(wc) => (wc, "customDefault"),
+            None => (doc! {"w": "majority"}, "implicitDefault"),
+        },
+    };
+    let mut shown = Document::new();
+    shown.insert(
+        "w",
+        wc.get("w")
+            .cloned()
+            .unwrap_or(Bson::String("majority".into())),
+    );
+    if let Some(j) = wc.get("j") {
+        shown.insert("j", j.clone());
+    }
+    shown.insert(
+        "wtimeout",
+        wc.get("wtimeout").cloned().unwrap_or(Bson::Int32(0)),
+    );
+    shown.insert(
+        "provenance",
+        wc.get_str("provenance").unwrap_or(provenance).to_string(),
+    );
+    s.append_oplog_note(doc! {
+        "msg": format!("read-only transaction with writeConcern {}", mongod_tostring(&shown)),
+    })
+    .map_err(|e| CommandError::new(1, "InternalError", format!("{e:?}")))?;
+    Ok(())
 }
 
 /// `endSessions` -- the listed sessions are no longer needed. mongod checks

@@ -1685,6 +1685,12 @@ pub trait Storage: Send + Sync {
         None
     }
 
+    /// The spec of index `name` as the durable catalog lists it, its fields
+    /// in mongod's order (`$listCatalog`'s `spec`), where it keeps one.
+    fn index_catalog_spec(&self, _db: &str, _coll: &str, _name: &str) -> Option<Document> {
+        None
+    }
+
     /// Count one use of each of `names`, the indexes a plan just read
     /// (`$indexStats`' `accesses.ops`).
     fn record_index_use(&self, _db: &str, _coll: &str, _names: &[String]) {}

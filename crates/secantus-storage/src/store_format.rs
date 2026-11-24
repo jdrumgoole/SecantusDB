@@ -279,6 +279,7 @@ const SERVED_INDEX_OPTIONS: &[&str] = &[
     "key",
     "name",
     "unique",
+    "prepareUnique",
     "sparse",
     "partialFilterExpression",
     "expireAfterSeconds",

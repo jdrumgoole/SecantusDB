@@ -1723,14 +1723,14 @@ fn oplog_view_shape(entry: &Document) -> Option<Document> {
             return None;
         };
         let mut n = bson::doc! {"createIndexes": coll};
-        n.extend(oplog_index_spec(spec));
+        n.extend(spec.clone());
         (n, None)
     } else if let (Ok(coll), Ok(spec)) = (o.get_str("dropIndexes"), o.get_document("spec")) {
         let mut n = bson::doc! {"dropIndexes": coll};
         if let Some(index) = o.get("index") {
             n.insert("index", index.clone());
         }
-        (n, Some(oplog_index_spec(spec)))
+        (n, Some(spec.clone()))
     } else {
         return None;
     };
@@ -1750,23 +1750,6 @@ fn oplog_view_shape(entry: &Document) -> Option<Document> {
         }
     }
     Some(out)
-}
-
-/// An index spec in the order mongod's oplog entries give it: `v`, then
-/// `unique` and `hidden`, then the rest (measured 8.2.11).
-fn oplog_index_spec(spec: &Document) -> Document {
-    let mut out = Document::new();
-    for first in ["v", "unique", "hidden"] {
-        if let Some(v) = spec.get(first) {
-            out.insert(first, v.clone());
-        }
-    }
-    for (k, v) in spec {
-        if !matches!(k.as_str(), "v" | "unique" | "hidden") {
-            out.insert(k.clone(), v.clone());
-        }
-    }
-    out
 }
 
 /// Can an oplog entry naming `ns` be a `local` one (`oplog_entry_is_local`)?
@@ -4434,6 +4417,14 @@ fn defines_view(options: &Document) -> bool {
     options.contains_key("viewOn") || options.contains_key("timeseries")
 }
 
+/// Whether `options` are a view's (not a time-series collection's), whose
+/// DDL mongod 8.2.11 logs as the writes to `system.views` alone: an insert
+/// of its definition, an update replacing it, its delete -- no command
+/// naming the view (measured 2026-11-21; RM-745).
+pub(crate) fn is_plain_view(options: &Document) -> bool {
+    options.contains_key("viewOn") && !options.contains_key("timeseries")
+}
+
 fn counting_index_keys() -> bool {
     INDEX_KEYS.with(|k| k.get().is_some())
 }
@@ -5795,6 +5786,12 @@ pub struct Storage {
     /// [`sizes`]).
     /// Shared with the oplog pruner, which removes expired pre-images.
     sizes: Arc<sizes::SizeStorer>,
+    /// Each collection's index order as mongod's in-memory index catalog
+    /// holds it, where a `collMod` of an index has moved that index to the
+    /// end (RM-734). `listIndexes` and `_mdb_catalog` keep build order;
+    /// `dropIndexes: "*"` drops in this one, and a restart forgets it.
+    /// Keyed by the collection's UUID, which a rename keeps.
+    index_order: Mutex<HashMap<Vec<u8>, Vec<String>>>,
     /// Index builds in progress (RM-187): what writes to their collections
     /// must also record, and what `listIndexes` / `currentOp` show.
     index_builds: index_build::Registry,
@@ -8579,6 +8576,7 @@ impl Storage {
             user_write_block: std::sync::RwLock::new(None),
             insert_groups: AtomicI64::new(0),
             sizes,
+            index_order: Mutex::new(HashMap::new()),
             index_builds: index_build::Registry::default(),
             open_record: OpenRecord {
                 started,
@@ -10598,6 +10596,22 @@ impl Storage {
         index_table_of(&session, db, coll, name)
     }
 
+    /// The spec of index `name` as `_mdb_catalog` lists it, its fields in
+    /// the order mongod keeps (RM-734): `$listCatalog`'s `spec`.
+    pub fn index_catalog_spec(&self, db: &str, coll: &str, name: &str) -> Result<Option<Document>> {
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor(IDX_TABLE, None)?;
+        cur.set_key_sss(db, coll, name);
+        match cur.search() {
+            Ok(()) => Ok(Some(index_event_spec(
+                &decode_doc(&cur.get_value_u()?)?,
+                name,
+            ))),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Write every collection's `_mdb_catalog` row from the registry, in one
     /// statement transaction (timestamped as the store's writes are): what
     /// an open does after the work that can rewrite index rows (a mongod
@@ -10844,8 +10858,24 @@ impl Storage {
     /// After a view's or a time-series collection's DDL: its database's
     /// `system.views` says what the registry says, and a time-series
     /// collection's buckets have mongod's catalog options.
-    fn after_view_ddl(&self, db: &str, coll: &str) -> Result<()> {
-        self.sync_system_views(db)?;
+    /// A user write block refuses a plain view's DDL, as mongod's op
+    /// observer refuses its `system.views` write: bare, before anything of
+    /// it commits (the command entry's check did so before RM-745).
+    fn refuse_blocked_view_ddl(&self, db: &str) -> Result<()> {
+        match self.user_write_block_for(db) {
+            Some(reason) => Err(StorageError::QueryError {
+                code: 371,
+                errmsg: format!("User writes blocked, reason: {reason}"),
+                exec: false,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// `plain`: `coll` is (or was) a plain view, whose document's write is
+    /// logged as its DDL (RM-745).
+    fn after_view_ddl(&self, db: &str, coll: &str, plain: bool) -> Result<()> {
+        self.sync_system_views_logging(db, plain.then_some(coll))?;
         let buckets = format!("{}{coll}", secantus_core::viewdefs::BUCKETS_PREFIX);
         if self.collection_exists(db, &buckets)? {
             self.catalog_write(|session| sync_catalog_entry(session, db, &buckets))?;
@@ -10863,6 +10893,17 @@ impl Storage {
     /// collection is made with the first view and stays when the last goes,
     /// as mongod's does.
     pub(crate) fn sync_system_views(&self, db: &str) -> Result<()> {
+        self.sync_system_views_logging(db, None)
+    }
+
+    /// [`Self::sync_system_views`], logging the write of the plain view
+    /// `logged`'s document (and the collection's create, when that write
+    /// makes it), as mongod logs a view's DDL (RM-745). Every other write
+    /// -- a time-series collection's document, a mend at open -- stays
+    /// unreplicated.
+    fn sync_system_views_logging(&self, db: &str, logged: Option<&str>) -> Result<()> {
+        let logged_id = logged.map(|name| Bson::String(format!("{db}.{name}")));
+        let guard = |id: &Bson| (logged_id.as_ref() != Some(id)).then(unreplicated);
         let mut want: Vec<Document> = Vec::new();
         {
             let session = self.conn.open_session()?;
@@ -10886,10 +10927,10 @@ impl Storage {
         if want.is_empty() && have.is_empty() {
             return Ok(());
         }
-        let _unlogged = unreplicated();
         for doc in &have {
             let id = doc.get("_id").cloned().unwrap_or(Bson::Null);
             if !want.iter().any(|w| w.get("_id") == Some(&id)) {
+                let _unlogged = guard(&id);
                 self.delete_matching(db, views, &bson::doc! {"_id": id}, 1, &Vars::new(), None)?;
             }
         }
@@ -10899,6 +10940,7 @@ impl Storage {
             match have.iter().find(|h| h.get("_id") == Some(&id)) {
                 Some(h) if *h == def => {}
                 Some(_) => {
+                    let _unlogged = guard(&id);
                     self.update_matching(
                         db,
                         views,
@@ -10913,11 +10955,12 @@ impl Storage {
                         false,
                     )?;
                 }
-                None => missing.push(encode_doc(&def)?),
+                None => missing.push((id, encode_doc(&def)?)),
             }
         }
-        if !missing.is_empty() {
-            let (_, errors) = self.insert(db, views, missing, true)?;
+        for (id, doc) in missing {
+            let _unlogged = guard(&id);
+            let (_, errors) = self.insert(db, views, vec![doc], true)?;
             if let Some(e) = errors.first() {
                 return Err(StorageError::Internal(format!("writing {db}.{views}: {e}")));
             }
@@ -11711,13 +11754,20 @@ impl Storage {
         // timestamp, and what it writes before it is untimestamped, over
         // rows earlier writes timestamped (RM-746).
         let _op = self.ddl_scope();
-        self.coll_mod_recording_inner(db, coll, opts, given)?;
-        let defined = {
+        let plain_before = {
             let session = self.conn.open_session()?;
-            coll_options(&session, db, coll)?.is_some_and(|o| defines_view(&o))
+            coll_options(&session, db, coll)?.is_some_and(|o| is_plain_view(&o))
         };
-        if defined {
-            self.after_view_ddl(db, coll)?;
+        if plain_before {
+            self.refuse_blocked_view_ddl(db)?;
+        }
+        self.coll_mod_recording_inner(db, coll, opts, given)?;
+        let options = {
+            let session = self.conn.open_session()?;
+            coll_options(&session, db, coll)?
+        };
+        if let Some(o) = options.filter(defines_view) {
+            self.after_view_ddl(db, coll, is_plain_view(&o))?;
         }
         Ok(())
     }
@@ -11752,7 +11802,9 @@ impl Storage {
             if state_before.contains_key("viewOn") {
                 note_index_keys(Some(0), Some(0));
             }
-            if self.enable_oplog {
+            // A view's `collMod` is logged as the update replacing its
+            // `system.views` document (`after_view_ddl`; RM-745).
+            if self.enable_oplog && !is_plain_view(&state_before) {
                 let ui = collection_uuid(session, db, coll)?;
                 let mut o = Document::new();
                 o.insert("collMod", coll);
@@ -15516,9 +15568,12 @@ impl Storage {
         // timestamp, and what it writes before it is untimestamped, over
         // rows earlier writes timestamped (RM-746).
         let _op = self.ddl_scope();
+        if is_plain_view(options) && !self.collection_exists(db, coll)? {
+            self.refuse_blocked_view_ddl(db)?;
+        }
         let created = self.create_collection_with_options_inner(db, coll, options)?;
         if created && defines_view(options) {
-            self.after_view_ddl(db, coll)?;
+            self.after_view_ddl(db, coll, is_plain_view(options))?;
         }
         Ok(created)
     }
@@ -15571,14 +15626,18 @@ impl Storage {
                         self.unplace_collection(&session, db, coll)?;
                     }
                 }
-                if self.enable_oplog {
+                // A view's create is logged as its `system.views` insert
+                // (`after_view_ddl`; RM-745).
+                if self.enable_oplog && !is_plain_view(options) {
                     self.emit_create_oplog(&session, db, coll, options)?;
                 }
                 Ok(true)
             })
         })
         .inspect(|&created| {
-            if created && defines_view(options) {
+            // A plain view's logged `system.views` insert counts its own
+            // key (RM-745); a time-series definition's is unreplicated.
+            if created && defines_view(options) && !is_plain_view(options) {
                 note_index_keys(Some(1), None);
             }
         })
@@ -15592,13 +15651,16 @@ impl Storage {
         // timestamp, and what it writes before it is untimestamped, over
         // rows earlier writes timestamped (RM-746).
         let _op = self.ddl_scope();
-        let defined = {
+        let options = {
             let session = self.conn.open_session()?;
-            coll_options(&session, db, coll)?.is_some_and(|o| defines_view(&o))
+            coll_options(&session, db, coll)?.filter(defines_view)
         };
+        if options.as_ref().is_some_and(is_plain_view) {
+            self.refuse_blocked_view_ddl(db)?;
+        }
         let existed = self.drop_collection_inner(db, coll)?;
-        if existed && defined {
-            self.after_view_ddl(db, coll)?;
+        if let (true, Some(o)) = (existed, options) {
+            self.after_view_ddl(db, coll, is_plain_view(&o))?;
         }
         Ok(existed)
     }
@@ -15692,8 +15754,10 @@ impl Storage {
                 let Some(options) = coll_options(&session, db, coll)? else {
                     return Ok(false);
                 };
-                defined.set(defines_view(&options));
-                let ui = if self.enable_oplog {
+                defined.set(defines_view(&options) && !is_plain_view(&options));
+                // A view's drop is logged as its `system.views` delete
+                // (`after_view_ddl`), not as a command (RM-745).
+                let ui = if self.enable_oplog && !is_plain_view(&options) {
                     Some(collection_uuid(&session, db, coll)?)
                 } else {
                     None
@@ -17313,6 +17377,9 @@ impl Storage {
         let mut payload_doc = Document::new();
         payload_doc.insert("key", Bson::Document(key_spec.clone()));
         payload_doc.insert("options", Bson::Document(stored_options.clone()));
+        // The spec's field order as mongod writes it, kept so the catalog
+        // lists it so, and a `collMod` appends after `name` (RM-734).
+        payload_doc.insert("specOrder", create_spec_order(stored_options));
         let payload = encode_doc(&payload_doc)?;
         Ok(Some(IndexPlan { payload, entries }))
     }
@@ -17349,6 +17416,8 @@ impl Storage {
         // `o.createIndexes` + `o.indexes[].{v,key,name}`).
         if self.enable_oplog && logged {
             let ui = collection_uuid(session, db, coll)?;
+            // The spec as the catalog lists it: `v`, `unique`, `hidden`,
+            // `prepareUnique`, `key`, `name`, then the rest (RM-734).
             let mut idx = Document::new();
             idx.insert("v", 2i32);
             idx.insert("key", Bson::Document(key_spec.clone()));
@@ -17365,7 +17434,7 @@ impl Storage {
                     idx.insert(k.clone(), v.clone());
                 }
             }
-            self.log_index_build(session, db, coll, &ui, oplog_index_spec(&idx))?;
+            self.log_index_build(session, db, coll, &ui, ordered_create_spec(&idx))?;
         }
         Ok(())
     }
@@ -17740,6 +17809,45 @@ impl Storage {
             .any(|(n, _key_spec, opts)| n == name && opts.get_bool("multikey").unwrap_or(false))
     }
 
+    /// mongod's in-memory index catalog moves an index a `collMod` changed
+    /// to the end of its collection's (RM-734, measured 8.2.11); the durable
+    /// catalog and `listIndexes` keep build order, and a restart forgets it.
+    fn note_index_modified(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+    ) -> Result<()> {
+        let uuid = collection_uuid(session, db, coll)?;
+        let names: Vec<String> = self
+            .iter_indexes(session, db, coll)?
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .collect();
+        let mut map = self.index_order.lock().unwrap_or_else(|e| e.into_inner());
+        let mut order = Self::in_memory_order(map.get(&uuid), names);
+        order.retain(|n| n != name);
+        order.push(name.to_string());
+        map.insert(uuid, order);
+        Ok(())
+    }
+
+    /// `names` (build order) in the order of the in-memory catalog: the
+    /// indexes it holds, in its order, then any made since, in build order.
+    fn in_memory_order(moved: Option<&Vec<String>>, names: Vec<String>) -> Vec<String> {
+        let Some(moved) = moved else {
+            return names;
+        };
+        let mut out: Vec<String> = moved
+            .iter()
+            .filter(|n| names.contains(n))
+            .cloned()
+            .collect();
+        out.extend(names.into_iter().filter(|n| !moved.contains(n)));
+        out
+    }
+
     /// Retune a TTL index's `expireAfterSeconds` option, resolving the index by
     /// name. Returns `false` if there is no such index. Used by `collMod` replay
     /// (`{index: {name, expireAfterSeconds}}`). Mirrors `storage.set_index_expiry`.
@@ -17768,9 +17876,11 @@ impl Storage {
                 Err(e) => return Err(e.into()),
             }
             let mut payload = decode_doc(&cur.get_value_u()?)?;
-            let mut opts = payload.get_document("options").cloned().unwrap_or_default();
-            opts.insert("expireAfterSeconds", expire_after_seconds);
-            payload.insert("options", Bson::Document(opts));
+            apply_index_options(
+                &mut payload,
+                name,
+                &bson::doc! {"expireAfterSeconds": expire_after_seconds},
+            );
             let blob = encode_doc(&payload)?;
             let wcur = session.open_cursor(IDX_TABLE, None)?;
             wcur.set_key_sss(db, coll, name);
@@ -17778,6 +17888,7 @@ impl Storage {
             wcur.update()?;
             // The catalog mongod reads says what the registry says.
             sync_catalog_entry(session, db, coll)?;
+            self.note_index_modified(session, db, coll, name)?;
             Ok(true)
         })
     }
@@ -17813,11 +17924,7 @@ impl Storage {
                 Err(e) => return Err(e.into()),
             }
             let mut payload = decode_doc(&cur.get_value_u()?)?;
-            let mut opts = payload.get_document("options").cloned().unwrap_or_default();
-            for (k, v) in new_opts {
-                opts.insert(k.clone(), v.clone());
-            }
-            payload.insert("options", Bson::Document(opts));
+            apply_index_options(&mut payload, name, new_opts);
             let blob = encode_doc(&payload)?;
             let wcur = session.open_cursor(IDX_TABLE, None)?;
             wcur.set_key_sss(db, coll, name);
@@ -17825,6 +17932,7 @@ impl Storage {
             wcur.update()?;
             // The catalog mongod reads says what the registry says.
             sync_catalog_entry(session, db, coll)?;
+            self.note_index_modified(session, db, coll, name)?;
             Ok(true)
         })
     }
@@ -17919,6 +18027,13 @@ impl Storage {
                 let key_spec = payload.get_document("key").cloned().unwrap_or_default();
                 let spec = index_event_spec(&payload, name);
                 c.remove()?;
+                // Its place in mongod's in-memory order goes with it.
+                if let Ok(uuid) = collection_uuid(&session, db, coll) {
+                    let mut map = self.index_order.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(held) = map.get_mut(&uuid) {
+                        held.retain(|n| n != name);
+                    }
+                }
                 // Its entries are in its own table, dropped once this
                 // commits and nothing reads it.
                 self.unplace_index(&session, db, coll, name)?;
@@ -17963,16 +18078,41 @@ impl Storage {
         let _gen = self.ddl_generation_scope();
         // One statement transaction across all the drops (registry rows, entry
         // rows, oplog entries) — same crash-atomicity as `drop_index`.
-        self.retry_write_conflicts("drop_all_indexes", || {
+        let dropped = self.retry_write_conflicts("drop_all_indexes", || {
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                let dropped: Vec<(String, Document, Document)> = self
-                    .iter_indexes(&session, db, coll)?
+                // Dropped in mongod's in-memory catalog order, which a
+                // `collMod` of an index changes (RM-734).
+                let mut listed = self.iter_indexes(&session, db, coll)?;
+                if let Ok(uuid) = collection_uuid(&session, db, coll) {
+                    let map = self.index_order.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(held) = map.get(&uuid).cloned() {
+                        let names: Vec<String> = listed.iter().map(|(n, _, _)| n.clone()).collect();
+                        let order = Self::in_memory_order(Some(&held), names);
+                        listed.sort_by_key(|(n, _, _)| order.iter().position(|o| o == n));
+                    }
+                }
+                let dropped: Vec<(String, Document, Document)> = listed
                     .into_iter()
                     .map(|(n, key_spec, opts)| {
+                        // The registry row itself, which holds the spec's
+                        // field order.
                         let mut payload = Document::new();
                         payload.insert("key", Bson::Document(key_spec.clone()));
                         payload.insert("options", Bson::Document(opts));
+                        if let Ok(cur) = session.open_cursor(IDX_TABLE, None) {
+                            cur.set_key_sss(db, coll, &n);
+                            if cur.search().is_ok() {
+                                if let Some(order) = cur
+                                    .get_value_u()
+                                    .ok()
+                                    .and_then(|b| decode_doc(&b).ok())
+                                    .and_then(|row| row.get("specOrder").cloned())
+                                {
+                                    payload.insert("specOrder", order);
+                                }
+                            }
+                        }
                         let spec = index_event_spec(&payload, &n);
                         (n, key_spec, spec)
                     })
@@ -18011,7 +18151,18 @@ impl Storage {
                 }
                 Ok(dropped.len())
             })
-        })
+        })?;
+        // No index is left to have a place in the in-memory order.
+        {
+            let session = self.conn.open_session()?;
+            if let Ok(uuid) = collection_uuid(&session, db, coll) {
+                self.index_order
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&uuid);
+            }
+        }
+        Ok(dropped)
     }
 
     /// The indexes a QUERY may use: every index that is not hidden. A hidden
@@ -25886,12 +26037,8 @@ fn sync_catalog_entry(session: &Session, db: &str, coll: &str) -> Result<()> {
     for (name, payload) in rows {
         let key = payload.get_document("key").cloned().unwrap_or_default();
         let opts = payload.get_document("options").cloned().unwrap_or_default();
-        let mut spec = bson::doc! {"v": 2i32, "key": key.clone(), "name": name.as_str()};
-        for (k, v) in index_event_spec(&payload, &name) {
-            if !matches!(k.as_str(), "v" | "key" | "name") {
-                spec.insert(k, v);
-            }
-        }
+        // The fields in the order mongod keeps them (RM-734).
+        let spec = index_event_spec(&payload, &name);
         // Per key field, the array prefixes recorded for it: a prefix of n
         // components marks component n - 1 (mongod's `MultikeyPaths`).
         let mut components = Vec::new();
@@ -25962,8 +26109,12 @@ fn sync_catalog_entry(session: &Session, db: &str, coll: &str) -> Result<()> {
         }
     }
     // A row that already says this is left alone: no write, no conflict.
-    if mdb_catalog::read_entry(session, placement.catalog_id)?.as_ref() == Some(&entry) {
-        return Ok(());
+    // Compared as bytes: `Document`'s equality ignores field order, and the
+    // order of an index's spec is part of what is kept (RM-734).
+    if let Some(have) = mdb_catalog::read_entry(session, placement.catalog_id)? {
+        if encode_doc(&have)? == encode_doc(&entry)? {
+            return Ok(());
+        }
     }
     mdb_catalog::write_entry(session, placement.catalog_id, &entry)
 }
@@ -25979,35 +26130,171 @@ fn collection_registered(session: &Session, db: &str, coll: &str) -> Result<bool
 }
 
 /// Register `(db, coll)` in the collections table if not already present.
-/// An index as a change event describes it: `v`, its options, then `key`
-/// and `name` (mongod 8.2.11's order). Internal catalog flags are left out.
+/// Options only this server's registry carries: not part of an index's spec.
+fn is_internal_index_option(k: &str) -> bool {
+    matches!(
+        k,
+        "v" | "key"
+            | "name"
+            | "ns"
+            | "multikey"
+            | "binDataOrder"
+            | "collationKeys"
+            | "buildSeq"
+            | "multikeyPaths"
+            | "timeseriesOriginalSpec"
+    )
+}
+
+/// The options mongod's `IndexSpec` writes ahead of `key`, in its order.
+const SPEC_BEFORE_KEY: [&str; 3] = ["unique", "hidden", "prepareUnique"];
+
+/// The field order of a new index's spec as mongod 8.2.11 writes it (and
+/// logs it): `v`, then `unique`, `hidden` and `prepareUnique` when given,
+/// `key`, `name`, then every other option in the order the registry holds
+/// them. `options` holds user options and this server's own flags; those
+/// are left out.
+fn create_spec_order(options: &Document) -> Bson {
+    let mut order: Vec<Bson> = vec![Bson::String("v".into())];
+    for f in SPEC_BEFORE_KEY {
+        if options.contains_key(f) {
+            order.push(Bson::String(f.into()));
+        }
+    }
+    order.push(Bson::String("key".into()));
+    order.push(Bson::String("name".into()));
+    for (k, _) in options {
+        if !is_internal_index_option(k) && !SPEC_BEFORE_KEY.contains(&k.as_str()) {
+            order.push(Bson::String(k.clone()));
+        }
+    }
+    Bson::Array(order)
+}
+
+/// `spec` with its fields in [`create_spec_order`]'s order.
+pub(crate) fn ordered_create_spec(spec: &Document) -> Document {
+    let mut out = Document::new();
+    for f in std::iter::once("v").chain(SPEC_BEFORE_KEY) {
+        if let Some(v) = spec.get(f) {
+            out.insert(f, v.clone());
+        }
+    }
+    for f in ["key", "name"] {
+        if let Some(v) = spec.get(f) {
+            out.insert(f, v.clone());
+        }
+    }
+    for (k, v) in spec {
+        if !out.contains_key(k) {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    out
+}
+
+/// An index as mongod's catalog, and its change events, describe it: the
+/// fields in the order its registry row recorded (`specOrder`: where mongod
+/// wrote them at creation, and after `name` for what a `collMod` added),
+/// internal flags left out. A row made before `specOrder` was kept gets the
+/// order a new index of its options would.
 fn index_event_spec(payload: &Document, name: &str) -> Document {
+    let options = payload.get_document("options").cloned().unwrap_or_default();
+    let key = payload.get_document("key").cloned().unwrap_or_default();
+    let order: Vec<String> = match payload.get_array("specOrder") {
+        Ok(a) => a
+            .iter()
+            .filter_map(|b| b.as_str().map(str::to_string))
+            .collect(),
+        Err(_) => match create_spec_order(&options) {
+            Bson::Array(a) => a
+                .into_iter()
+                .filter_map(|b| b.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        },
+    };
     let mut spec = Document::new();
-    spec.insert("v", 2i32);
-    if let Ok(options) = payload.get_document("options") {
-        for (k, v) in options {
-            if !matches!(
-                k.as_str(),
-                "v" | "key"
-                    | "name"
-                    | "ns"
-                    | "multikey"
-                    | "binDataOrder"
-                    | "collationKeys"
-                    | "buildSeq"
-                    | "multikeyPaths"
-                    | "timeseriesOriginalSpec"
-            ) {
-                spec.insert(k.clone(), v.clone());
+    for field in &order {
+        match field.as_str() {
+            "v" => {
+                spec.insert("v", 2i32);
+            }
+            "key" => {
+                spec.insert("key", Bson::Document(key.clone()));
+            }
+            "name" => {
+                spec.insert("name", name);
+            }
+            k => {
+                if let Some(v) = options.get(k) {
+                    if !is_internal_index_option(k) {
+                        spec.insert(k, v.clone());
+                    }
+                }
             }
         }
     }
-    spec.insert(
-        "key",
-        Bson::Document(payload.get_document("key").cloned().unwrap_or_default()),
-    );
-    spec.insert("name", name);
+    // A row whose order misses an option (or `v`, `key`, `name`) lists it
+    // after the rest.
+    for (k, v) in &options {
+        if !is_internal_index_option(k) && !spec.contains_key(k) {
+            spec.insert(k.clone(), v.clone());
+        }
+    }
+    for (f, v) in [
+        ("v", Bson::Int32(2)),
+        ("key", Bson::Document(key)),
+        ("name", Bson::String(name.to_string())),
+    ] {
+        if !spec.contains_key(f) {
+            spec.insert(f, v);
+        }
+    }
     spec
+}
+
+/// What a `collMod` of an index does to its registry row: each option is
+/// set, where an option set to its default (`hidden`, `prepareUnique`,
+/// `unique` false) is removed, as mongod removes it from the spec. An option
+/// the spec did not hold is written after the others (after `name`); one it
+/// held keeps its place, except `expireAfterSeconds`, which moves to the
+/// end (RM-734, measured 8.2.11).
+fn apply_index_options(payload: &mut Document, name: &str, new_opts: &Document) {
+    let mut opts = payload.get_document("options").cloned().unwrap_or_default();
+    let mut order: Vec<Bson> = match payload.get_array("specOrder") {
+        Ok(a) => a.clone(),
+        Err(_) => spec_order_of(payload, name),
+    };
+    for (k, v) in new_opts {
+        let default = matches!(k.as_str(), "hidden" | "prepareUnique" | "unique")
+            && v == &Bson::Boolean(false);
+        if default {
+            opts.remove(k);
+            order.retain(|f| f.as_str() != Some(k.as_str()));
+        } else {
+            // mongod rewrites the TTL setting by removing the field and
+            // writing it again, so it moves to the end of the spec (and of
+            // `listIndexes`' options), where it was.
+            if k == "expireAfterSeconds" {
+                opts.remove(k);
+                order.retain(|f| f.as_str() != Some(k.as_str()));
+            }
+            if !opts.contains_key(k) && !order.iter().any(|f| f.as_str() == Some(k.as_str())) {
+                order.push(Bson::String(k.clone()));
+            }
+            opts.insert(k.clone(), v.clone());
+        }
+    }
+    payload.insert("options", Bson::Document(opts));
+    payload.insert("specOrder", Bson::Array(order));
+}
+
+/// The `specOrder` of a row that has none, as it would list now.
+fn spec_order_of(payload: &Document, name: &str) -> Vec<Bson> {
+    index_event_spec(payload, name)
+        .keys()
+        .map(|k| Bson::String(k.clone()))
+        .collect()
 }
 
 /// Register the collection if it is not registered, answering whether it was

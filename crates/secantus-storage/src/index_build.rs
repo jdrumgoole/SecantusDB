@@ -292,7 +292,7 @@ impl ActiveBuild {
     fn oplog_specs(&self) -> Vec<Bson> {
         self.indexes
             .iter()
-            .map(|ix| Bson::Document(oplog_index_spec(&ix.spec())))
+            .map(|ix| Bson::Document(crate::ordered_create_spec(&ix.spec())))
             .collect()
     }
 }

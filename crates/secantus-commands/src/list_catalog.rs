@@ -188,6 +188,24 @@ fn collection_entry(
         if let Some(table) = storage.index_ident(db, name, &index) {
             idx_ident.insert(index.clone(), table);
         }
+        // The fields in the order the durable catalog keeps (RM-734).
+        let spec = match storage.index_catalog_spec(db, name, &index) {
+            Some(order) => {
+                let mut out = Document::new();
+                for k in order.keys() {
+                    if let Some(v) = spec.get(k) {
+                        out.insert(k.clone(), v.clone());
+                    }
+                }
+                for (k, v) in &spec {
+                    if !out.contains_key(k) {
+                        out.insert(k.clone(), v.clone());
+                    }
+                }
+                out
+            }
+            None => spec,
+        };
         md_indexes.push(Bson::Document(doc! {
             "spec": spec,
             "ready": true,

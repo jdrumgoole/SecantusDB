@@ -159,11 +159,20 @@ fn a_point_below_the_stable_timestamp_truncates_after_the_stable_timestamp() {
         std::thread::sleep(std::time::Duration::from_millis(200));
         st.insert_one("app", "c", &enc(&doc! {"_id": 2})).unwrap();
         st.flush_oplog();
-        // The periodic stable checkpoint takes the second insert.
-        let before = st.stable_checkpoint_seq();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while st.stable_checkpoint_seq() == before {
-            assert!(std::time::Instant::now() < deadline, "no stable checkpoint");
+        // The periodic stable checkpoint takes the second insert: the first
+        // one whose stable timestamp reaches the entry. A change of the seq
+        // is not enough -- a round already running when the insert committed
+        // set its stable timestamp before it, and stores the entry before it
+        // (the first round's seq differs from the store's initial one), so
+        // the seq moving can name a checkpoint that does not hold the insert.
+        let want = st.oplog_visible_tail_seq();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while st.stable_checkpoint_seq() < want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no stable checkpoint reached {want}: it is at {}",
+                st.stable_checkpoint_seq()
+            );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         st.insert_one("app", "c", &enc(&doc! {"_id": 3})).unwrap();
@@ -178,10 +187,15 @@ fn a_point_below_the_stable_timestamp_truncates_after_the_stable_timestamp() {
     );
     let st = open(&home, &opts);
     let truncation = st.open_record().oplog_truncation.expect("truncated");
-    assert!(truncation.after > truncation.point, "{truncation:?}");
-    assert_eq!(truncation.after, st.open_record().recovery_timestamp);
-    assert_eq!(truncation.removed, 1);
-    assert_eq!((has(&st, 1), has(&st, 2), has(&st, 3)), (true, true, false));
+    let recovery = st.open_record().recovery_timestamp;
+    let seen = (has(&st, 1), has(&st, 2), has(&st, 3));
+    assert!(
+        truncation.after > truncation.point,
+        "{truncation:?} recovery_timestamp={recovery:?}"
+    );
+    assert_eq!(truncation.after, recovery, "{truncation:?}");
+    assert_eq!(truncation.removed, 1, "{truncation:?} kept={seen:?}");
+    assert_eq!(seen, (true, true, false), "{truncation:?}");
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }

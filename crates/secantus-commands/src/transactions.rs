@@ -724,21 +724,31 @@ impl TransactionRegistry {
     /// of a committed transaction, which drivers send); `Some(reply)` for a
     /// state error.
     pub fn commit(&self, lsid_bytes: &[u8], txn_number: i64) -> Option<Document> {
+        self.commit_noting_first(lsid_bytes, txn_number).0
+    }
+
+    /// [`commit`](Self::commit), and whether this call is the one that
+    /// committed the transaction (not a repeated commit of a committed one).
+    pub fn commit_noting_first(
+        &self,
+        lsid_bytes: &[u8],
+        txn_number: i64,
+    ) -> (Option<Document>, bool) {
         let c = match self.ending(lsid_bytes, txn_number) {
             Ok(c) => c,
-            Err(reply) => return Some(reply),
+            Err(reply) => return (Some(reply), false),
         };
         let mut t = c.lock().unwrap_or_else(|e| e.into_inner());
         match t.state {
-            TxnState::Committed => None,
-            TxnState::Aborted => Some(transaction_aborted(txn_number)),
+            TxnState::Committed => (None, false),
+            TxnState::Aborted => (Some(transaction_aborted(txn_number)), false),
             TxnState::InProgress => {
                 t.last_use = (self.clock)();
                 match (self.commit)(&mut t) {
                     Ok(()) => {
                         t.state = TxnState::Committed;
                         self.ended(&t, true);
-                        None
+                        (None, true)
                     }
                     // Nothing of it was committed: the transaction is over,
                     // and the client is told why.
@@ -750,7 +760,7 @@ impl TransactionRegistry {
                         if crate::failpoints::is_transient_txn_code(code) {
                             add_label_first(&mut reply, TRANSIENT_LABEL);
                         }
-                        Some(reply)
+                        (Some(reply), false)
                     }
                 }
             }
