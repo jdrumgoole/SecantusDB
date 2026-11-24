@@ -46,12 +46,12 @@ use secantus_core::order::{with_bindata_order, BinDataOrder};
 use secantus_core::query::matches as query_matches;
 pub use secantus_core::recordid::RecordId;
 use secantus_core::sortkey::{self, COMPOUND_SEP, RANK_MINKEY};
+use secantus_core::wildcard::{self, is_wildcard_spec};
 use secantus_core::{get_path, get_path_values};
 /// The engine error [`StorageError::Wt`] carries, nameable by the crates
 /// that see it (a [`ReadFault`] in a test builds one).
 pub use secantus_wt::WtError;
 use secantus_wt::{Connection, Cursor, Session};
-use wildcard::is_wildcard_spec;
 
 /// The literal BSON decoder, for the crates that depend on this one.
 pub use secantus_core::bsondoc;
@@ -77,7 +77,6 @@ pub mod mdb_catalog;
 mod scan_bounds;
 mod sizes;
 pub mod store_format;
-mod wildcard;
 
 pub use catalog_changes::CatalogChange;
 pub use index_build::{IndexBuildAbort, IndexBuildInfo, IndexBuildSpec};
@@ -2371,8 +2370,12 @@ impl IndexDesc {
             }
             return (false, paths);
         }
-        if is_wildcard_spec(&self.key_spec) {
-            let makes = !self.wildcard_multikey_paths(doc).is_empty();
+        if let Some(w) = &self.wildcard {
+            // The paths the index holds multikey metadata keys for: what
+            // the planner needs to know of its entry for a queried path.
+            let arrays = self.wildcard_multikey_paths(doc);
+            let makes = !arrays.is_empty();
+            paths[w.at] = arrays.into_iter().collect();
             return (makes, paths);
         }
         for (field, parts) in self.key_spec.keys().zip(paths.iter_mut()) {
@@ -21737,8 +21740,22 @@ impl Storage {
             .find(|(n, _, _)| n == name)
             .map(|(_, _, opts)| stored_multikey_paths(&opts, key_spec))
             .unwrap_or_else(|| vec![Vec::new(); key_spec.len()]);
+        let wildcard = self
+            .iter_indexes(session, db, coll)?
+            .into_iter()
+            .find(|(n, _, _)| n == name)
+            .and_then(|(_, _, opts)| WildcardDesc::parse(key_spec, &opts));
         for (_recordid, blob) in self.scan_docs(session, db, coll)? {
             let d = decode_doc(&blob)?;
+            if let Some(w) = &wildcard {
+                // A wildcard index's arrays are where its metadata keys are.
+                for path in wildcard::leaves(&d, &w.projection).multikey {
+                    if !found[w.at].contains(&path) {
+                        found[w.at].push(path);
+                    }
+                }
+                continue;
+            }
             for (field, parts) in key_spec.keys().zip(found.iter_mut()) {
                 array_components(&d, field, parts);
             }

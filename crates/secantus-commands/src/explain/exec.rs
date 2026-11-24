@@ -205,8 +205,55 @@ pub(crate) fn entries(index: &IndexInfo, backward: bool, env: &Env) -> Vec<Entry
     let collation = index.collation.as_ref();
     let partial = index.partial.clone();
     let mut out: Vec<Entry> = Vec::with_capacity(env.docs.len());
+    let reversed = |dir: i64| (dir < 0) != backward;
     for (row, doc) in env.docs.iter().enumerate() {
         if partial.is_some() && !env.matches(row, &partial) {
+            continue;
+        }
+        // A wildcard index's entries (an entry of it for one path reads them all): `$_path`, then the value
+        // under it, one key for each leaf the document holds.
+        if let Some(wild) = index.wildcard.as_ref().filter(|w| w.path.is_some()) {
+            let mut keys: Vec<Vec<Vec<u8>>> =
+                secantus_core::wildcard::leaves(doc, &wild.projection)
+                    .keys
+                    .into_iter()
+                    .map(|(p, v)| {
+                        vec![
+                            directed(&Bson::String(p), false, None),
+                            directed(&v, reversed(fields[1].1), collation),
+                        ]
+                    })
+                    .collect();
+            keys.sort();
+            keys.dedup();
+            out.extend(keys.into_iter().map(|k| (k, row)));
+            continue;
+        }
+        // A geo index's entries: the cells (or geohashes) of its geo
+        // field, and the other fields' keys.
+        if let Some(geo) = &index.geo {
+            use secantus_core::geoorder::KeyPart;
+            let mut keys: Vec<Vec<Vec<u8>>> = geo
+                .keys(doc)
+                .into_iter()
+                .map(|key| {
+                    key.into_iter()
+                        .zip(&fields)
+                        .map(|(part, (_, dir))| match part {
+                            KeyPart::Cell(c) => sort_key(&Bson::Int64(c)),
+                            KeyPart::Hash(h) => sort_key(&Bson::Binary(bson::Binary {
+                                subtype: bson::spec::BinarySubtype::UserDefined(128),
+                                bytes: h.to_be_bytes().to_vec(),
+                            })),
+                            KeyPart::Value(bytes) if reversed(*dir) => reversed_key(&bytes),
+                            KeyPart::Value(bytes) => bytes,
+                        })
+                        .collect()
+                })
+                .collect();
+            keys.sort();
+            keys.dedup();
+            out.extend(keys.into_iter().map(|k| (k, row)));
             continue;
         }
         let per_field: Vec<Vec<Bson>> = fields
@@ -228,7 +275,6 @@ pub(crate) fn entries(index: &IndexInfo, backward: bool, env: &Env) -> Vec<Entry
                 }
             })
             .collect();
-        let reversed = |dir: i64| (dir < 0) != backward;
         // One value a field: one key, built directly.
         if per_field.iter().all(|values| values.len() <= 1) {
             let key = per_field

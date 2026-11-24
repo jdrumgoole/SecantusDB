@@ -29,9 +29,35 @@ pub(crate) struct IndexInfo {
     pub plain: bool,
     /// A `2d` or `2dsphere` index as mongod keys it, its ring search reads.
     pub geo: Option<secantus_core::geoorder::GeoIndex>,
+    /// A wildcard index; see [`Wildcard`].
+    pub wildcard: Option<Arc<Wildcard>>,
+}
+
+/// What the planner knows of a wildcard index, which it plans one path at
+/// a time: mongod expands the index into an entry per queried path, keyed
+/// `{$_path: 1, <path>: 1}` (`expandWildcardIndexEntry`).
+#[derive(Clone, Debug)]
+pub(crate) struct Wildcard {
+    /// The paths the index keys.
+    pub projection: secantus_core::wildcard::Projection,
+    /// Every dotted path some document holds an array at (the paths of its
+    /// multikey metadata keys).
+    pub arrays: std::collections::BTreeSet<String>,
+    /// For the entry of one queried path: that path.
+    pub path: Option<String>,
 }
 
 impl IndexInfo {
+    /// A wildcard index itself, not yet expanded to a path.
+    pub fn is_wildcard_base(&self) -> bool {
+        self.wildcard.as_ref().is_some_and(|w| w.path.is_none())
+    }
+
+    /// A `2d` index: mongod tracks no multikey paths for it.
+    pub fn is_two_d(&self) -> bool {
+        self.key.values().any(|v| v.as_str() == Some("2d"))
+    }
+
     pub fn is_multikey(&self) -> bool {
         self.multikey_paths.iter().any(|p| !p.is_empty())
     }
@@ -83,7 +109,7 @@ impl IndexInfo {
         out.insert("isMultiKey", self.is_multikey());
         // The `_id` index cannot be multikey, and mongod prints no paths for
         // it, nor for an index with a hashed field (it tracks none).
-        if self.name != "_id_" && !self.has_hashed() {
+        if self.name != "_id_" && !self.has_hashed() && !self.is_two_d() {
             let mut paths = Document::new();
             for (field, parts) in self.key.keys().zip(&self.multikey_paths) {
                 paths.insert(
