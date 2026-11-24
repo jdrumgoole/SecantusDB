@@ -2928,15 +2928,6 @@ wrote and stopped (the forward direction of RM-723).
 Each was measured by running the same writes on mongod 8.2.11 and on
 `secantusd-mdb`, one-member sets, and reading what each logged.
 
-- [ ] **The initiation logs no creation of `config.system.preimages`.**
-      mongod's initiation logs every collection it creates, the pre-images
-      collection's as `{op: "c", ns: "config.$cmd", o: {create:
-      "system.preimages", clusteredIndex: ...}}`; this server creates it
-      unreplicated, with no entry, so a mongod replaying this oplog from
-      genesis has no such `create`. (The initiation's other differences:
-      no `new primary` no-op, RM-735; no `admin.system.keys` documents.)
-      Verify: tests/backlog/test_rm_storage_model.py::test_the_initiation_logs_the_pre_images_collection
-      Backlog-ID: RM-748
 
 ## Found in CI on 2026-11-19
 

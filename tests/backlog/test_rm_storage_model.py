@@ -1504,13 +1504,13 @@ def test_a_read_only_transaction_logs_its_majority_no_op(tmp_path: Path) -> None
     ]
 
 
-@pytest.mark.backlog("RM-748")
+@pytest.mark.backlog_fixed("RM-748")
 def test_the_initiation_logs_the_pre_images_collection(tmp_path: Path) -> None:
     """mongod 8.2.11's initiation logs the creation of
     `config.system.preimages` (`{op: "c", ns: "config.$cmd", o: {create:
     "system.preimages", clusteredIndex: ...}}`, measured 2026-11-22), as it
-    logs every collection it creates then. This server creates it
-    unreplicated, with no entry."""
+    logs every collection it creates then. This server created it
+    unreplicated, with no entry, until RM-748 was fixed."""
     with rust_mongo_server(tmp_path / "store") as client:
         creates = [
             e["o"]["create"]
