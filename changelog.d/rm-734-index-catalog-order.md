@@ -20,11 +20,14 @@ listed with the option `collMod` added after `name`, as `mongod` 8.2.11 does.
   kept in `_mdb_catalog` as written, taken from the spec when a `mongod`
   store is opened, and written the same way into the `createIndexes` and
   `dropIndexes` entries. `collMod` writes `hidden: false` and
-  `prepareUnique: false` as no field, as mongod does, and applies
-  `expireAfterSeconds` before `hidden` whatever order the command gave them.
+  `prepareUnique: false` as no field, as mongod does, writes a changed
+  `expireAfterSeconds` last (mongod removes the field and writes it again),
+  and applies it before `hidden` whatever order the command gave them.
   The order of the in-memory catalog is kept in memory, keyed by the
   collection's UUID.
 - `$listCatalog` lists each spec in that order.
+- A `mongod` store holding an index armed with `collMod`'s `prepareUnique`
+  is served, where it was refused by name.
 - The store format does not move: a store written before reads as it did, and
   has its catalog rows rewritten in the new order when it is opened.
 

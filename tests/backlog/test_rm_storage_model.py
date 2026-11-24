@@ -442,6 +442,125 @@ def test_secantus_opens_a_mongod_store(tmp_path: Path) -> None:
         assert indexes == ("ok", ["_id_", "a_1"])
 
 
+def _collmodded_indexes(client: Any) -> None:
+    """Indexes a `collMod` has changed, which mongod keeps in its catalog in
+    build order with the spec fields as it wrote them (RM-734)."""
+    db = client["app"]
+    coll = db.create_collection("c")
+    coll.insert_many([{"_id": i, "a": i, "b": i, "d": i} for i in range(5)])
+    db.command(
+        "createIndexes",
+        "c",
+        indexes=[
+            {"name": "a_1", "key": {"a": 1}, "unique": True},
+            {"name": "b_1", "key": {"b": 1}},
+            {"name": "d_1", "key": {"d": 1}, "hidden": True},
+            {"name": "e_1", "key": {"e": 1}},
+        ],
+    )
+    db.command("collMod", "c", index={"name": "e_1", "prepareUnique": True})
+    db.command("collMod", "c", index={"name": "a_1", "hidden": True})
+    db.command("collMod", "c", index={"name": "b_1", "expireAfterSeconds": 100})
+    db.command("collMod", "c", index={"name": "d_1", "hidden": False})
+
+
+def _catalog_specs(client: Any) -> list[list[tuple[str, Any]]]:
+    out = []
+    for entry in client["app"]["c"].aggregate([{"$listCatalog": {}}]):
+        for ix in entry["md"]["indexes"]:
+            out.append(list(ix["spec"].items()))
+    return out
+
+
+def _drop_order_after_a_restart(store: Path, port: int | None) -> list[str]:
+    """The `dropIndexes: "*"` entries of the oplog, in the order logged, once
+    `store` is opened by mongod (so with no in-memory order moved)."""
+    proc, client = _mongod_on(store, port, SECANTUS_SET if port else "rs0")
+    try:
+        assert client is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            _until_primary(client)
+            client["app"]["c"].drop_indexes()
+            rows = client["local"]["oplog.rs"].find({"o.dropIndexes": "c"}).sort("$natural", 1)
+            return [r["o"]["index"] for r in rows][-4:]
+    finally:
+        _stop_mongod(proc, client)
+
+
+@pytest.mark.backlog_fixed("RM-734")
+def test_mongod_opens_the_collmodded_indexes_secantus_wrote(tmp_path: Path) -> None:
+    """A store `secantusd-mdb` wrote, with indexes a `collMod` changed, is a
+    store mongod 8.2.11 validates and reads in the same catalog order (build
+    order), the spec fields as they were written."""
+    store = tmp_path / "store"
+    with rust_mongo_server(store) as client:
+        _collmodded_indexes(client)
+        ours = _catalog_specs(client)
+        port = client.address[1]
+    assert [[k for k, _ in spec] for spec in ours] == [
+        ["v", "key", "name"],
+        ["v", "unique", "key", "name", "hidden"],
+        ["v", "key", "name", "expireAfterSeconds"],
+        ["v", "key", "name"],
+        ["v", "key", "name", "prepareUnique"],
+    ]
+    proc, client = _mongod_on(store, port, SECANTUS_SET)
+    try:
+        assert client is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            _until_primary(client)
+            assert _catalog_specs(client) == ours
+            result = client["app"].command("validate", "c", full=True)
+            assert (result["valid"], result["nrecords"]) == (True, 5)
+    finally:
+        _stop_mongod(proc, client)
+    assert _drop_order_after_a_restart(store, port) == ["a_1", "b_1", "d_1", "e_1"]
+
+
+@pytest.mark.backlog_fixed("RM-734")
+def test_secantus_keeps_the_catalog_order_of_collmodded_indexes_mongod_wrote(
+    tmp_path: Path,
+) -> None:
+    """A store mongod 8.2.11 wrote, with indexes a `collMod` changed, opened
+    by `secantusd-mdb`: the same specs in the same field order, `dropIndexes:
+    "*"` in build order, and a `collMod` of its own moves one to the end."""
+    seen: dict[str, Any] = {}
+
+    def setup(client: Any) -> None:
+        _collmodded_indexes(client)
+        seen["catalog"] = _catalog_specs(client)
+
+    store = _mongod_store(tmp_path, setup)
+    with rust_mongo_server(store) as rust:
+        assert _catalog_specs(rust) == seen["catalog"]
+        assert [i["name"] for i in rust["app"]["c"].list_indexes()] == [
+            "_id_",
+            "a_1",
+            "b_1",
+            "d_1",
+            "e_1",
+        ]
+    # This server's own `collMod` of what mongod wrote unhides `a_1` (its
+    # field goes) and moves it to the end of the drop order.
+    with rust_mongo_server(store) as rust:
+        rust["app"].command("collMod", "c", index={"name": "a_1", "hidden": False})
+        assert _catalog_specs(rust)[1] == [
+            ("v", 2),
+            ("unique", True),
+            ("key", {"a": 1}),
+            ("name", "a_1"),
+        ]
+        with rust["app"].watch(show_expanded_events=True, max_await_time_ms=200) as stream:
+            rust["app"]["c"].drop_indexes()
+            names = []
+            end = time.monotonic() + 10
+            while len(names) < 4 and time.monotonic() < end:
+                ev = stream.try_next()
+                if ev is not None and ev["operationType"] == "dropIndexes":
+                    names.append(ev["operationDescription"]["indexes"][0]["name"])
+        assert names == ["b_1", "d_1", "e_1", "a_1"]
+
+
 @pytest.mark.backlog("RM-735")
 def test_a_restart_raises_the_election_term(tmp_path: Path) -> None:
     """mongod 8.2.11 (measured 2026-11-20,

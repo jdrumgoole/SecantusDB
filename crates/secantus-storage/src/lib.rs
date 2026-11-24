@@ -10603,7 +10603,10 @@ impl Storage {
         let cur = session.open_cursor(IDX_TABLE, None)?;
         cur.set_key_sss(db, coll, name);
         match cur.search() {
-            Ok(()) => Ok(Some(index_event_spec(&decode_doc(&cur.get_value_u()?)?, name))),
+            Ok(()) => Ok(Some(index_event_spec(
+                &decode_doc(&cur.get_value_u()?)?,
+                name,
+            ))),
             Err(e) if e.is_not_found() => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -17836,7 +17839,11 @@ impl Storage {
         let Some(moved) = moved else {
             return names;
         };
-        let mut out: Vec<String> = moved.iter().filter(|n| names.contains(n)).cloned().collect();
+        let mut out: Vec<String> = moved
+            .iter()
+            .filter(|n| names.contains(n))
+            .cloned()
+            .collect();
         out.extend(names.into_iter().filter(|n| !moved.contains(n)));
         out
     }
@@ -26250,7 +26257,8 @@ fn index_event_spec(payload: &Document, name: &str) -> Document {
 /// set, where an option set to its default (`hidden`, `prepareUnique`,
 /// `unique` false) is removed, as mongod removes it from the spec. An option
 /// the spec did not hold is written after the others (after `name`); one it
-/// held keeps its place (RM-734, measured 8.2.11).
+/// held keeps its place, except `expireAfterSeconds`, which moves to the
+/// end (RM-734, measured 8.2.11).
 fn apply_index_options(payload: &mut Document, name: &str, new_opts: &Document) {
     let mut opts = payload.get_document("options").cloned().unwrap_or_default();
     let mut order: Vec<Bson> = match payload.get_array("specOrder") {
@@ -26264,6 +26272,13 @@ fn apply_index_options(payload: &mut Document, name: &str, new_opts: &Document) 
             opts.remove(k);
             order.retain(|f| f.as_str() != Some(k.as_str()));
         } else {
+            // mongod rewrites the TTL setting by removing the field and
+            // writing it again, so it moves to the end of the spec (and of
+            // `listIndexes`' options), where it was.
+            if k == "expireAfterSeconds" {
+                opts.remove(k);
+                order.retain(|f| f.as_str() != Some(k.as_str()));
+            }
             if !opts.contains_key(k) && !order.iter().any(|f| f.as_str() == Some(k.as_str())) {
                 order.push(Bson::String(k.clone()));
             }

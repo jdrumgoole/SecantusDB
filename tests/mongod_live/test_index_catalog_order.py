@@ -16,7 +16,6 @@ import time
 import uuid
 from typing import Any
 
-import pymongo
 import pytest
 
 from tests.mongod_live.conftest import same
@@ -51,6 +50,14 @@ def _hidden_first(co: Any) -> None:
         {"name": "e_1", "key": {"e": 1}, "hidden": True},
         {"name": "a_1", "key": {"a": 1}},
         {"name": "b_1", "key": {"b": 1}},
+    )
+
+
+def _ttl_sparse(co: Any) -> None:
+    _setup(
+        co,
+        {"name": "d_1", "key": {"d": 1}, "expireAfterSeconds": 100, "sparse": True},
+        {"name": "a_1", "key": {"a": 1}},
     )
 
 
@@ -92,6 +99,7 @@ _SCENARIOS = {
     "expire-added": (_plain, [_a(expireAfterSeconds=5)]),
     "expire-changed": (_ttl_first, [{"name": "d_1", "expireAfterSeconds": 200}]),
     "expire-the-same": (_ttl_first, [{"name": "d_1", "expireAfterSeconds": 100}]),
+    "expire-changed-after-sparse": (_ttl_sparse, [{"name": "d_1", "expireAfterSeconds": 9}]),
     "expire-and-hide-in-one": (_plain, [_a(hidden=True, expireAfterSeconds=5)]),
     "hide-and-expire-in-one": (_plain, [_a(expireAfterSeconds=5, hidden=True)]),
     "hide-then-prepare-unique": (_plain, [_a(hidden=True), _a(prepareUnique=True)]),
@@ -130,7 +138,10 @@ def _drops(client: Any, scenario: str) -> dict:
             if ev is not None:
                 events.append(ev)
     drops = [
-        (e["operationDescription"]["indexes"][0]["name"], list(e["operationDescription"]["indexes"][0]))
+        (
+            e["operationDescription"]["indexes"][0]["name"],
+            list(e["operationDescription"]["indexes"][0]),
+        )
         for e in events
         if e["operationType"] == "dropIndexes"
     ]
@@ -174,7 +185,12 @@ def test_a_collmod_keeps_the_options_position_when_it_changes_a_value(
         co = db.create_collection("c" + uuid.uuid4().hex[:8])
         _setup(co, {"name": "a_1", "key": {"a": 1}, "expireAfterSeconds": 100})
         out = []
-        for mod in ({"hidden": True}, {"expireAfterSeconds": 9}, {"hidden": False}, {"hidden": True}):
+        for mod in (
+            {"hidden": True},
+            {"expireAfterSeconds": 9},
+            {"hidden": False},
+            {"hidden": True},
+        ):
             db.command("collMod", co.name, index={"name": "a_1", **mod})
             out.append(_catalog_specs(co))
         return out

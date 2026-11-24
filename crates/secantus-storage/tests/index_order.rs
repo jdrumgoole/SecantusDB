@@ -45,7 +45,10 @@ fn dropped(st: &Storage) -> Vec<(String, Vec<String>)> {
             let o = e.get_document("o").ok()?;
             o.get_str("dropIndexes").ok()?;
             // mongod's form carries the spec as `o2`.
-            let spec = e.get_document("o2").or_else(|_| o.get_document("spec")).ok()?;
+            let spec = e
+                .get_document("o2")
+                .or_else(|_| o.get_document("spec"))
+                .ok()?;
             Some((
                 o.get_str("index").ok()?.to_string(),
                 spec.keys().cloned().collect(),
@@ -72,7 +75,10 @@ fn a_collmodded_index_is_dropped_last_with_its_option_after_name() {
     st.drop_all_indexes("app", "c").unwrap();
     let got = dropped(&st);
     assert_eq!(names(&got), ["b_1", "d_1", "a_1"]);
-    assert_eq!(fields(&got, "a_1"), ["v", "unique", "key", "name", "hidden"]);
+    assert_eq!(
+        fields(&got, "a_1"),
+        ["v", "unique", "key", "name", "hidden"]
+    );
     assert_eq!(fields(&got, "d_1"), ["v", "hidden", "key", "name"]);
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
@@ -90,7 +96,10 @@ fn a_restart_puts_the_indexes_back_in_build_order_and_keeps_the_spec_order() {
     st.drop_all_indexes("app", "c").unwrap();
     let got = dropped(&st);
     assert_eq!(names(&got), ["a_1", "b_1", "d_1"]);
-    assert_eq!(fields(&got, "a_1"), ["v", "unique", "key", "name", "hidden"]);
+    assert_eq!(
+        fields(&got, "a_1"),
+        ["v", "unique", "key", "name", "hidden"]
+    );
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -130,6 +139,41 @@ fn an_option_set_to_its_default_leaves_the_spec_and_a_dropped_index_forgets_its_
     assert_eq!(listed, ["b_1", "d_1"]);
     assert_eq!(*names(&got).last().unwrap(), "a_1");
     assert_eq!(fields(&got, "a_1"), ["v", "key", "name"]);
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn a_new_ttl_setting_is_written_last_in_the_spec() {
+    let home = temp_home();
+    let st = Storage::open(home.to_str().unwrap()).unwrap();
+    st.insert_one("app", "c", &bson::to_vec(&doc! {"_id": 1}).unwrap())
+        .unwrap();
+    st.create_index(
+        "app",
+        "c",
+        "x_1",
+        &doc! {"x": 1},
+        &doc! {"expireAfterSeconds": 100, "sparse": true},
+    )
+    .unwrap();
+    let order = |st: &Storage| -> Vec<String> {
+        st.index_catalog_spec("app", "c", "x_1")
+            .unwrap()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        order(&st),
+        ["v", "key", "name", "expireAfterSeconds", "sparse"]
+    );
+    assert!(st.set_index_expiry("app", "c", "x_1", 7).unwrap());
+    assert_eq!(
+        order(&st),
+        ["v", "key", "name", "sparse", "expireAfterSeconds"]
+    );
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }
