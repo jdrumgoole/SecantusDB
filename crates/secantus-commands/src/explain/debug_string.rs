@@ -254,6 +254,20 @@ fn predicate(path: &str, ops: &Document, level: usize, out: &mut String) {
                 other => leaf(path, "$eq", other, level + 1, out),
             }
         }
+        // Under a `$not`, which the parse does not rewrite: `$not` of `$ne`
+        // is `$not` of `$not` of the equality (measured 8.2.11).
+        "$ne" => {
+            indent(level, out);
+            out.push_str("$not\n");
+            leaf(path, "$eq", arg, level + 1, out);
+        }
+        "$nin" => {
+            indent(level, out);
+            out.push_str("$not\n");
+            let mut one = Document::new();
+            one.insert("$in", arg.clone());
+            predicate(path, &one, level + 1, out);
+        }
         "$exists" => {
             indent(level, out);
             out.push_str(&format!("{path} exists\n"));

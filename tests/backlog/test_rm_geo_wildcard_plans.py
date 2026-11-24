@@ -116,36 +116,86 @@ def test_a_near_over_a_multikey_trailing_field_bounds_it_by_one_predicate(
         assert sorted(d["_id"] for d in read(got)) == sorted(d["_id"] for d in read(ref)), label
 
 
-@pytest.mark.backlog("RM-783")
+@pytest.mark.backlog_fixed("RM-783")
 def test_a_near_over_a_compound_2dsphere_index_without_a_single_interval_is_refused(
     mongod: Any, rust_mongo: Any
 ) -> None:
     """Over `{t: 1, pts: "2dsphere"}` mongod 8.2.11 refuses (291,
-    NoQueryExecutionPlans, "unable to find index for $geoNear query") a
-    `$near` whose leading field `t` has no predicate, or one of `$ne`,
-    `$nin` or `$not` (bounds of two intervals); it answers `$exists`, `$in`,
-    `$type` and a range. `secantusd-mdb` answers every one, as it does for a
-    `2d` index, which mongod answers too."""
+    NoQueryExecutionPlans) a `$near` that no predicate bounds the LEADING
+    field `t` of: "unable to find index for $geoNear query" when `t` has no
+    usable predicate, "No query solutions" when only a negation, an `$or`
+    or the like touches it; it answers `$exists`, `$in`, `$type`, a range
+    and a hint. A compound `2d` index answers all of these."""
     queries = [
         {},
         {"z": 3},
         {"t": {"$ne": 2}},
         {"t": {"$nin": [1, 2]}},
         {"t": {"$not": {"$gt": 1}}},
+        {"t": {"$exists": False}},
+        {"t": {"$size": 1}},
+        {"$or": [{"t": 1}, {"t": {"$gt": 5}}]},
+        {"z": 3, "t": {"$ne": 2}},
+        {"t": 2},
+        {"t": {"$gt": 1}},
+        {"t": {"$in": [1, 2]}},
+        {"t": {"$in": []}},
+        {"t": {"$exists": True}},
+        {"t": {"$type": "int"}},
+        {"t": {"$ne": 1, "$gt": 0}},
     ]
+    near = {"pts": {"$near": {"$geometry": NEAR_PT}}}
+
+    def read(coll: Any, q: dict) -> list:
+        flt = {**near, **q}
+        out: list = []
+        for fn in (
+            lambda: len(list(coll.find(flt))),
+            lambda: len(list(coll.find(flt, {"z": 1}).sort("z", 1).limit(3).skip(1))),
+            lambda: coll.database.command("count", coll.name, query=flt)["n"],
+            lambda: coll.database.command(
+                {"explain": {"find": coll.name, "filter": flt}, "verbosity": "queryPlanner"}
+            )["queryPlanner"]["winningPlan"]["stage"],
+            lambda: coll.database.command("distinct", coll.name, key="z", query=flt)["values"],
+            lambda: coll.update_many(flt, {"$set": {"u": 1}}).matched_count,
+            lambda: len(
+                list(
+                    coll.aggregate(
+                        [
+                            {
+                                "$geoNear": {
+                                    "near": NEAR_PT,
+                                    "key": "pts",
+                                    "spherical": True,
+                                    "distanceField": "d",
+                                    "query": q,
+                                }
+                            }
+                        ]
+                    )
+                )
+            ),
+            lambda: len(list(coll.find(flt).hint("t_pts"))),
+        ):
+            got = mongo_answer(fn)
+            out.append(
+                (got[0], got[1] if got[0] == "err" else None, got[2:] if got[0] == "err" else None)
+            )
+        return out
+
     answers = []
     for client in (mongod, rust_mongo):
         coll = _load(client)
-        one = []
+        answers.append([read(coll, q) for q in queries])
+    assert answers[1] == answers[0]
+    # A `2d` index answers each of them.
+    for client in (mongod, rust_mongo):
+        coll = _load(client)
         for q in queries:
             got = mongo_answer(
-                lambda q=q, coll=coll: list(
-                    coll.find({"pts": {"$near": {"$geometry": NEAR_PT}}, **q})
-                )
+                lambda q=q, coll=coll: list(coll.find({"flat": {"$near": [3, 4]}, **q}))
             )
-            one.append((got[0], got[1] if got[0] == "err" else None))
-        answers.append(one)
-    assert answers[1] == answers[0]
+            assert got[0] == "ok", (q, got)
 
 
 @pytest.mark.backlog("RM-780")
@@ -192,6 +242,106 @@ def test_a_hint_to_a_wildcard_index_no_predicate_can_use_is_refused(
             got = mongo_answer(lambda flt=flt, coll=coll: list(coll.find(flt).hint("all_w")))
             one.append((got[0], got[1] if got[0] == "err" else None))
         answers.append(one)
+    assert answers[1] == answers[0]
+
+
+@pytest.mark.backlog("RM-785")
+def test_a_hinted_near_over_an_unbounded_leading_field_scans_the_whole_index(
+    mongod: Any, rust_mongo: Any
+) -> None:
+    """Hinted to `{t: 1, pts: "2dsphere"}` with no usable predicate on `t`,
+    mongod 8.2.11 plans a FETCH over a whole-index IXSCAN (bounds
+    `[MinKey, MaxKey]` on both fields) with the `$near` as the fetch's
+    filter, and returns the documents in the index's key order; for `{z: 3}`
+    `[12, 48, 21, 57, 30, 3, 39]`. `secantusd-mdb` returns them nearest
+    first, and plans GEO_NEAR_2DSPHERE for `t: {$ne: 2}`."""
+    near = {"pts": {"$near": {"$geometry": NEAR_PT}}}
+    answers = []
+    for client in (mongod, rust_mongo):
+        coll = _load(client)
+        one = []
+        for q in ({"z": 3}, {"t": {"$ne": 2}}, {}):
+            ids = [d["_id"] for d in coll.find({**near, **q}).hint("t_pts")]
+            stage = _winning(coll, {**near, **q}, hint="t_pts")["queryPlanner"]["winningPlan"]
+            one.append((ids, stage["stage"]))
+        answers.append(one)
+    assert answers[1] == answers[0]
+
+
+@pytest.mark.backlog("RM-786")
+def test_a_hinted_geo_near_stage_over_an_unbounded_leading_field_fails_in_the_executor(
+    mongod: Any, rust_mongo: Any
+) -> None:
+    """An `aggregate` `$geoNear` hinted to `t_pts` with a `query` that bounds
+    no leading field (`{z: 3}`, `{t: {$ne: 2}}`) fails on mongod 8.2.11 with
+    9911902, "Query returned a document that is unexpectedly missing the
+    geoNear distance: {...}": the hint's whole-index scan returns documents
+    the stage never measured. `secantusd-mdb` answers the documents."""
+    answers = []
+    for client in (mongod, rust_mongo):
+        coll = _load(client)
+        one = []
+        for q in ({"z": 3}, {"t": {"$ne": 2}}, {"t": 2}):
+            got = mongo_answer(
+                lambda q=q, coll=coll: list(
+                    coll.aggregate(
+                        [
+                            {
+                                "$geoNear": {
+                                    "near": NEAR_PT,
+                                    "key": "pts",
+                                    "spherical": True,
+                                    "distanceField": "d",
+                                    "query": q,
+                                }
+                            }
+                        ],
+                        hint="t_pts",
+                    )
+                )
+            )
+            one.append((got[0], got[1] if got[0] == "err" else None))
+        answers.append(one)
+    assert answers[1] == answers[0]
+
+
+@pytest.mark.backlog("RM-787")
+def test_an_explain_of_a_geo_near_stage_is_the_geo_near_cursor_with_its_query(
+    mongod: Any, rust_mongo: Any
+) -> None:
+    """mongod 8.2.11's `explain` of `aggregate` with a leading `$geoNear`
+    over `{t: 1, pts: "2dsphere"}` lists a `$geoNearCursor` stage whose
+    `parsedQuery` is the `query` and the near leaf
+    (`{$and: [{t: {$eq: 2}}, {pts: {$nearSphere: ...}}]}`) over a
+    GEO_NEAR_2DSPHERE winning plan; `secantusd-mdb` lists a `$cursor` with
+    an empty `parsedQuery`."""
+    answers = []
+    for client in (mongod, rust_mongo):
+        coll = _load(client)
+        reply = coll.database.command(
+            {
+                "explain": {
+                    "aggregate": coll.name,
+                    "pipeline": [
+                        {
+                            "$geoNear": {
+                                "near": NEAR_PT,
+                                "key": "pts",
+                                "spherical": True,
+                                "distanceField": "d",
+                                "query": {"t": 2},
+                            }
+                        }
+                    ],
+                    "cursor": {},
+                },
+                "verbosity": "queryPlanner",
+            }
+        )
+        stage = reply["stages"][0]
+        name = next(iter(stage))
+        planner = stage[name]["queryPlanner"]
+        answers.append((name, planner["parsedQuery"], planner["winningPlan"]["stage"]))
     assert answers[1] == answers[0]
 
 

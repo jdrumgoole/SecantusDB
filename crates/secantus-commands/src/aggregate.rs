@@ -843,6 +843,12 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     hint,
                 ) {
                     check_geo_near_hint(spec, hint, &ctx.db_name, c, storage)?;
+                } else if let Some(spec) = pipeline
+                    .first()
+                    .and_then(Bson::as_document)
+                    .and_then(|d| d.get("$geoNear"))
+                {
+                    check_geo_near_plan(spec, &ctx.db_name, c, storage)?;
                 }
                 read_pipeline = pipeline.clone();
                 let geonear_candidate = pipeline
@@ -5199,6 +5205,68 @@ fn geo_near_unplannable(
             )
         )
     )
+}
+
+/// mongod's refusal of a leading `$geoNear`, with no hint, over a compound
+/// index none of the query's predicates bounds the leading field of
+/// (`explain::plan::near_refusal`): 291 either way, "unable to find index
+/// for $geoNear query" or "No query solutions".
+pub(crate) fn check_geo_near_plan(
+    spec: &Bson,
+    db: &str,
+    coll: &str,
+    storage: &dyn crate::storage::Storage,
+) -> Result<(), CommandError> {
+    let Some(spec) = spec.as_document() else {
+        return Ok(());
+    };
+    // A stage that is not well formed, or is refused for another reason,
+    // says so where it runs.
+    let Ok(stage) = geo_near_stage(spec) else {
+        return Ok(());
+    };
+    if stage
+        .query
+        .and_then(secantus_core::query::unknown_top_level_refusal)
+        .is_some()
+    {
+        return Ok(());
+    }
+    let Ok(key) = (match stage.key {
+        Some(k) => Ok(k.to_string()),
+        None => infer_geo_near_key(db, Some(coll), storage),
+    }) else {
+        return Ok(());
+    };
+    let readable = |kind: &str| match kind {
+        "2dsphere" => stage.near.spherical,
+        "2d" => !stage.near.geojson,
+        _ => false,
+    };
+    let indexes = storage.list_indexes(db, coll).map_err(command_error)?;
+    let usable = indexes.iter().any(|ix| {
+        ix.get_document("key")
+            .ok()
+            .and_then(|k| k.get_str(&key).ok())
+            .is_some_and(readable)
+    });
+    if !usable {
+        return Ok(());
+    }
+    let catalog =
+        crate::explain::catalog_of_collection(storage, db, coll).map_err(command_error)?;
+    let empty = Document::new();
+    let query = stage.query.unwrap_or(&empty);
+    let canonical = crate::explain::parsed_query(query);
+    let implies = |partial: &Document| storage.query_implies_partial(query, partial);
+    match crate::explain::near_refusal(&canonical, &key, &stage.near, &catalog, &implies, None) {
+        Some(why) => Err(CommandError::new(
+            291,
+            "NoQueryExecutionPlans",
+            geo_near_unplannable(&stage, spec, &key, db, coll, why.message()),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// mongod's refusals of a leading `$geoNear` under the command's `hint`

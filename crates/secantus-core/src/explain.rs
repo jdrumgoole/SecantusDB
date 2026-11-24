@@ -45,13 +45,17 @@ fn match_type_rank(op: &str) -> i32 {
         "$not" => 19,
         "$type" => 20,
         "$expr" => 21,
+        // GEO_NEAR follows `$expr` and precedes the twins it derives
+        // (8.2.11, 2026-11-24: `$expr`, GEONEAR, `$_internalExprEq`).
+        "$geoWithin" | "$within" | "$geoIntersects" => 21,
+        "$near" | "$nearSphere" => 22,
         // mongod's enum order for the twins `$expr` derives (8.2.11): only
         // `$_internalExprEq` beside `$_internalExprLt` was measured.
-        "$_internalExprEq" => 22,
-        "$_internalExprGt" => 23,
-        "$_internalExprGte" => 24,
-        "$_internalExprLt" => 25,
-        "$_internalExprLte" => 26,
+        "$_internalExprEq" => 23,
+        "$_internalExprGt" => 24,
+        "$_internalExprGte" => 25,
+        "$_internalExprLt" => 26,
+        "$_internalExprLte" => 27,
         // What `$jsonSchema` parses into, after every other match type, in
         // mongod's enum order (the order its tree sort uses).
         "$_internalSchemaAllElemMatchFromIndex" => 30,

@@ -2887,18 +2887,36 @@ produce the dump it exists for.
       IXSCAN of the whole `$**` index, bounds `[MinKey, MaxKey]`.
       Verify: tests/backlog/test_rm_geo_wildcard_plans.py::test_a_hint_to_a_wildcard_index_no_predicate_can_use_is_refused
       Backlog-ID: RM-781
-- [ ] **A `$near` over a compound `2dsphere` index with no single-interval
-      bound on its leading field is answered, not refused.** Found closing
-      RM-779 (2026-11-24, mongod 8.2.11). Over `{t: 1, pts: "2dsphere"}`
-      mongod refuses (291, NoQueryExecutionPlans, "unable to find index for
-      $geoNear query"; `$geoNear` in an aggregate alike) a `$near` with no
-      predicate on `t`, or only `z: 3`, or `t` under `$ne`, `$nin` or
-      `$not` (bounds of two intervals); it answers `$exists`, `$in`, `$type`
-      and a range. `secantusd-mdb` answers every one, with the right
-      documents. A compound `2d` index (`{flat: "2d", t: 1}`) answers all of
-      them on mongod too.
-      Verify: tests/backlog/test_rm_geo_wildcard_plans.py::test_a_near_over_a_compound_2dsphere_index_without_a_single_interval_is_refused
-      Backlog-ID: RM-783
+- [ ] **A hinted `$near` over a compound `2dsphere` index whose leading
+      field no predicate bounds is read nearest first, not in the index's
+      key order.** Found closing RM-783 (2026-11-24, mongod 8.2.11). Hinted
+      to `{t: 1, pts: "2dsphere"}`, a `$near` with `{z: 3}`, `t` under
+      `$ne` or no other predicate is planned by mongod as a FETCH over a
+      whole-index IXSCAN (bounds `[MinKey, MaxKey]` on both fields, the
+      `$near` the fetch's filter) and returns the documents in the index's
+      key order (`[12, 48, 21, 57, 30, 3, 39]` for `{z: 3}`).
+      `secantusd-mdb` returns them nearest first, and `explain` shows
+      GEO_NEAR_2DSPHERE for `t: {$ne: 2}`.
+      Verify: tests/backlog/test_rm_geo_wildcard_plans.py::test_a_hinted_near_over_an_unbounded_leading_field_scans_the_whole_index
+      Backlog-ID: RM-785
+- [ ] **A hinted `$geoNear` stage over a compound `2dsphere` index whose
+      leading field no predicate bounds answers, where mongod fails.**
+      Found closing RM-783 (2026-11-24, mongod 8.2.11). An `aggregate`
+      `$geoNear` with `hint: "t_pts"` and a `query` of `{z: 3}` or `{t:
+      {$ne: 2}}` fails 9911902, "Executor error during aggregate command
+      ...: Query returned a document that is unexpectedly missing the
+      geoNear distance: {...}" (the first document of the whole-index scan,
+      printed whole); `secantusd-mdb` answers the documents.
+      Verify: tests/backlog/test_rm_geo_wildcard_plans.py::test_a_hinted_geo_near_stage_over_an_unbounded_leading_field_fails_in_the_executor
+      Backlog-ID: RM-786
+- [ ] **`explain` of an aggregate with a leading `$geoNear` lists a
+      `$cursor` with an empty `parsedQuery`, not a `$geoNearCursor` with
+      the query.** Found closing RM-783 (2026-11-24, mongod 8.2.11).
+      mongod's stage is `$geoNearCursor`, its `parsedQuery` the `query` and
+      the near leaf, over GEO_NEAR_2DSPHERE; `secantusd-mdb` plans the
+      stage's own query as `{}` under `$cursor`.
+      Verify: tests/backlog/test_rm_geo_wildcard_plans.py::test_an_explain_of_a_geo_near_stage_is_the_geo_near_cursor_with_its_query
+      Backlog-ID: RM-787
 
 ## Found making mongod open our stores (storage-model phase 7, 2026-11-21)
 

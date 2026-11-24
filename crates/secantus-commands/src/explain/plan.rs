@@ -1749,6 +1749,155 @@ fn geo_near_access(parts: &[Document], q: &Query, catalog: &[Arc<IndexInfo>]) ->
     })
 }
 
+/// Why mongod's planner finds no GEO_NEAR plan for a `$near`, which it
+/// words two ways (measured 8.2.11, 2026-11-24).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NearRefusal {
+    /// "unable to find index for $geoNear query": no index of the
+    /// collection is relevant to the query, since none has a predicate on
+    /// its leading field (or the one with a geo field leading is the wrong
+    /// kind).
+    NoIndex,
+    /// "No query solutions": an index is relevant, but no predicate can be
+    /// assigned to its leading field to bound the scan (`$ne`, `$nin`,
+    /// `$not`, `$nor` or an `$or`, a predicate on a path it keys that
+    /// cannot bound it).
+    NoSolutions,
+}
+
+impl NearRefusal {
+    /// The reason mongod gives.
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            NearRefusal::NoIndex => "unable to find index for $geoNear query",
+            NearRefusal::NoSolutions => "No query solutions",
+        }
+    }
+}
+
+/// Whether a predicate of the query is one mongod's planner counts as
+/// relevant to an index keying its path: the operators it never tags an
+/// index for are `$size`, the bit tests and an object-form `$elemMatch`.
+fn near_relevant(pred: &Document) -> bool {
+    let Some(op) = pred.keys().next() else {
+        return false;
+    };
+    match op.as_str() {
+        "$size" | "$bitsAllSet" | "$bitsAllClear" | "$bitsAnySet" | "$bitsAnyClear" | "$where"
+        | "$text" => false,
+        "$elemMatch" => pred
+            .get_document("$elemMatch")
+            .is_ok_and(|inner| inner.keys().any(|k| k.starts_with('$'))),
+        _ => true,
+    }
+}
+
+/// Whether anything under `clause` is a predicate relevant to `path`.
+fn near_mentions(clause: &Bson, path: &str) -> bool {
+    match clause {
+        Bson::Document(d) => d.iter().any(|(k, v)| {
+            if k == path {
+                return match v {
+                    Bson::Document(pred)
+                        if pred.keys().next().is_some_and(|o| o.starts_with('$')) =>
+                    {
+                        pred.iter().any(|(op, arg)| {
+                            let one = doc! { op.clone(): arg.clone() };
+                            near_relevant(&one)
+                        })
+                    }
+                    _ => true,
+                };
+            }
+            near_mentions(v, path)
+        }),
+        Bson::Array(list) => list.iter().any(|c| near_mentions(c, path)),
+        _ => false,
+    }
+}
+
+/// mongod's refusal of a `$near` (or `$geoNear`) on `found`'s field when no
+/// index can plan it, or `None` when one can. A geo index whose geo field
+/// does not lead is relevant only when a predicate of the query bounds its
+/// LEADING field (the fields between are free; measured over
+/// `{z: 1, t: 1, pts: "2dsphere"}`, where `z` alone plans and `t` alone
+/// does not); when only negations, an `$or` or the like touch it, mongod
+/// reports [`NearRefusal::NoSolutions`], and a hint overrides all of it
+/// (the caller's affair).
+pub(crate) fn near_refusal(
+    canonical: &Document,
+    field: &str,
+    near: &secantus_core::geoshape::Near,
+    catalog: &[Arc<IndexInfo>],
+    implies: &dyn Fn(&Document) -> bool,
+    collation: Option<&Collation>,
+) -> Option<NearRefusal> {
+    let parts = clauses(canonical);
+    // A query that matches nothing by its form (`$in: []`) is planned as
+    // EOF, whatever its indexes.
+    if parts.iter().any(|c| c.contains_key("$alwaysFalse")) {
+        return None;
+    }
+    let leaves = leaves_of(&parts);
+    let mut refusal = NearRefusal::NoIndex;
+    let mut any = false;
+    for ix in catalog {
+        let Some(geo) = ix.geo.as_ref().filter(|g| g.geo_field() == field) else {
+            continue;
+        };
+        if if geo.is_sphere() {
+            !near.spherical
+        } else {
+            near.geojson
+        } {
+            continue;
+        }
+        any = true;
+        if ix.partial.as_ref().is_some_and(|p| !implies(p)) {
+            continue;
+        }
+        if geo.geo_at == 0 {
+            return None;
+        }
+        let lead = ix.fields()[0].0;
+        let ctx = Ctx {
+            multikey: !ix.multikey_paths[0].is_empty(),
+            sparse: ix.sparse,
+            collated: collation_differs(ix, collation),
+            plain_strings: ix.collation.is_none(),
+            keys_only: false,
+        };
+        let mut relevant = false;
+        for leaf in leaves.iter().filter(|l| l.path == lead && !l.derived) {
+            // A sparse index is never read for what `$expr` derives.
+            if ix.sparse
+                && leaf
+                    .pred
+                    .keys()
+                    .next()
+                    .is_some_and(|k| k.starts_with("$_internalExpr"))
+            {
+                continue;
+            }
+            let negated = leaf.pred.keys().next().is_some_and(|k| k == "$not");
+            if !negated && leaf_bounds(&leaf.pred, ctx).is_some() {
+                return None;
+            }
+            relevant |= near_relevant(&leaf.pred);
+        }
+        // An `$or` or `$nor` over the leading field is relevant to the
+        // index, though it bounds nothing.
+        relevant |= parts.iter().any(|c| {
+            c.keys().next().is_some_and(|k| k == "$or" || k == "$nor")
+                && near_mentions(&Bson::Document(c.clone()), lead)
+        });
+        if relevant {
+            refusal = NearRefusal::NoSolutions;
+        }
+    }
+    any.then_some(refusal)
+}
+
 /// The walks of whole indexes that return the documents in the sort order,
 /// each one checked against the query, in catalog order.
 fn sort_walks(

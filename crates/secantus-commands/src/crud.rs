@@ -1786,23 +1786,30 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     } else {
         // A `$near` needs its index whether or not the order matters.
         if let Some(near) = crate::near::find_near(&filter).map_err(command_error)? {
-            near.check_index(storage, &ctx.db_name, &coll, Default::default())
-                .map_err(|e| match e {
-                    StorageError::WriteError {
-                        code,
-                        errmsg,
-                        exec: true,
-                    } => CommandError::new(
-                        code,
-                        crate::util::error_code_name(code),
-                        format!(
-                            "Executor error during count command on namespace: {}.{coll} :: \
+            near.check_index(
+                storage,
+                &ctx.db_name,
+                &coll,
+                Default::default(),
+                false,
+                collation.as_ref(),
+            )
+            .map_err(|e| match e {
+                StorageError::WriteError {
+                    code,
+                    errmsg,
+                    exec: true,
+                } => CommandError::new(
+                    code,
+                    crate::util::error_code_name(code),
+                    format!(
+                        "Executor error during count command on namespace: {}.{coll} :: \
                              caused by :: {errmsg}",
-                            ctx.db_name
-                        ),
+                        ctx.db_name
                     ),
-                    other => command_error(other),
-                })?;
+                ),
+                other => command_error(other),
+            })?;
         }
         crate::notablescan::check(
             ctx,
@@ -3117,7 +3124,7 @@ fn near_refusal(
         Ok(None) => return None,
         Err(e) => return Some(crate::util::write_error(index, e, command)),
     };
-    near.check_index(storage, db, coll, Default::default())
+    near.check_index(storage, db, coll, Default::default(), false, None)
         .err()
         .map(|e| crate::util::write_error(index, e, command))
 }
