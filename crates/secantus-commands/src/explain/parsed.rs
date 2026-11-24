@@ -306,6 +306,20 @@ fn parsed(filter: &Document, sorted_in: bool) -> Document {
 /// `MatchExpression::sortTree` over a tree built unsorted: every `$and`,
 /// `$or` and `$nor` lists its children in mongod's order.
 pub(super) fn sort_tree(node: Document) -> Document {
+    // A predicate that holds a tree of its own sorts it too.
+    if let [(path, Bson::Document(pred))] = node.iter().collect::<Vec<_>>()[..] {
+        if !path.starts_with('$') && pred.len() == 1 {
+            if let Some((op, Bson::Document(inner))) = pred.iter().next() {
+                if matches!(op.as_str(), "$elemMatch" | "$_internalSchemaObjectMatch") {
+                    let mut kept = Document::new();
+                    kept.insert(op.clone(), sort_tree(inner.clone()));
+                    let mut out = Document::new();
+                    out.insert(path.clone(), kept);
+                    return out;
+                }
+            }
+        }
+    }
     let [(key, Bson::Array(children))] = node.iter().collect::<Vec<_>>()[..] else {
         return node;
     };

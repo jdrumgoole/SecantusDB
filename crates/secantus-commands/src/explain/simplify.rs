@@ -100,16 +100,32 @@ impl Predicates {
     }
 }
 
-/// Whether `d` is a leaf mongod will not read as a bit: a clause that
-/// needs its own index or whose evaluation has side channels.
+/// Whether `value` holds a match type the simplifier does not read: the
+/// `$_internalSchema*` predicates `$jsonSchema` parses into, and the
+/// bucket and hashed-key ones. One of them anywhere in the tree leaves the
+/// whole tree as it was (measured 8.2.11, 2026-11-24).
+fn unsupported(value: &Bson) -> bool {
+    match value {
+        Bson::Document(d) => d.iter().any(|(k, v)| {
+            k.starts_with("$_internalSchema")
+                || k.starts_with("$_internalBucket")
+                || k == "$_internalEqHashedKey"
+                || unsupported(v)
+        }),
+        Bson::Array(items) => items.iter().any(unsupported),
+        _ => false,
+    }
+}
+
+/// Whether `d` is a leaf mongod will not read as a bit.
 fn opaque(d: &Document) -> bool {
     d.iter().any(|(k, v)| {
-        matches!(k.as_str(), "$text" | "$where")
+        k == "$text"
             || v.as_document().is_some_and(|p| {
                 p.keys()
                     .any(|op| matches!(op.as_str(), "$near" | "$nearSphere"))
             })
-    })
+    }) || unsupported(&Bson::Document(d.clone()))
 }
 
 fn read(d: &Document, preds: &mut Predicates) -> Option<Node> {
