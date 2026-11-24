@@ -260,6 +260,25 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **`test_a_contested_write_of_many_plans_as_mongod[query0-delete]`
+      compares a timing-dependent order (2026-11-24).** On snapshot PR
+      #2975 (run 45439792340, job `mdb-binary (live)`) it failed, then its
+      re-run on the same commit passed. Both servers deleted the same 5,000
+      documents under the same cached plan; the flattened list of deleted
+      ids from the oplog's batched `applyOps` entries differed at one point
+      (this server's list had `1050` before `1069`, mongod's did not), and
+      within an entry the ids ran descending. The test flattens the
+      entries to ignore where mongod cuts a batch, which its own comment
+      calls timing, but if the order within an entry is not the plan's
+      order, a moved cut still moves an id in the flattened list. Decide
+      from mongod what the batched delete's order inside one `applyOps`
+      entry is (the plan's order, reversed, or the write's buffering), then
+      compare only what the plan decides, keeping the test able to fail on
+      a real order divergence. Found by the MongoDB batch session; test
+      code unchanged.
+      Verify: none -- intermittent on CI; the test itself is the check
+      Backlog-ID: RM-784
+
 
 - [ ] **OPEN — the Go gauge's two mongocryptd leaves: confirm how session
       support is advertised.** The gauge completes 659 of 659 and read 598 /
