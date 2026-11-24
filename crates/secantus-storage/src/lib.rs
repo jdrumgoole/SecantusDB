@@ -8437,9 +8437,9 @@ impl Storage {
             // Drop any table a crash or a rollback left that no catalog row
             // or placement names.
             reconcile_idents(&boot)?;
-            (state, oplog, replay_from, truncation)
+            (state, oplog, replay_from, truncation, reconciled.unfinished)
         };
-        let (mut state, oplog_table, replay_from, truncation) = state;
+        let (mut state, oplog_table, replay_from, truncation, unfinished_builds) = state;
         let oplog_uri = oplog_table.uri.clone();
         // The oplog state as the last close left it: the size storer's
         // counts are trusted only when it is the state they were saved with.
@@ -8638,6 +8638,11 @@ impl Storage {
             storage.sync_system_views(&db)?;
         }
         storage.load_user_write_block()?;
+        // Builds mongod left unfinished are recorded as this server's
+        // own, under their build UUIDs, so they restart below (RM-755).
+        for (db, coll, uuid, spec) in &unfinished_builds {
+            storage.replay_start_index_build(db, coll, uuid, std::slice::from_ref(spec))?;
+        }
         // Index builds a crash or shutdown interrupted run again from the
         // start, as mongod restarts them (RM-187).
         storage.restart_index_builds()?;

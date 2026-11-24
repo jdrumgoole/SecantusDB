@@ -1749,6 +1749,318 @@ fn geo_near_access(parts: &[Document], q: &Query, catalog: &[Arc<IndexInfo>]) ->
     })
 }
 
+/// Why mongod's planner finds no GEO_NEAR plan for a `$near`, which it
+/// words two ways (measured 8.2.11, 2026-11-24).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NearRefusal {
+    /// "unable to find index for $geoNear query": no index of the
+    /// collection is relevant to the query, since none has a predicate on
+    /// its leading field (or the one with a geo field leading is the wrong
+    /// kind).
+    NoIndex,
+    /// "No query solutions": an index is relevant, but no predicate can be
+    /// assigned to its leading field to bound the scan (`$ne`, `$nin`,
+    /// `$not`, `$nor` or an `$or`, a predicate on a path it keys that
+    /// cannot bound it).
+    NoSolutions,
+}
+
+impl NearRefusal {
+    /// The reason mongod gives.
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            NearRefusal::NoIndex => "unable to find index for $geoNear query",
+            NearRefusal::NoSolutions => "No query solutions",
+        }
+    }
+}
+
+/// Whether a predicate of the query is one mongod's planner counts as
+/// relevant to an index keying its path: the operators it never tags an
+/// index for are `$size`, the bit tests and an object-form `$elemMatch`.
+fn near_relevant(pred: &Document) -> bool {
+    let Some(op) = pred.keys().next() else {
+        return false;
+    };
+    match op.as_str() {
+        "$size" | "$bitsAllSet" | "$bitsAllClear" | "$bitsAnySet" | "$bitsAnyClear" | "$where"
+        | "$text" => false,
+        "$elemMatch" => pred
+            .get_document("$elemMatch")
+            .is_ok_and(|inner| inner.keys().any(|k| k.starts_with('$'))),
+        _ => true,
+    }
+}
+
+/// Whether anything under `clause` is a predicate relevant to `path`.
+fn near_mentions(clause: &Bson, path: &str) -> bool {
+    match clause {
+        Bson::Document(d) => d.iter().any(|(k, v)| {
+            if k == path {
+                return match v {
+                    Bson::Document(pred)
+                        if pred.keys().next().is_some_and(|o| o.starts_with('$')) =>
+                    {
+                        pred.iter().any(|(op, arg)| {
+                            let one = doc! { op.clone(): arg.clone() };
+                            near_relevant(&one)
+                        })
+                    }
+                    _ => true,
+                };
+            }
+            near_mentions(v, path)
+        }),
+        Bson::Array(list) => list.iter().any(|c| near_mentions(c, path)),
+        _ => false,
+    }
+}
+
+/// mongod's refusal of a `$near` (or `$geoNear`) on `found`'s field when no
+/// index can plan it, or `None` when one can. A geo index whose geo field
+/// does not lead is relevant only when a predicate of the query bounds its
+/// LEADING field (the fields between are free; measured over
+/// `{z: 1, t: 1, pts: "2dsphere"}`, where `z` alone plans and `t` alone
+/// does not); when only negations, an `$or` or the like touch it, mongod
+/// reports [`NearRefusal::NoSolutions`], and a hint overrides all of it
+/// (the caller's affair).
+pub(crate) fn near_refusal(
+    canonical: &Document,
+    field: &str,
+    near: &secantus_core::geoshape::Near,
+    catalog: &[Arc<IndexInfo>],
+    implies: &dyn Fn(&Document) -> bool,
+    collation: Option<&Collation>,
+) -> Option<NearRefusal> {
+    let parts = clauses(canonical);
+    // A query that matches nothing by its form (`$in: []`) is planned as
+    // EOF, whatever its indexes.
+    if parts.iter().any(|c| c.contains_key("$alwaysFalse")) {
+        return None;
+    }
+    let leaves = leaves_of(&parts);
+    let mut refusal = NearRefusal::NoIndex;
+    let mut any = false;
+    for ix in catalog {
+        let Some(geo) = ix.geo.as_ref().filter(|g| g.geo_field() == field) else {
+            continue;
+        };
+        if if geo.is_sphere() {
+            !near.spherical
+        } else {
+            near.geojson
+        } {
+            continue;
+        }
+        any = true;
+        if ix.partial.as_ref().is_some_and(|p| !implies(p)) {
+            continue;
+        }
+        if geo.geo_at == 0 {
+            return None;
+        }
+        let lead = ix.fields()[0].0;
+        let ctx = Ctx {
+            multikey: !ix.multikey_paths[0].is_empty(),
+            sparse: ix.sparse,
+            collated: collation_differs(ix, collation),
+            plain_strings: ix.collation.is_none(),
+            keys_only: false,
+        };
+        let mut relevant = false;
+        for leaf in leaves.iter().filter(|l| l.path == lead && !l.derived) {
+            // A sparse index is never read for what `$expr` derives.
+            if ix.sparse
+                && leaf
+                    .pred
+                    .keys()
+                    .next()
+                    .is_some_and(|k| k.starts_with("$_internalExpr"))
+            {
+                continue;
+            }
+            let negated = leaf.pred.keys().next().is_some_and(|k| k == "$not");
+            if !negated && leaf_bounds(&leaf.pred, ctx).is_some() {
+                return None;
+            }
+            relevant |= near_relevant(&leaf.pred);
+        }
+        // An `$or` or `$nor` over the leading field is relevant to the
+        // index, though it bounds nothing.
+        relevant |= parts.iter().any(|c| {
+            c.keys().next().is_some_and(|k| k == "$or" || k == "$nor")
+                && near_mentions(&Bson::Document(c.clone()), lead)
+        });
+        if relevant {
+            refusal = NearRefusal::NoSolutions;
+        }
+    }
+    any.then_some(refusal)
+}
+
+/// Why mongod will not plan a read under a hint to a wildcard index
+/// (measured 8.2.11, 2026-11-24).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WildcardRefusal {
+    /// "$hint: refusing to build whole-index solution, because it's a
+    /// wildcard index": no predicate bounds a path the index keys, and
+    /// the query names exactly one path the index could be expanded to.
+    WholeIndex,
+    /// "No query solutions": no plan, and none or several expanded entries.
+    NoSolutions,
+}
+
+impl WildcardRefusal {
+    /// The reason mongod gives.
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            WildcardRefusal::WholeIndex => {
+                "$hint: refusing to build whole-index solution, because it's a wildcard index"
+            }
+            WildcardRefusal::NoSolutions => "No query solutions",
+        }
+    }
+}
+
+/// The paths a query names, as mongod's planner collects them to expand a
+/// wildcard index (`QueryPlannerIXSelect::getFields`): every path under
+/// `$and`, `$or` and `$not`, an `$elemMatch`'s sub-paths beside its own;
+/// not `$size` or the bit tests, which name none.
+fn query_paths(node: &Document, prefix: &str, out: &mut BTreeSet<String>) {
+    for (key, value) in node {
+        if key.starts_with('$') {
+            match value {
+                Bson::Array(items) => items
+                    .iter()
+                    .filter_map(Bson::as_document)
+                    .for_each(|d| query_paths(d, prefix, out)),
+                Bson::Document(d) => query_paths(d, prefix, out),
+                _ => {}
+            }
+            continue;
+        }
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        let Bson::Document(pred) = value else {
+            out.insert(path);
+            continue;
+        };
+        let names = |op: &str| {
+            !matches!(
+                op,
+                "$size" | "$bitsAllSet" | "$bitsAllClear" | "$bitsAnySet" | "$bitsAnyClear"
+            )
+        };
+        let mut named = false;
+        for (op, arg) in pred {
+            match (op.as_str(), arg) {
+                ("$not", Bson::Document(inner)) => {
+                    let mut one = Document::new();
+                    one.insert(key.clone(), Bson::Document(inner.clone()));
+                    query_paths(&one, prefix, out);
+                }
+                ("$elemMatch", Bson::Document(inner)) => {
+                    if inner.keys().any(|k| k.starts_with('$')) {
+                        named = true;
+                    } else {
+                        query_paths(inner, &path, out);
+                    }
+                }
+                (op, _) => named |= names(op),
+            }
+        }
+        if named {
+            out.insert(path);
+        }
+    }
+}
+
+/// Whether the wildcard index can serve one predicate of a path
+/// (`nodeIsSupportedByWildcardIndex`): the comparisons, `$in`, `$exists:
+/// true`, `$type`, `$regex`, `$mod`, `$all`, `$elemMatch` and what `$expr`
+/// derives, but not a negation, a null, a non-empty object or array, a geo
+/// predicate, `$size` or a bit test.
+fn wildcard_serves(pred: &Document) -> bool {
+    match pred.keys().next().map(String::as_str) {
+        Some("$regex" | "$mod" | "$all" | "$elemMatch") => true,
+        Some(op) if op.starts_with("$_internalExpr") => true,
+        _ => wildcard_fits(pred),
+    }
+}
+
+/// Whether some predicate of `node` can be planned through the wildcard
+/// index: any clause of a conjunction, every branch of a disjunction.
+fn wildcard_plans(node: &Document, wild: &super::node::Wildcard) -> bool {
+    node.iter().any(|(key, value)| match (key.as_str(), value) {
+        ("$and", Bson::Array(items)) => items
+            .iter()
+            .filter_map(Bson::as_document)
+            .any(|d| wildcard_plans(d, wild)),
+        ("$or", Bson::Array(items)) => {
+            !items.is_empty()
+                && items
+                    .iter()
+                    .filter_map(Bson::as_document)
+                    .all(|d| wildcard_plans(d, wild))
+        }
+        (k, _) if k.starts_with('$') => false,
+        (path, Bson::Document(pred)) => {
+            // An object-form `$elemMatch` bounds the paths under the array.
+            if let Ok(inner) = pred.get_document("$elemMatch") {
+                if inner.keys().all(|k| !k.starts_with('$')) {
+                    return inner.iter().any(|(sub, p)| {
+                        p.as_document().is_some_and(|p| {
+                            wild.projection.covers(&format!("{path}.{sub}")) && wildcard_serves(p)
+                        })
+                    });
+                }
+            }
+            wild.projection.covers(path) && wildcard_serves(pred)
+        }
+        _ => false,
+    })
+}
+
+/// mongod's refusal of a read hinted to the wildcard index `name` when no
+/// predicate of the query bounds a path it keys (the planner expands such
+/// an index into one entry per path the query names, and builds no
+/// whole-index scan of one), or `None` when the read is planned. Whether it
+/// words the refusal as the whole-index one or as "No query solutions"
+/// depends on how many entries the expansion left it.
+pub(crate) fn wildcard_hint_refusal(
+    canonical: &Document,
+    name: &str,
+    catalog: &[Arc<IndexInfo>],
+    implies: &dyn Fn(&Document) -> bool,
+) -> Option<WildcardRefusal> {
+    let index = catalog
+        .iter()
+        .find(|ix| ix.name == name && ix.is_wildcard_base())?;
+    let wild = index.wildcard.as_ref()?;
+    // A query that matches nothing by its form is planned as EOF.
+    if clauses(canonical)
+        .iter()
+        .any(|c| c.contains_key("$alwaysFalse"))
+    {
+        return None;
+    }
+    let unmet = index.partial.as_ref().is_some_and(|p| !implies(p));
+    if !unmet && wildcard_plans(canonical, wild) {
+        return None;
+    }
+    let mut paths = BTreeSet::new();
+    query_paths(canonical, "", &mut paths);
+    let entries = paths.iter().filter(|p| wild.projection.covers(p)).count();
+    Some(if entries == 1 {
+        WildcardRefusal::WholeIndex
+    } else {
+        WildcardRefusal::NoSolutions
+    })
+}
+
 /// The walks of whole indexes that return the documents in the sort order,
 /// each one checked against the query, in catalog order.
 fn sort_walks(

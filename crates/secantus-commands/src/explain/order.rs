@@ -1432,7 +1432,14 @@ pub(crate) fn near_stream(
     let hinted = geo::check_near_hint(storage, ask.db, ask.coll, ask.hint, &near, |why| {
         near.unplannable(ask.db, ask.coll, ask.asked, why)
     })?;
-    near.check_index(storage, ask.db, ask.coll, ask.asked)?;
+    near.check_index(
+        storage,
+        ask.db,
+        ask.coll,
+        ask.asked,
+        hinted.is_some(),
+        ask.collation,
+    )?;
     if !storage.can_stream(ask.db, ask.coll)? || ask.sort.is_some_and(|s| !s.is_empty()) {
         return Ok(None);
     }
@@ -1475,7 +1482,14 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         near_index = geo::check_near_hint(storage, ask.db, ask.coll, ask.hint, near, |why| {
             near.unplannable(ask.db, ask.coll, ask.asked, why)
         })?;
-        near.check_index(storage, ask.db, ask.coll, ask.asked)?;
+        near.check_index(
+            storage,
+            ask.db,
+            ask.coll,
+            ask.asked,
+            near_index.is_some(),
+            ask.collation,
+        )?;
     }
     // A hint to a geo index: the store reads such an index its own way, so
     // the matched set is asked for unhinted and ordered (and, for a scan of

@@ -60,6 +60,11 @@ pub(crate) struct Reconciled {
     pub adopted: Vec<String>,
     /// Namespaces the catalog no longer lists, whose rows went.
     pub removed: Vec<String>,
+    /// Index builds mongod left unfinished (`ready: false` in its catalog,
+    /// RM-755): `(db, coll, build UUID, spec)`. Not adopted as indexes; the
+    /// open records each as a build and restarts it, as mongod's restart
+    /// does.
+    pub unfinished: Vec<(String, String, [u8; 16], Document)>,
 }
 
 fn split_ns(ns: &str) -> Option<(String, String)> {
@@ -274,7 +279,11 @@ fn remove(session: &Session, table: &str, key: (&str, &str, Option<&str>)) -> Re
 /// keeps what this server recorded for it, with the catalog's multikey
 /// paths added; one the catalog lists otherwise, or not at all, is
 /// replaced or goes.
-fn adopt_row(session: &Session, row: &CatalogRow) -> Result<bool> {
+fn adopt_row(
+    session: &Session,
+    row: &CatalogRow,
+    unfinished: &mut Vec<(String, String, [u8; 16], Document)>,
+) -> Result<bool> {
     let (db, coll) = (row.db.as_str(), row.coll.as_str());
     let md = row.entry.get_document("md").cloned().unwrap_or_default();
     let mut options = md.get_document("options").cloned().unwrap_or_default();
@@ -316,6 +325,22 @@ fn adopt_row(session: &Session, row: &CatalogRow) -> Result<bool> {
             continue;
         };
         if name == ID_INDEX_NAME {
+            continue;
+        }
+        // A build mongod left unfinished is not an index yet: the open
+        // restarts it under its build UUID (RM-755).
+        if ix.get_bool("ready") == Ok(false) {
+            let uuid = match ix.get("buildUUID") {
+                Some(Bson::Binary(b)) => <[u8; 16]>::try_from(b.bytes.as_slice()).ok(),
+                _ => None,
+            };
+            let Some(uuid) = uuid else {
+                return Err(crate::StorageError::Internal(format!(
+                    "{db}.{coll}'s index {name} is unfinished and names no build UUID"
+                )));
+            };
+            let spec = ix.get_document("spec").cloned().unwrap_or_default();
+            unfinished.push((db.to_string(), coll.to_string(), uuid, spec));
             continue;
         }
         seq += 1;
@@ -594,7 +619,7 @@ pub(crate) fn reconcile(
             .filter(|r| format!("{}.{}", r.db, r.coll) != OPLOG_NS)
         {
             listed.insert((row.db.clone(), row.coll.clone()));
-            if adopt_row(session, row)? {
+            if adopt_row(session, row, &mut out.unfinished)? {
                 out.adopted.push(format!("{}.{}", row.db, row.coll));
             }
             if adopt_time_series(session, row)? {

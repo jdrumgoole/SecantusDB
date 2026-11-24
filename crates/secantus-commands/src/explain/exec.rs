@@ -890,7 +890,17 @@ impl Source<()> for Docs {
 fn near_search(index: &IndexInfo, clause: &Document, env: &Env) -> Option<(NearSearch<()>, Docs)> {
     let geo = index.geo.as_ref()?;
     let found = crate::near::find_near(clause).ok()??;
-    let base = super::geo::trailing_bounds(geo, env.query.unwrap_or(clause))?;
+    // Multikey as the documents make it (the catalog's record is not here).
+    let key: Document = geo
+        .fields
+        .iter()
+        .map(|f| (f.clone(), Bson::Int32(1)))
+        .collect();
+    let multikey: Vec<bool> = multikey_paths(env.docs, &key)
+        .iter()
+        .map(|p| !p.is_empty())
+        .collect();
+    let base = super::geo::trailing_bounds(geo, env.query.unwrap_or(clause), &multikey)?;
     let measure = secantus_core::geoorder::near::Measure::new(geo, &found.near)?;
     let docs = env
         .docs

@@ -52,7 +52,8 @@ pub(crate) use node::Node;
 use node::{num, Stats};
 pub(crate) use parsed::parsed_query;
 pub(crate) use plan::{
-    begin_operation, planned_apart, planning_scope, planning_spent, plans_nothing,
+    begin_operation, near_refusal, planned_apart, planning_scope, planning_spent, plans_nothing,
+    wildcard_hint_refusal,
 };
 use plan::{Hint, Query};
 use secantus_core::collation::Collation;
@@ -182,6 +183,19 @@ fn same_key(a: &Document, b: &Document) -> bool {
 /// query `s` makes of `ns`: an aggregate's under its collation (`simple`
 /// when it names none), a find's with its paging and projection.
 fn hint_refusal(ns: &str, s: &Shape) -> CommandError {
+    err(
+        2,
+        "BadValue",
+        planner_error(
+            ns,
+            s,
+            "hint provided does not correspond to an existing index",
+        ),
+    )
+}
+
+/// mongod's planner error for `s`, as it prints the query it was asked.
+fn planner_error(ns: &str, s: &Shape, reason: &str) -> String {
     let simple = doc! {"locale": "simple"};
     let named = s.options.get_document("collation").ok();
     let query = CanonicalQuery {
@@ -200,11 +214,7 @@ fn hint_refusal(ns: &str, s: &Shape) -> CommandError {
             .then(|| s.options.get("batchSize").and_then(crate::util::as_i64))
             .flatten(),
     };
-    err(
-        2,
-        "BadValue",
-        query.planner_error("hint provided does not correspond to an existing index"),
-    )
+    query.planner_error(reason)
 }
 
 fn resolve_hint(hint: Option<&Bson>, catalog: &[Arc<IndexInfo>]) -> Result<Hint, CommandError> {
@@ -770,6 +780,48 @@ fn plan_for(
             e
         }
     })?;
+    // A `$near` no geo index can plan is refused before any plan is made
+    // (`explain` reports it as the read does).
+    if s.min_max.is_none() {
+        if let Ok(Some(found)) = crate::near::find_near(&s.filter) {
+            let asked = crate::near::Asked {
+                skip: s.skip,
+                limit: s.limit,
+                sort: s.sort.as_ref(),
+                projection: s.projection.as_ref(),
+                ..Default::default()
+            };
+            let hinted = geo::check_near_hint(
+                storage,
+                &ctx.db_name,
+                &s.coll,
+                s.hint.as_ref(),
+                &found,
+                |why| found.unplannable(&ctx.db_name, &s.coll, asked, why),
+            )
+            .map_err(crate::util::command_error)?;
+            found
+                .refuse_unplannable(
+                    storage,
+                    &ctx.db_name,
+                    &s.coll,
+                    asked,
+                    hinted.is_some(),
+                    collation,
+                )
+                .map_err(crate::util::command_error)?;
+        }
+    }
+    // A hint to a wildcard index no predicate bounds is refused.
+    if let (Hint::Index(name), None) = (&hint, s.min_max) {
+        if let Some(why) = plan::wildcard_hint_refusal(canonical, name, &t.catalog, &implies) {
+            return Err(err(
+                291,
+                "NoQueryExecutionPlans",
+                planner_error(&ns, s, why.message()),
+            ));
+        }
+    }
     if let Some(which) = s.min_max {
         let Hint::Index(name) = &hint else {
             return Err(err(
@@ -3171,6 +3223,16 @@ fn aggregate(
                 && e.errmsg.starts_with("$geoNear requires a geo index")
                 && e.errmsg.ends_with(&format!(".{DRY} does not exist")) => {}
         other => other?,
+    }
+    // A leading `$geoNear` no index can plan is refused as the aggregate
+    // refuses it (a hint plans the index it names).
+    if let (Some(coll), Some(spec)) = (
+        &target_coll,
+        pipeline.first().and_then(|s| s.get("$geoNear")),
+    ) {
+        if inner.get("hint").is_none() {
+            crate::aggregate::check_geo_near_plan(spec, &ctx.db_name, coll, ctx.storage()?)?;
+        }
     }
     // mongod runs the pipeline for `executionStats`, and a window
     // function's run-time error is the executor's, not an explain

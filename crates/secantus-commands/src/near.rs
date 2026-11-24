@@ -9,14 +9,14 @@ use crate::storage::{RecordId, Storage, StorageError};
 use bson::{Bson, Document};
 use secantus_core::fallback::Fallback;
 use secantus_core::geoshape::{near_condition, Near};
-use secantus_core::query::bson_value_repr;
 
 /// A `$near` found in a filter.
 pub(crate) struct Found {
     pub field: String,
     pub near: Near,
-    /// The filter's other top-level clauses, as mongod prints them.
-    others: Vec<String>,
+    /// The whole filter, which mongod prints as its query tree when it
+    /// cannot plan the read.
+    filter: Document,
 }
 
 fn refuse(code: i32, message: impl Into<String>) -> StorageError {
@@ -76,17 +76,13 @@ fn holds_near(v: &Bson) -> bool {
     }
 }
 
-fn walk(
-    filter: &Document,
-    found: &mut Vec<Found>,
-    others: &mut Vec<String>,
-) -> Result<(), StorageError> {
+fn walk(filter: &Document, found: &mut Vec<Found>) -> Result<(), StorageError> {
     for (key, value) in filter {
         match (key.as_str(), value) {
             ("$and", Bson::Array(clauses)) => {
                 for clause in clauses {
                     if let Bson::Document(inner) = clause {
-                        walk(inner, found, others)?;
+                        walk(inner, found)?;
                     }
                 }
             }
@@ -99,14 +95,14 @@ fn walk(
                 Some(near) => found.push(Found {
                     field: field.to_string(),
                     near,
-                    others: Vec::new(),
+                    filter: Document::new(),
                 }),
                 None if cond_holds_near(value) => {
                     return Err(refuse(2, "geo $near must be top-level expr"));
                 }
-                None => others.push(format!("{field} {}", bson_value_repr(value))),
+                None => {}
             },
-            (field, v) => others.push(format!("{field} $eq {}", bson_value_repr(v))),
+            _ => {}
         }
     }
     Ok(())
@@ -118,33 +114,34 @@ pub(crate) fn find_near(filter: &Document) -> Result<Option<Found>, StorageError
     if !holds_near(&Bson::Document(filter.clone())) {
         return Ok(None);
     }
-    let (mut found, mut others) = (Vec::new(), Vec::new());
-    walk(filter, &mut found, &mut others)?;
+    let mut found = Vec::new();
+    walk(filter, &mut found)?;
     if found.len() > 1 {
         return Err(refuse(2, "Too many geoNear expressions"));
     }
     Ok(found.pop().map(|mut f| {
-        f.others = others;
+        f.filter = filter.clone();
         f
     }))
 }
 
 /// A query's tree as mongod prints one it could not plan: the `$near` leaf,
-/// under an `$and` with the other clauses when `query` has any.
+/// under an `$and` with the query's clauses when it has any.
 pub(crate) fn tree(query: Option<&Document>, leaf: &str) -> String {
-    let others: Vec<String> = query
-        .into_iter()
-        .flat_map(|q| q.iter())
-        .map(|(field, v)| match v {
-            Bson::Document(_) => format!("{field} {}", bson_value_repr(v)),
-            _ => format!("{field} $eq {}", bson_value_repr(v)),
-        })
-        .collect();
-    if others.is_empty() {
+    let body = query
+        .filter(|q| !q.is_empty())
+        .map(crate::explain::debug_string::debug_string)
+        .unwrap_or_default();
+    if body.is_empty() {
         return leaf.to_string();
     }
-    let mut lines = vec!["$and".to_string()];
-    lines.extend(others.iter().map(|o| format!("    {o}")));
+    let mut lines: Vec<String> = Vec::new();
+    if body.starts_with("$and\n") {
+        lines.extend(body.lines().map(str::to_string));
+    } else {
+        lines.push("$and".to_string());
+        lines.extend(body.lines().map(|l| format!("    {l}")));
+    }
     lines.push(format!("    {leaf}"));
     lines.join("\n")
 }
@@ -168,12 +165,6 @@ pub(crate) struct Asked<'a> {
     pub sbe: bool,
 }
 
-fn shown(d: Option<&Document>) -> String {
-    d.map_or("{}".to_string(), |d| {
-        bson_value_repr(&Bson::Document(d.clone()))
-    })
-}
-
 impl Found {
     /// Whether an index kind can answer this query: GeoJSON needs the
     /// sphere, a flat `$near` needs a `2d` index, and a legacy point on the
@@ -194,12 +185,33 @@ impl Found {
         db: &str,
         coll: &str,
         asked: Asked,
+        hinted: bool,
+        collation: Option<&secantus_core::collation::Collation>,
     ) -> Result<(), StorageError> {
+        let Some(usable) = self.refuse_unplannable(storage, db, coll, asked, hinted, collation)?
+        else {
+            return Ok(());
+        };
+        let usable: Vec<(&Document, String)> = usable.iter().map(|(s, k)| (s, k.clone())).collect();
+        centre_hashes(&usable, self.near.centre)
+    }
+
+    /// The refusal alone, with no read of the data: `None` when the
+    /// collection does not exist, else the indexes the query could read.
+    pub(crate) fn refuse_unplannable(
+        &self,
+        storage: &dyn Storage,
+        db: &str,
+        coll: &str,
+        asked: Asked,
+        hinted: bool,
+        collation: Option<&secantus_core::collation::Collation>,
+    ) -> Result<Option<Vec<(Document, String)>>, StorageError> {
         // A collection that does not exist is read as nothing, with no plan
         // to make (measured 8.2.11, 2026-10-15: `find` and `count` answer
         // empty, and `explain` reads its dry run that way).
         if !storage.collection_exists(db, coll)? {
-            return Ok(());
+            return Ok(None);
         }
         let indexes = storage.list_indexes(db, coll)?;
         let kind_of = |spec: &Document| -> Option<String> {
@@ -207,56 +219,53 @@ impl Found {
             (!spec.get_bool("hidden").unwrap_or(false) && self.reads(kind))
                 .then(|| kind.to_string())
         };
-        let usable: Vec<(&Document, String)> = indexes
+        let usable: Vec<(Document, String)> = indexes
             .iter()
-            .filter_map(|spec| kind_of(spec).map(|kind| (spec, kind)))
+            .filter_map(|spec| kind_of(spec).map(|kind| (spec.clone(), kind)))
             .collect();
-        if !usable.is_empty() {
-            return centre_hashes(&usable, self.near.centre);
+        if usable.is_empty() {
+            return Err(refuse(
+                291,
+                self.unplannable(db, coll, asked, "unable to find index for $geoNear query"),
+            ));
         }
-        Err(refuse(
-            291,
-            self.unplannable(db, coll, asked, "unable to find index for $geoNear query"),
-        ))
+        // A hint to a geo index plans it whatever the query bounds; without
+        // one, an index whose geo field does not lead is read only when a
+        // predicate bounds its leading field (`explain::plan::near_refusal`).
+        if !hinted {
+            let catalog = crate::explain::catalog_of_collection(storage, db, coll)?;
+            let canonical = crate::explain::parsed_query(&self.filter);
+            let implies = |partial: &Document| storage.query_implies_partial(&self.filter, partial);
+            if let Some(why) = crate::explain::near_refusal(
+                &canonical,
+                &self.field,
+                &self.near,
+                &catalog,
+                &implies,
+                collation,
+            ) {
+                return Err(refuse(
+                    291,
+                    self.unplannable(db, coll, asked, why.message()),
+                ));
+            }
+        }
+        Ok(Some(usable))
     }
 
     /// mongod's message for a `$near` it could not plan, for `reason`.
     pub(crate) fn unplannable(&self, db: &str, coll: &str, asked: Asked, reason: &str) -> String {
-        // The bound as given: metres for GeoJSON, radians for a legacy point
-        // on the sphere, the coordinates' own units in the plane.
-        let max = match self.near.max {
-            None => "1.79769e+308".to_string(),
-            Some(m) if self.near.spherical && !self.near.geojson => {
-                crate::crud::fmt_g(m / secantus_core::geoshape::EARTH_RADIUS_METERS)
-            }
-            Some(m) => crate::crud::fmt_g(m),
-        };
-        let sphere = i32::from(self.near.spherical && !self.near.geojson);
-        let leaf = format!(
-            "GEONEAR  field={} maxdist={max} isNearSphere={sphere}",
-            self.field
-        );
-        let tree = if self.others.is_empty() {
-            leaf
-        } else {
-            let mut lines = vec!["$and".to_string()];
-            lines.extend(self.others.iter().map(|o| format!("    {o}")));
-            lines.push(format!("    {leaf}"));
-            lines.join("\n")
-        };
-        let mut paging = String::new();
-        if asked.limit > 0 {
-            paging.push_str(&format!(" limit={}", asked.limit));
+        crate::explain::CanonicalQuery {
+            ns: format!("{db}.{coll}"),
+            filter: &self.filter,
+            sort: asked.sort,
+            projection: asked.projection,
+            skip: Some(asked.skip),
+            limit: Some(asked.limit),
+            collation: None,
+            batch_size: None,
         }
-        if asked.skip > 0 {
-            paging.push_str(&format!(" skip={}", asked.skip));
-        }
-        format!(
-            "error processing query: ns={db}.{coll}{paging}Tree: {tree}\nSort: {}\nProj: {}\n \
-             planner returned error :: caused by :: {reason}",
-            shown(asked.sort),
-            shown(asked.projection)
-        )
+        .planner_error(reason)
     }
 
     /// `rows` nearest first. Documents at one distance keep the order given,

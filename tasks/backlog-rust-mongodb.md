@@ -2846,16 +2846,6 @@ produce the dump it exists for.
 
 ## The storage model is not mongod's (tasks/mongod-storage-model-plan.md, 2026-11-19)
 
-- [ ] **An index build mongod left unfinished is refused, not finished.**
-      mongod 8.2.11 stopped cleanly during an index build leaves the index
-      in `_mdb_catalog` with `ready: false` and the build in
-      `config.system.indexBuilds`, and its restart finishes it (measured
-      2026-11-22, the build held by `hangAfterStartingIndexBuild`).
-      `secantusd-mdb` refuses such a store by name ("whose build has not
-      finished"): its own builds restart from `secantus_index_builds`
-      records (RM-187), which mongod's store does not have.
-      Verify: tests/backlog/test_rm_storage_model.py::test_secantus_finishes_an_index_build_mongod_left
-      Backlog-ID: RM-755
 - [ ] **A killed mongod store is judged at its stable checkpoint, before
       its replay.** What `secantusd-mdb` refuses by name in a store mongod
       wrote (an index kind it keys otherwise, a time-series collection,
@@ -2866,19 +2856,6 @@ produce the dump it exists for.
       (measured 2026-11-22).
       Verify: tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_killed_mongod_store_whose_oplog_drops_what_it_refuses
       Backlog-ID: RM-756
-- [ ] **A `$near` with a range on the leading field of a compound `2dsphere`
-      index returns too few documents.** Found closing RM-777 (measured
-      2026-11-24, mongod 8.2.11, on the same 60 documents). Over
-      `{t: 1, pts: "2dsphere"}`, `{pts: {$near: ...}, t: {$gte: 2}}` returns
-      the 30 documents with `t` of 2 or 3 on mongod; `secantusd-mdb` returns
-      28 (two `t: 3` documents are missing, the same two for `$gt: 1`). An
-      equality on `t`, and a range on the trailing field of a `2d` index
-      (`{flat: {$near: ...}, t: {$gte: 1}}`), return every match. Present
-      before RM-777's planner work (measured on the build without it): the
-      near search's bounds on the leading field (`geo::trailing_bounds`)
-      are built for an equality.
-      Verify: tests/backlog/test_rm_geo_wildcard_plans.py::test_a_near_with_a_range_on_the_leading_field_returns_every_match
-      Backlog-ID: RM-779
 - [ ] **A `$near`'s `executionStats` leave out its inner scans and count
       other keys.** Found closing RM-777 (2026-11-24, mongod 8.2.11). For
       `{flat: {$near: [3, 4]}, t: 1}` over `{flat: "2d", t: 1}` mongod's
@@ -2890,16 +2867,36 @@ produce the dump it exists for.
       mongod's.
       Verify: tests/backlog/test_rm_geo_wildcard_plans.py::test_a_near_stage_reports_its_inner_scans_and_counts_their_keys
       Backlog-ID: RM-780
-- [ ] **A hint to a wildcard index no predicate can use is planned, not
-      refused.** Found closing RM-777 (2026-11-24, mongod 8.2.11). mongod
-      refuses a find hinted to `$**` when no predicate of the query bounds
-      a path the index keys, since it will not build a whole-index scan of
-      a wildcard index (code 291, NoQueryExecutionPlans, "$hint: refusing to
-      build whole-index solution, because it's a wildcard index"): `{"w.a":
-      {$ne: 3}}`, or a `$geoWithin`, hinted to it. `secantusd-mdb` plans an
-      IXSCAN of the whole `$**` index, bounds `[MinKey, MaxKey]`.
-      Verify: tests/backlog/test_rm_geo_wildcard_plans.py::test_a_hint_to_a_wildcard_index_no_predicate_can_use_is_refused
-      Backlog-ID: RM-781
+- [ ] **A hinted `$near` over a compound `2dsphere` index whose leading
+      field no predicate bounds is read nearest first, not in the index's
+      key order.** Found closing RM-783 (2026-11-24, mongod 8.2.11). Hinted
+      to `{t: 1, pts: "2dsphere"}`, a `$near` with `{z: 3}`, `t` under
+      `$ne` or no other predicate is planned by mongod as a FETCH over a
+      whole-index IXSCAN (bounds `[MinKey, MaxKey]` on both fields, the
+      `$near` the fetch's filter) and returns the documents in the index's
+      key order (`[12, 48, 21, 57, 30, 3, 39]` for `{z: 3}`).
+      `secantusd-mdb` returns them nearest first, and `explain` shows
+      GEO_NEAR_2DSPHERE for `t: {$ne: 2}`.
+      Verify: tests/backlog/test_rm_geo_wildcard_plans.py::test_a_hinted_near_over_an_unbounded_leading_field_scans_the_whole_index
+      Backlog-ID: RM-785
+- [ ] **A hinted `$geoNear` stage over a compound `2dsphere` index whose
+      leading field no predicate bounds answers, where mongod fails.**
+      Found closing RM-783 (2026-11-24, mongod 8.2.11). An `aggregate`
+      `$geoNear` with `hint: "t_pts"` and a `query` of `{z: 3}` or `{t:
+      {$ne: 2}}` fails 9911902, "Executor error during aggregate command
+      ...: Query returned a document that is unexpectedly missing the
+      geoNear distance: {...}" (the first document of the whole-index scan,
+      printed whole); `secantusd-mdb` answers the documents.
+      Verify: tests/backlog/test_rm_geo_wildcard_plans.py::test_a_hinted_geo_near_stage_over_an_unbounded_leading_field_fails_in_the_executor
+      Backlog-ID: RM-786
+- [ ] **`explain` of an aggregate with a leading `$geoNear` lists a
+      `$cursor` with an empty `parsedQuery`, not a `$geoNearCursor` with
+      the query.** Found closing RM-783 (2026-11-24, mongod 8.2.11).
+      mongod's stage is `$geoNearCursor`, its `parsedQuery` the `query` and
+      the near leaf, over GEO_NEAR_2DSPHERE; `secantusd-mdb` plans the
+      stage's own query as `{}` under `$cursor`.
+      Verify: tests/backlog/test_rm_geo_wildcard_plans.py::test_an_explain_of_a_geo_near_stage_is_the_geo_near_cursor_with_its_query
+      Backlog-ID: RM-787
 
 ## Found making mongod open our stores (storage-model phase 7, 2026-11-21)
 
