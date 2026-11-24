@@ -31,7 +31,8 @@ a wildcard index named in a `hint` read as an error.
 
 - A `2d` index reported itself multikey, with `multiKeyPaths`, when a
   document held a location pair; `mongod` tracks no paths for one.
-- Fixes RM-777 (`tests/backlog/test_rm_storage_model.py::test_geo_within_and_wildcard_indexes_are_planned`,
+- Fixes RM-713 (`tests/backlog/test_rm_found_rm707.py::test_a_near_over_a_compound_2d_index_with_its_trailing_field_plans_geo_near`)
+  and RM-777 (`tests/backlog/test_rm_storage_model.py::test_geo_within_and_wildcard_indexes_are_planned`,
   `tests/mongod_live/test_geo_wildcard_plans.py`). Files RM-779 (a `$near`
   with a range on a compound index's leading field returns too few
   documents), RM-780 (a `$near`'s `executionStats` leave out its inner

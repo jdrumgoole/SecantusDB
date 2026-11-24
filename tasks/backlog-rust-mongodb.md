@@ -741,16 +741,6 @@ These are explicit non-goals. Don't add them without a reason.
       falls within mongod's own run-to-run spread of its answer.
       Verify: none -- mongod's own answer varies between runs; no test can pin it
       Backlog-ID: RM-556
-- [ ] **A `$near` with a predicate on a compound 2d index's trailing field
-      is not planned as GEO_NEAR_2D.** mongod 8.2.11 answers `{loc: {$near:
-      [0, 0]}, z: 1}` over `{loc: "2d", z: 1}` with GEO_NEAR_2D, the `z`
-      predicate a key filter (`filter: {z: {$eq: 1}}`) on each ring's IXSCAN
-      over `[MinKey, MaxKey]`; the ring search here already counts that
-      filter (`geoorder::scan`), but the plan this server explains is a FETCH
-      over another stage, and the IXSCAN's `filter` field is not rendered.
-      Found 2026-11-17 (RM-707).
-      Verify: tests/backlog/test_rm_found_rm707.py::test_a_near_over_a_compound_2d_index_with_its_trailing_field_plans_geo_near
-      Backlog-ID: RM-713
 - [ ] **A LIMIT over a GEO_NEAR stage reports no work counts.** mongod
       8.2.11's LIMIT over GEO_NEAR_2D (`find` with `limit: 3`) reports
       `works` (one more than its input's), `advanced` and `needTime`; this
