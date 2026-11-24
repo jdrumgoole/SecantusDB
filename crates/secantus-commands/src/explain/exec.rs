@@ -74,6 +74,15 @@ impl Env<'_> {
     }
 }
 
+/// The key a hashed index holds for `doc` at `field`: the hash of the
+/// value, null's for a missing field.
+pub(crate) fn hashed_key(index: &IndexInfo, field: &str, doc: &Document) -> Bson {
+    secantus_core::hashed::index_key(
+        secantus_core::get_path(doc, field),
+        index.collation.as_ref(),
+    )
+}
+
 /// The values a path holds in a document, one per array element on the way,
 /// and the path components that were arrays. No value: the field is missing.
 pub(crate) fn values_at(doc: &Document, path: &str) -> (Vec<Bson>, Vec<String>) {
@@ -207,6 +216,18 @@ pub(crate) fn entries(index: &IndexInfo, backward: bool, env: &Env) -> Vec<Entry
         if index.sparse && per_field.iter().all(Vec::is_empty) {
             continue;
         }
+        // A hashed field's key is the hash of its value.
+        let per_field: Vec<Vec<Bson>> = per_field
+            .into_iter()
+            .enumerate()
+            .map(|(pos, values)| {
+                if index.is_hashed(pos) {
+                    vec![hashed_key(index, fields[pos].0, doc)]
+                } else {
+                    values
+                }
+            })
+            .collect();
         let reversed = |dir: i64| (dir < 0) != backward;
         // One value a field: one key, built directly.
         if per_field.iter().all(|values| values.len() <= 1) {
@@ -1453,8 +1474,13 @@ pub(crate) fn key_members<'s>(
             let values: Vec<Bson> = fields
                 .iter()
                 .zip(key)
-                .map(|((field, dir), part)| {
-                    let (values, _) = values_at(&env.docs[row], field);
+                .enumerate()
+                .map(|(pos, ((field, dir), part))| {
+                    let (values, _) = if ix.index.is_hashed(pos) {
+                        (vec![hashed_key(&ix.index, field, &env.docs[row])], vec![])
+                    } else {
+                        values_at(&env.docs[row], field)
+                    };
                     let reversed = (*dir < 0) != ix.backward;
                     values
                         .iter()

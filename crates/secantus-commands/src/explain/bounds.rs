@@ -532,6 +532,60 @@ fn internal_expr_bounds(op: &str, v: &Bson, ctx: Ctx) -> Option<(Vec<Interval>, 
     Some((list, tight(inexact)))
 }
 
+/// The bounds one predicate sets on a HASHED key field (mongod 8.2.11,
+/// 2026-11-23): an equality or an `$in` is a point on the hash of each value
+/// (an array operand is not hashed: its first element and the whole array
+/// bound the field as they do a plain one's); `$exists: true` reads the
+/// whole index; `$exists: false` and null are the hash of null. No range,
+/// type, regex, negation or `$mod` is bounded, so the predicate does not use
+/// the index at all. The documents are always rechecked.
+pub(crate) fn hashed_leaf_bounds(
+    pred: &Document,
+    ctx: Ctx,
+    collation: Option<&secantus_core::collation::Collation>,
+) -> Option<(Vec<Interval>, Tight)> {
+    let (op, v) = pred.iter().next()?;
+    let one = |item: &Bson| -> Option<Vec<Interval>> {
+        if ctx.collated && has_string(item) {
+            return None;
+        }
+        match item {
+            Bson::Null if ctx.sparse => None,
+            Bson::Undefined | Bson::RegularExpression(_) => None,
+            Bson::Array(items) => {
+                let first = items.first().cloned().unwrap_or(Bson::Undefined);
+                Some(union(vec![
+                    Interval::point(first),
+                    Interval::point(item.clone()),
+                ]))
+            }
+            other => Some(vec![Interval::point(secantus_core::hashed::index_key(
+                Some(other),
+                collation,
+            ))]),
+        }
+    };
+    match op.as_str() {
+        "$eq" => Some((one(v)?, Tight::FetchFilter)),
+        "$in" => {
+            let mut list = Vec::new();
+            for item in v.as_array()? {
+                list.extend(one(item)?);
+            }
+            Some((union(list), Tight::FetchFilter))
+        }
+        "$exists" => Some((vec![Interval::all()], Tight::FetchFilter)),
+        "$not" => {
+            let inner = v.as_document()?;
+            if ctx.sparse || inner.len() != 1 || !inner.contains_key("$exists") {
+                return None;
+            }
+            one(&Bson::Null).map(|l| (l, Tight::FetchFilter))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn leaf_bounds(pred: &Document, ctx: Ctx) -> Option<(Vec<Interval>, Tight)> {
     let (op, v) = pred.iter().next()?;
     if op.starts_with("$_internalExpr") {

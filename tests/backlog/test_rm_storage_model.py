@@ -283,8 +283,8 @@ def test_mongod_opens_a_secantus_store(tmp_path: Path) -> None:
 
 #: Index kinds whose keys this server does not write as mongod does: a
 #: store holding one is not yet a store mongod validates (each has its
-#: backlog item and a gap test below). `hashed` and text indexes are refused
-#: by name when created, so the scenario's store never holds one.
+#: backlog item and a gap test below). Text indexes are refused by name
+#: when created, so the scenario's store never holds one.
 _KINDS_NOT_MONGODS = ("flat_2d", "loc_2dsphere", "w_wildcard")
 
 
@@ -373,9 +373,10 @@ def test_mongod_opens_the_phase_0b_store(tmp_path: Path) -> None:
     store = tmp_path / "store"
     with rust_mongo_server(store) as client:
         steps = run_scenario(client, strict=False)
-        # Refused by name when created (phase 4), so the store has none.
+        # Refused by name when created (phase 4), so the store has none:
+        # the text index (the hashed index is built, RM-732, and mongod
+        # validates its keys below).
         assert [s.split(":")[0] for s in steps if s.startswith("FAILED")] == [
-            "FAILED kinds",
             "FAILED kinds",
         ], steps
         for name in _KINDS_NOT_MONGODS:
@@ -607,14 +608,14 @@ def _validation(mongod: pymongo.MongoClient, db: str, coll: str) -> tuple:
     return (result["valid"], result.get("errors"), result.get("warnings"))
 
 
-@pytest.mark.backlog("RM-741")
+@pytest.mark.backlog_fixed("RM-741")
 def test_mongod_validates_a_2d_index_secantus_wrote(tmp_path: Path) -> None:
     """mongod 8.2.11 keys a `2d` index by the point's GeoHash at the index's
     `bits`, x then y interleaved in the high bits, as BinData subtype 128
-    (phase 0b: `[-10, 20]` is `6ad4ad4ad4ad4000`) and keeps it non-multikey
-    with no multikey paths. This server keys it by a cell of its own (y
-    first, in the low bits, BinData subtype 0), so mongod's `validate` finds
-    every entry missing and one extra each."""
+    (phase 0b: `[-10, 20]` is `6ad4ad4ad4ad4000`). This server keyed it by a
+    cell of its own (y first, in the low bits, BinData subtype 0), so
+    mongod's `validate` found every entry missing and one extra each; it now
+    writes mongod's."""
 
     def setup(c: pymongo.MongoClient) -> None:
         c.app.k.insert_many([{"_id": 1, "flat": [1.5, 2.5]}, {"_id": 2, "flat": [-10, 20]}])
@@ -624,13 +625,14 @@ def test_mongod_validates_a_2d_index_secantus_wrote(tmp_path: Path) -> None:
         assert _validation(mongod, "app", "k") == (True, [], [])
 
 
-@pytest.mark.backlog("RM-742")
+@pytest.mark.backlog_fixed("RM-742")
 def test_mongod_validates_a_2dsphere_index_secantus_wrote(tmp_path: Path) -> None:
     """mongod 8.2.11 keys a point of a `2dsphere` (version 3) index by one S2
     cell id as a NumberLong (phase 0b: two points, two entries,
-    `201384b1db336fa071` and `328fccdc3d444a7656`). This server writes its
+    `201384b1db336fa071` and `328fccdc3d444a7656`). This server wrote its
     own covering (levels 4 to 16, every ancestor of each cell, BinData), so
-    mongod's `validate` finds the entries missing and dozens extra."""
+    mongod's `validate` found the entries missing and dozens extra; it now
+    writes mongod's."""
 
     def setup(c: pymongo.MongoClient) -> None:
         c.app.k.insert_many(
@@ -645,12 +647,13 @@ def test_mongod_validates_a_2dsphere_index_secantus_wrote(tmp_path: Path) -> Non
         assert _validation(mongod, "app", "k") == (True, [], [])
 
 
-@pytest.mark.backlog("RM-743")
+@pytest.mark.backlog_fixed("RM-743")
 def test_mongod_validates_a_wildcard_index_secantus_wrote(tmp_path: Path) -> None:
     """mongod 8.2.11 keys a wildcard index by `($_path, value)` for each leaf
     path under it (phase 0b: `{w: {x: 1, y: {z: 2}}}` gives `w.x`/1 and
-    `w.y.z`/2). This server writes one null entry per document, so mongod's
-    `validate` finds the entries missing and the nulls extra."""
+    `w.y.z`/2). This server wrote one null entry per document, so mongod's
+    `validate` found the entries missing and the nulls extra; it now writes
+    mongod's, multikey metadata keys included."""
 
     def setup(c: pymongo.MongoClient) -> None:
         c.app.k.insert_many([{"_id": 1, "w": {"x": 1, "y": {"z": 2}}}, {"_id": 2, "w": {"x": "s"}}])
@@ -658,6 +661,235 @@ def test_mongod_validates_a_wildcard_index_secantus_wrote(tmp_path: Path) -> Non
 
     with _mongod_on_secantus_store(tmp_path, setup) as mongod:
         assert _validation(mongod, "app", "k") == (True, [], [])
+
+
+def _pt(x: float, y: float) -> dict:
+    return {"type": "Point", "coordinates": [x, y]}
+
+
+_SQUARE = {"type": "Polygon", "coordinates": [[[0, 0], [3, 0], [3, 3], [0, 3], [0, 0]]]}
+_BIG = {
+    "type": "Polygon",
+    "coordinates": [[[-100, -60], [100, -60], [100, 60], [-100, 60], [-100, -60]]],
+}
+
+# Each case: collection -> (documents, key pattern, index options). Measured on
+# mongod 8.2.11 (2026-11-23) by reading the index tables it wrote: every one
+# is a store `validate` passes on mongod.
+_GEO_CASES = {
+    "flat_many": (
+        [
+            {"_id": 1, "loc": [1.5, 2.5]},
+            {"_id": 2, "loc": [[1, 1], [30, 30]]},
+            {"_id": 3, "loc": {"x": -50.25, "y": 80}},
+            {"_id": 4},
+        ],
+        [("loc", "2d")],
+        {},
+    ),
+    "flat_compound": (
+        [
+            {"_id": 1, "loc": [1, 1], "z": [2, 1, 2]},
+            {"_id": 2, "loc": [1, 1]},
+            {"_id": 3, "loc": [1, 1], "z": {"k": [7, 8]}},
+            {"_id": 4, "loc": [1, 1], "z": [{"q": 1}, {"q": 2}]},
+            {"_id": 5, "loc": [1, 1], "z": []},
+        ],
+        [("loc", "2d"), ("z", 1), ("q", -1)],
+        {},
+    ),
+    "flat_bits": (
+        [{"_id": 1, "loc": [3, -4]}, {"_id": 2, "loc": [-10, 10]}],
+        [("loc", "2d")],
+        {"bits": 10, "min": -10, "max": 10},
+    ),
+    "flat_bits32": (
+        [{"_id": 1, "loc": [3, -4]}],
+        [("loc", "2d")],
+        {"bits": 32, "min": -100, "max": 100},
+    ),
+    "sphere_shapes": (
+        [
+            {"_id": 1, "loc": _pt(1.5, 2.5)},
+            {"_id": 2, "loc": [10, 20]},
+            {"_id": 3, "loc": {"type": "MultiPoint", "coordinates": [[1, 1], [2, 2]]}},
+            {"_id": 4, "loc": _SQUARE},
+            {"_id": 5, "loc": {"type": "LineString", "coordinates": [[0, 0], [1, 1]]}},
+            {"_id": 6, "loc": _BIG},
+            {"_id": 7},
+            {"_id": 8, "loc": _pt(-179.9, 89.9)},
+        ],
+        [("loc", "2dsphere")],
+        {},
+    ),
+    "sphere_collection": (
+        [
+            {
+                "_id": 1,
+                "loc": {
+                    "type": "GeometryCollection",
+                    "geometries": [
+                        _pt(1, 1),
+                        {"type": "LineString", "coordinates": [[0, 0], [1, 1]]},
+                    ],
+                },
+            },
+            {
+                "_id": 2,
+                "loc": {
+                    "type": "MultiPolygon",
+                    "coordinates": [
+                        [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
+                        [[[5, 5], [6, 5], [6, 6], [5, 6], [5, 5]]],
+                    ],
+                },
+            },
+            {
+                "_id": 3,
+                "loc": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [[0, 0], [3, 0], [3, 3], [0, 3], [0, 0]],
+                        [[1, 1], [1, 2], [2, 2], [2, 1], [1, 1]],
+                    ],
+                },
+            },
+        ],
+        [("loc", "2dsphere")],
+        {},
+    ),
+    "sphere_levels": (
+        [{"_id": 1, "loc": _SQUARE}, {"_id": 2, "loc": _BIG}],
+        [("loc", "2dsphere")],
+        {"finestIndexedLevel": 10, "coarsestIndexedLevel": 6},
+    ),
+    "sphere_geo_first": (
+        [
+            {"_id": 1, "loc": _pt(1, 1), "z": [1, 2]},
+            {"_id": 2, "loc": _pt(1, 1)},
+            {"_id": 3, "loc": _pt(1, 1), "z": "s"},
+            {"_id": 4, "loc": _SQUARE, "z": 4},
+        ],
+        [("loc", "2dsphere"), ("z", 1)],
+        {},
+    ),
+    "sphere_geo_last": (
+        [
+            {"_id": 1, "loc": _pt(1, 1), "z": [1, 2]},
+            {"_id": 2, "z": 2},
+            {"_id": 3, "loc": [], "z": 3},
+        ],
+        [("z", 1), ("loc", "2dsphere")],
+        {},
+    ),
+    "sphere_nested": (
+        [{"_id": 1, "a": {"loc": _SQUARE}}, {"_id": 2, "a": {"loc": _pt(1, 1)}}],
+        [("a.loc", "2dsphere")],
+        {},
+    ),
+}
+
+_WILDCARD_CASES = {
+    "path": (
+        [
+            {"_id": 1, "w": {"x": 1, "y": [1, [2, 3]]}},
+            {"_id": 2, "w": [{"a": 1}, {"a": 2}]},
+            {"_id": 3, "w": [[1, 2], [3]]},
+            {"_id": 4, "w": {"a": {"b": [{"c": 1}]}}},
+            {"_id": 5, "w": 5, "o": 9},
+            {"_id": 6, "w": {}},
+            {"_id": 7, "w": []},
+            {"_id": 8, "w": None},
+            {"_id": 9},
+        ],
+        [("w.$**", 1)],
+        {},
+    ),
+    "descending": (
+        [{"_id": 1, "w": {"x": 1, "y": [1, [2, 3]]}}, {"_id": 2, "w": [{"a": 1}, {"a": 2}]}],
+        [("w.$**", -1)],
+        {},
+    ),
+    "all_fields": (
+        [
+            {"_id": 1, "a": None, "b": {"d": 1.5}, "c": [], "d": [[]], "e": [{}], "f": [None]},
+            {"_id": 2, "a": {"b": {}}, "s": "Abc", "n": {"$numberDecimal": "1"}},
+            {"_id": 3, "a": [1, 1, 2]},
+        ],
+        [("$**", 1)],
+        {},
+    ),
+    "collated": (
+        [{"_id": 1, "a": 1, "b": [1, 2], "s": "Abc"}],
+        [("$**", 1)],
+        {"collation": {"locale": "en", "strength": 2}},
+    ),
+    "projection_in": (
+        [{"_id": 1, "a": 1, "b": [1, 2], "c": {"d": [3]}}],
+        [("$**", 1)],
+        {"wildcardProjection": {"a": 1, "c": 1}},
+    ),
+    "projection_out": (
+        [{"_id": 1, "a": 1, "b": {"c": 2}}],
+        [("$**", 1)],
+        {"wildcardProjection": {"b": 0}},
+    ),
+    "projection_id": (
+        [{"_id": 1, "a": 1, "b": {"c": 2}, "z": 1}],
+        [("$**", -1)],
+        {"wildcardProjection": {"b": 1, "_id": 1}},
+    ),
+    "compound": (
+        [{"_id": 1, "a": 1, "b": [1, 2]}, {"_id": 2, "a": 2, "b": 3}],
+        [("a", 1), ("$**", 1)],
+        {"wildcardProjection": {"b": 1}},
+    ),
+    "partial": (
+        [{"_id": 1, "a": 1, "b": 1}, {"_id": 2, "a": 3, "b": [1]}],
+        [("$**", 1)],
+        {"partialFilterExpression": {"a": {"$gt": 1}}},
+    ),
+}
+
+
+def _validate_cases(tmp_path: Path, cases: dict) -> dict:
+    def setup(c: pymongo.MongoClient) -> None:
+        for name, (docs, keys, opts) in cases.items():
+            c.app[name].insert_many(docs)
+            c.app[name].create_index(keys, name="i", **opts)
+
+    with _mongod_on_secantus_store(tmp_path, setup) as mongod:
+        return {name: _validation(mongod, "app", name) for name in cases}
+
+
+@pytest.mark.backlog_fixed("RM-741")
+def test_mongod_validates_each_kind_of_2d_index_secantus_wrote(tmp_path: Path) -> None:
+    """RM-741: `2d` indexes of every shape this server writes (several
+    locations, compound with array fields, the `bits` / `min` / `max`
+    options) hold the keys mongod 8.2.11 makes."""
+    cases = {n: c for n, c in _GEO_CASES.items() if n.startswith("flat_")}
+    assert _validate_cases(tmp_path, cases) == {name: (True, [], []) for name in cases}
+
+
+@pytest.mark.backlog_fixed("RM-742")
+def test_mongod_validates_each_kind_of_2dsphere_index_secantus_wrote(tmp_path: Path) -> None:
+    """RM-742: `2dsphere` indexes of every shape this server writes (every
+    GeoJSON kind, the covering levels, the geo field first or last or
+    nested, array fields beside it) hold the keys, and the multikey flag and
+    paths, mongod 8.2.11 makes."""
+    cases = {n: c for n, c in _GEO_CASES.items() if n.startswith("sphere_")}
+    assert _validate_cases(tmp_path, cases) == {name: (True, [], []) for name in cases}
+
+
+@pytest.mark.backlog_fixed("RM-743")
+def test_mongod_validates_each_kind_of_wildcard_index_secantus_wrote(tmp_path: Path) -> None:
+    """RM-743: wildcard indexes of every shape this server writes (a path,
+    descending, arrays and nested arrays, empty objects and arrays, a
+    collation, an inclusion or exclusion projection, compound, partial) hold
+    the keys and the multikey metadata keys mongod 8.2.11 makes."""
+    assert _validate_cases(tmp_path, _WILDCARD_CASES) == {
+        name: (True, [], []) for name in _WILDCARD_CASES
+    }
 
 
 @pytest.mark.backlog("RM-744")
@@ -810,7 +1042,7 @@ def _secantus_open(store: Path) -> tuple[str, str]:
 
 #: The index kinds this server does not key as mongod does (refused by name
 #: when a store holds one), which the servable scenario drops.
-_MONGOD_ONLY_KINDS = ("h_hashed", "loc_2dsphere", "flat_2d", "body_text", "w_wildcard")
+_MONGOD_ONLY_KINDS = ("loc_2dsphere", "flat_2d", "body_text", "w_wildcard")
 
 #: What both servers rewrite as they run, whoever wrote the store: each
 #: server's logical session cache refreshes the sessions it has seen into
@@ -822,7 +1054,7 @@ def _servable_scenario(rs: pymongo.MongoClient) -> None:
     """Phase 0b's scenario on mongod (every collection and index kind,
     capped, clustered, collated, pre-images, a view, a drop, a rename, a
     transaction), less what this server refuses by name in a store: the index
-    kinds it keys otherwise (RM-741 to RM-743, hashed, text), the
+    kinds it keys otherwise (RM-741 to RM-743, text), the
     time-series collection (RM-754) and the user and role (RM-744)."""
     from tools.probes.mongod_store_layout import run_scenario
 
@@ -1045,17 +1277,17 @@ def _build_quietly(rs: pymongo.MongoClient) -> None:
 def test_secantus_opens_a_killed_mongod_store_whose_oplog_drops_what_it_refuses(
     tmp_path: Path,
 ) -> None:
-    """A killed mongod 8.2.11 store whose stable checkpoint lists a `hashed`
+    """A killed mongod 8.2.11 store whose stable checkpoint lists a `text`
     index that the oplog after it drops: mongod's restart replays the drop
     and serves the collection without it. `secantusd-mdb` judges the store
     at the checkpoint, before its replay, and refuses it by name."""
 
     def setup(rs: pymongo.MongoClient) -> None:
-        rs.app.c.insert_many([{"_id": i, "h": i} for i in range(5)])
-        rs.app.c.create_index([("h", "hashed")], name="h_hashed")
+        rs.app.c.insert_many([{"_id": i, "h": f"word {i}"} for i in range(5)])
+        rs.app.c.create_index([("h", "text")], name="h_text")
         rs.admin.command("fsync")
-        rs.app.c.drop_index("h_hashed")
-        rs.app.c.insert_one({"_id": 5, "h": 5})
+        rs.app.c.drop_index("h_text")
+        rs.app.c.insert_one({"_id": 5, "h": "word 5"})
 
     store, port = _mongod_store_at(tmp_path, setup, kill=True)
     served = _served_after_mongods_restart(store, port, tmp_path)
@@ -1211,16 +1443,16 @@ def test_secantus_refuses_a_set_of_two_members_by_name(tmp_path: Path) -> None:
 @pytest.mark.backlog_fixed("RM-723")
 def test_secantus_refuses_an_index_kind_it_does_not_serve_by_name(tmp_path: Path) -> None:
     """A mongod store holding an index this server does not write as mongod
-    does (here `hashed`, which it refuses to create) is refused when
+    does (here `text`, which it refuses to create) is refused when
     `secantusd-mdb` opens it, naming the index, never served without it."""
 
     def setup(rs: pymongo.MongoClient) -> None:
         rs["app"]["c"].insert_one({"_id": 1, "h": "x"})
-        rs["app"]["c"].create_index([("h", "hashed")], name="h_hashed")
+        rs["app"]["c"].create_index([("h", "text")], name="h_text")
 
     store = _mongod_store(tmp_path, setup)
     outcome, said = _secantus_open(store)
-    assert (outcome, "app.c" in said, "h_hashed" in said) == ("refused", True, True), said
+    assert (outcome, "app.c" in said, "h_text" in said) == ("refused", True, True), said
 
 
 # ------------------------------------------------ storage-model phase 7b --
@@ -1261,3 +1493,283 @@ def test_the_initiation_logs_the_pre_images_collection(tmp_path: Path) -> None:
             if "create" in e["o"]
         ]
     assert "system.preimages" in creates, creates
+
+
+def _geo_wildcard_docs() -> list[dict]:
+    """The documents of the geo / wildcard hand-off store (RM-775)."""
+    docs: list[dict] = []
+    for i in range(60):
+        x, y = (i * 7) % 40 - 20, (i * 11) % 30 - 15
+        docs.append(
+            {
+                "_id": i,
+                "t": i % 4,
+                "flat": [x, y],
+                "pt": {"type": "Point", "coordinates": [x + 0.5, y + 0.25]},
+                "pts": {"type": "MultiPoint", "coordinates": [[x, y], [y / 2, x / 2]]},
+                "places": [
+                    {"loc": {"type": "Point", "coordinates": [x, y]}, "n": i},
+                    {"loc": {"type": "Point", "coordinates": [y / 2, x / 2]}, "n": i + 1},
+                ],
+                "poly": {
+                    "type": "Polygon",
+                    "coordinates": [[[x, y], [x + 2, y], [x + 2, y + 2], [x, y + 2], [x, y]]],
+                },
+                "w": {"a": i % 5, "b": [i % 3, f"s{i % 4}"], "c": {"d": i % 7, "e": None}},
+                "z": i % 9,
+                "arr": [{"k": i % 6}, {"k": (i + 1) % 6}],
+                "keep": i % 2 == 0,
+            }
+        )
+    return docs
+
+
+def _geo_wildcard_indexes(coll: Any) -> None:
+    coll.create_index([("flat", "2d"), ("t", 1)], name="flat_t")
+    coll.create_index(
+        [("flat", "2d")],
+        name="flat_b",
+        bits=20,
+        min=-100,
+        max=100,
+        partialFilterExpression={"keep": True},
+    )
+    coll.create_index([("pt", "2dsphere"), ("t", 1)], name="pt_t")
+    coll.create_index([("t", 1), ("pts", "2dsphere")], name="t_pts")
+    coll.create_index([("places.loc", "2dsphere"), ("t", -1)], name="pl_s")
+    coll.create_index(
+        [("poly", "2dsphere")], name="poly_s", partialFilterExpression={"t": {"$gte": 1}}
+    )
+    coll.create_index([("$**", 1)], name="all_w")
+    coll.create_index([("w.$**", 1)], name="w_w")
+    coll.create_index(
+        [("$**", 1)], name="proj_w", wildcardProjection={"w.a": 1, "arr.k": 1, "z": 1}
+    )
+    coll.create_index(
+        [("$**", 1)],
+        name="excl_w",
+        wildcardProjection={"flat": 0, "pt": 0, "pts": 0, "poly": 0, "w": 0},
+    )
+    coll.create_index([("$**", 1)], name="part_w", partialFilterExpression={"keep": True})
+
+
+def _sq(x: int, lo: int = 0) -> dict:
+    return {
+        "type": "Polygon",
+        "coordinates": [[[lo, lo], [x, lo], [x, x], [lo, x], [lo, lo]]],
+    }
+
+
+#: (name, filter, hint, sort)
+_GEO_QUERIES: list[tuple[str, dict, str | None, list | None]] = [
+    ("near2d", {"flat": {"$near": [3, 4]}}, "flat_t", None),
+    ("near2d_max", {"flat": {"$near": [3, 4], "$maxDistance": 12}, "t": 1}, "flat_t", None),
+    ("nearSphere2d", {"flat": {"$nearSphere": [3, 4], "$maxDistance": 0.3}}, "flat_t", None),
+    ("within_box", {"flat": {"$geoWithin": {"$box": [[-5, -5], [8, 9]]}}}, "flat_t", None),
+    (
+        "within_center",
+        {"flat": {"$geoWithin": {"$center": [[0, 0], 9]}}, "t": {"$in": [0, 2]}},
+        "flat_t",
+        None,
+    ),
+    (
+        "within_poly2d",
+        {"flat": {"$geoWithin": {"$polygon": [[-9, -9], [12, -3], [3, 11]]}}},
+        "flat_t",
+        None,
+    ),
+    (
+        "partial2d",
+        {"flat": {"$geoWithin": {"$box": [[-20, -20], [20, 20]]}}, "keep": True},
+        "flat_b",
+        None,
+    ),
+    (
+        "near_pt",
+        {
+            "pt": {
+                "$near": {
+                    "$geometry": {"type": "Point", "coordinates": [1, 2]},
+                    "$maxDistance": 2_000_000,
+                }
+            }
+        },
+        "pt_t",
+        None,
+    ),
+    (
+        "nearSphere_pt_t",
+        {
+            "pt": {
+                "$nearSphere": {
+                    "$geometry": {"type": "Point", "coordinates": [1, 2]},
+                    "$minDistance": 100_000,
+                }
+            },
+            "t": 2,
+        },
+        "pt_t",
+        None,
+    ),
+    ("within_sphere", {"pt": {"$geoWithin": {"$geometry": _sq(10, -10)}}}, "pt_t", None),
+    ("within_centerSphere", {"pt": {"$geoWithin": {"$centerSphere": [[0, 0], 0.2]}}}, "pt_t", None),
+    (
+        "intersects_poly",
+        {"poly": {"$geoIntersects": {"$geometry": _sq(9)}}, "t": {"$gte": 1}},
+        "poly_s",
+        None,
+    ),
+    (
+        "intersects_pts",
+        {"pts": {"$geoIntersects": {"$geometry": _sq(6, -6)}}, "t": 1},
+        "t_pts",
+        None,
+    ),
+    (
+        "near_pts_array",
+        {"pts": {"$near": {"$geometry": {"type": "Point", "coordinates": [5, 5]}}}, "t": 3},
+        "t_pts",
+        None,
+    ),
+    (
+        "near_places",
+        {"places.loc": {"$near": {"$geometry": {"type": "Point", "coordinates": [3, 3]}}}},
+        "pl_s",
+        None,
+    ),
+    ("within_places", {"places.loc": {"$geoWithin": {"$geometry": _sq(8, -8)}}}, "pl_s", None),
+    ("w_eq", {"w.a": 3}, "all_w", None),
+    ("w_eq_arr", {"w.b": 2}, "all_w", None),
+    ("w_str", {"w.b": "s1"}, "w_w", None),
+    ("w_range", {"w.c.d": {"$gt": 2, "$lte": 5}}, "w_w", None),
+    ("w_null", {"w.c.e": None}, "all_w", None),
+    ("w_in", {"z": {"$in": [1, 4, 8]}}, "all_w", None),
+    ("w_proj_eq", {"w.a": 2}, "proj_w", None),
+    ("w_proj_arr", {"arr.k": {"$gte": 4}}, "proj_w", None),
+    ("w_proj_z", {"z": {"$lt": 3}}, "proj_w", None),
+    ("w_excl", {"z": {"$gte": 7}}, "excl_w", None),
+    ("w_excl_arr", {"arr.k": 5}, "excl_w", None),
+    ("w_part", {"w.a": 1, "keep": True}, "part_w", None),
+    ("w_sort", {"w.c.d": {"$gte": 0}}, "w_w", [("w.c.d", 1), ("_id", 1)]),
+    ("w_exists", {"w.c.d": {"$exists": True}}, "w_w", None),
+]
+
+
+def _geo_answers(coll: Any) -> dict:
+    """Each query's ids (in order where mongod defines one) and count."""
+    out: dict = {}
+    for name, flt, hint, sort in _GEO_QUERIES:
+        ordered = "near" in name.lower()
+
+        def run(flt=flt, hint=hint, sort=sort, ordered=ordered):
+            cur = coll.find(flt, hint=hint)
+            if sort:
+                cur = cur.sort(sort)
+            ids = [d["_id"] for d in cur]
+            return ids if (ordered or sort) else sorted(ids)
+
+        out[name] = mongo_answer(run)
+        if "near" not in name.lower():
+            out["count:" + name] = mongo_answer(
+                lambda flt=flt, hint=hint: coll.count_documents(flt, hint=hint)
+            )
+    return out
+
+
+def _winning(plan: dict | None) -> list:
+    """The winning plan's stage and index names, root first."""
+    out: list = []
+    while plan:
+        out.append((plan.get("stage"), plan.get("indexName")))
+        plan = plan.get("inputStage") or (plan.get("inputStages") or [None])[0]
+    return out
+
+
+def _geo_plans(coll: Any) -> dict:
+    # No hint: the planner chooses, as it does on mongod.
+    return {
+        name: mongo_answer(
+            lambda flt=flt: _winning(coll.find(flt).explain()["queryPlanner"]["winningPlan"])
+        )
+        for name, flt, _hint, _sort in _GEO_QUERIES
+    }
+
+
+_GEO_WRITES_DOC = {
+    "_id": 900,
+    "t": 1,
+    "flat": [1, 1],
+    "pt": {"type": "Point", "coordinates": [1, 1]},
+    "pts": {"type": "MultiPoint", "coordinates": [[2, 2]]},
+    "places": [{"loc": {"type": "Point", "coordinates": [2, 2]}, "n": 1}],
+    "poly": _sq(3),
+    "w": {"a": 3, "b": [2], "c": {"d": 4}},
+    "z": 1,
+    "arr": [{"k": 5}],
+    "keep": True,
+}
+
+
+def _geo_writes(coll: Any) -> None:
+    coll.insert_one(dict(_GEO_WRITES_DOC))
+    coll.update_one({"_id": 5}, {"$set": {"flat": [2, 2], "w.a": 3, "z": 8, "keep": False}})
+    coll.delete_one({"_id": 6})
+
+
+@pytest.mark.backlog("RM-775")
+def test_secantus_serves_mongods_geo_and_wildcard_indexes(tmp_path: Path) -> None:
+    """A store mongod 8.2.11 wrote holding `2d`, `2dsphere` (compound, array,
+    partial) and wildcard (whole, subtree, `wildcardProjection` both ways,
+    partial) indexes is adopted by `secantusd-mdb`, which answers `$near` /
+    `$nearSphere` / `$geoWithin` / `$geoIntersects` and wildcard queries as
+    mongod does on the same data (documents, order where mongod defines it,
+    winning plans), keeps the indexes consistent through its own writes, and
+    hands the store back to a mongod whose `validate({full: true})` passes."""
+    store = tmp_path / "store"
+    store.mkdir()
+    proc, client = _mongod_on(store)
+    assert client is not None, "mongod did not start on an empty directory"
+    host, port = client.address or ("127.0.0.1", 0)
+    try:
+        _wait_primary(client, f"{host}:{port}")
+        with pymongo.MongoClient(
+            host, port, replicaSet="rs0", serverSelectionTimeoutMS=10_000
+        ) as rs:
+            coll = rs["app"]["g"]
+            coll.insert_many(_geo_wildcard_docs())
+            _geo_wildcard_indexes(coll)
+            expected = {"answers": _geo_answers(coll), "plans": _geo_plans(coll)}
+    finally:
+        _stop_mongod(proc, client)
+    # A copy of the clean store takes the writes on mongod, the reference for
+    # what the answers are afterwards.
+    ref = tmp_path / "ref" / "store"
+    shutil.copytree(store, ref)
+    proc, client = _mongod_on(ref, port)
+    assert client is not None, "mongod did not reopen its own store"
+    try:
+        _until_primary(client)
+        _geo_writes(client["app"]["g"])
+        expected["after"] = _geo_answers(client["app"]["g"])
+    finally:
+        _stop_mongod(proc, client)
+    names = ["_id_", "flat_t", "flat_b", "pt_t", "t_pts", "pl_s", "poly_s"]
+    names += ["all_w", "w_w", "proj_w", "excl_w", "part_w"]
+    with rust_mongo_server(store) as rust:
+        coll = rust["app"]["g"]
+        listed = mongo_answer(lambda: sorted(ix["name"] for ix in coll.list_indexes()))
+        assert listed == ("ok", sorted(names))
+        assert _geo_answers(coll) == expected["answers"]
+        assert _geo_plans(coll) == expected["plans"]
+        _geo_writes(coll)
+        assert _geo_answers(coll) == expected["after"]
+        rust_port = rust.address[1]
+    proc, mongod = _mongod_on(store, rust_port, SECANTUS_SET)
+    try:
+        assert mongod is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            _until_primary(mongod)
+            assert _validation_findings(mongod, "app", "g") is None
+            assert _geo_answers(mongod["app"]["g"]) == expected["after"]
+    finally:
+        _stop_mongod(proc, mongod)

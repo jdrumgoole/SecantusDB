@@ -204,18 +204,37 @@ fn compound_index_entries() {
 }
 
 #[test]
-fn reject_text_and_hashed_indexes() {
+fn reject_text_indexes() {
     with_db(|st| {
         assert!(matches!(
             st.create_index("app", "c", "t_text", &doc! {"t": "text"}, &doc! {})
                 .unwrap_err(),
             StorageError::CreateIndexUnsupported(_)
         ));
-        assert!(matches!(
-            st.create_index("app", "c", "h_hashed", &doc! {"h": "hashed"}, &doc! {})
-                .unwrap_err(),
-            StorageError::CreateIndexUnsupported(_)
-        ));
+    });
+}
+
+/// A hashed index holds the `NumberLong` hash of each value (RM-732): a
+/// missing field hashes as null, and an array is refused as mongod refuses
+/// it (16766).
+#[test]
+fn a_hashed_index_keys_each_document_once_by_its_hash() {
+    with_db(|st| {
+        st.create_index("app", "c", "h_hashed", &doc! {"h": "hashed"}, &doc! {})
+            .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "h": 3}))
+            .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 2, "h": 3.5}))
+            .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 3, "x": 1}))
+            .unwrap();
+        // 3 and 3.5 hash alike (a double is truncated), and a missing field is null.
+        assert_eq!(st.index_entries("app", "c", "h_hashed").unwrap().len(), 3);
+        let err = st
+            .insert_one("app", "c", &enc(&doc! {"_id": 4, "h": [1, 2]}))
+            .unwrap_err();
+        assert!(err.to_string().contains("Found array at path: h"), "{err}");
+        assert_eq!(st.index_entries("app", "c", "h_hashed").unwrap().len(), 3);
     });
 }
 

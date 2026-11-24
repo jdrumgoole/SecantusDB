@@ -158,12 +158,9 @@ fn create_2d_over_existing_data() {
 #[test]
 fn other_geo_index_types_still_rejected() {
     with_db(|st| {
-        // text / hashed are not supported (2d and 2dsphere are).
+        // text is not supported (2d, 2dsphere and hashed are).
         assert!(st
             .create_index("app", "c", "t", &doc! {"name": "text"}, &doc! {})
-            .is_err());
-        assert!(st
-            .create_index("app", "c", "h", &doc! {"name": "hashed"}, &doc! {})
             .is_err());
     });
 }

@@ -36,6 +36,46 @@ pub fn hash64(v: &Bson, missing: bool) -> i64 {
     i64::from_le_bytes(d[..8].try_into().unwrap())
 }
 
+/// Whether an index key pattern's value names a hashed field.
+pub fn is_hashed_spec(v: &Bson) -> bool {
+    matches!(v, Bson::String(s) if s == "hashed")
+}
+
+/// The key a hashed index holds for a field's value: its `hash64` as a
+/// `NumberLong`. Under a collation every string in the value, at any depth,
+/// is hashed as its collation key (mongod's `collationAwareIndexKeyAppend`
+/// before the hash, measured 8.2.11, 2026-11-23). A missing field is null.
+pub fn index_key(v: Option<&Bson>, collation: Option<&crate::collation::Collation>) -> Bson {
+    let h = match (v, collation) {
+        (None, _) => hash64(&Bson::Null, true),
+        (Some(v), Some(c)) => hash64(&crate::collation::comparison_key(v, c), false),
+        (Some(v), None) => hash64(v, false),
+    };
+    Bson::Int64(h)
+}
+
+/// Where a document holds an array along the path of a hashed index's key
+/// field, the path mongod names: the prefix of `path` up to and including
+/// the array (`extractElementAtPathOrArrayAlongPath`). `None` when the path
+/// reaches a non-array value or ends early.
+pub fn array_along_path(doc: &Document, path: &str) -> Option<String> {
+    let mut cur: &Document = doc;
+    let mut walked = String::new();
+    let mut parts = path.split('.').peekable();
+    while let Some(part) = parts.next() {
+        if !walked.is_empty() {
+            walked.push('.');
+        }
+        walked.push_str(part);
+        match cur.get(part) {
+            Some(Bson::Array(_)) => return Some(walked),
+            Some(Bson::Document(d)) if parts.peek().is_some() => cur = d,
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// `canonicalizeBSONType`.
 fn canonical_type(v: &Bson) -> i32 {
     // A string that is not UTF-8 hashes as the string it is (RM-222).
@@ -264,6 +304,33 @@ mod tests {
         let mut m = Md5::new();
         m.update(s);
         m.finish().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn an_index_key_is_the_long_hash_and_a_missing_field_is_null() {
+        // mongod 8.2.11: `{a: 3}` is keyed -1529429926180645992, and null
+        // 2338878944348059895, as a missing field.
+        assert_eq!(
+            index_key(Some(&Bson::Int32(3)), None),
+            Bson::Int64(-1529429926180645992)
+        );
+        assert_eq!(
+            index_key(Some(&Bson::Double(3.5)), None),
+            index_key(Some(&Bson::Int32(3)), None)
+        );
+        assert_eq!(index_key(None, None), Bson::Int64(2338878944348059895));
+        assert_eq!(index_key(Some(&Bson::Null), None), index_key(None, None));
+    }
+
+    #[test]
+    fn the_array_along_a_path_is_named_by_its_own_prefix() {
+        let d = doc! {"a": [{"b": 1}], "c": {"d": [1]}, "e": {"f": 1}, "g": 5};
+        assert_eq!(array_along_path(&d, "a.b").as_deref(), Some("a"));
+        assert_eq!(array_along_path(&d, "c.d").as_deref(), Some("c.d"));
+        assert_eq!(array_along_path(&d, "c").as_deref(), None);
+        assert_eq!(array_along_path(&d, "e.f"), None);
+        assert_eq!(array_along_path(&d, "g.h"), None);
+        assert_eq!(array_along_path(&d, "missing.x"), None);
     }
 
     #[test]

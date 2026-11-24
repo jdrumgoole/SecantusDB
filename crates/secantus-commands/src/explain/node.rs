@@ -43,6 +43,20 @@ impl IndexInfo {
             .collect()
     }
 
+    /// Whether key field `pos` is hashed: its keys are the hashes of its
+    /// values, which no range, and no sort, can be read from.
+    pub fn is_hashed(&self, pos: usize) -> bool {
+        self.key
+            .values()
+            .nth(pos)
+            .is_some_and(secantus_core::hashed::is_hashed_spec)
+    }
+
+    /// Whether the index has a hashed field.
+    pub fn has_hashed(&self) -> bool {
+        self.key.values().any(secantus_core::hashed::is_hashed_spec)
+    }
+
     pub fn position(&self, field: &str) -> Option<usize> {
         self.key.keys().position(|k| k == field)
     }
@@ -52,8 +66,10 @@ impl IndexInfo {
     /// keys are its values (mongod 8.2.11 covers `a` from `a_1_c_1` when
     /// only `c` holds arrays, `multiKeyPaths: {a: [], c: ["c"]}`).
     pub fn holds_value(&self, field: &str) -> bool {
-        self.position(field)
-            .is_some_and(|i| self.multikey_paths.get(i).is_none_or(|p| p.is_empty()))
+        self.position(field).is_some_and(|i| {
+            // A hashed field's key is its hash, not its value.
+            !self.is_hashed(i) && self.multikey_paths.get(i).is_none_or(|p| p.is_empty())
+        })
     }
 
     /// The flags every index-scanning stage carries, in mongod's order.
@@ -65,8 +81,9 @@ impl IndexInfo {
             out.insert("collation", c.spec().clone());
         }
         out.insert("isMultiKey", self.is_multikey());
-        // The `_id` index cannot be multikey, and mongod prints no paths for it.
-        if self.name != "_id_" {
+        // The `_id` index cannot be multikey, and mongod prints no paths for
+        // it, nor for an index with a hashed field (it tracks none).
+        if self.name != "_id_" && !self.has_hashed() {
             let mut paths = Document::new();
             for (field, parts) in self.key.keys().zip(&self.multikey_paths) {
                 paths.insert(

@@ -245,7 +245,7 @@ See the [SQL / PostgreSQL interface](sql.md).
 Both servers share the project-wide non-goals — anything that depends on **real
 cluster topology** (multi-node replica sets, sharding, elections, cross-node
 oplog), auth mechanisms beyond SCRAM (SHA-1 / SHA-256) and `MONGODB-X509`,
-text / hashed / wildcard indexes, and
+text / wildcard indexes, and
 `$where` / `$function` / `$accumulator` / JS `mapReduce` (no embedded JS
 runtime).
 These are out of scope for **both** servers; the per-feature detail lives in

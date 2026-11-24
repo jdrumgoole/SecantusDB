@@ -373,6 +373,57 @@ fn a_repair_finishes_an_unfinished_build() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A hashed index built over documents, with writes recorded while it is
+/// built, holds the hash of every document's value: `check_collection`
+/// finds no entry missing or extra, and an array under it stops the build
+/// as mongod's does (16766, RM-732).
+#[test]
+fn a_hashed_index_is_built_over_documents() {
+    let home = temp_home();
+    let st = Storage::open(home.to_str().unwrap()).unwrap();
+    load(&st, 500);
+    let uuid = [5u8; 16];
+    st.begin_index_build(
+        "app",
+        "c",
+        uuid,
+        &[spec("a_hashed", doc! {"a": "hashed"}, doc! {})],
+        "localhost:27017",
+    )
+    .unwrap();
+    set_a(&st, 3, 9_000);
+    st.run_index_build(&uuid, 200 * 1024 * 1024).unwrap();
+    st.commit_index_build(&uuid).unwrap();
+    assert_consistent(&st);
+    assert_eq!(st.index_entries("app", "c", "a_hashed").unwrap().len(), 500);
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+
+    let home = temp_home();
+    let st = Storage::open(home.to_str().unwrap()).unwrap();
+    load(&st, 10);
+    let (_, errors) = st
+        .insert("app", "c", vec![enc(&doc! {"_id": 99, "a": [1, 2]})], true)
+        .unwrap();
+    assert!(errors.is_empty(), "{errors:?}");
+    let uuid = [6u8; 16];
+    st.begin_index_build(
+        "app",
+        "c",
+        uuid,
+        &[spec("a_hashed", doc! {"a": "hashed"}, doc! {})],
+        "localhost:27017",
+    )
+    .unwrap();
+    let stopped = st.run_index_build(&uuid, 200 * 1024 * 1024).unwrap_err();
+    assert!(
+        stopped.to_string().contains("Found array at path: a"),
+        "{stopped}"
+    );
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// A build over documents refuses the index types this engine does not
 /// build, as the one-step build does. It skipped the check, and a text index
 /// over a collection with documents was recorded as built (found
@@ -382,19 +433,17 @@ fn a_build_over_documents_refuses_a_text_index() {
     let home = temp_home();
     let st = Storage::open(home.to_str().unwrap()).unwrap();
     load(&st, 3);
-    for key in [doc! {"s": "text"}, doc! {"s": "hashed"}] {
-        let refused = st.begin_index_build(
-            "app",
-            "c",
-            [9u8; 16],
-            &[spec("t", key.clone(), doc! {})],
-            "localhost:27017",
-        );
-        assert!(
-            matches!(refused, Err(StorageError::CreateIndexUnsupported(_))),
-            "{key}: {refused:?}"
-        );
-    }
+    let refused = st.begin_index_build(
+        "app",
+        "c",
+        [9u8; 16],
+        &[spec("t", doc! {"s": "text"}, doc! {})],
+        "localhost:27017",
+    );
+    assert!(
+        matches!(refused, Err(StorageError::CreateIndexUnsupported(_))),
+        "{refused:?}"
+    );
     let names: Vec<String> = st
         .list_indexes("app", "c")
         .unwrap()

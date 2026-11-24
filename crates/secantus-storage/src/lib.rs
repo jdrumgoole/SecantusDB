@@ -1,5 +1,5 @@
 //! SecantusDB's storage layer, in Rust: mongod's storage model on WiredTiger,
-//! at store format 10 (`store_format.rs`; the layout and how it was reached:
+//! at store format 11 (`store_format.rs`; the layout and how it was reached:
 //! `tasks/mongod-storage-model-plan.md`), built on `secantus-wt` (the
 //! WiredTiger FFI) and `secantus-core`'s `keystring` and `sortkey` (the
 //! index keys, and the in-memory identity and `$sort` bytes).
@@ -37,10 +37,6 @@ use std::time::{Duration, Instant};
 use bson::oid::ObjectId;
 use bson::spec::BinarySubtype;
 use bson::{Binary, Bson, Document};
-use s2::cellid::CellID;
-use s2::latlng::LatLng;
-use s2::rect::Rect;
-use s2::region::RegionCoverer;
 use secantus_core::collation::Collation;
 use secantus_core::deadline;
 use secantus_core::diff::compute_update_description_for;
@@ -55,6 +51,7 @@ use secantus_core::{get_path, get_path_values};
 /// that see it (a [`ReadFault`] in a test builds one).
 pub use secantus_wt::WtError;
 use secantus_wt::{Connection, Cursor, Session};
+use wildcard::is_wildcard_spec;
 
 /// The literal BSON decoder, for the crates that depend on this one.
 pub use secantus_core::bsondoc;
@@ -80,6 +77,7 @@ pub mod mdb_catalog;
 mod scan_bounds;
 mod sizes;
 pub mod store_format;
+mod wildcard;
 
 pub use catalog_changes::CatalogChange;
 pub use index_build::{IndexBuildAbort, IndexBuildInfo, IndexBuildSpec};
@@ -2240,6 +2238,9 @@ struct IndexDesc {
     /// `Some` for a `2dsphere` S2 index — its field. Writes covering cells +
     /// ancestors per geometry, not `index_key_variants`.
     geo_sphere: Option<GeoSphere>,
+    /// `Some` for a wildcard index: its projection and the position of its
+    /// `$**` field.
+    wildcard: Option<WildcardDesc>,
     /// The collection is clustered (a duplicate key is reported as
     /// mongod reports one on a clustered collection's key).
     clustered: bool,
@@ -2269,8 +2270,158 @@ impl IndexDesc {
 
     /// How this index's values become the KeyString its entries are keyed by.
     fn shape(&self) -> KeyShape {
-        KeyShape::new(&self.key_spec, self.collation.clone(), self.key_order)
-            .clustered(self.rid_bytes)
+        let shape = KeyShape::new(&self.key_spec, self.collation.clone(), self.key_order)
+            .clustered(self.rid_bytes);
+        match &self.wildcard {
+            Some(w) => shape.wildcard_at(w.at),
+            None => shape,
+        }
+    }
+
+    /// A wildcard index's keys for `doc`, as one value per key slot: the
+    /// fields before `$**` (their keys as any index makes them), `$_path`,
+    /// the value; then the fields after it.
+    fn wildcard_key_values(&self, doc: &Document) -> Vec<Vec<Bson>> {
+        let Some(w) = &self.wildcard else {
+            return Vec::new();
+        };
+        let found = wildcard::leaves(doc, &w.projection);
+        let mut out: Vec<Vec<Bson>> = Vec::new();
+        for (path, value) in found.keys {
+            let mut keys: Vec<Vec<Bson>> = vec![Vec::new()];
+            for (at, field) in self.key_spec.keys().enumerate() {
+                let values = if at == w.at {
+                    None
+                } else {
+                    Some(index_field_values(doc, field, false).0)
+                };
+                keys = keys
+                    .into_iter()
+                    .flat_map(|k| match &values {
+                        None => {
+                            let mut k = k;
+                            k.push(Bson::String(path.clone()));
+                            k.push(value.clone());
+                            vec![k]
+                        }
+                        Some(vs) => vs
+                            .iter()
+                            .map(|v| {
+                                let mut k = k.clone();
+                                k.push(v.clone());
+                                k
+                            })
+                            .collect(),
+                    })
+                    .collect();
+            }
+            for k in keys {
+                if !out.contains(&k) {
+                    out.push(k);
+                }
+            }
+        }
+        out
+    }
+
+    /// The paths of the arrays `doc` holds under a wildcard index.
+    fn wildcard_multikey_paths(&self, doc: &Document) -> BTreeSet<String> {
+        match &self.wildcard {
+            Some(w) => wildcard::leaves(doc, &w.projection).multikey,
+            None => BTreeSet::new(),
+        }
+    }
+
+    /// A wildcard index's multikey metadata keys for `doc`: for each array
+    /// path, `MinKey` in the fields before and after `$**`, then `1` and the
+    /// path.
+    fn wildcard_metadata_values(&self, doc: &Document) -> Vec<Vec<Bson>> {
+        let Some(w) = &self.wildcard else {
+            return Vec::new();
+        };
+        self.wildcard_multikey_paths(doc)
+            .into_iter()
+            .map(|path| {
+                let mut k = Vec::new();
+                for at in 0..self.key_spec.len() {
+                    if at == w.at {
+                        k.push(Bson::Int32(1));
+                        k.push(Bson::String(path.clone()));
+                    } else {
+                        k.push(Bson::MinKey);
+                    }
+                }
+                k
+            })
+            .collect()
+    }
+
+    /// Whether `doc` makes this index multikey, and the array prefixes it
+    /// adds per key field (the catalog's `multikeyPaths`). A `2d` index is
+    /// never multikey; a `2dsphere` index is on its geo field when that holds
+    /// more than one cell; a wildcard index is, with no paths, when a
+    /// document holds an array under it (its own entries say where).
+    fn multikey_paths_of(&self, doc: &Document) -> (bool, Vec<Vec<String>>) {
+        let mut paths: Vec<Vec<String>> = vec![Vec::new(); self.key_spec.len()];
+        if let Some(g) = &self.geo_2d {
+            // Several locations make the index multikey; the trailing fields
+            // are kept whole in a key, never expanded.
+            if g.cell_count(doc) > 1 {
+                paths[g.index.geo_at].push(g.field.clone());
+                return (true, paths);
+            }
+            return (false, paths);
+        }
+        if is_wildcard_spec(&self.key_spec) {
+            let makes = !self.wildcard_multikey_paths(doc).is_empty();
+            return (makes, paths);
+        }
+        for (field, parts) in self.key_spec.keys().zip(paths.iter_mut()) {
+            if self
+                .geo_sphere
+                .as_ref()
+                .is_some_and(|gs| gs.field == *field)
+            {
+                continue;
+            }
+            array_components(doc, field, parts);
+        }
+        if let Some(gs) = &self.geo_sphere {
+            if gs.cell_count(doc) > 1 {
+                paths[gs.index.geo_at].push(gs.field.clone());
+            }
+            return (paths.iter().any(|p| !p.is_empty()), paths);
+        }
+        (doc_makes_multikey(doc, &self.key_spec), paths)
+    }
+}
+
+/// Is `entry` a wildcard index's multikey metadata key, which no document
+/// owns and mongod never removes?
+fn is_metadata_entry(entry: &EntryKey) -> bool {
+    ixkeys::entry_rid(&entry.key, false) == Some(RecordId::Long(wildcard::metadata_rid()))
+}
+
+/// A wildcard index: where its `$**` field is, and what it projects.
+#[derive(Clone)]
+struct WildcardDesc {
+    at: usize,
+    projection: wildcard::Projection,
+}
+
+impl WildcardDesc {
+    fn parse(key_spec: &Document, opts: &Document) -> Option<WildcardDesc> {
+        let (at, field) = key_spec
+            .keys()
+            .enumerate()
+            .find(|(_, f)| *f == "$**" || f.ends_with(".$**"))?;
+        Some(WildcardDesc {
+            at,
+            projection: wildcard::Projection::new(
+                field,
+                opts.get_document("wildcardProjection").ok(),
+            ),
+        })
     }
 }
 
@@ -2378,54 +2529,129 @@ impl IdIndex {
     }
 }
 
-/// A geo index's cell, as the one BinData value its entry is keyed by.
-fn geo_entry(cell: &[u8], recordid: &RecordId) -> Result<EntryKey> {
-    KeyShape::plain().entry(&[geo_cell_value(cell)], recordid)
+/// The key value a geo index holds for one of its cells: a `2d` geohash is
+/// BinData of subtype 128 holding the 64-bit hash big-endian (`appendHashMin`),
+/// a `2dsphere` cell the S2 cell id as a NumberLong (index version 3).
+fn geo_part_value(part: &secantus_core::geoorder::KeyPart) -> Bson {
+    use secantus_core::geoorder::KeyPart;
+    match part {
+        KeyPart::Cell(c) => Bson::Int64(*c),
+        KeyPart::Hash(h) => Bson::Binary(Binary {
+            subtype: BinarySubtype::UserDefined(128),
+            bytes: h.to_be_bytes().to_vec(),
+        }),
+        KeyPart::Value(_) => Bson::Null,
+    }
 }
 
-fn geo_cell_value(cell: &[u8]) -> Bson {
-    Bson::Binary(Binary {
-        subtype: BinarySubtype::Generic,
-        bytes: cell.to_vec(),
-    })
+/// The geo index's cells for the value at `field`, distinct and in the order
+/// the covering gave them.
+fn geo_cells(index: &secantus_core::geoorder::GeoIndex, doc: &Document) -> Vec<Bson> {
+    let mut out: Vec<Bson> = Vec::new();
+    if let Some(v) = get_path(doc, index.geo_field()) {
+        for part in index.geo_keys(v) {
+            let cell = geo_part_value(&part);
+            if !out.contains(&cell) {
+                out.push(cell);
+            }
+        }
+    }
+    out
+}
+
+/// `dps::extractAllElementsAlongPath` into a `BSONElementSet`: the values at
+/// `path`, an array on the way or at its end contributing each of its
+/// elements (a nested array whole), distinct and in BSON order.
+fn extract_elements(doc: &Document, path: &str) -> Vec<Bson> {
+    fn walk(d: &Document, parts: &[&str], out: &mut Vec<Bson>) {
+        let Some(v) = d.get(parts[0]) else { return };
+        if parts.len() == 1 {
+            match v {
+                Bson::Array(items) => out.extend(items.iter().cloned()),
+                other => out.push(other.clone()),
+            }
+            return;
+        }
+        match v {
+            Bson::Document(inner) => walk(inner, &parts[1..], out),
+            Bson::Array(items) => {
+                for item in items {
+                    if let Bson::Document(inner) = item {
+                        walk(inner, &parts[1..], out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut out = Vec::new();
+    walk(doc, &parts, &mut out);
+    out.sort_by(order::cmp);
+    out.dedup_by(|a, b| order::cmp(a, b) == std::cmp::Ordering::Equal);
+    out
 }
 
 /// A `2d` geohash index's parameters (field + bucketing range / precision).
 #[derive(Clone)]
 struct Geo2d {
     field: String,
-    bits: u32,
     lo: f64,
     hi: f64,
+    /// The index as mongod keys it.
+    index: secantus_core::geoorder::GeoIndex,
 }
 
 impl Geo2d {
-    /// The geohash cell (8-byte big-endian key bytes) for a point-like value, or
-    /// `None` if the field value isn't a point (a `2d` index is point-only).
-    fn cell_kbs(&self, value: &Bson) -> Vec<Vec<u8>> {
-        // A value may hold several locations (`[[1, 1], [30, 30]]`): a cell
-        // each, so the document is found through any of them.
-        let mut out: Vec<Vec<u8>> = secantus_core::geoshape::stored_points(value)
+    /// The keys `doc` holds in the index, each as one value per key field
+    /// (`get2DKeys`): a geohash for each location the geo field holds, with
+    /// the other fields' values after it. A field with no value is a null,
+    /// one with several (an array's elements, or the elements along a path
+    /// through arrays) is the array of those values: a `2d` index is never
+    /// multikey.
+    fn key_values(&self, doc: &Document) -> Vec<Vec<Bson>> {
+        let cells = geo_cells(&self.index, doc);
+        cells
             .into_iter()
-            .map(|(x, y)| {
-                let cell = secantus_core::geo::cell_2d(x, y, self.bits, self.lo, self.hi);
-                secantus_core::geo::encode_cell(cell).to_vec()
+            .map(|cell| {
+                self.index
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(at, field)| {
+                        if at == self.index.geo_at {
+                            return cell.clone();
+                        }
+                        let mut found = extract_elements(doc, field);
+                        match found.len() {
+                            0 => Bson::Null,
+                            1 => found.remove(0),
+                            _ => Bson::Array(found),
+                        }
+                    })
+                    .collect()
             })
-            .collect();
-        out.sort();
-        out.dedup();
-        out
+            .collect()
+    }
+}
+
+impl Geo2d {
+    /// How many geohashes the geo field holds for `doc`: more than one makes
+    /// the index multikey (with no paths of mongod's to record).
+    fn cell_count(&self, doc: &Document) -> usize {
+        geo_cells(&self.index, doc).len()
     }
 }
 
 /// Parse a `2d` geo index from its key spec (`{field: "2d"}`) + options
 /// (`bits` / `min` / `max`, defaulting to mongod's 26 / -180 / 180). `None` if
-/// it isn't a single-field `2d` index.
+/// it isn't a `2d` index.
 fn parse_geo_2d(key_spec: &Document, opts: &Document) -> Option<Geo2d> {
-    // Like parse_geo_sphere: any field valued "2d" makes this a 2d index on that
-    // field; compound geo+scalar specs are accepted as geo-only (trailing scalar
-    // fields ignored at index time). Mirrors storage._geo_type_of.
-    let (field, _) = key_spec.iter().find(|(_, v)| v.as_str() == Some("2d"))?;
+    // Any field valued "2d" makes this a 2d index on that field.
+    let (geo_at, (field, _)) = key_spec
+        .iter()
+        .enumerate()
+        .find(|(_, (_, v))| v.as_str() == Some("2d"))?;
     // The options read as mongod's converter reads them. `createIndexes`
     // refuses a spec they do not make a converter for; a store written
     // before it did may still hold one, read as it was then.
@@ -2451,110 +2677,87 @@ fn parse_geo_2d(key_spec: &Document, opts: &Document) -> Option<Geo2d> {
     });
     Some(Geo2d {
         field: field.clone(),
-        bits: params.bits,
         lo: params.min,
         hi: params.max,
+        index: secantus_core::geoorder::GeoIndex {
+            name: String::new(),
+            kind: secantus_core::geoorder::Kind::Flat(secantus_core::geohash2d::Converter::new(
+                params.bits,
+                params.min,
+                params.max,
+            )),
+            fields: key_spec.keys().cloned().collect(),
+            geo_at,
+        },
     })
 }
 
-/// A `2dsphere` index's parameters — just the field. Spherical indexes use S2
-/// cell coverings: each indexed geometry writes its covering cells *plus every
-/// ancestor back to level 0* (mirroring real-mongo's S2 scheme and
-/// `geo_index.s2_doc_covering`), so a query covering at any level finds it.
+/// A `2dsphere` index (version 3): the field, and the covering it keys by.
 #[derive(Clone)]
 struct GeoSphere {
     field: String,
+    /// The index as mongod keys it.
+    index: secantus_core::geoorder::GeoIndex,
 }
 
 impl GeoSphere {
-    /// The S2 cell key bytes (8-byte big-endian, covering + ancestors) for a
-    /// doc field value: a point covers its leaf cell + ancestors; any other
-    /// geometry covers its bounding rect (over-covers; the `matches()` verifier
-    /// filters false positives). Empty when the value isn't a geometry.
-    fn cell_kbs(&self, value: &Bson) -> Vec<Vec<u8>> {
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        for (min_x, min_y, max_x, max_y) in secantus_core::geoshape::stored_boxes(value) {
-            let cells = if (min_x, min_y) == (max_x, max_y) {
-                s2_cells_for_point(min_x, min_y)
-            } else {
-                s2_cells_for_bbox(min_x, min_y, max_x, max_y)
-            };
-            out.extend(
-                cells
-                    .into_iter()
-                    .map(|c| secantus_core::geo::encode_cell(c).to_vec()),
-            );
+    /// The keys `doc` holds in the index, each as one value per key field:
+    /// the geo field's S2 cell ids (a point its leaf cell at the finest
+    /// level, any other geometry its covering between the coarsest and the
+    /// finest) crossed with the other fields' values as any index keys them
+    /// (an array's elements, `undefined` for an empty one, a null for a
+    /// missing field). A document with no geo value holds no key.
+    fn key_values(&self, doc: &Document) -> Vec<Vec<Bson>> {
+        let cells = geo_cells(&self.index, doc);
+        if cells.is_empty() {
+            return Vec::new();
         }
-        out.sort();
-        out.dedup();
-        out
+        let mut keys: Vec<Vec<Bson>> = vec![Vec::new()];
+        for (at, field) in self.index.fields.iter().enumerate() {
+            let values = if at == self.index.geo_at {
+                cells.clone()
+            } else {
+                index_field_values(doc, field, false).0
+            };
+            keys = keys
+                .into_iter()
+                .flat_map(|k| {
+                    values.iter().map(move |v| {
+                        let mut k = k.clone();
+                        k.push(v.clone());
+                        k
+                    })
+                })
+                .collect();
+        }
+        keys
+    }
+
+    /// How many cells the geo field holds for `doc`: more than one makes the
+    /// index multikey on that field.
+    fn cell_count(&self, doc: &Document) -> usize {
+        geo_cells(&self.index, doc).len()
     }
 }
 
-/// Parse a `2dsphere` geo index from its key spec (`{field: "2dsphere"}`).
-/// `None` if it isn't a single-field `2dsphere` index.
-fn parse_geo_sphere(key_spec: &Document) -> Option<GeoSphere> {
+/// Parse a `2dsphere` geo index from its key spec (`{field: "2dsphere"}`) and
+/// options (the covering's levels). `None` if it isn't a `2dsphere` index.
+fn parse_geo_sphere(key_spec: &Document, opts: &Document) -> Option<GeoSphere> {
     // A 2dsphere index is any spec containing a field whose value is the string
-    // "2dsphere". Compound geo+scalar specs ({g:"2dsphere", z:1}) are accepted as
-    // geo-only on the geo field; trailing scalar fields are ignored at index time
-    // and verified post-fetch (mirrors storage._geo_type_of).
-    let (field, _) = key_spec
+    // "2dsphere".
+    let (geo_at, (field, _)) = key_spec
         .iter()
-        .find(|(_, v)| v.as_str() == Some("2dsphere"))?;
+        .enumerate()
+        .find(|(_, (_, v))| v.as_str() == Some("2dsphere"))?;
     Some(GeoSphere {
         field: field.clone(),
+        index: secantus_core::geoorder::GeoIndex {
+            name: String::new(),
+            kind: secantus_core::geoorder::sphere_kind(opts),
+            fields: key_spec.keys().cloned().collect(),
+            geo_at,
+        },
     })
-}
-
-/// The S2 region coverer SecantusDB uses for `2dsphere` coverings (mirrors
-/// `geo_index._make_coverer`: min level 4, max level 16, 64 cells, level_mod 1).
-fn s2_coverer() -> RegionCoverer {
-    RegionCoverer {
-        min_level: 4,
-        max_level: 16,
-        level_mod: 1,
-        max_cells: 64,
-    }
-}
-
-/// Append `cell` and every ancestor up to level 0 to `out` (deduped via `seen`).
-/// Mirrors `geo_index._cell_with_ancestors`.
-fn cell_with_ancestors(cell: CellID, out: &mut Vec<u64>, seen: &mut HashSet<u64>) {
-    let mut c = cell;
-    loop {
-        if seen.insert(c.0) {
-            out.push(c.0);
-        }
-        let lvl = c.level();
-        if lvl == 0 {
-            break;
-        }
-        c = c.parent(lvl - 1);
-    }
-}
-
-/// S2 cells (covering + ancestors) for a point at `(lng, lat)` — its leaf cell
-/// plus every ancestor. Mirrors `geo_index.s2_doc_covering` for a `Point`.
-fn s2_cells_for_point(lng: f64, lat: f64) -> Vec<u64> {
-    let leaf = CellID::from(LatLng::from_degrees(lat, lng));
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    cell_with_ancestors(leaf, &mut out, &mut seen);
-    out
-}
-
-/// S2 cells (covering + ancestors) for a lng/lat bounding box. Covers the
-/// `LatLngRect` (s2sphere covers shapes via their bounding rect — over-covers,
-/// filtered later) and expands every covering cell to its ancestors.
-fn s2_cells_for_bbox(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Vec<u64> {
-    let rect = Rect::from_degrees(min_y, min_x, max_y, max_x);
-    let union = s2_coverer().covering(&rect);
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for c in union.0 {
-        cell_with_ancestors(c, &mut out, &mut seen);
-    }
-    out
 }
 
 /// A unique-index violation: the offending index plus the mongod-shaped
@@ -3693,11 +3896,24 @@ pub(crate) fn unsupported_index_type(
     key_spec: &Document,
     options: &Document,
 ) -> Option<StorageError> {
-    if parse_geo_2d(key_spec, options).is_some() || parse_geo_sphere(key_spec).is_some() {
+    if parse_geo_sphere(key_spec, options).is_some() {
+        // Version 3 is the one keyed as mongod keys it (an S2 cell id); the
+        // older two key by strings of their own.
+        return match options.get("2dsphereIndexVersion") {
+            None | Some(Bson::Int32(3)) | Some(Bson::Int64(3)) => None,
+            Some(Bson::Double(v)) if *v == 3.0 => None,
+            Some(Bson::Decimal128(d)) if d.to_string().parse::<f64>() == Ok(3.0) => None,
+            Some(v) => Some(StorageError::CreateIndexUnsupported(format!(
+                "2dsphere indexes of version {v} are not supported by the Rust storage engine \
+                 yet; version 3 is"
+            ))),
+        };
+    }
+    if parse_geo_2d(key_spec, options).is_some() {
         return None;
     }
     for (field, v) in key_spec {
-        if direction_of(v).is_none() {
+        if direction_of(v).is_none() && !secantus_core::hashed::is_hashed_spec(v) {
             let ty = match v {
                 Bson::String(s) => s.clone(),
                 other => format!("{other:?}"),
@@ -3719,7 +3935,8 @@ fn index_desc_from(name: String, key_spec: Document, opts: &Document) -> IndexDe
         .filter(|d| !d.is_empty())
         .cloned();
     let geo_2d = parse_geo_2d(&key_spec, opts);
-    let geo_sphere = parse_geo_sphere(&key_spec);
+    let geo_sphere = parse_geo_sphere(&key_spec, opts);
+    let wildcard = WildcardDesc::parse(&key_spec, opts);
     IndexDesc {
         name,
         key_spec,
@@ -3731,6 +3948,7 @@ fn index_desc_from(name: String, key_spec: Document, opts: &Document) -> IndexDe
         partial,
         geo_2d,
         geo_sphere,
+        wildcard,
         clustered: false,
         rid_bytes: false,
         key_order: index_bindata_order(opts),
@@ -3759,6 +3977,9 @@ fn named(why: String, names: bool, doc: &Document) -> String {
 /// message, or `None` when every one can.
 fn geo_key_problem(doc: &Document, descs: &[IndexDesc]) -> Option<(i32, String)> {
     for desc in descs {
+        if let Some(why) = hashed_array_problem(doc, &desc.key_spec) {
+            return Some((16766, why));
+        }
         if let Some(gs) = &desc.geo_sphere {
             let why =
                 secantus_core::geoshape::sphere_key_problem(&gs.field, get_path(doc, &gs.field));
@@ -3775,6 +3996,22 @@ fn geo_key_problem(doc: &Document, descs: &[IndexDesc]) -> Option<(i32, String)>
         }
     }
     None
+}
+
+/// Why a hashed index cannot hold `doc`: one of the index's key fields holds
+/// an array (mongod's `ExpressionKeysPrivate::getHashKeys`, code 16766).
+/// The check is of every key field in order, the ascending ones of a
+/// compound hashed index too (measured 8.2.11, 2026-11-23). `None` when the
+/// index is not hashed or the document is fine.
+fn hashed_array_problem(doc: &Document, key_spec: &Document) -> Option<String> {
+    if !key_spec.values().any(secantus_core::hashed::is_hashed_spec) {
+        return None;
+    }
+    key_spec.keys().find_map(|field| {
+        secantus_core::hashed::array_along_path(doc, field).map(|at| {
+            format!("Error: hashed indexes do not currently support array values. Found array at path: {at}")
+        })
+    })
 }
 
 /// An index build that met a document it cannot index, after `scanned` it
@@ -4434,7 +4671,23 @@ fn index_key_values_c(
     // encoded bytes so a repeated array element doesn't inflate the compound
     // cartesian product below.
     let mut per_field: Vec<Vec<Bson>> = Vec::with_capacity(fields.len());
-    for (f, d) in &fields {
+    if let Some(why) = hashed_array_problem(doc, key_spec) {
+        return Err(StorageError::QueryError {
+            code: 16766,
+            errmsg: why,
+            exec: false,
+        });
+    }
+    for ((f, d), spec) in fields.iter().zip(key_spec.values()) {
+        if secantus_core::hashed::is_hashed_spec(spec) {
+            // The key is the value's hash: a `NumberLong`, a missing field
+            // hashed as null.
+            per_field.push(vec![secantus_core::hashed::index_key(
+                get_path(doc, f),
+                coll,
+            )]);
+            continue;
+        }
         let (cands, _multikey) = index_field_values(doc, f, sparse);
         if cands.len() == 1 {
             per_field.push(cands);
@@ -16814,7 +17067,7 @@ impl Storage {
             return Ok(None);
         };
         let geo = parse_geo_2d(key_spec, options);
-        let geo_sphere = parse_geo_sphere(key_spec);
+        let geo_sphere = parse_geo_sphere(key_spec, options);
         let build_order = index_bindata_order(&stored_options);
         let key_coll: Option<Collation> = if geo.is_none() && geo_sphere.is_none() {
             options
@@ -16858,7 +17111,7 @@ impl Storage {
         // It writes the index catalog.
         note_planner_write_of(db, coll);
         let geo = parse_geo_2d(key_spec, options);
-        let geo_sphere = parse_geo_sphere(key_spec);
+        let geo_sphere = parse_geo_sphere(key_spec, options);
         ensure_collection(self, session, db, coll)?;
 
         let c = session.open_cursor(IDX_TABLE, None)?;
@@ -16959,6 +17212,8 @@ impl Storage {
             // multikey so the regular (numeric) pickers skip it.
             stored_options.insert("multikey", Bson::Boolean(true));
             let mut out: Vec<EntryKey> = Vec::new();
+            let shape = KeyShape::new(key_spec, None, build_order);
+            let mut flat_paths: Vec<Vec<String>> = vec![Vec::new(); key_spec.len()];
             let rows = self.scan_docs(session, db, coll)?;
             for (scanned, (rid, blob)) in rows.into_iter().enumerate() {
                 // The scan itself polls, but building the entries is per-document
@@ -16969,6 +17224,9 @@ impl Storage {
                     return Err(StorageError::MaxTimeExpired);
                 }
                 let d = decode_doc(&blob)?;
+                if geo.cell_count(&d) > 1 {
+                    flat_paths[geo.index.geo_at] = vec![geo.field.clone()];
+                }
                 if let Some((code, why, names)) = secantus_core::geoshape::flat_key_problem(
                     get_path(&d, &geo.field),
                     geo.lo,
@@ -16976,12 +17234,19 @@ impl Storage {
                 ) {
                     return Err(scan_stopped(scanned, code, &named(why, names, &d)));
                 }
-                for kb in get_path(&d, &geo.field)
-                    .map(|v| geo.cell_kbs(v))
-                    .unwrap_or_default()
-                {
-                    out.push(geo_entry(&kb, &rid)?);
+                for values in geo.key_values(&d) {
+                    out.push(shape.entry(&values, &rid)?);
                 }
+            }
+            if flat_paths.iter().any(|p| !p.is_empty()) {
+                let mut recorded = Document::new();
+                for (field, parts) in key_spec.keys().zip(flat_paths) {
+                    recorded.insert(
+                        field.clone(),
+                        Bson::Array(parts.into_iter().map(Bson::String).collect()),
+                    );
+                }
+                stored_options.insert(MULTIKEY_PATHS, recorded);
             }
             out
         } else if let Some(gs) = &geo_sphere {
@@ -16997,6 +17262,9 @@ impl Storage {
                 .entry("2dsphereIndexVersion".to_string())
                 .or_insert(Bson::Int32(3));
             let mut out: Vec<EntryKey> = Vec::new();
+            let shape = KeyShape::new(key_spec, None, build_order);
+            let mut multikey = false;
+            let mut sphere_paths: Vec<Vec<String>> = vec![Vec::new(); key_spec.len()];
             let rows = self.scan_docs(session, db, coll)?;
             for (scanned, (rid, blob)) in rows.into_iter().enumerate() {
                 // The scan itself polls, but building the entries is per-document
@@ -17012,11 +17280,31 @@ impl Storage {
                 {
                     return Err(scan_stopped(scanned, 16755, &no_geo_keys(&d, &why)));
                 }
-                if let Some(v) = get_path(&d, &gs.field) {
-                    for kb in gs.cell_kbs(v) {
-                        out.push(geo_entry(&kb, &rid)?);
+                for values in gs.key_values(&d) {
+                    out.push(shape.entry(&values, &rid)?);
+                }
+                if gs.cell_count(&d) > 1 {
+                    multikey = true;
+                    sphere_paths[gs.index.geo_at].push(gs.field.clone());
+                }
+                for (at, field) in key_spec.keys().enumerate() {
+                    if at != gs.index.geo_at {
+                        array_components(&d, field, &mut sphere_paths[at]);
+                        multikey |= !sphere_paths[at].is_empty();
                     }
                 }
+            }
+            if multikey {
+                let mut recorded = Document::new();
+                for (field, mut parts) in key_spec.keys().zip(sphere_paths) {
+                    parts.sort();
+                    parts.dedup();
+                    recorded.insert(
+                        field.clone(),
+                        Bson::Array(parts.into_iter().map(Bson::String).collect()),
+                    );
+                }
+                stored_options.insert(MULTIKEY_PATHS, recorded);
             }
             out
         } else {
@@ -17037,7 +17325,8 @@ impl Storage {
             let mut entries: Vec<EntryKey> = Vec::new();
             let mut seen: HashSet<Vec<u8>> = HashSet::new();
             let shape = KeyShape::new(key_spec, key_coll.clone(), build_order);
-            for (rid, blob) in self.scan_docs(session, db, coll)? {
+            for (scanned, (rid, blob)) in self.scan_docs(session, db, coll)?.into_iter().enumerate()
+            {
                 // The scan itself polls, but building the entries is per-document
                 // work of its own (decode + sort-key encode), so a large
                 // collection can outlive its budget here even after the read
@@ -17046,6 +17335,9 @@ impl Storage {
                     return Err(StorageError::MaxTimeExpired);
                 }
                 let d = decode_doc(&blob)?;
+                if let Some(why) = hashed_array_problem(&d, key_spec) {
+                    return Err(scan_stopped(scanned, 16766, &why));
+                }
                 if let Some(pf) = &partial {
                     if !query_matches(&d, pf, &Vars::new(), key_coll.as_ref())
                         .map_err(query_fault)?
@@ -18497,10 +18789,11 @@ impl Storage {
     ) -> Result<()> {
         for desc in descs {
             let name = desc.name.as_str();
-            if !doc_makes_multikey(doc, &desc.key_spec) {
+            let (makes, doc_paths) = desc.multikey_paths_of(doc);
+            if !makes {
                 continue;
             }
-            self.note_multikey_paths(db, coll, name, doc, &desc.key_spec);
+            self.note_multikey_paths(db, coll, name, &doc_paths);
             let cur = session.open_cursor(IDX_TABLE, None)?;
             cur.set_key_sss(db, coll, name);
             match cur.search() {
@@ -18513,9 +18806,13 @@ impl Storage {
             // The paths this document adds to what the catalog records.
             let mut paths = stored_multikey_paths(&opts, &desc.key_spec);
             let mut grew = false;
-            for (field, parts) in desc.key_spec.keys().zip(paths.iter_mut()) {
+            for (parts, add) in paths.iter_mut().zip(&doc_paths) {
                 let before = parts.len();
-                array_components(doc, field, parts);
+                for path in add {
+                    if !parts.contains(path) {
+                        parts.push(path.clone());
+                    }
+                }
                 if parts.len() != before {
                     parts.sort();
                     grew = true;
@@ -18558,22 +18855,18 @@ impl Storage {
         recordid: &RecordId,
     ) -> Result<Vec<EntryKey>> {
         let mut out = Vec::new();
-        // 2d geo index: one cell entry per point-valued field (point-only).
+        // A geo index: its keys, as mongod's `get2DKeys` / `getS2Keys` make them.
         if let Some(geo) = &desc.geo_2d {
-            for kb in get_path(doc, &geo.field)
-                .map(|v| geo.cell_kbs(v))
-                .unwrap_or_default()
-            {
-                out.push(geo_entry(&kb, recordid)?);
+            let shape = desc.shape();
+            for values in geo.key_values(doc) {
+                out.push(shape.entry(&values, recordid)?);
             }
             return Ok(out);
         }
-        // 2dsphere S2 index: covering cells + ancestors per geometry field.
         if let Some(gs) = &desc.geo_sphere {
-            if let Some(v) = get_path(doc, &gs.field) {
-                for kb in gs.cell_kbs(v) {
-                    out.push(geo_entry(&kb, recordid)?);
-                }
+            let shape = desc.shape();
+            for values in gs.key_values(doc) {
+                out.push(shape.entry(&values, recordid)?);
             }
             return Ok(out);
         }
@@ -18581,6 +18874,20 @@ impl Storage {
             return Ok(out);
         }
         let shape = desc.shape();
+        if desc.wildcard.is_some() {
+            for values in desc.wildcard_key_values(doc) {
+                out.push(shape.entry(&values, recordid)?);
+            }
+            let meta = RecordId::Long(wildcard::metadata_rid());
+            // The path is not a collation key in a metadata key either.
+            let meta_shape = shape
+                .clone()
+                .uncollated_at(desc.wildcard.as_ref().map_or(0, |w| w.at) + 1);
+            for values in desc.wildcard_metadata_values(doc) {
+                out.push(meta_shape.entry(&values, &meta)?);
+            }
+            return Ok(out);
+        }
         for (_kb, values) in desc.key_values(doc, desc.sparse)? {
             out.push(shape.entry(&values, recordid)?);
         }
@@ -18788,7 +19095,7 @@ impl Storage {
                 continue;
             }
             let cur = open_index_cursor(session, db, coll, &desc.name, Some("overwrite=false"))?;
-            for entry in &entries {
+            for entry in entries.iter().filter(|e| !is_metadata_entry(e)) {
                 self.drop_index_entry(session, &cur, db, coll, &desc.name, &entry.key)?;
             }
         }
@@ -18945,6 +19252,9 @@ impl Storage {
                 additions.push((desc.name.clone(), packed.clone()));
             }
             for packed in old_keys.difference(&new_keys) {
+                if is_metadata_entry(packed) {
+                    continue;
+                }
                 removals.push((desc.name.clone(), packed.clone()));
             }
         }
@@ -18959,13 +19269,14 @@ impl Storage {
     /// index holds no whole-array key, which is not one of mongod's. A
     /// geo index: its entries.
     fn reference_keys(&self, doc: &Document, desc: &IndexDesc) -> Result<HashSet<Vec<u8>>> {
-        if desc.geo_2d.is_some() || desc.geo_sphere.is_some() {
+        if desc.geo_2d.is_some() || desc.geo_sphere.is_some() || desc.wildcard.is_some() {
             // Only the number of keys a write adds or removes is read from
             // this (`keysInserted`, `keysDeleted`), the same RecordId on both
             // sides of the difference: which one is of no account.
             return Ok(self
                 .packed_entry_keys(doc, desc, &RecordId::Long(0))?
                 .into_iter()
+                .filter(|e| !is_metadata_entry(e))
                 .map(|e| e.key)
                 .collect());
         }
@@ -19244,6 +19555,7 @@ impl Storage {
                 partial: None,
                 geo_2d: None,
                 geo_sphere: None,
+                wildcard: None,
                 clustered,
                 rid_bytes: clustered,
                 key_order: BinDataOrder::Format4,
@@ -19534,8 +19846,11 @@ impl Storage {
             }
             for desc in &descs {
                 let packed = self.packed_entry_keys(&doc, desc, &recordid)?;
-                let held = if desc.geo_2d.is_some() || desc.geo_sphere.is_some() {
-                    packed.len() as i64
+                let held = if desc.geo_2d.is_some()
+                    || desc.geo_sphere.is_some()
+                    || desc.wildcard.is_some()
+                {
+                    packed.iter().filter(|e| !is_metadata_entry(e)).count() as i64
                 } else if packed.is_empty() {
                     0
                 } else {
@@ -19544,14 +19859,19 @@ impl Storage {
                     })
                 };
                 *keys.entry(desc.name.clone()).or_default() += held;
-                expected
-                    .entry(desc.name.clone())
-                    .or_default()
-                    .extend(packed.into_iter().map(|e| e.key));
+                expected.entry(desc.name.clone()).or_default().extend(
+                    packed
+                        .into_iter()
+                        .filter(|e| !is_metadata_entry(e))
+                        .map(|e| e.key),
+                );
             }
         }
         let mut actual: HashMap<String, HashSet<Vec<u8>>> = HashMap::new();
         for (name, packed) in self.collect_entry_rows(session, db, coll)? {
+            if ixkeys::entry_rid(&packed, false) == Some(RecordId::Long(wildcard::metadata_rid())) {
+                continue;
+            }
             actual.entry(name).or_default().insert(packed);
         }
         // The `_id` index: an entry whose document is gone.
@@ -21384,14 +21704,7 @@ impl Storage {
 
     /// A write of `doc` adds what it holds to the index's cached multikey
     /// paths, when there are any cached.
-    fn note_multikey_paths(
-        &self,
-        db: &str,
-        coll: &str,
-        name: &str,
-        doc: &Document,
-        key_spec: &Document,
-    ) {
+    fn note_multikey_paths(&self, db: &str, coll: &str, name: &str, doc_paths: &[Vec<String>]) {
         let mut cache = self
             .multikey_paths
             .lock()
@@ -21403,12 +21716,16 @@ impl Storage {
         let Some(entry) = cache.get_mut(&cache_key) else {
             return;
         };
-        if entry.paths.len() != key_spec.len() {
+        if entry.paths.len() != doc_paths.len() {
             return;
         }
         let before = entry.paths.clone();
-        for (field, parts) in key_spec.keys().zip(entry.paths.iter_mut()) {
-            array_components(doc, field, parts);
+        for (parts, add) in entry.paths.iter_mut().zip(doc_paths) {
+            for path in add {
+                if !parts.contains(path) {
+                    parts.push(path.clone());
+                }
+            }
             parts.sort();
         }
         if entry.paths != before {
@@ -23544,7 +23861,12 @@ impl Storage {
                 let mut found: Option<(Document, Document)> = None;
                 for (n, key_spec, o) in self.visible_indexes(session, db, coll)? {
                     if &n == name {
-                        if let Some((f, dv)) = key_spec.iter().next() {
+                        // The keys of a hashed field order nothing.
+                        if let Some((f, dv)) = key_spec
+                            .iter()
+                            .next()
+                            .filter(|(_, dv)| !secantus_core::hashed::is_hashed_spec(dv))
+                        {
                             leading = Some((f.clone(), direction_of(dv).unwrap_or(1)));
                         }
                         found = Some((key_spec, o));
@@ -24096,6 +24418,10 @@ impl Storage {
         if let Some(r) = self.try_geo_sphere_id_keys(session, db, coll, filter)? {
             return Ok(Some(r));
         }
+        // An equality or `$in` on a field a single-field hashed index keys.
+        if let Some(r) = self.try_hashed_id_keys(session, db, coll, filter)? {
+            return Ok(Some(r));
+        }
         // Bare-equality filters of any size can use a compound (or single-field)
         // index whose leading fields cover them.
         // (A regex is a pattern, not a key.)
@@ -24134,6 +24460,89 @@ impl Storage {
         self.lookup_id_keys_via_leading_field(session, db, coll, &idx_match, &value)
     }
 
+    /// The RecordIds of the documents a single-field HASHED index holds under
+    /// the hash of each value an equality or `$in` on its field names: the
+    /// candidates of that predicate, which the caller rechecks. `None` when no
+    /// field of the filter is one this reads (a range cannot use the hash).
+    /// An array operand, a regex or an operator other than `$eq` / `$in` is
+    /// left to the scan, and so is a null on a sparse index, which holds no
+    /// entry for a missing field.
+    fn try_hashed_id_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+    ) -> Result<Option<Vec<RecordId>>> {
+        let scalar = |v: &Bson| {
+            !matches!(
+                v,
+                Bson::Array(_) | Bson::RegularExpression(_) | Bson::Undefined
+            )
+        };
+        let mut descs: Option<Vec<IndexDesc>> = None;
+        for (field, pred) in filter {
+            // The values the predicate names, or not a predicate to read.
+            let values: Vec<&Bson> = match pred {
+                Bson::Document(d) if d.keys().any(|k| k.starts_with('$')) => {
+                    if d.len() != 1 {
+                        continue;
+                    }
+                    match d.iter().next() {
+                        Some((op, v)) if op == "$eq" && scalar(v) => vec![v],
+                        Some((op, Bson::Array(vs))) if op == "$in" && vs.iter().all(scalar) => {
+                            vs.iter().collect()
+                        }
+                        _ => continue,
+                    }
+                }
+                v if scalar(v) => vec![v],
+                _ => continue,
+            };
+            if descs.is_none() {
+                descs = Some(self.planner_descs(session, db, coll)?);
+            }
+            let found = descs.iter().flatten().find(|d| {
+                d.key_spec.len() == 1
+                    && d.key_spec
+                        .get(field)
+                        .is_some_and(secantus_core::hashed::is_hashed_spec)
+                    && d.partial.is_none()
+                    && (!d.sparse || values.iter().all(|v| !matches!(v, Bson::Null)))
+            });
+            let Some(desc) = found else {
+                continue;
+            };
+            let shape = self.index_shape(session, db, coll, &desc.name)?;
+            let mut seen: HashSet<i64> = HashSet::new();
+            let mut rids: Vec<RecordId> = Vec::new();
+            let mut got: HashSet<RecordId> = HashSet::new();
+            for v in values {
+                let Bson::Int64(h) = secantus_core::hashed::index_key(Some(v), None) else {
+                    continue;
+                };
+                if !seen.insert(h) {
+                    continue;
+                }
+                for rid in self.scan_index_for_id_keys(
+                    session,
+                    db,
+                    coll,
+                    &desc.name,
+                    &shape,
+                    &[Bson::Int64(h)],
+                    false,
+                )? {
+                    if got.insert(rid.clone()) {
+                        rids.push(rid);
+                    }
+                }
+            }
+            return Ok(Some(rids));
+        }
+        Ok(None)
+    }
+
     /// Find the `2d` index covering `field`, as `(index_name, params)`.
     fn geo_2d_for(
         &self,
@@ -24141,11 +24550,11 @@ impl Storage {
         db: &str,
         coll: &str,
         field: &str,
-    ) -> Result<Option<(String, Geo2d)>> {
+    ) -> Result<Option<(String, Geo2d, KeyShape)>> {
         for desc in self.planner_descs(session, db, coll)? {
             if let Some(g) = &desc.geo_2d {
                 if g.field == field {
-                    return Ok(Some((desc.name.clone(), g.clone())));
+                    return Ok(Some((desc.name.clone(), g.clone(), desc.shape())));
                 }
             }
         }
@@ -24175,19 +24584,41 @@ impl Storage {
             },
             _ => return Ok(None),
         };
-        let (name, g) = match self.geo_2d_for(session, db, coll, field)? {
+        let (name, g, shape) = match self.geo_2d_for(session, db, coll, field)? {
             Some(x) => x,
             None => return Ok(None),
         };
+        let secantus_core::geoorder::Kind::Flat(conv) = &g.index.kind else {
+            return Ok(None);
+        };
+        // The geohash is the key's first field: a scan of a range of it.
+        if g.index.geo_at != 0 {
+            return Ok(None);
+        }
         let (min_x, min_y, max_x, max_y) = match secantus_core::geo::query_within_bbox(within) {
             Some(b) => b,
             None => return Ok(None),
         };
-        let (clo, chi) =
-            secantus_core::geo::covering_2d(min_x, min_y, max_x, max_y, g.bits, g.lo, g.hi);
-        let lo_kb = secantus_core::geo::encode_cell(clo);
-        let hi_kb = secantus_core::geo::encode_cell(chi);
-        let ids = self.range_scan_cells(session, db, coll, &name, &lo_kb[..], &hi_kb[..])?;
+        // Both corners of the box: every
+        // point of the box hashes between them (the hash is interleaved
+        // coordinate bits, which only grow with either coordinate).
+        // A box reaching past the range (a `$centerSphere` over the
+        // antimeridian wraps round it) is the whole range.
+        if [min_x, min_y, max_x, max_y].iter().any(|v| v.is_nan()) {
+            return Ok(None);
+        }
+        let inside = |v: f64| v >= g.lo && v <= g.hi;
+        let (min_x, min_y, max_x, max_y) = if [min_x, min_y, max_x, max_y].into_iter().all(inside) {
+            (min_x, min_y, max_x, max_y)
+        } else {
+            (g.lo, g.lo, g.hi, g.hi)
+        };
+        let (Some(lo), Some(hi)) = (conv.hash(min_x, min_y), conv.hash(max_x, max_y)) else {
+            return Ok(None);
+        };
+        let lo = geo_part_value(&secantus_core::geoorder::KeyPart::Hash(lo.hash_min()));
+        let hi = geo_part_value(&secantus_core::geoorder::KeyPart::Hash(hi.hash_max()));
+        let ids = self.range_scan_cells(session, db, coll, &name, &shape, &lo, &hi)?;
         Ok(Some(ids))
     }
 
@@ -24198,11 +24629,11 @@ impl Storage {
         db: &str,
         coll: &str,
         field: &str,
-    ) -> Result<Option<(String, GeoSphere)>> {
+    ) -> Result<Option<(String, GeoSphere, KeyShape)>> {
         for desc in self.planner_descs(session, db, coll)? {
             if let Some(g) = &desc.geo_sphere {
                 if g.field == field {
-                    return Ok(Some((desc.name.clone(), g.clone())));
+                    return Ok(Some((desc.name.clone(), g.clone(), desc.shape())));
                 }
             }
         }
@@ -24233,35 +24664,37 @@ impl Storage {
             },
             _ => return Ok(None),
         };
-        let (name, _gs) = match self.geo_sphere_for(session, db, coll, field)? {
+        let (name, gs, shape) = match self.geo_sphere_for(session, db, coll, field)? {
             Some(x) => x,
             None => return Ok(None),
         };
-        // On the sphere the box is the shape's own: an edge can bow past its
-        // ends towards a pole, a cap can hold one, and a big polygon can be
-        // most of the sphere. A box around the vertices missed what was
-        // beyond them.
-        let bound = secantus_core::geoshape::sphere_within_bound(within)
-            .or_else(|| secantus_core::geo::query_within_bbox(within));
-        let (min_x, min_y, max_x, max_y) = match bound {
-            Some(b) => b,
-            None => return Ok(None),
+        // The cell is the key's first field: a scan of the intervals of
+        // cells mongod's covering of the region gives (a superset;
+        // `find_matching` re-checks each with `matches()`). A shape the
+        // covering does not take is a collection scan.
+        if gs.index.geo_at != 0 {
+            return Ok(None);
+        }
+        let Some(secantus_core::geoorder::FieldBounds::Cells(intervals)) = gs
+            .index
+            .predicate_bounds("$geoWithin", &Bson::Document(within.clone()))
+        else {
+            return Ok(None);
         };
         let mut out: Vec<RecordId> = Vec::new();
         let mut seen: HashSet<RecordId> = HashSet::new();
-        for cid in s2_cells_for_bbox(min_x, min_y, max_x, max_y) {
-            let kb = secantus_core::geo::encode_cell(cid);
-            for id_k in self.scan_index_for_id_keys(
+        for (lo, hi) in intervals {
+            for rid in self.range_scan_cells(
                 session,
                 db,
                 coll,
                 &name,
-                &KeyShape::plain(),
-                &[geo_cell_value(&kb)],
-                false,
+                &shape,
+                &Bson::Int64(lo),
+                &Bson::Int64(hi),
             )? {
-                if seen.insert(id_k.clone()) {
-                    out.push(id_k);
+                if seen.insert(rid.clone()) {
+                    out.push(rid);
                 }
             }
         }
@@ -24631,22 +25064,24 @@ impl Storage {
     }
 
     /// Range-scan a geo index `name` between the cells `lower` and `upper`
-    /// (their 8-byte keys), both inclusive. Mirrors `storage._range_scan_index`.
+    /// (values of its first key field), both inclusive. Mirrors
+    /// `storage._range_scan_index`.
+    #[allow(clippy::too_many_arguments)]
     fn range_scan_cells(
         &self,
         session: &Session,
         db: &str,
         coll: &str,
         name: &str,
-        lower: &[u8],
-        upper: &[u8],
+        shape: &KeyShape,
+        lower: &Bson,
+        upper: &Bson,
     ) -> Result<Vec<RecordId>> {
         note_routed(name);
         let cur = open_index_cursor(session, db, coll, name, None)?;
         let rb = is_clustered(session, db, coll)?;
-        let shape = KeyShape::plain();
-        let seed = shape.seek(&[geo_cell_value(lower)], false)?;
-        let end = shape.seek(&[geo_cell_value(upper)], true)?;
+        let seed = shape.seek(std::slice::from_ref(lower), false)?;
+        let end = shape.seek(std::slice::from_ref(upper), true)?;
         let mut out = Vec::new();
         let mut more = seek_ge(&cur, &seed)?;
         while more {
@@ -24956,7 +25391,7 @@ impl Storage {
             .is_some()
         {
             let (field, _) = filter.iter().next().unwrap();
-            if let Some((name, _g)) = self.geo_2d_for(session, db, coll, field)? {
+            if let Some((name, _g, _)) = self.geo_2d_for(session, db, coll, field)? {
                 let mut kp = Document::new();
                 kp.insert(field.clone(), "2d");
                 return Ok(Some((name, kp)));
@@ -24968,7 +25403,7 @@ impl Storage {
             .is_some()
         {
             let (field, _) = filter.iter().next().unwrap();
-            if let Some((name, _g)) = self.geo_sphere_for(session, db, coll, field)? {
+            if let Some((name, _g, _)) = self.geo_sphere_for(session, db, coll, field)? {
                 let mut kp = Document::new();
                 kp.insert(field.clone(), "2dsphere");
                 return Ok(Some((name, kp)));
@@ -25560,7 +25995,17 @@ fn sync_catalog_entry(session: &Session, db: &str, coll: &str) -> Result<()> {
             spec,
             ready: true,
             multikey: if pathless {
-                text
+                // A wildcard index is multikey once a document has held an
+                // array under it, with no paths (its own entries say where);
+                // a `2d` one once a document has held several locations.
+                text || (key.keys().any(|f| f.ends_with("$**"))
+                    && opts.get_bool("multikey").unwrap_or(false))
+                    || (key.values().any(|kind| kind.as_str() == Some("2d"))
+                        && !components.is_empty())
+            } else if key.values().any(|kind| kind.as_str() == Some("2dsphere")) {
+                // A `2dsphere` index is multikey where a document holds more
+                // than one key for a field, which the recorded paths say.
+                !components.is_empty()
             } else {
                 opts.get_bool("multikey").unwrap_or(false)
             },

@@ -190,7 +190,7 @@ still returns a generic `BadValue` where mongod returns `Location31325`.
 | Hidden indexes | ✅ | ✅ |
 | Geo `2dsphere` (S2 coverings) / `2d` (geohash) | ✅ | ✅ |
 | Text | ✅ | ❌ rejected |
-| Hashed | ✅ | ❌ rejected |
+| Hashed | ✅ | ✅ |
 | Wildcard (`$**`) | ✅ | ❌ |
 | `hint` (name, key spec, `{$natural: ±1}`) | ✅ | ✅ |
 | `explain` (IXSCAN/COLLSCAN + `winningPlan` shape) | ✅ | ✅ |
@@ -281,7 +281,7 @@ remainder.
 Anything that depends on real cluster topology or an embedded JavaScript
 runtime is out of scope by design: multi-node replica sets,
 elections, sharding, cross-node oplog; `$where`, `$function`, `$accumulator`,
-JS `mapReduce`; text / hashed / wildcard indexes; Atlas
+JS `mapReduce`; text / wildcard indexes; Atlas
 Search / Vector Search; LDAP / Kerberos / AWS / OIDC auth. See
 [Compatibility](compatibility.md) for the per-feature detail and
 [the validation reports](validation-summary.md) for the machine-checked

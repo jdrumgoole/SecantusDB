@@ -1016,14 +1016,15 @@ fn estimated_size(
     use super::entry_size::{ClauseTag, IndexCopy};
     let layout = super::entry_size::LAYOUT?;
     let copy = |index: &super::IndexInfo| -> Option<IndexCopy> {
-        if !index.plain {
+        if !index.plain && !index.has_hashed() {
             return None;
         }
         Some(IndexCopy {
             name: index.name.clone(),
             key: index.key.clone(),
-            // The `_id` index keeps no path-level multikey metadata.
-            multikey: if index.name == "_id_" {
+            // The `_id` index keeps no path-level multikey metadata, nor does
+            // an index with a hashed field.
+            multikey: if index.name == "_id_" || index.has_hashed() {
                 vec![]
             } else {
                 index.multikey_paths.iter().map(Vec::len).collect()

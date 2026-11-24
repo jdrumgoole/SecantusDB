@@ -3644,7 +3644,9 @@ fn index_spec_problem(spec: &Document) -> Option<CommandError> {
         if field.is_empty() {
             return Some(cannot("Index keys cannot be an empty field."));
         }
-        if field.starts_with('$') && field != "$**" {
+        if field.starts_with('$')
+            && (field != "$**" || secantus_core::hashed::is_hashed_spec(value))
+        {
             return Some(cannot(
                 "Index key contains an illegal field name: field name starts with '$'.",
             ));
@@ -3664,7 +3666,14 @@ fn index_spec_problem(spec: &Document) -> Option<CommandError> {
             _ => {}
         }
     }
-    let plugins: Vec<&str> = key.values().filter_map(Bson::as_str).collect();
+    // A wildcard field is a plugin of its own.
+    let mut plugins: Vec<&str> = key.values().filter_map(Bson::as_str).collect();
+    if key
+        .iter()
+        .any(|(f, v)| (f == "$**" || f.ends_with(".$**")) && v.as_str().is_none())
+    {
+        plugins.push("wildcard");
+    }
     if plugins.iter().any(|p| *p != plugins[0]) {
         return Some(cannot(
             "Can't use more than one index plugin for a single index.",
@@ -3701,7 +3710,11 @@ fn index_spec_problem(spec: &Document) -> Option<CommandError> {
         ));
     }
     // The `_id` index is `{_id: 1}` and takes no options of its own.
-    if key.len() == 1 && key.contains_key("_id") {
+    // (A hashed index on `_id` is an index of its own.)
+    if key.len() == 1
+        && key.contains_key("_id")
+        && !secantus_core::hashed::is_hashed_spec(&key["_id"])
+    {
         if as_i64(&key["_id"]) != Some(1) {
             return Some(CommandError::new(
                 2,
@@ -3738,6 +3751,38 @@ fn index_spec_problem(spec: &Document) -> Option<CommandError> {
                  {text}"
             ),
         ));
+    }
+    // A hashed index takes no uniqueness and one hashed field, measured
+    // 8.2.11 (2026-11-23); the unique refusal comes first.
+    let hashed = key
+        .values()
+        .filter(|v| secantus_core::hashed::is_hashed_spec(v))
+        .count();
+    if hashed > 0 {
+        let unique = spec.get("unique").is_some_and(|v| {
+            matches!(
+                v,
+                Bson::Boolean(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)
+            ) && !is_falsy(v)
+        });
+        if unique {
+            return Some(CommandError::new(
+                16764,
+                "Location16764",
+                "Currently hashed indexes cannot guarantee uniqueness. Use a regular index.",
+            ));
+        }
+        if hashed > 1 {
+            return Some(CommandError::new(
+                31303,
+                "Location31303",
+                format!(
+                    "A maximum of one index field is allowed to be hashed but found {hashed} \
+                     for 'key' {}",
+                    argtypes::render_stage_value(&Bson::Document(key.clone()))
+                ),
+            ));
+        }
     }
     // A `2dsphere` index is one of three formats.
     if key

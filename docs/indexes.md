@@ -408,6 +408,7 @@ list(coll.find().sort("name", 1))   # COLLSCAN
 - **TTL background sweeper** — `prune_ttl` is opt-in; no 60-second
   cadence sweeper. Real mongod runs one; for an in-process
   server the explicit-call ergonomics suit the audience better.
-- **Text / hashed indexes** — out of scope (no full-text engine; no
-  practical workload pulling hashed shard-key behaviour into an
-  in-process server).
+- **Text indexes** — out of scope (no full-text engine). Hashed indexes
+  are built by the Rust server, as `mongod` builds them: equality and `$in`
+  read them, one hashed field may sit in a compound index, `unique` is
+  refused, and so is an array under a hashed field.
