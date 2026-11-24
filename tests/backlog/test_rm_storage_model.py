@@ -1412,13 +1412,14 @@ def test_secantus_opens_a_mongod_time_series_collection(tmp_path: Path) -> None:
         assert rust.app.ts.count_documents({"m": 0}) == 4
 
 
-@pytest.mark.backlog("RM-755")
+@pytest.mark.backlog_fixed("RM-755")
 def test_secantus_finishes_an_index_build_mongod_left(tmp_path: Path) -> None:
     """mongod 8.2.11 stopped cleanly during an index build (held by
     `hangAfterStartingIndexBuild`) leaves the index in its catalog with
     `ready: false` and its build in `config.system.indexBuilds`; its restart
-    finishes the build. `secantusd-mdb` refuses the store by name ("whose
-    build has not finished") instead of finishing it."""
+    finishes the build. `secantusd-mdb` refused the store by name ("whose
+    build has not finished"); it now restarts the build under mongod's build
+    UUID and finishes it, as mongod's restart does."""
     import threading
 
     def setup(rs: pymongo.MongoClient) -> None:
@@ -1438,6 +1439,9 @@ def test_secantus_finishes_an_index_build_mongod_left(tmp_path: Path) -> None:
     assert outcome == "served", said
     with rust_mongo_server(store) as rust:
         assert _comparable(_store_contents(rust)) == _comparable(served)
+        assert list(rust.config["system.indexBuilds"].find()) == []
+        found = list(rust.app.c.find({"a": 3}).hint("a_1"))
+        assert sorted(d["_id"] for d in found) == [i for i in range(200) if i % 7 == 3]
 
 
 def _build_quietly(rs: pymongo.MongoClient) -> None:

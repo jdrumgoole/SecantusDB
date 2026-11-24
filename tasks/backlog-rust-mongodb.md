@@ -2846,16 +2846,6 @@ produce the dump it exists for.
 
 ## The storage model is not mongod's (tasks/mongod-storage-model-plan.md, 2026-11-19)
 
-- [ ] **An index build mongod left unfinished is refused, not finished.**
-      mongod 8.2.11 stopped cleanly during an index build leaves the index
-      in `_mdb_catalog` with `ready: false` and the build in
-      `config.system.indexBuilds`, and its restart finishes it (measured
-      2026-11-22, the build held by `hangAfterStartingIndexBuild`).
-      `secantusd-mdb` refuses such a store by name ("whose build has not
-      finished"): its own builds restart from `secantus_index_builds`
-      records (RM-187), which mongod's store does not have.
-      Verify: tests/backlog/test_rm_storage_model.py::test_secantus_finishes_an_index_build_mongod_left
-      Backlog-ID: RM-755
 - [ ] **A killed mongod store is judged at its stable checkpoint, before
       its replay.** What `secantusd-mdb` refuses by name in a store mongod
       wrote (an index kind it keys otherwise, a time-series collection,

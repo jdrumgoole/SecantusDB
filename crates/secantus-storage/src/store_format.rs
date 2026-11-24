@@ -321,7 +321,7 @@ pub fn mongod_store_findings(home: &Path) -> std::result::Result<Vec<String>, St
 /// What in the store `session` reads this server cannot serve, named: a
 /// replica-set configuration of more than one member, an index of a kind
 /// this server does not key as mongod does, an index of another version
-/// than 2 or one whose build has not finished, a collection or index option
+/// than 2, a collection or index option
 /// it does not keep, an index of a time-series collection's buckets that no
 /// index of the collection gives, a feature
 /// compatibility version other than 8.2. Checked
@@ -375,12 +375,6 @@ pub(crate) fn catalog_findings(session: &secantus_wt::Session) -> Result<Vec<Str
                          time-series collection is"
                     ));
                 }
-            }
-            if ix.get_bool("ready") == Ok(false) {
-                out.push(format!(
-                    "{ns}'s index {name}, whose build has not finished (this server does not \
-                     resume mongod's index builds yet, RM-755)"
-                ));
             }
             let version = spec.get("v").and_then(|v| match v {
                 bson::Bson::Int32(n) => Some(i64::from(*n)),
