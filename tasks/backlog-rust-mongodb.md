@@ -2904,6 +2904,47 @@ Each was measured by starting mongod 8.2.11 on a store `secantusd-mdb`
 wrote and stopped (the forward direction of RM-723).
 
 
+## Found working RM-734 (index spec fidelity, 2026-11-24)
+
+- [ ] **`createIndexes` drops `sparse: false` from the spec, and keeps
+      options mongod parses away.** mongod 8.2.11 keeps `sparse: false` in
+      the catalog's spec and in `listIndexes` (on a plain, a unique, a TTL,
+      a partial, a `2dsphere`, a wildcard and a text index), keeps
+      `background` (either value) and `expireAfterSeconds: 0`, and drops
+      `unique: false`, `hidden: false`, `prepareUnique: false`, `dropDups`
+      and `ns`. `secantusd-mdb` drops `sparse: false`, refuses
+      `prepareUnique: false` ("The field 'prepareUnique' is not valid for
+      an index specification") and keeps `dropDups` and `ns`. The same
+      name with `sparse: false` or none is "all indexes already exist" in
+      mongod, as here.
+      Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_create_indexes_keeps_a_false_sparse_as_mongod_does, tests/backlog/test_rm_index_spec_fidelity.py::test_create_indexes_drops_the_options_mongod_parses_away
+      Backlog-ID: RM-788
+- [ ] **`reIndex` rebuilds nothing, so a `collMod`'d index's spec keeps
+      the order `collMod` made.** mongod 8.2.11's `reIndex` (standalone)
+      drops and builds every index from its spec, so the spec comes back
+      in creation order: `v`, `unique`, `hidden`, `prepareUnique`, `key`,
+      `name`, the rest as held, a changed TTL last (an index `collMod`'d
+      with `hidden` lists `v, hidden, key, name`, not `v, key, name,
+      hidden`). `secantusd-mdb` answers from the registry and leaves the
+      specs as they were. (Measured with it: a plain `--repair` rebuilds
+      nothing in either server and leaves the specs; one that salvages
+      index files builds them again in creation order in both, pinned by
+      `tests/mongod_live/test_index_spec_repair.py`. Index builds restarted
+      after a crash, and a store opened from mongod, take their spec from
+      the log or the catalog and have no `collMod`'d order to lose.)
+      Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_reindex_writes_a_collmodded_spec_in_creation_order
+      Backlog-ID: RM-789
+- [ ] **A planner tie goes by build order, not by mongod's in-memory index
+      order.** Three single-field indexes cost the same for `{a: 3, b: 3,
+      c: 3}`: mongod 8.2.11 takes the first in the collection's in-memory
+      order, where an index a `collMod` changed has moved to the end (after
+      `collMod` of `a_1`, `b_1` wins and `a_1` is last of the rejected
+      plans; after `a_1` and `b_1`, `c_1`); `secantusd-mdb` picks `a_1`
+      each time. RM-734 keeps that in-memory order for `dropIndexes: "*"`
+      only. Found working RM-734 (not fixed with it).
+      Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_a_planner_tie_goes_by_the_in_memory_index_order
+      Backlog-ID: RM-790
+
 ## Found working RM-746 (storage-model phase 7b, 2026-11-22)
 
 Each was measured by running the same writes on mongod 8.2.11 and on
