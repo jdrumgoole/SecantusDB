@@ -2530,7 +2530,12 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         // Unknown fields on the spec itself are rejected, not ignored.
         let spec_opts: Document = s
             .iter()
-            .filter(|(k, _)| k.as_str() != "key" && k.as_str() != "name")
+            .filter(|(k, v)| {
+                k.as_str() != "key"
+                    && k.as_str() != "name"
+                    // A default `prepareUnique` is parsed and dropped.
+                    && !(k.as_str() == "prepareUnique" && is_falsy(v))
+            })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         if let Some(unknown) = first_unknown_field(&spec_opts, INDEX_SPEC_KNOWN_OPTIONS) {
@@ -2618,11 +2623,17 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             original.insert("v", s.get("v").cloned().unwrap_or(Bson::Int32(2)));
             spec.insert(TS_ORIGINAL_SPEC, original);
         }
-        for opt in ["hidden", "sparse", "unique"] {
+        // mongod parses `hidden`, `unique` and `prepareUnique` into its
+        // index spec and writes each back only when set; `sparse` and
+        // `background` it keeps as given, false included (8.2.11, RM-788).
+        // `dropDups` and `ns` it no longer reads at all.
+        for opt in ["hidden", "unique", "prepareUnique"] {
             if spec.get(opt).is_some_and(is_falsy) {
                 spec.remove(opt);
             }
         }
+        spec.remove("dropDups");
+        spec.remove("ns");
         // The collation is stored spelled out in full, as mongod stores it:
         // the one given, else the collection's default. `simple` is stored
         // as no collation at all.
@@ -3743,7 +3754,10 @@ fn index_spec_problem(spec: &Document) -> Option<CommandError> {
         }
     }
     if let Some(unknown) = spec.keys().find(|k| {
-        !matches!(k.as_str(), "key" | "name") && !INDEX_SPEC_KNOWN_OPTIONS.contains(&k.as_str())
+        !matches!(k.as_str(), "key" | "name")
+            && !INDEX_SPEC_KNOWN_OPTIONS.contains(&k.as_str())
+            // `prepareUnique: false` is a default mongod parses and drops.
+            && !(k.as_str() == "prepareUnique" && spec.get(k.as_str()).is_some_and(is_falsy))
     }) {
         return Some(in_spec(
             197,
@@ -4081,16 +4095,19 @@ fn uuid_text(bytes: &[u8]) -> Option<String> {
     Some(bson::uuid::Uuid::from_bytes(b).to_string())
 }
 
-/// mongod's spec rendering for a conflict message: `v` first, then the
-/// options, then `key` and `name` (measured 8.2.11, 2026-10-01).
+/// mongod's spec rendering for a conflict message: its creation order, `v`,
+/// then `unique`, `hidden` and `prepareUnique`, `key`, `name` and the rest
+/// as given (measured 8.2.11, 2026-11-24; RM-788 found the options after
+/// `name`, where 2026-10-01's probe had only the ones before it).
 fn conflict_spec_text(spec: &Document) -> String {
+    let skipped =
+        |k: &str| matches!(k, "v" | "key" | "name" | "ns") || INDEX_CATALOG_ONLY.contains(&k);
+    let before_key = ["unique", "hidden", "prepareUnique"];
     let mut out = Document::new();
     out.insert("v", 2i32);
-    for (k, v) in spec {
-        if !matches!(k.as_str(), "v" | "key" | "name" | "ns" | "collation")
-            && !INDEX_CATALOG_ONLY.contains(&k.as_str())
-        {
-            out.insert(k.clone(), v.clone());
+    for f in before_key {
+        if let Some(v) = spec.get(f) {
+            out.insert(f, v.clone());
         }
     }
     if let Some(k) = spec.get("key") {
@@ -4099,9 +4116,10 @@ fn conflict_spec_text(spec: &Document) -> String {
     if let Some(n) = spec.get("name") {
         out.insert("name", n.clone());
     }
-    // The collation is the exception: it follows the name.
-    if let Some(c) = spec.get("collation") {
-        out.insert("collation", c.clone());
+    for (k, v) in spec {
+        if !skipped(k) && !before_key.contains(&k.as_str()) {
+            out.insert(k.clone(), v.clone());
+        }
     }
     argtypes::render_stage_value(&Bson::Document(out))
 }
@@ -4149,9 +4167,13 @@ pub(crate) const INDEX_CATALOG_ONLY: &[&str] = &[
 
 fn index_options(spec: &Document) -> Document {
     spec.iter()
-        .filter(|(k, _)| {
+        .filter(|(k, v)| {
             !matches!(k.as_str(), "v" | "key" | "name" | "ns")
                 && !INDEX_CATALOG_ONLY.contains(&k.as_str())
+                // mongod compares two specs without `background`, and
+                // `sparse: false` is no `sparse` (8.2.11, RM-788).
+                && k.as_str() != "background"
+                && !(k.as_str() == "sparse" && **v == Bson::Boolean(false))
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()

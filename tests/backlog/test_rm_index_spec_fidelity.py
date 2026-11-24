@@ -76,9 +76,9 @@ def _created(client: Any, db: str, case: tuple[str, dict, dict]) -> Any:
     return _specs(client, db, label)
 
 
-@pytest.mark.backlog("RM-788")
+@pytest.mark.backlog_fixed("RM-788")
 def test_create_indexes_keeps_a_false_sparse_as_mongod_does(rust_mongo: Any, mongod: Any) -> None:
-    """`createIndexes` with `sparse: false` keeps it in the spec, in the
+    """`createIndexes` with `sparse: false` dropped it; mongod keeps it in the spec, in the
     catalog and in `listIndexes`; `unique: false` and `hidden: false` are
     dropped; `background` and `expireAfterSeconds: 0` are kept (mongod
     8.2.11, 2026-11-24)."""
@@ -97,10 +97,10 @@ def _legacy(client: Any, db: str, label: str, options: dict) -> Any:
     return _specs(client, db, label)
 
 
-@pytest.mark.backlog("RM-788")
+@pytest.mark.backlog_fixed("RM-788")
 def test_create_indexes_drops_the_options_mongod_parses_away(rust_mongo: Any, mongod: Any) -> None:
-    """`prepareUnique: false` is accepted and not kept, and `dropDups` and
-    `ns` are accepted and not kept (mongod 8.2.11, 2026-11-24)."""
+    """`prepareUnique: false` was refused and `dropDups` and `ns` were kept;
+    mongod accepts all three and keeps none (mongod 8.2.11, 2026-11-24)."""
     differences = {}
     for label, options in [
         ("prepare-unique-false", {"prepareUnique": False}),
@@ -155,7 +155,7 @@ def _twice(client: Any, label: str, first: dict, second: dict) -> Any:
     return reply.get("note"), reply["numIndexesAfter"]
 
 
-@pytest.mark.backlog("RM-788")
+@pytest.mark.backlog_fixed("RM-788")
 def test_create_indexes_compares_a_spec_without_sparse_false_and_background(
     rust_mongo: Any, mongod: Any
 ) -> None:

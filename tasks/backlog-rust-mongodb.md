@@ -2898,19 +2898,6 @@ wrote and stopped (the forward direction of RM-723).
 
 ## Found working RM-734 (index spec fidelity, 2026-11-24)
 
-- [ ] **`createIndexes` drops `sparse: false` from the spec, and keeps
-      options mongod parses away.** mongod 8.2.11 keeps `sparse: false` in
-      the catalog's spec and in `listIndexes` (on a plain, a unique, a TTL,
-      a partial, a `2dsphere`, a wildcard and a text index), keeps
-      `background` (either value) and `expireAfterSeconds: 0`, and drops
-      `unique: false`, `hidden: false`, `prepareUnique: false`, `dropDups`
-      and `ns`. `secantusd-mdb` drops `sparse: false`, refuses
-      `prepareUnique: false` ("The field 'prepareUnique' is not valid for
-      an index specification") and keeps `dropDups` and `ns`. The same
-      name with `sparse: false` or none is "all indexes already exist" in
-      mongod, as here.
-      Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_create_indexes_keeps_a_false_sparse_as_mongod_does, tests/backlog/test_rm_index_spec_fidelity.py::test_create_indexes_drops_the_options_mongod_parses_away
-      Backlog-ID: RM-788
 - [ ] **`createIndexes` coerces a flag's type, accepts a `hidden` that is
       no bool, and refuses `prepareUnique: true`.** Found closing RM-788
       (2026-11-24, mongod 8.2.11). mongod's catalog keeps `sparse` and
