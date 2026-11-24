@@ -17379,7 +17379,7 @@ impl Storage {
         payload_doc.insert("options", Bson::Document(stored_options.clone()));
         // The spec's field order as mongod writes it, kept so the catalog
         // lists it so, and a `collMod` appends after `name` (RM-734).
-        payload_doc.insert("specOrder", create_spec_order(&stored_options));
+        payload_doc.insert("specOrder", create_spec_order(stored_options));
         let payload = encode_doc(&payload_doc)?;
         Ok(Some(IndexPlan { payload, entries }))
     }
