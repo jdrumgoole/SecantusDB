@@ -46,7 +46,7 @@ use secantus_core::order::{with_bindata_order, BinDataOrder};
 use secantus_core::query::matches as query_matches;
 pub use secantus_core::recordid::RecordId;
 use secantus_core::sortkey::{self, COMPOUND_SEP, RANK_MINKEY};
-use secantus_core::wildcard::{self, is_wildcard_spec};
+use secantus_core::wildcard;
 use secantus_core::{get_path, get_path_values};
 /// The engine error [`StorageError::Wt`] carries, nameable by the crates
 /// that see it (a [`ReadFault`] in a test builds one).
