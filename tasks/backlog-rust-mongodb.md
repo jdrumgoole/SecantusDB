@@ -2918,6 +2918,19 @@ produce the dump it exists for.
       (measured 2026-11-22).
       Verify: tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_killed_mongod_store_whose_oplog_drops_what_it_refuses
       Backlog-ID: RM-756
+- [ ] **A mongod store holding a `2d`, `2dsphere` or wildcard index is
+      refused on adoption, never probed for whether it is served right.**
+      `secantusd-mdb` writes these indexes' keys as mongod 8.2.11 does since
+      store format 11, but `UNSERVED_INDEX_KINDS` (`store_format.rs`) and
+      the wildcard check still refuse a store mongod wrote with one, by
+      name. The reverse hand-off needs the adopted index (its spec, bits /
+      min / max, version 3, multikey paths, `wildcardProjection`, partial
+      filter) to be served by the same key generators and scans, with its
+      `$near` / `$geoWithin` / `$geoIntersects` and wildcard answers and
+      winning plans those of mongod on the same data, and the store handed
+      back to mongod to `validate` after this server's own writes.
+      Verify: tests/backlog/test_rm_storage_model.py::test_secantus_serves_mongods_geo_and_wildcard_indexes
+      Backlog-ID: RM-775
 
 ## Found making mongod open our stores (storage-model phase 7, 2026-11-21)
 

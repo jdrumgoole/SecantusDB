@@ -1492,3 +1492,283 @@ def test_the_initiation_logs_the_pre_images_collection(tmp_path: Path) -> None:
             if "create" in e["o"]
         ]
     assert "system.preimages" in creates, creates
+
+
+def _geo_wildcard_docs() -> list[dict]:
+    """The documents of the geo / wildcard hand-off store (RM-775)."""
+    docs: list[dict] = []
+    for i in range(60):
+        x, y = (i * 7) % 40 - 20, (i * 11) % 30 - 15
+        docs.append(
+            {
+                "_id": i,
+                "t": i % 4,
+                "flat": [x, y],
+                "pt": {"type": "Point", "coordinates": [x + 0.5, y + 0.25]},
+                "pts": {"type": "MultiPoint", "coordinates": [[x, y], [y / 2, x / 2]]},
+                "places": [
+                    {"loc": {"type": "Point", "coordinates": [x, y]}, "n": i},
+                    {"loc": {"type": "Point", "coordinates": [y / 2, x / 2]}, "n": i + 1},
+                ],
+                "poly": {
+                    "type": "Polygon",
+                    "coordinates": [[[x, y], [x + 2, y], [x + 2, y + 2], [x, y + 2], [x, y]]],
+                },
+                "w": {"a": i % 5, "b": [i % 3, f"s{i % 4}"], "c": {"d": i % 7, "e": None}},
+                "z": i % 9,
+                "arr": [{"k": i % 6}, {"k": (i + 1) % 6}],
+                "keep": i % 2 == 0,
+            }
+        )
+    return docs
+
+
+def _geo_wildcard_indexes(coll: Any) -> None:
+    coll.create_index([("flat", "2d"), ("t", 1)], name="flat_t")
+    coll.create_index(
+        [("flat", "2d")],
+        name="flat_b",
+        bits=20,
+        min=-100,
+        max=100,
+        partialFilterExpression={"keep": True},
+    )
+    coll.create_index([("pt", "2dsphere"), ("t", 1)], name="pt_t")
+    coll.create_index([("t", 1), ("pts", "2dsphere")], name="t_pts")
+    coll.create_index([("places.loc", "2dsphere"), ("t", -1)], name="pl_s")
+    coll.create_index(
+        [("poly", "2dsphere")], name="poly_s", partialFilterExpression={"t": {"$gte": 1}}
+    )
+    coll.create_index([("$**", 1)], name="all_w")
+    coll.create_index([("w.$**", 1)], name="w_w")
+    coll.create_index(
+        [("$**", 1)], name="proj_w", wildcardProjection={"w.a": 1, "arr.k": 1, "z": 1}
+    )
+    coll.create_index(
+        [("$**", 1)],
+        name="excl_w",
+        wildcardProjection={"flat": 0, "pt": 0, "pts": 0, "poly": 0, "w": 0},
+    )
+    coll.create_index([("$**", 1)], name="part_w", partialFilterExpression={"keep": True})
+
+
+def _sq(x: int, lo: int = 0) -> dict:
+    return {
+        "type": "Polygon",
+        "coordinates": [[[lo, lo], [x, lo], [x, x], [lo, x], [lo, lo]]],
+    }
+
+
+#: (name, filter, hint, sort)
+_GEO_QUERIES: list[tuple[str, dict, str | None, list | None]] = [
+    ("near2d", {"flat": {"$near": [3, 4]}}, "flat_t", None),
+    ("near2d_max", {"flat": {"$near": [3, 4], "$maxDistance": 12}, "t": 1}, "flat_t", None),
+    ("nearSphere2d", {"flat": {"$nearSphere": [3, 4], "$maxDistance": 0.3}}, "flat_t", None),
+    ("within_box", {"flat": {"$geoWithin": {"$box": [[-5, -5], [8, 9]]}}}, "flat_t", None),
+    (
+        "within_center",
+        {"flat": {"$geoWithin": {"$center": [[0, 0], 9]}}, "t": {"$in": [0, 2]}},
+        "flat_t",
+        None,
+    ),
+    (
+        "within_poly2d",
+        {"flat": {"$geoWithin": {"$polygon": [[-9, -9], [12, -3], [3, 11]]}}},
+        "flat_t",
+        None,
+    ),
+    (
+        "partial2d",
+        {"flat": {"$geoWithin": {"$box": [[-20, -20], [20, 20]]}}, "keep": True},
+        "flat_b",
+        None,
+    ),
+    (
+        "near_pt",
+        {
+            "pt": {
+                "$near": {
+                    "$geometry": {"type": "Point", "coordinates": [1, 2]},
+                    "$maxDistance": 2_000_000,
+                }
+            }
+        },
+        "pt_t",
+        None,
+    ),
+    (
+        "nearSphere_pt_t",
+        {
+            "pt": {
+                "$nearSphere": {
+                    "$geometry": {"type": "Point", "coordinates": [1, 2]},
+                    "$minDistance": 100_000,
+                }
+            },
+            "t": 2,
+        },
+        "pt_t",
+        None,
+    ),
+    ("within_sphere", {"pt": {"$geoWithin": {"$geometry": _sq(10, -10)}}}, "pt_t", None),
+    ("within_centerSphere", {"pt": {"$geoWithin": {"$centerSphere": [[0, 0], 0.2]}}}, "pt_t", None),
+    (
+        "intersects_poly",
+        {"poly": {"$geoIntersects": {"$geometry": _sq(9)}}, "t": {"$gte": 1}},
+        "poly_s",
+        None,
+    ),
+    (
+        "intersects_pts",
+        {"pts": {"$geoIntersects": {"$geometry": _sq(6, -6)}}, "t": 1},
+        "t_pts",
+        None,
+    ),
+    (
+        "near_pts_array",
+        {"pts": {"$near": {"$geometry": {"type": "Point", "coordinates": [5, 5]}}}, "t": 3},
+        "t_pts",
+        None,
+    ),
+    (
+        "near_places",
+        {"places.loc": {"$near": {"$geometry": {"type": "Point", "coordinates": [3, 3]}}}},
+        "pl_s",
+        None,
+    ),
+    ("within_places", {"places.loc": {"$geoWithin": {"$geometry": _sq(8, -8)}}}, "pl_s", None),
+    ("w_eq", {"w.a": 3}, "all_w", None),
+    ("w_eq_arr", {"w.b": 2}, "all_w", None),
+    ("w_str", {"w.b": "s1"}, "w_w", None),
+    ("w_range", {"w.c.d": {"$gt": 2, "$lte": 5}}, "w_w", None),
+    ("w_null", {"w.c.e": None}, "all_w", None),
+    ("w_in", {"z": {"$in": [1, 4, 8]}}, "all_w", None),
+    ("w_proj_eq", {"w.a": 2}, "proj_w", None),
+    ("w_proj_arr", {"arr.k": {"$gte": 4}}, "proj_w", None),
+    ("w_proj_z", {"z": {"$lt": 3}}, "proj_w", None),
+    ("w_excl", {"z": {"$gte": 7}}, "excl_w", None),
+    ("w_excl_arr", {"arr.k": 5}, "excl_w", None),
+    ("w_part", {"w.a": 1, "keep": True}, "part_w", None),
+    ("w_sort", {"w.c.d": {"$gte": 0}}, "w_w", [("w.c.d", 1), ("_id", 1)]),
+    ("w_exists", {"w.c.d": {"$exists": True}}, "w_w", None),
+]
+
+
+def _geo_answers(coll: Any) -> dict:
+    """Each query's ids (in order where mongod defines one) and count."""
+    out: dict = {}
+    for name, flt, hint, sort in _GEO_QUERIES:
+        ordered = "near" in name.lower()
+
+        def run(flt=flt, hint=hint, sort=sort, ordered=ordered):
+            cur = coll.find(flt, hint=hint)
+            if sort:
+                cur = cur.sort(sort)
+            ids = [d["_id"] for d in cur]
+            return ids if (ordered or sort) else sorted(ids)
+
+        out[name] = mongo_answer(run)
+        if "near" not in name.lower():
+            out["count:" + name] = mongo_answer(
+                lambda flt=flt, hint=hint: coll.count_documents(flt, hint=hint)
+            )
+    return out
+
+
+def _winning(plan: dict | None) -> list:
+    """The winning plan's stage and index names, root first."""
+    out: list = []
+    while plan:
+        out.append((plan.get("stage"), plan.get("indexName")))
+        plan = plan.get("inputStage") or (plan.get("inputStages") or [None])[0]
+    return out
+
+
+def _geo_plans(coll: Any) -> dict:
+    # No hint: the planner chooses, as it does on mongod.
+    return {
+        name: mongo_answer(
+            lambda flt=flt: _winning(coll.find(flt).explain()["queryPlanner"]["winningPlan"])
+        )
+        for name, flt, _hint, _sort in _GEO_QUERIES
+    }
+
+
+_GEO_WRITES_DOC = {
+    "_id": 900,
+    "t": 1,
+    "flat": [1, 1],
+    "pt": {"type": "Point", "coordinates": [1, 1]},
+    "pts": {"type": "MultiPoint", "coordinates": [[2, 2]]},
+    "places": [{"loc": {"type": "Point", "coordinates": [2, 2]}, "n": 1}],
+    "poly": _sq(3),
+    "w": {"a": 3, "b": [2], "c": {"d": 4}},
+    "z": 1,
+    "arr": [{"k": 5}],
+    "keep": True,
+}
+
+
+def _geo_writes(coll: Any) -> None:
+    coll.insert_one(dict(_GEO_WRITES_DOC))
+    coll.update_one({"_id": 5}, {"$set": {"flat": [2, 2], "w.a": 3, "z": 8, "keep": False}})
+    coll.delete_one({"_id": 6})
+
+
+@pytest.mark.backlog("RM-775")
+def test_secantus_serves_mongods_geo_and_wildcard_indexes(tmp_path: Path) -> None:
+    """A store mongod 8.2.11 wrote holding `2d`, `2dsphere` (compound, array,
+    partial) and wildcard (whole, subtree, `wildcardProjection` both ways,
+    partial) indexes is adopted by `secantusd-mdb`, which answers `$near` /
+    `$nearSphere` / `$geoWithin` / `$geoIntersects` and wildcard queries as
+    mongod does on the same data (documents, order where mongod defines it,
+    winning plans), keeps the indexes consistent through its own writes, and
+    hands the store back to a mongod whose `validate({full: true})` passes."""
+    store = tmp_path / "store"
+    store.mkdir()
+    proc, client = _mongod_on(store)
+    assert client is not None, "mongod did not start on an empty directory"
+    host, port = client.address or ("127.0.0.1", 0)
+    try:
+        _wait_primary(client, f"{host}:{port}")
+        with pymongo.MongoClient(
+            host, port, replicaSet="rs0", serverSelectionTimeoutMS=10_000
+        ) as rs:
+            coll = rs["app"]["g"]
+            coll.insert_many(_geo_wildcard_docs())
+            _geo_wildcard_indexes(coll)
+            expected = {"answers": _geo_answers(coll), "plans": _geo_plans(coll)}
+    finally:
+        _stop_mongod(proc, client)
+    # A copy of the clean store takes the writes on mongod, the reference for
+    # what the answers are afterwards.
+    ref = tmp_path / "ref" / "store"
+    shutil.copytree(store, ref)
+    proc, client = _mongod_on(ref, port)
+    assert client is not None, "mongod did not reopen its own store"
+    try:
+        _until_primary(client)
+        _geo_writes(client["app"]["g"])
+        expected["after"] = _geo_answers(client["app"]["g"])
+    finally:
+        _stop_mongod(proc, client)
+    names = ["_id_", "flat_t", "flat_b", "pt_t", "t_pts", "pl_s", "poly_s"]
+    names += ["all_w", "w_w", "proj_w", "excl_w", "part_w"]
+    with rust_mongo_server(store) as rust:
+        coll = rust["app"]["g"]
+        listed = mongo_answer(lambda: sorted(ix["name"] for ix in coll.list_indexes()))
+        assert listed == ("ok", sorted(names))
+        assert _geo_answers(coll) == expected["answers"]
+        assert _geo_plans(coll) == expected["plans"]
+        _geo_writes(coll)
+        assert _geo_answers(coll) == expected["after"]
+        rust_port = rust.address[1]
+    proc, mongod = _mongod_on(store, rust_port, SECANTUS_SET)
+    try:
+        assert mongod is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            _until_primary(mongod)
+            assert _validation_findings(mongod, "app", "g") is None
+            assert _geo_answers(mongod["app"]["g"]) == expected["after"]
+    finally:
+        _stop_mongod(proc, mongod)
