@@ -915,14 +915,16 @@ def test_mongod_finds_the_users_and_roles_secantus_made(tmp_path: Path) -> None:
         assert (users, roles) == (["u1"], ["r1"])
 
 
-@pytest.mark.backlog("RM-745")
+@pytest.mark.backlog_fixed("RM-745")
 def test_a_views_ddl_is_logged_as_mongod_logs_it() -> None:
     """mongod 8.2.11 logs a view's DDL as writes to `system.views`, not as
     commands (measured 2026-11-21): the first view's database gets
     `{op: c, o: {create: "system.views", idIndex}}`, then each create is an
     insert of the definition, a `collMod` an update replacing it and a drop
-    its delete. This server logs `create` (with its internal `viewPipeline`
-    and an `idIndex`), `collMod` and `drop` commands naming the view."""
+    its delete. This server logged `create` (with its internal `viewPipeline`
+    and an `idIndex`), `collMod` and `drop` commands naming the view, which
+    mongod replaying a killed store's oplog refused ("'viewPipeline' is not
+    a valid collection option"), aborting its recovery (RM-745)."""
     import tempfile
 
     with tempfile.TemporaryDirectory() as home, rust_mongo_server(Path(home) / "s") as c:
@@ -949,6 +951,51 @@ def test_a_views_ddl_is_logged_as_mongod_logs_it() -> None:
         ),
         ("d", "app.system.views", {"_id": "app.v1"}),
     ]
+
+
+@pytest.mark.backlog_fixed("RM-745")
+def test_mongod_opens_a_killed_store_whose_workload_made_views(tmp_path: Path) -> None:
+    """The kill probe RM-745 was measured with (2026-11-22): views made,
+    changed and dropped, then SIGKILL. mongod 8.2.11 replays the oplog after
+    the stable checkpoint, and a view's `create` command carrying
+    `viewPipeline` aborted its recovery. Logged as `system.views` writes,
+    the views replay as mongod's own do, and the live one reads back."""
+
+    def setup(c: pymongo.MongoClient) -> None:
+        c.app.c.insert_many([{"_id": i, "a": i % 3} for i in range(30)])
+        c.app.command("create", "v1", viewOn="c", pipeline=[{"$match": {"a": 1}}])
+        c.app.command("create", "gone", viewOn="c", pipeline=[])
+        c.app.command("collMod", "v1", viewOn="c", pipeline=[{"$match": {"a": 2}}])
+        c.app.gone.drop()
+
+    with _mongod_on_secantus_store(tmp_path, setup, kill=True) as mongod:
+        names = sorted(
+            (i["name"], i["type"]) for i in mongod.app.list_collections() if i["name"] != "c"
+        )
+        assert names == [("system.views", "collection"), ("v1", "view")]
+        assert mongod.app.v1.count_documents({}) == 10
+
+
+@pytest.mark.backlog_fixed("RM-745")
+def test_a_killed_store_replays_its_views(tmp_path: Path) -> None:
+    """The same workload, SIGKILLed, reopened by this server: its recovery
+    replays the `system.views` writes as the views' DDL (RM-745)."""
+    store = tmp_path / "store"
+
+    def setup(c: pymongo.MongoClient) -> None:
+        c.app.c.insert_many([{"_id": i, "a": i % 3} for i in range(30)])
+        c.app.command("create", "v1", viewOn="c", pipeline=[{"$match": {"a": 1}}])
+        c.app.command("create", "gone", viewOn="c", pipeline=[])
+        c.app.command("collMod", "v1", viewOn="c", pipeline=[{"$match": {"a": 2}}])
+        c.app.gone.drop()
+
+    _killed_secantus_store(store, setup)
+    with rust_mongo_server(store) as c:
+        views = {i["name"]: i["options"] for i in c.app.list_collections() if i["type"] == "view"}
+        assert views == {"v1": {"viewOn": "c", "pipeline": [{"$match": {"a": 2}}]}}
+        assert c.app.v1.count_documents({}) == 10
+        defs = list(c.app.system.views.find())
+        assert defs == [{"_id": "app.v1", "viewOn": "c", "pipeline": [{"$match": {"a": 2}}]}]
 
 
 #: The `_id` index spec an oplog `create` entry carries.

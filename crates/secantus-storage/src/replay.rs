@@ -200,6 +200,9 @@ fn apply_entry_with(storage: &Storage, entry: &Document, strict: bool) -> Result
         return Ok(true);
     }
     let (db, coll) = ns_split(ns);
+    if coll == secantus_core::viewdefs::SYSTEM_VIEWS && apply_view_write(storage, &db, op, entry)? {
+        return Ok(true);
+    }
     match op {
         "i" => {
             let o = entry
@@ -280,6 +283,66 @@ fn apply_entry_with(storage: &Storage, entry: &Document, strict: bool) -> Result
         }
         _ => Ok(false),
     }
+}
+
+/// A plain view's DDL, which mongod 8.2.11 logs as the writes to its
+/// database's `system.views` (RM-745): the insert of its definition creates
+/// the view, an update replacing it is its `collMod`, its delete the drop.
+/// Applied as that DDL, which writes the document itself. `false` for a
+/// write that is not a plain view's (a time-series collection's document),
+/// applied as the plain write it is.
+fn apply_view_write(storage: &Storage, db: &str, op: &str, entry: &Document) -> Result<bool> {
+    let o = entry.get_document("o").ok();
+    let id = entry
+        .get_document("o2")
+        .ok()
+        .and_then(|o2| o2.get_str("_id").ok())
+        .or_else(|| o.and_then(|o| o.get_str("_id").ok()));
+    let Some(name) = id.and_then(|id| id.strip_prefix(db)?.strip_prefix('.')) else {
+        return Ok(false);
+    };
+    let options = |def: &Document| -> Option<Document> {
+        let on = def.get_str("viewOn").ok()?;
+        if def.contains_key("timeseries") {
+            return None;
+        }
+        let mut opts = bson::doc! {
+            "viewOn": on,
+            "viewPipeline": def.get_array("pipeline").cloned().unwrap_or_default(),
+        };
+        if let Some(c) = def.get("collation") {
+            opts.insert("collation", c.clone());
+        }
+        Some(opts)
+    };
+    match op {
+        "i" => {
+            let Some(opts) = o.and_then(options) else {
+                return Ok(false);
+            };
+            if !storage.create_collection_with_options(db, name, &opts)? {
+                storage.coll_mod(db, name, &opts)?;
+            }
+        }
+        // A replacement: a view's definition is replaced whole.
+        "u" => {
+            let Some(opts) = o.filter(|o| !o.contains_key("$v")).and_then(options) else {
+                return Ok(false);
+            };
+            storage.coll_mod(db, name, &opts)?;
+        }
+        "d" => {
+            let plain = storage
+                .get_collection_options(db, name)
+                .is_ok_and(|o| crate::is_plain_view(&o));
+            if !plain {
+                return Ok(false);
+            }
+            storage.drop_collection(db, name)?;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 /// Is `entry` at or before the target? An entry past the bound stops replay.

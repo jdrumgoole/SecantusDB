@@ -4434,6 +4434,14 @@ fn defines_view(options: &Document) -> bool {
     options.contains_key("viewOn") || options.contains_key("timeseries")
 }
 
+/// Whether `options` are a view's (not a time-series collection's), whose
+/// DDL mongod 8.2.11 logs as the writes to `system.views` alone: an insert
+/// of its definition, an update replacing it, its delete -- no command
+/// naming the view (measured 2026-11-21; RM-745).
+pub(crate) fn is_plain_view(options: &Document) -> bool {
+    options.contains_key("viewOn") && !options.contains_key("timeseries")
+}
+
 fn counting_index_keys() -> bool {
     INDEX_KEYS.with(|k| k.get().is_some())
 }
@@ -10844,8 +10852,24 @@ impl Storage {
     /// After a view's or a time-series collection's DDL: its database's
     /// `system.views` says what the registry says, and a time-series
     /// collection's buckets have mongod's catalog options.
-    fn after_view_ddl(&self, db: &str, coll: &str) -> Result<()> {
-        self.sync_system_views(db)?;
+    /// A user write block refuses a plain view's DDL, as mongod's op
+    /// observer refuses its `system.views` write: bare, before anything of
+    /// it commits (the command entry's check did so before RM-745).
+    fn refuse_blocked_view_ddl(&self, db: &str) -> Result<()> {
+        match self.user_write_block_for(db) {
+            Some(reason) => Err(StorageError::QueryError {
+                code: 371,
+                errmsg: format!("User writes blocked, reason: {reason}"),
+                exec: false,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// `plain`: `coll` is (or was) a plain view, whose document's write is
+    /// logged as its DDL (RM-745).
+    fn after_view_ddl(&self, db: &str, coll: &str, plain: bool) -> Result<()> {
+        self.sync_system_views_logging(db, plain.then_some(coll))?;
         let buckets = format!("{}{coll}", secantus_core::viewdefs::BUCKETS_PREFIX);
         if self.collection_exists(db, &buckets)? {
             self.catalog_write(|session| sync_catalog_entry(session, db, &buckets))?;
@@ -10863,6 +10887,17 @@ impl Storage {
     /// collection is made with the first view and stays when the last goes,
     /// as mongod's does.
     pub(crate) fn sync_system_views(&self, db: &str) -> Result<()> {
+        self.sync_system_views_logging(db, None)
+    }
+
+    /// [`Self::sync_system_views`], logging the write of the plain view
+    /// `logged`'s document (and the collection's create, when that write
+    /// makes it), as mongod logs a view's DDL (RM-745). Every other write
+    /// -- a time-series collection's document, a mend at open -- stays
+    /// unreplicated.
+    fn sync_system_views_logging(&self, db: &str, logged: Option<&str>) -> Result<()> {
+        let logged_id = logged.map(|name| Bson::String(format!("{db}.{name}")));
+        let guard = |id: &Bson| (logged_id.as_ref() != Some(id)).then(unreplicated);
         let mut want: Vec<Document> = Vec::new();
         {
             let session = self.conn.open_session()?;
@@ -10886,10 +10921,10 @@ impl Storage {
         if want.is_empty() && have.is_empty() {
             return Ok(());
         }
-        let _unlogged = unreplicated();
         for doc in &have {
             let id = doc.get("_id").cloned().unwrap_or(Bson::Null);
             if !want.iter().any(|w| w.get("_id") == Some(&id)) {
+                let _unlogged = guard(&id);
                 self.delete_matching(db, views, &bson::doc! {"_id": id}, 1, &Vars::new(), None)?;
             }
         }
@@ -10899,6 +10934,7 @@ impl Storage {
             match have.iter().find(|h| h.get("_id") == Some(&id)) {
                 Some(h) if *h == def => {}
                 Some(_) => {
+                    let _unlogged = guard(&id);
                     self.update_matching(
                         db,
                         views,
@@ -10913,11 +10949,12 @@ impl Storage {
                         false,
                     )?;
                 }
-                None => missing.push(encode_doc(&def)?),
+                None => missing.push((id, encode_doc(&def)?)),
             }
         }
-        if !missing.is_empty() {
-            let (_, errors) = self.insert(db, views, missing, true)?;
+        for (id, doc) in missing {
+            let _unlogged = guard(&id);
+            let (_, errors) = self.insert(db, views, vec![doc], true)?;
             if let Some(e) = errors.first() {
                 return Err(StorageError::Internal(format!("writing {db}.{views}: {e}")));
             }
@@ -11711,13 +11748,20 @@ impl Storage {
         // timestamp, and what it writes before it is untimestamped, over
         // rows earlier writes timestamped (RM-746).
         let _op = self.ddl_scope();
-        self.coll_mod_recording_inner(db, coll, opts, given)?;
-        let defined = {
+        let plain_before = {
             let session = self.conn.open_session()?;
-            coll_options(&session, db, coll)?.is_some_and(|o| defines_view(&o))
+            coll_options(&session, db, coll)?.is_some_and(|o| is_plain_view(&o))
         };
-        if defined {
-            self.after_view_ddl(db, coll)?;
+        if plain_before {
+            self.refuse_blocked_view_ddl(db)?;
+        }
+        self.coll_mod_recording_inner(db, coll, opts, given)?;
+        let options = {
+            let session = self.conn.open_session()?;
+            coll_options(&session, db, coll)?
+        };
+        if let Some(o) = options.filter(defines_view) {
+            self.after_view_ddl(db, coll, is_plain_view(&o))?;
         }
         Ok(())
     }
@@ -11752,7 +11796,9 @@ impl Storage {
             if state_before.contains_key("viewOn") {
                 note_index_keys(Some(0), Some(0));
             }
-            if self.enable_oplog {
+            // A view's `collMod` is logged as the update replacing its
+            // `system.views` document (`after_view_ddl`; RM-745).
+            if self.enable_oplog && !is_plain_view(&state_before) {
                 let ui = collection_uuid(session, db, coll)?;
                 let mut o = Document::new();
                 o.insert("collMod", coll);
@@ -15516,9 +15562,12 @@ impl Storage {
         // timestamp, and what it writes before it is untimestamped, over
         // rows earlier writes timestamped (RM-746).
         let _op = self.ddl_scope();
+        if is_plain_view(options) && !self.collection_exists(db, coll)? {
+            self.refuse_blocked_view_ddl(db)?;
+        }
         let created = self.create_collection_with_options_inner(db, coll, options)?;
         if created && defines_view(options) {
-            self.after_view_ddl(db, coll)?;
+            self.after_view_ddl(db, coll, is_plain_view(options))?;
         }
         Ok(created)
     }
@@ -15571,14 +15620,18 @@ impl Storage {
                         self.unplace_collection(&session, db, coll)?;
                     }
                 }
-                if self.enable_oplog {
+                // A view's create is logged as its `system.views` insert
+                // (`after_view_ddl`; RM-745).
+                if self.enable_oplog && !is_plain_view(options) {
                     self.emit_create_oplog(&session, db, coll, options)?;
                 }
                 Ok(true)
             })
         })
         .inspect(|&created| {
-            if created && defines_view(options) {
+            // A plain view's logged `system.views` insert counts its own
+            // key (RM-745); a time-series definition's is unreplicated.
+            if created && defines_view(options) && !is_plain_view(options) {
                 note_index_keys(Some(1), None);
             }
         })
@@ -15592,13 +15645,16 @@ impl Storage {
         // timestamp, and what it writes before it is untimestamped, over
         // rows earlier writes timestamped (RM-746).
         let _op = self.ddl_scope();
-        let defined = {
+        let options = {
             let session = self.conn.open_session()?;
-            coll_options(&session, db, coll)?.is_some_and(|o| defines_view(&o))
+            coll_options(&session, db, coll)?.filter(defines_view)
         };
+        if options.as_ref().is_some_and(is_plain_view) {
+            self.refuse_blocked_view_ddl(db)?;
+        }
         let existed = self.drop_collection_inner(db, coll)?;
-        if existed && defined {
-            self.after_view_ddl(db, coll)?;
+        if let (true, Some(o)) = (existed, options) {
+            self.after_view_ddl(db, coll, is_plain_view(&o))?;
         }
         Ok(existed)
     }
@@ -15692,8 +15748,10 @@ impl Storage {
                 let Some(options) = coll_options(&session, db, coll)? else {
                     return Ok(false);
                 };
-                defined.set(defines_view(&options));
-                let ui = if self.enable_oplog {
+                defined.set(defines_view(&options) && !is_plain_view(&options));
+                // A view's drop is logged as its `system.views` delete
+                // (`after_view_ddl`), not as a command (RM-745).
+                let ui = if self.enable_oplog && !is_plain_view(&options) {
                     Some(collection_uuid(&session, db, coll)?)
                 } else {
                     None

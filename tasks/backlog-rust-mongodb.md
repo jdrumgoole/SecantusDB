@@ -2906,22 +2906,6 @@ produce the dump it exists for.
 Each was measured by starting mongod 8.2.11 on a store `secantusd-mdb`
 wrote and stopped (the forward direction of RM-723).
 
-- [ ] **A view's DDL is logged as commands, not as mongod logs it.** mongod
-      8.2.11 logs creating a view as an insert into `<db>.system.views` (the
-      first one preceded by `create: "system.views"`), a `collMod` of it as
-      an update replacing the document and a drop as its delete; it logs no
-      command naming the view. This server logs `create` (carrying its
-      internal `viewPipeline` option and an `idIndex`), `collMod` (without
-      the pipeline) and `drop`, and writes the `system.views` document
-      unreplicated beside them. Change streams read those commands, so a fix
-      also derives their view events from the `system.views` writes, as
-      mongod's change stream does. Since a killed store opens in mongod
-      (RM-746, phase 7b), this is what still stops one: mongod replaying a
-      view's `create` entry from our oplog fails it ("'viewPipeline' is not a
-      valid collection option", InvalidOptions) and aborts its recovery
-      (measured 2026-11-22, a kill probe whose workload makes views).
-      Backlog-ID: RM-745
-      Verify: tests/backlog/test_rm_storage_model.py::test_a_views_ddl_is_logged_as_mongod_logs_it
 
 ## Found working RM-746 (storage-model phase 7b, 2026-11-22)
 
