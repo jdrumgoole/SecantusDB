@@ -36,6 +36,20 @@ fn refuse(code: i32, message: impl Into<String>) -> StorageError {
     }
 }
 
+/// Whether each field of `index` is multikey: an array in some document
+/// has made it so (the catalog's record, which outlives the array).
+pub(crate) fn multikey_fields(
+    storage: &dyn Storage,
+    db: &str,
+    coll: &str,
+    index: &GeoIndex,
+) -> Result<Vec<bool>, StorageError> {
+    let paths = storage.index_multikey_paths(db, coll, &index.name)?;
+    Ok((0..index.fields.len())
+        .map(|at| paths.get(at).is_some_and(|p| !p.is_empty()))
+        .collect())
+}
+
 /// The collection's visible geo indexes, in catalog order.
 fn geo_indexes(storage: &dyn Storage, db: &str, coll: &str) -> Result<Vec<GeoIndex>, StorageError> {
     Ok(storage
@@ -140,8 +154,17 @@ fn clauses(filter: &Document) -> Vec<(&str, &Bson)> {
 
 /// The bounds of the index's non-geo fields from the filter: one value
 /// under an equality, all of them with no predicate. `None` when a field
-/// has another predicate, whose bounds this does not build.
-pub(crate) fn trailing_bounds(index: &GeoIndex, filter: &Document) -> Option<Vec<FieldBounds>> {
+/// has another predicate, whose bounds this does not build. `multikey`
+/// says, per field of the index, whether an array has made it multikey: its
+/// bounds are those of ONE predicate, the first of the query in canonical
+/// order, since two of them may be met by different elements of an array
+/// (measured 8.2.11: `{t: {$gte: 1, $lte: 2}}` over a multikey `t` scans
+/// `[-inf, 2]`, and a document holding `[3, 0]` is returned).
+pub(crate) fn trailing_bounds(
+    index: &GeoIndex,
+    filter: &Document,
+    multikey: &[bool],
+) -> Option<Vec<FieldBounds>> {
     let cl = clauses(filter);
     let mut out = Vec::with_capacity(index.fields.len());
     for (at, field) in index.fields.iter().enumerate() {
@@ -154,6 +177,10 @@ pub(crate) fn trailing_bounds(index: &GeoIndex, filter: &Document) -> Option<Vec
             .filter(|(k, _)| k == field)
             .map(|(_, v)| *v)
             .collect();
+        if multikey.get(at).copied().unwrap_or(false) && !preds.is_empty() {
+            out.push(multikey_bounds(field, &preds)?);
+            continue;
+        }
         let bound = match preds.as_slice() {
             [] => FieldBounds::Full,
             // A range on the field bounds it too (measured 8.2.11:
@@ -162,27 +189,9 @@ pub(crate) fn trailing_bounds(index: &GeoIndex, filter: &Document) -> Option<Vec
             [Bson::Document(d)]
                 if d.keys().any(|k| k.starts_with('$')) && !d.contains_key("$eq") =>
             {
-                range_bounds(d)?
+                range_bounds(d, false)?
             }
-            [v] => {
-                let value = match v {
-                    Bson::Document(d) if d.keys().any(|k| k.starts_with('$')) => {
-                        if d.len() == 1 {
-                            d.get("$eq")?
-                        } else {
-                            return None;
-                        }
-                    }
-                    other => other,
-                };
-                if matches!(
-                    value,
-                    Bson::Array(_) | Bson::Document(_) | Bson::RegularExpression(_) | Bson::Null
-                ) {
-                    return None;
-                }
-                FieldBounds::Point(secantus_core::sortkey::encode_value(value, None).ok()?)
-            }
+            [v] => equality_bounds(v)?,
             _ => return None,
         };
         out.push(bound);
@@ -190,11 +199,71 @@ pub(crate) fn trailing_bounds(index: &GeoIndex, filter: &Document) -> Option<Vec
     Some(out)
 }
 
+/// The bounds of an equality on a trailing field: one value, never an
+/// array, a document, a regex or null.
+fn equality_bounds(v: &Bson) -> Option<FieldBounds> {
+    let value = match v {
+        Bson::Document(d) if d.keys().any(|k| k.starts_with('$')) => {
+            if d.len() == 1 {
+                d.get("$eq")?
+            } else {
+                return None;
+            }
+        }
+        other => other,
+    };
+    if matches!(
+        value,
+        Bson::Array(_) | Bson::Document(_) | Bson::RegularExpression(_) | Bson::Null
+    ) {
+        return None;
+    }
+    Some(FieldBounds::Point(
+        secantus_core::sortkey::encode_value(value, None).ok()?,
+    ))
+}
+
+/// The bounds of a multikey trailing field: those of the first predicate of
+/// the query, in canonical order, that bounds it (`plan.rs` takes one the
+/// same way).
+fn multikey_bounds(field: &str, preds: &[&Bson]) -> Option<FieldBounds> {
+    // Each operator is a predicate of its own once canonical.
+    let mut each: Vec<Bson> = Vec::new();
+    for pred in preds {
+        match pred {
+            Bson::Document(d) if d.keys().any(|k| k.starts_with('$')) => {
+                each.extend(d.iter().map(|(op, arg)| {
+                    Bson::Document(bson::doc! { field: bson::doc! { op.clone(): arg.clone() } })
+                }));
+            }
+            other => each.push(Bson::Document(bson::doc! { field: (*other).clone() })),
+        }
+    }
+    let canonical = secantus_core::canonical_match(&Bson::Document(bson::doc! { "$and": each }));
+    let ordered: Vec<Bson> = clauses(&canonical)
+        .into_iter()
+        .filter(|(k, _)| *k == field)
+        .map(|(_, v)| v.clone())
+        .collect();
+    for pred in &ordered {
+        let found = match pred {
+            Bson::Document(d) if d.keys().any(|k| k.starts_with('$')) && !d.contains_key("$eq") => {
+                range_bounds(d, true)
+            }
+            v => equality_bounds(v),
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
 /// The bounds a trailing field's operators make, each operator's
 /// intervals intersected: `None` for one the bounds do not cover.
-fn range_bounds(pred: &Document) -> Option<FieldBounds> {
+fn range_bounds(pred: &Document, multikey: bool) -> Option<FieldBounds> {
     let ctx = super::bounds::Ctx {
-        multikey: false,
+        multikey,
         sparse: false,
         collated: false,
         plain_strings: true,
@@ -270,7 +339,8 @@ pub(crate) fn scan(
     elsewhere: bool,
 ) -> Result<Option<Scan>, StorageError> {
     if let Some(index) = hinted {
-        let Some(mut bounds) = trailing_bounds(&index, filter) else {
+        let multikey = multikey_fields(storage, db, coll, &index)?;
+        let Some(mut bounds) = trailing_bounds(&index, filter, &multikey) else {
             return Ok(None);
         };
         let geo = predicate_bounds(&index, filter);
@@ -295,7 +365,8 @@ pub(crate) fn scan(
         let Some(geo) = predicate_bounds(&index, filter) else {
             continue;
         };
-        let Some(mut bounds) = trailing_bounds(&index, filter) else {
+        let multikey = multikey_fields(storage, db, coll, &index)?;
+        let Some(mut bounds) = trailing_bounds(&index, filter, &multikey) else {
             return Ok(None);
         };
         bounds[index.geo_at] = geo;
@@ -397,7 +468,8 @@ pub(crate) fn near_search(
     index: &GeoIndex,
     near: &secantus_core::geoshape::Near,
 ) -> Result<Option<(Measure, Vec<FieldBounds>)>, StorageError> {
-    let Some(base) = trailing_bounds(index, filter) else {
+    let multikey = multikey_fields(storage, db, coll, index)?;
+    let Some(base) = trailing_bounds(index, filter, &multikey) else {
         return Ok(None);
     };
     if storage
@@ -420,7 +492,8 @@ pub(crate) fn near_rows(
     near: &Found,
     rows: Rows,
 ) -> Result<Result<Rows, Rows>, StorageError> {
-    let Some(base) = trailing_bounds(index, filter) else {
+    let multikey = multikey_fields(storage, db, coll, index)?;
+    let Some(base) = trailing_bounds(index, filter, &multikey) else {
         return Ok(Err(rows));
     };
     let Some(all) = collection(storage, db, coll)? else {
@@ -458,6 +531,7 @@ pub(crate) fn near_rows(
 /// from an equality on a compound index's other field, which bounds it.
 pub(crate) fn geo_near_order(
     index: &GeoIndex,
+    multikey: &[bool],
     near: &secantus_core::geoshape::Near,
     query: Option<&Document>,
     docs: &[Document],
@@ -467,6 +541,6 @@ pub(crate) fn geo_near_order(
         return None;
     }
     let empty = Document::new();
-    let base = trailing_bounds(index, query.unwrap_or(&empty))?;
+    let base = trailing_bounds(index, query.unwrap_or(&empty), multikey)?;
     near_order(index, &base, near, docs, &passes)
 }

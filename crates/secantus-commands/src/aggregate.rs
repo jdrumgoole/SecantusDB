@@ -5302,7 +5302,10 @@ fn geo_near_ranks(
     let Some(docs) = docs else {
         return Ok(None);
     };
-    let Some(order) = crate::explain::geo::geo_near_order(&index, &stage.near, stage.query, &docs)
+    let multikey =
+        crate::explain::geo::multikey_fields(storage, db, coll, &index).map_err(command_error)?;
+    let Some(order) =
+        crate::explain::geo::geo_near_order(&index, &multikey, &stage.near, stage.query, &docs)
     else {
         return Ok(None);
     };

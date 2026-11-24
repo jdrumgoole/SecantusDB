@@ -133,6 +133,9 @@ enum Check {
 struct Checker {
     fields: Vec<Vec<Iv>>,
     cur: Vec<usize>,
+    /// The key last checked: a field that moved on from it starts the
+    /// intervals of the fields after it again.
+    last: Option<Key>,
 }
 
 impl Checker {
@@ -160,6 +163,17 @@ impl Checker {
     }
 
     fn check(&mut self, key: &Key) -> Check {
+        // Each value of a field has its own run of the later fields'
+        // intervals: `{t: {$gte: 2}}` over `(t, cell)` reads `t: 2`'s cells
+        // through the last interval, and `t: 3`'s from the first (measured,
+        // 8.2.11: `{a: {$gte: 2}, b: {$in: [1, 5]}}` over `{a: 1, b: 1}`
+        // reads (2, 5) then (3, 1) with no seek).
+        if let Some(last) = &self.last {
+            if let Some(moved) = (0..key.len().min(last.len())).find(|&f| key[f] != last[f]) {
+                self.reset_after(moved);
+            }
+        }
+        self.last = Some(key.clone());
         let mut i = 0;
         while i < self.fields.len() {
             match self.fields[i][self.cur[i]].locate(&key[i]) {
@@ -246,7 +260,11 @@ impl<'a> IndexScan<'a> {
         let cur = vec![0; fields.len()];
         IndexScan {
             entries,
-            checker: Checker { fields, cur },
+            checker: Checker {
+                fields,
+                cur,
+                last: None,
+            },
             empty,
             pos: None,
             pending: None,
@@ -321,5 +339,42 @@ impl<'a> IndexScan<'a> {
                 Step::Advanced(at)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(t: u8, cell: i64, owner: usize) -> (Key, usize) {
+        (vec![KeyPart::Value(vec![t]), KeyPart::Cell(cell)], owner)
+    }
+
+    /// RM-779: `{t: {$gte: 2}}` over `(t, cell)` with two intervals of
+    /// cells. The scan leaves `t: 2` in the second interval; `t: 3` starts
+    /// again at the first, and its entry there is read (mongod 8.2.11
+    /// returns it; the scan once seeked to the second interval and lost it).
+    #[test]
+    fn a_range_on_the_leading_field_starts_each_value_at_the_first_cell_interval() {
+        let entries = vec![
+            entry(2, 5, 0),
+            entry(2, 50, 1),
+            entry(3, 4, 2),
+            entry(3, 51, 3),
+        ];
+        let bounds = vec![
+            FieldBounds::Ranges(vec![(vec![2], true, vec![255], true)]),
+            FieldBounds::Cells(vec![(1, 10), (40, 60)]),
+        ];
+        let mut scan = IndexScan::new(&entries, &bounds);
+        let mut owners = Vec::new();
+        loop {
+            match scan.work() {
+                Step::Advanced(at) => owners.push(entries[at].1),
+                Step::NeedTime => {}
+                Step::Eof => break,
+            }
+        }
+        assert_eq!(owners, vec![0, 1, 2, 3]);
     }
 }

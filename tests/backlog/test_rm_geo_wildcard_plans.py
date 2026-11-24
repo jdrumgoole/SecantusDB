@@ -10,7 +10,7 @@ import pymongo
 import pytest
 
 from tests.backlog.conftest import mongo_answer
-from tests.backlog.test_rm_storage_model import _plan_collection
+from tests.backlog.test_rm_storage_model import _geo_wildcard_docs, _plan_collection
 
 NEAR_PT = {"type": "Point", "coordinates": [5, 5]}
 
@@ -29,19 +29,123 @@ def _winning(coll: Any, flt: dict, verbosity: str = "queryPlanner", **kw: Any) -
     return reply
 
 
-@pytest.mark.backlog("RM-779")
+@pytest.mark.backlog_fixed("RM-779")
 def test_a_near_with_a_range_on_the_leading_field_returns_every_match(
     mongod: Any, rust_mongo: Any
 ) -> None:
     """`{pts: {$near: ...}, t: {$gte: 2}}` over `{t: 1, pts: "2dsphere"}`
     returns the 30 documents with `t` of 2 or 3 on mongod 8.2.11;
-    `secantusd-mdb` returns 28 (two `t: 3` documents are missing). An
-    equality on `t` and a range on the trailing field of a `2d` index return
-    them all."""
-    flt = {"pts": {"$near": {"$geometry": NEAR_PT}}, "t": {"$gte": 2}}
-    ref = sorted(d["_id"] for d in _load(mongod).find(flt))
-    got = sorted(d["_id"] for d in _load(rust_mongo).find(flt))
-    assert got == ref
+    `secantusd-mdb` returned 28 (two `t: 3` documents were missing): the
+    near search's scan left `t: 2` in the last interval of cells and began
+    `t: 3` there, past the cells of the first. An equality on `t` and a
+    range on the trailing field of a `2d` index returned them all. The
+    same for each range, a `$geoNear` and a `$maxDistance`."""
+    near = {"$geometry": NEAR_PT}
+    reads = {
+        "$gte 2": lambda c: c.find({"pts": {"$near": near}, "t": {"$gte": 2}}),
+        "$gt 1": lambda c: c.find({"pts": {"$near": near}, "t": {"$gt": 1}}),
+        "$lte 1": lambda c: c.find({"pts": {"$near": near}, "t": {"$lte": 1}}),
+        "$gt 0 $lt 3": lambda c: c.find({"pts": {"$near": near}, "t": {"$gt": 0, "$lt": 3}}),
+        "$nearSphere": lambda c: c.find({"pts": {"$nearSphere": near}, "t": {"$gte": 2}}),
+        "$maxDistance": lambda c: c.find(
+            {"pts": {"$near": {"$geometry": NEAR_PT, "$maxDistance": 5_000_000}}, "t": {"$gte": 2}}
+        ),
+        "$geoNear": lambda c: c.aggregate(
+            [
+                {
+                    "$geoNear": {
+                        "near": NEAR_PT,
+                        "key": "pts",
+                        "spherical": True,
+                        "distanceField": "d",
+                        "query": {"t": {"$gte": 2}},
+                    }
+                }
+            ]
+        ),
+    }
+    ref, got = _load(mongod), _load(rust_mongo)
+    for label, read in reads.items():
+        assert sorted(d["_id"] for d in read(got)) == sorted(d["_id"] for d in read(ref)), label
+
+
+@pytest.mark.backlog_fixed("RM-779")
+def test_a_near_over_a_multikey_trailing_field_bounds_it_by_one_predicate(
+    mongod: Any, rust_mongo: Any
+) -> None:
+    """Two predicates on a multikey field may be met by different elements
+    of an array, so mongod bounds it by ONE (`t: {$gte: 1, $lte: 2}` scans
+    `[-inf, 2]`, and a document holding `[3, 0]` is returned). The near
+    search intersected them, and a `2d` or `2dsphere` `$near` and a
+    `$geoNear` returned 45 of 60 documents (0 of 30 for `$gt: 0, $lt: 1`)."""
+
+    def arrays(coll: Any) -> Any:
+        coll.drop()
+        docs = _geo_wildcard_docs()
+        for d in docs:
+            d["t"] = [d["t"], (d["t"] + 1) % 4]
+        coll.insert_many(docs)
+        coll.create_index([("flat", "2d"), ("t", 1)], name="flat_t")
+        coll.create_index([("t", 1), ("pts", "2dsphere")], name="t_pts")
+        return coll
+
+    sphere = {"$geometry": NEAR_PT}
+    reads = {}
+    for label, rng in {
+        "$gte $lte": {"$gte": 1, "$lte": 2},
+        "$gt $lt": {"$gt": 0, "$lt": 1},
+        "$gte $lt": {"$gte": 3, "$lt": 1},
+    }.items():
+        reads[f"2dsphere {label}"] = lambda c, rng=rng: c.find({"pts": {"$near": sphere}, "t": rng})
+        reads[f"2d {label}"] = lambda c, rng=rng: c.find({"flat": {"$near": [3, 4]}, "t": rng})
+        reads[f"$geoNear {label}"] = lambda c, rng=rng: c.aggregate(
+            [
+                {
+                    "$geoNear": {
+                        "near": [3, 4],
+                        "key": "flat",
+                        "distanceField": "d",
+                        "query": {"t": rng},
+                    }
+                }
+            ]
+        )
+    ref = arrays(mongod["gw779"]["m"])
+    got = arrays(rust_mongo["gw779"]["m"])
+    for label, read in reads.items():
+        assert sorted(d["_id"] for d in read(got)) == sorted(d["_id"] for d in read(ref)), label
+
+
+@pytest.mark.backlog("RM-782")
+def test_a_near_over_a_compound_2dsphere_index_without_a_single_interval_is_refused(
+    mongod: Any, rust_mongo: Any
+) -> None:
+    """Over `{t: 1, pts: "2dsphere"}` mongod 8.2.11 refuses (291,
+    NoQueryExecutionPlans, "unable to find index for $geoNear query") a
+    `$near` whose leading field `t` has no predicate, or one of `$ne`,
+    `$nin` or `$not` (bounds of two intervals); it answers `$exists`, `$in`,
+    `$type` and a range. `secantusd-mdb` answers every one, as it does for a
+    `2d` index, which mongod answers too."""
+    queries = [
+        {},
+        {"z": 3},
+        {"t": {"$ne": 2}},
+        {"t": {"$nin": [1, 2]}},
+        {"t": {"$not": {"$gt": 1}}},
+    ]
+    answers = []
+    for client in (mongod, rust_mongo):
+        coll = _load(client)
+        one = []
+        for q in queries:
+            got = mongo_answer(
+                lambda q=q, coll=coll: list(
+                    coll.find({"pts": {"$near": {"$geometry": NEAR_PT}}, **q})
+                )
+            )
+            one.append((got[0], got[1] if got[0] == "err" else None))
+        answers.append(one)
+    assert answers[1] == answers[0]
 
 
 @pytest.mark.backlog("RM-780")
