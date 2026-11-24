@@ -322,7 +322,8 @@ pub fn mongod_store_findings(home: &Path) -> std::result::Result<Vec<String>, St
 /// replica-set configuration of more than one member, an index of a kind
 /// this server does not key as mongod does, an index of another version
 /// than 2 or one whose build has not finished, a collection or index option
-/// it does not keep, a time-series collection (RM-754), a feature
+/// it does not keep, an index of a time-series collection's buckets that no
+/// index of the collection gives, a feature
 /// compatibility version other than 8.2. Checked
 /// whenever another server (mongod) wrote the store, before this server
 /// writes to it.
@@ -342,16 +343,14 @@ pub(crate) fn catalog_findings(session: &secantus_wt::Session) -> Result<Vec<Str
         if let Ok(ident) = entry.get_str("ident") {
             idents.push((ns.clone(), ident.to_string()));
         }
-        if ns
+        // A time-series collection's buckets: each index is listed on the
+        // collection on its own fields, which a key it cannot be is not.
+        let ts = ns
             .split_once('.')
-            .is_some_and(|(_, c)| c.starts_with(secantus_core::viewdefs::BUCKETS_PREFIX))
-        {
-            out.push(format!(
-                "{ns}, a time-series collection's buckets, which this server does not open \
-                 yet (RM-754)"
-            ));
-            continue;
-        }
+            .filter(|(_, c)| c.starts_with(secantus_core::viewdefs::BUCKETS_PREFIX))
+            .and_then(|_| md.get_document("options").ok())
+            .and_then(|o| o.get_document("timeseries").ok())
+            .cloned();
         if let Ok(options) = md.get_document("options") {
             for (option, _) in options {
                 if !SERVED_COLLECTION_OPTIONS.contains(&option.as_str()) {
@@ -367,6 +366,16 @@ pub(crate) fn catalog_findings(session: &secantus_wt::Session) -> Result<Vec<Str
                 continue;
             };
             let name = spec.get_str("name").unwrap_or("");
+            if let Some(ts) = &ts {
+                if name != "_id_"
+                    && secantus_core::viewdefs::collection_index_spec(spec, ts).is_none()
+                {
+                    out.push(format!(
+                        "{ns}'s index {name}, keyed on the buckets as no index of the \
+                         time-series collection is"
+                    ));
+                }
+            }
             if ix.get_bool("ready") == Ok(false) {
                 out.push(format!(
                     "{ns}'s index {name}, whose build has not finished (this server does not \
@@ -443,28 +452,6 @@ pub(crate) fn catalog_findings(session: &secantus_wt::Session) -> Result<Vec<Str
                 "a featureCompatibilityVersion of {:?} (this server serves 8.2)",
                 v.get_str("version").unwrap_or("")
             ));
-        }
-    }
-    for (ns, _) in &idents {
-        let Some((db, "system.views")) = ns.split_once('.') else {
-            continue;
-        };
-        for view in docs(ns)? {
-            let unpacks = view
-                .get_array("pipeline")
-                .ok()
-                .and_then(|p| p.first())
-                .and_then(|s| {
-                    s.as_document()
-                        .map(|s| s.contains_key("$_internalUnpackBucket"))
-                });
-            if unpacks == Some(true) {
-                out.push(format!(
-                    "{}, a time-series collection of {db}, which this server does not open \
-                     yet (RM-754)",
-                    view.get_str("_id").unwrap_or("")
-                ));
-            }
         }
     }
     Ok(out)

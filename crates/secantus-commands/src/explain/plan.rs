@@ -672,17 +672,64 @@ fn use_index(index: &Arc<IndexInfo>, leaves: &[Leaf], parts: &[Document], q: &Qu
     let mut tagged = BTreeSet::new();
     let mut leads = false;
     let mut bounded_fields = 0;
+    let wildcard_path = index.wildcard.as_ref().and_then(|w| w.path.clone());
     for (pos, (field, _)) in index.fields().into_iter().enumerate() {
+        // A wildcard index's `$_path` is one string, the queried path.
+        if let (0, Some(path)) = (pos, &wildcard_path) {
+            let mut list = vec![Interval::point(Bson::String(path.clone()))];
+            // Present anywhere: the path, and every path below it.
+            if leaves
+                .iter()
+                .any(|l| l.path == *path && l.pred.get("$exists").is_some_and(truthy))
+            {
+                list.push(Interval::new(
+                    Bson::String(format!("{path}.")),
+                    true,
+                    Bson::String(format!("{path}/")),
+                    false,
+                ));
+            }
+            bounds.push(list);
+            continue;
+        }
+        // A geo field is bounded by the covering of a geo predicate alone.
+        if index.geo.as_ref().is_some_and(|g| g.geo_field() == field) {
+            let found = geo_leaves(index, leaves).find_map(|l| {
+                let (op, arg) = l.pred.iter().next()?;
+                let op = if op == "$within" {
+                    "$geoWithin"
+                } else {
+                    op.as_str()
+                };
+                let list = geo_intervals(index.geo.as_ref()?.predicate_bounds(op, arg)?)?;
+                Some((list, l.clause))
+            });
+            if let Some((list, clause)) = found {
+                tagged.insert(clause);
+                bounded_fields += 1;
+                if pos == 0 {
+                    leads = true;
+                }
+                bounds.push(list);
+            } else {
+                bounds.push(vec![Interval::all()]);
+            }
+            continue;
+        }
         let multikey = !index.multikey_paths[pos].is_empty();
         let ctx = Ctx {
             multikey,
-            sparse: index.sparse,
+            // A wildcard index holds no key for a missing path.
+            sparse: index.sparse || wildcard_path.is_some(),
             collated,
             plain_strings: index.collation.is_none(),
             keys_only: q.keys_only,
         };
         let mut list: Option<Vec<Interval>> = None;
         for leaf in leaves.iter().filter(|l| l.path == field) {
+            if wildcard_path.is_some() && !wildcard_fits(&leaf.pred) {
+                continue;
+            }
             // A multikey field takes the bounds of ONE predicate: two
             // predicates may be satisfied by different array elements.
             if multikey && !leaf.derived && list.is_some() {
@@ -716,7 +763,8 @@ fn use_index(index: &Arc<IndexInfo>, leaves: &[Leaf], parts: &[Document], q: &Qu
         }
         if list.is_some() {
             bounded_fields += 1;
-            if pos == 0 {
+            // A wildcard entry is led by `$_path`: its path's field leads.
+            if pos == 0 || (pos == 1 && wildcard_path.is_some()) {
                 leads = true;
             }
         }
@@ -915,7 +963,145 @@ fn sort_of<'a>(q: &'a Query) -> Option<&'a Document> {
 
 /// Whether an index may be read at all for this query.
 fn eligible(index: &IndexInfo, q: &Query) -> bool {
-    (index.plain || index.has_hashed()) && index.partial.as_ref().is_none_or(|p| (q.implies)(p))
+    (index.plain
+        || index.has_hashed()
+        || index.geo.is_some()
+        || index.wildcard.as_ref().is_some_and(|w| w.path.is_some()))
+        && index.partial.as_ref().is_none_or(|p| (q.implies)(p))
+}
+
+/// The `$geoWithin` / `$geoIntersects` leaves on a geo index's geo field.
+fn geo_leaves<'l>(index: &IndexInfo, leaves: &'l [Leaf]) -> impl Iterator<Item = &'l Leaf> {
+    let field = index.geo.as_ref().map(|g| g.geo_field().to_string());
+    leaves.iter().filter(move |l| {
+        !l.derived
+            && field.as_deref() == Some(l.path.as_str())
+            && l.pred
+                .keys()
+                .next()
+                .is_some_and(|k| matches!(k.as_str(), "$geoWithin" | "$within" | "$geoIntersects"))
+    })
+}
+
+/// The intervals of a geo field's bounds, as mongod prints them: cells as
+/// integers, a `2d` index's geohashes as `BinData(128, ...)`.
+fn geo_intervals(bounds: secantus_core::geoorder::FieldBounds) -> Option<Vec<Interval>> {
+    use secantus_core::geoorder::FieldBounds;
+    match bounds {
+        FieldBounds::Cells(list) => Some(
+            list.into_iter()
+                .map(|(lo, hi)| Interval::new(Bson::Int64(lo), true, Bson::Int64(hi), true))
+                .collect(),
+        ),
+        FieldBounds::Hashes(list) => {
+            let bin = |h: u64| {
+                Bson::Binary(bson::Binary {
+                    subtype: bson::spec::BinarySubtype::UserDefined(128),
+                    bytes: h.to_be_bytes().to_vec(),
+                })
+            };
+            Some(
+                list.into_iter()
+                    .map(|(lo, hi)| Interval::new(bin(lo), true, bin(hi), true))
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// `nodeIsSupportedByWildcardIndex`, and a wildcard index's sparseness: an
+/// equality to null, which it holds no key for, or to a non-empty object
+/// or array, which it keys by their leaves, is not one it serves.
+fn wildcard_fits(pred: &Document) -> bool {
+    let Some((op, v)) = pred.iter().next().filter(|_| pred.len() == 1) else {
+        return false;
+    };
+    let one = |v: &Bson, op: &str| match v {
+        Bson::Null => false,
+        Bson::Document(d) => d.is_empty() && (op == "$eq" || op == "$lte"),
+        Bson::Array(a) => a.is_empty() && op == "$eq",
+        _ => true,
+    };
+    match op.as_str() {
+        "$eq" | "$gt" | "$gte" | "$lt" | "$lte" => one(v, op),
+        "$in" => v
+            .as_array()
+            .is_some_and(|items| items.iter().all(|x| one(x, "$eq"))),
+        "$exists" => truthy(v),
+        "$type" | "$regex" => true,
+        _ => false,
+    }
+}
+
+/// What mongod expands a wildcard index to for one queried path
+/// (`expandWildcardIndexEntry`): the entry `{$_path: 1, <path>: 1}`, multikey
+/// where the index holds a metadata key for the path or a prefix of it.
+fn wildcard_entry(index: &Arc<IndexInfo>, path: &str) -> Arc<IndexInfo> {
+    let base = index.wildcard.as_ref().expect("a wildcard index");
+    let mut prefix = String::new();
+    let mut arrays = Vec::new();
+    for part in path.split('.') {
+        if !prefix.is_empty() {
+            prefix.push('.');
+        }
+        prefix.push_str(part);
+        if base.arrays.contains(&prefix) {
+            arrays.push(prefix.clone());
+        }
+    }
+    let dir = index.key.values().next().cloned().unwrap_or(Bson::Int32(1));
+    let mut key = Document::new();
+    key.insert("$_path", 1);
+    key.insert(path, dir);
+    Arc::new(IndexInfo {
+        name: index.name.clone(),
+        key,
+        unique: false,
+        sparse: false,
+        partial: index.partial.clone(),
+        multikey_paths: vec![vec![], arrays],
+        version: index.version,
+        collation: index.collation.clone(),
+        plain: false,
+        geo: None,
+        wildcard: Some(Arc::new(super::node::Wildcard {
+            projection: base.projection.clone(),
+            arrays: base.arrays.clone(),
+            path: Some(path.to_string()),
+        })),
+    })
+}
+
+/// The uses of one index for a conjunction: a wildcard index is one use
+/// per queried path it serves, as mongod plans it.
+fn uses_of(
+    index: &Arc<IndexInfo>,
+    leaves: &[Leaf],
+    parts: &[Document],
+    q: &Query,
+) -> Vec<IndexUse> {
+    let Some(wild) = index.wildcard.as_ref().filter(|_| index.is_wildcard_base()) else {
+        return vec![use_index(index, leaves, parts, q)];
+    };
+    let mut paths: Vec<&str> = Vec::new();
+    for leaf in leaves {
+        if wild.projection.covers(&leaf.path)
+            && wildcard_fits(&leaf.pred)
+            && !paths.contains(&leaf.path.as_str())
+        {
+            paths.push(&leaf.path);
+        }
+    }
+    // The expansion is over the paths in `FieldRef` order, which is the
+    // order its plans are tried in (measured 8.2.11: a tie goes to the
+    // path that sorts first, not the first in the query).
+    paths.sort_by(|a, b| a.split('.').cmp(b.split('.')));
+    paths
+        .into_iter()
+        .map(|path| use_index(&wildcard_entry(index, path), leaves, parts, q))
+        .filter(|u| u.leads)
+        .collect()
 }
 
 fn scan_of(u: &IndexUse, parts: &[Document], backward: bool) -> IxScan {
@@ -1053,8 +1239,12 @@ fn candidate_uses(
 ) -> Vec<IndexUse> {
     let uses: Vec<IndexUse> = catalog
         .iter()
-        .filter(|ix| eligible(ix, q))
-        .map(|ix| use_index(ix, leaves, parts, q))
+        .filter(|ix| {
+            // A geo index is read for a geo predicate on its field only.
+            eligible(ix, q) && (ix.geo.is_none() || geo_leaves(ix, leaves).next().is_some())
+                || ix.is_wildcard_base() && ix.partial.as_ref().is_none_or(|p| (q.implies)(p))
+        })
+        .flat_map(|ix| uses_of(ix, leaves, parts, q))
         .filter(|u| u.leads)
         .collect();
     // A unique index pinned to one key by its predicates is the plan, with
@@ -1082,7 +1272,15 @@ fn index_access(parts: &[Document], q: &Query, catalog: &[Arc<IndexInfo>]) -> Op
         _ => None,
     };
     let chosen: IndexUse = if let Some(index) = hinted {
-        use_index(index, &leaves, parts, q)
+        let mut uses = uses_of(index, &leaves, parts, q);
+        match uses.len() {
+            0 => use_index(index, &leaves, parts, q),
+            _ => {
+                let best = uses.iter().map(|u| preference(u, parts, q)).max()?;
+                let at = uses.iter().position(|u| preference(u, parts, q) == best)?;
+                uses.swap_remove(at)
+            }
+        }
     } else {
         let mut uses = candidate_uses(&leaves, parts, q, catalog);
         let best = uses.iter().map(|u| preference(u, parts, q)).max()?;
@@ -1475,30 +1673,61 @@ fn geo_near_access(parts: &[Document], q: &Query, catalog: &[Arc<IndexInfo>]) ->
     };
     let at = parts.iter().position(near_clause)?;
     let found = crate::near::find_near(&parts[at]).ok()??;
-    let mut candidates: Vec<(&Arc<IndexInfo>, bool)> = catalog
+    let leaves = leaves_of(parts);
+    let mut candidates: Vec<(&Arc<IndexInfo>, bool, BTreeSet<usize>)> = catalog
         .iter()
         .filter(|ix| match &q.hint {
             Hint::Index(name) => &ix.name == name,
             _ => true,
         })
         .filter_map(|ix| {
-            let (field, kind) = ix.key.iter().next()?;
-            if field != &found.field {
+            let geo = ix.geo.as_ref().filter(|g| g.geo_field() == found.field)?;
+            let sphere = geo.is_sphere();
+            if if sphere {
+                !found.near.spherical
+            } else {
+                found.near.geojson
+            } {
                 return None;
             }
-            match kind.as_str()? {
-                "2d" if !found.near.geojson => Some((ix, false)),
-                "2dsphere" if found.near.spherical => Some((ix, true)),
-                _ => None,
+            // The fields before the geo one are bounded by the query's
+            // predicates, and so are those after it that the stage's scans
+            // can decide: the near stage reads them as its bounds.
+            let collated = collation_differs(ix, q.collation);
+            let mut absorbed: BTreeSet<usize> = BTreeSet::new();
+            for (pos, (field, _)) in ix.fields().into_iter().enumerate() {
+                if pos == geo.geo_at {
+                    continue;
+                }
+                let ctx = Ctx {
+                    multikey: !ix.multikey_paths[pos].is_empty(),
+                    sparse: ix.sparse,
+                    collated,
+                    plain_strings: ix.collation.is_none(),
+                    keys_only: q.keys_only,
+                };
+                let mut bounded = false;
+                for leaf in leaves.iter().filter(|l| l.path == field && !l.derived) {
+                    if let Some((_, tight)) = leaf_bounds(&leaf.pred, ctx) {
+                        bounded = true;
+                        if tight != Tight::FetchFilter {
+                            absorbed.insert(leaf.clause);
+                        }
+                    }
+                }
+                if !bounded && pos < geo.geo_at {
+                    return None;
+                }
             }
+            Some((ix, sphere, absorbed))
         })
         .collect();
-    candidates.sort_by_key(|(_, sphere)| *sphere);
-    let (index, sphere) = candidates.into_iter().next()?;
+    candidates.sort_by_key(|(_, sphere, _)| *sphere);
+    let (index, sphere, absorbed) = candidates.into_iter().next()?;
     let rest: Vec<Document> = parts
         .iter()
         .enumerate()
-        .filter(|(i, _)| *i != at)
+        .filter(|(i, _)| *i != at && !absorbed.contains(i))
         .map(|(_, c)| c.clone())
         .collect();
     let fetch_filter = if rest.is_empty() {
@@ -1535,7 +1764,10 @@ fn sort_walks(
     catalog
         .iter()
         .filter_map(|ix| {
-            let usable = eligible(ix, q) && !ix.sparse && !collation_differs(ix, q.collation);
+            let usable = eligible(ix, q)
+                && ix.geo.is_none()
+                && !ix.sparse
+                && !collation_differs(ix, q.collation);
             let backward = usable.then(|| serves_sort(ix, &full(ix), sort)).flatten()?;
             Some(Access {
                 scan: Node::IxScan(IxScan {
@@ -1597,14 +1829,10 @@ fn candidates(
     let mut uses: Vec<IndexUse> = Vec::new();
     let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
     let found = match hinted {
-        Some(index) => {
-            let u = use_index(index, &leaves, parts, q);
-            if u.leads {
-                vec![u]
-            } else {
-                Vec::new()
-            }
-        }
+        Some(index) => uses_of(index, &leaves, parts, q)
+            .into_iter()
+            .filter(|u| u.leads)
+            .collect(),
         None => candidate_uses(&leaves, parts, q, catalog),
     };
     for u in found {
@@ -1729,7 +1957,8 @@ fn candidates(
             // Two scans of one index are intersected only all together,
             // above (an `$all` over a multikey index).
             let same = match (&out[x].0.index, &out[y].0.index) {
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                // (A wildcard index's entries for two paths are one index.)
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.name == b.name,
                 _ => false,
             };
             if same {

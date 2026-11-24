@@ -828,6 +828,15 @@ pub(crate) fn render(v: &Bson) -> String {
         Bson::ObjectId(o) => format!("ObjectId('{}')", o.to_hex()),
         Bson::RegularExpression(re) => format!("/{}/{}", re.pattern, re.options),
         Bson::Timestamp(t) => format!("Timestamp({}, {})", t.time, t.increment),
+        // A `2d` index's geohash keys.
+        Bson::Binary(b) => format!(
+            "BinData({}, {})",
+            u8::from(b.subtype),
+            b.bytes
+                .iter()
+                .map(|x| format!("{x:02X}"))
+                .collect::<String>()
+        ),
         Bson::Document(d) if d.is_empty() => "{}".into(),
         Bson::Document(d) => {
             let parts: Vec<String> = d

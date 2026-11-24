@@ -1221,8 +1221,8 @@ def _servable_scenario(rs: pymongo.MongoClient) -> None:
     """Phase 0b's scenario on mongod (every collection and index kind,
     capped, clustered, collated, pre-images, a view, a drop, a rename, a
     transaction), less what this server refuses by name in a store: the index
-    kinds it keys otherwise (RM-741 to RM-743, text) and the
-    time-series collection (RM-754). Its user and role stay: this server
+    kinds it keys otherwise (RM-741 to RM-743, text). Its time-series
+    collection stays (RM-754), and its user and role: this server
     keeps them in `admin.system.users` / `system.roles`, as mongod does
     (RM-744)."""
     from tools.probes.mongod_store_layout import run_scenario
@@ -1230,7 +1230,6 @@ def _servable_scenario(rs: pymongo.MongoClient) -> None:
     run_scenario(rs, strict=True)
     for name in _MONGOD_ONLY_KINDS:
         rs.app.kinds.drop_index(name)
-    rs.app.ts.drop()
 
 
 def _comparable(contents: dict) -> dict:
@@ -1380,15 +1379,15 @@ def _served_after_mongods_restart(store: Path, port: int, tmp_path: Path) -> dic
         _stop_mongod(proc, mongod)
 
 
-@pytest.mark.backlog("RM-754")
+@pytest.mark.backlog_fixed("RM-754")
 def test_secantus_opens_a_mongod_time_series_collection(tmp_path: Path) -> None:
     """A store mongod 8.2.11 wrote holding a time-series collection (a view
     in `system.views` over `system.buckets.<name>`, a clustered collection
     with zstd blocks and its own catalog options, measured in phase 0b):
-    `secantusd-mdb` serves its measurements as mongod does. It refuses the
-    store by name instead: the registry rows of a time-series collection
-    (its options, its buckets' catalog options and the indexes listed on it)
-    are not rebuilt from mongod's catalog."""
+    `secantusd-mdb` serves its measurements as mongod does, lists the index
+    mongod made on it (`m_1_t_1`, from the buckets' key) and takes a new
+    measurement. It refused the store by name until the registry rows of a
+    time-series collection were rebuilt from mongod's catalog."""
 
     def setup(rs: pymongo.MongoClient) -> None:
         import datetime as dt
@@ -1405,6 +1404,12 @@ def test_secantus_opens_a_mongod_time_series_collection(tmp_path: Path) -> None:
     assert outcome == "served", said
     with rust_mongo_server(store) as rust:
         assert _comparable(_store_contents(rust)) == _comparable(served)
+        listed = [(ix["name"], dict(ix["key"])) for ix in rust.app.ts.list_indexes()]
+        assert listed == [("m_1_t_1", {"m": 1, "t": 1})]
+        import datetime as dt
+
+        rust.app.ts.insert_one({"t": dt.datetime(2024, 1, 1, 0, 0, 9), "m": 0, "v": 9})
+        assert rust.app.ts.count_documents({"m": 0}) == 4
 
 
 @pytest.mark.backlog("RM-755")
@@ -1898,19 +1903,12 @@ def _winning(plan: dict | None, root_only: bool = False) -> list:
     return out
 
 
-#: `$near` queries with an equality on the index's other field: mongod plans
-#: the equality as the near stage's bounds, this server as a FETCH above it,
-#: or (the field before the geo one) a COLLSCAN (RM-777).
-_PLANS_NOT_MATCHED = {"near2d_max", "nearSphere_pt_t", "near_pts_array"}
-
-
 def _geo_plans(coll: Any) -> dict:
-    """A `$near` is planned by the planner (stage and index); the other geo
-    queries are asked their plan under their hint, as the planner does not
-    yet choose a `$geoWithin` / `$geoIntersects` index scan (RM-777)."""
+    """A `$near` is compared at its root (stage and index), the other geo
+    queries by the whole chain of stages and indexes the planner chooses."""
     out: dict = {}
     for name, flt, hint, _sort in _GEO_QUERIES:
-        if name.startswith("w_") or name in _PLANS_NOT_MATCHED:
+        if name.startswith("w_"):
             continue
         near = "near" in name.lower()
         kw = {} if near else {"hint": hint}
@@ -2038,7 +2036,7 @@ def _plan_collection(coll: Any) -> None:
     coll.create_index([("$**", 1)], name="all_w")
 
 
-@pytest.mark.backlog("RM-777")
+@pytest.mark.backlog_fixed("RM-777")
 def test_geo_within_and_wildcard_indexes_are_planned(tmp_path: Path) -> None:
     """mongod 8.2.11 plans a `$geoWithin` / `$geoIntersects` onto its
     `2d` / `2dsphere` index (FETCH over IXSCAN), a wildcard predicate onto

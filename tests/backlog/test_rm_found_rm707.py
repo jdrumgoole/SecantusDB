@@ -41,7 +41,7 @@ def test_a_multipoint_2dsphere_near_ring_scan_is_multikey(rust_mongo: Any, mongo
     assert scan(rust_mongo) == scan(mongod)
 
 
-@pytest.mark.backlog("RM-713")
+@pytest.mark.backlog_fixed("RM-713")
 def test_a_near_over_a_compound_2d_index_with_its_trailing_field_plans_geo_near(
     rust_mongo: Any, mongod: Any
 ) -> None:

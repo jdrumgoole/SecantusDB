@@ -260,6 +260,25 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **`test_a_contested_write_of_many_plans_as_mongod[query0-delete]`
+      compares a timing-dependent order (2026-11-24).** On snapshot PR
+      #2975 (run 45439792340, job `mdb-binary (live)`) it failed, then its
+      re-run on the same commit passed. Both servers deleted the same 5,000
+      documents under the same cached plan; the flattened list of deleted
+      ids from the oplog's batched `applyOps` entries differed at one point
+      (this server's list had `1050` before `1069`, mongod's did not), and
+      within an entry the ids ran descending. The test flattens the
+      entries to ignore where mongod cuts a batch, which its own comment
+      calls timing, but if the order within an entry is not the plan's
+      order, a moved cut still moves an id in the flattened list. Decide
+      from mongod what the batched delete's order inside one `applyOps`
+      entry is (the plan's order, reversed, or the write's buffering), then
+      compare only what the plan decides, keeping the test able to fail on
+      a real order divergence. Found by the MongoDB batch session; test
+      code unchanged.
+      Verify: none -- intermittent on CI; the test itself is the check
+      Backlog-ID: RM-784
+
 
 - [ ] **OPEN — the Go gauge's two mongocryptd leaves: confirm how session
       support is advertised.** The gauge completes 659 of 659 and read 598 /
@@ -741,16 +760,6 @@ These are explicit non-goals. Don't add them without a reason.
       falls within mongod's own run-to-run spread of its answer.
       Verify: none -- mongod's own answer varies between runs; no test can pin it
       Backlog-ID: RM-556
-- [ ] **A `$near` with a predicate on a compound 2d index's trailing field
-      is not planned as GEO_NEAR_2D.** mongod 8.2.11 answers `{loc: {$near:
-      [0, 0]}, z: 1}` over `{loc: "2d", z: 1}` with GEO_NEAR_2D, the `z`
-      predicate a key filter (`filter: {z: {$eq: 1}}`) on each ring's IXSCAN
-      over `[MinKey, MaxKey]`; the ring search here already counts that
-      filter (`geoorder::scan`), but the plan this server explains is a FETCH
-      over another stage, and the IXSCAN's `filter` field is not rendered.
-      Found 2026-11-17 (RM-707).
-      Verify: tests/backlog/test_rm_found_rm707.py::test_a_near_over_a_compound_2d_index_with_its_trailing_field_plans_geo_near
-      Backlog-ID: RM-713
 - [ ] **A LIMIT over a GEO_NEAR stage reports no work counts.** mongod
       8.2.11's LIMIT over GEO_NEAR_2D (`find` with `limit: 3`) reports
       `works` (one more than its input's), `advanced` and `needTime`; this
@@ -2837,16 +2846,6 @@ produce the dump it exists for.
 
 ## The storage model is not mongod's (tasks/mongod-storage-model-plan.md, 2026-11-19)
 
-- [ ] **A time-series collection in a store mongod wrote is refused.**
-      `secantusd-mdb` opens a store mongod 8.2.11 wrote (storage-model
-      phase 7c), but one holding a time-series collection (mongod's view in
-      `system.views` over `system.buckets.<name>`, whose catalog options
-      this server derives from its own registry rows) is refused by name:
-      the registry rows of the collection, of its buckets and of the indexes
-      listed on it (the inverse of `ts_buckets::bucket_key`) are not
-      rebuilt from mongod's catalog.
-      Verify: tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_mongod_time_series_collection
-      Backlog-ID: RM-754
 - [ ] **An index build mongod left unfinished is refused, not finished.**
       mongod 8.2.11 stopped cleanly during an index build leaves the index
       in `_mdb_catalog` with `ready: false` and the build in
@@ -2867,23 +2866,40 @@ produce the dump it exists for.
       (measured 2026-11-22).
       Verify: tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_killed_mongod_store_whose_oplog_drops_what_it_refuses
       Backlog-ID: RM-756
-- [ ] **`$geoWithin` / `$geoIntersects` and wildcard predicates are not planned
-      onto their indexes, and a compound `$near` plans its equality
-      differently.** Found adopting mongod's geo and wildcard indexes
-      (RM-775, measured 2026-11-24, mongod 8.2.11, on a store this server
-      wrote as much as on one mongod did). mongod plans `{flat: {$geoWithin:
-      {$box: ...}}}` and `{poly: {$geoIntersects: ...}}` as FETCH over IXSCAN
-      of the `2d` / `2dsphere` index, `{"w.a": 3}` and a range on a wildcard
-      index's path as FETCH over IXSCAN of it, and a `$near` with an equality
-      on the index's other field as the near stage alone (the equality is its
-      bounds). `secantusd-mdb` answers each with a COLLSCAN (a FETCH above
-      GEO_NEAR for the equality; a COLLSCAN when the equality field comes
-      before the geo one), and a wildcard index named in a `hint` reads as an
-      error ("index all_w holds an entry this server cannot read": the
-      explain stream does not know a wildcard key's `$_path` slot). The
-      answers are right: only the plan and the hint differ.
-      Verify: tests/backlog/test_rm_storage_model.py::test_geo_within_and_wildcard_indexes_are_planned
-      Backlog-ID: RM-777
+- [ ] **A `$near` with a range on the leading field of a compound `2dsphere`
+      index returns too few documents.** Found closing RM-777 (measured
+      2026-11-24, mongod 8.2.11, on the same 60 documents). Over
+      `{t: 1, pts: "2dsphere"}`, `{pts: {$near: ...}, t: {$gte: 2}}` returns
+      the 30 documents with `t` of 2 or 3 on mongod; `secantusd-mdb` returns
+      28 (two `t: 3` documents are missing, the same two for `$gt: 1`). An
+      equality on `t`, and a range on the trailing field of a `2d` index
+      (`{flat: {$near: ...}, t: {$gte: 1}}`), return every match. Present
+      before RM-777's planner work (measured on the build without it): the
+      near search's bounds on the leading field (`geo::trailing_bounds`)
+      are built for an equality.
+      Verify: tests/backlog/test_rm_geo_wildcard_plans.py::test_a_near_with_a_range_on_the_leading_field_returns_every_match
+      Backlog-ID: RM-779
+- [ ] **A `$near`'s `executionStats` leave out its inner scans and count
+      other keys.** Found closing RM-777 (2026-11-24, mongod 8.2.11). For
+      `{flat: {$near: [3, 4]}, t: 1}` over `{flat: "2d", t: 1}` mongod's
+      GEO_NEAR_2D stage lists `inputStages` (one FETCH over IXSCAN for each
+      ring its search read, the equality on `t` as the scan's filter and the
+      ring's covering as its bounds) and examines 87 keys; `secantusd-mdb`
+      lists none and examines 79. The winning plan's root, its index and
+      the stage above it (the FETCH for a clause off the index) are
+      mongod's.
+      Verify: tests/backlog/test_rm_geo_wildcard_plans.py::test_a_near_stage_reports_its_inner_scans_and_counts_their_keys
+      Backlog-ID: RM-780
+- [ ] **A hint to a wildcard index no predicate can use is planned, not
+      refused.** Found closing RM-777 (2026-11-24, mongod 8.2.11). mongod
+      refuses a find hinted to `$**` when no predicate of the query bounds
+      a path the index keys, since it will not build a whole-index scan of
+      a wildcard index (code 291, NoQueryExecutionPlans, "$hint: refusing to
+      build whole-index solution, because it's a wildcard index"): `{"w.a":
+      {$ne: 3}}`, or a `$geoWithin`, hinted to it. `secantusd-mdb` plans an
+      IXSCAN of the whole `$**` index, bounds `[MinKey, MaxKey]`.
+      Verify: tests/backlog/test_rm_geo_wildcard_plans.py::test_a_hint_to_a_wildcard_index_no_predicate_can_use_is_refused
+      Backlog-ID: RM-781
 
 ## Found making mongod open our stores (storage-model phase 7, 2026-11-21)
 

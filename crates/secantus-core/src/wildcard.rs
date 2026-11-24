@@ -26,21 +26,20 @@ use bson::{Bson, Document};
 /// The RecordId every multikey metadata key of a wildcard index ends in
 /// (`RecordId::reservedIdFor(kWildcardMultikeyMetadataId)`), as
 /// `Builder::append_record_id_long` writes it: measured on mongod 8.2.11.
-pub(crate) const METADATA_RID_BYTES: [u8; 9] =
-    [0xe3, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff];
+pub const METADATA_RID_BYTES: [u8; 9] = [0xe3, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0xff, 0xff];
 
 /// The RecordId value of [`METADATA_RID_BYTES`].
-pub(crate) fn metadata_rid() -> i64 {
+pub fn metadata_rid() -> i64 {
     static RID: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     *RID.get_or_init(|| {
-        secantus_core::keystring::decode_record_id_long(&METADATA_RID_BYTES)
+        crate::keystring::decode_record_id_long(&METADATA_RID_BYTES)
             .map(|(rid, _)| rid)
             .unwrap_or(i64::MAX)
     })
 }
 
 /// Is `key_spec` a wildcard index's: a field `$**` or `<path>.$**`?
-pub(crate) fn is_wildcard_spec(key_spec: &Document) -> bool {
+pub fn is_wildcard_spec(key_spec: &Document) -> bool {
     key_spec.keys().any(|f| f == "$**" || f.ends_with(".$**"))
 }
 
@@ -103,7 +102,7 @@ impl<'a> Scope<'a> {
 
 /// A wildcard index's projection.
 #[derive(Clone, Debug)]
-pub(crate) struct Projection {
+pub struct Projection {
     inclusion: bool,
     tree: BTreeMap<String, Tree>,
 }
@@ -151,6 +150,19 @@ impl Projection {
         Projection { inclusion, tree }
     }
 
+    /// Whether the index keys values at `path`: what the planner asks
+    /// before it expands the index to a queried path.
+    pub fn covers(&self, path: &str) -> bool {
+        let mut scope = self.scope();
+        for part in path.split('.') {
+            match scope.child(part) {
+                Some(inner) => scope = inner,
+                None => return false,
+            }
+        }
+        scope.keeps_value()
+    }
+
     fn scope(&self) -> Scope<'_> {
         if self.inclusion {
             Scope::Only(&self.tree)
@@ -162,7 +174,7 @@ impl Projection {
 
 /// What a document holds under the index.
 #[derive(Default, Debug)]
-pub(crate) struct Leaves {
+pub struct Leaves {
     /// `(path, value)` for each key, in the order met.
     pub keys: Vec<(String, Bson)>,
     /// The paths of the arrays met.
@@ -170,7 +182,7 @@ pub(crate) struct Leaves {
 }
 
 /// The keys `doc` holds under a wildcard index with `projection`.
-pub(crate) fn leaves(doc: &Document, projection: &Projection) -> Leaves {
+pub fn leaves(doc: &Document, projection: &Projection) -> Leaves {
     let mut out = Leaves::default();
     let mut path: Vec<String> = Vec::new();
     walk_document(doc, projection.scope(), &mut path, &mut out);
@@ -231,8 +243,8 @@ fn walk_value(v: &Bson, scope: Scope<'_>, path: &mut Vec<String>, out: &mut Leav
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keystring::{Builder, Ordering, Version};
     use bson::doc;
-    use secantus_core::keystring::{Builder, Ordering, Version};
 
     #[test]
     fn the_metadata_rid_is_the_one_mongod_wrote() {

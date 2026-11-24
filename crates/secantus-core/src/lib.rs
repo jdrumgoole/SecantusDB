@@ -59,6 +59,7 @@ pub(crate) mod timelib;
 pub mod update;
 pub mod vars;
 pub mod viewdefs;
+pub mod wildcard;
 
 // Internal shared helpers — implementation details of the engines above, not
 // part of the crate's public surface (kept crate-private so their deliberate

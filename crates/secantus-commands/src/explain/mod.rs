@@ -608,7 +608,9 @@ fn catalog(
         let name = spec.get_str("name").unwrap_or("").to_string();
         let plain = key.values().all(|v| matches!(as_i64(v), Some(1 | -1)))
             && !key.values().any(|v| matches!(v, Bson::String(_)));
-        let multikey_paths = if let Some(mut paths) = stored_paths {
+        let multikey_paths = if key.values().any(|v| v.as_str() == Some("2d")) {
+            vec![vec![]; key.len()]
+        } else if let Some(mut paths) = stored_paths {
             paths.resize(key.len(), vec![]);
             paths
         } else if !storage.index_is_multikey(db, coll, &name) {
@@ -632,7 +634,33 @@ fn catalog(
             paths.resize(key.len(), vec![]);
             paths
         };
+        let wildcard = key
+            .keys()
+            .find(|f| *f == "$**" || f.ends_with(".$**"))
+            .map(|field| {
+                let projection = secantus_core::wildcard::Projection::new(
+                    field,
+                    spec.get_document("wildcardProjection").ok(),
+                );
+                // The arrays the documents hold under it: where its
+                // multikey metadata keys are.
+                let arrays = match docs {
+                    Some(docs) => docs
+                        .iter()
+                        .flat_map(|d| secantus_core::wildcard::leaves(d, &projection).multikey)
+                        .collect(),
+                    // What the store records: the paths of its metadata keys.
+                    None => multikey_paths.iter().flatten().cloned().collect(),
+                };
+                Arc::new(node::Wildcard {
+                    projection,
+                    arrays,
+                    path: None,
+                })
+            });
+        let is_wildcard = wildcard.is_some();
         catalog.push(Arc::new(IndexInfo {
+            wildcard,
             unique: name == "_id_" || spec.get_bool("unique").unwrap_or(false),
             sparse: spec.get_bool("sparse").unwrap_or(false),
             partial: spec.get_document("partialFilterExpression").ok().cloned(),
@@ -649,7 +677,9 @@ fn catalog(
                         .then(|| crate::util::default_collation(storage, db, coll))
                         .flatten()
                 }),
-            plain,
+            // A wildcard index is not read as a plain one: its keys have a
+            // `$_path` slot its field does not name.
+            plain: plain && !is_wildcard,
             geo: secantus_core::geoorder::GeoIndex::from_spec(spec),
             key: key.clone(),
             name,
