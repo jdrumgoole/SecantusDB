@@ -2079,38 +2079,26 @@ would see them. What is left:
       transcribe (found working RM-452).
       Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_a_match_on_another_event_field_joins_the_oplog_filter
       Backlog-ID: RM-698
-- [ ] **RUST MongoDB server: the unwind filter of a change stream is not
-      Boolean-simplified.** mongod 8.2.11 optimizes
-      `internalUnwindTransaction`'s filter with its Boolean expression
-      simplifier (the oplog filter it optimizes without): after
-      `operationType: "drop"` (`rename`, `dropDatabase`) the writes branch
-      and the event-type `$or` fall away, as only a command can match. This
-      server prints the unsimplified `$and`, which matches the same entries
-      (2026-11-15, found working RM-452). The simplifier treats each
-      distinct leaf as a Boolean variable (`op: "c"` and `op: "i"` are
-      unrelated to it), so `insert` / `update` print unchanged on both; for
-      `rename` its output re-sorts the `$or`'s regexes by path, `o.to`
-      last. Sizing (2026-11-23): this server has no Boolean simplifier
-      anywhere -- the fix is the port of mongod's
-      `query/boolean_simplification/` (bitset algebra, Quine-McCluskey,
-      Petrick, the tree restore and its size guards) the item below needs,
-      then applying it to the unwind filter. Do it after that item. (The
-      gap test compared two different collection names until 2026-11-23.)
-      Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_the_unwind_filter_is_simplified
-      Backlog-ID: RM-699
-- [ ] **RUST MongoDB server: a `find`'s filter is not Boolean-simplified.**
-      mongod 8.2.11 runs its Boolean expression simplifier
-      (`internalQueryEnableBooleanExpressionsSimplifier`, true by default)
-      in normalizing every query: `{$or: [{a: 1, b: 1}, {a: 1}]}` and
-      `{$and: [{a: 1}, {$or: [{a: 1}, {b: 2}]}]}` print as `{a: {$eq: 1}}`,
-      `{a: 1, $nor: [{a: 1}]}` as `{$alwaysFalse: 1}`. This server has no
-      simplifier and prints each as given, so `parsedQuery`, and whatever
-      the planner and the query shape derive from the filter, differ. The
-      faithful fix ports `src/mongo/db/query/boolean_simplification/` and
-      its call in the canonicalizer, with mongod's size limits; several
-      PRs, and the plan-cache keys move (2026-11-23, found working RM-699).
-      Verify: tests/backlog/test_rm_found_2026_11_23_rm699.py::test_a_find_filter_is_boolean_simplified
-      Backlog-ID: RM-774
+- [ ] **RUST MongoDB server: the Boolean simplifier differs from mongod's
+      on about 0.3 percent of random trees, and on nested `$nor`.** The
+      simplifier (`crates/secantus-commands/src/explain/simplify.rs`, RM-774)
+      is built from what mongod 8.2.11 was measured to do -- a DNF and
+      Quine-McCluskey at every node (no Petrick: a term a merge made does
+      not absorb its neighbours, except after an `$and`'s product), the
+      common predicates of an `$and`'s terms taken out, the result kept
+      only if smaller -- not from a port of
+      `query/boolean_simplification/`, which is not on this box. A seeded
+      run of 4,000 random `$and` / `$or` trees over nine predicates differs
+      on 13 (the smallest are the gap tests), and one with nested `$nor`
+      on about 1 in 140: mongod keeps a `b` a merge here removes, simplifies
+      a contained `$or` in its `$and`'s context where this server does not,
+      and does not simplify a tree whose `$nor` holds a contradiction this
+      server folds. The residue points at a rule not yet found (how a
+      negated node is converted, and what its size counts), not at noise.
+      Reproduce with `tests/mongod_live/test_boolean_simplifier.py`'s
+      random run at other seeds (2026-11-24, found working RM-774).
+      Verify: tests/backlog/test_rm_found_2026_11_24_rm774.py::test_a_random_tree_is_simplified_as_mongod_does
+      Backlog-ID: RM-778
 - [ ] **RUST MongoDB server: a change stream's `docsExamined` leaves out
       mongod's own oplog entries.** mongod 8.2.11's `executionStats` of a
       change stream counts every oplog entry its scan reads from the start

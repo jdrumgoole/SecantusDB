@@ -16,7 +16,7 @@ def _parsed(client: Any, filt: dict) -> dict:
     return db.command("explain", {"find": "c", "filter": filt})["queryPlanner"]["parsedQuery"]
 
 
-@pytest.mark.backlog("RM-774")
+@pytest.mark.backlog_fixed("RM-774")
 @pytest.mark.parametrize(
     ("filt", "want"),
     [

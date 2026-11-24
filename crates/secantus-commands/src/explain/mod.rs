@@ -36,6 +36,7 @@ mod plan;
 pub(crate) mod plan_cache;
 mod sbe;
 pub(crate) mod shape;
+mod simplify;
 pub(crate) mod stream;
 mod sub_stages;
 pub(crate) mod summary;

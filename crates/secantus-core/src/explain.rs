@@ -26,7 +26,7 @@ fn match_type_rank(op: &str) -> i32 {
     match op {
         "$and" => 0,
         "$or" => 1,
-        "$nor" => 2,
+        "$nor" => 20,
         "$elemMatch" => 3,
         "$size" => 5,
         "$eq" => 6,
@@ -821,6 +821,32 @@ fn in_member(branch: &Document) -> Option<(String, Bson)> {
 /// from one mongod process to the next (measured 8.2.11, 2026-11-14: two
 /// runs listed `{$or: [{b: 1}, {a: 2}]}` as `[b, a]` and `[a, b]`). There is
 /// no order to match there; this lists each group in first-written order.
+/// An `$or` that is nothing but one path's `$in` is that `$in`, optimised
+/// as a node of its own: of one value (`$or: [{a: 1}, {a: 1}]`) it is the
+/// equality. Beside other children the `$in` is not optimised again, and
+/// stays an `$in` of one value (measured 8.2.11, 2026-11-24).
+fn lone_in(clause: Document) -> Document {
+    let [(path, Bson::Document(pred))] = clause.iter().collect::<Vec<_>>()[..] else {
+        return clause;
+    };
+    let Ok(values) = pred.get_array("$in") else {
+        return clause;
+    };
+    let mut distinct: Vec<&Bson> = Vec::new();
+    for v in values {
+        if !distinct
+            .iter()
+            .any(|d| crate::order::cmp(d, v) == std::cmp::Ordering::Equal)
+        {
+            distinct.push(v);
+        }
+    }
+    match distinct[..] {
+        [one] if !matches!(one, Bson::RegularExpression(_)) => equal_to(path, one),
+        _ => clause,
+    }
+}
+
 fn or_as_in(children: Vec<Document>) -> Document {
     let mut paths: Vec<(String, Vec<(Document, Bson)>)> = Vec::new();
     let mut others: Vec<Document> = Vec::new();
@@ -852,7 +878,7 @@ fn or_as_in(children: Vec<Document>) -> Document {
         );
     }
     if others.is_empty() && ins.len() == 1 {
-        return ins.pop().expect("one");
+        return lone_in(ins.pop().expect("one"));
     }
     ins.extend(others);
     one(
