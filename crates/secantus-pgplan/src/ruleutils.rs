@@ -6117,20 +6117,52 @@ pub fn statistics_expr_def_pretty(sql: &str, def: &TableDef) -> Option<String> {
         ..Default::default()
     }]);
     p.expr(expr)?;
-    let function_like = matches!(
-        expr.node.as_ref(),
-        Some(
-            N::FuncCall(_)
-                | N::CoalesceExpr(_)
-                | N::MinMaxExpr(_)
-                | N::SqlvalueFunction(_)
-                | N::XmlExpr(_)
-        )
-    );
-    Some(if function_like {
+    Some(if looks_like_function(expr) {
         p.buf
     } else {
         format!("({})", p.buf)
+    })
+}
+
+/// ruleutils' `looks_like_function`: an expression that prints as a call
+/// (a function, or one of `func_expr_common_subexpr`'s COALESCE, NULLIF,
+/// GREATEST / LEAST, CURRENT_DATE-style keywords and XML forms), which a
+/// key list then shows without parentheses of its own.
+fn looks_like_function(n: &Node) -> bool {
+    match n.node.as_ref() {
+        Some(
+            N::FuncCall(_)
+            | N::CoalesceExpr(_)
+            | N::MinMaxExpr(_)
+            | N::SqlvalueFunction(_)
+            | N::XmlExpr(_),
+        ) => true,
+        Some(N::AExpr(e)) => AExprKind::try_from(e.kind) == Ok(AExprKind::AexprNullif),
+        _ => false,
+    }
+}
+
+/// A partition key expression as `pg_get_partkeydef` prints it
+/// (`pg_get_partkeydef_worker`): as `pg_get_expr` does, and in parentheses
+/// of its own unless it looks like a function call -- `((x + 1))`,
+/// `((x)::text)`, but `abs(x)`. PostgreSQL 15.19 measured. `None` for a
+/// shape [`expr_def`] does not reproduce.
+pub fn partkey_expr_def(sql: &str, def: &TableDef) -> Option<String> {
+    let node = parse_select(&format!("SELECT {sql}"))?;
+    let Some(N::SelectStmt(s)) = node.node.as_ref() else {
+        return None;
+    };
+    let [target] = s.target_list.as_slice() else {
+        return None;
+    };
+    let Some(N::ResTarget(rt)) = target.node.as_ref() else {
+        return None;
+    };
+    let printed = expr_def(sql, def)?;
+    Some(if looks_like_function(rt.val.as_deref()?) {
+        printed
+    } else {
+        format!("({printed})")
     })
 }
 
@@ -6157,6 +6189,27 @@ mod tests {
             ("name", "bpchar", "name"),
         ] {
             assert_eq!(meet_types(a, b).as_deref(), Some(want), "{a} meets {b}");
+        }
+    }
+
+    /// A partition key expression as `pg_get_partkeydef` prints it inside
+    /// its key list, each measured on PostgreSQL 15.19 (RP-1052): an
+    /// operator, cast or test in a second pair of parentheses, a call or
+    /// one of the call-like forms bare.
+    #[test]
+    fn a_partition_key_expression_prints_as_partkeydef_does() {
+        let def = TableDef::new("p", vec![Column::new("x", "int4", true)]);
+        for (key, want) in [
+            ("(x + 1)", "((x + 1))"),
+            ("(x::text)", "((x)::text)"),
+            ("(-x)", "((- x))"),
+            ("(x IS NULL)", "((x IS NULL))"),
+            ("abs(x)", "abs(x)"),
+            ("(coalesce(x, 0))", "COALESCE(x, 0)"),
+            ("(nullif(x, 0))", "NULLIF(x, 0)"),
+            ("(greatest(x, 1))", "GREATEST(x, 1)"),
+        ] {
+            assert_eq!(partkey_expr_def(key, &def).as_deref(), Some(want), "{key}");
         }
     }
 

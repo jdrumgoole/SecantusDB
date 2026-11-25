@@ -125,12 +125,13 @@ def test_a_renamed_partition_key_column_still_routes(dsn: str) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-1052")
+@pytest.mark.backlog_fixed("RP-1052")
 def test_pg_get_partkeydef_of_an_expression_key(dsn: str) -> None:
     """`pg_get_partkeydef` prints an expression key as ruleutils does,
     `RANGE (((x + 1)))` on PostgreSQL 15.19 (shared reference, port 5415):
     the key list's parentheses, the expression's own, and the OpExpr's.
-    Here one layer is missing. Found while working RP-1024."""
+    One layer was missing, `RANGE ((x + 1))`. Found while working
+    RP-1024."""
     assert _script(
         dsn,
         [
@@ -294,3 +295,49 @@ def test_pg_get_indexdef_quotes_a_key_and_an_include_column(dsn: str) -> None:
         [('CREATE INDEX q1054a ON public.q1054 USING btree ("Big Y" DESC) INCLUDE ("W w")',)],
         "DROP TABLE",
     ]
+
+
+@pytest.mark.backlog("RP-1091")
+def test_pg_get_partkeydef_keeps_a_key_collation_and_opclass(dsn: str) -> None:
+    """A partition key's COLLATE and operator class are part of the key:
+    `partition by range ((x::text) collate "C")` prints `RANGE (((x)::text)
+    COLLATE "C")`, and `((x::text) text_pattern_ops)` prints `RANGE
+    (((x)::text) text_pattern_ops)`, on PostgreSQL 15.19 (shared reference,
+    port 5415). Here both print `RANGE (((x)::text))`. Found while working
+    RP-1052."""
+    assert _script(
+        dsn,
+        [
+            "drop table if exists p1052c",
+            'create table p1052c (x int) partition by range ((x::text) collate "C")',
+            "select pg_get_partkeydef('p1052c'::regclass)",
+            "drop table p1052c",
+            "create table p1052c (x int) partition by range ((x::text) text_pattern_ops)",
+            "select pg_get_partkeydef('p1052c'::regclass)",
+            "drop table p1052c",
+        ],
+    ) == [
+        "DROP TABLE",
+        "CREATE TABLE",
+        [('RANGE (((x)::text) COLLATE "C")',)],
+        "DROP TABLE",
+        "CREATE TABLE",
+        [("RANGE (((x)::text) text_pattern_ops)",)],
+        "DROP TABLE",
+    ]
+
+
+@pytest.mark.backlog("RP-1092")
+def test_client_min_messages_withholds_a_notice(dsn: str) -> None:
+    """`set client_min_messages = warning` withholds every NOTICE from the
+    client: neither `drop table if exists` of a missing table nor a DO
+    block's `raise notice` sends one on PostgreSQL 15.19 (shared reference,
+    port 5415), while `raise warning` still does. Here both NOTICEs arrive.
+    Found while working RP-1052."""
+    seen: list[tuple[str, str]] = []
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.add_notice_handler(lambda d: seen.append((d.severity or "", d.message_primary or "")))
+        c.execute("set client_min_messages = warning")
+        c.execute("drop table if exists p1052_missing")
+        c.execute("do $$ begin raise notice 'n1052'; raise warning 'w1052'; end $$")
+    assert seen == [("WARNING", "w1052")]

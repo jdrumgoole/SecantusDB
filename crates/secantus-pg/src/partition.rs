@@ -34,7 +34,9 @@ pub(crate) fn parent_of(def: &TableDef) -> Option<&str> {
     def.extra.get_str("partition_of").ok()
 }
 
-/// `pg_get_partkeydef`: the strategy and the key, `LIST (k)`.
+/// `pg_get_partkeydef`: the strategy and the key, `LIST (k)`. An
+/// expression key prints as ruleutils prints it, `RANGE (((x + 1)))`; one
+/// its printer does not reproduce keeps the SQL it was declared with.
 pub(crate) fn partkey_text(def: &TableDef) -> Option<String> {
     let strategy = match strategy(def) {
         "range" => "RANGE",
@@ -42,7 +44,17 @@ pub(crate) fn partkey_text(def: &TableDef) -> Option<String> {
         "hash" => "HASH",
         _ => return None,
     };
-    Some(format!("{strategy} ({})", key_names(def).join(", ")))
+    let keys: Vec<String> = key_names(def)
+        .into_iter()
+        .map(|k| {
+            if k.starts_with('(') {
+                secantus_pgplan::ruleutils::partkey_expr_def(&k, def).unwrap_or(k)
+            } else {
+                k
+            }
+        })
+        .collect();
+    Some(format!("{strategy} ({})", keys.join(", ")))
 }
 
 /// Is `def` a partitioned table (`PARTITION BY`)?

@@ -2879,12 +2879,31 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415).
 
-- [ ] **`pg_get_partkeydef` prints an expression key with one pair of
-      parentheses too few.** `create table p (x int) partition by range
-      ((x + 1))` prints `RANGE (((x + 1)))` on PostgreSQL 15.19 (the key
-      list's, the expression's, the OpExpr's); here `RANGE ((x + 1))`.
-      Verify: tests/backlog/test_rp_found_rp860.py::test_pg_get_partkeydef_of_an_expression_key
-      Backlog-ID: RP-1052
+
+## Found while working RP-1052 (2026-11-25)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
+tests are in `tests/backlog/test_rp_found_rp860.py`.
+
+- [ ] **`pg_get_partkeydef` drops a partition key's COLLATE and operator
+      class.** `partition by range ((x::text) collate "C")` prints
+      `RANGE (((x)::text) COLLATE "C")` on PostgreSQL 15.19, and
+      `((x::text) text_pattern_ops)` prints `RANGE (((x)::text)
+      text_pattern_ops)`; here both print `RANGE (((x)::text))`.
+      `partitions::lower_create` keeps only each `PartitionElem`'s name or
+      expression, never its `collation` / `opclass`: the catalog keeps
+      neither, so the text cannot print them.
+      Verify: tests/backlog/test_rp_found_rp860.py::test_pg_get_partkeydef_keeps_a_key_collation_and_opclass
+      Backlog-ID: RP-1091
+
+- [ ] **`client_min_messages` does not withhold a NOTICE.** After `set
+      client_min_messages = warning`, `drop table if exists` of a missing
+      table and a DO block's `raise notice` each still send their NOTICE;
+      PostgreSQL 15.19 sends neither (a `raise warning` still arrives).
+      The setting is stored and `show` reports it, but nothing consults it
+      before a notice goes out (`do_block.rs` assumes the default level).
+      Verify: tests/backlog/test_rp_found_rp860.py::test_client_min_messages_withholds_a_notice
+      Backlog-ID: RP-1092
 
 ## Found while working RP-1054 (2026-11-25)
 
