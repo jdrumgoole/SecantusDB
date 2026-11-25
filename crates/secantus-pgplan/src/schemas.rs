@@ -21,11 +21,11 @@ thread_local! {
     /// The user schemas (`CREATE SCHEMA`), installed per statement.
     static USER_SCHEMAS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    /// Every relation's catalog key (tables, views, sequences), installed
-    /// per statement: a table the Python server created carries no row-type
-    /// entry, so the regclass list alone does not see it.
-    static RELATION_KEYS: std::cell::RefCell<std::collections::HashSet<String>> =
-        std::cell::RefCell::new(std::collections::HashSet::new());
+    /// Every table's and view's catalog key, installed per statement: a
+    /// table the Python server created carries no row-type entry, so the
+    /// regclass list alone does not see it.
+    static RELATION_KEYS: std::cell::RefCell<RelationKeys> =
+        std::cell::RefCell::new(RelationKeys::default());
     /// The session's own temporary schema (`pg_temp_N`), installed per
     /// statement. A TEMP relation is stored under `pg_temp_N.name`, so two
     /// sessions' same-named temp tables are distinct relations -- as they
@@ -151,7 +151,7 @@ fn session_has_temp() -> bool {
     let has = temp_schema().is_some_and(|t| {
         let prefix = format!("{t}.");
         TEMP_OUTSIDE_KEYS.with(std::cell::Cell::get)
-            || RELATION_KEYS.with(|k| k.borrow().iter().any(|n| n.starts_with(&prefix)))
+            || RELATION_KEYS.with(|k| k.borrow().any_with_prefix(&prefix))
     });
     MEMO.with(|m| m.set(Some((epoch, has))));
     has
@@ -169,10 +169,76 @@ pub(crate) fn set_temp_outside_keys(has: bool) {
     TEMP_OUTSIDE_KEYS.with(|t| t.set(has));
 }
 
-/// Install every relation's catalog key for the statements that follow.
-pub fn set_relation_keys(keys: std::collections::HashSet<String>) {
+/// The relation keys [`relation_exists`] and [`session_has_temp`] ask
+/// about: the catalog version's table definitions as the server shares
+/// them, the views' keys and the keys noted part-way through a statement.
+///
+/// The definitions are held, not copied into a set: a set of every
+/// table's name, built for each catalog version, made the first statement
+/// after any DDL grow with the schema (RP-1073), where PostgreSQL's
+/// `get_relname_relid` reads one `pg_class` row through its name index.
+/// When the server says the definitions are in the order of their names
+/// (`by_name`), a name is found by a binary search; otherwise the set of
+/// the tables' names is built at the first lookup.
+#[derive(Default)]
+struct RelationKeys {
+    tables: std::sync::Arc<Vec<std::sync::Arc<TableDef>>>,
+    by_name: bool,
+    views: Vec<String>,
+    noted: std::collections::HashSet<String>,
+    names: std::cell::OnceCell<std::collections::HashSet<String>>,
+}
+
+impl RelationKeys {
+    /// Is `key` a table's or a view's, or one noted since the install?
+    fn contains(&self, key: &str) -> bool {
+        self.noted.contains(key)
+            || self.views.iter().any(|v| v == key)
+            || if self.by_name {
+                self.tables
+                    .binary_search_by(|t| t.name.as_str().cmp(key))
+                    .is_ok()
+            } else {
+                self.names
+                    .get_or_init(|| self.tables.iter().map(|t| t.name.clone()).collect())
+                    .contains(key)
+            }
+    }
+
+    /// Does any key start with `prefix`?
+    fn any_with_prefix(&self, prefix: &str) -> bool {
+        self.noted.iter().any(|n| n.starts_with(prefix))
+            || self.views.iter().any(|v| v.starts_with(prefix))
+            || if self.by_name {
+                // The names under the prefix are one run, from the first
+                // name not below it.
+                let at = self.tables.partition_point(|t| t.name.as_str() < prefix);
+                self.tables
+                    .get(at)
+                    .is_some_and(|t| t.name.starts_with(prefix))
+            } else {
+                self.tables.iter().any(|t| t.name.starts_with(prefix))
+            }
+    }
+}
+
+/// Install every table's and view's catalog key for the statements that
+/// follow: `tables` is the catalog version's shared list of definitions,
+/// `by_name` whether it is in the order of their names.
+pub fn set_relation_keys(
+    tables: std::sync::Arc<Vec<std::sync::Arc<TableDef>>>,
+    by_name: bool,
+    views: Vec<String>,
+) {
     bump_resolve_epoch();
-    RELATION_KEYS.with(|k| *k.borrow_mut() = keys);
+    RELATION_KEYS.with(|k| {
+        *k.borrow_mut() = RelationKeys {
+            tables,
+            by_name,
+            views,
+            ..RelationKeys::default()
+        }
+    });
 }
 
 /// Add one relation key to the installed set: a TEMP table a statement
@@ -182,7 +248,7 @@ pub fn set_relation_keys(keys: std::collections::HashSet<String>) {
 pub fn note_relation_key(key: &str) {
     bump_resolve_epoch();
     RELATION_KEYS.with(|k| {
-        k.borrow_mut().insert(key.to_string());
+        k.borrow_mut().noted.insert(key.to_string());
     });
 }
 
@@ -775,6 +841,18 @@ fn not_on_path(name: &str, location: i32) -> Error {
 }
 
 pub(crate) fn relation_exists(key: &str) -> bool {
+    // Every unqualified name is looked for in the temp schema first, and
+    // nothing is there while the session holds no temp relation: answered
+    // without the lookups below, which a miss makes walk every relation.
+    if let Some(t) = temp_schema() {
+        if key.len() > t.len()
+            && key.starts_with(t.as_str())
+            && key.as_bytes()[t.len()] == b'.'
+            && !session_has_temp()
+        {
+            return false;
+        }
+    }
     RELATION_KEYS.with(|k| k.borrow().contains(key)) || crate::user_relation_named(key)
 }
 
@@ -1700,5 +1778,58 @@ mod tests {
                 "CREATE TABLE \"s.c\" (a int REFERENCES \"s.p\" (id))"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod relation_keys_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn defs(names: &[&str]) -> Arc<Vec<Arc<TableDef>>> {
+        Arc::new(
+            names
+                .iter()
+                .map(|n| {
+                    Arc::new(TableDef {
+                        name: n.to_string(),
+                        columns: Vec::new(),
+                        temp: n.starts_with("pg_temp_"),
+                        check_constraints: Vec::new(),
+                        foreign_keys: Vec::new(),
+                        unique_constraints: Vec::new(),
+                        extra: bson::Document::new(),
+                        system_columns: Vec::new(),
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// Found by a binary search over definitions in the order of their
+    /// names, and by the built set over any others, alike (RP-1073).
+    #[test]
+    fn sorted_and_unsorted_definitions_answer_alike() {
+        let sorted = ["a", "pg_temp_3.t", "pg_temp_3.u", "s1.x", "z"];
+        let mut unsorted = sorted;
+        unsorted.reverse();
+        for (names, by_name) in [(&sorted, true), (&unsorted, false)] {
+            let keys = RelationKeys {
+                tables: defs(names),
+                by_name,
+                views: vec!["v".into()],
+                ..RelationKeys::default()
+            };
+            for n in sorted.iter().chain(["v"].iter()) {
+                assert!(keys.contains(n), "{n} ({by_name})");
+            }
+            for n in ["b", "pg_temp_3", "pg_temp_4.t", ""] {
+                assert!(!keys.contains(n), "{n} ({by_name})");
+            }
+            assert!(keys.any_with_prefix("pg_temp_3."));
+            assert!(keys.any_with_prefix("s1."));
+            assert!(!keys.any_with_prefix("pg_temp_4."));
+            assert!(!keys.any_with_prefix("s2."));
+        }
     }
 }
