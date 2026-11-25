@@ -2258,6 +2258,227 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Output: e2.b, e2.a",
         ],
     ),
+    # Measured on PostgreSQL 15.20 (2026-11-25, a private cluster): a
+    # Merge Join under a LIMIT returns the ORDER BY's resjunk key, its
+    # index-ordered side its physical target list and its sorted side only
+    # what the join needs.
+    "explain verbose of a merge join under a limit": (
+        "RP-966",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, k.b from e join k on e.a = k.a "
+        "order by k.a limit 10",
+        [
+            "Limit",
+            "  Output: e.b, k.b, k.a",
+            "  ->  Merge Join",
+            "        Output: e.b, k.b, k.a",
+            "        Merge Cond: (k.a = e.a)",
+            "        ->  Index Scan using k_pkey on public.k",
+            "              Output: k.a, k.b",
+            "        ->  Sort",
+            "              Output: e.b, e.a",
+            "              Sort Key: e.a",
+            "              ->  Seq Scan on public.e",
+            "                    Output: e.b, e.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (2026-11-25, a private cluster): an
+    # Index Only Scan returns its index's target list.
+    "explain verbose of a merge join over an index only scan": (
+        "RP-966",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b from e join k on e.a = k.a "
+        "order by k.a limit 10 offset 2",
+        [
+            "Limit",
+            "  Output: e.b, k.a",
+            "  ->  Merge Join",
+            "        Output: e.b, k.a",
+            "        Merge Cond: (k.a = e.a)",
+            "        ->  Index Only Scan using k_pkey on public.k",
+            "              Output: k.a",
+            "        ->  Sort",
+            "              Output: e.b, e.a",
+            "              Sort Key: e.a",
+            "              ->  Seq Scan on public.e",
+            "                    Output: e.b, e.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (2026-11-25, a private cluster): a
+    # descending merge reads the index backward and sorts its other side
+    # descending; a WHERE conjunct is the sorted scan's `Filter`.
+    "explain verbose of a descending merge join with a where": (
+        "RP-966",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, k.b from e join k on e.a = k.a "
+        "where e.b <> 'v1' order by k.a desc limit 10",
+        [
+            "Limit",
+            "  Output: e.b, k.b, k.a",
+            "  ->  Merge Join",
+            "        Output: e.b, k.b, k.a",
+            "        Merge Cond: (k.a = e.a)",
+            "        ->  Index Scan Backward using k_pkey on public.k",
+            "              Output: k.a, k.b",
+            "        ->  Sort",
+            "              Output: e.b, e.a",
+            "              Sort Key: e.a DESC",
+            "              ->  Seq Scan on public.e",
+            "                    Output: e.b, e.a",
+            "                    Filter: (e.b <> 'v1'::text)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (2026-11-25, a private cluster): a
+    # top-N Sort over a hash join returns the join's target list and the
+    # resjunk key, which the hashed side's scan returns too.
+    "explain verbose of a sorted hash join under a limit": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b from e join k on e.a = k.a "
+        "where k.b = 'v2' order by k.a limit 10",
+        [
+            "Limit",
+            "  Output: e.b, k.a",
+            "  ->  Sort",
+            "        Output: e.b, k.a",
+            "        Sort Key: k.a",
+            "        ->  Hash Join",
+            "              Output: e.b, k.a",
+            "              Inner Unique: true",
+            "              Hash Cond: (e.a = k.a)",
+            "              ->  Seq Scan on public.e",
+            "                    Output: e.a, e.b",
+            "              ->  Hash",
+            "                    Output: k.a",
+            "                    ->  Seq Scan on public.k",
+            "                          Output: k.a",
+            "                          Filter: (k.b = 'v2'::text)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (2026-11-25, a private cluster): the same
+    # over a LEFT JOIN, ordered by the preserved side.
+    "explain verbose of a sorted left join under a limit": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, k.b from e left join k on e.a = k.a "
+        "order by e.a limit 10",
+        [
+            "Limit",
+            "  Output: e.b, k.b, e.a",
+            "  ->  Sort",
+            "        Output: e.b, k.b, e.a",
+            "        Sort Key: e.a",
+            "        ->  Hash Left Join",
+            "              Output: e.b, k.b, e.a",
+            "              Inner Unique: true",
+            "              Hash Cond: (e.a = k.a)",
+            "              ->  Seq Scan on public.e",
+            "                    Output: e.a, e.b",
+            "              ->  Hash",
+            "                    Output: k.b, k.a",
+            "                    ->  Seq Scan on public.k",
+            "                          Output: k.b, k.a",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (2026-11-25, a private cluster; found
+    # while working RP-966): the merge in the ORDER BY's order beats a
+    # bounded Sort over the hash join under a LIMIT.
+    "an order by under a limit over a join is a merge join": (
+        "RP-1099",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e join k on e.a = k.a order by k.a limit 10",
+        [
+            "Limit",
+            "  ->  Merge Join",
+            "        Merge Cond: (k.a = e.a)",
+            "        ->  Index Scan using k_pkey on k",
+            "        ->  Sort",
+            "              Sort Key: e.a",
+            "              ->  Seq Scan on e",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (2026-11-25, a private cluster; found
+    # while working RP-966): the nested loop under the bounded Sort reads
+    # its inner side through the index, parameterised by the outer row.
+    "an order by under a limit over an inequality join reads the index": (
+        "RP-1099",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e join k on e.a < k.a order by e.b limit 5",
+        [
+            "Limit",
+            "  ->  Sort",
+            "        Sort Key: e.b",
+            "        ->  Nested Loop",
+            "              ->  Seq Scan on e",
+            "              ->  Index Scan using k_pkey on k",
+            "                    Index Cond: (a > e.a)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (2026-11-25, a private cluster): a
+    # merge join of two tables never analysed returns from each sorted side
+    # only what the join needs, and prints its Sort Keys prefixed.
+    "explain verbose of a merge join": (
+        "RP-966:fixed",
+        _NEVER_ANALYSED,
+        "explain (verbose, costs off) select e.a from e join k on e.b = k.b",
+        [
+            "Merge Join",
+            "  Output: e.a",
+            "  Merge Cond: (e.b = k.b)",
+            "  ->  Sort",
+            "        Output: e.a, e.b",
+            "        Sort Key: e.b",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.a, e.b",
+            "  ->  Sort",
+            "        Output: k.b",
+            "        Sort Key: k.b",
+            "        ->  Seq Scan on public.k",
+            "              Output: k.b",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (2026-11-25, a private cluster).
+    "explain verbose of a merge join of every column": (
+        "RP-966:fixed",
+        _NEVER_ANALYSED,
+        "explain (verbose, costs off) select * from e join k on e.b = k.b",
+        [
+            "Merge Join",
+            "  Output: e.a, e.b, k.a, k.b",
+            "  Merge Cond: (e.b = k.b)",
+            "  ->  Sort",
+            "        Output: e.a, e.b",
+            "        Sort Key: e.b",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.a, e.b",
+            "  ->  Sort",
+            "        Output: k.a, k.b",
+            "        Sort Key: k.b",
+            "        ->  Seq Scan on public.k",
+            "              Output: k.a, k.b",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (2026-11-25, a private cluster).
+    "explain verbose of a merge left join": (
+        "RP-966:fixed",
+        _NEVER_ANALYSED,
+        "explain (verbose, costs off) select e.a from e left join k on e.b = k.b",
+        [
+            "Merge Left Join",
+            "  Output: e.a",
+            "  Merge Cond: (e.b = k.b)",
+            "  ->  Sort",
+            "        Output: e.a, e.b",
+            "        Sort Key: e.b",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.a, e.b",
+            "  ->  Sort",
+            "        Output: k.b",
+            "        Sort Key: k.b",
+            "        ->  Seq Scan on public.k",
+            "              Output: k.b",
+        ],
+    ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): an inner
     # join above a FULL JOIN reduces it to a right join hashing `k`.
     "a full join an inner join reduces hashes its unique side": (

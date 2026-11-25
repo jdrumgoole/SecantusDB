@@ -3527,6 +3527,61 @@ mod join_type_tests {
     }
 
     #[test]
+    fn a_merge_join_under_a_limit_prints_every_output() {
+        // PostgreSQL 15.20, `explain (verbose, costs off) select e.b from e
+        // join k on e.a = k.a order by k.a limit 10 offset 2` (`e`, `k`
+        // analysed, 1000 rows; RP-966): the Limit and the Merge Join return
+        // the resjunk key, the Index Only Scan its index's column, the
+        // sorted side what the join needs.
+        use secantus_pgplan::ruleutils::{VerboseJoin, VerboseRel};
+        let rel = |name: &str, cols: &[&str], needed: &[&str]| VerboseRel {
+            relation: format!("public.{name}"),
+            plain: name.into(),
+            columns: cols.iter().map(|c| format!("{name}.{c}")).collect(),
+            needed: needed.iter().map(|c| format!("{name}.{c}")).collect(),
+            refname: name.into(),
+            pkey: (name == "k").then(|| ("k_pkey".into(), "k.a".into())),
+            ..Default::default()
+        };
+        let v = VerboseJoin {
+            rels: [
+                rel("e", &["a", "b"], &["b", "a"]),
+                rel("k", &["a", "b"], &["a"]),
+            ],
+            output: vec!["e.b".into(), "k.a".into()],
+            all_equal: true,
+            sort_keys: vec!["k.a".into()],
+            limit: true,
+            ..Default::default()
+        };
+        let mut sort = PlanNode::over("Sort", PlanNode::new("Seq Scan on e"));
+        sort.details.push(("Sort Key".into(), "e.a".into()));
+        let mut merge = PlanNode::new("Merge Join");
+        merge
+            .details
+            .push(("Merge Cond".into(), "(k.a = e.a)".into()));
+        merge
+            .children
+            .push(PlanNode::new("Index Only Scan using k_pkey on k"));
+        merge.children.push(sort);
+        let mut limit = PlanNode::over("Limit", merge);
+        attach_verbose_join(&mut limit, &Some(v));
+        let out = |n: &PlanNode| n.details[0].clone();
+        let o = |s: &str| ("Output".to_string(), s.to_string());
+        assert_eq!(out(&limit), o("e.b, k.a"));
+        let merge = &limit.children[0];
+        assert_eq!(out(merge), o("e.b, k.a"));
+        assert_eq!(
+            merge.children[0].name,
+            "Index Only Scan using k_pkey on public.k"
+        );
+        assert_eq!(out(&merge.children[0]), o("k.a"));
+        assert_eq!(out(&merge.children[1]), o("e.b, e.a"));
+        assert_eq!(merge.children[1].children[0].name, "Seq Scan on public.e");
+        assert_eq!(out(&merge.children[1].children[0]), o("e.b, e.a"));
+    }
+
+    #[test]
     fn a_constant_equality_fixes_its_field() {
         let mut out = Vec::new();
         let f = bson::doc! {
@@ -3662,6 +3717,53 @@ pub(crate) fn attach_verbose_join(
     let Some(v) = join else {
         return;
     };
+    // A LIMIT's `Limit` and an ORDER BY's `Sort` above the join return
+    // the join's target list, the ORDER BY's resjunk keys included, and
+    // the Sort prints its keys prefixed (`show_plan_tlist`,
+    // `show_sort_keys`; RP-966). A Merge Join may deliver the order
+    // itself, with no Sort.
+    let mut above = 0;
+    let mut n: &PlanNode = root;
+    if v.limit {
+        if n.name != "Limit" || n.children.len() != 1 || !n.details.is_empty() {
+            return;
+        }
+        n = &n.children[0];
+        above += 1;
+    }
+    if n.name == "Sort" {
+        let keys = v.sort_keys.join(", ");
+        if v.sort_keys.is_empty()
+            || n.children.len() != 1
+            || n.details.len() != 1
+            || n.details[0] != ("Sort Key".to_string(), keys)
+        {
+            return;
+        }
+        above += 1;
+    } else if !v.sort_keys.is_empty() && !n.name.starts_with("Merge ") {
+        return;
+    }
+    let mut join_node: &mut PlanNode = root;
+    for _ in 0..above {
+        join_node = &mut join_node.children[0];
+    }
+    attach_verbose_join_node(join_node, v);
+    if join_node.details.first().map(|(k, _)| k.as_str()) != Some("Output") {
+        return;
+    }
+    let mut n: &mut PlanNode = root;
+    for _ in 0..above {
+        n.details.insert(0, ("Output".into(), v.output.join(", ")));
+        n = &mut n.children[0];
+    }
+}
+
+fn attach_verbose_join_node(root: &mut PlanNode, v: &secantus_pgplan::ruleutils::VerboseJoin) {
+    if root.name.starts_with("Merge ") {
+        attach_verbose_merge_join(root, v);
+        return;
+    }
     // A WHERE comparing the two relations is the join's `Join Filter`,
     // already prefixed; its plan must print exactly that.
     let join_filters = root
@@ -3749,6 +3851,160 @@ pub(crate) fn attach_verbose_join(
     requalify(inner, &v.rels[i]);
     prefix_quals(inner, &v.rels[i].quals);
     inner.details.insert(0, ("Output".into(), needed));
+    root.details
+        .insert(0, ("Output".into(), v.output.join(", ")));
+}
+
+/// `EXPLAIN VERBOSE` of a two-relation merge join on column equalities
+/// (RP-966): a side read in order from an index returns its physical
+/// target list (an Index Only Scan its index's), a side under a Sort only
+/// the columns the join needs (`create_mergejoin_plan` asks
+/// `CP_SMALL_TLIST` of a sorted side), the Sort printing its key
+/// prefixed. Any other merge join prints as without VERBOSE.
+fn attach_verbose_merge_join(root: &mut PlanNode, v: &secantus_pgplan::ruleutils::VerboseJoin) {
+    let join_filters = root
+        .details
+        .iter()
+        .filter(|(k, _)| k == "Join Filter")
+        .count();
+    if !v.all_equal
+        || v.expr_on
+        || v.unprinted_filter
+        || join_filters != usize::from(v.join_filter)
+        || join_type_of(&root.name).is_none()
+        || root
+            .details
+            .iter()
+            .any(|(k, _)| k != "Merge Cond" && k != "Join Filter")
+        || root.children.len() != 2
+    {
+        return;
+    }
+    let rel_of = |n: &PlanNode| -> Option<usize> {
+        if !is_scan_name(&n.name)
+            || !n.children.is_empty()
+            || n.details
+                .iter()
+                .any(|(k, _)| k != "Index Cond" && k != "Filter")
+        {
+            return None;
+        }
+        v.rels
+            .iter()
+            .position(|r| n.name.ends_with(&format!(" on {}", r.plain)))
+    };
+    // Each side: its relation, and whether a Sort is over its scan.
+    let side = |n: &PlanNode| -> Option<(usize, bool)> {
+        if n.name != "Sort" {
+            return Some((rel_of(n)?, false));
+        }
+        let [scan] = n.children.as_slice() else {
+            return None;
+        };
+        let i = rel_of(scan)?;
+        let [(k, key)] = n.details.as_slice() else {
+            return None;
+        };
+        // The plain plan prints a sorted side's key bare or prefixed.
+        let r = &v.rels[i];
+        let qualified = key
+            .split(", ")
+            .map(|c| {
+                if c.contains('.') {
+                    c.to_string()
+                } else {
+                    format!("{}.{c}", r.refname)
+                }
+            })
+            .collect::<Vec<_>>();
+        let col = |c: &String| c.split_once(' ').map_or(c.clone(), |(c, _)| c.to_string());
+        (k == "Sort Key" && qualified.iter().all(|c| r.needed.contains(&col(c))))
+            .then_some((i, true))
+    };
+    let (Some((o, o_sorted)), Some((i, i_sorted))) =
+        (side(&root.children[0]), side(&root.children[1]))
+    else {
+        return;
+    };
+    if o == i {
+        return;
+    }
+    fn scan_of(n: &PlanNode) -> &PlanNode {
+        if n.name == "Sort" {
+            &n.children[0]
+        } else {
+            n
+        }
+    }
+    // A scan prints a `Filter` or an `Index Cond` exactly when its
+    // relation has WHERE conjuncts.
+    for (n, r) in [(&root.children[0], o), (&root.children[1], i)] {
+        let scan = scan_of(n);
+        let has = scan
+            .details
+            .iter()
+            .any(|(k, _)| k == "Filter" || k == "Index Cond");
+        if has == v.rels[r].quals.is_empty() {
+            return;
+        }
+    }
+    // An unsorted side's physical target list: the table's columns, or an
+    // Index Only Scan's index columns (a one-column primary key only).
+    let physical = |n: &PlanNode, r: &secantus_pgplan::ruleutils::VerboseRel| -> Option<String> {
+        if n.name.starts_with("Index Only Scan") {
+            let (index, col) = r.pkey.as_ref()?;
+            let name = n.name.replacen(" Backward", "", 1);
+            return name
+                .starts_with(&format!("Index Only Scan using {index} on "))
+                .then(|| col.clone());
+        }
+        Some(r.columns.join(", "))
+    };
+    let mut outputs = Vec::new();
+    for (n, r, sorted) in [
+        (&root.children[0], o, o_sorted),
+        (&root.children[1], i, i_sorted),
+    ] {
+        outputs.push(if sorted {
+            v.rels[r].needed.join(", ")
+        } else {
+            let Some(p) = physical(n, &v.rels[r]) else {
+                return;
+            };
+            p
+        });
+    }
+    for ((n, (r, sorted)), out) in root
+        .children
+        .iter_mut()
+        .zip([(o, o_sorted), (i, i_sorted)])
+        .zip(outputs)
+    {
+        let rel = &v.rels[r];
+        let scan = if sorted {
+            if let Some(d) = n.details.iter_mut().find(|(k, _)| k == "Sort Key") {
+                d.1 =
+                    d.1.split(", ")
+                        .map(|c| {
+                            if c.contains('.') {
+                                c.to_string()
+                            } else {
+                                format!("{}.{c}", rel.refname)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+            }
+            n.details.insert(0, ("Output".into(), out.clone()));
+            &mut n.children[0]
+        } else {
+            n
+        };
+        let at = scan.name.len() - rel.plain.len();
+        scan.name = format!("{}{}", &scan.name[..at], rel.relation);
+        prefix_quals(scan, &rel.quals);
+        scan.details.insert(0, ("Output".into(), out));
+    }
     root.details
         .insert(0, ("Output".into(), v.output.join(", ")));
 }

@@ -7413,6 +7413,10 @@ pub struct VerboseRel {
     /// scan evaluates it as a `Filter` (its own column bare, the other
     /// side's prefixed), and as VERBOSE prints it, both prefixed.
     pub join_quals: Vec<(String, String)>,
+    /// A one-column PRIMARY KEY's index name and its column, prefixed:
+    /// an Index Only Scan of it returns the index's target list
+    /// (`indextlist`), not the table's.
+    pub pkey: Option<(String, String)>,
 }
 
 /// `EXPLAIN VERBOSE` of a SELECT joining two relations on an ON of
@@ -7436,6 +7440,12 @@ pub struct VerboseJoin {
     /// An ON clause compares an expression rather than two columns: only
     /// a hash join, whose `Hash Cond` prints it, is printed (RP-966).
     pub expr_on: bool,
+    /// The ORDER BY's keys as a `Sort Key` prints them, prefixed: `k.a`,
+    /// `e.b DESC`. A key the target list lacks is a resjunk entry at the
+    /// end of `output` (`findTargetlistEntrySQL92`).
+    pub sort_keys: Vec<String>,
+    /// The query has a LIMIT or an OFFSET: a `Limit` node tops the plan.
+    pub limit: bool,
 }
 
 /// [`VerboseJoin`] for `SELECT <columns or *> FROM a [LEFT] JOIN b ON
@@ -7447,10 +7457,9 @@ pub fn explain_verbose_join(
     if !s.group_clause.is_empty()
         || s.having_clause.is_some()
         || !s.distinct_clause.is_empty()
-        || !s.sort_clause.is_empty()
-        || s.limit_count.is_some()
-        || s.limit_offset.is_some()
         || !s.window_clause.is_empty()
+        || !s.locking_clause.is_empty()
+        || s.with_clause.is_some()
     {
         return None;
     }
@@ -7549,6 +7558,45 @@ pub fn explain_verbose_join(
         let (i, col) = resolve(c)?;
         output.push(pre(i, &col));
         need(i, &col);
+    }
+    // The ORDER BY: each key a column of one side, which the plan's Sort
+    // prints prefixed; one the target list lacks is a resjunk entry that
+    // every node above the join's inputs returns too (RP-966).
+    let mut sort_keys = Vec::new();
+    for item in &s.sort_clause {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return None;
+        };
+        let Some(N::ColumnRef(c)) = sb.node.as_deref()?.node.as_ref() else {
+            return None;
+        };
+        let (i, col) = resolve(c)?;
+        use pg_query::protobuf::{SortByDir, SortByNulls};
+        if !matches!(
+            SortByNulls::try_from(sb.sortby_nulls).ok()?,
+            SortByNulls::SortbyNullsDefault | SortByNulls::Undefined
+        ) || !sb.use_op.is_empty()
+        {
+            return None;
+        }
+        let dir = match SortByDir::try_from(sb.sortby_dir).ok()? {
+            SortByDir::SortbyDefault | SortByDir::SortbyAsc | SortByDir::Undefined => "",
+            SortByDir::SortbyDesc => " DESC",
+            SortByDir::SortbyUsing => return None,
+        };
+        let key = pre(i, &col);
+        if !output.contains(&key) {
+            output.push(key.clone());
+        }
+        need(i, &col);
+        sort_keys.push(format!("{key}{dir}"));
+    }
+    let limit = s.limit_count.is_some() || s.limit_offset.is_some();
+    if limit
+        && pg_query::protobuf::LimitOption::try_from(s.limit_option).ok()
+            == Some(pg_query::protobuf::LimitOption::WithTies)
+    {
+        return None;
     }
     // The ON: equalities between a column of each side.
     let mut parts = Vec::new();
@@ -7827,6 +7875,23 @@ pub fn explain_verbose_join(
             refname: q(refname),
             quals: quals[i].clone(),
             join_quals: join_quals[i].clone(),
+            pkey: match def
+                .columns
+                .iter()
+                .filter(|c| c.pk)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [c] => Some((
+                    q(&def
+                        .extra
+                        .get_str("pk_name")
+                        .map(str::to_string)
+                        .unwrap_or_else(|_| format!("{bare}_pkey"))),
+                    format!("{}.{}", q(refname), q(&c.name)),
+                )),
+                _ => None,
+            },
         }
     };
     Some(VerboseJoin {
@@ -7836,6 +7901,8 @@ pub fn explain_verbose_join(
         join_filter,
         unprinted_filter,
         expr_on,
+        sort_keys,
+        limit,
     })
 }
 

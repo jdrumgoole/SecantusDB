@@ -1731,9 +1731,20 @@ a regression test.
       WHERE whose conjuncts each read one relation prints them as its
       scans' `Filter`, prefixed (RP-966, in part:
       `ruleutils::explain_verbose_join`, `explain::attach_verbose_join`,
-      `explain::attach_verbose_nested_loop`). Every other join does not:
-      PostgreSQL 15.19 prints a Merge Join's, its Materialize's and
-      Memoize's `Output` likewise; here the plain plan. (Since 2026-11-17
+      `explain::attach_verbose_nested_loop`). (Since 2026-11-25 a
+      two-relation merge join on column equalities prints every node's
+      `Output`, a sorted side only the columns the join needs, an
+      index-ordered side its physical target list, an Index Only Scan of a
+      one-column primary key that key: `explain::attach_verbose_merge_join`;
+      and a two-relation join under an ORDER BY of columns, a LIMIT or
+      both prints its Limit's and Sort's `Output` too, each ORDER BY column
+      the select list lacks a resjunk entry every node down to the join
+      returns: `VerboseJoin::sort_keys`, measured on PostgreSQL 15.20. A
+      merge join under a LIMIT, on PostgreSQL 15.20 the plan of `... e
+      join k on e.a = k.a order by k.a limit 10`, waits on RP-1099's plain
+      plan.) Every other join does not:
+      PostgreSQL 15.19 prints a Memoize's `Output` likewise; here the
+      plain plan. (Since 2026-11-17
       a nested loop over a scan and a Materialize of a scan, the ON its
       `Join Filter`, prints every node's `Output`:
       `explain::attach_verbose_materialized_loop`.) Nor does a WHERE conjunct reading both relations, an ON that is not column
@@ -1804,7 +1815,7 @@ a regression test.
       for `where e.a < 5`, RP-1065 for `where e.a = 3`), a RIGHT join
       (RP-1063). Work those first; the VERBOSE half then follows the
       chain's `Output` rules above.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a three-way join with a join filter]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a three-way join with a join filter], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a merge join under a limit], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a merge join over an index only scan], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a descending merge join with a where]
       Backlog-ID: RP-966
 
 - [ ] **A WHERE-filtered relation of a three-way join is not joined
@@ -1906,6 +1917,28 @@ a regression test.
       it. Found while working RP-966.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by over a join prints its sort]
       Backlog-ID: RP-1056
+
+- [ ] **An ORDER BY under a LIMIT over a two-table join is an unpriced
+      Sort over the join method it would use without them.** `explain
+      (costs off) select e.b, k.b from e join k on e.a = k.a order by k.a
+      limit 10` (`e`, `k` analysed, 1000 rows, `k.a` the primary key)
+      prints `Limit` over `Sort` (`Sort Key: k.a`) over a `Hash Join`,
+      every node `cost=0.00..0.00 rows=0 width=0`; PostgreSQL 15.20 prints
+      `Limit` over a `Merge Join` (`Merge Cond: (k.a = e.a)`) of `Index
+      Scan using k_pkey on k` and a Sort of `e`, (cost=65.10..65.71
+      rows=10). The same with `order by e.a`, `order by k.a desc` (an
+      `Index Scan Backward`), a LEFT join from `k`, `select k.b, k2.b from
+      k join k k2 ...` (two index scans) and two tables never analysed
+      (`e.b = k.b ... order by e.b limit 3`). `... on e.a < k.a order by
+      e.b limit 5` is PostgreSQL's bounded Sort over a Nested Loop into
+      `Index Scan using k_pkey on k` (`Index Cond: (a > e.a)`); here a
+      Nested Loop of two Seq Scans with a `Join Filter`. With `order by
+      k.a limit 5` PostgreSQL keeps the Sort over the Hash Join, matched
+      here but unpriced. The LIMIT search that matches these shapes on
+      `tools/probes/pg_join_order_matrix.py` does not reach them; find
+      where it declines before sizing. Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by under a limit over a join is a merge join], tests/backlog/test_rp_explain_costs.py::test_plan[an order by under a limit over an inequality join reads the index]
+      Backlog-ID: RP-1099
 
 - [ ] **A join's Hash Cond names a different member of the equivalence
       class than PostgreSQL's.** `explain (costs off) select k.b, e2.b
