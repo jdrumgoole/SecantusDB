@@ -9,6 +9,7 @@ WiredTiger parses badly is refused at `create`, as `==` is.
 
 from __future__ import annotations
 
+import pprint
 from typing import Any
 
 import pytest
@@ -48,4 +49,4 @@ def test_a_collection_table_is_made_from_its_config_string(rust_mongo: Any, mong
             )
         if answers[0] != answers[1]:
             differences[config] = {"mongod": answers[0], "secantusd-mdb": answers[1]}
-    assert not differences, differences
+    assert not differences, pprint.pformat(differences, width=120)

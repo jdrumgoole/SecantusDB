@@ -13,6 +13,7 @@ every default filled in), the way each test below reads what was applied.
 
 from __future__ import annotations
 
+import pprint
 import re
 from typing import Any
 
@@ -118,7 +119,7 @@ def test_an_index_table_is_made_from_its_config_string(rust_mongo: Any, mongod: 
                 answers[-1] = _normal(answer)
         if answers[0] != answers[1]:
             differences[config] = {"mongod": answers[0], "secantusd-mdb": answers[1]}
-    assert not differences, differences
+    assert not differences, pprint.pformat(differences, width=120)
 
 
 @_ITEM
@@ -154,7 +155,7 @@ def test_every_kind_of_index_is_made_from_its_config_string(rust_mongo: Any, mon
             )
         if answers[0] != answers[1]:
             differences[label] = {"mongod": answers[0], "secantusd-mdb": answers[1]}
-    assert not differences, differences
+    assert not differences, pprint.pformat(differences, width=120)
 
 
 @_ITEM
@@ -225,7 +226,7 @@ def test_a_table_that_cannot_be_made_fails_the_build_as_mongod_fails_it(
                         "mongod": answers[0],
                         "secantusd-mdb": answers[1],
                     }
-    assert not differences, differences
+    assert not differences, pprint.pformat(differences, width=120)
 
 
 def _defaults(config: Any) -> dict:
@@ -338,7 +339,7 @@ def test_index_option_defaults_are_checked_when_the_collection_is_created(
                     "mongod": answers[0],
                     "secantusd-mdb": answers[1],
                 }
-    assert not differences, differences
+    assert not differences, pprint.pformat(differences, width=120)
     unknown = [
         mongo_answer(
             lambda c=client: c["cfg"].create_collection("u", indexOptionDefaults={"foo": 1})
@@ -401,7 +402,7 @@ def test_an_equivalent_index_under_another_name_or_options_is_refused_as_mongod_
                     "mongod": answers[0],
                     "secantusd-mdb": answers[1],
                 }
-    assert not differences, differences
+    assert not differences, pprint.pformat(differences, width=120)
 
 
 @_ITEM

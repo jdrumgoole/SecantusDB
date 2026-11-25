@@ -1100,7 +1100,7 @@ fn create_user_configured_table(
     if user_nonlogged.is_some() && configured_table_type(cfg).is_some_and(|t| t != "file") {
         return Err(StorageError::QueryError {
             code: 8,
-            errmsg: format!("{prefix}45: Operation not supported - "),
+            errmsg: format!("{prefix}{ENOTSUP}: {} - ", os_error_text(ENOTSUP)),
             exec: false,
         });
     }
@@ -1116,6 +1116,25 @@ fn create_user_configured_table(
         errmsg: format!("{prefix}{}: {} - {detail}", e.code, e.message),
         exec: false,
     })
+}
+
+/// `ENOTSUP`, the code WiredTiger returns for a table type it cannot make:
+/// the platform's own, since mongod quotes the number its build was given
+/// (95 on Linux, the exemplar build; 45 on macOS).
+#[cfg(target_os = "macos")]
+const ENOTSUP: i32 = 45;
+#[cfg(not(target_os = "macos"))]
+const ENOTSUP: i32 = 95;
+
+/// The C library's text for an `errno`, as WiredTiger's `wiredtiger_strerror`
+/// gives it for a system error: Rust's own message without its
+/// " (os error N)" suffix.
+fn os_error_text(code: i32) -> String {
+    let text = std::io::Error::from_raw_os_error(code).to_string();
+    match text.rfind(" (os error ") {
+        Some(at) => text[..at].to_owned(),
+        None => text,
+    }
 }
 
 /// The last `type` a configuration string sets at its top level, however it
