@@ -244,7 +244,123 @@ pub(crate) struct Model<'a> {
     /// (rel, attnum), right (rel, attnum))`, for the planner's merge join
     /// costing once the base relations are planned.
     merge_clauses: Vec<MergeClause>,
+    /// Starting without the shared or the local relation cache init file
+    /// (RP-292): the relations it would hold are built, not read from it.
+    cold_shared: bool,
+    cold_local: bool,
+    /// `criticalRelcachesBuilt` and `criticalSharedRelcachesBuilt`: until
+    /// the critical indexes are built, the relation cache's catalog reads
+    /// (and the caches `IndexScanOK` names) are heap scans.
+    relcache_built: bool,
+    shared_built: bool,
 }
+
+/// `syscache.c`'s `cacheinfo`, in its order: each system cache's catalog
+/// and index, which `InitCatalogCachePhase2` opens.
+const SYSCACHES: &[(i64, i64)] = &[
+    (2600, 2650),
+    (2601, 2651),
+    (2601, 2652),
+    (2602, 2654),
+    (2602, 2653),
+    (2603, 2655),
+    (1249, 2658),
+    (1249, 2659),
+    (1261, 2695),
+    (1261, 2694),
+    (1260, 2676),
+    (1260, 2677),
+    (2605, 2661),
+    (2616, 2686),
+    (2616, 2687),
+    (3456, 3164),
+    (3456, 3085),
+    (2607, 2668),
+    (2607, 2669),
+    (2606, 2667),
+    (2607, 2670),
+    (1262, 2672),
+    (826, 827),
+    (3501, 3502),
+    (3501, 3503),
+    (3466, 3467),
+    (3466, 3468),
+    (2328, 548),
+    (2328, 112),
+    (1417, 549),
+    (1417, 113),
+    (3118, 3119),
+    (2610, 2679),
+    (2612, 2681),
+    (2612, 2682),
+    (2615, 2684),
+    (2615, 2685),
+    (2617, 2689),
+    (2617, 2688),
+    (2753, 2754),
+    (2753, 2755),
+    (6243, 6246),
+    (6243, 6247),
+    (3350, 3351),
+    (1255, 2691),
+    (1255, 2690),
+    (6104, 6111),
+    (6237, 6238),
+    (6237, 6239),
+    (6104, 6110),
+    (6106, 6112),
+    (6106, 6113),
+    (3541, 2228),
+    (3541, 3542),
+    (1259, 2663),
+    (1259, 2662),
+    (6000, 6001),
+    (6000, 6002),
+    (2618, 2693),
+    (2224, 5002),
+    (3429, 3433),
+    (3381, 3997),
+    (3381, 3380),
+    (2619, 2696),
+    (6100, 6115),
+    (6100, 6114),
+    (6102, 6117),
+    (1213, 2697),
+    (3576, 3574),
+    (3576, 3575),
+    (3603, 3609),
+    (3602, 3608),
+    (3602, 3712),
+    (3600, 3604),
+    (3600, 3605),
+    (3601, 3606),
+    (3601, 3607),
+    (3764, 3766),
+    (3764, 3767),
+    (1247, 2704),
+    (1247, 2703),
+    (1418, 174),
+    (1418, 175),
+    (3079, 3080),
+];
+
+/// `RelationCacheInitializePhase3`'s critical local indexes, in its order:
+/// `pg_class_oid_index`, `pg_attribute_relid_attnum_index`,
+/// `pg_index_indexrelid_index`, `pg_opclass_oid_index`,
+/// `pg_amproc_fam_proc_index`, `pg_rewrite_rel_rulename_index`,
+/// `pg_trigger_tgrelid_tgname_index`.
+const CRITICAL_LOCAL_INDEXES: &[i64] = &[2662, 2659, 2679, 2687, 2655, 2693, 2701];
+/// Its critical shared indexes: `pg_database`'s two, `pg_authid`'s two,
+/// `pg_auth_members_member_role_index`, `pg_shseclabel_object_index`.
+const CRITICAL_SHARED_INDEXES: &[i64] = &[2671, 2672, 2676, 2677, 2695, 3593];
+/// The catalogs `formrdesc` makes without reading anything: the shared
+/// ones (`RelationCacheInitializePhase2`) and the local ones (`Phase3`).
+const FORMRDESC_SHARED: &[i64] = &[1262, 1260, 1261, 3592, 6100];
+const FORMRDESC_LOCAL: &[i64] = &[1259, 1249, 1255, 1247];
+/// `OID_BTREE_OPS_OID` and `INT2_BTREE_OPS_OID`: `LookupOpclassInfo` reads
+/// them by heap scans until the critical indexes are built.
+const OID_BTREE_OPS: i64 = 1981;
+const INT2_BTREE_OPS: i64 = 1979;
 
 fn names_of(nodes: &[pb::Node]) -> Vec<String> {
     nodes
@@ -296,6 +412,10 @@ impl<'a> Model<'a> {
             active_fns: Vec::new(),
             pre: Vec::new(),
             merge_clauses: Vec::new(),
+            cold_shared: false,
+            cold_local: false,
+            relcache_built: true,
+            shared_built: true,
         }
     }
 
@@ -406,16 +526,45 @@ impl<'a> Model<'a> {
 
     // ---------------------------------------------------------- backend start
 
-    /// `InitPostgres` with the init files in place.
-    pub(crate) fn backend_start(&mut self, db_oid: i64, db_name: &str, role_oid: i64) {
-        // `GetDatabaseTuple`: a direct scan by name, uncached.
-        self.ct.index(2671, vec![K::N(db_name.to_string())], 1);
+    /// `InitPostgres`: with the relation cache init files in place, or,
+    /// when `cold` says one is missing (`(shared, local)`), building every
+    /// relation it would hold and writing it (RP-292).
+    pub(crate) fn backend_start(
+        &mut self,
+        db_oid: i64,
+        db_name: &str,
+        role_oid: i64,
+        cold: (bool, bool),
+    ) {
+        let (shared, local) = cold;
+        self.cold_shared = shared;
+        self.cold_local = local;
+        // `RelationCacheInitializePhase2`: no shared init file, so
+        // `formrdesc`'s descriptors, and no critical shared index yet.
+        if shared {
+            for &rel in FORMRDESC_SHARED {
+                self.be.build_relation(rel);
+            }
+            self.shared_built = false;
+        }
         // `InitializeSessionUserId`: AUTHNAME, then AUTHOID.
         let user = self.user.clone();
-        self.search(Cache::AuthName, vec![K::N(user)], |_| true);
-        self.search(Cache::AuthOid, vec![K::O(role_oid)], |_| true);
+        self.start_search(Cache::AuthName, vec![K::N(user)]);
+        self.start_search(Cache::AuthOid, vec![K::O(role_oid)]);
+        // `GetDatabaseTuple`: a direct scan by name, uncached; a heap scan
+        // until the critical shared indexes are built.
+        if self.shared_built {
+            self.ct.index(2671, vec![K::N(db_name.to_string())], 1);
+        } else {
+            self.ct.seq(1262, 1);
+        }
         // `GetDatabaseTupleByOid`, rechecking after the lock: uncached.
-        self.ct.index(2672, vec![K::O(db_oid)], 1);
+        if self.shared_built {
+            self.ct.index(2672, vec![K::O(db_oid)], 1);
+        } else {
+            self.ct.seq(1262, 1);
+        }
+        self.relcache_phase3();
         // `CheckMyDatabase`: DATABASEOID.
         self.search(Cache::DatabaseOid, vec![K::O(db_oid)], |_| true);
         // `process_settings`: four scans of pg_db_role_setting's index,
@@ -428,7 +577,157 @@ impl<'a> Model<'a> {
         for ((d, r), n) in keys.into_iter().zip(rows) {
             self.ct.index(2965, vec![K::O(d), K::O(r)], n);
         }
+        self.cold_shared = false;
+        self.cold_local = false;
         self.be.started = true;
+    }
+
+    /// `RelationCacheInitializePhase3` without an init file: `formrdesc`'s
+    /// local catalogs, the critical indexes built by heap scans, the
+    /// critical shared ones, every `formrdesc`'d catalog's own `pg_class`
+    /// row, then `InitCatalogCachePhase2`'s open of every system cache's
+    /// catalog and index -- the relations the init files then hold.
+    fn relcache_phase3(&mut self) {
+        let (shared, local) = (self.cold_shared, self.cold_local);
+        if local {
+            for &rel in FORMRDESC_LOCAL {
+                self.be.build_relation(rel);
+            }
+            self.relcache_built = false;
+            for &ix in CRITICAL_LOCAL_INDEXES {
+                self.build_desc(ix);
+            }
+            self.relcache_built = true;
+        }
+        if shared {
+            for &ix in CRITICAL_SHARED_INDEXES {
+                self.build_desc(ix);
+            }
+            self.shared_built = true;
+        }
+        // A `formrdesc`'d descriptor has no owner: its row by RELOID.
+        let fixups = if shared { FORMRDESC_SHARED } else { &[] };
+        let local_fixups = if local { FORMRDESC_LOCAL } else { &[] };
+        for &rel in fixups.iter().chain(local_fixups) {
+            self.start_search(Cache::RelOid, vec![K::O(rel)]);
+        }
+        if !(shared || local) {
+            return;
+        }
+        for &(rel, ix) in SYSCACHES {
+            // `CatalogCacheInitializeCache`, and the index unless it is
+            // pg_am's (`touch_index` is false for AMOID and AMNAME).
+            self.build_desc(rel);
+            if rel != 2601 {
+                self.build_desc(ix);
+            }
+        }
+    }
+
+    /// Whether a catalog's descriptor comes from an init file this
+    /// backend found.
+    fn held_by_init_file(&self, c: &cf::CatalogRel) -> bool {
+        c.in_init_file
+            && !(if c.shared {
+                self.cold_shared
+            } else {
+                self.cold_local
+            })
+    }
+
+    /// `RelationBuildDesc` of a catalog or catalog index while the init
+    /// files are built: its `pg_class` row (`ScanPgRelation`), its
+    /// attributes (`RelationBuildTupleDesc`), and an index's access info.
+    fn build_desc(&mut self, oid: i64) {
+        let b = builtin();
+        let Some(c) = b.relations.get(&oid) else {
+            return;
+        };
+        if self.held_by_init_file(c) || !self.be.build_relation(oid) {
+            return;
+        }
+        if self.relcache_built {
+            self.ct.index_key(2662, &vec![K::O(oid)], 1);
+            self.ct.index_key(2659, &vec![K::O(oid)], c.natts);
+        } else {
+            self.ct.seq(RELATION_RELATION, 1);
+            self.ct.seq(ATTRIBUTE_RELATION, c.natts);
+        }
+        if c.kind != 'i' {
+            return;
+        }
+        let Some(ix) = catalog_index(oid) else {
+            return;
+        };
+        // `RelationInitIndexAccessInfo`.
+        self.start_search(Cache::IndexRelid, vec![K::O(oid)]);
+        self.start_search(Cache::AmOid, vec![K::O(ix.am)]);
+        for class in &ix.classes {
+            self.start_opclass_info(*class);
+        }
+        // `RelationGetIndexAttOptions`: once the critical indexes are
+        // built, and never for pg_attribute's own.
+        if self.relcache_built && oid != 2659 {
+            for att in 1..=ix.natts {
+                self.start_search(Cache::AttNum, vec![K::O(oid), K::O(att)]);
+            }
+        }
+    }
+
+    /// A system cache search while the init files are built: the cache's
+    /// catalog opened on its first use (`CatalogCacheInitializeCache`),
+    /// and a miss read by a heap scan where `IndexScanOK` says so.
+    fn start_search(&mut self, cache: Cache, key: Key) {
+        let (catalog, index) = cache.relations();
+        self.build_desc(catalog);
+        let heap = match cache {
+            Cache::IndexRelid => !self.relcache_built,
+            Cache::AuthName | Cache::AuthOid | Cache::DatabaseOid => !self.shared_built,
+            _ => false,
+        };
+        if self.be.cached(cache, &key) {
+            return;
+        }
+        if heap {
+            self.be.search_heap(&self.ct, cache, key, 1);
+        } else {
+            if cache != Cache::AmOid {
+                self.build_desc(index);
+            }
+            self.be.search(&self.ct, cache, key, 1);
+        }
+    }
+
+    /// `LookupOpclassInfo` while the init files are built: heap scans for
+    /// `oid_ops` and `int2_ops` until the critical indexes are built.
+    fn start_opclass_info(&mut self, class: i64) {
+        if !self.be.opclasses.insert(class) {
+            return;
+        }
+        let index_ok = self.relcache_built || (class != OID_BTREE_OPS && class != INT2_BTREE_OPS);
+        self.build_desc(2616);
+        if index_ok {
+            self.build_desc(2687);
+            self.ct.index(2687, vec![K::O(class)], 1);
+        } else {
+            self.ct.seq(2616, 1);
+        }
+        let Some(o) = builtin().opclasses.get(&class).cloned() else {
+            return;
+        };
+        let procs = builtin()
+            .amproc_count
+            .get(&(o.family, o.intype, o.intype))
+            .copied()
+            .unwrap_or(0);
+        self.build_desc(2603);
+        if index_ok {
+            self.build_desc(2655);
+            let key = vec![K::O(o.family), K::O(o.intype), K::O(o.intype)];
+            self.ct.index(2655, key, procs);
+        } else {
+            self.ct.seq(2603, procs);
+        }
     }
 
     // ------------------------------------------------------------ namespace.c
@@ -4535,9 +4834,15 @@ impl PgHandler {
         let db = self.db().to_string();
         let mut be = self.catcache.lock().unwrap_or_else(|e| e.into_inner());
         be.attach(store);
+        // The relation cache init files: missing after a start until a
+        // backend writes them (RP-292).
+        let cold = crate::catcache::init_files_missing(store, db_oid);
         let mut m = Model::new(self, &mut be, ct);
-        m.backend_start(db_oid, &db, role_oid);
+        m.backend_start(db_oid, &db, role_oid, cold);
         let scans = m.ct.take_scans();
+        if cold.0 || cold.1 {
+            crate::catcache::init_files_written(store, db_oid);
+        }
         self.catalog_index_pages(&mut be, scans);
     }
 

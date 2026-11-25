@@ -2896,10 +2896,18 @@ def test_a_catalog_scan_is_estimated(rust_pg: Any) -> None:
 
 # RP-292: the first backend after the server starts finds no relation cache
 # init file and builds every critical relation's descriptor, by heap scans
-# until the critical indexes are built, and writes the files. PostgreSQL
+# until the critical indexes are built, then every system cache's catalog
+# and index (`InitCatalogCachePhase2`), and writes the files. PostgreSQL
 # 15.19's reads, a session that ran `select 1` then an observer's start,
 # measured across a restart of the private cluster (the counts survive a
-# clean shutdown, so the delta is the two sessions').
+# clean shutdown, so the delta is the two sessions'). Removing both init
+# files from a running cluster, so that no restart is involved, gives the
+# same counts (measured again on 15.20, 2026-11-25).
+#
+# Not compared: `pg_subscription`, whose heap scans are the logical
+# replication launcher's of the run before the restart (two at its start
+# and one per reload, flushed as it exits: 7 in this recording, 2 after a
+# run with no reload). This server has no launcher (RP-1096).
 FIRST_BACKEND: dict[str, list[int]] = {
     "pg_am": [2, 2, 0],
     "pg_amproc": [2, 7, 0],
@@ -2919,32 +2927,155 @@ FIRST_BACKEND: dict[str, list[int]] = {
     "pg_index_indexrelid_index": [80, 80, 80],
     "pg_opclass": [2, 2, 0],
     "pg_opclass_oid_index": [7, 7, 7],
-    "pg_subscription": [7, 0, 0],
+    "pg_type_oid_index": [1, 1, 1],
+}
+LAUNCHER_ONLY = "pg_subscription"
+
+
+def _restart_delta(
+    home: Any, steps: Any, db: str = "", setup: tuple[str, ...] = ()
+) -> dict[str, list[int]]:
+    from tests.test_rust_pgserver_slice import _Server
+
+    return _delta_across(lambda: _Server(home), steps, db, setup)
+
+
+def _delta_across(
+    server: Any, steps: Any, db: str = "", setup: tuple[str, ...] = ()
+) -> dict[str, list[int]]:
+    """Every catalog's counts across a restart: an observer's reading
+    before the server stops, and another's after `steps(dsn)` ran on the
+    restarted server, both in database `db` (`postgres` when empty). Each of
+    `setup`'s statements runs in the first run, half a second apart."""
+    with server() as srv:
+        if setup:
+            with _connect(_dsn(srv), "setup") as conn:
+                for sql in setup:
+                    conn.execute(sql)
+                    time.sleep(0.5)
+        obs = Observer(_dsn(srv), db)
+        before = obs.snap()
+        obs.conn.close()
+        time.sleep(0.5)
+    with server() as srv:
+        dsn = _dsn(srv)
+        steps(dsn)
+        time.sleep(0.5)
+        with _connect(dsn, f"obs:{db}") as conn:
+            conn.execute("select pg_stat_clear_snapshot()")
+            rows = conn.execute(obs.query).fetchall()
+    after = {obs.names[o]: (a, b, c) for o, a, b, c in rows}
+    return _delta(before, after)
+
+
+def _select_one(dsn: str) -> None:
+    first = _connect(dsn, "first")
+    first.execute("select 1")
+    first.close()
+
+
+@pytest.mark.backlog_fixed("RP-292")
+def test_the_first_backend_after_a_start(tmp_path: Any) -> None:
+    """Fixed: the first backend after a start built the relation cache
+    init files, where it was once counted as a warm one."""
+    got = _restart_delta(tmp_path, _select_one)
+    got.pop(LAUNCHER_ONLY, None)
+    assert got == FIRST_BACKEND
+
+
+# The logical replication launcher (`ApplyLauncherMain`) scans
+# pg_subscription at its start, again at once (its latch is set as it
+# starts), then whenever its latch is set (a reload's SIGHUP, a
+# subscription's commit) or `DEFAULT_NAPTIME_PER_CYCLE` (180 s) passes. Its
+# counts are flushed only as it exits, so a restart's delta holds the run
+# before's scans. PostgreSQL 15.20, private cluster (2026-11-25): a first run
+# with one `pg_reload_conf()` leaves these three; with none, two; with three
+# reloads, five.
+LAUNCHER_SCANS = [3, 0, 0]
+
+
+@pytest.mark.backlog("RP-1096")
+def test_the_logical_replication_launcher_scans_pg_subscription(tmp_path: Any) -> None:
+    got = _restart_delta(tmp_path, _select_one, setup=("select pg_reload_conf()",))
+    assert got.get(LAUNCHER_ONLY) == LAUNCHER_SCANS
+
+
+# A committed invalidation of a relation an init file holds removes the file
+# (`RelationCacheInitFilePreInvalidate`), so the next backend builds it
+# again. PostgreSQL 15.20, private cluster (2026-11-25): after a
+# database-wide `analyze`, the next backend's `select 1` makes the cold
+# start's heap scans (both files rebuilt); after `analyze pg_class`,
+# `analyze pg_authid` or a `create table`, none. Only the heap scans are
+# compared: they are the cold start's alone.
+AFTER_ANALYZE_HEAP_SCANS = {
+    "pg_attribute": [11, 53, 0],
+    "pg_authid": [2, 2, 0],
+    "pg_class": [11, 11, 0],
+}
+
+
+@pytest.mark.backlog("RP-1097")
+def test_a_database_wide_analyze_removes_the_init_files(tmp_path: Any) -> None:
+    from tests.test_rust_pgserver_slice import _Server
+
+    with _Server(tmp_path) as server:
+        dsn = _dsn(server)
+        obs = Observer(dsn)
+        conn = _connect(dsn, "ddl")
+        conn.execute("analyze")
+        conn.close()
+        time.sleep(0.5)
+        before = obs.snap()
+        _select_one(dsn)
+        time.sleep(0.5)
+        got = _delta(before, obs.snap())
+        obs.conn.close()
+    heap = {k: v for k, v in got.items() if k in AFTER_ANALYZE_HEAP_SCANS}
+    assert heap == AFTER_ANALYZE_HEAP_SCANS
+
+
+# The first backend in a second database after a start finds the shared
+# init file the first one wrote, and builds only its database's: no heap
+# scan of pg_authid or pg_database, no critical shared index, none of the
+# shared catalogs' descriptors. PostgreSQL 15.20's reads (private cluster,
+# 2026-11-25, twice, identical), a session in `postgres` and one in
+# `rp292b` that each ran `select 1`, then an observer's start in `rp292b`:
+# the shared catalogs' counts are all three sessions', the local ones
+# `rp292b`'s two. `pg_subscription` is left out as above.
+SECOND_DATABASE: dict[str, list[int]] = {
+    "pg_am": [2, 2, 0],
+    "pg_amproc": [2, 7, 0],
+    "pg_amproc_fam_proc_index": [6, 16, 16],
+    "pg_attribute": [11, 53, 0],
+    "pg_attribute_relid_attnum_index": [213, 518, 518],
+    "pg_authid": [2, 2, 0],
+    "pg_authid_oid_index": [2, 2, 2],
+    "pg_authid_rolname_index": [2, 2, 2],
+    "pg_class": [11, 11, 0],
+    "pg_class_oid_index": [107, 107, 107],
+    "pg_database": [2, 2, 0],
+    "pg_database_datname_index": [2, 2, 2],
+    "pg_database_oid_index": [5, 5, 5],
+    "pg_db_role_setting_databaseid_rol_index": [12, 0, 0],
+    "pg_index": [7, 7, 0],
+    "pg_index_indexrelid_index": [66, 66, 66],
+    "pg_opclass": [2, 2, 0],
+    "pg_opclass_oid_index": [6, 6, 6],
     "pg_type_oid_index": [1, 1, 1],
 }
 
 
-@pytest.mark.backlog("RP-292")
-def test_the_first_backend_after_a_start(rust_pg: Any, tmp_path: Any) -> None:
-    from tests.test_rust_pgserver_slice import _Server
+@pytest.mark.backlog_fixed("RP-292")
+def test_the_first_backend_in_a_second_database(tmp_path: Any) -> None:
+    def steps(dsn: str) -> None:
+        for session in ("first", "second:rp292b"):
+            conn = _connect(dsn, session)
+            conn.execute("select 1")
+            conn.close()
 
-    # The catalogs' oids, from another server: asking the fresh one would
-    # make its observer the first backend.
-    names = Observer(_dsn(rust_pg)).names
-    query = (
-        "select o, pg_stat_get_numscans(o), pg_stat_get_tuples_returned(o), "
-        "pg_stat_get_tuples_fetched(o) from (values {}) v(o)"
-    ).format(",".join(f"({o})" for o in names))
-    with _Server(tmp_path) as server:
-        dsn = _dsn(server)
-        first = _connect(dsn, "first")
-        first.execute("select 1")
-        first.close()
-        time.sleep(0.5)
-        with _connect(dsn, "obs") as obs:
-            rows = obs.execute(query).fetchall()
-    got = {names[o]: [a, b, c] for o, a, b, c in rows if a or b or c}
-    assert got == FIRST_BACKEND
+    got = _restart_delta(tmp_path, steps, "rp292b", ("create database rp292b",))
+    got.pop(LAUNCHER_ONLY, None)
+    assert got == SECOND_DATABASE
 
 
 # Found while measuring: RP-293, `pg_class.relnatts` left out a dropped

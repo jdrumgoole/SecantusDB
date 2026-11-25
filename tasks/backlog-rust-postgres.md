@@ -1617,16 +1617,35 @@ a regression test.
       are 15.19's page for page, which is what this slice was measured on.
       Backlog-ID: RP-291
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_views_and_a_functions_rows_are_read_from_the_heap
-- [ ] **The first backend after a start is counted as a warm one.**
-      PostgreSQL serves it without the relcache init files (about 245
-      `pg_attribute` index scans, `pg_class` heap scans, ...); the model
-      treats every backend as starting with them. Separating the shared
-      and local cold costs needs an instrumented PostgreSQL.
-      **Decided** (Joe, 2026-11-02): build it -- a private PostgreSQL
-      15.19 from source with the catalog-read counters, kept in the
-      worktree's `.scratch/`, never the shared reference servers.
-      Backlog-ID: RP-292
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_the_first_backend_after_a_start
+- [ ] **No logical replication launcher scans `pg_subscription`.**
+      PostgreSQL 15.19's launcher (`ApplyLauncherMain`) heap-scans
+      `pg_subscription` as it starts, again at once, then whenever its
+      latch is set (a reload, a subscription's commit) or 180 s pass, and
+      flushes those counts only as it exits: across a restart,
+      `pg_stat_get_numscans('pg_subscription'::regclass)` moves by the run
+      before's scans (2 after a run with no reload, 3 with one, 5 with
+      three; PostgreSQL 15.20, private cluster). Here it does not move.
+      The faithful fix keeps the launcher's pending scans per server run
+      and folds them in at a clean shutdown (found while working RP-292,
+      whose restart comparison leaves `pg_subscription` out for this).
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_the_logical_replication_launcher_scans_pg_subscription
+      Backlog-ID: RP-1096
+- [ ] **An invalidation never removes the relation cache init files.**
+      Since RP-292 the first backend after a start builds the init files
+      and later ones read them; but PostgreSQL 15.19 also removes a file
+      when a committed transaction invalidates a relation it holds
+      (`RelationCacheInitFilePreInvalidate`), and the next backend builds
+      it again. After a database-wide `analyze`, PostgreSQL 15.20's next
+      backend makes the cold start's heap scans (`pg_class` 11,
+      `pg_attribute` 11, `pg_authid` 2); after `analyze pg_class`, `analyze
+      pg_authid` or a `create table` it makes none. Here no invalidation
+      reaches the init files. The faithful fix: an `Inval::Rel` of an
+      init-file relation, at commit, removes that file (shared or the
+      database's), as `RegisterRelcacheInvalidation` marks
+      `RelcacheInitFileInval`; which of `analyze`'s catalog updates send
+      one is the part to measure (found while working RP-292).
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_removes_the_init_files
+      Backlog-ID: RP-1097
 - [ ] **A database-wide ANALYZE measures only some catalog columns.** Since
       RP-311 each database holds `initdb`'s `pg_statistic` rows for the
       built-in catalogs. A plain `ANALYZE` (or `VACUUM ANALYZE`)
