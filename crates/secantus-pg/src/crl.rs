@@ -37,11 +37,14 @@
 //! - a delta list (`2.5.29.27`) is never used either: PostgreSQL sets no
 //!   `X509_V_FLAG_USE_DELTAS`, and OpenSSL's `get_crl_score` passes a delta
 //!   over, so an issuer with only a delta has no list ("unknown ca",
-//!   `X509_V_ERR_UNABLE_TO_GET_CRL`). Measured with OpenSSL 3.5.9 and 4.1.0
-//!   (PostgreSQL 15.20 on each, 2026-11-25, RP-747). PostgreSQL 15.19 on
-//!   Ubuntu's OpenSSL 3.0.13 read it as a full list, which is what this
-//!   reader did until then; the current OpenSSL's answer is the one kept
-//!   (Joe, 2026-11-25).
+//!   `X509_V_ERR_UNABLE_TO_GET_CRL`). Measured with OpenSSL 3.0.22, 3.5.9,
+//!   3.6.5 and 4.1.0 (PostgreSQL 15.20 on each, 2026-11-25, RP-747). Before
+//!   the 2026-08-25 releases (3.0.22, 3.4.7, 3.5.8, 3.6.4, 4.0.2) the
+//!   "don't process deltas" check in `get_crl_score` was the `else` arm of
+//!   the extended-CRL-support test, which PostgreSQL never turns on, so a
+//!   delta was scored as a full list: 3.6.3 measured so, as did Ubuntu's
+//!   3.0.13, and so did this reader until then. Those releases hoisted the
+//!   check, and that answer is the one kept (Joe, 2026-11-25).
 //!
 //! Any other critical extension is refused when the file is read, as
 //! OpenSSL refuses a critical extension it does not handle.

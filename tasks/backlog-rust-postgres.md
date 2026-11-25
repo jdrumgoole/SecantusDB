@@ -335,13 +335,18 @@ one beside it.
       and a reasons-only or indirect list, answer as PostgreSQL 15.19 does.
     - **Scope decision (Joe, 2026-11-25, RP-747): where PostgreSQL's answer
       is its OpenSSL's, the CURRENT OpenSSL's is kept.** A delta list is
-      never a certificate's list (no `X509_V_FLAG_USE_DELTAS`; OpenSSL 3.5.9
-      and 4.1.0 pass it over, so an issuer with only a delta answers
-      "unknown ca"), where PostgreSQL on Ubuntu's OpenSSL 3.0.13 read it as
-      a full list. The login comparisons' references link a current
-      OpenSSL to match: CI builds one (`.github/actions/pg15-current-openssl`,
-      3.5.9), and a developer box uses Homebrew's `postgresql@15` (OpenSSL
-      4) or one built against `openssl@3`.
+      never a certificate's list (no `X509_V_FLAG_USE_DELTAS`; OpenSSL
+      3.0.22, 3.5.9, 3.6.5 and 4.1.0 pass it over, so an issuer with only a
+      delta answers "unknown ca"). Every OpenSSL line has answered so since
+      its 2026-08-25 release (3.0.22, 3.4.7, 3.5.8, 3.6.4, 4.0.2), which
+      fixed `get_crl_score` reaching its delta check only with extended CRL
+      support on; before it (Ubuntu's 3.0.13, Homebrew's 3.6.3) a delta was
+      read as a full list. The login comparisons' references link a fixed
+      OpenSSL to match, and `tests/test_rust_pg_login_differential.py`
+      refuses one that is not by name: CI builds one
+      (`.github/actions/pg15-current-openssl`, 3.5.9), and a developer box
+      uses Homebrew's `postgresql@15` (OpenSSL 4) or one built against a
+      fixed `openssl@3`.
     - **A self-signed root is never checked against the revocation lists**,
       as OpenSSL 3.6 has it (`check_cert_crl` skips it). PostgreSQL linked
       against an older OpenSSL (3.0.13 on Ubuntu 24.04) checks the root as
