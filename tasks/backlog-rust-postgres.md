@@ -1529,22 +1529,29 @@ a regression test.
       permission checks read stop its walk, and a view that depends on a
       dropped column is not seen: its pg_depend rows count as none), the rule
       queries of system views (`pg_stat_*`), the join in psql's `\d`
-      pattern query (`mergejoinscansel`'s operators and its
-      `get_actual_variable_range` probes of a histogram's ends; the nested
-      loop's whole-row scans, whose columns' types the executor looks up,
-      and its inner-unique scan stopping at the first match -- both follow
-      from PostgreSQL's choice of join method, which the walk does not
-      cost), a pattern whose fixed prefix is not all of it (`^(rpc.*)$`,
-      `LIKE 'rpc_t'`: the range conditions and their estimates), ILIKE and
+      pattern query (the nested loop's whole-row scans, whose columns'
+      types the executor looks up, and its inner-unique scan stopping at
+      the first match -- both follow from PostgreSQL's choice of join
+      method, which the walk does not cost), a pattern whose fixed prefix
+      is not all of it (`^(rpc.*)$`, `LIKE 'rpc_t'`: the range conditions
+      and their estimates), ILIKE and
       `~*`, subqueries, CTEs, windows, PL/pgSQL bodies, and texts over 64
       KiB. A pattern whose fixed prefix is all of it becoming the index's
       equality, `COLLATE`'s lookups and `pg_table_is_visible` on the rows a
       scan returns are walked since 2026-11-13 (regression tests
       `tests/backlog/test_rp_catalog_reads.py::test_gap[a pattern's exact
       match is an index condition]` and `::test_gap[psql's pattern on one
-      relation]`). Measured 2026-11-13: `\d rpc_t`'s first query 34
-      counters match, 5 differ (10 of its statement's 24 differed before);
-      a `pg_stat_*` view 16 match, 22 differ.
+      relation]`). Since 2026-11-25 a merge-joinable join clause's
+      `mergejoinscansel` is walked (its family's operators and their
+      functions, each side's range from its statistics,
+      `comparison_ops_are_compatible`, and `ineq_histogram_selectivity`'s
+      probes of a catalog column's index for its actual ends; regression
+      test `test_a_merge_join_clauses_scan_estimate`), ascending only: a
+      descending merge pathkey's `BTGreaterStrategyNumber` call is not, and
+      a table's own index is not probed (its ends stay the histogram's).
+      Measured 2026-11-25: `\d rpc_t`'s first query 37 counters match, 2
+      differ (`pg_namespace`'s scan and `pg_type_oid_index`, the join
+      method's); a `pg_stat_*` view 16 match, 22 differ.
       Backlog-ID: RP-290
       Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view], tests/backlog/test_rp_catalog_reads.py::test_gap[psql's describe query]
 - [ ] **A catalog row added after `initdb` counts no heap block** in

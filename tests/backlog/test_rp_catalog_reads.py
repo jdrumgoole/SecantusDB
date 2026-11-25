@@ -1866,6 +1866,31 @@ def test_a_catalog_scans_types_and_an_io_coercions_functions(rust_pg: Any) -> No
     assert only(got) == only(EXPECTED_GAPS[name])
 
 
+# What `mergejoinscansel` reads for psql's describe query's join clause
+# `n.oid = c.relnamespace`: `get_variable_range`'s and `scalarineqsel`'s
+# `oid <` and `oid <=` (`get_opcode`), `comparison_ops_are_compatible`'s
+# AMOPOPID list of the histogram's `<` and its search for `<=` in oid_ops,
+# and `ineq_histogram_selectivity`'s two probes of `pg_namespace_oid_index`
+# for its actual ends (`get_actual_variable_range`) as `pg_namespace.oid`'s
+# binary search reaches the histogram's first and last bins.
+MERGE_SCANSEL = ("pg_amop_opr_fam_index", "pg_namespace_oid_index", "pg_operator_oid_index")
+
+
+@pytest.mark.backlog_fixed("RP-290")
+def test_a_merge_join_clauses_scan_estimate(rust_pg: Any) -> None:
+    """RP-290 (slice): costing a merge join read nothing of the merge
+    clause's scan estimate (`mergejoinscansel`) beyond its family's `<`
+    and `<=`: not the operators' functions, the histogram operator's
+    families, nor the probes of the column's index for its actual ends."""
+    name = "psql's describe query"
+    got = catalog_reads(_dsn(rust_pg), {name: GAPS[name][2]})[name]
+
+    def only(segments: list[dict[str, list[int]]]) -> list[dict[str, list[int]]]:
+        return [{k: v for k, v in seg.items() if k in MERGE_SCANSEL} for seg in segments]
+
+    assert only(got) == only(EXPECTED_GAPS[name])
+
+
 @pytest.mark.backlog_fixed("RP-316")
 def test_a_built_in_catalogs_first_reads(rust_pg: Any) -> None:
     """RP-316: a new session's first reads of a built-in catalog were not

@@ -199,6 +199,10 @@ thread_local! {
     static FACTS: std::cell::RefCell<FactMemo> = std::cell::RefCell::new(FactMemo::default());
 }
 
+/// A merge-joinable join clause: its operator, and its left and right
+/// columns as `(relation, attnum)`.
+type MergeClause = (i64, (i64, i64), (i64, i64));
+
 /// The walk over one statement.
 pub(crate) struct Model<'a> {
     h: &'a PgHandler,
@@ -230,6 +234,10 @@ pub(crate) struct Model<'a> {
     /// The relations a DDL statement changes, as they stood before it ran
     /// (the walk runs after it).
     pre: Vec<Rel>,
+    /// The statement's merge-joinable join clauses, `(operator, left
+    /// (rel, attnum), right (rel, attnum))`, for the planner's merge join
+    /// costing once the base relations are planned.
+    merge_clauses: Vec<MergeClause>,
 }
 
 fn names_of(nodes: &[pb::Node]) -> Vec<String> {
@@ -281,6 +289,7 @@ impl<'a> Model<'a> {
             depth: 0,
             active_fns: Vec::new(),
             pre: Vec::new(),
+            merge_clauses: Vec::new(),
         }
     }
 
@@ -1908,11 +1917,16 @@ impl<'a> Model<'a> {
             let t = self.expr(l, &scope, true);
             self.coerce(t, INT8, COERCION_IMPLICIT);
         }
-        // The planner, per base relation (a view became its query).
+        // The planner, per base relation (a view became its query), then
+        // the joins: a merge join's cost estimates each merge clause's
+        // scan fractions.
         for (_, rel) in scope.rels.clone() {
             if rel.view.is_none() {
                 self.plan_rel(&rel);
             }
+        }
+        for (opr, l, r) in std::mem::take(&mut self.merge_clauses) {
+            self.mergejoinscansel(opr, l, r, &scope);
         }
         // The executor's Sort, unless the index scan gives the order.
         if !self.index_ordered {
@@ -2463,9 +2477,8 @@ impl<'a> Model<'a> {
 
     /// A join clause between two relations' columns: its operator's merge
     /// join families (`check_mergejoinable`), the type cache's hashing for a
-    /// Memoize (`check_memoizable`), each side's statistics (`eqjoinsel`),
-    /// and the merge join's scan estimate (`mergejoinscansel`: the family's
-    /// `<` and `<=`).
+    /// Memoize (`check_memoizable`), each side's statistics (`eqjoinsel`);
+    /// a merge-joinable one waits for the planner's `mergejoinscansel`.
     fn join_clause(&mut self, opr: i64, l: (i64, i64), r: (i64, i64)) {
         for (rel, att) in [l, r] {
             self.needs.entry(rel).or_default().all.insert(att);
@@ -2482,16 +2495,293 @@ impl<'a> Model<'a> {
         }
         let _ = lt;
         if o.canmerge {
-            if let Some(m) = builtin()
-                .amop_rows
-                .get(&opr)
-                .and_then(|v| v.iter().find(|r| r.method == BTREE_AM && r.strategy == 3))
-                .cloned()
-            {
-                self.opfamily_member(m.family, m.left, m.right, 1);
-                self.opfamily_member(m.family, m.left, m.right, 2);
+            self.merge_clauses.push((opr, l, r));
+        }
+    }
+
+    /// `mergejoinscansel`, as `initial_cost_mergejoin` asks it of a merge
+    /// path's first merge clause sorted ascending (the pathkeys
+    /// `select_outer_pathkeys_for_merge` builds, `BTLessStrategyNumber`):
+    /// the clause's B-tree family's operators, each side's range from its
+    /// statistics (`get_variable_range`), then the four `scalarineqsel`s of
+    /// one side against the other's ends. `sort_inner_and_outer` costs a
+    /// path with each clause first, and `cached_scansel` keeps the answer
+    /// in the clause: once per clause.
+    fn mergejoinscansel(&mut self, opr: i64, l: (i64, i64), r: (i64, i64), scope: &Scope) {
+        let rel_of = |oid: i64| {
+            scope
+                .rels
+                .iter()
+                .find(|(_, r)| r.oid == oid)
+                .map(|(_, r)| r.clone())
+        };
+        let (Some(lrel), Some(rrel)) = (rel_of(l.0), rel_of(r.0)) else {
+            return;
+        };
+        // The pathkey's family: the first of the clause's merge families
+        // (`get_mergejoin_opfamilies`, in AMOPOPID's order).
+        let mut fams: Vec<cf::AmopFact> = builtin()
+            .amop_rows
+            .get(&opr)
+            .map(|v| {
+                v.iter()
+                    .filter(|r| r.method == BTREE_AM && r.strategy == 3 && r.purpose == 's')
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        fams.sort_by_key(|r| r.family);
+        let Some(m) = fams.first().cloned() else {
+            return;
+        };
+        let fam = m.family;
+        // `get_op_opfamily_properties`.
+        self.search(
+            Cache::AmopOpid,
+            vec![K::O(opr), K::N("s".to_string()), K::O(fam)],
+            |_| true,
+        );
+        let (lt, rt) = (m.left, m.right);
+        let ltop = self.opfamily_member(fam, lt, rt, 1);
+        let leop = self.opfamily_member(fam, lt, rt, 2);
+        let (lsortop, rsortop, revltop, revleop) = if lt == rt {
+            (ltop, ltop, ltop, leop)
+        } else {
+            (
+                self.opfamily_member(fam, lt, lt, 1),
+                self.opfamily_member(fam, rt, rt, 1),
+                self.opfamily_member(fam, rt, lt, 1),
+                self.opfamily_member(fam, rt, lt, 2),
+            )
+        };
+        if [ltop, leop, lsortop, rsortop, revltop, revleop].contains(&0) {
+            return;
+        }
+        let (Some(lvar), Some(rvar)) = (self.stat_var(&lrel, l.1), self.stat_var(&rrel, r.1))
+        else {
+            return;
+        };
+        // The clause's input collation: its columns'.
+        let coll = lvar.coll;
+        let Some((lmin, lmax)) = self.variable_range(&lvar, lsortop, coll) else {
+            return;
+        };
+        let Some((rmin, rmax)) = self.variable_range(&rvar, rsortop, coll) else {
+            return;
+        };
+        self.scalarineqsel(leop, &lvar, coll, &rmax);
+        self.scalarineqsel(revleop, &rvar, coll, &lmax);
+        self.scalarineqsel(ltop, &lvar, coll, &rmin);
+        self.scalarineqsel(revltop, &rvar, coll, &lmin);
+    }
+
+    /// `examine_variable` of a plain column: its type, its collation and
+    /// its `pg_statistic` row.
+    fn stat_var(&mut self, rel: &Rel, att: i64) -> Option<StatVar> {
+        let typ = rel.columns.iter().find(|c| c.0 == att)?.2;
+        let mut coll = type_collation(self.h.cr_base_type(typ));
+        // A catalog's collatable column is "C" (its `attcollation`).
+        if rel.catalog && coll != 0 {
+            coll = C_COLLATION;
+        }
+        let stats = if rel.stats.contains(&att) {
+            self.h.cr_column_stats(rel.oid, att)
+        } else {
+            None
+        };
+        Some(StatVar {
+            rel: rel.clone(),
+            att,
+            typ,
+            coll,
+            stats,
+        })
+    }
+
+    /// `get_variable_range`: the column's least and greatest value by
+    /// `sortop`, from its histogram (the one sorted by `sortop` in the
+    /// collation, else any), and its most common values when they hold
+    /// the histogram's ends or, with none, nearly every row.
+    fn variable_range(&mut self, var: &StatVar, sortop: i64, coll: i64) -> Option<(Bson, Bson)> {
+        let st = var.stats.as_ref()?;
+        // `get_opcode`, then `get_typlenbyval`.
+        self.oper_oid(sortop);
+        self.type_oid(var.typ);
+        let lt = |a: &Bson, b: &Bson| op_holds(sortop, a, b);
+        let widen = |vals: &[Bson], range: &mut Option<(Bson, Bson)>| {
+            for v in vals {
+                match range {
+                    None => *range = Some((v.clone(), v.clone())),
+                    Some((lo, hi)) => {
+                        if lt(v, lo) {
+                            *lo = v.clone();
+                        }
+                        if lt(hi, v) {
+                            *hi = v.clone();
+                        }
+                    }
+                }
+            }
+        };
+        let mut range = None;
+        if let Some(h) = st.slot(STATISTIC_KIND_HISTOGRAM, sortop) {
+            if h.coll == coll && !h.values.is_empty() {
+                range = Some((h.values[0].clone(), h.values[h.values.len() - 1].clone()));
             }
         }
+        if range.is_none() {
+            if let Some(h) = st.slot(STATISTIC_KIND_HISTOGRAM, 0) {
+                widen(&h.values, &mut range);
+            }
+        }
+        if let Some(mcv) = st.slot(STATISTIC_KIND_MCV, 0) {
+            let sumcommon: f64 = mcv.numbers.iter().sum();
+            if range.is_some() || sumcommon + st.nullfrac > 0.99999 {
+                widen(&mcv.values, &mut range);
+            }
+        }
+        range
+    }
+
+    /// `scalarineqsel` of `var op constant`: the operator's function
+    /// (`get_opcode`), then the histogram (`ineq_histogram_selectivity`),
+    /// whose binary search asks the column's index for its actual ends
+    /// when it reaches the first or last bin.
+    fn scalarineqsel(&mut self, op: i64, var: &StatVar, coll: i64, konst: &Bson) {
+        let Some(st) = var.stats.as_ref() else {
+            return;
+        };
+        self.oper_oid(op);
+        let Some(h) = st.slot(STATISTIC_KIND_HISTOGRAM, 0) else {
+            return;
+        };
+        let n = h.values.len();
+        if n <= 1 || h.coll != coll || !self.comparison_ops_are_compatible(h.op, op) {
+            return;
+        }
+        let mut values = h.values.clone();
+        let staop = h.op;
+        if n == 2 {
+            self.actual_variable_range(var, staop, coll, true, true, &mut values);
+        }
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let probe = (lo + hi) / 2;
+            if probe == 0 && n > 2 {
+                self.actual_variable_range(var, staop, coll, true, false, &mut values);
+            } else if probe == n - 1 && n > 2 {
+                self.actual_variable_range(var, staop, coll, false, true, &mut values);
+            }
+            if op_holds(op, &values[probe], konst) {
+                lo = probe + 1;
+            } else {
+                hi = probe;
+            }
+        }
+    }
+
+    /// `comparison_ops_are_compatible`: the same operator, or one of the
+    /// first's B-tree or hash families holds the second
+    /// (`op_in_opfamily`).
+    fn comparison_ops_are_compatible(&mut self, op1: i64, op2: i64) -> bool {
+        if op1 == op2 {
+            return true;
+        }
+        self.amop_list(op1);
+        let mut members: Vec<(char, i64, i64)> = builtin()
+            .amop_rows
+            .get(&op1)
+            .map(|v| v.iter().map(|r| (r.purpose, r.family, r.method)).collect())
+            .unwrap_or_default();
+        members.sort();
+        for (_, fam, method) in members {
+            if method != BTREE_AM && method != HASH_AM {
+                continue;
+            }
+            let found = builtin()
+                .amop_by_opr
+                .get(&op2)
+                .is_some_and(|v| v.iter().any(|(p, f)| *p == 's' && *f == fam));
+            self.search(
+                Cache::AmopOpid,
+                vec![K::O(op2), K::N("s".to_string()), K::O(fam)],
+                |_| found,
+            );
+            if found {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `get_actual_variable_range`: the first B-tree of the relation
+    /// (no predicate, its collation the clause's) whose leading column is
+    /// the variable and whose family sorts by `sortop`, scanned from each
+    /// end asked for to its first live entry
+    /// (`get_actual_variable_endpoint`, an index-only read that visits the
+    /// heap only off an all-visible block). The ends found replace the
+    /// histogram's. A table's own index is not counted here, so its ends
+    /// stay the histogram's.
+    fn actual_variable_range(
+        &mut self,
+        var: &StatVar,
+        sortop: i64,
+        coll: i64,
+        min: bool,
+        max: bool,
+        values: &mut [Bson],
+    ) -> bool {
+        for ix in var.rel.indexes.clone() {
+            if ix.am != BTREE_AM || ix.keys.first() != Some(&var.att) || var.coll != coll {
+                continue;
+            }
+            let Some(o) = ix.classes.first().and_then(|c| self.h.cr_opclass(*c)) else {
+                continue;
+            };
+            // `get_op_opfamily_strategy`.
+            let strategy = builtin()
+                .amop_rows
+                .get(&sortop)
+                .and_then(|v| v.iter().find(|r| r.family == o.family && r.purpose == 's'))
+                .map_or(0, |r| r.strategy);
+            self.search(
+                Cache::AmopOpid,
+                vec![K::O(sortop), K::N("s".to_string()), K::O(o.family)],
+                |_| strategy != 0,
+            );
+            if strategy != 1 && strategy != 5 {
+                continue;
+            }
+            self.type_oid(var.typ);
+            if !var.rel.catalog {
+                return false;
+            }
+            let Some((least, greatest)) = self.h.cr_column_extremes(&var.rel, var.att) else {
+                return false;
+            };
+            // In the sort operator's order: `>` sorts greatest first.
+            let (first, last) = if strategy == 1 {
+                (least, greatest)
+            } else {
+                (greatest, least)
+            };
+            let key = |v: &Bson| match v {
+                Bson::String(s) => K::N(s.clone()),
+                v => K::O(crate::bson_i64(v).unwrap_or_default()),
+            };
+            if min {
+                self.exec
+                    .push(Scan::IndexOnly(ix.oid, vec![key(&first)], 1));
+                values[0] = first;
+            }
+            if max {
+                self.exec.push(Scan::IndexOnly(ix.oid, vec![key(&last)], 1));
+                let n = values.len();
+                values[n - 1] = last;
+            }
+            return true;
+        }
+        false
     }
 
     /// `oper`: the exact match first, then the candidates.
@@ -3238,6 +3528,90 @@ const DEFAULT_COLLATION: i64 = 100;
 /// The database encoding (`GetDatabaseEncoding`): UTF8.
 const DATABASE_ENCODING: i64 = 6;
 
+/// `pg_statistic`'s slot kinds (`STATISTIC_KIND_*`).
+const STATISTIC_KIND_MCV: i64 = 1;
+const STATISTIC_KIND_HISTOGRAM: i64 = 2;
+
+/// One `pg_statistic` slot: `stakindN`, `staopN`, `stacollN`,
+/// `stanumbersN`, `stavaluesN`.
+#[derive(Debug, Clone)]
+pub(crate) struct StatSlot {
+    pub kind: i64,
+    pub op: i64,
+    pub coll: i64,
+    pub numbers: Vec<f64>,
+    pub values: Vec<Bson>,
+}
+
+/// A column's `pg_statistic` row, as the planner reads it.
+#[derive(Debug, Clone)]
+pub(crate) struct ColumnStats {
+    pub nullfrac: f64,
+    pub slots: Vec<StatSlot>,
+}
+
+impl ColumnStats {
+    /// `get_attstatsslot`: the first slot of the kind (and, unless 0, the
+    /// operator).
+    fn slot(&self, kind: i64, op: i64) -> Option<&StatSlot> {
+        self.slots
+            .iter()
+            .find(|s| s.kind == kind && (op == 0 || s.op == op))
+    }
+}
+
+/// `examine_variable`'s answer for one column.
+#[derive(Debug, Clone)]
+struct StatVar {
+    rel: Rel,
+    att: i64,
+    typ: i64,
+    coll: i64,
+    stats: Option<ColumnStats>,
+}
+
+/// A number's value as a double.
+fn num_f64(v: &Bson) -> Option<f64> {
+    match v {
+        Bson::Double(f) => Some(*f),
+        v => crate::bson_i64(v).map(|n| n as f64),
+    }
+}
+
+/// Two statistics values compared as their type's B-tree does under "C":
+/// numbers by value, strings by their bytes.
+fn compare_values(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Bson::String(x), Bson::String(y)) => Some(x.as_bytes().cmp(y.as_bytes())),
+        (Bson::Boolean(x), Bson::Boolean(y)) => Some(x.cmp(y)),
+        (Bson::Double(x), _) => x.partial_cmp(&num_f64(b)?),
+        (_, Bson::Double(y)) => num_f64(a)?.partial_cmp(y),
+        _ => Some(crate::bson_i64(a)?.cmp(&crate::bson_i64(b)?)),
+    }
+}
+
+/// Whether the B-tree comparison operator `op` holds of `a op b`, by its
+/// strategy in its family (`<`, `<=`, `=`, `>=`, `>`).
+fn op_holds(op: i64, a: &Bson, b: &Bson) -> bool {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    let strategy = builtin()
+        .amop_rows
+        .get(&op)
+        .and_then(|v| v.iter().find(|r| r.method == BTREE_AM && r.purpose == 's'))
+        .map_or(0, |r| r.strategy);
+    let Some(o) = compare_values(a, b) else {
+        return false;
+    };
+    match strategy {
+        1 => o == Less,
+        2 => o != Greater,
+        3 => o == Equal,
+        4 => o != Less,
+        5 => o == Greater,
+        _ => false,
+    }
+}
+
 /// `typcollation` of a base type: `name` sorts by "C", the string types by
 /// the database's default, every other type has none.
 fn type_collation(base: i64) -> i64 {
@@ -3926,6 +4300,67 @@ impl PgHandler {
     }
 
     /// How many rows a catalog holds: what a sequential scan returns.
+    /// A column's `pg_statistic` row, its slots parsed.
+    pub(crate) fn cr_column_stats(&self, rel: i64, att: i64) -> Option<ColumnStats> {
+        let d = self.column_statistic(rel, att)?;
+        let f64_of = |b: &Bson| num_f64(b).unwrap_or(0.0);
+        let int = |k: &str| d.get(k).and_then(crate::bson_i64).unwrap_or(0);
+        let mut slots = Vec::new();
+        for n in 1..=5 {
+            let kind = int(&format!("stakind{n}"));
+            if kind == 0 {
+                continue;
+            }
+            let list = |k: String| match d.get(&k) {
+                Some(Bson::Array(a)) => a.clone(),
+                _ => Vec::new(),
+            };
+            slots.push(StatSlot {
+                kind,
+                op: int(&format!("staop{n}")),
+                coll: int(&format!("stacoll{n}")),
+                numbers: list(format!("stanumbers{n}")).iter().map(f64_of).collect(),
+                values: list(format!("stavalues{n}")),
+            });
+        }
+        Some(ColumnStats {
+            nullfrac: d.get("stanullfrac").map_or(0.0, f64_of),
+            slots,
+        })
+    }
+
+    /// A catalog column's least and greatest live value, as its index's
+    /// two ends hold them.
+    pub(crate) fn cr_column_extremes(&self, rel: &Rel, att: i64) -> Option<(Bson, Bson)> {
+        let def = self.catalog_def(&rel.name)?;
+        let name = &rel.columns.iter().find(|c| c.0 == att)?.1;
+        let field = def.field_of(name)?;
+        let rows = self.catalog_rows_keyed(&rel.name, None)?;
+        let mut range: Option<(Bson, Bson)> = None;
+        for v in rows.iter().filter_map(|r| r.get(&field)) {
+            if matches!(v, Bson::Null) {
+                continue;
+            }
+            range = match range {
+                None => Some((v.clone(), v.clone())),
+                Some((lo, hi)) => {
+                    let lo = if compare_values(v, &lo) == Some(std::cmp::Ordering::Less) {
+                        v.clone()
+                    } else {
+                        lo
+                    };
+                    let hi = if compare_values(v, &hi) == Some(std::cmp::Ordering::Greater) {
+                        v.clone()
+                    } else {
+                        hi
+                    };
+                    Some((lo, hi))
+                }
+            };
+        }
+        range
+    }
+
     pub(crate) fn cr_catalog_rows(&self, rel: &Rel) -> i64 {
         // Counted, not filled: a count needs no column's value (RP-715).
         self.catalog_row_count(&rel.name).map_or(0, |n| n as i64)
