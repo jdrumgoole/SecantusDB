@@ -25,11 +25,10 @@
 //! `change_stream_rewrite_helpers.cpp` rewrites it.
 //!
 //! So are a `$match` on `documentKey`, (inexactly) on `fullDocument`, on
-//! `ns` and `to`, and an `$expr` on `operationType` (RM-698). Not
-//! reproduced: the rewrites of `updateDescription`,
+//! `ns` and `to`, and an `$expr` on `operationType`, `documentKey`, `ns`
+//! or `to` (RM-698). Not reproduced: the rewrites of `updateDescription`,
 //! `fullDocumentBeforeChange`, the renamed `clusterTime` / `lsid` /
-//! `txnNumber`, and of an `$expr` on any field but `operationType`
-//! (RM-698), and the
+//! `txnNumber`, and of an `$expr` on those (RM-698), and the
 //! change stream's `queryShapeHash` (RM-454). The unwind's filter goes through
 //! mongod's Boolean simplifier (`simplify.rs`, RM-699).
 
@@ -96,6 +95,12 @@ enum Leaf {
     Exists,
     In,
     Type,
+    /// The `$_internalExpr*` twins the optimizer derives from an `$expr`.
+    ExprEq,
+    ExprGt,
+    ExprGte,
+    ExprLt,
+    ExprLte,
 }
 
 impl Leaf {
@@ -110,6 +115,11 @@ impl Leaf {
             Leaf::Exists => 12,
             Leaf::In => 13,
             Leaf::Type => 20,
+            Leaf::ExprEq => 30,
+            Leaf::ExprGt => 31,
+            Leaf::ExprGte => 32,
+            Leaf::ExprLt => 33,
+            Leaf::ExprLte => 34,
         }
     }
 
@@ -124,6 +134,11 @@ impl Leaf {
             Leaf::Exists => "$exists",
             Leaf::In => "$in",
             Leaf::Type => "$type",
+            Leaf::ExprEq => "$_internalExprEq",
+            Leaf::ExprGt => "$_internalExprGt",
+            Leaf::ExprGte => "$_internalExprGte",
+            Leaf::ExprLt => "$_internalExprLt",
+            Leaf::ExprLte => "$_internalExprLte",
         }
     }
 }
@@ -595,7 +610,11 @@ fn matches_missing(u: &U) -> bool {
     match u {
         U::Eq(_, v) => matches!(v, Bson::Null),
         U::In(_, vs, _) => vs.iter().any(|v| matches!(v, Bson::Null)),
-        U::Other(_, op, v) => matches!(op.as_str(), "$gte" | "$lte") && matches!(v, Bson::Null),
+        U::Other(_, op, v) => {
+            (matches!(op.as_str(), "$gte" | "$lte") && matches!(v, Bson::Null))
+                // Missing sorts below every value in an expression.
+                || matches!(op.as_str(), "$_internalExprLt" | "$_internalExprLte")
+        }
         _ => false,
     }
 }
@@ -612,8 +631,13 @@ fn renamed(u: &U, to: &str) -> Option<M> {
         U::Eq(p, v) => M::Leaf(path(p), Leaf::Eq, v.clone()),
         U::In(p, vs, res) if res.is_empty() => M::Leaf(path(p), Leaf::In, Bson::Array(vs.clone())),
         U::Exists(p) => M::Leaf(path(p), Leaf::Exists, Bson::Boolean(true)),
+        U::ExprEq(p, v) => M::Leaf(path(p), Leaf::ExprEq, v.clone()),
         U::Other(p, op, v) => {
             let kind = match op.as_str() {
+                "$_internalExprGt" => Leaf::ExprGt,
+                "$_internalExprGte" => Leaf::ExprGte,
+                "$_internalExprLt" => Leaf::ExprLt,
+                "$_internalExprLte" => Leaf::ExprLte,
                 "$lt" => Leaf::Lt,
                 "$lte" => Leaf::Lte,
                 "$gt" => Leaf::Gt,
@@ -1186,10 +1210,14 @@ fn rewrite(u: &U, inexact: bool) -> Option<M> {
             Some("fullDocument") if inexact => rewrite_full_document(u),
             _ => None,
         },
-        U::ExprEq(p, v) if p == "operationType" => {
-            rewrite_operation_type(&U::Eq(p.clone(), v.clone()), p)
+        // `documentKey` and `fullDocument` keep the twin's operator (their
+        // rewrites rename the predicate); every other field rewrites it as
+        // the equality.
+        U::ExprEq(p, _) if p.split('.').next() == Some("documentKey") => rewrite_document_key(u),
+        U::ExprEq(p, _) if p.split('.').next() == Some("fullDocument") => {
+            inexact.then(|| rewrite_full_document(u)).flatten()
         }
-        U::ExprEq(..) => None,
+        U::ExprEq(p, v) => rewrite(&U::Eq(p.clone(), v.clone()), inexact),
         U::Expr(e) => match rewrite_agg(e, inexact)? {
             Bson::Document(d) => Some(M::Expr(d)),
             _ => None,
@@ -1254,14 +1282,116 @@ fn operation_type_expr() -> Bson {
     } })
 }
 
-/// mongod's `rewriteAggExpressionTree`, for the field this server rewrites
-/// in an expression: `operationType`. An `$and` drops a child it cannot
+/// `$documentKey[.rest]` as an expression over the oplog entry (mongod's
+/// `exprRewriteDocumentKey`): `o` of a delete, `o2` of an insert or update.
+fn document_key_expr(rest: Option<&str>) -> Bson {
+    let at = |f: &str| match rest {
+        Some(r) => format!("${f}.{r}"),
+        None => format!("${f}"),
+    };
+    Bson::Document(doc! { "$switch": {
+        "branches": [
+            { "case": { "$eq": ["$op", { "$const": "d" }] }, "then": at("o") },
+            { "case": { "$in": ["$op", { "$const": ["i", "u"] }] }, "then": at("o2") },
+        ],
+        "default": "$$REMOVE",
+    } })
+}
+
+/// `$ns`, `$ns.db` or `$ns.coll` as an expression over the oplog entry
+/// (mongod's `exprRewriteNs`); `None` for any other path under `ns`.
+fn namespace_expr(rest: Option<&str>) -> Option<Bson> {
+    let after_db = |field: &str| {
+        doc! { "$substrBytes": [
+            field,
+            { "$add": [{ "$strLenBytes": ["$$dbName"] }, { "$const": 1 }] },
+            { "$const": -1 },
+        ] }
+    };
+    let field = |name: &str| {
+        let f = format!("$o.{name}");
+        doc! { "case": { "$ne": [f.clone(), "$$REMOVE"] }, "then": f }
+    };
+    let coll = || {
+        Bson::Document(doc! { "$switch": {
+            "branches": [
+                { "case": { "$in": ["$op", { "$const": ["i", "u", "d"] }] }, "then": after_db("$ns") },
+                { "case": { "$ne": ["$op", { "$const": "c" }] }, "then": "$$REMOVE" },
+                { "case": { "$ne": ["$o.dropDatabase", "$$REMOVE"] }, "then": "$$REMOVE" },
+                { "case": { "$ne": ["$o.renameCollection", "$$REMOVE"] }, "then": after_db("$o.renameCollection") },
+                field("drop"),
+                field("create"),
+                field("createIndexes"),
+                field("commitIndexBuild"),
+                field("startIndexBuild"),
+                field("abortIndexBuild"),
+                field("dropIndexes"),
+                field("collMod"),
+            ],
+            "default": "$$REMOVE",
+        } })
+    };
+    let inner = match rest {
+        None => Bson::Document(doc! { "db": "$$dbName", "coll": coll() }),
+        Some("db") => Bson::String("$$dbName".into()),
+        Some("coll") => coll(),
+        Some(_) => return None,
+    };
+    Some(Bson::Document(doc! { "$let": {
+        "vars": { "dbName": { "$substrBytes": [
+            "$ns", { "$const": 0 }, { "$indexOfBytes": ["$ns", { "$const": "." }] },
+        ] } },
+        "in": inner,
+    } }))
+}
+
+/// `$to`, `$to.db` or `$to.coll` as an expression over the oplog entry
+/// (mongod's `exprRewriteTo`): parts of a rename's `o.to`; `None` for any
+/// other path under `to`.
+fn to_expr(rest: Option<&str>) -> Option<Bson> {
+    let dot = doc! { "$indexOfBytes": ["$o.to", { "$const": "." }] };
+    let db = doc! { "$substrBytes": ["$o.to", { "$const": 0 }, dot.clone()] };
+    let coll = doc! { "$substrBytes": [
+        "$o.to", { "$add": [dot, { "$const": 1 }] }, { "$const": -1 },
+    ] };
+    let value = match rest {
+        None => Bson::Document(doc! { "db": db, "coll": coll }),
+        Some("db") => Bson::Document(db),
+        Some("coll") => Bson::Document(coll),
+        Some(_) => return None,
+    };
+    Some(Bson::Document(doc! { "$cond": [
+        { "$and": [{ "$eq": ["$op", { "$const": "c" }] }, { "$ne": ["$o.to", "$$REMOVE"] }] },
+        value,
+        "$$REMOVE",
+    ] }))
+}
+
+/// A field path of the event as an expression over the oplog entry, for
+/// the fields mongod rewrites in an expression; `fullDocument` and the
+/// rest are not.
+fn event_path_expr(p: &str) -> Option<Bson> {
+    let (head, rest) = match p.split_once('.') {
+        Some((h, r)) => (h, Some(r)),
+        None => (p, None),
+    };
+    match head {
+        "operationType" if rest.is_none() => Some(operation_type_expr()),
+        "documentKey" => Some(document_key_expr(rest)),
+        "ns" => namespace_expr(rest),
+        "to" => to_expr(rest),
+        _ => None,
+    }
+}
+
+/// mongod's `rewriteAggExpressionTree`, for the fields this server rewrites
+/// in an expression: `operationType`, `documentKey`, `ns` and `to`. An `$and` drops a child it cannot
 /// rewrite when the rewrite may be inexact; anything else needs all of its
 /// paths rewritten. Constants print as `$const`, as the optimizer leaves
 /// them. `None` is no rewrite.
 fn rewrite_agg(e: &Bson, inexact: bool) -> Option<Bson> {
     if let Some(p) = field_path(e) {
-        return (p == "operationType").then(operation_type_expr);
+        return event_path_expr(p);
     }
     if let Some(c) = constant(e) {
         return Some(Bson::Document(doc! { "$const": c }));
