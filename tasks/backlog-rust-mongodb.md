@@ -2076,9 +2076,9 @@ mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
 - [ ] **RUST MongoDB server: a `$match` after a `$changeStream` on an
-      event field other than `operationType`, `documentKey`, `fullDocument`
-      or `ns` is not rewritten into the oplog filter.** mongod 8.2.11
-      rewrites predicates on `to`, a regex on `ns`, `updateDescription`,
+      event field other than `operationType`, `documentKey`, `fullDocument`,
+      `ns` or `to` is not rewritten into the oplog filter.** mongod 8.2.11
+      rewrites a regex on `ns` or `to`, `updateDescription`,
       `fullDocumentBeforeChange`, the renamed `clusterTime` / `lsid` /
       `txnNumber` (also into the transaction filter), and an `$expr` over
       them, and adds them to the read's filter (`ns.coll: "c"`: `queryHash`
@@ -2089,8 +2089,9 @@ would see them. What is left:
       paths is still dropped, not renamed. The second slice (2026-11-24)
       ported `matchRewriteGenericNamespace` for `ns` by `$eq` / `$in`; a
       regex on `ns.db` / `ns.coll` (mongod's `$expr` of `$regexMatch` over
-      `$substrBytes`, hash EE5C1E5A for `^c`) and `to` (the same helper over
-      `o.to` / `o.renameCollection`) are left. The rest of
+      `$substrBytes`, hash EE5C1E5A for `^c`) is left. The third slice
+      (2026-11-25) ported it for `to` by `$eq` / `$in` (`o.to` of a
+      command); a regex on `to` is left the same way. The rest of
       `change_stream_rewrite_helpers.cpp` (the regex half of
       `matchRewriteGenericNamespace`,
       `matchRewriteUpdateDescription`, `rewriteAggExpressionTree`) is to
@@ -2133,18 +2134,21 @@ cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: a time-series read under a collation, or over
-      a collection with an index of its own, reads the collection at the
-      command.** Under `{locale: "en"}`, mongod 8.2.11 reads through its
-      cursor stage, 32 buckets first, and returns 2,303 more after the
-      delete; this server reads it whole: 3,999. So too any read of a
-      collection with an index besides the default one, and a hint to
-      any index but the default one (a hint to `m_1_t_1` or `{$natural: 1}`
-      matches since 2026-11-25). An index `createIndexes` adds is kept on
-      the collection only, `dropIndexes` leaves the bucket copy of
-      `m_1_t_1` in place, and `collStats` still reports index sizes of 0.
-      Found while working RM-457, 2026-11-15.
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_under_a_collation_buffers_its_buckets
+- [ ] **RUST MongoDB server: a time-series read over a collection with an
+      index of its own reads the collection at the command.** With an
+      index `{v: 1}` beside the default one, an unindexed filter's read:
+      mongod 8.2.11 reads through its cursor stage, 32 buckets first, and
+      returns 2,303 more after the delete; this server reads it whole:
+      3,999. So too a hint to any index but the default one (a hint to
+      `m_1_t_1` or `{$natural: 1}` matches since 2026-11-25, and a read
+      under a collation since 2026-11-25, unless its filter holds a string
+      or names the meta field: those still read whole, as the bucket
+      bounds and the index over the buckets compare without the
+      collation). An index `createIndexes` adds is kept on the collection
+      only, `dropIndexes` leaves the bucket copy of `m_1_t_1` in place, and
+      `collStats` still reports index sizes of 0. Found while working
+      RM-457, 2026-11-15.
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_beside_an_index_of_its_own_buffers_its_buckets
       Backlog-ID: RM-701
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every

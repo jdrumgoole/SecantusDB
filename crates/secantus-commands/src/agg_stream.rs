@@ -573,8 +573,8 @@ fn includes_only(spec: &Bson) -> bool {
 
 /// The cursor of a pipeline over a time-series collection: its buckets read
 /// through the cursor stage, each unpacked as the cursor reaches it
-/// (`ts_buckets::BucketScan`, RM-348). Read whole instead: under a hint or
-/// a collation, when the filter names the meta field or the collection has
+/// (`ts_buckets::BucketScan`, RM-348). Read whole instead: under a hint to
+/// another index, a collation over a string bound, when the filter names the meta field or the collection has
 /// an index of its own (mongod could read an index over the buckets), and
 /// for any other stage.
 fn time_series(
@@ -625,8 +625,7 @@ fn time_series(
         .get(lead)
         .is_some_and(|s| groups_on_meta(s, meta.as_deref()) || counts_stage(s))
         && ask.pipeline[lead + 1..].iter().all(fits);
-    if ask.collation.is_some()
-        || !(per_bucket || only_projects || meta_group || ask.pipeline.iter().all(fits))
+    if !(per_bucket || only_projects || meta_group || ask.pipeline.iter().all(fits))
         || ask.pipeline.iter().any(mentions_meta)
     {
         return Ok(None);
@@ -685,12 +684,23 @@ fn time_series(
     };
     let default_index = default_index.map(|(name, _)| name);
     let filter = crate::explain::pipeline_canonical(ask.coll, ask.pipeline).filter;
+    // Under a collation the buckets are read in order through the cursor
+    // stage, as with none (measured 8.2.11: 2,303 after the delete, RM-701),
+    // each batch matched under it. A string bound would prune buckets on
+    // `control.min` / `control.max`, which compare without the collation,
+    // and an index over the buckets carries the simple one: read whole.
+    if ask.collation.is_some() && (hinted || has_string(&Bson::Document(filter.clone()))) {
+        return Ok(None);
+    }
     let Some(scan) = crate::ts_buckets::BucketScan::of(storage, ask.db, ask.coll, ask.ns, &filter)?
     else {
         return Ok(None);
     };
     // A filter on the meta field is mongod's scan of the default index
     // over the buckets (RM-457).
+    if ask.collation.is_some() && scan.filters_meta() {
+        return Ok(None);
+    }
     let scan = if hinted || scan.filters_meta() {
         match default_index {
             Some(name) => match scan.through_index(storage, &name).map_err(read_error)? {
@@ -717,6 +727,16 @@ fn time_series(
         .iter()
         .any(|s| matches!(stage_name(s), "$sort" | "$group" | "$count"));
     Ok(Some((cursor, Vec::new())))
+}
+
+/// `v` is, or holds, a string (a symbol or a regex among them).
+fn has_string(v: &Bson) -> bool {
+    match v {
+        Bson::String(_) | Bson::Symbol(_) | Bson::RegularExpression(_) => true,
+        Bson::Document(d) => d.values().any(has_string),
+        Bson::Array(a) => a.iter().any(has_string),
+        _ => false,
+    }
 }
 
 /// `hint` names index `name` (key `key`): its name, or its key pattern.
