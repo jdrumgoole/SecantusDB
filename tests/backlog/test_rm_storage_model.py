@@ -1505,6 +1505,14 @@ def _served_after_mongods_restart(store: Path, port: int, tmp_path: Path) -> dic
         assert mongod is not None, "mongod refused its own store"
         with _mongod_answers(copy):
             _until_primary(mongod)
+            # A build the store was killed in is finished by the restart after
+            # the node is primary: its record in `config.system.indexBuilds`
+            # goes when it has, and a snapshot before that differs from the
+            # one of a server that has finished (it flaked, one run in three).
+            deadline = time.monotonic() + 60
+            while mongod.config["system.indexBuilds"].count_documents({}):
+                assert time.monotonic() < deadline, "mongod's restart never finished the build"
+                time.sleep(0.2)
             return _store_contents(mongod)
     finally:
         _stop_mongod(proc, mongod)

@@ -3885,6 +3885,32 @@ fn index_spec_fields_problem(spec: &Document) -> Option<CommandError> {
                         "The 'wildcardProjection' field can't be an empty object",
                     ));
                 }
+                // A compound wildcard key's other fields are indexed whole: a
+                // projection may not include any of them (or what holds one).
+                let included = |v: &Bson| {
+                    !matches!(v, Bson::Boolean(false))
+                        && crate::util::truthy_number_or_bool(v) != Some(false)
+                };
+                for field in key.iter().flat_map(|k| k.keys()).filter(|f| *f != "$**") {
+                    let overlap = projection.iter().find(|(path, v)| {
+                        included(v)
+                            && (field == *path
+                                || field
+                                    .strip_prefix(path.as_str())
+                                    .is_some_and(|r| r.starts_with('.')))
+                    });
+                    if let Some((path, _)) = overlap {
+                        return Some(in_spec(
+                            7_246_208,
+                            "Location7246208",
+                            &format!(
+                                "Index Key and Wildcard Projection cannot contain overlapping \
+                                 fields, however '{field}' index field is overlapping with \
+                                 '{path}' wildcardProjection path"
+                            ),
+                        ));
+                    }
+                }
             }
             _ => {}
         }
@@ -6446,6 +6472,15 @@ mod index_spec_fields_tests {
         assert_eq!(wp(doc! {"$**": 1}, doc! {"a": 1}.into()), None);
         // A compound wildcard key takes one.
         assert_eq!(wp(doc! {"a": 1, "$**": 1}, doc! {"b": 1}.into()), None);
+        assert_eq!(
+            wp(doc! {"a": 1, "$**": 1}, doc! {"a": 1}.into()),
+            Some(7_246_208)
+        );
+        assert_eq!(wp(doc! {"a": 1, "$**": 1}, doc! {"a": 0}.into()), None);
+        assert_eq!(
+            wp(doc! {"a.b": 1, "$**": 1}, doc! {"a": 1}.into()),
+            Some(7_246_208)
+        );
         assert_eq!(wp(doc! {"a": 1, "b.$**": 1}, doc! {"b": 1}.into()), Some(9));
     }
 }
