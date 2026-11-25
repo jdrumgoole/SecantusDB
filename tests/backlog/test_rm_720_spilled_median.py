@@ -22,7 +22,15 @@ def _spilled_medians(client: Any, budget: int = 150_000) -> tuple:
     db = client.rm720spill
     # Three groups, interleaved, of 15000 values each: every group's buffer
     # flushes twice, so its digest holds merged centroids when it spills.
-    db.c.insert_many([{"k": i % 3, "n": (i * 7919) % 30011 * 0.37} for i in range(45_000)])
+    # A digest's answer depends on the order of its input, so the `_id`s
+    # the `$sort` orders by are given, not pymongo's ObjectIds: their 24-bit
+    # counter starts at random and wraps, and a wrap inside the insert
+    # reorders the documents within that second. One did on mongod's side
+    # alone in CI (PR #2997, 2026-11-25: 5555.65219047619 against
+    # 5551.62724489796), and a wrap at 40000 here moves group 0 to 5554.96.
+    db.c.insert_many(
+        [{"_id": i, "k": i % 3, "n": (i * 7919) % 30011 * 0.37} for i in range(45_000)]
+    )
     pipeline = [
         {"$sort": {"_id": 1}},
         {
@@ -54,7 +62,9 @@ def _spilled_medians(client: Any, budget: int = 150_000) -> tuple:
 def _one_group(client: Any) -> tuple:
     client.drop_database("rm720one")
     db = client.rm720one
-    db.c.insert_many([{"n": (i * 7919) % 30011 * 0.37} for i in range(30_000)])
+    # Given `_id`s, as in `_spilled_medians`: the `$sort` must not depend on
+    # where pymongo's ObjectId counter wraps.
+    db.c.insert_many([{"_id": i, "n": (i * 7919) % 30011 * 0.37} for i in range(30_000)])
     group = {"_id": None, "m": {"$median": {"input": "$n", "method": "approximate"}}}
     client.admin.command({"setParameter": 1, "internalDocumentSourceGroupMaxMemoryBytes": 70_000})
     db.command({"profile": 2})
