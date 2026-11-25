@@ -137,6 +137,8 @@ enum M {
     Leaf(String, Leaf, Bson),
     Not(Box<M>),
     ElemObject(String, Box<M>),
+    /// `$expr` of an aggregation expression, as `parsedQuery` prints it.
+    Expr(Document),
 }
 
 impl M {
@@ -148,6 +150,7 @@ impl M {
             M::Leaf(_, leaf, _) => leaf.rank(),
             M::Not(_) => 18,
             M::Nor(_) => 19,
+            M::Expr(_) => 23,
             M::False => 24,
             M::True => 25,
         }
@@ -164,7 +167,7 @@ impl M {
         match self {
             M::And(c) | M::Or(c) | M::Nor(c) => c,
             M::Not(c) | M::ElemObject(_, c) => std::slice::from_ref(&**c),
-            M::Leaf(..) | M::True | M::False => &[],
+            M::Leaf(..) | M::Expr(_) | M::True | M::False => &[],
         }
     }
 
@@ -260,6 +263,7 @@ impl M {
             M::Leaf(path, leaf, value) => doc! { path.clone(): { leaf.op(): value.clone() } },
             M::True => doc! { "$alwaysTrue": 1 },
             M::False => doc! { "$alwaysFalse": 1 },
+            M::Expr(e) => doc! { "$expr": e.clone() },
             // A `$not` of a tree prints as the `$nor` of it.
             M::Not(child) if !matches!(**child, M::Leaf(..)) => doc! { "$nor": [child.to_doc()] },
             M::Not(child) => {
@@ -479,6 +483,18 @@ impl U {
                         _ => U::Opaque,
                     },
                     "$exists" => U::Exists(path.to_string()),
+                    // A `$regex` takes its `$options` with it.
+                    "$regex" => match (arg, ops.get("$options")) {
+                        (Bson::String(pattern), Some(Bson::String(options))) => U::Other(
+                            path.to_string(),
+                            op.to_string(),
+                            Bson::RegularExpression(bson::Regex {
+                                pattern: pattern.clone(),
+                                options: options.clone(),
+                            }),
+                        ),
+                        _ => U::Other(path.to_string(), op.to_string(), arg.clone()),
+                    },
                     _ => U::Other(path.to_string(), op.to_string(), arg.clone()),
                 }
             };
@@ -673,10 +689,127 @@ fn on_regex(path: &str, patterns: &[String], many: bool) -> M {
     }
 }
 
+/// The commands that name a collection in `o`, in the order mongod's
+/// `matchRewriteGenericNamespace` lists them for a regex (an `$expr`
+/// sorts by nothing, so the order shows).
+const REGEX_COMMANDS: [&str; 8] = [
+    "drop",
+    "create",
+    "createIndexes",
+    "commitIndexBuild",
+    "startIndexBuild",
+    "abortIndexBuild",
+    "dropIndexes",
+    "collMod",
+];
+
+/// A regex predicate's pattern and options: `{$regex}` (with its
+/// `$options`) or a bare regex value.
+fn regex_of(u: &U) -> Option<(String, String)> {
+    match u {
+        U::Eq(_, Bson::RegularExpression(r)) => Some((r.pattern.clone(), r.options.clone())),
+        U::Other(_, op, v) if op == "$regex" => match v {
+            Bson::String(p) => Some((p.clone(), String::new())),
+            Bson::RegularExpression(r) => Some((r.pattern.clone(), r.options.clone())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Which part of a namespace string a regex is matched against.
+#[derive(Clone, Copy)]
+enum Part {
+    Whole,
+    Db,
+    Coll,
+}
+
+/// mongod's `$expr` for a regex on a namespace held as a string in
+/// `field`: the string (or its part before / after the first dot) by
+/// `$regexMatch`, and nothing when the field is no string.
+fn ns_regex(field: &str, part: Part, (pattern, options): &(String, String)) -> M {
+    let dot = doc! { "$ifNull": [
+        { "$indexOfBytes": ["$$oplogField", { "$const": "." }] },
+        { "$const": 0_i32 },
+    ] };
+    let input = match part {
+        Part::Whole => Bson::String("$$oplogField".into()),
+        Part::Db => Bson::Document(doc! {
+            "$substrBytes": ["$$oplogField", { "$const": 0_i32 }, dot]
+        }),
+        Part::Coll => Bson::Document(doc! {
+            "$substrBytes": [
+                "$$oplogField",
+                { "$add": [{ "$const": 1_i32 }, dot] },
+                { "$const": -1_i32 },
+            ]
+        }),
+    };
+    let field = format!("${field}");
+    M::Expr(doc! { "$let": {
+        "vars": { "oplogField": { "$cond": [
+            { "$eq": [{ "$type": [field.as_str()] }, { "$const": "string" }] },
+            field.as_str(),
+            "$$REMOVE",
+        ] } },
+        "in": { "$regexMatch": {
+            "input": input,
+            "regex": { "$const": pattern.as_str() },
+            "options": { "$const": options.as_str() },
+        } },
+    } })
+}
+
+/// The part of a namespace a path past `ns` / `to` names, if any.
+fn part_of(path: &str) -> Option<Part> {
+    match path.split_once('.').map(|(_, rest)| rest) {
+        Some("db") => Some(Part::Db),
+        Some("coll") => Some(Part::Coll),
+        _ => None,
+    }
+}
+
+/// mongod's `matchRewriteGenericNamespace` for a regex on `ns.db` or
+/// `ns.coll`: an `$expr` on each command field that names it, and on a
+/// write's `ns`. A whole `ns` is an object, which no regex matches.
+fn namespace_regex(re: &(String, String), path: &str) -> M {
+    let (cmd, crud) = match part_of(path) {
+        Some(Part::Coll) => {
+            let mut cmd = vec![ns_regex("o.renameCollection", Part::Coll, re)];
+            cmd.extend(
+                REGEX_COMMANDS
+                    .iter()
+                    .map(|f| ns_regex(&format!("o.{f}"), Part::Whole, re)),
+            );
+            (cmd, ns_regex("ns", Part::Coll, re))
+        }
+        Some(_) => {
+            let mut cmd = vec![
+                M::And(vec![
+                    leaf("o.dropDatabase", Leaf::Eq, 1_i32),
+                    ns_regex("ns", Part::Db, re),
+                ]),
+                ns_regex("o.renameCollection", Part::Db, re),
+            ];
+            cmd.extend(REGEX_COMMANDS.iter().map(|_| ns_regex("ns", Part::Db, re)));
+            (cmd, ns_regex("ns", Part::Db, re))
+        }
+        None => return M::False,
+    };
+    M::Or(vec![
+        M::And(vec![M::Or(cmd), op_is("c")]),
+        M::And(vec![crud, M::Not(Box::new(op_is("c")))]),
+    ])
+}
+
 /// mongod's `matchRewriteGenericNamespace` for `ns`, `$eq` and `$in`: the
 /// commands' `o` fields that name the namespace, and a write's `ns`.
-/// A regex (which mongod rewrites into an `$expr`) is not rewritten here.
+/// A regex is [`namespace_regex`]'s.
 fn rewrite_namespace(u: &U, path: &str) -> Option<M> {
+    if let Some(re) = regex_of(u) {
+        return Some(namespace_regex(&re, path));
+    }
     let parts: Vec<&str> = path.split('.').collect();
     let (values, many): (Vec<Bson>, bool) = match u {
         U::Eq(_, v) => (vec![v.clone()], false),
@@ -769,8 +902,14 @@ fn rewrite_namespace(u: &U, path: &str) -> Option<M> {
 /// mongod's `matchRewriteGenericNamespace` for `to`, `$eq` and `$in`: a
 /// rename's `o.to`, the one oplog field holding a rename's target. A
 /// whole `to` names a collection, so a `{db}` alone matches nothing. A
-/// regex (which mongod rewrites into an `$expr`) is not rewritten here.
+/// regex on `to.db` / `to.coll` is an `$expr` on `o.to`.
 fn rewrite_to(u: &U, path: &str) -> Option<M> {
+    if let Some(re) = regex_of(u) {
+        return Some(match part_of(path) {
+            Some(part) => M::And(vec![ns_regex("o.to", part, &re), op_is("c")]),
+            None => M::False,
+        });
+    }
     let (values, many): (Vec<Bson>, bool) = match u {
         U::Eq(_, v) => (vec![v.clone()], false),
         U::In(_, _, true) => return None,
@@ -1853,6 +1992,18 @@ mod tests {
             // RM-698: `documentKey` and, inexactly, `fullDocument`.
             (doc! { "fullDocument.a": 1 }, "193DCAB5"),
             (doc! { "documentKey._id": 1 }, "97E310BC"),
+            // RM-698: a regex on the namespace, an `$expr` per field.
+            (doc! { "ns.coll": { "$regex": "^c" } }, "EE5C1E5A"),
+            (
+                doc! { "ns.db": { "$regex": "^r", "$options": "i" } },
+                "B38D21DB",
+            ),
+            (
+                doc! { "ns.coll": { "$not": bson::Regex { pattern: "^c".into(), options: String::new() } } },
+                "5CA25166",
+            ),
+            (doc! { "ns": { "$regex": "^c" } }, "33ABFEAA"),
+            (doc! { "to.coll": { "$regex": "^c" } }, "6F8558DD"),
         ];
         for (user, want) in cases {
             let (q, _) = hashes_after(&coll, doc! {}, Some(user.clone()));

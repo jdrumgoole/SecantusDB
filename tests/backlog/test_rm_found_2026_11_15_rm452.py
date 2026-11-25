@@ -4,13 +4,14 @@ mongod 8.2.11 as a one-member replica set.
 
 RM-452 ported mongod's rewrite of `operationType`, RM-698's first slice
 those of `documentKey` and `fullDocument`, its second that of `ns` by
-`$eq` / `$in`, its third that of `to`; the rewrites of the other event fields, of a regex on `ns`
-and of `$expr` are still to come; the Boolean simplifier mongod runs
+`$eq` / `$in`, its third that of `to`, its fourth a regex on either; the rewrites of the
+other event fields and of `$expr` are still to come; the Boolean simplifier mongod runs
 over the unwind's filter came with RM-699 (2026-11-24).
 """
 
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Any
 
@@ -134,21 +135,47 @@ def test_a_match_on_the_rename_target_joins_the_oplog_filter(
     assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)
 
 
+@pytest.mark.backlog_fixed("RM-698")
+@pytest.mark.parametrize(
+    "match",
+    [
+        {"ns.coll": {"$regex": "^c"}},
+        {"ns.coll": {"$regex": "^C", "$options": "i"}},
+        {"ns.coll": re.compile("^c")},
+        {"ns.db": {"$regex": "^rm"}},
+        {"ns.coll": {"$not": re.compile("^c")}},
+        {"ns": {"$regex": "^c"}},
+        {"ns.x": {"$regex": "^c"}},
+        {"to.coll": {"$regex": "^c"}},
+        {"to.db": {"$regex": "x"}},
+        {"to": {"$regex": "^c"}},
+        {"$or": [{"ns.coll": {"$regex": "^c"}}, {"operationType": "drop"}]},
+    ],
+)
+def test_a_regex_on_the_namespace_joins_the_oplog_filter(
+    rust_mongo: Any, mongod_rs: Any, match: dict
+) -> None:
+    """mongod 8.2.11 rewrites a regex on `ns.db` / `ns.coll` / `to.db` /
+    `to.coll` into an `$expr` of `$regexMatch` over the oplog field's part
+    (`matchRewriteGenericNamespace`; hash EE5C1E5A for `ns.coll: /^c/`), and
+    a regex on a whole `ns` or `to` into `$alwaysFalse`; this server left
+    them out of the read (90A52575)."""
+    assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)
+
+
 @pytest.mark.backlog("RM-698")
 @pytest.mark.parametrize(
     ("match", "want"),
     [
-        ({"ns.coll": {"$regex": "^c"}}, "EE5C1E5A"),
         ({"$expr": {"$eq": ["$operationType", "insert"]}}, "6F8558DD"),
     ],
 )
 def test_a_match_on_another_event_field_joins_the_oplog_filter(
     rust_mongo: Any, mongod_rs: Any, match: dict, want: str
 ) -> None:
-    """mongod 8.2.11 rewrites a regex on `ns` or `to` (into an `$expr`), a
-    `$match` on `updateDescription`, `fullDocumentBeforeChange`, `clusterTime`,
-    `lsid` or `txnNumber`, and an `$expr` on those, into the
-    oplog filter, which changes the read's `queryHash` from 90A52575."""
+    """mongod 8.2.11 rewrites a `$match` on `updateDescription`,
+    `fullDocumentBeforeChange`, `clusterTime`, `lsid` or `txnNumber`, and an
+    `$expr` on those, into the oplog filter, which changes the read's `queryHash` from 90A52575."""
     assert _query_hash(mongod_rs, match) == want
     assert _query_hash(rust_mongo, match) == want
 

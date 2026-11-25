@@ -2058,15 +2058,13 @@ would see them. What is left:
       `documentKey` and `fullDocument` for `$eq` / `$in` / `$exists` /
       `$lt(e)` / `$gt(e)`; a `$regex`, `$type`, `$size`, ... on those
       paths is still dropped, not renamed. The second slice (2026-11-24)
-      ported `matchRewriteGenericNamespace` for `ns` by `$eq` / `$in`; a
-      regex on `ns.db` / `ns.coll` (mongod's `$expr` of `$regexMatch` over
-      `$substrBytes`, hash EE5C1E5A for `^c`) is left. The third slice
-      (2026-11-25) ported it for `to` by `$eq` / `$in` (`o.to` of a
-      command); a regex on `to` is left the same way. The rest of
-      `change_stream_rewrite_helpers.cpp` (the regex half of
-      `matchRewriteGenericNamespace`,
-      `matchRewriteUpdateDescription`, `rewriteAggExpressionTree`) is to
-      transcribe (found working RM-452).
+      ported `matchRewriteGenericNamespace` for `ns` by `$eq` / `$in`, the
+      third (2026-11-25) for `to` (`o.to` of a command), and the fourth
+      (2026-11-25) a regex on either (mongod's `$expr` of `$regexMatch`
+      over `$substrBytes`). A regex inside an `$in` on `ns` / `to` is
+      still not rewritten. The rest of `change_stream_rewrite_helpers.cpp`
+      (`matchRewriteUpdateDescription`, `rewriteAggExpressionTree`, the
+      other event fields) is to transcribe (found working RM-452).
       Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_a_match_on_another_event_field_joins_the_oplog_filter
       Backlog-ID: RM-698
 - [ ] **RUST MongoDB server: the Boolean simplifier differs from mongod's
