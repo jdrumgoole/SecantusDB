@@ -475,6 +475,11 @@ pub fn bind(
     // mongod does, so its `replicaSetId` outlives the process.
     if let Some(set_name) = &config.replica_set_name {
         let step = Instant::now();
+        // Each start of a set member after its initiation is an election,
+        // which raises the term (RM-735).
+        storage
+            .step_up()
+            .map_err(|e| io::Error::other(format!("electing the member: {e:?}")))?;
         secantus_commands::serverinfo::record_replset_config(
             storage.as_ref(),
             set_name,

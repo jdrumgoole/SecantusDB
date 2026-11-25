@@ -173,9 +173,8 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // mongod reports the write dates to the second: they are the
         // timestamp's own seconds.
         let written = DateTime::from_millis(i64::from(stamp.time) * 1000);
-        // Fixed sentinel electionId, matching commands.py.
-        let election = ObjectId::parse_str("7fffffff0000000000000001")
-            .expect("static electionId hex is valid");
+        let term = ctx.storage.as_ref().map_or(1, |s| s.current_term());
+        let election = election_id(term);
         response.insert("topologyVersion", topology);
         response.insert("hosts", vec![Bson::String(addr.clone())]);
         response.insert("setName", set_name.clone());
@@ -197,9 +196,9 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         response.insert(
             "lastWrite",
             doc! {
-                "opTime": {"ts": ts.clone(), "t": 1_i64},
+                "opTime": {"ts": ts.clone(), "t": term},
                 "lastWriteDate": written,
-                "majorityOpTime": {"ts": ts, "t": 1_i64},
+                "majorityOpTime": {"ts": ts, "t": term},
                 "majorityWriteDate": written,
             },
         );
@@ -557,7 +556,8 @@ pub fn repl_set_get_status(_doc: &Document, ctx: &mut CommandContext) -> Handler
         None => ctx.cluster_time,
     });
     let now = bson::DateTime::now();
-    let optime = doc! { "ts": ts.clone(), "t": 1_i64 };
+    let term = ctx.storage.as_ref().map_or(1, |s| s.current_term());
+    let optime = doc! { "ts": ts.clone(), "t": term };
     // A one-member set elects itself as it starts: this server's election
     // is its start, the term it began is 1, and the opTime it had then is
     // the start's, in no term yet (`t: -1`). mongod's keys, types and order
@@ -573,7 +573,7 @@ pub fn repl_set_get_status(_doc: &Document, ctx: &mut CommandContext) -> Handler
     let election_metrics = doc! {
         "lastElectionReason": "electionTimeout",
         "lastElectionDate": elected,
-        "electionTerm": 1_i64,
+        "electionTerm": term,
         "lastCommittedOpTimeAtElection": at_election.clone(),
         "lastSeenWrittenOpTimeAtElection": at_election.clone(),
         "lastSeenOpTimeAtElection": at_election,
@@ -587,7 +587,7 @@ pub fn repl_set_get_status(_doc: &Document, ctx: &mut CommandContext) -> Handler
         "set": set_name.clone(),
         "date": now,
         "myState": 1_i32,
-        "term": 1_i64,
+        "term": term,
         "syncSourceHost": "",
         "syncSourceId": -1_i32,
         "heartbeatIntervalMillis": 2000_i64,
@@ -853,8 +853,23 @@ fn user_scram_mechanisms(ctx: &CommandContext, db: &str, user: &str) -> Option<V
     )
 }
 
+/// The `electionId` mongod reports for `term`: `OID::fromTerm`, the
+/// largest timestamp (`7fffffff`) then the term as eight big-endian bytes.
+pub(crate) fn election_id(term: i64) -> ObjectId {
+    let mut bytes = [0u8; 12];
+    bytes[..4].copy_from_slice(&0x7fff_ffff_u32.to_be_bytes());
+    bytes[4..].copy_from_slice(&term.to_be_bytes());
+    ObjectId::from_bytes(bytes)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn election_id_is_mongods_oid_from_term() {
+        assert_eq!(super::election_id(1).to_hex(), "7fffffff0000000000000001");
+        assert_eq!(super::election_id(258).to_hex(), "7fffffff0000000000000102");
+    }
+
     use super::*;
 
     fn code_of(doc: Document) -> Option<i32> {

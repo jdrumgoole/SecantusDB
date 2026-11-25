@@ -692,17 +692,30 @@ def test_secantus_keeps_the_flags_mongod_kept_as_given(tmp_path: Path) -> None:
         assert "IXSCAN" in str(plan["queryPlanner"]["winningPlan"])
 
 
-@pytest.mark.backlog("RM-735")
-def test_a_restart_raises_the_election_term(tmp_path: Path) -> None:
+@pytest.mark.backlog_fixed("RM-735")
+def test_a_restart_raised_the_election_term(tmp_path: Path) -> None:
     """mongod 8.2.11 (measured 2026-11-20,
     `tests/fixtures/storage_model/mongod-8.2.11-replset-state.json`): the
-    election document's `term` is 1 at initiation and 2 after the first clean
-    restart of the store."""
+    election document's `term` was 1 at initiation and 2 after the first
+    clean restart of the store, the configuration's `term` with it, and the
+    restart logged `{op: "n", o: {msg: "new primary"}}` at `t: 2`, the term
+    every later entry carries and `hello` reports."""
     store = tmp_path / "store"
     with rust_mongo_server(store) as client:
         assert client.local["replset.election"].find_one()["term"] == 1
+        assert client.local["system.replset"].find_one()["term"] == 1
     with rust_mongo_server(store) as client:
         assert client.local["replset.election"].find_one()["term"] == 2
+        assert client.local["system.replset"].find_one()["term"] == 2
+        last = next(client.local["oplog.rs"].find().sort("$natural", -1).limit(1))
+        assert (last["op"], last["o"], last["t"]) == ("n", {"msg": "new primary"}, 2)
+        client.t.x.insert_one({"a": 1})
+        entry = client.local["oplog.rs"].find_one({"ns": "t.x", "op": "i"})
+        assert entry["t"] == 2
+        hello = client.admin.command("hello")
+        assert str(hello["electionId"]) == "7fffffff0000000000000002"
+        assert hello["lastWrite"]["opTime"]["t"] == 2
+        assert client.admin.command("replSetGetStatus")["term"] == 2
 
 
 @pytest.mark.backlog_fixed("RM-736")

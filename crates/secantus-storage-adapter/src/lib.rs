@@ -1516,6 +1516,14 @@ impl CmdStorage for StorageAdapter {
             .map_err(map_err)
     }
 
+    fn current_term(&self) -> i64 {
+        self.inner.current_term()
+    }
+
+    fn step_up(&self) -> Result<i64, StorageError> {
+        self.inner.step_up().map_err(map_err)
+    }
+
     fn append_oplog_note(&self, data: bson::Document) -> Result<(), StorageError> {
         self.inner
             .append_oplog_note(data)

@@ -1321,6 +1321,19 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// The replica set's election term, every oplog entry's `t`. Default:
+    /// 1, a backend that holds no election.
+    fn current_term(&self) -> i64 {
+        1
+    }
+
+    /// The member's election as it starts (mongod raises the term at every
+    /// start of a one-member set after its initiation). Returns the term.
+    /// Default: no election, the term stays.
+    fn step_up(&self) -> Result<i64, StorageError> {
+        Ok(self.current_term())
+    }
+
     fn append_oplog_note(&self, _data: Document) -> Result<(), StorageError> {
         Err(StorageError::Internal(
             "appendOplogNote: this storage backend has no oplog".into(),

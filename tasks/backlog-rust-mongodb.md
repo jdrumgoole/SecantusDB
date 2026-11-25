@@ -68,20 +68,6 @@ These work end-to-end but cut corners.
 
 ## 3. Deferred work (skipped from a slice, ready to come back)
 
-- [ ] **Each start of the member is an election in mongod, not here.**
-  mongod 8.2.11 raises `local.replset.election.term` on every start (1 at
-  `replSetInitiate`, 2 after the first clean restart, 3 after a kill -9 and a
-  restart, measured 2026-11-20, `tests/fixtures/storage_model/mongod-8.2.11-
-  replset-state.json`) and logs a `{op: "n", o: {msg: "new primary"}}` entry
-  with `t` the new term; its entries carry that term. This store writes
-  `term: 1` once and every entry has `t: 1`. The fix moves the term in the
-  oplog entries, `replSetGetStatus` and `hello` with it. Since phase 7c
-  this server opens stores mongod wrote, whose term mongod has raised (2
-  after one restart): its entries there say `t: 1` after mongod's `t: 2`
-  ones (mongod 8.2.11 opened such a store again, became primary and
-  validated it, measured 2026-11-22).
-  Verify: tests/backlog/test_rm_storage_model.py::test_a_restart_raises_the_election_term
-  Backlog-ID: RM-735
 - [ ] **A PITR archive cannot prove that nothing was truncated between two
   segments.** The oplog's own mark of where it begins is mongod's, the
   `initiating set` entry (`oplog_reaches_genesis`); a segment's `prev` is 0

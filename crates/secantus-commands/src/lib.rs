@@ -3095,7 +3095,7 @@ fn order_write_reply(req: &Document, reply: &mut Document) {
 /// a command error and not on `findAndModify` (measured 8.2.11, 2026-10-05).
 /// `ts` is the reply's `operationTime`; `t` is the term, an int64, and
 /// `electionId` the one `hello` reports.
-fn attach_write_op_time(req: &Document, reply: &mut Document) {
+fn attach_write_op_time(req: &Document, reply: &mut Document, term: i64) {
     let Some(cmd) = req.keys().next() else { return };
     if !matches!(cmd.as_str(), "insert" | "update" | "delete") {
         return;
@@ -3119,15 +3119,14 @@ fn attach_write_op_time(req: &Document, reply: &mut Document) {
     let Some(Bson::Timestamp(ts)) = reply.get("operationTime").cloned() else {
         return;
     };
-    let election = bson::oid::ObjectId::parse_str("7fffffff0000000000000001")
-        .expect("static electionId hex is valid");
+    let election = handshake::election_id(term);
     let mut out = Document::new();
     for (k, v) in std::mem::take(reply) {
         let is_n = k == "n";
         out.insert(k, v);
         if is_n {
             out.insert("electionId", election);
-            out.insert("opTime", doc! {"ts": Bson::Timestamp(ts), "t": 1_i64});
+            out.insert("opTime", doc! {"ts": Bson::Timestamp(ts), "t": term});
         }
     }
     *reply = out;
@@ -3165,7 +3164,8 @@ fn attach_cluster_time_gossip(req: &Document, reply: &mut Document, ctx: &Comman
     // either way it follows `$clusterTime`, as mongod's does.
     let operation_time = reply.remove("operationTime").unwrap_or(Bson::Timestamp(ts));
     reply.insert("operationTime", operation_time);
-    attach_write_op_time(req, reply);
+    let term = ctx.storage.as_ref().map_or(1, |s| s.current_term());
+    attach_write_op_time(req, reply, term);
     // Snapshot sessions: pymongo pins the session's read timestamp from the
     // FIRST snapshot read's reply — `cursor.atClusterTime` for cursor commands,
     // top-level `atClusterTime` otherwise — and echoes it as
