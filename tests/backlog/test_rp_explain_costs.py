@@ -2512,9 +2512,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): an outer
-    # join's Hash Cond clauses each put the outer side's column first.
+    # join's Hash Cond clauses each put the outer side's column first; the
+    # server switched only a one-clause cond until RP-1062 was fixed.
     "an outer join's two-clause hash cond puts the outer column first": (
-        "RP-1062",
+        "RP-1062:fixed",
         _ANALYSED,
         "explain (costs off) select e.b, e2.b from e full join e e2 on e2.a = e.a and e2.b = e.b",
         [

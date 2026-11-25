@@ -2033,16 +2033,6 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sort above a hash aggregate prints its key]
       Backlog-ID: RP-1108
 
-- [ ] **An outer join's multi-column Hash Cond prints the nullable
-      side's column first.** `explain (costs off) select e.b, e2.b from e
-      full join e e2 on e2.a = e.a and e2.b = e.b` (a `Hash Left Join`
-      too) prints `Hash Cond: ((e2.a = e.a) AND (e2.b = e.b))`; PostgreSQL
-      15.19 prints `((e.a = e2.a) AND (e.b = e2.b))`, each clause commuted
-      to put the outer side's column first. A single-clause ON is printed
-      outer first already. Found while working RP-966.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an outer join's two-clause hash cond puts the outer column first]
-      Backlog-ID: RP-1062
-
 - [ ] **A RIGHT JOIN atop a chain hashes the chain.** `explain (costs
       off) select e.b, e2.b from e join k on e.a = k.a right join e e2 on
       e2.a = k.a` is a `Hash Left Join` of `e e2` over a Hash of `(e join
