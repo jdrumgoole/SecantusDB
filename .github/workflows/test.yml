@@ -1952,13 +1952,22 @@ jobs:
         with:
           packages: mongodb-org-server
 
+      # The login comparisons' reference links a CURRENT OpenSSL (RP-747): the
+      # package above links Ubuntu's OpenSSL 3.0, which reads a delta CRL as
+      # a full one, where OpenSSL 3.5 and 4.x -- and so PostgreSQL on them,
+      # and secantusd-pg -- never use a delta. Built once, then cached.
+      - name: PostgreSQL 15 on a current OpenSSL
+        id: pg15ssl
+        if: matrix.shard == 'server'
+        uses: ./.github/actions/pg15-current-openssl
+
       - name: Run the login comparisons against PostgreSQL 15
         if: matrix.shard == 'server'
         # SECANTUS_REQUIRE_PG15 makes a missing directory a failure: these
         # tests skip without one, and this is the only lane that has it.
         shell: bash
         env:
-          SECANTUS_PG15_BIN: /usr/lib/postgresql/15/bin
+          SECANTUS_PG15_BIN: ${{ steps.pg15ssl.outputs.bin }}
           SECANTUS_REQUIRE_PG15: "1"
         run: |
           "$SECANTUS_PG15_BIN/postgres" --version
