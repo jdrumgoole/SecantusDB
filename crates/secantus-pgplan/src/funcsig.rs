@@ -1014,6 +1014,29 @@ pub(crate) fn selected_result_type(name: &str, args: &[String]) -> Option<String
     }
 }
 
+/// The result type of a call with no arguments, where exactly one
+/// overload takes none and returns one concrete, non-set type
+/// (`getdatabaseencoding()` is `name`).
+pub(crate) fn zero_arg_result_type(name: &str) -> Option<String> {
+    let mut none = sigs()
+        .get(name)?
+        .iter()
+        .filter(|s| s.args.is_empty() && s.defaults == 0 && !s.variadic);
+    match (none.next(), none.next()) {
+        (Some(s), None)
+            if !s.retset
+                && !s.ret.starts_with("any")
+                && !matches!(
+                    s.ret.as_str(),
+                    "record" | "void" | "internal" | "trigger" | "unknown"
+                ) =>
+        {
+            Some(s.ret.clone())
+        }
+        _ => None,
+    }
+}
+
 /// The element type a SET-RETURNING built-in yields, where the overload its
 /// argument types select settles it: a concrete type (`json_array_elements`
 /// is `json`), or `anyelement` resolved from an `anyarray` argument

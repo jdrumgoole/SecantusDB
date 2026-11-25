@@ -2820,31 +2820,35 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 `xu782f` a domain over `text` `collate "und-x-icu"`, `xc782f` one
 `collate "C"`.
 
-- [ ] **`pg_get_viewdef` of most system views is NULL.** PostgreSQL
-      15.19 deparses every `pg_catalog` and `information_schema` view's
-      rule. Here `system_view_defs` prints `system_views.sql`'s and
+- [ ] **`pg_get_viewdef` of 16 system views is NULL.** PostgreSQL
+      deparses every `pg_catalog` and `information_schema` view's rule.
+      Here `system_view_defs` prints `system_views.sql`'s and
       `information_schema.sql`'s queries through `ruleutils`, which
-      reproduces 69 of the 75 `pg_catalog` views and 23 of the 65
+      reproduces 69 of the 75 `pg_catalog` views and 55 of the 65
       `information_schema` views exactly (none printed wrong, measured
-      2026-11-18 in both print modes by md5 against a fresh 15.19 cluster)
-      and leaves the rest NULL rather than print them as written.
-      Remaining: the 6 other `pg_catalog` views (`pg_policies`,
+      2026-11-25 in both print modes by md5 against PostgreSQL 15.20) and
+      leaves the rest NULL rather than print them as written. Remaining:
+      the 6 other `pg_catalog` views (`pg_policies`,
       `pg_publication_tables`, `pg_seclabels`,
       `pg_stat_replication_slots`, `pg_stats_ext`, `pg_stats_ext_exprs`),
       which the printer refuses (`pg_stat_replication_slots`' query cannot
       even be a user view here: `LATERAL
       pg_stat_get_replication_slot(slot_name) s` gives `s` no columns,
-      42703 `column s.slot_name does not exist`); and 42
-      `information_schema` views (`columns`, `tables`, `domains`,
-      `views`, `routines`' siblings, the `role_*` / `*_usage` /
-      `*_privileges` views, ...). Most of those compare a domain-typed
-      column with an operator (`administrable_role_authorizations`:
-      `WHERE ((applicable_roles.is_grantable)::text = 'YES'::text)`, the
-      operator resolved on the base type with the column coerced), which
-      the printer refuses: it types the operand as the domain. A user
-      view over `generate_series(1, c.relnatts)` is still refused:
-      ruleutils casts the int2 argument to `integer`, which the printer
-      does not add.
+      42703 `column s.slot_name does not exist`; `pg_stats_ext` reads a
+      column named `values`; `pg_seclabels` a `rel.tableoid` system
+      column); and 10 `information_schema` views. Five call
+      `_pg_expandarray` (`key_column_usage`, `parameters`,
+      `data_type_privileges`, `element_types`,
+      `triggered_update_columns`), an `information_schema` SQL function
+      returning `SETOF record` with a polymorphic OUT column, which the
+      printer cannot type; `domains` and `sequences` call
+      `_pg_char_max_length` / `_pg_numeric_precision` and their siblings,
+      the information_schema functions the printer has no signature for;
+      `attributes` and `columns` pass a whole row (`_pg_truetypid(a, t)`);
+      `user_mapping_options` refuses at its `pg_has_role(srvowner,
+      'USAGE')` over the `_pg_user_mappings` view. A user view over
+      `generate_series(1, c.relnatts)` is still refused: ruleutils casts
+      the int2 argument to `integer`, which the printer does not add.
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_the_remaining_system_views
       Backlog-ID: RP-798
 
@@ -2853,6 +2857,34 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster; the
 views read only `pg_class`.
 
+
+- [ ] **`pg_get_viewdef` does not parenthesise a function cast in ORDER
+      BY / PARTITION BY / GROUP BY when not pretty.**
+      `get_rule_sortgroupclause` forces parentheses round a FuncExpr item
+      in either print mode, and a cast PostgreSQL runs through a function
+      (`pg_cast.castmethod = 'f'`, such as `name::text`) is one: `create
+      view v as select c.oid from pg_class c order by c.relname::text`
+      prints `ORDER BY ((c.relname)::text)` on PostgreSQL 15.20 (a private
+      cluster). Here `ORDER BY (c.relname)::text`: the printer knows only
+      the binary-coercible (`'b'`) casts, so it cannot tell a function cast
+      from a relabel. The pretty print matches.
+      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_parenthesises_a_function_cast_sort_item
+      Backlog-ID: RP-1094
+
+- [ ] **`pg_get_viewdef` prints an operator over a user domain column
+      without relabelling it.** PostgreSQL resolves the operator on the
+      domain's base type and relabels the operand, which `get_oper_expr`
+      shows: over `create domain dint798 as int` and `u798(k int, dd
+      dint798)`, `select k from u798 where dd > 2` prints `WHERE
+      ((u798.dd)::integer > 2)` on PostgreSQL 15.20 (a private cluster).
+      Here `WHERE (u798.dd > 2)`: the printer types a user table's column
+      by its base type, and only an `information_schema` domain column by
+      the domain (RP-798). Typing every domain column as its domain needs
+      the printer to know each user domain's base type everywhere it
+      resolves an operator or a function over one, or it refuses views it
+      prints correctly today.
+      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_relabels_a_user_domain_operand
+      Backlog-ID: RP-1095
 
 ## Found while working RP-1046 (2026-11-25)
 

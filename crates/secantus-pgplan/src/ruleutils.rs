@@ -232,6 +232,10 @@ struct Printer<'a> {
     /// EXPLAIN's deparse context carries no window clauses, so a window
     /// call prints its window as `(?)` (`get_windowfunc_expr`).
     explain_windows: bool,
+    /// A set operation's leaf: the column types its parent resolved, which
+    /// an untyped literal of the leaf's select list takes in place
+    /// (`transformSetOperationTree`).
+    leaf_types: Option<Vec<String>>,
 }
 
 /// An IN list as `transformAExprIn` builds it (RP-1047).
@@ -507,6 +511,7 @@ impl<'a> Printer<'a> {
             legacy_joins: false,
             written_alias: std::rc::Rc::default(),
             explain_windows: false,
+            leaf_types: None,
         }
     }
 
@@ -579,7 +584,21 @@ impl<'a> Printer<'a> {
             return Some(
                 def.columns
                     .iter()
-                    .map(|c| (c.name.clone(), base_type(&c.pg_type)))
+                    .map(|c| {
+                        // A column over an `information_schema` domain is
+                        // typed as the domain, which an operator over it
+                        // relabels to its base (`(t.cn)::integer > 2`).
+                        let ty = c
+                            .extra
+                            .get_str("domain_type")
+                            .ok()
+                            .and_then(information_schema_domain)
+                            .map_or_else(
+                                || base_type(&c.pg_type),
+                                |(d, _)| format!("information_schema.{d}"),
+                            );
+                        (c.name.clone(), ty)
+                    })
                     .collect(),
             );
         }
@@ -807,7 +826,12 @@ impl<'a> Printer<'a> {
                                 return Some(result.into());
                             }
                         }
-                        Self::arith_result(&op, &l, &r)?.2
+                        // A domain operand resolves on its base type.
+                        let base = |t: String| match information_schema_domain(&t) {
+                            Some((_, b)) => b.to_string(),
+                            None => t,
+                        };
+                        Self::arith_result(&op, &base(l), &base(r))?.2
                     }
                     AExprKind::AexprLike
                     | AExprKind::AexprIlike
@@ -839,8 +863,12 @@ impl<'a> Printer<'a> {
                         .collect::<Option<Vec<String>>>()?;
                     return crate::funcsig::selected_result_type(&name, &types)
                         .or_else(|| crate::funcsig::resolved_result_type(&name, &types))
+                        .or_else(|| crate::funcsig::session_reader_result_type(&name, types.len()))
                         .or_else(|| {
-                            crate::funcsig::session_reader_result_type(&name, types.len())
+                            types
+                                .is_empty()
+                                .then(|| crate::funcsig::zero_arg_result_type(&name))
+                                .flatten()
                         });
                 };
                 match result {
@@ -935,6 +963,13 @@ impl<'a> Printer<'a> {
                 format!("{t}[]")
             }
             // `arr[i]`: the element type (a slice keeps the array's).
+            N::AIndirection(ind) if field_of_call(ind).is_some() => {
+                let (fname, nargs, field) = field_of_call(ind)?;
+                crate::builtin_out_columns(&fname, nargs)?
+                    .into_iter()
+                    .find(|(c, _)| *c == field)?
+                    .1
+            }
             N::AIndirection(ind) => {
                 let t = self.typ(ind.arg.as_deref()?)?;
                 let elem = t.strip_suffix("[]")?.to_string();
@@ -1031,6 +1066,27 @@ impl<'a> Printer<'a> {
             let lt = if l == meet { "" } else { meet };
             let rt = if r == meet { "" } else { meet };
             return Some((lt.into(), rt.into(), meet.into()));
+        }
+        // The integer bitwise operators exist per width only (`int4and`
+        // ...): mixed widths meet at the wider, which the narrower side is
+        // cast to; an untyped literal takes the other side's type.
+        if matches!(op, "&" | "|" | "#") {
+            let rank = |t: &str| match t {
+                "int2" => Some(0),
+                "int4" => Some(1),
+                "int8" => Some(2),
+                _ => None,
+            };
+            if r == "unknown" && rank(l).is_some() {
+                return Some((String::new(), l.into(), l.into()));
+            }
+            if l == "unknown" && rank(r).is_some() {
+                return Some((r.into(), String::new(), r.into()));
+            }
+            let wide = if rank(l)? >= rank(r)? { l } else { r };
+            let lt = if l == wide { "" } else { wide };
+            let rt = if r == wide { "" } else { wide };
+            return Some((lt.into(), rt.into(), wide.into()));
         }
         if matches!(op, "+" | "-" | "*" | "/" | "%") {
             if let Some((meet, cast)) = numeric_meet(l, r) {
@@ -1143,6 +1199,14 @@ impl<'a> Printer<'a> {
         if l == "oid" && is_int(r) {
             return Some((String::new(), "oid".into()));
         }
+        // An `oid` meets a `reg*` alias at `oideq`, the alias relabelled
+        // to `oid`: `(d.classid = ('pg_proc'::regclass)::oid)`.
+        if l == "oid" && is_reg_alias(r) {
+            return Some((String::new(), "oid".into()));
+        }
+        if r == "oid" && is_reg_alias(l) {
+            return Some(("oid".into(), String::new()));
+        }
         if r == "oid" && is_int(l) {
             return Some(("oid".into(), String::new()));
         }
@@ -1228,6 +1292,11 @@ impl<'a> Printer<'a> {
                 }
             }
             if own != want {
+                // `eval_const_expressions` folds a relabelled `reg*`
+                // constant into an `oid` one, which is not modelled here.
+                if self.fold_consts && want == "oid" && is_reg_alias(&own) {
+                    return None;
+                }
                 if self.fold_consts && want == "oid" {
                     if let Some(N::AConst(c)) = n.node.as_ref() {
                         if let Some(Val::Ival(i)) = c.val.as_ref() {
@@ -1404,15 +1473,18 @@ impl<'a> Printer<'a> {
                             self.buf.push_str(b);
                         }
                         // A `regtype` constant prints as `regtypeout` does,
-                        // the type's canonical name (`'int4'` is `'integer'`).
-                        "regtype" => {
+                        // the type's canonical name (`'int4'` is `'integer'`);
+                        // a `regclass` one as `regclassout`, qualified only
+                        // when the search path does not find it
+                        // (`'pg_catalog.pg_proc'` is `'pg_proc'`).
+                        "regtype" | "regclass" => {
                             let v = crate::cast_value(bson::Bson::String(lit.clone()), t).ok()?;
                             let text = match crate::cast_value(v, "text").ok()? {
                                 bson::Bson::String(text) => text,
                                 _ => return None,
                             };
                             self.buf
-                                .push_str(&format!("{}::regtype", simple_quote_literal(&text)));
+                                .push_str(&format!("{}::{t}", simple_quote_literal(&text)));
                         }
                         // A date / time constant prints in its type's output
                         // form (`'2020-01-01 00:00:00'::timestamp ...`).
@@ -1711,6 +1783,15 @@ impl<'a> Printer<'a> {
                 }
                 self.buf.push(']');
             }
+            // A FieldSelect: the argument always parenthesised, as
+            // ruleutils does unless it is a subscript or another field.
+            N::AIndirection(ind) if field_of_call(ind).is_some() => {
+                let (_, _, field) = field_of_call(ind)?;
+                self.typ(n)?;
+                self.buf.push('(');
+                self.expr(ind.arg.as_deref()?)?;
+                self.buf.push_str(&format!(").{}", q(&field)));
+            }
             N::AIndirection(ind) => {
                 let arg = ind.arg.as_deref()?;
                 self.typ(n)?;
@@ -1761,6 +1842,22 @@ impl<'a> Printer<'a> {
         Some(())
     }
 
+    /// The types a binary operator's operands are coerced to, `""` where
+    /// one keeps its own: a comparison, a pattern match, else arithmetic.
+    fn operator_coercion(op: &str, lt: &str, rt: &str) -> Option<(String, String)> {
+        if matches!(op, "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=") {
+            Self::compare_coercion(lt, rt)
+        } else if matches!(
+            op,
+            "~~" | "!~~" | "~~*" | "!~~*" | "~" | "~*" | "!~" | "!~*"
+        ) {
+            Self::string_match_coercion(lt, rt)
+        } else {
+            let (a, b, _) = Self::arith_result(op, lt, rt)?;
+            Some((a, b))
+        }
+    }
+
     /// An operator expression: parenthesised unless pretty.
     fn binary(&mut self, l: &Node, lw: &str, op: &str, r: &Node, rw: &str) -> Option<()> {
         let open = !self.pretty;
@@ -1804,14 +1901,27 @@ impl<'a> Printer<'a> {
                     return self.row_compare(&op, &lr.args, &rr.args);
                 }
                 let (lt, rt) = (self.typ(l)?, self.typ(r)?);
-                // An operator over a domain resolves on its base type and
-                // coerces the operand (`(x)::text = 'YES'::text`), which
-                // this printer does not model: refuse rather than print it
-                // over the domain.
-                if information_schema_domain(&lt).is_some()
-                    || information_schema_domain(&rt).is_some()
-                {
-                    return None;
+                // An operator over a domain resolves on its base type
+                // (`binary_oper_exact`, `func_select_candidate` reduce a
+                // domain to its base), and `make_fn_arguments` relabels
+                // the operand to the operator's input type, which
+                // `get_oper_expr` shows: `(x)::text = 'YES'::text`, and
+                // `(x)::integer` even when the base is already the input.
+                let (ld, rd) = (
+                    information_schema_domain(&lt).map(|(_, b)| b),
+                    information_schema_domain(&rt).map(|(_, b)| b),
+                );
+                if ld.is_some() || rd.is_some() {
+                    let lb = ld.map_or(lt.clone(), str::to_string);
+                    let rb = rd.map_or(rt.clone(), str::to_string);
+                    let (lw, rw) = Self::operator_coercion(&op, &lb, &rb)?;
+                    let relabel = |w: String, dom: Option<&str>| match (w.is_empty(), dom) {
+                        (true, Some(b)) => b.to_string(),
+                        _ => w,
+                    };
+                    let (lw, rw) = (relabel(lw, ld), relabel(rw, rd));
+                    let op = if op == "!=" { "<>".to_string() } else { op };
+                    return self.binary(l, &lw, &op, r, &rw);
                 }
                 // Array containment / overlap: same element types, no cast.
                 if matches!(op.as_str(), "@>" | "<@" | "&&") && is_array(&lt) && is_array(&rt) {
@@ -1839,18 +1949,7 @@ impl<'a> Printer<'a> {
                     let rw = if rt == want { "" } else { want };
                     return self.binary(l, "", &op, r, rw);
                 }
-                let (lw, rw) = if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=")
-                {
-                    Self::compare_coercion(&lt, &rt)?
-                } else if matches!(
-                    op.as_str(),
-                    "~~" | "!~~" | "~~*" | "!~~*" | "~" | "~*" | "!~" | "!~*"
-                ) {
-                    Self::string_match_coercion(&lt, &rt)?
-                } else {
-                    let (a, b, _) = Self::arith_result(&op, &lt, &rt)?;
-                    (a, b)
-                };
+                let (lw, rw) = Self::operator_coercion(&op, &lt, &rt)?;
                 let op = if op == "!=" { "<>".to_string() } else { op };
                 self.binary(l, &lw, &op, r, &rw)?;
             }
@@ -2688,7 +2787,9 @@ impl<'a> Printer<'a> {
                 if i > 0 {
                     self.buf.push_str(", ");
                 }
-                self.expr(p)?;
+                // `get_rule_windowspec` prints each through
+                // `get_rule_sortgroupclause`, as ORDER BY items are.
+                self.sort_expr(p)?;
             }
             need_space = true;
         }
@@ -2893,12 +2994,21 @@ impl<'a> Printer<'a> {
                 let op = names_.last().map(String::as_str).unwrap_or("=");
                 let lt = self.typ(test)?;
                 let cols = self.subquery_columns(sub)?;
-                let (lw, _) = Self::compare_coercion(&lt, &cols.first()?.1)?;
-                if !lw.is_empty() {
-                    return None;
-                }
+                // A domain resolves the operator on its base type, the
+                // test expression relabelled to the operator's input,
+                // which `get_sublink_expr` shows (`(x)::name IN (...)`).
+                let base = |t: &str| information_schema_domain(t).map(|(_, b)| b);
+                let (ld, rd) = (base(&lt), base(&cols.first()?.1));
+                let (lw, _) =
+                    Self::compare_coercion(ld.unwrap_or(&lt), rd.unwrap_or(&cols.first()?.1))?;
+                let lw = match (lw.is_empty(), ld) {
+                    (true, Some(b)) => b.to_string(),
+                    (true, None) => lw,
+                    (false, _) if ld.is_some() => lw,
+                    (false, _) => return None,
+                };
                 self.buf.push('(');
-                self.expr(test)?;
+                self.expr_as(test, &lw)?;
                 if kind == SubLinkType::AllSublink {
                     self.buf.push_str(&format!(" {op} ALL ("));
                 } else if op == "=" && s.oper_name.is_empty() {
@@ -3050,6 +3160,21 @@ pub(crate) fn base_type(t: &str) -> String {
         other => other,
     }
     .to_string()
+}
+
+/// `(f(...)).field` over a built-in call: `(function name, argument
+/// count, field)`.
+fn field_of_call(ind: &pg_query::protobuf::AIndirection) -> Option<(String, usize, String)> {
+    let [field] = ind.indirection.as_slice() else {
+        return None;
+    };
+    let Some(N::String(field)) = field.node.as_ref() else {
+        return None;
+    };
+    let Some(N::FuncCall(f)) = ind.arg.as_deref().and_then(|a| a.node.as_ref()) else {
+        return None;
+    };
+    Some((crate::func_name(f)?, f.args.len(), field.sval.clone()))
 }
 
 fn parse_select(sql: &str) -> Option<Node> {
@@ -3559,6 +3684,36 @@ impl Printer<'_> {
                     continue;
                 }
             }
+            // `(f(...)).*` over a built-in's OUT parameters expands to one
+            // field selection per column (`ExpandRowReference`).
+            if let Some(N::AIndirection(ind)) = val.node.as_ref() {
+                if let ([star], Some(N::FuncCall(f))) = (
+                    ind.indirection.as_slice(),
+                    ind.arg.as_deref().and_then(|a| a.node.as_ref()),
+                ) {
+                    if matches!(star.node.as_ref(), Some(N::AStar(_))) {
+                        if !rt.name.is_empty() {
+                            return None;
+                        }
+                        let fname = crate::func_name(f)?;
+                        for (col, _) in crate::builtin_out_columns(&fname, f.args.len())? {
+                            let mut field = ind.clone();
+                            field.indirection = vec![Node {
+                                node: Some(N::String(pg_query::protobuf::String {
+                                    sval: col.clone(),
+                                })),
+                            }];
+                            out.push(Target {
+                                expr: Node {
+                                    node: Some(N::AIndirection(field)),
+                                },
+                                name: col,
+                            });
+                        }
+                        continue;
+                    }
+                }
+            }
             let name = if rt.name.is_empty() {
                 figure_colname(val)
             } else {
@@ -3574,6 +3729,16 @@ impl Printer<'_> {
 
     /// A query's output columns and their types.
     fn query_columns(&mut self, n: &Node) -> Option<Vec<(String, String)>> {
+        self.query_columns_resolving(n, true)
+    }
+
+    /// `query_columns`; a set operation's leaf leaves an untyped literal
+    /// `unknown` (`resolve_unknowns` false), for its parent to resolve.
+    fn query_columns_resolving(
+        &mut self,
+        n: &Node,
+        resolve_unknowns: bool,
+    ) -> Option<Vec<(String, String)>> {
         let Some(N::SelectStmt(s)) = n.node.as_ref() else {
             return None;
         };
@@ -3588,15 +3753,24 @@ impl Printer<'_> {
             }
         }
         let out = if s.op != SetOperation::SetopNone as i32 {
-            let l = self.query_columns(&Node {
-                node: Some(N::SelectStmt(s.larg.clone()?)),
-            })?;
-            let r = self.query_columns(&Node {
-                node: Some(N::SelectStmt(s.rarg.clone()?)),
-            })?;
+            let l = self.query_columns_resolving(
+                &Node {
+                    node: Some(N::SelectStmt(s.larg.clone()?)),
+                },
+                false,
+            )?;
+            let r = self.query_columns_resolving(
+                &Node {
+                    node: Some(N::SelectStmt(s.rarg.clone()?)),
+                },
+                false,
+            )?;
             let mut out = Vec::new();
             for ((ln, lt), (_, rt)) in l.into_iter().zip(r) {
-                let t = if lt == rt {
+                // Two untyped literals meet as text.
+                let t = if lt == "unknown" && rt == "unknown" {
+                    "text".into()
+                } else if lt == rt {
                     lt
                 } else if lt == "unknown" {
                     rt
@@ -3626,7 +3800,11 @@ impl Printer<'_> {
                         let ty = self.typ(&t.expr)?;
                         Some((
                             t.name.clone(),
-                            if ty == "unknown" { "text".into() } else { ty },
+                            if ty == "unknown" && resolve_unknowns {
+                                "text".into()
+                            } else {
+                                ty
+                            },
                         ))
                     })
                     .collect::<Option<Vec<_>>>()
@@ -3835,6 +4013,7 @@ impl Printer<'_> {
             inner.pretty = self.pretty;
             inner.markers = self.markers;
             inner.col_names_visible = self.col_names_visible;
+            inner.leaf_types = self.leaf_types.take();
             inner.query(
                 &Node {
                     node: Some(N::SelectStmt(Box::new(s.clone()))),
@@ -3858,7 +4037,17 @@ impl Printer<'_> {
         } else {
             0
         };
+        // This node's column types, which its leaves' untyped literals take.
+        let types: Vec<String> = self
+            .query_columns(&Node {
+                node: Some(N::SelectStmt(Box::new(s.clone()))),
+            })?
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
+        self.leaf_types = Some(types.clone());
         self.setop(larg, colnames)?;
+        self.leaf_types = None;
         if need_paren {
             self.keyword(") ", -sub, 0, 0);
         } else {
@@ -3883,7 +4072,9 @@ impl Printer<'_> {
         self.keyword("", sub, 0, 0);
         // Only the leftmost query's column names are visible outside.
         let visible = std::mem::replace(&mut self.col_names_visible, false);
+        self.leaf_types = Some(types);
         let printed = self.setop(rarg, colnames);
+        self.leaf_types = None;
         self.col_names_visible = visible;
         printed?;
         self.indent -= sub;
@@ -3903,6 +4094,7 @@ impl Printer<'_> {
         if s.group_distinct {
             return None;
         }
+        let leaf_types = self.leaf_types.take();
         if !s.values_lists.is_empty() {
             self.buf.push(' ');
             return self.values_def(s);
@@ -3936,7 +4128,12 @@ impl Printer<'_> {
             self.buf.push_str(sep);
             sep = ", ";
             let saved = std::mem::take(&mut self.buf);
-            self.expr(&t.expr)?;
+            match leaf_types.as_ref().and_then(|ts| ts.get(i)) {
+                Some(want) if self.typ(&t.expr).as_deref() == Some("unknown") => {
+                    self.expr_as(&t.expr, want)?;
+                }
+                _ => self.expr(&t.expr)?,
+            }
             let name = colnames
                 .and_then(|c| c.get(i).cloned())
                 .unwrap_or_else(|| t.name.clone());
