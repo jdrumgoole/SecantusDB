@@ -2134,18 +2134,21 @@ cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: a time-series read under a collation, or over
-      a collection with an index of its own, reads the collection at the
-      command.** Under `{locale: "en"}`, mongod 8.2.11 reads through its
-      cursor stage, 32 buckets first, and returns 2,303 more after the
-      delete; this server reads it whole: 3,999. So too any read of a
-      collection with an index besides the default one, and a hint to
-      any index but the default one (a hint to `m_1_t_1` or `{$natural: 1}`
-      matches since 2026-11-25). An index `createIndexes` adds is kept on
-      the collection only, `dropIndexes` leaves the bucket copy of
-      `m_1_t_1` in place, and `collStats` still reports index sizes of 0.
-      Found while working RM-457, 2026-11-15.
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_under_a_collation_buffers_its_buckets
+- [ ] **RUST MongoDB server: a time-series read over a collection with an
+      index of its own reads the collection at the command.** With an
+      index `{v: 1}` beside the default one, an unindexed filter's read:
+      mongod 8.2.11 reads through its cursor stage, 32 buckets first, and
+      returns 2,303 more after the delete; this server reads it whole:
+      3,999. So too a hint to any index but the default one (a hint to
+      `m_1_t_1` or `{$natural: 1}` matches since 2026-11-25, and a read
+      under a collation since 2026-11-25, unless its filter holds a string
+      or names the meta field: those still read whole, as the bucket
+      bounds and the index over the buckets compare without the
+      collation). An index `createIndexes` adds is kept on the collection
+      only, `dropIndexes` leaves the bucket copy of `m_1_t_1` in place, and
+      `collStats` still reports index sizes of 0. Found while working
+      RM-457, 2026-11-15.
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_beside_an_index_of_its_own_buffers_its_buckets
       Backlog-ID: RM-701
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
