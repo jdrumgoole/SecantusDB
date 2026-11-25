@@ -897,6 +897,13 @@ pub trait Storage: Send + Sync {
         Ok(None)
     }
 
+    /// WiredTiger's check of `config` as the arguments of `method`
+    /// (`"WT_SESSION.create"`): `Err` is its error code and message. `Ok`
+    /// (the default, for test fakes) when there is no engine to ask.
+    fn validate_wt_config(&self, _method: &str, _config: &str) -> Result<(), (i32, String)> {
+        Ok(())
+    }
+
     /// How many documents the collection holds, when no more than `cap`.
     fn collection_count_at_most(
         &self,
@@ -1312,6 +1319,19 @@ pub trait Storage: Send + Sync {
         Err(StorageError::Internal(
             "this storage backend has no oplog".into(),
         ))
+    }
+
+    /// The replica set's election term, every oplog entry's `t`. Default:
+    /// 1, a backend that holds no election.
+    fn current_term(&self) -> i64 {
+        1
+    }
+
+    /// The member's election as it starts (mongod raises the term at every
+    /// start of a one-member set after its initiation). Returns the term.
+    /// Default: no election, the term stays.
+    fn step_up(&self) -> Result<i64, StorageError> {
+        Ok(self.current_term())
     }
 
     fn append_oplog_note(&self, _data: Document) -> Result<(), StorageError> {

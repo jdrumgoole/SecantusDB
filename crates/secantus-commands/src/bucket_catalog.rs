@@ -367,6 +367,52 @@ impl BucketCatalog {
         global.0[Stat::ActiveBuckets as usize] -= gone;
     }
 
+    /// `serverStatus`'s `bucketCatalog` section
+    /// (`BucketCatalogServerStatus::generateSection`), `None` while no
+    /// collection has a catalog entry, as on mongod before the first write
+    /// and after the last written collection is dropped. `memoryUsage` is
+    /// reported as 0: the catalog keeps no account of its memory (RM-710).
+    pub fn server_status(&self) -> Option<Document> {
+        let inner = self.lock();
+        if inner.collections.is_empty() {
+            return None;
+        }
+        let active = inner.global.get(Stat::ActiveBuckets);
+        let open: i64 = inner
+            .collections
+            .values()
+            .map(|c| c.open.len() as i64)
+            .sum();
+        let number = |n: i64| {
+            if n.unsigned_abs() < (1 << 30) {
+                Bson::Int32(n as i32)
+            } else {
+                Bson::Int64(n)
+            }
+        };
+        let mut out = Document::new();
+        out.insert("numBuckets", number(active));
+        out.insert("numOpenBuckets", number(open));
+        // Every write commits under the catalog's lock, so between
+        // commands every open bucket is idle.
+        out.insert("numIdleBuckets", number(open));
+        out.insert("numArchivedBuckets", number(active - open));
+        out.insert("memoryUsage", number(0));
+        inner.global.append_to(&mut out);
+        // The bucket state registry: this server clears a collection's
+        // buckets at once rather than by era, so the era stays 0.
+        out.insert(
+            "stateManagement",
+            doc! {
+                "bucketsManaged": number(open),
+                "currentEra": number(0),
+                "erasWithRemainingBuckets": number(i64::from(open > 0)),
+                "trackedClearOperations": number(0),
+            },
+        );
+        Some(out)
+    }
+
     /// A collection's execution statistics, when it has any.
     pub(crate) fn collection_stats(&self, uuid: &[u8]) -> ExecutionStats {
         self.lock()
@@ -591,14 +637,25 @@ fn stage_and_commit(
     batch: Vec<Measurement>,
     outcomes: &mut HashMap<usize, Outcome>,
 ) -> Result<(), CommandError> {
-    let mut touched: Vec<ObjectId> = Vec::new();
-    for (key, group) in by_series(batch, target.layout) {
-        stage_series(inner, uuid, target, env, &key, group, &mut touched)?;
+    let mut batch = batch;
+    loop {
+        let mut touched: Vec<ObjectId> = Vec::new();
+        for (key, group) in by_series(batch, target.layout) {
+            stage_series(inner, uuid, target, env, &key, group, &mut touched)?;
+        }
+        // A bucket removed under its write (a TTL pass, a delete) is
+        // aborted and its measurements staged again, into a bucket that
+        // exists: mongod retries the write on its WriteConflict, and no
+        // insert fails for it.
+        let mut retry = Vec::new();
+        for id in touched {
+            commit(inner, uuid, target, env, &id, outcomes, &mut retry)?;
+        }
+        if retry.is_empty() {
+            return Ok(());
+        }
+        batch = retry;
     }
-    for id in touched {
-        commit(inner, uuid, target, env, &id, outcomes)?;
-    }
-    Ok(())
 }
 
 /// `stageInsertBatch` for one series.
@@ -1458,6 +1515,7 @@ fn commit(
     env: &Env<'_>,
     id: &ObjectId,
     outcomes: &mut HashMap<usize, Outcome>,
+    retry: &mut Vec<Measurement>,
 ) -> Result<(), CommandError> {
     let layout = env.layout;
     let Inner {
@@ -1534,11 +1592,7 @@ fn commit(
                     .map_err(crate::util::command_error)?;
                 // Removed between the check above and this write.
                 if outcome.matched == 0 {
-                    return Err(CommandError::new(
-                        112,
-                        "WriteConflict",
-                        "the time-series bucket was removed while it was written",
-                    ));
+                    return Err(CommandError::new(112, "WriteConflict", BUCKET_REMOVED));
                 }
             }
             Ok(())
@@ -1590,13 +1644,24 @@ fn commit(
             coll.open.remove(at);
             coll.stats.0[Stat::ActiveBuckets as usize] -= 1;
             global.0[Stat::ActiveBuckets as usize] -= 1;
-            for (index, _) in &staged {
-                outcomes.insert(*index, Err(e.clone()));
+            if e.code == 112 && e.errmsg == BUCKET_REMOVED {
+                retry.extend(
+                    staged
+                        .into_iter()
+                        .map(|(index, doc)| Measurement { index, doc }),
+                );
+            } else {
+                for (index, _) in &staged {
+                    outcomes.insert(*index, Err(e.clone()));
+                }
             }
         }
     }
     Ok(())
 }
+
+/// The bucket an update was writing no longer exists.
+const BUCKET_REMOVED: &str = "the time-series bucket was removed while it was written";
 
 /// A storage write error document as a command error.
 fn write_error(e: &Document) -> CommandError {

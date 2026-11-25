@@ -82,17 +82,38 @@ def test_a_time_series_read_of_the_meta_index_buffers_its_buckets(
     assert _after_delete(rust_mongo, read) == want
 
 
-@pytest.mark.backlog("RM-701")
+@pytest.mark.backlog_fixed("RM-701")
 def test_a_hinted_time_series_read_scans_the_index_over_the_buckets(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """mongod 8.2.11 reads a time-series `aggregate` hinted to the default
-    `m_1_t_1` index by scanning that index over the buckets, buffering 32
-    of them series by series; this server reads a hinted read whole."""
+    `m_1_t_1` index, by name or by key, by scanning that index over the
+    buckets, buffering 32 of them series by series: 1,279. `{$natural: 1}`
+    reads as no hint does: 2,303. This server read a hinted read whole,
+    3,999, until a hint to the default index scanned it."""
+
+    for hint, want in (("m_1_t_1", 1279), ({"m": 1, "t": 1}, 1279), ({"$natural": 1}, 2303)):
+
+        def read(c: Any, hint: Any = hint) -> Any:
+            return c.aggregate([{"$match": {"v": {"$gte": 0}}}], batchSize=1, hint=hint)
+
+        assert _after_delete(mongod, read) == want
+        assert _after_delete(rust_mongo, read) == want
+
+
+@pytest.mark.backlog("RM-701")
+def test_a_time_series_read_under_a_collation_buffers_its_buckets(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11 reads a time-series `aggregate` under a collation
+    through its cursor stage, 32 buckets first: 2,303 after the delete;
+    this server reads it whole."""
 
     def read(c: Any) -> Any:
-        return c.aggregate([{"$match": {"v": {"$gte": 0}}}], batchSize=1, hint="m_1_t_1")
+        return c.aggregate(
+            [{"$match": {"v": {"$gte": 0}}}], batchSize=1, collation={"locale": "en"}
+        )
 
     want = _after_delete(mongod, read)
-    assert want == 1279
+    assert want == 2303
     assert _after_delete(rust_mongo, read) == want

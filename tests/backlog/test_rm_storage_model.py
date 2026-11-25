@@ -106,8 +106,23 @@ def _mongod_answers(dbpath: Path) -> Iterator[None]:
         yield
     except pymongo.errors.PyMongoError as exc:
         logs = sorted(dbpath.parent.glob("mongod-*.log"))
-        tail = logs[-1].read_text(errors="replace")[-3000:] if logs else "(no log)"
-        raise AssertionError(f"mongod failed on the store: {exc}\n{tail}") from exc
+        text = logs[-1].read_text(errors="replace") if logs else "(no log)"
+        # A crash's backtrace is long and the end of it is thread-pool
+        # frames: the failure CI kept was only that end (RM-797). Keep the
+        # lines that say WHY (warnings, errors, fatal messages, everything
+        # before the first frame) as well as the end.
+        why = [
+            line[:600]
+            for line in text.splitlines()
+            if '"s":"F"' in line or '"s":"E"' in line or '"s":"W"' in line
+        ]
+        head = text.split('"msg":"Frame"')[0][-2500:]
+        raise AssertionError(
+            f"mongod failed on the store: {exc}\n--- warnings, errors and fatal lines:\n"
+            + "\n".join(why[:40])
+            + f"\n--- the log up to the first backtrace frame:\n{head}"
+            + f"\n--- its end:\n{text[-1500:]}"
+        ) from exc
 
 
 def _wait_primary(client: pymongo.MongoClient, port_host: str) -> None:
@@ -631,17 +646,91 @@ def test_secantus_keeps_the_index_specs_mongod_wrote(tmp_path: Path) -> None:
     assert [k for k, _ in seen["both"][0][1]] == ["v", "key", "name", "sparse"]
 
 
-@pytest.mark.backlog("RM-735")
-def test_a_restart_raises_the_election_term(tmp_path: Path) -> None:
+def _flag_options(client: Any) -> None:
+    """Indexes made with flags given as numbers, which mongod keeps as given
+    (`sparse`, `background`) or reads as bools (`unique`), and one armed by
+    `prepareUnique` at creation (RM-791)."""
+    db = client["app"]
+    db["c"].insert_many([{"_id": i, "a": i, "b": i, "d": i} for i in range(5)])
+    db.command(
+        "createIndexes",
+        "c",
+        indexes=[
+            {"name": "a_1", "key": {"a": 1}, "sparse": 1.0, "background": 1},
+            {"name": "b_1", "key": {"b": 1}, "prepareUnique": True},
+            {"name": "d_1", "key": {"d": 1}, "unique": 1.0, "sparse": 0},
+        ],
+    )
+
+
+@pytest.mark.backlog_fixed("RM-791")
+def test_mongod_opens_the_flags_secantus_kept_as_given(tmp_path: Path) -> None:
+    """A store `secantusd-mdb` wrote with `sparse: 1.0`, `background: 1`,
+    `prepareUnique: true` and `unique: 1.0` is one mongod 8.2.11 validates,
+    with the same specs (RM-791)."""
+    store = tmp_path / "store"
+    with rust_mongo_server(store, "--standalone") as client:
+        _flag_options(client)
+        ours = _specs_and_listing(client)
+    kept = {dict(spec)["name"]: spec for spec in ours[0] if dict(spec)["name"] != "_id_"}
+    assert ("sparse", 1.0) in kept["a_1"] and ("background", 1) in kept["a_1"], kept
+    assert [k for k, _ in kept["b_1"]] == ["v", "prepareUnique", "key", "name"], kept
+    assert [k for k, _ in kept["d_1"]] == ["v", "unique", "key", "name", "sparse"], kept
+    proc, client = _mongod_on(store, None, "rs0")
+    try:
+        assert client is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            host, port = client.address or ("127.0.0.1", 0)
+            _wait_primary(client, f"{host}:{port}")
+            assert _specs_and_listing(client) == ours
+            result = client["app"].command("validate", "c", full=True)
+            assert (result["valid"], result["nrecords"]) == (True, 5)
+    finally:
+        _stop_mongod(proc, client)
+
+
+@pytest.mark.backlog_fixed("RM-791")
+def test_secantus_keeps_the_flags_mongod_kept_as_given(tmp_path: Path) -> None:
+    """A store mongod 8.2.11 wrote with the same flags, opened by
+    `secantusd-mdb`: the same specs, and a sparse index that is read as one
+    (RM-791)."""
+    seen: dict[str, Any] = {}
+
+    def setup(client: Any) -> None:
+        _flag_options(client)
+        seen["both"] = _specs_and_listing(client)
+
+    store = _mongod_store(tmp_path, setup)
+    with rust_mongo_server(store) as rust:
+        assert _specs_and_listing(rust) == seen["both"]
+        plan = rust["app"]["c"].find({"a": {"$gte": 0}}).hint("a_1").explain()
+        assert "IXSCAN" in str(plan["queryPlanner"]["winningPlan"])
+
+
+@pytest.mark.backlog_fixed("RM-735")
+def test_a_restart_raised_the_election_term(tmp_path: Path) -> None:
     """mongod 8.2.11 (measured 2026-11-20,
     `tests/fixtures/storage_model/mongod-8.2.11-replset-state.json`): the
-    election document's `term` is 1 at initiation and 2 after the first clean
-    restart of the store."""
+    election document's `term` was 1 at initiation and 2 after the first
+    clean restart of the store, the configuration's `term` with it, and the
+    restart logged `{op: "n", o: {msg: "new primary"}}` at `t: 2`, the term
+    every later entry carries and `hello` reports."""
     store = tmp_path / "store"
     with rust_mongo_server(store) as client:
         assert client.local["replset.election"].find_one()["term"] == 1
+        assert client.local["system.replset"].find_one()["term"] == 1
     with rust_mongo_server(store) as client:
         assert client.local["replset.election"].find_one()["term"] == 2
+        assert client.local["system.replset"].find_one()["term"] == 2
+        last = next(client.local["oplog.rs"].find().sort("$natural", -1).limit(1))
+        assert (last["op"], last["o"], last["t"]) == ("n", {"msg": "new primary"}, 2)
+        client.t.x.insert_one({"a": 1})
+        entry = client.local["oplog.rs"].find_one({"ns": "t.x", "op": "i"})
+        assert entry["t"] == 2
+        hello = client.admin.command("hello")
+        assert str(hello["electionId"]) == "7fffffff0000000000000002"
+        assert hello["lastWrite"]["opTime"]["t"] == 2
+        assert client.admin.command("replSetGetStatus")["term"] == 2
 
 
 @pytest.mark.backlog_fixed("RM-736")
@@ -1444,6 +1533,14 @@ def _served_after_mongods_restart(store: Path, port: int, tmp_path: Path) -> dic
         assert mongod is not None, "mongod refused its own store"
         with _mongod_answers(copy):
             _until_primary(mongod)
+            # A build the store was killed in is finished by the restart after
+            # the node is primary: its record in `config.system.indexBuilds`
+            # goes when it has, and a snapshot before that differs from the
+            # one of a server that has finished (it flaked, one run in three).
+            deadline = time.monotonic() + 60
+            while mongod.config["system.indexBuilds"].count_documents({}):
+                assert time.monotonic() < deadline, "mongod's restart never finished the build"
+                time.sleep(0.2)
             return _store_contents(mongod)
     finally:
         _stop_mongod(proc, mongod)
@@ -1519,14 +1616,14 @@ def _build_quietly(rs: pymongo.MongoClient) -> None:
         rs.app.c.create_index("a", name="a_1")
 
 
-@pytest.mark.backlog("RM-756")
+@pytest.mark.backlog_fixed("RM-756")
 def test_secantus_opens_a_killed_mongod_store_whose_oplog_drops_what_it_refuses(
     tmp_path: Path,
 ) -> None:
     """A killed mongod 8.2.11 store whose stable checkpoint lists a `text`
     index that the oplog after it drops: mongod's restart replays the drop
-    and serves the collection without it. `secantusd-mdb` judges the store
-    at the checkpoint, before its replay, and refuses it by name."""
+    and serves the collection without it. `secantusd-mdb` judged the store
+    at the checkpoint, before its replay, and refused it by name."""
 
     def setup(rs: pymongo.MongoClient) -> None:
         rs.app.c.insert_many([{"_id": i, "h": f"word {i}"} for i in range(5)])

@@ -1433,6 +1433,7 @@ fn update_oplog_o(desc: Document, pre: &Document, post: &Document, pipeline: boo
 fn oplog_view_entries(
     entries: Vec<Document>,
     chains: &mut HashMap<(Vec<u8>, i64), Bson>,
+    term: i64,
 ) -> Vec<Document> {
     let mut out = Vec::with_capacity(entries.len());
     // `chains`: the last entry of each retryable write's session and
@@ -1447,7 +1448,7 @@ fn oplog_view_entries(
             while iter.peek().and_then(txn_of) == Some(txn.clone()) {
                 run.push(iter.next().expect("peeked"));
             }
-            out.push(transaction_view(run, txn));
+            out.push(transaction_view(run, txn, term));
             continue;
         }
         let group = entry
@@ -1472,9 +1473,9 @@ fn oplog_view_entries(
             }
             None => oplog_view_shape(&entry).unwrap_or(entry),
         };
-        let shaped = with_term_and_version(shaped);
+        let shaped = with_term_and_version(shaped, term);
         let mut shaped = match rw {
-            Some(rw) => with_retryable_session(shaped, &rw, group.is_some(), chains),
+            Some(rw) => with_retryable_session(shaped, &rw, group.is_some(), chains, term),
             None => shaped,
         };
         view_names(&mut shaped);
@@ -1535,6 +1536,7 @@ fn with_retryable_session(
     rw: &Document,
     group: bool,
     chains: &mut HashMap<(Vec<u8>, i64), Bson>,
+    term: i64,
 ) -> Document {
     let (Ok(lsid), Ok(txn)) = (rw.get_document("lsid"), rw.get_i64("txnNumber")) else {
         return entry;
@@ -1553,7 +1555,9 @@ fn with_retryable_session(
     let prev_t: i64 = if matches!(prev, Bson::Timestamp(t) if t.time == 0 && t.increment == 0) {
         -1
     } else {
-        1
+        // The chain's last entry in this process's term: a chain is a
+        // retryable write's statements, written in one election's term.
+        term
     };
     if let Some(ts) = entry.get("ts") {
         chains.insert(key, ts.clone());
@@ -1593,7 +1597,7 @@ fn txn_of(entry: &Document) -> Option<(Document, i64)> {
 /// A committed transaction as mongod 8.2.11 logs it: one `applyOps` entry
 /// holding its writes, under its session, with the start of its
 /// `prevOpTime` chain.
-fn transaction_view(run: Vec<Document>, (lsid, txn): (Document, i64)) -> Document {
+fn transaction_view(run: Vec<Document>, (lsid, txn): (Document, i64), term: i64) -> Document {
     let first = run[0].clone();
     let ops: Vec<Bson> = run
         .into_iter()
@@ -1617,7 +1621,7 @@ fn transaction_view(run: Vec<Document>, (lsid, txn): (Document, i64)) -> Documen
     };
     if let Some(ts) = first.get("ts") {
         out.insert("ts", ts.clone());
-        out.insert("t", 1_i64);
+        out.insert("t", term);
         out.insert("v", 2_i64);
     }
     if let Some(wall) = first.get("wall") {
@@ -1666,7 +1670,7 @@ fn apply_ops_view(run: Vec<Document>) -> Document {
 }
 
 /// `entry` with mongod's `t` and `v` after its `ts`, where it has neither.
-fn with_term_and_version(mut entry: Document) -> Document {
+fn with_term_and_version(mut entry: Document, term: i64) -> Document {
     // The view's own markers are not mongod's.
     entry.remove("rw");
     entry.remove("bg");
@@ -1678,7 +1682,7 @@ fn with_term_and_version(mut entry: Document) -> Document {
         let is_ts = k == "ts";
         out.insert(k, v);
         if is_ts {
-            out.insert("t", 1_i64);
+            out.insert("t", term);
             out.insert("v", 2_i64);
         }
     }
@@ -3937,7 +3941,7 @@ fn index_desc_from(name: String, key_spec: Document, opts: &Document) -> IndexDe
     IndexDesc {
         name,
         key_spec,
-        sparse: opts.get_bool("sparse").unwrap_or(false),
+        sparse: secantus_core::index_keys::spec_flag(opts, "sparse"),
         hidden: opts.get_bool("hidden").unwrap_or(false),
         collation: index_key_collation(opts),
         unique: opts.get_bool("unique").unwrap_or(false),
@@ -5784,6 +5788,15 @@ pub struct Storage {
     /// Ids for the groups of inserts mongod logs as one `applyOps`
     /// (`local.oplog.rs` presents each group as that one entry).
     insert_groups: AtomicI64,
+    /// The replica set's election term (`local.replset.election`'s `term`),
+    /// which every oplog entry carries as its `t`. mongod raises it at each
+    /// election, one at every start of a one-member set (RM-735).
+    term: AtomicI64,
+    /// Whether this open initiated the set (its genesis ran): its election
+    /// is the initiation's, term 1, not a new one.
+    initiated_now: AtomicBool,
+    /// Whether [`Storage::step_up`] has already run in this open.
+    stepped_up: AtomicBool,
     /// Every collection's record count, data size and index sizes, kept
     /// current by every write: mongod's size storer (RM-191, see
     /// [`sizes`]).
@@ -8417,13 +8430,23 @@ impl Storage {
                     None => adopt::LastWriter::Unknown,
                 }
             };
-            let reconciled = adopt::reconcile(&boot, last, table_mode && !in_memory, |found| {
-                if mongod_store {
-                    store_format::mongod_store(std::path::Path::new(home), found)
-                } else {
-                    store_format::written_by_mongod_since(std::path::Path::new(home), found)
-                }
-            })?;
+            // What the replay below drops is judged and adopted as gone, as
+            // mongod's restart replays it first (RM-756). Only a store whose
+            // data is recovered by replaying the oplog replays it.
+            let replayed = if !in_memory && stored_mode.unwrap_or(data_create_mode) {
+                let rows = read_oplog_table(&boot, &oplog.uri, replay_from as i64 + 1, usize::MAX)?;
+                adopt::Replayed::from_entries(rows.iter().map(|(_, b)| b.as_slice()))
+            } else {
+                adopt::Replayed::default()
+            };
+            let reconciled =
+                adopt::reconcile(&boot, last, table_mode && !in_memory, replayed, |found| {
+                    if mongod_store {
+                        store_format::mongod_store(std::path::Path::new(home), found)
+                    } else {
+                        store_format::written_by_mongod_since(std::path::Path::new(home), found)
+                    }
+                })?;
             if !reconciled.adopted.is_empty() || !reconciled.removed.is_empty() {
                 eprintln!(
                     "secantus-storage: the catalog was written by another server: took {} \
@@ -8578,6 +8601,9 @@ impl Storage {
             compaction: compact::Compaction::default(),
             user_write_block: std::sync::RwLock::new(None),
             insert_groups: AtomicI64::new(0),
+            term: AtomicI64::new(1),
+            initiated_now: AtomicBool::new(false),
+            stepped_up: AtomicBool::new(false),
             sizes,
             index_order: Mutex::new(HashMap::new()),
             index_builds: index_build::Registry::default(),
@@ -8606,7 +8632,9 @@ impl Storage {
         // write: there is nothing to recover in it.
         if oplog_created || storage.needs_genesis()? {
             storage.genesis(oplog_created)?;
+            storage.initiated_now.store(true, Ordering::Release);
         }
+        storage.load_term()?;
         if storage.data_nonlogged {
             // Crash recovery: the data tables rolled back to the last stable
             // checkpoint; the (WAL-logged) oplog has everything. Replay the
@@ -9697,6 +9725,7 @@ impl Storage {
         }
         let cur = session.open_cursor(&self.oplog_uri, None)?;
         let wall_millis = now_millis();
+        let term = self.current_term();
         let wall = Bson::DateTime(bson::DateTime::from_millis(wall_millis));
         let slots = pre_image_slots(&entries, &ts, &pre_images);
         let mut records: Vec<Vec<u8>> = Vec::new();
@@ -9725,7 +9754,7 @@ impl Storage {
                 };
                 finals.push((
                     ts_u64(ts[i]) as i64,
-                    append_ts_t_v_wall(buf.into_bytes(), ts[i], wall_millis),
+                    append_ts_t_v_wall(buf.into_bytes(), ts[i], wall_millis, term),
                 ));
             }
         } else if let Some(fast) = {
@@ -9737,7 +9766,7 @@ impl Storage {
             let made = if prepare {
                 None
             } else {
-                fast_insert_view(&entries, &ts, wall_millis, &mut chains)
+                fast_insert_view(&entries, &ts, wall_millis, &mut chains, term)
             };
             made.inspect(|_| self.remember_retry_chains(chains))
         } {
@@ -9754,7 +9783,7 @@ impl Storage {
                 docs.push(d);
             }
             let mut chains = self.retry_chains_for(&docs);
-            let mut shaped = oplog_view_entries(docs, &mut chains);
+            let mut shaped = oplog_view_entries(docs, &mut chains, term);
             self.remember_retry_chains(chains);
             if prepare {
                 for d in &mut shaped {
@@ -9766,7 +9795,7 @@ impl Storage {
                 }
             }
             for d in shaped {
-                for part in split_partial_txn(d)? {
+                for part in split_partial_txn(d, term)? {
                     let at = part
                         .get_timestamp("ts")
                         .map_err(|e| StorageError::Bson(e.to_string()))?;
@@ -10721,6 +10750,96 @@ impl Storage {
         out.map(|()| start)
     }
 
+    /// The election term the store's `local.replset.election` records (1
+    /// when it records none), which the entries written from now carry.
+    fn load_term(&self) -> Result<()> {
+        if !self.collection_exists("local", "replset.election")? {
+            return Ok(());
+        }
+        let docs = self.find_matching("local", "replset.election", &Document::new())?;
+        let first = match docs.first() {
+            Some(b) => Some(decode_doc(b)?),
+            None => None,
+        };
+        let term = first
+            .as_ref()
+            .and_then(|d| d.get("term"))
+            .and_then(|t| match t {
+                Bson::Int64(v) => Some(*v),
+                Bson::Int32(v) => Some(i64::from(*v)),
+                _ => None,
+            })
+            .unwrap_or(1);
+        self.term.store(term.max(1), Ordering::Release);
+        Ok(())
+    }
+
+    /// The current election term: every oplog entry's `t`.
+    pub fn current_term(&self) -> i64 {
+        self.term.load(Ordering::Acquire)
+    }
+
+    /// The member's election as it starts: mongod's one-member set elects
+    /// itself at every start after its initiation, raising the term by one,
+    /// recording it in `local.replset.election`, and logging
+    /// `{op: "n", ns: "", o: {msg: "new primary"}}` at the new term (mongod
+    /// 8.2.11, measured 2026-11-20, `tests/fixtures/storage_model/
+    /// mongod-8.2.11-replset-state.json`). A start that initiated the set
+    /// keeps the initiation's term 1. Once per open; returns the term.
+    pub fn step_up(&self) -> Result<i64> {
+        if self.stepped_up.swap(true, Ordering::AcqRel)
+            || self.initiated_now.load(Ordering::Acquire)
+        {
+            return Ok(self.current_term());
+        }
+        let term = self.current_term() + 1;
+        {
+            let _unlogged = unreplicated();
+            let _untimestamped = untimestamped();
+            let docs = self.find_matching("local", "replset.election", &Document::new())?;
+            let first = match docs.first() {
+                Some(b) => Some(decode_doc(b)?),
+                None => None,
+            };
+            let mut doc = first.unwrap_or_else(|| {
+                bson::doc! {"_id": bson::oid::ObjectId::new(), "candidateIndex": 0_i64}
+            });
+            let mut out = Document::new();
+            if let Some(id) = doc.remove("_id") {
+                out.insert("_id", id);
+            }
+            out.insert("term", term);
+            for (k, v) in doc {
+                if k != "term" {
+                    out.insert(k, v);
+                }
+            }
+            let id = out.get("_id").cloned().unwrap_or(Bson::Null);
+            self.update_matching(
+                "local",
+                "replset.election",
+                &bson::doc! {"_id": id},
+                &out,
+                false,
+                true,
+                &[],
+                &Vars::new(),
+                None,
+                None,
+                false,
+            )?;
+        }
+        self.term.store(term, Ordering::Release);
+        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let session = self.conn.open_session()?;
+        self.emit_oplog(
+            &session,
+            vec![bson::doc! {"op": "n", "ns": "", "o": {"msg": "new primary"}}],
+            vec![None],
+        )?;
+        Ok(term)
+    }
+
     /// Put `doc` into `local.<coll>` unless the collection already holds a
     /// document, unreplicated as mongod's `local` writes are.
     fn put_local_singleton(&self, coll: &str, doc: Document) -> Result<()> {
@@ -11290,7 +11409,7 @@ impl Storage {
             bson::doc! {
                 "_id": lsid.clone(),
                 "txnNum": txn,
-                "lastWriteOpTime": {"ts": ts, "t": 1_i64},
+                "lastWriteOpTime": {"ts": ts, "t": entry.get_i64("t").unwrap_or(1)},
                 "lastWriteDate": wall,
             },
         )?;
@@ -13820,11 +13939,26 @@ impl Storage {
         if deferred {
             PENDING_MINTED.with(|p| p.borrow_mut().push((start, start + 1)));
         }
+        let mut entry = entry;
+        // The prepare's own term, which a restart since may have moved on
+        // from (RM-735).
+        if let Ok(prev) = entry.get_document_mut("prevOpTime") {
+            if let Ok(at) = prev.get_timestamp("ts") {
+                let seq = ts_u64(at) as i64;
+                if let Some((s, blob)) = self.read_oplog(seq, 1)?.into_iter().next() {
+                    if s == seq {
+                        if let Ok(t) = decode_doc(&blob)?.get_i64("t") {
+                            prev.insert("t", t);
+                        }
+                    }
+                }
+            }
+        }
         let mut out = Document::new();
         for (k, v) in entry {
             if k == "prevOpTime" {
                 out.insert("ts", Bson::Timestamp(ts[0]));
-                out.insert("t", 1_i64);
+                out.insert("t", self.current_term());
                 out.insert("v", 2_i64);
                 out.insert(
                     "wall",
@@ -17124,9 +17258,12 @@ impl Storage {
                 }
                 let existing_opts = existing.get_document("options").ok();
                 for opt in CONFLICTING_OPTS {
-                    // `sparse: false` is the same index as no `sparse`.
+                    // `sparse: false` is the same index as no `sparse`, and
+                    // `sparse: 1.0` the same as `sparse: true`.
                     let unset = |o: Option<&Document>| match o.and_then(|o| o.get(opt)) {
-                        Some(Bson::Boolean(false)) if *opt == "sparse" => None,
+                        _ if *opt == "sparse" => o
+                            .is_some_and(|o| secantus_core::index_keys::spec_flag(o, "sparse"))
+                            .then_some(Bson::Boolean(true)),
                         other => other.cloned(),
                     };
                     let (new, old) = (unset(Some(options)), unset(existing_opts));
@@ -17298,7 +17435,7 @@ impl Storage {
             }
             out
         } else {
-            let sparse = options.get_bool("sparse").unwrap_or(false);
+            let sparse = secantus_core::index_keys::spec_flag(options, "sparse");
             let unique = options.get_bool("unique").unwrap_or(false);
             let partial = options
                 .get_document("partialFilterExpression")
@@ -21348,7 +21485,7 @@ impl Storage {
                     {
                         return Ok(None);
                     }
-                    let sparse = opts.get_bool("sparse").unwrap_or(false);
+                    let sparse = secantus_core::index_keys::spec_flag(&opts, "sparse");
                     let partial = opts
                         .get_document("partialFilterExpression")
                         .ok()
@@ -21489,6 +21626,16 @@ impl Storage {
             }
         }
         Ok(Some(MatchedRows { rows: out, via }))
+    }
+
+    /// WiredTiger's check of `config` as the arguments of `method`, as
+    /// mongod runs it on a `storageEngine` option.
+    pub fn validate_wt_config(
+        &self,
+        method: &str,
+        config: &str,
+    ) -> std::result::Result<(), (i32, String)> {
+        secantus_wt::validate_config(method, config)
     }
 
     /// How many documents the collection holds, when no more than `cap`;
@@ -24047,7 +24194,7 @@ impl Storage {
         else {
             return Ok(None);
         };
-        let sparse = opts.get_bool("sparse").unwrap_or(false);
+        let sparse = secantus_core::index_keys::spec_flag(opts, "sparse");
         let partial = opts
             .get_document("partialFilterExpression")
             .ok()
@@ -24169,7 +24316,9 @@ impl Storage {
             // filter, `find({}).sort({a: 1, b: 1})` over a compound index
             // partial on `{a: {$gt: 5}}` returned 4 of 10 documents (mongod:
             // 10). Found 2026-09-30.
-            if opts.get_bool("sparse").unwrap_or(false) && !sparse_index_usable(&key_spec, query) {
+            if secantus_core::index_keys::spec_flag(&opts, "sparse")
+                && !sparse_index_usable(&key_spec, query)
+            {
                 continue;
             }
             if let Ok(pf) = opts.get_document("partialFilterExpression") {
@@ -26550,7 +26699,7 @@ fn element_size(op: &Bson) -> Result<usize> {
 /// `o: {applyOps, partialTxn: true}` and the last `o: {applyOps, count}`,
 /// `count` being the operations of the whole transaction. Any other entry,
 /// and a transaction that fits, is returned as it is.
-fn split_partial_txn(entry: Document) -> Result<Vec<Document>> {
+fn split_partial_txn(entry: Document, term: i64) -> Result<Vec<Document>> {
     let is_txn = entry.contains_key("lsid")
         && entry.contains_key("txnNumber")
         && !entry.contains_key("stmtId")
@@ -26614,13 +26763,13 @@ fn split_partial_txn(entry: Document) -> Result<Vec<Document>> {
         }
         d.insert("o", o);
         d.insert("ts", Bson::Timestamp(ts));
-        d.insert("t", 1_i64);
+        d.insert("t", term);
         d.insert("v", 2_i64);
         if let Some(wall) = entry.get("wall") {
             d.insert("wall", wall.clone());
         }
         let (prev_ts, prev_t) = match prev {
-            Some(p) => (p, 1_i64),
+            Some(p) => (p, term),
             None => (
                 bson::Timestamp {
                     time: 0,
@@ -26641,7 +26790,7 @@ fn split_partial_txn(entry: Document) -> Result<Vec<Document>> {
 
 /// A plain insert's bytes with `ts`, `t`, `v` and `wall` appended, in mongod's
 /// order (`..., o2, ts, t, v, wall`).
-fn append_ts_t_v_wall(mut b: Vec<u8>, ts: bson::Timestamp, wall_millis: i64) -> Vec<u8> {
+fn append_ts_t_v_wall(mut b: Vec<u8>, ts: bson::Timestamp, wall_millis: i64, term: i64) -> Vec<u8> {
     b.pop();
     b.push(0x11);
     b.extend_from_slice(b"ts\0");
@@ -26650,7 +26799,7 @@ fn append_ts_t_v_wall(mut b: Vec<u8>, ts: bson::Timestamp, wall_millis: i64) -> 
     for name in [&b"t\0"[..], &b"v\0"[..]] {
         b.push(0x12);
         b.extend_from_slice(name);
-        b.extend_from_slice(&(if name[0] == b't' { 1i64 } else { 2i64 }).to_le_bytes());
+        b.extend_from_slice(&(if name[0] == b't' { term } else { 2i64 }).to_le_bytes());
     }
     b.push(0x09);
     b.extend_from_slice(b"wall\0");
@@ -26931,6 +27080,7 @@ fn fast_insert_view(
     ts: &[bson::Timestamp],
     wall_millis: i64,
     chains: &mut HashMap<(Vec<u8>, i64), Bson>,
+    term: i64,
 ) -> Option<Vec<(i64, Vec<u8>)>> {
     let mut parts: Vec<RawInsertParts> = Vec::with_capacity(entries.len());
     for e in entries {
@@ -26951,7 +27101,7 @@ fn fast_insert_view(
             }
             finals.push((
                 ts_u64(ts[i]) as i64,
-                append_ts_t_v_wall(buf.as_bytes().to_vec(), ts[i], wall_millis),
+                append_ts_t_v_wall(buf.as_bytes().to_vec(), ts[i], wall_millis, term),
             ));
             i += 1;
             continue;
@@ -27014,7 +27164,7 @@ fn fast_insert_view(
         close_nested(&mut out, ops_at);
         close_nested(&mut out, o_at);
         put_ts(&mut out, b"ts", first_ts);
-        put_i64(&mut out, b"t", 1);
+        put_i64(&mut out, b"t", term);
         put_i64(&mut out, b"v", 2);
         out.push(0x09);
         out.extend_from_slice(b"wall\0");
@@ -27028,7 +27178,7 @@ fn fast_insert_view(
                 if prev.time == 0 && prev.increment == 0 {
                     -1
                 } else {
-                    1
+                    term
                 },
             );
             close_nested(&mut out, at);
@@ -28447,7 +28597,7 @@ mod tests {
                 );
             }
             let mut fast_chains = seeded.clone();
-            let fast = fast_insert_view(&entries, &ts, wall_millis, &mut fast_chains);
+            let fast = fast_insert_view(&entries, &ts, wall_millis, &mut fast_chains, 1);
             // The builder's answer, as `mint_and_write_ext` makes it.
             let wall = Bson::DateTime(bson::DateTime::from_millis(wall_millis));
             let docs: Vec<Document> = entries
@@ -28464,7 +28614,7 @@ mod tests {
                 })
                 .collect();
             let mut slow_chains = seeded;
-            let shaped = oplog_view_entries(docs, &mut slow_chains);
+            let shaped = oplog_view_entries(docs, &mut slow_chains, 1);
             let slow: Vec<(i64, Vec<u8>)> = shaped
                 .iter()
                 .map(|d| {
@@ -30634,7 +30784,7 @@ mod oplog_entry_bytes_tests {
             bson::RawBsonRef::DateTime(bson::DateTime::from_millis(-5)).to_raw_bson(),
         );
         assert_eq!(
-            append_ts_t_v_wall(entry.into_bytes(), ts, -5),
+            append_ts_t_v_wall(entry.into_bytes(), ts, -5, 1),
             appended.into_bytes()
         );
     }

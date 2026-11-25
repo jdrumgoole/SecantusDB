@@ -239,6 +239,72 @@ unsafe extern "C" fn handle_message(
     0
 }
 
+/// The error callback of [`validate_config`]: the message is held, not
+/// printed, for the caller to quote.
+unsafe extern "C" fn hold_error(
+    handler: *mut sys::WT_EVENT_HANDLER,
+    _session: *mut sys::WT_SESSION,
+    _error: c_int,
+    message: *const c_char,
+) -> c_int {
+    if handler.is_null() || message.is_null() {
+        return 0;
+    }
+    // SAFETY: `handler` is the `base` of the live `Handler` `validate_config`
+    // owns; WiredTiger passes a NUL-terminated message.
+    let handler = unsafe { &*(handler as *const Handler) };
+    let text = unsafe { CStr::from_ptr(message) }
+        .to_string_lossy()
+        .into_owned();
+    handler
+        .messages
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(text);
+    0
+}
+
+extern "C" {
+    // Declared here rather than in the generated bindings, which list only
+    // what the storage layer has needed so far.
+    fn wiredtiger_config_validate(
+        session: *mut sys::WT_SESSION,
+        handler: *mut sys::WT_EVENT_HANDLER,
+        name: *const c_char,
+        config: *const c_char,
+    ) -> c_int;
+}
+
+/// `wiredtiger_config_validate` of `config` as the arguments of `method`
+/// (`"WT_SESSION.create"`): what mongod runs on a `storageEngine`
+/// `configString` before it builds an index from it. `Err` is the error
+/// code with WiredTiger's own message for it, as it formatted it.
+pub fn validate_config(method: &str, config: &str) -> std::result::Result<(), (i32, String)> {
+    let (Ok(method_c), Ok(config_c)) = (CString::new(method), CString::new(config)) else {
+        return Err((22, String::from("argument contains an interior NUL byte")));
+    };
+    let mut handler = event_handler();
+    handler.base.handle_error = Some(hold_error);
+    let code = unsafe {
+        wiredtiger_config_validate(
+            ptr::null_mut(),
+            &mut handler.base,
+            method_c.as_ptr(),
+            config_c.as_ptr(),
+        )
+    };
+    if code == 0 {
+        return Ok(());
+    }
+    let held = std::mem::take(
+        &mut *handler
+            .messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    Err((code, held.join("\n")))
+}
+
 fn event_handler() -> Box<Handler> {
     Box::new(Handler {
         base: sys::WT_EVENT_HANDLER {

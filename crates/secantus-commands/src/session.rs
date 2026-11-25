@@ -1581,7 +1581,7 @@ pub(crate) fn record_session_transaction(
     let mut row = doc! {
         "_id": lsid.clone(),
         "txnNum": txn_number,
-        "lastWriteOpTime": {"ts": ts, "t": 1_i64},
+        "lastWriteOpTime": {"ts": ts, "t": storage.current_term()},
         "lastWriteDate": bson::DateTime::now(),
     };
     if let Some(state) = state {

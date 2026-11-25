@@ -50,14 +50,14 @@ def _insert_into_expiring_buckets(client: Any, seconds: float) -> list:
     return errors
 
 
-@pytest.mark.backlog("RM-702")
+@pytest.mark.backlog_fixed("RM-702")
 def test_an_insert_into_a_bucket_the_ttl_monitor_removes_succeeds(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """mongod 8.2.11 retries an insert whose bucket the TTL monitor removed
-    under it, into a new bucket: no insert fails. This server returns the
+    under it, into a new bucket: no insert fails. This server returned the
     write error 112, "the time-series bucket was removed while it was
-    written"."""
+    written", until RM-702 restaged such a bucket's measurements."""
     assert _insert_into_expiring_buckets(mongod, 10) == []
     # The race is a window in each TTL pass: up to 90 passes to find it.
     assert _insert_into_expiring_buckets(rust_mongo, 90) == []

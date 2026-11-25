@@ -68,20 +68,6 @@ These work end-to-end but cut corners.
 
 ## 3. Deferred work (skipped from a slice, ready to come back)
 
-- [ ] **Each start of the member is an election in mongod, not here.**
-  mongod 8.2.11 raises `local.replset.election.term` on every start (1 at
-  `replSetInitiate`, 2 after the first clean restart, 3 after a kill -9 and a
-  restart, measured 2026-11-20, `tests/fixtures/storage_model/mongod-8.2.11-
-  replset-state.json`) and logs a `{op: "n", o: {msg: "new primary"}}` entry
-  with `t` the new term; its entries carry that term. This store writes
-  `term: 1` once and every entry has `t: 1`. The fix moves the term in the
-  oplog entries, `replSetGetStatus` and `hello` with it. Since phase 7c
-  this server opens stores mongod wrote, whose term mongod has raised (2
-  after one restart): its entries there say `t: 1` after mongod's `t: 2`
-  ones (mongod 8.2.11 opened such a store again, became primary and
-  validated it, measured 2026-11-22).
-  Verify: tests/backlog/test_rm_storage_model.py::test_a_restart_raises_the_election_term
-  Backlog-ID: RM-735
 - [ ] **A PITR archive cannot prove that nothing was truncated between two
   segments.** The oplog's own mark of where it begins is mongod's, the
   `initiating set` entry (`oplog_reaches_genesis`); a segment's `prev` is 0
@@ -261,32 +247,33 @@ These are explicit non-goals. Don't add them without a reason.
 ## 5. Known bugs and edge cases to watch
 
 - [ ] **mongod 8.2 crashes, intermittently, opening a store
-      `secantusd-mdb` wrote and `reIndex`ed (2026-11-25).** On PR #2979 (run 45534098323, job
-      `mdb-binary (backlog)`, head `6eb68eb86`), RM-788's regression test
+      `secantusd-mdb` wrote and `reIndex`ed (2026-11-25).** RM-788's
       `tests/backlog/test_rm_storage_model.py::test_mongod_opens_the_index_specs_secantus_wrote_and_reindexed`
-      read REGRESSED: mongod died with a fatal message from the
-      `ReplCoord-0` thread (`ThreadPool::Impl::_doOneTask` frames) before
-      the client's first command, so pymongo saw `connection closed`. The
-      same test passed on `main`'s push run for `4547c86f9` (run
-      45528505272), which already held RM-788/RM-789's commits, and the PR
-      touched only the PG server's CRL reader and CI's PG login lane, which
-      neither server's store reaches. The log CI kept is the tail after the
-      fatal message, so its cause is not recorded. A mongod that crashes on
-      a store this server wrote is a durability signal, not noise: rerun
-      the test in a loop against mongod 8.2.11 with its full log kept
-      (`--logpath` beside the store), find the fatal message's first line
-      (an invariant or a fassert id) and what of the store it read, then
-      fix the store. Filed by the PG session; nothing on the MongoDB side
-      was changed. It then failed twice more the same way, with the same
-      `ReplCoord-0` fatal tail: #2979 again (run 45542344001, head
-      `c33d848d8`) and snapshot PR #2980 (`rm-batch-ci`, `144b95d51`). A
-      diagnostic re-run of `main`'s `4547c86f9` job (run 45528505272)
-      passed, on the same runner version (20261116.202.1) as two of the
-      failures. All runs used mongod 8.2.12 from MongoDB's `mongodb-org`
-      8.2 apt repo on image ubuntu-26.04 20261111.635, and the job passed on
-      every run from RM-788's landing until 2026-11-25T02:35Z. So neither
-      the code nor the image changed; it is a race, in mongod's start on
-      this store or in what the store holds.
+      read REGRESSED on PR #2979 (runs 45534098323 and 45542344001) and on
+      snapshot PR #2980 (run 45544205276): mongod died with a fatal
+      message on its `ReplCoord-0` thread (`ThreadPool::Impl::_doOneTask`
+      frames) during `replSetInitiate` / the first primary transition, so
+      pymongo saw `connection closed`. The same job passed on `main` runs
+      45528505272, 45569063349 and 45584567796, all on mongod 8.2.12
+      (Linux x86-64, from the `mongodb-org` apt repo). CI kept only the last
+      3000 characters of the log, which is thread-pool frames, so the
+      assertion that fired is NOT recorded. **Not reproduced locally**
+      (2026-11-25): 62 runs of the test and its steps on the macOS arm64
+      8.2.12 tarball (alone, three at a time, and with the last oplog write
+      in the same second as mongod's initiate) and 47 on the Linux arm64
+      8.2.12 tarball in a container held to 0.4 CPU, all green. The test's
+      failure message now keeps mongod's warning, error and fatal lines and
+      the log up to its first backtrace frame, so the next CI failure names
+      the assertion; read it, then fix what the store holds that it chokes
+      on (the suspects: an oplog entry or timestamp `reIndex` writes, the
+      catalog's `md.indexes`, `config.system.indexBuilds`).
+      On CI it failed 3 of the 7 runs on 2026-11-25, all on mongod 8.2.12
+      from the `mongodb-org` 8.2 apt repo on image ubuntu-26.04
+      20261111.635, and it had passed on every run from RM-788's landing
+      until 2026-11-25T02:35Z; neither the code nor the image changed
+      between passing and failing runs, so it is a race in mongod's start on
+      this store or in what the store holds. (Filed by the PG session on
+      PR #2979; merged with the MongoDB session's measurements.)
       Verify: none -- intermittent on CI (3 of the 7 runs on 2026-11-25); RM-788's regression test is the check
       Backlog-ID: RM-797
 
@@ -2146,34 +2133,19 @@ cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: a time-series read under a hint, or over a
-      collection with an index of its own, reads the collection at the
-      command.** Hinted to `m_1_t_1` (`{$match: {v: {$gte: 0}}}`), mongod
-      8.2.11 scans that index over the buckets, buffering 32 series by
-      series, and returns 1,279 more after the delete; this server reads it
-      whole: 3,999. So too a read under a collation, and any read of a
-      collection with an index besides the default one. Since RM-457 the
-      default `m_1_t_1` index is built over the buckets at create and a
-      filter on the meta field scans it; an index `createIndexes` adds is
-      kept on the collection only, `dropIndexes` leaves the bucket copy of
+- [ ] **RUST MongoDB server: a time-series read under a collation, or over
+      a collection with an index of its own, reads the collection at the
+      command.** Under `{locale: "en"}`, mongod 8.2.11 reads through its
+      cursor stage, 32 buckets first, and returns 2,303 more after the
+      delete; this server reads it whole: 3,999. So too any read of a
+      collection with an index besides the default one, and a hint to
+      any index but the default one (a hint to `m_1_t_1` or `{$natural: 1}`
+      matches since 2026-11-25). An index `createIndexes` adds is kept on
+      the collection only, `dropIndexes` leaves the bucket copy of
       `m_1_t_1` in place, and `collStats` still reports index sizes of 0.
       Found while working RM-457, 2026-11-15.
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_hinted_time_series_read_scans_the_index_over_the_buckets
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_under_a_collation_buffers_its_buckets
       Backlog-ID: RM-701
-- [ ] **RUST MongoDB server: an insert into a time-series bucket the TTL
-      monitor removes fails.** Inserting into a bucket that has expired
-      while the TTL monitor runs every second, mongod 8.2.11 never fails an
-      insert (it writes a new bucket); this server returns the write error
-      112, "the time-series bucket was removed while it was written"
-      (`bucket_catalog.rs`: the update of the open bucket matched nothing),
-      to the client. Seen once in `tests/mongod_live/test_time_series_buckets.py::test_ttl_expires_whole_buckets`
-      in a gate run, reproduced by the gap test (a race: it inserts until
-      the first failure, up to 90 TTL passes). Also read, not yet probed:
-      `commit` returns `Ok` without writing when the bucket it staged into
-      is no longer open (`ts_store`'s delete clears it first), which may
-      lose a staged insert silently. Found working RM-456, 2026-11-15.
-      Verify: tests/backlog/test_rm_found_rm456.py::test_an_insert_into_a_bucket_the_ttl_monitor_removes_succeeds
-      Backlog-ID: RM-702
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
   `{$meta}` shape measured on 8.2.11 matches since 2026-10-17, except a
@@ -2221,27 +2193,6 @@ bucket documents in `system.buckets.<name>`, each data field mongod's
 compressed column, placed by mongod's bucket catalog
 (`crates/secantus-commands/src/bucket_catalog.rs`). What is left:
 
-- [ ] **RUST MongoDB server: `serverStatus` has no `bucketCatalog`
-      section.** mongod 8.2.11 reports one once a time-series collection is
-      written to: `numBuckets`, `numOpenBuckets`, `numIdleBuckets`,
-      `numArchivedBuckets`, `memoryUsage`, the execution counters
-      (`numBucketInserts`, `numBucketUpdates`, `numCommits`,
-      `numMeasurementsCommitted`, the `numBucketsClosedDueTo...` and
-      `numBucketReopeningsFailedDueTo...` families and the rest, 45 fields in
-      all, in one order) and `stateManagement` (`bucketsManaged`,
-      `currentEra`, `erasWithRemainingBuckets`, `trackedClearOperations`).
-      None before the first write. This server reports no section. Every
-      field but `memoryUsage` is the catalog's own state
-      (`crates/secantus-commands/src/bucket_catalog.rs`): report it from what
-      the catalog keeps, counting as mongod does (a commit per bucket per
-      batch, an update when a measurement joins an open bucket, and so on).
-      `memoryUsage` is reported with the key but its value is RM-710's.
-      Measured 2026-11-11 and 2026-11-16 (a time-series collection gives a
-      section after four inserts over two metadata values: `numBuckets` 2,
-      `numCommits` 2, `numMeasurementsCommitted` 4). (This was part of
-      RM-549, split 2026-11-16, Joe's go-ahead.)
-      Verify: tests/backlog/test_rm_found_2026_11_11_rm088.py::test_server_status_reports_the_bucket_catalog, tests/backlog/test_rm_bucket_catalog.py::test_bucket_catalog_counts_and_counters_follow_the_writes
-      Backlog-ID: RM-709
 - [ ] **RUST MongoDB server: the bucket catalog keeps no account of its
       memory.** mongod 8.2.11's `bucketCatalog.memoryUsage` is the bytes its
       own C++ structures allocate through tracking allocators: 12552 with one
@@ -2255,9 +2206,29 @@ compressed column, placed by mongod's bucket catalog
       the bytes mongod's structures allocate through its tracking
       allocators, so `memoryUsage` follows mongod's. The size limit's memory
       accounting (`getCacheDerivedBucketMaxSize`, decided 2026-10-16) does
-      not depend on it and is built. Needs RM-709's section to report it
-      through, and RM-711's expiry needs this. (This was part of RM-549, split
+      not depend on it and is built. `serverStatus`'s section reports
+      `memoryUsage` as 0 until this lands, and RM-711's expiry needs this. (This was part of RM-549, split
       2026-11-16, Joe's go-ahead.)
+      **Measured 2026-11-25 (macOS arm64 mongod 8.2.11, each twice, stable):**
+      one measurement with metadata 12552 whatever the metadata's type or
+      length (41 characters too), with no metadata field 12024; one extra
+      data field 12564 (+12), two extra 15296 (+2744); a second measurement
+      12576 (+24). The steps are container capacity growth and `sizeof`, so
+      a faithful model ports mongod's containers allocation for allocation,
+      and the numbers are libc++'s: Linux x86-64 mongod (the exemplar, and
+      CI's) builds with libstdc++, whose `std::string` and hash-map nodes
+      differ in size, so the pinned 12552 / 12828 are likely macOS-only and
+      unmeasured on Linux (no Docker daemon here). **Decision needed
+      (Joe):** measure Linux mongod and pin its numbers (the faithful path:
+      port the tracking-allocator charges from mongod's source), or narrow
+      what is pinned.
+      **Decided 2026-11-25 (Joe):** the faithful option. Measure Linux
+      x86-64 mongod (the exemplar build, libstdc++; 8.2.11, and 8.2.12 which
+      CI now runs) for every case above, pin those numbers in the gap test
+      (an `only_on("linux")` case, checked by CI), and port mongod's memory
+      charges from its source so the counts match that build. Linux mongod
+      is not runnable here until Docker's daemon is started; CI's
+      `mdb-binary` jobs run Linux mongod and can measure it.
       Verify: tests/backlog/test_rm_bucket_catalog.py::test_bucket_catalog_memory_usage_is_the_bytes_mongod_accounts
       Backlog-ID: RM-710
 - [ ] **RUST MongoDB server: idle buckets never expire past
@@ -2272,10 +2243,31 @@ compressed column, placed by mongod's bucket catalog
       Which expire depends on the stripe each lands in, so only the facts
       are pinned. This server never expires an idle bucket, and refuses the
       `setParameter` (code 72). **Waits on RM-710** (the memory accounting
-      decides when the threshold is passed) and needs RM-709's counters. (This was part of RM-549, split 2026-11-16, Joe's
+      decides when the threshold is passed) and counts through the `bucketCatalog` section's counters. (This was part of RM-549, split 2026-11-16, Joe's
       go-ahead.)
       Verify: tests/backlog/test_rm_bucket_catalog.py::test_idle_buckets_expire_past_the_memory_threshold
       Backlog-ID: RM-711
+- [ ] **RUST MongoDB server: `bucketCatalog`'s open and archived counts
+      split differently from mongod's.** mongod 8.2.11 reports
+      `numOpenBuckets` from its stripes' open buckets and
+      `numArchivedBuckets` as the active buckets less those; after a
+      series' bucket rolls forward two days and a measurement for that
+      series' earlier window arrives (with other series and a count
+      rollover beside it), mongod has 5 buckets, 3 open, 2 archived and 4
+      managed, where this server has 4 open and 1 archived. Find which
+      bucket mongod holds outside its open set (measured 2026-11-25).
+      Verify: tests/backlog/test_rm_bucket_catalog.py::test_open_and_archived_buckets_split_as_mongod_counts_them
+      Backlog-ID: RM-798
+- [ ] **RUST MongoDB server: a dropped collection's buckets are cleared at
+      once, not by era.** mongod 8.2.11's bucket state manager clears them
+      lazily: a drop opens a new era (`currentEra` 1,
+      `trackedClearOperations` 1) and the dropped buckets stay among the
+      open and managed ones (`numOpenBuckets` 2 with `numBuckets` 1, so
+      `numArchivedBuckets` -1) until they are next touched. This server
+      forgets them at once and reports `currentEra` 0 (measured
+      2026-11-25).
+      Verify: tests/backlog/test_rm_bucket_catalog.py::test_dropping_a_collection_clears_its_buckets_by_era
+      Backlog-ID: RM-799
 - **Scope decision — `listCollections` order around time-series buckets.**
   This server puts each bucket namespace after its collection and
   `system.views` last; mongod's order is not stable between two runs of the
@@ -2868,16 +2860,6 @@ produce the dump it exists for.
 
 ## The storage model is not mongod's (tasks/mongod-storage-model-plan.md, 2026-11-19)
 
-- [ ] **A killed mongod store is judged at its stable checkpoint, before
-      its replay.** What `secantusd-mdb` refuses by name in a store mongod
-      wrote (an index kind it keys otherwise, a time-series collection,
-      users) is read from the catalog as WiredTiger recovers it, which is
-      the stable checkpoint's: a store whose oplog after the checkpoint
-      drops what is refused (a `text` index dropped after an `fsync`) is
-      refused, where mongod's restart replays the drop and serves it
-      (measured 2026-11-22).
-      Verify: tests/backlog/test_rm_storage_model.py::test_secantus_opens_a_killed_mongod_store_whose_oplog_drops_what_it_refuses
-      Backlog-ID: RM-756
 - [ ] **A `$near`'s `executionStats` leave out its inner scans and count
       other keys.** Found closing RM-777 (2026-11-24, mongod 8.2.11). For
       `{flat: {$near: [3, 4]}, t: 1}` over `{flat: "2d", t: 1}` mongod's
@@ -2928,20 +2910,6 @@ wrote and stopped (the forward direction of RM-723).
 
 ## Found working RM-734 (index spec fidelity, 2026-11-24)
 
-- [ ] **`createIndexes` coerces a flag's type, accepts a `hidden` that is
-      no bool, and refuses `prepareUnique: true`.** Found closing RM-788
-      (2026-11-24, mongod 8.2.11). mongod's catalog keeps `sparse` and
-      `background` as given (`sparse: 1.0` stays a double, `background: 1`
-      an int, where `listIndexes` shows both as booleans), refuses a
-      `background` that is a string ("not convertible to bool", 2) and a
-      `hidden` that is not a bool ("The field 'hidden' must be a bool, but
-      got int"), and takes `prepareUnique: true` at creation, an index armed
-      as `collMod` arms one (`v, prepareUnique, key, name`). `secantusd-mdb`
-      writes every number as a bool (and drops a `sparse: 0.0`), keeps a
-      string `background`, takes `hidden: 1` and `hidden: "x"` as hidden
-      indexes, and refuses `prepareUnique: true` as an unknown field.
-      Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_create_indexes_keeps_a_flag_as_given_and_refuses_a_hidden_that_is_no_bool
-      Backlog-ID: RM-791
 - [ ] **A planner tie goes by build order, not by mongod's in-memory index
       order.** Three single-field indexes cost the same for `{a: 3, b: 3,
       c: 3}`: mongod 8.2.11 takes the first in the collection's in-memory
@@ -2952,6 +2920,46 @@ wrote and stopped (the forward direction of RM-723).
       only. Found working RM-734 (not fixed with it).
       Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_a_planner_tie_goes_by_the_in_memory_index_order
       Backlog-ID: RM-790
+
+- [ ] **A `wildcardProjection` is not parsed as a projection.** Found closing
+      RM-771 (2026-11-24, mongod 8.2.11). mongod parses the projection of a
+      `$**` index as an inclusion or an exclusion and refuses one that mixes
+      them (31254, 31253: "Cannot do exclusion on field b in inclusion
+      projection"), one that computes a field (51271) and one whose paths
+      collide (31250), each as "Failed to parse projection:
+      wildcardProjection :: caused by :: ...". `secantusd-mdb` accepts all of
+      them and builds the index from whatever its own reading makes of them.
+      Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_a_wildcard_projection_is_parsed_as_a_projection_is
+      Backlog-ID: RM-794
+
+- [ ] **The `clustered` field of an index spec is refused as unknown.** Found
+      closing RM-771 (2026-11-24, mongod 8.2.11). `clustered` is a field of
+      mongod's index spec: on its own it is 67 ("The 'unique' field is
+      required when 'clustered' is specified"), with `unique` it is 6100900
+      ("Cannot implicitly create a new collection with createIndex
+      'clustered' option"), `false` is 6492800 and a string 14.
+      `secantusd-mdb` answers 197 ("not valid for an index specification")
+      to each. Beside any other refused field mongod answers 197 for it too,
+      which is not measured further.
+      Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_a_clustered_option_on_an_index_spec_is_read_as_mongod_reads_it
+      Backlog-ID: RM-795
+
+- [ ] **An index's `storageEngine.wiredTiger.configString` is checked and
+      kept, but not applied to the index's table.** **Decision needed (Joe):**
+      apply it (as mongod builds the table from it: `block_compressor`,
+      `leaf_page_max` and the rest, listed in `collStats` as the index's
+      `creationString`) or refuse a non-empty `configString` by name, as the
+      store adoption of a mongod store holding one already does ("index se's
+      option storageEngine"). Found closing RM-771 (2026-11-24): `createIndexes`
+      now refuses a bad `storageEngine` as mongod does (WiredTiger's own
+      configuration check, `secantus_wt::validate_config`) but a valid one is
+      stored and ignored, which refusing would break for the drivers' own
+      index tests that pass one.
+      **Decided (Joe, 2026-11-25): apply it**, as mongod does -- build the
+      index's table from the valid `configString`, and list it in `collStats`
+      as the index's `creationString`. Not built yet.
+      Verify: none -- a decision about serving or refusing an option; no mongod answer to compare until it is built
+      Backlog-ID: RM-796
 
 ## Found working RM-746 (storage-model phase 7b, 2026-11-22)
 
@@ -3079,16 +3087,6 @@ Each was measured against mongod 8.2.11 beside a hashed-index probe
       Verify: tests/backlog/test_rm_found_rm732.py::test_a_sort_by_a_hashed_field_leaves_ties_as_mongods_sorter_does
       Backlog-ID: RM-770
 
-- [ ] **`createIndexes` validates its options unlike mongod.** On a plain
-      key `{a: 1}`: `prepareUnique` is accepted by mongod and refused here
-      (197); `weights` and `default_language` are refused by mongod on a key
-      that is not `text` (67) and accepted here; `wildcardProjection` on a
-      non-wildcard key is 2 BadValue ("The field 'wildcardProjection' is
-      only allowed in 'wildcard' indexes") and 67 here, with the key printed
-      as `Document({...})`; a `storageEngine` option WiredTiger rejects (2,
-      with WiredTiger's own text) is accepted here and stored.
-      Verify: tests/backlog/test_rm_found_rm732.py::test_create_indexes_validates_its_options_as_mongod_does
-      Backlog-ID: RM-771
 
 - [ ] **An equality to a DBRef is planned as a collection scan.**
       `{a: DBRef("c", 1)}` is an equality to the document `{$ref: "c", $id:

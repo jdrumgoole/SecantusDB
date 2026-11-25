@@ -74,12 +74,12 @@ def test_bucket_indexes_list_each_index_as_mongod_keeps_it(
     assert got == ref
 
 
-@pytest.mark.backlog("RM-709")
+@pytest.mark.backlog_fixed("RM-709")
 def test_server_status_reports_the_bucket_catalog(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `serverStatus` has a `bucketCatalog` section once a
     time-series collection has been written to: the buckets it holds open,
     idle and archived, its memory use, the execution counters and its state
-    registry. This server reports none."""
+    registry. This server reported none before RM-709."""
 
     def probe(client: Any) -> list:
         client.drop_database("rm_found_ts_mem")
