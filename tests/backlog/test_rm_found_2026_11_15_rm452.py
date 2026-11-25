@@ -5,8 +5,9 @@ mongod 8.2.11 as a one-member replica set.
 RM-452 ported mongod's rewrite of `operationType`, RM-698's first slice
 those of `documentKey` and `fullDocument`, its second that of `ns` by
 `$eq` / `$in`, its third that of `to`, its fourth a regex on either,
-its fifth a regex in an `$in`; the rewrites of the other event fields
-and of `$expr` are still to come; the Boolean simplifier mongod runs
+its fifth a regex in an `$in`, its sixth an `$expr` on `operationType`;
+the rewrites of the other event fields, and of `$expr` on them, are still
+to come; the Boolean simplifier mongod runs
 over the unwind's filter came with RM-699 (2026-11-24).
 """
 
@@ -177,20 +178,77 @@ def test_a_regex_on_the_namespace_joins_the_oplog_filter(
     assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)
 
 
+@pytest.mark.backlog_fixed("RM-698")
+@pytest.mark.parametrize(
+    "match",
+    [
+        {"$expr": {"$eq": ["$operationType", "insert"]}},
+        {"$expr": {"$eq": ["insert", "$operationType"]}},
+        {"$expr": {"$eq": ["$operationType", "update"]}},
+        {"$expr": {"$eq": ["$operationType", "drop"]}},
+        {"$expr": {"$eq": ["$operationType", "bogus"]}},
+        {"$expr": {"$eq": ["$operationType", 1]}},
+        {"$expr": {"$eq": ["$operationType", {"$literal": "insert"}]}},
+        {"$expr": {"$ne": ["$operationType", "insert"]}},
+        {"$expr": {"$in": ["$operationType", ["insert", "delete"]]}},
+        {"$expr": {"$gt": ["$operationType", "a"]}},
+        {"$expr": {"$and": [{"$eq": ["$operationType", "insert"]}, {"$eq": ["$x", 1]}]}},
+        {
+            "$expr": {
+                "$and": [{"$eq": ["$operationType", "insert"]}, {"$ne": ["$operationType", "x"]}]
+            }
+        },
+        {
+            "$expr": {
+                "$or": [
+                    {"$eq": ["$operationType", "insert"]},
+                    {"$eq": ["$operationType", "delete"]},
+                ]
+            }
+        },
+        {"$expr": {"$or": [{"$eq": ["$operationType", "insert"]}, {"$eq": ["$x", 1]}]}},
+        {"$expr": {"$not": [{"$eq": ["$operationType", "insert"]}]}},
+        {"$or": [{"$expr": {"$eq": ["$operationType", "insert"]}}, {"operationType": "drop"}]},
+        {"operationType": "insert", "$expr": {"$ne": ["$operationType", "delete"]}},
+        {"$expr": {"$eq": ["$x", 1]}},
+    ],
+)
+def test_an_expr_on_the_operation_type_joins_the_oplog_filter(
+    rust_mongo: Any, mongod_rs: Any, match: dict
+) -> None:
+    """mongod 8.2.11 rewrites an `$expr` on `$operationType` into an `$expr`
+    over the oplog entry (`$operationType` as a `$switch` on `op` and the
+    command's field), and the `$_internalExprEq` its optimizer derives from
+    an `$eq` as the `operationType` equality's rewrite (hash 6F8558DD for
+    `$eq` of `insert`); this server left both out of the read (90A52575)."""
+    assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)
+
+
 @pytest.mark.backlog("RM-698")
 @pytest.mark.parametrize(
-    ("match", "want"),
+    "match",
     [
-        ({"$expr": {"$eq": ["$operationType", "insert"]}}, "6F8558DD"),
+        {"$expr": {"$eq": ["$documentKey._id", 1]}},
+        {"$expr": {"$eq": ["$ns.coll", "c"]}},
+        {
+            "$expr": {
+                "$and": [{"$eq": ["$operationType", "insert"]}, {"$eq": ["$fullDocument.a", 1]}]
+            }
+        },
+        {"updateDescription.updatedFields.a": 1},
+        {"fullDocumentBeforeChange.a": 1},
+        {"txnNumber": 1},
     ],
 )
 def test_a_match_on_another_event_field_joins_the_oplog_filter(
-    rust_mongo: Any, mongod_rs: Any, match: dict, want: str
+    rust_mongo: Any, mongod_rs: Any, match: dict
 ) -> None:
     """mongod 8.2.11 rewrites a `$match` on `updateDescription`,
     `fullDocumentBeforeChange`, `clusterTime`, `lsid` or `txnNumber`, and an
-    `$expr` on those, into the oplog filter, which changes the read's `queryHash` from 90A52575."""
-    assert _query_hash(mongod_rs, match) == want
+    `$expr` on `documentKey`, `ns` or `fullDocument`, into the oplog filter,
+    which changes the read's `queryHash` from 90A52575."""
+    want = _query_hash(mongod_rs, match)
+    assert want != "90A52575"
     assert _query_hash(rust_mongo, match) == want
 
 

@@ -2048,7 +2048,8 @@ would see them. What is left:
 
 - [ ] **RUST MongoDB server: a `$match` after a `$changeStream` on an
       event field other than `operationType`, `documentKey`, `fullDocument`,
-      `ns` or `to` is not rewritten into the oplog filter.** mongod 8.2.11
+      `ns` or `to`, or an `$expr` on one other than `operationType`, is not
+      rewritten into the oplog filter.** mongod 8.2.11
       rewrites `updateDescription`,
       `fullDocumentBeforeChange`, the renamed `clusterTime` / `lsid` /
       `txnNumber` (also into the transaction filter), and an `$expr` over
@@ -2062,9 +2063,14 @@ would see them. What is left:
       third (2026-11-25) for `to` (`o.to` of a command), and the fourth
       (2026-11-25) a regex on either (mongod's `$expr` of `$regexMatch`
       over `$substrBytes`), the fifth (2026-11-25) a regex inside an `$in`
-      on either. The rest of `change_stream_rewrite_helpers.cpp`
-      (`matchRewriteUpdateDescription`, `rewriteAggExpressionTree`, the
-      other event fields) is to transcribe (found working RM-452).
+      on either, and the sixth (2026-11-25) an `$expr` on `operationType`
+      (`rewriteAggExpressionTree` with `exprRewriteOperationType`, and the
+      `$_internalExprEq` the optimizer derives). An `$expr` on any other
+      field (`documentKey`, `ns`, `fullDocument`, ...) is still dropped,
+      and so is the `$_internalExprEq` on it. The rest of
+      `change_stream_rewrite_helpers.cpp` (`matchRewriteUpdateDescription`,
+      the other event fields, their expression rewrites) is to transcribe
+      (found working RM-452).
       Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_a_match_on_another_event_field_joins_the_oplog_filter
       Backlog-ID: RM-698
 - [ ] **RUST MongoDB server: the Boolean simplifier differs from mongod's
