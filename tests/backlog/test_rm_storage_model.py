@@ -629,6 +629,40 @@ def test_mongod_opens_the_index_specs_secantus_wrote_and_reindexed(tmp_path: Pat
         _stop_mongod(proc, client)
 
 
+@pytest.mark.backlog_fixed("RM-797")
+@pytest.mark.parametrize("round_", range(3))
+def test_mongod_starts_on_a_standalone_store_closed_within_the_second(
+    tmp_path: Path, round_: int
+) -> None:
+    """mongod 8.2 started on a `--standalone` store of ours initiates a set
+    with its first write at the wall clock's second, increment 1. A store
+    that carried a stable timestamp at its newest oplog entry, one at that
+    second or the next (a reopened store's clock runs a second ahead), made
+    WiredTiger refuse that write -- "commit timestamp (T, 1) must be after
+    the stable timestamp (T, n)" -- and mongod died on a fatal assertion
+    (28560). A standalone's clean close takes an unstable checkpoint, as
+    mongod's does, so no stable timestamp comes with the store (RM-797). Each
+    round reopens the store once (the second life's entries sit in the
+    second ahead) and starts mongod at once; before the fix about three
+    rounds in four died."""
+    store = tmp_path / "store"
+    with rust_mongo_server(store, "--standalone") as client:
+        _spec_options(client)
+    with rust_mongo_server(store, "--standalone") as client:
+        client["app"]["c"].insert_one({"_id": 99})
+        client["app"]["c"].update_one({"_id": 99}, {"$set": {"x": 1}})
+    proc, client = _mongod_on(store, None, "rs0")
+    try:
+        assert client is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            host, port = client.address or ("127.0.0.1", 0)
+            _wait_primary(client, f"{host}:{port}")
+            client["app"]["c"].insert_one({"_id": 100})
+            assert client["app"]["c"].count_documents({}) == 7
+    finally:
+        _stop_mongod(proc, client)
+
+
 @pytest.mark.backlog_fixed("RM-788")
 def test_secantus_keeps_the_index_specs_mongod_wrote(tmp_path: Path) -> None:
     """A store mongod 8.2.11 wrote, its indexes made with `sparse: false` and

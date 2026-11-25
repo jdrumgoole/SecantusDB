@@ -314,6 +314,15 @@ fn the_stable_checkpoint_position_is_the_recovery_timestamp() {
     let anchored;
     {
         let st = Storage::open_with_options(home.to_str().unwrap(), &options).unwrap();
+        // A replica-set member's clean close keeps its stable checkpoint; a
+        // standalone's does not (RM-797, the tests below).
+        st.insert(
+            "local",
+            "system.replset",
+            vec![enc(&bson::doc! {"_id": "rs0"})],
+            true,
+        )
+        .unwrap();
         st.insert_one("app", "c", &enc(&bson::doc! {"_id": 1}))
             .unwrap();
         st.stable_checkpoint().unwrap();
@@ -333,6 +342,74 @@ fn the_stable_checkpoint_position_is_the_recovery_timestamp() {
         assert!(st.stable_checkpoint_seq() >= st.oplog_tail_seq());
     } // close BEFORE deleting the home — a live connection's close checkpoint
       // over a removed directory is a guaranteed WT panic.
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// RM-797: a standalone's clean close (a store with no replica-set
+/// configuration) takes its checkpoint of every update and records no stable
+/// timestamp, as mongod's standalone shutdown does, so a store opened by
+/// mongod finds no stable timestamp ahead of its own first write (its
+/// `replSetInitiate` commits at the wall clock's second, which a stable
+/// timestamp at the newest oplog entry can be ahead of). The data and the
+/// oplog survive, and are not replayed from the oplog's first entry.
+#[test]
+fn a_standalone_close_records_no_stable_timestamp() {
+    let home = temp_home();
+    let options = secantus_storage::StorageOptions {
+        data_nonlogged: Some(true),
+        oplog_nonlogged: Some(false),
+        ..secantus_storage::StorageOptions::default()
+    };
+    let tail;
+    {
+        let st = Storage::open_with_options(home.to_str().unwrap(), &options).unwrap();
+        for i in 0..5 {
+            st.insert_one("app", "c", &enc(&bson::doc! {"_id": i}))
+                .unwrap();
+        }
+        st.delete_by_id("app", "c", &Bson::Int32(0)).unwrap();
+        tail = st.oplog_tail_seq();
+    }
+    for _ in 0..2 {
+        let st = Storage::open_with_options(home.to_str().unwrap(), &options).unwrap();
+        assert_eq!(st.open_record().recovery_timestamp, 0);
+        assert_eq!(st.stable_checkpoint_seq(), tail, "replayed from the marker");
+        assert_eq!(
+            st.collection_count_at_most("app", "c", 100).unwrap(),
+            Some(4)
+        );
+        assert_eq!(st.oplog_tail_seq(), tail);
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// RM-797: a replica-set member's clean close keeps its stable checkpoint:
+/// mongod opens the store as that set's member and resumes its clock from
+/// the oplog.
+#[test]
+fn a_replica_set_members_close_keeps_its_stable_timestamp() {
+    let home = temp_home();
+    let options = secantus_storage::StorageOptions {
+        data_nonlogged: Some(true),
+        oplog_nonlogged: Some(false),
+        ..secantus_storage::StorageOptions::default()
+    };
+    {
+        let st = Storage::open_with_options(home.to_str().unwrap(), &options).unwrap();
+        st.insert(
+            "local",
+            "system.replset",
+            vec![enc(&bson::doc! {"_id": "rs0"})],
+            true,
+        )
+        .unwrap();
+        st.insert_one("app", "c", &enc(&bson::doc! {"_id": 1}))
+            .unwrap();
+    }
+    {
+        let st = Storage::open_with_options(home.to_str().unwrap(), &options).unwrap();
+        assert_ne!(st.open_record().recovery_timestamp, 0);
+    }
     let _ = std::fs::remove_dir_all(&home);
 }
 

@@ -158,6 +158,9 @@ pub struct Connection {
     /// the callbacks left null, so the handler is the connection's own and
     /// outlives it: `Drop` closes the connection before this field drops.
     handler: Box<Handler>,
+    /// The close takes its checkpoint of every update, with no stable
+    /// timestamp (`use_timestamp=false`): see [`Connection::close_unstable`].
+    unstable_close: std::sync::atomic::AtomicBool,
 }
 
 // The connection handle is safe to share across threads; WiredTiger's own MVCC
@@ -376,6 +379,7 @@ impl Connection {
             ptr,
             stats: keeps_statistics(config),
             handler,
+            unstable_close: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -391,6 +395,16 @@ impl Connection {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
+    }
+
+    /// Have the close checkpoint every update and record no stable
+    /// timestamp (`use_timestamp=false`), as mongod's standalone shutdown
+    /// does. Without it WiredTiger's close writes a checkpoint at the
+    /// stable timestamp, and the store carries that timestamp to the next
+    /// open.
+    pub fn close_unstable(&self) {
+        self.unstable_close
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Open a new session (thread-affine — open one per thread).
@@ -435,7 +449,12 @@ impl Drop for Connection {
         if !self.ptr.is_null() {
             if let Some(close) = unsafe { (*self.ptr).close } {
                 // A drop cannot return the error; it must not vanish (RM-189).
-                let rc = unsafe { close(self.ptr, ptr::null()) };
+                let unstable = self
+                    .unstable_close
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let cfg = CString::new("use_timestamp=false").unwrap();
+                let rc =
+                    unsafe { close(self.ptr, if unstable { cfg.as_ptr() } else { ptr::null() }) };
                 if rc != 0 {
                     eprintln!("secantus-wt: Connection close failed: {:?}", check(rc));
                 }

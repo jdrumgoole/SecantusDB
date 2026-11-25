@@ -8369,7 +8369,24 @@ impl Storage {
                 // race). A checkpoint failure is logged, never silent: in a
                 // database a close-time write error is a durability signal.
                 if self.durable && !self.in_memory {
-                    if let Err(e) = self.drop_pending.checkpoint(&session) {
+                    // A store with no replica-set configuration is a
+                    // standalone's, and a standalone's clean shutdown takes
+                    // an unstable checkpoint (every update, no stable
+                    // timestamp), as mongod's does: the store then carries
+                    // no stable timestamp for mongod to find ahead of its
+                    // own first write (RM-797). The oplog this server keeps
+                    // beyond mongod's standalone is what the timestamp
+                    // named; nothing is left to replay after a clean stop.
+                    let standalone = self.timestamped
+                        && matches!(
+                            self.collection_count_at_most("local", "system.replset", 1),
+                            Ok(Some(0))
+                        );
+                    let config = standalone.then_some("use_timestamp=false");
+                    if standalone {
+                        self.conn.close_unstable();
+                    }
+                    if let Err(e) = self.drop_pending.checkpoint_with(&session, config) {
                         fail("the final checkpoint", e.into());
                     }
                 }
@@ -8529,12 +8546,23 @@ impl Storage {
             )?;
             // mongod's recovery truncates the oplog after the point first,
             // in a store whose data is recovered by replaying it (RM-736).
-            let (replay_from, truncation) = if !in_memory && stored_mode.unwrap_or(data_create_mode)
-            {
-                truncate_oplog_after_point(&conn, &boot, &oplog.uri, recovery_timestamp)?
-            } else {
-                (recovery_timestamp, None)
-            };
+            let (mut replay_from, truncation) =
+                if !in_memory && stored_mode.unwrap_or(data_create_mode) {
+                    truncate_oplog_after_point(&conn, &boot, &oplog.uri, recovery_timestamp)?
+                } else {
+                    (recovery_timestamp, None)
+                };
+            // A checkpoint with no stable timestamp is the one a standalone's
+            // clean close takes (`Connection::close_unstable`): it holds
+            // every update, through the oplog position its marker names, so
+            // the replay starts there and not at the oplog's first entry.
+            if replay_from == 0 && !in_memory && stored_mode.unwrap_or(data_create_mode) {
+                if let Some(left) = sizes::SizeStorer::clean_close_marker(&boot)? {
+                    if let Some(through) = left.first().filter(|n| **n > 1) {
+                        replay_from = (*through - 1) as u64;
+                    }
+                }
+            }
             if let Some(t) = truncation {
                 eprintln!(
                     "secantus-storage: Removing unapplied oplog entries after \
@@ -26267,8 +26295,17 @@ impl DropPending {
     /// Take a checkpoint on `session`, counted: what releases drop-pending
     /// idents.
     fn checkpoint(&self, session: &Session) -> std::result::Result<(), WtError> {
+        self.checkpoint_with(session, None)
+    }
+
+    /// [`Self::checkpoint`] with a WiredTiger configuration.
+    fn checkpoint_with(
+        &self,
+        session: &Session,
+        config: Option<&str>,
+    ) -> std::result::Result<(), WtError> {
         let n = self.started.fetch_add(1, Ordering::SeqCst) + 1;
-        session.checkpoint(None)?;
+        session.checkpoint(config)?;
         self.completed.fetch_max(n, Ordering::SeqCst);
         Ok(())
     }
