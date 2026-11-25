@@ -541,6 +541,10 @@ impl PgHandler {
                 ))
             })
             .collect();
+        let (store, db) = (
+            std::sync::Arc::as_ptr(&self.storage) as usize,
+            self.stats().db,
+        );
         let mut columns = Document::new();
         let mut relids: Vec<i64> = builtin_rows()
             .iter()
@@ -555,10 +559,28 @@ impl PgHandler {
             let Some(def) = Self::virtual_table(name) else {
                 continue;
             };
-            let docs = self.table_docs(name)?;
+            let mut docs = self.table_docs(name)?;
             // ANALYZE computes nothing from no rows.
             if docs.is_empty() {
                 continue;
+            }
+            // `acquire_sample_rows` reads the heap block by block, and
+            // `compute_scalar_stats` correlates each column's sort order
+            // with that order (RP-358): the rows go in it, a row whose
+            // place is not modelled after every placed one, in this
+            // server's order.
+            if let Some(order) = crate::catalog_btree::heap_order(store, db, rel) {
+                let fields: Option<Vec<String>> = order
+                    .attnums
+                    .iter()
+                    .map(|a| Some(def.column(attnames.get(&(rel, *a))?)?.field()))
+                    .collect();
+                if let Some(fields) = fields {
+                    docs.sort_by_cached_key(|d| {
+                        let values: Vec<Option<&Bson>> = fields.iter().map(|f| d.get(f)).collect();
+                        order.place(&values).unwrap_or(i64::MAX)
+                    });
+                }
             }
             let totalrows = docs.len() as f64;
             for row in builtin_rows()

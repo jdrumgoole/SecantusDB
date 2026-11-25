@@ -2619,12 +2619,12 @@ def test_a_database_wide_analyze_measures_a_quoted_char_column(rust_pg: Any) -> 
     assert row == ("{i,v,r,t}", "{0.3941606,0.34063262,0.16788322,0.097323604}", 4.0)
 
 
-@pytest.mark.backlog("RP-358")
+@pytest.mark.backlog_fixed("RP-358")
 def test_a_catalog_columns_correlation_follows_the_heap(rust_pg: Any) -> None:
     """PostgreSQL 15.19 (a fresh database on a private cluster): ANALYZE
-    correlates each catalog column with PostgreSQL's heap order, so after a
-    new table `pg_class`'s correlations are these; this server walks its own
-    row order."""
+    correlated each catalog column with PostgreSQL's heap order, so after a
+    new table `pg_class`'s correlations were these; this server walked its
+    own row order."""
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
         c.execute("drop database if exists rp358")
         c.execute("create database rp358")
@@ -2641,6 +2641,52 @@ def test_a_catalog_columns_correlation_follows_the_heap(rust_pg: Any) -> None:
         ("relname", -0.12838678),
         ("relnatts", 0.67018104),
     ]
+
+
+def _pg_type_correlations(rust_pg: Any, db: str, columns: tuple[str, ...]) -> list[Any]:
+    """`pg_type`'s correlations after a new table and a plain ANALYZE in a
+    fresh database."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        c.execute(f"drop database if exists {db}")
+        c.execute(f"create database {db}")
+    with psycopg.connect(_dsn(rust_pg) + f" dbname={db}", autocommit=True) as c:
+        c.execute("create table zzzz_rp313 (a int)")
+        c.execute("analyze")
+        return c.execute(
+            "select attname::text, correlation from pg_stats where tablename = 'pg_type'"
+            " and attname = any(%s) order by 1",
+            (list(columns),),
+        ).fetchall()
+
+
+@pytest.mark.backlog_fixed("RP-358")
+def test_a_catalog_columns_correlation_counts_the_new_rows_where_they_went(
+    rust_pg: Any,
+) -> None:
+    """PostgreSQL 15.20 (a fresh database on a private cluster; its
+    `pg_type` heap is 15.19's page for page): the two `pg_type` rows a new
+    table writes go on the heap's last block, (14,10) and (14,11), and
+    ANALYZE's correlations count them there; this server walked its own
+    row order."""
+    rows = _pg_type_correlations(rust_pg, "rp358_t", ("typinput", "typlen", "typname"))
+    assert rows == [
+        ("typinput", 0.29722527),
+        ("typlen", 0.5353159),
+        ("typname", -0.07610275),
+    ]
+
+
+@pytest.mark.backlog("RP-1098")
+def test_a_new_tables_array_type_oid_comes_before_its_row_types(rust_pg: Any) -> None:
+    """PostgreSQL 15.20 (a fresh database on a private cluster): `create
+    table zzzz_rp313 (a int)` draws the table's oid (16385), its array
+    type's (16386, `AssignTypeArrayOid`) and then its row type's (16387)
+    from the one counter, so after a plain ANALYZE `pg_type.oid`'s
+    correlation over the heap's order is 0.9796509; here the row type is
+    67001 and the array 167001, which sorts the two the other way
+    (0.979651)."""
+    rows = _pg_type_correlations(rust_pg, "rp1098_t", ("oid",))
+    assert rows == [("oid", 0.9796509)]
 
 
 @pytest.mark.backlog_fixed("RP-313")

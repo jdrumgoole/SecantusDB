@@ -36,6 +36,10 @@ use crate::heap_page::{tid, untid, Heap};
 pub(crate) struct Row {
     /// Where its index entries point: the root of its HOT chain.
     pub(crate) ctid: i64,
+    /// Where its live version is: the root, or the heap-only tuple a HOT
+    /// update put on the root's page, which a heap scan meets in its
+    /// place (`heapgettup`).
+    at: i64,
     /// Its key in each index of the catalog, by index oid.
     pub(crate) keys: Vec<(i64, Vec<Bson>)>,
     /// Neither deleted by a committed transaction nor written by one that
@@ -131,6 +135,9 @@ pub(crate) fn write(store: usize, db: i64, pid: i32, group: i64, writes: &[Write
                     .update(pid, Some(old), old_len, w.len, hot, 0, Bson::Null);
                 if hot && untid(new).map(|t| t.0) == untid(old).map(|t| t.0) {
                     // Reached through the chain's root: no entry of its own.
+                    if let Some(r) = cat.rows.iter_mut().find(|r| r.ctid == old && r.live) {
+                        r.at = new;
+                    }
                     cat.heap.accessed.clear();
                     placed.push(old);
                     continue;
@@ -159,6 +166,7 @@ pub(crate) fn write(store: usize, db: i64, pid: i32, group: i64, writes: &[Write
         }
         cat.rows.push(Row {
             ctid,
+            at: ctid,
             keys: w.keys.clone(),
             live: true,
             group,
@@ -274,6 +282,33 @@ pub(crate) fn rows(
             .filter_map(key_of)
             .collect(),
     }
+}
+
+/// The live rows of `catalog` with a key in `index`, each key and where
+/// its live version is, which a heap scan reads (`heapgettup`), not the
+/// root of its HOT chain its index entries point at.
+pub(crate) fn live_places(
+    store: usize,
+    db: i64,
+    catalog: i64,
+    index: i64,
+) -> Vec<(Vec<Bson>, i64)> {
+    let st = state();
+    let Some(cat) = st
+        .dbs
+        .get(&(store, home(db, catalog)))
+        .and_then(|c| c.get(&catalog))
+    else {
+        return Vec::new();
+    };
+    cat.rows
+        .iter()
+        .filter(|r| r.live)
+        .filter_map(|r| {
+            let (_, key) = r.keys.iter().find(|(i, _)| *i == index)?;
+            Some((key.clone(), r.at))
+        })
+        .collect()
 }
 
 /// The visibility map's all-visible bit of `block` of `catalog` and the

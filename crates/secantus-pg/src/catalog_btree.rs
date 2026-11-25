@@ -526,6 +526,89 @@ fn scan_tids(
     (pages, later.into_iter().map(|(_, tid)| tid).collect())
 }
 
+/// Where each row of a built-in catalog is in its heap in one database,
+/// found by its key in one of the catalog's unique indexes: a heap scan
+/// (`heapgettup`, as ANALYZE's `acquire_sample_rows` reads a table) meets
+/// the rows block by block, each block's in offset order.
+pub(crate) struct HeapOrder {
+    /// The index's key columns, as `pg_index.indkey` names them.
+    pub(crate) attnums: Vec<i64>,
+    types: Vec<i64>,
+    /// Each key's live tuple, as `block * 65536 + offset`.
+    at: HashMap<String, i64>,
+}
+
+impl HeapOrder {
+    fn key(&self, key: &[Bson]) -> String {
+        format!("{key:?}")
+    }
+
+    /// Where the row whose key columns hold `values` is; `None` for a
+    /// row whose place is not modelled (DDL other than RP-291's, or one
+    /// written before a restart).
+    pub(crate) fn place(&self, values: &[Option<&Bson>]) -> Option<i64> {
+        let key: Vec<Bson> = values
+            .iter()
+            .zip(&self.types)
+            .map(|(v, typ)| v.map_or(Bson::Null, |v| normal(v, *typ)))
+            .collect();
+        self.at.get(&self.key(&key)).copied()
+    }
+}
+
+/// [`HeapOrder`] of catalog `table` in database `(store, db)`: `initdb`'s
+/// rows where it left them -- the live tuple a HOT chain's root redirects
+/// to, not the root its index entries point at -- and the rows DDL wrote
+/// since where they were placed (`catalog_places.rs`). Keyed by the
+/// catalog's unique index of fewest columns (the lowest oid among them)
+/// that `initdb`'s dump holds; `None` for a catalog with none.
+pub(crate) fn heap_order(store: usize, db: i64, table: i64) -> Option<HeapOrder> {
+    let facts = builtin();
+    let heap = initdb_heaps().get(&table)?;
+    let mut indexes: Vec<&crate::catalog_facts::CatalogIndex> = facts
+        .indexes_of
+        .get(&table)?
+        .iter()
+        .filter_map(|i| facts.indexes.get(i))
+        .filter(|i| i.unique && !i.keys.is_empty() && i.keys.iter().all(|k| *k > 0))
+        .filter(|i| layouts().contains_key(&i.oid))
+        .collect();
+    indexes.sort_by_key(|i| (i.keys.len(), i.oid));
+    let index = indexes.first()?;
+    let layout = layouts().get(&index.oid)?;
+    let live: std::collections::HashSet<i64> = heap.tids.iter().copied().collect();
+    let mut order = HeapOrder {
+        attnums: index.keys.clone(),
+        types: layout.types.clone(),
+        at: HashMap::new(),
+    };
+    for (key, root) in layout.in_order() {
+        let (block, off) = (root / 65536, (root % 65536) as u16);
+        let tuple = match usize::try_from(block)
+            .ok()
+            .and_then(|b| heap.pages.get(b))
+            .and_then(|p| p.lps.get(&off))
+        {
+            Some(crate::heap_page::Lp::Redirect(to)) => block * 65536 + i64::from(*to),
+            _ => root,
+        };
+        if live.contains(&tuple) {
+            let k = order.key(&key);
+            order.at.insert(k, tuple);
+        }
+    }
+    for (key, at) in crate::catalog_places::live_places(store, db, table, index.oid) {
+        let key: Vec<Bson> = key
+            .iter()
+            .zip(&order.types)
+            .map(|(v, typ)| normal(v, *typ))
+            .collect();
+        let k = order.key(&key);
+        order.at.insert(k, at);
+    }
+    Some(order)
+}
+
 /// `Heap Fetches` of an index-only scan of catalog index `index` for the
 /// rows whose leading key columns are `key`, returning `rows` rows, in
 /// database `(store, db)` (`IndexOnlyNext`): a tuple whose heap block the
@@ -664,6 +747,35 @@ mod tests {
         let c = &layouts()[&2663];
         assert_eq!((c.root, c.in_order().len()), (3, 410));
         assert_eq!(c.types, vec![NAME, 26]);
+    }
+
+    #[test]
+    fn every_initdb_row_has_its_own_place_in_the_heap() {
+        // Each catalog with a unique index keys every live tuple of its
+        // `initdb` heap once: the HOT chains' roots redirect to them.
+        let mut keyed = 0;
+        for (table, heap) in initdb_heaps() {
+            let Some(order) = heap_order(usize::MAX, 0, *table) else {
+                continue;
+            };
+            let mut places: Vec<i64> = order.at.values().copied().collect();
+            places.sort_unstable();
+            assert_eq!(places, heap.tids, "{}", heap.name);
+            keyed += 1;
+        }
+        assert!(keyed > 40, "{keyed}");
+        // pg_class by oid (`select oid, ctid from pg_class` in a fresh
+        // database): pg_type's row is the heap-only tuple (0,47) that the
+        // root its index entry names, (0,1), redirects to; pg_class's own
+        // an ordinary tuple, (7,58).
+        let class = heap_order(usize::MAX, 0, 1259).expect("pg_class");
+        assert_eq!(class.attnums, vec![1]);
+        assert_eq!(class.place(&[Some(&Bson::Int32(1247))]), Some(47));
+        assert_eq!(
+            class.place(&[Some(&Bson::Int64(1259))]),
+            Some(7 * 65536 + 58)
+        );
+        assert_eq!(class.place(&[Some(&Bson::Int64(16384))]), None);
     }
 
     #[test]

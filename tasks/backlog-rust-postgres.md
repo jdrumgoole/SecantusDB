@@ -1677,18 +1677,22 @@ a regression test.
       Backlog-ID: RP-313
       Verify: none -- the `pg_node_tree` columns need `nodeToString`'s
       text of each stored tree; no gap test until a probe pins one
-- [ ] **A database-wide ANALYZE's correlation of a catalog column is not
-      PostgreSQL's.** `compute_scalar_stats` correlates a column's sort order
-      with the rows' heap order; here the catalog's rows are walked in this
-      server's own order, not PostgreSQL's heap's (`initdb`'s pages, then
-      where a new row goes, RP-291). In a fresh database after `create table
-      zzzz_rp313 (a int)` and `analyze`, PostgreSQL 15.19's `pg_class`
-      correlations are `oid` 0.6547713, `relkind` 0.7882681, `relname`
-      -0.12838678, `relnatts` 0.67018104; here 0.9854369, 0.8315357,
-      0.1999988 and 0.50667804. The most common values and their
-      frequencies match (found while working RP-313).
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_columns_correlation_follows_the_heap
-      Backlog-ID: RP-358
+- [ ] **A new table's array type's oid sorts after its row type's.**
+      PostgreSQL draws every new object's oid from one counter
+      (`GetNewOidWithIndex`, from `FirstNormalObjectId`): `create table
+      zzzz_rp313 (a int)` in a fresh 15.20 database (after `create
+      database`, 16384) is 16385, its array type 16386
+      (`AssignTypeArrayOid`, before `TypeCreate`) and its row type 16387.
+      Here user oids count from 67,000 and a type's array is its element's
+      oid plus 100,000 (`USER_TYPE_ARRAY_OID_OFFSET`, RP-137): 67000,
+      67001 and 167001, so the array sorts after the row type. A visible
+      answer moves with it: after a plain ANALYZE, `pg_type.oid`'s
+      correlation over the heap's order is 0.9796509 on PostgreSQL, here
+      0.979651 (found while working RP-358). Constraint oids are this
+      server's own numbers by a scope decision; whether that extends to
+      types and relations is not decided.
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_new_tables_array_type_oid_comes_before_its_row_types
+      Backlog-ID: RP-1098
 - [ ] **A chain of inequality joins under a LIMIT runs far past the rows
       it returns.** `select e.a, e3.a, zs.a, e4.a from e join e e3 on e.a <
       e3.a join zs on e3.a > zs.a join e e4 on e4.a < zs.a limit 7 offset
