@@ -2992,6 +2992,58 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       Backlog-ID: RM-728
       Verify: none -- a test-quality item: the behaviour is right on every run measured here; what is wrong is that the test can fail on timing alone
 
+- [ ] **RM-501's regression test times mongod, and mongod's own delete
+      once fitted the budget (2026-11-25).**
+      `tests/backlog/test_rm_found_2026_11_10_rm391.py::test_a_batched_delete_many_tests_each_document_twice`
+      gives a `deleteMany` of one slow document 1.5x the fastest of three
+      `find`s and expects code 50 from both servers. On pg-batch snapshot
+      PR #2992 (run 45595956409, job `mdb-binary (backlog)`, head
+      ec891bbfc, a PG planner change only) it read REGRESSED, and the
+      side that differed was mongod's: `theirs` was `None`, so mongod
+      8.2.12's batched delete finished inside the budget. It passed on
+      every other run that day, `main`'s included. mongod re-tests a staged
+      document's filter when the batch is deleted only if the statement
+      yielded and the snapshot moved in between, so "tests each document
+      twice" is itself timing on mongod's side. Decide from mongod's
+      source (`batched_delete_stage.cpp`, `ensureStillMatches`) when the
+      second test happens, then make the test force it, for example with
+      a yield the test can trigger, or compare a count that does not move
+      with the machine. Keep it able to fail on a server that tests once.
+      Reported by the PostgreSQL session; test code unchanged.
+      Verify: none -- intermittent on CI; the test itself is the check
+      Backlog-ID: RM-803
+
+- [ ] **Stopping a gate run leaves its tests' reference mongods running
+      (2026-11-25).** `scripts/detached_run.py stop` on a `gate_rm.py`
+      run ends pytest, but the `mongod_rs` / probe fixtures' `mongod`
+      processes (`--dbpath .../T/secantus-probe-<pid>-mongod-*`) are
+      reparented to PID 1 and keep running, each holding a port and a
+      store. Four were found idle on 2026-11-25: two 7.5 hours old, from
+      a gate a subagent stopped, and two 1.5 hours old, from one stopped
+      for a rebase. Either the fixture starts mongod in its own process
+      group and registers an exit handler that a SIGTERM reaches, or
+      `detached_run.py stop` signals the whole session it started. Then
+      the fixture's store is removed too.
+      Verify: none -- tooling; reproduce by stopping a gate in `mongod-live` and listing `ps -Ao pid,ppid,command | awk '$2==1 && /secantus-probe/'`
+      Backlog-ID: RM-804
+
+- [ ] **mongod started on a standalone store killed within a second of its
+      last write still dies on fassert 28560 (2026-11-25).** RM-797 made a
+      standalone store's clean close take an unstable checkpoint, so
+      mongod's first replica-set write at (wall-clock second, 1) is no
+      longer behind a recorded stable timestamp. A store that is killed
+      keeps its last periodic stable checkpoint at the newest oplog entry
+      (T, n), and a store reopened by this server dates its entries one
+      second ahead (`max(last, now) + 1`), so mongod 8.2 started on it as
+      `--replSet` within that second can still hit "commit timestamp
+      (T, 1) must be after the stable timestamp (T, n)". A standalone
+      mongod never sets a stable timestamp at all. Model that: no stable
+      timestamp on a store with no replica-set config, rather than one
+      only at close. Found by the RM-797 fix; not reproduced on a kill
+      yet.
+      Verify: none -- reproduce by killing secantusd-mdb right after an insert and starting mongod --replSet on the store within the second
+      Backlog-ID: RM-805
+
 - [ ] **A restore to the timestamp of a batched insert applies part of the
       batch.** `insert_many` of two documents is one `applyOps` entry in
       `local.oplog.rs` (as mongod 8.2 logs a batched insert), but
