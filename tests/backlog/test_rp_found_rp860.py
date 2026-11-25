@@ -194,12 +194,12 @@ def test_a_rename_to_a_quoted_name_is_printed_in_a_generated_column(dsn: str) ->
     ]
 
 
-@pytest.mark.backlog("RP-1054")
+@pytest.mark.backlog_fixed("RP-1054")
 def test_a_renamed_column_is_renamed_in_an_expression_index(dsn: str) -> None:
     """An index expression and predicate hold the column's attnum: after
     `rename column x to y` an INSERT still maintains the index, which
     prints `(((y + 1))) WHERE (y > 0)`, on PostgreSQL 15.19 (shared
-    reference, port 5415). Here both still name `x` and the INSERT is
+    reference, port 5415). Both used to still name `x`, and the INSERT was
     42703. Found while working RP-1024."""
     assert _script(
         dsn,
@@ -219,5 +219,78 @@ def test_a_renamed_column_is_renamed_in_an_expression_index(dsn: str) -> None:
         "ALTER TABLE",
         "INSERT 0 1",
         [("CREATE INDEX p1024ii ON public.p1024i USING btree (((y + 1))) WHERE (y > 0)",)],
+        "DROP TABLE",
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-1054")
+def test_a_renamed_column_is_renamed_in_every_index_that_names_it(dsn: str) -> None:
+    """A plain key, its INCLUDE and WHERE, a key expression beside a
+    function key, and two UNIQUE indexes (an expression one and a partial
+    plain one) follow three renames, one to a name that needs quoting.
+    Both UNIQUE ones still refuse a duplicate, and a literal naming a
+    renamed column is left alone. Measured on PostgreSQL 15.19 (shared
+    reference, port 5415). The plain key's storage index was keyed on the
+    old field, so it printed NULL and the UNIQUE one enforced nothing."""
+    out = _script(
+        dsn,
+        [
+            "drop table if exists r1054",
+            "create table r1054 (x int, z text, w int, v int)",
+            "create index r1054a on r1054 (w desc) include (v) where x > 0",
+            "create index r1054b on r1054 (lower(z), (x + w)) where z <> 'x'",
+            "create unique index r1054c on r1054 ((x * 2))",
+            "create unique index r1054d on r1054 (w) where w > 0",
+            'alter table r1054 rename column x to "Big Y"',
+            "alter table r1054 rename column w to ww",
+            "alter table r1054 rename column v to vv",
+            "insert into r1054 values (3, 'A', 4, 1)",
+            "insert into r1054 values (3, 'B', 5, 1)",
+            "insert into r1054 values (4, 'B', 4, 1)",
+            "select pg_get_indexdef(indexrelid) from pg_index"
+            " where indrelid = 'r1054'::regclass order by indexrelid",
+            'select "Big Y", ww, vv from r1054 where ww = 4',
+            "drop table r1054",
+        ],
+    )
+    assert out[:10] == ["DROP TABLE", "CREATE TABLE"] + ["CREATE INDEX"] * 4 + [
+        "ALTER TABLE"
+    ] * 3 + ["INSERT 0 1"]
+    assert [e[:3] for e in out[10:12]] == [
+        ("error", "23505", 'duplicate key value violates unique constraint "r1054c"'),
+        ("error", "23505", 'duplicate key value violates unique constraint "r1054d"'),
+    ]
+    on = "ON public.r1054 USING btree"
+    assert out[12:] == [
+        [
+            (f'CREATE INDEX r1054a {on} (ww DESC) INCLUDE (vv) WHERE ("Big Y" > 0)',),
+            (f"CREATE INDEX r1054b {on} (lower(z), ((\"Big Y\" + ww))) WHERE (z <> 'x'::text)",),
+            (f'CREATE UNIQUE INDEX r1054c {on} ((("Big Y" * 2)))',),
+            (f"CREATE UNIQUE INDEX r1054d {on} (ww) WHERE (ww > 0)",),
+        ],
+        [(3, 4, 1)],
+        "DROP TABLE",
+    ]
+
+
+@pytest.mark.backlog("RP-1082")
+def test_pg_get_indexdef_quotes_a_key_and_an_include_column(dsn: str) -> None:
+    """ruleutils prints a key column and an INCLUDE column through
+    `quote_identifier`, on PostgreSQL 15.19 (shared reference, port 5415).
+    Here both are printed bare. Found while working RP-1054."""
+    assert _script(
+        dsn,
+        [
+            "drop table if exists q1054",
+            'create table q1054 ("Big Y" int, "W w" int)',
+            'create index q1054a on q1054 ("Big Y" desc) include ("W w")',
+            "select pg_get_indexdef('q1054a'::regclass)",
+            "drop table q1054",
+        ],
+    ) == [
+        "DROP TABLE",
+        "CREATE TABLE",
+        "CREATE INDEX",
+        [('CREATE INDEX q1054a ON public.q1054 USING btree ("Big Y" DESC) INCLUDE ("W w")',)],
         "DROP TABLE",
     ]

@@ -12312,6 +12312,88 @@ pub fn rename_column_in_expression(
     deparse_expr(&node)
 }
 
+/// An index's stored text with its column `old` renamed to `new`: a key as
+/// `pg_get_indexdef` prints it (`key`: `x DESC`, `((x + 1))`, `lower(x)
+/// text_pattern_ops`), or a key's expression or the predicate (`(x > 0)`).
+/// PostgreSQL's index holds the column's attnum, so ruleutils prints the
+/// new name where the old one stood and nothing else moves; the text kept
+/// here has the new name spliced into each reference to the column, so the
+/// rest of it stays exactly as it was printed (RP-1054). The text unchanged
+/// when it does not name `old`.
+pub fn rename_column_in_index_text(
+    text: &str,
+    relation: &str,
+    old: &str,
+    new: &str,
+    key: bool,
+) -> Result<String> {
+    let relation = schemas::split_key(relation).1;
+    let (prefix, suffix) = if key {
+        ("CREATE INDEX ON t (", ")")
+    } else {
+        ("SELECT ", "")
+    };
+    let sql = format!("{prefix}{text}{suffix}");
+    let tree = pg_query::parse(&sql).map_err(|e| Error::Parse(e.to_string()))?;
+    let tokens = pg_query::scan(&sql)
+        .map_err(|e| Error::Parse(e.to_string()))?
+        .tokens;
+    // The `part`-th name of a dotted reference starting at `at`: the names
+    // are every other token (`t . x`).
+    let token_at = |at: i32, part: usize| {
+        let i = tokens.iter().position(|t| t.start == at)?;
+        tokens
+            .get(i + 2 * part)
+            .map(|t| (t.start as usize, t.end as usize))
+    };
+    let mut spans = Vec::new();
+    for (n, _, _, _) in tree.protobuf.nodes() {
+        match n {
+            // A plain column key is the key's first token.
+            pg_query::NodeRef::IndexElem(e) if e.expr.is_none() && e.name == old => {
+                spans.extend(token_at(prefix.len() as i32, 0));
+            }
+            pg_query::NodeRef::ColumnRef(c) => {
+                let names: Vec<&str> = c
+                    .fields
+                    .iter()
+                    .filter_map(|f| match f.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if names.len() != c.fields.len() {
+                    continue; // `t.*`
+                }
+                // `transformColumnRef`: `a.b` is the relation's column `b`
+                // when `a` names the relation, else column `a`'s field `b`.
+                let part = match names.as_slice() {
+                    [_, r, col] if *r == relation && *col == old => Some(2),
+                    [r, col, ..] if *r == relation && *col == old => Some(1),
+                    [r, ..] if *r == relation => None,
+                    [col, ..] if *col == old => Some(0),
+                    _ => None,
+                };
+                if let Some(part) = part {
+                    spans.extend(token_at(c.location, part));
+                }
+            }
+            _ => {}
+        }
+    }
+    if spans.is_empty() {
+        return Ok(text.to_string());
+    }
+    spans.sort_unstable();
+    spans.dedup();
+    let quoted = scalar::quote_identifier(new);
+    let mut out = sql;
+    for (start, end) in spans.into_iter().rev() {
+        out.replace_range(start..end, &quoted);
+    }
+    Ok(out[prefix.len()..out.len() - suffix.len()].to_string())
+}
+
 /// A CHECK constraint's expression as `pg_get_constraintdef` prints it:
 /// `CHECK ((n > 0))`.
 pub fn check_constraint_text(expression: &str, def: &TableDef) -> String {

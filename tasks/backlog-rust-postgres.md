@@ -2845,14 +2845,21 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415).
       list's, the expression's, the OpExpr's); here `RANGE ((x + 1))`.
       Verify: tests/backlog/test_rp_found_rp860.py::test_pg_get_partkeydef_of_an_expression_key
       Backlog-ID: RP-1052
-- [ ] **A renamed column leaves an expression index naming the old one,
-      and the table takes no more rows.** After `create index i on t ((x +
-      1)) where x > 0` and `rename column x to y`, PostgreSQL 15.19 inserts
-      and prints `(((y + 1))) WHERE (y > 0)`; here both still name `x` and
-      the INSERT is 42703. Column defaults measured fine (they cannot name
-      a column).
-      Verify: tests/backlog/test_rp_found_rp860.py::test_a_renamed_column_is_renamed_in_an_expression_index
-      Backlog-ID: RP-1054
+
+## Found while working RP-1054 (2026-11-25)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
+test is in `tests/backlog/test_rp_found_rp860.py`.
+
+- [ ] **`pg_get_indexdef` prints a plain key column, and an INCLUDE
+      column, unquoted.** `create index i on t ("Big Y" desc) include ("W
+      w")` prints `btree ("Big Y" DESC) INCLUDE ("W w")` on PostgreSQL
+      15.19; here `btree (Big Y DESC) INCLUDE (W w)`. The key text comes
+      from the bare name (`created_index_def`, and `key_sql` in the
+      planner's CREATE INDEX), where ruleutils prints
+      `quote_identifier(attname)`; an expression key already quotes.
+      Verify: tests/backlog/test_rp_found_rp860.py::test_pg_get_indexdef_quotes_a_key_and_an_include_column
+      Backlog-ID: RP-1082
 
 ## Found while working RP-751 (2026-11-10)
 
