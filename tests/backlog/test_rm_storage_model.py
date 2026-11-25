@@ -663,6 +663,37 @@ def test_mongod_starts_on_a_standalone_store_closed_within_the_second(
         _stop_mongod(proc, client)
 
 
+@pytest.mark.backlog("RM-805")
+def test_mongod_starts_on_a_standalone_store_killed_within_the_second(tmp_path: Path) -> None:
+    """The kill case of RM-797. A standalone store that is SIGKILLed keeps
+    the stable-timestamp checkpoint its periodic thread took, at its newest
+    oplog entry (T, n); each reopen of the store dates its entries a second
+    ahead of the last (`max(last, now) + 1`), so after a few quick lives T is
+    in the wall clock's future, and mongod 8.2's `replSetInitiate` first write
+    at (now, 1) was refused by WiredTiger ("commit timestamp (T, 1) must be
+    after the stable timestamp (T, n)", fatal 28560). A standalone mongod
+    sets no stable timestamp, so a store with no replica-set configuration
+    keeps none while it runs."""
+    store = tmp_path / "store"
+
+    def setup(c: pymongo.MongoClient) -> None:
+        c.app.c.insert_one({"_id": time.monotonic_ns()})
+        c.admin.command("fsync")  # a stable checkpoint at the newest entry
+
+    for _ in range(5):
+        _killed_secantus_store(store, setup, "--standalone")
+    proc, client = _mongod_on(store, None, "rs0")
+    try:
+        assert client is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            host, port = client.address or ("127.0.0.1", 0)
+            _wait_primary(client, f"{host}:{port}")
+            client["app"]["c"].insert_one({"_id": -1})
+            assert client["app"]["c"].count_documents({}) == 6
+    finally:
+        _stop_mongod(proc, client)
+
+
 @pytest.mark.backlog_fixed("RM-788")
 def test_secantus_keeps_the_index_specs_mongod_wrote(tmp_path: Path) -> None:
     """A store mongod 8.2.11 wrote, its indexes made with `sparse: false` and

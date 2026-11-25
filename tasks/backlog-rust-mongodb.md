@@ -3021,16 +3021,53 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       mongod's first replica-set write at (wall-clock second, 1) is no
       longer behind a recorded stable timestamp. A store that is killed
       keeps its last periodic stable checkpoint at the newest oplog entry
-      (T, n), and a store reopened by this server dates its entries one
-      second ahead (`max(last, now) + 1`), so mongod 8.2 started on it as
-      `--replSet` within that second can still hit "commit timestamp
-      (T, 1) must be after the stable timestamp (T, n)". A standalone
-      mongod never sets a stable timestamp at all. Model that: no stable
-      timestamp on a store with no replica-set config, rather than one
-      only at close. Found by the RM-797 fix; not reproduced on a kill
-      yet.
-      Verify: none -- reproduce by killing secantusd-mdb right after an insert and starting mongod --replSet on the store within the second
+      (T, n), and every reopen of a store dates its entries from
+      `max(last, now) + 1` second (the recovery bump in `Storage::open`),
+      so T runs ahead of the wall clock by about a second per quick
+      reopen. REPRODUCED (mongod v8.2.11): five lives of
+      `secantusd-mdb --standalone` on one store, each `insert_one`, `fsync`,
+      SIGKILL, then `mongod --replSet rs0` on the store and `replSetInitiate`
+      dies with "commit timestamp (1795642349, 1) must be after the stable
+      timestamp (1795642351, 1)", fatal 28560 (the gap test below).
+      NOT fixed, needs Joe's decision. The entry's proposal (no stable
+      timestamp on a store with no replica-set configuration, as a
+      standalone mongod has none) cannot be a change to the checkpoint
+      alone: this server's data tables are NOT logged (timestamps need
+      that), so a kill recovers by replaying the oplog from the
+      checkpoint's recovery timestamp, and `stable_seq` clamps the oplog
+      prune. An unstable periodic checkpoint has no recovery timestamp
+      (`get=recovery` is 0), so the replay would start at the oplog's
+      first entry over data that already holds those entries, and needs an
+      idempotent replay (mongod's standalone recovery is) plus a replay
+      position written atomically with the checkpoint. mongod's own
+      standalone avoids all of it by LOGGING its tables, which a store
+      cannot change after creation. The cheaper option, which is a
+      stand-in and not mongod's mechanism: on a store with no replica-set
+      configuration cap the stable timestamp at the newest entry whose
+      second is below the wall clock's (`s < now`), so a later (now, 1)
+      is always after it; replay from the older recovery point is the
+      normal path. Faithful first, cheap second.
+      Verify: tests/backlog/test_rm_storage_model.py::test_mongod_starts_on_a_standalone_store_killed_within_the_second
       Backlog-ID: RM-805
+
+- [ ] **mongod started as `--replSet` on a killed standalone store dies on
+      an invariant at the first election (2026-11-25).** The journal
+      flusher of a `--standalone` `secantusd-mdb` keeps
+      `local.replset.oplogTruncateAfterPoint` at the newest whole entry, as
+      a primary's does, and a SIGKILL leaves it non-null. `mongod
+      --replSet rs0` on that store has no replica-set configuration, so it
+      runs no startup recovery (it logs "Detected unclean shutdown ...
+      Recovering data from the last clean checkpoint"); `replSetInitiate`
+      succeeds and the transition to primary dies: invariant
+      `getOplogTruncateAfterPoint(opCtx).isNull()`,
+      `replication_coordinator_external_state_impl.cpp:623`, mongod 8.2.11.
+      Reproduced by the RM-805 test with its lives spaced out so no stable
+      timestamp is ahead of the clock (one life of `--standalone`, writes, a
+      second's wait, SIGKILL). A standalone mongod never moves the point,
+      so a store it left has it null. Decide with RM-805: a standalone
+      store that does not move the point has no hole recovery of its own.
+      Verify: none -- reproduced by hand through the RM-805 test with `time.sleep(3)` after each life; no gap test of its own yet
+      Backlog-ID: RM-806
 
 - [ ] **A restore to the timestamp of a batched insert applies part of the
       batch.** `insert_many` of two documents is one `applyOps` entry in
