@@ -160,7 +160,7 @@ fn collection_entry(
             (indexes, base)
         }
         None => {
-            let indexes = match crate::admin::listed_indexes(storage, db, name, oplog)? {
+            let indexes = match crate::admin::catalog_indexes(storage, db, name, oplog)? {
                 Some(indexes) => indexes,
                 None => listed
                     .get_document("idIndex")

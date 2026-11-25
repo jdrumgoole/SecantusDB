@@ -23,6 +23,23 @@ use bson::{Bson, Document};
 
 use crate::get_path_values;
 
+/// Whether an index spec's flag (`sparse`, `unique`, `hidden`,
+/// `prepareUnique`) is set. mongod's catalog keeps `sparse` and
+/// `background` as the request gave them -- a `1.0` stays a double -- and
+/// reads a flag as true when it is `true` or any non-zero number (NaN
+/// included), so a spec from `createIndexes` or from mongod's own catalog
+/// answers alike (measured 8.2.11, 2026-11-24).
+pub fn spec_flag(spec: &Document, field: &str) -> bool {
+    match spec.get(field) {
+        Some(Bson::Boolean(b)) => *b,
+        Some(Bson::Int32(n)) => *n != 0,
+        Some(Bson::Int64(n)) => *n != 0,
+        Some(Bson::Double(d)) => *d != 0.0,
+        Some(Bson::Decimal128(d)) => d.to_string().parse::<f64>() != Ok(0.0),
+        _ => false,
+    }
+}
+
 /// What one field of an index holds for a document.
 pub struct FieldKeys {
     /// mongod's keys, in no particular order (repeats possible). Never empty:

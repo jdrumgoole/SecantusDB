@@ -3937,7 +3937,7 @@ fn index_desc_from(name: String, key_spec: Document, opts: &Document) -> IndexDe
     IndexDesc {
         name,
         key_spec,
-        sparse: opts.get_bool("sparse").unwrap_or(false),
+        sparse: secantus_core::index_keys::spec_flag(&opts, "sparse"),
         hidden: opts.get_bool("hidden").unwrap_or(false),
         collation: index_key_collation(opts),
         unique: opts.get_bool("unique").unwrap_or(false),
@@ -17124,9 +17124,12 @@ impl Storage {
                 }
                 let existing_opts = existing.get_document("options").ok();
                 for opt in CONFLICTING_OPTS {
-                    // `sparse: false` is the same index as no `sparse`.
+                    // `sparse: false` is the same index as no `sparse`, and
+                    // `sparse: 1.0` the same as `sparse: true`.
                     let unset = |o: Option<&Document>| match o.and_then(|o| o.get(opt)) {
-                        Some(Bson::Boolean(false)) if *opt == "sparse" => None,
+                        _ if *opt == "sparse" => o
+                            .is_some_and(|o| secantus_core::index_keys::spec_flag(o, "sparse"))
+                            .then_some(Bson::Boolean(true)),
                         other => other.cloned(),
                     };
                     let (new, old) = (unset(Some(options)), unset(existing_opts));
@@ -17298,7 +17301,7 @@ impl Storage {
             }
             out
         } else {
-            let sparse = options.get_bool("sparse").unwrap_or(false);
+            let sparse = secantus_core::index_keys::spec_flag(&options, "sparse");
             let unique = options.get_bool("unique").unwrap_or(false);
             let partial = options
                 .get_document("partialFilterExpression")
@@ -21348,7 +21351,7 @@ impl Storage {
                     {
                         return Ok(None);
                     }
-                    let sparse = opts.get_bool("sparse").unwrap_or(false);
+                    let sparse = secantus_core::index_keys::spec_flag(&opts, "sparse");
                     let partial = opts
                         .get_document("partialFilterExpression")
                         .ok()
@@ -21489,6 +21492,16 @@ impl Storage {
             }
         }
         Ok(Some(MatchedRows { rows: out, via }))
+    }
+
+    /// WiredTiger's check of `config` as the arguments of `method`, as
+    /// mongod runs it on a `storageEngine` option.
+    pub fn validate_wt_config(
+        &self,
+        method: &str,
+        config: &str,
+    ) -> std::result::Result<(), (i32, String)> {
+        secantus_wt::validate_config(method, config)
     }
 
     /// How many documents the collection holds, when no more than `cap`;
@@ -24047,7 +24060,7 @@ impl Storage {
         else {
             return Ok(None);
         };
-        let sparse = opts.get_bool("sparse").unwrap_or(false);
+        let sparse = secantus_core::index_keys::spec_flag(&opts, "sparse");
         let partial = opts
             .get_document("partialFilterExpression")
             .ok()
@@ -24169,7 +24182,9 @@ impl Storage {
             // filter, `find({}).sort({a: 1, b: 1})` over a compound index
             // partial on `{a: {$gt: 5}}` returned 4 of 10 documents (mongod:
             // 10). Found 2026-09-30.
-            if opts.get_bool("sparse").unwrap_or(false) && !sparse_index_usable(&key_spec, query) {
+            if secantus_core::index_keys::spec_flag(&opts, "sparse")
+                && !sparse_index_usable(&key_spec, query)
+            {
                 continue;
             }
             if let Ok(pf) = opts.get_document("partialFilterExpression") {

@@ -989,6 +989,10 @@ impl CmdStorage for StorageAdapter {
             .map_err(map_err)
     }
 
+    fn validate_wt_config(&self, method: &str, config: &str) -> Result<(), (i32, String)> {
+        self.inner.validate_wt_config(method, config)
+    }
+
     fn collection_count_at_most(
         &self,
         db: &str,

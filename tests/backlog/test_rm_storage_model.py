@@ -631,6 +631,67 @@ def test_secantus_keeps_the_index_specs_mongod_wrote(tmp_path: Path) -> None:
     assert [k for k, _ in seen["both"][0][1]] == ["v", "key", "name", "sparse"]
 
 
+def _flag_options(client: Any) -> None:
+    """Indexes made with flags given as numbers, which mongod keeps as given
+    (`sparse`, `background`) or reads as bools (`unique`), and one armed by
+    `prepareUnique` at creation (RM-791)."""
+    db = client["app"]
+    db["c"].insert_many([{"_id": i, "a": i, "b": i, "d": i} for i in range(5)])
+    db.command(
+        "createIndexes",
+        "c",
+        indexes=[
+            {"name": "a_1", "key": {"a": 1}, "sparse": 1.0, "background": 1},
+            {"name": "b_1", "key": {"b": 1}, "prepareUnique": True},
+            {"name": "d_1", "key": {"d": 1}, "unique": 1.0, "sparse": 0},
+        ],
+    )
+
+
+@pytest.mark.backlog_fixed("RM-791")
+def test_mongod_opens_the_flags_secantus_kept_as_given(tmp_path: Path) -> None:
+    """A store `secantusd-mdb` wrote with `sparse: 1.0`, `background: 1`,
+    `prepareUnique: true` and `unique: 1.0` is one mongod 8.2.11 validates,
+    with the same specs (RM-791)."""
+    store = tmp_path / "store"
+    with rust_mongo_server(store, "--standalone") as client:
+        _flag_options(client)
+        ours = _specs_and_listing(client)
+    kept = {dict(spec)["name"]: spec for spec in ours[0] if dict(spec)["name"] != "_id_"}
+    assert ("sparse", 1.0) in kept["a_1"] and ("background", 1) in kept["a_1"], kept
+    assert [k for k, _ in kept["b_1"]] == ["v", "prepareUnique", "key", "name"], kept
+    assert [k for k, _ in kept["d_1"]] == ["v", "unique", "key", "name", "sparse"], kept
+    proc, client = _mongod_on(store, None, "rs0")
+    try:
+        assert client is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            host, port = client.address or ("127.0.0.1", 0)
+            _wait_primary(client, f"{host}:{port}")
+            assert _specs_and_listing(client) == ours
+            result = client["app"].command("validate", "c", full=True)
+            assert (result["valid"], result["nrecords"]) == (True, 5)
+    finally:
+        _stop_mongod(proc, client)
+
+
+@pytest.mark.backlog_fixed("RM-791")
+def test_secantus_keeps_the_flags_mongod_kept_as_given(tmp_path: Path) -> None:
+    """A store mongod 8.2.11 wrote with the same flags, opened by
+    `secantusd-mdb`: the same specs, and a sparse index that is read as one
+    (RM-791)."""
+    seen: dict[str, Any] = {}
+
+    def setup(client: Any) -> None:
+        _flag_options(client)
+        seen["both"] = _specs_and_listing(client)
+
+    store = _mongod_store(tmp_path, setup)
+    with rust_mongo_server(store) as rust:
+        assert _specs_and_listing(rust) == seen["both"]
+        plan = rust["app"]["c"].find({"a": {"$gte": 0}}).hint("a_1").explain()
+        assert "IXSCAN" in str(plan["queryPlanner"]["winningPlan"])
+
+
 @pytest.mark.backlog("RM-735")
 def test_a_restart_raises_the_election_term(tmp_path: Path) -> None:
     """mongod 8.2.11 (measured 2026-11-20,

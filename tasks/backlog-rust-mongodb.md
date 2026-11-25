@@ -2898,20 +2898,6 @@ wrote and stopped (the forward direction of RM-723).
 
 ## Found working RM-734 (index spec fidelity, 2026-11-24)
 
-- [ ] **`createIndexes` coerces a flag's type, accepts a `hidden` that is
-      no bool, and refuses `prepareUnique: true`.** Found closing RM-788
-      (2026-11-24, mongod 8.2.11). mongod's catalog keeps `sparse` and
-      `background` as given (`sparse: 1.0` stays a double, `background: 1`
-      an int, where `listIndexes` shows both as booleans), refuses a
-      `background` that is a string ("not convertible to bool", 2) and a
-      `hidden` that is not a bool ("The field 'hidden' must be a bool, but
-      got int"), and takes `prepareUnique: true` at creation, an index armed
-      as `collMod` arms one (`v, prepareUnique, key, name`). `secantusd-mdb`
-      writes every number as a bool (and drops a `sparse: 0.0`), keeps a
-      string `background`, takes `hidden: 1` and `hidden: "x"` as hidden
-      indexes, and refuses `prepareUnique: true` as an unknown field.
-      Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_create_indexes_keeps_a_flag_as_given_and_refuses_a_hidden_that_is_no_bool
-      Backlog-ID: RM-791
 - [ ] **A planner tie goes by build order, not by mongod's in-memory index
       order.** Three single-field indexes cost the same for `{a: 3, b: 3,
       c: 3}`: mongod 8.2.11 takes the first in the collection's in-memory
@@ -2922,6 +2908,43 @@ wrote and stopped (the forward direction of RM-723).
       only. Found working RM-734 (not fixed with it).
       Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_a_planner_tie_goes_by_the_in_memory_index_order
       Backlog-ID: RM-790
+
+- [ ] **A `wildcardProjection` is not parsed as a projection.** Found closing
+      RM-771 (2026-11-24, mongod 8.2.11). mongod parses the projection of a
+      `$**` index as an inclusion or an exclusion and refuses one that mixes
+      them (31254, 31253: "Cannot do exclusion on field b in inclusion
+      projection"), one that computes a field (51271) and one whose paths
+      collide (31250), each as "Failed to parse projection:
+      wildcardProjection :: caused by :: ...". `secantusd-mdb` accepts all of
+      them and builds the index from whatever its own reading makes of them.
+      Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_a_wildcard_projection_is_parsed_as_a_projection_is
+      Backlog-ID: RM-794
+
+- [ ] **The `clustered` field of an index spec is refused as unknown.** Found
+      closing RM-771 (2026-11-24, mongod 8.2.11). `clustered` is a field of
+      mongod's index spec: on its own it is 67 ("The 'unique' field is
+      required when 'clustered' is specified"), with `unique` it is 6100900
+      ("Cannot implicitly create a new collection with createIndex
+      'clustered' option"), `false` is 6492800 and a string 14.
+      `secantusd-mdb` answers 197 ("not valid for an index specification")
+      to each. Beside any other refused field mongod answers 197 for it too,
+      which is not measured further.
+      Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_a_clustered_option_on_an_index_spec_is_read_as_mongod_reads_it
+      Backlog-ID: RM-795
+
+- [ ] **An index's `storageEngine.wiredTiger.configString` is checked and
+      kept, but not applied to the index's table.** **Decision needed (Joe):**
+      apply it (as mongod builds the table from it: `block_compressor`,
+      `leaf_page_max` and the rest, listed in `collStats` as the index's
+      `creationString`) or refuse a non-empty `configString` by name, as the
+      store adoption of a mongod store holding one already does ("index se's
+      option storageEngine"). Found closing RM-771 (2026-11-24): `createIndexes`
+      now refuses a bad `storageEngine` as mongod does (WiredTiger's own
+      configuration check, `secantus_wt::validate_config`) but a valid one is
+      stored and ignored, which refusing would break for the drivers' own
+      index tests that pass one.
+      Verify: none -- a decision about serving or refusing an option; no mongod answer to compare until it is made
+      Backlog-ID: RM-796
 
 ## Found working RM-746 (storage-model phase 7b, 2026-11-22)
 
@@ -3049,16 +3072,6 @@ Each was measured against mongod 8.2.11 beside a hashed-index probe
       Verify: tests/backlog/test_rm_found_rm732.py::test_a_sort_by_a_hashed_field_leaves_ties_as_mongods_sorter_does
       Backlog-ID: RM-770
 
-- [ ] **`createIndexes` validates its options unlike mongod.** On a plain
-      key `{a: 1}`: `prepareUnique` is accepted by mongod and refused here
-      (197); `weights` and `default_language` are refused by mongod on a key
-      that is not `text` (67) and accepted here; `wildcardProjection` on a
-      non-wildcard key is 2 BadValue ("The field 'wildcardProjection' is
-      only allowed in 'wildcard' indexes") and 67 here, with the key printed
-      as `Document({...})`; a `storageEngine` option WiredTiger rejects (2,
-      with WiredTiger's own text) is accepted here and stored.
-      Verify: tests/backlog/test_rm_found_rm732.py::test_create_indexes_validates_its_options_as_mongod_does
-      Backlog-ID: RM-771
 
 - [ ] **An equality to a DBRef is planned as a collection scan.**
       `{a: DBRef("c", 1)}` is an equality to the document `{$ref: "c", $id:

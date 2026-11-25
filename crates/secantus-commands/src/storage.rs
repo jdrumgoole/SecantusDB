@@ -897,6 +897,13 @@ pub trait Storage: Send + Sync {
         Ok(None)
     }
 
+    /// WiredTiger's check of `config` as the arguments of `method`
+    /// (`"WT_SESSION.create"`): `Err` is its error code and message. `Ok`
+    /// (the default, for test fakes) when there is no engine to ask.
+    fn validate_wt_config(&self, _method: &str, _config: &str) -> Result<(), (i32, String)> {
+        Ok(())
+    }
+
     /// How many documents the collection holds, when no more than `cap`.
     fn collection_count_at_most(
         &self,
