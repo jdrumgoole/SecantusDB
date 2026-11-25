@@ -246,37 +246,6 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **mongod 8.2 crashes, intermittently, opening a store
-      `secantusd-mdb` wrote and `reIndex`ed (2026-11-25).** RM-788's
-      `tests/backlog/test_rm_storage_model.py::test_mongod_opens_the_index_specs_secantus_wrote_and_reindexed`
-      read REGRESSED on PR #2979 (runs 45534098323 and 45542344001) and on
-      snapshot PR #2980 (run 45544205276): mongod died with a fatal
-      message on its `ReplCoord-0` thread (`ThreadPool::Impl::_doOneTask`
-      frames) during `replSetInitiate` / the first primary transition, so
-      pymongo saw `connection closed`. The same job passed on `main` runs
-      45528505272, 45569063349 and 45584567796, all on mongod 8.2.12
-      (Linux x86-64, from the `mongodb-org` apt repo). CI kept only the last
-      3000 characters of the log, which is thread-pool frames, so the
-      assertion that fired is NOT recorded. **Not reproduced locally**
-      (2026-11-25): 62 runs of the test and its steps on the macOS arm64
-      8.2.12 tarball (alone, three at a time, and with the last oplog write
-      in the same second as mongod's initiate) and 47 on the Linux arm64
-      8.2.12 tarball in a container held to 0.4 CPU, all green. The test's
-      failure message now keeps mongod's warning, error and fatal lines and
-      the log up to its first backtrace frame, so the next CI failure names
-      the assertion; read it, then fix what the store holds that it chokes
-      on (the suspects: an oplog entry or timestamp `reIndex` writes, the
-      catalog's `md.indexes`, `config.system.indexBuilds`).
-      On CI it failed 3 of the 7 runs on 2026-11-25, all on mongod 8.2.12
-      from the `mongodb-org` 8.2 apt repo on image ubuntu-26.04
-      20261111.635, and it had passed on every run from RM-788's landing
-      until 2026-11-25T02:35Z; neither the code nor the image changed
-      between passing and failing runs, so it is a race in mongod's start on
-      this store or in what the store holds. (Filed by the PG session on
-      PR #2979; merged with the MongoDB session's measurements.)
-      Verify: none -- intermittent on CI (3 of the 7 runs on 2026-11-25); RM-788's regression test is the check
-      Backlog-ID: RM-797
-
 - [ ] **`test_a_contested_write_of_many_plans_as_mongod[query0-delete]`
       compares a timing-dependent order (2026-11-24).** On snapshot PR
       #2975 (run 45439792340, job `mdb-binary (live)`) it failed, then its
@@ -1617,9 +1586,11 @@ Still different:
   fields. They are additive, documented (`CLAUDE.md`, `docs/compatibility.md`,
   `docs/servers.md`), and how the admin UI tells this server from mongod;
   no driver compares a whole `buildInfo` reply.
-- [ ] `buildInfo` has no per-OS block; `collStats` has no `wiredTiger` or
-      `indexDetails` (they are WiredTiger statistics of the collection's
-      and each index's own table; since storage-model phase 5 each
+- [ ] `buildInfo` has no per-OS block; `collStats`' `wiredTiger` and
+      `indexDetails` list only each table's `metadata`, `creationString`,
+      `type`, `uri` and `version` (RM-796), not the WiredTiger statistics
+      categories mongod adds (`btree`, `cache`, `cursor` and the rest: since
+      storage-model phase 5 each
       collection and index has its own `collection-<UUID>` /
       `index-<UUID>` table, as on mongod, so the statistics exist but are
       not yet read -- and `storageSize` in `collStats` / `dbStats` is still
@@ -1646,7 +1617,7 @@ Still different:
       batching.
       **Decided (Joe, 2026-11-16): RM-499 goes ahead; once its storage stage lands, split this item's per-table parts and its other parts into separate items with their own gap tests.**
       Backlog-ID: RM-040
-      Verify: tests/backlog/test_rm_029_056.py::test_coll_stats_wiredtiger_and_index_details
+      Verify: tests/backlog/test_rm_029_056.py::test_coll_stats_lists_a_tables_statistics
 
 ### 7.081 Geo queries -- 2026-10-13
 
@@ -2078,7 +2049,7 @@ would see them. What is left:
 - [ ] **RUST MongoDB server: a `$match` after a `$changeStream` on an
       event field other than `operationType`, `documentKey`, `fullDocument`,
       `ns` or `to` is not rewritten into the oplog filter.** mongod 8.2.11
-      rewrites a regex on `ns` or `to`, `updateDescription`,
+      rewrites `updateDescription`,
       `fullDocumentBeforeChange`, the renamed `clusterTime` / `lsid` /
       `txnNumber` (also into the transaction filter), and an `$expr` over
       them, and adds them to the read's filter (`ns.coll: "c"`: `queryHash`
@@ -2087,15 +2058,13 @@ would see them. What is left:
       `documentKey` and `fullDocument` for `$eq` / `$in` / `$exists` /
       `$lt(e)` / `$gt(e)`; a `$regex`, `$type`, `$size`, ... on those
       paths is still dropped, not renamed. The second slice (2026-11-24)
-      ported `matchRewriteGenericNamespace` for `ns` by `$eq` / `$in`; a
-      regex on `ns.db` / `ns.coll` (mongod's `$expr` of `$regexMatch` over
-      `$substrBytes`, hash EE5C1E5A for `^c`) is left. The third slice
-      (2026-11-25) ported it for `to` by `$eq` / `$in` (`o.to` of a
-      command); a regex on `to` is left the same way. The rest of
-      `change_stream_rewrite_helpers.cpp` (the regex half of
-      `matchRewriteGenericNamespace`,
-      `matchRewriteUpdateDescription`, `rewriteAggExpressionTree`) is to
-      transcribe (found working RM-452).
+      ported `matchRewriteGenericNamespace` for `ns` by `$eq` / `$in`, the
+      third (2026-11-25) for `to` (`o.to` of a command), and the fourth
+      (2026-11-25) a regex on either (mongod's `$expr` of `$regexMatch`
+      over `$substrBytes`), the fifth (2026-11-25) a regex inside an `$in`
+      on either. The rest of `change_stream_rewrite_helpers.cpp`
+      (`matchRewriteUpdateDescription`, `rewriteAggExpressionTree`, the
+      other event fields) is to transcribe (found working RM-452).
       Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_a_match_on_another_event_field_joins_the_oplog_filter
       Backlog-ID: RM-698
 - [ ] **RUST MongoDB server: the Boolean simplifier differs from mongod's
@@ -2914,17 +2883,6 @@ wrote and stopped (the forward direction of RM-723).
 
 ## Found working RM-734 (index spec fidelity, 2026-11-24)
 
-- [ ] **A planner tie goes by build order, not by mongod's in-memory index
-      order.** Three single-field indexes cost the same for `{a: 3, b: 3,
-      c: 3}`: mongod 8.2.11 takes the first in the collection's in-memory
-      order, where an index a `collMod` changed has moved to the end (after
-      `collMod` of `a_1`, `b_1` wins and `a_1` is last of the rejected
-      plans; after `a_1` and `b_1`, `c_1`); `secantusd-mdb` picks `a_1`
-      each time. RM-734 keeps that in-memory order for `dropIndexes: "*"`
-      only. Found working RM-734 (not fixed with it).
-      Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_a_planner_tie_goes_by_the_in_memory_index_order
-      Backlog-ID: RM-790
-
 - [ ] **A `wildcardProjection` is not parsed as a projection.** Found closing
       RM-771 (2026-11-24, mongod 8.2.11). mongod parses the projection of a
       `$**` index as an inclusion or an exclusion and refuses one that mixes
@@ -2948,22 +2906,27 @@ wrote and stopped (the forward direction of RM-723).
       Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_a_clustered_option_on_an_index_spec_is_read_as_mongod_reads_it
       Backlog-ID: RM-795
 
-- [ ] **An index's `storageEngine.wiredTiger.configString` is checked and
-      kept, but not applied to the index's table.** **Decision needed (Joe):**
-      apply it (as mongod builds the table from it: `block_compressor`,
-      `leaf_page_max` and the rest, listed in `collStats` as the index's
-      `creationString`) or refuse a non-empty `configString` by name, as the
-      store adoption of a mongod store holding one already does ("index se's
-      option storageEngine"). Found closing RM-771 (2026-11-24): `createIndexes`
-      now refuses a bad `storageEngine` as mongod does (WiredTiger's own
-      configuration check, `secantus_wt::validate_config`) but a valid one is
-      stored and ignored, which refusing would break for the drivers' own
-      index tests that pass one.
-      **Decided (Joe, 2026-11-25): apply it**, as mongod does -- build the
-      index's table from the valid `configString`, and list it in `collStats`
-      as the index's `creationString`. Not built yet.
-      Verify: none -- a decision about serving or refusing an option; no mongod answer to compare until it is built
-      Backlog-ID: RM-796
+- [ ] **A collection's `storageEngine.wiredTiger.configString` is checked
+      and kept, but not applied to the collection's table.** Found closing
+      RM-796 (2026-11-25, mongod 8.2.11), which applied an index's own and a
+      collection's `indexOptionDefaults` one. mongod builds a collection's
+      table from `type=file,memory_page_max=10m,split_pct=90,
+      leaf_value_max=64MB,checksum=on,block_compressor=snappy`, then the
+      collection's `configString`, then `exclusive=true,key_format=q,
+      app_metadata=(formatVersion=1),log=(enabled=true)` (read off
+      WiredTiger's own parse error for `==`, which `create` answers as 2
+      with "22: Invalid argument - Error parsing '...' at offset N"): the
+      string overrides the defaults, `key_format`, `app_metadata`, `log` and
+      `exclusive` it cannot change, and `value_format=S` it can (measured
+      against `collStats`' `wiredTiger.creationString`). `secantusd-mdb`
+      makes the table from its defaults whatever the string says, and
+      accepts `==`. The shared `create_user_configured_table` and
+      `wt_parse_error_detail` in `crates/secantus-storage/src/lib.rs` are
+      the building blocks. Out of reach and left alone: mongod's server-wide
+      defaults (`--wiredTigerCollectionConfigString`).
+      Verify: tests/backlog/test_rm_collection_config_string.py::test_a_collection_table_is_made_from_its_config_string
+      Backlog-ID: 
+      Backlog-ID: RM-802
 
 ## Found working RM-746 (storage-model phase 7b, 2026-11-22)
 
@@ -3015,6 +2978,58 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       the cost and does not move with the machine.
       Backlog-ID: RM-728
       Verify: none -- a test-quality item: the behaviour is right on every run measured here; what is wrong is that the test can fail on timing alone
+
+- [ ] **RM-501's regression test times mongod, and mongod's own delete
+      once fitted the budget (2026-11-25).**
+      `tests/backlog/test_rm_found_2026_11_10_rm391.py::test_a_batched_delete_many_tests_each_document_twice`
+      gives a `deleteMany` of one slow document 1.5x the fastest of three
+      `find`s and expects code 50 from both servers. On pg-batch snapshot
+      PR #2992 (run 45595956409, job `mdb-binary (backlog)`, head
+      ec891bbfc, a PG planner change only) it read REGRESSED, and the
+      side that differed was mongod's: `theirs` was `None`, so mongod
+      8.2.12's batched delete finished inside the budget. It passed on
+      every other run that day, `main`'s included. mongod re-tests a staged
+      document's filter when the batch is deleted only if the statement
+      yielded and the snapshot moved in between, so "tests each document
+      twice" is itself timing on mongod's side. Decide from mongod's
+      source (`batched_delete_stage.cpp`, `ensureStillMatches`) when the
+      second test happens, then make the test force it, for example with
+      a yield the test can trigger, or compare a count that does not move
+      with the machine. Keep it able to fail on a server that tests once.
+      Reported by the PostgreSQL session; test code unchanged.
+      Verify: none -- intermittent on CI; the test itself is the check
+      Backlog-ID: RM-803
+
+- [ ] **Stopping a gate run leaves its tests' reference mongods running
+      (2026-11-25).** `scripts/detached_run.py stop` on a `gate_rm.py`
+      run ends pytest, but the `mongod_rs` / probe fixtures' `mongod`
+      processes (`--dbpath .../T/secantus-probe-<pid>-mongod-*`) are
+      reparented to PID 1 and keep running, each holding a port and a
+      store. Four were found idle on 2026-11-25: two 7.5 hours old, from
+      a gate a subagent stopped, and two 1.5 hours old, from one stopped
+      for a rebase. Either the fixture starts mongod in its own process
+      group and registers an exit handler that a SIGTERM reaches, or
+      `detached_run.py stop` signals the whole session it started. Then
+      the fixture's store is removed too.
+      Verify: none -- tooling; reproduce by stopping a gate in `mongod-live` and listing `ps -Ao pid,ppid,command | awk '$2==1 && /secantus-probe/'`
+      Backlog-ID: RM-804
+
+- [ ] **mongod started on a standalone store killed within a second of its
+      last write still dies on fassert 28560 (2026-11-25).** RM-797 made a
+      standalone store's clean close take an unstable checkpoint, so
+      mongod's first replica-set write at (wall-clock second, 1) is no
+      longer behind a recorded stable timestamp. A store that is killed
+      keeps its last periodic stable checkpoint at the newest oplog entry
+      (T, n), and a store reopened by this server dates its entries one
+      second ahead (`max(last, now) + 1`), so mongod 8.2 started on it as
+      `--replSet` within that second can still hit "commit timestamp
+      (T, 1) must be after the stable timestamp (T, n)". A standalone
+      mongod never sets a stable timestamp at all. Model that: no stable
+      timestamp on a store with no replica-set config, rather than one
+      only at close. Found by the RM-797 fix; not reproduced on a kill
+      yet.
+      Verify: none -- reproduce by killing secantusd-mdb right after an insert and starting mongod --replSet on the store within the second
+      Backlog-ID: RM-805
 
 - [ ] **A restore to the timestamp of a batched insert applies part of the
       batch.** `insert_many` of two documents is one `applyOps` entry in

@@ -232,7 +232,12 @@ def test_invalidate_token_is_the_triggering_events_with_from_invalidate(
                 # The same bytes but the one `fromInvalidate` bool.
                 trigger = evs[i - 1]["_id"]["_data"]
                 assert ev["_id"]["_data"] != trigger
-                assert ev["_id"]["_data"].replace("6F", "6E", 1) == trigger
+                # The flag's own byte (`29 6F`), not the first `6F` the data
+                # holds: the clock's seconds, in the token's first bytes, hold
+                # one for an hour in every few (`6B06F859`) and the test
+                # failed then.
+                flagged = re.sub(r"(2B042C0100296)F", r"\1E", ev["_id"]["_data"], count=1)
+                assert flagged == trigger
 
 
 # ---------------------------------------------------------- split events

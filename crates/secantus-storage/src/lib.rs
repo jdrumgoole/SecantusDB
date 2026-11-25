@@ -934,6 +934,7 @@ fn place_new_collection(
     coll: &str,
     data_nonlogged: bool,
     clustered: bool,
+    index_defaults: &str,
 ) -> Result<mdb_catalog::Placement> {
     let mut placement = mdb_catalog::Placement {
         ident: mdb_catalog::new_collection_ident(),
@@ -954,10 +955,18 @@ fn place_new_collection(
     // no `_id` index, and a clustered collection's `_id` is its RecordId.
     if coll != PROFILE_COLLECTION && !clustered {
         let ident = mdb_catalog::new_index_ident();
-        session.create(
+        create_user_configured_table(
+            session,
             &mdb_catalog::table_uri(&ident),
-            &data_table_cfg(mdb_catalog::INDEX_TABLE_CFG, data_nonlogged),
+            &data_table_cfg(
+                &mdb_catalog::index_table_cfg(false, index_defaults, None, !data_nonlogged),
+                data_nonlogged,
+            ),
+            (!index_defaults.is_empty()).then_some(data_nonlogged),
+            "",
         )?;
+        // A failure leaves the collection's own table made and unlisted,
+        // which the next open drops (`reconcile_idents`), as a rollback's.
         placement.indexes.insert(ID_INDEX_NAME.to_string(), ident);
     }
     Ok(placement)
@@ -1042,19 +1051,157 @@ fn seek_ge(cur: &Cursor, seed: &[u8]) -> Result<bool> {
 /// transaction that commits the index), so a build that dies leaves a table
 /// no placement names, which the next open drops (`reconcile_idents`). A
 /// table is not part of any transaction.
-fn make_index_table(store: &Storage, session: &Session, unique: bool) -> Result<String> {
+fn make_index_table(
+    store: &Storage,
+    session: &Session,
+    db: &str,
+    coll: &str,
+    unique: bool,
+    spec: &Document,
+) -> Result<String> {
     let ident = mdb_catalog::new_index_ident();
-    let cfg = if unique {
-        mdb_catalog::UNIQUE_INDEX_TABLE_CFG
-    } else {
-        mdb_catalog::INDEX_TABLE_CFG
+    // The collection's `indexOptionDefaults`, then the index's own
+    // `storageEngine`, each a WiredTiger `configString` that overrides the
+    // defaults (measured 8.2.11, 2026-11-25; RM-796).
+    let defaults = match coll_options(session, db, coll)? {
+        Some(o) => o
+            .get_document("indexOptionDefaults")
+            .map(|d| mdb_catalog::wired_tiger_config_string(d.get("storageEngine")))
+            .unwrap_or_default(),
+        None => String::new(),
     };
-    session.create(
+    let own = mdb_catalog::wired_tiger_config_string(spec.get("storageEngine"));
+    let cfg = mdb_catalog::index_table_cfg(unique, &defaults, Some(&own), !store.data_nonlogged);
+    create_user_configured_table(
+        session,
         &mdb_catalog::table_uri(&ident),
-        &data_table_cfg(cfg, store.data_nonlogged),
+        &data_table_cfg(&cfg, store.data_nonlogged),
+        (!defaults.is_empty() || !own.is_empty()).then_some(store.data_nonlogged),
+        TABLE_CREATE_FAILED,
     )?;
     Ok(ident)
 }
+
+/// `session.create(uri, cfg)` of a table whose configuration holds a user's
+/// `configString` (`user_nonlogged` is `Some`, the store's logging mode, when
+/// it does). A failure of that is mongod's: `BadValue` for `EINVAL` and
+/// `UnknownError` for any other code, quoting WiredTiger's code, its text
+/// and its detail (measured 8.2.11, 2026-11-25), under `prefix`.
+fn create_user_configured_table(
+    session: &Session,
+    uri: &str,
+    cfg: &str,
+    user_nonlogged: Option<bool>,
+    prefix: &str,
+) -> Result<()> {
+    // A table type this server's WiredTiger could make and mongod's cannot
+    // (`type = lsm` with spaces round the `=` gets past mongod's own refusal
+    // of the string `type=lsm` and fails in its engine): `ENOTSUP`.
+    if user_nonlogged.is_some() && configured_table_type(cfg).is_some_and(|t| t != "file") {
+        return Err(StorageError::QueryError {
+            code: 8,
+            errmsg: format!("{prefix}{ENOTSUP}: {} - ", os_error_text(ENOTSUP)),
+            exec: false,
+        });
+    }
+    let Err((e, detail)) = session.create_with_detail(uri, cfg) else {
+        return Ok(());
+    };
+    let Some(nonlogged) = user_nonlogged.filter(|_| e.code > 0) else {
+        return Err(e.into());
+    };
+    let detail = wt_parse_error_detail(&detail, nonlogged);
+    Err(StorageError::QueryError {
+        code: if e.code == 22 { 2 } else { 8 },
+        errmsg: format!("{prefix}{}: {} - {detail}", e.code, e.message),
+        exec: false,
+    })
+}
+
+/// `ENOTSUP`, the code WiredTiger returns for a table type it cannot make:
+/// the platform's own, since mongod quotes the number its build was given
+/// (95 on Linux, the exemplar build; 45 on macOS).
+#[cfg(target_os = "macos")]
+const ENOTSUP: i32 = 45;
+#[cfg(not(target_os = "macos"))]
+const ENOTSUP: i32 = 95;
+
+/// The C library's text for an `errno`, as WiredTiger's `wiredtiger_strerror`
+/// gives it for a system error: Rust's own message without its
+/// " (os error N)" suffix.
+fn os_error_text(code: i32) -> String {
+    let text = std::io::Error::from_raw_os_error(code).to_string();
+    match text.rfind(" (os error ") {
+        Some(at) => text[..at].to_owned(),
+        None => text,
+    }
+}
+
+/// The last `type` a configuration string sets at its top level, however it
+/// spaces or quotes it.
+fn configured_table_type(cfg: &str) -> Option<String> {
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut item = String::new();
+    let mut items = Vec::new();
+    for ch in cfg.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                item.push(ch);
+            }
+            '(' | '[' | '{' if !quoted => {
+                depth += 1;
+                item.push(ch);
+            }
+            ')' | ']' | '}' if !quoted => {
+                depth = depth.saturating_sub(1);
+                item.push(ch);
+            }
+            ',' if !quoted && depth == 0 => items.push(std::mem::take(&mut item)),
+            _ => item.push(ch),
+        }
+    }
+    items.push(item);
+    items
+        .iter()
+        .filter_map(|i| i.split_once('='))
+        .filter(|(k, _)| k.trim() == "type")
+        .map(|(_, v)| v.trim().trim_matches('"').to_string())
+        .next_back()
+}
+
+/// The part of what WiredTiger reported that mongod quotes after a table
+/// creation's error: a configuration it could not parse (`Error parsing
+/// '...' at offset N: ...`), whose text names the string it was given, as
+/// mongod's own (a store that does not log its data tables says so at the
+/// end of it, where mongod's logs). WiredTiger's other reports, which
+/// mongod does not quote, are left out. `detail` is its JSON error lines.
+fn wt_parse_error_detail(detail: &str, nonlogged: bool) -> String {
+    for line in detail.lines() {
+        let Ok(report) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(msg) = report.get("msg").and_then(|m| m.as_str()) else {
+            continue;
+        };
+        let Some(at) = msg.find("Error parsing '") else {
+            continue;
+        };
+        let text = &msg[at..];
+        return if nonlogged {
+            text.replacen(",log=(enabled=false)", ",log=(enabled=true)", 1)
+        } else {
+            text.to_string()
+        };
+    }
+    String::new()
+}
+
+/// What an error message begins with when a table could not be made from a
+/// user's `configString`: the command layer reports it as the build's
+/// failure (`secantus-commands`' `INDEX_TABLE_FAILED`, which is this text).
+pub const TABLE_CREATE_FAILED: &str = "index table creation failed :: ";
 
 /// List index `name`'s table in `(db, coll)`'s placement (the transaction's
 /// own, for a collection it created and has not committed), in `session`'s
@@ -8241,7 +8388,24 @@ impl Storage {
                 // race). A checkpoint failure is logged, never silent: in a
                 // database a close-time write error is a durability signal.
                 if self.durable && !self.in_memory {
-                    if let Err(e) = self.drop_pending.checkpoint(&session) {
+                    // A store with no replica-set configuration is a
+                    // standalone's, and a standalone's clean shutdown takes
+                    // an unstable checkpoint (every update, no stable
+                    // timestamp), as mongod's does: the store then carries
+                    // no stable timestamp for mongod to find ahead of its
+                    // own first write (RM-797). The oplog this server keeps
+                    // beyond mongod's standalone is what the timestamp
+                    // named; nothing is left to replay after a clean stop.
+                    let standalone = self.timestamped
+                        && matches!(
+                            self.collection_count_at_most("local", "system.replset", 1),
+                            Ok(Some(0))
+                        );
+                    let config = standalone.then_some("use_timestamp=false");
+                    if standalone {
+                        self.conn.close_unstable();
+                    }
+                    if let Err(e) = self.drop_pending.checkpoint_with(&session, config) {
                         fail("the final checkpoint", e.into());
                     }
                 }
@@ -8401,12 +8565,23 @@ impl Storage {
             )?;
             // mongod's recovery truncates the oplog after the point first,
             // in a store whose data is recovered by replaying it (RM-736).
-            let (replay_from, truncation) = if !in_memory && stored_mode.unwrap_or(data_create_mode)
-            {
-                truncate_oplog_after_point(&conn, &boot, &oplog.uri, recovery_timestamp)?
-            } else {
-                (recovery_timestamp, None)
-            };
+            let (mut replay_from, truncation) =
+                if !in_memory && stored_mode.unwrap_or(data_create_mode) {
+                    truncate_oplog_after_point(&conn, &boot, &oplog.uri, recovery_timestamp)?
+                } else {
+                    (recovery_timestamp, None)
+                };
+            // A checkpoint with no stable timestamp is the one a standalone's
+            // clean close takes (`Connection::close_unstable`): it holds
+            // every update, through the oplog position its marker names, so
+            // the replay starts there and not at the oplog's first entry.
+            if replay_from == 0 && !in_memory && stored_mode.unwrap_or(data_create_mode) {
+                if let Some(left) = sizes::SizeStorer::clean_close_marker(&boot)? {
+                    if let Some(through) = left.first().filter(|n| **n > 1) {
+                        replay_from = (*through - 1) as u64;
+                    }
+                }
+            }
             if let Some(t) = truncation {
                 eprintln!(
                     "secantus-storage: Removing unapplied oplog entries after \
@@ -12093,7 +12268,7 @@ impl Storage {
         }
         let (db, coll) = (PRE_IMAGES_DB, PRE_IMAGES_COLL);
         if !collection_registered(session, db, coll)? {
-            ensure_collection_as(self, session, db, coll, true)?;
+            ensure_collection_as(self, session, db, coll, true, "")?;
             write_coll_options(session, db, coll, &bson::doc! {"clusteredIndex": true})?;
         }
         let doc_cur = open_doc_cursor(session, db, coll, Some("overwrite=false"))?;
@@ -15750,6 +15925,12 @@ impl Storage {
                     db,
                     coll,
                     options.contains_key("clusteredIndex"),
+                    // The `_id_` index is made with the collection, from
+                    // its `indexOptionDefaults` (RM-796).
+                    &options
+                        .get_document("indexOptionDefaults")
+                        .map(|d| mdb_catalog::wired_tiger_config_string(d.get("storageEngine")))
+                        .unwrap_or_default(),
                 )?;
                 if !options.is_empty() {
                     // Persist before minting the UUID below — collection_uuid re-reads and
@@ -17065,7 +17246,14 @@ impl Storage {
         // a build that dies part-way leaves one the next open drops.
         let ident = {
             let session = self.op_session()?;
-            make_index_table(self, &session, options.get_bool("unique").unwrap_or(false))?
+            make_index_table(
+                self,
+                &session,
+                db,
+                coll,
+                options.get_bool("unique").unwrap_or(false),
+                options,
+            )?
         };
         let built = (|| -> Result<()> {
             for chunk in index_build_chunks(&plan.entries) {
@@ -17121,7 +17309,14 @@ impl Storage {
         let Some(plan) = self.plan_index(session, db, coll, name, key_spec, options)? else {
             return Ok(false);
         };
-        let ident = make_index_table(self, session, options.get_bool("unique").unwrap_or(false))?;
+        let ident = make_index_table(
+            self,
+            session,
+            db,
+            coll,
+            options.get_bool("unique").unwrap_or(false),
+            options,
+        )?;
         let mut listed = false;
         let made = (|| -> Result<()> {
             self.insert_built_entries(session, &ident, db, coll, name, &plan.entries)?;
@@ -18356,6 +18551,23 @@ impl Storage {
     /// [`Self::visible_indexes`]).
     fn planner_descs(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<IndexDesc>> {
         let mut descs = self.index_descs(session, db, coll)?;
+        // In mongod's in-memory catalog order (RM-790).
+        let moved_any = !self
+            .index_order
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        if let Some(uuid) = moved_any
+            .then(|| collection_uuid(session, db, coll).ok())
+            .flatten()
+        {
+            let map = self.index_order.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(held) = map.get(&uuid) {
+                let names = descs.iter().map(|d| d.name.clone()).collect();
+                let order = Self::in_memory_order(Some(held), names);
+                descs.sort_by_key(|d| order.iter().position(|n| *n == d.name));
+            }
+        }
         let order = order::bindata_order();
         descs.retain(|d| !d.hidden && d.collation.is_none() && d.key_order == order);
         Ok(descs)
@@ -21638,6 +21850,21 @@ impl Storage {
         secantus_wt::validate_config(method, config)
     }
 
+    /// A table's full creation configuration, defaults filled in, as
+    /// WiredTiger's `metadata:create` cursor gives it: what mongod's
+    /// `collStats` lists as `creationString` for `uri` (`table:<ident>`).
+    /// With WiredTiger's version string. `None` when the table is not there.
+    pub fn table_creation_string(&self, uri: &str) -> Result<Option<(String, String)>> {
+        let session = self.conn.open_session()?;
+        let cur = session.open_cursor("metadata:create", None)?;
+        cur.set_key_s(uri);
+        match cur.search() {
+            Ok(()) => Ok(Some((cur.get_value_s()?, secantus_wt::version_string()))),
+            Err(e) if e.is_not_found() => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// How many documents the collection holds, when no more than `cap`;
     /// `None` when it holds more. Reads keys only.
     pub fn collection_count_at_most(
@@ -21824,6 +22051,34 @@ impl Storage {
             };
             key(&a.0).cmp(&key(&b.0))
         });
+        // The planner reads mongod's IN-MEMORY catalog, where an index a
+        // `collMod` changed has moved to the end, and a cost tie goes to the
+        // first candidate (RM-790). `_id_` stays first.
+        let names: Vec<String> = out
+            .iter()
+            .map(|(d, _)| d.get_str("name").unwrap_or("").to_string())
+            .collect();
+        let moved_any = !self
+            .index_order
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        if let Some(uuid) = moved_any
+            .then(|| collection_uuid(&session, db, coll).ok())
+            .flatten()
+        {
+            let map = self.index_order.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(held) = map.get(&uuid) {
+                let order = Self::in_memory_order(Some(held), names);
+                let rank = |d: &Document| {
+                    order
+                        .iter()
+                        .position(|n| Some(n.as_str()) == d.get_str("name").ok())
+                        .unwrap_or(0)
+                };
+                out.sort_by_key(|(d, _)| (d.get_str("name") != Ok(ID_INDEX_NAME), rank(d)));
+            }
+        }
         Ok(out)
     }
 
@@ -26104,8 +26359,17 @@ impl DropPending {
     /// Take a checkpoint on `session`, counted: what releases drop-pending
     /// idents.
     fn checkpoint(&self, session: &Session) -> std::result::Result<(), WtError> {
+        self.checkpoint_with(session, None)
+    }
+
+    /// [`Self::checkpoint`] with a WiredTiger configuration.
+    fn checkpoint_with(
+        &self,
+        session: &Session,
+        config: Option<&str>,
+    ) -> std::result::Result<(), WtError> {
         let n = self.started.fetch_add(1, Ordering::SeqCst) + 1;
-        session.checkpoint(None)?;
+        session.checkpoint(config)?;
         self.completed.fetch_max(n, Ordering::SeqCst);
         Ok(())
     }
@@ -26473,7 +26737,7 @@ fn spec_order_of(payload: &Document, name: &str) -> Vec<Bson> {
 /// Register the collection if it is not registered, answering whether it was
 /// created here.
 fn ensure_collection(store: &Storage, session: &Session, db: &str, coll: &str) -> Result<bool> {
-    ensure_collection_as(store, session, db, coll, false)
+    ensure_collection_as(store, session, db, coll, false, "")
 }
 
 /// [`ensure_collection`] for a collection that is `clustered` when it has to
@@ -26485,6 +26749,7 @@ fn ensure_collection_as(
     db: &str,
     coll: &str,
     clustered: bool,
+    index_defaults: &str,
 ) -> Result<bool> {
     // mongod logs the tables of its unreplicated `local` collections whatever
     // the rest are (measured 8.2.11), `local.replset.minvalid` excepted.
@@ -26509,7 +26774,8 @@ fn ensure_collection_as(
             handle.wrote_registry = true;
             // Its documents' table is made now (a table is not part of any
             // transaction); the commit records where it is.
-            let placement = place_new_collection(session, coll, data_nonlogged, clustered)?;
+            let placement =
+                place_new_collection(session, coll, data_nonlogged, clustered, index_defaults)?;
             handle
                 .deferred_placements
                 .insert((db.to_string(), coll.to_string()), placement);
@@ -26528,7 +26794,8 @@ fn ensure_collection_as(
             note_coll_table_write(db, coll);
             // The collection's own documents table, as mongod makes it, and
             // its `_mdb_catalog` row, in this transaction.
-            let placement = place_new_collection(session, coll, data_nonlogged, clustered)?;
+            let placement =
+                place_new_collection(session, coll, data_nonlogged, clustered, index_defaults)?;
             mdb_catalog::write_placement(session, db, coll, &placement)?;
             // Its tables are not part of the transaction: one that rolls back
             // leaves them unlisted, and they go once nothing reads them.

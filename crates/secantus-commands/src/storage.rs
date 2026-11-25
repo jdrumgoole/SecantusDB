@@ -904,6 +904,14 @@ pub trait Storage: Send + Sync {
         Ok(())
     }
 
+    /// A table's creation configuration with its defaults filled in
+    /// (`collStats`' `creationString`), for the `table:<ident>` a
+    /// [`Storage::collection_ident`] or [`Storage::index_ident`] names, and
+    /// the engine's version string.
+    fn table_creation_string(&self, _uri: &str) -> Option<(String, String)> {
+        None
+    }
+
     /// How many documents the collection holds, when no more than `cap`.
     fn collection_count_at_most(
         &self,

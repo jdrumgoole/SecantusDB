@@ -578,7 +578,9 @@ fn stats_have_mongods_shape() {
                 "storageSize",
                 "freeStorageSize",
                 "capped",
+                "wiredTiger",
                 "nindexes",
+                "indexDetails",
                 "indexBuilds",
                 "totalIndexSize",
                 "indexSizes",
@@ -587,6 +589,23 @@ fn stats_have_mongods_shape() {
                 "ok"
             ]
         );
+        // Each table's own configuration, as mongod lists it (RM-796).
+        let wt = coll.get_document("wiredTiger").unwrap();
+        assert!(wt
+            .get_str("creationString")
+            .unwrap()
+            .contains("key_format=q"));
+        assert_eq!(wt.get_str("type"), Ok("file"));
+        let ids = coll.get_document("indexDetails").unwrap();
+        let id_table = ids.get_document("_id_").unwrap();
+        assert_eq!(
+            id_table.get_document("metadata").unwrap(),
+            &doc! {"formatVersion": 8}
+        );
+        assert!(id_table
+            .get_str("uri")
+            .unwrap()
+            .starts_with("statistics:table:index-"));
         assert_eq!(coll.get_i32("count"), Ok(2));
         // An empty capped collection still has its `_id` index.
         let capped = dispatch_full(&doc! { "collStats": "k" }, c);

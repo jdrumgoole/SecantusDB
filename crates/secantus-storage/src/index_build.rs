@@ -1180,7 +1180,14 @@ impl Storage {
             for ix in &b.indexes {
                 let mut ident = ix.ident.lock().unwrap_or_else(|e| e.into_inner());
                 if ident.is_none() {
-                    *ident = Some(make_index_table(self, &session, ix.unique())?);
+                    *ident = Some(make_index_table(
+                        self,
+                        &session,
+                        &b.db,
+                        &b.coll,
+                        ix.unique(),
+                        &ix.stored,
+                    )?);
                 }
             }
         }

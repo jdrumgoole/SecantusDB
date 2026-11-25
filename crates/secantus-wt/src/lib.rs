@@ -158,6 +158,9 @@ pub struct Connection {
     /// the callbacks left null, so the handler is the connection's own and
     /// outlives it: `Drop` closes the connection before this field drops.
     handler: Box<Handler>,
+    /// The close takes its checkpoint of every update, with no stable
+    /// timestamp (`use_timestamp=false`): see [`Connection::close_unstable`].
+    unstable_close: std::sync::atomic::AtomicBool,
 }
 
 // The connection handle is safe to share across threads; WiredTiger's own MVCC
@@ -176,6 +179,26 @@ unsafe extern "C" fn handle_error(
     error: std::os::raw::c_int,
     message: *const std::os::raw::c_char,
 ) -> std::os::raw::c_int {
+    if error != sys::WT_PANIC && !message.is_null() {
+        // A create being made with its failure's detail kept: the text is
+        // held for the caller and not printed.
+        let held = CAPTURED_ERRORS.with(|c| {
+            let mut c = c.borrow_mut();
+            let Some(held) = c.as_mut() else {
+                return false;
+            };
+            // SAFETY: WiredTiger passes a NUL-terminated message.
+            held.push(
+                unsafe { std::ffi::CStr::from_ptr(message) }
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            true
+        });
+        if held {
+            return 0;
+        }
+    }
     if error == sys::WT_PANIC {
         let text = if message.is_null() {
             String::from("(no message)")
@@ -189,6 +212,13 @@ unsafe extern "C" fn handle_error(
         std::process::abort();
     }
     1
+}
+
+thread_local! {
+    /// The error messages WiredTiger reported on this thread while
+    /// [`Session::create_with_detail`] ran, which would otherwise be printed.
+    static CAPTURED_ERRORS: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The most WiredTiger messages a connection holds before it drops the
@@ -349,6 +379,7 @@ impl Connection {
             ptr,
             stats: keeps_statistics(config),
             handler,
+            unstable_close: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -364,6 +395,16 @@ impl Connection {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
+    }
+
+    /// Have the close checkpoint every update and record no stable
+    /// timestamp (`use_timestamp=false`), as mongod's standalone shutdown
+    /// does. Without it WiredTiger's close writes a checkpoint at the
+    /// stable timestamp, and the store carries that timestamp to the next
+    /// open.
+    pub fn close_unstable(&self) {
+        self.unstable_close
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Open a new session (thread-affine — open one per thread).
@@ -408,7 +449,12 @@ impl Drop for Connection {
         if !self.ptr.is_null() {
             if let Some(close) = unsafe { (*self.ptr).close } {
                 // A drop cannot return the error; it must not vanish (RM-189).
-                let rc = unsafe { close(self.ptr, ptr::null()) };
+                let unstable = self
+                    .unstable_close
+                    .load(std::sync::atomic::Ordering::Acquire);
+                let cfg = CString::new("use_timestamp=false").unwrap();
+                let rc =
+                    unsafe { close(self.ptr, if unstable { cfg.as_ptr() } else { ptr::null() }) };
                 if rc != 0 {
                     eprintln!("secantus-wt: Connection close failed: {:?}", check(rc));
                 }
@@ -464,6 +510,23 @@ impl Session {
         let cfg_c = CString::new(config).map_err(nul_err)?;
         let create = unsafe { (*self.ptr).create }.unwrap();
         check(unsafe { create(self.ptr, name_c.as_ptr(), cfg_c.as_ptr()) })
+    }
+
+    /// [`Session::create`], keeping the detail WiredTiger reports with a
+    /// failure (`Error parsing '...' at offset 88: Value already complete`),
+    /// which mongod quotes after the error's code. `Err` carries the error
+    /// and the messages, joined by newlines, empty when WiredTiger gave none.
+    pub fn create_with_detail(
+        &self,
+        name: &str,
+        config: &str,
+    ) -> std::result::Result<(), (WtError, String)> {
+        CAPTURED_ERRORS.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        let outcome = self.create(name, config);
+        let held = CAPTURED_ERRORS
+            .with(|c| c.borrow_mut().take())
+            .unwrap_or_default();
+        outcome.map_err(|e| (e, held.join("\n")))
     }
 
     /// Make every cursor this session opens from now on read the named

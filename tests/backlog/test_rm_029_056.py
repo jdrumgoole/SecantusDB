@@ -294,13 +294,45 @@ def test_host_info_system_fields(rust_mongo: Any) -> None:
     assert (want - set(system), system.get("memSizeMB", 0) > 0) == (set(), True)
 
 
-@pytest.mark.backlog("RM-040")
+@pytest.mark.backlog_fixed("RM-040")
 def test_coll_stats_wiredtiger_and_index_details(rust_mongo: Any) -> None:
     """mongod 8.2.11's `collStats` has `wiredTiger` and `indexDetails`."""
     db = _fresh(rust_mongo, "rm040cs")
     db.c.insert_one({"a": 1})
     stats = db.command("collStats", "c")
     assert ("wiredTiger" in stats, "indexDetails" in stats) == (True, True)
+
+
+#: The WiredTiger statistics categories of a table that mongod 8.2.11 lists
+#: in `collStats`' `wiredTiger` and each `indexDetails` entry, and that every
+#: WiredTiger it ships with has (more, `block-disagg` among them, came later).
+_TABLE_STATISTICS = (
+    "block-manager",
+    "btree",
+    "cache",
+    "checkpoint",
+    "compression",
+    "cursor",
+    "reconciliation",
+    "session",
+    "transaction",
+)
+
+
+@pytest.mark.backlog("RM-040")
+def test_coll_stats_lists_a_tables_statistics(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11's `collStats` lists, beside a table's `creationString`,
+    the WiredTiger statistics of the collection's table and of each index's."""
+    shapes = []
+    for client in (mongod, rust_mongo):
+        db = _fresh(client, "rm040st")
+        db.c.insert_one({"a": 1})
+        db.c.create_index("a")
+        stats = db.command("collStats", "c")
+        tables = [stats["wiredTiger"], *stats["indexDetails"].values()]
+        shapes.append([[k for k in _TABLE_STATISTICS if k in t] for t in tables])
+    assert shapes[0] == [list(_TABLE_STATISTICS)] * 3, shapes[0]
+    assert shapes[1] == shapes[0], shapes[1]
 
 
 @pytest.mark.backlog_fixed("RM-040")

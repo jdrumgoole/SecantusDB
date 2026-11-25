@@ -145,6 +145,15 @@ fn verify_and_salvage(
         }
         Err(e) => return Err(e.into()),
     };
+    // A store closed as a standalone's has no stable timestamp, and a
+    // table salvaged under none cannot be verified again until a stable
+    // one is set. Set one past every timestamp the tables hold, and close
+    // without keeping it (`use_timestamp=false`): the repair leaves no
+    // stable timestamp behind, as a standalone's close leaves none.
+    if conn.query_timestamp("get=stable_timestamp")? == "0" {
+        conn.close_unstable();
+        conn.set_timestamp("oldest_timestamp=1,stable_timestamp=7fffffff00000000")?;
+    }
     let session = conn.open_session()?;
     let mut tables = Vec::new();
     {
@@ -216,6 +225,14 @@ impl Storage {
         // repair writes (RM-746).
         let _untimestamped = untimestamped();
         let session = self.conn.open_session()?;
+        // Every index is built again in build order, so the in-memory order
+        // a `collMod` moved them to is gone (mongod 8.2.11, RM-790).
+        if let Ok(uuid) = collection_uuid(&session, db, coll) {
+            self.index_order
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&uuid);
+        }
 
         // The `_id` index: emptied, then one entry per document.
         let id_table = if with_id {

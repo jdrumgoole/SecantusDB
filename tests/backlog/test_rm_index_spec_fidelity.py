@@ -336,7 +336,7 @@ def _tied(client: Any, label: str, moved: list[str]) -> list[Any]:
     return _winner(client, label)
 
 
-@pytest.mark.backlog("RM-790")
+@pytest.mark.backlog_fixed("RM-790")
 def test_a_planner_tie_goes_by_the_in_memory_index_order(rust_mongo: Any, mongod: Any) -> None:
     """Three single-field indexes cost the same for `{a: 3, b: 3, c: 3}`, so
     the first candidate wins, and candidates come in the collection's
@@ -350,6 +350,92 @@ def test_a_planner_tie_goes_by_the_in_memory_index_order(rust_mongo: Any, mongod
         if ours != theirs:
             differences[label] = {"secantusd-mdb": ours, "mongod": theirs}
     assert not differences, differences
+
+
+@pytest.mark.backlog_fixed("RM-790")
+def test_every_collmod_that_moves_an_index_moves_it_in_the_planner(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """Probed on mongod 8.2.11 (2026-11-25): `prepareUnique` on and off, `hidden`
+    set and cleared, and a TTL `expireAfterSeconds` (even to the value it had)
+    move the index to the end of the in-memory catalog the planner tries
+    candidates from; a `collMod` that changes nothing does not."""
+
+    def run(client: Any, label: str) -> list[Any]:
+        db = client["ties"]
+        steps = {
+            "ttl-changed": ({"a": 1000}, [("a_1", {"expireAfterSeconds": 2000})]),
+            "ttl-same": ({"a": 1000}, [("a_1", {"expireAfterSeconds": 1000})]),
+            "ttl-on-b": ({"b": 1000}, [("b_1", {"expireAfterSeconds": 2000})]),
+            "hide-unhide": ({}, [("a_1", {"hidden": True}), ("a_1", {"hidden": False})]),
+            "unhide-nothing": ({}, [("a_1", {"hidden": False})]),
+            "unset-nothing": ({}, [("a_1", {"prepareUnique": False})]),
+            "set-twice": (
+                {},
+                [("a_1", {"prepareUnique": True}), ("b_1", {"prepareUnique": True})]
+                + [("a_1", {"prepareUnique": True})],
+            ),
+            "set-then-unset": (
+                {},
+                [("a_1", {"prepareUnique": True}), ("b_1", {"prepareUnique": True})]
+                + [("a_1", {"prepareUnique": False})],
+            ),
+        }
+        ttl, changes = steps[label]
+        name = f"coll_{label}".replace("-", "_")
+        db.drop_collection(name)
+        db[name].insert_many([{"a": i % 10, "b": i % 10, "c": i % 10} for i in range(200)])
+        for key in "abc":
+            spec = {"name": f"{key}_1", "key": {key: 1}}
+            if key in ttl:
+                spec["expireAfterSeconds"] = ttl[key]
+            db.command("createIndexes", name, indexes=[spec])
+        for index_name, change in changes:
+            db.command("collMod", name, index={"name": index_name, **change})
+        return _winner(client, name)
+
+    labels = [
+        "ttl-changed",
+        "ttl-same",
+        "ttl-on-b",
+        "hide-unhide",
+        "unhide-nothing",
+        "unset-nothing",
+        "set-twice",
+        "set-then-unset",
+    ]
+    differences = {}
+    for label in labels:
+        theirs = run(mongod, label)
+        ours = run(rust_mongo, label)
+        if ours != theirs:
+            differences[label] = {"secantusd-mdb": ours, "mongod": theirs}
+    assert not differences, differences
+
+
+def _moved_then_rebuilt(client: Any) -> dict:
+    db = client["ties"]
+    db.drop_collection("t")
+    db["t"].insert_many([{"a": i % 10, "b": i % 10, "c": i % 10} for i in range(200)])
+    for key in "abc":
+        db.command("createIndexes", "t", indexes=[{"name": f"{key}_1", "key": {key: 1}}])
+    db.command("collMod", "t", index={"name": "a_1", "prepareUnique": True})
+    moved = _winner(client, "t")
+    db.command("reIndex", "t")
+    return {"moved": moved, "reindexed": _winner(client, "t")}
+
+
+@pytest.mark.backlog_fixed("RM-790")
+def test_reindex_puts_the_planner_candidates_back_in_build_order(tmp_path: Path) -> None:
+    """`reIndex` drops and builds every index again, so the in-memory order a
+    `collMod` made is gone: the tie goes to `a_1` again (mongod 8.2.11,
+    2026-11-25)."""
+    (tmp_path / "mongod").mkdir()
+    with _standalone_mongod(tmp_path / "mongod") as client:
+        theirs = _moved_then_rebuilt(client)
+    assert theirs["moved"][0] == "b_1" and theirs["reindexed"][0] == "a_1", theirs
+    with rust_mongo_server(tmp_path / "ours", "--standalone") as client:
+        assert _moved_then_rebuilt(client) == theirs
 
 
 def _refusals(client: Any, key: dict, options_list: list[dict]) -> dict:
