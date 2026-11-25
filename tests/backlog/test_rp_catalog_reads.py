@@ -352,8 +352,8 @@ class Observer:
     """Reads every system catalog's and catalog index's counters through
     `pg_stat_get_*` by oid: once warm, its own query reads no catalog."""
 
-    def __init__(self, dsn: str) -> None:
-        self.conn = _connect(dsn, "obs")
+    def __init__(self, dsn: str, db: str = "") -> None:
+        self.conn = _connect(dsn, f"obs:{db}")
         rels = self.conn.execute(
             "select relid::int, relname::text from pg_stat_sys_tables "
             "where schemaname = 'pg_catalog' order by 1"
@@ -1954,10 +1954,12 @@ EXPECTED_CATALOG_BLOCKS: list[dict[str, int]] = [
 ]
 
 
-@pytest.mark.backlog("RP-291")
+@pytest.mark.backlog_fixed("RP-291")
 def test_catalog_blocks(rust_pg: Any) -> None:
     """PostgreSQL 15.19: the heap blocks behind every catalog row a scan
-    returns, `initdb`'s or a later one's."""
+    returns, `initdb`'s or a later one's. A row CREATE TABLE wrote had no
+    place, so a lookup that returned it read no heap block; now each is
+    placed where PostgreSQL puts it (`catalog_places.rs`)."""
     assert catalog_blocks(_dsn(rust_pg)) == EXPECTED_CATALOG_BLOCKS
 
 
@@ -1985,20 +1987,21 @@ def index_blocks(dsn: str) -> list[dict[str, int]]:
 
 
 def _block_deltas(
-    dsn: str, steps: list[str], view: str, column: str, setup: bool
+    dsn: str, steps: list[str], view: str, column: str, setup: bool, db: str = ""
 ) -> list[dict[str, int]]:
     """Each catalog relation of `view`'s `blocks_fetched` delta between
     `steps`' marks ("drop" takes one and drops it), and over the sessions'
     ends; with `setup`, over the
-    module's objects, created and warmed first."""
+    module's objects, created and warmed first. Every session is in
+    database `db` (`postgres` when empty)."""
     if setup:
-        with _connect(dsn, "setup") as c:
+        with _connect(dsn, f"setup:{db}") as c:
             for s in SETUP:
                 c.execute(s)
-        with _connect(dsn, "warm") as c:
+        with _connect(dsn, f"warm:{db}") as c:
             for s in WARM:
                 c.execute(s)
-    obs = Observer(dsn)
+    obs = Observer(dsn, db)
     rels = [
         o
         for (o,) in obs.conn.execute(
@@ -2040,7 +2043,7 @@ def _block_deltas(
                 continue
             name, sql = st.split("|", 1)
             if name not in conns:
-                conns[name] = _connect(dsn, name)
+                conns[name] = _connect(dsn, name if ":" in name else f"{name}:{db}")
             if sql:
                 conns[name].execute(sql)
         for c in conns.values():
@@ -2051,7 +2054,7 @@ def _block_deltas(
     finally:
         obs.conn.close()
         if setup:
-            with _connect(dsn, "teardown") as c:
+            with _connect(dsn, f"teardown:{db}") as c:
                 for s in TEARDOWN:
                     c.execute(s)
 
@@ -2299,12 +2302,19 @@ def test_an_index_only_catalog_scan_reads_the_visibility_map(rust_pg: Any) -> No
     assert catalog_reads(dsn, {"x": INDEX_ONLY_STEPS})["x"] == EXPECTED_INDEX_ONLY_READS
 
 
-# RP-291, what is left of it: DDL's rows clear the visibility map bit of
-# each `initdb` page they are written to (`heap_insert`'s
-# `visibilitymap_clear`), so an index-only scan then fetches the `initdb`
-# rows on that page too. `pg_class`'s rows for `pg_type` and `pg_class` are
-# on block 0, where this module's tables' rows go. Measured as
-# `EXPECTED_INDEX_BLOCKS` was.
+# RP-291: DDL's rows clear the visibility map bit of each `initdb` page they
+# are written to (`heap_insert`'s `visibilitymap_clear`), so an index-only
+# scan then fetches the `initdb` rows on that page too. `pg_class`'s row
+# for `pg_type` is on block 0, where a fresh database's first CREATE TABLE
+# puts its rows; `pg_class`'s own is on block 7, which a fresh database's
+# first three cycles of this module's DDL never reach and its fourth does.
+# Each is measured in a fresh database of its own (as the module's other
+# answers are not: the shared database's pages hold whatever the module's
+# earlier tests wrote, so a run under xdist moves them), after `k - 1`
+# cycles of SETUP, WARM and TEARDOWN and then SETUP and WARM once more,
+# on a private PostgreSQL 15.20 cluster (whose initdb `pg_class`,
+# `pg_type` and `pg_index` heaps are 15.19's, page for page), twice, the
+# two recordings identical.
 CLEARED_VM_STEPS = [
     "a|",
     "mark",
@@ -2342,7 +2352,7 @@ EXPECTED_CLEARED_VM_BLOCKS: list[dict[str, int]] = [
     {
         "pg_amop": 4,
         "pg_cast": 3,
-        "pg_class": 2,
+        "pg_class": 1,
         "pg_operator": 43,
         "pg_proc": 1,
         "pg_statistic": 1,
@@ -2352,12 +2362,103 @@ EXPECTED_CLEARED_VM_BLOCKS: list[dict[str, int]] = [
 ]
 
 
-@pytest.mark.backlog("RP-291")
+def after_ddl_cycles(dsn: str, k: int, steps: list[str]) -> list[dict[str, int]]:
+    """`_block_deltas` over `steps` in a fresh database, after `k - 1`
+    cycles of the module's SETUP, WARM and TEARDOWN there."""
+    db = f"rp291_k{k}"
+    with psycopg.connect(dsn + " dbname=postgres", autocommit=True) as c:
+        c.execute(f"drop database if exists {db}")
+        c.execute(f"create database {db}")
+    try:
+        for _ in range(k - 1):
+            for group, name in ((SETUP, "setup"), (WARM, "warm"), (TEARDOWN, "teardown")):
+                with _connect(dsn, f"{name}:{db}") as c:
+                    for s in group:
+                        c.execute(s)
+        return _block_deltas(dsn, steps, "pg_stat_sys_tables", "relid", True, db)
+    finally:
+        with psycopg.connect(dsn + " dbname=postgres", autocommit=True) as c:
+            c.execute(f"drop database if exists {db}")
+
+
+@pytest.mark.backlog_fixed("RP-291")
 def test_a_page_ddl_wrote_to_is_not_all_visible(rust_pg: Any) -> None:
     """PostgreSQL 15.19: once DDL has written a catalog row to an `initdb`
-    page, an index-only scan fetches that page's rows from the heap."""
-    blocks = _block_deltas(_dsn(rust_pg), CLEARED_VM_STEPS, "pg_stat_sys_tables", "relid", True)
-    assert blocks == EXPECTED_CLEARED_VM_BLOCKS
+    page, an index-only scan fetches that page's rows from the heap, and a
+    page no DDL wrote stays all-visible. The rows DDL wrote had no place,
+    so every `initdb` page kept its bit."""
+    assert after_ddl_cycles(_dsn(rust_pg), 1, CLEARED_VM_STEPS) == EXPECTED_CLEARED_VM_BLOCKS
+
+
+# One `pg_class` row on each of `initdb`'s 14 `pg_class` blocks, by oid:
+# an index-only scan of it reads its block only once DDL has written there.
+PG_CLASS_BLOCK_ROWS = [
+    2619,
+    2836,
+    4163,
+    4184,
+    2693,
+    549,
+    3429,
+    1418,
+    2617,
+    6000,
+    12122,
+    12312,
+    13888,
+    13975,
+]
+
+# Which of those blocks four cycles of the module's DDL have written ("x")
+# in a fresh database, measured as `EXPECTED_CLEARED_VM_BLOCKS` was: the
+# free space map hands each cycle's new backend a page of its own.
+EXPECTED_WRITTEN_AFTER_FOUR = "xx...xxx......"
+
+
+@pytest.mark.backlog_fixed("RP-291")
+def test_ddl_cycles_write_the_pages_postgresqls_do(rust_pg: Any) -> None:
+    """PostgreSQL 15.19: four cycles of this module's DDL in a fresh database
+    write `pg_class` blocks 0, 1, 5, 6 and 7, each cycle's rows where the
+    free space map sends its backend."""
+    steps = ["a|", "mark"]
+    for oid in PG_CLASS_BLOCK_ROWS:
+        steps += [f"a|select oid from pg_class where oid = {oid}", "mark"]
+    got = after_ddl_cycles(_dsn(rust_pg), 4, steps)
+    written = "".join("x" if d.get("pg_class", 0) > 1 else "." for d in got[1:-1])
+    assert written == EXPECTED_WRITTEN_AFTER_FOUR
+
+
+# RP-291, what is left of it: the rows of DDL other than CREATE TABLE have
+# no place yet. A new session's first use of the module's view and then of
+# its function, in a fresh database after its DDL once, measured as
+# `EXPECTED_CLEARED_VM_BLOCKS` was: the view's `pg_class`, `pg_attribute`
+# and `pg_rewrite` rows and the function's `pg_proc` row are each read
+# from the heap.
+OTHER_DDL_STEPS = ["a|", "mark", "a|select * from rpc_v", "mark", "a|select rpc_f(1)", "mark"]
+
+EXPECTED_OTHER_DDL_BLOCKS: list[dict[str, int]] = [
+    {
+        "pg_am": 1,
+        "pg_attribute": 4,
+        "pg_class": 6,
+        "pg_index": 1,
+        "pg_operator": 1,
+        "pg_proc": 1,
+        "pg_rewrite": 1,
+        "pg_tablespace": 1,
+        "pg_type": 2,
+    },
+    {"pg_operator": 2, "pg_proc": 3},
+    {},
+]
+
+
+@pytest.mark.backlog("RP-291")
+def test_a_views_and_a_functions_rows_are_read_from_the_heap(rust_pg: Any) -> None:
+    """PostgreSQL 15.19: a lookup that returns a row CREATE VIEW or CREATE
+    FUNCTION wrote reads the row's heap block, as one of CREATE TABLE's
+    does."""
+    assert after_ddl_cycles(_dsn(rust_pg), 1, OTHER_DDL_STEPS)[1:] == EXPECTED_OTHER_DDL_BLOCKS
 
 
 # RP-935 (fixed): the index a catalog read directly is scanned through, and how
@@ -2936,10 +3037,15 @@ if __name__ == "__main__" and sys.argv[2:] == ["heap"]:
     )
     for case, (sql, prefix, _) in INDEX_PATHS.items():
         print(f"INDEX_PATHS[{case!r}]:", index_path(sys.argv[1], sql, prefix))
-    cleared = _block_deltas(sys.argv[1], CLEARED_VM_STEPS, "pg_stat_sys_tables", "relid", True)
+    cleared = after_ddl_cycles(sys.argv[1], 1, CLEARED_VM_STEPS)
     print(
         "EXPECTED_CLEARED_VM_BLOCKS: list[dict[str, int]] = "
         + pprint.pformat(cleared, width=100, sort_dicts=False)
+    )
+    other = after_ddl_cycles(sys.argv[1], 1, OTHER_DDL_STEPS)[1:]
+    print(
+        "EXPECTED_OTHER_DDL_BLOCKS: list[dict[str, int]] = "
+        + pprint.pformat(other, width=100, sort_dicts=False)
     )
 elif __name__ == "__main__":
     measured = catalog_reads(sys.argv[1])

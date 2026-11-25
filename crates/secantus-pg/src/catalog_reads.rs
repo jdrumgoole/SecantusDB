@@ -80,6 +80,9 @@ pub(crate) struct Rel {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Index {
     pub oid: i64,
+    /// Its name, and its columns' (`pg_attribute`'s `attname`).
+    pub name: String,
+    pub attnames: Vec<String>,
     pub natts: i64,
     /// Key columns' attnums, 0 for an expression.
     pub keys: Vec<i64>,
@@ -126,6 +129,9 @@ const RELATION_RELATION: i64 = 1259;
 /// `pg_table_is_visible`.
 const TABLE_IS_VISIBLE: i64 = 2079;
 const ATTRIBUTE_RELATION: i64 = 1249;
+const TYPE_RELATION: i64 = 1247;
+const INDEX_RELATION: i64 = 2610;
+const DATABASE_RELATION: i64 = 1262;
 const DEPEND_RELATION: i64 = 2608;
 const DEPEND_DEPENDER_INDEX: i64 = 2673;
 const DEPEND_REFERENCE_INDEX: i64 = 2674;
@@ -605,7 +611,8 @@ impl<'a> Model<'a> {
             self.search(Cache::AmOid, vec![K::O(HEAP_AM)], |_| true);
         }
         // `RelationBuildTupleDesc`: every attribute numbered above zero.
-        self.ct.index_key(2659, &vec![K::O(rel.oid)], rel.natts);
+        self.ct
+            .index_key_above(2659, &vec![K::O(rel.oid)], 0, rel.natts);
         if rel.defaults > 0 {
             // `AttrDefaultFetch`.
             self.open_catalog(2604);
@@ -645,7 +652,8 @@ impl<'a> Model<'a> {
             return;
         }
         self.ct.index_key(2662, &vec![K::O(ix.oid)], 1);
-        self.ct.index_key(2659, &vec![K::O(ix.oid)], ix.natts);
+        self.ct
+            .index_key_above(2659, &vec![K::O(ix.oid)], 0, ix.natts);
         self.search(Cache::IndexRelid, vec![K::O(ix.oid)], |_| true);
         self.search(Cache::AmOid, vec![K::O(ix.am)], |_| true);
         for class in &ix.classes {
@@ -3777,6 +3785,7 @@ fn catalog_index(oid: i64) -> Option<Index> {
         am: rel.relam,
         in_init_file: rel.in_init_file,
         unique: ix.unique,
+        ..Index::default()
     })
 }
 
@@ -3968,8 +3977,16 @@ impl PgHandler {
                             default_opclass(typ, BTREE_AM)
                         })
                         .collect();
+                    let attname = |k: &i32| {
+                        columns
+                            .iter()
+                            .find(|c| c.0 == i64::from(*k))
+                            .map_or_else(|| "expr".to_string(), |c| c.1.clone())
+                    };
                     Index {
                         oid: ix.oid,
+                        name: ix.name.rsplit('.').next().unwrap_or(&ix.name).to_string(),
+                        attnames: ix.keys.iter().chain(&ix.include).map(attname).collect(),
                         natts: (ix.keys.len() + ix.include.len()) as i64,
                         keys,
                         classes,
@@ -4558,9 +4575,133 @@ impl PgHandler {
                         }
                     }
                 }
+                self.placed_effects(stmt, &mut effects);
             }
         }
         effects
+    }
+
+    /// The tables whose catalog rows the statement writes or deletes, as
+    /// `catalog_places.rs` places them: a CREATE TABLE of the shapes
+    /// measured (plain columns, PRIMARY KEY, UNIQUE and CHECK constraints,
+    /// defaults; not a temporary, partitioned, inheriting or typed table,
+    /// a serial or identity column, a foreign key or an exclusion
+    /// constraint, whose other catalog writes move rows not placed yet),
+    /// and a DROP TABLE of tables this server has.
+    fn placed_effects(&self, stmt: &N, effects: &mut Effects) {
+        match stmt {
+            N::CreateStmt(c) => {
+                let Some(rv) = c.relation.as_ref() else {
+                    return;
+                };
+                let constraint_ok = |n: &pb::Node| match n.node.as_ref() {
+                    Some(N::Constraint(k)) => {
+                        let t = k.contype;
+                        t != pb::ConstrType::ConstrForeign as i32
+                            && t != pb::ConstrType::ConstrExclusion as i32
+                            && t != pb::ConstrType::ConstrIdentity as i32
+                            && t != pb::ConstrType::ConstrGenerated as i32
+                    }
+                    _ => true,
+                };
+                let plain = rv.relpersistence != "t"
+                    && c.inh_relations.is_empty()
+                    && c.partbound.is_none()
+                    && c.partspec.is_none()
+                    && c.of_typename.is_none()
+                    && c.table_elts.iter().all(|e| match e.node.as_ref() {
+                        Some(N::ColumnDef(cd)) => {
+                            let serial = cd.type_name.as_ref().is_some_and(|t| {
+                                names_of(&t.names).len() == 1
+                                    && matches!(
+                                        names_of(&t.names)[0].as_str(),
+                                        "smallserial"
+                                            | "serial2"
+                                            | "serial"
+                                            | "serial4"
+                                            | "bigserial"
+                                            | "serial8"
+                                    )
+                            });
+                            !serial
+                                && cd.identity.is_empty()
+                                && cd.generated.is_empty()
+                                && cd.constraints.iter().all(constraint_ok)
+                        }
+                        Some(N::Constraint(_)) => constraint_ok(e),
+                        _ => false,
+                    });
+                if !plain {
+                    return;
+                }
+                let nsp = if rv.schemaname.is_empty() {
+                    Some(PUBLIC)
+                } else {
+                    self.cr_namespace_oid(&rv.schemaname)
+                };
+                // IF NOT EXISTS over a table that is there writes nothing.
+                if nsp.is_some_and(|n| self.cr_relation_in(n, &rv.relname).is_some()) {
+                    return;
+                }
+                effects
+                    .created
+                    .push((rv.schemaname.clone(), rv.relname.clone()));
+            }
+            N::DropStmt(d) if d.remove_type == pb::ObjectType::ObjectTable as i32 => {
+                for o in &d.objects {
+                    let Some(N::List(l)) = o.node.as_ref() else {
+                        continue;
+                    };
+                    let parts = names_of(&l.items);
+                    let (schema, name) = match parts.as_slice() {
+                        [name] => ("", name.as_str()),
+                        [schema, name] => (schema.as_str(), name.as_str()),
+                        _ => continue,
+                    };
+                    let nsp = if schema.is_empty() {
+                        Some(PUBLIC)
+                    } else {
+                        self.cr_namespace_oid(schema)
+                    };
+                    if let Some(rel) = nsp.and_then(|n| self.cr_relation_in(n, name)) {
+                        effects.dropped.push(rel.oid);
+                    }
+                }
+            }
+            N::CreatedbStmt(c) => {
+                // An option that sets a locale changes the row's length.
+                let plain = c.options.iter().all(|o| match o.node.as_ref() {
+                    Some(N::DefElem(d)) => !matches!(
+                        d.defname.as_str(),
+                        "locale"
+                            | "lc_collate"
+                            | "lc_ctype"
+                            | "icu_locale"
+                            | "locale_provider"
+                            | "collation_version"
+                    ),
+                    _ => false,
+                });
+                let exists = self
+                    .databases
+                    .lookup(&self.storage, &c.dbname)
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if plain && !exists {
+                    effects.created_db = Some(c.dbname.clone());
+                }
+            }
+            N::DropdbStmt(d) => {
+                effects.dropped_db = self
+                    .databases
+                    .lookup(&self.storage, &d.dbname)
+                    .ok()
+                    .flatten()
+                    .map(|d| d.oid);
+            }
+            _ => {}
+        }
     }
 
     /// The catalog reads of one statement. Walked once it has run: the
@@ -4643,7 +4784,58 @@ impl PgHandler {
     /// The statement ended: a catalog change it made reaches this backend's
     /// caches now, the others' when its transaction commits.
     pub(crate) fn catalog_reads_done(&self, effects: Effects, ok: bool) {
-        if !ok || (effects.invals.is_empty() && effects.dead.is_empty()) {
+        if !ok {
+            return;
+        }
+        let (store, pid) = self.catcache_ids();
+        let db = self.stats().db;
+        for (schema, name) in &effects.created {
+            self.place_created_table(store, db, pid, schema, name);
+        }
+        for oid in &effects.dropped {
+            crate::catalog_places::drop_group(
+                store,
+                db,
+                pid,
+                *oid,
+                &[
+                    RELATION_RELATION,
+                    TYPE_RELATION,
+                    ATTRIBUTE_RELATION,
+                    INDEX_RELATION,
+                ],
+            );
+        }
+        if let Some(name) = &effects.created_db {
+            // `createdb`'s `pg_database` row, in the cluster's one heap.
+            if let Some(oid) = self
+                .databases
+                .lookup(&self.storage, name)
+                .ok()
+                .flatten()
+                .map(|d| d.oid)
+            {
+                crate::catalog_places::write(
+                    store,
+                    db,
+                    pid,
+                    oid,
+                    &[crate::catalog_places::Write {
+                        catalog: DATABASE_RELATION,
+                        len: crate::catalog_places::DATABASE_LEN,
+                        keys: vec![
+                            (2671, vec![Bson::String(name.clone())]),
+                            (2672, vec![Bson::Int64(oid)]),
+                        ],
+                        update_of: None,
+                    }],
+                );
+            }
+        }
+        if let Some(oid) = effects.dropped_db {
+            crate::catalog_places::drop_database(store, pid, oid);
+        }
+        if effects.invals.is_empty() && effects.dead.is_empty() {
             return;
         }
         let mut be = self.catcache.lock().unwrap_or_else(|e| e.into_inner());
@@ -4651,9 +4843,140 @@ impl PgHandler {
         be.left_dead(effects.dead);
     }
 
+    /// The catalog rows CREATE TABLE wrote for `name`, placed as
+    /// PostgreSQL 15 writes them (`catalog_places.rs`), measured on a fresh
+    /// database: `heap_create_with_catalog`'s row type and array type in
+    /// `pg_type`, the table's `pg_class` row, its columns' `pg_attribute`
+    /// rows and then the six system columns' (`ctid` down to `tableoid`);
+    /// then, for a table that needs one, `create_toast_table`'s TOAST table
+    /// (no row type) with its three columns and its index of two, and the
+    /// HOT update of the table's `pg_class` row that sets `reltoastrelid`;
+    /// then each index of its constraints: its `pg_class` row, its columns
+    /// and its `pg_index` row. `index_update_stats` updates the `pg_class`
+    /// rows in place, which moves nothing.
+    fn place_created_table(&self, store: usize, db: i64, pid: i32, schema: &str, name: &str) {
+        use crate::catalog_places::{pg_index_len, Write, ATTRIBUTE_LEN, CLASS_LEN, TYPE_LEN};
+        let nsp = if schema.is_empty() {
+            PUBLIC
+        } else {
+            match self.cr_namespace_oid(schema) {
+                Some(n) => n,
+                None => return,
+            }
+        };
+        let Some(rel) = self.cr_relation_in(nsp, name) else {
+            return;
+        };
+        let key = if nsp == PUBLIC {
+            name.to_string()
+        } else {
+            format!("{schema}.{name}")
+        };
+        let Some(rowtype) = self
+            .composites()
+            .ok()
+            .and_then(|c| c.iter().find(|(n, _, _)| *n == key).map(|c| c.1))
+        else {
+            return;
+        };
+        let o = Bson::Int64;
+        let n = |v: &str| Bson::String(v.to_string());
+        let class = |oid: i64, relname: &str| Write {
+            catalog: RELATION_RELATION,
+            len: CLASS_LEN,
+            keys: vec![
+                (2662, vec![o(oid)]),
+                (2663, vec![n(relname), o(nsp)]),
+                (3455, vec![o(0), o(oid)]),
+            ],
+            update_of: None,
+        };
+        let attribute = |rel: i64, attnum: i64, attname: &str| Write {
+            catalog: ATTRIBUTE_RELATION,
+            len: ATTRIBUTE_LEN,
+            keys: vec![
+                (2658, vec![o(rel), n(attname)]),
+                (2659, vec![o(rel), o(attnum)]),
+            ],
+            update_of: None,
+        };
+        // A TOAST table's rows: this server keeps no TOAST relation, so
+        // nothing looks them up; they take their space.
+        let unkeyed = |catalog: i64, len: u32| Write {
+            catalog,
+            len,
+            keys: Vec::new(),
+            update_of: None,
+        };
+        const SYSTEM: [(i64, &str); 6] = [
+            (-1, "ctid"),
+            (-2, "xmin"),
+            (-3, "cmin"),
+            (-4, "xmax"),
+            (-5, "cmax"),
+            (-6, "tableoid"),
+        ];
+        let mut w = vec![
+            Write {
+                catalog: TYPE_RELATION,
+                len: TYPE_LEN,
+                keys: vec![(2703, vec![o(rowtype)]), (2704, vec![n(name), o(nsp)])],
+                update_of: None,
+            },
+            Write {
+                catalog: TYPE_RELATION,
+                len: TYPE_LEN,
+                keys: vec![
+                    (
+                        2703,
+                        vec![o(rowtype + secantus_pgplan::USER_TYPE_ARRAY_OID_OFFSET)],
+                    ),
+                    (2704, vec![n(&format!("_{name}")), o(nsp)]),
+                ],
+                update_of: None,
+            },
+            class(rel.oid, name),
+        ];
+        let table_row = w.len() - 1;
+        for (attnum, attname, _) in &rel.columns {
+            w.push(attribute(rel.oid, *attnum, attname));
+        }
+        for (attnum, attname) in SYSTEM {
+            w.push(attribute(rel.oid, attnum, attname));
+        }
+        if rel.toast {
+            w.push(unkeyed(RELATION_RELATION, CLASS_LEN));
+            for _ in 0..3 + SYSTEM.len() {
+                w.push(unkeyed(ATTRIBUTE_RELATION, ATTRIBUTE_LEN));
+            }
+            w.push(unkeyed(RELATION_RELATION, CLASS_LEN));
+            w.push(unkeyed(ATTRIBUTE_RELATION, ATTRIBUTE_LEN));
+            w.push(unkeyed(ATTRIBUTE_RELATION, ATTRIBUTE_LEN));
+            w.push(unkeyed(INDEX_RELATION, pg_index_len(2)));
+            w.push(Write {
+                update_of: Some((table_row, true)),
+                ..class(rel.oid, name)
+            });
+        }
+        for ix in &rel.indexes {
+            w.push(class(ix.oid, &ix.name));
+            for (i, attname) in ix.attnames.iter().enumerate() {
+                w.push(attribute(ix.oid, i as i64 + 1, attname));
+            }
+            w.push(Write {
+                catalog: INDEX_RELATION,
+                len: pg_index_len(ix.natts as u32),
+                keys: vec![(2678, vec![o(rel.oid)]), (2679, vec![o(ix.oid)])],
+                update_of: None,
+            });
+        }
+        crate::catalog_places::write(store, db, pid, rel.oid, &w);
+    }
+
     /// The transaction ended.
     pub(crate) fn catcache_end_xact(&self, commit: bool) {
         let (store, pid) = self.catcache_ids();
+        crate::catalog_places::end_xact(store, pid, commit);
         self.catcache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -4670,6 +4993,15 @@ pub(crate) struct Effects {
     pub(crate) dead: Vec<(i64, Key)>,
     /// The relations an ALTER TABLE changes, as they stand before it.
     pub(crate) pre: Vec<Rel>,
+    /// The tables a CREATE TABLE makes whose catalog rows are placed
+    /// (`catalog_places.rs`): each one's schema, if named, and name.
+    pub(crate) created: Vec<(String, String)>,
+    /// The tables a DROP TABLE deletes, by oid.
+    pub(crate) dropped: Vec<i64>,
+    /// The database a CREATE DATABASE makes, and the one a DROP DATABASE
+    /// deletes (its oid).
+    pub(crate) created_db: Option<String>,
+    pub(crate) dropped_db: Option<i64>,
 }
 
 /// A statement's text with each literal replaced by a representative of

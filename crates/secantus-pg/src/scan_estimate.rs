@@ -3896,7 +3896,13 @@ impl PgHandler {
         if key.is_empty() {
             return None;
         }
-        catalog_btree::index_only_heap_fetches(ix.oid, &key, rows)
+        catalog_btree::index_only_heap_fetches(
+            std::sync::Arc::as_ptr(&self.storage) as usize,
+            self.stats().db,
+            ix.oid,
+            &key,
+            rows,
+        )
     }
 
     /// The estimate of a plain index scan of user table `table` through the

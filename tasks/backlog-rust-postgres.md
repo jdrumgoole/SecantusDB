@@ -1554,50 +1554,69 @@ a regression test.
       method's); a `pg_stat_*` view 16 match, 22 differ.
       Backlog-ID: RP-290
       Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view], tests/backlog/test_rp_catalog_reads.py::test_gap[psql's describe query]
-- [ ] **A catalog row added after `initdb` counts no heap block** in
-      `pg_statio_sys_tables`. A catalog scan counts its index pages
-      (`catalog_btree.rs`, from `pg15_catalog_indexes.txt`) and, since
-      2026-11-01, the heap blocks behind `initdb`'s own rows: an index
-      scan's fetch of each tuple it returns, a sequential scan's every
-      block, over `pg15_catalog_heaps.txt` (`catalog_heap.rs`; regression
-      test `test_catalog_heap_blocks`). A row any database adds later has
-      no place yet, so a scan that returns one (a new table's `pg_class`
-      and `pg_attribute` rows) counts neither its heap block nor, for a
-      sequential scan, the blocks it grew the heap by.
+- [ ] **A catalog row DDL other than CREATE TABLE writes counts no heap
+      block** in `pg_statio_sys_tables`. A catalog scan counts its index
+      pages (`catalog_btree.rs`, from `pg15_catalog_indexes.txt`) and the
+      heap blocks behind the rows it returns: `initdb`'s own
+      (`pg15_catalog_heaps.txt`, `catalog_heap.rs`), and since 2026-11-25
+      those CREATE TABLE and CREATE DATABASE write, placed in each
+      database's copy of `initdb`'s heap pages and free space map as
+      PostgreSQL places them (`catalog_places.rs`): the table's row type
+      and array type, its `pg_class` row, its columns' and the system
+      columns' `pg_attribute` rows, its TOAST table's and that table's
+      index's rows (keyless: this server keeps no TOAST relation), the
+      HOT update that sets `reltoastrelid`, each constraint index's
+      `pg_class`, `pg_attribute` and `pg_index` rows, and `createdb`'s
+      `pg_database` row in the cluster's one heap. Each write clears its
+      page's visibility map bit, so an index-only scan fetches the
+      `initdb` rows beside it; DROP TABLE and DROP DATABASE leave the rows
+      dead at commit, as does a rolled-back CREATE (regression tests
+      `test_catalog_blocks`, `test_a_page_ddl_wrote_to_is_not_all_visible`
+      and `test_ddl_cycles_write_the_pages_postgresqls_do`, which holds the
+      `pg_class` blocks four cycles of DDL write to PostgreSQL's).
       **Decided** (Joe, 2026-11-01): option A, the full model, landed as a
-      sequence of PRs, this item open until the last. Since 2026-11-02
-      each built-in catalog's `initdb` pages (free space, line pointers,
-      redirects, heap-only tuples) and free space map fork are recorded
-      too, and `catalog_heap::initdb_heap_model` builds the heap a new
-      row goes in, placed FSM-first as PostgreSQL places it (regression
-      test `a_new_tables_catalog_rows_go_where_postgresql_puts_them`).
-      Remaining: place every later catalog row in those models as DDL
-      writes it (each catalog's `heap_form_tuple` length, and the HOT or
-      non-HOT updates DDL makes of its own new rows), and insert its
-      index entries into the index trees, which hold only `initdb`'s
-      tuples and are shared by every database -- with a non-HOT update's
-      new version and entries, and VACUUM's removal of dead ones (reading
-      this server's catalog rows to find them is not the way: on a
-      statement's path it cost a new session hundreds of milliseconds,
-      inside a transaction that changed the catalogs it blinded the
-      session to its own new objects, and off a statement's path it lost
-      other sessions' new tables). Also open: the shared buffer pool keys
-      a page by relation oid and block, not database, so two databases'
-      copies of one catalog share hits. An index-only scan's `Heap
-      Fetches` (RP-360) reads `initdb`'s visibility map: until later rows
-      are placed, a row DDL adds counts as fetched but the `initdb` rows
-      on the page it cleared do not, and a row DDL deleted or updated
-      still reads as all-visible. Since 2026-11-13 a catalog read directly
-      through an index holding every column it reads is an index-only
-      scan here too (`IndexOnlyNext`: the visibility map's page once, the
-      heap only off an all-visible block; regression test
-      `test_an_index_only_catalog_scan_reads_the_visibility_map`), with the
-      same two gaps: each row DDL added is fetched as a block of its own,
-      and an `initdb` row on a page DDL wrote to is not fetched (`select
-      relname from pg_class where relname = 'pg_type'` after this module's
-      DDL: PostgreSQL 15.19 reads 7 `pg_class` blocks, this server 6).
+      sequence of PRs, this item open until the last. Remaining:
+      - every other DDL's rows: CREATE VIEW's (`pg_class`, `pg_type`,
+        `pg_attribute`, `pg_rewrite`, and the HOT update `relhasrules`
+        makes), CREATE FUNCTION's `pg_proc` row, GRANT's out-of-line
+        `relacl` update (217 bytes), CREATE INDEX, sequences and serial
+        columns, ALTER TABLE, roles, and the CREATE TABLE shapes left
+        unplaced (temporary, partitioned, inheriting and typed tables,
+        identity and generated columns, foreign keys, whose triggers update
+        the `pg_class` rows, exclusion constraints, CREATE DATABASE with a
+        locale option); and the catalogs none of it is placed in yet
+        (`pg_depend`, `pg_constraint`, `pg_shdepend`, ...). A view's first
+        use in a fresh database reads 6 `pg_class`, 4 `pg_attribute` and 1
+        `pg_rewrite` blocks on PostgreSQL, 3, 3 and 0 here; a function's
+        first call 3 `pg_proc` blocks, here 1;
+      - the index entries of the placed rows in the index trees, which hold
+        only `initdb`'s tuples and are shared by every database (a scan's
+        leaf pages are read over `initdb`'s tree), with a non-HOT update's
+        new version and entries, and VACUUM's removal of dead ones;
+      - a dead row's space: on-access pruning (`heap_page_prune_opt`) and
+        VACUUM do not free it, and a scan never meets a dead row's entry
+        (it reads as killed at once, where PostgreSQL's first scan reads
+        its block before `_bt_killitems`); a ROLLBACK TO SAVEPOINT past a
+        CREATE TABLE keeps its rows live;
+      - a restart: the places are kept in memory, so after one the rows
+        read as unplaced again (a row returned beyond the placed ones is
+        fetched as a block of its own by an index-only scan, and counts no
+        block in a plain one); and the template a CREATE DATABASE copies
+        is always `initdb`'s.
+      Also open: the shared buffer pool keys a page by relation oid and
+      block, not database, so two databases' copies of one catalog share
+      hits. Reading this server's catalog rows to find any of this is not
+      the way: on a statement's path it cost a new session hundreds of
+      milliseconds, inside a transaction that changed the catalogs it
+      blinded the session to its own new objects, and off a statement's
+      path it lost other sessions' new tables. PostgreSQL 15.20 (the
+      box's reference since 2026-11-24) writes `pg_attribute` differently
+      from 15.19: each table column's row carries `attoptions =
+      {pg_attver=...}` (189 bytes, not 144), and its `initdb` heap is 65
+      blocks, not 56; `pg_class`, `pg_type`, `pg_index` and `pg_database`
+      are 15.19's page for page, which is what this slice was measured on.
       Backlog-ID: RP-291
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_catalog_blocks, tests/backlog/test_rp_catalog_reads.py::test_a_page_ddl_wrote_to_is_not_all_visible
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_views_and_a_functions_rows_are_read_from_the_heap
 - [ ] **The first backend after a start is counted as a warm one.**
       PostgreSQL serves it without the relcache init files (about 245
       `pg_attribute` index scans, `pg_class` heap scans, ...); the model

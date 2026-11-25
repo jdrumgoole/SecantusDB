@@ -48,6 +48,7 @@ mod catalog_heap;
 mod catalog_meta;
 mod catalog_objects;
 mod catalog_order;
+mod catalog_places;
 mod catalog_reads;
 mod catcache;
 mod collations;

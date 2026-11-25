@@ -422,6 +422,9 @@ pub(crate) enum PageScan {
     /// are the key; no key for the planner's look at a B-tree's height
     /// (`_bt_getrootheight`), which reads its metapage alone.
     Index(i64, Option<Key>),
+    /// [`PageScan::Index`] for the rows whose next key column is above the
+    /// number (`RelationBuildTupleDesc`'s `attnum > 0`).
+    IndexAbove(i64, Key, i64),
     /// An index-only scan of the index for the rows whose leading key
     /// columns are the key, returning the count of rows: the visibility
     /// map, then the heap only for a tuple whose block it does not mark
@@ -464,8 +467,9 @@ impl Counter {
     pub(crate) fn index_only(&self, index: i64, key: Key, rows: i64) {
         if let Some(s) = &self.stats {
             let n = usize::try_from(rows).unwrap_or(0);
-            let fetched = crate::catalog_btree::index_only_heap_fetches(index, &key, n)
-                .map_or(rows, |f| f as i64);
+            let fetched =
+                crate::catalog_btree::index_only_heap_fetches(self.store, s.db, index, &key, n)
+                    .map_or(rows, |f| f as i64);
             s.index_scan(index, rows, fetched);
             self.scans
                 .borrow_mut()
@@ -490,6 +494,21 @@ impl Counter {
     /// which it returns once and then marks killed (`_bt_killitems`), so
     /// that no later scan returns them.
     pub(crate) fn index_key(&self, index: i64, key: &Key, rows: i64) {
+        self.index_key_scan(index, key, rows, PageScan::Index(index, Some(key.clone())));
+    }
+
+    /// [`Self::index_key`] for the rows whose next key column is above
+    /// `floor` (`RelationBuildTupleDesc`'s `attnum > 0`).
+    pub(crate) fn index_key_above(&self, index: i64, key: &Key, floor: i64, rows: i64) {
+        self.index_key_scan(
+            index,
+            key,
+            rows,
+            PageScan::IndexAbove(index, key.clone(), floor),
+        );
+    }
+
+    fn index_key_scan(&self, index: i64, key: &Key, rows: i64, scan: PageScan) {
         let own = self
             .own_dead
             .borrow()
@@ -499,9 +518,7 @@ impl Counter {
         let dead = take_dead(self.store, index, key) + own;
         if let Some(s) = &self.stats {
             s.index_scan(index, rows + dead, rows);
-            self.scans
-                .borrow_mut()
-                .push(PageScan::Index(index, Some(key.clone())));
+            self.scans.borrow_mut().push(scan);
         }
     }
 
