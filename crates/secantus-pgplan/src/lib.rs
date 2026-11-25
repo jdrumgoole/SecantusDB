@@ -12312,6 +12312,88 @@ pub fn rename_column_in_expression(
     deparse_expr(&node)
 }
 
+/// An index's stored text with its column `old` renamed to `new`: a key as
+/// `pg_get_indexdef` prints it (`key`: `x DESC`, `((x + 1))`, `lower(x)
+/// text_pattern_ops`), or a key's expression or the predicate (`(x > 0)`).
+/// PostgreSQL's index holds the column's attnum, so ruleutils prints the
+/// new name where the old one stood and nothing else moves; the text kept
+/// here has the new name spliced into each reference to the column, so the
+/// rest of it stays exactly as it was printed (RP-1054). The text unchanged
+/// when it does not name `old`.
+pub fn rename_column_in_index_text(
+    text: &str,
+    relation: &str,
+    old: &str,
+    new: &str,
+    key: bool,
+) -> Result<String> {
+    let relation = schemas::split_key(relation).1;
+    let (prefix, suffix) = if key {
+        ("CREATE INDEX ON t (", ")")
+    } else {
+        ("SELECT ", "")
+    };
+    let sql = format!("{prefix}{text}{suffix}");
+    let tree = pg_query::parse(&sql).map_err(|e| Error::Parse(e.to_string()))?;
+    let tokens = pg_query::scan(&sql)
+        .map_err(|e| Error::Parse(e.to_string()))?
+        .tokens;
+    // The `part`-th name of a dotted reference starting at `at`: the names
+    // are every other token (`t . x`).
+    let token_at = |at: i32, part: usize| {
+        let i = tokens.iter().position(|t| t.start == at)?;
+        tokens
+            .get(i + 2 * part)
+            .map(|t| (t.start as usize, t.end as usize))
+    };
+    let mut spans = Vec::new();
+    for (n, _, _, _) in tree.protobuf.nodes() {
+        match n {
+            // A plain column key is the key's first token.
+            pg_query::NodeRef::IndexElem(e) if e.expr.is_none() && e.name == old => {
+                spans.extend(token_at(prefix.len() as i32, 0));
+            }
+            pg_query::NodeRef::ColumnRef(c) => {
+                let names: Vec<&str> = c
+                    .fields
+                    .iter()
+                    .filter_map(|f| match f.node.as_ref() {
+                        Some(N::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if names.len() != c.fields.len() {
+                    continue; // `t.*`
+                }
+                // `transformColumnRef`: `a.b` is the relation's column `b`
+                // when `a` names the relation, else column `a`'s field `b`.
+                let part = match names.as_slice() {
+                    [_, r, col] if *r == relation && *col == old => Some(2),
+                    [r, col, ..] if *r == relation && *col == old => Some(1),
+                    [r, ..] if *r == relation => None,
+                    [col, ..] if *col == old => Some(0),
+                    _ => None,
+                };
+                if let Some(part) = part {
+                    spans.extend(token_at(c.location, part));
+                }
+            }
+            _ => {}
+        }
+    }
+    if spans.is_empty() {
+        return Ok(text.to_string());
+    }
+    spans.sort_unstable();
+    spans.dedup();
+    let quoted = scalar::quote_identifier(new);
+    let mut out = sql;
+    for (start, end) in spans.into_iter().rev() {
+        out.replace_range(start..end, &quoted);
+    }
+    Ok(out[prefix.len()..out.len() - suffix.len()].to_string())
+}
+
 /// A CHECK constraint's expression as `pg_get_constraintdef` prints it:
 /// `CHECK ((n > 0))`.
 pub fn check_constraint_text(expression: &str, def: &TableDef) -> String {
@@ -15513,6 +15595,26 @@ fn source_targets(sel: &pg_query::protobuf::SelectStmt) -> Vec<SourceTarget> {
             }
         })
         .collect()
+}
+
+/// A `record` an `INSERT ... SELECT`'s query gives a composite column:
+/// 42846 `cannot cast type record to <type>` at the source expression.
+/// `coerce_record_to_complex` converts only a `RowExpr` (or a whole-row
+/// `Var`) field by field; the query's output column reaches it as a plain
+/// `Var` of type `record`, which it refuses. A domain over a composite is
+/// named as the domain (`format_type_be` of the target, not its base).
+pub fn record_to_composite_mismatch(column: &Column, location: i32) -> Error {
+    set_error_location(location);
+    let target = match column
+        .extra
+        .get_str("domain_type")
+        .ok()
+        .and_then(domains::user_domain)
+    {
+        Some(d) => quote_type_path(&d.name),
+        None => scalar::format_type_text(&column.pg_type, None),
+    };
+    Error::CannotCoerce(format!("cannot cast type record to {target}"))
 }
 
 /// PostgreSQL's assignment-coercion failure for one column of an
@@ -40278,15 +40380,18 @@ fn text_type_oid(name: &str) -> Option<i64> {
     let found_in = match parts.as_slice() {
         [one] => {
             let schema = schemas::type_schema_of(&pgtypes::user_type_key(one));
-            // `_t`, the internal spelling of `t[]`, is found where `t` is.
-            if schema.is_none() {
-                if let Some(element) = one.strip_prefix('_').filter(|e| !e.is_empty()) {
-                    let key = pgtypes::user_type_key(element);
-                    if let Some(s) = schemas::type_schema_of(&key) {
-                        return user_type_or_array_oid(&format!(
-                            "{}[]",
-                            schemas::relation_key(&s, &key)
-                        ));
+            // No type is itself named `one`: it may be an array type's name,
+            // found in the first schema on the path whose array of that
+            // name exists (`TypenameGetTypid` reads `typname` as given).
+            if schema.is_none() && one.starts_with('_') {
+                for s in schemas::type_search_order() {
+                    let element = underscore_array_element(one, |n| {
+                        let key = schemas::relation_key(&s, &pgtypes::user_type_key(n));
+                        user_type_oid(&key).or_else(|| user_composite_oid(&key))
+                    });
+                    if let Some(element) = element {
+                        let key = schemas::relation_key(&s, &pgtypes::user_type_key(&element));
+                        return user_type_or_array_oid(&format!("{key}[]"));
                     }
                 }
             }
@@ -40329,19 +40434,56 @@ fn text_type_oid(name: &str) -> Option<i64> {
 
 pub(crate) fn user_type_or_array_oid(name: &str) -> Option<i64> {
     let trimmed = name.trim();
-    let element = if let Some(e) = trimmed.strip_suffix("[]") {
-        Some(e.trim_end())
-    } else if !trimmed.starts_with('"') && trimmed.starts_with('_') {
-        Some(&trimmed[1..])
-    } else {
-        None
-    };
-    match element {
-        Some(e) => user_type_oid(e)
-            .or_else(|| user_composite_oid(e))
-            .map(|oid| oid + USER_TYPE_ARRAY_OID_OFFSET),
-        None => user_type_oid(trimmed).or_else(|| user_composite_oid(trimmed)),
+    let own = |n: &str| user_type_oid(n).or_else(|| user_composite_oid(n));
+    let array_of = |e: &str| own(e).map(|oid| oid + USER_TYPE_ARRAY_OID_OFFSET);
+    if let Some(e) = trimmed.strip_suffix("[]") {
+        return array_of(e.trim_end());
     }
+    // A `_`-prefixed name is a `typname` like any other: the type of that
+    // name first (`CREATE TYPE _custom` is `_custom`, RP-1055), and only
+    // then the array type that carries it.
+    own(trimmed).or_else(|| {
+        if trimmed.starts_with('"') || !trimmed.starts_with('_') {
+            return None;
+        }
+        array_of(&underscore_array_element(trimmed, own)?)
+    })
+}
+
+/// The type whose ARRAY type is named `name`, when no type is itself named
+/// `name` -- PostgreSQL's `makeArrayTypeName` replayed. Each array is named
+/// `_` and its element's name, with another `_` in front for as long as
+/// that is taken, by a type's own name or by an array named before it
+/// (creation, i.e. oid, order; `moveArrayTypeName` gives the same names
+/// when a type later takes an array's). Only the types named by `name`'s
+/// stem with fewer leading `_` can own an array of that name, and only
+/// they can take the names those arrays try first. So after `CREATE TYPE
+/// custom` then `CREATE TYPE _custom`, `__custom` is `custom[]` and
+/// `___custom` is `_custom[]` (measured on PostgreSQL 15.19, 2026-11-25).
+/// `own` answers a type's own oid by name, in the schema being searched.
+fn underscore_array_element(name: &str, own: impl Fn(&str) -> Option<i64>) -> Option<String> {
+    let stem = name.trim_start_matches('_');
+    let depth = name.len() - stem.len();
+    if stem.is_empty() || depth == 0 {
+        return None;
+    }
+    // `(oid, leading underscores)` of each type in the family below `name`.
+    let mut family: Vec<(i64, usize)> = (0..depth)
+        .filter_map(|j| own(&format!("{}{stem}", "_".repeat(j))).map(|oid| (oid, j)))
+        .collect();
+    family.sort_unstable();
+    let mut taken: std::collections::HashSet<usize> = family.iter().map(|(_, j)| *j).collect();
+    for (_, j) in family {
+        let mut k = j + 1;
+        while taken.contains(&k) {
+            k += 1;
+        }
+        if k == depth {
+            return Some(format!("{}{stem}", "_".repeat(j)));
+        }
+        taken.insert(k);
+    }
+    None
 }
 
 /// Does `name` resolve to a user-defined type (a domain, enum, range, base

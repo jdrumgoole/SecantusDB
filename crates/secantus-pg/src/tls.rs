@@ -168,9 +168,11 @@ impl TlsConfig {
     /// names. Needs a CA file. As with PostgreSQL's `ssl_crl_file`, the
     /// file must then hold a list from every CA in a client certificate's
     /// chain, and none of them past its next update: a certificate whose
-    /// CA has no list here, or an expired one, is refused. A list with a
-    /// critical extension (one scoped by a distribution point, a delta
-    /// list) is refused when the file is read.
+    /// CA has no list here, or an expired one, is refused. A list scoped by
+    /// an issuing distribution point covers only what its scope names, and
+    /// a delta list is never used, as OpenSSL treats them for PostgreSQL
+    /// (`crl.rs`); a list with any other critical extension is refused when
+    /// the file is read.
     pub fn crl_file(mut self, crl_file: impl Into<PathBuf>) -> Self {
         self.crl_file = Some(crl_file.into());
         self

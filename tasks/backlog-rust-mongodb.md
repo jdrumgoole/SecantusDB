@@ -246,7 +246,7 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **mongod 8.2.12 crashes, intermittently on CI, opening a store
+- [ ] **mongod 8.2 crashes, intermittently, opening a store
       `secantusd-mdb` wrote and `reIndex`ed (2026-11-25).** RM-788's
       `tests/backlog/test_rm_storage_model.py::test_mongod_opens_the_index_specs_secantus_wrote_and_reindexed`
       read REGRESSED on PR #2979 (runs 45534098323 and 45542344001) and on
@@ -267,7 +267,14 @@ These are explicit non-goals. Don't add them without a reason.
       the assertion; read it, then fix what the store holds that it chokes
       on (the suspects: an oplog entry or timestamp `reIndex` writes, the
       catalog's `md.indexes`, `config.system.indexBuilds`).
-      Verify: none -- intermittent on CI; RM-788's regression test is the check
+      On CI it failed 3 of the 7 runs on 2026-11-25, all on mongod 8.2.12
+      from the `mongodb-org` 8.2 apt repo on image ubuntu-26.04
+      20261111.635, and it had passed on every run from RM-788's landing
+      until 2026-11-25T02:35Z; neither the code nor the image changed
+      between passing and failing runs, so it is a race in mongod's start on
+      this store or in what the store holds. (Filed by the PG session on
+      PR #2979; merged with the MongoDB session's measurements.)
+      Verify: none -- intermittent on CI (3 of the 7 runs on 2026-11-25); RM-788's regression test is the check
       Backlog-ID: RM-797
 
 - [ ] **`test_a_contested_write_of_many_plans_as_mongod[query0-delete]`

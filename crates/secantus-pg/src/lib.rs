@@ -30086,6 +30086,31 @@ fn type_size(ty: &Type) -> i16 {
 /// keeps the domain and its own modifier, -1. The one here reads its
 /// columns back from this description, and so makes the base type with the
 /// domain's width (RP-661).
+/// The built-in type an assignment to a column of `pg_type` coerces to,
+/// for the cast lookup: the type itself, a domain's base (a domain over an
+/// array included), or for an array of a domain the base's array -- as
+/// `find_coercion_pathway` takes `getBaseType` of the target and, for two
+/// arrays, recurses into the elements. So `text` into a `pint[]` column is
+/// 42804 as it is into an `int[]` one (RP-1048). `None` where the type is
+/// none of these (a composite, an enum, a user base type).
+fn assignment_target_oid(pg_type: &str) -> Option<i64> {
+    use secantus_pgplan::domains::base_type_and_typmod;
+    use secantus_pgplan::pgtypes::oid_of_name;
+    if let Some(oid) = oid_of_name(pg_type) {
+        return Some(oid);
+    }
+    if let Some((base, _, _)) = base_type_and_typmod(pg_type) {
+        return oid_of_name(&base);
+    }
+    let element = pg_type.trim().strip_suffix("[]")?;
+    let (base, _, _) = base_type_and_typmod(element)?;
+    // An array of a domain over an array is no type PostgreSQL has.
+    if base.ends_with("[]") {
+        return None;
+    }
+    oid_of_name(&format!("{base}[]"))
+}
+
 fn wire_typmod(pg_type: &str, typmod: i32) -> i32 {
     secantus_pgplan::domains::base_type_and_typmod(pg_type).map_or(typmod, |(_, m, _)| m)
 }
@@ -32049,17 +32074,26 @@ impl PgHandler {
             // A built-in type has no ASSIGNMENT cast to a user composite: a
             // `text` (a literal under a UNION, ORDER BY or DISTINCT, or a
             // subquery's output) is 42804, not read by `record_in` (RP-1044).
-            // A `record` (`row(...)`) is coerced field by field instead.
+            // Nor is a `record` (`row(...)`) converted: the query's output
+            // column is a `Var` of type `record`, not the `RowExpr` that
+            // `coerce_record_to_complex` coerces field by field as `VALUES`
+            // does, so it is 42846 (RP-1049).
             const RECORD: i64 = 2249;
+            if source_oid == RECORD && secantus_pgplan::user_composite_oid(&col.pg_type).is_some() {
+                return Err(Self::err(&secantus_pgplan::record_to_composite_mismatch(
+                    col,
+                    entry.map_or(-1, |t| t.location),
+                )));
+            }
             let builtin_to_composite = secantus_pgplan::user_composite_oid(&col.pg_type).is_some()
-                && !matches!(source_oid, RECORD | 705)
+                && source_oid != 705
                 && secantus_pgplan::pgtypes::BUILTIN_TYPES
                     .iter()
                     .any(|(_, el, _)| *el == source_oid);
             let target_oid = if builtin_to_composite {
                 None
             } else {
-                match secantus_pgplan::pgtypes::oid_of_name(&col.pg_type) {
+                match assignment_target_oid(&col.pg_type) {
                     Some(oid) => Some(oid),
                     None => continue,
                 }
@@ -37752,6 +37786,7 @@ impl PgHandler {
         let mut handle = self.open_transaction_handle()?;
         let counted = self.stats().checkpoint();
         let mut collided = false;
+        let changes_catalog = Self::may_change_catalog(&stmt);
         let out = loop {
             self.stats().rewind(counted.clone());
             let out = self
@@ -37763,6 +37798,21 @@ impl PgHandler {
                     self.storage
                         .commit_user_transaction(&mut handle)
                         .map_err(|e| Self::storage_err("could not commit a transaction", e))?;
+                    // The catalog version moved when the statement ran
+                    // (`execute_statement`), BEFORE this commit made its
+                    // catalog rows visible. Another connection's catalog read
+                    // in between saw the rows as they were and was recorded
+                    // as current for the new version -- a process-wide cache
+                    // entry every later reader trusted, so this connection's
+                    // next `'t'::regclass` answered 42P01 for the table it had
+                    // just created (RP-1080). PostgreSQL sends a
+                    // transaction's invalidations at its commit
+                    // (`AtEOXact_Inval`, after `RecordTransactionCommit`);
+                    // moving the version again now is that message, as
+                    // `commit_implicit_inner` and COMMIT already send it.
+                    if changes_catalog {
+                        bump_catalog_version();
+                    }
                     Ok(r)
                 });
             let e = match out {
@@ -46533,7 +46583,27 @@ impl PgHandler {
                     )
                     .map_err(|e| Self::err(&e))?;
                 }
+                // So does a generated column's expression: PostgreSQL stores
+                // its analysed tree, which holds the attnum (RP-1053).
+                for c in &mut def.columns {
+                    let Ok(generated) = c.extra.get_str("generated") else {
+                        continue;
+                    };
+                    let renamed = secantus_pgplan::rename_column_in_expression(
+                        generated, &before, &column, &to,
+                    )
+                    .map_err(|e| Self::err(&e))?;
+                    c.extra.insert("generated", renamed);
+                }
                 Self::rename_partition_key_column(&mut def, &column, &to)?;
+                // So does an index's key, expression and predicate (RP-1054).
+                let moved = (!old.pk).then(|| old.field());
+                self.rename_column_in_indexes(
+                    &table,
+                    &column,
+                    &to,
+                    moved.as_deref().map(|f| (f, to.as_str())),
+                )?;
                 if let Some(c) = def.columns.iter_mut().find(|c| c.name == column) {
                     c.name = to.clone();
                 }
@@ -59935,6 +60005,14 @@ impl CopyHandler for PgHandler {
         }
         self.bulk_insert(&state.table, None);
         state.progress.end();
+        // The command id the rows were stamped with is used: the next
+        // statement in a block takes the one after it (`command_ids`).
+        xids::advance_command(
+            &self.storage,
+            self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+        );
+        self.copy_end_transaction();
         let written = state.loaded;
 
         // pgwire sends ReadyForQuery after this, but NOT CommandComplete --
@@ -60490,6 +60568,25 @@ impl PgHandler {
                 eprintln!("secantusd-pg: rolling back a failed COPY: {e}");
             }
         }
+        self.copy_end_transaction();
+    }
+
+    /// Outside a block (and an extended-protocol group, which ends at its
+    /// `Sync`), a COPY FROM is its own transaction, from its first rows to
+    /// CopyDone or the failure: when it ends, so does what the statement's
+    /// end would have ended had the rows come with it -- the xid its rows
+    /// were stamped with is complete, its SSI registration and row waits
+    /// released (RP-1069). The statement itself returned at CopyInResponse,
+    /// before any row took an xid, so without this the next statement ran
+    /// under the COPY's xid and saw the copied rows as its own command's.
+    fn copy_end_transaction(&self) {
+        if self.transaction_handle_open() {
+            return;
+        }
+        let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+        row_waits::forget(pid);
+        self.ssi_end(false);
+        xids::end(&self.storage, pid);
     }
 }
 
@@ -62517,3 +62614,40 @@ mod type_catalog_reuse_tests {
 
 /// The most joined rows `join_rows_core` builds before handing them on.
 const JOIN_EMIT_ROWS: usize = 4096;
+
+#[cfg(test)]
+mod assignment_target_oid_tests {
+    use super::*;
+    use secantus_pgplan::domains::{set_user_domains, Domain};
+
+    fn domain(name: &str, base: &str) -> Domain {
+        Domain {
+            name: name.to_string(),
+            oid: 90_000,
+            base: base.to_string(),
+            typmod: -1,
+            not_null: false,
+            checks: Vec::new(),
+            not_valid: Vec::new(),
+            default_sql: None,
+            collation: None,
+        }
+    }
+
+    /// The cast lookup sees through a domain, and through the element of an
+    /// array of one, to the built-in base: `pint[]` is `int4[]` (1007), so
+    /// `text` has no assignment path to it (RP-1048).
+    #[test]
+    fn a_domain_array_is_its_base_array() {
+        set_user_domains(vec![domain("pint", "int4"), domain("dia", "int4[]")]);
+        assert_eq!(assignment_target_oid("int4"), Some(23));
+        assert_eq!(assignment_target_oid("pint"), Some(23));
+        assert_eq!(assignment_target_oid("pint[]"), Some(1007));
+        assert_eq!(assignment_target_oid("dia"), Some(1007));
+        assert_eq!(assignment_target_oid("dia[]"), None);
+        assert_eq!(assignment_target_oid("nosuch[]"), None);
+        assert!(!casts::assignment_path(25, 1007));
+        assert!(casts::assignment_path(1016, 1007));
+        set_user_domains(Vec::new());
+    }
+}

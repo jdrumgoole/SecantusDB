@@ -1247,6 +1247,7 @@ impl PgHandler {
             child.columns = parent.columns.clone();
             if let Some((old, new)) = renamed {
                 Self::rename_partition_key_column(&mut child, old, new)?;
+                self.rename_column_in_indexes(&child.name, old, new, None)?;
             }
             self.rewrite_catalog(&child.name.clone(), &child)?;
             if is_partitioned(&child) {

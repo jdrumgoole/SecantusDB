@@ -8676,3 +8676,31 @@ fn rename_column_in_a_check_expression() {
         check.expression
     );
 }
+
+/// A RENAME COLUMN renames the column where an index's stored key,
+/// expression and predicate name it, and nothing else in their text: a
+/// literal, a field of another column, the key's suffix (RP-1054).
+#[test]
+fn rename_column_in_index_text() {
+    let r = |text: &str, key: bool| {
+        crate::rename_column_in_index_text(text, "w", "x", "Big Y", key).expect("renames")
+    };
+    assert_eq!(r("((x + 1))", true), "((\"Big Y\" + 1))");
+    assert_eq!(r("x DESC NULLS LAST", true), "\"Big Y\" DESC NULLS LAST");
+    assert_eq!(
+        r("x COLLATE \"C\" text_pattern_ops", true),
+        "\"Big Y\" COLLATE \"C\" text_pattern_ops"
+    );
+    assert_eq!(r("lower((x)::text)", true), "lower((\"Big Y\")::text)");
+    assert_eq!(r("xx", true), "xx");
+    assert_eq!(
+        r("(x > 0) AND (w.x <> 'x')", false),
+        "(\"Big Y\" > 0) AND (w.\"Big Y\" <> 'x')"
+    );
+    assert_eq!(r("(z).x + x", false), "(z).x + \"Big Y\"");
+    assert_eq!(
+        r("__coll_key('x', \"x\")", false),
+        "__coll_key('x', \"Big Y\")"
+    );
+    assert_eq!(r("(z > 0)", false), "(z > 0)");
+}

@@ -332,8 +332,16 @@ one beside it.
   - **TLS files:**
     - **A revocation list's issuing distribution point named relative to
       its issuer is refused at startup** (`crl.rs`); one with a full name,
-      a delta list and a reasons-only or indirect list answer as
-      PostgreSQL 15.19 does.
+      and a reasons-only or indirect list, answer as PostgreSQL 15.19 does.
+    - **Scope decision (Joe, 2026-11-25, RP-747): where PostgreSQL's answer
+      is its OpenSSL's, the CURRENT OpenSSL's is kept.** A delta list is
+      never a certificate's list (no `X509_V_FLAG_USE_DELTAS`; OpenSSL 3.5.9
+      and 4.1.0 pass it over, so an issuer with only a delta answers
+      "unknown ca"), where PostgreSQL on Ubuntu's OpenSSL 3.0.13 read it as
+      a full list. The login comparisons' references link a current
+      OpenSSL to match: CI builds one (`.github/actions/pg15-current-openssl`,
+      3.5.9), and a developer box uses Homebrew's `postgresql@15` (OpenSSL
+      4) or one built against `openssl@3`.
     - **A self-signed root is never checked against the revocation lists**,
       as OpenSSL 3.6 has it (`check_cert_crl` skips it). PostgreSQL linked
       against an older OpenSSL (3.0.13 on Ubuntu 24.04) checks the root as
@@ -402,18 +410,10 @@ one beside it.
   the first query after DDL now grows with the schema again (a real
   RP-911 regression) or the bound sits inside the runner's noise. If it
   is noise, the fix is the measurement, not the bound. Filed by the
-  MongoDB session; nothing on the PG side was changed. A worse failure of
-  the same test, on 2026-11-24 in a local `gate_pg.sh --storage --fast`
-  backlog step at a load average of about 25: REGRESSED with `relation
-  "rp911c_l_14_2" does not exist`, a relation the test had just created,
-  not a latency miss. Three reruns alone passed. Undiagnosed; a relation
-  that DDL created and a later query cannot find is a correctness bug until
-  shown otherwise, so treat it as the first thing to reproduce here.
-  Again on 2026-11-24 in RM-745's `gate_pg.sh --storage --fast` (load
-  10-15): both 800-table tests, `relation "rp911a_l_3_0"` and
-  `"rp911c_l_1_2" does not exist`; the file run alone right after passed
-  both. RM-745 changed only plain views' `system.views` logging in the
-  shared storage, which a `CREATE TABLE` does not reach.
+  MongoDB session; nothing on the PG side was changed. (The same tests'
+  `relation "..." does not exist` failures of 2026-11-24 were RP-1080, a
+  catalog version moved before its commit, fixed: they are not this
+  latency question.)
   Verify: none -- intermittent on Linux CI; RP-911's regression test is the check
   Backlog-ID: RP-1078
 - [ ] **`stop_does_not_wait_on_an_idle_connection` overruns its 3 s bound
@@ -432,28 +432,6 @@ one beside it.
   MongoDB session; nothing on the PG side was changed.
   Verify: none -- intermittent under load; the test itself is the check
   Backlog-ID: RP-1079
-- [ ] **Under load, a query does not find a table the same test just
-  created (`42P01`), twice in two tests on 2026-11-24.** Both were in
-  local `gate_pg.sh --storage --fast` backlog steps on this Mac, run by
-  the MongoDB session's agents at load averages of about 25 and 14:
-  `tests/backlog/test_rp_catalog_latency.py` RP-911's
-  `..._at_800_tables_within_a_tenth` (REGRESSED, `relation
-  "rp911c_l_14_2" does not exist`, see RP-1078) and RP-1073's
-  `..._at_3200_tables_within_a_tenth` (BROKEN, `relation "rp_g32_l_7_1"
-  does not exist`). Alone, each failed only on its latency assertion or
-  passed. Both tests grow a schema of hundreds of tables, then query the
-  newest ones from a paired server, so the suspect is the catalog's
-  visibility of a just-committed `CREATE TABLE` to a later statement under
-  contention: a catalog cache that is filled before the commit is visible,
-  a snapshot taken too early, or a name lookup that races the catalog
-  write. In PostgreSQL a committed table is visible to every later
-  statement; a `42P01` here is a wrong answer, not noise. Reproduce under
-  load first (the two tests in a loop beside CPU burners), capture which
-  statement failed and the catalog state at that moment, then fix the
-  visibility. Filed by the MongoDB session; nothing on the PG side was
-  changed.
-  Verify: none -- intermittent under load; reproduce with the two catalog-latency tests
-  Backlog-ID: RP-1080
 - [ ] **NOT REPRODUCED -- left open as a watch item. A cancel during the
   parse was honoured late on Linux CI twice, in both of RP-002's
   regression tests (2026-11-08, 2026-11-10).** `tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_with_user_code_present`
@@ -504,27 +482,6 @@ one beside it.
   Left open as a watch item until the lane stays green.
   Backlog-ID: RP-571
   Verify: none -- intermittent, Linux CI only, not reproduced on macOS; RP-002's two regression tests are the check, and print the cancel trace on a miss
-- [ ] **OPEN -- `gate_pg.sh`'s login step differs from the local reference
-  in 6 of 547 TLS scenarios, because that reference now links OpenSSL 4.**
-  Homebrew's `postgresql@15` (15.19_1, 2026-11-07) links
-  `openssl@4/lib/libssl.4.dylib`. Since then
-  `tests/test_rust_pg_login_differential.py` (`pg_login_tls_files.py`)
-  reports `541 of 547 the same` on every local run, and again on
-  2026-11-09 in the RM-379 lane. The six are the CRL distribution-point
-  scenarios: no distribution point (good, revoked), distribution point a
-  (good, revoked), distribution point b, and revoked-first-answer. In each
-  of them the reference answers `tlsv1 alert unknown ca`, even for a good
-  certificate. The Rust PG server accepts the good certificate, or answers
-  `certificate revoked`. Neither server's code changed. RP-013's record
-  says the OpenSSL version decides how a CRL on the root is checked. CI's
-  Ubuntu reference links OpenSSL 3, which is why CI still passes. Until
-  this is settled, the local login step cannot tell a regression from this
-  difference. The fix is either a local reference PostgreSQL linked against
-  OpenSSL 3, or CRLs that the probe issues so that OpenSSL 3 and 4 agree,
-  with the decision recorded in RP-013. Found by the MongoDB batch, and not
-  worked from that side.
-  Verify: none -- the local reference's OpenSSL decides it; `tests/test_rust_pg_login_differential.py` against a PostgreSQL 15 on OpenSSL 4 is the check
-  Backlog-ID: RP-747
 - [ ] **RUST pgserver: the planner's choices that decide row order are only
   partly modelled.** **Decided (Joe, 2026-10-16): build a cost model** --
   enough of PostgreSQL's planner to make its choices, since the order rows
@@ -1234,19 +1191,6 @@ one beside it.
       tables before changing one.
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth
       Backlog-ID: RP-1073
-
-## Found while working RP-970 (2026-11-18)
-
-- [ ] **OPEN — `'_custom'::regtype` names `custom`'s array, not the type
-      named `_custom`.** After `CREATE TYPE _custom AS ENUM ('b')` and then
-      `CREATE TYPE custom AS ENUM ('c')`, PostgreSQL 15.19 resolves
-      `'_custom'::regtype` to the enum `_custom` (and names `custom`'s array
-      `___custom`, which `pg_type` here already lists). `secantusd-pg`
-      resolves it to `custom`'s array type: a `_`-prefixed name is read as
-      an array of the rest before a type of that exact name is looked for.
-      PostgreSQL's `typenameTypeId` looks the name up in `pg_type` as given.
-      Verify: tests/backlog/test_rp_found_rp970.py::test_an_underscore_type_name_resolves_to_that_type
-      Backlog-ID: RP-1055
 
 ## Found by a CI run (2026-11-07)
 
@@ -2485,20 +2429,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 Measured on PostgreSQL 15.19 (port 5415) over a scratch table. The gap
 test is in `tests/backlog/test_rp_found_rp693.py`.
 
-- [ ] **OPEN -- COPY in autocommit leaves its xid running, so the next
-      statement shares it.** After `copy t from stdin` the copied row's
-      `xmin` is the xid `txid_current()` then returns (730 and 730 here;
-      15.19 6257 then 6258), and an `insert ... on conflict (a) do update`
-      over the copied row is refused 21000 ("cannot affect row a second
-      time"; 15.19 updates it), because `written_by_this_command` sees its
-      own xid and cid on the row. `on_copy_done` commits the COPY's own
-      storage transaction but does not end the statement's transaction
-      state (`xids::end`, the table locks, `ssi_end`) as the implicit
-      transaction's end does (lib.rs ~35855); the statement after it ends
-      it instead.
-      Verify: tests/backlog/test_rp_found_rp693.py::test_copy_completes_its_own_xid
-      Backlog-ID: RP-1069
-
 - [ ] **OPEN -- EXPLAIN shows a Seq Scan for an indexed `=` ANDed with a
       filter.** `explain (costs off) select b from tp where a = 'x1' and
       b < 0` over a 2,000-row `text` PRIMARY KEY (analyzed) is `Seq Scan
@@ -2580,23 +2510,17 @@ Measured on PostgreSQL 15.19 with `create domain pint as int check (value >
 text)` and `create table tct (c ctp, d pint[])` holding `('(1,x)', null)`.
 The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
 
-- [ ] **A `text` column an `INSERT ... SELECT` writes to a domain-array
-      column is accepted.** `insert into tct(d) select '{1}' union all
-      select '{1}'` is 42804 `column "d" is of type pint[] but expression is
-      of type text` at 27 on PostgreSQL 15.19; here the text is read as the
-      array. `check_insert_select_types` (secantus-pg) skips a target whose
-      type `oid_of_name` cannot name, which an array of a domain is. Found
-      while working RP-1044, which closed the composite case there.
-      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_text_into_domain_array
-      Backlog-ID: RP-1048
-- [ ] **A `record` column an `INSERT ... SELECT` writes to a composite
-      column is accepted.** `insert into tct(c) select row(1,'x')` is 42846
-      `cannot cast type record to ctp` at 27 on PostgreSQL 15.19 (a
-      `RowExpr` is coerced to a composite only where it is written, as in
-      `VALUES`, not through a subquery's output column); here the row is
-      stored. RP-1044's check lets `record` through for this reason.
-      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_record_into_composite
-      Backlog-ID: RP-1049
+- [ ] **A `record` column an `INSERT ... SELECT` writes to a
+      non-composite column is 0A000.** `insert into tct(d) select
+      row(1,'x')` is 42804 `column "d" is of type pint[] but expression is
+      of type record` at 27 on PostgreSQL 15.20, and an `int` column's is
+      the same with `integer`; here each is 0A000 `a record cast to pint[]
+      is not supported yet` (`int4`) with no position, from the row write
+      after `check_insert_select_types` (secantus-pg) found no name for the
+      source type. Found while working RP-1049, which closed the composite
+      target there.
+      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_record_into_non_composite
+      Backlog-ID: RP-1086
 - [ ] **A UNION of a composite and a `record` has no error position.**
       `insert into tct(c) select (1,'x')::ctp union select row(2,'y')` is
       42804 `UNION types ctp and record cannot be matched` at 53 (the right
@@ -2604,6 +2528,42 @@ The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
       position is missing. Found while working RP-1044.
       Verify: tests/backlog/test_rp_found_rp552.py::test_union_composite_record_position
       Backlog-ID: RP-1050
+
+## Found while working RP-1048 (2026-11-25)
+
+Measured on PostgreSQL 15.20 with `create domain pint48 as int check (value
+> 0)`, `create domain dia48 as int[]`, `create domain vd48 as varchar(3)`,
+`create table t48 (p pint48, a dia48)` and `create table t48v (x vd48[])`.
+The gap tests are in `tests/backlog/test_rp_found_rp1048.py`.
+
+- [ ] **A 42804 assignment error names a domain column by its base type.**
+      `insert into t48(p) values ('1'::text)` is 42804 `column "p" is of
+      type pint48 but expression is of type text` at 28 on PostgreSQL 15.20
+      (`format_type_be` of the column's own type); here it says `of type
+      integer`. The same in `UPDATE`, in `INSERT ... SELECT`, and for a
+      domain over an array (`dia48`, here `integer[]`). A plain domain
+      column's `pg_type` is its base, the domain in `extra.domain_type`,
+      and `assignment_mismatch` (secantus-pgplan) prints `pg_type`.
+      Verify: tests/backlog/test_rp_found_rp1048.py::test_domain_column_named_in_42804
+      Backlog-ID: RP-1083
+- [ ] **A value too long for a `varchar(n)` domain is stored in an array of
+      that domain.** `insert into t48v(x) values (array['abcd'::text])`, the
+      same through `INSERT ... SELECT`, and the untyped `'{abcd}'` are each
+      22001 `value too long for type character varying(3)` on PostgreSQL
+      15.20 (the `ArrayCoerceExpr` applies the element domain's length
+      coercion; the literal's error is at 29); here the row is stored.
+      Verify: tests/backlog/test_rp_found_rp1048.py::test_domain_array_element_length
+      Backlog-ID: RP-1084
+- [ ] **A user type created unqualified under a non-public `search_path`
+      is created in `public`.** After `create schema s48; set search_path =
+      s48`, `create domain d48 as int`, `create type c48 as (a int)` and
+      `create type e48 as enum ('a')` are each in `s48` on PostgreSQL 15.20
+      (the creation namespace is the path's first schema,
+      `QualifiedNameGetCreationNamespace`); here all three are in `public`,
+      and `create table tt48 (d d48, c c48, e e48)` is then 42704 `type
+      "d48" does not exist`. A table and a sequence go to `s48` correctly.
+      Verify: tests/backlog/test_rp_found_rp1048.py::test_type_created_in_search_path_schema
+      Backlog-ID: RP-1085
 
 ## Found while working RP-534 (2026-11-08)
 
@@ -2903,22 +2863,21 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415).
       list's, the expression's, the OpExpr's); here `RANGE ((x + 1))`.
       Verify: tests/backlog/test_rp_found_rp860.py::test_pg_get_partkeydef_of_an_expression_key
       Backlog-ID: RP-1052
-- [ ] **A renamed column leaves a generated column naming the old one,
-      and the table takes no more rows.** On `(x int, g int generated
-      always as (x * 2) stored)`, after `rename column x to y`, PostgreSQL
-      15.19 inserts `(3, 6)`; here the stored expression still names `x`,
-      42703. Faithful: rename it as the RENAME COLUMN arm does for CHECKs
-      and the partition key (`rename_column_in_expression`).
-      Verify: tests/backlog/test_rp_found_rp860.py::test_a_renamed_column_is_renamed_in_a_generated_column
-      Backlog-ID: RP-1053
-- [ ] **A renamed column leaves an expression index naming the old one,
-      and the table takes no more rows.** After `create index i on t ((x +
-      1)) where x > 0` and `rename column x to y`, PostgreSQL 15.19 inserts
-      and prints `(((y + 1))) WHERE (y > 0)`; here both still name `x` and
-      the INSERT is 42703. Column defaults measured fine (they cannot name
-      a column).
-      Verify: tests/backlog/test_rp_found_rp860.py::test_a_renamed_column_is_renamed_in_an_expression_index
-      Backlog-ID: RP-1054
+
+## Found while working RP-1054 (2026-11-25)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
+test is in `tests/backlog/test_rp_found_rp860.py`.
+
+- [ ] **`pg_get_indexdef` prints a plain key column, and an INCLUDE
+      column, unquoted.** `create index i on t ("Big Y" desc) include ("W
+      w")` prints `btree ("Big Y" DESC) INCLUDE ("W w")` on PostgreSQL
+      15.19; here `btree (Big Y DESC) INCLUDE (W w)`. The key text comes
+      from the bare name (`created_index_def`, and `key_sql` in the
+      planner's CREATE INDEX), where ruleutils prints
+      `quote_identifier(attname)`; an expression key already quotes.
+      Verify: tests/backlog/test_rp_found_rp860.py::test_pg_get_indexdef_quotes_a_key_and_an_include_column
+      Backlog-ID: RP-1082
 
 ## Found while working RP-751 (2026-11-10)
 
