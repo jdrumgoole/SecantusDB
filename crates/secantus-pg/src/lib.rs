@@ -30086,6 +30086,31 @@ fn type_size(ty: &Type) -> i16 {
 /// keeps the domain and its own modifier, -1. The one here reads its
 /// columns back from this description, and so makes the base type with the
 /// domain's width (RP-661).
+/// The built-in type an assignment to a column of `pg_type` coerces to,
+/// for the cast lookup: the type itself, a domain's base (a domain over an
+/// array included), or for an array of a domain the base's array -- as
+/// `find_coercion_pathway` takes `getBaseType` of the target and, for two
+/// arrays, recurses into the elements. So `text` into a `pint[]` column is
+/// 42804 as it is into an `int[]` one (RP-1048). `None` where the type is
+/// none of these (a composite, an enum, a user base type).
+fn assignment_target_oid(pg_type: &str) -> Option<i64> {
+    use secantus_pgplan::domains::base_type_and_typmod;
+    use secantus_pgplan::pgtypes::oid_of_name;
+    if let Some(oid) = oid_of_name(pg_type) {
+        return Some(oid);
+    }
+    if let Some((base, _, _)) = base_type_and_typmod(pg_type) {
+        return oid_of_name(&base);
+    }
+    let element = pg_type.trim().strip_suffix("[]")?;
+    let (base, _, _) = base_type_and_typmod(element)?;
+    // An array of a domain over an array is no type PostgreSQL has.
+    if base.ends_with("[]") {
+        return None;
+    }
+    oid_of_name(&format!("{base}[]"))
+}
+
 fn wire_typmod(pg_type: &str, typmod: i32) -> i32 {
     secantus_pgplan::domains::base_type_and_typmod(pg_type).map_or(typmod, |(_, m, _)| m)
 }
@@ -32059,7 +32084,7 @@ impl PgHandler {
             let target_oid = if builtin_to_composite {
                 None
             } else {
-                match secantus_pgplan::pgtypes::oid_of_name(&col.pg_type) {
+                match assignment_target_oid(&col.pg_type) {
                     Some(oid) => Some(oid),
                     None => continue,
                 }
@@ -62580,3 +62605,40 @@ mod type_catalog_reuse_tests {
 
 /// The most joined rows `join_rows_core` builds before handing them on.
 const JOIN_EMIT_ROWS: usize = 4096;
+
+#[cfg(test)]
+mod assignment_target_oid_tests {
+    use super::*;
+    use secantus_pgplan::domains::{set_user_domains, Domain};
+
+    fn domain(name: &str, base: &str) -> Domain {
+        Domain {
+            name: name.to_string(),
+            oid: 90_000,
+            base: base.to_string(),
+            typmod: -1,
+            not_null: false,
+            checks: Vec::new(),
+            not_valid: Vec::new(),
+            default_sql: None,
+            collation: None,
+        }
+    }
+
+    /// The cast lookup sees through a domain, and through the element of an
+    /// array of one, to the built-in base: `pint[]` is `int4[]` (1007), so
+    /// `text` has no assignment path to it (RP-1048).
+    #[test]
+    fn a_domain_array_is_its_base_array() {
+        set_user_domains(vec![domain("pint", "int4"), domain("dia", "int4[]")]);
+        assert_eq!(assignment_target_oid("int4"), Some(23));
+        assert_eq!(assignment_target_oid("pint"), Some(23));
+        assert_eq!(assignment_target_oid("pint[]"), Some(1007));
+        assert_eq!(assignment_target_oid("dia"), Some(1007));
+        assert_eq!(assignment_target_oid("dia[]"), None);
+        assert_eq!(assignment_target_oid("nosuch[]"), None);
+        assert!(!casts::assignment_path(25, 1007));
+        assert!(casts::assignment_path(1016, 1007));
+        set_user_domains(Vec::new());
+    }
+}
