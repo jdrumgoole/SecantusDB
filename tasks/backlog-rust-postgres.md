@@ -2427,20 +2427,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 Measured on PostgreSQL 15.19 (port 5415) over a scratch table. The gap
 test is in `tests/backlog/test_rp_found_rp693.py`.
 
-- [ ] **OPEN -- COPY in autocommit leaves its xid running, so the next
-      statement shares it.** After `copy t from stdin` the copied row's
-      `xmin` is the xid `txid_current()` then returns (730 and 730 here;
-      15.19 6257 then 6258), and an `insert ... on conflict (a) do update`
-      over the copied row is refused 21000 ("cannot affect row a second
-      time"; 15.19 updates it), because `written_by_this_command` sees its
-      own xid and cid on the row. `on_copy_done` commits the COPY's own
-      storage transaction but does not end the statement's transaction
-      state (`xids::end`, the table locks, `ssi_end`) as the implicit
-      transaction's end does (lib.rs ~35855); the statement after it ends
-      it instead.
-      Verify: tests/backlog/test_rp_found_rp693.py::test_copy_completes_its_own_xid
-      Backlog-ID: RP-1069
-
 - [ ] **OPEN -- EXPLAIN shows a Seq Scan for an indexed `=` ANDed with a
       filter.** `explain (costs off) select b from tp where a = 'x1' and
       b < 0` over a 2,000-row `text` PRIMARY KEY (analyzed) is `Seq Scan
