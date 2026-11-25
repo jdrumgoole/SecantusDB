@@ -989,6 +989,10 @@ impl CmdStorage for StorageAdapter {
             .map_err(map_err)
     }
 
+    fn validate_wt_config(&self, method: &str, config: &str) -> Result<(), (i32, String)> {
+        self.inner.validate_wt_config(method, config)
+    }
+
     fn collection_count_at_most(
         &self,
         db: &str,
@@ -1510,6 +1514,14 @@ impl CmdStorage for StorageAdapter {
             .append_command_entry(ns, o)
             .map(|_| ())
             .map_err(map_err)
+    }
+
+    fn current_term(&self) -> i64 {
+        self.inner.current_term()
+    }
+
+    fn step_up(&self) -> Result<i64, StorageError> {
+        self.inner.step_up().map_err(map_err)
     }
 
     fn append_oplog_note(&self, data: bson::Document) -> Result<(), StorageError> {

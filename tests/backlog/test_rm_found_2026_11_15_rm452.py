@@ -4,7 +4,7 @@ mongod 8.2.11 as a one-member replica set.
 
 RM-452 ported mongod's rewrite of `operationType`, RM-698's first slice
 those of `documentKey` and `fullDocument`, its second that of `ns` by
-`$eq` / `$in`; the rewrites of the other event fields, of a regex on `ns`
+`$eq` / `$in`, its third that of `to`; the rewrites of the other event fields, of a regex on `ns`
 and of `$expr` are still to come; the Boolean simplifier mongod runs
 over the unwind's filter came with RM-699 (2026-11-24).
 """
@@ -102,6 +102,38 @@ def test_a_match_on_the_namespace_joins_the_oplog_filter(
     assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)
 
 
+@pytest.mark.backlog_fixed("RM-698")
+@pytest.mark.parametrize(
+    "match",
+    [
+        {"to.coll": "c"},
+        {"to.coll": "a.b"},
+        {"to.db": "rm452"},
+        {"to": {"db": "rm452", "coll": "c"}},
+        {"to": {"db": "rm452"}},
+        {"to": {"coll": "c", "db": "rm452"}},
+        {"to": "x"},
+        {"to.coll": {"$in": ["c", "d"]}},
+        {"to.coll": {"$in": ["c", 1]}},
+        {"to.db": {"$in": ["x", "y"]}},
+        {"to": {"$in": [{"db": "a", "coll": "b"}, {"db": "c", "coll": "d"}]}},
+        {"to": {"$in": [{"db": "a", "coll": "b"}, {"db": "c"}]}},
+        {"to.coll": {"$ne": "c"}},
+        {"to.coll": 1},
+        {"to.x": "a"},
+        {"$or": [{"to.coll": "c"}, {"operationType": "insert"}]},
+    ],
+)
+def test_a_match_on_the_rename_target_joins_the_oplog_filter(
+    rust_mongo: Any, mongod_rs: Any, match: dict
+) -> None:
+    """mongod 8.2.11 rewrites an `$eq` / `$in` on `to`, `to.db` or `to.coll`
+    into a predicate on a rename's `o.to` (`matchRewriteGenericNamespace`);
+    this server left them out of the read (90A52575 where mongod's
+    `{"to.coll": "c"}` is A491FA53)."""
+    assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)
+
+
 @pytest.mark.backlog("RM-698")
 @pytest.mark.parametrize(
     ("match", "want"),
@@ -113,8 +145,8 @@ def test_a_match_on_the_namespace_joins_the_oplog_filter(
 def test_a_match_on_another_event_field_joins_the_oplog_filter(
     rust_mongo: Any, mongod_rs: Any, match: dict, want: str
 ) -> None:
-    """mongod 8.2.11 rewrites a regex on `ns` (into an `$expr`), a `$match`
-    on `to`, `updateDescription`, `fullDocumentBeforeChange`, `clusterTime`,
+    """mongod 8.2.11 rewrites a regex on `ns` or `to` (into an `$expr`), a
+    `$match` on `updateDescription`, `fullDocumentBeforeChange`, `clusterTime`,
     `lsid` or `txnNumber`, and an `$expr` on those, into the
     oplog filter, which changes the read's `queryHash` from 90A52575."""
     assert _query_hash(mongod_rs, match) == want

@@ -429,7 +429,7 @@ fn extra_index_keys(
         .and_then(secantus_core::collation::parse);
     let sparse = spec
         .as_ref()
-        .is_some_and(|s| s.get_bool("sparse").unwrap_or(false));
+        .is_some_and(|s| secantus_core::index_keys::spec_flag(s, "sparse"));
     let partial = spec
         .as_ref()
         .and_then(|s| s.get_document("partialFilterExpression").ok())

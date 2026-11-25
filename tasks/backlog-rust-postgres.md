@@ -1178,6 +1178,21 @@ one beside it.
 
 ## Found while fixing the RP-911 latency test's noise (2026-11-19)
 
+- [ ] **A table a `CREATE TABLE` has just made is sometimes not there for
+      the next statement on the same connection.** Found while gating
+      RM-756 (2026-11-25, debug `secantusd-pg`, arm64 macOS): in
+      `tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth`,
+      on the server grown to 3,200 tables, the collation query straight
+      after `CREATE TABLE rp_g32_l_3_1 (v text COLLATE "C")` failed 42P01,
+      `relation "rp_g32_l_3_1" does not exist` (once in the gate's backlog
+      step under load, once more in the next solo run, as `rp_g32_l_7_1`);
+      the next eight solo runs, four on `rm-batch` without RM-756 and four
+      with it, all reached their timing assertion. PostgreSQL makes a
+      committed `CREATE TABLE` visible to its own session's next statement
+      every time.
+      Verify: none -- intermittent (2 of 11 runs), not reproducible on demand; the test named above is where it shows
+      Backlog-ID: RP-1081
+
 - [ ] **OPEN — the catalog-latency ratio tests fail at their thresholds on
       CI's runner (2026-11-25).** `tests/backlog/test_rp_catalog_latency.py`
       compares ratios so that its verdicts would hold on any runner, but the

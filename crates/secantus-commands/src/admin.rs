@@ -2028,6 +2028,29 @@ pub(crate) fn listed_indexes(
     coll: &str,
     oplog: bool,
 ) -> Result<Option<Vec<Document>>, CommandError> {
+    indexes_as(storage, db, coll, oplog, false)
+}
+
+/// The indexes of `db.coll` as the catalog keeps their specs (what
+/// `$listCatalog` shows): the options as the request gave them, where
+/// `listIndexes` ([`listed_indexes`]) shows only the ones its kind of index
+/// uses and `sparse` and `background` as bools (8.2.11, RM-791).
+pub(crate) fn catalog_indexes(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    oplog: bool,
+) -> Result<Option<Vec<Document>>, CommandError> {
+    indexes_as(storage, db, coll, oplog, true)
+}
+
+fn indexes_as(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    oplog: bool,
+    catalog: bool,
+) -> Result<Option<Vec<Document>>, CommandError> {
     let mut indexes = storage.list_indexes(db, coll).map_err(command_error)?;
     // `system.profile` exists and has no index at all (mongod creates it
     // without one), like a set member's oplog.
@@ -2070,7 +2093,9 @@ pub(crate) fn listed_indexes(
         ix.remove("binDataOrder");
         ix.remove("multikeyPaths");
         ix.remove(TS_ORIGINAL_SPEC);
-        *ix = listed_spec(std::mem::take(ix));
+        if !catalog {
+            *ix = listed_spec(std::mem::take(ix));
+        }
     }
     // The `_id` index of a collection with a default collation carries it.
     if let Some(default) = crate::util::default_collation(storage, db, coll) {
@@ -2228,24 +2253,9 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     if let Some(bson::Bson::Array(specs)) = doc.get("indexes") {
         for spec in specs {
             if let bson::Bson::Document(spec) = spec {
-                argtypes::require_index_spec_field(spec, "key", "an object", |v| {
-                    matches!(v, bson::Bson::Document(_))
-                })?;
-                argtypes::require_index_spec_field(spec, "name", "a string", |v| {
-                    matches!(v, bson::Bson::String(_))
-                })?;
-                for field in ["collation", "partialFilterExpression"] {
-                    argtypes::require_index_spec_field(spec, field, "an object", |v| {
-                        matches!(v, bson::Bson::Document(_))
-                    })?;
+                if let Some(problem) = index_spec_fields_problem(spec) {
+                    return Ok(problem.into_reply());
                 }
-                // Two more families INSIDE one spec: the bool options quote the
-                // spec back with mongod's unclosed quote, and the TTL option
-                // answers 67 rather than 14.
-                for field in ["unique", "sparse"] {
-                    argtypes::require_index_spec_bool(spec, field)?;
-                }
-                argtypes::require_index_spec_ttl(spec, "expireAfterSeconds")?;
             }
         }
     }
@@ -2279,20 +2289,10 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         }
     }
 
-    // A number is a boolean to an index option: `unique: 1` is a unique
-    // index. It used to be read as "not unique".
     let specs: Vec<Bson> = specs
         .into_iter()
         .map(|spec| match spec {
             Bson::Document(mut s) => {
-                for flag in ["unique", "sparse", "hidden", "background"] {
-                    if let Some(n) = s.get(flag).and_then(|v| match v {
-                        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) => as_i64(v),
-                        _ => None,
-                    }) {
-                        s.insert(flag, n != 0);
-                    }
-                }
                 // mongod stores a TTL as an int32 whatever number type it was
                 // given, truncating a fraction. NaN is left for the check
                 // below to refuse.
@@ -2484,38 +2484,6 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             any_existed = true;
             continue;
         }
-        if key.is_empty() {
-            return Ok(CommandError::new(
-                67,
-                "CannotCreateIndex",
-                format!(
-                    "Error in specification {spec_text} :: caused by :: Index keys cannot be empty."
-                ),
-            )
-            .into_reply());
-        }
-        // A string key value names an index PLUGIN. mongod knows a handful; any
-        // other name is refused as unknown, quoting the spec (measured 8.2.11,
-        // 2026-10-01). Known-but-unsupported types keep the storage layer's own
-        // refusal.
-        if let Some(plugin) = key.values().find_map(|v| match v {
-            Bson::String(p) if !KNOWN_INDEX_PLUGINS.contains(&p.as_str()) => Some(p.clone()),
-            _ => None,
-        }) {
-            let why = match plugin.as_str() {
-                "" => "Values in the index key pattern cannot be empty strings".to_string(),
-                "geoHaystack" => {
-                    "GeoHaystack indexes cannot be created in version 5.0 and above".to_string()
-                }
-                other => format!("Unknown index plugin '{other}'"),
-            };
-            return Ok(CommandError::new(
-                67,
-                "CannotCreateIndex",
-                format!("Error in specification {spec_text} :: caused by :: {why}"),
-            )
-            .into_reply());
-        }
         let Some(name) = s.get("name").and_then(Bson::as_str).map(str::to_string) else {
             return Ok(CommandError::new(
                 9,
@@ -2527,25 +2495,6 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             )
             .into_reply());
         };
-        // Unknown fields on the spec itself are rejected, not ignored.
-        let spec_opts: Document = s
-            .iter()
-            .filter(|(k, v)| {
-                k.as_str() != "key"
-                    && k.as_str() != "name"
-                    // A default `prepareUnique` is parsed and dropped.
-                    && !(k.as_str() == "prepareUnique" && is_falsy(v))
-            })
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        if let Some(unknown) = first_unknown_field(&spec_opts, INDEX_SPEC_KNOWN_OPTIONS) {
-            return Ok(CommandError::new(
-                40415,
-                "IDLUnknownField",
-                format!("Error in specification {s:?}: the field '{unknown}' is an unknown field"),
-            )
-            .into_reply());
-        }
         // Guard the index name against an embedded NUL before it reaches the
         // WT key encoder (see crate::nul_in_namespace / #139).
         if let Some(e) = crate::nul_in_namespace("index name", &name) {
@@ -2577,35 +2526,6 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
                 }
             }
         }
-        // `wildcardProjection` is only valid on a wildcard index ({$**:1} /
-        // {f.$**:1}) and must be a non-empty document (mongo-ruby-driver's
-        // invalid-wildcard-projection tests). Mirrors commands.py.
-        if let Some(wcp) = s.get("wildcardProjection") {
-            let nonempty_doc = matches!(wcp, Bson::Document(d) if !d.is_empty());
-            if !nonempty_doc {
-                return Ok(CommandError::new(
-                    67,
-                    "CannotCreateIndex",
-                    format!(
-                        "Error in specification {{ key: {key:?}, wildcardProjection: {wcp:?} }} \
-                         :: caused by :: wildcardProjection must be a non-empty object"
-                    ),
-                )
-                .into_reply());
-            }
-            let is_wildcard = key.keys().any(|k| k == "$**" || k.ends_with(".$**"));
-            if !is_wildcard {
-                return Ok(CommandError::new(
-                    67,
-                    "CannotCreateIndex",
-                    format!(
-                        "Error in specification {{ key: {key:?}, wildcardProjection: {wcp:?} }} \
-                         :: caused by :: wildcardProjection is only allowed on wildcard indexes"
-                    ),
-                )
-                .into_reply());
-            }
-        }
         // mongod stores only the non-default form of hidden / sparse / unique: a
         // falsy value is dropped so it doesn't come back from listIndexes
         // (mongo-ruby-driver `hidden is false` asserts hidden isn't echoed).
@@ -2627,6 +2547,22 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         // index spec and writes each back only when set; `sparse` and
         // `background` it keeps as given, false included (8.2.11, RM-788).
         // `dropDups` and `ns` it no longer reads at all.
+        // A number is a boolean to `unique` and `prepareUnique`: mongod writes
+        // the bool back, and `v` an int, where it keeps `sparse` and
+        // `background` as given -- a `1.0` stays a double (8.2.11, RM-791).
+        for flag in ["unique", "prepareUnique"] {
+            if let Some(set) = spec.get(flag).and_then(crate::util::truthy_number_or_bool) {
+                spec.insert(flag, set);
+            }
+        }
+        if let Some(v) = spec.get("v").and_then(as_i64).filter(|_| {
+            matches!(
+                spec.get("v"),
+                Some(Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_))
+            )
+        }) {
+            spec.insert("v", v as i32);
+        }
         for opt in ["hidden", "unique", "prepareUnique"] {
             if spec.get(opt).is_some_and(is_falsy) {
                 spec.remove(opt);
@@ -2685,6 +2621,10 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
                     spec.insert("collation", default.spec().clone());
                 }
             }
+        }
+        if let Some(e) = storage_engine_problem(storage, &spec) {
+            undo_request(storage, &ctx.db_name, &coll, created_coll, &built_here)?;
+            return Ok(e.into_reply());
         }
         if let Some(e) = index_conflict(&existing, &name, &key, &spec) {
             undo_request(storage, &ctx.db_name, &coll, created_coll, &built_here)?;
@@ -3364,7 +3304,7 @@ const LISTED_SPEC_ORDER: &[&str] = &[
 /// An index spec as `listIndexes` gives it (measured 8.2.11, 2026-10-15):
 /// in [`LISTED_SPEC_ORDER`], without the options of another kind of index
 /// (`repairIndexSpec`: `bits` on a `2dsphere` index is not listed), `bits`
-/// and `2dsphereIndexVersion` as ints and `min` / `max` as doubles,
+/// and `2dsphereIndexVersion` as ints and `min`, `max` and `bucketSize` as doubles,
 /// whatever number type they were given as.
 fn listed_spec(spec: Document) -> Document {
     let key = spec.get_document("key").cloned().unwrap_or_default();
@@ -3397,9 +3337,15 @@ fn listed_spec(spec: Document) -> Document {
         ),
         other => other.clone(),
     };
+    // The catalog keeps `sparse` and `background` as the request gave them;
+    // `listIndexes` shows them as the bools they read as.
+    let flag = |spec: &Document, field: &str| {
+        Bson::Boolean(secantus_core::index_keys::spec_flag(spec, field))
+    };
     let listed = |field: &str, v: &Bson| match field {
+        "sparse" | "background" => flag(&doc! {field: v.clone()}, field),
         "bits" | "2dsphereIndexVersion" => int(v),
-        "min" | "max" => double(v),
+        "min" | "max" | "bucketSize" => double(v),
         _ => v.clone(),
     };
     let mut out = Document::new();
@@ -3625,35 +3571,24 @@ fn undo_request(
     Ok(())
 }
 
-/// Why mongod refuses an index spec before building anything, or `None`.
-/// Each message is what 8.2.11 answered (2026-10-10); all of these specs
-/// used to be accepted and an index built from them.
-fn index_spec_problem(spec: &Document) -> Option<CommandError> {
+/// What mongod refuses in a spec's `key` (measured 8.2.11, 2026-11-24): the
+/// pattern's own shape, in the order it checks it, then a plugin it does not
+/// know. The spec is quoted as it was given.
+fn key_problem(spec: &Document) -> Option<CommandError> {
     let text = argtypes::render_stage_value(&Bson::Document(spec.clone()));
-    // Some checks run after mongod has filled in the index version.
-    let mut versioned = spec.clone();
-    if !versioned.contains_key("v") {
-        versioned.insert("v", 2_i32);
-    }
-    let versioned_text = argtypes::render_stage_value(&Bson::Document(versioned));
-    let in_spec = |code: i32, name: &str, text: &str, why: &str| {
+    let cannot = |why: &str| {
         CommandError::new(
-            code,
-            name,
+            67,
+            "CannotCreateIndex",
             format!("Error in specification {text} :: caused by :: {why}"),
         )
     };
-    let cannot = |why: &str| in_spec(67, "CannotCreateIndex", &text, why);
     let Some(Bson::Document(key)) = spec.get("key") else {
-        return spec.get("key").is_none().then(|| {
-            in_spec(
-                9,
-                "FailedToParse",
-                &text,
-                "The 'key' field is a required property of an index specification",
-            )
-        });
+        return None;
     };
+    if key.is_empty() {
+        return Some(cannot("Index keys cannot be empty."));
+    }
     for (field, value) in key {
         if field.is_empty() {
             return Some(cannot("Index keys cannot be an empty field."));
@@ -3700,12 +3635,334 @@ fn index_spec_problem(spec: &Document) -> Option<CommandError> {
             "too many compound keys",
         ));
     }
-    if let Some(v) = spec.get("v").and_then(as_i64) {
-        if !(1..=2).contains(&v) {
-            return Some(cannot(&format!(
-                "Invalid index specification {text}; cannot create an index with v={v}"
-            )));
+    // A string key value names an index PLUGIN. mongod knows a handful; any
+    // other name is refused as unknown (measured 8.2.11, 2026-10-01). Known
+    // but unsupported types keep the storage layer's own refusal.
+    if let Some(plugin) = key.values().find_map(|v| match v {
+        Bson::String(p) if !KNOWN_INDEX_PLUGINS.contains(&p.as_str()) => Some(p.clone()),
+        _ => None,
+    }) {
+        let why = match plugin.as_str() {
+            "" => "Values in the index key pattern cannot be empty strings".to_string(),
+            "geoHaystack" => {
+                "GeoHaystack indexes cannot be created in version 5.0 and above".to_string()
+            }
+            other => format!("Unknown index plugin '{other}'"),
+        };
+        return Some(cannot(&why));
+    }
+    None
+}
+
+/// What mongod refuses in an index's `storageEngine` option, last of all the
+/// checks on a spec, and in the order it makes them (measured 8.2.11,
+/// 2026-11-24). The spec is quoted with the index version it has been given
+/// by then. A `configString` is checked by WiredTiger itself, whose message
+/// is quoted: its timestamp, thread and source line are the engine's own.
+fn storage_engine_problem(storage: &dyn crate::Storage, spec: &Document) -> Option<CommandError> {
+    let engines = spec.get("storageEngine")?;
+    let mut versioned = spec.clone();
+    if !versioned.contains_key("v") {
+        versioned.insert("v", 2_i32);
+    }
+    let text = argtypes::render_stage_value(&Bson::Document(versioned));
+    let refuse = |code: i32, name: &str, why: String| {
+        Some(CommandError::new(
+            code,
+            name,
+            format!("Error in specification {text} :: caused by :: {why}"),
+        ))
+    };
+    let Bson::Document(engines) = engines else {
+        return refuse(
+            67,
+            "CannotCreateIndex",
+            "\"storageEngine\" options must be a document if present".to_string(),
+        );
+    };
+    if engines.is_empty() {
+        return refuse(
+            67,
+            "CannotCreateIndex",
+            "Empty \"storageEngine\" options are invalid. Please remove the field or include \
+             valid options."
+                .to_string(),
+        );
+    }
+    for (engine, options) in engines {
+        let Bson::Document(options) = options else {
+            return refuse(
+                2,
+                "BadValue",
+                format!("'storageEngine.{engine}' has to be an embedded document."),
+            );
+        };
+        if engine != "wiredTiger" {
+            return refuse(
+                72,
+                "InvalidOptions",
+                format!("{engine} is not a registered storage engine for this server"),
+            );
         }
+        for (option, value) in options {
+            if option != "configString" {
+                return refuse(
+                    72,
+                    "InvalidOptions",
+                    format!("'{option}' is not a supported option."),
+                );
+            }
+            let Bson::String(config) = value else {
+                return refuse(
+                    14,
+                    "TypeMismatch",
+                    "'configString' must be a string.".to_string(),
+                );
+            };
+            if let Err((code, message)) = storage.validate_wt_config("WT_SESSION.create", config) {
+                return refuse(
+                    2,
+                    "BadValue",
+                    format!("{code}: {} - . {message}.", wt_strerror(code)),
+                );
+            }
+        }
+    }
+    None
+}
+
+/// `strerror` for the codes WiredTiger's configuration check returns.
+fn wt_strerror(code: i32) -> &'static str {
+    match code {
+        22 => "Invalid argument",
+        _ => "Unknown error",
+    }
+}
+
+/// The option fields mongod's index-spec parse reads, checked as it reads
+/// them (measured 8.2.11, 2026-11-24 over every option and value class):
+/// a field it does not know is refused first (197), then each field in the
+/// order the spec gives them -- the first that is refused answers -- by its
+/// type (14), its value where that is checked on the spot (`v`, the key,
+/// `wildcardProjection`). What it checks once the fields are read
+/// (`weights` on a key that is no text key, the TTL, the collation, the
+/// storage engine) is in [`index_spec_problem`] and the build.
+fn index_spec_fields_problem(spec: &Document) -> Option<CommandError> {
+    let text = argtypes::render_stage_value(&Bson::Document(spec.clone()));
+    let in_spec = |code: i32, name: &str, why: &str| {
+        CommandError::new(
+            code,
+            name,
+            format!("Error in specification {text} :: caused by :: {why}"),
+        )
+    };
+    let mismatch = |field: &str, want: &str, v: &Bson| {
+        in_spec(
+            14,
+            "TypeMismatch",
+            &format!(
+                "The field '{field}' must be {want}, but got {}",
+                secantus_core::query::bson_type_name(v)
+            ),
+        )
+    };
+    let key = spec.get_document("key").ok();
+    // The `_id` index has an unknown-field check of its own.
+    let is_id = key.is_some_and(|k| {
+        k.len() == 1 && k.contains_key("_id") && !secantus_core::hashed::is_hashed_spec(&k["_id"])
+    });
+    if !is_id {
+        if let Some(unknown) = spec.keys().find(|k| {
+            !matches!(k.as_str(), "key" | "name") && !INDEX_SPEC_KNOWN_OPTIONS.contains(&k.as_str())
+        }) {
+            return Some(in_spec(
+                197,
+                "InvalidIndexSpecificationOption",
+                &format!(
+                    "The field '{unknown}' is not valid for an index specification. \
+                     Specification: {text}"
+                ),
+            ));
+        }
+    }
+    let is_number = |v: &Bson| {
+        matches!(
+            v,
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)
+        )
+    };
+    for (field, value) in spec {
+        match field.as_str() {
+            "key" => {
+                if !matches!(value, Bson::Document(_)) {
+                    return Some(mismatch("key", "an object", value));
+                }
+                if let Some(e) = key_problem(spec) {
+                    return Some(e);
+                }
+            }
+            "name" => {
+                if !matches!(value, Bson::String(_)) {
+                    return Some(mismatch("name", "a string", value));
+                }
+            }
+            "v" => {
+                if !is_number(value) {
+                    return Some(mismatch("v", "a number", value));
+                }
+                if let Some(v) = as_i64(value).filter(|v| !(1..=2).contains(v)) {
+                    return Some(in_spec(
+                        67,
+                        "CannotCreateIndex",
+                        &format!(
+                            "Invalid index specification {text}; cannot create an index with \
+                             v={v}"
+                        ),
+                    ));
+                }
+            }
+            "hidden" => {
+                if !matches!(value, Bson::Boolean(_)) {
+                    return Some(mismatch("hidden", "a bool", value));
+                }
+            }
+            "unique" | "sparse" | "background" | "prepareUnique" => {
+                if let Err(e) = argtypes::require_index_spec_bool(spec, field) {
+                    return Some(e);
+                }
+            }
+            "weights" | "partialFilterExpression" | "collation" => {
+                // `weights` also takes a string (`"$**"`), which only a text
+                // key can use.
+                if !matches!(value, Bson::Document(_))
+                    && !(field == "weights" && matches!(value, Bson::String(_)))
+                {
+                    return Some(mismatch(field, "an object", value));
+                }
+            }
+            "default_language" | "language_override" => {
+                if !matches!(value, Bson::String(_)) {
+                    return Some(mismatch(field, "a string", value));
+                }
+            }
+            "textIndexVersion"
+            | "2dsphereIndexVersion"
+            | "bits"
+            | "min"
+            | "max"
+            | "bucketSize"
+            | "coarsestIndexedLevel"
+            | "finestIndexedLevel" => {
+                if !is_number(value) {
+                    return Some(mismatch(field, "a number", value));
+                }
+            }
+            "wildcardProjection" => {
+                let wildcards =
+                    key.is_some_and(|k| k.keys().any(|f| f == "$**" || f.ends_with(".$**")));
+                if !wildcards {
+                    return Some(in_spec(
+                        2,
+                        "BadValue",
+                        "The field 'wildcardProjection' is only allowed in 'wildcard' indexes",
+                    ));
+                }
+                let Bson::Document(projection) = value else {
+                    return Some(mismatch(field, "a non-empty object", value));
+                };
+                if !key.is_some_and(|k| k.contains_key("$**")) {
+                    return Some(in_spec(
+                        9,
+                        "FailedToParse",
+                        "The field 'wildcardProjection' is only allowed when 'key' is \
+                         {\"$**\": \u{b1}1}",
+                    ));
+                }
+                if projection.is_empty() {
+                    return Some(in_spec(
+                        9,
+                        "FailedToParse",
+                        "The 'wildcardProjection' field can't be an empty object",
+                    ));
+                }
+                // A compound wildcard key's other fields are indexed whole: a
+                // projection may not include any of them (or what holds one).
+                let included = |v: &Bson| {
+                    !matches!(v, Bson::Boolean(false))
+                        && crate::util::truthy_number_or_bool(v) != Some(false)
+                };
+                for field in key.iter().flat_map(|k| k.keys()).filter(|f| *f != "$**") {
+                    let overlap = projection.iter().find(|(path, v)| {
+                        included(v)
+                            && (field == *path
+                                || field
+                                    .strip_prefix(path.as_str())
+                                    .is_some_and(|r| r.starts_with('.')))
+                    });
+                    if let Some((path, _)) = overlap {
+                        return Some(in_spec(
+                            7_246_208,
+                            "Location7246208",
+                            &format!(
+                                "Index Key and Wildcard Projection cannot contain overlapping \
+                                 fields, however '{field}' index field is overlapping with \
+                                 '{path}' wildcardProjection path"
+                            ),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Why mongod refuses an index spec before building anything, or `None`.
+/// Each message is what 8.2.11 answered (2026-10-10); all of these specs
+/// used to be accepted and an index built from them.
+fn index_spec_problem(spec: &Document) -> Option<CommandError> {
+    let text = argtypes::render_stage_value(&Bson::Document(spec.clone()));
+    // Some checks run after mongod has filled in the index version.
+    let mut versioned = spec.clone();
+    if !versioned.contains_key("v") {
+        versioned.insert("v", 2_i32);
+    }
+    let versioned_text = argtypes::render_stage_value(&Bson::Document(versioned));
+    let in_spec = |code: i32, name: &str, text: &str, why: &str| {
+        CommandError::new(
+            code,
+            name,
+            format!("Error in specification {text} :: caused by :: {why}"),
+        )
+    };
+    let cannot = |why: &str| in_spec(67, "CannotCreateIndex", &text, why);
+    let Some(Bson::Document(key)) = spec.get("key") else {
+        return spec.get("key").is_none().then(|| {
+            in_spec(
+                9,
+                "FailedToParse",
+                &text,
+                "The 'key' field is a required property of an index specification",
+            )
+        });
+    };
+    if let Some(e) = key_problem(spec) {
+        return Some(e);
+    }
+    // Two options that exclude each other come before every other check on
+    // the spec's meaning (8.2.11, 2026-11-24).
+    if spec
+        .get("unique")
+        .is_some_and(|v| crate::util::truthy_number_or_bool(v) == Some(true))
+        && spec
+            .get("prepareUnique")
+            .is_some_and(|v| crate::util::truthy_number_or_bool(v) == Some(true))
+    {
+        return Some(cannot(&format!(
+            "Invalid index specification {text}; cannot create an index with the 'unique' \
+             option and the 'prepareUnique' option"
+        )));
     }
     let name = spec.get_str("name").ok();
     if name == Some("") {
@@ -3752,22 +4009,6 @@ fn index_spec_problem(spec: &Document) -> Option<CommandError> {
                 ),
             ));
         }
-    }
-    if let Some(unknown) = spec.keys().find(|k| {
-        !matches!(k.as_str(), "key" | "name")
-            && !INDEX_SPEC_KNOWN_OPTIONS.contains(&k.as_str())
-            // `prepareUnique: false` is a default mongod parses and drops.
-            && !(k.as_str() == "prepareUnique" && spec.get(k.as_str()).is_some_and(is_falsy))
-    }) {
-        return Some(in_spec(
-            197,
-            "InvalidIndexSpecificationOption",
-            &text,
-            &format!(
-                "The field '{unknown}' is not valid for an index specification. Specification: \
-                 {text}"
-            ),
-        ));
     }
     // A hashed index takes no uniqueness and one hashed field, measured
     // 8.2.11 (2026-11-23); the unique refusal comes first.
@@ -3931,7 +4172,7 @@ fn index_spec_problem(spec: &Document) -> Option<CommandError> {
         }
     }
     if spec.contains_key("partialFilterExpression")
-        && matches!(spec.get("sparse"), Some(Bson::Boolean(true)))
+        && secantus_core::index_keys::spec_flag(spec, "sparse")
     {
         return Some(in_spec(
             67,
@@ -3962,6 +4203,18 @@ fn index_spec_problem(spec: &Document) -> Option<CommandError> {
             }
             None => {}
         }
+    }
+    // What mongod checks once it has read every field, in its order
+    // (measured 8.2.11, 2026-11-24): `weights` on a key that is no text key,
+    // then the TTL.
+    if spec.contains_key("weights") && !key.values().any(|v| v.as_str() == Some("text")) {
+        return Some(cannot(&format!(
+            "Invalid index specification {text}; the field 'weights' can only be specified \
+             with text indexes"
+        )));
+    }
+    if let Err(e) = argtypes::require_index_spec_ttl(spec, "expireAfterSeconds") {
+        return Some(e);
     }
     // TTL: one field, and a non-negative 32-bit number of seconds.
     if let Some(seconds) = spec.get("expireAfterSeconds") {
@@ -4167,15 +4420,19 @@ pub(crate) const INDEX_CATALOG_ONLY: &[&str] = &[
 
 fn index_options(spec: &Document) -> Document {
     spec.iter()
-        .filter(|(k, v)| {
+        .filter(|(k, _)| {
             !matches!(k.as_str(), "v" | "key" | "name" | "ns")
                 && !INDEX_CATALOG_ONLY.contains(&k.as_str())
                 // mongod compares two specs without `background`, and
                 // `sparse: false` is no `sparse` (8.2.11, RM-788).
                 && k.as_str() != "background"
-                && !(k.as_str() == "sparse" && **v == Bson::Boolean(false))
+                && !(k.as_str() == "sparse" && !secantus_core::index_keys::spec_flag(spec, "sparse"))
         })
-        .map(|(k, v)| (k.clone(), v.clone()))
+        // `sparse: 1.0` is the same index as `sparse: true`.
+        .map(|(k, v)| match k.as_str() {
+            "sparse" => (k.clone(), Bson::Boolean(true)),
+            _ => (k.clone(), v.clone()),
+        })
         .collect()
 }
 
@@ -4229,7 +4486,12 @@ fn index_conflict(
         // with only these different is an equivalent index, 85.
         let identity = |d: &Document| -> Document {
             d.iter()
-                .filter(|(k, _)| !matches!(k.as_str(), "expireAfterSeconds" | "hidden"))
+                .filter(|(k, _)| {
+                    !matches!(
+                        k.as_str(),
+                        "expireAfterSeconds" | "hidden" | "prepareUnique"
+                    )
+                })
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect()
         };
@@ -4778,6 +5040,16 @@ pub fn server_status(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     };
     if let Some(status) = status {
         reply.insert("asserts", status.asserts());
+    }
+    // The time-series bucket catalog (RM-709), once a time-series
+    // collection has been written to.
+    if let Some(section) = ctx
+        .storage()
+        .ok()
+        .and_then(|s| s.bucket_catalog())
+        .and_then(|c| c.server_status())
+    {
+        reply.insert("bucketCatalog", section);
     }
     // mongo-c-driver's `/Client/exhaust_cursor/{single,pool}` read
     // `connections.totalCreated` off serverStatus to check the connection
@@ -5624,6 +5896,7 @@ const INDEX_SPEC_KNOWN_OPTIONS: &[&str] = &[
     "storageEngine",
     // Text — accepted on the wire even though text indexes are unsupported
     // (storage rejects them with CreateIndexUnsupported).
+    "prepareUnique",
     "weights",
     "default_language",
     "language_override",
@@ -6138,5 +6411,86 @@ mod create_parse_tests {
         assert_eq!(code(doc! {"create": "d", "autoIndexId": true}), 40415);
         // The capped 72s are the run's, not the parse's.
         assert!(create_parse(&doc! {"create": "d", "capped": true}).is_ok());
+    }
+}
+
+/// `index_spec_fields_problem` answers as mongod's index-spec parse does:
+/// an unknown field first, then the fields in the order the spec gives them
+/// (measured 8.2.11, 2026-11-24, RM-771 and RM-791).
+#[cfg(test)]
+mod index_spec_fields_tests {
+    use super::index_spec_fields_problem;
+    use bson::doc;
+
+    fn code(d: bson::Document) -> Option<i32> {
+        index_spec_fields_problem(&d).map(|e| e.code)
+    }
+
+    #[test]
+    fn an_unknown_field_answers_before_a_type_does() {
+        assert_eq!(
+            code(doc! {"key": {"a": 1}, "name": "i", "v": "x", "bogus": 1}),
+            Some(197)
+        );
+    }
+
+    #[test]
+    fn the_first_fault_in_document_order_answers() {
+        let hidden = |k: bson::Document| code(k);
+        assert_eq!(
+            hidden(doc! {"key": {"a": 1}, "name": "i", "hidden": 1, "v": 3}),
+            Some(14)
+        );
+        assert_eq!(
+            hidden(doc! {"key": {"a": 1}, "name": "i", "v": 3, "hidden": 1}),
+            Some(67)
+        );
+        // A key's own refusal answers where the key stands.
+        assert_eq!(code(doc! {"key": {}, "name": "i", "sparse": "x"}), Some(67));
+        assert_eq!(code(doc! {"sparse": "x", "key": {}, "name": "i"}), Some(14));
+    }
+
+    #[test]
+    fn a_flag_is_a_bool_or_a_number_and_hidden_only_a_bool() {
+        for flag in ["sparse", "background", "unique", "prepareUnique"] {
+            assert_eq!(
+                code(doc! {"key": {"a": 1}, "name": "i", flag: 1.0}),
+                None,
+                "{flag}"
+            );
+            assert_eq!(
+                code(doc! {"key": {"a": 1}, "name": "i", flag: "x"}),
+                Some(14),
+                "{flag}"
+            );
+        }
+        assert_eq!(
+            code(doc! {"key": {"a": 1}, "name": "i", "hidden": 1}),
+            Some(14)
+        );
+    }
+
+    #[test]
+    fn a_wildcard_projection_needs_a_top_level_wildcard_key() {
+        let wp = |key: bson::Document, value: bson::Bson| {
+            code(doc! {"key": key, "name": "i", "wildcardProjection": value})
+        };
+        assert_eq!(wp(doc! {"a": 1}, 1.into()), Some(2));
+        assert_eq!(wp(doc! {"a.$**": 1}, 1.into()), Some(14));
+        assert_eq!(wp(doc! {"a.$**": 1}, doc! {}.into()), Some(9));
+        assert_eq!(wp(doc! {"$**": 1}, doc! {}.into()), Some(9));
+        assert_eq!(wp(doc! {"$**": 1}, doc! {"a": 1}.into()), None);
+        // A compound wildcard key takes one.
+        assert_eq!(wp(doc! {"a": 1, "$**": 1}, doc! {"b": 1}.into()), None);
+        assert_eq!(
+            wp(doc! {"a": 1, "$**": 1}, doc! {"a": 1}.into()),
+            Some(7_246_208)
+        );
+        assert_eq!(wp(doc! {"a": 1, "$**": 1}, doc! {"a": 0}.into()), None);
+        assert_eq!(
+            wp(doc! {"a.b": 1, "$**": 1}, doc! {"a": 1}.into()),
+            Some(7_246_208)
+        );
+        assert_eq!(wp(doc! {"a": 1, "b.$**": 1}, doc! {"b": 1}.into()), Some(9));
     }
 }

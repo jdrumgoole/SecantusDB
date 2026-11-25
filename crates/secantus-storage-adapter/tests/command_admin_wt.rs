@@ -127,27 +127,27 @@ fn create_indexes_validates_options() {
             .unwrap()
             .contains("No write concern mode named 'unsupported-value'"));
 
-        // wildcardProjection must be a non-empty document.
+        // wildcardProjection must be a non-empty document (mongod 8.2.11: 14).
         let r = dispatch(
             &doc! {"createIndexes": "c", "indexes": [{"key": {"$**": 1}, "name": "w", "wildcardProjection": 5}]},
             c,
         );
-        assert_eq!(r.get_i32("code").unwrap(), 67);
+        assert_eq!(r.get_i32("code").unwrap(), 14);
         assert!(r
             .get_str("errmsg")
             .unwrap()
-            .contains("wildcardProjection must be a non-empty object"));
+            .contains("The field 'wildcardProjection' must be a non-empty object, but got int"));
 
         // wildcardProjection only on a wildcard ($**) index.
         let r = dispatch(
             &doc! {"createIndexes": "c", "indexes": [{"key": {"x": 1}, "name": "x_1", "wildcardProjection": {"rating": 1}}]},
             c,
         );
-        assert_eq!(r.get_i32("code").unwrap(), 67);
+        assert_eq!(r.get_i32("code").unwrap(), 2);
         assert!(r
             .get_str("errmsg")
             .unwrap()
-            .contains("wildcardProjection is only allowed on wildcard indexes"));
+            .contains("The field 'wildcardProjection' is only allowed in 'wildcard' indexes"));
 
         // hidden: false is dropped, not echoed by listIndexes.
         dispatch(

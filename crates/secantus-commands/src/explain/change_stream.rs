@@ -766,6 +766,66 @@ fn rewrite_namespace(u: &U, path: &str) -> Option<M> {
     ]))
 }
 
+/// mongod's `matchRewriteGenericNamespace` for `to`, `$eq` and `$in`: a
+/// rename's `o.to`, the one oplog field holding a rename's target. A
+/// whole `to` names a collection, so a `{db}` alone matches nothing. A
+/// regex (which mongod rewrites into an `$expr`) is not rewritten here.
+fn rewrite_to(u: &U, path: &str) -> Option<M> {
+    let (values, many): (Vec<Bson>, bool) = match u {
+        U::Eq(_, v) => (vec![v.clone()], false),
+        U::In(_, _, true) => return None,
+        U::In(_, vs, false) => (vs.clone(), true),
+        _ => return None,
+    };
+    let to = match path.split('.').collect::<Vec<_>>().as_slice() {
+        ["to"] => {
+            let full: Vec<Bson> = values
+                .iter()
+                .filter_map(|v| {
+                    let Bson::Document(d) = v else { return None };
+                    let keys: Vec<&str> = d.keys().map(String::as_str).collect();
+                    match (keys.as_slice(), d.get("db"), d.get("coll")) {
+                        (["db", "coll"], Some(Bson::String(db)), Some(Bson::String(c))) => {
+                            Some(Bson::String(format!("{db}.{c}")))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+            if full.is_empty() {
+                return Some(M::False);
+            }
+            let many = many && full.len() > 1;
+            on("o.to", &full, many)
+        }
+        ["to", field @ ("db" | "coll")] => {
+            if !values.iter().all(|v| matches!(v, Bson::String(_))) {
+                return None;
+            }
+            let patterns: Vec<String> = values
+                .iter()
+                .filter_map(Bson::as_str)
+                .map(|n| {
+                    if *field == "coll" {
+                        format!("{ANY_DB}\\.{}$", escaped(n))
+                    } else {
+                        format!("^{}\\.(?!(\\$|system\\.))", escaped(n))
+                    }
+                })
+                .collect();
+            on_regex("o.to", &patterns, many)
+        }
+        _ => {
+            return if matches_missing(u) {
+                None
+            } else {
+                Some(M::False)
+            }
+        }
+    };
+    Some(M::And(vec![to, op_is("c")]))
+}
+
 /// mongod's `matchRewriteOperationType`.
 fn rewrite_operation_type(u: &U, path: &str) -> Option<M> {
     // A subfield of `operationType` is always missing: the predicate is
@@ -842,6 +902,7 @@ fn rewrite(u: &U, inexact: bool) -> Option<M> {
             Some("operationType") => rewrite_operation_type(u, p),
             Some("documentKey") => rewrite_document_key(u),
             Some("ns") => rewrite_namespace(u, p),
+            Some("to") => rewrite_to(u, p),
             Some("fullDocument") if inexact => rewrite_full_document(u),
             _ => None,
         },

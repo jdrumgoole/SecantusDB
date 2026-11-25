@@ -232,7 +232,7 @@ fn beyond_the_planner(
         }
         // mongod does not serve a rewritten `$expr` from a sparse index
         // (measured: refused with one on the field).
-        let sparse = spec.get_bool("sparse").unwrap_or(false);
+        let sparse = secantus_core::index_keys::spec_flag(&spec, "sparse");
         if !sparse
             && key
                 .keys()

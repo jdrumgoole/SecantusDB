@@ -672,7 +672,7 @@ fn catalog(
         catalog.push(Arc::new(IndexInfo {
             wildcard,
             unique: name == "_id_" || spec.get_bool("unique").unwrap_or(false),
-            sparse: spec.get_bool("sparse").unwrap_or(false),
+            sparse: secantus_core::index_keys::spec_flag(spec, "sparse"),
             partial: spec.get_document("partialFilterExpression").ok().cloned(),
             multikey_paths,
             version: spec.get("v").and_then(as_i64).unwrap_or(2) as i32,

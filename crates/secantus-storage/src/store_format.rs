@@ -329,6 +329,17 @@ pub fn mongod_store_findings(home: &Path) -> std::result::Result<Vec<String>, St
 /// whenever another server (mongod) wrote the store, before this server
 /// writes to it.
 pub(crate) fn catalog_findings(session: &secantus_wt::Session) -> Result<Vec<String>> {
+    catalog_findings_after(session, &crate::adopt::Replayed::default())
+}
+
+/// [`catalog_findings`] of the catalog as crash recovery's replay leaves it:
+/// an index or collection an oplog entry after the recovery point drops is
+/// not judged, as mongod's restart replays the drop before it serves
+/// anything (RM-756).
+pub(crate) fn catalog_findings_after(
+    session: &secantus_wt::Session,
+    replayed: &crate::adopt::Replayed,
+) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let mut idents: Vec<(String, String)> = Vec::new();
     let cur = session.open_cursor("table:_mdb_catalog", None)?;
@@ -343,6 +354,9 @@ pub(crate) fn catalog_findings(session: &secantus_wt::Session) -> Result<Vec<Str
         let ns = md.get_str("ns").unwrap_or("").to_string();
         if let Ok(ident) = entry.get_str("ident") {
             idents.push((ns.clone(), ident.to_string()));
+        }
+        if replayed.drops_collection(&ns) {
+            continue;
         }
         // A time-series collection's buckets: each index is listed on the
         // collection on its own fields, which a key it cannot be is not.
@@ -367,6 +381,9 @@ pub(crate) fn catalog_findings(session: &secantus_wt::Session) -> Result<Vec<Str
                 continue;
             };
             let name = spec.get_str("name").unwrap_or("");
+            if replayed.drops_index(&ns, name) {
+                continue;
+            }
             if let Some(ts) = &ts {
                 if name != "_id_"
                     && secantus_core::viewdefs::collection_index_spec(spec, ts).is_none()
