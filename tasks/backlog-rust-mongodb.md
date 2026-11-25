@@ -2191,6 +2191,13 @@ compressed column, placed by mongod's bucket catalog
       (Joe):** measure Linux mongod and pin its numbers (the faithful path:
       port the tracking-allocator charges from mongod's source), or narrow
       what is pinned.
+      **Decided 2026-11-25 (Joe):** the faithful option. Measure Linux
+      x86-64 mongod (the exemplar build, libstdc++; 8.2.11, and 8.2.12 which
+      CI now runs) for every case above, pin those numbers in the gap test
+      (an `only_on("linux")` case, checked by CI), and port mongod's memory
+      charges from its source so the counts match that build. Linux mongod
+      is not runnable here until Docker's daemon is started; CI's
+      `mdb-binary` jobs run Linux mongod and can measure it.
       Verify: tests/backlog/test_rm_bucket_catalog.py::test_bucket_catalog_memory_usage_is_the_bytes_mongod_accounts
       Backlog-ID: RM-710
 - [ ] **RUST MongoDB server: idle buckets never expire past
