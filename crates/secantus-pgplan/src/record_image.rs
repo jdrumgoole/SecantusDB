@@ -15,8 +15,9 @@
 //! Modelled: the integers, oid, bool, `"char"`, the floats, numeric, date,
 //! time, timetz, the timestamps, interval, uuid, macaddr / macaddr8, inet /
 //! cidr, tid, pg_lsn, name, text / varchar / bpchar, bytea, money, bit /
-//! varbit, jsonb, arrays of any of those but bit / varbit, and
-//! the built-in ranges and multiranges, and named composites.
+//! varbit, json, xml, jsonb, the ranges and multiranges (built-in, or over
+//! a subtype this list holds), named composites, and arrays of any of
+//! those but bit / varbit.
 
 use std::cmp::Ordering;
 
@@ -156,6 +157,13 @@ fn image(v: &Bson, ty: &str) -> Result<Image> {
             Bson::String(s) => Image::Bytes(s.as_bytes().to_vec()),
             _ => return Err(refused()),
         },
+        // `json_in` and `xml_in` keep the input text as it was written
+        // (`cstring_to_text`), so `{"a":1}` and `{"a": 1}` differ.
+        "json" | "xml" => Image::Bytes(
+            crate::hashfn::text_of(v, ty)
+                .map_err(|_| refused())?
+                .into_bytes(),
+        ),
         "bytea" => match v {
             Bson::Binary(b) => Image::Bytes(b.bytes.clone()),
             _ => return Err(refused()),
@@ -274,10 +282,8 @@ fn image(v: &Bson, ty: &str) -> Result<Image> {
             let j = crate::json::parse(&t).map_err(|_| refused())?;
             Image::Bytes(jsonb_image(&j).ok_or_else(refused)?)
         }
-        t if RANGE_TYPES.iter().any(|(n, _)| *n == t) => {
-            Image::Bytes(range_image(v, t).ok_or_else(refused)?)
-        }
-        t if MULTIRANGE_TYPES.iter().any(|(n, _)| *n == t) => {
+        t if range_oid(t).is_some() => Image::Bytes(range_image(v, t).ok_or_else(refused)?),
+        t if multirange_oid(t).is_some() => {
             Image::Bytes(multirange_image(v, t).ok_or_else(refused)?)
         }
         t if crate::user_composite_fields(t).is_some() => {
@@ -355,11 +361,13 @@ fn pad_to(out: &mut Vec<u8>, base: usize, align: usize) {
 /// MAXALIGN, then the present elements, each at its type's alignment.
 /// A varlena element keeps the 4-byte header `array_in` and `ARRAY[]` give
 /// it (`(size << 2)`, little-endian), measured on PostgreSQL 15.19:
-/// `row('{b}'::text[]) *< row('{<63 a>}'::text[])` is false.
+/// `row('{b}'::text[]) *< row('{<63 a>}'::text[])` is false. So does a
+/// range, multirange or composite element: `range_serialize`,
+/// `make_multirange` and `heap_form_tuple` build each with a 4-byte header.
 fn array_image(v: &Bson, elem: &str) -> Option<Vec<u8>> {
     let (oid, len, align) = match fixed_element(elem).or_else(|| fixed_byref_element(elem)) {
         Some(f) => f,
-        None => (varlena_element(elem)?, 0, 4),
+        None => (varlena_oid(elem)?, 0, varlena_align(elem)?),
     };
     let dims = crate::arrays::dim_lengths(&crate::arrays::strip(v));
     let lbs = crate::arrays::lower_bounds(v);
@@ -498,18 +506,38 @@ fn varlena_align(t: &str) -> Option<usize> {
     if crate::user_composite_fields(t).is_some() {
         return Some(8);
     }
-    // A range or multirange is aligned as its subtype.
-    let is_range = RANGE_TYPES
-        .iter()
-        .chain(MULTIRANGE_TYPES)
-        .any(|(n, _)| *n == t);
-    is_range.then(|| {
-        if t.starts_with("int8") || t.starts_with("ts") {
-            8
-        } else {
-            4
-        }
+    // A range or multirange is double-aligned when its subtype is, else
+    // int-aligned (`DefineRange`).
+    let range = if multirange_oid(t).is_some() {
+        crate::range::multirange_member(t)?
+    } else {
+        t.to_string()
+    };
+    range_oid(&range)?;
+    let (elem, _) = crate::range::range_element(&range)?;
+    Some(if subtype_align(&canonical(&elem))? == 8 {
+        8
+    } else {
+        4
     })
+}
+
+/// A type's `typalign`, for a type whose image `image` models.
+fn subtype_align(t: &str) -> Option<usize> {
+    match fixed_element(t).or_else(|| fixed_byref_element(t)) {
+        Some((_, _, align)) => Some(align),
+        None => varlena_align(t),
+    }
+}
+
+/// The `pg_type` oid of a varlena type whose image `image` models: an
+/// element type of [`varlena_element`], a range or multirange, or a named
+/// composite.
+fn varlena_oid(t: &str) -> Option<u32> {
+    varlena_element(t)
+        .or_else(|| range_oid(t))
+        .or_else(|| multirange_oid(t))
+        .or_else(|| u32::try_from(crate::user_composite_oid(t)?).ok())
 }
 
 /// The `pg_type` oid of a varlena element type with int alignment whose
@@ -524,6 +552,8 @@ fn varlena_element(ty: &str) -> Option<u32> {
         "cidr" => 650,
         "inet" => 869,
         "jsonb" => 3802,
+        "json" => 114,
+        "xml" => 142,
         _ => return None,
     })
 }
@@ -641,12 +671,32 @@ const RANGE_TYPES: &[(&str, u32)] = &[
     ("int8range", 3926),
 ];
 
+/// A range type's oid: a built-in one, or one `CREATE TYPE ... AS RANGE`
+/// made.
+fn range_oid(ty: &str) -> Option<u32> {
+    match RANGE_TYPES.iter().find(|(n, _)| *n == ty) {
+        Some((_, oid)) => Some(*oid),
+        None => u32::try_from(crate::user_range_oid(ty)?).ok(),
+    }
+}
+
+/// A multirange type's oid: a built-in one, or the one made beside a user
+/// range.
+fn multirange_oid(ty: &str) -> Option<u32> {
+    match MULTIRANGE_TYPES.iter().find(|(n, _)| *n == ty) {
+        Some((_, oid)) => Some(*oid),
+        None => u32::try_from(crate::user_multirange_oid(ty)?).ok(),
+    }
+}
+
 /// A `RangeType`'s varlena data (`range_serialize`): the range type's oid,
-/// each finite bound at its subtype's alignment (a numeric bound with a
-/// one-byte short header, unaligned), then the flags byte (`EMPTY` 0x01,
-/// `LB_INC` 0x02, `UB_INC` 0x04, `LB_INF` 0x08, `UB_INF` 0x10).
+/// each finite bound as `datum_write` lays it (a by-value or fixed-length
+/// bound at its subtype's alignment; a varlena one of at most 126 data
+/// bytes with a one-byte short header, unaligned; a longer one aligned with
+/// its 4-byte header), then the flags byte (`EMPTY` 0x01, `LB_INC` 0x02,
+/// `UB_INC` 0x04, `LB_INF` 0x08, `UB_INF` 0x10).
 fn range_image(v: &Bson, ty: &str) -> Option<Vec<u8>> {
-    let oid = RANGE_TYPES.iter().find(|(n, _)| *n == ty)?.1;
+    let oid = range_oid(ty)?;
     let Bson::String(text) = v else { return None };
     let r = crate::range::parse_stored(text).ok()?;
     let mut out = oid.to_le_bytes().to_vec();
@@ -660,6 +710,7 @@ fn range_image(v: &Bson, ty: &str) -> Option<Vec<u8>> {
 /// header), and returns the flags byte.
 fn range_bounds(r: &crate::range::Range, ty: &str, out: &mut Vec<u8>) -> Option<u8> {
     let (elem, _) = crate::range::range_element(ty)?;
+    let elem = canonical(&elem);
     let mut flags = 0u8;
     if r.empty {
         return Some(0x01);
@@ -675,20 +726,35 @@ fn range_bounds(r: &crate::range::Range, ty: &str, out: &mut Vec<u8>) -> Option<
         if inc {
             flags |= inc_flag;
         }
-        if elem == "numeric" {
-            let n = numeric_image(b)?;
-            out.push((((n.len() + 1) << 1) | 1) as u8);
-            out.extend(n);
-        } else {
-            let (_, len, align) = fixed_element(&elem)?;
+        if let Some((_, len, align)) = fixed_element(&elem).or_else(|| fixed_byref_element(&elem)) {
             let value = match elem.as_str() {
                 "int4" | "int8" => Bson::Int64(b.parse().ok()?),
                 "date" => Bson::String(b.clone()),
-                _ => crate::cast_value(Bson::String(b.clone()), "timestamp").ok()?,
+                "timestamp" | "timestamptz" => {
+                    crate::cast_value(Bson::String(b.clone()), "timestamp").ok()?
+                }
+                _ => crate::cast_value(Bson::String(b.clone()), &elem).ok()?,
             };
             pad_to(out, 4, align);
             out.extend(fixed_bytes(&value, &elem, len)?);
+            continue;
         }
+        let data = if elem == "numeric" {
+            numeric_image(b)?
+        } else {
+            let value = crate::cast_value(Bson::String(b.clone()), &elem).ok()?;
+            match image(&value, &elem).ok()? {
+                Image::Bytes(d) => d,
+                Image::ByValue(_) => return None,
+            }
+        };
+        if data.len() < 0x7f {
+            out.push((((data.len() + 1) << 1) | 1) as u8);
+        } else {
+            pad_to(out, 4, varlena_align(&elem)?);
+            out.extend((((data.len() + 4) as u32) << 2).to_le_bytes());
+        }
+        out.extend(data);
     }
     Some(flags)
 }
@@ -714,15 +780,11 @@ const MULTIRANGE_TYPES: &[(&str, u32)] = &[
 fn multirange_image(v: &Bson, ty: &str) -> Option<Vec<u8>> {
     const STRIDE: usize = 4;
     const OFF_BIT: u32 = 0x8000_0000;
-    let oid = MULTIRANGE_TYPES.iter().find(|(n, _)| *n == ty)?.1;
+    let oid = multirange_oid(ty)?;
     let Bson::String(text) = v else { return None };
     let member = crate::range::multirange_member(ty)?;
     let (elem, _) = crate::range::range_element(&member)?;
-    let align = if elem == "numeric" {
-        4
-    } else {
-        fixed_element(&elem)?.2
-    };
+    let align = subtype_align(&canonical(&elem))?;
     let members = crate::range::multirange_from_text(text, ty).ok()?;
     let n = members.len();
     let mut bounds: Vec<Vec<u8>> = Vec::with_capacity(n);
@@ -829,7 +891,7 @@ fn numeric_image(text: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{jsonb_image, multirange_image, numeric_image};
+    use super::{array_image, jsonb_image, multirange_image, numeric_image};
 
     fn jsonb(text: &str) -> Vec<u8> {
         jsonb_image(&crate::json::parse(text).unwrap()).unwrap()
@@ -880,6 +942,23 @@ mod tests {
             .collect();
         want.extend([0x02, 0x02, 0, 0]);
         want.extend([1u32, 3, 5, 6].iter().flat_map(|w| w.to_le_bytes()));
+        assert_eq!(img, want);
+    }
+
+    /// An array of ranges: the int4range oid as its element type, then the
+    /// element with the 4-byte header `range_serialize` gave it -- the
+    /// range's oid, its two int4 bounds and the flags byte.
+    #[test]
+    fn range_array_elements_keep_their_header() {
+        let v = bson::Bson::Array(vec![bson::Bson::String("[1,3)".into())]);
+        let img = array_image(&v, "int4range").unwrap();
+        let mut want: Vec<u8> = [1i32, 0, 3904, 1, 1]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        want.extend((((4 + 13) as u32) << 2).to_le_bytes());
+        want.extend([3904u32, 1, 3].iter().flat_map(|w| w.to_le_bytes()));
+        want.push(0x02);
         assert_eq!(img, want);
     }
 

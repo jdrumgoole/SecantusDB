@@ -2212,24 +2212,31 @@ gap tests are in `tests/backlog/test_rp_found_rp532.py`.
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp590.py`.
 
-- [ ] **The `record_image` operators refuse some field types.** `*=` ..
-      `*>=` compare a record's fields by their binary images (RP-650):
-      the scalar types in `record_image.rs`, jsonb (its `JsonbContainer`,
-      2026-11-18), arrays of fixed-length elements (by value, or by
-      reference: interval, uuid, timetz, name, macaddr / macaddr8, tid) or
-      of text / varchar / bpchar / numeric / bytea / inet / cidr / jsonb
-      (each with the 4-byte header `array_in` gives it, measured), the
-      built-in ranges and the built-in multiranges (`make_multirange`'s
-      layout, 2026-11-18) and named composites (the `HeapTupleHeader`
-      `heap_form_tuple` builds, 2026-11-18) are modelled. Every other type
-      is 0A000 `a record_image comparison over a field of type ... is not
-      supported yet`. Remaining, measured on PostgreSQL 15.19: arrays of
-      any other varlena element (`xml[]`), a user range or multirange, an
-      anonymous `record` field (its typmod is the session's blessed one),
-      and a composite whose type has a dropped attribute (its `natts`
-      and NULL bitmap count the dropped column; the planner's field list
-      does not, so such a value is imaged as though never altered).
-      Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_over_still_refused_field_types
+- [ ] **The `record_image` operators refuse some field types, and image a
+      composite with a dropped attribute wrongly.** `*=` .. `*>=` compare a
+      record's fields by their binary images (RP-650): the scalar types in
+      `record_image.rs`, json and xml (their text as written, 2026-11-25),
+      jsonb (its `JsonbContainer`), the ranges and multiranges, built-in or
+      user, over a subtype the module models (`range_serialize`'s
+      `datum_write` layout, 2026-11-25), named composites (the
+      `HeapTupleHeader` `heap_form_tuple` builds) and arrays of any of
+      those but bit / varbit are modelled. Every other type is 0A000 `a
+      record_image comparison over a field of type ... is not supported
+      yet` (point, tsvector and the other geometric and text-search types
+      among them). Remaining, measured on PostgreSQL 15.20: an anonymous
+      `record` field (its image carries the typmod the session blessed its
+      row type with, `assign_record_type_typmod`, so two records of
+      different field types order by blessing order), and a WRONG answer,
+      not a refusal: a composite whose type has a dropped attribute
+      (`ALTER TYPE ... DROP ATTRIBUTE`, or a table's row type after `ALTER
+      TABLE ... DROP COLUMN`). Its `t_infomask2` counts the dropped slot
+      and its NULL bitmap always marks it, so `row(row(null, 'a')::cx) *<
+      row(row(1, 'a')::cx)` is true on 15.20 and false here: the planner
+      holds only the live fields (`CompositeType`), not the `attnums` and
+      `dropped` slots the composite catalog document keeps
+      (`composite_alter.rs`), so the value is imaged as though never
+      altered. The fix hands those slots to `composite_image`.
+      Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_over_still_refused_field_types, tests/backlog/test_rp_found_rp590.py::test_record_image_over_a_composite_with_a_dropped_attribute
       Backlog-ID: RP-976
 
 ## Found while working RP-569 (2026-11-08)

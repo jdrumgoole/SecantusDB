@@ -26,13 +26,21 @@ from tests.backlog.test_rp_batch26 import _dsn
 
 _SETUP = [
     "drop table if exists tca",
-    "drop type if exists cf, ca, cb, cc, cd, ce cascade",
+    "drop type if exists cf, ca, cb, cc, cd, ce, cj, cx, fr, tr, nr, ir, i2r cascade",
     "create type ca as (x int, y text)",
     "create type cb as (x int, y int)",
     "create type cc as (x int, y text, z int)",
     "create type cd as (p int, q text)",
     "create type ce as (a int8, b text, c int2)",
     "create type cf as (p ca, q numeric)",
+    "create type cj as (a int, b json, c xml)",
+    "create type cx as (a int, b int, c text)",
+    "alter type cx drop attribute b",
+    "create type fr as range (subtype = float8)",
+    "create type tr as range (subtype = text)",
+    "create type nr as range (subtype = numeric)",
+    "create type ir as range (subtype = interval)",
+    "create type i2r as range (subtype = int2)",
     "create table tca (k int, v ca)",
     "insert into tca values (1, row(1, 'a')), (2, row(2, 'b')), (3, null)",
 ]
@@ -464,9 +472,136 @@ def test_record_image_over_arrays_of_jsonb_and_inet(
     assert answer(dsn, query) == [(want,)]
 
 
+# Measured on PostgreSQL 15.20: an anonymous record field's image carries
+# the typmod the session blessed its row type with (`assign_record_type_typmod`).
 RECORD_IMAGE_STILL_REFUSED = {
-    "select (select row(array['<a/>'::xml])) *= (select row(array['<a/>'::xml]))": [(True,)],
+    "select (select row((1,2))) *= (select row((1,2)))": [(True,)],
+    "select (select row((1,2))) *< (select row((1,3)))": [(True,)],
 }
+
+# Measured on PostgreSQL 15.20: `cx` had `b` dropped, so each value's
+# `t_infomask2` counts three attributes and its NULL bitmap always marks the
+# dropped one; `row(null, 'a')` and `row(1, 'a')` differ in the bitmap only.
+RECORD_IMAGE_DROPPED_ATTRIBUTE = {
+    "select (select row(row(null, 'a')::cx)) *< (select row(row(1, 'a')::cx))": [(True,)],
+}
+
+# Measured on PostgreSQL 15.20: `json_in` and `xml_in` keep the text as it
+# was written, and an array keeps each element's 4-byte header.
+RECORD_IMAGE_TEXT_TYPES = [
+    ("'<a/>'::xml", "*=", "'<a/>'::xml", True),
+    ("'<b/>'::xml", "*<", "'<a/><a/>'::xml", False),
+    ("'<a/>'::xml", "*<", "'<a />'::xml", False),
+    ("array['<a/>'::xml]", "*=", "array['<a/>'::xml]", True),
+    ("array['<b/>'::xml]", "*<", "array['<a/><a/>'::xml]", True),
+    ("array['<a/>'::xml, null]", "*<", "array['<a/>'::xml]", False),
+    ("'{\"b\":1}'::json", "*<", '\'{"a":1, "x":2}\'::json', False),
+    ("' {\"a\":1}'::json", "*<", "'{\"a\":1}'::json", True),
+    ("'{\"a\":1}'::json", "*=", "'{\"a\": 1}'::json", False),
+    ("array['{\"b\":1}'::json]", "*<", 'array[\'{"a":1, "x":2}\'::json]', True),
+    ("array[null, '{\"a\":1}'::json]", "*<", "array[null, '{\"a\":2}'::json]", True),
+    (
+        "row(1, '{\"a\":1}'::json, '<x/>'::xml)::cj",
+        "*<",
+        "row(1, '{\"a\":2}'::json, '<x/>'::xml)::cj",
+        True,
+    ),
+]
+
+
+@pytest.mark.backlog_fixed("RP-976")
+@pytest.mark.parametrize(("left", "op", "right", "want"), RECORD_IMAGE_TEXT_TYPES)
+def test_record_image_over_json_and_xml(
+    left: str, op: str, right: str, want: bool, dsn: str
+) -> None:
+    """json and xml fields, and arrays of them, were 0A000: each is the text
+    as it was written."""
+    query = f"select (select row({left})) {op} (select row({right}))"
+    assert answer(dsn, query) == [(want,)]
+
+
+# Measured on PostgreSQL 15.20: `range_serialize` writes a varlena bound
+# with a 1-byte header when its data fits in 126 bytes, else aligned with
+# its 4-byte header; a user range is aligned as its subtype.
+RECORD_IMAGE_USER_RANGES = [
+    ("'[1,2)'::fr", "*<", "'[1,3)'::fr", True),
+    ("'[-1,2)'::fr", "*<", "'[1,3)'::fr", False),
+    ("'(,2)'::fr", "*<", "'[1,3)'::fr", True),
+    ("'empty'::fr", "*<", "'[1,3)'::fr", False),
+    ("'[1,2]'::fr", "*<", "'[1,2)'::fr", False),
+    ("'{[1,2)}'::fr_multirange", "*<", "'{[1,3)}'::fr_multirange", True),
+    ("'{[1,2), [3,4)}'::fr_multirange", "*<", "'{[1,2)}'::fr_multirange", False),
+    ("'{}'::fr_multirange", "*<", "'{[1,2)}'::fr_multirange", True),
+    ("'[a,b)'::tr", "*<", "'[a,c)'::tr", True),
+    ("'[b,c)'::tr", "*<", "'[aa,c)'::tr", True),
+    ("('[a,' || repeat('b', 200) || ')')::tr", "*<", "'[a,c)'::tr", True),
+    ("'{[a,b), [c,d)}'::tr_multirange", "*<", "'{[a,b), [cc,d)}'::tr_multirange", True),
+    (
+        "('{[a,' || repeat('b', 200) || '), [x,y)}')::tr_multirange",
+        "*<",
+        "('{[a,' || repeat('b', 200) || '), [x,z)}')::tr_multirange",
+        True,
+    ),
+    (
+        "('{[a,' || repeat('b', 200) || '), [x,y)}')::tr_multirange",
+        "*<",
+        "'{[a,c)}'::tr_multirange",
+        False,
+    ),
+    ("'[1.0,2)'::nr", "*<", "'[1.00,2)'::nr", False),
+    ("'[1.0,2)'::nr", "*=", "'[1.0,2)'::nr", True),
+    ("'[1 day, 2 days)'::ir", "*<", "'[24 hours, 2 days)'::ir", True),
+    ("'[1 day, 2 days)'::ir", "*=", "'[1 day, 2 days)'::ir", True),
+    ("'[-1,2)'::i2r", "*<", "'[1,2)'::i2r", False),
+    ("'[1,256)'::i2r", "*<", "'[1,3)'::i2r", True),
+    ("'{[1,2),[5,256)}'::i2r_multirange", "*<", "'{[1,2),[5,6)}'::i2r_multirange", True),
+]
+
+
+@pytest.mark.backlog_fixed("RP-976")
+@pytest.mark.parametrize(("left", "op", "right", "want"), RECORD_IMAGE_USER_RANGES)
+def test_record_image_over_user_ranges(
+    left: str, op: str, right: str, want: bool, dsn: str
+) -> None:
+    """A user range or multirange field was 0A000: its image is the
+    `RangeType` / `MultirangeType` its subtype's bounds lay out."""
+    query = f"select (select row({left})) {op} (select row({right}))"
+    assert answer(dsn, query) == [(want,)]
+
+
+# Measured on PostgreSQL 15.20: an array of ranges, multiranges or
+# composites keeps each element's 4-byte header.
+RECORD_IMAGE_VARLENA_ARRAYS = [
+    ("array['[1,2)'::int4range]", "*<", "array['[1,3)'::int4range]", True),
+    ("array['[2,3)'::int4range]", "*<", "array['[1,3)'::int4range, 'empty']", True),
+    ("array['[1,2)'::int8range, null]", "*<", "array['[1,2)'::int8range]", False),
+    ("array['[1.0,2)'::numrange]", "*<", "array['[1.00,2)'::numrange]", False),
+    (
+        "array['{[1,2)}'::int4multirange]",
+        "*<",
+        "array['{[1,2),[3,4)}'::int4multirange]",
+        True,
+    ),
+    ("array[row(1, 'a')::ca]", "*<", "array[row(1, 'b')::ca]", True),
+    ("array[row(2, 'a')::ca]", "*<", "array[row(1, 'b')::ca, row(0, '')::ca]", True),
+    ("array[row(1, null)::ca]", "*<", "array[row(1, 'a')::ca]", True),
+    ("array[row(1, null)::ca, null]", "*<", "array[row(1, null)::ca]", False),
+    ("array['[1,2)'::fr]", "*<", "array['[1,3)'::fr]", True),
+    ("array['[1 day,2 days)'::ir]", "*<", "array['[1 day,3 days)'::ir]", True),
+    ("array['{[1,2)}'::fr_multirange]", "*<", "array['{[1,2),[3,4)}'::fr_multirange]", True),
+    ("array['[a,b)'::tr]", "*<", "array['[a,bb)'::tr]", True),
+]
+
+
+@pytest.mark.backlog_fixed("RP-976")
+@pytest.mark.parametrize(("left", "op", "right", "want"), RECORD_IMAGE_VARLENA_ARRAYS)
+def test_record_image_over_arrays_of_ranges_and_composites(
+    left: str, op: str, right: str, want: bool, dsn: str
+) -> None:
+    """An array of ranges, multiranges or composites was 0A000."""
+    query = f"select (select row({left})) {op} (select row({right}))"
+    assert answer(dsn, query) == [(want,)]
+
 
 # Measured on PostgreSQL 15.19: a composite field's image is its
 # `HeapTupleHeader` (typmod, type oid, ctid, infomask2, infomask, hoff,
@@ -592,3 +727,9 @@ def test_record_image_over_multiranges(
 @pytest.mark.parametrize("query", list(RECORD_IMAGE_STILL_REFUSED))
 def test_record_image_over_still_refused_field_types(query: str, dsn: str) -> None:
     assert answer(dsn, query) == RECORD_IMAGE_STILL_REFUSED[query]
+
+
+@pytest.mark.backlog("RP-976")
+@pytest.mark.parametrize("query", list(RECORD_IMAGE_DROPPED_ATTRIBUTE))
+def test_record_image_over_a_composite_with_a_dropped_attribute(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == RECORD_IMAGE_DROPPED_ATTRIBUTE[query]
