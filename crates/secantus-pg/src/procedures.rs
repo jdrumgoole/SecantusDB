@@ -304,6 +304,7 @@ impl PgHandler {
                             out_params: &out_names,
                             procedure: true,
                             nonatomic: true,
+                            catalog_row: self.catalog_row(doc),
                         },
                         &host,
                     )
@@ -525,6 +526,12 @@ impl PgHandler {
                 };
                 if role != self.session_user_name() && self.role(&role)?.is_none() {
                     return Err(error("42704", format!("role \"{role}\" does not exist")));
+                }
+                // The owner it has already: `AlterObjectOwner_internal`
+                // leaves the row as it is, so a compiled function stays
+                // cached and no xid is assigned (RP-1051).
+                if doc.get_str("owner") == Ok(role.as_str()) {
+                    return Ok(vec![Response::Execution(Tag::new(tag))]);
                 }
                 doc.insert("owner", role);
             }

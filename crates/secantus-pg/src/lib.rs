@@ -2398,12 +2398,25 @@ impl PgHandler {
 }
 
 impl plpgsql_fn::Host for PlHost<'_> {
-    fn compiled_label(&self, create_sql: &str, label: &dyn Fn() -> String) -> String {
+    fn compiled_label(
+        &self,
+        create_sql: &str,
+        row: Option<plpgsql_fn::CatalogRow>,
+        label: &dyn Fn() -> String,
+    ) -> String {
         let mut labels = self.h.pl_labels.lock().unwrap_or_else(|e| e.into_inner());
-        labels
-            .entry(create_sql.to_string())
-            .or_insert_with(label)
-            .clone()
+        // Cached by the routine's oid, and kept while its catalog row is the
+        // one the compile read (`plpgsql_compile`'s `fn_xmin` / `fn_tid`
+        // check); a routine with no stamped row by its CREATE text.
+        let key = row.map_or_else(|| create_sql.to_string(), |r| format!("oid:{}", r.oid));
+        match labels.get(&key) {
+            Some((stamp, label)) if *stamp == row => label.clone(),
+            _ => {
+                let fresh = label();
+                labels.insert(key, (row, fresh.clone()));
+                fresh
+            }
+        }
     }
     fn push_frame(&self, frame: String) {
         self.h.push_pl_frame(frame);
@@ -4846,9 +4859,10 @@ pub struct PgHandler {
     /// savepoint level of the transaction that made it while that is
     /// open (`myTempNamespaceSubID`), `Some(None)` once committed.
     temp_namespace: Mutex<Option<Option<usize>>>,
-    /// The CONTEXT label each PL/pgSQL function got at the session's first
-    /// compile of it, by its CREATE text (`plpgsql_compile`'s cache).
-    pl_labels: Mutex<HashMap<String, String>>,
+    /// The CONTEXT label each PL/pgSQL function got at the session's
+    /// compile of it, by its oid (or, unstamped, its CREATE text), with the
+    /// catalog row the compile read (`plpgsql_compile`'s cache).
+    pl_labels: Mutex<HashMap<String, (Option<plpgsql_fn::CatalogRow>, String)>>,
     /// The open block declared a `WITH HOLD` cursor: another thing
     /// PostgreSQL refuses to PREPARE.
     holdable_declared: AtomicBool,
@@ -13578,6 +13592,19 @@ impl PgHandler {
         names.into_iter().collect()
     }
 
+    /// A routine's identity for the session's compile cache: its oid and
+    /// the stamp its catalog row was written with (RP-1051). `None` for a
+    /// row written before rows were stamped.
+    pub(crate) fn catalog_row(&self, doc: &Document) -> Option<plpgsql_fn::CatalogRow> {
+        let xmin = doc.get("__sys_xmin").and_then(bson_i64)?;
+        let cmin = doc.get("__sys_cid").and_then(bson_i64)?;
+        let oid = doc
+            .get("oid")
+            .and_then(bson_i64)
+            .unwrap_or_else(|| self.function_oid(doc.get_str("_id").unwrap_or_default()));
+        Some(plpgsql_fn::CatalogRow { oid, xmin, cmin })
+    }
+
     /// A user function's oid: the one its CREATE drew (RP-137), else -- a
     /// function made before oids were drawn -- the one its key hashes to.
     pub(crate) fn function_oid(&self, key: &str) -> i64 {
@@ -15531,7 +15558,7 @@ impl PgHandler {
             if let Err(e) = self.check_sql_function_body(&def.name, &read_back, def.sql_standard) {
                 self.delete_type_doc(Self::FUNCTION_COLLECTION, &key)?;
                 if let Some(old) = replaced {
-                    self.insert_type_doc(Self::FUNCTION_COLLECTION, &key, old)?;
+                    self.reinsert_type_doc(Self::FUNCTION_COLLECTION, &key, old)?;
                 }
                 bump_catalog_version();
                 return Err(e);
@@ -16553,6 +16580,7 @@ impl PgHandler {
                         out_params: &u.columns.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
                         procedure: false,
                         nonatomic: false,
+                        catalog_row: self.catalog_row(doc),
                     },
                     &host,
                 )
@@ -19675,6 +19703,28 @@ impl PgHandler {
         &self,
         collection: &'static str,
         id: &str,
+        mut doc: Document,
+    ) -> PgWireResult<()> {
+        // A function's row carries the xid and command id that wrote it, as
+        // a `pg_proc` tuple its `xmin`: a compiled function is cached while
+        // that stamp holds (`plpgsql_compile`), so any rewrite of the row
+        // recompiles it (RP-1051). The write assigns the xid, as
+        // `ProcedureCreate`'s does.
+        if collection == Self::FUNCTION_COLLECTION {
+            let (xid, cid) = self.writer();
+            doc.insert("__sys_xmin", Bson::Int64((xid & 0xFFFF_FFFF) as i64));
+            doc.insert("__sys_cid", Bson::Int64(cid));
+        }
+        self.reinsert_type_doc(collection, id, doc)
+    }
+
+    /// Write a catalog doc with the stamp it carries: the row a failed
+    /// statement replaced, which PostgreSQL's abort leaves as it was, or a
+    /// function whose change PostgreSQL keeps outside its `pg_proc` row.
+    fn reinsert_type_doc(
+        &self,
+        collection: &'static str,
+        id: &str,
         doc: Document,
     ) -> PgWireResult<()> {
         let bytes =
@@ -20612,9 +20662,11 @@ impl PgHandler {
                 }
                 // Through the transaction's catalog overlay, which the
                 // function catalog is read through: `pg_description` is
-                // read under the transaction's snapshot (RP-518).
+                // read under the transaction's snapshot (RP-518). The
+                // comment is not in `pg_proc`, so the row keeps its stamp
+                // and a compiled function its label (RP-1051).
                 self.delete_type_doc(Self::FUNCTION_COLLECTION, &id)?;
-                self.insert_type_doc(Self::FUNCTION_COLLECTION, &id, doc)
+                self.reinsert_type_doc(Self::FUNCTION_COLLECTION, &id, doc)
             }
             "operator" | "access method" => {
                 let name = names.first().map_or("", String::as_str);

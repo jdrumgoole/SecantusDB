@@ -2911,20 +2911,20 @@ test is in `tests/backlog/test_rp_found_rp833.py`.
 Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
 test is in `tests/backlog/test_rp_found_rp833.py`.
 
-- [ ] **A function replaced by an identical CREATE keeps the label of its
-      old compile.** PostgreSQL revalidates a cached compiled function by
-      its `pg_proc` row's `xmin` and `ctid` (`plpgsql_compile`), so any
-      rewrite of the row -- an identical `CREATE OR REPLACE`, a DROP and
-      re-CREATE, an `ALTER FUNCTION ... OWNER TO`, from any session --
-      recompiles it and labels it afresh: on PostgreSQL 15.19 `s.f()` called
-      first off the path is `PL/pgSQL function s.f()`, and after another
-      session's identical `CREATE OR REPLACE` and `set search_path = s` it
-      is `f()`. `secantusd-pg` keys the session's label cache by the CREATE
-      text (RP-1034) and keeps `s.f()`. Faithful: stamp each function row
-      with the writing transaction's xid (`xids::writer`) and key the cache
-      by the function's oid and that stamp.
-      Verify: tests/backlog/test_rp_found_rp833.py::test_an_identical_replace_relabels_the_function
-      Backlog-ID: RP-1051
+
+## Found while working RP-1051 (2026-11-25)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
+test is in `tests/backlog/test_rp_found_rp833.py`.
+
+- [ ] **A function's CONTEXT label leaves a parameter type unqualified.**
+      `format_procedure` qualifies each parameter type that is not visible
+      on the search path, as it does the function's name: on PostgreSQL
+      15.19 `s1100.f(x s1100.ty)`, `s1100.ty` an enum, called off the path
+      is `PL/pgSQL function s1100.f(s1100.ty) line 1 at RAISE`;
+      `secantusd-pg` gives `s1100.f(ty)`. Found while working RP-1051.
+      Verify: tests/backlog/test_rp_found_rp833.py::test_a_label_qualifies_a_parameter_type_off_the_path
+      Backlog-ID: RP-1090
 
 ## Found while working RP-689 (2026-11-10)
 

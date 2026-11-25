@@ -485,6 +485,7 @@ impl PgHandler {
                         out_params: &[],
                         procedure: false,
                         nonatomic: false,
+                        catalog_row: self.catalog_row(&doc),
                     },
                     &PlHost { h: self },
                 )

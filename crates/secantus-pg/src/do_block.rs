@@ -122,6 +122,7 @@ impl PgHandler {
                         out_params: &[],
                         procedure: false,
                         nonatomic: true,
+                        catalog_row: None,
                     },
                     &crate::PlHost { h: self },
                 );
