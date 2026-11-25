@@ -1224,6 +1224,13 @@ pub trait Storage: Send + Sync {
         Ok(false)
     }
 
+    /// `reIndex`: drop every index but `_id` and build it again from its
+    /// options. Default no-op for test fakes; the WT adapter forwards to
+    /// `Storage::rebuild_secondary_indexes`.
+    fn rebuild_secondary_indexes(&self, _db: &str, _coll: &str) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     /// Group the `_id`s of docs sharing a key on index `name` (groups of >= 2).
     /// A non-empty result blocks a `collMod {index: {unique: true}}` conversion
     /// (code 359 + `violations`). Default empty; the WT adapter forwards to

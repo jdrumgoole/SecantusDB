@@ -1120,19 +1120,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       to run. Found 2026-11-13 working RM-325.
       Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_a_window_spill_the_engine_writes_out_is_mongods_size
       Backlog-ID: RM-611
-- [ ] **A `$group` `$median` / `$percentile` t-digest counts only its
-      buffer's memory, and spills every value.** The answer is mongod's
-      t-digest since RM-720's first slice (`secantus_core::tdigest`, a port of
-      8.2's `percentile_algo_tdigest`), but the digest is rebuilt at finalize
-      from every value kept: `group::tdigest_buffer` counts only the buffer,
-      not the centroids a flush leaves (`TDigest::memUsageBytes`), and
-      `group_spill::tdigest_state` writes every value as a weight-one
-      centroid, sorted, where mongod writes its merged centroids. A group that
-      spilled is then rebuilt from sorted values, which flush at other points
-      than mongod's arrival order, so its approximate answer can differ.
-      Found 2026-11-18 working RM-613; trimmed 2026-11-23.
-      Verify: none -- needs a spill-point / spilled-answer probe against mongod 8.2.11 to pin; the unspilled answer is pinned by tests/backlog/test_rm_found_2026_11_18_rm613.py
-      Backlog-ID: RM-720
 - [ ] **An upsert's field order sometimes repeats for all twelve
       upserts.** `tests/backlog/test_rm_057_084.py::test_upsert_field_order_from_several_equalities`
       (RM-059's regression test) failed in one RM-625 gate run on
@@ -2072,9 +2059,9 @@ mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
 - [ ] **RUST MongoDB server: a `$match` after a `$changeStream` on an
-      event field other than `operationType`, `documentKey` or
-      `fullDocument` is not rewritten into the oplog filter.** mongod 8.2.11
-      rewrites predicates on `ns`, `to`, `updateDescription`,
+      event field other than `operationType`, `documentKey`, `fullDocument`
+      or `ns` is not rewritten into the oplog filter.** mongod 8.2.11
+      rewrites predicates on `to`, a regex on `ns`, `updateDescription`,
       `fullDocumentBeforeChange`, the renamed `clusterTime` / `lsid` /
       `txnNumber` (also into the transaction filter), and an `$expr` over
       them, and adds them to the read's filter (`ns.coll: "c"`: `queryHash`
@@ -2082,8 +2069,13 @@ would see them. What is left:
       `operationType` rewrite, RM-698's first slice (2026-11-23)
       `documentKey` and `fullDocument` for `$eq` / `$in` / `$exists` /
       `$lt(e)` / `$gt(e)`; a `$regex`, `$type`, `$size`, ... on those
-      paths is still dropped, not renamed. The rest of
-      `change_stream_rewrite_helpers.cpp` (`matchRewriteGenericNamespace`,
+      paths is still dropped, not renamed. The second slice (2026-11-24)
+      ported `matchRewriteGenericNamespace` for `ns` by `$eq` / `$in`; a
+      regex on `ns.db` / `ns.coll` (mongod's `$expr` of `$regexMatch` over
+      `$substrBytes`, hash EE5C1E5A for `^c`) and `to` (the same helper over
+      `o.to` / `o.renameCollection`) are left. The rest of
+      `change_stream_rewrite_helpers.cpp` (the regex half of
+      `matchRewriteGenericNamespace`,
       `matchRewriteUpdateDescription`, `rewriteAggExpressionTree`) is to
       transcribe (found working RM-452).
       Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_a_match_on_another_event_field_joins_the_oplog_filter
@@ -2904,6 +2896,33 @@ Each was measured by starting mongod 8.2.11 on a store `secantusd-mdb`
 wrote and stopped (the forward direction of RM-723).
 
 
+## Found working RM-734 (index spec fidelity, 2026-11-24)
+
+- [ ] **`createIndexes` coerces a flag's type, accepts a `hidden` that is
+      no bool, and refuses `prepareUnique: true`.** Found closing RM-788
+      (2026-11-24, mongod 8.2.11). mongod's catalog keeps `sparse` and
+      `background` as given (`sparse: 1.0` stays a double, `background: 1`
+      an int, where `listIndexes` shows both as booleans), refuses a
+      `background` that is a string ("not convertible to bool", 2) and a
+      `hidden` that is not a bool ("The field 'hidden' must be a bool, but
+      got int"), and takes `prepareUnique: true` at creation, an index armed
+      as `collMod` arms one (`v, prepareUnique, key, name`). `secantusd-mdb`
+      writes every number as a bool (and drops a `sparse: 0.0`), keeps a
+      string `background`, takes `hidden: 1` and `hidden: "x"` as hidden
+      indexes, and refuses `prepareUnique: true` as an unknown field.
+      Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_create_indexes_keeps_a_flag_as_given_and_refuses_a_hidden_that_is_no_bool
+      Backlog-ID: RM-791
+- [ ] **A planner tie goes by build order, not by mongod's in-memory index
+      order.** Three single-field indexes cost the same for `{a: 3, b: 3,
+      c: 3}`: mongod 8.2.11 takes the first in the collection's in-memory
+      order, where an index a `collMod` changed has moved to the end (after
+      `collMod` of `a_1`, `b_1` wins and `a_1` is last of the rejected
+      plans; after `a_1` and `b_1`, `c_1`); `secantusd-mdb` picks `a_1`
+      each time. RM-734 keeps that in-memory order for `dropIndexes: "*"`
+      only. Found working RM-734 (not fixed with it).
+      Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_a_planner_tie_goes_by_the_in_memory_index_order
+      Backlog-ID: RM-790
+
 ## Found working RM-746 (storage-model phase 7b, 2026-11-22)
 
 Each was measured by running the same writes on mongod 8.2.11 and on
@@ -3040,14 +3059,6 @@ Each was measured against mongod 8.2.11 beside a hashed-index probe
       with WiredTiger's own text) is accepted here and stored.
       Verify: tests/backlog/test_rm_found_rm732.py::test_create_indexes_validates_its_options_as_mongod_does
       Backlog-ID: RM-771
-
-- [ ] **An `IndexKeySpecsConflict` quotes the requested spec's options in
-      the wrong place.** mongod 8.2.11 writes `{ v: 2, unique: true, key:
-      ..., name: ... }` and `{ v: 2, key: ..., name: ..., sparse: true }`
-      whatever order the client sent them in; this server writes every
-      option before `key`.
-      Verify: tests/backlog/test_rm_found_rm732.py::test_an_index_conflict_quotes_the_requested_spec_in_mongods_order
-      Backlog-ID: RM-772
 
 - [ ] **An equality to a DBRef is planned as a collection scan.**
       `{a: DBRef("c", 1)}` is an equality to the document `{$ref: "c", $id:

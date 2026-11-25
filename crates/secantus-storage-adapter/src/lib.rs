@@ -1439,6 +1439,15 @@ impl CmdStorage for StorageAdapter {
         Ok(changed)
     }
 
+    fn rebuild_secondary_indexes(&self, db: &str, coll: &str) -> Result<(), StorageError> {
+        let change = self.inner.catalog_change(&[(db, coll)]);
+        self.inner
+            .rebuild_secondary_indexes(db, coll)
+            .map_err(map_err)?;
+        change.committed();
+        Ok(())
+    }
+
     fn find_index_duplicates(
         &self,
         db: &str,

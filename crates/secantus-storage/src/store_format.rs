@@ -281,6 +281,7 @@ const SERVED_INDEX_OPTIONS: &[&str] = &[
     "unique",
     "prepareUnique",
     "sparse",
+    "background",
     "partialFilterExpression",
     "expireAfterSeconds",
     "collation",

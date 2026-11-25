@@ -66,6 +66,9 @@ fn true_rank(n: i64, p: f64) -> i64 {
 
 pub(crate) struct TDigest {
     buffer: Vec<f64>,
+    /// The capacity mongod's `_buffer` vector reaches: it doubles from one
+    /// as values arrive and keeps what it reached when a flush clears it.
+    buffer_cap: usize,
     centroids: Vec<Centroid>,
     n: i64,
     neg_inf: i64,
@@ -78,6 +81,7 @@ impl TDigest {
     pub(crate) fn new() -> Self {
         TDigest {
             buffer: Vec::new(),
+            buffer_cap: 0,
             centroids: Vec::new(),
             n: 0,
             neg_inf: 0,
@@ -102,9 +106,125 @@ impl TDigest {
             return;
         }
         self.buffer.push(input);
+        if self.buffer.len() > self.buffer_cap {
+            self.buffer_cap = (2 * self.buffer_cap).max(1);
+        }
         if self.buffer.len() >= MAX_BUFFER {
             self.flush_buffer();
         }
+    }
+
+    /// `TDigest::memUsageBytes` beyond `sizeof(TDigest)`: the buffer's
+    /// capacity in doubles and the centroids', which every merge shrinks to
+    /// their count (`shrink_to_fit`), at 16 bytes a centroid.
+    pub(crate) fn mem_bytes(&self) -> usize {
+        self.buffer_cap * std::mem::size_of::<f64>() + self.centroids.len() * 16
+    }
+
+    /// `TDigestDistributedClassic::serialize`: flush the buffer, then
+    /// `[negInfCount, posInfCount, min, max]` and each centroid's `weight,
+    /// mean` in mean order.
+    pub(crate) fn serialize(&mut self) -> Vec<f64> {
+        self.flush_buffer();
+        let mut out = vec![self.neg_inf as f64, self.pos_inf as f64, self.min, self.max];
+        for c in &self.centroids {
+            out.extend([c.weight, c.mean]);
+        }
+        out
+    }
+
+    /// `TDigestDistributedClassic::combine`: merge a [`TDigest::serialize`]d
+    /// digest into this one. None for a state mongod would refuse
+    /// (`tassert` 7492700 / 7492701).
+    pub(crate) fn combine(&mut self, state: &[f64]) -> Option<()> {
+        if !state.len().is_multiple_of(2) {
+            return None;
+        }
+        if state.is_empty() {
+            return Some(());
+        }
+        if state.len() < 4 {
+            return None;
+        }
+        // `coerceToLong`, then weights summed into `_n` as `int64_t`.
+        let mut other = TDigest::new();
+        other.neg_inf = state[0] as i64;
+        other.pos_inf = state[1] as i64;
+        other.min = state[2];
+        other.max = state[3];
+        for c in state[4..].chunks(2) {
+            other.n += c[0] as i64;
+            other.centroids.push(Centroid {
+                weight: c[0],
+                mean: c[1],
+            });
+        }
+        self.merge_digest(&other);
+        Some(())
+    }
+
+    /// `TDigest::merge(const TDigest&)`: the two centroid lists merged in
+    /// mean order and compacted by the scaling function in one pass. It
+    /// does not flush either buffer, as mongod's does not.
+    pub(crate) fn merge_digest(&mut self, other: &TDigest) {
+        self.n += other.n;
+        self.neg_inf += other.neg_inf;
+        self.pos_inf += other.pos_inf;
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        if other.centroids.is_empty() {
+            return;
+        }
+        let c1 = std::mem::take(&mut self.centroids);
+        let c2 = &other.centroids;
+        let n = self.n as f64;
+        let limit = |w: i64| n * k2_limit(w as f64 / n, DELTA);
+        let mut temp: Vec<Centroid> = Vec::with_capacity(c1.len() + c2.len());
+        let (mut i1, mut i2) = (0usize, 0usize);
+        let mut w: i64 = 0;
+        while i1 < c1.len() && i2 < c2.len() {
+            let mut cur = if c1[i1].mean > c2[i2].mean {
+                i2 += 1;
+                c2[i2 - 1]
+            } else {
+                i1 += 1;
+                c1[i1 - 1]
+            };
+            let q_limit = limit(w);
+            while i1 < c1.len() && i2 < c2.len() {
+                let next = if c2[i2].mean < c1[i1].mean {
+                    c2[i2]
+                } else {
+                    c1[i1]
+                };
+                if w as f64 + cur.weight + next.weight <= q_limit {
+                    cur.add(next);
+                    if c2[i2].mean < c1[i1].mean {
+                        i2 += 1;
+                    } else {
+                        i1 += 1;
+                    }
+                } else {
+                    break;
+                }
+            }
+            temp.push(cur);
+            w += cur.weight as i64;
+        }
+        let (tail, mut it): (&[Centroid], usize) = if i1 < c1.len() { (&c1, i1) } else { (c2, i2) };
+        while it < tail.len() {
+            let mut cur = tail[it];
+            it += 1;
+            let q_limit = limit(w);
+            while it < tail.len() && w as f64 + cur.weight + tail[it].weight <= q_limit {
+                cur.add(tail[it]);
+                it += 1;
+            }
+            temp.push(cur);
+            w += cur.weight as i64;
+        }
+        debug_assert_eq!(w, self.n, "a t-digest merge lost or duplicated inputs");
+        self.centroids = temp;
     }
 
     fn flush_buffer(&mut self) {

@@ -17124,11 +17124,13 @@ impl Storage {
                 }
                 let existing_opts = existing.get_document("options").ok();
                 for opt in CONFLICTING_OPTS {
-                    let in_new = options.contains_key(opt);
-                    let in_old = existing_opts.is_some_and(|o| o.contains_key(opt));
-                    if (in_new || in_old)
-                        && options.get(opt) != existing_opts.and_then(|o| o.get(opt))
-                    {
+                    // `sparse: false` is the same index as no `sparse`.
+                    let unset = |o: Option<&Document>| match o.and_then(|o| o.get(opt)) {
+                        Some(Bson::Boolean(false)) if *opt == "sparse" => None,
+                        other => other.cloned(),
+                    };
+                    let (new, old) = (unset(Some(options)), unset(existing_opts));
+                    if new != old {
                         return Err(StorageError::IndexOptionsConflict(format!(
                             "Index with name '{name}' already exists with different options"
                         )));
