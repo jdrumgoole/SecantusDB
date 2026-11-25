@@ -80,18 +80,28 @@ def test_a_sort_by_a_hashed_field_leaves_ties_as_mongods_sorter_does(
 
 
 def _wiredtiger_text(answer: tuple) -> tuple:
-    """A refusal quoting WiredTiger's own message, with what is the engine's
-    build and not the server's taken out: the time and thread, the source
-    function with its arguments and line, and the wording of the key it
-    names, which differs between the WiredTiger mongod 8.2 and this server
-    are built on."""
+    """A refusal quoting WiredTiger's own message, with only what is the
+    engine's BUILD and not mongod's behaviour taken out. Compared as they
+    are: the code (2), the spec echo, WiredTiger's `22: Invalid argument`,
+    that the text comes from `wiredtiger_config_validate` at error level,
+    and the key it rejects. Normalised:
+
+    - the time and the process and thread ids, which differ every run;
+    - the source function, its signature and its line: mongod's compiler
+      decides whether it is `int __config_check_search(WT_SESSION_IMPL *,
+      ...), 114` (clang, macOS) or `__config_check_search, 114` (gcc,
+      Linux), and this server's vendored WiredTiger (mongodb-7.0.33) names
+      it `config_check_search` at line 65;
+    - the colon after `configuration key`, which the two WiredTiger
+      versions word differently."""
     if answer[0] != "err" or "wiredtiger_config_validate" not in answer[2]:
         return answer
+    text = re.sub(r"\[\d+:\d+\]\[\d+:0x[0-9a-f]+\], ", "<time and thread>, ", answer[2])
     text = re.sub(
-        r"\[\d+:\d+\]\[\d+:0x[0-9a-f]+\], wiredtiger_config_validate: "
-        r"\[WT_VERB_DEFAULT\]\[ERROR\]: int \w+\(.*?\), \d+: ",
-        "<wiredtiger>: ",
-        answer[2],
+        r"(wiredtiger_config_validate: \[WT_VERB_DEFAULT\]\[ERROR\]: )"
+        r"(?:int )?\w+(?:\(.*?\))?, \d+: ",
+        r"\1<function, line>: ",
+        text,
     )
     return answer[0], answer[1], re.sub(r"configuration key:? ", "configuration key ", text)
 

@@ -106,8 +106,23 @@ def _mongod_answers(dbpath: Path) -> Iterator[None]:
         yield
     except pymongo.errors.PyMongoError as exc:
         logs = sorted(dbpath.parent.glob("mongod-*.log"))
-        tail = logs[-1].read_text(errors="replace")[-3000:] if logs else "(no log)"
-        raise AssertionError(f"mongod failed on the store: {exc}\n{tail}") from exc
+        text = logs[-1].read_text(errors="replace") if logs else "(no log)"
+        # A crash's backtrace is long and the end of it is thread-pool
+        # frames: the failure CI kept was only that end (RM-797). Keep the
+        # lines that say WHY (warnings, errors, fatal messages, everything
+        # before the first frame) as well as the end.
+        why = [
+            line[:600]
+            for line in text.splitlines()
+            if '"s":"F"' in line or '"s":"E"' in line or '"s":"W"' in line
+        ]
+        head = text.split('"msg":"Frame"')[0][-2500:]
+        raise AssertionError(
+            f"mongod failed on the store: {exc}\n--- warnings, errors and fatal lines:\n"
+            + "\n".join(why[:40])
+            + f"\n--- the log up to the first backtrace frame:\n{head}"
+            + f"\n--- its end:\n{text[-1500:]}"
+        ) from exc
 
 
 def _wait_primary(client: pymongo.MongoClient, port_host: str) -> None:

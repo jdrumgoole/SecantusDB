@@ -246,6 +246,30 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **mongod 8.2.12 crashes, intermittently on CI, opening a store
+      `secantusd-mdb` wrote and `reIndex`ed (2026-11-25).** RM-788's
+      `tests/backlog/test_rm_storage_model.py::test_mongod_opens_the_index_specs_secantus_wrote_and_reindexed`
+      read REGRESSED on PR #2979 (runs 45534098323 and 45542344001) and on
+      snapshot PR #2980 (run 45544205276): mongod died with a fatal
+      message on its `ReplCoord-0` thread (`ThreadPool::Impl::_doOneTask`
+      frames) during `replSetInitiate` / the first primary transition, so
+      pymongo saw `connection closed`. The same job passed on `main` runs
+      45528505272, 45569063349 and 45584567796, all on mongod 8.2.12
+      (Linux x86-64, from the `mongodb-org` apt repo). CI kept only the last
+      3000 characters of the log, which is thread-pool frames, so the
+      assertion that fired is NOT recorded. **Not reproduced locally**
+      (2026-11-25): 62 runs of the test and its steps on the macOS arm64
+      8.2.12 tarball (alone, three at a time, and with the last oplog write
+      in the same second as mongod's initiate) and 47 on the Linux arm64
+      8.2.12 tarball in a container held to 0.4 CPU, all green. The test's
+      failure message now keeps mongod's warning, error and fatal lines and
+      the log up to its first backtrace frame, so the next CI failure names
+      the assertion; read it, then fix what the store holds that it chokes
+      on (the suspects: an oplog entry or timestamp `reIndex` writes, the
+      catalog's `md.indexes`, `config.system.indexBuilds`).
+      Verify: none -- intermittent on CI; RM-788's regression test is the check
+      Backlog-ID: RM-797
+
 - [ ] **`test_a_contested_write_of_many_plans_as_mongod[query0-delete]`
       compares a timing-dependent order (2026-11-24).** On snapshot PR
       #2975 (run 45439792340, job `mdb-binary (live)`) it failed, then its
@@ -2924,7 +2948,10 @@ wrote and stopped (the forward direction of RM-723).
       configuration check, `secantus_wt::validate_config`) but a valid one is
       stored and ignored, which refusing would break for the drivers' own
       index tests that pass one.
-      Verify: none -- a decision about serving or refusing an option; no mongod answer to compare until it is made
+      **Decided (Joe, 2026-11-25): apply it**, as mongod does -- build the
+      index's table from the valid `configString`, and list it in `collStats`
+      as the index's `creationString`. Not built yet.
+      Verify: none -- a decision about serving or refusing an option; no mongod answer to compare until it is built
       Backlog-ID: RM-796
 
 ## Found working RM-746 (storage-model phase 7b, 2026-11-22)
