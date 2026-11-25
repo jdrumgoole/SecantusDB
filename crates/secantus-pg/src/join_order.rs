@@ -1300,13 +1300,40 @@ impl PgHandler {
                     }
                 }
             }
+            // The ORDER BY's key's table when its class is an outer join's
+            // clause's id: that id stands for two one-member classes, the
+            // ORDER BY key's and the other side's (`key_ec`).
+            let order_outer_t = order_class.and_then(|c| {
+                let i = c.checked_sub(2)?;
+                search.edge_outer.get(i).copied().flatten()?;
+                let (key, _) = search.order.as_ref()?;
+                search.aliases.iter().position(|a| a == alias_of(key))
+            });
+            let order_desc = search.order_desc;
             let useful = move |c: usize| {
-                // A class's ascending order under a descending ORDER BY on
-                // it is of use for merging only.
+                // An order of the ORDER BY's class that is not its pathkey
+                // (NULLS LAST under ASC NULLS FIRST, a backward scan's DESC
+                // NULLS FIRST under DESC NULLS LAST) is of use for merging
+                // only: `right_merge_direction` weighs the direction alone.
                 let flags =
                     secantus_pgplan::joincost::ASC_KEYS | secantus_pgplan::joincost::BACK_KEYS;
                 let asc = c != secantus_pgplan::joincost::USELESS_KEYS && c & flags != 0;
+                let ascending = asc && c & secantus_pgplan::joincost::ASC_KEYS != 0;
                 let c = if asc { c & !flags } else { c };
+                // An ascending order of a class the query's pathkeys read
+                // descending is the wrong direction for merging
+                // (`right_merge_direction` stops
+                // `pathkeys_useful_for_merging` at it) and of no use for the
+                // ORDER BY, so `build_join_pathkeys` truncates it. Under an
+                // outer join's id it is the ORDER BY key's class while this
+                // relation holds that key's table.
+                if ascending
+                    && order_desc
+                    && Some(c) == order_class
+                    && order_outer_t.is_none_or(|t| set & (1 << t) != 0)
+                {
+                    return false;
+                }
                 if (!asc && Some(c) == order_class) || outer_reads.contains(&c) {
                     true
                 } else if let Some(k) = class_index(c) {

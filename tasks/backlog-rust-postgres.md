@@ -865,15 +865,28 @@ one beside it.
     in the merge's ascending one (a Merge Right Join reads it presorted):
     `--desc --then m0.c` 809 of 810 (801), `--desc --then "m1.c desc,
     m0.b"` 2 differences (12), every two-table shape matching, no other
-    variant worse. What is left there is a five-table two-hub shape
-    (`multi5/300/idx1/two_hubs2/inner/ordlastlim5`), not diagnosed; the
-    `--desc-nulls-last` ones (7 and 21 differences) are four- and
-    five-table stars. Declined still: a later key a
+    variant worse. Since 2026-11-25 a join's ascending order of the
+    ORDER BY's class under a descending first key is of no use above it:
+    the wrong direction for merging (`right_merge_direction`) and not the
+    ORDER BY's, so `build_join_pathkeys` truncates it and a merge above
+    sorts that side again (the search had read it presorted, a plan
+    PostgreSQL never builds). On a private 15.20: `--desc` and
+    `--desc-nulls-last` 1,665 of 1,665 each, `--desc --then m0.c` and
+    `--then "m1.c desc, m0.b"` 810 of 810 (1 and 2 differences before),
+    `--desc-nulls-last --then m1.c` 810 of 810 (7), `--then "m0.c desc"`
+    793 (21), no shape worse. Those 17 left are four- and five-table
+    stars with a LEFT join (one inner), the same rule for a LATER key:
+    `right_merge_direction` reads every query pathkey, so an ascending
+    order of a later DESC key's class is the wrong direction too (checked
+    on `multi4/20/plain/star_cb/lastleft/ordlastlim5`: the t0/t1 merge on
+    t0.c read presorted under the Merge Right Join). The search's `later`
+    keys carry no direction (`four_table_join`, `ordered_limit_searched`).
+    Declined still: a later key a
     WHERE may fix to a constant; a table with an index of several columns;
     and a two-table join with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_five_table_two_hub_join_desc_with_another_key
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_four_table_star_left_join_desc_nulls_last_then_desc
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
