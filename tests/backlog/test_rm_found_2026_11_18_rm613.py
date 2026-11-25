@@ -13,7 +13,10 @@ import pytest
 def _medians(client: Any) -> list:
     client.drop_database("rm613digest")
     db = client.rm613digest
-    db.c.insert_many([{"n": (i * 7919) % 30011 * 0.37} for i in range(20_000)])
+    # Given `_id`s, not pymongo's ObjectIds: the `$sort` and `$limit` pick the
+    # digest's input in `_id` order, and an ObjectId counter that wraps
+    # inside the insert reorders it (test_rm_720_spilled_median.py).
+    db.c.insert_many([{"_id": i, "n": (i * 7919) % 30011 * 0.37} for i in range(20_000)])
     out = []
     for limit in (5999, 20_000):
         (row,) = db.c.aggregate(
