@@ -2048,7 +2048,7 @@ would see them. What is left:
 
 - [ ] **RUST MongoDB server: a `$match` after a `$changeStream` on an
       event field other than `operationType`, `documentKey`, `fullDocument`,
-      `ns` or `to`, or an `$expr` on one other than `operationType`, is not
+      `ns` or `to`, or an `$expr` on one of those others, is not
       rewritten into the oplog filter.** mongod 8.2.11
       rewrites `updateDescription`,
       `fullDocumentBeforeChange`, the renamed `clusterTime` / `lsid` /
@@ -2065,9 +2065,13 @@ would see them. What is left:
       over `$substrBytes`), the fifth (2026-11-25) a regex inside an `$in`
       on either, and the sixth (2026-11-25) an `$expr` on `operationType`
       (`rewriteAggExpressionTree` with `exprRewriteOperationType`, and the
-      `$_internalExprEq` the optimizer derives). An `$expr` on any other
-      field (`documentKey`, `ns`, `fullDocument`, ...) is still dropped,
-      and so is the `$_internalExprEq` on it. The rest of
+      `$_internalExprEq` the optimizer derives), and the seventh
+      (2026-11-25) an `$expr` on `documentKey`, `ns` or `to`
+      (`exprRewriteDocumentKey` / `Ns` / `To`) and the `$_internalExpr*`
+      twins on every rewritten field (`documentKey` and `fullDocument`
+      keep the twin's operator, the others rewrite it as the equality);
+      mongod drops an `$expr` on `fullDocument`, and so does this server.
+      The rest of
       `change_stream_rewrite_helpers.cpp` (`matchRewriteUpdateDescription`,
       the other event fields, their expression rewrites) is to transcribe
       (found working RM-452).

@@ -5,8 +5,9 @@ mongod 8.2.11 as a one-member replica set.
 RM-452 ported mongod's rewrite of `operationType`, RM-698's first slice
 those of `documentKey` and `fullDocument`, its second that of `ns` by
 `$eq` / `$in`, its third that of `to`, its fourth a regex on either,
-its fifth a regex in an `$in`, its sixth an `$expr` on `operationType`;
-the rewrites of the other event fields, and of `$expr` on them, are still
+its fifth a regex in an `$in`, its sixth an `$expr` on `operationType`,
+its seventh one on `documentKey`, `ns` or `to`; the rewrites of the other
+event fields, and of `$expr` on them, are still
 to come; the Boolean simplifier mongod runs
 over the unwind's filter came with RM-699 (2026-11-24).
 """
@@ -224,17 +225,60 @@ def test_an_expr_on_the_operation_type_joins_the_oplog_filter(
     assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)
 
 
-@pytest.mark.backlog("RM-698")
+@pytest.mark.backlog_fixed("RM-698")
 @pytest.mark.parametrize(
     "match",
     [
         {"$expr": {"$eq": ["$documentKey._id", 1]}},
+        {"$expr": {"$eq": ["$documentKey", {"_id": 1}]}},
+        {"$expr": {"$eq": ["$documentKey._id", None]}},
+        {"$expr": {"$eq": ["$documentKey._id.x", 1]}},
+        {"$expr": {"$eq": ["$documentKey._id", [1]]}},
+        {"$expr": {"$gt": ["$documentKey._id", 1]}},
+        {"$expr": {"$lte": ["$documentKey._id", 1]}},
+        {"$expr": {"$in": ["$documentKey._id", [1, 2]]}},
         {"$expr": {"$eq": ["$ns.coll", "c"]}},
+        {"$expr": {"$eq": ["$ns.db", "rm452"]}},
+        {"$expr": {"$eq": ["$ns", {"db": "x", "coll": "c"}]}},
+        {"$expr": {"$eq": ["$to.coll", "c"]}},
+        {"$expr": {"$eq": ["$to.db", "x"]}},
+        {"$expr": {"$eq": ["$to", {"db": "x", "coll": "c"}]}},
+        {"$expr": {"$eq": ["$fullDocument.a", 1]}},
+        {"$expr": {"$eq": ["$fullDocument", {"a": 1}]}},
+        {"$expr": {"$eq": ["$fullDocument.a", None]}},
+        {"$expr": {"$gt": ["$fullDocument.a", 1]}},
+        {"$expr": {"$eq": ["$ns.coll", None]}},
+        {"$expr": {"$eq": ["$ns.foo", 1]}},
+        {"$expr": {"$eq": ["$to.foo", 1]}},
         {
             "$expr": {
                 "$and": [{"$eq": ["$operationType", "insert"]}, {"$eq": ["$fullDocument.a", 1]}]
             }
         },
+        {
+            "$expr": {
+                "$or": [{"$eq": ["$operationType", "insert"]}, {"$eq": ["$fullDocument.a", 1]}]
+            }
+        },
+        {"$expr": {"$or": [{"$eq": ["$operationType", "insert"]}, {"$eq": ["$ns.coll", "c"]}]}},
+    ],
+)
+def test_an_expr_on_the_document_key_or_namespace_joins_the_oplog_filter(
+    rust_mongo: Any, mongod_rs: Any, match: dict
+) -> None:
+    """mongod 8.2.11 rewrites an `$expr` on `$documentKey` (a `$switch` of
+    `o` and `o2`), `$ns` (a `$let` of the database name) and `$to` (a
+    `$cond` over `o.to`), and the `$_internalExpr*` twins the optimizer
+    derives (as the equality, but on `documentKey` and `fullDocument`), and
+    drops an `$expr` on `fullDocument`; this server left all but
+    `operationType` out of the read (90A52575)."""
+    assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)
+
+
+@pytest.mark.backlog("RM-698")
+@pytest.mark.parametrize(
+    "match",
+    [
         {"updateDescription.updatedFields.a": 1},
         {"fullDocumentBeforeChange.a": 1},
         {"txnNumber": 1},
@@ -244,9 +288,8 @@ def test_a_match_on_another_event_field_joins_the_oplog_filter(
     rust_mongo: Any, mongod_rs: Any, match: dict
 ) -> None:
     """mongod 8.2.11 rewrites a `$match` on `updateDescription`,
-    `fullDocumentBeforeChange`, `clusterTime`, `lsid` or `txnNumber`, and an
-    `$expr` on `documentKey`, `ns` or `fullDocument`, into the oplog filter,
-    which changes the read's `queryHash` from 90A52575."""
+    `fullDocumentBeforeChange`, `clusterTime`, `lsid` or `txnNumber` into the
+    oplog filter, which changes the read's `queryHash` from 90A52575."""
     want = _query_hash(mongod_rs, match)
     assert want != "90A52575"
     assert _query_hash(rust_mongo, match) == want
