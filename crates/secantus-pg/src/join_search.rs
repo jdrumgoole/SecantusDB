@@ -1013,6 +1013,153 @@ impl PgHandler {
         Some((out, vec![first_cond, top_cond]))
     }
 
+    /// Each join's condition, post-order (`ExplainOptions::join_conds`),
+    /// of a chain drawn as written whose ONs' equalities make an
+    /// equivalence class of three or more columns (RP-1057, RP-1061).
+    /// `deconstruct_jointree` hands each ON's equality to
+    /// `process_equivalence` bottom-up, left side first, which adds its two
+    /// columns in the order written (`equi_reversed`), appends a column
+    /// new to a class to it, and merges two classes the first one's
+    /// members first. A join then evaluates the clause
+    /// `generate_join_implied_equalities_normal` derives from the class:
+    /// its first member on each side (both plain columns of one type, so
+    /// the first pair scores best), which `create_hashjoin_plan` prints
+    /// outer side first. A LEFT join an inner ON above reduced
+    /// (`reduce_outer_joins`) is inner here already. Inner joins only, each
+    /// ON one equality of two columns of one type and nothing else, no
+    /// WHERE equality or constant on a member (either joins the class to
+    /// more); `None` otherwise, and for a chain whose every class is one
+    /// ON's own (whose clause is its ON).
+    pub(crate) fn class_chain_conds(
+        &self,
+        sel: &secantus_pgplan::Select,
+        written: &[String],
+    ) -> Option<Vec<String>> {
+        use secantus_pgplan::Statement;
+        let sub = sel.sub.as_ref()?;
+        let Statement::JoinRows(j) = sub.plan.as_ref() else {
+            return None;
+        };
+        if sel.join.is_some()
+            || ((!sel.filter.is_empty() || sel.residual.is_some()) && !j.where_modelled)
+            || j.where_spans_equality
+            || !j.where_filters.is_empty()
+            || !j.where_span_aliases.is_empty()
+            || !j.where_equalities.is_empty()
+        {
+            return None;
+        }
+        // Each join's (left aliases, right aliases, its ON's equality as
+        // written), post-order; every leaf's aliases and key types.
+        struct Walk {
+            joins: Vec<(Vec<String>, Vec<String>, [String; 2])>,
+            types: Vec<(String, String)>,
+        }
+        fn walk(n: &JoinNode, out: &mut Walk) -> Option<Vec<String>> {
+            match n {
+                JoinNode::Leaf { def, columns, .. } => {
+                    let (_, filter) = plain_leaf_table(n)?;
+                    let alias = alias_of(&columns.first()?.0).to_string();
+                    for (key, field) in columns {
+                        // A constant on a column joins its class to it.
+                        if filter_fixes(&filter, field) {
+                            return None;
+                        }
+                        let ty = def.columns.iter().find(|c| c.field() == *field)?;
+                        out.types.push((key.clone(), ty.pg_type.clone()));
+                    }
+                    Some(vec![alias])
+                }
+                JoinNode::Join {
+                    kind: JoinKind::Inner,
+                    left,
+                    right,
+                    on: Some(_),
+                    on_other: false,
+                    on_filters,
+                    equi,
+                    equi_reversed,
+                    merged,
+                    expr_keys,
+                    ec: None,
+                    ..
+                } if on_filters.is_empty() && merged.is_empty() && expr_keys.is_empty() => {
+                    let [(l, r)] = equi.as_slice() else {
+                        return None;
+                    };
+                    let la = walk(left, out)?;
+                    let ra = walk(right, out)?;
+                    let pair = if equi_reversed.first().copied().unwrap_or(false) {
+                        [r.clone(), l.clone()]
+                    } else {
+                        [l.clone(), r.clone()]
+                    };
+                    let mut all = la.clone();
+                    all.extend(ra.iter().cloned());
+                    out.joins.push((la, ra, pair));
+                    Some(all)
+                }
+                _ => None,
+            }
+        }
+        let mut w = Walk {
+            joins: Vec::new(),
+            types: Vec::new(),
+        };
+        walk(&j.tree, &mut w)?;
+        if w.joins.len() < 2 || w.joins.len() != written.len() {
+            return None;
+        }
+        let type_of = |key: &str| w.types.iter().find(|(k, _)| k == key).map(|(_, t)| t);
+        // `process_equivalence`, clause by clause.
+        let mut classes: Vec<Vec<String>> = Vec::new();
+        for (_, _, [a, b]) in &w.joins {
+            if type_of(a)? != type_of(b)? {
+                return None;
+            }
+            let ia = classes.iter().position(|c| c.contains(a));
+            let ib = classes.iter().position(|c| c.contains(b));
+            match (ia, ib) {
+                (Some(x), Some(y)) if x == y => {}
+                (Some(x), Some(y)) => {
+                    let moved = classes[y].clone();
+                    classes[x].extend(moved);
+                    classes.remove(y);
+                }
+                (Some(x), None) => classes[x].push(b.clone()),
+                (None, Some(y)) => classes[y].push(a.clone()),
+                (None, None) => classes.push(vec![a.clone(), b.clone()]),
+            }
+        }
+        if classes.iter().all(|c| c.len() < 3) {
+            return None;
+        }
+        let text = |key: &str| -> Option<String> {
+            Some(format!(
+                "{}.{}",
+                secantus_pgplan::scalar::quote_identifier(alias_of(key)),
+                secantus_pgplan::scalar::quote_identifier(column_of(key)?)
+            ))
+        };
+        let mut conds = Vec::new();
+        for (la, ra, [a, _]) in &w.joins {
+            let class = classes.iter().find(|c| c.contains(a))?;
+            // Another class over both sides would add a second clause,
+            // whose order is not modelled.
+            let spans = |c: &Vec<String>| {
+                c.iter().any(|m| la.iter().any(|t| t == alias_of(m)))
+                    && c.iter().any(|m| ra.iter().any(|t| t == alias_of(m)))
+            };
+            if classes.iter().filter(|c| spans(c)).count() != 1 {
+                return None;
+            }
+            let first =
+                |side: &[String]| class.iter().find(|m| side.iter().any(|t| t == alias_of(m)));
+            conds.push(format!("({} = {})", text(first(la)?)?, text(first(ra)?)?));
+        }
+        Some(conds)
+    }
+
     /// `node`'s rows in the plan `three_table_plan` picks, or `None` when it
     /// picks none (or the plan's order cannot be reproduced).
     pub(crate) fn three_table_join(

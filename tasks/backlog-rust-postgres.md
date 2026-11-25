@@ -1866,8 +1866,8 @@ a regression test.
       join in a chain, a RIGHT join in one (RP-1063 first), a FULL JOIN
       below an inner join (its plain plan differs too), a WHERE over a FULL JOIN (`... full join e e2
       on e2.a = k.a where e.b <> 'x'` is reduced to a `Hash Left Join` on
-      PostgreSQL 15.19, `reduce_outer_joins`, whose plain plan matches here), a LEFT JOIN an inner ON above reduces to an inner one (RP-1061
-      first), a WHERE on a LEFT JOIN's nullable side (its plain plan differs
+      PostgreSQL 15.19, `reduce_outer_joins`, whose plain plan matches here), a LEFT JOIN an inner ON above reduces to an inner one (its plain
+      plan matches since 2026-11-25), a WHERE on a LEFT JOIN's nullable side (its plain plan differs
       too: `... left join e e2 on e2.a = k.a where e2.b <> 'x'` is reduced
       and reordered on PostgreSQL 15.19, `where e2.b is null` a `Hash Right
       Join` of `e2` and `k` under a Hash), and a WHERE conjunct
@@ -2027,17 +2027,6 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sort above a hash aggregate prints its key]
       Backlog-ID: RP-1108
 
-- [ ] **A LEFT JOIN reduced to inner keeps its ON out of the
-      equivalence class.** `explain (costs off) select e.b, k.b from e
-      left join k on e.a = k.a join e e2 on e2.a = k.a` prints the top
-      `Hash Cond: (k.a = e2.a)`; PostgreSQL 15.19, which reduces the LEFT
-      JOIN to an inner one (`reduce_outer_joins`) before
-      `deconstruct_jointree`, merges `e.a = k.a` into the class with
-      `e2.a` and prints `Hash Cond: (e.a = e2.a)` (and no `Inner Unique`
-      on that join under VERBOSE). Found while working RP-966.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join reduced to inner joins the chain on its class]
-      Backlog-ID: RP-1061
-
 - [ ] **An outer join's multi-column Hash Cond prints the nullable
       side's column first.** `explain (costs off) select e.b, e2.b from e
       full join e e2 on e2.a = e.a and e2.b = e.b` (a `Hash Left Join`
@@ -2107,16 +2096,6 @@ a regression test.
       where it declines before sizing. Found while working RP-966.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by under a limit over a join is a merge join], tests/backlog/test_rp_explain_costs.py::test_plan[an order by under a limit over an inequality join reads the index]
       Backlog-ID: RP-1099
-
-- [ ] **A join's Hash Cond names a different member of the equivalence
-      class than PostgreSQL's.** `explain (costs off) select k.b, e2.b
-      from e join k on e.a = k.a join e e2 on e2.a = k.a` (`e`, `k`
-      analysed, 1000 rows) prints the upper join's `Hash Cond: (k.a =
-      e2.a)`; PostgreSQL 15.19 prints `(e.a = e2.a)` over the same plan
-      shape, the clause `generate_join_implied_equalities` builds from the
-      class's members in their order. Found while working RP-966.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a three-way hash join names the class's first member]
-      Backlog-ID: RP-1057
 
 
 - [ ] **EXPLAIN ANALYZE's scan counters PostgreSQL prints that are still

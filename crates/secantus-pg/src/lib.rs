@@ -46895,6 +46895,15 @@ impl PgHandler {
                         }
                     }
                 }
+                // A chain drawn as written, its joins' conditions derived
+                // from the equivalence class its ONs make (RP-1057,
+                // RP-1061); hash joins only, checked on the tree below.
+                let class_conds = match (&reordered, &chain_conds, inner.as_ref()) {
+                    (None, None, Statement::Select(sel)) => {
+                        self.class_chain_conds(sel, &options.join_conds)
+                    }
+                    _ => None,
+                };
                 let mut tree = explain::plan_tree(reordered.as_ref().unwrap_or(&inner), &chooser);
                 // A removed join's relation stays in the range table
                 // (RP-1060): the group keys print qualified.
@@ -46908,6 +46917,9 @@ impl PgHandler {
                             explain::qualify_group_keys(&mut tree, &alias);
                         }
                     }
+                }
+                if class_conds.is_some() && explain::joins_all_hash(&tree) {
+                    chain_conds = class_conds;
                 }
                 // Each join's `Inner Unique` (RP-353): a unique index of
                 // the inner table that is immediate, has no WHERE and keys

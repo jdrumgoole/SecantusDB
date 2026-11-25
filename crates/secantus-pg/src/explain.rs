@@ -445,6 +445,21 @@ fn query_is_distinct_for(plan: &Statement, fixed: &[bool]) -> Option<bool> {
     }
 }
 
+/// Whether the tree joins, and every join in it is a hash join.
+pub(crate) fn joins_all_hash(n: &PlanNode) -> bool {
+    fn walk(n: &PlanNode, joins: &mut usize) -> bool {
+        if n.name.ends_with("Join") || n.name.starts_with("Nested Loop") {
+            if !n.name.starts_with("Hash") {
+                return false;
+            }
+            *joins += 1;
+        }
+        n.children.iter().all(|c| walk(c, joins))
+    }
+    let mut joins = 0;
+    walk(n, &mut joins) && joins > 0
+}
+
 /// Whether any join in the tree waits on [`resolve_inner_unique`].
 pub(crate) fn has_unique_probe(n: &PlanNode) -> bool {
     n.unique_probe.is_some() || n.children.iter().any(has_unique_probe)
