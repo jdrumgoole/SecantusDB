@@ -2076,9 +2076,9 @@ mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
 - [ ] **RUST MongoDB server: a `$match` after a `$changeStream` on an
-      event field other than `operationType`, `documentKey`, `fullDocument`
-      or `ns` is not rewritten into the oplog filter.** mongod 8.2.11
-      rewrites predicates on `to`, a regex on `ns`, `updateDescription`,
+      event field other than `operationType`, `documentKey`, `fullDocument`,
+      `ns` or `to` is not rewritten into the oplog filter.** mongod 8.2.11
+      rewrites a regex on `ns` or `to`, `updateDescription`,
       `fullDocumentBeforeChange`, the renamed `clusterTime` / `lsid` /
       `txnNumber` (also into the transaction filter), and an `$expr` over
       them, and adds them to the read's filter (`ns.coll: "c"`: `queryHash`
@@ -2089,8 +2089,9 @@ would see them. What is left:
       paths is still dropped, not renamed. The second slice (2026-11-24)
       ported `matchRewriteGenericNamespace` for `ns` by `$eq` / `$in`; a
       regex on `ns.db` / `ns.coll` (mongod's `$expr` of `$regexMatch` over
-      `$substrBytes`, hash EE5C1E5A for `^c`) and `to` (the same helper over
-      `o.to` / `o.renameCollection`) are left. The rest of
+      `$substrBytes`, hash EE5C1E5A for `^c`) is left. The third slice
+      (2026-11-25) ported it for `to` by `$eq` / `$in` (`o.to` of a
+      command); a regex on `to` is left the same way. The rest of
       `change_stream_rewrite_helpers.cpp` (the regex half of
       `matchRewriteGenericNamespace`,
       `matchRewriteUpdateDescription`, `rewriteAggExpressionTree`) is to
