@@ -2846,16 +2846,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster; the
 views read only `pg_class`.
 
-- [ ] **`pg_get_viewdef` prints an IN list holding a column as `= ANY
-      (ARRAY[...])`.** `create view v as select c.relnatts in (1,
-      c.relam::int) from pg_class c` prints `((c.relnatts = 1) OR
-      (c.relnatts = (c.relam)::integer))` on PostgreSQL 15.19:
-      `transformAExprIn` builds a ScalarArrayOpExpr only of the list's
-      Var-free elements, and only when there are two or more, and ORs an
-      `=` for each of the rest. Here `(c.relnatts = ANY (ARRAY[1,
-      (c.relam)::integer]))`.
-      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_an_in_list_holding_a_column
-      Backlog-ID: RP-1047
 
 ## Found while working RP-1046 (2026-11-25)
 

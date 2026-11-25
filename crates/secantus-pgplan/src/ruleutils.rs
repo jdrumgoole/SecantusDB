@@ -25,6 +25,24 @@ thread_local! {
     /// their InitPlan order: each prints as `$n` (RP-440).
     static INIT_PLANS: std::cell::RefCell<Vec<pg_query::protobuf::SubLink>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The query levels being probed for a Var of their own, each with
+    /// whether a column reference has resolved to it yet: what
+    /// `contain_vars_of_level(rexpr, 0)` asks of an IN list's member
+    /// (RP-1047). A stack, as a member's sublink can hold an IN list too.
+    static VAR_PROBES: std::cell::RefCell<Vec<(usize, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A column reference resolved to query level `scope`: mark every probe of
+/// that level.
+fn note_var_level(scope: usize) {
+    VAR_PROBES.with(|p| {
+        for (level, hit) in p.borrow_mut().iter_mut() {
+            if *level == scope {
+                *hit = true;
+            }
+        }
+    });
 }
 
 /// Run `f` with `plans` printing as their InitPlans' parameters.
@@ -214,6 +232,42 @@ struct Printer<'a> {
     /// EXPLAIN's deparse context carries no window clauses, so a window
     /// call prints its window as `(?)` (`get_windowfunc_expr`).
     explain_windows: bool,
+}
+
+/// An IN list as `transformAExprIn` builds it (RP-1047).
+struct InShape {
+    /// The ScalarArrayOpExpr's members and their common type.
+    array: Option<(Vec<Node>, String)>,
+    /// The members compared one at a time, after the array.
+    rest: Vec<Node>,
+}
+
+impl InShape {
+    /// The comparisons the BoolExpr chain joins.
+    fn terms(&self) -> usize {
+        self.rest.len() + usize::from(self.array.is_some())
+    }
+}
+
+/// One member's comparison of an IN list: `l = x` (`l <> x` for NOT IN),
+/// resolved as `make_op` resolves a written one.
+fn in_term(e: &pg_query::protobuf::AExpr, x: Node) -> Node {
+    let mut op = e.clone();
+    op.kind = AExprKind::AexprOp as i32;
+    op.rexpr = Some(Box::new(x));
+    Node {
+        node: Some(N::AExpr(Box::new(op))),
+    }
+}
+
+/// The BoolExpr an IN list's comparisons are joined by: OR, or for NOT IN
+/// (`<>`) AND.
+fn in_chain_type(e: &pg_query::protobuf::AExpr) -> BoolExprType {
+    if crate::operator_name(e).is_ok_and(|op| op == "=") {
+        BoolExprType::OrExpr
+    } else {
+        BoolExprType::AndExpr
+    }
 }
 
 /// What a sub-expression is printed inside, for `isSimpleNode`.
@@ -554,17 +608,24 @@ impl<'a> Printer<'a> {
             return None;
         }
         let rel = sval(rel)?;
-        self.scopes.iter().rev().find_map(|scope| {
-            scope
-                .iter()
-                .find(|r| {
-                    r.kind == RteKind::Relation
-                        && r.hidden_by.is_none()
-                        && !r.name.is_empty()
-                        && r.name == rel
-                })
-                .map(|r| (r.refname.clone(), r.name.clone()))
-        })
+        self.scopes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(si, scope)| {
+                scope
+                    .iter()
+                    .find(|r| {
+                        r.kind == RteKind::Relation
+                            && r.hidden_by.is_none()
+                            && !r.name.is_empty()
+                            && r.name == rel
+                    })
+                    .map(|r| {
+                        note_var_level(si);
+                        (r.refname.clone(), r.name.clone())
+                    })
+            })
     }
 
     fn resolve(&self, fields: &[String]) -> Option<(String, String, String)> {
@@ -574,6 +635,12 @@ impl<'a> Printer<'a> {
 
     /// The entry a column reference names: `(scope, entry, column)`.
     fn lookup(&self, fields: &[String]) -> Option<(usize, usize, usize)> {
+        let found = self.lookup_entry(fields)?;
+        note_var_level(found.0);
+        Some(found)
+    }
+
+    fn lookup_entry(&self, fields: &[String]) -> Option<(usize, usize, usize)> {
         if let [mark, scope, rte, col] = fields {
             if mark == VAR_MARK {
                 return Some((scope.parse().ok()?, rte.parse().ok()?, col.parse().ok()?));
@@ -1206,7 +1273,7 @@ impl<'a> Printer<'a> {
     }
 
     /// ruleutils' `isSimpleNode`: can `n` go inside `parent` unparenthesised?
-    fn simple(&self, n: &Node, parent: Parent<'_>) -> bool {
+    fn simple(&mut self, n: &Node, parent: Parent<'_>) -> bool {
         // The parents under which an operator-like node needs none.
         let group = |parent: Parent<'_>| matches!(parent, Parent::Bool(_));
         match n.node.as_ref() {
@@ -1239,6 +1306,23 @@ impl<'a> Printer<'a> {
             {
                 false
             }
+            // A row `=` (`<>`) of several fields is an AND (OR) of the
+            // pairs (`make_row_comparison_op`).
+            Some(N::AExpr(e))
+                if matches!(
+                    (
+                        e.lexpr.as_deref().and_then(|x| x.node.as_ref()),
+                        e.rexpr.as_deref().and_then(|x| x.node.as_ref())
+                    ),
+                    (Some(N::RowExpr(l)), Some(N::RowExpr(_))) if l.args.len() > 1
+                ) && e.kind == AExprKind::AexprOp as i32 =>
+            {
+                match crate::operator_name(e).unwrap_or("") {
+                    "=" => bool_simple(BoolExprType::AndExpr, parent),
+                    "<>" | "!=" => bool_simple(BoolExprType::OrExpr, parent),
+                    _ => false,
+                }
+            }
             Some(N::AExpr(e)) => match AExprKind::try_from(e.kind) {
                 Ok(AExprKind::AexprNullif) => true,
                 Ok(AExprKind::AexprOp | AExprKind::AexprLike | AExprKind::AexprIlike) => {
@@ -1257,13 +1341,20 @@ impl<'a> Printer<'a> {
                     group(parent)
                 }
                 Ok(AExprKind::AexprDistinct) => group(parent),
-                // A one-element IN is the plain operator.
-                Ok(AExprKind::AexprIn)
-                    if matches!(e.rexpr.as_deref().and_then(|r| r.node.as_ref()),
-                        Some(N::List(l)) if l.items.len() == 1) =>
-                {
-                    group(parent)
-                }
+                // An IN list is what `transformAExprIn` made of it: a
+                // BoolExpr of several comparisons, a lone ScalarArrayOpExpr
+                // (simple under nothing), or one plain operator.
+                Ok(AExprKind::AexprIn) => match self.in_shape(e) {
+                    Some(shape) if shape.terms() > 1 => bool_simple(in_chain_type(e), parent),
+                    Some(InShape { array: None, rest }) => match rest.as_slice() {
+                        [only] => {
+                            let term = in_term(e, only.clone());
+                            self.simple(&term, parent)
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                },
                 Ok(AExprKind::AexprNotDistinct) => bool_simple(BoolExprType::NotExpr, parent),
                 Ok(AExprKind::AexprSimilar) => group(parent),
                 Ok(AExprKind::AexprBetweenSym) => bool_simple(BoolExprType::OrExpr, parent),
@@ -1520,6 +1611,32 @@ impl<'a> Printer<'a> {
                 // The analyser flattens nested ANDs (and ORs).
                 let mut flat = Vec::new();
                 flatten_bool(b, op, &mut flat);
+                // The planner flattens an IN list's chain of the same kind
+                // into it too (`simplify_or_arguments` / `_and_`).
+                let flat: Vec<std::borrow::Cow<'_, Node>> = if self.fold_consts {
+                    let mut out = Vec::with_capacity(flat.len());
+                    for a in flat {
+                        match a.node.as_ref() {
+                            Some(N::AExpr(e))
+                                if e.kind == AExprKind::AexprIn as i32
+                                    && in_chain_type(e) == op =>
+                            {
+                                match self.in_shape(e) {
+                                    Some(shape) if shape.terms() > 1 => out.extend(
+                                        self.in_terms(e, shape)
+                                            .into_iter()
+                                            .map(std::borrow::Cow::Owned),
+                                    ),
+                                    _ => out.push(std::borrow::Cow::Borrowed(a)),
+                                }
+                            }
+                            _ => out.push(std::borrow::Cow::Borrowed(a)),
+                        }
+                    }
+                    out
+                } else {
+                    flat.into_iter().map(std::borrow::Cow::Borrowed).collect()
+                };
                 if open {
                     self.buf.push('(');
                 }
@@ -1753,77 +1870,44 @@ impl<'a> Printer<'a> {
             }
             AExprKind::AexprIn => {
                 let op = crate::operator_name(e).ok()?.to_string();
-                let l = e.lexpr.as_deref()?;
-                let Some(N::List(list)) = e.rexpr.as_deref().and_then(|r| r.node.as_ref()) else {
-                    return None;
-                };
-                let lt = self.typ(l)?;
-                // One element: the plain operator (`transformAExprIn`).
-                if let [only] = list.items.as_slice() {
-                    let (lw, rw) = Self::compare_coercion(&lt, &self.typ(only)?)?;
-                    let word = if op == "=" { "=" } else { "<>" };
-                    return self.binary(l, &lw, word, only, &rw);
+                let shape = self.in_shape(e)?;
+                if shape.terms() == 1 {
+                    if let Some((items, common)) = &shape.array {
+                        return self.in_array(e.lexpr.as_deref()?, &op, items, common);
+                    }
+                    return self.expr(&in_term(e, shape.rest.first()?.clone()));
                 }
-                let mut all = vec![l.clone()];
-                all.extend(list.items.iter().cloned());
-                let common = self.common_type(&all)?;
-                // The integer comparison operators take mixed widths
-                // (`int24eq`): an integer left side keeps its own type.
-                let lw = if lt == common || (is_int(&lt) && is_int(&common)) {
-                    String::new()
+                // `makeBoolExpr` of two at a time, left to right: each OR
+                // (AND) a BoolExpr of its own, parenthesised unless pretty,
+                // where none needs it under another of its kind. The
+                // planned expression EXPLAIN prints has them flattened to
+                // one (`simplify_or_arguments` / `_and_`).
+                let chain = in_chain_type(e);
+                let word = if chain == BoolExprType::OrExpr {
+                    " OR "
                 } else {
-                    common.clone()
+                    " AND "
                 };
-                let (word, quant) = if op == "=" {
-                    ("=", "ANY")
-                } else {
-                    ("<>", "ALL")
-                };
-                // varchar has no `=` of its own: the operator is text's, so
-                // the column and the whole array are cast to text. `name`
-                // has `nameeq` / `namene` and keeps its type.
-                let via_text = common == "varchar";
-                let lw = if via_text { "text".to_string() } else { lw };
+                let terms = self.in_terms(e, shape);
                 let open = !self.pretty;
-                if open {
+                let opens = match (open, self.fold_consts) {
+                    (false, _) => 0,
+                    (true, true) => 1,
+                    (true, false) => terms.len() - 1,
+                };
+                for _ in 0..opens {
                     self.buf.push('(');
                 }
-                self.child(l, &lw, Parent::Other)?;
-                self.buf.push_str(&format!(" {word} {quant} ("));
-                // `eval_const_expressions` folds an ARRAY of constants (and
-                // varchar's coercion of it to text[]) to one array constant,
-                // printed as its `array_out` text (RP-348).
-                if self.fold_consts {
-                    let elem = if via_text { "text" } else { common.as_str() };
-                    if let Some(lit) = folded_array_literal(&list.items, elem) {
-                        self.buf.push_str(&lit);
-                        self.buf.push_str(&format!("::{}[]", display_type(elem)));
-                        self.buf.push(')');
-                        if open {
-                            self.buf.push(')');
-                        }
-                        return Some(());
-                    }
-                }
-                if via_text && open {
-                    self.buf.push('(');
-                }
-                self.buf.push_str("ARRAY[");
-                for (i, x) in list.items.iter().enumerate() {
+                for (i, t) in terms.iter().enumerate() {
                     if i > 0 {
-                        self.buf.push_str(", ");
+                        self.buf.push_str(word);
                     }
-                    self.expr_as(x, &common)?;
-                }
-                self.buf.push(']');
-                if via_text {
-                    if open {
+                    self.child(t, "", Parent::Bool(chain))?;
+                    if i > 0 && open && !self.fold_consts {
                         self.buf.push(')');
                     }
-                    self.buf.push_str("::text[]");
                 }
-                self.buf.push(')');
-                if open {
+                if open && self.fold_consts {
                     self.buf.push(')');
                 }
             }
@@ -1982,6 +2066,174 @@ impl<'a> Printer<'a> {
     /// `ROW(a, b) op ROW(c, d)`: `=` is the AND of the pairs' equalities,
     /// `<>` the OR of their inequalities (the parser expands both), and an
     /// ordering operator stays a row comparison.
+    /// `transformAExprIn`'s reading of `l IN (...)` (RP-1047): the members
+    /// holding no Var of this query, when there are more than one and their
+    /// common type with `l` has an array type (not a row, a record or an
+    /// array), become one ScalarArrayOpExpr over that type; every other
+    /// member, in the list's order, is a comparison of its own, ORed (for
+    /// NOT IN, ANDed) after it.
+    fn in_shape(&mut self, e: &pg_query::protobuf::AExpr) -> Option<InShape> {
+        let l = e.lexpr.as_deref()?;
+        let Some(N::List(list)) = e.rexpr.as_deref().and_then(|r| r.node.as_ref()) else {
+            return None;
+        };
+        let mut has_var = Vec::with_capacity(list.items.len());
+        for x in &list.items {
+            has_var.push(self.has_own_var(x)?);
+        }
+        let nonvars: Vec<Node> = list
+            .items
+            .iter()
+            .zip(&has_var)
+            .filter(|(_, v)| !**v)
+            .map(|(x, _)| x.clone())
+            .collect();
+        if nonvars.len() > 1 && !matches!(l.node.as_ref(), Some(N::RowExpr(_))) {
+            let mut all = vec![l.clone()];
+            all.extend(nonvars.iter().cloned());
+            let common = self.common_type(&all)?;
+            if !is_array(&common) && common != "record" {
+                let rest = list
+                    .items
+                    .iter()
+                    .zip(&has_var)
+                    .filter(|(_, v)| **v)
+                    .map(|(x, _)| x.clone())
+                    .collect();
+                return Some(InShape {
+                    array: Some((nonvars, common)),
+                    rest,
+                });
+            }
+        }
+        Some(InShape {
+            array: None,
+            rest: list.items.clone(),
+        })
+    }
+
+    /// The comparisons an IN list of several terms chains, as nodes of
+    /// their own: the array of its non-Var members first, as an IN list of
+    /// only those, then an operator expression per other member.
+    fn in_terms(&self, e: &pg_query::protobuf::AExpr, shape: InShape) -> Vec<Node> {
+        let mut out = Vec::with_capacity(shape.terms());
+        if let Some((items, _)) = shape.array {
+            let mut only = e.clone();
+            only.rexpr = Some(Box::new(Node {
+                node: Some(N::List(pg_query::protobuf::List { items })),
+            }));
+            out.push(Node {
+                node: Some(N::AExpr(Box::new(only))),
+            });
+        }
+        out.extend(shape.rest.into_iter().map(|x| in_term(e, x)));
+        out
+    }
+
+    /// `contain_vars_of_level(n, 0)`: whether `n` reads a column of the
+    /// query being printed, counting a correlated reference from inside
+    /// one of its sublinks and not a reference to an enclosing query.
+    /// Found by printing `n` and noting where its columns resolve; `None`
+    /// where `n` does not print.
+    fn has_own_var(&mut self, n: &Node) -> Option<bool> {
+        let column = |n: &Node| {
+            matches!(n.node.as_ref(), Some(N::ColumnRef(_)))
+                || n.node.as_ref().is_some_and(|x| {
+                    x.nodes()
+                        .iter()
+                        .any(|(r, _, _, _)| matches!(r, pg_query::NodeRef::ColumnRef(_)))
+                })
+        };
+        if !column(n) {
+            return Some(false);
+        }
+        // A row prints only as an operand: probe its fields.
+        if let Some(N::RowExpr(r)) = n.node.as_ref() {
+            for a in &r.args {
+                if self.has_own_var(a)? {
+                    return Some(true);
+                }
+            }
+            return Some(false);
+        }
+        let level = self.scopes.len().checked_sub(1)?;
+        VAR_PROBES.with(|p| p.borrow_mut().push((level, false)));
+        let mark = self.buf.len();
+        let printed = self.child(n, "", Parent::Other);
+        self.buf.truncate(mark);
+        let hit = VAR_PROBES
+            .with(|p| p.borrow_mut().pop())
+            .is_some_and(|(_, hit)| hit);
+        printed?;
+        Some(hit)
+    }
+
+    /// The ScalarArrayOpExpr of an IN list's non-Var members, coerced to
+    /// their common type `common` (`make_scalar_array_op`).
+    fn in_array(&mut self, l: &Node, op: &str, items: &[Node], common: &str) -> Option<()> {
+        let lt = self.typ(l)?;
+        // The integer comparison operators take mixed widths
+        // (`int24eq`): an integer left side keeps its own type.
+        let lw = if lt == common || (is_int(&lt) && is_int(common)) {
+            String::new()
+        } else {
+            common.to_string()
+        };
+        let (word, quant) = if op == "=" {
+            ("=", "ANY")
+        } else {
+            ("<>", "ALL")
+        };
+        // varchar has no `=` of its own: the operator is text's, so
+        // the column and the whole array are cast to text. `name`
+        // has `nameeq` / `namene` and keeps its type.
+        let via_text = common == "varchar";
+        let lw = if via_text { "text".to_string() } else { lw };
+        let open = !self.pretty;
+        if open {
+            self.buf.push('(');
+        }
+        self.child(l, &lw, Parent::Other)?;
+        self.buf.push_str(&format!(" {word} {quant} ("));
+        // `eval_const_expressions` folds an ARRAY of constants (and
+        // varchar's coercion of it to text[]) to one array constant,
+        // printed as its `array_out` text (RP-348).
+        if self.fold_consts {
+            let elem = if via_text { "text" } else { common };
+            if let Some(lit) = folded_array_literal(items, elem) {
+                self.buf.push_str(&lit);
+                self.buf.push_str(&format!("::{}[]", display_type(elem)));
+                self.buf.push(')');
+                if open {
+                    self.buf.push(')');
+                }
+                return Some(());
+            }
+        }
+        if via_text && open {
+            self.buf.push('(');
+        }
+        self.buf.push_str("ARRAY[");
+        for (i, x) in items.iter().enumerate() {
+            if i > 0 {
+                self.buf.push_str(", ");
+            }
+            self.expr_as(x, common)?;
+        }
+        self.buf.push(']');
+        if via_text {
+            if open {
+                self.buf.push(')');
+            }
+            self.buf.push_str("::text[]");
+        }
+        self.buf.push(')');
+        if open {
+            self.buf.push(')');
+        }
+        Some(())
+    }
+
     fn row_compare(&mut self, op: &str, l: &[Node], r: &[Node]) -> Option<()> {
         if l.len() != r.len() || l.is_empty() {
             return None;
@@ -4884,9 +5136,78 @@ pub fn and_clauses<'n>(n: &'n Node, out: &mut Vec<std::borrow::Cow<'n, Node>>) {
         }
         _ => match between_clauses(n) {
             Some(halves) => out.extend(halves.map(std::borrow::Cow::Owned)),
-            None => out.push(std::borrow::Cow::Borrowed(n)),
+            None => match not_in_clauses(n) {
+                Some(terms) => out.extend(terms.into_iter().map(std::borrow::Cow::Owned)),
+                None => out.push(std::borrow::Cow::Borrowed(n)),
+            },
         },
     }
+}
+
+/// A NOT IN list holding columns, as the AND of its comparisons that the
+/// planner flattens into a qual's conjuncts (RP-1047): its column-free
+/// members' `<> ALL` when there are several (an IN list of only those),
+/// then a `<>` per other member. Every column of an EXPLAIN qual is a Var
+/// of the query it filters. `None` for any other node, and for a member
+/// holding a sublink, whose columns may be its own.
+fn not_in_clauses(n: &Node) -> Option<Vec<Node>> {
+    let Some(N::AExpr(e)) = n.node.as_ref() else {
+        return None;
+    };
+    if e.kind != AExprKind::AexprIn as i32 || in_chain_type(e) != BoolExprType::AndExpr {
+        return None;
+    }
+    let Some(N::List(list)) = e.rexpr.as_deref().and_then(|r| r.node.as_ref()) else {
+        return None;
+    };
+    let holds = |x: &Node, f: &dyn Fn(&pg_query::NodeRef<'_>) -> bool| {
+        x.node
+            .as_ref()
+            .is_some_and(|y| f(&y.to_ref()) || y.nodes().iter().any(|(r, _, _, _)| f(r)))
+    };
+    if list
+        .items
+        .iter()
+        .any(|x| holds(x, &|r| matches!(r, pg_query::NodeRef::SubLink(_))))
+    {
+        return None;
+    }
+    let has_var: Vec<bool> = list
+        .items
+        .iter()
+        .map(|x| holds(x, &|r| matches!(r, pg_query::NodeRef::ColumnRef(_))))
+        .collect();
+    let nonvars: Vec<Node> = list
+        .items
+        .iter()
+        .zip(&has_var)
+        .filter(|(_, v)| !**v)
+        .map(|(x, _)| x.clone())
+        .collect();
+    let row = matches!(
+        e.lexpr.as_deref().and_then(|l| l.node.as_ref()),
+        Some(N::RowExpr(_))
+    );
+    let mut terms = Vec::new();
+    let rest: Vec<Node> = if nonvars.len() > 1 && !row {
+        let mut only = (**e).clone();
+        only.rexpr = Some(Box::new(Node {
+            node: Some(N::List(pg_query::protobuf::List { items: nonvars })),
+        }));
+        terms.push(Node {
+            node: Some(N::AExpr(Box::new(only))),
+        });
+        list.items
+            .iter()
+            .zip(&has_var)
+            .filter(|(_, v)| **v)
+            .map(|(x, _)| x.clone())
+            .collect()
+    } else {
+        list.items.clone()
+    };
+    terms.extend(rest.into_iter().map(|x| in_term(e, x)));
+    (terms.len() > 1).then_some(terms)
 }
 
 /// A single-relation WHERE as EXPLAIN shows it: each top-level AND conjunct
@@ -6356,6 +6677,109 @@ mod tests {
         ];
         for (sql, want) in cases {
             assert_eq!(render(sql).as_deref(), Some(want), "{sql}");
+        }
+    }
+    /// `transformAExprIn`: one `= ANY` over the members holding no Var of
+    /// the query, when there are two or more, then an `=` per other member,
+    /// ORed (ANDed for NOT IN) two at a time; a reference to an enclosing
+    /// query is no Var of this one. Each answer measured on PostgreSQL
+    /// 15.19, plain and pretty (RP-1047).
+    #[test]
+    fn an_in_list_holding_a_column_prints_as_transform_a_expr_in_builds_it() {
+        let none = |_: &str| None;
+        let cat = Catalog {
+            lookup: &cat_lookup,
+            view_sql: &none,
+            home_schema: None,
+        };
+        let cases = [
+            (
+                "SELECT id IN (1, t_id) FROM vd_u",
+                " SELECT ((vd_u.id = 1) OR (vd_u.id = vd_u.t_id)) AS \"?column?\"\n   FROM vd_u;",
+                " SELECT vd_u.id = 1 OR vd_u.id = vd_u.t_id AS \"?column?\"\n   FROM vd_u;",
+            ),
+            (
+                "SELECT id IN (1, 2, t_id, 3) FROM vd_u",
+                " SELECT ((vd_u.id = ANY (ARRAY[1, 2, 3])) OR (vd_u.id = vd_u.t_id)) AS \"?column?\"\n   FROM vd_u;",
+                " SELECT (vd_u.id = ANY (ARRAY[1, 2, 3])) OR vd_u.id = vd_u.t_id AS \"?column?\"\n   FROM vd_u;",
+            ),
+            (
+                "SELECT id NOT IN (t_id, 1, 2) FROM vd_u",
+                " SELECT ((vd_u.id <> ALL (ARRAY[1, 2])) AND (vd_u.id <> vd_u.t_id)) AS \"?column?\"\n   FROM vd_u;",
+                " SELECT (vd_u.id <> ALL (ARRAY[1, 2])) AND vd_u.id <> vd_u.t_id AS \"?column?\"\n   FROM vd_u;",
+            ),
+            (
+                "SELECT id FROM vd_t WHERE EXISTS (SELECT 1 FROM vd_u WHERE vd_u.id IN (1, 2, vd_t.id))",
+                " SELECT vd_t.id\n   FROM vd_t\n  WHERE (EXISTS ( SELECT 1\n           FROM vd_u\n          WHERE (vd_u.id = ANY (ARRAY[1, 2, vd_t.id]))));",
+                " SELECT vd_t.id\n   FROM vd_t\n  WHERE (EXISTS ( SELECT 1\n           FROM vd_u\n          WHERE vd_u.id = ANY (ARRAY[1, 2, vd_t.id])));",
+            ),
+            (
+                "SELECT id IN (1, (SELECT max(u2.t_id) FROM vd_u u2 WHERE u2.id = vd_u.id), 2) FROM vd_u",
+                " SELECT ((vd_u.id = ANY (ARRAY[1, 2])) OR (vd_u.id = ( SELECT max(u2.t_id) AS max\n           FROM vd_u u2\n          WHERE (u2.id = vd_u.id)))) AS \"?column?\"\n   FROM vd_u;",
+                " SELECT (vd_u.id = ANY (ARRAY[1, 2])) OR vd_u.id = (( SELECT max(u2.t_id) AS max\n           FROM vd_u u2\n          WHERE u2.id = vd_u.id)) AS \"?column?\"\n   FROM vd_u;",
+            ),
+            (
+                "SELECT (id, t_id) IN ((1, 2), (t_id, 3)) FROM vd_u",
+                " SELECT (((vd_u.id = 1) AND (vd_u.t_id = 2)) OR ((vd_u.id = vd_u.t_id) AND (vd_u.t_id = 3))) AS \"?column?\"\n   FROM vd_u;",
+                " SELECT vd_u.id = 1 AND vd_u.t_id = 2 OR vd_u.id = vd_u.t_id AND vd_u.t_id = 3 AS \"?column?\"\n   FROM vd_u;",
+            ),
+            (
+                "SELECT w IN ('a', w, 'b') FROM vd_u",
+                " SELECT ((vd_u.w = ANY (ARRAY['a'::text, 'b'::text])) OR (vd_u.w = vd_u.w)) AS \"?column?\"\n   FROM vd_u;",
+                " SELECT (vd_u.w = ANY (ARRAY['a'::text, 'b'::text])) OR vd_u.w = vd_u.w AS \"?column?\"\n   FROM vd_u;",
+            ),
+            (
+                "SELECT id FROM vd_u WHERE id NOT IN (1, t_id) AND w = 'x'",
+                " SELECT vd_u.id\n   FROM vd_u\n  WHERE (((vd_u.id <> 1) AND (vd_u.id <> vd_u.t_id)) AND (vd_u.w = 'x'::text));",
+                " SELECT vd_u.id\n   FROM vd_u\n  WHERE vd_u.id <> 1 AND vd_u.id <> vd_u.t_id AND vd_u.w = 'x'::text;",
+            ),
+        ];
+        for (sql, plain, pretty) in cases {
+            assert_eq!(viewdef(sql, None, &cat).as_deref(), Some(plain), "{sql}");
+            assert_eq!(
+                viewdef_pretty(sql, None, &cat).as_deref(),
+                Some(pretty),
+                "{sql} (pretty)"
+            );
+        }
+    }
+    /// The planned IN list EXPLAIN prints: its chain flattened into one OR,
+    /// with a user OR around it, and a NOT IN's into the scan's conjuncts.
+    /// PostgreSQL 15.19, `explain (costs off)` over `t (a int, b int, c
+    /// int)` (RP-1047).
+    #[test]
+    fn a_planned_in_list_holding_a_column_is_flattened() {
+        let def = TableDef::new(
+            "t",
+            ["a", "b", "c"]
+                .into_iter()
+                .map(|c| Column::new(c, "int4", false))
+                .collect(),
+        );
+        for (sql, want) in [
+            (
+                "select 1 from t where a in (1, b, c)",
+                vec!["((a = 1) OR (a = b) OR (a = c))"],
+            ),
+            (
+                "select 1 from t where a in (1, 2, b, c) or c = 2",
+                vec!["((a = ANY ('{1,2}'::integer[])) OR (a = b) OR (a = c) OR (c = 2))"],
+            ),
+            (
+                "select 1 from t where a not in (1, b) and c > 2",
+                vec!["(a <> 1)", "(a <> b)", "(c > 2)"],
+            ),
+        ] {
+            let Some(N::SelectStmt(s)) = parse_select(sql).and_then(|n| n.node) else {
+                panic!("not a select");
+            };
+            let got = explain_conjuncts(s.where_clause.as_deref().unwrap(), &def)
+                .map(|parts| parts.into_iter().map(|(text, _)| text).collect::<Vec<_>>());
+            assert_eq!(
+                got,
+                Some(want.into_iter().map(String::from).collect()),
+                "{sql}"
+            );
         }
     }
 }

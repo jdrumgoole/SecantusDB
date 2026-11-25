@@ -493,8 +493,9 @@ def test_pg_get_viewdef_names_a_case_column_by_its_else_column(dsn: str) -> None
     ]
 
 
-# `transformAExprIn` ORs an `=` for each element holding a Var (RP-1047).
-@pytest.mark.backlog("RP-1047")
+# `transformAExprIn` ORed an `=` for each element holding a Var, which was
+# printed inside the `= ANY` array (RP-1047).
+@pytest.mark.backlog_fixed("RP-1047")
 def test_pg_get_viewdef_of_an_in_list_holding_a_column(dsn: str) -> None:
     got = _viewdef_of(dsn, "v1047", "select c.relnatts in (1, c.relam::int) from pg_class c")
     assert got == [
