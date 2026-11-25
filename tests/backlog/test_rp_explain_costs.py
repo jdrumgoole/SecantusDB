@@ -2691,10 +2691,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): the WHERE
-    # constant joins the ON's equivalence class, as in the comma join RP-977
-    # fixed, and each inner index scan takes it as its Index Cond.
+    # constant joined the ON's equivalence class, as in the comma join
+    # RP-977 fixed, and each inner index scan took it as its Index Cond
+    # (RP-1065, fixed).
     "an explicit join's class constant is the inner index's cond": (
-        "RP-1065",
+        "RP-1065:fixed",
         _ANALYSED,
         "explain (costs off) select e.b, k.b from e join k on e.a = k.a where e.a = 3",
         [
@@ -2706,10 +2707,108 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "a three-way explicit join's class constant is each inner index's cond": (
-        "RP-1065",
+        "RP-1065:fixed",
         _ANALYSED,
         "explain (costs off) select e.b, k.b from e join k on e.a = k.a "
         "join k k2 on k2.a = e.a where e.a = 3",
+        [
+            "Nested Loop",
+            "  ->  Nested Loop",
+            "        ->  Seq Scan on e",
+            "              Filter: (a = 3)",
+            "        ->  Index Scan using k_pkey on k",
+            "              Index Cond: (a = 3)",
+            "  ->  Index Only Scan using k_pkey on k k2",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1065, fixed): the
+    # constant comes from the WHERE's equality on the ON key, never from
+    # another conjunct of that side (once printed `Index Cond: (a =
+    # 'v3'::text)` on `e`'s side), and an inner read through its index
+    # gives its Index Cond's constant to the other side.
+    "a class constant beside another conjunct of the fixing side": (
+        "RP-1065:fixed",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e join k on e.a = k.a "
+        "where k.b = 'v3' and k.a = 3",
+        [
+            "Nested Loop",
+            "  ->  Seq Scan on e",
+            "        Filter: (a = 3)",
+            "  ->  Index Scan using k_pkey on k",
+            "        Index Cond: (a = 3)",
+            "        Filter: (b = 'v3'::text)",
+        ],
+    ),
+    # Measured likewise: an inner reading only its key is read index-only.
+    "an explicit join's class constant on an index-only inner": (
+        "RP-1065:fixed",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a = k.a where e.a = 3",
+        [
+            "Nested Loop  (cost=0.28..25.80 rows=1 width=3)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "        Filter: (a = 3)",
+            "  ->  Index Only Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=4)",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1065): the class's equality keeps the place of the class's first
+    # source clause among the scan's quals.
+    "a class constant's equality keeps its class's place among the quals": (
+        "RP-1101",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e, k where e.a = k.a and e.a = 3 and e.b = 'v3'",
+        [
+            "Nested Loop",
+            "  ->  Seq Scan on e",
+            "        Filter: ((a = 3) AND (b = 'v3'::text))",
+            "  ->  Index Scan using k_pkey on k",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    "a class fixed to two constants is the empty result": (
+        "RP-1102",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e join k on e.a = k.a where e.a = 3 and k.a = 4",
+        [
+            "Result",
+            "  One-Time Filter: false",
+        ],
+    ),
+    "a left join's fixed outer key is the inner index's cond": (
+        "RP-1103",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e left join k on e.a = k.a where e.a = 3",
+        [
+            "Nested Loop Left Join",
+            "  Join Filter: (e.a = k.a)",
+            "  ->  Seq Scan on e",
+            "        Filter: (a = 3)",
+            "  ->  Index Scan using k_pkey on k",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    "an aggregate over a join's class constant": (
+        "RP-1104",
+        _ANALYSED,
+        "explain (costs off) select count(*) from e join k on e.a = k.a where e.a = 3",
+        [
+            "Aggregate",
+            "  ->  Nested Loop",
+            "        ->  Seq Scan on e",
+            "              Filter: (a = 3)",
+            "        ->  Index Only Scan using k_pkey on k",
+            "              Index Cond: (a = 3)",
+        ],
+    ),
+    "a three-way comma join's class constant is each inner index's cond": (
+        "RP-1105",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e, k, k k2 "
+        "where e.a = k.a and k2.a = e.a and e.a = 3",
         [
             "Nested Loop",
             "  ->  Nested Loop",

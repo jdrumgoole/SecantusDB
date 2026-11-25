@@ -31,6 +31,19 @@ type ArmScan = (
     Vec<usize>,
 );
 
+/// A chain of joins whose class a WHERE constant fixes
+/// ([`PgHandler::chain_class_constant`], RP-1065).
+#[derive(Debug)]
+pub(crate) struct ChainConstant {
+    /// The members the class filters by the constant, `(alias, column)`.
+    pub implied: Vec<(String, String)>,
+    /// The member whose scan the WHERE fixed.
+    pub from: (String, String),
+    /// Each table's scan, by alias: its index and whether index-only,
+    /// `None` for the Seq Scan.
+    pub indexes: Vec<(String, Option<(String, bool)>)>,
+}
+
 /// The index an index scan reads, and whether the scan is index-only (the
 /// index holds every column the statement reads, `check_index_only`).
 #[derive(Debug, Clone, PartialEq)]
@@ -2697,6 +2710,240 @@ impl PgHandler {
         Some((a, b, more, filter, left_join, target_width))
     }
 
+    /// A chain of three or more tables planned as joined rows, each join
+    /// INNER on one column equality, whose clauses put every table's key in
+    /// one equivalence class and whose WHERE fixes a member to a constant
+    /// (RP-1065): `generate_base_implied_equalities_const` filters every
+    /// member's scan by the constant, which leaves no join clause, so each
+    /// join is a Nested Loop. Each scan reads through an index where
+    /// `set_cheapest` keeps that path ([`Self::cheapest_filtered_scan`]).
+    /// The joins stay in their written order and unpriced (RP-1059).
+    pub(crate) fn chain_class_constant(
+        &self,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<ChainConstant> {
+        use secantus_pgplan::joins::{JoinKind, JoinNode};
+        use secantus_pgplan::Statement;
+        let sub = sel.sub.as_ref()?;
+        let Statement::JoinRows(j) = sub.plan.as_ref() else {
+            return None;
+        };
+        if sel.series.is_some()
+            || sel.join.is_some()
+            || !sel.windows.is_empty()
+            || !sel.order.is_empty()
+            || sel.limit.is_some()
+            || sel.offset != 0
+            || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
+            || sel.with_ties
+            || sel.residual.is_some()
+            || sel.casts.iter().any(Option::is_some)
+            || j.where_spans_equality
+            || !j.where_filters.is_empty()
+            || !j.where_span_aliases.is_empty()
+        {
+            return None;
+        }
+        // The leaves, left to right, and the ON equalities.
+        fn walk<'n>(
+            n: &'n JoinNode,
+            leaves: &mut Vec<&'n JoinNode>,
+            pairs: &mut Vec<(String, String)>,
+        ) -> Option<()> {
+            match n {
+                JoinNode::Leaf { .. } => leaves.push(n),
+                JoinNode::Join {
+                    kind: JoinKind::Inner,
+                    left,
+                    right,
+                    equi,
+                    merged,
+                    expr_keys,
+                    on_other: false,
+                    on_filters,
+                    ..
+                } if equi.len() == 1
+                    && merged.is_empty()
+                    && expr_keys.is_empty()
+                    && on_filters.is_empty() =>
+                {
+                    walk(left, leaves, pairs)?;
+                    walk(right, leaves, pairs)?;
+                    pairs.push(equi[0].clone());
+                }
+                _ => return None,
+            }
+            Some(())
+        }
+        let mut leaves = Vec::new();
+        let mut pairs = Vec::new();
+        walk(&j.tree, &mut leaves, &mut pairs)?;
+        if leaves.len() < 3 {
+            return None;
+        }
+        // One class: every clause's keys, each table's one member.
+        let mut members: Vec<String> = Vec::new();
+        for (l, r) in &pairs {
+            for k in [l, r] {
+                if !members.contains(k) {
+                    members.push(k.clone());
+                }
+            }
+        }
+        if members.len() != leaves.len() {
+            return None;
+        }
+        let mut class: Vec<usize> = (0..members.len()).collect();
+        fn find(class: &mut [usize], i: usize) -> usize {
+            let mut r = i;
+            while class[r] != r {
+                r = class[r];
+            }
+            class[i] = r;
+            r
+        }
+        for (l, r) in &pairs {
+            let a = members.iter().position(|m| m == l)?;
+            let b = members.iter().position(|m| m == r)?;
+            let (ra, rb) = (find(&mut class, a), find(&mut class, b));
+            class[ra] = rb;
+        }
+        let root = find(&mut class, 0);
+        if (0..members.len()).any(|i| find(&mut class, i) != root) {
+            return None;
+        }
+        // The WHERE's conjuncts each ran in one table's scan.
+        let above = joined_conjuncts(&sel.filter)?;
+        struct Side {
+            alias: String,
+            column: String,
+            table: String,
+            field: String,
+            filter: Document,
+            read: Vec<String>,
+        }
+        let mut sides = Vec::new();
+        let mut held = 0;
+        for leaf in &leaves {
+            let JoinNode::Leaf { plan, columns, .. } = leaf else {
+                return None;
+            };
+            let Statement::Select(scan) = plan.as_ref() else {
+                return None;
+            };
+            let (table, filter) = crate::plain_leaf_table(leaf)?;
+            if !scan.windows.is_empty()
+                || !scan.order.is_empty()
+                || scan.limit.is_some()
+                || scan.offset != 0
+                || !matches!(scan.distinct, secantus_pgplan::Distinct::None)
+                || scan.casts.iter().any(Option::is_some)
+            {
+                return None;
+            }
+            let key = members
+                .iter()
+                .find(|m| columns.iter().any(|(k, _)| k == *m))?;
+            let stored = |out: &str| {
+                scan.columns
+                    .iter()
+                    .find(|(o, _)| o == out)
+                    .map(|(_, f)| f.clone())
+            };
+            let (_, out) = columns.iter().find(|(k, _)| k == key)?;
+            let field = stored(out)?;
+            let pushed = PushedConjuncts::new(&filter);
+            for (k, v) in &above {
+                if let Some((_, o)) = columns.iter().find(|(ck, _)| ck == k) {
+                    if !pushed.holds(&stored(o)?, v) {
+                        return None;
+                    }
+                    held += 1;
+                }
+            }
+            let mut read: Vec<String> = columns
+                .iter()
+                .filter(|(k, _)| j.needed.contains(k) || j.project.is_none())
+                .map(|(_, o)| stored(o))
+                .collect::<Option<_>>()?;
+            if !read.contains(&field) {
+                read.push(field.clone());
+            }
+            sides.push(Side {
+                alias: crate::join_search::alias_of(key).to_string(),
+                column: crate::join_search::column_of(key)?.to_string(),
+                table,
+                field,
+                filter,
+                read,
+            });
+        }
+        if held != above.len() {
+            return None;
+        }
+        // The class's constant: one value, never NULL, the same everywhere
+        // a scan fixes its member.
+        let mut value: Option<Bson> = None;
+        let mut from = None;
+        for s in &sides {
+            match key_constant(&s.filter, &s.field) {
+                Some(Some(v)) => {
+                    if let Some(x) = &value {
+                        if secantus_pgplan::compare_values(x, &v) != Some(std::cmp::Ordering::Equal)
+                        {
+                            return None;
+                        }
+                    } else {
+                        value = Some(v);
+                        from = Some((s.alias.clone(), s.column.clone()));
+                    }
+                }
+                Some(None) => return None,
+                None => {}
+            }
+        }
+        let (value, from) = (value?, from?);
+        if value == Bson::Null {
+            return None;
+        }
+        // The keys are of one type.
+        let ty = |s: &Side| {
+            self.lookup(&s.table)?
+                .columns
+                .iter()
+                .find(|c| c.field() == s.field)
+                .map(|c| c.pg_type.clone())
+        };
+        let first = ty(&sides[0])?;
+        for s in &sides[1..] {
+            if ty(s)? != first {
+                return None;
+            }
+        }
+        let mut implied = Vec::new();
+        let mut indexes = Vec::new();
+        for s in &mut sides {
+            if key_constant(&s.filter, &s.field).is_none() {
+                implied.push((s.alias.clone(), s.column.clone()));
+                let mut eq = Document::new();
+                eq.insert(s.field.clone(), value.clone());
+                let own = std::mem::take(&mut s.filter);
+                s.filter = if own.is_empty() {
+                    eq
+                } else {
+                    bson::doc! { "$and": [Bson::Document(own), eq] }
+                };
+            }
+            let (_, index) = self.cheapest_filtered_scan(&s.table, &s.filter, &s.read)?;
+            indexes.push((s.alias.clone(), index.map(|ix| (ix.name, ix.only))));
+        }
+        Some(ChainConstant {
+            implied,
+            from,
+            indexes,
+        })
+    }
+
     /// The Nested Loop of an inner join planned as joined rows whose WHERE
     /// fixes a join key to a constant (RP-376; RP-363 on the narrow path):
     /// the constant joins the keys' equivalence class, so each side is
@@ -2718,7 +2965,7 @@ impl PgHandler {
         Estimate,
         Vec<(String, String)>,
         (String, String),
-        [Option<String>; 2],
+        [Option<ScanIndex>; 2],
     )> {
         let (mut a, mut b, more, filter, left_join, target_width) = self.joined_sides(sel)?;
         if !more.is_empty()
@@ -2814,10 +3061,14 @@ impl PgHandler {
         ))
     }
 
-    /// A filtered scan of user table `table` reading `read`: through an
-    /// index where `set_cheapest` keeps that path (`index_scan_estimate`,
-    /// RP-376), else its sequential scan -- only where no index leads with
-    /// a filtered column, as a path the model does not price may win
+    /// A filtered scan of user table `table` reading `read`: the path
+    /// `set_cheapest` keeps ([`Self::user_scan_path_reading`]), an Index
+    /// Only Scan where the index holds every column the scan reads
+    /// (`check_index_only`, RP-1065), declined where that is a bitmap
+    /// scan, which a join's drawing does not print. Where that model
+    /// declines, through an index where `index_scan_estimate` prices it
+    /// (RP-376), else its sequential scan -- only where no index leads
+    /// with a filtered column, as a path the model does not price may win
     /// there. Returns the estimate and the index read, `None` for a Seq
     /// Scan.
     fn cheapest_filtered_scan(
@@ -2825,8 +3076,17 @@ impl PgHandler {
         table: &str,
         filter: &Document,
         read: &[String],
-    ) -> Option<(Estimate, Option<String>)> {
+    ) -> Option<(Estimate, Option<ScanIndex>)> {
         if !filter.is_empty() {
+            if let Some((est, index)) = self.user_scan_path_reading(table, filter, read, &[]) {
+                if index
+                    .as_ref()
+                    .is_some_and(|ix| ix.bitmap.is_some() || !ix.or_arms.is_empty())
+                {
+                    return None;
+                }
+                return Some((est, index));
+            }
             for ix in self
                 .index_relations()
                 .iter()
@@ -2841,7 +3101,15 @@ impl PgHandler {
                     })
                     .collect::<Option<_>>()?;
                 if let Some(est) = self.index_scan_estimate(table, filter, read, &key) {
-                    return Some((est, Some(ix.name.clone())));
+                    return Some((
+                        est,
+                        Some(ScanIndex {
+                            name: ix.name.clone(),
+                            only: false,
+                            bitmap: None,
+                            or_arms: Vec::new(),
+                        }),
+                    ));
                 }
                 if key.first().is_some_and(|lead| filter_names(filter, lead)) {
                     return None;
@@ -3100,9 +3368,12 @@ impl PgHandler {
     /// key to a constant (RP-363): the constant is in the keys' equivalence
     /// class, so each side is filtered by it
     /// (`generate_base_implied_equalities_const`) and no join clause is
-    /// left. Each side's sequential scan reads the columns the select list
-    /// and the ON take from it; the plan is `cheapest_nest_loop`'s. Also
-    /// returns the filters the class adds, `(alias, column)`.
+    /// left. Each side's scan reads the columns the select list and the ON
+    /// take from it, through an index where `set_cheapest` keeps that path
+    /// (RP-1065, as [`Self::joined_implied_estimate`] does), else
+    /// sequentially; the plan is `cheapest_nest_loop`'s. Also returns the
+    /// filters the class adds, `(alias, column)`, and the index each side
+    /// reads (left, right).
     #[allow(clippy::type_complexity)]
     pub(crate) fn join_select_implied_estimate(
         &self,
@@ -3113,6 +3384,7 @@ impl PgHandler {
         Estimate,
         Estimate,
         Vec<(String, String)>,
+        [Option<ScanIndex>; 2],
     )> {
         let j = sel.join.as_ref()?;
         if sel.sub.is_some()
@@ -3139,37 +3411,38 @@ impl PgHandler {
         if !matches!(by, crate::NarrowImplied::NoJoinClause) {
             return None;
         }
-        let side = |(table, alias): &(String, String)| -> Option<(Estimate, i64)> {
-            let key = if a.0 == *alias {
-                &a.1
-            } else if b.0 == *alias {
-                &b.1
-            } else {
-                return None;
+        let side =
+            |(table, alias): &(String, String)| -> Option<(Estimate, i64, Option<ScanIndex>)> {
+                let key = if a.0 == *alias {
+                    &a.1
+                } else if b.0 == *alias {
+                    &b.1
+                } else {
+                    return None;
+                };
+                let def = self.lookup(table)?;
+                let above: Vec<String> = j
+                    .columns
+                    .iter()
+                    .filter(|(_, side, _)| side == alias)
+                    .map(|(_, _, c)| def.field_of(c))
+                    .collect::<Option<_>>()?;
+                let mut read = above.clone();
+                let field = def.field_of(key)?;
+                if !read.contains(&field) {
+                    read.push(field);
+                }
+                // The side's index paths are weighed here, so a WHERE over an
+                // indexed table is priced too.
+                let filter = self.narrow_side_filter(&implied.filter, table, alias, true)?;
+                let (scan, index) = self.cheapest_filtered_scan(table, &filter, &read)?;
+                let (width, None) = self.scan_estimate(table, &Document::new(), &above)? else {
+                    return None;
+                };
+                Some((scan, width.3, index))
             };
-            let def = self.lookup(table)?;
-            let above: Vec<String> = j
-                .columns
-                .iter()
-                .filter(|(_, side, _)| side == alias)
-                .map(|(_, _, c)| def.field_of(c))
-                .collect::<Option<_>>()?;
-            let mut read = above.clone();
-            let field = def.field_of(key)?;
-            if !read.contains(&field) {
-                read.push(field);
-            }
-            let filter = self.narrow_side_filter(&implied.filter, table, alias, false)?;
-            let (scan, None) = self.scan_estimate(table, &filter, &read)? else {
-                return None;
-            };
-            let (width, None) = self.scan_estimate(table, &Document::new(), &above)? else {
-                return None;
-            };
-            Some((scan, width.3))
-        };
-        let (sa, a_above) = side(&j.left)?;
-        let (sb, b_above) = side(&j.right)?;
+        let (sa, a_above, ia) = side(&j.left)?;
+        let (sb, b_above, ib) = side(&j.right)?;
         let plan = secantus_pgplan::joincost::cheapest_nest_loop(sa, sb, 0.0);
         let rows = costsize::clamp_row_est(sa.2 * sb.2);
         let added = implied.filter[j.filter.len()..]
@@ -3182,6 +3455,7 @@ impl PgHandler {
             sb,
             (plan.startup, plan.total, rows, a_above + b_above),
             added,
+            [ia, ib],
         ))
     }
 

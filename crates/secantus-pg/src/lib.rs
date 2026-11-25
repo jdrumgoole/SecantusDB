@@ -47271,17 +47271,41 @@ impl PgHandler {
                 if let Statement::Select(sel) = inner.as_ref() {
                     if let Some(j) = &sel.join {
                         if tree.name == "Hash Join" {
-                            if let Some((plan, a, b, join, implied)) =
+                            if let Some((plan, a, b, join, implied, indexes)) =
                                 self.join_select_implied_estimate(sel)
                             {
+                                // The WHERE equality that fixed an ON key:
+                                // never another of that side's conjuncts
+                                // (RP-1065).
+                                let on_key = |p: &secantus_pgplan::JoinPred| {
+                                    j.on.as_ref().is_some_and(|(x, y)| {
+                                        [x, y].iter().any(|(al, c)| *al == p.alias && *c == p.col)
+                                    })
+                                };
                                 let from = j
                                     .filter
                                     .iter()
-                                    .find(|p| !implied.iter().any(|(al, _)| *al == p.alias))
+                                    .find(|p| {
+                                        p.op == secantus_pgplan::JoinOp::Eq
+                                            && on_key(p)
+                                            && !implied.iter().any(|(al, _)| *al == p.alias)
+                                    })
                                     .map(|p| (p.alias.clone(), p.col.clone()))
                                     .unwrap_or_default();
                                 explain::implied_nest_loop(&mut tree, &implied, &from);
                                 explain::price_nest_loop(&mut tree, &plan, a, b, join);
+                                // Outer then inner, as the scans now sit
+                                // (RP-1065).
+                                let [a_index, b_index] = indexes;
+                                let in_order = if plan.b_outer {
+                                    [b_index, a_index]
+                                } else {
+                                    [a_index, b_index]
+                                };
+                                explain::name_scan_indexes(
+                                    &mut tree,
+                                    &in_order.map(|ix| ix.map(|ix| (ix.name, ix.only))),
+                                );
                             }
                         }
                     }
@@ -47303,7 +47327,22 @@ impl PgHandler {
                             } else {
                                 [a_index, b_index]
                             };
-                            explain::name_index_scans(&mut tree, &in_order);
+                            explain::name_scan_indexes(
+                                &mut tree,
+                                &in_order.map(|ix| ix.map(|ix| (ix.name, ix.only))),
+                            );
+                        }
+                    }
+                }
+                // A chain whose join keys a WHERE constant's equivalence
+                // class holds (RP-1065): Nested Loops with no join clause,
+                // each scan filtered by the constant.
+                if let Statement::Select(sel) = inner.as_ref() {
+                    if tree.name == "Hash Join" && !options.verbose && !options.analyze {
+                        if let Some(c) = self.chain_class_constant(sel) {
+                            explain::class_constant_chain(
+                                &mut tree, &c.implied, &c.from, &c.indexes,
+                            );
                         }
                     }
                 }

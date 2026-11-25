@@ -1828,9 +1828,12 @@ a regression test.
       remaining shape probed has a plain plan that differs too, so each
       waits on the item named: a WHERE conjunct reading two relations of a
       chain (RP-1059, all three pairings), a nested loop in a chain (RP-1059
-      for `where e.a < 5`, RP-1065 for `where e.a = 3`), a RIGHT join
-      (RP-1063). Work those first; the VERBOSE half then follows the
-      chain's `Output` rules above.
+      for `where e.a < 5`), a RIGHT join (RP-1063). Work those first; the
+      VERBOSE half then follows the chain's `Output` rules above. The
+      chain `where e.a = 3` (RP-1065, 2026-11-25) now has PostgreSQL's
+      plain plan, Nested Loops under the class's constant, and is drawn
+      only without VERBOSE (`chain_class_constant`): its VERBOSE half can
+      be worked now.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a three-way join with a join filter], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a merge join under a limit], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a merge join over an index only scan], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a descending merge join with a where]
       Backlog-ID: RP-966
 
@@ -1870,25 +1873,75 @@ a regression test.
       (5) costs: every node of a three-way chain prints `cost=0.00..0.00
       rows=0 width=0`; the search's estimates match PostgreSQL's
       (`83.58..123.68` for the first query over tables never analysed) but
-      its relations carry no width.
+      its relations carry no width. So does a chain whose class a WHERE
+      constant fixes (RP-1065, `PgHandler::chain_class_constant`), drawn
+      as Nested Loops in its written order, which the search does not
+      weigh at all (`three_table_plan` declines a class with a constant):
+      `... join k k2 on k2.a = e.a where e.a = 3` is `0.55..34.10` on a
+      private PostgreSQL 15.20 cluster, the lower join `0.28..25.80`.
       Work (1) first: it is what the two gap tests below measure. Found
       while working RP-966.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a filtered relation of a three-way join is joined first], tests/backlog/test_rp_explain_costs.py::test_plan[a range-filtered relation of a three-way join is joined first]
       Backlog-ID: RP-1059
 
-- [ ] **A WHERE constant does not join an explicit JOIN's equivalence
-      class.** `explain (costs off) select e.b, k.b from e join k on e.a =
-      k.a where e.a = 3` (`e`, `k` analysed, 1000 rows) is a `Hash Join`
-      on `(e.a = k.a)` here; PostgreSQL 15.19 puts the constant in the
-      class (`generate_base_implied_equalities_const`) and runs a Nested
-      Loop into `Index Scan using k_pkey on k`, `Index Cond: (a = 3)`, no
-      join clause, as RP-977 already does for the comma join `from e, k
-      where e.a = k.a and e.a = 5`. A third relation on the class (`join k
-      k2 on k2.a = e.a`) likewise gets its own `Index Cond: (a = 3)`. Find
-      where the ON's equalities miss the WHERE's constant. Found while
-      working RP-966.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an explicit join's class constant is the inner index's cond], tests/backlog/test_rp_explain_costs.py::test_plan[a three-way explicit join's class constant is each inner index's cond]
-      Backlog-ID: RP-1065
+- [ ] **A class constant's equality on the side the WHERE names is
+      printed after that side's other quals, not where the class began.**
+      `explain (costs off) select e.b, k.b from e, k where e.a = k.a and
+      e.a = 3 and e.b = 'v3'` (`e`, `k` analysed, 1000 rows) prints `Filter:
+      ((b = 'v3'::text) AND (a = 3))` on `e`; a private PostgreSQL 15.20
+      cluster prints `((a = 3) AND (b = 'v3'::text))`. Measured there: the
+      class's equality takes the place of the class's first source clause
+      among the scan's own quals, the ON's ahead of the WHERE's -- `where
+      e.b = 'v3' and e.a = k.a and e.a = 3` prints `b` first, every
+      explicit `join k on e.a = k.a where ...` prints `a` first, whatever
+      the WHERE's order. `apply_implied_filters` always moves it last. Find
+      the mechanism in `equivclass.c` / `initsplan.c` before modelling it.
+      Found while working RP-1065.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a class constant's equality keeps its class's place among the quals]
+      Backlog-ID: RP-1101
+
+- [ ] **A WHERE that fixes one class to two constants is not the empty
+      Result.** `explain (costs off) select e.b, k.b from e join k on e.a =
+      k.a where e.a = 3 and k.a = 4` is a `Hash Join` of two filtered
+      scans here; a private PostgreSQL 15.20 cluster prints `Result` with
+      `One-Time Filter: false`, as `generate_base_implied_equalities_const`
+      reduces `3 = 4` to a constant FALSE. Found while working RP-1065.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a class fixed to two constants is the empty result]
+      Backlog-ID: RP-1102
+
+- [ ] **A LEFT JOIN whose WHERE fixes the outer key does not read the
+      inner side through its index.** `explain (costs off) select e.b, k.b
+      from e left join k on e.a = k.a where e.a = 3` is a `Hash Left Join`
+      here; a private PostgreSQL 15.20 cluster prints a `Nested Loop Left
+      Join`, `Join Filter: (e.a = k.a)`, into `Index Scan using k_pkey on
+      k`, `Index Cond: (a = 3)` (`reconsider_outer_join_clauses` gives the
+      inner key the constant; RP-364 covers the narrow path's Seq Scans).
+      Found while working RP-1065.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join's fixed outer key is the inner index's cond]
+      Backlog-ID: RP-1103
+
+- [ ] **An aggregate over a join whose class a WHERE constant fixes is
+      drawn over a Hash Join.** `explain (costs off) select count(*) from e
+      join k on e.a = k.a where e.a = 3` is an `Aggregate` over a `Hash
+      Join` here; a private PostgreSQL 15.20 cluster prints the `Nested
+      Loop` the select list alone gets (RP-1065), into `Index Only Scan
+      using k_pkey on k`, `Index Cond: (a = 3)`. Found while working
+      RP-1065.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a join's class constant]
+      Backlog-ID: RP-1104
+
+- [ ] **A comma join of three tables whose class a WHERE constant fixes
+      prints its equalities as Join Filters.** `explain (costs off) select
+      e.b, k.b from e, k, k k2 where e.a = k.a and k2.a = e.a and e.a = 3`
+      prints Hash Joins with `Join Filter: (e.a = k.a)` and `(k2.a = e.a)`
+      over Seq Scans here; a private PostgreSQL 15.20 cluster prints the
+      plan the explicit JOINs get (RP-1065): Nested Loops, `Index Cond: (a
+      = 3)` on each of `k` and `k2`. The comma chain's equalities are the
+      WHERE's (`JoinRows::where_equalities`), which
+      `PgHandler::chain_class_constant` does not read. Found while working
+      RP-1065.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a three-way comma join's class constant is each inner index's cond]
+      Backlog-ID: RP-1105
 
 - [ ] **A LEFT JOIN nothing reads is not removed.** `explain (costs
       off) select e.b from e left join k on e.a = k.a` (`k.a` the primary
