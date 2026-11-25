@@ -15597,6 +15597,26 @@ fn source_targets(sel: &pg_query::protobuf::SelectStmt) -> Vec<SourceTarget> {
         .collect()
 }
 
+/// A `record` an `INSERT ... SELECT`'s query gives a composite column:
+/// 42846 `cannot cast type record to <type>` at the source expression.
+/// `coerce_record_to_complex` converts only a `RowExpr` (or a whole-row
+/// `Var`) field by field; the query's output column reaches it as a plain
+/// `Var` of type `record`, which it refuses. A domain over a composite is
+/// named as the domain (`format_type_be` of the target, not its base).
+pub fn record_to_composite_mismatch(column: &Column, location: i32) -> Error {
+    set_error_location(location);
+    let target = match column
+        .extra
+        .get_str("domain_type")
+        .ok()
+        .and_then(domains::user_domain)
+    {
+        Some(d) => quote_type_path(&d.name),
+        None => scalar::format_type_text(&column.pg_type, None),
+    };
+    Error::CannotCoerce(format!("cannot cast type record to {target}"))
+}
+
 /// PostgreSQL's assignment-coercion failure for one column of an
 /// `INSERT ... SELECT` (`transformAssignedExpr`): 42804, reported at the
 /// source expression, with the hint the mapping adds.

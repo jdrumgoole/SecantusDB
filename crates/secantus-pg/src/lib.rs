@@ -32074,10 +32074,19 @@ impl PgHandler {
             // A built-in type has no ASSIGNMENT cast to a user composite: a
             // `text` (a literal under a UNION, ORDER BY or DISTINCT, or a
             // subquery's output) is 42804, not read by `record_in` (RP-1044).
-            // A `record` (`row(...)`) is coerced field by field instead.
+            // Nor is a `record` (`row(...)`) converted: the query's output
+            // column is a `Var` of type `record`, not the `RowExpr` that
+            // `coerce_record_to_complex` coerces field by field as `VALUES`
+            // does, so it is 42846 (RP-1049).
             const RECORD: i64 = 2249;
+            if source_oid == RECORD && secantus_pgplan::user_composite_oid(&col.pg_type).is_some() {
+                return Err(Self::err(&secantus_pgplan::record_to_composite_mismatch(
+                    col,
+                    entry.map_or(-1, |t| t.location),
+                )));
+            }
             let builtin_to_composite = secantus_pgplan::user_composite_oid(&col.pg_type).is_some()
-                && !matches!(source_oid, RECORD | 705)
+                && source_oid != 705
                 && secantus_pgplan::pgtypes::BUILTIN_TYPES
                     .iter()
                     .any(|(_, el, _)| *el == source_oid);
