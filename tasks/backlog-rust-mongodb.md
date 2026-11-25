@@ -2115,20 +2115,6 @@ differs on 5 scenarios. What is left:
       Found while working RM-457, 2026-11-15.
       Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_under_a_collation_buffers_its_buckets
       Backlog-ID: RM-701
-- [ ] **RUST MongoDB server: an insert into a time-series bucket the TTL
-      monitor removes fails.** Inserting into a bucket that has expired
-      while the TTL monitor runs every second, mongod 8.2.11 never fails an
-      insert (it writes a new bucket); this server returns the write error
-      112, "the time-series bucket was removed while it was written"
-      (`bucket_catalog.rs`: the update of the open bucket matched nothing),
-      to the client. Seen once in `tests/mongod_live/test_time_series_buckets.py::test_ttl_expires_whole_buckets`
-      in a gate run, reproduced by the gap test (a race: it inserts until
-      the first failure, up to 90 TTL passes). Also read, not yet probed:
-      `commit` returns `Ok` without writing when the bucket it staged into
-      is no longer open (`ts_store`'s delete clears it first), which may
-      lose a staged insert silently. Found working RM-456, 2026-11-15.
-      Verify: tests/backlog/test_rm_found_rm456.py::test_an_insert_into_a_bucket_the_ttl_monitor_removes_succeeds
-      Backlog-ID: RM-702
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
   `{$meta}` shape measured on 8.2.11 matches since 2026-10-17, except a

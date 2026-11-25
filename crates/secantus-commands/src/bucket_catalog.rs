@@ -591,14 +591,25 @@ fn stage_and_commit(
     batch: Vec<Measurement>,
     outcomes: &mut HashMap<usize, Outcome>,
 ) -> Result<(), CommandError> {
-    let mut touched: Vec<ObjectId> = Vec::new();
-    for (key, group) in by_series(batch, target.layout) {
-        stage_series(inner, uuid, target, env, &key, group, &mut touched)?;
+    let mut batch = batch;
+    loop {
+        let mut touched: Vec<ObjectId> = Vec::new();
+        for (key, group) in by_series(batch, target.layout) {
+            stage_series(inner, uuid, target, env, &key, group, &mut touched)?;
+        }
+        // A bucket removed under its write (a TTL pass, a delete) is
+        // aborted and its measurements staged again, into a bucket that
+        // exists: mongod retries the write on its WriteConflict, and no
+        // insert fails for it.
+        let mut retry = Vec::new();
+        for id in touched {
+            commit(inner, uuid, target, env, &id, outcomes, &mut retry)?;
+        }
+        if retry.is_empty() {
+            return Ok(());
+        }
+        batch = retry;
     }
-    for id in touched {
-        commit(inner, uuid, target, env, &id, outcomes)?;
-    }
-    Ok(())
 }
 
 /// `stageInsertBatch` for one series.
@@ -1458,6 +1469,7 @@ fn commit(
     env: &Env<'_>,
     id: &ObjectId,
     outcomes: &mut HashMap<usize, Outcome>,
+    retry: &mut Vec<Measurement>,
 ) -> Result<(), CommandError> {
     let layout = env.layout;
     let Inner {
@@ -1534,11 +1546,7 @@ fn commit(
                     .map_err(crate::util::command_error)?;
                 // Removed between the check above and this write.
                 if outcome.matched == 0 {
-                    return Err(CommandError::new(
-                        112,
-                        "WriteConflict",
-                        "the time-series bucket was removed while it was written",
-                    ));
+                    return Err(CommandError::new(112, "WriteConflict", BUCKET_REMOVED));
                 }
             }
             Ok(())
@@ -1590,13 +1598,24 @@ fn commit(
             coll.open.remove(at);
             coll.stats.0[Stat::ActiveBuckets as usize] -= 1;
             global.0[Stat::ActiveBuckets as usize] -= 1;
-            for (index, _) in &staged {
-                outcomes.insert(*index, Err(e.clone()));
+            if e.code == 112 && e.errmsg == BUCKET_REMOVED {
+                retry.extend(
+                    staged
+                        .into_iter()
+                        .map(|(index, doc)| Measurement { index, doc }),
+                );
+            } else {
+                for (index, _) in &staged {
+                    outcomes.insert(*index, Err(e.clone()));
+                }
             }
         }
     }
     Ok(())
 }
+
+/// The bucket an update was writing no longer exists.
+const BUCKET_REMOVED: &str = "the time-series bucket was removed while it was written";
 
 /// A storage write error document as a command error.
 fn write_error(e: &Document) -> CommandError {
