@@ -3937,7 +3937,7 @@ fn index_desc_from(name: String, key_spec: Document, opts: &Document) -> IndexDe
     IndexDesc {
         name,
         key_spec,
-        sparse: secantus_core::index_keys::spec_flag(&opts, "sparse"),
+        sparse: secantus_core::index_keys::spec_flag(opts, "sparse"),
         hidden: opts.get_bool("hidden").unwrap_or(false),
         collation: index_key_collation(opts),
         unique: opts.get_bool("unique").unwrap_or(false),
@@ -17301,7 +17301,7 @@ impl Storage {
             }
             out
         } else {
-            let sparse = secantus_core::index_keys::spec_flag(&options, "sparse");
+            let sparse = secantus_core::index_keys::spec_flag(options, "sparse");
             let unique = options.get_bool("unique").unwrap_or(false);
             let partial = options
                 .get_document("partialFilterExpression")
@@ -24060,7 +24060,7 @@ impl Storage {
         else {
             return Ok(None);
         };
-        let sparse = secantus_core::index_keys::spec_flag(&opts, "sparse");
+        let sparse = secantus_core::index_keys::spec_flag(opts, "sparse");
         let partial = opts
             .get_document("partialFilterExpression")
             .ok()
