@@ -1331,12 +1331,29 @@ impl<'a> Run<'a> {
             });
             near_extra(index, *sphere, search, &mut extra);
         }
+        let children: Vec<Stats> = self.inputs.iter().map(Run::stats).collect();
+        // mongod's LimitStage passes each work of its input through and
+        // answers one more, its EOF, once it has returned `n` (RM-714).
+        if let (Node::Limit(n, _), Some(Stats { work: Some(cw), .. })) =
+            (self.node, children.first())
+        {
+            let stopped = self.returned >= *n && !cw.eof;
+            work = Some(WorkCounts {
+                works: cw.works + i64::from(stopped),
+                advanced: self.returned,
+                need_time: cw.need_time,
+                eof: stopped || cw.eof,
+                saved: cw.saved,
+                restored: cw.restored,
+                ..WorkCounts::default()
+            });
+        }
         Stats {
             n_returned: self.returned,
             keys: self.keys,
             docs,
             extra,
-            children: self.inputs.iter().map(Run::stats).collect(),
+            children,
             work,
         }
     }

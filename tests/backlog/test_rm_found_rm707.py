@@ -59,11 +59,11 @@ def test_a_near_over_a_compound_2d_index_with_its_trailing_field_plans_geo_near(
     assert top(rust_mongo) == top(mongod)
 
 
-@pytest.mark.backlog("RM-714")
+@pytest.mark.backlog_fixed("RM-714")
 def test_a_limit_over_a_geo_near_reports_its_works(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's LIMIT over GEO_NEAR_2D (`find` with `limit: 3`)
     reports its work accounting: one work more than the stage below it.
-    This server's LIMIT prints no `works`, `advanced` or `needTime`."""
+    This server's LIMIT printed no `works`, `advanced` or `needTime`."""
     docs = [{"_id": n, "loc": [n, n]} for n in range(12)]
     find = {"filter": {"loc": {"$near": [0, 0]}}, "limit": 3}
 
