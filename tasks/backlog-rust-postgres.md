@@ -1970,14 +1970,38 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a three-way comma join's class constant is each inner index's cond]
       Backlog-ID: RP-1105
 
-- [ ] **A LEFT JOIN nothing reads is not removed.** `explain (costs
-      off) select e.b from e left join k on e.a = k.a` (`k.a` the primary
-      key) is a `Hash Left Join` here; PostgreSQL 15.19 prints `Seq Scan on
-      e` alone, as `remove_useless_joins` drops a LEFT JOIN whose inner side
-      is unique on the ON's columns and read nowhere above
-      (`join_is_removable`). Found while working RP-966.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join nothing reads is removed]
-      Backlog-ID: RP-1060
+- [ ] **A LEFT JOIN to a view or a CTE nothing reads is not removed.**
+      `explain (costs off) select e.b from e left join kv on kv.a = e.a`
+      (`kv` the view `select * from k`, `k.a` the primary key) is a `Hash
+      Left Join` over `Subquery Scan on kv` here; PostgreSQL (a private
+      15.20 cluster) pulls the view up into `k` and removes the join,
+      printing `Seq Scan on e` alone. `with k as (select 1 as a) select e.b
+      from e left join k on k.a = e.a` is removed there too: the CTE is
+      inlined, and a subquery of one row is distinct on any column
+      (`query_is_distinct_for`). RP-1060's removal (`join_removal.rs`)
+      takes only a plain table as the inner side; a pulled-up view, a
+      subquery's distinctness and a NATURAL join are what is left. Found
+      while working RP-1060.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join to a view nothing reads is removed], tests/backlog/test_rp_explain_costs.py::test_plan[a left join to a one-row cte nothing reads is removed]
+      Backlog-ID: RP-1106
+
+- [ ] **A GROUP BY over a cross join with a FROM subquery prints a
+      joined-row key.** `explain (costs off) select e.b, count(*) from e,
+      (select 1) x group by e.b` prints `Group Key: e\x1Fb` (the internal
+      `alias<U+001F>column` key, escaped) over a `Nested Loop` of `e` and
+      `Subquery Scan on x`; PostgreSQL (a private 15.20 cluster) pulls the
+      one-row subquery up and prints `HashAggregate`, `Group Key: e.b`,
+      `Seq Scan on e`. Found while working RP-1060.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a group by over a cross join with a one-row subquery prints its key]
+      Backlog-ID: RP-1107
+
+- [ ] **A Sort above a HashAggregate prints no Sort Key.** `explain
+      (costs off) select e.b, count(*) from e group by e.b order by e.b`
+      prints `Sort` with no `Sort Key` line over `HashAggregate` (`Group
+      Key: b`); PostgreSQL (a private 15.20 cluster) prints `Sort Key: b`.
+      Found while working RP-1060.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sort above a hash aggregate prints its key]
+      Backlog-ID: RP-1108
 
 - [ ] **A LEFT JOIN reduced to inner keeps its ON out of the
       equivalence class.** `explain (costs off) select e.b, k.b from e

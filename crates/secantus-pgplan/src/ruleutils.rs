@@ -7281,6 +7281,9 @@ pub struct VerboseScan {
     /// The relation as the plain plan names it: `k`, `k x`.
     pub plain: String,
     pub output: Vec<String>,
+    /// `output` prefixed, as it prints when the range table holds more
+    /// than this relation.
+    pub output_prefixed: Vec<String>,
     /// Each WHERE conjunct: its text as the plain plan prints it, and
     /// qualified.
     pub quals: Vec<(String, String)>,
@@ -7292,13 +7295,20 @@ pub struct VerboseScan {
     /// Each ORDER BY key that is not a bare column (RP-966): its text
     /// unqualified, as the scan's resjunk `Output` entry, and qualified.
     pub sort_exprs: Vec<(String, String)>,
+    /// The range table holds more than this relation (a join removed,
+    /// RP-1060): the target lists are prefixed too (`show_plan_tlist`'s
+    /// `useprefix`), and so are the plain plan's sort keys.
+    pub prefixed: bool,
 }
 
 /// [`VerboseScan`] for a SELECT over one relation; `None` for any other
-/// shape, or an expression the printer does not know.
+/// shape, or an expression the printer does not know. `prefixed`: the
+/// range table holds more than this relation (a join removed, RP-1060),
+/// so the target list is prefixed too (`show_plan_tlist`'s `useprefix`).
 pub fn explain_verbose_scan(
     s: &pg_query::protobuf::SelectStmt,
     def: &TableDef,
+    prefixed: bool,
 ) -> Option<VerboseScan> {
     let [item] = s.from_clause.as_slice() else {
         return None;
@@ -7334,6 +7344,7 @@ pub fn explain_verbose_scan(
         p
     };
     let mut output = Vec::new();
+    let mut output_prefixed = Vec::new();
     for t in &s.target_list {
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {
             return None;
@@ -7345,11 +7356,19 @@ pub fn explain_verbose_scan(
         );
         if star {
             output.extend(def.columns.iter().map(|c| q(&c.name)));
+            output_prefixed.extend(
+                def.columns
+                    .iter()
+                    .map(|c| format!("{}.{}", q(&refname), q(&c.name))),
+            );
             continue;
         }
         let mut p = printer(true);
         p.expr(val)?;
         output.push(p.buf);
+        let mut p = printer(false);
+        p.expr(val)?;
+        output_prefixed.push(p.buf);
     }
     let mut quals = Vec::new();
     if let Some(w) = s.where_clause.as_deref() {
@@ -7383,10 +7402,12 @@ pub fn explain_verbose_scan(
         relation: format!("{}.{}{suffix}", q(&schema), q(&bare)),
         plain: format!("{}{suffix}", q(&bare)),
         output,
+        output_prefixed,
         quals,
         refname: q(&refname),
         columns: def.columns.iter().map(|c| q(&c.name)).collect(),
         sort_exprs,
+        prefixed,
     })
 }
 

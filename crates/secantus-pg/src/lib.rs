@@ -46826,6 +46826,16 @@ impl PgHandler {
                 "a join source reached execution on its own".into(),
             ))),
             Statement::Explain { inner, options } => {
+                // A LEFT JOIN nothing reads, to a table unique on its ON's
+                // columns: `remove_useless_joins` plans the query without
+                // it (RP-1060).
+                if let Some(r) = options
+                    .join_removals
+                    .iter()
+                    .find(|r| self.unique_index_fixed(&r.table, &r.fixed))
+                {
+                    return self.execute_statement((*r.removed).clone(), max_rows);
+                }
                 // An IN / EXISTS whose inner side is unique on its column:
                 // `reduce_unique_semijoins` plans the inner join (RP-411).
                 if let Some(joined) = options.semi_join.as_ref().and_then(|sj| {
@@ -46886,6 +46896,19 @@ impl PgHandler {
                     }
                 }
                 let mut tree = explain::plan_tree(reordered.as_ref().unwrap_or(&inner), &chooser);
+                // A removed join's relation stays in the range table
+                // (RP-1060): the group keys print qualified.
+                if options.joins_removed {
+                    if let Statement::Aggregate(agg) = inner.as_ref() {
+                        if agg.sub.is_none() && !agg.table.is_empty() {
+                            let alias = options
+                                .scan_alias
+                                .clone()
+                                .unwrap_or_else(|| explain::display_alias(&agg.table));
+                            explain::qualify_group_keys(&mut tree, &alias);
+                        }
+                    }
+                }
                 // Each join's `Inner Unique` (RP-353): a unique index of
                 // the inner table that is immediate, has no WHERE and keys
                 // only plain columns, every one fixed by the join's clauses

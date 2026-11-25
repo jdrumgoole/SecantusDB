@@ -3803,6 +3803,31 @@ mod join_type_tests {
 /// `EXPLAIN VERBOSE` of a plan that is one relation's scan (RP-925): the
 /// relation schema-qualified, its `Output` list first, its quals
 /// prefixed. Every other plan prints as without VERBOSE.
+/// Each `Group Key` of the tree that is a bare column qualified by
+/// `alias`, as a range table of more than one relation prints it
+/// (`show_sort_group_keys`'s `useprefix`; a join removed, RP-1060).
+pub(crate) fn qualify_group_keys(n: &mut PlanNode, alias: &str) {
+    for (label, value) in &mut n.details {
+        if label == "Group Key" {
+            let bare = |k: &str| {
+                !k.is_empty()
+                    && k.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '"')
+            };
+            if value.split(", ").all(bare) {
+                *value = value
+                    .split(", ")
+                    .map(|k| format!("{alias}.{k}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+            }
+        }
+    }
+    for c in &mut n.children {
+        qualify_group_keys(c, alias);
+    }
+}
+
 pub(crate) fn attach_verbose(
     root: &mut PlanNode,
     scan: &Option<secantus_pgplan::ruleutils::VerboseScan>,
@@ -3821,25 +3846,37 @@ pub(crate) fn attach_verbose(
     // A computed key is a resjunk entry the scan computes, which the nodes
     // above it reference: they print it parenthesised, and the Sort Key
     // its qualified text so (RP-966).
+    // With a join removed (RP-1060) the plain plan's keys are already
+    // qualified: a computed one is its qualified text.
     let computed = |key: &str| {
-        v.sort_exprs.iter().find(|(u, _)| {
-            let wrapped = format!("({u})");
-            key == wrapped
+        v.sort_exprs.iter().find_map(|(u, q)| {
+            let wrapped = format!("({})", if v.prefixed { q } else { u });
+            (key == wrapped
                 || key
                     .strip_prefix(&wrapped)
-                    .is_some_and(|r| r.starts_with(' '))
+                    .is_some_and(|r| r.starts_with(' ')))
+            .then_some((u, q, wrapped.len()))
         })
     };
+    let own = format!("{}.", v.refname);
     let mut keys: Vec<String> = Vec::new();
     let mut n: &PlanNode = root;
     while upper(n) {
         if let Some((_, text)) = n.details.iter().find(|(k, _)| k == "Sort Key") {
             for key in text.split(", ") {
-                if let Some((u, _)) = computed(key) {
+                if let Some((u, _, _)) = computed(key) {
                     keys.push(u.clone());
                     continue;
                 }
                 let col = key.split_once(' ').map_or(key, |(c, _)| c);
+                let col = if v.prefixed {
+                    match col.strip_prefix(&own) {
+                        Some(c) => c,
+                        None => return,
+                    }
+                } else {
+                    col
+                };
                 if !v.columns.iter().any(|c| c == col) {
                     return;
                 }
@@ -3851,31 +3888,55 @@ pub(crate) fn attach_verbose(
     if !is_scan_name(&n.name) || !n.children.is_empty() || !n.name.ends_with(&plain) {
         return;
     }
-    let mut output = v.output.clone();
+    // Each entry unqualified, and as it prints: prefixed when the range
+    // table holds more than the scan's relation.
+    let shown = |unqualified: &str, prefixed: &str| {
+        if v.prefixed {
+            prefixed.to_string()
+        } else {
+            unqualified.to_string()
+        }
+    };
+    let mut output: Vec<(String, String)> = v
+        .output
+        .iter()
+        .zip(
+            v.output_prefixed
+                .iter()
+                .chain(std::iter::repeat(&String::new())),
+        )
+        .map(|(u, p)| (u.clone(), shown(u, p)))
+        .collect();
     for col in keys {
-        if !output.contains(&col) {
-            output.push(col);
+        if !output.iter().any(|(u, _)| *u == col) {
+            let printed = match v.sort_exprs.iter().find(|(u, _)| *u == col) {
+                Some((_, q)) => shown(&col, q),
+                None => shown(&col, &format!("{own}{col}")),
+            };
+            output.push((col, printed));
         }
     }
     // A node above the scan references each entry the scan computed, and
     // prints it parenthesised.
     let above: Vec<String> = output
         .iter()
-        .map(|e| {
-            if v.columns.contains(e) {
-                e.clone()
+        .map(|(u, p)| {
+            if v.columns.contains(u) {
+                p.clone()
             } else {
-                format!("({e})")
+                format!("({p})")
             }
         })
         .collect();
+    let output: Vec<String> = output.into_iter().map(|(_, p)| p).collect();
     let mut root = root;
     while upper(root) {
         if let Some(d) = root.details.iter_mut().find(|(k, _)| k == "Sort Key") {
             d.1 =
                 d.1.split(", ")
                     .map(|key| match computed(key) {
-                        Some((u, q)) => format!("({q}){}", &key[u.len() + 2..]),
+                        Some((_, q, len)) => format!("({q}){}", &key[len..]),
+                        None if v.prefixed => key.to_string(),
                         None => format!("{}.{key}", v.refname),
                     })
                     .collect::<Vec<_>>()
@@ -4722,6 +4783,8 @@ mod heap_fetches_tests {
             nullable_gate: None,
             dummy_relation: false,
             semi_join: None,
+            join_removals: Vec::new(),
+            joins_removed: false,
             init_plans: Vec::new(),
             modify_table: None,
             sort_keys: None,

@@ -41,6 +41,18 @@ _ANALYSED = [
     "analyze k",
 ]
 
+# Those, a table unique on a plain unique index, one keyed on a bigint,
+# and a view over `k` (RP-1060).
+_REMOVABLE = _ANALYSED + [
+    "create table u (a int, b text)",
+    "create unique index u_a on u (a)",
+    "insert into u select g, 'x' from generate_series(1, 1000) g",
+    "create table h (a bigint primary key, b text)",
+    "create view kv as select * from k",
+    "analyze u",
+    "analyze h",
+]
+
 # Two tables of ten rows never analysed (RP-1019): the planner sizes each
 # at its default 1,270 rows.
 _NEVER_ANALYSED = [
@@ -2539,6 +2551,146 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         _ANALYSED,
         "explain (costs off) select e.b from e left join k on e.a = k.a",
         ["Seq Scan on e"],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1060): the
+    # shapes `join_is_removable` removes and keeps.
+    "a left join to a unique index's table nothing reads is removed": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join u on e.a = u.a",
+        ["Seq Scan on e"],
+    ),
+    "a left join whose on fixes the key to a constant is removed": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join k on k.a = 3",
+        ["Seq Scan on e"],
+    ),
+    "a left join on a key of another integer type is removed": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join h on e.a = h.a",
+        ["Seq Scan on e"],
+    ),
+    "a left join on an expression of the outer side is removed": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join k on e.a + 1 = k.a",
+        ["Seq Scan on e"],
+    ),
+    "a left join using the key nothing reads is removed": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select a from e left join k using (a)",
+        ["Seq Scan on e"],
+    ),
+    "two left joins nothing reads are both removed": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join k on e.a = k.a left join u on u.a = e.a",
+        ["Seq Scan on e"],
+    ),
+    "a left join only another join's on reads is removed": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select e.b, k.b from e left join k on e.a = k.a "
+        "left join k k2 on k2.a = k.a",
+        [
+            "Hash Left Join",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on k",
+        ],
+    ),
+    "a left join to a table not unique on its on is kept": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join e e2 on e.a = e2.a",
+        [
+            "Hash Left Join",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on e e2",
+        ],
+    ),
+    "a left join the where reads is kept": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join k on e.a = k.a where k.b is null",
+        [
+            "Hash Left Join",
+            "  Hash Cond: (e.a = k.a)",
+            "  Filter: (k.b IS NULL)",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on k",
+        ],
+    ),
+    "a removed left join's scan is priced as the outer relation's": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain select e.b from e left join k on e.a = k.a",
+        ["Seq Scan on e  (cost=0.00..15.00 rows=1000 width=3)"],
+    ),
+    "a removed left join leaves its group keys qualified": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select e.b, count(*) from e left join k on e.a = k.a group by e.b",
+        ["HashAggregate", "  Group Key: e.b", "  ->  Seq Scan on e"],
+    ),
+    "a removed left join leaves its verbose output qualified": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (verbose, costs off) select e.b from e left join k on e.a = k.a",
+        ["Seq Scan on public.e", "  Output: e.b"],
+    ),
+    "a removed left join leaves its verbose sort qualified": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (verbose, costs off) select e.b from e left join k on e.a = k.a order by e.a + 1",
+        [
+            "Sort",
+            "  Output: e.b, ((e.a + 1))",
+            "  Sort Key: ((e.a + 1))",
+            "  ->  Seq Scan on public.e",
+            "        Output: e.b, (e.a + 1)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1060): a view, and a one-row CTE, are removed as a table is.
+    "a left join to a view nothing reads is removed": (
+        "RP-1106",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join kv on kv.a = e.a",
+        ["Seq Scan on e"],
+    ),
+    "a left join to a one-row cte nothing reads is removed": (
+        "RP-1106",
+        _REMOVABLE,
+        "explain (costs off) with k as (select 1 as a) select e.b from e left join k on k.a = e.a",
+        ["Seq Scan on e"],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1060).
+    "a group by over a cross join with a one-row subquery prints its key": (
+        "RP-1107",
+        _ANALYSED,
+        "explain (costs off) select e.b, count(*) from e, (select 1) x group by e.b",
+        ["HashAggregate", "  Group Key: e.b", "  ->  Seq Scan on e"],
+    ),
+    "a sort above a hash aggregate prints its key": (
+        "RP-1108",
+        _ANALYSED,
+        "explain (costs off) select e.b, count(*) from e group by e.b order by e.b",
+        [
+            "Sort",
+            "  Sort Key: b",
+            "  ->  HashAggregate",
+            "        Group Key: b",
+            "        ->  Seq Scan on e",
+        ],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): a LEFT
     # JOIN an inner ON reduces to an inner one joins on its class.
@@ -8470,6 +8622,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1060",
         "RP-1038",
         "RP-1039",
         "RP-1025",
