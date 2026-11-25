@@ -142,13 +142,13 @@ def test_pg_get_partkeydef_of_an_expression_key(dsn: str) -> None:
     ) == ["DROP TABLE", "CREATE TABLE", [("RANGE (((x + 1)))",)], "DROP TABLE"]
 
 
-@pytest.mark.backlog("RP-1053")
+@pytest.mark.backlog_fixed("RP-1053")
 def test_a_renamed_column_is_renamed_in_a_generated_column(dsn: str) -> None:
     """A generated column's expression holds the column's attnum: after
     `rename column x to y` an INSERT still computes it, `(3, 6)`, on
-    PostgreSQL 15.19 (shared reference, port 5415). Here the stored
-    expression still names `x`, so the INSERT is 42703. Found while
-    working RP-1024."""
+    PostgreSQL 15.19 (shared reference, port 5415). The stored expression
+    still named `x`, so the INSERT was 42703. Found while working
+    RP-1024."""
     assert _script(
         dsn,
         [
@@ -160,6 +160,38 @@ def test_a_renamed_column_is_renamed_in_a_generated_column(dsn: str) -> None:
             "drop table p1024g",
         ],
     ) == ["DROP TABLE", "CREATE TABLE", "ALTER TABLE", "INSERT 0 1", [(3, 6)], "DROP TABLE"]
+
+
+@pytest.mark.backlog_fixed("RP-1053")
+def test_a_rename_to_a_quoted_name_is_printed_in_a_generated_column(dsn: str) -> None:
+    """The renamed expression prints quoted where the new name needs it,
+    in `information_schema.columns.generation_expression` and
+    `pg_get_expr` of its `pg_attrdef` row, and still computes:
+    `(("Big Y" * 2) + z)` and `(3, 1, 7)` on PostgreSQL 15.19 (shared
+    reference, port 5415)."""
+    assert _script(
+        dsn,
+        [
+            "drop table if exists q1053",
+            'create table q1053 ("X" int, z int, g int generated always as ("X" * 2 + z) stored)',
+            'alter table q1053 rename column "X" to "Big Y"',
+            "select generation_expression from information_schema.columns"
+            " where table_name = 'q1053' and column_name = 'g'",
+            "select pg_get_expr(adbin, adrelid) from pg_attrdef where adrelid = 'q1053'::regclass",
+            'insert into q1053 ("Big Y", z) values (3, 1)',
+            "select * from q1053",
+            "drop table q1053",
+        ],
+    ) == [
+        "DROP TABLE",
+        "CREATE TABLE",
+        "ALTER TABLE",
+        [('(("Big Y" * 2) + z)',)],
+        [('(("Big Y" * 2) + z)',)],
+        "INSERT 0 1",
+        [(3, 1, 7)],
+        "DROP TABLE",
+    ]
 
 
 @pytest.mark.backlog("RP-1054")

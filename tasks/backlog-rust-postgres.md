@@ -2845,14 +2845,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415).
       list's, the expression's, the OpExpr's); here `RANGE ((x + 1))`.
       Verify: tests/backlog/test_rp_found_rp860.py::test_pg_get_partkeydef_of_an_expression_key
       Backlog-ID: RP-1052
-- [ ] **A renamed column leaves a generated column naming the old one,
-      and the table takes no more rows.** On `(x int, g int generated
-      always as (x * 2) stored)`, after `rename column x to y`, PostgreSQL
-      15.19 inserts `(3, 6)`; here the stored expression still names `x`,
-      42703. Faithful: rename it as the RENAME COLUMN arm does for CHECKs
-      and the partition key (`rename_column_in_expression`).
-      Verify: tests/backlog/test_rp_found_rp860.py::test_a_renamed_column_is_renamed_in_a_generated_column
-      Backlog-ID: RP-1053
 - [ ] **A renamed column leaves an expression index naming the old one,
       and the table takes no more rows.** After `create index i on t ((x +
       1)) where x > 0` and `rename column x to y`, PostgreSQL 15.19 inserts
