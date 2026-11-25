@@ -4,7 +4,7 @@ literal written to a composite or domain-array column, or coerced as an
 `ARRAY[]` element or an `INSERT ... SELECT` output column, reported a
 field's domain error with no position; fixed), RP-1044 (a `text` SELECT
 column written to a composite column was accepted; fixed), RP-1048 (a
-`text` SELECT column written to a domain-array column is accepted), RP-1049
+`text` SELECT column written to a domain-array column was accepted; fixed), RP-1049
 (a `record` SELECT column written to a composite column is accepted), RP-1050
 (a UNION of a composite and a record has no error position), RP-946
 (a NULL element of a NOT NULL domain's array literal was accepted; fixed),
@@ -195,14 +195,36 @@ def test_prepare_error_location(query: str, dsn: str) -> None:
     assert answer(dsn, query) == PREPARED[query]
 
 
-@pytest.mark.backlog("RP-1048")
-def test_insert_select_text_into_domain_array(dsn: str) -> None:
-    """`text` has no assignment cast to `pint[]`; here it is read as the array."""
-    assert answer(dsn, "insert into tct(d) select '{1}' union all select '{1}'") == (
+_PINT_ARRAY = 'column "d" is of type pint[] but expression is of type {}'
+
+# `find_coercion_pathway` recurses into two arrays' elements, and `int` is
+# `pint`'s base: an array of a type with an assignment cast to `int` is
+# coerced, anything else (`text`, `text[]`, a `NULL` typed `text`) is 42804.
+DOMAIN_ARRAY = {
+    "insert into tct(d) select '{1}' union all select '{1}'": (
         "42804",
-        'column "d" is of type pint[] but expression is of type text',
+        _PINT_ARRAY.format("text"),
         "27",
-    )
+    ),
+    "insert into tct(d) select '{1}'::text": ("42804", _PINT_ARRAY.format("text"), "27"),
+    "insert into tct(d) select array['1'::text]": (
+        "42804",
+        _PINT_ARRAY.format("text[]"),
+        "27",
+    ),
+    "insert into tct(d) select null::text": ("42804", _PINT_ARRAY.format("text"), "27"),
+    "insert into tct(d) select array[1]": "INSERT 0 1",
+    "insert into tct(d) select array[1::int8]": "INSERT 0 1",
+    "insert into tct(d) select array[1.5]": "INSERT 0 1",
+}
+
+
+@pytest.mark.backlog_fixed("RP-1048")
+@pytest.mark.parametrize("query", list(DOMAIN_ARRAY))
+def test_insert_select_text_into_domain_array(query: str, dsn: str) -> None:
+    """`text` has no assignment cast to `pint[]`; it was read as the array,
+    where the target's domain element is now looked through to `int`."""
+    assert answer(dsn, query) == DOMAIN_ARRAY[query]
 
 
 @pytest.mark.backlog("RP-1049")

@@ -2495,15 +2495,6 @@ Measured on PostgreSQL 15.19 with `create domain pint as int check (value >
 text)` and `create table tct (c ctp, d pint[])` holding `('(1,x)', null)`.
 The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
 
-- [ ] **A `text` column an `INSERT ... SELECT` writes to a domain-array
-      column is accepted.** `insert into tct(d) select '{1}' union all
-      select '{1}'` is 42804 `column "d" is of type pint[] but expression is
-      of type text` at 27 on PostgreSQL 15.19; here the text is read as the
-      array. `check_insert_select_types` (secantus-pg) skips a target whose
-      type `oid_of_name` cannot name, which an array of a domain is. Found
-      while working RP-1044, which closed the composite case there.
-      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_text_into_domain_array
-      Backlog-ID: RP-1048
 - [ ] **A `record` column an `INSERT ... SELECT` writes to a composite
       column is accepted.** `insert into tct(c) select row(1,'x')` is 42846
       `cannot cast type record to ctp` at 27 on PostgreSQL 15.19 (a
@@ -2519,6 +2510,42 @@ The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
       position is missing. Found while working RP-1044.
       Verify: tests/backlog/test_rp_found_rp552.py::test_union_composite_record_position
       Backlog-ID: RP-1050
+
+## Found while working RP-1048 (2026-11-25)
+
+Measured on PostgreSQL 15.20 with `create domain pint48 as int check (value
+> 0)`, `create domain dia48 as int[]`, `create domain vd48 as varchar(3)`,
+`create table t48 (p pint48, a dia48)` and `create table t48v (x vd48[])`.
+The gap tests are in `tests/backlog/test_rp_found_rp1048.py`.
+
+- [ ] **A 42804 assignment error names a domain column by its base type.**
+      `insert into t48(p) values ('1'::text)` is 42804 `column "p" is of
+      type pint48 but expression is of type text` at 28 on PostgreSQL 15.20
+      (`format_type_be` of the column's own type); here it says `of type
+      integer`. The same in `UPDATE`, in `INSERT ... SELECT`, and for a
+      domain over an array (`dia48`, here `integer[]`). A plain domain
+      column's `pg_type` is its base, the domain in `extra.domain_type`,
+      and `assignment_mismatch` (secantus-pgplan) prints `pg_type`.
+      Verify: tests/backlog/test_rp_found_rp1048.py::test_domain_column_named_in_42804
+      Backlog-ID: RP-1083
+- [ ] **A value too long for a `varchar(n)` domain is stored in an array of
+      that domain.** `insert into t48v(x) values (array['abcd'::text])`, the
+      same through `INSERT ... SELECT`, and the untyped `'{abcd}'` are each
+      22001 `value too long for type character varying(3)` on PostgreSQL
+      15.20 (the `ArrayCoerceExpr` applies the element domain's length
+      coercion; the literal's error is at 29); here the row is stored.
+      Verify: tests/backlog/test_rp_found_rp1048.py::test_domain_array_element_length
+      Backlog-ID: RP-1084
+- [ ] **A user type created unqualified under a non-public `search_path`
+      is created in `public`.** After `create schema s48; set search_path =
+      s48`, `create domain d48 as int`, `create type c48 as (a int)` and
+      `create type e48 as enum ('a')` are each in `s48` on PostgreSQL 15.20
+      (the creation namespace is the path's first schema,
+      `QualifiedNameGetCreationNamespace`); here all three are in `public`,
+      and `create table tt48 (d d48, c c48, e e48)` is then 42704 `type
+      "d48" does not exist`. A table and a sequence go to `s48` correctly.
+      Verify: tests/backlog/test_rp_found_rp1048.py::test_type_created_in_search_path_schema
+      Backlog-ID: RP-1085
 
 ## Found while working RP-534 (2026-11-08)
 
