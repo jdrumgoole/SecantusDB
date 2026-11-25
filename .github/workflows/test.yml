@@ -1851,6 +1851,9 @@ jobs:
           # A `bpchar` PRIMARY KEY keyed trimmed, its row's value as
           # written (RP-693), with 15.19's answers written in. Binary only.
           files="$files tests/test_rust_pg_bpchar_key.py"
+          # An unaliased CASE column named by its ELSE result, with
+          # PostgreSQL 15.20's names written in (RP-1046). Binary only.
+          files="$files tests/test_rust_pgserver_case_colname.py"
           else
           files=""
           # The DIFFERENTIAL suite, whole: 836 cases against the PostgreSQL 14
