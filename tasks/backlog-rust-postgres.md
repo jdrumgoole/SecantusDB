@@ -1213,8 +1213,35 @@ one beside it.
       runner: more interleaved rounds, the median of several fastest-of-N
       pairs, or a threshold measured on CI's own runner shape. Then bisect
       the 0.6 ms. Do not just widen a threshold until it passes.
-      Verify: none -- intermittent on CI; RP-715's and RP-911's regression tests are the check
+      A third, the same evening: RP-1073's new 3,200-table pair, a median
+      of 25.3 ms with no other table against 31.4 ms with 3,200 (ratio
+      median 1.22, rounds 1.04 to 1.60, over its 1.10 plus 1 ms; PR #2998 at
+      `432c8ec3e`, RP-1065's EXPLAIN-only change, run 45711355695), where
+      the snapshot before (#2996, which carried RP-1073) passed it and the
+      local debug build measures 13.1 ms against 14.3 ms (1.10).
+      Verify: none -- intermittent on CI; RP-715's, RP-911's and RP-1073's regression tests are the check
       Backlog-ID: RP-1100
+
+- [ ] **`test_catalog_blocks` once counted an extra `pg_attribute` block
+      on CI (2026-11-25).** `tests/backlog/test_rp_catalog_reads.py::test_catalog_blocks`
+      (RP-291's regression test) read 4 `pg_attribute` heap blocks for
+      `select * from rpc_t where id = 1`, where PostgreSQL 15.19 reads 3
+      (third step; the other steps matched). PR #2998 at `432c8ec3e`, job
+      `pg-oracle (backlog)`, run 45711355695. It passed on every other run
+      found that day, #2996's (the same tree less RP-1065, whose change is
+      EXPLAIN-only) included. Not reproduced locally (debug, arm64 macOS):
+      alone on RP-1065's tree and on the tree before it; the whole module
+      serially, twice; each of the 29 tests defined after it run just before
+      it on one server; and eight runs on one server with
+      `autovacuum_naptime = 1s` (the expected counts were measured with
+      autovacuum off). The module shares one server (`rust_pg` is
+      module-scoped) and CI runs it `-n auto --dist worksteal`, so the
+      tests before it on its server are not fixed; a combination of
+      earlier tests, or a race with something the server does in the
+      background, is what is left. PostgreSQL reads the same blocks for
+      the same query every time.
+      Verify: none -- intermittent (1 CI run), not reproducible on demand; the test named above is where it shows
+      Backlog-ID: RP-1111
 
 ## Found by a CI run (2026-11-07)
 
