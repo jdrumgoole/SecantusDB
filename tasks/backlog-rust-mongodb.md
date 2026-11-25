@@ -2162,27 +2162,6 @@ bucket documents in `system.buckets.<name>`, each data field mongod's
 compressed column, placed by mongod's bucket catalog
 (`crates/secantus-commands/src/bucket_catalog.rs`). What is left:
 
-- [ ] **RUST MongoDB server: `serverStatus` has no `bucketCatalog`
-      section.** mongod 8.2.11 reports one once a time-series collection is
-      written to: `numBuckets`, `numOpenBuckets`, `numIdleBuckets`,
-      `numArchivedBuckets`, `memoryUsage`, the execution counters
-      (`numBucketInserts`, `numBucketUpdates`, `numCommits`,
-      `numMeasurementsCommitted`, the `numBucketsClosedDueTo...` and
-      `numBucketReopeningsFailedDueTo...` families and the rest, 45 fields in
-      all, in one order) and `stateManagement` (`bucketsManaged`,
-      `currentEra`, `erasWithRemainingBuckets`, `trackedClearOperations`).
-      None before the first write. This server reports no section. Every
-      field but `memoryUsage` is the catalog's own state
-      (`crates/secantus-commands/src/bucket_catalog.rs`): report it from what
-      the catalog keeps, counting as mongod does (a commit per bucket per
-      batch, an update when a measurement joins an open bucket, and so on).
-      `memoryUsage` is reported with the key but its value is RM-710's.
-      Measured 2026-11-11 and 2026-11-16 (a time-series collection gives a
-      section after four inserts over two metadata values: `numBuckets` 2,
-      `numCommits` 2, `numMeasurementsCommitted` 4). (This was part of
-      RM-549, split 2026-11-16, Joe's go-ahead.)
-      Verify: tests/backlog/test_rm_found_2026_11_11_rm088.py::test_server_status_reports_the_bucket_catalog, tests/backlog/test_rm_bucket_catalog.py::test_bucket_catalog_counts_and_counters_follow_the_writes
-      Backlog-ID: RM-709
 - [ ] **RUST MongoDB server: the bucket catalog keeps no account of its
       memory.** mongod 8.2.11's `bucketCatalog.memoryUsage` is the bytes its
       own C++ structures allocate through tracking allocators: 12552 with one
@@ -2196,8 +2175,8 @@ compressed column, placed by mongod's bucket catalog
       the bytes mongod's structures allocate through its tracking
       allocators, so `memoryUsage` follows mongod's. The size limit's memory
       accounting (`getCacheDerivedBucketMaxSize`, decided 2026-10-16) does
-      not depend on it and is built. Needs RM-709's section to report it
-      through, and RM-711's expiry needs this. (This was part of RM-549, split
+      not depend on it and is built. `serverStatus`'s section reports
+      `memoryUsage` as 0 until this lands, and RM-711's expiry needs this. (This was part of RM-549, split
       2026-11-16, Joe's go-ahead.)
       Verify: tests/backlog/test_rm_bucket_catalog.py::test_bucket_catalog_memory_usage_is_the_bytes_mongod_accounts
       Backlog-ID: RM-710
@@ -2213,10 +2192,31 @@ compressed column, placed by mongod's bucket catalog
       Which expire depends on the stripe each lands in, so only the facts
       are pinned. This server never expires an idle bucket, and refuses the
       `setParameter` (code 72). **Waits on RM-710** (the memory accounting
-      decides when the threshold is passed) and needs RM-709's counters. (This was part of RM-549, split 2026-11-16, Joe's
+      decides when the threshold is passed) and counts through the `bucketCatalog` section's counters. (This was part of RM-549, split 2026-11-16, Joe's
       go-ahead.)
       Verify: tests/backlog/test_rm_bucket_catalog.py::test_idle_buckets_expire_past_the_memory_threshold
       Backlog-ID: RM-711
+- [ ] **RUST MongoDB server: `bucketCatalog`'s open and archived counts
+      split differently from mongod's.** mongod 8.2.11 reports
+      `numOpenBuckets` from its stripes' open buckets and
+      `numArchivedBuckets` as the active buckets less those; after a
+      series' bucket rolls forward two days and a measurement for that
+      series' earlier window arrives (with other series and a count
+      rollover beside it), mongod has 5 buckets, 3 open, 2 archived and 4
+      managed, where this server has 4 open and 1 archived. Find which
+      bucket mongod holds outside its open set (measured 2026-11-25).
+      Verify: tests/backlog/test_rm_bucket_catalog.py::test_open_and_archived_buckets_split_as_mongod_counts_them
+      Backlog-ID: RM-798
+- [ ] **RUST MongoDB server: a dropped collection's buckets are cleared at
+      once, not by era.** mongod 8.2.11's bucket state manager clears them
+      lazily: a drop opens a new era (`currentEra` 1,
+      `trackedClearOperations` 1) and the dropped buckets stay among the
+      open and managed ones (`numOpenBuckets` 2 with `numBuckets` 1, so
+      `numArchivedBuckets` -1) until they are next touched. This server
+      forgets them at once and reports `currentEra` 0 (measured
+      2026-11-25).
+      Verify: tests/backlog/test_rm_bucket_catalog.py::test_dropping_a_collection_clears_its_buckets_by_era
+      Backlog-ID: RM-799
 - **Scope decision — `listCollections` order around time-series buckets.**
   This server puts each bucket namespace after its collection and
   `system.views` last; mongod's order is not stable between two runs of the

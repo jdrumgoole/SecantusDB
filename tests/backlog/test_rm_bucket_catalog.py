@@ -55,7 +55,7 @@ def _without_memory(section: dict) -> list:
     return [(k, "<bytes>" if k == "memoryUsage" else v) for k, v in section.items()]
 
 
-@pytest.mark.backlog("RM-709")
+@pytest.mark.backlog_fixed("RM-709")
 def test_bucket_catalog_counts_and_counters_follow_the_writes(tmp_path: pathlib.Path) -> None:
     """mongod 8.2.11, a fresh server: no section before the first write;
     after four inserts over two metadata values (`numBuckets` 2,
@@ -64,7 +64,8 @@ def test_bucket_catalog_counts_and_counters_follow_the_writes(tmp_path: pathlib.
     currentEra: 0, erasWithRemainingBuckets: 1, trackedClearOperations: 0}`),
     and after one more measurement into an open bucket (the bucket updated:
     `numBucketUpdates` 1, `numBuckets` still 2). Every field but
-    `memoryUsage` is compared, in order."""
+    `memoryUsage` is compared, in order; this server reported no section
+    before RM-709."""
     t = dt.datetime(2026, 1, 1)
 
     def probe(client: Any) -> list:
@@ -153,4 +154,63 @@ def test_idle_buckets_expire_past_the_memory_threshold(tmp_path: pathlib.Path) -
         "closed_equals_archived": True,
         "all_documents_stored": True,
     }
+    assert got == want
+
+
+def _split(client: Any) -> list:
+    s = _section(client)
+    return [s.get(k) for k in ("numBuckets", "numOpenBuckets", "numArchivedBuckets")] + [
+        s.get("stateManagement", {}).get("bucketsManaged")
+    ]
+
+
+@pytest.mark.backlog("RM-798")
+def test_open_and_archived_buckets_split_as_mongod_counts_them(tmp_path: pathlib.Path) -> None:
+    """mongod 8.2.11 (measured 2026-11-25): a measurement for metadata 0 at
+    `t`, after that series' bucket rolled forward to `t + 2 days`, leaves
+    `numBuckets` 5 as here, but `numOpenBuckets` 3 and `numArchivedBuckets`
+    2 (`bucketsManaged` 4); this server counts 4 open and 1 archived."""
+    t = dt.datetime(2026, 1, 1)
+
+    def probe(client: Any) -> list:
+        coll = _make(client)
+        coll.insert_many([{"t": t, "m": i % 2} for i in range(4)])
+        coll.insert_one({"t": t, "m": 0})
+        coll.insert_one({"t": t + dt.timedelta(days=2), "m": 0})
+        coll.insert_one({"t": t - dt.timedelta(days=2), "m": 1})
+        coll.insert_many([{"t": t, "m": 5, "v": i} for i in range(1005)])
+        coll.insert_one({"t": t, "m": 0, "v": "str"})
+        return _split(client)
+
+    with _fresh_pair(tmp_path) as (rust, ref):
+        got, want = probe(rust), probe(ref)
+    assert want == [5, 3, 2, 4]
+    assert got == want
+
+
+@pytest.mark.backlog("RM-799")
+def test_dropping_a_collection_clears_its_buckets_by_era(tmp_path: pathlib.Path) -> None:
+    """mongod 8.2.11 (measured 2026-11-25) clears a dropped collection's
+    buckets lazily, by era: after two time-series collections hold a bucket
+    each and one is dropped, `numBuckets` is 1 but `numOpenBuckets` stays 2
+    (`numArchivedBuckets` -1), and `stateManagement` reads `bucketsManaged`
+    2, `currentEra` 1, `trackedClearOperations` 1. This server forgets the
+    buckets at once and keeps no eras."""
+    t = dt.datetime(2026, 1, 1)
+
+    def probe(client: Any) -> list:
+        db = client["rm_bucket_catalog"]
+        for name in ("a", "b"):
+            db.create_collection(name, timeseries={"timeField": "t", "metaField": "m"})
+            db[name].insert_one({"t": t, "m": 0})
+        db.a.drop()
+        s = _section(client)
+        return _split(client) + [
+            s["stateManagement"]["currentEra"],
+            s["stateManagement"]["trackedClearOperations"],
+        ]
+
+    with _fresh_pair(tmp_path) as (rust, ref):
+        got, want = probe(rust), probe(ref)
+    assert want == [1, 2, -1, 2, 1, 1]
     assert got == want

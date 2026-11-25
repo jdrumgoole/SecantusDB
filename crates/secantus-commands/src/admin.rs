@@ -5041,6 +5041,16 @@ pub fn server_status(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     if let Some(status) = status {
         reply.insert("asserts", status.asserts());
     }
+    // The time-series bucket catalog (RM-709), once a time-series
+    // collection has been written to.
+    if let Some(section) = ctx
+        .storage()
+        .ok()
+        .and_then(|s| s.bucket_catalog())
+        .and_then(|c| c.server_status())
+    {
+        reply.insert("bucketCatalog", section);
+    }
     // mongo-c-driver's `/Client/exhaust_cursor/{single,pool}` read
     // `connections.totalCreated` off serverStatus to check the connection
     // pool wasn't cleared. Omitting the section made those fail with
