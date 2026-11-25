@@ -5,7 +5,8 @@ literal written to a composite or domain-array column, or coerced as an
 field's domain error with no position; fixed), RP-1044 (a `text` SELECT
 column written to a composite column was accepted; fixed), RP-1048 (a
 `text` SELECT column written to a domain-array column was accepted; fixed), RP-1049
-(a `record` SELECT column written to a composite column is accepted), RP-1050
+(a `record` SELECT column written to a composite column was accepted;
+fixed), RP-1086 (one written to a non-composite column is 0A000), RP-1050
 (a UNION of a composite and a record has no error position), RP-946
 (a NULL element of a NOT NULL domain's array literal was accepted; fixed),
 RP-947 (a
@@ -33,11 +34,15 @@ _SETUP = [
     "deallocate all",
     "drop table if exists tct cascade",
     "drop table if exists tnn cascade",
+    "drop table if exists tdc cascade",
+    "drop domain if exists dctp cascade",
     "drop type if exists ctp cascade",
     "drop domain if exists pint, nnint cascade",
     "create domain pint as int check (value > 0)",
     "create domain nnint as int not null",
     "create type ctp as (a pint, b text)",
+    "create domain dctp as ctp",
+    "create table tdc (e dctp)",
     "create table tct (c ctp, d pint[])",
     "create table tnn (x nnint[])",
     "insert into tct(c) values ('(1,x)')",
@@ -51,7 +56,7 @@ _NNINT = "domain nnint does not allow null values"
 def dsn(rust_pg: object) -> Iterator[str]:
     yield _dsn(rust_pg) + " dbname=postgres"
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
-        for q in _SETUP[:5]:
+        for q in _SETUP[:7]:
             c.execute(q)
 
 
@@ -227,12 +232,38 @@ def test_insert_select_text_into_domain_array(query: str, dsn: str) -> None:
     assert answer(dsn, query) == DOMAIN_ARRAY[query]
 
 
-@pytest.mark.backlog("RP-1049")
+@pytest.mark.backlog_fixed("RP-1049")
 def test_insert_select_record_into_composite(dsn: str) -> None:
-    """`record` to `ctp` is not an assignment coercion; here it is stored."""
+    """`record` to `ctp` is not an assignment coercion; it was stored."""
     assert answer(dsn, "insert into tct(c) select row(1,'x')") == (
         "42846",
         "cannot cast type record to ctp",
+        "27",
+    )
+
+
+@pytest.mark.backlog_fixed("RP-1049")
+def test_insert_select_record_into_domain_over_composite(dsn: str) -> None:
+    """The refusal names the domain, the column's own type, not its base."""
+    assert answer(dsn, "insert into tdc(e) select row(1,'x')") == (
+        "42846",
+        "cannot cast type record to dctp",
+        "27",
+    )
+
+
+@pytest.mark.backlog_fixed("RP-1049")
+def test_values_record_into_composite_is_stored(dsn: str) -> None:
+    """A `RowExpr` written directly, as in `VALUES`, is coerced and stored."""
+    assert answer(dsn, "insert into tct(c) values (row(1,'x')), (row(2,'y'))") == "INSERT 0 2"
+
+
+@pytest.mark.backlog("RP-1086")
+def test_insert_select_record_into_non_composite(dsn: str) -> None:
+    """`record` to `pint[]` has no assignment cast; here it is 0A000."""
+    assert answer(dsn, "insert into tct(d) select row(1,'x')") == (
+        "42804",
+        'column "d" is of type pint[] but expression is of type record',
         "27",
     )
 

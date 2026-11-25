@@ -2495,14 +2495,17 @@ Measured on PostgreSQL 15.19 with `create domain pint as int check (value >
 text)` and `create table tct (c ctp, d pint[])` holding `('(1,x)', null)`.
 The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
 
-- [ ] **A `record` column an `INSERT ... SELECT` writes to a composite
-      column is accepted.** `insert into tct(c) select row(1,'x')` is 42846
-      `cannot cast type record to ctp` at 27 on PostgreSQL 15.19 (a
-      `RowExpr` is coerced to a composite only where it is written, as in
-      `VALUES`, not through a subquery's output column); here the row is
-      stored. RP-1044's check lets `record` through for this reason.
-      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_record_into_composite
-      Backlog-ID: RP-1049
+- [ ] **A `record` column an `INSERT ... SELECT` writes to a
+      non-composite column is 0A000.** `insert into tct(d) select
+      row(1,'x')` is 42804 `column "d" is of type pint[] but expression is
+      of type record` at 27 on PostgreSQL 15.20, and an `int` column's is
+      the same with `integer`; here each is 0A000 `a record cast to pint[]
+      is not supported yet` (`int4`) with no position, from the row write
+      after `check_insert_select_types` (secantus-pg) found no name for the
+      source type. Found while working RP-1049, which closed the composite
+      target there.
+      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_record_into_non_composite
+      Backlog-ID: RP-1086
 - [ ] **A UNION of a composite and a `record` has no error position.**
       `insert into tct(c) select (1,'x')::ctp union select row(2,'y')` is
       42804 `UNION types ctp and record cannot be matched` at 53 (the right
