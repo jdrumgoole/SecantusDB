@@ -420,8 +420,8 @@ enum U {
     Nor(Vec<U>),
     Not(Box<U>),
     Eq(String, Bson),
-    /// The equalities, and whether the list held a regex.
-    In(String, Vec<Bson>, bool),
+    /// The equalities, and the regexes the list held.
+    In(String, Vec<Bson>, Vec<bson::Regex>),
     /// `{$exists: true}`; `false` parses as its `$not`.
     Exists(String),
     /// Any other predicate on a path: its operator and operand.
@@ -478,7 +478,12 @@ impl U {
                                 .filter(|b| !matches!(b, Bson::RegularExpression(_)))
                                 .cloned()
                                 .collect(),
-                            a.iter().any(|b| matches!(b, Bson::RegularExpression(_))),
+                            a.iter()
+                                .filter_map(|b| match b {
+                                    Bson::RegularExpression(r) => Some(r.clone()),
+                                    _ => None,
+                                })
+                                .collect(),
                         ),
                         _ => U::Opaque,
                     },
@@ -596,7 +601,7 @@ fn renamed(u: &U, to: &str) -> Option<M> {
     };
     Some(match u {
         U::Eq(p, v) => M::Leaf(path(p), Leaf::Eq, v.clone()),
-        U::In(p, vs, false) => M::Leaf(path(p), Leaf::In, Bson::Array(vs.clone())),
+        U::In(p, vs, res) if res.is_empty() => M::Leaf(path(p), Leaf::In, Bson::Array(vs.clone())),
         U::Exists(p) => M::Leaf(path(p), Leaf::Exists, Bson::Boolean(true)),
         U::Other(p, op, v) => {
             let kind = match op.as_str() {
@@ -803,6 +808,108 @@ fn namespace_regex(re: &(String, String), path: &str) -> M {
     ])
 }
 
+/// The equalities an `$in` holds besides its regexes, as mongod parses
+/// them: an `$eq` of one, an `$in` of several.
+fn equalities(p: &str, vs: &[Bson]) -> U {
+    match vs {
+        [v] => U::Eq(p.to_string(), v.clone()),
+        _ => U::In(p.to_string(), vs.to_vec(), Vec::new()),
+    }
+}
+
+fn regex_pair(r: &bson::Regex) -> (String, String) {
+    (r.pattern.clone(), r.options.clone())
+}
+
+/// The command and write branches of a namespace rewrite.
+fn branches(m: M) -> Option<(Vec<M>, Vec<M>)> {
+    let M::Or(mut top) = m else { return None };
+    if top.len() != 2 {
+        return None;
+    }
+    let side = |m: M| match m {
+        M::And(mut c) if c.len() == 2 => match c.swap_remove(0) {
+            M::Or(v) => Some(v),
+            other => Some(vec![other]),
+        },
+        _ => None,
+    };
+    let crud = side(top.pop()?)?;
+    let cmd = side(top.pop()?)?;
+    Some((cmd, crud))
+}
+
+/// Appends the lists' first items, then their second, and so on.
+fn interleave(out: &mut Vec<M>, mut lists: Vec<std::vec::IntoIter<M>>) {
+    loop {
+        let before = out.len();
+        out.extend(lists.iter_mut().filter_map(Iterator::next));
+        if out.len() == before {
+            return;
+        }
+    }
+}
+
+/// mongod's `matchRewriteGenericNamespace` for an `$in` on `ns` holding
+/// regexes: each command field and a write's `ns` match an equality or a
+/// regex, the equalities as [`rewrite_namespace`] has them and each regex
+/// as [`namespace_regex`]'s `$expr`.
+fn namespace_in_regex(p: &str, vs: &[Bson], res: &[bson::Regex], path: &str) -> Option<M> {
+    let (mut cmd, mut crud) = (Vec::new(), Vec::new());
+    let mut eq_db_drop = None;
+    if !vs.is_empty() {
+        let eq = equalities(p, vs);
+        match rewrite_namespace(&eq, path) {
+            Some(m @ M::Or(_)) => {
+                let (mut c, w) = branches(m)?;
+                if matches!(part_of(path), Some(Part::Db)) {
+                    // `ns.db`: the `dropDatabase` branch takes the regexes too.
+                    eq_db_drop = Some(c.remove(0));
+                }
+                cmd = c;
+                crud = w;
+            }
+            Some(M::False) => {}
+            other => return other,
+        }
+    }
+    // Each field takes its regexes together, field by field.
+    let mut drop_regexes = Vec::new();
+    let (mut cmds, mut cruds) = (Vec::new(), Vec::new());
+    for r in res {
+        let Some((mut c, w)) = branches(namespace_regex(&regex_pair(r), path)) else {
+            continue;
+        };
+        if matches!(part_of(path), Some(Part::Db)) {
+            if let M::And(mut d) = c.remove(0) {
+                drop_regexes.push(d.pop().expect("the regex"));
+            }
+        }
+        cmds.push(c.into_iter());
+        cruds.push(w.into_iter());
+    }
+    interleave(&mut cmd, cmds);
+    interleave(&mut crud, cruds);
+    if matches!(part_of(path), Some(Part::Db)) {
+        let mut on_ns = Vec::new();
+        if let Some(M::And(mut d)) = eq_db_drop {
+            on_ns.push(d.pop().expect("the namespace"));
+        }
+        on_ns.extend(drop_regexes);
+        cmd.insert(
+            0,
+            M::And(vec![leaf("o.dropDatabase", Leaf::Eq, 1_i32), M::Or(on_ns)]),
+        );
+    }
+    if cmd.is_empty() && crud.is_empty() {
+        return Some(M::False);
+    }
+    Some(M::Or(vec![
+        M::And(vec![M::Or(cmd), op_is("c")]),
+        M::And(vec![M::Or(crud), M::Not(Box::new(op_is("c")))]),
+    ]))
+}
+
 /// mongod's `matchRewriteGenericNamespace` for `ns`, `$eq` and `$in`: the
 /// commands' `o` fields that name the namespace, and a write's `ns`.
 /// A regex is [`namespace_regex`]'s.
@@ -810,11 +917,15 @@ fn rewrite_namespace(u: &U, path: &str) -> Option<M> {
     if let Some(re) = regex_of(u) {
         return Some(namespace_regex(&re, path));
     }
+    if let U::In(p, vs, res) = u {
+        if !res.is_empty() {
+            return namespace_in_regex(p, vs, res, path);
+        }
+    }
     let parts: Vec<&str> = path.split('.').collect();
     let (values, many): (Vec<Bson>, bool) = match u {
         U::Eq(_, v) => (vec![v.clone()], false),
-        U::In(_, _, true) => return None,
-        U::In(_, vs, false) => (vs.clone(), true),
+        U::In(_, vs, _) => (vs.clone(), true),
         _ => return None,
     };
     let (mut cmd, mut crud) = (Vec::new(), Vec::new());
@@ -910,10 +1021,31 @@ fn rewrite_to(u: &U, path: &str) -> Option<M> {
             None => M::False,
         });
     }
+    if let U::In(p, vs, res) = u {
+        if !res.is_empty() {
+            // Each equality and each regex, as mongod's `$or` of them.
+            let mut on_to = Vec::new();
+            if !vs.is_empty() {
+                let eq = equalities(p, vs);
+                match rewrite_to(&eq, path) {
+                    Some(M::And(mut c)) if c.len() == 2 => on_to.push(c.swap_remove(0)),
+                    Some(M::False) => {}
+                    _ => return None,
+                }
+            }
+            if let Some(part) = part_of(path) {
+                on_to.extend(res.iter().map(|r| ns_regex("o.to", part, &regex_pair(r))));
+            }
+            return Some(if on_to.is_empty() {
+                M::False
+            } else {
+                M::And(vec![M::Or(on_to), op_is("c")])
+            });
+        }
+    }
     let (values, many): (Vec<Bson>, bool) = match u {
         U::Eq(_, v) => (vec![v.clone()], false),
-        U::In(_, _, true) => return None,
-        U::In(_, vs, false) => (vs.clone(), true),
+        U::In(_, vs, _) => (vs.clone(), true),
         _ => return None,
     };
     let to = match path.split('.').collect::<Vec<_>>().as_slice() {
@@ -982,9 +1114,9 @@ fn rewrite_operation_type(u: &U, path: &str) -> Option<M> {
     };
     match u {
         U::Eq(_, v) => Some(named(v).map_or(M::False, |(_, m)| m)),
-        U::In(_, _, true) => None,
-        U::In(_, vs, false) if vs.is_empty() => Some(M::False),
-        U::In(_, vs, false) => {
+        U::In(_, _, res) if !res.is_empty() => None,
+        U::In(_, vs, _) if vs.is_empty() => Some(M::False),
+        U::In(_, vs, _) => {
             let mut names: Vec<String> = vs.iter().filter_map(named).map(|(s, _)| s).collect();
             names.sort();
             names.dedup();
@@ -2004,6 +2136,19 @@ mod tests {
             ),
             (doc! { "ns": { "$regex": "^c" } }, "33ABFEAA"),
             (doc! { "to.coll": { "$regex": "^c" } }, "6F8558DD"),
+            // RM-698: an `$in` holding regexes, measured on mongod 8.2.11.
+            (
+                doc! { "ns.coll": { "$in": ["x", bson::Regex { pattern: "^c".into(), options: "iu".into() }] } },
+                "7426DAC8",
+            ),
+            (
+                doc! { "ns.db": { "$in": ["x", bson::Regex { pattern: "^r".into(), options: "u".into() }] } },
+                "5E53332A",
+            ),
+            (
+                doc! { "to.coll": { "$in": ["x", bson::Regex { pattern: "^c".into(), options: "u".into() }] } },
+                "5BF65C39",
+            ),
         ];
         for (user, want) in cases {
             let (q, _) = hashes_after(&coll, doc! {}, Some(user.clone()));

@@ -4,8 +4,9 @@ mongod 8.2.11 as a one-member replica set.
 
 RM-452 ported mongod's rewrite of `operationType`, RM-698's first slice
 those of `documentKey` and `fullDocument`, its second that of `ns` by
-`$eq` / `$in`, its third that of `to`, its fourth a regex on either; the rewrites of the
-other event fields and of `$expr` are still to come; the Boolean simplifier mongod runs
+`$eq` / `$in`, its third that of `to`, its fourth a regex on either,
+its fifth a regex in an `$in`; the rewrites of the other event fields
+and of `$expr` are still to come; the Boolean simplifier mongod runs
 over the unwind's filter came with RM-699 (2026-11-24).
 """
 
@@ -150,6 +151,18 @@ def test_a_match_on_the_rename_target_joins_the_oplog_filter(
         {"to.db": {"$regex": "x"}},
         {"to": {"$regex": "^c"}},
         {"$or": [{"ns.coll": {"$regex": "^c"}}, {"operationType": "drop"}]},
+        {"ns.coll": {"$in": [re.compile("^c")]}},
+        {"ns.coll": {"$in": ["x", re.compile("^c", re.I)]}},
+        {"ns.coll": {"$in": ["x", "y", re.compile("^c"), re.compile("d$")]}},
+        {"ns.db": {"$in": ["x", re.compile("^r")]}},
+        {"ns.db": {"$in": [re.compile("^r"), re.compile("x")]}},
+        {"ns": {"$in": [re.compile("^c")]}},
+        {"ns": {"$in": [{"db": "rm452", "coll": "c"}, re.compile("^c")]}},
+        {"ns.x": {"$in": [None, re.compile("^c")]}},
+        {"to.coll": {"$in": ["x", re.compile("^c")]}},
+        {"to.db": {"$in": [re.compile("^r"), re.compile("x")]}},
+        {"to": {"$in": [{"db": "a", "coll": "b"}, re.compile("^c")]}},
+        {"to": {"$in": [re.compile("^c")]}},
     ],
 )
 def test_a_regex_on_the_namespace_joins_the_oplog_filter(
@@ -158,8 +171,9 @@ def test_a_regex_on_the_namespace_joins_the_oplog_filter(
     """mongod 8.2.11 rewrites a regex on `ns.db` / `ns.coll` / `to.db` /
     `to.coll` into an `$expr` of `$regexMatch` over the oplog field's part
     (`matchRewriteGenericNamespace`; hash EE5C1E5A for `ns.coll: /^c/`), and
-    a regex on a whole `ns` or `to` into `$alwaysFalse`; this server left
-    them out of the read (90A52575)."""
+    a regex on a whole `ns` or `to` into `$alwaysFalse`, and an `$in` holding
+    regexes into the `$or` of its equalities' rewrite and each regex's;
+    this server left them out of the read (90A52575)."""
     assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)
 
 

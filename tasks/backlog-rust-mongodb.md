@@ -2049,7 +2049,7 @@ would see them. What is left:
 - [ ] **RUST MongoDB server: a `$match` after a `$changeStream` on an
       event field other than `operationType`, `documentKey`, `fullDocument`,
       `ns` or `to` is not rewritten into the oplog filter.** mongod 8.2.11
-      rewrites a regex on `ns` or `to`, `updateDescription`,
+      rewrites `updateDescription`,
       `fullDocumentBeforeChange`, the renamed `clusterTime` / `lsid` /
       `txnNumber` (also into the transaction filter), and an `$expr` over
       them, and adds them to the read's filter (`ns.coll: "c"`: `queryHash`
@@ -2061,8 +2061,8 @@ would see them. What is left:
       ported `matchRewriteGenericNamespace` for `ns` by `$eq` / `$in`, the
       third (2026-11-25) for `to` (`o.to` of a command), and the fourth
       (2026-11-25) a regex on either (mongod's `$expr` of `$regexMatch`
-      over `$substrBytes`). A regex inside an `$in` on `ns` / `to` is
-      still not rewritten. The rest of `change_stream_rewrite_helpers.cpp`
+      over `$substrBytes`), the fifth (2026-11-25) a regex inside an `$in`
+      on either. The rest of `change_stream_rewrite_helpers.cpp`
       (`matchRewriteUpdateDescription`, `rewriteAggExpressionTree`, the
       other event fields) is to transcribe (found working RM-452).
       Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_a_match_on_another_event_field_joins_the_oplog_filter
