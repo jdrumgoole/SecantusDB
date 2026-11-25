@@ -468,10 +468,16 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
         return pos(lit.start);
     }
     // A set operation whose column types cannot be unified points at the
-    // RIGHT arm's expression (`select null::text union select 1`, under `1`).
+    // RIGHT arm's expression (`select null::text union select 1`, under `1`),
+    // in a plain query and in the query an `INSERT ... SELECT` writes
+    // (PostgreSQL 15.19: `insert into tct(c) select (1,'x')::ctp union
+    // select row(2,'y')` is 42804 at the `row`, RP-1050).
     if sqlstate == "42804" && m.contains(" types ") && m.ends_with("cannot be matched") {
         let tree = pg_query::parse(sql).ok()?;
-        let stmt = tree.protobuf.stmts.first()?.stmt.as_ref()?;
+        let mut stmt = tree.protobuf.stmts.first()?.stmt.as_deref()?;
+        if let Some(N::InsertStmt(ins)) = stmt.node.as_ref() {
+            stmt = ins.select_stmt.as_deref()?;
+        }
         let Some(N::SelectStmt(sel)) = stmt.node.as_ref() else {
             return None;
         };

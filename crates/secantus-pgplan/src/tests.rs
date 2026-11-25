@@ -4035,6 +4035,45 @@ fn a_using_clause_name_error_has_no_position() {
     );
 }
 
+/// A set operation's unmatched column types are placed at the right arm's
+/// column in the query an `INSERT ... SELECT` writes, as in a plain query
+/// (PostgreSQL 15.19 positions, RP-1050).
+#[test]
+fn a_set_operation_mismatch_under_insert_select_is_at_the_right_arm() {
+    let msg = "UNION types ctp and record cannot be matched";
+    for (sql, want) in [
+        ("select (1,'x')::ctp union select row(2,'y')", 34),
+        (
+            "insert into tct(c) select (1,'x')::ctp union select row(2,'y')",
+            53,
+        ),
+        (
+            "insert into tct(c) (select (1,'x')::ctp union select row(2,'y'))",
+            54,
+        ),
+        (
+            "with w as (select 1) insert into tct(c) select (1,'x')::ctp union select row(2,'y')",
+            74,
+        ),
+        (
+            "insert into tct(c) with w as (select 1) select (1,'x')::ctp union select row(2,'y')",
+            74,
+        ),
+    ] {
+        take_error_location();
+        assert_eq!(error_position(sql, "42804", msg), Some(want), "for {sql}");
+    }
+    take_error_location();
+    assert_eq!(
+        error_position(
+            "insert into tct(c) select (1,'x')::ctp except select row(2,'y')",
+            "42804",
+            "EXCEPT types ctp and record cannot be matched",
+        ),
+        Some(54)
+    );
+}
+
 #[test]
 fn an_unterminated_literal_is_positioned_where_it_opens() {
     let at = |sql: &str, message: &str| error_position(sql, "42601", message);

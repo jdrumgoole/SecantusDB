@@ -2506,13 +2506,43 @@ The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
       target there.
       Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_record_into_non_composite
       Backlog-ID: RP-1086
-- [ ] **A UNION of a composite and a `record` has no error position.**
-      `insert into tct(c) select (1,'x')::ctp union select row(2,'y')` is
-      42804 `UNION types ctp and record cannot be matched` at 53 (the right
-      arm's column) on PostgreSQL 15.19; here the message matches and the
-      position is missing. Found while working RP-1044.
-      Verify: tests/backlog/test_rp_found_rp552.py::test_union_composite_record_position
-      Backlog-ID: RP-1050
+
+## Found while working RP-1050 (2026-11-25)
+
+Measured on PostgreSQL 15.19. The gap tests are in
+`tests/backlog/test_rp_found_rp1050.py`; the `INSERT` one uses
+`test_rp_found_rp552.py`'s `tct (c ctp, d pint[])`.
+
+- [ ] **A set operation's unmatched types are placed at the wrong column
+      or arm.** `select 1, 'a'::text union select 2, 3` is 42804 at 37 (the
+      `3`, the right side of the first unmatched column pair) on PostgreSQL
+      15.19, here at 34 (the right arm's first column); `select 1 union
+      select 'a'::text union select 2` is at 23 (the inner UNION fails
+      first, `transformSetOperationTree` works the left subtree before this
+      node), here at 46; `select 1 union (select 'a'::text union select
+      'b'::text)` is at 24, here none. `error_position` (secantus-pgplan
+      `errpos.rs`) guesses the top node's right arm's first target, as the
+      executor's `unify_set_op_type` raises the error with no location; the
+      faithful fix raises it where the column pair is known.
+      Verify: tests/backlog/test_rp_found_rp1050.py::test_set_op_mismatch_column_and_arm
+      Backlog-ID: RP-1087
+- [ ] **`INSERT ... SELECT` checks the column assignment before the set
+      operation's types.** `insert into tct(c) select null::text union
+      select 1` is 42804 `UNION types text and integer cannot be matched`
+      at 51 on PostgreSQL 15.19 (parse analysis of the query comes before
+      `transformInsertStmt` coerces its targets); here it is 42804 `column
+      "c" is of type ctp but expression is of type text` at 27.
+      Verify: tests/backlog/test_rp_found_rp1050.py::test_insert_select_set_op_types_before_assignment
+      Backlog-ID: RP-1088
+- [ ] **A set operation's unmatched types are not refused by `EXPLAIN` or
+      `PREPARE`.** `explain select null::text union select 1` and `prepare p
+      as select null::text union select 1` are 42804 `UNION types text and
+      integer cannot be matched` (at 40, at 50) on PostgreSQL 15.19, which
+      checks them in parse analysis; here both succeed, as the check runs
+      only when the set operation executes. `create view v as` the same
+      query is refused with the message and no position (PostgreSQL: 54).
+      Verify: tests/backlog/test_rp_found_rp1050.py::test_set_op_mismatch_refused_at_analysis
+      Backlog-ID: RP-1089
 
 ## Found while working RP-1048 (2026-11-25)
 
