@@ -1259,6 +1259,7 @@ pub fn limit_choice_of(paths: &[(f64, f64)], rows: f64, count: f64, offset: f64)
             rescan: (startup, total),
             req_outer: 0,
             memoized: false,
+            hash: false,
         })
         .collect();
     limit_choice(&choices, rows, count, offset)
@@ -1340,6 +1341,7 @@ fn nest_loop_pathlist_with(
                             rows: 0.0,
                             req_outer: 0,
                             memoized: false,
+                            hash: false,
                             rescan: (startup, total),
                         },
                         startup_counts,
@@ -1529,6 +1531,9 @@ struct JoinPath {
     /// A nested loop whose inner is a Memoize of its parameterized scan
     /// (`get_memoize_path`).
     memoized: bool,
+    /// A hash join: what tells one with `a` outer on a unique `b` from a
+    /// nested loop, both `JoinMethod::Other`.
+    hash: bool,
 }
 
 /// `JoinChoice::a_path` / `b_path` for a path built from a `JoinSide`
@@ -1763,6 +1768,9 @@ pub struct JoinChoice {
     pub req_outer: u32,
     /// A nested loop whose inner is a Memoize of its parameterized scan.
     pub memoized: bool,
+    /// A hash join (`JoinPath::hash`): what EXPLAIN tells a hash join with
+    /// `a` outer on a unique `b` from a nested loop by.
+    pub hash: bool,
 }
 
 impl JoinPath {
@@ -1779,6 +1787,7 @@ impl JoinPath {
             rescan: self.rescan,
             req_outer: self.req_outer,
             memoized: self.memoized,
+            hash: self.hash,
         }
     }
 }
@@ -1974,6 +1983,8 @@ impl JoinRel {
         let extra = self.extra;
         let paths = &mut self.paths;
         let useful = class != USELESS_KEYS;
+        // Set while the hash joins are weighed (`JoinPath::hash`).
+        let hashing = std::cell::Cell::new(false);
         let mut consider = |(startup, total): (f64, f64), keyed: bool, method: JoinMethod| {
             add_path(
                 paths,
@@ -1989,6 +2000,7 @@ impl JoinRel {
                     rows: 0.0,
                     req_outer: 0,
                     memoized: false,
+                    hash: hashing.get(),
                     rescan: (startup, total + extra),
                 },
                 startup_counts,
@@ -2075,9 +2087,11 @@ impl JoinRel {
             } else {
                 JoinMethod::HashOuterA
             };
+            hashing.set(true);
             for o in &outers {
                 consider(hash_join(o, inner), false, hash);
             }
+            hashing.set(false);
         }
     }
 
@@ -2108,6 +2122,7 @@ impl JoinRel {
                     rows: 0.0,
                     req_outer: 0,
                     memoized: false,
+                    hash: matches!(method, JoinMethod::HashFullA | JoinMethod::HashFullB),
                     rescan: (startup, total + extra),
                 },
                 startup_counts,
@@ -2643,6 +2658,8 @@ impl JoinRel {
             r
         };
         let memo_flag = std::cell::Cell::new(false);
+        // Set while the hash joins are weighed (`JoinPath::hash`).
+        let hashing = std::cell::Cell::new(false);
         let mut consider = |(startup, total): (f64, f64),
                             order: Option<usize>,
                             method: JoinMethod,
@@ -2666,6 +2683,7 @@ impl JoinRel {
                     rows: path_rows,
                     req_outer,
                     memoized: memo_flag.get(),
+                    hash: hashing.get(),
                     rescan: rescan.unwrap_or((startup, total + extra)),
                 },
                 startup_counts,
@@ -2902,7 +2920,9 @@ impl JoinRel {
                 let isd = inner.at(i, false);
                 let cost = hash_join_qp(&outer.at(o, false), &isd, qp);
                 let rescan = hash_rescan((cost.0, cost.1 + extra), &isd);
+                hashing.set(true);
                 consider(cost, None, hash, ids(o, i), Some(rescan), req);
+                hashing.set(false);
             }
         }
     }
@@ -2942,6 +2962,7 @@ impl JoinRel {
                     rows,
                     req_outer: 0,
                     memoized: false,
+                    hash: matches!(method, JoinMethod::HashFullA | JoinMethod::HashFullB),
                     rescan: rescan.unwrap_or((startup, total + extra)),
                 },
                 startup_counts,
@@ -3064,6 +3085,7 @@ pub fn base_pathlist(cands: &[InPath], startup_counts: bool) -> Option<(Vec<usiz
                 rows: c.rows,
                 req_outer: c.req_outer,
                 memoized: false,
+                hash: false,
                 rescan: c.rescan,
             },
             startup_counts,
@@ -3158,6 +3180,7 @@ pub fn ordered_limit_choice(
                     rows,
                     req_outer: 0,
                     memoized: false,
+                    hash: p.hash,
                     rescan: (startup, total),
                 },
                 true,
@@ -3220,6 +3243,7 @@ pub fn limit_choice(paths: &[JoinChoice], rows: f64, count: f64, offset: f64) ->
                 rows: count_rows.max(1.0),
                 req_outer: 0,
                 memoized: false,
+                hash: p.hash,
                 rescan: (startup, total),
             },
             true,
@@ -3961,6 +3985,7 @@ mod tests {
             rescan: (0.0, 699_250.20),
             req_outer: 0,
             memoized: false,
+            hash: false,
         };
         let hash = JoinChoice {
             startup: 120.0,

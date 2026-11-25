@@ -46832,13 +46832,27 @@ impl PgHandler {
                 };
                 // The tree of the order the search keeps (RP-919); its
                 // estimates come from the written one below.
-                let (reordered, cond_from) = match inner.as_ref() {
+                let (mut reordered, cond_from) = match inner.as_ref() {
                     Statement::Select(sel) => match self.reorder_nest_loop_chain(sel) {
                         Some((s, from)) => (Some(Statement::Select(s)), Some(from)),
                         None => (None, None),
                     },
                     _ => (None, None),
                 };
+                // A chain of three tables in the plan the join order search
+                // picks, each join's condition as it prints (RP-1059).
+                // VERBOSE's and ANALYZE's lists follow the written chain.
+                let mut chain_conds: Option<Vec<String>> = None;
+                if let (None, Statement::Select(sel)) = (&reordered, inner.as_ref()) {
+                    if !options.verbose && !options.analyze {
+                        if let Some((s, conds)) =
+                            self.reorder_three_table_chain(sel, &options.join_conds)
+                        {
+                            reordered = Some(Statement::Select(s));
+                            chain_conds = Some(conds);
+                        }
+                    }
+                }
                 let mut tree = explain::plan_tree(reordered.as_ref().unwrap_or(&inner), &chooser);
                 // Each join's `Inner Unique` (RP-353): a unique index of
                 // the inner table that is immediate, has no WHERE and keys
@@ -48359,6 +48373,7 @@ impl PgHandler {
                 explain::attach_setop_quals(&mut tree, &options.setop_quals, &index_columns);
                 // Each ON's text on the join it moved to (RP-919).
                 let join_conds: Vec<String> = match &cond_from {
+                    _ if chain_conds.is_some() => chain_conds.clone().unwrap_or_default(),
                     Some(from) if from.len() == options.join_conds.len() => from
                         .iter()
                         .map(|clauses| explain::placed_join_cond(&options.join_conds, clauses))

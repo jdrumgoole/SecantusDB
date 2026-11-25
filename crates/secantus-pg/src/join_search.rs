@@ -27,7 +27,7 @@ use secantus_pgplan::joincost::{JoinChoice, JoinMethod, JoinRel, JoinSide};
 
 /// `cpu_operator_cost`.
 const CPU_OPERATOR_COST: f64 = 0.0025;
-use secantus_pgplan::joins::{JoinKind, JoinNode, SEP};
+use secantus_pgplan::joins::{node_keys, JoinKind, JoinNode, SEP};
 
 thread_local! {
     /// One of the WHERE conjuncts over more than one table of the join
@@ -177,6 +177,34 @@ pub(crate) struct Base {
     filter: Document,
 }
 
+/// An ON's column equalities, `(left key, right key)` each, and whether
+/// each was written right key first (`JoinNode::Join::equi_reversed`).
+type OnEqualities<'a> = (&'a [(String, String)], &'a [bool]);
+
+/// The members of the equivalence class two ONs' column equalities make,
+/// in the order `process_equivalence` adds them: each ON's two columns as
+/// written (`JoinNode::Join::equi_reversed`), one already there not added
+/// again. `None` unless each ON holds one equality.
+fn class_members(ons: [OnEqualities<'_>; 2]) -> Option<Vec<String>> {
+    let mut members: Vec<String> = Vec::new();
+    for (equi, reversed) in ons {
+        let [(l, r)] = equi else {
+            return None;
+        };
+        let pair = if reversed.first().copied().unwrap_or(false) {
+            [r, l]
+        } else {
+            [l, r]
+        };
+        for k in pair {
+            if !members.contains(k) {
+                members.push(k.clone());
+            }
+        }
+    }
+    Some(members)
+}
+
 /// One join of the plan: how, which side is preserved, and what it joins
 /// on.
 pub(crate) struct Step {
@@ -226,6 +254,13 @@ pub(crate) struct ThreePlan {
     first_filters: Vec<usize>,
     joinrel_first: bool,
     second_step: Step,
+    /// Whether each join is a hash join (`JoinChoice::hash`), which a
+    /// nested loop and a hash join on a unique `b` share a method with.
+    first_hash: bool,
+    second_hash: bool,
+    /// The chain's clauses share a key: one equivalence class over the
+    /// three tables, whose derived clause each join prints.
+    ec: bool,
 }
 
 /// A planned join's input: its rows and the joined-row keys they carry.
@@ -336,6 +371,7 @@ impl PgHandler {
             left: lower,
             right: z_node,
             equi: e2,
+            equi_reversed: rr2,
             merged: m2,
             expr_keys: x2,
             ec: ec2,
@@ -351,6 +387,7 @@ impl PgHandler {
             left: x_node,
             right: y_node,
             equi: e1,
+            equi_reversed: rr1,
             merged: m1,
             expr_keys: x1,
             ec: ec1,
@@ -531,6 +568,20 @@ impl PgHandler {
                 on: on_of(a, b),
             };
             let pairs = vec![pair(0, 1, xk, yk), pair(0, 2, xk, zk), pair(1, 2, yk, zk)];
+            // A pair joins the third table on the class's first member in
+            // it (`generate_join_implied_equalities_normal`), whose
+            // statistics size the join and its hash buckets.
+            let members = class_members([(e1, rr1), (e2, rr2)])?;
+            let first_in = |a: usize, b: usize| {
+                members
+                    .iter()
+                    .find(|m| {
+                        let t = alias_of(m);
+                        t == bases[a].alias || t == bases[b].alias
+                    })
+                    .cloned()
+            };
+            let (xy, xz, yz) = (first_in(0, 1)?, first_in(0, 2)?, first_in(1, 2)?);
             let combo = |pair: usize, base: usize, pk: &String, bk: &String| Combo {
                 pair,
                 base,
@@ -541,9 +592,9 @@ impl PgHandler {
                 pair_first: true,
             };
             let combos = vec![
-                combo(0, 2, xk, zk),
-                combo(1, 1, xk, yk),
-                combo(2, 0, yk, xk),
+                combo(0, 2, &xy, zk),
+                combo(1, 1, &xz, yk),
+                combo(2, 0, &yz, xk),
             ];
             (pairs, combos)
         } else {
@@ -740,6 +791,9 @@ impl PgHandler {
                 nulls_first: false,
             },
             joinrel_first: c.pair_first,
+            first_hash: first.hash,
+            second_hash: choice.hash,
+            ec,
             second_step: Step {
                 method: choice.method,
                 left: c.left,
@@ -757,6 +811,206 @@ impl PgHandler {
             },
         };
         Some(plan)
+    }
+
+    /// `sel` with its chain of three tables in the plan the search picks
+    /// (`three_table_plan`), for EXPLAIN to draw (RP-1059): each join's
+    /// outer side its left child and its hashed side its right, under the
+    /// Hash `join_tree` puts there. With it, each join's condition as its
+    /// node prints it, post-order (`ExplainOptions::join_conds`): the ON
+    /// it evaluates, as written (`written`), or, over one equivalence
+    /// class, the clause `generate_join_implied_equalities_normal` derives
+    /// -- the class's first member each side, the outer one first, as
+    /// `create_hashjoin_plan` switches it. Inner joins whose every join is
+    /// a hash join only, with no join filter, under no LIMIT, ORDER BY or
+    /// DISTINCT (whose paths the search does not weigh); `None` for any
+    /// other chain, which is drawn as written.
+    pub(crate) fn reorder_three_table_chain(
+        &self,
+        sel: &secantus_pgplan::Select,
+        written: &[String],
+    ) -> Option<(secantus_pgplan::Select, Vec<String>)> {
+        use secantus_pgplan::Statement;
+        let sub = sel.sub.as_ref()?;
+        let Statement::JoinRows(j) = sub.plan.as_ref() else {
+            return None;
+        };
+        if sel.series.is_some()
+            || sel.join.is_some()
+            || !sel.windows.is_empty()
+            || sel.limit.is_some()
+            || sel.offset != 0
+            || !sel.order.is_empty()
+            || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
+            || sel.lock.is_some()
+            || !sel.lock_clauses.is_empty()
+            || sel.casts.iter().any(Option::is_some)
+            || ((!sel.filter.is_empty() || sel.residual.is_some()) && !j.where_modelled)
+            || !j.where_filters.is_empty()
+            || !j.where_span_aliases.is_empty()
+            || written.len() != 2
+        {
+            return None;
+        }
+        let JoinNode::Join {
+            kind: JoinKind::Inner,
+            left: lower,
+            right: z_node,
+            equi: e2,
+            equi_reversed: r2,
+            on_filters: f2,
+            on: on2,
+            ..
+        } = &j.tree
+        else {
+            return None;
+        };
+        let JoinNode::Join {
+            kind: JoinKind::Inner,
+            left: x_node,
+            right: y_node,
+            equi: e1,
+            equi_reversed: r1,
+            on_filters: f1,
+            on: on1,
+            ..
+        } = lower.as_ref()
+        else {
+            return None;
+        };
+        if !f1.is_empty() || !f2.is_empty() {
+            return None;
+        }
+        let plan = with_join_where(j, || self.three_table_plan(&j.tree))?;
+        if !plan.first_hash || !plan.second_hash || !plan.first_filters.is_empty() {
+            return None;
+        }
+        // Which side a hash join hashes: `b`, or `a` with `b` outer.
+        let hashes_b = |m: JoinMethod| match m {
+            JoinMethod::HashOuterA | JoinMethod::Other => Some(true),
+            JoinMethod::HashOuterB => Some(false),
+            _ => None,
+        };
+        let leaves = [x_node.as_ref(), y_node.as_ref(), z_node.as_ref()];
+        let aliases: Vec<String> = leaves
+            .iter()
+            .map(|n| node_keys(n).first().map(|k| alias_of(k).to_string()))
+            .collect::<Option<_>>()?;
+        let members = class_members([(e1, r1), (e2, r2)])?;
+        let text = |key: &str| -> Option<String> {
+            Some(format!(
+                "{}.{}",
+                secantus_pgplan::scalar::quote_identifier(alias_of(key)),
+                secantus_pgplan::scalar::quote_identifier(column_of(key)?)
+            ))
+        };
+        // A join's condition: its ON as written, or the class's clause
+        // between the members on each side.
+        let cond = |on: Option<usize>, outer: &[&str], inner: &[&str]| -> Option<String> {
+            if !plan.ec {
+                return written.get(on? - 1).cloned();
+            }
+            let first = |side: &[&str]| members.iter().find(|m| side.contains(&alias_of(m)));
+            Some(format!(
+                "({} = {})",
+                text(first(outer)?)?,
+                text(first(inner)?)?
+            ))
+        };
+        let ons = [on1.clone(), on2.clone()];
+        let on_expr = |on: Option<usize>| on.and_then(|i| ons[i - 1].clone());
+        let join = |left: JoinNode,
+                    right: JoinNode,
+                    keys: (String, String),
+                    on: Option<secantus_pgplan::ColumnExpr>| {
+            let (left_keys, right_keys) = (node_keys(&left), node_keys(&right));
+            let on_aliases = vec![alias_of(&keys.0).to_string(), alias_of(&keys.1).to_string()];
+            JoinNode::Join {
+                kind: JoinKind::Inner,
+                left: Box::new(left),
+                right: Box::new(right),
+                on,
+                on_aliases,
+                on_other: false,
+                on_filters: Vec::new(),
+                equi: vec![keys],
+                equi_reversed: vec![false],
+                merged: Vec::new(),
+                expr_keys: Vec::new(),
+                ec: None,
+                left_keys,
+                right_keys,
+            }
+        };
+        // The first join: its outer side left.
+        let (fa, fb) = plan.first;
+        let step = &plan.first_step;
+        let (outer, inner, keys) = if hashes_b(step.method)? {
+            (fa, fb, (step.a_key.clone(), step.b_key.clone()))
+        } else {
+            (fb, fa, (step.b_key.clone(), step.a_key.clone()))
+        };
+        let first_cond = cond(
+            step.on,
+            &[aliases[outer].as_str()],
+            &[aliases[inner].as_str()],
+        )?;
+        let pair = join(
+            leaves[outer].clone(),
+            leaves[inner].clone(),
+            keys,
+            on_expr(step.on),
+        );
+        // The second: the pair and the third table, `a` first.
+        let third = (0..3).find(|i| *i != fa && *i != fb)?;
+        let pair_aliases = [aliases[fa].as_str(), aliases[fb].as_str()];
+        let third_alias = [aliases[third].as_str()];
+        let step = &plan.second_step;
+        let (a, a_aliases, b, b_aliases) = if plan.joinrel_first {
+            (
+                pair,
+                &pair_aliases[..],
+                leaves[third].clone(),
+                &third_alias[..],
+            )
+        } else {
+            (
+                leaves[third].clone(),
+                &third_alias[..],
+                pair,
+                &pair_aliases[..],
+            )
+        };
+        let (top, top_cond) = if hashes_b(step.method)? {
+            let c = cond(step.on, a_aliases, b_aliases)?;
+            (
+                join(
+                    a,
+                    b,
+                    (step.a_key.clone(), step.b_key.clone()),
+                    on_expr(step.on),
+                ),
+                c,
+            )
+        } else {
+            let c = cond(step.on, b_aliases, a_aliases)?;
+            (
+                join(
+                    b,
+                    a,
+                    (step.b_key.clone(), step.a_key.clone()),
+                    on_expr(step.on),
+                ),
+                c,
+            )
+        };
+        let mut j = j.clone();
+        j.tree = top;
+        let mut out = sel.clone();
+        let mut s = sub.clone();
+        s.plan = Box::new(Statement::JoinRows(j));
+        out.sub = Some(s);
+        Some((out, vec![first_cond, top_cond]))
     }
 
     /// `node`'s rows in the plan `three_table_plan` picks, or `None` when it
@@ -1236,8 +1490,25 @@ fn merge_right_fill(
 
 #[cfg(test)]
 mod tests {
-    use super::merge_right_fill;
+    use super::{class_members, merge_right_fill, SEP};
     use bson::{doc, Bson, Document};
+
+    #[test]
+    fn a_class_takes_each_on_s_columns_as_written() {
+        // `e join k on k.a = e.a join e e2 on k.a = e2.a`: the first ON is
+        // stored `(e.a, k.a)`, written right key first, so `k.a` leads
+        // (`process_equivalence`), and `e2.a` comes last.
+        let key = |t: &str| format!("{t}{SEP}a");
+        let on1 = [(key("e"), key("k"))];
+        let on2 = [(key("k"), key("e2"))];
+        let members = class_members([(&on1, &[true]), (&on2, &[false])]).unwrap();
+        assert_eq!(members, vec![key("k"), key("e"), key("e2")]);
+        let members = class_members([(&on1, &[false]), (&on2, &[true])]).unwrap();
+        assert_eq!(members, vec![key("e"), key("k"), key("e2")]);
+        // Two equalities in one ON are not one class's.
+        let two = [(key("e"), key("k")), (key("e"), key("k"))];
+        assert!(class_members([(&two, &[false, false]), (&on2, &[false])]).is_none());
+    }
 
     fn rows(keys: &[(Option<i32>, i32, &str)]) -> Vec<Document> {
         keys.iter()

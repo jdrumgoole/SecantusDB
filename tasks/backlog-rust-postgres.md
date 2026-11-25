@@ -1861,21 +1861,45 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a three-way join with a join filter], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a merge join under a limit], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a merge join over an index only scan], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a descending merge join with a where]
       Backlog-ID: RP-966
 
-- [ ] **A WHERE-filtered relation of a three-way join is not joined
-      first.** `explain (costs off) select e.b, e2.b from e join k on e.a
-      = k.a join e e2 on e2.a = k.a where e2.b <> 'x'` (`e`, `k`
-      analysed, 1000 rows) joins `(e join k) join e2`; PostgreSQL 15.19
-      joins `(e2 join e) join k`, the filtered `e e2` the outermost scan,
-      `Hash Cond: (e2.a = e.a)` below `Hash Cond: (e.a = k.a)`. Size the
-      join-order search's costing of the filtered relation from a probe
-      of each candidate's cost. The same query with `where e2.b <> k.b`
-      and `on e2.a = e.a` is bushy on PostgreSQL 15.19, `e` against a
-      Hash of `(e2 join k)` with the `Join Filter`; here left-deep `(e
-      join k) join e2`. So with a range: `... on e2.a = k.a where e.a < 5`
-      is on PostgreSQL 15.19 a Nested Loop of `(e2 join e)`, `e` the
-      filtered Hash, into an Index Only Scan of `k` with `Join Filter: (e.a
-      = k.a)`; here `(e join k) join e2`, all hash joins. Found while
-      working RP-966.
+- [ ] **A three-way join over analysed tables is drawn in its written
+      order, not the join order search's.** Since 2026-11-25 EXPLAIN draws
+      a chain of three tables in the plan the search picks
+      (`join_search::reorder_three_table_chain` over `three_table_plan`)
+      when that search runs and every join is an inner hash join with no
+      join filter, under no LIMIT, ORDER BY or DISTINCT: each join's outer
+      side first, its hashed side under the Hash, and its `Hash Cond` its
+      ON or, over one equivalence class, the class's first member each
+      side (1,039 of 1,039 such shapes in a randomised sweep against a
+      private PostgreSQL 15.20 cluster, tables never analysed). Still
+      drawn as written:
+      (1) any chain over an ANALYZED table: `join_side` declines one
+      (`eqjoinsel` over its most common values is not modelled there), so
+      the search does not run at all. `explain (costs off) select e.b,
+      e2.b from e join k on e.a = k.a join e e2 on e2.a = k.a where e2.b
+      <> 'x'` (`e`, `k` analysed, 1000 rows) joins `(e join k) join e2`
+      here; PostgreSQL 15.19 joins `(e2 join e) join k`, `Hash Cond: (e2.a
+      = e.a)` below `Hash Cond: (e.a = k.a)` (on 15.20 every order costs
+      88.89 in total, and `(e2 join e)` beats the written order on its
+      startup cost, 55.00 against 57.50). The same query with `where e2.b <> k.b` and `on e2.a
+      = e.a` is bushy on PostgreSQL 15.19, `e` against a Hash of `(e2 join
+      k)` with the `Join Filter`.
+      (2) a parameterized index nested loop, which the search without a
+      LIMIT does not weigh (`JoinRel::add_paths_on` has no parameterized
+      inner; the LIMIT search's `add_paths_general` does): `... on e2.a =
+      k.a where e.a < 5` is on PostgreSQL 15.19 a Nested Loop of `(e2 join
+      e)`, `e` the filtered Hash, into an Index Only Scan of `k` with
+      `Join Filter: (e.a = k.a)`.
+      (3) a plan with a merge join (never-analysed `m0 join m1 on m0.b =
+      m1.a join m2 on m1.b = m2.a`, 20 rows, is PostgreSQL's Merge Join
+      over Sorts): the search weighs it, the drawing declines it.
+      (4) a LEFT or FULL join in the chain, a join filter, and VERBOSE and
+      ANALYZE, whose lists follow the written chain.
+      (5) costs: every node of a three-way chain prints `cost=0.00..0.00
+      rows=0 width=0`; the search's estimates match PostgreSQL's
+      (`83.58..123.68` for the first query over tables never analysed) but
+      its relations carry no width.
+      Work (1) first: it is what the two gap tests below measure. Found
+      while working RP-966.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a filtered relation of a three-way join is joined first], tests/backlog/test_rp_explain_costs.py::test_plan[a range-filtered relation of a three-way join is joined first]
       Backlog-ID: RP-1059
 

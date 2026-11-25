@@ -2629,6 +2629,67 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a = e2.a)",
         ],
     ),
+    # Measured on PostgreSQL 15.20, a private cluster (2026-11-25): over
+    # tables never analysed the three-way chain is drawn in the plan the
+    # join order search picks, the filtered `e e2` hashed against `k` and
+    # that pair hashed under `e`, each join on its class's derived clause.
+    "a three-way join never analysed is drawn in the searched order": (
+        "RP-1059:fixed",
+        _NEVER_ANALYSED,
+        "explain (costs off) select e.b, e2.b from e join k on e.a = k.a "
+        "join e e2 on e2.a = k.a where e2.b <> 'x'",
+        [
+            "Hash Join",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Hash Join",
+            "              Hash Cond: (e2.a = k.a)",
+            "              ->  Seq Scan on e e2",
+            "                    Filter: (b <> 'x'::text)",
+            "              ->  Hash",
+            "                    ->  Seq Scan on k",
+        ],
+    ),
+    # Measured likewise: with no key two clauses share, each join prints
+    # its own ON, the second ON's pair joined first.
+    "a three-way chain never analysed joins its second pair first": (
+        "RP-1059:fixed",
+        _NEVER_ANALYSED,
+        "explain (costs off) select e.b, e2.b from e join k on e.b = k.b "
+        "join e e2 on e2.a = k.a where e2.a < 5",
+        [
+            "Hash Join",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Hash Join",
+            "              Hash Cond: (e2.a = k.a)",
+            "              ->  Seq Scan on e e2",
+            "                    Filter: (a < 5)",
+            "              ->  Hash",
+            "                    ->  Seq Scan on k",
+        ],
+    ),
+    # Measured likewise: the ONs written `k.a = ...` put `k.a` first in the
+    # class, so a pair holding `k` is hashed on its unique key, and the
+    # cheaper plan hashes `e join k` under `e e2`.
+    "a three-way join hashes a pair on its class's first member": (
+        "RP-1059:fixed",
+        _NEVER_ANALYSED,
+        "explain (costs off) select * from e join k on k.a = e.a join e e2 on k.a = e2.a",
+        [
+            "Hash Join",
+            "  Hash Cond: (e2.a = k.a)",
+            "  ->  Seq Scan on e e2",
+            "  ->  Hash",
+            "        ->  Hash Join",
+            "              Hash Cond: (e.a = k.a)",
+            "              ->  Seq Scan on e",
+            "              ->  Hash",
+            "                    ->  Seq Scan on k",
+        ],
+    ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): the WHERE
     # constant joins the ON's equivalence class, as in the comma join RP-977
     # fixed, and each inner index scan takes it as its Index Cond.
