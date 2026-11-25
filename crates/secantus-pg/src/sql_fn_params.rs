@@ -160,7 +160,8 @@ fn figure_colname(v: &Value) -> Option<String> {
         "FuncCall" => strings(list(o, "funcname")).pop(),
         // AEXPR_NULLIF (the protobuf's numbering is PostgreSQL's plus one).
         "A_Expr" => (o.get("kind").and_then(Value::as_i64) == Some(6)).then(|| "nullif".into()),
-        "TypeCast" => figure_colname(o.get("arg")?).or_else(|| {
+        // A definite name beneath the cast survives it; otherwise the type's.
+        "TypeCast" => definite_colname(o.get("arg")?).or_else(|| {
             let t = o.get("type_name")?.as_object()?;
             strings(list(t, "names")).pop()
         }),
@@ -181,11 +182,31 @@ fn figure_colname(v: &Value) -> Option<String> {
                 _ => None,
             }
         }
-        "CaseExpr" => Some("case".into()),
+        // Its ELSE result's name when that is definite, `case` otherwise
+        // (RP-1046).
+        "CaseExpr" => o
+            .get("defresult")
+            .and_then(definite_colname)
+            .or_else(|| Some("case".into())),
         "A_ArrayExpr" => Some("array".into()),
         "RowExpr" => Some("row".into()),
         "CoalesceExpr" => Some("coalesce".into()),
         _ => None,
+    }
+}
+
+/// `figure_colname` at FigureColnameInternal's strength 2 only: `None` for
+/// the fallbacks, a cast's type and `case`, that a cast or a CASE above
+/// replaces with its own.
+fn definite_colname(v: &Value) -> Option<String> {
+    let (k, o) = tagged(v)?;
+    match k {
+        "TypeCast" | "CollateClause" => definite_colname(o.get("arg")?),
+        "CaseExpr" => definite_colname(o.get("defresult")?),
+        "A_Indirection" => strings(list(o, "indirection"))
+            .pop()
+            .or_else(|| definite_colname(o.get("arg")?)),
+        _ => figure_colname(v),
     }
 }
 

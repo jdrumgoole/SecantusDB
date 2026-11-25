@@ -2812,9 +2812,15 @@ fn figure_colname(n: &Node) -> String {
     match n.node.as_ref() {
         Some(N::ColumnRef(c)) => names(&c.fields).pop().unwrap_or(unnamed),
         Some(N::FuncCall(f)) => names(&f.funcname).pop().unwrap_or(unnamed),
+        // A cast keeps a definite name from beneath it (strength 2) and
+        // otherwise takes its type's: `(case ... else 2 end)::int8` is `int8`.
         Some(N::TypeCast(tc)) => {
             let inner = tc.arg.as_deref().map(figure_colname).unwrap_or_default();
-            if inner != "?column?" && !inner.is_empty() {
+            let strong = tc
+                .arg
+                .as_deref()
+                .is_some_and(|a| crate::nodetostring::target::figure_colname_strength(a).1 == 2);
+            if strong && inner != "?column?" && !inner.is_empty() {
                 inner
             } else {
                 tc.type_name
@@ -2823,7 +2829,9 @@ fn figure_colname(n: &Node) -> String {
                     .unwrap_or(unnamed)
             }
         }
-        Some(N::CaseExpr(_)) => "case".into(),
+        // Its ELSE result's name when that is definite, `case` otherwise
+        // (FigureColnameInternal, RP-1046).
+        Some(N::CaseExpr(_)) => crate::nodetostring::target::figure_colname(n),
         Some(N::CoalesceExpr(_)) => "coalesce".into(),
         Some(N::MinMaxExpr(m)) => {
             if m.op == pg_query::protobuf::MinMaxOp::IsGreatest as i32 {

@@ -449,9 +449,17 @@ pub(crate) enum Starred {
 
 /// `FigureColname`.
 pub(crate) fn figure_colname(node: &pb::Node) -> String {
+    figure_colname_strength(node).0
+}
+
+/// `FigureColnameInternal`'s name and strength: 2 a name the expression
+/// gives its column (a column, a call, a keyword), 1 a fallback (a cast's
+/// type, `case`), 0 none (`?column?`). A cast or a CASE keeps a strength-2
+/// name from beneath it and otherwise takes its own fallback.
+pub(crate) fn figure_colname_strength(node: &pb::Node) -> (String, i32) {
     let mut name = None;
-    figure_colname_internal(node, &mut name);
-    name.unwrap_or_else(|| "?column?".to_string())
+    let strength = figure_colname_internal(node, &mut name);
+    (name.unwrap_or_else(|| "?column?".to_string()), strength)
 }
 
 fn figure_colname_internal(node: &pb::Node, name: &mut Option<String>) -> i32 {
@@ -591,6 +599,22 @@ fn figure_colname_internal(node: &pb::Node, name: &mut Option<String>) -> i32 {
                 12 => "session_user",
                 13 => "current_catalog",
                 _ => "current_schema",
+            };
+            *name = Some(n.into());
+            return 2;
+        }
+        // The SQL/XML functions act like a regular function; IS DOCUMENT
+        // names nothing.
+        N::XmlExpr(x) => {
+            let n = match pb::XmlExprOp::try_from(x.op) {
+                Ok(pb::XmlExprOp::IsXmlconcat) => "xmlconcat",
+                Ok(pb::XmlExprOp::IsXmlelement) => "xmlelement",
+                Ok(pb::XmlExprOp::IsXmlforest) => "xmlforest",
+                Ok(pb::XmlExprOp::IsXmlparse) => "xmlparse",
+                Ok(pb::XmlExprOp::IsXmlpi) => "xmlpi",
+                Ok(pb::XmlExprOp::IsXmlroot) => "xmlroot",
+                Ok(pb::XmlExprOp::IsXmlserialize) => "xmlserialize",
+                _ => return 0,
             };
             *name = Some(n.into());
             return 2;

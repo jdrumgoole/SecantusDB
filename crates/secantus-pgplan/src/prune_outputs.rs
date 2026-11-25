@@ -1081,8 +1081,12 @@ pub fn figure_colname(n: &pg_query::protobuf::Node) -> Option<String> {
         N::TypeCast(tc) => {
             // A cast of an unnamed expression takes the TYPE's name (the
             // grammar has already made `int` `int4`).
-            match figure_colname(tc.arg.as_deref()?) {
-                Some(inner) if inner != "?column?" => Some(inner),
+            // Only a definite name (strength 2) survives the cast: a CASE
+            // that is only `case` takes the type's.
+            let arg = tc.arg.as_deref()?;
+            let strong = crate::nodetostring::target::figure_colname_strength(arg).1 == 2;
+            match figure_colname(arg) {
+                Some(inner) if strong && inner != "?column?" => Some(inner),
                 _ => match tc.type_name.as_ref()?.names.last()?.node.as_ref()? {
                     N::String(s) => Some(s.sval.clone()),
                     _ => None,
@@ -1092,7 +1096,8 @@ pub fn figure_colname(n: &pg_query::protobuf::Node) -> Option<String> {
         N::AExpr(_) | N::AConst(_) | N::BoolExpr(_) | N::NullTest(_) | N::BooleanTest(_) => {
             Some("?column?".into())
         }
-        N::CaseExpr(_) => Some("case".into()),
+        // Its ELSE result's name when that is definite (RP-1046).
+        N::CaseExpr(_) => Some(crate::nodetostring::target::figure_colname(n)),
         N::SubLink(sl) => {
             use pg_query::protobuf::SubLinkType as T;
             match T::try_from(sl.sub_link_type).ok()? {

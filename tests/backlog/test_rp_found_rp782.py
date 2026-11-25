@@ -473,8 +473,10 @@ def _viewdef_of(dsn: str, name: str, query: str) -> object:
     return got
 
 
-# `FigureColnameInternal` names a CASE by its ELSE result (RP-1046).
-@pytest.mark.backlog("RP-1046")
+# `FigureColnameInternal` names a CASE by its ELSE result when that is a
+# definite (strength 2) name. Here every unaliased CASE was `case`; fixed by
+# RP-1046.
+@pytest.mark.backlog_fixed("RP-1046")
 def test_pg_get_viewdef_names_a_case_column_by_its_else_column(dsn: str) -> None:
     got = _viewdef_of(
         dsn, "v1046", "select case when c.oid > 5 then 0 else c.relnatts end from pg_class c"

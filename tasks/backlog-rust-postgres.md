@@ -2846,13 +2846,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster; the
 views read only `pg_class`.
 
-- [ ] **`pg_get_viewdef` names a CASE column `case` where ruleutils takes
-      its ELSE column's name.** `create view v as select case when c.oid >
-      5 then 0 else c.relnatts end from pg_class c` prints `END AS
-      relnatts` on PostgreSQL 15.19 (`FigureColnameInternal` reads a
-      `CaseExpr`'s `defresult` at strength 1); here `END AS "case"`.
-      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_names_a_case_column_by_its_else_column
-      Backlog-ID: RP-1046
 - [ ] **`pg_get_viewdef` prints an IN list holding a column as `= ANY
       (ARRAY[...])`.** `create view v as select c.relnatts in (1,
       c.relam::int) from pg_class c` prints `((c.relnatts = 1) OR
@@ -2863,6 +2856,25 @@ views read only `pg_class`.
       (c.relam)::integer]))`.
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_an_in_list_holding_a_column
       Backlog-ID: RP-1047
+
+## Found while working RP-1046 (2026-11-25)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.20 cluster; the
+statements create nothing.
+
+- [ ] **A column under a cast or `COLLATE` loses the name
+      `FigureColnameInternal` gives it.** `select user::text,
+      current_date::text` names its columns `user`, `current_date` on
+      PostgreSQL 15.20 (a SQLValueFunction is strength 2, so the cast
+      keeps it); here `text`, `text`. `select c.relname collate "C" from
+      pg_class c` is `relname` there (a CollateClause is named for its
+      argument, through a cast above too); here `?column?`, and
+      `(c.relname collate "C")::text` is `text`. The planner's
+      `expression_column_name` / `cast_source_names_column`
+      (`crates/secantus-pgplan/src/lib.rs`) have no arm for either; the
+      faithful port is `nodetostring::target::figure_colname_strength`.
+      Verify: tests/backlog/test_rp_found_rp1046.py::test_a_cast_of_a_sql_value_function_keeps_its_name, tests/backlog/test_rp_found_rp1046.py::test_a_collate_clause_keeps_its_argument_name
+      Backlog-ID: RP-1093
 
 ## Found while working RP-816 (2026-11-11)
 
