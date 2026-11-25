@@ -2048,7 +2048,8 @@ would see them. What is left:
 
 - [ ] **RUST MongoDB server: a `$match` after a `$changeStream` on an
       event field other than `operationType`, `documentKey`, `fullDocument`,
-      `ns` or `to` is not rewritten into the oplog filter.** mongod 8.2.11
+      `ns` or `to`, or an `$expr` on one other than `operationType`, is not
+      rewritten into the oplog filter.** mongod 8.2.11
       rewrites `updateDescription`,
       `fullDocumentBeforeChange`, the renamed `clusterTime` / `lsid` /
       `txnNumber` (also into the transaction filter), and an `$expr` over
@@ -2062,9 +2063,14 @@ would see them. What is left:
       third (2026-11-25) for `to` (`o.to` of a command), and the fourth
       (2026-11-25) a regex on either (mongod's `$expr` of `$regexMatch`
       over `$substrBytes`), the fifth (2026-11-25) a regex inside an `$in`
-      on either. The rest of `change_stream_rewrite_helpers.cpp`
-      (`matchRewriteUpdateDescription`, `rewriteAggExpressionTree`, the
-      other event fields) is to transcribe (found working RM-452).
+      on either, and the sixth (2026-11-25) an `$expr` on `operationType`
+      (`rewriteAggExpressionTree` with `exprRewriteOperationType`, and the
+      `$_internalExprEq` the optimizer derives). An `$expr` on any other
+      field (`documentKey`, `ns`, `fullDocument`, ...) is still dropped,
+      and so is the `$_internalExprEq` on it. The rest of
+      `change_stream_rewrite_helpers.cpp` (`matchRewriteUpdateDescription`,
+      the other event fields, their expression rewrites) is to transcribe
+      (found working RM-452).
       Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_a_match_on_another_event_field_joins_the_oplog_filter
       Backlog-ID: RM-698
 - [ ] **RUST MongoDB server: the Boolean simplifier differs from mongod's
@@ -2104,20 +2110,21 @@ listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
 - [ ] **RUST MongoDB server: a time-series read over a collection with an
-      index of its own reads the collection at the command.** With an
-      index `{v: 1}` beside the default one, an unindexed filter's read:
-      mongod 8.2.11 reads through its cursor stage, 32 buckets first, and
-      returns 2,303 more after the delete; this server reads it whole:
-      3,999. So too a hint to any index but the default one (a hint to
-      `m_1_t_1` or `{$natural: 1}` matches since 2026-11-25, and a read
-      under a collation since 2026-11-25, unless its filter holds a string
-      or names the meta field: those still read whole, as the bucket
-      bounds and the index over the buckets compare without the
-      collation). An index `createIndexes` adds is kept on the collection
-      only, `dropIndexes` leaves the bucket copy of `m_1_t_1` in place, and
-      `collStats` still reports index sizes of 0. Found while working
-      RM-457, 2026-11-15.
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_beside_an_index_of_its_own_buffers_its_buckets
+      index of its own reads the collection at the command when the index
+      could serve it.** With an index `{v: 1}` beside the default one, a
+      filter naming `v` (or any `$expr` / `$text` / `$where` filter) reads
+      whole here, 3,999 after the delete, as this server keeps no copy of
+      that index over the buckets to plan with. mongod 8.2.11 plans it:
+      `{v: {$gte: 0}}` takes the buckets in order, 2,303; a selective one
+      may scan its index over the buckets (not measured). An unindexed
+      filter streams its buckets since 2026-11-25. So too a hint to any
+      index but the default one, and a read under a collation whose filter
+      holds a string or names the meta field (the bucket bounds and the
+      index over the buckets compare without the collation). An index
+      `createIndexes` adds is kept on the collection only, `dropIndexes`
+      leaves the bucket copy of `m_1_t_1` in place, and `collStats` still
+      reports index sizes of 0. Found while working RM-457, 2026-11-15.
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_of_its_own_index_buffers_as_mongod
       Backlog-ID: RM-701
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
@@ -3020,16 +3027,53 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       mongod's first replica-set write at (wall-clock second, 1) is no
       longer behind a recorded stable timestamp. A store that is killed
       keeps its last periodic stable checkpoint at the newest oplog entry
-      (T, n), and a store reopened by this server dates its entries one
-      second ahead (`max(last, now) + 1`), so mongod 8.2 started on it as
-      `--replSet` within that second can still hit "commit timestamp
-      (T, 1) must be after the stable timestamp (T, n)". A standalone
-      mongod never sets a stable timestamp at all. Model that: no stable
-      timestamp on a store with no replica-set config, rather than one
-      only at close. Found by the RM-797 fix; not reproduced on a kill
-      yet.
-      Verify: none -- reproduce by killing secantusd-mdb right after an insert and starting mongod --replSet on the store within the second
+      (T, n), and every reopen of a store dates its entries from
+      `max(last, now) + 1` second (the recovery bump in `Storage::open`),
+      so T runs ahead of the wall clock by about a second per quick
+      reopen. REPRODUCED (mongod v8.2.11): five lives of
+      `secantusd-mdb --standalone` on one store, each `insert_one`, `fsync`,
+      SIGKILL, then `mongod --replSet rs0` on the store and `replSetInitiate`
+      dies with "commit timestamp (1795642349, 1) must be after the stable
+      timestamp (1795642351, 1)", fatal 28560 (the gap test below).
+      NOT fixed, needs Joe's decision. The entry's proposal (no stable
+      timestamp on a store with no replica-set configuration, as a
+      standalone mongod has none) cannot be a change to the checkpoint
+      alone: this server's data tables are NOT logged (timestamps need
+      that), so a kill recovers by replaying the oplog from the
+      checkpoint's recovery timestamp, and `stable_seq` clamps the oplog
+      prune. An unstable periodic checkpoint has no recovery timestamp
+      (`get=recovery` is 0), so the replay would start at the oplog's
+      first entry over data that already holds those entries, and needs an
+      idempotent replay (mongod's standalone recovery is) plus a replay
+      position written atomically with the checkpoint. mongod's own
+      standalone avoids all of it by LOGGING its tables, which a store
+      cannot change after creation. The cheaper option, which is a
+      stand-in and not mongod's mechanism: on a store with no replica-set
+      configuration cap the stable timestamp at the newest entry whose
+      second is below the wall clock's (`s < now`), so a later (now, 1)
+      is always after it; replay from the older recovery point is the
+      normal path. Faithful first, cheap second.
+      Verify: tests/backlog/test_rm_storage_model.py::test_mongod_starts_on_a_standalone_store_killed_within_the_second
       Backlog-ID: RM-805
+
+- [ ] **mongod started as `--replSet` on a killed standalone store dies on
+      an invariant at the first election (2026-11-25).** The journal
+      flusher of a `--standalone` `secantusd-mdb` keeps
+      `local.replset.oplogTruncateAfterPoint` at the newest whole entry, as
+      a primary's does, and a SIGKILL leaves it non-null. `mongod
+      --replSet rs0` on that store has no replica-set configuration, so it
+      runs no startup recovery (it logs "Detected unclean shutdown ...
+      Recovering data from the last clean checkpoint"); `replSetInitiate`
+      succeeds and the transition to primary dies: invariant
+      `getOplogTruncateAfterPoint(opCtx).isNull()`,
+      `replication_coordinator_external_state_impl.cpp:623`, mongod 8.2.11.
+      Reproduced by the RM-805 test with its lives spaced out so no stable
+      timestamp is ahead of the clock (one life of `--standalone`, writes, a
+      second's wait, SIGKILL). A standalone mongod never moves the point,
+      so a store it left has it null. Decide with RM-805: a standalone
+      store that does not move the point has no hole recovery of its own.
+      Verify: none -- reproduced by hand through the RM-805 test with `time.sleep(3)` after each life; no gap test of its own yet
+      Backlog-ID: RM-806
 
 - [ ] **A restore to the timestamp of a batched insert applies part of the
       batch.** `insert_many` of two documents is one `applyOps` entry in

@@ -24,10 +24,12 @@
 //! joins the read's filter and the unwind's (RM-452), as mongod's
 //! `change_stream_rewrite_helpers.cpp` rewrites it.
 //!
-//! So are a `$match` on `documentKey` and (inexactly) on `fullDocument`
-//! (RM-698). Not reproduced: the rewrites of `ns`, `to`,
-//! `updateDescription`, `fullDocumentBeforeChange`, the renamed
-//! `clusterTime` / `lsid` / `txnNumber`, and of `$expr` (RM-698), and the
+//! So are a `$match` on `documentKey`, (inexactly) on `fullDocument`, on
+//! `ns` and `to`, and an `$expr` on `operationType` (RM-698). Not
+//! reproduced: the rewrites of `updateDescription`,
+//! `fullDocumentBeforeChange`, the renamed `clusterTime` / `lsid` /
+//! `txnNumber`, and of an `$expr` on any field but `operationType`
+//! (RM-698), and the
 //! change stream's `queryShapeHash` (RM-454). The unwind's filter goes through
 //! mongod's Boolean simplifier (`simplify.rs`, RM-699).
 
@@ -426,7 +428,12 @@ enum U {
     Exists(String),
     /// Any other predicate on a path: its operator and operand.
     Other(String, String, Bson),
-    /// `$expr`, `$where`, `$text`, ... -- nothing on a path.
+    /// `$_internalExprEq`, which the `$match`'s optimizer derived from an
+    /// `$expr`'s `$eq` of a field path and a constant (`RewriteExpr`).
+    ExprEq(String, Bson),
+    /// An `$expr`'s aggregation expression.
+    Expr(Bson),
+    /// `$where`, `$text`, ... -- nothing on a path.
     Opaque,
     False,
 }
@@ -449,6 +456,7 @@ impl U {
                 "$or" => all.push(U::Or(list())),
                 "$nor" => all.push(U::Nor(list())),
                 "$alwaysFalse" => all.push(U::False),
+                "$expr" => all.push(U::Expr(v.clone())),
                 k if k.starts_with('$') => all.push(U::Opaque),
                 path => all.push(U::path(path, v)),
             }
@@ -470,6 +478,7 @@ impl U {
             let one = |op: &str, arg: &Bson| -> U {
                 match op {
                     "$eq" => U::Eq(path.to_string(), arg.clone()),
+                    "$_internalExprEq" => U::ExprEq(path.to_string(), arg.clone()),
                     "$in" => match arg {
                         Bson::Array(a) if a.is_empty() => U::False,
                         Bson::Array(a) => U::In(
@@ -1177,8 +1186,113 @@ fn rewrite(u: &U, inexact: bool) -> Option<M> {
             Some("fullDocument") if inexact => rewrite_full_document(u),
             _ => None,
         },
+        U::ExprEq(p, v) if p == "operationType" => {
+            rewrite_operation_type(&U::Eq(p.clone(), v.clone()), p)
+        }
+        U::ExprEq(..) => None,
+        U::Expr(e) => match rewrite_agg(e, inexact)? {
+            Bson::Document(d) => Some(M::Expr(d)),
+            _ => None,
+        },
         U::Opaque | U::False => None,
     }
+}
+
+/// A field path of an aggregation expression (`"$a.b"`), not a variable.
+fn field_path(b: &Bson) -> Option<&str> {
+    match b {
+        Bson::String(s) if s.starts_with('$') && !s.starts_with("$$") => Some(&s[1..]),
+        _ => None,
+    }
+}
+
+/// A constant of an aggregation expression: a literal that is not a path,
+/// a variable, an operator or an array or document holding one.
+fn constant(b: &Bson) -> Option<Bson> {
+    match b {
+        Bson::String(s) if s.starts_with('$') => None,
+        // `$const` is how the optimizer prints a constant, `$literal` how a
+        // user writes one.
+        Bson::Document(d)
+            if d.len() == 1 && (d.contains_key("$const") || d.contains_key("$literal")) =>
+        {
+            d.values().next().cloned()
+        }
+        Bson::Document(d) if d.keys().any(|k| k.starts_with('$')) => None,
+        Bson::Document(d) => d.values().all(|v| constant(v).is_some()).then(|| b.clone()),
+        Bson::Array(a) => a.iter().all(|v| constant(v).is_some()).then(|| b.clone()),
+        other => Some(other.clone()),
+    }
+}
+
+/// `$operationType` as an expression over the oplog entry (mongod's
+/// `exprRewriteOperationType`).
+fn operation_type_expr() -> Bson {
+    let is = |op: &str| doc! { "$eq": ["$op", { "$const": op }] };
+    let cmd = |field: &str, name: &str| {
+        doc! { "case": { "$ne": [format!("$o.{field}"), "$$REMOVE"] }, "then": { "$const": name } }
+    };
+    Bson::Document(doc! { "$switch": {
+        "branches": [
+            { "case": is("i"), "then": { "$const": "insert" } },
+            { "case": { "$and": [is("u"), { "$eq": ["$o._id", "$$REMOVE"] }] }, "then": { "$const": "update" } },
+            { "case": { "$and": [is("u"), { "$ne": ["$o._id", "$$REMOVE"] }] }, "then": { "$const": "replace" } },
+            { "case": is("d"), "then": { "$const": "delete" } },
+            { "case": { "$ne": ["$op", { "$const": "c" }] }, "then": "$$REMOVE" },
+            cmd("drop", "drop"),
+            cmd("create", "create"),
+            cmd("dropDatabase", "dropDatabase"),
+            cmd("renameCollection", "rename"),
+            cmd("createIndexes", "createIndexes"),
+            cmd("commitIndexBuild", "createIndexes"),
+            cmd("startIndexBuild", "startIndexBuild"),
+            cmd("abortIndexBuild", "abortIndexBuild"),
+            cmd("dropIndexes", "dropIndexes"),
+            cmd("collMod", "modify"),
+        ],
+        "default": "$$REMOVE",
+    } })
+}
+
+/// mongod's `rewriteAggExpressionTree`, for the field this server rewrites
+/// in an expression: `operationType`. An `$and` drops a child it cannot
+/// rewrite when the rewrite may be inexact; anything else needs all of its
+/// paths rewritten. Constants print as `$const`, as the optimizer leaves
+/// them. `None` is no rewrite.
+fn rewrite_agg(e: &Bson, inexact: bool) -> Option<Bson> {
+    if let Some(p) = field_path(e) {
+        return (p == "operationType").then(operation_type_expr);
+    }
+    if let Some(c) = constant(e) {
+        return Some(Bson::Document(doc! { "$const": c }));
+    }
+    let d = e.as_document()?;
+    if d.len() != 1 {
+        return None;
+    }
+    let (op, args) = d.iter().next()?;
+    let args = match args {
+        Bson::Array(a) => a.clone(),
+        one => vec![one.clone()],
+    };
+    let out: Vec<Bson> = match op.as_str() {
+        "$and" => {
+            let kept: Vec<Bson> = args
+                .iter()
+                .filter_map(|a| rewrite_agg(a, inexact))
+                .collect();
+            if (kept.len() != args.len() && !inexact) || kept.is_empty() {
+                return None;
+            }
+            kept
+        }
+        "$or" | "$not" | "$eq" | "$ne" | "$gt" | "$gte" | "$lt" | "$lte" | "$in" => args
+            .iter()
+            .map(|a| rewrite_agg(a, false))
+            .collect::<Option<_>>()?,
+        _ => return None,
+    };
+    Some(Bson::Document(doc! { op.clone(): out }))
 }
 
 /// The rewrite of the `$match` after the stream into the oplog's terms, if

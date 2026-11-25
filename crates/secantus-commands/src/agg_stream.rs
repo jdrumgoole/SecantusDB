@@ -574,9 +574,9 @@ fn includes_only(spec: &Bson) -> bool {
 /// The cursor of a pipeline over a time-series collection: its buckets read
 /// through the cursor stage, each unpacked as the cursor reaches it
 /// (`ts_buckets::BucketScan`, RM-348). Read whole instead: under a hint to
-/// another index, a collation over a string bound, when the filter names the meta field or the collection has
-/// an index of its own (mongod could read an index over the buckets), and
-/// for any other stage.
+/// another index, a collation over a string bound, when the filter names
+/// the meta field or a field of an index of the collection's own (mongod
+/// could read that index over the buckets), and for any other stage.
 fn time_series(
     storage: &dyn Storage,
     ask: &Ask,
@@ -649,13 +649,36 @@ fn time_series(
         .iter()
         .filter_map(|spec| spec.get_str("name").ok())
         .collect();
-    let own_index = names.iter().any(|name| {
-        *name != "_id_" && Some(*name) != default_index.as_ref().map(|(n, _)| n.as_str())
-    });
+    // The roots of the fields the collection's own indexes cover (all but
+    // `_id_` and the default one).
+    let own_roots: Vec<String> = listed
+        .iter()
+        .filter(|spec| {
+            spec.get_str("name").is_ok_and(|name| {
+                name != "_id_" && Some(name) != default_index.as_ref().map(|(n, _)| n.as_str())
+            })
+        })
+        .flat_map(|spec| {
+            spec.get_document("key")
+                .map(|k| k.keys().map(|f| root(f).to_string()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        })
+        .collect();
     // A dropped default index leaves its copy over the buckets: unused.
     let default_index = default_index.filter(|(d, _)| names.contains(&d.as_str()));
-    if own_index {
-        return Ok(None);
+    // An index of its own leaves a filter it cannot serve read through the
+    // cursor stage, the buckets in order (measured 8.2.11: 2,303 after the
+    // delete with `{v: 1}` beside an unindexed filter, RM-701). A filter it
+    // might serve is mongod's scan of that index over the buckets, which
+    // this server does not keep: read whole.
+    if !own_roots.is_empty() {
+        let filter = crate::explain::pipeline_canonical(ask.coll, ask.pipeline).filter;
+        let mut paths = Vec::new();
+        if !filter_paths(&filter, &mut paths)
+            || paths.iter().any(|p| own_roots.iter().any(|r| r == root(p)))
+        {
+            return Ok(None);
+        }
     }
     // A hint to the default index, by name or by key, is mongod's scan of
     // it over the buckets (measured 8.2.11: 1,279 after the delete, as the
@@ -727,6 +750,34 @@ fn time_series(
         .iter()
         .any(|s| matches!(stage_name(s), "$sort" | "$group" | "$count"));
     Ok(Some((cursor, Vec::new())))
+}
+
+/// The first segment of dotted path `p`.
+fn root(p: &str) -> &str {
+    p.split('.').next().unwrap_or(p)
+}
+
+/// Push the field paths `filter` names onto `out`, through `$and`, `$or`
+/// and `$nor`. False when it holds an operator that names fields some
+/// other way (`$expr`, `$where`, `$text`, ...), so no path list is sure.
+fn filter_paths(filter: &Document, out: &mut Vec<String>) -> bool {
+    for (k, v) in filter {
+        match k.as_str() {
+            "$and" | "$or" | "$nor" => {
+                let Bson::Array(a) = v else { return false };
+                for c in a {
+                    let Bson::Document(c) = c else { return false };
+                    if !filter_paths(c, out) {
+                        return false;
+                    }
+                }
+            }
+            "$comment" => {}
+            k if k.starts_with('$') => return false,
+            k => out.push(k.to_string()),
+        }
+    }
+    true
 }
 
 /// `v` is, or holds, a string (a symbol or a regex among them).
