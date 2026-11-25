@@ -46562,6 +46562,14 @@ impl PgHandler {
                     c.extra.insert("generated", renamed);
                 }
                 Self::rename_partition_key_column(&mut def, &column, &to)?;
+                // So does an index's key, expression and predicate (RP-1054).
+                let moved = (!old.pk).then(|| old.field());
+                self.rename_column_in_indexes(
+                    &table,
+                    &column,
+                    &to,
+                    moved.as_deref().map(|f| (f, to.as_str())),
+                )?;
                 if let Some(c) = def.columns.iter_mut().find(|c| c.name == column) {
                     c.name = to.clone();
                 }

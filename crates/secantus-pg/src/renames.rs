@@ -2,6 +2,8 @@
 //! indexes, constraints, sequences, triggers, rules, types (with their
 //! attributes), domains and schemas. Each rewrites the catalog rows that
 //! name the object, and the rows and indexes that store data under it.
+//! A renamed column's references in its table's indexes are renamed here
+//! too.
 
 use bson::{Bson, Document};
 use pgwire::api::results::{Response, Tag};
@@ -52,6 +54,117 @@ impl PgHandler {
             || self.sequence_doc(to)?.is_some();
         if taken {
             return Err(error("42P07", format!("relation \"{to}\" already exists")));
+        }
+        Ok(())
+    }
+
+    /// RENAME COLUMN reaches the table's indexes. PostgreSQL's index holds
+    /// the column's attnum, so its keys, expressions and predicate follow
+    /// the rename; the ones kept here are SQL text, and each that names the
+    /// column is renamed in place (RP-1054). `fields` is the row field the
+    /// rename moved, `(from, to)`, `None` for a PRIMARY KEY column (stored
+    /// as `_id` whatever it is called): a storage index keyed on that field
+    /// is built again over the new one, or it would key no row, and a
+    /// UNIQUE one would enforce nothing.
+    pub(crate) fn rename_column_in_indexes(
+        &self,
+        table: &str,
+        old: &str,
+        new: &str,
+        fields: Option<(&str, &str)>,
+    ) -> PgWireResult<()> {
+        let indexes = self
+            .storage
+            .list_indexes(self.db(), table)
+            .map_err(|e| Self::storage_err("could not read the indexes", e))?;
+        let rename = |text: &str, key: bool| {
+            secantus_pgplan::rename_column_in_index_text(text, table, old, new, key)
+                .map_err(|e| Self::err(&e))
+        };
+        for ix in indexes {
+            let Ok(name) = ix.get_str("name") else {
+                continue;
+            };
+            let opt = |k: &str| {
+                ix.get(k).cloned().or_else(|| {
+                    ix.get_document("options")
+                        .ok()
+                        .and_then(|o| o.get(k).cloned())
+                })
+            };
+            let mut changes = Document::new();
+            for (k, key) in [("sqlExpressions", false), ("sqlKeys", true)] {
+                let Some(Bson::Array(texts)) = opt(k) else {
+                    continue;
+                };
+                let mut renamed = Vec::with_capacity(texts.len());
+                for t in &texts {
+                    renamed.push(match t {
+                        Bson::String(s) => Bson::String(rename(s, key)?),
+                        other => other.clone(),
+                    });
+                }
+                if renamed != texts {
+                    changes.insert(k, renamed);
+                }
+            }
+            if let Some(Bson::String(pred)) = opt("sqlPredicate") {
+                let renamed = rename(&pred, false)?;
+                if renamed != pred {
+                    changes.insert("sqlPredicate", renamed);
+                }
+            }
+            if let Some(Bson::Array(include)) = opt("include") {
+                let renamed: Vec<Bson> = include
+                    .iter()
+                    .map(|c| match c {
+                        Bson::String(s) if s == old => Bson::String(new.to_string()),
+                        other => other.clone(),
+                    })
+                    .collect();
+                if renamed != include {
+                    changes.insert("include", renamed);
+                }
+            }
+            // A key or partial filter over the moved field: the storage
+            // index is built again over the new one.
+            let key = ix.get_document("key").cloned().unwrap_or_default();
+            let filter = opt("partialFilterExpression");
+            let moved = fields.filter(|(from, _)| {
+                key.contains_key(*from)
+                    || filter.as_ref().is_some_and(|f| bson_names_field(f, from))
+            });
+            if let Some((from, to)) = moved {
+                let mut options = ix.clone();
+                for k in ["name", "key", "v", "ns"] {
+                    options.remove(k);
+                }
+                for (k, v) in changes {
+                    options.insert(k, v);
+                }
+                if let Some(f) = filter {
+                    options.insert("partialFilterExpression", rename_field_in_bson(f, from, to));
+                }
+                let mut key_spec = Document::new();
+                for (k, v) in key {
+                    key_spec.insert(if k == from { to.to_string() } else { k }, v);
+                }
+                self.atomically(|| {
+                    self.storage
+                        .drop_index(self.db(), table, name)
+                        .map_err(|e| Self::storage_err("could not alter the index", e))?;
+                    self.storage
+                        .create_index(self.db(), table, name, &key_spec, &options)
+                        .map_err(|e| Self::storage_err("could not alter the index", e))
+                })?;
+                continue;
+            }
+            if changes.is_empty() {
+                continue;
+            }
+            self.storage
+                .set_index_options(self.db(), table, name, &changes)
+                .map_err(|e| Self::storage_err("could not alter the index", e))?;
         }
         Ok(())
     }
@@ -957,5 +1070,37 @@ impl PgHandler {
             }
         }
         done("ALTER SCHEMA")
+    }
+}
+
+/// A storage filter names `field` as a path of its own (`{x: {$gt: 0}}`,
+/// inside `$and`).
+fn bson_names_field(filter: &Bson, field: &str) -> bool {
+    match filter {
+        Bson::Document(d) => d
+            .iter()
+            .any(|(k, v)| k == field || bson_names_field(v, field)),
+        Bson::Array(a) => a.iter().any(|v| bson_names_field(v, field)),
+        _ => false,
+    }
+}
+
+/// A storage filter with its path `from` renamed to `to`.
+fn rename_field_in_bson(filter: Bson, from: &str, to: &str) -> Bson {
+    match filter {
+        Bson::Document(d) => Bson::Document(
+            d.into_iter()
+                .map(|(k, v)| {
+                    let k = if k == from { to.to_string() } else { k };
+                    (k, rename_field_in_bson(v, from, to))
+                })
+                .collect(),
+        ),
+        Bson::Array(a) => Bson::Array(
+            a.into_iter()
+                .map(|v| rename_field_in_bson(v, from, to))
+                .collect(),
+        ),
+        other => other,
     }
 }
