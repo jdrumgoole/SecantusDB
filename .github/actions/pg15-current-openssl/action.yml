@@ -6,11 +6,12 @@ description: >
   take as SECANTUS_PG15_BIN.
 
 # Why (RP-747, Joe 2026-11-25): PostgreSQL leaves revocation checking to the
-# OpenSSL it links, and OpenSSL's answer moved. With OpenSSL 3.5.9 and 4.1.0
-# a delta CRL is never a certificate's list (PostgreSQL sets no
-# X509_V_FLAG_USE_DELTAS), so an issuer with only a delta has no list and the
-# client is told "unknown ca"; the runner's PGDG postgresql-15 links Ubuntu's
-# OpenSSL 3.0, which read the delta as a full list. secantusd-pg keeps the
+# OpenSSL it links, and OpenSSL's answer moved. Since its 2026-08-25
+# releases (3.0.22, 3.4.7, 3.5.8, 3.6.4, 4.0.2) a delta CRL is never a
+# certificate's list (PostgreSQL sets no X509_V_FLAG_USE_DELTAS), so an
+# issuer with only a delta has no list and the client is told "unknown ca";
+# the runner's PGDG postgresql-15 links Ubuntu's OpenSSL 3.0.13, from before
+# that fix, which reads the delta as a full list. secantusd-pg keeps the
 # current OpenSSL's answer, so the reference the login comparisons run
 # against must link a current OpenSSL too -- which no package for this runner
 # does. Built once per (runner image, versions) and restored after that.

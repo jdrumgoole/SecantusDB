@@ -660,9 +660,12 @@ impl PgHandler {
                     }
                 }
                 if changed {
+                    // A function names its types by oid in `pg_proc`, which
+                    // a type rename does not rewrite: its row keeps its
+                    // stamp, and a compiled function its label (RP-1051).
                     let id = doc.get_str("_id").unwrap_or_default().to_string();
                     self.delete_type_doc(coll, &id)?;
-                    self.insert_type_doc(coll, &id, doc)?;
+                    self.reinsert_type_doc(coll, &id, doc)?;
                 }
             }
         }
@@ -1065,8 +1068,10 @@ impl PgHandler {
                 let mut doc = Document::clone(d);
                 doc.insert("schema", to);
                 let id = doc.get_str("_id").unwrap_or_default().to_string();
+                // `pronamespace` is the schema's oid, which a rename keeps:
+                // the `pg_proc` row is not rewritten (RP-1051).
                 self.delete_type_doc(Self::FUNCTION_COLLECTION, &id)?;
-                self.insert_type_doc(Self::FUNCTION_COLLECTION, &id, doc)?;
+                self.reinsert_type_doc(Self::FUNCTION_COLLECTION, &id, doc)?;
             }
         }
         done("ALTER SCHEMA")

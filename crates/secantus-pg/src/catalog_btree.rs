@@ -363,6 +363,48 @@ fn unplaced_block(n: usize) -> i64 {
     -2 - n as i64
 }
 
+/// The heap of a catalog a scan reads in one database: the visibility
+/// map's bits and the heap's length as `initdb` left them, or as the
+/// database's DDL has left them since (`catalog_places.rs`).
+struct HeapView<'a> {
+    initdb: &'a InitdbHeap,
+    placed: Option<(Vec<bool>, u32)>,
+}
+
+impl<'a> HeapView<'a> {
+    fn new(store: usize, db: i64, table: i64) -> Option<Self> {
+        Some(HeapView {
+            initdb: initdb_heaps().get(&table)?,
+            placed: crate::catalog_places::heap_state(store, db, table),
+        })
+    }
+
+    #[cfg(test)]
+    fn initdb(table: i64) -> Option<Self> {
+        Some(HeapView {
+            initdb: initdb_heaps().get(&table)?,
+            placed: None,
+        })
+    }
+
+    /// `VM_ALL_VISIBLE`.
+    fn all_visible(&self, block: i64) -> bool {
+        match &self.placed {
+            Some((bits, _)) => usize::try_from(block)
+                .ok()
+                .and_then(|b| bits.get(b))
+                .copied()
+                .unwrap_or(false),
+            None => self.initdb.block_all_visible(block),
+        }
+    }
+
+    /// `RelationGetNumberOfBlocks`.
+    fn blocks(&self) -> u32 {
+        self.placed.as_ref().map_or(self.initdb.blocks, |p| p.1)
+    }
+}
+
 /// What an index-only scan reads of catalog `heap` for the index tuples
 /// `tids` (in index order) and `rows` rows returned (`IndexOnlyNext`):
 /// for each tuple `visibilitymap_get_status` reads the visibility map's
@@ -370,20 +412,22 @@ fn unplaced_block(n: usize) -> i64 {
 /// fork -- and a tuple whose block it does not mark all-visible is
 /// fetched from the heap, its block read when the block fetched before
 /// it was another (`heapam_index_fetch_tuple` keeps its buffer). A row
-/// returned beyond `tids` was written later, onto a page whose bit the
-/// write cleared (`heap_insert`'s `visibilitymap_clear`), so it is fetched
-/// too. The table's blocks read, in order, and the tuples fetched.
-fn index_only_reads(heap: &InitdbHeap, tids: &[i64], rows: usize) -> (Vec<i64>, usize) {
+/// DDL wrote is on a page whose bit the write cleared (`heap_insert`'s
+/// `visibilitymap_clear`), so it is fetched; a row returned beyond `tids`
+/// was written by DDL whose rows are not placed yet, and is fetched as a
+/// block of its own. The table's blocks read, in order, and the tuples
+/// fetched.
+fn index_only_reads(heap: &HeapView, tids: &[i64], rows: usize) -> (Vec<i64>, usize) {
     let later = rows.saturating_sub(tids.len());
     let mut pages = Vec::new();
-    if heap.vm_fork && (!tids.is_empty() || later > 0) {
+    if heap.initdb.vm_fork && (!tids.is_empty() || later > 0) {
         pages.push(VM_PAGE);
     }
     let mut last = None;
     let mut fetched = 0;
     for tid in tids {
         let block = tid / 65536;
-        if heap.block_all_visible(block) {
+        if heap.all_visible(block) {
             continue;
         }
         fetched += 1;
@@ -410,20 +454,178 @@ fn key_tids(t: &Tree, key: &[K]) -> (Vec<u32>, Vec<i64>) {
     t.btree.prefix_scan(&t.shape, &prefix)
 }
 
+/// The heap TIDs a scan of catalog index `t` (`index`) for the rows whose
+/// leading key columns are `key` returns in database `(store, db)`, in
+/// index order: `initdb`'s tuples, and the rows its DDL wrote since
+/// (`catalog_places.rs`) -- of these, with `above`, only those whose next
+/// key column is above it (`RelationBuildTupleDesc`'s `attnum > 0`) --
+/// with the index pages the scan reads over `initdb`'s tree.
+fn scan_tids(
+    store: usize,
+    db: i64,
+    index: i64,
+    t: &Tree,
+    key: &[K],
+    above: Option<i64>,
+) -> (Vec<u32>, Vec<i64>) {
+    let (pages, tids) = key_tids(t, key);
+    let Some(table) = builtin().indexes.get(&index).map(|i| i.table) else {
+        return (pages, tids);
+    };
+    let prefix: Vec<Bson> = key
+        .iter()
+        .zip(&t.shape.types)
+        .map(|(k, typ)| from_k(k, *typ))
+        .collect();
+    let shape = &t.shape;
+    let matches = |k: &[Bson]| {
+        prefix.iter().enumerate().all(|(a, p)| {
+            k.get(a)
+                .is_some_and(|v| shape.cmp_attr(a, p, v) == Ordering::Equal)
+        })
+    };
+    let mut later: Vec<(Vec<Bson>, i64)> =
+        crate::catalog_places::rows(store, db, table, index, prefix.first())
+            .into_iter()
+            .filter(|(k, _)| matches(k))
+            .filter(|(k, _)| {
+                above.is_none_or(|floor| {
+                    k.get(prefix.len())
+                        .and_then(crate::bson_i64)
+                        .is_some_and(|v| v > floor)
+                })
+            })
+            .collect();
+    if later.is_empty() {
+        return (pages, tids);
+    }
+    let order = |a: &(Vec<Bson>, i64), b: &(Vec<Bson>, i64)| {
+        for attr in 0..shape.nkeyatts() {
+            match (a.0.get(attr), b.0.get(attr)) {
+                (Some(x), Some(y)) => match shape.cmp_attr(attr, x, y) {
+                    Ordering::Equal => {}
+                    o => return o,
+                },
+                _ => break,
+            }
+        }
+        a.1.cmp(&b.1)
+    };
+    if !tids.is_empty() {
+        // Both: in index order, by key and then TID.
+        let tid_set: std::collections::HashSet<i64> = tids.iter().copied().collect();
+        if let Some(l) = layouts().get(&index) {
+            later.extend(
+                l.in_order()
+                    .into_iter()
+                    .filter(|(k, tid)| tid_set.contains(tid) && matches(k)),
+            );
+        }
+    }
+    later.sort_by(order);
+    (pages, later.into_iter().map(|(_, tid)| tid).collect())
+}
+
+/// Where each row of a built-in catalog is in its heap in one database,
+/// found by its key in one of the catalog's unique indexes: a heap scan
+/// (`heapgettup`, as ANALYZE's `acquire_sample_rows` reads a table) meets
+/// the rows block by block, each block's in offset order.
+pub(crate) struct HeapOrder {
+    /// The index's key columns, as `pg_index.indkey` names them.
+    pub(crate) attnums: Vec<i64>,
+    types: Vec<i64>,
+    /// Each key's live tuple, as `block * 65536 + offset`.
+    at: HashMap<String, i64>,
+}
+
+impl HeapOrder {
+    fn key(&self, key: &[Bson]) -> String {
+        format!("{key:?}")
+    }
+
+    /// Where the row whose key columns hold `values` is; `None` for a
+    /// row whose place is not modelled (DDL other than RP-291's, or one
+    /// written before a restart).
+    pub(crate) fn place(&self, values: &[Option<&Bson>]) -> Option<i64> {
+        let key: Vec<Bson> = values
+            .iter()
+            .zip(&self.types)
+            .map(|(v, typ)| v.map_or(Bson::Null, |v| normal(v, *typ)))
+            .collect();
+        self.at.get(&self.key(&key)).copied()
+    }
+}
+
+/// [`HeapOrder`] of catalog `table` in database `(store, db)`: `initdb`'s
+/// rows where it left them -- the live tuple a HOT chain's root redirects
+/// to, not the root its index entries point at -- and the rows DDL wrote
+/// since where they were placed (`catalog_places.rs`). Keyed by the
+/// catalog's unique index of fewest columns (the lowest oid among them)
+/// that `initdb`'s dump holds; `None` for a catalog with none.
+pub(crate) fn heap_order(store: usize, db: i64, table: i64) -> Option<HeapOrder> {
+    let facts = builtin();
+    let heap = initdb_heaps().get(&table)?;
+    let mut indexes: Vec<&crate::catalog_facts::CatalogIndex> = facts
+        .indexes_of
+        .get(&table)?
+        .iter()
+        .filter_map(|i| facts.indexes.get(i))
+        .filter(|i| i.unique && !i.keys.is_empty() && i.keys.iter().all(|k| *k > 0))
+        .filter(|i| layouts().contains_key(&i.oid))
+        .collect();
+    indexes.sort_by_key(|i| (i.keys.len(), i.oid));
+    let index = indexes.first()?;
+    let layout = layouts().get(&index.oid)?;
+    let live: std::collections::HashSet<i64> = heap.tids.iter().copied().collect();
+    let mut order = HeapOrder {
+        attnums: index.keys.clone(),
+        types: layout.types.clone(),
+        at: HashMap::new(),
+    };
+    for (key, root) in layout.in_order() {
+        let (block, off) = (root / 65536, (root % 65536) as u16);
+        let tuple = match usize::try_from(block)
+            .ok()
+            .and_then(|b| heap.pages.get(b))
+            .and_then(|p| p.lps.get(&off))
+        {
+            Some(crate::heap_page::Lp::Redirect(to)) => block * 65536 + i64::from(*to),
+            _ => root,
+        };
+        if live.contains(&tuple) {
+            let k = order.key(&key);
+            order.at.insert(k, tuple);
+        }
+    }
+    for (key, at) in crate::catalog_places::live_places(store, db, table, index.oid) {
+        let key: Vec<Bson> = key
+            .iter()
+            .zip(&order.types)
+            .map(|(v, typ)| normal(v, *typ))
+            .collect();
+        let k = order.key(&key);
+        order.at.insert(k, at);
+    }
+    Some(order)
+}
+
 /// `Heap Fetches` of an index-only scan of catalog index `index` for the
-/// rows whose leading key columns are `key`, returning `rows` rows
-/// (`IndexOnlyNext`): a tuple whose heap block the visibility map does not
-/// mark all-visible is fetched from the heap, and counted, before its
-/// visibility is checked. The tuples are `initdb`'s, on the blocks and
-/// visibility map it left (`catalog_heap.rs`); a row returned beyond them
-/// was written later, onto a page whose bit the write cleared, so it is
-/// fetched too ([`index_only_reads`]). `None` for an index this server
-/// does not model.
-pub(crate) fn index_only_heap_fetches(index: i64, key: &[K], rows: usize) -> Option<usize> {
+/// rows whose leading key columns are `key`, returning `rows` rows, in
+/// database `(store, db)` (`IndexOnlyNext`): a tuple whose heap block the
+/// visibility map does not mark all-visible is fetched from the heap, and
+/// counted, before its visibility is checked ([`index_only_reads`]).
+/// `None` for an index this server does not model.
+pub(crate) fn index_only_heap_fetches(
+    store: usize,
+    db: i64,
+    index: i64,
+    key: &[K],
+    rows: usize,
+) -> Option<usize> {
     let t = tree(index)?;
     let table = builtin().indexes.get(&index)?.table;
-    let heap = initdb_heaps().get(&table)?;
-    Some(index_only_reads(heap, &key_tids(t, key).1, rows).1)
+    let heap = HeapView::new(store, db, table)?;
+    Some(index_only_reads(&heap, &scan_tids(store, db, index, t, key, None).1, rows).1)
 }
 
 impl PgHandler {
@@ -443,65 +645,70 @@ impl PgHandler {
     /// An index-only scan reads the visibility map and fetches only what it
     /// does not mark all-visible ([`index_only_reads`]).
     ///
-    /// The heap is `initdb`'s (`catalog_heap.rs`): a row added after it is
-    /// not yet placed (RP-291).
+    /// The heap is `initdb`'s (`catalog_heap.rs`) with the rows the
+    /// database's DDL has written into it since (`catalog_places.rs`); a
+    /// row other DDL wrote is not placed yet (RP-291).
     pub(crate) fn catalog_index_pages(&self, be: &mut Backend, scans: Vec<PageScan>) {
         if scans.is_empty() || !self.tracking() {
             return;
         }
         let stats = self.stats();
+        let (store, db) = (std::sync::Arc::as_ptr(&self.storage) as usize, stats.db);
         let capacity = self.buffer_pages();
-        let heaps = initdb_heaps();
         for scan in scans {
-            let (index, key, only) = match scan {
+            let (index, key, only, above) = match scan {
                 PageScan::Seq(table) => {
-                    if let Some(h) = heaps.get(&table) {
-                        stats.pages(table, 0..i64::from(h.blocks), capacity);
+                    if let Some(h) = HeapView::new(store, db, table) {
+                        stats.pages(table, 0..i64::from(h.blocks()), capacity);
                     }
                     continue;
                 }
-                PageScan::Index(index, key) => (index, key, None),
-                PageScan::IndexOnly(index, key, rows) => (index, Some(key), Some(rows)),
+                PageScan::Index(index, key) => (index, key, None, None),
+                PageScan::IndexAbove(index, key, floor) => (index, Some(key), None, Some(floor)),
+                PageScan::IndexOnly(index, key, rows) => (index, Some(key), Some(rows), None),
             };
             let Some(t) = tree(index) else {
                 continue;
             };
+            let table = builtin().indexes.get(&index).map(|i| i.table);
             let mut blocks: Vec<i64> = Vec::new();
             let mut heap: Vec<i64> = Vec::new();
+            let mut tids = Vec::new();
             if t.btree.root.is_none() {
                 // No root: nothing is cached.
                 blocks.push(0);
-                if key.is_some() {
+                if let Some(key) = &key {
                     blocks.push(0);
+                    tids = scan_tids(store, db, index, t, key, above).1;
                 }
             } else {
                 if be.read_metapage(index) {
                     blocks.push(0);
                 }
                 if let Some(key) = &key {
-                    let (pages, tids) = key_tids(t, key);
+                    let (pages, found) = scan_tids(store, db, index, t, key, above);
                     blocks.extend(pages.into_iter().map(i64::from));
-                    if only.is_none() {
-                        for tid in tids {
-                            let block = tid / 65536;
-                            if heap.last() != Some(&block) {
-                                heap.push(block);
-                            }
+                    tids = found;
+                }
+            }
+            match only {
+                Some(rows) => {
+                    if let Some(h) = table.and_then(|t| HeapView::new(store, db, t)) {
+                        heap = index_only_reads(&h, &tids, rows).0;
+                    }
+                }
+                None => {
+                    for tid in tids {
+                        let block = tid / 65536;
+                        if heap.last() != Some(&block) {
+                            heap.push(block);
                         }
                     }
                 }
             }
-            if let (Some(rows), Some(key)) = (only, &key) {
-                let table = builtin().indexes.get(&index).map(|i| i.table);
-                if let Some(h) = table.and_then(|t| heaps.get(&t)) {
-                    heap = index_only_reads(h, &key_tids(t, key).1, rows).0;
-                }
-            }
             stats.pages(index, blocks, capacity);
-            if !heap.is_empty() {
-                if let Some(table) = builtin().indexes.get(&index).map(|i| i.table) {
-                    stats.pages(table, heap, capacity);
-                }
+            if let (false, Some(table)) = (heap.is_empty(), table) {
+                stats.pages(table, heap, capacity);
             }
         }
     }
@@ -543,12 +750,47 @@ mod tests {
     }
 
     #[test]
+    fn every_initdb_row_has_its_own_place_in_the_heap() {
+        // Each catalog with a unique index keys every live tuple of its
+        // `initdb` heap once: the HOT chains' roots redirect to them.
+        let mut keyed = 0;
+        for (table, heap) in initdb_heaps() {
+            let Some(order) = heap_order(usize::MAX, 0, *table) else {
+                continue;
+            };
+            let mut places: Vec<i64> = order.at.values().copied().collect();
+            places.sort_unstable();
+            assert_eq!(places, heap.tids, "{}", heap.name);
+            keyed += 1;
+        }
+        assert!(keyed > 40, "{keyed}");
+        // pg_class by oid (`select oid, ctid from pg_class` in a fresh
+        // database): pg_type's row is the heap-only tuple (0,47) that the
+        // root its index entry names, (0,1), redirects to; pg_class's own
+        // an ordinary tuple, (7,58).
+        let class = heap_order(usize::MAX, 0, 1259).expect("pg_class");
+        assert_eq!(class.attnums, vec![1]);
+        assert_eq!(class.place(&[Some(&Bson::Int32(1247))]), Some(47));
+        assert_eq!(
+            class.place(&[Some(&Bson::Int64(1259))]),
+            Some(7 * 65536 + 58)
+        );
+        assert_eq!(class.place(&[Some(&Bson::Int64(16384))]), None);
+    }
+
+    #[test]
     fn an_index_only_scan_fetches_only_what_the_visibility_map_does_not_cover() {
         // pg_attribute_relid_attnam_index for pg_class's 39 columns:
         // initdb's VACUUM left every pg_attribute block all-visible.
-        assert_eq!(index_only_heap_fetches(2658, &[K::O(1259)], 39), Some(0));
+        assert_eq!(
+            index_only_heap_fetches(0, 0, 2658, &[K::O(1259)], 39),
+            Some(0)
+        );
         // Two rows a later ALTER TABLE added are on a page it cleared.
-        assert_eq!(index_only_heap_fetches(2658, &[K::O(1259)], 41), Some(2));
+        assert_eq!(
+            index_only_heap_fetches(0, 0, 2658, &[K::O(1259)], 41),
+            Some(2)
+        );
         // A heap with no visibility map fork has no block all-visible.
         let heaps = initdb_heaps();
         let no_vm = heaps
@@ -567,7 +809,11 @@ mod tests {
         let reads = |index: i64, key: &[K], rows: usize| {
             let t = tree(index).expect("a catalog index");
             let table = builtin().indexes[&index].table;
-            index_only_reads(&heaps[&table], &key_tids(t, key).1, rows)
+            index_only_reads(
+                &HeapView::initdb(table).expect("a catalog"),
+                &key_tids(t, key).1,
+                rows,
+            )
         };
         // pg_class_relname_nsp_index for `pg_type`: initdb left its block
         // all-visible, so only the map's page is read.

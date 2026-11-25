@@ -7,7 +7,7 @@ column written to a composite column was accepted; fixed), RP-1048 (a
 `text` SELECT column written to a domain-array column was accepted; fixed), RP-1049
 (a `record` SELECT column written to a composite column was accepted;
 fixed), RP-1086 (one written to a non-composite column is 0A000), RP-1050
-(a UNION of a composite and a record has no error position), RP-946
+(a UNION of a composite and a record had no error position; fixed), RP-946
 (a NULL element of a NOT NULL domain's array literal was accepted; fixed),
 RP-947 (a
 composite column compared with an untyped literal read the literal as the
@@ -268,9 +268,10 @@ def test_insert_select_record_into_non_composite(dsn: str) -> None:
     )
 
 
-@pytest.mark.backlog("RP-1050")
+@pytest.mark.backlog_fixed("RP-1050")
 def test_union_composite_record_position(dsn: str) -> None:
-    """The UNION's type mismatch is placed at the right arm's column."""
+    """The UNION's type mismatch under INSERT ... SELECT had no position;
+    it was placed at the right arm's column."""
     assert answer(dsn, "insert into tct(c) select (1,'x')::ctp union select row(2,'y')") == (
         "42804",
         "UNION types ctp and record cannot be matched",

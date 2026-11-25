@@ -247,6 +247,18 @@ impl Backend {
         true
     }
 
+    /// `SearchCatCache` when `IndexScanOK` refuses the index (a backend
+    /// building its relation cache init files, RP-292): a miss is a heap
+    /// scan of the cache's catalog.
+    pub(crate) fn search_heap(&mut self, st: &Counter, cache: Cache, key: Key, found: i64) -> bool {
+        if self.entries.contains(&(cache, key.clone())) {
+            return false;
+        }
+        st.seq(cache.relations().0, found);
+        self.entries.insert((cache, key));
+        true
+    }
+
     /// Whether `search` would hit.
     pub(crate) fn cached(&self, cache: Cache, key: &Key) -> bool {
         self.entries.contains(&(cache, key.clone()))
@@ -422,6 +434,9 @@ pub(crate) enum PageScan {
     /// are the key; no key for the planner's look at a B-tree's height
     /// (`_bt_getrootheight`), which reads its metapage alone.
     Index(i64, Option<Key>),
+    /// [`PageScan::Index`] for the rows whose next key column is above the
+    /// number (`RelationBuildTupleDesc`'s `attnum > 0`).
+    IndexAbove(i64, Key, i64),
     /// An index-only scan of the index for the rows whose leading key
     /// columns are the key, returning the count of rows: the visibility
     /// map, then the heap only for a tuple whose block it does not mark
@@ -464,8 +479,9 @@ impl Counter {
     pub(crate) fn index_only(&self, index: i64, key: Key, rows: i64) {
         if let Some(s) = &self.stats {
             let n = usize::try_from(rows).unwrap_or(0);
-            let fetched = crate::catalog_btree::index_only_heap_fetches(index, &key, n)
-                .map_or(rows, |f| f as i64);
+            let fetched =
+                crate::catalog_btree::index_only_heap_fetches(self.store, s.db, index, &key, n)
+                    .map_or(rows, |f| f as i64);
             s.index_scan(index, rows, fetched);
             self.scans
                 .borrow_mut()
@@ -490,6 +506,21 @@ impl Counter {
     /// which it returns once and then marks killed (`_bt_killitems`), so
     /// that no later scan returns them.
     pub(crate) fn index_key(&self, index: i64, key: &Key, rows: i64) {
+        self.index_key_scan(index, key, rows, PageScan::Index(index, Some(key.clone())));
+    }
+
+    /// [`Self::index_key`] for the rows whose next key column is above
+    /// `floor` (`RelationBuildTupleDesc`'s `attnum > 0`).
+    pub(crate) fn index_key_above(&self, index: i64, key: &Key, floor: i64, rows: i64) {
+        self.index_key_scan(
+            index,
+            key,
+            rows,
+            PageScan::IndexAbove(index, key.clone(), floor),
+        );
+    }
+
+    fn index_key_scan(&self, index: i64, key: &Key, rows: i64, scan: PageScan) {
         let own = self
             .own_dead
             .borrow()
@@ -499,9 +530,7 @@ impl Counter {
         let dead = take_dead(self.store, index, key) + own;
         if let Some(s) = &self.stats {
             s.index_scan(index, rows + dead, rows);
-            self.scans
-                .borrow_mut()
-                .push(PageScan::Index(index, Some(key.clone())));
+            self.scans.borrow_mut().push(scan);
         }
     }
 
@@ -682,6 +711,50 @@ pub(crate) fn forget_store(store: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&store);
+    init_files_removed(store);
+}
+
+// ------------------------------------------- the relation cache init files
+
+/// The relation cache init files a store's server holds (RP-292): the
+/// shared one (`global/pg_internal.init`) and each database's
+/// (`base/<oid>/pg_internal.init`). A start removes them all
+/// (`RelationCacheInitFileRemove` in `StartupXLOG`), and the first backend
+/// that finds one missing builds every relation it would hold and writes it
+/// (`RelationCacheInitializePhase3`).
+#[derive(Debug, Default)]
+struct InitFiles {
+    shared: bool,
+    local: HashSet<i64>,
+}
+
+fn init_files() -> &'static Mutex<HashMap<usize, InitFiles>> {
+    static F: OnceLock<Mutex<HashMap<usize, InitFiles>>> = OnceLock::new();
+    F.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Which of the init files a backend starting in `db` finds missing:
+/// `(shared, local)`.
+pub(crate) fn init_files_missing(store: usize, db: i64) -> (bool, bool) {
+    let f = init_files().lock().unwrap_or_else(|e| e.into_inner());
+    f.get(&store)
+        .map_or((true, true), |f| (!f.shared, !f.local.contains(&db)))
+}
+
+/// A backend in `db` wrote both init files (`write_relcache_init_file`).
+pub(crate) fn init_files_written(store: usize, db: i64) {
+    let mut f = init_files().lock().unwrap_or_else(|e| e.into_inner());
+    let f = f.entry(store).or_default();
+    f.shared = true;
+    f.local.insert(db);
+}
+
+/// The server started, or stopped: no init file is there.
+pub(crate) fn init_files_removed(store: usize) {
+    init_files()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&store);
 }
 
 #[cfg(test)]
@@ -762,6 +835,19 @@ mod tests {
         assert_eq!(take_dead(store, 2659, &vec![K::O(16384)]), 1);
         assert_eq!(take_dead(store, 2659, &vec![K::O(16384)]), 0);
         forget_store(store);
+    }
+
+    #[test]
+    fn a_start_leaves_no_init_file_until_a_backend_writes_them() {
+        let store = 0xfef0;
+        assert_eq!(init_files_missing(store, 5), (true, true));
+        init_files_written(store, 5);
+        assert_eq!(init_files_missing(store, 5), (false, false));
+        // Another database's backend finds only the shared file.
+        assert_eq!(init_files_missing(store, 16384), (false, true));
+        // The server stopped: the next start finds neither.
+        forget_store(store);
+        assert_eq!(init_files_missing(store, 5), (true, true));
     }
 
     #[test]

@@ -76,10 +76,10 @@ item touches the planner or explain.
 
 ## 1. Pick the item
 
-- **PG backlog: check `main`'s psycopg Windows gauge first.** PRs that do
-  not touch the wire, TLS or auth no longer run it, so the push-to-main run
-  is where a regression shows:
-  `gh run list --workflow psycopg-windows.yml --branch main --event push --limit 1 --json conclusion,headSha,url`.
+- **PG backlog: check `main`'s psycopg Windows gauge first.** No PR or
+  push runs it (Joe, 2026-11-25: no Windows build for debug builds), so
+  the weekly run is where a regression shows:
+  `gh run list --workflow psycopg-windows.yml --branch main --event schedule --limit 1 --json conclusion,headSha,url`.
   If it is `failure`, that regression is the item: reproduce it, fix it,
   file it if it is not one PR.
 - An ID was given: take it.

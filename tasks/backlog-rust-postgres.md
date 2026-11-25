@@ -335,13 +335,18 @@ one beside it.
       and a reasons-only or indirect list, answer as PostgreSQL 15.19 does.
     - **Scope decision (Joe, 2026-11-25, RP-747): where PostgreSQL's answer
       is its OpenSSL's, the CURRENT OpenSSL's is kept.** A delta list is
-      never a certificate's list (no `X509_V_FLAG_USE_DELTAS`; OpenSSL 3.5.9
-      and 4.1.0 pass it over, so an issuer with only a delta answers
-      "unknown ca"), where PostgreSQL on Ubuntu's OpenSSL 3.0.13 read it as
-      a full list. The login comparisons' references link a current
-      OpenSSL to match: CI builds one (`.github/actions/pg15-current-openssl`,
-      3.5.9), and a developer box uses Homebrew's `postgresql@15` (OpenSSL
-      4) or one built against `openssl@3`.
+      never a certificate's list (no `X509_V_FLAG_USE_DELTAS`; OpenSSL
+      3.0.22, 3.5.9, 3.6.5 and 4.1.0 pass it over, so an issuer with only a
+      delta answers "unknown ca"). Every OpenSSL line has answered so since
+      its 2026-08-25 release (3.0.22, 3.4.7, 3.5.8, 3.6.4, 4.0.2), which
+      fixed `get_crl_score` reaching its delta check only with extended CRL
+      support on; before it (Ubuntu's 3.0.13, Homebrew's 3.6.3) a delta was
+      read as a full list. The login comparisons' references link a fixed
+      OpenSSL to match, and `tests/test_rust_pg_login_differential.py`
+      refuses one that is not by name: CI builds one
+      (`.github/actions/pg15-current-openssl`, 3.5.9), and a developer box
+      uses Homebrew's `postgresql@15` (OpenSSL 4) or one built against a
+      fixed `openssl@3`.
     - **A self-signed root is never checked against the revocation lists**,
       as OpenSSL 3.6 has it (`check_cert_crl` skips it). PostgreSQL linked
       against an older OpenSSL (3.0.13 on Ubuntu 24.04) checks the root as
@@ -865,15 +870,28 @@ one beside it.
     in the merge's ascending one (a Merge Right Join reads it presorted):
     `--desc --then m0.c` 809 of 810 (801), `--desc --then "m1.c desc,
     m0.b"` 2 differences (12), every two-table shape matching, no other
-    variant worse. What is left there is a five-table two-hub shape
-    (`multi5/300/idx1/two_hubs2/inner/ordlastlim5`), not diagnosed; the
-    `--desc-nulls-last` ones (7 and 21 differences) are four- and
-    five-table stars. Declined still: a later key a
+    variant worse. Since 2026-11-25 a join's ascending order of the
+    ORDER BY's class under a descending first key is of no use above it:
+    the wrong direction for merging (`right_merge_direction`) and not the
+    ORDER BY's, so `build_join_pathkeys` truncates it and a merge above
+    sorts that side again (the search had read it presorted, a plan
+    PostgreSQL never builds). On a private 15.20: `--desc` and
+    `--desc-nulls-last` 1,665 of 1,665 each, `--desc --then m0.c` and
+    `--then "m1.c desc, m0.b"` 810 of 810 (1 and 2 differences before),
+    `--desc-nulls-last --then m1.c` 810 of 810 (7), `--then "m0.c desc"`
+    793 (21), no shape worse. Those 17 left are four- and five-table
+    stars with a LEFT join (one inner), the same rule for a LATER key:
+    `right_merge_direction` reads every query pathkey, so an ascending
+    order of a later DESC key's class is the wrong direction too (checked
+    on `multi4/20/plain/star_cb/lastleft/ordlastlim5`: the t0/t1 merge on
+    t0.c read presorted under the Merge Right Join). The search's `later`
+    keys carry no direction (`four_table_join`, `ordered_limit_searched`).
+    Declined still: a later key a
     WHERE may fix to a constant; a table with an index of several columns;
     and a two-table join with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_five_table_two_hub_join_desc_with_another_key
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_four_table_star_left_join_desc_nulls_last_then_desc
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
@@ -1188,9 +1206,42 @@ one beside it.
       -> `index_relations` -> `derive_index_relations`, which visits every
       table's columns; and `catalog_rows_keyed` -> `build_catalog_rows`.
       Which of these grow is not yet split out: profile 0 against 8,000
-      tables before changing one.
+      tables before changing one. On CI it has reached 800 tables once:
+      snapshot PR #2992 (run 45595956409, job `pg-oracle (backlog)`, head
+      `ec891bbfc`, which held only RP-1050's planner change) failed RP-911's
+      regression test
+      `test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth`
+      with a median of 22.1 ms with no other table and 25.1 ms with 800
+      (1.14, over the tenth). The same job passed on the 28 other runs
+      from 2026-11-24 17:45 to 2026-11-25 12:16, main's included. Whether
+      that is runner noise at a budget this tight or this growth showing at
+      800 tables on CI's slower runner is not settled: measure the
+      800-table pair in a loop before touching its budget.
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth
       Backlog-ID: RP-1073
+
+- [ ] **OPEN — the catalog-latency ratio tests fail at their thresholds on
+      CI's runner (2026-11-25).** `tests/backlog/test_rp_catalog_latency.py`
+      compares ratios so that its verdicts would hold on any runner, but the
+      ratios themselves differ by runner. Twice in one day a snapshot PR's
+      `pg-oracle (backlog)` job failed one of them at the edge, and each time
+      the same tests passed on the snapshot before:
+      RP-911's 800-table pair (22.1 ms against 25.1 ms, 1.14 over its 1.10;
+      PR #2992 at `ec891bbfc`, run 45595956409), then RP-715's
+      first-against-warm (83 ms against 3 x 21 ms + 20 ms = 83 ms; PR #2992
+      at `47b7dbed4`, run 45662413394). Locally (debug `secantusd-pg`, arm64
+      macOS, five runs of each tree interleaved) RP-715's pair is 14.0-14.2 ms
+      first and 6.2-6.5 ms warm on `pg-batch` at `672bed686`, against
+      13.1-13.4 ms and 5.6-5.7 ms on `main`'s server code, so the batch moved
+      neither ratio (2.3 against 2.4, limit 39 ms). CI's runner gives about
+      4. The batch did add about 0.6-0.8 ms to both queries (7-11%), from
+      commits not yet split out (RP-291's and RP-292's catalog changes touch
+      this path). Decide what the comparison should hold to on a slow
+      runner: more interleaved rounds, the median of several fastest-of-N
+      pairs, or a threshold measured on CI's own runner shape. Then bisect
+      the 0.6 ms. Do not just widen a threshold until it passes.
+      Verify: none -- intermittent on CI; RP-715's and RP-911's regression tests are the check
+      Backlog-ID: RP-1100
 
 ## Found by a CI run (2026-11-07)
 
@@ -1400,10 +1451,11 @@ batch, their tests regression tests:
       A `btree_gin` index over a scalar `int2`/`int4`/`int8`/`float4`/
       `float8`/`bool`/`text` column has been modelled since 2026-11-17, and
       over `date`/`timestamp`/`timestamptz`, `numeric` and `interval` since
-      2026-11-18 (one key per row, the value itself); its scans are not, nor
-      its other types (`time`, `timetz`, `bytea`, `inet`, ...).
+      2026-11-18, and over `time` since 2026-11-25 (one key per row, the
+      value itself); its scans are not, nor its other types (`timetz`,
+      `bytea`, `inet`, ...).
       Backlog-ID: RP-287
-      Verify: tests/backlog/test_rp_top10_found.py::test_a_btree_gin_time_index_has_its_pages
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_btree_gin_timetz_index_has_its_pages
 
 
 ## Found by batch 71 (2026-10-25)
@@ -1544,78 +1596,123 @@ a regression test.
       permission checks read stop its walk, and a view that depends on a
       dropped column is not seen: its pg_depend rows count as none), the rule
       queries of system views (`pg_stat_*`), the join in psql's `\d`
-      pattern query (`mergejoinscansel`'s operators and its
-      `get_actual_variable_range` probes of a histogram's ends; the nested
-      loop's whole-row scans, whose columns' types the executor looks up,
-      and its inner-unique scan stopping at the first match -- both follow
-      from PostgreSQL's choice of join method, which the walk does not
-      cost), a pattern whose fixed prefix is not all of it (`^(rpc.*)$`,
-      `LIKE 'rpc_t'`: the range conditions and their estimates), ILIKE and
+      pattern query (the nested loop's whole-row scans, whose columns'
+      types the executor looks up, and its inner-unique scan stopping at
+      the first match -- both follow from PostgreSQL's choice of join
+      method, which the walk does not cost), a pattern whose fixed prefix
+      is not all of it (`^(rpc.*)$`, `LIKE 'rpc_t'`: the range conditions
+      and their estimates), ILIKE and
       `~*`, subqueries, CTEs, windows, PL/pgSQL bodies, and texts over 64
       KiB. A pattern whose fixed prefix is all of it becoming the index's
       equality, `COLLATE`'s lookups and `pg_table_is_visible` on the rows a
       scan returns are walked since 2026-11-13 (regression tests
       `tests/backlog/test_rp_catalog_reads.py::test_gap[a pattern's exact
       match is an index condition]` and `::test_gap[psql's pattern on one
-      relation]`). Measured 2026-11-13: `\d rpc_t`'s first query 34
-      counters match, 5 differ (10 of its statement's 24 differed before);
-      a `pg_stat_*` view 16 match, 22 differ.
+      relation]`). Since 2026-11-25 a merge-joinable join clause's
+      `mergejoinscansel` is walked (its family's operators and their
+      functions, each side's range from its statistics,
+      `comparison_ops_are_compatible`, and `ineq_histogram_selectivity`'s
+      probes of a catalog column's index for its actual ends; regression
+      test `test_a_merge_join_clauses_scan_estimate`), ascending only: a
+      descending merge pathkey's `BTGreaterStrategyNumber` call is not, and
+      a table's own index is not probed (its ends stay the histogram's).
+      Measured 2026-11-25: `\d rpc_t`'s first query 37 counters match, 2
+      differ (`pg_namespace`'s scan and `pg_type_oid_index`, the join
+      method's); a `pg_stat_*` view 16 match, 22 differ.
       Backlog-ID: RP-290
       Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view], tests/backlog/test_rp_catalog_reads.py::test_gap[psql's describe query]
-- [ ] **A catalog row added after `initdb` counts no heap block** in
-      `pg_statio_sys_tables`. A catalog scan counts its index pages
-      (`catalog_btree.rs`, from `pg15_catalog_indexes.txt`) and, since
-      2026-11-01, the heap blocks behind `initdb`'s own rows: an index
-      scan's fetch of each tuple it returns, a sequential scan's every
-      block, over `pg15_catalog_heaps.txt` (`catalog_heap.rs`; regression
-      test `test_catalog_heap_blocks`). A row any database adds later has
-      no place yet, so a scan that returns one (a new table's `pg_class`
-      and `pg_attribute` rows) counts neither its heap block nor, for a
-      sequential scan, the blocks it grew the heap by.
+- [ ] **A catalog row DDL other than CREATE TABLE writes counts no heap
+      block** in `pg_statio_sys_tables`. A catalog scan counts its index
+      pages (`catalog_btree.rs`, from `pg15_catalog_indexes.txt`) and the
+      heap blocks behind the rows it returns: `initdb`'s own
+      (`pg15_catalog_heaps.txt`, `catalog_heap.rs`), and since 2026-11-25
+      those CREATE TABLE and CREATE DATABASE write, placed in each
+      database's copy of `initdb`'s heap pages and free space map as
+      PostgreSQL places them (`catalog_places.rs`): the table's row type
+      and array type, its `pg_class` row, its columns' and the system
+      columns' `pg_attribute` rows, its TOAST table's and that table's
+      index's rows (keyless: this server keeps no TOAST relation), the
+      HOT update that sets `reltoastrelid`, each constraint index's
+      `pg_class`, `pg_attribute` and `pg_index` rows, and `createdb`'s
+      `pg_database` row in the cluster's one heap. Each write clears its
+      page's visibility map bit, so an index-only scan fetches the
+      `initdb` rows beside it; DROP TABLE and DROP DATABASE leave the rows
+      dead at commit, as does a rolled-back CREATE (regression tests
+      `test_catalog_blocks`, `test_a_page_ddl_wrote_to_is_not_all_visible`
+      and `test_ddl_cycles_write_the_pages_postgresqls_do`, which holds the
+      `pg_class` blocks four cycles of DDL write to PostgreSQL's).
       **Decided** (Joe, 2026-11-01): option A, the full model, landed as a
-      sequence of PRs, this item open until the last. Since 2026-11-02
-      each built-in catalog's `initdb` pages (free space, line pointers,
-      redirects, heap-only tuples) and free space map fork are recorded
-      too, and `catalog_heap::initdb_heap_model` builds the heap a new
-      row goes in, placed FSM-first as PostgreSQL places it (regression
-      test `a_new_tables_catalog_rows_go_where_postgresql_puts_them`).
-      Remaining: place every later catalog row in those models as DDL
-      writes it (each catalog's `heap_form_tuple` length, and the HOT or
-      non-HOT updates DDL makes of its own new rows), and insert its
-      index entries into the index trees, which hold only `initdb`'s
-      tuples and are shared by every database -- with a non-HOT update's
-      new version and entries, and VACUUM's removal of dead ones (reading
-      this server's catalog rows to find them is not the way: on a
-      statement's path it cost a new session hundreds of milliseconds,
-      inside a transaction that changed the catalogs it blinded the
-      session to its own new objects, and off a statement's path it lost
-      other sessions' new tables). Also open: the shared buffer pool keys
-      a page by relation oid and block, not database, so two databases'
-      copies of one catalog share hits. An index-only scan's `Heap
-      Fetches` (RP-360) reads `initdb`'s visibility map: until later rows
-      are placed, a row DDL adds counts as fetched but the `initdb` rows
-      on the page it cleared do not, and a row DDL deleted or updated
-      still reads as all-visible. Since 2026-11-13 a catalog read directly
-      through an index holding every column it reads is an index-only
-      scan here too (`IndexOnlyNext`: the visibility map's page once, the
-      heap only off an all-visible block; regression test
-      `test_an_index_only_catalog_scan_reads_the_visibility_map`), with the
-      same two gaps: each row DDL added is fetched as a block of its own,
-      and an `initdb` row on a page DDL wrote to is not fetched (`select
-      relname from pg_class where relname = 'pg_type'` after this module's
-      DDL: PostgreSQL 15.19 reads 7 `pg_class` blocks, this server 6).
+      sequence of PRs, this item open until the last. Remaining:
+      - every other DDL's rows: CREATE VIEW's (`pg_class`, `pg_type`,
+        `pg_attribute`, `pg_rewrite`, and the HOT update `relhasrules`
+        makes), CREATE FUNCTION's `pg_proc` row, GRANT's out-of-line
+        `relacl` update (217 bytes), CREATE INDEX, sequences and serial
+        columns, ALTER TABLE, roles, and the CREATE TABLE shapes left
+        unplaced (temporary, partitioned, inheriting and typed tables,
+        identity and generated columns, foreign keys, whose triggers update
+        the `pg_class` rows, exclusion constraints, CREATE DATABASE with a
+        locale option); and the catalogs none of it is placed in yet
+        (`pg_depend`, `pg_constraint`, `pg_shdepend`, ...). A view's first
+        use in a fresh database reads 6 `pg_class`, 4 `pg_attribute` and 1
+        `pg_rewrite` blocks on PostgreSQL, 3, 3 and 0 here; a function's
+        first call 3 `pg_proc` blocks, here 1;
+      - the index entries of the placed rows in the index trees, which hold
+        only `initdb`'s tuples and are shared by every database (a scan's
+        leaf pages are read over `initdb`'s tree), with a non-HOT update's
+        new version and entries, and VACUUM's removal of dead ones;
+      - a dead row's space: on-access pruning (`heap_page_prune_opt`) and
+        VACUUM do not free it, and a scan never meets a dead row's entry
+        (it reads as killed at once, where PostgreSQL's first scan reads
+        its block before `_bt_killitems`); a ROLLBACK TO SAVEPOINT past a
+        CREATE TABLE keeps its rows live;
+      - a restart: the places are kept in memory, so after one the rows
+        read as unplaced again (a row returned beyond the placed ones is
+        fetched as a block of its own by an index-only scan, and counts no
+        block in a plain one); and the template a CREATE DATABASE copies
+        is always `initdb`'s.
+      Also open: the shared buffer pool keys a page by relation oid and
+      block, not database, so two databases' copies of one catalog share
+      hits. Reading this server's catalog rows to find any of this is not
+      the way: on a statement's path it cost a new session hundreds of
+      milliseconds, inside a transaction that changed the catalogs it
+      blinded the session to its own new objects, and off a statement's
+      path it lost other sessions' new tables. PostgreSQL 15.20 (the
+      box's reference since 2026-11-24) writes `pg_attribute` differently
+      from 15.19: each table column's row carries `attoptions =
+      {pg_attver=...}` (189 bytes, not 144), and its `initdb` heap is 65
+      blocks, not 56; `pg_class`, `pg_type`, `pg_index` and `pg_database`
+      are 15.19's page for page, which is what this slice was measured on.
       Backlog-ID: RP-291
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_catalog_blocks, tests/backlog/test_rp_catalog_reads.py::test_a_page_ddl_wrote_to_is_not_all_visible
-- [ ] **The first backend after a start is counted as a warm one.**
-      PostgreSQL serves it without the relcache init files (about 245
-      `pg_attribute` index scans, `pg_class` heap scans, ...); the model
-      treats every backend as starting with them. Separating the shared
-      and local cold costs needs an instrumented PostgreSQL.
-      **Decided** (Joe, 2026-11-02): build it -- a private PostgreSQL
-      15.19 from source with the catalog-read counters, kept in the
-      worktree's `.scratch/`, never the shared reference servers.
-      Backlog-ID: RP-292
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_the_first_backend_after_a_start
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_views_and_a_functions_rows_are_read_from_the_heap
+- [ ] **No logical replication launcher scans `pg_subscription`.**
+      PostgreSQL 15.19's launcher (`ApplyLauncherMain`) heap-scans
+      `pg_subscription` as it starts, again at once, then whenever its
+      latch is set (a reload, a subscription's commit) or 180 s pass, and
+      flushes those counts only as it exits: across a restart,
+      `pg_stat_get_numscans('pg_subscription'::regclass)` moves by the run
+      before's scans (2 after a run with no reload, 3 with one, 5 with
+      three; PostgreSQL 15.20, private cluster). Here it does not move.
+      The faithful fix keeps the launcher's pending scans per server run
+      and folds them in at a clean shutdown (found while working RP-292,
+      whose restart comparison leaves `pg_subscription` out for this).
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_the_logical_replication_launcher_scans_pg_subscription
+      Backlog-ID: RP-1096
+- [ ] **An invalidation never removes the relation cache init files.**
+      Since RP-292 the first backend after a start builds the init files
+      and later ones read them; but PostgreSQL 15.19 also removes a file
+      when a committed transaction invalidates a relation it holds
+      (`RelationCacheInitFilePreInvalidate`), and the next backend builds
+      it again. After a database-wide `analyze`, PostgreSQL 15.20's next
+      backend makes the cold start's heap scans (`pg_class` 11,
+      `pg_attribute` 11, `pg_authid` 2); after `analyze pg_class`, `analyze
+      pg_authid` or a `create table` it makes none. Here no invalidation
+      reaches the init files. The faithful fix: an `Inval::Rel` of an
+      init-file relation, at commit, removes that file (shared or the
+      database's), as `RegisterRelcacheInvalidation` marks
+      `RelcacheInitFileInval`; which of `analyze`'s catalog updates send
+      one is the part to measure (found while working RP-292).
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_removes_the_init_files
+      Backlog-ID: RP-1097
 - [ ] **A database-wide ANALYZE measures only some catalog columns.** Since
       RP-311 each database holds `initdb`'s `pg_statistic` rows for the
       built-in catalogs. A plain `ANALYZE` (or `VACUUM ANALYZE`)
@@ -1637,18 +1734,22 @@ a regression test.
       Backlog-ID: RP-313
       Verify: none -- the `pg_node_tree` columns need `nodeToString`'s
       text of each stored tree; no gap test until a probe pins one
-- [ ] **A database-wide ANALYZE's correlation of a catalog column is not
-      PostgreSQL's.** `compute_scalar_stats` correlates a column's sort order
-      with the rows' heap order; here the catalog's rows are walked in this
-      server's own order, not PostgreSQL's heap's (`initdb`'s pages, then
-      where a new row goes, RP-291). In a fresh database after `create table
-      zzzz_rp313 (a int)` and `analyze`, PostgreSQL 15.19's `pg_class`
-      correlations are `oid` 0.6547713, `relkind` 0.7882681, `relname`
-      -0.12838678, `relnatts` 0.67018104; here 0.9854369, 0.8315357,
-      0.1999988 and 0.50667804. The most common values and their
-      frequencies match (found while working RP-313).
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_columns_correlation_follows_the_heap
-      Backlog-ID: RP-358
+- [ ] **A new table's array type's oid sorts after its row type's.**
+      PostgreSQL draws every new object's oid from one counter
+      (`GetNewOidWithIndex`, from `FirstNormalObjectId`): `create table
+      zzzz_rp313 (a int)` in a fresh 15.20 database (after `create
+      database`, 16384) is 16385, its array type 16386
+      (`AssignTypeArrayOid`, before `TypeCreate`) and its row type 16387.
+      Here user oids count from 67,000 and a type's array is its element's
+      oid plus 100,000 (`USER_TYPE_ARRAY_OID_OFFSET`, RP-137): 67000,
+      67001 and 167001, so the array sorts after the row type. A visible
+      answer moves with it: after a plain ANALYZE, `pg_type.oid`'s
+      correlation over the heap's order is 0.9796509 on PostgreSQL, here
+      0.979651 (found while working RP-358). Constraint oids are this
+      server's own numbers by a scope decision; whether that extends to
+      types and relations is not decided.
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_new_tables_array_type_oid_comes_before_its_row_types
+      Backlog-ID: RP-1098
 - [ ] **A chain of inequality joins under a LIMIT runs far past the rows
       it returns.** `select e.a, e3.a, zs.a, e4.a from e join e e3 on e.a <
       e3.a join zs on e3.a > zs.a join e e4 on e4.a < zs.a limit 7 offset
@@ -1673,9 +1774,20 @@ a regression test.
       WHERE whose conjuncts each read one relation prints them as its
       scans' `Filter`, prefixed (RP-966, in part:
       `ruleutils::explain_verbose_join`, `explain::attach_verbose_join`,
-      `explain::attach_verbose_nested_loop`). Every other join does not:
-      PostgreSQL 15.19 prints a Merge Join's, its Materialize's and
-      Memoize's `Output` likewise; here the plain plan. (Since 2026-11-17
+      `explain::attach_verbose_nested_loop`). (Since 2026-11-25 a
+      two-relation merge join on column equalities prints every node's
+      `Output`, a sorted side only the columns the join needs, an
+      index-ordered side its physical target list, an Index Only Scan of a
+      one-column primary key that key: `explain::attach_verbose_merge_join`;
+      and a two-relation join under an ORDER BY of columns, a LIMIT or
+      both prints its Limit's and Sort's `Output` too, each ORDER BY column
+      the select list lacks a resjunk entry every node down to the join
+      returns: `VerboseJoin::sort_keys`, measured on PostgreSQL 15.20. A
+      merge join under a LIMIT, on PostgreSQL 15.20 the plan of `... e
+      join k on e.a = k.a order by k.a limit 10`, waits on RP-1099's plain
+      plan.) Every other join does not:
+      PostgreSQL 15.19 prints a Memoize's `Output` likewise; here the
+      plain plan. (Since 2026-11-17
       a nested loop over a scan and a Materialize of a scan, the ON its
       `Join Filter`, prints every node's `Output`:
       `explain::attach_verbose_materialized_loop`.) Nor does a WHERE conjunct reading both relations, an ON that is not column
@@ -1746,7 +1858,7 @@ a regression test.
       for `where e.a < 5`, RP-1065 for `where e.a = 3`), a RIGHT join
       (RP-1063). Work those first; the VERBOSE half then follows the
       chain's `Output` rules above.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a three-way join with a join filter]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a three-way join with a join filter], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a merge join under a limit], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a merge join over an index only scan], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a descending merge join with a where]
       Backlog-ID: RP-966
 
 - [ ] **A WHERE-filtered relation of a three-way join is not joined
@@ -1848,6 +1960,28 @@ a regression test.
       it. Found while working RP-966.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by over a join prints its sort]
       Backlog-ID: RP-1056
+
+- [ ] **An ORDER BY under a LIMIT over a two-table join is an unpriced
+      Sort over the join method it would use without them.** `explain
+      (costs off) select e.b, k.b from e join k on e.a = k.a order by k.a
+      limit 10` (`e`, `k` analysed, 1000 rows, `k.a` the primary key)
+      prints `Limit` over `Sort` (`Sort Key: k.a`) over a `Hash Join`,
+      every node `cost=0.00..0.00 rows=0 width=0`; PostgreSQL 15.20 prints
+      `Limit` over a `Merge Join` (`Merge Cond: (k.a = e.a)`) of `Index
+      Scan using k_pkey on k` and a Sort of `e`, (cost=65.10..65.71
+      rows=10). The same with `order by e.a`, `order by k.a desc` (an
+      `Index Scan Backward`), a LEFT join from `k`, `select k.b, k2.b from
+      k join k k2 ...` (two index scans) and two tables never analysed
+      (`e.b = k.b ... order by e.b limit 3`). `... on e.a < k.a order by
+      e.b limit 5` is PostgreSQL's bounded Sort over a Nested Loop into
+      `Index Scan using k_pkey on k` (`Index Cond: (a > e.a)`); here a
+      Nested Loop of two Seq Scans with a `Join Filter`. With `order by
+      k.a limit 5` PostgreSQL keeps the Sort over the Hash Join, matched
+      here but unpriced. The LIMIT search that matches these shapes on
+      `tools/probes/pg_join_order_matrix.py` does not reach them; find
+      where it declines before sizing. Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by under a limit over a join is a merge join], tests/backlog/test_rp_explain_costs.py::test_plan[an order by under a limit over an inequality join reads the index]
+      Backlog-ID: RP-1099
 
 - [ ] **A join's Hash Cond names a different member of the equivalence
       class than PostgreSQL's.** `explain (costs off) select k.b, e2.b
@@ -2227,24 +2361,31 @@ gap tests are in `tests/backlog/test_rp_found_rp532.py`.
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp590.py`.
 
-- [ ] **The `record_image` operators refuse some field types.** `*=` ..
-      `*>=` compare a record's fields by their binary images (RP-650):
-      the scalar types in `record_image.rs`, jsonb (its `JsonbContainer`,
-      2026-11-18), arrays of fixed-length elements (by value, or by
-      reference: interval, uuid, timetz, name, macaddr / macaddr8, tid) or
-      of text / varchar / bpchar / numeric / bytea / inet / cidr / jsonb
-      (each with the 4-byte header `array_in` gives it, measured), the
-      built-in ranges and the built-in multiranges (`make_multirange`'s
-      layout, 2026-11-18) and named composites (the `HeapTupleHeader`
-      `heap_form_tuple` builds, 2026-11-18) are modelled. Every other type
-      is 0A000 `a record_image comparison over a field of type ... is not
-      supported yet`. Remaining, measured on PostgreSQL 15.19: arrays of
-      any other varlena element (`xml[]`), a user range or multirange, an
-      anonymous `record` field (its typmod is the session's blessed one),
-      and a composite whose type has a dropped attribute (its `natts`
-      and NULL bitmap count the dropped column; the planner's field list
-      does not, so such a value is imaged as though never altered).
-      Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_over_still_refused_field_types
+- [ ] **The `record_image` operators refuse some field types, and image a
+      composite with a dropped attribute wrongly.** `*=` .. `*>=` compare a
+      record's fields by their binary images (RP-650): the scalar types in
+      `record_image.rs`, json and xml (their text as written, 2026-11-25),
+      jsonb (its `JsonbContainer`), the ranges and multiranges, built-in or
+      user, over a subtype the module models (`range_serialize`'s
+      `datum_write` layout, 2026-11-25), named composites (the
+      `HeapTupleHeader` `heap_form_tuple` builds) and arrays of any of
+      those but bit / varbit are modelled. Every other type is 0A000 `a
+      record_image comparison over a field of type ... is not supported
+      yet` (point, tsvector and the other geometric and text-search types
+      among them). Remaining, measured on PostgreSQL 15.20: an anonymous
+      `record` field (its image carries the typmod the session blessed its
+      row type with, `assign_record_type_typmod`, so two records of
+      different field types order by blessing order), and a WRONG answer,
+      not a refusal: a composite whose type has a dropped attribute
+      (`ALTER TYPE ... DROP ATTRIBUTE`, or a table's row type after `ALTER
+      TABLE ... DROP COLUMN`). Its `t_infomask2` counts the dropped slot
+      and its NULL bitmap always marks it, so `row(row(null, 'a')::cx) *<
+      row(row(1, 'a')::cx)` is true on 15.20 and false here: the planner
+      holds only the live fields (`CompositeType`), not the `attnums` and
+      `dropped` slots the composite catalog document keeps
+      (`composite_alter.rs`), so the value is imaged as though never
+      altered. The fix hands those slots to `composite_image`.
+      Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_over_still_refused_field_types, tests/backlog/test_rp_found_rp590.py::test_record_image_over_a_composite_with_a_dropped_attribute
       Backlog-ID: RP-976
 
 ## Found while working RP-569 (2026-11-08)
@@ -2521,13 +2662,43 @@ The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
       target there.
       Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_record_into_non_composite
       Backlog-ID: RP-1086
-- [ ] **A UNION of a composite and a `record` has no error position.**
-      `insert into tct(c) select (1,'x')::ctp union select row(2,'y')` is
-      42804 `UNION types ctp and record cannot be matched` at 53 (the right
-      arm's column) on PostgreSQL 15.19; here the message matches and the
-      position is missing. Found while working RP-1044.
-      Verify: tests/backlog/test_rp_found_rp552.py::test_union_composite_record_position
-      Backlog-ID: RP-1050
+
+## Found while working RP-1050 (2026-11-25)
+
+Measured on PostgreSQL 15.19. The gap tests are in
+`tests/backlog/test_rp_found_rp1050.py`; the `INSERT` one uses
+`test_rp_found_rp552.py`'s `tct (c ctp, d pint[])`.
+
+- [ ] **A set operation's unmatched types are placed at the wrong column
+      or arm.** `select 1, 'a'::text union select 2, 3` is 42804 at 37 (the
+      `3`, the right side of the first unmatched column pair) on PostgreSQL
+      15.19, here at 34 (the right arm's first column); `select 1 union
+      select 'a'::text union select 2` is at 23 (the inner UNION fails
+      first, `transformSetOperationTree` works the left subtree before this
+      node), here at 46; `select 1 union (select 'a'::text union select
+      'b'::text)` is at 24, here none. `error_position` (secantus-pgplan
+      `errpos.rs`) guesses the top node's right arm's first target, as the
+      executor's `unify_set_op_type` raises the error with no location; the
+      faithful fix raises it where the column pair is known.
+      Verify: tests/backlog/test_rp_found_rp1050.py::test_set_op_mismatch_column_and_arm
+      Backlog-ID: RP-1087
+- [ ] **`INSERT ... SELECT` checks the column assignment before the set
+      operation's types.** `insert into tct(c) select null::text union
+      select 1` is 42804 `UNION types text and integer cannot be matched`
+      at 51 on PostgreSQL 15.19 (parse analysis of the query comes before
+      `transformInsertStmt` coerces its targets); here it is 42804 `column
+      "c" is of type ctp but expression is of type text` at 27.
+      Verify: tests/backlog/test_rp_found_rp1050.py::test_insert_select_set_op_types_before_assignment
+      Backlog-ID: RP-1088
+- [ ] **A set operation's unmatched types are not refused by `EXPLAIN` or
+      `PREPARE`.** `explain select null::text union select 1` and `prepare p
+      as select null::text union select 1` are 42804 `UNION types text and
+      integer cannot be matched` (at 40, at 50) on PostgreSQL 15.19, which
+      checks them in parse analysis; here both succeed, as the check runs
+      only when the set operation executes. `create view v as` the same
+      query is refused with the message and no position (PostgreSQL: 54).
+      Verify: tests/backlog/test_rp_found_rp1050.py::test_set_op_mismatch_refused_at_analysis
+      Backlog-ID: RP-1089
 
 ## Found while working RP-1048 (2026-11-25)
 
@@ -2791,31 +2962,35 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 `xu782f` a domain over `text` `collate "und-x-icu"`, `xc782f` one
 `collate "C"`.
 
-- [ ] **`pg_get_viewdef` of most system views is NULL.** PostgreSQL
-      15.19 deparses every `pg_catalog` and `information_schema` view's
-      rule. Here `system_view_defs` prints `system_views.sql`'s and
+- [ ] **`pg_get_viewdef` of 16 system views is NULL.** PostgreSQL
+      deparses every `pg_catalog` and `information_schema` view's rule.
+      Here `system_view_defs` prints `system_views.sql`'s and
       `information_schema.sql`'s queries through `ruleutils`, which
-      reproduces 69 of the 75 `pg_catalog` views and 23 of the 65
+      reproduces 69 of the 75 `pg_catalog` views and 55 of the 65
       `information_schema` views exactly (none printed wrong, measured
-      2026-11-18 in both print modes by md5 against a fresh 15.19 cluster)
-      and leaves the rest NULL rather than print them as written.
-      Remaining: the 6 other `pg_catalog` views (`pg_policies`,
+      2026-11-25 in both print modes by md5 against PostgreSQL 15.20) and
+      leaves the rest NULL rather than print them as written. Remaining:
+      the 6 other `pg_catalog` views (`pg_policies`,
       `pg_publication_tables`, `pg_seclabels`,
       `pg_stat_replication_slots`, `pg_stats_ext`, `pg_stats_ext_exprs`),
       which the printer refuses (`pg_stat_replication_slots`' query cannot
       even be a user view here: `LATERAL
       pg_stat_get_replication_slot(slot_name) s` gives `s` no columns,
-      42703 `column s.slot_name does not exist`); and 42
-      `information_schema` views (`columns`, `tables`, `domains`,
-      `views`, `routines`' siblings, the `role_*` / `*_usage` /
-      `*_privileges` views, ...). Most of those compare a domain-typed
-      column with an operator (`administrable_role_authorizations`:
-      `WHERE ((applicable_roles.is_grantable)::text = 'YES'::text)`, the
-      operator resolved on the base type with the column coerced), which
-      the printer refuses: it types the operand as the domain. A user
-      view over `generate_series(1, c.relnatts)` is still refused:
-      ruleutils casts the int2 argument to `integer`, which the printer
-      does not add.
+      42703 `column s.slot_name does not exist`; `pg_stats_ext` reads a
+      column named `values`; `pg_seclabels` a `rel.tableoid` system
+      column); and 10 `information_schema` views. Five call
+      `_pg_expandarray` (`key_column_usage`, `parameters`,
+      `data_type_privileges`, `element_types`,
+      `triggered_update_columns`), an `information_schema` SQL function
+      returning `SETOF record` with a polymorphic OUT column, which the
+      printer cannot type; `domains` and `sequences` call
+      `_pg_char_max_length` / `_pg_numeric_precision` and their siblings,
+      the information_schema functions the printer has no signature for;
+      `attributes` and `columns` pass a whole row (`_pg_truetypid(a, t)`);
+      `user_mapping_options` refuses at its `pg_has_role(srvowner,
+      'USAGE')` over the `_pg_user_mappings` view. A user view over
+      `generate_series(1, c.relnatts)` is still refused: ruleutils casts
+      the int2 argument to `integer`, which the printer does not add.
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_the_remaining_system_views
       Backlog-ID: RP-798
 
@@ -2824,23 +2999,53 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster; the
 views read only `pg_class`.
 
-- [ ] **`pg_get_viewdef` names a CASE column `case` where ruleutils takes
-      its ELSE column's name.** `create view v as select case when c.oid >
-      5 then 0 else c.relnatts end from pg_class c` prints `END AS
-      relnatts` on PostgreSQL 15.19 (`FigureColnameInternal` reads a
-      `CaseExpr`'s `defresult` at strength 1); here `END AS "case"`.
-      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_names_a_case_column_by_its_else_column
-      Backlog-ID: RP-1046
-- [ ] **`pg_get_viewdef` prints an IN list holding a column as `= ANY
-      (ARRAY[...])`.** `create view v as select c.relnatts in (1,
-      c.relam::int) from pg_class c` prints `((c.relnatts = 1) OR
-      (c.relnatts = (c.relam)::integer))` on PostgreSQL 15.19:
-      `transformAExprIn` builds a ScalarArrayOpExpr only of the list's
-      Var-free elements, and only when there are two or more, and ORs an
-      `=` for each of the rest. Here `(c.relnatts = ANY (ARRAY[1,
-      (c.relam)::integer]))`.
-      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_an_in_list_holding_a_column
-      Backlog-ID: RP-1047
+
+- [ ] **`pg_get_viewdef` does not parenthesise a function cast in ORDER
+      BY / PARTITION BY / GROUP BY when not pretty.**
+      `get_rule_sortgroupclause` forces parentheses round a FuncExpr item
+      in either print mode, and a cast PostgreSQL runs through a function
+      (`pg_cast.castmethod = 'f'`, such as `name::text`) is one: `create
+      view v as select c.oid from pg_class c order by c.relname::text`
+      prints `ORDER BY ((c.relname)::text)` on PostgreSQL 15.20 (a private
+      cluster). Here `ORDER BY (c.relname)::text`: the printer knows only
+      the binary-coercible (`'b'`) casts, so it cannot tell a function cast
+      from a relabel. The pretty print matches.
+      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_parenthesises_a_function_cast_sort_item
+      Backlog-ID: RP-1094
+
+- [ ] **`pg_get_viewdef` prints an operator over a user domain column
+      without relabelling it.** PostgreSQL resolves the operator on the
+      domain's base type and relabels the operand, which `get_oper_expr`
+      shows: over `create domain dint798 as int` and `u798(k int, dd
+      dint798)`, `select k from u798 where dd > 2` prints `WHERE
+      ((u798.dd)::integer > 2)` on PostgreSQL 15.20 (a private cluster).
+      Here `WHERE (u798.dd > 2)`: the printer types a user table's column
+      by its base type, and only an `information_schema` domain column by
+      the domain (RP-798). Typing every domain column as its domain needs
+      the printer to know each user domain's base type everywhere it
+      resolves an operator or a function over one, or it refuses views it
+      prints correctly today.
+      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_relabels_a_user_domain_operand
+      Backlog-ID: RP-1095
+
+## Found while working RP-1046 (2026-11-25)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.20 cluster; the
+statements create nothing.
+
+- [ ] **A column under a cast or `COLLATE` loses the name
+      `FigureColnameInternal` gives it.** `select user::text,
+      current_date::text` names its columns `user`, `current_date` on
+      PostgreSQL 15.20 (a SQLValueFunction is strength 2, so the cast
+      keeps it); here `text`, `text`. `select c.relname collate "C" from
+      pg_class c` is `relname` there (a CollateClause is named for its
+      argument, through a cast above too); here `?column?`, and
+      `(c.relname collate "C")::text` is `text`. The planner's
+      `expression_column_name` / `cast_source_names_column`
+      (`crates/secantus-pgplan/src/lib.rs`) have no arm for either; the
+      faithful port is `nodetostring::target::figure_colname_strength`.
+      Verify: tests/backlog/test_rp_found_rp1046.py::test_a_cast_of_a_sql_value_function_keeps_its_name, tests/backlog/test_rp_found_rp1046.py::test_a_collate_clause_keeps_its_argument_name
+      Backlog-ID: RP-1093
 
 ## Found while working RP-816 (2026-11-11)
 
@@ -2857,12 +3062,31 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415).
 
-- [ ] **`pg_get_partkeydef` prints an expression key with one pair of
-      parentheses too few.** `create table p (x int) partition by range
-      ((x + 1))` prints `RANGE (((x + 1)))` on PostgreSQL 15.19 (the key
-      list's, the expression's, the OpExpr's); here `RANGE ((x + 1))`.
-      Verify: tests/backlog/test_rp_found_rp860.py::test_pg_get_partkeydef_of_an_expression_key
-      Backlog-ID: RP-1052
+
+## Found while working RP-1052 (2026-11-25)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
+tests are in `tests/backlog/test_rp_found_rp860.py`.
+
+- [ ] **`pg_get_partkeydef` drops a partition key's COLLATE and operator
+      class.** `partition by range ((x::text) collate "C")` prints
+      `RANGE (((x)::text) COLLATE "C")` on PostgreSQL 15.19, and
+      `((x::text) text_pattern_ops)` prints `RANGE (((x)::text)
+      text_pattern_ops)`; here both print `RANGE (((x)::text))`.
+      `partitions::lower_create` keeps only each `PartitionElem`'s name or
+      expression, never its `collation` / `opclass`: the catalog keeps
+      neither, so the text cannot print them.
+      Verify: tests/backlog/test_rp_found_rp860.py::test_pg_get_partkeydef_keeps_a_key_collation_and_opclass
+      Backlog-ID: RP-1091
+
+- [ ] **`client_min_messages` does not withhold a NOTICE.** After `set
+      client_min_messages = warning`, `drop table if exists` of a missing
+      table and a DO block's `raise notice` each still send their NOTICE;
+      PostgreSQL 15.19 sends neither (a `raise warning` still arrives).
+      The setting is stored and `show` reports it, but nothing consults it
+      before a notice goes out (`do_block.rs` assumes the default level).
+      Verify: tests/backlog/test_rp_found_rp860.py::test_client_min_messages_withholds_a_notice
+      Backlog-ID: RP-1092
 
 ## Found while working RP-1054 (2026-11-25)
 
@@ -2896,20 +3120,20 @@ test is in `tests/backlog/test_rp_found_rp833.py`.
 Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
 test is in `tests/backlog/test_rp_found_rp833.py`.
 
-- [ ] **A function replaced by an identical CREATE keeps the label of its
-      old compile.** PostgreSQL revalidates a cached compiled function by
-      its `pg_proc` row's `xmin` and `ctid` (`plpgsql_compile`), so any
-      rewrite of the row -- an identical `CREATE OR REPLACE`, a DROP and
-      re-CREATE, an `ALTER FUNCTION ... OWNER TO`, from any session --
-      recompiles it and labels it afresh: on PostgreSQL 15.19 `s.f()` called
-      first off the path is `PL/pgSQL function s.f()`, and after another
-      session's identical `CREATE OR REPLACE` and `set search_path = s` it
-      is `f()`. `secantusd-pg` keys the session's label cache by the CREATE
-      text (RP-1034) and keeps `s.f()`. Faithful: stamp each function row
-      with the writing transaction's xid (`xids::writer`) and key the cache
-      by the function's oid and that stamp.
-      Verify: tests/backlog/test_rp_found_rp833.py::test_an_identical_replace_relabels_the_function
-      Backlog-ID: RP-1051
+
+## Found while working RP-1051 (2026-11-25)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
+test is in `tests/backlog/test_rp_found_rp833.py`.
+
+- [ ] **A function's CONTEXT label leaves a parameter type unqualified.**
+      `format_procedure` qualifies each parameter type that is not visible
+      on the search path, as it does the function's name: on PostgreSQL
+      15.19 `s1100.f(x s1100.ty)`, `s1100.ty` an enum, called off the path
+      is `PL/pgSQL function s1100.f(s1100.ty) line 1 at RAISE`;
+      `secantusd-pg` gives `s1100.f(ty)`. Found while working RP-1051.
+      Verify: tests/backlog/test_rp_found_rp833.py::test_a_label_qualifies_a_parameter_type_off_the_path
+      Backlog-ID: RP-1090
 
 ## Found while working RP-689 (2026-11-10)
 

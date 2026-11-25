@@ -53,6 +53,8 @@ pub(crate) fn restore_store(
 ) -> Result<(), String> {
     let key = std::sync::Arc::as_ptr(storage) as usize;
     with_shared(key, |s| *s = Shared::default());
+    // A start removes the relation cache init files (RP-292).
+    crate::catcache::init_files_removed(key);
     if !storage
         .collection_exists(STATS_NAMESPACE, STATS_COLLECTION)
         .map_err(|e| e.to_string())?
@@ -90,6 +92,8 @@ pub(crate) fn save_store(
     Stats::forget_store(key);
     // The shared invalidation queue goes with the server (RP-225).
     crate::catcache::forget_store(key);
+    // And where its databases' DDL put catalog rows (RP-291).
+    crate::catalog_places::forget_store(key);
     if !storage
         .collection_exists(STATS_NAMESPACE, STATS_COLLECTION)
         .map_err(|e| e.to_string())?

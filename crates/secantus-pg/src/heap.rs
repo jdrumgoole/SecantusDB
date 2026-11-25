@@ -802,7 +802,7 @@ impl PgHandler {
         field("__sys_xmin") == Some((xid & 0xFFFF_FFFF) as i64) && field("__sys_cid") == Some(cid)
     }
 
-    fn writer(&self) -> (u64, i64) {
+    pub(crate) fn writer(&self) -> (u64, i64) {
         let pid = self.pid();
         // The xid as the planner's hook (`xids::answer`) assigns it.
         let (xid, cid) = crate::xids::writer(&self.storage, pid);

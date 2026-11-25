@@ -2981,13 +2981,17 @@ def test_a_left_join_desc_with_another_key_merges_on_the_forward_scan(pg: Any) -
     assert got == ("ok", [(1245, 6), (1735, 6), (1280, 6), (2820, 6), (1770, 6)])
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_five_table_two_hub_join_desc_with_another_key(pg: Any) -> None:
-    """PostgreSQL 15.19, five 300-row tables never analysed, an index on
-    t1.a: `t0 JOIN t1 ON t0.b = t1.a JOIN t2 ON t0.c = t2.a JOIN t3 ON
-    t1.b = t3.a JOIN t4 ON t1.b = t4.a ORDER BY t4.a DESC, t0.c LIMIT 5`
-    leaves t0.a 116, 81, 46, 11, 151; the search's plan leaves 46, 81,
-    11, 221, 256. Not diagnosed."""
+    """PostgreSQL 15.19 and 15.20, five 300-row tables never analysed, an
+    index on t1.a: `t0 JOIN t1 ON t0.b = t1.a JOIN t2 ON t0.c = t2.a JOIN
+    t3 ON t1.b = t3.a JOIN t4 ON t1.b = t4.a ORDER BY t4.a DESC, t0.c
+    LIMIT 5` leaves t0.a 116, 81, 46, 11, 151. The search's plan left 46,
+    81, 11, 221, 256: it kept the t3/t4 merge's ascending order of the
+    t1.b class as of use for merging and read it presorted in the top
+    merge, where the query's DESC pathkey on that class makes it the wrong
+    direction (`right_merge_direction`), so PostgreSQL truncates it and
+    sorts again (a Merge Join on t0.b = t1.a, cost 54192.71)."""
     pg.execute("begin")
     try:
         _rp028_tables(pg, "rp028_h", 5, 300)
@@ -3004,6 +3008,33 @@ def test_a_five_table_two_hub_join_desc_with_another_key(pg: Any) -> None:
     finally:
         pg.execute("rollback")
     assert got == ("ok", [(116,), (81,), (46,), (11,), (151,)])
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_four_table_star_left_join_desc_nulls_last_then_desc(pg: Any) -> None:
+    """PostgreSQL 15.20, four 20-row tables never analysed: `t0 JOIN t1 ON
+    t0.c = t1.a JOIN t2 ON t0.b = t2.a LEFT JOIN t3 ON t0.c = t3.a ORDER BY
+    t3.a DESC NULLS LAST, t0.c DESC LIMIT 5` leaves t0.a 19, 9, 4, 8, 18
+    (a Merge Right Join over the inner joins sorted again on t0.c, cost
+    60276.07). The search reads the t0/t1 merge's ascending order of the
+    {t0.c, t1.a} class presorted under the right join (38061.98), where
+    the second key's DESC on that class makes it the wrong direction
+    (`right_merge_direction` reads every query pathkey), and leaves 19,
+    9, 4, 3, 13."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_s", 4, 20)
+        got = pg_answer(
+            pg,
+            "select rp028_s0.a from rp028_s0"
+            " join rp028_s1 on rp028_s0.c = rp028_s1.a"
+            " join rp028_s2 on rp028_s0.b = rp028_s2.a"
+            " left join rp028_s3 on rp028_s0.c = rp028_s3.a"
+            " order by rp028_s3.a desc nulls last, rp028_s0.c desc limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", [(19,), (9,), (4,), (8,), (18,)])
 
 
 @pytest.mark.backlog_fixed("RP-028")

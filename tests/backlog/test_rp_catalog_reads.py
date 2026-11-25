@@ -352,8 +352,8 @@ class Observer:
     """Reads every system catalog's and catalog index's counters through
     `pg_stat_get_*` by oid: once warm, its own query reads no catalog."""
 
-    def __init__(self, dsn: str) -> None:
-        self.conn = _connect(dsn, "obs")
+    def __init__(self, dsn: str, db: str = "") -> None:
+        self.conn = _connect(dsn, f"obs:{db}")
         rels = self.conn.execute(
             "select relid::int, relname::text from pg_stat_sys_tables "
             "where schemaname = 'pg_catalog' order by 1"
@@ -1866,6 +1866,31 @@ def test_a_catalog_scans_types_and_an_io_coercions_functions(rust_pg: Any) -> No
     assert only(got) == only(EXPECTED_GAPS[name])
 
 
+# What `mergejoinscansel` reads for psql's describe query's join clause
+# `n.oid = c.relnamespace`: `get_variable_range`'s and `scalarineqsel`'s
+# `oid <` and `oid <=` (`get_opcode`), `comparison_ops_are_compatible`'s
+# AMOPOPID list of the histogram's `<` and its search for `<=` in oid_ops,
+# and `ineq_histogram_selectivity`'s two probes of `pg_namespace_oid_index`
+# for its actual ends (`get_actual_variable_range`) as `pg_namespace.oid`'s
+# binary search reaches the histogram's first and last bins.
+MERGE_SCANSEL = ("pg_amop_opr_fam_index", "pg_namespace_oid_index", "pg_operator_oid_index")
+
+
+@pytest.mark.backlog_fixed("RP-290")
+def test_a_merge_join_clauses_scan_estimate(rust_pg: Any) -> None:
+    """RP-290 (slice): costing a merge join read nothing of the merge
+    clause's scan estimate (`mergejoinscansel`) beyond its family's `<`
+    and `<=`: not the operators' functions, the histogram operator's
+    families, nor the probes of the column's index for its actual ends."""
+    name = "psql's describe query"
+    got = catalog_reads(_dsn(rust_pg), {name: GAPS[name][2]})[name]
+
+    def only(segments: list[dict[str, list[int]]]) -> list[dict[str, list[int]]]:
+        return [{k: v for k, v in seg.items() if k in MERGE_SCANSEL} for seg in segments]
+
+    assert only(got) == only(EXPECTED_GAPS[name])
+
+
 @pytest.mark.backlog_fixed("RP-316")
 def test_a_built_in_catalogs_first_reads(rust_pg: Any) -> None:
     """RP-316: a new session's first reads of a built-in catalog were not
@@ -1929,10 +1954,12 @@ EXPECTED_CATALOG_BLOCKS: list[dict[str, int]] = [
 ]
 
 
-@pytest.mark.backlog("RP-291")
+@pytest.mark.backlog_fixed("RP-291")
 def test_catalog_blocks(rust_pg: Any) -> None:
     """PostgreSQL 15.19: the heap blocks behind every catalog row a scan
-    returns, `initdb`'s or a later one's."""
+    returns, `initdb`'s or a later one's. A row CREATE TABLE wrote had no
+    place, so a lookup that returned it read no heap block; now each is
+    placed where PostgreSQL puts it (`catalog_places.rs`)."""
     assert catalog_blocks(_dsn(rust_pg)) == EXPECTED_CATALOG_BLOCKS
 
 
@@ -1960,20 +1987,21 @@ def index_blocks(dsn: str) -> list[dict[str, int]]:
 
 
 def _block_deltas(
-    dsn: str, steps: list[str], view: str, column: str, setup: bool
+    dsn: str, steps: list[str], view: str, column: str, setup: bool, db: str = ""
 ) -> list[dict[str, int]]:
     """Each catalog relation of `view`'s `blocks_fetched` delta between
     `steps`' marks ("drop" takes one and drops it), and over the sessions'
     ends; with `setup`, over the
-    module's objects, created and warmed first."""
+    module's objects, created and warmed first. Every session is in
+    database `db` (`postgres` when empty)."""
     if setup:
-        with _connect(dsn, "setup") as c:
+        with _connect(dsn, f"setup:{db}") as c:
             for s in SETUP:
                 c.execute(s)
-        with _connect(dsn, "warm") as c:
+        with _connect(dsn, f"warm:{db}") as c:
             for s in WARM:
                 c.execute(s)
-    obs = Observer(dsn)
+    obs = Observer(dsn, db)
     rels = [
         o
         for (o,) in obs.conn.execute(
@@ -2015,7 +2043,7 @@ def _block_deltas(
                 continue
             name, sql = st.split("|", 1)
             if name not in conns:
-                conns[name] = _connect(dsn, name)
+                conns[name] = _connect(dsn, name if ":" in name else f"{name}:{db}")
             if sql:
                 conns[name].execute(sql)
         for c in conns.values():
@@ -2026,7 +2054,7 @@ def _block_deltas(
     finally:
         obs.conn.close()
         if setup:
-            with _connect(dsn, "teardown") as c:
+            with _connect(dsn, f"teardown:{db}") as c:
                 for s in TEARDOWN:
                     c.execute(s)
 
@@ -2274,12 +2302,19 @@ def test_an_index_only_catalog_scan_reads_the_visibility_map(rust_pg: Any) -> No
     assert catalog_reads(dsn, {"x": INDEX_ONLY_STEPS})["x"] == EXPECTED_INDEX_ONLY_READS
 
 
-# RP-291, what is left of it: DDL's rows clear the visibility map bit of
-# each `initdb` page they are written to (`heap_insert`'s
-# `visibilitymap_clear`), so an index-only scan then fetches the `initdb`
-# rows on that page too. `pg_class`'s rows for `pg_type` and `pg_class` are
-# on block 0, where this module's tables' rows go. Measured as
-# `EXPECTED_INDEX_BLOCKS` was.
+# RP-291: DDL's rows clear the visibility map bit of each `initdb` page they
+# are written to (`heap_insert`'s `visibilitymap_clear`), so an index-only
+# scan then fetches the `initdb` rows on that page too. `pg_class`'s row
+# for `pg_type` is on block 0, where a fresh database's first CREATE TABLE
+# puts its rows; `pg_class`'s own is on block 7, which a fresh database's
+# first three cycles of this module's DDL never reach and its fourth does.
+# Each is measured in a fresh database of its own (as the module's other
+# answers are not: the shared database's pages hold whatever the module's
+# earlier tests wrote, so a run under xdist moves them), after `k - 1`
+# cycles of SETUP, WARM and TEARDOWN and then SETUP and WARM once more,
+# on a private PostgreSQL 15.20 cluster (whose initdb `pg_class`,
+# `pg_type` and `pg_index` heaps are 15.19's, page for page), twice, the
+# two recordings identical.
 CLEARED_VM_STEPS = [
     "a|",
     "mark",
@@ -2317,7 +2352,7 @@ EXPECTED_CLEARED_VM_BLOCKS: list[dict[str, int]] = [
     {
         "pg_amop": 4,
         "pg_cast": 3,
-        "pg_class": 2,
+        "pg_class": 1,
         "pg_operator": 43,
         "pg_proc": 1,
         "pg_statistic": 1,
@@ -2327,12 +2362,103 @@ EXPECTED_CLEARED_VM_BLOCKS: list[dict[str, int]] = [
 ]
 
 
-@pytest.mark.backlog("RP-291")
+def after_ddl_cycles(dsn: str, k: int, steps: list[str]) -> list[dict[str, int]]:
+    """`_block_deltas` over `steps` in a fresh database, after `k - 1`
+    cycles of the module's SETUP, WARM and TEARDOWN there."""
+    db = f"rp291_k{k}"
+    with psycopg.connect(dsn + " dbname=postgres", autocommit=True) as c:
+        c.execute(f"drop database if exists {db}")
+        c.execute(f"create database {db}")
+    try:
+        for _ in range(k - 1):
+            for group, name in ((SETUP, "setup"), (WARM, "warm"), (TEARDOWN, "teardown")):
+                with _connect(dsn, f"{name}:{db}") as c:
+                    for s in group:
+                        c.execute(s)
+        return _block_deltas(dsn, steps, "pg_stat_sys_tables", "relid", True, db)
+    finally:
+        with psycopg.connect(dsn + " dbname=postgres", autocommit=True) as c:
+            c.execute(f"drop database if exists {db}")
+
+
+@pytest.mark.backlog_fixed("RP-291")
 def test_a_page_ddl_wrote_to_is_not_all_visible(rust_pg: Any) -> None:
     """PostgreSQL 15.19: once DDL has written a catalog row to an `initdb`
-    page, an index-only scan fetches that page's rows from the heap."""
-    blocks = _block_deltas(_dsn(rust_pg), CLEARED_VM_STEPS, "pg_stat_sys_tables", "relid", True)
-    assert blocks == EXPECTED_CLEARED_VM_BLOCKS
+    page, an index-only scan fetches that page's rows from the heap, and a
+    page no DDL wrote stays all-visible. The rows DDL wrote had no place,
+    so every `initdb` page kept its bit."""
+    assert after_ddl_cycles(_dsn(rust_pg), 1, CLEARED_VM_STEPS) == EXPECTED_CLEARED_VM_BLOCKS
+
+
+# One `pg_class` row on each of `initdb`'s 14 `pg_class` blocks, by oid:
+# an index-only scan of it reads its block only once DDL has written there.
+PG_CLASS_BLOCK_ROWS = [
+    2619,
+    2836,
+    4163,
+    4184,
+    2693,
+    549,
+    3429,
+    1418,
+    2617,
+    6000,
+    12122,
+    12312,
+    13888,
+    13975,
+]
+
+# Which of those blocks four cycles of the module's DDL have written ("x")
+# in a fresh database, measured as `EXPECTED_CLEARED_VM_BLOCKS` was: the
+# free space map hands each cycle's new backend a page of its own.
+EXPECTED_WRITTEN_AFTER_FOUR = "xx...xxx......"
+
+
+@pytest.mark.backlog_fixed("RP-291")
+def test_ddl_cycles_write_the_pages_postgresqls_do(rust_pg: Any) -> None:
+    """PostgreSQL 15.19: four cycles of this module's DDL in a fresh database
+    write `pg_class` blocks 0, 1, 5, 6 and 7, each cycle's rows where the
+    free space map sends its backend."""
+    steps = ["a|", "mark"]
+    for oid in PG_CLASS_BLOCK_ROWS:
+        steps += [f"a|select oid from pg_class where oid = {oid}", "mark"]
+    got = after_ddl_cycles(_dsn(rust_pg), 4, steps)
+    written = "".join("x" if d.get("pg_class", 0) > 1 else "." for d in got[1:-1])
+    assert written == EXPECTED_WRITTEN_AFTER_FOUR
+
+
+# RP-291, what is left of it: the rows of DDL other than CREATE TABLE have
+# no place yet. A new session's first use of the module's view and then of
+# its function, in a fresh database after its DDL once, measured as
+# `EXPECTED_CLEARED_VM_BLOCKS` was: the view's `pg_class`, `pg_attribute`
+# and `pg_rewrite` rows and the function's `pg_proc` row are each read
+# from the heap.
+OTHER_DDL_STEPS = ["a|", "mark", "a|select * from rpc_v", "mark", "a|select rpc_f(1)", "mark"]
+
+EXPECTED_OTHER_DDL_BLOCKS: list[dict[str, int]] = [
+    {
+        "pg_am": 1,
+        "pg_attribute": 4,
+        "pg_class": 6,
+        "pg_index": 1,
+        "pg_operator": 1,
+        "pg_proc": 1,
+        "pg_rewrite": 1,
+        "pg_tablespace": 1,
+        "pg_type": 2,
+    },
+    {"pg_operator": 2, "pg_proc": 3},
+    {},
+]
+
+
+@pytest.mark.backlog("RP-291")
+def test_a_views_and_a_functions_rows_are_read_from_the_heap(rust_pg: Any) -> None:
+    """PostgreSQL 15.19: a lookup that returns a row CREATE VIEW or CREATE
+    FUNCTION wrote reads the row's heap block, as one of CREATE TABLE's
+    does."""
+    assert after_ddl_cycles(_dsn(rust_pg), 1, OTHER_DDL_STEPS)[1:] == EXPECTED_OTHER_DDL_BLOCKS
 
 
 # RP-935 (fixed): the index a catalog read directly is scanned through, and how
@@ -2493,12 +2619,12 @@ def test_a_database_wide_analyze_measures_a_quoted_char_column(rust_pg: Any) -> 
     assert row == ("{i,v,r,t}", "{0.3941606,0.34063262,0.16788322,0.097323604}", 4.0)
 
 
-@pytest.mark.backlog("RP-358")
+@pytest.mark.backlog_fixed("RP-358")
 def test_a_catalog_columns_correlation_follows_the_heap(rust_pg: Any) -> None:
     """PostgreSQL 15.19 (a fresh database on a private cluster): ANALYZE
-    correlates each catalog column with PostgreSQL's heap order, so after a
-    new table `pg_class`'s correlations are these; this server walks its own
-    row order."""
+    correlated each catalog column with PostgreSQL's heap order, so after a
+    new table `pg_class`'s correlations were these; this server walked its
+    own row order."""
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
         c.execute("drop database if exists rp358")
         c.execute("create database rp358")
@@ -2515,6 +2641,52 @@ def test_a_catalog_columns_correlation_follows_the_heap(rust_pg: Any) -> None:
         ("relname", -0.12838678),
         ("relnatts", 0.67018104),
     ]
+
+
+def _pg_type_correlations(rust_pg: Any, db: str, columns: tuple[str, ...]) -> list[Any]:
+    """`pg_type`'s correlations after a new table and a plain ANALYZE in a
+    fresh database."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        c.execute(f"drop database if exists {db}")
+        c.execute(f"create database {db}")
+    with psycopg.connect(_dsn(rust_pg) + f" dbname={db}", autocommit=True) as c:
+        c.execute("create table zzzz_rp313 (a int)")
+        c.execute("analyze")
+        return c.execute(
+            "select attname::text, correlation from pg_stats where tablename = 'pg_type'"
+            " and attname = any(%s) order by 1",
+            (list(columns),),
+        ).fetchall()
+
+
+@pytest.mark.backlog_fixed("RP-358")
+def test_a_catalog_columns_correlation_counts_the_new_rows_where_they_went(
+    rust_pg: Any,
+) -> None:
+    """PostgreSQL 15.20 (a fresh database on a private cluster; its
+    `pg_type` heap is 15.19's page for page): the two `pg_type` rows a new
+    table writes go on the heap's last block, (14,10) and (14,11), and
+    ANALYZE's correlations count them there; this server walked its own
+    row order."""
+    rows = _pg_type_correlations(rust_pg, "rp358_t", ("typinput", "typlen", "typname"))
+    assert rows == [
+        ("typinput", 0.29722527),
+        ("typlen", 0.5353159),
+        ("typname", -0.07610275),
+    ]
+
+
+@pytest.mark.backlog("RP-1098")
+def test_a_new_tables_array_type_oid_comes_before_its_row_types(rust_pg: Any) -> None:
+    """PostgreSQL 15.20 (a fresh database on a private cluster): `create
+    table zzzz_rp313 (a int)` draws the table's oid (16385), its array
+    type's (16386, `AssignTypeArrayOid`) and then its row type's (16387)
+    from the one counter, so after a plain ANALYZE `pg_type.oid`'s
+    correlation over the heap's order is 0.9796509; here the row type is
+    67001 and the array 167001, which sorts the two the other way
+    (0.979651)."""
+    rows = _pg_type_correlations(rust_pg, "rp1098_t", ("oid",))
+    assert rows == [("oid", 0.9796509)]
 
 
 @pytest.mark.backlog_fixed("RP-313")
@@ -2770,10 +2942,18 @@ def test_a_catalog_scan_is_estimated(rust_pg: Any) -> None:
 
 # RP-292: the first backend after the server starts finds no relation cache
 # init file and builds every critical relation's descriptor, by heap scans
-# until the critical indexes are built, and writes the files. PostgreSQL
+# until the critical indexes are built, then every system cache's catalog
+# and index (`InitCatalogCachePhase2`), and writes the files. PostgreSQL
 # 15.19's reads, a session that ran `select 1` then an observer's start,
 # measured across a restart of the private cluster (the counts survive a
-# clean shutdown, so the delta is the two sessions').
+# clean shutdown, so the delta is the two sessions'). Removing both init
+# files from a running cluster, so that no restart is involved, gives the
+# same counts (measured again on 15.20, 2026-11-25).
+#
+# Not compared: `pg_subscription`, whose heap scans are the logical
+# replication launcher's of the run before the restart (two at its start
+# and one per reload, flushed as it exits: 7 in this recording, 2 after a
+# run with no reload). This server has no launcher (RP-1096).
 FIRST_BACKEND: dict[str, list[int]] = {
     "pg_am": [2, 2, 0],
     "pg_amproc": [2, 7, 0],
@@ -2793,32 +2973,155 @@ FIRST_BACKEND: dict[str, list[int]] = {
     "pg_index_indexrelid_index": [80, 80, 80],
     "pg_opclass": [2, 2, 0],
     "pg_opclass_oid_index": [7, 7, 7],
-    "pg_subscription": [7, 0, 0],
+    "pg_type_oid_index": [1, 1, 1],
+}
+LAUNCHER_ONLY = "pg_subscription"
+
+
+def _restart_delta(
+    home: Any, steps: Any, db: str = "", setup: tuple[str, ...] = ()
+) -> dict[str, list[int]]:
+    from tests.test_rust_pgserver_slice import _Server
+
+    return _delta_across(lambda: _Server(home), steps, db, setup)
+
+
+def _delta_across(
+    server: Any, steps: Any, db: str = "", setup: tuple[str, ...] = ()
+) -> dict[str, list[int]]:
+    """Every catalog's counts across a restart: an observer's reading
+    before the server stops, and another's after `steps(dsn)` ran on the
+    restarted server, both in database `db` (`postgres` when empty). Each of
+    `setup`'s statements runs in the first run, half a second apart."""
+    with server() as srv:
+        if setup:
+            with _connect(_dsn(srv), "setup") as conn:
+                for sql in setup:
+                    conn.execute(sql)
+                    time.sleep(0.5)
+        obs = Observer(_dsn(srv), db)
+        before = obs.snap()
+        obs.conn.close()
+        time.sleep(0.5)
+    with server() as srv:
+        dsn = _dsn(srv)
+        steps(dsn)
+        time.sleep(0.5)
+        with _connect(dsn, f"obs:{db}") as conn:
+            conn.execute("select pg_stat_clear_snapshot()")
+            rows = conn.execute(obs.query).fetchall()
+    after = {obs.names[o]: (a, b, c) for o, a, b, c in rows}
+    return _delta(before, after)
+
+
+def _select_one(dsn: str) -> None:
+    first = _connect(dsn, "first")
+    first.execute("select 1")
+    first.close()
+
+
+@pytest.mark.backlog_fixed("RP-292")
+def test_the_first_backend_after_a_start(tmp_path: Any) -> None:
+    """Fixed: the first backend after a start built the relation cache
+    init files, where it was once counted as a warm one."""
+    got = _restart_delta(tmp_path, _select_one)
+    got.pop(LAUNCHER_ONLY, None)
+    assert got == FIRST_BACKEND
+
+
+# The logical replication launcher (`ApplyLauncherMain`) scans
+# pg_subscription at its start, again at once (its latch is set as it
+# starts), then whenever its latch is set (a reload's SIGHUP, a
+# subscription's commit) or `DEFAULT_NAPTIME_PER_CYCLE` (180 s) passes. Its
+# counts are flushed only as it exits, so a restart's delta holds the run
+# before's scans. PostgreSQL 15.20, private cluster (2026-11-25): a first run
+# with one `pg_reload_conf()` leaves these three; with none, two; with three
+# reloads, five.
+LAUNCHER_SCANS = [3, 0, 0]
+
+
+@pytest.mark.backlog("RP-1096")
+def test_the_logical_replication_launcher_scans_pg_subscription(tmp_path: Any) -> None:
+    got = _restart_delta(tmp_path, _select_one, setup=("select pg_reload_conf()",))
+    assert got.get(LAUNCHER_ONLY) == LAUNCHER_SCANS
+
+
+# A committed invalidation of a relation an init file holds removes the file
+# (`RelationCacheInitFilePreInvalidate`), so the next backend builds it
+# again. PostgreSQL 15.20, private cluster (2026-11-25): after a
+# database-wide `analyze`, the next backend's `select 1` makes the cold
+# start's heap scans (both files rebuilt); after `analyze pg_class`,
+# `analyze pg_authid` or a `create table`, none. Only the heap scans are
+# compared: they are the cold start's alone.
+AFTER_ANALYZE_HEAP_SCANS = {
+    "pg_attribute": [11, 53, 0],
+    "pg_authid": [2, 2, 0],
+    "pg_class": [11, 11, 0],
+}
+
+
+@pytest.mark.backlog("RP-1097")
+def test_a_database_wide_analyze_removes_the_init_files(tmp_path: Any) -> None:
+    from tests.test_rust_pgserver_slice import _Server
+
+    with _Server(tmp_path) as server:
+        dsn = _dsn(server)
+        obs = Observer(dsn)
+        conn = _connect(dsn, "ddl")
+        conn.execute("analyze")
+        conn.close()
+        time.sleep(0.5)
+        before = obs.snap()
+        _select_one(dsn)
+        time.sleep(0.5)
+        got = _delta(before, obs.snap())
+        obs.conn.close()
+    heap = {k: v for k, v in got.items() if k in AFTER_ANALYZE_HEAP_SCANS}
+    assert heap == AFTER_ANALYZE_HEAP_SCANS
+
+
+# The first backend in a second database after a start finds the shared
+# init file the first one wrote, and builds only its database's: no heap
+# scan of pg_authid or pg_database, no critical shared index, none of the
+# shared catalogs' descriptors. PostgreSQL 15.20's reads (private cluster,
+# 2026-11-25, twice, identical), a session in `postgres` and one in
+# `rp292b` that each ran `select 1`, then an observer's start in `rp292b`:
+# the shared catalogs' counts are all three sessions', the local ones
+# `rp292b`'s two. `pg_subscription` is left out as above.
+SECOND_DATABASE: dict[str, list[int]] = {
+    "pg_am": [2, 2, 0],
+    "pg_amproc": [2, 7, 0],
+    "pg_amproc_fam_proc_index": [6, 16, 16],
+    "pg_attribute": [11, 53, 0],
+    "pg_attribute_relid_attnum_index": [213, 518, 518],
+    "pg_authid": [2, 2, 0],
+    "pg_authid_oid_index": [2, 2, 2],
+    "pg_authid_rolname_index": [2, 2, 2],
+    "pg_class": [11, 11, 0],
+    "pg_class_oid_index": [107, 107, 107],
+    "pg_database": [2, 2, 0],
+    "pg_database_datname_index": [2, 2, 2],
+    "pg_database_oid_index": [5, 5, 5],
+    "pg_db_role_setting_databaseid_rol_index": [12, 0, 0],
+    "pg_index": [7, 7, 0],
+    "pg_index_indexrelid_index": [66, 66, 66],
+    "pg_opclass": [2, 2, 0],
+    "pg_opclass_oid_index": [6, 6, 6],
     "pg_type_oid_index": [1, 1, 1],
 }
 
 
-@pytest.mark.backlog("RP-292")
-def test_the_first_backend_after_a_start(rust_pg: Any, tmp_path: Any) -> None:
-    from tests.test_rust_pgserver_slice import _Server
+@pytest.mark.backlog_fixed("RP-292")
+def test_the_first_backend_in_a_second_database(tmp_path: Any) -> None:
+    def steps(dsn: str) -> None:
+        for session in ("first", "second:rp292b"):
+            conn = _connect(dsn, session)
+            conn.execute("select 1")
+            conn.close()
 
-    # The catalogs' oids, from another server: asking the fresh one would
-    # make its observer the first backend.
-    names = Observer(_dsn(rust_pg)).names
-    query = (
-        "select o, pg_stat_get_numscans(o), pg_stat_get_tuples_returned(o), "
-        "pg_stat_get_tuples_fetched(o) from (values {}) v(o)"
-    ).format(",".join(f"({o})" for o in names))
-    with _Server(tmp_path) as server:
-        dsn = _dsn(server)
-        first = _connect(dsn, "first")
-        first.execute("select 1")
-        first.close()
-        time.sleep(0.5)
-        with _connect(dsn, "obs") as obs:
-            rows = obs.execute(query).fetchall()
-    got = {names[o]: [a, b, c] for o, a, b, c in rows if a or b or c}
-    assert got == FIRST_BACKEND
+    got = _restart_delta(tmp_path, steps, "rp292b", ("create database rp292b",))
+    got.pop(LAUNCHER_ONLY, None)
+    assert got == SECOND_DATABASE
 
 
 # Found while measuring: RP-293, `pg_class.relnatts` left out a dropped
@@ -2911,10 +3214,15 @@ if __name__ == "__main__" and sys.argv[2:] == ["heap"]:
     )
     for case, (sql, prefix, _) in INDEX_PATHS.items():
         print(f"INDEX_PATHS[{case!r}]:", index_path(sys.argv[1], sql, prefix))
-    cleared = _block_deltas(sys.argv[1], CLEARED_VM_STEPS, "pg_stat_sys_tables", "relid", True)
+    cleared = after_ddl_cycles(sys.argv[1], 1, CLEARED_VM_STEPS)
     print(
         "EXPECTED_CLEARED_VM_BLOCKS: list[dict[str, int]] = "
         + pprint.pformat(cleared, width=100, sort_dicts=False)
+    )
+    other = after_ddl_cycles(sys.argv[1], 1, OTHER_DDL_STEPS)[1:]
+    print(
+        "EXPECTED_OTHER_DDL_BLOCKS: list[dict[str, int]] = "
+        + pprint.pformat(other, width=100, sort_dicts=False)
     )
 elif __name__ == "__main__":
     measured = catalog_reads(sys.argv[1])

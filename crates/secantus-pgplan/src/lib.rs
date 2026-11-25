@@ -19815,7 +19815,10 @@ fn expression_column_name(node: &pg_query::protobuf::Node) -> String {
         Some(N::AExpr(e)) if AExprKind::try_from(e.kind) == Ok(AExprKind::AexprNullif) => {
             "nullif".to_string()
         }
-        Some(N::CaseExpr(_)) => "case".to_string(),
+        // A CASE takes its ELSE result's name when that is a definite one
+        // (`else c.relnatts` is `relnatts`), and is `case` otherwise
+        // (FigureColnameInternal, RP-1046).
+        Some(N::CaseExpr(_)) => nodetostring::target::figure_colname(node),
         // A subscript / field selection names from what it selects: `x[1]`
         // is `x`, `(array[1, 2])[1]` is `array`, and `(r).f` is the field.
         Some(N::AIndirection(ind)) => {
@@ -19888,6 +19891,9 @@ fn cast_source_names_column(node: &pg_query::protobuf::Node) -> bool {
                 || ind.arg.as_deref().is_some_and(cast_source_names_column)
         }
         Some(N::TypeCast(tc)) => tc.arg.as_deref().is_some_and(cast_source_names_column),
+        // A CASE whose ELSE names its column keeps that name through a cast;
+        // a bare `case` is only a fallback, so the cast's type wins.
+        Some(N::CaseExpr(_)) => nodetostring::target::figure_colname_strength(node).1 == 2,
         // A scalar subquery always names its column (its one target's
         // `resname`, `?column?` included), as EXISTS and ARRAY(...) do: so
         // `(select 1 + 1)::int` is `?column?` and `(select a)::int` is `a`.

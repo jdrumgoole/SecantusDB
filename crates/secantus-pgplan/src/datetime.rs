@@ -1087,12 +1087,17 @@ pub fn make_date(y: i32, m: i32, d: i32) -> Result<NaiveDate> {
         .ok_or_else(|| field_range("date", format!("{y}-{m:02}-{d:02}")))
 }
 
+/// `float_time_overflows`, then `tm2time`: each field in range, the
+/// seconds rounded to microseconds first and allowed to reach 60 (a leap
+/// second), as the hour may reach 24, and the whole at most 24:00:00.
 fn make_time_micros(h: i32, m: i32, sec: f64) -> Result<i64> {
-    let micros = (sec * 1_000_000.0).round() as i64;
-    let total = i64::from(h) * USECS_PER_HOUR + i64::from(m) * USECS_PER_MINUTE + micros;
-    let in_range = (0..=23).contains(&h) && (0..=59).contains(&m) && (0.0..60.0).contains(&sec);
-    let midnight = h == 24 && m == 0 && sec == 0.0;
-    if !(in_range || midnight) {
+    let micros = (sec * 1_000_000.0).round_ties_even();
+    let overflows = !(0..=24).contains(&h)
+        || !(0..60).contains(&m)
+        || sec.is_nan()
+        || !(0.0..=60.0 * 1_000_000.0).contains(&micros);
+    let total = i64::from(h) * USECS_PER_HOUR + i64::from(m) * USECS_PER_MINUTE + micros as i64;
+    if overflows || total > 24 * USECS_PER_HOUR {
         return Err(field_range("time", format!("{h}:{m:02}:{sec:02}")));
     }
     Ok(total)
@@ -2654,4 +2659,25 @@ fn not_allowed(rest: &[char], field: &str) -> Error {
     Error::InvalidDatetimeFormat(format!(
         "invalid value \"{word}\" for \"{field}\"\nDetail: The given value did not match any of the allowed values for this field."
     ))
+}
+
+#[cfg(test)]
+mod make_time_tests {
+    use super::*;
+
+    /// `float_time_overflows`: 60 seconds and hour 24 are allowed, each
+    /// rounded to microseconds first, while the whole stays at most
+    /// 24:00:00 (PostgreSQL 15.20).
+    #[test]
+    fn make_time_takes_a_leap_second() {
+        let t = |h, m, s| make_time_micros(h, m, s).ok();
+        assert_eq!(t(12, 0, 60.0), Some(12 * USECS_PER_HOUR + USECS_PER_MINUTE));
+        assert_eq!(t(23, 59, 60.0), Some(24 * USECS_PER_HOUR));
+        assert_eq!(t(23, 59, 60.000_000_4), Some(24 * USECS_PER_HOUR));
+        assert_eq!(t(24, 0, 0.0), Some(24 * USECS_PER_HOUR));
+        assert_eq!(t(24, 0, 0.4), None);
+        assert_eq!(t(12, 0, 60.000_001), None);
+        assert_eq!(t(12, 0, f64::NAN), None);
+        assert_eq!(t(12, 60, 0.0), None);
+    }
 }

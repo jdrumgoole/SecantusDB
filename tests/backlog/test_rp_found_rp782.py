@@ -173,6 +173,80 @@ INFORMATION_SCHEMA_VIEWDEF_MD5 = {
         "d7a78c3875c8ac1227eae2d030adc766",
     ),
     "schemata": ("582f055df269ae7d14b87133470c182e", "b755dd39bfb4cc0f52f667684a4bd191"),
+    # An operator over a domain resolves on its base type, the operand
+    # relabelled (`(x.is_grantable)::text = 'YES'::text`); an `oid` meets a
+    # `regclass` constant printed by `regclassout`
+    # (`('pg_proc'::regclass)::oid`); `(aclexplode(...)).*` expands to one
+    # field selection per OUT column; a set operation's untyped literal
+    # takes the column's type (`'PUBLIC'::name`); the integer bitwise
+    # operators; `getdatabaseencoding()`; a PARTITION BY item parenthesised
+    # as an ORDER BY one is. These were NULL (RP-798), measured on
+    # PostgreSQL 15.20.
+    "administrable_role_authorizations": (
+        "3b2dd83acf16e21582d04ddbf0e8805c",
+        "0d71cf2b28aeb95f6aa35f1bf6cbc770",
+    ),
+    "character_sets": ("f7dfd03a976d9dd99e4cbb221b6c518b", "d5e7b95d5931db65e5f9afe2e5670530"),
+    "check_constraint_routine_usage": (
+        "bbd2c5f1c9c62890e8b1047b45656222",
+        "a14206f1d37d9d8de6acd5fd49de3d4a",
+    ),
+    "collation_character_set_applicability": (
+        "bc1156543daef9fa9e43707bd07d099a",
+        "b245894cfa52c42d6841d2b924f0c2e3",
+    ),
+    "column_column_usage": ("aa714ec98f05775a96a6b98888e3f0ed", "d3509537311773f97d6f563e7f5abacb"),
+    "column_options": ("ef2af50013889fe314343d93a6054e64", "ec02b13db0fde6c40fbc25dbe80e4dd2"),
+    "column_privileges": ("7236f9885917742caff34fd0f8278cb0", "06c6b686553fb5a85b2e76e236ae9adc"),
+    "constraint_column_usage": (
+        "96bb72948cd97bb9b9e254c72a156641",
+        "6e43c9b98ffc19600fa9c31871d9d86c",
+    ),
+    "foreign_data_wrapper_options": (
+        "089cd585c682bbeb670e56cbb22b65e8",
+        "42ad09f5a05724570f3e9d40fc19ed55",
+    ),
+    "foreign_server_options": (
+        "916a920cd0196bec0d212efb88634b74",
+        "695ee10f5379d47ead84fc503838361b",
+    ),
+    "foreign_table_options": (
+        "3e9d62b401e799912e38fdc4d6d5370a",
+        "0dc9d90ffe2721da4b4dc432ea09d302",
+    ),
+    "referential_constraints": (
+        "80a6a77b048c51ae3a15e8bb08a0331b",
+        "85d236ab4f1d1d3ad96e40d3c268d7cb",
+    ),
+    "role_column_grants": ("c29fbab88d920e154f5185b653530ffe", "b77078e6664c36c0bfd304af8f8da89e"),
+    "role_routine_grants": ("a82aad25383019502d9a70943988a00c", "597487f5b49171cbcab3492ed181b2d9"),
+    "role_table_grants": ("ad3fc3286b3c629d0222f3e79d7ba25b", "ffeb916f9860affdbdcba4a7b0438080"),
+    "role_udt_grants": ("0fa29059f523a56ad9561078942f80d3", "d7414257fa33f7ccfe20be36885dea15"),
+    "role_usage_grants": ("138846a9a5825527b04a19d90027d4e1", "86d12fc2480c4e50f015ba87ae1d5e23"),
+    "routine_column_usage": (
+        "629eb42244294bca8c0725f8f36d0312",
+        "00341f79ac460ad4c219a14facd2743e",
+    ),
+    "routine_privileges": ("5ee368aafdf89176954b87c3cea814f1", "8a14b15ea7421c496162bbb2dd8bebd8"),
+    "routine_routine_usage": (
+        "8e6dbaa5f060b3511216fa290bc63b3d",
+        "a962a928d9e37f527055ed353b64f816",
+    ),
+    "routine_sequence_usage": (
+        "51eb647078e221b1a338ded5c22517cd",
+        "223a7d3d768eb9f12f0d7a12d993e0c1",
+    ),
+    "routine_table_usage": ("099e12531adb229ed6d697e1df01a68b", "6ced76f131f895b071e2a22642585f43"),
+    "table_privileges": ("e179519f86779ed1d45f492d3c0c359e", "0b4ece261793c61344d6eeb823588e50"),
+    "tables": ("844c95f09db89603b78a5cfdc895d49f", "acdc6eb1ff8215f525200f6742477ae0"),
+    "transforms": ("0c6d73729f17d5a235d4091c2e73c40b", "0348811c002152461714eaf0586a3a97"),
+    "triggers": ("5849ec685959aebf845b5a85a124c5aa", "ec7e95768097160e64cd4edb03d7f1c7"),
+    "udt_privileges": ("bac682d5952abf036a787e84b8776ffb", "92ecf7b3132f3602424b245617cf449f"),
+    "usage_privileges": ("adfdfbe67b522a00faa7d4a6af84ae8a", "cf35ea3a9ec6b7f9f29d0da25d36c417"),
+    "view_column_usage": ("94497736c894537349d5f88b75b966a8", "5ce844882d47c30f8d24b996bcf03e34"),
+    "view_routine_usage": ("3185c6efe32b5d8f47ae9f74f9964cb1", "31186fee452ad102d8fe3acb2569c481"),
+    "view_table_usage": ("dda4436e9c406854bd32ee79f557bf1f", "493b3f348205698568dd0fc484c380e0"),
+    "views": ("58cef64baa6a7ba40589cd9f220ca666", "5a8a15b275719003b6af8fd72c029228"),
 }
 
 
@@ -240,6 +314,87 @@ def test_pg_get_viewdef_names_set_operation_branches(dsn: str) -> None:
             " SELECT 1 AS a\nUNION\n SELECT 2 AS a;",
         )
     ]
+
+
+# A user view over the shapes the system views needed prints as
+# PostgreSQL's does (measured on a private PostgreSQL 15.20 cluster): a
+# set operation's untyped literal takes the column's type, an `oid` meets
+# a `regclass` constant at `oid`, mixed-width bitwise operators widen, an
+# operator or IN over an `information_schema` domain column relabels it
+# to its base type, and `(f(...)).*` expands. These printed as written or
+# were refused (RP-798).
+@pytest.mark.backlog_fixed("RP-798")
+def test_pg_get_viewdef_of_user_views_over_the_system_view_shapes(dsn: str) -> None:
+    with _connect(dsn) as c:
+        c.execute("drop table if exists t798 cascade")
+        c.execute(
+            "create table t798 (k int, n name, s int2, flag information_schema.yes_or_no,"
+            " cn information_schema.cardinal_number)"
+        )
+        views = {
+            "a": "select n from t798 union all select 'x'",
+            "b": "select c.relname from pg_class c where c.oid = 'pg_catalog.pg_class'::regclass",
+            "c": "select k from t798 where (s & 3) <> 0 and (k | 1) = 1",
+            "d": "select k from t798 where flag = 'YES' and cn > 2",
+            "e": "select k from t798 where flag in (select flag from t798)",
+            "f": "select (aclexplode(relacl)).* from pg_class",
+            "i": "select n from t798 union select 'x' union all select 'y'",
+        }
+        got = {}
+        for v, q in views.items():
+            c.execute(f"create view v798{v} as {q}")
+            got[v] = _answer(
+                c, f"select pg_get_viewdef('v798{v}'::regclass), pg_get_viewdef('v798{v}', true)"
+            )
+        c.execute("drop table t798 cascade")
+    acl = (
+        " SELECT (aclexplode(pg_class.relacl)).grantor AS grantor,\n"
+        "    (aclexplode(pg_class.relacl)).grantee AS grantee,\n"
+        "    (aclexplode(pg_class.relacl)).privilege_type AS privilege_type,\n"
+        "    (aclexplode(pg_class.relacl)).is_grantable AS is_grantable\n"
+        "   FROM pg_class;"
+    )
+    union3 = (
+        "(\n         SELECT t798.n\n           FROM t798\n        UNION\n"
+        "         SELECT 'x'::name AS n\n) UNION ALL\n SELECT 'y'::name AS n;"
+    )
+    assert got == {
+        "a": [(" SELECT t798.n\n   FROM t798\nUNION ALL\n SELECT 'x'::name AS n;",) * 2],
+        "b": [
+            (
+                " SELECT c.relname\n   FROM pg_class c\n"
+                "  WHERE (c.oid = ('pg_class'::regclass)::oid);",
+                " SELECT c.relname\n   FROM pg_class c\n  WHERE c.oid = 'pg_class'::regclass::oid;",
+            )
+        ],
+        "c": [
+            (
+                " SELECT t798.k\n   FROM t798\n"
+                "  WHERE ((((t798.s)::integer & 3) <> 0) AND ((t798.k | 1) = 1));",
+                " SELECT t798.k\n   FROM t798\n"
+                "  WHERE (t798.s::integer & 3) <> 0 AND (t798.k | 1) = 1;",
+            )
+        ],
+        "d": [
+            (
+                " SELECT t798.k\n   FROM t798\n"
+                "  WHERE (((t798.flag)::text = 'YES'::text) AND ((t798.cn)::integer > 2));",
+                " SELECT t798.k\n   FROM t798\n"
+                "  WHERE t798.flag::text = 'YES'::text AND t798.cn::integer > 2;",
+            )
+        ],
+        "e": [
+            (
+                " SELECT t798.k\n   FROM t798\n"
+                "  WHERE ((t798.flag)::text IN ( SELECT t798_1.flag\n"
+                "           FROM t798 t798_1));",
+                " SELECT t798.k\n   FROM t798\n"
+                "  WHERE (t798.flag::text IN ( SELECT t798_1.flag\n           FROM t798 t798_1));",
+            )
+        ],
+        "f": [(acl, acl)],
+        "i": [(union3, union3)],
+    }
 
 
 # The system views the printer does not reproduce are still NULL: an
@@ -473,8 +628,10 @@ def _viewdef_of(dsn: str, name: str, query: str) -> object:
     return got
 
 
-# `FigureColnameInternal` names a CASE by its ELSE result (RP-1046).
-@pytest.mark.backlog("RP-1046")
+# `FigureColnameInternal` names a CASE by its ELSE result when that is a
+# definite (strength 2) name. Here every unaliased CASE was `case`; fixed by
+# RP-1046.
+@pytest.mark.backlog_fixed("RP-1046")
 def test_pg_get_viewdef_names_a_case_column_by_its_else_column(dsn: str) -> None:
     got = _viewdef_of(
         dsn, "v1046", "select case when c.oid > 5 then 0 else c.relnatts end from pg_class c"
@@ -491,8 +648,9 @@ def test_pg_get_viewdef_names_a_case_column_by_its_else_column(dsn: str) -> None
     ]
 
 
-# `transformAExprIn` ORs an `=` for each element holding a Var (RP-1047).
-@pytest.mark.backlog("RP-1047")
+# `transformAExprIn` ORed an `=` for each element holding a Var, which was
+# printed inside the `= ANY` array (RP-1047).
+@pytest.mark.backlog_fixed("RP-1047")
 def test_pg_get_viewdef_of_an_in_list_holding_a_column(dsn: str) -> None:
     got = _viewdef_of(dsn, "v1047", "select c.relnatts in (1, c.relam::int) from pg_class c")
     assert got == [
@@ -501,3 +659,31 @@ def test_pg_get_viewdef_of_an_in_list_holding_a_column(dsn: str) -> None:
             "   FROM pg_class c;",
         )
     ]
+
+
+# `get_rule_sortgroupclause` parenthesises a FuncExpr item even when not
+# pretty, and `name::text` is one (`text(name)`, `castmethod = 'f'`).
+# Measured on a private PostgreSQL 15.20 cluster; here the raw print gives
+# `ORDER BY (c.relname)::text`.
+@pytest.mark.backlog("RP-1094")
+def test_pg_get_viewdef_parenthesises_a_function_cast_sort_item(dsn: str) -> None:
+    got = _viewdef_of(dsn, "v798o", "select c.oid from pg_class c order by c.relname::text")
+    assert got == [(" SELECT c.oid\n   FROM pg_class c\n  ORDER BY ((c.relname)::text);",)]
+
+
+# An operator over a column of a user domain resolves on the base type and
+# relabels the operand, which `get_oper_expr` shows. Measured on a private
+# PostgreSQL 15.20 cluster; here the column is typed as its base type and
+# prints bare, `(u798.dd > 2)`.
+@pytest.mark.backlog("RP-1095")
+def test_pg_get_viewdef_relabels_a_user_domain_operand(dsn: str) -> None:
+    with _connect(dsn) as c:
+        c.execute("drop table if exists u798 cascade")
+        c.execute("drop domain if exists dint798")
+        c.execute("create domain dint798 as int")
+        c.execute("create table u798 (k int, dd dint798)")
+        c.execute("create view w798 as select k from u798 where dd > 2")
+        got = _answer(c, "select pg_get_viewdef('w798'::regclass)")
+        c.execute("drop table u798 cascade")
+        c.execute("drop domain dint798")
+    assert got == [(" SELECT u798.k\n   FROM u798\n  WHERE ((u798.dd)::integer > 2);",)]

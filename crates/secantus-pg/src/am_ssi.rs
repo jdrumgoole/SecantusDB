@@ -199,6 +199,8 @@ impl ElemOps {
                 | "numeric"
                 | "decimal"
                 | "interval"
+                | "time"
+                | "time without time zone"
         )
     }
 
@@ -235,6 +237,11 @@ impl ElemOps {
 
     fn jsonb(&self) -> bool {
         self.elem == "jsonb"
+    }
+
+    /// `time`'s keys: an 8-byte `TimeADT`, microseconds since midnight.
+    fn is_time(&self) -> bool {
+        matches!(self.elem.as_str(), "time" | "time without time zone")
     }
 
     /// `varstr_cmp`: bytewise, or under the column's collation with a
@@ -284,7 +291,9 @@ impl ElemOps {
             | "timestamp"
             | "timestamp without time zone"
             | "timestamptz"
-            | "timestamp with time zone" => (8, 8),
+            | "timestamp with time zone"
+            | "time"
+            | "time without time zone" => (8, 8),
             "interval" => (16, 8),
             _ => (4, 4),
         };
@@ -371,6 +380,15 @@ impl KeyOps for ElemOps {
             secantus_pgplan::Interval::from_bson(b),
         ) {
             return x.comparable_micros().cmp(&y.comparable_micros());
+        }
+        if self.is_time() {
+            // `time_cmp`: the microseconds since midnight. A `time` is held
+            // as its text, which orders otherwise only while every value
+            // writes its fraction the same way.
+            let micros = |v: &Bson| secantus_pgplan::hashfn::time_micros(v).ok();
+            if let (Some(x), Some(y)) = (micros(a), micros(b)) {
+                return x.cmp(&y);
+            }
         }
         if self.is_numeric() {
             // `cmp_numerics`: NaN equal to itself and above every number.
@@ -1794,6 +1812,26 @@ mod tests {
                 (cat, _) => format!("{cat:?}"),
             })
             .collect()
+    }
+
+    /// `btree_gin`'s `time_ops` orders its keys by `time_cmp`, the
+    /// microseconds since midnight, not by the text a `time` is held as.
+    #[test]
+    fn time_keys_order_by_time_cmp() {
+        let ops = ElemOps {
+            elem: "time".into(),
+            collation: None,
+        };
+        let t = |s: &str| Bson::String(s.into());
+        let cmp = |a: &str, b: &str| ops.cmp(0, &t(a), &t(b));
+        assert_eq!(
+            cmp("10:00:00.5", "10:00:00.25"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(cmp("09:59:59.999999", "10:00:00"), std::cmp::Ordering::Less);
+        assert_eq!(cmp("24:00:00", "23:59:59"), std::cmp::Ordering::Greater);
+        assert_eq!(ops.key_size(0, &t("12:00:00")), 16);
+        assert_eq!(ops.multi_key_size(&t("12:00:00")), 24);
     }
 
     /// `gin_extract_jsonb` through `ginExtractEntries`: object keys flagged

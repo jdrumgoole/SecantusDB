@@ -343,9 +343,15 @@ pub trait Host {
     /// The CONTEXT label of the function `create_sql` defines, as the
     /// session compiled it: `plpgsql_compile` labels a function once and
     /// keeps the label while the compiled function is cached, whatever the
-    /// search path of a later call (RP-1034). `label` makes it at the first.
-    fn compiled_label(&self, create_sql: &str, label: &dyn Fn() -> String) -> String {
-        let _ = create_sql;
+    /// search path of a later call (RP-1034) -- until its catalog row is
+    /// rewritten, which `row` tells (RP-1051). `label` makes it at a compile.
+    fn compiled_label(
+        &self,
+        create_sql: &str,
+        row: Option<CatalogRow>,
+        label: &dyn Fn() -> String,
+    ) -> String {
+        let _ = (create_sql, row);
         label()
     }
 }
@@ -404,6 +410,20 @@ pub struct Invocation<'a> {
     /// A procedure or DO block, whose body may COMMIT / ROLLBACK; a
     /// function's (or trigger's) may not.
     pub nonatomic: bool,
+    /// The routine's oid and the stamp of its catalog row (the `xmin` and
+    /// `cmin` of the write that made it), which `plpgsql_compile` checks a
+    /// cached compile against; `None` for a DO block, or a row from before
+    /// rows were stamped.
+    pub catalog_row: Option<CatalogRow>,
+}
+
+/// A routine's identity in the session's compile cache: its oid, and the
+/// version of its catalog row the compile was made from (RP-1051).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogRow {
+    pub oid: i64,
+    pub xmin: i64,
+    pub cmin: i64,
 }
 
 /// What a call produced.
@@ -1493,7 +1513,7 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         cursor_options: open_cursor::cursor_options(&f),
         cursor_argrows: open_cursor::cursor_argrows(&f),
         expression_types: std::cell::RefCell::default(),
-        label: host.compiled_label(create_sql, &|| function_label(create_sql)),
+        label: host.compiled_label(create_sql, inv.catalog_row, &|| function_label(create_sql)),
         dyn_text: None,
         scopes: block_scope::scopes(&f),
         defaults: f

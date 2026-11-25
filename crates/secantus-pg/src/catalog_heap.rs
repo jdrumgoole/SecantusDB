@@ -23,8 +23,8 @@
 //! heap for a tuple on a block without one (RP-360).
 //!
 //! A catalog scan's heap blocks are counted over these
-//! (`catalog_btree.rs`); placing every later catalog row into these models
-//! as DDL writes it, and its index entries, is RP-291's next slice.
+//! (`catalog_btree.rs`), and over the rows DDL has written into each
+//! database's copy of them since (`catalog_places.rs`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
@@ -44,10 +44,8 @@ pub(crate) struct InitdbHeap {
     pub(crate) blocks: u32,
     /// Every live tuple's `ctid` as `block * 65536 + offset`, in `ctid` order.
     pub(crate) tids: Vec<i64>,
-    #[cfg_attr(not(test), allow(dead_code))]
     /// Each block's page as `heap_pages` in the dump tool recorded it.
     pub(crate) pages: Vec<InitdbPage>,
-    #[cfg_attr(not(test), allow(dead_code))]
     /// The free space map fork, as [`crate::fsm::Fsm::from_doc`] reads
     /// it; `None` without one.
     pub(crate) fsm: Option<bson::Document>,
@@ -71,7 +69,6 @@ impl InitdbHeap {
 }
 
 /// One heap page as `initdb` left it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct InitdbPage {
     /// `pd_upper - pd_lower`.
     pub(crate) free: u32,
@@ -204,18 +201,19 @@ pub(crate) fn initdb_heaps() -> &'static HashMap<i64, InitdbHeap> {
     H.get_or_init(|| parse(include_str!("pg15_catalog_heaps.txt")))
 }
 
-/// The heap page model of catalog `table` as `initdb` left it: its pages
-/// and its free space map. `None` for a table that is not a built-in
-/// catalog. (The next slice places DDL's catalog rows in it.)
-#[cfg_attr(not(test), allow(dead_code))]
+/// The heap page model of catalog `table` as `initdb` left it: its pages,
+/// their visibility map bits and its free space map. `None` for a table
+/// that is not a built-in catalog. Each database's DDL writes its catalog
+/// rows into its own copy (`catalog_places.rs`).
 pub(crate) fn initdb_heap_model(table: i64) -> Option<Heap> {
     let h = initdb_heaps().get(&table)?;
     let mut heap = Heap::default();
-    for p in &h.pages {
+    for (b, p) in h.pages.iter().enumerate() {
         heap.pages.push(Page {
             free: p.free,
             nlp: p.nlp,
             lps: p.lps.clone(),
+            all_visible: h.block_all_visible(b as i64),
             ..Page::default()
         });
     }

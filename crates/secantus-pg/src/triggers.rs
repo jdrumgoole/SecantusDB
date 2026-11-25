@@ -484,6 +484,7 @@ impl PgHandler {
                         out_params: &[],
                         procedure: false,
                         nonatomic: false,
+                        catalog_row: self.catalog_row(&doc),
                     },
                     &PlHost { h: self },
                 )
@@ -536,6 +537,7 @@ impl PgHandler {
                 out_params: &[],
                 procedure: false,
                 nonatomic: false,
+                catalog_row: None,
             },
             &PlHost { h: self },
         )

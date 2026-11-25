@@ -541,6 +541,10 @@ impl PgHandler {
                 ))
             })
             .collect();
+        let (store, db) = (
+            std::sync::Arc::as_ptr(&self.storage) as usize,
+            self.stats().db,
+        );
         let mut columns = Document::new();
         let mut relids: Vec<i64> = builtin_rows()
             .iter()
@@ -555,10 +559,28 @@ impl PgHandler {
             let Some(def) = Self::virtual_table(name) else {
                 continue;
             };
-            let docs = self.table_docs(name)?;
+            let mut docs = self.table_docs(name)?;
             // ANALYZE computes nothing from no rows.
             if docs.is_empty() {
                 continue;
+            }
+            // `acquire_sample_rows` reads the heap block by block, and
+            // `compute_scalar_stats` correlates each column's sort order
+            // with that order (RP-358): the rows go in it, a row whose
+            // place is not modelled after every placed one, in this
+            // server's order.
+            if let Some(order) = crate::catalog_btree::heap_order(store, db, rel) {
+                let fields: Option<Vec<String>> = order
+                    .attnums
+                    .iter()
+                    .map(|a| Some(def.column(attnames.get(&(rel, *a))?)?.field()))
+                    .collect();
+                if let Some(fields) = fields {
+                    docs.sort_by_cached_key(|d| {
+                        let values: Vec<Option<&Bson>> = fields.iter().map(|f| d.get(f)).collect();
+                        order.place(&values).unwrap_or(i64::MAX)
+                    });
+                }
             }
             let totalrows = docs.len() as f64;
             for row in builtin_rows()
@@ -718,6 +740,51 @@ impl PgHandler {
             );
         }
         Some(d)
+    }
+
+    /// The `pg_statistic` row of column `attnum` of relation `rel`, as
+    /// `examine_variable` finds it, keyed by column name: a built-in
+    /// catalog's (a database-wide ANALYZE's, else `initdb`'s), or a
+    /// table's own ANALYZE's. `None` when the column has none.
+    pub(crate) fn column_statistic(&self, rel: i64, attnum: i64) -> Option<Document> {
+        let def = Self::virtual_table("pg_statistic")?;
+        let named = |d: Document| -> Document {
+            def.columns
+                .iter()
+                .filter_map(|c| Some((c.name.clone(), d.get(def.field_of(&c.name)?)?.clone())))
+                .collect()
+        };
+        let att = i16::try_from(attnum).ok()?;
+        let measured = self
+            .relstats(CATALOG_STATISTICS)
+            .and_then(|d| d.get_document("catalogs").ok().cloned())
+            .unwrap_or_default();
+        if let Ok(entry) = measured.get_document(format!("{rel}:{attnum}")) {
+            if let (Ok(name), Ok(ty)) = (entry.get_str("name"), entry.get_str("type")) {
+                let c = secantus_pgcatalog::Column::new(name, ty, false);
+                if let Some(d) = Self::statistic_row(&def, rel, att, &c, entry) {
+                    return Some(named(d));
+                }
+            }
+        }
+        if let Some(row) = builtin_stats(rel)
+            .find(|r| r.get(1).map(|(_, v)| v) == Some(&Bson::Int32(i32::from(att))))
+        {
+            return Some(row.iter().cloned().collect());
+        }
+        let defs = self.shared_table_defs().ok()?;
+        let t = defs
+            .iter()
+            .find(|t| self.relation_oid(&t.name) == Some(rel))?;
+        let doc = self.relstats(&t.name)?;
+        let columns = doc.get_document("columns").ok()?;
+        let (_, c) = t
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(i, _)| t.attnum(*i) == att)?;
+        let entry = columns.get_document(c.field()).ok()?;
+        Self::statistic_row(&def, rel, att, c, entry).map(named)
     }
 
     pub(crate) fn pg_statistic_rows(&self, def: &TableDef) -> Vec<Document> {

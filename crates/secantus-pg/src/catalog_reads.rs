@@ -80,6 +80,9 @@ pub(crate) struct Rel {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Index {
     pub oid: i64,
+    /// Its name, and its columns' (`pg_attribute`'s `attname`).
+    pub name: String,
+    pub attnames: Vec<String>,
     pub natts: i64,
     /// Key columns' attnums, 0 for an expression.
     pub keys: Vec<i64>,
@@ -126,6 +129,9 @@ const RELATION_RELATION: i64 = 1259;
 /// `pg_table_is_visible`.
 const TABLE_IS_VISIBLE: i64 = 2079;
 const ATTRIBUTE_RELATION: i64 = 1249;
+const TYPE_RELATION: i64 = 1247;
+const INDEX_RELATION: i64 = 2610;
+const DATABASE_RELATION: i64 = 1262;
 const DEPEND_RELATION: i64 = 2608;
 const DEPEND_DEPENDER_INDEX: i64 = 2673;
 const DEPEND_REFERENCE_INDEX: i64 = 2674;
@@ -199,6 +205,10 @@ thread_local! {
     static FACTS: std::cell::RefCell<FactMemo> = std::cell::RefCell::new(FactMemo::default());
 }
 
+/// A merge-joinable join clause: its operator, and its left and right
+/// columns as `(relation, attnum)`.
+type MergeClause = (i64, (i64, i64), (i64, i64));
+
 /// The walk over one statement.
 pub(crate) struct Model<'a> {
     h: &'a PgHandler,
@@ -230,7 +240,127 @@ pub(crate) struct Model<'a> {
     /// The relations a DDL statement changes, as they stood before it ran
     /// (the walk runs after it).
     pre: Vec<Rel>,
+    /// The statement's merge-joinable join clauses, `(operator, left
+    /// (rel, attnum), right (rel, attnum))`, for the planner's merge join
+    /// costing once the base relations are planned.
+    merge_clauses: Vec<MergeClause>,
+    /// Starting without the shared or the local relation cache init file
+    /// (RP-292): the relations it would hold are built, not read from it.
+    cold_shared: bool,
+    cold_local: bool,
+    /// `criticalRelcachesBuilt` and `criticalSharedRelcachesBuilt`: until
+    /// the critical indexes are built, the relation cache's catalog reads
+    /// (and the caches `IndexScanOK` names) are heap scans.
+    relcache_built: bool,
+    shared_built: bool,
 }
+
+/// `syscache.c`'s `cacheinfo`, in its order: each system cache's catalog
+/// and index, which `InitCatalogCachePhase2` opens.
+const SYSCACHES: &[(i64, i64)] = &[
+    (2600, 2650),
+    (2601, 2651),
+    (2601, 2652),
+    (2602, 2654),
+    (2602, 2653),
+    (2603, 2655),
+    (1249, 2658),
+    (1249, 2659),
+    (1261, 2695),
+    (1261, 2694),
+    (1260, 2676),
+    (1260, 2677),
+    (2605, 2661),
+    (2616, 2686),
+    (2616, 2687),
+    (3456, 3164),
+    (3456, 3085),
+    (2607, 2668),
+    (2607, 2669),
+    (2606, 2667),
+    (2607, 2670),
+    (1262, 2672),
+    (826, 827),
+    (3501, 3502),
+    (3501, 3503),
+    (3466, 3467),
+    (3466, 3468),
+    (2328, 548),
+    (2328, 112),
+    (1417, 549),
+    (1417, 113),
+    (3118, 3119),
+    (2610, 2679),
+    (2612, 2681),
+    (2612, 2682),
+    (2615, 2684),
+    (2615, 2685),
+    (2617, 2689),
+    (2617, 2688),
+    (2753, 2754),
+    (2753, 2755),
+    (6243, 6246),
+    (6243, 6247),
+    (3350, 3351),
+    (1255, 2691),
+    (1255, 2690),
+    (6104, 6111),
+    (6237, 6238),
+    (6237, 6239),
+    (6104, 6110),
+    (6106, 6112),
+    (6106, 6113),
+    (3541, 2228),
+    (3541, 3542),
+    (1259, 2663),
+    (1259, 2662),
+    (6000, 6001),
+    (6000, 6002),
+    (2618, 2693),
+    (2224, 5002),
+    (3429, 3433),
+    (3381, 3997),
+    (3381, 3380),
+    (2619, 2696),
+    (6100, 6115),
+    (6100, 6114),
+    (6102, 6117),
+    (1213, 2697),
+    (3576, 3574),
+    (3576, 3575),
+    (3603, 3609),
+    (3602, 3608),
+    (3602, 3712),
+    (3600, 3604),
+    (3600, 3605),
+    (3601, 3606),
+    (3601, 3607),
+    (3764, 3766),
+    (3764, 3767),
+    (1247, 2704),
+    (1247, 2703),
+    (1418, 174),
+    (1418, 175),
+    (3079, 3080),
+];
+
+/// `RelationCacheInitializePhase3`'s critical local indexes, in its order:
+/// `pg_class_oid_index`, `pg_attribute_relid_attnum_index`,
+/// `pg_index_indexrelid_index`, `pg_opclass_oid_index`,
+/// `pg_amproc_fam_proc_index`, `pg_rewrite_rel_rulename_index`,
+/// `pg_trigger_tgrelid_tgname_index`.
+const CRITICAL_LOCAL_INDEXES: &[i64] = &[2662, 2659, 2679, 2687, 2655, 2693, 2701];
+/// Its critical shared indexes: `pg_database`'s two, `pg_authid`'s two,
+/// `pg_auth_members_member_role_index`, `pg_shseclabel_object_index`.
+const CRITICAL_SHARED_INDEXES: &[i64] = &[2671, 2672, 2676, 2677, 2695, 3593];
+/// The catalogs `formrdesc` makes without reading anything: the shared
+/// ones (`RelationCacheInitializePhase2`) and the local ones (`Phase3`).
+const FORMRDESC_SHARED: &[i64] = &[1262, 1260, 1261, 3592, 6100];
+const FORMRDESC_LOCAL: &[i64] = &[1259, 1249, 1255, 1247];
+/// `OID_BTREE_OPS_OID` and `INT2_BTREE_OPS_OID`: `LookupOpclassInfo` reads
+/// them by heap scans until the critical indexes are built.
+const OID_BTREE_OPS: i64 = 1981;
+const INT2_BTREE_OPS: i64 = 1979;
 
 fn names_of(nodes: &[pb::Node]) -> Vec<String> {
     nodes
@@ -281,6 +411,11 @@ impl<'a> Model<'a> {
             depth: 0,
             active_fns: Vec::new(),
             pre: Vec::new(),
+            merge_clauses: Vec::new(),
+            cold_shared: false,
+            cold_local: false,
+            relcache_built: true,
+            shared_built: true,
         }
     }
 
@@ -391,16 +526,45 @@ impl<'a> Model<'a> {
 
     // ---------------------------------------------------------- backend start
 
-    /// `InitPostgres` with the init files in place.
-    pub(crate) fn backend_start(&mut self, db_oid: i64, db_name: &str, role_oid: i64) {
-        // `GetDatabaseTuple`: a direct scan by name, uncached.
-        self.ct.index(2671, vec![K::N(db_name.to_string())], 1);
+    /// `InitPostgres`: with the relation cache init files in place, or,
+    /// when `cold` says one is missing (`(shared, local)`), building every
+    /// relation it would hold and writing it (RP-292).
+    pub(crate) fn backend_start(
+        &mut self,
+        db_oid: i64,
+        db_name: &str,
+        role_oid: i64,
+        cold: (bool, bool),
+    ) {
+        let (shared, local) = cold;
+        self.cold_shared = shared;
+        self.cold_local = local;
+        // `RelationCacheInitializePhase2`: no shared init file, so
+        // `formrdesc`'s descriptors, and no critical shared index yet.
+        if shared {
+            for &rel in FORMRDESC_SHARED {
+                self.be.build_relation(rel);
+            }
+            self.shared_built = false;
+        }
         // `InitializeSessionUserId`: AUTHNAME, then AUTHOID.
         let user = self.user.clone();
-        self.search(Cache::AuthName, vec![K::N(user)], |_| true);
-        self.search(Cache::AuthOid, vec![K::O(role_oid)], |_| true);
+        self.start_search(Cache::AuthName, vec![K::N(user)]);
+        self.start_search(Cache::AuthOid, vec![K::O(role_oid)]);
+        // `GetDatabaseTuple`: a direct scan by name, uncached; a heap scan
+        // until the critical shared indexes are built.
+        if self.shared_built {
+            self.ct.index(2671, vec![K::N(db_name.to_string())], 1);
+        } else {
+            self.ct.seq(1262, 1);
+        }
         // `GetDatabaseTupleByOid`, rechecking after the lock: uncached.
-        self.ct.index(2672, vec![K::O(db_oid)], 1);
+        if self.shared_built {
+            self.ct.index(2672, vec![K::O(db_oid)], 1);
+        } else {
+            self.ct.seq(1262, 1);
+        }
+        self.relcache_phase3();
         // `CheckMyDatabase`: DATABASEOID.
         self.search(Cache::DatabaseOid, vec![K::O(db_oid)], |_| true);
         // `process_settings`: four scans of pg_db_role_setting's index,
@@ -413,7 +577,157 @@ impl<'a> Model<'a> {
         for ((d, r), n) in keys.into_iter().zip(rows) {
             self.ct.index(2965, vec![K::O(d), K::O(r)], n);
         }
+        self.cold_shared = false;
+        self.cold_local = false;
         self.be.started = true;
+    }
+
+    /// `RelationCacheInitializePhase3` without an init file: `formrdesc`'s
+    /// local catalogs, the critical indexes built by heap scans, the
+    /// critical shared ones, every `formrdesc`'d catalog's own `pg_class`
+    /// row, then `InitCatalogCachePhase2`'s open of every system cache's
+    /// catalog and index -- the relations the init files then hold.
+    fn relcache_phase3(&mut self) {
+        let (shared, local) = (self.cold_shared, self.cold_local);
+        if local {
+            for &rel in FORMRDESC_LOCAL {
+                self.be.build_relation(rel);
+            }
+            self.relcache_built = false;
+            for &ix in CRITICAL_LOCAL_INDEXES {
+                self.build_desc(ix);
+            }
+            self.relcache_built = true;
+        }
+        if shared {
+            for &ix in CRITICAL_SHARED_INDEXES {
+                self.build_desc(ix);
+            }
+            self.shared_built = true;
+        }
+        // A `formrdesc`'d descriptor has no owner: its row by RELOID.
+        let fixups = if shared { FORMRDESC_SHARED } else { &[] };
+        let local_fixups = if local { FORMRDESC_LOCAL } else { &[] };
+        for &rel in fixups.iter().chain(local_fixups) {
+            self.start_search(Cache::RelOid, vec![K::O(rel)]);
+        }
+        if !(shared || local) {
+            return;
+        }
+        for &(rel, ix) in SYSCACHES {
+            // `CatalogCacheInitializeCache`, and the index unless it is
+            // pg_am's (`touch_index` is false for AMOID and AMNAME).
+            self.build_desc(rel);
+            if rel != 2601 {
+                self.build_desc(ix);
+            }
+        }
+    }
+
+    /// Whether a catalog's descriptor comes from an init file this
+    /// backend found.
+    fn held_by_init_file(&self, c: &cf::CatalogRel) -> bool {
+        c.in_init_file
+            && !(if c.shared {
+                self.cold_shared
+            } else {
+                self.cold_local
+            })
+    }
+
+    /// `RelationBuildDesc` of a catalog or catalog index while the init
+    /// files are built: its `pg_class` row (`ScanPgRelation`), its
+    /// attributes (`RelationBuildTupleDesc`), and an index's access info.
+    fn build_desc(&mut self, oid: i64) {
+        let b = builtin();
+        let Some(c) = b.relations.get(&oid) else {
+            return;
+        };
+        if self.held_by_init_file(c) || !self.be.build_relation(oid) {
+            return;
+        }
+        if self.relcache_built {
+            self.ct.index_key(2662, &vec![K::O(oid)], 1);
+            self.ct.index_key(2659, &vec![K::O(oid)], c.natts);
+        } else {
+            self.ct.seq(RELATION_RELATION, 1);
+            self.ct.seq(ATTRIBUTE_RELATION, c.natts);
+        }
+        if c.kind != 'i' {
+            return;
+        }
+        let Some(ix) = catalog_index(oid) else {
+            return;
+        };
+        // `RelationInitIndexAccessInfo`.
+        self.start_search(Cache::IndexRelid, vec![K::O(oid)]);
+        self.start_search(Cache::AmOid, vec![K::O(ix.am)]);
+        for class in &ix.classes {
+            self.start_opclass_info(*class);
+        }
+        // `RelationGetIndexAttOptions`: once the critical indexes are
+        // built, and never for pg_attribute's own.
+        if self.relcache_built && oid != 2659 {
+            for att in 1..=ix.natts {
+                self.start_search(Cache::AttNum, vec![K::O(oid), K::O(att)]);
+            }
+        }
+    }
+
+    /// A system cache search while the init files are built: the cache's
+    /// catalog opened on its first use (`CatalogCacheInitializeCache`),
+    /// and a miss read by a heap scan where `IndexScanOK` says so.
+    fn start_search(&mut self, cache: Cache, key: Key) {
+        let (catalog, index) = cache.relations();
+        self.build_desc(catalog);
+        let heap = match cache {
+            Cache::IndexRelid => !self.relcache_built,
+            Cache::AuthName | Cache::AuthOid | Cache::DatabaseOid => !self.shared_built,
+            _ => false,
+        };
+        if self.be.cached(cache, &key) {
+            return;
+        }
+        if heap {
+            self.be.search_heap(&self.ct, cache, key, 1);
+        } else {
+            if cache != Cache::AmOid {
+                self.build_desc(index);
+            }
+            self.be.search(&self.ct, cache, key, 1);
+        }
+    }
+
+    /// `LookupOpclassInfo` while the init files are built: heap scans for
+    /// `oid_ops` and `int2_ops` until the critical indexes are built.
+    fn start_opclass_info(&mut self, class: i64) {
+        if !self.be.opclasses.insert(class) {
+            return;
+        }
+        let index_ok = self.relcache_built || (class != OID_BTREE_OPS && class != INT2_BTREE_OPS);
+        self.build_desc(2616);
+        if index_ok {
+            self.build_desc(2687);
+            self.ct.index(2687, vec![K::O(class)], 1);
+        } else {
+            self.ct.seq(2616, 1);
+        }
+        let Some(o) = builtin().opclasses.get(&class).cloned() else {
+            return;
+        };
+        let procs = builtin()
+            .amproc_count
+            .get(&(o.family, o.intype, o.intype))
+            .copied()
+            .unwrap_or(0);
+        self.build_desc(2603);
+        if index_ok {
+            self.build_desc(2655);
+            let key = vec![K::O(o.family), K::O(o.intype), K::O(o.intype)];
+            self.ct.index(2655, key, procs);
+        } else {
+            self.ct.seq(2603, procs);
+        }
     }
 
     // ------------------------------------------------------------ namespace.c
@@ -596,7 +910,8 @@ impl<'a> Model<'a> {
             self.search(Cache::AmOid, vec![K::O(HEAP_AM)], |_| true);
         }
         // `RelationBuildTupleDesc`: every attribute numbered above zero.
-        self.ct.index_key(2659, &vec![K::O(rel.oid)], rel.natts);
+        self.ct
+            .index_key_above(2659, &vec![K::O(rel.oid)], 0, rel.natts);
         if rel.defaults > 0 {
             // `AttrDefaultFetch`.
             self.open_catalog(2604);
@@ -636,7 +951,8 @@ impl<'a> Model<'a> {
             return;
         }
         self.ct.index_key(2662, &vec![K::O(ix.oid)], 1);
-        self.ct.index_key(2659, &vec![K::O(ix.oid)], ix.natts);
+        self.ct
+            .index_key_above(2659, &vec![K::O(ix.oid)], 0, ix.natts);
         self.search(Cache::IndexRelid, vec![K::O(ix.oid)], |_| true);
         self.search(Cache::AmOid, vec![K::O(ix.am)], |_| true);
         for class in &ix.classes {
@@ -1908,11 +2224,16 @@ impl<'a> Model<'a> {
             let t = self.expr(l, &scope, true);
             self.coerce(t, INT8, COERCION_IMPLICIT);
         }
-        // The planner, per base relation (a view became its query).
+        // The planner, per base relation (a view became its query), then
+        // the joins: a merge join's cost estimates each merge clause's
+        // scan fractions.
         for (_, rel) in scope.rels.clone() {
             if rel.view.is_none() {
                 self.plan_rel(&rel);
             }
+        }
+        for (opr, l, r) in std::mem::take(&mut self.merge_clauses) {
+            self.mergejoinscansel(opr, l, r, &scope);
         }
         // The executor's Sort, unless the index scan gives the order.
         if !self.index_ordered {
@@ -2463,9 +2784,8 @@ impl<'a> Model<'a> {
 
     /// A join clause between two relations' columns: its operator's merge
     /// join families (`check_mergejoinable`), the type cache's hashing for a
-    /// Memoize (`check_memoizable`), each side's statistics (`eqjoinsel`),
-    /// and the merge join's scan estimate (`mergejoinscansel`: the family's
-    /// `<` and `<=`).
+    /// Memoize (`check_memoizable`), each side's statistics (`eqjoinsel`);
+    /// a merge-joinable one waits for the planner's `mergejoinscansel`.
     fn join_clause(&mut self, opr: i64, l: (i64, i64), r: (i64, i64)) {
         for (rel, att) in [l, r] {
             self.needs.entry(rel).or_default().all.insert(att);
@@ -2482,16 +2802,293 @@ impl<'a> Model<'a> {
         }
         let _ = lt;
         if o.canmerge {
-            if let Some(m) = builtin()
-                .amop_rows
-                .get(&opr)
-                .and_then(|v| v.iter().find(|r| r.method == BTREE_AM && r.strategy == 3))
-                .cloned()
-            {
-                self.opfamily_member(m.family, m.left, m.right, 1);
-                self.opfamily_member(m.family, m.left, m.right, 2);
+            self.merge_clauses.push((opr, l, r));
+        }
+    }
+
+    /// `mergejoinscansel`, as `initial_cost_mergejoin` asks it of a merge
+    /// path's first merge clause sorted ascending (the pathkeys
+    /// `select_outer_pathkeys_for_merge` builds, `BTLessStrategyNumber`):
+    /// the clause's B-tree family's operators, each side's range from its
+    /// statistics (`get_variable_range`), then the four `scalarineqsel`s of
+    /// one side against the other's ends. `sort_inner_and_outer` costs a
+    /// path with each clause first, and `cached_scansel` keeps the answer
+    /// in the clause: once per clause.
+    fn mergejoinscansel(&mut self, opr: i64, l: (i64, i64), r: (i64, i64), scope: &Scope) {
+        let rel_of = |oid: i64| {
+            scope
+                .rels
+                .iter()
+                .find(|(_, r)| r.oid == oid)
+                .map(|(_, r)| r.clone())
+        };
+        let (Some(lrel), Some(rrel)) = (rel_of(l.0), rel_of(r.0)) else {
+            return;
+        };
+        // The pathkey's family: the first of the clause's merge families
+        // (`get_mergejoin_opfamilies`, in AMOPOPID's order).
+        let mut fams: Vec<cf::AmopFact> = builtin()
+            .amop_rows
+            .get(&opr)
+            .map(|v| {
+                v.iter()
+                    .filter(|r| r.method == BTREE_AM && r.strategy == 3 && r.purpose == 's')
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        fams.sort_by_key(|r| r.family);
+        let Some(m) = fams.first().cloned() else {
+            return;
+        };
+        let fam = m.family;
+        // `get_op_opfamily_properties`.
+        self.search(
+            Cache::AmopOpid,
+            vec![K::O(opr), K::N("s".to_string()), K::O(fam)],
+            |_| true,
+        );
+        let (lt, rt) = (m.left, m.right);
+        let ltop = self.opfamily_member(fam, lt, rt, 1);
+        let leop = self.opfamily_member(fam, lt, rt, 2);
+        let (lsortop, rsortop, revltop, revleop) = if lt == rt {
+            (ltop, ltop, ltop, leop)
+        } else {
+            (
+                self.opfamily_member(fam, lt, lt, 1),
+                self.opfamily_member(fam, rt, rt, 1),
+                self.opfamily_member(fam, rt, lt, 1),
+                self.opfamily_member(fam, rt, lt, 2),
+            )
+        };
+        if [ltop, leop, lsortop, rsortop, revltop, revleop].contains(&0) {
+            return;
+        }
+        let (Some(lvar), Some(rvar)) = (self.stat_var(&lrel, l.1), self.stat_var(&rrel, r.1))
+        else {
+            return;
+        };
+        // The clause's input collation: its columns'.
+        let coll = lvar.coll;
+        let Some((lmin, lmax)) = self.variable_range(&lvar, lsortop, coll) else {
+            return;
+        };
+        let Some((rmin, rmax)) = self.variable_range(&rvar, rsortop, coll) else {
+            return;
+        };
+        self.scalarineqsel(leop, &lvar, coll, &rmax);
+        self.scalarineqsel(revleop, &rvar, coll, &lmax);
+        self.scalarineqsel(ltop, &lvar, coll, &rmin);
+        self.scalarineqsel(revltop, &rvar, coll, &lmin);
+    }
+
+    /// `examine_variable` of a plain column: its type, its collation and
+    /// its `pg_statistic` row.
+    fn stat_var(&mut self, rel: &Rel, att: i64) -> Option<StatVar> {
+        let typ = rel.columns.iter().find(|c| c.0 == att)?.2;
+        let mut coll = type_collation(self.h.cr_base_type(typ));
+        // A catalog's collatable column is "C" (its `attcollation`).
+        if rel.catalog && coll != 0 {
+            coll = C_COLLATION;
+        }
+        let stats = if rel.stats.contains(&att) {
+            self.h.cr_column_stats(rel.oid, att)
+        } else {
+            None
+        };
+        Some(StatVar {
+            rel: rel.clone(),
+            att,
+            typ,
+            coll,
+            stats,
+        })
+    }
+
+    /// `get_variable_range`: the column's least and greatest value by
+    /// `sortop`, from its histogram (the one sorted by `sortop` in the
+    /// collation, else any), and its most common values when they hold
+    /// the histogram's ends or, with none, nearly every row.
+    fn variable_range(&mut self, var: &StatVar, sortop: i64, coll: i64) -> Option<(Bson, Bson)> {
+        let st = var.stats.as_ref()?;
+        // `get_opcode`, then `get_typlenbyval`.
+        self.oper_oid(sortop);
+        self.type_oid(var.typ);
+        let lt = |a: &Bson, b: &Bson| op_holds(sortop, a, b);
+        let widen = |vals: &[Bson], range: &mut Option<(Bson, Bson)>| {
+            for v in vals {
+                match range {
+                    None => *range = Some((v.clone(), v.clone())),
+                    Some((lo, hi)) => {
+                        if lt(v, lo) {
+                            *lo = v.clone();
+                        }
+                        if lt(hi, v) {
+                            *hi = v.clone();
+                        }
+                    }
+                }
+            }
+        };
+        let mut range = None;
+        if let Some(h) = st.slot(STATISTIC_KIND_HISTOGRAM, sortop) {
+            if h.coll == coll && !h.values.is_empty() {
+                range = Some((h.values[0].clone(), h.values[h.values.len() - 1].clone()));
             }
         }
+        if range.is_none() {
+            if let Some(h) = st.slot(STATISTIC_KIND_HISTOGRAM, 0) {
+                widen(&h.values, &mut range);
+            }
+        }
+        if let Some(mcv) = st.slot(STATISTIC_KIND_MCV, 0) {
+            let sumcommon: f64 = mcv.numbers.iter().sum();
+            if range.is_some() || sumcommon + st.nullfrac > 0.99999 {
+                widen(&mcv.values, &mut range);
+            }
+        }
+        range
+    }
+
+    /// `scalarineqsel` of `var op constant`: the operator's function
+    /// (`get_opcode`), then the histogram (`ineq_histogram_selectivity`),
+    /// whose binary search asks the column's index for its actual ends
+    /// when it reaches the first or last bin.
+    fn scalarineqsel(&mut self, op: i64, var: &StatVar, coll: i64, konst: &Bson) {
+        let Some(st) = var.stats.as_ref() else {
+            return;
+        };
+        self.oper_oid(op);
+        let Some(h) = st.slot(STATISTIC_KIND_HISTOGRAM, 0) else {
+            return;
+        };
+        let n = h.values.len();
+        if n <= 1 || h.coll != coll || !self.comparison_ops_are_compatible(h.op, op) {
+            return;
+        }
+        let mut values = h.values.clone();
+        let staop = h.op;
+        if n == 2 {
+            self.actual_variable_range(var, staop, coll, true, true, &mut values);
+        }
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let probe = (lo + hi) / 2;
+            if probe == 0 && n > 2 {
+                self.actual_variable_range(var, staop, coll, true, false, &mut values);
+            } else if probe == n - 1 && n > 2 {
+                self.actual_variable_range(var, staop, coll, false, true, &mut values);
+            }
+            if op_holds(op, &values[probe], konst) {
+                lo = probe + 1;
+            } else {
+                hi = probe;
+            }
+        }
+    }
+
+    /// `comparison_ops_are_compatible`: the same operator, or one of the
+    /// first's B-tree or hash families holds the second
+    /// (`op_in_opfamily`).
+    fn comparison_ops_are_compatible(&mut self, op1: i64, op2: i64) -> bool {
+        if op1 == op2 {
+            return true;
+        }
+        self.amop_list(op1);
+        let mut members: Vec<(char, i64, i64)> = builtin()
+            .amop_rows
+            .get(&op1)
+            .map(|v| v.iter().map(|r| (r.purpose, r.family, r.method)).collect())
+            .unwrap_or_default();
+        members.sort();
+        for (_, fam, method) in members {
+            if method != BTREE_AM && method != HASH_AM {
+                continue;
+            }
+            let found = builtin()
+                .amop_by_opr
+                .get(&op2)
+                .is_some_and(|v| v.iter().any(|(p, f)| *p == 's' && *f == fam));
+            self.search(
+                Cache::AmopOpid,
+                vec![K::O(op2), K::N("s".to_string()), K::O(fam)],
+                |_| found,
+            );
+            if found {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `get_actual_variable_range`: the first B-tree of the relation
+    /// (no predicate, its collation the clause's) whose leading column is
+    /// the variable and whose family sorts by `sortop`, scanned from each
+    /// end asked for to its first live entry
+    /// (`get_actual_variable_endpoint`, an index-only read that visits the
+    /// heap only off an all-visible block). The ends found replace the
+    /// histogram's. A table's own index is not counted here, so its ends
+    /// stay the histogram's.
+    fn actual_variable_range(
+        &mut self,
+        var: &StatVar,
+        sortop: i64,
+        coll: i64,
+        min: bool,
+        max: bool,
+        values: &mut [Bson],
+    ) -> bool {
+        for ix in var.rel.indexes.clone() {
+            if ix.am != BTREE_AM || ix.keys.first() != Some(&var.att) || var.coll != coll {
+                continue;
+            }
+            let Some(o) = ix.classes.first().and_then(|c| self.h.cr_opclass(*c)) else {
+                continue;
+            };
+            // `get_op_opfamily_strategy`.
+            let strategy = builtin()
+                .amop_rows
+                .get(&sortop)
+                .and_then(|v| v.iter().find(|r| r.family == o.family && r.purpose == 's'))
+                .map_or(0, |r| r.strategy);
+            self.search(
+                Cache::AmopOpid,
+                vec![K::O(sortop), K::N("s".to_string()), K::O(o.family)],
+                |_| strategy != 0,
+            );
+            if strategy != 1 && strategy != 5 {
+                continue;
+            }
+            self.type_oid(var.typ);
+            if !var.rel.catalog {
+                return false;
+            }
+            let Some((least, greatest)) = self.h.cr_column_extremes(&var.rel, var.att) else {
+                return false;
+            };
+            // In the sort operator's order: `>` sorts greatest first.
+            let (first, last) = if strategy == 1 {
+                (least, greatest)
+            } else {
+                (greatest, least)
+            };
+            let key = |v: &Bson| match v {
+                Bson::String(s) => K::N(s.clone()),
+                v => K::O(crate::bson_i64(v).unwrap_or_default()),
+            };
+            if min {
+                self.exec
+                    .push(Scan::IndexOnly(ix.oid, vec![key(&first)], 1));
+                values[0] = first;
+            }
+            if max {
+                self.exec.push(Scan::IndexOnly(ix.oid, vec![key(&last)], 1));
+                let n = values.len();
+                values[n - 1] = last;
+            }
+            return true;
+        }
+        false
     }
 
     /// `oper`: the exact match first, then the candidates.
@@ -3238,6 +3835,90 @@ const DEFAULT_COLLATION: i64 = 100;
 /// The database encoding (`GetDatabaseEncoding`): UTF8.
 const DATABASE_ENCODING: i64 = 6;
 
+/// `pg_statistic`'s slot kinds (`STATISTIC_KIND_*`).
+const STATISTIC_KIND_MCV: i64 = 1;
+const STATISTIC_KIND_HISTOGRAM: i64 = 2;
+
+/// One `pg_statistic` slot: `stakindN`, `staopN`, `stacollN`,
+/// `stanumbersN`, `stavaluesN`.
+#[derive(Debug, Clone)]
+pub(crate) struct StatSlot {
+    pub kind: i64,
+    pub op: i64,
+    pub coll: i64,
+    pub numbers: Vec<f64>,
+    pub values: Vec<Bson>,
+}
+
+/// A column's `pg_statistic` row, as the planner reads it.
+#[derive(Debug, Clone)]
+pub(crate) struct ColumnStats {
+    pub nullfrac: f64,
+    pub slots: Vec<StatSlot>,
+}
+
+impl ColumnStats {
+    /// `get_attstatsslot`: the first slot of the kind (and, unless 0, the
+    /// operator).
+    fn slot(&self, kind: i64, op: i64) -> Option<&StatSlot> {
+        self.slots
+            .iter()
+            .find(|s| s.kind == kind && (op == 0 || s.op == op))
+    }
+}
+
+/// `examine_variable`'s answer for one column.
+#[derive(Debug, Clone)]
+struct StatVar {
+    rel: Rel,
+    att: i64,
+    typ: i64,
+    coll: i64,
+    stats: Option<ColumnStats>,
+}
+
+/// A number's value as a double.
+fn num_f64(v: &Bson) -> Option<f64> {
+    match v {
+        Bson::Double(f) => Some(*f),
+        v => crate::bson_i64(v).map(|n| n as f64),
+    }
+}
+
+/// Two statistics values compared as their type's B-tree does under "C":
+/// numbers by value, strings by their bytes.
+fn compare_values(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Bson::String(x), Bson::String(y)) => Some(x.as_bytes().cmp(y.as_bytes())),
+        (Bson::Boolean(x), Bson::Boolean(y)) => Some(x.cmp(y)),
+        (Bson::Double(x), _) => x.partial_cmp(&num_f64(b)?),
+        (_, Bson::Double(y)) => num_f64(a)?.partial_cmp(y),
+        _ => Some(crate::bson_i64(a)?.cmp(&crate::bson_i64(b)?)),
+    }
+}
+
+/// Whether the B-tree comparison operator `op` holds of `a op b`, by its
+/// strategy in its family (`<`, `<=`, `=`, `>=`, `>`).
+fn op_holds(op: i64, a: &Bson, b: &Bson) -> bool {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    let strategy = builtin()
+        .amop_rows
+        .get(&op)
+        .and_then(|v| v.iter().find(|r| r.method == BTREE_AM && r.purpose == 's'))
+        .map_or(0, |r| r.strategy);
+    let Some(o) = compare_values(a, b) else {
+        return false;
+    };
+    match strategy {
+        1 => o == Less,
+        2 => o != Greater,
+        3 => o == Equal,
+        4 => o != Less,
+        5 => o == Greater,
+        _ => false,
+    }
+}
+
 /// `typcollation` of a base type: `name` sorts by "C", the string types by
 /// the database's default, every other type has none.
 fn type_collation(base: i64) -> i64 {
@@ -3403,6 +4084,7 @@ fn catalog_index(oid: i64) -> Option<Index> {
         am: rel.relam,
         in_init_file: rel.in_init_file,
         unique: ix.unique,
+        ..Index::default()
     })
 }
 
@@ -3594,8 +4276,16 @@ impl PgHandler {
                             default_opclass(typ, BTREE_AM)
                         })
                         .collect();
+                    let attname = |k: &i32| {
+                        columns
+                            .iter()
+                            .find(|c| c.0 == i64::from(*k))
+                            .map_or_else(|| "expr".to_string(), |c| c.1.clone())
+                    };
                     Index {
                         oid: ix.oid,
+                        name: ix.name.rsplit('.').next().unwrap_or(&ix.name).to_string(),
+                        attnames: ix.keys.iter().chain(&ix.include).map(attname).collect(),
                         natts: (ix.keys.len() + ix.include.len()) as i64,
                         keys,
                         classes,
@@ -3926,6 +4616,67 @@ impl PgHandler {
     }
 
     /// How many rows a catalog holds: what a sequential scan returns.
+    /// A column's `pg_statistic` row, its slots parsed.
+    pub(crate) fn cr_column_stats(&self, rel: i64, att: i64) -> Option<ColumnStats> {
+        let d = self.column_statistic(rel, att)?;
+        let f64_of = |b: &Bson| num_f64(b).unwrap_or(0.0);
+        let int = |k: &str| d.get(k).and_then(crate::bson_i64).unwrap_or(0);
+        let mut slots = Vec::new();
+        for n in 1..=5 {
+            let kind = int(&format!("stakind{n}"));
+            if kind == 0 {
+                continue;
+            }
+            let list = |k: String| match d.get(&k) {
+                Some(Bson::Array(a)) => a.clone(),
+                _ => Vec::new(),
+            };
+            slots.push(StatSlot {
+                kind,
+                op: int(&format!("staop{n}")),
+                coll: int(&format!("stacoll{n}")),
+                numbers: list(format!("stanumbers{n}")).iter().map(f64_of).collect(),
+                values: list(format!("stavalues{n}")),
+            });
+        }
+        Some(ColumnStats {
+            nullfrac: d.get("stanullfrac").map_or(0.0, f64_of),
+            slots,
+        })
+    }
+
+    /// A catalog column's least and greatest live value, as its index's
+    /// two ends hold them.
+    pub(crate) fn cr_column_extremes(&self, rel: &Rel, att: i64) -> Option<(Bson, Bson)> {
+        let def = self.catalog_def(&rel.name)?;
+        let name = &rel.columns.iter().find(|c| c.0 == att)?.1;
+        let field = def.field_of(name)?;
+        let rows = self.catalog_rows_keyed(&rel.name, None)?;
+        let mut range: Option<(Bson, Bson)> = None;
+        for v in rows.iter().filter_map(|r| r.get(&field)) {
+            if matches!(v, Bson::Null) {
+                continue;
+            }
+            range = match range {
+                None => Some((v.clone(), v.clone())),
+                Some((lo, hi)) => {
+                    let lo = if compare_values(v, &lo) == Some(std::cmp::Ordering::Less) {
+                        v.clone()
+                    } else {
+                        lo
+                    };
+                    let hi = if compare_values(v, &hi) == Some(std::cmp::Ordering::Greater) {
+                        v.clone()
+                    } else {
+                        hi
+                    };
+                    Some((lo, hi))
+                }
+            };
+        }
+        range
+    }
+
     pub(crate) fn cr_catalog_rows(&self, rel: &Rel) -> i64 {
         // Counted, not filled: a count needs no column's value (RP-715).
         self.catalog_row_count(&rel.name).map_or(0, |n| n as i64)
@@ -4083,9 +4834,15 @@ impl PgHandler {
         let db = self.db().to_string();
         let mut be = self.catcache.lock().unwrap_or_else(|e| e.into_inner());
         be.attach(store);
+        // The relation cache init files: missing after a start until a
+        // backend writes them (RP-292).
+        let cold = crate::catcache::init_files_missing(store, db_oid);
         let mut m = Model::new(self, &mut be, ct);
-        m.backend_start(db_oid, &db, role_oid);
+        m.backend_start(db_oid, &db, role_oid, cold);
         let scans = m.ct.take_scans();
+        if cold.0 || cold.1 {
+            crate::catcache::init_files_written(store, db_oid);
+        }
         self.catalog_index_pages(&mut be, scans);
     }
 
@@ -4123,9 +4880,133 @@ impl PgHandler {
                         }
                     }
                 }
+                self.placed_effects(stmt, &mut effects);
             }
         }
         effects
+    }
+
+    /// The tables whose catalog rows the statement writes or deletes, as
+    /// `catalog_places.rs` places them: a CREATE TABLE of the shapes
+    /// measured (plain columns, PRIMARY KEY, UNIQUE and CHECK constraints,
+    /// defaults; not a temporary, partitioned, inheriting or typed table,
+    /// a serial or identity column, a foreign key or an exclusion
+    /// constraint, whose other catalog writes move rows not placed yet),
+    /// and a DROP TABLE of tables this server has.
+    fn placed_effects(&self, stmt: &N, effects: &mut Effects) {
+        match stmt {
+            N::CreateStmt(c) => {
+                let Some(rv) = c.relation.as_ref() else {
+                    return;
+                };
+                let constraint_ok = |n: &pb::Node| match n.node.as_ref() {
+                    Some(N::Constraint(k)) => {
+                        let t = k.contype;
+                        t != pb::ConstrType::ConstrForeign as i32
+                            && t != pb::ConstrType::ConstrExclusion as i32
+                            && t != pb::ConstrType::ConstrIdentity as i32
+                            && t != pb::ConstrType::ConstrGenerated as i32
+                    }
+                    _ => true,
+                };
+                let plain = rv.relpersistence != "t"
+                    && c.inh_relations.is_empty()
+                    && c.partbound.is_none()
+                    && c.partspec.is_none()
+                    && c.of_typename.is_none()
+                    && c.table_elts.iter().all(|e| match e.node.as_ref() {
+                        Some(N::ColumnDef(cd)) => {
+                            let serial = cd.type_name.as_ref().is_some_and(|t| {
+                                names_of(&t.names).len() == 1
+                                    && matches!(
+                                        names_of(&t.names)[0].as_str(),
+                                        "smallserial"
+                                            | "serial2"
+                                            | "serial"
+                                            | "serial4"
+                                            | "bigserial"
+                                            | "serial8"
+                                    )
+                            });
+                            !serial
+                                && cd.identity.is_empty()
+                                && cd.generated.is_empty()
+                                && cd.constraints.iter().all(constraint_ok)
+                        }
+                        Some(N::Constraint(_)) => constraint_ok(e),
+                        _ => false,
+                    });
+                if !plain {
+                    return;
+                }
+                let nsp = if rv.schemaname.is_empty() {
+                    Some(PUBLIC)
+                } else {
+                    self.cr_namespace_oid(&rv.schemaname)
+                };
+                // IF NOT EXISTS over a table that is there writes nothing.
+                if nsp.is_some_and(|n| self.cr_relation_in(n, &rv.relname).is_some()) {
+                    return;
+                }
+                effects
+                    .created
+                    .push((rv.schemaname.clone(), rv.relname.clone()));
+            }
+            N::DropStmt(d) if d.remove_type == pb::ObjectType::ObjectTable as i32 => {
+                for o in &d.objects {
+                    let Some(N::List(l)) = o.node.as_ref() else {
+                        continue;
+                    };
+                    let parts = names_of(&l.items);
+                    let (schema, name) = match parts.as_slice() {
+                        [name] => ("", name.as_str()),
+                        [schema, name] => (schema.as_str(), name.as_str()),
+                        _ => continue,
+                    };
+                    let nsp = if schema.is_empty() {
+                        Some(PUBLIC)
+                    } else {
+                        self.cr_namespace_oid(schema)
+                    };
+                    if let Some(rel) = nsp.and_then(|n| self.cr_relation_in(n, name)) {
+                        effects.dropped.push(rel.oid);
+                    }
+                }
+            }
+            N::CreatedbStmt(c) => {
+                // An option that sets a locale changes the row's length.
+                let plain = c.options.iter().all(|o| match o.node.as_ref() {
+                    Some(N::DefElem(d)) => !matches!(
+                        d.defname.as_str(),
+                        "locale"
+                            | "lc_collate"
+                            | "lc_ctype"
+                            | "icu_locale"
+                            | "locale_provider"
+                            | "collation_version"
+                    ),
+                    _ => false,
+                });
+                let exists = self
+                    .databases
+                    .lookup(&self.storage, &c.dbname)
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if plain && !exists {
+                    effects.created_db = Some(c.dbname.clone());
+                }
+            }
+            N::DropdbStmt(d) => {
+                effects.dropped_db = self
+                    .databases
+                    .lookup(&self.storage, &d.dbname)
+                    .ok()
+                    .flatten()
+                    .map(|d| d.oid);
+            }
+            _ => {}
+        }
     }
 
     /// The catalog reads of one statement. Walked once it has run: the
@@ -4208,7 +5089,58 @@ impl PgHandler {
     /// The statement ended: a catalog change it made reaches this backend's
     /// caches now, the others' when its transaction commits.
     pub(crate) fn catalog_reads_done(&self, effects: Effects, ok: bool) {
-        if !ok || (effects.invals.is_empty() && effects.dead.is_empty()) {
+        if !ok {
+            return;
+        }
+        let (store, pid) = self.catcache_ids();
+        let db = self.stats().db;
+        for (schema, name) in &effects.created {
+            self.place_created_table(store, db, pid, schema, name);
+        }
+        for oid in &effects.dropped {
+            crate::catalog_places::drop_group(
+                store,
+                db,
+                pid,
+                *oid,
+                &[
+                    RELATION_RELATION,
+                    TYPE_RELATION,
+                    ATTRIBUTE_RELATION,
+                    INDEX_RELATION,
+                ],
+            );
+        }
+        if let Some(name) = &effects.created_db {
+            // `createdb`'s `pg_database` row, in the cluster's one heap.
+            if let Some(oid) = self
+                .databases
+                .lookup(&self.storage, name)
+                .ok()
+                .flatten()
+                .map(|d| d.oid)
+            {
+                crate::catalog_places::write(
+                    store,
+                    db,
+                    pid,
+                    oid,
+                    &[crate::catalog_places::Write {
+                        catalog: DATABASE_RELATION,
+                        len: crate::catalog_places::DATABASE_LEN,
+                        keys: vec![
+                            (2671, vec![Bson::String(name.clone())]),
+                            (2672, vec![Bson::Int64(oid)]),
+                        ],
+                        update_of: None,
+                    }],
+                );
+            }
+        }
+        if let Some(oid) = effects.dropped_db {
+            crate::catalog_places::drop_database(store, pid, oid);
+        }
+        if effects.invals.is_empty() && effects.dead.is_empty() {
             return;
         }
         let mut be = self.catcache.lock().unwrap_or_else(|e| e.into_inner());
@@ -4216,9 +5148,140 @@ impl PgHandler {
         be.left_dead(effects.dead);
     }
 
+    /// The catalog rows CREATE TABLE wrote for `name`, placed as
+    /// PostgreSQL 15 writes them (`catalog_places.rs`), measured on a fresh
+    /// database: `heap_create_with_catalog`'s row type and array type in
+    /// `pg_type`, the table's `pg_class` row, its columns' `pg_attribute`
+    /// rows and then the six system columns' (`ctid` down to `tableoid`);
+    /// then, for a table that needs one, `create_toast_table`'s TOAST table
+    /// (no row type) with its three columns and its index of two, and the
+    /// HOT update of the table's `pg_class` row that sets `reltoastrelid`;
+    /// then each index of its constraints: its `pg_class` row, its columns
+    /// and its `pg_index` row. `index_update_stats` updates the `pg_class`
+    /// rows in place, which moves nothing.
+    fn place_created_table(&self, store: usize, db: i64, pid: i32, schema: &str, name: &str) {
+        use crate::catalog_places::{pg_index_len, Write, ATTRIBUTE_LEN, CLASS_LEN, TYPE_LEN};
+        let nsp = if schema.is_empty() {
+            PUBLIC
+        } else {
+            match self.cr_namespace_oid(schema) {
+                Some(n) => n,
+                None => return,
+            }
+        };
+        let Some(rel) = self.cr_relation_in(nsp, name) else {
+            return;
+        };
+        let key = if nsp == PUBLIC {
+            name.to_string()
+        } else {
+            format!("{schema}.{name}")
+        };
+        let Some(rowtype) = self
+            .composites()
+            .ok()
+            .and_then(|c| c.iter().find(|(n, _, _)| *n == key).map(|c| c.1))
+        else {
+            return;
+        };
+        let o = Bson::Int64;
+        let n = |v: &str| Bson::String(v.to_string());
+        let class = |oid: i64, relname: &str| Write {
+            catalog: RELATION_RELATION,
+            len: CLASS_LEN,
+            keys: vec![
+                (2662, vec![o(oid)]),
+                (2663, vec![n(relname), o(nsp)]),
+                (3455, vec![o(0), o(oid)]),
+            ],
+            update_of: None,
+        };
+        let attribute = |rel: i64, attnum: i64, attname: &str| Write {
+            catalog: ATTRIBUTE_RELATION,
+            len: ATTRIBUTE_LEN,
+            keys: vec![
+                (2658, vec![o(rel), n(attname)]),
+                (2659, vec![o(rel), o(attnum)]),
+            ],
+            update_of: None,
+        };
+        // A TOAST table's rows: this server keeps no TOAST relation, so
+        // nothing looks them up; they take their space.
+        let unkeyed = |catalog: i64, len: u32| Write {
+            catalog,
+            len,
+            keys: Vec::new(),
+            update_of: None,
+        };
+        const SYSTEM: [(i64, &str); 6] = [
+            (-1, "ctid"),
+            (-2, "xmin"),
+            (-3, "cmin"),
+            (-4, "xmax"),
+            (-5, "cmax"),
+            (-6, "tableoid"),
+        ];
+        let mut w = vec![
+            Write {
+                catalog: TYPE_RELATION,
+                len: TYPE_LEN,
+                keys: vec![(2703, vec![o(rowtype)]), (2704, vec![n(name), o(nsp)])],
+                update_of: None,
+            },
+            Write {
+                catalog: TYPE_RELATION,
+                len: TYPE_LEN,
+                keys: vec![
+                    (
+                        2703,
+                        vec![o(rowtype + secantus_pgplan::USER_TYPE_ARRAY_OID_OFFSET)],
+                    ),
+                    (2704, vec![n(&format!("_{name}")), o(nsp)]),
+                ],
+                update_of: None,
+            },
+            class(rel.oid, name),
+        ];
+        let table_row = w.len() - 1;
+        for (attnum, attname, _) in &rel.columns {
+            w.push(attribute(rel.oid, *attnum, attname));
+        }
+        for (attnum, attname) in SYSTEM {
+            w.push(attribute(rel.oid, attnum, attname));
+        }
+        if rel.toast {
+            w.push(unkeyed(RELATION_RELATION, CLASS_LEN));
+            for _ in 0..3 + SYSTEM.len() {
+                w.push(unkeyed(ATTRIBUTE_RELATION, ATTRIBUTE_LEN));
+            }
+            w.push(unkeyed(RELATION_RELATION, CLASS_LEN));
+            w.push(unkeyed(ATTRIBUTE_RELATION, ATTRIBUTE_LEN));
+            w.push(unkeyed(ATTRIBUTE_RELATION, ATTRIBUTE_LEN));
+            w.push(unkeyed(INDEX_RELATION, pg_index_len(2)));
+            w.push(Write {
+                update_of: Some((table_row, true)),
+                ..class(rel.oid, name)
+            });
+        }
+        for ix in &rel.indexes {
+            w.push(class(ix.oid, &ix.name));
+            for (i, attname) in ix.attnames.iter().enumerate() {
+                w.push(attribute(ix.oid, i as i64 + 1, attname));
+            }
+            w.push(Write {
+                catalog: INDEX_RELATION,
+                len: pg_index_len(ix.natts as u32),
+                keys: vec![(2678, vec![o(rel.oid)]), (2679, vec![o(ix.oid)])],
+                update_of: None,
+            });
+        }
+        crate::catalog_places::write(store, db, pid, rel.oid, &w);
+    }
+
     /// The transaction ended.
     pub(crate) fn catcache_end_xact(&self, commit: bool) {
         let (store, pid) = self.catcache_ids();
+        crate::catalog_places::end_xact(store, pid, commit);
         self.catcache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -4235,6 +5298,15 @@ pub(crate) struct Effects {
     pub(crate) dead: Vec<(i64, Key)>,
     /// The relations an ALTER TABLE changes, as they stand before it.
     pub(crate) pre: Vec<Rel>,
+    /// The tables a CREATE TABLE makes whose catalog rows are placed
+    /// (`catalog_places.rs`): each one's schema, if named, and name.
+    pub(crate) created: Vec<(String, String)>,
+    /// The tables a DROP TABLE deletes, by oid.
+    pub(crate) dropped: Vec<i64>,
+    /// The database a CREATE DATABASE makes, and the one a DROP DATABASE
+    /// deletes (its oid).
+    pub(crate) created_db: Option<String>,
+    pub(crate) dropped_db: Option<i64>,
 }
 
 /// A statement's text with each literal replaced by a representative of

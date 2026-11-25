@@ -123,6 +123,19 @@ step ruff-format uvx ruff@0.15.20 format --check .
 # another lane had reserved passed this gate and went red in CI a cycle
 # later on snapshot PR #2580 (2026-11-09).
 step backlog-ids "$py" tools/backlog.py check-ids --file backlog-rust-postgres.md
+# The repo's guard tests: every test file that needs a binary runs in some CI
+# job, backlog markers and changelog fragments are well formed, no build
+# output is tracked. They read files only (seconds), and CI runs them only in
+# its `test` job, which nothing above stands in for: RP-1046 added a test file
+# no workflow named, and it went red on snapshot PR #2992 a cycle later
+# (2026-11-25). They run before `pgbuild`, while the binary may still be the
+# previous commit's: they read no artifact, so the provenance abort is
+# lifted for this step alone.
+step guards env SECANTUS_ALLOW_STALE_ARTIFACT=1 "$py" -m pytest -q -n 3 -p no:cacheprovider \
+    tests/test_backlog_ids.py tests/test_backlog_markers.py \
+    tests/test_backlog_platform.py tests/test_changelog_fragments.py \
+    tests/test_changelog.py tests/test_ci_pg_needed.py \
+    tests/test_ci_runs_rust_server_tests.py tests/test_no_tracked_build_output.py
 if [[ $failed -ne 0 ]]; then
     echo "    a cheap check failed: fix it and rerun the gate (nothing slower ran)"
     summary

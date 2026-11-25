@@ -25,6 +25,24 @@ thread_local! {
     /// their InitPlan order: each prints as `$n` (RP-440).
     static INIT_PLANS: std::cell::RefCell<Vec<pg_query::protobuf::SubLink>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The query levels being probed for a Var of their own, each with
+    /// whether a column reference has resolved to it yet: what
+    /// `contain_vars_of_level(rexpr, 0)` asks of an IN list's member
+    /// (RP-1047). A stack, as a member's sublink can hold an IN list too.
+    static VAR_PROBES: std::cell::RefCell<Vec<(usize, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A column reference resolved to query level `scope`: mark every probe of
+/// that level.
+fn note_var_level(scope: usize) {
+    VAR_PROBES.with(|p| {
+        for (level, hit) in p.borrow_mut().iter_mut() {
+            if *level == scope {
+                *hit = true;
+            }
+        }
+    });
 }
 
 /// Run `f` with `plans` printing as their InitPlans' parameters.
@@ -214,6 +232,46 @@ struct Printer<'a> {
     /// EXPLAIN's deparse context carries no window clauses, so a window
     /// call prints its window as `(?)` (`get_windowfunc_expr`).
     explain_windows: bool,
+    /// A set operation's leaf: the column types its parent resolved, which
+    /// an untyped literal of the leaf's select list takes in place
+    /// (`transformSetOperationTree`).
+    leaf_types: Option<Vec<String>>,
+}
+
+/// An IN list as `transformAExprIn` builds it (RP-1047).
+struct InShape {
+    /// The ScalarArrayOpExpr's members and their common type.
+    array: Option<(Vec<Node>, String)>,
+    /// The members compared one at a time, after the array.
+    rest: Vec<Node>,
+}
+
+impl InShape {
+    /// The comparisons the BoolExpr chain joins.
+    fn terms(&self) -> usize {
+        self.rest.len() + usize::from(self.array.is_some())
+    }
+}
+
+/// One member's comparison of an IN list: `l = x` (`l <> x` for NOT IN),
+/// resolved as `make_op` resolves a written one.
+fn in_term(e: &pg_query::protobuf::AExpr, x: Node) -> Node {
+    let mut op = e.clone();
+    op.kind = AExprKind::AexprOp as i32;
+    op.rexpr = Some(Box::new(x));
+    Node {
+        node: Some(N::AExpr(Box::new(op))),
+    }
+}
+
+/// The BoolExpr an IN list's comparisons are joined by: OR, or for NOT IN
+/// (`<>`) AND.
+fn in_chain_type(e: &pg_query::protobuf::AExpr) -> BoolExprType {
+    if crate::operator_name(e).is_ok_and(|op| op == "=") {
+        BoolExprType::OrExpr
+    } else {
+        BoolExprType::AndExpr
+    }
 }
 
 /// What a sub-expression is printed inside, for `isSimpleNode`.
@@ -453,6 +511,7 @@ impl<'a> Printer<'a> {
             legacy_joins: false,
             written_alias: std::rc::Rc::default(),
             explain_windows: false,
+            leaf_types: None,
         }
     }
 
@@ -525,7 +584,21 @@ impl<'a> Printer<'a> {
             return Some(
                 def.columns
                     .iter()
-                    .map(|c| (c.name.clone(), base_type(&c.pg_type)))
+                    .map(|c| {
+                        // A column over an `information_schema` domain is
+                        // typed as the domain, which an operator over it
+                        // relabels to its base (`(t.cn)::integer > 2`).
+                        let ty = c
+                            .extra
+                            .get_str("domain_type")
+                            .ok()
+                            .and_then(information_schema_domain)
+                            .map_or_else(
+                                || base_type(&c.pg_type),
+                                |(d, _)| format!("information_schema.{d}"),
+                            );
+                        (c.name.clone(), ty)
+                    })
                     .collect(),
             );
         }
@@ -554,17 +627,24 @@ impl<'a> Printer<'a> {
             return None;
         }
         let rel = sval(rel)?;
-        self.scopes.iter().rev().find_map(|scope| {
-            scope
-                .iter()
-                .find(|r| {
-                    r.kind == RteKind::Relation
-                        && r.hidden_by.is_none()
-                        && !r.name.is_empty()
-                        && r.name == rel
-                })
-                .map(|r| (r.refname.clone(), r.name.clone()))
-        })
+        self.scopes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(si, scope)| {
+                scope
+                    .iter()
+                    .find(|r| {
+                        r.kind == RteKind::Relation
+                            && r.hidden_by.is_none()
+                            && !r.name.is_empty()
+                            && r.name == rel
+                    })
+                    .map(|r| {
+                        note_var_level(si);
+                        (r.refname.clone(), r.name.clone())
+                    })
+            })
     }
 
     fn resolve(&self, fields: &[String]) -> Option<(String, String, String)> {
@@ -574,6 +654,12 @@ impl<'a> Printer<'a> {
 
     /// The entry a column reference names: `(scope, entry, column)`.
     fn lookup(&self, fields: &[String]) -> Option<(usize, usize, usize)> {
+        let found = self.lookup_entry(fields)?;
+        note_var_level(found.0);
+        Some(found)
+    }
+
+    fn lookup_entry(&self, fields: &[String]) -> Option<(usize, usize, usize)> {
         if let [mark, scope, rte, col] = fields {
             if mark == VAR_MARK {
                 return Some((scope.parse().ok()?, rte.parse().ok()?, col.parse().ok()?));
@@ -740,7 +826,12 @@ impl<'a> Printer<'a> {
                                 return Some(result.into());
                             }
                         }
-                        Self::arith_result(&op, &l, &r)?.2
+                        // A domain operand resolves on its base type.
+                        let base = |t: String| match information_schema_domain(&t) {
+                            Some((_, b)) => b.to_string(),
+                            None => t,
+                        };
+                        Self::arith_result(&op, &base(l), &base(r))?.2
                     }
                     AExprKind::AexprLike
                     | AExprKind::AexprIlike
@@ -772,8 +863,12 @@ impl<'a> Printer<'a> {
                         .collect::<Option<Vec<String>>>()?;
                     return crate::funcsig::selected_result_type(&name, &types)
                         .or_else(|| crate::funcsig::resolved_result_type(&name, &types))
+                        .or_else(|| crate::funcsig::session_reader_result_type(&name, types.len()))
                         .or_else(|| {
-                            crate::funcsig::session_reader_result_type(&name, types.len())
+                            types
+                                .is_empty()
+                                .then(|| crate::funcsig::zero_arg_result_type(&name))
+                                .flatten()
                         });
                 };
                 match result {
@@ -868,6 +963,13 @@ impl<'a> Printer<'a> {
                 format!("{t}[]")
             }
             // `arr[i]`: the element type (a slice keeps the array's).
+            N::AIndirection(ind) if field_of_call(ind).is_some() => {
+                let (fname, nargs, field) = field_of_call(ind)?;
+                crate::builtin_out_columns(&fname, nargs)?
+                    .into_iter()
+                    .find(|(c, _)| *c == field)?
+                    .1
+            }
             N::AIndirection(ind) => {
                 let t = self.typ(ind.arg.as_deref()?)?;
                 let elem = t.strip_suffix("[]")?.to_string();
@@ -964,6 +1066,27 @@ impl<'a> Printer<'a> {
             let lt = if l == meet { "" } else { meet };
             let rt = if r == meet { "" } else { meet };
             return Some((lt.into(), rt.into(), meet.into()));
+        }
+        // The integer bitwise operators exist per width only (`int4and`
+        // ...): mixed widths meet at the wider, which the narrower side is
+        // cast to; an untyped literal takes the other side's type.
+        if matches!(op, "&" | "|" | "#") {
+            let rank = |t: &str| match t {
+                "int2" => Some(0),
+                "int4" => Some(1),
+                "int8" => Some(2),
+                _ => None,
+            };
+            if r == "unknown" && rank(l).is_some() {
+                return Some((String::new(), l.into(), l.into()));
+            }
+            if l == "unknown" && rank(r).is_some() {
+                return Some((r.into(), String::new(), r.into()));
+            }
+            let wide = if rank(l)? >= rank(r)? { l } else { r };
+            let lt = if l == wide { "" } else { wide };
+            let rt = if r == wide { "" } else { wide };
+            return Some((lt.into(), rt.into(), wide.into()));
         }
         if matches!(op, "+" | "-" | "*" | "/" | "%") {
             if let Some((meet, cast)) = numeric_meet(l, r) {
@@ -1076,6 +1199,14 @@ impl<'a> Printer<'a> {
         if l == "oid" && is_int(r) {
             return Some((String::new(), "oid".into()));
         }
+        // An `oid` meets a `reg*` alias at `oideq`, the alias relabelled
+        // to `oid`: `(d.classid = ('pg_proc'::regclass)::oid)`.
+        if l == "oid" && is_reg_alias(r) {
+            return Some((String::new(), "oid".into()));
+        }
+        if r == "oid" && is_reg_alias(l) {
+            return Some(("oid".into(), String::new()));
+        }
         if r == "oid" && is_int(l) {
             return Some(("oid".into(), String::new()));
         }
@@ -1161,6 +1292,11 @@ impl<'a> Printer<'a> {
                 }
             }
             if own != want {
+                // `eval_const_expressions` folds a relabelled `reg*`
+                // constant into an `oid` one, which is not modelled here.
+                if self.fold_consts && want == "oid" && is_reg_alias(&own) {
+                    return None;
+                }
                 if self.fold_consts && want == "oid" {
                     if let Some(N::AConst(c)) = n.node.as_ref() {
                         if let Some(Val::Ival(i)) = c.val.as_ref() {
@@ -1206,7 +1342,7 @@ impl<'a> Printer<'a> {
     }
 
     /// ruleutils' `isSimpleNode`: can `n` go inside `parent` unparenthesised?
-    fn simple(&self, n: &Node, parent: Parent<'_>) -> bool {
+    fn simple(&mut self, n: &Node, parent: Parent<'_>) -> bool {
         // The parents under which an operator-like node needs none.
         let group = |parent: Parent<'_>| matches!(parent, Parent::Bool(_));
         match n.node.as_ref() {
@@ -1239,6 +1375,23 @@ impl<'a> Printer<'a> {
             {
                 false
             }
+            // A row `=` (`<>`) of several fields is an AND (OR) of the
+            // pairs (`make_row_comparison_op`).
+            Some(N::AExpr(e))
+                if matches!(
+                    (
+                        e.lexpr.as_deref().and_then(|x| x.node.as_ref()),
+                        e.rexpr.as_deref().and_then(|x| x.node.as_ref())
+                    ),
+                    (Some(N::RowExpr(l)), Some(N::RowExpr(_))) if l.args.len() > 1
+                ) && e.kind == AExprKind::AexprOp as i32 =>
+            {
+                match crate::operator_name(e).unwrap_or("") {
+                    "=" => bool_simple(BoolExprType::AndExpr, parent),
+                    "<>" | "!=" => bool_simple(BoolExprType::OrExpr, parent),
+                    _ => false,
+                }
+            }
             Some(N::AExpr(e)) => match AExprKind::try_from(e.kind) {
                 Ok(AExprKind::AexprNullif) => true,
                 Ok(AExprKind::AexprOp | AExprKind::AexprLike | AExprKind::AexprIlike) => {
@@ -1257,13 +1410,20 @@ impl<'a> Printer<'a> {
                     group(parent)
                 }
                 Ok(AExprKind::AexprDistinct) => group(parent),
-                // A one-element IN is the plain operator.
-                Ok(AExprKind::AexprIn)
-                    if matches!(e.rexpr.as_deref().and_then(|r| r.node.as_ref()),
-                        Some(N::List(l)) if l.items.len() == 1) =>
-                {
-                    group(parent)
-                }
+                // An IN list is what `transformAExprIn` made of it: a
+                // BoolExpr of several comparisons, a lone ScalarArrayOpExpr
+                // (simple under nothing), or one plain operator.
+                Ok(AExprKind::AexprIn) => match self.in_shape(e) {
+                    Some(shape) if shape.terms() > 1 => bool_simple(in_chain_type(e), parent),
+                    Some(InShape { array: None, rest }) => match rest.as_slice() {
+                        [only] => {
+                            let term = in_term(e, only.clone());
+                            self.simple(&term, parent)
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                },
                 Ok(AExprKind::AexprNotDistinct) => bool_simple(BoolExprType::NotExpr, parent),
                 Ok(AExprKind::AexprSimilar) => group(parent),
                 Ok(AExprKind::AexprBetweenSym) => bool_simple(BoolExprType::OrExpr, parent),
@@ -1313,15 +1473,18 @@ impl<'a> Printer<'a> {
                             self.buf.push_str(b);
                         }
                         // A `regtype` constant prints as `regtypeout` does,
-                        // the type's canonical name (`'int4'` is `'integer'`).
-                        "regtype" => {
+                        // the type's canonical name (`'int4'` is `'integer'`);
+                        // a `regclass` one as `regclassout`, qualified only
+                        // when the search path does not find it
+                        // (`'pg_catalog.pg_proc'` is `'pg_proc'`).
+                        "regtype" | "regclass" => {
                             let v = crate::cast_value(bson::Bson::String(lit.clone()), t).ok()?;
                             let text = match crate::cast_value(v, "text").ok()? {
                                 bson::Bson::String(text) => text,
                                 _ => return None,
                             };
                             self.buf
-                                .push_str(&format!("{}::regtype", simple_quote_literal(&text)));
+                                .push_str(&format!("{}::{t}", simple_quote_literal(&text)));
                         }
                         // A date / time constant prints in its type's output
                         // form (`'2020-01-01 00:00:00'::timestamp ...`).
@@ -1520,6 +1683,32 @@ impl<'a> Printer<'a> {
                 // The analyser flattens nested ANDs (and ORs).
                 let mut flat = Vec::new();
                 flatten_bool(b, op, &mut flat);
+                // The planner flattens an IN list's chain of the same kind
+                // into it too (`simplify_or_arguments` / `_and_`).
+                let flat: Vec<std::borrow::Cow<'_, Node>> = if self.fold_consts {
+                    let mut out = Vec::with_capacity(flat.len());
+                    for a in flat {
+                        match a.node.as_ref() {
+                            Some(N::AExpr(e))
+                                if e.kind == AExprKind::AexprIn as i32
+                                    && in_chain_type(e) == op =>
+                            {
+                                match self.in_shape(e) {
+                                    Some(shape) if shape.terms() > 1 => out.extend(
+                                        self.in_terms(e, shape)
+                                            .into_iter()
+                                            .map(std::borrow::Cow::Owned),
+                                    ),
+                                    _ => out.push(std::borrow::Cow::Borrowed(a)),
+                                }
+                            }
+                            _ => out.push(std::borrow::Cow::Borrowed(a)),
+                        }
+                    }
+                    out
+                } else {
+                    flat.into_iter().map(std::borrow::Cow::Borrowed).collect()
+                };
                 if open {
                     self.buf.push('(');
                 }
@@ -1594,6 +1783,15 @@ impl<'a> Printer<'a> {
                 }
                 self.buf.push(']');
             }
+            // A FieldSelect: the argument always parenthesised, as
+            // ruleutils does unless it is a subscript or another field.
+            N::AIndirection(ind) if field_of_call(ind).is_some() => {
+                let (_, _, field) = field_of_call(ind)?;
+                self.typ(n)?;
+                self.buf.push('(');
+                self.expr(ind.arg.as_deref()?)?;
+                self.buf.push_str(&format!(").{}", q(&field)));
+            }
             N::AIndirection(ind) => {
                 let arg = ind.arg.as_deref()?;
                 self.typ(n)?;
@@ -1644,6 +1842,22 @@ impl<'a> Printer<'a> {
         Some(())
     }
 
+    /// The types a binary operator's operands are coerced to, `""` where
+    /// one keeps its own: a comparison, a pattern match, else arithmetic.
+    fn operator_coercion(op: &str, lt: &str, rt: &str) -> Option<(String, String)> {
+        if matches!(op, "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=") {
+            Self::compare_coercion(lt, rt)
+        } else if matches!(
+            op,
+            "~~" | "!~~" | "~~*" | "!~~*" | "~" | "~*" | "!~" | "!~*"
+        ) {
+            Self::string_match_coercion(lt, rt)
+        } else {
+            let (a, b, _) = Self::arith_result(op, lt, rt)?;
+            Some((a, b))
+        }
+    }
+
     /// An operator expression: parenthesised unless pretty.
     fn binary(&mut self, l: &Node, lw: &str, op: &str, r: &Node, rw: &str) -> Option<()> {
         let open = !self.pretty;
@@ -1687,14 +1901,27 @@ impl<'a> Printer<'a> {
                     return self.row_compare(&op, &lr.args, &rr.args);
                 }
                 let (lt, rt) = (self.typ(l)?, self.typ(r)?);
-                // An operator over a domain resolves on its base type and
-                // coerces the operand (`(x)::text = 'YES'::text`), which
-                // this printer does not model: refuse rather than print it
-                // over the domain.
-                if information_schema_domain(&lt).is_some()
-                    || information_schema_domain(&rt).is_some()
-                {
-                    return None;
+                // An operator over a domain resolves on its base type
+                // (`binary_oper_exact`, `func_select_candidate` reduce a
+                // domain to its base), and `make_fn_arguments` relabels
+                // the operand to the operator's input type, which
+                // `get_oper_expr` shows: `(x)::text = 'YES'::text`, and
+                // `(x)::integer` even when the base is already the input.
+                let (ld, rd) = (
+                    information_schema_domain(&lt).map(|(_, b)| b),
+                    information_schema_domain(&rt).map(|(_, b)| b),
+                );
+                if ld.is_some() || rd.is_some() {
+                    let lb = ld.map_or(lt.clone(), str::to_string);
+                    let rb = rd.map_or(rt.clone(), str::to_string);
+                    let (lw, rw) = Self::operator_coercion(&op, &lb, &rb)?;
+                    let relabel = |w: String, dom: Option<&str>| match (w.is_empty(), dom) {
+                        (true, Some(b)) => b.to_string(),
+                        _ => w,
+                    };
+                    let (lw, rw) = (relabel(lw, ld), relabel(rw, rd));
+                    let op = if op == "!=" { "<>".to_string() } else { op };
+                    return self.binary(l, &lw, &op, r, &rw);
                 }
                 // Array containment / overlap: same element types, no cast.
                 if matches!(op.as_str(), "@>" | "<@" | "&&") && is_array(&lt) && is_array(&rt) {
@@ -1722,18 +1949,7 @@ impl<'a> Printer<'a> {
                     let rw = if rt == want { "" } else { want };
                     return self.binary(l, "", &op, r, rw);
                 }
-                let (lw, rw) = if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=")
-                {
-                    Self::compare_coercion(&lt, &rt)?
-                } else if matches!(
-                    op.as_str(),
-                    "~~" | "!~~" | "~~*" | "!~~*" | "~" | "~*" | "!~" | "!~*"
-                ) {
-                    Self::string_match_coercion(&lt, &rt)?
-                } else {
-                    let (a, b, _) = Self::arith_result(&op, &lt, &rt)?;
-                    (a, b)
-                };
+                let (lw, rw) = Self::operator_coercion(&op, &lt, &rt)?;
                 let op = if op == "!=" { "<>".to_string() } else { op };
                 self.binary(l, &lw, &op, r, &rw)?;
             }
@@ -1753,77 +1969,44 @@ impl<'a> Printer<'a> {
             }
             AExprKind::AexprIn => {
                 let op = crate::operator_name(e).ok()?.to_string();
-                let l = e.lexpr.as_deref()?;
-                let Some(N::List(list)) = e.rexpr.as_deref().and_then(|r| r.node.as_ref()) else {
-                    return None;
-                };
-                let lt = self.typ(l)?;
-                // One element: the plain operator (`transformAExprIn`).
-                if let [only] = list.items.as_slice() {
-                    let (lw, rw) = Self::compare_coercion(&lt, &self.typ(only)?)?;
-                    let word = if op == "=" { "=" } else { "<>" };
-                    return self.binary(l, &lw, word, only, &rw);
+                let shape = self.in_shape(e)?;
+                if shape.terms() == 1 {
+                    if let Some((items, common)) = &shape.array {
+                        return self.in_array(e.lexpr.as_deref()?, &op, items, common);
+                    }
+                    return self.expr(&in_term(e, shape.rest.first()?.clone()));
                 }
-                let mut all = vec![l.clone()];
-                all.extend(list.items.iter().cloned());
-                let common = self.common_type(&all)?;
-                // The integer comparison operators take mixed widths
-                // (`int24eq`): an integer left side keeps its own type.
-                let lw = if lt == common || (is_int(&lt) && is_int(&common)) {
-                    String::new()
+                // `makeBoolExpr` of two at a time, left to right: each OR
+                // (AND) a BoolExpr of its own, parenthesised unless pretty,
+                // where none needs it under another of its kind. The
+                // planned expression EXPLAIN prints has them flattened to
+                // one (`simplify_or_arguments` / `_and_`).
+                let chain = in_chain_type(e);
+                let word = if chain == BoolExprType::OrExpr {
+                    " OR "
                 } else {
-                    common.clone()
+                    " AND "
                 };
-                let (word, quant) = if op == "=" {
-                    ("=", "ANY")
-                } else {
-                    ("<>", "ALL")
-                };
-                // varchar has no `=` of its own: the operator is text's, so
-                // the column and the whole array are cast to text. `name`
-                // has `nameeq` / `namene` and keeps its type.
-                let via_text = common == "varchar";
-                let lw = if via_text { "text".to_string() } else { lw };
+                let terms = self.in_terms(e, shape);
                 let open = !self.pretty;
-                if open {
+                let opens = match (open, self.fold_consts) {
+                    (false, _) => 0,
+                    (true, true) => 1,
+                    (true, false) => terms.len() - 1,
+                };
+                for _ in 0..opens {
                     self.buf.push('(');
                 }
-                self.child(l, &lw, Parent::Other)?;
-                self.buf.push_str(&format!(" {word} {quant} ("));
-                // `eval_const_expressions` folds an ARRAY of constants (and
-                // varchar's coercion of it to text[]) to one array constant,
-                // printed as its `array_out` text (RP-348).
-                if self.fold_consts {
-                    let elem = if via_text { "text" } else { common.as_str() };
-                    if let Some(lit) = folded_array_literal(&list.items, elem) {
-                        self.buf.push_str(&lit);
-                        self.buf.push_str(&format!("::{}[]", display_type(elem)));
-                        self.buf.push(')');
-                        if open {
-                            self.buf.push(')');
-                        }
-                        return Some(());
-                    }
-                }
-                if via_text && open {
-                    self.buf.push('(');
-                }
-                self.buf.push_str("ARRAY[");
-                for (i, x) in list.items.iter().enumerate() {
+                for (i, t) in terms.iter().enumerate() {
                     if i > 0 {
-                        self.buf.push_str(", ");
+                        self.buf.push_str(word);
                     }
-                    self.expr_as(x, &common)?;
-                }
-                self.buf.push(']');
-                if via_text {
-                    if open {
+                    self.child(t, "", Parent::Bool(chain))?;
+                    if i > 0 && open && !self.fold_consts {
                         self.buf.push(')');
                     }
-                    self.buf.push_str("::text[]");
                 }
-                self.buf.push(')');
-                if open {
+                if open && self.fold_consts {
                     self.buf.push(')');
                 }
             }
@@ -1982,6 +2165,174 @@ impl<'a> Printer<'a> {
     /// `ROW(a, b) op ROW(c, d)`: `=` is the AND of the pairs' equalities,
     /// `<>` the OR of their inequalities (the parser expands both), and an
     /// ordering operator stays a row comparison.
+    /// `transformAExprIn`'s reading of `l IN (...)` (RP-1047): the members
+    /// holding no Var of this query, when there are more than one and their
+    /// common type with `l` has an array type (not a row, a record or an
+    /// array), become one ScalarArrayOpExpr over that type; every other
+    /// member, in the list's order, is a comparison of its own, ORed (for
+    /// NOT IN, ANDed) after it.
+    fn in_shape(&mut self, e: &pg_query::protobuf::AExpr) -> Option<InShape> {
+        let l = e.lexpr.as_deref()?;
+        let Some(N::List(list)) = e.rexpr.as_deref().and_then(|r| r.node.as_ref()) else {
+            return None;
+        };
+        let mut has_var = Vec::with_capacity(list.items.len());
+        for x in &list.items {
+            has_var.push(self.has_own_var(x)?);
+        }
+        let nonvars: Vec<Node> = list
+            .items
+            .iter()
+            .zip(&has_var)
+            .filter(|(_, v)| !**v)
+            .map(|(x, _)| x.clone())
+            .collect();
+        if nonvars.len() > 1 && !matches!(l.node.as_ref(), Some(N::RowExpr(_))) {
+            let mut all = vec![l.clone()];
+            all.extend(nonvars.iter().cloned());
+            let common = self.common_type(&all)?;
+            if !is_array(&common) && common != "record" {
+                let rest = list
+                    .items
+                    .iter()
+                    .zip(&has_var)
+                    .filter(|(_, v)| **v)
+                    .map(|(x, _)| x.clone())
+                    .collect();
+                return Some(InShape {
+                    array: Some((nonvars, common)),
+                    rest,
+                });
+            }
+        }
+        Some(InShape {
+            array: None,
+            rest: list.items.clone(),
+        })
+    }
+
+    /// The comparisons an IN list of several terms chains, as nodes of
+    /// their own: the array of its non-Var members first, as an IN list of
+    /// only those, then an operator expression per other member.
+    fn in_terms(&self, e: &pg_query::protobuf::AExpr, shape: InShape) -> Vec<Node> {
+        let mut out = Vec::with_capacity(shape.terms());
+        if let Some((items, _)) = shape.array {
+            let mut only = e.clone();
+            only.rexpr = Some(Box::new(Node {
+                node: Some(N::List(pg_query::protobuf::List { items })),
+            }));
+            out.push(Node {
+                node: Some(N::AExpr(Box::new(only))),
+            });
+        }
+        out.extend(shape.rest.into_iter().map(|x| in_term(e, x)));
+        out
+    }
+
+    /// `contain_vars_of_level(n, 0)`: whether `n` reads a column of the
+    /// query being printed, counting a correlated reference from inside
+    /// one of its sublinks and not a reference to an enclosing query.
+    /// Found by printing `n` and noting where its columns resolve; `None`
+    /// where `n` does not print.
+    fn has_own_var(&mut self, n: &Node) -> Option<bool> {
+        let column = |n: &Node| {
+            matches!(n.node.as_ref(), Some(N::ColumnRef(_)))
+                || n.node.as_ref().is_some_and(|x| {
+                    x.nodes()
+                        .iter()
+                        .any(|(r, _, _, _)| matches!(r, pg_query::NodeRef::ColumnRef(_)))
+                })
+        };
+        if !column(n) {
+            return Some(false);
+        }
+        // A row prints only as an operand: probe its fields.
+        if let Some(N::RowExpr(r)) = n.node.as_ref() {
+            for a in &r.args {
+                if self.has_own_var(a)? {
+                    return Some(true);
+                }
+            }
+            return Some(false);
+        }
+        let level = self.scopes.len().checked_sub(1)?;
+        VAR_PROBES.with(|p| p.borrow_mut().push((level, false)));
+        let mark = self.buf.len();
+        let printed = self.child(n, "", Parent::Other);
+        self.buf.truncate(mark);
+        let hit = VAR_PROBES
+            .with(|p| p.borrow_mut().pop())
+            .is_some_and(|(_, hit)| hit);
+        printed?;
+        Some(hit)
+    }
+
+    /// The ScalarArrayOpExpr of an IN list's non-Var members, coerced to
+    /// their common type `common` (`make_scalar_array_op`).
+    fn in_array(&mut self, l: &Node, op: &str, items: &[Node], common: &str) -> Option<()> {
+        let lt = self.typ(l)?;
+        // The integer comparison operators take mixed widths
+        // (`int24eq`): an integer left side keeps its own type.
+        let lw = if lt == common || (is_int(&lt) && is_int(common)) {
+            String::new()
+        } else {
+            common.to_string()
+        };
+        let (word, quant) = if op == "=" {
+            ("=", "ANY")
+        } else {
+            ("<>", "ALL")
+        };
+        // varchar has no `=` of its own: the operator is text's, so
+        // the column and the whole array are cast to text. `name`
+        // has `nameeq` / `namene` and keeps its type.
+        let via_text = common == "varchar";
+        let lw = if via_text { "text".to_string() } else { lw };
+        let open = !self.pretty;
+        if open {
+            self.buf.push('(');
+        }
+        self.child(l, &lw, Parent::Other)?;
+        self.buf.push_str(&format!(" {word} {quant} ("));
+        // `eval_const_expressions` folds an ARRAY of constants (and
+        // varchar's coercion of it to text[]) to one array constant,
+        // printed as its `array_out` text (RP-348).
+        if self.fold_consts {
+            let elem = if via_text { "text" } else { common };
+            if let Some(lit) = folded_array_literal(items, elem) {
+                self.buf.push_str(&lit);
+                self.buf.push_str(&format!("::{}[]", display_type(elem)));
+                self.buf.push(')');
+                if open {
+                    self.buf.push(')');
+                }
+                return Some(());
+            }
+        }
+        if via_text && open {
+            self.buf.push('(');
+        }
+        self.buf.push_str("ARRAY[");
+        for (i, x) in items.iter().enumerate() {
+            if i > 0 {
+                self.buf.push_str(", ");
+            }
+            self.expr_as(x, common)?;
+        }
+        self.buf.push(']');
+        if via_text {
+            if open {
+                self.buf.push(')');
+            }
+            self.buf.push_str("::text[]");
+        }
+        self.buf.push(')');
+        if open {
+            self.buf.push(')');
+        }
+        Some(())
+    }
+
     fn row_compare(&mut self, op: &str, l: &[Node], r: &[Node]) -> Option<()> {
         if l.len() != r.len() || l.is_empty() {
             return None;
@@ -2436,7 +2787,9 @@ impl<'a> Printer<'a> {
                 if i > 0 {
                     self.buf.push_str(", ");
                 }
-                self.expr(p)?;
+                // `get_rule_windowspec` prints each through
+                // `get_rule_sortgroupclause`, as ORDER BY items are.
+                self.sort_expr(p)?;
             }
             need_space = true;
         }
@@ -2641,12 +2994,21 @@ impl<'a> Printer<'a> {
                 let op = names_.last().map(String::as_str).unwrap_or("=");
                 let lt = self.typ(test)?;
                 let cols = self.subquery_columns(sub)?;
-                let (lw, _) = Self::compare_coercion(&lt, &cols.first()?.1)?;
-                if !lw.is_empty() {
-                    return None;
-                }
+                // A domain resolves the operator on its base type, the
+                // test expression relabelled to the operator's input,
+                // which `get_sublink_expr` shows (`(x)::name IN (...)`).
+                let base = |t: &str| information_schema_domain(t).map(|(_, b)| b);
+                let (ld, rd) = (base(&lt), base(&cols.first()?.1));
+                let (lw, _) =
+                    Self::compare_coercion(ld.unwrap_or(&lt), rd.unwrap_or(&cols.first()?.1))?;
+                let lw = match (lw.is_empty(), ld) {
+                    (true, Some(b)) => b.to_string(),
+                    (true, None) => lw,
+                    (false, _) if ld.is_some() => lw,
+                    (false, _) => return None,
+                };
                 self.buf.push('(');
-                self.expr(test)?;
+                self.expr_as(test, &lw)?;
                 if kind == SubLinkType::AllSublink {
                     self.buf.push_str(&format!(" {op} ALL ("));
                 } else if op == "=" && s.oper_name.is_empty() {
@@ -2800,6 +3162,21 @@ pub(crate) fn base_type(t: &str) -> String {
     .to_string()
 }
 
+/// `(f(...)).field` over a built-in call: `(function name, argument
+/// count, field)`.
+fn field_of_call(ind: &pg_query::protobuf::AIndirection) -> Option<(String, usize, String)> {
+    let [field] = ind.indirection.as_slice() else {
+        return None;
+    };
+    let Some(N::String(field)) = field.node.as_ref() else {
+        return None;
+    };
+    let Some(N::FuncCall(f)) = ind.arg.as_deref().and_then(|a| a.node.as_ref()) else {
+        return None;
+    };
+    Some((crate::func_name(f)?, f.args.len(), field.sval.clone()))
+}
+
 fn parse_select(sql: &str) -> Option<Node> {
     let parsed = pg_query::parse(sql).ok()?;
     let stmt = parsed.protobuf.stmts.first()?.stmt.as_deref()?.clone();
@@ -2812,9 +3189,15 @@ fn figure_colname(n: &Node) -> String {
     match n.node.as_ref() {
         Some(N::ColumnRef(c)) => names(&c.fields).pop().unwrap_or(unnamed),
         Some(N::FuncCall(f)) => names(&f.funcname).pop().unwrap_or(unnamed),
+        // A cast keeps a definite name from beneath it (strength 2) and
+        // otherwise takes its type's: `(case ... else 2 end)::int8` is `int8`.
         Some(N::TypeCast(tc)) => {
             let inner = tc.arg.as_deref().map(figure_colname).unwrap_or_default();
-            if inner != "?column?" && !inner.is_empty() {
+            let strong = tc
+                .arg
+                .as_deref()
+                .is_some_and(|a| crate::nodetostring::target::figure_colname_strength(a).1 == 2);
+            if strong && inner != "?column?" && !inner.is_empty() {
                 inner
             } else {
                 tc.type_name
@@ -2823,7 +3206,9 @@ fn figure_colname(n: &Node) -> String {
                     .unwrap_or(unnamed)
             }
         }
-        Some(N::CaseExpr(_)) => "case".into(),
+        // Its ELSE result's name when that is definite, `case` otherwise
+        // (FigureColnameInternal, RP-1046).
+        Some(N::CaseExpr(_)) => crate::nodetostring::target::figure_colname(n),
         Some(N::CoalesceExpr(_)) => "coalesce".into(),
         Some(N::MinMaxExpr(m)) => {
             if m.op == pg_query::protobuf::MinMaxOp::IsGreatest as i32 {
@@ -3299,6 +3684,36 @@ impl Printer<'_> {
                     continue;
                 }
             }
+            // `(f(...)).*` over a built-in's OUT parameters expands to one
+            // field selection per column (`ExpandRowReference`).
+            if let Some(N::AIndirection(ind)) = val.node.as_ref() {
+                if let ([star], Some(N::FuncCall(f))) = (
+                    ind.indirection.as_slice(),
+                    ind.arg.as_deref().and_then(|a| a.node.as_ref()),
+                ) {
+                    if matches!(star.node.as_ref(), Some(N::AStar(_))) {
+                        if !rt.name.is_empty() {
+                            return None;
+                        }
+                        let fname = crate::func_name(f)?;
+                        for (col, _) in crate::builtin_out_columns(&fname, f.args.len())? {
+                            let mut field = ind.clone();
+                            field.indirection = vec![Node {
+                                node: Some(N::String(pg_query::protobuf::String {
+                                    sval: col.clone(),
+                                })),
+                            }];
+                            out.push(Target {
+                                expr: Node {
+                                    node: Some(N::AIndirection(field)),
+                                },
+                                name: col,
+                            });
+                        }
+                        continue;
+                    }
+                }
+            }
             let name = if rt.name.is_empty() {
                 figure_colname(val)
             } else {
@@ -3314,6 +3729,16 @@ impl Printer<'_> {
 
     /// A query's output columns and their types.
     fn query_columns(&mut self, n: &Node) -> Option<Vec<(String, String)>> {
+        self.query_columns_resolving(n, true)
+    }
+
+    /// `query_columns`; a set operation's leaf leaves an untyped literal
+    /// `unknown` (`resolve_unknowns` false), for its parent to resolve.
+    fn query_columns_resolving(
+        &mut self,
+        n: &Node,
+        resolve_unknowns: bool,
+    ) -> Option<Vec<(String, String)>> {
         let Some(N::SelectStmt(s)) = n.node.as_ref() else {
             return None;
         };
@@ -3328,15 +3753,24 @@ impl Printer<'_> {
             }
         }
         let out = if s.op != SetOperation::SetopNone as i32 {
-            let l = self.query_columns(&Node {
-                node: Some(N::SelectStmt(s.larg.clone()?)),
-            })?;
-            let r = self.query_columns(&Node {
-                node: Some(N::SelectStmt(s.rarg.clone()?)),
-            })?;
+            let l = self.query_columns_resolving(
+                &Node {
+                    node: Some(N::SelectStmt(s.larg.clone()?)),
+                },
+                false,
+            )?;
+            let r = self.query_columns_resolving(
+                &Node {
+                    node: Some(N::SelectStmt(s.rarg.clone()?)),
+                },
+                false,
+            )?;
             let mut out = Vec::new();
             for ((ln, lt), (_, rt)) in l.into_iter().zip(r) {
-                let t = if lt == rt {
+                // Two untyped literals meet as text.
+                let t = if lt == "unknown" && rt == "unknown" {
+                    "text".into()
+                } else if lt == rt {
                     lt
                 } else if lt == "unknown" {
                     rt
@@ -3366,7 +3800,11 @@ impl Printer<'_> {
                         let ty = self.typ(&t.expr)?;
                         Some((
                             t.name.clone(),
-                            if ty == "unknown" { "text".into() } else { ty },
+                            if ty == "unknown" && resolve_unknowns {
+                                "text".into()
+                            } else {
+                                ty
+                            },
                         ))
                     })
                     .collect::<Option<Vec<_>>>()
@@ -3575,6 +4013,7 @@ impl Printer<'_> {
             inner.pretty = self.pretty;
             inner.markers = self.markers;
             inner.col_names_visible = self.col_names_visible;
+            inner.leaf_types = self.leaf_types.take();
             inner.query(
                 &Node {
                     node: Some(N::SelectStmt(Box::new(s.clone()))),
@@ -3598,7 +4037,17 @@ impl Printer<'_> {
         } else {
             0
         };
+        // This node's column types, which its leaves' untyped literals take.
+        let types: Vec<String> = self
+            .query_columns(&Node {
+                node: Some(N::SelectStmt(Box::new(s.clone()))),
+            })?
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
+        self.leaf_types = Some(types.clone());
         self.setop(larg, colnames)?;
+        self.leaf_types = None;
         if need_paren {
             self.keyword(") ", -sub, 0, 0);
         } else {
@@ -3623,7 +4072,9 @@ impl Printer<'_> {
         self.keyword("", sub, 0, 0);
         // Only the leftmost query's column names are visible outside.
         let visible = std::mem::replace(&mut self.col_names_visible, false);
+        self.leaf_types = Some(types);
         let printed = self.setop(rarg, colnames);
+        self.leaf_types = None;
         self.col_names_visible = visible;
         printed?;
         self.indent -= sub;
@@ -3643,6 +4094,7 @@ impl Printer<'_> {
         if s.group_distinct {
             return None;
         }
+        let leaf_types = self.leaf_types.take();
         if !s.values_lists.is_empty() {
             self.buf.push(' ');
             return self.values_def(s);
@@ -3676,7 +4128,12 @@ impl Printer<'_> {
             self.buf.push_str(sep);
             sep = ", ";
             let saved = std::mem::take(&mut self.buf);
-            self.expr(&t.expr)?;
+            match leaf_types.as_ref().and_then(|ts| ts.get(i)) {
+                Some(want) if self.typ(&t.expr).as_deref() == Some("unknown") => {
+                    self.expr_as(&t.expr, want)?;
+                }
+                _ => self.expr(&t.expr)?,
+            }
             let name = colnames
                 .and_then(|c| c.get(i).cloned())
                 .unwrap_or_else(|| t.name.clone());
@@ -4876,9 +5333,78 @@ pub fn and_clauses<'n>(n: &'n Node, out: &mut Vec<std::borrow::Cow<'n, Node>>) {
         }
         _ => match between_clauses(n) {
             Some(halves) => out.extend(halves.map(std::borrow::Cow::Owned)),
-            None => out.push(std::borrow::Cow::Borrowed(n)),
+            None => match not_in_clauses(n) {
+                Some(terms) => out.extend(terms.into_iter().map(std::borrow::Cow::Owned)),
+                None => out.push(std::borrow::Cow::Borrowed(n)),
+            },
         },
     }
+}
+
+/// A NOT IN list holding columns, as the AND of its comparisons that the
+/// planner flattens into a qual's conjuncts (RP-1047): its column-free
+/// members' `<> ALL` when there are several (an IN list of only those),
+/// then a `<>` per other member. Every column of an EXPLAIN qual is a Var
+/// of the query it filters. `None` for any other node, and for a member
+/// holding a sublink, whose columns may be its own.
+fn not_in_clauses(n: &Node) -> Option<Vec<Node>> {
+    let Some(N::AExpr(e)) = n.node.as_ref() else {
+        return None;
+    };
+    if e.kind != AExprKind::AexprIn as i32 || in_chain_type(e) != BoolExprType::AndExpr {
+        return None;
+    }
+    let Some(N::List(list)) = e.rexpr.as_deref().and_then(|r| r.node.as_ref()) else {
+        return None;
+    };
+    let holds = |x: &Node, f: &dyn Fn(&pg_query::NodeRef<'_>) -> bool| {
+        x.node
+            .as_ref()
+            .is_some_and(|y| f(&y.to_ref()) || y.nodes().iter().any(|(r, _, _, _)| f(r)))
+    };
+    if list
+        .items
+        .iter()
+        .any(|x| holds(x, &|r| matches!(r, pg_query::NodeRef::SubLink(_))))
+    {
+        return None;
+    }
+    let has_var: Vec<bool> = list
+        .items
+        .iter()
+        .map(|x| holds(x, &|r| matches!(r, pg_query::NodeRef::ColumnRef(_))))
+        .collect();
+    let nonvars: Vec<Node> = list
+        .items
+        .iter()
+        .zip(&has_var)
+        .filter(|(_, v)| !**v)
+        .map(|(x, _)| x.clone())
+        .collect();
+    let row = matches!(
+        e.lexpr.as_deref().and_then(|l| l.node.as_ref()),
+        Some(N::RowExpr(_))
+    );
+    let mut terms = Vec::new();
+    let rest: Vec<Node> = if nonvars.len() > 1 && !row {
+        let mut only = (**e).clone();
+        only.rexpr = Some(Box::new(Node {
+            node: Some(N::List(pg_query::protobuf::List { items: nonvars })),
+        }));
+        terms.push(Node {
+            node: Some(N::AExpr(Box::new(only))),
+        });
+        list.items
+            .iter()
+            .zip(&has_var)
+            .filter(|(_, v)| **v)
+            .map(|(x, _)| x.clone())
+            .collect()
+    } else {
+        list.items.clone()
+    };
+    terms.extend(rest.into_iter().map(|x| in_term(e, x)));
+    (terms.len() > 1).then_some(terms)
 }
 
 /// A single-relation WHERE as EXPLAIN shows it: each top-level AND conjunct
@@ -6117,20 +6643,52 @@ pub fn statistics_expr_def_pretty(sql: &str, def: &TableDef) -> Option<String> {
         ..Default::default()
     }]);
     p.expr(expr)?;
-    let function_like = matches!(
-        expr.node.as_ref(),
-        Some(
-            N::FuncCall(_)
-                | N::CoalesceExpr(_)
-                | N::MinMaxExpr(_)
-                | N::SqlvalueFunction(_)
-                | N::XmlExpr(_)
-        )
-    );
-    Some(if function_like {
+    Some(if looks_like_function(expr) {
         p.buf
     } else {
         format!("({})", p.buf)
+    })
+}
+
+/// ruleutils' `looks_like_function`: an expression that prints as a call
+/// (a function, or one of `func_expr_common_subexpr`'s COALESCE, NULLIF,
+/// GREATEST / LEAST, CURRENT_DATE-style keywords and XML forms), which a
+/// key list then shows without parentheses of its own.
+fn looks_like_function(n: &Node) -> bool {
+    match n.node.as_ref() {
+        Some(
+            N::FuncCall(_)
+            | N::CoalesceExpr(_)
+            | N::MinMaxExpr(_)
+            | N::SqlvalueFunction(_)
+            | N::XmlExpr(_),
+        ) => true,
+        Some(N::AExpr(e)) => AExprKind::try_from(e.kind) == Ok(AExprKind::AexprNullif),
+        _ => false,
+    }
+}
+
+/// A partition key expression as `pg_get_partkeydef` prints it
+/// (`pg_get_partkeydef_worker`): as `pg_get_expr` does, and in parentheses
+/// of its own unless it looks like a function call -- `((x + 1))`,
+/// `((x)::text)`, but `abs(x)`. PostgreSQL 15.19 measured. `None` for a
+/// shape [`expr_def`] does not reproduce.
+pub fn partkey_expr_def(sql: &str, def: &TableDef) -> Option<String> {
+    let node = parse_select(&format!("SELECT {sql}"))?;
+    let Some(N::SelectStmt(s)) = node.node.as_ref() else {
+        return None;
+    };
+    let [target] = s.target_list.as_slice() else {
+        return None;
+    };
+    let Some(N::ResTarget(rt)) = target.node.as_ref() else {
+        return None;
+    };
+    let printed = expr_def(sql, def)?;
+    Some(if looks_like_function(rt.val.as_deref()?) {
+        printed
+    } else {
+        format!("({printed})")
     })
 }
 
@@ -6157,6 +6715,27 @@ mod tests {
             ("name", "bpchar", "name"),
         ] {
             assert_eq!(meet_types(a, b).as_deref(), Some(want), "{a} meets {b}");
+        }
+    }
+
+    /// A partition key expression as `pg_get_partkeydef` prints it inside
+    /// its key list, each measured on PostgreSQL 15.19 (RP-1052): an
+    /// operator, cast or test in a second pair of parentheses, a call or
+    /// one of the call-like forms bare.
+    #[test]
+    fn a_partition_key_expression_prints_as_partkeydef_does() {
+        let def = TableDef::new("p", vec![Column::new("x", "int4", true)]);
+        for (key, want) in [
+            ("(x + 1)", "((x + 1))"),
+            ("(x::text)", "((x)::text)"),
+            ("(-x)", "((- x))"),
+            ("(x IS NULL)", "((x IS NULL))"),
+            ("abs(x)", "abs(x)"),
+            ("(coalesce(x, 0))", "COALESCE(x, 0)"),
+            ("(nullif(x, 0))", "NULLIF(x, 0)"),
+            ("(greatest(x, 1))", "GREATEST(x, 1)"),
+        ] {
+            assert_eq!(partkey_expr_def(key, &def).as_deref(), Some(want), "{key}");
         }
     }
 
@@ -6295,6 +6874,109 @@ mod tests {
         ];
         for (sql, want) in cases {
             assert_eq!(render(sql).as_deref(), Some(want), "{sql}");
+        }
+    }
+    /// `transformAExprIn`: one `= ANY` over the members holding no Var of
+    /// the query, when there are two or more, then an `=` per other member,
+    /// ORed (ANDed for NOT IN) two at a time; a reference to an enclosing
+    /// query is no Var of this one. Each answer measured on PostgreSQL
+    /// 15.19, plain and pretty (RP-1047).
+    #[test]
+    fn an_in_list_holding_a_column_prints_as_transform_a_expr_in_builds_it() {
+        let none = |_: &str| None;
+        let cat = Catalog {
+            lookup: &cat_lookup,
+            view_sql: &none,
+            home_schema: None,
+        };
+        let cases = [
+            (
+                "SELECT id IN (1, t_id) FROM vd_u",
+                " SELECT ((vd_u.id = 1) OR (vd_u.id = vd_u.t_id)) AS \"?column?\"\n   FROM vd_u;",
+                " SELECT vd_u.id = 1 OR vd_u.id = vd_u.t_id AS \"?column?\"\n   FROM vd_u;",
+            ),
+            (
+                "SELECT id IN (1, 2, t_id, 3) FROM vd_u",
+                " SELECT ((vd_u.id = ANY (ARRAY[1, 2, 3])) OR (vd_u.id = vd_u.t_id)) AS \"?column?\"\n   FROM vd_u;",
+                " SELECT (vd_u.id = ANY (ARRAY[1, 2, 3])) OR vd_u.id = vd_u.t_id AS \"?column?\"\n   FROM vd_u;",
+            ),
+            (
+                "SELECT id NOT IN (t_id, 1, 2) FROM vd_u",
+                " SELECT ((vd_u.id <> ALL (ARRAY[1, 2])) AND (vd_u.id <> vd_u.t_id)) AS \"?column?\"\n   FROM vd_u;",
+                " SELECT (vd_u.id <> ALL (ARRAY[1, 2])) AND vd_u.id <> vd_u.t_id AS \"?column?\"\n   FROM vd_u;",
+            ),
+            (
+                "SELECT id FROM vd_t WHERE EXISTS (SELECT 1 FROM vd_u WHERE vd_u.id IN (1, 2, vd_t.id))",
+                " SELECT vd_t.id\n   FROM vd_t\n  WHERE (EXISTS ( SELECT 1\n           FROM vd_u\n          WHERE (vd_u.id = ANY (ARRAY[1, 2, vd_t.id]))));",
+                " SELECT vd_t.id\n   FROM vd_t\n  WHERE (EXISTS ( SELECT 1\n           FROM vd_u\n          WHERE vd_u.id = ANY (ARRAY[1, 2, vd_t.id])));",
+            ),
+            (
+                "SELECT id IN (1, (SELECT max(u2.t_id) FROM vd_u u2 WHERE u2.id = vd_u.id), 2) FROM vd_u",
+                " SELECT ((vd_u.id = ANY (ARRAY[1, 2])) OR (vd_u.id = ( SELECT max(u2.t_id) AS max\n           FROM vd_u u2\n          WHERE (u2.id = vd_u.id)))) AS \"?column?\"\n   FROM vd_u;",
+                " SELECT (vd_u.id = ANY (ARRAY[1, 2])) OR vd_u.id = (( SELECT max(u2.t_id) AS max\n           FROM vd_u u2\n          WHERE u2.id = vd_u.id)) AS \"?column?\"\n   FROM vd_u;",
+            ),
+            (
+                "SELECT (id, t_id) IN ((1, 2), (t_id, 3)) FROM vd_u",
+                " SELECT (((vd_u.id = 1) AND (vd_u.t_id = 2)) OR ((vd_u.id = vd_u.t_id) AND (vd_u.t_id = 3))) AS \"?column?\"\n   FROM vd_u;",
+                " SELECT vd_u.id = 1 AND vd_u.t_id = 2 OR vd_u.id = vd_u.t_id AND vd_u.t_id = 3 AS \"?column?\"\n   FROM vd_u;",
+            ),
+            (
+                "SELECT w IN ('a', w, 'b') FROM vd_u",
+                " SELECT ((vd_u.w = ANY (ARRAY['a'::text, 'b'::text])) OR (vd_u.w = vd_u.w)) AS \"?column?\"\n   FROM vd_u;",
+                " SELECT (vd_u.w = ANY (ARRAY['a'::text, 'b'::text])) OR vd_u.w = vd_u.w AS \"?column?\"\n   FROM vd_u;",
+            ),
+            (
+                "SELECT id FROM vd_u WHERE id NOT IN (1, t_id) AND w = 'x'",
+                " SELECT vd_u.id\n   FROM vd_u\n  WHERE (((vd_u.id <> 1) AND (vd_u.id <> vd_u.t_id)) AND (vd_u.w = 'x'::text));",
+                " SELECT vd_u.id\n   FROM vd_u\n  WHERE vd_u.id <> 1 AND vd_u.id <> vd_u.t_id AND vd_u.w = 'x'::text;",
+            ),
+        ];
+        for (sql, plain, pretty) in cases {
+            assert_eq!(viewdef(sql, None, &cat).as_deref(), Some(plain), "{sql}");
+            assert_eq!(
+                viewdef_pretty(sql, None, &cat).as_deref(),
+                Some(pretty),
+                "{sql} (pretty)"
+            );
+        }
+    }
+    /// The planned IN list EXPLAIN prints: its chain flattened into one OR,
+    /// with a user OR around it, and a NOT IN's into the scan's conjuncts.
+    /// PostgreSQL 15.19, `explain (costs off)` over `t (a int, b int, c
+    /// int)` (RP-1047).
+    #[test]
+    fn a_planned_in_list_holding_a_column_is_flattened() {
+        let def = TableDef::new(
+            "t",
+            ["a", "b", "c"]
+                .into_iter()
+                .map(|c| Column::new(c, "int4", false))
+                .collect(),
+        );
+        for (sql, want) in [
+            (
+                "select 1 from t where a in (1, b, c)",
+                vec!["((a = 1) OR (a = b) OR (a = c))"],
+            ),
+            (
+                "select 1 from t where a in (1, 2, b, c) or c = 2",
+                vec!["((a = ANY ('{1,2}'::integer[])) OR (a = b) OR (a = c) OR (c = 2))"],
+            ),
+            (
+                "select 1 from t where a not in (1, b) and c > 2",
+                vec!["(a <> 1)", "(a <> b)", "(c > 2)"],
+            ),
+        ] {
+            let Some(N::SelectStmt(s)) = parse_select(sql).and_then(|n| n.node) else {
+                panic!("not a select");
+            };
+            let got = explain_conjuncts(s.where_clause.as_deref().unwrap(), &def)
+                .map(|parts| parts.into_iter().map(|(text, _)| text).collect::<Vec<_>>());
+            assert_eq!(
+                got,
+                Some(want.into_iter().map(String::from).collect()),
+                "{sql}"
+            );
         }
     }
 }
@@ -6731,6 +7413,10 @@ pub struct VerboseRel {
     /// scan evaluates it as a `Filter` (its own column bare, the other
     /// side's prefixed), and as VERBOSE prints it, both prefixed.
     pub join_quals: Vec<(String, String)>,
+    /// A one-column PRIMARY KEY's index name and its column, prefixed:
+    /// an Index Only Scan of it returns the index's target list
+    /// (`indextlist`), not the table's.
+    pub pkey: Option<(String, String)>,
 }
 
 /// `EXPLAIN VERBOSE` of a SELECT joining two relations on an ON of
@@ -6754,6 +7440,12 @@ pub struct VerboseJoin {
     /// An ON clause compares an expression rather than two columns: only
     /// a hash join, whose `Hash Cond` prints it, is printed (RP-966).
     pub expr_on: bool,
+    /// The ORDER BY's keys as a `Sort Key` prints them, prefixed: `k.a`,
+    /// `e.b DESC`. A key the target list lacks is a resjunk entry at the
+    /// end of `output` (`findTargetlistEntrySQL92`).
+    pub sort_keys: Vec<String>,
+    /// The query has a LIMIT or an OFFSET: a `Limit` node tops the plan.
+    pub limit: bool,
 }
 
 /// [`VerboseJoin`] for `SELECT <columns or *> FROM a [LEFT] JOIN b ON
@@ -6765,10 +7457,9 @@ pub fn explain_verbose_join(
     if !s.group_clause.is_empty()
         || s.having_clause.is_some()
         || !s.distinct_clause.is_empty()
-        || !s.sort_clause.is_empty()
-        || s.limit_count.is_some()
-        || s.limit_offset.is_some()
         || !s.window_clause.is_empty()
+        || !s.locking_clause.is_empty()
+        || s.with_clause.is_some()
     {
         return None;
     }
@@ -6867,6 +7558,45 @@ pub fn explain_verbose_join(
         let (i, col) = resolve(c)?;
         output.push(pre(i, &col));
         need(i, &col);
+    }
+    // The ORDER BY: each key a column of one side, which the plan's Sort
+    // prints prefixed; one the target list lacks is a resjunk entry that
+    // every node above the join's inputs returns too (RP-966).
+    let mut sort_keys = Vec::new();
+    for item in &s.sort_clause {
+        let Some(N::SortBy(sb)) = item.node.as_ref() else {
+            return None;
+        };
+        let Some(N::ColumnRef(c)) = sb.node.as_deref()?.node.as_ref() else {
+            return None;
+        };
+        let (i, col) = resolve(c)?;
+        use pg_query::protobuf::{SortByDir, SortByNulls};
+        if !matches!(
+            SortByNulls::try_from(sb.sortby_nulls).ok()?,
+            SortByNulls::SortbyNullsDefault | SortByNulls::Undefined
+        ) || !sb.use_op.is_empty()
+        {
+            return None;
+        }
+        let dir = match SortByDir::try_from(sb.sortby_dir).ok()? {
+            SortByDir::SortbyDefault | SortByDir::SortbyAsc | SortByDir::Undefined => "",
+            SortByDir::SortbyDesc => " DESC",
+            SortByDir::SortbyUsing => return None,
+        };
+        let key = pre(i, &col);
+        if !output.contains(&key) {
+            output.push(key.clone());
+        }
+        need(i, &col);
+        sort_keys.push(format!("{key}{dir}"));
+    }
+    let limit = s.limit_count.is_some() || s.limit_offset.is_some();
+    if limit
+        && pg_query::protobuf::LimitOption::try_from(s.limit_option).ok()
+            == Some(pg_query::protobuf::LimitOption::WithTies)
+    {
+        return None;
     }
     // The ON: equalities between a column of each side.
     let mut parts = Vec::new();
@@ -7145,6 +7875,23 @@ pub fn explain_verbose_join(
             refname: q(refname),
             quals: quals[i].clone(),
             join_quals: join_quals[i].clone(),
+            pkey: match def
+                .columns
+                .iter()
+                .filter(|c| c.pk)
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [c] => Some((
+                    q(&def
+                        .extra
+                        .get_str("pk_name")
+                        .map(str::to_string)
+                        .unwrap_or_else(|_| format!("{bare}_pkey"))),
+                    format!("{}.{}", q(refname), q(&c.name)),
+                )),
+                _ => None,
+            },
         }
     };
     Some(VerboseJoin {
@@ -7154,6 +7901,8 @@ pub fn explain_verbose_join(
         join_filter,
         unprinted_filter,
         expr_on,
+        sort_keys,
+        limit,
     })
 }
 
