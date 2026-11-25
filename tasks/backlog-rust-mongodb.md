@@ -2178,6 +2178,19 @@ compressed column, placed by mongod's bucket catalog
       not depend on it and is built. `serverStatus`'s section reports
       `memoryUsage` as 0 until this lands, and RM-711's expiry needs this. (This was part of RM-549, split
       2026-11-16, Joe's go-ahead.)
+      **Measured 2026-11-25 (macOS arm64 mongod 8.2.11, each twice, stable):**
+      one measurement with metadata 12552 whatever the metadata's type or
+      length (41 characters too), with no metadata field 12024; one extra
+      data field 12564 (+12), two extra 15296 (+2744); a second measurement
+      12576 (+24). The steps are container capacity growth and `sizeof`, so
+      a faithful model ports mongod's containers allocation for allocation,
+      and the numbers are libc++'s: Linux x86-64 mongod (the exemplar, and
+      CI's) builds with libstdc++, whose `std::string` and hash-map nodes
+      differ in size, so the pinned 12552 / 12828 are likely macOS-only and
+      unmeasured on Linux (no Docker daemon here). **Decision needed
+      (Joe):** measure Linux mongod and pin its numbers (the faithful path:
+      port the tracking-allocator charges from mongod's source), or narrow
+      what is pinned.
       Verify: tests/backlog/test_rm_bucket_catalog.py::test_bucket_catalog_memory_usage_is_the_bytes_mongod_accounts
       Backlog-ID: RM-710
 - [ ] **RUST MongoDB server: idle buckets never expire past
