@@ -1549,12 +1549,16 @@ impl PgHandler {
 }
 
 /// The command ids a statement consumes: a row write (INSERT, UPDATE,
-/// DELETE, MERGE, COPY FROM) one, whether or not it wrote a row
-/// (`ExecInitModifyTable` takes it); DDL its measured count.
+/// DELETE, MERGE) one, whether or not it wrote a row
+/// (`ExecInitModifyTable` takes it); DDL its measured count. A COPY FROM
+/// takes its one at CopyDone (`on_copy_done`): the statement returns at
+/// CopyInResponse, before any row loads, and advancing then stamped the
+/// rows with the NEXT statement's command id (RP-1069).
 pub(crate) fn command_ids(stmt: &secantus_pgplan::Statement) -> u32 {
     use secantus_pgplan::Statement as S;
     match stmt {
-        S::Insert(_) | S::Update(_) | S::Delete(_) | S::CopyFrom(_) | S::RuleRewrite(_) => 1,
+        S::Insert(_) | S::Update(_) | S::Delete(_) | S::RuleRewrite(_) => 1,
+        S::CopyFrom(_) => 0,
         _ => ddl_command_ids(stmt),
     }
 }

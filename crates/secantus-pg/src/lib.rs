@@ -59971,6 +59971,14 @@ impl CopyHandler for PgHandler {
         }
         self.bulk_insert(&state.table, None);
         state.progress.end();
+        // The command id the rows were stamped with is used: the next
+        // statement in a block takes the one after it (`command_ids`).
+        xids::advance_command(
+            &self.storage,
+            self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+        );
+        self.copy_end_transaction();
         let written = state.loaded;
 
         // pgwire sends ReadyForQuery after this, but NOT CommandComplete --
@@ -60526,6 +60534,25 @@ impl PgHandler {
                 eprintln!("secantusd-pg: rolling back a failed COPY: {e}");
             }
         }
+        self.copy_end_transaction();
+    }
+
+    /// Outside a block (and an extended-protocol group, which ends at its
+    /// `Sync`), a COPY FROM is its own transaction, from its first rows to
+    /// CopyDone or the failure: when it ends, so does what the statement's
+    /// end would have ended had the rows come with it -- the xid its rows
+    /// were stamped with is complete, its SSI registration and row waits
+    /// released (RP-1069). The statement itself returned at CopyInResponse,
+    /// before any row took an xid, so without this the next statement ran
+    /// under the COPY's xid and saw the copied rows as its own command's.
+    fn copy_end_transaction(&self) {
+        if self.transaction_handle_open() {
+            return;
+        }
+        let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+        row_waits::forget(pid);
+        self.ssi_end(false);
+        xids::end(&self.storage, pid);
     }
 }
 
