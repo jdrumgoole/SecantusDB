@@ -176,6 +176,26 @@ unsafe extern "C" fn handle_error(
     error: std::os::raw::c_int,
     message: *const std::os::raw::c_char,
 ) -> std::os::raw::c_int {
+    if error != sys::WT_PANIC && !message.is_null() {
+        // A create being made with its failure's detail kept: the text is
+        // held for the caller and not printed.
+        let held = CAPTURED_ERRORS.with(|c| {
+            let mut c = c.borrow_mut();
+            let Some(held) = c.as_mut() else {
+                return false;
+            };
+            // SAFETY: WiredTiger passes a NUL-terminated message.
+            held.push(
+                unsafe { std::ffi::CStr::from_ptr(message) }
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            true
+        });
+        if held {
+            return 0;
+        }
+    }
     if error == sys::WT_PANIC {
         let text = if message.is_null() {
             String::from("(no message)")
@@ -189,6 +209,13 @@ unsafe extern "C" fn handle_error(
         std::process::abort();
     }
     1
+}
+
+thread_local! {
+    /// The error messages WiredTiger reported on this thread while
+    /// [`Session::create_with_detail`] ran, which would otherwise be printed.
+    static CAPTURED_ERRORS: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The most WiredTiger messages a connection holds before it drops the
@@ -464,6 +491,23 @@ impl Session {
         let cfg_c = CString::new(config).map_err(nul_err)?;
         let create = unsafe { (*self.ptr).create }.unwrap();
         check(unsafe { create(self.ptr, name_c.as_ptr(), cfg_c.as_ptr()) })
+    }
+
+    /// [`Session::create`], keeping the detail WiredTiger reports with a
+    /// failure (`Error parsing '...' at offset 88: Value already complete`),
+    /// which mongod quotes after the error's code. `Err` carries the error
+    /// and the messages, joined by newlines, empty when WiredTiger gave none.
+    pub fn create_with_detail(
+        &self,
+        name: &str,
+        config: &str,
+    ) -> std::result::Result<(), (WtError, String)> {
+        CAPTURED_ERRORS.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        let outcome = self.create(name, config);
+        let held = CAPTURED_ERRORS
+            .with(|c| c.borrow_mut().take())
+            .unwrap_or_default();
+        outcome.map_err(|e| (e, held.join("\n")))
     }
 
     /// Make every cursor this session opens from now on read the named

@@ -297,6 +297,7 @@ const SERVED_INDEX_OPTIONS: &[&str] = &[
     "finestIndexedLevel",
     "coarsestIndexedLevel",
     "wildcardProjection",
+    "storageEngine",
 ];
 
 /// What in a store mongod wrote this server cannot serve, named (plan

@@ -2248,3 +2248,133 @@ def test_secantus_refuses_a_2dsphere_version_it_does_not_key_by_name(tmp_path: P
     store = _mongod_store(tmp_path, setup)
     outcome, said = _secantus_open(store)
     assert (outcome, "app.c" in said, "loc_v2" in said) == ("refused", True, True), said
+
+
+_CONFIG_KEYS = (
+    "block_compressor",
+    "prefix_compression",
+    "prefix_compression_min",
+    "leaf_page_max",
+    "internal_page_max",
+    "allocation_size",
+    "key_format",
+    "value_format",
+    "app_metadata",
+    "checksum",
+)
+
+
+def _config_string_indexes(client: Any) -> None:
+    """A collection whose `indexOptionDefaults` and indexes carry
+    `configString`s (RM-796): the defaults reach `_id_` and the index made
+    without its own, an index's own string overrides them key by key."""
+    from tests.backlog.test_rm_index_config_string import _se
+
+    db = client["cfg"]
+    db.create_collection(
+        "c", indexOptionDefaults={"storageEngine": _se("block_compressor=zstd,leaf_page_max=8KB")}
+    )
+    db["c"].insert_many([{"_id": i, "a": i, "b": i % 3} for i in range(40)])
+    db.command(
+        "createIndexes",
+        "c",
+        indexes=[
+            {
+                "key": {"a": 1},
+                "name": "a_1",
+                "storageEngine": _se("block_compressor=snappy,prefix_compression=false"),
+            },
+            {"key": {"b": 1}, "name": "b_1"},
+            {
+                "key": {"a": 1, "b": 1},
+                "name": "ab_1",
+                "unique": True,
+                "storageEngine": _se("internal_page_max=32KB,block_compressor=none"),
+            },
+        ],
+    )
+
+
+def _config_string_state(client: Any) -> tuple[dict, list]:
+    """Each table's configuration (the keys a configString can set) and the
+    index specs, as the catalog and `listIndexes` show them."""
+    from tests.backlog.test_rm_index_config_string import _config
+
+    details = client["cfg"].command("collStats", "c")["indexDetails"]
+    tables = {
+        name: {k: v for k, v in _config(d["creationString"]).items() if k in _CONFIG_KEYS}
+        for name, d in details.items()
+    }
+    specs = [list(i.items()) for i in client["cfg"]["c"].list_indexes()]
+    return tables, specs
+
+
+def _expected_config_string_tables(tables: dict) -> None:
+    assert {n: (t["block_compressor"], t["prefix_compression"]) for n, t in tables.items()} == {
+        "_id_": ("zstd", "true"),
+        "a_1": ("snappy", "false"),
+        "b_1": ("zstd", "true"),
+        "ab_1": ("none", "true"),
+    }, tables
+    assert {n: (t["leaf_page_max"], t["internal_page_max"]) for n, t in tables.items()} == {
+        "_id_": ("8KB", "16k"),
+        "a_1": ("8KB", "16k"),
+        "b_1": ("8KB", "16k"),
+        "ab_1": ("8KB", "32KB"),
+    }, tables
+
+
+@pytest.mark.backlog_fixed("RM-796")
+def test_mongod_opens_the_config_string_indexes_secantus_wrote(tmp_path: Path) -> None:
+    """A store `secantusd-mdb` wrote with `configString`s on its indexes and
+    its collection's `indexOptionDefaults` is one mongod 8.2.11 validates:
+    each table has the configuration it was made with, the same one
+    `secantusd-mdb` listed, and the specs are the same."""
+    store = tmp_path / "store"
+    with rust_mongo_server(store, "--standalone") as client:
+        _config_string_indexes(client)
+        ours = _config_string_state(client)
+    _expected_config_string_tables(ours[0])
+    proc, client = _mongod_on(store, None, "rs0")
+    try:
+        assert client is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            host, port = client.address or ("127.0.0.1", 0)
+            _wait_primary(client, f"{host}:{port}")
+            assert _config_string_state(client) == ours
+            result = client["cfg"].command("validate", "c", full=True)
+            assert (result["valid"], result["nrecords"]) == (True, 40), result
+            assert client["cfg"]["c"].find({"a": {"$gte": 35}}).hint("a_1").to_list() == [
+                {"_id": i, "a": i, "b": i % 3} for i in range(35, 40)
+            ]
+            # An index made on the store under mongod gets the defaults.
+            client["cfg"]["c"].create_index("c", name="c_1")
+    finally:
+        _stop_mongod(proc, client)
+
+
+@pytest.mark.backlog_fixed("RM-796")
+def test_secantus_serves_the_config_string_indexes_mongod_wrote(tmp_path: Path) -> None:
+    """A store mongod 8.2.11 wrote with the same `configString`s is adopted,
+    not refused: the specs keep their `storageEngine`, each table keeps its
+    configuration, reads use the indexes, and `validate` is clean."""
+    seen: dict[str, Any] = {}
+
+    def setup(client: Any) -> None:
+        _config_string_indexes(client)
+        seen["state"] = _config_string_state(client)
+
+    store = _mongod_store(tmp_path, setup)
+    _expected_config_string_tables(seen["state"][0])
+    with rust_mongo_server(store) as rust:
+        assert _config_string_state(rust) == seen["state"]
+        plan = rust["cfg"]["c"].find({"a": {"$gte": 35}}).hint("a_1")
+        assert plan.to_list() == [{"_id": i, "a": i, "b": i % 3} for i in range(35, 40)]
+        result = rust["cfg"].command("validate", "c", full=True)
+        assert (result["valid"], result["nrecords"]) == (True, 40), result
+        # A write keeps every index, and a new one gets the defaults.
+        rust["cfg"]["c"].insert_one({"_id": 40, "a": 40, "b": 1})
+        rust["cfg"]["c"].create_index("c", name="c_1")
+        tables = _config_string_state(rust)[0]
+        assert tables["c_1"]["block_compressor"] == "zstd", tables
+        assert rust["cfg"].command("validate", "c", full=True)["valid"] is True

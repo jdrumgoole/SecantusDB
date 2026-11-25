@@ -366,13 +366,70 @@ pub(crate) fn storage_stats(
             out.insert("maxSize", int(max_size / scale));
         }
     }
+    // The tables' own configuration, as mongod lists it: what the table was
+    // made with, defaults filled in (RM-796). Its statistics categories are
+    // not listed here (`tasks/backlog-rust-mongodb.md`).
+    if !time_series {
+        if let Some(section) = storage
+            .collection_ident(db, coll)
+            .and_then(|uri| table_section(storage, &uri))
+        {
+            out.insert("wiredTiger", section);
+        }
+    }
     out.insert("nindexes", sizes.len() as i32);
+    if !time_series {
+        let mut details = Document::new();
+        for (index, _) in ready
+            .iter()
+            .map(|ix| (ix, false))
+            .chain(building.iter().map(|ix| (ix, true)))
+        {
+            let Ok(name) = index.get_str("name") else {
+                continue;
+            };
+            if let Some(section) = storage
+                .index_ident(db, coll, name)
+                .and_then(|uri| table_section(storage, &uri))
+            {
+                details.insert(name, section);
+            }
+        }
+        out.insert("indexDetails", details);
+    }
     out.insert("indexBuilds", Bson::Array(builds));
     out.insert("totalIndexSize", int(index_total / scale));
     out.insert("indexSizes", scaled);
     out.insert("totalSize", int((size + index_total) / scale));
     out.insert("scaleFactor", int(scale));
     Ok(out)
+}
+
+/// What `collStats` lists for one WiredTiger table: its `app_metadata`, the
+/// configuration it was created with (`creationString`, defaults filled in),
+/// its type, the statistics URI and the engine's version. mongod adds the
+/// table's statistics categories, which are not listed here.
+fn table_section(storage: &dyn crate::Storage, uri: &str) -> Option<Document> {
+    let (creation, version) = storage.table_creation_string(uri)?;
+    let mut metadata = Document::new();
+    if let Some(at) = creation.find("app_metadata=(") {
+        let rest = &creation[at + "app_metadata=(".len()..];
+        for pair in rest.split(')').next().unwrap_or("").split(',') {
+            if let Some((k, v)) = pair.split_once('=') {
+                match v.parse::<i32>() {
+                    Ok(n) => metadata.insert(k, n),
+                    Err(_) => metadata.insert(k, v),
+                };
+            }
+        }
+    }
+    Some(doc! {
+        "metadata": metadata,
+        "creationString": creation,
+        "type": "file",
+        "uri": format!("statistics:{uri}"),
+        "version": version,
+    })
 }
 
 /// A `dataSize` request, parsed.

@@ -993,6 +993,10 @@ impl CmdStorage for StorageAdapter {
         self.inner.validate_wt_config(method, config)
     }
 
+    fn table_creation_string(&self, uri: &str) -> Option<(String, String)> {
+        self.inner.table_creation_string(uri).ok()?
+    }
+
     fn collection_count_at_most(
         &self,
         db: &str,

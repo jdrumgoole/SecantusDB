@@ -163,7 +163,12 @@ pub(crate) fn create(doc: &Document) -> Result<(), CommandError> {
     string(doc, "create", "validationAction")?;
     pre_images(doc, "create")?;
     crate::argtypes::require_number(doc, "expireAfterSeconds", "create.expireAfterSeconds")?;
-    object(doc, "create", "indexOptionDefaults")?;
+    if let Some(defaults) = object(doc, "create", "indexOptionDefaults")? {
+        if let Some(extra) = defaults.keys().find(|k| *k != "storageEngine") {
+            return Err(unknown(&format!("create.indexOptionDefaults.{extra}")));
+        }
+        object(defaults, "create.indexOptionDefaults", "storageEngine")?;
+    }
     if doc.contains_key("autoIndexId") {
         return Err(unknown("create.autoIndexId"));
     }
@@ -186,15 +191,6 @@ pub(crate) fn create(doc: &Document) -> Result<(), CommandError> {
             "'recordIdsReplicated' option may not be run without \
              featureFlagRecordIdsReplicated enabled",
         ));
-    }
-    if let Some(engines) = object(doc, "create", "storageEngine")? {
-        if let Some(other) = engines.keys().find(|k| *k != "wiredTiger") {
-            return Err(CommandError::new(
-                72,
-                "InvalidOptions",
-                format!("{other} is not a registered storage engine for this server"),
-            ));
-        }
     }
     if let Some(id_index) = object(doc, "create", "idIndex")? {
         let key = id_index.get_document("key").ok();
@@ -409,9 +405,19 @@ mod tests {
             code(doc! {"create": "c", "clusteredIndex": true}),
             Some(5_979_703)
         );
+        // The engines are checked with the storage's own configuration
+        // check (`admin::create_storage_engines_problem`).
         assert_eq!(
             code(doc! {"create": "c", "storageEngine": {"nope": {}}}),
-            Some(72)
+            None
+        );
+        assert_eq!(
+            code(doc! {"create": "c", "indexOptionDefaults": {"foo": 1}}),
+            Some(40415)
+        );
+        assert_eq!(
+            code(doc! {"create": "c", "indexOptionDefaults": {"storageEngine": 1}}),
+            Some(14)
         );
         assert_eq!(
             code(doc! {"create": "c", "changeStreamPreAndPostImages": {"enabled": true}}),

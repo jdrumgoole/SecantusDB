@@ -1617,9 +1617,11 @@ Still different:
   fields. They are additive, documented (`CLAUDE.md`, `docs/compatibility.md`,
   `docs/servers.md`), and how the admin UI tells this server from mongod;
   no driver compares a whole `buildInfo` reply.
-- [ ] `buildInfo` has no per-OS block; `collStats` has no `wiredTiger` or
-      `indexDetails` (they are WiredTiger statistics of the collection's
-      and each index's own table; since storage-model phase 5 each
+- [ ] `buildInfo` has no per-OS block; `collStats`' `wiredTiger` and
+      `indexDetails` list only each table's `metadata`, `creationString`,
+      `type`, `uri` and `version` (RM-796), not the WiredTiger statistics
+      categories mongod adds (`btree`, `cache`, `cursor` and the rest: since
+      storage-model phase 5 each
       collection and index has its own `collection-<UUID>` /
       `index-<UUID>` table, as on mongod, so the statistics exist but are
       not yet read -- and `storageSize` in `collStats` / `dbStats` is still
@@ -1646,7 +1648,7 @@ Still different:
       batching.
       **Decided (Joe, 2026-11-16): RM-499 goes ahead; once its storage stage lands, split this item's per-table parts and its other parts into separate items with their own gap tests.**
       Backlog-ID: RM-040
-      Verify: tests/backlog/test_rm_029_056.py::test_coll_stats_wiredtiger_and_index_details
+      Verify: tests/backlog/test_rm_029_056.py::test_coll_stats_lists_a_tables_statistics
 
 ### 7.081 Geo queries -- 2026-10-13
 
@@ -2948,22 +2950,27 @@ wrote and stopped (the forward direction of RM-723).
       Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_a_clustered_option_on_an_index_spec_is_read_as_mongod_reads_it
       Backlog-ID: RM-795
 
-- [ ] **An index's `storageEngine.wiredTiger.configString` is checked and
-      kept, but not applied to the index's table.** **Decision needed (Joe):**
-      apply it (as mongod builds the table from it: `block_compressor`,
-      `leaf_page_max` and the rest, listed in `collStats` as the index's
-      `creationString`) or refuse a non-empty `configString` by name, as the
-      store adoption of a mongod store holding one already does ("index se's
-      option storageEngine"). Found closing RM-771 (2026-11-24): `createIndexes`
-      now refuses a bad `storageEngine` as mongod does (WiredTiger's own
-      configuration check, `secantus_wt::validate_config`) but a valid one is
-      stored and ignored, which refusing would break for the drivers' own
-      index tests that pass one.
-      **Decided (Joe, 2026-11-25): apply it**, as mongod does -- build the
-      index's table from the valid `configString`, and list it in `collStats`
-      as the index's `creationString`. Not built yet.
-      Verify: none -- a decision about serving or refusing an option; no mongod answer to compare until it is built
-      Backlog-ID: RM-796
+- [ ] **A collection's `storageEngine.wiredTiger.configString` is checked
+      and kept, but not applied to the collection's table.** Found closing
+      RM-796 (2026-11-25, mongod 8.2.11), which applied an index's own and a
+      collection's `indexOptionDefaults` one. mongod builds a collection's
+      table from `type=file,memory_page_max=10m,split_pct=90,
+      leaf_value_max=64MB,checksum=on,block_compressor=snappy`, then the
+      collection's `configString`, then `exclusive=true,key_format=q,
+      app_metadata=(formatVersion=1),log=(enabled=true)` (read off
+      WiredTiger's own parse error for `==`, which `create` answers as 2
+      with "22: Invalid argument - Error parsing '...' at offset N"): the
+      string overrides the defaults, `key_format`, `app_metadata`, `log` and
+      `exclusive` it cannot change, and `value_format=S` it can (measured
+      against `collStats`' `wiredTiger.creationString`). `secantusd-mdb`
+      makes the table from its defaults whatever the string says, and
+      accepts `==`. The shared `create_user_configured_table` and
+      `wt_parse_error_detail` in `crates/secantus-storage/src/lib.rs` are
+      the building blocks. Out of reach and left alone: mongod's server-wide
+      defaults (`--wiredTigerCollectionConfigString`).
+      Verify: tests/backlog/test_rm_collection_config_string.py::test_a_collection_table_is_made_from_its_config_string
+      Backlog-ID: 
+      Backlog-ID: RM-802
 
 ## Found working RM-746 (storage-model phase 7b, 2026-11-22)
 

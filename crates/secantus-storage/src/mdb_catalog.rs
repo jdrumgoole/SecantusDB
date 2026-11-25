@@ -64,18 +64,50 @@ pub fn is_buckets_collection(coll: &str) -> bool {
 /// The configuration mongod 8.2.11 creates an index's table with (phase 0b):
 /// `key_format=u,value_format=u` (the KeyString and RecordId are the key, the
 /// TypeBits the value), no block compressor, prefix compression, 16k pages,
-/// and `app_metadata=(formatVersion=8)`. The store's data-logging mode is
-/// applied by the caller, as for a collection.
-pub const INDEX_TABLE_CFG: &str = "type=file,internal_page_max=16k,leaf_page_max=16k,\
-     checksum=on,prefix_compression=true,key_format=u,value_format=u,\
-     app_metadata=(formatVersion=8)";
+/// and `app_metadata=(formatVersion=8)`, a unique secondary index's
+/// `formatVersion=14` (the same key layout, the RecordId appended).
+///
+/// The options a user gives go where mongod's `generateCreateString` puts
+/// them (measured 8.2.11, 2026-11-25, by reading `collStats` and a
+/// `WT_SESSION::create` refusal's text): after the defaults, so each
+/// overrides one, in the order the collection's `indexOptionDefaults`
+/// `storageEngine.wiredTiger.configString` then the index's own, and before
+/// `key_format`, `value_format`, `app_metadata` and `log`, which no
+/// `configString` changes. The server's own startup default
+/// (`--wiredTigerIndexConfigString`) is the empty slot before them.
+/// `logged` is the store's logging mode; the caller's data-table mode follows.
+pub fn index_table_cfg(unique: bool, defaults: &str, own: Option<&str>, logged: bool) -> String {
+    let format_version = if unique { 14 } else { 8 };
+    let tail = if logged { ",log=(enabled=true)" } else { "" };
+    // The empty slots are mongod's: the server-wide default
+    // (`--wiredTigerIndexConfigString`) before the collection's, and ones
+    // after each. The `_id_` index made with the collection has no slot of
+    // its own (measured 8.2.11, read off WiredTiger's own parse errors).
+    let own = own.map(|o| format!("{o},,")).unwrap_or_default();
+    format!(
+        "type=file,internal_page_max=16k,leaf_page_max=16k,checksum=on,\
+         prefix_compression=true,,{defaults},,{own}key_format=u,value_format=u,\
+         app_metadata=(formatVersion={format_version}){tail}"
+    )
+}
 
-/// A unique secondary index's table: the same, `formatVersion=14` (the
-/// index format mongod 8.2.11 gives a unique index; its key layout is the
-/// same, the RecordId appended).
-pub const UNIQUE_INDEX_TABLE_CFG: &str = "type=file,internal_page_max=16k,leaf_page_max=16k,\
-     checksum=on,prefix_compression=true,key_format=u,value_format=u,\
-     app_metadata=(formatVersion=14)";
+/// An index's table with no user options: `_id_`'s, and every index's of a
+/// collection with no `indexOptionDefaults`.
+pub fn default_index_table_cfg(unique: bool, logged: bool) -> String {
+    index_table_cfg(unique, "", Some(""), logged)
+}
+
+/// The `storageEngine.wiredTiger.configString` of a `storageEngine` option
+/// document (an index spec's, or a collection's `indexOptionDefaults`'s),
+/// or `""`.
+pub fn wired_tiger_config_string(storage_engine: Option<&bson::Bson>) -> String {
+    storage_engine
+        .and_then(|e| e.as_document())
+        .and_then(|e| e.get_document("wiredTiger").ok())
+        .and_then(|w| w.get_str("configString").ok())
+        .unwrap_or("")
+        .to_string()
+}
 
 /// A collection's ident: `collection-<UUID>`, as mongod 8.2 names them.
 pub fn new_collection_ident() -> String {

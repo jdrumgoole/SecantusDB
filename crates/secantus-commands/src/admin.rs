@@ -270,6 +270,7 @@ pub fn create(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     argtypes::require_object(doc, "timeseries", "create.timeseries")?;
     argtypes::require_object(doc, "collation", "create.collation")?;
     crate::ddl_checks::create(doc)?;
+    create_storage_engines_problem(ctx.storage()?, doc)?;
     // `capped` is bool-OR-number here; `size` / `max` are plain numeric. A null
     // in any of the three is ACCEPTED as absent and then answers the semantic
     // error ("the 'size' field is required when 'capped' is true"), not a type
@@ -1692,6 +1693,18 @@ pub(crate) fn collection_entries(
             .into_iter()
             .filter(|(_, v)| !matches!(v, Bson::Null))
             .collect();
+        // An empty `storageEngine`, and `indexOptionDefaults` with no
+        // `storageEngine` in them, are not listed (measured 8.2.11,
+        // 2026-11-25); `indexOptionDefaults: {storageEngine: {}}` is.
+        if matches!(options.get("storageEngine"), Some(Bson::Document(d)) if d.is_empty()) {
+            options.remove("storageEngine");
+        }
+        if matches!(
+            options.get("indexOptionDefaults"),
+            Some(Bson::Document(d)) if !matches!(d.get("storageEngine"), Some(Bson::Document(_)))
+        ) {
+            options.remove("indexOptionDefaults");
+        }
         let off = |o: &Document, field: &str, key: &str, value: Bson| {
             o.get_document(field)
                 .is_ok_and(|d| d.get(key) == Some(&value))
@@ -2752,6 +2765,24 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
                     ),
                 ));
             }
+            // A `configString` WiredTiger will not build the table from: the
+            // build fails with WiredTiger's code and text (RM-796).
+            Err(StorageError::WriteError { code, errmsg, .. })
+                if errmsg.starts_with(INDEX_TABLE_FAILED) =>
+            {
+                undo_request(storage, &ctx.db_name, &coll, created_coll, &built_here)?;
+                let why = errmsg[INDEX_TABLE_FAILED.len()..].to_string();
+                let e = build_failure(
+                    storage,
+                    &ctx.db_name,
+                    &coll,
+                    created_coll,
+                    &specs,
+                    BuildStep::Prepare,
+                    BuildProblem::Refused(code, why),
+                );
+                return Ok(e.into_reply());
+            }
             Err(e) => return Err(command_error(e)),
         };
         if created {
@@ -3066,8 +3097,9 @@ fn run_index_build(
                 (cause, reply)
             }
             Failure::Storage(StorageError::WriteError { code, errmsg, .. }) => {
+                let errmsg = errmsg.strip_prefix(INDEX_TABLE_FAILED).unwrap_or(errmsg);
                 let name = crate::util::error_code_name(*code);
-                let cause = IndexBuildAbort::new(*code, &name, errmsg.clone());
+                let cause = IndexBuildAbort::new(*code, &name, errmsg.to_string());
                 let reply = doc! {
                     "ok": 0.0,
                     "errmsg": wrapped(errmsg),
@@ -3654,6 +3686,11 @@ fn key_problem(spec: &Document) -> Option<CommandError> {
     None
 }
 
+/// What the storage layer's error message begins with when an index's table
+/// could not be made from the `configString` it was given
+/// (`secantus_storage::TABLE_CREATE_FAILED`).
+const INDEX_TABLE_FAILED: &str = "index table creation failed :: ";
+
 /// What mongod refuses in an index's `storageEngine` option, last of all the
 /// checks on a spec, and in the order it makes them (measured 8.2.11,
 /// 2026-11-24). The spec is quoted with the index version it has been given
@@ -3689,46 +3726,116 @@ fn storage_engine_problem(storage: &dyn crate::Storage, spec: &Document) -> Opti
                 .to_string(),
         );
     }
+    if let Some((code, name, why)) = engine_options_problem(storage, engines, "has to be") {
+        return refuse(code, name, why);
+    }
+    None
+}
+
+/// What mongod refuses in the engines of a `storageEngine` option (an index
+/// spec's, a collection's, a collection's `indexOptionDefaults`'), as
+/// `(code, name, why)` in the order it makes its checks (measured 8.2.11,
+/// 2026-11-25). `must` is how an engine's options not being a document is
+/// worded: "has to be" for an index and a collection, "must be" (no full
+/// stop) for `indexOptionDefaults`.
+fn engine_options_problem(
+    storage: &dyn crate::Storage,
+    engines: &Document,
+    must: &str,
+) -> Option<(i32, &'static str, String)> {
     for (engine, options) in engines {
         let Bson::Document(options) = options else {
-            return refuse(
+            let stop = if must == "has to be" { "." } else { "" };
+            return Some((
                 2,
                 "BadValue",
-                format!("'storageEngine.{engine}' has to be an embedded document."),
-            );
+                format!("'storageEngine.{engine}' {must} an embedded document{stop}"),
+            ));
         };
         if engine != "wiredTiger" {
-            return refuse(
+            return Some((
                 72,
                 "InvalidOptions",
                 format!("{engine} is not a registered storage engine for this server"),
-            );
+            ));
         }
         for (option, value) in options {
             if option != "configString" {
-                return refuse(
+                return Some((
                     72,
                     "InvalidOptions",
                     format!("'{option}' is not a supported option."),
-                );
+                ));
             }
             let Bson::String(config) = value else {
-                return refuse(
+                return Some((
                     14,
                     "TypeMismatch",
                     "'configString' must be a string.".to_string(),
-                );
+                ));
             };
+            // In the order mongod makes them: a NUL byte, then the two
+            // configurations it refuses by name (a substring `type=lsm`; an
+            // `encryption=(...)` group), then WiredTiger's own check.
+            if config.contains('\0') {
+                return Some((
+                    9,
+                    "FailedToParse",
+                    "malformed 'configString' value.".to_string(),
+                ));
+            }
+            if config.contains("type=lsm") {
+                return Some((
+                    6627201,
+                    "Location6627201",
+                    "Configuration 'type=lsm' is not supported.".to_string(),
+                ));
+            }
+            if config
+                .find("encryption=(")
+                .is_some_and(|at| config[at..].contains(')'))
+            {
+                return Some((
+                    20,
+                    "IllegalOperation",
+                    "Manual configuration of encryption options as part of 'configString' is not \
+                     supported"
+                        .to_string(),
+                ));
+            }
             if let Err((code, message)) = storage.validate_wt_config("WT_SESSION.create", config) {
-                return refuse(
+                return Some((
                     2,
                     "BadValue",
                     format!("{code}: {} - . {message}.", wt_strerror(code)),
-                );
+                ));
             }
         }
     }
     None
+}
+
+/// The `storageEngine` and `indexOptionDefaults` options of `create`, as
+/// mongod checks them once the command is parsed (RM-796).
+fn create_storage_engines_problem(
+    storage: &dyn crate::Storage,
+    doc: &Document,
+) -> Result<(), CommandError> {
+    let refuse =
+        |(code, name, why): (i32, &'static str, String)| CommandError::new(code, name, why);
+    if let Some(Bson::Document(engines)) = doc.get("storageEngine") {
+        if let Some(problem) = engine_options_problem(storage, engines, "has to be") {
+            return Err(refuse(problem));
+        }
+    }
+    if let Some(Bson::Document(defaults)) = doc.get("indexOptionDefaults") {
+        if let Some(Bson::Document(engines)) = defaults.get("storageEngine") {
+            if let Some(problem) = engine_options_problem(storage, engines, "must be") {
+                return Err(refuse(problem));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `strerror` for the codes WiredTiger's configuration check returns.
@@ -4382,7 +4489,7 @@ fn conflict_spec_text(spec: &Document) -> String {
 fn equivalent_spec_text(spec: &Document) -> String {
     let mut out = Document::new();
     out.insert("v", 2i32);
-    let trailing = |k: &str| matches!(k, "expireAfterSeconds" | "hidden");
+    let trailing = |k: &str| matches!(k, "expireAfterSeconds" | "hidden" | "storageEngine");
     let listed =
         |k: &str| !matches!(k, "v" | "key" | "name" | "ns") && !INDEX_CATALOG_ONLY.contains(&k);
     for (k, v) in spec.iter().filter(|(k, _)| listed(k) && !trailing(k)) {
@@ -4489,7 +4596,7 @@ fn index_conflict(
                 .filter(|(k, _)| {
                     !matches!(
                         k.as_str(),
-                        "expireAfterSeconds" | "hidden" | "prepareUnique"
+                        "expireAfterSeconds" | "hidden" | "prepareUnique" | "storageEngine"
                     )
                 })
                 .map(|(k, v)| (k.clone(), v.clone()))
@@ -4506,8 +4613,26 @@ fn index_conflict(
                 format!(
                     "An equivalent index already exists with the same name but different \
                      options. Requested index: {}, existing index: {}",
-                    equivalent_spec_text(spec),
+                    conflict_spec_text(spec),
                     equivalent_spec_text(idx),
+                ),
+            ));
+        }
+        // The same key under another name, differing only in those options:
+        // equivalent, and refused (measured 8.2.11, 2026-11-25).
+        if !same_name
+            && same_key
+            && !same_opts
+            && docs_equal_by_value(&identity(&index_options(idx)), &identity(&wanted))
+        {
+            return Some(CommandError::new(
+                85,
+                "IndexOptionsConflict",
+                format!(
+                    "An equivalent index already exists with a different name and options. \
+                     Requested index: {}, existing index: {}",
+                    conflict_spec_text(spec),
+                    conflict_spec_text(idx),
                 ),
             ));
         }
@@ -6186,6 +6311,55 @@ mod parity_tests {
                 1.0,
                 "batchSize {bs}: {reply:?}"
             );
+        }
+    }
+
+    #[test]
+    fn create_checks_its_storage_engines_as_mongod_does() {
+        let code = |d: Document| {
+            create_storage_engines_problem(&FakeStorage, &d)
+                .err()
+                .map(|e| (e.code, e.errmsg))
+        };
+        let se = |v: Bson| doc! {"create": "c", "storageEngine": v};
+        let defaults = |v: Bson| doc! {"create": "c", "indexOptionDefaults": {"storageEngine": v}};
+        assert_eq!(code(se(bson::bson!({"nope": {}}))).map(|e| e.0), Some(72));
+        // An engine that is no document is 2 before its name is looked at,
+        // worded one way for `storageEngine` and another for the defaults.
+        assert_eq!(
+            code(se(bson::bson!({"x": 1}))),
+            Some((
+                2,
+                "'storageEngine.x' has to be an embedded document.".to_string()
+            ))
+        );
+        assert_eq!(
+            code(defaults(bson::bson!({"x": 1}))),
+            Some((
+                2,
+                "'storageEngine.x' must be an embedded document".to_string()
+            ))
+        );
+        assert_eq!(
+            code(se(bson::bson!({"wiredTiger": {"configString": 1}}))).map(|e| e.0),
+            Some(14)
+        );
+        assert_eq!(
+            code(se(bson::bson!({"wiredTiger": {"x": 1}}))).map(|e| e.0),
+            Some(72)
+        );
+        // Refused by name before WiredTiger's own check, in mongod's order.
+        for (config, want) in [
+            ("bogus=1\u{0}", 9),
+            ("bogus=1,type=lsm", 6_627_201),
+            ("bogus=1,encryption=(name=x)", 20),
+            ("encryption=(name=x", -1),
+            ("block_compressor=zstd", -1),
+        ] {
+            let got = code(defaults(
+                bson::bson!({"wiredTiger": {"configString": config}}),
+            ));
+            assert_eq!(got.map_or(-1, |e| e.0), want, "{config:?}");
         }
     }
 
