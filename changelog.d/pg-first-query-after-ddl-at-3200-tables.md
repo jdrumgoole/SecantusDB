@@ -20,6 +20,7 @@ tables, and the one or two tables a keyed `pg_attribute` read is about.
   and collating tables, are kept with each committed catalog version and
   patched from the definitions a commit changed, as PostgreSQL rebuilds
   only the cache entries an invalidation names (`inval.c`). Now 13.1 ms
-  against 14.3 ms at 3,200 tables.
+  against 14.3 ms at 3,200 tables; the growth that is left keeps RP-1073
+  open.
 
-Fixes RP-1073 (tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth)
+Fixes RP-1073, in part (tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth)
