@@ -260,8 +260,8 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **mongod 8.2 crashed opening a store `secantusd-mdb` wrote and
-      `reIndex`ed (2026-11-25), once.** On PR #2979 (run 45534098323, job
+- [ ] **mongod 8.2 crashes, intermittently, opening a store
+      `secantusd-mdb` wrote and `reIndex`ed (2026-11-25).** On PR #2979 (run 45534098323, job
       `mdb-binary (backlog)`, head `6eb68eb86`), RM-788's regression test
       `tests/backlog/test_rm_storage_model.py::test_mongod_opens_the_index_specs_secantus_wrote_and_reindexed`
       read REGRESSED: mongod died with a fatal message from the
@@ -277,8 +277,17 @@ These are explicit non-goals. Don't add them without a reason.
       (`--logpath` beside the store), find the fatal message's first line
       (an invariant or a fassert id) and what of the store it read, then
       fix the store. Filed by the PG session; nothing on the MongoDB side
-      was changed.
-      Verify: none -- intermittent, once on CI; RM-788's regression test is the check
+      was changed. It then failed twice more the same way, with the same
+      `ReplCoord-0` fatal tail: #2979 again (run 45542344001, head
+      `c33d848d8`) and snapshot PR #2980 (`rm-batch-ci`, `144b95d51`). A
+      diagnostic re-run of `main`'s `4547c86f9` job (run 45528505272)
+      passed, on the same runner version (20261116.202.1) as two of the
+      failures. All runs used mongod 8.2.12 from MongoDB's `mongodb-org`
+      8.2 apt repo on image ubuntu-26.04 20261111.635, and the job passed on
+      every run from RM-788's landing until 2026-11-25T02:35Z. So neither
+      the code nor the image changed; it is a race, in mongod's start on
+      this store or in what the store holds.
+      Verify: none -- intermittent on CI (3 of the 7 runs on 2026-11-25); RM-788's regression test is the check
       Backlog-ID: RM-797
 
 - [ ] **`test_a_contested_write_of_many_plans_as_mongod[query0-delete]`
