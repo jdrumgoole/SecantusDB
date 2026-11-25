@@ -34,7 +34,14 @@
 //!   certificate whose CRL distribution points name the same point; a
 //!   certificate the chosen list does not cover fails, "certificate
 //!   unknown" (`X509_V_ERR_DIFFERENT_CRL_SCOPE`);
-//! - a delta list (`2.5.29.27`) is read as a full one.
+//! - a delta list (`2.5.29.27`) is never used either: PostgreSQL sets no
+//!   `X509_V_FLAG_USE_DELTAS`, and OpenSSL's `get_crl_score` passes a delta
+//!   over, so an issuer with only a delta has no list ("unknown ca",
+//!   `X509_V_ERR_UNABLE_TO_GET_CRL`). Measured with OpenSSL 3.5.9 and 4.1.0
+//!   (PostgreSQL 15.20 on each, 2026-11-25, RP-747). PostgreSQL 15.19 on
+//!   Ubuntu's OpenSSL 3.0.13 read it as a full list, which is what this
+//!   reader did until then; the current OpenSSL's answer is the one kept
+//!   (Joe, 2026-11-25).
 //!
 //! Any other critical extension is refused when the file is read, as
 //! OpenSSL refuses a critical extension it does not handle.
@@ -74,7 +81,8 @@ pub(crate) struct RevocationList {
 /// An issuing distribution point's scope.
 #[derive(Debug, Default)]
 struct Scope {
-    /// A list for some reasons only, or an indirect one: never used.
+    /// A list for some reasons only, an indirect one, or a delta: never
+    /// used.
     unusable: bool,
     only_user: bool,
     only_ca: bool,
@@ -245,6 +253,11 @@ impl RevocationList {
             let (extensions, _) = expect(extensions.body, SEQUENCE).ok_or_else(malformed)?;
             if let Some((_, value)) = x509::extension(extensions.body, IDP) {
                 scope = idp_scope(value)?;
+            }
+            // A delta is never a certificate's list without delta support
+            // (`get_crl_score`), which PostgreSQL does not ask for.
+            if x509::extension(extensions.body, DELTA_CRL_INDICATOR).is_some() {
+                scope.unusable = true;
             }
             refuse_critical(extensions.body, "it", &[IDP, DELTA_CRL_INDICATOR])?;
         }
@@ -573,6 +586,25 @@ mod tests {
         let err = RevocationList::parse(&list(true, &[], Some(&extension(Some(0xff))), None))
             .expect_err("critical");
         assert!(err.contains("critical extension 1.2.3.4"), "{err}");
+    }
+
+    #[test]
+    fn a_delta_list_is_never_a_candidate() {
+        // `DeltaCRLIndicator` (2.5.29.27), critical, base CRL number 1.
+        let delta = tlv(
+            SEQUENCE,
+            &[
+                tlv(OID, DELTA_CRL_INDICATOR),
+                tlv(BOOLEAN, &[0xff]),
+                tlv(0x04, &tlv(INTEGER, &[1])),
+            ]
+            .concat(),
+        );
+        let parsed = RevocationList::parse(&list(true, &[&[5]], Some(&delta), None))
+            .expect("a delta list is read, then passed over");
+        assert!(parsed.scope.unusable, "OpenSSL 3.5.9 / 4.1.0: no delta support");
+        let full = RevocationList::parse(&list(true, &[&[5]], Some(&[]), None)).unwrap();
+        assert!(!full.scope.unusable);
     }
 
     #[test]

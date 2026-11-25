@@ -332,8 +332,16 @@ one beside it.
   - **TLS files:**
     - **A revocation list's issuing distribution point named relative to
       its issuer is refused at startup** (`crl.rs`); one with a full name,
-      a delta list and a reasons-only or indirect list answer as
-      PostgreSQL 15.19 does.
+      and a reasons-only or indirect list, answer as PostgreSQL 15.19 does.
+    - **Scope decision (Joe, 2026-11-25, RP-747): where PostgreSQL's answer
+      is its OpenSSL's, the CURRENT OpenSSL's is kept.** A delta list is
+      never a certificate's list (no `X509_V_FLAG_USE_DELTAS`; OpenSSL 3.5.9
+      and 4.1.0 pass it over, so an issuer with only a delta answers
+      "unknown ca"), where PostgreSQL on Ubuntu's OpenSSL 3.0.13 read it as
+      a full list. The login comparisons' references link a current
+      OpenSSL to match: CI builds one (`.github/actions/pg15-current-openssl`,
+      3.5.9), and a developer box uses Homebrew's `postgresql@15` (OpenSSL
+      4) or one built against `openssl@3`.
     - **A self-signed root is never checked against the revocation lists**,
       as OpenSSL 3.6 has it (`check_cert_crl` skips it). PostgreSQL linked
       against an older OpenSSL (3.0.13 on Ubuntu 24.04) checks the root as
@@ -474,27 +482,6 @@ one beside it.
   Left open as a watch item until the lane stays green.
   Backlog-ID: RP-571
   Verify: none -- intermittent, Linux CI only, not reproduced on macOS; RP-002's two regression tests are the check, and print the cancel trace on a miss
-- [ ] **OPEN -- `gate_pg.sh`'s login step differs from the local reference
-  in 6 of 547 TLS scenarios, because that reference now links OpenSSL 4.**
-  Homebrew's `postgresql@15` (15.19_1, 2026-11-07) links
-  `openssl@4/lib/libssl.4.dylib`. Since then
-  `tests/test_rust_pg_login_differential.py` (`pg_login_tls_files.py`)
-  reports `541 of 547 the same` on every local run, and again on
-  2026-11-09 in the RM-379 lane. The six are the CRL distribution-point
-  scenarios: no distribution point (good, revoked), distribution point a
-  (good, revoked), distribution point b, and revoked-first-answer. In each
-  of them the reference answers `tlsv1 alert unknown ca`, even for a good
-  certificate. The Rust PG server accepts the good certificate, or answers
-  `certificate revoked`. Neither server's code changed. RP-013's record
-  says the OpenSSL version decides how a CRL on the root is checked. CI's
-  Ubuntu reference links OpenSSL 3, which is why CI still passes. Until
-  this is settled, the local login step cannot tell a regression from this
-  difference. The fix is either a local reference PostgreSQL linked against
-  OpenSSL 3, or CRLs that the probe issues so that OpenSSL 3 and 4 agree,
-  with the decision recorded in RP-013. Found by the MongoDB batch, and not
-  worked from that side.
-  Verify: none -- the local reference's OpenSSL decides it; `tests/test_rust_pg_login_differential.py` against a PostgreSQL 15 on OpenSSL 4 is the check
-  Backlog-ID: RP-747
 - [ ] **RUST pgserver: the planner's choices that decide row order are only
   partly modelled.** **Decided (Joe, 2026-10-16): build a cost model** --
   enough of PostgreSQL's planner to make its choices, since the order rows
