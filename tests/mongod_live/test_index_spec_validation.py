@@ -109,7 +109,16 @@ def test_a_wildcard_projection_belongs_to_a_top_level_wildcard_key(
 ) -> None:
     cases = [
         (key, {"wildcardProjection": value})
-        for key in ({"a": 1}, {"a": "text"}, {"a": "hashed"}, {"a.$**": 1}, {"$**": 1}, {"$**": -1})
+        for key in (
+            {"a": 1},
+            {"a": "text"},
+            {"a": "hashed"},
+            {"a.$**": 1},
+            {"$**": 1},
+            {"$**": -1},
+            {"a": 1, "$**": 1},
+            {"a": 1, "b.$**": 1},
+        )
         for value in ({"a": 1}, {}, 1, "x", None)
     ]
     assert not _differences(rust_mongo, mongod, cases)

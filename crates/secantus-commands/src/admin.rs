@@ -3870,7 +3870,7 @@ fn index_spec_fields_problem(spec: &Document) -> Option<CommandError> {
                 let Bson::Document(projection) = value else {
                     return Some(mismatch(field, "a non-empty object", value));
                 };
-                if !key.is_some_and(|k| k.len() == 1 && k.contains_key("$**")) {
+                if !key.is_some_and(|k| k.contains_key("$**")) {
                     return Some(in_spec(
                         9,
                         "FailedToParse",
@@ -6444,5 +6444,8 @@ mod index_spec_fields_tests {
         assert_eq!(wp(doc! {"a.$**": 1}, doc! {}.into()), Some(9));
         assert_eq!(wp(doc! {"$**": 1}, doc! {}.into()), Some(9));
         assert_eq!(wp(doc! {"$**": 1}, doc! {"a": 1}.into()), None);
+        // A compound wildcard key takes one.
+        assert_eq!(wp(doc! {"a": 1, "$**": 1}, doc! {"b": 1}.into()), None);
+        assert_eq!(wp(doc! {"a": 1, "b.$**": 1}, doc! {"b": 1}.into()), Some(9));
     }
 }
