@@ -602,7 +602,10 @@ mod tests {
         );
         let parsed = RevocationList::parse(&list(true, &[&[5]], Some(&delta), None))
             .expect("a delta list is read, then passed over");
-        assert!(parsed.scope.unusable, "OpenSSL 3.5.9 / 4.1.0: no delta support");
+        assert!(
+            parsed.scope.unusable,
+            "OpenSSL 3.5.9 / 4.1.0: no delta support"
+        );
         let full = RevocationList::parse(&list(true, &[&[5]], Some(&[]), None)).unwrap();
         assert!(!full.scope.unusable);
     }
