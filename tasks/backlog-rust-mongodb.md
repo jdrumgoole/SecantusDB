@@ -2102,19 +2102,18 @@ cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: a time-series read under a hint, or over a
-      collection with an index of its own, reads the collection at the
-      command.** Hinted to `m_1_t_1` (`{$match: {v: {$gte: 0}}}`), mongod
-      8.2.11 scans that index over the buckets, buffering 32 series by
-      series, and returns 1,279 more after the delete; this server reads it
-      whole: 3,999. So too a read under a collation, and any read of a
-      collection with an index besides the default one. Since RM-457 the
-      default `m_1_t_1` index is built over the buckets at create and a
-      filter on the meta field scans it; an index `createIndexes` adds is
-      kept on the collection only, `dropIndexes` leaves the bucket copy of
+- [ ] **RUST MongoDB server: a time-series read under a collation, or over
+      a collection with an index of its own, reads the collection at the
+      command.** Under `{locale: "en"}`, mongod 8.2.11 reads through its
+      cursor stage, 32 buckets first, and returns 2,303 more after the
+      delete; this server reads it whole: 3,999. So too any read of a
+      collection with an index besides the default one, and a hint to
+      any index but the default one (a hint to `m_1_t_1` or `{$natural: 1}`
+      matches since 2026-11-25). An index `createIndexes` adds is kept on
+      the collection only, `dropIndexes` leaves the bucket copy of
       `m_1_t_1` in place, and `collStats` still reports index sizes of 0.
       Found while working RM-457, 2026-11-15.
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_hinted_time_series_read_scans_the_index_over_the_buckets
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_under_a_collation_buffers_its_buckets
       Backlog-ID: RM-701
 - [ ] **RUST MongoDB server: an insert into a time-series bucket the TTL
       monitor removes fails.** Inserting into a bucket that has expired

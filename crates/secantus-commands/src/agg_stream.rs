@@ -625,8 +625,7 @@ fn time_series(
         .get(lead)
         .is_some_and(|s| groups_on_meta(s, meta.as_deref()) || counts_stage(s))
         && ask.pipeline[lead + 1..].iter().all(fits);
-    if ask.hint.is_some()
-        || ask.collation.is_some()
+    if ask.collation.is_some()
         || !(per_bucket || only_projects || meta_group || ask.pipeline.iter().all(fits))
         || ask.pipeline.iter().any(mentions_meta)
     {
@@ -645,21 +644,46 @@ fn time_series(
         .get_collection_options(ask.db, ask.coll)
         .ok()
         .and_then(|o| crate::timeseries::Fields::of(&o))
-        .and_then(|f| f.default_index())
-        .map(|(name, _)| name);
+        .and_then(|f| f.default_index());
     let listed = storage.list_indexes(ask.db, ask.coll).map_err(read_error)?;
     let names: Vec<&str> = listed
         .iter()
         .filter_map(|spec| spec.get_str("name").ok())
         .collect();
-    let own_index = names
-        .iter()
-        .any(|name| *name != "_id_" && Some(*name) != default_index.as_deref());
+    let own_index = names.iter().any(|name| {
+        *name != "_id_" && Some(*name) != default_index.as_ref().map(|(n, _)| n.as_str())
+    });
     // A dropped default index leaves its copy over the buckets: unused.
-    let default_index = default_index.filter(|d| names.contains(&d.as_str()));
+    let default_index = default_index.filter(|(d, _)| names.contains(&d.as_str()));
     if own_index {
         return Ok(None);
     }
+    // A hint to the default index, by name or by key, is mongod's scan of
+    // it over the buckets (measured 8.2.11: 1,279 after the delete, as the
+    // meta filter of RM-457, RM-701). Any other hint reads at the command.
+    // `{$natural: 1}` reads the buckets in order, as no hint does (2,303).
+    let natural = |h: &Bson| {
+        h.as_document().is_some_and(|d| {
+            d.len() == 1
+                && d.get("$natural")
+                    .and_then(|n| match n {
+                        Bson::Int32(n) => Some(f64::from(*n)),
+                        Bson::Int64(n) => Some(*n as f64),
+                        Bson::Double(n) => Some(*n),
+                        _ => None,
+                    })
+                    .is_some_and(|n| n == 1.0)
+        })
+    };
+    let hinted = match ask.hint {
+        None => false,
+        Some(hint) if natural(hint) => false,
+        Some(hint) => match &default_index {
+            Some((name, key)) if hints_index(hint, name, key) => true,
+            _ => return Ok(None),
+        },
+    };
+    let default_index = default_index.map(|(name, _)| name);
     let filter = crate::explain::pipeline_canonical(ask.coll, ask.pipeline).filter;
     let Some(scan) = crate::ts_buckets::BucketScan::of(storage, ask.db, ask.coll, ask.ns, &filter)?
     else {
@@ -667,7 +691,7 @@ fn time_series(
     };
     // A filter on the meta field is mongod's scan of the default index
     // over the buckets (RM-457).
-    let scan = if scan.filters_meta() {
+    let scan = if hinted || scan.filters_meta() {
         match default_index {
             Some(name) => match scan.through_index(storage, &name).map_err(read_error)? {
                 Some(scan) => scan,
@@ -693,6 +717,15 @@ fn time_series(
         .iter()
         .any(|s| matches!(stage_name(s), "$sort" | "$group" | "$count"));
     Ok(Some((cursor, Vec::new())))
+}
+
+/// `hint` names index `name` (key `key`): its name, or its key pattern.
+fn hints_index(hint: &Bson, name: &str, key: &Document) -> bool {
+    match hint {
+        Bson::String(h) => h == name,
+        Bson::Document(h) => h == key,
+        _ => false,
+    }
 }
 
 /// The cursor of a pipeline that opens with a `$geoNear`: mongod's ring
