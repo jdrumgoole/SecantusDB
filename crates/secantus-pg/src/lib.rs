@@ -46549,6 +46549,18 @@ impl PgHandler {
                     )
                     .map_err(|e| Self::err(&e))?;
                 }
+                // So does a generated column's expression: PostgreSQL stores
+                // its analysed tree, which holds the attnum (RP-1053).
+                for c in &mut def.columns {
+                    let Ok(generated) = c.extra.get_str("generated") else {
+                        continue;
+                    };
+                    let renamed = secantus_pgplan::rename_column_in_expression(
+                        generated, &before, &column, &to,
+                    )
+                    .map_err(|e| Self::err(&e))?;
+                    c.extra.insert("generated", renamed);
+                }
                 Self::rename_partition_key_column(&mut def, &column, &to)?;
                 if let Some(c) = def.columns.iter_mut().find(|c| c.name == column) {
                     c.name = to.clone();
