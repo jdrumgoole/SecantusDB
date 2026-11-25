@@ -260,6 +260,27 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **mongod 8.2 crashed opening a store `secantusd-mdb` wrote and
+      `reIndex`ed (2026-11-25), once.** On PR #2979 (run 45534098323, job
+      `mdb-binary (backlog)`, head `6eb68eb86`), RM-788's regression test
+      `tests/backlog/test_rm_storage_model.py::test_mongod_opens_the_index_specs_secantus_wrote_and_reindexed`
+      read REGRESSED: mongod died with a fatal message from the
+      `ReplCoord-0` thread (`ThreadPool::Impl::_doOneTask` frames) before
+      the client's first command, so pymongo saw `connection closed`. The
+      same test passed on `main`'s push run for `4547c86f9` (run
+      45528505272), which already held RM-788/RM-789's commits, and the PR
+      touched only the PG server's CRL reader and CI's PG login lane, which
+      neither server's store reaches. The log CI kept is the tail after the
+      fatal message, so its cause is not recorded. A mongod that crashes on
+      a store this server wrote is a durability signal, not noise: rerun
+      the test in a loop against mongod 8.2.11 with its full log kept
+      (`--logpath` beside the store), find the fatal message's first line
+      (an invariant or a fassert id) and what of the store it read, then
+      fix the store. Filed by the PG session; nothing on the MongoDB side
+      was changed.
+      Verify: none -- intermittent, once on CI; RM-788's regression test is the check
+      Backlog-ID: RM-797
+
 - [ ] **`test_a_contested_write_of_many_plans_as_mongod[query0-delete]`
       compares a timing-dependent order (2026-11-24).** On snapshot PR
       #2975 (run 45439792340, job `mdb-binary (live)`) it failed, then its
