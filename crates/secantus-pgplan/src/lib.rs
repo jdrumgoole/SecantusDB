@@ -40360,15 +40360,18 @@ fn text_type_oid(name: &str) -> Option<i64> {
     let found_in = match parts.as_slice() {
         [one] => {
             let schema = schemas::type_schema_of(&pgtypes::user_type_key(one));
-            // `_t`, the internal spelling of `t[]`, is found where `t` is.
-            if schema.is_none() {
-                if let Some(element) = one.strip_prefix('_').filter(|e| !e.is_empty()) {
-                    let key = pgtypes::user_type_key(element);
-                    if let Some(s) = schemas::type_schema_of(&key) {
-                        return user_type_or_array_oid(&format!(
-                            "{}[]",
-                            schemas::relation_key(&s, &key)
-                        ));
+            // No type is itself named `one`: it may be an array type's name,
+            // found in the first schema on the path whose array of that
+            // name exists (`TypenameGetTypid` reads `typname` as given).
+            if schema.is_none() && one.starts_with('_') {
+                for s in schemas::type_search_order() {
+                    let element = underscore_array_element(one, |n| {
+                        let key = schemas::relation_key(&s, &pgtypes::user_type_key(n));
+                        user_type_oid(&key).or_else(|| user_composite_oid(&key))
+                    });
+                    if let Some(element) = element {
+                        let key = schemas::relation_key(&s, &pgtypes::user_type_key(&element));
+                        return user_type_or_array_oid(&format!("{key}[]"));
                     }
                 }
             }
@@ -40411,19 +40414,56 @@ fn text_type_oid(name: &str) -> Option<i64> {
 
 pub(crate) fn user_type_or_array_oid(name: &str) -> Option<i64> {
     let trimmed = name.trim();
-    let element = if let Some(e) = trimmed.strip_suffix("[]") {
-        Some(e.trim_end())
-    } else if !trimmed.starts_with('"') && trimmed.starts_with('_') {
-        Some(&trimmed[1..])
-    } else {
-        None
-    };
-    match element {
-        Some(e) => user_type_oid(e)
-            .or_else(|| user_composite_oid(e))
-            .map(|oid| oid + USER_TYPE_ARRAY_OID_OFFSET),
-        None => user_type_oid(trimmed).or_else(|| user_composite_oid(trimmed)),
+    let own = |n: &str| user_type_oid(n).or_else(|| user_composite_oid(n));
+    let array_of = |e: &str| own(e).map(|oid| oid + USER_TYPE_ARRAY_OID_OFFSET);
+    if let Some(e) = trimmed.strip_suffix("[]") {
+        return array_of(e.trim_end());
     }
+    // A `_`-prefixed name is a `typname` like any other: the type of that
+    // name first (`CREATE TYPE _custom` is `_custom`, RP-1055), and only
+    // then the array type that carries it.
+    own(trimmed).or_else(|| {
+        if trimmed.starts_with('"') || !trimmed.starts_with('_') {
+            return None;
+        }
+        array_of(&underscore_array_element(trimmed, own)?)
+    })
+}
+
+/// The type whose ARRAY type is named `name`, when no type is itself named
+/// `name` -- PostgreSQL's `makeArrayTypeName` replayed. Each array is named
+/// `_` and its element's name, with another `_` in front for as long as
+/// that is taken, by a type's own name or by an array named before it
+/// (creation, i.e. oid, order; `moveArrayTypeName` gives the same names
+/// when a type later takes an array's). Only the types named by `name`'s
+/// stem with fewer leading `_` can own an array of that name, and only
+/// they can take the names those arrays try first. So after `CREATE TYPE
+/// custom` then `CREATE TYPE _custom`, `__custom` is `custom[]` and
+/// `___custom` is `_custom[]` (measured on PostgreSQL 15.19, 2026-11-25).
+/// `own` answers a type's own oid by name, in the schema being searched.
+fn underscore_array_element(name: &str, own: impl Fn(&str) -> Option<i64>) -> Option<String> {
+    let stem = name.trim_start_matches('_');
+    let depth = name.len() - stem.len();
+    if stem.is_empty() || depth == 0 {
+        return None;
+    }
+    // `(oid, leading underscores)` of each type in the family below `name`.
+    let mut family: Vec<(i64, usize)> = (0..depth)
+        .filter_map(|j| own(&format!("{}{stem}", "_".repeat(j))).map(|oid| (oid, j)))
+        .collect();
+    family.sort_unstable();
+    let mut taken: std::collections::HashSet<usize> = family.iter().map(|(_, j)| *j).collect();
+    for (_, j) in family {
+        let mut k = j + 1;
+        while taken.contains(&k) {
+            k += 1;
+        }
+        if k == depth {
+            return Some(format!("{}{stem}", "_".repeat(j)));
+        }
+        taken.insert(k);
+    }
+    None
 }
 
 /// Does `name` resolve to a user-defined type (a domain, enum, range, base

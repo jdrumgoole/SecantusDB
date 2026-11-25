@@ -490,7 +490,7 @@ pub fn type_key(parts: &[String]) -> String {
 /// `pg_catalog` is left out: [`resolve_type_names`] checks a temporary
 /// type ahead of the built-ins, and the path's others after. Relations and types are found in the temporary schema;
 /// functions and operators never are (`FuncnameGetCandidates`).
-fn type_search_order() -> Vec<String> {
+pub(crate) fn type_search_order() -> Vec<String> {
     let temp = temp_schema_in_use();
     let path = search_path();
     let explicit = path.iter().any(|s| s == "pg_temp");

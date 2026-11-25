@@ -1177,19 +1177,6 @@ one beside it.
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth
       Backlog-ID: RP-1073
 
-## Found while working RP-970 (2026-11-18)
-
-- [ ] **OPEN — `'_custom'::regtype` names `custom`'s array, not the type
-      named `_custom`.** After `CREATE TYPE _custom AS ENUM ('b')` and then
-      `CREATE TYPE custom AS ENUM ('c')`, PostgreSQL 15.19 resolves
-      `'_custom'::regtype` to the enum `_custom` (and names `custom`'s array
-      `___custom`, which `pg_type` here already lists). `secantusd-pg`
-      resolves it to `custom`'s array type: a `_`-prefixed name is read as
-      an array of the rest before a type of that exact name is looked for.
-      PostgreSQL's `typenameTypeId` looks the name up in `pg_type` as given.
-      Verify: tests/backlog/test_rp_found_rp970.py::test_an_underscore_type_name_resolves_to_that_type
-      Backlog-ID: RP-1055
-
 ## Found by a CI run (2026-11-07)
 
 - [ ] **OPEN — CI: `obj_description` of a commented index answered NULL
