@@ -37752,6 +37752,7 @@ impl PgHandler {
         let mut handle = self.open_transaction_handle()?;
         let counted = self.stats().checkpoint();
         let mut collided = false;
+        let changes_catalog = Self::may_change_catalog(&stmt);
         let out = loop {
             self.stats().rewind(counted.clone());
             let out = self
@@ -37763,6 +37764,21 @@ impl PgHandler {
                     self.storage
                         .commit_user_transaction(&mut handle)
                         .map_err(|e| Self::storage_err("could not commit a transaction", e))?;
+                    // The catalog version moved when the statement ran
+                    // (`execute_statement`), BEFORE this commit made its
+                    // catalog rows visible. Another connection's catalog read
+                    // in between saw the rows as they were and was recorded
+                    // as current for the new version -- a process-wide cache
+                    // entry every later reader trusted, so this connection's
+                    // next `'t'::regclass` answered 42P01 for the table it had
+                    // just created (RP-1080). PostgreSQL sends a
+                    // transaction's invalidations at its commit
+                    // (`AtEOXact_Inval`, after `RecordTransactionCommit`);
+                    // moving the version again now is that message, as
+                    // `commit_implicit_inner` and COMMIT already send it.
+                    if changes_catalog {
+                        bump_catalog_version();
+                    }
                     Ok(r)
                 });
             let e = match out {
