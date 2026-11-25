@@ -17230,6 +17230,54 @@ def test_parallel_sessions_resolve_their_own_new_temp_table(home: Path) -> None:
     assert failures == []
 
 
+def test_an_autocommit_create_table_resolves_beside_a_catalog_reader(home: Path) -> None:
+    """RP-1080: an autocommit `CREATE TABLE` is visible to its connection's
+    next statement while another connection reads the catalog, as every
+    committed table is in PostgreSQL.
+
+    The statement runs in a transaction of its own (`run_autocommit_write`),
+    and the catalog version moved when it ran, BEFORE that transaction
+    committed. A catalog read on another connection in between saw the
+    catalog without the table and was recorded process-wide as current for
+    the new version; the creator's `'t'::regclass` then answered 42P01, and
+    went on answering it until the next DDL. Before the fix this loop missed
+    26 of 300 tables in 10 s on an empty schema (debug build, 2026-11-24);
+    the backlog saw it first as the catalog-latency tests' 42P01 under load,
+    where the reader was the autovacuum worker walking every table."""
+    stop = threading.Event()
+    reads = [0]
+    reader_errors: list[str] = []
+
+    def reader() -> None:
+        try:
+            with server.connect() as b:
+                while not stop.is_set():
+                    b.execute("select to_regclass('pg_class')").fetchone()
+                    reads[0] += 1
+        except psycopg.Error as e:  # surfaced below, never swallowed
+            reader_errors.append(f"{e.sqlstate}: {e}")
+
+    misses: list[str] = []
+    with _Server(home) as server, server.connect() as a:
+        b = threading.Thread(target=reader)
+        b.start()
+        try:
+            for i in range(200):
+                a.execute(f"create table rp1080_{i} (v int)")
+                try:
+                    a.execute(f"select 'rp1080_{i}'::regclass").fetchone()
+                except psycopg.errors.UndefinedTable as e:
+                    misses.append(str(e).splitlines()[0])
+        finally:
+            stop.set()
+            b.join(60)
+        assert not b.is_alive()
+    assert reader_errors == []
+    # The race needs the reader to have been reading throughout.
+    assert reads[0] > 200
+    assert misses == []
+
+
 def test_pg_temp_function_is_session_private_and_dropped_at_disconnect(home: Path) -> None:
     """`create function pg_temp.f()` lives in the session's temp schema: no
     other session sees it, and it is gone when the session ends. It used to
