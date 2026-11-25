@@ -18532,6 +18532,23 @@ impl Storage {
     /// [`Self::visible_indexes`]).
     fn planner_descs(&self, session: &Session, db: &str, coll: &str) -> Result<Vec<IndexDesc>> {
         let mut descs = self.index_descs(session, db, coll)?;
+        // In mongod's in-memory catalog order (RM-790).
+        let moved_any = !self
+            .index_order
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        if let Some(uuid) = moved_any
+            .then(|| collection_uuid(session, db, coll).ok())
+            .flatten()
+        {
+            let map = self.index_order.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(held) = map.get(&uuid) {
+                let names = descs.iter().map(|d| d.name.clone()).collect();
+                let order = Self::in_memory_order(Some(held), names);
+                descs.sort_by_key(|d| order.iter().position(|n| *n == d.name));
+            }
+        }
         let order = order::bindata_order();
         descs.retain(|d| !d.hidden && d.collation.is_none() && d.key_order == order);
         Ok(descs)
@@ -22015,6 +22032,34 @@ impl Storage {
             };
             key(&a.0).cmp(&key(&b.0))
         });
+        // The planner reads mongod's IN-MEMORY catalog, where an index a
+        // `collMod` changed has moved to the end, and a cost tie goes to the
+        // first candidate (RM-790). `_id_` stays first.
+        let names: Vec<String> = out
+            .iter()
+            .map(|(d, _)| d.get_str("name").unwrap_or("").to_string())
+            .collect();
+        let moved_any = !self
+            .index_order
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        if let Some(uuid) = moved_any
+            .then(|| collection_uuid(&session, db, coll).ok())
+            .flatten()
+        {
+            let map = self.index_order.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(held) = map.get(&uuid) {
+                let order = Self::in_memory_order(Some(held), names);
+                let rank = |d: &Document| {
+                    order
+                        .iter()
+                        .position(|n| Some(n.as_str()) == d.get_str("name").ok())
+                        .unwrap_or(0)
+                };
+                out.sort_by_key(|(d, _)| (d.get_str("name") != Ok(ID_INDEX_NAME), rank(d)));
+            }
+        }
         Ok(out)
     }
 

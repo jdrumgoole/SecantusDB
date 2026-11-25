@@ -2883,17 +2883,6 @@ wrote and stopped (the forward direction of RM-723).
 
 ## Found working RM-734 (index spec fidelity, 2026-11-24)
 
-- [ ] **A planner tie goes by build order, not by mongod's in-memory index
-      order.** Three single-field indexes cost the same for `{a: 3, b: 3,
-      c: 3}`: mongod 8.2.11 takes the first in the collection's in-memory
-      order, where an index a `collMod` changed has moved to the end (after
-      `collMod` of `a_1`, `b_1` wins and `a_1` is last of the rejected
-      plans; after `a_1` and `b_1`, `c_1`); `secantusd-mdb` picks `a_1`
-      each time. RM-734 keeps that in-memory order for `dropIndexes: "*"`
-      only. Found working RM-734 (not fixed with it).
-      Verify: tests/backlog/test_rm_index_spec_fidelity.py::test_a_planner_tie_goes_by_the_in_memory_index_order
-      Backlog-ID: RM-790
-
 - [ ] **A `wildcardProjection` is not parsed as a projection.** Found closing
       RM-771 (2026-11-24, mongod 8.2.11). mongod parses the projection of a
       `$**` index as an inclusion or an exclusion and refuses one that mixes

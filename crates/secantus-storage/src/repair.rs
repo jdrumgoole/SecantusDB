@@ -225,6 +225,14 @@ impl Storage {
         // repair writes (RM-746).
         let _untimestamped = untimestamped();
         let session = self.conn.open_session()?;
+        // Every index is built again in build order, so the in-memory order
+        // a `collMod` moved them to is gone (mongod 8.2.11, RM-790).
+        if let Ok(uuid) = collection_uuid(&session, db, coll) {
+            self.index_order
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&uuid);
+        }
 
         // The `_id` index: emptied, then one entry per document.
         let id_table = if with_id {
