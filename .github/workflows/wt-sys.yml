@@ -35,6 +35,13 @@ on:
       - "cmake/patch_wt_*.py"
       - "vendor/wiredtiger"
       - ".github/workflows/wt-sys.yml"
+  # Windows builds only weekly and on demand (Joe, 2026-11-25: "For
+  # debugging builds don't build windows"): a PR or a push to main packages
+  # the crate on Linux and macOS; the Sunday run and `gh workflow run
+  # wt-sys.yml` add Windows. Run it by hand before a release or after a
+  # change to the crate's build.
+  schedule:
+    - cron: "37 4 * * 0"
   workflow_dispatch:
 
 concurrency:
@@ -49,7 +56,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: >-
+          ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+          && '["ubuntu-latest", "macos-latest", "windows-latest"]'
+          || '["ubuntu-latest", "macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

@@ -1193,33 +1193,6 @@ one beside it.
       Verify: none -- intermittent (2 of 11 runs), not reproducible on demand; the test named above is where it shows
       Backlog-ID: RP-1081
 
-- [ ] **OPEN — the first catalog query after a `CREATE TABLE` still grows
-      with the schema, about 0.9 ms per thousand tables (debug build).**
-      psql's `\d` collation query, run straight after a `CREATE TABLE`:
-      11.5 ms with no other table, 11.8 ms with 800, 13.5 ms with 2,400 and
-      15.9 ms with 4,800 (one debug `secantusd-pg`, arm64 macOS). PostgreSQL
-      15.19 takes the same time at any size: DDL invalidates only the cache
-      entries it changed (`inval.c`) and its scans read one relation's rows
-      by index. A sample at 8,000 tables shows whole-schema walks per
-      statement: `install_user_types` -> `install_session_state`
-      (`committed_table_defs`, `patch_table_defs`) and `publish_user_types`
-      -> `index_relations` -> `derive_index_relations`, which visits every
-      table's columns; and `catalog_rows_keyed` -> `build_catalog_rows`.
-      Which of these grow is not yet split out: profile 0 against 8,000
-      tables before changing one. On CI it has reached 800 tables once:
-      snapshot PR #2992 (run 45595956409, job `pg-oracle (backlog)`, head
-      `ec891bbfc`, which held only RP-1050's planner change) failed RP-911's
-      regression test
-      `test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a_tenth`
-      with a median of 22.1 ms with no other table and 25.1 ms with 800
-      (1.14, over the tenth). The same job passed on the 28 other runs
-      from 2026-11-24 17:45 to 2026-11-25 12:16, main's included. Whether
-      that is runner noise at a budget this tight or this growth showing at
-      800 tables on CI's slower runner is not settled: measure the
-      800-table pair in a loop before touching its budget.
-      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth
-      Backlog-ID: RP-1073
-
 - [ ] **OPEN — the catalog-latency ratio tests fail at their thresholds on
       CI's runner (2026-11-25).** `tests/backlog/test_rp_catalog_latency.py`
       compares ratios so that its verdicts would hold on any runner, but the

@@ -306,7 +306,7 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a
     )
 
 
-@pytest.mark.backlog("RP-1073")
+@pytest.mark.backlog_fixed("RP-1073")
 def test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth(
     pg_pair: tuple[Any, Any],
 ) -> None:
@@ -317,18 +317,24 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_
     A debug `secantusd-pg` on arm64 macOS, one server grown in steps
     (2026-11-19): a median of 11.5 ms with no other table, 11.8 ms with
     800, 13.5 ms with 2,400 and 15.9 ms with 4,800, about 0.9 ms more for
-    each thousand tables. At 800 that is inside the previous test's tenth
-    again plus 1 ms; here it is not. A sample at 8,000 tables puts the
-    statement's whole-schema walks in `install_user_types`
-    (`committed_table_defs`, `patch_table_defs`, and `publish_user_types`'
-    `index_relations`, which visits every table's columns) and
-    `catalog_rows_keyed`'s `build_catalog_rows`.
+    each thousand tables; paired here, 13.7 ms against 16.4 ms at 3,200
+    (a ratio of 1.20, 2026-11-25). Each catalog version republished the
+    planner's tables by walking every definition: a set of every table's
+    name copied out of them (`set_relation_keys`), which a miss then
+    searched, and the partitions, the inheriting, temporary and collating
+    tables, and a keyed `pg_attribute` read's own tables, each found by a
+    walk of its own. The definitions are now installed as shared, found
+    by name with a binary search, and those few tables are kept with the
+    committed version and patched from what a commit changed, as
+    PostgreSQL rebuilds only the cache entries an invalidation names. Then
+    13.1 ms against 14.3 ms (1.10, 2026-11-25).
 
     The same bound as at 800 tables, a tenth again plus 1 ms, with four
     times as many tables."""
     small, large = pg_pair
     _grow(large, "rp_g32", 8 * GROWTH_TABLES)
     pairs = _paired(small, large, _first_collation, "rp_g32")
+    print(_ratios(pairs, "first query after DDL", 8 * GROWTH_TABLES))
     assert _median_excess(pairs, 1.1) < 0.001, _ratios(
         pairs, "first query after DDL", 8 * GROWTH_TABLES
     )

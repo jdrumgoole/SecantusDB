@@ -236,7 +236,10 @@ impl PgHandler {
         let Ok(defs) = self.shared_table_defs() else {
             return Vec::new();
         };
-        defs.iter()
+        // The partitions alone, not every table (RP-1073).
+        self.special_tables(&defs)
+            .partitions
+            .iter()
             .filter_map(|d| {
                 let parent = parent_of(d)?;
                 let cond = self.partition_condition(d).ok()??;
@@ -258,7 +261,9 @@ impl PgHandler {
         let Ok(defs) = self.shared_table_defs() else {
             return Vec::new();
         };
-        defs.iter()
+        self.special_tables(&defs)
+            .partitions
+            .iter()
             .filter_map(|d| {
                 let parent = self.lookup(parent_of(d)?)?;
                 let cols: Vec<(String, String)> = d

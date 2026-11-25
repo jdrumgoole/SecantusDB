@@ -11,7 +11,7 @@ use std::sync::Arc;
 use bson::{Bson, Document};
 use secantus_pgcatalog::{Column, TableDef};
 
-use crate::PgHandler;
+use crate::{PgHandler, TableDefs};
 
 /// The `default` collation, and the one a `name` column carries (`C`).
 const DEFAULT_COLLATION: i64 = 100;
@@ -1208,16 +1208,33 @@ impl PgHandler {
     /// them. `None` when a catalog cannot be read.
     fn tables_of_relids<'a>(
         &self,
-        defs: &'a [Arc<TableDef>],
+        defs: &'a TableDefs,
         relids: &[i64],
     ) -> Option<Vec<(i64, &'a TableDef)>> {
         let mut names: Vec<String> = Vec::new();
         for oid in relids.iter().filter(|o| **o != 0) {
             names.extend(self.relation_names_of_oid(*oid)?.0);
         }
-        let parents: Vec<String> = defs
-            .iter()
-            .filter(|t| names.contains(&t.name))
+        // The definitions `names` holds, in `defs`' order: found by name
+        // when `defs` are in the order of their names, as PostgreSQL reads
+        // each relation's `pg_class` row by oid, rather than by a walk over
+        // every table (RP-1073).
+        let by_name = self.table_defs_by_name(defs);
+        let named = |names: &[String]| -> Vec<&'a Arc<TableDef>> {
+            if by_name {
+                let mut at: Vec<usize> = names
+                    .iter()
+                    .filter_map(|n| defs.binary_search_by(|t| t.name.as_str().cmp(n)).ok())
+                    .collect();
+                at.sort_unstable();
+                at.dedup();
+                at.into_iter().map(|i| &defs[i]).collect()
+            } else {
+                defs.iter().filter(|t| names.contains(&t.name)).collect()
+            }
+        };
+        let parents: Vec<String> = named(&names)
+            .into_iter()
             .flat_map(|t| {
                 let mut p = Self::inherited_parents(t);
                 p.extend(crate::partition::parent_of(t).map(str::to_string));
@@ -1226,8 +1243,8 @@ impl PgHandler {
             .collect();
         names.extend(parents);
         Some(
-            defs.iter()
-                .filter(|t| names.contains(&t.name))
+            named(&names)
+                .into_iter()
                 .filter_map(|t| Some((self.relation_oid(&t.name)?, &**t)))
                 .collect(),
         )
