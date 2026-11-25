@@ -1395,10 +1395,11 @@ batch, their tests regression tests:
       A `btree_gin` index over a scalar `int2`/`int4`/`int8`/`float4`/
       `float8`/`bool`/`text` column has been modelled since 2026-11-17, and
       over `date`/`timestamp`/`timestamptz`, `numeric` and `interval` since
-      2026-11-18 (one key per row, the value itself); its scans are not, nor
-      its other types (`time`, `timetz`, `bytea`, `inet`, ...).
+      2026-11-18, and over `time` since 2026-11-25 (one key per row, the
+      value itself); its scans are not, nor its other types (`timetz`,
+      `bytea`, `inet`, ...).
       Backlog-ID: RP-287
-      Verify: tests/backlog/test_rp_top10_found.py::test_a_btree_gin_time_index_has_its_pages
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_btree_gin_timetz_index_has_its_pages
 
 
 ## Found by batch 71 (2026-10-25)

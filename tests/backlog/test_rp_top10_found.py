@@ -1319,11 +1319,12 @@ def test_a_btree_gin_interval_index_has_its_pages(pg: Any) -> None:
     assert got == ("ok", [(177,)])
 
 
-@pytest.mark.backlog("RP-287")
+@pytest.mark.backlog_fixed("RP-287")
 def test_a_btree_gin_time_index_has_its_pages(pg: Any) -> None:
-    """A btree_gin index over a `time` column is not modelled (8-byte keys
+    """A btree_gin index over a `time` column was not modelled (8-byte keys
     ordered by `time_cmp`): PostgreSQL 15.19 sizes this one at 66 pages;
-    here `pg_relation_size` reads 0."""
+    here `pg_relation_size` read 0. Building it also needed `make_time` to
+    take 60 seconds, as `float_time_overflows` does: it raised 22008."""
     got = _in_block(
         pg,
         [
@@ -1336,3 +1337,23 @@ def test_a_btree_gin_time_index_has_its_pages(pg: Any) -> None:
         "select pg_relation_size('rp287_bti') / 8192",
     )
     assert got == ("ok", [(66,)])
+
+
+@pytest.mark.backlog("RP-287")
+def test_a_btree_gin_timetz_index_has_its_pages(pg: Any) -> None:
+    """A btree_gin index over a `timetz` column is not modelled (12-byte
+    keys ordered by `timetz_cmp_internal`, the UTC time then the zone):
+    PostgreSQL 15.20 sizes this one at 177 pages; here `pg_relation_size`
+    reads 0."""
+    got = _in_block(
+        pg,
+        [
+            "create extension if not exists btree_gin",
+            "create table rp287_btz (a timetz)",
+            "insert into rp287_btz select (make_time(g % 24, g % 60, (g % 61)::float8)::text"
+            " || '+' || (g % 13))::timetz from generate_series(1, 20000) g",
+            "create index rp287_btzi on rp287_btz using gin (a)",
+        ],
+        "select pg_relation_size('rp287_btzi') / 8192",
+    )
+    assert got == ("ok", [(177,)])

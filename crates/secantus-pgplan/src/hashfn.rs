@@ -207,7 +207,7 @@ fn clock_micros(s: &str) -> Result<i64> {
 }
 
 /// A `time` as microseconds since midnight.
-pub(crate) fn time_micros(v: &Bson) -> Result<i64> {
+pub fn time_micros(v: &Bson) -> Result<i64> {
     clock_micros(&text_of(v, "time")?)
 }
 
