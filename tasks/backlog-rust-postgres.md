@@ -1205,6 +1205,29 @@ one beside it.
       Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth
       Backlog-ID: RP-1073
 
+- [ ] **OPEN — the catalog-latency ratio tests fail at their thresholds on
+      CI's runner (2026-11-25).** `tests/backlog/test_rp_catalog_latency.py`
+      compares ratios so that its verdicts would hold on any runner, but the
+      ratios themselves differ by runner. Twice in one day a snapshot PR's
+      `pg-oracle (backlog)` job failed one of them at the edge, and each time
+      the same tests passed on the snapshot before:
+      RP-911's 800-table pair (22.1 ms against 25.1 ms, 1.14 over its 1.10;
+      PR #2992 at `ec891bbfc`, run 45595956409), then RP-715's
+      first-against-warm (83 ms against 3 x 21 ms + 20 ms = 83 ms; PR #2992
+      at `47b7dbed4`, run 45662413394). Locally (debug `secantusd-pg`, arm64
+      macOS, five runs of each tree interleaved) RP-715's pair is 14.0-14.2 ms
+      first and 6.2-6.5 ms warm on `pg-batch` at `672bed686`, against
+      13.1-13.4 ms and 5.6-5.7 ms on `main`'s server code, so the batch moved
+      neither ratio (2.3 against 2.4, limit 39 ms). CI's runner gives about
+      4. The batch did add about 0.6-0.8 ms to both queries (7-11%), from
+      commits not yet split out (RP-291's and RP-292's catalog changes touch
+      this path). Decide what the comparison should hold to on a slow
+      runner: more interleaved rounds, the median of several fastest-of-N
+      pairs, or a threshold measured on CI's own runner shape. Then bisect
+      the 0.6 ms. Do not just widen a threshold until it passes.
+      Verify: none -- intermittent on CI; RP-715's and RP-911's regression tests are the check
+      Backlog-ID: RP-1100
+
 ## Found by a CI run (2026-11-07)
 
 - [ ] **OPEN — CI: `obj_description` of a commented index answered NULL
