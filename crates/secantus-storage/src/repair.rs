@@ -145,6 +145,15 @@ fn verify_and_salvage(
         }
         Err(e) => return Err(e.into()),
     };
+    // A store closed as a standalone's has no stable timestamp, and a
+    // table salvaged under none cannot be verified again until a stable
+    // one is set. Set one past every timestamp the tables hold, and close
+    // without keeping it (`use_timestamp=false`): the repair leaves no
+    // stable timestamp behind, as a standalone's close leaves none.
+    if conn.query_timestamp("get=stable_timestamp")? == "0" {
+        conn.close_unstable();
+        conn.set_timestamp("oldest_timestamp=1,stable_timestamp=7fffffff00000000")?;
+    }
     let session = conn.open_session()?;
     let mut tables = Vec::new();
     {
