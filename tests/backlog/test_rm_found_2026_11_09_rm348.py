@@ -149,18 +149,65 @@ def test_a_time_series_read_under_a_collation_matches_as_mongod(
     assert run(rust_mongo) == run(mongod)
 
 
-@pytest.mark.backlog("RM-701")
+@pytest.mark.backlog_fixed("RM-701")
 def test_a_time_series_read_beside_an_index_of_its_own_buffers_its_buckets(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """A time-series collection with an index of its own, `{v: 1}`: mongod
     8.2.11 still reads an unindexed filter's buckets through its cursor
-    stage, 32 buckets first: 2,303 after the delete; this server reads the
-    collection whole at the command, 3,999."""
+    stage, 32 buckets first: 2,303 after the delete. This server read the
+    collection whole at the command, 3,999, until a filter the index
+    cannot serve streamed its buckets."""
 
     def read(c: Any) -> Any:
         c.create_index("v")
         return c.aggregate([{"$match": {"x": {"$exists": False}}}], batchSize=1)
+
+    want = _after_delete(mongod, read)
+    assert want == 2303
+    assert _after_delete(rust_mongo, read) == want
+
+
+@pytest.mark.backlog_fixed("RM-701")
+def test_a_time_series_read_beside_an_index_of_its_own_matches_as_mongod(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """With `{v: 1}` beside the default index, a read on `v`, on the meta
+    field and on neither answers as mongod 8.2.11 does."""
+
+    def run(client: Any) -> Any:
+        db = client["rm_found_1109_rm348"]
+        name = "ts" + uuid.uuid4().hex[:8]
+        db.create_collection(name, timeseries={"timeField": "t", "metaField": "m"})
+        c = db[name]
+        base = datetime.datetime(2024, 1, 1)
+        c.insert_many(
+            [
+                {"t": base + datetime.timedelta(minutes=i), "m": i % 5, "v": i, "w": i % 7}
+                for i in range(300)
+            ]
+        )
+        c.create_index("v")
+        out = []
+        for match in ({"v": {"$gte": 250}}, {"m": 2, "w": 3}, {"w": {"$lt": 2}}):
+            out.append(sorted(d["v"] for d in c.aggregate([{"$match": match}])))
+        return out
+
+    assert run(rust_mongo) == run(mongod)
+
+
+@pytest.mark.backlog("RM-701")
+def test_a_time_series_read_of_its_own_index_buffers_as_mongod(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """With `{v: 1}` beside the default index, a filter on `v` that every
+    measurement passes: mongod 8.2.11's planner picks the buckets in order
+    over its index, 32 buckets first, 2,303 after the delete; this server
+    reads any filter naming an own index's field whole, 3,999."""
+
+    def read(c: Any) -> Any:
+        c.create_index("v")
+        return c.aggregate([{"$match": {"v": {"$gte": 0}}}], batchSize=1)
 
     want = _after_delete(mongod, read)
     assert want == 2303

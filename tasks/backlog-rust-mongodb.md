@@ -2104,20 +2104,21 @@ listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
 - [ ] **RUST MongoDB server: a time-series read over a collection with an
-      index of its own reads the collection at the command.** With an
-      index `{v: 1}` beside the default one, an unindexed filter's read:
-      mongod 8.2.11 reads through its cursor stage, 32 buckets first, and
-      returns 2,303 more after the delete; this server reads it whole:
-      3,999. So too a hint to any index but the default one (a hint to
-      `m_1_t_1` or `{$natural: 1}` matches since 2026-11-25, and a read
-      under a collation since 2026-11-25, unless its filter holds a string
-      or names the meta field: those still read whole, as the bucket
-      bounds and the index over the buckets compare without the
-      collation). An index `createIndexes` adds is kept on the collection
-      only, `dropIndexes` leaves the bucket copy of `m_1_t_1` in place, and
-      `collStats` still reports index sizes of 0. Found while working
-      RM-457, 2026-11-15.
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_beside_an_index_of_its_own_buffers_its_buckets
+      index of its own reads the collection at the command when the index
+      could serve it.** With an index `{v: 1}` beside the default one, a
+      filter naming `v` (or any `$expr` / `$text` / `$where` filter) reads
+      whole here, 3,999 after the delete, as this server keeps no copy of
+      that index over the buckets to plan with. mongod 8.2.11 plans it:
+      `{v: {$gte: 0}}` takes the buckets in order, 2,303; a selective one
+      may scan its index over the buckets (not measured). An unindexed
+      filter streams its buckets since 2026-11-25. So too a hint to any
+      index but the default one, and a read under a collation whose filter
+      holds a string or names the meta field (the bucket bounds and the
+      index over the buckets compare without the collation). An index
+      `createIndexes` adds is kept on the collection only, `dropIndexes`
+      leaves the bucket copy of `m_1_t_1` in place, and `collStats` still
+      reports index sizes of 0. Found while working RM-457, 2026-11-15.
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_of_its_own_index_buffers_as_mongod
       Backlog-ID: RM-701
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
