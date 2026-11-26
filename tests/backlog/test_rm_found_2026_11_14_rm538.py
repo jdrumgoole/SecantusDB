@@ -40,7 +40,7 @@ DROPPED_OR_KEPT = {
 }
 
 
-@pytest.mark.backlog("RM-662")
+@pytest.mark.backlog_fixed("RM-662")
 def test_a_match_after_a_group_as_the_optimizer_leaves_it(
     rust_mongo: Any,
     mongod: Any,
@@ -48,7 +48,7 @@ def test_a_match_after_a_group_as_the_optimizer_leaves_it(
     """mongod 8.2.11 drops a `$match` of nothing behind a `$group` -- `{}`,
     or `{$sampleRate: 1}`, which it parses into nothing -- and the query
     then takes the whole pipeline; it leaves `{$alwaysTrue: 1}` behind the
-    `$group`. This server lists the empty `$match`, and moves the
+    `$group`. This server listed the empty `$match`, and moved the
     `$alwaysTrue` into the query."""
 
     def stage_names(client: Any) -> dict:
@@ -64,14 +64,14 @@ def test_a_match_after_a_group_as_the_optimizer_leaves_it(
 # ------------------------------------------------ a $$ROOT.x new root --
 
 
-@pytest.mark.backlog("RM-662")
+@pytest.mark.backlog_fixed("RM-662")
 def test_a_match_moves_ahead_of_a_root_variable_new_root(
     rust_mongo: Any,
     mongod: Any,
 ) -> None:
     """mongod 8.2.11 moves a `$match` behind `{$replaceRoot: {newRoot:
     "$$ROOT.x"}}` into the query, renamed onto `x`, as it does behind
-    `"$x"` (RM-536). This server leaves it behind the `$replaceRoot`."""
+    `"$x"` (RM-536). This server left it behind the `$replaceRoot`."""
     pipeline = [{"$replaceRoot": {"newRoot": "$$ROOT.x"}}, {"$match": {"a": 1}}]
     assert _listing(rust_mongo, pipeline) == _listing(mongod, pipeline)
 
