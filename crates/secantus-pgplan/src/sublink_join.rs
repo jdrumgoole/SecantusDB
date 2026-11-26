@@ -454,6 +454,16 @@ fn qualify(n: &mut pg_query::protobuf::Node, rel: &str) {
     }
 }
 
+/// Does `n` hold a one-part column reference?
+fn has_bare_column(n: &pg_query::protobuf::Node) -> bool {
+    let mut n = n.clone();
+    crate::walk_expr(&mut n, &mut |x| match x.node.as_ref() {
+        Some(N::ColumnRef(c)) if c.fields.len() == 1 => Err(Error::Parse(String::new())),
+        _ => Ok(()),
+    })
+    .is_err()
+}
+
 /// `n` with every `rel.col` reference made a bare `col`.
 fn unqualified(n: &pg_query::protobuf::Node, rel: &str) -> Option<pg_query::protobuf::Node> {
     let mut out = n.clone();
@@ -614,9 +624,9 @@ pub(crate) fn anti_join_of(query: &N, lookup: &dyn Fn(&str) -> Option<TableDef>)
             _ => conjuncts.push(a),
         }
     }
-    // An outer conjunct beside it is not yet planned as an anti join in
-    // the LEFT join form either (RP-1027).
-    if !found || conjuncts.len() != 1 {
+    // An outer conjunct beside it stays the WHERE's, over the outer
+    // relation, which restricts the anti join's outer scan (RP-1027).
+    if !found {
         return None;
     }
     exists.where_clause = and_of(conjuncts).map(Box::new);
@@ -634,6 +644,12 @@ pub(crate) fn anti_join_of(query: &N, lookup: &dyn Fn(&str) -> Option<TableDef>)
         None => return None,
     };
     let on = rest.pop()?;
+    // Each outer conjunct names its columns by the outer relation now
+    // (`qualify`); one it could not reach would be ambiguous beside the
+    // inner relation, or read it: not rewritten.
+    if rest.iter().any(has_bare_column) {
+        return None;
+    }
     let [outer_rv, inner_rv] = std::mem::take(&mut joined.from_clause).try_into().ok()?;
     joined.from_clause = vec![pg_query::protobuf::Node {
         node: Some(N::JoinExpr(Box::new(pg_query::protobuf::JoinExpr {
@@ -679,7 +695,7 @@ mod rp980_anti_join {
 
     /// A NOT EXISTS over a column equality is the LEFT join PostgreSQL
     /// reduces to the same anti join (RP-980); an outer conjunct beside
-    /// it is left alone (RP-1027).
+    /// it stays the WHERE's, over the outer relation (RP-1027).
     #[test]
     fn a_not_exists_is_the_left_join_anti_form() {
         assert_eq!(
@@ -690,6 +706,16 @@ mod rp980_anti_join {
         assert_eq!(
             rewritten(
                 "select * from e where a > 5 and not exists (select 1 from e e2 where e2.a = e.a)"
+            )
+            .as_deref(),
+            Some("SELECT e.* FROM e LEFT JOIN e e2 ON e.a = e2.a WHERE e.a > 5 AND e2.a IS NULL")
+        );
+        // A column `qualify` does not reach would be ambiguous beside the
+        // inner relation: not rewritten.
+        assert_eq!(
+            rewritten(
+                "select * from e where coalesce(a, 0) > 5 \
+                 and not exists (select 1 from e e2 where e2.a = e.a)"
             ),
             None
         );

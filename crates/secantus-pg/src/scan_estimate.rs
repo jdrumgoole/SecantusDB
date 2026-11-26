@@ -472,7 +472,8 @@ impl PgHandler {
     /// the join's ON is strict in that key -- an equality on it, or a
     /// `<>` reading it -- so a NULL-extended row is the only one the
     /// WHERE keeps: `reduce_outer_joins` makes such a join `JOIN_ANTI`,
-    /// and the `IS NULL` is no longer checked above it (RP-908).
+    /// and the `IS NULL` is no longer checked above it (RP-908). Beside it
+    /// the WHERE may restrict the preserved side (RP-1027).
     pub(crate) fn left_anti_key(sel: &secantus_pgplan::Select) -> Option<String> {
         use secantus_pgplan::joins::{FilterKind, JoinKind, JoinNode};
         use secantus_pgplan::Statement;
@@ -481,6 +482,7 @@ impl PgHandler {
         };
         let JoinNode::Join {
             kind: JoinKind::Left,
+            left,
             right,
             on,
             on_filters,
@@ -494,14 +496,48 @@ impl PgHandler {
         let JoinNode::Leaf { def, .. } = right.as_ref() else {
             return None;
         };
-        if sel.residual.is_some() || !j.where_filters.is_empty() || sel.filter.len() != 1 {
+        if sel.residual.is_some() || !j.where_filters.is_empty() {
             return None;
         }
-        let (k, v) = sel.filter.iter().next()?;
+        // Beside the `IS NULL`, a conjunct over the preserved side alone
+        // is that side's restriction (`distribute_qual_to_rels`), run in
+        // its scan below the anti join: one the planner pushed, whole,
+        // into the left leaf's filter, which prices it there (RP-1027).
+        let held_by_left = |c: &Document| {
+            let JoinNode::Leaf { plan, columns, .. } = left.as_ref() else {
+                return false;
+            };
+            let Statement::Select(leaf) = plan.as_ref() else {
+                return false;
+            };
+            let field = |k: &str| {
+                let (_, out) = columns.iter().find(|(ck, _)| ck == k)?;
+                let (_, f) = leaf.columns.iter().find(|(o, _)| o == out)?;
+                Some(f.clone())
+            };
+            let Some(c) = scan_fields(c, &field) else {
+                return false;
+            };
+            leaf.filter == c
+                || leaf
+                    .filter
+                    .get_array("$and")
+                    .is_ok_and(|items| items.iter().any(|i| i.as_document() == Some(&c)))
+                || matches!(c.iter().collect::<Vec<_>>().as_slice(), [(f, v)]
+                    if PushedConjuncts::new(&leaf.filter).holds(f, v))
+        };
         let prefix = format!("{}{}", def.name, secantus_pgplan::joins::SEP);
-        if !k.starts_with(&prefix) || *v != bson::Bson::Null {
-            return None;
+        let mut key = None;
+        for c in top_conjuncts(&sel.filter)? {
+            match c.iter().collect::<Vec<_>>().as_slice() {
+                [(k, bson::Bson::Null)] if k.starts_with(&prefix) && key.is_none() => {
+                    key = Some((*k).clone());
+                }
+                _ if held_by_left(&c) => {}
+                _ => return None,
+            }
         }
+        let k = &key?;
         // An expression key is built of operators and casts over the one
         // column (`expr_equalities`), each strict: the ON is strict in
         // that column too (RP-981).
@@ -9414,6 +9450,53 @@ fn joins_tables(e: &secantus_pgplan::ColumnExpr) -> bool {
         }
     }
     aliases.len() >= 2
+}
+
+/// A filter's top-level conjuncts, each whole: its `$and`'s items and
+/// each of its other fields as a one-field document. `None` where an
+/// `$and` holds anything but documents.
+fn top_conjuncts(filter: &Document) -> Option<Vec<Document>> {
+    let mut out = Vec::new();
+    for (k, v) in filter {
+        if k == "$and" {
+            let bson::Bson::Array(items) = v else {
+                return None;
+            };
+            for item in items {
+                out.push(item.as_document()?.clone());
+            }
+        } else {
+            let mut d = Document::new();
+            d.insert(k.clone(), v.clone());
+            out.push(d);
+        }
+    }
+    Some(out)
+}
+
+/// A filter over joined keys as its scan's filter reads it, each key the
+/// stored field `field` names, through `$and` / `$or` / `$nor`. `None`
+/// where a key names no field of the scan, or for any other operator at a
+/// field's place.
+fn scan_fields(filter: &Document, field: &dyn Fn(&str) -> Option<String>) -> Option<Document> {
+    let mut out = Document::new();
+    for (k, v) in filter {
+        if matches!(k.as_str(), "$and" | "$or" | "$nor") {
+            let bson::Bson::Array(items) = v else {
+                return None;
+            };
+            let items: Vec<bson::Bson> = items
+                .iter()
+                .map(|i| Some(bson::Bson::Document(scan_fields(i.as_document()?, field)?)))
+                .collect::<Option<_>>()?;
+            out.insert(k.clone(), items);
+        } else if k.starts_with('$') {
+            return None;
+        } else {
+            out.insert(field(k)?, v.clone());
+        }
+    }
+    Some(out)
 }
 
 fn joined_conjuncts(filter: &Document) -> Option<Vec<(String, bson::Bson)>> {

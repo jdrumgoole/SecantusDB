@@ -5116,7 +5116,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on PostgreSQL 15.19: an outer conjunct beside the anti
-    # join is its outer scan's Filter, in either spelling.
+    # join is its outer scan's Filter, in either spelling. Both printed
+    # an unpriced plan before RP-1027.
     "a not exists beside an outer conjunct is a hash anti join": (
         "RP-1027",
         _ANALYSED,
@@ -5140,6 +5141,51 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Hash Cond: (e.a = e2.a)",
             "  ->  Seq Scan on e  (cost=0.00..17.50 rows=500 width=7)",
             "        Filter: (a > 500)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (a private cluster): an outer OR, IN
+    # list or expression comparison beside the anti join is its outer
+    # scan's Filter, priced (found while working RP-1027).
+    "a not exists beside an outer or is a hash anti join": (
+        "RP-1134",
+        _ANALYSED,
+        "explain select * from e where (a > 900 or a < 10)"
+        " and not exists (select 1 from e e2 where e2.a = e.a)",
+        [
+            "Hash Anti Join  (cost=27.50..47.91 rows=1 width=7)",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..20.00 rows=108 width=7)",
+            "        Filter: ((a > 900) OR (a < 10))",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    "a not exists beside an outer in list is a hash anti join": (
+        "RP-1134",
+        _ANALYSED,
+        "explain select * from e where a in (1, 2, 3)"
+        " and not exists (select 1 from e e2 where e2.a = e.a)",
+        [
+            "Hash Anti Join  (cost=27.50..46.26 rows=1 width=7)",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..18.75 rows=3 width=7)",
+            "        Filter: (a = ANY ('{1,2,3}'::integer[]))",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    "a not exists beside an outer expression comparison is a hash anti join": (
+        "RP-1134",
+        _ANALYSED,
+        "explain select * from e where length(b) > 1"
+        " and not exists (select 1 from e e2 where e2.a = e.a)",
+        [
+            "Hash Anti Join  (cost=27.50..48.75 rows=1 width=7)",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..20.00 rows=333 width=7)",
+            "        Filter: (length(b) > 1)",
             "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=4)",
         ],
@@ -9866,6 +9912,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1027",
         "RP-1030",
         "RP-1071",
         "RP-1058",
