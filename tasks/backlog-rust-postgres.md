@@ -1199,7 +1199,13 @@ one beside it.
       -> `derive_index_relations` (every table's columns) and
       `catalog_rows_keyed` -> `build_catalog_rows`; profile 0 against 8,000
       tables before changing one.
-      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth
+      The pair decides nothing on CI at this bound: reopened as its gap
+      test, it then passed (PR #2998 at `916946abe`, run 45721708475,
+      FIXED?), so in four hours it failed twice and passed twice there. It
+      stays a gap test of this item that the verifier does not count,
+      until RP-1100 settles what a ratio test holds to on CI's runner or
+      the growth is gone by a margin no runner closes.
+      Verify: none -- a latency budget at its bound on CI's runner (2 failed, 2 passed, 2026-11-25); tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth measures it
       Backlog-ID: RP-1073
 
 - [ ] **A table a `CREATE TABLE` has just made is sometimes not there for
