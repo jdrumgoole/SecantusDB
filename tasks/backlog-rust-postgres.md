@@ -487,6 +487,23 @@ one beside it.
   Left open as a watch item until the lane stays green.
   Backlog-ID: RP-571
   Verify: none -- intermittent, Linux CI only, not reproduced on macOS; RP-002's two regression tests are the check, and print the cancel trace on a miss
+- [ ] **A cancel sent while a prepared statement's Parse is described was
+  lost once on Linux CI (2026-11-26).** RP-215's regression test
+  `tests/backlog/test_rp_batch53.py::test_a_cancel_during_a_prepared_statements_parse_is_honoured[2.5]`
+  answered `ok` where PostgreSQL 15.19 answers 57014: the call took 7.50 s,
+  so `select pg_sleep(3), 25 in (<200,000 items>)` ran to its end, which is
+  RP-215's own symptom (a cancel left pending when the Parse answered,
+  cleared as stale at the next message). PR #3002 at `e579c75e0` (RP-1062's
+  EXPLAIN-only change and a backlog note), job `pg-oracle (backlog)`, run
+  45734519669; the `[0.5]` and `[1.5]` cases passed in the same run, and
+  this test passed on #3002's previous run at `32d5d7242` and on the
+  snapshots before. Unlike RP-571 (honoured late), this one was never
+  honoured. PostgreSQL answers a cancel at its next `CHECK_FOR_INTERRUPTS`
+  wherever in the cycle it lands. Start from the cancel trace
+  (`SECANTUS_PG_CANCEL_TRACE`) under load: where the pending flag is
+  cleared between the Parse's answer and the Sync.
+  Verify: none -- intermittent (1 CI run), not reproduced; the test named above is the check
+  Backlog-ID: RP-1115
 - [ ] **RUST pgserver: the planner's choices that decide row order are only
   partly modelled.** **Decided (Joe, 2026-10-16): build a cost model** --
   enough of PostgreSQL's planner to make its choices, since the order rows
