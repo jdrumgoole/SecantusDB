@@ -1383,6 +1383,32 @@ fn outer_first(n: &PlanNode, c: &str) -> Option<bool> {
     }
 }
 
+/// A hash or merge join's condition with each equality written outer
+/// side first, as `create_hashjoin_plan` / `create_mergejoin_plan` leave
+/// it: `get_switched_clauses` commutes every clause of the list whose
+/// left operand is not from the outer relation, one clause at a time, so
+/// `((e2.a = e.a) AND (e2.b = e.b))` over an outer `e` is `((e.a = e2.a)
+/// AND (e.b = e2.b))` (RP-1062). A clause whose side `outer_first` cannot
+/// tell is commuted when the join itself was swapped (`commute_cond`).
+/// Anything else (a nested loop's `Join Filter`) is returned as is.
+fn switched_clauses(n: &PlanNode, c: &str) -> String {
+    let switch = |clause: &str| match outer_first(n, clause) {
+        Some(true) => commute_equality(clause).unwrap_or_else(|| clause.to_string()),
+        Some(false) => clause.to_string(),
+        None if n.commute_cond => commute_equality(clause).unwrap_or_else(|| clause.to_string()),
+        None => clause.to_string(),
+    };
+    let parts = split_conjuncts(c);
+    if parts.len() == 1 {
+        return switch(c);
+    }
+    if !((n.name.starts_with("Hash") || n.name.starts_with("Merge")) && n.name.ends_with("Join")) {
+        return c.to_string();
+    }
+    let parts: Vec<String> = parts.iter().map(|p| switch(p)).collect();
+    format!("({})", parts.join(" AND "))
+}
+
 /// A nested loop's ON conjuncts in the order PostgreSQL lists them
 /// (RP-920): `build_joinrel_restrictlist` takes the outer rel's `joininfo`
 /// first, and a join rel's `joininfo` holds its base rels' clauses in
@@ -2756,13 +2782,7 @@ pub(crate) fn attach_join_conds(
         let split = splits.get(*next).and_then(Option::as_ref);
         if let (Some((hash, rest)), "Hash Cond" | "Merge Cond") = (split, label) {
             if !n.skip_cond {
-                let c = match outer_first(n, hash) {
-                    Some(true) => commute_equality(hash).unwrap_or_else(|| hash.clone()),
-                    None if n.commute_cond => {
-                        commute_equality(hash).unwrap_or_else(|| hash.clone())
-                    }
-                    _ => hash.clone(),
-                };
+                let c = switched_clauses(n, hash);
                 n.details.insert(0, ("Join Filter".into(), rest.clone()));
                 n.details.insert(0, (label.into(), c));
             }
@@ -2776,13 +2796,7 @@ pub(crate) fn attach_join_conds(
                 } else {
                     c.clone()
                 };
-                let c = &c;
-                let c = match outer_first(n, c) {
-                    Some(true) => commute_equality(c).unwrap_or_else(|| c.clone()),
-                    Some(false) => c.clone(),
-                    None if n.commute_cond => commute_equality(c).unwrap_or_else(|| c.clone()),
-                    None => c.clone(),
-                };
+                let c = switched_clauses(n, &c);
                 let c = if label == "Merge Cond" {
                     merge_cond_text(&c)
                 } else {
@@ -3672,6 +3686,32 @@ mod join_type_tests {
         root.children.push(PlanNode::over("Hash", rel("k")));
         attach_join_conds(&mut root, &["(e.b = k.b)".to_string()], &[]);
         assert_eq!(root.details[0].1, "(e.b = k.b)");
+    }
+
+    /// Every clause of a multi-clause `Hash Cond` is switched outer side
+    /// first on its own, as `get_switched_clauses` walks the list
+    /// (RP-1062): PostgreSQL 15.19 prints `e full join e e2 on e2.a = e.a
+    /// and e2.b = e.b` as `Hash Cond: ((e.a = e2.a) AND (e.b = e2.b))`. A
+    /// nested loop's `Join Filter` is not switched.
+    #[test]
+    fn each_clause_of_a_hash_cond_is_written_outer_side_first() {
+        let rel = |name: &str, alias: &str| {
+            let mut n = PlanNode::new(format!("Seq Scan on {name}"));
+            n.props.push(("Relation Name".into(), name.to_string()));
+            n.props.push(("Alias".into(), alias.to_string()));
+            n
+        };
+        let mut root = PlanNode::new("Hash Full Join");
+        root.children.push(rel("e", "e"));
+        root.children.push(PlanNode::over("Hash", rel("e", "e2")));
+        let on = "((e2.a = e.a) AND (e.b = e2.b))".to_string();
+        attach_join_conds(&mut root, std::slice::from_ref(&on), &[]);
+        assert_eq!(root.details[0].1, "((e.a = e2.a) AND (e.b = e2.b))");
+        let mut root = PlanNode::new("Nested Loop Full Join");
+        root.children.push(rel("e", "e"));
+        root.children.push(rel("e", "e2"));
+        attach_join_conds(&mut root, std::slice::from_ref(&on), &[]);
+        assert_eq!(root.details[0].1, on);
     }
 
     #[test]
