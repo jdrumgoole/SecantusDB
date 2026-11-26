@@ -55,6 +55,13 @@ pub(crate) struct PlanNode {
     /// the columns its join clauses and constant equalities fix, which
     /// [`resolve_inner_unique`] checks against the table's unique indexes.
     pub unique_probe: Option<(String, Vec<String>)>,
+    /// The same two facts for the join's OUTER side, as written (RP-1030):
+    /// where the cost model hashes that side instead ([`price_hash_join`]'s
+    /// swap, a merge join reading it inner), it is the inner relation
+    /// `innerrel_is_unique` checks, and [`PlanNode::swap_unique_sides`]
+    /// moves them over.
+    pub outer_unique: bool,
+    pub outer_unique_probe: Option<(String, Vec<String>)>,
     /// A hash join whose sides the cost model swapped (RP-359): its
     /// `Hash Cond` is written outer side first, as `create_hashjoin_plan`
     /// commutes the clause to `outer = inner`.
@@ -181,6 +188,22 @@ impl HashInfo {
 }
 
 impl PlanNode {
+    /// The join's inner side became its outer one and the other way round
+    /// (RP-1030): the uniqueness `innerrel_is_unique` reads is now the
+    /// other side's, resolved or still waiting on its probe.
+    pub(crate) fn swap_unique_sides(&mut self) {
+        std::mem::swap(&mut self.inner_unique, &mut self.outer_unique);
+        std::mem::swap(&mut self.unique_probe, &mut self.outer_unique_probe);
+    }
+
+    /// The join lost its clauses: neither side is proven unique.
+    fn clear_unique(&mut self) {
+        self.inner_unique = false;
+        self.unique_probe = None;
+        self.outer_unique = false;
+        self.outer_unique_probe = None;
+    }
+
     pub(crate) fn new(name: impl Into<String>) -> Self {
         PlanNode {
             name: name.into(),
@@ -190,6 +213,8 @@ impl PlanNode {
             estimate: None,
             inner_unique: false,
             unique_probe: None,
+            outer_unique: false,
+            outer_unique_probe: None,
             commute_cond: false,
             heap_fetches: None,
             heap_blocks: None,
@@ -413,6 +438,9 @@ pub(crate) fn resolve_inner_unique(n: &mut PlanNode, unique: &dyn Fn(&str, &[Str
     if let Some((table, fields)) = n.unique_probe.take() {
         n.inner_unique = unique(&table, &fields);
     }
+    if let Some((table, fields)) = n.outer_unique_probe.take() {
+        n.outer_unique = unique(&table, &fields);
+    }
     for c in &mut n.children {
         resolve_inner_unique(c, unique);
     }
@@ -479,7 +507,9 @@ pub(crate) fn joins_all_hash(n: &PlanNode) -> bool {
 
 /// Whether any join in the tree waits on [`resolve_inner_unique`].
 pub(crate) fn has_unique_probe(n: &PlanNode) -> bool {
-    n.unique_probe.is_some() || n.children.iter().any(has_unique_probe)
+    n.unique_probe.is_some()
+        || n.outer_unique_probe.is_some()
+        || n.children.iter().any(has_unique_probe)
 }
 
 /// The fields of a leaf table's rows that a scan filter fixes to a
@@ -641,6 +671,61 @@ fn table_scan(table: &str, filter: &Document, scan: &ScanChooser<'_>) -> PlanNod
     n
 }
 
+/// Whether one side of a join is unique on the columns its join clauses
+/// fix (`keys`, join keys `alias<US>column`): `(proven, probe)`, the
+/// probe the table and fields [`resolve_inner_unique`] checks against the
+/// table's unique indexes where the side is one table's plain scan.
+fn side_uniqueness(
+    side: &JoinNode,
+    keys: &[&str],
+    has_on: bool,
+) -> (bool, Option<(String, Vec<String>)>) {
+    let JoinNode::Leaf { plan, columns, .. } = side else {
+        return (false, None);
+    };
+    // A subquery's DISTINCT, GROUP BY or set operation proves its output
+    // unique on the columns the join fixes (`rel_is_distinct_for`, RP-356).
+    let fixed_outputs: Vec<bool> = columns
+        .iter()
+        .map(|(c, _)| keys.iter().any(|k| k == c))
+        .collect();
+    if let Some(unique) = query_is_distinct_for(plan, &fixed_outputs) {
+        // No join clause at all is never unique (`innerrel_is_unique`
+        // returns false first).
+        return (unique && (has_on || fixed_outputs.iter().any(|&f| f)), None);
+    }
+    let Statement::Select(leaf) = plan.as_ref() else {
+        return (false, None);
+    };
+    if leaf.sub.is_some() || leaf.join.is_some() || leaf.series.is_some() || leaf.table.is_empty() {
+        return (false, None);
+    }
+    // Column names: a join key is `alias<US>column`.
+    let name = |key: &str| {
+        key.split(secantus_pgplan::joins::SEP)
+            .nth(1)
+            .map(str::to_string)
+    };
+    let mut fixed: Vec<String> = keys
+        .iter()
+        .copied()
+        .filter(|k| columns.iter().any(|(c, _)| c == k))
+        .filter_map(name)
+        .collect();
+    if fixed.is_empty() {
+        return (false, None);
+    }
+    let mut consts = Vec::new();
+    constant_equalities(&leaf.filter, &mut consts);
+    fixed.extend(consts.iter().filter_map(|f| {
+        columns
+            .iter()
+            .find(|(_, cf)| cf == f)
+            .and_then(|(k, _)| name(k))
+    }));
+    (false, Some((leaf.table.clone(), fixed)))
+}
+
 fn join_tree(node: &JoinNode, scan: &ScanChooser<'_>) -> PlanNode {
     match node {
         JoinNode::Lateral { .. } => PlanNode::new("Function Scan"),
@@ -688,55 +773,23 @@ fn join_tree(node: &JoinNode, scan: &ScanChooser<'_>) -> PlanNode {
                 format!("Hash{side} Join")
             };
             let mut n = PlanNode::new(name);
-            // The inner side one table's plain scan: the fields its join
-            // clauses fix, for `resolve_inner_unique`.
-            if let JoinNode::Leaf { plan, columns, .. } = right.as_ref() {
-                // A subquery's DISTINCT, GROUP BY or set operation proves
-                // its output unique on the columns the join fixes
-                // (`rel_is_distinct_for`, RP-356).
-                let fixed_outputs: Vec<bool> = columns
-                    .iter()
-                    .map(|(c, _)| {
-                        equi.iter().any(|(_, r)| r == c) || merged.iter().any(|(_, _, r)| r == c)
-                    })
-                    .collect();
-                if let Some(unique) = query_is_distinct_for(plan, &fixed_outputs) {
-                    // No join clause at all is never unique
-                    // (`innerrel_is_unique` returns false first).
-                    n.inner_unique = unique && (on.is_some() || fixed_outputs.iter().any(|&f| f));
-                } else if let Statement::Select(leaf) = plan.as_ref() {
-                    if leaf.sub.is_none()
-                        && leaf.join.is_none()
-                        && leaf.series.is_none()
-                        && !leaf.table.is_empty()
-                    {
-                        // Column names: a join key is `alias<US>column`.
-                        let name = |key: &str| {
-                            key.split(secantus_pgplan::joins::SEP)
-                                .nth(1)
-                                .map(str::to_string)
-                        };
-                        let mut fixed: Vec<String> = equi
-                            .iter()
-                            .map(|(_, r)| r.as_str())
-                            .chain(merged.iter().map(|(_, _, r)| r.as_str()))
-                            .filter(|k| columns.iter().any(|(c, _)| c == k))
-                            .filter_map(name)
-                            .collect();
-                        if !fixed.is_empty() {
-                            let mut consts = Vec::new();
-                            constant_equalities(&leaf.filter, &mut consts);
-                            fixed.extend(consts.iter().filter_map(|f| {
-                                columns
-                                    .iter()
-                                    .find(|(_, cf)| cf == f)
-                                    .and_then(|(k, _)| name(k))
-                            }));
-                            n.unique_probe = Some((leaf.table.clone(), fixed));
-                        }
-                    }
-                }
-            }
+            // Each side one table's plain scan: the fields its join
+            // clauses fix, for `resolve_inner_unique` -- the right side's
+            // for the join as drawn, the left one's for a plan that reads
+            // it inner (RP-1030).
+            let right_keys: Vec<&str> = equi
+                .iter()
+                .map(|(_, r)| r.as_str())
+                .chain(merged.iter().map(|(_, _, r)| r.as_str()))
+                .collect();
+            let left_keys: Vec<&str> = equi
+                .iter()
+                .map(|(l, _)| l.as_str())
+                .chain(merged.iter().map(|(_, l, _)| l.as_str()))
+                .collect();
+            (n.inner_unique, n.unique_probe) = side_uniqueness(right, &right_keys, on.is_some());
+            (n.outer_unique, n.outer_unique_probe) =
+                side_uniqueness(left, &left_keys, on.is_some());
             n.children.push(join_tree(left, scan));
             let right = join_tree(right, scan);
             n.children.push(if equi.is_empty() {
@@ -855,6 +908,11 @@ fn join_select_tree(j: &secantus_pgplan::JoinSelect, scan: &ScanChooser<'_>) -> 
                 let col = if a.0 == j.right.1 { &a.1 } else { &b.1 };
                 n.unique_probe = Some((j.right.0.clone(), vec![col.clone()]));
             }
+            // The left one's, for a plan that reads it inner (RP-1030).
+            if j.left_sub.is_none() && !j.left.0.is_empty() {
+                let col = if a.0 == j.right.1 { &b.1 } else { &a.1 };
+                n.outer_unique_probe = Some((j.left.0.clone(), vec![col.clone()]));
+            }
             n.children.push(left);
             n.children.push(PlanNode::over("Hash", right));
             n
@@ -895,6 +953,7 @@ pub(crate) fn price_nest_loop(
     left.estimate = Some(a);
     right.estimate = Some(b);
     let (outer, inner) = if plan.b_outer {
+        root.swap_unique_sides();
         (right, left)
     } else {
         (left, right)
@@ -1466,7 +1525,7 @@ pub(crate) fn price_merge_join(
     root.name = kind.into();
     root.commute_cond = b_outer;
     if b_outer {
-        root.inner_unique = false;
+        root.swap_unique_sides();
     }
     root.estimate = Some(join);
 }
@@ -1662,9 +1721,9 @@ pub(crate) fn price_hash_join(
         if root.name == "Hash Left Join" {
             root.name = "Hash Right Join".into();
         }
-        // The hashed side is now the left table, not proven unique on
-        // the key (a unique key is not priced).
-        root.inner_unique = false;
+        // The hashed side is now the left table: its uniqueness is the
+        // join's `inner_unique` (RP-1030).
+        root.swap_unique_sides();
     }
     let [scan, hash] = root.children.as_mut_slice() else {
         return;
@@ -1699,6 +1758,7 @@ pub(crate) fn price_param_nest_loop(
     let left = root.children.pop().expect("two children");
     let right = hash.children.pop().expect("one child");
     let (mut o, mut i) = if b_outer {
+        root.swap_unique_sides();
         (right, left)
     } else {
         (left, right)
@@ -3133,8 +3193,7 @@ pub(crate) fn implied_nest_loop(
     root.children.push(right);
     root.name = "Nested Loop".into();
     root.skip_cond = true;
-    root.inner_unique = false;
-    root.unique_probe = None;
+    root.clear_unique();
     mark_implied_filters(root, implied, from);
 }
 
@@ -3164,13 +3223,11 @@ pub(crate) fn class_constant_chain(
             n.details.retain(|(k, _)| k != "Hash Cond");
             n.skip_cond = true;
             // No join clause at all is never unique (`innerrel_is_unique`).
-            n.inner_unique = false;
-            n.unique_probe = None;
+            n.clear_unique();
             n.estimate = None;
         } else if n.name == "Nested Loop" && !n.children.is_empty() {
             n.skip_cond = true;
-            n.inner_unique = false;
-            n.unique_probe = None;
+            n.clear_unique();
         }
     }
     unhash(root);
@@ -3802,6 +3859,34 @@ mod join_type_tests {
                 ("Filter".to_string(), "(e.b <> b)".to_string()),
             ]
         );
+    }
+
+    /// A hash join the cost model swaps hashes the table written first:
+    /// that table's uniqueness becomes the join's `Inner Unique`, as
+    /// `innerrel_is_unique` checks the side the plan reads inner (RP-1030).
+    #[test]
+    fn a_swapped_hash_join_takes_the_left_sides_uniqueness() {
+        let mut root = PlanNode::new("Hash Join");
+        root.children.push(PlanNode::new("Seq Scan on k"));
+        root.children
+            .push(PlanNode::over("Hash", PlanNode::new("Seq Scan on e")));
+        root.unique_probe = Some(("e".into(), vec!["a".into()]));
+        root.outer_unique_probe = Some(("k".into(), vec!["a".into()]));
+        // Resolved before the swap, as the server does.
+        resolve_inner_unique(&mut root, &|table, _| table == "k");
+        assert!(!root.inner_unique);
+        let est = (0.0, 1.0, 1.0, 1);
+        price_hash_join(&mut root, est, est, est, true);
+        assert!(root.inner_unique);
+        assert_eq!(root.children[1].children[0].name, "Seq Scan on k");
+        // Unswapped, the right side's stays.
+        let mut root = PlanNode::new("Hash Join");
+        root.children.push(PlanNode::new("Seq Scan on k"));
+        root.children
+            .push(PlanNode::over("Hash", PlanNode::new("Seq Scan on e")));
+        root.outer_unique = true;
+        price_hash_join(&mut root, est, est, est, false);
+        assert!(!root.inner_unique);
     }
 
     #[test]
