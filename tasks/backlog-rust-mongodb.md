@@ -1267,14 +1267,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       stand-in.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_lookup_on_join_fields_is_explained_as_sbe_runs_it
       Backlog-ID: RM-683
-- [ ] **A 12-byte string is counted as held outside its `Value`.** mongod
-      8.2.11's classic `Value` keeps a string of up to 12 bytes inline (a
-      `$push` of one counts 136 bytes, a sort of a `$documents` document
-      holding one 245); `memlimit::SHORT_STR` is 11, so this server counts
-      36 bytes more for each such string, in every memory figure and
-      budget. Found 2026-11-14 (RM-539).
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_twelve_byte_string_is_kept_in_its_value
-      Backlog-ID: RM-684
 - [ ] **A `$sort` that took a `$limit` reports the size of every document
       it sorted.** mongod 8.2.11's `$sort` with a `limit` is a top-k sorter:
       its `totalDataSizeSortedBytesEstimate` is the size of the documents it
