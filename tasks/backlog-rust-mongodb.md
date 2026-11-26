@@ -1122,7 +1122,11 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       was truncated, so which counter and which side is not known). A
       candidate: mongod's time-based yields moving `saveState` /
       `restoreState`, or this server modelling them by count. Found
-      2026-11-23 (RM-632).
+      2026-11-23 (RM-632). Again 2026-11-26 (RM-684 gate, load ~5):
+      `tests/backlog/test_rm_found_2026_11_10_rm418.py::test_sbe_find_in_and_projection_are_mongods[{'filter': {'d.e': {'$in': [1, 2]}}}]`
+      differed in its `executionStats` (an SBE `filter` over a `scan`,
+      `saveState` / `restoreState` among the fields shown; the differing
+      one was truncated) and passed in 9 reruns, serial and `-n 4`.
       Verify: none -- intermittent, once in 13 runs; no deterministic gap test until the differing counter is known
       Backlog-ID: RM-768
 - [ ] **A `$fill` with a `sortBy` passes ties on in a different order.**
