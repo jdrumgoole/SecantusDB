@@ -73,11 +73,18 @@ GAPS = [
             {"a": 2},
         ]
     },
+    # mongod keeps the `$not` of an `$and` beside a leaf (no gain); this
+    # server's simplifier turns it into an `$or` of `$not`s (found working
+    # RM-660: `{a: {$not: {$lt: 9, $gt: 3}}, b: 1}` parses to this tree).
+    {"$nor": [{"$and": [{"a": 1}, {"b": 1}]}], "c": 1},
+    {"a": {"$not": {"$lt": 9, "$gt": 3}}, "b": 1},
 ]
 
 
 @pytest.mark.backlog("RM-778")
-@pytest.mark.parametrize("filt", GAPS, ids=["merge-keeps-b", "or-in-context", "in-beside-eq"])
+@pytest.mark.parametrize(
+    "filt", GAPS, ids=["merge-keeps-b", "or-in-context", "in-beside-eq", "nor-of-and", "not-of-two"]
+)
 def test_a_random_tree_is_simplified_as_mongod_does(
     rust_mongo: Any, mongod: Any, filt: dict
 ) -> None:

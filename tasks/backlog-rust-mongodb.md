@@ -1251,20 +1251,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-26 working RM-659.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm536.py::test_a_run_time_error_names_the_document_the_read_projected
       Backlog-ID: RM-809
-- [ ] **A query's `parsedQuery` keeps three leaves as written.** mongod
-      8.2.11 parses an `$elemMatch` document whose FIRST field is a path as
-      a query (`{$elemMatch: {b: 1, $and: [{q: 1}], a: {$gt: 0}}}` is
-      `{$and: [b, q, a]}`; it is the value form only when the first field is
-      an operator other than `$and` / `$or` / `$nor` / `$expr` ...), a
-      `$not` of two operators as `{$nor: [{$and: [...]}]}`, and drops a
-      `{a: {$nin: []}}` beside another clause. This server's
-      `canonical_match` takes any `$`-key for the value form and echoes the
-      document, keeps `{$not: {$lt: 9, $gt: 3}}` whole, and keeps
-      `{a: {$not: {$in: []}}}` in the `$and`. A pipeline `$match`
-      (`match_as_written`) already parses all three as mongod does. Found
-      2026-11-14 working RM-537.
-      Verify: tests/backlog/test_rm_found_2026_11_14.py::test_parsed_query_parses_these_leaves_as_mongod
-      Backlog-ID: RM-660
 - [ ] **A `$lookup` over a collection reports nothing it examined.** At
       `executionStats` mongod 8.2.11 gives a `$lookup` whose pipeline reads
       a collection its `totalDocsExamined`, `totalKeysExamined`,
@@ -2056,7 +2042,13 @@ would see them. What is left:
       server folds. The residue points at a rule not yet found (how a
       negated node is converted, and what its size counts), not at noise.
       Reproduce with `tests/mongod_live/test_boolean_simplifier.py`'s
-      random run at other seeds (2026-11-24, found working RM-774).
+      random run at other seeds (2026-11-24, found working RM-774). The
+      smallest such case: mongod keeps `{$nor: [{$and: [a, b]}], c: 1}`
+      (and `{a: {$not: {$lt: 9, $gt: 3}}, b: 1}`, which parses to that
+      shape) as it is, where this server turns the `$nor` into an `$or` of
+      `$not`s. Counting a `$not` leaf as two nodes fixes these two and makes
+      the seeded fuzz worse (11 -> 52 of 1,500 with `$nor`), so it is not
+      the rule (2026-11-26, working RM-660).
       Verify: tests/backlog/test_rm_found_2026_11_24_rm774.py::test_a_random_tree_is_simplified_as_mongod_does
       Backlog-ID: RM-778
 - [ ] **RUST MongoDB server: a change stream's `docsExamined` leaves out
