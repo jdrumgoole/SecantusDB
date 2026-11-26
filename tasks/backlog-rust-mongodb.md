@@ -1252,16 +1252,16 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-536.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm536.py::test_a_residual_or_lists_its_branches_as_mongod_does
       Backlog-ID: RM-658
-- [ ] **`explain` with `executionStats` answers where a `$replaceRoot`
-      fails.** mongod 8.2.11 runs the pipeline for `executionStats` and
-      returns the executor's error: `{$replaceRoot: {newRoot: "$x.b"}}` over
-      `{x: {a: 1, b: 1}}` is 40228, naming the document the read handed it
-      (`{x: {b: 1}}`), with no "Executor error" prefix. This server answers
-      with an `explain` document: `count_inline` (`explain/mod.rs`) takes a
-      run that failed for one of 0 documents, the root RM-617 (a
-      `$setWindowFields`) likely shares. Found 2026-11-14 working RM-536.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm536.py::test_explain_reports_a_replace_roots_run_time_error
-      Backlog-ID: RM-659
+- [ ] **A run-time error names the stored document, not the one the read
+      projected.** mongod 8.2.11 reads only the fields a pipeline depends
+      on, and an expression's error names that projection:
+      `{$replaceRoot: {newRoot: "$x.b"}}` over `{_id: 1, x: {a: 1, b: 1}}`
+      is 40228 "... Input document: {x: {b: 1}}", in `aggregate` and in
+      `explain`; behind `{$replaceRoot: {newRoot: "$x"}}` it is the whole
+      new root. This server names the whole stored document. Found
+      2026-11-26 working RM-659.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm536.py::test_a_run_time_error_names_the_document_the_read_projected
+      Backlog-ID: RM-809
 - [ ] **A query's `parsedQuery` keeps three leaves as written.** mongod
       8.2.11 parses an `$elemMatch` document whose FIRST field is a path as
       a query (`{$elemMatch: {b: 1, $and: [{q: 1}], a: {$gt: 0}}}` is

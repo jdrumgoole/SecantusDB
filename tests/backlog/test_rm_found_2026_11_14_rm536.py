@@ -77,13 +77,41 @@ def _replace_root_error(client: Any) -> tuple:
     )
 
 
-@pytest.mark.backlog("RM-659")
+@pytest.mark.backlog_fixed("RM-659")
 def test_explain_reports_a_replace_roots_run_time_error(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 runs the pipeline for `executionStats` and returns the
     executor's error: `{$replaceRoot: {newRoot: "$x.b"}}` over `{x: {a: 1,
-    b: 1}}` is 40228, naming the document the read handed it (`{x: {b:
-    1}}`), with no "Executor error" prefix. This server answers with an
-    `explain` document: `count_inline` takes a failed run for 0 documents."""
+    b: 1}}` is 40228, with no "Executor error" prefix. This server answered
+    with an `explain` document: `count_inline` took a failed run for 0
+    documents. (The input document the message names is RM-809.)"""
     want = _replace_root_error(mongod)
     assert want[:2] == ("err", 40228)
-    assert _replace_root_error(rust_mongo) == want
+    got = _replace_root_error(rust_mongo)
+    assert got[:2] == want[:2]
+    assert got[2].split(" Input document: ")[0] == want[2].split(" Input document: ")[0]
+
+
+def _replace_root_messages(client: Any) -> list:
+    coll = client["rm_found_1114"]["c" + uuid.uuid4().hex[:8]]
+    coll.insert_many([{"_id": 1, "x": {"a": 1, "b": 1}}])
+    out = []
+    for p in (
+        [{"$replaceRoot": {"newRoot": "$x.b"}}],
+        [{"$match": {"_id": 1}}, {"$replaceRoot": {"newRoot": "$x.b"}}],
+        [{"$replaceRoot": {"newRoot": "$x"}}, {"$replaceRoot": {"newRoot": "$b"}}],
+    ):
+        out.append(mongo_answer(lambda p=p: list(coll.aggregate(p))))
+    out.append(_replace_root_error(client))
+    return out
+
+
+@pytest.mark.backlog("RM-809")
+def test_a_run_time_error_names_the_document_the_read_projected(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11 reads only the fields a pipeline depends on, and an
+    error names that projected document: `{$replaceRoot: {newRoot: "$x.b"}}`
+    over `{_id: 1, x: {a: 1, b: 1}}` reports "Input document: {x: {b: 1}}",
+    in `aggregate` and in `explain`. This server names the whole stored
+    document."""
+    assert _replace_root_messages(rust_mongo) == _replace_root_messages(mongod)
