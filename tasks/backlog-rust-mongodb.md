@@ -1709,15 +1709,6 @@ Still different, all 77:
       **Decided (Joe, 2026-11-16): install colima on this Mac and run the Linux x86_64 mongod 8.2.11 image locally to fit LIBSTDCXX_X86_64.**
       Backlog-ID: RM-442
       Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_an_entry_reports_its_estimated_size_on_linux
-- [ ] **A `$group` whose `_id` takes `$mod`, or whose accumulator takes an
-      expression object, is not pushed into SBE.** `[{$group: {_id: {$mod:
-      ["$b", 2]}}}, {$sort: {_id: 1}}]`, and `{_id: "$a", q: {$push: {s:
-      "$s"}}}` (`$addToSet` too): mongod 8.2.11 runs the `$group` in SBE,
-      `explainVersion` "2" and no `$group` in `stages`; this server explains
-      version "1" with a classic `$group`. The `$sort`'s byte count after it
-      already matches. Found 2026-11-14 (RM-435).
-      Verify: tests/backlog/test_rm_found_rm435.py::test_a_group_mongod_pushes_into_sbe_is_pushed
-      Backlog-ID: RM-693
 - [ ] **`estimatedSizeBytes` is still left out of some entries whose
       index tree this server does not build.** It sizes an entry's
       `PlanCacheIndexTree` from the canonical query and the index tags of

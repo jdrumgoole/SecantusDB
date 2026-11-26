@@ -39,8 +39,16 @@ impl Out {
         }
     }
 
+    /// A new line; on a line that is still fresh, that line re-indented
+    /// instead, as mongod prints a nested `if` (`else if ...` ends both
+    /// blocks on one line; RM-693).
     fn newline(&mut self) {
-        self.text.push('\n');
+        if self.fresh {
+            let start = self.text.rfind('\n').map_or(0, |i| i + 1);
+            self.text.truncate(start);
+        } else {
+            self.text.push('\n');
+        }
         for _ in 0..self.indent {
             self.text.push_str("    ");
         }

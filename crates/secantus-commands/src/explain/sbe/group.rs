@@ -20,7 +20,9 @@
 //! since with two mongod orders their slots by a hash table salted per
 //! process. A skip or limit only where the group reads no field (with
 //! one, mongod puts a dependency projection among them that is not built
-//! here). Anything else returns `None`.
+//! here). Also an `_id` part that is `$mod` of a field by a number, and a
+//! `$push` / `$addToSet` of an object of fields (RM-693). Anything else
+//! returns `None`.
 
 use super::expr::{BinOp, Expr, Slot, NULLISH_MASK};
 use super::filter::Filter;
@@ -43,6 +45,43 @@ pub(super) enum Arg {
     Path(Vec<String>),
     /// A constant.
     Const(Bson),
+    /// `{$mod: [<field>, <numeric constant>]}` in the `_id` (RM-693).
+    Mod(String, Bson),
+    /// An object of top-level fields, as a `$push` / `$addToSet` argument:
+    /// `newObj` over their scan slots (RM-693).
+    Obj(Vec<(String, String)>),
+}
+
+/// An `_id` part: [`arg_of`], or a `$mod` of a field by a number.
+fn id_arg_of(v: &Bson) -> Option<Arg> {
+    if let Bson::Document(d) = v {
+        if let (1, Some(Bson::Array(a))) = (d.len(), d.get("$mod")) {
+            return match (a.as_slice(), a.first().and_then(arg_of)) {
+                ([_, Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_)], Some(Arg::Field(f))) => {
+                    Some(Arg::Mod(f, a[1].clone()))
+                }
+                _ => None,
+            };
+        }
+    }
+    arg_of(v)
+}
+
+/// A `$push` / `$addToSet` argument: [`arg_of`], or an object of fields.
+fn collect_arg_of(v: &Bson) -> Option<Arg> {
+    match v {
+        Bson::Document(d) if !d.is_empty() && !d.keys().any(|k| k.starts_with('$')) => {
+            let children: Option<Vec<(String, String)>> = d
+                .iter()
+                .map(|(k, v)| match arg_of(v)? {
+                    Arg::Field(f) => Some((k.clone(), f)),
+                    _ => None,
+                })
+                .collect();
+            Some(Arg::Obj(children?))
+        }
+        other => arg_of(other),
+    }
 }
 
 pub(super) fn arg_of(v: &Bson) -> Option<Arg> {
@@ -100,7 +139,7 @@ fn parse(group: &Document) -> Option<(Id, Vec<Acc>)> {
             }
             let children: Option<Vec<(String, Arg)>> = d
                 .iter()
-                .map(|(k, v)| Some((k.clone(), arg_of(v)?)))
+                .map(|(k, v)| Some((k.clone(), id_arg_of(v)?)))
                 .collect();
             let children = children?;
             // An object of constants is folded into one constant before
@@ -110,7 +149,7 @@ fn parse(group: &Document) -> Option<(Id, Vec<Acc>)> {
             }
             Id::Object(children)
         }
-        other => Id::One(arg_of(other)?),
+        other => Id::One(id_arg_of(other)?),
     };
     let mut accs = Vec::new();
     for (name, spec) in group {
@@ -127,7 +166,11 @@ fn parse(group: &Document) -> Option<(Id, Vec<Acc>)> {
                 _ => return None,
             },
             "$sum" | "$avg" | "$first" | "$last" | "$min" | "$max" | "$push" | "$addToSet" => {
-                let a = arg_of(value)?;
+                let a = if matches!(op.as_str(), "$push" | "$addToSet") {
+                    collect_arg_of(value)?
+                } else {
+                    arg_of(value)?
+                };
                 let numeric = matches!(
                     &a,
                     Arg::Const(Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_))
@@ -352,10 +395,11 @@ pub(super) fn build(group: &Document, uuid: &str, last: bool, front: &Front) -> 
     }
     let fields: BTreeSet<String> = args
         .iter()
-        .filter_map(|a| match a {
-            Arg::Field(f) => Some(f.clone()),
-            Arg::Path(p) => Some(p[0].clone()),
-            _ => None,
+        .flat_map(|a| match a {
+            Arg::Field(f) | Arg::Mod(f, _) => vec![f.clone()],
+            Arg::Path(p) => vec![p[0].clone()],
+            Arg::Obj(children) => children.iter().map(|(_, f)| f.clone()).collect(),
+            _ => vec![],
         })
         .collect();
     let whole_document = args.iter().any(|a| matches!(a, Arg::Root));
@@ -402,6 +446,38 @@ pub(super) fn build(group: &Document, uuid: &str, last: bool, front: &Front) -> 
             Arg::Field(f) => Expr::Slot(field_slot(f)?),
             Arg::Path(_) => Expr::Slot(path_slot?),
             Arg::Const(c) => Expr::Const(Some(c.clone())),
+            // `$mod`'s program (`ExpressionMod` in `sbe_stage_builder_expression.cpp`).
+            Arg::Mod(f, divisor) => {
+                let x = Expr::Slot(field_slot(f)?);
+                Expr::if_(
+                    Expr::fill_empty(
+                        Expr::TypeMatch(Box::new(x.clone()), NULLISH_MASK),
+                        Expr::Const(Some(Bson::Boolean(true))),
+                    ),
+                    Expr::null(),
+                    Expr::if_(
+                        Expr::func("isNumber", vec![x.clone()]),
+                        Expr::func("mod", vec![x, Expr::Const(Some(divisor.clone()))]),
+                        Expr::func(
+                            "fail",
+                            vec![
+                                Expr::Const(Some(Bson::Int32(7157718))),
+                                Expr::Const(Some(Bson::String(
+                                    "$mod only supports numeric types".into(),
+                                ))),
+                            ],
+                        ),
+                    ),
+                )
+            }
+            Arg::Obj(children) => {
+                let mut args = Vec::new();
+                for (name, f) in children {
+                    args.push(Expr::Const(Some(Bson::String(name.clone()))));
+                    args.push(Expr::Slot(field_slot(f)?));
+                }
+                Expr::func("newObj", args)
+            }
         })
     };
 
