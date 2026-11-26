@@ -7,8 +7,10 @@
 //! limit, as `buildCollScan` and `buildLimitSkip` build them, and a simple
 //! projection over them (`buildProjectionSimple`, RM-543): an inclusion or
 //! exclusion of top-level fields. The plan's result is the scanned record,
-//! or the projected one. A sorted or index-served `find` is not built
-//! (`None`), nor a projection of a path, a computed field or a `$` operator.
+//! or the projected one. A sort on one top-level field is built
+//! (`build_sorted`, RM-543). An index-served `find` is not built (`None`),
+//! nor a sort on more keys or a path, nor a projection of a path, a
+//! computed field or a `$` operator.
 //!
 //! The same plan is what mongod runs for a `distinct`, and for an
 //! `aggregate` whose stages it takes into the query, under
@@ -198,6 +200,77 @@ pub(super) fn build(uuid: &str, front: &Front, spec: Option<&Document>) -> Optio
         result,
         env,
         query_plan,
+        eof: false,
+    })
+}
+
+/// The plan for the `find` whose query is `front`, sorted on one
+/// top-level `field` (`desc`: descending), with `limit` (0: none) as the
+/// sort's top-k: `buildSort` puts a `project` of the key's
+/// `getSortKeyAsc` / `getSortKeyDesc` and a `sort` over the scan, both the
+/// `SORT` node's, the scan reading the key's field before the filter's
+/// (measured 8.2.11, 2026-11-26). `None` with a skip, or a `seek`.
+pub(super) fn build_sorted(uuid: &str, front: &Front, field: &str, desc: bool) -> Option<Plan> {
+    if front.skip > 0 || front.seek.is_some() || field.is_empty() || field.contains('.') {
+        return None;
+    }
+    let under = Front {
+        parsed: front.parsed.clone(),
+        filter: front.filter.clone(),
+        skip: 0,
+        limit: 0,
+        seek: None,
+    };
+    let mut slots = Slots(0);
+    let read: BTreeSet<String> = [field.to_string()].into_iter().collect();
+    let Scanned {
+        root,
+        record,
+        fields,
+        mut env,
+        query_plan,
+    } = scan(&under, uuid, read, &mut slots)?;
+    let source = fields.iter().find(|(n, _)| n == field)?.1;
+    let node = under.nodes() + 1;
+    let key = slots.next();
+    let get = if desc {
+        "getSortKeyDesc"
+    } else {
+        "getSortKeyAsc"
+    };
+    let project = Stage::Project {
+        node,
+        binds: vec![(key, Expr::func(get, vec![Expr::Slot(source)]))],
+        input: Box::new(root),
+    };
+    let limit = (front.limit > 0).then(|| {
+        let s = slots.next();
+        env.push((s, front.limit.to_string()));
+        (s, front.limit)
+    });
+    let root = Stage::Sort {
+        node,
+        keys: vec![(key, desc)],
+        outputs: vec![record],
+        limit,
+        input: Box::new(project),
+    };
+    let mut sort = doc! {
+        "stage": "SORT",
+        "planNodeId": node as i32,
+        "sortPattern": { field: if desc { -1 } else { 1 } },
+        "memLimit": 104_857_600_i32,
+    };
+    if front.limit > 0 {
+        sort.insert("limitAmount", super::number(front.limit));
+    }
+    sort.insert("type", "simple");
+    sort.insert("inputStage", query_plan);
+    Some(Plan {
+        root,
+        result: record,
+        env,
+        query_plan: sort,
         eof: false,
     })
 }
@@ -641,5 +714,46 @@ mod tests {
                  [1] scan s1 s2 none none none none none none [s3 = x] @\"u\" true false "
             )
         );
+    }
+
+    /// A sort on one top-level field: `sort` over a `project` of its key,
+    /// the key's field read first (mongod 8.2.11, measured 2026-11-26).
+    #[test]
+    fn sort_plans_are_mongods() {
+        let gt1 = || front(doc! { "x": { "$gt": 1 } }, 0, 0);
+        let sorted = |f: &Front, field: &str, desc: bool| {
+            let plan = super::build_sorted("u", f, field, desc).expect("built");
+            let sbp = plan.winning_plan(false);
+            let sbp = sbp.get_document("slotBasedPlan").unwrap();
+            (
+                sbp.get_str("slots").unwrap().to_string(),
+                sbp.get_str("stages").unwrap().to_string(),
+            )
+        };
+        assert_eq!(
+            sorted(&gt1(), "y", false),
+            (
+                "$$RESULT=s1 env: {  }".to_string(),
+                "[2] sort [s5] [asc] [s1] \n\
+                 [2] project [s5 = getSortKeyAsc(s3)] \n\
+                 [1] filter {traverseF(s4, lambda(l2.0) { ((move(l2.0) > 1) ?: false) }, false)} \n\
+                 [1] scan s1 s2 none none none none none none [s3 = y, s4 = x] @\"u\" true false "
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            sorted(&front(doc! { "x": { "$gt": 1 } }, 0, 2), "y", true),
+            (
+                "$$RESULT=s1 env: { s6 = 2 }".to_string(),
+                "[2] sort [s5] [desc] [s1] s6 \n\
+                 [2] project [s5 = getSortKeyDesc(s3)] \n\
+                 [1] filter {traverseF(s4, lambda(l2.0) { ((move(l2.0) > 1) ?: false) }, false)} \n\
+                 [1] scan s1 s2 none none none none none none [s3 = y, s4 = x] @\"u\" true false "
+                    .to_string()
+            )
+        );
+        // Not built: a path, a skip.
+        assert!(super::build_sorted("u", &gt1(), "d.e", false).is_none());
+        assert!(super::build_sorted("u", &front(doc! {}, 1, 0), "y", false).is_none());
     }
 }

@@ -62,6 +62,13 @@ pub(crate) fn find_plan(uuid: &str, front: &Front, projection: Option<&Document>
     find::build(uuid, front, projection)
 }
 
+/// The plan for a `find` whose query is `front`, sorted on the one
+/// top-level `field` (`desc`: descending) under `queryFramework: "sbe"`
+/// (RM-543). `None` when it is outside what is built here.
+pub(crate) fn sorted_plan(uuid: &str, front: &Front, field: &str, desc: bool) -> Option<Plan> {
+    find::build_sorted(uuid, front, field, desc)
+}
+
 /// The plan for a query `front` with `adds` (`$addFields` specs, in
 /// order) over it, as `aggregate` runs it under `queryFramework: "sbe"`
 /// (RM-542). `None` when a spec is outside what is built here.
@@ -222,7 +229,7 @@ impl Plan {
                 let mut at = Some(&self.root);
                 let mut found = false;
                 while let Some(st) = at {
-                    found |= matches!(st, Stage::Group { .. });
+                    found |= matches!(st, Stage::Group { .. } | Stage::Sort { .. });
                     at = st.input();
                 }
                 found

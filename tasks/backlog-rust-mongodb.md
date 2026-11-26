@@ -1331,14 +1331,17 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Verify: none -- no gap test yet for the direct write to
       `config.clusterParameters`
       Backlog-ID: RM-418
-- [ ] **A `find` under `queryFramework: "sbe"` that is sorted or
-      index-served is explained in the classic shape.** mongod 8.2.11 runs
-      it in SBE and explains it so (`nlj` over an `ixseek` and a `seek` for
-      an index; a `sort` over a `project` of `getSortKeyAsc` for a sort);
-      this server builds the slot program only for a forward collection
-      scan, its filter (comparisons and `$in`s), skip, limit and a simple
-      projection of top-level fields (`explain/sbe/find.rs`). Also not
-      built: an `$in` holding null (mongod's `typeMatch` program), a
+- [ ] **A `find` under `queryFramework: "sbe"` that is index-served, or
+      sorted beyond one top-level field, is explained in the classic
+      shape.** mongod 8.2.11 runs it in SBE and explains it so (`nlj` over
+      an `ixseek` and a `seek` for an index); this server builds the slot
+      program only for a forward collection scan, its filter (comparisons
+      and `$in`s), skip, limit, a simple projection of top-level fields,
+      and since 2026-11-26 a sort on one top-level field with or without a
+      limit (`explain/sbe/find.rs`). Also not built: a sort on two keys
+      (mongod adds a parallel-arrays `fail` check to the key `project`), on
+      a path (`traverseP` with `getNonLeafSortKeyAsc`), or with a skip or a
+      projection; an `$in` holding null (mongod's `typeMatch` program), a
       projection of a path or a computed field, and a projection under both
       a skip and a limit. For an `aggregate` (RM-542) the `$addFields`
       after its query are built when they set new top-level fields to

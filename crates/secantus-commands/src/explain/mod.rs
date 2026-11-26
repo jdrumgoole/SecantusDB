@@ -1252,6 +1252,11 @@ fn front_runs_in_sbe(
     sbe_pushdown(storage, db, &s.coll, &hoisted, s.hint.as_ref(), collation).is_some()
 }
 
+/// The read has a projection that is not empty.
+fn projected_find(s: &Shape) -> bool {
+    s.projection.as_ref().is_some_and(|p| !p.is_empty())
+}
+
 /// A `find` command of a collection, not a view's pipeline.
 fn plain_find(s: &Shape) -> bool {
     matches!(s.kind, Kind::Find) && !s.pipeline
@@ -2466,7 +2471,33 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                     ..
                 }
             );
-            let simple = s.sort.as_ref().is_none_or(Document::is_empty)
+            // A sort on one top-level field over a forward collection scan,
+            // with no skip or projection (RM-543): `sort` over a `project`
+            // of its key.
+            let sorted = s.sort.as_ref().filter(|d| !d.is_empty()).and_then(|d| {
+                match d.iter().collect::<Vec<_>>().as_slice() {
+                    [(k, v)] if own_read && s.skip == 0 && !projected_find(s) => match v {
+                        Bson::Int32(1) | Bson::Int64(1) => Some((k.to_string(), false)),
+                        Bson::Double(d) if *d == 1.0 => Some((k.to_string(), false)),
+                        Bson::Int32(-1) | Bson::Int64(-1) => Some((k.to_string(), true)),
+                        Bson::Double(d) if *d == -1.0 => Some((k.to_string(), true)),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            });
+            let sort_scan = sorted.is_some()
+                && matches!(
+                    plan.without_paging(),
+                    Node::Sort {
+                        on_keys: false,
+                        keeps_metadata: false,
+                        input,
+                        ..
+                    } if matches!(**input, Node::CollScan { backward: false, .. })
+                );
+            let scan = scan || sort_scan;
+            let simple = (s.sort.as_ref().is_none_or(Document::is_empty) || sort_scan)
                 && s.hint.is_none()
                 && collation.is_none()
                 && s.min_max.is_none()
@@ -2486,6 +2517,10 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             // An `aggregate`'s projection is not built here.
             let projected = s.projection.as_ref().is_some_and(|p| !p.is_empty());
             let built = |()| match added.as_slice() {
+                [] if sort_scan => {
+                    let (field, desc) = sorted.as_ref()?;
+                    sbe::sorted_plan(&uuid, &on, field, *desc)
+                }
                 [] if own_read => sbe::find_plan(&uuid, &on, s.projection.as_ref()),
                 _ if projected => None,
                 [] => sbe::find_plan(&uuid, &on, None),

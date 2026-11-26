@@ -475,6 +475,37 @@ impl Expr {
                     _ => None,
                 }
             }
+            // `getSortKeyAsc(v)` / `getSortKeyDesc(v)`: the value an
+            // ascending (descending) sort orders `v` by: an array's least
+            // (greatest) element, an empty array's `undefined`, a missing
+            // value's null.
+            "getSortKeyAsc" | "getSortKeyDesc" => {
+                let desc = name == "getSortKeyDesc";
+                match args[0].eval(env) {
+                    None => Some(Bson::Null),
+                    Some(Bson::Array(items)) => {
+                        let mut best: Option<Bson> = None;
+                        for v in items {
+                            let better = match &best {
+                                None => true,
+                                Some(b) => {
+                                    let o = compare(&Some(v.clone()), &Some(b.clone()));
+                                    if desc {
+                                        o == Ordering::Greater
+                                    } else {
+                                        o == Ordering::Less
+                                    }
+                                }
+                            };
+                            if better {
+                                best = Some(v);
+                            }
+                        }
+                        Some(best.unwrap_or(Bson::Undefined))
+                    }
+                    other => other,
+                }
+            }
             "isNumber" => args[0].eval(env).map(|v| Bson::Boolean(is_number(&v))),
             "fillType" => {
                 let v = args[0].eval(env);
