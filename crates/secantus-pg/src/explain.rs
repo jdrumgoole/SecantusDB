@@ -37,6 +37,7 @@ pub(crate) fn add_row_identity(node: &mut PlanNode) -> i64 {
 }
 
 /// One plan node: its header, its detail lines, its children.
+#[derive(Clone)]
 pub(crate) struct PlanNode {
     pub name: String,
     /// `(label, value)`: `Sort Key: id`, `Group Key: g`, `Index Name: ...`.
@@ -909,6 +910,95 @@ pub(crate) fn price_nest_loop(
     root.estimate = Some(join);
 }
 
+/// Draw and price a two-table join's tree as the path
+/// [`PgHandler::hash_join_estimate`] picked (RP-330 to RP-978): a hash, merge
+/// or parameterized nested loop join, each side's scan named after the
+/// index it reads.
+pub(crate) fn apply_join_pick(
+    tree: &mut PlanNode,
+    sel: &secantus_pgplan::Select,
+    est: crate::scan_estimate::JoinEstimate,
+    join_conds: &[String],
+) {
+    let (a, b, join, pick, indexes) = est;
+    match pick {
+        crate::scan_estimate::JoinPick::Hash { swap } => price_hash_join(tree, a, b, join, swap),
+        // The merge path PostgreSQL keeps (RP-366):
+        // both inputs sorted on the join keys.
+        crate::scan_estimate::JoinPick::Merge { b_outer, plan } => {
+            // On an expression key, the texts
+            // of its one ON equality (RP-1032).
+            let keys = if crate::scan_estimate::has_expr_join_key(sel) {
+                match join_conds {
+                    [cond] => expr_merge_key_texts(&tree.children[0], cond),
+                    _ => None,
+                }
+            } else {
+                join_key_texts(sel)
+            };
+            if let Some(keys) = keys {
+                price_merge_join(tree, a, b, join, &plan, b_outer, &keys);
+            }
+        }
+        // A nested loop into the inner side's unique
+        // key index, parameterized by the outer row
+        // (RP-978).
+        crate::scan_estimate::JoinPick::NestParam {
+            b_outer,
+            index_only,
+        } => {
+            let inner_key = join_key_texts(sel).and_then(|(l, r)| {
+                let k = if b_outer { l } else { r };
+                k.split_once('.')
+                    .map(|(a, c)| (a.to_string(), c.to_string()))
+            });
+            if let (Some((alias, column)), Some(index)) = (inner_key, indexes[1].clone()) {
+                price_param_nest_loop(
+                    tree,
+                    a,
+                    b,
+                    join,
+                    b_outer,
+                    &crate::scan_estimate::ParamScan {
+                        index,
+                        alias,
+                        column,
+                        index_only,
+                        read: Vec::new(),
+                        memoize: None,
+                    },
+                );
+            }
+        }
+    }
+    // A side read through its index (RP-369).
+    if tree.estimate.is_some() {
+        name_index_scans(tree, &indexes);
+    }
+}
+
+/// Draw and price a two-table Nested Loop as
+/// [`PgHandler::nest_loop_estimate`] priced it (RP-329, RP-354): the inner
+/// materialised or read through its index parameterized by the outer row,
+/// a LEFT join's preserved side read through its index.
+pub(crate) fn apply_nest_loop(tree: &mut PlanNode, est: crate::scan_estimate::NestLoopEstimate) {
+    let (plan, a, b, join, param, outer_index) = est;
+    price_nest_loop(tree, &plan, a, b, join);
+    // A LEFT join's preserved side read through its
+    // index, its WHERE the Index Cond (RP-354).
+    if let Some(index) = outer_index {
+        let outer = &mut tree.children[0];
+        if let Some(table) = outer.name.strip_prefix("Seq Scan on ").map(str::to_string) {
+            index_path_node(outer, index, &table);
+        }
+    }
+    // The inner read through its index, the join
+    // clause its Index Cond (RP-354).
+    if let Some(p) = param {
+        param_index_inner(tree, &p);
+    }
+}
+
 /// Make a priced `Nested Loop`'s inner scan the index scan parameterized
 /// by the outer row the cost model chose (RP-354): its name and index,
 /// and the column whose join clause [`move_param_conds`] makes its
@@ -1653,7 +1743,7 @@ fn name_two_scans(
 
 /// Name one scan after the index it reads, `(index, index-only)`; `None`
 /// the Seq Scan. A node that is no table's scan is left as it is.
-fn name_scan_index(scan: &mut PlanNode, index: &Option<(String, bool)>) {
+pub(crate) fn name_scan_index(scan: &mut PlanNode, index: &Option<(String, bool)>) {
     let table = match scan.name.strip_prefix("Seq Scan on ") {
         Some(t) => t.to_string(),
         None => match scan

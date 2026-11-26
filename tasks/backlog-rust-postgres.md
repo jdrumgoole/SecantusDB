@@ -2229,60 +2229,53 @@ a regression test.
       ANALYZE (`join_analyze.rs`, as a two-table loop's is).
       Backlog-ID: RP-390
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop over a hash join], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop over a hash join]
-- [ ] **A join nested in an outer join prints no estimate, and its join
-      order and method are not PostgreSQL's.** Since 2026-11-15 an inner
-      join's one-table ON conjuncts under an outer join, and an outer
-      join's ON conjunct over one table of an inner join on its nullable
-      side, run in their tables' scans (RP-393, RP-397), and where the join
-      search keeps the written order the plan prints as PostgreSQL 15.19's
-      does (`s left join (e join s s2 on e.a = s2.a) on s.a = e.a and s2.c =
-      'xx'`). But every node of such a plan prints `cost=0.00..0.00 rows=0
-      width=0`, and the join is not searched: `select * from s left join (e
-      join k on e.a > 998 and k.a = e.a) on true` is, in PostgreSQL, a
-      `Nested Loop Left Join` over a `Materialize` of a `Nested Loop` into
-      `Index Scan using k_pkey on k` (`Index Cond: (a = e.a)`,
-      cost=0.28..36.16 rows=60); here a Hash Join of two Seq Scans with no
-      Materialize, and under ANALYZE no actual block below the top join.
-      `select * from s left join (e join k on e.a < k.a) on s.a = e.a and
-      k.b = 'v3'` is PostgreSQL's `Hash Right Join` with `s` hashed and a
-      `Materialize` over `k`; here a `Hash Left Join` hashing the inner
-      join. Since 2026-11-17 the same inner join alone (`e join k on k.a =
-      e.a where e.a > 998`) is PostgreSQL's nested loop into `k_pkey`
-      parameterized by the outer row, priced (`JoinPick::NestParam`, drawn
-      by `explain::price_param_nest_loop`), where the unique-key path
-      search (`unique_key_other_paths`) picks it with no Memoize, and
-      since 2026-11-17 that inner read index-only where it reads only its
-      key (`select e.b from e join k ...`, `HashSide::key_only_read`, the
-      visibility map's fraction applied), and since 2026-11-17 a range on
-      the hashed side's key read through its index (`where k.a < 10`,
-      `Hash Join` over an `Index Scan using k_pkey`; that scan is the
-      side's ordered path in `unique_key_other_paths`), and since 2026-11-17
-      bounds on both sides' keys (`where e.a > 998 and k.a < 2000`, the
-      bound joining the inner's `Index Cond: ((a = e.a) AND (a < 2000))`).
-      Sized 2026-11-18: every three-table plan with an outer join over a
-      nested join prints zeros here, whatever its shape, including the
-      one whose order and methods already match
-      (`s left join (e join s s2 on e.a = s2.a) on ...` is PostgreSQL's
-      `Hash Left Join (cost=20.16..21.58 rows=30 width=47)` over a hashed
-      `Hash Join (cost=1.39..20.15 rows=1 width=27)`):
-      `hash_join_estimate` / `joined_sides` price only a two-leaf
-      `JoinNode::Join`. The work is a join search over the outer join's
-      sides with the nested join as one priced relation
-      (`make_rel_from_joinlist` keeps the outer join's order constraints),
-      then each method as `joincost.rs` prices it for two leaves. The
-      `on true` plan's arithmetic checks out from 15.19's own formulas:
-      `Materialize` over the 34.10 nest loop is 0.28..34.11
-      (`cost_material`, 2 x cpu_operator_cost per row), and the
-      `Nested Loop Left Join` 0.28..36.16 (outer 1.30, inner 33.83 run,
-      29 rescans of 0.005, 60 x cpu_tuple_cost). The `k.b = 'v3'` plan is
-      `Hash Right Join (cost=1.68..1669.42 rows=1000 width=34)` over
-      `Nested Loop (cost=0.00..1532.75 rows=33333)` and a `Materialize
-      (cost=0.00..18.00 rows=100)` of `k`. Under ANALYZE the executor runs
-      a different tree from the one printed, so the actuals need the
-      executed shape to follow the chosen one.
-      Measured on a private 15.19 cluster (found while working RP-393 and RP-397).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends]
+- [ ] **A join nested in an outer join is priced only in its simplest
+      shapes.** Since 2026-11-26 `t LEFT JOIN (x JOIN y ON ..) ON ..`, with
+      no WHERE and an ON that is one column equality between `t` and a
+      table of the pair (or nothing, `ON true`), is planned as PostgreSQL
+      15 plans it (`nested_join.rs`): the pair priced as the two-table join
+      it is, then the LEFT join over the pair's cheapest path, each method
+      `add_paths_to_joinrel` weighs (a nested loop over the pair
+      materialised or not, a hash join hashing either side -- the pair
+      outer is a `Hash Right Join` -- a merge of either order), the pair
+      standing as one side (`JoinedRel`: its path's cost, rows and width,
+      its key's statistics its base table's). `ON true`'s loop under
+      ANALYZE counts the pair once under its Materialize. Still zeros, or
+      uncounted:
+      - a LEFT join keyed on a column a B-tree of the pair's table leads
+        with (`s left join (e join k on k.a = e.a) on s.a = k.a`, which
+        PostgreSQL 15 plans as `Hash Right Join (cost=29.18..50.86 rows=30
+        width=34)`): the pair may then take a path parameterized by `t`
+        (`k_pkey` probed by `s.a`), which `JoinedRel` does not weigh, so
+        it is declined (`hash_join_estimate_over`);
+      - ANALYZE's counts below a hash join over the pair (`count_hash_join`
+        reads only two scans): a `Hash Right Join` probing with a nested
+        loop prints no actual block below its top;
+      - a WHERE, an ON conjunct over the preserved table, an ON of
+        several equalities or one on an expression, a pair whose own
+        join is not one `hash_join_estimate` / `nest_loop_estimate`
+        prices, a FULL or RIGHT join, an aggregate over the join, and a
+        pair on either side of an inner join (`(e join k) join s`) or
+        deeper nesting.
+      The order and method of these plans match PostgreSQL's where they
+      are drawn (and the rows already come out in its order).
+      Measured on a private 15.20 cluster (found while working RP-393 and RP-397).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested join keyed on an indexed column under a left join], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a hash right join over a nested loop]
       Backlog-ID: RP-978
+- [ ] **EXPLAIN VERBOSE of a join nested in an outer join prints no
+      `Output` lines and unqualified quals.** `explain (verbose, costs
+      off) select * from s left join (e join k on e.a > 998 and k.a = e.a)
+      on true` prints `Seq Scan on s`, `Filter: (a > 998)` and `Index Cond:
+      (a = e.a)` with no `Output:` on any node; PostgreSQL 15 prints each
+      node's target list (`Output: s.a, s.c, e.a, e.b, k.a, k.b` on the
+      top, `Output: e.a, e.b, k.a, k.b` on the Materialize and the pair),
+      `Seq Scan on public.s` and the quals qualified (`Filter: (e.a >
+      998)`, `Index Cond: (k.a = e.a)`). `attach_verbose_join` models a
+      join of two scans; a join whose side is a join is left bare. Found
+      while working RP-978 (this server printed it so before that change
+      too); measured on a private PostgreSQL 15.20 cluster.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[verbose of an inner join nested in a left join]
+      Backlog-ID: RP-1121
 - [ ] **EXPLAIN prints no estimate for a join over a scan filtered by an
       expression.** Since RP-404 a comparison of integer or text arithmetic
       with a constant, and a LIKE / ILIKE of an analysed string column, are

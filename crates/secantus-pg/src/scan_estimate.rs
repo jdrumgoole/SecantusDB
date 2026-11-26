@@ -520,6 +520,17 @@ impl PgHandler {
         &self,
         sel: &secantus_pgplan::Select,
     ) -> Option<NestLoopEstimate> {
+        self.nest_loop_estimate_over(sel, None)
+    }
+
+    /// [`Self::nest_loop_estimate`] with the join's right side standing for
+    /// the joined relation `rel` (RP-978): its cheapest path, rows and
+    /// width, never an index scan nor parameterized.
+    pub(crate) fn nest_loop_estimate_over(
+        &self,
+        sel: &secantus_pgplan::Select,
+        over: Option<&JoinedRel>,
+    ) -> Option<NestLoopEstimate> {
         use secantus_pgplan::joins::{FilterKind, JoinKind, JoinNode, JoinRows};
         use secantus_pgplan::Statement;
         let sub = sel.sub.as_ref()?;
@@ -761,7 +772,10 @@ impl PgHandler {
             Some((scan, width.3, index))
         };
         let (a, a_above, a_index) = side(left, left_join)?;
-        let (b, b_above, _) = side(right, false)?;
+        let (b, b_above, _) = match (side(right, false), over) {
+            (Some(_), Some(rel)) => (rel.est, rel.above, None),
+            (side, _) => side?,
+        };
         let qual: f64 = filters
             .iter()
             .map(|f| f.ops * costsize::CPU_OPERATOR_COST)
@@ -858,6 +872,10 @@ impl PgHandler {
         {
             if left_join && slot == 1 {
                 break;
+            }
+            // A joined relation's paths are not parameterized here.
+            if over.is_some() && slot == 0 {
+                continue;
             }
             // `get_parameterized_baserel_size`: the join clauses moved
             // into the scan, estimated as restrictions of the inner.
@@ -2217,6 +2235,23 @@ impl PgHandler {
     }
 
     pub(crate) fn hash_join_estimate(&self, sel: &secantus_pgplan::Select) -> Option<JoinEstimate> {
+        self.hash_join_estimate_over(sel, None)
+    }
+
+    /// [`Self::hash_join_estimate`] with the side whose key is a column of
+    /// `rel.alias` standing for the joined relation `rel` (RP-978): its
+    /// cheapest path, rows and width, its key's statistics still its base
+    /// table's (`examine_variable` finds the column there), and nothing an
+    /// index of that table gives a base relation's paths -- a join
+    /// relation is never proven unique (`rel_supports_distinctness`), and
+    /// none of its paths is an index scan. A key a B-tree of its table
+    /// leads with could make a path of the joined relation parameterized
+    /// by the other side, which is not modelled: `None`.
+    pub(crate) fn hash_join_estimate_over(
+        &self,
+        sel: &secantus_pgplan::Select,
+        over: Option<&JoinedRel>,
+    ) -> Option<JoinEstimate> {
         let (a, b, more, filter, left_join, target_width) = self.joined_sides(sel)?;
         // A WHERE conjunct pushed into a side's scan (RP-365) is priced as
         // that scan's filter, through an index where that is the cheaper
@@ -2233,6 +2268,12 @@ impl PgHandler {
             let mut h =
                 self.hash_side_with(&p.table, &p.filter, &p.exprs, &p.field, &p.read, &p.above)?;
             self.mark_key_only(&mut h, p.read.iter().all(|f| *f == p.field));
+            if let Some(rel) = over.filter(|r| r.alias == p.alias) {
+                if h.key_indexed || p.key_expr.is_some() {
+                    return None;
+                }
+                rel.stand_in(&mut h);
+            }
             // A side whose key is an expression: no statistics for it, so
             // `get_variable_numdistinct`'s 200 default, no MCVs and no
             // NULLs (`eqjoinsel`, `estimate_hash_bucket_stats`); not unique
@@ -2255,6 +2296,9 @@ impl PgHandler {
         // clauses: past them, pricing each side's scan for nothing would
         // cost a scan per clause the client wrote (RP-388).
         if more.len() > MORE_HASH_CLAUSES {
+            return None;
+        }
+        if over.is_some_and(|r| !more.is_empty() || ![&a.alias, &b.alias].contains(&&r.alias)) {
             return None;
         }
         let more: Vec<(HashSide, HashSide)> = more
@@ -3827,6 +3871,7 @@ impl PgHandler {
             default_nd,
             no_stats: key.is_none(),
             key_only_read: false,
+            rel_rows: scan.2,
         })
     }
 
@@ -7795,6 +7840,38 @@ fn bson_value_hash(v: &bson::Bson) -> u64 {
     h.finish()
 }
 
+/// A join relation standing as one side of a two-table join's pricing
+/// (RP-978): an inner join nested in an outer join, its cheapest path
+/// priced as the two-table join it is, and the join above it priced over
+/// that path as `add_paths_to_joinrel` prices one over any relation.
+#[derive(Debug, Clone)]
+pub(crate) struct JoinedRel {
+    /// The alias of the table its join key is a column of.
+    pub(crate) alias: String,
+    /// Its cheapest path: `(startup, total, rows, width)`, the width its
+    /// rows carry up to the join above, its clause's key among them.
+    pub(crate) est: Estimate,
+    /// The width of what it passes above that join: the columns the query
+    /// reads (`build_joinrel_tlist` of the join above).
+    pub(crate) above: i64,
+}
+
+impl JoinedRel {
+    /// `h`, its key's table's side, as this relation: its path and width,
+    /// and none of the facts only a base relation's scan has.
+    fn stand_in(&self, h: &mut HashSide) {
+        h.scan = self.est;
+        h.above = self.above;
+        h.index = None;
+        h.one_row = false;
+        h.unique = false;
+        h.key_indexed = false;
+        h.key_index = None;
+        h.key_index_name = None;
+        h.key_only_read = false;
+    }
+}
+
 struct HashSide {
     scan: Estimate,
     /// The index the scan reads, when it is an Index Scan (RP-369).
@@ -7835,6 +7912,12 @@ struct HashSide {
     /// Its scan reads no column but its key: an index on the key serves
     /// it index-only (`check_index_only`).
     key_only_read: bool,
+    /// The rows of the base relation its key's column is in, which a hash
+    /// bucket's size scales its distinct count by
+    /// (`estimate_hash_bucket_stats`): the scan's own rows, and for a
+    /// joined relation standing as this side ([`JoinedRel`]) still the
+    /// base table's, as `examine_variable` finds the column there.
+    rel_rows: f64,
 }
 
 /// A join key's B-tree index over an analysed table (RP-377): the table
@@ -8488,7 +8571,7 @@ fn hash_join_of(
         ndistinct: s.stats.0,
         default_ndistinct: s.default_nd,
         key_ops,
-        rel_rows: s.scan.2,
+        rel_rows: s.rel_rows,
         width: Some(s.scan.3),
         extra,
     };

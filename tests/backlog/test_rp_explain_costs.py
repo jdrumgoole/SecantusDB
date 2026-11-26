@@ -6283,10 +6283,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # A LEFT join's ON conjunct over one table of an inner join on its
-    # nullable side is that table's scan Filter too (RP-397, fixed); still
-    # open: the join search's order and method around it (RP-978).
+    # nullable side is that table's scan Filter too (RP-397, fixed); the
+    # join above the inner join was searched over its cheapest path, which
+    # put it outer of a Hash Right Join (RP-978, fixed).
     "a left join's ON conjunct over a table of an inner join it null-extends": (
-        "RP-978",
+        "RP-978:fixed",
         _ANALYSED_THIRTY,
         "explain (costs off)"
         " select * from s left join (e join k on e.a < k.a) on s.a = e.a and k.b = 'v3'",
@@ -8499,10 +8500,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # An inner join nested inside an outer join: its one-table ON conjunct
-    # is its table's scan Filter (RP-393, fixed); still open: the nested
-    # join's search and its counts (RP-978).
+    # is its table's scan Filter (RP-393, fixed); the nested join was
+    # priced as two tables are, the loop above it materialised it, and
+    # ANALYZE counted it once under the Materialize (RP-978, fixed).
     "analyze of an inner join under an outer join with a one-table ON conjunct": (
-        "RP-978",
+        "RP-978:fixed",
         _ANALYSED_THIRTY,
         "explain (analyze, costs off, timing off, summary off)"
         " select * from s left join (e join k on e.a > 998 and k.a = e.a) on true",
@@ -8516,6 +8518,143 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "                    Rows Removed by Filter: 998",
             "              ->  Index Scan using k_pkey on k (actual rows=1 loops=2)",
             "                    Index Cond: (a = e.a)",
+        ],
+    ),
+    # An inner join nested on a LEFT join's nullable side, priced: the
+    # pair as the two tables it joins, the LEFT join over the pair's
+    # cheapest path as over any relation (RP-978, fixed).
+    "a nested loop left join materialises a priced inner join": (
+        "RP-978:fixed",
+        _ANALYSED_THIRTY,
+        "explain select * from s left join (e join k on e.a > 998 and k.a = e.a) on true",
+        [
+            "Nested Loop Left Join  (cost=0.28..36.16 rows=60 width=34)",
+            "  ->  Seq Scan on s  (cost=0.00..1.30 rows=30 width=20)",
+            "  ->  Materialize  (cost=0.28..34.11 rows=2 width=14)",
+            "        ->  Nested Loop  (cost=0.28..34.10 rows=2 width=14)",
+            "              ->  Seq Scan on e  (cost=0.00..17.50 rows=2 width=7)",
+            "                    Filter: (a > 998)",
+            "              ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "                    Index Cond: (a = e.a)",
+        ],
+    ),
+    "a hash right join probes with a nested inner join": (
+        "RP-978:fixed",
+        _ANALYSED_THIRTY,
+        "explain select * from s left join (e join k on e.a < k.a) on s.a = e.a and k.b = 'v3'",
+        [
+            "Hash Right Join  (cost=1.68..1669.42 rows=1000 width=34)",
+            "  Hash Cond: (e.a = s.a)",
+            "  ->  Nested Loop  (cost=0.00..1532.75 rows=33333 width=14)",
+            "        Join Filter: (e.a < k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Materialize  (cost=0.00..18.00 rows=100 width=7)",
+            "              ->  Seq Scan on k  (cost=0.00..17.50 rows=100 width=7)",
+            "                    Filter: (b = 'v3'::text)",
+            "  ->  Hash  (cost=1.30..1.30 rows=30 width=20)",
+            "        ->  Seq Scan on s  (cost=0.00..1.30 rows=30 width=20)",
+        ],
+    ),
+    "a hash left join hashes a nested hash join": (
+        "RP-978:fixed",
+        _ANALYSED_THIRTY,
+        "explain select * from s left join (e join s s2 on e.a = s2.a)"
+        " on s.a = e.a and s2.c = 'xx'",
+        [
+            "Hash Left Join  (cost=20.16..21.58 rows=30 width=47)",
+            "  Hash Cond: (s.a = e.a)",
+            "  ->  Seq Scan on s  (cost=0.00..1.30 rows=30 width=20)",
+            "  ->  Hash  (cost=20.15..20.15 rows=1 width=27)",
+            "        ->  Hash Join  (cost=1.39..20.15 rows=1 width=27)",
+            "              Hash Cond: (e.a = s2.a)",
+            "              ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "              ->  Hash  (cost=1.38..1.38 rows=1 width=20)",
+            "                    ->  Seq Scan on s s2  (cost=0.00..1.38 rows=1 width=20)",
+            "                          Filter: (c = 'xx'::text)",
+        ],
+    ),
+    # The nested join's rows carry the LEFT join's key up to it, but pass
+    # above it only what the query reads (`build_joinrel_tlist`).
+    "a nested join passes above the left join only what the query reads": (
+        "RP-978:fixed",
+        _ANALYSED_THIRTY,
+        "explain select s.a from s left join (e join k on e.a = k.a) on s.a = e.a",
+        [
+            "Hash Right Join  (cost=29.18..50.86 rows=30 width=4)",
+            "  Hash Cond: (e.a = s.a)",
+            "  ->  Hash Join  (cost=27.50..45.14 rows=1000 width=4)",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+            "        ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
+            "  ->  Hash  (cost=1.30..1.30 rows=30 width=4)",
+            "        ->  Seq Scan on s  (cost=0.00..1.30 rows=30 width=4)",
+        ],
+    ),
+    # Still open: a LEFT join keyed on a column a B-tree of the pair's
+    # table leads with, where the pair could take a path parameterized by
+    # the preserved table, which is not weighed; and ANALYZE's counts below
+    # a hash join over the pair (RP-978).
+    "a nested join keyed on an indexed column under a left join": (
+        "RP-978",
+        _ANALYSED_THIRTY,
+        "explain select * from s left join (e join k on k.a = e.a) on s.a = k.a",
+        [
+            "Hash Right Join  (cost=29.18..50.86 rows=30 width=34)",
+            "  Hash Cond: (k.a = s.a)",
+            "  ->  Hash Join  (cost=27.50..45.14 rows=1000 width=14)",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=1.30..1.30 rows=30 width=20)",
+            "        ->  Seq Scan on s  (cost=0.00..1.30 rows=30 width=20)",
+        ],
+    ),
+    "analyze of a hash right join over a nested loop": (
+        "RP-978",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from s left join (e join k on e.a < k.a) on s.a = e.a and k.b = 'v3'",
+        [
+            "Hash Right Join (actual rows=2946 loops=1)",
+            "  Hash Cond: (e.a = s.a)",
+            "  ->  Nested Loop (actual rows=49700 loops=1)",
+            "        Join Filter: (e.a < k.a)",
+            "        Rows Removed by Join Filter: 50300",
+            "        ->  Seq Scan on e (actual rows=1000 loops=1)",
+            "        ->  Materialize (actual rows=100 loops=1000)",
+            "              ->  Seq Scan on k (actual rows=100 loops=1)",
+            "                    Filter: (b = 'v3'::text)",
+            "                    Rows Removed by Filter: 900",
+            "  ->  Hash (actual rows=30 loops=1)",
+            "        Buckets: 1024  Batches: 1  Memory Usage: 10kB",
+            "        ->  Seq Scan on s (actual rows=30 loops=1)",
+        ],
+    ),
+    # VERBOSE of a join nested in an outer join prints no `Output` and no
+    # qualified quals (RP-1121).
+    "verbose of an inner join nested in a left join": (
+        "RP-1121",
+        _ANALYSED_THIRTY,
+        "explain (verbose, costs off)"
+        " select * from s left join (e join k on e.a > 998 and k.a = e.a) on true",
+        [
+            "Nested Loop Left Join",
+            "  Output: s.a, s.c, e.a, e.b, k.a, k.b",
+            "  ->  Seq Scan on public.s",
+            "        Output: s.a, s.c",
+            "  ->  Materialize",
+            "        Output: e.a, e.b, k.a, k.b",
+            "        ->  Nested Loop",
+            "              Output: e.a, e.b, k.a, k.b",
+            "              Inner Unique: true",
+            "              ->  Seq Scan on public.e",
+            "                    Output: e.a, e.b",
+            "                    Filter: (e.a > 998)",
+            "              ->  Index Scan using k_pkey on public.k",
+            "                    Output: k.a, k.b",
+            "                    Index Cond: (k.a = e.a)",
         ],
     ),
     # Part of RP-978, fixed: an inner join whose range on the outer key
