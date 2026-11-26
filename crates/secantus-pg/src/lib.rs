@@ -14056,20 +14056,57 @@ impl PgHandler {
 
     /// The heap ctids a scan of `table`'s B-tree `index` reaches under
     /// `filter`'s index quals, and how many of them sit on a page the
-    /// visibility map leaves unmarked (see `user_index_tids`).
+    /// visibility map leaves unmarked (see `user_index_tids`). While the
+    /// heap holds no dead version, dead line pointer or HOT chain these
+    /// are the live rows the quals match; otherwise they are the index's
+    /// own tuples (RP-384): a dead version's entry, until VACUUM's index
+    /// pass removes it or a scan marks it dead to all, is read and its
+    /// heap page fetched as a live row's is.
     fn user_index_ctids(
         &self,
         table: &str,
         index: &str,
         filter: &Document,
     ) -> Option<(Vec<i64>, usize)> {
-        if !self.has_heap(table)
-            || self
-                .with_heap_read(table, |h| h.has_dead_entries())
-                .unwrap_or(true)
-        {
+        if !self.has_heap(table) {
             return None;
         }
+        let dead = self.with_heap_read(table, |h| h.has_dead_entries()).ok()?;
+        let quals = self.user_index_quals(index, filter)?;
+        let ctids = if dead {
+            self.user_index_entry_tids(table, index, &quals)?
+        } else {
+            self.user_index_live_ctids(table, &quals)?
+        };
+        let visible = self
+            .with_heap_read(table, |h| {
+                ctids
+                    .iter()
+                    .map(|c| h.all_visible(*c))
+                    .collect::<Vec<bool>>()
+            })
+            .ok()?;
+        let not_visible = visible.iter().filter(|v| !**v).count();
+        Some((ctids, not_visible))
+    }
+
+    /// The live rows of user table `table` its B-tree `index`'s quals in
+    /// `filter` match -- the tuples an index scan's heap fetches return,
+    /// which its Filter then sees (`Rows Removed by Filter`, RP-384). A
+    /// dead version's entry fetches nothing visible, so it is not among
+    /// them. `None` where `user_index_quals` refuses.
+    fn user_index_live_rows(&self, table: &str, index: &str, filter: &Document) -> Option<usize> {
+        if !self.has_heap(table) {
+            return None;
+        }
+        let quals = self.user_index_quals(index, filter)?;
+        Some(self.user_index_live_ctids(table, &quals)?.len())
+    }
+
+    /// `filter`'s conjuncts on `index`'s columns, its index quals, one
+    /// single-field document each. `None` for a qual not a plain conjunct
+    /// of column conditions, or none on the index's columns.
+    fn user_index_quals(&self, index: &str, filter: &Document) -> Option<Vec<Document>> {
         // A WHERE of several conjuncts arrives as one `$and`; its
         // conjuncts on other columns are the scan's Filter, not its Index
         // Cond (RP-384). Any other operator key is refused.
@@ -14096,38 +14133,109 @@ impl PgHandler {
                 ix.table.field_of(&ix.table.columns.get(i)?.name)
             })
             .collect::<Option<_>>()?;
-        let arms: Vec<Bson> = conjuncts
+        let arms: Vec<Document> = conjuncts
             .iter()
             .flat_map(|c| c.iter())
             .filter(|(k, _)| columns.contains(k))
             .map(|(k, v)| {
                 let mut d = Document::new();
                 d.insert(k.clone(), v.clone());
-                Bson::Document(d)
+                d
             })
             .collect();
-        if arms.is_empty() {
-            return None;
-        }
-        let mut quals = Document::new();
-        quals.insert("$and", arms);
+        (!arms.is_empty()).then_some(arms)
+    }
+
+    /// The ctids of `table`'s live rows `quals` match.
+    fn user_index_live_ctids(&self, table: &str, quals: &[Document]) -> Option<Vec<i64>> {
+        let mut all = Document::new();
+        all.insert(
+            "$and",
+            quals
+                .iter()
+                .cloned()
+                .map(Bson::Document)
+                .collect::<Vec<_>>(),
+        );
         let empty = secantus_core::vars::Vars::new();
         let mut ctids = Vec::new();
         for d in self.table_docs(table).ok()? {
-            if secantus_core::query::matches(&d, &quals, &empty, None).ok()? {
+            if secantus_core::query::matches(&d, &all, &empty, None).ok()? {
                 ctids.push(heap::ctid_of(&d)?);
             }
         }
-        let visible = self
-            .with_heap_read(table, |h| {
-                ctids
-                    .iter()
-                    .map(|c| h.all_visible(*c))
-                    .collect::<Vec<bool>>()
+        Some(ctids)
+    }
+
+    /// The heap TIDs of the index tuples a scan of `table`'s B-tree
+    /// `index` returns under `quals`, read from the index's page model
+    /// (RP-196): from where its leading column's bounds put it, each tuple
+    /// not yet marked dead (`_bt_readpage` skips those) whose key meets
+    /// every qual (`_bt_checkkeys`) -- a dead version's by its own key, the
+    /// one it was indexed under. A HOT chain's tuple is its root's. `None`
+    /// for an index the model does not follow (over an expression, or one
+    /// with a predicate it cannot evaluate), or a qual on no key column.
+    fn user_index_entry_tids(
+        &self,
+        table: &str,
+        index: &str,
+        quals: &[Document],
+    ) -> Option<Vec<i64>> {
+        let shape = self
+            .btree_shapes(table)
+            .into_iter()
+            .find(|s| s.name == index)?;
+        if !shape.is_plain() && shape.plain_predicate().is_none() {
+            return None;
+        }
+        // Each qual as `(key position, condition on "v")`.
+        let checks: Vec<(usize, Document)> = quals
+            .iter()
+            .map(|q| {
+                let (field, cond) = q.iter().next()?;
+                let at = shape.key_fields().iter().position(|f| f == field)?;
+                let mut d = Document::new();
+                d.insert("v", cond.clone());
+                Some((at, d))
             })
-            .ok()?;
-        let not_visible = visible.iter().filter(|v| !**v).count();
-        Some((ctids, not_visible))
+            .collect::<Option<_>>()?;
+        let mut all = Document::new();
+        all.insert(
+            "$and",
+            quals
+                .iter()
+                .cloned()
+                .map(Bson::Document)
+                .collect::<Vec<_>>(),
+        );
+        let ranges = serializable::index_scan_ranges(&shape, &all);
+        let empty = secantus_core::vars::Vars::new();
+        self.with_btree(table, &shape, |t| {
+            let mut out = Vec::new();
+            for (lo, hi) in &ranges {
+                for (key, tid) in t.entries_in(
+                    &*shape,
+                    lo.as_ref().map(|(v, i)| (v, *i)),
+                    hi.as_ref().map(|(v, i)| (v, *i)),
+                ) {
+                    let mut meets = true;
+                    for (at, cond) in &checks {
+                        let mut v = Document::new();
+                        v.insert("v", key.get(*at)?.clone());
+                        if !secantus_core::query::matches(&v, cond, &empty, None).ok()? {
+                            meets = false;
+                            break;
+                        }
+                    }
+                    if meets {
+                        out.push(tid);
+                    }
+                }
+            }
+            Some(out)
+        })
+        .ok()
+        .flatten()
     }
 
     /// [`Self::try_index_relations`], a failed catalog or index-list read
@@ -48679,6 +48787,61 @@ impl PgHandler {
                 explain::attach_verbose(&mut tree, &options.verbose_scan);
                 explain::attach_verbose_join(&mut tree, &options.verbose_join);
                 explain::attach_verbose_chain(&mut tree, &options.verbose_chain);
+                // The index tuples ANALYZE's scans read, counted before the
+                // statement runs: a scan marks the entries it finds dead to
+                // all as it goes (`_bt_killitems`), and a count taken after it
+                // would miss the ones it fetched to learn that -- PostgreSQL's
+                // first scan over a committed update prints `Heap Fetches: 2`,
+                // its next 1 (RP-384).
+                let (ios_index, ios_tids, bitmap_tids, or_tids) =
+                    match (options.analyze, inner.as_ref()) {
+                        (true, Statement::Select(sel)) => {
+                            // An index-only scan's heap fetches (RP-360).
+                            let ios_index = tree
+                                .name
+                                .strip_prefix("Index Only Scan using ")
+                                .and_then(|r| r.split_once(" on "))
+                                .map(|(i, _)| i.to_string())
+                                .filter(|_| tree.children.is_empty());
+                            let ios_tids = ios_index
+                                .as_ref()
+                                .and_then(|i| self.user_index_tids(&sel.table, i, &sel.filter));
+                            // A bitmap scan's pages and its index scan's tuples
+                            // (RP-383).
+                            let bitmap_tids = (tree.name.starts_with("Bitmap Heap Scan on ")
+                                && tree.children.len() == 1)
+                                .then(|| {
+                                    tree.children[0].name.strip_prefix("Bitmap Index Scan on ")
+                                })
+                                .flatten()
+                                .and_then(|i| self.user_index_tids(&sel.table, i, &sel.filter));
+                            // A BitmapOr's arms (RP-384).
+                            let or_indexes: Option<Vec<String>> =
+                                (tree.name.starts_with("Bitmap Heap Scan on ")
+                                    && tree.children.len() == 1
+                                    && tree.children[0].name == "BitmapOr")
+                                    .then(|| {
+                                        tree.children[0]
+                                            .children
+                                            .iter()
+                                            .map(|c| {
+                                                (c.children.is_empty())
+                                                    .then(|| {
+                                                        c.name.strip_prefix("Bitmap Index Scan on ")
+                                                    })
+                                                    .flatten()
+                                                    .map(str::to_string)
+                                            })
+                                            .collect()
+                                    })
+                                    .flatten();
+                            let or_tids = or_indexes.and_then(|ix| {
+                                self.user_bitmap_or_tids(&sel.table, &ix, &sel.filter)
+                            });
+                            (ios_index, ios_tids, bitmap_tids, or_tids)
+                        }
+                        _ => (None, None, None, None),
+                    };
                 // ANALYZE runs the statement, as PostgreSQL's does -- a write
                 // is written -- and reports the rows it produced.
                 let actual = if options.analyze {
@@ -48692,24 +48855,19 @@ impl PgHandler {
                 } else {
                     None
                 };
-                // An index-only scan's heap fetches, under ANALYZE (RP-360).
                 if let (Some(rows), Statement::Select(sel)) = (actual, inner.as_ref()) {
-                    let index = tree
-                        .name
-                        .strip_prefix("Index Only Scan using ")
-                        .and_then(|r| r.split_once(" on "))
-                        .map(|(i, _)| i.to_string());
-                    if let Some(index) = index.filter(|_| tree.children.is_empty()) {
-                        tree.heap_fetches =
-                            match self.user_index_tids(&sel.table, &index, &sel.filter) {
-                                Some((_, not_visible, _)) => Some(not_visible),
-                                None => {
-                                    self.catalog_heap_fetches(&sel.table, &index, &sel.filter, rows)
-                                }
-                            };
+                    if let Some(index) = ios_index {
+                        tree.heap_fetches = match ios_tids {
+                            Some((_, not_visible, _)) => Some(not_visible),
+                            None => {
+                                self.catalog_heap_fetches(&sel.table, &index, &sel.filter, rows)
+                            }
+                        };
                     }
                     // An index scan's rows its Filter removed (RP-384): the
-                    // tuples its Index Cond fetched, less the rows it returned.
+                    // live rows its Index Cond fetched, less the rows it
+                    // returned. A dead version's entry fetches nothing
+                    // visible, so the Filter never sees it.
                     let scan_index = tree
                         .name
                         .strip_prefix("Index Scan using ")
@@ -48720,57 +48878,26 @@ impl PgHandler {
                                 && tree.details.iter().any(|(k, _)| k == "Filter")
                         });
                     if let Some(index) = scan_index {
-                        if let Some((tuples, _, _)) =
-                            self.user_index_tids(&sel.table, &index, &sel.filter)
+                        if let Some(live) =
+                            self.user_index_live_rows(&sel.table, &index, &sel.filter)
                         {
-                            tree.removed_by_filter = tuples.checked_sub(rows);
+                            tree.removed_by_filter = live.checked_sub(rows);
                         }
                     }
-                    // A bitmap scan's pages and its index scan's tuples (RP-383).
-                    let bitmap_index = (tree.name.starts_with("Bitmap Heap Scan on ")
-                        && tree.children.len() == 1)
-                        .then(|| tree.children[0].name.strip_prefix("Bitmap Index Scan on "))
-                        .flatten()
-                        .map(str::to_string);
-                    if let Some(index) = bitmap_index {
-                        if let Some((tuples, _, blocks)) =
-                            self.user_index_tids(&sel.table, &index, &sel.filter)
-                        {
-                            tree.heap_blocks = Some(blocks);
-                            tree.children[0].actual_rows = Some(tuples);
-                        }
+                    if let Some((tuples, _, blocks)) = bitmap_tids {
+                        tree.heap_blocks = Some(blocks);
+                        tree.children[0].actual_rows = Some(tuples);
                     }
-                    // A BitmapOr's arms (RP-384): each Bitmap Index Scan's
-                    // tuples, the heap scan's pages of their union, and the
-                    // BitmapOr's own `actual rows=0` -- `MultiExecBitmapOr`
-                    // returns a bitmap and counts no tuples.
-                    let or_indexes: Option<Vec<String>> =
-                        (tree.name.starts_with("Bitmap Heap Scan on ")
-                            && tree.children.len() == 1
-                            && tree.children[0].name == "BitmapOr")
-                            .then(|| {
-                                tree.children[0]
-                                    .children
-                                    .iter()
-                                    .map(|c| {
-                                        (c.children.is_empty())
-                                            .then(|| c.name.strip_prefix("Bitmap Index Scan on "))
-                                            .flatten()
-                                            .map(str::to_string)
-                                    })
-                                    .collect()
-                            })
-                            .flatten();
-                    if let Some(indexes) = or_indexes {
-                        if let Some((tuples, blocks)) =
-                            self.user_bitmap_or_tids(&sel.table, &indexes, &sel.filter)
-                        {
-                            tree.heap_blocks = Some(blocks);
-                            let or = &mut tree.children[0];
-                            or.actual_rows = Some(0);
-                            for (arm, n) in or.children.iter_mut().zip(tuples) {
-                                arm.actual_rows = Some(n);
-                            }
+                    // A BitmapOr's arms: each Bitmap Index Scan's tuples, the
+                    // heap scan's pages of their union, and the BitmapOr's
+                    // own `actual rows=0` -- `MultiExecBitmapOr` returns a
+                    // bitmap and counts no tuples.
+                    if let Some((tuples, blocks)) = or_tids {
+                        tree.heap_blocks = Some(blocks);
+                        let or = &mut tree.children[0];
+                        or.actual_rows = Some(0);
+                        for (arm, n) in or.children.iter_mut().zip(tuples) {
+                            arm.actual_rows = Some(n);
                         }
                     }
                     // A join's children: their rows, loops and counters
