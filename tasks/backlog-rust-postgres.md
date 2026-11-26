@@ -2383,7 +2383,8 @@ a regression test.
       `Hash Semi Join (cost=27.50..50.27 rows=50 width=7)` the merge bound
       declines. An outer expression against a unique inner column (`a + 1
       in (select a from k)`) is the inner join `as_inner_join` writes,
-      unpriced as RP-1032's expression key against a unique column. (2)
+      a comma join whose WHERE expression equality is unpriced
+      (RP-1127). (2)
       Wider shapes still print the scan: a cross-type comparison
       (`a::bigint in (select a from k)`, `int8 = int4`, 15.19's `Hash Join
       (cost=27.50..45.26 rows=1000 width=7)` hashing `k`), an expression
@@ -3471,48 +3472,66 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by on a primary key a computed entry reads is an index scan]
       Backlog-ID: RP-1066
 
-- [ ] **A join on an expression key PostgreSQL prices is unpriced in
-      two shapes.** Since RP-981 a join of two analysed tables on one
-      equality between a column and an operator expression over one column
-      of the other is a priced Hash Join (inner, LEFT, anti), hashing the
-      side whose key has statistics, and since RP-1032 an inner one the
-      merge wins is a priced Merge Join (`e.b = e2.b || 'x'`, the
-      expression's Sort Key `((e2.b || 'x'::text))`). Still a `Nested
-      Loop` with `Join Filter` and zero costs: against a unique column,
-      `select * from e join k on k.a = e.a - 1` (PostgreSQL 15.19 `Hash
-      Join (cost=27.50..45.26 rows=1000 width=14)` hashing `k`, inner
-      unique; `hash_join_of`'s unique-key paths are not modelled over an
-      expression; an IN of an outer expression over a unique column, `a +
-      1 in (select a from k)`, reaches it as the inner join RP-411 writes); and across types, `e.a::bigint = e2.a` (`Hash Join
-      (cost=27.50..57.50 rows=1000 width=14)`; declined on `pg_type`). A
-      LEFT join the merge wins is declined at the end of `hash_join_of`
-      (`expr_key && left_join && JoinPick::Merge`), its Merge Left/Right
-      Join not drawn. An aggregate over such a join (`select count(*)`)
-      and a LEFT join filtered on a column not its key (`where e2.b is
-      null`, a `Hash Right Join` with `Filter`) stay unpriced as they do
-      over a column key. Measured on the 15.19 reference on port 5415.
-      Where each declines (read 2026-11-18): the unique column in
-      `hash_join_of`'s `if unique_key && (redundant || expr_key) { return
-      None }` -- `unique_key_other_paths` would need the column side's
-      index probed by the expression (its param scan and Memoize keyed on
-      an expression with no statistics, 200 distinct) and a merge sorting
-      the expression side against the presorted index; the cross-type one
-      at its `a.pg_type != b.pg_type` check, where `int8 = int4` is one
-      integer opfamily's hashable operator.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an expression key against a unique column is a hash join]
-      Backlog-ID: RP-1032
-- [ ] **VERBOSE of a merge join prints no `Output`.** `explain verbose
-      select * from e join e e2 on e.b = e2.b || 'x'` prints, in
-      PostgreSQL 15.19, `Output:` on the Merge Join, each Sort and each
-      scan, the expression side's Sort and scan carrying the projected
-      value (`Output: e2.a, e2.b, ((e2.b || 'x'::text))` over `Output:
-      e2.a, e2.b, (e2.b || 'x'::text)`), and the scans as `public.e`.
-      Here the plan prints as without VERBOSE: `attach_verbose_join`
-      handles a hash join and a nested loop only, so a merge on a column
-      key is the same. Measured on the 15.19 reference on port 5415
-      (found while working RP-1032).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[verbose of a merge join on an expression key]
-      Backlog-ID: RP-1071
+- [ ] **An expression equality in a WHERE joining two relations is
+      unpriced.** Since RP-981 and RP-1032 an expression equality in a
+      JOIN's ON is a priced Hash or Merge Join, but the same clause in the
+      WHERE of a comma join prints a `Nested Loop` with `Join Filter` and
+      zero costs: `select * from e, e e2 where e.b = e2.b || 'x'` (and
+      `from e cross join e e2 where ...`) is, on PostgreSQL 15, the same
+      `Merge Join (cost=129.66..224.66 rows=5000 width=14)` its ON form
+      is. An IN of an outer expression over a unique column, `select *
+      from e where a + 1 in (select a from k)`, reaches this shape: RP-411's
+      `sublink_join::as_inner_join` writes it as `from e, k where (e.a + 1)
+      = k.a`, so it stays unpriced (15's `Hash Join (cost=27.50..45.26
+      rows=1000 width=7)` hashing `k`). The ON form reaches pricing through
+      `JoinNode::Join::expr_keys` (`joins::expr_equalities` over the ON);
+      a WHERE's equality across the two relations is never collected
+      there. Measured on a private 15.20 cluster (2026-11-26, found while
+      working RP-1032).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an expression equality in a comma join's where is a merge join], tests/backlog/test_rp_explain_costs.py::test_plan[an in of an outer expression over a unique column is a hash join]
+      Backlog-ID: RP-1127
+- [ ] **A merge reading a unique index presorted against a sorted
+      expression key is not drawn.** Since RP-1032 a join of an expression
+      key against a unique column weighs, as PostgreSQL does, the merge
+      reading the column's index in order against the expression side
+      sorted (`unique_key_other_paths`), and the nested loop probing that
+      index by the expression. Where either is the cheapest path,
+      `hash_join_of` declines (`if expr_key { return None }` before the
+      presorted merge, `!expr_key` on the parameterized nested loop): the
+      plan prints unpriced rather than with an `Index Cond` or `Sort Key`
+      never compared with PostgreSQL's. Neither was reached at any size
+      measured: with no statistics on the expression `mergejoinscansel`
+      reads the whole index, and the hash wins at 1,000 and at 100,000 rows
+      a side, and at `work_mem = 64kB` (private 15.20 cluster,
+      2026-11-26); the nested loop needs an outer side small enough that
+      PostgreSQL still hashes it (`where e.a < 10`: Hash Join 37.70 against
+      the loop's 60.16).
+      Verify: none -- no shape measured reaches it: PostgreSQL hashes every join of an expression key against a unique column built so far, up to 100,000 rows a side and at the smallest work_mem
+      Backlog-ID: RP-1128
+- [ ] **An aggregate over a Hash Join is not priced.** `explain select
+      count(*) from e join k on k.a = e.a` prints zero costs on the
+      `Aggregate` and on the `Hash Join` below it, though the join alone
+      (`select * ...`) is priced since RP-330; a private PostgreSQL 15.20
+      cluster prints `Aggregate (cost=47.64..47.65 rows=1 width=8)` over
+      `Hash Join (cost=27.50..45.14 rows=1000 width=0)`, each scan
+      narrowed to its key (`width=4`). The same over an expression key
+      (`k.a = e.a - 1`, `Aggregate (cost=47.76..47.77 ...)`). The Nested
+      Loop case is RP-1125. Found while working RP-1032 (2026-11-26).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a hash join is priced], tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a hash join on an expression key is priced]
+      Backlog-ID: RP-1129
+- [ ] **A LEFT join filtered on its nullable side's other column prints
+      zero costs.** `explain select * from e left join e e2 on e.a = e2.a
+      where e2.b is null` draws a `Hash Left Join` with the `Filter: (e2.b
+      IS NULL)` but every cost, row count and width zero; a private
+      PostgreSQL 15.20 cluster prints `Hash Left Join (cost=27.50..56.25
+      rows=1 width=14)` (the filter's NULL test leaves one row). Over an
+      expression key on the nullable side (`e.a = e2.a + 1`) it is a `Hash
+      Right Join (cost=27.50..57.50 rows=1 width=14)` hashing the preserved
+      side, which prints here as an unpriced `Nested Loop Left Join`. A
+      filter naming the join key (`where e2.a is null`) is the anti join
+      RP-981 prices. Found while working RP-1032 (2026-11-26).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join filtered on its nullable side's other column is priced], tests/backlog/test_rp_explain_costs.py::test_plan[a left join on an expression key filtered on its nullable side's other column is priced]
+      Backlog-ID: RP-1130
 - [ ] **ANALYZE of a hash join on an expression key counts nothing below
       it.** `explain (analyze, costs off, timing off, summary off) select *
       from e left join e e2 on e.a = e2.a + 1 where e2.a is null` prints,
@@ -3536,6 +3555,25 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       Measured on the 15.19 reference on port 5415.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash join written inner side first is inner unique]
       Backlog-ID: RP-1030
+## Found while working RP-1071 (2026-11-26)
+
+- [ ] **A join on an expression of each side, or one ordered by its
+      expression-key merge, is not a priced Merge Join.** `explain select *
+      from e join e e2 on e.b || 'y' = e2.b || 'x'` is in PostgreSQL 15.20
+      (a private cluster) `Merge Join (cost=129.66..239.66 rows=5000
+      width=14)`, each side a Sort on its expression (`Sort Key: ((e.b ||
+      'y'::text))`); `explain select * from e join e e2 on e.b = e2.b ||
+      'x' order by e.b` is the same Merge Join as without the ORDER BY
+      (`cost=129.66..224.66`), its order serving the query's with no Sort
+      above it. Here the first is an unpriced `Nested Loop` with `Join
+      Filter: ((e.b || 'y'::text) = (e2.b || 'x'::text))`, the second an
+      unpriced Sort over that Nested Loop. RP-981 / RP-1032 draw an
+      expression key only against a column of the other side, and the
+      ORDER BY path does not reach the expression merge. Once drawn,
+      VERBOSE prints them already (RP-1071).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join on an expression of each side is a merge join], tests/backlog/test_rp_explain_costs.py::test_plan[a join on an expression key ordered by its merge key is a merge join]
+      Backlog-ID: RP-1131
+
 ## Found while working RP-980 (2026-11-17)
 
 - [ ] **An anti join with an outer conjunct beside it is not planned as

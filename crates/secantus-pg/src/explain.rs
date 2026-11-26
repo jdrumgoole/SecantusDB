@@ -3398,6 +3398,29 @@ pub(crate) fn attach_join_where(
 }
 
 #[cfg(test)]
+mod sort_key_expr_tests {
+    use super::sort_key_expr;
+
+    #[test]
+    fn an_expression_key_is_its_parenthesised_reference() {
+        let k = "((e2.b || 'x'::text))";
+        assert_eq!(sort_key_expr(k).as_deref(), Some(k));
+        assert_eq!(
+            sort_key_expr("(lower(e2.b)) DESC").as_deref(),
+            Some("(lower(e2.b))")
+        );
+        // A parenthesis inside a literal does not close the reference.
+        assert_eq!(
+            sort_key_expr("((e2.b || ')'::text))").as_deref(),
+            Some("((e2.b || ')'::text))")
+        );
+        // Outer parentheses that close before the end are no reference.
+        assert_eq!(sort_key_expr("(e2.a) + (e2.b)"), None);
+        assert_eq!(sort_key_expr("((e2.b)) NULLS FIRST"), None);
+    }
+}
+
+#[cfg(test)]
 mod cost_tests {
     use super::*;
 
@@ -4305,7 +4328,12 @@ fn attach_verbose_join_node(root: &mut PlanNode, v: &secantus_pgplan::ruleutils:
 /// target list (an Index Only Scan its index's), a side under a Sort only
 /// the columns the join needs (`create_mergejoin_plan` asks
 /// `CP_SMALL_TLIST` of a sorted side), the Sort printing its key
-/// prefixed. Any other merge join prints as without VERBOSE.
+/// prefixed. A side sorted on an expression of its columns (`e.b =
+/// e2.b || 'x'`, RP-1071) returns that expression too, after the columns:
+/// `prepare_sort_from_pathkeys` adds the key the scan's target list lacks
+/// as a resjunk entry the scan computes, printed `(e2.b || 'x'::text)`,
+/// and the Sort above references it, printed `((e2.b || 'x'::text))`.
+/// Any other merge join prints as without VERBOSE.
 fn attach_verbose_merge_join(root: &mut PlanNode, v: &secantus_pgplan::ruleutils::VerboseJoin) {
     let join_filters = root
         .details
@@ -4313,7 +4341,6 @@ fn attach_verbose_merge_join(root: &mut PlanNode, v: &secantus_pgplan::ruleutils
         .filter(|(k, _)| k == "Join Filter")
         .count();
     if !v.all_equal
-        || v.expr_on
         || v.unprinted_filter
         || join_filters != usize::from(v.join_filter)
         || join_type_of(&root.name).is_none()
@@ -4338,10 +4365,12 @@ fn attach_verbose_merge_join(root: &mut PlanNode, v: &secantus_pgplan::ruleutils
             .iter()
             .position(|r| n.name.ends_with(&format!(" on {}", r.plain)))
     };
-    // Each side: its relation, and whether a Sort is over its scan.
-    let side = |n: &PlanNode| -> Option<(usize, bool)> {
+    // Each side: its relation, whether a Sort is over its scan, and the
+    // expressions that Sort orders by, as its `Sort Key` prints them
+    // (`((e2.b || 'x'::text))`).
+    let side = |n: &PlanNode| -> Option<(usize, bool, Vec<String>)> {
         if n.name != "Sort" {
-            return Some((rel_of(n)?, false));
+            return Some((rel_of(n)?, false, Vec::new()));
         }
         let [scan] = n.children.as_slice() else {
             return None;
@@ -4350,28 +4379,41 @@ fn attach_verbose_merge_join(root: &mut PlanNode, v: &secantus_pgplan::ruleutils
         let [(k, key)] = n.details.as_slice() else {
             return None;
         };
-        // The plain plan prints a sorted side's key bare or prefixed.
+        if k != "Sort Key" {
+            return None;
+        }
+        // The plain plan prints a sorted side's key bare or prefixed, an
+        // expression key parenthesised and prefixed (two relations).
         let r = &v.rels[i];
-        let qualified = key
-            .split(", ")
-            .map(|c| {
-                if c.contains('.') {
-                    c.to_string()
-                } else {
-                    format!("{}.{c}", r.refname)
+        let mut exprs = Vec::new();
+        for c in crate::split_top_level_commas(key) {
+            if c.starts_with('(') {
+                let expr = sort_key_expr(&c)?;
+                if !expr.contains(&format!("{}.", r.refname)) || exprs.contains(&expr) {
+                    return None;
                 }
-            })
-            .collect::<Vec<_>>();
-        let col = |c: &String| c.split_once(' ').map_or(c.clone(), |(c, _)| c.to_string());
-        (k == "Sort Key" && qualified.iter().all(|c| r.needed.contains(&col(c))))
-            .then_some((i, true))
+                exprs.push(expr);
+                continue;
+            }
+            let c = if c.contains('.') {
+                c
+            } else {
+                format!("{}.{c}", r.refname)
+            };
+            let col = c.split_once(' ').map_or(c.as_str(), |(c, _)| c);
+            if !r.needed.iter().any(|n| n == col) {
+                return None;
+            }
+        }
+        Some((i, true, exprs))
     };
-    let (Some((o, o_sorted)), Some((i, i_sorted))) =
+    let (Some((o, o_sorted, o_exprs)), Some((i, i_sorted, i_exprs))) =
         (side(&root.children[0]), side(&root.children[1]))
     else {
         return;
     };
-    if o == i {
+    // An ON over an expression is a merge key one side sorts by.
+    if o == i || v.expr_on == (o_exprs.is_empty() && i_exprs.is_empty()) {
         return;
     }
     fn scan_of(n: &PlanNode) -> &PlanNode {
@@ -4405,21 +4447,31 @@ fn attach_verbose_merge_join(root: &mut PlanNode, v: &secantus_pgplan::ruleutils
         }
         Some(r.columns.join(", "))
     };
+    // Each side's Sort's target list and its scan's: a sorted side's
+    // needed columns, then each expression key, which the Sort references
+    // and the scan computes.
     let mut outputs = Vec::new();
-    for (n, r, sorted) in [
-        (&root.children[0], o, o_sorted),
-        (&root.children[1], i, i_sorted),
+    for (n, r, sorted, exprs) in [
+        (&root.children[0], o, o_sorted, &o_exprs),
+        (&root.children[1], i, i_sorted, &i_exprs),
     ] {
         outputs.push(if sorted {
-            v.rels[r].needed.join(", ")
+            let needed = &v.rels[r].needed;
+            let above = needed.iter().chain(exprs).cloned().collect::<Vec<_>>();
+            let below = needed
+                .iter()
+                .cloned()
+                .chain(exprs.iter().map(|e| e[1..e.len() - 1].to_string()))
+                .collect::<Vec<_>>();
+            (above.join(", "), below.join(", "))
         } else {
             let Some(p) = physical(n, &v.rels[r]) else {
                 return;
             };
-            p
+            (p.clone(), p)
         });
     }
-    for ((n, (r, sorted)), out) in root
+    for ((n, (r, sorted)), (out, scan_out)) in root
         .children
         .iter_mut()
         .zip([(o, o_sorted), (i, i_sorted)])
@@ -4428,19 +4480,19 @@ fn attach_verbose_merge_join(root: &mut PlanNode, v: &secantus_pgplan::ruleutils
         let rel = &v.rels[r];
         let scan = if sorted {
             if let Some(d) = n.details.iter_mut().find(|(k, _)| k == "Sort Key") {
-                d.1 =
-                    d.1.split(", ")
-                        .map(|c| {
-                            if c.contains('.') {
-                                c.to_string()
-                            } else {
-                                format!("{}.{c}", rel.refname)
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
+                d.1 = crate::split_top_level_commas(&d.1)
+                    .into_iter()
+                    .map(|c| {
+                        if c.contains('.') {
+                            c
+                        } else {
+                            format!("{}.{c}", rel.refname)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
             }
-            n.details.insert(0, ("Output".into(), out.clone()));
+            n.details.insert(0, ("Output".into(), out));
             &mut n.children[0]
         } else {
             n
@@ -4448,10 +4500,35 @@ fn attach_verbose_merge_join(root: &mut PlanNode, v: &secantus_pgplan::ruleutils
         let at = scan.name.len() - rel.plain.len();
         scan.name = format!("{}{}", &scan.name[..at], rel.relation);
         prefix_quals(scan, &rel.quals);
-        scan.details.insert(0, ("Output".into(), out));
+        scan.details.insert(0, ("Output".into(), scan_out));
     }
     root.details
         .insert(0, ("Output".into(), v.output.join(", ")));
+}
+
+/// A `Sort Key` entry over an expression, `((e2.b || 'x'::text))` or
+/// `(lower(e2.b)) DESC`, as the Sort's target list prints it: the
+/// reference to the scan's computed entry, which ruleutils parenthesises
+/// (`get_variable` of a non-Var subplan entry), without its direction.
+/// `None` when the outer parentheses do not enclose the whole reference.
+fn sort_key_expr(key: &str) -> Option<String> {
+    let mut depth = 0i32;
+    let mut quoted = false;
+    for (at, ch) in key.char_indices() {
+        match ch {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => {
+                depth -= 1;
+                if depth == 0 {
+                    let (expr, rest) = key.split_at(at + 1);
+                    return matches!(rest, "" | " DESC").then(|| expr.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `EXPLAIN VERBOSE` of a two-relation nested loop whose inner side is a

@@ -108,13 +108,15 @@ pub enum JoinNode {
 /// (`JoinNode::Join::expr_keys`), at least one side not a bare column.
 /// Each side's expression reads only that side's keys; `*_ops` is how many
 /// operators it evaluates, which the join clause's cost charges
-/// (`cost_qual_eval`).
+/// (`cost_qual_eval`): each operator, and each cast of a key its `pg_cast`
+/// function or I/O conversion (`e.a::bigint` is `int48`, RP-1032). `None`
+/// where a cast is one [`cast_cost`] does not price.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExprEquality {
     pub left: ColumnExpr,
     pub right: ColumnExpr,
-    pub left_ops: u32,
-    pub right_ops: u32,
+    pub left_ops: Option<u32>,
+    pub right_ops: Option<u32>,
     /// The joined-row key a side's operand is, when it is a bare column.
     pub left_column: Option<String>,
     pub right_column: Option<String>,
@@ -3206,8 +3208,8 @@ fn build_join(
                     Ok(ExprEquality {
                         left: on_expr(l, &side_scope, params)?,
                         right: on_expr(r, &side_scope, params)?,
-                        left_ops: expr_ops(l),
-                        right_ops: expr_ops(r),
+                        left_ops: key_expr_ops(l, &side_scope),
+                        right_ops: key_expr_ops(r, &side_scope),
                         left_column: bare_key(l),
                         right_column: bare_key(r),
                     })
@@ -4325,6 +4327,14 @@ fn bare_key(n: &pg_query::protobuf::Node) -> Option<String> {
         Some(N::ColumnRef(c)) if c.fields.len() == 1 => column_ref_name(c),
         _ => None,
     }
+}
+
+/// What a join key's expression costs `cost_qual_eval`, in
+/// `cpu_operator_cost` units: its operators and its casts of keys
+/// ([`cast_cost`]). `None` where a cast is not priced.
+fn key_expr_ops(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<u32> {
+    let casts = u32::try_from(cast_cost(n, scope)?).ok()?;
+    Some(expr_ops(n) + casts)
 }
 
 /// The operators an expression evaluates, each a `cpu_operator_cost`.
