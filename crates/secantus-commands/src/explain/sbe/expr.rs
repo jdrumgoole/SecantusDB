@@ -64,6 +64,12 @@ pub(crate) enum Expr {
     /// from the value argument of its position, over the input object
     /// (`Open`, `NewObj`; RM-542).
     SetSpec(Vec<String>),
+    /// `ELocalBind`: `let [lF.0 = bind] in body`.
+    Let {
+        frame: u32,
+        bind: Box<Expr>,
+        body: Box<Expr>,
+    },
 }
 
 /// The mask `typeMatch` and `fillType` take for null and undefined:
@@ -90,6 +96,10 @@ impl Expr {
                 c.collect_lists(out);
                 t.collect_lists(out);
                 e.collect_lists(out);
+            }
+            Expr::Let { bind, body, .. } => {
+                bind.collect_lists(out);
+                body.collect_lists(out);
             }
             Expr::Not(e) | Expr::TypeMatch(e, _) | Expr::ConvertInt32(e) => e.collect_lists(out),
             Expr::Lambda { body, .. } => body.collect_lists(out),
@@ -120,6 +130,18 @@ impl Expr {
 
     pub fn fill_empty(l: Expr, r: Expr) -> Expr {
         Expr::bin(BinOp::FillEmpty, l, r)
+    }
+
+    pub fn let_(frame: u32, bind: Expr, body: Expr) -> Expr {
+        Expr::Let {
+            frame,
+            bind: Box::new(bind),
+            body: Box::new(body),
+        }
+    }
+
+    pub fn local(frame: u32, moved: bool) -> Expr {
+        Expr::Local { frame, moved }
     }
 
     pub fn if_(c: Expr, t: Expr, e: Expr) -> Expr {
@@ -340,6 +362,13 @@ impl Expr {
             Expr::Local { frame, .. } => env.local(*frame),
             Expr::Const(v) => v.clone(),
             Expr::Int64(n) => Some(Bson::Int64(*n)),
+            Expr::Let { frame, bind, body } => {
+                let v = bind.eval(env);
+                env.locals.push((*frame, v));
+                let out = body.eval(env);
+                env.locals.pop();
+                out
+            }
             Expr::Bin(op, l, r) => {
                 let a = l.eval(env);
                 match op {
@@ -507,6 +536,52 @@ impl Expr {
                 }
             }
             "isNumber" => args[0].eval(env).map(|v| Bson::Boolean(is_number(&v))),
+            "isArray" => args[0]
+                .eval(env)
+                .map(|v| Bson::Boolean(matches!(v, Bson::Array(_)))),
+            "isObject" => args[0]
+                .eval(env)
+                .map(|v| Bson::Boolean(matches!(v, Bson::Document(_)))),
+            "isArrayEmpty" => match args[0].eval(env) {
+                Some(Bson::Array(a)) => Some(Bson::Boolean(a.is_empty())),
+                _ => None,
+            },
+            // `newArray(v, ...)`: the values that are not `Nothing`.
+            "newArray" => Some(Bson::Array(
+                args.iter().filter_map(|a| a.eval(env)).collect(),
+            )),
+            "makeOwn" => args[0].eval(env),
+            // `arrayToSet(a)`: the array's distinct values under BSON
+            // comparison, in the order they first appear.
+            "arrayToSet" => match args[0].eval(env) {
+                Some(Bson::Array(items)) => {
+                    let mut out: Vec<Bson> = Vec::new();
+                    for v in items {
+                        if !out
+                            .iter()
+                            .any(|o| secantus_core::order::cmp(o, &v) == Ordering::Equal)
+                        {
+                            out.push(v);
+                        }
+                    }
+                    Some(Bson::Array(out))
+                }
+                _ => None,
+            },
+            // `unwindArray(a)`: the array with each element that is itself
+            // an array replaced by its elements.
+            "unwindArray" => match args[0].eval(env) {
+                Some(Bson::Array(items)) => Some(Bson::Array(
+                    items
+                        .into_iter()
+                        .flat_map(|v| match v {
+                            Bson::Array(inner) => inner,
+                            other => vec![other],
+                        })
+                        .collect(),
+                )),
+                other => other,
+            },
             "fillType" => {
                 let v = args[0].eval(env);
                 let mask = match &args[1] {
