@@ -488,3 +488,43 @@ def test_the_first_catalog_query_after_ddl_over_two_user_types_costs_the_same_at
     assert _median_excess(pairs, 1.5) < 0.005, _describe(
         pairs, "first query after DDL", GROWTH_TABLES
     )
+
+
+def _creates(conn: Any, prefix: str, tables: int, block: bool) -> float:
+    """`tables` `CREATE TABLE`s, inside one `BEGIN` ... `COMMIT` or each
+    in autocommit."""
+    start = time.monotonic()
+    if block:
+        with conn.transaction():
+            for i in range(tables):
+                conn.execute(f"CREATE TABLE {prefix}_{i} (a int, b text)")
+    else:
+        for i in range(tables):
+            conn.execute(f"CREATE TABLE {prefix}_{i} (a int, b text)")
+    return time.monotonic() - start
+
+
+@pytest.mark.backlog("RP-1112")
+def test_ten_create_tables_in_one_block_cost_what_they_do_one_at_a_time(pg: Any) -> None:
+    """A migration tool (Alembic, Django) runs its DDL inside one
+    transaction block. PostgreSQL 15.20 takes the same time for ten
+    `CREATE TABLE`s inside one `BEGIN` ... `COMMIT` as for ten in
+    autocommit (private cluster, 2026-11-26: 317 ms against 266 ms for
+    ten, 82 ms against 62 ms for twenty, with fsync): a statement in the
+    block reads its own transaction's catalog rows through the same
+    caches and indexes. A debug `secantusd-pg` on arm64 macOS took 4.3 s
+    for ten in a block against 0.7 s in autocommit, and 14.2 s against
+    1.2 s for twenty (2026-11-26): each DDL in the block costs more than
+    the one before it, so a block's cost grows with the square of its
+    statements.
+
+    Ten in a block within twice ten in autocommit plus 50 ms, the fastest
+    of three of each, interleaved."""
+    block = autocommit = float("inf")
+    for t in range(3):
+        block = min(block, _creates(pg, f"rp_blk_b{t}", 10, True))
+        autocommit = min(autocommit, _creates(pg, f"rp_blk_a{t}", 10, False))
+    assert block < 2 * autocommit + 0.05, (
+        f"ten CREATE TABLEs: {block * 1000:.0f} ms in one block, "
+        f"{autocommit * 1000:.0f} ms in autocommit"
+    )

@@ -3466,6 +3466,26 @@ statement is VALUES-only and runs there as written. The gap test is in
 ## Found while working RP-971 (2026-11-17)
 
 
+## Found while working RP-1073 (2026-11-26)
+
+- [ ] **Each `CREATE TABLE` inside a transaction block costs more than the
+      one before it.** Ten in one `BEGIN` ... `COMMIT` took a debug
+      `secantusd-pg` 4.3 s against 0.7 s for the same ten in autocommit,
+      and twenty 14.2 s against 1.2 s (arm64 macOS, 2026-11-26, an empty
+      schema): the cost grows with the square of the block's statements.
+      A multi-statement simple query, which runs as one implicit block, is
+      the same (twenty in one string, 14.2 s). PostgreSQL 15.20 on a
+      private cluster takes the same time either way (317 ms against
+      266 ms for ten, 82 ms against 62 ms for twenty, with fsync): a
+      statement in the block reads its own transaction's catalog rows
+      through the same caches and indexes. Every migration tool that wraps
+      its DDL in a transaction (Alembic, Django) pays it. Not yet
+      profiled: the in-block reads bypass the committed catalog's shared
+      copies (`block_wrote_catalog`, `in_open_transaction`), which is the
+      first place to look.
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_ten_create_tables_in_one_block_cost_what_they_do_one_at_a_time
+      Backlog-ID: RP-1112
+
 ## The storage model is not mongod's (tasks/mongod-storage-model-plan.md, 2026-11-19)
 
 - [ ] **A store `secantusd-pg` writes is not one mongod can open.** The
