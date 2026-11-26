@@ -12686,7 +12686,14 @@ impl PgHandler {
     /// `__sql_relstats__` too: the first CREATE TABLE of each of several
     /// sessions records its table's size there, and on a fresh store they
     /// raced to register it (RP-269).
-    const CATALOG_COLLECTIONS: [&'static str; 10] = [
+    ///
+    /// The saved heap and B-tree pages too: PostgreSQL's `initdb` makes every
+    /// catalog, so a `CREATE TABLE` adds only its own relation's file (and
+    /// its index's), which here is its own collection and `_id_` index. The
+    /// checkpointer made these two at the first table's first save, so the
+    /// first `CREATE TABLE` of a store added three collections besides its
+    /// own (RP-1074).
+    const CATALOG_COLLECTIONS: [&'static str; 12] = [
         CATALOG_COLLECTION,
         Self::RELSTATS_COLLECTION,
         Self::DOMAIN_COLLECTION,
@@ -12697,6 +12704,8 @@ impl PgHandler {
         Self::ENUM_COLLECTION,
         Self::ENUM_META_COLLECTION,
         Self::RANGE_COLLECTION,
+        crate::heap_store::COLLECTION,
+        crate::btree::COLLECTION,
     ];
 
     /// Open a transaction handle, with every catalog collection registered
@@ -23567,6 +23576,26 @@ impl PgHandler {
     /// and no two objects share one (RP-137). Each kind of object once drew
     /// from a band of its own, per database: the counter starts above every
     /// oid those handed out.
+    /// The oid counter's collection, made if missing: at server start, as
+    /// PostgreSQL's `initdb` leaves its counter in `pg_control`, so the
+    /// first object a store creates adds no collection but its own
+    /// (RP-1074).
+    pub(crate) fn ensure_oid_counter(&self) -> PgWireResult<()> {
+        let ns = Self::OID_COUNTER_NAMESPACE;
+        let coll = Self::OID_COUNTER_COLLECTION;
+        let err = |e: secantus_storage::StorageError| {
+            Self::storage_err("could not create the oid counter", e)
+        };
+        self.storage
+            .outside_user_transaction(|| -> secantus_storage::Result<()> {
+                if !self.storage.collection_exists(ns, coll)? {
+                    self.storage.create_collection(ns, coll)?;
+                }
+                Ok(())
+            })
+            .map_err(err)
+    }
+
     pub(crate) fn mint_global_oids(&self, n: usize) -> PgWireResult<i64> {
         let ns = Self::OID_COUNTER_NAMESPACE;
         let coll = Self::OID_COUNTER_COLLECTION;
