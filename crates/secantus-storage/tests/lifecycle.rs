@@ -422,6 +422,39 @@ fn a_standalone_checkpoint_anchors_a_replay_position_not_a_stable_timestamp() {
     let _ = std::fs::remove_dir_all(&member);
 }
 
+/// RM-808: the mode a store is opened in sets its tables' logging as mongod's
+/// `setTableLogging` does: a member's unlogged (and timestamped), a
+/// standalone's logged, whichever mode the store was made in. Nothing is lost
+/// in either direction.
+#[test]
+fn the_tables_follow_the_mode_the_store_is_opened_in() {
+    let home = temp_home();
+    let options = |member: bool| secantus_storage::StorageOptions {
+        replica_set: Some(member),
+        oplog_nonlogged: Some(false),
+        ..secantus_storage::StorageOptions::default()
+    };
+    let mut expect = 0;
+    for member in [true, false, false, true, false, true] {
+        let st = Storage::open_with_options(home.to_str().unwrap(), &options(member)).unwrap();
+        assert_eq!(
+            st.is_timestamped(),
+            member,
+            "the tables are unlogged only for a member"
+        );
+        assert_eq!(
+            st.collection_count_at_most("app", "c", 1000).unwrap(),
+            Some(expect)
+        );
+        for _ in 0..5 {
+            st.insert_one("app", "c", &enc(&bson::doc! {"_id": expect as i32}))
+                .unwrap();
+            expect += 1;
+        }
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// RM-797: a replica-set member's clean close keeps its stable checkpoint:
 /// mongod opens the store as that set's member and resumes its clock from
 /// the oplog.

@@ -219,6 +219,13 @@ pub struct StorageOptions {
     /// [`default_oplog_size`]). An existing store keeps the size its catalog
     /// entry holds, which `replSetResizeOplog` changes.
     pub oplog_size_bytes: Option<i64>,
+    /// Whether the server runs as a replica-set member (`Some(true)`) or as
+    /// a standalone (`Some(false)`), as mongod's `--replSet` decides at
+    /// startup. With it set (and `data_nonlogged` not), the data tables are
+    /// made to match as the store opens, as mongod's `setTableLogging`
+    /// does: unlogged for a member, logged for a standalone (RM-808). `None`
+    /// keeps the mode the store was made in.
+    pub replica_set: Option<bool>,
 }
 
 /// What opening the store did and how long it took, for the startup lines
@@ -7978,6 +7985,92 @@ fn u64_ts(t: u64) -> bson::Timestamp {
     }
 }
 
+/// mongod's `setTableLogging` (measured 8.2.11): started as a replica-set
+/// member, the user collections and their indexes are unlogged (`admin` and
+/// `config` included); started standalone, they are logged; the `local`
+/// collections, the oplog and the size storer are logged either way.
+/// Applied to a store at rest, before it is opened in the new mode.
+fn set_table_logging(home: &str, opts: &StorageOptions, nonlogged: bool) -> Result<()> {
+    let config = opts
+        .wt_config
+        .clone()
+        .unwrap_or_else(|| DEFAULT_CONFIG.to_string());
+    let config = store_format::mongod_log_config(&config);
+    let conn = Connection::open(home, &config)?;
+    let session = conn.open_session()?;
+    // Tables mongod keeps in the journal in either mode.
+    let mut always_logged: std::collections::HashSet<String> = [
+        sizes::SIZE_STORER_TABLE,
+        sizes::PRIVATE_TABLE,
+        index_build::BUILDS_TABLE,
+    ]
+    .iter()
+    .map(|t| t.to_string())
+    .collect();
+    // The oplog is the one record a member recovers from: it is never
+    // unlogged here, whatever else changes.
+    if let Some(entry) = mdb_catalog::entry_of_ns(&session, OPLOG_NS)? {
+        if let Ok(ident) = entry.get_str("ident") {
+            always_logged.insert(mdb_catalog::table_uri(ident));
+        }
+    }
+    for (db, coll, placement) in mdb_catalog::all_placements(&session)? {
+        if table_logged_by_mongod(&db, &coll) {
+            always_logged.insert(placement.table());
+            for ident in placement.indexes.values() {
+                always_logged.insert(mdb_catalog::table_uri(ident));
+            }
+        }
+    }
+    let mut changes = Vec::new();
+    {
+        // A table's logging is in its file's metadata row.
+        let cur = session.open_cursor("metadata:", None)?;
+        let mut tables = Vec::new();
+        let mut more = cur.next()?;
+        while more {
+            let key = cur.get_key_s()?;
+            if key.starts_with("table:") && !always_logged.contains(&key) {
+                tables.push(key);
+            }
+            more = cur.next()?;
+        }
+        for uri in tables {
+            cur.reset()?;
+            cur.set_key_s(&(uri.replacen("table:", "file:", 1) + ".wt"));
+            match cur.search() {
+                Ok(()) => {
+                    let now_nonlogged = cur.get_value_s()?.contains("log=(enabled=false)");
+                    if now_nonlogged != nonlogged {
+                        changes.push(uri);
+                    }
+                }
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    let cfg = if nonlogged {
+        "log=(enabled=false)"
+    } else {
+        "log=(enabled=true)"
+    };
+    eprintln!(
+        "secantus-storage: Changing table logging settings: {} tables become {}",
+        changes.len(),
+        if nonlogged { "unlogged" } else { "logged" }
+    );
+    for uri in &changes {
+        session.alter(uri, cfg)?;
+    }
+    // Every table is at its last close's state: checkpoint it, so the change
+    // and the data are on disk together.
+    session.checkpoint(None)?;
+    drop(session);
+    drop(conn);
+    Ok(())
+}
+
 /// Whether an existing store's data tables were created without logging, as
 /// WiredTiger's metadata records the catalog table's file; `None` for a
 /// store that has none yet.
@@ -8621,6 +8714,26 @@ impl Storage {
     /// explicit `Some` wins over the environment. This is what the Python
     /// `RustServer(...)` kwargs and the `secantusd-mdb` flags thread through.
     pub fn open_with_options(home: &str, opts: &StorageOptions) -> Result<Storage> {
+        let storage = Self::open_once(home, opts)?;
+        let Some(member) = opts.replica_set.filter(|_| opts.data_nonlogged.is_none()) else {
+            return Ok(storage);
+        };
+        if storage.in_memory || storage.data_nonlogged == member {
+            return Ok(storage);
+        }
+        // The store was last open in the other mode. It has been recovered
+        // in the mode it was made in (a member's by replaying its oplog), and
+        // closing it cleanly leaves every table at rest: set the logging of
+        // its tables as mongod does at startup, then open it in the new mode.
+        storage.close().map_err(|e| {
+            StorageError::Internal(format!("closing the store to change its logging: {e:?}"))
+        })?;
+        drop(storage);
+        set_table_logging(home, opts, member)?;
+        Self::open_once(home, opts)
+    }
+
+    fn open_once(home: &str, opts: &StorageOptions) -> Result<Storage> {
         let started = Instant::now();
         let (lock_file, lock_record) = match &opts.lock_file {
             Some(name) => {
@@ -8641,7 +8754,10 @@ impl Storage {
         // CREATE-time table configs (fresh stores; creates on existing tables
         // are no-ops).
         let oplog_nonlogged = opts.oplog_nonlogged.unwrap_or_else(oplog_tables_nonlogged);
-        let data_create_mode = opts.data_nonlogged.unwrap_or_else(data_tables_nonlogged);
+        let data_create_mode = opts
+            .data_nonlogged
+            .or(opts.replica_set)
+            .unwrap_or_else(data_tables_nonlogged);
         let in_memory = config.contains("in_memory=true");
         let new_store = in_memory || !std::path::Path::new(home).join("WiredTiger.wt").exists();
         // A new store is refused before WiredTiger writes a file of it; an

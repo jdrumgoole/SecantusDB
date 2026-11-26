@@ -657,6 +657,13 @@ impl Session {
         self.on_object(unsafe { (*self.ptr).drop }, uri, config)
     }
 
+    /// `WT_SESSION::alter`: change a table's mutable configuration
+    /// (`log=(enabled=...)` is one), as mongod's `setTableLogging` does at
+    /// startup. Needs the table to have no open cursor (`EBUSY` otherwise).
+    pub fn alter(&self, uri: &str, config: &str) -> Result<()> {
+        self.on_object(unsafe { (*self.ptr).alter }, uri, Some(config))
+    }
+
     /// `WT_SESSION::salvage`: rebuild a damaged table's file from whatever
     /// of it can still be read, discarding what cannot. Needs the table to
     /// have no open handle (`EBUSY` otherwise).

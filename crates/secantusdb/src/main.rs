@@ -387,7 +387,11 @@ fn storage_options(cli: &CliArgs) -> StorageOptions {
         oplog_nonlogged: cli.oplog_nonlogged,
         // mongod's split, so writes carry the timestamps a snapshot read at a
         // past time reads by (RM-210); `--data-logged` opts out.
-        data_nonlogged: Some(cli.data_nonlogged.unwrap_or(true)),
+        data_nonlogged: cli.data_nonlogged,
+        // mongod's `setTableLogging`: the tables follow the mode the server
+        // starts in, a replica-set member's unlogged and a standalone's
+        // logged (RM-808); an explicit `--data-(non)logged` overrides.
+        replica_set: Some(cli.replica_set_name.is_some()),
         checkpoint_seconds: cli.checkpoint_seconds,
         oplog_size_bytes: cli.oplog_size_mb.map(|mb| mb as i64 * 1024 * 1024),
         // mongod's lock file: a clean shutdown empties it, and the next
