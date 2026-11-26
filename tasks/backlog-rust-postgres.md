@@ -1269,8 +1269,15 @@ one beside it.
       tests before it on its server are not fixed; a combination of
       earlier tests, or a race with something the server does in the
       background, is what is left. PostgreSQL reads the same blocks for
-      the same query every time.
-      Verify: none -- intermittent (1 CI run), not reproducible on demand; the test named above is where it shows
+      the same query every time. A second time, the same diff in the same
+      step: PR #3002 at `32d5d7242` (RP-1062, EXPLAIN-only), run
+      45730933189, 2026-11-26. Both failures came after RP-1073's
+      6711f3618, which changed how a keyed `pg_attribute` read finds its
+      tables (`tables_of_relids`, by name over the sorted shared
+      definitions, with a fallback when they are not in name order) --
+      which tables the module's earlier tests left on the server decides
+      that order; look there first.
+      Verify: none -- intermittent (2 CI runs of about five), not reproducible on demand; the test named above is where it shows
       Backlog-ID: RP-1111
 
 ## Found by a CI run (2026-11-07)
