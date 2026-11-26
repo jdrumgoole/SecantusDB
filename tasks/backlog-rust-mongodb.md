@@ -2021,9 +2021,12 @@ would see them. What is left:
       mongod drops an `$expr` on `fullDocument`, and so does this server.
       The eighth (2026-11-26) renamed `clusterTime` (`ts`), `lsid` and
       `txnNumber` into the events and the transaction filter (not the
-      unwind's), for every leaf `renamed` prints; a `$type` on them, and an
-      `$expr` (mongod prints the `$expr` and three copies of its
-      `$_internalExprEq` twin), are still left out of the read.
+      unwind's), for every leaf `renamed` prints, and the ninth
+      (2026-11-26) an `$expr` on them (renamed, beside three copies of each
+      `$_internalExpr*` twin: the user's and one per re-optimisation of the
+      oplog filter); a `$type` on them is still left out of the read, and
+      `expr_twins` derives none from an `$expr` `$or`, which mongod's
+      `RewriteExpr` may.
       The rest of
       `change_stream_rewrite_helpers.cpp` (`matchRewriteUpdateDescription`,
       the other event fields, their expression rewrites) is to transcribe

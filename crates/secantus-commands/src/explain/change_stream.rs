@@ -26,10 +26,10 @@
 //!
 //! So are a `$match` on `documentKey`, (inexactly) on `fullDocument`, on
 //! `ns` and `to`, an `$expr` on `operationType`, `documentKey`, `ns`
-//! or `to`, and the renamed `clusterTime` / `lsid` / `txnNumber` (RM-698).
+//! or `to`, and the renamed `clusterTime` / `lsid` / `txnNumber`, an
+//! `$expr` on them included (RM-698).
 //! Not reproduced: the rewrites of `updateDescription`,
-//! `fullDocumentBeforeChange`, and of an `$expr` on those or on the
-//! renamed fields (RM-698), and the
+//! `fullDocumentBeforeChange`, and of an `$expr` on those (RM-698), and the
 //! change stream's `queryShapeHash` (RM-454). The unwind's filter goes through
 //! mongod's Boolean simplifier (`simplify.rs`, RM-699).
 
@@ -1194,7 +1194,6 @@ enum Fields {
 
 fn rewrite(u: &U, inexact: bool, fields: Fields) -> Option<M> {
     match u {
-        U::ExprEq(..) | U::Expr(_) if fields == Fields::Transaction => None,
         U::And(c) => {
             let mut out = Vec::new();
             for child in c {
@@ -1247,16 +1246,47 @@ fn rewrite(u: &U, inexact: bool, fields: Fields) -> Option<M> {
         // `documentKey` and `fullDocument` keep the twin's operator (their
         // rewrites rename the predicate); every other field rewrites it as
         // the equality.
+        // The transaction filter takes only the renamed fields' twins.
+        U::ExprEq(p, _)
+            if fields == Fields::Transaction
+                && !RENAMES.iter().any(|(f, _)| p.split('.').next() == Some(*f)) =>
+        {
+            None
+        }
         U::ExprEq(p, _) if p.split('.').next() == Some("documentKey") => rewrite_document_key(u),
         U::ExprEq(p, _) if p.split('.').next() == Some("fullDocument") => {
             inexact.then(|| rewrite_full_document(u)).flatten()
         }
-        // mongod rewrites an `$expr` on a renamed field (and its twins) in
-        // a way not yet transcribed: leave it out of the read (RM-698).
-        U::ExprEq(p, _) if RENAMES.iter().any(|(f, _)| p.split('.').next() == Some(*f)) => None,
-        U::ExprEq(p, v) => rewrite(&U::Eq(p.clone(), v.clone()), inexact, fields),
-        U::Expr(e) => match rewrite_agg(e, inexact)? {
-            Bson::Document(d) => Some(M::Expr(d)),
+        // A twin on a renamed field keeps its operator under the new name;
+        // the unwind leaves it out, the transaction filter keeps only it.
+        U::ExprEq(p, _) => match RENAMES
+            .iter()
+            .find(|(f, _)| p.split('.').next() == Some(*f))
+        {
+            Some((_, to)) if fields != Fields::Unwind => renamed(u, to),
+            Some(_) => None,
+            None if fields == Fields::Transaction => None,
+            None => match u {
+                U::ExprEq(p, v) => rewrite(&U::Eq(p.clone(), v.clone()), inexact, fields),
+                _ => None,
+            },
+        },
+        U::Expr(e) => match rewrite_agg(e, inexact, fields)? {
+            Bson::Document(d) => {
+                // The oplog filter is optimised again, twice, and each pass
+                // derives the `$_internalExpr*` twins of the rewritten
+                // expression afresh (mongod 8.2.11 prints three copies of a
+                // renamed field's twin, the user's own among them).
+                let twins = expr_twins(&d);
+                if twins.is_empty() {
+                    Some(M::Expr(d))
+                } else {
+                    let mut all = vec![M::Expr(d)];
+                    all.extend(twins.iter().cloned());
+                    all.extend(twins);
+                    Some(M::And(all))
+                }
+            }
             _ => None,
         },
         U::Opaque | U::False => None,
@@ -1407,11 +1437,23 @@ fn to_expr(rest: Option<&str>) -> Option<Bson> {
 /// A field path of the event as an expression over the oplog entry, for
 /// the fields mongod rewrites in an expression; `fullDocument` and the
 /// rest are not.
-fn event_path_expr(p: &str) -> Option<Bson> {
+fn event_path_expr(p: &str, fields: Fields) -> Option<Bson> {
     let (head, rest) = match p.split_once('.') {
         Some((h, r)) => (h, Some(r)),
         None => (p, None),
     };
+    if let Some((_, to)) = RENAMES.iter().find(|(f, _)| *f == head) {
+        if fields == Fields::Unwind {
+            return None;
+        }
+        return Some(Bson::String(match rest {
+            Some(r) => format!("${to}.{r}"),
+            None => format!("${to}"),
+        }));
+    }
+    if fields == Fields::Transaction {
+        return None;
+    }
     match head {
         "operationType" if rest.is_none() => Some(operation_type_expr()),
         "documentKey" => Some(document_key_expr(rest)),
@@ -1426,9 +1468,9 @@ fn event_path_expr(p: &str) -> Option<Bson> {
 /// rewrite when the rewrite may be inexact; anything else needs all of its
 /// paths rewritten. Constants print as `$const`, as the optimizer leaves
 /// them. `None` is no rewrite.
-fn rewrite_agg(e: &Bson, inexact: bool) -> Option<Bson> {
+fn rewrite_agg(e: &Bson, inexact: bool, fields: Fields) -> Option<Bson> {
     if let Some(p) = field_path(e) {
-        return event_path_expr(p);
+        return event_path_expr(p, fields);
     }
     if let Some(c) = constant(e) {
         return Some(Bson::Document(doc! { "$const": c }));
@@ -1446,7 +1488,7 @@ fn rewrite_agg(e: &Bson, inexact: bool) -> Option<Bson> {
         "$and" => {
             let kept: Vec<Bson> = args
                 .iter()
-                .filter_map(|a| rewrite_agg(a, inexact))
+                .filter_map(|a| rewrite_agg(a, inexact, fields))
                 .collect();
             if (kept.len() != args.len() && !inexact) || kept.is_empty() {
                 return None;
@@ -1455,11 +1497,55 @@ fn rewrite_agg(e: &Bson, inexact: bool) -> Option<Bson> {
         }
         "$or" | "$not" | "$eq" | "$ne" | "$gt" | "$gte" | "$lt" | "$lte" | "$in" => args
             .iter()
-            .map(|a| rewrite_agg(a, false))
+            .map(|a| rewrite_agg(a, false, fields))
             .collect::<Option<_>>()?,
         _ => return None,
     };
     Some(Bson::Document(doc! { op.clone(): out }))
+}
+
+/// The `$_internalExpr*` twins mongod's `RewriteExpr` derives from an
+/// expression: a comparison of a field path and a constant (not an array),
+/// or an `$and` of them. A rewritten path that is no plain field (a
+/// `$switch`, a `$let`) derives none.
+fn expr_twins(e: &Document) -> Vec<M> {
+    let Some((op, args)) = e.iter().next().filter(|_| e.len() == 1) else {
+        return Vec::new();
+    };
+    if op == "$and" {
+        return match args {
+            Bson::Array(a) => a
+                .iter()
+                .filter_map(Bson::as_document)
+                .flat_map(expr_twins)
+                .collect(),
+            _ => Vec::new(),
+        };
+    }
+    let kind = |flipped: bool| match (op.as_str(), flipped) {
+        ("$eq", _) => Some(Leaf::ExprEq),
+        ("$gt", false) | ("$lt", true) => Some(Leaf::ExprGt),
+        ("$gte", false) | ("$lte", true) => Some(Leaf::ExprGte),
+        ("$lt", false) | ("$gt", true) => Some(Leaf::ExprLt),
+        ("$lte", false) | ("$gte", true) => Some(Leaf::ExprLte),
+        _ => None,
+    };
+    let Some([a, b]) = args.as_array().map(Vec::as_slice) else {
+        return Vec::new();
+    };
+    let value = |c: &Bson| match c {
+        Bson::Document(d) if d.len() == 1 => d.get("$const").cloned(),
+        _ => None,
+    };
+    let (path, c, flipped) = match (field_path(a), field_path(b)) {
+        (Some(p), None) => (p, value(b), false),
+        (None, Some(p)) => (p, value(a), true),
+        _ => return Vec::new(),
+    };
+    match (kind(flipped), c) {
+        (Some(k), Some(c)) if !matches!(c, Bson::Array(_)) => vec![M::Leaf(path.to_string(), k, c)],
+        _ => Vec::new(),
+    }
 }
 
 /// The rewrite of the `$match` after the stream into the oplog's terms, if
