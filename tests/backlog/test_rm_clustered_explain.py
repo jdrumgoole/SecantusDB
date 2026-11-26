@@ -41,10 +41,10 @@ def test_an_id_range_is_a_bounded_clustered_scan(rust_mongo: Any) -> None:
     }
 
 
-def _collection(client: Any, ids: Any = range(1, 6)) -> Any:
+def _collection(client: Any, ids: Any = None) -> Any:
     db = client[f"cl_{uuid.uuid4().hex[:12]}"]
     db.create_collection("c", clusteredIndex=_SPEC)
-    db.c.insert_many([{"_id": i, "x": i} for i in ids])
+    db.c.insert_many([{"_id": i, "x": i} for i in (range(1, 6) if ids is None else ids)])
     return db
 
 
@@ -209,6 +209,10 @@ def test_a_clustered_key_is_hinted_by_its_own_name(rust_mongo: Any) -> None:
     db = rust_mongo[f"cl_{uuid.uuid4().hex[:12]}"]
     db.create_collection("c", clusteredIndex={**_SPEC, "name": "ci"})
     db.c.insert_many([{"_id": i} for i in (3, 1, 2)])
-    assert [d["_id"] for d in db.c.find().hint("ci")] == [1, 2, 3]
+    try:
+        found: Any = [d["_id"] for d in db.c.find().hint("ci")]
+    except Exception as err:  # noqa: BLE001 -- the refusal is the answer
+        found = f"refused: {err}"
+    assert found == [1, 2, 3]
     with pytest.raises(Exception, match="hint provided does not correspond"):
         list(db.c.find().hint("_id_"))
