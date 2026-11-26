@@ -487,23 +487,21 @@ one beside it.
   Left open as a watch item until the lane stays green.
   Backlog-ID: RP-571
   Verify: none -- intermittent, Linux CI only, not reproduced on macOS; RP-002's two regression tests are the check, and print the cancel trace on a miss
-- [ ] **A cancel sent while a prepared statement's Parse is described was
-  lost once on Linux CI (2026-11-26).** RP-215's regression test
-  `tests/backlog/test_rp_batch53.py::test_a_cancel_during_a_prepared_statements_parse_is_honoured[2.5]`
-  answered `ok` where PostgreSQL 15.19 answers 57014: the call took 7.50 s,
-  so `select pg_sleep(3), 25 in (<200,000 items>)` ran to its end, which is
-  RP-215's own symptom (a cancel left pending when the Parse answered,
-  cleared as stale at the next message). PR #3002 at `e579c75e0` (RP-1062's
-  EXPLAIN-only change and a backlog note), job `pg-oracle (backlog)`, run
-  45734519669; the `[0.5]` and `[1.5]` cases passed in the same run, and
-  this test passed on #3002's previous run at `32d5d7242` and on the
-  snapshots before. Unlike RP-571 (honoured late), this one was never
-  honoured. PostgreSQL answers a cancel at its next `CHECK_FOR_INTERRUPTS`
-  wherever in the cycle it lands. Start from the cancel trace
-  (`SECANTUS_PG_CANCEL_TRACE`) under load: where the pending flag is
-  cleared between the Parse's answer and the Sync.
-  Verify: none -- intermittent (1 CI run), not reproduced; the test named above is the check
-  Backlog-ID: RP-1115
+- [ ] **A busy backend's held statistics are published mid-statement.**
+  PostgreSQL 15 holds the counts a backend could not flush yet (under a
+  second since its last flush) for the idle timer, and turns that timer
+  off when it reads the next command, so they go out when the backend is
+  next idle: inserts held that way, then `pg_sleep(13)`, and another
+  session reads `n_tup_ins` 1 at 11.5 s and 2 afterwards (15.20). Here it
+  reads 2 at 11.5 s: `begin_message_cycle`'s first-message branch never
+  runs, because the wire layer's `MessageStartHook` (installed at
+  startup) opens the cycle at the message's first byte, so
+  `stats().wake()` never clears `idle_since` and another backend's
+  `flush_idle` flushes the busy one. The same dead branch never moves
+  `message_cycle` (a key of the per-cycle catalog cache, RP-715) and never
+  writes the trace's `cycle start` line. Found while working RP-1115.
+  Verify: tests/backlog/test_rp_busy_backend_stats.py::test_a_busy_backends_held_counts_wait_until_it_is_idle
+  Backlog-ID: RP-1116
 - [ ] **RUST pgserver: the planner's choices that decide row order are only
   partly modelled.** **Decided (Joe, 2026-10-16): build a cost model** --
   enough of PostgreSQL's planner to make its choices, since the order rows
@@ -1239,34 +1237,6 @@ one beside it.
       Verify: none -- intermittent on CI; RP-715's, RP-911's and RP-1073's tests are the check
       Backlog-ID: RP-1100
 
-- [ ] **`test_catalog_blocks` once counted an extra `pg_attribute` block
-      on CI (2026-11-25).** `tests/backlog/test_rp_catalog_reads.py::test_catalog_blocks`
-      (RP-291's regression test) read 4 `pg_attribute` heap blocks for
-      `select * from rpc_t where id = 1`, where PostgreSQL 15.19 reads 3
-      (third step; the other steps matched). PR #2998 at `432c8ec3e`, job
-      `pg-oracle (backlog)`, run 45711355695. It passed on every other run
-      found that day, #2996's (the same tree less RP-1065, whose change is
-      EXPLAIN-only) included. Not reproduced locally (debug, arm64 macOS):
-      alone on RP-1065's tree and on the tree before it; the whole module
-      serially, twice; each of the 29 tests defined after it run just before
-      it on one server; and eight runs on one server with
-      `autovacuum_naptime = 1s` (the expected counts were measured with
-      autovacuum off). The module shares one server (`rust_pg` is
-      module-scoped) and CI runs it `-n auto --dist worksteal`, so the
-      tests before it on its server are not fixed; a combination of
-      earlier tests, or a race with something the server does in the
-      background, is what is left. PostgreSQL reads the same blocks for
-      the same query every time. A second time, the same diff in the same
-      step: PR #3002 at `32d5d7242` (RP-1062, EXPLAIN-only), run
-      45730933189, 2026-11-26. Both failures came after RP-1073's
-      6711f3618, which changed how a keyed `pg_attribute` read finds its
-      tables (`tables_of_relids`, by name over the sorted shared
-      definitions, with a fallback when they are not in name order) --
-      which tables the module's earlier tests left on the server decides
-      that order; look there first.
-      Verify: none -- intermittent (2 CI runs of about five), not reproducible on demand; the test named above is where it shows
-      Backlog-ID: RP-1111
-
 ## Found by a CI run (2026-11-07)
 
 - [ ] **OPEN — CI: `obj_description` of a commented index answered NULL
@@ -1685,10 +1655,18 @@ a regression test.
         leaf pages are read over `initdb`'s tree), with a non-HOT update's
         new version and entries, and VACUUM's removal of dead ones;
       - a dead row's space: on-access pruning (`heap_page_prune_opt`) and
-        VACUUM do not free it, and a scan never meets a dead row's entry
-        (it reads as killed at once, where PostgreSQL's first scan reads
-        its block before `_bt_killitems`); a ROLLBACK TO SAVEPOINT past a
-        CREATE TABLE keeps its rows live;
+        VACUUM do not free it, so each cycle of DDL in a database puts
+        its rows after the last cycle's, where PostgreSQL puts them in the
+        space pruning gave back. At the module's tenth cycle in one
+        database (only there, of cycles 1 to 14), where `rpc_t`'s rows
+        land makes its primary-key lookup read 4 `pg_attribute` blocks
+        where PostgreSQL 15.20 reads 3, most likely its rows crossing a
+        page boundary (`test_a_dead_rows_space_takes_new_rows`; this is why
+        `test_catalog_blocks` failed on CI in the shared database until it
+        moved to a fresh one, RP-1111). Also, a scan never meets a dead
+        row's entry (it reads as killed at once, where PostgreSQL's first
+        scan reads its block before `_bt_killitems`); a ROLLBACK TO
+        SAVEPOINT past a CREATE TABLE keeps its rows live;
       - a restart: the places are kept in memory, so after one the rows
         read as unplaced again (a row returned beyond the placed ones is
         fetched as a block of its own by an index-only scan, and counts no
@@ -1707,7 +1685,7 @@ a regression test.
       blocks, not 56; `pg_class`, `pg_type`, `pg_index` and `pg_database`
       are 15.19's page for page, which is what this slice was measured on.
       Backlog-ID: RP-291
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_views_and_a_functions_rows_are_read_from_the_heap
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_views_and_a_functions_rows_are_read_from_the_heap, tests/backlog/test_rp_catalog_reads.py::test_a_dead_rows_space_takes_new_rows
 - [ ] **No logical replication launcher scans `pg_subscription`.**
       PostgreSQL 15.19's launcher (`ApplyLauncherMain`) heap-scans
       `pg_subscription` as it starts, again at once, then whenever its
