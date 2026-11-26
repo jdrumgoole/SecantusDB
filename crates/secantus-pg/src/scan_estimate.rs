@@ -2203,7 +2203,7 @@ impl PgHandler {
                 }
             }
         }
-        let a = self.hash_side_with(
+        let mut a = self.hash_side_with(
             &sj.outer.0,
             &sel.filter,
             &sj.outer_exprs,
@@ -2214,8 +2214,16 @@ impl PgHandler {
         // The subquery's WHERE filters the inner scan, which returns its
         // key alone.
         let inner_read = [inner_key.clone()];
-        let b = self.hash_side(&sj.inner.0, &sj.inner_filter, &inner_key, &inner_read, &[])?;
-        let ((outer, inner, mut join, _, [_, index]), unique) = hash_semi_join_of(a, b)?;
+        let mut b = self.hash_side(&sj.inner.0, &sj.inner_filter, &inner_key, &inner_read, &[])?;
+        // The inner side made unique is grouped on its key, whose groups
+        // `estimate_num_groups` counts from the column an expression reads.
+        let group_nd = b.stats.0;
+        for (h, e) in [(&mut a, &sj.outer_expr), (&mut b, &sj.inner_expr)] {
+            if let Some(e) = e {
+                key_is_expression(h, f64::from(e.ops), &e.pg_type);
+            }
+        }
+        let ((outer, inner, mut join, _, [_, index]), unique) = hash_semi_join_of(a, b, group_nd)?;
         join.1 += target * join.2;
         join.3 += width;
         Some((outer, inner, join, unique, index))
@@ -2279,16 +2287,7 @@ impl PgHandler {
             // NULLs (`eqjoinsel`, `estimate_hash_bucket_stats`); not unique
             // and in no index's order (RP-981).
             if let Some((ops, ty)) = &p.key_expr {
-                h.stats = (200.0, 0.0, Vec::new());
-                h.unique = false;
-                h.column = None;
-                h.ordered = false;
-                h.key_indexed = false;
-                h.key_index = None;
-                h.key_index_name = None;
-                h.pg_type = ty.clone();
-                h.key_ops = f64::from(*ops);
-                h.default_nd = true;
+                key_is_expression(&mut h, f64::from(*ops), ty);
             }
             Some(h)
         };
@@ -7709,6 +7708,24 @@ pub(crate) fn has_expr_join_key(sel: &secantus_pgplan::Select) -> bool {
     )
 }
 
+/// A join side whose key is an expression evaluating `ops` operators,
+/// of type `pg_type`: no statistics for it, so `get_variable_numdistinct`'s
+/// 200 default, no MCVs and no NULLs (`eqjoinsel`,
+/// `estimate_hash_bucket_stats`); not unique and in no index's order
+/// (RP-981, RP-411).
+fn key_is_expression(h: &mut HashSide, ops: f64, pg_type: &str) {
+    h.stats = (200.0, 0.0, Vec::new());
+    h.unique = false;
+    h.column = None;
+    h.ordered = false;
+    h.key_indexed = false;
+    h.key_index = None;
+    h.key_index_name = None;
+    h.pg_type = pg_type.to_string();
+    h.key_ops = ops;
+    h.default_nd = true;
+}
+
 struct JoinedSide {
     /// Its join key, as the joined rows name it (`alias` SEP `column`).
     key: String,
@@ -8309,7 +8326,11 @@ const MORE_HASH_CLAUSES: usize = 3;
 /// scan and the inner side's `HashAggregate` any join of the unique-ified
 /// side reads. An outer side read through an index is not priced; the
 /// inner one is (its index the join estimate's second).
-fn hash_semi_join_of(a: HashSide, b: HashSide) -> Option<(JoinEstimate, Option<Estimate>)> {
+fn hash_semi_join_of(
+    a: HashSide,
+    b: HashSide,
+    group_nd: f64,
+) -> Option<(JoinEstimate, Option<Estimate>)> {
     use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
     const CPU_OPERATOR_COST: f64 = 0.0025;
     const CPU_TUPLE_COST: f64 = 0.01;
@@ -8319,7 +8340,7 @@ fn hash_semi_join_of(a: HashSide, b: HashSide) -> Option<(JoinEstimate, Option<E
     fn key(s: &HashSide) -> KeyStats<'_> {
         KeyStats {
             ndistinct: s.stats.0,
-            default_ndistinct: false,
+            default_ndistinct: s.default_nd,
             null_frac: s.stats.1,
             mcv: &s.stats.2,
         }
@@ -8334,8 +8355,9 @@ fn hash_semi_join_of(a: HashSide, b: HashSide) -> Option<(JoinEstimate, Option<E
         scan_ordered: false,
         unique: false,
         ndistinct: s.stats.0,
-        default_ndistinct: false,
-        key_ops: 0.0,
+        default_ndistinct: s.default_nd,
+        // An expression key's operators, charged with the clause's `=`.
+        key_ops: s.key_ops,
         rel_rows: s.scan.2,
         width: Some(s.scan.3),
         extra: joincost::ExtraKeys::default(),
@@ -8366,7 +8388,9 @@ fn hash_semi_join_of(a: HashSide, b: HashSide) -> Option<(JoinEstimate, Option<E
     // clause on every pair of rows: bounds of those.
     // `estimate_num_groups`: the key's distinct values scaled down to the
     // rows the inner side's own WHERE keeps.
-    let mut reldistinct = b.stats.0.min(b.tuples);
+    // An expression's groups are its column's (`estimate_num_groups` over
+    // the Vars it reads).
+    let mut reldistinct = group_nd.min(b.tuples);
     if reldistinct > 0.0 && inner.rows < b.tuples {
         reldistinct *= 1.0 - ((b.tuples - inner.rows) / b.tuples).powf(b.tuples / reldistinct);
     }

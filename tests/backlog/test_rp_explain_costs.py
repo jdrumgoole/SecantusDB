@@ -7262,9 +7262,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "                    Index Cond: (a < 20)",
         ],
     ),
-    # An IN whose two sides compare expressions, measured on 15.19 (RP-411).
+    # An IN whose two sides compare expressions was planned as the join of
+    # the inner side made unique on its expression, as 15.19 plans it
+    # (RP-411).
     "an in subquery comparing expressions is planned as a join": (
-        "RP-411",
+        "RP-411:fixed",
         _ANALYSED,
         "explain select * from e where a::bigint in (select a::bigint + 0 from k where b = 'v3')",
         [
@@ -7276,6 +7278,71 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Group Key: ((k.a)::bigint + 0)",
             "              ->  Seq Scan on k  (cost=0.00..17.50 rows=100 width=4)",
             "                    Filter: (b = 'v3'::text)",
+        ],
+    ),
+    # An expression over the inner column has no statistics, its default
+    # 200 distinct values clamped to the inner side's 100 rows, which makes
+    # it no default (`eqjoinsel_semi`): 100 of the 1,000 outer rows match
+    # (RP-411).
+    "an in subquery of an expression over a filtered side clamps its distinct count": (
+        "RP-411:fixed",
+        _ANALYSED,
+        "explain select * from e where a in (select a + 0 from k where b = 'v3')",
+        [
+            "Hash Join  (cost=20.00..38.98 rows=100 width=7)",
+            "  Hash Cond: (e.a = (k.a + 0))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=18.75..18.75 rows=100 width=4)",
+            "        ->  HashAggregate  (cost=17.75..18.75 rows=100 width=4)",
+            "              Group Key: (k.a + 0)",
+            "              ->  Seq Scan on k  (cost=0.00..17.50 rows=100 width=4)",
+            "                    Filter: (b = 'v3'::text)",
+        ],
+    ),
+    # Calls of a string function on each side, the inner grouped by its
+    # call into the column's ten groups (RP-411).
+    "an in subquery comparing function calls is planned as a join": (
+        "RP-411:fixed",
+        _ANALYSED,
+        "explain select * from e where upper(b) in (select lower(b) from k)",
+        [
+            "Hash Join  (cost=17.73..42.29 rows=500 width=7)",
+            "  Hash Cond: (upper(e.b) = lower(k.b))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=17.60..17.60 rows=10 width=3)",
+            "        ->  HashAggregate  (cost=17.50..17.60 rows=10 width=3)",
+            "              Group Key: lower(k.b)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=3)",
+        ],
+    ),
+    # The subquery's WHERE naming its relation by its alias filters the
+    # inner scan as the bare column would (RP-411).
+    "an in subquery whose where names its alias is a hash semi join": (
+        "RP-411:fixed",
+        _ANALYSED,
+        "explain select * from e where a in (select a from e e2 where e2.b = 'v3')",
+        [
+            "Hash Semi Join  (cost=18.75..37.49 rows=100 width=7)",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=17.50..17.50 rows=100 width=4)",
+            "        ->  Seq Scan on e e2  (cost=0.00..17.50 rows=100 width=4)",
+            "              Filter: (b = 'v3'::text)",
+        ],
+    ),
+    # An IN across types compares through the cross-type `int8 = int4`,
+    # measured on 15.19 (RP-411): the inner column is unique, so the inner
+    # join.
+    "an in subquery across types is planned as a join": (
+        "RP-411",
+        _ANALYSED,
+        "explain select * from e where a::bigint in (select a from k)",
+        [
+            "Hash Join  (cost=27.50..45.26 rows=1000 width=7)",
+            "  Hash Cond: ((e.a)::bigint = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
         ],
     ),
     # Planned as the inner join `reduce_unique_semijoins` makes of it.

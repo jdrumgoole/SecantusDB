@@ -48596,7 +48596,12 @@ impl PgHandler {
                 // an inner side unique on its column it was planned above
                 // as the inner join `reduce_unique_semijoins` makes of it.
                 if let Some(sj) = &options.semi_join {
-                    if !self.unique_index_fixed(&sj.inner.0, std::slice::from_ref(&sj.inner_col)) {
+                    // An expression over the inner column is unique by no
+                    // index (`innerrel_is_unique`).
+                    if sj.inner_expr.is_some()
+                        || !self
+                            .unique_index_fixed(&sj.inner.0, std::slice::from_ref(&sj.inner_col))
+                    {
                         tree = explain::semi_join_tree(sj);
                         explain::outer_quals_on_semi_join(
                             &mut tree,
