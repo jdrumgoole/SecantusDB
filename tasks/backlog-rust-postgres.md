@@ -3456,16 +3456,19 @@ from 15.19): every statement is VALUES-only. The gap tests are in
 
 ## Found while working RP-966 (2026-11-17)
 
-- [ ] **An ORDER BY on a column the select list only computes from
-      names the computed entry as its Sort Key.** `explain (costs off)
-      select a+1 from e order by a` prints `Sort Key: ?column?`;
-      PostgreSQL 15.19 prints `Sort Key: a` (the key is a resjunk column
-      of the scan, which this server's costs already price: `Sort
-      (cost=67.33..69.83 rows=1000 width=8)` matches). Over `k`, whose
-      primary key returns `a` in order, PostgreSQL prints `Index Only Scan
-      using k_pkey on k (cost=0.28..45.77 rows=1000 width=8)` and no Sort
-      at all. Found while working RP-1036.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by on a column only a computed entry reads names the column]
+- [ ] **An ORDER BY on a primary key under a computed select list is a
+      Sort, not the index.** `explain select a+1 from k order by a` prints
+      an unpriced `Sort` over `Seq Scan on k`; PostgreSQL 15.19 prints
+      `Index Only Scan using k_pkey on k (cost=0.28..45.77 rows=1000
+      width=8)` and no Sort, the primary key returning `a` in order
+      (`Index Scan using k_pkey` when the list also reads `b`). This
+      server draws no index path for an ORDER BY at all: `select a from k
+      order by a` is the same unpriced Sort (PostgreSQL `Index Only Scan
+      ... (cost=0.28..43.27 ...)`), so the faithful fix is
+      `build_index_paths`' useful pathkeys, an index whose order matches
+      the query's, priced against the Sort. (The Sort Key naming half of
+      this item, `?column?` for `a`, closed 2026-11-26.)
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by on a primary key a computed entry reads is an index scan]
       Backlog-ID: RP-1066
 
 - [ ] **A join on an expression key PostgreSQL prices is unpriced in
@@ -3666,3 +3669,17 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       inner materialised. Found while working RP-1068.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a nested loop is priced]
       Backlog-ID: RP-1125
+
+## Found while working RP-1066 (2026-11-26)
+
+- [ ] **A DISTINCT whose ORDER BY is a prefix of it sorts on the ORDER BY
+      alone.** `explain (costs off) select distinct b, a+1 from e order by
+      b` prints `Sort Key: b` under the `Unique`; PostgreSQL 15.19 prints
+      `Sort Key: b, ((a + 1))`, the ORDER BY followed by every other
+      DISTINCT column (`transformDistinctClause` appends them to the sort
+      clause), and `select distinct b, a from e order by b` likewise `b,
+      a` where this server prints `b`. SQL leaves the order within one
+      `b` unspecified, so the rows are not wrong; the plan's text is. Both
+      plans are unpriced here.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a distinct sorted on a prefix sorts on every distinct column]
+      Backlog-ID: RP-1126

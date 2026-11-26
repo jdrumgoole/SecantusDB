@@ -3531,15 +3531,52 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on PostgreSQL 15.19 (RP-1066): the key is a resjunk column
-    # of the scan, named as itself.
+    # of the scan, named as itself. Named so since RP-1066 (it printed the
+    # computed entry's `?column?`).
     "an order by on a column only a computed entry reads names the column": (
-        "RP-1066",
+        "RP-1066:fixed",
         _ANALYSED,
         "explain (costs off) select a+1 from e order by a",
         [
             "Sort",
             "  Sort Key: a",
             "  ->  Seq Scan on e",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (RP-1066): a key is the expression its
+    # name resolves to, never a target's output name -- an alias of a
+    # column is the column, an output name over an expression that
+    # expression. Named so since RP-1066 (`x`, `__order0`, `upper`).
+    "an order by through an output name prints the expression": (
+        "RP-1066:fixed",
+        _ANALYSED,
+        "explain (costs off) select a as x, a*2 as a, upper(b) from e order by x, a, b",
+        [
+            "Sort",
+            "  Sort Key: a, ((a * 2)), b",
+            "  ->  Seq Scan on e",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (RP-1066): the primary key returns `a`
+    # in order, so there is no Sort.
+    "an order by on a primary key a computed entry reads is an index scan": (
+        "RP-1066",
+        _ANALYSED,
+        "explain select a+1 from k order by a",
+        ["Index Only Scan using k_pkey on k  (cost=0.28..45.77 rows=1000 width=8)"],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-1066): the
+    # Sort under a DISTINCT's Unique sorts on the ORDER BY then every
+    # other DISTINCT column.
+    "a distinct sorted on a prefix sorts on every distinct column": (
+        "RP-1126",
+        _ANALYSED,
+        "explain (costs off) select distinct b, a+1 from e order by b",
+        [
+            "Unique",
+            "  ->  Sort",
+            "        Sort Key: b, ((a + 1))",
+            "        ->  Seq Scan on e",
         ],
     ),
     # Priced since RP-1036.
