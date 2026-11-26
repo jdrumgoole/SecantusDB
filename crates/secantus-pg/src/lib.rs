@@ -9010,7 +9010,7 @@ impl PgHandler {
                             }
                             _ => 0.0,
                         };
-                        ix.correlation = if ix.columns.len() > 1 { c * 0.75 } else { c };
+                        ix.correlation = Some(if ix.columns.len() > 1 { c * 0.75 } else { c });
                         // An index holding every column read is scanned
                         // index-only, skipping the pages all-visible.
                         if allvisfrac > 0.0 {
@@ -10719,7 +10719,7 @@ impl PgHandler {
                 pages,
                 height,
                 columns: fields.clone(),
-                correlation: 0.0,
+                correlation: Some(0.0),
                 visible: 0.0,
                 tuples: None,
                 predicate: None,
