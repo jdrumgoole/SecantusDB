@@ -1195,36 +1195,6 @@ one beside it.
 
 ## Found while fixing the RP-911 latency test's noise (2026-11-19)
 
-- [ ] **OPEN — the first catalog query after a `CREATE TABLE` still grows
-      with the schema: 9% at 3,200 tables locally, 15-20% on CI (debug
-      build).** psql's `\d` collation query, run straight after a `CREATE
-      TABLE`. PostgreSQL 15.19 takes the same time at any size: DDL
-      invalidates only the cache entries it changed (`inval.c`) and its
-      scans read one relation's rows by index. Before 2026-11-25 it was
-      13.7 ms with no other table against 16.4 ms with 3,200 (arm64 macOS);
-      the planner's tables are now republished from what a commit changed
-      rather than by walking every definition (`SpecialTables`, sorted
-      shared definitions, 6711f3618), and locally that pair is 13.1 ms
-      against 14.3 ms, right at the regression test's bound (a tenth plus
-      1 ms). CI's runner then failed it on two snapshots in a row: 25.3 ms
-      against 31.4 ms (ratio median 1.22; PR #2998 at `432c8ec3e`, run
-      45711355695) and 27.5 ms against 32.3 ms (1.14, rounds 0.94 to 1.24;
-      PR #2998 at `02490b0b0`, run 45718185237), where it passed once on
-      #2996. So about 1.2 ms of growth is left locally and about 5 ms on
-      CI. The walks the 2026-11-19 sample named and 6711f3618 did not take
-      out are where to look first: `publish_user_types` -> `index_relations`
-      -> `derive_index_relations` (every table's columns) and
-      `catalog_rows_keyed` -> `build_catalog_rows`; profile 0 against 8,000
-      tables before changing one.
-      The pair decides nothing on CI at this bound: reopened as its gap
-      test, it then passed (PR #2998 at `916946abe`, run 45721708475,
-      FIXED?), so in four hours it failed twice and passed twice there. It
-      stays a gap test of this item that the verifier does not count,
-      until RP-1100 settles what a ratio test holds to on CI's runner or
-      the growth is gone by a margin no runner closes.
-      Verify: none -- a latency budget at its bound on CI's runner (2 failed, 2 passed, 2026-11-25); tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth measures it
-      Backlog-ID: RP-1073
-
 - [ ] **A table a `CREATE TABLE` has just made is sometimes not there for
       the next statement on the same connection.** Found while gating
       RM-756 (2026-11-25, debug `secantusd-pg`, arm64 macOS): in
@@ -3465,6 +3435,26 @@ statement is VALUES-only and runs there as written. The gap test is in
 
 ## Found while working RP-971 (2026-11-17)
 
+
+## Found while working RP-1073 (2026-11-26)
+
+- [ ] **Each `CREATE TABLE` inside a transaction block costs more than the
+      one before it.** Ten in one `BEGIN` ... `COMMIT` took a debug
+      `secantusd-pg` 4.3 s against 0.7 s for the same ten in autocommit,
+      and twenty 14.2 s against 1.2 s (arm64 macOS, 2026-11-26, an empty
+      schema): the cost grows with the square of the block's statements.
+      A multi-statement simple query, which runs as one implicit block, is
+      the same (twenty in one string, 14.2 s). PostgreSQL 15.20 on a
+      private cluster takes the same time either way (317 ms against
+      266 ms for ten, 82 ms against 62 ms for twenty, with fsync): a
+      statement in the block reads its own transaction's catalog rows
+      through the same caches and indexes. Every migration tool that wraps
+      its DDL in a transaction (Alembic, Django) pays it. Not yet
+      profiled: the in-block reads bypass the committed catalog's shared
+      copies (`block_wrote_catalog`, `in_open_transaction`), which is the
+      first place to look.
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_ten_create_tables_in_one_block_cost_what_they_do_one_at_a_time
+      Backlog-ID: RP-1112
 
 ## The storage model is not mongod's (tasks/mongod-storage-model-plan.md, 2026-11-19)
 

@@ -4225,7 +4225,7 @@ impl PgHandler {
             return Some(view);
         }
         let defs = self.shared_table_defs().ok()?;
-        if let Some(def) = defs.iter().find(|d| d.name == key) {
+        if let Some(def) = self.table_def_named(&defs, &key) {
             let oid = self.relation_oid(&key)?;
             let mut columns = Vec::new();
             for (i, c) in def.columns.iter().enumerate() {

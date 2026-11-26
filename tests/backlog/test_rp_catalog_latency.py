@@ -306,7 +306,7 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a
     )
 
 
-@pytest.mark.backlog("RP-1073")
+@pytest.mark.backlog_fixed("RP-1073")
 def test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth(
     pg_pair: tuple[Any, Any],
 ) -> None:
@@ -328,9 +328,18 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_
     committed version and patched from what a commit changed, as
     PostgreSQL rebuilds only the cache entries an invalidation names. Then
     13.1 ms against 14.3 ms (1.10, 2026-11-25), at the bound; CI's
-    runner measured 1.22 and 1.14 on two snapshots in a row, then passed,
-    so RP-1073 stays open for the growth that is left with `Verify: none`:
-    at this bound the pair does not decide on CI (RP-1100).
+    runner measured 1.22 and 1.14 on two snapshots in a row, then passed.
+    Most of what was left came from mongod's storage model: a full read
+    of the table catalog returns its documents in RecordId order, so on
+    any schema whose names were not created in sorted order the version
+    had no sorted `_id`s, the patch of the definitions a commit changed
+    (RP-911) and the binary search by name never ran, and each version
+    re-read every definition and built a set of every name. The version
+    now keeps a sorted index of the names beside the definitions, patched
+    from what a commit changed, and the partitioned, partition and temp
+    tables, `cr_relation_in`'s table and the composite index by oid are
+    found through it or patched the same way. Then 14.1 ms against
+    14.4 ms (a ratio median of 1.02, rounds 1.01 to 1.04, 2026-11-26).
 
     The same bound as at 800 tables, a tenth again plus 1 ms, with four
     times as many tables."""
@@ -487,4 +496,44 @@ def test_the_first_catalog_query_after_ddl_over_two_user_types_costs_the_same_at
     pairs = _paired(small, large, _first_over_columns("a rp_e1, b rp_e2"), "rp_te")
     assert _median_excess(pairs, 1.5) < 0.005, _describe(
         pairs, "first query after DDL", GROWTH_TABLES
+    )
+
+
+def _creates(conn: Any, prefix: str, tables: int, block: bool) -> float:
+    """`tables` `CREATE TABLE`s, inside one `BEGIN` ... `COMMIT` or each
+    in autocommit."""
+    start = time.monotonic()
+    if block:
+        with conn.transaction():
+            for i in range(tables):
+                conn.execute(f"CREATE TABLE {prefix}_{i} (a int, b text)")
+    else:
+        for i in range(tables):
+            conn.execute(f"CREATE TABLE {prefix}_{i} (a int, b text)")
+    return time.monotonic() - start
+
+
+@pytest.mark.backlog("RP-1112")
+def test_ten_create_tables_in_one_block_cost_what_they_do_one_at_a_time(pg: Any) -> None:
+    """A migration tool (Alembic, Django) runs its DDL inside one
+    transaction block. PostgreSQL 15.20 takes the same time for ten
+    `CREATE TABLE`s inside one `BEGIN` ... `COMMIT` as for ten in
+    autocommit (private cluster, 2026-11-26: 317 ms against 266 ms for
+    ten, 82 ms against 62 ms for twenty, with fsync): a statement in the
+    block reads its own transaction's catalog rows through the same
+    caches and indexes. A debug `secantusd-pg` on arm64 macOS took 4.3 s
+    for ten in a block against 0.7 s in autocommit, and 14.2 s against
+    1.2 s for twenty (2026-11-26): each DDL in the block costs more than
+    the one before it, so a block's cost grows with the square of its
+    statements.
+
+    Ten in a block within twice ten in autocommit plus 50 ms, the fastest
+    of three of each, interleaved."""
+    block = autocommit = float("inf")
+    for t in range(3):
+        block = min(block, _creates(pg, f"rp_blk_b{t}", 10, True))
+        autocommit = min(autocommit, _creates(pg, f"rp_blk_a{t}", 10, False))
+    assert block < 2 * autocommit + 0.05, (
+        f"ten CREATE TABLEs: {block * 1000:.0f} ms in one block, "
+        f"{autocommit * 1000:.0f} ms in autocommit"
     )
