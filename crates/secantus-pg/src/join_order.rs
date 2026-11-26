@@ -220,6 +220,13 @@ struct Search {
     /// only), and only a backward index scan, or a nested loop over one,
     /// is in the query's order.
     merge_asc: bool,
+    /// The classes of the ORDER BY's descending keys after its first that
+    /// are pathkeys of their own (`key_ec`), each with its key's table when
+    /// that id is an outer join's clause's (two one-member classes, the
+    /// key's and the other side's). A class's ascending order is then the
+    /// wrong direction for merging (`right_merge_direction` reads every
+    /// query pathkey) and of no use for the ORDER BY.
+    later_desc: Vec<(usize, Option<usize>)>,
     /// Each edge's outer join (`Search::edges` order): the preserved table
     /// of a LEFT join, `usize::MAX` for a FULL join, `None` for an inner
     /// join's clause. An outer join's clause moves only into a scan of its
@@ -1003,6 +1010,7 @@ impl PgHandler {
                 order_desc: false,
                 order_nulls_first: false,
                 merge_asc: false,
+                later_desc: Vec::new(),
                 edge_outer,
                 general: false,
                 param_keys: Vec::new(),
@@ -1310,6 +1318,7 @@ impl PgHandler {
                 search.aliases.iter().position(|a| a == alias_of(key))
             });
             let order_desc = search.order_desc;
+            let later_desc = search.later_desc.clone();
             let useful = move |c: usize| {
                 // An order of the ORDER BY's class that is not its pathkey
                 // (NULLS LAST under ASC NULLS FIRST, a backward scan's DESC
@@ -1319,6 +1328,7 @@ impl PgHandler {
                     secantus_pgplan::joincost::ASC_KEYS | secantus_pgplan::joincost::BACK_KEYS;
                 let asc = c != secantus_pgplan::joincost::USELESS_KEYS && c & flags != 0;
                 let ascending = asc && c & secantus_pgplan::joincost::ASC_KEYS != 0;
+                let backward = asc && c & secantus_pgplan::joincost::BACK_KEYS != 0;
                 let c = if asc { c & !flags } else { c };
                 // An ascending order of a class the query's pathkeys read
                 // descending is the wrong direction for merging
@@ -1331,6 +1341,18 @@ impl PgHandler {
                     && order_desc
                     && Some(c) == order_class
                     && order_outer_t.is_none_or(|t| set & (1 << t) != 0)
+                {
+                    return false;
+                }
+                // The same for a later descending key's class: a merge on it
+                // sorts ascending (`select_outer_pathkeys_for_merge` takes
+                // the query's pathkeys only when every one is the merge's),
+                // and `right_merge_direction` finds that key's DESC.
+                if !backward
+                    && Some(c) != order_class
+                    && later_desc
+                        .iter()
+                        .any(|&(l, lt)| l == c && lt.is_none_or(|t| set & (1 << t) != 0))
                 {
                     return false;
                 }
@@ -1951,7 +1973,7 @@ impl PgHandler {
         node: &JoinNode,
         limit: Option<(usize, usize)>,
         order: Option<(&str, bool, bool)>,
-        later: &[String],
+        later: &[(String, bool)],
     ) -> PgWireResult<Option<Vec<Document>>> {
         if order.is_some() && limit.is_none() {
             return Ok(None);
@@ -1975,7 +1997,7 @@ impl PgHandler {
         node: &JoinNode,
         limit: Option<(usize, usize)>,
         order: Option<(&str, bool, bool)>,
-        later: &[String],
+        later: &[(String, bool)],
         general: bool,
     ) -> PgWireResult<Option<Vec<Document>>> {
         let spanning_modelled = if limit.is_some() {
@@ -2009,9 +2031,12 @@ impl PgHandler {
                 search.order_desc = desc;
                 search.order_nulls_first = nulls_first;
                 if !later.is_empty() {
-                    let Some(n) = self.later_order_keys_modelled(&search, key, class, later) else {
+                    let names: Vec<String> = later.iter().map(|(k, _)| k.clone()).collect();
+                    let Some(n) = self.later_order_keys_modelled(&search, key, class, &names)
+                    else {
                         return Ok(None);
                     };
+                    search.later_desc = Self::later_desc_classes(&search, key, class, later);
                     // A merge join takes the query's pathkeys only when every
                     // ORDER BY key is one of its clauses' classes
                     // (`select_outer_pathkeys_for_merge`); with another key
@@ -2128,6 +2153,26 @@ impl PgHandler {
                             *cs += 1;
                         }
                         i += 2;
+                    }
+                }
+            }
+            // An index scan in a later descending key's class: its forward
+            // scan's ascending order is the wrong direction for merging
+            // (`right_merge_direction`) and of no use for the ORDER BY, so
+            // `truncate_useless_pathkeys` leaves it none, and the backward
+            // scan's DESC NULLS FIRST, of use for merging, replaces it at
+            // the same cost (`build_index_paths`). A merge with it outer runs
+            // descending (`match_unsorted_outer`).
+            for (t, (list, _, _)) in base_lists.iter_mut().enumerate() {
+                for (i, (path, _)) in list.iter_mut().enumerate() {
+                    let Some(c) = path.class else { continue };
+                    if search
+                        .later_desc
+                        .iter()
+                        .any(|&(l, lt)| l == c && lt.is_none_or(|l| l == t))
+                    {
+                        path.class = Some(secantus_pgplan::joincost::back_keys(c));
+                        base_backward[t][i] = true;
                     }
                 }
             }
@@ -2291,6 +2336,39 @@ impl PgHandler {
                 .all(|ix| ix.get_document("key").is_ok_and(|k| k.len() == 1))
         });
         single.then_some(kept)
+    }
+
+    /// [`Search::later_desc`]: the class of each of `later`'s descending
+    /// keys that is a pathkey of its own (as
+    /// [`PgHandler::later_order_keys_modelled`] counts them), with that
+    /// key's table when the class is an outer join's clause's id.
+    fn later_desc_classes(
+        search: &Search,
+        key: &str,
+        class: usize,
+        later: &[(String, bool)],
+    ) -> Vec<(usize, Option<usize>)> {
+        let outer_id = |c: usize| {
+            c.checked_sub(2)
+                .is_some_and(|i| search.edge_outer.get(i).is_some_and(Option::is_some))
+        };
+        let mut out = Vec::new();
+        for (k, desc) in later {
+            if !desc || k == key {
+                continue;
+            }
+            let Some(t) = search.aliases.iter().position(|a| a == alias_of(k)) else {
+                continue;
+            };
+            let Some(c) = search.key_ec(t, k) else {
+                continue;
+            };
+            if c == class && !outer_id(class) {
+                continue;
+            }
+            out.push((c, outer_id(c).then_some(t)));
+        }
+        out
     }
 
     /// `estimate_num_groups` over the first member of the ORDER BY's first

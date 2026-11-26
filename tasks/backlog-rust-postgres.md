@@ -879,19 +879,26 @@ one beside it.
     `--desc-nulls-last` 1,665 of 1,665 each, `--desc --then m0.c` and
     `--then "m1.c desc, m0.b"` 810 of 810 (1 and 2 differences before),
     `--desc-nulls-last --then m1.c` 810 of 810 (7), `--then "m0.c desc"`
-    793 (21), no shape worse. Those 17 left are four- and five-table
-    stars with a LEFT join (one inner), the same rule for a LATER key:
-    `right_merge_direction` reads every query pathkey, so an ascending
-    order of a later DESC key's class is the wrong direction too (checked
-    on `multi4/20/plain/star_cb/lastleft/ordlastlim5`: the t0/t1 merge on
-    t0.c read presorted under the Merge Right Join). The search's `later`
-    keys carry no direction (`four_table_join`, `ordered_limit_searched`).
-    Declined still: a later key a
-    WHERE may fix to a constant; a table with an index of several columns;
-    and a two-table join with a subquery side.
+    793 (21), no shape worse. Since 2026-11-26 the same holds for a
+    descending key AFTER the first (`right_merge_direction` reads every
+    query pathkey): the search's later keys carry their direction
+    (`Search::later_desc`), a join's ascending order of such a key's class
+    is truncated, and an index scan in it is the backward one, of use for
+    merging (`build_index_paths`). On a private 15.20: `--desc-nulls-last
+    --then "m0.c desc"` 810 of 810 (793), `--then "m0.c, m1.b desc"` 810
+    (809), `--desc --then "m0.c desc"` 810 (793), `--then "m0.c desc"`
+    810 (794), and 810 of 810 each for `--desc --then m0.c`, `--desc
+    --then "m1.c desc, m0.b"`, `--then "m1.c desc"`,
+    `--desc-nulls-last --then m1.c` and
+    `--nulls-first --then "m1.c desc, m0.b"`. Declined still, and wrong
+    where ties decide (19 of 52 such shapes of four tables at 20 and 300
+    rows differ, measured 2026-11-26): a later key a WHERE fixes to a
+    constant (`ec_has_const`); a table with an index of several columns,
+    whose scan is in the order of more than one key; and a two-table join
+    with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_four_table_star_left_join_desc_nulls_last_then_desc
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_four_table_star_desc_then_a_key_the_where_fixes, tests/backlog/test_rust_postgres_gaps.py::test_a_four_table_chain_order_by_two_keys_over_a_two_column_index
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
@@ -3788,7 +3795,12 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       the module's tests errored at setup as `REGRESSED`. Not reproduced:
       the module alone passed (32 in 138 s), the step's full rerun had no
       start failure, and 24 fresh starts eight at a time took 7.8-9.5 s
-      each (a lone debug start is about 4.2 s). Not yet known: whether the
+      each (a lone debug start is about 4.2 s). Again on 2026-11-26, in
+      the backlog step of another lane's `gate_pg.sh --fast` (RP-028's,
+      load average about 2.6): `tests/backlog/test_rp_found_rp921.py`'s
+      module server gave `''` for its first line, so its 6 tests were
+      `REGRESSED`; the module alone passed (6 in 105 s), and the same
+      commit's gate before a rebase had no start failure. Not yet known: whether the
       server stalled (a lock, a WiredTiger create waiting on a checkpoint)
       or was starved, since the harness keeps no stack or timing of a
       start it gives up on. The harness should sample the child

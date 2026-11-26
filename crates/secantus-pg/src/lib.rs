@@ -471,13 +471,14 @@ thread_local! {
     /// With `GENERAL_JOIN_LIMIT`, the joined-row key of the ORDER BY's
     /// first column over the join (a plain column; descending, and NULLs
     /// against the direction's default), and the joined-row keys of its
-    /// plain columns after it, which only the join order search plans for
+    /// plain columns after it (each descending or not), which only the
+    /// join order search plans for
     /// (`four_table_join`); and, once it has, how many of the ORDER BY's
     /// keys the plan it picked returns its rows in the order of already
     /// (`usize::MAX` for all), so that the select runs no Sort of its own,
     /// or an Incremental Sort (`create_ordered_paths`).
     #[allow(clippy::type_complexity)]
-    static GENERAL_JOIN_ORDER: std::cell::RefCell<Option<(String, bool, bool, Vec<String>)>> =
+    static GENERAL_JOIN_ORDER: std::cell::RefCell<Option<(String, bool, bool, Vec<(String, bool)>)>> =
         const { std::cell::RefCell::new(None) };
     static GENERAL_JOIN_PRESORTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -41678,7 +41679,10 @@ impl PgHandler {
                         // NULLs against the default: first in the ascending
                         // comparator a descending order reverses.
                         let nulls_first = matches!(k.nulls, secantus_pgplan::Nulls::First);
-                        let later = later.iter().map(|k| k.field.clone()).collect();
+                        let later = later
+                            .iter()
+                            .map(|k| (k.field.clone(), !k.ascending))
+                            .collect();
                         Some((
                             k.field.clone(),
                             !k.ascending,
