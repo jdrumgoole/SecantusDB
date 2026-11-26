@@ -16,9 +16,11 @@
 use bson::{doc, Bson, Document};
 
 pub const CATALOG_COLLECTION: &str = "__sql_catalog__";
-/// Where sequence state lives: one document per sequence, keyed by name, in
-/// the shape the Python server writes (`last_value` / `is_called` are the two
-/// `nextval` reads and moves).
+/// The sequences' catalog (`pg_sequence`, with each one's `pg_class` name and
+/// owner): one document per sequence, keyed by name. A sequence's STATE
+/// (`last_value` / `log_cnt` / `is_called`, what `nextval` reads and moves)
+/// is not here but in the sequence's own relation, `__sql_seq_<oid>__`, as
+/// PostgreSQL keeps it in the sequence's own file (RP-1076).
 pub const SEQUENCE_COLLECTION: &str = "__sql_sequences__";
 
 /// The sequence document for a fresh `serial` column, owned by `owned_by`

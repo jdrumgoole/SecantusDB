@@ -29,7 +29,7 @@ use crate::{Result, StorageError};
 /// The layout version this build writes and reads. Every change to the
 /// on-disk layout moves it on (each phase of the storage-model plan does),
 /// and a store at any other version is refused.
-pub const STORE_FORMAT_VERSION: u32 = 12;
+pub const STORE_FORMAT_VERSION: u32 = 13;
 
 /// The file holding [`STORE_FORMAT_VERSION`] in a SecantusDB-written store.
 pub const FORMAT_FILE: &str = "secantus.format";
@@ -580,7 +580,11 @@ mod tests {
     }
 
     #[test]
-    fn the_previous_layouts_are_refused_and_this_one_is_format_12() {
+    fn the_previous_layouts_are_refused_and_this_one_is_format_13() {
+        // Format 12 kept every PostgreSQL sequence's state (`last_value`,
+        // `is_called`) in its row of the shared `__sql_sequences__`; format
+        // 13 keeps it in the sequence's own relation, `__sql_seq_<oid>__`,
+        // as PostgreSQL keeps it in the sequence's file (RP-1076).
         // Format 11 kept users and roles in `secantus_users` /
         // `secantus_roles`; format 12 keeps them in `admin.system.users` /
         // `admin.system.roles`, as mongod does (RM-744).
@@ -603,15 +607,15 @@ mod tests {
         // bytes and the clean-close marker in this server's own table.
         // Format 6 held a document in its table as `[id_key length][id_key]
         // [BSON]`; format 7 stores the document alone, as mongod does.
-        assert_eq!(STORE_FORMAT_VERSION, 12);
-        for old in ["4", "5", "6", "7", "8", "9", "10", "11"] {
+        assert_eq!(STORE_FORMAT_VERSION, 13);
+        for old in ["4", "5", "6", "7", "8", "9", "10", "11", "12"] {
             let dir = tempfile::tempdir().unwrap();
             fs::write(dir.path().join("WiredTiger.wt"), b"").unwrap();
             fs::write(dir.path().join(STORAGE_BSON), mongod_storage_bson()).unwrap();
             fs::write(dir.path().join(FORMAT_FILE), format!("{old}\n")).unwrap();
             let err = prepare(dir.path()).unwrap_err().to_string();
             assert!(err.contains(&format!("store format {old}")), "{err}");
-            assert!(err.contains("format 12 only"), "{err}");
+            assert!(err.contains("format 13 only"), "{err}");
         }
     }
 }
