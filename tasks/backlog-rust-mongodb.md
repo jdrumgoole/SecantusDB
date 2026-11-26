@@ -2777,7 +2777,12 @@ touched:
   their own passed, at load 18. A later RM gate that day (RM-515) saw
   mongod answer two with no queue, as on 2026-11-08; three runs on their
   own passed. So did the RM-533 gate of 2026-11-14 (load average up to
-  32), and again three runs on their own passed. The test depends on six connects landing within one
+  32), and again three runs on their own passed. The first CI occurrence
+  known was on pg-batch snapshot PR #3036 (2026-11-26, head 224a8b6f, run
+  45834896035, job `mdb-binary (backlog)` 139961032166, a PG explain
+  change only): with `maxQueueDepth` 2, this server answered its third
+  connection after a wait that rounded to 3 seconds, mongod after 2, the
+  2026-11-13 case again. The test depends on six connects landing within one
   second, so it is flaky by construction: it needs a measurement that
   load cannot change (connect all six behind a barrier and record how
   long they took to land, or compare with the answer mongod gives when
