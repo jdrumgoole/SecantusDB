@@ -1276,17 +1276,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-537.
       Verify: tests/backlog/test_rm_found_2026_11_14.py::test_parsed_query_parses_these_leaves_as_mongod
       Backlog-ID: RM-660
-- [ ] **Explain lists a `$match` behind a `$group` or a `$$ROOT.x` new
-      root where mongod's optimizer does not leave it.** mongod 8.2.11 drops
-      a `$match` of nothing behind a `$group` (`{}`, and `{$sampleRate: 1}`,
-      which it parses into nothing), and its query then takes the whole
-      pipeline; it leaves `{$alwaysTrue: 1}` there, which this server moves
-      into the query. It moves a `$match` behind `{$replaceRoot: {newRoot:
-      "$$ROOT.x"}}` into the query renamed onto `x`, as behind `"$x"`
-      (RM-536), which this server leaves behind the stage. Found 2026-11-14
-      working RM-538.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm538.py::test_a_match_after_a_group_as_the_optimizer_leaves_it, tests/backlog/test_rm_found_2026_11_14_rm538.py::test_a_match_moves_ahead_of_a_root_variable_new_root
-      Backlog-ID: RM-662
 - [ ] **A `$lookup` over a collection reports nothing it examined.** At
       `executionStats` mongod 8.2.11 gives a `$lookup` whose pipeline reads
       a collection its `totalDocsExamined`, `totalKeysExamined`,

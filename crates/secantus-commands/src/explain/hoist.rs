@@ -102,8 +102,13 @@ fn new_root_path(stage: &Bson) -> Option<&str> {
         (_, Some(Bson::String(root))) => root.as_str(),
         _ => return None,
     };
-    root.strip_prefix('$')
-        .filter(|p| !p.is_empty() && !p.starts_with('$'))
+    // `$$ROOT.x` and `$$CURRENT.x` read the same field as `$x` (measured
+    // 8.2.11, RM-662: a `$match` behind `$$ROOT.x` moves renamed onto `x`).
+    let path = ["$$ROOT.", "$$CURRENT."]
+        .iter()
+        .find_map(|v| root.strip_prefix(v))
+        .or_else(|| root.strip_prefix('$'))?;
+    Some(path).filter(|p| !p.is_empty() && !p.starts_with('$'))
 }
 
 /// A stage that turns each document into one other (mongod's
@@ -1187,6 +1192,12 @@ fn hoist(pipeline: &[Bson]) -> Vec<Bson> {
             || as_sort(s).is_some()
             || transforms_one_by_one(s)
     };
+    let written_constant = |k: &str| {
+        pipeline
+            .iter()
+            .filter_map(as_match)
+            .any(|m| m.contains_key(k))
+    };
     'again: loop {
         for at in 1..out.len() {
             if !out[..at].iter().all(leading) {
@@ -1225,6 +1236,14 @@ fn hoist(pipeline: &[Bson]) -> Vec<Bson> {
                 out[at - 1] = Bson::Document(doc! { PUSHED_MATCH: moved });
                 continue 'again;
             }
+            // A `$match` of nothing goes (`{}`, or a `$sampleRate` of 1
+            // parsed into nothing): measured 8.2.11 behind a `$group` and
+            // a `$set`, RM-662;
+            // one behind a `$replaceRoot` moves ahead of it (RM-414).
+            if m.is_empty() {
+                out.remove(at);
+                continue 'again;
+            }
             // A rewritten `$match` stays one as it moves on.
             let key = if pushed { PUSHED_MATCH } else { "$match" };
             // A `$match` behind a `$sort` goes ahead of it (measured 8.2.11:
@@ -1256,7 +1275,16 @@ fn hoist(pipeline: &[Bson]) -> Vec<Bson> {
                     kept: names,
                     renamed,
                 } => through_projection(k, v, names, renamed),
-                Reshape::Groups { renamed, .. } => through_projection(k, v, &[], renamed),
+                // A written `$alwaysTrue` / `$alwaysFalse` stays behind a
+                // `$group`; the `$alwaysFalse` a `$sampleRate` of 0 parses
+                // into moves (measured 8.2.11, RM-662).
+                Reshape::Groups { renamed, .. } => {
+                    if matches!(k, "$alwaysTrue" | "$alwaysFalse") && written_constant(k) {
+                        None
+                    } else {
+                        through_projection(k, v, &[], renamed)
+                    }
+                }
             };
             let mut moved = Vec::new();
             let mut kept = Vec::new();
@@ -1525,6 +1553,38 @@ mod tests {
             runnable(moved),
             vec![doc! { "$match": filter }.into(), over_x]
         );
+    }
+
+    /// `$$ROOT.x` is the field `x`: a `$match` behind it moves as behind
+    /// `"$x"` (measured 8.2.11, RM-662).
+    #[test]
+    fn a_match_moves_ahead_of_a_root_variable_new_root() {
+        let m = Bson::from(doc! { "$match": { "a": 1 } });
+        for root in ["$$ROOT.x", "$$CURRENT.x"] {
+            let stage = Bson::from(doc! { "$replaceRoot": { "newRoot": root } });
+            let moved = hoist_matches(&[stage.clone(), m.clone()]);
+            assert_eq!(moved.len(), 2, "{root}");
+            assert!(super::is_pushed(&moved[0]), "{root}");
+            assert_eq!(moved[1], stage);
+        }
+    }
+
+    /// Behind a `$group`, a `$match` of nothing goes and `$alwaysTrue`
+    /// stays (measured 8.2.11, RM-662).
+    #[test]
+    fn a_match_behind_a_group_as_the_optimizer_leaves_it() {
+        let group = Bson::from(doc! { "$group": { "_id": "$a" } });
+        for empty in [doc! {}, doc! { "$sampleRate": 1 }] {
+            let m = Bson::from(doc! { "$match": empty });
+            assert_eq!(hoist_matches(&[group.clone(), m]), vec![group.clone()]);
+        }
+        let set = Bson::from(doc! { "$set": { "c": 1 } });
+        assert_eq!(
+            hoist_matches(&[group.clone(), set.clone(), doc! { "$match": {} }.into()]),
+            vec![group.clone(), set]
+        );
+        let t = Bson::from(doc! { "$match": { "$alwaysTrue": 1 } });
+        assert_eq!(hoist_matches(&[group.clone(), t.clone()]), vec![group, t]);
     }
 
     /// mongod 8.2.11 drops a `$replaceRoot` / `$replaceWith` of the document
