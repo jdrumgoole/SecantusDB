@@ -62,12 +62,12 @@ def test_a_natural_sort_is_recorded_as_a_hint(own_servers: Any) -> None:
     assert _keys(ours, command) == _keys(theirs, command)
 
 
-@pytest.mark.backlog("RM-644")
+@pytest.mark.backlog_fixed("RM-644")
 def test_a_hybrid_search_names_the_collection_it_unions(own_servers: Any) -> None:
     """mongod 8.2.11 lists the `$unionWith` a `$rankFusion` desugars its
     second input pipeline into among the key's `otherNss` -- the
-    aggregate's own collection. This server walks the pipeline as written,
-    which names no other namespace, and prints no `otherNss`."""
+    aggregate's own collection. This server walked the pipeline as written,
+    which names no other namespace, and printed no `otherNss`."""
     ours, theirs = own_servers
     command = SON(
         [

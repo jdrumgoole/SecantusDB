@@ -1225,15 +1225,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       have, mongod's `otherNss` order is its hash set's, and the rest is
       unmeasured: a probe must find a difference before a test can assert it
       Backlog-ID: RM-532
-- [ ] **A hybrid search's key names no `otherNss`.** mongod 8.2.11 lists
-      the collection of the `$unionWith` a `$rankFusion` (or
-      `$scoreFusion`) desugars its later input pipelines into under the
-      key's `otherNss`, the aggregate's own collection, and hashes the key
-      with it. This server walks the pipeline as written, finds no other
-      namespace, and prints none: the entry's `keyHash` differs. Found
-      2026-11-14 working RM-532.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm532.py::test_a_hybrid_search_names_the_collection_it_unions
-      Backlog-ID: RM-644
 - [ ] **A run-time error names the stored document, not the one the read
       projected.** mongod 8.2.11 reads only the fields a pipeline depends
       on, and an expression's error names that projection:
@@ -3025,6 +3016,25 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       writes two separate inserts.
       Backlog-ID: RM-727
       Verify: none -- PITR restore is this server's own tool, with no mongod counterpart to compare; reproduce with the test above using insert_many
+
+- [ ] **RM-808's `[killed]` test kills mongod before its store can be
+      opened by anyone.** `test_secantus_opens_a_standalone_mongod_store_in_both_modes[killed]`
+      SIGKILLs mongod right after `create_index` returns. Under load (the
+      gate's backlog step at `-n 4`, about one run in three) mongod has not
+      yet checkpointed: the catalog still holds `v_1` unfinished, and
+      `secantusd-mdb` refuses with `app.c's index v_1 is unfinished and
+      names no build UUID` (the test sees only `did not start: ''`).
+      mongod 8.2.11 cannot open that store either: it logs "Dropping
+      unfinished index" and stops on fatal assertion 40652 (no
+      featureCompatibilityVersion document). The test needs to wait for a
+      checkpoint before the kill (for example `fsync`), and the fixture to
+      print what the server said. Separately, mongod drops an unfinished
+      index that has no build UUID where this server refuses the store; the
+      next probe should decide whether that is a second item. Found
+      2026-11-26 in RM-644's gate.
+      Verify: none -- a test-timing race; reproduce with four parallel
+      runs of `tests/backlog/test_rm_storage_model.py` at `-n 4`
+      Backlog-ID: RM-812
 
 - [ ] **`explain` of a clustered collection names `IXSCAN` on `_id_`, where mongod
       names `EXPRESS_CLUSTERED_IXSCAN` / `CLUSTERED_IXSCAN`.** On a collection
