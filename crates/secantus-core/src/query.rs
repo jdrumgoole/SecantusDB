@@ -391,23 +391,7 @@ fn match_clause(
         // mongod rewrites `{$sampleRate: p}` to `{$expr: {$lt: [{$rand: {}},
         // p]}}`: each document matches with probability p, drawn afresh
         // (measured 8.2.11, 2026-10-22).
-        "$sampleRate" => {
-            let p = match cond {
-                Bson::Decimal128(d) => d.to_string().parse::<f64>().ok(),
-                Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) => {
-                    crate::numeric::as_float_like(cond)
-                }
-                _ => None,
-            }
-            .ok_or_else(|| Fallback::mongo(2, "argument to $sampleRate must be a numeric type"))?;
-            if !(0.0..=1.0).contains(&p) {
-                return Err(Fallback::mongo(
-                    2,
-                    "numeric argument to $sampleRate must be in [0, 1]",
-                ));
-            }
-            Ok(rand::random::<f64>() < p)
-        }
+        "$sampleRate" => Ok(rand::random::<f64>() < sample_rate(cond)?),
         // `$alwaysTrue: 1` / `$alwaysFalse: 1`; any other value is refused.
         "$alwaysTrue" | "$alwaysFalse" => {
             // Any number equal to 1, a Decimal128 included (measured 8.2.11,
@@ -3581,4 +3565,42 @@ mod nested_in_tests {
             assert_eq!(check(filter.clone()), None, "{filter:?}");
         }
     }
+}
+
+/// The probability a `{$sampleRate: p}` stands for, or mongod 8.2.11's
+/// refusal of it (BadValue), which it gives when it parses the filter.
+pub fn sample_rate(cond: &Bson) -> Result<f64, Fallback> {
+    let p = match cond {
+        Bson::Decimal128(d) => d.to_string().parse::<f64>().ok(),
+        Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) => crate::numeric::as_float_like(cond),
+        _ => None,
+    }
+    .ok_or_else(|| Fallback::mongo(2, "argument to $sampleRate must be a numeric type"))?;
+    if !(0.0..=1.0).contains(&p) {
+        return Err(Fallback::mongo(
+            2,
+            "numeric argument to $sampleRate must be in [0, 1]",
+        ));
+    }
+    Ok(p)
+}
+
+/// Refuse each `$sampleRate` in `filter` (under `$and` / `$or` / `$nor`
+/// too) that mongod refuses to parse, before a document is read: over no
+/// documents, as an `explain` runs, the matcher never meets it (RM-663).
+pub fn check_sample_rates(filter: &Document) -> Result<(), Fallback> {
+    for (k, v) in filter {
+        match (k.as_str(), v) {
+            ("$sampleRate", rate) => {
+                sample_rate(rate)?;
+            }
+            ("$and" | "$or" | "$nor", Bson::Array(cs)) => {
+                for c in cs.iter().filter_map(Bson::as_document) {
+                    check_sample_rates(c)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }

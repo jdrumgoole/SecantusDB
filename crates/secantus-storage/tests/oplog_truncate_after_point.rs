@@ -42,6 +42,20 @@ fn open(home: &Path, opts: &StorageOptions) -> Storage {
     Storage::open_with_options(home.to_str().unwrap(), opts).unwrap()
 }
 
+/// A store with a replica-set configuration is a member's, and only a member
+/// moves the truncate point (a standalone's stays null, as mongod's does,
+/// RM-806): write one, and the journaled wait that follows notices it.
+fn become_a_member(st: &Storage) {
+    st.insert(
+        "local",
+        "system.replset",
+        vec![enc(&doc! {"_id": "rs0"})],
+        true,
+    )
+    .unwrap();
+    st.flush_journal().unwrap();
+}
+
 fn enc(d: &Document) -> Vec<u8> {
     bson::to_vec(d).unwrap()
 }
@@ -100,6 +114,7 @@ fn recovery_truncates_after_the_point_and_clears_it() {
     let opts = options(None);
     if let Ok(home) = std::env::var(CHILD) {
         let st = open(Path::new(&home), &opts);
+        become_a_member(&st);
         st.insert_one("app", "c", &enc(&doc! {"_id": 1})).unwrap();
         // Journaled: the point moves to its entry first.
         st.flush_journal().unwrap();
@@ -152,6 +167,7 @@ fn a_point_below_the_stable_timestamp_truncates_after_the_stable_timestamp() {
     let opts = options(Some(1));
     if let Ok(home) = std::env::var(CHILD) {
         let st = open(Path::new(&home), &opts);
+        become_a_member(&st);
         st.insert_one("app", "c", &enc(&doc! {"_id": 1})).unwrap();
         st.flush_journal().unwrap();
         st.pause_journal_flusher(true);
@@ -208,6 +224,7 @@ fn a_cleared_or_current_point_truncates_nothing() {
     let opts = options(None);
     if let Ok(home) = std::env::var(CHILD) {
         let st = open(Path::new(&home), &opts);
+        become_a_member(&st);
         st.insert_one("app", "c", &enc(&doc! {"_id": 1})).unwrap();
         st.insert_one("app", "c", &enc(&doc! {"_id": 2})).unwrap();
         st.flush_journal().unwrap();
