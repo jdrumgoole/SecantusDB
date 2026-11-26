@@ -488,14 +488,14 @@ def test_a_time_series_expr_read_beside_an_index_of_its_own_buffers_as_mongod(
     assert _after_delete_setup(rust_mongo, _own_index("v"), read) == want
 
 
-@pytest.mark.backlog("RM-701")
+@pytest.mark.backlog_fixed("RM-701")
 def test_a_time_series_read_beside_a_collated_index_scans_it_as_mongod(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """With a collated index `{v: 1}` (`en`), a read under that collation of
     `v < 100` is an index scan over the buckets: mongod 8.2.11 leaves 63
-    after the delete; this server keeps no copy of a collated index over the
-    buckets and filters the buckets it reads, 99."""
+    after the delete; this server kept no copy of a collated index over the
+    buckets and filtered the buckets it read, 99, until it did."""
 
     def read(c: Any) -> Any:
         return c.aggregate(
@@ -510,14 +510,14 @@ def test_a_time_series_read_beside_a_collated_index_scans_it_as_mongod(
     assert _after_delete_setup(rust_mongo, setup, read) == want
 
 
-@pytest.mark.backlog("RM-701")
+@pytest.mark.backlog_fixed("RM-701")
 def test_a_time_series_read_beside_an_exists_partial_index_scans_it_as_mongod(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """With a partial index `{v: 1}` (`v: {$exists: true}`), `v < 100` is an
     index scan over the buckets: mongod 8.2.11 leaves 63 after the delete;
-    this server keeps no copy of a partial index whose filter is not a
-    comparison over the buckets, 99."""
+    this server kept no copy of a partial index whose filter is not a
+    comparison over the buckets, 99, until it did."""
 
     def read(c: Any) -> Any:
         return c.aggregate([{"$match": {"v": {"$lt": 100}}}], batchSize=1)
@@ -530,13 +530,15 @@ def test_a_time_series_read_beside_an_exists_partial_index_scans_it_as_mongod(
     assert _after_delete_setup(rust_mongo, setup, read) == want
 
 
-@pytest.mark.backlog("RM-701")
+@pytest.mark.backlog_fixed("RM-701")
 def test_a_time_series_or_read_over_an_index_of_its_own_scans_it_as_mongod(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """`{$or: [{v: {$lt: 100}}, {v: {$gt: 3900}}]}` beside `{v: 1}` is one
     index scan over the buckets: mongod 8.2.11 leaves 63 after the delete;
-    this server reads the collection whole, 198."""
+    this server read the collection whole, 198, until it planned an
+    `$or` as mongod does (a SUBPLAN of one scan of the buckets when a branch
+    has no bounds, of the index when each has)."""
 
     def read(c: Any) -> Any:
         return c.aggregate(
@@ -546,6 +548,118 @@ def test_a_time_series_or_read_over_an_index_of_its_own_scans_it_as_mongod(
     want = _after_delete_setup(mongod, _own_index("v"), read)
     assert want == 63
     assert _after_delete_setup(rust_mongo, _own_index("v"), read) == want
+
+
+@pytest.mark.backlog_fixed("RM-701")
+@pytest.mark.parametrize(
+    ("index", "match", "options"),
+    [
+        # A collated index serves a read under its collation, and under no
+        # other.
+        ({"collation": {"locale": "en"}}, {"v": {"$lt": 100}}, {}),
+        ({"collation": {"locale": "en"}}, {"v": {"$lt": 100}}, {"locale": "fr"}),
+        ({"collation": {"locale": "en"}}, {"v": 5}, {"locale": "en"}),
+        ({"collation": {"locale": "en"}}, {"v": {"$lt": 100}, "m": {"$lt": 5}}, {"locale": "en"}),
+        # A partial filter of `$exists` is proved against the bucket filter's
+        # `$exists` clauses alone.
+        ({"partialFilterExpression": {"v": {"$exists": True}}}, {"v": {"$exists": True}}, None),
+        (
+            {"partialFilterExpression": {"v": {"$exists": True}}},
+            {"v": {"$exists": True, "$lt": 100}},
+            None,
+        ),
+        ({"partialFilterExpression": {"v": {"$exists": True}}}, {"v": 5}, None),
+        ({"partialFilterExpression": {"v": {"$exists": True}}}, {"w": {"$lt": 100}}, None),
+    ],
+    ids=str,
+)
+def test_a_time_series_read_beside_a_collated_or_exists_index_matches_mongod(
+    rust_mongo: Any, mongod: Any, index: dict[str, Any], match: dict[str, Any], options: Any
+) -> None:
+    """Which of the index over the buckets and a scan of them a read takes
+    beside a collated index or a partial index of `$exists`, as mongod
+    8.2.11. (A read whose count after the delete varies between runs under
+    mongod, such as `v > 3900` under a collation, is left out.)"""
+
+    def setup(db: Any, c: Any) -> None:
+        c.create_index("v", **index)
+
+    def read(c: Any) -> Any:
+        if options:
+            return c.aggregate([{"$match": match}], batchSize=1, collation=options)
+        return c.aggregate([{"$match": match}], batchSize=1)
+
+    assert _after_delete_setup(rust_mongo, setup, read) == _after_delete_setup(mongod, setup, read)
+
+
+@pytest.mark.backlog_fixed("RM-701")
+@pytest.mark.parametrize(
+    "match",
+    [
+        {"$or": [{"v": {"$lt": 100}}, {"v": {"$lt": 50}}]},
+        {"$or": [{"v": 5}, {"v": 7}]},
+        {"m": {"$lt": 40}, "$or": [{"v": {"$lt": 100}}, {"v": {"$gt": 3900}}]},
+    ],
+    ids=str,
+)
+def test_a_time_series_or_read_beside_an_index_of_its_own_matches_mongod(
+    rust_mongo: Any, mongod: Any, match: dict[str, Any]
+) -> None:
+    """An `$or` with every branch bounded by the index is one scan of it, and
+    one with a branch it cannot bound is one scan of the buckets, both under
+    a SUBPLAN, as mongod 8.2.11."""
+
+    def read(c: Any) -> Any:
+        return c.aggregate([{"$match": match}], batchSize=1)
+
+    assert _after_delete_setup(rust_mongo, _own_index("v"), read) == _after_delete_setup(
+        mongod, _own_index("v"), read
+    )
+
+
+@pytest.mark.backlog("RM-701")
+def test_a_hinted_time_series_read_under_a_collation_scans_the_collated_index(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """With a collated index `{v: 1}` (`en`), a hint to it and a read of
+    `v < 100` under that collation is an index scan over the buckets: mongod
+    8.2.11 leaves 63 after the delete (3 of 3 runs); this server reads the
+    collection whole under a collation and a hint, 99."""
+
+    def read(c: Any) -> Any:
+        return c.aggregate(
+            [{"$match": {"v": {"$lt": 100}}}], batchSize=1, collation={"locale": "en"}, hint="v_1"
+        )
+
+    def setup(db: Any, c: Any) -> None:
+        c.create_index("v", collation={"locale": "en"})
+
+    want = _after_delete_setup(mongod, setup, read)
+    assert want == 63
+    assert _after_delete_setup(rust_mongo, setup, read) == want
+
+
+@pytest.mark.backlog("RM-701")
+def test_a_time_series_or_read_across_two_indexes_of_its_own_scans_them_as_mongod(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """`{$or: [{v: {$lt: 100}}, {w: {$lt: 100}}]}` beside `{v: 1}` and
+    `{w: 1}` is a union of the two index scans under a SUBPLAN: mongod 8.2.11
+    leaves 112 after the delete (3 of 3 runs); this server reads the
+    collection whole, 184."""
+
+    def read(c: Any) -> Any:
+        return c.aggregate(
+            [{"$match": {"$or": [{"v": {"$lt": 100}}, {"w": {"$lt": 100}}]}}], batchSize=1
+        )
+
+    def setup(db: Any, c: Any) -> None:
+        c.create_index("v")
+        c.create_index("w")
+
+    want = _after_delete_setup(mongod, setup, read)
+    assert want == 112
+    assert _after_delete_setup(rust_mongo, setup, read) == want
 
 
 @pytest.mark.backlog("RM-810")

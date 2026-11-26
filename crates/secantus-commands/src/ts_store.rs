@@ -746,8 +746,10 @@ fn plain_partial(filter: &Document) -> bool {
                 .all(|i| i.as_document().is_some_and(plain_partial)),
             (k, _) if k.starts_with('$') => false,
             (_, Bson::Document(ops)) if ops.keys().next().is_some_and(|o| o.starts_with('$')) => {
-                ops.iter().all(|(op, arg)| {
-                    matches!(op.as_str(), "$eq" | "$gt" | "$gte" | "$lt" | "$lte") && scalar(arg)
+                ops.iter().all(|(op, arg)| match op.as_str() {
+                    "$eq" | "$gt" | "$gte" | "$lt" | "$lte" => scalar(arg),
+                    "$exists" => crate::util::truthy(arg),
+                    _ => false,
                 })
             }
             (_, arg) => scalar(arg),
@@ -769,7 +771,7 @@ fn scalar(v: &Bson) -> bool {
 
 /// Whether collection index `ix` of a time-series collection is built over
 /// its buckets as well: an ascending or descending key on measurement
-/// and meta fields, with no collation or expiry, and a partial filter only
+/// and meta fields, with no expiry (a collation is kept), and a partial filter only
 /// of the comparisons [`plain_partial`] reads (the ones the planner of this
 /// server reads over the buckets, RM-701).
 pub(crate) fn built_on_buckets(ix: &Document) -> bool {
@@ -779,9 +781,7 @@ pub(crate) fn built_on_buckets(ix: &Document) -> bool {
                 && k.values()
                     .all(|d| matches!(crate::util::as_i64(d), Some(1 | -1)))
         })
-        && ["collation", "expireAfterSeconds"]
-            .iter()
-            .all(|o| !ix.contains_key(*o))
+        && !ix.contains_key("expireAfterSeconds")
         && match ix.get("partialFilterExpression") {
             None => true,
             Some(Bson::Document(filter)) => plain_partial(filter),
@@ -856,6 +856,11 @@ pub(crate) fn sync_bucket_indexes(
                     }
                     spec.insert("partialFilterExpression", over_buckets);
                 }
+                // A collated index keeps its collation over the buckets
+                // (measured 8.2.11: `collation` beside the key).
+                if let Some(collation) = ix.get("collation") {
+                    spec.insert("collation", collation.clone());
+                }
                 if hidden {
                     spec.insert("hidden", true);
                 }
@@ -881,10 +886,16 @@ mod tests {
         assert!(built_on_buckets(
             &doc! { "name": "p", "key": { "v": 1 }, "partialFilterExpression": { "v": { "$gt": 1 } } }
         ));
+        assert!(built_on_buckets(
+            &doc! { "name": "p", "key": { "v": 1 }, "partialFilterExpression": { "v": { "$exists": true } } }
+        ));
+        assert!(built_on_buckets(
+            &doc! { "name": "c", "key": { "s": 1 }, "collation": { "locale": "en" } }
+        ));
         for spec in [
             doc! { "name": "_id_", "key": { "_id": 1 } },
-            doc! { "name": "p", "key": { "v": 1 }, "partialFilterExpression": { "v": { "$exists": true } } },
-            doc! { "name": "c", "key": { "s": 1 }, "collation": { "locale": "en" } },
+            doc! { "name": "p", "key": { "v": 1 }, "partialFilterExpression": { "v": { "$type": "int" } } },
+            doc! { "name": "p", "key": { "v": 1 }, "partialFilterExpression": { "v": { "$exists": false } } },
             doc! { "name": "ttl", "key": { "t": 1 }, "expireAfterSeconds": 10 },
             doc! { "name": "g", "key": { "loc": "2dsphere" } },
         ] {
