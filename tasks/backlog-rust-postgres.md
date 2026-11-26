@@ -487,23 +487,21 @@ one beside it.
   Left open as a watch item until the lane stays green.
   Backlog-ID: RP-571
   Verify: none -- intermittent, Linux CI only, not reproduced on macOS; RP-002's two regression tests are the check, and print the cancel trace on a miss
-- [ ] **A cancel sent while a prepared statement's Parse is described was
-  lost once on Linux CI (2026-11-26).** RP-215's regression test
-  `tests/backlog/test_rp_batch53.py::test_a_cancel_during_a_prepared_statements_parse_is_honoured[2.5]`
-  answered `ok` where PostgreSQL 15.19 answers 57014: the call took 7.50 s,
-  so `select pg_sleep(3), 25 in (<200,000 items>)` ran to its end, which is
-  RP-215's own symptom (a cancel left pending when the Parse answered,
-  cleared as stale at the next message). PR #3002 at `e579c75e0` (RP-1062's
-  EXPLAIN-only change and a backlog note), job `pg-oracle (backlog)`, run
-  45734519669; the `[0.5]` and `[1.5]` cases passed in the same run, and
-  this test passed on #3002's previous run at `32d5d7242` and on the
-  snapshots before. Unlike RP-571 (honoured late), this one was never
-  honoured. PostgreSQL answers a cancel at its next `CHECK_FOR_INTERRUPTS`
-  wherever in the cycle it lands. Start from the cancel trace
-  (`SECANTUS_PG_CANCEL_TRACE`) under load: where the pending flag is
-  cleared between the Parse's answer and the Sync.
-  Verify: none -- intermittent (1 CI run), not reproduced; the test named above is the check
-  Backlog-ID: RP-1115
+- [ ] **A busy backend's held statistics are published mid-statement.**
+  PostgreSQL 15 holds the counts a backend could not flush yet (under a
+  second since its last flush) for the idle timer, and turns that timer
+  off when it reads the next command, so they go out when the backend is
+  next idle: inserts held that way, then `pg_sleep(13)`, and another
+  session reads `n_tup_ins` 1 at 11.5 s and 2 afterwards (15.20). Here it
+  reads 2 at 11.5 s: `begin_message_cycle`'s first-message branch never
+  runs, because the wire layer's `MessageStartHook` (installed at
+  startup) opens the cycle at the message's first byte, so
+  `stats().wake()` never clears `idle_since` and another backend's
+  `flush_idle` flushes the busy one. The same dead branch never moves
+  `message_cycle` (a key of the per-cycle catalog cache, RP-715) and never
+  writes the trace's `cycle start` line. Found while working RP-1115.
+  Verify: tests/backlog/test_rp_busy_backend_stats.py::test_a_busy_backends_held_counts_wait_until_it_is_idle
+  Backlog-ID: RP-1116
 - [ ] **RUST pgserver: the planner's choices that decide row order are only
   partly modelled.** **Decided (Joe, 2026-10-16): build a cost model** --
   enough of PostgreSQL's planner to make its choices, since the order rows
