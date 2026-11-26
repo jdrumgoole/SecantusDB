@@ -46826,6 +46826,16 @@ impl PgHandler {
                 "a join source reached execution on its own".into(),
             ))),
             Statement::Explain { inner, options } => {
+                // A LEFT JOIN nothing reads, to a table unique on its ON's
+                // columns: `remove_useless_joins` plans the query without
+                // it (RP-1060).
+                if let Some(r) = options
+                    .join_removals
+                    .iter()
+                    .find(|r| self.unique_index_fixed(&r.table, &r.fixed))
+                {
+                    return self.execute_statement((*r.removed).clone(), max_rows);
+                }
                 // An IN / EXISTS whose inner side is unique on its column:
                 // `reduce_unique_semijoins` plans the inner join (RP-411).
                 if let Some(joined) = options.semi_join.as_ref().and_then(|sj| {
@@ -46885,7 +46895,32 @@ impl PgHandler {
                         }
                     }
                 }
+                // A chain drawn as written, its joins' conditions derived
+                // from the equivalence class its ONs make (RP-1057,
+                // RP-1061); hash joins only, checked on the tree below.
+                let class_conds = match (&reordered, &chain_conds, inner.as_ref()) {
+                    (None, None, Statement::Select(sel)) => {
+                        self.class_chain_conds(sel, &options.join_conds)
+                    }
+                    _ => None,
+                };
                 let mut tree = explain::plan_tree(reordered.as_ref().unwrap_or(&inner), &chooser);
+                // A removed join's relation stays in the range table
+                // (RP-1060): the group keys print qualified.
+                if options.joins_removed {
+                    if let Statement::Aggregate(agg) = inner.as_ref() {
+                        if agg.sub.is_none() && !agg.table.is_empty() {
+                            let alias = options
+                                .scan_alias
+                                .clone()
+                                .unwrap_or_else(|| explain::display_alias(&agg.table));
+                            explain::qualify_group_keys(&mut tree, &alias);
+                        }
+                    }
+                }
+                if class_conds.is_some() && explain::joins_all_hash(&tree) {
+                    chain_conds = class_conds;
+                }
                 // Each join's `Inner Unique` (RP-353): a unique index of
                 // the inner table that is immediate, has no WHERE and keys
                 // only plain columns, every one fixed by the join's clauses
@@ -47271,17 +47306,41 @@ impl PgHandler {
                 if let Statement::Select(sel) = inner.as_ref() {
                     if let Some(j) = &sel.join {
                         if tree.name == "Hash Join" {
-                            if let Some((plan, a, b, join, implied)) =
+                            if let Some((plan, a, b, join, implied, indexes)) =
                                 self.join_select_implied_estimate(sel)
                             {
+                                // The WHERE equality that fixed an ON key:
+                                // never another of that side's conjuncts
+                                // (RP-1065).
+                                let on_key = |p: &secantus_pgplan::JoinPred| {
+                                    j.on.as_ref().is_some_and(|(x, y)| {
+                                        [x, y].iter().any(|(al, c)| *al == p.alias && *c == p.col)
+                                    })
+                                };
                                 let from = j
                                     .filter
                                     .iter()
-                                    .find(|p| !implied.iter().any(|(al, _)| *al == p.alias))
+                                    .find(|p| {
+                                        p.op == secantus_pgplan::JoinOp::Eq
+                                            && on_key(p)
+                                            && !implied.iter().any(|(al, _)| *al == p.alias)
+                                    })
                                     .map(|p| (p.alias.clone(), p.col.clone()))
                                     .unwrap_or_default();
                                 explain::implied_nest_loop(&mut tree, &implied, &from);
                                 explain::price_nest_loop(&mut tree, &plan, a, b, join);
+                                // Outer then inner, as the scans now sit
+                                // (RP-1065).
+                                let [a_index, b_index] = indexes;
+                                let in_order = if plan.b_outer {
+                                    [b_index, a_index]
+                                } else {
+                                    [a_index, b_index]
+                                };
+                                explain::name_scan_indexes(
+                                    &mut tree,
+                                    &in_order.map(|ix| ix.map(|ix| (ix.name, ix.only))),
+                                );
                             }
                         }
                     }
@@ -47303,7 +47362,22 @@ impl PgHandler {
                             } else {
                                 [a_index, b_index]
                             };
-                            explain::name_index_scans(&mut tree, &in_order);
+                            explain::name_scan_indexes(
+                                &mut tree,
+                                &in_order.map(|ix| ix.map(|ix| (ix.name, ix.only))),
+                            );
+                        }
+                    }
+                }
+                // A chain whose join keys a WHERE constant's equivalence
+                // class holds (RP-1065): Nested Loops with no join clause,
+                // each scan filtered by the constant.
+                if let Statement::Select(sel) = inner.as_ref() {
+                    if tree.name == "Hash Join" && !options.verbose && !options.analyze {
+                        if let Some(c) = self.chain_class_constant(sel) {
+                            explain::class_constant_chain(
+                                &mut tree, &c.implied, &c.from, &c.indexes,
+                            );
                         }
                     }
                 }

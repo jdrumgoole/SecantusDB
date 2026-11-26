@@ -306,7 +306,7 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a
     )
 
 
-@pytest.mark.backlog_fixed("RP-1073")
+@pytest.mark.backlog("RP-1073")
 def test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth(
     pg_pair: tuple[Any, Any],
 ) -> None:
@@ -327,7 +327,10 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_
     by name with a binary search, and those few tables are kept with the
     committed version and patched from what a commit changed, as
     PostgreSQL rebuilds only the cache entries an invalidation names. Then
-    13.1 ms against 14.3 ms (1.10, 2026-11-25).
+    13.1 ms against 14.3 ms (1.10, 2026-11-25), at the bound; CI's
+    runner measured 1.22 and 1.14 on two snapshots in a row, then passed,
+    so RP-1073 stays open for the growth that is left with `Verify: none`:
+    at this bound the pair does not decide on CI (RP-1100).
 
     The same bound as at 800 tables, a tenth again plus 1 ms, with four
     times as many tables."""

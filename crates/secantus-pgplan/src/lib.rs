@@ -21,6 +21,7 @@ mod dml_pullup;
 mod domain_scope;
 mod initplan;
 mod join_alias;
+mod join_removal;
 mod pg_regex;
 mod record_image;
 mod relabel;
@@ -28,6 +29,7 @@ mod sublink_join;
 mod subquery_pullup;
 pub use domain_scope::{select_output_domains, select_target_domain};
 pub use initplan::InitPlan;
+pub use join_removal::JoinRemoval;
 pub use sublink_join::SemiJoin;
 mod targetlist_size;
 pub use targetlist_size::MAX_HEAP_ATTRIBUTE_NUMBER;
@@ -3787,6 +3789,15 @@ pub struct ExplainOptions {
     /// A SELECT whose WHERE is one IN or EXISTS sublink pulled up into a
     /// semi join (RP-411).
     pub semi_join: Option<Box<SemiJoin>>,
+    /// The LEFT JOINs `remove_useless_joins` removes when their inner
+    /// table is unique on the columns their ON fixes (RP-1060), each with
+    /// the plan of the query without it. The server, which knows the
+    /// unique indexes, takes the first whose table is.
+    pub join_removals: Vec<JoinRemoval>,
+    /// This is the plan of a query with a join removed (RP-1060): the
+    /// removed relation stays in the range table, so the keys print
+    /// qualified (`show_sort_group_keys`'s `useprefix`).
+    pub joins_removed: bool,
     /// The uncorrelated scalar subqueries the scan's quals compare with,
     /// each an InitPlan run once (RP-440).
     pub init_plans: Vec<InitPlan>,
@@ -12698,6 +12709,8 @@ fn plan_explain(
         function_scan_call: None,
         function_scan_where: None,
         semi_join: None,
+        join_removals: Vec::new(),
+        joins_removed: join_removal::joins_removed(),
         init_plans: Vec::new(),
     };
     let (mut timing, mut summary) = (None, None);
@@ -12804,6 +12817,24 @@ fn plan_explain(
             }
         }
     }
+    // A LEFT JOIN nothing above it reads, to a table unique on its ON's
+    // columns, is removed (`remove_useless_joins`, RP-1060). Each is
+    // planned without the join; the server, which knows the unique
+    // indexes, decides. Under ANALYZE the statement runs as written.
+    if !options.analyze && options.modify_table.is_none() {
+        for c in join_removal::candidates(&query, lookup).into_iter().take(3) {
+            let mut alt = e.clone();
+            alt.query = Some(Box::new(pg_query::protobuf::Node {
+                node: Some(c.query),
+            }));
+            let removed = join_removal::with_joins_removed(|| plan_explain(&alt, lookup, params))?;
+            options.join_removals.push(JoinRemoval {
+                table: c.table,
+                fixed: c.fixed,
+                removed: Box::new(removed),
+            });
+        }
+    }
     // The WHERE's constants are simplified before anything is planned
     // (`eval_const_expressions`, `canonicalize_qual`; RP-409).
     options.dummy_relation = const_quals::simplify_statement(&mut query, lookup)?;
@@ -12858,7 +12889,10 @@ fn plan_explain(
                 // An InitPlan's range table entry makes the range table
                 // longer than one, so the keys are qualified
                 // (`show_sort_group_keys`'s `useprefix`, RP-440).
-                Some(N::RangeVar(_)) if !options.init_plans.is_empty() => {
+                // So does a relation a removed join leaves there (RP-1060).
+                Some(N::RangeVar(_))
+                    if !options.init_plans.is_empty() || join_removal::joins_removed() =>
+                {
                     let none = |_: &str| None;
                     let cat = ruleutils::Catalog {
                         lookup,
@@ -12879,9 +12913,9 @@ fn plan_explain(
     options.verbose_scan = match &query {
         N::SelectStmt(s) if options.verbose => match s.from_clause.as_slice() {
             [item] => match item.node.as_ref() {
-                Some(N::RangeVar(rv)) => {
-                    lookup(&rv.relname).and_then(|def| ruleutils::explain_verbose_scan(s, &def))
-                }
+                Some(N::RangeVar(rv)) => lookup(&rv.relname).and_then(|def| {
+                    ruleutils::explain_verbose_scan(s, &def, join_removal::joins_removed())
+                }),
                 _ => None,
             },
             _ => None,

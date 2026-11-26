@@ -41,6 +41,18 @@ _ANALYSED = [
     "analyze k",
 ]
 
+# Those, a table unique on a plain unique index, one keyed on a bigint,
+# and a view over `k` (RP-1060).
+_REMOVABLE = _ANALYSED + [
+    "create table u (a int, b text)",
+    "create unique index u_a on u (a)",
+    "insert into u select g, 'x' from generate_series(1, 1000) g",
+    "create table h (a bigint primary key, b text)",
+    "create view kv as select * from k",
+    "analyze u",
+    "analyze h",
+]
+
 # Two tables of ten rows never analysed (RP-1019): the planner sizes each
 # at its default 1,270 rows.
 _NEVER_ANALYSED = [
@@ -2540,6 +2552,146 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         "explain (costs off) select e.b from e left join k on e.a = k.a",
         ["Seq Scan on e"],
     ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1060): the
+    # shapes `join_is_removable` removes and keeps.
+    "a left join to a unique index's table nothing reads is removed": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join u on e.a = u.a",
+        ["Seq Scan on e"],
+    ),
+    "a left join whose on fixes the key to a constant is removed": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join k on k.a = 3",
+        ["Seq Scan on e"],
+    ),
+    "a left join on a key of another integer type is removed": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join h on e.a = h.a",
+        ["Seq Scan on e"],
+    ),
+    "a left join on an expression of the outer side is removed": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join k on e.a + 1 = k.a",
+        ["Seq Scan on e"],
+    ),
+    "a left join using the key nothing reads is removed": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select a from e left join k using (a)",
+        ["Seq Scan on e"],
+    ),
+    "two left joins nothing reads are both removed": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join k on e.a = k.a left join u on u.a = e.a",
+        ["Seq Scan on e"],
+    ),
+    "a left join only another join's on reads is removed": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select e.b, k.b from e left join k on e.a = k.a "
+        "left join k k2 on k2.a = k.a",
+        [
+            "Hash Left Join",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on k",
+        ],
+    ),
+    "a left join to a table not unique on its on is kept": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join e e2 on e.a = e2.a",
+        [
+            "Hash Left Join",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on e e2",
+        ],
+    ),
+    "a left join the where reads is kept": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join k on e.a = k.a where k.b is null",
+        [
+            "Hash Left Join",
+            "  Hash Cond: (e.a = k.a)",
+            "  Filter: (k.b IS NULL)",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on k",
+        ],
+    ),
+    "a removed left join's scan is priced as the outer relation's": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain select e.b from e left join k on e.a = k.a",
+        ["Seq Scan on e  (cost=0.00..15.00 rows=1000 width=3)"],
+    ),
+    "a removed left join leaves its group keys qualified": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (costs off) select e.b, count(*) from e left join k on e.a = k.a group by e.b",
+        ["HashAggregate", "  Group Key: e.b", "  ->  Seq Scan on e"],
+    ),
+    "a removed left join leaves its verbose output qualified": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (verbose, costs off) select e.b from e left join k on e.a = k.a",
+        ["Seq Scan on public.e", "  Output: e.b"],
+    ),
+    "a removed left join leaves its verbose sort qualified": (
+        "RP-1060",
+        _REMOVABLE,
+        "explain (verbose, costs off) select e.b from e left join k on e.a = k.a order by e.a + 1",
+        [
+            "Sort",
+            "  Output: e.b, ((e.a + 1))",
+            "  Sort Key: ((e.a + 1))",
+            "  ->  Seq Scan on public.e",
+            "        Output: e.b, (e.a + 1)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1060): a view, and a one-row CTE, are removed as a table is.
+    "a left join to a view nothing reads is removed": (
+        "RP-1106",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join kv on kv.a = e.a",
+        ["Seq Scan on e"],
+    ),
+    "a left join to a one-row cte nothing reads is removed": (
+        "RP-1106",
+        _REMOVABLE,
+        "explain (costs off) with k as (select 1 as a) select e.b from e left join k on k.a = e.a",
+        ["Seq Scan on e"],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1060).
+    "a group by over a cross join with a one-row subquery prints its key": (
+        "RP-1107",
+        _ANALYSED,
+        "explain (costs off) select e.b, count(*) from e, (select 1) x group by e.b",
+        ["HashAggregate", "  Group Key: e.b", "  ->  Seq Scan on e"],
+    ),
+    "a sort above a hash aggregate prints its key": (
+        "RP-1108",
+        _ANALYSED,
+        "explain (costs off) select e.b, count(*) from e group by e.b order by e.b",
+        [
+            "Sort",
+            "  Sort Key: b",
+            "  ->  HashAggregate",
+            "        Group Key: b",
+            "        ->  Seq Scan on e",
+        ],
+    ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): a LEFT
     # JOIN an inner ON reduces to an inner one joins on its class.
     "a left join reduced to inner joins the chain on its class": (
@@ -2691,10 +2843,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): the WHERE
-    # constant joins the ON's equivalence class, as in the comma join RP-977
-    # fixed, and each inner index scan takes it as its Index Cond.
+    # constant joined the ON's equivalence class, as in the comma join
+    # RP-977 fixed, and each inner index scan took it as its Index Cond
+    # (RP-1065, fixed).
     "an explicit join's class constant is the inner index's cond": (
-        "RP-1065",
+        "RP-1065:fixed",
         _ANALYSED,
         "explain (costs off) select e.b, k.b from e join k on e.a = k.a where e.a = 3",
         [
@@ -2706,10 +2859,108 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "a three-way explicit join's class constant is each inner index's cond": (
-        "RP-1065",
+        "RP-1065:fixed",
         _ANALYSED,
         "explain (costs off) select e.b, k.b from e join k on e.a = k.a "
         "join k k2 on k2.a = e.a where e.a = 3",
+        [
+            "Nested Loop",
+            "  ->  Nested Loop",
+            "        ->  Seq Scan on e",
+            "              Filter: (a = 3)",
+            "        ->  Index Scan using k_pkey on k",
+            "              Index Cond: (a = 3)",
+            "  ->  Index Only Scan using k_pkey on k k2",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1065, fixed): the
+    # constant comes from the WHERE's equality on the ON key, never from
+    # another conjunct of that side (once printed `Index Cond: (a =
+    # 'v3'::text)` on `e`'s side), and an inner read through its index
+    # gives its Index Cond's constant to the other side.
+    "a class constant beside another conjunct of the fixing side": (
+        "RP-1065:fixed",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e join k on e.a = k.a "
+        "where k.b = 'v3' and k.a = 3",
+        [
+            "Nested Loop",
+            "  ->  Seq Scan on e",
+            "        Filter: (a = 3)",
+            "  ->  Index Scan using k_pkey on k",
+            "        Index Cond: (a = 3)",
+            "        Filter: (b = 'v3'::text)",
+        ],
+    ),
+    # Measured likewise: an inner reading only its key is read index-only.
+    "an explicit join's class constant on an index-only inner": (
+        "RP-1065:fixed",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a = k.a where e.a = 3",
+        [
+            "Nested Loop  (cost=0.28..25.80 rows=1 width=3)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "        Filter: (a = 3)",
+            "  ->  Index Only Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=4)",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1065): the class's equality keeps the place of the class's first
+    # source clause among the scan's quals.
+    "a class constant's equality keeps its class's place among the quals": (
+        "RP-1101",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e, k where e.a = k.a and e.a = 3 and e.b = 'v3'",
+        [
+            "Nested Loop",
+            "  ->  Seq Scan on e",
+            "        Filter: ((a = 3) AND (b = 'v3'::text))",
+            "  ->  Index Scan using k_pkey on k",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    "a class fixed to two constants is the empty result": (
+        "RP-1102",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e join k on e.a = k.a where e.a = 3 and k.a = 4",
+        [
+            "Result",
+            "  One-Time Filter: false",
+        ],
+    ),
+    "a left join's fixed outer key is the inner index's cond": (
+        "RP-1103",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e left join k on e.a = k.a where e.a = 3",
+        [
+            "Nested Loop Left Join",
+            "  Join Filter: (e.a = k.a)",
+            "  ->  Seq Scan on e",
+            "        Filter: (a = 3)",
+            "  ->  Index Scan using k_pkey on k",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    "an aggregate over a join's class constant": (
+        "RP-1104",
+        _ANALYSED,
+        "explain (costs off) select count(*) from e join k on e.a = k.a where e.a = 3",
+        [
+            "Aggregate",
+            "  ->  Nested Loop",
+            "        ->  Seq Scan on e",
+            "              Filter: (a = 3)",
+            "        ->  Index Only Scan using k_pkey on k",
+            "              Index Cond: (a = 3)",
+        ],
+    ),
+    "a three-way comma join's class constant is each inner index's cond": (
+        "RP-1105",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e, k, k k2 "
+        "where e.a = k.a and k2.a = e.a and e.a = 3",
         [
             "Nested Loop",
             "  ->  Nested Loop",
@@ -2765,6 +3016,124 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              ->  Seq Scan on k",
             "  ->  Hash",
             "        ->  Seq Scan on e e2",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (2026-11-25): the
+    # class's members are in the order `process_equivalence` adds them,
+    # each ON's two columns as written, so `k.a = e.a` puts `k.a` first.
+    "a chain's class written right key first names that key": (
+        "RP-1057",
+        _ANALYSED,
+        "explain (costs off) select e.b from e join k on k.a = e.a join e e2 on e2.a = k.a",
+        [
+            "Hash Join",
+            "  Hash Cond: (k.a = e2.a)",
+            "  ->  Hash Join",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e",
+            "        ->  Hash",
+            "              ->  Seq Scan on k",
+            "  ->  Hash",
+            "        ->  Seq Scan on e e2",
+        ],
+    ),
+    "a chain's class whose first member is the second table's": (
+        "RP-1057",
+        _ANALYSED,
+        "explain (costs off) select e.b from e join e e2 on e2.a = e.a join k on k.a = e2.a",
+        [
+            "Hash Join",
+            "  Hash Cond: (e2.a = k.a)",
+            "  ->  Hash Join",
+            "        Hash Cond: (e.a = e2.a)",
+            "        ->  Seq Scan on e",
+            "        ->  Hash",
+            "              ->  Seq Scan on e e2",
+            "  ->  Hash",
+            "        ->  Seq Scan on k",
+        ],
+    ),
+    "a four-way chain over one class joins each on its first member": (
+        "RP-1057",
+        _ANALYSED,
+        "explain (costs off) select e.b from e join k on e.a = k.a join e e2 on e2.a = k.a "
+        "join e e3 on e3.a = e2.a",
+        [
+            "Hash Join",
+            "  Hash Cond: (e.a = e3.a)",
+            "  ->  Hash Join",
+            "        Hash Cond: (e.a = e2.a)",
+            "        ->  Hash Join",
+            "              Hash Cond: (e.a = k.a)",
+            "              ->  Seq Scan on e",
+            "              ->  Hash",
+            "                    ->  Seq Scan on k",
+            "        ->  Hash",
+            "              ->  Seq Scan on e e2",
+            "  ->  Hash",
+            "        ->  Seq Scan on e e3",
+        ],
+    ),
+    "a chain's class under an order by": (
+        "RP-1057",
+        _ANALYSED,
+        "explain (costs off) select e.b from e join k on e.a = k.a join e e2 on e2.a = k.a "
+        "order by e.b",
+        [
+            "Sort",
+            "  Sort Key: e.b",
+            "  ->  Hash Join",
+            "        Hash Cond: (e.a = e2.a)",
+            "        ->  Hash Join",
+            "              Hash Cond: (e.a = k.a)",
+            "              ->  Seq Scan on e",
+            "              ->  Hash",
+            "                    ->  Seq Scan on k",
+            "        ->  Hash",
+            "              ->  Seq Scan on e e2",
+        ],
+    ),
+    "a chain's class beside a filter on a column outside it": (
+        "RP-1057",
+        _ANALYSED,
+        "explain (costs off) select e.b from e join k on e.a = k.a join e e2 on e2.a = k.a "
+        "where e.b <> 'x'",
+        [
+            "Hash Join",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Hash Join",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e",
+            "              Filter: (b <> 'x'::text)",
+            "        ->  Hash",
+            "              ->  Seq Scan on k",
+            "  ->  Hash",
+            "        ->  Seq Scan on e e2",
+        ],
+    ),
+    "explain verbose of a chain over one class": (
+        "RP-1057",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, k.b from e join k on e.a = k.a "
+        "join e e2 on e2.a = k.a",
+        [
+            "Hash Join",
+            "  Output: e.b, k.b",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Hash Join",
+            "        Output: e.b, e.a, k.b, k.a",
+            "        Inner Unique: true",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.a, e.b",
+            "        ->  Hash",
+            "              Output: k.b, k.a",
+            "              ->  Seq Scan on public.k",
+            "                    Output: k.b, k.a",
+            "  ->  Hash",
+            "        Output: e2.a",
+            "        ->  Seq Scan on public.e e2",
+            "              Output: e2.a",
         ],
     ),
     "explain verbose of an inner index scan filtering an expression of both": (
@@ -8371,6 +8740,9 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1060",
+        "RP-1061",
+        "RP-1057",
         "RP-1038",
         "RP-1039",
         "RP-1025",

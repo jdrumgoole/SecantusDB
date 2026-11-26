@@ -1178,6 +1178,36 @@ one beside it.
 
 ## Found while fixing the RP-911 latency test's noise (2026-11-19)
 
+- [ ] **OPEN — the first catalog query after a `CREATE TABLE` still grows
+      with the schema: 9% at 3,200 tables locally, 15-20% on CI (debug
+      build).** psql's `\d` collation query, run straight after a `CREATE
+      TABLE`. PostgreSQL 15.19 takes the same time at any size: DDL
+      invalidates only the cache entries it changed (`inval.c`) and its
+      scans read one relation's rows by index. Before 2026-11-25 it was
+      13.7 ms with no other table against 16.4 ms with 3,200 (arm64 macOS);
+      the planner's tables are now republished from what a commit changed
+      rather than by walking every definition (`SpecialTables`, sorted
+      shared definitions, 6711f3618), and locally that pair is 13.1 ms
+      against 14.3 ms, right at the regression test's bound (a tenth plus
+      1 ms). CI's runner then failed it on two snapshots in a row: 25.3 ms
+      against 31.4 ms (ratio median 1.22; PR #2998 at `432c8ec3e`, run
+      45711355695) and 27.5 ms against 32.3 ms (1.14, rounds 0.94 to 1.24;
+      PR #2998 at `02490b0b0`, run 45718185237), where it passed once on
+      #2996. So about 1.2 ms of growth is left locally and about 5 ms on
+      CI. The walks the 2026-11-19 sample named and 6711f3618 did not take
+      out are where to look first: `publish_user_types` -> `index_relations`
+      -> `derive_index_relations` (every table's columns) and
+      `catalog_rows_keyed` -> `build_catalog_rows`; profile 0 against 8,000
+      tables before changing one.
+      The pair decides nothing on CI at this bound: reopened as its gap
+      test, it then passed (PR #2998 at `916946abe`, run 45721708475,
+      FIXED?), so in four hours it failed twice and passed twice there. It
+      stays a gap test of this item that the verifier does not count,
+      until RP-1100 settles what a ratio test holds to on CI's runner or
+      the growth is gone by a margin no runner closes.
+      Verify: none -- a latency budget at its bound on CI's runner (2 failed, 2 passed, 2026-11-25); tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth measures it
+      Backlog-ID: RP-1073
+
 - [ ] **A table a `CREATE TABLE` has just made is sometimes not there for
       the next statement on the same connection.** Found while gating
       RM-756 (2026-11-25, debug `secantusd-pg`, arm64 macOS): in
@@ -1213,8 +1243,35 @@ one beside it.
       runner: more interleaved rounds, the median of several fastest-of-N
       pairs, or a threshold measured on CI's own runner shape. Then bisect
       the 0.6 ms. Do not just widen a threshold until it passes.
-      Verify: none -- intermittent on CI; RP-715's and RP-911's regression tests are the check
+      A third, the same evening: RP-1073's new 3,200-table pair, a median
+      of 25.3 ms with no other table against 31.4 ms with 3,200 (ratio
+      median 1.22, rounds 1.04 to 1.60, over its 1.10 plus 1 ms; PR #2998 at
+      `432c8ec3e`, RP-1065's EXPLAIN-only change, run 45711355695), where
+      the snapshot before (#2996, which carried RP-1073) passed it and the
+      local debug build measures 13.1 ms against 14.3 ms (1.10).
+      Verify: none -- intermittent on CI; RP-715's, RP-911's and RP-1073's tests are the check
       Backlog-ID: RP-1100
+
+- [ ] **`test_catalog_blocks` once counted an extra `pg_attribute` block
+      on CI (2026-11-25).** `tests/backlog/test_rp_catalog_reads.py::test_catalog_blocks`
+      (RP-291's regression test) read 4 `pg_attribute` heap blocks for
+      `select * from rpc_t where id = 1`, where PostgreSQL 15.19 reads 3
+      (third step; the other steps matched). PR #2998 at `432c8ec3e`, job
+      `pg-oracle (backlog)`, run 45711355695. It passed on every other run
+      found that day, #2996's (the same tree less RP-1065, whose change is
+      EXPLAIN-only) included. Not reproduced locally (debug, arm64 macOS):
+      alone on RP-1065's tree and on the tree before it; the whole module
+      serially, twice; each of the 29 tests defined after it run just before
+      it on one server; and eight runs on one server with
+      `autovacuum_naptime = 1s` (the expected counts were measured with
+      autovacuum off). The module shares one server (`rust_pg` is
+      module-scoped) and CI runs it `-n auto --dist worksteal`, so the
+      tests before it on its server are not fixed; a combination of
+      earlier tests, or a race with something the server does in the
+      background, is what is left. PostgreSQL reads the same blocks for
+      the same query every time.
+      Verify: none -- intermittent (1 CI run), not reproducible on demand; the test named above is where it shows
+      Backlog-ID: RP-1111
 
 ## Found by a CI run (2026-11-07)
 
@@ -1815,8 +1872,8 @@ a regression test.
       join in a chain, a RIGHT join in one (RP-1063 first), a FULL JOIN
       below an inner join (its plain plan differs too), a WHERE over a FULL JOIN (`... full join e e2
       on e2.a = k.a where e.b <> 'x'` is reduced to a `Hash Left Join` on
-      PostgreSQL 15.19, `reduce_outer_joins`, whose plain plan matches here), a LEFT JOIN an inner ON above reduces to an inner one (RP-1061
-      first), a WHERE on a LEFT JOIN's nullable side (its plain plan differs
+      PostgreSQL 15.19, `reduce_outer_joins`, whose plain plan matches here), a LEFT JOIN an inner ON above reduces to an inner one (its plain
+      plan matches since 2026-11-25), a WHERE on a LEFT JOIN's nullable side (its plain plan differs
       too: `... left join e e2 on e2.a = k.a where e2.b <> 'x'` is reduced
       and reordered on PostgreSQL 15.19, `where e2.b is null` a `Hash Right
       Join` of `e2` and `k` under a Hash), and a WHERE conjunct
@@ -1828,9 +1885,12 @@ a regression test.
       remaining shape probed has a plain plan that differs too, so each
       waits on the item named: a WHERE conjunct reading two relations of a
       chain (RP-1059, all three pairings), a nested loop in a chain (RP-1059
-      for `where e.a < 5`, RP-1065 for `where e.a = 3`), a RIGHT join
-      (RP-1063). Work those first; the VERBOSE half then follows the
-      chain's `Output` rules above.
+      for `where e.a < 5`), a RIGHT join (RP-1063). Work those first; the
+      VERBOSE half then follows the chain's `Output` rules above. The
+      chain `where e.a = 3` (RP-1065, 2026-11-25) now has PostgreSQL's
+      plain plan, Nested Loops under the class's constant, and is drawn
+      only without VERBOSE (`chain_class_constant`): its VERBOSE half can
+      be worked now.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a three-way join with a join filter], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a merge join under a limit], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a merge join over an index only scan], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a descending merge join with a where]
       Backlog-ID: RP-966
 
@@ -1870,45 +1930,108 @@ a regression test.
       (5) costs: every node of a three-way chain prints `cost=0.00..0.00
       rows=0 width=0`; the search's estimates match PostgreSQL's
       (`83.58..123.68` for the first query over tables never analysed) but
-      its relations carry no width.
+      its relations carry no width. So does a chain whose class a WHERE
+      constant fixes (RP-1065, `PgHandler::chain_class_constant`), drawn
+      as Nested Loops in its written order, which the search does not
+      weigh at all (`three_table_plan` declines a class with a constant):
+      `... join k k2 on k2.a = e.a where e.a = 3` is `0.55..34.10` on a
+      private PostgreSQL 15.20 cluster, the lower join `0.28..25.80`.
       Work (1) first: it is what the two gap tests below measure. Found
       while working RP-966.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a filtered relation of a three-way join is joined first], tests/backlog/test_rp_explain_costs.py::test_plan[a range-filtered relation of a three-way join is joined first]
       Backlog-ID: RP-1059
 
-- [ ] **A WHERE constant does not join an explicit JOIN's equivalence
-      class.** `explain (costs off) select e.b, k.b from e join k on e.a =
-      k.a where e.a = 3` (`e`, `k` analysed, 1000 rows) is a `Hash Join`
-      on `(e.a = k.a)` here; PostgreSQL 15.19 puts the constant in the
-      class (`generate_base_implied_equalities_const`) and runs a Nested
-      Loop into `Index Scan using k_pkey on k`, `Index Cond: (a = 3)`, no
-      join clause, as RP-977 already does for the comma join `from e, k
-      where e.a = k.a and e.a = 5`. A third relation on the class (`join k
-      k2 on k2.a = e.a`) likewise gets its own `Index Cond: (a = 3)`. Find
-      where the ON's equalities miss the WHERE's constant. Found while
-      working RP-966.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an explicit join's class constant is the inner index's cond], tests/backlog/test_rp_explain_costs.py::test_plan[a three-way explicit join's class constant is each inner index's cond]
-      Backlog-ID: RP-1065
+- [ ] **A class constant's equality on the side the WHERE names is
+      printed after that side's other quals, not where the class began.**
+      `explain (costs off) select e.b, k.b from e, k where e.a = k.a and
+      e.a = 3 and e.b = 'v3'` (`e`, `k` analysed, 1000 rows) prints `Filter:
+      ((b = 'v3'::text) AND (a = 3))` on `e`; a private PostgreSQL 15.20
+      cluster prints `((a = 3) AND (b = 'v3'::text))`. Measured there: the
+      class's equality takes the place of the class's first source clause
+      among the scan's own quals, the ON's ahead of the WHERE's -- `where
+      e.b = 'v3' and e.a = k.a and e.a = 3` prints `b` first, every
+      explicit `join k on e.a = k.a where ...` prints `a` first, whatever
+      the WHERE's order. `apply_implied_filters` always moves it last. Find
+      the mechanism in `equivclass.c` / `initsplan.c` before modelling it.
+      Found while working RP-1065.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a class constant's equality keeps its class's place among the quals]
+      Backlog-ID: RP-1101
 
-- [ ] **A LEFT JOIN nothing reads is not removed.** `explain (costs
-      off) select e.b from e left join k on e.a = k.a` (`k.a` the primary
-      key) is a `Hash Left Join` here; PostgreSQL 15.19 prints `Seq Scan on
-      e` alone, as `remove_useless_joins` drops a LEFT JOIN whose inner side
-      is unique on the ON's columns and read nowhere above
-      (`join_is_removable`). Found while working RP-966.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join nothing reads is removed]
-      Backlog-ID: RP-1060
+- [ ] **A WHERE that fixes one class to two constants is not the empty
+      Result.** `explain (costs off) select e.b, k.b from e join k on e.a =
+      k.a where e.a = 3 and k.a = 4` is a `Hash Join` of two filtered
+      scans here; a private PostgreSQL 15.20 cluster prints `Result` with
+      `One-Time Filter: false`, as `generate_base_implied_equalities_const`
+      reduces `3 = 4` to a constant FALSE. Found while working RP-1065.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a class fixed to two constants is the empty result]
+      Backlog-ID: RP-1102
 
-- [ ] **A LEFT JOIN reduced to inner keeps its ON out of the
-      equivalence class.** `explain (costs off) select e.b, k.b from e
-      left join k on e.a = k.a join e e2 on e2.a = k.a` prints the top
-      `Hash Cond: (k.a = e2.a)`; PostgreSQL 15.19, which reduces the LEFT
-      JOIN to an inner one (`reduce_outer_joins`) before
-      `deconstruct_jointree`, merges `e.a = k.a` into the class with
-      `e2.a` and prints `Hash Cond: (e.a = e2.a)` (and no `Inner Unique`
-      on that join under VERBOSE). Found while working RP-966.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join reduced to inner joins the chain on its class]
-      Backlog-ID: RP-1061
+- [ ] **A LEFT JOIN whose WHERE fixes the outer key does not read the
+      inner side through its index.** `explain (costs off) select e.b, k.b
+      from e left join k on e.a = k.a where e.a = 3` is a `Hash Left Join`
+      here; a private PostgreSQL 15.20 cluster prints a `Nested Loop Left
+      Join`, `Join Filter: (e.a = k.a)`, into `Index Scan using k_pkey on
+      k`, `Index Cond: (a = 3)` (`reconsider_outer_join_clauses` gives the
+      inner key the constant; RP-364 covers the narrow path's Seq Scans).
+      Found while working RP-1065.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join's fixed outer key is the inner index's cond]
+      Backlog-ID: RP-1103
+
+- [ ] **An aggregate over a join whose class a WHERE constant fixes is
+      drawn over a Hash Join.** `explain (costs off) select count(*) from e
+      join k on e.a = k.a where e.a = 3` is an `Aggregate` over a `Hash
+      Join` here; a private PostgreSQL 15.20 cluster prints the `Nested
+      Loop` the select list alone gets (RP-1065), into `Index Only Scan
+      using k_pkey on k`, `Index Cond: (a = 3)`. Found while working
+      RP-1065.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a join's class constant]
+      Backlog-ID: RP-1104
+
+- [ ] **A comma join of three tables whose class a WHERE constant fixes
+      prints its equalities as Join Filters.** `explain (costs off) select
+      e.b, k.b from e, k, k k2 where e.a = k.a and k2.a = e.a and e.a = 3`
+      prints Hash Joins with `Join Filter: (e.a = k.a)` and `(k2.a = e.a)`
+      over Seq Scans here; a private PostgreSQL 15.20 cluster prints the
+      plan the explicit JOINs get (RP-1065): Nested Loops, `Index Cond: (a
+      = 3)` on each of `k` and `k2`. The comma chain's equalities are the
+      WHERE's (`JoinRows::where_equalities`), which
+      `PgHandler::chain_class_constant` does not read. Found while working
+      RP-1065.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a three-way comma join's class constant is each inner index's cond]
+      Backlog-ID: RP-1105
+
+- [ ] **A LEFT JOIN to a view or a CTE nothing reads is not removed.**
+      `explain (costs off) select e.b from e left join kv on kv.a = e.a`
+      (`kv` the view `select * from k`, `k.a` the primary key) is a `Hash
+      Left Join` over `Subquery Scan on kv` here; PostgreSQL (a private
+      15.20 cluster) pulls the view up into `k` and removes the join,
+      printing `Seq Scan on e` alone. `with k as (select 1 as a) select e.b
+      from e left join k on k.a = e.a` is removed there too: the CTE is
+      inlined, and a subquery of one row is distinct on any column
+      (`query_is_distinct_for`). RP-1060's removal (`join_removal.rs`)
+      takes only a plain table as the inner side; a pulled-up view, a
+      subquery's distinctness and a NATURAL join are what is left. Found
+      while working RP-1060.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join to a view nothing reads is removed], tests/backlog/test_rp_explain_costs.py::test_plan[a left join to a one-row cte nothing reads is removed]
+      Backlog-ID: RP-1106
+
+- [ ] **A GROUP BY over a cross join with a FROM subquery prints a
+      joined-row key.** `explain (costs off) select e.b, count(*) from e,
+      (select 1) x group by e.b` prints `Group Key: e\x1Fb` (the internal
+      `alias<U+001F>column` key, escaped) over a `Nested Loop` of `e` and
+      `Subquery Scan on x`; PostgreSQL (a private 15.20 cluster) pulls the
+      one-row subquery up and prints `HashAggregate`, `Group Key: e.b`,
+      `Seq Scan on e`. Found while working RP-1060.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a group by over a cross join with a one-row subquery prints its key]
+      Backlog-ID: RP-1107
+
+- [ ] **A Sort above a HashAggregate prints no Sort Key.** `explain
+      (costs off) select e.b, count(*) from e group by e.b order by e.b`
+      prints `Sort` with no `Sort Key` line over `HashAggregate` (`Group
+      Key: b`); PostgreSQL (a private 15.20 cluster) prints `Sort Key: b`.
+      Found while working RP-1060.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sort above a hash aggregate prints its key]
+      Backlog-ID: RP-1108
 
 - [ ] **An outer join's multi-column Hash Cond prints the nullable
       side's column first.** `explain (costs off) select e.b, e2.b from e
@@ -1979,16 +2102,6 @@ a regression test.
       where it declines before sizing. Found while working RP-966.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by under a limit over a join is a merge join], tests/backlog/test_rp_explain_costs.py::test_plan[an order by under a limit over an inequality join reads the index]
       Backlog-ID: RP-1099
-
-- [ ] **A join's Hash Cond names a different member of the equivalence
-      class than PostgreSQL's.** `explain (costs off) select k.b, e2.b
-      from e join k on e.a = k.a join e e2 on e2.a = k.a` (`e`, `k`
-      analysed, 1000 rows) prints the upper join's `Hash Cond: (k.a =
-      e2.a)`; PostgreSQL 15.19 prints `(e.a = e2.a)` over the same plan
-      shape, the clause `generate_join_implied_equalities` builds from the
-      class's members in their order. Found while working RP-966.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a three-way hash join names the class's first member]
-      Backlog-ID: RP-1057
 
 
 - [ ] **EXPLAIN ANALYZE's scan counters PostgreSQL prints that are still
