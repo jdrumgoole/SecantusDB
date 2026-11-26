@@ -3547,16 +3547,6 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       while working RP-981).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a merge join on an expression key]
       Backlog-ID: RP-1033
-- [ ] **A hash join written inner side first is not `Inner Unique`.**
-      `explain verbose select * from k join e on e.a = k.a` (`k.a` the
-      primary key, `k` hashed) prints `Inner Unique: true` in PostgreSQL
-      15.19, as the same join written `e join k` does; here `false`, in
-      the structured formats without VERBOSE too (`"Inner Unique":
-      false`). The `unique_probe` of the join's inner table is taken from
-      the side the FROM writes second, not the side the plan hashes.
-      Measured on the 15.19 reference on port 5415.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash join written inner side first is inner unique]
-      Backlog-ID: RP-1030
 ## Found while working RP-1071 (2026-11-26)
 
 - [ ] **A join on an expression of each side, or one ordered by its
