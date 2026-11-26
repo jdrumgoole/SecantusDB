@@ -1249,6 +1249,22 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       and explains it so (`explainVersion` "2", no `stages`, an `EQ_LOOKUP`
       on top of the query's plan); this server lists a `$cursor` and a
       `$lookup` stage. Found 2026-11-14 (RM-539).
+      Sized 2026-11-26 against 8.2.11 (`from` d, `localField` a,
+      `foreignField` b, no index): `queryPlan` is `EQ_LOOKUP` (planNodeId 2,
+      `strategy` "HashJoin", `scanDirection`, `foreignCollection`,
+      `localField`, `foreignField`, `asField`) over a `COLLSCAN`, and the
+      `slotBasedPlan` is `project makeBsonObj(MakeObjSpec([z = Set(0)], ...))`
+      / `project (s13 ?: [])` / `hash_lookup [addToArray]` with an outer
+      `arrayToSet(...)` key projection over the scan and an inner `nlj` over
+      the foreign scan whose right side is a spilling `group addToSet` over
+      `nlj` / `branch {isArray}` / `union` / `unwind` / `limit 1` / `coscan`.
+      None of `hash_lookup`, `nlj`, `branch`, `union`, `unwind`, `coscan`
+      or `makeBsonObj` exists in `explain/sbe/` yet, and an index on the
+      foreign field gives the IndexedLoopJoin strategy, a different plan.
+      Slices: the stages and expressions with their runs and
+      `executionStats` (HashJoin first), then IndexedLoopJoin, then the
+      NestedLoopJoin cutover; emitting the `queryPlan` alone would be a
+      stand-in.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_lookup_on_join_fields_is_explained_as_sbe_runs_it
       Backlog-ID: RM-683
 - [ ] **A 12-byte string is counted as held outside its `Value`.** mongod
