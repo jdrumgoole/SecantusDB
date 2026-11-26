@@ -2144,31 +2144,40 @@ a regression test.
       Backlog-ID: RP-1099
 
 
-- [ ] **EXPLAIN ANALYZE's scan counters PostgreSQL prints that are still
-      left out.** Since RP-383 a user table's heap pages carry the
-      visibility map's bit (set by VACUUM, cleared by a write to the page),
-      and an index-only scan prints its `Heap Fetches`, a Bitmap Heap Scan
-      its `Heap Blocks: exact=` and its Bitmap Index Scan its own `actual
-      rows`, as PostgreSQL 15.19 does, and since 2026-11-06 an index
-      scan its `Rows Removed by Filter`, and since 2026-11-06 a BitmapOr
-      its and its arms' actual rows. Still missing: any of those
-      counters while the heap holds a dead
-      version, a dead line pointer or a HOT chain not yet vacuumed, whose
-      index entries the scan visits too (`update k set b = 'z' where a =
-      5`, then the index-only scan of `a = 5`: `Heap Fetches: 2`); and a
-      bitmap past `work_mem`, whose
-      pages go lossy (`Heap Blocks: exact=... lossy=...`). Measured on a
-      private 15.19 cluster (found while working RP-383).
-      Sized 2026-11-15: `user_index_ctids` (lib.rs) refuses any heap with
-      `has_dead_entries`, and the heap model keeps no index entries: a
-      dead non-HOT version's key is not recorded (`Xmax` holds only the
-      row's `_id`, and the update may have changed the key), and nothing
-      models `_bt_killitems` -- PostgreSQL's first scan fetches the dead
-      entry (`Heap Fetches: 2`) and kills it, so a second scan prints 1.
-      The fix is an index-entry model (key per version, killed bit,
-      removed by VACUUM's index pass), persisted beside the heap.
+- [ ] **EXPLAIN ANALYZE prints no lossy pages for a bitmap past
+      `work_mem`.** Since RP-383 an index-only scan prints its `Heap
+      Fetches`, a Bitmap Heap Scan its `Heap Blocks: exact=` and its
+      Bitmap Index Scan its own `actual rows`, an index scan its `Rows
+      Removed by Filter` and a BitmapOr its arms' rows, and since
+      2026-11-26 each of them counts a dead version's index entry as
+      PostgreSQL does (read from the B-tree page model, until VACUUM
+      removes it or a scan marks it dead to all). Still missing: a bitmap
+      whose pages outgrow `work_mem` goes lossy (`tbm_lossify`), so
+      PostgreSQL 15.20 prints `Rows Removed by Index Recheck: 114504` and
+      `Heap Blocks: exact=811 lossy=517` for `select * from big where b =
+      7` (300,000 rows, `b = g % 50`, `work_mem = '64kB'`) where this
+      server prints `exact=1328` and no recheck line. Measured on a private
+      15.20 cluster. The fix is `tidbitmap.c`'s page table: its
+      `maxentries` from `work_mem`, and `tbm_lossify`'s chunking of exact
+      pages into lossy ones, whose every tuple the heap scan rechecks.
       Backlog-ID: RP-384
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an index-only scan over a dead version]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a bitmap past work_mem]
+- [ ] **A range read through a B-tree index marks no dead entries, as the
+      executor takes it for a bitmap scan.** `select * from k where a
+      between 8 and 14` after a committed `update k set b = 'y' where a
+      between 10 and 12` (`k` of 1,000 rows, keyed on `a`, analysed) is
+      an `Index Scan using k_pkey` in EXPLAIN, and on PostgreSQL 15.20
+      that scan marks the three dead versions' entries (`_bt_killitems`),
+      so the next `select a from k where a between 8 and 14` prints `Heap
+      Fetches: 7`. This server prints 10: `in_scan_order` asks
+      `priced_scan`, which answers `Bitmap` for the range where the plan
+      EXPLAIN prints is an index scan, so `btree_index_scanned` never
+      runs. A primary-key lookup of one row marks its entries
+      (`unique_lookup_scanned`), so only reads of several rows are
+      affected. Measured on a private 15.20 cluster (found while working
+      RP-384).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_a_range_index_scan_marks_dead_entries
+      Backlog-ID: RP-1120
 - [ ] **EXPLAIN ANALYZE prints no counts below most other joins.** Since
       RP-386 a join's children print their actual rows and loops, a
       parameterized inner index-only scan its `Heap Fetches`, a Hash its

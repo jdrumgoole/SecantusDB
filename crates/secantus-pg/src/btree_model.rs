@@ -939,6 +939,23 @@ impl BTree {
         lower: Option<(&Bson, bool)>,
         upper: Option<(&Bson, bool)>,
     ) -> Vec<i64> {
+        self.entries_in(shape, lower, upper)
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect()
+    }
+
+    /// [`Self::tids_in`] with each TID's key: the index tuples an index
+    /// scan of that range reads, in index order, a posting list's TIDs one
+    /// by one -- a dead version's own key among them, which is what lets
+    /// the scan's other index quals be checked against it (`_bt_checkkeys`,
+    /// RP-384).
+    pub(crate) fn entries_in(
+        &self,
+        shape: &dyn Shape,
+        lower: Option<(&Bson, bool)>,
+        upper: Option<(&Bson, bool)>,
+    ) -> Vec<(&[Bson], i64)> {
         let Some(pages) = self.scan_pages(shape, lower, upper) else {
             return Vec::new();
         };
@@ -962,7 +979,7 @@ impl BTree {
             };
             for it in items {
                 if !it.dead && it.key.first().is_some_and(within) {
-                    out.extend(it.tids.iter().copied());
+                    out.extend(it.tids.iter().map(|t| (it.key.as_slice(), *t)));
                 }
             }
         }

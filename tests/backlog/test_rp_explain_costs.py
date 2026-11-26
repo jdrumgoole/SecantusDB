@@ -8773,14 +8773,37 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Rows Removed by Filter: 26",
         ],
     ),
+    # Fixed: a dead version's index entry is read as PostgreSQL's scan
+    # reads it, until VACUUM removes it or a scan marks it dead to all.
     "analyze of an index-only scan over a dead version": (
-        "RP-384",
+        "RP-384:fixed",
         _ANALYSED + ["update k set b = 'z' where a = 5"],
         "explain (analyze, costs off, timing off, summary off) select a from k where a = 5",
         [
             "Index Only Scan using k_pkey on k (actual rows=1 loops=1)",
             "  Index Cond: (a = 5)",
             "  Heap Fetches: 2",
+        ],
+    ),
+    # A bitmap whose pages outgrow `work_mem` goes lossy (`tbm_lossify`):
+    # PostgreSQL 15.20 rechecks every tuple of a lossy page.
+    "analyze of a bitmap past work_mem": (
+        "RP-384",
+        [
+            "create table big (a int, b int)",
+            "insert into big select g, g % 50 from generate_series(1, 300000) g",
+            "create index big_b on big (b)",
+            "analyze big",
+            "set local work_mem = '64kB'",
+        ],
+        "explain (analyze, costs off, timing off, summary off) select * from big where b = 7",
+        [
+            "Bitmap Heap Scan on big (actual rows=6000 loops=1)",
+            "  Recheck Cond: (b = 7)",
+            "  Rows Removed by Index Recheck: 114504",
+            "  Heap Blocks: exact=811 lossy=517",
+            "  ->  Bitmap Index Scan on big_b (actual rows=6000 loops=1)",
+            "        Index Cond: (b = 7)",
         ],
     ),
     # Split from RP-384 and fixed: a BitmapOr prints `actual rows=0`, each
@@ -9232,6 +9255,111 @@ def test_an_index_only_scan_after_a_delete_and_vacuum(rust_pg: Any) -> None:
         "Index Only Scan using k_pkey on k (actual rows=8 loops=1)",
         "  Index Cond: (a < 10)",
         "  Heap Fetches: 0",
+    ]
+
+
+# Analysed, never vacuumed: every page is left off the visibility map, so
+# an index-only scan fetches the heap for each index tuple it reads.
+_UNVACUUMED = [
+    "create table k (a int primary key, b text)",
+    "insert into k select g, 'v' || (g % 10) from generate_series(1, 1000) g",
+    "analyze k",
+    "create table n (a int, b int, c text)",
+    "insert into n select g, g % 50, 'x' || (g % 7) from generate_series(1, 5000) g",
+    "create index n_b on n (b)",
+    "analyze n",
+]
+
+
+@pytest.mark.backlog_fixed("RP-384")
+def test_scan_counters_over_dead_versions(rust_pg: Any) -> None:
+    """A dead version's index entry is read until VACUUM removes it or a
+    scan marks it dead to all, as PostgreSQL 15.20 counts it on a fresh
+    cluster: the first index-only scan after a committed update fetched
+    both versions (`Heap Fetches: 2`) and marked the dead one, the next
+    fetched one; a Bitmap Index Scan returned the dead entries too, which
+    no bitmap scan marks; and an index scan's Filter saw only the live
+    rows its fetches returned. Each counter printed bare while the heap
+    held a dead version."""
+    steps = _UNVACUUMED + [
+        "update k set b = 'z' where a = 5",
+        _ANALYZE + "select a from k where a = 5",
+        _ANALYZE + "select a from k where a = 5",
+        "delete from k where a = 30",
+        _ANALYZE + "select * from k where a between 25 and 35 and b = 'v1'",
+        "update n set c = 'q' where b = 7 and a < 100",
+        _ANALYZE + "select * from n where b = 7",
+        _ANALYZE + "select * from n where b = 7",
+        "update n set b = 9 where b = 7 and a < 300",
+        _ANALYZE + "select * from n where b = 7",
+        _ANALYZE + "select * from n where b = 7 or b = 9",
+    ]
+    got = run_autocommit(fresh_db(_dsn(rust_pg)), steps)[len(_UNVACUUMED) :]
+    assert got[1] == [
+        "Index Only Scan using k_pkey on k (actual rows=1 loops=1)",
+        "  Index Cond: (a = 5)",
+        "  Heap Fetches: 2",
+    ]
+    assert got[2] == [
+        "Index Only Scan using k_pkey on k (actual rows=1 loops=1)",
+        "  Index Cond: (a = 5)",
+        "  Heap Fetches: 1",
+    ]
+    assert got[4] == [
+        "Index Scan using k_pkey on k (actual rows=1 loops=1)",
+        "  Index Cond: ((a >= 25) AND (a <= 35))",
+        "  Filter: (b = 'v1'::text)",
+        "  Rows Removed by Filter: 9",
+    ]
+    bitmap = [
+        "Bitmap Heap Scan on n (actual rows=100 loops=1)",
+        "  Recheck Cond: (b = 7)",
+        "  Heap Blocks: exact=28",
+        "  ->  Bitmap Index Scan on n_b (actual rows=102 loops=1)",
+        "        Index Cond: (b = 7)",
+    ]
+    assert got[6] == bitmap
+    assert got[7] == bitmap
+    assert got[9] == [
+        "Bitmap Heap Scan on n (actual rows=94 loops=1)",
+        "  Recheck Cond: (b = 7)",
+        "  Heap Blocks: exact=28",
+        "  ->  Bitmap Index Scan on n_b (actual rows=102 loops=1)",
+        "        Index Cond: (b = 7)",
+    ]
+    assert got[10] == [
+        "Bitmap Heap Scan on n (actual rows=200 loops=1)",
+        "  Recheck Cond: ((b = 7) OR (b = 9))",
+        "  Heap Blocks: exact=28",
+        "  ->  BitmapOr (actual rows=0 loops=1)",
+        "        ->  Bitmap Index Scan on n_b (actual rows=102 loops=1)",
+        "              Index Cond: (b = 7)",
+        "        ->  Bitmap Index Scan on n_b (actual rows=106 loops=1)",
+        "              Index Cond: (b = 9)",
+    ]
+
+
+@pytest.mark.backlog("RP-1120")
+def test_a_range_index_scan_marks_dead_entries(rust_pg: Any) -> None:
+    """PostgreSQL 15.20's index scan of a range marks the entries of the
+    versions it finds dead to all (`_bt_killitems`), so the index-only scan
+    after it fetches only the live rows' heap tuples; this server's
+    executor takes the range for a bitmap scan, which marks nothing, and
+    the second scan fetches the dead versions too (`Heap Fetches: 10`)."""
+    steps = _UNVACUUMED[:3] + [
+        "update k set b = 'y' where a between 10 and 12",
+        _ANALYZE + "select * from k where a between 8 and 14",
+        _ANALYZE + "select a from k where a between 8 and 14",
+    ]
+    got = run_autocommit(fresh_db(_dsn(rust_pg)), steps)
+    assert got[-2] == [
+        "Index Scan using k_pkey on k (actual rows=7 loops=1)",
+        "  Index Cond: ((a >= 8) AND (a <= 14))",
+    ]
+    assert got[-1] == [
+        "Index Only Scan using k_pkey on k (actual rows=7 loops=1)",
+        "  Index Cond: ((a >= 8) AND (a <= 14))",
+        "  Heap Fetches: 7",
     ]
 
 
