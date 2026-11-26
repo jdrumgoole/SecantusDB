@@ -3245,10 +3245,15 @@ fn aggregate(
     }
     // mongod runs the pipeline for `executionStats`, and a window
     // function's run-time error is the executor's, not an explain
-    // document (measured 8.2.11: codes 2, 5423900, 5624903; RM-617).
+    // document (measured 8.2.11: codes 2, 5423900, 5624903; RM-617), as is
+    // a new root that is not a document (40228, RM-659).
     if verbosity != Verbosity::QueryPlanner
         && target_coll.is_some()
-        && pipeline.iter().any(|s| s.contains_key("$setWindowFields"))
+        && pipeline.iter().any(|s| {
+            s.contains_key("$setWindowFields")
+                || s.contains_key("$replaceRoot")
+                || s.contains_key("$replaceWith")
+        })
     {
         let mut run = checked.clone();
         run.insert(
@@ -3256,7 +3261,21 @@ fn aggregate(
             inner.get("aggregate").cloned().unwrap_or(Bson::Null),
         );
         run.insert("cursor", doc! { "batchSize": i32::MAX });
-        let reply = order::uncounted(|| crate::aggregate::aggregate_inline(&run, ctx))?;
+        // The error is the executor's own, without the aggregate's
+        // "Executor error during aggregate command" wrapper (measured
+        // 8.2.11).
+        let reply = order::uncounted(|| crate::aggregate::aggregate_inline(&run, ctx)).map_err(
+            |mut e| {
+                if let Some((_, cause)) = e
+                    .errmsg
+                    .strip_prefix("Executor error during aggregate command on namespace: ")
+                    .and_then(|rest| rest.split_once(" :: caused by :: "))
+                {
+                    e.errmsg = cause.to_string();
+                }
+                e
+            },
+        )?;
         if let Some(id) = reply
             .get_document("cursor")
             .ok()
