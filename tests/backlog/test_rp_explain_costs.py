@@ -3164,6 +3164,108 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              ->  Seq Scan on k",
         ],
     ),
+    # Measured on PostgreSQL 15.20 (RP-1056): `cost_sort` over the join's
+    # cheapest path, the ORDER BY column no path yields in order.
+    "an order by over a join prices its sort": (
+        "RP-1056",
+        _ANALYSED,
+        "explain select e.b, k.b from e join k on e.a = k.a order by e.b",
+        [
+            "Sort  (cost=94.97..97.47 rows=1000 width=6)",
+            "  Sort Key: e.b",
+            "  ->  Hash Join  (cost=27.50..45.14 rows=1000 width=6)",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "an order by a column the select list does not take sorts the join": (
+        "RP-1056",
+        _ANALYSED,
+        "explain select k.b from e join k on e.a = k.a order by e.b",
+        [
+            "Sort  (cost=94.97..97.47 rows=1000 width=6)",
+            "  Sort Key: e.b",
+            "  ->  Hash Join  (cost=27.50..45.14 rows=1000 width=6)",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "an order by descending over a left join prices its sort": (
+        "RP-1056",
+        _ANALYSED,
+        "explain select e.b, k.b from e left join k on e.a = k.a order by k.b desc",
+        [
+            "Sort  (cost=94.97..97.47 rows=1000 width=6)",
+            "  Sort Key: k.b DESC",
+            "  ->  Hash Left Join  (cost=27.50..45.14 rows=1000 width=6)",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "an order by over a filtered join prices its sort": (
+        "RP-1056",
+        _ANALYSED,
+        "explain select e.b, k.b from e join k on e.a = k.a where e.b = 'v1' order by k.b",
+        [
+            "Sort  (cost=41.82..42.07 rows=100 width=6)",
+            "  Sort Key: k.b",
+            "  ->  Hash Join  (cost=18.75..38.50 rows=100 width=6)",
+            "        Hash Cond: (k.a = e.a)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Hash  (cost=17.50..17.50 rows=100 width=7)",
+            "              ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=7)",
+            "                    Filter: (b = 'v1'::text)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (found while working RP-1056).
+    "an order by a join key over a join prices its sort": (
+        "RP-1119",
+        _ANALYSED,
+        "explain select e.b, k.b from e join k on e.a = k.a order by k.a",
+        [
+            "Sort  (cost=94.97..97.47 rows=1000 width=10)",
+            "  Sort Key: k.a",
+            "  ->  Hash Join  (cost=27.50..45.14 rows=1000 width=10)",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "an order by an output alias over a join prices its sort": (
+        "RP-1119",
+        _ANALYSED,
+        "explain select e.b as x, k.b from e join k on e.a = k.a order by x",
+        [
+            "Sort  (cost=94.97..97.47 rows=1000 width=6)",
+            "  Sort Key: e.b",
+            "  ->  Hash Join  (cost=27.50..45.14 rows=1000 width=6)",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "an order by over a join a where fixes prices its sort": (
+        "RP-1119",
+        _ANALYSED,
+        "explain select e.b, k.b from e join k on e.a = k.a where k.a = 5 order by e.b",
+        [
+            "Sort  (cost=25.81..25.82 rows=1 width=6)",
+            "  Sort Key: e.b",
+            "  ->  Nested Loop  (cost=0.28..25.80 rows=1 width=6)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "              Filter: (a = 5)",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "              Index Cond: (a = 5)",
+        ],
+    ),
     # Measured on PostgreSQL 15.19 (found while working RP-966).
     "a three-way hash join names the class's first member": (
         "RP-1057",
@@ -8904,6 +9006,7 @@ def _marked(name: str, item: str) -> Any:
         )
     fixed = item in (
         "RP-1058",
+        "RP-1056",
         "RP-1060",
         "RP-1061",
         "RP-1057",
