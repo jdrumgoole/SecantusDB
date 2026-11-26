@@ -3,7 +3,9 @@
 A find on `_id` of a collection made with `clusteredIndex` reads the table
 itself (the RecordId is the `_id`): a point read is
 `EXPRESS_CLUSTERED_IXSCAN`, a range a `CLUSTERED_IXSCAN` bounded by
-`minRecord` / `maxRecord` (measured on mongod 8.2.11, 2026-11-21).
+`minRecord` / `maxRecord` (measured on mongod 8.2.11, 2026-11-21). An open
+end is the type bracket's end, not null: `{_id: {$gt: 1}}` has
+`maxRecord: Infinity` (re-measured on mongod 8.2.11, 2026-11-26).
 """
 
 from __future__ import annotations
@@ -35,5 +37,5 @@ def test_an_id_range_is_a_bounded_clustered_scan(rust_mongo: Any) -> None:
         "stage": "CLUSTERED_IXSCAN",
         "direction": "forward",
         "minRecord": 1,
-        "maxRecord": None,
+        "maxRecord": float("inf"),
     }

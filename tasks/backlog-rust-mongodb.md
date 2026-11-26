@@ -3090,12 +3090,29 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       names `EXPRESS_CLUSTERED_IXSCAN` / `CLUSTERED_IXSCAN`.** On a collection
       made with `clusteredIndex` mongod 8.2.11 explains `{_id: 3}` as
       `EXPRESS_CLUSTERED_IXSCAN` and `{_id: {$gt: 1}}` as `CLUSTERED_IXSCAN`
-      with `direction`, `minRecord` and `maxRecord` (null for none): the scan
+      with `direction`, `minRecord` and `maxRecord` (an open end is the
+      type bracket's end: `$gt: 1` has `maxRecord: Infinity`): the scan
       reads the table, the RecordId being the `_id`. This server's planner
       still treats the clustering key as an `_id_` index (`FETCH` over
       `IXSCAN`, `indexBounds`). The rows come back right since storage-model
       phase 5 keys the table by `_id` itself; only the plan's shape differs,
       the work counters with it. Found by the phase 5 smoke test.
+      Measured on mongod 8.2.11 (2026-11-26), five `_id`s 1..5: the scan has
+      `keysExamined: 0`, and a filter it cannot bound stays on it
+      (`{_id: 3, x: 3}` is `[3, 3]` with `filter: {$and: [{x: {$eq: 3}}]}`;
+      `$in: [1, 3]` is one range `[1, 3]` keeping `filter: {_id: {$in:
+      ...}}`, not two intervals). The start bound is a seek, so a record
+      before it is not examined; the end is found by reading the first
+      record past it, which counts in `docsExamined` (`[2, 4)` examines 3,
+      `[3, 3]` 2, `$in [1, 3]` 4, `$gt: 1` backward 5); `works` is
+      `docsExamined` plus one when the scan runs off the table. A `sort:
+      {_id: -1}` runs it `backward` with no SORT. Sizing (2026-11-26): not a
+      rendering change -- the faithful fix drops the clustered key from the
+      planner's catalog and adds a bounded collection scan as a candidate
+      (mongod's `collscanIsBounded`), which reaches the trial ranking
+      against secondary indexes, the plan cache's signatures, the stream
+      executor and the read order `order.rs` takes from the plan; one
+      planner slice, not a lane item.
       Backlog-ID: pending
       Verify: tests/backlog/test_rm_clustered_explain.py::test_an_id_point_read_is_an_express_clustered_scan, tests/backlog/test_rm_clustered_explain.py::test_an_id_range_is_a_bounded_clustered_scan
       Backlog-ID: RM-739
