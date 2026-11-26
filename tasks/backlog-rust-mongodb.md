@@ -1995,7 +1995,8 @@ would see them. What is left:
 
 - [ ] **RUST MongoDB server: a `$match` after a `$changeStream` on an
       event field other than `operationType`, `documentKey`, `fullDocument`,
-      `ns` or `to`, or an `$expr` on one of those others, is not
+      `ns`, `to`, `clusterTime`, `lsid` or `txnNumber`, or an `$expr` on
+      one of those others or on the last three, is not
       rewritten into the oplog filter.** mongod 8.2.11
       rewrites `updateDescription`,
       `fullDocumentBeforeChange`, the renamed `clusterTime` / `lsid` /
@@ -2018,6 +2019,11 @@ would see them. What is left:
       twins on every rewritten field (`documentKey` and `fullDocument`
       keep the twin's operator, the others rewrite it as the equality);
       mongod drops an `$expr` on `fullDocument`, and so does this server.
+      The eighth (2026-11-26) renamed `clusterTime` (`ts`), `lsid` and
+      `txnNumber` into the events and the transaction filter (not the
+      unwind's), for every leaf `renamed` prints; a `$type` on them, and an
+      `$expr` (mongod prints the `$expr` and three copies of its
+      `$_internalExprEq` twin), are still left out of the read.
       The rest of
       `change_stream_rewrite_helpers.cpp` (`matchRewriteUpdateDescription`,
       the other event fields, their expression rewrites) is to transcribe
