@@ -1,12 +1,13 @@
-"""A backend's held statistics are published while it is busy again.
+"""A backend's held statistics were published while it was busy again.
 
 PostgreSQL 15 holds the counts a backend could not flush yet (its last
 flush under a second before) for the idle timer, and turns that timer off
 as soon as the next command is read: the counts go out when the backend is
-next idle. Here `begin_message_cycle`'s wake never runs -- the wire layer's
-`MessageStartHook` opens the cycle at the message's first byte, so the
-branch that ends the idle wait is dead -- and another backend's report
-flushes them ten seconds later, mid-statement.
+next idle. Here `begin_message_cycle`'s wake never ran -- the wire layer's
+`MessageStartHook` opened the cycle at the message's first byte, so the
+branch that ends the idle wait was dead -- and another backend's report
+flushed them ten seconds later, mid-statement. The hook now starts the
+cycle itself (`open_message_cycle`), idle timer included.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import pytest
 from tests.backlog.conftest import pg_answer
 
 
-@pytest.mark.backlog("RP-1116")
+@pytest.mark.backlog_fixed("RP-1116")
 def test_a_busy_backends_held_counts_wait_until_it_is_idle(rust_pg: Any) -> None:
     """Measured against PostgreSQL 15.20: the second insert's count, held
     for the idle timer, is not visible while its backend sleeps (1), and is

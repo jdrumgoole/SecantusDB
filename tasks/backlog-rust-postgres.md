@@ -487,21 +487,6 @@ one beside it.
   Left open as a watch item until the lane stays green.
   Backlog-ID: RP-571
   Verify: none -- intermittent, Linux CI only, not reproduced on macOS; RP-002's two regression tests are the check, and print the cancel trace on a miss
-- [ ] **A busy backend's held statistics are published mid-statement.**
-  PostgreSQL 15 holds the counts a backend could not flush yet (under a
-  second since its last flush) for the idle timer, and turns that timer
-  off when it reads the next command, so they go out when the backend is
-  next idle: inserts held that way, then `pg_sleep(13)`, and another
-  session reads `n_tup_ins` 1 at 11.5 s and 2 afterwards (15.20). Here it
-  reads 2 at 11.5 s: `begin_message_cycle`'s first-message branch never
-  runs, because the wire layer's `MessageStartHook` (installed at
-  startup) opens the cycle at the message's first byte, so
-  `stats().wake()` never clears `idle_since` and another backend's
-  `flush_idle` flushes the busy one. The same dead branch never moves
-  `message_cycle` (a key of the per-cycle catalog cache, RP-715) and never
-  writes the trace's `cycle start` line. Found while working RP-1115.
-  Verify: tests/backlog/test_rp_busy_backend_stats.py::test_a_busy_backends_held_counts_wait_until_it_is_idle
-  Backlog-ID: RP-1116
 - [ ] **RUST pgserver: the planner's choices that decide row order are only
   partly modelled.** **Decided (Joe, 2026-10-16): build a cost model** --
   enough of PostgreSQL's planner to make its choices, since the order rows
