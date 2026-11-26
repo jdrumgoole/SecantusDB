@@ -1909,8 +1909,13 @@ def test_a_built_in_catalogs_first_reads(rust_pg: Any) -> None:
 def catalog_blocks(dsn: str) -> list[dict[str, int]]:
     """The heap blocks each catalog counts in `pg_statio_sys_tables` over
     `INDEX_BLOCK_STEPS`, which read this module's objects' catalog rows:
-    rows added after `initdb`, which the model has not placed yet."""
-    return _block_deltas(dsn, INDEX_BLOCK_STEPS, "pg_stat_sys_tables", "relid", True)
+    rows added after `initdb`. Measured in a fresh database
+    (`after_ddl_cycles`), as the other answers that follow the heap's
+    places are: where `rpc_t`'s rows go depends on the DDL that database
+    ran before them. In the shared database that DDL is whatever the
+    module's earlier tests on the same server ran, and under xdist
+    (`--dist worksteal`) that changes from run to run (RP-1111)."""
+    return after_ddl_cycles(dsn, 1, INDEX_BLOCK_STEPS)
 
 
 EXPECTED_CATALOG_BLOCKS: list[dict[str, int]] = [
@@ -2459,6 +2464,30 @@ def test_a_views_and_a_functions_rows_are_read_from_the_heap(rust_pg: Any) -> No
     FUNCTION wrote reads the row's heap block, as one of CREATE TABLE's
     does."""
     assert after_ddl_cycles(_dsn(rust_pg), 1, OTHER_DDL_STEPS)[1:] == EXPECTED_OTHER_DDL_BLOCKS
+
+
+# RP-291, what is left of it: a dead row's space. PostgreSQL prunes the
+# rows a DROP left dead (`heap_page_prune_opt`) and puts new rows in that
+# space again, so `INDEX_BLOCK_STEPS` read the same blocks after any number
+# of cycles of the module's DDL in one database: `EXPECTED_CATALOG_BLOCKS`
+# for every k from 1 to 14 (a private PostgreSQL 15.20 cluster, 2026-11-26,
+# set up as `EXPECTED_CLEARED_VM_BLOCKS` was; the box has no 15.19 binary
+# since 2026-11-24). The model never frees that space, so each cycle's
+# rows go after the last cycle's. At the tenth cycle (and only there, of
+# 1 to 14) the primary-key lookup reads 4 `pg_attribute` blocks where
+# PostgreSQL reads 3, most likely because `rpc_t`'s rows cross a page
+# boundary. RP-1111 found it, as `test_catalog_blocks` failing on CI in
+# the shared database.
+DEAD_SPACE_CYCLES = 10
+
+
+@pytest.mark.backlog("RP-291")
+def test_a_dead_rows_space_takes_new_rows(rust_pg: Any) -> None:
+    """PostgreSQL 15.20: after nine cycles of the module's DDL in one
+    database, the tenth cycle's catalog rows read the same blocks as the
+    first cycle's, because pruning gave their space back."""
+    got = after_ddl_cycles(_dsn(rust_pg), DEAD_SPACE_CYCLES, INDEX_BLOCK_STEPS)
+    assert got == EXPECTED_CATALOG_BLOCKS
 
 
 # RP-935 (fixed): the index a catalog read directly is scanned through, and how

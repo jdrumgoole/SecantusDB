@@ -1237,34 +1237,6 @@ one beside it.
       Verify: none -- intermittent on CI; RP-715's, RP-911's and RP-1073's tests are the check
       Backlog-ID: RP-1100
 
-- [ ] **`test_catalog_blocks` once counted an extra `pg_attribute` block
-      on CI (2026-11-25).** `tests/backlog/test_rp_catalog_reads.py::test_catalog_blocks`
-      (RP-291's regression test) read 4 `pg_attribute` heap blocks for
-      `select * from rpc_t where id = 1`, where PostgreSQL 15.19 reads 3
-      (third step; the other steps matched). PR #2998 at `432c8ec3e`, job
-      `pg-oracle (backlog)`, run 45711355695. It passed on every other run
-      found that day, #2996's (the same tree less RP-1065, whose change is
-      EXPLAIN-only) included. Not reproduced locally (debug, arm64 macOS):
-      alone on RP-1065's tree and on the tree before it; the whole module
-      serially, twice; each of the 29 tests defined after it run just before
-      it on one server; and eight runs on one server with
-      `autovacuum_naptime = 1s` (the expected counts were measured with
-      autovacuum off). The module shares one server (`rust_pg` is
-      module-scoped) and CI runs it `-n auto --dist worksteal`, so the
-      tests before it on its server are not fixed; a combination of
-      earlier tests, or a race with something the server does in the
-      background, is what is left. PostgreSQL reads the same blocks for
-      the same query every time. A second time, the same diff in the same
-      step: PR #3002 at `32d5d7242` (RP-1062, EXPLAIN-only), run
-      45730933189, 2026-11-26. Both failures came after RP-1073's
-      6711f3618, which changed how a keyed `pg_attribute` read finds its
-      tables (`tables_of_relids`, by name over the sorted shared
-      definitions, with a fallback when they are not in name order) --
-      which tables the module's earlier tests left on the server decides
-      that order; look there first.
-      Verify: none -- intermittent (2 CI runs of about five), not reproducible on demand; the test named above is where it shows
-      Backlog-ID: RP-1111
-
 ## Found by a CI run (2026-11-07)
 
 - [ ] **OPEN — CI: `obj_description` of a commented index answered NULL
@@ -1683,10 +1655,18 @@ a regression test.
         leaf pages are read over `initdb`'s tree), with a non-HOT update's
         new version and entries, and VACUUM's removal of dead ones;
       - a dead row's space: on-access pruning (`heap_page_prune_opt`) and
-        VACUUM do not free it, and a scan never meets a dead row's entry
-        (it reads as killed at once, where PostgreSQL's first scan reads
-        its block before `_bt_killitems`); a ROLLBACK TO SAVEPOINT past a
-        CREATE TABLE keeps its rows live;
+        VACUUM do not free it, so each cycle of DDL in a database puts
+        its rows after the last cycle's, where PostgreSQL puts them in the
+        space pruning gave back. At the module's tenth cycle in one
+        database (only there, of cycles 1 to 14), where `rpc_t`'s rows
+        land makes its primary-key lookup read 4 `pg_attribute` blocks
+        where PostgreSQL 15.20 reads 3, most likely its rows crossing a
+        page boundary (`test_a_dead_rows_space_takes_new_rows`; this is why
+        `test_catalog_blocks` failed on CI in the shared database until it
+        moved to a fresh one, RP-1111). Also, a scan never meets a dead
+        row's entry (it reads as killed at once, where PostgreSQL's first
+        scan reads its block before `_bt_killitems`); a ROLLBACK TO
+        SAVEPOINT past a CREATE TABLE keeps its rows live;
       - a restart: the places are kept in memory, so after one the rows
         read as unplaced again (a row returned beyond the placed ones is
         fetched as a block of its own by an index-only scan, and counts no
@@ -1705,7 +1685,7 @@ a regression test.
       blocks, not 56; `pg_class`, `pg_type`, `pg_index` and `pg_database`
       are 15.19's page for page, which is what this slice was measured on.
       Backlog-ID: RP-291
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_views_and_a_functions_rows_are_read_from_the_heap
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_views_and_a_functions_rows_are_read_from_the_heap, tests/backlog/test_rp_catalog_reads.py::test_a_dead_rows_space_takes_new_rows
 - [ ] **No logical replication launcher scans `pg_subscription`.**
       PostgreSQL 15.19's launcher (`ApplyLauncherMain`) heap-scans
       `pg_subscription` as it starts, again at once, then whenever its
