@@ -37,11 +37,14 @@ def _count(path: Path, prefix: str) -> int:
     return sum(1 for p in path.iterdir() if p.name.startswith(prefix) and p.suffix == ".wt")
 
 
-@pytest.mark.backlog("RP-1074")
+@pytest.mark.backlog_fixed("RP-1074")
 def test_a_table_is_its_own_collection_table(tmp_path: Path) -> None:
     """A table is stored as mongod stores a collection: its own
     `collection-<UUID>.wt` table, and an `index-<UUID>.wt` table for its
-    PRIMARY KEY (the `_id_` index)."""
+    PRIMARY KEY (the `_id_` index). The first `CREATE TABLE` of a store
+    added three more collections and their indexes (the heap and B-tree
+    page maps and the oid counter), made lazily where PostgreSQL's `initdb`
+    makes every catalog; they are made at server start now."""
     from tests.test_rust_pgserver_slice import _Server
 
     base = tmp_path / "base"

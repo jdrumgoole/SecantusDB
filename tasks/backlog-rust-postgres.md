@@ -3657,11 +3657,43 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       now opens the store `secantusd-pg` writes, initiates as a one-member
       set (the store holds no `local.system.replset`) and reads the table
       as a collection, but each document carries `__sys_xmin`, `__sys_cid`,
-      `__sys_xmax` and `__sys_ctid`; and the first `CREATE TABLE` of a store
-      adds four collections and four index tables, not one each (the
-      server's own catalog collections are made with it).
+      `__sys_xmax` and `__sys_ctid` (`{_id: 1, name: 'bolt', qty: 40,
+      __sys_xmin: 723, __sys_cid: 0, __sys_xmax: 0, __sys_ctid: 1}`,
+      re-measured 2026-11-26). (The first `CREATE TABLE` of a store no
+      longer adds the heap and B-tree page maps and the oid counter beside
+      its own collection: they are made at server start since 2026-11-26.)
+      **Decision needed (2026-11-26):** where the tuple header goes once
+      the stored document is the row alone. In PostgreSQL `t_xmin`,
+      `t_xmax`, `t_cid` and `t_ctid` are the tuple's header, on the heap
+      page beside the data; in mongod's model the record is the BSON
+      document and nothing else (a record with bytes after the document
+      fails mongod's `validate`). The fields are read as document fields
+      today in 39 places across 9 files (`heap.rs`, `lib.rs`,
+      `pgstat_sql.rs`'s `{__sys_ctid: {$lte: ...}}` filter, the
+      `in_ctid_order` sort, `serializable.rs` / `am_ssi.rs` reading
+      `__sys_xmin`, the `secantus-pgcatalog` system-column map) and
+      stripped for MongoDB clients by `secantus-storage-adapter`. Options,
+      most faithful first:
+      (a) the header in a private WiredTiger table beside the collection
+      (`secantus_pg_tuple_headers`, keyed by the collection's ident and the
+      RecordId, written in the record's own transaction), which mongod
+      ignores as it does the other `secantus_*` tables; a SQL scan walks it
+      in step with the collection (same RecordId order), and a record with
+      no header row (written by `secantusd-mdb` or mongod) reads as a
+      ctid-less row does today (`heap::in_ctid_order`). A change to the
+      shared storage crate's write, delete and scan paths, and a second
+      cursor per SQL scan; a MongoDB-side update of a SQL row must drop the
+      row's header too. Several PRs.
+      (b) keep the header in the document, so mongod sees four extra
+      fields, and restate the gap test to expect them: a departure from
+      decision 3's "reads back through mongod as it reads back through
+      `secantusd-mdb`".
+      (c) not persist it: derive xmin/ctid at open, which undoes RP-069
+      (Joe, 2026-10-22: persist the per-row state).
+      Recommended: (a), the only option that keeps both RP-069 and
+      decision 7.
       Backlog-ID: RP-1074
-      Verify: tests/backlog/test_rp_storage_model.py::test_a_table_is_its_own_collection_table, tests/backlog/test_rp_storage_model.py::test_mongod_reads_a_table_the_sql_server_wrote
+      Verify: tests/backlog/test_rp_storage_model.py::test_mongod_reads_a_table_the_sql_server_wrote
 - [ ] **`pg_relation_filepath` of a system catalog is NULL.** PostgreSQL
       15.19 gives every catalog a file (`pg_class` is `base/5/1259`,
       `pg_database` `global/1262`); this server computes its catalogs, keeps
@@ -3724,6 +3756,25 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       it.
       Backlog-ID: RP-1135
       Verify: tests/backlog/test_rp_storage_model.py::test_filepath_of_a_relation_the_open_transaction_created
+
+## Found while working RP-1074 (2026-11-26)
+
+- [ ] **A fresh `secantusd-pg` once printed nothing for 30 s at start.**
+      In the backlog step of a `gate_pg.sh --fast` run (4 workers, the
+      other pg-batch lane also running), `tests/backlog/test_rp_found_rp530.py`'s
+      module server (`rust_pg`, a fresh store) gave no `listening on` line
+      within `_Server`'s 30 s and no output after its stop, so all 32 of
+      the module's tests errored at setup as `REGRESSED`. Not reproduced:
+      the module alone passed (32 in 138 s), the step's full rerun had no
+      start failure, and 24 fresh starts eight at a time took 7.8-9.5 s
+      each (a lone debug start is about 4.2 s). Not yet known: whether the
+      server stalled (a lock, a WiredTiger create waiting on a checkpoint)
+      or was starved, since the harness keeps no stack or timing of a
+      start it gives up on. The harness should sample the child
+      (`sample <pid>` on macOS) before it kills one that missed the
+      deadline, so the next one leaves its stacks.
+      Verify: none -- an intermittent start stall under load, not reproduced; tests/test_rust_pgserver_slice.py::_Server's start deadline is the check
+      Backlog-ID: RP-1136
 
 ## Found while working RP-1068 (2026-11-26)
 

@@ -687,6 +687,9 @@ pub fn bind_with(
         if handler.select_database("postgres").is_ok() {
             handler.install_user_types();
         }
+        if let Err(e) = handler.ensure_oid_counter() {
+            eprintln!("secantusd-pg: could not create the oid counter: {e}");
+        }
     }
     let stop_flag = Arc::new(AtomicBool::new(false));
     let active = Arc::new(AtomicUsize::new(0));
