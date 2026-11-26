@@ -6380,9 +6380,15 @@ fn expr_node_printed_with(
 /// it (`show_sort_group_keys`, RP-840): a column bare, any other key the
 /// planned expression its Var resolves to, parenthesised as `get_variable`
 /// does for a non-Var subplan output, its window calls `OVER (?)`. An
-/// ordinal key is its target's expression. `None` when every key is a
-/// plain column (the plan's own text is then right), or for a key the
-/// printer does not know.
+/// ordinal key is its target's expression, and so is a bare name a
+/// target's output name matches (`findTargetlistEntrySQL92`: in ORDER BY
+/// the output name wins over the table's column), so `select a as x ...
+/// order by x` is `Sort Key: a` and `select a+1 as a ... order by a` is
+/// `((a + 1))`. A key is the expression, never the output name a target
+/// gives it: `select a+1 ... order by a` is `Sort Key: a` (RP-1066).
+/// `None` when the select list is bare, unaliased columns and every key a
+/// plain column stored under its own name (the plan's own text is then
+/// right), or for a key the printer does not know.
 pub fn explain_sort_keys(
     s: &pg_query::protobuf::SelectStmt,
     def: &TableDef,
@@ -6402,6 +6408,37 @@ pub fn explain_sort_keys(
             _ => None,
         })
         .collect();
+    // Each target's output name (`resname`): its alias, else the name
+    // `FigureColname` gives it. A `*` names no target a key can match.
+    let resnames: Vec<Option<String>> = s
+        .target_list
+        .iter()
+        .filter_map(|t| match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => {
+                let val = rt.val.as_deref()?;
+                let star = matches!(val.node.as_ref(), Some(N::ColumnRef(c))
+                    if c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_)))));
+                Some(if !rt.name.is_empty() {
+                    Some(rt.name.clone())
+                } else if star {
+                    None
+                } else {
+                    Some(figure_colname(val))
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    // Any select-list entry but a bare, unaliased column (or `*`) names its
+    // output other than the column a plain key reads, which the plan's own
+    // text would print.
+    let mut computed = targets.iter().zip(&resnames).any(|(t, name)| match name {
+        None => false,
+        Some(name) => match t.node.as_ref() {
+            Some(N::ColumnRef(c)) => names(&c.fields).pop().as_deref() != Some(name.as_str()),
+            _ => true,
+        },
+    });
     // A key qualified by the FROM's alias resolves against it (RP-1035).
     let refname = match s.from_clause.as_slice() {
         [item] => match item.node.as_ref() {
@@ -6411,24 +6448,35 @@ pub fn explain_sort_keys(
         _ => None,
     }
     .unwrap_or_else(|| def.name.clone());
-    let mut computed = false;
     let mut out = Vec::new();
     for item in &s.sort_clause {
         let Some(N::SortBy(sb)) = item.node.as_ref() else {
             return None;
         };
         let mut key = sb.node.as_deref()?;
-        if let Some(N::AConst(c)) = key.node.as_ref() {
-            let Some(Val::Ival(v)) = c.val.as_ref() else {
-                return None;
-            };
-            key = targets.get(usize::try_from(v.ival).ok()?.checked_sub(1)?)?;
+        match key.node.as_ref() {
+            Some(N::AConst(c)) => {
+                let Some(Val::Ival(v)) = c.val.as_ref() else {
+                    return None;
+                };
+                key = targets.get(usize::try_from(v.ival).ok()?.checked_sub(1)?)?;
+            }
+            Some(N::ColumnRef(c)) if c.fields.len() == 1 => {
+                let name = c.fields.first().and_then(sval)?;
+                if let Some(i) = resnames.iter().position(|n| n.as_deref() == Some(name)) {
+                    key = targets[i];
+                }
+            }
+            _ => {}
         }
         let text = match key.node.as_ref() {
             Some(N::ColumnRef(c)) => {
                 let name = c.fields.last().and_then(sval)?;
                 // An output alias, or a column this does not resolve.
-                def.columns.iter().find(|col| col.name == name)?;
+                let col = def.columns.iter().find(|col| col.name == name)?;
+                // A column stored under another field (a primary key's
+                // `_id`) the plan's own text would print by that field.
+                computed |= col.field() != col.name;
                 q(name)
             }
             _ => {
@@ -6766,6 +6814,59 @@ mod tests {
             explain_sort_keys(&s, &def),
             Some(vec!["((a * 2))".to_string()])
         );
+    }
+
+    /// PostgreSQL 15.19 (RP-1066): a Sort Key is the expression the key
+    /// resolves to, never a target's output name; a bare name an output
+    /// name matches is that target (`findTargetlistEntrySQL92`).
+    #[test]
+    fn a_sort_key_is_the_expression_not_the_output_name() {
+        let def = TableDef::new(
+            "e",
+            vec![
+                Column::new("a", "int4", false),
+                Column::new("b", "text", false),
+            ],
+        );
+        for (sql, want) in [
+            ("select a+1 from e order by a", Some(vec!["a"])),
+            ("select a+1 from e order by a desc", Some(vec!["a DESC"])),
+            ("select a as x from e order by x", Some(vec!["a"])),
+            ("select a as x from e order by a", Some(vec!["a"])),
+            ("select a+1 as a from e order by a", Some(vec!["((a + 1))"])),
+            ("select b, a+1 from e order by a, b", Some(vec!["a", "b"])),
+            ("select upper(b) from e order by b", Some(vec!["b"])),
+            (
+                "select upper(b) from e order by upper",
+                Some(vec!["(upper(b))"]),
+            ),
+            ("select a, b from e order by a", None),
+            ("select * from e order by b", None),
+        ] {
+            let Some(N::SelectStmt(s)) = parse_select(sql).and_then(|n| n.node) else {
+                panic!("not a select");
+            };
+            let want = want.map(|w| w.into_iter().map(String::from).collect::<Vec<_>>());
+            assert_eq!(explain_sort_keys(&s, &def), want, "{sql}");
+        }
+        // A primary key is stored as `_id`; its key is still its name.
+        let def = TableDef::new(
+            "k",
+            vec![
+                Column::new("a", "int4", true),
+                Column::new("b", "text", false),
+            ],
+        );
+        for (sql, want) in [
+            ("select b from k order by a", Some(vec!["a"])),
+            ("select b from k order by b", None),
+        ] {
+            let Some(N::SelectStmt(s)) = parse_select(sql).and_then(|n| n.node) else {
+                panic!("not a select");
+            };
+            let want = want.map(|w| w.into_iter().map(String::from).collect::<Vec<_>>());
+            assert_eq!(explain_sort_keys(&s, &def), want, "{sql}");
+        }
     }
 
     fn cat_lookup(n: &str) -> Option<TableDef> {
