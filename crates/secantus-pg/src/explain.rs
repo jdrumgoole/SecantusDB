@@ -983,18 +983,33 @@ pub(crate) fn apply_join_pick(
 /// Draw and price a two-table Nested Loop as
 /// [`PgHandler::nest_loop_estimate`] priced it (RP-329, RP-354): the inner
 /// materialised or read through its index parameterized by the outer row,
-/// a LEFT join's preserved side read through its index.
+/// each side its own cheapest path -- a LEFT join's preserved side, or a
+/// side no join clause parameterizes, read through its index where that
+/// wins (RP-354, RP-1068) -- before the loop orders them.
 pub(crate) fn apply_nest_loop(tree: &mut PlanNode, est: crate::scan_estimate::NestLoopEstimate) {
-    let (plan, a, b, join, param, outer_index) = est;
-    price_nest_loop(tree, &plan, a, b, join);
-    // A LEFT join's preserved side read through its
-    // index, its WHERE the Index Cond (RP-354).
-    if let Some(index) = outer_index {
-        let outer = &mut tree.children[0];
-        if let Some(table) = outer.name.strip_prefix("Seq Scan on ").map(str::to_string) {
-            index_path_node(outer, index, &table);
+    let (plan, a, b, join, param, indexes) = est;
+    // Each side as the cost model priced it, its WHERE the Index Cond of
+    // an index path or the Filter of its Seq Scan, as the scans' quals are
+    // placed later by the index each names.
+    if tree.children.len() == 2 {
+        for (side, index) in tree.children.iter_mut().zip(indexes) {
+            let table = side
+                .name
+                .strip_prefix("Seq Scan on ")
+                .or_else(|| {
+                    side.name
+                        .strip_prefix("Index Scan using ")
+                        .or_else(|| side.name.strip_prefix("Index Only Scan using "))
+                        .and_then(|r| r.split_once(" on "))
+                        .map(|(_, t)| t)
+                })
+                .map(str::to_string);
+            if let (Some(table), true) = (table, side.children.is_empty()) {
+                scan_path_node(side, index, &table);
+            }
         }
     }
+    price_nest_loop(tree, &plan, a, b, join);
     // The inner read through its index, the join
     // clause its Index Cond (RP-354).
     if let Some(p) = param {

@@ -678,6 +678,19 @@ impl PgHandler {
             let Statement::Select(leaf) = plan.as_ref() else {
                 return None;
             };
+            // A side no `<`, `<=`, `>` or `>=` reads has no parameterized
+            // path (a `<>` is never an index qual): its only paths are its
+            // restriction's, the cheapest of which -- an index path where
+            // that wins -- is the loop's side (`set_cheapest`, RP-1068).
+            let unparameterized = !preserved_side
+                && !inequalities().any(|f| {
+                    f.bounds
+                        .iter()
+                        .any(|b| columns.iter().any(|(k, _)| *k == b.key))
+                        || f.inequality_keys
+                            .iter()
+                            .any(|k| columns.iter().any(|(c, _)| c == k))
+                });
             if leaf.residual.is_some()
                 || leaf.sub.is_some()
                 || leaf.series.is_some()
@@ -700,7 +713,8 @@ impl PgHandler {
                                 .any(|ix| ix.table.name == leaf.table && ix.keys.contains(&0)))
                         || (!leaf.filter.is_empty()
                             && !self.own_quals(&leaf.table, &leaf.filter).is_some_and(|q| {
-                                q.iter().all(|(_, q)| matches!(q, costsize::Qual::Ne))
+                                unparameterized
+                                    || q.iter().all(|(_, q)| matches!(q, costsize::Qual::Ne))
                                     || own_bounds_only(&q)
                                     || self.quals_unindexed(&leaf.table, &q)
                             }))))
@@ -734,7 +748,7 @@ impl PgHandler {
                 .map(|(_, f)| stored(f))
                 .collect::<Option<_>>()?;
             let (scan, index) = self.scan_estimate(&leaf.table, &leaf.filter, &read)?;
-            if index.is_some() && !preserved_side {
+            if index.is_some() && !preserved_side && !unparameterized {
                 return None;
             }
             let (width, None) = self.scan_estimate(&leaf.table, &Document::new(), &above)? else {
@@ -772,7 +786,7 @@ impl PgHandler {
             Some((scan, width.3, index))
         };
         let (a, a_above, a_index) = side(left, left_join)?;
-        let (b, b_above, _) = match (side(right, false), over) {
+        let (b, b_above, b_index) = match (side(right, false), over) {
             (Some(_), Some(rel)) => (rel.est, rel.above, None),
             (side, _) => side?,
         };
@@ -933,7 +947,7 @@ impl PgHandler {
                 b,
                 (plan.startup, plan.total, rows, a_above + b_above),
                 None,
-                a_index,
+                [a_index, b_index],
             ));
         }
         let plan = secantus_pgplan::joincost::cheapest_nest_loop_param(
@@ -953,8 +967,15 @@ impl PgHandler {
         };
         let rows = costsize::clamp_row_est(rows);
         let join = (plan.startup, plan.total, rows, a_above + b_above);
+        let (mut a_index, mut b_index) = (a_index, b_index);
         let (a, b, scan) = if plan.param {
             let slot = usize::from(plan.b_outer);
+            // The inner is its parameterized scan, not its own path.
+            if plan.b_outer {
+                a_index = None;
+            } else {
+                b_index = None;
+            }
             let p = param[slot]?;
             let est = |e: Estimate| (p.startup, p.total, p.rows, e.3);
             let mut scan = param_scans[slot].take();
@@ -970,10 +991,10 @@ impl PgHandler {
             (a, b, None)
         };
         // The preserved side is the loop's outer, never moved.
-        if a_index.is_some() && plan.b_outer {
+        if left_join && a_index.is_some() && plan.b_outer {
             return None;
         }
-        Some((plan, a, b, join, scan, a_index))
+        Some((plan, a, b, join, scan, [a_index, b_index]))
     }
 
     /// A left-deep chain of Nested Loops over three to eight tables'
@@ -7962,15 +7983,17 @@ struct KeyIndex {
 }
 
 /// [`PgHandler::nest_loop_estimate`]'s answer: the plan, the two scans'
-/// and the join's estimates, the inner's parameterized index scan and the
-/// preserved side's index path, where either is chosen.
+/// and the join's estimates, the inner's parameterized index scan, and
+/// each side's index path (the join's left side, then its right) where
+/// its own cheapest path is one: a LEFT join's preserved side (RP-354), or
+/// a side no join clause can parameterize (RP-1068).
 pub(crate) type NestLoopEstimate = (
     secantus_pgplan::joincost::NestLoopPlan,
     Estimate,
     Estimate,
     Estimate,
     Option<ParamScan>,
-    Option<ScanIndex>,
+    [Option<ScanIndex>; 2],
 );
 
 /// `neqjoinsel` of a `<>` (or IS DISTINCT FROM) between two analysed

@@ -3433,8 +3433,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966).
-    # Measured on PostgreSQL 15.19 (found while working RP-1038): the
-    # one-row index side is the loop's outer.
+    # Measured on PostgreSQL 15.19 (found while working RP-1038; fixed,
+    # RP-1068): the one-row index side is the loop's outer, its own cheapest
+    # path, as no `<>` parameterizes it.
     "a nested loop over an inner relation's index qual is priced": (
         "RP-1068",
         _ANALYSED,
@@ -3445,6 +3446,50 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Index Only Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=4)",
             "        Index Cond: (a = 5)",
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1068): the `<` reads the indexed side, which may be parameterized,
+    # and its own equality's one-row path still wins as the outer.
+    "a nested loop over an index qual a join inequality also reads is priced": (
+        "RP-1124",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a < k.a where k.a = 5",
+        [
+            "Nested Loop  (cost=0.28..35.79 rows=333 width=3)",
+            "  Join Filter: (e.a < k.a)",
+            "  ->  Index Only Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=4)",
+            "        Index Cond: (a = 5)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1068): the other side's index scan parameterized by the one row.
+    "a nested loop's one-row outer parameterizes the other index": (
+        "RP-1124",
+        _ANALYSED,
+        "explain select x.b from k x join k y on x.a < y.a where y.a = 5",
+        [
+            "Nested Loop  (cost=0.55..30.72 rows=333 width=3)",
+            "  ->  Index Only Scan using k_pkey on k y  (cost=0.28..8.29 rows=1 width=4)",
+            "        Index Cond: (a = 5)",
+            "  ->  Index Scan using k_pkey on k x  (cost=0.28..19.10 rows=333 width=7)",
+            "        Index Cond: (a < y.a)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1068): `cost_agg`'s AGG_PLAIN over the loop's rows.
+    "an aggregate over a nested loop is priced": (
+        "RP-1125",
+        _ANALYSED,
+        "explain select count(*) from e join k on e.a <> k.a",
+        [
+            "Aggregate  (cost=17530.00..17530.01 rows=1 width=8)",
+            "  ->  Nested Loop  (cost=0.00..15032.50 rows=999000 width=0)",
+            "        Join Filter: (e.a <> k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+            "        ->  Materialize  (cost=0.00..20.00 rows=1000 width=4)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
         ],
     ),
     # Priced since RP-1038: no index covers the inner's conjunct.
@@ -9415,6 +9460,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-1061",
         "RP-1057",
         "RP-1038",
+        "RP-1068",
         "RP-1039",
         "RP-1025",
         "RP-1035",
