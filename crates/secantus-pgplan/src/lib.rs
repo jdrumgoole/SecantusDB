@@ -31,7 +31,7 @@ mod subquery_pullup;
 pub use domain_scope::{select_output_domains, select_target_domain};
 pub use initplan::InitPlan;
 pub use join_removal::JoinRemoval;
-pub use sublink_join::SemiJoin;
+pub use sublink_join::{KeyExpr, SemiJoin};
 mod targetlist_size;
 pub use targetlist_size::MAX_HEAP_ATTRIBUTE_NUMBER;
 mod cmpfn;
@@ -14890,6 +14890,14 @@ pub fn plan_check_expression(expression: &str, def: &TableDef) -> Result<ColumnE
             _ => None,
         })
         .ok_or_else(|| Error::Parse("CHECK expression is not an expression".into()))?;
+    plan_expression_node(val, def)
+}
+
+/// [`plan_check_expression`] of an expression already parsed.
+pub(crate) fn plan_expression_node(
+    val: &pg_query::protobuf::Node,
+    def: &TableDef,
+) -> Result<ColumnExpr> {
     let mut val = val.clone();
     plan_whole_row_refs(&mut val, def)?;
     plan_check_tableoid(&mut val, &def.name)?;

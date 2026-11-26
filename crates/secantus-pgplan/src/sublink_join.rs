@@ -10,6 +10,11 @@
 //! a WHERE over that relation alone, which filters its scan (IN), or a WHERE
 //! that is the one correlating column equality (EXISTS). Anything else is left to the plan as written.
 //!
+//! Either side of an IN's comparison may be an expression over one column
+//! of its relation (`a::bigint in (select a::bigint + 0 from k)`): the
+//! hash clause compares the expressions, and the inner side made unique is
+//! grouped by its expression (`create_unique_path`).
+//!
 //! Over an inner relation unique on its column, `reduce_unique_semijoins`
 //! makes the semi join an inner join: `as_inner_join` writes that join, and
 //! the server plans it when a unique index fixes the column.
@@ -28,10 +33,17 @@ pub struct SemiJoin {
     pub outer: (String, String),
     /// The inner relation's table and printed name.
     pub inner: (String, String),
-    /// The inner relation's column the clause compares.
+    /// The inner relation's column the clause compares (or the one its
+    /// expression reads).
     pub inner_col: String,
-    /// The outer relation's column the clause compares.
+    /// The outer relation's column the clause compares (or the one its
+    /// expression reads).
     pub outer_col: String,
+    /// The outer side of an IN's comparison where it is an expression over
+    /// `outer_col` (RP-411); `None`: the bare column.
+    pub outer_expr: Option<KeyExpr>,
+    /// The inner side's, over `inner_col`.
+    pub inner_expr: Option<KeyExpr>,
     /// `(outer.col = inner.col)`.
     pub hash_cond: String,
     /// The WHERE's other conjuncts, over the outer relation alone, as its
@@ -52,6 +64,82 @@ pub struct SemiJoin {
     /// from the outer side. Planned in `plan_explain`; the server, which
     /// knows the unique indexes, chooses it.
     pub inner_join: Option<Box<Statement>>,
+}
+
+/// One side of a semi join's clause that is an expression over one column
+/// of its relation (RP-411).
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyExpr {
+    /// As EXPLAIN prints it, qualified: `((k.a)::bigint + 0)`.
+    pub text: String,
+    /// The operators it evaluates a row (`cost_qual_eval`).
+    pub ops: u32,
+    /// Its result type's name (`int8`).
+    pub pg_type: String,
+    /// As written, its columns qualified by the relation's printed name.
+    pub node: pg_query::protobuf::Node,
+}
+
+/// `n`, every column of which is `def`'s (printed as `name`), as a
+/// [`KeyExpr`] with the one column it reads: an integer or string
+/// expression `expr_side` prices, reading exactly one column and
+/// evaluating at least one operator (a bare column, or a cast PostgreSQL
+/// strips, is not one).
+fn key_expr(n: &pg_query::protobuf::Node, name: &str, def: &TableDef) -> Option<(String, KeyExpr)> {
+    if !outer_only(n, name, def) {
+        return None;
+    }
+    let side = expr_side(n, def)?;
+    let [field] = side.fields.as_slice() else {
+        return None;
+    };
+    if side.operators == 0 {
+        return None;
+    }
+    let col = def
+        .columns
+        .iter()
+        .find(|c| c.field() == *field)?
+        .name
+        .clone();
+    let mut shown = def.clone();
+    shown.name = name.to_string();
+    let text = ruleutils::explain_qualified_expr(n, &shown)?;
+    let ty = plan_expression_node(n, def).ok()?;
+    let pg_type = canonical_type(column_expr_type(&ty))?;
+    let mut node = n.clone();
+    qualify(&mut node, name);
+    Some((
+        col,
+        KeyExpr {
+            text,
+            ops: side.operators,
+            pg_type,
+            node,
+        },
+    ))
+}
+
+/// A type's name as `pg_type` names it (`bigint` -> `int8`).
+fn canonical_type(t: &str) -> Option<String> {
+    Some(pgtypes::name_of_oid(pgtypes::oid_of_name(t)?)?.to_string())
+}
+
+/// A side of an IN's comparison: a bare column of `sides[0]`, or an
+/// expression over one ([`key_expr`]).
+fn key_side(
+    n: &pg_query::protobuf::Node,
+    sides: &[(&str, &TableDef)],
+) -> Option<(String, Option<KeyExpr>)> {
+    match resolve(n, sides) {
+        Some((0, col)) => Some((col, None)),
+        Some(_) => None,
+        None if column_parts(n).is_some() => None,
+        None => {
+            let (col, e) = key_expr(n, sides[0].0, sides[0].1)?;
+            Some((col, Some(e)))
+        }
+    }
 }
 
 fn plain(s: &SelectStmt) -> bool {
@@ -243,6 +331,7 @@ pub(crate) fn semi_join_of(
     ];
     let mut inner_filter = Document::new();
     let mut inner_quals = Vec::new();
+    let (mut outer_expr, mut inner_expr) = (None, None);
     let (outer_col, inner_col) = match SubLinkType::try_from(link.sub_link_type).ok()? {
         SubLinkType::AnySublink => {
             // `IN` leaves the operator name empty; `= ANY` names it.
@@ -257,8 +346,11 @@ pub(crate) fn semi_join_of(
                 {
                     return None;
                 }
-                inner_filter = lower_where_nonvolatile(w, &inner_def, &[]).ok()?;
-                inner_quals = ruleutils::explain_conjuncts(w, &inner_def)?;
+                // Its columns as the scan names them: an alias's qualifier
+                // (`e2.b`) is the relation's own.
+                let w = unqualified(w, &inner_name)?;
+                inner_filter = lower_where_nonvolatile(&w, &inner_def, &[]).ok()?;
+                inner_quals = ruleutils::explain_conjuncts(&w, &inner_def)?;
             }
             let [t] = sub.target_list.as_slice() else {
                 return None;
@@ -266,10 +358,9 @@ pub(crate) fn semi_join_of(
             let Some(N::ResTarget(rt)) = t.node.as_ref() else {
                 return None;
             };
-            let (0, inner_col) = resolve(rt.val.as_deref()?, &sides[..1])? else {
-                return None;
-            };
-            let outer = resolve(link.testexpr.as_deref()?, &[sides[1]])?.1;
+            let (inner_col, ie) = key_side(rt.val.as_deref()?, &sides[..1])?;
+            let (outer, oe) = key_side(link.testexpr.as_deref()?, &[sides[1]])?;
+            (outer_expr, inner_expr) = (oe, ie);
             (outer, inner_col)
         }
         SubLinkType::ExistsSublink => {
@@ -289,16 +380,31 @@ pub(crate) fn semi_join_of(
         _ => return None,
     };
     // Two types would print the coercion PostgreSQL adds; not modelled.
-    if user_column(&outer_def, &outer_col)?.pg_type != user_column(&inner_def, &inner_col)?.pg_type
+    let side_type = |e: &Option<KeyExpr>, def: &TableDef, col: &str| match e {
+        Some(e) => Some(e.pg_type.clone()),
+        None => canonical_type(&user_column(def, col)?.pg_type),
+    };
+    if side_type(&outer_expr, &outer_def, &outer_col)?
+        != side_type(&inner_expr, &inner_def, &inner_col)?
     {
         return None;
     }
+    let shown = |e: &Option<KeyExpr>, rel: &str, col: &str| match e {
+        Some(e) => e.text.clone(),
+        None => format!("{rel}.{col}"),
+    };
     Some(Box::new(SemiJoin {
-        hash_cond: format!("({outer_name}.{outer_col} = {inner_name}.{inner_col})"),
+        hash_cond: format!(
+            "({} = {})",
+            shown(&outer_expr, &outer_name, &outer_col),
+            shown(&inner_expr, &inner_name, &inner_col)
+        ),
         outer: (outer_rv.relname.clone(), outer_name),
         inner: (inner_rv.relname.clone(), inner_name),
         inner_col,
         outer_col,
+        outer_expr,
+        inner_expr,
         outer_quals,
         outer_exprs,
         inner_filter,
@@ -348,6 +454,26 @@ fn qualify(n: &mut pg_query::protobuf::Node, rel: &str) {
     }
 }
 
+/// `n` with every `rel.col` reference made a bare `col`.
+fn unqualified(n: &pg_query::protobuf::Node, rel: &str) -> Option<pg_query::protobuf::Node> {
+    let mut out = n.clone();
+    crate::walk_expr(&mut out, &mut |x| {
+        if let Some(N::ColumnRef(c)) = x.node.as_mut() {
+            let named = matches!(
+                c.fields.as_slice(),
+                [r, f] if matches!(r.node.as_ref(), Some(N::String(s)) if s.sval == rel)
+                    && matches!(f.node, Some(N::String(_)))
+            );
+            if named {
+                c.fields.remove(0);
+            }
+        }
+        Ok(())
+    })
+    .ok()?;
+    Some(out)
+}
+
 fn column_ref(fields: Vec<N>) -> pg_query::protobuf::Node {
     pg_query::protobuf::Node {
         node: Some(N::ColumnRef(ColumnRef {
@@ -373,6 +499,11 @@ pub(crate) fn as_inner_join(query: &N, sj: &SemiJoin) -> Option<N> {
     let N::SelectStmt(s) = query else {
         return None;
     };
+    // An expression is unique by no index on its column
+    // (`innerrel_is_unique` matches an index's own columns).
+    if sj.inner_expr.is_some() {
+        return None;
+    }
     let (link, rest) = split_where(s.where_clause.as_deref()?)?;
     let Some(N::SelectStmt(sub)) = link.subselect.as_deref()?.node.as_ref() else {
         return None;
@@ -422,7 +553,10 @@ pub(crate) fn as_inner_join(query: &N, sj: &SemiJoin) -> Option<N> {
             name: vec![pg_query::protobuf::Node {
                 node: Some(string("=")),
             }],
-            lexpr: Some(side(outer, &sj.outer_col)),
+            lexpr: Some(match &sj.outer_expr {
+                Some(e) => Box::new(e.node.clone()),
+                None => side(outer, &sj.outer_col),
+            }),
             rexpr: Some(side(&sj.inner.1, &sj.inner_col)),
             location: -1,
         }))),
@@ -561,6 +695,90 @@ mod rp980_anti_join {
         );
         assert_eq!(
             rewritten("select * from e where exists (select 1 from e e2 where e2.a = e.a)"),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod rp411_expression_keys {
+    use super::*;
+
+    fn semi(sql: &str) -> Option<Box<SemiJoin>> {
+        let def = |name: &str| {
+            TableDef::new(
+                name,
+                vec![
+                    secantus_pgcatalog::Column::new("a", "int4", false),
+                    secantus_pgcatalog::Column::new("b", "text", false),
+                ],
+            )
+        };
+        let tree = pg_query::parse(sql).unwrap();
+        let q = tree.protobuf.stmts[0].stmt.as_ref()?.node.clone()?;
+        semi_join_of(&q, &|t| Some(def(t)))
+    }
+
+    /// An IN comparing expressions over one column of each side hashes
+    /// the expressions, as PostgreSQL 15.19 prints them (RP-411); it is
+    /// never the inner join of a unique inner column.
+    #[test]
+    fn an_in_comparing_expressions_hashes_them() {
+        let sj = semi("select * from e where a::bigint in (select a::bigint + 0 from k)").unwrap();
+        assert_eq!(sj.hash_cond, "((e.a)::bigint = ((k.a)::bigint + 0))");
+        assert_eq!((sj.outer_col.as_str(), sj.inner_col.as_str()), ("a", "a"));
+        let (o, i) = (
+            sj.outer_expr.as_ref().unwrap(),
+            sj.inner_expr.as_ref().unwrap(),
+        );
+        assert_eq!((o.ops, o.pg_type.as_str()), (1, "int8"));
+        assert_eq!(
+            (i.ops, i.pg_type.as_str(), i.text.as_str()),
+            (2, "int8", "((k.a)::bigint + 0)")
+        );
+        let tree =
+            pg_query::parse("select * from e where a::bigint in (select a::bigint + 0 from k)")
+                .unwrap();
+        let q = tree.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .unwrap()
+            .node
+            .clone()
+            .unwrap();
+        assert_eq!(as_inner_join(&q, &sj), None);
+        let sj = semi("select * from e x where upper(x.b) in (select lower(b) from k)").unwrap();
+        assert_eq!(sj.hash_cond, "(upper(x.b) = lower(k.b))");
+    }
+
+    /// One side bare, the other an expression of the same type; an alias's
+    /// qualifier in the subquery's WHERE is the scan's own column.
+    #[test]
+    fn one_side_may_be_a_bare_column() {
+        let sj =
+            semi("select * from e where a in (select a + 0 from e e2 where e2.b = 'v3')").unwrap();
+        assert_eq!(sj.hash_cond, "(e.a = (e2.a + 0))");
+        assert!(sj.outer_expr.is_none());
+        assert_eq!(
+            sj.inner_quals,
+            vec![("(b = 'v3'::text)".to_string(), Some("b".to_string()))]
+        );
+    }
+
+    /// Across types PostgreSQL compares through a cross-type operator,
+    /// not modelled; an expression over two columns, or none, is declined.
+    #[test]
+    fn other_shapes_are_declined() {
+        assert_eq!(
+            semi("select * from e where a::bigint in (select a from k)"),
+            None
+        );
+        assert_eq!(
+            semi("select * from e where a + b::int in (select a from k)"),
+            None
+        );
+        assert_eq!(
+            semi("select * from e where a in (select 1 + 0 from k)"),
             None
         );
     }

@@ -582,6 +582,17 @@ pub fn hash_join_over_unique_path(
     )
 }
 
+/// `nd2` clamped to the inner relation's `inner_rows`, as `eqjoinsel_semi`
+/// clamps it, and whether it is still the default: a clamped count is
+/// "not a default estimate" there (RP-411).
+fn clamped_nd2(k2: &KeyStats<'_>, inner_rows: f64) -> (f64, bool) {
+    if k2.ndistinct >= inner_rows {
+        (inner_rows, false)
+    } else {
+        (k2.ndistinct, k2.default_ndistinct)
+    }
+}
+
 /// `eqjoinsel_semi` (also JOIN_ANTI's) of `k1 = k2` where neither key has
 /// a most-common-values list: the share of the outer rows with a match,
 /// `nd2` clamped to the inner relation's `inner_rows`. `None` where an
@@ -591,8 +602,8 @@ pub fn eqjoinsel_semi_no_mcv(k1: &KeyStats<'_>, k2: &KeyStats<'_>, inner_rows: f
         return None;
     }
     let nd1 = k1.ndistinct;
-    let nd2 = k2.ndistinct.min(inner_rows);
-    Some(if k1.default_ndistinct || k2.default_ndistinct {
+    let (nd2, default2) = clamped_nd2(k2, inner_rows);
+    Some(if k1.default_ndistinct || default2 {
         0.5 * (1.0 - k1.null_frac)
     } else if nd1 <= nd2 || nd2 < 0.0 {
         1.0 - k1.null_frac
@@ -614,7 +625,7 @@ pub fn eqjoinsel_semi(k1: &KeyStats<'_>, k2: &KeyStats<'_>, inner_rows: f64) -> 
         return eqjoinsel_semi_no_mcv(&bare(k1), &bare(k2), inner_rows).expect("no MCV lists");
     }
     let mut nd1 = k1.ndistinct;
-    let mut nd2 = k2.ndistinct.min(inner_rows);
+    let (mut nd2, default2) = clamped_nd2(k2, inner_rows);
     let clamped2 = (k2.mcv.len() as f64).min(nd2).max(0.0) as usize;
     let mut has2 = vec![false; clamped2];
     let mut matchfreq1 = 0.0f64;
@@ -631,7 +642,7 @@ pub fn eqjoinsel_semi(k1: &KeyStats<'_>, k2: &KeyStats<'_>, inner_rows: f64) -> 
         }
     }
     let matchfreq1 = matchfreq1.clamp(0.0, 1.0);
-    let uncertainfrac = if !k1.default_ndistinct && !k2.default_ndistinct {
+    let uncertainfrac = if !k1.default_ndistinct && !default2 {
         nd1 -= nmatches;
         nd2 -= nmatches;
         if nd1 <= nd2 || nd2 < 0.0 {
@@ -3276,6 +3287,31 @@ mod tests {
         // One side without a list: the formula without MCVs.
         let k3 = k(3.0, &[][..]);
         assert_eq!(eqjoinsel_semi(&k1, &k3, 30.0), 0.75);
+    }
+
+    /// A default inner distinct count clamped to the inner rows is no
+    /// longer the default (`eqjoinsel_semi`, RP-411): `a in (select a + 0
+    /// from k where b = 'v3')` matches nd2 / nd1 of the outer rows, 100 of
+    /// 1,000, not half of them.
+    #[test]
+    fn a_clamped_default_inner_distinct_count_is_not_the_default() {
+        let k = |ndistinct: f64, default_ndistinct| KeyStats {
+            ndistinct,
+            default_ndistinct,
+            null_frac: 0.0,
+            mcv: &[],
+        };
+        assert_eq!(
+            eqjoinsel_semi(&k(1000.0, false), &k(200.0, true), 100.0),
+            0.1
+        );
+        // Not clamped: half, as either count is the default.
+        assert_eq!(
+            eqjoinsel_semi(&k(1000.0, false), &k(200.0, true), 1000.0),
+            0.5
+        );
+        // The outer side's default is never cleared.
+        assert_eq!(eqjoinsel_semi(&k(200.0, true), &k(200.0, true), 100.0), 0.5);
     }
 
     #[test]

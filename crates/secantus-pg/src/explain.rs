@@ -811,7 +811,10 @@ pub(crate) fn unique_ify_semi_join(
     grouped.estimate = Some(agg);
     grouped.details.push((
         "Group Key".into(),
-        format!("{}.{}", sj.inner.1, sj.inner_col),
+        match &sj.inner_expr {
+            Some(e) => e.text.clone(),
+            None => format!("{}.{}", sj.inner.1, sj.inner_col),
+        },
     ));
     hash.children.push(grouped);
 }

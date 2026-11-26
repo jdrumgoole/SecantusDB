@@ -6841,9 +6841,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # A grouped sum hashed above an InitPlan's scan, measured on 15.19
-    # (RP-440): grouped aggregates other than counts are unpriced.
+    # (RP-440): grouped aggregates other than counts were unpriced.
     "a grouped sum above an initplan's scan is priced": (
-        "RP-440",
+        "RP-440:fixed",
         _ANALYSED,
         "explain select b, sum(a) from e where a > (select 5) group by b",
         [
@@ -6852,6 +6852,127 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  InitPlan 1 (returns $0)",
             "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
             "  ->  Seq Scan on e  (cost=0.00..17.50 rows=333 width=7)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    # Grouped aggregates other than counts above an InitPlan's scan,
+    # measured on 15.20 (RP-440): an avg's final function runs once a
+    # group, and identical calls share one transition state
+    # (`find_compatible_agg`), each still its own output column.
+    "a grouped avg above an initplan's scan is priced": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select b, avg(a) from e where a > (select 5) group by b",
+        [
+            "HashAggregate  (cost=19.18..19.30 rows=10 width=35)",
+            "  Group Key: e.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=333 width=7)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    "grouped min, max and count above an initplan's scan are priced": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select b, min(a), max(a), count(*) from e where a > (select 5) group by b",
+        [
+            "HashAggregate  (cost=20.84..20.94 rows=10 width=19)",
+            "  Group Key: e.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=333 width=7)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    "a repeated grouped sum above an initplan's scan shares one state": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select b, sum(a), sum(a) from e where a > (select 5) group by b",
+        [
+            "HashAggregate  (cost=19.18..19.28 rows=10 width=19)",
+            "  Group Key: e.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=333 width=7)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    "a repeated grouped count above an initplan's scan shares one state": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select b, count(*), count(*) from e where a > (select 5) group by b",
+        [
+            "HashAggregate  (cost=19.18..19.28 rows=10 width=19)",
+            "  Group Key: e.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=333 width=3)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    # Grouped bool_and / bool_or above an InitPlan's scan, measured on
+    # 15.20 (RP-440): neither has a final function.
+    "grouped bool_and and bool_or above an initplan's scan are priced": (
+        "RP-440:fixed",
+        _ANALYSED
+        + [
+            "create table bt (a int, b text, c bool)",
+            "insert into bt select g, 'v' || (g % 10), g % 2 = 0 from generate_series(1, 1000) g",
+            "analyze bt",
+        ],
+        "explain select b, bool_and(c), bool_or(c) from bt where a > (select 5) group by b",
+        [
+            "HashAggregate  (cost=20.01..20.11 rows=10 width=5)",
+            "  Group Key: bt.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on bt  (cost=0.00..17.50 rows=333 width=4)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    # A grouped sum over an expression above an InitPlan's scan, measured
+    # on 15.20 (RP-440): the argument's own cost is not priced.
+    "a grouped sum of an expression above an initplan's scan is priced": (
+        "RP-440",
+        _ANALYSED,
+        "explain select b, sum(a + 1) from e where a > (select 5) group by b",
+        [
+            "HashAggregate  (cost=20.01..20.11 rows=10 width=11)",
+            "  Group Key: e.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=333 width=7)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    # A GROUP BY of an expression above an InitPlan's scan, measured on
+    # 15.20 (RP-440).
+    "a group by of an expression above an initplan's scan is priced": (
+        "RP-440",
+        _ANALYSED,
+        "explain select upper(b), count(*) from e where a > (select 5) group by upper(b)",
+        [
+            "HashAggregate  (cost=20.01..20.13 rows=10 width=40)",
+            "  Group Key: upper(e.b)",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on e  (cost=0.00..18.33 rows=333 width=32)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    # A grouped sum above an InitPlan's scan of a table with an index the
+    # keys do not lead, measured on 15.20 (RP-440).
+    "a grouped sum above an initplan's scan of an indexed table is priced": (
+        "RP-440",
+        _ANALYSED,
+        "explain select b, sum(a) from k where a > (select 5) group by b",
+        [
+            "HashAggregate  (cost=19.18..19.28 rows=10 width=11)",
+            "  Group Key: k.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on k  (cost=0.00..17.50 rows=333 width=7)",
             "        Filter: (a > $0)",
         ],
     ),
@@ -7141,9 +7262,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "                    Index Cond: (a < 20)",
         ],
     ),
-    # An IN whose two sides compare expressions, measured on 15.19 (RP-411).
+    # An IN whose two sides compare expressions was planned as the join of
+    # the inner side made unique on its expression, as 15.19 plans it
+    # (RP-411).
     "an in subquery comparing expressions is planned as a join": (
-        "RP-411",
+        "RP-411:fixed",
         _ANALYSED,
         "explain select * from e where a::bigint in (select a::bigint + 0 from k where b = 'v3')",
         [
@@ -7155,6 +7278,71 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Group Key: ((k.a)::bigint + 0)",
             "              ->  Seq Scan on k  (cost=0.00..17.50 rows=100 width=4)",
             "                    Filter: (b = 'v3'::text)",
+        ],
+    ),
+    # An expression over the inner column has no statistics, its default
+    # 200 distinct values clamped to the inner side's 100 rows, which makes
+    # it no default (`eqjoinsel_semi`): 100 of the 1,000 outer rows match
+    # (RP-411).
+    "an in subquery of an expression over a filtered side clamps its distinct count": (
+        "RP-411:fixed",
+        _ANALYSED,
+        "explain select * from e where a in (select a + 0 from k where b = 'v3')",
+        [
+            "Hash Join  (cost=20.00..38.98 rows=100 width=7)",
+            "  Hash Cond: (e.a = (k.a + 0))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=18.75..18.75 rows=100 width=4)",
+            "        ->  HashAggregate  (cost=17.75..18.75 rows=100 width=4)",
+            "              Group Key: (k.a + 0)",
+            "              ->  Seq Scan on k  (cost=0.00..17.50 rows=100 width=4)",
+            "                    Filter: (b = 'v3'::text)",
+        ],
+    ),
+    # Calls of a string function on each side, the inner grouped by its
+    # call into the column's ten groups (RP-411).
+    "an in subquery comparing function calls is planned as a join": (
+        "RP-411:fixed",
+        _ANALYSED,
+        "explain select * from e where upper(b) in (select lower(b) from k)",
+        [
+            "Hash Join  (cost=17.73..42.29 rows=500 width=7)",
+            "  Hash Cond: (upper(e.b) = lower(k.b))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=17.60..17.60 rows=10 width=3)",
+            "        ->  HashAggregate  (cost=17.50..17.60 rows=10 width=3)",
+            "              Group Key: lower(k.b)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=3)",
+        ],
+    ),
+    # The subquery's WHERE naming its relation by its alias filters the
+    # inner scan as the bare column would (RP-411).
+    "an in subquery whose where names its alias is a hash semi join": (
+        "RP-411:fixed",
+        _ANALYSED,
+        "explain select * from e where a in (select a from e e2 where e2.b = 'v3')",
+        [
+            "Hash Semi Join  (cost=18.75..37.49 rows=100 width=7)",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=17.50..17.50 rows=100 width=4)",
+            "        ->  Seq Scan on e e2  (cost=0.00..17.50 rows=100 width=4)",
+            "              Filter: (b = 'v3'::text)",
+        ],
+    ),
+    # An IN across types compares through the cross-type `int8 = int4`,
+    # measured on 15.19 (RP-411): the inner column is unique, so the inner
+    # join.
+    "an in subquery across types is planned as a join": (
+        "RP-411",
+        _ANALYSED,
+        "explain select * from e where a::bigint in (select a from k)",
+        [
+            "Hash Join  (cost=27.50..45.26 rows=1000 width=7)",
+            "  Hash Cond: ((e.a)::bigint = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
         ],
     ),
     # Planned as the inner join `reduce_unique_semijoins` makes of it.

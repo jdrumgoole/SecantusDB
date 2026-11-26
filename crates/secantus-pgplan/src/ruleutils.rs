@@ -6310,6 +6310,13 @@ fn folded_array_literal(items: &[Node], elem: &str) -> Option<String> {
     Some(format!("'{}'", out.replace('\'', "''")))
 }
 
+/// An expression over one relation as EXPLAIN prints it once the plan's
+/// range table holds more than one relation: its columns qualified by
+/// `def.name`, constants folded (a semi join's hash clause, RP-411).
+pub fn explain_qualified_expr(n: &Node, def: &TableDef) -> Option<String> {
+    expr_node_printed_with(n, def, true, false)
+}
+
 fn expr_node_planned(n: &Node, def: &TableDef) -> Option<String> {
     expr_node_printed(n, def, true)
 }

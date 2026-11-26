@@ -2367,17 +2367,33 @@ a regression test.
       `Index Scan using k_pkey`), the unique-ified side's groups scaled to
       its rows (`estimate_num_groups`) and its hash buckets one entry each
       (`final_cost_hashjoin`'s UniquePath rule,
-      `joincost::hash_join_over_unique_path`). (2) Wider shapes still print
-      the scan: an IN comparing expressions (`a::bigint in (select
-      a::bigint + 0 ...)`, which 15.19 groups by the expression), a
-      cross-type comparison, and an
-      outer conjunct other than a comparison of an expression with a
-      constant that the scan's filter does not hold whole. Outer conjuncts
-      are pulled up with the sublink and filter that scan
-      (`sublink_join::split_where`); one that does not lower is priced as an
-      `ExprQual` (`SemiJoin::outer_exprs`).
+      `joincost::hash_join_over_unique_path`). Since 2026-11-26 either side
+      of an IN may be an expression over one column of its relation
+      (`SemiJoin::outer_expr` / `inner_expr`, `sublink_join::key_expr`):
+      hashed on the expressions with no statistics (200 distinct, the
+      inner count clamped to the inner rows and so no default, as
+      `eqjoinsel_semi` clamps it), the unique-ified side grouped by its
+      expression into its column's groups (`estimate_num_groups` over the
+      Vars), and an alias's qualifier in the subquery's WHERE read as its
+      relation's (`e2.b`). Where such an IN is not cheapest hashed over
+      the unique-ified inner side it prints an unpriced `Hash Semi Join`
+      under (1): `a in (select a + 0 from k) and b = 'v1'` is 15.19's `Hash
+      Join` with the `HashAggregate` as the outer side, and
+      `a::bigint in (select a::bigint + 0 from k) and b = 'v1'` a priced
+      `Hash Semi Join (cost=27.50..50.27 rows=50 width=7)` the merge bound
+      declines. An outer expression against a unique inner column (`a + 1
+      in (select a from k)`) is the inner join `as_inner_join` writes,
+      unpriced as RP-1032's expression key against a unique column. (2)
+      Wider shapes still print the scan: a cross-type comparison
+      (`a::bigint in (select a from k)`, `int8 = int4`, 15.19's `Hash Join
+      (cost=27.50..45.26 rows=1000 width=7)` hashing `k`), an expression
+      over two columns, and an outer conjunct other than a comparison of an
+      expression with a constant that the scan's filter does not hold
+      whole. Outer conjuncts are pulled up with the sublink and filter that
+      scan (`sublink_join::split_where`); one that does not lower is priced
+      as an `ExprQual` (`SemiJoin::outer_exprs`).
       Backlog-ID: RP-411
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery comparing expressions is planned as a join]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery across types is planned as a join]
 - [ ] **A node above an InitPlan's scan is unpriced.** Since
       RP-440's first slices (2026-11-16) a SELECT over one relation whose WHERE
       compares columns with uncorrelated FROM-less scalar subqueries plans
@@ -2394,11 +2410,15 @@ a regression test.
       FROM, a correlated one, or a sublink beside any other non-constant
       qual is still printed inline (`select * from e where b = (select b
       from k limit 1)`); a join's ON InitPlan is unpriced; other nodes above
-      the scan (a computed sort key, a GROUP BY of anything but counts of
-      stored columns) are unpriced. Counts grouped by stored columns
+      the scan (a computed sort key, a GROUP BY of an expression) are
+      unpriced. Aggregates of stored columns grouped by stored columns
       straight over the scan, on a table with no index, are hashed and
-      priced since 2026-11-18 (`init_plan_grouped_counts`); a grouped
-      `sum` or other aggregate is not. A SELECT
+      priced (`init_plan_grouped_aggs`: counts since 2026-11-18, `sum`,
+      `avg`, `min`, `max`, `bool_and` / `bool_or` since 2026-11-26, with
+      `get_agg_clause_costs`' shared states and final calls); an aggregate
+      of an expression (`sum(a + 1)`, its argument's cost unpriced), or any
+      over a table with an index (`k`, whose primary key the keys do not
+      lead: 15.20 still hashes a Seq Scan), is not. A SELECT
       DISTINCT of stored columns straight over the scan, on a table with no
       index, is hashed and priced since 2026-11-18 (`create_distinct_paths`
       against a Sort and Unique); over an indexed table, or with an ORDER
@@ -2407,7 +2427,7 @@ a regression test.
       2026-11-18. Plain aggregates other than counts over the scan are
       priced since 2026-11-18 (`plain_agg_estimate`). Measured on a private
       15.19 cluster.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a grouped sum above an initplan's scan is priced]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a grouped sum of an expression above an initplan's scan is priced]
       Backlog-ID: RP-440
 
 ## Found by batch 54 (2026-10-24)
@@ -3457,7 +3477,8 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       `select * from e join k on k.a = e.a - 1` (PostgreSQL 15.19 `Hash
       Join (cost=27.50..45.26 rows=1000 width=14)` hashing `k`, inner
       unique; `hash_join_of`'s unique-key paths are not modelled over an
-      expression); and across types, `e.a::bigint = e2.a` (`Hash Join
+      expression; an IN of an outer expression over a unique column, `a +
+      1 in (select a from k)`, reaches it as the inner join RP-411 writes); and across types, `e.a::bigint = e2.a` (`Hash Join
       (cost=27.50..57.50 rows=1000 width=14)`; declined on `pg_type`). A
       LEFT join the merge wins is declined at the end of `hash_join_of`
       (`expr_key && left_join && JoinPick::Merge`), its Merge Left/Right
