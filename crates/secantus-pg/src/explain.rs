@@ -235,7 +235,23 @@ pub(crate) fn plan_tree(stmt: &Statement, scan: &ScanChooser<'_>) -> PlanNode {
             } else if sel.series.is_some() {
                 PlanNode::new("Function Scan on generate_series")
             } else if let Some(j) = &sel.join {
-                join_select_tree(j, scan)
+                let join = join_select_tree(j, scan);
+                // The narrow path's one ORDER BY column is the join's own
+                // sort (`JoinSelect::order`): a Sort over the join, by
+                // `alias.column` (RP-1056).
+                match &j.order {
+                    Some((alias, column, ascending)) if sel.order.is_empty() => {
+                        let mut sort = PlanNode::over("Sort", join);
+                        let key = if *ascending {
+                            format!("{alias}.{column}")
+                        } else {
+                            format!("{alias}.{column} DESC")
+                        };
+                        sort.details.push(("Sort Key".into(), key));
+                        sort
+                    }
+                    _ => join,
+                }
             } else if sel.table.is_empty() {
                 PlanNode::new("Result")
             } else {

@@ -3166,6 +3166,69 @@ impl PgHandler {
         }
     }
 
+    /// The narrow path's ORDER BY (RP-1056), one column: the join's own
+    /// (`JoinSelect::order`), or the select's one key naming an output
+    /// column (`order by x` for `e.b as x`). `Some(None)` with no ORDER
+    /// BY; `Some(Some((alias, column)))` for a column no join clause names
+    /// and no index of its table leads with, where PostgreSQL has no path
+    /// already in its order and sorts the join's cheapest. A join key's
+    /// order a merge join yields, and an index's an ordered scan does
+    /// (`pathkeys`, which this model does not weigh): `None`, as is any
+    /// other ORDER BY.
+    pub(crate) fn narrow_sort_column<'s>(
+        &self,
+        sel: &'s secantus_pgplan::Select,
+    ) -> Option<Option<(&'s str, &'s str)>> {
+        let j = sel.join.as_ref()?;
+        let (alias, column) = match (&j.order, sel.order.as_slice()) {
+            (None, []) => return Some(None),
+            (Some((alias, column, _)), []) => (alias, column),
+            (None, [k]) => {
+                let default_nulls = if k.ascending {
+                    secantus_pgplan::Nulls::Last
+                } else {
+                    secantus_pgplan::Nulls::First
+                };
+                if k.expr.is_some() || k.jsonb || k.bpchar || k.nulls != default_nulls {
+                    return None;
+                }
+                let mut named = j
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (out, _, _))| *out == k.field);
+                let (i, (_, alias, column)) = named.next()?;
+                if named.next().is_some() || j.exprs.get(i).is_some_and(Option::is_some) {
+                    return None;
+                }
+                (alias, column)
+            }
+            _ => return None,
+        };
+        if j.on
+            .as_ref()
+            .is_some_and(|(x, y)| [x, y].iter().any(|(a, c)| a == alias && c == column))
+        {
+            return None;
+        }
+        let table = if j.left.1 == *alias {
+            &j.left.0
+        } else if j.right.1 == *alias {
+            &j.right.0
+        } else {
+            return None;
+        };
+        let attnum = i32::from(self.lookup(table)?.attnum_of(column)?);
+        if self
+            .index_relations()
+            .iter()
+            .any(|ix| ix.table.name == *table && ix.keys.first() == Some(&attnum))
+        {
+            return None;
+        }
+        Some(Some((alias.as_str(), column.as_str())))
+    }
+
     /// [`Self::hash_join_estimate`] for a two-table inner join planned on
     /// the narrow path (`Select::join`, RP-361): each side's scan reads
     /// the columns the select list takes from it and its join key, and
@@ -3178,7 +3241,6 @@ impl PgHandler {
         if sel.sub.is_some()
             || sel.series.is_some()
             || !sel.windows.is_empty()
-            || !sel.order.is_empty()
             || sel.limit.is_some()
             || sel.offset != 0
             || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
@@ -3187,10 +3249,13 @@ impl PgHandler {
             || sel.residual.is_some()
             || j.left_sub.is_some()
             || j.right_sub.is_some()
-            || j.order.is_some()
         {
             return None;
         }
+        // An ORDER BY column (RP-1056), any other ORDER BY refused: a
+        // resjunk entry of the join's target list where the select list
+        // does not take it, its width the join's too.
+        let order = self.narrow_sort_column(sel)?;
         // A constant in the select list adds its type's width to the
         // join's and reads neither side (RP-435); any other computed entry
         // stays unpriced.
@@ -3234,13 +3299,19 @@ impl PgHandler {
                 .count_matching(self.db(), table, &Document::new(), None)
                 .ok()?;
             let def = self.planner_table(table, count)?.def;
-            let above: Vec<String> = j
+            let mut above: Vec<String> = j
                 .columns
                 .iter()
                 .enumerate()
                 .filter(|(i, (_, side, _))| side == alias && !is_const(*i))
                 .map(|(_, (_, _, c))| def.field_of(c))
                 .collect::<Option<_>>()?;
+            if let Some((_, c)) = order.filter(|(a, _)| a == alias) {
+                let f = def.field_of(c)?;
+                if !above.contains(&f) {
+                    above.push(f);
+                }
+            }
             let field = def.field_of(key)?;
             let mut read = above.clone();
             if !read.contains(&field) {
@@ -3295,7 +3366,6 @@ impl PgHandler {
             || sel.sub.is_some()
             || sel.series.is_some()
             || !sel.windows.is_empty()
-            || !sel.order.is_empty()
             || sel.limit.is_some()
             || sel.offset != 0
             || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
@@ -3306,24 +3376,33 @@ impl PgHandler {
             || j.left_sub.is_some()
             || j.right_sub.is_some()
             || !j.filter.is_empty()
-            || j.order.is_some()
             || j.exprs.iter().any(Option::is_some)
             || j.left.1 == j.right.1
         {
             return None;
         }
+        // An ORDER BY column (RP-1056), any other ORDER BY refused: read
+        // too where the select list does not take it, a resjunk entry the
+        // Sort above keys on.
+        let order = self.narrow_sort_column(sel)?;
         let indexes = self.index_relations();
         let side = |(table, alias): &(String, String)| -> Option<Estimate> {
             if indexes.iter().any(|ix| &ix.table.name == table) {
                 return None;
             }
             let def = self.lookup(table)?;
-            let read: Vec<String> = j
+            let mut read: Vec<String> = j
                 .columns
                 .iter()
                 .filter(|(_, side, _)| side == alias)
                 .map(|(_, _, c)| def.field_of(c))
                 .collect::<Option<_>>()?;
+            if let Some((_, c)) = order.filter(|(a, _)| a == alias) {
+                let f = def.field_of(c)?;
+                if !read.contains(&f) {
+                    read.push(f);
+                }
+            }
             let (scan, None) = self.scan_estimate(table, &Document::new(), &read)? else {
                 return None;
             };

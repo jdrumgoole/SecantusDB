@@ -47454,6 +47454,26 @@ impl PgHandler {
                     // On the top plan node (`SS_attach_initplans`).
                     tree.init_plans = inits;
                 }
+                // The narrow path's ORDER BY of one column with no path in
+                // its order is a Sort over the join's cheapest (RP-1056):
+                // the join is priced below as it is without one, the Sort
+                // lifted off it until then.
+                let narrow_sort = match inner.as_ref() {
+                    Statement::Select(sel)
+                        if sel.join.is_some()
+                            && self.narrow_sort_column(sel).is_some_and(|c| c.is_some())
+                            && sel.limit.is_none()
+                            && sel.offset == 0
+                            && matches!(sel.distinct, secantus_pgplan::Distinct::None)
+                            && tree.name == "Sort"
+                            && tree.children.len() == 1 =>
+                    {
+                        let mut shell = std::mem::replace(&mut tree, explain::PlanNode::new(""));
+                        tree = shell.children.pop().expect("one child");
+                        Some(shell)
+                    }
+                    _ => None,
+                };
                 // A narrow-path inner join whose WHERE fixes a join key
                 // (RP-363) is a Nested Loop of the two filtered scans: the
                 // equivalence class with the constant replaced its clause.
@@ -47703,6 +47723,17 @@ impl PgHandler {
                             }
                         }
                     }
+                }
+                // The Sort back over the join, priced where the join is:
+                // `cost_sort` over the join's rows and width (RP-1056).
+                if let Some(mut sort) = narrow_sort {
+                    if let Some(join) = tree.estimate {
+                        let (startup, total) =
+                            secantus_pgplan::joincost::cost_sort(join.1, join.2, join.3, None);
+                        sort.estimate = Some((startup, total, join.2, join.3));
+                    }
+                    sort.children.push(tree);
+                    tree = sort;
                 }
                 // A left-deep chain of Nested Loops over three or more
                 // tables' sequential scans (RP-354): PostgreSQL's search
@@ -48743,8 +48774,21 @@ impl PgHandler {
                         }
                     }
                     // A join's children: their rows, loops and counters
-                    // (RP-386).
-                    self.analyze_join_children(&mut tree, sel, rows);
+                    // (RP-386). Under the narrow path's Sort (RP-1056) the
+                    // join returned every row the Sort did.
+                    if tree.name == "Sort"
+                        && tree.children.len() == 1
+                        && sel.join.is_some()
+                        && sel.limit.is_none()
+                        && sel.offset == 0
+                        && matches!(sel.distinct, secantus_pgplan::Distinct::None)
+                    {
+                        let join = &mut tree.children[0];
+                        join.actual_rows = Some(rows);
+                        self.analyze_join_children(join, sel, rows);
+                    } else {
+                        self.analyze_join_children(&mut tree, sel, rows);
+                    }
                 }
                 // An UPDATE ... FROM / DELETE ... USING explained as its
                 // join: the ModifyTable over it, costing what the join
