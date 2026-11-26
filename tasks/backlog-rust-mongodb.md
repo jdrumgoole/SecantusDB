@@ -1714,17 +1714,28 @@ Still different, all 77:
       `PlanCacheIndexTree` from the canonical query and the index tags of
       its winner (`plan::index_tags`, `plan::or_tags`,
       `entry_size::tagged_tree`): one index, or an `OR` of single-predicate
-      branches beside other clauses, and an untagged `$elemMatch` over
-      operators. mongod 8.2.11 sizes every entry; this server leaves the
-      field out for a `$not` inside `$elemMatch` (3350 for `{a: {$lt: 5}, b:
-      {$elemMatch: {$not: {$gt: 3}}}}` over `a_1` and `b_1` on macOS
-      arm64), the object form of `$elemMatch` and an `$elemMatch` the
-      winner's index reads, an `$or` that is the root or whose clauses
-      mongod pushes into the branches (`OrPushdownTag`), a branch of several
-      predicates, `$nor`, a `$not` over several predicates, `$jsonSchema`,
-      and an `AND_SORTED` winner. Found 2026-11-14 (RM-436).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_not_inside_elem_match_entry_reports_its_size
+      branches beside other clauses, and an `$elemMatch` over operators,
+      `$not` among them, tagged on the `ELEM_MATCH_VALUE` itself when the
+      winner reads it. mongod 8.2.11 sizes every entry; this server leaves
+      the field out for the object form of `$elemMatch` (3230 for `{a: {$lt:
+      5}, d: {$elemMatch: {e: 3}}}` over `a_1`, `b_1` and `d.e_1` on macOS
+      arm64), an `$or` whose clauses mongod pushes into the branches
+      (`OrPushdownTag`), a branch of several predicates, a `$not` over
+      several predicates, `$jsonSchema`, and an `AND_SORTED` winner (not
+      re-measured 2026-11-26: a root `$or`, `$jsonSchema` beside a range and
+      `$or` with a two-predicate branch made no entry on either server, and
+      `$nor` is sized as mongod sizes it). Found 2026-11-14 (RM-436).
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_an_object_elem_match_entry_reports_its_size
       Backlog-ID: RM-694
+- [ ] **The plan cache holds entries mongod does not, and misses ones it
+      holds.** mongod 8.2.11 caches no entry for `{a: {$lt: 5}, b: {$not:
+      {$gt: 3, $lt: 9}}}` over `a_1` and `b_1` (it plans one candidate);
+      this server caches one. mongod caches one for `{a: {$lt: 5}, d:
+      {$elemMatch: {e: {$lt: 2}, f: null}}}` over `a_1`, `b_1` and `d.e_1`;
+      this server caches none. Which candidates each plans is not yet
+      compared. Found 2026-11-26 (RM-694).
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_the_plan_cache_holds_the_entries_mongod_holds
+      Backlog-ID: RM-826
 
 ### 7.079 `$out` and `$merge` -- 2026-10-13
 

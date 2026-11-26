@@ -281,8 +281,7 @@ pub(crate) fn estimate(
 /// `tagged` to `index` (`QueryPlanner::cacheDataFromTaggedTree`, after
 /// `tagForSort`). `None` for an expression whose tree this does not build:
 /// an `$or` or `$nor` that is not tagged as [`ClauseTag::Or`] (an `OR` may
-/// take an `OrPushdownTag` of its own), an `$elemMatch` with a tag, a
-/// `$not` of several predicates, `$jsonSchema`.
+/// take an `OrPushdownTag` of its own), a `$not` of several predicates, `$jsonSchema`.
 pub(crate) fn tagged_tree(
     canonical: &Document,
     clauses: &[Document],
@@ -332,24 +331,27 @@ fn clause_node(clause: &Document, tag: Option<&IndexCopy>) -> Option<TreeNode> {
     };
     let ops: Vec<&str> = pred.keys().map(String::as_str).collect();
     match ops.as_slice() {
-        // An `ELEM_MATCH_VALUE` holds one node per operator; nothing below
-        // it carries a tag unless the plan's index read it. The object form
-        // and a `$not` inside are left out: no measured figure.
-        ["$elemMatch"] if tag.is_none() => {
+        // An `ELEM_MATCH_VALUE` holds one node per operator; a `$not`
+        // inside is a `NOT` over its predicate. Nothing below it carries a
+        // tag: when the plan's index read it, mongod tags the
+        // `ELEM_MATCH_VALUE` itself (`Indexability::arrayUsesIndexOnOwnField`;
+        // measured 8.2.11: two copies of the index entry for `{a: {$lt: 5},
+        // b: {$elemMatch: {$not: {$gt: 3}}}}` read from `b_1`, by the
+        // name's length). The object form is left out: no measured figure.
+        ["$elemMatch"] => {
             let inner = pred.get_document("$elemMatch").ok()?;
             let mut children = Vec::with_capacity(inner.len());
             for (op, v) in inner {
-                if !op.starts_with('$') || op == "$not" {
+                if !op.starts_with('$') {
                     return None;
                 }
                 children.push(clause_node(&bson::doc! { path: { op: v.clone() } }, None)?);
             }
             Some(TreeNode {
-                entry: None,
+                entry: tag.cloned(),
                 children,
             })
         }
-        ["$elemMatch"] => None,
         ["$not"] => {
             let one = match pred.get("$not")? {
                 Bson::Document(d) => d.len() == 1 && !d.contains_key("$elemMatch"),
@@ -507,10 +509,22 @@ mod tests {
         ] {
             assert!(tagged_tree(&clause, std::slice::from_ref(&clause), &[]).is_none());
         }
-        // An `$elemMatch` the plan's index read is not built.
+        // The object form of `$elemMatch` is not built.
         let clause = doc! { "a": { "$elemMatch": { "b": 1 } } };
+        assert!(tagged_tree(&clause, std::slice::from_ref(&clause), &[]).is_none());
+    }
+
+    #[test]
+    fn a_tagged_elem_match_holds_the_tag_itself() {
+        // `{a: {$elemMatch: {$not: {$gt: 3}}}}` read from the index: the
+        // `ELEM_MATCH_VALUE` carries the tag, the `NOT` and `$gt` none.
+        let clause = doc! { "a": { "$elemMatch": { "$not": { "$gt": 3 } } } };
         let tags = [ClauseTag::One(a_1("a_1"))];
-        assert!(tagged_tree(&clause, std::slice::from_ref(&clause), &tags).is_none());
+        let tree = tagged_tree(&clause, std::slice::from_ref(&clause), &tags).unwrap();
+        assert_eq!(tree.entry.as_ref().unwrap().name, "a_1");
+        let not = &tree.children[0];
+        assert!(not.entry.is_none());
+        assert!(not.children[0].entry.is_none());
     }
 
     #[test]

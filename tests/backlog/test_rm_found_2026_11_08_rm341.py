@@ -84,11 +84,12 @@ def test_more_or_and_elem_match_entries_report_their_size(rust_mongo: Any, mongo
     assert sizes(rust_mongo) == sizes(mongod)
 
 
-@pytest.mark.backlog("RM-694")
+@pytest.mark.backlog_fixed("RM-694")
 def test_a_not_inside_elem_match_entry_reports_its_size(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 sizes the entry for `{a: {$lt: 5}, b: {$elemMatch:
+    """mongod 8.2.11 sized the entry for `{a: {$lt: 5}, b: {$elemMatch:
     {$not: {$gt: 3}}}}` over `a_1` and `b_1` at 3350 on macOS arm64; this
-    server leaves `estimatedSizeBytes` out."""
+    server left `estimatedSizeBytes` out. Its winner reads `b_1`, and mongod
+    tags the `ELEM_MATCH_VALUE` itself, not the predicates inside."""
     only_on("darwin", why="RM-341 sizes entries with macOS arm64's layout")
     only_on("arm64", why="RM-341 sizes entries with macOS arm64's layout")
     q = {"a": {"$lt": 5}, "b": {"$elemMatch": {"$not": {"$gt": 3}}}}
@@ -206,3 +207,75 @@ def test_a_multikey_index_covers_a_field_that_holds_no_array(rust_mongo: Any, mo
 
     assert plan(mongod)[0] == ["PROJECTION_COVERED", "IXSCAN"]
     assert plan(rust_mongo) == plan(mongod)
+
+
+@pytest.mark.backlog_fixed("RM-694")
+def test_an_elem_match_the_winner_reads_reports_its_size(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 sized the entries for an `$elemMatch` over operators
+    that the winning `b_1` scan reads at 3214 (`{$lt: 4}`) and 3318 (`{$gt:
+    1, $lt: 4}`) on macOS arm64; this server left `estimatedSizeBytes` out."""
+    only_on("darwin", why="RM-341 sizes entries with macOS arm64's layout")
+    only_on("arm64", why="RM-341 sizes entries with macOS arm64's layout")
+
+    def sizes(client: Any) -> list:
+        out = []
+        for inner in ({"$lt": 4}, {"$gt": 1, "$lt": 4}):
+            q = {"a": {"$lt": 5}, "b": {"$elemMatch": inner}}
+            out += [
+                e.get("estimatedSizeBytes")
+                for e in _entries(client, ["a", "b"], lambda col, q=q: col.find(q))
+            ]
+        return out
+
+    assert sizes(mongod) == [3214, 3318]
+    assert sizes(rust_mongo) == sizes(mongod)
+
+
+def _with_d(client: Any, run: Any) -> list:
+    client.drop_database("rm341_found")
+    col = client.rm341_found.c
+    col.insert_many(
+        [
+            {"_id": i, "a": i % 100, "b": (i // 20) % 100, "c": i % 7, "d": [{"e": i % 5}]}
+            for i in range(2000)
+        ]
+    )
+    for keys in ("a", "b", "d.e"):
+        col.create_index(keys)
+    for _ in range(2):
+        list(run(col))
+    return list(col.aggregate([{"$planCacheStats": {}}]))
+
+
+@pytest.mark.backlog("RM-694")
+def test_an_object_elem_match_entry_reports_its_size(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 sizes the entry for `{a: {$lt: 5}, d: {$elemMatch: {e:
+    3}}}` over `a_1`, `b_1` and `d.e_1` at 3230 on macOS arm64; this server
+    leaves `estimatedSizeBytes` out."""
+    only_on("darwin", why="RM-341 sizes entries with macOS arm64's layout")
+    only_on("arm64", why="RM-341 sizes entries with macOS arm64's layout")
+    q = {"a": {"$lt": 5}, "d": {"$elemMatch": {"e": 3}}}
+
+    def sizes(client: Any) -> list:
+        return [e.get("estimatedSizeBytes") for e in _with_d(client, lambda col: col.find(q))]
+
+    assert sizes(mongod) == [3230]
+    assert sizes(rust_mongo) == sizes(mongod)
+
+
+@pytest.mark.backlog("RM-826")
+def test_the_plan_cache_holds_the_entries_mongod_holds(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 caches no entry for `{a: {$lt: 5}, b: {$not: {$gt: 3,
+    $lt: 9}}}` over `a_1` and `b_1`, and one for `{a: {$lt: 5}, d:
+    {$elemMatch: {e: {$lt: 2}, f: null}}}` over `a_1`, `b_1` and `d.e_1`;
+    this server caches the first and not the second."""
+    queries = [
+        {"a": {"$lt": 5}, "b": {"$not": {"$gt": 3, "$lt": 9}}},
+        {"a": {"$lt": 5}, "d": {"$elemMatch": {"e": {"$lt": 2}, "f": None}}},
+    ]
+
+    def counts(client: Any) -> list:
+        return [len(_with_d(client, lambda col, q=q: col.find(q))) for q in queries]
+
+    assert counts(mongod) == [0, 1]
+    assert counts(rust_mongo) == counts(mongod)
