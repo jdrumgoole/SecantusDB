@@ -326,8 +326,8 @@ The backlog is the canonical list of commands that are stubbed, features with si
 
 **Working items unattended: `scripts/fix_one.sh -p postgres [RP-nnn]`** runs one
 `/fix-one` in a fresh headless session; `scripts/fix_many.sh -j 2 -i pg-batch
-postgres <n>` runs n of them in two lanes (three when this is the machine's
-only session), each lane in its own reused worktree and each fix landing on
+postgres <n>` runs n of them in two lanes (three when this is the 12-core
+Mac's only session; never three on the M1), each lane in its own reused worktree and each fix landing on
 the `pg-batch` integration branch after the local `gate_pg.sh --fast`, then
 `scripts/land_batch.sh pg-batch <batch pid>` lands that branch on `main` in
 snapshot PRs, each after green CI
@@ -347,7 +347,7 @@ filed as a 16-site refactor; a "planner slice" that already existed).
 
 **Read the `differential-probe` skill before probing.** It has the reference
 servers on this box (mongod 8.2.11 on `PATH`, 6.0.16 and 8.3.4 by Cellar path;
-PostgreSQL 15.19 on port 5415 and 14), the probe recipe, the four ways a probe
+PostgreSQL 15.20 on port 5415 and 14), the probe recipe, the four ways a probe
 lies, and the bug shapes worth grepping for (user paths as dict keys, comments
 citing the other engine, Python `==`/`hash()` for a BSON semantic, serde BSON
 decodes in the Rust servers, missing conflated with null). Cite the exact
@@ -372,22 +372,35 @@ After every push (to a feature branch via PR — the default — or to `main`), 
 
 ## Parallel sessions and subagents: a machine-wide budget
 
-This Mac has **12 cores and 32 GB**, and Joe runs **two sessions at once**.
-The limit is the machine, not the session, so it is shared:
+Joe works on **two machines**, and both configurations below are current.
+Read which one you are on before sizing any work (`sysctl -n hw.ncpu
+hw.memsize`); the limit is the machine, not the session, so it is shared by
+every session on it:
 
-- **At most 4 agents that build or test, across both sessions: 2 per
-  session.** Each compiles its own worktree (a WiredTiger-linked
-  `cargo build` is several minutes and about 1.3 GB of `target/` for the
-  server binary alone, more as the other crates build).
+| machine | cores | memory | build/test budget |
+| --- | --- | --- | --- |
+| the 12-core Mac | 12 | 32 GB | 4 agents x `CARGO_BUILD_JOBS=3` = 12, across two sessions |
+| the Apple M1 | 8 (4 performance + 4 efficiency) | 16 GB | **six cores** (Joe, 2026-11-25: "Keep it to six cores"): two `fix_many` lanes x `CARGO_BUILD_JOBS=3`, `SECANTUS_LOAD_CEILING=6` |
+
+- **At most 2 agents that build or test per session** (4 across two
+  sessions on the 12-core Mac). Each compiles its own worktree (a
+  WiredTiger-linked `cargo build` is several minutes and about 1.3 GB of
+  `target/` for the server binary alone, more as the other crates build).
 - **Every one of them sets `CARGO_BUILD_JOBS=3`** (and `cargo test --
   --test-threads=4`). Cargo's default is one job per core, so each agent
-  alone would take the whole machine: 4 agents x 3 jobs = 12, one job per
-  core.
+  alone would take the whole machine: on the 12-core Mac 4 agents x 3 jobs
+  = 12, one job per core.
+- **On the M1, two building lanes are the whole budget**: no third lane and
+  no gate or build of your own beside two running lanes -- run your own in
+  the gap between batches, or in place of a lane. Three lanes held its load
+  average at 9-11 (2026-11-25); two held it at 3-7, no swap.
 - **Agents that only read, search or probe a running server** (no cargo, no
-  pytest) are cheap: one or two more per session on top of the four.
-- Count what is ALREADY running before spawning: the other session's agents
+  pytest) are cheap: one or two more per session on top of the builders.
+- Count what is ALREADY running before spawning: another session's agents
   are invisible to you, so ask, or read `uptime`. A load average well above
-  12 means the budget is spent.
+  the machine's core count (12, or 6 on the M1) means the budget is spent.
+- `SECANTUS_LOAD_CEILING` and `CARGO_BUILD_JOBS` are read when a batch
+  starts: set them at launch, since a running batch cannot be throttled.
 
 (Measured 2026-10-15: eight agents at cargo's default jobs held the load
 average at 66 on 12 cores.)
