@@ -2790,6 +2790,22 @@ touched:
   environmental.
   Verify: none -- seen once under load; reproduce by running the gate's storage-engine step beside another gate while sampling `netstat -m`
   Backlog-ID: RM-815
+
+- [ ] **`land_batch.sh` reports a GitHub network error as a red snapshot
+  (2026-11-26).** On PR #3048 (d08c97dcc) the MongoDB lander logged
+  `Post "https://api.github.com/graphql": net/http: TLS handshake
+  timeout` 11 s after opening the wait, then `RED on PR #3048 ...: not
+  merging; bisect`, and exited 1. All 15 of the PR's checks were in fact
+  green or skipped. `scripts/wait_ci.sh` exits 2 when any `gh` call fails
+  (`gh repo view`, `gh pr view`, `gh api`), the same code it uses for a
+  timeout, and the lander treats every non-zero code but 1-with-no-bad-
+  checks as RED. A transient network failure then stops the landing and
+  points a reader at a bisect that has nothing to find. Retry a failed
+  `gh` call a few times with a back-off in `wait_ci.sh`, and give an
+  unrecoverable tool failure its own exit code that the lander reports as
+  such, not as RED. Both batch landers (pg-batch too) use these scripts.
+  Verify: none -- tooling; reproduce by running wait_ci.sh with the network down for one call
+  Backlog-ID: RM-825
 - [ ] **The profiler's level-two test fails when its `find` touches the
   disk or waits on a WiredTiger lock.** `profiler_wt.rs`'s
   `level_two_writes_each_operation_in_mongods_shape` compares a `find`
