@@ -5250,6 +5250,83 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Output: e2.a, e2.b, (e2.b || 'x'::text)",
         ],
     ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1071): a narrower
+    # select list leaves the expression side's Sort the join's column and
+    # its key, and a WHERE on the column side prints as that scan's Filter.
+    "verbose of a merge join on an expression key returning one column": (
+        "RP-1071",
+        _ANALYSED,
+        "explain verbose select e.a from e join e e2 on e.b = e2.b || 'x'",
+        [
+            "Merge Join  (cost=129.66..224.66 rows=5000 width=4)",
+            "  Output: e.a",
+            "  Merge Cond: (e.b = ((e2.b || 'x'::text)))",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "        Sort Key: e.b",
+            "        ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "              Output: e.a, e.b",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=3)",
+            "        Output: e2.b, ((e2.b || 'x'::text))",
+            "        Sort Key: ((e2.b || 'x'::text))",
+            "        ->  Seq Scan on public.e e2  (cost=0.00..15.00 rows=1000 width=3)",
+            "              Output: e2.b, (e2.b || 'x'::text)",
+        ],
+    ),
+    "verbose of a merge join on an expression key with a where": (
+        "RP-1071",
+        _ANALYSED,
+        "explain verbose select * from e join e e2 on e.b = e2.b || 'x' where e.a > 5",
+        [
+            "Merge Join  (cost=131.87..226.40 rows=4975 width=14)",
+            "  Output: e.a, e.b, e2.a, e2.b",
+            "  Merge Cond: (e.b = ((e2.b || 'x'::text)))",
+            "  ->  Sort  (cost=67.04..69.53 rows=995 width=7)",
+            "        Output: e.a, e.b",
+            "        Sort Key: e.b",
+            "        ->  Seq Scan on public.e  (cost=0.00..17.50 rows=995 width=7)",
+            "              Output: e.a, e.b",
+            "              Filter: (e.a > 5)",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Output: e2.a, e2.b, ((e2.b || 'x'::text))",
+            "        Sort Key: ((e2.b || 'x'::text))",
+            "        ->  Seq Scan on public.e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "              Output: e2.a, e2.b, (e2.b || 'x'::text)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster: a join on an
+    # expression of each side, and one ordered by its merge key, are both
+    # the priced Merge Join, the latter with no Sort above it.
+    "a join on an expression of each side is a merge join": (
+        "RP-1131",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.b || 'y' = e2.b || 'x'",
+        [
+            "Merge Join  (cost=129.66..239.66 rows=5000 width=14)",
+            "  Merge Cond: (((e.b || 'y'::text)) = ((e2.b || 'x'::text)))",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: ((e.b || 'y'::text))",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: ((e2.b || 'x'::text))",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a join on an expression key ordered by its merge key is a merge join": (
+        "RP-1131",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.b = e2.b || 'x' order by e.b",
+        [
+            "Merge Join  (cost=129.66..224.66 rows=5000 width=14)",
+            "  Merge Cond: (e.b = ((e2.b || 'x'::text)))",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: e.b",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: ((e2.b || 'x'::text))",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
     # Measured on PostgreSQL 15.19: ANALYZE of an anti join hashed on an
     # expression counts its children and its hash table.
     "analyze of an anti join on an expression key": (
@@ -9491,6 +9568,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1071",
         "RP-1058",
         "RP-1056",
         "RP-1060",

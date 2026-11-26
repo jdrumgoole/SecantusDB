@@ -3501,18 +3501,6 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       integer opfamily's hashable operator.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an expression key against a unique column is a hash join]
       Backlog-ID: RP-1032
-- [ ] **VERBOSE of a merge join prints no `Output`.** `explain verbose
-      select * from e join e e2 on e.b = e2.b || 'x'` prints, in
-      PostgreSQL 15.19, `Output:` on the Merge Join, each Sort and each
-      scan, the expression side's Sort and scan carrying the projected
-      value (`Output: e2.a, e2.b, ((e2.b || 'x'::text))` over `Output:
-      e2.a, e2.b, (e2.b || 'x'::text)`), and the scans as `public.e`.
-      Here the plan prints as without VERBOSE: `attach_verbose_join`
-      handles a hash join and a nested loop only, so a merge on a column
-      key is the same. Measured on the 15.19 reference on port 5415
-      (found while working RP-1032).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[verbose of a merge join on an expression key]
-      Backlog-ID: RP-1071
 - [ ] **ANALYZE of a hash join on an expression key counts nothing below
       it.** `explain (analyze, costs off, timing off, summary off) select *
       from e left join e e2 on e.a = e2.a + 1 where e2.a is null` prints,
@@ -3536,6 +3524,25 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       Measured on the 15.19 reference on port 5415.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash join written inner side first is inner unique]
       Backlog-ID: RP-1030
+## Found while working RP-1071 (2026-11-26)
+
+- [ ] **A join on an expression of each side, or one ordered by its
+      expression-key merge, is not a priced Merge Join.** `explain select *
+      from e join e e2 on e.b || 'y' = e2.b || 'x'` is in PostgreSQL 15.20
+      (a private cluster) `Merge Join (cost=129.66..239.66 rows=5000
+      width=14)`, each side a Sort on its expression (`Sort Key: ((e.b ||
+      'y'::text))`); `explain select * from e join e e2 on e.b = e2.b ||
+      'x' order by e.b` is the same Merge Join as without the ORDER BY
+      (`cost=129.66..224.66`), its order serving the query's with no Sort
+      above it. Here the first is an unpriced `Nested Loop` with `Join
+      Filter: ((e.b || 'y'::text) = (e2.b || 'x'::text))`, the second an
+      unpriced Sort over that Nested Loop. RP-981 / RP-1032 draw an
+      expression key only against a column of the other side, and the
+      ORDER BY path does not reach the expression merge. Once drawn,
+      VERBOSE prints them already (RP-1071).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join on an expression of each side is a merge join], tests/backlog/test_rp_explain_costs.py::test_plan[a join on an expression key ordered by its merge key is a merge join]
+      Backlog-ID: RP-1131
+
 ## Found while working RP-980 (2026-11-17)
 
 - [ ] **An anti join with an outer conjunct beside it is not planned as
