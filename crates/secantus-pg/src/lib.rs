@@ -4988,8 +4988,9 @@ pub struct PgHandler {
     /// `begin_message_cycle`.
     cycle_open: Arc<AtomicBool>,
     /// Counts message cycles: the catalog rows `virtual_rows` computed are
-    /// kept for the rest of the cycle that computed them.
-    message_cycle: std::sync::atomic::AtomicU64,
+    /// kept for the rest of the cycle that computed them. Shared with the
+    /// session's `MessageStartHook`, which opens the cycle.
+    message_cycle: Arc<std::sync::atomic::AtomicU64>,
     /// `virtual_rows`' unfiltered rows per relation, for one message cycle,
     /// catalog version and settings generation.
     virtual_cache: Mutex<HashMap<String, CachedRows>>,
@@ -5678,7 +5679,7 @@ impl PgHandler {
             commit_failed: AtomicBool::new(false),
             implicit_extended: AtomicBool::new(false),
             cycle_open: Arc::new(AtomicBool::new(false)),
-            message_cycle: std::sync::atomic::AtomicU64::new(0),
+            message_cycle: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             virtual_cache: Mutex::new(HashMap::new()),
             group_failed: AtomicBool::new(false),
             pending_notifies: Mutex::new(Vec::new()),
@@ -31577,14 +31578,18 @@ impl PgHandler {
         // lands while a long statement is still arriving is kept, as
         // PostgreSQL keeps it; one from before the message is stale and is
         // cleared (`begin_message_cycle`).
+        // The hook does everything a cycle's start does, since
+        // `begin_message_cycle` finds the cycle already open: before RP-1116
+        // it only cleared the cancel, so the idle timer was never stopped and
+        // another backend's report flushed a busy one's held counts.
         let cycle = Arc::clone(&self.cycle_open);
         let backend = Arc::clone(&self.backend);
+        let message_cycle = Arc::clone(&self.message_cycle);
+        let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+        let stats = self.stats();
         _c.session_extensions()
             .insert(pgwire::api::MessageStartHook(Arc::new(move || {
-                use std::sync::atomic::Ordering::Relaxed;
-                if !cycle.swap(true, Relaxed) {
-                    backend.cancel.store(false, Relaxed);
-                }
+                open_message_cycle(&cycle, &backend, &message_cycle, pid, || stats);
             })));
         let settings = Arc::clone(&self.settings);
         _c.session_extensions()
@@ -32017,6 +32022,71 @@ impl SimpleQueryHandler for PgHandler {
             }
             out => out,
         }
+    }
+}
+
+/// Opens a message cycle, if this is its first message: the first message
+/// after a `ReadyForQuery`. A cancel pending from before it targeted nothing
+/// and is dropped, the cycle count moves (the per-cycle catalog cache), and the
+/// backend's idle timer stops -- PostgreSQL's `disable_timeout` of
+/// IDLE_STATS_UPDATE_TIMEOUT as it reads the next command -- so counts it held
+/// for that timer wait until it is idle again (RP-1116). The session's
+/// `MessageStartHook` calls it at the message's first byte, and
+/// `begin_message_cycle` again once the message is whole, for a session
+/// without the hook.
+fn open_message_cycle(
+    cycle_open: &AtomicBool,
+    backend: &BackendEntry,
+    message_cycle: &std::sync::atomic::AtomicU64,
+    pid: i32,
+    stats: impl FnOnce() -> pgstat::Stats,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if cycle_open.swap(true, Relaxed) {
+        return;
+    }
+    let dropped = backend.cancel.swap(false, Relaxed);
+    secantus_pgplan::cancel::trace(format_args!(
+        "pid {pid} cycle start{}",
+        if dropped {
+            ", a pending cancel dropped"
+        } else {
+            ""
+        }
+    ));
+    message_cycle.fetch_add(1, Relaxed);
+    if pid != 0 {
+        stats().wake();
+    }
+}
+
+#[cfg(test)]
+mod message_cycle_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// The hook opens the cycle at the first byte and `begin_message_cycle`
+    /// then finds it open: the cycle's start happens once, in the hook, and a
+    /// cancel landing between the two is kept (RP-1116).
+    #[test]
+    fn a_cycle_starts_once_whichever_opener_comes_first() {
+        let (open, backend, cycles) = (
+            AtomicBool::new(false),
+            BackendEntry::new(""),
+            AtomicU64::new(0),
+        );
+        let no_stats = || -> pgstat::Stats { unreachable!("pid 0 keeps no statistics") };
+        backend.cancel.store(true, Relaxed); // sent while idle: stale
+        open_message_cycle(&open, &backend, &cycles, 0, no_stats);
+        assert!(!backend.cancel.load(Relaxed));
+        assert_eq!(cycles.load(Relaxed), 1);
+        backend.cancel.store(true, Relaxed); // sent while the message arrives
+        open_message_cycle(&open, &backend, &cycles, 0, no_stats);
+        assert!(backend.cancel.load(Relaxed));
+        assert_eq!(cycles.load(Relaxed), 1);
+        open.store(false, Relaxed); // ReadyForQuery
+        open_message_cycle(&open, &backend, &cycles, 0, no_stats);
+        assert_eq!(cycles.load(Relaxed), 2);
     }
 }
 
@@ -36798,23 +36868,13 @@ impl PgHandler {
     /// statement slow to parse, PostgreSQL answered 57014 at every offset and
     /// this server ran the statement to completion.
     fn begin_message_cycle(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        if !self.cycle_open.swap(true, Relaxed) {
-            let dropped = self.backend.cancel.swap(false, Relaxed);
-            secantus_pgplan::cancel::trace(format_args!(
-                "pid {} cycle start{}",
-                self.backend_pid.load(Relaxed),
-                if dropped {
-                    ", a pending cancel dropped"
-                } else {
-                    ""
-                }
-            ));
-            self.message_cycle.fetch_add(1, Relaxed);
-            if self.backend_pid.load(Relaxed) != 0 {
-                self.stats().wake();
-            }
-        }
+        open_message_cycle(
+            &self.cycle_open,
+            &self.backend,
+            &self.message_cycle,
+            self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+            || self.stats(),
+        );
         // A reload is taken between messages, as a backend takes the
         // postmaster's SIGHUP.
         self.apply_config_reload();
