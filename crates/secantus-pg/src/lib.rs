@@ -23023,10 +23023,14 @@ impl PgHandler {
                         _ => return Ok(Bson::Null),
                     }
                 } else if self.sequence_names().contains(&rel) {
-                    match self
-                        .storage
-                        .collection_table_name(self.db(), SEQUENCE_COLLECTION)
-                    {
+                    // The sequence's own relation (RP-1076).
+                    let Some(own) = self
+                        .sequence_doc(&rel)?
+                        .and_then(|d| Self::sequence_relation_of(&d).ok())
+                    else {
+                        return Ok(Bson::Null);
+                    };
+                    match self.storage.collection_table_name(self.db(), &own) {
                         Ok(Some(t)) => t,
                         _ => return Ok(Bson::Null),
                     }
@@ -33183,7 +33187,7 @@ impl PgHandler {
         coll: &str,
         rows: &[&secantus_storage::UndoRow],
     ) -> PgWireResult<()> {
-        let sequence = db == self.db() && coll == SEQUENCE_COLLECTION;
+        let sequence = db == self.db() && Self::is_sequence_collection(coll);
         let key_of = |id: &Bson| -> PgWireResult<Vec<u8>> {
             bson::to_vec(&bson::doc! { "k": id.clone() })
                 .map_err(|e| Self::storage_err("could not encode a key", e))
@@ -33751,17 +33755,10 @@ impl PgHandler {
                 o.sequence_name = None;
                 o.owned_by = Some(format!("{table}.{column}"));
                 o.data_type = Some(ty);
-                self.ensure_collection(SEQUENCE_COLLECTION)?;
                 let mut doc = Self::new_sequence_doc(&seq, &o)?;
                 doc.insert("oid", self.mint_global_oids(1)?);
                 doc.insert("owner", self.current_role_name());
-                let bytes = encode_doc(&doc)
-                    .map_err(|e| Self::storage_err("could not encode the sequence", e))?;
-                self.insert_checked(
-                    SEQUENCE_COLLECTION,
-                    vec![bytes],
-                    "could not create the sequence",
-                )?;
+                self.create_sequence_storage(doc, "could not create the sequence")?;
                 Ok(())
             }
             A::ValidateConstraint(name) => {
@@ -33848,14 +33845,7 @@ impl PgHandler {
                         &format!("{table}.{}", column.name),
                         max_value,
                     );
-                    let bytes = encode_doc(&doc)
-                        .map_err(|e| Self::storage_err("could not encode a sequence", e))?;
-                    self.ensure_collection(SEQUENCE_COLLECTION)?;
-                    self.insert_checked(
-                        SEQUENCE_COLLECTION,
-                        vec![bytes],
-                        "could not record the sequence",
-                    )?;
+                    self.create_sequence_storage(doc, "could not record the sequence")?;
                     let field = column.field();
                     let wide = column.pg_type == "int8";
                     // A volatile default rewrites the table (RP-069).
@@ -34877,7 +34867,10 @@ impl PgHandler {
             .storage
             .find_matching(self.db(), SEQUENCE_COLLECTION, &Document::new())
             .map_err(|e| Self::storage_err("could not read the sequences", e))?;
-        Ok(raw.iter().filter_map(|b| decode_doc(b).ok()).collect())
+        raw.iter()
+            .filter_map(|b| decode_doc(b).ok())
+            .map(|d| self.with_sequence_state(d))
+            .collect()
     }
 
     /// A column's DEFAULT as PostgreSQL renders it in the catalog -- a
@@ -35078,11 +35071,174 @@ impl PgHandler {
         match raw.first() {
             None => Ok(None),
             Some(bytes) => {
-                Ok(Some(decode_doc(bytes).map_err(|e| {
-                    Self::storage_err("could not decode the sequence", e)
-                })?))
+                let doc = decode_doc(bytes)
+                    .map_err(|e| Self::storage_err("could not decode the sequence", e))?;
+                Ok(Some(self.with_sequence_state(doc)?))
             }
         }
+    }
+
+    /// The fields of a sequence's own relation: the one row PostgreSQL's
+    /// sequence file holds (`FormData_pg_sequence_data`). Everything else
+    /// about a sequence is its catalog row in [`SEQUENCE_COLLECTION`]
+    /// (`pg_sequence`, with the `pg_class` name and owner).
+    const SEQUENCE_STATE_FIELDS: [&'static str; 3] = ["last_value", "log_cnt", "is_called"];
+
+    /// The prefix of a sequence's own relation, `__sql_seq_<oid>__`.
+    const SEQUENCE_RELATION_PREFIX: &'static str = "__sql_seq_";
+
+    /// The collection holding a sequence's state, named by the oid its
+    /// CREATE drew, so a rename leaves it where it is, as a rename keeps a
+    /// PostgreSQL relation's file (RP-1076).
+    pub(crate) fn sequence_relation(oid: i64) -> String {
+        format!("{}{oid}__", Self::SEQUENCE_RELATION_PREFIX)
+    }
+
+    /// Is `coll` a sequence's own relation?
+    pub(crate) fn is_sequence_relation(coll: &str) -> bool {
+        coll.strip_prefix(Self::SEQUENCE_RELATION_PREFIX)
+            .and_then(|rest| rest.strip_suffix("__"))
+            .is_some_and(|oid| !oid.is_empty() && oid.bytes().all(|b| b.is_ascii_digit()))
+    }
+
+    /// Does `coll` hold sequence rows whose advances no rollback undoes: the
+    /// sequences' catalog, or one sequence's own relation?
+    pub(crate) fn is_sequence_collection(coll: &str) -> bool {
+        coll == SEQUENCE_COLLECTION || Self::is_sequence_relation(coll)
+    }
+
+    /// The relation of a sequence's catalog row.
+    fn sequence_relation_of(doc: &Document) -> PgWireResult<String> {
+        doc.get("oid")
+            .and_then(bson_i64)
+            .map(Self::sequence_relation)
+            .ok_or_else(|| {
+                Self::storage_err(
+                    "could not read the sequence",
+                    format!(
+                        "sequence \"{}\" has no oid to name its relation",
+                        doc.get_str("_id").unwrap_or_default()
+                    ),
+                )
+            })
+    }
+
+    /// A sequence's catalog row with its state, read from its own relation,
+    /// merged in: the whole sequence as one document, as callers read it.
+    fn with_sequence_state(&self, mut doc: Document) -> PgWireResult<Document> {
+        let rel = Self::sequence_relation_of(&doc)?;
+        let raw = self
+            .storage
+            .find_matching(self.db(), &rel, &Document::new())
+            .map_err(|e| Self::storage_err("could not read the sequence", e))?;
+        let Some(bytes) = raw.first() else {
+            return Err(Self::storage_err(
+                "could not read the sequence",
+                format!(
+                    "the relation of sequence \"{}\" holds no row",
+                    doc.get_str("_id").unwrap_or_default()
+                ),
+            ));
+        };
+        let state =
+            decode_doc(bytes).map_err(|e| Self::storage_err("could not decode the sequence", e))?;
+        for k in Self::SEQUENCE_STATE_FIELDS {
+            if let Some(v) = state.get(k) {
+                doc.insert(k, v.clone());
+            }
+        }
+        Ok(doc)
+    }
+
+    /// Write `doc` (a whole sequence, as [`Self::sequence_doc`] reads it) as
+    /// its catalog row, without the state its relation holds.
+    fn insert_sequence_catalog(&self, doc: &Document, context: &str) -> PgWireResult<()> {
+        let mut row = doc.clone();
+        for k in Self::SEQUENCE_STATE_FIELDS {
+            row.remove(k);
+        }
+        let bytes = encode_doc(&row).map_err(|e| Self::storage_err(context, e))?;
+        self.ensure_collection(SEQUENCE_COLLECTION)?;
+        self.insert_checked(SEQUENCE_COLLECTION, vec![bytes], context)?;
+        Ok(())
+    }
+
+    /// Create a sequence: its catalog row, and its own relation holding its
+    /// one state row, as `DefineSequence` writes `pg_sequence` and the
+    /// sequence's file (RP-1076). A `doc` without an oid draws one. Returns
+    /// the document as written, oid included.
+    fn create_sequence_storage(&self, mut doc: Document, context: &str) -> PgWireResult<Document> {
+        if doc.get("oid").and_then(bson_i64).is_none() {
+            doc.insert("oid", self.mint_global_oids(1)?);
+        }
+        let rel = Self::sequence_relation_of(&doc)?;
+        self.insert_sequence_catalog(&doc, context)?;
+        self.storage
+            .create_collection(self.db(), &rel)
+            .map_err(|e| Self::storage_err(context, e))?;
+        let state = bson::doc! {
+            "_id": 1i32,
+            "last_value": doc.get("last_value").and_then(bson_i64).unwrap_or(1),
+            "log_cnt": 0i64,
+            "is_called": doc.get_bool("is_called").unwrap_or(false),
+        };
+        let bytes = encode_doc(&state).map_err(|e| Self::storage_err(context, e))?;
+        self.insert_checked(&rel, vec![bytes], context)?;
+        Ok(doc)
+    }
+
+    /// Set a sequence's state, in its own relation.
+    fn write_sequence_state(
+        &self,
+        doc: &Document,
+        last_value: i64,
+        is_called: bool,
+        context: &str,
+    ) -> PgWireResult<()> {
+        let rel = Self::sequence_relation_of(doc)?;
+        self.storage
+            .update_matching(
+                self.db(),
+                &rel,
+                &bson::doc! { "_id": 1i32 },
+                &bson::doc! { "$set": { "last_value": last_value, "is_called": is_called } },
+                false,
+                false,
+                &[],
+                &secantus_core::vars::Vars::new(),
+                None,
+                None,
+                false,
+            )
+            .map_err(|e| Self::storage_err(context, e))?;
+        Ok(())
+    }
+
+    /// Drop a sequence's catalog row and its relation. `false` when there is
+    /// no such sequence.
+    fn drop_sequence_storage(&self, name: &str, context: &str) -> PgWireResult<bool> {
+        let raw = self
+            .storage
+            .find_matching(self.db(), SEQUENCE_COLLECTION, &bson::doc! { "_id": name })
+            .map_err(|e| Self::storage_err(context, e))?;
+        let Some(bytes) = raw.first() else {
+            return Ok(false);
+        };
+        let doc = decode_doc(bytes).map_err(|e| Self::storage_err(context, e))?;
+        self.storage
+            .delete_matching(
+                self.db(),
+                SEQUENCE_COLLECTION,
+                &bson::doc! { "_id": name },
+                0,
+                &secantus_core::vars::Vars::new(),
+                None,
+            )
+            .map_err(|e| Self::storage_err(context, e))?;
+        self.storage
+            .drop_collection(self.db(), &Self::sequence_relation_of(&doc)?)
+            .map_err(|e| Self::storage_err(context, e))?;
+        Ok(true)
     }
 
     /// A new sequence's document, with PostgreSQL's defaults filled in.
@@ -35343,21 +35499,7 @@ impl PgHandler {
             ))));
         }
         self.note_txn_sequence(name);
-        self.storage
-            .update_matching(
-                self.db(),
-                SEQUENCE_COLLECTION,
-                &bson::doc! { "_id": name },
-                &bson::doc! { "$set": { "last_value": value, "is_called": called } },
-                false,
-                false,
-                &[],
-                &secantus_core::vars::Vars::new(),
-                None,
-                None,
-                false,
-            )
-            .map_err(|e| Self::storage_err("could not set the sequence", e))?;
+        self.write_sequence_state(&doc, value, called, "could not set the sequence")?;
         Ok(value)
     }
 
@@ -38936,7 +39078,7 @@ impl PgHandler {
                     !secantus_storage::Storage::no_commit_touching_since(
                         handle.snapshot_epoch(),
                         &|db, coll| {
-                            if coll == SEQUENCE_COLLECTION && !own_sequences {
+                            if Self::is_sequence_collection(coll) && !own_sequences {
                                 return secantus_storage::NsRead::No;
                             }
                             match &narrow {
@@ -40013,13 +40155,21 @@ impl PgHandler {
         let (Some(pos), Some(lock_pos)) = (write_pos, lock_pos) else {
             return Ok(false);
         };
-        let sequences = format!("{}.{SEQUENCE_COLLECTION}", self.db());
+        // A sequence's rows: its catalog row, and the state row of its own
+        // relation (RP-1076).
+        let db_prefix = format!("{}.", self.db());
+        let sequence_ns = |ns: &str| -> bool {
+            ns.strip_prefix(db_prefix.as_str())
+                .is_some_and(Self::is_sequence_collection)
+        };
         // The sequences created since the savepoint, met in write order
-        // (a sequence's insert comes before any advance of it).
-        let created: std::cell::RefCell<HashSet<Vec<u8>>> = Default::default();
-        let id_key = |op: &Document, field: &str| -> Option<Vec<u8>> {
+        // (a sequence's insert comes before any advance of it), by
+        // namespace and key.
+        let created: std::cell::RefCell<HashSet<(String, Vec<u8>)>> = Default::default();
+        let id_key = |op: &Document, field: &str| -> Option<(String, Vec<u8>)> {
             let id = op.get_document(field).ok()?.get("_id")?.clone();
-            bson::to_vec(&bson::doc! { "k": id }).ok()
+            let ns = op.get_str("ns").ok()?.to_string();
+            Some((ns, bson::to_vec(&bson::doc! { "k": id }).ok()?))
         };
         // Everything written since the savepoint is undone -- a command (a
         // CREATE: the move refuses any other) included -- but a sequence's
@@ -40028,7 +40178,7 @@ impl PgHandler {
             if i < pos {
                 return true;
             }
-            if op.get_str("ns") != Ok(sequences.as_str()) {
+            if !op.get_str("ns").is_ok_and(sequence_ns) {
                 return false;
             }
             match op.get_str("op") {
@@ -40962,20 +41112,13 @@ impl PgHandler {
     }
 
     fn nextval_in_scope(&self, name: &str, count: usize) -> PgWireResult<Vec<i64>> {
-        let filter = bson::doc! { "_id": name };
-        let raw = self
-            .storage
-            .find_matching(self.db(), SEQUENCE_COLLECTION, &filter)
-            .map_err(|e| Self::storage_err("could not read the sequence", e))?;
-        let Some(raw) = raw.first() else {
+        let Some(seq) = self.sequence_doc_here(name)? else {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
                 "42P01".into(), // undefined_table
                 format!("relation \"{name}\" does not exist"),
             ))));
         };
-        let seq: Document =
-            decode_doc(raw).map_err(|e| Self::storage_err("could not decode the sequence", e))?;
         let int = |key: &str| seq.get(key).and_then(bson_i64);
         let mut last = int("last_value").unwrap_or(1);
         let increment = int("increment").unwrap_or(1);
@@ -41028,21 +41171,7 @@ impl PgHandler {
             called = true;
         }
         if !values.is_empty() {
-            self.storage
-                .update_matching(
-                    self.db(),
-                    SEQUENCE_COLLECTION,
-                    &filter,
-                    &bson::doc! { "$set": { "last_value": last, "is_called": true } },
-                    false,
-                    false,
-                    &[],
-                    &secantus_core::vars::Vars::new(),
-                    None,
-                    None,
-                    false,
-                )
-                .map_err(|e| Self::storage_err("could not advance the sequence", e))?;
+            self.write_sequence_state(&seq, last, true, "could not advance the sequence")?;
         }
         Ok(values)
     }
@@ -44432,8 +44561,7 @@ impl PgHandler {
                             // Drawn before the table's, as PostgreSQL makes
                             // a serial's sequence first (RP-137).
                             doc.insert("oid", self.mint_global_oids(1)?);
-                            return encode_doc(&doc)
-                                .map_err(|e| Self::storage_err("could not encode a sequence", e));
+                            return Ok(doc);
                         };
                         // The bounds a sequence of the column's type takes by
                         // default, for the direction its increment runs.
@@ -44468,8 +44596,7 @@ impl PgHandler {
                         };
                         let mut doc = Self::new_sequence_doc(seq, &options)?;
                         doc.insert("oid", self.mint_global_oids(1)?);
-                        encode_doc(&doc)
-                            .map_err(|e| Self::storage_err("could not encode a sequence", e))
+                        Ok(doc)
                     })
                     .collect::<PgWireResult<Vec<_>>>()?;
                 if !sequences.is_empty() {
@@ -44479,22 +44606,11 @@ impl PgHandler {
                     // otherwise collide on `_id`.
                     for seq in def.columns.iter().filter_map(|c| c.sequence.as_deref()) {
                         self.note_txn_sequence(seq);
-                        self.storage
-                            .delete_matching(
-                                self.db(),
-                                SEQUENCE_COLLECTION,
-                                &bson::doc! { "_id": seq },
-                                0,
-                                &secantus_core::vars::Vars::new(),
-                                None,
-                            )
-                            .map_err(|e| Self::storage_err("could not reset a sequence", e))?;
+                        self.drop_sequence_storage(seq, "could not reset a sequence")?;
                     }
-                    self.insert_checked(
-                        SEQUENCE_COLLECTION,
-                        sequences,
-                        "could not record a sequence",
-                    )?;
+                    for doc in sequences {
+                        self.create_sequence_storage(doc, "could not record a sequence")?;
+                    }
                 }
                 // The table's ROW TYPE: a composite of its columns, in the
                 // type catalog like any other so `'(foo)'::mytype`,
@@ -47019,13 +47135,7 @@ impl PgHandler {
                 let mut doc = Self::new_sequence_doc(&name, &options)?;
                 doc.insert("oid", self.mint_global_oids(1)?);
                 doc.insert("owner", self.current_role_name());
-                let bytes = encode_doc(&doc)
-                    .map_err(|e| Self::storage_err("could not encode the sequence", e))?;
-                self.insert_checked(
-                    SEQUENCE_COLLECTION,
-                    vec![bytes],
-                    "could not create the sequence",
-                )?;
+                let doc = self.create_sequence_storage(doc, "could not create the sequence")?;
                 // Planning reads the catalog outside the transaction, so a
                 // sequence this block created is named to it by the overlay
                 // (`'s'::regclass`, `pg_table_is_visible`).
@@ -47050,9 +47160,11 @@ impl PgHandler {
                         format!("relation \"{name}\" does not exist"),
                     ))));
                 };
+                let before = (
+                    doc.get("last_value").and_then(bson_i64),
+                    doc.get_bool("is_called").ok(),
+                );
                 Self::apply_sequence_options(&mut doc, &options)?;
-                let bytes = encode_doc(&doc)
-                    .map_err(|e| Self::storage_err("could not encode the sequence", e))?;
                 self.storage
                     .delete_matching(
                         self.db(),
@@ -47064,11 +47176,20 @@ impl PgHandler {
                     )
                     .map_err(|e| Self::storage_err("could not alter the sequence", e))?;
                 self.note_txn_sequence(&name);
-                self.insert_checked(
-                    SEQUENCE_COLLECTION,
-                    vec![bytes],
-                    "could not alter the sequence",
-                )?;
+                self.insert_sequence_catalog(&doc, "could not alter the sequence")?;
+                // A RESTART moves the state, in the sequence's own relation.
+                let after = (
+                    doc.get("last_value").and_then(bson_i64),
+                    doc.get_bool("is_called").ok(),
+                );
+                if after != before {
+                    self.write_sequence_state(
+                        &doc,
+                        after.0.unwrap_or(1),
+                        after.1.unwrap_or(false),
+                        "could not alter the sequence",
+                    )?;
+                }
                 Ok(vec![Response::Execution(Tag::new("ALTER SEQUENCE"))])
             }
 
@@ -47095,16 +47216,7 @@ impl PgHandler {
                             format!("sequence \"{name}\" does not exist"),
                         ))));
                     }
-                    self.storage
-                        .delete_matching(
-                            self.db(),
-                            SEQUENCE_COLLECTION,
-                            &bson::doc! { "_id": name },
-                            0,
-                            &secantus_core::vars::Vars::new(),
-                            None,
-                        )
-                        .map_err(|e| Self::storage_err("could not drop the sequence", e))?;
+                    self.drop_sequence_storage(name, "could not drop the sequence")?;
                     self.note_uncommitted_type(SEQUENCE_COLLECTION, name, None);
                     self.note_txn_sequence(name);
                     self.drop_object_acl("sequence", name)?;
@@ -49203,16 +49315,7 @@ impl PgHandler {
                     }
                     for seq in def.columns.iter().filter_map(|c| c.sequence.as_deref()) {
                         self.note_txn_sequence(seq);
-                        self.storage
-                            .delete_matching(
-                                self.db(),
-                                SEQUENCE_COLLECTION,
-                                &bson::doc! { "_id": seq },
-                                0,
-                                &secantus_core::vars::Vars::new(),
-                                None,
-                            )
-                            .map_err(|e| Self::storage_err("could not drop a sequence", e))?;
+                        self.drop_sequence_storage(seq, "could not drop a sequence")?;
                     }
                     // Both halves, and the CATALOG entry last: if the drop
                     // fails midway, a table whose catalog row survived is
@@ -51956,33 +52059,12 @@ impl PgHandler {
                 let Some(seq) = col.sequence.as_deref() else {
                     continue;
                 };
-                let filter = bson::doc! { "_id": seq };
-                let raw = self
-                    .storage
-                    .find_matching(self.db(), SEQUENCE_COLLECTION, &filter)
-                    .map_err(|e| Self::storage_err("could not read the sequence", e))?;
-                let Some(raw) = raw.first() else {
+                let Some(doc) = self.sequence_doc_here(seq)? else {
                     continue;
                 };
-                let doc: Document = decode_doc(raw)
-                    .map_err(|e| Self::storage_err("could not decode the sequence", e))?;
                 let start = doc.get("start").and_then(bson_i64).unwrap_or(1);
                 self.note_txn_sequence(seq);
-                self.storage
-                    .update_matching(
-                        self.db(),
-                        SEQUENCE_COLLECTION,
-                        &filter,
-                        &bson::doc! { "$set": { "last_value": start, "is_called": false } },
-                        false,
-                        false,
-                        &[],
-                        &secantus_core::vars::Vars::new(),
-                        None,
-                        None,
-                        false,
-                    )
-                    .map_err(|e| Self::storage_err("could not restart the sequence", e))?;
+                self.write_sequence_state(&doc, start, false, "could not restart the sequence")?;
             }
         }
         Ok(())

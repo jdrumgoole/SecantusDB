@@ -21595,7 +21595,61 @@ def test_relation_filepath_names_each_relations_own_file(home: Path) -> None:
     assert by_name["fp"].startswith("collection-")
     assert by_name["fp_pkey"].startswith("index-")
     assert by_name["fp_name"].startswith("index-")
-    assert len({by_name["fp"], by_name["fp_pkey"], by_name["fp_name"]}) == 3
+    # A sequence is a relation of its own, with its own file (RP-1076).
+    assert by_name["fp_seq"].startswith("collection-")
+    assert len({by_name[r] for r in ("fp", "fp_pkey", "fp_name", "fp_seq")}) == 4
     for rel in ("fp", "fp_pkey", "fp_name", "fp_seq"):
         assert by_name[rel].endswith(".wt"), by_name
         assert (home / by_name[rel]).is_file(), by_name[rel]
+
+
+def test_a_sequence_keeps_its_state_in_its_own_file(home: Path) -> None:
+    """A sequence's state is the one row of its own relation, as PostgreSQL
+    keeps it in the sequence's file (RP-1076): each sequence names a file of
+    its own, which holds its state across a restart and stays the same file
+    through a rename, as PostgreSQL's relfilenode does; an advance outlives a
+    rollback, and a DROP removes the file (at the next open, as a dropped
+    table's)."""
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE SEQUENCE ks1")
+        cur.execute("CREATE SEQUENCE ks2 START 10")
+        cur.execute("CREATE TABLE kt (id serial PRIMARY KEY, v int)")
+        cur.execute(
+            "SELECT pg_relation_filepath('ks1'), pg_relation_filepath('ks2'),"
+            " pg_relation_filepath('kt_id_seq')"
+        )
+        files = cur.fetchone()
+        assert len(set(files)) == 3, files
+        assert all((home / f).exists() for f in files), files
+        cur.execute("SELECT nextval('ks1'), nextval('ks1'), nextval('ks2')")
+        assert cur.fetchone() == (1, 2, 10)
+        # An advance is never rolled back; a sequence created in the
+        # rolled-back block goes with it, file and all.
+        cur.execute("BEGIN")
+        cur.execute("SELECT nextval('ks1')")
+        cur.execute("CREATE SEQUENCE ks_gone")
+        cur.execute("SELECT pg_relation_filepath('ks_gone')")
+        cur.execute("INSERT INTO kt (v) VALUES (1), (2)")
+        cur.execute("ROLLBACK")
+        cur.execute("SELECT to_regclass('ks_gone')")
+        assert cur.fetchone() == (None,)
+        cur.execute("ALTER SEQUENCE ks2 RENAME TO ks2r")
+        cur.execute("SELECT pg_relation_filepath('ks2r')")
+        assert cur.fetchone() == (files[1],)
+        cur.execute("CREATE SEQUENCE ks3")
+        cur.execute("SELECT pg_relation_filepath('ks3')")
+        (dropped,) = cur.fetchone()
+        cur.execute("DROP SEQUENCE ks3")
+    with _Server(home) as server, server.connect(autocommit=True) as conn:
+        cur = conn.cursor()
+        # A dropped relation's file is reaped at the next open, a table's
+        # as a sequence's.
+        assert not (home / dropped).exists()
+        cur.execute("SELECT last_value, is_called FROM ks1")
+        assert cur.fetchone() == (3, True)
+        cur.execute("SELECT nextval('ks1'), nextval('ks2r'), nextval('kt_id_seq')")
+        assert cur.fetchone() == (4, 11, 3)
+        cur.execute("ALTER SEQUENCE ks1 RESTART WITH 100")
+        cur.execute("SELECT nextval('ks1'), setval('ks2r', 50), nextval('ks2r')")
+        assert cur.fetchone() == (100, 50, 51)

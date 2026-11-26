@@ -10,7 +10,7 @@ use pgwire::api::results::{Response, Tag};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use secantus_pgcatalog::{TableDef, SEQUENCE_COLLECTION};
 
-use crate::{encode_doc, triggers::TRIGGER_COLLECTION, PgHandler};
+use crate::{triggers::TRIGGER_COLLECTION, PgHandler};
 
 fn error(code: &str, message: String) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -466,13 +466,10 @@ impl PgHandler {
                 None,
             )
             .map_err(|e| Self::storage_err("could not rename the sequence", e))?;
+        // The catalog row only: the sequence's own relation is named by its
+        // oid, so it stays where it is, as a rename keeps a relation's file.
         doc.insert("_id", to);
-        let bytes = encode_doc(&doc).map_err(|e| Self::storage_err("could not encode", e))?;
-        self.insert_checked(
-            SEQUENCE_COLLECTION,
-            vec![bytes],
-            "could not rename the sequence",
-        )?;
+        self.insert_sequence_catalog(&doc, "could not rename the sequence")?;
         for mut def in self.all_table_defs()? {
             let mut changed = false;
             for c in &mut def.columns {

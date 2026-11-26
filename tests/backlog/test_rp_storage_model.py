@@ -104,11 +104,12 @@ def test_a_catalog_has_a_file(pg: Any) -> None:
     ) == ("ok", [(True, True)])
 
 
-@pytest.mark.backlog("RP-1076")
+@pytest.mark.backlog_fixed("RP-1076")
 def test_each_sequence_has_its_own_file(pg: Any) -> None:
     """A sequence is a relation of its own in PostgreSQL 15.19, with its own
-    file; here every sequence's state is a row of one shared collection, so
-    two sequences name the same file."""
+    file; every sequence's state was a row of one shared collection, so two
+    sequences named the same file. Each now keeps its state in its own
+    relation, `__sql_seq_<oid>__`."""
     pg.execute("create sequence fp_s1")
     pg.execute("create sequence fp_s2")
     try:

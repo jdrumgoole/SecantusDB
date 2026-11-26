@@ -3725,15 +3725,6 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       call `pg_relation_filepath`.
       Backlog-ID: RP-1075
       Verify: tests/backlog/test_rp_storage_model.py::test_a_catalog_has_a_file
-- [ ] **Every sequence names the same file.** A sequence is a relation of
-      its own in PostgreSQL 15.19, with its own file
-      (`pg_relation_filepath` differs for two sequences); here every
-      sequence's state is a row of one shared collection, so
-      `pg_relation_filepath` gives that collection's `collection-<UUID>.wt`
-      for all of them. The faithful fix stores each sequence as a relation
-      of its own (a collection per sequence). Found working phase 6.
-      Backlog-ID: RP-1076
-      Verify: tests/backlog/test_rp_storage_model.py::test_each_sequence_has_its_own_file
 - [ ] **`pg_relation_filenode` is refused** (0A000, "not supported yet").
       PostgreSQL 15.19 answers the relation's `pg_class.relfilenode` (an
       `oid`), NULL for a view. Here `relfilenode` is a number of this

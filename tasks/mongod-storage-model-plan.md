@@ -909,7 +909,8 @@ landing and phase 6 landing**, so no user ever holds an intermediate format.
      an index's, a sequence's or a catalog's name was 42P01 (the argument is
      a `regclass`, read now as `regclassin` reads it). Filed: a catalog's
      file is NULL (RP-1075, PostgreSQL gives `base/5/1259`), every sequence
-     names one shared file (RP-1076), `pg_relation_filenode` is refused
+     names one shared file (RP-1076, since fixed: each keeps its state in its
+     own `__sql_seq_<oid>__`, store format 13), `pg_relation_filenode` is refused
      (RP-1077).
    - **Still different from mongod after this phase:** the size storer is
      written only at a clean close, not at checkpoints, so a store that
