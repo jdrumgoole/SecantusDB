@@ -1225,13 +1225,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       have, mongod's `otherNss` order is its hash set's, and the rest is
       unmeasured: a probe must find a difference before a test can assert it
       Backlog-ID: RM-532
-- [ ] **A `find` sorted on `$natural` is recorded with the sort, not as a
-      hint.** mongod 8.2.11's `$queryStats` key for `{find: "c", sort:
-      {$natural: -1}}` has no `sort` in its shape and `hint: {$natural:
-      -1}`, a different `keyHash`. This server keeps the sort in the shape
-      and prints no hint. Found 2026-11-14 working RM-532.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm532.py::test_a_natural_sort_is_recorded_as_a_hint
-      Backlog-ID: RM-643
 - [ ] **A hybrid search's key names no `otherNss`.** mongod 8.2.11 lists
       the collection of the `$unionWith` a `$rankFusion` (or
       `$scoreFusion`) desugars its later input pipelines into under the

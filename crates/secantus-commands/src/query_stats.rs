@@ -978,7 +978,31 @@ fn recorded_request(request: &Document) -> Option<(Cow<'_, Document>, Option<Str
             explains.then(|| "queryPlanner".to_string()),
         ));
     }
-    Some((Cow::Borrowed(request), None))
+    Some((natural_sort_as_hint(request), None))
+}
+
+/// mongod's find parsing moves a sort on `$natural` alone into the hint:
+/// `{find: "c", sort: {$natural: -1}}` is recorded with no `sort` in its
+/// shape and `hint: {$natural: -1}` (measured 8.2.11, 2026-11-26). A
+/// `$natural` beside another sort field, or beside another hint, is refused
+/// before anything is recorded.
+fn natural_sort_as_hint(request: &Document) -> Cow<'_, Document> {
+    if request.keys().next().map(String::as_str) != Some("find") {
+        return Cow::Borrowed(request);
+    }
+    let Ok(sort) = request.get_document("sort") else {
+        return Cow::Borrowed(request);
+    };
+    if sort.len() != 1 || !sort.contains_key("$natural") {
+        return Cow::Borrowed(request);
+    }
+    let mut rewritten = request.clone();
+    let sort = sort.clone();
+    rewritten.remove("sort");
+    if !rewritten.contains_key("hint") {
+        rewritten.insert("hint", sort);
+    }
+    Cow::Owned(rewritten)
 }
 
 /// A change stream's `aggregate`.
