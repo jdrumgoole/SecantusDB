@@ -252,10 +252,10 @@ def test_a_lookup_on_join_fields_is_explained_as_sbe_runs_it(
 # ------------------------------------------------- a short string --
 
 
-def _twelve_byte_strings(client: Any) -> dict:
+def _short_strings(client: Any, n: int) -> dict:
     client.drop_database("rm539s")
     db = client.rm539s
-    db.c.insert_one({"a": 1, "b": "v" * 12})
+    db.c.insert_one({"a": 1, "b": "v" * n})
     grouped = _explained(
         db,
         "c",
@@ -269,7 +269,7 @@ def _twelve_byte_strings(client: Any) -> dict:
     sorted_ = _explained(
         client.admin,
         1,
-        [{"$documents": [{"a": 1, "b": "v" * 12}]}, {"$sort": {"a": 1}}],
+        [{"$documents": [{"a": 1, "b": "v" * n}]}, {"$sort": {"a": 1}}],
         "executionStats",
         "$sort",
     )
@@ -283,16 +283,18 @@ def _twelve_byte_strings(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-684")
+@pytest.mark.backlog_fixed("RM-684")
 def test_a_twelve_byte_string_is_kept_in_its_value(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
     """mongod 8.2.11's classic `Value` keeps a string of up to 12 bytes
     inline: a `$push` of one counts 136 bytes, a `$sort` of a `$documents`
-    document holding one 245. This server keeps only 11 inline
-    (`memlimit::SHORT_STR`) and counts 36 bytes more for each."""
-    assert _twelve_byte_strings(rust_mongo) == _twelve_byte_strings(mongod_rs)
+    document holding one 245, and a 13-byte string outside it. This
+    server kept only 11 inline (`memlimit::SHORT_STR`) and counted 36
+    bytes more for each 12-byte string."""
+    for n in (12, 13):
+        assert _short_strings(rust_mongo, n) == _short_strings(mongod_rs, n)
 
 
 # --------------------------------------- a $sort and $limit in a facet --

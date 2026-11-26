@@ -58,7 +58,7 @@ pub(crate) const RC_VECTOR: usize = 40;
 /// `sizeof(RCDecimal)`.
 const RC_DECIMAL: usize = 32;
 /// The longest string a classic `Value` keeps inline.
-const SHORT_STR: usize = 11;
+const SHORT_STR: usize = 12;
 /// An SBE value's tag and word.
 pub(crate) const SBE_VALUE: usize = 9;
 /// The longest string SBE keeps in the word (`StringSmall`).
