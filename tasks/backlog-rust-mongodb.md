@@ -2971,6 +2971,29 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       Verify: none -- intermittent on CI; the test itself is the check
       Backlog-ID: RM-803
 
+- [ ] **RM-391's regression test times mongod, and mongod's own `update`
+      went over the budget on CPU time (2026-11-26).**
+      `tests/backlog/test_rm_found_2026_11_07d.py::test_a_write_tests_each_document_once`
+      takes the median of five rounds of a write's `cpuNanos` over that of
+      a `find` of the same slow document, and expects both servers under
+      1.5. On pg-batch snapshot PR #3025 (run 45798379181, job
+      `mdb-binary (backlog)` 139834830441, head f2249990; a PG change
+      only) it read REGRESSED, and the assertion that failed was mongod's
+      (line 122, `theirs`): `update` came to 1.544, with finds 0.839,
+      0.517, 0.593, 0.555, 0.75 s and updates 1.295, 0.581, 0.539, 0.862,
+      1.502 s, so the per-round ratios ran from 0.91 to 2.0. The same
+      `find` on the same server took between 0.517 and 0.839 s of CPU, so on
+      a shared runner `cpuNanos` moves with the machine too, and a budget
+      halfway between one filter test and two leaves no margin for that.
+      Make the test count the work rather than time it, for example the
+      documents the write examined (`docsExamined` in its slow-query line
+      or the profiler) against the `find`'s, or the times a filter with a
+      countable effect ran, so that it can still fail on a server that
+      tests each document twice. RM-547 and RM-803 are the same shape.
+      Reported by the PostgreSQL session; test code unchanged.
+      Verify: none -- intermittent on CI; the test itself is the check
+      Backlog-ID: RM-814
+
 - [ ] **RUST MongoDB server: a standalone mongod store killed right after
       a `createIndexes` does not open (2026-11-26).** `secantusd-mdb
       --standalone` on the store of a standalone mongod 8.2.11 that was
