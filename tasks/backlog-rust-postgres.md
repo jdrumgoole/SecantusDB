@@ -3568,28 +3568,32 @@ from 15.19): every statement is VALUES-only. The gap tests are in
 
 ## Found while working RP-980 (2026-11-17)
 
-- [ ] **An anti join with an outer conjunct beside it is not planned as
-      one.** `select b from e where a > 500 and not exists (select 1 from e
-      e2 where e2.a = e.a)`, and its LEFT join spelling `select e.b from e
-      left join e e2 on e.a = e2.a where e.a > 500 and e2.a is null`, are
-      in PostgreSQL 15.19 both `Hash Anti Join (cost=27.50..46.88 rows=1
-      width=3)` with `Filter: (a > 500)` on the outer Seq Scan (`rows=500`).
-      Here the LEFT join form prints an unpriced `Hash Left Join` with
-      `Filter: (e2.a IS NULL)` (RP-908's `left_anti_key` recognises the
-      anti join only where the WHERE is the IS NULL alone), and the NOT
-      EXISTS form a Seq Scan with `Filter: (...)`:
-      `sublink_join::anti_join_of` (RP-980) rewrites NOT EXISTS into that
-      LEFT join form only when it is the whole WHERE, and should take the
-      outer conjuncts once the LEFT join form prices them. Measured on the
-      15.19 reference on port 5415.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not exists beside an outer conjunct is a hash anti join], tests/backlog/test_rp_explain_costs.py::test_plan[a left join anti join beside an outer conjunct is a hash anti join]
-      Backlog-ID: RP-1027
-
 ## Found while working RP-981 (2026-11-17)
 
 
 ## Found while working RP-971 (2026-11-17)
 
+
+## Found while working RP-1027 (2026-11-26)
+
+- [ ] **An anti join beside an outer OR, IN list or expression comparison
+      is unpriced.** `select * from e where (a > 900 or a < 10) and not
+      exists (select 1 from e e2 where e2.a = e.a)` is in PostgreSQL 15.20
+      (a private cluster, the gap tests' analysed `e`) `Hash Anti Join
+      (cost=27.50..47.91 rows=1 width=7)` over `Seq Scan on e
+      (cost=0.00..20.00 rows=108 width=7)`; `a in (1, 2, 3)` is
+      `(cost=27.50..46.26 rows=1 ...)` over `rows=3`, and `length(b) > 1`
+      `(cost=27.50..48.75 rows=1 ...)` over `rows=333`. Here the first two
+      print an unpriced `Hash Anti Join` with the right shape, and the
+      third an unpriced `Hash Left Join` with `Filter: (e2.a IS NULL)`:
+      RP-1027 prices the anti join's outer scan where each conjunct is
+      one its leaf filter holds and `hash_side_with` prices, and an OR or
+      an IN list there is not priced on this path, while an expression
+      comparison is the select's residual, which `left_anti_key` refuses
+      (the inner join prices it, RP-423's `join_exprs_of`). The LEFT join
+      spellings are the same.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not exists beside an outer or is a hash anti join], tests/backlog/test_rp_explain_costs.py::test_plan[a not exists beside an outer in list is a hash anti join], tests/backlog/test_rp_explain_costs.py::test_plan[a not exists beside an outer expression comparison is a hash anti join]
+      Backlog-ID: RP-1134
 
 ## Found while working RP-1073 (2026-11-26)
 
