@@ -7,7 +7,7 @@ those of `documentKey` and `fullDocument`, its second that of `ns` by
 `$eq` / `$in`, its third that of `to`, its fourth a regex on either,
 its fifth a regex in an `$in`, its sixth an `$expr` on `operationType`,
 its seventh one on `documentKey`, `ns` or `to`, its eighth the renamed
-`clusterTime` / `lsid` / `txnNumber`; the rewrites of the other
+`clusterTime` / `lsid` / `txnNumber`, its ninth an `$expr` on those; the rewrites of the other
 event fields, and of `$expr` on them, are still
 to come; the Boolean simplifier mongod runs
 over the unwind's filter came with RM-699 (2026-11-24).
@@ -321,6 +321,33 @@ def test_a_match_on_a_renamed_field_joins_the_oplog_filter(
     `txnNumber` into the read's events and its transaction filter, and leaves
     them out of the unwind's; this server left them out of the read
     (90A52575)."""
+    assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)
+
+
+@pytest.mark.backlog_fixed("RM-698")
+@pytest.mark.parametrize(
+    "match",
+    [
+        {"$expr": {"$eq": ["$txnNumber", 1]}},
+        {"$expr": {"$eq": ["$clusterTime", 5]}},
+        {"$expr": {"$eq": ["$lsid.id", 1]}},
+        {"$expr": {"$lt": ["$txnNumber", 1]}},
+        {"$expr": {"$gte": [3, "$txnNumber"]}},
+        {"$expr": {"$ne": ["$txnNumber", 1]}},
+        {"$expr": {"$eq": ["$txnNumber", "$lsid"]}},
+        {"$expr": {"$and": [{"$eq": ["$txnNumber", 1]}, {"$eq": ["$clusterTime", 2]}]}},
+        {"$expr": {"$and": [{"$eq": ["$txnNumber", 1]}, {"$eq": ["$operationType", "insert"]}]}},
+        {"$or": [{"$expr": {"$eq": ["$txnNumber", 1]}}, {"operationType": "insert"}]},
+        {"$expr": {"$eq": ["$txnNumber", 1]}, "operationType": "insert"},
+    ],
+)
+def test_an_expr_on_a_renamed_field_joins_the_oplog_filter(
+    rust_mongo: Any, mongod_rs: Any, match: dict
+) -> None:
+    """mongod 8.2.11 renames an `$expr` on `clusterTime` (`$ts`), `lsid` and
+    `txnNumber` into the read's events and its transaction filter, beside
+    three copies of each `$_internalExpr*` twin it derives; this server left
+    it out of the read."""
     assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)
 
 
