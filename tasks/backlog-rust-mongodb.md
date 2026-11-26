@@ -1241,17 +1241,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-14 working RM-532.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm532.py::test_a_hybrid_search_names_the_collection_it_unions
       Backlog-ID: RM-644
-- [ ] **A FETCH's residual `$or` lists its branches in `parsedQuery`'s
-      order.** mongod 8.2.11 lists the `$or` a FETCH filters by behind an
-      IXSCAN (`{k: {$gte: 2}, $or: [{"x.a": 1}, {x: {$type: [4]}}, {x: {$not:
-      {$type: [3]}}}]}` with an index on `k`) as `[{x: {$not: {$type: [3]}}},
-      {x: {$type: [4]}}, {"x.a": {$eq: 1}}]`, in a `find` and in the `$or` an
-      aggregate's `$replaceRoot` rewrite builds, though its `parsedQuery`
-      sorts the branches `x.a` first. This server lists the residual as
-      `parsedQuery` does. A rooted `$or` (SUBPLAN, COLLSCAN) agrees. Found
-      2026-11-14 working RM-536.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm536.py::test_a_residual_or_lists_its_branches_as_mongod_does
-      Backlog-ID: RM-658
 - [ ] **A run-time error names the stored document, not the one the read
       projected.** mongod 8.2.11 reads only the fields a pipeline depends
       on, and an expression's error names that projection:

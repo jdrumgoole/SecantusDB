@@ -45,15 +45,15 @@ def _fetch_filters(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-658")
+@pytest.mark.backlog_fixed("RM-658")
 def test_a_residual_or_lists_its_branches_as_mongod_does(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 lists the `$or` a FETCH filters by, behind an IXSCAN of
     `k`, as `[{x: {$not: {$type: [3]}}}, {x: {$type: [4]}}, {"x.a": {$eq:
     1}}]` for `{k: {$gte: 2}, $or: [{"x.a": 1}, {x: {$type: [4]}}, {x:
     {$not: {$type: [3]}}}]}`, in a `find` and in the `$or` an aggregate's
     `$replaceRoot` rewrite builds alike, though its `parsedQuery` sorts the
-    branches `x.a` first. This server lists the FETCH's `$or` as
-    `parsedQuery` does."""
+    branches `x.a` first. This server listed the FETCH's `$or` as
+    `parsedQuery` does: `sortUsingTags` sorted only the top level."""
     want = _fetch_filters(mongod)
     assert want["find"] == {
         "$or": [{"x": {"$not": {"$type": [3]}}}, {"x": {"$type": [4]}}, {"x.a": {"$eq": 1}}]

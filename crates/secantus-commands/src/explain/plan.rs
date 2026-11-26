@@ -1132,8 +1132,33 @@ fn residual(u: &IndexUse, parts: &[Document]) -> Option<Document> {
         // bounds but the bounds do not decide, an inexact `$exists`) sorts
         // ahead of the untagged ones, which follow by path (RM-439).
         rest.sort_by_key(|(i, c)| (!u.tagged.contains(i), secantus_core::residual_key(c)));
+        // ... and recursively: the children of a logical node it rechecks
+        // sort by the same key, all untagged (RM-658, 8.2.11: the `$or` of
+        // `{x.a: 1}`, `{x: {$type: [4]}}`, `{x: {$not: ...}}` rechecks the
+        // `$not` first, then `x`, then `x.a`).
+        for (_, c) in &mut rest {
+            sort_by_tags(c);
+        }
     }
     assemble(rest.into_iter().map(|(_, c)| c).collect())
+}
+
+/// `sortUsingTags` below the top: every `$and` / `$or` / `$nor` a residual
+/// clause holds orders its children by path, then match type.
+fn sort_by_tags(clause: &mut Document) {
+    for (key, value) in clause.iter_mut() {
+        if let ("$and" | "$or" | "$nor", Bson::Array(children)) = (key.as_str(), value) {
+            for child in children.iter_mut() {
+                if let Bson::Document(d) = child {
+                    sort_by_tags(d);
+                }
+            }
+            children.sort_by_key(|c| match c {
+                Bson::Document(d) => secantus_core::residual_key(d),
+                _ => (String::new(), 0),
+            });
+        }
+    }
 }
 
 /// When the leading fields are a few points and the sort follows them, mongod
