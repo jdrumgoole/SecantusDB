@@ -843,6 +843,17 @@ fn filter_paths(filter: &Document, out: &mut Vec<String>) -> bool {
                 }
             }
             "$comment" => {}
+            // An `$expr` that compares a field with a constant names that
+            // path, and derives bucket predicates as a plain filter on it
+            // does; one that derives none names no path (RM-701).
+            "$expr" => match v.as_document() {
+                Some(e) if crate::timeseries::expr_derives_nothing(e) => {}
+                Some(e) => match crate::timeseries::expr_comparison(e) {
+                    Some((path, _, _)) => out.push(path.to_string()),
+                    None => return false,
+                },
+                None => return false,
+            },
             k if k.starts_with('$') => return false,
             k => out.push(k.to_string()),
         }

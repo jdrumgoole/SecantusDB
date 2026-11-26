@@ -375,7 +375,13 @@ pub(crate) fn bucket_access(
         None => Hint::None,
     };
     let canonical = parsed::parsed_query(bucket_filter);
-    let implies = |partial: &Document| storage.query_implies_partial(bucket_filter, partial);
+    // mongod proves a bucket filter's `$_internalExpr` comparisons against a
+    // partial index's as the comparisons they say (measured 8.2.11,
+    // 2026-11-26: `v < 3000, v > 5` is an index scan beside a partial
+    // filter of `v > 5`).
+    let as_query = as_comparisons(bucket_filter);
+    let implies =
+        |partial: &Document| storage.query_implies_partial(&as_query, &as_comparisons(partial));
     let q = Query {
         canonical: &canonical,
         sort: None,
@@ -411,6 +417,64 @@ pub(crate) fn bucket_access(
         },
         _ => BucketAccess::Unsure,
     })
+}
+
+/// `filter` with its `$_internalExpr` comparisons as the plain ones, and a
+/// top-level `$and` of distinct fields flattened into one document, so the
+/// implication test of the partial index reads either.
+fn as_comparisons(filter: &Document) -> Document {
+    fn rename(v: &Bson) -> Bson {
+        match v {
+            Bson::Document(d) => Bson::Document(
+                d.iter()
+                    .map(|(k, v)| {
+                        let k = match k.as_str() {
+                            "$_internalExprEq" => "$eq",
+                            "$_internalExprGt" => "$gt",
+                            "$_internalExprGte" => "$gte",
+                            "$_internalExprLt" => "$lt",
+                            "$_internalExprLte" => "$lte",
+                            other => other,
+                        };
+                        (k.to_string(), rename(v))
+                    })
+                    .collect(),
+            ),
+            Bson::Array(a) => Bson::Array(a.iter().map(rename).collect()),
+            other => other.clone(),
+        }
+    }
+    let Bson::Document(renamed) = rename(&Bson::Document(filter.clone())) else {
+        return filter.clone();
+    };
+    let mut out = Document::new();
+    for (k, v) in renamed {
+        match (k.as_str(), &v) {
+            ("$and", Bson::Array(items))
+                if items.iter().all(|i| {
+                    i.as_document()
+                        .is_some_and(|d| d.keys().all(|k| !k.starts_with('$')))
+                }) =>
+            {
+                let mut merged = Document::new();
+                let mut distinct = true;
+                for item in items.iter().filter_map(Bson::as_document) {
+                    for (ik, iv) in item {
+                        distinct &= merged.insert(ik.clone(), iv.clone()).is_none();
+                    }
+                }
+                if distinct {
+                    out.extend(merged);
+                } else {
+                    out.insert(k, v);
+                }
+            }
+            _ => {
+                out.insert(k, v);
+            }
+        }
+    }
+    out
 }
 
 /// A top-level predicate on the bucket `_id`, which the time field's bounds
@@ -3752,6 +3816,22 @@ mod tests {
 #[cfg(test)]
 mod bucket_access_tests {
     use super::*;
+
+    #[test]
+    fn internal_comparisons_read_as_the_plain_ones() {
+        assert_eq!(
+            as_comparisons(&doc! {
+                "$and": [
+                    { "control.max.v": { "$_internalExprGt": 5 } },
+                    { "control.min.v": { "$_internalExprLt": 3000 } }
+                ]
+            }),
+            doc! {
+                "control.max.v": { "$gt": 5 },
+                "control.min.v": { "$lt": 3000 }
+            }
+        );
+    }
 
     #[test]
     fn a_bucket_filter_names_the_id_the_time_field_adds() {

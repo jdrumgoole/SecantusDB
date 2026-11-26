@@ -612,6 +612,71 @@ pub(crate) fn index_bucket_filter(
     fields.index_clauses(filter)
 }
 
+/// An `$expr` that compares a field path with a constant, as `(path, the
+/// operator of the query form, constant)`; what a time-series read pushes
+/// down to the buckets (`BucketFields::expr_clauses`).
+pub(crate) fn expr_comparison(expr: &Document) -> Option<(&str, &'static str, &Bson)> {
+    if expr.len() != 1 {
+        return None;
+    }
+    let (op, args) = expr.iter().next()?;
+    let [a, b] = args.as_array()?.as_slice() else {
+        return None;
+    };
+    fn path_of(v: &Bson) -> Option<&str> {
+        v.as_str()
+            .and_then(|s| s.strip_prefix('$'))
+            .filter(|p| !p.is_empty() && !p.starts_with('$'))
+    }
+    let (path, constant, flipped) = match (path_of(a), path_of(b)) {
+        (Some(p), None) => (p, b, false),
+        (None, Some(p)) => (p, a, true),
+        _ => return None,
+    };
+    let op = match (op.as_str(), flipped) {
+        ("$eq", _) => "$eq",
+        ("$gt", false) | ("$lt", true) => "$gt",
+        ("$gte", false) | ("$lte", true) => "$gte",
+        _ => return None,
+    };
+    Some((path, op, constant))
+}
+
+/// A constant a comparison derives a bucket bound from.
+fn scalar_constant(v: &Bson) -> bool {
+    !matches!(
+        v,
+        Bson::Null
+            | Bson::Undefined
+            | Bson::Array(_)
+            | Bson::Document(_)
+            | Bson::RegularExpression(_)
+            | Bson::MinKey
+            | Bson::MaxKey
+    )
+}
+
+/// An `$expr` that is one comparison of two field paths, or of a path with
+/// a literal, and yet derives no bucket predicate (`expr_comparison` says
+/// not): a `$lt` of the field, a `$ne`, two paths. mongod reads the buckets
+/// in order for it (measured 8.2.11, 2026-11-26).
+pub(crate) fn expr_derives_nothing(expr: &Document) -> bool {
+    if expr.len() != 1 || expr_comparison(expr).is_some() {
+        return false;
+    }
+    let Some((op, Bson::Array(args))) = expr.iter().next() else {
+        return false;
+    };
+    let operand = |v: &Bson| match v {
+        Bson::String(s) => !s.starts_with("$$"),
+        Bson::Document(_) | Bson::Array(_) | Bson::Undefined => false,
+        _ => true,
+    };
+    matches!(op.as_str(), "$eq" | "$gt" | "$gte" | "$lt" | "$lte" | "$ne")
+        && args.len() == 2
+        && args.iter().all(operand)
+}
+
 struct BucketFields<'a> {
     time: &'a str,
     meta: Option<&'a str>,
@@ -688,11 +753,41 @@ impl BucketFields<'_> {
                         out.push(doc! { "$or": list });
                     }
                 }
+                ("$expr", Bson::Document(e)) => out.extend(self.expr_clauses(e)),
                 (k, _) if k.starts_with('$') => {}
                 (path, value) => out.extend(self.field(path, value)),
             }
         }
         out
+    }
+
+    /// The bucket predicates mongod derives from an `$expr` comparison of a
+    /// measurement with a constant (measured 8.2.11, 2026-11-26, RM-701):
+    /// `$eq` either way round, `$gt` / `$gte` with the field first and
+    /// `$lt` / `$lte` with it second, as the comparison they say, `$expr`
+    /// kept beside them. A `$lt` of the field and any other expression
+    /// derive nothing. The meta field's is `$_internalExpr*` on `meta`.
+    fn expr_clauses(&self, expr: &Document) -> Vec<Document> {
+        let Some((path, op, constant)) = expr_comparison(expr) else {
+            return Vec::new();
+        };
+        if let Some(meta) = self.meta {
+            if let Some(rest) = path
+                .strip_prefix(meta)
+                .filter(|r| r.is_empty() || r.starts_with('.'))
+            {
+                if !scalar_constant(constant) {
+                    return Vec::new();
+                }
+                let internal = match op {
+                    "$eq" => "$_internalExprEq",
+                    "$gt" => "$_internalExprGt",
+                    _ => "$_internalExprGte",
+                };
+                return vec![pred(&format!("meta{rest}"), internal, constant.clone())];
+            }
+        }
+        self.comparison(path, op, constant)
     }
 
     fn field(&self, path: &str, value: &Bson) -> Vec<Document> {
@@ -906,6 +1001,43 @@ pub(crate) fn check_hint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What an `$expr` pushes down to the buckets (measured 8.2.11,
+    /// 2026-11-26, RM-701).
+    #[test]
+    fn an_expr_comparison_derives_what_mongod_derives() {
+        let f = |e: Document| {
+            let fields = BucketFields {
+                time: "t",
+                meta: Some("m"),
+                span_ms: 3_600_000,
+                index: false,
+            };
+            fields.clauses(&doc! {"$expr": e})
+        };
+        let max = |op: &str, n: i32| doc! {"control.max.v": {op: n}};
+        assert_eq!(
+            f(doc! {"$gte": ["$v", 5]}),
+            vec![max("$_internalExprGte", 5)]
+        );
+        assert_eq!(f(doc! {"$lt": [5, "$v"]}), vec![max("$_internalExprGt", 5)]);
+        assert_eq!(f(doc! {"$eq": [5, "$v"]}).len(), 2);
+        assert_eq!(
+            f(doc! {"$gte": ["$m", 0]}),
+            vec![doc! {"meta": {"$_internalExprGte": 0}}]
+        );
+        for e in [
+            doc! {"$lt": ["$v", 5]},
+            doc! {"$gt": [5, "$v"]},
+            doc! {"$ne": ["$v", 5]},
+            doc! {"$gte": ["$v", "$w"]},
+        ] {
+            assert!(f(e.clone()).is_empty(), "{e}");
+            assert!(expr_derives_nothing(&e), "{e}");
+        }
+        assert!(!expr_derives_nothing(&doc! {"$gte": ["$v", 5]}));
+        assert!(!expr_derives_nothing(&doc! {"$and": [{"$gte": ["$v", 5]}]}));
+    }
 
     /// A partial index's filter on the buckets, as mongod 8.2.11 lists it
     /// (RM-548).
