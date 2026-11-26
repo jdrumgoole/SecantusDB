@@ -3584,6 +3584,27 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       Verify: tests/backlog/test_rp_catalog_latency.py::test_ten_create_tables_in_one_block_cost_what_they_do_one_at_a_time
       Backlog-ID: RP-1112
 
+## Found on another session's gate (2026-11-26)
+
+- [ ] **`stop()` takes about 2.7 s with nothing to wait for, and the test
+      that it does not wait on an idle connection is bounded at 3 s.**
+      `tests/embedded.rs::stop_does_not_wait_on_an_idle_connection` failed
+      once in a `gate_pg.sh --storage --fast` run at a load average over 20
+      on the arm64 M1 ("stop() waited 4.26s"; the stage took 661 s, against
+      172 s on the passing rerun, 2026-11-26, the MongoDB session's RM-811
+      gate, a change to `secantus-storage` `adopt.rs` only). Alone it takes
+      about 2.7 s, 90% of its bound. The test exists to catch a stop that
+      waits out `DRAIN_TIMEOUT` (10 s) on an open connection, but its bound
+      also carries everything `Teardown::run` does after the drain: the
+      heaps' flush (`heap::flush_store`), the statistics' save
+      (`pgstat::save_store`) and the store's close-checkpoint. Not yet
+      split: which of those takes the 2.7 s on a debug build, and what
+      PostgreSQL 15.20's fast shutdown of an idle cluster takes beside it.
+      The test should time the drain (connections at zero) on its own, or
+      compare a stop with an open connection against one without.
+      Verify: none -- an intermittent wall-clock bound under load; crates/secantus-pg/tests/embedded.rs::stop_does_not_wait_on_an_idle_connection is the check
+      Backlog-ID: RP-1132
+
 ## The storage model is not mongod's (tasks/mongod-storage-model-plan.md, 2026-11-19)
 
 - [ ] **A store `secantusd-pg` writes is not one mongod can open.** The
