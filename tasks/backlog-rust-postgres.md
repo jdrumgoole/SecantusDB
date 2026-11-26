@@ -2394,11 +2394,15 @@ a regression test.
       FROM, a correlated one, or a sublink beside any other non-constant
       qual is still printed inline (`select * from e where b = (select b
       from k limit 1)`); a join's ON InitPlan is unpriced; other nodes above
-      the scan (a computed sort key, a GROUP BY of anything but counts of
-      stored columns) are unpriced. Counts grouped by stored columns
+      the scan (a computed sort key, a GROUP BY of an expression) are
+      unpriced. Aggregates of stored columns grouped by stored columns
       straight over the scan, on a table with no index, are hashed and
-      priced since 2026-11-18 (`init_plan_grouped_counts`); a grouped
-      `sum` or other aggregate is not. A SELECT
+      priced (`init_plan_grouped_aggs`: counts since 2026-11-18, `sum`,
+      `avg`, `min`, `max`, `bool_and` / `bool_or` since 2026-11-26, with
+      `get_agg_clause_costs`' shared states and final calls); an aggregate
+      of an expression (`sum(a + 1)`, its argument's cost unpriced), or any
+      over a table with an index (`k`, whose primary key the keys do not
+      lead: 15.20 still hashes a Seq Scan), is not. A SELECT
       DISTINCT of stored columns straight over the scan, on a table with no
       index, is hashed and priced since 2026-11-18 (`create_distinct_paths`
       against a Sort and Unique); over an indexed table, or with an ORDER
@@ -2407,7 +2411,7 @@ a regression test.
       2026-11-18. Plain aggregates other than counts over the scan are
       priced since 2026-11-18 (`plain_agg_estimate`). Measured on a private
       15.19 cluster.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a grouped sum above an initplan's scan is priced]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a grouped sum of an expression above an initplan's scan is priced]
       Backlog-ID: RP-440
 
 ## Found by batch 54 (2026-10-24)

@@ -5162,7 +5162,7 @@ impl PgHandler {
             && tree.children[0].children[0].children.is_empty()
             && tree.children[0].children[0].name == format!("Seq Scan on {}", sel.table);
         if simple_sub && !plain_counts {
-            self.init_plan_grouped_counts(agg, sel, tree, param_quals, init_cost);
+            self.init_plan_grouped_aggs(agg, sel, tree, param_quals, init_cost);
             return;
         }
         if !(plain_counts && simple_sub && shaped) {
@@ -5192,15 +5192,16 @@ impl PgHandler {
         tree.estimate = Some((startup + init_cost, total + init_cost, rows, w));
     }
 
-    /// Counts grouped by stored columns over one user table whose WHERE
-    /// reads InitPlans (RP-440): the merged FROM subquery leaves a
-    /// HashAggregate straight over the scan, priced by `cost_agg`
-    /// (AGG_HASHED) where `add_paths_to_grouping_rel` keeps it over a Sort
-    /// and GroupAggregate. The same limits as the grouped count without an
-    /// InitPlan: no index on the table, each key projected once, and few
-    /// enough groups that the hash table fits `hash_mem`. The keys are
-    /// qualified, as the InitPlan lengthens the range table.
-    fn init_plan_grouped_counts(
+    /// Aggregates of stored columns grouped by stored columns over one
+    /// user table whose WHERE reads InitPlans (RP-440): the merged FROM
+    /// subquery leaves a HashAggregate straight over the scan, priced by
+    /// `cost_agg` (AGG_HASHED) with `get_agg_clause_costs`' sums
+    /// (`agg_clause_costs`) where `add_paths_to_grouping_rel` keeps it over
+    /// a Sort and GroupAggregate. The same limits as the grouped count
+    /// without an InitPlan: no index on the table, each key projected once,
+    /// and few enough groups that the hash table fits `hash_mem`. The keys
+    /// are qualified, as the InitPlan lengthens the range table.
+    fn init_plan_grouped_aggs(
         &self,
         agg: &secantus_pgplan::Aggregate,
         sel: &secantus_pgplan::Select,
@@ -5215,17 +5216,9 @@ impl PgHandler {
             && tree.children[0].children.len() == 1
             && tree.children[0].children[0].children.is_empty()
             && tree.children[0].children[0].name == format!("Seq Scan on {}", sel.table);
-        let counts = agg.items.iter().all(|it| {
-            matches!(
-                it.func,
-                secantus_pgplan::AggFunc::CountStar | secantus_pgplan::AggFunc::Count
-            ) && it.expr.is_none()
-                && it.expr2.is_none()
-                && it.field2.is_none()
-                && !it.distinct
-                && it.filter.is_none()
-                && it.order.is_empty()
-        });
+        let Some((calls, finals, agg_width)) = agg_clause_costs(&agg.items) else {
+            return;
+        };
         let keys: Vec<String> = agg.group_by.iter().map(|k| k.field.clone()).collect();
         let projected = |i: usize| {
             agg.select
@@ -5239,7 +5232,6 @@ impl PgHandler {
             .iter()
             .any(|ix| ix.table.name == sel.table);
         if !(shaped
-            && counts
             && !indexed
             && !keys.is_empty()
             && agg.group_by.iter().all(|k| k.expr.is_none())
@@ -5279,7 +5271,7 @@ impl PgHandler {
         else {
             return;
         };
-        let aggs = secantus_pgplan::costsize::AggCosts::simple(agg.items.len(), 0);
+        let aggs = secantus_pgplan::costsize::AggCosts::simple(calls, finals);
         if groups > 50_000.0
             || secantus_pgplan::costsize::sorted_grouping_wins(
                 scan.1,
@@ -5292,8 +5284,14 @@ impl PgHandler {
         {
             return;
         }
-        let (startup, total, rows, w) =
-            hashed_count_agg_estimate(scan, keys.len(), agg.items.len(), groups, keyed.3);
+        let (startup, total) = secantus_pgplan::costsize::hashed_grouping_cost(
+            scan.1,
+            scan.2,
+            groups,
+            keys.len(),
+            Some(aggs),
+        );
+        let (rows, w) = (groups, keyed.3 + agg_width);
         let mut scan_node = tree.children[0].children.remove(0);
         scan_node.estimate = Some(scan);
         tree.children[0] = scan_node;
@@ -6694,22 +6692,36 @@ pub(crate) fn count_agg_estimate(input: Estimate, n: usize) -> Estimate {
 /// transition function (`procost` 1) runs once a row and its final
 /// function, where `pg_aggregate` names one, once at the end, both at
 /// startup; the one row costs `cpu_tuple_cost`. The width is each
-/// result type's `get_typavgwidth`. `None` for an aggregate whose
-/// `pg_aggregate` row is not resolved here: one over an expression, a
-/// DISTINCT, a FILTER, an ORDER BY, or a function outside the list below.
+/// result type's `get_typavgwidth`. `None` for an aggregate
+/// `agg_clause_costs` does not resolve.
 pub(crate) fn plain_agg_estimate(
     input: Estimate,
     items: &[secantus_pgplan::AggItem],
 ) -> Option<Estimate> {
-    use secantus_pgplan::AggFunc;
     const CPU_OPERATOR_COST: f64 = 0.0025;
     const CPU_TUPLE_COST: f64 = 0.01;
+    let (calls, finals, width) = agg_clause_costs(items)?;
+    let (_, in_total, rows, _) = input;
+    let startup =
+        in_total + CPU_OPERATOR_COST * calls as f64 * rows + CPU_OPERATOR_COST * finals as f64;
+    Some((startup, startup + CPU_TUPLE_COST, 1.0, width))
+}
+
+/// `get_agg_clause_costs` over `items`, as `(transition calls, final
+/// calls, width)`: each distinct call's transition function (`procost` 1)
+/// runs once an input row and its final function, where `pg_aggregate`
+/// names one, once a group; `find_compatible_agg` shares one state, and
+/// one final call, between identical calls, each still its own output
+/// column of its result type's `get_typavgwidth`. `None` for an aggregate
+/// whose `pg_aggregate` row is not resolved here: one over an expression,
+/// a DISTINCT, a FILTER, an ORDER BY, or a function outside the list
+/// below.
+pub(crate) fn agg_clause_costs(items: &[secantus_pgplan::AggItem]) -> Option<(usize, usize, i64)> {
+    use secantus_pgplan::AggFunc;
     if items.is_empty() {
         return None;
     }
     let facts = crate::catalog_facts::builtin();
-    // `find_compatible_agg` shares one state, and one final call, between
-    // identical calls; each still has its own output column.
     let (mut finals, mut width) = (0usize, 0i64);
     let mut seen: Vec<(AggFunc, Option<&str>)> = Vec::new();
     let mut distinct_calls = 0usize;
@@ -6758,11 +6770,7 @@ pub(crate) fn plain_agg_estimate(
         }
         width += type_width(&secantus_pgplan::aggregate_item_type(it), -1);
     }
-    let (_, in_total, rows, _) = input;
-    let startup = in_total
-        + CPU_OPERATOR_COST * distinct_calls as f64 * rows
-        + CPU_OPERATOR_COST * finals as f64;
-    Some((startup, startup + CPU_TUPLE_COST, 1.0, width))
+    Some((distinct_calls, finals, width))
 }
 
 /// A HashAggregate's estimate for a GROUP BY of `ncols` keys with `n`

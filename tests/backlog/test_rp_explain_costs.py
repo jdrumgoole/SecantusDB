@@ -6841,9 +6841,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # A grouped sum hashed above an InitPlan's scan, measured on 15.19
-    # (RP-440): grouped aggregates other than counts are unpriced.
+    # (RP-440): grouped aggregates other than counts were unpriced.
     "a grouped sum above an initplan's scan is priced": (
-        "RP-440",
+        "RP-440:fixed",
         _ANALYSED,
         "explain select b, sum(a) from e where a > (select 5) group by b",
         [
@@ -6852,6 +6852,127 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  InitPlan 1 (returns $0)",
             "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
             "  ->  Seq Scan on e  (cost=0.00..17.50 rows=333 width=7)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    # Grouped aggregates other than counts above an InitPlan's scan,
+    # measured on 15.20 (RP-440): an avg's final function runs once a
+    # group, and identical calls share one transition state
+    # (`find_compatible_agg`), each still its own output column.
+    "a grouped avg above an initplan's scan is priced": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select b, avg(a) from e where a > (select 5) group by b",
+        [
+            "HashAggregate  (cost=19.18..19.30 rows=10 width=35)",
+            "  Group Key: e.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=333 width=7)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    "grouped min, max and count above an initplan's scan are priced": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select b, min(a), max(a), count(*) from e where a > (select 5) group by b",
+        [
+            "HashAggregate  (cost=20.84..20.94 rows=10 width=19)",
+            "  Group Key: e.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=333 width=7)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    "a repeated grouped sum above an initplan's scan shares one state": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select b, sum(a), sum(a) from e where a > (select 5) group by b",
+        [
+            "HashAggregate  (cost=19.18..19.28 rows=10 width=19)",
+            "  Group Key: e.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=333 width=7)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    "a repeated grouped count above an initplan's scan shares one state": (
+        "RP-440:fixed",
+        _ANALYSED,
+        "explain select b, count(*), count(*) from e where a > (select 5) group by b",
+        [
+            "HashAggregate  (cost=19.18..19.28 rows=10 width=19)",
+            "  Group Key: e.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=333 width=3)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    # Grouped bool_and / bool_or above an InitPlan's scan, measured on
+    # 15.20 (RP-440): neither has a final function.
+    "grouped bool_and and bool_or above an initplan's scan are priced": (
+        "RP-440:fixed",
+        _ANALYSED
+        + [
+            "create table bt (a int, b text, c bool)",
+            "insert into bt select g, 'v' || (g % 10), g % 2 = 0 from generate_series(1, 1000) g",
+            "analyze bt",
+        ],
+        "explain select b, bool_and(c), bool_or(c) from bt where a > (select 5) group by b",
+        [
+            "HashAggregate  (cost=20.01..20.11 rows=10 width=5)",
+            "  Group Key: bt.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on bt  (cost=0.00..17.50 rows=333 width=4)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    # A grouped sum over an expression above an InitPlan's scan, measured
+    # on 15.20 (RP-440): the argument's own cost is not priced.
+    "a grouped sum of an expression above an initplan's scan is priced": (
+        "RP-440",
+        _ANALYSED,
+        "explain select b, sum(a + 1) from e where a > (select 5) group by b",
+        [
+            "HashAggregate  (cost=20.01..20.11 rows=10 width=11)",
+            "  Group Key: e.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=333 width=7)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    # A GROUP BY of an expression above an InitPlan's scan, measured on
+    # 15.20 (RP-440).
+    "a group by of an expression above an initplan's scan is priced": (
+        "RP-440",
+        _ANALYSED,
+        "explain select upper(b), count(*) from e where a > (select 5) group by upper(b)",
+        [
+            "HashAggregate  (cost=20.01..20.13 rows=10 width=40)",
+            "  Group Key: upper(e.b)",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on e  (cost=0.00..18.33 rows=333 width=32)",
+            "        Filter: (a > $0)",
+        ],
+    ),
+    # A grouped sum above an InitPlan's scan of a table with an index the
+    # keys do not lead, measured on 15.20 (RP-440).
+    "a grouped sum above an initplan's scan of an indexed table is priced": (
+        "RP-440",
+        _ANALYSED,
+        "explain select b, sum(a) from k where a > (select 5) group by b",
+        [
+            "HashAggregate  (cost=19.18..19.28 rows=10 width=11)",
+            "  Group Key: k.b",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on k  (cost=0.00..17.50 rows=333 width=7)",
             "        Filter: (a > $0)",
         ],
     ),
