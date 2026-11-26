@@ -2493,6 +2493,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): an inner
     # join above a FULL JOIN reduces it to a right join hashing `k`.
+    # (`Inner Unique` prints under VERBOSE only: not in this plan, as
+    # measured again on a private PostgreSQL 15.20 cluster, 2026-11-26.)
     "a full join an inner join reduces hashes its unique side": (
         "RP-1064",
         _ANALYSED,
@@ -2502,11 +2504,72 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "Hash Join",
             "  Hash Cond: (k.a = e2.a)",
             "  ->  Hash Right Join",
-            "        Inner Unique: true",
             "        Hash Cond: (e.a = k.a)",
             "        ->  Seq Scan on e",
             "        ->  Hash",
             "              ->  Seq Scan on k",
+            "  ->  Hash",
+            "        ->  Seq Scan on e e2",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (2026-11-26, RP-1064):
+    # over tables never analysed, the join order search plans the FULL JOIN
+    # the inner join above reduces to `k LEFT JOIN e`, a Hash Right Join
+    # hashing `k`, and joins it to `e e2` with the pair hashed.
+    "a full join an inner join reduces over never-analysed tables hashes its preserved side": (
+        "RP-1064:fixed",
+        _NEVER_ANALYSED,
+        "explain (costs off) select e.b, e2.b from e full join k on e.a = k.a "
+        "join e e2 on e2.a = k.a",
+        [
+            "Hash Join",
+            "  Hash Cond: (e2.a = k.a)",
+            "  ->  Seq Scan on e e2",
+            "  ->  Hash",
+            "        ->  Hash Right Join",
+            "              Hash Cond: (e.a = k.a)",
+            "              ->  Seq Scan on e",
+            "              ->  Hash",
+            "                    ->  Seq Scan on k",
+        ],
+    ),
+    # The same join written as the LEFT JOIN it reduces to (measured as
+    # above).
+    "a left join below an inner join over never-analysed tables hashes its preserved side": (
+        "RP-1064:fixed",
+        _NEVER_ANALYSED,
+        "explain (costs off) select e.b, e2.b from k left join e on e.a = k.a "
+        "join e e2 on e2.a = k.a",
+        [
+            "Hash Join",
+            "  Hash Cond: (e2.a = k.a)",
+            "  ->  Seq Scan on e e2",
+            "  ->  Hash",
+            "        ->  Hash Right Join",
+            "              Hash Cond: (e.a = k.a)",
+            "              ->  Seq Scan on e",
+            "              ->  Hash",
+            "                    ->  Seq Scan on k",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (2026-11-26, found
+    # while working RP-1064): a FULL JOIN `reduce_outer_joins` makes a LEFT
+    # JOIN to a unique key nothing reads is removed, as a written one is.
+    "a full join a where reduces to a removable left join is removed": (
+        "RP-1118",
+        _ANALYSED,
+        "explain (costs off) select e.b from e full join k on e.a = k.a where e.a > 0",
+        ["Seq Scan on e", "  Filter: (a > 0)"],
+    ),
+    "a full join an inner join reduces to a removable left join is removed": (
+        "RP-1118",
+        _ANALYSED,
+        "explain (costs off) select e.b, e2.b from e full join k on e.a = k.a "
+        "join e e2 on e2.a = e.a",
+        [
+            "Hash Join",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e",
             "  ->  Hash",
             "        ->  Seq Scan on e e2",
         ],

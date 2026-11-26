@@ -916,11 +916,13 @@ impl PgHandler {
     /// it evaluates, as written (`written`), or, over one equivalence
     /// class, the clause `generate_join_implied_equalities_normal` derives
     /// -- the class's first member each side, the outer one first, as
-    /// `create_hashjoin_plan` switches it. Inner joins, or a RIGHT join
-    /// atop an inner pair (RP-1063: a `Hash Left Join` with the preserved
-    /// table outer, or a `Hash Right Join` hashing it), whose every join is
-    /// a hash join only, with no join filter, under no LIMIT, ORDER BY or
-    /// DISTINCT (whose paths the search does not weigh); `None` for any
+    /// `create_hashjoin_plan` switches it. Inner and LEFT joins, or a
+    /// RIGHT join atop an inner pair (RP-1063), each join as the search
+    /// plans it: an inner one, or a LEFT one as a `Hash Left Join` with
+    /// its preserved side outer or a `Hash Right Join` hashing it (RP-1064:
+    /// the FULL JOIN an inner join above reduces to a LEFT one too). Every
+    /// join a hash join only, with no join filter, under no LIMIT, ORDER BY
+    /// or DISTINCT (whose paths the search does not weigh); `None` for any
     /// other chain, which is drawn as written.
     pub(crate) fn reorder_three_table_chain(
         &self,
@@ -952,7 +954,7 @@ impl PgHandler {
         let chain = right_chain(&j.tree);
         let tree = chain.as_ref().unwrap_or(&j.tree);
         let JoinNode::Join {
-            kind: top_kind @ (JoinKind::Inner | JoinKind::Right),
+            kind: top_kind @ (JoinKind::Inner | JoinKind::Left | JoinKind::Right),
             left: lower,
             right: z_node,
             equi: e2,
@@ -966,8 +968,10 @@ impl PgHandler {
         };
         // A RIGHT join atop the pair (RP-1063): the third table preserved.
         let right = *top_kind == JoinKind::Right;
+        // A FULL join keeps both sides, which a `Step` does not record: it
+        // is drawn as written.
         let JoinNode::Join {
-            kind: JoinKind::Inner,
+            kind: JoinKind::Inner | JoinKind::Left,
             left: x_node,
             right: y_node,
             equi: e1,
@@ -1021,6 +1025,14 @@ impl PgHandler {
         };
         let ons = [on1.clone(), on2.clone()];
         let on_expr = |on: Option<usize>| on.and_then(|i| ons[i - 1].clone());
+        // A join's kind and its sides, outer first: an inner join's, or a
+        // LEFT join's (`a` preserved) as a hash left join with `a` outer or
+        // a hash right join hashing it.
+        let sides = |step: &Step, hashes_b: bool| match (step.left, hashes_b) {
+            (false, _) => JoinKind::Inner,
+            (true, true) => JoinKind::Left,
+            (true, false) => JoinKind::Right,
+        };
         let join = |kind: JoinKind,
                     left: JoinNode,
                     right: JoinNode,
@@ -1048,7 +1060,8 @@ impl PgHandler {
         // The first join: its outer side left.
         let (fa, fb) = plan.first;
         let step = &plan.first_step;
-        let (outer, inner, keys) = if hashes_b(step.method)? {
+        let first_b = hashes_b(step.method)?;
+        let (outer, inner, keys) = if first_b {
             (fa, fb, (step.a_key.clone(), step.b_key.clone()))
         } else {
             (fb, fa, (step.b_key.clone(), step.a_key.clone()))
@@ -1059,7 +1072,7 @@ impl PgHandler {
             &[aliases[inner].as_str()],
         )?;
         let pair = join(
-            JoinKind::Inner,
+            sides(step, first_b),
             leaves[outer].clone(),
             leaves[inner].clone(),
             keys,
@@ -1090,13 +1103,10 @@ impl PgHandler {
                 &pair_aliases[..],
             )
         };
-        let (top, top_cond) = if hashes_b(step.method)? {
+        let second_b = hashes_b(step.method)?;
+        let kind = sides(step, second_b);
+        let (top, top_cond) = if second_b {
             let c = cond(step.on, a_aliases, b_aliases)?;
-            let kind = if right {
-                JoinKind::Left
-            } else {
-                JoinKind::Inner
-            };
             (
                 join(
                     kind,
@@ -1109,11 +1119,6 @@ impl PgHandler {
             )
         } else {
             let c = cond(step.on, b_aliases, a_aliases)?;
-            let kind = if right {
-                JoinKind::Right
-            } else {
-                JoinKind::Inner
-            };
             (
                 join(
                     kind,

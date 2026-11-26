@@ -1897,9 +1897,11 @@ a regression test.
       (3) a plan with a merge join (never-analysed `m0 join m1 on m0.b =
       m1.a join m2 on m1.b = m2.a`, 20 rows, is PostgreSQL's Merge Join
       over Sorts): the search weighs it, the drawing declines it.
-      (4) a LEFT or FULL join in the chain (a RIGHT join atop an inner
-      pair is drawn since 2026-11-26, RP-1063), a join filter, and VERBOSE
-      and ANALYZE, whose lists follow the written chain.
+      (4) a FULL join the chain keeps FULL (a RIGHT join atop an inner
+      pair is drawn since 2026-11-26, RP-1063, and a LEFT join below or
+      above an inner one, or a FULL one reduced to it, since 2026-11-26,
+      RP-1064), a join filter, and VERBOSE and ANALYZE, whose lists follow
+      the written chain.
       (5) costs: every node of a three-way chain prints `cost=0.00..0.00
       rows=0 width=0`; the search's estimates match PostgreSQL's
       (`83.58..123.68` for the first query over tables never analysed) but
@@ -2049,10 +2051,38 @@ a regression test.
       `Hash Left Join` of `k` over a Hash of `e` here, `Hash Cond: (k.a =
       e.a)`; PostgreSQL 15.19 reduces the FULL JOIN to a `Hash Right Join`
       of `e` over a Hash of `k`, `Hash Cond: (e.a = k.a)`, `Inner Unique:
-      true` (`reduce_outer_joins`, then costing both sides). Found while
-      working RP-966.
+      true` under VERBOSE (`reduce_outer_joins`, then costing both
+      sides). Found while working RP-966. Since 2026-11-26 EXPLAIN draws
+      a chain of three tables whose LEFT join (written so, or the FULL
+      JOIN an inner join above reduces) sits below or above an inner
+      join in the plan the join order search picks, each LEFT join a
+      `Hash Left Join` with its preserved side outer or a `Hash Right
+      Join` hashing it (`reorder_three_table_chain`): over tables never
+      analysed this query matches a private PostgreSQL 15.20 cluster, and
+      a sweep of 144 three-table chains of 20, 300 and 3,000 rows (INNER,
+      LEFT, RIGHT and FULL pairs) went from 62 to 116 plans matching, none
+      lost, rows unchanged. What remains is the analysed case this item
+      measures: `join_side` declines the search over an analysed table
+      (RP-1059 (1)), and the chain is drawn as written. Work RP-1059 (1)
+      first. Still drawn as written with it: a FULL join the chain keeps
+      FULL, and a LEFT pair below a RIGHT join (RP-1063).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a full join an inner join reduces hashes its unique side]
       Backlog-ID: RP-1064
+
+- [ ] **A FULL JOIN reduced to a LEFT JOIN nothing reads is not
+      removed.** `explain (costs off) select e.b from e full join k on
+      e.a = k.a where e.a > 0` (`e`, `k` analysed, 1000 rows, `k.a` the
+      primary key) is a `Hash Left Join` of `e` over a Hash of `k` here;
+      on a private PostgreSQL 15.20 cluster it is `Seq Scan on e` with
+      `Filter: (a > 0)`: `reduce_outer_joins` makes the FULL JOIN a LEFT
+      JOIN, which `remove_useless_joins` then removes as it does a
+      written one (RP-1060's `join_removal.rs` only sees the join as
+      written, before the reduction). Likewise `... full join k on e.a =
+      k.a join e e2 on e2.a = e.a`, the inner join above reducing it: a
+      Hash Join of `e` and `e e2` alone there. Found while working
+      RP-1064.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a full join a where reduces to a removable left join is removed], tests/backlog/test_rp_explain_costs.py::test_plan[a full join an inner join reduces to a removable left join is removed]
+      Backlog-ID: RP-1118
 
 - [ ] **A hash join on an expression and a column pair hashes the
       expression's side.** `explain select e.b from e join k on e.a = k.a
