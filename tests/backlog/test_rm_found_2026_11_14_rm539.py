@@ -355,7 +355,7 @@ def _sorted_bytes(client: Any) -> int:
     return total() - before
 
 
-@pytest.mark.backlog("RM-686")
+@pytest.mark.backlog_fixed("RM-686")
 def test_a_documents_sort_counts_the_documents_built(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -363,6 +363,6 @@ def test_a_documents_sort_counts_the_documents_built(
     """mongod 8.2.11 counts each document a `$documents` makes as the
     storage its expression object built: `metrics.query.sort.totalBytesSorted`
     grows by 490 for `[{a: 1, b: 3}, {a: 2}]` sorted. This server's explain
-    counts them so (RM-539), but a run hands them to the pipeline as read
-    BSON and counts 255."""
+    counts them so (RM-539); a run handed them to the pipeline as read
+    BSON and counted 255 until RM-686."""
     assert _sorted_bytes(rust_mongo) == _sorted_bytes(mongod_rs)
