@@ -3670,6 +3670,27 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       stand-in; which file, if any, is Joe's call (RP-112 decided only that
       a relation's file is WiredTiger's). Found working phase 6 of
       `tasks/mongod-storage-model-plan.md`.
+      **Decision needed (2026-11-26):** measured on this server: all 64
+      `pg_catalog` tables (11 of them shared, which PostgreSQL keeps under
+      `global/`) and all 122 catalog indexes answer NULL; the 75 catalog
+      views answer NULL on both sides, as they should. The catalogs are
+      computed per query from about 58 `__sql_*__` collections plus the
+      baked PostgreSQL 15 rows (`pg15_catalog_rows.txt`, 8,135 lines), so
+      no single file holds any one of them. Options, most faithful first:
+      (1) store each system catalog as a relation of its own, read and
+      written through its own WiredTiger table as PostgreSQL reads its
+      heaps, and name that file. This is the PostgreSQL model, but it
+      rebuilds the catalog layer, and it reaches the scope decision that
+      makes direct catalog writes 0A000. Recommended as the faithful
+      answer; sequence it as its own plan. (2) name the `__sql_*__`
+      collection a catalog is mostly computed from (`pg_class` from
+      `__sql_catalog__`'s `collection-<UUID>.wt`). This is a stand-in:
+      the catalog is not read from that file alone, and catalogs built
+      only from baked rows have none. (3) keep NULL as a written scope
+      decision. What is lost: a client asking for a catalog's file gets
+      the no-storage answer. No gauge or corpus reaches it: only the
+      server's own slice and gap tests, and the two catalog-dump probes,
+      call `pg_relation_filepath`.
       Backlog-ID: RP-1075
       Verify: tests/backlog/test_rp_storage_model.py::test_a_catalog_has_a_file
 - [ ] **Every sequence names the same file.** A sequence is a relation of
@@ -3689,6 +3710,20 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       working phase 6.
       Backlog-ID: RP-1077
       Verify: tests/backlog/test_rp_storage_model.py::test_relation_filenode
+
+## Found while working RP-1075 (2026-11-26)
+
+- [ ] **`pg_relation_filepath` of a table the open transaction created is
+      NULL.** `begin; create table u (id int primary key); select
+      pg_relation_filepath('u'), pg_relation_filepath('u_pkey')` answers
+      NULL for both until the CREATE commits; PostgreSQL 15.20 names both
+      files, since the creating transaction sees its own catalog rows. The
+      size functions read through the open block (`size_call` ->
+      `read_in_block`, RP-299); `wal_call`'s `pg_relation_filepath` arm
+      does not, so it looks the ident up outside the transaction that made
+      it.
+      Backlog-ID: RP-1135
+      Verify: tests/backlog/test_rp_storage_model.py::test_filepath_of_a_relation_the_open_transaction_created
 
 ## Found while working RP-1068 (2026-11-26)
 

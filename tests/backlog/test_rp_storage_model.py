@@ -133,3 +133,19 @@ def test_relation_filenode(pg: Any) -> None:
     finally:
         pg.execute("drop view fp_v")
         pg.execute("drop table fp_t")
+
+
+@pytest.mark.backlog("RP-1135")
+def test_filepath_of_a_relation_the_open_transaction_created(pg: Any) -> None:
+    """PostgreSQL 15.20 names the file of a table and of its primary key
+    created in the open transaction (the creating transaction sees its own
+    catalog rows); this server answers NULL for both until the CREATE
+    commits, because `pg_relation_filepath` does not read through the open
+    block as the size functions do."""
+    with pg.transaction(force_rollback=True):
+        pg.execute("create table fp_tx (id int primary key)")
+        assert pg_answer(
+            pg,
+            "select pg_relation_filepath('fp_tx') is not null,"
+            " pg_relation_filepath('fp_tx_pkey') is not null",
+        ) == ("ok", [(True, True)])
