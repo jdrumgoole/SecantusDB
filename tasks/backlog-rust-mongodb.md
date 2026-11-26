@@ -3018,24 +3018,6 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       Verify: none -- intermittent on CI; the test itself is the check
       Backlog-ID: RM-814
 
-- [ ] **RUST MongoDB server: a standalone mongod store killed right after
-      a `createIndexes` does not open (2026-11-26).** `secantusd-mdb
-      --standalone` on the store of a standalone mongod 8.2.11 that was
-      SIGKILLed just after `create_index("v")` on a collection of 50
-      documents exits 1 with `failed to open storage ... Internal("app.c's
-      index v_1 is unfinished and names no build UUID")` (`adopt.rs`, the
-      RM-755 check): the catalog row has `ready: false` and no `buildUUID`.
-      mongod itself reopens such a store and rebuilds the index in the
-      foreground at startup, so this server should restart the build under a
-      build UUID of its own where the row names none, as it does for one that
-      does. 3 of 8 runs of the RM-808 test
-      (`test_secantus_opens_a_standalone_mongod_store_in_both_modes[killed]`)
-      fail so on an unmodified origin/rm-batch binary (f5ea08060 plus RM-658,
-      RM-660, RM-643), which is how the gate's `backlog` stage comes out red
-      about half the time. Found while gating RM-701.
-      Verify: none -- intermittent: the RM-808 test is the check (it reaches the unfinished row in about 3 runs of 8); a deterministic test needs the kill to land between the catalog row and its `ready` update
-      Backlog-ID: RM-811
-
 - [ ] **Stopping a gate run leaves its tests' reference mongods running
       (2026-11-25).** `scripts/detached_run.py stop` on a `gate_rm.py`
       run ends pytest, but the `mongod_rs` / probe fixtures' `mongod`
@@ -3075,10 +3057,10 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       unfinished index" and stops on fatal assertion 40652 (no
       featureCompatibilityVersion document). The test needs to wait for a
       checkpoint before the kill (for example `fsync`), and the fixture to
-      print what the server said. Separately, mongod drops an unfinished
-      index that has no build UUID where this server refuses the store; the
-      next probe should decide whether that is a second item. Found
-      2026-11-26 in RM-644's gate.
+      print what the server said. (The refusal itself, mongod dropping
+      an unfinished index that has no build UUID where this server refused
+      the store, was RM-811 and is fixed: what remains is that mongod cannot
+      open the store.) Found 2026-11-26 in RM-644's gate.
       Verify: none -- a test-timing race; reproduce with four parallel
       runs of `tests/backlog/test_rm_storage_model.py` at `-n 4`
       Backlog-ID: RM-812

@@ -414,11 +414,12 @@ fn adopt_row(
                 Some(Bson::Binary(b)) => <[u8; 16]>::try_from(b.bytes.as_slice()).ok(),
                 _ => None,
             };
-            let Some(uuid) = uuid else {
-                return Err(crate::StorageError::Internal(format!(
-                    "{db}.{coll}'s index {name} is unfinished and names no build UUID"
-                )));
-            };
+            // A build that names none is a single-phase one (a standalone's):
+            // mongod's startup does not restart it, it drops the index
+            // ("Dropping unfinished index", 22256) and the collection is
+            // served without it (RM-811). Not listed, the registry row (and
+            // the table, as an orphan) goes.
+            let Some(uuid) = uuid else { continue };
             let spec = ix.get_document("spec").cloned().unwrap_or_default();
             unfinished.push((db.to_string(), coll.to_string(), uuid, spec));
             continue;

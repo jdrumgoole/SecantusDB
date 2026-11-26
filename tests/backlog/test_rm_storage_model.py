@@ -1680,7 +1680,9 @@ def test_mongod_opens_a_killed_secantus_store(tmp_path: Path) -> None:
         assert _validation(mongod, "app", "c") == (True, [], [])
 
 
-def _mongod_standalone_on(dbpath: Path) -> tuple[subprocess.Popen, pymongo.MongoClient | None]:
+def _mongod_standalone_on(
+    dbpath: Path, *extra: str
+) -> tuple[subprocess.Popen, pymongo.MongoClient | None]:
     """mongod 8.2.11 started WITHOUT `--replSet` on `dbpath`: a standalone."""
     assert MONGOD, "no mongod on PATH: the reference server is required"
     port = _free_port()
@@ -1696,6 +1698,7 @@ def _mongod_standalone_on(dbpath: Path) -> tuple[subprocess.Popen, pymongo.Mongo
             "--logpath",
             str(dbpath.parent / f"mongod-{port}.log"),
             "--logappend",
+            *extra,
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -1827,6 +1830,81 @@ def test_secantus_opens_a_standalone_mongod_store_in_both_modes(tmp_path: Path, 
         assert _mongod_docs(c) == expected
     with rust_mongo_server(copy) as c:
         assert _mongod_docs(c) == expected
+
+
+def _build_v_quietly(client: pymongo.MongoClient) -> None:
+    with contextlib.suppress(pymongo.errors.PyMongoError):
+        client.app.c.create_index("v")
+
+
+@pytest.mark.backlog_fixed("RM-811")
+def test_secantus_drops_an_index_build_a_standalone_mongod_left_unfinished(
+    tmp_path: Path,
+) -> None:
+    """A standalone mongod 8.2.11 SIGKILLed while `create_index("v")` is
+    unfinished (held by `hangAfterInitializingIndexBuild`, the catalog made
+    durable by `fsync`) leaves the index in its catalog with `ready: false`
+    and NO build UUID. mongod's startup does not rebuild it: it logs
+    "Dropping unfinished index" (id 22256) and serves the collection with the
+    `_id` index alone; the documents are all there and `validate` passes.
+    `secantusd-mdb` refused the store ("is unfinished and names no build
+    UUID"); it now drops the index the same way, takes the store in both
+    modes and hands it back to mongod, which can build the index (RM-811)."""
+    import threading
+
+    store = tmp_path / "store"
+    store.mkdir()
+    proc, client = _mongod_standalone_on(store, "--setParameter", "enableTestCommands=1")
+    assert client is not None, "mongod did not start on an empty directory"
+    try:
+        client.app.get_collection("c", write_concern=pymongo.WriteConcern(j=True)).insert_many(
+            [{"_id": i, "v": i} for i in range(50)]
+        )
+        client.admin.command(
+            "configureFailPoint", "hangAfterInitializingIndexBuild", mode="alwaysOn"
+        )
+        threading.Thread(target=_build_v_quietly, args=(client,), daemon=True).start()
+        deadline = time.monotonic() + 30
+        while "v_1" not in {i["name"] for i in client.app.c.list_indexes()}:
+            assert time.monotonic() < deadline, "the build never started"
+            time.sleep(0.1)
+        client.admin.command("fsync")
+        proc.send_signal(signal.SIGKILL)
+        proc.wait()
+    finally:
+        client.close()
+    expected = {i: i for i in range(50)}
+    member = tmp_path / "member"
+    shutil.copytree(store, member)
+    ref = tmp_path / "reference" / "store"
+    shutil.copytree(store, ref)
+    # mongod's own restart: the index is dropped, nothing is rebuilt.
+    proc, client = _mongod_standalone_on(ref)
+    assert client is not None, "mongod refused its own store"
+    try:
+        with _mongod_answers(ref):
+            assert [i["name"] for i in client.app.c.list_indexes()] == ["_id_"]
+            assert _mongod_docs(client) == expected
+            assert client.app.command("validate", "c", full=True)["valid"]
+    finally:
+        _stop_mongod(proc, client)
+    for path, args in ((store, ("--standalone",)), (member, ())):
+        with rust_mongo_server(path, *args) as c:
+            assert [i["name"] for i in c.app.c.list_indexes()] == ["_id_"]
+            assert _mongod_docs(c) == expected
+            assert c.app.command("validate", "c", full=True)["valid"]
+            assert [d["_id"] for d in c.app.c.find({"v": 7})] == [7]
+    # Back to mongod, which builds the index on the store this server held.
+    proc, client = _mongod_standalone_on(store)
+    assert client is not None, "mongod refused the store secantusd-mdb held"
+    try:
+        with _mongod_answers(store):
+            assert _mongod_docs(client) == expected
+            client.app.c.create_index("v")
+            assert [d["_id"] for d in client.app.c.find({"v": 7}).hint("v_1")] == [7]
+            assert client.app.command("validate", "c", full=True)["valid"]
+    finally:
+        _stop_mongod(proc, client)
 
 
 def _mongod_store(tmp_path: Path, setup: Any, kill: bool = False) -> Path:
