@@ -2555,12 +2555,12 @@ def test_ddl_cycles_write_the_pages_postgresqls_do(rust_pg: Any) -> None:
     assert written == EXPECTED_WRITTEN_AFTER_FOUR
 
 
-# RP-291, what is left of it: the rows of DDL other than CREATE TABLE have
-# no place yet. A new session's first use of the module's view and then of
-# its function, in a fresh database after its DDL once, measured as
-# `EXPECTED_CLEARED_VM_BLOCKS` was: the view's `pg_class`, `pg_attribute`
-# and `pg_rewrite` rows and the function's `pg_proc` row are each read
-# from the heap.
+# RP-291: a lookup reads the heap block of a row CREATE VIEW or CREATE
+# FUNCTION wrote, as one of CREATE TABLE's. A new session's first use of
+# the module's view and then of its function, in a fresh database after
+# its DDL once, measured as `EXPECTED_CLEARED_VM_BLOCKS` was: the view's
+# `pg_class`, `pg_attribute` and `pg_rewrite` rows and the function's
+# `pg_proc` row are each read from the heap.
 OTHER_DDL_STEPS = ["a|", "mark", "a|select * from rpc_v", "mark", "a|select rpc_f(1)", "mark"]
 
 EXPECTED_OTHER_DDL_BLOCKS: list[dict[str, int]] = [
@@ -2580,36 +2580,67 @@ EXPECTED_OTHER_DDL_BLOCKS: list[dict[str, int]] = [
 ]
 
 
-@pytest.mark.backlog("RP-291")
+@pytest.mark.backlog_fixed("RP-291")
 def test_a_views_and_a_functions_rows_are_read_from_the_heap(rust_pg: Any) -> None:
     """PostgreSQL 15.19: a lookup that returns a row CREATE VIEW or CREATE
     FUNCTION wrote reads the row's heap block, as one of CREATE TABLE's
-    does."""
+    does. Those rows had no place, so the view's first use read 3
+    `pg_class`, 3 `pg_attribute` and no `pg_rewrite` block, and the
+    function's first call 1 `pg_proc` block; now they are placed
+    (`place_created_view`, `place_created_function`)."""
     assert after_ddl_cycles(_dsn(rust_pg), 1, OTHER_DDL_STEPS)[1:] == EXPECTED_OTHER_DDL_BLOCKS
 
 
+# RP-291: `INDEX_BLOCK_STEPS` read the same blocks after any number of
+# cycles of the module's DDL in one database, `EXPECTED_CATALOG_BLOCKS`
+# for every k from 1 to 14 (a private PostgreSQL 15.20 cluster,
+# 2026-11-26, set up as `EXPECTED_CLEARED_VM_BLOCKS` was; the box has no
+# 15.19 binary since 2026-11-24). At the tenth cycle (and only there, of 1
+# to 14) the primary-key lookup read 4 `pg_attribute` blocks where
+# PostgreSQL reads 3 until CREATE VIEW's and CREATE FUNCTION's rows were
+# placed: their space moved where `rpc_t`'s rows went. RP-1111 found it, as
+# `test_catalog_blocks` failing on CI in the shared database.
+TENTH_CYCLE = 10
+
+
+@pytest.mark.backlog_fixed("RP-291")
+def test_the_tenth_cycles_rows_read_what_the_firsts_do(rust_pg: Any) -> None:
+    """PostgreSQL 15.20: after nine cycles of the module's DDL in one
+    database, the tenth cycle's catalog rows read the same blocks as the
+    first cycle's."""
+    got = after_ddl_cycles(_dsn(rust_pg), TENTH_CYCLE, INDEX_BLOCK_STEPS)
+    assert got == EXPECTED_CATALOG_BLOCKS
+
+
 # RP-291, what is left of it: a dead row's space. PostgreSQL prunes the
-# rows a DROP left dead (`heap_page_prune_opt`) and puts new rows in that
-# space again, so `INDEX_BLOCK_STEPS` read the same blocks after any number
-# of cycles of the module's DDL in one database: `EXPECTED_CATALOG_BLOCKS`
-# for every k from 1 to 14 (a private PostgreSQL 15.20 cluster, 2026-11-26,
-# set up as `EXPECTED_CLEARED_VM_BLOCKS` was; the box has no 15.19 binary
-# since 2026-11-24). The model never frees that space, so each cycle's
-# rows go after the last cycle's. At the tenth cycle (and only there, of
-# 1 to 14) the primary-key lookup reads 4 `pg_attribute` blocks where
-# PostgreSQL reads 3, most likely because `rpc_t`'s rows cross a page
-# boundary. RP-1111 found it, as `test_catalog_blocks` failing on CI in
-# the shared database.
-DEAD_SPACE_CYCLES = 10
+# rows a DROP left dead (`heap_page_prune_opt`, when a later scan meets
+# them) and puts new rows in that space again, so a catalog's heap stops
+# growing: after 20 cycles of the module's DDL in one database, and the
+# 21st's SETUP and WARM, a sequential scan of `pg_class` reads 14 blocks
+# and one of `pg_type` 15, as after one cycle (a private PostgreSQL 15.20
+# cluster, 2026-11-26, set up as `EXPECTED_CLEARED_VM_BLOCKS` was; its
+# `pg_class` and `pg_type` heaps are 15.19's page for page, its
+# `pg_attribute` is not, so that is left out). The model never frees that
+# space, so each cycle's rows go after the last cycle's: 16 and 18 blocks.
+DEAD_SPACE_CYCLES = 21
+
+DEAD_SPACE_STEPS = [
+    "a|select count(*) from pg_class where relname::text like '%zz%'",
+    "a|select count(*) from pg_type where typname::text like '%zz%'",
+    "mark",
+    "a|select count(*) from pg_class where relname::text like '%zz%'",
+    "a|select count(*) from pg_type where typname::text like '%zz%'",
+    "mark",
+]
 
 
 @pytest.mark.backlog("RP-291")
 def test_a_dead_rows_space_takes_new_rows(rust_pg: Any) -> None:
-    """PostgreSQL 15.20: after nine cycles of the module's DDL in one
-    database, the tenth cycle's catalog rows read the same blocks as the
-    first cycle's, because pruning gave their space back."""
-    got = after_ddl_cycles(_dsn(rust_pg), DEAD_SPACE_CYCLES, INDEX_BLOCK_STEPS)
-    assert got == EXPECTED_CATALOG_BLOCKS
+    """PostgreSQL 15.20: twenty cycles of DDL in one database leave
+    `pg_class` and `pg_type` as long as one does, because pruning gave the
+    dead rows' space back to the cycles after."""
+    got = after_ddl_cycles(_dsn(rust_pg), DEAD_SPACE_CYCLES, DEAD_SPACE_STEPS)
+    assert got[1] == {"pg_class": 14, "pg_type": 15}
 
 
 # RP-935 (fixed): the index a catalog read directly is scanned through, and how

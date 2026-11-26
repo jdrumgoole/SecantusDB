@@ -17,9 +17,13 @@
 //! TABLE's rows in `pg_class`, `pg_type`, `pg_attribute` and `pg_index`
 //! (the table, its row type and array type, its TOAST table and that
 //! table's index, each index of its constraints), and the HOT update of
-//! the table's `pg_class` row a TOAST table makes; DROP TABLE's deletion
-//! of them, as dead rows no later scan reads (`_bt_killitems` once the
-//! first scan has met them). A row any other DDL writes is not placed,
+//! the table's `pg_class` row a TOAST table makes; CREATE VIEW's in
+//! `pg_type`, `pg_class`, `pg_attribute` and `pg_rewrite` (its `_RETURN`
+//! rule, at the length TOAST compression leaves it, [`row_len`]) with the
+//! HOT update `relhasrules` makes; CREATE FUNCTION's `pg_proc` row
+//! ([`proc_len`]); a DROP's deletion of them, as dead rows no later scan
+//! reads (`_bt_killitems` once the first scan has met them). A row any
+//! other DDL writes is not placed,
 //! nor are the other catalogs' rows, the index entries in the index
 //! trees, the space a deletion leaves for pruning and VACUUM, or a
 //! restart: the places are kept in memory.
@@ -360,9 +364,314 @@ pub(crate) const DATABASE_LEN: u32 = 136;
 /// columns, so its are longer; this server is 15.19's.)
 pub(crate) const ATTRIBUTE_LEN: u32 = 144;
 
+/// One variable-width column of a catalog row as `heap_form_tuple` is
+/// handed it.
+#[derive(Debug, Clone)]
+pub(crate) struct Varlena<'a> {
+    /// `VARSIZE`, its 4-byte header included.
+    pub(crate) size: u32,
+    /// Its `attstorage` is `extended` (`x`): it may be packed into a short
+    /// header, compressed and moved out of line. Otherwise `plain`.
+    pub(crate) extended: bool,
+    /// Its bytes, which compressing it needs; `None` when they are not
+    /// built, and then a row that must compress it is not placed.
+    pub(crate) data: Option<&'a [u8]>,
+}
+
+impl<'a> Varlena<'a> {
+    /// A `text` (or `pg_node_tree`) value.
+    pub(crate) fn text(s: &'a str) -> Self {
+        Varlena {
+            size: 4 + s.len() as u32,
+            extended: true,
+            data: Some(s.as_bytes()),
+        }
+    }
+
+    /// A one-dimensional array with no null element, of elements of
+    /// `elem_len` bytes each (`-1` for `text`, with `texts` their
+    /// lengths), as `construct_md_array` builds it: the 24-byte header
+    /// (`ARR_OVERHEAD_NONULLS(1)`) and each element aligned as its type
+    /// is -- a `text` with its 4-byte header to 4, a `char` unaligned.
+    pub(crate) fn array(elem_len: i32, n: usize, texts: &[usize]) -> Self {
+        let body: usize = if elem_len < 0 {
+            texts.iter().map(|l| (4 + l + 3) & !3).sum()
+        } else {
+            n * elem_len as usize
+        };
+        Varlena {
+            size: 24 + body as u32,
+            extended: true,
+            data: None,
+        }
+    }
+
+    /// An `oidvector` of `n` (always one dimension, `plain` storage).
+    pub(crate) fn oidvector(n: usize) -> Self {
+        Varlena {
+            size: 24 + 4 * n as u32,
+            extended: false,
+            data: None,
+        }
+    }
+}
+
+/// `TOAST_TUPLE_THRESHOLD` (and `TOAST_TUPLE_TARGET`) for 8 kB pages.
+const TOAST_TUPLE_THRESHOLD: u32 = 2032;
+/// `TOAST_POINTER_SIZE`: an out-of-line value's pointer in the row.
+const TOAST_POINTER_SIZE: u32 = 18;
+/// `VARHDRSZ_COMPRESSED`.
+const VARHDRSZ_COMPRESSED: u32 = 8;
+
+/// A column's value as the TOAST pass leaves it.
+#[derive(Clone, Copy, PartialEq)]
+enum Form {
+    Plain,
+    Compressed,
+    External,
+}
+
+/// `heap_compute_data_size` of the varlena columns after `fixed` bytes of
+/// fixed-width ones: a packable value of at most 127 bytes once its header
+/// is one byte takes a short header and no alignment, an out-of-line one
+/// its pointer, any other its 4-byte header aligned to 4.
+fn data_size(fixed: u32, vars: &[(Varlena, Form, u32)]) -> u32 {
+    let mut off = fixed;
+    for (v, form, size) in vars {
+        match form {
+            Form::External => off += TOAST_POINTER_SIZE,
+            Form::Plain if v.extended && *size - 3 <= 127 => off += *size - 3,
+            _ => off = ((off + 3) & !3) + *size,
+        }
+    }
+    off
+}
+
+/// The MAXALIGNed length of a catalog row (`heap_form_tuple`, then
+/// `heap_toast_insert_or_update` when the row is longer than
+/// `TOAST_TUPLE_THRESHOLD`): `natts` columns, `nulls` whether any is null
+/// (for the null bitmap), the fixed-width columns' `fixed` bytes, then
+/// each non-null variable-width column in order. Too long, the biggest
+/// `extended` value is compressed (pglz, kept when it saves more than two
+/// bytes), and moved out of line when still longer than the row may be;
+/// then the biggest left in line are moved out until it fits. `None`
+/// when a value that must be compressed has no bytes to compress.
+pub(crate) fn row_len(natts: u32, nulls: bool, fixed: u32, vars: &[Varlena]) -> Option<u32> {
+    let bitmap = if nulls { natts.div_ceil(8) } else { 0 };
+    let hoff = (23 + bitmap + 7) & !7;
+    let mut cols: Vec<(Varlena, Form, u32)> = vars
+        .iter()
+        .map(|v| (v.clone(), Form::Plain, v.size))
+        .collect();
+    let max_data = TOAST_TUPLE_THRESHOLD - hoff;
+    if hoff + data_size(fixed, &cols) > TOAST_TUPLE_THRESHOLD {
+        // `toast_tuple_find_biggest_attribute`: bigger than a TOAST
+        // pointer, and in the pass that compresses, not compressed nor
+        // found incompressible.
+        let biggest = |cols: &[(Varlena, Form, u32)], skip: &[bool], compressing: bool| {
+            let mut best: Option<usize> = None;
+            let mut best_size = (TOAST_POINTER_SIZE + 7) & !7;
+            for (i, (v, form, size)) in cols.iter().enumerate() {
+                if !v.extended
+                    || *form == Form::External
+                    || (compressing && (*form == Form::Compressed || skip[i]))
+                {
+                    continue;
+                }
+                if *size > best_size {
+                    best = Some(i);
+                    best_size = *size;
+                }
+            }
+            best
+        };
+        let mut incompressible = vec![false; cols.len()];
+        while data_size(fixed, &cols) > max_data {
+            let Some(i) = biggest(&cols, &incompressible, true) else {
+                break;
+            };
+            // `toast_tuple_try_compression`.
+            let data = cols[i].0.data?;
+            match crate::pglz::compressed_len(data) {
+                Some(n) if (n as u32) + VARHDRSZ_COMPRESSED < cols[i].2 - 4 - 2 => {
+                    cols[i].1 = Form::Compressed;
+                    cols[i].2 = n as u32 + VARHDRSZ_COMPRESSED;
+                }
+                _ => incompressible[i] = true,
+            }
+            if cols[i].2 > max_data {
+                cols[i].1 = Form::External;
+            }
+        }
+        while data_size(fixed, &cols) > max_data {
+            let Some(i) = biggest(&cols, &incompressible, false) else {
+                break;
+            };
+            cols[i].1 = Form::External;
+        }
+    }
+    Some((hoff + data_size(fixed, &cols) + 7) & !7)
+}
+
+/// The fixed-width columns of a `pg_proc` row, `oid` to `prorettype`.
+pub(crate) const PROC_FIXED: u32 = 112;
+/// `pg_proc`'s columns.
+pub(crate) const PROC_NATTS: u32 = 30;
+/// The fixed-width columns of a `pg_rewrite` row, `oid` to `is_instead`.
+pub(crate) const REWRITE_FIXED: u32 = 75;
+
+/// What a `pg_proc` row holds beyond its fixed-width columns, as
+/// `ProcedureCreate` writes it.
+#[derive(Debug, Default)]
+pub(crate) struct ProcRow<'a> {
+    /// `pronargs`: `proargtypes`' length.
+    pub(crate) nargs: usize,
+    /// `proallargtypes` and `proargmodes`, when a parameter is not IN:
+    /// how many parameters there are in all.
+    pub(crate) all: Option<usize>,
+    /// `proargnames`, when a parameter is named.
+    pub(crate) names: Option<&'a [String]>,
+    pub(crate) src: &'a str,
+    pub(crate) bin: Option<&'a str>,
+    /// `proconfig`: each `name=value`.
+    pub(crate) config: Option<&'a [String]>,
+}
+
+/// The MAXALIGNed length of a `pg_proc` row with no `proargdefaults`,
+/// `protrftypes`, `prosqlbody` or `proacl`: its 32-byte header (30
+/// columns, so a null bitmap of 4) and then `proargtypes`,
+/// `proallargtypes`, `proargmodes`, `proargnames`, `prosrc`, `probin` and
+/// `proconfig`, in that order. Measured on PostgreSQL 15.20 with
+/// pageinspect (`lp_len`).
+pub(crate) fn proc_len(p: &ProcRow) -> Option<u32> {
+    let lens = |v: &[String]| v.iter().map(String::len).collect::<Vec<_>>();
+    let mut vars = vec![Varlena::oidvector(p.nargs)];
+    if let Some(n) = p.all {
+        vars.push(Varlena::array(4, n, &[]));
+        vars.push(Varlena::array(1, n, &[]));
+    }
+    if let Some(names) = p.names {
+        vars.push(Varlena::array(-1, names.len(), &lens(names)));
+    }
+    vars.push(Varlena::text(p.src));
+    if let Some(bin) = p.bin {
+        vars.push(Varlena::text(bin));
+    }
+    if let Some(config) = p.config {
+        vars.push(Varlena::array(-1, config.len(), &lens(config)));
+    }
+    row_len(PROC_NATTS, true, PROC_FIXED, &vars)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rows_length_is_postgresqls() {
+        // `lp_len` of each function's `pg_proc` row on PostgreSQL 15.20,
+        // MAXALIGNed.
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let (n1, n2, n4, c3) = (
+            s(&["a", "bb"]),
+            s(&["a", "b", "ccc"]),
+            s(&["", "x"]),
+            s(&["search_path=public"]),
+        );
+        let cases: Vec<(&str, ProcRow, u32)> = vec![
+            (
+                "rpc_f(int) as 'select $1 + 1': 186",
+                ProcRow {
+                    nargs: 1,
+                    src: "select $1 + 1",
+                    ..ProcRow::default()
+                },
+                192,
+            ),
+            (
+                "f1(a int, bb text): 222",
+                ProcRow {
+                    nargs: 2,
+                    names: Some(&n1),
+                    src: "select a",
+                    ..ProcRow::default()
+                },
+                224,
+            ),
+            (
+                "f2(a int, out b int, out ccc text): 288",
+                ProcRow {
+                    nargs: 1,
+                    all: Some(3),
+                    names: Some(&n2),
+                    src: "select a, 'x'",
+                    ..ProcRow::default()
+                },
+                288,
+            ),
+            (
+                "f3(int) set search_path = public: 226",
+                ProcRow {
+                    nargs: 1,
+                    src: "select 1",
+                    config: Some(&c3),
+                    ..ProcRow::default()
+                },
+                232,
+            ),
+            (
+                "f4(int, x int), one name empty: 234",
+                ProcRow {
+                    nargs: 2,
+                    names: Some(&n4),
+                    src: "begin return next 1; end",
+                    ..ProcRow::default()
+                },
+                240,
+            ),
+            (
+                "f6(variadic int[]): 228",
+                ProcRow {
+                    nargs: 1,
+                    all: Some(1),
+                    src: "select 1",
+                    ..ProcRow::default()
+                },
+                232,
+            ),
+        ];
+        for (what, row, len) in &cases {
+            assert_eq!(proc_len(row), Some(*len), "{what}");
+        }
+        // f5(), a body of 3494 bytes that compresses to 1897: still too
+        // long for the row, so out of line, and the row is 186.
+        let body = format!(
+            "select {}",
+            (0..600)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(" + ")
+        );
+        assert_eq!(body.len(), 3494);
+        let long = ProcRow {
+            src: &body,
+            ..ProcRow::default()
+        };
+        assert_eq!(proc_len(&long), Some(192));
+        // `rpc_v`'s `_RETURN` rule, its `ev_action` compressed: 1246.
+        let action = include_str!("pglz_ev_action.txt");
+        let r = [Varlena::text("<>"), Varlena::text(action)];
+        assert_eq!(row_len(8, false, REWRITE_FIXED, &r), Some(1248));
+        // Without the bytes the row cannot be measured.
+        let blind = [
+            Varlena::text("<>"),
+            Varlena {
+                data: None,
+                ..Varlena::text(action)
+            },
+        ];
+        assert_eq!(row_len(8, false, REWRITE_FIXED, &blind), None);
+    }
 
     fn s(v: &str) -> Bson {
         Bson::String(v.into())

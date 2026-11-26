@@ -104,6 +104,7 @@ mod parameter_acl;
 mod partition;
 mod pg15_settings;
 mod pg_type_facts;
+mod pglz;
 mod pgstat;
 mod pgstat_sql;
 mod plan_cache;

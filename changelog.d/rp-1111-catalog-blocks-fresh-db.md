@@ -17,8 +17,9 @@ server the result is deterministic: the tenth run reads 4 every time.
 
 #### Found
 
-- RP-291 gains a gap test for the divergence behind the flake. The model
-  never frees the space a dropped table's catalog rows leave, so the tenth
-  cycle of the module's DDL in one database reads 4 `pg_attribute` blocks.
-  PostgreSQL prunes that space and reads 3 at every cycle from 1 to 14
-  (`tests/backlog/test_rp_catalog_reads.py::test_a_dead_rows_space_takes_new_rows`).
+- RP-291 gains a gap test for the divergence behind the flake: the tenth
+  cycle of the module's DDL in one database read 4 `pg_attribute` blocks,
+  where PostgreSQL reads 3 at every cycle from 1 to 14
+  (`tests/backlog/test_rp_catalog_reads.py::test_the_tenth_cycles_rows_read_what_the_firsts_do`).
+  The cause, found by RP-291's next slice, was the view's and function's
+  catalog rows, which had no place.

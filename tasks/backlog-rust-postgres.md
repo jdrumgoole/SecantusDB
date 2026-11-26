@@ -1618,8 +1618,9 @@ a regression test.
       match, 22 differ.
       Backlog-ID: RP-290
       Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view]
-- [ ] **A catalog row DDL other than CREATE TABLE writes counts no heap
-      block** in `pg_statio_sys_tables`. A catalog scan counts its index
+- [ ] **A catalog row DDL other than CREATE TABLE, VIEW or FUNCTION
+      writes counts no heap block** in `pg_statio_sys_tables`, nor does a
+      dead row's space take new rows. A catalog scan counts its index
       pages (`catalog_btree.rs`, from `pg15_catalog_indexes.txt`) and the
       heap blocks behind the rows it returns: `initdb`'s own
       (`pg15_catalog_heaps.txt`, `catalog_heap.rs`), and since 2026-11-25
@@ -1637,22 +1638,32 @@ a regression test.
       dead at commit, as does a rolled-back CREATE (regression tests
       `test_catalog_blocks`, `test_a_page_ddl_wrote_to_is_not_all_visible`
       and `test_ddl_cycles_write_the_pages_postgresqls_do`, which holds the
-      `pg_class` blocks four cycles of DDL write to PostgreSQL's).
+      `pg_class` blocks four cycles of DDL write to PostgreSQL's). Since
+      2026-11-26 CREATE VIEW's rows are placed too (its row type and array
+      type, its `pg_class` row and columns, its `_RETURN` rule's
+      `pg_rewrite` row with `ev_action` compressed by a port of pglz as
+      `heap_toast_insert_or_update` compresses it, and the HOT update
+      `relhasrules` makes), and CREATE FUNCTION's `pg_proc` row; a DROP
+      (or a CASCADE) of either leaves them dead (regression tests
+      `test_a_views_and_a_functions_rows_are_read_from_the_heap` and
+      `test_the_tenth_cycles_rows_read_what_the_firsts_do`).
       **Decided** (Joe, 2026-11-01): option A, the full model, landed as a
       sequence of PRs, this item open until the last. Remaining:
-      - every other DDL's rows: CREATE VIEW's (`pg_class`, `pg_type`,
-        `pg_attribute`, `pg_rewrite`, and the HOT update `relhasrules`
-        makes), CREATE FUNCTION's `pg_proc` row, GRANT's out-of-line
-        `relacl` update (217 bytes), CREATE INDEX, sequences and serial
-        columns, ALTER TABLE, roles, and the CREATE TABLE shapes left
-        unplaced (temporary, partitioned, inheriting and typed tables,
-        identity and generated columns, foreign keys, whose triggers update
-        the `pg_class` rows, exclusion constraints, CREATE DATABASE with a
-        locale option); and the catalogs none of it is placed in yet
-        (`pg_depend`, `pg_constraint`, `pg_shdepend`, ...). A view's first
-        use in a fresh database reads 6 `pg_class`, 4 `pg_attribute` and 1
-        `pg_rewrite` blocks on PostgreSQL, 3, 3 and 0 here; a function's
-        first call 3 `pg_proc` blocks, here 1;
+      - every other DDL's rows: GRANT's out-of-line `relacl` update (217
+        bytes), CREATE INDEX, sequences and serial columns, ALTER TABLE,
+        roles, CREATE OR REPLACE of a view or a function (an update of its
+        rows), and the shapes of the placed DDL left unplaced: temporary,
+        partitioned, inheriting and typed tables, identity and generated
+        columns, foreign keys, whose triggers update the `pg_class` rows,
+        exclusion constraints, CREATE DATABASE with a locale option; a
+        temporary view, one with options or a CHECK OPTION; a function
+        with parameter defaults, transforms, a SQL-standard body or an
+        ACL; an aggregate. A view whose rule does not fit even compressed
+        puts it in `pg_rewrite`'s TOAST table, which is not modelled. A
+        query string that both creates and drops one view or function
+        places nothing for it, as the two are compared before and after
+        the whole string. And the catalogs none of it is placed in yet
+        (`pg_depend`, `pg_constraint`, `pg_shdepend`, ...);
       - the index entries of the placed rows in the index trees, which hold
         only `initdb`'s tuples and are shared by every database (a scan's
         leaf pages are read over `initdb`'s tree), with a non-HOT update's
@@ -1660,13 +1671,14 @@ a regression test.
       - a dead row's space: on-access pruning (`heap_page_prune_opt`) and
         VACUUM do not free it, so each cycle of DDL in a database puts
         its rows after the last cycle's, where PostgreSQL puts them in the
-        space pruning gave back. At the module's tenth cycle in one
-        database (only there, of cycles 1 to 14), where `rpc_t`'s rows
-        land makes its primary-key lookup read 4 `pg_attribute` blocks
-        where PostgreSQL 15.20 reads 3, most likely its rows crossing a
-        page boundary (`test_a_dead_rows_space_takes_new_rows`; this is why
-        `test_catalog_blocks` failed on CI in the shared database until it
-        moved to a fresh one, RP-1111). Also, a scan never meets a dead
+        space pruning gave back. After 20 cycles of the module's DDL in
+        one database PostgreSQL 15.20's `pg_class` and `pg_type` are 14 and
+        15 blocks, as after one; here 16 and 18, and 26 and 23 after 60
+        (`test_a_dead_rows_space_takes_new_rows`). The `heap_page.rs`
+        model a user table's heap uses has the pruning (`prune_opt`,
+        `delete`); the catalog heaps only mark a dropped row dead. The
+        tenth-cycle `pg_attribute` difference RP-1111 found was the
+        unplaced view's and function's rows, not this. Also, a scan never meets a dead
         row's entry (it reads as killed at once, where PostgreSQL's first
         scan reads its block before `_bt_killitems`); a ROLLBACK TO
         SAVEPOINT past a CREATE TABLE keeps its rows live;
@@ -1688,7 +1700,7 @@ a regression test.
       blocks, not 56; `pg_class`, `pg_type`, `pg_index` and `pg_database`
       are 15.19's page for page, which is what this slice was measured on.
       Backlog-ID: RP-291
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_views_and_a_functions_rows_are_read_from_the_heap, tests/backlog/test_rp_catalog_reads.py::test_a_dead_rows_space_takes_new_rows
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_dead_rows_space_takes_new_rows
 - [ ] **A `pg_stat_get_*` function given a regclass answers NULL.**
       `pg_stat_get_numscans('pg_class'::regclass)` (and
       `pg_stat_get_tuples_returned`, the same shape) is NULL here, where
