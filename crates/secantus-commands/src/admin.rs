@@ -687,6 +687,7 @@ pub fn coll_mod(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     crate::ddl_checks::coll_mod(doc)?;
     // mongod's reply ends with `ok`, after what the command changed.
     let mut reply = coll_mod_inner(doc, ctx)?;
+    sync_bucket_indexes_after(doc, "collMod", ctx, &reply)?;
     if reply.get("ok").is_some_and(crate::util::truthy) {
         if let Some(ok) = reply.remove("ok") {
             reply.insert("ok", ok);
@@ -2257,6 +2258,30 @@ fn is_falsy(v: &Bson) -> bool {
 }
 
 pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let reply = create_indexes_inner(doc, ctx)?;
+    sync_bucket_indexes_after(doc, "createIndexes", ctx, &reply)?;
+    Ok(reply)
+}
+
+/// A time-series collection's index changed: make its copies over the
+/// buckets as many (RM-701). `name` is the command that ran.
+fn sync_bucket_indexes_after(
+    doc: &Document,
+    name: &str,
+    ctx: &mut CommandContext,
+    reply: &Document,
+) -> Result<(), CommandError> {
+    if !reply.get("ok").is_some_and(crate::util::truthy) {
+        return Ok(());
+    }
+    let Ok(coll) = doc.get_str(name) else {
+        return Ok(());
+    };
+    let storage = ctx.storage()?;
+    crate::ts_store::sync_bucket_indexes(storage, &ctx.db_name, coll)
+}
+
+fn create_indexes_inner(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `indexes` is an array of specs; a scalar there used to report ok:1 and
     // create NOTHING, so a driver believed an index existed that did not.
     // An explicit `indexes: null` means ABSENT on 8.x (40414), identical to
@@ -4698,6 +4723,13 @@ pub fn drop_indexes_parse(doc: &Document) -> Result<Option<Vec<String>>, Command
 }
 
 pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let reply = drop_indexes_inner(doc, ctx)?;
+    let name = doc.keys().next().map_or("dropIndexes", |k| k.as_str());
+    sync_bucket_indexes_after(doc, name, ctx, &reply)?;
+    Ok(reply)
+}
+
+fn drop_indexes_inner(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let names = drop_indexes_parse(doc)?;
     let coll = coll_arg(doc, doc.keys().next().map_or("dropIndexes", |k| k.as_str()))?;
     let storage = ctx.storage()?;

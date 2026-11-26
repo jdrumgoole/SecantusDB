@@ -729,7 +729,111 @@ pub fn create_missing_buckets(storage: &dyn Storage) -> Result<usize, CommandErr
                 create_buckets(storage, &db, &coll)?;
                 created += 1;
             }
+            sync_bucket_indexes(storage, &db, &coll)?;
         }
     }
     Ok(created)
+}
+
+/// Whether collection index `ix` of a time-series collection is built over
+/// its buckets as well: an ascending or descending key on measurement
+/// and meta fields, with no partial filter, collation or expiry (the ones
+/// the planner of this server reads over the buckets, RM-701).
+pub(crate) fn built_on_buckets(ix: &Document) -> bool {
+    ix.get_str("name").is_ok_and(|n| n != "_id_")
+        && ix.get_document("key").is_ok_and(|k| {
+            !k.is_empty()
+                && k.values()
+                    .all(|d| matches!(crate::util::as_i64(d), Some(1 | -1)))
+        })
+        && ["partialFilterExpression", "collation", "expireAfterSeconds"]
+            .iter()
+            .all(|o| !ix.contains_key(*o))
+}
+
+/// Make the indexes over the buckets of time-series collection `db.coll`
+/// the ones mongod keeps there: each index of the collection that
+/// [`built_on_buckets`] has its copy, keyed as mongod keys it on the buckets
+/// (`{control.min.v: 1, control.max.v: 1}`), and a copy whose index is gone
+/// is dropped (mongod keeps the one index, on the buckets). `hidden` follows.
+/// Idempotent; run after every command that changes the indexes.
+pub(crate) fn sync_bucket_indexes(
+    storage: &dyn Storage,
+    db: &str,
+    coll: &str,
+) -> Result<(), CommandError> {
+    let Some(layout) = layout_of(storage, db, coll) else {
+        return Ok(());
+    };
+    let ns = buckets_ns(coll);
+    if !storage
+        .collection_exists(db, &ns)
+        .map_err(crate::util::command_error)?
+    {
+        return Ok(());
+    }
+    let command_error = crate::util::command_error;
+    let on_collection = storage.list_indexes(db, coll).map_err(command_error)?;
+    let on_buckets = storage.list_indexes(db, &ns).map_err(command_error)?;
+    for ix in on_buckets.iter() {
+        let Ok(name) = ix.get_str("name") else {
+            continue;
+        };
+        if name != "_id_"
+            && !on_collection
+                .iter()
+                .any(|c| c.get_str("name") == Ok(name) && built_on_buckets(c))
+        {
+            storage.drop_index(db, &ns, name).map_err(command_error)?;
+        }
+    }
+    for ix in on_collection.iter().filter(|ix| built_on_buckets(ix)) {
+        let (Ok(name), Ok(key)) = (ix.get_str("name"), ix.get_document("key")) else {
+            continue;
+        };
+        let hidden = ix.get_bool("hidden").unwrap_or(false);
+        let held = on_buckets.iter().find(|b| b.get_str("name") == Ok(name));
+        match held {
+            Some(copy) => {
+                if copy.get_bool("hidden").unwrap_or(false) != hidden {
+                    storage
+                        .set_index_options(db, &ns, name, &doc! { "hidden": hidden })
+                        .map_err(command_error)?;
+                }
+            }
+            None => {
+                let on_buckets_key = crate::ts_buckets::bucket_key(key, &layout);
+                let mut spec = doc! { "key": on_buckets_key.clone(), "name": name };
+                if hidden {
+                    spec.insert("hidden", true);
+                }
+                storage
+                    .create_index(db, &ns, name, &on_buckets_key, &spec)
+                    .map_err(command_error)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_plain_indexes_are_built_over_the_buckets() {
+        assert!(built_on_buckets(&doc! { "name": "v_1", "key": { "v": 1 } }));
+        assert!(built_on_buckets(
+            &doc! { "name": "m_1_v_-1", "key": { "m": 1, "v": -1 } }
+        ));
+        for spec in [
+            doc! { "name": "_id_", "key": { "_id": 1 } },
+            doc! { "name": "p", "key": { "v": 1 }, "partialFilterExpression": { "v": { "$gt": 1 } } },
+            doc! { "name": "c", "key": { "s": 1 }, "collation": { "locale": "en" } },
+            doc! { "name": "ttl", "key": { "t": 1 }, "expireAfterSeconds": 10 },
+            doc! { "name": "g", "key": { "loc": "2dsphere" } },
+        ] {
+            assert!(!built_on_buckets(&spec), "{spec}");
+        }
+    }
 }

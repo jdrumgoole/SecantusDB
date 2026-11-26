@@ -338,6 +338,94 @@ pub(crate) fn plans_table_scan(
     Ok(table_scan(&plan::plan(&q, &catalog), &hint))
 }
 
+/// The access mongod's planner takes to the buckets of a time-series
+/// collection for a read (RM-701).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BucketAccess {
+    /// The buckets in order, a collection scan.
+    Scan,
+    /// One index over the buckets, by name: FETCH over its IXSCAN.
+    Index(String),
+    /// A plan this planner cannot tell from mongod's without a trial run of
+    /// several candidates, or one that is not a plain index scan.
+    Unsure,
+}
+
+/// The plan for `bucket_filter`, a read's bucket-level predicates, over
+/// the indexes of `system.buckets.<coll>` named in `only` (the `_id` index
+/// is the clustered one, which no index scan answers), planned with `hint`
+/// (an index by name) and `collation`.
+pub(crate) fn bucket_access(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    buckets: &str,
+    bucket_filter: &Document,
+    only: &[String],
+    hint: Option<&str>,
+    collation: Option<&Collation>,
+) -> Result<BucketAccess, CommandError> {
+    let catalog: Vec<_> = catalog(storage, db, buckets, None)
+        .map_err(command_error)?
+        .into_iter()
+        .filter(|ix| only.contains(&ix.name))
+        .collect();
+    let hint = match hint {
+        Some(name) if catalog.iter().any(|ix| ix.name == name) => Hint::Index(name.to_string()),
+        Some(_) => return Ok(BucketAccess::Unsure),
+        None => Hint::None,
+    };
+    let canonical = parsed::parsed_query(bucket_filter);
+    let implies = |partial: &Document| storage.query_implies_partial(bucket_filter, partial);
+    let q = Query {
+        canonical: &canonical,
+        sort: None,
+        projection: None,
+        skip: 0,
+        limit: 0,
+        hint: hint.clone(),
+        collation,
+        min_max: false,
+        return_key: false,
+        show_record_id: false,
+        batch_size: false,
+        keys_only: false,
+        wanted: None,
+        sbe: false,
+        implies: &implies,
+        trial: None,
+    };
+    // Several candidates are a trial between them; a filter on the bucket
+    // `_id` (the time field's) may be the clustered scan's bounds instead
+    // of an index's.
+    if hint == Hint::None {
+        let candidates = plan::index_candidates(&q, &catalog);
+        if candidates > 1 || (candidates == 1 && bucket_filter_names_id(bucket_filter)) {
+            return Ok(BucketAccess::Unsure);
+        }
+    }
+    Ok(match plan::plan(&q, &catalog) {
+        Node::CollScan { .. } => BucketAccess::Scan,
+        Node::Fetch { input, .. } => match *input {
+            Node::IxScan(scan) => BucketAccess::Index(scan.index.name.clone()),
+            _ => BucketAccess::Unsure,
+        },
+        _ => BucketAccess::Unsure,
+    })
+}
+
+/// A top-level predicate on the bucket `_id`, which the time field's bounds
+/// add.
+fn bucket_filter_names_id(filter: &Document) -> bool {
+    filter.iter().any(|(k, v)| match (k.as_str(), v) {
+        ("_id", _) => true,
+        ("$and" | "$or", Bson::Array(items)) => items
+            .iter()
+            .filter_map(Bson::as_document)
+            .any(bucket_filter_names_id),
+        _ => false,
+    })
+}
+
 /// The filter and sort of the query an aggregate's leading stages make, as
 /// `explain` reports it.
 pub(crate) fn pipeline_query(coll: &str, pipeline: &[Bson]) -> (Document, Option<Document>) {
@@ -3647,5 +3735,22 @@ mod tests {
             true
         ));
         assert!(!reads(vec![m, group()], None, false));
+    }
+}
+
+#[cfg(test)]
+mod bucket_access_tests {
+    use super::*;
+
+    #[test]
+    fn a_bucket_filter_names_the_id_the_time_field_adds() {
+        let id = bson::oid::ObjectId::new();
+        assert!(bucket_filter_names_id(&doc! { "_id": { "$lt": id } }));
+        assert!(bucket_filter_names_id(&doc! {
+            "$and": [{ "meta": 3 }, { "_id": { "$gte": id } }]
+        }));
+        assert!(!bucket_filter_names_id(&doc! {
+            "$and": [{ "meta": 3 }, { "control.max.v": { "$_internalExprGte": 1 } }]
+        }));
     }
 }

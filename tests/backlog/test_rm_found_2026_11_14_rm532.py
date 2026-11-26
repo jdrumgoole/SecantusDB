@@ -52,11 +52,11 @@ def _keys(client: Any, command: SON) -> list[Any]:
     return keys
 
 
-@pytest.mark.backlog("RM-643")
+@pytest.mark.backlog_fixed("RM-643")
 def test_a_natural_sort_is_recorded_as_a_hint(own_servers: Any) -> None:
     """mongod 8.2.11 records a `find` sorted on `$natural` with no `sort`
     in its shape and the sort as its key's `hint` (`{$natural: -1}`). This
-    server records the sort in the shape and no hint."""
+    server recorded the sort in the shape and no hint."""
     ours, theirs = own_servers
     command = SON([("find", "c"), ("filter", {}), ("sort", {"$natural": -1})])
     assert _keys(ours, command) == _keys(theirs, command)

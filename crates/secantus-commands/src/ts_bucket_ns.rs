@@ -3,7 +3,8 @@
 //! The bucket namespace is a real collection (`ts_store`); most commands
 //! read and write it as any other. The ones handled here are those whose
 //! answer involves the time-series collection: its indexes, which are kept
-//! on the collection and listed here in bucket form, dropping the buckets
+//! on the collection, copied over the buckets when a plain key
+//! (`ts_store::sync_bucket_indexes`), and listed here in bucket form, dropping the buckets
 //! (which drops the collection), and writing a bucket by hand, which the
 //! bucket catalog has to hear about. Shapes were read from `mongod` 8.2.11.
 

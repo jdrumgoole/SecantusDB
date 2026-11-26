@@ -392,6 +392,11 @@ impl BucketScan {
         Ok(Some(self))
     }
 
+    /// The bucket-level filter the scan applies.
+    pub(crate) fn bucket_filter(&self) -> &Document {
+        &self.filter
+    }
+
     /// The bucket-level filter names the meta field, which an index over
     /// the buckets can answer.
     pub(crate) fn filters_meta(&self) -> bool {

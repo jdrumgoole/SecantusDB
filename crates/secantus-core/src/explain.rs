@@ -279,6 +279,31 @@ fn field_clauses(path: &str, value: &Bson) -> Vec<Document> {
     for (op, arg) in spec.iter() {
         match op.as_str() {
             "$ne" => out.push(one(path, wrap("$not", wrap("$eq", arg.clone())))),
+            // `$nin: []` excludes nothing: the `$not` of an `$alwaysFalse`,
+            // which `canonical_match` drops beside another clause.
+            "$nin" if matches!(arg, Bson::Array(a) if a.is_empty()) => out.push(nin_empty()),
+            "$not"
+                if matches!(arg, Bson::Document(d) if d.len() == 1
+                && matches!(d.get("$in"), Some(Bson::Array(a)) if a.is_empty())) =>
+            {
+                out.push(nin_empty())
+            }
+            // A `$not` of several operators is the `$not` of their `$and`,
+            // sorted as any `$and` is, with no path to print it under.
+            "$not"
+                if matches!(arg, Bson::Document(d)
+                if d.keys().filter(|k| *k != "$options").count() > 1) =>
+            {
+                let mut inner = field_clauses(path, arg);
+                inner.sort_by_key(rank);
+                out.push(one(
+                    "$nor",
+                    Bson::Array(vec![Bson::Document(one(
+                        "$and",
+                        Bson::Array(inner.into_iter().map(Bson::Document).collect()),
+                    ))]),
+                ));
+            }
             "$nin" => out.push(one(path, wrap("$not", wrap("$in", arg.clone())))),
             "$in" => match arg {
                 Bson::Array(items) if items.is_empty() => {
@@ -311,7 +336,7 @@ fn field_clauses(path: &str, value: &Bson) -> Vec<Document> {
                 }
             }
             "$elemMatch" => {
-                if is_operator_doc(arg) {
+                if !matches!(arg, Bson::Document(d) if !elem_match_is_value(d)) {
                     // The VALUE form (`{$elemMatch: {$gt: 1}}`) applies the
                     // operators to the elements themselves, so it is not a
                     // sub-document query.
@@ -343,6 +368,11 @@ fn field_clauses(path: &str, value: &Bson) -> Vec<Document> {
         }
     }
     out
+}
+
+/// What `{a: {$nin: []}}` parses to: the `$not` of an `$alwaysFalse`.
+fn nin_empty() -> Document {
+    doc! { "$nor": [{ "$alwaysFalse": 1 }] }
 }
 
 /// Re-open an already-canonical document into its clause list.
@@ -480,7 +510,16 @@ pub fn canonical_match(filter: &Bson) -> Document {
     if doc.is_empty() {
         return Document::new();
     }
-    let found = clauses(doc);
+    let mut found = clauses(doc);
+    // A `$nin: []` matches everything, so it goes beside another clause,
+    // and two of them alone are the empty query (measured 8.2.11).
+    let trivial = found.iter().filter(|c| **c == nin_empty()).count();
+    if trivial > 0 {
+        found.retain(|c| *c != nin_empty());
+        if found.is_empty() && trivial == 1 {
+            return nin_empty();
+        }
+    }
     if found
         .iter()
         .any(|c| c.len() == 1 && c.contains_key("$alwaysFalse"))

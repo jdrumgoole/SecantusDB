@@ -39,6 +39,10 @@ fn shape_of(request: &Document) -> Option<Shape> {
                 return None;
             }
             shape::absorb(&mut s, &stages);
+            // The aggregate's own hint plans its leading read.
+            if s.hint.is_none() {
+                s.hint = request.get("hint").cloned();
+            }
             Some(s)
         }
         _ => None,

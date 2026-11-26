@@ -649,41 +649,66 @@ fn time_series(
         .iter()
         .filter_map(|spec| spec.get_str("name").ok())
         .collect();
-    // The roots of the fields the collection's own indexes cover (all but
-    // `_id_` and the default one).
-    let own_roots: Vec<String> = listed
+    // The collection's own indexes (all but `_id_` and the default one),
+    // by whether the buckets keep a copy of each the planner reads
+    // (`ts_store::sync_bucket_indexes`, RM-701).
+    let on_buckets: Vec<String> = storage
+        .list_indexes(ask.db, &crate::ts_store::buckets_ns(ask.coll))
+        .map_err(read_error)?
+        .iter()
+        .filter_map(|spec| spec.get_str("name").ok().map(String::from))
+        .collect();
+    let own: Vec<&Document> = listed
         .iter()
         .filter(|spec| {
             spec.get_str("name").is_ok_and(|name| {
                 name != "_id_" && Some(name) != default_index.as_ref().map(|(n, _)| n.as_str())
             })
         })
+        .collect();
+    let copied = |spec: &Document| {
+        crate::ts_store::built_on_buckets(spec)
+            && spec
+                .get_str("name")
+                .is_ok_and(|n| on_buckets.iter().any(|b| b == n))
+    };
+    // The roots of the fields of the indexes the planner cannot read over
+    // the buckets (a partial, collated or expiring one, a geo one).
+    let unread_roots: Vec<String> = own
+        .iter()
+        .filter(|spec| !copied(spec))
         .flat_map(|spec| {
             spec.get_document("key")
                 .map(|k| k.keys().map(|f| root(f).to_string()).collect::<Vec<_>>())
                 .unwrap_or_default()
         })
         .collect();
-    // A dropped default index leaves its copy over the buckets: unused.
+    let planned_own = own.iter().any(|spec| copied(spec));
+    // A dropped default index leaves nothing over the buckets.
     let default_index = default_index.filter(|(d, _)| names.contains(&d.as_str()));
-    // An index of its own leaves a filter it cannot serve read through the
-    // cursor stage, the buckets in order (measured 8.2.11: 2,303 after the
-    // delete with `{v: 1}` beside an unindexed filter, RM-701). A filter it
-    // might serve is mongod's scan of that index over the buckets, which
-    // this server does not keep: read whole.
-    if !own_roots.is_empty() {
+    // An index of its own: a filter it cannot serve reads the buckets in
+    // order through the cursor stage (measured 8.2.11: 2,303 after the
+    // delete with `{v: 1}` beside an unindexed filter, and beside
+    // `{v: {$gte: 0}}`, which is a collection scan to its planner, RM-701).
+    // A filter that names the field of an index this server does not read
+    // over the buckets, or a filter whose fields are not plain paths, is
+    // read whole.
+    if !own.is_empty() {
         let filter = crate::explain::pipeline_canonical(ask.coll, ask.pipeline).filter;
         let mut paths = Vec::new();
         if !filter_paths(&filter, &mut paths)
-            || paths.iter().any(|p| own_roots.iter().any(|r| r == root(p)))
+            || paths
+                .iter()
+                .any(|p| unread_roots.iter().any(|r| r == root(p)))
         {
             return Ok(None);
         }
     }
-    // A hint to the default index, by name or by key, is mongod's scan of
-    // it over the buckets (measured 8.2.11: 1,279 after the delete, as the
-    // meta filter of RM-457, RM-701). Any other hint reads at the command.
-    // `{$natural: 1}` reads the buckets in order, as no hint does (2,303).
+    // A hint to an index over the buckets, by name or by key, is mongod's
+    // scan of it (measured 8.2.11: 1,279 after the delete for the default
+    // one, as the meta filter of RM-457). Any other hint reads at the
+    // command. `{$natural: 1}` reads the buckets in order, as no hint does
+    // (2,303).
     let natural = |h: &Bson| {
         h.as_document().is_some_and(|d| {
             d.len() == 1
@@ -697,12 +722,25 @@ fn time_series(
                     .is_some_and(|n| n == 1.0)
         })
     };
+    // The index a hint names, among those the buckets keep.
+    let hinted_index = |hint: &Bson| -> Option<String> {
+        if let Some((name, key)) = &default_index {
+            if hints_index(hint, name, key) {
+                return Some(name.clone());
+            }
+        }
+        own.iter().filter(|spec| copied(spec)).find_map(|spec| {
+            let name = spec.get_str("name").ok()?;
+            let key = spec.get_document("key").ok()?;
+            hints_index(hint, name, key).then(|| name.to_string())
+        })
+    };
     let hinted = match ask.hint {
-        None => false,
-        Some(hint) if natural(hint) => false,
-        Some(hint) => match &default_index {
-            Some((name, key)) if hints_index(hint, name, key) => true,
-            _ => return Ok(None),
+        None => None,
+        Some(hint) if natural(hint) => None,
+        Some(hint) => match hinted_index(hint) {
+            Some(name) => Some(name),
+            None => return Ok(None),
         },
     };
     let default_index = default_index.map(|(name, _)| name);
@@ -712,7 +750,8 @@ fn time_series(
     // each batch matched under it. A string bound would prune buckets on
     // `control.min` / `control.max`, which compare without the collation,
     // and an index over the buckets carries the simple one: read whole.
-    if ask.collation.is_some() && (hinted || has_string(&Bson::Document(filter.clone()))) {
+    if ask.collation.is_some() && (hinted.is_some() || has_string(&Bson::Document(filter.clone())))
+    {
         return Ok(None);
     }
     let Some(scan) = crate::ts_buckets::BucketScan::of(storage, ask.db, ask.coll, ask.ns, &filter)?
@@ -724,16 +763,47 @@ fn time_series(
     if ask.collation.is_some() && scan.filters_meta() {
         return Ok(None);
     }
-    let scan = if hinted || scan.filters_meta() {
-        match default_index {
-            Some(name) => match scan.through_index(storage, &name).map_err(read_error)? {
+    let through = |name: &str, scan: crate::ts_buckets::BucketScan| {
+        scan.through_index(storage, name).map_err(read_error)
+    };
+    let scan = if planned_own {
+        // With indexes of its own the buckets' access is mongod's planner's:
+        // the index it takes, or a scan of the buckets (RM-701).
+        let mut readable: Vec<String> = own
+            .iter()
+            .filter(|spec| copied(spec))
+            .filter_map(|spec| spec.get_str("name").ok().map(String::from))
+            .collect();
+        readable.extend(default_index.clone());
+        let access = crate::explain::bucket_access(
+            storage,
+            ask.db,
+            &crate::ts_store::buckets_ns(ask.coll),
+            scan.bucket_filter(),
+            &readable,
+            hinted.as_deref(),
+            ask.collation,
+        )?;
+        match access {
+            crate::explain::BucketAccess::Scan => scan,
+            crate::explain::BucketAccess::Index(name) => match through(&name, scan)? {
                 Some(scan) => scan,
                 None => return Ok(None),
             },
-            None => return Ok(None),
+            crate::explain::BucketAccess::Unsure => return Ok(None),
         }
     } else {
-        scan
+        // A filter on the meta field is the default index's scan, when the
+        // collection still has it; with it dropped, mongod reads the
+        // buckets in order (measured 8.2.11: 2,303 after the delete).
+        let by_meta = scan.filters_meta().then_some(default_index).flatten();
+        match hinted.or(by_meta) {
+            Some(name) => match through(&name, scan)? {
+                Some(scan) => scan,
+                None => return Ok(None),
+            },
+            None => scan,
+        }
     };
     let mut cursor = AggStream::new(
         Feed::Buckets(Box::new(scan)),
