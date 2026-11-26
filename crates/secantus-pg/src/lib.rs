@@ -93,6 +93,7 @@ mod largeobjects;
 mod live;
 mod live_notices;
 mod lock_manager;
+mod logical_launcher;
 mod merge;
 mod nested_join;
 mod objaddr;
@@ -31798,7 +31799,10 @@ impl Drop for PgHandler {
         self.ssi_end(false);
         xids::end(&self.storage, pid);
         heap::forget_backend(pid);
-        if pid != 0 {
+        // The logical replication launcher's session is no client's: its
+        // counts stay pending until it exits, at a clean shutdown
+        // (RP-1096), and it reports no session's end.
+        if pid != 0 && pid != logical_launcher::LAUNCHER_PID {
             self.stat_end_session(in_block);
             backend_registry()
                 .lock()

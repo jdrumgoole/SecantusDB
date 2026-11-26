@@ -3104,7 +3104,7 @@ def test_a_catalog_scan_is_estimated(rust_pg: Any) -> None:
 # Not compared: `pg_subscription`, whose heap scans are the logical
 # replication launcher's of the run before the restart (two at its start
 # and one per reload, flushed as it exits: 7 in this recording, 2 after a
-# run with no reload). This server has no launcher (RP-1096).
+# run with no reload). The launcher's own test (RP-1096, below) checks them.
 FIRST_BACKEND: dict[str, list[int]] = {
     "pg_am": [2, 2, 0],
     "pg_amproc": [2, 7, 0],
@@ -3191,10 +3191,92 @@ def test_the_first_backend_after_a_start(tmp_path: Any) -> None:
 LAUNCHER_SCANS = [3, 0, 0]
 
 
-@pytest.mark.backlog("RP-1096")
+@pytest.mark.backlog_fixed("RP-1096")
 def test_the_logical_replication_launcher_scans_pg_subscription(tmp_path: Any) -> None:
+    """Fixed: a logical replication launcher scans pg_subscription at its
+    start, twice, and once per reload, and its counts reach the shared ones
+    as it exits, at a clean shutdown."""
     got = _restart_delta(tmp_path, _select_one, setup=("select pg_reload_conf()",))
     assert got.get(LAUNCHER_ONLY) == LAUNCHER_SCANS
+
+
+# A server with `max_logical_replication_workers = 0` registers no launcher
+# (`ApplyLauncherRegister`), so a restart moves nothing. PostgreSQL 15.20,
+# private cluster (2026-11-26): 6 before and after a run with a reload.
+@pytest.mark.backlog_fixed("RP-1096")
+def test_no_launcher_runs_without_logical_replication_workers(tmp_path: Any) -> None:
+    """Fixed: with no logical replication workers there is no launcher."""
+    got = _restart_delta(
+        tmp_path,
+        _select_one,
+        setup=(
+            "alter system set max_logical_replication_workers = 0",
+            "select pg_reload_conf()",
+        ),
+    )
+    # The first run's launcher started before the setting: its scans are
+    # the delta's. A second restart, with the setting in force, adds none.
+    assert got.get(LAUNCHER_ONLY) == [3, 0, 0]
+    again = _restart_delta(tmp_path, _select_one, setup=("select pg_reload_conf()",))
+    assert again.get(LAUNCHER_ONLY) is None
+
+
+# Found while working RP-1096: a fresh PostgreSQL 15.20 cluster's first run
+# reads `pg_stat_get_numscans('pg_subscription'::regclass)` as 2 before any
+# launcher has exited -- `initdb`'s scans, kept in the statistics file it
+# leaves -- with or without a launcher (`max_logical_replication_workers =
+# 0`), private clusters, 2026-11-26. No client backend reads pg_subscription,
+# so it is the one catalog whose count shows `initdb`'s alone.
+@pytest.mark.backlog("RP-1142")
+def test_a_fresh_stores_statistics_hold_initdbs_scans(tmp_path: Any) -> None:
+    from tests.test_rust_pgserver_slice import _Server
+
+    with _Server(tmp_path) as server, _connect(_dsn(server), "fresh") as conn:
+        got = conn.execute(
+            "select pg_stat_get_numscans('pg_subscription'::regclass::oid)"
+        ).fetchone()
+    assert got == (2,)
+
+
+# Found while working RP-1096: PostgreSQL 15.20 (port 5415, 2026-11-26)
+# takes a regclass where a `pg_stat_get_*` function's oid argument goes, an
+# implicit binary-coercible cast: `pg_stat_get_numscans('pg_class'::regclass)`
+# is pg_class's count, the same as with `::regclass::oid`.
+@pytest.mark.backlog("RP-1143")
+def test_a_stat_function_takes_a_regclass(rust_pg: Any) -> None:
+    with rust_pg.connect() as conn:
+        got = conn.execute(
+            "select pg_stat_get_numscans('pg_class'::regclass) is not null, "
+            "pg_stat_get_numscans('pg_class'::regclass) "
+            "= pg_stat_get_numscans('pg_class'::regclass::oid), "
+            "pg_stat_get_tuples_returned('pg_class'::regclass) is not null"
+        ).fetchone()
+    assert got == (True, True, True)
+
+
+# Found while working RP-1096: PostgreSQL 15.20 (port 5415, `autovacuum =
+# on`, 2026-11-26) lists five background processes in pg_stat_activity, each
+# with no database, and only the launcher, a background worker, with a user
+# (the bootstrap superuser); `pg_stat_get_db_numbackends(0)` counts the five
+# (the view's row for datid 0 says 0 whatever it counts).
+BACKGROUND_PROCESSES = [
+    ("autovacuum launcher", None, None, "AutoVacuumMain"),
+    ("background writer", None, None, "BgWriterHibernate"),
+    ("checkpointer", None, None, "CheckpointerMain"),
+    ("logical replication launcher", None, "postgres", "LogicalLauncherMain"),
+    ("walwriter", None, None, "WalWriterMain"),
+]
+
+
+@pytest.mark.backlog("RP-1141")
+def test_pg_stat_activity_lists_the_background_processes(rust_pg: Any) -> None:
+    with rust_pg.connect() as conn:
+        rows = conn.execute(
+            "select backend_type::text, datname::text, usename::text, wait_event::text "
+            "from pg_stat_activity where backend_type <> 'client backend' order by 1"
+        ).fetchall()
+        numbackends = conn.execute("select pg_stat_get_db_numbackends(0)").fetchone()
+    assert ([tuple(r) for r in rows], numbackends) == (BACKGROUND_PROCESSES, (5,))
 
 
 # A committed invalidation of a relation an init file holds removes the file

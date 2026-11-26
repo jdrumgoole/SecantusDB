@@ -1689,19 +1689,52 @@ a regression test.
       are 15.19's page for page, which is what this slice was measured on.
       Backlog-ID: RP-291
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_views_and_a_functions_rows_are_read_from_the_heap, tests/backlog/test_rp_catalog_reads.py::test_a_dead_rows_space_takes_new_rows
-- [ ] **No logical replication launcher scans `pg_subscription`.**
-      PostgreSQL 15.19's launcher (`ApplyLauncherMain`) heap-scans
-      `pg_subscription` as it starts, again at once, then whenever its
-      latch is set (a reload, a subscription's commit) or 180 s pass, and
-      flushes those counts only as it exits: across a restart,
-      `pg_stat_get_numscans('pg_subscription'::regclass)` moves by the run
-      before's scans (2 after a run with no reload, 3 with one, 5 with
-      three; PostgreSQL 15.20, private cluster). Here it does not move.
-      The faithful fix keeps the launcher's pending scans per server run
-      and folds them in at a clean shutdown (found while working RP-292,
-      whose restart comparison leaves `pg_subscription` out for this).
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_the_logical_replication_launcher_scans_pg_subscription
-      Backlog-ID: RP-1096
+- [ ] **A `pg_stat_get_*` function given a regclass answers NULL.**
+      `pg_stat_get_numscans('pg_class'::regclass)` (and
+      `pg_stat_get_tuples_returned`, the same shape) is NULL here, where
+      PostgreSQL 15.20 casts the regclass to the oid argument (binary
+      coercible, implicit) and answers pg_class's count; with
+      `'pg_class'::regclass::oid` or a bare integer both agree. The
+      argument helper in `pgstat_sql.rs` already resolves a regclass
+      value, so the NULL comes from before it: how the call reaches it
+      with a regclass argument is the part to find (found while working
+      RP-1096).
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_stat_function_takes_a_regclass
+      Backlog-ID: RP-1143
+- [ ] **A fresh store's statistics hold none of `initdb`'s counts.**
+      `initdb` leaves a statistics file, so a fresh PostgreSQL 15.20
+      cluster's first run already reads counts no session of its made:
+      `pg_stat_get_numscans('pg_subscription'::regclass)` is 2, with or
+      without a logical replication launcher (whose own scans are pending
+      until it exits, RP-1096), and no restart without a launcher moves it
+      (private clusters, 2026-11-26). Here a fresh store starts from
+      nothing: 0. pg_subscription is the clean measure, read by no client
+      backend; the busy catalogs (`pg_class`, `pg_database`, `pg_authid`)
+      read higher on PostgreSQL in a first session too, but a reading
+      holds that session's own scans, so `initdb`'s share of them is
+      still to be measured. The faithful fix seeds a new store's shared counts with
+      the statistics file `initdb` writes, as the catalogs' rows are
+      seeded with its heaps (found while working RP-1096).
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_fresh_stores_statistics_hold_initdbs_scans
+      Backlog-ID: RP-1142
+- [ ] **`pg_stat_activity` lists no background process.** PostgreSQL
+      15.20 (`autovacuum = on`) lists five, each with no database: the
+      autovacuum launcher, background writer, checkpointer, walwriter and
+      the logical replication launcher (a background worker, so the only
+      one with a user, the bootstrap superuser), waiting on
+      `AutoVacuumMain`, `BgWriterHibernate`, `CheckpointerMain`,
+      `WalWriterMain` and `LogicalLauncherMain`; and
+      `pg_stat_get_db_numbackends(0)` counts the five (the
+      `pg_stat_database` row for datid 0 hard-codes 0). Here the view has
+      no such row, and since RP-1096 `pg_stat_get_db_numbackends(0)` counts
+      only the logical replication launcher, whose statistics entry is a
+      backend's: 1. The faithful fix gives each process this server runs
+      as a thread (the autovacuum launcher, the checkpointer, the logical
+      replication launcher) its `PgBackendStatus` row, and models the two
+      it has no thread for, or refuses the gap by name; found while working
+      RP-1096.
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_pg_stat_activity_lists_the_background_processes
+      Backlog-ID: RP-1141
 - [ ] **An invalidation never removes the relation cache init files.**
       Since RP-292 the first backend after a start builds the init files
       and later ones read them; but PostgreSQL 15.19 also removes a file

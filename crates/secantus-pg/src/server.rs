@@ -252,6 +252,9 @@ pub struct RunningPgServer {
     storage: Option<Arc<Storage>>,
     /// The autovacuum launcher, joined before the store closes.
     autovacuum: Option<std::thread::JoinHandle<()>>,
+    /// The logical replication launcher, stopped before the statistics
+    /// are written: its scans reach them as it exits (RP-1096).
+    logical_launcher: Option<crate::logical_launcher::Launcher>,
     /// Set by `stop` once the store is known to be closed (its last reference
     /// dropped, so the close-checkpoint ran).
     store_closed: bool,
@@ -314,6 +317,9 @@ impl RunningPgServer {
         // table its worker is on is done.
         if let Some(launcher) = self.autovacuum.take() {
             let _ = launcher.join();
+        }
+        if let Some(launcher) = self.logical_launcher.take() {
+            launcher.stop();
         }
         // Tell the accept loop and every live connection to finish. Ignore a
         // send error: it only means every receiver is already gone.
@@ -623,6 +629,7 @@ pub fn bind_with(
             Some(config) => Some(crate::tls::LiveTls::new(config)?),
             None => None,
         },
+        launcher: Arc::default(),
     });
     let trust_unknown_users = options.trust_unknown_users;
     // Statements are planned and run on each connection's own thread (see
@@ -714,6 +721,12 @@ pub fn bind_with(
         ))
     };
 
+    let logical_launcher = crate::logical_launcher::launch(
+        &storage,
+        databases_for_autovacuum.clone(),
+        live.launcher.clone(),
+        stop_flag.clone(),
+    );
     let autovacuum =
         crate::autovacuum::launch(&storage, databases_for_autovacuum, stop_flag.clone());
     Ok(RunningPgServer {
@@ -721,6 +734,7 @@ pub fn bind_with(
         runtime: Some(runtime),
         accept: Some(accept),
         autovacuum,
+        logical_launcher,
         stop_flag,
         shutdown,
         active,

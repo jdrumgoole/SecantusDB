@@ -13,6 +13,9 @@ use crate::tls::LiveTls;
 pub(crate) struct Live {
     pub tls: Option<LiveTls>,
     pub hba: Option<LiveHba>,
+    /// The logical replication launcher's latch: a reload is the
+    /// postmaster's SIGHUP, which every child gets (RP-1096).
+    pub launcher: Arc<crate::logical_launcher::Latch>,
 }
 
 impl Live {
@@ -20,6 +23,9 @@ impl Live {
     /// `pg_hba.conf` that cannot be read does not stop new TLS files from
     /// being taken up, and the reverse. The error is the first met.
     fn reload(&self) -> io::Result<()> {
+        // The launcher's SIGHUP sets its latch whether or not the files
+        // read well.
+        self.launcher.set();
         let hba = self.hba.as_ref().map_or(Ok(()), LiveHba::reload);
         let tls = self.tls.as_ref().map_or(Ok(()), LiveTls::reload);
         hba.and(tls)
