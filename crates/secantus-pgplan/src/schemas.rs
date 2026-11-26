@@ -177,13 +177,13 @@ pub(crate) fn set_temp_outside_keys(has: bool) {
 /// table's name, built for each catalog version, made the first statement
 /// after any DDL grow with the schema (RP-1073), where PostgreSQL's
 /// `get_relname_relid` reads one `pg_class` row through its name index.
-/// When the server says the definitions are in the order of their names
-/// (`by_name`), a name is found by a binary search; otherwise the set of
-/// the tables' names is built at the first lookup.
+/// When the server shares the version's sorted index of the tables' names
+/// (`sorted`), a name is found by a binary search over it; otherwise the
+/// set of the tables' names is built at the first lookup.
 #[derive(Default)]
 struct RelationKeys {
     tables: std::sync::Arc<Vec<std::sync::Arc<TableDef>>>,
-    by_name: bool,
+    sorted: Option<std::sync::Arc<Vec<String>>>,
     views: Vec<String>,
     noted: std::collections::HashSet<String>,
     names: std::cell::OnceCell<std::collections::HashSet<String>>,
@@ -194,14 +194,12 @@ impl RelationKeys {
     fn contains(&self, key: &str) -> bool {
         self.noted.contains(key)
             || self.views.iter().any(|v| v == key)
-            || if self.by_name {
-                self.tables
-                    .binary_search_by(|t| t.name.as_str().cmp(key))
-                    .is_ok()
-            } else {
-                self.names
+            || match &self.sorted {
+                Some(sorted) => sorted.binary_search_by(|n| n.as_str().cmp(key)).is_ok(),
+                None => self
+                    .names
                     .get_or_init(|| self.tables.iter().map(|t| t.name.clone()).collect())
-                    .contains(key)
+                    .contains(key),
             }
     }
 
@@ -209,32 +207,32 @@ impl RelationKeys {
     fn any_with_prefix(&self, prefix: &str) -> bool {
         self.noted.iter().any(|n| n.starts_with(prefix))
             || self.views.iter().any(|v| v.starts_with(prefix))
-            || if self.by_name {
+            || match &self.sorted {
                 // The names under the prefix are one run, from the first
                 // name not below it.
-                let at = self.tables.partition_point(|t| t.name.as_str() < prefix);
-                self.tables
-                    .get(at)
-                    .is_some_and(|t| t.name.starts_with(prefix))
-            } else {
-                self.tables.iter().any(|t| t.name.starts_with(prefix))
+                Some(sorted) => {
+                    let at = sorted.partition_point(|n| n.as_str() < prefix);
+                    sorted.get(at).is_some_and(|n| n.starts_with(prefix))
+                }
+                None => self.tables.iter().any(|t| t.name.starts_with(prefix)),
             }
     }
 }
 
 /// Install every table's and view's catalog key for the statements that
 /// follow: `tables` is the catalog version's shared list of definitions,
-/// `by_name` whether it is in the order of their names.
+/// `sorted` the version's sorted list of their names when the server
+/// keeps one.
 pub fn set_relation_keys(
     tables: std::sync::Arc<Vec<std::sync::Arc<TableDef>>>,
-    by_name: bool,
+    sorted: Option<std::sync::Arc<Vec<String>>>,
     views: Vec<String>,
 ) {
     bump_resolve_epoch();
     RELATION_KEYS.with(|k| {
         *k.borrow_mut() = RelationKeys {
             tables,
-            by_name,
+            sorted,
             views,
             ..RelationKeys::default()
         }
@@ -1806,17 +1804,19 @@ mod relation_keys_tests {
         )
     }
 
-    /// Found by a binary search over definitions in the order of their
-    /// names, and by the built set over any others, alike (RP-1073).
+    /// Found by a binary search over the sorted index of the names, and
+    /// by the built set without one, alike, whatever the definitions'
+    /// order (RP-1073).
     #[test]
-    fn sorted_and_unsorted_definitions_answer_alike() {
+    fn indexed_and_unindexed_definitions_answer_alike() {
         let sorted = ["a", "pg_temp_3.t", "pg_temp_3.u", "s1.x", "z"];
         let mut unsorted = sorted;
         unsorted.reverse();
-        for (names, by_name) in [(&sorted, true), (&unsorted, false)] {
+        let index = std::sync::Arc::new(sorted.iter().map(|n| n.to_string()).collect::<Vec<_>>());
+        for (names, by_name) in [(&unsorted, true), (&unsorted, false), (&sorted, false)] {
             let keys = RelationKeys {
                 tables: defs(names),
-                by_name,
+                sorted: by_name.then(|| std::sync::Arc::clone(&index)),
                 views: vec!["v".into()],
                 ..RelationKeys::default()
             };

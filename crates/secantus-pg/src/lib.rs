@@ -285,7 +285,9 @@ type ColumnTypes = Vec<(String, String)>;
 /// (RP-911).
 struct RelationSources {
     docs: Option<CatalogDocs>,
-    defs: TableDefs,
+    /// The temporary tables' names (`SpecialTables::temp`), not every
+    /// definition (RP-1073).
+    temps: std::collections::HashSet<String>,
     indexes: Vec<IndexRelation>,
     views: Vec<(String, i64)>,
     sequences: Vec<(String, i64)>,
@@ -304,7 +306,7 @@ impl RelationSources {
     }
 
     fn is_temp(&self, table: &str) -> bool {
-        self.defs.iter().any(|d| d.temp && d.name == table)
+        self.temps.contains(table)
     }
 
     /// Every relation, `(stored name, oid, temp)`: the standalone and
@@ -313,12 +315,7 @@ impl RelationSources {
         let Some(docs) = &self.docs else {
             return Vec::new();
         };
-        let temps: std::collections::HashSet<&str> = self
-            .defs
-            .iter()
-            .filter(|d| d.temp)
-            .map(|d| d.name.as_str())
-            .collect();
+        let temps = &self.temps;
         // A standalone composite (`CREATE TYPE t AS (...)`) is a relation
         // too, relkind `c`, under its own oid (`typrelid`).
         docs.iter()
@@ -344,7 +341,6 @@ impl RelationSources {
     /// asked, that temp-ness), without listing the others.
     fn find(&self, name: &str, temp: Option<bool>) -> Option<i64> {
         let docs = self.docs.as_ref()?;
-        // Asked lazily: whether a table is temp walks every definition.
         let wanted = |is_temp: &dyn Fn() -> bool| temp.is_none_or(|want| want == is_temp());
         fn id(d: &Document) -> Option<&str> {
             d.get_str("_id").ok()
@@ -1023,6 +1019,98 @@ type CommentsDerivation = Box<dyn FnOnce() -> Vec<(i64, i32, String)>>;
 /// them (RP-911).
 type TableDefs = Arc<Vec<Arc<TableDef>>>;
 
+/// A committed catalog version's index of its table definitions, which
+/// stay in the catalog's own order (its RecordIds, the order a table was
+/// created or last rewritten in) as PostgreSQL's sequential scan of
+/// `pg_class` returns its rows in the heap's order: every `_id`, sorted,
+/// with the place of its definition, as PostgreSQL finds a relation by
+/// name through `pg_class`'s name index (RP-1073). Kept with the version
+/// and patched from the documents a commit changed, never rebuilt by a
+/// walk over every table.
+#[derive(Clone, Default)]
+struct TableIds {
+    /// Every definition's `_id`, sorted.
+    sorted: Arc<Vec<String>>,
+    /// The place in the definitions of the `_id` at the same place in
+    /// `sorted`.
+    at: Vec<u32>,
+    /// Each definition's RecordId, in the definitions' order (ascending).
+    rids: Vec<i64>,
+    /// Whether every definition's name is its `_id`, as this server writes
+    /// them: then `sorted` holds the tables' names.
+    by_name: bool,
+}
+
+impl TableIds {
+    /// The index of definitions `defs`, stored as `raw` at RecordIds
+    /// `rids`, in the catalog's order. `None` when an `_id` is no string
+    /// or the RecordIds do not ascend (a commit landed between the reads),
+    /// which a patch would need.
+    fn of(defs: &[Arc<TableDef>], raw: &[Arc<[u8]>], rids: Vec<i64>) -> Option<Self> {
+        if rids.len() != defs.len() || rids.windows(2).any(|w| w[0] >= w[1]) {
+            return None;
+        }
+        let ids: Vec<String> = raw
+            .iter()
+            .map(|b| raw_string_id(b))
+            .collect::<Option<_>>()?;
+        let by_name = defs.iter().zip(&ids).all(|(d, id)| d.name == *id);
+        let mut order: Vec<u32> = (0..ids.len() as u32).collect();
+        order.sort_by(|a, b| ids[*a as usize].cmp(&ids[*b as usize]));
+        if order
+            .windows(2)
+            .any(|w| ids[w[0] as usize] == ids[w[1] as usize])
+        {
+            return None;
+        }
+        let sorted = order.iter().map(|i| ids[*i as usize].clone()).collect();
+        Some(Self {
+            sorted: Arc::new(sorted),
+            at: order,
+            rids,
+            by_name,
+        })
+    }
+
+    /// The place in the definitions of the one stored under `id`.
+    fn position(&self, id: &str) -> Option<usize> {
+        let i = self.sorted.binary_search_by(|s| s.as_str().cmp(id)).ok()?;
+        Some(self.at[i] as usize)
+    }
+
+    /// Take the entry at `id` out, returning its place.
+    fn remove(&mut self, id: &str) -> Option<usize> {
+        let i = self.sorted.binary_search_by(|s| s.as_str().cmp(id)).ok()?;
+        let p = self.at[i] as usize;
+        Arc::make_mut(&mut self.sorted).remove(i);
+        self.at.remove(i);
+        self.rids.remove(p);
+        for a in &mut self.at {
+            if *a as usize > p {
+                *a -= 1;
+            }
+        }
+        Some(p)
+    }
+
+    /// Enter `id`, stored at RecordId `rid`, returning the place its
+    /// definition takes: after every lower RecordId. `None` when `id` is
+    /// already held.
+    fn insert(&mut self, id: String, rid: i64) -> Option<usize> {
+        let i = self.sorted.binary_search(&id).err()?;
+        let p = self.rids.partition_point(|r| *r < rid);
+        for a in &mut self.at {
+            if *a as usize >= p {
+                *a += 1;
+            }
+        }
+        self.rids.insert(p, rid);
+        Arc::make_mut(&mut self.sorted).insert(i, id);
+        self.at.insert(i, p as u32);
+        Some(p)
+    }
+}
+
 /// The few definitions of a catalog version that the planner's tables
 /// list on their own, each list in the definitions' order: kept with the
 /// committed definitions and patched from the ones a commit changed, so a
@@ -1033,6 +1121,8 @@ type TableDefs = Arc<Vec<Arc<TableDef>>>;
 struct SpecialTables {
     /// Partitions (`partition::parent_of`).
     partitions: Vec<Arc<TableDef>>,
+    /// Partitioned tables (`partition::is_partitioned`).
+    partitioned: Vec<Arc<TableDef>>,
     /// Tables that inherit from another (`INHERITS`).
     inheriting: Vec<Arc<TableDef>>,
     /// Temporary tables.
@@ -1045,6 +1135,9 @@ impl SpecialTables {
     fn note(&mut self, t: &Arc<TableDef>) {
         if partition::parent_of(t).is_some() {
             self.partitions.push(Arc::clone(t));
+        }
+        if partition::is_partitioned(t) {
+            self.partitioned.push(Arc::clone(t));
         }
         if PgHandler::inherits_any(t) {
             self.inheriting.push(Arc::clone(t));
@@ -1067,9 +1160,10 @@ impl SpecialTables {
     }
 
     /// `self` with the definitions named by `changed` taken from `defs`,
-    /// which are in the order of their names: a changed name's old entries
-    /// leave every list and its new definition, if any, enters them.
-    fn patched(&self, defs: &[Arc<TableDef>], changed: &[String]) -> Self {
+    /// whose names `ids` finds: a changed name's old entries leave every
+    /// list and its new definition, if any, enters them, each list kept in
+    /// the definitions' order.
+    fn patched(&self, defs: &[Arc<TableDef>], ids: &TableIds, changed: &[String]) -> Self {
         let keep = |list: &[Arc<TableDef>]| -> Vec<Arc<TableDef>> {
             list.iter()
                 .filter(|t| !changed.contains(&t.name))
@@ -1078,22 +1172,24 @@ impl SpecialTables {
         };
         let mut out = Self {
             partitions: keep(&self.partitions),
+            partitioned: keep(&self.partitioned),
             inheriting: keep(&self.inheriting),
             temp: keep(&self.temp),
             collating: keep(&self.collating),
         };
         for id in changed {
-            if let Ok(i) = defs.binary_search_by(|t| t.name.as_str().cmp(id)) {
+            if let Some(i) = ids.position(id) {
                 out.note(&defs[i]);
             }
         }
         for list in [
             &mut out.partitions,
+            &mut out.partitioned,
             &mut out.inheriting,
             &mut out.temp,
             &mut out.collating,
         ] {
-            list.sort_by(|a, b| a.name.cmp(&b.name));
+            list.sort_by_key(|t| ids.position(&t.name));
         }
         out
     }
@@ -6664,8 +6760,12 @@ impl PgHandler {
                 name,
             )
         };
+        // The partitioned tables and the partitions alone, not every
+        // table (RP-1073).
+        let special = self.special_tables(&table_defs);
         secantus_pgplan::set_partkey_defs(
-            table_defs
+            special
+                .partitioned
                 .iter()
                 .filter_map(|t| {
                     let key = partition::partkey_text(t)?;
@@ -6674,7 +6774,8 @@ impl PgHandler {
                 .collect(),
         );
         secantus_pgplan::set_partition_parents(
-            table_defs
+            special
+                .partitions
                 .iter()
                 .filter_map(|t| {
                     let parent = partition::parent_of(t)?;
@@ -6955,12 +7056,15 @@ impl PgHandler {
                 )),
             }
         }
-        // The shared definitions themselves, not a set of every name
-        // copied out of them (RP-1073).
-        let by_name = self.table_defs_by_name(&table_defs);
+        // The shared definitions themselves and the version's sorted
+        // index of their names, not a set of every name copied out of them
+        // (RP-1073).
+        let names = self
+            .table_names_index(&table_defs)
+            .map(|ids| Arc::clone(&ids.sorted));
         secantus_pgplan::schemas::set_relation_keys(
             table_defs,
-            by_name,
+            names,
             self.views()
                 .unwrap_or_default()
                 .into_iter()
@@ -13413,6 +13517,9 @@ impl PgHandler {
         struct Index {
             docs: CatalogDocs,
             by: By,
+            /// The catalog key log's position `docs` are current to, when
+            /// they are a committed read (`type_catalog_bases`).
+            serial: Option<u64>,
         }
         type Key = (usize, String, usize);
         static INDEXES: OnceLock<Mutex<HashMap<Key, Index>>> = OnceLock::new();
@@ -13448,8 +13555,48 @@ impl PgHandler {
         let index = indexes.entry(key).or_insert_with(|| Index {
             docs: Arc::new(Vec::new()),
             by: HashMap::new(),
+            serial: None,
         });
-        if !Arc::ptr_eq(&index.docs, comps) {
+        // The position `comps` are current to, when they are the committed
+        // read the type catalog last recorded.
+        let serial = catalog_patch_base(
+            type_catalog_bases(),
+            &(
+                Arc::as_ptr(&self.storage) as usize,
+                self.db().to_string(),
+                Self::COMPOSITE_COLLECTION,
+            ),
+        )
+        .filter(|(_, docs)| Arc::ptr_eq(docs, comps))
+        .map(|(serial, _)| serial);
+        // Both committed reads: only the documents the catalog key log says
+        // a commit changed since the index's are looked at, by `_id`, rather
+        // than a walk over every composite (RP-1073). The log may run past
+        // `comps`; an id changed later is set to what `comps` holds for it,
+        // which is still `comps`' index.
+        let changed = match (index.serial, serial) {
+            (Some(since), Some(_)) if !Arc::ptr_eq(&index.docs, comps) => {
+                self.changed_catalog_ids(since, Self::COMPOSITE_COLLECTION)
+            }
+            _ => None,
+        };
+        if let Some((_, changed)) = changed {
+            let run = |docs: &CatalogDocs, want: &str| {
+                let at = docs.partition_point(|d| id(d) < want);
+                let len = docs[at..].iter().take_while(|d| id(d) == want).count();
+                at..at + len
+            };
+            let old = Arc::clone(&index.docs);
+            for want in &changed {
+                for d in &old[run(&old, want)] {
+                    remove(&mut index.by, d);
+                }
+                for d in &comps[run(comps, want)] {
+                    add(&mut index.by, d);
+                }
+            }
+            index.docs = Arc::clone(comps);
+        } else if !Arc::ptr_eq(&index.docs, comps) {
             // Both lists are `_id`-sorted: a merge walk pairs the shared
             // documents and visits only the ones added, removed or changed.
             let (old, new) = (&index.docs, comps);
@@ -13490,6 +13637,7 @@ impl PgHandler {
             }
             index.docs = Arc::clone(comps);
         }
+        index.serial = serial;
         index.by.get(&oid).cloned().unwrap_or_default()
     }
 
@@ -13595,6 +13743,12 @@ impl PgHandler {
     ) {
         let docs = self.type_catalog_docs(Self::COMPOSITE_COLLECTION).ok();
         let defs = self.shared_table_defs().unwrap_or_default();
+        let temps: std::collections::HashSet<String> = self
+            .special_tables(&defs)
+            .temp
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
         let indexes = self.index_relations();
         let views: Vec<(String, i64)> = self
             .views()
@@ -13625,11 +13779,11 @@ impl PgHandler {
                     .iter()
                     .map(id)
                     .take_while(|n| n.starts_with(&temp_prefix))
-                    .any(|n| !defs.iter().any(|t| t.name == n))
+                    .any(|n| !temps.contains(&n))
             });
         let sources = Rc::new(RelationSources {
             docs,
-            defs,
+            temps,
             indexes,
             views,
             sequences,
@@ -52648,29 +52802,26 @@ impl PgHandler {
     /// (on a session of its own) and shared; `None` while this session's
     /// transaction has catalog changes of its own (`catalog_untouched`).
     fn committed_table_defs(&self) -> Option<TableDefs> {
-        self.committed_table_defs_sorted().map(|(defs, _, _)| defs)
+        self.committed_table_defs_indexed().map(|(defs, _, _)| defs)
     }
 
-    /// [`Self::committed_table_defs`], and whether the definitions are in
-    /// the order of their names: each one's `_id` is its name, as this
-    /// server writes them, and the `_id`s are sorted. Then a name is found
-    /// by a binary search rather than a walk over every table (RP-1073),
-    /// and the flag is carried from version to version through the
-    /// definitions a commit changed.
-    /// Also the version's [`SpecialTables`].
-    fn committed_table_defs_sorted(&self) -> Option<(TableDefs, bool, Arc<SpecialTables>)> {
-        /// One catalog version's definitions, each one's stored bytes and
-        /// string `_id` (`None` when the ids are not all strings in sorted
-        /// order, which a patch relies on), the catalog key log's position
-        /// the read is current to, and whether every definition's name is
-        /// its `_id`.
+    /// [`Self::committed_table_defs`], with the version's index of them
+    /// ([`TableIds`]; `None` when a read could not build one) and its
+    /// [`SpecialTables`]. The definitions are in the catalog's own order,
+    /// the order a full read returns them in, whether this version was
+    /// read in full or patched from the one before.
+    fn committed_table_defs_indexed(
+        &self,
+    ) -> Option<(TableDefs, Option<Arc<TableIds>>, Arc<SpecialTables>)> {
+        /// One catalog version's definitions, each one's stored bytes, the
+        /// index of their `_id`s, and the catalog key log's position the
+        /// read is current to.
         struct Entry {
             version: u64,
             serial: u64,
             defs: TableDefs,
-            raw: Arc<Vec<Vec<u8>>>,
-            ids: Option<Arc<Vec<String>>>,
-            by_name: bool,
+            raw: Arc<Vec<Arc<[u8]>>>,
+            ids: Option<Arc<TableIds>>,
             special: Arc<SpecialTables>,
         }
         type Cache = Mutex<HashMap<(usize, String), Entry>>;
@@ -52686,18 +52837,17 @@ impl PgHandler {
             .version
             .load(std::sync::atomic::Ordering::SeqCst);
         let serial = self.storage.catalog_doc_serial();
-        let (old_raw, old_defs, old_ids, old_serial, old_by_name, old_special) = {
+        let (old_raw, old_defs, old_ids, old_serial, old_special) = {
             let c = cache.lock().unwrap_or_else(|e| e.into_inner());
             match c.get(&key) {
                 Some(e) if e.version == version => {
-                    return Some((Arc::clone(&e.defs), e.by_name, Arc::clone(&e.special)))
+                    return Some((Arc::clone(&e.defs), e.ids.clone(), Arc::clone(&e.special)))
                 }
                 Some(e) => (
                     Arc::clone(&e.raw),
                     Arc::clone(&e.defs),
                     e.ids.clone(),
                     Some(e.serial),
-                    e.by_name,
                     Some(Arc::clone(&e.special)),
                 ),
                 None => Default::default(),
@@ -52706,28 +52856,24 @@ impl PgHandler {
         // Only the definitions the catalog key log says a commit changed are
         // read again, as PostgreSQL rebuilds only the relcache entries an
         // invalidation names (RP-911).
-        let patched = match (old_ids, old_serial) {
+        let patched = match (&old_ids, old_serial) {
             (Some(ids), Some(since)) => self
                 .changed_catalog_ids(since, CATALOG_COLLECTION)
                 .and_then(|(now, changed)| {
-                    self.patch_table_defs(&old_raw, &old_defs, &ids, &changed)
+                    self.patch_table_defs(&old_raw, &old_defs, ids, &changed)
                         .map(|p| (now, p, changed))
                 }),
             _ => None,
         };
-        let (serial, defs, kept, ids, by_name, special) = match patched {
+        let (serial, defs, kept, ids, special) = match patched {
             Some((now, (defs, raw, ids), changed)) => {
-                // Only the changed definitions can have broken the order.
-                let by_name = old_by_name
-                    && changed.iter().all(|id| match ids.binary_search(id) {
-                        Ok(i) => defs[i].name == *id,
-                        Err(_) => true,
-                    });
-                let special = match old_special.filter(|_| by_name) {
-                    Some(old) => old.patched(&defs, &changed),
-                    None => SpecialTables::of(&defs),
+                let special = match (old_special, &old_ids) {
+                    (Some(old), Some(old_ids)) if old_ids.by_name && ids.by_name => {
+                        old.patched(&defs, &ids, &changed)
+                    }
+                    _ => SpecialTables::of(&defs),
                 };
-                (now, defs, raw, Some(ids), by_name, special)
+                (now, defs, raw, Some(ids), special)
             }
             None => {
                 let raw = self
@@ -52738,20 +52884,16 @@ impl PgHandler {
                     })
                     .ok()?;
                 let (defs, kept) = Self::decode_table_defs(raw, &old_raw, &old_defs);
-                let ids: Option<Vec<String>> = kept
-                    .iter()
-                    .map(|b| raw_string_id(b))
-                    .collect::<Option<Vec<String>>>()
-                    .filter(|ids| ids.windows(2).all(|w| w[0] < w[1]));
-                let by_name = ids
-                    .as_ref()
-                    .is_some_and(|ids| defs.iter().zip(ids).all(|(d, id)| d.name == *id));
+                let ids = self
+                    .catalog_record_ids(&kept)
+                    .and_then(|rids| TableIds::of(&defs, &kept, rids));
                 let special = SpecialTables::of(&defs);
-                (serial, defs, kept, ids, by_name, special)
+                (serial, defs, kept, ids, special)
             }
         };
         let special = Arc::new(special);
         let defs = Arc::new(defs);
+        let ids = ids.map(Arc::new);
         cache.lock().unwrap_or_else(|e| e.into_inner()).insert(
             key,
             Entry {
@@ -52759,25 +52901,51 @@ impl PgHandler {
                 serial,
                 defs: Arc::clone(&defs),
                 raw: Arc::new(kept),
-                ids: ids.map(Arc::new),
-                by_name,
+                ids: ids.clone(),
                 special: Arc::clone(&special),
             },
         );
-        Some((defs, by_name, special))
+        Some((defs, ids, special))
     }
 
-    /// Are `defs` the committed definitions, in the order of their names
-    /// (see [`Self::committed_table_defs_sorted`])?
-    fn table_defs_by_name(&self, defs: &TableDefs) -> bool {
-        self.committed_table_defs_sorted()
-            .is_some_and(|(committed, by_name, _)| by_name && Arc::ptr_eq(&committed, defs))
+    /// The RecordId of each of the table catalog's documents `raw`, read
+    /// as committed; `None` when one cannot be read.
+    fn catalog_record_ids(&self, raw: &[Arc<[u8]>]) -> Option<Vec<i64>> {
+        let docs: Vec<&[u8]> = raw.iter().map(|b| &b[..]).collect();
+        self.storage
+            .outside_user_transaction(|| {
+                self.storage
+                    .record_ids_of(self.db(), CATALOG_COLLECTION, &docs)
+            })
+            .ok()?
+            .into_iter()
+            .map(|r| r?.as_long())
+            .collect()
+    }
+
+    /// The index of `defs` when they are the committed definitions and
+    /// each one's name is its `_id`: a name is then found by a binary
+    /// search over it rather than by a walk over every table (RP-1073).
+    fn table_names_index(&self, defs: &TableDefs) -> Option<Arc<TableIds>> {
+        let (committed, ids, _) = self.committed_table_defs_indexed()?;
+        ids.filter(|ids| ids.by_name && Arc::ptr_eq(&committed, defs))
+    }
+
+    /// The definition in `defs` named `name`: found through the version's
+    /// index of names when `defs` are the committed ones, as PostgreSQL
+    /// reads one `pg_class` row through its name index, else by a walk
+    /// (RP-1073).
+    fn table_def_named<'a>(&self, defs: &'a TableDefs, name: &str) -> Option<&'a Arc<TableDef>> {
+        match self.table_names_index(defs) {
+            Some(index) => index.position(name).map(|i| &defs[i]),
+            None => defs.iter().find(|d| d.name == name),
+        }
     }
 
     /// `defs`' [`SpecialTables`]: the committed version's, kept with it,
     /// else found by walking them.
     fn special_tables(&self, defs: &TableDefs) -> Arc<SpecialTables> {
-        match self.committed_table_defs_sorted() {
+        match self.committed_table_defs_indexed() {
             Some((committed, _, special)) if Arc::ptr_eq(&committed, defs) => special,
             _ => Arc::new(SpecialTables::of(defs)),
         }
@@ -52787,29 +52955,29 @@ impl PgHandler {
     /// are those the previous version decoded: only what a statement
     /// changed is decoded anew, as PostgreSQL rebuilds only the relcache
     /// entries an invalidation names (RP-715). Both reads come in the
-    /// catalog's key order, so the previous version's entry for a document
-    /// is at the cursor, or just past an entry the statement dropped or
-    /// changed.
+    /// catalog's RecordId order, and a document a statement rewrote moves
+    /// to the end, so the previous version's entry for a document is at
+    /// the cursor, or just past an entry the statement dropped or changed.
     fn decode_table_defs(
         raw: Vec<Vec<u8>>,
-        old_raw: &[Vec<u8>],
+        old_raw: &[Arc<[u8]>],
         old_defs: &[Arc<TableDef>],
-    ) -> (Vec<Arc<TableDef>>, Vec<Vec<u8>>) {
+    ) -> (Vec<Arc<TableDef>>, Vec<Arc<[u8]>>) {
         let mut cursor = 0;
         let mut defs = Vec::with_capacity(raw.len());
         let mut kept = Vec::with_capacity(raw.len());
         for b in raw {
-            let same = (cursor..old_raw.len().min(cursor + 3)).find(|&i| old_raw[i] == b);
-            let def = match same {
+            let same = (cursor..old_raw.len().min(cursor + 3)).find(|&i| old_raw[i][..] == b[..]);
+            let (def, b) = match same {
                 Some(i) => {
                     cursor = i + 1;
-                    Arc::clone(&old_defs[i])
+                    (Arc::clone(&old_defs[i]), Arc::clone(&old_raw[i]))
                 }
                 None => match decode_doc(&b)
                     .ok()
                     .and_then(|d| TableDef::from_document(&d))
                 {
-                    Some(def) => Arc::new(def),
+                    Some(def) => (Arc::new(def), Arc::from(b)),
                     None => continue,
                 },
             };
@@ -52820,20 +52988,22 @@ impl PgHandler {
     }
 
     /// The previous read's definitions with the documents `changed` names
-    /// read again (inserted, replaced or removed at their `_id`'s place in
-    /// `ids`, the sorted string `_id`s of `raw`), or `None` when one cannot
-    /// be read or decoded (the caller reads everything).
+    /// read again: each one's old entry taken out, and its document, if
+    /// it is still a definition, placed by its RecordId, where a full read
+    /// would find it (a rewritten definition is stored anew, at the end).
+    /// `None` when one cannot be read (the caller reads everything).
     #[allow(clippy::type_complexity)]
     fn patch_table_defs(
         &self,
-        raw: &[Vec<u8>],
+        raw: &[Arc<[u8]>],
         defs: &[Arc<TableDef>],
-        ids: &[String],
+        ids: &TableIds,
         changed: &[String],
-    ) -> Option<(Vec<Arc<TableDef>>, Vec<Vec<u8>>, Vec<String>)> {
+    ) -> Option<(Vec<Arc<TableDef>>, Vec<Arc<[u8]>>, TableIds)> {
         let mut raw = raw.to_vec();
         let mut defs = defs.to_vec();
-        let mut ids = ids.to_vec();
+        let mut ids = ids.clone();
+        let mut fresh = Vec::new();
         for id in changed {
             let b = self
                 .storage
@@ -52845,40 +53015,34 @@ impl PgHandler {
                     )
                 })
                 .ok()?;
-            let at = ids.binary_search(id);
-            match b {
-                Some(b) => {
-                    // A document that is no definition is left out, as the
-                    // full read leaves it out.
-                    let def = decode_doc(&b)
-                        .ok()
-                        .and_then(|d| TableDef::from_document(&d));
-                    match (def, at) {
-                        (Some(def), Ok(i)) => {
-                            defs[i] = Arc::new(def);
-                            raw[i] = b;
-                        }
-                        (Some(def), Err(i)) => {
-                            defs.insert(i, Arc::new(def));
-                            raw.insert(i, b);
-                            ids.insert(i, id.clone());
-                        }
-                        (None, Ok(i)) => {
-                            defs.remove(i);
-                            raw.remove(i);
-                            ids.remove(i);
-                        }
-                        (None, Err(_)) => {}
-                    }
-                }
-                None => {
-                    if let Ok(i) = at {
-                        defs.remove(i);
-                        raw.remove(i);
-                        ids.remove(i);
-                    }
-                }
+            if let Some(p) = ids.remove(id) {
+                defs.remove(p);
+                raw.remove(p);
             }
+            // A document that is no definition is left out, as the full
+            // read leaves it out.
+            let Some(b) = b else { continue };
+            if let Some(def) = decode_doc(&b)
+                .ok()
+                .and_then(|d| TableDef::from_document(&d))
+            {
+                fresh.push((id.clone(), Arc::<[u8]>::from(b), def));
+            }
+        }
+        if fresh.is_empty() {
+            return Some((defs, raw, ids));
+        }
+        let rids = self.catalog_record_ids(
+            &fresh
+                .iter()
+                .map(|(_, b, _)| Arc::clone(b))
+                .collect::<Vec<_>>(),
+        )?;
+        for ((id, b, def), rid) in fresh.into_iter().zip(rids) {
+            ids.by_name &= def.name == id;
+            let p = ids.insert(id, rid)?;
+            defs.insert(p, Arc::new(def));
+            raw.insert(p, b);
         }
         Some((defs, raw, ids))
     }
@@ -60934,10 +61098,18 @@ mod special_tables_tests {
         list.iter().map(|t| t.name.as_str()).collect()
     }
 
+    /// Each definition's stored document: its `_id` is its name.
+    fn raw(defs: &[Arc<TableDef>]) -> Vec<Arc<[u8]>> {
+        defs.iter()
+            .map(|d| Arc::from(encode_doc(&bson::doc! { "_id": d.name.as_str() }).unwrap()))
+            .collect()
+    }
+
     /// The lists patched from the names a commit changed are the ones a
     /// walk over the new definitions finds (RP-1073): a table that became
     /// a partition, one created temporary, one dropped and one replaced
-    /// by a plain table each move only their own entries.
+    /// by a plain table each move only their own entries, and every list
+    /// stays in the definitions' order (their RecordIds), not their names'.
     #[test]
     fn a_patch_lists_what_a_walk_lists() {
         let old = vec![
@@ -60948,15 +61120,17 @@ mod special_tables_tests {
             def("e", true, Document::new()),
         ];
         let before = SpecialTables::of(&old);
+        // `c` and `b` rewritten, so stored anew after `e`; `b2` created.
         let new = vec![
             Arc::clone(&old[0]),
+            Arc::clone(&old[4]),
+            def("c", false, Document::new()),
             def("b", false, bson::doc! { "partition_of": "a" }),
             def("b2", true, Document::new()),
-            def("c", false, Document::new()),
-            Arc::clone(&old[4]),
         ];
+        let ids = TableIds::of(&new, &raw(&new), vec![1, 5, 6, 7, 8]).unwrap();
         let changed: Vec<String> = ["b", "b2", "c", "d"].map(String::from).to_vec();
-        let patched = before.patched(&new, &changed);
+        let patched = before.patched(&new, &ids, &changed);
         let walked = SpecialTables::of(&new);
         assert_eq!(names(&patched.partitions), names(&walked.partitions));
         assert_eq!(names(&patched.inheriting), names(&walked.inheriting));
@@ -60964,7 +61138,50 @@ mod special_tables_tests {
         assert_eq!(names(&patched.collating), names(&walked.collating));
         assert_eq!(names(&patched.partitions), ["b"]);
         assert!(patched.inheriting.is_empty());
-        assert_eq!(names(&patched.temp), ["b2", "e"]);
+        assert_eq!(names(&patched.temp), ["e", "b2"]);
+    }
+
+    fn fields(ids: &TableIds) -> (Vec<String>, Vec<u32>, Vec<i64>, bool) {
+        (
+            ids.sorted.as_ref().clone(),
+            ids.at.clone(),
+            ids.rids.clone(),
+            ids.by_name,
+        )
+    }
+
+    /// An index patched by removing and entering the documents a commit
+    /// changed is the one a full read builds (RP-1073): a drop shifts the
+    /// places after it, a rewrite moves to its new RecordId, and a new
+    /// table takes its place among the RecordIds whatever its name.
+    #[test]
+    fn a_patched_index_is_the_one_a_full_read_builds() {
+        let old: Vec<_> = ["zz", "aa", "mm", "t10", "t2"]
+            .iter()
+            .map(|n| def(n, false, Document::new()))
+            .collect();
+        let mut ids = TableIds::of(&old, &raw(&old), vec![1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(ids.position("t10"), Some(3));
+        assert_eq!(ids.position("t1"), None);
+        // DROP mm, ALTER aa (stored anew at 7), CREATE bb at 6 and yy at 8.
+        assert_eq!(ids.remove("mm"), Some(2));
+        assert_eq!(ids.remove("aa"), Some(1));
+        assert_eq!(ids.insert("bb".into(), 6), Some(3));
+        assert_eq!(ids.insert("aa".into(), 7), Some(4));
+        assert_eq!(ids.insert("yy".into(), 8), Some(5));
+        assert_eq!(ids.insert("yy".into(), 9), None);
+        let new: Vec<_> = ["zz", "t10", "t2", "bb", "aa", "yy"]
+            .iter()
+            .map(|n| def(n, false, Document::new()))
+            .collect();
+        let full = TableIds::of(&new, &raw(&new), vec![1, 4, 5, 6, 7, 8]).unwrap();
+        assert_eq!(fields(&ids), fields(&full));
+        for (i, d) in new.iter().enumerate() {
+            assert_eq!(ids.position(&d.name), Some(i));
+        }
+        // RecordIds that do not ascend (a commit between the reads) build
+        // no index.
+        assert!(TableIds::of(&new, &raw(&new), vec![1, 4, 5, 7, 6, 8]).is_none());
     }
 }
 

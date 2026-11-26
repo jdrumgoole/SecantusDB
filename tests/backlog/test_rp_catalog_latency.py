@@ -306,7 +306,7 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_800_tables_within_a
     )
 
 
-@pytest.mark.backlog("RP-1073")
+@pytest.mark.backlog_fixed("RP-1073")
 def test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_a_tenth(
     pg_pair: tuple[Any, Any],
 ) -> None:
@@ -328,9 +328,18 @@ def test_the_first_catalog_query_after_ddl_costs_the_same_at_3200_tables_within_
     committed version and patched from what a commit changed, as
     PostgreSQL rebuilds only the cache entries an invalidation names. Then
     13.1 ms against 14.3 ms (1.10, 2026-11-25), at the bound; CI's
-    runner measured 1.22 and 1.14 on two snapshots in a row, then passed,
-    so RP-1073 stays open for the growth that is left with `Verify: none`:
-    at this bound the pair does not decide on CI (RP-1100).
+    runner measured 1.22 and 1.14 on two snapshots in a row, then passed.
+    Most of what was left came from mongod's storage model: a full read
+    of the table catalog returns its documents in RecordId order, so on
+    any schema whose names were not created in sorted order the version
+    had no sorted `_id`s, the patch of the definitions a commit changed
+    (RP-911) and the binary search by name never ran, and each version
+    re-read every definition and built a set of every name. The version
+    now keeps a sorted index of the names beside the definitions, patched
+    from what a commit changed, and the partitioned, partition and temp
+    tables, `cr_relation_in`'s table and the composite index by oid are
+    found through it or patched the same way. Then 14.1 ms against
+    14.4 ms (a ratio median of 1.02, rounds 1.01 to 1.04, 2026-11-26).
 
     The same bound as at 800 tables, a tenth again plus 1 ms, with four
     times as many tables."""

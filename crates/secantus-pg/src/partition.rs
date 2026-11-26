@@ -298,7 +298,10 @@ impl PgHandler {
         let comps = self.type_catalog_docs(Self::COMPOSITE_COLLECTION);
         let views = self.type_catalog_docs(Self::VIEW_COLLECTION);
         match (defs, comps, views) {
-            (Ok(defs), Ok(comps), Ok(views)) if !defs.iter().any(|d| is_partitioned(d)) => {
+            // The partitioned tables alone, not every table (RP-1073).
+            (Ok(defs), Ok(comps), Ok(views))
+                if self.special_tables(&defs).partitioned.is_empty() =>
+            {
                 secantus_pgplan::partitions::defer_tableoids(move || {
                     let oids = Self::relation_oids_of(comps, views);
                     defs.iter()

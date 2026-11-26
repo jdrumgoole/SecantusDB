@@ -1215,17 +1215,14 @@ impl PgHandler {
         for oid in relids.iter().filter(|o| **o != 0) {
             names.extend(self.relation_names_of_oid(*oid)?.0);
         }
-        // The definitions `names` holds, in `defs`' order: found by name
-        // when `defs` are in the order of their names, as PostgreSQL reads
-        // each relation's `pg_class` row by oid, rather than by a walk over
-        // every table (RP-1073).
-        let by_name = self.table_defs_by_name(defs);
+        // The definitions `names` holds, in `defs`' order: found through
+        // the version's index of their names, as PostgreSQL reads each
+        // relation's `pg_class` row by oid, rather than by a walk over every
+        // table (RP-1073).
+        let index = self.table_names_index(defs);
         let named = |names: &[String]| -> Vec<&'a Arc<TableDef>> {
-            if by_name {
-                let mut at: Vec<usize> = names
-                    .iter()
-                    .filter_map(|n| defs.binary_search_by(|t| t.name.as_str().cmp(n)).ok())
-                    .collect();
+            if let Some(index) = &index {
+                let mut at: Vec<usize> = names.iter().filter_map(|n| index.position(n)).collect();
                 at.sort_unstable();
                 at.dedup();
                 at.into_iter().map(|i| &defs[i]).collect()
