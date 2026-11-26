@@ -68,12 +68,11 @@ def test_sbe_framework_pushes_an_aggregate_and_a_distinct(
 
 FINDS = [
     ({"find": "a", "filter": {"x": 1}}, True),
-    ({"find": "a", "filter": {"x": {"$gt": 1}}, "sort": {"y": 1}}, False),
 ]
 
 
 @pytest.mark.backlog("RM-543")
-@pytest.mark.parametrize("cmd,index", FINDS, ids=["index", "sort"])
+@pytest.mark.parametrize("cmd,index", FINDS, ids=["index"])
 def test_sbe_find_shapes_are_explained_as_sbe(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -140,6 +139,31 @@ def test_sbe_find_in_and_projection_are_mongods(
     """An `$in` and a simple projection under `queryFramework: "sbe"` were
     explained in the classic shape; they now print and run as mongod's
     slot programs (`isMember` over an `InList`, `makeBsonObj`, `newBsonObj`)."""
+    assert _built(rust_mongo, cmd) == _built(mongod_rs, cmd)
+
+
+SORTED_FINDS = [
+    _find(filter={"x": {"$gt": 1}}, sort={"y": 1}),
+    _find(filter={"x": {"$gt": 1}}, sort={"y": -1}),
+    _find(filter={"x": {"$gt": 1}}, sort={"x": 1}),
+    _find(filter={}, sort={"y": 1}),
+    _find(filter={"x": {"$gt": 1}}, sort={"y": 1}, limit=2),
+    _find(filter={"x": {"$in": [1, 3]}}, sort={"y": -1}, limit=1),
+]
+
+
+@pytest.mark.backlog_fixed("RM-543")
+@pytest.mark.parametrize(
+    "cmd", SORTED_FINDS, ids=lambda c: str({k: v for k, v in c.items() if k != "find"})
+)
+def test_sbe_sorted_find_is_mongods(
+    rust_mongo: Any,
+    mongod_rs: Any,  # noqa: F811
+    cmd: dict,
+) -> None:
+    """A `find` sorted on one top-level field under `queryFramework: "sbe"`
+    was explained in the classic shape; it now prints and runs as mongod's
+    `sort` over a `project` of `getSortKeyAsc` / `getSortKeyDesc`."""
     assert _built(rust_mongo, cmd) == _built(mongod_rs, cmd)
 
 

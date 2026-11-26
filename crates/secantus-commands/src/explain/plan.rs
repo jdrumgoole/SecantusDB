@@ -11,7 +11,7 @@
 
 use super::bounds::{intersect, leaf_bounds, union, Ctx, Interval, Tight};
 use super::exec::Env;
-use super::node::{IndexInfo, IxScan, Node, Stats};
+use super::node::{IndexInfo, IxScan, Node, RidRange, Stats};
 use bson::{doc, Bson, Document};
 use secantus_core::collation::Collation;
 use std::borrow::Cow;
@@ -386,8 +386,15 @@ pub(crate) fn signature(node: &Node) -> String {
             | Node::Count(input)
             | Node::Update(input)
             | Node::Delete { input, .. } => return walk(input, out),
-            Node::CollScan { backward, .. } => {
-                out.push_str(if *backward { "COLLSCAN<" } else { "COLLSCAN>" });
+            Node::CollScan {
+                backward, range, ..
+            } => {
+                out.push_str(match (range.is_some(), *backward) {
+                    (false, true) => "COLLSCAN<",
+                    (false, false) => "COLLSCAN>",
+                    (true, true) => "CLUSTERED_IXSCAN<",
+                    (true, false) => "CLUSTERED_IXSCAN>",
+                });
                 vec![]
             }
             Node::IxScan(ix) => {
@@ -1055,6 +1062,7 @@ fn wildcard_entry(index: &Arc<IndexInfo>, path: &str) -> Arc<IndexInfo> {
     key.insert("$_path", 1);
     key.insert(path, dir);
     Arc::new(IndexInfo {
+        clustered: None,
         name: index.name.clone(),
         key,
         unique: false,
@@ -1293,6 +1301,8 @@ fn candidate_uses(
 /// try against the others (RM-701): more than one is a trial this planner
 /// has no documents to run.
 pub(crate) fn index_candidates(q: &Query, catalog: &[Arc<IndexInfo>]) -> usize {
+    let (_, catalog) = split_cluster(catalog);
+    let catalog: &[Arc<IndexInfo>] = &catalog;
     let parts = clauses(q.canonical);
     let leaves = leaves_of(&parts);
     candidate_uses(&leaves, &parts, q, catalog).len()
@@ -1456,7 +1466,14 @@ fn or_access(
         };
         let tried_alone = plain.trial.and_then(|trial| {
             let kept = trial.ranked.replace(Vec::new());
-            let found = tried(&parts, &alone, &usable, trial, assemble(parts.clone()));
+            let found = tried(
+                &parts,
+                &alone,
+                &usable,
+                None,
+                trial,
+                assemble(parts.clone()),
+            );
             *trial.ranked.borrow_mut() = kept;
             found
         });
@@ -1600,7 +1617,7 @@ fn merge_branches(inputs: &[Node], sort: &Document, q: &Query) -> Option<Node> {
     })
 }
 
-fn access(q: &Query, catalog: &[Arc<IndexInfo>]) -> Access {
+fn access(q: &Query, catalog: &[Arc<IndexInfo>], cluster: Option<&Arc<IndexInfo>>) -> Access {
     let always = q.canonical.len() == 1 && q.canonical.contains_key("$alwaysTrue");
     // Through `assemble`, which leaves out the twins `$expr` derives.
     let whole = || {
@@ -1612,6 +1629,7 @@ fn access(q: &Query, catalog: &[Arc<IndexInfo>]) -> Access {
         scan: Node::CollScan {
             filter: whole(),
             backward,
+            range: None,
         },
         fetch_filter: None,
         indexed: false,
@@ -1619,8 +1637,22 @@ fn access(q: &Query, catalog: &[Arc<IndexInfo>]) -> Access {
         sorted: false,
         subplan,
     };
+    // A clustered collection's scan, bounded by the `_id`s the query names
+    // and in the direction its sort asks (or the hint's).
+    let clustered = |backward: Option<bool>| {
+        cluster.map(|c| {
+            clustered_scan(&clauses(q.canonical), q, c, backward)
+                .unwrap_or_else(|| collscan(false, backward.unwrap_or(false)))
+        })
+    };
     if let Hint::Natural(backward) = q.hint {
-        return collscan(false, backward);
+        return clustered(Some(backward)).map_or_else(|| collscan(false, backward), unsorted);
+    }
+    // A hint of the clustered key is the same scan.
+    if let (Hint::Index(name), Some(c)) = (&q.hint, cluster) {
+        if *name == c.name {
+            return clustered(None).unwrap_or_else(|| collscan(false, false));
+        }
     }
     let parts = clauses(q.canonical);
     // A `$near` is the geo index's ring search (RM-578).
@@ -1650,8 +1682,18 @@ fn access(q: &Query, catalog: &[Arc<IndexInfo>]) -> Access {
     }
     // Several plans could answer it: mongod tries them against each other.
     if let Some(trial) = q.trial {
-        if let Some(found) = tried(&parts, q, catalog, trial, whole()) {
+        if let Some(found) = tried(&parts, q, catalog, cluster, trial, whole()) {
             return found;
+        }
+    }
+    // With no collection to try them on, the scan between the `_id`s the
+    // query names is taken over an index (a clustered collection's own
+    // order costs no more than a key's).
+    if q.hint == Hint::None && !only_or {
+        if let Some(c) = cluster {
+            if let Some(found) = clustered_scan(&parts, q, c, None).filter(bounded) {
+                return found;
+            }
         }
     }
     if let Some(found) = index_access(&parts, q, catalog) {
@@ -1686,6 +1728,11 @@ fn access(q: &Query, catalog: &[Arc<IndexInfo>]) -> Access {
     // No predicate has an index: one that returns the sort order still helps.
     if let Some(found) = sort_provider(q, catalog, whole(), only_or) {
         return found;
+    }
+    if !only_or {
+        if let Some(found) = clustered(None) {
+            return found;
+        }
     }
     collscan(only_or, false)
 }
@@ -2154,6 +2201,33 @@ fn candidates(
     parts: &[Document],
     q: &Query,
     catalog: &[Arc<IndexInfo>],
+    cluster: Option<&Arc<IndexInfo>>,
+    filter: Option<Document>,
+) -> Vec<(Access, Option<Preference>)> {
+    let mut out = index_plans(parts, q, catalog, filter);
+    // A clustered collection's scan is one more plan to try where it is
+    // bounded by an `_id` the query names, or where it returns the sort
+    // (`collscanIsBounded`; measured 8.2.11, 2026-11-26).
+    if let Some(c) = cluster.filter(|_| {
+        q.hint == Hint::None
+            && !q.min_max
+            && !q.keys_only
+            && q.wanted.is_none()
+            && !parts.iter().any(|p| p.contains_key("$or"))
+    }) {
+        if let Some(scan) = clustered_scan(parts, q, c, None) {
+            if bounded(&scan) || (scan.sorted && !out.is_empty()) {
+                out.push((scan, None));
+            }
+        }
+    }
+    out
+}
+
+fn index_plans(
+    parts: &[Document],
+    q: &Query,
+    catalog: &[Arc<IndexInfo>],
     filter: Option<Document>,
 ) -> Vec<(Access, Option<Preference>)> {
     if q.min_max || q.keys_only || q.wanted.is_some() {
@@ -2395,11 +2469,13 @@ fn candidates(
 /// (a scan, or an OR of scans of a contained `$or`): no index
 /// intersection, and no rooted `$or`, whose branches are each tried apart.
 pub(crate) fn single_index_candidates(q: &Query, catalog: &[Arc<IndexInfo>]) -> bool {
+    let (cluster, catalog) = split_cluster(catalog);
+    let catalog: &[Arc<IndexInfo>] = &catalog;
     let parts = clauses(q.canonical);
     if matches!(parts.as_slice(), [only] if only.contains_key("$or")) {
         return false;
     }
-    candidates(&parts, q, catalog, None)
+    candidates(&parts, q, catalog, cluster.as_ref(), None)
         .iter()
         .all(|(a, _)| !matches!(a.scan, Node::AndSorted(_)))
 }
@@ -2407,6 +2483,8 @@ pub(crate) fn single_index_candidates(q: &Query, catalog: &[Arc<IndexInfo>]) -> 
 /// Whether mongod has more than one plan to try for the query, and so
 /// which it reads depends on its trial.
 pub(crate) fn contested(q: &Query, catalog: &[Arc<IndexInfo>]) -> bool {
+    let (cluster, catalog) = split_cluster(catalog);
+    let catalog: &[Arc<IndexInfo>] = &catalog;
     let parts = clauses(q.canonical);
     if let [only] = parts.as_slice() {
         // An `$or` is planned branch by branch, each with its own trial
@@ -2422,11 +2500,11 @@ pub(crate) fn contested(q: &Query, catalog: &[Arc<IndexInfo>]) -> bool {
                     hint: Hint::None,
                     ..q.clone()
                 };
-                candidates(&clauses(b), &alone, catalog, None).len() > 1
+                candidates(&clauses(b), &alone, catalog, None, None).len() > 1
             });
         }
     }
-    candidates(&parts, q, catalog, None).len() > 1
+    candidates(&parts, q, catalog, cluster.as_ref(), None).len() > 1
 }
 
 /// The plan mongod keeps for a conjunction after trying its candidates
@@ -2436,10 +2514,11 @@ fn tried(
     parts: &[Document],
     q: &Query,
     catalog: &[Arc<IndexInfo>],
+    cluster: Option<&Arc<IndexInfo>>,
     trial: &Trial,
     filter: Option<Document>,
 ) -> Option<Access> {
-    let mut found = candidates(parts, q, catalog, filter);
+    let mut found = candidates(parts, q, catalog, cluster, filter);
     if found.len() < 2 {
         return None;
     }
@@ -2790,7 +2869,7 @@ fn count_plan(q: &Query, catalog: &[Arc<IndexInfo>]) -> Node {
         keys_only: true,
         ..q.clone()
     };
-    let node = match unfetched(wrap(access(&bare, catalog), &bare)) {
+    let node = match unfetched(wrap(access(&bare, catalog, None), &bare)) {
         Node::IxScan(ix) if ix.filter.is_none() && ix.single_range().is_some() => {
             Node::CountScan(ix)
         }
@@ -2854,7 +2933,7 @@ fn distinct_plan(q: &Query, catalog: &[Arc<IndexInfo>], key: &str, asked: bool) 
     };
     let parts = clauses(q.canonical);
     if parts.is_empty() && asked {
-        return wrap(access(&bare, catalog), &bare);
+        return wrap(access(&bare, catalog, None), &bare);
     }
     if parts.is_empty() {
         let hinted = |ix: &&Arc<IndexInfo>| match &q.hint {
@@ -2869,7 +2948,7 @@ fn distinct_plan(q: &Query, catalog: &[Arc<IndexInfo>], key: &str, asked: bool) 
         });
         return match led {
             Some(ix) => scan_of_key(IxScan::full(ix.clone()), 1),
-            None => wrap(access(&bare, catalog), &bare),
+            None => wrap(access(&bare, catalog, None), &bare),
         };
     }
     let distinct_of = |found: Access| {
@@ -2900,7 +2979,7 @@ fn distinct_plan(q: &Query, catalog: &[Arc<IndexInfo>], key: &str, asked: bool) 
             }
         }
     }
-    distinct_of(access(&bare, catalog))
+    distinct_of(access(&bare, catalog, None))
 }
 
 /// The plan for an update or a delete. `returns`: findAndModify, which hands
@@ -2963,7 +3042,7 @@ fn write_plan(
     let input = if never(q) {
         Node::Eof("predicateEvalsToFalse")
     } else {
-        match wrap(access(&read, catalog), &read) {
+        match wrap(access(&read, catalog, None), &read) {
             // The one document a write sorts for: mongod labels it so.
             Node::Sort {
                 pattern,
@@ -3011,6 +3090,11 @@ fn find_plan(q: &Query, catalog: &[Arc<IndexInfo>]) -> Node {
     if never(q) {
         return Node::Eof("predicateEvalsToFalse");
     }
+    // The `_id` of a clustered collection is the table itself, not an index
+    // of the catalog: it is read as a scan of the collection between two
+    // `_id`s, or one `_id`'s lookup (`EXPRESS_CLUSTERED_IXSCAN`).
+    let (cluster, indexes) = split_cluster(catalog);
+    let catalog: &[Arc<IndexInfo>] = &indexes;
     // An `_id` point lookup under `returnKey` is an IDHACK at any batch
     // size, under a limit or a sort, which it does not run (measured
     // 8.2.11, RM-567: `RETURN_KEY <- IDHACK`, and `RETURN_KEY <-
@@ -3041,6 +3125,18 @@ fn find_plan(q: &Query, catalog: &[Arc<IndexInfo>]) -> Node {
     }
     let simple = q.hint == Hint::None && q.skip == 0 && !q.min_max && !q.return_key;
     if let (true, Some((path, value))) = (simple && !q.show_record_id, point_lookup(q.canonical)) {
+        // A clustered collection's `_id` lookup: not under a batch size or a
+        // collation of its own, which scan the one `_id` instead (measured
+        // 8.2.11, 2026-11-26).
+        if let Some(cluster) = cluster
+            .as_ref()
+            .filter(|c| path == "_id" && !q.batch_size && !collation_differs(c, q.collation))
+        {
+            return Node::Express {
+                index: cluster.clone(),
+                value: value.clone(),
+            };
+        }
         let index = catalog.iter().find(|ix| {
             ix.unique
                 && ix.plain
@@ -3062,7 +3158,216 @@ fn find_plan(q: &Query, catalog: &[Arc<IndexInfo>]) -> Node {
             }
         }
     }
-    wrap(access(q, catalog), q)
+    wrap(access(q, catalog, cluster.as_ref()), q)
+}
+
+/// Whether the access scans a clustered collection between two `_id`s.
+fn bounded(a: &Access) -> bool {
+    matches!(a.scan, Node::CollScan { range: Some(_), .. })
+}
+
+/// The same access, its sort not provided.
+fn unsorted(mut a: Access) -> Access {
+    a.sorted = false;
+    a
+}
+
+/// The `_id` range one clause of a conjunction bounds a clustered
+/// collection's scan to, and whether the clause is decided by it (the scan
+/// then does not recheck it): mongod's `handleRIDRangeScan` reads a
+/// comparison of `_id` to a value as bounds, and an `$in` as the bounds of
+/// its first and last value, rechecked (measured 8.2.11, 2026-11-26).
+fn rid_clause(clause: &Document, collated: bool) -> Option<(RidRange, bool)> {
+    let (path, pred) = clause.iter().next().filter(|_| clause.len() == 1)?;
+    if path != "_id" {
+        return None;
+    }
+    let pred = pred.as_document()?;
+    // A string, or what holds one, is ordered by the query's collation, not
+    // the table's: no range.
+    let stringy = |v: &Bson| {
+        collated
+            && matches!(
+                v,
+                Bson::String(_) | Bson::Document(_) | Bson::Array(_) | Bson::Symbol(_)
+            )
+    };
+    let mut range: Option<RidRange> = None;
+    let mut decided = true;
+    for (op, v) in pred {
+        let op = match op.as_str() {
+            "$_internalExprEq" => "$eq",
+            "$_internalExprGt" => "$gt",
+            "$_internalExprGte" => "$gte",
+            "$_internalExprLt" => "$lt",
+            "$_internalExprLte" => "$lte",
+            other => other,
+        };
+        let one = match (op, v) {
+            (_, Bson::RegularExpression(_)) => return None,
+            ("$eq", v) if !stringy(v) => RidRange {
+                min: v.clone(),
+                min_incl: true,
+                max: v.clone(),
+                max_incl: true,
+            },
+            ("$gt" | "$gte" | "$lt" | "$lte", Bson::Null) => RidRange {
+                min: Bson::Null,
+                min_incl: true,
+                max: Bson::Null,
+                max_incl: true,
+            },
+            ("$gt" | "$gte" | "$lt" | "$lte", v) if !matches!(v, Bson::Array(_)) && !stringy(v) => {
+                let one = doc! { op: v.clone() };
+                let (list, _) = leaf_bounds(&one, Ctx::default())?;
+                let (first, last) = (list.first()?, list.last()?);
+                let (lo, hi) = (first.lo.clone(), last.hi.clone());
+                // Numbers start at NaN, below minus infinity.
+                let below = matches!(&lo, Bson::Double(d) if *d == f64::NEG_INFINITY)
+                    && matches!(op, "$lt" | "$lte");
+                RidRange {
+                    min: if below { Bson::Double(f64::NAN) } else { lo },
+                    min_incl: first.lo_incl,
+                    max: hi,
+                    max_incl: last.hi_incl,
+                }
+            }
+            ("$in", Bson::Array(items)) => {
+                if items
+                    .iter()
+                    .any(|i| matches!(i, Bson::RegularExpression(_)) || stringy(i))
+                {
+                    return None;
+                }
+                let mut sorted: Vec<&Bson> = items.iter().collect();
+                sorted.sort_by(|a, b| super::bounds::cmp(a, b));
+                let (first, last) = (sorted.first()?, sorted.last()?);
+                decided = false;
+                RidRange {
+                    min: (*first).clone(),
+                    min_incl: true,
+                    max: (*last).clone(),
+                    max_incl: true,
+                }
+            }
+            _ => return None,
+        };
+        // A comparison under a collation of the query's own is still
+        // rechecked.
+        decided &= !collated;
+        range = Some(match range {
+            None => one,
+            Some(r) => tighten(r, one),
+        });
+    }
+    range.map(|r| (r, decided))
+}
+
+/// The range both ranges hold: the higher start, the lower end, the
+/// exclusive one where they meet.
+fn tighten(a: RidRange, b: RidRange) -> RidRange {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    let (min, min_incl) = match super::bounds::cmp(&a.min, &b.min) {
+        Greater => (a.min, a.min_incl),
+        Less => (b.min, b.min_incl),
+        Equal => (a.min, a.min_incl && b.min_incl),
+    };
+    let (max, max_incl) = match super::bounds::cmp(&a.max, &b.max) {
+        Less => (a.max, a.max_incl),
+        Greater => (b.max, b.max_incl),
+        Equal => (a.max, a.max_incl && b.max_incl),
+    };
+    RidRange {
+        min,
+        min_incl,
+        max,
+        max_incl,
+    }
+}
+
+/// A scan of the clustered collection `cluster` for a conjunction: between
+/// the `_id`s it names, when it names any, with the rest of the conjunction
+/// as its filter (an `$and` of what is left, as mongod prints it when the
+/// bounds took some clause away), in the direction of the sort on `_id` it
+/// returns, or `backward` where that is given. `None`: no `_id` bounds the
+/// scan, and no sort on it asks for it.
+fn clustered_scan(
+    parts: &[Document],
+    q: &Query,
+    cluster: &Arc<IndexInfo>,
+    backward: Option<bool>,
+) -> Option<Access> {
+    let collated = collation_differs(cluster, q.collation);
+    let mut range: Option<RidRange> = None;
+    let mut kept: Vec<Document> = Vec::new();
+    for part in parts {
+        match rid_clause(part, collated) {
+            Some((one, decided)) => {
+                range = Some(match range {
+                    None => one,
+                    Some(r) => tighten(r, one),
+                });
+                if !decided {
+                    kept.push(part.clone());
+                }
+            }
+            None => kept.push(part.clone()),
+        }
+    }
+    // The sort on `_id` the scan returns, in the order it reads.
+    let sort_on_id = sort_of(q).and_then(|s| match s.iter().collect::<Vec<_>>().as_slice() {
+        [(path, dir)] if *path == "_id" => crate::util::as_i64(dir),
+        _ => None,
+    });
+    let backward_by_sort = sort_on_id.map(|d| d < 0);
+    if range.is_none() && sort_on_id.is_none() && backward.is_none() {
+        return None;
+    }
+    let filter = match range {
+        // Nothing bounds it: the whole of the filter, as any scan's.
+        None => assemble(parts.to_vec()),
+        Some(_) => {
+            let kept: Vec<Document> = kept.into_iter().filter(|c| !is_expr_twin(c)).collect();
+            if parts.len() == 1 {
+                kept.into_iter().next()
+            } else if kept.is_empty() {
+                None
+            } else {
+                Some(doc! { "$and": kept.into_iter().map(Bson::Document).collect::<Vec<_>>() })
+            }
+        }
+    };
+    Some(Access {
+        scan: Node::CollScan {
+            filter,
+            backward: backward.or(backward_by_sort).unwrap_or(false),
+            range,
+        },
+        fetch_filter: None,
+        indexed: false,
+        index: None,
+        sorted: sort_on_id.is_some() && backward.is_none(),
+        subplan: false,
+    })
+}
+
+/// The clustered key of a catalog, and the indexes beside it.
+fn split_cluster(
+    catalog: &[Arc<IndexInfo>],
+) -> (
+    Option<Arc<IndexInfo>>,
+    std::borrow::Cow<'_, [Arc<IndexInfo>]>,
+) {
+    let Some(at) = catalog.iter().position(|ix| ix.clustered.is_some()) else {
+        return (None, std::borrow::Cow::Borrowed(catalog));
+    };
+    let rest = catalog
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != at)
+        .map(|(_, ix)| ix.clone())
+        .collect();
+    (Some(catalog[at].clone()), std::borrow::Cow::Owned(rest))
 }
 
 /// Whether mongod's planner runs `projection` below a blocking sort by

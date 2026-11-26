@@ -174,6 +174,16 @@ pub(crate) enum Stage {
         index: String,
         uuid: String,
     },
+    /// `SortStage`: the key slots and each one's direction (`true`:
+    /// descending), the slots it outputs, and a top-k limit's slot and
+    /// amount.
+    Sort {
+        node: u32,
+        keys: Vec<(Slot, bool)>,
+        outputs: Vec<Slot>,
+        limit: Option<(Slot, i64)>,
+        input: Box<Stage>,
+    },
     /// `HashAggStage`.
     Group {
         node: u32,
@@ -244,6 +254,7 @@ impl Stage {
             | Stage::LimitSkip { node, .. }
             | Stage::Project { node, .. }
             | Stage::IxSeek { node, .. }
+            | Stage::Sort { node, .. }
             | Stage::Group { node, .. } => *node,
         }
     }
@@ -418,6 +429,37 @@ impl Stage {
                     },
                 )
             }
+            Stage::Sort {
+                keys, limit, input, ..
+            } => {
+                // A blocking stage: it reads everything under it, then
+                // returns its rows in key order (ties in input order).
+                let (mut rows, below) = input.run(docs, None);
+                rows.sort_by(|a, b| {
+                    for (slot, desc) in keys {
+                        let x = a.get(slot).cloned().flatten();
+                        let y = b.get(slot).cloned().flatten();
+                        let o = compare(&x, &y);
+                        let o = if *desc { o.reverse() } else { o };
+                        if o != Ordering::Equal {
+                            return o;
+                        }
+                    }
+                    Ordering::Equal
+                });
+                let cap = limit.map_or(usize::MAX, |(_, n)| n.max(0) as usize);
+                rows.truncate(cap.min(demand.unwrap_or(usize::MAX)));
+                let n = rows.len() as i64;
+                (
+                    rows,
+                    Counted {
+                        returned: n,
+                        eof: true,
+                        input: Some(Box::new(below)),
+                        ..Counted::default()
+                    },
+                )
+            }
             Stage::Group {
                 keys, aggs, input, ..
             } => {
@@ -488,6 +530,7 @@ impl Stage {
             Stage::LimitSkip { skip: None, .. } => "limit",
             Stage::LimitSkip { .. } => "limitskip",
             Stage::Project { .. } => "project",
+            Stage::Sort { .. } => "sort",
             Stage::Group { .. } => "group",
         }
     }
@@ -498,6 +541,7 @@ impl Stage {
             Stage::Filter { input, .. }
             | Stage::LimitSkip { input, .. }
             | Stage::Project { input, .. }
+            | Stage::Sort { input, .. }
             | Stage::Group { input, .. } => Some(input),
         }
     }

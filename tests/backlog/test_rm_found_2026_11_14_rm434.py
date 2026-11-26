@@ -30,14 +30,15 @@ def _cursor_stages(client: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-692")
+@pytest.mark.backlog_fixed("RM-692")
 def test_a_cursor_the_pipeline_stops_reading_reports_one_batch(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """mongod 8.2.11's `$cursor` under `[$match, $unwind, $limit: 3]` loads
     one batch of 32 documents and stops: its FETCH and IXSCAN report
     `nReturned` 32, 32 works, `saveState` 2 and `isEOF` 0. This server's
-    plan runs to the end (70 documents) and reports no work accounting."""
+    plan ran to the end (70 documents) and reported no work accounting;
+    it now replays the plan to the end of the batches the cursor loaded."""
     want = _cursor_stages(mongod)
     assert want[0] == {"stage": "FETCH", "nReturned": 32, "works": 32, "saveState": 2, "isEOF": 0}
     assert _cursor_stages(rust_mongo) == want

@@ -981,6 +981,9 @@ enum Stage {
     Point {
         filter: Document,
         done: bool,
+        /// The read counts a key: not a clustered collection's, whose
+        /// documents are found by `_id` in the table itself.
+        keyed: bool,
         t: Tally,
     },
     Coll(CollScan),
@@ -1325,7 +1328,12 @@ impl Stage {
     /// One result of the stage's, counted by [`Self::next`].
     fn step(&mut self, cx: &mut Cx) -> Result<Option<Member>, StorageError> {
         match self {
-            Stage::Point { filter, done, t } => {
+            Stage::Point {
+                filter,
+                done,
+                keyed,
+                t,
+            } => {
                 if *done {
                     return Ok(None);
                 }
@@ -1339,9 +1347,9 @@ impl Stage {
                 let Some((rid, blob)) = matched.rows.into_iter().next() else {
                     return Ok(None);
                 };
-                cx.keys += 1;
+                cx.keys += i64::from(*keyed);
                 cx.docs += 1;
-                t.keys += 1;
+                t.keys += i64::from(*keyed);
                 t.docs += 1;
                 Ok(Some(Member {
                     rid,
@@ -1981,14 +1989,18 @@ fn stage_of(
             Some(Stage::Point {
                 filter: doc! { field.clone(): { "$eq": value.clone() } },
                 done: false,
+                keyed: index.clustered.is_none(),
                 t: Tally::default(),
             })
         }
         Node::IdHack(value) => Some(Stage::Point {
             filter: doc! { "_id": { "$eq": value.clone() } },
             done: false,
+            keyed: true,
             t: Tally::default(),
         }),
+        // A scan between two `_id`s is read from the documents.
+        Node::CollScan { range: Some(_), .. } => None,
         Node::CollScan { backward, .. } => Some(Stage::Coll(CollScan::new(
             *backward,
             command.cloned(),
@@ -3426,7 +3438,7 @@ impl WriteRun {
     pub(crate) fn exec_stats(&self, wrote: &Wrote) -> Option<Document> {
         let millis = coarse_ms() - self.started_ms;
         let (writes, extra, input) = match &self.plan {
-            Node::ExpressWrite { delete, .. } => {
+            Node::ExpressWrite { index, delete, .. } => {
                 let mut extra = Document::new();
                 extra.insert(
                     "nWouldModify",
@@ -3436,7 +3448,11 @@ impl WriteRun {
                 extra.insert("nWouldDelete", num(wrote.deleted));
                 let stats = Stats {
                     n_returned: i64::from(wrote.returned),
-                    keys: self.examined,
+                    keys: if index.clustered.is_some() {
+                        0
+                    } else {
+                        self.examined
+                    },
                     docs: self.examined,
                     extra,
                     ..Default::default()

@@ -57,6 +57,9 @@ struct Stage<'a> {
     /// Calls to `work()`, and those that answered NEED_TIME.
     works: i64,
     need_time: i64,
+    /// A scan of a clustered collection between two `_id`s: the rows it
+    /// reads and how many of them are within its range.
+    clustered: Option<(Vec<usize>, usize)>,
 }
 
 impl<'a> Stage<'a> {
@@ -118,6 +121,14 @@ impl<'a> Stage<'a> {
             extra,
             works: 0,
             need_time: 0,
+            clustered: match node {
+                Node::CollScan {
+                    backward,
+                    range: Some(range),
+                    ..
+                } => Some(super::exec::clustered_reads(range, *backward, env)),
+                _ => None,
+            },
         })
     }
 
@@ -216,7 +227,33 @@ impl<'a> Stage<'a> {
                     }
                 }
             }
-            Node::CollScan { filter, backward } => {
+            Node::CollScan {
+                filter,
+                range: Some(_),
+                ..
+            } => {
+                let Some((reads, inside)) = self.clustered.as_ref() else {
+                    return Work::Eof;
+                };
+                if self.pos >= reads.len() {
+                    return Work::Eof;
+                }
+                let row = reads[self.pos];
+                let past = self.pos >= *inside;
+                self.pos += 1;
+                self.docs += 1;
+                if past {
+                    return Work::Eof;
+                }
+                if env.matches(row, filter) {
+                    Work::Advanced(row)
+                } else {
+                    Work::NeedTime
+                }
+            }
+            Node::CollScan {
+                filter, backward, ..
+            } => {
                 if self.pos >= env.docs.len() {
                     return Work::Eof;
                 }
@@ -849,6 +886,15 @@ pub(crate) fn worked_through(plan: &Node, env: &Env) -> Option<Stats> {
     let mut cache = Entries::new();
     let mut stage = Stage::new(plan, env, &mut cache)?;
     while !matches!(stage.work(env), Work::Eof) {}
+    Some(stage.stats())
+}
+
+/// [`worked_through`], stopped once the plan has returned `need`
+/// documents: a `$cursor` whose batches end there asks it for no more.
+pub(crate) fn worked_until(plan: &Node, env: &Env, need: i64) -> Option<Stats> {
+    let mut cache = Entries::new();
+    let mut stage = Stage::new(plan, env, &mut cache)?;
+    while stage.returned < need && !matches!(stage.work(env), Work::Eof) {}
     Some(stage.stats())
 }
 

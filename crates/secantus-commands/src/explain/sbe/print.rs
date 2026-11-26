@@ -39,8 +39,16 @@ impl Out {
         }
     }
 
+    /// A new line; on a line that is still fresh, that line re-indented
+    /// instead, as mongod prints a nested `if` (`else if ...` ends both
+    /// blocks on one line; RM-693).
     fn newline(&mut self) {
-        self.text.push('\n');
+        if self.fresh {
+            let start = self.text.rfind('\n').map_or(0, |i| i + 1);
+            self.text.truncate(start);
+        } else {
+            self.text.push('\n');
+        }
         for _ in 0..self.indent {
             self.text.push_str("    ");
         }
@@ -340,6 +348,30 @@ fn stage(st: &Stage, lines: &mut Vec<String>) {
             lines.push(format!("[{node}] project [{}] ", binds.join(", ")));
             stage(input, lines);
         }
+        Stage::Sort {
+            node,
+            keys,
+            outputs,
+            limit,
+            input,
+        } => {
+            let slots_of: Vec<u32> = keys.iter().map(|(s, _)| *s).collect();
+            let dirs: Vec<&str> = keys
+                .iter()
+                .map(|(_, d)| if *d { "desc" } else { "asc" })
+                .collect();
+            let mut line = format!(
+                "[{node}] sort [{}] [{}] [{}] ",
+                slots(&slots_of),
+                dirs.join(", "),
+                slots(outputs)
+            );
+            if let Some((s, _)) = limit {
+                line.push_str(&format!("s{s} "));
+            }
+            lines.push(line);
+            stage(input, lines);
+        }
         Stage::Group {
             node,
             keys,
@@ -439,6 +471,24 @@ pub(super) fn specific_stats(st: &Stage, counted: &Counted, out: &mut Document) 
                 p.insert(s.to_string(), listed(e));
             }
             out.insert("projections", p);
+        }
+        Stage::Sort { keys, outputs, .. } => {
+            // `SortStats`: the in-memory sort mongod runs under its default
+            // 100 MiB limit, never spilling here.
+            out.insert("memLimit", 104_857_600_i32);
+            out.insert("totalDataSizeSorted", 0_i32);
+            out.insert("usedDisk", false);
+            out.insert("spills", 0_i32);
+            out.insert("spilledDataStorageSize", 0_i32);
+            out.insert("spilledBytes", 0_i32);
+            out.insert("spilledRecords", 0_i32);
+            let mut order = Document::new();
+            for (s, d) in keys {
+                order.insert(s.to_string(), if *d { "desc" } else { "asc" });
+            }
+            out.insert("orderBySlots", order);
+            let outs: Vec<Bson> = outputs.iter().map(|s| Bson::Int64(*s as i64)).collect();
+            out.insert("outputSlots", outs);
         }
         Stage::Group { keys, aggs, .. } => {
             let keys: Vec<Bson> = keys.iter().map(|s| Bson::Int64(*s as i64)).collect();

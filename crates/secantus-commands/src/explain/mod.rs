@@ -222,7 +222,7 @@ fn resolve_hint(hint: Option<&Bson>, catalog: &[Arc<IndexInfo>]) -> Result<Hint,
         None | Some(Bson::Null) => Ok(Hint::None),
         Some(given @ Bson::String(name)) => catalog
             .iter()
-            .find(|ix| &ix.name == name)
+            .find(|ix| ix.clustered.as_ref().unwrap_or(&ix.name) == name)
             .map(|ix| Hint::Index(ix.name.clone()))
             .ok_or_else(|| bad_hint(given)),
         Some(Bson::Document(d)) if d.is_empty() => Ok(Hint::None),
@@ -257,7 +257,9 @@ pub(crate) enum TableScan {
 /// Whether `plan` reads the collection rather than an index.
 fn scans_collection(plan: &Node) -> bool {
     match plan {
-        Node::CollScan { .. } => true,
+        // A scan between two `_id`s of a clustered collection reads no more
+        // than an index scan would (`collscanIsBounded`).
+        Node::CollScan { range, .. } => range.is_none(),
         Node::Fetch { input, .. }
         | Node::Sort { input, .. }
         | Node::Skip(_, input)
@@ -833,7 +835,18 @@ fn catalog(
                 })
             });
         let is_wildcard = wildcard.is_some();
+        // The `_id` index of a clustered collection is the table itself: a
+        // hint names it as the collection was created with.
+        let clustered = (name == "_id_")
+            .then(|| storage.get_collection_options(db, coll).ok())
+            .flatten()
+            .and_then(|options| match options.get("clusteredIndex") {
+                Some(Bson::Document(c)) => Some(c.get_str("name").unwrap_or("_id_").to_string()),
+                Some(_) => Some("_id_".to_string()),
+                None => None,
+            });
         catalog.push(Arc::new(IndexInfo {
+            clustered,
             wildcard,
             unique: name == "_id_" || spec.get_bool("unique").unwrap_or(false),
             sparse: secantus_core::index_keys::spec_flag(spec, "sparse"),
@@ -1250,6 +1263,11 @@ fn front_runs_in_sbe(
     let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
     let hoisted = hoist::hoist_matches(&stages);
     sbe_pushdown(storage, db, &s.coll, &hoisted, s.hint.as_ref(), collation).is_some()
+}
+
+/// The read has a projection that is not empty.
+fn projected_find(s: &Shape) -> bool {
+    s.projection.as_ref().is_some_and(|p| !p.is_empty())
 }
 
 /// A `find` command of a collection, not a view's pipeline.
@@ -1785,18 +1803,25 @@ fn set_aside(st: &mut Stats) {
     }
 }
 
-/// Raise each counter of `run` to what `trial` counted in the same stage.
 /// A `$cursor`'s plan, saved when the cursor is prepared and after each
 /// batch it loads, restored before each (`DocumentSourceCursor::loadBatch`).
-/// The plan here ran to its end; where the stages after the cursor stopped
-/// pulling first, mongod's stopped with them, and the run's work counts are
-/// not its: they are left out (RM-692).
-fn cursor_yields(run: &mut Stats, pulled: Option<i64>) {
-    if pulled.is_some_and(|p| p < run.n_returned) {
-        strip_work(run);
-        return;
+/// Where the stages after the cursor stopped pulling at `pulled`, the
+/// cursor loaded only the batches that reached it, and its plan stopped
+/// there: the run is replayed to that point (RM-692). Where the plan holds
+/// a stage that replay does not step, its work counts are left out.
+fn cursor_yields(run: &mut Stats, pulled: Option<i64>, plan: &Node, env: &exec::Env) {
+    let demand = pulled.filter(|p| *p < run.n_returned);
+    if let Some(p) = demand {
+        let (loaded, _, _) = sbe::batches(run.n_returned, Some(p));
+        match trial::worked_until(plan, env, loaded) {
+            Some(stopped) => *run = stopped,
+            None => {
+                strip_work(run);
+                return;
+            }
+        }
     }
-    let (_, loads, _) = sbe::batches(run.n_returned, None);
+    let (_, loads, _) = sbe::batches(run.n_returned, demand);
     stream::yielded(
         run,
         stream::Yields {
@@ -1813,6 +1838,7 @@ fn strip_work(stats: &mut Stats) {
     }
 }
 
+/// Raise each counter of `run` to what `trial` counted in the same stage.
 fn at_least(run: &mut Stats, trial: &Stats) {
     run.n_returned = run.n_returned.max(trial.n_returned);
     run.keys = run.keys.max(trial.keys);
@@ -2396,6 +2422,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                 plan.without_paging(),
                 Node::CollScan {
                     backward: false,
+                    range: None,
                     ..
                 }
             );
@@ -2463,10 +2490,37 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                 plan.without_paging(),
                 Node::CollScan {
                     backward: false,
+                    range: None,
                     ..
                 }
             );
-            let simple = s.sort.as_ref().is_none_or(Document::is_empty)
+            // A sort on one top-level field over a forward collection scan,
+            // with no skip or projection (RM-543): `sort` over a `project`
+            // of its key.
+            let sorted = s.sort.as_ref().filter(|d| !d.is_empty()).and_then(|d| {
+                match d.iter().collect::<Vec<_>>().as_slice() {
+                    [(k, v)] if own_read && s.skip == 0 && !projected_find(s) => match v {
+                        Bson::Int32(1) | Bson::Int64(1) => Some((k.to_string(), false)),
+                        Bson::Double(d) if *d == 1.0 => Some((k.to_string(), false)),
+                        Bson::Int32(-1) | Bson::Int64(-1) => Some((k.to_string(), true)),
+                        Bson::Double(d) if *d == -1.0 => Some((k.to_string(), true)),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            });
+            let sort_scan = sorted.is_some()
+                && matches!(
+                    plan.without_paging(),
+                    Node::Sort {
+                        on_keys: false,
+                        keeps_metadata: false,
+                        input,
+                        ..
+                    } if matches!(**input, Node::CollScan { backward: false, .. })
+                );
+            let scan = scan || sort_scan;
+            let simple = (s.sort.as_ref().is_none_or(Document::is_empty) || sort_scan)
                 && s.hint.is_none()
                 && collation.is_none()
                 && s.min_max.is_none()
@@ -2486,6 +2540,10 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             // An `aggregate`'s projection is not built here.
             let projected = s.projection.as_ref().is_some_and(|p| !p.is_empty());
             let built = |()| match added.as_slice() {
+                [] if sort_scan => {
+                    let (field, desc) = sorted.as_ref()?;
+                    sbe::sorted_plan(&uuid, &on, field, *desc)
+                }
                 [] if own_read => sbe::find_plan(&uuid, &on, s.projection.as_ref()),
                 _ if projected => None,
                 [] => sbe::find_plan(&uuid, &on, None),
@@ -2539,7 +2597,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             at_least(&mut run, trial);
         }
         if !s.rest.is_empty() || union::nested() {
-            cursor_yields(&mut run, cursor_pulled);
+            cursor_yields(&mut run, cursor_pulled, &plan, &env);
         }
         run
     });
