@@ -225,8 +225,11 @@ pub struct Index {
     pub columns: Vec<String>,
     /// `btcostestimate`'s `indexCorrelation`: the leading column's ANALYZE
     /// correlation (three quarters of it for an index of several columns);
-    /// 0 with no statistics.
-    pub correlation: f64,
+    /// 0 with no statistics. `None` where ANALYZE measured it in an order
+    /// not modelled (text, in the reference's locale): the scan is then
+    /// priced only where `cost_index`'s heap I/O does not depend on it
+    /// (RP-1070).
+    pub correlation: Option<f64>,
     /// For a scan that can be index-only (the index holds every column the
     /// statement reads), the heap's all-visible fraction, whose pages it
     /// does not fetch (`cost_index`); 0 otherwise.
@@ -537,8 +540,15 @@ fn index_scan_loops(
         };
         (max_pages * RANDOM_PAGE_COST, min_io)
     };
-    let csquared = index.correlation * index.correlation;
-    let io = csquared.mul_add(min_io - max_io, max_io);
+    // An unknown correlation moves nothing when both bounds are the same
+    // pages (one row fetched, as a unique `=` does): `max_IO_cost +
+    // csquared * (min_IO_cost - max_IO_cost)` is `max_IO_cost` whatever
+    // `csquared` is (RP-1070).
+    let io = match index.correlation {
+        Some(c) => (c * c).mul_add(min_io - max_io, max_io),
+        None if min_io == max_io => max_io,
+        None => return None,
+    };
     let others = || {
         quals
             .iter()
@@ -1409,6 +1419,66 @@ pub fn index_scan_over(
 }
 
 #[cfg(test)]
+mod unknown_correlation_tests {
+    use super::*;
+
+    /// `create table tp (a text primary key, b int)` of 2,000 rows (11
+    /// heap pages, `tp_pkey` 10 pages of height 1), as PostgreSQL 15
+    /// measures them; `correlation` as given.
+    fn tp_pkey(correlation: Option<f64>) -> Index {
+        Index {
+            field: "a".into(),
+            unique: true,
+            pages: 10.0,
+            height: 1,
+            columns: vec!["a".into()],
+            correlation,
+            visible: 0.0,
+            tuples: None,
+            predicate: None,
+            hash: false,
+            later: Vec::new(),
+        }
+    }
+
+    const TP: Rel = Rel {
+        pages: 11.0,
+        tuples: 2000.0,
+    };
+
+    /// `where a = 'x1' and b < 0`: one row fetched, so the heap I/O is one
+    /// random page whatever the correlation, and a text key's (not
+    /// modelled) still prices PostgreSQL 15's `cost=0.28..8.30` (RP-1070).
+    #[test]
+    fn one_row_fetched_needs_no_correlation() {
+        let quals = vec![
+            ("a".to_string(), Qual::Eq),
+            ("b".to_string(), Qual::Range(false)),
+        ];
+        let sel = ColSel::Given(1.0 / 2000.0);
+        let unknown = index_scan_cost(&TP, &tp_pkey(None), &quals, sel).unwrap();
+        for c in [0.0, -0.389_682_56, 1.0] {
+            assert_eq!(
+                index_scan_cost(&TP, &tp_pkey(Some(c)), &quals, sel),
+                Some(unknown)
+            );
+        }
+        let (startup, total) = unknown;
+        assert_eq!(format!("{startup:.2}..{total:.2}"), "0.28..8.30");
+    }
+
+    /// A range fetching many rows: the heap I/O lies anywhere between the
+    /// two bounds, so with no correlation the scan is not priced.
+    #[test]
+    fn many_rows_fetched_need_the_correlation() {
+        let quals = vec![("a".to_string(), Qual::Range(false))];
+        let sel = ColSel::Given(0.3);
+        assert!(index_scan_cost(&TP, &tp_pkey(Some(0.0)), &quals, sel).is_some());
+        assert_eq!(index_scan_cost(&TP, &tp_pkey(None), &quals, sel), None);
+    }
+}
+
+#[cfg(test)]
 mod composite_index_tests {
     use super::*;
 
@@ -1423,7 +1493,7 @@ mod composite_index_tests {
             pages: 16.0,
             height: 1,
             columns: vec!["a".into(), "b".into()],
-            correlation: 0.75,
+            correlation: Some(0.75),
             visible: 0.0,
             tuples: None,
             predicate: None,
@@ -1515,7 +1585,7 @@ mod tests {
             pages: 2.0,
             height: 0,
             columns: vec!["k".into()],
-            correlation: 0.0,
+            correlation: Some(0.0),
             visible: 0.0,
             tuples: None,
             predicate: None,
@@ -1550,7 +1620,7 @@ mod tests {
             columns: vec!["a".into()],
             pages: 5.0,
             height: 1,
-            correlation: 1.0,
+            correlation: Some(1.0),
             ..pkey()
         };
         let quals = q(bson::doc! {"a": {"$lt": 5}});
@@ -1874,7 +1944,7 @@ mod tests {
             pages: 5.0,
             height: 1,
             columns: vec!["a".into()],
-            correlation: 1.0,
+            correlation: Some(1.0),
             visible: 0.0,
             tuples: None,
             predicate: None,
@@ -1943,7 +2013,7 @@ mod tests {
             pages: 5.0,
             height: 1,
             columns: vec!["x".into(), "y".into()],
-            correlation: 0.1044901 * 0.75,
+            correlation: Some(0.1044901 * 0.75),
             visible: 0.0,
             tuples: None,
             predicate: None,

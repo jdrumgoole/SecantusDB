@@ -3999,7 +3999,7 @@ impl PgHandler {
                 Some(cs) => cs.get(&ix.field).copied().flatten()?,
                 None => 0.0,
             };
-            ix.correlation = if ix.columns.len() > 1 { c * 0.75 } else { c };
+            ix.correlation = Some(if ix.columns.len() > 1 { c * 0.75 } else { c });
             if !ix.unique {
                 if let Some(Some((pages, height))) = self.dedup_index_size(table, ix) {
                     ix.pages = pages;
@@ -4433,7 +4433,7 @@ impl PgHandler {
                 return None;
             }
             let c = correlations.get(&lead).copied().flatten()?;
-            ix.correlation = if ix.columns.len() > 1 { c * 0.75 } else { c };
+            ix.correlation = Some(if ix.columns.len() > 1 { c * 0.75 } else { c });
             if !ix.unique {
                 if let Some(Some((pages, height))) = self.dedup_index_size(table, ix) {
                     ix.pages = pages;
@@ -4652,11 +4652,11 @@ impl PgHandler {
                         }
                         let lead = ordered.columns.first()?.clone();
                         let c = correlations.get(&lead).copied().flatten()?;
-                        ordered.correlation = if ordered.columns.len() > 1 {
+                        ordered.correlation = Some(if ordered.columns.len() > 1 {
                             c * 0.75
                         } else {
                             c
-                        };
+                        });
                         if !ordered.unique {
                             if let Some(Some((pages, height))) =
                                 self.dedup_index_size(table, &ordered)
@@ -4714,8 +4714,11 @@ impl PgHandler {
             if only {
                 ix.visible = pt.allvisfrac;
             }
-            let c = correlations.get(&lead).copied().flatten()?;
-            ix.correlation = if ix.columns.len() > 1 { c * 0.75 } else { c };
+            // A correlation measured in an order not modelled (text) is
+            // unknown: the scan is priced only where it does not matter
+            // (`costsize::Index::correlation`, RP-1070).
+            let c = *correlations.get(&lead)?;
+            ix.correlation = c.map(|c| if ix.columns.len() > 1 { c * 0.75 } else { c });
             if !ix.unique {
                 if let Some(Some((pages, height))) = self.dedup_index_size(table, ix) {
                     ix.pages = pages;
@@ -4885,8 +4888,20 @@ impl PgHandler {
             );
         }
         for (i, (_, ix)) in serving.iter().enumerate() {
-            if let Some(c) = scan_cost(ix) {
-                consider(Pick::Index(i), disable(c, !off("enable_indexscan")));
+            match scan_cost(ix) {
+                Some(c) => consider(Pick::Index(i), disable(c, !off("enable_indexscan"))),
+                // A path whose cost turns on a correlation not modelled
+                // is a choice this model cannot make (RP-1070).
+                None if ix.correlation.is_none()
+                    && scan_cost(&costsize::Index {
+                        correlation: Some(0.0),
+                        ..ix.clone()
+                    })
+                    .is_some() =>
+                {
+                    return None
+                }
+                None => {}
             }
         }
         let (pick, (startup, total)) = best;
@@ -5873,7 +5888,7 @@ impl PgHandler {
                     pages: f64::from(ipages),
                     height,
                     columns: ix.columns.clone(),
-                    correlation: if ix.columns.len() > 1 { c * 0.75 } else { c },
+                    correlation: Some(if ix.columns.len() > 1 { c * 0.75 } else { c }),
                     visible,
                     tuples: None,
                     predicate: None,

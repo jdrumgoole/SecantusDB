@@ -2767,14 +2767,32 @@ Measured on PostgreSQL 15.19 (port 5415) over a scratch table. The gap
 test is in `tests/backlog/test_rp_found_rp693.py`.
 
 - [ ] **OPEN -- EXPLAIN shows a Seq Scan for an indexed `=` ANDed with a
-      filter.** `explain (costs off) select b from tp where a = 'x1' and
-      b < 0` over a 2,000-row `text` PRIMARY KEY (analyzed) is `Seq Scan
-      on tp / Filter: ((b < 0) AND (a = 'x1'::text))` here; 15.19 is `Index
-      Scan using tp_pkey on tp / Index Cond: (a = 'x1'::text) / Filter:
-      (b < 0)`. The `=` alone is an Index Scan on both; an expression index
-      (`lower(t) = 'x1' and b < 0`) and a `bpchar` key (RP-693 step 4) show
-      the same Seq Scan. Only the plan text differs: the rows are right.
-      Verify: tests/backlog/test_rp_found_rp693.py::test_explain_indexed_equality_with_a_filter
+      filter, for three kinds of index.** A text key's unique `=` is
+      fixed (2026-11-26: `cost_index` needs no correlation when one row
+      is fetched). What remains, each measured on a fresh 15.20 cluster
+      in C.UTF-8 against the gap test's 2,000 analysed rows:
+      - **A non-unique text index** (`t = 'x1' and b < 0`, 20 rows per
+        value): 15.20 is a `Bitmap Heap Scan` (`Recheck Cond`, `Filter:
+        (b < 0)`, the Bitmap Index Scan's `Index Cond`); here a Seq Scan.
+        The plain index scan's cost turns on the column's correlation,
+        which `stats_correlations` drops for text as "measured in an
+        order not modelled" -- yet the correlations ANALYZE stores here
+        equal 15.20's in C.UTF-8 (`-0.38968256`, `0.050268013`), the
+        server's own collation. The distrust dates from the en_US.UTF-8
+        shared reference on 5415; trusting text correlations moves every
+        text index's cost, so pinned plans and corpora need re-checking.
+      - **A `char(5)` PRIMARY KEY**: 15.20 is `Index Scan using
+        <t>_pkey` with `Filter: (b < 0)`; here a Seq Scan. The WHERE's
+        estimate (`analyzed_where`) reads no statistics for a bpchar
+        constant, so even the `=` alone prints `cost=0.00..0.00 rows=0
+        width=0` (15.20: `cost=0.28..8.29 rows=1 width=4`).
+      - **An expression index** on `lower(t)`: the `=` alone prints
+        `Filter: (lower(t) = 'x1'::text)` under the Index Scan where
+        15.20 prints `Index Cond:`, and ANDed with `b < 0` it is a Seq
+        Scan, as ANALYZE keeps no statistics for an index expression
+        (PostgreSQL's `compute_index_stats`).
+      Only the plan text differs: the rows are right.
+      Verify: tests/backlog/test_rp_found_rp693.py::test_explain_non_unique_text_index_with_a_filter, tests/backlog/test_rp_found_rp693.py::test_explain_bpchar_key_with_a_filter, tests/backlog/test_rp_found_rp693.py::test_explain_expression_index_with_a_filter
       Backlog-ID: RP-1070
 
 ## Found while working RP-665 (2026-11-10)
