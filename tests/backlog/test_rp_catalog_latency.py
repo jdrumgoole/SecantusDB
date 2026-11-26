@@ -499,18 +499,21 @@ def test_the_first_catalog_query_after_ddl_over_two_user_types_costs_the_same_at
     )
 
 
-def _creates(conn: Any, prefix: str, tables: int, block: bool) -> float:
-    """`tables` `CREATE TABLE`s, inside one `BEGIN` ... `COMMIT` or each
-    in autocommit."""
-    start = time.monotonic()
-    if block:
-        with conn.transaction():
-            for i in range(tables):
-                conn.execute(f"CREATE TABLE {prefix}_{i} (a int, b text)")
-    else:
-        for i in range(tables):
+BLOCK_STATEMENTS = 16
+BLOCK_SAMPLE = 4
+
+
+def _block_costs(conn: Any, prefix: str) -> list[float]:
+    """The time each of `BLOCK_STATEMENTS` `CREATE TABLE`s takes inside one
+    `BEGIN` ... `COMMIT`, in order. The `COMMIT` is not timed, so the
+    runner's fsync cost is in none of them."""
+    costs = []
+    with conn.transaction():
+        for i in range(BLOCK_STATEMENTS):
+            start = time.monotonic()
             conn.execute(f"CREATE TABLE {prefix}_{i} (a int, b text)")
-    return time.monotonic() - start
+            costs.append(time.monotonic() - start)
+    return costs
 
 
 @pytest.mark.backlog("RP-1112")
@@ -521,19 +524,27 @@ def test_ten_create_tables_in_one_block_cost_what_they_do_one_at_a_time(pg: Any)
     autocommit (private cluster, 2026-11-26: 317 ms against 266 ms for
     ten, 82 ms against 62 ms for twenty, with fsync): a statement in the
     block reads its own transaction's catalog rows through the same
-    caches and indexes. A debug `secantusd-pg` on arm64 macOS took 4.3 s
-    for ten in a block against 0.7 s in autocommit, and 14.2 s against
-    1.2 s for twenty (2026-11-26): each DDL in the block costs more than
-    the one before it, so a block's cost grows with the square of its
-    statements.
+    caches and indexes, so the last statement in a block costs what the
+    first does. A debug `secantusd-pg` on arm64 macOS took 4.3 s for ten
+    in a block against 0.7 s in autocommit, and 14.2 s against 1.2 s for
+    twenty (2026-11-26): each DDL in the block costs more than the one
+    before it, so a block's cost grows with the square of its statements.
 
-    Ten in a block within twice ten in autocommit plus 50 ms, the fastest
-    of three of each, interleaved."""
-    block = autocommit = float("inf")
-    for t in range(3):
-        block = min(block, _creates(pg, f"rp_blk_b{t}", 10, True))
-        autocommit = min(autocommit, _creates(pg, f"rp_blk_a{t}", 10, False))
-    assert block < 2 * autocommit + 0.05, (
-        f"ten CREATE TABLEs: {block * 1000:.0f} ms in one block, "
-        f"{autocommit * 1000:.0f} ms in autocommit"
+    First written as ten in a block against ten in autocommit, within
+    twice plus 50 ms. That compared the block with the runner's commit
+    cost: CI's Linux runner commits far faster than macOS's `dsync`
+    (62 ms for ten in autocommit), and the ratio passed once there
+    (run 45774818452, PR #3019, 2026-11-26) while failing at 224 ms
+    against 62 ms on the next. So it now compares the block with itself:
+    the median of the last four of sixteen statements within twice the
+    median of the first four plus 2 ms, each position the fastest of two
+    blocks, which no commit cost enters."""
+    rounds = [_block_costs(pg, f"rp_blk{t}") for t in range(2)]
+    costs = [min(r[i] for r in rounds) for i in range(BLOCK_STATEMENTS)]
+    early = statistics.median(costs[:BLOCK_SAMPLE])
+    late = statistics.median(costs[-BLOCK_SAMPLE:])
+    assert late < 2 * early + 0.002, (
+        f"{BLOCK_STATEMENTS} CREATE TABLEs in one block: the first {BLOCK_SAMPLE} "
+        f"{early * 1000:.1f} ms each, the last {BLOCK_SAMPLE} {late * 1000:.1f} ms each "
+        f"(all: {', '.join(f'{c * 1000:.0f}' for c in costs)} ms)"
     )

@@ -3551,7 +3551,10 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       its DDL in a transaction (Alembic, Django) pays it. Not yet
       profiled: the in-block reads bypass the committed catalog's shared
       copies (`block_wrote_catalog`, `in_open_transaction`), which is the
-      first place to look.
+      first place to look. The gap test compares the block's last
+      statements with its first, not the block with autocommit: CI's
+      Linux runner commits so cheaply that the first form passed there
+      once (run 45774818452, PR #3019, 2026-11-26).
       Verify: tests/backlog/test_rp_catalog_latency.py::test_ten_create_tables_in_one_block_cost_what_they_do_one_at_a_time
       Backlog-ID: RP-1112
 
