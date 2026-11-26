@@ -49,6 +49,8 @@ use crate::catalog_facts::{
 use crate::catcache::{Backend, Cache, Counter, Inval, Key, Scan, K};
 use crate::PgHandler;
 
+mod catalog_join;
+
 /// A relation as the model reads it.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Rel {
@@ -189,6 +191,10 @@ struct Needs {
     /// The query's ORDER BY, when every item is a column of this lone
     /// relation: `(attnum, descending)`.
     order: Vec<(i64, bool)>,
+    /// This relation's columns an ORDER BY item is, in a query of any
+    /// number of relations: each in the equivalence class the query's
+    /// pathkeys make.
+    sort_cols: Vec<i64>,
 }
 
 /// [`Model::facts`]' memo: `(session, catalog version, invalidation
@@ -253,6 +259,10 @@ pub(crate) struct Model<'a> {
     /// (and the caches `IndexScanOK` names) are heap scans.
     relcache_built: bool,
     shared_built: bool,
+    /// The `pg_class` rows a planned scan of it returns through its
+    /// restrictions, `(oid, relname, relnamespace)`, where the walk can
+    /// tell them: a join above reads them (`catalog_join`).
+    scan_rows: HashMap<i64, Vec<(i64, String, i64)>>,
 }
 
 /// `syscache.c`'s `cacheinfo`, in its order: each system cache's catalog
@@ -416,6 +426,7 @@ impl<'a> Model<'a> {
             cold_local: false,
             relcache_built: true,
             shared_built: true,
+            scan_rows: HashMap::new(),
         }
     }
 
@@ -1224,7 +1235,10 @@ impl<'a> Model<'a> {
         if !needs.order.is_empty() && want.is_empty() {
             self.index_ordered = true;
         }
-        if !want.is_empty() {
+        // `has_useful_pathkeys`: the query's pathkeys, or a join clause in
+        // an equivalence class (`has_eclass_joins`), which merge joins
+        // above could use (`pathkeys_useful_for_merging`).
+        if !want.is_empty() || !needs.joins.is_empty() {
             for ix in rel.indexes.iter().filter(|i| i.am == BTREE_AM) {
                 for (pos, col) in ix.keys.iter().enumerate() {
                     let Some(o) = ix.classes.get(pos).and_then(|c| self.h.cr_opclass(*c)) else {
@@ -1237,12 +1251,15 @@ impl<'a> Model<'a> {
                     self.search(Cache::AmopStrategy, key, |_| found);
                     let has_class = fixed(col)
                         || needs.order.iter().any(|(a, _)| a == col)
+                        || needs.sort_cols.contains(col)
                         || needs.joins.contains(col);
                     if !has_class {
                         break;
                     }
                 }
             }
+        }
+        if !want.is_empty() {
             // `pathkeys_contained_in`: the query's pathkeys, less those an
             // equality makes constant, lead the chosen index's, all in one
             // direction (a backward scan for descending).
@@ -1300,7 +1317,12 @@ impl<'a> Model<'a> {
         // the row by oid, then `RelationIsVisible`'s search for its name
         // in each schema before its own on the path. Walked only when
         // every other qual is an equality the rows can be matched to.
-        if needs.visible && rel.oid == RELATION_RELATION && needs.saops.is_empty() {
+        // The rows the scan returns are kept for a join above
+        // (`scan_rows`) when every qual is such an equality.
+        if rel.oid == RELATION_RELATION
+            && needs.saops.is_empty()
+            && (needs.visible || !needs.joins.is_empty())
+        {
             let evaluable = needs.quals.iter().all(|(a, o, _)| {
                 needs.eq_consts.iter().any(|(x, _)| x == a)
                     && (self.h.cr_operator(*o).is_some_and(|f| f.name == "=")
@@ -1309,26 +1331,38 @@ impl<'a> Model<'a> {
             if evaluable {
                 let ix = used.as_ref().map(|u| u.0.clone());
                 let rows = self.h.cr_class_rows(rel, ix.as_ref(), &needs.eq_consts);
-                let path = self.active_path();
-                let by_name = catalog_index(2663);
-                for (oid, name, nsp) in rows {
-                    self.search(Cache::RelOid, vec![K::O(oid)], |_| true);
-                    if nsp != PG_CATALOG && !path.contains(&nsp) {
-                        continue;
-                    }
-                    for p in &path {
-                        if *p == nsp {
-                            break;
+                let mut returned = Vec::new();
+                if needs.visible {
+                    let path = self.active_path();
+                    let by_name = catalog_index(2663);
+                    for (oid, name, nsp) in rows {
+                        self.search(Cache::RelOid, vec![K::O(oid)], |_| true);
+                        if nsp != PG_CATALOG && !path.contains(&nsp) {
+                            continue;
                         }
-                        let eq = [(2, Bson::String(name.clone())), (3, Bson::Int64(*p))];
-                        let other = !self.h.cr_class_rows(rel, by_name.as_ref(), &eq).is_empty();
-                        let key = vec![K::N(name.clone()), K::O(*p)];
-                        self.search(Cache::RelNameNsp, key, |_| other);
-                        if other {
-                            break;
+                        let mut visible = false;
+                        for p in &path {
+                            if *p == nsp {
+                                visible = true;
+                                break;
+                            }
+                            let eq = [(2, Bson::String(name.clone())), (3, Bson::Int64(*p))];
+                            let other =
+                                !self.h.cr_class_rows(rel, by_name.as_ref(), &eq).is_empty();
+                            let key = vec![K::N(name.clone()), K::O(*p)];
+                            self.search(Cache::RelNameNsp, key, |_| other);
+                            if other {
+                                break;
+                            }
+                        }
+                        if visible {
+                            returned.push((oid, name, nsp));
                         }
                     }
+                } else {
+                    returned = rows;
                 }
+                self.scan_rows.insert(rel.oid, returned);
             }
         }
         // The executor's index-only scan builds its tuple from the index's
@@ -2188,6 +2222,37 @@ impl<'a> Model<'a> {
                     (Some(att), Some(o)) => o.push((att, desc)),
                     _ => order = None,
                 }
+                // `ORDER BY n` is the n-th result column's expression.
+                let item = match node(&b.node) {
+                    Some(N::AConst(c)) => match &c.val {
+                        Some(pb::a_const::Val::Ival(i)) => usize::try_from(i.ival - 1)
+                            .ok()
+                            .and_then(|i| s.target_list.get(i))
+                            .and_then(|t| match t.node.as_ref() {
+                                Some(N::ResTarget(rt)) => node(&rt.val),
+                                _ => None,
+                            }),
+                        _ => None,
+                    },
+                    other => other,
+                };
+                if let Some(N::ColumnRef(c)) = item {
+                    let names = names_of(&c.fields);
+                    let found = names.last().and_then(|name| {
+                        scope.rels.iter().find_map(|(alias, r)| {
+                            if names.len() > 1 && names[names.len() - 2] != *alias {
+                                return None;
+                            }
+                            r.columns
+                                .iter()
+                                .find(|c| &c.1 == name)
+                                .map(|c| (r.oid, c.0))
+                        })
+                    });
+                    if let Some((rel, att)) = found {
+                        self.needs.entry(rel).or_default().sort_cols.push(att);
+                    }
+                }
                 if let Some(e) = node(&b.node) {
                     let t = match e {
                         // ORDER BY n: the n-th result column.
@@ -2232,9 +2297,12 @@ impl<'a> Model<'a> {
                 self.plan_rel(&rel);
             }
         }
-        for (opr, l, r) in std::mem::take(&mut self.merge_clauses) {
+        let clauses = std::mem::take(&mut self.merge_clauses);
+        for (opr, l, r) in clauses.clone() {
             self.mergejoinscansel(opr, l, r, &scope);
         }
+        // The join method the costing keeps, and what it reads.
+        self.catalog_join(s, &scope, &clauses, aggs_before);
         // The executor's Sort, unless the index scan gives the order.
         if !self.index_ordered {
             for (f, t) in pending {
@@ -4134,6 +4202,26 @@ impl PgHandler {
             .into_iter()
             .find(|(n, _)| n == name)
             .map(|(_, o)| o)
+    }
+
+    /// `pg_namespace`'s rows' oids in its heap's order, where it holds
+    /// `initdb`'s rows and no other: the order `initdb` left them in
+    /// ([`crate::catalog_heap::INITDB_NAMESPACE_ORDER`]). A schema created
+    /// since is not placed in the heap (RP-291), so its row's place, and
+    /// what a scan reads before it, is not known.
+    pub(crate) fn cr_namespace_heap_order(&self) -> Option<&'static [i64]> {
+        let def = self.catalog_def("pg_namespace")?;
+        let field = def.field_of("oid")?;
+        let rows = self.catalog_rows_keyed("pg_namespace", None)?;
+        let mut oids: Vec<i64> = rows
+            .iter()
+            .filter_map(|r| r.get(&field).and_then(crate::bson_i64))
+            .collect();
+        oids.sort_unstable();
+        let order = &crate::catalog_heap::INITDB_NAMESPACE_ORDER[..];
+        let mut initdb = order.to_vec();
+        initdb.sort_unstable();
+        (oids == initdb).then_some(order)
     }
 
     /// The four `ApplySetting` scans' rows: (database, role), (0, role),

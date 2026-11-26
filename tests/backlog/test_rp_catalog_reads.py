@@ -322,10 +322,11 @@ GAPS: dict[str, tuple[str, bool, list[str]]] = {
         ],
     ),
     # psql's \d pattern query: a regular expression's fixed prefix as an
-    # index condition, pg_table_is_visible per row, the join's sort.
+    # index condition, pg_table_is_visible per row, the join's sort, and
+    # the nested loop PostgreSQL's costing keeps (`JOIN_METHOD_STEPS`).
     "psql's describe query": (
         "RP-290",
-        True,
+        False,
         [
             "a|",
             "mark",
@@ -1889,6 +1890,127 @@ def test_a_merge_join_clauses_scan_estimate(rust_pg: Any) -> None:
         return [{k: v for k, v in seg.items() if k in MERGE_SCANSEL} for seg in segments]
 
     assert only(got) == only(EXPECTED_GAPS[name])
+
+
+# Two catalogs joined on one equality: the join method PostgreSQL 15's
+# costing keeps (`add_paths_to_joinrel`, `set_cheapest`) decides what the
+# executor reads. A nested loop's sides and a hash join's outer side are
+# scanned with their relation's whole row (`use_physical_tlist`), whose
+# tuple descriptor looks up every column's type; a Hash, a Sort or a
+# Material asks its input for the columns needed above only; and a nested
+# loop's inner side unique for the join clause stops at an outer row's first
+# match (`single_match`). With `pg_class` scanned through its relname index
+# (psql's describe query, above) the plan is a nested loop over
+# `pg_namespace`'s heap, read to `public`, the third row; here
+# `relkind = 'v'` makes the `pg_class` side a sequential scan of 138
+# estimated rows, and a hash left join over a Hash of `pg_namespace` is the
+# cheapest; with `pg_namespace` first in the FROM of an inner join, the
+# nested loop has `pg_class` outer, an index-only scan, and reads
+# `pg_namespace` to `pg_catalog`, the second row. Every scenario's relation
+# lookups also build each B-tree index's pathkeys for the join
+# (`has_useful_pathkeys`: a join clause in an equivalence class). Measured
+# on a private PostgreSQL 15.20 cluster, twice, the two identical; the same
+# recording reproduced psql's describe query's answer above (RP-290).
+JOIN_METHOD_STEPS: dict[str, list[str]] = {
+    "a hash join of two catalogs": [
+        "a|",
+        "mark",
+        "a|SELECT c.oid, n.nspname, c.relname FROM pg_catalog.pg_class c "
+        "LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE c.relkind = 'v' ORDER BY 2, 3",
+        "mark",
+    ],
+    "a nested loop with the second relation outer": [
+        "a|",
+        "mark",
+        "a|SELECT n.nspname, c.relname FROM pg_catalog.pg_namespace n "
+        "JOIN pg_catalog.pg_class c ON n.oid = c.relnamespace "
+        "WHERE c.relname = 'pg_class'",
+        "mark",
+    ],
+}
+
+# A new session's reads, as in every scenario, then the statement's.
+EXPECTED_JOIN_METHOD: dict[str, list[dict[str, list[int]]]] = {
+    "a hash join of two catalogs": [
+        EXPECTED_GAPS["psql's describe query"][0],
+        {
+            "pg_amop_fam_strat_index": [8, 8, 8],
+            "pg_amop_opr_fam_index": [6, 19, 19],
+            "pg_amproc_fam_proc_index": [3, 3, 3],
+            "pg_attribute_relid_attnum_index": [7, 8, 8],
+            "pg_cast_source_target_index": [46, 3, 3],
+            "pg_class": [1, 418, 0],
+            "pg_class_oid_index": [5, 5, 5],
+            "pg_class_relname_nsp_index": [2, 2, 2],
+            "pg_index_indexrelid_index": [3, 3, 3],
+            "pg_index_indrelid_index": [2, 5, 5],
+            "pg_namespace": [1, 4, 0],
+            "pg_namespace_nspname_index": [1, 1, 1],
+            "pg_namespace_oid_index": [2, 2, 0],
+            "pg_opclass_am_name_nsp_index": [4, 170, 170],
+            "pg_opclass_oid_index": [4, 4, 4],
+            "pg_operator_oid_index": [4, 4, 4],
+            "pg_operator_oprname_l_r_n_index": [2, 2, 2],
+            "pg_proc_oid_index": [2, 2, 2],
+            "pg_statistic_ext_relid_index": [2, 0, 0],
+            "pg_statistic_relid_att_inh_index": [6, 6, 6],
+            "pg_tablespace_oid_index": [1, 1, 1],
+            "pg_type_oid_index": [11, 11, 11],
+        },
+        {},
+    ],
+    "a nested loop with the second relation outer": [
+        EXPECTED_GAPS["psql's describe query"][0],
+        {
+            "pg_amop_fam_strat_index": [6, 6, 6],
+            "pg_amop_opr_fam_index": [4, 13, 13],
+            "pg_amproc_fam_proc_index": [1, 1, 1],
+            "pg_attribute_relid_attnum_index": [7, 8, 8],
+            "pg_cast_source_target_index": [24, 2, 2],
+            "pg_class_oid_index": [5, 5, 5],
+            "pg_class_relname_nsp_index": [3, 3, 2],
+            "pg_index_indexrelid_index": [3, 3, 3],
+            "pg_index_indrelid_index": [2, 5, 5],
+            "pg_namespace": [1, 2, 0],
+            "pg_namespace_nspname_index": [1, 1, 1],
+            "pg_namespace_oid_index": [2, 2, 0],
+            "pg_opclass_am_name_nsp_index": [2, 85, 85],
+            "pg_opclass_oid_index": [2, 2, 2],
+            "pg_operator_oid_index": [4, 4, 4],
+            "pg_operator_oprname_l_r_n_index": [2, 2, 2],
+            "pg_proc_oid_index": [2, 2, 2],
+            "pg_statistic_ext_relid_index": [2, 0, 0],
+            "pg_statistic_relid_att_inh_index": [4, 4, 4],
+            "pg_tablespace_oid_index": [1, 1, 1],
+            "pg_type_oid_index": [4, 4, 4],
+        },
+        {},
+    ],
+}
+
+# What the hash join's sequential scan of `pg_class` returns counts the four
+# TOAST relations of `rpc_t` and `rpc_p` and their indexes, which this
+# server does not create (RP-1140): compared without it.
+TOAST_ROWS = "pg_class"
+
+
+@pytest.mark.backlog_fixed("RP-290")
+def test_a_catalog_joins_method_decides_its_reads(rust_pg: Any) -> None:
+    """RP-290 (slice): a join of two catalogs was walked as a hash join
+    whatever PostgreSQL's costing chose: its scans' tuple descriptors were
+    the columns needed above, never the whole row, and the inner
+    `pg_namespace` was read whole once, where a nested loop's unique inner
+    stops at each outer row's match; and a join's relations built no index
+    pathkeys without an ORDER BY of their own."""
+    got = catalog_reads(_dsn(rust_pg), JOIN_METHOD_STEPS)
+
+    def without_toast(segments: list[dict[str, list[int]]]) -> list[dict[str, list[int]]]:
+        return [{k: v for k, v in seg.items() if k != TOAST_ROWS} for seg in segments]
+
+    for name, want in EXPECTED_JOIN_METHOD.items():
+        compare = without_toast if name == "a hash join of two catalogs" else list
+        assert (name, compare(got[name])) == (name, compare(want))
 
 
 @pytest.mark.backlog_fixed("RP-316")

@@ -32,6 +32,14 @@ use std::sync::OnceLock;
 use crate::fsm::Fsm;
 use crate::heap_page::{Heap, Lp, Page, Tuple};
 
+/// `pg_namespace`'s rows in a fresh database, by oid in `ctid` order:
+/// `pg_toast`, `pg_catalog`, `public` (the bootstrap's, at `(0,2)`,
+/// `(0,4)` and `(0,5)` after `initdb`'s in-place updates) and
+/// `information_schema` (`(0,7)`). Measured on PostgreSQL 15.19 and 15.20:
+/// `select ctid, oid from pg_namespace`. A sequential scan returns them in
+/// this order.
+pub(crate) const INITDB_NAMESPACE_ORDER: [i64; 4] = [99, 11, 2200, 13679];
+
 /// `NodesPerPage`: an FSM page's node array.
 const FSM_NODES_PER_PAGE: usize = 8192 - 24 - 4;
 
@@ -256,6 +264,14 @@ mod tests {
         }
         // An empty catalog has no block at all.
         assert_eq!((h[&826].blocks, h[&826].tids.len()), (0, 0));
+    }
+
+    #[test]
+    fn pg_namespaces_order_is_one_oid_a_live_tuple() {
+        assert_eq!(
+            initdb_heaps()[&2615].tids.len(),
+            INITDB_NAMESPACE_ORDER.len()
+        );
     }
 
     #[test]

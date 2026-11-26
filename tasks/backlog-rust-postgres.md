@@ -1581,11 +1581,14 @@ a regression test.
       subcommand, a new TOAST table and the role caches a non-superuser's
       permission checks read stop its walk, and a view that depends on a
       dropped column is not seen: its pg_depend rows count as none), the rule
-      queries of system views (`pg_stat_*`), the join in psql's `\d`
-      pattern query (the nested loop's whole-row scans, whose columns'
-      types the executor looks up, and its inner-unique scan stopping at
-      the first match -- both follow from PostgreSQL's choice of join
-      method, which the walk does not cost), a pattern whose fixed prefix
+      queries of system views (`pg_stat_*`), a join of more than two
+      relations or of a non-catalog, and a two-catalog join's plan where
+      the walk cannot price it (a LIMIT, grouping, an ORDER BY a join key,
+      a restriction the catalog estimator does not price, a full index
+      scan in the join key's order, a Material inner's lazily read scan,
+      and the early stop of any unique inner but `pg_namespace` below
+      `pg_class`, whose heap order is known only while it holds `initdb`'s
+      rows), a pattern whose fixed prefix
       is not all of it (`^(rpc.*)$`, `LIKE 'rpc_t'`: the range conditions
       and their estimates), ILIKE and
       `~*`, subqueries, CTEs, windows, PL/pgSQL bodies, and texts over 64
@@ -1602,11 +1605,19 @@ a regression test.
       test `test_a_merge_join_clauses_scan_estimate`), ascending only: a
       descending merge pathkey's `BTGreaterStrategyNumber` call is not, and
       a table's own index is not probed (its ends stay the histogram's).
-      Measured 2026-11-25: `\d rpc_t`'s first query 37 counters match, 2
-      differ (`pg_namespace`'s scan and `pg_type_oid_index`, the join
-      method's); a `pg_stat_*` view 16 match, 22 differ.
+      Since 2026-11-26 a two-catalog join's method is PostgreSQL's
+      costing's (`catalog_reads/catalog_join.rs`, over `joincost::JoinRel`
+      with each side priced as `scan_estimate` prices a catalog scan), and
+      the executor's reads follow it: the whole-row scans' column types, a
+      nested loop's unique inner stopping at each match, and each join
+      relation's index pathkeys (regression tests `test_gap[psql's
+      describe query]` and `test_a_catalog_joins_method_decides_its_reads`).
+      The side's rows multiply the equality's clamped estimate by
+      `pg_table_is_visible`'s selectivity, where PostgreSQL clamps the
+      product once. Measured 2026-11-25: a `pg_stat_*` view 16 counters
+      match, 22 differ.
       Backlog-ID: RP-290
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view], tests/backlog/test_rp_catalog_reads.py::test_gap[psql's describe query]
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view]
 - [ ] **A catalog row DDL other than CREATE TABLE writes counts no heap
       block** in `pg_statio_sys_tables`. A catalog scan counts its index
       pages (`catalog_btree.rs`, from `pg15_catalog_indexes.txt`) and the
@@ -3875,3 +3886,19 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       reference on port 5415.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an anti join against a primary key is priced], tests/backlog/test_rp_explain_costs.py::test_plan[an anti join on an expression key against a primary key is a hash anti join]
       Backlog-ID: RP-1133
+
+## Found while working RP-290 (2026-11-26)
+
+- [ ] **A table with a `text` column has no TOAST table.** `create table
+      t (a int, b text)` gives PostgreSQL 15 a TOAST table
+      (`needs_toast_table`, `create_toast_table`): `reltoastrelid` set, a
+      `pg_class` row `pg_toast.pg_toast_<oid>` of relkind `t`, and its
+      index `pg_toast_<oid>_index`. Here `reltoastrelid` is 0 and neither
+      relation exists, so a client reading `pg_class` sees two rows fewer
+      a table, and a sequential scan of `pg_class` counts that many fewer
+      tuples in `pg_stat_sys_tables` (the hash join scenario of
+      `test_a_catalog_joins_method_decides_its_reads` compares without
+      `pg_class`'s counts for that reason). A table of fixed-width columns
+      has none on either server. Measured on a private 15.20 cluster.
+      Verify: tests/backlog/test_rp_found_rp290.py::test_a_table_with_a_text_column_has_a_toast_table
+      Backlog-ID: RP-1140
