@@ -3438,22 +3438,6 @@ from 15.19): every statement is VALUES-only. The gap tests are in
 
 ## Found while working RP-966 (2026-11-17)
 
-- [ ] **A nested loop whose inner relation has an index qual is not
-      priced.** `explain select e.b from e join k on e.a <> k.a where k.a
-      = 5` (`e`, `k` 1,000 analysed rows, `k.a` its primary key) prints a
-      Nested Loop over `Seq Scan on e` and `Index Scan using k_pkey on k`,
-      every cost zero; PostgreSQL 15.19 puts the one-row index side outer:
-      `Nested Loop (cost=0.28..35.79 rows=999 width=3)` over `Index Only
-      Scan using k_pkey on k (cost=0.28..8.29 rows=1 width=4)` and `Seq
-      Scan on e (cost=0.00..15.00 rows=1000 width=7)`. Since RP-1038 an
-      inner WHERE conjunct over a column no index covers is priced;
-      `nest_loop_estimate`'s side check still refuses a non-preserved
-      indexed side whose own quals an index can take. Found while working
-      RP-1038.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop over an inner relation's index qual is priced]
-      Backlog-ID: RP-1068
-
-
 - [ ] **An ORDER BY on a column the select list only computes from
       names the computed entry as its Sort Key.** `explain (costs off)
       select a+1 from e order by a` prints `Sort Key: ?column?`;
@@ -3629,3 +3613,38 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       working phase 6.
       Backlog-ID: RP-1077
       Verify: tests/backlog/test_rp_storage_model.py::test_relation_filenode
+
+## Found while working RP-1068 (2026-11-26)
+
+- [ ] **A nested loop over an indexed side whose own index qual a join
+      `<` or `>` also reads is not priced.** `explain select e.b from e
+      join k on e.a < k.a where k.a = 5` (`e`, `k` 1,000 analysed rows,
+      `k.a` its primary key) prints zero costs over `Seq Scan on e` and
+      `Index Scan using k_pkey on k`; a private PostgreSQL 15.20 cluster
+      prints `Nested Loop (cost=0.28..35.79 rows=333 width=3)`, `Join
+      Filter: (e.a < k.a)`, over `Index Only Scan using k_pkey on k
+      (cost=0.28..8.29 rows=1 width=4)` outer and `Seq Scan on e`. Where
+      the other side has an index too (`k x join k y on x.a < y.a where
+      y.a = 5`), the one-row side's row parameterizes it: `Nested Loop
+      (cost=0.55..30.72 rows=333 width=3)` into `Index Scan using k_pkey
+      on k x (cost=0.28..19.10 rows=333 width=7)`, `Index Cond: (a <
+      y.a)`, no Join Filter. Since RP-1068 a side only `<>` reads is its
+      own cheapest path, an index path included; `nest_loop_estimate`'s
+      side check still refuses an indexed side an inequality reads, since
+      its parameterized path would weigh the own qual and the join's
+      together (`a = 5 AND a > e.a`), which `param_index_inner` does not
+      model beyond one column's own bounds (RP-979). Found while working
+      RP-1068.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop over an index qual a join inequality also reads is priced], tests/backlog/test_rp_explain_costs.py::test_plan[a nested loop's one-row outer parameterizes the other index]
+      Backlog-ID: RP-1124
+
+- [ ] **An aggregate over a Nested Loop is not priced.** `explain select
+      count(*) from e join k on e.a <> k.a` prints zero costs on the
+      `Aggregate` and on the loop below it, though the loop alone
+      (`select e.b ...`) is priced since RP-329; a private PostgreSQL
+      15.20 cluster prints `Aggregate (cost=17530.00..17530.01 rows=1
+      width=8)` over `Nested Loop (cost=0.00..15032.50 rows=999000
+      width=0)`, each scan narrowed to the join's key (`width=4`), the
+      inner materialised. Found while working RP-1068.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a nested loop is priced]
+      Backlog-ID: RP-1125

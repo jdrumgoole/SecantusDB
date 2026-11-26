@@ -47747,19 +47747,22 @@ impl PgHandler {
                     && tree
                         .children
                         .iter()
-                        .all(|c| c.children.is_empty() && c.name.starts_with("Seq Scan on "))
+                        .all(|c| c.children.is_empty() && explain::is_relation_scan(&c.name))
                 {
+                    // A side the storage planner reads through an index is
+                    // its restriction's index path, which only the
+                    // two-table estimate weighs (RP-1068).
+                    let seq_scans = tree
+                        .children
+                        .iter()
+                        .all(|c| c.name.starts_with("Seq Scan on "));
                     if let Statement::Select(sel) = inner.as_ref() {
-                        if let Some((plan, a, b, join, param, outer_index)) =
-                            self.nest_loop_estimate(sel).or_else(|| {
-                                self.join_select_nest_loop_estimate(sel)
-                                    .map(|(plan, a, b, join)| (plan, a, b, join, None, None))
-                            })
-                        {
-                            explain::apply_nest_loop(
-                                &mut tree,
-                                (plan, a, b, join, param, outer_index),
-                            );
+                        if let Some(est) = self.nest_loop_estimate(sel).or_else(|| {
+                            self.join_select_nest_loop_estimate(sel)
+                                .filter(|_| seq_scans)
+                                .map(|(plan, a, b, join)| (plan, a, b, join, None, [None, None]))
+                        }) {
+                            explain::apply_nest_loop(&mut tree, est);
                         }
                     }
                 }
