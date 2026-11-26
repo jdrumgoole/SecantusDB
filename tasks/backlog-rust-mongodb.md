@@ -2792,6 +2792,24 @@ touched:
   they land within the second), not a retry.
   Backlog-ID: RM-372
   Verify: none -- a timing flake under load; the test passes when the connects land within a second
+
+- [ ] **A local RM gate's `storage-engine` step failed once on
+  `OSError: [Errno 55] No buffer space available` (2026-11-26).**
+  `tests/test_getmore_batching.py::test_default_getmore_respects_16mb_byte_budget[rust]`
+  failed in the client's `sendall` while it was inserting forty 1 MB
+  documents, during the RM-701 subagent's first `gate_rm.py` run on this
+  Mac (M2 Pro, 12 cores). Other gates and batch lanes were loading the
+  machine at the time, with load averages from 11 to 24 that afternoon.
+  It passed 3 of 3 on its own, and the step passed on the full re-run.
+  ENOBUFS from a blocking `sendall` on macOS means the kernel's network
+  buffer pool was exhausted, rather than the peer being slow to read. Find
+  what held the buffers: count the sockets the gate's servers and the
+  probe mongods left open (`netstat -m`, `lsof -i -P` during a gate),
+  since stopped gates are known to leak mongods (RM-804). Fix the leak, or
+  show that the test's own 40 MB send is what needs it, before calling it
+  environmental.
+  Verify: none -- seen once under load; reproduce by running the gate's storage-engine step beside another gate while sampling `netstat -m`
+  Backlog-ID: RM-815
 - [ ] **The profiler's level-two test fails when its `find` touches the
   disk or waits on a WiredTiger lock.** `profiler_wt.rs`'s
   `level_two_writes_each_operation_in_mongods_shape` compares a `find`
