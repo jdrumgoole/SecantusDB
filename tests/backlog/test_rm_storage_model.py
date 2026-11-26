@@ -728,13 +728,14 @@ def test_mongod_starts_as_primary_on_a_standalone_store_killed_long_ago(tmp_path
         _stop_mongod(proc, client)
 
 
-@pytest.mark.backlog("RM-808")
+@pytest.mark.backlog_fixed("RM-808")
 def test_mongod_keeps_the_writes_of_a_killed_standalone_store(tmp_path: Path) -> None:
     """A standalone mongod keeps every journaled write across a kill, and
     mongod 8.2.11 started as `--replSet` on a killed `--standalone` store of
-    ours should hold them too: an acknowledged write is in the oplog (logged)
-    but not in the unlogged data tables until a checkpoint, and mongod, with
-    no replica-set configuration to recover from, does not replay it."""
+    ours holds them too: as mongod's `setTableLogging` does at startup, a
+    store opened as a standalone has its collections and indexes LOGGED, so
+    WiredTiger's own log recovery keeps what the data tables would have lost
+    to a kill between checkpoints (RM-808)."""
     store = tmp_path / "store"
 
     def setup(c: pymongo.MongoClient) -> None:
@@ -780,17 +781,33 @@ class _Model:
 
 
 def _write_until(
-    store: Path, kill_after: float, model: _Model, *extra: str, env: dict | None = None
-) -> None:
-    """Start `secantusd-mdb --standalone` on `store`, write inserts, `$inc`
-    updates and deletes one at a time (each acknowledged operation goes in
-    `model`), and SIGKILL the server `kill_after` seconds in, mid-operation."""
+    store: Path,
+    kill_after: float,
+    model: _Model,
+    *extra: str,
+    env: dict | None = None,
+    standalone: bool = True,
+    kill: bool = True,
+) -> int:
+    """Start `secantusd-mdb` (`--standalone`, or as a replica-set member)
+    on `store`, write inserts, `$inc` updates and deletes one at a time (each
+    acknowledged operation goes in `model`), and SIGKILL the server
+    `kill_after` seconds in, mid-operation (or, without `kill`, stop the
+    writer and the server cleanly). Returns the port it listened on."""
     import os
     import random
     import threading
 
     proc = subprocess.Popen(
-        [str(RS_BINARY), "--port", "0", "--storage-path", str(store), "--standalone", *extra],
+        [
+            str(RS_BINARY),
+            "--port",
+            "0",
+            "--storage-path",
+            str(store),
+            *(["--standalone"] if standalone else []),
+            *extra,
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -847,18 +864,27 @@ def _write_until(
         t = threading.Thread(target=writer, daemon=True)
         t.start()
         time.sleep(kill_after)
-        proc.send_signal(signal.SIGKILL)
-        proc.wait()
-        stop.set()
-        t.join(timeout=30)
+        if kill:
+            proc.send_signal(signal.SIGKILL)
+            proc.wait()
+            stop.set()
+            t.join(timeout=30)
+        else:
+            stop.set()
+            t.join(timeout=30)
+            proc.terminate()
+            proc.wait(timeout=60)
         client.close()
+        return int(m.group(2))
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait()
 
 
-def _open_and_kill(store: Path, delay: float = 0.0, env: dict | None = None) -> None:
+def _open_and_kill(
+    store: Path, delay: float = 0.0, env: dict | None = None, standalone: bool = True
+) -> None:
     """Open `store` as `secantusd-mdb --standalone` (replaying what a crash
     left) and SIGKILL it `delay` seconds after it listens, with no clean
     close in between: the next open replays again, over what the first
@@ -866,7 +892,14 @@ def _open_and_kill(store: Path, delay: float = 0.0, env: dict | None = None) -> 
     import os
 
     proc = subprocess.Popen(
-        [str(RS_BINARY), "--port", "0", "--storage-path", str(store), "--standalone"],
+        [
+            str(RS_BINARY),
+            "--port",
+            "0",
+            "--storage-path",
+            str(store),
+            *(["--standalone"] if standalone else []),
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -886,10 +919,10 @@ def _open_and_kill(store: Path, delay: float = 0.0, env: dict | None = None) -> 
         proc.wait()
 
 
-def _store_state(store: Path, *extra: str) -> dict[int, int]:
-    """Open the store with `secantusd-mdb --standalone`, read it whole, and
-    check its indexes and `validate`; stop it cleanly."""
-    with rust_mongo_server(store, "--standalone", *extra) as client:
+def _store_state(store: Path, *extra: str, standalone: bool = True) -> dict[int, int]:
+    """Open the store with `secantusd-mdb` (`--standalone`, or as a member),
+    read it whole, and check its indexes and `validate`; stop it cleanly."""
+    with rust_mongo_server(store, *(["--standalone"] if standalone else []), *extra) as client:
         docs = list(client.app.c.find({}))
         ids = [d["_id"] for d in docs]
         assert len(ids) == len(set(ids)), "a document twice"
@@ -1645,6 +1678,155 @@ def test_mongod_opens_a_killed_secantus_store(tmp_path: Path) -> None:
         # clean after an `fsync` (measured 8.2.11, 2026-11-22).
         mongod.admin.command("fsync")
         assert _validation(mongod, "app", "c") == (True, [], [])
+
+
+def _mongod_standalone_on(dbpath: Path) -> tuple[subprocess.Popen, pymongo.MongoClient | None]:
+    """mongod 8.2.11 started WITHOUT `--replSet` on `dbpath`: a standalone."""
+    assert MONGOD, "no mongod on PATH: the reference server is required"
+    port = _free_port()
+    proc = subprocess.Popen(
+        [
+            MONGOD,
+            "--dbpath",
+            str(dbpath),
+            "--port",
+            str(port),
+            "--bind_ip",
+            "127.0.0.1",
+            "--logpath",
+            str(dbpath.parent / f"mongod-{port}.log"),
+            "--logappend",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return proc, None
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                break
+        except OSError:
+            time.sleep(0.2)
+    return proc, pymongo.MongoClient(
+        f"mongodb://127.0.0.1:{port}/?directConnection=true", serverSelectionTimeoutMS=10_000
+    )
+
+
+def _mongod_docs(client: pymongo.MongoClient) -> dict[int, int]:
+    return {d["_id"]: d["v"] for d in client.app.c.find({})}
+
+
+@pytest.mark.backlog_fixed("RM-808")
+@pytest.mark.parametrize(
+    "mode, target, kill_after",
+    [
+        ("standalone", "standalone", 0.4),
+        ("standalone", "standalone", 2.0),
+        ("standalone", "replset", 0.4),
+        ("standalone", "replset", 2.0),
+        ("member", "replset", 1.2),
+    ],
+)
+def test_a_killed_store_is_handed_straight_to_mongod_with_every_write(
+    tmp_path: Path, mode: str, target: str, kill_after: float
+) -> None:
+    """`secantusd-mdb` SIGKILLed mid-write (journaled writes, `$inc`s and
+    deletes), and mongod 8.2.11 started on the store with NO `secantusd-mdb`
+    open in between, as a standalone or as `--replSet`: every acknowledged
+    write is there, and mongod takes a write (RM-808). A standalone's tables
+    are logged, so WiredTiger's log recovery keeps them (mongod's
+    `setTableLogging`); a member's recovery is mongod's own, from the oplog.
+    A killed member opened by a standalone mongod is not asked: with no
+    `--replSet` mongod does not replay the oplog, as with its own stores."""
+    store = tmp_path / "store"
+    model = _Model({})
+    port = _write_until(store, kill_after, model, standalone=mode == "standalone")
+    if target == "standalone":
+        proc, client = _mongod_standalone_on(store)
+    else:
+        if mode == "member":
+            # The set the member recorded, under its name and on its port.
+            proc, client = _mongod_on(store, port, SECANTUS_SET)
+        else:
+            proc, client = _mongod_on(store, None, "rs0")
+    try:
+        assert client is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            if target == "replset":
+                host, mport = client.address or ("127.0.0.1", 0)
+                if mode == "standalone":
+                    _wait_primary(client, f"{host}:{mport}")
+                else:
+                    _until_primary(client)
+            states = model.settle()
+            got = _mongod_docs(client)
+            assert got in states, (
+                f"mongod holds {len(got)} documents; acknowledged: {len(model.docs)}"
+            )
+            client["app"]["post"].insert_one({"_id": -1})
+    finally:
+        _stop_mongod(proc, client)
+
+
+@pytest.mark.backlog_fixed("RM-808")
+@pytest.mark.parametrize("kill", [True, False])
+def test_a_store_switched_between_standalone_and_member_keeps_every_write(
+    tmp_path: Path, kill: bool
+) -> None:
+    """The mode a server starts in sets its tables' logging as mongod's
+    `setTableLogging` does (a standalone's logged, a member's unlogged):
+    lives alternate between them on one store, each ended by a SIGKILL or a
+    clean stop, and the next life -- in the OTHER mode as often as not --
+    finds every acknowledged write exactly once (RM-808)."""
+    store = tmp_path / "store"
+    env = {"SECANTUS_CHECKPOINT_SECONDS": "1"}
+    model = _Model({})
+    modes = [True, False, True, True, False, False, True]
+    for life, standalone in enumerate(modes):
+        _write_until(store, 0.8 + 0.1 * life, model, env=env, standalone=standalone, kill=kill)
+        nxt = modes[(life + 1) % len(modes)]
+        got = _store_state(store, standalone=nxt)
+        _assert_matches(
+            model,
+            got,
+            f"life {life} ({'standalone' if standalone else 'member'}) -> "
+            f"{'standalone' if nxt else 'member'}",
+        )
+
+
+@pytest.mark.backlog_fixed("RM-808")
+@pytest.mark.parametrize("how", ["clean", "killed"])
+def test_secantus_opens_a_standalone_mongod_store_in_both_modes(tmp_path: Path, how: str) -> None:
+    """A store written by a STANDALONE mongod 8.2.11 (logged tables, no
+    oplog), stopped cleanly or killed, opened by `secantusd-mdb` as a
+    standalone and as a replica-set member (which makes the tables unlogged):
+    every document is there both times (RM-808)."""
+    store = tmp_path / "store"
+    store.mkdir()
+    proc, client = _mongod_standalone_on(store)
+    assert client is not None, "mongod did not start on an empty directory"
+    try:
+        client.app.get_collection("c", write_concern=pymongo.WriteConcern(j=True)).insert_many(
+            [{"_id": i, "v": i} for i in range(50)]
+        )
+        client.app.c.create_index("v")
+        if how == "killed":
+            proc.send_signal(signal.SIGKILL)
+            proc.wait()
+    finally:
+        if how == "killed":
+            client.close()
+        else:
+            _stop_mongod(proc, client)
+    expected = {i: i for i in range(50)}
+    copy = tmp_path / "member"
+    shutil.copytree(store, copy)
+    with rust_mongo_server(store, "--standalone") as c:
+        assert _mongod_docs(c) == expected
+    with rust_mongo_server(copy) as c:
+        assert _mongod_docs(c) == expected
 
 
 def _mongod_store(tmp_path: Path, setup: Any, kill: bool = False) -> Path:

@@ -2998,23 +2998,6 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       Verify: none -- tooling; reproduce by stopping a gate in `mongod-live` and listing `ps -Ao pid,ppid,command | awk '$2==1 && /secantus-probe/'`
       Backlog-ID: RM-804
 
-- [ ] **A killed `--standalone` store handed straight to mongod loses the
-      writes since its last checkpoint (2026-11-25).** A standalone's data
-      tables are unlogged and its crash recovery is this server's own
-      replay of the oplog from the position its last checkpoint recorded
-      (RM-805), which only `secantusd-mdb` runs. `mongod --replSet` started
-      on a killed standalone store (no replica-set configuration, so no
-      startup recovery) opens the last checkpoint, and every write since --
-      up to `SECANTUS_CHECKPOINT_SECONDS`, 60 by default -- is absent,
-      where a killed standalone mongod, whose tables are logged, keeps every
-      journaled write. Opening the store once with `secantusd-mdb` (which
-      replays) before the hand-off, or a clean stop, loses nothing.
-      Closing it needs the data tables logged for a standalone store, which
-      is a create-time property of a table: a decision for Joe (log the
-      tables of a store created `--standalone`, as mongod does, and give up
-      the timestamped reads and the unlogged write path there).
-      Verify: tests/backlog/test_rm_storage_model.py::test_mongod_keeps_the_writes_of_a_killed_standalone_store
-      Backlog-ID: RM-808
 - [ ] **A restore to the timestamp of a batched insert applies part of the
       batch.** `insert_many` of two documents is one `applyOps` entry in
       `local.oplog.rs` (as mongod 8.2 logs a batched insert), but
