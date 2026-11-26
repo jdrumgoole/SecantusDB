@@ -1225,15 +1225,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       have, mongod's `otherNss` order is its hash set's, and the rest is
       unmeasured: a probe must find a difference before a test can assert it
       Backlog-ID: RM-532
-- [ ] **A hybrid search's key names no `otherNss`.** mongod 8.2.11 lists
-      the collection of the `$unionWith` a `$rankFusion` (or
-      `$scoreFusion`) desugars its later input pipelines into under the
-      key's `otherNss`, the aggregate's own collection, and hashes the key
-      with it. This server walks the pipeline as written, finds no other
-      namespace, and prints none: the entry's `keyHash` differs. Found
-      2026-11-14 working RM-532.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm532.py::test_a_hybrid_search_names_the_collection_it_unions
-      Backlog-ID: RM-644
 - [ ] **A run-time error names the stored document, not the one the read
       projected.** mongod 8.2.11 reads only the fields a pipeline depends
       on, and an expression's error names that projection:

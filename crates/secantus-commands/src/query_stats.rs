@@ -1296,13 +1296,14 @@ fn collection_type(request: &Document, ctx: &CommandContext, db: &str, coll: &st
 /// them.
 fn involved(request: &Document, db: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
+    let coll = request.get_str("aggregate").unwrap_or_default();
     if let Ok(pipeline) = request.get_array("pipeline") {
-        walk(pipeline, db, &mut out);
+        walk(pipeline, db, coll, &mut out);
     }
     out
 }
 
-fn walk(pipeline: &[Bson], db: &str, out: &mut Vec<(String, String)>) {
+fn walk(pipeline: &[Bson], db: &str, coll: &str, out: &mut Vec<(String, String)>) {
     let add = |ns: (String, String), out: &mut Vec<(String, String)>| {
         if !out.contains(&ns) {
             out.push(ns);
@@ -1326,7 +1327,7 @@ fn walk(pipeline: &[Bson], db: &str, out: &mut Vec<(String, String)>) {
                         _ => {}
                     }
                     if let Ok(p) = s.get_array("pipeline") {
-                        walk(p, db, out);
+                        walk(p, db, coll, out);
                     }
                 }
             }
@@ -1337,7 +1338,7 @@ fn walk(pipeline: &[Bson], db: &str, out: &mut Vec<(String, String)>) {
                         add((db.to_string(), c.to_string()), out);
                     }
                     if let Ok(p) = s.get_array("pipeline") {
-                        walk(p, db, out);
+                        walk(p, db, coll, out);
                     }
                 }
                 _ => {}
@@ -1359,10 +1360,26 @@ fn walk(pipeline: &[Bson], db: &str, out: &mut Vec<(String, String)>) {
                     _ => {}
                 }
             }
+            // A hybrid search desugars every input pipeline after the
+            // first into a `$unionWith` of the aggregate's own collection
+            // (`DocumentSourceRankFusion` / `DocumentSourceScoreFusion`).
+            "$rankFusion" | "$scoreFusion" => {
+                let pipelines = spec
+                    .and_then(|s| s.get_document("input").ok())
+                    .and_then(|i| i.get_document("pipelines").ok());
+                if let Some(pipelines) = pipelines {
+                    for (i, p) in pipelines.values().filter_map(Bson::as_array).enumerate() {
+                        if i > 0 {
+                            add((db.to_string(), coll.to_string()), out);
+                        }
+                        walk(p, db, coll, out);
+                    }
+                }
+            }
             "$facet" => {
                 if let Some(s) = spec {
                     for p in s.values().filter_map(Bson::as_array) {
-                        walk(p, db, out);
+                        walk(p, db, coll, out);
                     }
                 }
             }
