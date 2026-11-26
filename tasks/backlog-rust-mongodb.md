@@ -3162,6 +3162,37 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       Verify: tests/backlog/test_rm_clustered_explain.py::test_a_clustered_key_is_hinted_by_its_own_name
       Backlog-ID: RM-821
 
+- [ ] **`{_id: {$gt: NaN}}` on a clustered collection is a plain
+      `COLLSCAN`, where mongod bounds it (2026-11-26).** mongod 8.2.11
+      explains it as `CLUSTERED_IXSCAN` with `minRecord` NaN and
+      `maxRecord` Infinity, the number bracket. This server's
+      `plan::rid_clause` bounds nothing for a NaN operand. Found by the
+      RM-739 fix; probed, no gap test yet.
+      Verify: none -- gap test to write beside tests/backlog/test_rm_clustered_explain.py, comparing the winning plan's stage and bounds with mongod's
+      Backlog-ID: RM-822
+
+- [ ] **A `tailable` find of an `_id` point on an uncapped clustered
+      collection is planned as `EXPRESS`, where mongod refuses it
+      (2026-11-26).** mongod 8.2.11 refuses a tailable cursor on a
+      collection that is not capped. This server picks the express plan
+      first, and its explain shows `EXPRESS_CLUSTERED_IXSCAN`. Compare
+      the plain find's reply and the explain's with mongod's, and check
+      that the refusal comes before planning. Found by the RM-739 fix;
+      probed, no gap test yet.
+      Verify: none -- gap test to write beside tests/backlog/test_rm_clustered_explain.py, comparing the error code and message with mongod's
+      Backlog-ID: RM-823
+
+- [ ] **The winning plan of a multi-plan trial reports one `works` fewer
+      than mongod (2026-11-26).** On a plain collection with two
+      competing indexes, the winner's own `executionStages.works` is one
+      lower than mongod 8.2.11's (2 against 3, 5 against 6). The rejected
+      plans' counters match. `tests/mongod_live/test_plan_trial.py`
+      compares the trial's accounting but says it leaves the winner's own
+      run out, so nothing catches it. mongod's final run counts the work
+      that reports EOF. Found by the RM-739 fix's probes.
+      Verify: none -- gap test to write: extend tests/mongod_live/test_plan_trial.py's comparison to the winner's executionStages
+      Backlog-ID: RM-824
+
 - [ ] **A time-series collection's own namespace still has a table and a
       registry entry, and its buckets collection's catalog options are
       short.** mongod keeps `app.ts` as a view (one `system.views` document)
