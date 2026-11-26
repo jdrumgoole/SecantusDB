@@ -47795,9 +47795,10 @@ impl PgHandler {
                 }
                 // A chain whose join keys a WHERE constant's equivalence
                 // class holds (RP-1065): Nested Loops with no join clause,
-                // each scan filtered by the constant.
+                // each scan filtered by the constant. VERBOSE prints its
+                // lists over this plan (RP-966).
                 if let Statement::Select(sel) = inner.as_ref() {
-                    if tree.name == "Hash Join" && !options.verbose && !options.analyze {
+                    if tree.name == "Hash Join" && !options.analyze {
                         if let Some(c) = self.chain_class_constant(sel) {
                             explain::class_constant_chain(
                                 &mut tree, &c.implied, &c.from, &c.indexes,

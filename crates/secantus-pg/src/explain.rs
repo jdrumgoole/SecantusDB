@@ -4074,6 +4074,71 @@ mod join_type_tests {
     }
 
     #[test]
+    fn verbose_class_constant_loop_prefixes_each_scan() {
+        // `select e.b from e join k on e.a = k.a where e.a = 3 and e.b <>
+        // 'x'` on a private PostgreSQL 15.20 cluster (RP-966): each scan's
+        // physical target list, its quals and the class's equality
+        // prefixed; a scan holding no class equality is another plan.
+        use secantus_pgplan::ruleutils::{VerboseJoin, VerboseRel};
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        let rel = |name: &str| VerboseRel {
+            relation: format!("public.{name}"),
+            plain: name.into(),
+            columns: vec![format!("{name}.a"), format!("{name}.b")],
+            refname: name.into(),
+            pkey: (name == "k").then(|| ("k_pkey".into(), "k.a".into())),
+            ..Default::default()
+        };
+        let mut e = rel("e");
+        e.quals = vec![
+            pair("(b <> 'x'::text)", "(e.b <> 'x'::text)"),
+            pair("(a = 3)", "(e.a = 3)"),
+        ];
+        let mut k = rel("k");
+        k.class_quals = vec![pair("(a = 3)", "(k.a = 3)")];
+        let v = VerboseJoin {
+            rels: [e, k],
+            output: vec!["e.b".into()],
+            all_equal: true,
+            ..Default::default()
+        };
+        let plan = |cond: &str| {
+            let mut root = PlanNode::new("Nested Loop");
+            let mut seq = PlanNode::new("Seq Scan on e");
+            seq.details
+                .push(pair("Filter", "((b <> 'x'::text) AND (a = 3))"));
+            let mut ios = PlanNode::new("Index Only Scan using k_pkey on k");
+            ios.details.push(pair("Index Cond", cond));
+            root.children = vec![seq, ios];
+            root
+        };
+        let mut root = plan("(a = 3)");
+        assert!(attach_verbose_class_loop(&mut root, &v));
+        assert_eq!(root.details, vec![pair("Output", "e.b")]);
+        assert_eq!(root.children[0].name, "Seq Scan on public.e");
+        assert_eq!(
+            root.children[0].details,
+            vec![
+                pair("Output", "e.a, e.b"),
+                pair("Filter", "((e.b <> 'x'::text) AND (e.a = 3))"),
+            ]
+        );
+        assert_eq!(
+            root.children[1].name,
+            "Index Only Scan using k_pkey on public.k"
+        );
+        assert_eq!(
+            root.children[1].details,
+            vec![pair("Output", "k.a"), pair("Index Cond", "(k.a = 3)")]
+        );
+        let mut other = plan("(a = e.a)");
+        let before = other.clone();
+        assert!(!attach_verbose_class_loop(&mut other, &v));
+        assert_eq!(other.name, before.name);
+        assert_eq!(other.children[0].name, before.children[0].name);
+    }
+
+    #[test]
     fn a_constant_equality_fixes_its_field() {
         let mut out = Vec::new();
         let f = bson::doc! {
@@ -4628,6 +4693,9 @@ fn attach_verbose_nested_loop(root: &mut PlanNode, v: &secantus_pgplan::ruleutil
         attach_verbose_materialized_loop(root, v);
         return;
     }
+    if attach_verbose_class_loop(root, v) {
+        return;
+    }
     if !root.details.is_empty() || root.children.len() != 2 {
         return;
     }
@@ -4780,6 +4848,228 @@ fn attach_verbose_nested_loop(root: &mut PlanNode, v: &secantus_pgplan::ruleutil
         .insert(0, ("Output".into(), v.output.join(", ")));
 }
 
+/// The conjuncts of a printed `Filter` or `Index Cond`, each
+/// parenthesised: one when it is not an AND of parenthesised parts.
+fn printed_conjuncts(text: &str) -> Vec<String> {
+    if let Some(inner) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
+        if inner.starts_with('(') && inner.ends_with(')') && inner.contains(") AND (") {
+            return inner.split(" AND ").map(str::to_string).collect();
+        }
+    }
+    vec![text.to_string()]
+}
+
+/// A scan whose every detail is a `Filter` or an `Index Cond` made of
+/// `quals` and `class_quals` (plain, prefixed): each detail prefixed, in
+/// order, and whether a class equality was among them. `None` when a
+/// detail holds anything else.
+fn class_scan_quals(
+    n: &PlanNode,
+    quals: &[(String, String)],
+    class_quals: &[(String, String)],
+) -> Option<(Vec<String>, bool)> {
+    let mut out = Vec::new();
+    let mut class = false;
+    for (k, text) in &n.details {
+        if k != "Filter" && k != "Index Cond" {
+            return None;
+        }
+        let mut parts = Vec::new();
+        for part in printed_conjuncts(text) {
+            if let Some((_, full)) = class_quals.iter().find(|(bare, _)| *bare == part) {
+                class = true;
+                parts.push(full.clone());
+            } else {
+                parts.push(quals.iter().find(|(bare, _)| *bare == part)?.1.clone());
+            }
+        }
+        out.push(match parts.as_slice() {
+            [one] => one.clone(),
+            _ => format!("({})", parts.join(" AND ")),
+        });
+    }
+    Some((out, class))
+}
+
+/// A scan's physical target list (`use_physical_tlist`): its table's
+/// columns, or an Index Only Scan's index columns (a one-column primary
+/// key only, `pkey` its index and column).
+fn physical_output(
+    n: &PlanNode,
+    pkey: &Option<(String, String)>,
+    columns: &[String],
+) -> Option<String> {
+    if n.name.starts_with("Index Only Scan") {
+        let (index, col) = pkey.as_ref()?;
+        let name = n.name.replacen(" Backward", "", 1);
+        return name
+            .starts_with(&format!("Index Only Scan using {index} on "))
+            .then(|| col.clone());
+    }
+    Some(columns.join(", "))
+}
+
+/// Print a class-constant scan under VERBOSE: its relation's name, its
+/// `Output` and its prefixed quals. `false`, the node untouched, when it
+/// is not such a scan: a member's scan must hold its class equality.
+fn verbose_class_scan(
+    n: &mut PlanNode,
+    plain: &str,
+    relation: &str,
+    columns: &[String],
+    pkey: &Option<(String, String)>,
+    quals: &[(String, String)],
+    class_quals: &[(String, String)],
+) -> bool {
+    if !is_scan_name(&n.name)
+        || !n.children.is_empty()
+        || !n.name.ends_with(&format!(" on {plain}"))
+    {
+        return false;
+    }
+    let Some((details, class)) = class_scan_quals(n, quals, class_quals) else {
+        return false;
+    };
+    let Some(output) = physical_output(n, pkey, columns) else {
+        return false;
+    };
+    if !class && !class_quals.is_empty() {
+        return false;
+    }
+    let cut = n.name.len() - plain.len();
+    n.name = format!("{}{relation}", &n.name[..cut]);
+    for ((_, text), full) in n.details.iter_mut().zip(details) {
+        *text = full;
+    }
+    n.details.insert(0, ("Output".into(), output));
+    true
+}
+
+/// `EXPLAIN VERBOSE` of a two-relation Nested Loop with no join clause,
+/// a WHERE constant on one ON key having fixed the ON's equivalence class
+/// (RP-1065, RP-966): each scan returns its physical target list (an
+/// Index Only Scan its index's), and prints its own WHERE conjuncts and
+/// the class's equality on its key prefixed, as PostgreSQL 15.20 prints
+/// `Filter: (e.a = 3)` over `Index Cond: (k.a = 3)`. `false` when the
+/// loop is not that plan, which is then left to the other shapes.
+fn attach_verbose_class_loop(
+    root: &mut PlanNode,
+    v: &secantus_pgplan::ruleutils::VerboseJoin,
+) -> bool {
+    if root.name != "Nested Loop"
+        || !root.details.is_empty()
+        || root.children.len() != 2
+        || v.join_filter
+        || !v.all_equal
+        || v.expr_on
+        || v.rels.iter().all(|r| r.class_quals.is_empty())
+    {
+        return false;
+    }
+    let mut drawn = root.clone();
+    let mut used = Vec::new();
+    for child in &mut drawn.children {
+        let Some(at) = (0..2).find(|&i| {
+            !used.contains(&i) && {
+                let r = &v.rels[i];
+                verbose_class_scan(
+                    child,
+                    &r.plain,
+                    &r.relation,
+                    &r.columns,
+                    &r.pkey,
+                    &r.quals,
+                    &r.class_quals,
+                )
+            }
+        }) else {
+            return false;
+        };
+        used.push(at);
+    }
+    drawn
+        .details
+        .insert(0, ("Output".into(), v.output.join(", ")));
+    *root = drawn;
+    true
+}
+
+/// `EXPLAIN VERBOSE` of a chain whose one equivalence class a WHERE
+/// constant fixes (RP-1065, RP-966), drawn as left-deep Nested Loops with
+/// no join clause: each scan as [`verbose_class_scan`] prints it, each
+/// join its `build_joinrel_tlist` (its outer side's columns, then its
+/// inner side's, each one the target list reads or an ON clause still
+/// reaching outside it needs), the top join the query's target list, as
+/// PostgreSQL 15.20 prints `Output: e.b, e.a, k.b` under `(... join k k2
+/// on k2.a = e.a)`. `false`, the plan untouched, for any other plan.
+fn attach_verbose_class_chain(
+    root: &mut PlanNode,
+    c: &secantus_pgplan::ruleutils::VerboseChain,
+) -> bool {
+    use secantus_pgplan::ruleutils::ChainNeed;
+    type Tlist = Vec<(String, ChainNeed)>;
+    fn walk(
+        n: &mut PlanNode,
+        c: &secantus_pgplan::ruleutils::VerboseChain,
+    ) -> Option<(Vec<usize>, Tlist)> {
+        if n.children.is_empty() {
+            let i = (0..c.rels.len()).find(|&i| {
+                let r = &c.rels[i];
+                verbose_class_scan(
+                    n,
+                    &r.plain,
+                    &r.relation,
+                    &r.columns,
+                    &r.pkey,
+                    &r.quals,
+                    &r.class_quals,
+                )
+            })?;
+            return Some((vec![i], c.rels[i].reltarget.clone()));
+        }
+        if n.name != "Nested Loop" || !n.details.is_empty() || n.children.len() != 2 {
+            return None;
+        }
+        let (mut rels, outer) = walk(&mut n.children[0], c)?;
+        let (inner_rels, inner) = walk(&mut n.children[1], c)?;
+        if inner_rels.iter().any(|r| rels.contains(r)) {
+            return None;
+        }
+        rels.extend(inner_rels);
+        let tlist: Tlist = outer
+            .into_iter()
+            .chain(inner)
+            .filter(|(_, need)| {
+                need.output
+                    || need
+                        .clause_rels
+                        .iter()
+                        .any(|pair| pair.iter().any(|r| !rels.contains(r)))
+            })
+            .collect();
+        let shown: Vec<&str> = tlist.iter().map(|(t, _)| t.as_str()).collect();
+        n.details.insert(0, ("Output".into(), shown.join(", ")));
+        Some((rels, tlist))
+    }
+    if !c.class_constant
+        || c.nullable.iter().any(|x| *x)
+        || c.full.iter().any(|x| *x)
+        || root.name != "Nested Loop"
+    {
+        return false;
+    }
+    let mut drawn = root.clone();
+    let Some((rels, _)) = walk(&mut drawn, c) else {
+        return false;
+    };
+    if rels.len() != c.rels.len() {
+        return false;
+    }
+    drawn.details[0].1 = c.output.join(", ");
+    *root = drawn;
+    true
+}
+
 /// `EXPLAIN VERBOSE` of a two-relation nested loop whose inner side is a
 /// Materialize over a scan, the ON evaluated as its `Join Filter`
 /// (RP-966): the outer scan returns its physical target list, the
@@ -4886,6 +5176,12 @@ pub(crate) fn attach_verbose_chain(
     root: &mut PlanNode,
     chain: &Option<secantus_pgplan::ruleutils::VerboseChain>,
 ) {
+    if let Some(c) = chain {
+        if c.class_constant {
+            attach_verbose_class_chain(root, c);
+            return;
+        }
+    }
     use secantus_pgplan::ruleutils::{ChainNeed, VerboseChain};
     type Tlist = Vec<(String, ChainNeed)>;
     fn walk(

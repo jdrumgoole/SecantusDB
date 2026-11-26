@@ -7519,6 +7519,33 @@ pub fn explain_verbose_scan(
     })
 }
 
+/// The column of a WHERE conjunct `<column> = <constant>`, the shape that
+/// joins a column's equivalence class to a constant (RP-1065): its right
+/// side reads no column and holds no subquery.
+fn column_equals_constant(part: &Node) -> Option<&pg_query::protobuf::ColumnRef> {
+    let Some(N::AExpr(a)) = part.node.as_ref() else {
+        return None;
+    };
+    let is_eq = a.kind() == pg_query::protobuf::AExprKind::AexprOp
+        && matches!(
+            a.name.as_slice(),
+            [n] if matches!(n.node.as_ref(), Some(N::String(s)) if s.sval == "=")
+        );
+    let Some(N::ColumnRef(c)) = a.lexpr.as_deref()?.node.as_ref() else {
+        return None;
+    };
+    let mut constant = true;
+    let mut copy = a.rexpr.as_deref()?.clone();
+    crate::walk_expr(&mut copy, &mut |n| {
+        if matches!(n.node.as_ref(), Some(N::ColumnRef(_) | N::SubLink(_))) {
+            constant = false;
+        }
+        Ok(())
+    })
+    .ok()?;
+    (is_eq && constant).then_some(c)
+}
+
 /// One relation of a two-relation join under `EXPLAIN VERBOSE` (RP-966).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct VerboseRel {
@@ -7546,6 +7573,11 @@ pub struct VerboseRel {
     /// an Index Only Scan of it returns the index's target list
     /// (`indextlist`), not the table's.
     pub pkey: Option<(String, String)>,
+    /// Each equality an inner join's equivalence class gives this
+    /// relation's ON key from a WHERE constant on the other relation's
+    /// key (`generate_base_implied_equalities_const`, RP-1065), as the
+    /// plain plan prints it (`(a = 3)`) and as VERBOSE does (`(k.a = 3)`).
+    pub class_quals: Vec<(String, String)>,
 }
 
 /// `EXPLAIN VERBOSE` of a SELECT joining two relations on an ON of
@@ -7731,6 +7763,8 @@ pub fn explain_verbose_join(
     let mut parts = Vec::new();
     let mut all_equal = true;
     let mut expr_on = false;
+    // Each ON equality of a column of each side: an equivalence class.
+    let mut on_equalities: Vec<((usize, String), (usize, String))> = Vec::new();
     and_clauses(j.quals.as_deref()?, &mut parts);
     for part in &parts {
         let part: &Node = part;
@@ -7819,12 +7853,16 @@ pub fn explain_verbose_join(
             );
             join_quals[own].push((plain, full.clone()));
         }
+        if op == "=" {
+            on_equalities.push(((li, lc.clone()), (ri, rc.clone())));
+        }
         need(li, &lc);
         need(ri, &rc);
     }
     // The WHERE: each conjunct a restriction of one relation, which its
     // scan evaluates as its `Filter`; its columns are not needed above.
     let mut quals: [Vec<(String, String)>; 2] = [Vec::new(), Vec::new()];
+    let mut class_quals: [Vec<(String, String)>; 2] = [Vec::new(), Vec::new()];
     let mut join_filter = false;
     let mut unprinted_filter = false;
     if let Some(w) = s.where_clause.as_deref() {
@@ -7979,7 +8017,30 @@ pub fn explain_verbose_join(
                 }
                 _ => return None,
             };
-            quals[i].push((print(part, i, true)?, print(part, i, false)?));
+            let plain = print(part, i, true)?;
+            // `<ON key> = <constant>` joins the ON's equivalence class
+            // over an inner join, which then gives the other side's key
+            // the same equality (RP-1065).
+            if jt == pg_query::protobuf::JoinType::JoinInner {
+                if let Some((ki, kc)) = column_equals_constant(part).and_then(&resolve) {
+                    if let Some(rest) = plain.strip_prefix(&format!("({} = ", q(&kc))) {
+                        for (x, y) in &on_equalities {
+                            let other = if *x == (ki, kc.clone()) {
+                                y
+                            } else if *y == (ki, kc.clone()) {
+                                x
+                            } else {
+                                continue;
+                            };
+                            class_quals[other.0].push((
+                                format!("({} = {rest}", q(&other.1)),
+                                format!("({}.{} = {rest}", q(&sides[other.0].0), q(&other.1)),
+                            ));
+                        }
+                    }
+                }
+            }
+            quals[i].push((plain, print(part, i, false)?));
         }
     }
     let rel = |i: usize| {
@@ -8004,6 +8065,7 @@ pub fn explain_verbose_join(
             refname: q(refname),
             quals: quals[i].clone(),
             join_quals: join_quals[i].clone(),
+            class_quals: class_quals[i].clone(),
             pkey: match def
                 .columns
                 .iter()
@@ -8088,6 +8150,13 @@ pub struct ChainRel {
     /// Each WHERE conjunct over this relation alone, as the plain plan
     /// prints its scan's `Filter` and as VERBOSE prints it, prefixed.
     pub quals: Vec<(String, String)>,
+    /// A one-column PRIMARY KEY's index name and its column, prefixed: an
+    /// Index Only Scan of it returns the index's target list.
+    pub pkey: Option<(String, String)>,
+    /// The equality a WHERE constant's equivalence class gives this
+    /// relation's member (RP-1065), plain and prefixed, as
+    /// [`VerboseRel::class_quals`].
+    pub class_quals: Vec<(String, String)>,
 }
 
 /// Why a column of a [`ChainRel`] is needed above a join.
@@ -8099,6 +8168,12 @@ pub struct ChainNeed {
     /// that does not hold all of them (`generate_base_implied_equalities`
     /// adds its Vars with the class's relids).
     pub ec_rels: Vec<usize>,
+    /// The two relations of each inner ON clause that reads it: with a
+    /// constant in its class it is needed above a join only while one of
+    /// those clauses reaches outside it (`distribute_qual_to_rels` adds
+    /// each clause's Vars with the clause's relids;
+    /// `generate_base_implied_equalities_const` adds none).
+    pub clause_rels: Vec<[usize; 2]>,
 }
 
 /// `EXPLAIN VERBOSE` of a SELECT of columns over three or more relations
@@ -8114,6 +8189,10 @@ pub struct VerboseChain {
     /// Per relation: a FULL JOIN adds it, a `Hash Full Join` hashing it
     /// alone. Every join above a FULL JOIN is an outer join.
     pub full: Vec<bool>,
+    /// A WHERE `<member> = <constant>` fixes the ON's one equivalence
+    /// class (RP-1065): every join is a Nested Loop with no clause, each
+    /// member's scan taking its `class_quals`.
+    pub class_constant: bool,
 }
 
 /// [`VerboseChain`] for `SELECT <columns> FROM a JOIN b ON a.x = b.y JOIN
@@ -8259,6 +8338,8 @@ pub fn explain_verbose_chain(
     // is needed until the join above both of its relations
     // (`distribute_qual_to_rels` keeps it an outer-join clause).
     let mut outer_needs: Vec<((usize, String), [usize; 2])> = Vec::new();
+    // Each inner ON clause's columns, with the clause's two relations.
+    let mut clause_needs: Vec<((usize, String), [usize; 2])> = Vec::new();
     for (on_i, on) in ons.iter().enumerate() {
         let mut parts = Vec::new();
         and_clauses(on, &mut parts);
@@ -8300,6 +8381,8 @@ pub fn explain_verbose_chain(
                 outer_needs.push((r.clone(), [l.0, r.0]));
                 continue;
             }
+            clause_needs.push((l.clone(), [l.0, r.0]));
+            clause_needs.push((r.clone(), [l.0, r.0]));
             let li = ecs.iter().position(|e| e.contains(&l));
             let ri = ecs.iter().position(|e| e.contains(&r));
             match (li, ri) {
@@ -8317,6 +8400,9 @@ pub fn explain_verbose_chain(
     // Each WHERE conjunct must read exactly one relation: its scan's
     // `Filter`. Its columns are not in the `reltarget`.
     let mut quals: Vec<Vec<(String, String)>> = vec![Vec::new(); n];
+    // Each WHERE `<class member> = <constant>`: its class, the member and
+    // the text after `(<column> = `.
+    let mut constants: Vec<(usize, (usize, String), String)> = Vec::new();
     // A WHERE over a FULL JOIN filters above it, or reduces it.
     if fulls.contains(&true) && s.where_clause.is_some() {
         return None;
@@ -8362,7 +8448,33 @@ pub fn explain_verbose_chain(
             if nullable[i] {
                 return None;
             }
-            quals[i].push((print(part, i, true)?, print(part, i, false)?));
+            let plain = print(part, i, true)?;
+            if let Some(key) = column_equals_constant(part).and_then(&resolve) {
+                if let (Some(ec), Some(rest)) = (
+                    ecs.iter().position(|e| e.contains(&key)),
+                    plain.strip_prefix(&format!("({} = ", q(&key.1))),
+                ) {
+                    constants.push((ec, key, rest.to_string()));
+                }
+            }
+            quals[i].push((plain, print(part, i, false)?));
+        }
+    }
+    // A class one WHERE constant fixes gives every other member its
+    // equality (`generate_base_implied_equalities_const`). Two constants
+    // in one class are another plan (RP-1102).
+    let mut class_quals: Vec<Vec<(String, String)>> = vec![Vec::new(); n];
+    let mut class_constant = false;
+    for (ec, key, rest) in &constants {
+        if constants.iter().filter(|(e, _, _)| e == ec).count() != 1 {
+            continue;
+        }
+        class_constant = true;
+        for (j, c) in ecs[*ec].iter().filter(|m| *m != key) {
+            class_quals[*j].push((
+                format!("({} = {rest}", q(c)),
+                format!("({}.{} = {rest}", q(&sides[*j].0), q(c)),
+            ));
         }
     }
     let pre = |i: usize, c: &str| format!("{}.{}", q(&sides[i].0), q(c));
@@ -8396,11 +8508,34 @@ pub fn explain_verbose_chain(
                         let need = ChainNeed {
                             output: outputs.contains(&key),
                             ec_rels,
+                            clause_rels: clause_needs
+                                .iter()
+                                .filter(|(k, _)| *k == key)
+                                .map(|(_, rels)| *rels)
+                                .collect(),
                         };
                         (pre(i, c), need)
                     })
                     .collect(),
                 quals: quals[i].clone(),
+                pkey: match def
+                    .columns
+                    .iter()
+                    .filter(|c| c.pk)
+                    .collect::<Vec<_>>()
+                    .as_slice()
+                {
+                    [c] => Some((
+                        q(&def
+                            .extra
+                            .get_str("pk_name")
+                            .map(str::to_string)
+                            .unwrap_or_else(|_| format!("{bare}_pkey"))),
+                        pre(i, &c.name),
+                    )),
+                    _ => None,
+                },
+                class_quals: class_quals[i].clone(),
             }
         })
         .collect();
@@ -8409,5 +8544,98 @@ pub fn explain_verbose_chain(
         output: outputs.iter().map(|(i, c)| pre(*i, c)).collect(),
         nullable,
         full: std::iter::once(false).chain(fulls).collect(),
+        class_constant,
     })
+}
+
+#[cfg(test)]
+mod verbose_class_constant_tests {
+    use super::*;
+    use secantus_pgcatalog::Column;
+
+    fn lookup(name: &str) -> Option<TableDef> {
+        matches!(name, "e" | "k").then(|| {
+            TableDef::new(
+                name,
+                vec![
+                    Column::new("a", "int4", name == "k"),
+                    Column::new("b", "text", false),
+                ],
+            )
+        })
+    }
+
+    fn select(sql: &str) -> pg_query::protobuf::SelectStmt {
+        let p = pg_query::parse(sql).unwrap();
+        let Some(N::SelectStmt(s)) = p.protobuf.stmts[0].stmt.as_ref().unwrap().node.as_ref()
+        else {
+            panic!("{sql}")
+        };
+        (**s).clone()
+    }
+
+    fn pair(plain: &str, full: &str) -> (String, String) {
+        (plain.to_string(), full.to_string())
+    }
+
+    #[test]
+    fn a_where_constant_gives_the_other_on_key_its_equality() {
+        // PostgreSQL 15.20 (RP-966, RP-1065): `e.a = 3` joins the ON's
+        // class, so `k`'s key takes `(k.a = 3)` too; `e`'s own conjunct
+        // stays its WHERE qual.
+        let v = explain_verbose_join(
+            &select("select e.b from e join k on e.a = k.a where e.a = 3"),
+            &lookup,
+        )
+        .unwrap();
+        assert_eq!(v.rels[0].quals, vec![pair("(a = 3)", "(e.a = 3)")]);
+        assert!(v.rels[0].class_quals.is_empty());
+        assert_eq!(v.rels[1].class_quals, vec![pair("(a = 3)", "(k.a = 3)")]);
+        // A LEFT JOIN's ON makes no class (`reconsider_outer_join_clauses`
+        // is another mechanism, RP-1103), nor does a constant compared
+        // with anything but `=`.
+        for sql in [
+            "select e.b from e left join k on e.a = k.a where e.a = 3",
+            "select e.b from e join k on e.a = k.a where e.a < 3",
+            "select e.b from e join k on e.a = k.a where e.a = length(e.b)",
+        ] {
+            let v = explain_verbose_join(&select(sql), &lookup).unwrap();
+            assert!(v.rels.iter().all(|r| r.class_quals.is_empty()), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_chain_class_constant_keeps_each_column_for_its_own_clauses() {
+        // PostgreSQL 15.20 (RP-966): with a constant in the class, `e.a`
+        // is needed by the two ON clauses that read it, with their own
+        // relations, not by the class as a whole.
+        let c = explain_verbose_chain(
+            &select(
+                "select e.b, k.b from e join k on e.a = k.a \
+                 join k k2 on k2.a = e.a where e.a = 3",
+            ),
+            &lookup,
+        )
+        .unwrap();
+        assert!(c.class_constant);
+        assert_eq!(c.rels[1].class_quals, vec![pair("(a = 3)", "(k.a = 3)")]);
+        assert_eq!(c.rels[2].class_quals, vec![pair("(a = 3)", "(k2.a = 3)")]);
+        assert_eq!(c.rels[2].pkey, Some(("k_pkey".into(), "k2.a".into())));
+        let (_, need) = c.rels[0]
+            .reltarget
+            .iter()
+            .find(|(t, _)| t == "e.a")
+            .unwrap();
+        assert_eq!(need.clause_rels, vec![[0, 1], [2, 0]]);
+        // Two constants in one class are another plan (RP-1102).
+        let c = explain_verbose_chain(
+            &select(
+                "select e.b from e join k on e.a = k.a \
+                 join k k2 on k2.a = e.a where e.a = 3 and k2.a = 3",
+            ),
+            &lookup,
+        )
+        .unwrap();
+        assert!(!c.class_constant);
+    }
 }

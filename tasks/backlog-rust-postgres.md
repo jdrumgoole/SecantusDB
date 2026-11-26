@@ -1858,11 +1858,14 @@ a regression test.
       waits on the item named: a WHERE conjunct reading two relations of a
       chain (RP-1059, all three pairings), a nested loop in a chain (RP-1059
       for `where e.a < 5`), a RIGHT join (RP-1063). Work those first; the
-      VERBOSE half then follows the chain's `Output` rules above. The
-      chain `where e.a = 3` (RP-1065, 2026-11-25) now has PostgreSQL's
-      plain plan, Nested Loops under the class's constant, and is drawn
-      only without VERBOSE (`chain_class_constant`): its VERBOSE half can
-      be worked now.
+      VERBOSE half then follows the chain's `Output` rules above. (Since
+      2026-11-26 a join of two relations or a chain whose class a WHERE
+      constant fixes, RP-1065's Nested Loops, prints every node's
+      `Output` and its quals prefixed, each join keeping a column while
+      an ON clause reading it reaches outside the join:
+      `explain::attach_verbose_class_loop`,
+      `explain::attach_verbose_class_chain`. Its shapes whose plain plan
+      differs wait on RP-1137 and RP-1138.)
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a three-way join with a join filter], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a merge join under a limit], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a merge join over an index only scan], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a descending merge join with a where]
       Backlog-ID: RP-966
 
@@ -1974,6 +1977,48 @@ a regression test.
       RP-1065.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a three-way comma join's class constant is each inner index's cond]
       Backlog-ID: RP-1105
+
+- [ ] **A class constant written on the left of its equality is not the
+      class's, and the inner index scan prints no condition.** `explain
+      (costs off) select e.b, k.b from e join k on e.a = k.a where 3 =
+      e.a` (`e`, `k` analysed, 1000 rows, `k.a` the primary key) prints a
+      Nested Loop of `Seq Scan on e` (`Filter: (3 = a)`) and `Index Scan
+      using k_pkey on k` with no `Index Cond` at all, a plan that would
+      join every row of `k`; a private PostgreSQL 15.20 cluster prints the
+      plan `where e.a = 3` gets (RP-1065), `Filter: (a = 3)` on `e` and
+      `Index Cond: (a = 3)` on `k`: `generate_base_implied_equalities_const`
+      rebuilds every member's equality as `member = constant`, the
+      original clause's side order lost. Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a class constant on the left of its equality is the class's]
+      Backlog-ID: RP-1137
+
+- [ ] **A join a class constant fixes stays a Hash Join under an ORDER BY
+      or LIMIT, or beside a second ON equality.** `explain (costs off)
+      select e.b, k.b from e join k on e.a = k.a where e.a = 3 order by e.b
+      limit 2` (`e`, `k` analysed, 1000 rows) prints a `Hash Join` on `(e.a
+      = k.a)` under the Sort, its Hash over an `Index Scan using k_pkey on
+      k` that prints no `Index Cond`; a private PostgreSQL 15.20 cluster
+      prints the Nested Loop the query gets without them (RP-1065), `Index
+      Cond: (a = 3)` on `k`. `... on e.a = k.a and e.b = k.b where e.a =
+      3` is the same here, `Hash Cond: ((e.a = k.a) AND (e.b = k.b))`; on
+      PostgreSQL a Nested Loop with `Join Filter: (e.b = k.b)` into the
+      same index scan. Both are declined by the class-constant drawing
+      (`joined_implied_estimate`), which takes one ON equality and no ORDER
+      BY or LIMIT. Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a class constant join under a limit is a nested loop], tests/backlog/test_rp_explain_costs.py::test_plan[a class constant join beside a second on equality is a nested loop]
+      Backlog-ID: RP-1138
+
+- [ ] **A scan a class constant filters beside another qual is priced
+      for one operator too many.** `explain select e.b, k.b from e join k
+      on e.a = k.a where e.a = 3 and e.b <> 'x'` (`e`, `k` analysed, 1000
+      rows) prices `Seq Scan on e` at `cost=0.00..22.50` and the Nested
+      Loop at `0.28..30.80`; a private PostgreSQL 15.20 cluster prints
+      `0.00..20.00` and `0.28..28.30`: its two quals, `cpu_operator_cost`
+      each per row over 1,000 rows, on 15.00 of pages and tuples. The
+      class's equality is counted once more than it is printed. Without
+      `e.b <> 'x'` the price matches (17.50). Found while working RP-966.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a class constant scan beside another qual is priced for its two quals]
+      Backlog-ID: RP-1139
 
 - [ ] **A LEFT JOIN to a view or a CTE nothing reads is not removed.**
       `explain (costs off) select e.b from e left join kv on kv.a = e.a`
