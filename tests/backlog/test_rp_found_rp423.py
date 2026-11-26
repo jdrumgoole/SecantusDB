@@ -4,11 +4,16 @@
   evaluator and the regex builtins compiled with a linear engine that
   refuses it (RP-1022, fixed: they fall back to a backtracking one);
 - a back reference under `~*` compared case-sensitively (RP-1022, fixed:
-  fancy-regex 0.20).
+  fancy-regex 0.20);
+- a director or an embedded option was an invalid regex, and `.` did not
+  match a newline (RP-1122, 2026-11-26);
+- an invalid regex was 22P02 with the `regex` crate's message, or accepted
+  (RP-1123, 2026-11-26).
 
 An answer is the rows and the column names, or `(sqlstate, message,
 position)` for an error. Measured on PostgreSQL 15.19 (the shared reference
-on port 5415): every statement is VALUES-only.
+on port 5415; RP-1122 and RP-1123 on 15.20, its upgrade): every statement
+is VALUES-only.
 """
 
 from __future__ import annotations
@@ -96,3 +101,57 @@ def test_a_case_insensitive_back_reference_in_a_where(dsn: str) -> None:
         rows = c.execute(r"select x from r1022 where x ~* '(ab)\1' order by x").fetchall()
         count = c.execute(r"select count(*) from r1022 where x !~* '(ab)\1'").fetchone()
     assert (rows, count) == ([("ABab",), ("abAB",), ("abab",)], (1,))
+
+
+# A regex's flavour and flags (`regcomp.c`'s `prefixes()`): a `***`
+# director, an ARE's embedded options, and the newline-insensitive default
+# under which `.` matches a newline. Measured on PostgreSQL 15.20.
+FLAVOURS = {
+    r"select E'a\nb' ~ 'a.b' as m": ([(True,)], ["m"]),
+    r"select regexp_replace(E'a\nb', 'a.b', 'X') as r": ([("X",)], ["r"]),
+    r"select E'a\nb' ~ '(?n)a.b' as m": ([(False,)], ["m"]),
+    r"select E'x\nab' ~ '(?n)^ab' as m": ([(True,)], ["m"]),
+    r"select E'x\nab' ~ '(?p)^ab' as m": ([(False,)], ["m"]),
+    r"select E'x\nab' ~ '(?w)^ab' as m": ([(True,)], ["m"]),
+    r"select 'a.c' ~ '(?q)a.c' as m, 'abc' ~ '(?q)a.c' as n": ([(True, False)], ["m", "n"]),
+    r"select '^w' ~ '***=^w' as m": ([(True,)], ["m"]),
+    r"select 'w' ~ '***:(?i)W' as m": ([(True,)], ["m"]),
+    r"select 'w0+' ~ '(?b)w0+' as m, 'w00' ~ '(?b)w0+' as n": ([(True, False)], ["m", "n"]),
+    r"select 'wd' ~ '(?e)w\d' as m": ([(True,)], ["m"]),
+    r"select 'W' ~* '(?c)w' as m": ([(False,)], ["m"]),
+}
+
+
+@pytest.mark.backlog("RP-1122")
+@pytest.mark.parametrize("query", list(FLAVOURS))
+def test_regex_flavours(query: str, dsn: str) -> None:
+    """Each was 22P02 "unrecognized flag", or `f` for the newline."""
+    assert answer(dsn, query) == FLAVOURS[query]
+
+
+# `regcomp`'s refusals: 2201B with `pg_regerror`'s text. Measured on
+# PostgreSQL 15.20.
+INVALID = {
+    "select 'a' ~ '(' as m": (
+        "2201B",
+        "invalid regular expression: parentheses () not balanced",
+        None,
+    ),
+    "select 'a' ~ '(?z)a' as m": (
+        "2201B",
+        "invalid regular expression: invalid embedded option",
+        None,
+    ),
+    "select 'a' ~ 'a{2,1}' as m": (
+        "2201B",
+        "invalid regular expression: invalid repetition count(s)",
+        None,
+    ),
+}
+
+
+@pytest.mark.backlog("RP-1123")
+@pytest.mark.parametrize("query", list(INVALID))
+def test_invalid_regexes(query: str, dsn: str) -> None:
+    """Each was 22P02 with the `regex` crate's message, or `f`."""
+    assert answer(dsn, query) == INVALID[query]

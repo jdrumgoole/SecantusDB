@@ -24,6 +24,7 @@ mod join_alias;
 mod join_removal;
 mod pg_regex;
 mod record_image;
+mod regex_flavour;
 mod relabel;
 mod sublink_join;
 mod subquery_pullup;

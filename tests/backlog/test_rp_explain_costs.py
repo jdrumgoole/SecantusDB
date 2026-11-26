@@ -8181,15 +8181,49 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Filter: (c ~ '^w(?:^x|0)0'::text)",
         ],
     ),
-    # Still open: a regex with embedded options (`(?x)` expanded syntax)
-    # is estimated by its compiled prefix (`w00`); here zeros.
+    # Fixed under RP-423: a regex with embedded options (`(?x)` expanded
+    # syntax) is estimated by its compiled prefix (`w00`); the scan printed
+    # zeros.
     "estimate of a regex match with embedded options": (
-        "RP-423",
+        "RP-423:fixed",
         _ANALYSED_STRINGS,
         "explain select * from w where c ~ '(?x)^w 0 0'",
         [
             "Seq Scan on w  (cost=0.00..18.50 rows=91 width=10)",
             "  Filter: (c ~ '(?x)^w 0 0'::text)",
+        ],
+    ),
+    # Fixed under RP-423: a literal regex (`(?q)`) has no anchor, and
+    # matches no histogram entry; the scan printed zeros (15.20).
+    "estimate of a literal regex": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '(?q)^w00'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=1 width=10)",
+            "  Filter: (c ~ '(?q)^w00'::text)",
+        ],
+    ),
+    # Fixed under RP-423: a BRE's `+` is a character, so `w0+` is all of
+    # its prefix; the scan printed zeros (15.20).
+    "estimate of a basic regex": (
+        "RP-423:fixed",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '(?b)^w0+'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=1 width=10)",
+            "  Filter: (c ~ '(?b)^w0+'::text)",
+        ],
+    ),
+    # Still open: a `^` nothing precedes inside an optional group leaves
+    # the regex no prefix (15.20); here zeros.
+    "estimate of a regex match with an anchor in an optional group": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ '^(?:^w0)?1'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=101 width=10)",
+            "  Filter: (c ~ '^(?:^w0)?1'::text)",
         ],
     ),
     # Fixed under RP-423: a `^` every path meets after a character made

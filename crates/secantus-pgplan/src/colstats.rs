@@ -692,16 +692,27 @@ impl Column<'_> {
             Backtracking(fancy_regex::Regex),
         }
         let compiled = if regex {
-            let source = crate::scalar::pg_regex_source(pattern);
+            // The flags and ARE text `regcomp` compiles (RP-423): `.`
+            // matches a newline unless `REG_NLSTOP`, `^` and `$` match at
+            // one under `REG_NLANCH`.
+            let re = crate::regex_flavour::are_text(pattern, insensitive, self.c_collation)?;
+            let mut source = String::new();
+            if !re.nlstop {
+                source.push_str("(?s)");
+            }
+            if re.nlanch {
+                source.push_str("(?m)");
+            }
+            source.push_str(&crate::scalar::pg_regex_source(&re.text));
             Some(
                 match regex::RegexBuilder::new(&source)
-                    .case_insensitive(insensitive)
+                    .case_insensitive(re.icase)
                     .build()
                 {
                     Ok(re) => Compiled::Linear(re),
                     Err(_) => Compiled::Backtracking(
                         fancy_regex::RegexBuilder::new(&source)
-                            .case_insensitive(insensitive)
+                            .case_insensitive(re.icase)
                             .build()
                             .ok()?,
                     ),
@@ -1119,11 +1130,20 @@ type QuantifiedAtom = (ReAtom, u32, Option<u32>);
 /// regex is not anchored, alternates at its top, or fixes no first
 /// character. `None` for a regex whose NFA this does not model: a constraint or anchor anywhere but
 /// a leading `^` and a trailing `$`, a back reference to a group not
-/// yet closed or quantified, a numeric character escape, embedded
-/// options or a director.
+/// yet closed or quantified, a numeric character escape, or a regex
+/// `regcomp` refuses. A director and embedded options are read first
+/// (`prefixes()`), and the flavour they leave read as an ARE
+/// ([`crate::regex_flavour::are_text`], RP-423).
 fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String, PrefixStatus)> {
-    let chars: Vec<char> = patt.chars().collect();
-    if patt.starts_with("***") || patt.starts_with("(?") && !patt.starts_with("(?:") {
+    let re = crate::regex_flavour::are_text(patt, insensitive, c_ctype)?;
+    // A literal string (`***=`, `(?q)`) has no anchor: the `pre` state's
+    // rainbow (`(?q)^w00` is `rows=1` on 15.20, no prefix).
+    if re.quote {
+        return Some((String::new(), PrefixStatus::None));
+    }
+    let insensitive = re.icase;
+    let chars: Vec<char> = re.text.chars().collect();
+    if re.text.starts_with("(?") && !re.text.starts_with("(?:") {
         return None;
     }
     // An alternation at the top: the `pre` state's rainbow, or BOS arcs
@@ -1142,6 +1162,13 @@ fn regex_prefix(patt: &str, insensitive: bool, c_ctype: bool) -> Option<(String,
     // The `pre` state's rainbow: no `^` can anchor the match, whatever
     // else of the regex is not modelled.
     if !regex_has_bare(&chars, '^', false) {
+        return Some((String::new(), PrefixStatus::None));
+    }
+    // Newline-sensitive anchors (`n`, `m`, `w`): a `^` is also a BEHIND
+    // arc on the newline color (`parseqatom`), so `pre` reaches the
+    // match by more than its BOS arc (`(?n)^w00` has no prefix on 15.20,
+    // `(?p)^w00` is `w00`).
+    if re.nlanch {
         return Some((String::new(), PrefixStatus::None));
     }
     let body = &chars[..chars.len() - usize::from(exact_end)];
@@ -1515,6 +1542,20 @@ fn regex_bracket(chars: &[char], pos: &mut usize) -> Option<ReAtom> {
                 let end = rest.windows(2).position(|w| w == [':', ']'])?;
                 *pos += 2 + end + 2;
                 class = true;
+            }
+            // An ARE's escape of a non-alphanumeric character in a
+            // bracket is that character (`^w[\\]0` is prefix `w\0`,
+            // `^w[\]]0` `w]0` on 15.20, RP-423).
+            ('\\', Some(&e)) if !e.is_alphanumeric() => {
+                if !members.contains(&e) {
+                    members.push(e);
+                }
+                *pos += 2;
+            }
+            // A class escape: several characters (`^w[\\d]0` is `w`).
+            ('\\', Some('d' | 's' | 'w')) => {
+                class = true;
+                *pos += 2;
             }
             ('[', Some('.' | '=')) | ('\\', _) => return None,
             (lo, Some('-')) if chars.get(*pos + 2).is_some_and(|c| *c != ']') => {
@@ -2057,6 +2098,50 @@ mod tests {
             (r"^a(b)x(c)\2\1", false, Some(("abxccb", Partial))),
             (r"^a(?:b)(c)\1", false, Some(("abcc", Partial))),
             (r"^a(b)?\1", false, None),
+            // A director and embedded options, and the flavour they
+            // leave (RP-423): each a "C" column's Index Cond on
+            // PostgreSQL 15.20, or its absence.
+            ("(?x)^w 0 0", false, Some(("w00", Partial))),
+            ("(?x)^w0 # c", false, Some(("w0", Partial))),
+            ("(?x)^w0 * 1", false, Some(("w", Partial))),
+            (r"(?x)^w\ 0", false, Some(("w 0", Partial))),
+            ("(?x)^w[ ]0", false, Some(("w 0", Partial))),
+            ("(?x) ^ (?:w 0) 1", false, Some(("w01", Partial))),
+            ("^w(?#c)00", false, Some(("w00", Partial))),
+            ("(?i)^w00", false, Some(("", NoMatch))),
+            ("(?i)^00", false, Some(("00", Partial))),
+            ("(?ic)^w00", false, Some(("w00", Partial))),
+            ("(?ci)^w00", false, Some(("", NoMatch))),
+            ("(?c)^w00", true, Some(("w00", Partial))),
+            ("(?q)^w00", false, Some(("", NoMatch))),
+            ("***=^w00", false, Some(("", NoMatch))),
+            ("***:^w00", false, Some(("w00", Partial))),
+            ("***:(?x)^w 0", false, Some(("w0", Partial))),
+            ("(?n)^w00", false, Some(("", NoMatch))),
+            ("(?m)^w00", false, Some(("", NoMatch))),
+            ("(?w)^w00", false, Some(("", NoMatch))),
+            ("(?p)^w00", false, Some(("w00", Partial))),
+            ("(?s)^w00", false, Some(("w00", Partial))),
+            ("(?t)^w00", false, Some(("w00", Partial))),
+            ("(?e)^w00", false, Some(("w00", Partial))),
+            (r"(?e)^w\d", false, Some(("wd", Partial))),
+            (r"(?e)^w(0)\1", false, Some(("w01", Partial))),
+            ("(?b)^w0+", false, Some(("w0+", Partial))),
+            (r"(?b)^w0\{2\}", false, Some(("w00", Partial))),
+            (r"(?b)\(^w\)0", false, Some(("w0", Partial))),
+            (r"(?b)^w\(0\)\1", false, Some(("w00", Partial))),
+            ("(?b)^*w", false, Some(("*w", Partial))),
+            ("(?b)^w0$", false, Some(("w0", Exact))),
+            ("(?b)^w0$x", false, Some(("w0$x", Partial))),
+            ("(?bx)^w 0 0", false, Some(("w00", Partial))),
+            (r"(?e)^w[\]0", false, Some(("w\\0", Partial))),
+            (r"^w[\\]0", false, Some(("w\\0", Partial))),
+            (r"^w[\]]0", false, Some(("w]0", Partial))),
+            (r"^w[a\-]0", false, Some(("w", Partial))),
+            (r"^w[\d]0", false, Some(("w", Partial))),
+            // Refused by `regcomp`.
+            ("(?z)^w00", false, None),
+            ("***?", false, None),
         ] {
             let got = regex_prefix(pattern, insensitive, true);
             let got = got.as_ref().map(|(p, s)| (p.as_str(), *s));

@@ -2295,8 +2295,17 @@ a regression test.
       (RP-354), and since 2026-11-17 a join over a scan a LIKE / ILIKE or
       regex match filters (the join's WHERE patterns collected by
       `explain_join_patterns`). Still zeros: a call of a function whose
-      overloads differ in `procost`; a regex whose prefix walk is not
-      modelled (an anchor in an optional group; embedded options). Since 2026-11-18 a `^` no
+      overloads differ in `procost` (in 15.20's catalog only `ts_rewrite`);
+      a regex whose prefix walk is not modelled (an anchor in an optional
+      group: `^(?:^w0)?1`, `(?:^w)?0` and `^(^w)*0` have no prefix on
+      15.20, `rows=101`, `1000`, `1000`). Since 2026-11-26 a director and
+      embedded options are read as `prefixes()` reads them, and the
+      flavour they leave (BRE, ERE, literal, expanded) as an ARE of the
+      same meaning (`regex_flavour::are_text`), for the prefix walk and
+      the histogram matcher alike (`(?x)^w 0 0` is `rows=91`, `(?q)^w00`
+      and `(?b)^w0+` `rows=1`, `(?n)^w00` no prefix); a regex `regcomp`
+      refuses still prints zeros where 15.20 raises 2201B (RP-1123).
+      Since 2026-11-18 a `^` no
       character precedes, inside a group or not, anchors the match as
       `regc_nfa.c`'s optimisation pulls it into the `pre` state
       (`strip_bos`: `^(?:^w0)1` and `(?:^w0)1` are both prefix `w01`). A back reference is walked as a copy of
@@ -2324,8 +2333,7 @@ a regression test.
       `rows=1`), and since 2026-11-18 a branch whose `^` a character
       precedes is pruned as dead, as `regc_nfa.c` prunes it
       (`prune_dead_branches`: `^x(?:^w|y)0` is prefix `xy0`,
-      `^w(?:^x|0)0` `rows=91`). Embedded options are still zeros
-      (`(?x)^w 0 0` is `rows=91` on 15.19). Measured
+      `^w(?:^x|0)0` `rows=91`). Measured
       on the 15.19 reference on port 5415 (found while working RP-404 and
       RP-354). The repeated group's prefix is not a walk of the regex's
       text: `pg_regprefix` reads the NFA after `regc_nfa.c`'s `optimize`
@@ -2337,7 +2345,7 @@ a regression test.
       `repeat`'s arcs gives (`aba`). The faithful fix ports `regcomp.c` /
       `regc_nfa.c`'s NFA build and optimisation and runs `findprefix` on
       it (2026-11-17, sized while working RP-841).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with embedded options]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a regex match with an anchor in an optional group]
       Backlog-ID: RP-423
 - [ ] **A semi join cheaper unique-ified keeps the semi join's shape.**
       Since RP-411's first slice (2026-11-16) a WHERE that is one
@@ -3373,6 +3381,47 @@ statement is VALUES-only and runs there as written. The gap test is in
       the 15.19 reference on port 5415.
       Verify: none -- no EXPLAIN this server prints reaches an exact half yet (its HashAggregate over a HAVING prints zeros); `setop_order::tests::having_selectivity_is_postgres` notes the case
       Backlog-ID: RP-1023
+
+## Found while working RP-423 (2026-11-26)
+
+Measured on PostgreSQL 15.20 (the shared reference on port 5415, upgraded
+from 15.19): every statement is VALUES-only. The gap tests are in
+`tests/backlog/test_rp_found_rp423.py`.
+
+- [ ] **A regex match refuses a director or an embedded option, and `.`
+      never matches a newline.** The `~` family and the regex functions
+      hand the pattern to the `regex` crate (`scalar::pg_regex_source`),
+      which knows only its own inline flags: `select 'a.c' ~ '(?q)a.c'`,
+      `'^w' ~ '***=^w'`, `'w0+' ~ '(?b)w0+'`, `'wd' ~ '(?e)w\d'`, `'W' ~*
+      '(?c)w'` and `E'x\nab' ~ '(?n)^ab'` are each 22P02 "unrecognized
+      flag" (or "repetition operator missing expression" for `***`), where
+      PostgreSQL 15.20 answers `t`, `t`, `t`, `t`, `f` and `t`. And with no
+      option `select E'a\nb' ~ 'a.b'` is `f` (15.20 `t`: a regex is not
+      newline-sensitive unless `n`, `m` or `p` makes it, so `.` and a
+      negated bracket match a newline), as is `regexp_replace(E'a\nb',
+      'a.b', 'X')`, which leaves the text alone. The planner already
+      reads every flavour into an ARE with its flags
+      (`secantus-pgplan/src/regex_flavour.rs`, `are_text`, RP-423); the fix
+      compiles from that (`(?s)` unless `REG_NLSTOP`, `(?m)` under
+      `REG_NLANCH`, a negated bracket without the newline under
+      `REG_NLSTOP`) everywhere `pg_regex_source` is called, the regex
+      functions' flags argument included.
+      Verify: tests/backlog/test_rp_found_rp423.py::test_regex_flavours
+      Backlog-ID: RP-1122
+- [ ] **An invalid regex is 22P02 with the `regex` crate's message, and
+      some are accepted.** `select 'a' ~ '('` is 22P02 "invalid regular
+      expression: regex parse error: ..." where PostgreSQL 15.20 raises
+      2201B "invalid regular expression: parentheses () not balanced"
+      (`RE_compile_and_cache`, `pg_regerror`'s text); `select 'a' ~
+      '(?z)a'` is 22P02 against 2201B "invalid regular expression: invalid
+      embedded option"; `select 'a' ~ 'a{2,1}'` is `f` where 15.20 raises
+      2201B "invalid regular expression: invalid repetition count(s)". An
+      EXPLAIN of a scan filtered by an invalid regex prints the plan where
+      15.20 raises the same error (the planner compiles the regex for its
+      fixed prefix). The faithful fix is `regcomp.c`'s parser and its
+      error codes in front of whichever engine matches.
+      Verify: tests/backlog/test_rp_found_rp423.py::test_invalid_regexes
+      Backlog-ID: RP-1123
 
 ## Found while working RP-966 (2026-11-17)
 
