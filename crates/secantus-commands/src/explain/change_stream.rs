@@ -25,10 +25,11 @@
 //! `change_stream_rewrite_helpers.cpp` rewrites it.
 //!
 //! So are a `$match` on `documentKey`, (inexactly) on `fullDocument`, on
-//! `ns` and `to`, and an `$expr` on `operationType`, `documentKey`, `ns`
-//! or `to` (RM-698). Not reproduced: the rewrites of `updateDescription`,
-//! `fullDocumentBeforeChange`, the renamed `clusterTime` / `lsid` /
-//! `txnNumber`, and of an `$expr` on those (RM-698), and the
+//! `ns` and `to`, an `$expr` on `operationType`, `documentKey`, `ns`
+//! or `to`, and the renamed `clusterTime` / `lsid` / `txnNumber` (RM-698).
+//! Not reproduced: the rewrites of `updateDescription`,
+//! `fullDocumentBeforeChange`, and of an `$expr` on those or on the
+//! renamed fields (RM-698), and the
 //! change stream's `queryShapeHash` (RM-454). The unwind's filter goes through
 //! mongod's Boolean simplifier (`simplify.rs`, RM-699).
 
@@ -1172,12 +1173,32 @@ fn rewrite_operation_type(u: &U, path: &str) -> Option<M> {
 /// mongod's `rewriteMatchExpressionTree`, for the fields this server
 /// rewrites: `operationType`, `documentKey` and `fullDocument`. `None` is
 /// no rewrite.
-fn rewrite(u: &U, inexact: bool) -> Option<M> {
+/// The event fields mongod renames into the oplog's (`clusterTime` is an
+/// entry's `ts`); they rewrite into the transaction filter as well.
+const RENAMES: [(&str, &str); 3] = [
+    ("clusterTime", "ts"),
+    ("lsid", "lsid"),
+    ("txnNumber", "txnNumber"),
+];
+
+/// Which event fields a rewrite may use: all of them (the read's events),
+/// all but the renamed ones (the unwind's events, whose entries take those
+/// from the `applyOps` that holds them), or only the renamed ones (the
+/// transaction filter).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fields {
+    Event,
+    Unwind,
+    Transaction,
+}
+
+fn rewrite(u: &U, inexact: bool, fields: Fields) -> Option<M> {
     match u {
+        U::ExprEq(..) | U::Expr(_) if fields == Fields::Transaction => None,
         U::And(c) => {
             let mut out = Vec::new();
             for child in c {
-                match rewrite(child, inexact) {
+                match rewrite(child, inexact, fields) {
                     Some(m) => out.push(m),
                     None if inexact => {}
                     None => return None,
@@ -1187,13 +1208,13 @@ fn rewrite(u: &U, inexact: bool) -> Option<M> {
         }
         U::Or(c) => c
             .iter()
-            .map(|x| rewrite(x, inexact))
+            .map(|x| rewrite(x, inexact, fields))
             .collect::<Option<Vec<_>>>()
             .map(M::Or),
         U::Nor(c) => {
             let mut out = Vec::new();
             for child in c {
-                match rewrite(child, false) {
+                match rewrite(child, false, fields) {
                     Some(m) => out.push(m),
                     None if inexact => {}
                     None => return None,
@@ -1201,8 +1222,21 @@ fn rewrite(u: &U, inexact: bool) -> Option<M> {
             }
             Some(M::Nor(out))
         }
-        U::Not(c) => rewrite(c, false).map(|m| M::Not(Box::new(m))),
+        U::Not(c) => rewrite(c, false, fields).map(|m| M::Not(Box::new(m))),
+        U::Eq(p, _) | U::In(p, ..) | U::Exists(p) | U::Other(p, ..) if fields != Fields::Event => {
+            let first = p.split('.').next().unwrap_or(p);
+            match RENAMES.iter().find(|(from, _)| *from == first) {
+                Some((_, to)) if fields == Fields::Transaction => renamed(u, to),
+                _ if fields == Fields::Transaction => None,
+                Some(_) => None,
+                None => rewrite(u, inexact, Fields::Event),
+            }
+        }
         U::Eq(p, _) | U::In(p, ..) | U::Exists(p) | U::Other(p, ..) => match p.split('.').next() {
+            Some(first @ ("clusterTime" | "lsid" | "txnNumber")) => {
+                let (_, to) = RENAMES.iter().find(|(from, _)| *from == first)?;
+                renamed(u, to)
+            }
             Some("operationType") => rewrite_operation_type(u, p),
             Some("documentKey") => rewrite_document_key(u),
             Some("ns") => rewrite_namespace(u, p),
@@ -1217,7 +1251,10 @@ fn rewrite(u: &U, inexact: bool) -> Option<M> {
         U::ExprEq(p, _) if p.split('.').next() == Some("fullDocument") => {
             inexact.then(|| rewrite_full_document(u)).flatten()
         }
-        U::ExprEq(p, v) => rewrite(&U::Eq(p.clone(), v.clone()), inexact),
+        // mongod rewrites an `$expr` on a renamed field (and its twins) in
+        // a way not yet transcribed: leave it out of the read (RM-698).
+        U::ExprEq(p, _) if RENAMES.iter().any(|(f, _)| p.split('.').next() == Some(*f)) => None,
+        U::ExprEq(p, v) => rewrite(&U::Eq(p.clone(), v.clone()), inexact, fields),
         U::Expr(e) => match rewrite_agg(e, inexact)? {
             Bson::Document(d) => Some(M::Expr(d)),
             _ => None,
@@ -1427,12 +1464,15 @@ fn rewrite_agg(e: &Bson, inexact: bool) -> Option<Bson> {
 
 /// The rewrite of the `$match` after the stream into the oplog's terms, if
 /// it has one; mongod skips a `$match` its optimizer folded to a constant.
-fn rewritten(user: Option<&Document>) -> Option<M> {
+fn rewritten(user: Option<&Document>, fields: Fields) -> Option<M> {
     let u = U::parse(user?);
     if u.always_false() {
         return None;
     }
-    rewrite(&u, true)
+    match rewrite(&u, true, fields)? {
+        M::And(c) if c.is_empty() => None,
+        m => Some(m),
+    }
 }
 
 /// An oplog entry that writes a document: not a no-op, not a command.
@@ -1584,7 +1624,9 @@ fn filters(
     user: Option<&Document>,
 ) -> (Document, Document) {
     let n = Names::of(scope, spec.system);
-    let user = rewritten(user);
+    let txn_user = rewritten(user, Fields::Transaction);
+    let unwind_user = rewritten(user, Fields::Unwind);
+    let user = rewritten(user, Fields::Event);
     let user = user.as_ref();
     let mut any = Vec::new();
     if spec.expanded {
@@ -1594,19 +1636,24 @@ fn filters(
     }
     any.push(events(scope, &n, spec, user));
     any.extend(invalidations(scope));
-    any.push(transactions(&n));
+    // mongod's transaction filter: the renamed fields of the `$match`
+    // apply to the entries that hold a transaction's events too.
+    let txns = M::Or(vec![
+        transactions(&n),
+        M::And(vec![
+            leaf("o.commitTransaction", Leaf::Eq, 1_i32),
+            op_is("c"),
+        ]),
+        M::And(vec![op_is("n"), regex("o2.endOfTransaction", &n.ns)]),
+    ]);
+    match txn_user {
+        Some(m) => any.push(M::And(vec![txns, m])),
+        None => any.push(txns),
+    }
     any.push(sharding(&n, spec));
-    any.push(M::And(vec![
-        leaf("o.commitTransaction", Leaf::Eq, 1_i32),
-        op_is("c"),
-    ]));
-    any.push(M::And(vec![
-        op_is("n"),
-        regex("o2.endOfTransaction", &n.ns),
-    ]));
     let mut oplog = vec![M::Or(any), leaf("ts", Leaf::Gte, start)];
     oplog.extend(not_from_migration(&n, spec));
-    let mut unwind = vec![events(scope, &n, spec, user)];
+    let mut unwind = vec![events(scope, &n, spec, unwind_user.as_ref())];
     unwind.extend(not_from_migration(&n, spec));
     // The unwind's filter goes through mongod's Boolean simplifier
     // (`internalUnwindTransaction` optimises it as a query is; the oplog

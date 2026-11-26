@@ -6,7 +6,8 @@ RM-452 ported mongod's rewrite of `operationType`, RM-698's first slice
 those of `documentKey` and `fullDocument`, its second that of `ns` by
 `$eq` / `$in`, its third that of `to`, its fourth a regex on either,
 its fifth a regex in an `$in`, its sixth an `$expr` on `operationType`,
-its seventh one on `documentKey`, `ns` or `to`; the rewrites of the other
+its seventh one on `documentKey`, `ns` or `to`, its eighth the renamed
+`clusterTime` / `lsid` / `txnNumber`; the rewrites of the other
 event fields, and of `$expr` on them, are still
 to come; the Boolean simplifier mongod runs
 over the unwind's filter came with RM-699 (2026-11-24).
@@ -281,18 +282,46 @@ def test_an_expr_on_the_document_key_or_namespace_joins_the_oplog_filter(
     [
         {"updateDescription.updatedFields.a": 1},
         {"fullDocumentBeforeChange.a": 1},
-        {"txnNumber": 1},
     ],
 )
 def test_a_match_on_another_event_field_joins_the_oplog_filter(
     rust_mongo: Any, mongod_rs: Any, match: dict
 ) -> None:
-    """mongod 8.2.11 rewrites a `$match` on `updateDescription`,
-    `fullDocumentBeforeChange`, `clusterTime`, `lsid` or `txnNumber` into the
-    oplog filter, which changes the read's `queryHash` from 90A52575."""
+    """mongod 8.2.11 rewrites a `$match` on `updateDescription` or
+    `fullDocumentBeforeChange` into the oplog filter, which changes the
+    read's `queryHash` from 90A52575."""
     want = _query_hash(mongod_rs, match)
     assert want != "90A52575"
     assert _query_hash(rust_mongo, match) == want
+
+
+@pytest.mark.backlog_fixed("RM-698")
+@pytest.mark.parametrize(
+    "match",
+    [
+        {"txnNumber": 1},
+        {"lsid.id": 1},
+        {"clusterTime": 5},
+        {"txnNumber": {"$gt": 1}},
+        {"txnNumber": {"$exists": True}},
+        {"txnNumber": {"$in": [1, 2]}},
+        {"txnNumber": {"$ne": 1}},
+        {"txnNumber": None},
+        {"txnNumber": 1, "operationType": "insert"},
+        {"txnNumber": 1, "ns.coll": "c"},
+        {"$or": [{"txnNumber": 1}, {"operationType": "insert"}]},
+        {"$or": [{"txnNumber": 1}, {"clusterTime": 3}]},
+        {"$nor": [{"txnNumber": 1}]},
+    ],
+)
+def test_a_match_on_a_renamed_field_joins_the_oplog_filter(
+    rust_mongo: Any, mongod_rs: Any, match: dict
+) -> None:
+    """mongod 8.2.11 renames a `$match` on `clusterTime` (`ts`), `lsid` and
+    `txnNumber` into the read's events and its transaction filter, and leaves
+    them out of the unwind's; this server left them out of the read
+    (90A52575)."""
+    assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)
 
 
 def _unwind(client: Any, match: dict, name: str) -> dict:
