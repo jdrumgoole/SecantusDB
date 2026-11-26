@@ -3073,7 +3073,24 @@ pub(crate) fn run_segmented(
                 buffer.clear();
             }
             let spec = stage.as_document().and_then(|d| d.get(name));
-            docs = documents_stage(spec, vars, coll, at)?;
+            // The checks and their errors are `documents_stage`'s; the
+            // documents themselves come from the stages mongod desugars
+            // `$documents` into, run with what follows, so each is counted
+            // as the storage its expression object built, not as read BSON
+            // (`totalBytesSorted`, and the memory budget, RM-686, 8.2.11).
+            documents_stage(spec, vars, coll, at)?;
+            docs = vec![Document::new()];
+            if let Some(spec) = spec {
+                buffer.push(Bson::Document(
+                    bson::doc! {"$addFields": {"_tempDocumentsField": spec.clone()}},
+                ));
+                buffer.push(Bson::Document(
+                    bson::doc! {"$unwind": "$_tempDocumentsField"},
+                ));
+                buffer.push(Bson::Document(
+                    bson::doc! {"$replaceRoot": {"newRoot": "$_tempDocumentsField"}},
+                ));
+            }
         } else if name == crate::list_catalog::STAGE {
             if !buffer.is_empty() {
                 let _ = core_run(docs, &buffer, vars, collation, Some(&ns))?;

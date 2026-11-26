@@ -1282,15 +1282,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       RM-538; the fold was RM-685).
       Verify: tests/backlog/test_rm_found_2026_11_14_rm538.py::test_a_top_k_sort_reports_the_documents_it_keeps
       Backlog-ID: RM-689
-- [ ] **A run of `$documents` counts its documents as read BSON.** mongod
-      8.2.11 counts each document a `$documents` makes as the storage its
-      expression object built (`metrics.query.sort.totalBytesSorted` grows
-      by 490 for `[{a: 1, b: 3}, {a: 2}]` sorted, as explain reports since
-      RM-539); `run_segmented` evaluates the stage and hands the documents
-      on as read, so a run counts 255, and its memory budget is held to
-      that. Found 2026-11-14 (RM-539).
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_documents_sort_counts_the_documents_built
-      Backlog-ID: RM-686
 - [ ] **The operation rows `currentOp` lists lack mongod's detail.** Since
       2026-10-20 a registry of running operations stands behind
       `currentOp`, `$currentOp` (with `idleCursors`) and `killOp`, which
