@@ -29,7 +29,7 @@ pub(super) fn fill(
     } else if let Ok(spec) = stage.get_document("$unionWith") {
         union_with(ctx, options, spec, listed, &db);
     } else if let Ok(spec) = stage.get_document("$lookup") {
-        lookup(spec, listed);
+        lookup(ctx, target, input, options, spec, listed);
     }
 }
 
@@ -184,22 +184,192 @@ fn parsed(v: &Bson) -> Bson {
     }
 }
 
-/// A `$lookup` reports what its pipeline examined in the collections it read
+/// A `$lookup` reports what its pipeline examined in the collection it read
 /// (`totalDocsExamined`, `totalKeysExamined`, `collectionScans`,
-/// `indexesUsed`): none for a pipeline that makes its own documents. One
-/// that reads a collection is RM-682.
-fn lookup(spec: &Document, listed: &mut Document) {
-    let documents = spec
-        .get_array("pipeline")
-        .ok()
-        .and_then(|p| p.first())
+/// `indexesUsed`), summed over the runs of its pipeline (measured 8.2.11):
+/// none for a pipeline that makes its own documents. mongod's sub-pipeline
+/// cache runs the read of `from` once for every outer document unless the
+/// pipeline's first stage is correlated (a `let` variable in it, or the
+/// `foreignField` match the join fields put in front), and then at each.
+/// The equality form without a pipeline runs in SBE and is RM-683.
+fn lookup(
+    ctx: &mut CommandContext,
+    target: &Bson,
+    input: &[Document],
+    options: &Document,
+    spec: &Document,
+    listed: &mut Document,
+) {
+    let Ok(pipeline) = spec.get_array("pipeline") else {
+        return;
+    };
+    let documents = pipeline
+        .first()
         .and_then(Bson::as_document)
         .is_some_and(|s| s.contains_key("$documents"));
-    if !documents {
+    if documents {
+        listed.insert("totalDocsExamined", Bson::Int64(0));
+        listed.insert("totalKeysExamined", Bson::Int64(0));
+        listed.insert("collectionScans", Bson::Int64(0));
+        listed.insert("indexesUsed", Bson::Array(Vec::new()));
         return;
     }
-    listed.insert("totalDocsExamined", Bson::Int64(0));
-    listed.insert("totalKeysExamined", Bson::Int64(0));
-    listed.insert("collectionScans", Bson::Int64(0));
-    listed.insert("indexesUsed", Bson::Array(Vec::new()));
+    let Ok(from) = spec.get_str("from") else {
+        return;
+    };
+    let let_spec = spec.get_document("let").ok();
+    let join = match (spec.get_str("localField"), spec.get_str("foreignField")) {
+        (Ok(lf), Ok(ff)) => Some((lf, ff)),
+        _ => None,
+    };
+    let correlated = join.is_some()
+        || pipeline
+            .first()
+            .is_some_and(|first| crate::aggregate::uses_variable(first, let_spec));
+    let outer = super::documents_through(ctx, target, input, options);
+    let runs: Vec<Option<Document>> = if correlated {
+        outer
+            .iter()
+            .filter_map(Bson::as_document)
+            .cloned()
+            .map(Some)
+            .collect()
+    } else if outer.is_empty() {
+        Vec::new()
+    } else {
+        vec![None]
+    };
+    let mut examined = Examined::default();
+    for run in runs {
+        let mut stages = pipeline.clone();
+        let mut lets = Document::new();
+        if let Some(doc) = &run {
+            if let Some((lf, ff)) = join {
+                let value = crate::aggregate::lookup_local_value(doc, lf).unwrap_or(Bson::Null);
+                let test = match value {
+                    Bson::Array(items) => doc! { "$in": items },
+                    v => doc! { "$eq": v },
+                };
+                stages.insert(0, Bson::Document(doc! { "$match": { ff: test } }));
+            }
+            for (name, expr) in let_spec.into_iter().flatten() {
+                let bound = match secantus_core::expressions::evaluate_field(
+                    doc,
+                    expr,
+                    &Default::default(),
+                ) {
+                    Ok(secantus_core::expressions::Field::Value(v)) => {
+                        Bson::Document(doc! { "$literal": v })
+                    }
+                    _ => Bson::String("$$REMOVE".into()),
+                };
+                lets.insert(name.clone(), bound);
+            }
+        } else if let Some(ls) = let_spec {
+            // An uncorrelated first stage reads none of them; the rest run
+            // in the classic engine after the cursor, which is not counted.
+            for (name, _) in ls {
+                lets.insert(name.clone(), Bson::Null);
+            }
+        }
+        let mut inner = doc! { "aggregate": from, "pipeline": stages, "cursor": {} };
+        if !lets.is_empty() {
+            inner.insert("let", lets);
+        }
+        if let Some(c) = options.get("collation") {
+            inner.insert("collation", c.clone());
+        }
+        let cmd = doc! { "explain": inner, "verbosity": "executionStats" };
+        let Ok(reply) = super::explain_reply(&cmd, ctx) else {
+            return;
+        };
+        let stats = reply
+            .get_array("stages")
+            .ok()
+            .and_then(|s| s.first())
+            .and_then(Bson::as_document)
+            .and_then(|s| s.get_document("$cursor").ok())
+            .and_then(|c| c.get_document("executionStats").ok())
+            .or_else(|| reply.get_document("executionStats").ok());
+        let Some(stats) = stats else {
+            return;
+        };
+        examined.add(stats);
+    }
+    listed.insert("totalDocsExamined", Bson::Int64(examined.docs));
+    listed.insert("totalKeysExamined", Bson::Int64(examined.keys));
+    listed.insert("collectionScans", Bson::Int64(examined.scans));
+    listed.insert(
+        "indexesUsed",
+        Bson::Array(examined.indexes.into_iter().map(Bson::String).collect()),
+    );
+}
+
+/// What a `$lookup`'s reads examined, summed.
+#[derive(Default)]
+struct Examined {
+    docs: i64,
+    keys: i64,
+    scans: i64,
+    indexes: Vec<String>,
+}
+
+impl Examined {
+    fn add(&mut self, stats: &Document) {
+        let num = |k: &str| stats.get(k).and_then(crate::util::as_i64).unwrap_or(0);
+        self.docs += num("totalDocsExamined");
+        self.keys += num("totalKeysExamined");
+        if let Ok(stages) = stats.get_document("executionStages") {
+            self.walk(stages);
+        }
+    }
+
+    fn walk(&mut self, stage: &Document) {
+        match stage.get_str("stage") {
+            Ok("COLLSCAN") => self.scans += 1,
+            Ok("IXSCAN" | "COUNT_SCAN" | "DISTINCT_SCAN") => {
+                if let Ok(name) = stage.get_str("indexName") {
+                    if !self.indexes.iter().any(|i| i == name) {
+                        self.indexes.push(name.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+        for key in [
+            "inputStage",
+            "innerStage",
+            "outerStage",
+            "thenStage",
+            "elseStage",
+        ] {
+            if let Ok(child) = stage.get_document(key) {
+                self.walk(child);
+            }
+        }
+        if let Ok(children) = stage.get_array("inputStages") {
+            for child in children.iter().filter_map(Bson::as_document) {
+                self.walk(child);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn examined_sums_runs_and_names_each_index_once() {
+        let mut e = Examined::default();
+        let ixscan = doc! {
+            "totalDocsExamined": 1_i64, "totalKeysExamined": 1_i64,
+            "executionStages": { "stage": "FETCH", "inputStage": { "stage": "IXSCAN", "indexName": "b_1" } },
+        };
+        e.add(&ixscan);
+        e.add(&ixscan);
+        e.add(&doc! { "totalDocsExamined": 2_i32, "executionStages": { "stage": "COLLSCAN" } });
+        assert_eq!((e.docs, e.keys, e.scans), (4, 2, 1));
+        assert_eq!(e.indexes, vec!["b_1".to_string()]);
+    }
 }

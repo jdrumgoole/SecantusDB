@@ -1235,16 +1235,15 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-26 working RM-659.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm536.py::test_a_run_time_error_names_the_document_the_read_projected
       Backlog-ID: RM-809
-- [ ] **A `$lookup` over a collection reports nothing it examined.** At
-      `executionStats` mongod 8.2.11 gives a `$lookup` whose pipeline reads
-      a collection its `totalDocsExamined`, `totalKeysExamined`,
-      `collectionScans` and `indexesUsed`, summed over its runs: an
-      uncorrelated pipeline is run once and cached (2 documents, 1 scan for
-      3 outer documents), a correlated one at each (6 and 3). This server
-      reports them only for a pipeline over `$documents` (zeros, RM-539).
-      Found 2026-11-14 (RM-539).
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_lookup_over_a_collection_reports_what_it_examined
-      Backlog-ID: RM-682
+- [ ] **An `$expr` equality on a `let` variable is not planned on an
+      index.** mongod 8.2.11 plans `{$match: {$expr: {$eq: ["$b", "$$x"]}}}`
+      with `let: {x: 1}` on an index on `b` (1 document and 1 key examined
+      of 2), as it plans the same with a constant; this server scans the
+      collection (2 documents, 0 keys), at the top level and in each run of
+      a correlated `$lookup` (6 documents and 3 scans where mongod examines
+      2 documents and 2 keys of `b_1`). Found 2026-11-26 working RM-682.
+      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_an_expr_equality_on_a_let_variable_uses_an_index
+      Backlog-ID: RM-813
 - [ ] **A `$lookup` on `localField` / `foreignField` is explained as a
       classic stage.** mongod 8.2.11 pushes it into SBE over a collection
       and explains it so (`explainVersion` "2", no `stages`, an `EQ_LOOKUP`

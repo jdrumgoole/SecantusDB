@@ -3547,7 +3547,7 @@ fn unlocked_foreign_read() -> Result<(), CommandError> {
 
 /// Whether `stage` refers to one of the `let` variables (`$$name`,
 /// `$$name.path`).
-fn uses_variable(stage: &Bson, let_spec: Option<&Document>) -> bool {
+pub(crate) fn uses_variable(stage: &Bson, let_spec: Option<&Document>) -> bool {
     let Some(names) = let_spec else {
         return false;
     };
@@ -4420,7 +4420,7 @@ pub(crate) fn set_field_path(doc: &mut Document, path: &str, value: Bson) {
 /// missing, or it is an empty array -- it matches null instead, so `[]` joins
 /// the foreign documents whose `foreignField` is missing, null or `[null]`
 /// (measured on 8.2.11, RM-529).
-fn lookup_local_value(doc: &Document, local_field: &str) -> Option<Bson> {
+pub(crate) fn lookup_local_value(doc: &Document, local_field: &str) -> Option<Bson> {
     match secantus_core::get_path(doc, local_field) {
         Some(Bson::Array(a)) if a.is_empty() => Some(Bson::Null),
         other => other.cloned(),

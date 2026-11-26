@@ -1967,6 +1967,17 @@ fn count_inline(
     pipeline: &[Document],
     options: &Document,
 ) -> i64 {
+    documents_through(ctx, target, pipeline, options).len() as i64
+}
+
+/// The documents that come out of `pipeline` over `target`, run as
+/// [`count_through`] runs it (a `$lookup`'s outer documents, RM-682).
+fn documents_through(
+    ctx: &mut CommandContext,
+    target: &Bson,
+    pipeline: &[Document],
+    options: &Document,
+) -> Vec<Bson> {
     // The window's `$sort` runs as the `$sort` it is, a `$match` moved
     // ahead of a `$replaceRoot` as the `$match` it is, and a `$count` as
     // the `$group` and `$project` mongod runs, whose `$group` reports its
@@ -2025,17 +2036,17 @@ fn count_inline(
         run()
     };
     let Ok(reply) = reply else {
-        return 0;
+        return Vec::new();
     };
     let Ok(cursor) = reply.get_document("cursor") else {
-        return 0;
+        return Vec::new();
     };
     if let Some(id) = cursor.get("id").and_then(as_i64).filter(|id| *id != 0) {
         if let Ok(cursors) = ctx.cursors() {
             cursors.kill(&[id]);
         }
     }
-    cursor.get_array("firstBatch").map_or(0, |b| b.len() as i64)
+    cursor.get_array("firstBatch").cloned().unwrap_or_default()
 }
 
 /// Whether a stage hands each document on as it reads it.

@@ -107,7 +107,7 @@ def _lookup_examined(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-682")
+@pytest.mark.backlog_fixed("RM-682")
 def test_a_lookup_over_a_collection_reports_what_it_examined(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -116,8 +116,97 @@ def test_a_lookup_over_a_collection_reports_what_it_examined(
     what the reads examined, summed over its runs: an uncorrelated
     pipeline's documents once (2 documents, 1 collection scan for 3 outer
     documents: it is run once and cached), a correlated one's at every
-    run. This server reports none of the four figures."""
+    run. This server reported none of the four figures until 2026-11-26."""
     assert _lookup_examined(rust_mongo) == _lookup_examined(mongod_rs)
+
+
+def _lookup_examined_indexed(client: Any, pipelines: dict | None = None) -> dict:
+    db = _collections(client)
+    db.d.create_index("b")
+    pipelines = pipelines or {
+        "indexed_uncorrelated": [
+            {"$lookup": {"from": "d", "pipeline": [{"$match": {"b": 1}}], "as": "z"}}
+        ],
+        "join_fields_and_pipeline": [
+            {
+                "$lookup": {
+                    "from": "d",
+                    "localField": "a",
+                    "foreignField": "b",
+                    "pipeline": [{"$project": {"b": 1}}],
+                    "as": "z",
+                }
+            }
+        ],
+    }
+    out = {}
+    for name, p in pipelines.items():
+        answer = _explained(db, "c", p, "executionStats", "$lookup")
+        out[name] = (
+            [{k: s.get(k) for k in EXAMINED} for s in answer[1]] if answer[0] == "ok" else answer
+        )
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-682")
+def test_a_lookup_over_an_indexed_collection_reports_what_it_examined(
+    rust_mongo: Any,
+    mongod_rs: Any,  # noqa: F811
+) -> None:
+    """With an index on the foreign field, mongod 8.2.11's `$lookup` counts
+    the keys its runs examined and names the index; the join fields with a
+    pipeline read `from` at every outer document."""
+    assert _lookup_examined_indexed(rust_mongo) == _lookup_examined_indexed(mongod_rs)
+
+
+CORRELATED_ON_AN_INDEX = {
+    "indexed_correlated": [
+        {
+            "$lookup": {
+                "from": "d",
+                "let": {"x": "$a"},
+                "pipeline": [{"$match": {"$expr": {"$eq": ["$b", "$$x"]}}}],
+                "as": "z",
+            }
+        }
+    ],
+}
+
+
+def _let_equality(client: Any) -> dict:
+    db = _collections(client)
+    db.d.create_index("b")
+
+    def run() -> dict:
+        reply = db.command(
+            "explain",
+            {
+                "aggregate": "d",
+                "pipeline": [{"$match": {"$expr": {"$eq": ["$b", "$$x"]}}}],
+                "let": {"x": 1},
+                "cursor": {},
+            },
+            verbosity="executionStats",
+        )
+        stats = reply.get("executionStats") or reply["stages"][0]["$cursor"]["executionStats"]
+        return {k: stats.get(k) for k in ("totalDocsExamined", "totalKeysExamined")}
+
+    return {
+        "top_level": mongo_answer(run),
+        "lookup": _lookup_examined_indexed(client, CORRELATED_ON_AN_INDEX),
+    }
+
+
+@pytest.mark.backlog("RM-813")
+def test_an_expr_equality_on_a_let_variable_uses_an_index(
+    rust_mongo: Any,
+    mongod_rs: Any,  # noqa: F811
+) -> None:
+    """mongod 8.2.11 plans an `$expr` `$eq` of a field and a `let` variable
+    on the field's index, at the top level (1 document, 1 key) and in each
+    run of a correlated `$lookup` (2 documents, 2 keys of `b_1`). This
+    server scans the collection."""
+    assert _let_equality(rust_mongo) == _let_equality(mongod_rs)
 
 
 # ------------------------------------------ a $lookup SBE runs --
