@@ -3078,6 +3078,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): with a
     # second ON clause the expression's side is the probe side.
+    # A hash join on an expression and a column pair was unpriced, and
+    # hashed the expression's side (RP-1058).
     "a hash join on an expression and a column pair hashes the column side": (
         "RP-1058",
         _ANALYSED,
@@ -3088,6 +3090,63 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
             "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: the clauses in the other order.
+    "a hash join on a column pair and an expression keeps the on order": (
+        "RP-1058",
+        _ANALYSED,
+        "explain select e.b from e join k on e.b = k.b and e.a = k.a + 1",
+        [
+            "Hash Join  (cost=30.00..54.75 rows=100 width=3)",
+            "  Hash Cond: ((k.b = e.b) AND ((k.a + 1) = e.a))",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: the expression on the left table's
+    # side, which stays the probe side.
+    "a hash join on an expression of the left table and a column pair": (
+        "RP-1058",
+        _ANALYSED,
+        "explain select * from e join k on e.a + 1 = k.a and e.b = k.b",
+        [
+            "Hash Join  (cost=30.00..50.38 rows=100 width=14)",
+            "  Hash Cond: (((e.a + 1) = k.a) AND (e.b = k.b))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: two expression keys and no column
+    # pair, each a hash clause charging its own operators.
+    "a hash join on two expression keys": (
+        "RP-1058",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a = k.a + 1 and e.b = k.b || 'x'",
+        [
+            "Hash Join  (cost=30.00..55.05 rows=5 width=3)",
+            "  Hash Cond: (((k.a + 1) = e.a) AND ((k.b || 'x'::text) = e.b))",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-1058): `e.a`,
+    # `(k.a - 1)` and `k.a` are one equivalence class, which hashes on
+    # its column members and filters `k` by the rest.
+    "an expression key sharing a column with a column pair joins its class": (
+        "RP-1117",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a = k.a - 1 and e.a = k.a",
+        [
+            "Hash Join  (cost=20.06..37.70 rows=5 width=3)",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=20.00..20.00 rows=5 width=4)",
+            "        ->  Seq Scan on k  (cost=0.00..20.00 rows=5 width=4)",
+            "              Filter: ((a - 1) = a)",
         ],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966).
@@ -8844,6 +8903,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1058",
         "RP-1060",
         "RP-1061",
         "RP-1057",

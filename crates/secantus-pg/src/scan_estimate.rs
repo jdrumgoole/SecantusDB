@@ -2383,22 +2383,58 @@ impl PgHandler {
             return None;
         }
         let on_filters: Vec<&secantus_pgplan::joins::JoinFilter> = on_filters.iter().collect();
-        // A join on one equality between a column of one side and an
+        // A join on an equality between a column of one side and an
         // expression over one column of the other is hashed on the
         // expression (RP-981): keyed here by the column it reads, priced
-        // by the caller with no statistics for it.
-        let expr_key = match (equi.as_slice(), merged.as_slice(), expr_keys.as_slice()) {
-            ([], [], [e]) => Some(expr_key_pair(e)?),
-            _ => None,
+        // by the caller with no statistics for it. Beside column pairs it
+        // is one more hash clause (`hash_inner_and_outer` takes every
+        // hashable clause of the restriction list, RP-1058), after them.
+        let expr_pairs: Vec<(String, String, (bool, u32, String))> = if merged.is_empty() {
+            expr_keys.iter().map(expr_key_pair).collect::<Option<_>>()?
+        } else {
+            Vec::new()
         };
-        let synth: Vec<(String, String)>;
-        let equi: &Vec<(String, String)> = match &expr_key {
-            Some((l, r, _)) => {
-                synth = vec![(l.clone(), r.clone())];
-                &synth
+        // A bare column two clauses share, or one expression two share,
+        // puts them in one equivalence class, which PostgreSQL turns into
+        // one join clause and a restriction of a side (`e.a = k.a - 1 and
+        // e.a = k.a` hashes on `e.a = k.a` and filters `k` by `(a - 1) =
+        // a`): not modelled, so not priced.
+        if !expr_keys.is_empty() {
+            let mut members: Vec<String> = equi
+                .iter()
+                .flat_map(|(l, r)| [l.clone(), r.clone()])
+                .collect();
+            let mut exprs: Vec<&secantus_pgplan::ColumnExpr> = Vec::new();
+            for e in expr_keys {
+                let (bare, expr) = match (&e.left_column, &e.right_column) {
+                    (Some(l), None) => (l, &e.right),
+                    (None, Some(r)) => (r, &e.left),
+                    _ => return None,
+                };
+                if members.contains(bare) || exprs.contains(&expr) {
+                    return None;
+                }
+                members.push(bare.clone());
+                exprs.push(expr);
             }
-            None => equi,
+        }
+        let synth: Vec<(String, String)>;
+        let equi: &Vec<(String, String)> = if expr_pairs.is_empty() {
+            equi
+        } else {
+            synth = equi
+                .iter()
+                .cloned()
+                .chain(expr_pairs.iter().map(|(l, r, _)| (l.clone(), r.clone())))
+                .collect();
+            &synth
         };
+        // Each clause's expression, where its side is one: `None` for a
+        // column pair.
+        let clause_exprs: Vec<Option<&(bool, u32, String)>> =
+            std::iter::repeat_n(None, equi.len() - expr_pairs.len())
+                .chain(expr_pairs.iter().map(|(_, _, x)| Some(x)))
+                .collect();
         let ((left_key, right_key), rest) = equi.split_first()?;
         // The join clauses are an ON's, or -- a comma join, `FROM e, k
         // WHERE e.b = k.b` -- the WHERE's conjuncts over both tables, those
@@ -2484,7 +2520,7 @@ impl PgHandler {
                 return None;
             }
         }
-        if !merged.is_empty() || (!expr_keys.is_empty() && expr_key.is_none()) {
+        if !merged.is_empty() {
             return None;
         }
         let project = j.project.as_deref();
@@ -2647,15 +2683,23 @@ impl PgHandler {
             })
         };
         let (left, right) = (scan(left)?, scan(right)?);
+        let mark = |a: &mut JoinedSide, b: &mut JoinedSide, x: Option<&(bool, u32, String)>| {
+            if let Some((left_expr, ops, ty)) = x {
+                let s = if *left_expr { a } else { b };
+                s.key_expr = Some((*ops, ty.clone()));
+            }
+        };
         let mut a = side(&left, left_key)?;
         let mut b = side(&right, right_key)?;
-        if let Some((_, _, (left_expr, ops, ty))) = &expr_key {
-            let s = if *left_expr { &mut a } else { &mut b };
-            s.key_expr = Some((*ops, ty.clone()));
-        }
+        mark(&mut a, &mut b, clause_exprs[0]);
         let more: Vec<(JoinedSide, JoinedSide)> = rest
             .iter()
-            .map(|(l, r)| Some((side(&left, l)?, side(&right, r)?)))
+            .zip(&clause_exprs[1..])
+            .map(|((l, r), x)| {
+                let (mut l, mut r) = (side(&left, l)?, side(&right, r)?);
+                mark(&mut l, &mut r, *x);
+                Some((l, r))
+            })
             .collect::<Option<_>>()?;
         // `clauselist_selectivity` over the join filter: the product of
         // its conjuncts'. An inequality is `DEFAULT_INEQ_SEL`; a `<>` is
@@ -7516,8 +7560,8 @@ fn expr_key_pair(
     }
 }
 
-/// Whether `sel` joins two relations on one expression equality and
-/// nothing else (RP-981).
+/// Whether `sel` joins two relations on expression equalities and nothing
+/// else (RP-981; several, RP-1058).
 pub(crate) fn has_expr_join_key(sel: &secantus_pgplan::Select) -> bool {
     use secantus_pgplan::joins::JoinNode;
     let Some(sub) = sel.sub.as_ref() else {
@@ -7529,7 +7573,7 @@ pub(crate) fn has_expr_join_key(sel: &secantus_pgplan::Select) -> bool {
     matches!(
         &j.tree,
         JoinNode::Join { equi, merged, expr_keys, on_other: false, .. }
-            if equi.is_empty() && merged.is_empty() && expr_keys.len() == 1
+            if equi.is_empty() && merged.is_empty() && !expr_keys.is_empty()
     )
 }
 
@@ -8327,6 +8371,10 @@ fn hash_join_of(
         }
     }
     let expr_key = a.key_ops > 0.0 || b.key_ops > 0.0;
+    // `cost_qual_eval` over every hash clause: each side's operators in
+    // each, an expression key's beside a column pair's (RP-1058).
+    let ops_a = a.key_ops + more.iter().map(|(x, _)| x.key_ops).sum::<f64>();
+    let ops_b = b.key_ops + more.iter().map(|(_, y)| y.key_ops).sum::<f64>();
     let (ka, kb) = (key(&a), key(&b));
     let mut selectivity = if redundant {
         1.0
@@ -8350,7 +8398,7 @@ fn hash_join_of(
     // unique column of the side makes it `inner_unique` when hashed.
     let unique_a = a.unique || more.iter().any(|(x, _)| x.unique);
     let unique_b = b.unique || more.iter().any(|(_, y)| y.unique);
-    let join_side = |s: &HashSide| JoinSide {
+    let join_side = |s: &HashSide, key_ops: f64| JoinSide {
         rows: s.scan.2,
         tuples: s.tuples,
         scan: (s.scan.0, s.scan.1),
@@ -8360,7 +8408,7 @@ fn hash_join_of(
         unique: s.unique,
         ndistinct: s.stats.0,
         default_ndistinct: s.default_nd,
-        key_ops: s.key_ops,
+        key_ops,
         rel_rows: s.scan.2,
         width: Some(s.scan.3),
         extra,
@@ -8380,11 +8428,11 @@ fn hash_join_of(
     let (outer, inner) = (
         JoinSide {
             unique: a.one_row || unique_a,
-            ..join_side(&a)
+            ..join_side(&a, ops_a)
         },
         JoinSide {
             unique: b.one_row || unique_b,
-            ..join_side(&b)
+            ..join_side(&b, ops_b)
         },
     );
     // The join filter (RP-375): `final_cost_hashjoin` charges its

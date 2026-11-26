@@ -2084,16 +2084,20 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a full join a where reduces to a removable left join is removed], tests/backlog/test_rp_explain_costs.py::test_plan[a full join an inner join reduces to a removable left join is removed]
       Backlog-ID: RP-1118
 
-- [ ] **A hash join on an expression and a column pair hashes the
-      expression's side.** `explain select e.b from e join k on e.a = k.a
-      + 1 and e.b = k.b` (both analysed, 1000 rows) hashes `k` and prints
-      `Hash Cond: ((e.a = (k.a + 1)) AND (e.b = k.b))`; PostgreSQL 15.19
-      hashes `e` (`Hash Join (cost=30.00..54.75 rows=100 width=3)`, `Hash
-      Cond: (((k.a + 1) = e.a) AND (k.b = e.b))`, `k` the probe side). With
-      the expression clause alone the sides match (RP-981). Found while
-      working RP-966.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash join on an expression and a column pair hashes the column side]
-      Backlog-ID: RP-1058
+- [ ] **A join whose expression key shares a column with another
+      clause is unpriced.** `explain select e.b from e join k on e.a =
+      k.a - 1 and e.a = k.a` (`e`, `k` analysed, 1000 rows) prints a `Hash
+      Join` on both clauses, every cost zero; PostgreSQL 15.19 puts `e.a`,
+      `(k.a - 1)` and `k.a` in one equivalence class, hashes on `e.a = k.a`
+      alone and filters `k` by `((a - 1) = a)` (`Hash Join
+      (cost=20.06..37.70 rows=5 width=3)`). `... on e.a = e2.a + 1 and e.a
+      = e2.a * 2` is the same: PostgreSQL hashes `(e.a = (e2.a + 1))` and
+      filters `e2` by `((a + 1) = (a * 2))`; here an unpriced Nested Loop.
+      The pricing of expression keys refuses a bare column two clauses
+      share (`joined_sides`) rather than model the class. Found while
+      working RP-1058.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an expression key sharing a column with a column pair joins its class]
+      Backlog-ID: RP-1117
 
 - [ ] **EXPLAIN drops the Sort of an ORDER BY over a join with no
       LIMIT.** `explain (costs off) select e.b, k.b from e join k on e.a =
@@ -2746,6 +2750,12 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
       (`tests/test_pgserver_embedded.py::test_stop_does_not_wait_on_an_open_connection`,
       `stop() waited 3.4s`, in RM-729's `gate_rm.py` storage-engine step
       at load 8.6-9.6); alone it then passed three times at load ~14.
+      A fourth on 2026-11-26 (RP-1058's `--fast` gate, a change to EXPLAIN
+      pricing only, at load ~9): `3.322904625s`. Then, at load ~2, the
+      test alone passed five times and `stop()` itself, timed inside the
+      whole `embedded` binary at `--test-threads=4`, took 1.23-1.56 s in
+      three runs: the budget's margin is under 2x at rest. RP-1079 is the
+      same overrun.
       Backlog-ID: RP-690
       Verify: none -- seen once, under load; a timing that does not fail on demand
 
