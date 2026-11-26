@@ -2105,16 +2105,17 @@ impl PgHandler {
     }
 
     /// For EXPLAIN ANALYZE of a hash join on one key (RP-386): the outer
-    /// side's key field, the hashed side's, and the fields the hashed
-    /// side's scan projects (its target list, in the order the planner
-    /// builds it: what the join's output reads, then the key), by the two
-    /// sides' aliases. `None` for a join on several keys.
+    /// side's key, the hashed side's, and the fields the hashed side's
+    /// scan projects (its target list, in the order the planner builds
+    /// it: what the join's output reads, then the key), by the two sides'
+    /// aliases. A key is a stored field, or an expression over one
+    /// (RP-1033). `None` for a join on several keys.
     pub(crate) fn hash_join_reads(
         &self,
         sel: &secantus_pgplan::Select,
         outer_alias: &str,
         inner_alias: &str,
-    ) -> Option<(String, String, Vec<String>)> {
+    ) -> Option<(HashKey, HashKey, Vec<String>)> {
         if let Some(j) = &sel.join {
             if j.left_sub.is_some() || j.right_sub.is_some() {
                 return None;
@@ -2152,7 +2153,7 @@ impl PgHandler {
             if !read.contains(&inner_key) {
                 read.push(inner_key.clone());
             }
-            return Some((outer_key, inner_key, read));
+            return Some((HashKey::field(outer_key), HashKey::field(inner_key), read));
         }
         let (a, b, more, _, _, _) = self.joined_sides(sel)?;
         if !more.is_empty() || !a.exprs.is_empty() || !b.exprs.is_empty() {
@@ -2165,7 +2166,9 @@ impl PgHandler {
         } else {
             return None;
         };
-        Some((outer.field, inner.field.clone(), inner.read))
+        let outer_key = side_hash_key(sel, &outer)?;
+        let inner_key = side_hash_key(sel, &inner)?;
+        Some((outer_key, inner_key, inner.read))
     }
 
     /// A Hash node's input, a bare Seq Scan of `table` reading `read`
@@ -7782,6 +7785,59 @@ struct JoinedSide {
     /// Its side of the join clause is an expression over `field` (RP-981):
     /// the operators it evaluates and its result type.
     key_expr: Option<(u32, String)>,
+}
+
+/// A hash join's key on one side, as EXPLAIN ANALYZE recounts the join
+/// (RP-386): a stored field, or an expression over one (RP-981), with the
+/// joined-row key the expression reads that field as.
+pub(crate) struct HashKey {
+    pub(crate) field: String,
+    pub(crate) expr: Option<(String, secantus_pgplan::ColumnExpr)>,
+}
+
+impl HashKey {
+    pub(crate) fn field(field: String) -> Self {
+        Self { field, expr: None }
+    }
+}
+
+/// `s`'s hash key: its field, or where its side of the join clause is an
+/// expression (RP-981), that expression -- the ON's one expression
+/// equality's operand that is not a bare column. `None` where the clause
+/// cannot be found.
+fn side_hash_key(sel: &secantus_pgplan::Select, s: &JoinedSide) -> Option<HashKey> {
+    use secantus_pgplan::joins::JoinNode;
+    if s.key_expr.is_none() {
+        return Some(HashKey::field(s.field.clone()));
+    }
+    let secantus_pgplan::Statement::JoinRows(j) = sel.sub.as_ref()?.plan.as_ref() else {
+        return None;
+    };
+    let JoinNode::Join {
+        equi, expr_keys, ..
+    } = &j.tree
+    else {
+        return None;
+    };
+    let ([], [e]) = (&equi[..], &expr_keys[..]) else {
+        return None;
+    };
+    let expr = match (&e.left_column, &e.right_column) {
+        (Some(_), None) => &e.right,
+        (None, Some(_)) => &e.left,
+        _ => return None,
+    };
+    let mut keys = std::collections::HashSet::new();
+    if !secantus_pgplan::joins::expr_reads(expr, &mut keys)
+        || keys.len() != 1
+        || !keys.contains(&s.key)
+    {
+        return None;
+    }
+    Some(HashKey {
+        field: s.field.clone(),
+        expr: Some((s.key.clone(), expr.clone())),
+    })
 }
 
 /// The constant `filter` sets stored field `field` equal to, at its top

@@ -5510,9 +5510,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on PostgreSQL 15.19: ANALYZE of an anti join hashed on an
-    # expression counts its children and its hash table.
+    # expression counted its children and its hash table, as one hashed on
+    # a column did; both printed only the join's own rows here before
+    # RP-1033.
     "analyze of an anti join on an expression key": (
-        "RP-1033",
+        "RP-1033:fixed",
         _ANALYSED,
         "explain (analyze, costs off, timing off, summary off)"
         " select * from e left join e e2 on e.a = e2.a + 1 where e2.a is null",
@@ -5523,6 +5525,120 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Hash (actual rows=1000 loops=1)",
             "        Buckets: 1024  Batches: 1  Memory Usage: 47kB",
             "        ->  Seq Scan on e e2 (actual rows=1000 loops=1)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: a column-key anti join's counts (RP-1033).
+    "analyze of an anti join on a column key": (
+        "RP-1033:fixed",
+        _ANALYSED,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from e left join e e2 on e.a = e2.a where e2.a is null",
+        [
+            "Hash Anti Join (actual rows=0 loops=1)",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e (actual rows=1000 loops=1)",
+            "  ->  Hash (actual rows=1000 loops=1)",
+            "        Buckets: 1024  Batches: 1  Memory Usage: 47kB",
+            "        ->  Seq Scan on e e2 (actual rows=1000 loops=1)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: an inner join hashed on a column against
+    # the other side's expression, probed by the expression (RP-1033).
+    "analyze of an inner join on an expression key": (
+        "RP-1033:fixed",
+        _ANALYSED,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from e join e e2 on e.a = e2.a + 1",
+        [
+            "Hash Join (actual rows=999 loops=1)",
+            "  Hash Cond: ((e2.a + 1) = e.a)",
+            "  ->  Seq Scan on e e2 (actual rows=1000 loops=1)",
+            "  ->  Hash (actual rows=1000 loops=1)",
+            "        Buckets: 1024  Batches: 1  Memory Usage: 47kB",
+            "        ->  Seq Scan on e (actual rows=1000 loops=1)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: the hashed side's tuples are the
+    # columns the join returns, one here (RP-1033).
+    "analyze of an expression key join returning one column": (
+        "RP-1033:fixed",
+        _ANALYSED,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select e.a from e join e e2 on e.a = e2.a * 2",
+        [
+            "Hash Join (actual rows=500 loops=1)",
+            "  Hash Cond: ((e2.a * 2) = e.a)",
+            "  ->  Seq Scan on e e2 (actual rows=1000 loops=1)",
+            "  ->  Hash (actual rows=1000 loops=1)",
+            "        Buckets: 1024  Batches: 1  Memory Usage: 44kB",
+            "        ->  Seq Scan on e (actual rows=1000 loops=1)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: a LEFT join on an expression key hashes
+    # its preserved side, a Hash Right Join (RP-1033).
+    "analyze of a left join on an expression key": (
+        "RP-1033:fixed",
+        _ANALYSED,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from e left join e e2 on e.a = e2.a + 1",
+        [
+            "Hash Right Join (actual rows=1000 loops=1)",
+            "  Hash Cond: ((e2.a + 1) = e.a)",
+            "  ->  Seq Scan on e e2 (actual rows=1000 loops=1)",
+            "  ->  Hash (actual rows=1000 loops=1)",
+            "        Buckets: 1024  Batches: 1  Memory Usage: 47kB",
+            "        ->  Seq Scan on e (actual rows=1000 loops=1)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: a Merge Join on an expression key counts
+    # its Sorts, each Sort's method and memory, and its scans; the inner
+    # Sort returns the 901 rows the merge read before the outer side ran out.
+    "analyze of a merge join on an expression key": (
+        "RP-1033",
+        _ANALYSED,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from e join e e2 on e.b = e2.b || 'x'",
+        [
+            "Merge Join (actual rows=0 loops=1)",
+            "  Merge Cond: (e.b = ((e2.b || 'x'::text)))",
+            "  ->  Sort (actual rows=1000 loops=1)",
+            "        Sort Key: e.b",
+            "        Sort Method: quicksort  Memory: 71kB",
+            "        ->  Seq Scan on e (actual rows=1000 loops=1)",
+            "  ->  Sort (actual rows=901 loops=1)",
+            "        Sort Key: ((e2.b || 'x'::text))",
+            "        Sort Method: quicksort  Memory: 79kB",
+            "        ->  Seq Scan on e e2 (actual rows=1000 loops=1)",
+        ],
+    ),
+    # ------------- RP-1133 an anti join against a primary key
+    # Measured on PostgreSQL 15.19: a LEFT join keeping only its
+    # NULL-extended rows hashes the primary key's side, as against a
+    # column with no unique index.
+    "an anti join against a primary key is priced": (
+        "RP-1133",
+        _ANALYSED,
+        "explain select * from e left join k on k.a = e.a where k.a is null",
+        [
+            "Hash Anti Join  (cost=27.50..46.25 rows=1 width=14)",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19: over an expression key it is a Hash
+    # Anti Join on the expression too.
+    "an anti join on an expression key against a primary key is a hash anti join": (
+        "RP-1133",
+        _ANALYSED,
+        "explain select * from e left join k on k.a = e.a - 1 where k.a is null",
+        [
+            "Hash Anti Join  (cost=27.50..51.38 rows=500 width=14)",
+            "  Hash Cond: ((e.a - 1) = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
     # ------------- RP-902 a reduced LEFT join's one-sided ON conjunct

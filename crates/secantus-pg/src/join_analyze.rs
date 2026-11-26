@@ -93,6 +93,19 @@ fn key_of(v: Option<&Bson>) -> Option<Option<Key>> {
     })
 }
 
+/// A row's hash key: its key field's value, or the key expression's over
+/// it (RP-1033), evaluated as the Hash and the join evaluate their hash
+/// keys (`ExecHashGetHashValue`). `None` where it errors.
+fn hash_key_of(d: &Document, k: &crate::scan_estimate::HashKey) -> Option<Option<Key>> {
+    let Some((name, expr)) = &k.expr else {
+        return key_of(d.get(&k.field));
+    };
+    let mut row = Document::new();
+    row.insert(name.clone(), d.get(&k.field).cloned().unwrap_or(Bson::Null));
+    let v = secantus_pgplan::apply_row_expr(expr, &row).ok()?;
+    key_of(Some(&v))
+}
+
 /// A number an index condition compares; `None` for NULL or a non-number.
 fn number(v: Option<&Bson>) -> Option<f64> {
     match v? {
@@ -250,14 +263,22 @@ impl PgHandler {
                 let (o, i, r) = self.hash_join_reads(sel, &outer_alias, &inner_alias)?;
                 (o, i, r, estimate)
             }
-            None => self.lower_hash_reads(
-                sel,
-                &tree.details[0].1,
-                (&outer_table, &outer_alias),
-                (&inner_table, &inner_alias),
-                hash.children[0].details.is_empty(),
-                above,
-            )?,
+            None => {
+                let (o, i, r, estimate) = self.lower_hash_reads(
+                    sel,
+                    &tree.details[0].1,
+                    (&outer_table, &outer_alias),
+                    (&inner_table, &inner_alias),
+                    hash.children[0].details.is_empty(),
+                    above,
+                )?;
+                (
+                    crate::scan_estimate::HashKey::field(o),
+                    crate::scan_estimate::HashKey::field(i),
+                    r,
+                    estimate,
+                )
+            }
         };
         // Each scan's rows: those of its table its Filter keeps
         // (`ExecScan`'s `nfiltered1` counts the rest).
@@ -275,12 +296,15 @@ impl PgHandler {
         // (`keepNulls`); the others do not hash them.
         let right = tree.name == "Hash Right Join";
         let left = tree.name == "Hash Left Join";
-        if !(right || left || tree.name == "Hash Join") {
+        // An anti join returns each outer row no hashed row matches
+        // (RP-1033), a LEFT join's NULL-extended rows.
+        let anti = tree.name == "Hash Anti Join";
+        if !(right || left || anti || tree.name == "Hash Join") {
             return None;
         }
         // A lower join's rows are built for the join above; a RIGHT
-        // one's null-extended rows are not.
-        if top.is_none() && right {
+        // one's null-extended rows are not, nor an anti join's.
+        if top.is_none() && (right || anti) {
             return None;
         }
         let mut buckets: std::collections::HashMap<Key, Vec<usize>> =
@@ -288,7 +312,7 @@ impl PgHandler {
         let mut lens = Vec::new();
         let mut inner_nulls = 0usize;
         for (i, d) in inner_docs.iter().enumerate() {
-            match key_of(d.get(&inner_key))? {
+            match hash_key_of(d, &inner_key)? {
                 Some(k) => buckets.entry(k).or_default().push(i),
                 None if right => inner_nulls += 1,
                 None => continue,
@@ -307,10 +331,16 @@ impl PgHandler {
         let mut joined = 0usize;
         let mut matched: std::collections::HashSet<Key> = std::collections::HashSet::new();
         for d in &outer_docs {
-            let k = key_of(d.get(&outer_key))?;
+            let k = hash_key_of(d, &outer_key)?;
             let hits = k.as_ref().and_then(|k| buckets.get(k));
             let c = hits.map_or(0, Vec::len);
-            joined += if left { c.max(1) } else { c };
+            joined += if anti {
+                usize::from(c == 0)
+            } else if left {
+                c.max(1)
+            } else {
+                c
+            };
             if top.is_none() {
                 let o = prefixed(std::slice::from_ref(d), &outer_alias).pop()?;
                 for &i in hits.into_iter().flatten() {
