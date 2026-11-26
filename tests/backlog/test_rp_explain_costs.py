@@ -7483,6 +7483,26 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on z z2 (actual rows=20 loops=1)",
         ],
     ),
+    # The same plan priced (RP-390), measured on a private PostgreSQL 15.20
+    # cluster: the Hash Join wins its level over a Merge Join of two Sorts
+    # (11.32 in total at the top) and a Nested Loop over a Materialize of kz
+    # (18.40), so all three methods are weighed to choose it.
+    "nested loop over a hash join": (
+        "RP-390",
+        _ANALYSED_INDEXED_SMALL,
+        "explain select * from z join kz on z.a = kz.a join z z2 on z2.a < kz.a",
+        [
+            "Nested Loop  (cost=1.68..10.19 rows=133 width=18)",
+            "  Join Filter: (z2.a < kz.a)",
+            "  ->  Hash Join  (cost=1.68..2.94 rows=20 width=12)",
+            "        Hash Cond: (z.a = kz.a)",
+            "        ->  Seq Scan on z  (cost=0.00..1.20 rows=20 width=6)",
+            "        ->  Hash  (cost=1.30..1.30 rows=30 width=6)",
+            "              ->  Seq Scan on kz  (cost=0.00..1.30 rows=30 width=6)",
+            "  ->  Materialize  (cost=0.00..1.30 rows=20 width=6)",
+            "        ->  Seq Scan on z z2  (cost=0.00..1.20 rows=20 width=6)",
+        ],
+    ),
     # An index over a weakly correlated column (RP-926): a nested loop's
     # inner scan of it is priced a little high, more so the fewer the
     # loops. (Its wide range is `test_a_wide_range_over_a_weakly_correlated_index`.)

@@ -2196,14 +2196,30 @@ a regression test.
       it (`Materialize (actual rows=20 loops=20)`).
       Measured on a private 15.19 cluster (found while working RP-386,
       the chain while working RP-354).
-      Sized 2026-11-15: `nest_loop_chain_estimate` (scan_estimate.rs)
-      admits only inner joins with no hash or merge clause (`inner_join`
-      refuses a non-empty `equi`), so the Materialize needs the join
-      search to build hash-join paths for a level's relations
-      (`hash_inner_and_outer`) beside its nested loops, then price the
-      top nested loop's inner through `cost_material`.
+      Re-sized 2026-11-26 (private PostgreSQL 15.20 cluster): this is
+      not one PR, and it waits on RP-1059's (1), (2) and (5). Plain
+      EXPLAIN of the query prints `cost=0.00..0.00` on every node here;
+      PostgreSQL prints `Nested Loop (cost=1.68..10.19 rows=133
+      width=18)` over `Hash Join (cost=1.68..2.94 rows=20 width=12)` and
+      `Materialize (cost=0.00..1.30 rows=20 width=6)`. The Hash Join wins
+      its level only narrowly: with `enable_hashjoin` off the plan is a
+      Merge Join of two Sorts (11.32 at the top), with merge joins off too
+      a Nested Loop over a Materialize of `kz` (18.40). So the search
+      has to weigh hash, merge and nested-loop paths over the analysed
+      statistics (`eqjoinsel` with MCVs), and `kz_pkey` parameterized by
+      `z` (`a = z.a`) and by `z2` (`a > z2.a`). Neither search here
+      does. `nest_loop_chain` (scan_estimate.rs) refuses any equality
+      (`inner_join` refuses a non-empty `equi`) and any indexed table
+      linked to two others. `three_table_plan` (join_search.rs) wants two
+      equalities, declines analysed tables (RP-1059 (1)), weighs no
+      parameterized inner (RP-1059 (2)) and gives its relations no width
+      (RP-1059 (5)). Order: those three parts of RP-1059 first, then
+      admit an inequality clause between two of the three tables
+      (nested-loop paths only for that pair), then draw the top loop's
+      inner through `cost_material` and count the Materialize under
+      ANALYZE (`join_analyze.rs`, as a two-table loop's is).
       Backlog-ID: RP-390
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop over a hash join]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop over a hash join], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop over a hash join]
 - [ ] **A join nested in an outer join prints no estimate, and its join
       order and method are not PostgreSQL's.** Since 2026-11-15 an inner
       join's one-table ON conjuncts under an outer join, and an outer
