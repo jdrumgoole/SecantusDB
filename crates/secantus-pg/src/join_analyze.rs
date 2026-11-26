@@ -189,7 +189,14 @@ impl PgHandler {
         if tree.name.starts_with("Hash") && tree.name.ends_with(" Join") {
             self.analyze_hash_join(tree, sel, actual);
         } else if tree.name.starts_with("Nested Loop") {
-            if crate::explain::param_scan(&tree.children[1])
+            if tree.children[1].name == "Materialize"
+                && tree.children[1]
+                    .children
+                    .first()
+                    .is_some_and(|j| j.children.len() == 2)
+            {
+                self.analyze_nest_over_join(tree, sel, actual);
+            } else if crate::explain::param_scan(&tree.children[1])
                 .param_cond
                 .is_some()
             {
@@ -789,6 +796,63 @@ impl PgHandler {
             }
         }
         Some((kept, read))
+    }
+
+    /// A Nested Loop with no qual over a Seq Scan, its inner side a
+    /// Materialize of a join (an inner join nested in an outer one,
+    /// RP-978). With no qual every outer row pairs with each row the join
+    /// returned -- a LEFT join's outer row that finds none is
+    /// null-extended once -- so the join returned the loop's rows over the
+    /// outer rows, which its own counts are checked against. The
+    /// Materialize runs the join once and returns its rows on every loop.
+    /// A LEFT join returning just its outer rows could be over a join of
+    /// one row or of none: not counted.
+    fn analyze_nest_over_join(
+        &self,
+        tree: &mut PlanNode,
+        sel: &secantus_pgplan::Select,
+        actual: usize,
+    ) {
+        if !tree.details.is_empty() || tree.children.len() != 2 {
+            return;
+        }
+        let left = match tree.name.as_str() {
+            "Nested Loop" => false,
+            "Nested Loop Left Join" => true,
+            _ => return,
+        };
+        let Some((table, alias)) = filtered_seq_scan(&tree.children[0]) else {
+            return;
+        };
+        let Some((docs, read)) = self.scan_rows(sel, &tree.children[0], &table, &alias) else {
+            return;
+        };
+        let n_outer = docs.len();
+        if n_outer == 0 || !actual.is_multiple_of(n_outer) {
+            return;
+        }
+        let joined = actual / n_outer;
+        if left && joined <= 1 {
+            return;
+        }
+        let Some(pair) = crate::nested_join::nested_pair_sel(sel) else {
+            return;
+        };
+        let mut join = tree.children[1].children[0].clone();
+        self.analyze_join_children(&mut join, &pair, joined);
+        if join.children.iter().any(|c| c.actual_rows.is_none()) {
+            return;
+        }
+        join.actual_rows = Some(joined);
+        let outer = &mut tree.children[0];
+        if !outer.details.is_empty() {
+            outer.removed_by_filter = Some(read - n_outer);
+        }
+        outer.actual_rows = Some(n_outer);
+        let material = &mut tree.children[1];
+        material.actual_rows = Some(joined);
+        material.actual_loops = Some(n_outer);
+        material.children[0] = join;
     }
 
     /// A plain Nested Loop's children counted, without touching the

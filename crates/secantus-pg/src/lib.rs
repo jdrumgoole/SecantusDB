@@ -94,6 +94,7 @@ mod live;
 mod live_notices;
 mod lock_manager;
 mod merge;
+mod nested_join;
 mod objaddr;
 mod object_acl;
 mod opclasses;
@@ -47725,70 +47726,12 @@ impl PgHandler {
                             if let Some((implied, from)) = self.join_select_left_implied(sel) {
                                 explain::mark_implied_filters(&mut tree, &implied, &from);
                             }
-                            match pick {
-                                scan_estimate::JoinPick::Hash { swap } => {
-                                    explain::price_hash_join(&mut tree, a, b, join, swap)
-                                }
-                                // The merge path PostgreSQL keeps (RP-366):
-                                // both inputs sorted on the join keys.
-                                scan_estimate::JoinPick::Merge { b_outer, plan } => {
-                                    // On an expression key, the texts
-                                    // of its one ON equality (RP-1032).
-                                    let keys = if scan_estimate::has_expr_join_key(sel) {
-                                        match options.join_conds.as_slice() {
-                                            [cond] => explain::expr_merge_key_texts(
-                                                &tree.children[0],
-                                                cond,
-                                            ),
-                                            _ => None,
-                                        }
-                                    } else {
-                                        explain::join_key_texts(sel)
-                                    };
-                                    if let Some(keys) = keys {
-                                        explain::price_merge_join(
-                                            &mut tree, a, b, join, &plan, b_outer, &keys,
-                                        );
-                                    }
-                                }
-                                // A nested loop into the inner side's unique
-                                // key index, parameterized by the outer row
-                                // (RP-978).
-                                scan_estimate::JoinPick::NestParam {
-                                    b_outer,
-                                    index_only,
-                                } => {
-                                    let inner_key =
-                                        explain::join_key_texts(sel).and_then(|(l, r)| {
-                                            let k = if b_outer { l } else { r };
-                                            k.split_once('.')
-                                                .map(|(a, c)| (a.to_string(), c.to_string()))
-                                        });
-                                    if let (Some((alias, column)), Some(index)) =
-                                        (inner_key, indexes[1].clone())
-                                    {
-                                        explain::price_param_nest_loop(
-                                            &mut tree,
-                                            a,
-                                            b,
-                                            join,
-                                            b_outer,
-                                            &scan_estimate::ParamScan {
-                                                index,
-                                                alias,
-                                                column,
-                                                index_only,
-                                                read: Vec::new(),
-                                                memoize: None,
-                                            },
-                                        );
-                                    }
-                                }
-                            }
-                            // A side read through its index (RP-369).
-                            if tree.estimate.is_some() {
-                                explain::name_index_scans(&mut tree, &indexes);
-                            }
+                            explain::apply_join_pick(
+                                &mut tree,
+                                sel,
+                                (a, b, join, pick, indexes),
+                                &options.join_conds,
+                            );
                         }
                     }
                 }
@@ -47813,23 +47756,19 @@ impl PgHandler {
                                     .map(|(plan, a, b, join)| (plan, a, b, join, None, None))
                             })
                         {
-                            explain::price_nest_loop(&mut tree, &plan, a, b, join);
-                            // A LEFT join's preserved side read through its
-                            // index, its WHERE the Index Cond (RP-354).
-                            if let Some(index) = outer_index {
-                                let outer = &mut tree.children[0];
-                                if let Some(table) =
-                                    outer.name.strip_prefix("Seq Scan on ").map(str::to_string)
-                                {
-                                    explain::index_path_node(outer, index, &table);
-                                }
-                            }
-                            // The inner read through its index, the join
-                            // clause its Index Cond (RP-354).
-                            if let Some(p) = param {
-                                explain::param_index_inner(&mut tree, &p);
-                            }
+                            explain::apply_nest_loop(
+                                &mut tree,
+                                (plan, a, b, join, param, outer_index),
+                            );
                         }
+                    }
+                }
+                // An inner join nested on a LEFT join's nullable side
+                // (RP-978): the pair priced as two tables are, then the
+                // join above it over the pair's cheapest path.
+                if tree.estimate.is_none() {
+                    if let Statement::Select(sel) = inner.as_ref() {
+                        self.price_nested_outer_join(sel, &mut tree, &options.join_conds);
                     }
                 }
                 // The Sort back over the join, priced where the join is:
