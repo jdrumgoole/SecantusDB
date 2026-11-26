@@ -858,6 +858,7 @@ impl plan::CacheHook for ReadCache<'_> {
             projection: self.ask.asked.projection,
             collation: q.collation,
             distinct: if top { self.ask.asked.distinct } else { None },
+            distinct_backward: false,
             // The subplanner plans a branch in the classic engine (so `q.sbe`
             // is false for it), but keys it by whether the query runs in SBE.
             sbe: if branch { self.ask.asked.sbe } else { q.sbe },

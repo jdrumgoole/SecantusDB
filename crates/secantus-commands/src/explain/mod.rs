@@ -1212,7 +1212,14 @@ fn cache_key_of(
     let full = catalog(storage, db, &s.coll, None).ok()?;
     let implies = |partial: &Document| storage.query_implies_partial(&s.filter, partial);
     let sbe = front_runs_in_sbe(storage, db, s, collation, pipeline);
+    let group = s.distinct_group.as_ref();
     let (projection, distinct) = match &s.kind {
+        // A `$group` read by a DISTINCT_SCAN is keyed with the fields it
+        // reads and its key (RM-697).
+        Kind::Find if group.is_some() => (
+            group.map(|g| &g.projection),
+            group.map(|g| g.field.as_str()),
+        ),
         Kind::Find => (s.projection.as_ref(), None),
         // A `distinct` SBE runs is keyed as the `find` of its query
         // (measured 8.2.11, 2026-11-14: `eqx||||fs`; RM-542).
@@ -1220,11 +1227,16 @@ fn cache_key_of(
         Kind::Distinct(key) => (None, Some(key.as_str())),
         _ => (None, None),
     };
+    let sort = match group {
+        Some(g) => g.sort.as_ref(),
+        None => s.sort.as_ref(),
+    };
     let parts = cache_key::Parts {
-        sort: s.sort.as_ref().filter(|d| !d.is_empty()),
+        sort: sort.filter(|d| !d.is_empty()),
         projection,
         collation,
         distinct,
+        distinct_backward: group.is_some_and(|g| g.last),
         sbe,
         subplanner: false,
     };
@@ -1541,6 +1553,19 @@ fn distinct_group_with(
         root.insert(name.clone(), arg.clone());
     }
     let last = last.unwrap_or(false);
+    let mut group_projection = Document::new();
+    for f in &reads {
+        group_projection.insert(f.clone(), 1_i32);
+    }
+    if !reads.iter().any(|r| r == "_id") {
+        group_projection.insert("_id", 0_i32);
+    }
+    let group_key = shape::DistinctGroupKey {
+        field: field.clone(),
+        sort: s.sort.clone(),
+        projection: group_projection,
+        last,
+    };
     let mut asked = s.clone();
     asked.kind = Kind::Distinct(field.clone());
     asked.sort = None;
@@ -1718,6 +1743,7 @@ fn distinct_group_with(
                 shape.sort = None;
                 shape.projection = None;
                 shape.rest[0] = doc! { "$groupByDistinctScan": { "newRoot": root } };
+                shape.distinct_group = Some(group_key);
                 return Ok(Some((shape, plans[at].clone(), ranked)));
             }
         }
@@ -1758,6 +1784,7 @@ fn distinct_group_with(
     shape.sort = None;
     shape.projection = None;
     shape.rest[0] = doc! { "$groupByDistinctScan": { "newRoot": root } };
+    shape.distinct_group = Some(group_key);
     Ok(Some((shape, plan, ranked)))
 }
 
