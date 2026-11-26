@@ -3889,6 +3889,7 @@ impl PgHandler {
             key_index_name,
             key_ops: 0.0,
             default_nd,
+            group_nd: (nd, default_nd),
             no_stats: key.is_none(),
             key_only_read: false,
             rel_rows: scan.2,
@@ -7720,9 +7721,9 @@ fn expr_key_pair(
         (Some(l), None) => Some((
             l.clone(),
             read(&e.right)?,
-            (false, e.right_ops, ty(&e.right)),
+            (false, e.right_ops?, ty(&e.right)),
         )),
-        (None, Some(r)) => Some((read(&e.left)?, r.clone(), (true, e.left_ops, ty(&e.left)))),
+        (None, Some(r)) => Some((read(&e.left)?, r.clone(), (true, e.left_ops?, ty(&e.left)))),
         _ => None,
     }
 }
@@ -7750,6 +7751,7 @@ pub(crate) fn has_expr_join_key(sel: &secantus_pgplan::Select) -> bool {
 /// `estimate_hash_bucket_stats`); not unique and in no index's order
 /// (RP-981, RP-411).
 fn key_is_expression(h: &mut HashSide, ops: f64, pg_type: &str) {
+    h.group_nd = (h.stats.0, h.default_nd);
     h.stats = (200.0, 0.0, Vec::new());
     h.unique = false;
     h.column = None;
@@ -7967,6 +7969,11 @@ struct HashSide {
     /// no statistics (RP-981).
     key_ops: f64,
     default_nd: bool,
+    /// The distinct count `estimate_num_groups` finds for the key (a
+    /// Memoize's cache keys): its column's, and over an expression still
+    /// the one column it reads (`pull_var_clause`), not the 200 default
+    /// `eqjoinsel` takes (RP-1032).
+    group_nd: (f64, bool),
     /// Its table was never analysed (RP-1019): no statistics for the key,
     /// so `mergejoinscansel` keeps its defaults and reads it whole.
     no_stats: bool,
@@ -8560,6 +8567,18 @@ fn hash_anti_join_of(a: HashSide, b: HashSide) -> Option<JoinEstimate> {
     ))
 }
 
+/// Whether a join clause over keys of these two types is one PostgreSQL
+/// hashes as priced here: one type, or an expression key against a key of
+/// another integer type (`e.a::bigint = e2.a`, RP-1032) -- `int84eq` and
+/// its kin are hashable members of the one `integer_ops` family, so the
+/// clause hashes and merges as a same-type one does. The expression side
+/// has no MCVs, so `eqjoinsel` never compares values across the types.
+fn hash_key_types_match(a: &HashSide, b: &HashSide) -> bool {
+    let integer = |t: &str| matches!(t, "int2" | "int4" | "int8");
+    a.pg_type == b.pg_type
+        || ((a.key_ops > 0.0 || b.key_ops > 0.0) && integer(&a.pg_type) && integer(&b.pg_type))
+}
+
 /// `cost_hashjoin` over two priced sides, the hashed one PostgreSQL's
 /// `add_path` keeps (RP-330, RP-359): the printed outer scan's, the hashed
 /// scan's and the join's estimates, and whether the left table is hashed.
@@ -8586,7 +8605,7 @@ fn hash_join_of(
 ) -> Option<JoinEstimate> {
     use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
     if (filter.count != 0 && redundant)
-        || a.pg_type != b.pg_type
+        || !hash_key_types_match(&a, &b)
         || more.len() > MORE_HASH_CLAUSES
         || more.iter().any(|(x, y)| x.pg_type != y.pg_type)
         || (!more.is_empty() && (left_join || redundant))
@@ -8650,9 +8669,9 @@ fn hash_join_of(
     // nested loop probing it (RP-377): priced below over each side's
     // pathlist. An outer join or a join filter there is not modelled.
     let unique_key = !multi && (a.unique || b.unique);
-    // The other paths a unique key weighs are not modelled over an
-    // expression key.
-    if unique_key && (redundant || expr_key) {
+    // Over an expression key they are weighed too (RP-1032), the
+    // column side's index probed by the expression.
+    if unique_key && redundant {
         return None;
     }
     // A side its own WHERE cuts to one row is `inner_unique` as the inner
@@ -8825,10 +8844,7 @@ fn hash_join_of(
         }
     })?;
     // A merge on an expression key sorts on the expression, drawn as the
-    // scan's projected value (RP-1032); an outer one is not modelled.
-    if expr_key && left_join && matches!(pick, JoinPick::Merge { .. }) {
-        return None;
-    }
+    // scan's projected value, inner or LEFT (RP-1032).
     // `match_unsorted_outer`'s nested loops are paths too, each pair
     // paying the join clause (`cpu_operator_cost` for its `=`). Over two
     // whole sequential scans they never come near; a side an index scan
@@ -8870,6 +8886,11 @@ fn hash_join_of(
             ));
         }
         if other <= t0 * 1.01 {
+            // Over an expression key, a merge sorting the expression against
+            // the presorted index is not drawn yet (RP-1032).
+            if expr_key {
+                return None;
+            }
             // A merge reading a side presorted by its key's index, cheaper
             // beyond the fuzz factor, is the plan (RP-401); anything closer,
             // or another method, is not priced.
@@ -8969,8 +8990,9 @@ fn unique_key_other_paths(
         // key's order: no whole-index scan beside it (RP-978).
         let by_key = s.index.is_some() && s.index == s.key_index_name;
         // The Memoize over it is keyed on the other side's column: its
-        // statistics, or a table never analysed's defaults (RP-1019).
-        if !other.no_stats {
+        // statistics, or a table never analysed's defaults (RP-1019); over
+        // an expression the column it reads (RP-1032).
+        if !other.no_stats && other.key_ops == 0.0 {
             other.column.as_ref()?;
         }
         let (st, tt) = costsize::ordered_index_scan_with(
@@ -8988,14 +9010,24 @@ fn unique_key_other_paths(
         // clause's (`var_eq_non_const`), at most the rows.
         let ppi_rows = costsize::clamp_row_est(k.rel.tuples * k.where_sel / k.ndistinct.max(1.0))
             .min(s.scan.2);
-        let memo_key = MemoKey::column(other.stats.0, other.default_nd, other.tuples, other.scan.2);
+        let memo_key = MemoKey::column(
+            other.group_nd.0,
+            other.group_nd.1,
+            other.tuples,
+            other.scan.2,
+        );
+        // `genericcostestimate`'s `qual_arg_cost`: the index qual's other
+        // operand, an expression over the outer row, evaluated once a scan
+        // to make its runtime key -- on the index's startup and total, and
+        // so on a bitmap heap scan's (RP-1032).
+        let qual_arg = other.key_ops * costsize::CPU_OPERATOR_COST;
         let param = |(startup, total): (f64, f64)| InPath {
-            startup,
-            total,
+            startup: startup + qual_arg,
+            total: total + qual_arg,
             class: None,
             rows: ppi_rows,
             req_outer: other_bit,
-            rescan: (startup, total),
+            rescan: (startup + qual_arg, total + qual_arg),
             indexed: true,
             memo_key: Some(memo_key),
         };

@@ -5195,10 +5195,12 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Measured on PostgreSQL 15.19: an expression key against a unique
-    # column hashes the unique side, inner unique.
+    # Measured on PostgreSQL 15.19 (RP-1032, fixed): an expression key
+    # against a unique column hashed the unique side, inner unique, once
+    # the merge and the nested loop probing its index by the expression
+    # were weighed beside it.
     "an expression key against a unique column is a hash join": (
-        "RP-1032",
+        "RP-1032:fixed",
         _ANALYSED,
         "explain select * from e join k on k.a = e.a - 1",
         [
@@ -5207,6 +5209,186 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
             "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1032, fixed):
+    # the side its WHERE cuts to nine rows hashed, k probing it.
+    "an expression key against a unique column, hashed as the smaller side": (
+        "RP-1032:fixed",
+        _ANALYSED,
+        "explain select * from e join k on k.a = e.a - 1 where e.a < 10",
+        [
+            "Hash Join  (cost=17.61..37.70 rows=9 width=14)",
+            "  Hash Cond: (k.a = (e.a - 1))",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=17.50..17.50 rows=9 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=9 width=7)",
+            "              Filter: (a < 10)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1032, fixed):
+    # the unique side hashed, inner unique.
+    "an expression key against a unique column in a left join is a hash left join": (
+        "RP-1032:fixed",
+        _ANALYSED,
+        "explain select * from e left join k on k.a = e.a - 1",
+        [
+            "Hash Left Join  (cost=27.50..45.26 rows=1000 width=14)",
+            "  Hash Cond: ((e.a - 1) = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1032, fixed):
+    # the preserved unique side hashed.
+    "an expression key against a preserved unique column is a hash right join": (
+        "RP-1032:fixed",
+        _ANALYSED,
+        "explain select * from k left join e on k.a = e.a - 1",
+        [
+            "Hash Right Join  (cost=27.50..45.26 rows=1000 width=14)",
+            "  Hash Cond: ((e.a - 1) = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1032, fixed):
+    # `int84eq` hashes in the integer family, the cast `int48` one operator a row.
+    "a cast key against another integer type is a hash join": (
+        "RP-1032:fixed",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a::bigint = e2.a",
+        [
+            "Hash Join  (cost=27.50..57.50 rows=1000 width=14)",
+            "  Hash Cond: ((e.a)::bigint = e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1032, fixed):
+    # `int24eq`, the cast `int42` one operator, k inner unique.
+    "a cast key against a unique column of another integer type is a hash join": (
+        "RP-1032:fixed",
+        _ANALYSED,
+        "explain select * from e join k on e.a::smallint = k.a",
+        [
+            "Hash Join  (cost=27.50..45.26 rows=1000 width=14)",
+            "  Hash Cond: ((e.a)::smallint = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1032, fixed):
+    # the expression's Sort Key its projected value.
+    "an expression key in a left join the merge wins is a merge left join": (
+        "RP-1032:fixed",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.b = e2.b || 'x'",
+        [
+            "Merge Left Join  (cost=129.66..224.66 rows=5000 width=14)",
+            "  Merge Cond: (e.b = ((e2.b || 'x'::text)))",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: e.b",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: ((e2.b || 'x'::text))",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1127, found while
+    # working RP-1032): the WHERE's equality is the join clause its ON form is.
+    "an expression equality in a comma join's where is a merge join": (
+        "RP-1127",
+        _ANALYSED,
+        "explain select * from e, e e2 where e.b = e2.b || 'x'",
+        [
+            "Merge Join  (cost=129.66..224.66 rows=5000 width=14)",
+            "  Merge Cond: (e.b = ((e2.b || 'x'::text)))",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: e.b",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: ((e2.b || 'x'::text))",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1127, found while
+    # working RP-1032): the semi join made inner over the unique side, hashed.
+    "an in of an outer expression over a unique column is a hash join": (
+        "RP-1127",
+        _ANALYSED,
+        "explain select * from e where a + 1 in (select a from k)",
+        [
+            "Hash Join  (cost=27.50..45.26 rows=1000 width=7)",
+            "  Hash Cond: ((e.a + 1) = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1129, found while
+    # working RP-1032): `cost_agg`'s AGG_PLAIN over the hash join, each scan narrowed to its key.
+    "an aggregate over a hash join is priced": (
+        "RP-1129",
+        _ANALYSED,
+        "explain select count(*) from e join k on k.a = e.a",
+        [
+            "Aggregate  (cost=47.64..47.65 rows=1 width=8)",
+            "  ->  Hash Join  (cost=27.50..45.14 rows=1000 width=0)",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+            "        ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1129, found while
+    # working RP-1032): as over a column key, the clause paying the expression's operator.
+    "an aggregate over a hash join on an expression key is priced": (
+        "RP-1129",
+        _ANALYSED,
+        "explain select count(*) from e join k on k.a = e.a - 1",
+        [
+            "Aggregate  (cost=47.76..47.77 rows=1 width=8)",
+            "  ->  Hash Join  (cost=27.50..45.26 rows=1000 width=0)",
+            "        Hash Cond: ((e.a - 1) = k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+            "        ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1130, found while
+    # working RP-1032): the filter over the join, its rows the one a NULL test leaves.
+    "a left join filtered on its nullable side's other column is priced": (
+        "RP-1130",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a = e2.a where e2.b is null",
+        [
+            "Hash Left Join  (cost=27.50..56.25 rows=1 width=14)",
+            "  Hash Cond: (e.a = e2.a)",
+            "  Filter: (e2.b IS NULL)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1130, found while
+    # working RP-1032): the nullable side's expression key, a Hash Right
+    # Join hashing the preserved side.
+    "a left join on an expression key filtered on its nullable side's other column is priced": (
+        "RP-1130",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a = e2.a + 1 where e2.b is null",
+        [
+            "Hash Right Join  (cost=27.50..57.50 rows=1 width=14)",
+            "  Hash Cond: ((e2.a + 1) = e.a)",
+            "  Filter: (e2.b IS NULL)",
+            "  ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
     # Measured on PostgreSQL 15.19 (RP-1032, fixed): a text expression key

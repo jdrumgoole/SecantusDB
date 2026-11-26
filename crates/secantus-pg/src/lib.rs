@@ -12279,9 +12279,9 @@ impl PgHandler {
         // One join key: a column equality, or one over an expression; or,
         // under equivalence classes, the one join clause they leave or none.
         let column = |k: &str| k.split(SEP).nth(1).map(str::to_string);
-        let side_key = |col: &Option<String>, ops: u32| match col {
+        let side_key = |col: &Option<String>, ops: Option<u32>| match col {
             Some(k) => column(k).map(Ok),
-            None => Some(Err(ops)),
+            None => Some(Err(ops?)),
         };
         let mut restrict = (0, 0);
         let (lkey, rkey, order) = match (ec, equi, expr_keys) {
