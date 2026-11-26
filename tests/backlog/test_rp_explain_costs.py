@@ -2545,6 +2545,46 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e2",
         ],
     ),
+    # Measured on a private PostgreSQL 15.20 cluster (2026-11-26, RP-1063):
+    # over tables never analysed, the join order search plans a RIGHT JOIN
+    # atop a chain, the pair first, and hashes the preserved relation,
+    # unique on its key, under a Hash Right Join.
+    "a right join atop a never-analysed chain hashes its unique preserved relation": (
+        "RP-1063:fixed",
+        _NEVER_ANALYSED,
+        "explain (costs off) select e.b, k2.b from e join k on e.a = k.a "
+        "right join k k2 on k2.a = e.a",
+        [
+            "Hash Right Join",
+            "  Hash Cond: (e.a = k2.a)",
+            "  ->  Hash Join",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e",
+            "        ->  Hash",
+            "              ->  Seq Scan on k",
+            "  ->  Hash",
+            "        ->  Seq Scan on k k2",
+        ],
+    ),
+    # The same join written as a LEFT JOIN to a parenthesised pair, which
+    # PostgreSQL plans alike (measured as above).
+    "a left join to a never-analysed parenthesised pair hashes its unique preserved relation": (
+        "RP-1063:fixed",
+        _NEVER_ANALYSED,
+        "explain (costs off) select e.b, k2.b from k k2 left join "
+        "(e join k on e.a = k.a) on k2.a = e.a",
+        [
+            "Hash Right Join",
+            "  Hash Cond: (e.a = k2.a)",
+            "  ->  Hash Join",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e",
+            "        ->  Hash",
+            "              ->  Seq Scan on k",
+            "  ->  Hash",
+            "        ->  Seq Scan on k k2",
+        ],
+    ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): a LEFT
     # JOIN to a unique key whose columns nothing reads is removed.
     "a left join nothing reads is removed": (

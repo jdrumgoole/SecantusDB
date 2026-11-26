@@ -1949,8 +1949,9 @@ a regression test.
       (3) a plan with a merge join (never-analysed `m0 join m1 on m0.b =
       m1.a join m2 on m1.b = m2.a`, 20 rows, is PostgreSQL's Merge Join
       over Sorts): the search weighs it, the drawing declines it.
-      (4) a LEFT or FULL join in the chain, a join filter, and VERBOSE and
-      ANALYZE, whose lists follow the written chain.
+      (4) a LEFT or FULL join in the chain (a RIGHT join atop an inner
+      pair is drawn since 2026-11-26, RP-1063), a join filter, and VERBOSE
+      and ANALYZE, whose lists follow the written chain.
       (5) costs: every node of a three-way chain prints `cost=0.00..0.00
       rows=0 width=0`; the search's estimates match PostgreSQL's
       (`83.58..123.68` for the first query over tables never analysed) but
@@ -2062,8 +2063,37 @@ a regression test.
       e2.a = k.a` is a `Hash Left Join` of `e e2` over a Hash of `(e join
       k)` here; PostgreSQL 15.19 prints a `Hash Right Join` of the `(e
       join k)` Hash Join over a Hash of `e e2`. Found while working RP-966.
+      Since 2026-11-26 the join order search plans a RIGHT JOIN atop an
+      inner pair, and `z LEFT JOIN (x JOIN y)` written so, as one chain
+      (`join_search::right_chain`, the pair first), and EXPLAIN draws its
+      hash plans: over tables never analysed both shapes match a private
+      PostgreSQL 15.20 cluster (`... right join k k2 on k2.a = e.a` is its
+      `Hash Right Join` hashing `k k2`; 11 of 11 all-hash shapes in a
+      randomised sweep, against 5 before, rows and their order unchanged).
+      What remains is the analysed case this item measures: `e` and `k`
+      analysed, `join_side` declines the search (RP-1059 (1), `eqjoinsel`
+      over MCVs not modelled there), and the chain is drawn as written.
+      Work RP-1059 (1) first. Still declined with it: a WHERE conjunct
+      over two tables, a LEFT or FULL pair below the RIGHT join, an ON
+      that is not plain column equalities.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a right join atop a chain hashes its preserved relation]
       Backlog-ID: RP-1063
+
+- [ ] **A chain whose hashed pair is PostgreSQL's Merge Join returns a
+      key's rows in another order.** `select x.c, y.c, z.c from t5 z left
+      join (u1 x join t4 y on x.b = y.b) on z.b = x.a` (never analysed:
+      `t5` 7 rows, `u1` 300 keyed on `a`, `t4` 1,000; setup in the gap
+      test) returns the same 858 rows as a private PostgreSQL 15.20
+      cluster, but the 143 of `x.c = 'u6'` start `x995, x988, ...` here
+      and `x85, x78, ...` there. PostgreSQL's plan is a Hash Left Join of
+      `z` over a Hash of a Merge Join of `x` and `y` over Sorts; EXPLAIN
+      here draws that pair as a Hash Join (RP-1059 (3), the drawing
+      declines a merge join), and which method the rows were built with
+      is not yet known. The pair alone (`u1 x join t4 y on x.b = y.b`, a
+      Merge Join on both) comes out in PostgreSQL's order. The same before
+      and after RP-1063's change. Found while working RP-1063.
+      Verify: tests/backlog/test_rp_hashed_pair_order.py::test_a_hashed_merge_pair_returns_a_keys_rows_in_postgres_order
+      Backlog-ID: RP-1114
 
 - [ ] **A FULL JOIN an inner join above reduces hashes the wrong side.**
       `explain (costs off) select e.b, e2.b from e full join k on e.a =
