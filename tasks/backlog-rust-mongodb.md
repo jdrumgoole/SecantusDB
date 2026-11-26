@@ -1287,15 +1287,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       working RM-538.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm538.py::test_a_match_after_a_group_as_the_optimizer_leaves_it, tests/backlog/test_rm_found_2026_11_14_rm538.py::test_a_match_moves_ahead_of_a_root_variable_new_root
       Backlog-ID: RM-662
-- [ ] **`explain` of a `$sampleRate` the run refuses succeeds.** mongod
-      8.2.11 refuses to explain `{$match: {$sampleRate: 2}}` (BadValue,
-      "numeric argument to $sampleRate must be in [0, 1]") and `{$sampleRate:
-      "x"}` (BadValue, "argument to $sampleRate must be a numeric type"), as
-      it refuses to run them; this server's run refuses both, but its
-      `explain` answers, listing the `$sampleRate` as written. Found
-      2026-11-14 working RM-538.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm538.py::test_explain_refuses_a_sample_rate_the_run_refuses
-      Backlog-ID: RM-663
 - [ ] **A `$lookup` over a collection reports nothing it examined.** At
       `executionStats` mongod 8.2.11 gives a `$lookup` whose pipeline reads
       a collection its `totalDocsExamined`, `totalKeysExamined`,

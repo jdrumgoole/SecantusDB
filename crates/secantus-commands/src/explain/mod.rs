@@ -3209,6 +3209,15 @@ fn aggregate(
     let plan_cache_stats = pipeline
         .first()
         .is_some_and(|s| s.contains_key("$planCacheStats"));
+    // mongod refuses a `$sampleRate` it cannot parse when it parses the
+    // pipeline; the dry run reads no document for the matcher to meet it
+    // with (measured 8.2.11, RM-663).
+    for filter in pipeline
+        .iter()
+        .filter_map(|s| s.get_document("$match").ok())
+    {
+        secantus_core::query::check_sample_rates(filter).map_err(crate::ts_store::match_error)?;
+    }
     match validate(crate::aggregate::aggregate, &checked, ctx) {
         // The dry run's namespace is not there, which is all a `$collStats`
         // stage is saying when it cannot read its count or its sizes.

@@ -79,12 +79,12 @@ def test_a_match_moves_ahead_of_a_root_variable_new_root(
 # ------------------------------------------- an invalid $sampleRate --
 
 
-@pytest.mark.backlog("RM-663")
+@pytest.mark.backlog_fixed("RM-663")
 def test_explain_refuses_a_sample_rate_the_run_refuses(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 refuses to explain `{$sampleRate: 2}` (BadValue,
     "numeric argument to $sampleRate must be in [0, 1]") and `{$sampleRate:
     "x"}` (BadValue, "argument to $sampleRate must be a numeric type"), as
-    it refuses to run them. This server runs neither, but explains both."""
+    it refuses to run them. This server ran neither, but explained both."""
 
     def answers(client: Any) -> list:
         return [
