@@ -854,6 +854,55 @@ impl Scan {
     }
 }
 
+/// The rows a scan of a clustered collection between two `_id`s reads, in
+/// the order it reads them, and how many of them are within the range: the
+/// scan seeks to its start, which no record before counts for, and reads
+/// the first record past the other end too (measured 8.2.11, 2026-11-26).
+/// The documents are the table's, in `_id` order.
+pub(crate) fn clustered_reads(
+    range: &super::node::RidRange,
+    backward: bool,
+    env: &Env,
+) -> (Vec<usize>, usize) {
+    use super::bounds::cmp;
+    use std::cmp::Ordering::{Greater, Less};
+    let mut order: Vec<usize> = (0..env.docs.len()).collect();
+    let id = |row: usize| env.docs[row].get("_id").cloned().unwrap_or(Bson::Null);
+    order.sort_by(|&a, &b| cmp(&id(a), &id(b)));
+    if backward {
+        order.reverse();
+    }
+    // Whether a row is not before the start of the scan, and not past its end.
+    let (near, far): (&Bson, &Bson) = if backward {
+        (&range.max, &range.min)
+    } else {
+        (&range.min, &range.max)
+    };
+    let (near_incl, far_incl) = if backward {
+        (range.max_incl, range.min_incl)
+    } else {
+        (range.min_incl, range.max_incl)
+    };
+    let started = |row: usize| {
+        let o = cmp(&id(row), near);
+        let toward = if backward { Greater } else { Less };
+        o != toward && (near_incl || o != std::cmp::Ordering::Equal)
+    };
+    let within = |row: usize| {
+        let o = cmp(&id(row), far);
+        let past = if backward { Less } else { Greater };
+        o != past && (far_incl || o != std::cmp::Ordering::Equal)
+    };
+    let start = order
+        .iter()
+        .position(|&r| started(r))
+        .unwrap_or(order.len());
+    let tail = &order[start..];
+    let inside = tail.iter().position(|&r| !within(r)).unwrap_or(tail.len());
+    let reads = (inside + 1).min(tail.len());
+    (tail[..reads].to_vec(), inside)
+}
+
 /// A stage being run: its own state and its inputs.
 struct Run<'a> {
     node: &'a Node,
@@ -873,6 +922,9 @@ struct Run<'a> {
     extra: Document,
     /// A GEO_NEAR stage's ring search, over the documents it reads.
     near: Option<Box<(NearSearch<()>, Docs)>>,
+    /// A scan of a clustered collection between two `_id`s: the rows it
+    /// reads and how many of them are within its range.
+    clustered: Option<(Vec<usize>, usize)>,
 }
 
 /// The collection as a `$near` search reads it, unchanging.
@@ -945,11 +997,20 @@ impl<'a> Run<'a> {
             Node::GeoNear { index, clause, .. } => near_search(index, clause, env).map(Box::new),
             _ => None,
         };
+        let clustered = match node {
+            Node::CollScan {
+                backward,
+                range: Some(range),
+                ..
+            } => Some(clustered_reads(range, *backward, env)),
+            _ => None,
+        };
         let mut inputs: Vec<Run> = inputs.into_iter().map(|n| Run::new(n, env)).collect();
         if let Node::Sort { on_keys: true, .. } = node {
             inputs[0].keep_found();
         }
         Run {
+            clustered,
             node,
             inputs,
             scan,
@@ -1008,7 +1069,30 @@ impl<'a> Run<'a> {
 
     fn step(&mut self, env: &Env) -> Option<usize> {
         match self.node {
-            Node::CollScan { filter, backward } => {
+            Node::CollScan {
+                filter,
+                range: Some(_),
+                ..
+            } => {
+                let (reads, inside) = self.clustered.as_ref()?;
+                while self.pos < reads.len() {
+                    let row = reads[self.pos];
+                    let past = self.pos >= *inside;
+                    self.pos += 1;
+                    self.docs += 1;
+                    if past {
+                        // The record that ends the scan.
+                        return None;
+                    }
+                    if env.matches(row, filter) {
+                        return Some(row);
+                    }
+                }
+                None
+            }
+            Node::CollScan {
+                filter, backward, ..
+            } => {
                 while self.pos < env.docs.len() {
                     let row = if *backward {
                         env.docs.len() - 1 - self.pos
@@ -1198,7 +1282,7 @@ impl<'a> Run<'a> {
                     .docs
                     .iter()
                     .position(|d| values_at(d, field).0.iter().any(|v| sort_key(v) == want))?;
-                self.keys = 1;
+                self.keys = i64::from(index.clustered.is_none());
                 self.docs = 1;
                 Some(row)
             }
@@ -1280,7 +1364,11 @@ impl<'a> Run<'a> {
                 self.extra.insert("nWouldDelete", num(deleted));
                 first.filter(|_| env.returns)
             }
-            Node::ExpressWrite { value, delete, .. } => {
+            Node::ExpressWrite {
+                index,
+                value,
+                delete,
+            } => {
                 if self.pos > 0 {
                     return None;
                 }
@@ -1291,7 +1379,7 @@ impl<'a> Run<'a> {
                     .iter()
                     .position(|d| d.get("_id").is_some_and(|v| sort_key(v) == want));
                 let found = i64::from(row.is_some());
-                self.keys = found;
+                self.keys = if index.clustered.is_some() { 0 } else { found };
                 self.docs = found;
                 let modify = row.is_some() && !*delete;
                 self.extra.insert("nWouldModify", num(i64::from(modify)));
@@ -1853,5 +1941,82 @@ fn graft_work(stats: &mut Stats, worked: &Stats) {
         for (s, w) in stats.children.iter_mut().zip(&worked.children) {
             graft_work(s, w);
         }
+    }
+}
+
+#[cfg(test)]
+mod clustered_tests {
+    use super::*;
+    use crate::explain::node::RidRange;
+    use bson::doc;
+
+    fn env(docs: &[Document]) -> Env<'_> {
+        Env {
+            docs,
+            collation: None,
+            skip: 0,
+            limit: 0,
+            multi: true,
+            upsert: false,
+            returns: false,
+            known: None,
+            query: None,
+            clustered: true,
+        }
+    }
+
+    fn range(min: i32, min_incl: bool, max: i32, max_incl: bool) -> RidRange {
+        RidRange {
+            min: Bson::Int32(min),
+            min_incl,
+            max: Bson::Int32(max),
+            max_incl,
+        }
+    }
+
+    /// The `_id`s a scan reads of the table 1..5 (stored out of order), and
+    /// how many are in the range: mongod 8.2.11 (2026-11-26) seeks to the
+    /// start, which no record before counts for, and reads the first record
+    /// past the end (`[2, 5)` of five documents examines 4, `[3, 3]` 2,
+    /// `$gt: 4` 1, `$gt: 5` none, backward `$gt: 1` 4).
+    fn read(r: &RidRange, backward: bool) -> (Vec<i32>, usize) {
+        let docs: Vec<Document> = [3, 1, 5, 2, 4].map(|i| doc! {"_id": i}).to_vec();
+        let (rows, inside) = clustered_reads(r, backward, &env(&docs));
+        let ids = rows
+            .iter()
+            .map(|&row| docs[row].get_i32("_id").unwrap())
+            .collect();
+        (ids, inside)
+    }
+
+    #[test]
+    fn a_scan_reads_the_first_record_past_its_end() {
+        assert_eq!(
+            read(&range(2, true, 5, false), false),
+            (vec![2, 3, 4, 5], 3)
+        );
+        assert_eq!(read(&range(3, true, 3, true), false), (vec![3, 4], 1));
+        assert_eq!(read(&range(1, true, 3, true), false), (vec![1, 2, 3, 4], 3));
+    }
+
+    #[test]
+    fn a_scan_seeks_past_an_exclusive_start() {
+        assert_eq!(read(&range(4, false, 9, true), false), (vec![5], 1));
+        assert_eq!(read(&range(5, false, 9, true), false), (vec![], 0));
+    }
+
+    #[test]
+    fn a_backward_scan_starts_at_the_end_and_stops_below_the_start() {
+        assert_eq!(
+            read(&range(1, false, 9, true), true),
+            (vec![5, 4, 3, 2, 1], 4)
+        );
+        assert_eq!(read(&range(2, true, 4, false), true), (vec![3, 2, 1], 2));
+    }
+
+    #[test]
+    fn an_empty_range_reads_one_record() {
+        assert_eq!(read(&range(5, false, 5, false), false), (vec![], 0));
+        assert_eq!(read(&range(3, true, 2, true), false), (vec![3], 0));
     }
 }

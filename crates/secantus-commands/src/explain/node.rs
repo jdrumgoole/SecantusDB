@@ -31,6 +31,11 @@ pub(crate) struct IndexInfo {
     pub geo: Option<secantus_core::geoorder::GeoIndex>,
     /// A wildcard index; see [`Wildcard`].
     pub wildcard: Option<Arc<Wildcard>>,
+    /// The entry stands for the collection's clustered key (the table is
+    /// keyed by `_id`, so no index of its own): the name the collection
+    /// was created with, which a hint names. mongod's planner reads it as
+    /// a bounded collection scan, never as an index.
+    pub clustered: Option<String>,
 }
 
 /// What the planner knows of a wildcard index, which it plans one path at
@@ -201,12 +206,26 @@ impl IxScan {
     }
 }
 
+/// The `_id` range of a scan of a clustered collection, whose RecordIds are
+/// the `_id`s (mongod's `CollectionScanNode::minRecord` / `maxRecord`).
+/// The ends are as `explain` prints them.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RidRange {
+    pub min: Bson,
+    pub min_incl: bool,
+    pub max: Bson,
+    pub max_incl: bool,
+}
+
 /// A stage of the plan.
 #[derive(Clone, Debug)]
 pub(crate) enum Node {
     CollScan {
         filter: Option<Document>,
         backward: bool,
+        /// A clustered collection's scan between two `_id`s: mongod names
+        /// it CLUSTERED_IXSCAN.
+        range: Option<RidRange>,
     },
     IxScan(IxScan),
     Fetch {
@@ -390,13 +409,28 @@ impl Node {
             out.insert("inputStages", list);
         };
         match self {
-            Node::CollScan { filter, backward } => {
-                out.insert("stage", "COLLSCAN");
+            Node::CollScan {
+                filter,
+                backward,
+                range,
+            } => {
+                out.insert(
+                    "stage",
+                    if range.is_some() {
+                        "CLUSTERED_IXSCAN"
+                    } else {
+                        "COLLSCAN"
+                    },
+                );
                 if let Some(f) = filter {
                     out.insert("filter", f.clone());
                 }
                 counted(&mut out);
                 out.insert("direction", if *backward { "backward" } else { "forward" });
+                if let Some(r) = range {
+                    out.insert("minRecord", r.min.clone());
+                    out.insert("maxRecord", r.max.clone());
+                }
                 if let Some(s) = stats {
                     out.insert("docsExamined", num(s.docs));
                 }
@@ -532,6 +566,14 @@ impl Node {
                 counted(&mut out);
                 out.insert("type", *kind);
             }
+            Node::Express { index, .. } if index.clustered.is_some() => {
+                out.insert("stage", "EXPRESS_CLUSTERED_IXSCAN");
+                if let Some(s) = stats {
+                    out.insert("keysExamined", num(s.keys));
+                    out.insert("docsExamined", num(s.docs));
+                    out.insert("nReturned", num(s.n_returned));
+                }
+            }
             Node::Express { index, .. } => {
                 out.insert("stage", "EXPRESS_IXSCAN");
                 out.insert("keyPattern", render_key_pattern(&index.key));
@@ -559,8 +601,11 @@ impl Node {
                         "EXPRESS_UPDATE"
                     },
                 );
-                out.insert("keyPattern", render_key_pattern(&index.key));
-                out.insert("indexName", index.name.clone());
+                // A clustered collection has no index to name.
+                if index.clustered.is_none() {
+                    out.insert("keyPattern", render_key_pattern(&index.key));
+                    out.insert("indexName", index.name.clone());
+                }
                 if let Some(s) = stats {
                     out.insert("keysExamined", num(s.keys));
                     out.insert("docsExamined", num(s.docs));

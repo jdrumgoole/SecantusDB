@@ -222,7 +222,7 @@ fn resolve_hint(hint: Option<&Bson>, catalog: &[Arc<IndexInfo>]) -> Result<Hint,
         None | Some(Bson::Null) => Ok(Hint::None),
         Some(given @ Bson::String(name)) => catalog
             .iter()
-            .find(|ix| &ix.name == name)
+            .find(|ix| ix.clustered.as_ref().unwrap_or(&ix.name) == name)
             .map(|ix| Hint::Index(ix.name.clone()))
             .ok_or_else(|| bad_hint(given)),
         Some(Bson::Document(d)) if d.is_empty() => Ok(Hint::None),
@@ -257,7 +257,9 @@ pub(crate) enum TableScan {
 /// Whether `plan` reads the collection rather than an index.
 fn scans_collection(plan: &Node) -> bool {
     match plan {
-        Node::CollScan { .. } => true,
+        // A scan between two `_id`s of a clustered collection reads no more
+        // than an index scan would (`collscanIsBounded`).
+        Node::CollScan { range, .. } => range.is_none(),
         Node::Fetch { input, .. }
         | Node::Sort { input, .. }
         | Node::Skip(_, input)
@@ -833,7 +835,18 @@ fn catalog(
                 })
             });
         let is_wildcard = wildcard.is_some();
+        // The `_id` index of a clustered collection is the table itself: a
+        // hint names it as the collection was created with.
+        let clustered = (name == "_id_")
+            .then(|| storage.get_collection_options(db, coll).ok())
+            .flatten()
+            .and_then(|options| match options.get("clusteredIndex") {
+                Some(Bson::Document(c)) => Some(c.get_str("name").unwrap_or("_id_").to_string()),
+                Some(_) => Some("_id_".to_string()),
+                None => None,
+            });
         catalog.push(Arc::new(IndexInfo {
+            clustered,
             wildcard,
             unique: name == "_id_" || spec.get_bool("unique").unwrap_or(false),
             sparse: secantus_core::index_keys::spec_flag(spec, "sparse"),
@@ -2409,6 +2422,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                 plan.without_paging(),
                 Node::CollScan {
                     backward: false,
+                    range: None,
                     ..
                 }
             );
@@ -2476,6 +2490,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                 plan.without_paging(),
                 Node::CollScan {
                     backward: false,
+                    range: None,
                     ..
                 }
             );

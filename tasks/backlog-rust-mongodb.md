@@ -3076,36 +3076,91 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       runs of `tests/backlog/test_rm_storage_model.py` at `-n 4`
       Backlog-ID: RM-812
 
-- [ ] **`explain` of a clustered collection names `IXSCAN` on `_id_`, where mongod
-      names `EXPRESS_CLUSTERED_IXSCAN` / `CLUSTERED_IXSCAN`.** On a collection
-      made with `clusteredIndex` mongod 8.2.11 explains `{_id: 3}` as
-      `EXPRESS_CLUSTERED_IXSCAN` and `{_id: {$gt: 1}}` as `CLUSTERED_IXSCAN`
-      with `direction`, `minRecord` and `maxRecord` (an open end is the
-      type bracket's end: `$gt: 1` has `maxRecord: Infinity`): the scan
-      reads the table, the RecordId being the `_id`. This server's planner
-      still treats the clustering key as an `_id_` index (`FETCH` over
-      `IXSCAN`, `indexBounds`). The rows come back right since storage-model
-      phase 5 keys the table by `_id` itself; only the plan's shape differs,
-      the work counters with it. Found by the phase 5 smoke test.
-      Measured on mongod 8.2.11 (2026-11-26), five `_id`s 1..5: the scan has
-      `keysExamined: 0`, and a filter it cannot bound stays on it
-      (`{_id: 3, x: 3}` is `[3, 3]` with `filter: {$and: [{x: {$eq: 3}}]}`;
-      `$in: [1, 3]` is one range `[1, 3]` keeping `filter: {_id: {$in:
-      ...}}`, not two intervals). The start bound is a seek, so a record
-      before it is not examined; the end is found by reading the first
-      record past it, which counts in `docsExamined` (`[2, 4)` examines 3,
-      `[3, 3]` 2, `$in [1, 3]` 4, `$gt: 1` backward 5); `works` is
-      `docsExamined` plus one when the scan runs off the table. A `sort:
-      {_id: -1}` runs it `backward` with no SORT. Sizing (2026-11-26): not a
-      rendering change -- the faithful fix drops the clustered key from the
-      planner's catalog and adds a bounded collection scan as a candidate
-      (mongod's `collscanIsBounded`), which reaches the trial ranking
-      against secondary indexes, the plan cache's signatures, the stream
-      executor and the read order `order.rs` takes from the plan; one
-      planner slice, not a lane item.
-      Backlog-ID: pending
-      Verify: tests/backlog/test_rm_clustered_explain.py::test_an_id_point_read_is_an_express_clustered_scan, tests/backlog/test_rm_clustered_explain.py::test_an_id_range_is_a_bounded_clustered_scan
-      Backlog-ID: RM-739
+- [ ] **`count`, `distinct`, `update` and `delete` over an `_id` range of a
+      clustered collection still plan through the `_id_` index.** A `find` is
+      planned as mongod plans it since RM-739 (a scan of the table between
+      two `_id`s, `CLUSTERED_IXSCAN`, or `EXPRESS_CLUSTERED_IXSCAN` for one
+      `_id`); the other commands plan from the catalog with the clustered
+      key still in it as an index. Measured on mongod 8.2.11 (2026-11-26),
+      `_id`s 1..5: `count` of `{_id: {$gt: 1}}` is `COUNT <- CLUSTERED_IXSCAN`
+      (`minRecord: 1`, `maxRecord: Infinity`), `count` of `{_id: 2}` the same
+      with `[2, 2]` (no IDHACK), an `update` with `multi` `UPDATE <-
+      CLUSTERED_IXSCAN`, a `delete` of the range `BATCHED_DELETE <-
+      CLUSTERED_IXSCAN` and a `distinct` over it a lone `CLUSTERED_IXSCAN`;
+      this server names `COUNT_SCAN`, `IDHACK`, `UPDATE <- FETCH <- IXSCAN`
+      and a `FETCH <- IXSCAN`. The `EXPRESS_UPDATE` / `EXPRESS_DELETE` of one
+      `_id` already name no index and examine no key. The fix is
+      `plan::count`, `plan::distinct` and `plan::write` taking the cluster
+      from the catalog as `plan::plan` does (`split_cluster`), and the write
+      stages' counters (`docsExamined` of a range, as for a find) with them.
+      Verify: tests/backlog/test_rm_clustered_explain.py::test_a_count_over_an_id_range_reads_the_clustered_scan, tests/backlog/test_rm_clustered_explain.py::test_a_distinct_over_an_id_range_reads_the_clustered_scan, tests/backlog/test_rm_clustered_explain.py::test_an_update_over_an_id_range_reads_the_clustered_scan, tests/backlog/test_rm_clustered_explain.py::test_a_delete_over_an_id_range_reads_the_clustered_scan
+      Backlog-ID: RM-816
+
+- [ ] **An `$or` of `_id` ranges over a clustered collection is one `COLLSCAN`
+      under the `SUBPLAN`, where mongod reads an `OR` of `CLUSTERED_IXSCAN`s.**
+      Measured on mongod 8.2.11 (2026-11-26): `{$or: [{_id: {$gt: 8}}, {_id:
+      {$lt: 2}}]}` is `SUBPLAN <- OR <- [CLUSTERED_IXSCAN {minRecord: NaN,
+      maxRecord: 2}, CLUSTERED_IXSCAN {minRecord: 8, maxRecord: Infinity}]`
+      (documents examined 4 of 10 for ids 1..10, `works` 5); an `$or` with a
+      branch that names no `_id` (`{_id: 2}` or `{y: 3}`) is a `COLLSCAN`
+      under the `SUBPLAN` with the whole `$or` as its filter, as this server
+      prints. `or_access` plans a branch from the catalog's indexes, and the
+      clustered key is not one since RM-739: a branch needs the bounded scan
+      as its candidate (`clustered_scan`), the `OR` its trial and its
+      counters.
+      Verify: tests/backlog/test_rm_clustered_explain.py::test_an_or_of_id_ranges_is_an_or_of_clustered_scans
+      Backlog-ID: RM-817
+
+- [ ] **`min()` / `max()` with a hint of the clustered key do not set the
+      scan's ends.** On mongod 8.2.11 (2026-11-26), `find({_id: {$gt:
+      0}}).hint({_id: 1}).min({_id: 2}).max({_id: 4})` is a `CLUSTERED_IXSCAN`
+      with `minRecord: 2`, `maxRecord: 4` (the filter's own bound stays out
+      of it: `$gt: 0` is rechecked, or taken where tighter); a `min` alone
+      leaves `maxRecord: Infinity`. This server bounds the scan by the
+      filter alone (`minRecord: 0`, `maxRecord: Infinity`), the `Query` it
+      plans carrying only that `min` / `max` were given.
+      Verify: tests/backlog/test_rm_clustered_explain.py::test_min_and_max_bound_the_clustered_scan
+      Backlog-ID: RM-818
+
+- [ ] **A read of a clustered collection goes through no plan trial and
+      leaves nothing in the plan cache.** mongod 8.2.11 (2026-11-26) caches
+      the winner of `{_id: {$gt: 1}, x: 3}` beside an `x_1` index
+      (`$planCacheStats`: one active entry after the second run, its
+      `cachedPlan` the `FETCH` over `x_1`, or a `CLUSTERED_IXSCAN` with its
+      `minRecord` / `maxRecord` where that scan wins). `Storage::can_stream`
+      is false for a clustered collection, so `order::planned` never reaches
+      the trial, the plan cache or the buffered first batch, and the
+      stream executor (`stream::stage_of`) has no ranged scan to run
+      either (it declines a `CLUSTERED_IXSCAN`, which `explain` runs over the
+      documents it holds). Streaming a clustered table by `_id` (the
+      RecordId is the key) is the storage half; the ranged
+      `stream::CollScan` the other.
+      Verify: tests/backlog/test_rm_clustered_explain.py::test_a_contested_read_of_a_clustered_collection_is_cached
+      Backlog-ID: RM-819
+
+- [ ] **A `$group` over an `_id` range of a clustered collection is not
+      reported as the SBE's clustered scan.** mongod 8.2.11 (2026-11-26)
+      answers `[{$match: {_id: {$gt: 1}}}, {$group: {_id: null, n: {$sum:
+      1}}}]` over `_id`s 1..5 with one top-level `queryPlanner` whose
+      `winningPlan.queryPlan` is `GROUP <- CLUSTERED_IXSCAN` (`minRecord:
+      1`, `maxRecord: Infinity`, `filter: {}`) over a slot plan whose
+      `scan` has `minRecordIdSlot` and `maxRecordIdSlot`, reading 4
+      documents; this server explains it as the `find`'s plan under a
+      `$cursor` stage and a separate `$group`, as it does for an index scan
+      (`sbe_layer` takes only a forward `COLLSCAN` with no range).
+      Verify: tests/backlog/test_rm_clustered_explain.py::test_a_group_over_an_id_range_scans_the_clustered_range
+      Backlog-ID: RM-820
+
+- [ ] **A `find` hinted with a clustered key's own name is refused, and with
+      `_id_` is accepted.** On mongod 8.2.11 (2026-11-26) a collection made
+      with `clusteredIndex: {key: {_id: 1}, unique: true, name: "ci"}` is
+      hinted `"ci"` (or `{_id: 1}`), and `"_id_"` is BadValue ("hint
+      provided does not correspond to an existing index"); `explain` here
+      says the same since RM-739, but the commands that run the hint
+      (`storage::resolve_hint`, `util::hint_is_known`) know the `_id` index
+      as `_id_` alone, so `find().hint("ci")` fails and `hint("_id_")` runs.
+      Verify: tests/backlog/test_rm_clustered_explain.py::test_a_clustered_key_is_hinted_by_its_own_name
+      Backlog-ID: RM-821
 
 - [ ] **A time-series collection's own namespace still has a table and a
       registry entry, and its buckets collection's catalog options are
@@ -3121,7 +3176,6 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       with `{clusteredIndex: true}` alone. Compare with
       `tools/probes/mongod_store_layout.py --secantusd <binary>`; it belongs
       with phase 7's views.
-      Backlog-ID: pending
       Verify: none -- a layout and catalog comparison with the phase 0 fixture (`tests/fixtures/storage_model/mongod-8.2.11-layout.json`), made by the phase 0c comparison tool; no client call shows it
       Backlog-ID: RM-740
 
