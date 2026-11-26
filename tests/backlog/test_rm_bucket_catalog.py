@@ -17,7 +17,7 @@ from typing import Any
 import pymongo
 import pytest
 
-from tests.backlog.conftest import rust_mongo_server
+from tests.backlog.conftest import only_on, rust_mongo_server
 
 IDLE_THRESHOLD = "timeseriesIdleBucketExpiryMemoryUsageThreshold"
 
@@ -89,11 +89,21 @@ def test_bucket_catalog_counts_and_counters_follow_the_writes(tmp_path: pathlib.
 
 @pytest.mark.backlog("RM-710")
 def test_bucket_catalog_memory_usage_is_the_bytes_mongod_accounts(tmp_path: pathlib.Path) -> None:
-    """mongod 8.2.11 charges the catalog's structures through tracking
-    allocators: `memoryUsage` is 12552 with one bucket holding one
-    measurement, and 12828 after four more measurements (a new `v` field
-    among them) join that bucket; both repeat run for run. This server keeps
-    no account."""
+    """mongod charges the catalog's structures through tracking allocators,
+    so `memoryUsage` is the bytes its C++ containers allocate, and those
+    are the standard library's. Linux x86-64 mongod (the exemplar, built
+    with libstdc++; 8.2.11 and 8.2.12, official amd64 image, measured
+    2026-11-26) gives 13120 with one bucket holding one measurement and
+    13396 after four more measurements (a new `v` field among them) join
+    that bucket, both repeating run for run and in both versions. macOS
+    arm64 mongod 8.2.11 (libc++) gives 12552 and 12828, the same +276
+    step, so the case is pinned on Linux only, where CI checks it (Joe,
+    2026-11-25: port mongod's charges so the counts match that build).
+    This server keeps no account."""
+    only_on(
+        "linux",
+        why="the counts are libstdc++'s container sizes; macOS mongod's libc++ gives 12552 / 12828",
+    )
     t = dt.datetime(2026, 1, 1)
 
     def probe(client: Any) -> list:
@@ -107,7 +117,7 @@ def test_bucket_catalog_memory_usage_is_the_bytes_mongod_accounts(tmp_path: path
 
     with _fresh_pair(tmp_path) as (rust, ref):
         got, want = probe(rust), probe(ref)
-    assert want == [12552, 12828]
+    assert want == [13120, 13396]
     assert got == want
 
 

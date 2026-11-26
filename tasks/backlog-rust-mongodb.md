@@ -2173,9 +2173,23 @@ compressed column, placed by mongod's bucket catalog
       x86-64 mongod (the exemplar build, libstdc++; 8.2.11, and 8.2.12 which
       CI now runs) for every case above, pin those numbers in the gap test
       (an `only_on("linux")` case, checked by CI), and port mongod's memory
-      charges from its source so the counts match that build. Linux mongod
-      is not runnable here until Docker's daemon is started; CI's
-      `mdb-binary` jobs run Linux mongod and can measure it.
+      charges from its source so the counts match that build.
+      **Measured 2026-11-26, Linux x86-64 mongod 8.2.11 and 8.2.12:** the
+      official `mongo` amd64 image under Colima with Rosetta, standalone
+      `--quiet` as the harness starts it, a fresh mongod per case, each case
+      twice. Both versions and both runs agree:
+      - one measurement with metadata: 13120, for `"a"`, `1` or a
+        41-character string alike;
+      - with no metadata field: 12592 (-528, as on macOS);
+      - one extra data field: 13132 (+12, as on macOS);
+      - two extra data fields: 16120 (+3000, where macOS gives +2744);
+      - a second measurement: 13168 (+48, where macOS gives +24);
+      - the gap test's case: 13120 then 13396 (+276, as on macOS).
+
+      So the containers' sizes differ, while most steps match. The gap
+      test now pins 13120 / 13396 under `only_on("linux")`. To reproduce,
+      run `tools/probes/linux_bucket_catalog.py 8.2.11 8.2.12`
+      with `DOCKER_HOST` set to Colima's socket.
       Verify: tests/backlog/test_rm_bucket_catalog.py::test_bucket_catalog_memory_usage_is_the_bytes_mongod_accounts
       Backlog-ID: RM-710
 - [ ] **RUST MongoDB server: idle buckets never expire past
@@ -2187,6 +2201,9 @@ compressed column, placed by mongod's bucket catalog
       write, takes effect) as a bucket is opened for a new metadata
       value; with it at 30000 bytes, 21 buckets opened for 21 metadata values
       leave 14 to 17 in the catalog, and every bucket document stays stored.
+      Linux x86-64 mongod 8.2.11 and 8.2.12 (2026-11-26, four runs) leave
+      17, 17, 17 and 15, closing as many as they archive (4, 4, 4, 6), with
+      `memoryUsage` 69648 to 77664 afterwards and all 21 documents stored.
       Which expire depends on the stripe each lands in, so only the facts
       are pinned. This server never expires an idle bucket, and refuses the
       `setParameter` (code 72). **Waits on RM-710** (the memory accounting
