@@ -163,6 +163,10 @@ fn match_clause_raw(
             Err(unknown_top_level_operator(key))
         }
         _ if key.starts_with('$') => Err(Fallback::Defer),
+        _ if internal_expr_split(cond).is_some() => {
+            let doc = crate::bsondoc::from_bytes(raw.as_bytes()).map_err(|_| Fallback::Defer)?;
+            match_clause(&doc, key, cond, vars, coll)
+        }
         _ => {
             let reached = resolve_path_raw(raw, key)?;
             let refs: Vec<Cand> = reached
@@ -424,7 +428,94 @@ fn match_clause(
             Err(unknown_top_level_operator(key))
         }
         _ if key.starts_with('$') => Err(Fallback::Defer),
-        _ => field_matches(&resolve_path(doc, key), cond, coll, key),
+        _ => match internal_expr_split(cond) {
+            Some((internal, rest)) => {
+                if !internal
+                    .iter()
+                    .all(|(op, arg)| internal_expr_matches(doc, key, op, arg))
+                {
+                    return Ok(false);
+                }
+                match rest {
+                    Some(rest) => field_matches(&resolve_path(doc, key), &rest, coll, key),
+                    None => Ok(true),
+                }
+            }
+            None => field_matches(&resolve_path(doc, key), cond, coll, key),
+        },
+    }
+}
+
+/// The `$_internalExpr*` comparisons of a field condition, and what else it
+/// holds (`internal_expr_split`).
+type InternalExprSplit<'a> = (Vec<(&'a str, &'a Bson)>, Option<Bson>);
+
+/// A field condition's `$_internalExpr*` comparisons and what else it holds
+/// (`None` when nothing else), when it has any: mongod parses them as the
+/// path-accepting operators they are (`InternalExprComparisonMatchExpression`).
+fn internal_expr_split(cond: &Bson) -> Option<InternalExprSplit<'_>> {
+    let Bson::Document(d) = cond else {
+        return None;
+    };
+    let is_internal = |k: &str| {
+        matches!(
+            k,
+            "$_internalExprEq"
+                | "$_internalExprGt"
+                | "$_internalExprGte"
+                | "$_internalExprLt"
+                | "$_internalExprLte"
+        )
+    };
+    if !d.keys().any(|k| is_internal(k)) {
+        return None;
+    }
+    let internal = d
+        .iter()
+        .filter(|(k, _)| is_internal(k))
+        .map(|(k, v)| (k.as_str(), v))
+        .collect();
+    let rest: Document = d
+        .iter()
+        .filter(|(k, _)| !is_internal(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    Some((internal, (!rest.is_empty()).then(|| Bson::Document(rest))))
+}
+
+/// One `$_internalExpr*` comparison of `path` in `doc` with `arg`: mongod's
+/// comparison with no type bracketing, a missing field below everything, and
+/// an array met on the path always matching.
+pub fn internal_expr_matches(doc: &Document, path: &str, op: &str, arg: &Bson) -> bool {
+    let mut at: Option<&Bson> = None;
+    let mut current = doc;
+    let last = path.split('.').count() - 1;
+    for (n, part) in path.split('.').enumerate() {
+        match current.get(part) {
+            None => {
+                at = None;
+                break;
+            }
+            Some(Bson::Array(_)) => return true,
+            Some(Bson::Document(d)) if n < last => current = d,
+            Some(v) if n == last => at = Some(v),
+            Some(_) => {
+                at = None;
+                break;
+            }
+        }
+    }
+    let ordering = match at {
+        Some(v) => crate::order::cmp(v, arg),
+        None => std::cmp::Ordering::Less,
+    };
+    match op {
+        "$_internalExprEq" => ordering == std::cmp::Ordering::Equal,
+        "$_internalExprGt" => ordering == std::cmp::Ordering::Greater,
+        "$_internalExprGte" => ordering != std::cmp::Ordering::Less,
+        "$_internalExprLt" => ordering == std::cmp::Ordering::Less,
+        "$_internalExprLte" => ordering != std::cmp::Ordering::Greater,
+        _ => true,
     }
 }
 
@@ -2835,6 +2926,23 @@ pub fn is_nan_bson(b: &Bson) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The `$_internalExpr*` comparisons mongod parses as path operators
+    /// compare with no type bracketing; a missing field is below everything
+    /// (measured 8.2.11, RM-701).
+    #[test]
+    fn internal_expr_comparisons_are_not_type_bracketed() {
+        let d = doc! {"control": {"max": {"v": "x"}}, "n": 5i32};
+        let m = |q: Document| matches(&d, &q, &Vars::new(), None).unwrap();
+        assert!(m(doc! {"control.max.v": {"$_internalExprGt": 5i32}}));
+        assert!(!m(doc! {"control.max.v": {"$_internalExprLt": 5i32}}));
+        assert!(m(doc! {"n": {"$_internalExprGte": 5.0}}));
+        assert!(!m(doc! {"n": {"$_internalExprGt": 5i32}}));
+        assert!(m(doc! {"absent": {"$_internalExprLt": 0i32}}));
+        assert!(!m(doc! {"absent": {"$_internalExprGte": 0i32}}));
+        assert!(m(doc! {"n": {"$_internalExprEq": 5i32, "$gt": 4i32}}));
+        assert!(!m(doc! {"n": {"$_internalExprEq": 5i32, "$gt": 5i32}}));
+    }
+
     /// A MinKey / MaxKey bound compares against every type, an ABSENT field
     /// included -- mongod's query language treats a missing field as null,
     /// which ranks above MinKey and below MaxKey. The comparison skipped an

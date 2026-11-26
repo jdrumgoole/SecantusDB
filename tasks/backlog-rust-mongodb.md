@@ -2062,35 +2062,47 @@ cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: a time-series read beside a partial index, or
-      an `$expr` / `$text` / `$where` filter beside an index of its own,
-      still reads the collection at the command.** Since 2026-11-26 an
-      index of its own (an ascending / descending key, no partial filter,
-      collation or expiry) is kept over the buckets as mongod keeps it
-      (`{control.min.v: 1, control.max.v: 1}`, `ts_store::sync_bucket_indexes`
-      after `createIndexes` / `dropIndexes` / `collMod`) and a read plans
-      over it with this server's planner (`explain::bucket_access`): measured
-      8.2.11, `v < 100` and `v = 5` are an IXSCAN (`control.min.v` leads),
-      `v >= n` / `v > n` alone a COLLSCAN of the buckets in order (only the
-      second key field is bounded), a hint to any index over the buckets its
-      scan. What is left: a PARTIAL index (the bucket copy needs the filter
-      as `index_bucket_filter` writes it, and the planner `implies` over the
-      buckets): mongod leaves 1,913 after the delete for `v < 3000, v > 5`
-      beside `partialFilterExpression: {v: {$gt: 5}}`, here 2,993, the
-      collection read whole; a collated index (and a read under a collation
-      whose filter holds a string or names the meta field: the bucket bounds
-      and the index over the buckets compare without the collation); a TTL
-      or 2dsphere index (`{data.loc: "2dsphere_bucket"}`); an `$expr` /
-      `$text` / `$where` filter with any index of its own (mongod 2,303 after
-      the delete, the buckets in order, here 3,999); a read two indexes could
-      answer, or an `$or` / `$in` over one (mongod runs a trial between the
-      plans, `rejectedPlans`, and a filter on the time field with an index
-      candidate competes with the clustered scan: this server reads whole,
-      which matched mongod's 2,399 in the one case measured); `v > n` reads
-      as the buckets in order but mongod's count after the delete varies
-      between runs (2,294 to 2,298, here 2,292). Found while working RM-457,
-      2026-11-15.
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_beside_a_partial_index_scans_it_as_mongod, tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_expr_read_beside_an_index_of_its_own_buffers_as_mongod
+- [ ] **RUST MongoDB server: a time-series read beside a collated, TTL or
+      2dsphere index, a `$where` / `$text` filter, an `$expr` it cannot
+      push down, or a read two indexes could answer, still reads the
+      collection at the command.** Since 2026-11-26 an index of its own
+      (an ascending / descending key, with or without a partial filter of
+      comparisons) is kept over the buckets as mongod keeps it
+      (`{control.min.v: 1, control.max.v: 1}`, the partial filter as
+      `index_bucket_filter` writes it, `ts_store::sync_bucket_indexes` after
+      `createIndexes` / `dropIndexes` / `collMod`) and a read plans over it
+      with this server's planner (`explain::bucket_access`, the bucket
+      filter's `$_internalExpr*` comparisons read as the plain ones when it
+      tests a partial filter): measured 8.2.11, `v < 100` and `v = 5` are an
+      IXSCAN (`control.min.v` leads), `v >= n` / `v > n` alone a COLLSCAN of
+      the buckets in order (only the second key field is bounded), `v < 3000,
+      v > 5` beside `partialFilterExpression: {v: {$gt: 5}}` an IXSCAN of the
+      partial index, a hint to any index over the buckets its scan. An
+      `$expr` comparison of a field with a constant derives the bucket
+      predicates mongod derives (`$eq`; `$gt` / `$gte` with the field first,
+      `$lt` / `$lte` with it second; `$lt` of the field none), and one that
+      derives none reads the buckets in order. What is left: a collated
+      index (and a read under a collation whose filter holds a string or
+      names the meta field: the bucket bounds and the index over the buckets
+      compare without the collation); a TTL or 2dsphere index
+      (`{data.loc: "2dsphere_bucket"}`); a partial index whose filter is not
+      a comparison (`$exists`, `$type`, `$in`, ...); `$where` and `$text`
+      filters with an index of its own, and an `$expr` that is not a single
+      comparison (`$and`, `$or`, computed operands: mongod derived only the
+      first clause of one `$and` measured, `$gte` of `v` alone); a read two
+      indexes could answer, or an `$or` / `$in` over one (mongod runs a trial
+      between the plans, `rejectedPlans`, and a filter on the time field with
+      an index candidate competes with the clustered scan: this server reads
+      whole, which matched mongod's 2,399 in the one case measured; `$or`
+      of two ranges of `v` beside `{v: 1}`: mongod 63 after the delete, here
+      198; a `$in` of two values matched, 1). Where
+      mongod filters the buckets it buffers (a collection scan under a
+      measurement-level filter) its count after the delete varies between
+      runs (2,294 to 2,298 for `v > 10`, 1,915 to 1,917 for `v < 3000, v >
+      3` beside the partial index, 1,021 to 1,028 for `$expr: {$gte: ["$v",
+      "$w"]}`) and this server's is one number (2,292, 1,915, 1,017), so no
+      test pins those. Found while working RM-457, 2026-11-15.
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_beside_a_collated_index_scans_it_as_mongod, tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_beside_an_exists_partial_index_scans_it_as_mongod, tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_or_read_over_an_index_of_its_own_scans_it_as_mongod
       Backlog-ID: RM-701
 - [ ] **RUST MongoDB server: a time-series read of the meta field and the
       time field together reads the buckets through the default index alone,

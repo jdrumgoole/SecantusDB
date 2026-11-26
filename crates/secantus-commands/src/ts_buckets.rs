@@ -574,8 +574,9 @@ pub(crate) fn bucket_matches(bucket: &Document, filter: &Document) -> Result<boo
             (path, Bson::Document(ops))
                 if ops.keys().any(|op| op.starts_with("$_internalExpr")) =>
             {
-                ops.iter()
-                    .all(|(op, arg)| internal_expr(bucket, path, op, arg))
+                ops.iter().all(|(op, arg)| {
+                    secantus_core::query::internal_expr_matches(bucket, path, op, arg)
+                })
             }
             _ => {
                 let mut one = Document::new();
@@ -594,39 +595,6 @@ pub(crate) fn bucket_matches(bucket: &Document, filter: &Document) -> Result<boo
         }
     }
     Ok(true)
-}
-
-/// `{path: {op: arg}}` for one `$_internalExpr*` comparison over `doc`.
-fn internal_expr(doc: &Document, path: &str, op: &str, arg: &Bson) -> bool {
-    let mut at: Option<&Bson> = None;
-    let mut current = doc;
-    for (n, part) in path.split('.').enumerate() {
-        match current.get(part) {
-            None => {
-                at = None;
-                break;
-            }
-            Some(Bson::Array(_)) => return true,
-            Some(Bson::Document(d)) if n + 1 < path.split('.').count() => current = d,
-            Some(v) if n + 1 == path.split('.').count() => at = Some(v),
-            Some(_) => {
-                at = None;
-                break;
-            }
-        }
-    }
-    let ordering = match at {
-        Some(v) => secantus_core::order::cmp(v, arg),
-        None => Ordering::Less,
-    };
-    match op {
-        "$_internalExprEq" => ordering == Ordering::Equal,
-        "$_internalExprGt" => ordering == Ordering::Greater,
-        "$_internalExprGte" => ordering != Ordering::Less,
-        "$_internalExprLt" => ordering == Ordering::Less,
-        "$_internalExprLte" => ordering != Ordering::Greater,
-        _ => true,
-    }
 }
 
 /// A stable UUID for a namespace that is derived rather than stored, from

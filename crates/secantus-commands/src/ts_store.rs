@@ -735,10 +735,43 @@ pub fn create_missing_buckets(storage: &dyn Storage) -> Result<usize, CommandErr
     Ok(created)
 }
 
+/// A partial filter whose bucket form this server's planner can test a
+/// read against: comparisons (`$eq`, `$gt`, `$gte`, `$lt`, `$lte`, or a bare
+/// equality) of fields with a scalar, as top-level fields or in `$and`.
+fn plain_partial(filter: &Document) -> bool {
+    !filter.is_empty()
+        && filter.iter().all(|(k, v)| match (k.as_str(), v) {
+            ("$and", Bson::Array(items)) => items
+                .iter()
+                .all(|i| i.as_document().is_some_and(plain_partial)),
+            (k, _) if k.starts_with('$') => false,
+            (_, Bson::Document(ops)) if ops.keys().next().is_some_and(|o| o.starts_with('$')) => {
+                ops.iter().all(|(op, arg)| {
+                    matches!(op.as_str(), "$eq" | "$gt" | "$gte" | "$lt" | "$lte") && scalar(arg)
+                })
+            }
+            (_, arg) => scalar(arg),
+        })
+}
+
+fn scalar(v: &Bson) -> bool {
+    !matches!(
+        v,
+        Bson::Null
+            | Bson::Undefined
+            | Bson::Array(_)
+            | Bson::Document(_)
+            | Bson::RegularExpression(_)
+            | Bson::MinKey
+            | Bson::MaxKey
+    )
+}
+
 /// Whether collection index `ix` of a time-series collection is built over
 /// its buckets as well: an ascending or descending key on measurement
-/// and meta fields, with no partial filter, collation or expiry (the ones
-/// the planner of this server reads over the buckets, RM-701).
+/// and meta fields, with no collation or expiry, and a partial filter only
+/// of the comparisons [`plain_partial`] reads (the ones the planner of this
+/// server reads over the buckets, RM-701).
 pub(crate) fn built_on_buckets(ix: &Document) -> bool {
     ix.get_str("name").is_ok_and(|n| n != "_id_")
         && ix.get_document("key").is_ok_and(|k| {
@@ -746,9 +779,14 @@ pub(crate) fn built_on_buckets(ix: &Document) -> bool {
                 && k.values()
                     .all(|d| matches!(crate::util::as_i64(d), Some(1 | -1)))
         })
-        && ["partialFilterExpression", "collation", "expireAfterSeconds"]
+        && ["collation", "expireAfterSeconds"]
             .iter()
             .all(|o| !ix.contains_key(*o))
+        && match ix.get("partialFilterExpression") {
+            None => true,
+            Some(Bson::Document(filter)) => plain_partial(filter),
+            Some(_) => false,
+        }
 }
 
 /// Make the indexes over the buckets of time-series collection `db.coll`
@@ -804,6 +842,20 @@ pub(crate) fn sync_bucket_indexes(
             None => {
                 let on_buckets_key = crate::ts_buckets::bucket_key(key, &layout);
                 let mut spec = doc! { "key": on_buckets_key.clone(), "name": name };
+                // A partial index's filter over the buckets, as mongod
+                // keeps it there (`timeseries::index_bucket_filter`).
+                if let Ok(filter) = ix.get_document("partialFilterExpression") {
+                    let over_buckets = crate::timeseries::index_bucket_filter(
+                        filter,
+                        &layout.time,
+                        layout.meta.as_deref(),
+                        layout.span_ms,
+                    );
+                    if over_buckets.is_empty() {
+                        continue;
+                    }
+                    spec.insert("partialFilterExpression", over_buckets);
+                }
                 if hidden {
                     spec.insert("hidden", true);
                 }
@@ -826,9 +878,12 @@ mod tests {
         assert!(built_on_buckets(
             &doc! { "name": "m_1_v_-1", "key": { "m": 1, "v": -1 } }
         ));
+        assert!(built_on_buckets(
+            &doc! { "name": "p", "key": { "v": 1 }, "partialFilterExpression": { "v": { "$gt": 1 } } }
+        ));
         for spec in [
             doc! { "name": "_id_", "key": { "_id": 1 } },
-            doc! { "name": "p", "key": { "v": 1 }, "partialFilterExpression": { "v": { "$gt": 1 } } },
+            doc! { "name": "p", "key": { "v": 1 }, "partialFilterExpression": { "v": { "$exists": true } } },
             doc! { "name": "c", "key": { "s": 1 }, "collation": { "locale": "en" } },
             doc! { "name": "ttl", "key": { "t": 1 }, "expireAfterSeconds": 10 },
             doc! { "name": "g", "key": { "loc": "2dsphere" } },
