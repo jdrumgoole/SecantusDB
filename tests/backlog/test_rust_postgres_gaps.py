@@ -3010,17 +3010,17 @@ def test_a_five_table_two_hub_join_desc_with_another_key(pg: Any) -> None:
     assert got == ("ok", [(116,), (81,), (46,), (11,), (151,)])
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_four_table_star_left_join_desc_nulls_last_then_desc(pg: Any) -> None:
     """PostgreSQL 15.20, four 20-row tables never analysed: `t0 JOIN t1 ON
     t0.c = t1.a JOIN t2 ON t0.b = t2.a LEFT JOIN t3 ON t0.c = t3.a ORDER BY
     t3.a DESC NULLS LAST, t0.c DESC LIMIT 5` leaves t0.a 19, 9, 4, 8, 18
     (a Merge Right Join over the inner joins sorted again on t0.c, cost
-    60276.07). The search reads the t0/t1 merge's ascending order of the
+    60276.07). The search read the t0/t1 merge's ascending order of the
     {t0.c, t1.a} class presorted under the right join (38061.98), where
     the second key's DESC on that class makes it the wrong direction
-    (`right_merge_direction` reads every query pathkey), and leaves 19,
-    9, 4, 3, 13."""
+    (`right_merge_direction` reads every query pathkey), and left 19,
+    9, 4, 3, 13: its later keys carried no direction."""
     pg.execute("begin")
     try:
         _rp028_tables(pg, "rp028_s", 4, 20)
@@ -3035,6 +3035,57 @@ def test_a_four_table_star_left_join_desc_nulls_last_then_desc(pg: Any) -> None:
     finally:
         pg.execute("rollback")
     assert got == ("ok", [(19,), (9,), (4,), (8,), (18,)])
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_four_table_star_desc_then_a_key_the_where_fixes(pg: Any) -> None:
+    """PostgreSQL 15.20, four 20-row tables never analysed: `t0 JOIN t1 ON
+    t0.c = t1.a JOIN t2 ON t0.b = t2.a LEFT JOIN t3 ON t0.c = t3.a WHERE
+    t1.b = 2 ORDER BY t0.c DESC, t1.b LIMIT 5` leaves t0.a 12, 17, 2.
+    The WHERE fixes the later key to a constant (`ec_has_const`, a
+    redundant pathkey), which the join order search declines, and the
+    join planned for every row leaves the three tied rows as 2, 17, 12."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_w", 4, 20)
+        got = pg_answer(
+            pg,
+            "select rp028_w0.a from rp028_w0"
+            " join rp028_w1 on rp028_w0.c = rp028_w1.a"
+            " join rp028_w2 on rp028_w0.b = rp028_w2.a"
+            " left join rp028_w3 on rp028_w0.c = rp028_w3.a"
+            " where rp028_w1.b = 2"
+            " order by rp028_w0.c desc, rp028_w1.b limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", [(12,), (17,), (2,)])
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_four_table_chain_order_by_two_keys_over_a_two_column_index(pg: Any) -> None:
+    """PostgreSQL 15.20, four 20-row tables never analysed and an index on
+    t1 (a, b): `t0 JOIN t1 ON t0.b = t1.a JOIN t2 ON t1.b = t2.a JOIN t3
+    ON t2.b = t3.a ORDER BY t1.a, t0.b DESC LIMIT 5` leaves t0.a 1, 8, 15,
+    2, 9. An index of several columns returns its rows in the order of
+    more than one key, which the join order search declines, and the
+    join planned for every row leaves the three rows tied on t1.a as 15,
+    8, 1."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_x", 4, 20)
+        pg.execute("create index on rp028_x1 (a, b)")
+        got = pg_answer(
+            pg,
+            "select rp028_x0.a from rp028_x0"
+            " join rp028_x1 on rp028_x0.b = rp028_x1.a"
+            " join rp028_x2 on rp028_x1.b = rp028_x2.a"
+            " join rp028_x3 on rp028_x2.b = rp028_x3.a"
+            " order by rp028_x1.a, rp028_x0.b desc limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", [(1,), (8,), (15,), (2,), (9,)])
 
 
 @pytest.mark.backlog_fixed("RP-028")
