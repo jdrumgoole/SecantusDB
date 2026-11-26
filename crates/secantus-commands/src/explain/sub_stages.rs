@@ -48,16 +48,16 @@ fn listed_runs(
     options: &Document,
     db: &str,
 ) -> Vec<Bson> {
-    let mut run = head.to_vec();
+    let full = [head, stages].concat();
     let mut before = if head.is_empty() {
         secantus_core::memlimit::SpillReport::default()
     } else {
         super::count_and_spills(ctx, target, head, options).1
     };
     let mut out = Vec::new();
-    for stage in stages {
-        run.push(stage.clone());
-        let (n, report) = super::count_and_spills(ctx, target, &run, options);
+    for (i, stage) in stages.iter().enumerate() {
+        let through = super::run_through(&full, head.len() + i);
+        let (n, report) = super::count_and_spills(ctx, target, &through, options);
         let spilled = report.less(&before);
         before = report;
         for mut listed in shape::listed_stage(stage, db) {

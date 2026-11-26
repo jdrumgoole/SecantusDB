@@ -1271,17 +1271,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       stand-in.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_lookup_on_join_fields_is_explained_as_sbe_runs_it
       Backlog-ID: RM-683
-- [ ] **A `$sort` that took a `$limit` reports the size of every document
-      it sorted.** mongod 8.2.11's `$sort` with a `limit` is a top-k sorter:
-      its `totalDataSizeSortedBytesEstimate` is the size of the documents it
-      keeps (490 for two `$documents` documents of 245), and 0 for a `limit`
-      of 1, in a `$facet` and outside one. Since RM-538 (2026-11-14) this
-      server lists the one `{$sort: {sortKey, limit}}` mongod does, but
-      measures each stage from a run that stops at it, so the `$sort` counts
-      every document it took (735 for three). Found 2026-11-14 (RM-539,
-      RM-538; the fold was RM-685).
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm538.py::test_a_top_k_sort_reports_the_documents_it_keeps
-      Backlog-ID: RM-689
 - [ ] **The operation rows `currentOp` lists lack mongod's detail.** Since
       2026-10-20 a registry of running operations stands behind
       `currentOp`, `$currentOp` (with `idleCursors`) and `killOp`, which

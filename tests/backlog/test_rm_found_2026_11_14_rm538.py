@@ -98,12 +98,13 @@ def test_explain_refuses_a_sample_rate_the_run_refuses(rust_mongo: Any, mongod: 
 # ------------------------------------------- what a top-k sort sizes --
 
 
-@pytest.mark.backlog("RM-689")
+@pytest.mark.backlog_fixed("RM-689")
 def test_a_top_k_sort_reports_the_documents_it_keeps(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's `$sort` that took a `$limit` reports the size of the
     documents it keeps -- 490 for two of three `$documents` documents, 0
-    for a `limit` of 1, in a `$facet` too. This server reports the size of
-    all three it sorted (735)."""
+    for a `limit` of 1, in a `$facet` too. This server reported the size of
+    all three it sorted (735) until its per-stage runs took the `$limit` a
+    `$sort` folds in after `$documents` and in a `$facet` as well."""
     docs = {"$documents": [{"a": 1}, {"a": 2}, {"a": 3}]}
     pipelines = {
         "limit_2": [docs, {"$sort": {"a": -1}}, {"$limit": 2}],

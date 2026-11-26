@@ -1941,6 +1941,26 @@ pub(crate) fn server_parameters(own: bool) -> Document {
     }
 }
 
+/// `pipeline` as far as stage `i`, run to measure that stage: a `$sort`
+/// takes the `$limit` behind it (`extractLimitForPushdown`) and keeps only
+/// that many, as in the whole run, or its counters are those of a sort of
+/// everything (mongod 8.2.11: 490 bytes for the top two of three
+/// `$documents` documents, not 735; RM-516, RM-689).
+pub(crate) fn run_through(pipeline: &[Document], i: usize) -> Vec<Document> {
+    let mut prefix = pipeline[..=i].to_vec();
+    if pipeline[i].contains_key("$sort") {
+        let after: Vec<Bson> = pipeline[i + 1..]
+            .iter()
+            .cloned()
+            .map(Bson::Document)
+            .collect();
+        if let Some(k) = secantus_core::aggregate::limit_for_pushdown(&after) {
+            prefix.push(doc! { "$limit": i64::try_from(k).unwrap_or(i64::MAX) });
+        }
+    }
+    prefix
+}
+
 /// A blocking stage's memory and spill counters in an explain, as mongod
 /// 8.2.11 lists them: a `$sort`'s, a `$group`'s, and a
 /// `$_internalSetWindowFields`'s (RM-328).
@@ -3609,7 +3629,8 @@ fn own_source_reply(
         let options = Document::new();
         let mut before = secantus_core::memlimit::SpillReport::default();
         for i in 1..run.len() {
-            let (n, report) = count_and_spills(ctx, target, &run[..=i], &options);
+            let through = run_through(&run, i);
+            let (n, report) = count_and_spills(ctx, target, &through, &options);
             spills.push(report.less(&before));
             before = report;
             counts.push(n);
