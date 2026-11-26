@@ -3532,18 +3532,20 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       RP-981 prices. Found while working RP-1032 (2026-11-26).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join filtered on its nullable side's other column is priced], tests/backlog/test_rp_explain_costs.py::test_plan[a left join on an expression key filtered on its nullable side's other column is priced]
       Backlog-ID: RP-1130
-- [ ] **ANALYZE of a hash join on an expression key counts nothing below
-      it.** `explain (analyze, costs off, timing off, summary off) select *
-      from e left join e e2 on e.a = e2.a + 1 where e2.a is null` prints,
-      in PostgreSQL 15.19, `actual rows` on both scans and the Hash and the
-      Hash's `Buckets: 1024  Batches: 1  Memory Usage: 47kB`; here only the
-      join's own `actual rows=1`. `join_analyze` reads the `Hash Cond` as
-      two columns. Measured on the 15.19 reference on port 5415 (found
-      while working RP-981). An inner join on an expression key the merge
-      wins (RP-1032) prints its Merge Join's `actual rows` but none on its
-      Sorts and scans, nor PostgreSQL's `Sort Method: quicksort  Memory:
-      71kB` on each Sort.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an anti join on an expression key]
+- [ ] **ANALYZE of a merge join on an expression key counts nothing
+      below it.** `explain (analyze, costs off, timing off, summary off)
+      select * from e join e e2 on e.b = e2.b || 'x'` prints, in
+      PostgreSQL 15.19, `actual rows` on both Sorts and both scans, and
+      `Sort Method: quicksort  Memory: 71kB` (the column side) and `79kB`
+      (the expression side) on the Sorts; here only the Merge Join's own
+      `actual rows=0`. The inner Sort's `actual rows=901`, not 1000: the
+      merge stops reading it once the outer side runs out
+      (`ExecMergeJoin`), so a count must replay the merge, not count the
+      table. `analyze_join_children` (`join_analyze.rs`) recounts only
+      Hash Joins and Nested Loops; no Merge Join is recounted, on a column
+      key either. Measured on the 15.19 reference on port 5415 (found
+      while working RP-981).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a merge join on an expression key]
       Backlog-ID: RP-1033
 - [ ] **A hash join written inner side first is not `Inner Unique`.**
       `explain verbose select * from k join e on e.a = k.a` (`k.a` the
@@ -3742,3 +3744,21 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       plans are unpriced here.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a distinct sorted on a prefix sorts on every distinct column]
       Backlog-ID: RP-1126
+
+## Found while working RP-1033 (2026-11-26)
+
+- [ ] **An anti join against a primary key is unpriced, and on an
+      expression key is not a hash anti join.** `explain select * from e
+      left join k on k.a = e.a where k.a is null` (`k.a` the primary key)
+      is in PostgreSQL 15.19 `Hash Anti Join (cost=27.50..46.25 rows=1
+      width=14)` hashing `k`; here the same plan with every cost, row
+      count and width zero. Over an expression key, `... on k.a = e.a - 1
+      where k.a is null`, PostgreSQL 15.19 prints `Hash Anti Join
+      (cost=27.50..51.38 rows=500 width=14)` with `Hash Cond: ((e.a - 1) =
+      k.a)`; here an unpriced `Nested Loop Anti Join` with `Join Filter:
+      (k.a = (e.a - 1))`, which EXPLAIN ANALYZE then cannot count below.
+      The same joins against a column with no unique index (`e e2`) are
+      priced Hash Anti Joins (RP-908, RP-981). Measured on the 15.19
+      reference on port 5415.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an anti join against a primary key is priced], tests/backlog/test_rp_explain_costs.py::test_plan[an anti join on an expression key against a primary key is a hash anti join]
+      Backlog-ID: RP-1133
