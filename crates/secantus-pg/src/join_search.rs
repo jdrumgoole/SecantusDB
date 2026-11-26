@@ -5,7 +5,9 @@
 //! ON ..`, is planned by `standard_join_search` over every order the
 //! joins allow, and the order it picks decides the order its rows come
 //! out in. This is that search for three stored tables joined by two
-//! column equalities, inner or LEFT: the joins of two tables a clause
+//! column equalities, inner or LEFT, or an inner pair under a RIGHT join
+//! (whose nullable side is the whole pair, so it joins first): the joins
+//! of two tables a clause
 //! connects (`join_search_one_level`'s level 2), each priced as two
 //! tables are and kept by its cheapest path, then the three-table
 //! relation built from each of them with the third table
@@ -205,6 +207,63 @@ fn class_members(ons: [OnEqualities<'_>; 2]) -> Option<Vec<String>> {
     Some(members)
 }
 
+/// `z LEFT JOIN (x JOIN y)` -- a RIGHT join atop a chain of two tables
+/// with its sides swapped, as `joins::build_join` swaps one -- as the
+/// chain `(x JOIN y) RIGHT JOIN z`, its ON's equalities turned back, for
+/// the search to read as one (RP-1063): PostgreSQL plans the two alike.
+/// `None` for any other node, and for an ON whose equalities are not plain
+/// column pairs.
+pub(crate) fn right_chain(node: &JoinNode) -> Option<JoinNode> {
+    let JoinNode::Join {
+        kind: JoinKind::Left,
+        left,
+        right,
+        on,
+        on_aliases,
+        on_other,
+        on_filters,
+        equi,
+        equi_reversed,
+        merged,
+        expr_keys,
+        ec: None,
+        left_keys,
+        right_keys,
+    } = node
+    else {
+        return None;
+    };
+    if !matches!(left.as_ref(), JoinNode::Leaf { .. })
+        || !matches!(
+            right.as_ref(),
+            JoinNode::Join {
+                kind: JoinKind::Inner,
+                ..
+            }
+        )
+        || !merged.is_empty()
+        || !expr_keys.is_empty()
+    {
+        return None;
+    }
+    Some(JoinNode::Join {
+        kind: JoinKind::Right,
+        left: right.clone(),
+        right: left.clone(),
+        on: on.clone(),
+        on_aliases: on_aliases.clone(),
+        on_other: *on_other,
+        on_filters: on_filters.clone(),
+        equi: equi.iter().map(|(l, r)| (r.clone(), l.clone())).collect(),
+        equi_reversed: equi_reversed.iter().map(|r| !r).collect(),
+        merged: Vec::new(),
+        expr_keys: Vec::new(),
+        ec: None,
+        left_keys: right_keys.clone(),
+        right_keys: left_keys.clone(),
+    })
+}
+
 /// One join of the plan: how, which side is preserved, and what it joins
 /// on.
 pub(crate) struct Step {
@@ -358,6 +417,8 @@ impl PgHandler {
     /// on two column equalities; `None` for any other join.
     pub(crate) fn three_table_plan(&self, node: &JoinNode) -> Option<ThreePlan> {
         use secantus_pgplan::joincost::join_rows;
+        let chain = right_chain(node);
+        let node = chain.as_ref().unwrap_or(node);
         // A WHERE over two of the three tables that is no equality is a
         // join filter of the top join, where it is first evaluable, and its
         // rows' estimate and cost are the same for every order the search
@@ -405,8 +466,14 @@ impl PgHandler {
         }
         let modelled =
             |k: &JoinKind| matches!(k, JoinKind::Inner | JoinKind::Left | JoinKind::Full);
+        // A RIGHT join atop an inner pair is the LEFT join of its right
+        // table to the pair (`deconstruct_recurse` swaps a JOIN_RIGHT's
+        // sides), whose minimum nullable side is the whole pair
+        // (`make_outerjoininfo` adds the inner joins below it), so the
+        // pair is joined first (RP-1063).
+        let right2 = *k2 == JoinKind::Right && *k1 == JoinKind::Inner;
         if !modelled(k1)
-            || !modelled(k2)
+            || !(modelled(k2) || right2)
             || !m1.is_empty()
             || !m2.is_empty()
             || !x1.is_empty()
@@ -466,6 +533,12 @@ impl PgHandler {
         let filters = WHERE_FILTERS.with(|c| c.borrow().clone());
         let spans = WHERE_SPAN_ALIASES.with(|c| c.borrow().len());
         if filters.len() != spans {
+            return None;
+        }
+        // A WHERE conjunct over two tables is not placed against a RIGHT
+        // join: one strict on the pair would reduce it
+        // (`reduce_outer_joins`), which the search does not model.
+        if right2 && spans != 0 {
             return None;
         }
         let within = |f: &secantus_pgplan::joins::JoinFilter, a: &str, b: &str| {
@@ -533,7 +606,7 @@ impl PgHandler {
         // clauses are matched by their keys' hash alone, so only for
         // integer keys, where that is equality; the ONs still decide every
         // row at the top.
-        let ec = shared && !left1 && !left2 && !full1 && !full2;
+        let ec = shared && !left1 && !left2 && !full1 && !full2 && !right2;
         // The class's pairs are not the chain's: a filter on one of them is
         // not placed.
         if ec && pair_filters.iter().any(|p| !p.is_empty()) {
@@ -596,6 +669,28 @@ impl PgHandler {
                 combo(1, 1, &xz, yk),
                 combo(2, 0, &yz, xk),
             ];
+            (pairs, combos)
+        } else if right2 {
+            // The pair, then the right table preserved: the LEFT join's
+            // `a` (`make_join_rel` swaps its preserved side first).
+            let pairs = vec![Pair {
+                a: 0,
+                b: 1,
+                a_key: xk.clone(),
+                b_key: yk.clone(),
+                left: false,
+                full: false,
+                on: Some(1),
+            }];
+            let combos = vec![Combo {
+                pair: 0,
+                base: 2,
+                pair_key: wk.clone(),
+                base_key: zk.clone(),
+                left: true,
+                full: false,
+                pair_first: false,
+            }];
             (pairs, combos)
         } else {
             // The chain: x-y, then w-z; each ON its own join's.
@@ -821,7 +916,9 @@ impl PgHandler {
     /// it evaluates, as written (`written`), or, over one equivalence
     /// class, the clause `generate_join_implied_equalities_normal` derives
     /// -- the class's first member each side, the outer one first, as
-    /// `create_hashjoin_plan` switches it. Inner joins whose every join is
+    /// `create_hashjoin_plan` switches it. Inner joins, or a RIGHT join
+    /// atop an inner pair (RP-1063: a `Hash Left Join` with the preserved
+    /// table outer, or a `Hash Right Join` hashing it), whose every join is
     /// a hash join only, with no join filter, under no LIMIT, ORDER BY or
     /// DISTINCT (whose paths the search does not weigh); `None` for any
     /// other chain, which is drawn as written.
@@ -852,8 +949,10 @@ impl PgHandler {
         {
             return None;
         }
+        let chain = right_chain(&j.tree);
+        let tree = chain.as_ref().unwrap_or(&j.tree);
         let JoinNode::Join {
-            kind: JoinKind::Inner,
+            kind: top_kind @ (JoinKind::Inner | JoinKind::Right),
             left: lower,
             right: z_node,
             equi: e2,
@@ -861,10 +960,12 @@ impl PgHandler {
             on_filters: f2,
             on: on2,
             ..
-        } = &j.tree
+        } = tree
         else {
             return None;
         };
+        // A RIGHT join atop the pair (RP-1063): the third table preserved.
+        let right = *top_kind == JoinKind::Right;
         let JoinNode::Join {
             kind: JoinKind::Inner,
             left: x_node,
@@ -881,14 +982,15 @@ impl PgHandler {
         if !f1.is_empty() || !f2.is_empty() {
             return None;
         }
-        let plan = with_join_where(j, || self.three_table_plan(&j.tree))?;
+        let plan = with_join_where(j, || self.three_table_plan(tree))?;
         if !plan.first_hash || !plan.second_hash || !plan.first_filters.is_empty() {
             return None;
         }
-        // Which side a hash join hashes: `b`, or `a` with `b` outer.
+        // Which side a hash join hashes: `b`, or `a` with `b` outer (an
+        // inner join's, or a LEFT join's hash right join).
         let hashes_b = |m: JoinMethod| match m {
             JoinMethod::HashOuterA | JoinMethod::Other => Some(true),
-            JoinMethod::HashOuterB => Some(false),
+            JoinMethod::HashOuterB | JoinMethod::HashRightB => Some(false),
             _ => None,
         };
         let leaves = [x_node.as_ref(), y_node.as_ref(), z_node.as_ref()];
@@ -919,14 +1021,15 @@ impl PgHandler {
         };
         let ons = [on1.clone(), on2.clone()];
         let on_expr = |on: Option<usize>| on.and_then(|i| ons[i - 1].clone());
-        let join = |left: JoinNode,
+        let join = |kind: JoinKind,
+                    left: JoinNode,
                     right: JoinNode,
                     keys: (String, String),
                     on: Option<secantus_pgplan::ColumnExpr>| {
             let (left_keys, right_keys) = (node_keys(&left), node_keys(&right));
             let on_aliases = vec![alias_of(&keys.0).to_string(), alias_of(&keys.1).to_string()];
             JoinNode::Join {
-                kind: JoinKind::Inner,
+                kind,
                 left: Box::new(left),
                 right: Box::new(right),
                 on,
@@ -956,6 +1059,7 @@ impl PgHandler {
             &[aliases[inner].as_str()],
         )?;
         let pair = join(
+            JoinKind::Inner,
             leaves[outer].clone(),
             leaves[inner].clone(),
             keys,
@@ -966,6 +1070,11 @@ impl PgHandler {
         let pair_aliases = [aliases[fa].as_str(), aliases[fb].as_str()];
         let third_alias = [aliases[third].as_str()];
         let step = &plan.second_step;
+        // The search's LEFT join keeps `a`, the third table: a hash left
+        // join with it outer, or a hash right join hashing it.
+        if right && (plan.joinrel_first || !step.left) {
+            return None;
+        }
         let (a, a_aliases, b, b_aliases) = if plan.joinrel_first {
             (
                 pair,
@@ -983,8 +1092,14 @@ impl PgHandler {
         };
         let (top, top_cond) = if hashes_b(step.method)? {
             let c = cond(step.on, a_aliases, b_aliases)?;
+            let kind = if right {
+                JoinKind::Left
+            } else {
+                JoinKind::Inner
+            };
             (
                 join(
+                    kind,
                     a,
                     b,
                     (step.a_key.clone(), step.b_key.clone()),
@@ -994,8 +1109,14 @@ impl PgHandler {
             )
         } else {
             let c = cond(step.on, b_aliases, a_aliases)?;
+            let kind = if right {
+                JoinKind::Right
+            } else {
+                JoinKind::Inner
+            };
             (
                 join(
+                    kind,
                     b,
                     a,
                     (step.b_key.clone(), step.a_key.clone()),
@@ -1173,6 +1294,8 @@ impl PgHandler {
         let Some(plan) = self.three_table_plan(node) else {
             return Ok(None);
         };
+        let chain = right_chain(node);
+        let node = chain.as_ref().unwrap_or(node);
         let JoinNode::Join {
             left: lower,
             right: z_node,
