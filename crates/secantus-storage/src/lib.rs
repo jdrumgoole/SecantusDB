@@ -3236,7 +3236,15 @@ const BOOTSTRAP: &[(&str, &str)] = &[
     // writes made to its collection while it scans.
     (index_build::BUILDS_TABLE, "key_format=u,value_format=u"),
     (index_build::SIDE_TABLE, "key_format=u,value_format=u"),
+    // Where a standalone's crash replay starts (RM-805): written beside each
+    // unstable checkpoint, and as unlogged as the data tables are, so the
+    // checkpoint holds it atomically with the data it describes.
+    (REPLAY_FROM_TABLE, "key_format=u,value_format=u"),
 ];
+
+/// See [`BOOTSTRAP`]: the table of the one row, [`REPLAY_FROM_KEY`].
+const REPLAY_FROM_TABLE: &str = "table:secantus_replay_from";
+const REPLAY_FROM_KEY: &[u8] = b"replayFrom";
 
 /// Durable record of every prepared (two-phase) transaction: `gid -> BSON
 /// {gid, owner, database, prepared, xid, minted, ops}`. Written at `PREPARE
@@ -5901,6 +5909,12 @@ pub struct Storage {
     /// [`Storage::syncs_every_commit`]. Read once, from the open's config.
     syncs_every_commit: bool,
     stable_seq: Arc<AtomicI64>,
+    /// The store holds a replica-set configuration (`local.system.replset`):
+    /// it is a set member's, and takes stable checkpoints and moves
+    /// `oplogTruncateAfterPoint`; without one it is a standalone's, as
+    /// mongod's, with neither (RM-805, RM-806). Refreshed by the checkpoint
+    /// thread, which sees the configuration `replSetInitiate` writes.
+    member: Arc<AtomicBool>,
     /// Periodic checkpoint thread (WT does not checkpoint on its own under
     /// our config). For a data-nonlogged store it is the durability cadence
     /// (unlogged tables are only as durable as their last checkpoint — the
@@ -7487,13 +7501,30 @@ fn advance_timestamps(
     conn: &Connection,
     oplog: &Mutex<OplogState>,
     oplog_uri: &str,
+    member: bool,
 ) -> Result<i64> {
     let bound = {
         let st = oplog.lock().unwrap_or_else(|e| e.into_inner());
         Storage::all_committed_ts_locked(&st)
     };
     let session = conn.open_session()?;
-    if let Some(stable) = newest_entry_at_or_below(&session, oplog_uri, bound)? {
+    let newest = newest_entry_at_or_below(&session, oplog_uri, bound)?;
+    if !member {
+        // A standalone, as mongod's, sets no stable timestamp (RM-805): its
+        // checkpoints take every committed write ([`unstable_checkpoint`])
+        // and a crash replays the oplog from the position they record. The
+        // oldest timestamp still trails the clock, so history is let go.
+        let Some(position) = newest else {
+            return Ok(0);
+        };
+        let floor = ((now_secs() - SNAPSHOT_HISTORY_SECONDS).max(0) as u64) << 32;
+        let oldest = floor.min(position);
+        if oldest > 0 {
+            conn.set_timestamp(&format!("oldest_timestamp={oldest:x}"))?;
+        }
+        return Ok(position as i64);
+    }
+    if let Some(stable) = newest {
         conn.set_timestamp(&format!("stable_timestamp={stable:x}"))?;
         let floor = ((now_secs() - SNAPSHOT_HISTORY_SECONDS).max(0) as u64) << 32;
         let oldest = floor.min(stable);
@@ -7510,6 +7541,98 @@ fn advance_timestamps(
         .and_then(|hex| u64::from_str_radix(&hex, 16).ok())
         .unwrap_or(0);
     Ok(held as i64)
+}
+
+/// Read whether the store holds a replica-set configuration into `member`.
+fn refresh_member(conn: &Connection, member: &AtomicBool, point: &TruncatePoint) {
+    match conn
+        .open_session()
+        .map_err(Into::into)
+        .and_then(|s| replset_configured(&s))
+    {
+        Ok(now) => {
+            member.store(now, Ordering::Release);
+            point.standalone.store(!now, Ordering::Release);
+        }
+        Err(e) => {
+            eprintln!("secantus-storage: reading the replica-set configuration failed: {e:?}")
+        }
+    }
+}
+
+/// A standalone's checkpoint (RM-805): the replay position first, then a
+/// checkpoint of every committed write with no stable timestamp
+/// (`use_timestamp=false`), as mongod's checkpoint thread takes while it has
+/// none. Returns the position. `position` is what [`advance_timestamps`]
+/// gave: committed before this call, so before the checkpoint's snapshot.
+fn unstable_checkpoint(conn: &Connection, drop_pending: &DropPending, position: i64) -> Result<()> {
+    if position > 0 {
+        write_replay_from(conn, position as u64)?;
+    }
+    let session = conn.open_session()?;
+    drop_pending.checkpoint_with(&session, Some("use_timestamp=false"))?;
+    Ok(())
+}
+
+/// Whether the store holds a replica-set configuration
+/// (`local.system.replset`): a set member's, as against a standalone's.
+fn replset_configured(session: &Session) -> Result<bool> {
+    let cur = match open_doc_cursor(session, "local", "system.replset", None) {
+        Ok(c) => c,
+        Err(e) if e.is_missing_table() => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let more = cur.first()?;
+    if !more {
+        return Ok(false);
+    }
+    let (d, c, _rid) = cur.get_key_ssq()?;
+    Ok(d == "local" && c == "system.replset")
+}
+
+/// Record, in the unlogged [`REPLAY_FROM_TABLE`], the oplog position every
+/// entry at or below is in the data tables: the checkpoint that follows
+/// (taken with no stable timestamp, so holding every committed write) keeps
+/// the row with the data, and a crash replays the oplog after it. Written
+/// BEFORE the checkpoint starts, from a position that was already committed
+/// then, so the checkpoint's snapshot is never behind it.
+fn write_replay_from(conn: &Connection, position: u64) -> Result<()> {
+    let session = conn.open_session()?;
+    begin_untimestamped(&session, true)?;
+    let wrote = (|| -> Result<()> {
+        let cur = session.open_cursor(REPLAY_FROM_TABLE, None)?;
+        cur.set_key_u(REPLAY_FROM_KEY);
+        cur.set_value_u(&position.to_be_bytes());
+        cur.insert()?;
+        Ok(())
+    })();
+    match wrote {
+        Ok(()) => commit_untimestamped(&session),
+        Err(e) => {
+            let _ = session.rollback_transaction(None);
+            Err(e)
+        }
+    }
+}
+
+/// [`write_replay_from`]'s row, as the last checkpoint kept it.
+fn read_replay_from(session: &Session) -> Result<Option<u64>> {
+    let cur = match session.open_cursor(REPLAY_FROM_TABLE, None) {
+        Ok(c) => c,
+        Err(e) if e.is_not_found() || e.is_missing_table() => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    cur.set_key_u(REPLAY_FROM_KEY);
+    match cur.search() {
+        Ok(()) => {
+            let v = cur.get_value_u()?;
+            Ok(<[u8; 8]>::try_from(v.as_slice())
+                .ok()
+                .map(u64::from_be_bytes))
+        }
+        Err(e) if e.is_not_found() => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// The newest entry of the oplog at `oplog_uri` at or below `bound` (a
@@ -7545,6 +7668,10 @@ struct TruncatePoint {
     /// flusher neither moves the point nor syncs while it is set, and a
     /// journaled write waits for it, as on mongod.
     paused: AtomicBool,
+    /// The store is a standalone's: with no replica-set configuration it
+    /// moves no point, as a standalone mongod's journal flusher moves none
+    /// (RM-806).
+    standalone: AtomicBool,
     /// The session each refresh reads and writes with, kept between
     /// refreshes (they are serialised by `row`): opening one per journaled
     /// write was 40% of the refresh's cost (measured 2026-11-22). Closed by
@@ -7566,6 +7693,9 @@ fn refresh_truncate_point(
     oplog_uri: &str,
     point: &TruncatePoint,
 ) -> Result<()> {
+    if point.standalone.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let row = point.row.lock().unwrap_or_else(|e| e.into_inner());
     let Some((uri, rid)) = row.as_ref() else {
         return Ok(());
@@ -8580,6 +8710,13 @@ impl Storage {
                     if let Some(through) = left.first().filter(|n| **n > 1) {
                         replay_from = (*through - 1) as u64;
                     }
+                } else if let Some(from) = read_replay_from(&boot)? {
+                    // A standalone that was killed: its last checkpoint
+                    // held every committed write, and the position it
+                    // recorded with them is where the oplog replays from
+                    // (RM-805). The replay is idempotent, so entries
+                    // after it that the checkpoint also holds are safe.
+                    replay_from = from;
                 }
             }
             if let Some(t) = truncation {
@@ -8701,6 +8838,11 @@ impl Storage {
         } else {
             0
         }));
+        let member = Arc::new(AtomicBool::new(if in_memory {
+            true
+        } else {
+            replset_configured(&conn.open_session()?)?
+        }));
         let checkpoint_requested = Arc::new(AtomicBool::new(false));
         let sizes = Arc::new(sizes::SizeStorer::default());
         let prune_ctx = Arc::new(PruneCtx {
@@ -8765,6 +8907,7 @@ impl Storage {
             data_nonlogged,
             timestamped: data_nonlogged,
             stable_seq,
+            member,
             truncate_point: Arc::default(),
             syncs_every_commit: !in_memory && config.contains("transaction_sync=(enabled=true"),
             checkpoint_stop: Arc::new(AtomicBool::new(false)),
@@ -8797,6 +8940,10 @@ impl Storage {
         };
         // Before the store takes any write -- crash recovery's replay and the
         // catalog work below write documents, and each write moves the counts.
+        storage.truncate_point.standalone.store(
+            storage.timestamped && !storage.member.load(Ordering::Acquire),
+            Ordering::Release,
+        );
         storage.open_size_storer(&size_fingerprint)?;
         // What the store writes as it opens -- its genesis, the catalog and
         // views brought in line, drops a crash interrupted -- logs no
@@ -9392,6 +9539,12 @@ impl Storage {
     /// Whether this store keeps the history a read at a past timestamp needs.
     pub fn is_timestamped(&self) -> bool {
         self.timestamped
+    }
+
+    /// WiredTiger's stable timestamp in hex, `"0"` when none is set: a
+    /// standalone's never is (RM-805).
+    pub fn stable_timestamp_hex(&self) -> Result<String> {
+        Ok(self.conn.query_timestamp("get=stable_timestamp")?)
     }
 
     /// WiredTiger's oldest timestamp: a read below it has no history to read
@@ -10370,12 +10523,26 @@ impl Storage {
     pub fn checkpoint(&self) -> Result<()> {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.timestamped {
-            // A checkpoint keeps the data tables as of the stable timestamp.
-            advance_timestamps(&self.conn, &self.oplog, &self.oplog_uri)?;
+            self.refresh_member();
+            // A checkpoint keeps the data tables as of the stable timestamp;
+            // a standalone's keeps every one and records where to replay from.
+            let member = self.member.load(Ordering::Acquire);
+            let position = advance_timestamps(&self.conn, &self.oplog, &self.oplog_uri, member)?;
+            if !member {
+                return unstable_checkpoint(&self.conn, &self.drop_pending, position);
+            }
         }
         let session = self.conn.open_session()?;
         self.drop_pending.checkpoint(&session)?;
         Ok(())
+    }
+
+    /// Whether the store is a replica-set member's now: read again from its
+    /// configuration, which `replSetInitiate` writes while the store runs.
+    fn refresh_member(&self) {
+        if self.timestamped {
+            refresh_member(&self.conn, &self.member, &self.truncate_point);
+        }
     }
 
     /// Phase A': set the stable timestamp to the all-committed point, then
@@ -10433,6 +10600,11 @@ impl Storage {
         self.wait_until_all_committed_through(through);
         // mongod's `waitUntilDurable` runs a journal flusher round, which
         // moves the truncate point first (RM-736).
+        if self.truncate_point.standalone.load(Ordering::Acquire) {
+            // A configuration written since (`replSetInitiate`) makes the
+            // store a member's, whose point this wait moves.
+            self.refresh_member();
+        }
         refresh_truncate_point(
             &self.conn,
             &self.oplog,
@@ -10540,6 +10712,7 @@ impl Storage {
         let oplog = self.oplog.clone();
         let oplog_uri = self.oplog_uri.clone();
         let point = self.truncate_point.clone();
+        let member = self.member.clone();
         let handle = thread::Builder::new()
             .name("secantus-journal".into())
             .spawn(move || {
@@ -10548,6 +10721,10 @@ impl Storage {
                     std::thread::sleep(interval);
                     if point.paused.load(Ordering::Acquire) {
                         continue;
+                    }
+                    if point.standalone.load(Ordering::Acquire) {
+                        // A configuration may have come (`replSetInitiate`).
+                        refresh_member(&conn, &member, &point);
                     }
                     // The truncate point first, then the sync that makes it
                     // durable with the entries it covers, as mongod's
@@ -10872,9 +11049,20 @@ impl Storage {
         // can leave a recovery point that the data does not match (the
         // checkpoint-then-marker row of an earlier format could be crashed
         // between, and had to be written second).
+        self.refresh_member();
+        if self.timestamped && !self.member.load(Ordering::Acquire) {
+            // A standalone (RM-805): no stable timestamp and no truncate
+            // point; the checkpoint takes every write and the replay
+            // position goes with it.
+            let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            let position = advance_timestamps(&self.conn, &self.oplog, &self.oplog_uri, false)?;
+            unstable_checkpoint(&self.conn, &self.drop_pending, position)?;
+            self.stable_seq.store(position, Ordering::Release);
+            return Ok(());
+        }
         self.refresh_oplog_truncate_after_point()?;
         let stable = if self.timestamped {
-            advance_timestamps(&self.conn, &self.oplog, &self.oplog_uri)?
+            advance_timestamps(&self.conn, &self.oplog, &self.oplog_uri, true)?
         } else {
             self.oplog_visible_tail_seq()
         };
@@ -11041,16 +11229,9 @@ impl Storage {
         // `local` writes have no entry anyway; the guard makes it so for the
         // helpers that might not know.
         let unlogged = unreplicated();
-        let first =
-            if created && scan_max_oplog_seq(&self.conn.open_session()?, &self.oplog_uri) == 0 {
-                Some(self.write_initiating_entry()?)
-            } else {
-                None
-            };
-        let tail = {
-            let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
-            Self::all_committed_ts_locked(&st)
-        };
+        if created && scan_max_oplog_seq(&self.conn.open_session()?, &self.oplog_uri) == 0 {
+            self.write_initiating_entry()?;
+        }
         self.put_local_singleton(
             "replset.minvalid",
             bson::doc! {
@@ -11063,7 +11244,11 @@ impl Storage {
             "replset.oplogTruncateAfterPoint",
             bson::doc! {
                 "_id": "oplogTruncateAfterPoint",
-                "oplogTruncateAfterPoint": Bson::Timestamp(u64_ts(first.map_or(tail, |f| f as u64))),
+                // Null: a store is a standalone's until a replica-set
+                // configuration is written, and a standalone mongod keeps
+                // no point (RM-806). A member's journal flusher moves it
+                // from its first round.
+                "oplogTruncateAfterPoint": Bson::Timestamp(u64_ts(0)),
             },
         )?;
         self.put_local_singleton(
@@ -11703,6 +11888,8 @@ impl Storage {
         let gate = self.checkpoint_gate.clone();
         let timestamped = self.timestamped;
         let drop_pending = self.drop_pending.clone();
+        let member = self.member.clone();
+        let point = self.truncate_point.clone();
         let handle = thread::Builder::new()
             .name(
                 if stable {
@@ -11724,9 +11911,16 @@ impl Storage {
                     waited += tick;
                     reap_drop_pending(&conn, &drop_pending);
                     if timestamped {
+                        // Whether a configuration came (`replSetInitiate`).
+                        refresh_member(&conn, &member, &point);
                         // The oldest timestamp trails the clock by the
                         // snapshot window, not by a checkpoint interval.
-                        if let Err(e) = advance_timestamps(&conn, &oplog, &oplog_uri) {
+                        if let Err(e) = advance_timestamps(
+                            &conn,
+                            &oplog,
+                            &oplog_uri,
+                            member.load(Ordering::Acquire),
+                        ) {
                             eprintln!(
                                 "secantus-storage: moving the stable timestamp failed: {e:?}"
                             );
@@ -11751,8 +11945,9 @@ impl Storage {
                     }
                     // The stable timestamp first, then the checkpoint that
                     // keeps it (see `stable_checkpoint`).
+                    let standalone = timestamped && !member.load(Ordering::Acquire);
                     let stable = if timestamped {
-                        match advance_timestamps(&conn, &oplog, &oplog_uri) {
+                        match advance_timestamps(&conn, &oplog, &oplog_uri, !standalone) {
                             Ok(seq) => seq,
                             Err(e) => {
                                 eprintln!("secantus-storage: stable checkpoint failed: {e:?}");
@@ -11767,7 +11962,13 @@ impl Storage {
                         let session = conn.open_session()?;
                         {
                             let _cp = gate.lock().unwrap_or_else(|e| e.into_inner());
-                            drop_pending.checkpoint(&session)?;
+                            if standalone {
+                                // Every committed write, and where a crash
+                                // replays from (RM-805).
+                                unstable_checkpoint(&conn, &drop_pending, stable)?;
+                            } else {
+                                drop_pending.checkpoint(&session)?;
+                            }
                         }
                         Ok(())
                     })();
@@ -11804,8 +12005,13 @@ impl Storage {
         // Sync mode: waits out any in-flight mint window (usually a no-op).
         // The drainers never take `self.lock`, so waiting here cannot deadlock.
         self.flush_oplog();
+        self.refresh_member();
         if self.timestamped {
-            advance_timestamps(&self.conn, &self.oplog, &self.oplog_uri)?;
+            let member = self.member.load(Ordering::Acquire);
+            let position = advance_timestamps(&self.conn, &self.oplog, &self.oplog_uri, member)?;
+            if !member {
+                unstable_checkpoint(&self.conn, &self.drop_pending, position)?;
+            }
         }
         let session = self.conn.open_session()?;
         // Durable, consistent snapshot first; the backup cursor enumerates the

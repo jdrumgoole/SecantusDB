@@ -383,6 +383,45 @@ fn a_standalone_close_records_no_stable_timestamp() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// RM-805: a standalone's periodic (stable) checkpoint records where a crash
+/// replays from and no stable timestamp, so a hand-off to mongod finds none
+/// ahead of its first write. Only a replica-set member's checkpoint keeps one.
+#[test]
+fn a_standalone_checkpoint_anchors_a_replay_position_not_a_stable_timestamp() {
+    let options = secantus_storage::StorageOptions {
+        data_nonlogged: Some(true),
+        oplog_nonlogged: Some(false),
+        ..secantus_storage::StorageOptions::default()
+    };
+    let standalone = temp_home();
+    let member = temp_home();
+    let st = Storage::open_with_options(standalone.to_str().unwrap(), &options).unwrap();
+    let ms = Storage::open_with_options(member.to_str().unwrap(), &options).unwrap();
+    ms.insert(
+        "local",
+        "system.replset",
+        vec![enc(&bson::doc! {"_id": "rs0"})],
+        true,
+    )
+    .unwrap();
+    for store in [&st, &ms] {
+        for i in 0..5 {
+            store
+                .insert_one("app", "c", &enc(&bson::doc! {"_id": i}))
+                .unwrap();
+        }
+        store.stable_checkpoint().unwrap();
+        assert_eq!(store.stable_checkpoint_seq(), store.oplog_tail_seq());
+    }
+    // The standalone holds no stable timestamp for mongod to find; the
+    // member's holds the newest entry's.
+    assert_eq!(st.stable_timestamp_hex().unwrap(), "0");
+    assert_ne!(ms.stable_timestamp_hex().unwrap(), "0");
+    drop((st, ms));
+    let _ = std::fs::remove_dir_all(&standalone);
+    let _ = std::fs::remove_dir_all(&member);
+}
+
 /// RM-797: a replica-set member's clean close keeps its stable checkpoint:
 /// mongod opens the store as that set's member and resumes its clock from
 /// the oplog.

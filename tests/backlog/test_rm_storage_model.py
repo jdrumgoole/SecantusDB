@@ -24,7 +24,13 @@ import bson
 import pymongo
 import pytest
 
-from tests.backlog.conftest import _RS_BANNER, RS_BINARY, mongo_answer, rust_mongo_server
+from tests.backlog.conftest import (
+    _RS_BANNER,
+    RS_BINARY,
+    drain_output,
+    mongo_answer,
+    rust_mongo_server,
+)
 from tests.mongod_reference import MONGOD
 
 #: `storage.bson` in a mongod 8.2.11 store (phase 0b).
@@ -663,7 +669,7 @@ def test_mongod_starts_on_a_standalone_store_closed_within_the_second(
         _stop_mongod(proc, client)
 
 
-@pytest.mark.backlog("RM-805")
+@pytest.mark.backlog_fixed("RM-805")
 def test_mongod_starts_on_a_standalone_store_killed_within_the_second(tmp_path: Path) -> None:
     """The kill case of RM-797. A standalone store that is SIGKILLed keeps
     the stable-timestamp checkpoint its periodic thread took, at its newest
@@ -690,6 +696,272 @@ def test_mongod_starts_on_a_standalone_store_killed_within_the_second(tmp_path: 
             _wait_primary(client, f"{host}:{port}")
             client["app"]["c"].insert_one({"_id": -1})
             assert client["app"]["c"].count_documents({}) == 6
+    finally:
+        _stop_mongod(proc, client)
+
+
+@pytest.mark.backlog_fixed("RM-806")
+def test_mongod_starts_as_primary_on_a_standalone_store_killed_long_ago(tmp_path: Path) -> None:
+    """A `--standalone` store keeps `local.replset.oplogTruncateAfterPoint`
+    null, as a standalone mongod's journal flusher leaves it: only a primary
+    moves it. It used to hold the newest whole entry, so a SIGKILL left it
+    non-null, and mongod 8.2.11 started as `--replSet` on the store (no
+    configuration, so no startup recovery) died on the invariant
+    `getOplogTruncateAfterPoint(opCtx).isNull()` at its first election."""
+    store = tmp_path / "store"
+
+    def setup(c: pymongo.MongoClient) -> None:
+        c.app.c.insert_one({"_id": 1})
+        c.admin.command("fsync")  # the write is in a checkpoint, which mongod reads
+        time.sleep(1)  # the journal flusher's rounds
+
+    _killed_secantus_store(store, setup, "--standalone")
+    proc, client = _mongod_on(store, None, "rs0")
+    try:
+        assert client is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            host, port = client.address or ("127.0.0.1", 0)
+            _wait_primary(client, f"{host}:{port}")
+            client["app"]["c"].insert_one({"_id": 2})
+            assert client["app"]["c"].count_documents({}) == 2
+    finally:
+        _stop_mongod(proc, client)
+
+
+@pytest.mark.backlog("RM-808")
+def test_mongod_keeps_the_writes_of_a_killed_standalone_store(tmp_path: Path) -> None:
+    """A standalone mongod keeps every journaled write across a kill, and
+    mongod 8.2.11 started as `--replSet` on a killed `--standalone` store of
+    ours should hold them too: an acknowledged write is in the oplog (logged)
+    but not in the unlogged data tables until a checkpoint, and mongod, with
+    no replica-set configuration to recover from, does not replay it."""
+    store = tmp_path / "store"
+
+    def setup(c: pymongo.MongoClient) -> None:
+        coll = c.app.get_collection("c", write_concern=pymongo.WriteConcern(w=1, j=True))
+        coll.insert_one({"_id": 1})
+
+    _killed_secantus_store(store, setup, "--standalone")
+    proc, client = _mongod_on(store, None, "rs0")
+    try:
+        assert client is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            host, port = client.address or ("127.0.0.1", 0)
+            _wait_primary(client, f"{host}:{port}")
+            assert client["app"]["c"].count_documents({}) == 1
+    finally:
+        _stop_mongod(proc, client)
+
+
+class _Model:
+    """What a writer was told, so a kill can be judged against it: the
+    documents `{_id: v}` every acknowledged operation leaves, and the one
+    operation in flight when the server died, which may or may not have
+    committed."""
+
+    def __init__(self, docs: dict[int, int]) -> None:
+        self.docs = dict(docs)
+        self.pending: tuple[str, int, int] | None = None
+        self.next_id = max(docs, default=0) + 1
+
+    def settle(self) -> list[dict[int, int]]:
+        """The states the store may be in: with and without the operation
+        that was in flight."""
+        states = [dict(self.docs)]
+        if self.pending:
+            op, i, v = self.pending
+            other = dict(self.docs)
+            if op == "delete":
+                other.pop(i, None)
+            else:
+                other[i] = v
+            states.append(other)
+        return states
+
+
+def _write_until(
+    store: Path, kill_after: float, model: _Model, *extra: str, env: dict | None = None
+) -> None:
+    """Start `secantusd-mdb --standalone` on `store`, write inserts, `$inc`
+    updates and deletes one at a time (each acknowledged operation goes in
+    `model`), and SIGKILL the server `kill_after` seconds in, mid-operation."""
+    import os
+    import random
+    import threading
+
+    proc = subprocess.Popen(
+        [str(RS_BINARY), "--port", "0", "--storage-path", str(store), "--standalone", *extra],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env={**os.environ, **(env or {})},
+    )
+    try:
+        assert proc.stdout is not None
+        m = None
+        for _ in range(40):
+            line = proc.stdout.readline()
+            m = _RS_BANNER.search(line)
+            if m or not line:
+                break
+        assert m, f"secantusd-mdb did not start: {line!r}"
+        drain_output(proc)
+        client = pymongo.MongoClient(
+            m.group(1),
+            int(m.group(2)),
+            serverSelectionTimeoutMS=3000,
+            retryWrites=False,
+            # Acknowledged once journaled: a plain `w: 1` write of the last
+            # 100 ms is lost to a kill, as on mongod.
+            w=1,
+            journal=True,
+        )
+        coll = client.app.c
+        rnd = random.Random(kill_after)
+        stop = threading.Event()
+
+        def writer() -> None:
+            try:
+                while not stop.is_set():
+                    pick = rnd.random()
+                    if pick < 0.5 or not model.docs:
+                        i = model.next_id
+                        model.next_id += 1
+                        model.pending = ("insert", i, 0)
+                        coll.insert_one({"_id": i, "v": 0, "pad": "x" * 200})
+                        model.docs[i] = 0
+                    elif pick < 0.85:
+                        i = rnd.choice(list(model.docs))
+                        model.pending = ("update", i, model.docs[i] + 1)
+                        coll.update_one({"_id": i}, {"$inc": {"v": 1}})
+                        model.docs[i] += 1
+                    else:
+                        i = rnd.choice(list(model.docs))
+                        model.pending = ("delete", i, 0)
+                        coll.delete_one({"_id": i})
+                        del model.docs[i]
+                    model.pending = None
+            except pymongo.errors.PyMongoError:
+                return
+
+        t = threading.Thread(target=writer, daemon=True)
+        t.start()
+        time.sleep(kill_after)
+        proc.send_signal(signal.SIGKILL)
+        proc.wait()
+        stop.set()
+        t.join(timeout=30)
+        client.close()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def _open_and_kill(store: Path, delay: float = 0.0, env: dict | None = None) -> None:
+    """Open `store` as `secantusd-mdb --standalone` (replaying what a crash
+    left) and SIGKILL it `delay` seconds after it listens, with no clean
+    close in between: the next open replays again, over what the first
+    replay and its checkpoint wrote."""
+    import os
+
+    proc = subprocess.Popen(
+        [str(RS_BINARY), "--port", "0", "--storage-path", str(store), "--standalone"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env={**os.environ, **(env or {})},
+    )
+    try:
+        assert proc.stdout is not None
+        for _ in range(40):
+            line = proc.stdout.readline()
+            if _RS_BANNER.search(line) or not line:
+                break
+        assert _RS_BANNER.search(line), f"secantusd-mdb did not start: {line!r}"
+        drain_output(proc)
+        time.sleep(delay)
+    finally:
+        proc.send_signal(signal.SIGKILL)
+        proc.wait()
+
+
+def _store_state(store: Path, *extra: str) -> dict[int, int]:
+    """Open the store with `secantusd-mdb --standalone`, read it whole, and
+    check its indexes and `validate`; stop it cleanly."""
+    with rust_mongo_server(store, "--standalone", *extra) as client:
+        docs = list(client.app.c.find({}))
+        ids = [d["_id"] for d in docs]
+        assert len(ids) == len(set(ids)), "a document twice"
+        assert client.app.c.count_documents({}) == len(docs)
+        if docs:
+            check = client.app.command("validate", "c", full=True)
+            assert check["valid"], check
+        return {d["_id"]: d["v"] for d in docs}
+
+
+def _assert_matches(model: _Model, got: dict[int, int], where: str) -> None:
+    states = model.settle()
+    changed = [
+        (i, model.docs[i], got[i]) for i in model.docs if i in got and got[i] != model.docs[i]
+    ]
+    assert got in states, (
+        f"{where}: the store holds {len(got)} documents; an acknowledged write is missing "
+        f"or applied twice. expected one of {[len(s) for s in states]} documents; "
+        f"missing {sorted(set(model.docs) - set(got))[:5]}, "
+        f"changed {changed[:5]}, "
+        f"extra {sorted(set(got) - set(model.docs))[:5]}"
+    )
+    # An in-flight operation that did commit is part of the next baseline.
+    model.docs = got
+    model.pending = None
+    model.next_id = (
+        max(got, default=0) + max(model.next_id, 1)
+        if False
+        else max(model.next_id, max(got, default=0) + 1)
+    )
+
+
+@pytest.mark.backlog_fixed("RM-805")
+@pytest.mark.parametrize(
+    "case, lives, kill_after, checkpoint_seconds",
+    [
+        ("after_an_insert", 1, 0.3, "60"),
+        ("mid_batch_of_work", 1, 2.0, "60"),
+        ("right_after_a_checkpoint", 1, 2.2, "1"),
+        ("during_checkpoints", 4, 1.7, "1"),
+        ("repeated_quick_kills", 8, 0.6, "60"),
+    ],
+)
+def test_a_killed_standalone_store_keeps_every_acknowledged_write_once(
+    tmp_path: Path, case: str, lives: int, kill_after: float, checkpoint_seconds: str
+) -> None:
+    """SIGKILL a `--standalone` store at several points of a writer's life
+    (RM-805): the store carries no stable timestamp (as a standalone mongod's
+    does not), so a crash replays its oplog from the position its last
+    checkpoint recorded, and the replay must leave every acknowledged insert,
+    `$inc` and delete in place exactly once -- over a checkpoint that already
+    holds some of them. After the kills the store opens, validates and is
+    handed to mongod 8.2.11 as `--replSet`, which initiates and takes a write."""
+    store = tmp_path / "store"
+    env = {"SECANTUS_CHECKPOINT_SECONDS": checkpoint_seconds}
+    model = _Model({})
+    for life in range(lives):
+        _write_until(store, kill_after + 0.13 * life, model, env=env)
+        # Opening the store IS the replay: it must leave the model's state.
+        _open_and_kill(store, 0.2 * life, env)  # killed again while recovered
+        got = _store_state(store)
+        _assert_matches(model, got, f"{case}, life {life}")
+    _write_until(store, kill_after, model, env=env)
+    proc, client = _mongod_on(store, None, "rs0")
+    # A kill with no open in between is mongod's to open: it has no
+    # configuration to replay from, so only its start and a write are asked.
+    try:
+        assert client is not None, "mongod refused the store (see its log beside the store)"
+        with _mongod_answers(store):
+            host, port = client.address or ("127.0.0.1", 0)
+            _wait_primary(client, f"{host}:{port}")
+            client["app"]["post"].insert_one({"_id": -1})
     finally:
         _stop_mongod(proc, client)
 
