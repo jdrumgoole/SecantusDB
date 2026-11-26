@@ -1709,16 +1709,6 @@ Still different, all 77:
       **Decided (Joe, 2026-11-16): install colima on this Mac and run the Linux x86_64 mongod 8.2.11 image locally to fit LIBSTDCXX_X86_64.**
       Backlog-ID: RM-442
       Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_an_entry_reports_its_estimated_size_on_linux
-- [ ] **A `$cursor` the pipeline stops reading reports a plan run to its
-      end.** Under `[{$match: {a: {$gt: 2}}}, {$unwind: "$b"}, {$limit: 3}]`
-      (100 documents, `a_1`), mongod 8.2.11's `DocumentSourceCursor` loads one
-      batch of 32 documents and stops: its FETCH and IXSCAN report
-      `nReturned` 32, 32 works, `saveState` 2, `restoreState` 1, `isEOF` 0.
-      This server's classic run goes to the end (70 documents), and leaves the
-      work accounting out where its stages' counts are not mongod's
-      (`cursor_yields`). Found 2026-11-14 (RM-434).
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm434.py::test_a_cursor_the_pipeline_stops_reading_reports_one_batch
-      Backlog-ID: RM-692
 - [ ] **A `$group` whose `_id` takes `$mod`, or whose accumulator takes an
       expression object, is not pushed into SBE.** `[{$group: {_id: {$mod:
       ["$b", 2]}}}, {$sort: {_id: 1}}]`, and `{_id: "$a", q: {$push: {s:

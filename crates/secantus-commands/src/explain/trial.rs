@@ -852,6 +852,15 @@ pub(crate) fn worked_through(plan: &Node, env: &Env) -> Option<Stats> {
     Some(stage.stats())
 }
 
+/// [`worked_through`], stopped once the plan has returned `need`
+/// documents: a `$cursor` whose batches end there asks it for no more.
+pub(crate) fn worked_until(plan: &Node, env: &Env, need: i64) -> Option<Stats> {
+    let mut cache = Entries::new();
+    let mut stage = Stage::new(plan, env, &mut cache)?;
+    while stage.returned < need && !matches!(stage.work(env), Work::Eof) {}
+    Some(stage.stats())
+}
+
 /// Adds one to the count `key` in `extra`.
 fn bump(extra: &mut Document, key: &str) {
     let n = extra.get(key).and_then(crate::util::as_i64).unwrap_or(0);

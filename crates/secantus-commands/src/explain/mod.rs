@@ -1790,18 +1790,25 @@ fn set_aside(st: &mut Stats) {
     }
 }
 
-/// Raise each counter of `run` to what `trial` counted in the same stage.
 /// A `$cursor`'s plan, saved when the cursor is prepared and after each
 /// batch it loads, restored before each (`DocumentSourceCursor::loadBatch`).
-/// The plan here ran to its end; where the stages after the cursor stopped
-/// pulling first, mongod's stopped with them, and the run's work counts are
-/// not its: they are left out (RM-692).
-fn cursor_yields(run: &mut Stats, pulled: Option<i64>) {
-    if pulled.is_some_and(|p| p < run.n_returned) {
-        strip_work(run);
-        return;
+/// Where the stages after the cursor stopped pulling at `pulled`, the
+/// cursor loaded only the batches that reached it, and its plan stopped
+/// there: the run is replayed to that point (RM-692). Where the plan holds
+/// a stage that replay does not step, its work counts are left out.
+fn cursor_yields(run: &mut Stats, pulled: Option<i64>, plan: &Node, env: &exec::Env) {
+    let demand = pulled.filter(|p| *p < run.n_returned);
+    if let Some(p) = demand {
+        let (loaded, _, _) = sbe::batches(run.n_returned, Some(p));
+        match trial::worked_until(plan, env, loaded) {
+            Some(stopped) => *run = stopped,
+            None => {
+                strip_work(run);
+                return;
+            }
+        }
     }
-    let (_, loads, _) = sbe::batches(run.n_returned, None);
+    let (_, loads, _) = sbe::batches(run.n_returned, demand);
     stream::yielded(
         run,
         stream::Yields {
@@ -1818,6 +1825,7 @@ fn strip_work(stats: &mut Stats) {
     }
 }
 
+/// Raise each counter of `run` to what `trial` counted in the same stage.
 fn at_least(run: &mut Stats, trial: &Stats) {
     run.n_returned = run.n_returned.max(trial.n_returned);
     run.keys = run.keys.max(trial.keys);
@@ -2574,7 +2582,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             at_least(&mut run, trial);
         }
         if !s.rest.is_empty() || union::nested() {
-            cursor_yields(&mut run, cursor_pulled);
+            cursor_yields(&mut run, cursor_pulled, &plan, &env);
         }
         run
     });
