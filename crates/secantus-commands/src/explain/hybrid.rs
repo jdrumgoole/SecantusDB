@@ -100,6 +100,13 @@ pub(super) fn has_hybrid(v: &Bson) -> bool {
     }
 }
 
+/// Whether `stage`, in a pipeline `crate::hybrid` prepared, is one the user
+/// wrote: it neither runs the fusion nor reads its hidden fields.
+pub(super) fn is_user_stage(stage: &Document) -> bool {
+    let v = Bson::Document(stage.clone());
+    !has_hybrid(&v) && !reads_hidden(&v)
+}
+
 fn reads_hidden(v: &Bson) -> bool {
     match v {
         Bson::String(s) => s.contains(SCORE),

@@ -3345,7 +3345,7 @@ fn explain_reply(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
         "aggregate" => {
             let reply = aggregate(&inner, echo, inline, verbosity, ctx)?;
-            return Ok(union::explain_unions(reply, verbosity, ctx));
+            return Ok(union::explain_unions(reply, &inner, verbosity, ctx));
         }
         "update" | "delete" => {
             let coll = collection(&inner, &name, &db)?;

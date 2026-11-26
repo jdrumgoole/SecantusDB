@@ -1934,15 +1934,17 @@ What is left, all on the RUST MongoDB server:
       **Decided 2026-10-16 (Joe):** as RM-071, transcribe and execute.
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view_fetching_from_an_index
       Backlog-ID: RM-695
-- [ ] **A fusion input pipeline's `$unionWith` lists no `$cursor`.**
-      mongod 8.2.11 explains the `$unionWith` a `$rankFusion` or
-      `$scoreFusion` input pipeline runs in as any `$unionWith` over a
-      collection (RM-426): a `$cursor` of its own, then the stages it did
-      not absorb. This server lists that pipeline's stages desugared
-      (RM-200) with no `$cursor`: it runs hidden stages the explain of a
-      sub-pipeline cannot parse. Split from RM-426 2026-11-15.
-      Verify: tests/backlog/test_rm_found_2026_11_15_rm426.py::test_a_fusion_input_union_opens_with_its_cursor
-      Backlog-ID: RM-696
+- [ ] **A fusion input pipeline's `$unionWith` counts none of the stages
+      after its `$cursor`.** At `executionStats`, mongod 8.2.11 gives each
+      stage a `$rankFusion` input pipeline runs in its `$unionWith` an
+      `nReturned` and `executionTimeMillisEstimate` (4 each under a `$limit: 4`
+      in pipeline `b`), the `$_internalSetWindowFields` its memory and spill
+      figures, and the top-level `$_internalSetWindowFields` / `$group`
+      their `maxFunctionMemoryUsageBytes` / `maxAccumulatorMemoryUsageBytes`;
+      this server lists those stages with no counts. The `$cursor` itself
+      matches since RM-696. Found 2026-11-26 working RM-696.
+      Verify: tests/backlog/test_rm_found_2026_11_15_rm426.py::test_a_fusion_input_unions_stages_count_as_mongod_does
+      Backlog-ID: RM-830
 - [ ] **A `$group` read by a `DISTINCT_SCAN` hashes as another query.**
       mongod 8.2.11 explains `[{$match: {x: {$gt: 2}}}, {$group: {_id:
       "$x"}}]` over an index `{x: 1}` with `queryHash` /

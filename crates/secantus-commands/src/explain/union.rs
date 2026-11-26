@@ -16,9 +16,11 @@ use super::Verbosity;
 /// a collection listing its sub-pipeline explained.
 pub(super) fn explain_unions(
     mut reply: Document,
+    inner: &Document,
     verbosity: Verbosity,
     ctx: &mut CommandContext,
 ) -> Document {
+    let mut fusions = fusion_inputs(inner).into_iter();
     let Ok(stages) = reply.get_array_mut("stages") else {
         return reply;
     };
@@ -37,20 +39,74 @@ pub(super) fn explain_unions(
             },
             _ => continue,
         };
-        // The hidden stages a `$rankFusion` / `$scoreFusion` input runs in
-        // are listed as mongod desugars them (RM-200); they are not a
-        // pipeline the parser takes.
-        if super::hybrid::has_hybrid(&Bson::Array(pipeline.clone())) {
-            continue;
-        }
-        let Some(sub) = explained(&coll, &pipeline, verbosity, ctx) else {
-            continue;
+        // The `$unionWith` a `$rankFusion` / `$scoreFusion` input pipeline
+        // runs in (RM-696): mongod explains the input pipeline the user
+        // wrote under its `$cursor`, then the stages it desugars the
+        // fusion into, listed (RM-200), which are not a pipeline the
+        // parser takes.
+        let fusion = fusions.next().flatten();
+        let sub = match fusion {
+            Some((prefix, listed_len)) => {
+                let Some(mut sub) = explained(&coll, &prefix, verbosity, ctx) else {
+                    continue;
+                };
+                sub.extend(pipeline.iter().skip(listed_len).cloned());
+                sub
+            }
+            None => {
+                if super::hybrid::has_hybrid(&Bson::Array(pipeline.clone())) {
+                    continue;
+                }
+                match explained(&coll, &pipeline, verbosity, ctx) {
+                    Some(sub) => sub,
+                    None => continue,
+                }
+            }
         };
         let mut out = doc! { "coll": coll };
         out.insert("pipeline", sub);
         listed.insert("$unionWith", out);
     }
     reply
+}
+
+/// For each top-level `$unionWith` over a collection, in order: when it is
+/// one a fusion input pipeline runs in, the stages of that pipeline the
+/// user wrote (those before the first the fusion added) and how many
+/// stages they list as.
+fn fusion_inputs(inner: &Document) -> Vec<Option<(Vec<Bson>, usize)>> {
+    let (Ok(coll), Ok(pipeline)) = (inner.get_str("aggregate"), inner.get_array("pipeline")) else {
+        return Vec::new();
+    };
+    if !crate::hybrid::mentions_hybrid(pipeline) {
+        return Vec::new();
+    }
+    let Ok(prepared) = crate::hybrid::prepare_for_explain(pipeline.clone(), Some(coll)) else {
+        return Vec::new();
+    };
+    prepared
+        .iter()
+        .filter_map(Bson::as_document)
+        .filter_map(|d| d.get_document("$unionWith").ok())
+        .filter(|spec| spec.contains_key("coll"))
+        .map(|spec| {
+            let sub = spec.get_array("pipeline").ok()?;
+            if !super::hybrid::has_hybrid(&Bson::Array(sub.clone())) {
+                return None;
+            }
+            let prefix: Vec<Bson> = sub
+                .iter()
+                .take_while(|s| s.as_document().is_some_and(super::hybrid::is_user_stage))
+                .cloned()
+                .collect();
+            let listed = prefix
+                .iter()
+                .filter_map(Bson::as_document)
+                .map(|d| super::shape::listed_stage(d, "").len())
+                .sum();
+            Some((prefix, listed))
+        })
+        .collect()
 }
 
 /// The stages mongod lists for `pipeline` over `coll`: its explain's
