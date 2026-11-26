@@ -409,14 +409,26 @@ pub(crate) fn bucket_access(
             return Ok(BucketAccess::Unsure);
         }
     }
+    // An `$or` is planned under a SUBPLAN (measured 8.2.11, 2026-11-26):
+    // `v < 100 or v > 3900` beside `{v: 1}` has a branch no index bounds, so
+    // one scan of the buckets (63 after the delete, as with no index), and
+    // `v < 100 or v < 50` is one index scan.
     Ok(match plan::plan(&q, &catalog) {
+        Node::Subplan(inner) => access_of(*inner),
+        node => access_of(node),
+    })
+}
+
+/// How a bucket read goes through the plan `node`.
+fn access_of(node: Node) -> BucketAccess {
+    match node {
         Node::CollScan { .. } => BucketAccess::Scan,
         Node::Fetch { input, .. } => match *input {
             Node::IxScan(scan) => BucketAccess::Index(scan.index.name.clone()),
             _ => BucketAccess::Unsure,
         },
         _ => BucketAccess::Unsure,
-    })
+    }
 }
 
 /// `filter` with its `$_internalExpr` comparisons as the plain ones, and a
