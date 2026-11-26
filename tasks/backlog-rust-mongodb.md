@@ -2060,23 +2060,45 @@ cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: a time-series read over a collection with an
-      index of its own reads the collection at the command when the index
-      could serve it.** With an index `{v: 1}` beside the default one, a
-      filter naming `v` (or any `$expr` / `$text` / `$where` filter) reads
-      whole here, 3,999 after the delete, as this server keeps no copy of
-      that index over the buckets to plan with. mongod 8.2.11 plans it:
-      `{v: {$gte: 0}}` takes the buckets in order, 2,303; a selective one
-      may scan its index over the buckets (not measured). An unindexed
-      filter streams its buckets since 2026-11-25. So too a hint to any
-      index but the default one, and a read under a collation whose filter
-      holds a string or names the meta field (the bucket bounds and the
-      index over the buckets compare without the collation). An index
-      `createIndexes` adds is kept on the collection only, `dropIndexes`
-      leaves the bucket copy of `m_1_t_1` in place, and `collStats` still
-      reports index sizes of 0. Found while working RM-457, 2026-11-15.
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_of_its_own_index_buffers_as_mongod
+- [ ] **RUST MongoDB server: a time-series read beside a partial index, or
+      an `$expr` / `$text` / `$where` filter beside an index of its own,
+      still reads the collection at the command.** Since 2026-11-26 an
+      index of its own (an ascending / descending key, no partial filter,
+      collation or expiry) is kept over the buckets as mongod keeps it
+      (`{control.min.v: 1, control.max.v: 1}`, `ts_store::sync_bucket_indexes`
+      after `createIndexes` / `dropIndexes` / `collMod`) and a read plans
+      over it with this server's planner (`explain::bucket_access`): measured
+      8.2.11, `v < 100` and `v = 5` are an IXSCAN (`control.min.v` leads),
+      `v >= n` / `v > n` alone a COLLSCAN of the buckets in order (only the
+      second key field is bounded), a hint to any index over the buckets its
+      scan. What is left: a PARTIAL index (the bucket copy needs the filter
+      as `index_bucket_filter` writes it, and the planner `implies` over the
+      buckets): mongod leaves 1,913 after the delete for `v < 3000, v > 5`
+      beside `partialFilterExpression: {v: {$gt: 5}}`, here 2,993, the
+      collection read whole; a collated index (and a read under a collation
+      whose filter holds a string or names the meta field: the bucket bounds
+      and the index over the buckets compare without the collation); a TTL
+      or 2dsphere index (`{data.loc: "2dsphere_bucket"}`); an `$expr` /
+      `$text` / `$where` filter with any index of its own (mongod 2,303 after
+      the delete, the buckets in order, here 3,999); a read two indexes could
+      answer, or an `$or` / `$in` over one (mongod runs a trial between the
+      plans, `rejectedPlans`, and a filter on the time field with an index
+      candidate competes with the clustered scan: this server reads whole,
+      which matched mongod's 2,399 in the one case measured); `v > n` reads
+      as the buckets in order but mongod's count after the delete varies
+      between runs (2,294 to 2,298, here 2,292). Found while working RM-457,
+      2026-11-15.
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_beside_a_partial_index_scans_it_as_mongod, tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_expr_read_beside_an_index_of_its_own_buffers_as_mongod
       Backlog-ID: RM-701
+- [ ] **RUST MongoDB server: a time-series read of the meta field and the
+      time field together reads the buckets through the default index alone,
+      and mongod tries it against the clustered scan.** With the default
+      index only, `{m: {$gte: 0}, t: {$lt: <40 minutes in>}}` leaves 2,399
+      measurements after the delete on mongod 8.2.11 (3 of 3 runs: the trial
+      between the `m_1_t_1` scan and the bucket `_id` scan, `rejectedPlans:
+      1`, reads on), here 1,535. Found while working RM-701, 2026-11-26.
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_meta_and_time_read_is_tried_against_the_clustered_scan
+      Backlog-ID: RM-810
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
   `{$meta}` shape measured on 8.2.11 matches since 2026-10-17, except a
@@ -2957,6 +2979,24 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       Reported by the PostgreSQL session; test code unchanged.
       Verify: none -- intermittent on CI; the test itself is the check
       Backlog-ID: RM-803
+
+- [ ] **RUST MongoDB server: a standalone mongod store killed right after
+      a `createIndexes` does not open (2026-11-26).** `secantusd-mdb
+      --standalone` on the store of a standalone mongod 8.2.11 that was
+      SIGKILLed just after `create_index("v")` on a collection of 50
+      documents exits 1 with `failed to open storage ... Internal("app.c's
+      index v_1 is unfinished and names no build UUID")` (`adopt.rs`, the
+      RM-755 check): the catalog row has `ready: false` and no `buildUUID`.
+      mongod itself reopens such a store and rebuilds the index in the
+      foreground at startup, so this server should restart the build under a
+      build UUID of its own where the row names none, as it does for one that
+      does. 3 of 8 runs of the RM-808 test
+      (`test_secantus_opens_a_standalone_mongod_store_in_both_modes[killed]`)
+      fail so on an unmodified origin/rm-batch binary (f5ea08060 plus RM-658,
+      RM-660, RM-643), which is how the gate's `backlog` stage comes out red
+      about half the time. Found while gating RM-701.
+      Verify: none -- intermittent: the RM-808 test is the check (it reaches the unfinished row in about 3 runs of 8); a deterministic test needs the kill to land between the catalog row and its `ready` update
+      Backlog-ID: RM-811
 
 - [ ] **Stopping a gate run leaves its tests' reference mongods running
       (2026-11-25).** `scripts/detached_run.py stop` on a `gate_rm.py`

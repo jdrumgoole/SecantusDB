@@ -1289,6 +1289,15 @@ fn candidate_uses(
     }
 }
 
+/// How many indexes `q` could be answered through, each a plan mongod would
+/// try against the others (RM-701): more than one is a trial this planner
+/// has no documents to run.
+pub(crate) fn index_candidates(q: &Query, catalog: &[Arc<IndexInfo>]) -> usize {
+    let parts = clauses(q.canonical);
+    let leaves = leaves_of(&parts);
+    candidate_uses(&leaves, &parts, q, catalog).len()
+}
+
 /// The index access for a conjunction, if any index is worth reading.
 fn index_access(parts: &[Document], q: &Query, catalog: &[Arc<IndexInfo>]) -> Option<Access> {
     let leaves = leaves_of(parts);
