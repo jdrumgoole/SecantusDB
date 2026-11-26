@@ -746,13 +746,6 @@ These are explicit non-goals. Don't add them without a reason.
       falls within mongod's own run-to-run spread of its answer.
       Verify: none -- mongod's own answer varies between runs; no test can pin it
       Backlog-ID: RM-556
-- [ ] **A LIMIT over a GEO_NEAR stage reports no work counts.** mongod
-      8.2.11's LIMIT over GEO_NEAR_2D (`find` with `limit: 3`) reports
-      `works` (one more than its input's), `advanced` and `needTime`; this
-      server's LIMIT there prints none of them (the plan has no trial to
-      take them from, `exec::graft_work`). Found 2026-11-17 (RM-707).
-      Verify: tests/backlog/test_rm_found_rm707.py::test_a_limit_over_a_geo_near_reports_its_works
-      Backlog-ID: RM-714
 - [ ] **Some lines have no `numInterruptChecks`.** Since 2026-11-08 this
       server checks for interrupt where mongod 8.2 does, and counts it
       (`secantus_core::deadline::check_for_interrupt`): at dispatch, at
