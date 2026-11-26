@@ -3010,6 +3010,154 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a = 3)",
         ],
     ),
+    # Measured on a private PostgreSQL 15.20 cluster (2026-11-26, RP-966,
+    # fixed): VERBOSE over the Nested Loop a class constant leaves, each
+    # scan its physical target list and its quals prefixed, the class's
+    # equality on each key.
+    "explain verbose of a join a class constant fixes": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, k.b from e join k on e.a = k.a "
+        "where e.a = 3 and e.b <> 'x'",
+        [
+            "Nested Loop",
+            "  Output: e.b, k.b",
+            "  ->  Seq Scan on public.e",
+            "        Output: e.a, e.b",
+            "        Filter: ((e.b <> 'x'::text) AND (e.a = 3))",
+            "  ->  Index Scan using k_pkey on public.k",
+            "        Output: k.a, k.b",
+            "        Index Cond: (k.a = 3)",
+        ],
+    ),
+    # Measured likewise: an Index Only Scan returns its index's column, and
+    # the costs are the plain plan's.
+    "explain verbose of a class constant join over an index only scan": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain verbose select e.b from e join k on e.a = k.a where k.a = 3",
+        [
+            "Nested Loop  (cost=0.28..25.80 rows=1 width=3)",
+            "  Output: e.b",
+            "  ->  Seq Scan on public.e  (cost=0.00..17.50 rows=1 width=7)",
+            "        Output: e.a, e.b",
+            "        Filter: (e.a = 3)",
+            "  ->  Index Only Scan using k_pkey on public.k  (cost=0.28..8.29 rows=1 width=4)",
+            "        Output: k.a",
+            "        Index Cond: (k.a = 3)",
+        ],
+    ),
+    # Measured likewise: a chain's join keeps a column only while an ON
+    # clause reading it reaches outside the join -- `e.a` for `k2.a =
+    # e.a`, never `k.a` -- as `generate_base_implied_equalities_const`
+    # adds no Vars of its own.
+    "explain verbose of a three-way join a class constant fixes": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, k.b from e join k on e.a = k.a "
+        "join k k2 on k2.a = e.a where e.a = 3",
+        [
+            "Nested Loop",
+            "  Output: e.b, k.b",
+            "  ->  Nested Loop",
+            "        Output: e.b, e.a, k.b",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.a, e.b",
+            "              Filter: (e.a = 3)",
+            "        ->  Index Scan using k_pkey on public.k",
+            "              Output: k.a, k.b",
+            "              Index Cond: (k.a = 3)",
+            "  ->  Index Only Scan using k_pkey on public.k k2",
+            "        Output: k2.a",
+            "        Index Cond: (k2.a = 3)",
+        ],
+    ),
+    "explain verbose of a four-way join a class constant fixes": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b, e2.b from e join k on e.a = k.a "
+        "join e e2 on e2.a = k.a join k k3 on k3.a = e2.a where e.a = 7",
+        [
+            "Nested Loop",
+            "  Output: e.b, e2.b",
+            "  ->  Nested Loop",
+            "        Output: e.b, e2.b, e2.a",
+            "        ->  Nested Loop",
+            "              Output: e.b, k.a",
+            "              ->  Seq Scan on public.e",
+            "                    Output: e.a, e.b",
+            "                    Filter: (e.a = 7)",
+            "              ->  Index Only Scan using k_pkey on public.k",
+            "                    Output: k.a",
+            "                    Index Cond: (k.a = 7)",
+            "        ->  Seq Scan on public.e e2",
+            "              Output: e2.a, e2.b",
+            "              Filter: (e2.a = 7)",
+            "  ->  Index Only Scan using k_pkey on public.k k3",
+            "        Output: k3.a",
+            "        Index Cond: (k3.a = 7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (2026-11-26, found
+    # while working RP-966): a constant on the left of its equality joins
+    # the class too, every member's equality rebuilt `member = constant`.
+    "a class constant on the left of its equality is the class's": (
+        "RP-1137",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e join k on e.a = k.a where 3 = e.a",
+        [
+            "Nested Loop",
+            "  ->  Seq Scan on e",
+            "        Filter: (a = 3)",
+            "  ->  Index Scan using k_pkey on k",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    # Measured likewise: an ORDER BY and LIMIT, or a second ON equality,
+    # keep the Nested Loop a class constant leaves.
+    "a class constant join under a limit is a nested loop": (
+        "RP-1138",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e join k on e.a = k.a "
+        "where e.a = 3 order by e.b limit 2",
+        [
+            "Limit",
+            "  ->  Sort",
+            "        Sort Key: e.b",
+            "        ->  Nested Loop",
+            "              ->  Seq Scan on e",
+            "                    Filter: (a = 3)",
+            "              ->  Index Scan using k_pkey on k",
+            "                    Index Cond: (a = 3)",
+        ],
+    ),
+    "a class constant join beside a second on equality is a nested loop": (
+        "RP-1138",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e join k on e.a = k.a "
+        "and e.b = k.b where e.a = 3",
+        [
+            "Nested Loop",
+            "  Join Filter: (e.b = k.b)",
+            "  ->  Seq Scan on e",
+            "        Filter: (a = 3)",
+            "  ->  Index Scan using k_pkey on k",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    # Measured likewise: the scan is priced for the two quals it prints.
+    "a class constant scan beside another qual is priced for its two quals": (
+        "RP-1139",
+        _ANALYSED,
+        "explain select e.b, k.b from e join k on e.a = k.a where e.a = 3 and e.b <> 'x'",
+        [
+            "Nested Loop  (cost=0.28..28.30 rows=1 width=6)",
+            "  ->  Seq Scan on e  (cost=0.00..20.00 rows=1 width=7)",
+            "        Filter: ((b <> 'x'::text) AND (a = 3))",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
     # Measured on a private PostgreSQL 15.20 cluster (found while working
     # RP-1065): the class's equality keeps the place of the class's first
     # source clause among the scan's quals.
