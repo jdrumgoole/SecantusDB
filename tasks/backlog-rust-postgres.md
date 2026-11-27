@@ -1205,54 +1205,37 @@ one beside it.
       Verify: none -- intermittent (2 of 11 runs), not reproducible on demand; the test named above is where it shows
       Backlog-ID: RP-1081
 
-- [ ] **OPEN — the catalog-latency ratio tests fail at their thresholds on
-      CI's runner (2026-11-25).** `tests/backlog/test_rp_catalog_latency.py`
-      compares ratios so that its verdicts would hold on any runner, but the
-      ratios themselves differ by runner. Twice in one day a snapshot PR's
-      `pg-oracle (backlog)` job failed one of them at the edge, and each time
-      the same tests passed on the snapshot before:
-      RP-911's 800-table pair (22.1 ms against 25.1 ms, 1.14 over its 1.10;
-      PR #2992 at `ec891bbfc`, run 45595956409), then RP-715's
-      first-against-warm (83 ms against 3 x 21 ms + 20 ms = 83 ms; PR #2992
-      at `47b7dbed4`, run 45662413394). Locally (debug `secantusd-pg`, arm64
-      macOS, five runs of each tree interleaved) RP-715's pair is 14.0-14.2 ms
-      first and 6.2-6.5 ms warm on `pg-batch` at `672bed686`, against
-      13.1-13.4 ms and 5.6-5.7 ms on `main`'s server code, so the batch moved
-      neither ratio (2.3 against 2.4, limit 39 ms). CI's runner gives about
-      4. The batch did add about 0.6-0.8 ms to both queries (7-11%), from
-      commits not yet split out (RP-291's and RP-292's catalog changes touch
-      this path). Decide what the comparison should hold to on a slow
-      runner: more interleaved rounds, the median of several fastest-of-N
-      pairs, or a threshold measured on CI's own runner shape. Then bisect
-      the 0.6 ms. Do not just widen a threshold until it passes.
-      A third, the same evening: RP-1073's new 3,200-table pair, a median
-      of 25.3 ms with no other table against 31.4 ms with 3,200 (ratio
-      median 1.22, rounds 1.04 to 1.60, over its 1.10 plus 1 ms; PR #2998 at
-      `432c8ec3e`, RP-1065's EXPLAIN-only change, run 45711355695), where
-      the snapshot before (#2996, which carried RP-1073) passed it and the
-      local debug build measures 13.1 ms against 14.3 ms (1.10).
-      A fourth, after the sorted name index (`487548600`, locally a ratio
-      median of 1.02): the same 3,200-table test on a MongoDB-only PR
-      (#3085 at `ca4bcfa1`, RM-636, which changes only
-      `crates/secantus-core/src/docstore.rs`; run 46029656831, job
-      140610095715, the only failure of 5,704), a median of 27.7 ms with
-      no other table against 31.6 ms with 3,200, ratio median 1.14, rounds
-      0.82 to 1.28 (2026-11-27). So on CI's runner the fix left the ratio
-      near 1.1 where locally it is 1.02: either the runner's noise spans
-      the bound or some growth CI sees is not seen on arm64 macOS.
-      A fifth, the next snapshot but one (#3087 at `74aef8b8`, RP-1121's
-      EXPLAIN VERBOSE change; run 46042159284, job 140652457171): 26.9 ms
-      against 31.0 ms, ratio median 1.15, rounds 0.91 to 1.20; #3086
-      between them passed. Two of the last three CI runs now fail it.
-      A sixth, two snapshots on (#3089 at `c7c3ac8d`, RP-1086's INSERT ...
-      SELECT record coercion, nowhere near the catalog; run 46053786106,
-      job 140691365217, 1 failed of 5,734): 32.6 ms against 36.0 ms,
-      ratio median 1.14, rounds 0.79 to 1.32. Three CI medians in a row
-      at 1.14-1.15 (3.4-4.1 ms more at 3,200 tables, about 1.2 ms per
-      thousand) where arm64 macOS measures 1.02 (0.3 ms) suggest a real
-      growth on Linux x86_64 that this Mac does not show, not only noise;
-      it wants a profile on Linux.
-      Verify: none -- intermittent on CI; RP-715's, RP-911's and RP-1073's tests are the check
+- [ ] **OPEN — the first catalog query after DDL still grows with the
+      schema on CI's x86_64 runner, and RP-715's first-against-warm pair
+      was never explained (2026-11-25, narrowed 2026-11-27).**
+      `tests/backlog/test_rp_catalog_latency.py`'s 3,200-table pair
+      (RP-1073) failed six CI runs at ratio medians of 1.14 to 1.22 over its
+      1.10 (PRs #2998, #3085, #3087, #3089 among them), and RP-911's
+      800-table pair once (1.14, PR #2992), while arm64 macOS measured 1.02.
+      Measured on CI's own runner (AMD EPYC 9V74, 4 vCPU, debug build,
+      branch `rp-1100-diag`, 2026-11-27): 1.13 to 1.16 with the test ALONE
+      on an idle runner, and the same beside three CPU hogs, so it was real
+      growth, not contention: 18.8 ms with no other table, 20.1 with 800,
+      21.9 with 1,600, 24.2 with 3,200. `perf` over the timed queries only
+      found the keyed `pg_attribute` read walking every definition to
+      compare its name with the oid's few (`Vec<u8>` equality, 1,087 more
+      samples of 300 queries), and the parse memo adding up every key's
+      length on each new text (`sql_relations` -> `parse_tree`). With both
+      fixed the pair measured 1.06 to 1.07 on CI (three runs, 2026-11-27).
+      What still grows, from the same profile (inclusive samples gained at
+      3,200 tables over 300 queries, about 2,500 of 37,000 left): the
+      statement's own catalog scan, `CatalogRows::filtered` running
+      `query::matches` over every row of a table it built (+292, under
+      `virtual_rows`); `publish_user_types` (+501), in which
+      `set_relation_keys` drops the previous version's sorted names and
+      definitions (+183: `TableIds`' `Arc::make_mut` copies all of
+      `sorted`'s strings each version, because `RelationKeys` shares it)
+      and `object_comments_builder` collects every comment (+109).
+      PostgreSQL reads each through an index and invalidates only the
+      entries a commit names. RP-715's first-against-warm failure (83 ms
+      against 3 x 21 ms + 20 ms, PR #2992 at `47b7dbed4`) is a different
+      comparison and was not looked at again.
+      Verify: none -- measured only on CI's x86_64 runner (the diagnostic workflow on `rp-1100-diag`); RP-715's, RP-911's and RP-1073's tests are the check
       Backlog-ID: RP-1100
 
 ## Found by a CI run (2026-11-07)

@@ -5157,8 +5157,11 @@ fn parse_tree(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResul
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
     const MAX_ENTRIES: usize = 4096;
-    static MEMO: OnceLock<Mutex<HashMap<String, Arc<pg_query::protobuf::ParseResult>>>> =
-        OnceLock::new();
+    /// The trees by text, and the bytes of text they hold: kept as the
+    /// entries come and go, since adding up every key's length on each
+    /// parse walked the whole memo (RP-1100).
+    type Memo = (HashMap<String, Arc<pg_query::protobuf::ParseResult>>, usize);
+    static MEMO: OnceLock<Mutex<Memo>> = OnceLock::new();
     thread_local! {
         /// The tree last answered on this thread, by its text compared in
         /// place: a statement run over and over is not hashed each time
@@ -5166,7 +5169,7 @@ fn parse_tree(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResul
         static LAST: std::cell::RefCell<Option<(String, Arc<pg_query::protobuf::ParseResult>)>> =
             const { std::cell::RefCell::new(None) };
     }
-    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    let memo = MEMO.get_or_init(|| Mutex::new((HashMap::new(), 0)));
     cancel::check()?;
     if let Some(tree) = LAST.with(|l| {
         l.borrow()
@@ -5176,7 +5179,7 @@ fn parse_tree(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResul
     }) {
         return Ok(tree);
     }
-    if let Some(tree) = memo.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
+    if let Some(tree) = memo.lock().unwrap_or_else(|e| e.into_inner()).0.get(sql) {
         let tree = Arc::clone(tree);
         LAST.with(|l| *l.borrow_mut() = Some((sql.to_string(), Arc::clone(&tree))));
         return Ok(tree);
@@ -5199,11 +5202,14 @@ fn parse_tree(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResul
         return Ok(tree);
     }
     let mut guard = memo.lock().unwrap_or_else(|e| e.into_inner());
-    let held: usize = guard.keys().map(String::len).sum();
-    if guard.len() >= MAX_ENTRIES || held + sql.len() > MAX_TEXT_BYTES {
-        guard.clear();
+    let (trees, held) = &mut *guard;
+    if trees.len() >= MAX_ENTRIES || *held + sql.len() > MAX_TEXT_BYTES {
+        trees.clear();
+        *held = 0;
     }
-    guard.insert(sql.to_string(), Arc::clone(&tree));
+    if trees.insert(sql.to_string(), Arc::clone(&tree)).is_none() {
+        *held += sql.len();
+    }
     Ok(tree)
 }
 
