@@ -6948,6 +6948,53 @@ impl PgHandler {
                     .collect()
             });
         }
+        // The attnums of a composite with a dropped attribute, which its
+        // binary image keeps a slot for (`record_image`, RP-976): a
+        // standalone type's from its document, a table row type's from the
+        // table's definition.
+        {
+            let docs = Arc::clone(&composite_docs);
+            let tables = Arc::clone(&table_defs);
+            secantus_pgplan::defer_user_composite_slots(move || {
+                let altered: HashMap<&str, &TableDef> = tables
+                    .iter()
+                    .filter(|t| !t.dropped_attnums().is_empty())
+                    .map(|t| (t.name.as_str(), t.as_ref()))
+                    .collect();
+                docs.iter()
+                    .filter_map(|d| {
+                        let schema = d.get_str("schema").unwrap_or("public");
+                        let name = d.get_str("composite").ok()?;
+                        let slots = if d.get_bool("relation").unwrap_or(false) {
+                            let def = altered.get(d.get_str("_id").ok()?)?;
+                            let attnums = (0..def.columns.len())
+                                .map(|i| usize::try_from(def.attnum(i)).ok())
+                                .collect::<Option<Vec<_>>>()?;
+                            (attnums, usize::try_from(def.natts()).ok()?)
+                        } else {
+                            let ints = |k: &str| -> Vec<usize> {
+                                d.get_array(k)
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(bson_i64)
+                                            .filter_map(|n| usize::try_from(n).ok())
+                                            .collect()
+                                    })
+                                    .unwrap_or_default()
+                            };
+                            let dropped = ints("dropped");
+                            if dropped.is_empty() {
+                                return None;
+                            }
+                            let attnums = ints("attnums");
+                            let natts = attnums.iter().chain(&dropped).copied().max()?;
+                            (attnums, natts)
+                        };
+                        Some((Self::type_resolution(schema, name), slots))
+                    })
+                    .collect()
+            });
+        }
         secantus_pgplan::defer_standalone_composites(move || {
             composite_docs
                 .iter()

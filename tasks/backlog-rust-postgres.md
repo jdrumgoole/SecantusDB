@@ -2824,32 +2824,39 @@ gap tests are in `tests/backlog/test_rp_found_rp532.py`.
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp590.py`.
 
-- [ ] **The `record_image` operators refuse some field types, and image a
-      composite with a dropped attribute wrongly.** `*=` .. `*>=` compare a
+- [ ] **The `record_image` operators refuse an anonymous `record` field,
+      and some other field types.** `*=` .. `*>=` compare a
       record's fields by their binary images (RP-650): the scalar types in
       `record_image.rs`, json and xml (their text as written, 2026-11-25),
       jsonb (its `JsonbContainer`), the ranges and multiranges, built-in or
       user, over a subtype the module models (`range_serialize`'s
       `datum_write` layout, 2026-11-25), named composites (the
-      `HeapTupleHeader` `heap_form_tuple` builds) and arrays of any of
-      those but bit / varbit are modelled. Every other type is 0A000 `a
-      record_image comparison over a field of type ... is not supported
-      yet` (point, tsvector and the other geometric and text-search types
-      among them). Remaining, measured on PostgreSQL 15.20: an anonymous
-      `record` field (its image carries the typmod the session blessed its
-      row type with, `assign_record_type_typmod`, so two records of
-      different field types order by blessing order), and a WRONG answer,
-      not a refusal: a composite whose type has a dropped attribute
-      (`ALTER TYPE ... DROP ATTRIBUTE`, or a table's row type after `ALTER
-      TABLE ... DROP COLUMN`). Its `t_infomask2` counts the dropped slot
-      and its NULL bitmap always marks it, so `row(row(null, 'a')::cx) *<
-      row(row(1, 'a')::cx)` is true on 15.20 and false here: the planner
-      holds only the live fields (`CompositeType`), not the `attnums` and
-      `dropped` slots the composite catalog document keeps
-      (`composite_alter.rs`), so the value is imaged as though never
-      altered. The fix hands those slots to `composite_image`.
-      Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_over_still_refused_field_types, tests/backlog/test_rp_found_rp590.py::test_record_image_over_a_composite_with_a_dropped_attribute
+      `HeapTupleHeader` `heap_form_tuple` builds, a dropped attribute's
+      slot included, 2026-11-27) and arrays of any of those but bit /
+      varbit are modelled. Every other type is 0A000 `a record_image
+      comparison over a field of type ... is not supported yet` (point,
+      tsvector and the other geometric and text-search types among them).
+      Remaining, measured on PostgreSQL 15.20: an anonymous `record` field
+      (its image carries the typmod the session blessed its row type with,
+      `assign_record_type_typmod`, so two records of different field types
+      order by blessing order).
+      Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_over_still_refused_field_types
       Backlog-ID: RP-976
+- [ ] **A row-constructor comparison with a `record_image` operator over a
+      composite field is 42883.** `select row(v) *< row(v) from tca` (`v` of
+      composite type `ca`) is `operator does not exist: ca *< ca` here, and
+      `row(t1) *< row(t2)` over two whole-row references of one table is
+      `unknown *< unknown`; PostgreSQL 15.20 answers both (false, and the
+      images' order). `make_row_comparison_op` looks the operator up per
+      column, and `ca *< ca` resolves to `record *< record` because a
+      composite coerces to `record`; here the per-column lookup does not
+      try that coercion, and a whole-row reference inside a row
+      constructor is typed `unknown`. The `(select row(...))` form, which
+      is one record operand rather than a row constructor, already
+      answers. A row constructor over scalar fields (`row(1, 'a'::text) *<
+      row(2, 'a'::text)`) is 42883 on PostgreSQL too, as here.
+      Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_row_compare_over_a_composite_field
+      Backlog-ID: RP-1174
 
 ## Found while working RP-569 (2026-11-08)
 

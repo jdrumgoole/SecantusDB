@@ -40044,6 +40044,30 @@ pub fn defer_user_composite_widths(build: impl FnOnce() -> CompositeWidths + 'st
     PLAN_COMPOSITE_WIDTHS.with(|t| t.defer(build));
 }
 
+/// A composite's attribute layout, by resolution name, for a type that
+/// has a dropped attribute (`ALTER TYPE ... DROP ATTRIBUTE`, or a table's
+/// row type after `ALTER TABLE ... DROP COLUMN`): each live field's
+/// attnum, and `natts`, every attnum the type has used, the dropped slots
+/// included. A type absent from the map numbers its fields 1..n.
+pub type CompositeSlots = std::collections::HashMap<String, (Vec<usize>, usize)>;
+
+thread_local! {
+    /// The composites with a dropped attribute, as [`CompositeSlots`].
+    static PLAN_COMPOSITE_SLOTS: deferred::Slot<CompositeSlots> = deferred::Slot::default();
+}
+
+/// The composites' attribute layouts `build` lists, at the first lookup
+/// (see [`deferred`]).
+pub fn defer_user_composite_slots(build: impl FnOnce() -> CompositeSlots + 'static) {
+    PLAN_COMPOSITE_SLOTS.with(|t| t.defer(build));
+}
+
+/// A composite's `(attnums, natts)` when it has a dropped attribute.
+pub(crate) fn user_composite_slots(name: &str) -> Option<(Vec<usize>, usize)> {
+    let target = canonical_type_ref(name);
+    deferred::read(&PLAN_COMPOSITE_SLOTS, |t| t.get(&target).cloned())
+}
+
 /// A composite's field widths, found as `user_composite` finds the type.
 fn user_composite_widths(name: &str) -> Option<Vec<Option<usize>>> {
     let target = canonical_type_ref(name);

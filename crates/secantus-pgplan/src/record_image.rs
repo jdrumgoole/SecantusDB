@@ -431,9 +431,10 @@ const HEAP_HASVARWIDTH: u16 = 0x0002;
 /// the fields as `heap_fill_tuple` lays them: a by-value or fixed-length
 /// field at its alignment, a varlena of at most 126 data bytes with a
 /// 1-byte header and no alignment, a longer one aligned with its 4-byte
-/// header. Offsets count from the tuple's start. A composite whose type
-/// carries a dropped attribute is not told apart here (the planner keeps
-/// only the live fields).
+/// header. Offsets count from the tuple's start. A type with a dropped
+/// attribute keeps its slot: `t_infomask2` counts it, and the NULL bitmap
+/// always marks it absent, as `heap_form_tuple` builds the value from the
+/// type's whole `TupleDesc` (measured on PostgreSQL 15.20).
 fn composite_image(v: &Bson, ty: &str) -> Option<Vec<u8>> {
     let oid = crate::user_composite_oid(ty)?;
     let defs = crate::user_composite_fields(ty)?;
@@ -441,8 +442,12 @@ fn composite_image(v: &Bson, ty: &str) -> Option<Vec<u8>> {
     if fields.len() != defs.len() {
         return None;
     }
-    let natts = fields.len();
-    let has_nulls = fields.iter().any(|f| matches!(f, Bson::Null));
+    let (attnums, natts) = match crate::user_composite_slots(ty) {
+        Some((attnums, natts)) if attnums.len() == fields.len() => (attnums, natts),
+        Some(_) => return None,
+        None => ((1..=fields.len()).collect(), fields.len()),
+    };
+    let has_nulls = natts > fields.len() || fields.iter().any(|f| matches!(f, Bson::Null));
     let bitmap = if has_nulls { natts.div_ceil(8) } else { 0 };
     let hoff = (23 + bitmap).div_ceil(8) * 8;
     let mut data: Vec<u8> = Vec::new();
@@ -479,9 +484,10 @@ fn composite_image(v: &Bson, ty: &str) -> Option<Vec<u8>> {
     out.push(hoff as u8);
     if has_nulls {
         let mut bits = vec![0u8; bitmap];
-        for (i, f) in fields.iter().enumerate() {
+        for (f, n) in fields.iter().zip(&attnums) {
             if !matches!(f, Bson::Null) {
-                bits[i / 8] |= 1 << (i % 8);
+                let i = n.checked_sub(1)?;
+                *bits.get_mut(i / 8)? |= 1 << (i % 8);
             }
         }
         out.extend(bits);
@@ -891,7 +897,7 @@ fn numeric_image(text: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{array_image, jsonb_image, multirange_image, numeric_image};
+    use super::{array_image, composite_image, jsonb_image, multirange_image, numeric_image};
 
     fn jsonb(text: &str) -> Vec<u8> {
         jsonb_image(&crate::json::parse(text).unwrap()).unwrap()
@@ -979,5 +985,37 @@ mod tests {
         );
         // 0.0001: weight -1, digit 1.
         assert_eq!(numeric_image("0.0001"), Some(vec![0x7F, 0x82, 1, 0]));
+    }
+    #[test]
+    fn composite_images_keep_a_dropped_attribute_slot() {
+        // `create type cx as (a int, b int, c text); alter type cx drop
+        // attribute b`: attnums 1 and 3, natts 3.
+        crate::set_user_composites(vec![(
+            "cx".to_string(),
+            90001,
+            vec![
+                ("a".to_string(), "int4".to_string()),
+                ("c".to_string(), "text".to_string()),
+            ],
+        )]);
+        crate::defer_user_composite_slots(|| {
+            [("cx".to_string(), (vec![1, 3], 3))].into_iter().collect()
+        });
+        let record = |a: bson::Bson| {
+            bson::Bson::Document(bson::doc! {
+                crate::RECORD_KEY: [a, "a"],
+            })
+        };
+        let full = composite_image(&record(bson::Bson::Int32(1)), "cx").unwrap();
+        // t_infomask2 counts three attributes; HEAP_HASNULL | HEAP_HASVARWIDTH.
+        assert_eq!(&full[14..16], &3u16.to_le_bytes());
+        assert_eq!(&full[16..18], &3u16.to_le_bytes());
+        // t_hoff 24, and the bitmap marks attnums 1 and 3 only.
+        assert_eq!(full[18], 24);
+        assert_eq!(full[19], 0b101);
+        let null_a = composite_image(&record(bson::Bson::Null), "cx").unwrap();
+        assert_eq!(null_a[19], 0b100);
+        // So `row(null, 'a')::cx` images below `row(1, 'a')::cx`.
+        assert!(null_a < full);
     }
 }
