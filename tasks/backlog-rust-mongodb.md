@@ -677,12 +677,13 @@ These are explicit non-goals. Don't add them without a reason.
       global IS twice for each read of their collection, under no lock of
       the command's. Still different,
       measured against a one-member replica set:
-      - an `insert` of several documents one of which fails: mongod inserts
-        them again a document at a time, each under a transition, global,
-        database and collection lock of its own
-        (`insertBatchAndHandleErrors`), and counts an interrupt check for
-        each lock; this server takes no such rounds, and its line prints no
-        `numInterruptChecks` (RM-360);
+      - an `insert` of 64 documents or more (measured at 64 and 70, failing
+        or not): mongod takes one more round of the transition, global,
+        database and collection locks in IS; this server takes none (the
+        one-at-a-time rounds after a failed batch match since 2026-11-27);
+      - an `insert` whose batch fails counts an interrupt check for each
+        lock on mongod; this server's line prints no `numInterruptChecks`
+        (RM-360);
       - a profiled `update` or `delete` statement's entry's locks are taken
         without interrupt checks here (the command's `numInterruptChecks`
         is mongod's without them);

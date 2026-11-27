@@ -507,6 +507,20 @@ _MATCHING_WRITES = {
     # A global IS alone, then the collection in X twice in one write round
     # (measured 2026-11-16).
     "collMod": lambda d: d.command("collMod", "c", writeConcern={"w": 1}),
+    # A batch of several documents that fails is inserted again a document
+    # at a time, in rounds that end at each failure; an unordered batch
+    # opens a new round for the documents after one, and a retryable
+    # write's documents each write the session's row (measured 2026-11-27).
+    "insert of three, one a duplicate": lambda d: _insert_with_a_duplicate(_plain(d)),
+    "ordered insert of three, one a duplicate": lambda d: _insert_with_a_duplicate(
+        _plain(d), ordered=True
+    ),
+    "insert of four, two duplicates": lambda d: _insert_with_a_duplicate(
+        _plain(d), docs=[{"_id": 200}, {"_id": 1}, {"_id": 201}, {"_id": 2}]
+    ),
+    "retryable insert, a duplicate last": lambda d: _insert_with_a_duplicate(
+        d, ordered=True, docs=[{"_id": 200}, {"_id": 201}, {"_id": 1}]
+    ),
 }
 
 
@@ -529,7 +543,9 @@ def test_a_write_reports_mongods_locks_and_flow_control(
     transition lock (`setLastOpToSystemLastOpTime`, measured 2026-11-12);
     this server did not. A `collMod` takes the global IS alone, then the
     collection in X twice under one write round (measured 2026-11-16); this
-    server took the plain chain once."""
+    server took the plain chain once. An insert of several documents one of
+    which fails takes a round for each run of the documents inserted again
+    one at a time (measured 2026-11-27); this server took one round."""
     answers = _write_locks(rust_mongo, mongod_rs, _MATCHING_WRITES[name])
     assert answers["mongod"]
     assert answers["rust"] == answers["mongod"]
@@ -537,17 +553,20 @@ def test_a_write_reports_mongods_locks_and_flow_control(
 
 #: Writes whose locks are not mongod's yet (RM-357's remainder).
 _DIVERGING_WRITES = {
-    # mongod inserts a batch again a document at a time once one fails,
-    # each under a transition, global, database and collection lock of its
-    # own (`insertBatchAndHandleErrors`); this server takes no such rounds.
-    "insert of three, one a duplicate": lambda d: _insert_with_a_duplicate(d),
+    # mongod takes the transition, global, database and collection locks
+    # in IS once more for a batch of 64 documents, failing or not
+    # (measured 8.2.11, 2026-11-27); this server takes no such round.
+    "insert of sixty-four": lambda d: _plain(d).c.insert_many(
+        [{"_id": 300 + n} for n in range(64)]
+    ),
 }
 
 
-def _insert_with_a_duplicate(d: Any) -> None:
+def _insert_with_a_duplicate(d: Any, ordered: bool = False, docs: list | None = None) -> None:
     # The duplicate's failure is the point: the lines are what is compared.
+    docs = docs or [{"_id": 200}, {"_id": 1}, {"_id": 201}]
     with contextlib.suppress(pymongo.errors.BulkWriteError):
-        _plain(d).c.insert_many([{"_id": 200}, {"_id": 1}, {"_id": 201}], ordered=False)
+        d.c.insert_many(docs, ordered=ordered)
 
 
 _LOOKUP = {"from": "c", "localField": "_id", "foreignField": "_id", "as": "j"}
