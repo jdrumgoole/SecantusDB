@@ -6570,6 +6570,7 @@ impl PgHandler {
                 .collect(),
         );
         secantus_pgplan::set_views(views);
+        secantus_pgplan::set_security_barrier_views(self.security_barrier_views());
         secantus_pgplan::view_dml::set_checked_views(checked);
         secantus_pgplan::view_dml::set_view_defaults(self.view_column_defaults());
         self.publish_tableoids();
@@ -18371,6 +18372,23 @@ impl PgHandler {
             })
             .chain(self.partition_defaults())
             .collect()
+    }
+
+    /// The views whose options mark them `security_barrier`, which the
+    /// planner does not pull up into a query that reads them (RP-1106).
+    fn security_barrier_views(&self) -> Vec<String> {
+        self.type_catalog_docs(Self::VIEW_COLLECTION)
+            .map(|docs| {
+                docs.iter()
+                    .filter(|d| {
+                        d.get_document("options")
+                            .is_ok_and(|o| o.get_str("security_barrier") == Ok("true"))
+                    })
+                    .filter_map(|d| d.get_str("view").or_else(|_| d.get_str("_id")).ok())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// `ALTER VIEW ... SET (security_invoker = true)`: the view's reads are

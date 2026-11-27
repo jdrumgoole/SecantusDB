@@ -2107,20 +2107,71 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a class constant scan beside another qual is priced for its two quals]
       Backlog-ID: RP-1139
 
-- [ ] **A LEFT JOIN to a view or a CTE nothing reads is not removed.**
-      `explain (costs off) select e.b from e left join kv on kv.a = e.a`
-      (`kv` the view `select * from k`, `k.a` the primary key) is a `Hash
-      Left Join` over `Subquery Scan on kv` here; PostgreSQL (a private
-      15.20 cluster) pulls the view up into `k` and removes the join,
-      printing `Seq Scan on e` alone. `with k as (select 1 as a) select e.b
-      from e left join k on k.a = e.a` is removed there too: the CTE is
-      inlined, and a subquery of one row is distinct on any column
-      (`query_is_distinct_for`). RP-1060's removal (`join_removal.rs`)
-      takes only a plain table as the inner side; a pulled-up view, a
-      subquery's distinctness and a NATURAL join are what is left. Found
-      while working RP-1060.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join to a view nothing reads is removed], tests/backlog/test_rp_explain_costs.py::test_plan[a left join to a one-row cte nothing reads is removed]
+- [ ] **A LEFT JOIN nothing reads, to a subquery distinct on its ON or by
+      NATURAL, is not removed.** A view, an inlined CTE and a FROM subquery
+      over one table are pulled up and their join removed as a table's is,
+      and one with no FROM (a single row) whatever its ON (RP-1106,
+      `join_removal.rs`). Left: `explain (costs off) select e.b from e left
+      join (select distinct a from e) s on s.a = e.a` is a `Hash Left Join`
+      over `Subquery Scan on s` here; PostgreSQL (a private 15.20 cluster)
+      prints `Seq Scan on e`, the subquery distinct on `a`
+      (`query_is_distinct_for`: DISTINCT, GROUP BY, a set operation, an
+      aggregate with no GROUP BY). `select e.b from e natural left join k`
+      is removed there too, the NATURAL columns read as its ON's
+      equalities. And `select e.b, s.a from e left join (select 1 as a) s on
+      true` is `Seq Scan on e` there, `s.a` a PlaceHolderVar evaluated at
+      the scan: an ON that folds to TRUE removes a one-row join even when
+      its columns are read (`remove_useless_results_recurse`), which needs
+      them substituted into the query. Found while working RP-1060.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join to a distinct subquery nothing reads is removed], tests/backlog/test_rp_explain_costs.py::test_plan[a natural left join nothing reads is removed], tests/backlog/test_rp_explain_costs.py::test_plan[a left join on true to a one-row subquery the query reads is removed]
       Backlog-ID: RP-1106
+
+- [ ] **CREATE VIEW drops its WITH options.** `create view v with
+      (check_option = local) as select * from t where a > 0` then `insert
+      into v values (-1)` inserts the row here; PostgreSQL 15.20 refuses it
+      (`44000`, `new row violates check option for view "v"`). The
+      `ViewStmt`'s `options` are never read by `plan_create_view`, so
+      `security_barrier` and `security_invoker` given there are dropped too
+      (`ALTER VIEW ... SET` records all three). A security barrier view
+      created that way is then pulled up into a join that reads it, and a
+      LEFT JOIN to it removed, where PostgreSQL keeps it a subquery.
+      Found while working RP-1106.
+      Verify: tests/backlog/test_rp_found_rp1106.py::test_create_view_with_check_option_refuses_a_row_it_cannot_show
+      Backlog-ID: RP-1155
+
+- [ ] **`pg_class.reloptions` is NULL for every user view.** After `alter
+      view w set (security_barrier)`, `select reloptions from pg_class where
+      relname = 'w'` is NULL here; PostgreSQL 15.20 prints
+      `{security_barrier=true}` (and `{check_option=local}` for a view
+      created `WITH LOCAL CHECK OPTION`). `catalog_fill.rs` answers only the
+      three system views `system_views.sql` creates with an option. Found
+      while working RP-1106.
+      Verify: tests/backlog/test_rp_found_rp1106.py::test_a_views_options_are_its_reloptions
+      Backlog-ID: RP-1156
+
+- [ ] **A join to a view, or to a subquery of a join, prints its ON in the
+      wrong place.** `explain (costs off) select e.b, kv.b from e left join
+      kv on kv.a = e.a` (`kv` the view `select * from k`) prints `Hash Left
+      Join` with no `Hash Cond` over `Subquery Scan on kv`; PostgreSQL (a
+      private 15.20 cluster) pulls the view up and prints `Hash Cond: (e.a =
+      k.a)` over `Seq Scan on k`. `select e.b from e left join (select k.a
+      from k join u on u.a = k.a) s on s.a = e.a` prints the outer ON,
+      `Hash Cond: (s.a = e.a)`, on the subquery's own join of `k` and `u`,
+      whose cond is `(k.a = u.a)` there. The rows are right; the plan is
+      not. Found while working RP-1106.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join to a view a query reads hashes on its on], tests/backlog/test_rp_explain_costs.py::test_plan[a left join to a subquery of a join keeps each on in its join]
+      Backlog-ID: RP-1157
+
+- [ ] **A MATERIALIZED CTE is planned as a subquery.** `explain (costs
+      off) with c as materialized (select 1 as a) select e.b from e left
+      join c on c.a = e.a` prints `Subquery Scan on c` over `Result`, and no
+      `Hash Cond`; PostgreSQL (a private 15.20 cluster) prints `CTE c` above
+      the join's sides and `CTE Scan on c`, as it does for a CTE read twice
+      (`inline_cte` inlines one read once, or NOT MATERIALIZED). `inline_ctes`
+      inlines every CTE, which keeps the rows but not the plan. Found while
+      working RP-1106.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a materialized cte is a cte scan]
+      Backlog-ID: RP-1158
 
 - [ ] **A Sort above a HashAggregate prints no Sort Key.** `explain
       (costs off) select e.b, count(*) from e group by e.b order by e.b`

@@ -12839,7 +12839,18 @@ fn plan_explain(
     // planned without the join; the server, which knows the unique
     // indexes, decides. Under ANALYZE the statement runs as written.
     if !options.analyze && options.modify_table.is_none() {
-        for c in join_removal::candidates(&query, lookup).into_iter().take(3) {
+        let candidates = join_removal::candidates(&query, lookup);
+        // One to a single row goes first, and whatever the indexes say:
+        // `remove_useless_result_rtes` runs before any join is planned
+        // (RP-1106).
+        if let Some(c) = candidates.iter().find(|c| c.always) {
+            let mut alt = e.clone();
+            alt.query = Some(Box::new(pg_query::protobuf::Node {
+                node: Some(c.query.clone()),
+            }));
+            return join_removal::with_joins_removed(|| plan_explain(&alt, lookup, params));
+        }
+        for c in candidates.into_iter().take(3) {
             let mut alt = e.clone();
             alt.query = Some(Box::new(pg_query::protobuf::Node {
                 node: Some(c.query),
@@ -13168,6 +13179,24 @@ thread_local! {
 /// Install the views for the statements that follow on this thread.
 pub fn set_views(views: Vec<(String, String)>) {
     PLAN_VIEWS.with(|v| *v.borrow_mut() = views);
+}
+
+thread_local! {
+    /// The views marked `security_barrier`, which the planner never pulls
+    /// up into the query that reads them (`is_simple_subquery`).
+    static PLAN_BARRIER_VIEWS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install the `security_barrier` views for the statements that follow on
+/// this thread.
+pub fn set_security_barrier_views(views: Vec<String>) {
+    PLAN_BARRIER_VIEWS.with(|v| *v.borrow_mut() = views);
+}
+
+/// Is `name` a view marked `security_barrier`?
+pub(crate) fn is_security_barrier_view(name: &str) -> bool {
+    PLAN_BARRIER_VIEWS.with(|v| v.borrow().iter().any(|n| n == name))
 }
 
 thread_local! {

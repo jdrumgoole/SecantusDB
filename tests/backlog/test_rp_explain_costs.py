@@ -53,6 +53,17 @@ _REMOVABLE = _ANALYSED + [
     "analyze h",
 ]
 
+# Those, and views over `k`: one renaming a column under a WHERE, one
+# fixing `u.a` in its WHERE, one over another view, and one marked
+# `security_barrier`, which is never pulled up (RP-1106).
+_PULLED = _REMOVABLE + [
+    "create view kw as select a as x, b from k where b = 'v1'",
+    "create view uv as select * from u where a = 3",
+    "create view kv2 as select a as z from kv",
+    "create view kvs as select * from k",
+    "alter view kvs set (security_barrier)",
+]
+
 # Two tables of ten rows never analysed (RP-1019): the planner sizes each
 # at its default 1,270 rows.
 _NEVER_ANALYSED = [
@@ -2763,17 +2774,165 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on a private PostgreSQL 15.20 cluster (found while working
-    # RP-1060): a view, and a one-row CTE, are removed as a table is.
+    # RP-1060, and while fixing RP-1106): a view, an inlined CTE and a FROM
+    # subquery are pulled up and their join removed as a table's is; one
+    # with no FROM is a single row, whose join is removed whatever its ON.
     "a left join to a view nothing reads is removed": (
-        "RP-1106",
+        "RP-1106:fixed",
         _REMOVABLE,
         "explain (costs off) select e.b from e left join kv on kv.a = e.a",
         ["Seq Scan on e"],
     ),
     "a left join to a one-row cte nothing reads is removed": (
-        "RP-1106",
+        "RP-1106:fixed",
         _REMOVABLE,
         "explain (costs off) with k as (select 1 as a) select e.b from e left join k on k.a = e.a",
+        ["Seq Scan on e"],
+    ),
+    "a left join to a subquery of one table nothing reads is removed": (
+        "RP-1106:fixed",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join (select * from k) s on s.a = e.a",
+        ["Seq Scan on e"],
+    ),
+    "a left join to a subquery renaming its columns is removed": (
+        "RP-1106:fixed",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join (select * from k) s(x, y) on s.x = e.a",
+        ["Seq Scan on e"],
+    ),
+    "a left join to a view renaming the key under a where is removed": (
+        "RP-1106:fixed",
+        _PULLED,
+        "explain (costs off) select e.b from e left join kw on kw.x = e.a",
+        ["Seq Scan on e"],
+    ),
+    "a left join to a view whose where fixes the key is removed": (
+        "RP-1106:fixed",
+        _PULLED,
+        "explain (costs off) select e.b from e left join uv on uv.b = e.b",
+        ["Seq Scan on e"],
+    ),
+    "a left join to a view over a view is removed": (
+        "RP-1106:fixed",
+        _PULLED,
+        "explain (costs off) select e.b from e left join kv2 on kv2.z = e.a",
+        ["Seq Scan on e"],
+    ),
+    "a left join to a view nothing reads is removed under a where": (
+        "RP-1106:fixed",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join kv on kv.a = e.a where e.a > 5",
+        ["Seq Scan on e", "  Filter: (a > 5)"],
+    ),
+    "two left joins to one view are both removed": (
+        "RP-1106:fixed",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join kv on kv.a = e.a "
+        "left join kv kv2 on kv2.a = e.a",
+        ["Seq Scan on e"],
+    ),
+    "a left join using the key of a subquery is removed": (
+        "RP-1106:fixed",
+        _REMOVABLE,
+        "explain (costs off) select a from e left join (select * from k) s using (a)",
+        ["Seq Scan on e"],
+    ),
+    "a left join to an inlined cte of one table is removed": (
+        "RP-1106:fixed",
+        _REMOVABLE,
+        "explain (costs off) with c as (select * from k) select e.b from e "
+        "left join c on c.a = e.a",
+        ["Seq Scan on e"],
+    ),
+    "two left joins to a not materialized cte are both removed": (
+        "RP-1106:fixed",
+        _REMOVABLE,
+        "explain (costs off) with c as not materialized (select * from k) select e.b from e "
+        "left join c on c.a = e.a left join c c2 on c2.a = e.a",
+        ["Seq Scan on e"],
+    ),
+    "a left join to a one-row subquery is removed whatever its on": (
+        "RP-1106:fixed",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join (select 1 as a) s on random() > 0.5",
+        ["Seq Scan on e"],
+    ),
+    "a left join to a one-row subquery of two columns is removed": (
+        "RP-1106:fixed",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join (select 1 as a, 2 as b) s "
+        "on s.a = e.a and s.b = 2",
+        ["Seq Scan on e"],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1106): a view a query reads is pulled up and hashed on its ON, a
+    # subquery's join keeps its own cond, and a MATERIALIZED CTE is a CTE
+    # Scan.
+    "a left join to a view a query reads hashes on its on": (
+        "RP-1157",
+        _REMOVABLE,
+        "explain (costs off) select e.b, kv.b from e left join kv on kv.a = e.a",
+        [
+            "Hash Left Join",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on k",
+        ],
+    ),
+    "a left join to a subquery of a join keeps each on in its join": (
+        "RP-1157",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join (select k.a from k join u on u.a = k.a) s "
+        "on s.a = e.a",
+        [
+            "Hash Right Join",
+            "  Hash Cond: (k.a = e.a)",
+            "  ->  Hash Join",
+            "        Hash Cond: (k.a = u.a)",
+            "        ->  Seq Scan on k",
+            "        ->  Hash",
+            "              ->  Seq Scan on u",
+            "  ->  Hash",
+            "        ->  Seq Scan on e",
+        ],
+    ),
+    "a materialized cte is a cte scan": (
+        "RP-1158",
+        _REMOVABLE,
+        "explain (costs off) with c as materialized (select 1 as a) select e.b from e "
+        "left join c on c.a = e.a",
+        [
+            "Hash Left Join",
+            "  Hash Cond: (e.a = c.a)",
+            "  CTE c",
+            "    ->  Result",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  CTE Scan on c",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (2026-11-27): what
+    # RP-1106 leaves -- a subquery distinct on its ON's columns
+    # (`query_is_distinct_for`), a NATURAL join, and a one-row subquery
+    # under ON TRUE whose column the query reads.
+    "a left join to a distinct subquery nothing reads is removed": (
+        "RP-1106",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e left join (select distinct a from e) s on s.a = e.a",
+        ["Seq Scan on e"],
+    ),
+    "a natural left join nothing reads is removed": (
+        "RP-1106",
+        _REMOVABLE,
+        "explain (costs off) select e.b from e natural left join k",
+        ["Seq Scan on e"],
+    ),
+    "a left join on true to a one-row subquery the query reads is removed": (
+        "RP-1106",
+        _REMOVABLE,
+        "explain (costs off) select e.b, s.a from e left join (select 1 as a) s on true",
         ["Seq Scan on e"],
     ),
     # Measured on a private PostgreSQL 15.20 cluster (found while working
