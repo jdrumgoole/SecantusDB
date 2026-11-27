@@ -1,6 +1,6 @@
 """Gap tests of the divergences found while working RP-1048 (a `text`
 column an `INSERT ... SELECT` wrote to a domain-array column was accepted):
-RP-1083 (a 42804 assignment error names a domain column by its base type),
+RP-1083 (a 42804 assignment error named a domain column by its base type; fixed),
 RP-1084 (a value too long for a `varchar(n)` domain is stored in an array
 of that domain) and RP-1085 (a user type created unqualified under a
 non-public `search_path` is created in `public`).
@@ -62,9 +62,10 @@ _P = 'column "p" is of type pint48 but expression is of type text'
 _A = 'column "a" is of type dia48 but expression is of type text'
 
 
-@pytest.mark.backlog("RP-1083")
+@pytest.mark.backlog_fixed("RP-1083")
 def test_domain_column_named_in_42804(dsn: str) -> None:
-    """`format_type_be` names the column's own type, the domain."""
+    """`format_type_be` named the column's own type, the domain; the
+    message gave the domain's base type instead."""
     got = {
         q: answer(dsn, q)
         for q in (
@@ -79,6 +80,49 @@ def test_domain_column_named_in_42804(dsn: str) -> None:
         "update t48 set p = '1'::text": ("42804", _P, "20"),
         "insert into t48(p) select '1'::text": ("42804", _P, "27"),
         "insert into t48(a) values ('{1}'::text)": ("42804", _A, "28"),
+    }
+
+
+_QD = 'column "p" is of type q83.qd but expression is of type {}'
+
+
+@pytest.mark.backlog_fixed("RP-1083")
+def test_domain_column_named_in_default_and_qualified(dsn: str) -> None:
+    """A DEFAULT's 42804 names the domain too, and a domain outside the
+    `search_path` is schema-qualified, as `format_type_be` prints it
+    (measured on PostgreSQL 15.20)."""
+    setup = [
+        *_SETUP,
+        "drop table if exists t83d, t83q cascade",
+        "drop schema if exists q83 cascade",
+        "create schema q83",
+        "create domain q83.qd as int",
+        "create table t83q (p q83.qd)",
+    ]
+    try:
+        got = {
+            q: answer(dsn, q, setup)
+            for q in (
+                "create table t83d (p pint48 default now())",
+                "insert into t83q values ('1'::text)",
+                "update t83q set p = true",
+                "insert into t83q select '1'::text",
+            )
+        }
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as c:
+            c.execute("drop table if exists t83d, t83q cascade")
+            c.execute("drop schema if exists q83 cascade")
+    assert got == {
+        "create table t83d (p pint48 default now())": (
+            "42804",
+            'column "p" is of type pint48 but default expression is of type '
+            "timestamp with time zone",
+            None,
+        ),
+        "insert into t83q values ('1'::text)": ("42804", _QD.format("text"), "26"),
+        "update t83q set p = true": ("42804", _QD.format("boolean"), "21"),
+        "insert into t83q select '1'::text": ("42804", _QD.format("text"), "25"),
     }
 
 
