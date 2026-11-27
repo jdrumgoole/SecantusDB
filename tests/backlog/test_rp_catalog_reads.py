@@ -1996,14 +1996,23 @@ TOAST_ROWS = "pg_class"
 
 
 @pytest.mark.backlog_fixed("RP-290")
-def test_a_catalog_joins_method_decides_its_reads(rust_pg: Any) -> None:
+def test_a_catalog_joins_method_decides_its_reads(tmp_path: Any) -> None:
     """RP-290 (slice): a join of two catalogs was walked as a hash join
     whatever PostgreSQL's costing chose: its scans' tuple descriptors were
     the columns needed above, never the whole row, and the inner
     `pg_namespace` was read whole once, where a nested loop's unique inner
     stops at each outer row's match; and a join's relations built no index
-    pathkeys without an ORDER BY of their own."""
-    got = catalog_reads(_dsn(rust_pg), JOIN_METHOD_STEPS)
+    pathkeys without an ORDER BY of their own.
+
+    On a server of its own: the nested loop's index-only probe of
+    `pg_class_relname_nsp_index` fetches no heap tuple while `pg_class`'s
+    own row is on an all-visible block, and the module's server, after the
+    other tests' CREATE TABLEs placed rows on that block, has cleared its
+    bit (a heap fetch more, as on PostgreSQL)."""
+    from tests.test_rust_pgserver_slice import _Server
+
+    with _Server(tmp_path) as server:
+        got = catalog_reads(_dsn(server), JOIN_METHOD_STEPS)
 
     def without_toast(segments: list[dict[str, list[int]]]) -> list[dict[str, list[int]]]:
         return [{k: v for k, v in seg.items() if k != TOAST_ROWS} for seg in segments]
@@ -3324,14 +3333,82 @@ AFTER_ANALYZE_HEAP_SCANS = {
 }
 
 
-@pytest.mark.backlog("RP-1097")
+@pytest.mark.backlog_fixed("RP-1097")
 def test_a_database_wide_analyze_removes_the_init_files(tmp_path: Any) -> None:
+    """Fixed: a database-wide ANALYZE found `pg_database` grown since
+    initdb's VACUUM, wrote its `pg_class` row, and the relation cache
+    invalidation that sent at commit removed both init files, so the next
+    backend built them again."""
     from tests.test_rust_pgserver_slice import _Server
 
     with _Server(tmp_path) as server:
         dsn = _dsn(server)
         obs = Observer(dsn)
         conn = _connect(dsn, "ddl")
+        conn.execute("analyze")
+        conn.close()
+        time.sleep(0.5)
+        before = obs.snap()
+        _select_one(dsn)
+        time.sleep(0.5)
+        got = _delta(before, obs.snap())
+        obs.conn.close()
+    heap = {k: v for k, v in got.items() if k in AFTER_ANALYZE_HEAP_SCANS}
+    assert heap == AFTER_ANALYZE_HEAP_SCANS
+
+
+# What leaves the init files in place: an invalidation of no relation they
+# hold, or an ANALYZE that measured nothing new (`vac_update_relstats`
+# writes a catalog's `pg_class` row only when its size changed).
+# PostgreSQL 15.20, private cluster (2026-11-27): after each, the files are
+# both still there and the next backend makes no heap scan of the three.
+KEEPS_THE_INIT_FILES = {
+    "analyze pg_class": ["analyze pg_class"],
+    "analyze pg_authid": ["analyze pg_authid"],
+    "create table": ["create table rp1097_t (a int)"],
+    "a second analyze": ["analyze", "@select 1", "analyze"],
+}
+
+
+@pytest.mark.backlog_fixed("RP-1097")
+@pytest.mark.parametrize("steps", KEEPS_THE_INIT_FILES.values(), ids=list(KEEPS_THE_INIT_FILES))
+def test_what_leaves_the_init_files(tmp_path: Any, steps: list[str]) -> None:
+    from tests.test_rust_pgserver_slice import _Server
+
+    with _Server(tmp_path) as server:
+        dsn = _dsn(server)
+        obs = Observer(dsn)
+        conn = _connect(dsn, "ddl")
+        for sql in steps:
+            if sql.startswith("@"):
+                # A backend of its own, which builds any missing file.
+                _select_one(dsn)
+            else:
+                conn.execute(sql)
+        conn.close()
+        time.sleep(0.5)
+        before = obs.snap()
+        _select_one(dsn)
+        time.sleep(0.5)
+        got = _delta(before, obs.snap())
+        obs.conn.close()
+    assert {k: v for k, v in got.items() if k in AFTER_ANALYZE_HEAP_SCANS} == {}
+
+
+# A database-wide ANALYZE after the files were rebuilt measures again, and
+# a CREATE TABLE since has grown `pg_class`, `pg_type` and `pg_attribute`:
+# the files go again. PostgreSQL 15.20, private cluster (2026-11-27).
+@pytest.mark.backlog_fixed("RP-1097")
+def test_an_analyze_after_a_create_table_removes_the_init_files(tmp_path: Any) -> None:
+    from tests.test_rust_pgserver_slice import _Server
+
+    with _Server(tmp_path) as server:
+        dsn = _dsn(server)
+        obs = Observer(dsn)
+        conn = _connect(dsn, "ddl")
+        conn.execute("analyze")
+        _select_one(dsn)
+        conn.execute("create table rp1097_t (a int)")
         conn.execute("analyze")
         conn.close()
         time.sleep(0.5)
@@ -3537,3 +3614,27 @@ def test_an_index_scan_with_a_filter_counts_one_index_scan(rust_pg: Any, query: 
         after = conn.execute(_SCANS).fetchone()
         conn.rollback()
     assert (after[0] - before[0], after[1] - before[1]) == (0, 1)
+
+
+# Found while working RP-1097: a fresh PostgreSQL 15.20 cluster's
+# `relpages`, `reltuples` and `relallvisible` of the four catalogs whose
+# `pg15_class_sizes.tsv` literal came from the shared reference cluster
+# (private cluster, 2026-11-27, `initdb` then `select ... from pg_class`).
+FRESH_CLUSTER_SIZES = [
+    ("pg_shdepend", 0, 0.0, 0),
+    ("pg_authid", 1, 13.0, 1),
+    ("pg_auth_members", 1, 3.0, 1),
+    ("pg_statistic", 20, 404.0, 20),
+]
+
+
+@pytest.mark.backlog("RP-1144")
+def test_a_fresh_servers_pg_class_holds_a_fresh_clusters_sizes(tmp_path: Any) -> None:
+    from tests.test_rust_pgserver_slice import _Server
+
+    with _Server(tmp_path) as server, _connect(_dsn(server), "fresh") as conn:
+        got = conn.execute(
+            "select relname::text, relpages, reltuples::float8, relallvisible "
+            "from pg_class where oid in (1214, 1260, 1261, 2619) order by oid"
+        ).fetchall()
+    assert [tuple(r) for r in got] == FRESH_CLUSTER_SIZES

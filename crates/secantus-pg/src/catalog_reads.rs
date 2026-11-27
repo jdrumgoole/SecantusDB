@@ -5678,7 +5678,7 @@ impl PgHandler {
         self.catcache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .end_xact(store, pid, commit);
+            .end_xact(store, self.stats().db, pid, commit);
     }
 }
 

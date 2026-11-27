@@ -1747,22 +1747,23 @@ a regression test.
       RP-1096.
       Verify: tests/backlog/test_rp_catalog_reads.py::test_pg_stat_activity_lists_the_background_processes
       Backlog-ID: RP-1141
-- [ ] **An invalidation never removes the relation cache init files.**
-      Since RP-292 the first backend after a start builds the init files
-      and later ones read them; but PostgreSQL 15.19 also removes a file
-      when a committed transaction invalidates a relation it holds
-      (`RelationCacheInitFilePreInvalidate`), and the next backend builds
-      it again. After a database-wide `analyze`, PostgreSQL 15.20's next
-      backend makes the cold start's heap scans (`pg_class` 11,
-      `pg_attribute` 11, `pg_authid` 2); after `analyze pg_class`, `analyze
-      pg_authid` or a `create table` it makes none. Here no invalidation
-      reaches the init files. The faithful fix: an `Inval::Rel` of an
-      init-file relation, at commit, removes that file (shared or the
-      database's), as `RegisterRelcacheInvalidation` marks
-      `RelcacheInitFileInval`; which of `analyze`'s catalog updates send
-      one is the part to measure (found while working RP-292).
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_removes_the_init_files
-      Backlog-ID: RP-1097
+- [ ] **A fresh server's `pg_class` shows another cluster's size for four
+      catalogs.** `pg15_class_sizes.tsv`, from which `pg_class` takes each
+      built-in catalog's `relpages`, `reltuples` and `relallvisible`, was
+      dumped from a database of the shared reference cluster, whose shared
+      catalogs hold that cluster's roles and dependencies. A fresh
+      PostgreSQL 15.20 cluster (private, 2026-11-27) shows `pg_shdepend`
+      0 / 0 / 0, `pg_authid` 1 / 13 / 1, `pg_auth_members` 1 / 3 / 1 and
+      `pg_statistic` 20 / 404 / 20; here 5 / 494 / 5, 1 / 16 / 0, 1 / 3 / 0
+      and 27 / 411 / 27. Since RP-1097 the gap also moves a database-wide
+      ANALYZE's `vac_update_relstats` check, which compares its measure
+      with what `pg_class` holds: the first one also invalidates
+      `pg_authid`, `pg_auth_members` and `pg_statistic`, whose measure
+      differs only from the wrong literal. The planner sizes those
+      catalogs from the same literal (RP-314), so a fix re-measures their
+      estimates too (found while working RP-1097).
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_fresh_servers_pg_class_holds_a_fresh_clusters_sizes
+      Backlog-ID: RP-1144
 - [ ] **A database-wide ANALYZE measures only some catalog columns.** Since
       RP-311 each database holds `initdb`'s `pg_statistic` rows for the
       built-in catalogs. A plain `ANALYZE` (or `VACUUM ANALYZE`)
@@ -1778,7 +1779,10 @@ a regression test.
       `oidvector_ops`). The other columns keep `initdb`'s rows, where
       PostgreSQL 15.19 measures them too: `pg_node_tree`. Not modelled
       either: the measured
-      catalogs' `relpages` / `reltuples` in `pg_class`, and the row order
+      catalogs' `relpages` / `reltuples` in `pg_class` (since RP-1097 a
+      database-wide ANALYZE records its measure of each catalog's size, and
+      invalidates the catalog whose size changed, but `pg_class` still
+      shows `initdb`'s), and the row order
       of the replaced `pg_statistic` rows (an update moves PostgreSQL's)
       (found while working RP-311).
       Backlog-ID: RP-313
