@@ -2778,8 +2778,12 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # Measured on a private PostgreSQL 15.20 cluster (found while working
     # RP-1060).
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1107, fixed): the
+    # one-row constant subquery is pulled up and leaves the join tree, its
+    # range table entry kept, so the key prints qualified (once `Group
+    # Key: e\x1Fb` over a Nested Loop of `e` and `Subquery Scan on x`).
     "a group by over a cross join with a one-row subquery prints its key": (
-        "RP-1107",
+        "RP-1107:fixed",
         _ANALYSED,
         "explain (costs off) select e.b, count(*) from e, (select 1) x group by e.b",
         ["HashAggregate", "  Group Key: e.b", "  ->  Seq Scan on e"],
@@ -3523,6 +3527,79 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Output: count(*)",
             "  ->  Seq Scan on public.e",
             "        Output: a, b",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1107, fixed): a
+    # one-row constant subquery joined on a column is pulled up, its
+    # constant the scan's Filter; and with no aggregate the scan is alone.
+    "a join to a one-row subquery on a column is the scan's filter": (
+        "RP-1107:fixed",
+        _ANALYSED,
+        "explain (costs off) select e.b from e join (select 3 as c) x on e.a = x.c",
+        ["Seq Scan on e", "  Filter: (a = 3)"],
+    ),
+    "a cross join to a one-row subquery sorts by its qualified key": (
+        "RP-1107:fixed",
+        _ANALYSED,
+        "explain (costs off) select e.b from e cross join (select 1) x order by e.b",
+        ["Sort", "  Sort Key: e.b", "  ->  Seq Scan on e"],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1107): an aggregate over a comma join prints the join under its
+    # key, as over an explicit JOIN.
+    "a group by over a comma join prints the join": (
+        "RP-1159",
+        _ANALYSED,
+        "explain (costs off) select e.b, count(*) from e, k where e.a = k.a group by e.b",
+        [
+            "HashAggregate",
+            "  Group Key: e.b",
+            "  ->  Hash Join",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e",
+            "        ->  Hash",
+            "              ->  Seq Scan on k",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1107): a group by over the one row a WHERE equality leaves sorts.
+    "a group by over a one-row filter is a group aggregate": (
+        "RP-1160",
+        _ANALYSED,
+        "explain (costs off) select e.b, count(*) from e where e.a = 3 group by e.b",
+        [
+            "GroupAggregate",
+            "  Group Key: b",
+            "  ->  Sort",
+            "        Sort Key: b",
+            "        ->  Seq Scan on e",
+            "              Filter: (a = 3)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1107): the one-row subqueries the pull-up leaves as written.
+    "a one-row subquery under a star is pulled up": (
+        "RP-1161",
+        _ANALYSED,
+        "explain (costs off) select * from e, (select 1 c) x",
+        ["Seq Scan on e"],
+    ),
+    "a one-row subquery with a false where is a one-time filter": (
+        "RP-1161",
+        _ANALYSED,
+        "explain (costs off) select e.b, count(*) from e, (select 1 where false) x group by e.b",
+        ["HashAggregate", "  Group Key: e.b", "  ->  Result", "        One-Time Filter: false"],
+    ),
+    "a volatile one-row subquery is a result under the nested loop": (
+        "RP-1161",
+        _ANALYSED,
+        "explain (costs off) select e.b, count(*) from e, (select random() r) x group by e.b",
+        [
+            "HashAggregate",
+            "  Group Key: e.b",
+            "  ->  Nested Loop",
+            "        ->  Result",
+            "        ->  Seq Scan on e",
         ],
     ),
     # Measured on a private PostgreSQL 15.20 cluster (RP-1105, fixed): a
