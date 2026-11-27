@@ -1910,7 +1910,15 @@ def test_a_merge_join_clauses_scan_estimate(rust_pg: Any) -> None:
 # lookups also build each B-tree index's pathkeys for the join
 # (`has_useful_pathkeys`: a join clause in an equivalence class). Measured
 # on a private PostgreSQL 15.20 cluster, twice, the two identical; the same
-# recording reproduced psql's describe query's answer above (RP-290).
+# recording reproduced psql's describe query's answer above (RP-290). The
+# answer holds only where little DDL has run: in one database PostgreSQL
+# 15.20 itself answers this on runs 1 to 3 of the module's SETUP and these
+# steps, and from run 4 on its nested loop fetches the heap once more
+# (`pg_class_relname_nsp_index` `[3, 3, 3]`, not `[3, 3, 2]`), where in a
+# database created for each run it answers this at every one of 5 runs (a
+# private 15.20 cluster set up as the module docstring says, 2026-11-27).
+# So the test runs on a server of its own, never after the module's other
+# tests (RP-1145).
 JOIN_METHOD_STEPS: dict[str, list[str]] = {
     "a hash join of two catalogs": [
         "a|",

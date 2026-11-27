@@ -3736,38 +3736,6 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       Verify: none -- an intermittent wall-clock bound under load; crates/secantus-pg/tests/embedded.rs::stop_does_not_wait_on_an_idle_connection is the check
       Backlog-ID: RP-1132
 
-## Found landing PR #3058 (2026-11-27)
-
-- [ ] **RP-290's join-method regression test fails once three of its
-      module's tests have run on the same server.**
-      `tests/backlog/test_rp_catalog_reads.py::test_a_catalog_joins_method_decides_its_reads`
-      (added with RP-290's part at d86010b3f) failed on CI on snapshot
-      PR #3058 (1a4477ac, RP-1096 alone; run 45916374322, `pg-oracle
-      (backlog)`). In "a nested loop with the second relation outer",
-      `pg_class_relname_nsp_index` returned 3 entries and fetched 3 heap
-      rows, where PostgreSQL 15 fetches 2: one entry it returns points at
-      a row no longer visible. Reproduced on arm64 macOS with a debug
-      build at 62af52b6d, with the suite's random order off: it fails
-      after the module's first three tests, after its 4th to 6th, and
-      after its 8th to 11th; it passes alone, after a test that only
-      sleeps 30 s, and after any one of those tests alone. So it is the
-      catalog's state after several tests' DDL, not time and not one
-      statement. `pytest-randomly` shuffles the module on every run, so
-      CI meets it by chance. PostgreSQL itself moves the same way
-      (measured while working RP-291, 2026-11-27): on a private 15.20
-      cluster `initdb`'d fresh, `catalog_reads` over `JOIN_METHOD_STEPS`
-      run again and again in one database answers `EXPECTED_JOIN_METHOD`
-      on runs 1 to 3 and differs from run 4 on, in that scenario alone,
-      and a fresh `secantusd-pg` store gives PostgreSQL's answer exactly
-      at every run from 1 to 5. So the server is right and the test is
-      not: its expected answer holds only in a database with little DDL
-      history, and the fix is RP-1111's, to measure the scenarios in a
-      fresh database and re-measure the answer there. The failure is the
-      same on `origin/pg-batch` at `1a4477ac5` and with RP-291's view
-      slice on top (the module in file order with `-n0`).
-      Verify: none -- order-dependent; run the module serially with `-p no:randomly`, where test_a_catalog_joins_method_decides_its_reads fails
-      Backlog-ID: RP-1145
-
 ## The storage model is not mongod's (tasks/mongod-storage-model-plan.md, 2026-11-19)
 
 - [ ] **A store `secantusd-pg` writes is not one mongod can open.** The
@@ -3892,7 +3860,14 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       load average about 2.6): `tests/backlog/test_rp_found_rp921.py`'s
       module server gave `''` for its first line, so its 6 tests were
       `REGRESSED`; the module alone passed (6 in 105 s), and the same
-      commit's gate before a rebase had no start failure. Not yet known: whether the
+      commit's gate before a rebase had no start failure. A third time on
+      2026-11-27, in RP-1145's `gate_pg.sh --fast` backlog step (load
+      average about 4 at its end, the other lane running):
+      `tests/backlog/test_rp_found_rp726.py`'s module server gave `''`
+      for its first line and nothing after its stop, so its 22 tests were
+      `REGRESSED`; no crash report was written, so it did not die of a
+      signal, and the module alone passed (22 in 153 s), where three lone
+      fresh starts took 4.1-4.3 s each. Not yet known: whether the
       server stalled (a lock, a WiredTiger create waiting on a checkpoint)
       or was starved, since the harness keeps no stack or timing of a
       start it gives up on. The harness should sample the child
