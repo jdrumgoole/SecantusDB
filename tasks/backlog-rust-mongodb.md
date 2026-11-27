@@ -2192,6 +2192,20 @@ compressed column, placed by mongod's bucket catalog
       2026-11-25).
       Verify: tests/backlog/test_rm_bucket_catalog.py::test_dropping_a_collection_clears_its_buckets_by_era
       Backlog-ID: RM-799
+- [ ] **RUST MongoDB server: `bucketCatalog.memoryUsage` releases a cleared
+      bucket at once, not when it is next touched.** Found with RM-710
+      (2026-11-27). Linux x86-64 mongod 8.2.11 keeps the buckets of a dropped
+      collection, and a bucket a direct write (a delete) cleared, in its
+      catalog until they are next touched, as RM-799 measures for the counts:
+      with two collections written, dropping one takes `memoryUsage` from
+      14568 to 14304 (the collection's statistics only), a delete of one
+      series' documents leaves 14152 where it was, and the series' next write
+      moves it (14224, 14176). This server forgets a cleared bucket at once
+      (14568 to 11716; 14152 to 11660). The account itself follows the bytes;
+      the missing piece is the registry's era (RM-799), which decides when a
+      cleared bucket leaves memory.
+      Verify: tests/backlog/test_rm_bucket_catalog.py::test_memory_usage_keeps_cleared_buckets_until_they_are_touched
+      Backlog-ID: RM-833
 - **Scope decision — `listCollections` order around time-series buckets.**
   This server puts each bucket namespace after its collection and
   `system.views` last; mongod's order is not stable between two runs of the

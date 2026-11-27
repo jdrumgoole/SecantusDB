@@ -385,6 +385,39 @@ CASES["arr [0,1] then [0,1,2]"] = steps(
 )
 
 
+def lifecycle(c):
+    db = mk(c)
+    ins(db, [d(m="a")])
+    out = [mem(c)]
+    db.create_collection("ts2", timeseries={"timeField": "t", "metaField": "m"})
+    ins(db, [d(m="b")], name="ts2")
+    out.append(mem(c))
+    db.drop_collection("ts")
+    out.append(mem(c))
+    ins(db, [{"t": sec(1), "m": "b"}], name="ts2")
+    out.append(mem(c))
+    db.drop_collection("ts2")
+    out.append(mem(c))
+    return out
+
+
+def deletes(c):
+    db = mk(c)
+    ins(db, [d(m="a"), d(m="b")])
+    out = [mem(c)]
+    db.command("delete", "ts", deletes=[{"q": {"m": "a"}, "limit": 0}])
+    out.append(mem(c))
+    ins(db, [{"t": sec(1), "m": "b"}])
+    out.append(mem(c))
+    ins(db, [{"t": sec(2), "m": "a"}])
+    out.append(mem(c))
+    return out
+
+
+CASES["lifecycle drops"] = lifecycle
+CASES["deletes then inserts"] = deletes
+
+
 def main() -> None:
     want = sys.argv[2:] if len(sys.argv) > 2 else None
     version = sys.argv[1]

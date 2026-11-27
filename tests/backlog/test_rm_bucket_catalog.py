@@ -453,6 +453,56 @@ def test_idle_bucket_expiry_parameters_answer_as_mongod_does(tmp_path: pathlib.P
     assert got == want
 
 
+@pytest.mark.backlog("RM-833")
+def test_memory_usage_keeps_cleared_buckets_until_they_are_touched(tmp_path: pathlib.Path) -> None:
+    """Linux x86-64 mongod 8.2.11 (measured 2026-11-27): a dropped
+    collection's buckets and a bucket a direct write (a delete) cleared stay
+    in the catalog's memory until they are next touched (the bucket state
+    registry clears them by era), so `memoryUsage` drops by the collection's
+    statistics only (14568 -> 14304 after a drop) and does not move at all
+    after a delete (14152 -> 14152); a bucket is released when its series is
+    written again. This server releases them at once (14568 -> 11716, 14152
+    -> 11660)."""
+    only_on("linux", why="the counts are the exemplar's (Linux x86-64) bytes")
+    t = dt.datetime(2026, 1, 1)
+
+    def lifecycle(client: Any) -> list:
+        db = client["rm_bucket_catalog"]
+        opts = {"timeField": "t", "metaField": "m"}
+        db.create_collection("ts", timeseries=opts)
+        db.create_collection("ts2", timeseries=opts)
+        out = []
+        db.command("insert", "ts", documents=[{"t": t, "m": "a"}])
+        out.append(_section(client).get("memoryUsage"))
+        db.command("insert", "ts2", documents=[{"t": t, "m": "b"}])
+        out.append(_section(client).get("memoryUsage"))
+        db.drop_collection("ts")
+        out.append(_section(client).get("memoryUsage"))
+        db.command("insert", "ts2", documents=[{"t": t + dt.timedelta(seconds=1), "m": "b"}])
+        out.append(_section(client).get("memoryUsage"))
+        return out
+
+    def deletes(client: Any) -> list:
+        db = _make(client).database
+        out = []
+        db.command("insert", "ts", documents=[{"t": t, "m": "a"}, {"t": t, "m": "b"}])
+        out.append(_section(client).get("memoryUsage"))
+        db.command("delete", "ts", deletes=[{"q": {"m": "a"}, "limit": 0}])
+        out.append(_section(client).get("memoryUsage"))
+        db.command("insert", "ts", documents=[{"t": t + dt.timedelta(seconds=1), "m": "b"}])
+        out.append(_section(client).get("memoryUsage"))
+        db.command("insert", "ts", documents=[{"t": t + dt.timedelta(seconds=2), "m": "a"}])
+        out.append(_section(client).get("memoryUsage"))
+        return out
+
+    got, want = {}, {}
+    for name, probe in (("drops", lifecycle), ("deletes", deletes)):
+        with _fresh_pair(tmp_path / name) as (rust, ref):
+            got[name], want[name] = probe(rust), probe(ref)
+    assert want == {"drops": [11604, 14568, 14304, 14376], "deletes": [14152, 14152, 14224, 14176]}
+    assert got == want
+
+
 def _split(client: Any) -> list:
     s = _section(client)
     return [s.get(k) for k in ("numBuckets", "numOpenBuckets", "numArchivedBuckets")] + [
