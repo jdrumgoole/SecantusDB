@@ -2194,21 +2194,38 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a right join atop a chain hashes its preserved relation]
       Backlog-ID: RP-1063
 
-- [ ] **A chain whose hashed pair is PostgreSQL's Merge Join returns a
-      key's rows in another order.** `select x.c, y.c, z.c from t5 z left
-      join (u1 x join t4 y on x.b = y.b) on z.b = x.a` (never analysed:
-      `t5` 7 rows, `u1` 300 keyed on `a`, `t4` 1,000; setup in the gap
-      test) returns the same 858 rows as a private PostgreSQL 15.20
-      cluster, but the 143 of `x.c = 'u6'` start `x995, x988, ...` here
-      and `x85, x78, ...` there. PostgreSQL's plan is a Hash Left Join of
-      `z` over a Hash of a Merge Join of `x` and `y` over Sorts; EXPLAIN
-      here draws that pair as a Hash Join (RP-1059 (3), the drawing
-      declines a merge join), and which method the rows were built with
-      is not yet known. The pair alone (`u1 x join t4 y on x.b = y.b`, a
-      Merge Join on both) comes out in PostgreSQL's order. The same before
-      and after RP-1063's change. Found while working RP-1063.
-      Verify: tests/backlog/test_rp_hashed_pair_order.py::test_a_hashed_merge_pair_returns_a_keys_rows_in_postgres_order
-      Backlog-ID: RP-1114
+- [ ] **A hash table that outgrows `work_mem` while it is built returns
+      a key's rows in another order.** `select x.c, y.c, z.c from t5 z
+      left join (u1 x join t4 y on x.b = y.b) on z.b = x.a` (never
+      analysed: `t5` 300 rows, `u1` 1,000 keyed on `a`, `t4` 3,000; setup
+      in the gap test) returns the same 110,681 rows as a private
+      PostgreSQL 15.20 cluster, but the 18,447 of `x.c = 'u1'` start
+      `x1282, x1723, ...` here and `x2136, x862, ...` there (those of
+      `u3` and `u4` differ too; `u6`'s and three other keys' match).
+      PostgreSQL's
+      Hash of the pair's 428,800 rows (estimated 12,240) reports `Buckets:
+      262144 (originally 16384)  Batches: 4 (originally 1)`: past
+      `work_mem` the build doubles its batches (`ExecHashIncreaseNumBatches`),
+      writing the rows of later batches to files and re-reading them, so
+      neither one table's order nor its grown chains' order
+      (`hash_grown_order`) is the order out. Model the batch doubling and
+      the outer side's batch files. Found while working RP-1114.
+      Verify: tests/backlog/test_rp_chain_order_large.py::test_a_hash_table_that_grows_batches_returns_a_keys_rows_in_postgres_order
+      Backlog-ID: RP-1169
+
+- [ ] **A LEFT chain over larger tables is joined in another order.**
+      `select x.c, y.c, z.c from u1 x join t4 y on x.b = y.b left join t5 z
+      on z.b = x.a` (never analysed: `u1` 3,000 rows keyed on `a`, `t4`
+      300, `t5` 3,000; setup in the gap test) returns the same 238,311
+      rows as a private PostgreSQL 15.20 cluster in another order:
+      PostgreSQL plans a Merge Join of `y` with the Hash Right Join of `z`
+      and `x` (`Buckets: 4096 (originally 2048)`), its first rows `(u5,
+      x14, z...586)`; here the chain is a Hash Left Join of `z` over the
+      Hash Join of `x` and `y` (EXPLAIN draws it so), its first `(u2145,
+      x14, NULL)`. Which of the search's costs picks the other order is not
+      yet known. Found while working RP-1114.
+      Verify: tests/backlog/test_rp_chain_order_large.py::test_a_left_chain_over_larger_tables_returns_rows_in_postgres_order
+      Backlog-ID: RP-1170
 
 - [ ] **A FULL JOIN an inner join above reduces hashes the wrong side.**
       `explain (costs off) select e.b, e2.b from e full join k on e.a =

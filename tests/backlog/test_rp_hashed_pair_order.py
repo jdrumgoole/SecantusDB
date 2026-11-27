@@ -4,10 +4,13 @@ Hash is PostgreSQL's Merge Join (found while working RP-1063).
 `t5 z LEFT JOIN (u1 x JOIN t4 y ON x.b = y.b) ON z.b = x.a`, all three
 never analysed, is on PostgreSQL 15.20 (a private cluster, 2026-11-26) a
 Hash Left Join of `z` over a Hash of the Merge Join of `x` and `y`, each
-under a Sort: the rows of one key come out of the hash table in the
-reverse of the order the Merge Join gave them. The pair alone (`u1 x join
-t4 y on x.b = y.b`) comes out in PostgreSQL's order here; under the chain
-the 143 rows of `x.c = 'u6'` do not.
+under a Sort. The pair's 42,840 rows outgrow the 8,192 buckets its
+estimate of 7,200 sized (`Buckets: 65536 (originally 8192)`), and the
+build's end rebuilds the chains chunk by chunk, so the 143 rows of `x.c =
+'u6'`, which straddle two 32 kB chunks, come out rotated. This server once
+reversed them as one table that never grew would (RP-1114): the chain's
+hash joins modelled no growth, and `hash_grown_order` sized only tuples of
+one fixed-length type, where these hold text.
 
 Each run is in a database of its own, in a transaction it rolls back, so
 no table is ever analysed.
@@ -49,9 +52,9 @@ def _rows(server: Any) -> list[tuple]:
             c.rollback()
 
 
-@pytest.mark.backlog("RP-1114")
+@pytest.mark.backlog_fixed("RP-1114")
 def test_a_hashed_merge_pair_returns_a_keys_rows_in_postgres_order(rust_pg: Any) -> None:
-    """The rows of `x.c = 'u6'` in the order PostgreSQL 15.20 returns them."""
+    """The rows of `x.c = 'u6'` came out in the order PostgreSQL 15.20 returns them."""
     rows = _rows(rust_pg)
     assert len(rows) == 858
     u6 = [r[1] for r in rows if r[0] == "u6"]

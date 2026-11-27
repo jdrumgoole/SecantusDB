@@ -63166,6 +63166,72 @@ fn hash_table_order_on(
     true
 }
 
+/// A column of a hashed tuple, as `heap_compute_data_size` lays it out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TupleCol {
+    /// A fixed-length type: `attlen` bytes at its `attalign` boundary.
+    Fixed { len: usize, align: usize },
+    /// `text` / `varchar`: a value of at most 126 bytes packs into a
+    /// one-byte header with no alignment (`VARATT_CAN_MAKE_SHORT`), a
+    /// longer one keeps its four-byte header at an `int` boundary.
+    Varlena,
+}
+
+impl TupleCol {
+    /// The layout of a column of PostgreSQL type `ty`; `None` for a type
+    /// not modelled.
+    pub(crate) fn of_type(ty: &str) -> Option<TupleCol> {
+        let fixed = |len: usize| Some(TupleCol::Fixed { len, align: len });
+        match ty {
+            "bool" => fixed(1),
+            "int2" => fixed(2),
+            "int4" | "float4" | "date" => fixed(4),
+            "int8" | "float8" => fixed(8),
+            "text" | "varchar" => Some(TupleCol::Varlena),
+            _ => None,
+        }
+    }
+}
+
+/// A row's minimal tuple data, `cols` in order: its NULL columns' count and
+/// its data's length (`heap_compute_data_size`, each column at its
+/// alignment from the data's start, which `t_hoff` maxaligns). `None` for
+/// a varlena value that is not text, or that a table would have compressed
+/// or stored out of line (TOAST, past about 2 kB).
+pub(crate) fn tuple_data_size(
+    row: &Document,
+    cols: &[(String, TupleCol)],
+) -> Option<(usize, usize)> {
+    let align = |off: usize, a: usize| off.div_ceil(a) * a;
+    let (mut nulls, mut off) = (0, 0);
+    for (key, col) in cols {
+        let value = match row.get(key.as_str()) {
+            None | Some(Bson::Null) => {
+                nulls += 1;
+                continue;
+            }
+            Some(v) => v,
+        };
+        match col {
+            TupleCol::Fixed { len, align: a } => off = align(off, *a) + len,
+            TupleCol::Varlena => {
+                let Bson::String(s) = value else {
+                    return None;
+                };
+                let n = s.len();
+                if n <= 126 {
+                    off += n + 1;
+                } else if n < 2000 {
+                    off = align(off, 4) + n + 4;
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
+    Some((nulls, off))
+}
+
 /// The order a hash join's table leaves `rows` in when they outgrow the
 /// buckets it was sized for (`rows_estimate`, single batch): each insert
 /// (`ExecHashTableInsert`) counts its tuple and doubles the optimal bucket
@@ -63174,20 +63240,21 @@ fn hash_table_order_on(
 /// walking the dense-allocation chunks newest first, each in insertion
 /// order, pushing every tuple onto its bucket's head. A chunk holds 32 kB
 /// of tuples (`HASH_CHUNK_SIZE`), each `MAXALIGN(HJTUPLE_OVERHEAD +
-/// t_len)`: the minimal tuple of `cols`, all `typlen` bytes wide, behind
-/// a header with the null bitmap when one is NULL. The rows come back by
-/// bucket, each bucket's chain in order, rows never inserted (a NULL key
-/// an inner join drops, unless `keep_nulls`) last. `None` when the table
-/// does not grow (the caller's order stands) or a key's hash is not
-/// modelled.
+/// t_len)`: the minimal tuple of `cols` in their order, laid out as
+/// `heap_compute_data_size` sizes it (`TupleCol`), behind a header with
+/// the null bitmap when one is NULL. The rows come back by bucket, each
+/// bucket's chain in order, rows never inserted (a NULL key an inner join
+/// drops, unless `keep_nulls`) last. `None` when the table does not grow
+/// (the caller's order stands), a key's hash is not modelled, or a
+/// tuple's size is not (a value a varlena column does not hold as text,
+/// or one long enough to be compressed or stored apart).
 pub(crate) fn hash_grown_order(
     rows: &[Document],
     key: &str,
     ty: &str,
     rows_estimate: f64,
     keep_nulls: bool,
-    cols: &[String],
-    typlen: i64,
+    cols: &[(String, TupleCol)],
 ) -> Option<Vec<Document>> {
     const HASH_CHUNK_SIZE: usize = 32 * 1024;
     const HJTUPLE_OVERHEAD: usize = 16;
@@ -63219,14 +63286,15 @@ pub(crate) fn hash_grown_order(
     let mut chunks: Vec<Vec<(usize, u32)>> = Vec::new();
     let mut used = 0usize;
     for &(i, hash) in &inserted {
-        let row = &rows[i];
-        let nulls = cols
-            .iter()
-            .filter(|c| matches!(row.get(c.as_str()), None | Some(Bson::Null)))
-            .count();
+        let (nulls, data) = tuple_data_size(&rows[i], cols)?;
         let hoff = maxalign(15 + if nulls > 0 { cols.len().div_ceil(8) } else { 0 });
-        let t_len = hoff + (cols.len() - nulls) * typlen as usize;
+        let t_len = hoff + data;
         let size = maxalign(HJTUPLE_OVERHEAD + t_len);
+        // A tuple past `HASH_CHUNK_THRESHOLD` gets a chunk of its own, put
+        // behind the current one: not modelled.
+        if size > HASH_CHUNK_SIZE / 4 {
+            return None;
+        }
         if chunks.is_empty() || HASH_CHUNK_SIZE - used < size {
             chunks.push(Vec::new());
             used = 0;
