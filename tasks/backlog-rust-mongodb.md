@@ -1116,6 +1116,12 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       differed in its `executionStats` (an SBE `filter` over a `scan`,
       `saveState` / `restoreState` among the fields shown; the differing
       one was truncated) and passed in 9 reruns, serial and `-n 4`.
+      Again 2026-11-27 (RM-715 gate, load ~7-11):
+      `tests/mongod_live/test_lookup_hash_join.py::test_a_hash_join_lookup_is_explained_as_mongod_does`
+      (one case in the gate, `empty_local_collection-executionStats` in a
+      rerun, then two clean runs): here the side known, mongod's every
+      stage counted `saveState` 5 / `restoreState` 4 to this server's 4 /
+      3, one yield more, which points at mongod's time-based yield.
       Verify: none -- intermittent, once in 13 runs; no deterministic gap test until the differing counter is known
       Backlog-ID: RM-768
 - [ ] **A `$fill` with a `sortBy` passes ties on in a different order.**
