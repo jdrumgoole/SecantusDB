@@ -49156,6 +49156,7 @@ impl PgHandler {
                 explain::attach_verbose(&mut tree, &options.verbose_scan);
                 explain::attach_verbose_join(&mut tree, &options.verbose_join);
                 explain::attach_verbose_chain(&mut tree, &options.verbose_chain);
+                explain::attach_verbose_nested_join(&mut tree, &options.verbose_nested);
                 explain::attach_scan_filters(&mut tree, &class_filters, options.verbose);
                 // The index tuples ANALYZE's scans read, counted before the
                 // statement runs: a scan marks the entries it finds dead to

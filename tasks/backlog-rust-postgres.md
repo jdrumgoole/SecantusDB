@@ -1231,6 +1231,19 @@ one beside it.
       `432c8ec3e`, RP-1065's EXPLAIN-only change, run 45711355695), where
       the snapshot before (#2996, which carried RP-1073) passed it and the
       local debug build measures 13.1 ms against 14.3 ms (1.10).
+      A fourth, after the sorted name index (`487548600`, locally a ratio
+      median of 1.02): the same 3,200-table test on a MongoDB-only PR
+      (#3085 at `ca4bcfa1`, RM-636, which changes only
+      `crates/secantus-core/src/docstore.rs`; run 46029656831, job
+      140610095715, the only failure of 5,704), a median of 27.7 ms with
+      no other table against 31.6 ms with 3,200, ratio median 1.14, rounds
+      0.82 to 1.28 (2026-11-27). So on CI's runner the fix left the ratio
+      near 1.1 where locally it is 1.02: either the runner's noise spans
+      the bound or some growth CI sees is not seen on arm64 macOS.
+      A fifth, the next snapshot but one (#3087 at `74aef8b8`, RP-1121's
+      EXPLAIN VERBOSE change; run 46042159284, job 140652457171): 26.9 ms
+      against 31.0 ms, ratio median 1.15, rounds 0.91 to 1.20; #3086
+      between them passed. Two of the last three CI runs now fail it.
       Verify: none -- intermittent on CI; RP-715's, RP-911's and RP-1073's tests are the check
       Backlog-ID: RP-1100
 
@@ -1922,7 +1935,19 @@ a regression test.
       an ON clause reading it reaches outside the join:
       `explain::attach_verbose_class_loop`,
       `explain::attach_verbose_class_chain`. Its shapes whose plain plan
-      differs wait on RP-1137 and RP-1138.)
+      differs wait on RP-1137 and RP-1138.) (Since 2026-11-27 an inner ON's
+      conjunct over one relation, `e join k on e.a > 998 and k.a = e.a`,
+      is that relation's scan `Filter`, prefixed, as a WHERE's is, and a
+      nested loop's Index Only Scan of a one-column primary key prints
+      that key; a relation LEFT or inner joined to a nested two-relation
+      join on its right, `s left join (e join k on ...) on true` or on
+      column equalities, prints every node's `Output`:
+      `ruleutils::explain_verbose_nested_join`,
+      `explain::attach_verbose_nested_join`, RP-1121. A LEFT JOIN's ON
+      conjunct over one relation, `e left join k on e.a > 998 and k.a =
+      e.a`, still prints the plain plan, PostgreSQL 15.20 printing it
+      as the join's `Join Filter` on the preserved side and an `Index
+      Cond` or `Filter` on the nullable side's scan.)
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a three-way join with a join filter], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a merge join under a limit], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a merge join over an index only scan], tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of a descending merge join with a where]
       Backlog-ID: RP-966
 
@@ -2517,20 +2542,6 @@ a regression test.
       Measured on a private 15.20 cluster (found while working RP-393 and RP-397).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a nested join keyed on an indexed column under a left join], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a hash right join over a nested loop]
       Backlog-ID: RP-978
-- [ ] **EXPLAIN VERBOSE of a join nested in an outer join prints no
-      `Output` lines and unqualified quals.** `explain (verbose, costs
-      off) select * from s left join (e join k on e.a > 998 and k.a = e.a)
-      on true` prints `Seq Scan on s`, `Filter: (a > 998)` and `Index Cond:
-      (a = e.a)` with no `Output:` on any node; PostgreSQL 15 prints each
-      node's target list (`Output: s.a, s.c, e.a, e.b, k.a, k.b` on the
-      top, `Output: e.a, e.b, k.a, k.b` on the Materialize and the pair),
-      `Seq Scan on public.s` and the quals qualified (`Filter: (e.a >
-      998)`, `Index Cond: (k.a = e.a)`). `attach_verbose_join` models a
-      join of two scans; a join whose side is a join is left bare. Found
-      while working RP-978 (this server printed it so before that change
-      too); measured on a private PostgreSQL 15.20 cluster.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[verbose of an inner join nested in a left join]
-      Backlog-ID: RP-1121
 - [ ] **EXPLAIN prints no estimate for a join over a scan filtered by an
       expression.** Since RP-404 a comparison of integer or text arithmetic
       with a constant, and a LIKE / ILIKE of an analysed string column, are
