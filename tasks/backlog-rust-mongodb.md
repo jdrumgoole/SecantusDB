@@ -2728,6 +2728,55 @@ touched:
 
 ## The backlog verifier's pytest stalled once in CI (2026-10-21)
 
+- [ ] **RM-008's limiter test reads mongod's answer under load as a
+  different answer.** `test_ingress_rate_limiter_admits_queues_and_closes`
+  opens six connections against each server with the limiter at one a
+  second and a burst of one, and compares which were answered. In the
+  local RM gate's `backlog verify` step (2026-11-07, load average about
+  11 on 12 cores) mongod answered two connections with no queue, where
+  it answers one: the six connects took longer than a second to land, so
+  the bucket refilled. The test passed three runs out of three on its own
+  at low load. The same happened to this server's side in the RM gate of
+  2026-11-09 (load average about 9: it answered two with `maxQueueDepth`
+  2, where mongod answered one); three runs on their own passed. In the
+  RM gate of 2026-11-13 (load average up to 18) the same queue-2 case
+  differed in a wait instead: this server answered its third connection
+  after a wait that rounded to 3 seconds, mongod after 2; four runs on
+  their own passed, at load 18. A later RM gate that day (RM-515) saw
+  mongod answer two with no queue, as on 2026-11-08; three runs on their
+  own passed. So did the RM-533 gate of 2026-11-14 (load average up to
+  32), and again three runs on their own passed. The first CI occurrence
+  known was on pg-batch snapshot PR #3036 (2026-11-26, head 224a8b6f, run
+  45834896035, job `mdb-binary (backlog)` 139961032166, a PG explain
+  change only): with `maxQueueDepth` 2, this server answered its third
+  connection after a wait that rounded to 3 seconds, mongod after 2, the
+  2026-11-13 case again. The test depends on six connects landing within one
+  second, so it is flaky by construction: it needs a measurement that
+  load cannot change (connect all six behind a barrier and record how
+  long they took to land, or compare with the answer mongod gives when
+  they land within the second), not a retry.
+  Seen again on CI on rm-batch PR #3073 (49c12d71, run 45959038413, job
+  140372204555, 2026-11-27): with `maxQueueDepth` 2 this server answered
+  its third connection after a wait rounding to 2 s, mongod after 1.
+  **A first fix was reverted (2026-11-27).** e663afaaa stopped the
+  server with SIGSTOP while the six sockets connected and sent `hello`,
+  then resumed it with SIGCONT, so the six landed together whatever the
+  load. It passed 6 of 6 locally under 16 CPU burners, but on CI (PR
+  #3076 at e663afaa, run 45985326929, job 140459373674) the test's own
+  client lost its connection to this server (`AutoReconnect: ...
+  connection closed`). The `finally` that turns the limiter off then
+  failed too, so the limiter stayed on with no queue and closed every
+  new connection, and five later tests in the module failed the same
+  way (RM-010, RM-016, RM-302, RM-305 and RM-386 reported REGRESSED).
+  The likely cause is that pymongo's monitor or a pooled connection
+  reconnected while the server was stopped, and the limiter closed it.
+  A next design must keep the client's own connections out of the
+  limiter's path (a separate client created before the limiter is on,
+  with no monitor reconnects) and must restore the parameters even when
+  that client fails, for example from a fresh client after a wait.
+  Backlog-ID: RM-372
+  Verify: none -- a timing flake under load; the test passes when the connects land within a second
+
 - [ ] **A local RM gate's `storage-engine` step failed once on
   `OSError: [Errno 55] No buffer space available` (2026-11-26).**
   `tests/test_getmore_batching.py::test_default_getmore_respects_16mb_byte_budget[rust]`
