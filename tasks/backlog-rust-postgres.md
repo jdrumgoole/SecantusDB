@@ -3154,25 +3154,29 @@ text)` and `create table tct (c ctp, d pint[])` holding `('(1,x)', null)`.
 The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
 
 
+## Found while working RP-1087 (2026-11-27)
+
+Measured on PostgreSQL 15.19. The gap tests are in
+`tests/backlog/test_rp_found_rp1087.py`.
+
+- [ ] **A set operation's type errors name an array type by its internal
+      name.** `select 1 union select array[1]` is 42804 `UNION types integer
+      and integer[] cannot be matched` on PostgreSQL 15.19, here `... integer
+      and _int4 ...`; `select array[1] union select array['a'::text]` is 42846
+      `UNION could not convert type text[] to integer[]`, here `... type _text
+      to _int4`. `unify_set_op_type` and `check_set_op_conversion`
+      (secantus-pg) format the wire type's name, which for an array is
+      `_int4`, where `format_type_be` names the element and `[]`. The
+      positions are right (RP-1087).
+      Verify: tests/backlog/test_rp_found_rp1087.py::test_set_op_error_names_an_array_type_by_its_element
+      Backlog-ID: RP-1176
+
 ## Found while working RP-1050 (2026-11-25)
 
 Measured on PostgreSQL 15.19. The gap tests are in
 `tests/backlog/test_rp_found_rp1050.py`; the `INSERT` one uses
 `test_rp_found_rp552.py`'s `tct (c ctp, d pint[])`.
 
-- [ ] **A set operation's unmatched types are placed at the wrong column
-      or arm.** `select 1, 'a'::text union select 2, 3` is 42804 at 37 (the
-      `3`, the right side of the first unmatched column pair) on PostgreSQL
-      15.19, here at 34 (the right arm's first column); `select 1 union
-      select 'a'::text union select 2` is at 23 (the inner UNION fails
-      first, `transformSetOperationTree` works the left subtree before this
-      node), here at 46; `select 1 union (select 'a'::text union select
-      'b'::text)` is at 24, here none. `error_position` (secantus-pgplan
-      `errpos.rs`) guesses the top node's right arm's first target, as the
-      executor's `unify_set_op_type` raises the error with no location; the
-      faithful fix raises it where the column pair is known.
-      Verify: tests/backlog/test_rp_found_rp1050.py::test_set_op_mismatch_column_and_arm
-      Backlog-ID: RP-1087
 - [ ] **`INSERT ... SELECT` checks the column assignment before the set
       operation's types.** `insert into tct(c) select null::text union
       select 1` is 42804 `UNION types text and integer cannot be matched`

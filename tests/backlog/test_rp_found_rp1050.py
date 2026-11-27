@@ -1,6 +1,7 @@
 """Gap tests of the divergences found while working RP-1050 (a UNION's
 unmatched column types under `INSERT ... SELECT` had no position; fixed): RP-1087
-(the mismatch is placed at the wrong column or arm of a plain query),
+(the mismatch was placed at the wrong column or arm of a plain query;
+fixed),
 RP-1088 (the `INSERT` checks its column's assignment before the set
 operation's types) and RP-1089 (a statement that only analyses its query,
 `EXPLAIN` or `PREPARE`, does not check the set operation's types at all).
@@ -53,10 +54,11 @@ PLACED = {
 }
 
 
-@pytest.mark.backlog("RP-1087")
+@pytest.mark.backlog_fixed("RP-1087")
 @pytest.mark.parametrize("query", list(PLACED))
 def test_set_op_mismatch_column_and_arm(dsn: str, query: str) -> None:
-    """The mismatch is at the right column of the first unmatched pair."""
+    """The mismatch was placed at the right arm's first column of the top
+    node; it is at the right column of the first unmatched pair."""
     got = answer(dsn, query)
     assert got[0] == "42804" and got[2] == PLACED[query], got
 
