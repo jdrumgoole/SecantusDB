@@ -801,8 +801,8 @@ These are explicit non-goals. Don't add them without a reason.
       - the other aggregates (since 2026-11-19 a `$sort` closing stages
         that pass one document on for each, `$addFields`, `$set`, `$unset`,
         `$project`, `$replaceRoot`, `$replaceWith`, over a classic read is
-        counted): a `$sort` with a `$limit` after it (`[{$addFields},
-        {$sort}, {$limit: 5}]` 12 on mongod), a classic `$group` or
+        counted, and since 2026-11-27 with a `$limit` after the `$sort`):
+        a classic `$group` or
         `$count` after such stages (12 for 300 documents), a `$sample`
         (4), one with a `$match` or `$redact` left after
         its read, a `$lookup`,
