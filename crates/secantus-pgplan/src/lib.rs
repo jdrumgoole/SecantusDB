@@ -12799,6 +12799,16 @@ fn plan_explain(
     let mut query = analysed.ok_or_else(|| Error::Parse("EXPLAIN without a statement".into()))?;
     // A one-row constant FROM / USING subquery is pulled up (RP-435).
     dml_pullup::pull_up_constant_subqueries(&mut query)?;
+    // So is one in a SELECT's FROM beside another item, which leaves the
+    // join tree but not the range table (RP-1107). Under ANALYZE the
+    // statement runs as written.
+    if !options.analyze {
+        if let Some(pulled) = dml_pullup::pull_up_select_constant_subqueries(&query) {
+            let mut alt = e.clone();
+            alt.query = Some(Box::new(pg_query::protobuf::Node { node: Some(pulled) }));
+            return join_removal::with_joins_removed(|| plan_explain(&alt, lookup, params));
+        }
+    }
     // One with a FROM item left is planned as the join it is (RP-435).
     if !options.analyze {
         options.modify_table = dml_pullup::dml_join_as_select(&mut query);

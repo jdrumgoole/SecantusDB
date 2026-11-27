@@ -2122,16 +2122,6 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join to a view nothing reads is removed], tests/backlog/test_rp_explain_costs.py::test_plan[a left join to a one-row cte nothing reads is removed]
       Backlog-ID: RP-1106
 
-- [ ] **A GROUP BY over a cross join with a FROM subquery prints a
-      joined-row key.** `explain (costs off) select e.b, count(*) from e,
-      (select 1) x group by e.b` prints `Group Key: e\x1Fb` (the internal
-      `alias<U+001F>column` key, escaped) over a `Nested Loop` of `e` and
-      `Subquery Scan on x`; PostgreSQL (a private 15.20 cluster) pulls the
-      one-row subquery up and prints `HashAggregate`, `Group Key: e.b`,
-      `Seq Scan on e`. Found while working RP-1060.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a group by over a cross join with a one-row subquery prints its key]
-      Backlog-ID: RP-1107
-
 - [ ] **A Sort above a HashAggregate prints no Sort Key.** `explain
       (costs off) select e.b, count(*) from e group by e.b order by e.b`
       prints `Sort` with no `Sort Key` line over `HashAggregate` (`Group
@@ -4007,8 +3997,7 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       off) select count(*) from e join k on e.a = k.a group by e.b` (`e`,
       `k` analysed, 1000 rows) prints `Group Key: e\x1Fb`, the internal
       `alias<U+001F>column` key, over the `Hash Join`; a private
-      PostgreSQL 15.20 cluster prints `Group Key: e.b`. RP-1107 is the same
-      key over a cross join with a one-row subquery. With `where e.a = 3`
+      PostgreSQL 15.20 cluster prints `Group Key: e.b`. With `where e.a = 3`
       PostgreSQL also draws a `GroupAggregate` over a `Sort` (`Sort Key:
       e.b`) over RP-1065's Nested Loop, where this server keeps the
       `HashAggregate` over the `Hash Join`.
@@ -4025,3 +4014,45 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       lists without an aggregate.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of an aggregate prints its output]
       Backlog-ID: RP-1152
+
+## Found while working RP-1107 (2026-11-27)
+
+- [ ] **An aggregate over a comma join prints an unnamed Subquery Scan.**
+      `explain (costs off) select e.b, count(*) from e, k where e.a = k.a
+      group by e.b` (`e`, `k` analysed, 1000 rows) prints `HashAggregate`,
+      `Group Key: e\x1Fb`, then `Subquery Scan on ` (no name) over the
+      `Hash Join`; a private PostgreSQL 15.20 cluster prints the `Hash
+      Join` straight under `Group Key: e.b`, as for the explicit JOIN
+      RP-1151 measures (whose joined-row key is this one's too).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a group by over a comma join prints the join]
+      Backlog-ID: RP-1159
+
+- [ ] **A GROUP BY over the one row a WHERE equality leaves is a
+      HashAggregate.** `explain (costs off) select e.b, count(*) from e
+      where e.a = 3 group by e.b` (`e` analysed, 1000 rows, the filter
+      estimated at one) prints `HashAggregate` over the filtered `Seq Scan
+      on e`; a private PostgreSQL 15.20 cluster prints `GroupAggregate`
+      over `Sort` (`Sort Key: b`), the sorted path cheaper for one row.
+      RP-1151's `where e.a = 3` over a join is the same choice.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a group by over a one-row filter is a group aggregate]
+      Backlog-ID: RP-1160
+
+- [ ] **Some one-row FROM subqueries PostgreSQL pulls up are a Subquery
+      Scan in EXPLAIN.** RP-1107 pulls up a FROM-less subquery of literal
+      targets beside another FROM item (`dml_pullup.rs`,
+      `pull_up_select_constant_subqueries`) only when every reference to
+      it is qualified and outside GROUP BY / ORDER BY / DISTINCT ON. Left
+      as a `Nested Loop` over `Subquery Scan on x` here, against a private
+      PostgreSQL 15.20 cluster: a bare `*` over it (`select * from e,
+      (select 1 c) x` is `Seq Scan on e` there); a WHERE in it (`(select 1
+      where false) x` is a `Result` with `One-Time Filter: false` there); a
+      volatile target (`(select random() r) x` is a `Nested Loop` of a
+      `Result` over `Seq Scan on e` there, not pulled up but not a
+      Subquery Scan either). A target that is not a literal (`select 1 +
+      1`), a bare reference to one of its columns (`select e.b, c from e,
+      (select 1 c) x`), a reference inside a sublink (`where e.a in
+      (select a from k where k.a = x.c)`, a hashed SubPlan with `Index
+      Cond: (a = 1)` there) and one in a key clause are left as written
+      too.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a one-row subquery under a star is pulled up], tests/backlog/test_rp_explain_costs.py::test_plan[a one-row subquery with a false where is a one-time filter], tests/backlog/test_rp_explain_costs.py::test_plan[a volatile one-row subquery is a result under the nested loop]
+      Backlog-ID: RP-1161
