@@ -15881,6 +15881,19 @@ fn check_assigned_literal(
     };
     match const_value(&cast, params) {
         Err(e) if matches!(e.sqlstate(), "23514" | "23502") => Err(e),
+        // `domain_in` reads an element of an array of a domain over
+        // `varchar(n)` / `char(n)` at the domain's modifier, so an overlong
+        // one is 22001 at the literal: `'{abcd}'` into a `vd[]` column,
+        // `vd` over `varchar(3)`, is reported at 29 in `insert into t48v(x)
+        // values ('{abcd}')` (15.20, RP-1084).
+        Err(e)
+            if e.sqlstate() == "22001"
+                && ty
+                    .strip_suffix("[]")
+                    .is_some_and(|element| domains::user_domain(element).is_some()) =>
+        {
+            Err(e)
+        }
         _ => Ok(()),
     }
 }
@@ -20201,9 +20214,22 @@ pub(crate) fn fit_to_column(v: Bson, column: &Column) -> Result<Bson> {
 /// over the element's length coercion function does: an overlong
 /// `varchar(3)[]` element is 22001, not truncated (15.19, RP-695). A NULL
 /// element stays NULL, and an array's lower bounds are kept.
+///
+/// An array of a domain (`vd[]`, `vd` a domain over `varchar(3)`) fits each
+/// element to the domain's base type AT the domain's modifier: the
+/// `ArrayCoerceExpr`'s element step is `coerce_to_domain`, which takes
+/// `getBaseTypeAndTypmod` and applies the base's length coercion, so an
+/// overlong element is 22001 and trailing blanks past the length are
+/// dropped (15.20, RP-1084). The domain's constraints are checked after,
+/// over the fitted value, with the row's other domain checks.
 pub fn fit_assigned_length(v: Bson, pg_type: &str, typmod: i32) -> Result<Bson> {
     match pg_type.strip_suffix("[]") {
-        Some(element) => fit_array_elements(v, element, typmod),
+        Some(element) => match domains::base_type_and_typmod(element) {
+            Some((base, base_typmod, _)) if base_typmod >= 0 && !base.ends_with("[]") => {
+                fit_array_elements(v, &base, base_typmod)
+            }
+            _ => fit_array_elements(v, element, typmod),
+        },
         None => fit_length(v, pg_type, typmod),
     }
 }
@@ -20347,6 +20373,35 @@ mod fit_assigned_length_tests {
         // bit(3)[]: an element of another length is 22026.
         assert!(fit(arr(&["1"]), "bit[]", 3).is_err());
         assert_eq!(fit(arr(&["101"]), "bit[]", 3).unwrap(), arr(&["101"]));
+    }
+
+    /// An array of a domain over `varchar(3)` fits each element to the
+    /// domain's base at the domain's modifier, the column's own modifier
+    /// being -1: `coerce_to_domain` in the `ArrayCoerceExpr` (RP-1084).
+    #[test]
+    fn fits_each_element_of_a_domain_array_at_the_domain_modifier() {
+        use crate::domains::{set_user_domains, Domain};
+        set_user_domains(vec![Domain {
+            name: "vd84".into(),
+            oid: 90_084,
+            base: "varchar".into(),
+            typmod: 7,
+            not_null: false,
+            checks: Vec::new(),
+            not_valid: Vec::new(),
+            default_sql: None,
+            collation: None,
+        }]);
+        let long = fit(arr(&["abcd"]), "vd84[]", -1);
+        let blanks = fit(arr(&["ab  "]), "vd84[]", -1);
+        let short = fit(arr(&["ab"]), "vd84[]", -1);
+        set_user_domains(Vec::new());
+        assert_eq!(
+            long.unwrap_err().to_string(),
+            "value too long for type character varying(3)"
+        );
+        assert_eq!(blanks.unwrap(), arr(&["ab "]));
+        assert_eq!(short.unwrap(), arr(&["ab"]));
     }
 }
 
@@ -49820,7 +49875,9 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             .unwrap_or_else(|| const_value_node(node, params));
         return v.inspect_err(|e| {
             if let Some(at) = literal {
-                if matches!(e.sqlstate(), "23514" | "23502") {
+                if matches!(e.sqlstate(), "23514" | "23502")
+                    || (e.sqlstate() == "22001" && reads_domain_elements(tc))
+                {
                     set_error_location(at);
                 }
             }
@@ -49862,6 +49919,20 @@ fn literal_input_location(tc: &pg_query::protobuf::TypeCast) -> Option<i32> {
     domains::user_domain(&target)
         .is_none()
         .then_some(c.location)
+}
+
+/// Whether `tc` casts to an array of a user domain, whose `array_in` reads
+/// each element with `domain_in`: the base type's input AT the domain's
+/// modifier, so an overlong element of a domain over `varchar(3)` is 22001
+/// under the literal's parser error position (`'{abcd}'::vd[]`, and the
+/// same literal assigned to a `vd[]` column, are at the literal on 15.20,
+/// RP-1084).
+fn reads_domain_elements(tc: &pg_query::protobuf::TypeCast) -> bool {
+    tc.type_name
+        .as_ref()
+        .map(type_name_of)
+        .and_then(|t| t.strip_suffix("[]").map(str::to_string))
+        .is_some_and(|element| domains::user_domain(&element).is_some())
 }
 
 /// The untyped string element of `ARRAY[...]::t[]` whose read as `t`
