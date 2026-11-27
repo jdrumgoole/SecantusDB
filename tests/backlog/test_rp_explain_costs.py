@@ -3240,10 +3240,63 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a = 3)",
         ],
     ),
+    # Measured on a private PostgreSQL 15.20 cluster and on 15.19 (found
+    # while working RP-1065): the ON's
+    # equality merges `e.a` and `k.a` into one class, the WHERE gives it two
+    # constants, and `generate_base_implied_equalities_const` folds `4 = 3`
+    # to a constant false join clause, which makes the join dummy (RP-1102,
+    # fixed).
     "a class fixed to two constants is the empty result": (
-        "RP-1102",
+        "RP-1102:fixed",
         _ANALYSED,
         "explain (costs off) select e.b, k.b from e join k on e.a = k.a where e.a = 3 and k.a = 4",
+        [
+            "Result",
+            "  One-Time Filter: false",
+        ],
+    ),
+    # Measured likewise (RP-1102, fixed): the class reaches a third relation
+    # through a second ON.
+    "a class fixed to two constants through a second join": (
+        "RP-1102:fixed",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e join k on e.a = k.a "
+        "join s on s.a = k.a where e.a = 3 and s.a = 4",
+        [
+            "Result",
+            "  One-Time Filter: false",
+        ],
+    ),
+    # Measured likewise: an int4 and an int8 column are one class, as
+    # `integer_ops` holds both types' `=` (RP-1102, fixed).
+    "a class of an int4 and an int8 column fixed to two constants": (
+        "RP-1102:fixed",
+        _REMOVABLE,
+        "explain (costs off) select * from e join h on e.a = h.a where e.a = 3 and h.a = 4",
+        [
+            "Result",
+            "  One-Time Filter: false",
+        ],
+    ),
+    # Measured likewise: an inner ON's constant joins the class as the
+    # WHERE's does (RP-1102, fixed).
+    "a class fixed to two constants one of them in the on": (
+        "RP-1102:fixed",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e join k on e.a = k.a and k.a = 4 where e.a = 3",
+        [
+            "Result",
+            "  One-Time Filter: false",
+        ],
+    ),
+    # Measured on PostgreSQL 15.19 (found while working RP-1102): the
+    # WHERE's `k.a = 4` is strict on the nullable side, so
+    # `reduce_outer_joins` makes the LEFT join inner before the classes are
+    # built, and the class's two constants make it dummy (RP-1148).
+    "a left join a strict where makes inner with its class fixed to two constants": (
+        "RP-1148",
+        _ANALYSED,
+        "explain (costs off) select * from e left join k on e.a = k.a where e.a = 3 and k.a = 4",
         [
             "Result",
             "  One-Time Filter: false",

@@ -1985,14 +1985,18 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a class constant join beside an expression qual is a nested loop]
       Backlog-ID: RP-1147
 
-- [ ] **A WHERE that fixes one class to two constants is not the empty
-      Result.** `explain (costs off) select e.b, k.b from e join k on e.a =
-      k.a where e.a = 3 and k.a = 4` is a `Hash Join` of two filtered
-      scans here; a private PostgreSQL 15.20 cluster prints `Result` with
-      `One-Time Filter: false`, as `generate_base_implied_equalities_const`
-      reduces `3 = 4` to a constant FALSE. Found while working RP-1065.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a class fixed to two constants is the empty result]
-      Backlog-ID: RP-1102
+- [ ] **A LEFT JOIN a strict WHERE makes inner, whose class the WHERE
+      fixes to two constants, is not the empty Result.** `explain (costs
+      off) select * from e left join k on e.a = k.a where e.a = 3 and k.a =
+      4` is a `Hash Join` of two filtered scans here; PostgreSQL 15.19
+      prints `Result` with `One-Time Filter: false`: `k.a = 4` is strict on
+      the nullable side, so `reduce_outer_joins` makes the join inner, and
+      `generate_base_implied_equalities_const` folds the class's `4 = 3` to
+      false (RP-1102's inner-join case). `join_const_contradiction` reads
+      the statement before the reduction (`joins.rs`) and refuses an outer
+      join. Found while working RP-1102.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join a strict where makes inner with its class fixed to two constants]
+      Backlog-ID: RP-1148
 
 - [ ] **A LEFT JOIN whose WHERE fixes the outer key is still an unpriced
       Hash Left Join where the inner side is not unique, the select list
@@ -3893,7 +3897,14 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       for its first line and nothing after its stop, so its 22 tests were
       `REGRESSED`; no crash report was written, so it did not die of a
       signal, and the module alone passed (22 in 153 s), where three lone
-      fresh starts took 4.1-4.3 s each. Not yet known: whether the
+      fresh starts took 4.1-4.3 s each. A fourth time on 2026-11-27, in
+      RP-1102's `gate_pg.sh --fast` backlog step after a rebase (load
+      average about 3.3, the other lane running): `rust_pg` in
+      `tests/backlog/conftest.py`, for
+      `tests/backlog/test_rp_batch70.py::test_each_encoding_is_its_databases_server_encoding`,
+      gave `''` for its first line, so the test was `REGRESSED`; it passed
+      alone three times (110 s, 6.1 s, 6.0 s), and the same change's gate
+      before the rebase had no start failure. Not yet known: whether the
       server stalled (a lock, a WiredTiger create waiting on a checkpoint)
       or was starved, since the harness keeps no stack or timing of a
       start it gives up on. The harness should sample the child
