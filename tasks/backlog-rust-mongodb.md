@@ -1149,18 +1149,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Rust server". Found 2026-11-23 (RM-634).
       Verify: tests/backlog/test_rm_found_rm634.py::test_an_unpushed_sort_key_read_with_no_sort_is_empty
       Backlog-ID: RM-766
-- [ ] **A `$setWindowFields` behind an `$unwind` hands back tied documents
-      in the order they were read.** mongod 8.2.11 hoists the window's
-      `$sort` ahead of an `$unwind` whose path it does not sort on, so it
-      sorts the documents the `$unwind` took, each then unwound in place:
-      `[{$unwind: "$a"}, {$setWindowFields: {sortBy: {k: 1}, ...}}]` over
-      60 documents of `a: [i % 4, 9]`, `k: i % 3` gives (0, 0), (0, 9),
-      (3, 3), (3, 9), (30, 2), ... on macOS. This server sorts nothing
-      there and keeps the order read, (6, 2) fifth. The fix sorts at the
-      `$unwind` (after the `$match`es in front, which mongod runs first),
-      held to the budget as that sort is. Found 2026-11-14 working RM-527.
-      Verify: tests/backlog/test_rm_found_rm527.py::test_window_sort_hoisted_past_unwind_orders_the_source_documents
-      Backlog-ID: RM-640
 - **Scope decision — SBE's `$concatArrays` refusal names a count mongod
   never set.** Over its budget mongod 8.2.11 says "Concatentating array of
   2 elements and N bytes with array of 87684434848907256 elements and M
