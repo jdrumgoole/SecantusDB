@@ -805,7 +805,9 @@ fn accept_loop(listeners: Vec<TcpListener>, shared: Arc<Shared>) {
                         drop(guard);
                     });
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(ref e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => return,
             }
         }
@@ -924,12 +926,7 @@ fn handle_connection(tcp: TcpStream, shared: Arc<Shared>) -> io::Result<()> {
                 }
                 match conn.complete_io(&mut tcp) {
                     Ok(_) => {}
-                    Err(ref e)
-                        if e.kind() == io::ErrorKind::WouldBlock
-                            || e.kind() == io::ErrorKind::TimedOut =>
-                    {
-                        continue;
-                    }
+                    Err(ref e) if is_read_poll(e) => continue,
                     // Handshake failure / peer hung up — drop the connection.
                     Err(_) => return Ok(()),
                 }
@@ -1919,9 +1916,7 @@ fn stream_awaitable_hello<S: Read + Write>(
             match stream.read(&mut probe) {
                 Ok(0) => return Ok(false), // EOF: client closed / killed
                 Ok(_) => return Ok(false), // unexpected data mid-stream: drop
-                Err(ref e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut => {}
+                Err(ref e) if is_read_poll(e) => {}
                 Err(_) => return Ok(false), // socket error: drop
             }
         }
@@ -1989,6 +1984,20 @@ fn send_bad_value<S: Write>(
     write_op_msg(stream, req, shared, &reply, None)
 }
 
+/// Whether a failed read on a connection socket is only the poll ending
+/// rather than the connection failing: the read timeout (`READ_POLL`) lapsing,
+/// or `Interrupted`. A stop and continue of the server (SIGSTOP/SIGCONT, a
+/// container pause, a debugger attach) fails a read that has a timeout with
+/// EINTR on Linux whatever the signal handlers (signal(7)), and the
+/// connection must go on, as mongod's does (RM-836; found by RM-372's
+/// ingress limiter test, which stops the server).
+fn is_read_poll(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+    )
+}
+
 enum ReadOutcome {
     Filled,
     Closed,
@@ -2036,9 +2045,7 @@ fn read_full<S: Read>(
                     }
                 }
             }
-            Err(ref e)
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
-            {
+            Err(ref e) if is_read_poll(e) => {
                 // Read timeout: loop to re-check the stop flag and deadline. (If
                 // we got a partial read before timing out, `filled` is preserved.)
                 continue;
@@ -2047,6 +2054,33 @@ fn read_full<S: Read>(
         }
     }
     Ok(ReadOutcome::Filled)
+}
+
+#[cfg(test)]
+mod read_poll_tests {
+    use super::is_read_poll;
+    use std::io::{Error, ErrorKind};
+
+    /// RM-836: EINTR from a read with a timeout, after a SIGSTOP/SIGCONT,
+    /// is a poll ending and not a failed connection.
+    #[test]
+    fn an_interrupted_read_is_a_poll_not_a_failure() {
+        for kind in [
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+            ErrorKind::Interrupted,
+        ] {
+            assert!(is_read_poll(&Error::from(kind)), "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::BrokenPipe,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::InvalidData,
+        ] {
+            assert!(!is_read_poll(&Error::from(kind)), "{kind:?}");
+        }
+    }
 }
 
 #[cfg(test)]

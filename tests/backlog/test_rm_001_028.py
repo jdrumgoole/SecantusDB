@@ -154,67 +154,150 @@ def test_ingress_connection_rate_limiter_parameters(rust_mongo: Any, mongod: Any
     assert answers["rust"] == answers["mongod"]
 
 
-def _admitted(client: Any, queue: int) -> list:
-    """Six connections opened at once with the limiter at one connection a
-    second, a burst of one and `queue` allowed to wait: which were answered,
-    and roughly how long each waited."""
-    import socket
-    import struct
-    import threading
-    import time
+def _ingress_request(command: dict) -> bytes:
+    """One OP_MSG request carrying `command`."""
+    body = bson.encode(command)
+    return struct.pack("<iiii", 21 + len(body), 1, 0, 2013) + struct.pack("<I", 0) + b"\x00" + body
 
-    import bson
+
+def _raw_command(sock: Any, command: dict) -> dict:
+    """Send `command` on an open socket and read the reply document; raises
+    OSError when the server closes the socket instead of answering."""
+
+    def exactly(n: int) -> bytes:
+        data = b""
+        while len(data) < n:
+            chunk = sock.recv(n - len(data))
+            if not chunk:
+                raise ConnectionError("the server closed the connection")
+            data += chunk
+        return data
+
+    sock.sendall(_ingress_request(command))
+    (length,) = struct.unpack("<i", exactly(16)[:4])
+    # flagBits (4) and the kind-0 section byte precede the reply document.
+    return bson.decode(exactly(length - 16)[5:])
+
+
+#: The limiter parameters as the servers start with them.
+_INGRESS_OFF = (
+    {"setParameter": 1, "ingressConnectionEstablishmentRateLimiterEnabled": False},
+    {
+        "setParameter": 1,
+        "ingressConnectionEstablishmentRatePerSec": 2147483647,
+        "ingressConnectionEstablishmentBurstCapacitySecs": 1.7976931348623157e308,
+        "ingressConnectionEstablishmentMaxQueueDepth": 0,
+    },
+)
+
+
+def _turn_limiter_off(host: str, port: int, control: Any) -> None:
+    """Put the limiter's parameters back, whatever happened to the test.
+
+    The limiter closes every NEW connection once its bucket is empty, so a
+    test that fails with it on would close the connection of every later
+    test in the module. The `control` connection, opened while the limiter was
+    off, is not in its path and is tried first; if it has gone, a fresh
+    connection is tried once a second, since the bucket refills at one token a
+    second and each pass can be admitted. Raises if nothing gets through in a
+    minute: the limiter must never be left on silently."""
+    deadline = time.monotonic() + 60
+    last: Exception | None = None
+    sock = control
+    while True:
+        try:
+            if sock is None:
+                sock = socket.create_connection((host, port), timeout=10)
+            for command in _INGRESS_OFF:
+                reply = _raw_command(sock, {**command, "$db": "admin"})
+                assert reply.get("ok") == 1, reply
+            return
+        except (OSError, AssertionError) as e:
+            last = e
+            if sock is not None:
+                sock.close()
+            sock = None
+            if time.monotonic() > deadline:
+                raise AssertionError(f"could not turn the ingress limiter off: {last!r}") from e
+            time.sleep(1.1)
+
+
+def _admitted(client: Any, queue: int) -> list:
+    """Six connections arriving at the server at once with the limiter at one
+    connection a second, a burst of one and `queue` allowed to wait: which
+    were answered, and roughly how long each waited.
+
+    The six must reach the server within a second of each other, and six
+    client threads connecting under load do not (RM-372). So the server is
+    stopped (SIGSTOP) while all six connect and send their `hello`: the kernel
+    completes the handshakes in its listen backlog, and on SIGCONT the server
+    accepts all six together, whatever the client's load. Every wait is
+    measured from the SIGCONT, in one thread.
+
+    The limiter closes any NEW connection past its queue, so none of this
+    test's own traffic may open one while it is on: the parameters are set
+    and restored on a raw connection opened before it was turned on (a
+    pymongo client reconnects its monitor and pool, which the limiter can
+    refuse), and the server's pid is read before."""
+    import os
+    import selectors
+    import signal
 
     host, port = client.address
-    admin = client.admin
-
-    def hello() -> Any:
-        s = socket.create_connection((host, port), timeout=10)
-        body = bson.encode({"hello": 1, "$db": "admin"})
-        s.sendall(
-            struct.pack("<iiii", 21 + len(body), 1, 0, 2013) + struct.pack("<I", 0) + b"\x00" + body
-        )
-        started = time.monotonic()
-        try:
-            header = s.recv(16)
-            return (
-                ("answered", round(time.monotonic() - started))
-                if len(header) == 16
-                else ("closed", 0)
-            )
-        except OSError:
-            return ("closed", 0)
-        finally:
-            s.close()
-
-    admin.command(
-        "setParameter",
-        1,
-        ingressConnectionEstablishmentRatePerSec=1,
-        ingressConnectionEstablishmentBurstCapacitySecs=1,
-        ingressConnectionEstablishmentMaxQueueDepth=queue,
-    )
-    admin.command("setParameter", 1, ingressConnectionEstablishmentRateLimiterEnabled=True)
+    pid = client.admin.command("serverStatus")["pid"]
+    request = _ingress_request({"hello": 1, "$db": "admin"})
+    control = socket.create_connection((host, port), timeout=10)
+    stopped = False
+    socks: list = []
     try:
+        for command in (
+            {
+                "setParameter": 1,
+                "ingressConnectionEstablishmentRatePerSec": 1,
+                "ingressConnectionEstablishmentBurstCapacitySecs": 1,
+                "ingressConnectionEstablishmentMaxQueueDepth": queue,
+            },
+            {"setParameter": 1, "ingressConnectionEstablishmentRateLimiterEnabled": True},
+        ):
+            reply = _raw_command(control, {**command, "$db": "admin"})
+            assert reply.get("ok") == 1, reply
         time.sleep(1.2)  # a full bucket
-        results: list = [None] * 6
-        threads = [
-            threading.Thread(target=lambda i=i: results.__setitem__(i, hello())) for i in range(6)
-        ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        os.kill(pid, signal.SIGSTOP)
+        stopped = True
+        for _ in range(6):
+            s = socket.create_connection((host, port), timeout=10)
+            s.sendall(request)
+            socks.append(s)
+        started = time.monotonic()
+        os.kill(pid, signal.SIGCONT)
+        stopped = False
+        sel = selectors.DefaultSelector()
+        for s in socks:
+            sel.register(s, selectors.EVENT_READ)
+        results: list = []
+        while sel.get_map():
+            ready = sel.select(timeout=10)
+            assert ready, "a connection was neither answered nor closed within 10 s"
+            for key, _ in ready:
+                try:
+                    answered = len(key.fileobj.recv(16)) == 16
+                except OSError:
+                    answered = False
+                results.append(
+                    ("answered", round(time.monotonic() - started)) if answered else ("closed", 0)
+                )
+                sel.unregister(key.fileobj)
+                key.fileobj.close()
         return sorted(results)
     finally:
-        admin.command("setParameter", 1, ingressConnectionEstablishmentRateLimiterEnabled=False)
-        admin.command(
-            "setParameter",
-            1,
-            ingressConnectionEstablishmentRatePerSec=2147483647,
-            ingressConnectionEstablishmentBurstCapacitySecs=1.7976931348623157e308,
-            ingressConnectionEstablishmentMaxQueueDepth=0,
-        )
+        if stopped:
+            os.kill(pid, signal.SIGCONT)
+        for s in socks:
+            s.close()
+        try:
+            _turn_limiter_off(host, port, control)
+        finally:
+            control.close()
 
 
 @pytest.mark.backlog_fixed("RM-008")
