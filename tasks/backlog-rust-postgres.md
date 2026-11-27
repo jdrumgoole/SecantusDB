@@ -3748,11 +3748,19 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       after its 8th to 11th; it passes alone, after a test that only
       sleeps 30 s, and after any one of those tests alone. So it is the
       catalog's state after several tests' DDL, not time and not one
-      statement. Not yet known: whether RP-1096's launcher is involved
-      (CI passed the test once, on PR #3056, before it), and whether the
-      third row is a dead `pg_class` row ours treats as visible or a row
-      PostgreSQL would have pruned. `pytest-randomly` shuffles the module
-      on every run, so CI meets it by chance.
+      statement. `pytest-randomly` shuffles the module on every run, so
+      CI meets it by chance. PostgreSQL itself moves the same way
+      (measured while working RP-291, 2026-11-27): on a private 15.20
+      cluster `initdb`'d fresh, `catalog_reads` over `JOIN_METHOD_STEPS`
+      run again and again in one database answers `EXPECTED_JOIN_METHOD`
+      on runs 1 to 3 and differs from run 4 on, in that scenario alone,
+      and a fresh `secantusd-pg` store gives PostgreSQL's answer exactly
+      at every run from 1 to 5. So the server is right and the test is
+      not: its expected answer holds only in a database with little DDL
+      history, and the fix is RP-1111's, to measure the scenarios in a
+      fresh database and re-measure the answer there. The failure is the
+      same on `origin/pg-batch` at `1a4477ac5` and with RP-291's view
+      slice on top (the module in file order with `-n0`).
       Verify: none -- order-dependent; run the module serially with `-p no:randomly`, where test_a_catalog_joins_method_decides_its_reads fails
       Backlog-ID: RP-1145
 
