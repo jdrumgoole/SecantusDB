@@ -56,6 +56,9 @@ const ELEMENT: usize = 16 + 4 + 4 + 1 + 1;
 const BUCKET: usize = 4;
 /// `HASH_TAB_INIT_SIZE`.
 const INIT_BUCKETS: usize = 8;
+/// The `leaf` [`Stored::set_path`] takes for a field an exclusion
+/// projection removes, which it writes only where the input has it.
+pub const REMOVED: usize = usize::MAX;
 /// What an empty BSON object takes.
 const EMPTY_BSON: usize = 5;
 
@@ -274,6 +277,18 @@ impl Stored {
         }
     }
 
+    /// The top-level field `name` of `doc` cached as a read made on
+    /// another storage over the same BSON (an exclusion projection reads the
+    /// input after its output's storage was copied from it): its value as
+    /// read, its bytes still counted in the BSON.
+    pub fn cache_unread(&mut self, doc: &Document, name: &str) {
+        if self.cached(name).is_none() {
+            if let Some(v) = doc.get(name) {
+                self.append(name, Held::read(v));
+            }
+        }
+    }
+
     /// A read of the dotted `path` of `doc`, the document this storage
     /// holds (`getNestedField`, `ExpressionFieldPath::evaluatePath`): each
     /// field on it from the BSON into the cache of the document that holds
@@ -343,7 +358,15 @@ impl Stored {
     /// returned at this level; `leaf`: what the value written holds.
     pub fn set_path(&mut self, input: Option<&Document>, out: &Document, path: &str, leaf: usize) {
         let Some((top, rest)) = path.split_once('.') else {
-            self.set_field(path, leaf);
+            if leaf != REMOVED {
+                self.set_field(path, leaf);
+            } else if input.is_some_and(|d| d.contains_key(path)) {
+                self.set_field(path, 0);
+            } else {
+                // `MutableDocument::remove` of a field the document does not
+                // have leaves its cache alone.
+                self.modified = true;
+            }
             return;
         };
         if let Some(input) = input {

@@ -460,10 +460,9 @@ pub fn apply_pipeline(
         ) || name == crate::sbe::ENGINE_STAGE
             || name == INHIBIT_OPTIMIZATION
             || (name == "$project"
-                && spec
-                    .as_document()
-                    .and_then(docstore::Inclusion::parse)
-                    .is_some());
+                && spec.as_document().is_some_and(|d| {
+                    docstore::Inclusion::parse(d).is_some() || exclusion_paths(d).is_some()
+                }));
         let changes = matches!(name.as_str(), "$unwind" | "$addFields" | "$set");
         if stores.is_none() && changes && counts_storage(&pipeline[i + 1..]) {
             stores = Some(read_stores(&docs));
@@ -914,6 +913,10 @@ fn stored_stage(
         "$project" => spec.as_document().and_then(docstore::Inclusion::parse),
         _ => None,
     };
+    let exclusion = match (name, &inclusion) {
+        ("$project", None) => spec.as_document().and_then(exclusion_paths),
+        _ => None,
+    };
     let mut out = Vec::with_capacity(docs.len());
     let mut kept = Vec::with_capacity(docs.len());
     let mut reads = Vec::new();
@@ -929,14 +932,14 @@ fn stored_stage(
             }
             "$unset" => {
                 if let [o] = one.as_slice() {
-                    kept.push(unset_storage(spec, s, o)?);
+                    kept.push(excluded_storage(&unset_paths(spec)?, &d, s, o));
                 }
             }
-            "$project" => {
-                if let ([o], Some(inc)) = (one.as_slice(), &inclusion) {
-                    kept.push(inc.apply(&d, &s, o, vars));
-                }
-            }
+            "$project" => match (one.as_slice(), &inclusion, &exclusion) {
+                ([o], Some(inc), _) => kept.push(inc.apply(&d, &s, o, vars)),
+                ([o], None, Some(paths)) => kept.push(excluded_storage(paths, &d, s, o)),
+                _ => {}
+            },
             "$replaceRoot" | "$replaceWith" => {
                 if let [o] = one.as_slice() {
                     kept.push(replaced_storage(name, spec, &d, s, o));
@@ -1083,12 +1086,74 @@ fn added_storage(
 /// The storage of what `$unset` makes of a document a stage before it
 /// changed: each field it names written as missing
 /// (`MutableDocument::remove`), the BSON beneath still holding it.
-fn unset_storage(spec: &Bson, mut s: docstore::Stored, out: &Document) -> R<docstore::Stored> {
-    for path in unset_paths(spec)? {
-        let top = path.split('.').next().unwrap_or_default();
-        s.set_field(top, field_held(out, top));
+/// The storage of what an exclusion projection (`$unset`, or a `$project`
+/// that only excludes) makes of `input` (`ExclusionNode::applyProjection`,
+/// 8.2): a copy of the input's storage with each excluded top-level field
+/// removed (written empty), and a sub-document a path goes through
+/// projected into a copy of its own storage with the field below removed
+/// (RM-637).
+fn excluded_storage(
+    paths: &[String],
+    input: &Document,
+    mut s: docstore::Stored,
+    out: &Document,
+) -> docstore::Stored {
+    // The fields removed at the top level first (`_projectedFields`), then
+    // each child projection. The first write copies the input's storage,
+    // so a child read of the input after a top-level removal caches its
+    // field in the input's storage and not in the output's.
+    let mut written = false;
+    for path in paths.iter().filter(|p| !p.contains('.')) {
+        s.set_field(path, field_held(out, path));
+        written = true;
     }
-    Ok(s)
+    for path in paths.iter().filter(|p| p.contains('.')) {
+        let top = path.split('.').next().unwrap_or_default();
+        if written {
+            s.cache_unread(input, top);
+        }
+        s.set_path(Some(input), out, path, docstore::REMOVED);
+        written = true;
+    }
+    s
+}
+
+/// The paths an exclusion `$project` removes, flattened from its nested
+/// form (`{e: {y: 0}}` is `e.y`); `None` unless every leaf is a false or a
+/// zero (an inclusion, an expression or an operator is another projection).
+pub(crate) fn exclusion_paths(spec: &Document) -> Option<Vec<String>> {
+    fn walk(prefix: &str, d: &Document, out: &mut Vec<String>) -> bool {
+        for (k, v) in d {
+            if k.starts_with('$') {
+                return false;
+            }
+            let path = if prefix.is_empty() {
+                k.clone()
+            } else {
+                format!("{prefix}.{k}")
+            };
+            let excluded = match v {
+                Bson::Boolean(b) => !*b,
+                Bson::Int32(n) => *n == 0,
+                Bson::Int64(n) => *n == 0,
+                Bson::Double(n) => *n == 0.0,
+                Bson::Document(sub) if !sub.is_empty() => {
+                    if !walk(&path, sub, out) {
+                        return false;
+                    }
+                    continue;
+                }
+                _ => return false,
+            };
+            if !excluded {
+                return false;
+            }
+            out.push(path);
+        }
+        true
+    }
+    let mut out = Vec::new();
+    (walk("", spec, &mut out) && !out.is_empty()).then_some(out)
 }
 
 thread_local! {
@@ -3413,5 +3478,24 @@ mod project_id_only_tests {
         assert_eq!(project(bson!({"_id": true})), doc! {"_id": 1});
         assert_eq!(project(bson!({"_id": 1, "v": 0})), doc! {"_id": 1, "w": 2});
         assert_eq!(project(bson!({"_id": 0, "w": 1})), doc! {"w": 2});
+    }
+}
+
+#[cfg(test)]
+mod exclusion_paths_tests {
+    use super::exclusion_paths;
+    use bson::doc;
+
+    #[test]
+    fn an_exclusion_is_flattened_and_anything_else_is_not_one() {
+        assert_eq!(
+            exclusion_paths(&doc! {"b": 0, "e": {"z": {"k": false}}, "x.y": 0.0}),
+            Some(vec!["b".into(), "e.z.k".into(), "x.y".into()])
+        );
+        assert_eq!(exclusion_paths(&doc! {"_id": 0}), Some(vec!["_id".into()]));
+        assert_eq!(exclusion_paths(&doc! {"_id": 0, "a": 1}), None);
+        assert_eq!(exclusion_paths(&doc! {"a": {"$slice": 1}}), None);
+        assert_eq!(exclusion_paths(&doc! {"a": "$b"}), None);
+        assert_eq!(exclusion_paths(&doc! {}), None);
     }
 }

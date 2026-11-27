@@ -1149,17 +1149,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Rust server". Found 2026-11-23 (RM-634).
       Verify: tests/backlog/test_rm_found_rm634.py::test_an_unpushed_sort_key_read_with_no_sort_is_empty
       Backlog-ID: RM-766
-- [ ] **A `$sort` behind an exclusion `$project` counts each document
-      as the BSON it encodes.** mongod 8.2.11's exclusion `$project` keeps
-      the input's own storage and writes each excluded field out of it,
-      and projects a sub-document (`{"e.y": 0}`) into one of its own;
-      behind an `$unwind`, the `$sort` after it counts 4640 bytes over ten
-      documents for `{b: 0}` and 6930 for `{"e.y": 0}`. This server counts
-      2350 and 2850: the storage model (`docstore`, RM-408) models an
-      inclusion `$project` (RM-519) and stops at an exclusion. Found
-      2026-11-13 (RM-519).
-      Verify: tests/backlog/test_rm_found_rm519.py::test_a_sort_counts_what_an_exclusion_project_left
-      Backlog-ID: RM-637
 - [ ] **A `$project` behind a `$group` pushed into SBE is sized as if it
       were read.** `[{$group: {_id: "$n", c: {$sum: 1}}}, {$project: {c:
       1}}, {$sort: {c: 1}}]`: mongod 8.2.11's `$project` builds each

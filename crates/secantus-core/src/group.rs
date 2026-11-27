@@ -2081,6 +2081,11 @@ pub fn downstream_fields(stages: &[Bson]) -> Option<std::collections::BTreeSet<S
                 let Bson::Document(p) = spec else {
                     return None;
                 };
+                // An exclusion keeps everything else: `{_id: 0}` alone and
+                // the nested form `{e: {y: 0}}` too (RM-637).
+                if crate::aggregate::exclusion_paths(p).is_some() {
+                    return None;
+                }
                 let mut id = true;
                 for (k, v) in p {
                     if falsy(v) {

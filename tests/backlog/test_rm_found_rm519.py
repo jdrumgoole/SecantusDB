@@ -33,19 +33,37 @@ def _stages(client: Any, pipeline: list) -> list:
     return [(next(iter(s)), s.get("totalDataSizeSortedBytesEstimate")) for s in ex["stages"][1:]]
 
 
+_EXCLUSIONS = (
+    {"b": 0},
+    {"e.y": 0},
+    {"b": 0, "e.y": 0},
+    {"e": {"z": {"k": False}}},
+    {"_id": 0},
+    {"q": 0},
+    {"e.q": 0},
+    {"b": 0, "a": 0},
+)
+
+
 def _excluded(client: Any) -> dict:
-    return {
+    out = {
         str(spec): _stages(client, [{"$unwind": "$t"}, {"$project": spec}, {"$sort": {"n": 1}}])
-        for spec in ({"b": 0}, {"e.y": 0})
+        for spec in _EXCLUSIONS
     }
+    for path in ("b", "e.y"):
+        out[path] = _stages(client, [{"$unwind": "$t"}, {"$unset": path}, {"$sort": {"n": 1}}])
+    return out
 
 
-@pytest.mark.backlog("RM-637")
+@pytest.mark.backlog_fixed("RM-637")
 def test_a_sort_counts_what_an_exclusion_project_left(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11's exclusion `$project` writes each excluded field out
-    of the input's own storage, and projects a sub-document into one of its
-    own: behind an `$unwind`, the `$sort` counts 4640 bytes over ten
-    documents for `{b: 0}` and 6930 for `{"e.y": 0}`."""
+    """mongod 8.2.11's exclusion `$project` (and `$unset`) writes each
+    excluded field out of the input's own storage, and projects a
+    sub-document into one of its own: behind an `$unwind`, the `$sort`
+    counts 4640 bytes over ten documents for `{b: 0}` and 6930 for
+    `{"e.y": 0}`. This server counted 2350 and 2850 until RM-637 modelled
+    the exclusion, the top-level removals coming before the sub-document
+    projections, and `{_id: 0}` alone read as an exclusion."""
     assert _excluded(rust_mongo) == _excluded(mongod)
 
 
