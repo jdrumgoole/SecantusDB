@@ -375,10 +375,20 @@ def test_idle_buckets_expire_past_the_memory_threshold(tmp_path: pathlib.Path) -
     the first write), opening a bucket for a new metadata value closes idle
     ones: of 21 buckets opened for 21 metadata values the catalog holds fewer
     (14 to 17 across runs: which ones expire depends on the stripe each lands
-    in), `numBucketsClosedDueToMemoryThreshold` equals
-    `numBucketsArchivedDueToMemoryThreshold` and is at least 1, and every
-    bucket document stays stored. Asserted as those facts, not the counts.
-    The accounting (RM-710) decides when the threshold is passed."""
+    in), `numBucketsClosedDueToMemoryThreshold` is at least 1 and no more than
+    `numBucketsArchivedDueToMemoryThreshold`, and every bucket document stays
+    stored. Asserted as those facts, not the counts. The accounting (RM-710)
+    decides when the threshold is passed.
+
+    No more, not equal (found 2026-11-27 reading `expireIdleBuckets`): an
+    idle bucket is archived, and an archived bucket is closed only while the
+    memory is still over the threshold. While the catalog is just past
+    30000 bytes (the sixth to eighth bucket) an archive can leave the memory
+    under it, so that bucket stays archived until its stripe is next
+    written; later expiries find the memory far over the threshold and close
+    what they archive. The four runs measured on 2026-11-26 all happened to
+    be equal; a closed bucket is always one that was archived first.
+    """
     t = dt.datetime(2026, 1, 1)
 
     def probe(client: Any) -> dict:
@@ -396,7 +406,7 @@ def test_idle_buckets_expire_past_the_memory_threshold(tmp_path: pathlib.Path) -
         return {
             "fewer_buckets_than_opened": s.get("numBuckets", 21) < 21,
             "expired": closed >= 1,
-            "closed_equals_archived": closed == archived,
+            "closed_follows_archived": closed <= archived,
             "all_documents_stored": client["rm_bucket_catalog"][
                 "system.buckets.ts"
             ].count_documents({})
@@ -408,7 +418,7 @@ def test_idle_buckets_expire_past_the_memory_threshold(tmp_path: pathlib.Path) -
     assert want == {
         "fewer_buckets_than_opened": True,
         "expired": True,
-        "closed_equals_archived": True,
+        "closed_follows_archived": True,
         "all_documents_stored": True,
     }
     assert got == want
