@@ -1149,15 +1149,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Rust server". Found 2026-11-23 (RM-634).
       Verify: tests/backlog/test_rm_found_rm634.py::test_an_unpushed_sort_key_read_with_no_sort_is_empty
       Backlog-ID: RM-766
-- [ ] **A `$sort` behind a `$setWindowFields` that sorted by the same key
-      is kept.** `[{$unwind: "$t"}, {$set: {w: 1}}, {$setWindowFields:
-      {sortBy: {n: 1}, ...}}, {$sort: {n: 1}}]`: mongod 8.2.11 drops the
-      trailing `$sort`, its explain ending at `$_internalSetWindowFields`;
-      this server keeps it and lists a `$sort` after the window, as it does
-      with a `$project` in the `$set`'s place. Behind the `$unwind` alone
-      it drops it, as mongod does. Found 2026-11-13 (RM-519).
-      Verify: tests/backlog/test_rm_found_rm519.py::test_a_sort_after_a_window_on_its_key_is_dropped
-      Backlog-ID: RM-639
 - [ ] **A `$setWindowFields` behind an `$unwind` hands back tied documents
       in the order they were read.** mongod 8.2.11 hoists the window's
       `$sort` ahead of an `$unwind` whose path it does not sort on, so it

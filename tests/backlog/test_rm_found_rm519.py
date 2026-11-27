@@ -90,24 +90,61 @@ def test_a_project_after_a_pushed_down_group_builds_its_documents(
     assert _after_pushed_group(rust_mongo) == _after_pushed_group(mongod)
 
 
-def _after_window(client: Any) -> list:
+def _window(by: dict, **extra: Any) -> dict:
+    return {"$setWindowFields": {**extra, "sortBy": by, "output": {"z": {"$first": "$n"}}}}
+
+
+_AFTER_WINDOW = (
+    [{"$unwind": "$t"}, {"$set": {"w": 1}}, _window({"n": 1}), {"$sort": {"n": 1}}],
+    [{"$unwind": "$t"}, _window({"n": 1}), {"$sort": {"n": 1, "_id": 1}}],
+    [{"$set": {"w": 1}}, _window({"n": 1}), {"$sort": {"n": 1, "_id": 1}}],
+    [{"$set": {"w": 1}}, _window({"n": 1, "_id": 1}), {"$sort": {"n": 1}}],
+    [{"$set": {"w": 1}}, _window({"n": 1}), {"$sort": {"n": -1}}],
+    [{"$set": {"w": 1}}, _window({"n": 1}), {"$sort": {"_id": 1}}],
+    [{"$set": {"w": 1}}, _window({"n": 1}), {"$skip": 0}, {"$sort": {"n": 1}}],
+    [{"$set": {"w": 1}}, _window({"n": 1}), {"$match": {"n": 2}}, {"$sort": {"n": 1}}],
+    [{"$set": {"w": 1}}, _window({"n": 1}), _window({"n": 1}), {"$sort": {"n": 1}}],
+    [
+        {"$set": {"w": 1}},
+        _window({"n": 1}),
+        {"$sort": {"n": 1}},
+        _window({"n": 1}),
+        {"$sort": {"n": 1}},
+    ],
+    [{"$set": {"w": 1}}, _window({"n": 1}, partitionBy="$a"), {"$sort": {"a": 1}}],
+    [{"$set": {"w": 1}}, _window({"n": 1}, partitionBy="$a"), {"$sort": {"n": 1}}],
+    [{"$set": {"w": 1}}, _window({"n": 1}, partitionBy={"$add": ["$a", 1]}), {"$sort": {"n": 1}}],
+    [
+        {"$group": {"_id": "$n", "n": {"$first": "$n"}}},
+        _window({"n": 1}),
+        {"$sort": {"n": 1, "_id": 1}},
+    ],
+)
+
+
+def _sort_keys(client: Any, pipeline: list) -> list:
+    _stages(client, [{"$set": {"w": 1}}])  # seeds the collection
+    ex = client.rmfoundrm519.command(
+        {"explain": {"aggregate": "c", "pipeline": pipeline, "cursor": {}}}
+    )
     return [
-        name
-        for name, _ in _stages(
-            client,
-            [
-                {"$unwind": "$t"},
-                {"$set": {"w": 1}},
-                {"$setWindowFields": {"sortBy": {"n": 1}, "output": {"z": {"$first": "$n"}}}},
-                {"$sort": {"n": 1}},
-            ],
-        )
+        (name, spec.get("sortKey") if name == "$sort" else None)
+        for s in ex["stages"][1:]
+        for name, spec in s.items()
+        if name.startswith("$")
     ]
 
 
-@pytest.mark.backlog("RM-639")
+def _after_window(client: Any) -> list:
+    return [_sort_keys(client, p) for p in _AFTER_WINDOW]
+
+
+@pytest.mark.backlog_fixed("RM-639")
 def test_a_sort_after_a_window_on_its_key_is_dropped(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 drops a `$sort` behind a `$setWindowFields` that
-    sorted by the same key: behind an `$unwind` and a `$set`, its explain
-    ends at the `$_internalSetWindowFields`."""
+    """mongod 8.2.11 takes a `$sort` right behind a `$setWindowFields`
+    into the `$sort` the window runs behind when either key is a prefix
+    of the other, the longer kept: behind an `$unwind` and a `$set`, its
+    explain ends at the `$_internalSetWindowFields`. This server kept the
+    trailing `$sort` until RM-639 modelled the rule, on the stages a
+    window parses into, past `$skip: 0` and not past anything else."""
     assert _after_window(rust_mongo) == _after_window(mongod)
