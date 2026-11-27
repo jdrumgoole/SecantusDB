@@ -6,7 +6,7 @@ field's domain error with no position; fixed), RP-1044 (a `text` SELECT
 column written to a composite column was accepted; fixed), RP-1048 (a
 `text` SELECT column written to a domain-array column was accepted; fixed), RP-1049
 (a `record` SELECT column written to a composite column was accepted;
-fixed), RP-1086 (one written to a non-composite column is 0A000), RP-1050
+fixed), RP-1086 (one written to a non-composite column was 0A000; fixed), RP-1050
 (a UNION of a composite and a record had no error position; fixed), RP-946
 (a NULL element of a NOT NULL domain's array literal was accepted; fixed),
 RP-947 (a
@@ -38,6 +38,8 @@ _SETUP = [
     "drop domain if exists dctp cascade",
     "drop type if exists ctp cascade",
     "drop domain if exists pint, nnint cascade",
+    "drop table if exists trec cascade",
+    "drop type if exists ren cascade",
     "create domain pint as int check (value > 0)",
     "create domain nnint as int not null",
     "create type ctp as (a pint, b text)",
@@ -45,6 +47,9 @@ _SETUP = [
     "create table tdc (e dctp)",
     "create table tct (c ctp, d pint[])",
     "create table tnn (x nnint[])",
+    "create type ren as enum ('a')",
+    'create table trec (i int, ch "char", j jsonb, e ren, r int4range, '
+    "ta text[], ia int[], t text, v varchar(10), n name, bp char(5))",
     "insert into tct(c) values ('(1,x)')",
 ]
 
@@ -56,7 +61,7 @@ _NNINT = "domain nnint does not allow null values"
 def dsn(rust_pg: object) -> Iterator[str]:
     yield _dsn(rust_pg) + " dbname=postgres"
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
-        for q in _SETUP[:7]:
+        for q in _SETUP[:9]:
             c.execute(q)
 
 
@@ -258,14 +263,56 @@ def test_values_record_into_composite_is_stored(dsn: str) -> None:
     assert answer(dsn, "insert into tct(c) values (row(1,'x')), (row(2,'y'))") == "INSERT 0 2"
 
 
-@pytest.mark.backlog("RP-1086")
+@pytest.mark.backlog_fixed("RP-1086")
 def test_insert_select_record_into_non_composite(dsn: str) -> None:
-    """`record` to `pint[]` has no assignment cast; here it is 0A000."""
+    """`record` to `pint[]` has no assignment cast; it was 0A000."""
     assert answer(dsn, "insert into tct(d) select row(1,'x')") == (
         "42804",
         'column "d" is of type pint[] but expression is of type record',
         "27",
     )
+
+
+def _record_mismatch(column: str, ty: str, source: str, position: str) -> tuple[str, str, str]:
+    return (
+        "42804",
+        f'column "{column}" is of type {ty} but expression is of type {source}',
+        position,
+    )
+
+
+# A `record` is a pseudo-type, so the only ASSIGNMENT coercion out of it is
+# the I/O conversion into the string category (`find_coercion_pathway`),
+# element by element for a `record[]` into an array. Everything else is
+# refused in analysis, an empty source included.
+RECORD_INTO = {
+    "insert into trec(i) select row(1,'x')": _record_mismatch("i", "integer", "record", "28"),
+    "insert into trec(ch) select row(1,'x')": _record_mismatch("ch", '"char"', "record", "29"),
+    "insert into trec(j) select row(1,'x')": _record_mismatch("j", "jsonb", "record", "28"),
+    "insert into trec(e) select row(1,'x')": _record_mismatch("e", "ren", "record", "28"),
+    "insert into trec(r) select row(1,'x')": _record_mismatch("r", "int4range", "record", "28"),
+    "insert into trec(ta) select row(1,'x')": _record_mismatch("ta", "text[]", "record", "29"),
+    "insert into trec(ia) select array[row(1,'x')]": _record_mismatch(
+        "ia", "integer[]", "record[]", "29"
+    ),
+    "insert into trec(i) select row(1,'x') where false": _record_mismatch(
+        "i", "integer", "record", "28"
+    ),
+    "insert into trec(i) select row(1,'x') union select row(2,'y')": _record_mismatch(
+        "i", "integer", "record", "28"
+    ),
+    "insert into trec(t, v, n, bp) select row(1,'x'), row(2,'y'), row(3,'z'), row(4,'w') "
+    "returning t, v, n, bp": [("(1,x)", "(2,y)", "(3,z)", "(4,w)")],
+    "insert into trec(ta) select array[row(1,'x')] returning ta": [(["(1,x)"],)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-1086")
+@pytest.mark.parametrize("query", list(RECORD_INTO))
+def test_insert_select_record_into_builtin(query: str, dsn: str) -> None:
+    """Each refusal was 0A000 at the row write or, into `"char"` or an
+    empty source, no error at all; the string types still take the text."""
+    assert answer(dsn, query) == RECORD_INTO[query]
 
 
 @pytest.mark.backlog_fixed("RP-1050")
