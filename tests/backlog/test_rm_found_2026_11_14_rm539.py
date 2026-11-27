@@ -237,7 +237,7 @@ def _join_field_lookup(client: Any) -> Any:
     return mongo_answer(run)
 
 
-@pytest.mark.backlog("RM-683")
+@pytest.mark.backlog_fixed("RM-683")
 def test_a_lookup_on_join_fields_is_explained_as_sbe_runs_it(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -245,7 +245,8 @@ def test_a_lookup_on_join_fields_is_explained_as_sbe_runs_it(
     """mongod 8.2.11 pushes a `$lookup` on `localField` / `foreignField`
     over a collection into SBE and explains it so: `explainVersion` "2", no
     `stages`, an `EQ_LOOKUP` on top of the query's plan. This server lists
-    a classic `$cursor` and a `$lookup` stage."""
+    a classic `$cursor` and a `$lookup` stage until 2026-11-26 (the hash
+    join; the strategies after it are still open under RM-683)."""
     assert _join_field_lookup(rust_mongo) == _join_field_lookup(mongod_rs)
 
 

@@ -16,6 +16,9 @@ struct Out {
     indent: usize,
     /// Nothing written since the last new line: a separator is dropped.
     fresh: bool,
+    /// The indent the text started at: a line back at it is one column
+    /// short.
+    base: usize,
 }
 
 impl Out {
@@ -24,10 +27,25 @@ impl Out {
             text: String::new(),
             indent: 0,
             fresh: false,
+            base: 0,
+        }
+    }
+
+    /// Text whose lines start `level` indents in, as a stage at that depth
+    /// of a plan prints its expressions.
+    fn at(level: usize) -> Self {
+        Out {
+            text: String::new(),
+            indent: level,
+            fresh: false,
+            base: level,
         }
     }
 
     fn push(&mut self, s: &str) {
+        if self.fresh && self.base > 0 && self.indent == self.base {
+            self.text.pop();
+        }
         self.text.push_str(s);
         self.fresh = false;
     }
@@ -43,7 +61,8 @@ impl Out {
     /// instead, as mongod prints a nested `if` (`else if ...` ends both
     /// blocks on one line; RM-693).
     fn newline(&mut self) {
-        if self.fresh {
+        let here = self.text.len() - self.text.rfind('\n').map_or(0, |i| i + 1);
+        if self.fresh && here != self.indent * 4 {
             let start = self.text.rfind('\n').map_or(0, |i| i + 1);
             self.text.truncate(start);
         } else {
@@ -160,10 +179,31 @@ fn expr(e: &Expr, out: &mut Out) {
             out.indent -= 1;
             out.newline();
         }
+        Expr::Let { frame, bind, body } => {
+            out.indent += 1;
+            out.newline();
+            out.push("let [");
+            out.indent += 1;
+            out.newline();
+            out.push(&format!("l{frame}.0 = "));
+            expr(bind, out);
+            out.space();
+            out.indent -= 1;
+            out.newline();
+            out.push("]");
+            out.space();
+            out.newline();
+            out.push("in ");
+            expr(body, out);
+            out.space();
+            out.indent -= 1;
+            out.newline();
+        }
         Expr::Lambda { frame, body } => {
             out.push(&format!("lambda(l{frame}.0) {{ "));
             expr(body, out);
-            out.push(" }");
+            out.space();
+            out.push("}");
         }
         Expr::TypeMatch(e, mask) => {
             out.push("typeMatch(");
@@ -261,16 +301,26 @@ fn op_text(op: BinOp) -> &'static str {
     }
 }
 
-/// An expression's text, as a stage line prints it.
+/// An expression's text, as a stage line prints it at the top.
+#[cfg(test)]
 pub(super) fn expression(e: &Expr) -> String {
-    let mut out = Out::new();
+    expression_at(e, 0)
+}
+
+/// An expression's text in a stage line `level` indents deep: its lines
+/// start there, and a closing line sits one column short of the indent.
+fn expression_at(e: &Expr, level: usize) -> String {
+    let mut out = Out::at(level);
     expr(e, &mut out);
+    if out.fresh && level > 0 {
+        out.text.pop();
+    }
     out.text
 }
 
 /// An expression's text as `executionStats` lists it: with the separator
 /// after its last token, unless that ended a line.
-fn listed(e: &Expr) -> String {
+pub(super) fn listed(e: &Expr) -> String {
     let mut out = Out::new();
     expr(e, &mut out);
     out.space();
@@ -284,8 +334,13 @@ fn slots(list: &[u32]) -> String {
         .join(", ")
 }
 
+/// One line of a stage at `level` indents.
+fn push(lines: &mut Vec<String>, level: usize, text: String) {
+    lines.push(format!("{}{text}", "    ".repeat(level)));
+}
+
 /// One stage's line, then the lines of the stages under it.
-fn stage(st: &Stage, lines: &mut Vec<String>) {
+fn stage(st: &Stage, level: usize, lines: &mut Vec<String>) {
     match st {
         Stage::IxSeek {
             node,
@@ -296,7 +351,7 @@ fn stage(st: &Stage, lines: &mut Vec<String>) {
             uuid,
             ..
         } => {
-            lines.push(format!(
+            push(lines, level, format!(
                 "[{node}] ixseek {} {} none s{record_id} none none [] @\"{uuid}\" @\"{index}\" true ",
                 key_string(low),
                 key_string(high)
@@ -310,7 +365,7 @@ fn stage(st: &Stage, lines: &mut Vec<String>) {
             uuid,
         } => {
             let fields: Vec<String> = fields.iter().map(|(n, s)| format!("s{s} = {n}")).collect();
-            lines.push(format!(
+            push(lines, level, format!(
                 "[{node}] scan s{record} s{record_id} none none none none none none [{}] @\"{uuid}\" true false ",
                 fields.join(", ")
             ));
@@ -320,8 +375,12 @@ fn stage(st: &Stage, lines: &mut Vec<String>) {
             predicate,
             input,
         } => {
-            lines.push(format!("[{node}] filter {{{}}} ", expression(predicate)));
-            stage(input, lines);
+            push(
+                lines,
+                level,
+                format!("[{node}] filter {{{}}} ", expression_at(predicate, level)),
+            );
+            stage(input, level, lines);
         }
         Stage::LimitSkip {
             node,
@@ -332,22 +391,26 @@ fn stage(st: &Stage, lines: &mut Vec<String>) {
             let slot =
                 |a: &Option<(u32, i64)>| a.map_or("none".to_string(), |(s, _)| format!("s{s}"));
             match skip {
-                None => lines.push(format!("[{node}] limit {} ", slot(limit))),
-                Some(_) => lines.push(format!(
-                    "[{node}] limitskip {} {} ",
-                    slot(limit),
-                    slot(skip)
-                )),
+                None => push(lines, level, format!("[{node}] limit {} ", slot(limit))),
+                Some(_) => push(
+                    lines,
+                    level,
+                    format!("[{node}] limitskip {} {} ", slot(limit), slot(skip)),
+                ),
             }
-            stage(input, lines);
+            stage(input, level, lines);
         }
         Stage::Project { node, binds, input } => {
             let binds: Vec<String> = binds
                 .iter()
-                .map(|(s, e)| format!("s{s} = {}", expression(e)))
+                .map(|(s, e)| format!("s{s} = {}", expression_at(e, level)))
                 .collect();
-            lines.push(format!("[{node}] project [{}] ", binds.join(", ")));
-            stage(input, lines);
+            push(
+                lines,
+                level,
+                format!("[{node}] project [{}] ", binds.join(", ")),
+            );
+            stage(input, level, lines);
         }
         Stage::Sort {
             node,
@@ -370,8 +433,8 @@ fn stage(st: &Stage, lines: &mut Vec<String>) {
             if let Some((s, _)) = limit {
                 line.push_str(&format!("s{s} "));
             }
-            lines.push(line);
-            stage(input, lines);
+            push(lines, level, line);
+            stage(input, level, lines);
         }
         Stage::Group {
             node,
@@ -382,21 +445,140 @@ fn stage(st: &Stage, lines: &mut Vec<String>) {
             let mut line = format!("[{node}] group [{}] [", slots(keys));
             let accs: Vec<String> = aggs
                 .iter()
-                .map(|a| format!("s{} = {}", a.slot, expression(&a.call())))
+                .map(|a| format!("s{} = {}", a.slot, expression_at(&a.call(), level)))
                 .collect();
             line.push_str(&accs.join(", "));
             line.push_str("] ");
             if !aggs.is_empty() {
                 let spills: Vec<u32> = aggs.iter().map(|a| a.spill).collect();
-                let merging: Vec<String> = aggs.iter().map(|a| expression(&a.merging)).collect();
+                let merging: Vec<String> = aggs
+                    .iter()
+                    .map(|a| expression_at(&a.merging, level))
+                    .collect();
                 line.push_str(&format!(
                     "spillSlots[{}] mergingExprs[{}] ",
                     slots(&spills),
                     merging.join(", ")
                 ));
             }
-            lines.push(line);
-            stage(input, lines);
+            push(lines, level, line);
+            stage(input, level, lines);
+        }
+        Stage::Coscan { node } => push(lines, level, format!("[{node}] coscan ")),
+        Stage::LimitLit { node, limit, input } => {
+            push(lines, level, format!("[{node}] limit {limit}ll "));
+            stage(input, level, lines);
+        }
+        Stage::Unwind {
+            node,
+            input_slot,
+            out,
+            index,
+            preserve,
+            input,
+        } => {
+            push(
+                lines,
+                level,
+                format!("[{node}] unwind s{out} s{index} s{input_slot} {preserve} "),
+            );
+            stage(input, level, lines);
+        }
+        Stage::Branch {
+            node,
+            predicate,
+            then_slots,
+            else_slots,
+            outputs,
+            then_,
+            else_,
+        } => {
+            push(
+                lines,
+                level,
+                format!(
+                    "[{node}] branch {{{}}} [{}] ",
+                    expression_at(predicate, level),
+                    slots(outputs)
+                ),
+            );
+            let mark = lines.len();
+            stage(then_, level, lines);
+            if let Some(first) = lines.get_mut(mark) {
+                let (pad, rest) = first.split_at(level * 4);
+                *first = format!("{pad}[{}] {rest}", slots(then_slots).replace(", ", " "));
+            }
+            lines.push(" ".repeat(level * 4));
+            let mark = lines.len();
+            stage(else_, level, lines);
+            if let Some(first) = lines.get_mut(mark) {
+                let (pad, rest) = first.split_at(level * 4);
+                *first = format!("{pad}[{}] {rest}", slots(else_slots).replace(", ", " "));
+            }
+        }
+        Stage::Union {
+            node,
+            inputs,
+            outputs,
+        } => {
+            push(
+                lines,
+                level,
+                format!("[{node}] union [{}] ", slots(outputs)),
+            );
+            for (i, (slots_of, input)) in inputs.iter().enumerate() {
+                push(
+                    lines,
+                    level + 1,
+                    format!("branch{i} [{}] ", slots(slots_of)),
+                );
+                stage(input, level + 2, lines);
+            }
+        }
+        Stage::Nlj {
+            node,
+            projects,
+            correlated,
+            outer,
+            inner,
+        } => {
+            push(
+                lines,
+                level,
+                format!(
+                    "[{node}] nlj inner [{}] [{}] ",
+                    slots(projects),
+                    slots(correlated)
+                ),
+            );
+            push(lines, level + 1, "left ".to_string());
+            stage(outer, level + 2, lines);
+            push(lines, level + 1, "right ".to_string());
+            stage(inner, level + 2, lines);
+        }
+        Stage::HashLookup {
+            node,
+            outer_key,
+            inner_key,
+            inner_value,
+            out,
+            outer,
+            inner,
+            ..
+        } => {
+            push(
+                lines,
+                level,
+                format!("[{node}] hash_lookup [s{out} = addToArray(s{inner_value})] "),
+            );
+            push(lines, level + 1, format!("outer s{outer_key} "));
+            stage(outer, level + 2, lines);
+            push(
+                lines,
+                level + 1,
+                format!("inner s{inner_key} s{inner_value} "),
+            );
+            stage(inner, level + 2, lines);
         }
     }
 }
@@ -408,11 +590,54 @@ fn key_string(bytes: &[u8]) -> String {
     format!("KS({hex})")
 }
 
+/// Whether a stage in the tree prints its inputs as indented blocks.
+fn has_blocks(st: &Stage) -> bool {
+    matches!(
+        st,
+        Stage::HashLookup { .. } | Stage::Nlj { .. } | Stage::Branch { .. } | Stage::Union { .. }
+    ) || st.inputs().into_iter().any(has_blocks)
+}
+
 /// `slotBasedPlan.stages`.
 pub(super) fn stages(root: &Stage) -> String {
     let mut lines = Vec::new();
-    stage(root, &mut lines);
-    lines.join("\n")
+    stage(root, 0, &mut lines);
+    // A stage with blocks under it (a join, a branch, a union) ends the
+    // text with the new line that closes the last block.
+    let mut text = lines.join("\n");
+    if has_blocks(root) {
+        text.push('\n');
+    }
+    text
+}
+
+/// What the scans under a stage read, and how many there are: a join's
+/// `totalDocsExamined` and `collectionScans`.
+fn tally(stage: &Stage, counted: &Counted) -> (i64, i64) {
+    let mut docs = 0;
+    let mut scans = 0;
+    if matches!(stage, Stage::Scan { .. }) {
+        docs += counted.reads;
+        scans += 1;
+    }
+    for (input, below) in stage.inputs().into_iter().zip(counted.children()) {
+        let (d, c) = tally(input, below);
+        docs += d;
+        scans += c;
+    }
+    (docs, scans)
+}
+
+/// The scan statistics a join stage lists first.
+fn join_stats(stage: &Stage, counted: &Counted, out: &mut Document) {
+    let (docs, scans) = tally(stage, counted);
+    out.insert("totalDocsExamined", super::number(docs));
+    out.insert("totalKeysExamined", 0_i32);
+    out.insert("collectionScans", super::number(scans));
+    out.insert("collectionSeeks", 0_i32);
+    out.insert("indexScans", 0_i32);
+    out.insert("indexSeeks", 0_i32);
+    out.insert("indexesUsed", Bson::Array(vec![]));
 }
 
 /// The fields `executionStats` adds for each kind of stage.
@@ -490,6 +715,77 @@ pub(super) fn specific_stats(st: &Stage, counted: &Counted, out: &mut Document) 
             out.insert("orderBySlots", order);
             let outs: Vec<Bson> = outputs.iter().map(|s| Bson::Int64(*s as i64)).collect();
             out.insert("outputSlots", outs);
+        }
+        Stage::Coscan { .. } => {}
+        Stage::LimitLit { limit, .. } => {
+            // A limit that was never opened reports no amount.
+            if counted.opens != Some(0) {
+                out.insert("limit", super::number(*limit));
+            }
+        }
+        Stage::Unwind {
+            input_slot,
+            out: out_slot,
+            index,
+            preserve,
+            ..
+        } => {
+            out.insert("inputSlot", super::number(*input_slot as i64));
+            out.insert("outSlot", super::number(*out_slot as i64));
+            out.insert("outIndexSlot", super::number(*index as i64));
+            out.insert("preserveNullAndEmptyArrays", i32::from(*preserve));
+        }
+        Stage::Branch {
+            predicate,
+            then_slots,
+            else_slots,
+            outputs,
+            ..
+        } => {
+            let list =
+                |v: &[u32]| -> Vec<Bson> { v.iter().map(|s| Bson::Int64(*s as i64)).collect() };
+            out.insert("numTested", super::number(counted.tested));
+            out.insert("thenBranchOpens", super::number(counted.then_opens));
+            let closes = |i: usize| counted.kids.get(i).and_then(|k| k.closes).unwrap_or(0);
+            out.insert("thenBranchCloses", super::number(closes(0)));
+            out.insert("elseBranchOpens", super::number(counted.else_opens));
+            out.insert("elseBranchCloses", super::number(closes(1)));
+            out.insert("filter", listed(predicate));
+            out.insert("thenSlots", list(then_slots));
+            out.insert("elseSlots", list(else_slots));
+            out.insert("outputSlots", list(outputs));
+        }
+        Stage::Union {
+            inputs, outputs, ..
+        } => {
+            let list =
+                |v: Vec<u32>| -> Vec<Bson> { v.iter().map(|s| Bson::Int64(*s as i64)).collect() };
+            out.insert(
+                "inputSlots",
+                list(inputs.iter().flat_map(|(s, _)| s.iter().copied()).collect()),
+            );
+            out.insert("outputSlots", list(outputs.clone()));
+        }
+        Stage::Nlj {
+            projects,
+            correlated,
+            ..
+        } => {
+            let list =
+                |v: &[u32]| -> Vec<Bson> { v.iter().map(|s| Bson::Int64(*s as i64)).collect() };
+            join_stats(st, counted, out);
+            out.insert("innerOpens", super::number(counted.inner_opens));
+            out.insert("innerCloses", super::number(counted.inner_closes));
+            out.insert("outerProjects", list(projects));
+            out.insert("outerCorrelated", list(correlated));
+        }
+        Stage::HashLookup { .. } => {
+            join_stats(st, counted, out);
+            out.insert("usedDisk", false);
+            out.insert("spills", 0_i32);
+            out.insert("spilledRecords", 0_i32);
+            out.insert("spilledBytes", 0_i32);
+            out.insert("spilledDataStorageSize", 0_i32);
         }
         Stage::Group { keys, aggs, .. } => {
             let keys: Vec<Bson> = keys.iter().map(|s| Bson::Int64(*s as i64)).collect();

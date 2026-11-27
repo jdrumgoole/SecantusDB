@@ -2456,9 +2456,10 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             let parsed = parsed::parsed_query(&s.filter);
             // The one plan is an index scan whose documents need no fetch:
             // a group that reads no field counts its keys (RM-072).
-            let seek = (tried.len() <= 1 && s.skip == 0 && s.limit == 0)
-                .then(|| count_seek(&plan))
-                .flatten();
+            let seek =
+                (front.lookups.is_empty() && tried.len() <= 1 && s.skip == 0 && s.limit == 0)
+                    .then(|| count_seek(&plan))
+                    .flatten();
             let filter = if seek.is_some() {
                 None
             } else {
@@ -2474,11 +2475,18 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             let filtered = s.filter.is_empty() || on.filter.is_some();
             let uuid = crate::admin::collection_uuid_text(storage, &db, &s.coll);
             let last = front.tail.is_empty() && s.rest.len() == front.pushed;
-            front
-                .group
-                .as_ref()
-                .filter(|_| (forward_scan && filtered) || on.seek.is_some())
-                .and_then(|g| sbe::group_plan(g, &uuid, last, &on))
+            if front.lookups.is_empty() {
+                front
+                    .group
+                    .as_ref()
+                    .filter(|_| (forward_scan && filtered) || on.seek.is_some())
+                    .and_then(|g| sbe::group_plan(g, &uuid, last, &on))
+            } else if forward_scan && filtered {
+                lookup_joins(ctx, &front.lookups)
+                    .and_then(|joins| sbe::lookup_plan(&uuid, &on, &joins, last))
+            } else {
+                None
+            }
         } else {
             Some(sbe::eof_plan())
         };
@@ -2818,6 +2826,9 @@ struct SbeFront {
     /// The `$group` among them that is built here (RM-071), the one a
     /// `$count` is included (RM-072).
     group: Option<Document>,
+    /// The `$lookup` specs among them, when every stage pushed is one that
+    /// is built here (RM-683).
+    lookups: Vec<Document>,
     /// The classic stages a pushed stage leaves after the plan: a
     /// `$count`'s `$project`.
     tail: Vec<Document>,
@@ -2857,8 +2868,40 @@ fn sbe_front(
         ),
         _ => (None, vec![]),
     };
-    let plain = group.is_some()
-        && pushed == 1
+    // A `$lookup` on join fields, or several in a row, over a plain query.
+    let lookups: Vec<Document> = s.rest[..pushed]
+        .iter()
+        .map_while(|st| st.get_document("$lookup").ok().cloned())
+        .collect();
+    // What follows must hand on whole documents: mongod puts a projection
+    // of the fields a later stage reads under the pushed stages otherwise,
+    // and moves a `$match` that does not read a joined array ahead of the
+    // `$lookup` into the query; neither is built here.
+    let joined: Vec<&str> = lookups
+        .iter()
+        .filter_map(|l| l.get_str("as").ok())
+        .collect();
+    let reads_joined = |filter: &Document| {
+        !filter.is_empty()
+            && filter.keys().all(|k| {
+                joined
+                    .iter()
+                    .any(|j| k == j || k.strip_prefix(j).is_some_and(|r| r.starts_with('.')))
+            })
+    };
+    let whole = s.rest[pushed..]
+        .iter()
+        .all(|st| match st.keys().next().map(String::as_str) {
+            Some("$addFields" | "$set") => true,
+            Some("$match") => st.get_document("$match").is_ok_and(&reads_joined),
+            _ => false,
+        });
+    let lookups = if lookups.len() == pushed && whole {
+        lookups
+    } else {
+        vec![]
+    };
+    let plain = ((group.is_some() && pushed == 1) || !lookups.is_empty())
         && s.sort.is_none()
         && s.projection_stage.is_none()
         && s.hint.is_none()
@@ -2866,8 +2909,81 @@ fn sbe_front(
     (plain || !exists).then_some(SbeFront {
         pushed,
         group,
+        lookups,
         tail,
     })
+}
+
+/// The `$lookup` stages as the hash join builds them, each with the foreign
+/// collection it reads (RM-683); `None` for one mongod joins another way
+/// or this server has not built: a foreign field an index leads with (an
+/// indexed loop join), a collection past what a hash join takes (10,000
+/// documents or 100 MiB, `internalQueryCollectionMaxNoOfDocumentsToChooseHashJoin`
+/// and `...MaxDataSizeBytesToChooseHashJoin`, a nested loop join), a
+/// collation, or a spec whose names are not plain strings.
+fn lookup_joins(ctx: &CommandContext, specs: &[Document]) -> Option<Vec<sbe::Join>> {
+    let storage = ctx.storage().ok()?;
+    let db = &ctx.db_name;
+    let mut joins = Vec::new();
+    for spec in specs {
+        let from = spec.get_str("from").ok()?;
+        let local = spec.get_str("localField").ok()?;
+        let foreign = spec.get_str("foreignField").ok()?;
+        let as_field = spec.get_str("as").ok()?;
+        if spec.len() != 4 + usize::from(spec.contains_key("let")) {
+            return None;
+        }
+        let namespace = format!("{db}.{from}");
+        if !storage.collection_exists(db, from).unwrap_or(false) {
+            joins.push(sbe::Join {
+                namespace,
+                local_field: local.to_string(),
+                foreign_field: foreign.to_string(),
+                as_field: as_field.to_string(),
+                foreign: None,
+            });
+            continue;
+        }
+        let options = storage.get_collection_options(db, from).unwrap_or_default();
+        if options.contains_key("collation") || options.contains_key("clusteredIndex") {
+            return None;
+        }
+        let t = target(ctx, from).ok()?;
+        let led = t.catalog.iter().any(|ix| {
+            ix.key.keys().next().is_some_and(|first| {
+                first == foreign
+                    || first
+                        .strip_prefix(foreign)
+                        .is_some_and(|r| r.starts_with('.'))
+                    || foreign
+                        .strip_prefix(first.as_str())
+                        .is_some_and(|r| r.starts_with('.'))
+            })
+        }) || foreign == "_id"
+            || foreign.starts_with("_id.");
+        if led {
+            return None;
+        }
+        let docs = t.docs(storage).ok()?;
+        let bytes: usize = docs
+            .iter()
+            .map(|d| secantus_core::bsondoc::to_vec(d).map_or(usize::MAX / 2, |v| v.len()))
+            .sum();
+        if docs.len() > 10_000 || bytes >= 100 * 1024 * 1024 {
+            return None;
+        }
+        joins.push(sbe::Join {
+            namespace,
+            local_field: local.to_string(),
+            foreign_field: foreign.to_string(),
+            as_field: as_field.to_string(),
+            foreign: Some((
+                crate::admin::collection_uuid_text(storage, db, from),
+                docs.to_vec(),
+            )),
+        });
+    }
+    Some(joins)
 }
 
 /// Under `queryFramework: "sbe"`, the `$addFields` / `$set` specs of a

@@ -1248,29 +1248,56 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2 documents and 2 keys of `b_1`). Found 2026-11-26 working RM-682.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_an_expr_equality_on_a_let_variable_uses_an_index
       Backlog-ID: RM-813
-- [ ] **A `$lookup` on `localField` / `foreignField` is explained as a
-      classic stage.** mongod 8.2.11 pushes it into SBE over a collection
-      and explains it so (`explainVersion` "2", no `stages`, an `EQ_LOOKUP`
-      on top of the query's plan); this server lists a `$cursor` and a
-      `$lookup` stage. Found 2026-11-14 (RM-539).
-      Sized 2026-11-26 against 8.2.11 (`from` d, `localField` a,
-      `foreignField` b, no index): `queryPlan` is `EQ_LOOKUP` (planNodeId 2,
-      `strategy` "HashJoin", `scanDirection`, `foreignCollection`,
-      `localField`, `foreignField`, `asField`) over a `COLLSCAN`, and the
-      `slotBasedPlan` is `project makeBsonObj(MakeObjSpec([z = Set(0)], ...))`
-      / `project (s13 ?: [])` / `hash_lookup [addToArray]` with an outer
-      `arrayToSet(...)` key projection over the scan and an inner `nlj` over
-      the foreign scan whose right side is a spilling `group addToSet` over
-      `nlj` / `branch {isArray}` / `union` / `unwind` / `limit 1` / `coscan`.
-      None of `hash_lookup`, `nlj`, `branch`, `union`, `unwind`, `coscan`
-      or `makeBsonObj` exists in `explain/sbe/` yet, and an index on the
-      foreign field gives the IndexedLoopJoin strategy, a different plan.
-      Slices: the stages and expressions with their runs and
-      `executionStats` (HashJoin first), then IndexedLoopJoin, then the
-      NestedLoopJoin cutover; emitting the `queryPlan` alone would be a
-      stand-in.
-      Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_a_lookup_on_join_fields_is_explained_as_sbe_runs_it
+- [ ] **A `$lookup` on `localField` / `foreignField` that mongod joins by
+      an index or a nested loop is explained as a classic stage.** mongod
+      8.2.11 pushes every `$lookup` on join fields over a collection into
+      SBE and explains it so (`explainVersion` "2", no `stages`, an
+      `EQ_LOOKUP` on top of the query's plan). Since 2026-11-26 the hash
+      join is built (`explain/sbe/lookup.rs`, `corr.rs`): the `EQ_LOOKUP` of
+      strategy `HashJoin` or `NonExistentForeignCollection`, the
+      `hash_lookup`, `nlj`, `group`, `branch`, `union`, `unwind`, `limit` and
+      `coscan` stages with their slots and frames, and each stage's
+      `executionStats` from a run of the foreign side's key program over
+      both collections, for a plain collection scan (a `$match`, `$skip` or
+      `$limit` in front, none after but a `$match` of the joined array or an
+      `$addFields`). Open: the two other strategies, which mongod picks by
+      the foreign collection (measured 8.2.11): `IndexedLoopJoin` when an
+      index (not sparse, partial, hidden or collated; btree or hashed) leads
+      with the foreign field, `_id` included; `NestedLoopJoin` past 10,000
+      documents or 100 MiB (`internalQueryCollectionMaxNoOfDocumentsToChooseHashJoin`,
+      `...MaxDataSizeBytesToChooseHashJoin`). Both are explained as the
+      classic `$cursor` and `$lookup` here, which `lookup_joins`
+      (`explain/mod.rs`) declines on purpose: a stand-in `queryPlan` alone
+      would be wrong. Slices: IndexedLoopJoin (an `ixseek` / `seek` over the
+      foreign index with its stats), then the NestedLoopJoin cutover.
+      Verify: tests/backlog/test_rm_lookup_sbe.py::test_a_lookup_on_an_indexed_foreign_field_is_an_indexed_loop_join, tests/backlog/test_rm_lookup_sbe.py::test_a_lookup_on_a_large_foreign_collection_is_a_nested_loop_join
       Backlog-ID: RM-683
+- [ ] **A `$lookup` beside other pushed stages is explained as a classic
+      stage.** mongod 8.2.11 runs a `$lookup` in SBE after a `$sort`,
+      `$project` or `$group` in front, and with a `$project`, `$group`,
+      `$count`, `$limit`, `$skip` or `$sort` after it (the last three move
+      ahead of the `$lookup` into the query; a `$project` after it puts a
+      projection of the fields it reads, plus the local field, under it),
+      over a query an index serves (`IXSCAN` and `FETCH` under the
+      `EQ_LOOKUP`), and with a dotted `as`; this server explains each as a
+      classic `$cursor` and `$lookup`. Found 2026-11-26 working RM-683, whose builder takes a
+      plain collection scan and stages that hand on whole documents.
+      Verify: tests/backlog/test_rm_lookup_sbe.py::test_a_lookup_among_other_pushed_stages_is_explained_as_sbe
+      Backlog-ID: RM-827
+- [ ] **A `$match` that does not read a `$lookup`'s `as` field is listed
+      after it.** mongod 8.2.11 moves such a `$match` ahead of the
+      `$lookup` into the query (`parsedQuery` {a: {$eq: 1}}, and the
+      `COLLSCAN`'s filter), classic or SBE; this server lists it after the
+      `$lookup` with an empty query. Found 2026-11-26 working RM-683.
+      Verify: tests/backlog/test_rm_lookup_sbe.py::test_a_match_moves_ahead_of_a_classic_lookup_that_does_not_read_it
+      Backlog-ID: RM-828
+- [ ] **A `$unwind` after a `$lookup` is listed as a stage of its own.**
+      mongod 8.2.11 absorbs a `$unwind` of the `as` field into the
+      `$lookup` (`unwinding: {preserveNullAndEmptyArrays: false}`, and the
+      stages after it count the unwound documents); this server lists both
+      stages. Found 2026-11-26 working RM-683.
+      Verify: tests/backlog/test_rm_lookup_sbe.py::test_an_unwind_after_a_lookup_is_listed_inside_it
+      Backlog-ID: RM-829
 - [ ] **The operation rows `currentOp` lists lack mongod's detail.** Since
       2026-10-20 a registry of running operations stands behind
       `currentOp`, `$currentOp` (with `idleCursors`) and `killOp`, which

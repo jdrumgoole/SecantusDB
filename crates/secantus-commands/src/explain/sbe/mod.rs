@@ -17,14 +17,21 @@
 //! in SBE (RM-418, `find.rs`): the same collection scan, filter, skip and
 //! limit, with a simple projection over them, which is also what it runs
 //! for a `distinct` and an `aggregate`'s query, with the `$addFields` an
-//! `aggregate` puts over it (RM-542). Everything else SBE runs is still
+//! `aggregate` puts over it (RM-542). And the hash join of a `$lookup` on
+//! `localField` / `foreignField` over a collection scan (`lookup.rs`,
+//! RM-683): `hash_lookup` over the query's plan and a scan of the foreign
+//! collection, each foreign record's keys made by a correlated program of
+//! `nlj`, `branch`, `union`, `unwind`, `limit` and `coscan` (`corr.rs`),
+//! run over both collections' documents. Everything else SBE runs is still
 //! explained in the classic shape (`tasks/backlog-rust-mongodb.md`, RM-071,
 //! RM-543).
 
+mod corr;
 mod expr;
 mod filter;
 mod find;
 mod group;
+mod lookup;
 mod print;
 mod stage;
 
@@ -32,6 +39,7 @@ use bson::{doc, Bson, Document};
 use expr::Slot;
 pub(crate) use filter::Filter;
 pub(crate) use group::{Front, Seek};
+pub(crate) use lookup::Join;
 use stage::{Counted, Stage};
 
 /// A built slot-based plan.
@@ -74,6 +82,14 @@ pub(crate) fn sorted_plan(uuid: &str, front: &Front, field: &str, desc: bool) ->
 /// (RM-542). `None` when a spec is outside what is built here.
 pub(crate) fn added_plan(uuid: &str, front: &Front, adds: &[Document]) -> Option<Plan> {
     find::build_added(uuid, front, adds)
+}
+
+/// The plan for `joins` (`$lookup` stages on `localField` / `foreignField`,
+/// in order) over `front`, a collection scan of the collection whose UUID
+/// is `uuid` (RM-683); `last`: nothing classic follows. `None` when it is
+/// outside what is built here.
+pub(crate) fn lookup_plan(uuid: &str, front: &Front, joins: &[Join], last: bool) -> Option<Plan> {
+    lookup::build(uuid, front, joins, last)
 }
 
 /// The plan mongod builds over a collection that does not exist.
@@ -239,17 +255,22 @@ impl Plan {
             } else {
                 counted
             };
-            // What the scan at the bottom read.
-            let mut scan = &counted;
-            while let Some(below) = scan.input.as_deref() {
-                scan = below;
+            // What the scans and index seeks under the plan read; an index
+            // seek examines keys and no document.
+            fn examined_by(c: &Counted) -> (i64, i64) {
+                let (mut docs, mut keys) = if c.seeks > 0 {
+                    (0, c.keys)
+                } else {
+                    (c.reads, 0)
+                };
+                for below in c.children() {
+                    let (d, k) = examined_by(below);
+                    docs += d;
+                    keys += k;
+                }
+                (docs, keys)
             }
-            // An index seek examines keys and no document.
-            let (examined, keys) = if scan.seeks > 0 {
-                (0, scan.keys)
-            } else {
-                (scan.reads, 0)
-            };
+            let (examined, keys) = examined_by(&counted);
             let pulled = Pulled { produced, eof };
             let pulled = (grouped && !matches!(pull, Pull::Find)).then_some(&pulled);
             let stages = stats_doc(&self.root, &counted, pulled, saves);
@@ -294,20 +315,43 @@ fn stats_doc(
         "planNodeId": stage.node() as i32,
         "nReturned": number(returned),
         "executionTimeMillisEstimate": 0_i32,
-        "opens": 1_i32,
-        "closes": 1_i32,
+        "opens": number(counted.opens.unwrap_or(1)),
+        "closes": number(counted.closes.unwrap_or(1)),
         "saveState": number(saved),
         "restoreState": number(restored),
         "isEOF": i32::from(eof),
     };
     print::specific_stats(stage, counted, &mut out);
-    if let (Some(input), Some(below)) = (stage.input(), counted.input.as_deref()) {
-        let under = if matches!(stage, Stage::Group { .. }) {
-            None
-        } else {
-            pulled
-        };
-        out.insert("inputStage", stats_doc(input, below, under, saves));
+    let under = if matches!(stage, Stage::Group { .. }) {
+        None
+    } else {
+        pulled
+    };
+    let inputs: Vec<Document> = stage
+        .inputs()
+        .into_iter()
+        .zip(counted.children())
+        .map(|(input, below)| stats_doc(input, below, under, saves))
+        .collect();
+    match (stage, inputs.len()) {
+        (Stage::Branch { .. }, 2) => {
+            out.insert("thenStage", inputs[0].clone());
+            out.insert("elseStage", inputs[1].clone());
+        }
+        (Stage::Nlj { .. }, 2) => {
+            out.insert("outerStage", inputs[0].clone());
+            out.insert("innerStage", inputs[1].clone());
+        }
+        (Stage::Union { .. } | Stage::HashLookup { .. }, _) => {
+            out.insert(
+                "inputStages",
+                Bson::Array(inputs.into_iter().map(Bson::Document).collect()),
+            );
+        }
+        (_, 1) => {
+            out.insert("inputStage", inputs.into_iter().next().unwrap_or_default());
+        }
+        _ => {}
     }
     out
 }

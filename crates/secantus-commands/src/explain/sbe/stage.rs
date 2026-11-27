@@ -3,6 +3,7 @@
 //! each one keeps (`PlanStageStats` / `SpecificStats`), and printed as
 //! mongod's `debugPrint` prints them.
 
+use super::corr;
 use super::expr::{compare, Env, Expr, Slot, Value};
 use bson::{Bson, Document};
 use std::cmp::Ordering;
@@ -27,6 +28,9 @@ pub(crate) enum AggFn {
     /// `addToArrayCapped(e, cap)` / `addToSetCapped(e, cap)`.
     AddToArray(i32),
     AddToSet(i32),
+    /// `addToSet(e)`: a `$lookup`'s foreign key set (`aggSetUnion` merges
+    /// its spills).
+    AddToSetUncapped,
 }
 
 impl AggFn {
@@ -41,11 +45,12 @@ impl AggFn {
             AggFn::Max => "max",
             AggFn::AddToArray(_) => "addToArrayCapped",
             AggFn::AddToSet(_) => "addToSetCapped",
+            AggFn::AddToSetUncapped => "addToSet",
         }
     }
 
     /// The accumulator's state after one more row whose argument is `v`.
-    fn step(&self, state: Value, v: Value) -> Value {
+    pub(super) fn step(&self, state: Value, v: Value) -> Value {
         match self {
             AggFn::Count => Some(Bson::Int64(match state {
                 Some(Bson::Int64(n)) => n + 1,
@@ -91,6 +96,21 @@ impl AggFn {
                     }
                 }
             },
+            AggFn::AddToSetUncapped => {
+                let mut items = match state {
+                    Some(Bson::Array(a)) => a,
+                    _ => vec![],
+                };
+                if let Some(x) = v {
+                    if !items
+                        .iter()
+                        .any(|y| secantus_core::order::cmp(y, &x) == Ordering::Equal)
+                    {
+                        items.push(x);
+                    }
+                }
+                Some(Bson::Array(items))
+            }
             AggFn::AddToArray(_) | AggFn::AddToSet(_) => {
                 let mut items = match state {
                     Some(Bson::Array(mut s)) => match s.first_mut() {
@@ -191,6 +211,67 @@ pub(crate) enum Stage {
         aggs: Vec<Agg>,
         input: Box<Stage>,
     },
+    /// `CoScanStage`: one empty row per pull, never at EOF.
+    Coscan { node: u32 },
+    /// `LimitSkipStage` with a literal limit (`limit 1ll`).
+    LimitLit {
+        node: u32,
+        limit: i64,
+        input: Box<Stage>,
+    },
+    /// `UnwindStage`: each element of the array in `input_slot` into
+    /// `out`, its position into `index`; a value that is no array, or an
+    /// empty one, passes once when `preserve`.
+    Unwind {
+        node: u32,
+        input_slot: Slot,
+        out: Slot,
+        index: Slot,
+        preserve: bool,
+        input: Box<Stage>,
+    },
+    /// `BranchStage`: `then_` where the predicate holds of the correlated
+    /// row, else `else_`; each branch's output slots become `outputs`.
+    Branch {
+        node: u32,
+        predicate: Expr,
+        then_slots: Vec<Slot>,
+        else_slots: Vec<Slot>,
+        outputs: Vec<Slot>,
+        then_: Box<Stage>,
+        else_: Box<Stage>,
+    },
+    /// `UnionStage`: each input's rows in turn, an input's slots read into
+    /// `outputs`.
+    Union {
+        node: u32,
+        inputs: Vec<(Vec<Slot>, Stage)>,
+        outputs: Vec<Slot>,
+    },
+    /// `LoopJoinStage` (`nlj inner`): the inner side runs once per outer
+    /// row, reading `correlated` from it.
+    Nlj {
+        node: u32,
+        projects: Vec<Slot>,
+        correlated: Vec<Slot>,
+        outer: Box<Stage>,
+        inner: Box<Stage>,
+    },
+    /// `HashLookupStage`: `inner` yields each foreign record (`inner_value`)
+    /// with its set of join keys (`inner_key`); each `outer` row, with its
+    /// own keys in `outer_key`, gets the array of the records it matches in
+    /// `out` (`addToArray`).
+    HashLookup {
+        node: u32,
+        outer_key: Slot,
+        inner_key: Slot,
+        inner_value: Slot,
+        out: Slot,
+        outer: Box<Stage>,
+        inner: Box<Stage>,
+        /// The foreign collection's documents in record order.
+        foreign: Vec<Document>,
+    },
 }
 
 /// What running a stage counted (`CommonStats` and the stage's own).
@@ -206,9 +287,24 @@ pub(crate) struct Counted {
     /// The stage was asked for a row after its last one.
     pub eof: bool,
     pub input: Option<Box<Counted>>,
+    /// The counts of a stage with several inputs, or of one run again for
+    /// each row of the stage it is correlated with (`corr.rs`), in order.
+    pub kids: Vec<Counted>,
+    /// How often the stage was opened and closed, where it is not once.
+    pub opens: Option<i64>,
+    pub closes: Option<i64>,
+    /// A `nlj`'s inner side opens and closes; a `branch`'s opens of each
+    /// side.
+    pub inner_opens: i64,
+    pub inner_closes: i64,
+    pub then_opens: i64,
+    pub else_opens: i64,
+    /// A `branch`'s side that is open now, which stays open while it is
+    /// re-opened on the same side.
+    pub side: Option<usize>,
 }
 
-type Row = HashMap<Slot, Value>;
+pub(super) type Row = HashMap<Slot, Value>;
 
 /// A group key: the key slots' values under BSON comparison.
 #[derive(Clone, Debug)]
@@ -255,6 +351,13 @@ impl Stage {
             | Stage::Project { node, .. }
             | Stage::IxSeek { node, .. }
             | Stage::Sort { node, .. }
+            | Stage::Coscan { node }
+            | Stage::LimitLit { node, .. }
+            | Stage::Unwind { node, .. }
+            | Stage::Branch { node, .. }
+            | Stage::Union { node, .. }
+            | Stage::Nlj { node, .. }
+            | Stage::HashLookup { node, .. }
             | Stage::Group { node, .. } => *node,
         }
     }
@@ -504,11 +607,44 @@ impl Stage {
                     },
                 )
             }
+            Stage::HashLookup { .. } => corr::hash_lookup(self, docs, demand),
+            Stage::Coscan { .. }
+            | Stage::LimitLit { .. }
+            | Stage::Unwind { .. }
+            | Stage::Branch { .. }
+            | Stage::Union { .. }
+            | Stage::Nlj { .. } => {
+                // Only run inside a `hash_lookup`, once per outer row.
+                let mut counted = Counted::default();
+                let rows = corr::exec(self, &Row::new(), &[], &mut counted);
+                (rows, counted)
+            }
         }
     }
 }
 
 impl Counted {
+    /// What a stage that was never opened counted: nothing, down to its
+    /// inputs.
+    pub fn blank(stage: &Stage) -> Counted {
+        Counted {
+            opens: Some(0),
+            closes: Some(0),
+            kids: stage.inputs().into_iter().map(Counted::blank).collect(),
+            ..Counted::default()
+        }
+    }
+
+    /// What the stages under this one counted, in the order its stage
+    /// lists its inputs.
+    pub fn children(&self) -> Vec<&Counted> {
+        if self.kids.is_empty() {
+            self.input.as_deref().into_iter().collect()
+        } else {
+            self.kids.iter().collect()
+        }
+    }
+
     /// What a scan counted when its consumer read only its first `n` rows:
     /// it produced those, and is at EOF only if it was asked past them.
     fn trim(&mut self, n: i64, eof: bool) {
@@ -532,12 +668,38 @@ impl Stage {
             Stage::Project { .. } => "project",
             Stage::Sort { .. } => "sort",
             Stage::Group { .. } => "group",
+            Stage::Coscan { .. } => "coscan",
+            Stage::LimitLit { .. } => "limit",
+            Stage::Unwind { .. } => "unwind",
+            Stage::Branch { .. } => "branch",
+            Stage::Union { .. } => "union",
+            Stage::Nlj { .. } => "nlj",
+            Stage::HashLookup { .. } => "hash_lookup",
+        }
+    }
+
+    /// The stage's inputs, in the order its statistics list them.
+    pub fn inputs(&self) -> Vec<&Stage> {
+        match self {
+            Stage::Branch { then_, else_, .. } => vec![then_, else_],
+            Stage::Union { inputs, .. } => inputs.iter().map(|(_, s)| s).collect(),
+            Stage::Nlj { outer, inner, .. } | Stage::HashLookup { outer, inner, .. } => {
+                vec![outer, inner]
+            }
+            other => other.input().into_iter().collect(),
         }
     }
 
     pub fn input(&self) -> Option<&Stage> {
         match self {
-            Stage::Scan { .. } | Stage::IxSeek { .. } => None,
+            Stage::Scan { .. }
+            | Stage::IxSeek { .. }
+            | Stage::Coscan { .. }
+            | Stage::Branch { .. }
+            | Stage::Union { .. }
+            | Stage::Nlj { .. }
+            | Stage::HashLookup { .. } => None,
+            Stage::LimitLit { input, .. } | Stage::Unwind { input, .. } => Some(input),
             Stage::Filter { input, .. }
             | Stage::LimitSkip { input, .. }
             | Stage::Project { input, .. }
