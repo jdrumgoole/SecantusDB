@@ -57,6 +57,54 @@ use crate::argtypes;
 use crate::util::{as_i64, bool_field, coll_arg, command_error, doc_field, write_error};
 use crate::{CommandContext, CommandError, HandlerResult, StorageError};
 
+/// The lock rounds mongod's `insertBatchAndHandleErrors` takes after a
+/// batch of several documents failed as one: it inserts them again a
+/// document at a time, in a round that holds its locks while documents
+/// succeed and ends at the one that fails; an unordered batch opens a new
+/// round for the documents after it (measured 8.2.11, 2026-11-27: two rounds
+/// for `[a, dup, b]` ordered, three unordered, two for `[a, b, dup]`
+/// either way). The batch's first attempt is the command's own round. Each
+/// round takes a flow control ticket, as any write round. A retryable
+/// write's documents each write the session's row in their own unit of
+/// work, under the round's locks; the command writes the last one itself.
+fn retry_rounds(
+    db: &str,
+    coll: &str,
+    batch: usize,
+    (inserted, errors): (usize, &[Document]),
+    ordered: bool,
+) {
+    let rounds = insert_retry_rounds(batch, errors, ordered);
+    if rounds == 0 {
+        return;
+    }
+    drop(crate::lock_manager::write_rounds(db, coll, rounds));
+    for _ in 1..inserted {
+        // Nothing outside a retryable write; a spent deadline shows on the
+        // command's own round, which takes the same locks.
+        if crate::lock_manager::held_write_round("config", "transactions").is_err() {
+            break;
+        }
+    }
+}
+
+/// How many one-document-at-a-time rounds [`retry_rounds`] takes for a
+/// storage batch of `batch` documents that failed at `errors`' indices.
+fn insert_retry_rounds(batch: usize, errors: &[Document], ordered: bool) -> usize {
+    if batch < 2 || errors.is_empty() {
+        return 0;
+    }
+    if ordered {
+        return 1;
+    }
+    // A failure before the batch's last document starts another round.
+    let last = (batch - 1) as i64;
+    1 + errors
+        .iter()
+        .filter(|e| e.get("index").and_then(as_i64).is_some_and(|i| i < last))
+        .count()
+}
+
 /// Build the `insert` reply from storage's outcome: remap storage's
 /// surviving-subset indices back to their original `documents` positions and
 /// prepend the command-layer pre-check errors. Shared by the decoded and the
@@ -754,9 +802,11 @@ fn insert_raw_path(
     }
     // A retryable write's inserts name their statements (RM-224).
     storage.set_insert_positions(Some(survivor_to_orig.clone()));
+    let batch = surviving.len();
     let inserted = storage.insert(db, coll, surviving, ordered);
     storage.set_insert_positions(None);
     let (inserted, errors) = inserted.map_err(command_error)?;
+    retry_rounds(db, coll, batch, (inserted, &errors), ordered);
     insert_reply(inserted, errors, pre_errors, &survivor_to_orig, ordered)
 }
 
@@ -1206,9 +1256,11 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     // A retryable write's inserts name their statements (RM-224).
     storage.set_insert_positions(Some(survivor_to_orig.clone()));
+    let batch = surviving.len();
     let inserted = storage.insert(&db, &coll, surviving, ordered);
     storage.set_insert_positions(None);
     let (inserted, errors) = inserted.map_err(command_error)?;
+    retry_rounds(&db, &coll, batch, (inserted, &errors), ordered);
     insert_reply(inserted, errors, pre_errors, &survivor_to_orig, ordered)
 }
 
@@ -3127,4 +3179,29 @@ fn near_refusal(
     near.check_index(storage, db, coll, Default::default(), false, None)
         .err()
         .map(|e| crate::util::write_error(index, e, command))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::insert_retry_rounds;
+    use bson::{doc, Document};
+
+    fn at(indices: &[i32]) -> Vec<Document> {
+        indices.iter().map(|i| doc! { "index": *i }).collect()
+    }
+
+    #[test]
+    fn a_failed_batch_is_retried_in_mongods_rounds() {
+        // Measured against mongod 8.2.11 (2026-11-27), less the batch's own round.
+        assert_eq!(insert_retry_rounds(1, &at(&[0]), false), 0);
+        assert_eq!(insert_retry_rounds(3, &[], false), 0);
+        assert_eq!(insert_retry_rounds(2, &at(&[1]), false), 1);
+        assert_eq!(insert_retry_rounds(2, &at(&[0]), false), 2);
+        assert_eq!(insert_retry_rounds(2, &at(&[0]), true), 1);
+        assert_eq!(insert_retry_rounds(3, &at(&[1]), false), 2);
+        assert_eq!(insert_retry_rounds(3, &at(&[2]), false), 1);
+        assert_eq!(insert_retry_rounds(2, &at(&[0, 1]), false), 2);
+        assert_eq!(insert_retry_rounds(4, &at(&[1, 3]), false), 2);
+        assert_eq!(insert_retry_rounds(5, &at(&[3]), true), 1);
+    }
 }
