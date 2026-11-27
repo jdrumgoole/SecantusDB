@@ -8743,3 +8743,76 @@ fn rename_column_in_index_text() {
     );
     assert_eq!(r("(z > 0)", false), "(z > 0)");
 }
+
+/// `reduce_outer_joins_pass2`'s kinds, in the written tree's shape
+/// (RP-1118): a WHERE proving a FULL join's left side non-NULL leaves a
+/// LEFT join, its right side a RIGHT one, both an inner one; an inner join
+/// above proves what its ON reads, a LEFT join above passes its ON to its
+/// nullable side only, and a FULL join above passes nothing. A USING join
+/// keeps its kind.
+#[test]
+fn outer_join_kinds_as_reduce_outer_joins_leaves_them() {
+    use pg_query::protobuf::JoinType;
+    fn kinds(n: &N, out: &mut Vec<JoinType>) {
+        if let N::JoinExpr(j) = n {
+            out.push(JoinType::try_from(j.jointype).unwrap());
+            for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                if let Some(n) = side.node.as_ref() {
+                    kinds(n, out);
+                }
+            }
+        }
+    }
+    let reduced = |sql: &str| {
+        let Ok(N::SelectStmt(s)) = parse_one(sql) else {
+            panic!("{sql}");
+        };
+        let r = joins::reduced_join_kinds(&s);
+        let mut out = Vec::new();
+        for item in &r.from_clause {
+            kinds(item.node.as_ref().unwrap(), &mut out);
+        }
+        out
+    };
+    use JoinType::{JoinFull as F, JoinInner as I, JoinLeft as L, JoinRight as R};
+    let f = "select 1 from e full join k on e.a = k.a";
+    assert_eq!(reduced(f), [F]);
+    assert_eq!(reduced(&format!("{f} where e.a > 0")), [L]);
+    assert_eq!(reduced(&format!("{f} where k.a > 0")), [R]);
+    assert_eq!(
+        reduced(&format!("{f} where e.a > 0 and k.b is not null")),
+        [I]
+    );
+    assert_eq!(reduced(&format!("{f} join e e2 on e2.a = e.a")), [I, L]);
+    assert_eq!(
+        reduced(&format!(
+            "select 1 from e e2 left join ({}) on e2.a = e.a",
+            &f[14..]
+        )),
+        [L, L]
+    );
+    assert_eq!(
+        reduced(&format!(
+            "select 1 from ({}) left join e e2 on e2.a = e.a",
+            &f[14..]
+        )),
+        [L, F]
+    );
+    assert_eq!(
+        reduced(&format!(
+            "select 1 from e e2 full join ({}) on e2.a = e.a",
+            &f[14..]
+        )),
+        [F, F]
+    );
+    assert_eq!(
+        reduced(
+            "select 1 from e left join k on e.a = k.a left join e e2 on e2.a = k.a where e2.b > ''"
+        ),
+        [I, I]
+    );
+    assert_eq!(
+        reduced("select 1 from e full join k using (a) where e.a > 0"),
+        [F]
+    );
+}

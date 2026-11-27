@@ -2234,20 +2234,45 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a full join an inner join reduces hashes its unique side]
       Backlog-ID: RP-1064
 
-- [ ] **A FULL JOIN reduced to a LEFT JOIN nothing reads is not
-      removed.** `explain (costs off) select e.b from e full join k on
-      e.a = k.a where e.a > 0` (`e`, `k` analysed, 1000 rows, `k.a` the
-      primary key) is a `Hash Left Join` of `e` over a Hash of `k` here;
-      on a private PostgreSQL 15.20 cluster it is `Seq Scan on e` with
-      `Filter: (a > 0)`: `reduce_outer_joins` makes the FULL JOIN a LEFT
-      JOIN, which `remove_useless_joins` then removes as it does a
-      written one (RP-1060's `join_removal.rs` only sees the join as
-      written, before the reduction). Likewise `... full join k on e.a =
-      k.a join e e2 on e2.a = e.a`, the inner join above reducing it: a
-      Hash Join of `e` and `e e2` alone there. Found while working
-      RP-1064.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a full join a where reduces to a removable left join is removed], tests/backlog/test_rp_explain_costs.py::test_plan[a full join an inner join reduces to a removable left join is removed]
-      Backlog-ID: RP-1118
+- [ ] **A RIGHT JOIN to a unique key nothing reads is not removed.**
+      `explain (costs off) select e.b from k right join e on e.a = k.a`
+      (`e`, `k` analysed, 1000 rows, `k.a` the primary key) is a `Hash
+      Left Join` of `e` over a Hash of `k` here; on a private PostgreSQL
+      15.20 cluster it is `Seq Scan on e`: `reduce_outer_joins_pass2`
+      flips a RIGHT join into the LEFT join of its sides swapped, which
+      `remove_useless_joins` then removes. Likewise a FULL join the WHERE
+      reduces to a RIGHT one (`k full join e on e.a = k.a where e.a > 0`,
+      `Seq Scan on e` with `Filter: (a > 0)` there). `join_removal.rs`
+      takes only a LEFT join, and `joins::reduced_join_kinds` keeps each
+      side where it is written, so the removal must mirror its checks for
+      the RIGHT kind (the inner side is `larg`, the kept one `rarg`).
+      Found while working RP-1118.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a right join to a key nothing reads is removed], tests/backlog/test_rp_explain_costs.py::test_plan[a full join a where reduces to a removable right join is removed]
+      Backlog-ID: RP-1166
+
+- [ ] **A USING join's EXPLAIN prints no Hash Cond.** `explain (costs
+      off) select e.b, k.b from e left join k using (b)` (`e`, `k`
+      analysed, 1000 rows) prints `Hash Left Join` over `e` and a Hash of
+      `k` with no `Hash Cond` line; PostgreSQL 15.20 prints `Hash Cond:
+      (e.b = k.b)`. A FULL USING join loses its filter on the merged
+      column too: `... from e full join k using (a) where a > 0` is there
+      `Hash Full Join`, `Hash Cond: (e.a = k.a)`, `Filter: (COALESCE(e.a,
+      k.a) > 0)`, and neither line here. Found while working RP-1118.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a using join prints its hash cond], tests/backlog/test_rp_explain_costs.py::test_plan[a full using join prints its hash cond and its merged column's filter]
+      Backlog-ID: RP-1167
+
+- [ ] **A FULL USING join reduced to a LEFT JOIN nothing reads is not
+      removed.** `explain (costs off) select e.b from e full join k using
+      (a) where e.a > 0` (`e`, `k` analysed, `k.a` the primary key) is a
+      `Hash Left Join` here; PostgreSQL 15.20 removes it, `Seq Scan on e`
+      with `Filter: (a > 0)`. It keeps it when the query reads the merged
+      column (`select a ...`), which is `COALESCE(e.a, k.a)` and so reads
+      `k`. `joins::reduced_join_kinds` leaves every USING join's kind
+      alone (RP-1118), since a reduced FULL USING join's unqualified
+      merged column still reads the inner side, which `may_read` takes as
+      the outer side's for a LEFT one. Found while working RP-1118.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a full using join a where reduces to a removable left join is removed]
+      Backlog-ID: RP-1168
 
 - [ ] **A join whose expression key shares a column with another
       clause is unpriced.** `explain select e.b from e join k on e.a =

@@ -4885,6 +4885,91 @@ pub(crate) fn reduce_outer_joins(
     changed.then_some(out)
 }
 
+/// `s` with every outer join's kind as `reduce_outer_joins_pass2` reduces
+/// it (RP-1118): what the WHERE proves non-NULL goes down to every FROM
+/// item, and a join passes down what it was given and what its own ON
+/// proves as PostgreSQL does -- an inner join both to both sides, a LEFT
+/// join the first to its preserved side and its ON to its nullable side, a
+/// RIGHT join the mirror of that, a FULL join nothing. A LEFT join whose
+/// nullable side is proven non-NULL becomes inner, a RIGHT join likewise,
+/// and a FULL join becomes LEFT, RIGHT or inner by which sides are proven.
+///
+/// No sides are swapped (PostgreSQL flips the RIGHT joins it leaves into
+/// LEFT ones), so the tree keeps its shape and each join its place: the
+/// reduced kinds are read, never planned. An aliased, NATURAL or USING
+/// join keeps its kind, as in [`reduce_outer_joins`]; a FULL USING join's
+/// merged column reads both sides.
+pub(crate) fn reduced_join_kinds(
+    s: &pg_query::protobuf::SelectStmt,
+) -> pg_query::protobuf::SelectStmt {
+    use pg_query::protobuf::JoinType;
+    fn proved(q: Option<&pg_query::protobuf::Node>) -> Vec<String> {
+        let mut conjuncts = Vec::new();
+        if let Some(q) = q {
+            split_and(q, &mut conjuncts);
+        }
+        conjuncts
+            .iter()
+            .flat_map(|c| strict_aliases(c, &|_| None))
+            .collect()
+    }
+    fn walk(item: &mut pg_query::protobuf::Node, nonnull: &[String]) {
+        let Some(N::JoinExpr(j)) = item.node.as_mut() else {
+            return;
+        };
+        let proven = |side: Option<&pg_query::protobuf::Node>| {
+            let mut below = Vec::new();
+            if let Some(side) = side {
+                subtree_aliases(side, &mut below);
+            }
+            below.iter().any(|a| nonnull.contains(a))
+        };
+        let fixed = j.alias.is_some() || j.is_natural || !j.using_clause.is_empty();
+        let (l, r) = (proven(j.larg.as_deref()), proven(j.rarg.as_deref()));
+        let kind = match JoinType::try_from(j.jointype) {
+            Ok(k) if fixed => k,
+            Ok(JoinType::JoinLeft) if r => JoinType::JoinInner,
+            Ok(JoinType::JoinRight) if l => JoinType::JoinInner,
+            Ok(JoinType::JoinFull) => match (l, r) {
+                (true, true) => JoinType::JoinInner,
+                (true, false) => JoinType::JoinLeft,
+                (false, true) => JoinType::JoinRight,
+                (false, false) => JoinType::JoinFull,
+            },
+            Ok(k) => k,
+            Err(_) => return,
+        };
+        j.jointype = kind as i32;
+        let local = match kind {
+            JoinType::JoinFull => Vec::new(),
+            _ => proved(j.quals.as_deref()),
+        };
+        let upper = nonnull.to_vec();
+        let (to_left, to_right) = match kind {
+            JoinType::JoinInner => {
+                let mut both = local;
+                both.extend(upper);
+                (both.clone(), both)
+            }
+            JoinType::JoinLeft => (upper, local),
+            JoinType::JoinRight => (local, upper),
+            _ => (Vec::new(), Vec::new()),
+        };
+        if let Some(larg) = j.larg.as_deref_mut() {
+            walk(larg, &to_left);
+        }
+        if let Some(rarg) = j.rarg.as_deref_mut() {
+            walk(rarg, &to_right);
+        }
+    }
+    let nonnull = proved(s.where_clause.as_deref());
+    let mut out = s.clone();
+    for item in &mut out.from_clause {
+        walk(item, &nonnull);
+    }
+    out
+}
+
 /// `s` with every literal TRUE argument of a join's ON dropped, or `None`
 /// when no ON has one (RP-394).
 ///

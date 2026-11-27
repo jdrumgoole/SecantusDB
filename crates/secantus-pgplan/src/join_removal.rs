@@ -18,6 +18,11 @@
 //! relations (`useprefix`): [`joins_removed`] tells the planning of the
 //! removed form so.
 //!
+//! A join is judged as `reduce_outer_joins` leaves it (RP-1118,
+//! [`joins::reduced_join_kinds`]): a FULL join the WHERE or a join above
+//! reduces to a LEFT join is removable as a written one is. A RIGHT join,
+//! which PostgreSQL flips into a LEFT one, is not removed here.
+//!
 //! Recognised here: an ON equality whose inner operand is a bare column and
 //! whose other operand is a column of the outer side, a literal or a cast
 //! of either, of the inner column's type or one its B-tree operator family
@@ -97,13 +102,18 @@ pub(crate) fn candidates(query: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -
         return Vec::new();
     }
     let ctes = statement_ctes(s);
+    // A join is removable as `reduce_outer_joins` leaves it: a FULL join
+    // the WHERE or a join above reduces to a LEFT join is one (RP-1118).
+    // The reduced kinds keep the tree's shape, so its joins are numbered
+    // as the written ones, which the rewrite below replaces.
+    let reduced = joins::reduced_join_kinds(s);
     let mut joins = Vec::new();
-    for item in &s.from_clause {
+    for item in &reduced.from_clause {
         collect_joins(item, &mut joins);
     }
     let mut out = Vec::new();
     for (i, j) in joins.iter().enumerate() {
-        let Some((table, fixed)) = removable(s, &joins, i, j, &ctes, lookup) else {
+        let Some((table, fixed)) = removable(&reduced, &joins, i, j, &ctes, lookup) else {
             continue;
         };
         let always = table.is_none();
