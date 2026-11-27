@@ -548,6 +548,11 @@ impl PgHandler {
     ) -> PgWireResult<()> {
         match self.statement_rule_trees_inner(kind, relname, rulename, relid) {
             Err(TreeError::Refused(e)) => {
+                // At `parser_errposition`'s location, where it has one
+                // (RP-1089: a set operation's unmatched column).
+                if let Some(l) = e.location {
+                    secantus_pgplan::set_error_location(l);
+                }
                 let mut info = ErrorInfo::new(
                     "ERROR".into(),
                     e.sqlstate.unwrap_or("XX000").into(),
@@ -673,8 +678,21 @@ impl PgHandler {
             'm' => secantus_pgplan::nodetostring::analyze_create_matview(&ctx, &source, index, oid),
             _ => secantus_pgplan::nodetostring::analyze_create_rule(&ctx, &source, index, oid),
         }
-        .map_err(|e| {
+        .map_err(|mut e| {
             if e.sqlstate.is_some() {
+                // A location counts in the whole query string; the error's
+                // position counts in this statement, from its first
+                // character (the batch adds the statement's offset).
+                let start = parsed.protobuf.stmts.get(index).map_or(0, |r| {
+                    let at = usize::try_from(r.stmt_location).unwrap_or(0);
+                    let rest = source.get(at..).unwrap_or("");
+                    at + (rest.len() - rest.trim_start().len())
+                });
+                e.location = e
+                    .location
+                    .and_then(|l| usize::try_from(l).ok())
+                    .and_then(|l| l.checked_sub(start))
+                    .and_then(|l| i32::try_from(l).ok());
                 TreeError::Refused(e)
             } else {
                 TreeError::NoTree(e.message)

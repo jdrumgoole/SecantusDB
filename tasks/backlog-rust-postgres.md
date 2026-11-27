@@ -3171,21 +3171,30 @@ Measured on PostgreSQL 15.19. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp1087.py::test_set_op_error_names_an_array_type_by_its_element
       Backlog-ID: RP-1176
 
-## Found while working RP-1050 (2026-11-25)
+## Found while working RP-1089 (2026-11-27)
 
-Measured on PostgreSQL 15.19. The gap tests are in
-`tests/backlog/test_rp_found_rp1050.py`; the `INSERT` one uses
-`test_rp_found_rp552.py`'s `tct (c ctp, d pint[])`.
+Measured on PostgreSQL 15.20; neither needs objects. The gap tests are in
+`tests/backlog/test_rp_found_rp1089.py`.
 
-- [ ] **A set operation's unmatched types are not refused by `EXPLAIN` or
-      `PREPARE`.** `explain select null::text union select 1` and `prepare p
-      as select null::text union select 1` are 42804 `UNION types text and
-      integer cannot be matched` (at 40, at 50) on PostgreSQL 15.19, which
-      checks them in parse analysis; here both succeed, as the check runs
-      only when the set operation executes. `create view v as` the same
-      query is refused with the message and no position (PostgreSQL: 54).
-      Verify: tests/backlog/test_rp_found_rp1050.py::test_set_op_mismatch_refused_at_analysis
-      Backlog-ID: RP-1089
+- [ ] **A set operation's untyped literal is not read as the other side's
+      type at analysis.** `explain select 'a' union select 1`, `prepare p as`
+      and `create view v as` the same query are 22P02 `invalid input syntax
+      for type integer: "a"` (at 16, 26, 30) on PostgreSQL 15.20, where
+      `transformSetOperationTree` coerces the `unknown` Const to the
+      column's common type (`coerce_to_common_type`, which runs the type's
+      input function); here all three succeed, as the literal is read only
+      when the set operation runs (`set_op_rows_located`'s `retype`). The
+      analysis this server makes since RP-1089 (`set_op_analysed`) checks
+      the types but has no constant to read.
+      Verify: tests/backlog/test_rp_found_rp1089.py::test_set_op_untyped_literal_read_at_analysis
+      Backlog-ID: RP-1216
+- [ ] **`CREATE RULE` on a missing relation reports a position.** `create
+      rule r as on insert to nosuch do instead nothing` is 42P01 `relation
+      "nosuch" does not exist` with no position on PostgreSQL 15.20 (the
+      relation is opened by name, `RangeVarGetRelid` in `DefineRule`, outside
+      any expression); here it is at 35, the relation's name.
+      Verify: tests/backlog/test_rp_found_rp1089.py::test_create_rule_missing_relation_unpositioned
+      Backlog-ID: RP-1217
 
 ## Found while working RP-1048 (2026-11-25)
 
@@ -4033,7 +4042,13 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       `tests/backlog/test_rp_batch70.py::test_each_encoding_is_its_databases_server_encoding`,
       gave `''` for its first line, so the test was `REGRESSED`; it passed
       alone three times (110 s, 6.1 s, 6.0 s), and the same change's gate
-      before the rebase had no start failure. Not yet known: whether the
+      before the rebase had no start failure. A fifth time on 2026-11-27,
+      in RP-1089's `gate_pg.sh --fast` backlog step (load average about
+      2.5, the other lane running): `rust_pg` for
+      `tests/backlog/test_rp_catalog_reads.py::test_a_catalog_joins_method_decides_its_reads`
+      gave `''` for its first line, so RP-290 was `REGRESSED`; it passed
+      alone three times (149 s, 10 s, 9 s), and three lone fresh starts of
+      that build took 3.8-4.3 s each. Not yet known: whether the
       server stalled (a lock, a WiredTiger create waiting on a checkpoint)
       or was starved, since the harness keeps no stack or timing of a
       start it gives up on. The harness should sample the child

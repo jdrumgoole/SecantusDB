@@ -4066,6 +4066,11 @@ pub struct CreateView {
     /// which aliases qualification added, and ruleutils prints only the
     /// written ones.
     pub written_aliases: Vec<bool>,
+    /// The query as the client wrote it, and how many characters of the
+    /// statement precede it: `body` is deparsed, so a location found
+    /// analysing it is not one in the client's text (RP-1089), as
+    /// `SqlPrepare::source`.
+    pub source: Option<(usize, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -6037,20 +6042,35 @@ pub fn plan_with_params(
     .map(|st| with_prepare_source(sql, st))
 }
 
-/// A `SqlPrepare`, with the query's text as `sql` holds it: what follows
-/// the first `AS` outside parentheses.
+/// A `SqlPrepare` or a `CreateView`, with the query's text as `sql` holds
+/// it: what follows the first `AS` outside parentheses.
 fn with_prepare_source(sql: &str, st: Statement) -> Statement {
-    let Statement::SqlPrepare {
-        name,
-        arg_types,
-        query,
-        text,
-        source: None,
-    } = st
-    else {
-        return st;
-    };
-    let source = pg_query::scan(sql).ok().and_then(|scan| {
+    match st {
+        Statement::SqlPrepare {
+            name,
+            arg_types,
+            query,
+            text,
+            source: None,
+        } => Statement::SqlPrepare {
+            name,
+            arg_types,
+            query,
+            text,
+            source: query_source(sql),
+        },
+        Statement::CreateView(cv) if cv.source.is_none() => {
+            let source = query_source(sql);
+            Statement::CreateView(CreateView { source, ..cv })
+        }
+        st => st,
+    }
+}
+
+/// The text of the query a `PREPARE` or `CREATE VIEW` holds, and how many
+/// characters precede it: what follows the first `AS` outside parentheses.
+fn query_source(sql: &str) -> Option<(usize, String)> {
+    pg_query::scan(sql).ok().and_then(|scan| {
         let t = scan.tokens;
         let mut depth = 0i32;
         let at = t.iter().position(|tok| {
@@ -6064,14 +6084,7 @@ fn with_prepare_source(sql: &str, st: Statement) -> Statement {
         let start = t.get(at + 1)?.start as usize;
         let body = sql[start..].trim_end().trim_end_matches(';').trim_end();
         Some((sql[..start].chars().count(), body.to_string()))
-    });
-    Statement::SqlPrepare {
-        name,
-        arg_types,
-        query,
-        text,
-        source,
-    }
+    })
 }
 
 fn plan_with_params_parsed(
@@ -13183,6 +13196,7 @@ fn plan_create_view(v: &pg_query::protobuf::ViewStmt) -> Result<Statement> {
             .as_ref()
             .map(schemas::written_aliases)
             .unwrap_or_default(),
+        source: None,
     }))
 }
 

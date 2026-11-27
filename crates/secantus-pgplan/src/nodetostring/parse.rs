@@ -658,10 +658,17 @@ impl<'a> Analyzer<'a> {
         }
         let (r, rcols) = self.transform_set_operation_tree(rarg, false, true)?;
         if lcols.len() != rcols.len() {
-            return pg_error(
+            // `exprLocation(rtargetlist)`: its first column that has one.
+            let location = rcols
+                .iter()
+                .map(|c| super::nodefuncs::expr_location(&self.setop_col_expr(c)))
+                .find(|l| *l >= 0)
+                .unwrap_or(-1);
+            return Err(AnalysisError::pg(
                 "42601",
                 format!("each {context} query must have the same number of columns"),
-            );
+            )
+            .at(location));
         }
         let mut sop = SetOperationStmt {
             op,

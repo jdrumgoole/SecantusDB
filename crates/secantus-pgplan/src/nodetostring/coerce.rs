@@ -729,14 +729,15 @@ impl<'a> Analyzer<'a> {
                     let Some(context) = context else {
                         return Ok((0, pidx));
                     };
-                    return pg_error(
+                    return Err(AnalysisError::pg(
                         "42804",
                         format!(
                             "{context} types {} and {} cannot be matched",
                             self.cat.format_type_be(ptype),
                             self.cat.format_type_be(ntype)
                         ),
-                    );
+                    )
+                    .at(super::nodefuncs::expr_location(e)));
                 } else if !ppref
                     && self.can_coerce_type(&[ptype], &[ntype], CoercionContext::Implicit)
                     && !self.can_coerce_type(&[ntype], &[ptype], CoercionContext::Implicit)
@@ -828,7 +829,8 @@ impl<'a> Analyzer<'a> {
                 -1,
             )
         } else {
-            pg_error(
+            let location = super::nodefuncs::expr_location(&node);
+            Err(AnalysisError::pg(
                 "42846",
                 format!(
                     "{context} could not convert type {} to {}",
@@ -836,6 +838,7 @@ impl<'a> Analyzer<'a> {
                     self.cat.format_type_be(target)
                 ),
             )
+            .at(location))
         }
     }
 
