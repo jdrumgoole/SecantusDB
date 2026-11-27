@@ -11535,13 +11535,14 @@ def test_scan_counters_over_dead_versions(rust_pg: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-1120")
+@pytest.mark.backlog_fixed("RP-1120")
 def test_a_range_index_scan_marks_dead_entries(rust_pg: Any) -> None:
     """PostgreSQL 15.20's index scan of a range marks the entries of the
     versions it finds dead to all (`_bt_killitems`), so the index-only scan
     after it fetches only the live rows' heap tuples; this server's
-    executor takes the range for a bitmap scan, which marks nothing, and
-    the second scan fetches the dead versions too (`Heap Fetches: 10`)."""
+    executor took the range for a bitmap scan, which marked nothing, and
+    the second scan fetched the dead versions too (`Heap Fetches: 10`).
+    The executor now reads the scan EXPLAIN prints for an analysed table."""
     steps = _UNVACUUMED[:3] + [
         "update k set b = 'y' where a between 10 and 12",
         _ANALYZE + "select * from k where a between 8 and 14",

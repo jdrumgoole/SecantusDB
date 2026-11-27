@@ -434,7 +434,12 @@ one beside it.
   an idle connection is the behaviour the test forbids, so find what the
   stop path waits for under contention (a poll interval, a join on the
   connection thread, a checkpoint) before touching the bound. Filed by the
-  MongoDB session; nothing on the PG side was changed.
+  MongoDB session; nothing on the PG side was changed. Again on
+  2026-11-27: 3.23 s in a `gate_pg.sh --fast` `pgserver-test` step at a
+  load average of about 4, beside a 4-worker pytest run, on RP-1120's
+  branch (a change to the executor's scan choice, which this test's
+  CREATE / INSERT never reaches). It passed on a rerun with that pytest
+  run done.
   Verify: none -- intermittent under load; the test itself is the check
   Backlog-ID: RP-1079
 - [ ] **NOT REPRODUCED -- left open as a watch item. A cancel during the
@@ -2412,22 +2417,6 @@ a regression test.
       pages into lossy ones, whose every tuple the heap scan rechecks.
       Backlog-ID: RP-384
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a bitmap past work_mem]
-- [ ] **A range read through a B-tree index marks no dead entries, as the
-      executor takes it for a bitmap scan.** `select * from k where a
-      between 8 and 14` after a committed `update k set b = 'y' where a
-      between 10 and 12` (`k` of 1,000 rows, keyed on `a`, analysed) is
-      an `Index Scan using k_pkey` in EXPLAIN, and on PostgreSQL 15.20
-      that scan marks the three dead versions' entries (`_bt_killitems`),
-      so the next `select a from k where a between 8 and 14` prints `Heap
-      Fetches: 7`. This server prints 10: `in_scan_order` asks
-      `priced_scan`, which answers `Bitmap` for the range where the plan
-      EXPLAIN prints is an index scan, so `btree_index_scanned` never
-      runs. A primary-key lookup of one row marks its entries
-      (`unique_lookup_scanned`), so only reads of several rows are
-      affected. Measured on a private 15.20 cluster (found while working
-      RP-384).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_a_range_index_scan_marks_dead_entries
-      Backlog-ID: RP-1120
 - [ ] **EXPLAIN ANALYZE prints no counts below most other joins.** Since
       RP-386 a join's children print their actual rows and loops, a
       parameterized inner index-only scan its `Heap Fetches`, a Hash its

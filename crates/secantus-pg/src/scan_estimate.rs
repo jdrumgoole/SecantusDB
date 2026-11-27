@@ -4913,6 +4913,30 @@ impl PgHandler {
         }
     }
 
+    /// The scan the executor reads `filter` over user table `table` with,
+    /// as EXPLAIN prints it for an analysed table (RP-1120): `Some(None)`
+    /// for the sequential scan, `Some(Some(index))` for an index or bitmap
+    /// path, `None` where the table was never analysed or the choice is not
+    /// modelled (the caller falls back to the unanalysed estimate,
+    /// [`Self::priced_scan`]). The select list is not known where the rows
+    /// are read, so the scan is priced as reading every column: an index
+    /// path that would be index-only for a narrower list is priced as the
+    /// plain index scan it otherwise is.
+    pub(crate) fn executor_scan_path(
+        &self,
+        table: &str,
+        filter: &Document,
+    ) -> Option<Option<ScanIndex>> {
+        let defs = self.shared_table_defs().ok()?;
+        let def = defs.iter().find(|d| d.name == table)?;
+        let fields: Vec<String> = def.columns.iter().map(|c| c.field()).collect();
+        Some(
+            self.user_paths(table, filter, &fields, &[], &PathWant::default())?
+                .chosen
+                .and_then(|(_, index)| index),
+        )
+    }
+
     fn user_index_path(
         &self,
         table: &str,
