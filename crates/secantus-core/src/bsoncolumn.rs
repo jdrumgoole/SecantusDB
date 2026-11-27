@@ -1125,6 +1125,19 @@ impl EncodingState {
         }
     }
 
+    fn shape(&self) -> EncShape {
+        let (pending, wide) = match &self.encoder {
+            Encoder::E64(e) => (e.s8.pending.len(), false),
+            Encoder::E128(e) => (e.s8.pending.len(), true),
+        };
+        EncShape {
+            pending,
+            wide,
+            // `_prev`: the type byte, the field name's terminator, the value.
+            prev_len: self.prev_value.len() + 2,
+        }
+    }
+
     fn store_previous(&mut self, elem: Element<'_>) {
         self.prev_ty = elem.ty;
         self.prev_value.clear();
@@ -1532,6 +1545,9 @@ struct Interleaved {
     states: Vec<SubObjState>,
     reference: Vec<u8>,
     reference_type: u8,
+    /// The reference is `mergeObj`'s result (a `BSONObjBuilder`'s buffer)
+    /// and no longer the buffer the first buffered object shares.
+    reference_merged: bool,
     buffered: Vec<Vec<u8>>,
 }
 
@@ -1542,6 +1558,7 @@ impl Interleaved {
             states: Vec::new(),
             reference: obj.to_vec(),
             reference_type: ty,
+            reference_merged: false,
             buffered: vec![obj.to_vec()],
         }
     }
@@ -1551,6 +1568,61 @@ impl Interleaved {
 enum State {
     Regular(EncodingState),
     Interleaved(Interleaved),
+}
+
+/// The capacity of the buffer `mergeObj` returns for a merged object of `len`
+/// bytes: the `BSONObjBuilder`'s 512, grown to the next power of two (less
+/// the header) when the object needs more.
+fn merged_buffer_capacity(len: usize) -> usize {
+    if len <= 512 {
+        512
+    } else {
+        (len + 16).next_power_of_two() - 16
+    }
+}
+
+/// One stream's in-memory shape (see [`ColumnBuilder::memory_shape`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncShape {
+    /// Values pending in the Simple-8b builder (`_pendingValues.size()`).
+    pub pending: usize,
+    /// The 128-bit encoder is live (its pending values are larger).
+    pub wide: bool,
+    /// `_prev.size()`.
+    pub prev_len: usize,
+}
+
+/// One scalar path's stream inside an interleaved column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubShape {
+    pub state: EncShape,
+    /// The sub-stream's output buffer length.
+    pub buffer_len: usize,
+    pub control_blocks: usize,
+}
+
+/// A column builder's in-memory shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColumnShape {
+    Regular {
+        state: EncShape,
+        /// Bytes from the open control byte to the buffer's end (the
+        /// buffer `intermediate()` keeps), `None` with no control byte open.
+        retained: Option<usize>,
+    },
+    Interleaved {
+        determining: bool,
+        /// Size of the reference object.
+        reference_len: usize,
+        /// The bytes the reference's buffer holds: its size, or a
+        /// `BSONObjBuilder`'s capacity for a merged one.
+        reference_cap: usize,
+        /// The first buffered object shares the reference's buffer.
+        reference_shared: bool,
+        /// Sizes of the buffered objects (5 for an empty one).
+        buffered: Vec<usize>,
+        states: Vec<SubShape>,
+    },
 }
 
 /// `BSONColumnBuilder`: append each value (or a skip), then `finalize`.
@@ -1656,7 +1728,10 @@ impl ColumnBuilder {
             let mut n: usize = 0;
             if !traverse_lock_step(&il.reference, obj, &mut |_, _| n += 1) {
                 match merge_obj(&il.reference, obj) {
-                    Some(merged) => il.reference = merged,
+                    Some(merged) => {
+                        il.reference = merged;
+                        il.reference_merged = true;
+                    }
                     None => {
                         self.flush_sub_obj_mode();
                         if scalars {
@@ -1788,6 +1863,41 @@ impl ColumnBuilder {
         }
         self.buf.push(EOO);
         self.state = State::Regular(EncodingState::new());
+    }
+
+    /// What the builder holds in memory after `intermediate()` has run,
+    /// for the bucket catalog's memory account (`serverStatus`'s
+    /// `bucketCatalog.memoryUsage`): `intermediate()` copies the builder's
+    /// state, so every vector in the copy holds exactly its elements, and
+    /// replaces the output buffer with a copy of what follows the open
+    /// control byte.
+    pub fn memory_shape(&self) -> ColumnShape {
+        match &self.state {
+            State::Regular(r) => ColumnShape::Regular {
+                state: r.shape(),
+                retained: r.control_offset.map(|c| self.buf.len() - c),
+            },
+            State::Interleaved(il) => ColumnShape::Interleaved {
+                determining: il.mode == Mode::DeterminingReference,
+                reference_len: il.reference.len(),
+                reference_cap: if il.reference_merged {
+                    merged_buffer_capacity(il.reference.len())
+                } else {
+                    il.reference.len()
+                },
+                reference_shared: !il.reference_merged,
+                buffered: il.buffered.iter().map(Vec::len).collect(),
+                states: il
+                    .states
+                    .iter()
+                    .map(|s| SubShape {
+                        state: s.state.shape(),
+                        buffer_len: s.buffer.len(),
+                        control_blocks: s.control_blocks.len(),
+                    })
+                    .collect(),
+            },
+        }
     }
 
     /// The column's bytes.

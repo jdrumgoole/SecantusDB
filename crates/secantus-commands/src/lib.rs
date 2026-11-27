@@ -121,6 +121,7 @@ mod ts_store;
 pub use ts_buckets::{BUCKETS_PREFIX, BUCKETS_STAGE, VIEWS_STAGE};
 pub use ts_store::create_missing_buckets;
 pub mod bucket_catalog;
+pub(crate) mod bucket_memory;
 pub use bucket_catalog::BucketCatalog;
 pub mod topstats;
 pub mod transactions;

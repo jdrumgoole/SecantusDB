@@ -2171,58 +2171,6 @@ bucket documents in `system.buckets.<name>`, each data field mongod's
 compressed column, placed by mongod's bucket catalog
 (`crates/secantus-commands/src/bucket_catalog.rs`). What is left:
 
-- [ ] **RUST MongoDB server: the bucket catalog keeps no account of its
-      memory.** mongod 8.2.11's `bucketCatalog.memoryUsage` is the bytes its
-      own C++ structures allocate through tracking allocators: 12552 with one
-      bucket holding one measurement (and a one-character metadata value),
-      12828 after four more measurements, a new field among them, join that
-      bucket; each repeats run for run, while a larger catalog varies by about
-      a hundred bytes between runs (so only the small cases are pinned). This
-      server reports no section, and keeps no such account.
-      **Decided (Joe, 2026-11-11):** model mongod's accounting: charge each
-      bucket, its column builders, summaries, schema and the catalog's maps
-      the bytes mongod's structures allocate through its tracking
-      allocators, so `memoryUsage` follows mongod's. The size limit's memory
-      accounting (`getCacheDerivedBucketMaxSize`, decided 2026-10-16) does
-      not depend on it and is built. `serverStatus`'s section reports
-      `memoryUsage` as 0 until this lands, and RM-711's expiry needs this. (This was part of RM-549, split
-      2026-11-16, Joe's go-ahead.)
-      **Measured 2026-11-25 (macOS arm64 mongod 8.2.11, each twice, stable):**
-      one measurement with metadata 12552 whatever the metadata's type or
-      length (41 characters too), with no metadata field 12024; one extra
-      data field 12564 (+12), two extra 15296 (+2744); a second measurement
-      12576 (+24). The steps are container capacity growth and `sizeof`, so
-      a faithful model ports mongod's containers allocation for allocation,
-      and the numbers are libc++'s: Linux x86-64 mongod (the exemplar, and
-      CI's) builds with libstdc++, whose `std::string` and hash-map nodes
-      differ in size, so the pinned 12552 / 12828 are likely macOS-only and
-      unmeasured on Linux (no Docker daemon here). **Decision needed
-      (Joe):** measure Linux mongod and pin its numbers (the faithful path:
-      port the tracking-allocator charges from mongod's source), or narrow
-      what is pinned.
-      **Decided 2026-11-25 (Joe):** the faithful option. Measure Linux
-      x86-64 mongod (the exemplar build, libstdc++; 8.2.11, and 8.2.12 which
-      CI now runs) for every case above, pin those numbers in the gap test
-      (an `only_on("linux")` case, checked by CI), and port mongod's memory
-      charges from its source so the counts match that build.
-      **Measured 2026-11-26, Linux x86-64 mongod 8.2.11 and 8.2.12:** the
-      official `mongo` amd64 image under Colima with Rosetta, standalone
-      `--quiet` as the harness starts it, a fresh mongod per case, each case
-      twice. Both versions and both runs agree:
-      - one measurement with metadata: 13120, for `"a"`, `1` or a
-        41-character string alike;
-      - with no metadata field: 12592 (-528, as on macOS);
-      - one extra data field: 13132 (+12, as on macOS);
-      - two extra data fields: 16120 (+3000, where macOS gives +2744);
-      - a second measurement: 13168 (+48, where macOS gives +24);
-      - the gap test's case: 13120 then 13396 (+276, as on macOS).
-
-      So the containers' sizes differ, while most steps match. The gap
-      test now pins 13120 / 13396 under `only_on("linux")`. To reproduce,
-      run `tools/probes/linux_bucket_catalog.py 8.2.11 8.2.12`
-      with `DOCKER_HOST` set to Colima's socket.
-      Verify: tests/backlog/test_rm_bucket_catalog.py::test_bucket_catalog_memory_usage_is_the_bytes_mongod_accounts
-      Backlog-ID: RM-710
 - [ ] **RUST MongoDB server: idle buckets never expire past
       `timeseriesIdleBucketExpiryMemoryUsageThreshold`.** mongod 8.2.11
       closes idle buckets (and counts `numBucketsClosedDueToMemoryThreshold`
@@ -2237,8 +2185,8 @@ compressed column, placed by mongod's bucket catalog
       `memoryUsage` 69648 to 77664 afterwards and all 21 documents stored.
       Which expire depends on the stripe each lands in, so only the facts
       are pinned. This server never expires an idle bucket, and refuses the
-      `setParameter` (code 72). **Waits on RM-710** (the memory accounting
-      decides when the threshold is passed) and counts through the `bucketCatalog` section's counters. (This was part of RM-549, split 2026-11-16, Joe's
+      `setParameter` (code 72). The memory accounting that decides when the threshold is passed
+      is built (RM-710), and the expiry counts through the `bucketCatalog` section's counters. (This was part of RM-549, split 2026-11-16, Joe's
       go-ahead.)
       Verify: tests/backlog/test_rm_bucket_catalog.py::test_idle_buckets_expire_past_the_memory_threshold
       Backlog-ID: RM-711

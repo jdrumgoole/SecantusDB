@@ -130,16 +130,22 @@ CASES = {
     "expiry at 30000": expiry,
 }
 
-for version in sys.argv[1:]:
-    for run in (1, 2):
-        for name, fn in CASES.items():
-            cid, port = start(version)
-            try:
-                c = pymongo.MongoClient(port=port)
-                print(
-                    json.dumps({"version": version, "run": run, "case": name, "got": fn(c)}),
-                    flush=True,
-                )
-                c.close()
-            finally:
-                stop(cid)
+
+def main() -> None:
+    for version in sys.argv[1:]:
+        for run in (1, 2):
+            for name, fn in CASES.items():
+                cid, port = start(version)
+                try:
+                    c = pymongo.MongoClient(port=port)
+                    print(
+                        json.dumps({"version": version, "run": run, "case": name, "got": fn(c)}),
+                        flush=True,
+                    )
+                    c.close()
+                finally:
+                    stop(cid)
+
+
+if __name__ == "__main__":
+    main()
