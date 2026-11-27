@@ -229,15 +229,22 @@ pub(crate) struct Seek {
     pub path: String,
     pub descending: bool,
     pub index: String,
-    /// The `COUNT_SCAN` node of `queryPlan`, less its stage and node id.
+    /// The index's key pattern, as the plan's environment prints it.
+    pub key_pattern: String,
+    /// The `COUNT_SCAN` (or, under a fetch, `IXSCAN`) node of `queryPlan`,
+    /// less its stage and node id.
     pub described: Document,
+    /// The filter of the `FETCH` over the index scan, when the documents
+    /// are fetched (RM-695): `None` for a `COUNT_SCAN`.
+    pub fetch_filter: Option<Document>,
 }
 
 impl Front {
     /// How many query solution nodes the query makes: the scan, then a
     /// SKIP and a LIMIT when it has them.
     pub(super) fn nodes(&self) -> u32 {
-        1 + u32::from(self.skip > 0) + u32::from(self.limit > 0)
+        let fetched = self.seek.as_ref().is_some_and(|s| s.fetch_filter.is_some());
+        1 + u32::from(fetched) + u32::from(self.skip > 0) + u32::from(self.limit > 0)
     }
 }
 
@@ -268,6 +275,9 @@ pub(super) fn scan(
     slots: &mut Slots,
 ) -> Option<Scanned> {
     let (skip, limit) = (front.skip.max(0), front.limit.max(0));
+    if let Some(seek) = front.seek.as_ref().filter(|s| s.fetch_filter.is_some()) {
+        return fetch_scan(front, seek, uuid, fields, slots);
+    }
     if let Some(seek) = &front.seek {
         if front.filter.is_some() || skip > 0 || limit > 0 || !fields.is_empty() {
             return None;
@@ -285,6 +295,7 @@ pub(super) fn scan(
                 descending: seek.descending,
                 index: seek.index.clone(),
                 uuid: uuid.to_string(),
+                fetch: None,
             },
             // No record is read: nothing may ask for `$$ROOT`.
             record: 0,
@@ -363,6 +374,96 @@ pub(super) fn scan(
             input: Box::new(root),
         };
     }
+    Some(Scanned {
+        root,
+        record,
+        fields: scan_fields,
+        env,
+        query_plan,
+    })
+}
+
+/// A `FETCH` with a filter over an `IXSCAN`, as `buildFetch` over
+/// `buildIndexScan` builds it for a group that reads no field (RM-695):
+/// an `nlj` whose outer `ixseek` reads each entry's record id, key,
+/// snapshot id and index ident into slots, correlated into a `limit 1`
+/// `seek` of the document that reads the filter's fields, under the
+/// `filter`. Slots in the builder's order: record id, index ident, key,
+/// snapshot id, the key pattern (an environment constant), then the
+/// seek's record and record id and its fields.
+fn fetch_scan(
+    front: &Front,
+    seek: &Seek,
+    uuid: &str,
+    fields: BTreeSet<String>,
+    slots: &mut Slots,
+) -> Option<Scanned> {
+    let f = front.filter.as_ref()?;
+    if front.skip > 0 || front.limit > 0 || !fields.is_empty() {
+        return None;
+    }
+    let record_id = slots.next();
+    let ident = slots.next();
+    let key = slots.next();
+    let snapshot = slots.next();
+    let key_pattern = slots.next();
+    let record = slots.next();
+    let fetched_id = slots.next();
+    let scan_fields: Vec<(String, Slot)> =
+        f.fields().into_iter().map(|n| (n, slots.next())).collect();
+    let field_slot = |n: &str| scan_fields.iter().find(|(m, _)| m == n).map(|(_, s)| *s);
+    let predicate = f.program(&field_slot, &mut || slots.next())?;
+    let mut env: Vec<(Slot, String)> = vec![(key_pattern, seek.key_pattern.clone())];
+    for (slot, values) in predicate.in_lists() {
+        env.push((slot, super::print::in_list(&values)?));
+    }
+    env.sort();
+    let outer = Stage::IxSeek {
+        node: 1,
+        record_id,
+        low: seek.low.clone(),
+        high: seek.high.clone(),
+        path: seek.path.clone(),
+        descending: seek.descending,
+        index: seek.index.clone(),
+        uuid: uuid.to_string(),
+        fetch: Some((key, snapshot, ident)),
+    };
+    let inner = Stage::LimitLit {
+        node: 2,
+        limit: 1,
+        input: Box::new(Stage::Seek {
+            node: 2,
+            seek_record_id: record_id,
+            record,
+            record_id: fetched_id,
+            snapshot,
+            ident,
+            key,
+            key_pattern,
+            fields: scan_fields.clone(),
+            uuid: uuid.to_string(),
+        }),
+    };
+    let root = Stage::Filter {
+        node: 2,
+        predicate,
+        input: Box::new(Stage::Nlj {
+            node: 2,
+            projects: vec![],
+            correlated: vec![record_id, snapshot, ident, key, key_pattern],
+            outer: Box::new(outer),
+            inner: Box::new(inner),
+        }),
+    };
+    let mut ixscan = doc! { "stage": "IXSCAN", "planNodeId": 1 };
+    ixscan.extend(seek.described.clone());
+    let query_plan = doc! {
+        "stage": "FETCH",
+        "planNodeId": 2,
+        "filter": seek.fetch_filter.clone()?,
+        "inputStage": ixscan,
+    };
     Some(Scanned {
         root,
         record,

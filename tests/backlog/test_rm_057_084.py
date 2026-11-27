@@ -492,12 +492,24 @@ def test_explain_of_count_on_a_view_over_an_index(rust_mongo: Any, mongod: Any) 
     assert _view_count_over_an_index(rust_mongo, None) == _view_count_over_an_index(mongod, None)
 
 
-@pytest.mark.backlog("RM-695")
+@pytest.mark.backlog_fixed("RM-695")
 def test_explain_of_count_on_a_view_fetching_from_an_index(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 explains `count` on a view whose filter is left to a
     `FETCH` over an `IXSCAN` as a slot-based plan too: a `GROUP` over the
-    `FETCH` and `IXSCAN`, run as an `nlj` of an `ixseek` and a `seek`."""
+    `FETCH` and `IXSCAN`, run as an `nlj` of an `ixseek` and a `seek`.
+    Fixed 2026-11-27 (tests/mongod_live/test_sbe_fetch_explain.py)."""
     q = {"b": 2}
+    assert _view_count_over_an_index(rust_mongo, q) == _view_count_over_an_index(mongod, q)
+
+
+@pytest.mark.backlog("RM-831")
+def test_explain_of_count_on_a_view_fetching_from_index_intervals(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11 runs the same `FETCH` over an `IXSCAN` of more than one
+    interval (`{b: {$in: [1, 2]}}` over `b_-1`) in SBE too; this server
+    keeps it classic."""
+    q = {"b": {"$in": [1, 2]}}
     assert _view_count_over_an_index(rust_mongo, q) == _view_count_over_an_index(mongod, q)
 
 

@@ -1930,40 +1930,50 @@ fn execution_stats(
         "executionStages": stages,
     };
     if verbosity == Verbosity::AllPlans {
-        let entries: Vec<Bson> = tried
-            .iter()
-            .enumerate()
-            .map(|(at, (node, score, st))| {
-                // mongod's write stage is one object, shared by every plan:
-                // the plans it rejected show the counts of the run that
-                // followed, the winner the counts it had during the trial.
-                let mut st = st.clone();
-                if at > 0 && matches!(node, Node::Update(_) | Node::Delete { .. }) {
-                    st.extra = stats.extra.clone();
-                    st.n_returned = stats.n_returned;
-                }
-                // A plan the trial rejected is saved once more when it is
-                // set aside (measured 8.2.11: `saveState` 1 on each of its
-                // stages, the winner's 0).
-                if at > 0 {
-                    set_aside(&mut st);
-                }
-                let (keys, docs) = st.totals();
-                let mut stages = doc! { "isCached": cached(node) };
-                stages.extend(node.to_doc(Some(&st)));
-                Bson::Document(doc! {
-                    "nReturned": num(st.n_returned),
-                    "executionTimeMillisEstimate": 0_i32,
-                    "totalKeysExamined": num(keys),
-                    "totalDocsExamined": num(docs),
-                    "score": *score,
-                    "executionStages": stages,
-                })
-            })
-            .collect();
+        let entries = all_plans_entries(tried, stats, &cached);
         out.insert("allPlansExecution", entries);
     }
     out
+}
+
+/// `allPlansExecution`: each plan the trial ran, with the counts it had
+/// during the trial (`stats`: the winner's run, for a write stage).
+fn all_plans_entries(
+    tried: &[(Node, f64, Stats)],
+    stats: &Stats,
+    cached: &dyn Fn(&Node) -> bool,
+) -> Vec<Bson> {
+    tried
+        .iter()
+        .enumerate()
+        .map(|(at, (node, score, st))| {
+            // mongod's write stage is one object, shared by every plan:
+            // the plans it rejected show the counts of the run that
+            // followed, the winner the counts it had during the trial.
+            let mut st = st.clone();
+            if at > 0 && matches!(node, Node::Update(_) | Node::Delete { .. }) {
+                st.extra = stats.extra.clone();
+                st.n_returned = stats.n_returned;
+            }
+            // A plan the trial rejected is saved once more when it is
+            // set aside (measured 8.2.11: `saveState` 1 on each of its
+            // stages, the winner's 0).
+            if at > 0 {
+                set_aside(&mut st);
+            }
+            let (keys, docs) = st.totals();
+            let mut stages = doc! { "isCached": cached(node) };
+            stages.extend(node.to_doc(Some(&st)));
+            Bson::Document(doc! {
+                "nReturned": num(st.n_returned),
+                "executionTimeMillisEstimate": 0_i32,
+                "totalKeysExamined": num(keys),
+                "totalDocsExamined": num(docs),
+                "score": *score,
+                "executionStages": stages,
+            })
+        })
+        .collect()
 }
 
 fn server_info(ctx: &CommandContext) -> Document {
@@ -2442,6 +2452,8 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
         planner.insert("rejectedPlans", rejected);
     }
     if let Some(front) = pushed_down {
+        // The plan fetches from an index scan (RM-695).
+        let mut fetched = false;
         let built = if t.exists {
             // The plan the trial chose is a forward collection scan: the
             // query in front of the group is that scan's filter and paging.
@@ -2456,15 +2468,25 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             let parsed = parsed::parsed_query(&s.filter);
             // The one plan is an index scan whose documents need no fetch:
             // a group that reads no field counts its keys (RM-072).
-            let seek =
-                (front.lookups.is_empty() && tried.len() <= 1 && s.skip == 0 && s.limit == 0)
-                    .then(|| count_seek(&plan))
-                    .flatten();
-            let filter = if seek.is_some() {
-                None
-            } else {
-                sbe::Filter::parse_find(&parsed, &s.filter)
+            // A fetch with a filter of its own is planned the same way
+            // whether or not other plans were tried (RM-695).
+            let seek = (front.lookups.is_empty() && s.skip == 0 && s.limit == 0)
+                .then(|| {
+                    (tried.len() <= 1)
+                        .then(|| count_seek(&plan))
+                        .flatten()
+                        .or_else(|| fetch_seek(&plan))
+                })
+                .flatten();
+            // A fetch's filter is what the index left of the query (RM-695).
+            let filter = match &seek {
+                Some(sk) => sk
+                    .fetch_filter
+                    .as_ref()
+                    .and_then(|f| sbe::Filter::parse_find(&parsed::parsed_query(f), f)),
+                None => sbe::Filter::parse_find(&parsed, &s.filter),
             };
+            fetched = seek.as_ref().is_some_and(|sk| sk.fetch_filter.is_some());
             let on = sbe::Front {
                 parsed,
                 filter,
@@ -2491,7 +2513,12 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             Some(sbe::eof_plan())
         };
         if let Some(built) = built {
-            let is_cached = cache.as_ref().is_some_and(|c| c.cached(&plan));
+            // An SBE plan chosen by the classic multi-planner is not in the
+            // SBE plan cache, whatever the classic cache holds; the trial's
+            // plans are listed as the classic ones ran (measured 8.2.11).
+            let is_cached = !fetched && cache.as_ref().is_some_and(|c| c.cached(&plan));
+            let trials = (fetched && tried.len() > 1)
+                .then(|| all_plans_entries(&tried, &tried[0].2, &|_: &Node| false));
             let sbe = Pushed {
                 plan: &built,
                 pushed: front.pushed,
@@ -2501,6 +2528,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                 stage_counts: &stage_counts,
                 cursor_pulled,
                 stage_spills: &stage_spills,
+                trials,
             };
             return sbe_reply(r, planner, &sbe, verbosity, ctx);
         }
@@ -2597,6 +2625,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                 stage_counts: &stage_counts,
                 cursor_pulled,
                 stage_spills: &stage_spills,
+                trials: None,
             };
             return sbe_reply(r, planner, &sbe, verbosity, ctx);
         }
@@ -2766,7 +2795,7 @@ fn count_seek(plan: &Node) -> Option<sbe::Seek> {
         return None;
     };
     let index = &ix.index;
-    let [(field, dir)] = index.fields()[..] else {
+    let [(field, _)] = index.fields()[..] else {
         return None;
     };
     // A count plans with `IS_COUNT`, under which an equality to null over
@@ -2781,7 +2810,20 @@ fn count_seek(plan: &Node) -> Option<sbe::Seek> {
     if !null_only {
         return None;
     }
-    if ix.filter.is_some()
+    if !seekable(ix) {
+        return None;
+    }
+    let mut described = Node::CountScan(ix.clone()).to_doc(None);
+    described.remove("stage");
+    index_seek(ix, described, None)
+}
+
+/// A single-field index's eligibility for an `ixseek`: a forward scan of
+/// one interval of a plain index on a top-level field that is not
+/// multikey, sparse or partial and has no collation or index filter.
+fn seekable(ix: &node::IxScan) -> bool {
+    let index = &ix.index;
+    !(ix.filter.is_some()
         || ix.backward
         || ix.no_bounds
         || !index.plain
@@ -2789,10 +2831,44 @@ fn count_seek(plan: &Node) -> Option<sbe::Seek> {
         || index.sparse
         || index.partial.is_some()
         || index.collation.is_some()
-        || field.contains('.')
-    {
+        || index.fields().len() != 1
+        || index.fields()[0].0.contains('.'))
+}
+
+/// The `FETCH` over an `IXSCAN` mongod 8.2.11 builds for a group that
+/// reads no field when the fetch has a filter of its own (RM-695): an
+/// `nlj` of an `ixseek` and a `limit 1` `seek` of each document, under a
+/// `filter` of what the index left. Built for the indexes
+/// [`count_seek`] serves.
+fn fetch_seek(plan: &Node) -> Option<sbe::Seek> {
+    let Node::Fetch {
+        filter: Some(filter),
+        input,
+    } = plan
+    else {
+        return None;
+    };
+    let Node::IxScan(ix) = &**input else {
+        return None;
+    };
+    if !seekable(ix) {
         return None;
     }
+    let mut described = Node::IxScan(ix.clone()).to_doc(None);
+    described.remove("stage");
+    index_seek(ix, described, Some(filter.clone()))
+}
+
+/// The seek keys of the one interval of `ix`.
+fn index_seek(
+    ix: &node::IxScan,
+    described: Document,
+    fetch_filter: Option<Document>,
+) -> Option<sbe::Seek> {
+    let index = &ix.index;
+    let [(field, dir)] = index.fields()[..] else {
+        return None;
+    };
     let (start, start_incl, end, end_incl) = ix.single_range()?;
     let descending = dir < 0;
     // A seek key is the bound's KeyString with a discriminator for its
@@ -2806,15 +2882,16 @@ fn count_seek(plan: &Node) -> Option<sbe::Seek> {
     };
     let low = seek_key(start.get(field)?, start_incl)?;
     let high = seek_key(end.get(field)?, !end_incl)?;
-    let mut described = Node::CountScan(ix.clone()).to_doc(None);
-    described.remove("stage");
     Some(sbe::Seek {
         low,
         high,
         path: field.to_string(),
         descending,
         index: index.name.clone(),
+        // The key pattern as the environment prints it.
+        key_pattern: format!("{{\"{field}\" : {dir}}}"),
         described,
+        fetch_filter,
     })
 }
 
@@ -3030,6 +3107,8 @@ struct Pushed<'a> {
     /// `$limit`; read only when no stage is pushed after the query.
     cursor_pulled: Option<i64>,
     stage_spills: &'a [secantus_core::memlimit::SpillReport],
+    /// `allPlansExecution`, when a trial of more than one plan chose it.
+    trials: Option<Vec<Bson>>,
 }
 
 /// The reply for a pipeline mongod runs in SBE: `explainVersion` "2", the
@@ -3067,7 +3146,10 @@ fn sbe_reply(
             } else {
                 sbe::Pull::Whole
             };
-            let (stats, _) = p.plan.execution_stats(p.docs, pull, all_plans);
+            let (mut stats, _) = p.plan.execution_stats(p.docs, pull, all_plans);
+            if let Some(trials) = p.trials.as_ref().filter(|_| all_plans) {
+                stats.insert("allPlansExecution", trials.clone());
+            }
             reply.insert("executionStats", stats);
         }
         reply.insert("command", r.echo.clone());
@@ -3099,6 +3181,10 @@ fn sbe_reply(
         let (stats, produced) =
             p.plan
                 .execution_stats(p.docs, sbe::Pull::Batches { limit, handed }, all_plans);
+        let mut stats = stats;
+        if let Some(trials) = p.trials.as_ref().filter(|_| all_plans) {
+            stats.insert("allPlansExecution", trials.clone());
+        }
         // A plan that ran to the end handed over everything it produced.
         pulled = Some(handed.min(produced));
         cursor.insert("executionStats", stats);

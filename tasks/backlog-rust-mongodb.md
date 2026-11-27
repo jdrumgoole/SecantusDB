@@ -1921,8 +1921,9 @@ What is left, all on the RUST MongoDB server:
       / `coscan` plan over a collection that does not exist. Still the
       classic `$cursor` / `stages` shape: any other filter (an `$in` holding
       null on a dotted path, `$exists`'s `exists`, a dotted `$eq: null`, `$or`, ...), a sorted,
-      projected or index-served front (`IXSCAN` / `FETCH`; for `count` on
-      a view, RM-695; the `COUNT_SCAN` of a single-field
+      projected or index-served front (`IXSCAN` / `FETCH` under a group
+      that reads a field; the single-interval `FETCH` under one that reads
+      none is built since 2026-11-27, RM-695; the `COUNT_SCAN` of a single-field
       index under a group that reads no field is built since 2026-11-14,
       RM-072), a skip or limit with a group that reads a field (mongod
       puts its dependency projection among them), `$lookup`,
@@ -1946,22 +1947,19 @@ What is left, all on the RUST MongoDB server:
       stats all come from running the plan. Not a printed stand-in.
       Backlog-ID: RM-071
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_a_group_pushed_into_the_query, tests/backlog/test_rm_057_084.py::test_explain_of_a_filter_sbe_runs_beyond_comparisons
-- [ ] **`count` on a view whose filter a `FETCH` over an index scan
-      finishes** is explained by mongod 8.2.11 as an SBE plan
-      (`explainVersion: "2"`, a `queryPlan` of `GROUP` over `FETCH` /
-      `IXSCAN`, a `slotBasedPlan` of an `nlj` of an `ixseek` that reads the
-      key, record id, snapshot and index ident into slots, and a `limit 1`
-      `seek` of the document, under a `filter` of `traverseF`); this server
-      reports the classic cursor with `FETCH` / `IXSCAN` and the `$count`'s
-      `$group`. Reproduce: a view `{$match: {a: {$gt: 1}}}` over indexes
-      `a_1` and `b_-1`, `explain` of `{count: <view>, query: {b: 2}}`.
-      Where the index serves the whole filter and the count reads no
-      field, the `GROUP` over a `COUNT_SCAN` is built since 2026-11-14
-      (RM-072). Needs the `nlj` and `seek` stages and their stats, and the
-      index-key slots of `ixseek`. `explain_commands.py`: `a view` 5.
+- [ ] **A `FETCH` over an index scan of more than one interval is not
+      run in SBE under a group that reads no field.** mongod 8.2.11 runs
+      `count` on a view `{$match: {a: {$gt: 1}}}` with `query: {b: {$in:
+      [1, 2]}}` over `b_-1` as an SBE plan (`explainVersion: "2"`, a
+      `GROUP` over `FETCH` / `IXSCAN`); this server keeps the classic
+      cursor. The single-interval shape is built since 2026-11-27 (RM-695:
+      the `nlj` of an `ixseek` and a `limit 1` `seek`, `fetch_seek` in
+      `explain/mod.rs`); several intervals need the seek over each one
+      that `buildIndexScan` generates for them (its union or its
+      `ixscan_generic` over a bounds program), still unprobed.
       **Decided 2026-10-16 (Joe):** as RM-071, transcribe and execute.
-      Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view_fetching_from_an_index
-      Backlog-ID: RM-695
+      Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view_fetching_from_index_intervals
+      Backlog-ID: RM-831
 - [ ] **A fusion input pipeline's `$unionWith` counts none of the stages
       after its `$cursor`.** At `executionStats`, mongod 8.2.11 gives each
       stage a `$rankFusion` input pipeline runs in its `$unionWith` an

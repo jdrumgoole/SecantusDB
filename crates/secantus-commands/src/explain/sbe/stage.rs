@@ -193,6 +193,25 @@ pub(crate) enum Stage {
         descending: bool,
         index: String,
         uuid: String,
+        /// Under a fetch (RM-695): the key, snapshot id and index ident
+        /// slots it also reads each entry into.
+        fetch: Option<(Slot, Slot, Slot)>,
+    },
+    /// `ScanStage` as a `seek` of the record whose id is in
+    /// `seek_record_id`, checked against the index entry (snapshot, ident,
+    /// key and key pattern slots), reading top-level `fields`: the inner
+    /// side of the `nlj` a `FETCH` over an index scan builds (RM-695).
+    Seek {
+        node: u32,
+        seek_record_id: Slot,
+        record: Slot,
+        record_id: Slot,
+        snapshot: Slot,
+        ident: Slot,
+        key: Slot,
+        key_pattern: Slot,
+        fields: Vec<(String, Slot)>,
+        uuid: String,
     },
     /// `SortStage`: the key slots and each one's direction (`true`:
     /// descending), the slots it outputs, and a top-k limit's slot and
@@ -357,6 +376,7 @@ impl Stage {
             | Stage::Branch { node, .. }
             | Stage::Union { node, .. }
             | Stage::Nlj { node, .. }
+            | Stage::Seek { node, .. }
             | Stage::HashLookup { node, .. }
             | Stage::Group { node, .. } => *node,
         }
@@ -608,6 +628,10 @@ impl Stage {
                 )
             }
             Stage::HashLookup { .. } => corr::hash_lookup(self, docs, demand),
+            Stage::Nlj { outer, inner, .. } if fetch_of(inner).is_some() => {
+                fetch_join(outer, inner, docs, demand)
+            }
+            Stage::Seek { .. } => unreachable!("a seek runs under its nlj"),
             Stage::Coscan { .. }
             | Stage::LimitLit { .. }
             | Stage::Unwind { .. }
@@ -621,6 +645,85 @@ impl Stage {
             }
         }
     }
+}
+
+/// The `seek` under the `limit 1` an `nlj`'s inner side is when it
+/// fetches the documents of an index seek (RM-695).
+fn fetch_of(inner: &Stage) -> Option<&Stage> {
+    let Stage::LimitLit { input, .. } = inner else {
+        return None;
+    };
+    matches!(**input, Stage::Seek { .. }).then_some(&**input)
+}
+
+/// An `nlj` of an index seek and a `limit 1` `seek` of each entry's
+/// document: each outer entry opens the inner side once, whose limit
+/// returns the one document the seek reads and stops it before it is
+/// asked past it; both are closed once, if opened at all.
+fn fetch_join(
+    outer: &Stage,
+    inner: &Stage,
+    docs: &[Document],
+    demand: Option<usize>,
+) -> (Vec<Row>, Counted) {
+    let (keys, below) = outer.run(docs, None);
+    let Some(Stage::Seek {
+        seek_record_id,
+        record,
+        record_id,
+        fields,
+        ..
+    }) = fetch_of(inner)
+    else {
+        unreachable!("checked by the caller")
+    };
+    let mut out = Vec::new();
+    for mut row in keys {
+        if demand.is_some_and(|d| out.len() >= d) {
+            break;
+        }
+        let Some(Some(Bson::Int64(id))) = row.get(seek_record_id).cloned() else {
+            continue;
+        };
+        let Some(d) = usize::try_from(id - 1).ok().and_then(|i| docs.get(i)) else {
+            continue;
+        };
+        row.insert(*record, Some(Bson::Document(d.clone())));
+        row.insert(*record_id, Some(Bson::Int64(id)));
+        for (name, slot) in fields {
+            row.insert(*slot, d.get(name).cloned());
+        }
+        out.push(row);
+    }
+    let n = out.len() as i64;
+    let closes = n.min(1);
+    let seek = Counted {
+        returned: n,
+        reads: n,
+        opens: Some(n),
+        closes: Some(closes),
+        ..Counted::default()
+    };
+    let limit = Counted {
+        returned: n,
+        opens: Some(n),
+        closes: Some(closes),
+        eof: n > 0,
+        input: Some(Box::new(seek)),
+        ..Counted::default()
+    };
+    let eof = below.eof && demand.is_none_or(|d| out.len() < d);
+    (
+        out,
+        Counted {
+            returned: n,
+            eof,
+            kids: vec![below, limit],
+            inner_opens: n,
+            inner_closes: closes,
+            ..Counted::default()
+        },
+    )
 }
 
 impl Counted {
@@ -674,6 +777,7 @@ impl Stage {
             Stage::Branch { .. } => "branch",
             Stage::Union { .. } => "union",
             Stage::Nlj { .. } => "nlj",
+            Stage::Seek { .. } => "seek",
             Stage::HashLookup { .. } => "hash_lookup",
         }
     }
@@ -698,6 +802,7 @@ impl Stage {
             | Stage::Branch { .. }
             | Stage::Union { .. }
             | Stage::Nlj { .. }
+            | Stage::Seek { .. }
             | Stage::HashLookup { .. } => None,
             Stage::LimitLit { input, .. } | Stage::Unwind { input, .. } => Some(input),
             Stage::Filter { input, .. }
