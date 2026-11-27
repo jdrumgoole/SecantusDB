@@ -1231,6 +1231,15 @@ one beside it.
       `432c8ec3e`, RP-1065's EXPLAIN-only change, run 45711355695), where
       the snapshot before (#2996, which carried RP-1073) passed it and the
       local debug build measures 13.1 ms against 14.3 ms (1.10).
+      A fourth, after the sorted name index (`487548600`, locally a ratio
+      median of 1.02): the same 3,200-table test on a MongoDB-only PR
+      (#3085 at `ca4bcfa1`, RM-636, which changes only
+      `crates/secantus-core/src/docstore.rs`; run 46029656831, job
+      140610095715, the only failure of 5,704), a median of 27.7 ms with
+      no other table against 31.6 ms with 3,200, ratio median 1.14, rounds
+      0.82 to 1.28 (2026-11-27). So on CI's runner the fix left the ratio
+      near 1.1 where locally it is 1.02: either the runner's noise spans
+      the bound or some growth CI sees is not seen on arm64 macOS.
       Verify: none -- intermittent on CI; RP-715's, RP-911's and RP-1073's tests are the check
       Backlog-ID: RP-1100
 
