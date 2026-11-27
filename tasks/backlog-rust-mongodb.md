@@ -1883,7 +1883,8 @@ What is left, all on the RUST MongoDB server:
       is, over a forward collection scan with no sort, projection, hint or
       collation, whose filter is `$eq` / `$lt` / `$lte` / `$gt` / `$gte` of
       a number, string or boolean on a path of named fields, `$eq: null`
-      on one field, an `$in` of such values, the `$not: {$eq}` a `$ne` is
+      on one field, an `$in` of such values (holding null too on one
+      field, since 2026-11-27), the `$not: {$eq}` a `$ne` is
       (since 2026-11-14), and the `$and`s of those (`explain/sbe/filter.rs`), with a skip and a limit where the
       group reads no field (RM-072); whose `_id` is a field path, `$$ROOT`,
       a scalar constant or an object of those, whose arguments are field
@@ -1892,7 +1893,7 @@ What is left, all on the RUST MongoDB server:
       `$addToSet`, and at most one distinct dotted path; and the `limit 0`
       / `coscan` plan over a collection that does not exist. Still the
       classic `$cursor` / `stages` shape: any other filter (an `$in` holding
-      null, `$exists`'s `exists`, a dotted `$eq: null`, `$or`, ...), a sorted,
+      null on a dotted path, `$exists`'s `exists`, a dotted `$eq: null`, `$or`, ...), a sorted,
       projected or index-served front (`IXSCAN` / `FETCH`; for `count` on
       a view, RM-695; the `COUNT_SCAN` of a single-field
       index under a group that reads no field is built since 2026-11-14,

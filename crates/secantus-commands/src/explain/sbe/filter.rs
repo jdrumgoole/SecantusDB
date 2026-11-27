@@ -15,8 +15,8 @@
 //!
 //! Built here: `$eq`, `$lt`, `$lte`, `$gt` and `$gte` of a number (not NaN),
 //! a string or a boolean, on a path of named fields, and `$and`s of those;
-//! given the command's filter (`Filter::parse_find`), also an `$in` of such values but
-//! null: `isMember` against an `InList` the plan's environment binds, its
+//! given the command's filter (`Filter::parse_find`), also an `$in` of such values (and
+//! null, on a one-field path, with the value folded as `$eq: null` folds it): `isMember` against an `InList` the plan's environment binds, its
 //! values in the command's own order (the `parsedQuery` sorts them). An
 //! `$eq: null` on a one-field path (`typeMatch` folding undefined and
 //! Nothing to null) and the `$not: {$eq: c}` a `$ne` canonicalises to
@@ -35,7 +35,9 @@ const UNDEFINED_MASK: u32 = 1024;
 #[derive(Clone, Debug)]
 enum Test {
     Compare(BinOp, Bson),
-    /// `$in`: the values as the command gave them.
+    /// `$in`: the values as the command gave them. One holding null tests
+    /// the value folded as `$eq: null` folds it (Nothing and undefined
+    /// read as null), on a one-field path only.
     In(Vec<Bson>),
     /// `$eq: null`: null, undefined or missing (`generateComparison`'s
     /// null case, `typeMatch` of undefined folding it to null).
@@ -122,9 +124,13 @@ fn leaf(clause: &Document, raw: Option<&Document>) -> Option<Leaf> {
             return None;
         }
         let values = raw_in(raw?, path)?;
-        let printable = values
-            .iter()
-            .all(|v| comparable(v) && super::print::list_value(v).is_some());
+        // A null member: measured on a one-field path only (2026-11-27); a
+        // dotted path's test reads the levels above it as well.
+        let null_ok = parts.len() == 1;
+        let printable = values.iter().all(|v| {
+            (matches!(v, Bson::Null) && null_ok)
+                || (comparable(v) && super::print::list_value(v).is_some())
+        });
         return printable.then_some(Leaf {
             path: parts,
             test: Test::In(values),
@@ -214,30 +220,18 @@ impl Filter {
             let test: Box<dyn Fn(Expr) -> Expr> = match &l.test {
                 Test::In(values) => {
                     let list = Expr::InList(slots(), values.clone());
-                    Box::new(move |v| Expr::func("isMember", vec![v, list.clone()]))
+                    let nullish = values.iter().any(|v| matches!(v, Bson::Null));
+                    Box::new(move |v| {
+                        let v = if nullish { fold_null(v) } else { v };
+                        Expr::func("isMember", vec![v, list.clone()])
+                    })
                 }
                 // `((if (typeMatch(l, 1024) ?: true) then null else
                 // move(l) == null) ?: false)`: Nothing and undefined read
                 // as null.
                 Test::Null => Box::new(|v| {
-                    let Expr::Local { frame, .. } = v else {
-                        unreachable!("a traversal's lambda reads its local")
-                    };
-                    let read = Expr::Local {
-                        frame,
-                        moved: false,
-                    };
-                    let nullish = Expr::fill_empty(
-                        Expr::TypeMatch(Box::new(read), UNDEFINED_MASK),
-                        Expr::Const(Some(Bson::Boolean(true))),
-                    );
-                    let folded = Expr::If(
-                        Box::new(nullish),
-                        Box::new(Expr::Const(Some(Bson::Null))),
-                        Box::new(v),
-                    );
                     Expr::fill_empty(
-                        Expr::bin(BinOp::Eq, folded, Expr::Const(Some(Bson::Null))),
+                        Expr::bin(BinOp::Eq, fold_null(v), Expr::Const(Some(Bson::Null))),
                         Expr::Const(Some(Bson::Boolean(false))),
                     )
                 }),
@@ -260,6 +254,27 @@ impl Filter {
         }
         Some(out)
     }
+}
+
+/// `if (typeMatch(l, 1024) ?: true) then null else move(l)`: the lambda's
+/// value with Nothing and undefined read as null.
+fn fold_null(v: Expr) -> Expr {
+    let Expr::Local { frame, .. } = v else {
+        unreachable!("a traversal's lambda reads its local")
+    };
+    let read = Expr::Local {
+        frame,
+        moved: false,
+    };
+    let nullish = Expr::fill_empty(
+        Expr::TypeMatch(Box::new(read), UNDEFINED_MASK),
+        Expr::Const(Some(Bson::Boolean(true))),
+    );
+    Expr::If(
+        Box::new(nullish),
+        Box::new(Expr::Const(Some(Bson::Null))),
+        Box::new(v),
+    )
 }
 
 /// `traverseF` over `input`, the field `leaf.path[depth]` of the level
@@ -358,6 +373,23 @@ mod tests {
             "traverseF(s3, lambda(l2.0) { ((\n    if (typeMatch(l2.0, 1024) ?: true) \n    \
              then null \n    else move(l2.0) \n== null) ?: false) }, false)"
         );
+    }
+
+    /// An `$in` holding null folds the value as `$eq: null` does; measured
+    /// against mongod 8.2.11 on 2026-11-27 (RM-071). A dotted one is not
+    /// built.
+    #[test]
+    fn an_in_holding_null_folds_the_value() {
+        let f = doc! { "a": { "$in": [null, 1] } };
+        let built = Filter::parse_find(&f, &f).unwrap();
+        let slot = |n: &str| (n == "a").then_some(3);
+        assert_eq!(
+            expression(&built.program(&slot, &mut || 4).unwrap()),
+            "traverseF(s3, lambda(l2.0) { isMember(\n    if (typeMatch(l2.0, 1024) ?: true) \n    \
+             then null \n    else move(l2.0) \n, s4) }, false)"
+        );
+        let dotted = doc! { "x.y": { "$in": [null, 1] } };
+        assert!(Filter::parse_find(&dotted, &dotted).is_none());
     }
 
     /// What is not built here is left to the classic explain.

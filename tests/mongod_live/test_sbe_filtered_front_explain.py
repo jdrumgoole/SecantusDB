@@ -58,6 +58,9 @@ PIPELINES = [
     [{"$match": {"a": {"$in": [1, 2, "str"]}}}, COUNT],
     [{"$match": {"a": {"$ne": 2}}}, COUNT],
     [{"$match": {"a": {"$ne": 2}, "b": {"$gt": 0}}}, {"$group": {"_id": "$b"}}],
+    # RM-071 (2026-11-27): an `$in` holding null folds the value to null.
+    [{"$match": {"a": {"$in": [None, 1]}}}, COUNT],
+    [{"$match": {"a": {"$in": [2, None, "str"]}, "b": {"$gt": 0}}}, {"$group": {"_id": "$b"}}],
 ]
 
 
