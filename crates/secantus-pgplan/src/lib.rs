@@ -15719,16 +15719,21 @@ fn source_targets(sel: &pg_query::protobuf::SelectStmt) -> Vec<SourceTarget> {
 /// named as the domain (`format_type_be` of the target, not its base).
 pub fn record_to_composite_mismatch(column: &Column, location: i32) -> Error {
     set_error_location(location);
-    let target = match column
+    let target = column_domain_name(column)
+        .unwrap_or_else(|| scalar::format_type_text(&column.pg_type, None));
+    Error::CannotCoerce(format!("cannot cast type record to {target}"))
+}
+
+/// A domain column's own type as `format_type_be` prints it (`pint48`,
+/// not its base `integer`): the column's `atttypid` is the domain, while
+/// `pg_type` here holds the base and `extra.domain_type` the domain.
+fn column_domain_name(column: &Column) -> Option<String> {
+    column
         .extra
         .get_str("domain_type")
         .ok()
         .and_then(domains::user_domain)
-    {
-        Some(d) => quote_type_path(&d.name),
-        None => scalar::format_type_text(&column.pg_type, None),
-    };
-    Error::CannotCoerce(format!("cannot cast type record to {target}"))
+        .map(|d| quote_type_path(&d.name))
 }
 
 /// PostgreSQL's assignment-coercion failure for one column of an
@@ -15737,11 +15742,13 @@ pub fn record_to_composite_mismatch(column: &Column, location: i32) -> Error {
 pub fn assignment_mismatch(column: &Column, source_type: &str, location: i32) -> Error {
     set_error_location(location);
     // `format_type_be`: the column's type without its modifier
-    // (`bit`, not `bit(4)`; `numeric`, not `numeric(4,1)`).
+    // (`bit`, not `bit(4)`; `numeric`, not `numeric(4,1)`), and a domain
+    // column named as the domain (RP-1083).
     Error::DatatypeMismatch(format!(
         "column \"{}\" is of type {} but expression is of type {}",
         column.name,
-        scalar::format_type_text(&column.pg_type, None),
+        column_domain_name(column)
+            .unwrap_or_else(|| scalar::format_type_text(&column.pg_type, None)),
         display_type(source_type)
     ))
 }
@@ -15981,6 +15988,9 @@ fn assignable(column: &Column, from: &str, what: &str) -> Result<()> {
     if allowed {
         return Ok(());
     }
+    // `format_type_be(atttypid)`: a domain column is named as the domain,
+    // though the check above runs on its base type (RP-1083).
+    let to_s = column_domain_name(column).unwrap_or(to_s);
     Err(Error::DatatypeMismatch(format!(
         "column \"{}\" is of type {to_s} but {what} is of type {from_s}",
         column.name

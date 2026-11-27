@@ -3194,16 +3194,6 @@ Measured on PostgreSQL 15.20 with `create domain pint48 as int check (value
 `create table t48 (p pint48, a dia48)` and `create table t48v (x vd48[])`.
 The gap tests are in `tests/backlog/test_rp_found_rp1048.py`.
 
-- [ ] **A 42804 assignment error names a domain column by its base type.**
-      `insert into t48(p) values ('1'::text)` is 42804 `column "p" is of
-      type pint48 but expression is of type text` at 28 on PostgreSQL 15.20
-      (`format_type_be` of the column's own type); here it says `of type
-      integer`. The same in `UPDATE`, in `INSERT ... SELECT`, and for a
-      domain over an array (`dia48`, here `integer[]`). A plain domain
-      column's `pg_type` is its base, the domain in `extra.domain_type`,
-      and `assignment_mismatch` (secantus-pgplan) prints `pg_type`.
-      Verify: tests/backlog/test_rp_found_rp1048.py::test_domain_column_named_in_42804
-      Backlog-ID: RP-1083
 - [ ] **A value too long for a `varchar(n)` domain is stored in an array of
       that domain.** `insert into t48v(x) values (array['abcd'::text])`, the
       same through `INSERT ... SELECT`, and the untyped `'{abcd}'` are each
