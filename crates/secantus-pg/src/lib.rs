@@ -8174,8 +8174,9 @@ impl PgHandler {
         // (RP-028): a sequential scan's is the heap's; a bitmap heap
         // scan's is the TIDs its index holds, each a HOT chain's root
         // (where a scan reaches a version an update left on the page); a
-        // B-tree index scan's is the index's, ties in their roots' order.
-        // A lookup of one row by a unique key: an index scan whenever the
+        // B-tree index scan's is the index's, ties in their roots' order --
+        // the path EXPLAIN prints, from the table's statistics once analysed
+        // (RP-1120). A lookup of one row by a unique key: an index scan whenever the
         // planner prices it so, which marks the dead versions of that key it
         // passes (RP-196).
         if rows.len() <= 1 && !filter.is_empty() && self.has_heap(table) {
@@ -8192,7 +8193,7 @@ impl PgHandler {
         }
         if rows.len() > 1 && !filter.is_empty() && self.has_heap(table) {
             use serializable::{PricedScan, ScanIndex};
-            match self.priced_scan(table, filter) {
+            match self.executor_scan(table, filter) {
                 Some(PricedScan::Seq) => return Ok(heap::in_ctid_order(rows)),
                 Some(PricedScan::Bitmap(_)) => return self.in_root_order(table, rows),
                 Some(PricedScan::Index(ScanIndex::Btree(shape))) => {

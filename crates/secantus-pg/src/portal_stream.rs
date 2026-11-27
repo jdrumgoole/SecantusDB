@@ -502,7 +502,7 @@ impl PgHandler {
         let mut priced = false;
         if order.is_empty() && !sel.filter.is_empty() && self.has_heap(&sel.table) {
             use crate::serializable::{PricedScan, ScanIndex};
-            match self.priced_scan(&sel.table, &sel.filter) {
+            match self.executor_scan(&sel.table, &sel.filter) {
                 Some(PricedScan::Seq) => {
                     priced = true;
                     if !seq || self.heap_scan_disordered(&sel.table) {

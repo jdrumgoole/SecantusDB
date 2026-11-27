@@ -440,6 +440,33 @@ impl PgHandler {
         self.priced_scan_am(table, filter, false)
     }
 
+    /// The scan the executor reads `filter` over `table` with: the path
+    /// EXPLAIN prints for an analysed table (`executor_scan_path`, priced
+    /// from its statistics: its histograms and its columns' correlation),
+    /// and otherwise [`Self::priced_scan`]'s, which prices a table never
+    /// analysed. Before RP-1120 the executor always took the latter, which
+    /// prices every index as uncorrelated, so a range EXPLAIN printed as an
+    /// index scan was read as a bitmap scan, in heap order and marking no
+    /// dead entries (`_bt_killitems`).
+    pub(crate) fn executor_scan(&self, table: &str, filter: &Document) -> Option<PricedScan> {
+        let modelled = match self.executor_scan_path(table, filter) {
+            Some(None) => Some(PricedScan::Seq),
+            Some(Some(ix)) => self
+                .btree_shapes(table)
+                .into_iter()
+                .find(|s| s.name == ix.name)
+                .map(|shape| {
+                    if ix.bitmap.is_some() || !ix.or_arms.is_empty() {
+                        PricedScan::Bitmap(ScanIndex::Btree(shape))
+                    } else {
+                        PricedScan::Index(ScanIndex::Btree(shape))
+                    }
+                }),
+            None => None,
+        };
+        modelled.or_else(|| self.priced_scan(table, filter))
+    }
+
     /// [`Self::priced_scan`], with the GIN and GiST paths the reading
     /// SELECT's residual opens weighed too when `am` (RP-254).
     pub(crate) fn priced_scan_am(
