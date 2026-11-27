@@ -1618,8 +1618,9 @@ a regression test.
       match, 22 differ.
       Backlog-ID: RP-290
       Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view]
-- [ ] **A catalog row DDL other than CREATE TABLE writes counts no heap
-      block** in `pg_statio_sys_tables`. A catalog scan counts its index
+- [ ] **A catalog row DDL other than CREATE TABLE, VIEW or FUNCTION
+      writes counts no heap block** in `pg_statio_sys_tables`, nor does a
+      dead row's space take new rows. A catalog scan counts its index
       pages (`catalog_btree.rs`, from `pg15_catalog_indexes.txt`) and the
       heap blocks behind the rows it returns: `initdb`'s own
       (`pg15_catalog_heaps.txt`, `catalog_heap.rs`), and since 2026-11-25
@@ -1637,22 +1638,32 @@ a regression test.
       dead at commit, as does a rolled-back CREATE (regression tests
       `test_catalog_blocks`, `test_a_page_ddl_wrote_to_is_not_all_visible`
       and `test_ddl_cycles_write_the_pages_postgresqls_do`, which holds the
-      `pg_class` blocks four cycles of DDL write to PostgreSQL's).
+      `pg_class` blocks four cycles of DDL write to PostgreSQL's). Since
+      2026-11-26 CREATE VIEW's rows are placed too (its row type and array
+      type, its `pg_class` row and columns, its `_RETURN` rule's
+      `pg_rewrite` row with `ev_action` compressed by a port of pglz as
+      `heap_toast_insert_or_update` compresses it, and the HOT update
+      `relhasrules` makes), and CREATE FUNCTION's `pg_proc` row; a DROP
+      (or a CASCADE) of either leaves them dead (regression tests
+      `test_a_views_and_a_functions_rows_are_read_from_the_heap` and
+      `test_the_tenth_cycles_rows_read_what_the_firsts_do`).
       **Decided** (Joe, 2026-11-01): option A, the full model, landed as a
       sequence of PRs, this item open until the last. Remaining:
-      - every other DDL's rows: CREATE VIEW's (`pg_class`, `pg_type`,
-        `pg_attribute`, `pg_rewrite`, and the HOT update `relhasrules`
-        makes), CREATE FUNCTION's `pg_proc` row, GRANT's out-of-line
-        `relacl` update (217 bytes), CREATE INDEX, sequences and serial
-        columns, ALTER TABLE, roles, and the CREATE TABLE shapes left
-        unplaced (temporary, partitioned, inheriting and typed tables,
-        identity and generated columns, foreign keys, whose triggers update
-        the `pg_class` rows, exclusion constraints, CREATE DATABASE with a
-        locale option); and the catalogs none of it is placed in yet
-        (`pg_depend`, `pg_constraint`, `pg_shdepend`, ...). A view's first
-        use in a fresh database reads 6 `pg_class`, 4 `pg_attribute` and 1
-        `pg_rewrite` blocks on PostgreSQL, 3, 3 and 0 here; a function's
-        first call 3 `pg_proc` blocks, here 1;
+      - every other DDL's rows: GRANT's out-of-line `relacl` update (217
+        bytes), CREATE INDEX, sequences and serial columns, ALTER TABLE,
+        roles, CREATE OR REPLACE of a view or a function (an update of its
+        rows), and the shapes of the placed DDL left unplaced: temporary,
+        partitioned, inheriting and typed tables, identity and generated
+        columns, foreign keys, whose triggers update the `pg_class` rows,
+        exclusion constraints, CREATE DATABASE with a locale option; a
+        temporary view, one with options or a CHECK OPTION; a function
+        with parameter defaults, transforms, a SQL-standard body or an
+        ACL; an aggregate. A view whose rule does not fit even compressed
+        puts it in `pg_rewrite`'s TOAST table, which is not modelled. A
+        query string that both creates and drops one view or function
+        places nothing for it, as the two are compared before and after
+        the whole string. And the catalogs none of it is placed in yet
+        (`pg_depend`, `pg_constraint`, `pg_shdepend`, ...);
       - the index entries of the placed rows in the index trees, which hold
         only `initdb`'s tuples and are shared by every database (a scan's
         leaf pages are read over `initdb`'s tree), with a non-HOT update's
@@ -1660,13 +1671,14 @@ a regression test.
       - a dead row's space: on-access pruning (`heap_page_prune_opt`) and
         VACUUM do not free it, so each cycle of DDL in a database puts
         its rows after the last cycle's, where PostgreSQL puts them in the
-        space pruning gave back. At the module's tenth cycle in one
-        database (only there, of cycles 1 to 14), where `rpc_t`'s rows
-        land makes its primary-key lookup read 4 `pg_attribute` blocks
-        where PostgreSQL 15.20 reads 3, most likely its rows crossing a
-        page boundary (`test_a_dead_rows_space_takes_new_rows`; this is why
-        `test_catalog_blocks` failed on CI in the shared database until it
-        moved to a fresh one, RP-1111). Also, a scan never meets a dead
+        space pruning gave back. After 20 cycles of the module's DDL in
+        one database PostgreSQL 15.20's `pg_class` and `pg_type` are 14 and
+        15 blocks, as after one; here 16 and 18, and 26 and 23 after 60
+        (`test_a_dead_rows_space_takes_new_rows`). The `heap_page.rs`
+        model a user table's heap uses has the pruning (`prune_opt`,
+        `delete`); the catalog heaps only mark a dropped row dead. The
+        tenth-cycle `pg_attribute` difference RP-1111 found was the
+        unplaced view's and function's rows, not this. Also, a scan never meets a dead
         row's entry (it reads as killed at once, where PostgreSQL's first
         scan reads its block before `_bt_killitems`); a ROLLBACK TO
         SAVEPOINT past a CREATE TABLE keeps its rows live;
@@ -1688,36 +1700,70 @@ a regression test.
       blocks, not 56; `pg_class`, `pg_type`, `pg_index` and `pg_database`
       are 15.19's page for page, which is what this slice was measured on.
       Backlog-ID: RP-291
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_views_and_a_functions_rows_are_read_from_the_heap, tests/backlog/test_rp_catalog_reads.py::test_a_dead_rows_space_takes_new_rows
-- [ ] **No logical replication launcher scans `pg_subscription`.**
-      PostgreSQL 15.19's launcher (`ApplyLauncherMain`) heap-scans
-      `pg_subscription` as it starts, again at once, then whenever its
-      latch is set (a reload, a subscription's commit) or 180 s pass, and
-      flushes those counts only as it exits: across a restart,
-      `pg_stat_get_numscans('pg_subscription'::regclass)` moves by the run
-      before's scans (2 after a run with no reload, 3 with one, 5 with
-      three; PostgreSQL 15.20, private cluster). Here it does not move.
-      The faithful fix keeps the launcher's pending scans per server run
-      and folds them in at a clean shutdown (found while working RP-292,
-      whose restart comparison leaves `pg_subscription` out for this).
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_the_logical_replication_launcher_scans_pg_subscription
-      Backlog-ID: RP-1096
-- [ ] **An invalidation never removes the relation cache init files.**
-      Since RP-292 the first backend after a start builds the init files
-      and later ones read them; but PostgreSQL 15.19 also removes a file
-      when a committed transaction invalidates a relation it holds
-      (`RelationCacheInitFilePreInvalidate`), and the next backend builds
-      it again. After a database-wide `analyze`, PostgreSQL 15.20's next
-      backend makes the cold start's heap scans (`pg_class` 11,
-      `pg_attribute` 11, `pg_authid` 2); after `analyze pg_class`, `analyze
-      pg_authid` or a `create table` it makes none. Here no invalidation
-      reaches the init files. The faithful fix: an `Inval::Rel` of an
-      init-file relation, at commit, removes that file (shared or the
-      database's), as `RegisterRelcacheInvalidation` marks
-      `RelcacheInitFileInval`; which of `analyze`'s catalog updates send
-      one is the part to measure (found while working RP-292).
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_removes_the_init_files
-      Backlog-ID: RP-1097
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_dead_rows_space_takes_new_rows
+- [ ] **A `pg_stat_get_*` function given a regclass answers NULL.**
+      `pg_stat_get_numscans('pg_class'::regclass)` (and
+      `pg_stat_get_tuples_returned`, the same shape) is NULL here, where
+      PostgreSQL 15.20 casts the regclass to the oid argument (binary
+      coercible, implicit) and answers pg_class's count; with
+      `'pg_class'::regclass::oid` or a bare integer both agree. The
+      argument helper in `pgstat_sql.rs` already resolves a regclass
+      value, so the NULL comes from before it: how the call reaches it
+      with a regclass argument is the part to find (found while working
+      RP-1096).
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_stat_function_takes_a_regclass
+      Backlog-ID: RP-1143
+- [ ] **A fresh store's statistics hold none of `initdb`'s counts.**
+      `initdb` leaves a statistics file, so a fresh PostgreSQL 15.20
+      cluster's first run already reads counts no session of its made:
+      `pg_stat_get_numscans('pg_subscription'::regclass)` is 2, with or
+      without a logical replication launcher (whose own scans are pending
+      until it exits, RP-1096), and no restart without a launcher moves it
+      (private clusters, 2026-11-26). Here a fresh store starts from
+      nothing: 0. pg_subscription is the clean measure, read by no client
+      backend; the busy catalogs (`pg_class`, `pg_database`, `pg_authid`)
+      read higher on PostgreSQL in a first session too, but a reading
+      holds that session's own scans, so `initdb`'s share of them is
+      still to be measured. The faithful fix seeds a new store's shared counts with
+      the statistics file `initdb` writes, as the catalogs' rows are
+      seeded with its heaps (found while working RP-1096).
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_fresh_stores_statistics_hold_initdbs_scans
+      Backlog-ID: RP-1142
+- [ ] **`pg_stat_activity` lists no background process.** PostgreSQL
+      15.20 (`autovacuum = on`) lists five, each with no database: the
+      autovacuum launcher, background writer, checkpointer, walwriter and
+      the logical replication launcher (a background worker, so the only
+      one with a user, the bootstrap superuser), waiting on
+      `AutoVacuumMain`, `BgWriterHibernate`, `CheckpointerMain`,
+      `WalWriterMain` and `LogicalLauncherMain`; and
+      `pg_stat_get_db_numbackends(0)` counts the five (the
+      `pg_stat_database` row for datid 0 hard-codes 0). Here the view has
+      no such row, and since RP-1096 `pg_stat_get_db_numbackends(0)` counts
+      only the logical replication launcher, whose statistics entry is a
+      backend's: 1. The faithful fix gives each process this server runs
+      as a thread (the autovacuum launcher, the checkpointer, the logical
+      replication launcher) its `PgBackendStatus` row, and models the two
+      it has no thread for, or refuses the gap by name; found while working
+      RP-1096.
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_pg_stat_activity_lists_the_background_processes
+      Backlog-ID: RP-1141
+- [ ] **A fresh server's `pg_class` shows another cluster's size for four
+      catalogs.** `pg15_class_sizes.tsv`, from which `pg_class` takes each
+      built-in catalog's `relpages`, `reltuples` and `relallvisible`, was
+      dumped from a database of the shared reference cluster, whose shared
+      catalogs hold that cluster's roles and dependencies. A fresh
+      PostgreSQL 15.20 cluster (private, 2026-11-27) shows `pg_shdepend`
+      0 / 0 / 0, `pg_authid` 1 / 13 / 1, `pg_auth_members` 1 / 3 / 1 and
+      `pg_statistic` 20 / 404 / 20; here 5 / 494 / 5, 1 / 16 / 0, 1 / 3 / 0
+      and 27 / 411 / 27. Since RP-1097 the gap also moves a database-wide
+      ANALYZE's `vac_update_relstats` check, which compares its measure
+      with what `pg_class` holds: the first one also invalidates
+      `pg_authid`, `pg_auth_members` and `pg_statistic`, whose measure
+      differs only from the wrong literal. The planner sizes those
+      catalogs from the same literal (RP-314), so a fix re-measures their
+      estimates too (found while working RP-1097).
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_fresh_servers_pg_class_holds_a_fresh_clusters_sizes
+      Backlog-ID: RP-1144
 - [ ] **A database-wide ANALYZE measures only some catalog columns.** Since
       RP-311 each database holds `initdb`'s `pg_statistic` rows for the
       built-in catalogs. A plain `ANALYZE` (or `VACUUM ANALYZE`)
@@ -1733,7 +1779,10 @@ a regression test.
       `oidvector_ops`). The other columns keep `initdb`'s rows, where
       PostgreSQL 15.19 measures them too: `pg_node_tree`. Not modelled
       either: the measured
-      catalogs' `relpages` / `reltuples` in `pg_class`, and the row order
+      catalogs' `relpages` / `reltuples` in `pg_class` (since RP-1097 a
+      database-wide ANALYZE records its measure of each catalog's size, and
+      invalidates the catalog whose size changed, but `pg_class` still
+      shows `initdb`'s), and the row order
       of the replaced `pg_statistic` rows (an update moves PostgreSQL's)
       (found while working RP-311).
       Backlog-ID: RP-313
@@ -3811,7 +3860,14 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       load average about 2.6): `tests/backlog/test_rp_found_rp921.py`'s
       module server gave `''` for its first line, so its 6 tests were
       `REGRESSED`; the module alone passed (6 in 105 s), and the same
-      commit's gate before a rebase had no start failure. Not yet known: whether the
+      commit's gate before a rebase had no start failure. A third time on
+      2026-11-27, in RP-1145's `gate_pg.sh --fast` backlog step (load
+      average about 4 at its end, the other lane running):
+      `tests/backlog/test_rp_found_rp726.py`'s module server gave `''`
+      for its first line and nothing after its stop, so its 22 tests were
+      `REGRESSED`; no crash report was written, so it did not die of a
+      signal, and the module alone passed (22 in 153 s), where three lone
+      fresh starts took 4.1-4.3 s each. Not yet known: whether the
       server stalled (a lock, a WiredTiger create waiting on a checkpoint)
       or was starved, since the harness keeps no stack or timing of a
       start it gives up on. The harness should sample the child

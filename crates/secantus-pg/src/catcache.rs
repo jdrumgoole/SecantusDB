@@ -676,7 +676,7 @@ impl Backend {
     /// The transaction ended: a commit sends its messages; an abort
     /// applies them again here (the cached rows it read may be the
     /// aborted ones) and sends nothing.
-    pub(crate) fn end_xact(&mut self, store: usize, pid: i32, commit: bool) {
+    pub(crate) fn end_xact(&mut self, store: usize, db: i64, pid: i32, commit: bool) {
         let pending = std::mem::take(&mut self.pending);
         let dead = std::mem::take(&mut self.pending_dead);
         if commit && !dead.is_empty() {
@@ -691,6 +691,13 @@ impl Backend {
                 self.apply(m);
             }
             return;
+        }
+        // `AtEOXact_Inval`: a relation an init file holds was invalidated
+        // (`RegisterRelcacheInvalidation` set `RelcacheInitFileInval`), so
+        // the files go before the messages are sent
+        // (`RelationCacheInitFilePreInvalidate`, RP-1097).
+        if pending.iter().any(invalidates_init_file) {
+            init_files_invalidated(store, db);
         }
         let mut q = queues().lock().unwrap_or_else(|e| e.into_inner());
         let q = q.entry(store).or_default();
@@ -747,6 +754,32 @@ pub(crate) fn init_files_written(store: usize, db: i64) {
     let f = f.entry(store).or_default();
     f.shared = true;
     f.local.insert(db);
+}
+
+/// Whether a committed message makes the init files go
+/// (`RegisterRelcacheInvalidation`): a relation cache invalidation of a
+/// relation an init file holds (`RelationIdIsInInitFile`).
+fn invalidates_init_file(msg: &Inval) -> bool {
+    match msg {
+        Inval::Rel(rel) => crate::catalog_facts::builtin()
+            .relations
+            .get(rel)
+            .is_some_and(|c| c.in_init_file),
+        _ => false,
+    }
+}
+
+/// `RelationCacheInitFilePreInvalidate`: a backend in `db` committed an
+/// invalidation of a relation an init file holds. The database's file goes,
+/// and the shared one with it whichever file held the relation ("for
+/// simplicity invalidations for a specific database always invalidate the
+/// shared file as well"); another database's file stays.
+pub(crate) fn init_files_invalidated(store: usize, db: i64) {
+    let mut f = init_files().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(f) = f.get_mut(&store) {
+        f.shared = false;
+        f.local.remove(&db);
+    }
 }
 
 /// The server started, or stopped: no init file is there.
@@ -813,7 +846,7 @@ mod tests {
         ]);
         b.accept(store, 2);
         assert!(b.has_relation(16384));
-        a.end_xact(store, 1, true);
+        a.end_xact(store, 5, 1, true);
         b.accept(store, 2);
         assert!(!b.has_relation(16384));
         assert!(!b.cached(Cache::RelOid, &vec![K::O(16384)]));
@@ -829,7 +862,7 @@ mod tests {
         a.left_dead(vec![(2659, key.clone())]);
         // Not killable while its transaction is open.
         assert_eq!(take_dead(store, 2659, &vec![K::O(16384)]), 0);
-        a.end_xact(store, 1, true);
+        a.end_xact(store, 5, 1, true);
         // A scan of the relation's attributes meets it once.
         assert_eq!(take_dead(store, 2659, &vec![K::O(16385)]), 0);
         assert_eq!(take_dead(store, 2659, &vec![K::O(16384)]), 1);
@@ -851,6 +884,33 @@ mod tests {
     }
 
     #[test]
+    fn a_committed_invalidation_of_an_init_file_relation_removes_the_files() {
+        let store = 0xfef1;
+        let mut a = Backend::default();
+        a.attach(store);
+        init_files_written(store, 5);
+        init_files_written(store, 16384);
+        // A user table's invalidation, and an aborted one of `pg_database`:
+        // the files stay.
+        a.local(vec![Inval::Rel(70000)]);
+        a.end_xact(store, 5, 1, true);
+        a.local(vec![Inval::Rel(1262)]);
+        a.end_xact(store, 5, 1, false);
+        assert_eq!(init_files_missing(store, 5), (false, false));
+        // `pg_am_name_index` is a catalog index no init file holds.
+        a.local(vec![Inval::Rel(2651)]);
+        a.end_xact(store, 5, 1, true);
+        assert_eq!(init_files_missing(store, 5), (false, false));
+        // A committed one of `pg_database` (shared): the shared file and
+        // this database's go, the other database's stays.
+        a.local(vec![Inval::Rel(1262)]);
+        a.end_xact(store, 5, 1, true);
+        assert_eq!(init_files_missing(store, 5), (true, true));
+        assert_eq!(init_files_missing(store, 16384), (true, false));
+        forget_store(store);
+    }
+
+    #[test]
     fn an_aborted_change_reaches_no_one_else() {
         let store = 0xfeee;
         let c = counter();
@@ -861,7 +921,7 @@ mod tests {
         b.build_relation(16384);
         b.search(&c, Cache::RelOid, vec![K::O(16384)], 1);
         a.local(vec![Inval::Rel(16384)]);
-        a.end_xact(store, 1, false);
+        a.end_xact(store, 5, 1, false);
         b.accept(store, 2);
         assert!(b.has_relation(16384));
         forget_store(store);

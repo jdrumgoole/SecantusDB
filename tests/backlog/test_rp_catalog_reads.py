@@ -1910,7 +1910,15 @@ def test_a_merge_join_clauses_scan_estimate(rust_pg: Any) -> None:
 # lookups also build each B-tree index's pathkeys for the join
 # (`has_useful_pathkeys`: a join clause in an equivalence class). Measured
 # on a private PostgreSQL 15.20 cluster, twice, the two identical; the same
-# recording reproduced psql's describe query's answer above (RP-290).
+# recording reproduced psql's describe query's answer above (RP-290). The
+# answer holds only where little DDL has run: in one database PostgreSQL
+# 15.20 itself answers this on runs 1 to 3 of the module's SETUP and these
+# steps, and from run 4 on its nested loop fetches the heap once more
+# (`pg_class_relname_nsp_index` `[3, 3, 3]`, not `[3, 3, 2]`), where in a
+# database created for each run it answers this at every one of 5 runs (a
+# private 15.20 cluster set up as the module docstring says, 2026-11-27).
+# So the test runs on a server of its own, never after the module's other
+# tests (RP-1145).
 JOIN_METHOD_STEPS: dict[str, list[str]] = {
     "a hash join of two catalogs": [
         "a|",
@@ -1996,14 +2004,23 @@ TOAST_ROWS = "pg_class"
 
 
 @pytest.mark.backlog_fixed("RP-290")
-def test_a_catalog_joins_method_decides_its_reads(rust_pg: Any) -> None:
+def test_a_catalog_joins_method_decides_its_reads(tmp_path: Any) -> None:
     """RP-290 (slice): a join of two catalogs was walked as a hash join
     whatever PostgreSQL's costing chose: its scans' tuple descriptors were
     the columns needed above, never the whole row, and the inner
     `pg_namespace` was read whole once, where a nested loop's unique inner
     stops at each outer row's match; and a join's relations built no index
-    pathkeys without an ORDER BY of their own."""
-    got = catalog_reads(_dsn(rust_pg), JOIN_METHOD_STEPS)
+    pathkeys without an ORDER BY of their own.
+
+    On a server of its own: the nested loop's index-only probe of
+    `pg_class_relname_nsp_index` fetches no heap tuple while `pg_class`'s
+    own row is on an all-visible block, and the module's server, after the
+    other tests' CREATE TABLEs placed rows on that block, has cleared its
+    bit (a heap fetch more, as on PostgreSQL)."""
+    from tests.test_rust_pgserver_slice import _Server
+
+    with _Server(tmp_path) as server:
+        got = catalog_reads(_dsn(server), JOIN_METHOD_STEPS)
 
     def without_toast(segments: list[dict[str, list[int]]]) -> list[dict[str, list[int]]]:
         return [{k: v for k, v in seg.items() if k != TOAST_ROWS} for seg in segments]
@@ -2555,12 +2572,12 @@ def test_ddl_cycles_write_the_pages_postgresqls_do(rust_pg: Any) -> None:
     assert written == EXPECTED_WRITTEN_AFTER_FOUR
 
 
-# RP-291, what is left of it: the rows of DDL other than CREATE TABLE have
-# no place yet. A new session's first use of the module's view and then of
-# its function, in a fresh database after its DDL once, measured as
-# `EXPECTED_CLEARED_VM_BLOCKS` was: the view's `pg_class`, `pg_attribute`
-# and `pg_rewrite` rows and the function's `pg_proc` row are each read
-# from the heap.
+# RP-291: a lookup reads the heap block of a row CREATE VIEW or CREATE
+# FUNCTION wrote, as one of CREATE TABLE's. A new session's first use of
+# the module's view and then of its function, in a fresh database after
+# its DDL once, measured as `EXPECTED_CLEARED_VM_BLOCKS` was: the view's
+# `pg_class`, `pg_attribute` and `pg_rewrite` rows and the function's
+# `pg_proc` row are each read from the heap.
 OTHER_DDL_STEPS = ["a|", "mark", "a|select * from rpc_v", "mark", "a|select rpc_f(1)", "mark"]
 
 EXPECTED_OTHER_DDL_BLOCKS: list[dict[str, int]] = [
@@ -2580,36 +2597,67 @@ EXPECTED_OTHER_DDL_BLOCKS: list[dict[str, int]] = [
 ]
 
 
-@pytest.mark.backlog("RP-291")
+@pytest.mark.backlog_fixed("RP-291")
 def test_a_views_and_a_functions_rows_are_read_from_the_heap(rust_pg: Any) -> None:
     """PostgreSQL 15.19: a lookup that returns a row CREATE VIEW or CREATE
     FUNCTION wrote reads the row's heap block, as one of CREATE TABLE's
-    does."""
+    does. Those rows had no place, so the view's first use read 3
+    `pg_class`, 3 `pg_attribute` and no `pg_rewrite` block, and the
+    function's first call 1 `pg_proc` block; now they are placed
+    (`place_created_view`, `place_created_function`)."""
     assert after_ddl_cycles(_dsn(rust_pg), 1, OTHER_DDL_STEPS)[1:] == EXPECTED_OTHER_DDL_BLOCKS
 
 
+# RP-291: `INDEX_BLOCK_STEPS` read the same blocks after any number of
+# cycles of the module's DDL in one database, `EXPECTED_CATALOG_BLOCKS`
+# for every k from 1 to 14 (a private PostgreSQL 15.20 cluster,
+# 2026-11-26, set up as `EXPECTED_CLEARED_VM_BLOCKS` was; the box has no
+# 15.19 binary since 2026-11-24). At the tenth cycle (and only there, of 1
+# to 14) the primary-key lookup read 4 `pg_attribute` blocks where
+# PostgreSQL reads 3 until CREATE VIEW's and CREATE FUNCTION's rows were
+# placed: their space moved where `rpc_t`'s rows went. RP-1111 found it, as
+# `test_catalog_blocks` failing on CI in the shared database.
+TENTH_CYCLE = 10
+
+
+@pytest.mark.backlog_fixed("RP-291")
+def test_the_tenth_cycles_rows_read_what_the_firsts_do(rust_pg: Any) -> None:
+    """PostgreSQL 15.20: after nine cycles of the module's DDL in one
+    database, the tenth cycle's catalog rows read the same blocks as the
+    first cycle's."""
+    got = after_ddl_cycles(_dsn(rust_pg), TENTH_CYCLE, INDEX_BLOCK_STEPS)
+    assert got == EXPECTED_CATALOG_BLOCKS
+
+
 # RP-291, what is left of it: a dead row's space. PostgreSQL prunes the
-# rows a DROP left dead (`heap_page_prune_opt`) and puts new rows in that
-# space again, so `INDEX_BLOCK_STEPS` read the same blocks after any number
-# of cycles of the module's DDL in one database: `EXPECTED_CATALOG_BLOCKS`
-# for every k from 1 to 14 (a private PostgreSQL 15.20 cluster, 2026-11-26,
-# set up as `EXPECTED_CLEARED_VM_BLOCKS` was; the box has no 15.19 binary
-# since 2026-11-24). The model never frees that space, so each cycle's
-# rows go after the last cycle's. At the tenth cycle (and only there, of
-# 1 to 14) the primary-key lookup reads 4 `pg_attribute` blocks where
-# PostgreSQL reads 3, most likely because `rpc_t`'s rows cross a page
-# boundary. RP-1111 found it, as `test_catalog_blocks` failing on CI in
-# the shared database.
-DEAD_SPACE_CYCLES = 10
+# rows a DROP left dead (`heap_page_prune_opt`, when a later scan meets
+# them) and puts new rows in that space again, so a catalog's heap stops
+# growing: after 20 cycles of the module's DDL in one database, and the
+# 21st's SETUP and WARM, a sequential scan of `pg_class` reads 14 blocks
+# and one of `pg_type` 15, as after one cycle (a private PostgreSQL 15.20
+# cluster, 2026-11-26, set up as `EXPECTED_CLEARED_VM_BLOCKS` was; its
+# `pg_class` and `pg_type` heaps are 15.19's page for page, its
+# `pg_attribute` is not, so that is left out). The model never frees that
+# space, so each cycle's rows go after the last cycle's: 16 and 18 blocks.
+DEAD_SPACE_CYCLES = 21
+
+DEAD_SPACE_STEPS = [
+    "a|select count(*) from pg_class where relname::text like '%zz%'",
+    "a|select count(*) from pg_type where typname::text like '%zz%'",
+    "mark",
+    "a|select count(*) from pg_class where relname::text like '%zz%'",
+    "a|select count(*) from pg_type where typname::text like '%zz%'",
+    "mark",
+]
 
 
 @pytest.mark.backlog("RP-291")
 def test_a_dead_rows_space_takes_new_rows(rust_pg: Any) -> None:
-    """PostgreSQL 15.20: after nine cycles of the module's DDL in one
-    database, the tenth cycle's catalog rows read the same blocks as the
-    first cycle's, because pruning gave their space back."""
-    got = after_ddl_cycles(_dsn(rust_pg), DEAD_SPACE_CYCLES, INDEX_BLOCK_STEPS)
-    assert got == EXPECTED_CATALOG_BLOCKS
+    """PostgreSQL 15.20: twenty cycles of DDL in one database leave
+    `pg_class` and `pg_type` as long as one does, because pruning gave the
+    dead rows' space back to the cycles after."""
+    got = after_ddl_cycles(_dsn(rust_pg), DEAD_SPACE_CYCLES, DEAD_SPACE_STEPS)
+    assert got[1] == {"pg_class": 14, "pg_type": 15}
 
 
 # RP-935 (fixed): the index a catalog read directly is scanned through, and how
@@ -3104,7 +3152,7 @@ def test_a_catalog_scan_is_estimated(rust_pg: Any) -> None:
 # Not compared: `pg_subscription`, whose heap scans are the logical
 # replication launcher's of the run before the restart (two at its start
 # and one per reload, flushed as it exits: 7 in this recording, 2 after a
-# run with no reload). This server has no launcher (RP-1096).
+# run with no reload). The launcher's own test (RP-1096, below) checks them.
 FIRST_BACKEND: dict[str, list[int]] = {
     "pg_am": [2, 2, 0],
     "pg_amproc": [2, 7, 0],
@@ -3191,10 +3239,92 @@ def test_the_first_backend_after_a_start(tmp_path: Any) -> None:
 LAUNCHER_SCANS = [3, 0, 0]
 
 
-@pytest.mark.backlog("RP-1096")
+@pytest.mark.backlog_fixed("RP-1096")
 def test_the_logical_replication_launcher_scans_pg_subscription(tmp_path: Any) -> None:
+    """Fixed: a logical replication launcher scans pg_subscription at its
+    start, twice, and once per reload, and its counts reach the shared ones
+    as it exits, at a clean shutdown."""
     got = _restart_delta(tmp_path, _select_one, setup=("select pg_reload_conf()",))
     assert got.get(LAUNCHER_ONLY) == LAUNCHER_SCANS
+
+
+# A server with `max_logical_replication_workers = 0` registers no launcher
+# (`ApplyLauncherRegister`), so a restart moves nothing. PostgreSQL 15.20,
+# private cluster (2026-11-26): 6 before and after a run with a reload.
+@pytest.mark.backlog_fixed("RP-1096")
+def test_no_launcher_runs_without_logical_replication_workers(tmp_path: Any) -> None:
+    """Fixed: with no logical replication workers there is no launcher."""
+    got = _restart_delta(
+        tmp_path,
+        _select_one,
+        setup=(
+            "alter system set max_logical_replication_workers = 0",
+            "select pg_reload_conf()",
+        ),
+    )
+    # The first run's launcher started before the setting: its scans are
+    # the delta's. A second restart, with the setting in force, adds none.
+    assert got.get(LAUNCHER_ONLY) == [3, 0, 0]
+    again = _restart_delta(tmp_path, _select_one, setup=("select pg_reload_conf()",))
+    assert again.get(LAUNCHER_ONLY) is None
+
+
+# Found while working RP-1096: a fresh PostgreSQL 15.20 cluster's first run
+# reads `pg_stat_get_numscans('pg_subscription'::regclass)` as 2 before any
+# launcher has exited -- `initdb`'s scans, kept in the statistics file it
+# leaves -- with or without a launcher (`max_logical_replication_workers =
+# 0`), private clusters, 2026-11-26. No client backend reads pg_subscription,
+# so it is the one catalog whose count shows `initdb`'s alone.
+@pytest.mark.backlog("RP-1142")
+def test_a_fresh_stores_statistics_hold_initdbs_scans(tmp_path: Any) -> None:
+    from tests.test_rust_pgserver_slice import _Server
+
+    with _Server(tmp_path) as server, _connect(_dsn(server), "fresh") as conn:
+        got = conn.execute(
+            "select pg_stat_get_numscans('pg_subscription'::regclass::oid)"
+        ).fetchone()
+    assert got == (2,)
+
+
+# Found while working RP-1096: PostgreSQL 15.20 (port 5415, 2026-11-26)
+# takes a regclass where a `pg_stat_get_*` function's oid argument goes, an
+# implicit binary-coercible cast: `pg_stat_get_numscans('pg_class'::regclass)`
+# is pg_class's count, the same as with `::regclass::oid`.
+@pytest.mark.backlog("RP-1143")
+def test_a_stat_function_takes_a_regclass(rust_pg: Any) -> None:
+    with rust_pg.connect() as conn:
+        got = conn.execute(
+            "select pg_stat_get_numscans('pg_class'::regclass) is not null, "
+            "pg_stat_get_numscans('pg_class'::regclass) "
+            "= pg_stat_get_numscans('pg_class'::regclass::oid), "
+            "pg_stat_get_tuples_returned('pg_class'::regclass) is not null"
+        ).fetchone()
+    assert got == (True, True, True)
+
+
+# Found while working RP-1096: PostgreSQL 15.20 (port 5415, `autovacuum =
+# on`, 2026-11-26) lists five background processes in pg_stat_activity, each
+# with no database, and only the launcher, a background worker, with a user
+# (the bootstrap superuser); `pg_stat_get_db_numbackends(0)` counts the five
+# (the view's row for datid 0 says 0 whatever it counts).
+BACKGROUND_PROCESSES = [
+    ("autovacuum launcher", None, None, "AutoVacuumMain"),
+    ("background writer", None, None, "BgWriterHibernate"),
+    ("checkpointer", None, None, "CheckpointerMain"),
+    ("logical replication launcher", None, "postgres", "LogicalLauncherMain"),
+    ("walwriter", None, None, "WalWriterMain"),
+]
+
+
+@pytest.mark.backlog("RP-1141")
+def test_pg_stat_activity_lists_the_background_processes(rust_pg: Any) -> None:
+    with rust_pg.connect() as conn:
+        rows = conn.execute(
+            "select backend_type::text, datname::text, usename::text, wait_event::text "
+            "from pg_stat_activity where backend_type <> 'client backend' order by 1"
+        ).fetchall()
+        numbackends = conn.execute("select pg_stat_get_db_numbackends(0)").fetchone()
+    assert ([tuple(r) for r in rows], numbackends) == (BACKGROUND_PROCESSES, (5,))
 
 
 # A committed invalidation of a relation an init file holds removes the file
@@ -3211,14 +3341,82 @@ AFTER_ANALYZE_HEAP_SCANS = {
 }
 
 
-@pytest.mark.backlog("RP-1097")
+@pytest.mark.backlog_fixed("RP-1097")
 def test_a_database_wide_analyze_removes_the_init_files(tmp_path: Any) -> None:
+    """Fixed: a database-wide ANALYZE found `pg_database` grown since
+    initdb's VACUUM, wrote its `pg_class` row, and the relation cache
+    invalidation that sent at commit removed both init files, so the next
+    backend built them again."""
     from tests.test_rust_pgserver_slice import _Server
 
     with _Server(tmp_path) as server:
         dsn = _dsn(server)
         obs = Observer(dsn)
         conn = _connect(dsn, "ddl")
+        conn.execute("analyze")
+        conn.close()
+        time.sleep(0.5)
+        before = obs.snap()
+        _select_one(dsn)
+        time.sleep(0.5)
+        got = _delta(before, obs.snap())
+        obs.conn.close()
+    heap = {k: v for k, v in got.items() if k in AFTER_ANALYZE_HEAP_SCANS}
+    assert heap == AFTER_ANALYZE_HEAP_SCANS
+
+
+# What leaves the init files in place: an invalidation of no relation they
+# hold, or an ANALYZE that measured nothing new (`vac_update_relstats`
+# writes a catalog's `pg_class` row only when its size changed).
+# PostgreSQL 15.20, private cluster (2026-11-27): after each, the files are
+# both still there and the next backend makes no heap scan of the three.
+KEEPS_THE_INIT_FILES = {
+    "analyze pg_class": ["analyze pg_class"],
+    "analyze pg_authid": ["analyze pg_authid"],
+    "create table": ["create table rp1097_t (a int)"],
+    "a second analyze": ["analyze", "@select 1", "analyze"],
+}
+
+
+@pytest.mark.backlog_fixed("RP-1097")
+@pytest.mark.parametrize("steps", KEEPS_THE_INIT_FILES.values(), ids=list(KEEPS_THE_INIT_FILES))
+def test_what_leaves_the_init_files(tmp_path: Any, steps: list[str]) -> None:
+    from tests.test_rust_pgserver_slice import _Server
+
+    with _Server(tmp_path) as server:
+        dsn = _dsn(server)
+        obs = Observer(dsn)
+        conn = _connect(dsn, "ddl")
+        for sql in steps:
+            if sql.startswith("@"):
+                # A backend of its own, which builds any missing file.
+                _select_one(dsn)
+            else:
+                conn.execute(sql)
+        conn.close()
+        time.sleep(0.5)
+        before = obs.snap()
+        _select_one(dsn)
+        time.sleep(0.5)
+        got = _delta(before, obs.snap())
+        obs.conn.close()
+    assert {k: v for k, v in got.items() if k in AFTER_ANALYZE_HEAP_SCANS} == {}
+
+
+# A database-wide ANALYZE after the files were rebuilt measures again, and
+# a CREATE TABLE since has grown `pg_class`, `pg_type` and `pg_attribute`:
+# the files go again. PostgreSQL 15.20, private cluster (2026-11-27).
+@pytest.mark.backlog_fixed("RP-1097")
+def test_an_analyze_after_a_create_table_removes_the_init_files(tmp_path: Any) -> None:
+    from tests.test_rust_pgserver_slice import _Server
+
+    with _Server(tmp_path) as server:
+        dsn = _dsn(server)
+        obs = Observer(dsn)
+        conn = _connect(dsn, "ddl")
+        conn.execute("analyze")
+        _select_one(dsn)
+        conn.execute("create table rp1097_t (a int)")
         conn.execute("analyze")
         conn.close()
         time.sleep(0.5)
@@ -3424,3 +3622,27 @@ def test_an_index_scan_with_a_filter_counts_one_index_scan(rust_pg: Any, query: 
         after = conn.execute(_SCANS).fetchone()
         conn.rollback()
     assert (after[0] - before[0], after[1] - before[1]) == (0, 1)
+
+
+# Found while working RP-1097: a fresh PostgreSQL 15.20 cluster's
+# `relpages`, `reltuples` and `relallvisible` of the four catalogs whose
+# `pg15_class_sizes.tsv` literal came from the shared reference cluster
+# (private cluster, 2026-11-27, `initdb` then `select ... from pg_class`).
+FRESH_CLUSTER_SIZES = [
+    ("pg_shdepend", 0, 0.0, 0),
+    ("pg_authid", 1, 13.0, 1),
+    ("pg_auth_members", 1, 3.0, 1),
+    ("pg_statistic", 20, 404.0, 20),
+]
+
+
+@pytest.mark.backlog("RP-1144")
+def test_a_fresh_servers_pg_class_holds_a_fresh_clusters_sizes(tmp_path: Any) -> None:
+    from tests.test_rust_pgserver_slice import _Server
+
+    with _Server(tmp_path) as server, _connect(_dsn(server), "fresh") as conn:
+        got = conn.execute(
+            "select relname::text, relpages, reltuples::float8, relallvisible "
+            "from pg_class where oid in (1214, 1260, 1261, 2619) order by oid"
+        ).fetchall()
+    assert [tuple(r) for r in got] == FRESH_CLUSTER_SIZES

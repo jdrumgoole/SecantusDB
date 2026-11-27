@@ -17,6 +17,7 @@
 //! before any table's.
 
 use super::*;
+use crate::catcache::{Cache, Inval, K};
 
 const MCV: i32 = 1;
 const HISTOGRAM: i32 = 2;
@@ -29,6 +30,16 @@ const C_COLLATION: i64 = 950;
 /// The `RELSTATS_COLLECTION` row holding a database-wide ANALYZE's measure
 /// of the built-in catalogs, by `"<relid>:<attnum>"` (RP-313).
 pub(crate) const CATALOG_STATISTICS: &str = "\u{0}catalogs";
+
+/// Where a database-wide ANALYZE records what it measured of each built-in
+/// catalog (`vac_update_relstats`, RP-1097), in the cluster-wide namespace:
+/// one document a database, `_id` its oid (0 for the shared catalogs, whose
+/// `pg_class` rows are the cluster's), `sizes` holding `[relpages,
+/// reltuples, relallvisible]` by relation oid.
+const CATALOG_SIZES: &str = "catalog_sizes";
+
+/// `pg_catalog`'s oid.
+const PG_CATALOG_OID: i64 = 11;
 
 /// A type's `=` and `<` operators (its default B-tree opclass), and the
 /// collation its slots are recorded under (`stacollN`; 0 for a type that
@@ -609,7 +620,162 @@ impl PgHandler {
             Self::RELSTATS_COLLECTION,
             CATALOG_STATISTICS,
             Some(bson::doc! {"_id": CATALOG_STATISTICS, "catalogs": columns}),
-        )
+        )?;
+        self.update_catalog_relstats()
+    }
+
+    /// `vac_update_relstats` of each built-in catalog a database-wide
+    /// ANALYZE takes (RP-1097): the catalog's `relpages` (its heap's blocks),
+    /// `reltuples` (its rows) and `relallvisible` (the visibility map's
+    /// all-visible blocks), and its indexes' `reltuples`, written in place
+    /// over its `pg_class` row only when one of them changed
+    /// (`heap_inplace_update` under the `dirty` check). A changed row sends
+    /// its invalidations at commit (`CacheInvalidateHeapTuple`): the row's
+    /// two `pg_class` cache entries and the relation's cache entry, which
+    /// for a relation an init file holds removes the init files
+    /// (`RelationCacheInitFilePreInvalidate`). PostgreSQL 15.20, a fresh
+    /// cluster (2026-11-27): `pg_database` (initdb's VACUUM measured it
+    /// before `template0` and `postgres` were made) and `pg_shdescription`
+    /// change; a second ANALYZE with nothing new changes none; after a
+    /// CREATE TABLE, `pg_class`, `pg_type`, `pg_attribute`, `pg_depend`.
+    ///
+    /// The measure goes where `pg_class` keeps it: the shared catalogs'
+    /// under the cluster's key 0, the others' under the database's. Not
+    /// modelled: `pg_class` showing it (RP-313), and the order of the
+    /// measures (PostgreSQL takes each catalog in `pg_class` order among
+    /// the tables, here every catalog after them).
+    fn update_catalog_relstats(&self) -> PgWireResult<()> {
+        if Self::virtual_table("pg_class").is_none() {
+            return Ok(());
+        }
+        let facts = crate::catalog_facts::builtin();
+        let (store, db) = (
+            std::sync::Arc::as_ptr(&self.storage) as usize,
+            self.stats().db,
+        );
+        let mut recorded = [self.catalog_sizes(0)?, self.catalog_sizes(db)?];
+        let mut changed = [false, false];
+        let mut invals = Vec::new();
+        let pg_class_row = |out: &mut Vec<Inval>, oid: i64| {
+            let Some(rel) = facts.relations.get(&oid) else {
+                return;
+            };
+            out.push(Inval::Cat(Cache::RelOid, vec![K::O(oid)]));
+            out.push(Inval::Cat(
+                Cache::RelNameNsp,
+                vec![K::N(rel.name.clone()), K::O(PG_CATALOG_OID)],
+            ));
+            out.push(Inval::Rel(oid));
+        };
+        let heaps = crate::catalog_heap::initdb_heaps();
+        let mut oids: Vec<i64> = heaps.keys().copied().collect();
+        oids.sort_unstable();
+        for oid in oids {
+            let Some(rel) = facts.relations.get(&oid) else {
+                continue;
+            };
+            if rel.kind != 'r' || Self::virtual_table(&rel.name).is_none() {
+                continue;
+            }
+            let rows = self.table_docs(&rel.name)?.len();
+            let (visible, blocks) = crate::catalog_places::heap_state(store, db, oid)
+                .unwrap_or_else(|| (heaps[&oid].all_visible.clone(), heaps[&oid].blocks));
+            let now = (
+                i32::try_from(blocks).unwrap_or(i32::MAX),
+                // `reltuples` is a `real`.
+                f64::from(rows as f32),
+                visible.iter().filter(|v| **v).count() as i32,
+            );
+            let which = usize::from(!rel.shared);
+            let key = oid.to_string();
+            let before = recorded[which]
+                .get_array(&key)
+                .ok()
+                .and_then(|a| match a.as_slice() {
+                    [Bson::Int32(p), Bson::Double(t), Bson::Int32(v)] => Some((*p, *t, *v)),
+                    _ => None,
+                })
+                .or_else(|| crate::catalog_meta::initdb_class_size(oid))
+                .unwrap_or((0, -1.0, 0));
+            if now == before {
+                continue;
+            }
+            recorded[which].insert(
+                key,
+                vec![Bson::Int32(now.0), Bson::Double(now.1), Bson::Int32(now.2)],
+            );
+            changed[which] = true;
+            pg_class_row(&mut invals, oid);
+            // Each index's `reltuples` is the table's rows again.
+            if now.1 != before.1 {
+                for ix in facts.indexes_of.get(&oid).into_iter().flatten() {
+                    pg_class_row(&mut invals, *ix);
+                }
+            }
+        }
+        for (which, key) in [(0, 0), (1, db)] {
+            if changed[which] {
+                self.put_catalog_sizes(key, &recorded[which])?;
+            }
+        }
+        if !invals.is_empty() && self.backend_pid.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            self.catcache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .local(invals);
+        }
+        Ok(())
+    }
+
+    /// What ANALYZE last measured of the built-in catalogs `pg_class` keeps
+    /// under `db` (0: the shared ones), by relation oid.
+    fn catalog_sizes(&self, db: i64) -> PgWireResult<Document> {
+        let ns = DatabaseRegistry::NAMESPACE;
+        let exists = self
+            .storage
+            .collection_exists(ns, CATALOG_SIZES)
+            .map_err(|e| Self::storage_err("could not read the catalogs' sizes", e))?;
+        if !exists {
+            return Ok(Document::new());
+        }
+        Ok(self
+            .storage
+            .find_matching(ns, CATALOG_SIZES, &bson::doc! {"_id": db})
+            .map_err(|e| Self::storage_err("could not read the catalogs' sizes", e))?
+            .first()
+            .and_then(|b| decode_doc(b).ok())
+            .and_then(|d| d.get_document("sizes").ok().cloned())
+            .unwrap_or_default())
+    }
+
+    fn put_catalog_sizes(&self, db: i64, sizes: &Document) -> PgWireResult<()> {
+        let ns = DatabaseRegistry::NAMESPACE;
+        let err = |e| Self::storage_err("could not record the catalogs' sizes", e);
+        if !self
+            .storage
+            .collection_exists(ns, CATALOG_SIZES)
+            .map_err(err)?
+        {
+            self.storage
+                .create_collection(ns, CATALOG_SIZES)
+                .map_err(err)?;
+        }
+        self.storage
+            .delete_matching(
+                ns,
+                CATALOG_SIZES,
+                &bson::doc! {"_id": db},
+                0,
+                &secantus_core::vars::Vars::new(),
+                None,
+            )
+            .map_err(err)?;
+        let bytes = encode_doc(&bson::doc! {"_id": db, "sizes": sizes.clone()})
+            .map_err(|e| Self::storage_err("could not encode the catalogs' sizes", e))?;
+        self.storage
+            .insert(ns, CATALOG_SIZES, vec![bytes], true)
+            .map_err(err)?;
+        Ok(())
     }
 
     /// One `pg_statistic` row of column `c` (attnum `attnum`) of relation

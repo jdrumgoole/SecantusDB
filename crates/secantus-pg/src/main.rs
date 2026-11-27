@@ -90,11 +90,14 @@ fn watch_for_reload(reloader: Reloader) {
         .spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
             if RELOAD_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                // Every child gets the signal, the logical replication
+                // launcher included (RP-1096), files or none.
+                let reloaded = reloader.reload();
                 if !has_files {
                     eprintln!("secantusd-pg: received SIGHUP; there are no files to reload");
                     continue;
                 }
-                match reloader.reload() {
+                match reloaded {
                     Ok(()) => eprintln!("secantusd-pg: configuration reloaded"),
                     Err(e) => eprintln!("secantusd-pg: configuration was not reloaded: {e}"),
                 }

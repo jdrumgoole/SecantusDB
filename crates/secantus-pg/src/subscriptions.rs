@@ -503,6 +503,53 @@ impl PgHandler {
         docs
     }
 
+    /// How many rows `pg_subscription` holds, committed, over every
+    /// database: what the logical replication launcher's heap scan returns
+    /// (RP-1096). A row an earlier build kept in its database counts unless
+    /// a shared row of that database and name shadows it, as
+    /// [`Self::all_subscription_docs`] reads them.
+    pub(crate) fn all_subscription_rows(&self) -> i64 {
+        let ns = crate::DatabaseRegistry::NAMESPACE;
+        let mut shared: std::collections::BTreeSet<(i64, String)> =
+            std::collections::BTreeSet::new();
+        if let Ok(true) = self.storage.collection_exists(ns, SUBSCRIPTION_COLLECTION) {
+            for b in self
+                .storage
+                .find_matching(ns, SUBSCRIPTION_COLLECTION, &Document::new())
+                .unwrap_or_default()
+            {
+                if let Ok(d) = crate::decode_doc(&b) {
+                    let db = d.get("db").and_then(bson_i64).unwrap_or(0);
+                    let name = d.get_str("name").unwrap_or_default().to_string();
+                    shared.insert((db, name));
+                }
+            }
+        }
+        let mut rows = shared.len() as i64;
+        for info in self.databases.all(&self.storage).unwrap_or_default() {
+            if !matches!(
+                self.storage
+                    .collection_exists(&info.name, SUBSCRIPTION_COLLECTION),
+                Ok(true)
+            ) {
+                continue;
+            }
+            for b in self
+                .storage
+                .find_matching(&info.name, SUBSCRIPTION_COLLECTION, &Document::new())
+                .unwrap_or_default()
+            {
+                if let Ok(d) = crate::decode_doc(&b) {
+                    let name = d.get_str("_id").unwrap_or_default().to_string();
+                    if !shared.contains(&(info.oid, name)) {
+                        rows += 1;
+                    }
+                }
+            }
+        }
+        rows
+    }
+
     /// The subscriptions an earlier build kept in this database's catalog.
     fn legacy_subscription_docs(&self) -> Vec<Document> {
         if !matches!(

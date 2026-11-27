@@ -134,6 +134,8 @@ const ATTRIBUTE_RELATION: i64 = 1249;
 const TYPE_RELATION: i64 = 1247;
 const INDEX_RELATION: i64 = 2610;
 const DATABASE_RELATION: i64 = 1262;
+const PROCEDURE_RELATION: i64 = 1255;
+const REWRITE_RELATION: i64 = 2618;
 const DEPEND_RELATION: i64 = 2608;
 const DEPEND_DEPENDER_INDEX: i64 = 2673;
 const DEPEND_REFERENCE_INDEX: i64 = 2674;
@@ -5041,6 +5043,8 @@ impl PgHandler {
                     .push((rv.schemaname.clone(), rv.relname.clone()));
             }
             N::DropStmt(d) if d.remove_type == pb::ObjectType::ObjectTable as i32 => {
+                // A view on the table goes with it under CASCADE.
+                self.snapshot_objects(effects);
                 for o in &d.objects {
                     let Some(N::List(l)) = o.node.as_ref() else {
                         continue;
@@ -5084,6 +5088,25 @@ impl PgHandler {
                 if plain && !exists {
                     effects.created_db = Some(c.dbname.clone());
                 }
+            }
+            N::ViewStmt(v) => {
+                let replaces = v.replace
+                    && v.view.as_ref().is_some_and(|rv| {
+                        let nsp = if rv.schemaname.is_empty() {
+                            Some(PUBLIC)
+                        } else {
+                            self.cr_namespace_oid(&rv.schemaname)
+                        };
+                        nsp.is_some_and(|n| self.cr_relation_in(n, &rv.relname).is_some())
+                    });
+                effects.plain_view = !replaces
+                    && v.options.is_empty()
+                    && v.with_check_option == pb::ViewCheckOption::NoCheckOption as i32
+                    && v.view.as_ref().is_some_and(|rv| rv.relpersistence != "t");
+                self.snapshot_objects(effects);
+            }
+            N::CreateFunctionStmt(_) | N::DropStmt(_) | N::DropOwnedStmt(_) => {
+                self.snapshot_objects(effects);
             }
             N::DropdbStmt(d) => {
                 effects.dropped_db = self
@@ -5184,6 +5207,9 @@ impl PgHandler {
         let db = self.stats().db;
         for (schema, name) in &effects.created {
             self.place_created_table(store, db, pid, schema, name);
+        }
+        if let Some(before) = &effects.objects_before {
+            self.place_views_and_functions(store, db, pid, before, effects.plain_view);
         }
         for oid in &effects.dropped {
             crate::catalog_places::drop_group(
@@ -5366,6 +5392,285 @@ impl PgHandler {
         crate::catalog_places::write(store, db, pid, rel.oid, &w);
     }
 
+    /// A statement that may make or drop a view or a function needs the
+    /// ones there are before it runs.
+    fn snapshot_objects(&self, effects: &mut Effects) {
+        if effects.objects_before.is_none() {
+            effects.objects_before = self.placed_objects();
+        }
+    }
+
+    /// The user views and functions there are now; `None` when either
+    /// list cannot be read, and then nothing is placed or dropped.
+    fn placed_objects(&self) -> Option<PlacedObjects> {
+        let mut o = PlacedObjects::default();
+        for (key, _) in self.views_shared().ok()?.iter() {
+            let oid = self
+                .relation_oid(key)
+                .unwrap_or_else(|| self.view_relid(key));
+            o.views.insert(oid, key.clone());
+        }
+        for d in self
+            .type_catalog_docs(Self::FUNCTION_COLLECTION)
+            .ok()?
+            .iter()
+        {
+            let key = d.get_str("_id").unwrap_or_default();
+            let oid = d
+                .get("oid")
+                .and_then(crate::bson_i64)
+                .unwrap_or_else(|| Self::index_oid(&format!("fn:{key}")));
+            o.procs.insert(oid);
+        }
+        Some(o)
+    }
+
+    /// What a statement made and dropped of views and functions, against
+    /// `before`: each new one's rows placed (a view only when `plain_view`
+    /// says its rows are the measured shape), each gone one's deleted.
+    fn place_views_and_functions(
+        &self,
+        store: usize,
+        db: i64,
+        pid: i32,
+        before: &PlacedObjects,
+        plain_view: bool,
+    ) {
+        let Some(after) = self.placed_objects() else {
+            return;
+        };
+        for (oid, key) in &after.views {
+            if plain_view && !before.views.contains_key(oid) {
+                self.place_created_view(store, db, pid, *oid, key);
+            }
+        }
+        for oid in after.procs.difference(&before.procs) {
+            self.place_created_function(store, db, pid, *oid);
+        }
+        for oid in before.views.keys().filter(|o| !after.views.contains_key(o)) {
+            crate::catalog_places::drop_group(
+                store,
+                db,
+                pid,
+                *oid,
+                &[
+                    RELATION_RELATION,
+                    TYPE_RELATION,
+                    ATTRIBUTE_RELATION,
+                    REWRITE_RELATION,
+                ],
+            );
+        }
+        for oid in before.procs.difference(&after.procs) {
+            crate::catalog_places::drop_group(store, db, pid, *oid, &[PROCEDURE_RELATION]);
+        }
+    }
+
+    /// The catalog rows CREATE VIEW wrote for the view `key` (oid `oid`),
+    /// as PostgreSQL 15 writes them (`DefineView`), measured on a fresh
+    /// database: `heap_create_with_catalog`'s row type and array type in
+    /// `pg_type`, the view's `pg_class` row and its columns' `pg_attribute`
+    /// rows (a view has no system columns), then `InsertRule`'s
+    /// `pg_rewrite` row for its `_RETURN` rule, its `ev_action` compressed
+    /// as `heap_toast_insert_or_update` compresses a row too long for its
+    /// page, and `SetRelationRuleStatus`'s HOT update of the `pg_class`
+    /// row (`relhasrules`).
+    fn place_created_view(&self, store: usize, db: i64, pid: i32, oid: i64, key: &str) {
+        use crate::catalog_places::{row_len, Varlena, Write, ATTRIBUTE_LEN, CLASS_LEN, TYPE_LEN};
+        let (nsp, name) = match key.split_once('.') {
+            None => (PUBLIC, key),
+            Some((schema, name)) => match self.cr_namespace_oid(schema) {
+                Some(n) => (n, name),
+                None => return,
+            },
+        };
+        let Some(rel) = self.cr_view(key, name, nsp) else {
+            return;
+        };
+        let Some(doc) = self
+            .type_catalog_docs(Self::VIEW_COLLECTION)
+            .ok()
+            .and_then(|docs| {
+                docs.iter()
+                    .find(|d| d.get_str("_id") == Ok(key))
+                    .map(|d| bson::Document::clone(d))
+            })
+        else {
+            return;
+        };
+        let (Ok(qual), Ok(action)) = (
+            doc.get_str("ev_qual").or(Ok::<&str, ()>("<>")),
+            doc.get_str("ev_action"),
+        ) else {
+            return;
+        };
+        let Some(rewrite_len) = row_len(
+            8,
+            false,
+            crate::catalog_places::REWRITE_FIXED,
+            &[Varlena::text(qual), Varlena::text(action)],
+        ) else {
+            return;
+        };
+        let o = Bson::Int64;
+        let n = |v: &str| Bson::String(v.to_string());
+        let rowtype = self.view_type_relid(key);
+        let class = Write {
+            catalog: RELATION_RELATION,
+            len: CLASS_LEN,
+            keys: vec![
+                (2662, vec![o(oid)]),
+                (2663, vec![n(name), o(nsp)]),
+                // A view has no storage: `relfilenode` 0.
+                (3455, vec![o(0), o(0)]),
+            ],
+            update_of: None,
+        };
+        let mut w = vec![
+            Write {
+                catalog: TYPE_RELATION,
+                len: TYPE_LEN,
+                keys: vec![(2703, vec![o(rowtype)]), (2704, vec![n(name), o(nsp)])],
+                update_of: None,
+            },
+            Write {
+                catalog: TYPE_RELATION,
+                len: TYPE_LEN,
+                keys: vec![
+                    (
+                        2703,
+                        vec![o(rowtype + secantus_pgplan::USER_TYPE_ARRAY_OID_OFFSET)],
+                    ),
+                    (2704, vec![n(&format!("_{name}")), o(nsp)]),
+                ],
+                update_of: None,
+            },
+            class.clone(),
+        ];
+        let view_row = w.len() - 1;
+        for (attnum, attname, _) in &rel.columns {
+            w.push(Write {
+                catalog: ATTRIBUTE_RELATION,
+                len: ATTRIBUTE_LEN,
+                keys: vec![
+                    (2658, vec![o(oid), n(attname)]),
+                    (2659, vec![o(oid), o(*attnum)]),
+                ],
+                update_of: None,
+            });
+        }
+        w.push(Write {
+            catalog: REWRITE_RELATION,
+            len: rewrite_len,
+            keys: vec![
+                (2692, vec![o(self.view_rule_relid(key))]),
+                (2693, vec![o(oid), n("_RETURN")]),
+            ],
+            update_of: None,
+        });
+        w.push(Write {
+            update_of: Some((view_row, true)),
+            ..class
+        });
+        crate::catalog_places::write(store, db, pid, oid, &w);
+    }
+
+    /// The `pg_proc` row CREATE FUNCTION wrote for function `oid`
+    /// (`ProcedureCreate`), its length from the row `pg_proc` answers. A
+    /// row with parameter defaults, transforms, a SQL-standard body or an
+    /// ACL is not placed: its length is not measured yet (RP-291).
+    fn place_created_function(&self, store: usize, db: i64, pid: i32, oid: i64) {
+        use crate::catalog_places::{proc_len, ProcRow, Write};
+        let Some(def) = Self::virtual_table("pg_proc") else {
+            return;
+        };
+        let Some(rows) = self.catalog_rows_keyed("pg_proc", None) else {
+            return;
+        };
+        let get = |d: &bson::Document, col: &str| -> Option<Bson> {
+            match d.get(def.field_of(col)?) {
+                None | Some(Bson::Null) => None,
+                Some(v) => Some(v.clone()),
+            }
+        };
+        let Some(row) = rows
+            .iter()
+            .find(|d| get(d, "oid").as_ref().and_then(crate::bson_i64) == Some(oid))
+        else {
+            return;
+        };
+        if ["proargdefaults", "protrftypes", "prosqlbody", "proacl"]
+            .iter()
+            .any(|c| get(row, c).is_some())
+        {
+            return;
+        }
+        let strings = |v: Option<Bson>| -> Option<Vec<String>> {
+            match v? {
+                Bson::Array(a) => Some(
+                    a.iter()
+                        .map(|x| x.as_str().unwrap_or_default().to_string())
+                        .collect(),
+                ),
+                _ => None,
+            }
+        };
+        let oids = |v: Option<Bson>| -> Vec<Bson> {
+            match v {
+                Some(Bson::Array(a)) => a
+                    .iter()
+                    .map(|x| Bson::Int64(crate::bson_i64(x).unwrap_or(0)))
+                    .collect(),
+                Some(Bson::String(s)) => s
+                    .split_whitespace()
+                    .filter_map(|x| x.parse().ok())
+                    .map(Bson::Int64)
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        let argtypes = oids(get(row, "proargtypes"));
+        let all = match get(row, "proallargtypes") {
+            Some(Bson::Array(a)) => Some(a.len()),
+            _ => None,
+        };
+        let names = strings(get(row, "proargnames"));
+        let config = strings(get(row, "proconfig"));
+        let src = get(row, "prosrc");
+        let bin = get(row, "probin");
+        let Some(len) = proc_len(&ProcRow {
+            nargs: argtypes.len(),
+            all,
+            names: names.as_deref(),
+            src: src.as_ref().and_then(Bson::as_str).unwrap_or_default(),
+            bin: bin.as_ref().and_then(Bson::as_str),
+            config: config.as_deref(),
+        }) else {
+            return;
+        };
+        let (Some(name), Some(nsp)) = (
+            get(row, "proname"),
+            get(row, "pronamespace").as_ref().and_then(crate::bson_i64),
+        ) else {
+            return;
+        };
+        crate::catalog_places::write(
+            store,
+            db,
+            pid,
+            oid,
+            &[Write {
+                catalog: PROCEDURE_RELATION,
+                len,
+                keys: vec![
+                    (2690, vec![Bson::Int64(oid)]),
+                    (2691, vec![name, Bson::Array(argtypes), Bson::Int64(nsp)]),
+                ],
+                update_of: None,
+            }],
+        );
+    }
+
     /// The transaction ended.
     pub(crate) fn catcache_end_xact(&self, commit: bool) {
         let (store, pid) = self.catcache_ids();
@@ -5373,7 +5678,7 @@ impl PgHandler {
         self.catcache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .end_xact(store, pid, commit);
+            .end_xact(store, self.stats().db, pid, commit);
     }
 }
 
@@ -5395,6 +5700,22 @@ pub(crate) struct Effects {
     /// deletes (its oid).
     pub(crate) created_db: Option<String>,
     pub(crate) dropped_db: Option<i64>,
+    /// The user views and functions before a statement that may make or
+    /// drop one (CREATE VIEW, CREATE FUNCTION, a DROP), whose catalog rows
+    /// are placed: what it made and what it dropped are what differs once
+    /// it has run.
+    pub(crate) objects_before: Option<PlacedObjects>,
+    /// The statement is a CREATE VIEW whose rows are the measured shape:
+    /// not temporary, no options, no CHECK OPTION, not replacing a view.
+    pub(crate) plain_view: bool,
+}
+
+/// The user views and functions, by oid: each view's name as the server
+/// keys it (`schema.name`, or the name in `public`).
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct PlacedObjects {
+    pub(crate) views: std::collections::BTreeMap<i64, String>,
+    pub(crate) procs: std::collections::BTreeSet<i64>,
 }
 
 /// A statement's text with each literal replaced by a representative of
