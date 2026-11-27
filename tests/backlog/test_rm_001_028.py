@@ -155,37 +155,32 @@ def test_ingress_connection_rate_limiter_parameters(rust_mongo: Any, mongod: Any
 
 
 def _admitted(client: Any, queue: int) -> list:
-    """Six connections opened at once with the limiter at one connection a
-    second, a burst of one and `queue` allowed to wait: which were answered,
-    and roughly how long each waited."""
+    """Six connections arriving at the server at once with the limiter at one
+    connection a second, a burst of one and `queue` allowed to wait: which
+    were answered, and roughly how long each waited.
+
+    The six must reach the server within a second of each other, and six
+    client threads connecting under load do not. So the server is stopped
+    (SIGSTOP) while all six connect and send their `hello`: the kernel
+    completes the handshakes in its listen backlog, and on SIGCONT the
+    server accepts all six within milliseconds, whatever the client's load.
+    Every wait is measured from the SIGCONT, in one thread."""
+    import os
+    import selectors
+    import signal
     import socket
     import struct
-    import threading
     import time
 
     import bson
 
     host, port = client.address
     admin = client.admin
-
-    def hello() -> Any:
-        s = socket.create_connection((host, port), timeout=10)
-        body = bson.encode({"hello": 1, "$db": "admin"})
-        s.sendall(
-            struct.pack("<iiii", 21 + len(body), 1, 0, 2013) + struct.pack("<I", 0) + b"\x00" + body
-        )
-        started = time.monotonic()
-        try:
-            header = s.recv(16)
-            return (
-                ("answered", round(time.monotonic() - started))
-                if len(header) == 16
-                else ("closed", 0)
-            )
-        except OSError:
-            return ("closed", 0)
-        finally:
-            s.close()
+    pid = admin.command("serverStatus")["pid"]
+    body = bson.encode({"hello": 1, "$db": "admin"})
+    request = (
+        struct.pack("<iiii", 21 + len(body), 1, 0, 2013) + struct.pack("<I", 0) + b"\x00" + body
+    )
 
     admin.command(
         "setParameter",
@@ -195,18 +190,42 @@ def _admitted(client: Any, queue: int) -> list:
         ingressConnectionEstablishmentMaxQueueDepth=queue,
     )
     admin.command("setParameter", 1, ingressConnectionEstablishmentRateLimiterEnabled=True)
+    stopped = False
+    socks: list = []
     try:
         time.sleep(1.2)  # a full bucket
-        results: list = [None] * 6
-        threads = [
-            threading.Thread(target=lambda i=i: results.__setitem__(i, hello())) for i in range(6)
-        ]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        os.kill(pid, signal.SIGSTOP)
+        stopped = True
+        for _ in range(6):
+            s = socket.create_connection((host, port), timeout=10)
+            s.sendall(request)
+            socks.append(s)
+        started = time.monotonic()
+        os.kill(pid, signal.SIGCONT)
+        stopped = False
+        sel = selectors.DefaultSelector()
+        for s in socks:
+            sel.register(s, selectors.EVENT_READ)
+        results: list = []
+        while sel.get_map():
+            ready = sel.select(timeout=10)
+            assert ready, "a connection was neither answered nor closed within 10 s"
+            for key, _ in ready:
+                try:
+                    answered = len(key.fileobj.recv(16)) == 16
+                except OSError:
+                    answered = False
+                results.append(
+                    ("answered", round(time.monotonic() - started)) if answered else ("closed", 0)
+                )
+                sel.unregister(key.fileobj)
+                key.fileobj.close()
         return sorted(results)
     finally:
+        if stopped:
+            os.kill(pid, signal.SIGCONT)
+        for s in socks:
+            s.close()
         admin.command("setParameter", 1, ingressConnectionEstablishmentRateLimiterEnabled=False)
         admin.command(
             "setParameter",
