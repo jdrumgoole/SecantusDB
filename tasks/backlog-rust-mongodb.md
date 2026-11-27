@@ -2953,6 +2953,14 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       a yield the test can trigger, or compare a count that does not move
       with the machine. Keep it able to fail on a server that tests once.
       Reported by the PostgreSQL session; test code unchanged.
+      Again on PG snapshot PR #3092 (run 46067170511, job 140735196294,
+      head 951f5cf6, a PG-only change, 2026-11-27), and this time the
+      side that fitted was THIS server's: mongod's answer was 50 and
+      this server's `None`, so its delete finished inside 1.5x the
+      fastest of its three `find`s. Either all three `find`s ran slow
+      under load or the delete tested the document once; the test does
+      not say which, so the fix should also put the timings in its
+      assertion message.
       Verify: none -- intermittent on CI; the test itself is the check
       Backlog-ID: RM-803
 
