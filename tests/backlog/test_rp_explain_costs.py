@@ -2959,6 +2959,176 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e",
         ],
     ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1108): each key's
+    # direction, an output alias printed as its column, and a removed
+    # join's range table qualifying the key as it does the Group Key.
+    "a sort above a hash aggregate prints each key's direction": (
+        "RP-1108",
+        _ANALYSED,
+        "explain (costs off) select e.b as x, count(*) from e group by x "
+        "order by x desc nulls last",
+        [
+            "Sort",
+            "  Sort Key: b DESC NULLS LAST",
+            "  ->  HashAggregate",
+            "        Group Key: b",
+            "        ->  Seq Scan on e",
+        ],
+    ),
+    "a sort above a hash aggregate over a removed join qualifies its key": (
+        "RP-1108",
+        _ANALYSED,
+        "explain (costs off) select e.b, count(*) from e left join k on k.a = e.a "
+        "group by e.b order by e.b desc",
+        [
+            "Sort",
+            "  Sort Key: e.b DESC",
+            "  ->  HashAggregate",
+            "        Group Key: e.b",
+            "        ->  Seq Scan on e",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1108): a computed group key prints as its expression, and over
+    # two keys PostgreSQL sorts below a GroupAggregate.
+    "a hash aggregate over a computed key prints the expression": (
+        "RP-1162",
+        _ANALYSED,
+        "explain (costs off) select length(e.b), count(*) from e group by length(e.b)",
+        ["HashAggregate", "  Group Key: length(b)", "  ->  Seq Scan on e"],
+    ),
+    "a group by of a column and a computed key ordered by both": (
+        "RP-1162",
+        _ANALYSED,
+        "explain (costs off) select e.b, e.a % 3, count(*) from e "
+        "group by e.b, e.a % 3 order by 2, 1",
+        [
+            "GroupAggregate",
+            "  Group Key: ((a % 3)), b",
+            "  ->  Sort",
+            "        Sort Key: ((a % 3)), b",
+            "        ->  Seq Scan on e",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1108): a key the ORDER BY repeats is a redundant pathkey, printed
+    # once, over one relation, a join and an aggregate.
+    "a sort key repeated prints once": (
+        "RP-1163",
+        _ANALYSED,
+        "explain (costs off) select a, b from e order by b desc, b",
+        ["Sort", "  Sort Key: b DESC", "  ->  Seq Scan on e"],
+    ),
+    "a sort key repeated over a join prints once": (
+        "RP-1163",
+        _ANALYSED,
+        "explain (costs off) select e.b from e join k on e.a = k.a order by e.b, k.b, e.b desc",
+        [
+            "Sort",
+            "  Sort Key: e.b, k.b",
+            "  ->  Hash Join",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e",
+            "        ->  Hash",
+            "              ->  Seq Scan on k",
+        ],
+    ),
+    "a sort key repeated above a hash aggregate prints once": (
+        "RP-1163",
+        _ANALYSED,
+        "explain (costs off) select e.b, count(*) from e group by e.b order by e.b desc, e.b",
+        [
+            "Sort",
+            "  Sort Key: b DESC",
+            "  ->  HashAggregate",
+            "        Group Key: b",
+            "        ->  Seq Scan on e",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1108): JSON names every aggregate `Aggregate`, with its strategy.
+    "a hash aggregate in json is an aggregate of the hashed strategy": (
+        "RP-1164",
+        _ANALYSED,
+        "explain (costs off, format json) select e.b, count(*) from e group by e.b",
+        [
+            "[\n"
+            "  {\n"
+            '    "Plan": {\n'
+            '      "Node Type": "Aggregate",\n'
+            '      "Strategy": "Hashed",\n'
+            '      "Partial Mode": "Simple",\n'
+            '      "Parallel Aware": false,\n'
+            '      "Async Capable": false,\n'
+            '      "Group Key": ["b"],\n'
+            '      "Plans": [\n'
+            "        {\n"
+            '          "Node Type": "Seq Scan",\n'
+            '          "Parent Relationship": "Outer",\n'
+            '          "Parallel Aware": false,\n'
+            '          "Async Capable": false,\n'
+            '          "Relation Name": "e",\n'
+            '          "Alias": "e"\n'
+            "        }\n"
+            "      ]\n"
+            "    }\n"
+            "  }\n"
+            "]"
+        ],
+    ),
+    "a plain aggregate in json carries its strategy": (
+        "RP-1164",
+        _ANALYSED,
+        "explain (costs off, format json) select count(*) from e",
+        [
+            "[\n"
+            "  {\n"
+            '    "Plan": {\n'
+            '      "Node Type": "Aggregate",\n'
+            '      "Strategy": "Plain",\n'
+            '      "Partial Mode": "Simple",\n'
+            '      "Parallel Aware": false,\n'
+            '      "Async Capable": false,\n'
+            '      "Plans": [\n'
+            "        {\n"
+            '          "Node Type": "Seq Scan",\n'
+            '          "Parent Relationship": "Outer",\n'
+            '          "Parallel Aware": false,\n'
+            '          "Async Capable": false,\n'
+            '          "Relation Name": "e",\n'
+            '          "Alias": "e"\n'
+            "        }\n"
+            "      ]\n"
+            "    }\n"
+            "  }\n"
+            "]"
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1108): a group key a WHERE constant fixes needs no sort.
+    "a group key a where constant fixes is a group aggregate": (
+        "RP-1165",
+        _ANALYSED,
+        "explain (costs off) select e.b, count(*) from e where e.b = 'v1' group by e.b",
+        [
+            "GroupAggregate",
+            "  Group Key: b",
+            "  ->  Seq Scan on e",
+            "        Filter: (b = 'v1'::text)",
+        ],
+    ),
+    "a group key a where constant fixes is ordered without a sort": (
+        "RP-1165",
+        _ANALYSED,
+        "explain (costs off) select e.b, count(*) from e where e.b = 'v1' group by e.b "
+        "order by e.b",
+        [
+            "GroupAggregate",
+            "  Group Key: b",
+            "  ->  Seq Scan on e",
+            "        Filter: (b = 'v1'::text)",
+        ],
+    ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): a LEFT
     # JOIN an inner ON reduces to an inner one joins on its class.
     "a left join reduced to inner joins the chain on its class": (
@@ -10692,6 +10862,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1108",
         "RP-1104",
         "RP-1103",
         "RP-1101",

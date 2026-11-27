@@ -2173,14 +2173,6 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a materialized cte is a cte scan]
       Backlog-ID: RP-1158
 
-- [ ] **A Sort above a HashAggregate prints no Sort Key.** `explain
-      (costs off) select e.b, count(*) from e group by e.b order by e.b`
-      prints `Sort` with no `Sort Key` line over `HashAggregate` (`Group
-      Key: b`); PostgreSQL (a private 15.20 cluster) prints `Sort Key: b`.
-      Found while working RP-1060.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sort above a hash aggregate prints its key]
-      Backlog-ID: RP-1108
-
 - [ ] **A RIGHT JOIN atop a chain hashes the chain.** `explain (costs
       off) select e.b, e2.b from e join k on e.a = k.a right join e e2 on
       e2.a = k.a` is a `Hash Left Join` of `e e2` over a Hash of `(e join
@@ -4107,3 +4099,54 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       too.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a one-row subquery under a star is pulled up], tests/backlog/test_rp_explain_costs.py::test_plan[a one-row subquery with a false where is a one-time filter], tests/backlog/test_rp_explain_costs.py::test_plan[a volatile one-row subquery is a result under the nested loop]
       Backlog-ID: RP-1161
+
+## Found while working RP-1108 (2026-11-27)
+
+- [ ] **A computed GROUP BY key prints its column name as its Group Key.**
+      `explain (costs off) select length(e.b), count(*) from e group by
+      length(e.b)` (`e` analysed, 1000 rows) prints `Group Key: length`
+      here, the name the key's output column takes (`GroupKey::name`);
+      a private PostgreSQL 15.20 cluster prints `Group Key: length(b)`.
+      `group by e.b, e.a % 3` prints `Group Key: b, ?column?`. With
+      `order by 2, 1` PostgreSQL also draws a `GroupAggregate` whose
+      `Group Key: ((a % 3)), b` is in the ORDER BY's order, over a `Sort`
+      by the same keys, where this server keeps the `HashAggregate` under
+      a `Sort` (whose `Sort Key: ((a % 3)), b` already matches, RP-1108).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash aggregate over a computed key prints the expression], tests/backlog/test_rp_explain_costs.py::test_plan[a group by of a column and a computed key ordered by both]
+      Backlog-ID: RP-1162
+
+- [ ] **A Sort prints a key the ORDER BY repeats.** `explain (costs off)
+      select a, b from e order by b desc, b` prints `Sort Key: b DESC, b`
+      here; a private PostgreSQL 15.20 cluster prints `Sort Key: b DESC`,
+      the second key a redundant pathkey (`pathkey_is_redundant`: its
+      equivalence class is already in the list). The same over a join
+      (`order by e.b, k.b, e.b desc` is `Sort Key: e.b, k.b` there), over
+      an ordinal (`order by b desc, 2, b` with `b` the second target), and
+      above a HashAggregate (`group by e.b order by e.b desc, e.b`). The
+      rows come back in the same order.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sort key repeated prints once], tests/backlog/test_rp_explain_costs.py::test_plan[a sort key repeated over a join prints once], tests/backlog/test_rp_explain_costs.py::test_plan[a sort key repeated above a hash aggregate prints once]
+      Backlog-ID: RP-1163
+
+- [ ] **EXPLAIN (FORMAT JSON) of an aggregate prints no Strategy.** `explain
+      (costs off, format json) select e.b, count(*) from e group by e.b`
+      prints `"Node Type": "HashAggregate"` here; a private PostgreSQL
+      15.20 cluster prints `"Node Type": "Aggregate"`, `"Strategy":
+      "Hashed"`, `"Partial Mode": "Simple"` (`ExplainNode` names every
+      `Agg` node `Aggregate` and adds its strategy outside the text
+      format). A plain `select count(*) from e` lacks `"Strategy":
+      "Plain"` and `"Partial Mode": "Simple"`.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a hash aggregate in json is an aggregate of the hashed strategy], tests/backlog/test_rp_explain_costs.py::test_plan[a plain aggregate in json carries its strategy]
+      Backlog-ID: RP-1164
+
+- [ ] **A GROUP BY key a WHERE constant fixes is hashed.** `explain (costs
+      off) select e.b, count(*) from e where e.b = 'v1' group by e.b`
+      (`e` analysed, 1000 rows, 100 of them `v1`) prints `HashAggregate`
+      here, and with `order by e.b` a `Sort` over it; a private
+      PostgreSQL 15.20 cluster prints a `GroupAggregate` straight over the
+      filtered `Seq Scan` in both, no Sort: the key's equivalence class
+      holds a constant, so its pathkey is redundant and the scan's rows
+      are already in the group order, which makes the sorted path
+      cheapest. RP-1160 is a GroupAggregate chosen for a one-row estimate,
+      a different reason.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a group key a where constant fixes is a group aggregate], tests/backlog/test_rp_explain_costs.py::test_plan[a group key a where constant fixes is ordered without a sort]
+      Backlog-ID: RP-1165
