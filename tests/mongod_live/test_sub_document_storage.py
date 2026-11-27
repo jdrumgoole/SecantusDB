@@ -95,3 +95,54 @@ def _sizes(client: Any, name: str) -> tuple:
 @pytest.mark.parametrize("name", list(PIPELINES))
 def test_a_sub_document_is_sized_by_its_storage(rust_mongo: Any, mongod: Any, name: str) -> None:
     same(_sizes(rust_mongo, name), _sizes(mongod, name))
+
+
+# The documents inside an array (RM-636): read through the array, each
+# element caches into its own storage; written through it, each document
+# element is a copy with the path set and each scalar a document built.
+ARRAYS = {
+    "a field set in documents": ([{"q": 1, "y": "w" * 50}, {"q": 2}], {"$set": {"t.w": 1}}),
+    "a field set over scalars": ([1, "z" * 30], {"$set": {"t.w": 1}}),
+    "a field overwritten in a document": ([{"q": 1}], {"$set": {"t.q": 2}}),
+    "a field set through a nested array": ([[{"q": 1}], 2], {"$set": {"t.w": 1}}),
+    "a field set two levels down": (
+        [{"e": {"y": 1}}, {"e": [{"y": 2}]}],
+        {"$set": {"t.e.w": 1}},
+    ),
+    "a field read in documents and scalars": (
+        [1, "z" * 30, {"q": 1, "y": "w" * 50}],
+        {"$addFields": {"q": "$t.y"}},
+    ),
+    "a field read past a nested array": (
+        [[{"q": 1, "y": "w" * 50}], {"y": "v" * 40}],
+        {"$addFields": {"q": "$t.y"}},
+    ),
+    "a field read two levels down": (
+        [{"e": {"y": "w" * 40}}, {"e": [{"y": "v" * 40}]}],
+        {"$addFields": {"q": "$t.e.y"}},
+    ),
+}
+
+
+def _array_sizes(client: Any, name: str) -> tuple:
+    t, stage = ARRAYS[name]
+    client.drop_database("rm636arrays")
+    db = client.rm636arrays
+    db.c.insert_many([{"_id": i, "t": t, "n": i} for i in range(50)])
+    ex = db.command(
+        {
+            "explain": {"aggregate": "c", "pipeline": [stage, WINDOW], "cursor": {}},
+            "verbosity": "executionStats",
+        }
+    )
+    stages = ex["stages"]
+    sort = next(s for s in stages if "$sort" in s)
+    win = next(s for s in stages if "$_internalSetWindowFields" in s)
+    return sort["totalDataSizeSortedBytesEstimate"], win["maxTotalMemoryUsageBytes"]
+
+
+@pytest.mark.parametrize("name", list(ARRAYS))
+def test_an_arrays_documents_are_sized_by_their_storage(
+    rust_mongo: Any, mongod: Any, name: str
+) -> None:
+    same(_array_sizes(rust_mongo, name), _array_sizes(mongod, name))

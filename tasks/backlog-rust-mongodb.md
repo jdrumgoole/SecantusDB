@@ -1126,6 +1126,11 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       rerun, then two clean runs): here the side known, mongod's every
       stage counted `saveState` 5 / `restoreState` 4 to this server's 4 /
       3, one yield more, which points at mongod's time-based yield.
+      Again 2026-11-27 (RM-372 gate, load ~7-10, `-n 4`, 1 of 2455):
+      `test_a_hash_join_lookup_is_explained_as_mongod_does[nested_foreign_field-executionStats]`,
+      every stage of mongod's counting `saveState` 1 / `restoreState` 1 to
+      this server's 0 / 0, so mongod yielded once and this server did not;
+      three serial reruns of the case passed.
       Verify: none -- intermittent, once in 13 runs; no deterministic gap test until the differing counter is known
       Backlog-ID: RM-768
 - [ ] **A `$fill` with a `sortBy` passes ties on in a different order.**
@@ -1144,37 +1149,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Rust server". Found 2026-11-23 (RM-634).
       Verify: tests/backlog/test_rm_found_rm634.py::test_an_unpushed_sort_key_read_with_no_sort_is_empty
       Backlog-ID: RM-766
-- [ ] **A document inside an array a stage reads or writes into is sized
-      as if it were read.** mongod 8.2.11 gives each document in an array a
-      cache of its own when a stage reads a field through the array
-      (`$addFields: {q: "$t.y"}`) or sets one (`$set: {"t.w": 1}`), and the
-      sort and window behind count it: (236000, 259600) and (279200, 302800)
-      bytes over 200 documents of `t: [1, <30 bytes>, {q: 1, y: <50 bytes>}]`.
-      This server's storage model (`docstore`) follows a sub-document's
-      storage since RM-515, but not an array's elements: (195600, 219200)
-      and (206600, 230200). Found 2026-11-13 (RM-515).
-      Verify: tests/backlog/test_rm_found_rm515.py::test_an_arrays_documents_a_stage_touched_are_sized_by_their_storage
-      Backlog-ID: RM-636
-- [ ] **A `$sort` behind an exclusion `$project` counts each document
-      as the BSON it encodes.** mongod 8.2.11's exclusion `$project` keeps
-      the input's own storage and writes each excluded field out of it,
-      and projects a sub-document (`{"e.y": 0}`) into one of its own;
-      behind an `$unwind`, the `$sort` after it counts 4640 bytes over ten
-      documents for `{b: 0}` and 6930 for `{"e.y": 0}`. This server counts
-      2350 and 2850: the storage model (`docstore`, RM-408) models an
-      inclusion `$project` (RM-519) and stops at an exclusion. Found
-      2026-11-13 (RM-519).
-      Verify: tests/backlog/test_rm_found_rm519.py::test_a_sort_counts_what_an_exclusion_project_left
-      Backlog-ID: RM-637
-- [ ] **A `$project` behind a `$group` pushed into SBE is sized as if it
-      were read.** `[{$group: {_id: "$n", c: {$sum: 1}}}, {$project: {c:
-      1}}, {$sort: {c: 1}}]`: mongod 8.2.11's `$project` builds each
-      document (a `MutableDocument` with room for its two fields), and the
-      `$sort` counts 2450 bytes over ten groups; this server counts the
-      BSON each encodes, 1170, as it keeps no storage behind an SBE
-      `$group`. Found 2026-11-13 (RM-519).
-      Verify: tests/backlog/test_rm_found_rm519.py::test_a_project_after_a_pushed_down_group_builds_its_documents
-      Backlog-ID: RM-638
 - [ ] **A `$sort` behind a `$setWindowFields` that sorted by the same key
       is kept.** `[{$unwind: "$t"}, {$set: {w: 1}}, {$setWindowFields:
       {sortBy: {n: 1}, ...}}, {$sort: {n: 1}}]`: mongod 8.2.11 drops the
@@ -2731,55 +2705,6 @@ touched:
 
 
 ## The backlog verifier's pytest stalled once in CI (2026-10-21)
-
-- [ ] **RM-008's limiter test reads mongod's answer under load as a
-  different answer.** `test_ingress_rate_limiter_admits_queues_and_closes`
-  opens six connections against each server with the limiter at one a
-  second and a burst of one, and compares which were answered. In the
-  local RM gate's `backlog verify` step (2026-11-07, load average about
-  11 on 12 cores) mongod answered two connections with no queue, where
-  it answers one: the six connects took longer than a second to land, so
-  the bucket refilled. The test passed three runs out of three on its own
-  at low load. The same happened to this server's side in the RM gate of
-  2026-11-09 (load average about 9: it answered two with `maxQueueDepth`
-  2, where mongod answered one); three runs on their own passed. In the
-  RM gate of 2026-11-13 (load average up to 18) the same queue-2 case
-  differed in a wait instead: this server answered its third connection
-  after a wait that rounded to 3 seconds, mongod after 2; four runs on
-  their own passed, at load 18. A later RM gate that day (RM-515) saw
-  mongod answer two with no queue, as on 2026-11-08; three runs on their
-  own passed. So did the RM-533 gate of 2026-11-14 (load average up to
-  32), and again three runs on their own passed. The first CI occurrence
-  known was on pg-batch snapshot PR #3036 (2026-11-26, head 224a8b6f, run
-  45834896035, job `mdb-binary (backlog)` 139961032166, a PG explain
-  change only): with `maxQueueDepth` 2, this server answered its third
-  connection after a wait that rounded to 3 seconds, mongod after 2, the
-  2026-11-13 case again. The test depends on six connects landing within one
-  second, so it is flaky by construction: it needs a measurement that
-  load cannot change (connect all six behind a barrier and record how
-  long they took to land, or compare with the answer mongod gives when
-  they land within the second), not a retry.
-  Seen again on CI on rm-batch PR #3073 (49c12d71, run 45959038413, job
-  140372204555, 2026-11-27): with `maxQueueDepth` 2 this server answered
-  its third connection after a wait rounding to 2 s, mongod after 1.
-  **A first fix was reverted (2026-11-27).** e663afaaa stopped the
-  server with SIGSTOP while the six sockets connected and sent `hello`,
-  then resumed it with SIGCONT, so the six landed together whatever the
-  load. It passed 6 of 6 locally under 16 CPU burners, but on CI (PR
-  #3076 at e663afaa, run 45985326929, job 140459373674) the test's own
-  client lost its connection to this server (`AutoReconnect: ...
-  connection closed`). The `finally` that turns the limiter off then
-  failed too, so the limiter stayed on with no queue and closed every
-  new connection, and five later tests in the module failed the same
-  way (RM-010, RM-016, RM-302, RM-305 and RM-386 reported REGRESSED).
-  The likely cause is that pymongo's monitor or a pooled connection
-  reconnected while the server was stopped, and the limiter closed it.
-  A next design must keep the client's own connections out of the
-  limiter's path (a separate client created before the limiter is on,
-  with no monitor reconnects) and must restore the parameters even when
-  that client fails, for example from a fresh client after a wait.
-  Backlog-ID: RM-372
-  Verify: none -- a timing flake under load; the test passes when the connects land within a second
 
 - [ ] **A local RM gate's `storage-engine` step failed once on
   `OSError: [Errno 55] No buffer space available` (2026-11-26).**

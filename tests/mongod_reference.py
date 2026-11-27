@@ -21,7 +21,6 @@ import time
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
-import pytest
 from pymongo import MongoClient
 
 MONGOD = shutil.which("mongod")
@@ -88,6 +87,35 @@ def _stop_mongod(proc: subprocess.Popen, dbpath: str) -> None:
         f"failure.\nlog kept at: {kept or '(none captured)'}\n"
         f"--- last of mongod's output ---\n{tail or '(empty)'}"
     )
+
+
+class _MongodNeverReady(RuntimeError):
+    """The reference mongod never answered its ping.
+
+    A FAILURE, never a skip (RM-837): a mongod that crashes or hangs while it
+    starts is a broken reference server, and a skipped comparison reads as one
+    that was not asked for. The message carries the tail of mongod's own log,
+    which is the only thing that says why, and the process's exit status when it
+    exited.
+    """
+
+    def __init__(self, proc: subprocess.Popen, port: int, dbpath: str) -> None:
+        returncode = proc.poll()
+        state = (
+            f"exited on its own (returncode={returncode})"
+            if returncode is not None
+            else "was still running but never answered"
+        )
+        tail = ""
+        log = _mongod_log(dbpath)
+        if log.exists():
+            with contextlib.suppress(OSError):
+                tail = log.read_text(encoding="utf-8", errors="replace")[-2000:]
+        super().__init__(
+            f"the reference mongod on port {port} did not become ready in 30 s: it {state}. "
+            "This is a failure of the reference server, not a test to skip.\n"
+            f"--- last of mongod's output ---\n{tail or '(empty)'}"
+        )
 
 
 class _LostPortRace(RuntimeError):
@@ -159,13 +187,13 @@ def _start_mongod_once(
     uri = f"mongodb://127.0.0.1:{port}/"
     # Everything from here to the `return` runs under `_reap_on_failure`: the
     # caller only gets a `finally` to clean up with once it HOLDS the handle, so
-    # any exit before the return -- the skip below, the race guard's raise, a
+    # any exit before the return -- the failure below, the race guard's raise, a
     # KeyboardInterrupt -- would otherwise leave a live mongod and its dbpath
-    # behind. `pytest.skip` raises `Skipped`, which is a `BaseException` and not
-    # an `Exception`, so the guard has to catch the wider one.
+    # behind. The guard catches `BaseException` so that an interrupt, which is
+    # not an `Exception`, reaps too.
     with _reap_on_failure(proc, tmp):
         if not _wait_owned(proc, port, 30):
-            pytest.skip("mongod did not become ready")
+            raise _MongodNeverReady(proc, port, tmp)
         _assert_owns_port(proc, port)
     return proc, uri, tmp
 

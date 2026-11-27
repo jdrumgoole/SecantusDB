@@ -1017,15 +1017,21 @@ impl Default for MemState {
     }
 }
 
-/// `BucketKey::hash`: a hash of the collection and the series (`mongod`'s is
-/// Abseil's, seeded at random for each process).
+/// `BucketKey::hash`: a hash of the collection and the series. `mongod`'s is
+/// `absl::Hash`, whose seed is drawn at random for each process, so which
+/// stripe a series lands in differs from run to run and spreads evenly over
+/// the 32 stripes. This is SipHash seeded at random for each process, which
+/// does the same. (It was FNV-1a: its low bits are a bijection of the
+/// input's low bits, so the stripes of series that differ in one byte
+/// collided half as often as `mongod`'s, and an idle bucket expired in too
+/// few runs: RM-711, CI run 46029656831.)
 pub(crate) fn key_hash(uuid: &[u8], series: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in uuid.iter().chain(series) {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    h ^ (h >> 32)
+    use std::hash::{BuildHasher, Hash, Hasher};
+    static SEED: std::sync::OnceLock<std::hash::RandomState> = std::sync::OnceLock::new();
+    let mut h = SEED.get_or_init(std::hash::RandomState::new).build_hasher();
+    uuid.hash(&mut h);
+    series.hash(&mut h);
+    h.finish()
 }
 
 /// The stripe a series falls in (`key.hash % stripes.size()`).
@@ -1152,6 +1158,33 @@ impl MemState {
 mod tests {
     use super::*;
     use bson::{doc, oid::ObjectId};
+
+    #[test]
+    fn stripes_spread_as_evenly_as_a_random_hash_does() {
+        // 21 series that differ in one byte, as the RM-711 probe opens them,
+        // in many collections: once the sixth is open, each new series lands
+        // in a stripe already holding one with probability 1 - (31/32)^k,
+        // about 4.98 times in the fifteen that follow. FNV-1a gave 2.68.
+        let series: Vec<Vec<u8>> = (-1..20)
+            .map(|m| crate::bsondoc::to_vec(&doc! {"m": m}).unwrap())
+            .collect();
+        let runs = 3000u32;
+        let mut total = 0u32;
+        for run in 0..runs {
+            let uuid = [run.to_be_bytes(), run.to_le_bytes(), [7; 4], [9; 4]].concat();
+            let mut seen = std::collections::HashSet::new();
+            for (k, s) in series.iter().enumerate() {
+                if !seen.insert(stripe_of(&uuid, s)) && k >= 6 {
+                    total += 1;
+                }
+            }
+        }
+        let mean = f64::from(total) / f64::from(runs);
+        assert!(
+            (4.7..5.3).contains(&mean),
+            "stripe collisions per run {mean}, a uniform hash gives about 5"
+        );
+    }
 
     #[test]
     fn table_capacities_and_bytes() {
