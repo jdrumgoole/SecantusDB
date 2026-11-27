@@ -3720,6 +3720,30 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       Verify: none -- an intermittent wall-clock bound under load; crates/secantus-pg/tests/embedded.rs::stop_does_not_wait_on_an_idle_connection is the check
       Backlog-ID: RP-1132
 
+## Found landing PR #3058 (2026-11-27)
+
+- [ ] **RP-290's join-method regression test fails once three of its
+      module's tests have run on the same server.**
+      `tests/backlog/test_rp_catalog_reads.py::test_a_catalog_joins_method_decides_its_reads`
+      (added with RP-290's part at d86010b3f) failed on CI on snapshot
+      PR #3058 (1a4477ac, RP-1096 alone; run 45916374322, `pg-oracle
+      (backlog)`). In "a nested loop with the second relation outer",
+      `pg_class_relname_nsp_index` returned 3 entries and fetched 3 heap
+      rows, where PostgreSQL 15 fetches 2: one entry it returns points at
+      a row no longer visible. Reproduced on arm64 macOS with a debug
+      build at 62af52b6d, with the suite's random order off: it fails
+      after the module's first three tests, after its 4th to 6th, and
+      after its 8th to 11th; it passes alone, after a test that only
+      sleeps 30 s, and after any one of those tests alone. So it is the
+      catalog's state after several tests' DDL, not time and not one
+      statement. Not yet known: whether RP-1096's launcher is involved
+      (CI passed the test once, on PR #3056, before it), and whether the
+      third row is a dead `pg_class` row ours treats as visible or a row
+      PostgreSQL would have pruned. `pytest-randomly` shuffles the module
+      on every run, so CI meets it by chance.
+      Verify: none -- order-dependent; run the module serially with `-p no:randomly`, where test_a_catalog_joins_method_decides_its_reads fails
+      Backlog-ID: RP-1145
+
 ## The storage model is not mongod's (tasks/mongod-storage-model-plan.md, 2026-11-19)
 
 - [ ] **A store `secantusd-pg` writes is not one mongod can open.** The
