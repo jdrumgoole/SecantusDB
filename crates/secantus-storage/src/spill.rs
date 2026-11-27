@@ -17,10 +17,9 @@
 //! The MongoDB server opens it at startup, as mongod does ([`SpillEngine::open`],
 //! RM-305); otherwise it is opened at the first spill (or the first
 //! `serverStatus`, which reports it), so the PostgreSQL server, which shares
-//! this crate, never makes the directory. Its tables are not compressed: mongod's are zstd at level
-//! -7 (`spillWiredTigerBlockCompressor`), which the vendored WiredTiger is
-//! not built with; that only shows once the engine writes a table's pages to
-//! its file.
+//! this crate, never makes the directory. Its tables are zstd-compressed at
+//! level -7, as mongod's
+//! (`spillWiredTigerBlockCompressor`, `spillWiredTigerZstdCompressionLevel`; RM-611).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,8 +33,9 @@ use crate::{Result, StorageError};
 pub const SPILL_DIR: &[&str] = &["_tmp", "spilldb"];
 
 /// A spill table's configuration: mongod's record store over a record-id
-/// key, without its zstd compressor (see the module comment).
-const TABLE_CFG: &str = "type=file,memory_page_max=10m,split_pct=90,leaf_value_max=64MB,\
+/// key, zstd-compressed (`spillWiredTigerBlockCompressor`).
+const TABLE_CFG: &str =
+    "type=file,block_compressor=zstd,memory_page_max=10m,split_pct=90,leaf_value_max=64MB,\
                          checksum=on,key_format=q,value_format=u,log=(enabled=false)";
 
 /// How a spill table is dropped: its pages discarded, its file removed.
@@ -115,6 +115,7 @@ pub fn open_config(cache_mb: i64) -> String {
          eviction=(threads_min=1,threads_max=1),eviction_dirty_target={}MB,\
          eviction_dirty_trigger={}MB,eviction_updates_trigger={}MB,config_base=false,\
          statistics=(fast),log=(enabled=false),\
+         builtin_extension_config=(zstd=(compression_level=-7)),\
          file_manager=(close_idle_time=600,close_scan_interval=10,close_handle_minimum=2000),\
          statistics_log=(wait=0),{}",
         pct(5),
@@ -494,6 +495,11 @@ mod tests {
         assert!(cfg.contains("cache_size=819M"), "{cfg}");
         assert!(cfg.contains("eviction_dirty_target=40MB"), "{cfg}");
         assert!(cfg.contains("eviction_dirty_trigger=655MB"), "{cfg}");
+        // mongod 8.2.11 logged this, in this place (RM-611).
+        assert!(
+            cfg.contains("log=(enabled=false),builtin_extension_config=(zstd=(compression_level=-7)),file_manager="),
+            "{cfg}"
+        );
     }
 
     /// A table the engine holds in its cache keeps the file WiredTiger made

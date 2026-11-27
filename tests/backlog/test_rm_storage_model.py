@@ -31,7 +31,7 @@ from tests.backlog.conftest import (
     mongo_answer,
     rust_mongo_server,
 )
-from tests.mongod_reference import MONGOD
+from tests.mongod_reference import MONGOD, _LostPortRace, _wait_owned
 
 #: `storage.bson` in a mongod 8.2.11 store (phase 0b).
 MONGOD_STORAGE_BSON = {
@@ -68,37 +68,42 @@ def _mongod_on(
     8.2.11 started under another name or port leaves such a store REMOVED
     ("NodeNotFound"), its own store included (measured 2026-11-21)."""
     assert MONGOD, "no mongod on PATH: the reference server is required"
-    port = port or _free_port()
-    proc = subprocess.Popen(
-        [
-            MONGOD,
-            "--dbpath",
-            str(dbpath),
-            "--port",
-            str(port),
-            "--bind_ip",
-            "127.0.0.1",
-            "--replSet",
-            set_name,
-            "--logpath",
-            str(dbpath.parent / f"mongod-{port}.log"),
-            "--logappend",
-            *extra,
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            return proc, None
+    for attempt in range(4):
+        member_port = port or _free_port()
+        proc = subprocess.Popen(
+            [
+                MONGOD,
+                "--dbpath",
+                str(dbpath),
+                "--port",
+                str(member_port),
+                "--bind_ip",
+                "127.0.0.1",
+                "--replSet",
+                set_name,
+                "--logpath",
+                str(dbpath.parent / f"mongod-{member_port}.log"),
+                "--logappend",
+                *extra,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                break
-        except OSError:
-            time.sleep(0.2)
+            owned = _wait_owned(proc, member_port, 60)
+        except _LostPortRace:
+            # Another worker's mongod took a port `_free_port()` had handed
+            # out; a store that names its port cannot move, so only a port we
+            # chose is tried again. Four lost in a row is still an error.
+            _stop_mongod(proc, None)
+            if port is not None or attempt == 3:
+                raise
+            continue
+        if not owned and proc.poll() is not None:
+            return proc, None
+        break
     client = pymongo.MongoClient(
-        f"mongodb://127.0.0.1:{port}/?directConnection=true", serverSelectionTimeoutMS=10_000
+        f"mongodb://127.0.0.1:{member_port}/?directConnection=true", serverSelectionTimeoutMS=10_000
     )
     return proc, client
 
@@ -1685,33 +1690,35 @@ def _mongod_standalone_on(
 ) -> tuple[subprocess.Popen, pymongo.MongoClient | None]:
     """mongod 8.2.11 started WITHOUT `--replSet` on `dbpath`: a standalone."""
     assert MONGOD, "no mongod on PATH: the reference server is required"
-    port = _free_port()
-    proc = subprocess.Popen(
-        [
-            MONGOD,
-            "--dbpath",
-            str(dbpath),
-            "--port",
-            str(port),
-            "--bind_ip",
-            "127.0.0.1",
-            "--logpath",
-            str(dbpath.parent / f"mongod-{port}.log"),
-            "--logappend",
-            *extra,
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            return proc, None
+    for attempt in range(4):
+        port = _free_port()
+        proc = subprocess.Popen(
+            [
+                MONGOD,
+                "--dbpath",
+                str(dbpath),
+                "--port",
+                str(port),
+                "--bind_ip",
+                "127.0.0.1",
+                "--logpath",
+                str(dbpath.parent / f"mongod-{port}.log"),
+                "--logappend",
+                *extra,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                break
-        except OSError:
-            time.sleep(0.2)
+            owned = _wait_owned(proc, port, 60)
+        except _LostPortRace:
+            _stop_mongod(proc, None)
+            if attempt == 3:
+                raise
+            continue
+        if not owned and proc.poll() is not None:
+            return proc, None
+        break
     return proc, pymongo.MongoClient(
         f"mongodb://127.0.0.1:{port}/?directConnection=true", serverSelectionTimeoutMS=10_000
     )

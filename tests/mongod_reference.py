@@ -164,21 +164,7 @@ def _start_mongod_once(
     # behind. `pytest.skip` raises `Skipped`, which is a `BaseException` and not
     # an `Exception`, so the guard has to catch the wider one.
     with _reap_on_failure(proc, tmp):
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            try:
-                # `directConnection` matters for the replica-set fixture: an
-                # UNINITIATED member fails server selection through normal
-                # discovery, so the readiness probe timed out and the whole
-                # step-down comparison skipped with "mongod did not become
-                # ready" rather than running.
-                MongoClient(uri, serverSelectionTimeoutMS=500, directConnection=True).admin.command(
-                    "ping"
-                )
-                break
-            except Exception:  # noqa: BLE001 - polling for readiness
-                time.sleep(0.25)
-        else:
+        if not _wait_owned(proc, port, 30):
             pytest.skip("mongod did not become ready")
         _assert_owns_port(proc, port)
     return proc, uri, tmp
@@ -197,6 +183,68 @@ def _reap_on_failure(proc: subprocess.Popen, dbpath: str) -> Iterator[None]:
         raise
 
 
+def _answering_pid(port: int) -> int | None:
+    """The pid of the mongod that answers on `port`, or `None` when nothing
+    does. `serverStatus` reports it whichever role the member has.
+
+    `directConnection` matters for the replica-set fixture: an UNINITIATED
+    member fails server selection through normal discovery, so the readiness
+    probe timed out and the whole step-down comparison skipped with "mongod
+    did not become ready" rather than running."""
+    client = MongoClient(
+        f"mongodb://127.0.0.1:{port}/", serverSelectionTimeoutMS=500, directConnection=True
+    )
+    try:
+        status = client.admin.command(
+            {"serverStatus": 1, "repl": 0, "metrics": 0, "locks": 0, "wiredTiger": 0}
+        )
+        return int(status["pid"])
+    except Exception:  # noqa: BLE001 - nothing answering yet
+        return None
+    finally:
+        client.close()
+
+
+def _wait_owned(proc: subprocess.Popen, port: int, timeout: float) -> bool:
+    """Wait until the mongod answering on `port` is `proc` itself.
+
+    Returns `True` once it is, and `False` when `proc` exited with nothing
+    answering (it refused to start: its own log says why) or `timeout`
+    passed with nothing answering. Raises `_LostPortRace` when a DIFFERENT
+    mongod answers: `_free_port()` closes its probe socket before `proc`
+    binds, and mongod opens WiredTiger BEFORE it binds, so another worker's
+    mongod can take the port while `proc` is still starting. `proc` has not
+    exited yet at that point, so "it is still alive" proves nothing; the pid
+    the server reports is the identity (2026-11-27: 108 setup errors, one
+    xdist worker's `replSetInitiate` reaching a standalone mongod).
+    """
+    deadline = time.monotonic() + timeout
+    foreign: int | None = None
+    while time.monotonic() < deadline:
+        pid = _answering_pid(port)
+        if pid == proc.pid:
+            return True
+        if pid is not None:
+            foreign = pid
+        if proc.poll() is not None:
+            # Dead. A server still answering on the port took it from us;
+            # nothing answering means mongod itself refused to start.
+            foreign = _answering_pid(port)
+            if foreign is not None and foreign != proc.pid:
+                raise _LostPortRace(
+                    f"mongod on port {port} exited during startup and pid {foreign} "
+                    "holds the port: a ping would have reached a DIFFERENT server, "
+                    "so this gate would have compared against a mongod it does not own"
+                )
+            return False
+        time.sleep(0.25)
+    if foreign is not None:
+        raise _LostPortRace(
+            f"pid {foreign} answers on port {port} and mongod pid {proc.pid} never did"
+        )
+    return False
+
+
 def _assert_owns_port(proc: subprocess.Popen, port: int) -> None:
     # A ping that succeeds is NOT proof it reached the mongod spawned above.
     # `_free_port()` closes its probe socket before this child binds, so
@@ -204,16 +252,18 @@ def _assert_owns_port(proc: subprocess.Popen, port: int) -> None:
     # "address already in use" while the ping lands on THEIRS. This gate
     # would go on measuring a server it does not own -- and, being a
     # differential gate, would report agreement it never actually tested.
-    # A child that lost the race is long gone by the time a ping succeeds,
-    # so its exit is the reliable tell. Fail loudly rather than measure the
-    # wrong server. (The same race broke `pg-oracle` on 2026-09-09; the
-    # `secantusd-pg` harness fixed it properly by binding :0 and reading the
-    # port back, which mongod gives us no way to do.)
-    if proc.poll() is not None:
+    # "Ours has not exited" is not an answer either (it is still opening
+    # WiredTiger when the other one answers), so the identity is checked
+    # outright: the pid the answering server reports must be `proc`'s.
+    # (The same race broke `pg-oracle` on 2026-09-09; the `secantusd-pg`
+    # harness fixed it properly by binding :0 and reading the port back,
+    # which mongod gives us no way to do.)
+    pid = _answering_pid(port)
+    if proc.poll() is not None or pid != proc.pid:
         raise _LostPortRace(
-            f"mongod on port {port} exited during startup; the ping that "
-            "succeeded reached a DIFFERENT server, so this gate would have "
-            "compared against a mongod it does not own"
+            f"mongod pid {proc.pid} on port {port} is not the server answering there "
+            f"(pid {pid}); a ping that succeeded reached a DIFFERENT server, so this "
+            "gate would have compared against a mongod it does not own"
         )
 
 
