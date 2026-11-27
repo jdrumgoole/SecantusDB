@@ -1089,6 +1089,18 @@ pub fn cheapest_nest_loop_left(
     nest_loop_paths(a, b, qual, [None, None], &[false])
 }
 
+/// [`cheapest_nest_loop_left`] whose nullable side `b` may be
+/// `inner_unique` (`innerrel_is_unique` runs for `JOIN_LEFT` too), `unique`
+/// its semi-join factors `(match fraction, match count)` (RP-1103).
+pub fn cheapest_nest_loop_left_semi(
+    a: (f64, f64, f64, i64),
+    b: (f64, f64, f64, i64),
+    qual: f64,
+    unique: Option<(f64, f64)>,
+) -> NestLoopPlan {
+    nest_loop_paths(a, b, qual, [None, unique], &[false])
+}
+
 /// [`cheapest_nest_loop_left`] of an anti join (RP-908): `b`, the inner,
 /// read until an outer row's first match, `factors` the join's
 /// `(outer match fraction, match count)` (`compute_semi_anti_join_factors`).

@@ -3262,6 +3262,135 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a = 3)",
         ],
     ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1103): the same
+    # LEFT join priced, the nullable side's constant its index's cond, the
+    # ON the join filter; over 100 outer rows a Materialize of the one
+    # inner row.
+    "a priced left join's fixed outer key is the inner index's cond": (
+        "RP-1103",
+        _ANALYSED,
+        "explain select e.b, k.b from e left join k on e.a = k.a where e.a = 3",
+        [
+            "Nested Loop Left Join  (cost=0.28..25.80 rows=1 width=6)",
+            "  Join Filter: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "        Filter: (a = 3)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    "a left join's fixed outer key over many outer rows materializes the inner": (
+        "RP-1103",
+        _ANALYSED
+        + [
+            "create table m (a int, b text)",
+            "insert into m select g % 10, 'v' || g from generate_series(1, 1000) g",
+            "analyze m",
+        ],
+        "explain select m.b, k.b from m left join k on m.a = k.a where m.a = 3",
+        [
+            "Nested Loop Left Join  (cost=0.28..28.29 rows=100 width=7)",
+            "  Join Filter: (m.a = k.a)",
+            "  ->  Seq Scan on m  (cost=0.00..18.50 rows=100 width=8)",
+            "        Filter: (a = 3)",
+            "  ->  Materialize  (cost=0.28..8.30 rows=1 width=7)",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "              Index Cond: (a = 3)",
+        ],
+    ),
+    # The outer key's class is created by the ON (`initialize_mergeclause_
+    # eclasses`) before the WHERE's other class, so its constant comes first
+    # whichever order the WHERE writes them (RP-1103).
+    "a left join's fixed outer key leads the outer scan's filter": (
+        "RP-1103",
+        _ANALYSED,
+        "explain select e.b, k.b from e left join k on e.a = k.a where e.b = 'v3' and e.a = 3",
+        [
+            "Nested Loop Left Join  (cost=0.28..28.30 rows=1 width=6)",
+            "  Join Filter: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..20.00 rows=1 width=7)",
+            "        Filter: ((a = 3) AND (b = 'v3'::text))",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster: the same Nested Loop
+    # Left Join where the inner side is not unique, the select list is `*`,
+    # the WHERE also tests the nullable side, or the inner side has no
+    # index on its key.
+    "a left join's fixed outer key over a non-unique inner index": (
+        "RP-1149",
+        _ANALYSED
+        + [
+            "create table n (a int, b text)",
+            "create index n_a on n (a)",
+            "insert into n select g, 'v' || g from generate_series(1, 1000) g",
+            "analyze n",
+        ],
+        "explain select e.b, n.b from e left join n on e.a = n.a where e.a = 3",
+        [
+            "Nested Loop Left Join  (cost=0.28..25.80 rows=1 width=7)",
+            "  Join Filter: (e.a = n.a)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "        Filter: (a = 3)",
+            "  ->  Index Scan using n_a on n  (cost=0.28..8.29 rows=1 width=8)",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    "a left join's fixed outer key under select star": (
+        "RP-1149",
+        _ANALYSED,
+        "explain select * from e left join k on e.a = k.a where e.a = 3",
+        [
+            "Nested Loop Left Join  (cost=0.28..25.80 rows=1 width=14)",
+            "  Join Filter: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "        Filter: (a = 3)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    "a left join's fixed outer key beside a test of the nullable side": (
+        "RP-1149",
+        _ANALYSED,
+        "explain select e.b, k.b from e left join k on e.a = k.a where e.a = 3 and k.b is null",
+        [
+            "Nested Loop Left Join  (cost=0.28..25.80 rows=1 width=6)",
+            "  Join Filter: (e.a = k.a)",
+            "  Filter: (k.b IS NULL)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "        Filter: (a = 3)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    "a left join's fixed outer key into an unindexed inner": (
+        "RP-1149",
+        _ANALYSED,
+        "explain select e.b, k.b from k left join e on e.a = k.a where k.a = 3",
+        [
+            "Nested Loop Left Join  (cost=0.28..25.80 rows=1 width=6)",
+            "  Join Filter: (e.a = k.a)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = 3)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "        Filter: (a = 3)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster: a WHERE equality
+    # written twice is one member of its class, one qual on the scan.
+    "a class constant written twice is costed once": (
+        "RP-1150",
+        _ANALYSED,
+        "explain select e.b, k.b from e join k on e.a = k.a where e.a = 3 and e.a = 3",
+        [
+            "Nested Loop  (cost=0.28..25.80 rows=1 width=6)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "        Filter: (a = 3)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
     "an aggregate over a join's class constant": (
         "RP-1104",
         _ANALYSED,
@@ -10127,6 +10256,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1103",
         "RP-1101",
         "RP-1027",
         "RP-1030",

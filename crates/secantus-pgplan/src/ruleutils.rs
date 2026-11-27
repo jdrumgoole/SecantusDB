@@ -6027,8 +6027,12 @@ pub fn join_where(s: &pg_query::protobuf::SelectStmt, cat: &Catalog<'_>) -> Opti
 /// too), or starts one at the list's end. A clause whose two sides are in
 /// different classes merges the second into the first, which keeps its
 /// place. `generate_base_implied_equalities` gives each scan its classes'
-/// equalities in this order. Empty -- the order unknown -- for an outer
-/// join, a USING or NATURAL join, or a FROM item other than a table.
+/// equalities in this order. A LEFT JOIN of two tables on one column
+/// equality is an outer-join clause, never a class: it gives each of its
+/// two columns a class of its own, left operand first
+/// (`initialize_mergeclause_eclasses`, RP-1103), which a WHERE constant
+/// then joins. Empty -- the order unknown -- for any other outer join, a
+/// USING or NATURAL join, or a FROM item other than a table.
 pub fn class_ranks(
     s: &pg_query::protobuf::SelectStmt,
     cat: &Catalog<'_>,
@@ -6039,33 +6043,54 @@ pub fn class_ranks(
         let mut rtes = Vec::new();
         p.collect_rtes(&s.from_clause, &mut rtes)?;
         p.scopes.push(rtes);
-        // The quals in the order `deconstruct_recurse` distributes them.
-        fn gather<'n>(n: &'n Node, out: &mut Vec<std::borrow::Cow<'n, Node>>) -> Option<()> {
+        // The quals in the order `deconstruct_recurse` distributes them,
+        // each with whether it is a LEFT JOIN's outer-join clause.
+        type Quals<'n> = Vec<(std::borrow::Cow<'n, Node>, bool)>;
+        fn gather<'n>(n: &'n Node, out: &mut Quals<'n>) -> Option<()> {
             match n.node.as_ref()? {
                 N::RangeVar(_) => Some(()),
                 N::JoinExpr(j) => {
-                    if JoinType::try_from(j.jointype).ok()? != JoinType::JoinInner
-                        || j.is_natural
-                        || !j.using_clause.is_empty()
-                    {
+                    let kind = JoinType::try_from(j.jointype).ok()?;
+                    if j.is_natural || !j.using_clause.is_empty() {
                         return None;
                     }
+                    let mut on = Vec::new();
+                    if let Some(q) = j.quals.as_deref() {
+                        and_clauses(q, &mut on);
+                    }
+                    let outer = match kind {
+                        JoinType::JoinInner => false,
+                        // Two tables on one clause: anything more is a
+                        // class order not modelled.
+                        JoinType::JoinLeft
+                            if on.len() == 1
+                                && [&j.larg, &j.rarg].iter().all(|a| {
+                                    matches!(
+                                        a.as_deref().and_then(|a| a.node.as_ref()),
+                                        Some(N::RangeVar(_))
+                                    )
+                                }) =>
+                        {
+                            true
+                        }
+                        _ => return None,
+                    };
                     gather(j.larg.as_deref()?, out)?;
                     gather(j.rarg.as_deref()?, out)?;
-                    if let Some(q) = j.quals.as_deref() {
-                        and_clauses(q, out);
-                    }
+                    out.extend(on.into_iter().map(|q| (q, outer)));
                     Some(())
                 }
                 _ => None,
             }
         }
-        let mut quals = Vec::new();
+        let mut quals: Quals<'_> = Vec::new();
         for item in &s.from_clause {
             gather(item, &mut quals)?;
         }
         if let Some(w) = s.where_clause.as_deref() {
-            and_clauses(w, &mut quals);
+            let mut parts = Vec::new();
+            and_clauses(w, &mut parts);
+            quals.extend(parts.into_iter().map(|q| (q, false)));
         }
         // A member: a column as `(relation, column)`, anything else by
         // its tree (`equal()`).
@@ -6103,10 +6128,35 @@ pub fn class_ranks(
             }
         };
         let mut classes: Vec<Vec<Member>> = Vec::new();
-        for q in &quals {
+        for (q, outer) in &quals {
             let Some(N::AExpr(e)) = q.node.as_ref() else {
+                // An outer-join clause other than a column equality.
+                if *outer {
+                    return None;
+                }
                 continue;
             };
+            // The LEFT JOIN's clause: each column the class it is in, or
+            // one of its own at the list's end.
+            if *outer {
+                if e.kind != AExprKind::AexprOp as i32 || crate::operator_name(e).ok() != Some("=")
+                {
+                    return None;
+                }
+                let sides = [e.lexpr.as_deref()?, e.rexpr.as_deref()?].map(member);
+                let [Some(l @ Member::Var(lr, _)), Some(r @ Member::Var(rr, _))] = &sides else {
+                    return None;
+                };
+                if lr == rr {
+                    return None;
+                }
+                for m in [l, r] {
+                    if !classes.iter().any(|c| c.contains(m)) {
+                        classes.push(vec![m.clone()]);
+                    }
+                }
+                continue;
+            }
             if e.kind != AExprKind::AexprOp as i32 || crate::operator_name(e).ok() != Some("=") {
                 continue;
             }
@@ -7517,8 +7567,22 @@ mod join_where_tests {
             ranks("select * from e, s where e.a = 3 and s.c = 'y' and s.a = 3"),
             vec![vec![v("e", "a"), v("s", "a")], vec![v("s", "c")]]
         );
-        // An outer join's order is not modelled.
-        assert!(ranks("select * from e left join s on e.a = s.a where e.a = 3").is_empty());
+        // A LEFT JOIN's one equality gives each column a class of its own,
+        // left operand first, before the WHERE's (RP-1103, PostgreSQL
+        // 15.20: `where e.b = 'v3' and e.a = 3` filters e by `((a = 3) AND
+        // (b = 'v3'::text))`).
+        assert_eq!(
+            ranks("select * from e left join s on e.a = s.a where e.b = 'x' and e.a = 3"),
+            vec![vec![v("e", "a")], vec![v("s", "a")], vec![v("e", "b")]]
+        );
+        assert_eq!(
+            ranks("select * from e left join s on s.a = e.a where e.a = 3"),
+            vec![vec![v("s", "a")], vec![v("e", "a")]]
+        );
+        // Any other outer join's order is not modelled.
+        assert!(ranks("select * from e left join s on e.a = s.a and s.b = 'x'").is_empty());
+        assert!(ranks("select * from e left join s on e.a < s.a where e.a = 3").is_empty());
+        assert!(ranks("select * from e full join s on e.a = s.a where e.a = 3").is_empty());
     }
 
     #[test]

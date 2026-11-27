@@ -279,7 +279,8 @@ impl PgHandler {
             let (a, b, join, pick, indexes) = self.hash_join_estimate_over(&top_sel, Some(&rel))?;
             match pick {
                 // The pair never takes a parameterized path here.
-                scan_estimate::JoinPick::NestParam { .. } => return None,
+                scan_estimate::JoinPick::NestParam { .. }
+                | scan_estimate::JoinPick::Nest { .. } => return None,
                 scan_estimate::JoinPick::Merge { .. } => {
                     explain::join_key_texts(&top_sel)?;
                 }
