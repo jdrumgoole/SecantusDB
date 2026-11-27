@@ -1032,6 +1032,20 @@ pub(crate) fn apply_join_pick(
                 );
             }
         }
+        // A LEFT join's nested loop over the two scans (RP-1103): the
+        // Hash removed, the ON its Join Filter (`attach_join_conds`).
+        crate::scan_estimate::JoinPick::Nest { plan } => {
+            if tree.name == "Hash Left Join"
+                && tree.children.len() == 2
+                && tree.children[1].name == "Hash"
+                && tree.children[1].children.len() == 1
+            {
+                let mut hash = tree.children.pop().expect("two children");
+                tree.children.push(hash.children.pop().expect("one child"));
+                tree.name = "Nested Loop Left Join".into();
+                price_nest_loop(tree, &plan, a, b, join);
+            }
+        }
     }
     // A side read through its index (RP-369).
     if tree.estimate.is_some() {

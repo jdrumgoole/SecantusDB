@@ -1994,16 +1994,37 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a class fixed to two constants is the empty result]
       Backlog-ID: RP-1102
 
-- [ ] **A LEFT JOIN whose WHERE fixes the outer key does not read the
-      inner side through its index.** `explain (costs off) select e.b, k.b
-      from e left join k on e.a = k.a where e.a = 3` is a `Hash Left Join`
-      here; a private PostgreSQL 15.20 cluster prints a `Nested Loop Left
-      Join`, `Join Filter: (e.a = k.a)`, into `Index Scan using k_pkey on
-      k`, `Index Cond: (a = 3)` (`reconsider_outer_join_clauses` gives the
-      inner key the constant; RP-364 covers the narrow path's Seq Scans).
-      Found while working RP-1065.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join's fixed outer key is the inner index's cond]
-      Backlog-ID: RP-1103
+- [ ] **A LEFT JOIN whose WHERE fixes the outer key is still an unpriced
+      Hash Left Join where the inner side is not unique, the select list
+      is `*`, the WHERE also tests the nullable side, or the inner side
+      has no index on its key.** Each of `explain select e.b, n.b from e
+      left join n on e.a = n.a where e.a = 3` (`n_a` a plain index), `...
+      select * from e left join k ...`, `... where e.a = 3 and k.b is
+      null` and `select e.b, k.b from k left join e on e.a = k.a where k.a
+      = 3` prints a `Hash Left Join` with every cost zero here; a private
+      PostgreSQL 15.20 cluster prints the `Nested Loop Left Join
+      (cost=0.28..25.80 rows=1 ...)` with the ON its `Join Filter` that
+      RP-1103 draws for a unique inner. That path (`hash_join_of`,
+      `left_one_row`) is taken only where the nullable side's own WHERE
+      fixes a unique key, because the merge paths over a redundant clause
+      are not weighed (`merges` is `None` there); the narrow path's
+      estimate refuses `*` and a WHERE on the nullable side; and over the
+      unindexed inner `hash_join_of`'s nested-loop check leaves the plan
+      unpriced. Found while working RP-1103.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join's fixed outer key over a non-unique inner index], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's fixed outer key under select star], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's fixed outer key beside a test of the nullable side], tests/backlog/test_rp_explain_costs.py::test_plan[a left join's fixed outer key into an unindexed inner]
+      Backlog-ID: RP-1149
+
+- [ ] **A WHERE equality written twice on a join's class key is costed
+      twice.** `explain select e.b, k.b from e join k on e.a = k.a where
+      e.a = 3 and e.a = 3` (and the LEFT JOIN form) prices `Seq Scan on e
+      (cost=0.00..20.00 ...)` under a `28.30` Nested Loop here, printing
+      one `Filter: (a = 3)`; a private PostgreSQL 15.20 cluster prices it
+      `17.50` under `25.80`, the two clauses one member of the class
+      (`process_equivalence`) and one qual on the scan. A lone scan, `select
+      b from e where a = 3 and a = 3`, is already `17.50`. Found while
+      working RP-1103.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a class constant written twice is costed once]
+      Backlog-ID: RP-1150
 
 - [ ] **An aggregate over a join whose class a WHERE constant fixes is
       drawn over a Hash Join.** `explain (costs off) select count(*) from e
@@ -2039,6 +2060,9 @@ a regression test.
       `Index Cond: (a = 3)` on `k`: `generate_base_implied_equalities_const`
       rebuilds every member's equality as `member = constant`, the
       original clause's side order lost. Found while working RP-966.
+      A LEFT JOIN, `... from e left join k on e.a = k.a where 3 = e.a`,
+      is an unpriced `Hash Left Join` with `Filter: (3 = a)` here for the
+      same reason; PostgreSQL 15.20 prints RP-1103's Nested Loop Left Join.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a class constant on the left of its equality is the class's]
       Backlog-ID: RP-1137
 
@@ -2054,7 +2078,11 @@ a regression test.
       PostgreSQL a Nested Loop with `Join Filter: (e.b = k.b)` into the
       same index scan. Both are declined by the class-constant drawing
       (`joined_implied_estimate`), which takes one ON equality and no ORDER
-      BY or LIMIT. Found while working RP-966.
+      BY or LIMIT. Found while working RP-966. A LEFT JOIN whose WHERE
+      fixes its outer key is the same under a LIMIT (`... left join k on
+      e.a = k.a where e.a = 3 limit 5`): an unpriced `Hash Left Join` here,
+      RP-1103's Nested Loop Left Join under the Limit on PostgreSQL 15.20
+      (`join_select_hash_estimate` refuses a LIMIT).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a class constant join under a limit is a nested loop], tests/backlog/test_rp_explain_costs.py::test_plan[a class constant join beside a second on equality is a nested loop]
       Backlog-ID: RP-1138
 

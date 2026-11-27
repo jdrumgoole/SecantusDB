@@ -8763,7 +8763,11 @@ fn hash_join_of(
     let unique_key = !multi && (a.unique || b.unique);
     // Over an expression key they are weighed too (RP-1032), the
     // column side's index probed by the expression.
-    if unique_key && redundant {
+    // A LEFT join whose nullable side its own WHERE (the constant the
+    // outer key's class gave it) cuts to one row is weighed below
+    // (RP-1103); any other redundant clause over a unique key is not.
+    let left_one_row = left_join && redundant && b.one_row;
+    if unique_key && redundant && !left_one_row {
         return None;
     }
     // A side its own WHERE cuts to one row is `inner_unique` as the inner
@@ -8947,6 +8951,49 @@ fn hash_join_of(
     let semi = |s: &HashSide, unique: bool| {
         (s.one_row || unique).then(|| (selectivity, s.scan.2.max(1.0)))
     };
+    // A LEFT join whose outer key a WHERE constant fixes, its nullable
+    // side cut to one row by the constant that class gives it (RP-1103):
+    // `match_unsorted_outer` builds its nested loops -- the preserved side
+    // outer, the inner its cheapest path and then a Material of it, the
+    // redundant ON each pair's join filter -- before `hash_inner_and_outer`
+    // adds the hash paths, and `add_path` lets a hash path replace it only
+    // where that is better (`compare_path_costs_fuzzily`, then the
+    // 1.0000000001 fuzz). The merge over the inner's presorted index and
+    // the nested loop into its index parameterized by the outer key are
+    // not weighed: each reads the same one inner row, the merge after
+    // sorting the outer and the parameterized scan checking the ON as a
+    // second index qual where this one checks it as the join filter, so
+    // neither comes in under the plain nested loop.
+    if left_one_row {
+        let plan = joincost::cheapest_nest_loop_left_semi(
+            a.scan,
+            b.scan,
+            costsize::CPU_OPERATOR_COST * (1.0 + filter.ops + a.key_ops + b.key_ops),
+            semi(&b, unique_b),
+        );
+        let nest = (plan.startup, plan.total);
+        let replaced =
+            [(startup, total), (l_startup, l_total)]
+                .into_iter()
+                .any(|hash| match better(hash, nest, 1.01) {
+                    Some(w) => w,
+                    None => better(hash, nest, 1.000_000_000_1) == Some(true),
+                });
+        if !replaced {
+            return Some((
+                a.scan,
+                b.scan,
+                (plan.startup, plan.total, rows, width),
+                JoinPick::Nest { plan },
+                [a.index.clone(), b.index.clone()],
+            ));
+        }
+        // A hash path won, but the unique key's other paths are not
+        // weighed over a redundant clause.
+        if unique_key {
+            return None;
+        }
+    }
     let nest = joincost::cheapest_nest_loop_semi(
         a.scan,
         b.scan,
@@ -9294,6 +9341,12 @@ pub(crate) enum JoinPick {
     NestParam {
         b_outer: bool,
         index_only: bool,
+    },
+    /// A LEFT join's nested loop over the two scans, the preserved side
+    /// outer and the ON its join filter (RP-1103): the plain inner, or a
+    /// Material of it.
+    Nest {
+        plan: secantus_pgplan::joincost::NestLoopPlan,
     },
 }
 
