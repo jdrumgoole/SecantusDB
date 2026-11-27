@@ -3179,6 +3179,49 @@ Measured on PostgreSQL 15.20; neither needs objects. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp1089.py::test_create_rule_missing_relation_unpositioned
       Backlog-ID: RP-1217
 
+## Found while working RP-1085 (2026-11-27)
+
+Measured on a private PostgreSQL 15.20 cluster after `create schema s85x`.
+The gap tests are in `tests/backlog/test_rp_found_rp1085.py`.
+
+- [ ] **Renaming a domain outside `public` does nothing, and says it
+      worked.** `create domain s85x.dd as int; alter domain s85x.dd rename
+      to ddb` answers `ALTER DOMAIN` and leaves the domain named `dd`, so a
+      following `drop domain s85x.ddb` is 42704. On PostgreSQL 15.20 the
+      domain is `s85x.ddb`. An enum in the same schema renames correctly.
+      Verify: tests/backlog/test_rp_found_rp1085.py::test_rename_non_public_domain
+      Backlog-ID: RP-1218
+- [ ] **A bare type name in `DROP TYPE` reaches `public` when the path does
+      not.** After `create type public.pub85x as enum ('a'); set
+      search_path = s85x`, `drop type if exists pub85x` drops
+      `public.pub85x` here; on PostgreSQL 15.20 it is a notice (`type
+      "pub85x" does not exist, skipping`), `drop type pub85x` is 42704, and
+      the type survives. An unqualified name is stored under its bare key,
+      which the DDL lookups reach without asking whether `public` is on the
+      path (`LookupTypeName` searches only the path).
+      Verify: tests/backlog/test_rp_found_rp1085.py::test_bare_drop_type_misses_public_off_path
+      Backlog-ID: RP-1219
+- [ ] **A schema's types do not share one name space across kinds.**
+      `create domain s85x.dup as int` then `create type s85x.dup as enum
+      ('x')` (or `as (a int)`), and an enum `s85x.dup2` then `create domain
+      s85x.dup2`, are each made here; on PostgreSQL 15.20 each is 42710
+      `type "dup" already exists` (`pg_type`'s unique index on `(typname,
+      typnamespace)`). The cross-kind check runs only for an unqualified
+      name in `public` (`CreateEnum` / `CreateComposite` in `lib.rs`).
+      Verify: tests/backlog/test_rp_found_rp1085.py::test_type_name_unique_across_kinds_in_schema
+      Backlog-ID: RP-1220
+- [ ] **A `pg_catalog` written first on the path is not where an
+      unqualified CREATE lands.** After `set search_path = pg_catalog`,
+      `create type zz85x as enum ('a')` is made in `pg_catalog` on
+      PostgreSQL 15.20 (as superuser) and `create table zt85x (a int)` is
+      42501 `permission denied to create "pg_catalog.zt85x"`; here both are
+      3F000 `no schema has been selected to create in`, and with
+      `pg_catalog, public` the type goes to `public`. `creation_schema`
+      (`schemas.rs`) skips `pg_catalog` wherever it stands, where
+      `recomputeNamespacePath` skips only the implicitly added one.
+      Verify: tests/backlog/test_rp_found_rp1085.py::test_explicit_pg_catalog_is_creation_namespace
+      Backlog-ID: RP-1222
+
 ## Found while working RP-1048 (2026-11-25)
 
 Measured on PostgreSQL 15.20 with `create domain pint48 as int check (value
@@ -3186,16 +3229,6 @@ Measured on PostgreSQL 15.20 with `create domain pint48 as int check (value
 `create table t48 (p pint48, a dia48)` and `create table t48v (x vd48[])`.
 The gap tests are in `tests/backlog/test_rp_found_rp1048.py`.
 
-- [ ] **A user type created unqualified under a non-public `search_path`
-      is created in `public`.** After `create schema s48; set search_path =
-      s48`, `create domain d48 as int`, `create type c48 as (a int)` and
-      `create type e48 as enum ('a')` are each in `s48` on PostgreSQL 15.20
-      (the creation namespace is the path's first schema,
-      `QualifiedNameGetCreationNamespace`); here all three are in `public`,
-      and `create table tt48 (d d48, c c48, e e48)` is then 42704 `type
-      "d48" does not exist`. A table and a sequence go to `s48` correctly.
-      Verify: tests/backlog/test_rp_found_rp1048.py::test_type_created_in_search_path_schema
-      Backlog-ID: RP-1085
 
 ## Found while working RP-534 (2026-11-08)
 

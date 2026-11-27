@@ -3,7 +3,7 @@ column an `INSERT ... SELECT` wrote to a domain-array column was accepted):
 RP-1083 (a 42804 assignment error named a domain column by its base type; fixed),
 RP-1084 (a value too long for a `varchar(n)` domain was stored in an array
 of that domain; fixed) and RP-1085 (a user type created unqualified under a
-non-public `search_path` is created in `public`).
+non-public `search_path` was created in `public`; fixed).
 
 An answer is the command tag for a statement that returns no rows, or
 `(sqlstate, message, position)` for an error. The expected answers were
@@ -24,6 +24,7 @@ from tests.backlog.test_rp_batch26 import _dsn
 _DROP = [
     "set search_path = public",
     "drop schema if exists s48 cascade",
+    "drop schema if exists s48r cascade",
     "drop table if exists t48, t48v, tt48 cascade",
     "drop type if exists c48, e48 cascade",
     "drop domain if exists pint48, dia48, vd48, d48 cascade",
@@ -148,9 +149,10 @@ def test_domain_array_element_length(dsn: str) -> None:
     }
 
 
-@pytest.mark.backlog("RP-1085")
+@pytest.mark.backlog_fixed("RP-1085")
 def test_type_created_in_search_path_schema(dsn: str) -> None:
-    """The creation namespace of an unqualified name is the path's first schema."""
+    """The creation namespace of an unqualified name was `public` whatever
+    the path; it is now the path's first schema."""
     with psycopg.connect(dsn, autocommit=True) as c:
         for q in _DROP:
             c.execute(q)
@@ -175,3 +177,69 @@ def test_type_created_in_search_path_schema(dsn: str) -> None:
         [("c48", "s48"), ("d48", "s48"), ("e48", "s48")],
         "CREATE TABLE",
     )
+
+
+# Each statement after `create schema s48r; set search_path = s48r`, as
+# PostgreSQL 15.20 answers it: every unqualified type lands in `s48r`, a
+# bare name in a DROP / ALTER / COMMENT finds it through the path, and a
+# path with no usable schema has nowhere to create.
+_ROUND_TRIP = [
+    ("create domain d48r as int check (value > 0)", "CREATE DOMAIN"),
+    ("create type c48r as (a int)", "CREATE TYPE"),
+    ("create type e48r as enum ('a', 'b')", "CREATE TYPE"),
+    ("create type r48r as range (subtype = int4)", "CREATE TYPE"),
+    ("create type sh48r", "CREATE TYPE"),
+    (
+        "select string_agg(typname || ':' || typnamespace::regnamespace, ',' order by typname)"
+        " from pg_type where typname in ('d48r', 'c48r', 'e48r', 'r48r', 'sh48r')",
+        [("c48r:s48r,d48r:s48r,e48r:s48r,r48r:s48r,sh48r:s48r",)],
+    ),
+    ("create domain d48r as text", ("42710", 'type "d48r" already exists', None)),
+    ("alter domain d48r set not null", "ALTER DOMAIN"),
+    ("comment on domain d48r is 'x'", "COMMENT"),
+    ("alter type e48r add value 'c'", "ALTER TYPE"),
+    ("comment on type e48r is 'x'", "COMMENT"),
+    ("alter type c48r add attribute b text", "ALTER TYPE"),
+    ("alter type e48r rename to e48rb", "ALTER TYPE"),
+    ("alter type e48rb owner to postgres", "ALTER TYPE"),
+    ("select 'c'::s48r.e48rb::text", [("c",)]),
+    ("drop type e48rb", "DROP TYPE"),
+    ("drop type c48r", "DROP TYPE"),
+    ("drop type r48r", "DROP TYPE"),
+    ("drop type sh48r", "DROP TYPE"),
+    ("drop domain d48r", "DROP DOMAIN"),
+    ("drop type if exists e48rb", "DROP TYPE"),
+    ("select count(*) from pg_type where typnamespace = 's48r'::regnamespace", [(0,)]),
+    ("set search_path = nosuch48r", "SET"),
+    (
+        "create type e48rn as enum ('a')",
+        ("3F000", "no schema has been selected to create in", None),
+    ),
+    ("create domain d48rn as int", ("3F000", "no schema has been selected to create in", None)),
+    ("set search_path = nosuch48r, s48r", "SET"),
+    ("create type e48rn as enum ('a')", "CREATE TYPE"),
+    (
+        "select typnamespace::regnamespace::text from pg_type where typname = 'e48rn'",
+        [("s48r",)],
+    ),
+    ("drop type e48rn", "DROP TYPE"),
+]
+
+
+@pytest.mark.backlog_fixed("RP-1085")
+def test_search_path_type_round_trip(dsn: str) -> None:
+    """A type made under a non-public path is found there by every DDL
+    statement that names it bare, as `LookupTypeName` finds it."""
+    got = []
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _DROP:
+            c.execute(q)
+        c.execute("create schema s48r")
+        c.execute("set search_path = s48r")
+        for q, _ in _ROUND_TRIP:
+            try:
+                cur = c.execute(q)
+                got.append(cur.fetchall() if cur.description else cur.statusmessage)
+            except psycopg.Error as e:
+                got.append((e.sqlstate, e.diag.message_primary, e.diag.statement_position))
+    assert list(zip([q for q, _ in _ROUND_TRIP], got, strict=True)) == _ROUND_TRIP

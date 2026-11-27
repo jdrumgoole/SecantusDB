@@ -6897,16 +6897,26 @@ fn plan_node(
                 .typevar
                 .as_ref()
                 .ok_or_else(|| Error::Parse("CREATE TYPE without a name".into()))?;
+            // An unqualified name lands in the path's first schema
+            // (`QualifiedNameGetCreationNamespace`), as a table's does.
+            let written = if typevar.schemaname.is_empty() {
+                match schemas::creation_schema()?.as_str() {
+                    "public" => String::new(),
+                    s => s.to_string(),
+                }
+            } else {
+                typevar.schemaname.clone()
+            };
             // A grammar spelling (`int`) is kept quoted (`user_type_name`).
-            let name = if matches!(typevar.schemaname.as_str(), "" | "public") {
+            let name = if matches!(written.as_str(), "" | "public") {
                 pgtypes::user_type_key(&typevar.relname)
             } else {
                 typevar.relname.clone()
             };
-            let schema = if typevar.schemaname.is_empty() {
+            let schema = if written.is_empty() {
                 None
             } else {
-                Some(typevar.schemaname.clone())
+                Some(written)
             };
             let mut fields = Vec::new();
             let mut typmods = Vec::new();
@@ -6939,7 +6949,7 @@ fn plan_node(
             // Keep the schema qualifier: `CREATE TYPE s.t AS ENUM` is a distinct
             // type from a bare `t`. Dropping it (a bare `.next_back()`) collided
             // the two.
-            let (schema, name) = split_qualified_type_name(&e.type_name)?;
+            let (schema, name) = creation_type_name(&e.type_name)?;
             let labels = e
                 .vals
                 .iter()
@@ -6959,7 +6969,7 @@ fn plan_node(
             // Keep the schema qualifier: `CREATE TYPE s.t AS RANGE` is a distinct
             // type from a bare `t`. Dropping it (a bare `.next_back()`) collided
             // the two.
-            let (schema, name) = split_qualified_type_name(&r.type_name)?;
+            let (schema, name) = creation_type_name(&r.type_name)?;
             // The subtype is a DefElem `subtype = <type>`; its arg is a TypeName.
             let subtype = r
                 .params
@@ -7505,6 +7515,29 @@ fn plan_node(
     }
 }
 
+/// The `(schema, name)` a `CREATE TYPE` / `CREATE DOMAIN` makes: as
+/// `split_qualified_type_name`, but an unqualified name lands in the search
+/// path's first usable schema (`QualifiedNameGetCreationNamespace`), so
+/// after `set search_path = s` a bare `create type t` is `s.t`. `None` is
+/// still `public`; no usable schema on the path is 3F000.
+fn creation_type_name(names: &[pg_query::protobuf::Node]) -> Result<(Option<String>, String)> {
+    let (schema, name) = split_qualified_type_name(names)?;
+    let bare = names.len() == 1;
+    if !bare {
+        return Ok((schema, name));
+    }
+    let target = schemas::creation_schema()?;
+    if target == "public" {
+        return Ok((None, name));
+    }
+    // The bare spelling, as a qualified name keeps it (`user_type_key`
+    // quotes only a name `public` would confuse with a grammar alias).
+    Ok((
+        Some(target),
+        pgtypes::user_type_catalog_name(&name).to_string(),
+    ))
+}
+
 /// Split a possibly schema-qualified `CREATE TYPE` name (the statement's
 /// `type_name` node list) into `(schema, bare_name)`. An unqualified name -- or
 /// one explicitly in `public` -- yields `None`, so it registers under its bare
@@ -7624,7 +7657,7 @@ fn type_attr_bool(e: &pg_query::protobuf::DefElem) -> Result<bool> {
 /// like = t)` (a base type over its shell). Both arrive as a `DefineStmt` of
 /// kind OBJECT_TYPE; an empty option list is the shell form.
 fn plan_define_type(d: &pg_query::protobuf::DefineStmt) -> Result<Statement> {
-    let (schema, name) = split_qualified_type_name(&d.defnames)?;
+    let (schema, name) = creation_type_name(&d.defnames)?;
     if d.definition.is_empty() {
         return Ok(Statement::CreateShellType { name, schema });
     }
