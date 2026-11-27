@@ -3177,14 +3177,6 @@ Measured on PostgreSQL 15.19. The gap tests are in
 `tests/backlog/test_rp_found_rp1050.py`; the `INSERT` one uses
 `test_rp_found_rp552.py`'s `tct (c ctp, d pint[])`.
 
-- [ ] **`INSERT ... SELECT` checks the column assignment before the set
-      operation's types.** `insert into tct(c) select null::text union
-      select 1` is 42804 `UNION types text and integer cannot be matched`
-      at 51 on PostgreSQL 15.19 (parse analysis of the query comes before
-      `transformInsertStmt` coerces its targets); here it is 42804 `column
-      "c" is of type ctp but expression is of type text` at 27.
-      Verify: tests/backlog/test_rp_found_rp1050.py::test_insert_select_set_op_types_before_assignment
-      Backlog-ID: RP-1088
 - [ ] **A set operation's unmatched types are not refused by `EXPLAIN` or
       `PREPARE`.** `explain select null::text union select 1` and `prepare p
       as select null::text union select 1` are 42804 `UNION types text and
