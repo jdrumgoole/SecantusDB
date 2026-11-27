@@ -78,13 +78,15 @@ def _after_pushed_group(client: Any) -> list:
     )
 
 
-@pytest.mark.backlog("RM-638")
+@pytest.mark.backlog_fixed("RM-638")
 def test_a_project_after_a_pushed_down_group_builds_its_documents(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """Behind a `$group` mongod 8.2.11 runs in SBE, its inclusion
     `$project` builds each document it returns, and the `$sort` after it
-    counts 2450 bytes over ten groups."""
+    counts 2450 bytes over ten groups. This server counted the BSON each
+    encodes, 1170, until RM-638 kept SBE's built storage for the stages
+    behind the `$group`."""
     assert _after_pushed_group(rust_mongo) == _after_pushed_group(mongod)
 
 

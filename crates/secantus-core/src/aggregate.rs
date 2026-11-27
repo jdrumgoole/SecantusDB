@@ -467,6 +467,20 @@ pub fn apply_pipeline(
         if stores.is_none() && changes && counts_storage(&pipeline[i + 1..]) {
             stores = Some(read_stores(&docs));
         }
+        // The groups an SBE `$group` hands back are built field by field
+        // (`docstore::sbe_built`): a modelled stage behind it changes that
+        // storage, not BSON read (RM-638). A `$sort` right behind it sizes
+        // them itself (`after_sbe_group`).
+        if stores.is_none()
+            && name == crate::sbe::ENGINE_STAGE
+            && after_sbe_group(&pipeline[..=i])
+            && pipeline
+                .get(i + 1)
+                .is_some_and(|st| !counts_storage(std::slice::from_ref(st)))
+            && counts_storage(&pipeline[i + 1..])
+        {
+            stores = Some(docs.iter().map(docstore::sbe_built).collect());
+        }
         if !modelled {
             stores = None;
         }

@@ -1149,15 +1149,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Rust server". Found 2026-11-23 (RM-634).
       Verify: tests/backlog/test_rm_found_rm634.py::test_an_unpushed_sort_key_read_with_no_sort_is_empty
       Backlog-ID: RM-766
-- [ ] **A `$project` behind a `$group` pushed into SBE is sized as if it
-      were read.** `[{$group: {_id: "$n", c: {$sum: 1}}}, {$project: {c:
-      1}}, {$sort: {c: 1}}]`: mongod 8.2.11's `$project` builds each
-      document (a `MutableDocument` with room for its two fields), and the
-      `$sort` counts 2450 bytes over ten groups; this server counts the
-      BSON each encodes, 1170, as it keeps no storage behind an SBE
-      `$group`. Found 2026-11-13 (RM-519).
-      Verify: tests/backlog/test_rm_found_rm519.py::test_a_project_after_a_pushed_down_group_builds_its_documents
-      Backlog-ID: RM-638
 - [ ] **A `$sort` behind a `$setWindowFields` that sorted by the same key
       is kept.** `[{$unwind: "$t"}, {$set: {w: 1}}, {$setWindowFields:
       {sortBy: {n: 1}, ...}}, {$sort: {n: 1}}]`: mongod 8.2.11 drops the
