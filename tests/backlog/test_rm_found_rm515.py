@@ -35,12 +35,12 @@ def _array_sizes(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-636")
+@pytest.mark.backlog_fixed("RM-636")
 def test_an_arrays_documents_a_stage_touched_are_sized_by_their_storage(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """mongod 8.2.11 gives each document in an array a cache of its own when
     a stage reads (`$t.y`) or writes (`t.w`) a field through the array, and
     the window's sort and cache count it: (236000, 259600) and (279200,
-    302800) bytes over 200 documents."""
+    302800) bytes over 200 documents. This server did not until RM-636."""
     assert _array_sizes(rust_mongo) == _array_sizes(mongod)

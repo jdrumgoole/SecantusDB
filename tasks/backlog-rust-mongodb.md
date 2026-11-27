@@ -1144,17 +1144,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Rust server". Found 2026-11-23 (RM-634).
       Verify: tests/backlog/test_rm_found_rm634.py::test_an_unpushed_sort_key_read_with_no_sort_is_empty
       Backlog-ID: RM-766
-- [ ] **A document inside an array a stage reads or writes into is sized
-      as if it were read.** mongod 8.2.11 gives each document in an array a
-      cache of its own when a stage reads a field through the array
-      (`$addFields: {q: "$t.y"}`) or sets one (`$set: {"t.w": 1}`), and the
-      sort and window behind count it: (236000, 259600) and (279200, 302800)
-      bytes over 200 documents of `t: [1, <30 bytes>, {q: 1, y: <50 bytes>}]`.
-      This server's storage model (`docstore`) follows a sub-document's
-      storage since RM-515, but not an array's elements: (195600, 219200)
-      and (206600, 230200). Found 2026-11-13 (RM-515).
-      Verify: tests/backlog/test_rm_found_rm515.py::test_an_arrays_documents_a_stage_touched_are_sized_by_their_storage
-      Backlog-ID: RM-636
 - [ ] **A `$sort` behind an exclusion `$project` counts each document
       as the BSON it encodes.** mongod 8.2.11's exclusion `$project` keeps
       the input's own storage and writes each excluded field out of it,
