@@ -349,12 +349,39 @@ fn stage(st: &Stage, level: usize, lines: &mut Vec<String>) {
             high,
             index,
             uuid,
+            fetch,
             ..
         } => {
+            let opt = |s: Option<u32>| s.map_or("none".to_string(), |s| format!("s{s}"));
+            push(
+                lines,
+                level,
+                format!(
+                    "[{node}] ixseek {} {} {} s{record_id} {} {} [] @\"{uuid}\" @\"{index}\" true ",
+                    key_string(low),
+                    key_string(high),
+                    opt(fetch.map(|f| f.0)),
+                    opt(fetch.map(|f| f.1)),
+                    opt(fetch.map(|f| f.2)),
+                ),
+            );
+        }
+        Stage::Seek {
+            node,
+            seek_record_id,
+            record,
+            record_id,
+            snapshot,
+            ident,
+            key,
+            key_pattern,
+            fields,
+            uuid,
+        } => {
+            let fields: Vec<String> = fields.iter().map(|(n, s)| format!("s{s} = {n}")).collect();
             push(lines, level, format!(
-                "[{node}] ixseek {} {} none s{record_id} none none [] @\"{uuid}\" @\"{index}\" true ",
-                key_string(low),
-                key_string(high)
+                "[{node}] seek s{seek_record_id} s{record} s{record_id} s{snapshot} s{ident} s{key} s{key_pattern} none none [{}] @\"{uuid}\" true false ",
+                fields.join(", ")
             ));
         }
         Stage::Scan {
@@ -611,33 +638,56 @@ pub(super) fn stages(root: &Stage) -> String {
     text
 }
 
-/// What the scans under a stage read, and how many there are: a join's
-/// `totalDocsExamined` and `collectionScans`.
-fn tally(stage: &Stage, counted: &Counted) -> (i64, i64) {
-    let mut docs = 0;
-    let mut scans = 0;
-    if matches!(stage, Stage::Scan { .. }) {
-        docs += counted.reads;
-        scans += 1;
+/// What the scans and seeks under a join read: its `totalDocsExamined`,
+/// `totalKeysExamined`, `collectionScans`, `collectionSeeks`,
+/// `indexSeeks` and `indexesUsed`.
+#[derive(Default)]
+struct Tally {
+    docs: i64,
+    keys: i64,
+    scans: i64,
+    seeks: i64,
+    index_seeks: i64,
+    indexes: Vec<String>,
+}
+
+fn tally(stage: &Stage, counted: &Counted, t: &mut Tally) {
+    match stage {
+        Stage::Scan { .. } => {
+            t.docs += counted.reads;
+            t.scans += 1;
+        }
+        // A seek of each fetched document (RM-695).
+        Stage::Seek { .. } => {
+            t.docs += counted.reads;
+            t.seeks += counted.reads;
+        }
+        Stage::IxSeek { index, .. } => {
+            t.keys += counted.keys;
+            t.index_seeks += 1;
+            if !t.indexes.contains(index) {
+                t.indexes.push(index.clone());
+            }
+        }
+        _ => {}
     }
     for (input, below) in stage.inputs().into_iter().zip(counted.children()) {
-        let (d, c) = tally(input, below);
-        docs += d;
-        scans += c;
+        tally(input, below, t);
     }
-    (docs, scans)
 }
 
 /// The scan statistics a join stage lists first.
 fn join_stats(stage: &Stage, counted: &Counted, out: &mut Document) {
-    let (docs, scans) = tally(stage, counted);
-    out.insert("totalDocsExamined", super::number(docs));
-    out.insert("totalKeysExamined", 0_i32);
-    out.insert("collectionScans", super::number(scans));
-    out.insert("collectionSeeks", 0_i32);
+    let mut t = Tally::default();
+    tally(stage, counted, &mut t);
+    out.insert("totalDocsExamined", super::number(t.docs));
+    out.insert("totalKeysExamined", super::number(t.keys));
+    out.insert("collectionScans", super::number(t.scans));
+    out.insert("collectionSeeks", super::number(t.seeks));
     out.insert("indexScans", 0_i32);
-    out.insert("indexSeeks", 0_i32);
-    out.insert("indexesUsed", Bson::Array(vec![]));
+    out.insert("indexSeeks", super::number(t.index_seeks));
+    let used: Vec<Bson> = t.indexes.into_iter().map(Bson::String).collect();
+    out.insert("indexesUsed", used);
 }
 
 /// The fields `executionStats` adds for each kind of stage.
@@ -648,19 +698,54 @@ pub(super) fn specific_stats(st: &Stage, counted: &Counted, out: &mut Document) 
             low,
             high,
             index,
+            fetch,
             ..
         } => {
             out.insert("indexName", index.clone());
             out.insert("keysExamined", super::number(counted.keys));
             out.insert("seeks", super::number(counted.seeks));
             out.insert("numReads", super::number(counted.reads));
+            if let Some((key, _, _)) = fetch {
+                out.insert("indexKeySlot", super::number(*key as i64));
+            }
             out.insert("recordIdSlot", super::number(*record_id as i64));
+            if let Some((_, snapshot, ident)) = fetch {
+                out.insert("snapshotIdSlot", super::number(*snapshot as i64));
+                out.insert("indexIdentSlot", super::number(*ident as i64));
+            }
             out.insert("outputSlots", Bson::Array(vec![]));
             // `indexKeysToInclude`: a bitset of the key fields read into
             // slots, none here.
             out.insert("indexKeysToInclude", "0".repeat(32));
             out.insert("seekKeyLow", format!("{} ", key_string(low)));
             out.insert("seekKeyHigh", format!("{} ", key_string(high)));
+        }
+        Stage::Seek {
+            seek_record_id,
+            record,
+            record_id,
+            snapshot,
+            ident,
+            key,
+            key_pattern,
+            fields,
+            ..
+        } => {
+            out.insert("numReads", super::number(counted.reads));
+            out.insert("recordSlot", super::number(*record as i64));
+            out.insert("recordIdSlot", super::number(*record_id as i64));
+            out.insert("seekRecordIdSlot", super::number(*seek_record_id as i64));
+            out.insert("snapshotIdSlot", super::number(*snapshot as i64));
+            out.insert("indexIdentSlot", super::number(*ident as i64));
+            out.insert("indexKeySlot", super::number(*key as i64));
+            out.insert("indexKeyPatternSlot", super::number(*key_pattern as i64));
+            let names: Vec<Bson> = fields
+                .iter()
+                .map(|(n, _)| Bson::String(n.clone()))
+                .collect();
+            let slots: Vec<Bson> = fields.iter().map(|(_, s)| Bson::Int64(*s as i64)).collect();
+            out.insert("scanFieldNames", names);
+            out.insert("scanFieldSlots", slots);
         }
         Stage::Scan {
             record,
