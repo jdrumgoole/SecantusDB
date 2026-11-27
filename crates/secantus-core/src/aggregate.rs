@@ -110,6 +110,24 @@ pub fn apply_pipeline(
         // point every stage passes through, including those (a `$sort`) that
         // are a single call with no per-document loop to poll from.
         deadline::check_now()?;
+        if name == "$unwind"
+            && !pipeline[..i]
+                .iter()
+                .any(|st| stage_name_of(st) == "$unwind")
+        {
+            // A window `$sort` mongod hoists ahead of this `$unwind` sorts
+            // the documents it takes, each then unwound in place (RM-640).
+            if let Some(order) = hoisted_window_order(&docs, pipeline, i, vars)? {
+                let mut taken: Vec<Option<Document>> = docs.into_iter().map(Some).collect();
+                docs = order
+                    .iter()
+                    .map(|&j| taken[j].take().expect("each place once"))
+                    .collect();
+                if let Some(st) = stores.take() {
+                    stores = Some(order.iter().map(|&j| st[j].clone()).collect());
+                }
+            }
+        }
         if name == "$setWindowFields" {
             // mongod runs the stage behind a `$sort` on its partition and
             // `sortBy`, which its budget holds like any other (RM-315).
@@ -147,7 +165,8 @@ pub fn apply_pipeline(
             );
             // A sort mongod hoists ahead of an `$unwind` orders the
             // documents the `$unwind` took, which are not the ones here:
-            // those keep the order they came in (RM-640).
+            // those were sorted there (`hoisted_window_order`) and keep
+            // the order they came in (RM-640).
             let hoisted_past_unwind = !computed
                 && before.iter().any(|st| stage_name_of(st) == "$unwind")
                 && spec.as_document().is_some_and(|s| {
@@ -754,6 +773,86 @@ fn window_sort_budget(
         added: None,
     };
     crate::sorter::blocking_sort_order(items, &cmp, &sizing).map(Some)
+}
+
+/// The order of `docs`, about to reach the first `$unwind` (at `at`), once
+/// sorted by the `$setWindowFields` behind it whose `$sort` mongod 8.2.11
+/// hoists ahead of that `$unwind` (`hoists_to_front`): ties in the build's
+/// `std::sort` order. `None` when no such window follows.
+///
+/// The window's own sort, run on the unwound documents, still holds the
+/// sort budget; a sort that spills merges its runs in an order this one
+/// does not model.
+fn hoisted_window_order(
+    docs: &[Document],
+    pipeline: &[Bson],
+    at: usize,
+    vars: &Vars,
+) -> R<Option<Vec<usize>>> {
+    let Some(k) = pipeline[at..].iter().position(|st| {
+        !matches!(
+            stage_name_of(st),
+            "$match" | "$sort" | "$unwind" | crate::sbe::ENGINE_STAGE
+        )
+    }) else {
+        return Ok(None);
+    };
+    let k = at + k;
+    if stage_name_of(&pipeline[k]) != "$setWindowFields" {
+        return Ok(None);
+    }
+    let Some(spec) = pipeline[k]
+        .as_document()
+        .and_then(|d| d.get_document("$setWindowFields").ok())
+    else {
+        return Ok(None);
+    };
+    let by = spec
+        .get("partitionBy")
+        .filter(|by| !is_constant_expression(by, &[]));
+    if by.is_some_and(
+        |by| !matches!(by, Bson::String(p) if p.starts_with('$') && !p.starts_with("$$")),
+    ) {
+        return Ok(None); // a computed partition: its `$addFields` stays in front
+    }
+    if !hoists_to_front(&pipeline[..k], by, spec.get_document("sortBy").ok()) {
+        return Ok(None);
+    }
+    let sort = match spec.get("sortBy") {
+        Some(Bson::Document(d)) => sort_fields(&Bson::Document(d.clone()))?,
+        _ => Vec::new(),
+    };
+    if by.is_none() && sort.is_empty() {
+        return Ok(None);
+    }
+    let mut keys: Vec<Vec<Bson>> = Vec::with_capacity(docs.len());
+    for d in docs {
+        let mut key = Vec::with_capacity(sort.len() + 1);
+        if let Some(by) = by {
+            key.push(crate::expressions::evaluate(d, by, vars).unwrap_or(Bson::Null));
+        }
+        key.extend(sort_key_values(d, &sort)?);
+        keys.push(key);
+    }
+    let offset = usize::from(by.is_some());
+    let cmp = |a: usize, b: usize| {
+        let (ka, kb) = (&keys[a], &keys[b]);
+        if offset == 1 {
+            let c = order::cmp(&ka[0], &kb[0]);
+            if c != Ordering::Equal {
+                return c;
+            }
+        }
+        for (i, (_, rev)) in sort.iter().enumerate() {
+            let c = order::cmp(&ka[i + offset], &kb[i + offset]);
+            let c = if *rev { c.reverse() } else { c };
+            if c != Ordering::Equal {
+                return c;
+            }
+        }
+        Ordering::Equal
+    };
+    Ok(Some(crate::sorter::std_sort_order(docs.len(), &cmp)))
 }
 
 /// The temporary field a computed `partitionBy` is evaluated into
@@ -2943,8 +3042,8 @@ mod tests {
     /// A `$setWindowFields` takes its documents in the order of the
     /// `$sort` mongod runs it behind, whose `std::sort` reorders ties, not
     /// in the order they came: what `$sort` on the same key gives (RM-527).
-    /// Behind an `$unwind` that sort is mongod's before it, so the documents
-    /// here keep their order (RM-640).
+    /// Behind an `$unwind` mongod runs that sort before it, so each
+    /// document's unwound copies stay together in that order (RM-640).
     #[test]
     fn a_window_takes_ties_in_its_sorts_order() {
         let docs: Vec<Document> = (0..40).map(|i| doc! {"_id": i, "k": i % 3}).collect();
@@ -2980,12 +3079,9 @@ mod tests {
                 }}),
             ],
         ));
-        let mut expected: Vec<i32> = Vec::new();
-        for k in 0..3 {
-            for i in (0..40).filter(|i| i % 3 == k) {
-                expected.extend([i, i]);
-            }
-        }
+        // mongod sorts the documents the `$unwind` takes, each then
+        // unwound in place.
+        let expected: Vec<i32> = sorted.iter().flat_map(|&i| [i, i]).collect();
         assert_eq!(unwound, expected);
     }
 

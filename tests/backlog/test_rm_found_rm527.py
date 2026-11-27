@@ -22,14 +22,14 @@ def _unwound_window_order(client: Any) -> list:
     return [(d["_id"], d["a"]) for d in c.aggregate(pipeline)]
 
 
-@pytest.mark.backlog("RM-640")
+@pytest.mark.backlog_fixed("RM-640")
 def test_window_sort_hoisted_past_unwind_orders_the_source_documents(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """mongod 8.2.11 (macOS) runs the window's `$sort` on `k` before the
     `$unwind` of `a`, so ties come in `std::sort`'s order of the 60 source
     documents, each followed by its second element: (0, 0), (0, 9), (3, 3),
-    (3, 9), (30, 2), (30, 9), .... This server sorts nothing there and
-    returns them in the order read: (0, 0), (0, 9), (3, 3), (3, 9), (6, 2),
-    ...."""
+    (3, 9), (30, 2), (30, 9), .... This server sorted nothing there and
+    returned them in the order read, (6, 2) fifth; it now sorts at the
+    `$unwind` as mongod does (RM-640)."""
     assert _unwound_window_order(rust_mongo) == _unwound_window_order(mongod)
