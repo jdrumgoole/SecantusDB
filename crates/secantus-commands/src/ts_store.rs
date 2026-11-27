@@ -267,6 +267,7 @@ pub(crate) fn insert(
     db: &str,
     coll: &str,
     batches: Vec<Vec<crate::bucket_catalog::Measurement>>,
+    expiry: crate::bucket_catalog::Expiry,
 ) -> Result<std::collections::HashMap<usize, crate::bucket_catalog::Outcome>, CommandError> {
     let Some(layout) = layout_of(storage, db, coll) else {
         return Err(CommandError::new(
@@ -286,6 +287,7 @@ pub(crate) fn insert(
         db,
         coll,
         layout: &layout,
+        expiry,
     };
     let own;
     let catalog = match storage.bucket_catalog() {
@@ -333,7 +335,13 @@ pub(crate) fn insert_or_fail(
         .enumerate()
         .map(|(index, doc)| crate::bucket_catalog::Measurement { index, doc })
         .collect();
-    let outcomes = insert(storage, db, coll, vec![batch])?;
+    let outcomes = insert(
+        storage,
+        db,
+        coll,
+        vec![batch],
+        crate::bucket_catalog::Expiry::default(),
+    )?;
     let mut failed: Vec<(usize, CommandError)> = outcomes
         .into_iter()
         .filter_map(|(i, o)| o.err().map(|e| (i, e)))

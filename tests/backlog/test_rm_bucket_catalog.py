@@ -368,7 +368,7 @@ def test_bucket_catalog_memory_usage_follows_each_write_in_the_exemplar_bytes(
     assert got == want
 
 
-@pytest.mark.backlog("RM-711")
+@pytest.mark.backlog_fixed("RM-711")
 def test_idle_buckets_expire_past_the_memory_threshold(tmp_path: pathlib.Path) -> None:
     """mongod 8.2.11: once the catalog's memory passes
     `timeseriesIdleBucketExpiryMemoryUsageThreshold` (set to 30000 bytes after
@@ -378,7 +378,7 @@ def test_idle_buckets_expire_past_the_memory_threshold(tmp_path: pathlib.Path) -
     in), `numBucketsClosedDueToMemoryThreshold` equals
     `numBucketsArchivedDueToMemoryThreshold` and is at least 1, and every
     bucket document stays stored. Asserted as those facts, not the counts.
-    Needs RM-710 (the accounting) to decide when the threshold is passed."""
+    The accounting (RM-710) decides when the threshold is passed."""
     t = dt.datetime(2026, 1, 1)
 
     def probe(client: Any) -> dict:
@@ -411,6 +411,45 @@ def test_idle_buckets_expire_past_the_memory_threshold(tmp_path: pathlib.Path) -
         "closed_equals_archived": True,
         "all_documents_stored": True,
     }
+    assert got == want
+
+
+@pytest.mark.backlog_fixed("RM-711")
+def test_idle_bucket_expiry_parameters_answer_as_mongod_does(tmp_path: pathlib.Path) -> None:
+    """mongod 8.2.11 (measured 2026-11-27): `getParameter` reports the
+    threshold as the long 5 (a percentage of memory) and the count per
+    attempt as the int 3; `setParameter` of the threshold answers the
+    previous value, coerces a number or a bool to a long (`2.5` is 2, `true`
+    is 1) and refuses a string, null, array or document with 2; the count is
+    startup only (20, "not allowed to change [..] at runtime")."""
+
+    def probe(client: Any) -> dict:
+        admin = client.admin
+        both = {IDLE_THRESHOLD: 1, "timeseriesIdleBucketExpiryMaxCountPerAttempt": 1}
+        got = admin.command("getParameter", 1, **both)
+        out: dict = {
+            "defaults": [
+                (k, type(v).__name__, v)
+                for k, v in sorted(got.items())
+                if k.startswith("timeseries")
+            ]
+        }
+        for v in (30000, 0, -5, 50, 101, 2.5, True, 1 << 40, "x", None, [1], {"a": 1}):
+            try:
+                r = admin.command("setParameter", 1, **{IDLE_THRESHOLD: v})
+                now = admin.command("getParameter", 1, **{IDLE_THRESHOLD: 1})[IDLE_THRESHOLD]
+                out[repr(v)] = ("ok", type(r["was"]).__name__, r["was"], type(now).__name__, now)
+            except pymongo.errors.OperationFailure as e:
+                out[repr(v)] = ("err", e.code, e.details.get("errmsg"))
+        try:
+            admin.command("setParameter", 1, timeseriesIdleBucketExpiryMaxCountPerAttempt=5)
+        except pymongo.errors.OperationFailure as e:
+            out["max count"] = ("err", e.code, e.details.get("errmsg"))
+        return out
+
+    with _fresh_pair(tmp_path) as (rust, ref):
+        got, want = probe(rust), probe(ref)
+    assert want["max count"][1] == 20
     assert got == want
 
 

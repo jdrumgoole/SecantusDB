@@ -886,6 +886,20 @@ fn listed(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
             true,
             Bson::Int32(secantus_auth::DEFAULT_ITERATIONS as i32),
         ),
+        // The idle bucket expiry of the time-series bucket catalog
+        // (`bucket_catalog::expire_idle`): the threshold takes a percentage
+        // of the machine's memory up to 100 and bytes above, and is a
+        // long; the count per attempt is startup only (mongod 8.2.11).
+        (
+            "timeseriesIdleBucketExpiryMaxCountPerAttempt",
+            true,
+            Bson::Int32(3),
+        ),
+        (
+            "timeseriesIdleBucketExpiryMemoryUsageThreshold",
+            true,
+            Bson::Int64(5),
+        ),
         ("transactionLifetimeLimitSeconds", true, Bson::Int32(60)),
         ("ttlMonitorEnabled", true, Bson::Boolean(true)),
         ("ttlMonitorSleepSecs", true, Bson::Int32(60)),

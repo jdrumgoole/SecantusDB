@@ -2171,25 +2171,6 @@ bucket documents in `system.buckets.<name>`, each data field mongod's
 compressed column, placed by mongod's bucket catalog
 (`crates/secantus-commands/src/bucket_catalog.rs`). What is left:
 
-- [ ] **RUST MongoDB server: idle buckets never expire past
-      `timeseriesIdleBucketExpiryMemoryUsageThreshold`.** mongod 8.2.11
-      closes idle buckets (and counts `numBucketsClosedDueToMemoryThreshold`
-      and `numBucketsArchivedDueToMemoryThreshold`, equal) when the catalog's
-      memory passes the threshold (`getParameter` reports 5 by default, a share of the
-      machine's memory; a byte count set at runtime, here after the first
-      write, takes effect) as a bucket is opened for a new metadata
-      value; with it at 30000 bytes, 21 buckets opened for 21 metadata values
-      leave 14 to 17 in the catalog, and every bucket document stays stored.
-      Linux x86-64 mongod 8.2.11 and 8.2.12 (2026-11-26, four runs) leave
-      17, 17, 17 and 15, closing as many as they archive (4, 4, 4, 6), with
-      `memoryUsage` 69648 to 77664 afterwards and all 21 documents stored.
-      Which expire depends on the stripe each lands in, so only the facts
-      are pinned. This server never expires an idle bucket, and refuses the
-      `setParameter` (code 72). The memory accounting that decides when the threshold is passed
-      is built (RM-710), and the expiry counts through the `bucketCatalog` section's counters. (This was part of RM-549, split 2026-11-16, Joe's
-      go-ahead.)
-      Verify: tests/backlog/test_rm_bucket_catalog.py::test_idle_buckets_expire_past_the_memory_threshold
-      Backlog-ID: RM-711
 - [ ] **RUST MongoDB server: `bucketCatalog`'s open and archived counts
       split differently from mongod's.** mongod 8.2.11 reports
       `numOpenBuckets` from its stripes' open buckets and

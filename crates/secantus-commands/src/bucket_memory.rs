@@ -1006,6 +1006,9 @@ pub(crate) struct MemState {
     stats: Table,
     stats_n: usize,
     buckets: i64,
+    /// Where the stripes' idle lists' order comes from: each bucket marked
+    /// idle takes the next number (`push_front`), the oldest is the lowest.
+    idle_clock: u64,
 }
 
 impl Default for MemState {
@@ -1014,17 +1017,20 @@ impl Default for MemState {
     }
 }
 
-/// The stripe a series falls in (`key.hash % stripes.size()`): a hash of the
-/// collection and the series, as the key's own hash is (`mongod`'s is seeded
-/// at random for each process).
-pub(crate) fn stripe_of(uuid: &[u8], series: &[u8]) -> usize {
+/// `BucketKey::hash`: a hash of the collection and the series (`mongod`'s is
+/// Abseil's, seeded at random for each process).
+pub(crate) fn key_hash(uuid: &[u8], series: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in uuid.iter().chain(series) {
         h ^= u64::from(*b);
         h = h.wrapping_mul(0x0100_0000_01b3);
     }
-    h ^= h >> 32;
-    (h % STRIPES as u64) as usize
+    h ^ (h >> 32)
+}
+
+/// The stripe a series falls in (`key.hash % stripes.size()`).
+pub(crate) fn stripe_of(uuid: &[u8], series: &[u8]) -> usize {
+    (key_hash(uuid, series) % STRIPES as u64) as usize
 }
 
 impl MemState {
@@ -1037,7 +1043,14 @@ impl MemState {
             stats: Table::new(8, 8),
             stats_n: 0,
             buckets: 0,
+            idle_clock: 0,
         }
+    }
+
+    /// The place of a bucket just marked idle in its stripe's idle list.
+    pub(crate) fn next_idle(&mut self) -> u64 {
+        self.idle_clock += 1;
+        self.idle_clock
     }
 
     /// `memoryUsage`.

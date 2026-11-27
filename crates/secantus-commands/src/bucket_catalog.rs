@@ -33,8 +33,11 @@
 //! The catalog's memory (`serverStatus`'s `bucketCatalog.memoryUsage`) is
 //! the bytes `mongod`'s tracking allocators charge for its structures,
 //! kept by `bucket_memory` as the exemplar (Linux x86-64) lays them out.
-//! Not modelled yet: closing idle buckets when that memory passes
-//! `timeseriesIdleBucketExpiryMemoryUsageThreshold` (RM-711).
+//! When that memory passes `timeseriesIdleBucketExpiryMemoryUsageThreshold`
+//! a bucket opened in a stripe first expires the stripe's idle buckets
+//! (`expireIdleBuckets`): the oldest idle ones are archived, then archived
+//! ones closed, at most `timeseriesIdleBucketExpiryMaxCountPerAttempt` + 1
+//! of them.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
@@ -44,7 +47,7 @@ use bson::spec::BinarySubtype;
 use bson::{doc, Binary, Bson, Document};
 use secantus_core::bsoncolumn::{ColumnBuilder, Element};
 
-use crate::bucket_memory::{metadata_bytes, stripe_of, BucketMem, BucketView, MemState};
+use crate::bucket_memory::{key_hash, metadata_bytes, stripe_of, BucketMem, BucketView, MemState};
 use crate::storage::Storage;
 use crate::ts_buckets::{fold, Layout, Schema};
 use crate::CommandError;
@@ -279,6 +282,9 @@ struct Bucket {
     max: Document,
     /// What the bucket's structures allocate (`bucket_memory`).
     mem: BucketMem,
+    /// The bucket's place in its stripe's idle list, when it is on it
+    /// (`idleListEntry`).
+    idle_since: Option<u64>,
     /// This operation's measurements for the bucket: `(input index, doc)`.
     staged: Vec<(usize, Document)>,
     staged_estimate: i32,
@@ -289,10 +295,7 @@ struct Bucket {
 impl Bucket {
     /// Count the bucket's structures again.
     fn refresh_mem(&mut self, mem: &mut MemState) {
-        let idle = self.committed > 0
-            && self.count == self.committed
-            && self.staged.is_empty()
-            && self.rollover == Reason::None;
+        let idle = self.idle_since.is_some();
         let view = BucketView {
             field_names: &self.field_names,
             uncommitted: &self.uncommitted_field_names,
@@ -552,6 +555,44 @@ fn cache_derived_max_size(cache_bytes: u64, active: i64) -> (i32, i32) {
 struct Env<'a> {
     layout: &'a Layout,
     cache_bytes: u64,
+    expiry: Expiry,
+}
+
+/// What the idle bucket expiry reads: the parameters
+/// `timeseriesIdleBucketExpiryMemoryUsageThreshold` (a percentage of the
+/// machine's memory up to 100, bytes above, the default when not positive)
+/// and `timeseriesIdleBucketExpiryMaxCountPerAttempt`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Expiry {
+    pub threshold: i64,
+    pub max_count: i64,
+}
+
+impl Default for Expiry {
+    fn default() -> Self {
+        Expiry {
+            threshold: 5,
+            max_count: 3,
+        }
+    }
+}
+
+impl Expiry {
+    /// `getTimeseriesIdleBucketExpiryMemoryUsageThresholdBytes`.
+    fn bytes(&self) -> i64 {
+        let value = if self.threshold <= 0 {
+            5
+        } else {
+            self.threshold
+        };
+        if value <= 100 {
+            // `getSystemMemSizeMB() * value * 10485`: about a percent.
+            return crate::hostinfo::mem_size_mb().map_or(i64::MAX, |mb| {
+                mb.saturating_mul(value).saturating_mul(10485)
+            });
+        }
+        value
+    }
 }
 
 /// `determineRolloverReason`. Takes the measurement into the bucket's
@@ -626,6 +667,7 @@ pub(crate) struct Target<'a> {
     /// The time-series collection's name.
     pub coll: &'a str,
     pub layout: &'a Layout,
+    pub expiry: Expiry,
 }
 
 impl Target<'_> {
@@ -667,6 +709,7 @@ pub(crate) fn insert(
     let env = Env {
         layout: target.layout,
         cache_bytes: target.storage.storage_cache_bytes(),
+        expiry: target.expiry,
     };
     let mut outcomes = HashMap::new();
     let mut inner = catalog.lock();
@@ -1014,7 +1057,11 @@ fn find_open_bucket(
         };
         let reason = coll.open[at].rollover;
         match action(reason) {
-            Action::None => none_bucket = Some(id),
+            Action::None => {
+                none_bucket = Some(id);
+                // `markBucketNotIdle`.
+                coll.open[at].idle_since = None;
+            }
             Action::HardClose => {
                 roll_over(coll, global, mem, at, reason);
                 decide_query(reason, allow_query);
@@ -1082,6 +1129,8 @@ fn allocate(
     m: &Measurement,
     t: i64,
 ) -> usize {
+    // `expireIdleBuckets`, before the bucket is made.
+    expire_idle(inner, stripe_of(uuid, key), env.expiry);
     let rounding = env.layout.rounding_ms;
     let rounded = t.div_euclid(rounding) * rounding;
     inner.id_counter = inner.id_counter.wrapping_add(1);
@@ -1139,10 +1188,99 @@ fn allocate(
         new_field_names: Vec::new(),
         opened_due_to_metadata: false,
         mem: bucket_mem,
+        idle_since: None,
     });
     let at = coll.open.len() - 1;
     open_counted(coll, mem, at);
     at
+}
+
+/// `expireIdleBuckets`: while the catalog's memory is over the threshold and
+/// fewer than `max_count + 1` buckets have expired, the stripe's oldest idle
+/// bucket is archived (closed, when one with its key and window is already
+/// archived), then its archived buckets closed, greatest key first.
+fn expire_idle(inner: &mut Inner, stripe: usize, expiry: Expiry) {
+    let limit = expiry.bytes();
+    let mut expired = 0i64;
+    while expired <= expiry.max_count && inner.mem.total() > limit {
+        let oldest = inner
+            .collections
+            .iter()
+            .flat_map(|(u, c)| {
+                c.open
+                    .iter()
+                    .filter(|b| b.mem.stripe == stripe)
+                    .filter_map(move |b| b.idle_since.map(|since| (since, u.clone(), b.id)))
+            })
+            .min();
+        let Some((_, owner, id)) = oldest else {
+            break;
+        };
+        let Inner {
+            collections,
+            global,
+            mem,
+            ..
+        } = inner;
+        let Some(coll) = collections.get_mut(&owner) else {
+            break;
+        };
+        let Some(at) = coll.open.iter().position(|b| b.id == id) else {
+            break;
+        };
+        // `archiveBucket`: the bucket leaves the open set and stays active
+        // as an archived one, or closes when its slot is taken.
+        let bucket = close_open(coll, mem, at);
+        let slot = (bucket.key.clone(), bucket.min_time);
+        if let std::collections::btree_map::Entry::Vacant(e) = coll.archived.entry(slot) {
+            e.insert(bucket.id);
+            mem.archived_added(bucket.mem.stripe);
+        } else {
+            coll.stats.0[Stat::ActiveBuckets as usize] -= 1;
+            global.0[Stat::ActiveBuckets as usize] -= 1;
+        }
+        let mut stats = StatsRef {
+            coll: &mut coll.stats,
+            global,
+        };
+        stats.inc(Stat::ArchivedDueToMemoryThreshold);
+        expired += 1;
+    }
+    while expired <= expiry.max_count && inner.mem.total() > limit {
+        let first = inner
+            .collections
+            .iter()
+            .flat_map(|(u, c)| {
+                c.archived
+                    .keys()
+                    .filter(|(key, _)| stripe_of(u, key) == stripe)
+                    .map(move |(key, time)| (u.clone(), key_hash(u, key), *time, key.clone()))
+            })
+            .max();
+        let Some((owner, _, time, key)) = first else {
+            break;
+        };
+        let Inner {
+            collections,
+            global,
+            mem,
+            ..
+        } = inner;
+        let Some(coll) = collections.get_mut(&owner) else {
+            break;
+        };
+        // `closeArchivedBucket`.
+        if coll.archived.remove(&(key, time)).is_some() {
+            mem.archived_removed(stripe);
+        }
+        let mut stats = StatsRef {
+            coll: &mut coll.stats,
+            global,
+        };
+        stats.add(Stat::ActiveBuckets, -1);
+        stats.inc(Stat::ClosedDueToMemoryThreshold);
+        expired += 1;
+    }
 }
 
 /// A bucket just pushed onto the open set joins the memory account.
@@ -1226,6 +1364,30 @@ fn reopen(
         return Ok(None);
     };
     *opened_due_to_metadata = false;
+    let bucket = {
+        let Inner {
+            collections,
+            global,
+            mem,
+            ..
+        } = &mut *inner;
+        let coll = coll_of(collections, mem, uuid);
+        let mut stats = StatsRef {
+            coll: &mut coll.stats,
+            global,
+        };
+        let Some(bucket) = rehydrate(&found, uuid, key, env.layout, &coll.frozen, &mut stats)
+        else {
+            return Ok(None);
+        };
+        if coll.open.iter().any(|b| b.id == bucket.id) {
+            stats.inc(Stat::DuplicateReopened);
+            return Ok(None);
+        }
+        bucket
+    };
+    // `loadBucketIntoCatalog` starts with `expireIdleBuckets`.
+    expire_idle(inner, bucket.mem.stripe, env.expiry);
     let Inner {
         collections,
         global,
@@ -1237,14 +1399,6 @@ fn reopen(
         coll: &mut coll.stats,
         global,
     };
-    let Some(bucket) = rehydrate(&found, uuid, key, env.layout, &coll.frozen, &mut stats) else {
-        return Ok(None);
-    };
-    if coll.open.iter().any(|b| b.id == bucket.id) {
-        stats.inc(Stat::DuplicateReopened);
-        return Ok(None);
-    }
-    // `loadBucketIntoCatalog`.
     let slot = (key.to_vec(), bucket.min_time);
     if coll.archived.remove(&slot).is_some() {
         stats.add(Stat::ActiveBuckets, -1);
@@ -1519,6 +1673,7 @@ fn rehydrate(
         new_field_names: Vec::new(),
         opened_due_to_metadata: false,
         mem: bucket_mem,
+        idle_since: None,
     })
 }
 
@@ -1754,6 +1909,10 @@ fn commit(
             for (index, _) in &staged {
                 outcomes.insert(*index, Ok(()));
             }
+            // `markBucketIdle`.
+            bucket.idle_since = (bucket.rollover == Reason::None
+                && bucket.count == bucket.committed)
+                .then(|| mem.next_idle());
             bucket.refresh_mem(mem);
             let reason = bucket.rollover;
             if action(reason) != Action::None {
