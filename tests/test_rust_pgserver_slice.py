@@ -11853,6 +11853,70 @@ def test_set_operation_type_rules(home: Path) -> None:
         )
 
 
+def test_insert_select_set_operation_types_come_first(home: Path) -> None:
+    """`INSERT ... SELECT` over a set operation analyses the query before it
+    assigns the columns, as PostgreSQL's parse analysis does: the UNION's
+    own 42804 comes before the column's, and a set operation PostgreSQL
+    accepts still writes (RP-1088; answers measured on PostgreSQL 15.20)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table p88 (i int, t text, ia int[])")
+        conn.execute("create table s88 (i int, t text)")
+        conn.execute("insert into s88 values (1, 'x')")
+        for sql, want in [
+            (
+                "insert into p88(i) select t from s88 union select 2",
+                ("42804", "UNION types text and integer cannot be matched", "51"),
+            ),
+            (
+                "insert into p88(i) values (1) union select 'a'::text",
+                ("42804", "UNION types integer and text cannot be matched", "44"),
+            ),
+            (
+                "insert into p88(i) (select 1 union select 2) union select 'x'::text",
+                ("42804", "UNION types integer and text cannot be matched", "59"),
+            ),
+            # A side that does not convert, and a column count, are placed
+            # in the query as in a plain one (RP-1087).
+            (
+                "insert into p88(t) select 1::numeric union select 1::oid",
+                ("42846", "UNION could not convert type oid to numeric", "51"),
+            ),
+            (
+                "insert into p88(i) select 1 union select 2, 3",
+                ("42601", "each UNION query must have the same number of columns", "42"),
+            ),
+            (
+                "insert into p88(i, t) select 1, 'a'::text union select 2, 3",
+                ("42804", "UNION types text and integer cannot be matched", "59"),
+            ),
+            (
+                "insert into p88(i) select 1 union select 'a'::text union select 2",
+                ("42804", "UNION types integer and text cannot be matched", "42"),
+            ),
+            # Both untyped: the query's column is text, which `i` refuses.
+            (
+                "insert into p88(i) select null union select null",
+                ("42804", 'column "i" is of type integer but expression is of type text', "27"),
+            ),
+        ]:
+            try:
+                conn.execute(sql)
+            except psycopg.Error as e:
+                got = (e.sqlstate, e.diag.message_primary, e.diag.statement_position)
+            else:
+                got = None
+            assert got == want, sql
+        for sql, written in [
+            ("insert into p88(i) select null union select 2", 2),
+            ("insert into p88(i) select '1' union select 2", 2),
+            ("insert into p88(i) select 1 union select 2::bigint", 2),
+            ("insert into p88(i) select i from s88 intersect select 1", 1),
+            ("insert into p88(ia) select array[1] union select array[2::bigint]", 2),
+            ("insert into p88(t) select '1' union select '3'", 2),
+        ]:
+            assert conn.execute(sql).rowcount == written, sql
+
+
 def _error_of(conn, sql: str) -> str:
     try:
         conn.execute(sql).fetchall()

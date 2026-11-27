@@ -1,9 +1,8 @@
 """Gap tests of the divergences found while working RP-1050 (a UNION's
 unmatched column types under `INSERT ... SELECT` had no position; fixed): RP-1087
 (the mismatch was placed at the wrong column or arm of a plain query;
-fixed),
-RP-1088 (the `INSERT` checks its column's assignment before the set
-operation's types) and RP-1089 (a statement that only analyses its query,
+fixed), RP-1088 (the `INSERT` checked its column's assignment before the
+set operation's types; fixed) and RP-1089 (a statement that only analyses its query,
 `EXPLAIN` or `PREPARE`, does not check the set operation's types at all).
 
 An answer is `(sqlstate, message, position)` for an error, or the command
@@ -63,9 +62,10 @@ def test_set_op_mismatch_column_and_arm(dsn: str, query: str) -> None:
     assert got[0] == "42804" and got[2] == PLACED[query], got
 
 
-@pytest.mark.backlog("RP-1088")
+@pytest.mark.backlog_fixed("RP-1088")
 def test_insert_select_set_op_types_before_assignment(dsn: str) -> None:
-    """The query's set operation is analysed before the INSERT assigns it."""
+    """The query's set operation was analysed after the INSERT assigned it:
+    the column's 42804 came before the UNION's (fixed)."""
     assert answer(dsn, "insert into tct(c) select null::text union select 1", _SETUP) == (
         "42804",
         "UNION types text and integer cannot be matched",

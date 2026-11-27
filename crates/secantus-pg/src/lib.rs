@@ -1537,6 +1537,10 @@ struct RowEnv {
 /// operation contributes, and what `rows_with_schema` returns.
 type SchemaAndRows = (Vec<FieldInfo>, Vec<Vec<Option<Bson>>>);
 
+/// A set operation's column types as parse analysis resolves them, and
+/// where each column is for the node above (`analyse_set_op_types`).
+type SetOpColumns = (Vec<Type>, Vec<Option<i32>>);
+
 /// An integer sequence field, whichever BSON width it was written at.
 /// Decode a stored document, FLATTENING a subdocument `_id` into
 /// `_id.<name>` keys at the same position -- a composite primary key's
@@ -32674,6 +32678,12 @@ impl PgHandler {
         ins: &secantus_pgplan::Insert,
         source: &Statement,
     ) -> PgWireResult<Vec<String>> {
+        // Parse analysis of the query comes first: a set operation's
+        // unmatched column types are refused before any column is assigned
+        // (RP-1088).
+        if let Statement::SetOp(set) = source {
+            self.analyse_set_op_types(set)?;
+        }
         let Ok(fields) = self.copy_query_fields(source) else {
             return Ok(Vec::new());
         };
@@ -43099,6 +43109,129 @@ impl PgHandler {
                 "this query is not supported on one side of a set operation".into(),
             )))),
         }
+    }
+
+    /// A set operation's column types as parse analysis resolves them,
+    /// without running either side: PostgreSQL's `transformSetOperationTree`
+    /// works the left subtree, then the right, then this node's columns in
+    /// order, and refuses an unmatched pair there (42804 from
+    /// `select_common_type`, 42846 from `coerce_to_common_type`, 42601 for
+    /// a column count). So `insert into tct(c) select null::text union
+    /// select 1` is the UNION's 42804 at the `1`, before
+    /// `transformInsertStmt` assigns the query's `text` to `c` (RP-1088).
+    /// The rules and the error locations are `set_op_rows_located`'s, which
+    /// refuses the same pair when the operation runs; with each column's
+    /// type comes where it is, for the node above.
+    ///
+    /// `Ok(None)` when a side cannot be described here: the check is then
+    /// the executor's, as before.
+    fn analyse_set_op_types(
+        &self,
+        set: &secantus_pgplan::SetOpSelect,
+    ) -> PgWireResult<Option<SetOpColumns>> {
+        let side_types =
+            |stmt: &Statement, planned: &[Option<i32>]| -> PgWireResult<Option<SetOpColumns>> {
+                match stmt {
+                    Statement::SetOp(inner) => self.analyse_set_op_types(inner),
+                    leaf => Ok(self
+                        .describe_planned(leaf.clone())
+                        .ok()
+                        .flatten()
+                        .map(|fields| {
+                            (
+                                fields.iter().map(|f| f.datatype().clone()).collect(),
+                                planned.to_vec(),
+                            )
+                        })),
+                }
+            };
+        let left = side_types(&set.left, &set.left_locations)?;
+        let right = side_types(&set.right, &set.right_locations)?;
+        let (Some((left, left_at)), Some((right, right_at))) = (left, right) else {
+            return Ok(None);
+        };
+        let op = match set.kind {
+            secantus_pgplan::SetOpKind::Union => "UNION",
+            secantus_pgplan::SetOpKind::Intersect => "INTERSECT",
+            secantus_pgplan::SetOpKind::Except => "EXCEPT",
+        };
+        if left.len() != right.len() {
+            let first = if right_at.is_empty() {
+                None
+            } else {
+                right_at
+                    .iter()
+                    .find(|l| **l != Some(-1))
+                    .copied()
+                    .unwrap_or(Some(-1))
+            };
+            Self::locate_set_op_error(first);
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "42601".into(), // syntax_error
+                format!("each {op} query must have the same number of columns"),
+            ))));
+        }
+        // A side's untyped literal columns, read as `set_op_rows_located`
+        // reads them: a constant side knows its own, any other side is read
+        // from the parse tree.
+        let side = |stmt: &Statement, parsed: &[bool], own: fn(&Statement) -> Vec<bool>| {
+            if matches!(stmt, Statement::SelectConstant(_)) {
+                own(stmt)
+            } else {
+                parsed.to_vec()
+            }
+        };
+        let left_nulls = side(
+            &set.left,
+            &set.left_untyped.nulls,
+            Self::null_constant_columns,
+        );
+        let right_nulls = side(
+            &set.right,
+            &set.right_untyped.nulls,
+            Self::null_constant_columns,
+        );
+        let left_strs = side(
+            &set.left,
+            &set.left_untyped.strings,
+            Self::untyped_string_columns,
+        );
+        let right_strs = side(
+            &set.right,
+            &set.right_untyped.strings,
+            Self::untyped_string_columns,
+        );
+        let flag = |v: &[bool], i: usize| v.get(i).copied().unwrap_or(false);
+        let at = |v: &[Option<i32>], i: usize| v.get(i).copied().flatten();
+        let mut types = Vec::with_capacity(left.len());
+        let mut located = Vec::with_capacity(left.len());
+        for (i, (l, r)) in left.iter().zip(&right).enumerate() {
+            let (lat, rat) = (at(&left_at, i), at(&right_at, i));
+            let (ty, from) = if flag(&right_nulls, i) {
+                (l.clone(), lat)
+            } else if flag(&left_nulls, i) {
+                (r.clone(), rat)
+            } else if flag(&right_strs, i) && !flag(&left_strs, i) {
+                (l.clone(), lat)
+            } else if flag(&left_strs, i) && !flag(&right_strs, i) {
+                (r.clone(), rat)
+            } else {
+                let ty = Self::unify_set_op_type(op, l, r)
+                    .inspect_err(|_| Self::locate_set_op_error(rat))?;
+                for (side, side_at) in [(l, lat), (r, rat)] {
+                    if *side != ty {
+                        Self::check_set_op_conversion(op, side, &ty)
+                            .inspect_err(|_| Self::locate_set_op_error(side_at))?;
+                    }
+                }
+                let from = if *l == ty { lat } else { rat };
+                (ty, from)
+            };
+            types.push(ty);
+            located.push(from);
+        }
+        Ok(Some((types, located)))
     }
 
     /// `UNION` / `INTERSECT` / `EXCEPT`: run both sides, combine, then apply
