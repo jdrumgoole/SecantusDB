@@ -5090,8 +5090,28 @@ fn attach_verbose_nested_loop(root: &mut PlanNode, v: &secantus_pgplan::ruleutil
     let Some((at, cond)) = cond else {
         return;
     };
-    root.children[1].details[at].1 = cond;
+    // Each scan's target list: its physical one (`use_physical_tlist`),
+    // an Index Only Scan's its index's (`indextlist`), known here for a
+    // one-column primary key.
+    let mut outputs = Vec::new();
     for (n, idx) in [(0usize, o), (1, i)] {
+        let r = &v.rels[idx];
+        let name = &root.children[n].name;
+        if !name.starts_with("Index Only Scan ") {
+            outputs.push(r.columns.join(", "));
+            continue;
+        }
+        match &r.pkey {
+            Some((index, col))
+                if name.starts_with(&format!("Index Only Scan using {index} on ")) =>
+            {
+                outputs.push(col.clone());
+            }
+            _ => return,
+        }
+    }
+    root.children[1].details[at].1 = cond;
+    for ((n, idx), out) in [(0usize, o), (1, i)].into_iter().zip(outputs) {
         let r = &v.rels[idx];
         let node = &mut root.children[n];
         let cut = node.name.len() - r.plain.len();
@@ -5111,8 +5131,7 @@ fn attach_verbose_nested_loop(root: &mut PlanNode, v: &secantus_pgplan::ruleutil
                 }
             }
         }
-        node.details
-            .insert(0, ("Output".into(), r.columns.join(", ")));
+        node.details.insert(0, ("Output".into(), out));
     }
     root.details
         .insert(0, ("Output".into(), v.output.join(", ")));
@@ -5551,6 +5570,130 @@ pub(crate) fn attach_verbose_chain(
     root.details[0].1 = c.output.join(", ");
 }
 
+/// `EXPLAIN VERBOSE` of a relation joined to a nested two-relation join,
+/// `s LEFT JOIN (e JOIN k ON ...) ON true` (RP-1121), as PostgreSQL 15.20
+/// prints it: the top join the query's target list; the nested join its
+/// join relation's (a join's plan always returns its path target,
+/// whatever its parent asks, `create_join_plan`), and so does a
+/// Materialize or a Hash over it; the nested join's own nodes as a
+/// two-relation join's ([`attach_verbose_join_node`]); the relation's scan
+/// its physical target list (`use_physical_tlist`), or under a Hash or a
+/// Materialize its `reltarget` (`CP_SMALL_TLIST`). The top join's quals
+/// are prefixed already: the range table holds more than one relation.
+/// Any other plan prints as without VERBOSE.
+pub(crate) fn attach_verbose_nested_join(
+    root: &mut PlanNode,
+    nested: &Option<secantus_pgplan::ruleutils::VerboseNestedJoin>,
+) {
+    let Some(v) = nested else {
+        return;
+    };
+    if root.children.len() != 2 {
+        return;
+    }
+    let holds_rel = |n: &PlanNode| {
+        let n = match n.children.as_slice() {
+            [only] if n.name == "Materialize" => only,
+            _ => n,
+        };
+        is_scan_name(&n.name) && n.name.ends_with(&format!(" on {}", v.rel.plain))
+    };
+    // Which child is the relation's, and which the pair's.
+    let (rel_at, pair_at) = match (v.left, root.name.as_str()) {
+        (true, "Nested Loop Left Join" | "Hash Left Join") => (0, 1),
+        (true, "Hash Right Join") => (1, 0),
+        (false, "Nested Loop") if holds_rel(&root.children[0]) => (0, 1),
+        (false, "Nested Loop") => (1, 0),
+        _ => return,
+    };
+    if root
+        .details
+        .iter()
+        .any(|(k, _)| !matches!(k.as_str(), "Inner Unique" | "Hash Cond" | "Join Filter"))
+    {
+        return;
+    }
+    // A Hash under a hash join's inner side, a Materialize under a nested
+    // loop's: either returns its child's target list.
+    let wrapper = if root.name.starts_with("Hash ") {
+        "Hash"
+    } else {
+        "Materialize"
+    };
+    let wrapped = |n: &PlanNode, at: usize| -> Option<bool> {
+        if n.name != wrapper {
+            return Some(false);
+        }
+        (at == 1 && n.details.is_empty() && n.children.len() == 1).then_some(true)
+    };
+    let mut drawn = root.clone();
+    let rel_wrapped = match wrapped(&drawn.children[rel_at], rel_at) {
+        Some(w) => w,
+        None => return,
+    };
+    let pair_wrapped = match wrapped(&drawn.children[pair_at], pair_at) {
+        Some(w) => w,
+        None => return,
+    };
+    if wrapper == "Hash" && !(rel_wrapped || pair_wrapped) {
+        return;
+    }
+    // The relation's scan: no quals of its own, since the query has no
+    // WHERE and the outer ON is the join's.
+    {
+        let side = &mut drawn.children[rel_at];
+        let scan = if rel_wrapped {
+            &mut side.children[0]
+        } else {
+            &mut *side
+        };
+        let suffix = format!(" on {}", v.rel.plain);
+        if !is_scan_name(&scan.name)
+            || scan.name.starts_with("Index Only Scan ")
+            || !scan.name.ends_with(&suffix)
+            || !scan.children.is_empty()
+            || !scan.details.is_empty()
+        {
+            return;
+        }
+        let cut = scan.name.len() - v.rel.plain.len();
+        scan.name = format!("{}{}", &scan.name[..cut], v.rel.relation);
+        let out = if rel_wrapped {
+            &v.rel.needed
+        } else {
+            &v.rel.columns
+        };
+        scan.details.insert(0, ("Output".into(), out.join(", ")));
+        if rel_wrapped {
+            side.details
+                .insert(0, ("Output".into(), v.rel.needed.join(", ")));
+        }
+    }
+    {
+        let side = &mut drawn.children[pair_at];
+        let pair = if pair_wrapped {
+            &mut side.children[0]
+        } else {
+            &mut *side
+        };
+        if join_type_of(&pair.name).map(|t| t.1) != Some("Inner") || pair.children.len() != 2 {
+            return;
+        }
+        attach_verbose_join_node(pair, &v.pair);
+        if pair.details.first().map(|(k, _)| k.as_str()) != Some("Output") {
+            return;
+        }
+        if pair_wrapped {
+            side.details
+                .insert(0, ("Output".into(), v.pair.output.join(", ")));
+        }
+    }
+    drawn
+        .details
+        .insert(0, ("Output".into(), v.output.join(", ")));
+    *root = drawn;
+}
+
 fn is_scan_name(name: &str) -> bool {
     name.starts_with("Seq Scan on ")
         || name.starts_with("Bitmap Heap Scan on ")
@@ -5668,6 +5811,7 @@ mod heap_fetches_tests {
             verbose_scan: None,
             verbose_join: None,
             verbose_chain: None,
+            verbose_nested: None,
             scan_alias: None,
             costs: false,
             timing: false,

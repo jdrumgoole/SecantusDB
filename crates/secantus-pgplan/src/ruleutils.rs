@@ -7999,6 +7999,35 @@ pub fn explain_verbose_join(
     {
         return None;
     }
+    // A conjunct over one relation as its scan's `Filter` prints it: bare
+    // in the plain plan, prefixed under VERBOSE.
+    let none_lookup = |_: &str| None;
+    let none_views = |_: &str| None;
+    let cat = Catalog {
+        lookup: &none_lookup,
+        view_sql: &none_views,
+        home_schema: None,
+    };
+    let print = |part: &Node, i: usize, unqualified: bool| -> Option<String> {
+        let (refname, def, _) = &sides[i];
+        let mut p = Printer::new(&cat, 0);
+        p.unqualified = unqualified;
+        p.fold_consts = true;
+        p.scopes.push(vec![Rte {
+            refname: refname.clone(),
+            name: refname.clone(),
+            columns: def
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), base_type(&c.pg_type)))
+                .collect(),
+            qualified_only: false,
+            ..Default::default()
+        }]);
+        p.expr(part)?;
+        Some(p.buf)
+    };
+    let mut on_restrictions: Vec<std::borrow::Cow<Node>> = Vec::new();
     // The ON: equalities between a column of each side.
     let mut parts = Vec::new();
     let mut all_equal = true;
@@ -8008,6 +8037,16 @@ pub fn explain_verbose_join(
     and_clauses(j.quals.as_deref()?, &mut parts);
     for part in &parts {
         let part: &Node = part;
+        // A conjunct of an inner ON over one relation restricts that
+        // relation alone, as a WHERE conjunct does (`distribute_qual_to_rels`
+        // pushes it to the base relation): its scan's `Filter`.
+        if jt == pg_query::protobuf::JoinType::JoinInner {
+            if let (Some(_), None) | (None, Some(_)) = (print(part, 0, true), print(part, 1, true))
+            {
+                on_restrictions.push(std::borrow::Cow::Borrowed(part));
+                continue;
+            }
+        }
         let Some(N::AExpr(a)) = part.node.as_ref() else {
             return None;
         };
@@ -8105,35 +8144,13 @@ pub fn explain_verbose_join(
     let mut class_quals: [Vec<(String, String)>; 2] = [Vec::new(), Vec::new()];
     let mut join_filter = false;
     let mut unprinted_filter = false;
-    if let Some(w) = s.where_clause.as_deref() {
-        let none_lookup = |_: &str| None;
-        let none_views = |_: &str| None;
-        let cat = Catalog {
-            lookup: &none_lookup,
-            view_sql: &none_views,
-            home_schema: None,
-        };
-        let print = |part: &Node, i: usize, unqualified: bool| -> Option<String> {
-            let (refname, def, _) = &sides[i];
-            let mut p = Printer::new(&cat, 0);
-            p.unqualified = unqualified;
-            p.fold_consts = true;
-            p.scopes.push(vec![Rte {
-                refname: refname.clone(),
-                name: refname.clone(),
-                columns: def
-                    .columns
-                    .iter()
-                    .map(|c| (c.name.clone(), base_type(&c.pg_type)))
-                    .collect(),
-                qualified_only: false,
-                ..Default::default()
-            }]);
-            p.expr(part)?;
-            Some(p.buf)
-        };
-        let mut parts = Vec::new();
-        and_clauses(w, &mut parts);
+    {
+        // An inner ON's restrictions first: `deconstruct_recurse`
+        // distributes a join's quals before its FromExpr's WHERE.
+        let mut parts = on_restrictions;
+        if let Some(w) = s.where_clause.as_deref() {
+            and_clauses(w, &mut parts);
+        }
         for part in &parts {
             let part: &Node = part;
             let i = match (print(part, 0, true), print(part, 1, true)) {
@@ -8285,44 +8302,11 @@ pub fn explain_verbose_join(
     }
     let rel = |i: usize| {
         let (refname, def, alias) = &sides[i];
-        let (schema, bare) = crate::schemas::split_key(&def.name);
-        let suffix = alias
-            .as_ref()
-            .map(|a| format!(" {}", q(a)))
-            .unwrap_or_default();
         VerboseRel {
-            relation: format!("{}.{}{suffix}", q(&schema), q(&bare)),
-            plain: format!("{}{suffix}", q(&bare)),
-            columns: def
-                .columns
-                .iter()
-                .map(|c| format!("{}.{}", q(refname), q(&c.name)))
-                .collect(),
-            needed: needed[i]
-                .iter()
-                .map(|c| format!("{}.{}", q(refname), q(c)))
-                .collect(),
-            refname: q(refname),
             quals: quals[i].clone(),
             join_quals: join_quals[i].clone(),
             class_quals: class_quals[i].clone(),
-            pkey: match def
-                .columns
-                .iter()
-                .filter(|c| c.pk)
-                .collect::<Vec<_>>()
-                .as_slice()
-            {
-                [c] => Some((
-                    q(&def
-                        .extra
-                        .get_str("pk_name")
-                        .map(str::to_string)
-                        .unwrap_or_else(|_| format!("{bare}_pkey"))),
-                    format!("{}.{}", q(refname), q(&c.name)),
-                )),
-                _ => None,
-            },
+            ..verbose_rel(refname, def, alias, &needed[i])
         }
     };
     Some(VerboseJoin {
@@ -8334,6 +8318,295 @@ pub fn explain_verbose_join(
         expr_on,
         sort_keys,
         limit,
+    })
+}
+
+/// A relation of a verbose join with no restrictions: its names, its
+/// physical target list, the `needed` columns (bare names) prefixed, and
+/// its one-column PRIMARY KEY's index.
+fn verbose_rel(
+    refname: &str,
+    def: &TableDef,
+    alias: &Option<String>,
+    needed: &[String],
+) -> VerboseRel {
+    let (schema, bare) = crate::schemas::split_key(&def.name);
+    let suffix = alias
+        .as_ref()
+        .map(|a| format!(" {}", q(a)))
+        .unwrap_or_default();
+    VerboseRel {
+        relation: format!("{}.{}{suffix}", q(&schema), q(&bare)),
+        plain: format!("{}{suffix}", q(&bare)),
+        columns: def
+            .columns
+            .iter()
+            .map(|c| format!("{}.{}", q(refname), q(&c.name)))
+            .collect(),
+        needed: needed
+            .iter()
+            .map(|c| format!("{}.{}", q(refname), q(c)))
+            .collect(),
+        refname: q(refname),
+        pkey: match def
+            .columns
+            .iter()
+            .filter(|c| c.pk)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            [c] => Some((
+                q(&def
+                    .extra
+                    .get_str("pk_name")
+                    .map(str::to_string)
+                    .unwrap_or_else(|_| format!("{bare}_pkey"))),
+                format!("{}.{}", q(refname), q(&c.name)),
+            )),
+            _ => None,
+        },
+        ..Default::default()
+    }
+}
+
+/// `EXPLAIN VERBOSE` of a SELECT joining a relation to an inner join of
+/// two relations nested on its right: `s LEFT JOIN (e JOIN k ON ...) ON
+/// true` (RP-1121). The nested join's quals are a two-relation join's,
+/// so its nodes print as [`VerboseJoin`]'s do; above it, every node
+/// prints its target list too.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct VerboseNestedJoin {
+    /// The relation joined to the pair: its `needed` is its `reltarget`
+    /// (the target list's columns, then the outer ON's), which a scan
+    /// under a Hash or a Materialize returns (`CP_SMALL_TLIST`).
+    pub rel: VerboseRel,
+    /// The nested pair, as a two-relation join. Each relation's `needed`
+    /// is its `reltarget` (the target list's columns, then the pair's ON's,
+    /// then the outer ON's: `deconstruct_recurse` distributes a lower
+    /// join's quals first), and `output` is the pair's join-relation target
+    /// list (`build_joinrel_tlist`): each relation's columns still needed
+    /// above the pair, the relations in FROM order (`make_join_rel(rel1,
+    /// rel2)` of the pair's own join search).
+    pub pair: VerboseJoin,
+    /// The query's target list, prefixed.
+    pub output: Vec<String>,
+    /// The outer join is a LEFT JOIN, the relation its preserved side;
+    /// otherwise an inner join, its ON `true`.
+    pub left: bool,
+}
+
+/// [`VerboseNestedJoin`] for `SELECT <columns or *> FROM a [LEFT] JOIN (b
+/// JOIN c ON ...) ON <true, or column equalities of a with b or c>`;
+/// `None` for any other shape.
+pub fn explain_verbose_nested_join(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<VerboseNestedJoin> {
+    use pg_query::protobuf::JoinType;
+    if !s.group_clause.is_empty()
+        || s.having_clause.is_some()
+        || !s.distinct_clause.is_empty()
+        || !s.window_clause.is_empty()
+        || !s.locking_clause.is_empty()
+        || s.with_clause.is_some()
+        || s.where_clause.is_some()
+        || !s.sort_clause.is_empty()
+        || s.limit_count.is_some()
+        || s.limit_offset.is_some()
+    {
+        return None;
+    }
+    let [item] = s.from_clause.as_slice() else {
+        return None;
+    };
+    let plain_join = |n: &Node| -> Option<(pg_query::protobuf::JoinExpr, JoinType)> {
+        let Some(N::JoinExpr(j)) = n.node.as_ref() else {
+            return None;
+        };
+        if j.is_natural || !j.using_clause.is_empty() || j.alias.is_some() {
+            return None;
+        }
+        Some(((**j).clone(), JoinType::try_from(j.jointype).ok()?))
+    };
+    let (j, jt) = plain_join(item)?;
+    let left = match jt {
+        JoinType::JoinLeft => true,
+        JoinType::JoinInner => false,
+        _ => return None,
+    };
+    let (p, pt) = plain_join(j.rarg.as_deref()?)?;
+    if pt != JoinType::JoinInner {
+        return None;
+    }
+    let side = |n: &Option<Box<Node>>| -> Option<(String, TableDef, Option<String>)> {
+        let Some(N::RangeVar(rv)) = n.as_deref()?.node.as_ref() else {
+            return None;
+        };
+        let def = lookup(&rv.relname)?;
+        let alias = rv.alias.as_ref().map(|a| a.aliasname.clone());
+        let refname = alias
+            .clone()
+            .unwrap_or_else(|| crate::schemas::split_key(&def.name).1);
+        Some((refname, def, alias))
+    };
+    let sides = [side(&j.larg)?, side(&p.larg)?, side(&p.rarg)?];
+    if sides[0].0 == sides[1].0 || sides[0].0 == sides[2].0 || sides[1].0 == sides[2].0 {
+        return None;
+    }
+    let has = |i: usize, col: &str| sides[i].1.columns.iter().any(|c| c.name == col);
+    let resolve = |c: &pg_query::protobuf::ColumnRef| -> Option<(usize, String)> {
+        let names: Vec<&str> = c
+            .fields
+            .iter()
+            .map(|f| match f.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        match names.as_slice() {
+            [rel, col] => {
+                let i = sides.iter().position(|s| s.0 == *rel)?;
+                has(i, col).then(|| (i, col.to_string()))
+            }
+            [col] => {
+                let mut hits = (0..3).filter(|&i| has(i, col));
+                let i = hits.next()?;
+                hits.next().is_none().then(|| (i, col.to_string()))
+            }
+            _ => None,
+        }
+    };
+    // The target list, `*` expanded in FROM order.
+    let mut outputs: Vec<(usize, String)> = Vec::new();
+    for t in &s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return None;
+        };
+        let Some(N::ColumnRef(c)) = rt.val.as_deref()?.node.as_ref() else {
+            return None;
+        };
+        let star = c
+            .fields
+            .last()
+            .is_some_and(|f| matches!(f.node.as_ref(), Some(N::AStar(_))));
+        if !star {
+            outputs.push(resolve(c)?);
+            continue;
+        }
+        let which: Vec<usize> = match c.fields.as_slice() {
+            [_] => vec![0, 1, 2],
+            [rel, _] => match rel.node.as_ref() {
+                Some(N::String(s)) => vec![sides.iter().position(|x| x.0 == s.sval)?],
+                _ => return None,
+            },
+            _ => return None,
+        };
+        for i in which {
+            outputs.extend(sides[i].1.columns.iter().map(|c| (i, c.name.clone())));
+        }
+    }
+    // The outer ON: `true`, or (a LEFT JOIN's) equalities of a column of
+    // the relation with one of the pair's, whose columns it reads after
+    // the pair's ON (`deconstruct_recurse` distributes the lower join's
+    // quals first).
+    let on = j.quals.as_deref()?;
+    let mut on_cols: Vec<(usize, String)> = Vec::new();
+    let on_true = matches!(
+        on.node.as_ref(),
+        Some(N::AConst(c)) if matches!(c.val.as_ref(), Some(Val::Boolval(b)) if b.boolval)
+    );
+    if !on_true {
+        if !left {
+            return None;
+        }
+        let mut parts = Vec::new();
+        and_clauses(on, &mut parts);
+        for part in &parts {
+            let Some(N::AExpr(a)) = part.node.as_ref() else {
+                return None;
+            };
+            let op = a.name.iter().find_map(|n| match n.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            });
+            if a.kind() != pg_query::protobuf::AExprKind::AexprOp || op != Some("=") {
+                return None;
+            }
+            let col = |n: &Option<Box<Node>>| match n.as_deref()?.node.as_ref() {
+                Some(N::ColumnRef(c)) => resolve(c),
+                _ => None,
+            };
+            let (l, r) = (col(&a.lexpr)?, col(&a.rexpr)?);
+            if (l.0 == 0) == (r.0 == 0) {
+                return None;
+            }
+            on_cols.extend([l, r]);
+        }
+    }
+    // The pair as a two-relation SELECT of the target list's columns it
+    // holds: its relations' `reltarget`s begin as the query's do.
+    let column = |i: usize, c: &str| Node {
+        node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+            fields: [sides[i].0.as_str(), c]
+                .iter()
+                .map(|f| Node {
+                    node: Some(N::String(pg_query::protobuf::String {
+                        sval: f.to_string(),
+                    })),
+                })
+                .collect(),
+            location: -1,
+        })),
+    };
+    let pair_select = pg_query::protobuf::SelectStmt {
+        target_list: outputs
+            .iter()
+            .filter(|(i, _)| *i != 0)
+            .map(|(i, c)| Node {
+                node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                    val: Some(Box::new(column(*i, c))),
+                    location: -1,
+                    ..Default::default()
+                }))),
+            })
+            .collect(),
+        from_clause: vec![(*j.rarg.clone()?).clone()],
+        ..Default::default()
+    };
+    let mut pair = explain_verbose_join(&pair_select, lookup)?;
+    let pre = |i: usize, c: &str| format!("{}.{}", q(&sides[i].0), q(c));
+    let above: Vec<String> = outputs
+        .iter()
+        .chain(&on_cols)
+        .map(|(i, c)| pre(*i, c))
+        .collect();
+    for (r, i) in [(0usize, 1usize), (1, 2)] {
+        for (_, c) in on_cols.iter().filter(|(x, _)| *x == i) {
+            let col = pre(i, c);
+            if !pair.rels[r].needed.contains(&col) {
+                pair.rels[r].needed.push(col);
+            }
+        }
+    }
+    pair.output = pair
+        .rels
+        .iter()
+        .flat_map(|r| r.needed.iter())
+        .filter(|c| above.contains(c))
+        .cloned()
+        .collect();
+    let mut needed: Vec<String> = Vec::new();
+    for (_, c) in outputs.iter().chain(&on_cols).filter(|(i, _)| *i == 0) {
+        if !needed.contains(c) {
+            needed.push(c.clone());
+        }
+    }
+    let (refname, def, alias) = &sides[0];
+    Some(VerboseNestedJoin {
+        rel: verbose_rel(refname, def, alias, &needed),
+        pair,
+        output: outputs.iter().map(|(i, c)| pre(*i, c)).collect(),
+        left,
     })
 }
 
@@ -8786,6 +9059,77 @@ pub fn explain_verbose_chain(
         full: std::iter::once(false).chain(fulls).collect(),
         class_constant,
     })
+}
+
+#[cfg(test)]
+mod verbose_nested_join_tests {
+    use super::*;
+    use secantus_pgcatalog::Column;
+
+    fn lookup(name: &str) -> Option<TableDef> {
+        let second = if name == "s" { "c" } else { "b" };
+        matches!(name, "e" | "k" | "s").then(|| {
+            TableDef::new(
+                name,
+                vec![
+                    Column::new("a", "int4", name == "k"),
+                    Column::new(second, "text", false),
+                ],
+            )
+        })
+    }
+
+    fn nested(sql: &str) -> Option<VerboseNestedJoin> {
+        let p = pg_query::parse(sql).unwrap();
+        let Some(N::SelectStmt(s)) = p.protobuf.stmts[0].stmt.as_ref().unwrap().node.as_ref()
+        else {
+            panic!("{sql}")
+        };
+        explain_verbose_nested_join(s, &lookup)
+    }
+
+    #[test]
+    fn the_nested_join_returns_only_the_columns_needed_above_it() {
+        // PostgreSQL 15.20 (RP-1121): the pair's list is each relation's
+        // columns the query or the outer ON reads, in FROM order; the
+        // relation's `reltarget` is the target list's columns, then the
+        // ON's; the pair's ON restriction is `e`'s qual.
+        let v = nested("select s.c from s left join (e join k on k.a = e.a) on s.a = e.a").unwrap();
+        assert!(v.left);
+        assert_eq!(v.output, ["s.c"]);
+        assert_eq!(v.pair.output, ["e.a"]);
+        assert_eq!(v.rel.needed, ["s.c", "s.a"]);
+        assert_eq!(v.rel.columns, ["s.a", "s.c"]);
+        let v = nested(
+            "select k.b, s.c from s left join (e join k on e.a > 998 and k.a = e.a) on true",
+        )
+        .unwrap();
+        assert_eq!(v.pair.output, ["k.b"]);
+        assert_eq!(v.pair.rels[1].needed, ["k.b", "k.a"]);
+        assert_eq!(
+            v.pair.rels[0].quals,
+            [("(a > 998)".to_string(), "(e.a > 998)".to_string())]
+        );
+        let v = nested("select * from s join (e join k on k.a = e.a) on true").unwrap();
+        assert!(!v.left);
+        assert_eq!(v.output, ["s.a", "s.c", "e.a", "e.b", "k.a", "k.b"]);
+        assert_eq!(v.pair.output, ["e.a", "e.b", "k.a", "k.b"]);
+    }
+
+    #[test]
+    fn other_shapes_are_not_modelled() {
+        for sql in [
+            // An inner join's ON over the pair joins an equivalence class.
+            "select * from s join (e join k on k.a = e.a) on s.a = e.a",
+            // A WHERE, an expression ON, a LEFT pair, a pair on the left.
+            "select * from s left join (e join k on k.a = e.a) on true where s.a = 1",
+            "select * from s left join (e join k on k.a = e.a) on s.a = e.a + 1",
+            "select * from s left join (e left join k on k.a = e.a) on true",
+            "select * from (e join k on k.a = e.a) left join s on true",
+        ] {
+            assert_eq!(nested(sql), None, "{sql}");
+        }
+    }
 }
 
 #[cfg(test)]

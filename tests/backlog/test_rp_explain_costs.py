@@ -10754,8 +10754,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on s (actual rows=30 loops=1)",
         ],
     ),
-    # VERBOSE of a join nested in an outer join prints no `Output` and no
-    # qualified quals (RP-1121).
+    # RP-1121, fixed: VERBOSE of a join nested in an outer join printed no
+    # `Output` and no qualified quals; every node prints its target list,
+    # the nested join's and the Materialize's its join relation's.
     "verbose of an inner join nested in a left join": (
         "RP-1121",
         _ANALYSED_THIRTY,
@@ -10777,6 +10778,78 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              ->  Index Scan using k_pkey on public.k",
             "                    Output: k.a, k.b",
             "                    Index Cond: (k.a = e.a)",
+        ],
+    ),
+    # RP-1121, fixed: the nested join, and the Materialize over it, return
+    # only the columns needed above it; its scans their physical lists.
+    "verbose of a nested join returning only the columns above it": (
+        "RP-1121",
+        _ANALYSED_THIRTY,
+        "explain (verbose, costs off)"
+        " select s.c, k.b from s left join (e join k on e.a > 998 and k.a = e.a) on true",
+        [
+            "Nested Loop Left Join",
+            "  Output: s.c, k.b",
+            "  ->  Seq Scan on public.s",
+            "        Output: s.a, s.c",
+            "  ->  Materialize",
+            "        Output: k.b",
+            "        ->  Nested Loop",
+            "              Output: k.b",
+            "              Inner Unique: true",
+            "              ->  Seq Scan on public.e",
+            "                    Output: e.a, e.b",
+            "                    Filter: (e.a > 998)",
+            "              ->  Index Scan using k_pkey on public.k",
+            "                    Output: k.a, k.b",
+            "                    Index Cond: (k.a = e.a)",
+        ],
+    ),
+    # RP-1121, fixed: a Hash Right Join probing with the nested hash join,
+    # the outer ON's column kept in the nested join's list, the hashed
+    # relation its `reltarget`.
+    "verbose of a hash right join over a nested hash join": (
+        "RP-1121",
+        _ANALYSED_THIRTY,
+        "explain (verbose, costs off)"
+        " select s.c from s left join (e join k on k.a = e.a) on s.a = e.a",
+        [
+            "Hash Right Join",
+            "  Output: s.c",
+            "  Hash Cond: (e.a = s.a)",
+            "  ->  Hash Join",
+            "        Output: e.a",
+            "        Inner Unique: true",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on public.e",
+            "              Output: e.a, e.b",
+            "        ->  Hash",
+            "              Output: k.a",
+            "              ->  Seq Scan on public.k",
+            "                    Output: k.a",
+            "  ->  Hash",
+            "        Output: s.c, s.a",
+            "        ->  Seq Scan on public.s",
+            "              Output: s.c, s.a",
+        ],
+    ),
+    # RP-966, in part, fixed: an inner ON's conjunct over one relation is
+    # that relation's restriction, its scan's `Filter`, as a WHERE's is;
+    # an Index Only Scan returns its index's target list.
+    "verbose of an inner join whose on restricts one relation": (
+        "RP-966:fixed",
+        _ANALYSED,
+        "explain (verbose, costs off) select e.b from e join k on e.a > 998 and k.a = e.a",
+        [
+            "Nested Loop",
+            "  Output: e.b",
+            "  Inner Unique: true",
+            "  ->  Seq Scan on public.e",
+            "        Output: e.a, e.b",
+            "        Filter: (e.a > 998)",
+            "  ->  Index Only Scan using k_pkey on public.k",
+            "        Output: k.a",
+            "        Index Cond: (k.a = e.a)",
         ],
     ),
     # Part of RP-978, fixed: an inner join whose range on the outer key
@@ -11343,6 +11416,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1121",
         "RP-1117",
         "RP-1108",
         "RP-1104",
