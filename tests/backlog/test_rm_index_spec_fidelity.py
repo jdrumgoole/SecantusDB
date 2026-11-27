@@ -24,7 +24,7 @@ import pymongo
 import pytest
 
 from tests.backlog.conftest import RS_BINARY, mongo_answer, rust_mongo_server
-from tests.mongod_reference import MONGOD
+from tests.mongod_reference import MONGOD, _LostPortRace, _wait_owned
 
 
 def _specs(client: Any, db: str, coll: str) -> dict[str, list[tuple[str, Any]]]:
@@ -193,12 +193,32 @@ def _free_port() -> int:
 @contextlib.contextmanager
 def _standalone_mongod(dbpath: Path) -> Iterator[Any]:
     assert MONGOD, "no mongod on PATH: the reference server is required"
-    port = _free_port()
-    proc = subprocess.Popen(
-        [MONGOD, "--dbpath", str(dbpath), "--port", str(port), "--bind_ip", "127.0.0.1", "--quiet"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    for attempt in range(4):
+        port = _free_port()
+        proc = subprocess.Popen(
+            [
+                MONGOD,
+                "--dbpath",
+                str(dbpath),
+                "--port",
+                str(port),
+                "--bind_ip",
+                "127.0.0.1",
+                "--quiet",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            # Not "something answers the ping": another worker's mongod can
+            # take the port `_free_port()` handed out while ours is still
+            # opening WiredTiger. Four lost in a row is still an error.
+            _wait_owned(proc, port, 60)
+            break
+        except _LostPortRace:
+            proc.wait(timeout=60)
+            if attempt == 3:
+                raise
     client = pymongo.MongoClient(
         f"mongodb://127.0.0.1:{port}/?directConnection=true", serverSelectionTimeoutMS=30_000
     )
