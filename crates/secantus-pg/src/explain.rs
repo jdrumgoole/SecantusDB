@@ -2117,6 +2117,10 @@ fn structured(
             .next()
             .unwrap_or(&n.name)
             .to_string();
+        // A backward scan's direction is a field of its own; its node type
+        // is the scan's (`ExplainIndexScanDetails`).
+        let backward = node_type.ends_with(" Backward");
+        let node_type = node_type.trim_end_matches(" Backward").to_string();
         let join_type = join_type_of(&node_type);
         let node_type = match join_type {
             Some((pname, _)) => pname.to_string(),
@@ -2138,7 +2142,8 @@ fn structured(
         // An index scan reads its index forward unless an ORDER BY runs
         // it backward (`ExplainIndexScanDetails`).
         if node_type == "Index Scan" || node_type == "Index Only Scan" {
-            fields.push(("Scan Direction".into(), Value::Str("Forward".into())));
+            let direction = if backward { "Backward" } else { "Forward" };
+            fields.push(("Scan Direction".into(), Value::Str(direction.into())));
         }
         for (k, v) in &n.props {
             fields.push((k.clone(), Value::Str(v.clone())));
@@ -5754,6 +5759,32 @@ mod heap_fetches_tests {
         assert!(at("\"Index Cond\"") < at("\"Rows Removed by Index Recheck\": 0"));
         assert!(at("\"Rows Removed by Index Recheck\"") < at("\"Filter\""));
         assert!(at("\"Filter\"") < at("\"Rows Removed by Filter\": 0"));
+    }
+
+    #[test]
+    fn a_backward_index_scan_is_an_index_scan_of_that_direction() {
+        // PostgreSQL 15.20 (RP-1099): the structured formats name the node
+        // by its scan, and print the direction as a field of its own.
+        for (name, kind) in [
+            ("Index Scan Backward using k_pkey on k", "Index Scan"),
+            (
+                "Index Only Scan Backward using k_pkey on k",
+                "Index Only Scan",
+            ),
+        ] {
+            let json = render_json(&PlanNode::new(name), &options("json"), None);
+            assert!(
+                json.contains(&format!("\"Node Type\": \"{kind}\"")),
+                "{json}"
+            );
+            assert!(json.contains("\"Scan Direction\": \"Backward\""), "{json}");
+        }
+        let json = render_json(
+            &PlanNode::new("Index Scan using k_pkey on k"),
+            &options("json"),
+            None,
+        );
+        assert!(json.contains("\"Scan Direction\": \"Forward\""), "{json}");
     }
 }
 

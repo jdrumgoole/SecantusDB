@@ -2450,7 +2450,7 @@ const WORK_MEM_BYTES: f64 = 4096.0 * 1024.0;
 /// `cost_material` over `inner` (`width` bytes a row), with what a rescan
 /// of it costs (`cost_rescan`): two operators a row stored, one a row
 /// read again, and a page a block when it spills past `work_mem`.
-fn material(inner: &InPath, width: i64) -> InPath {
+pub fn material(inner: &InPath, width: i64) -> InPath {
     let nbytes = relation_byte_size(inner.rows, width);
     let spill = if nbytes > WORK_MEM_BYTES {
         (nbytes / 8192.0).ceil()

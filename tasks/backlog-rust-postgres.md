@@ -2376,25 +2376,41 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a comma join counts its hash table's memory]
       Backlog-ID: RP-1173
 
-- [ ] **An ORDER BY under a LIMIT over a two-table join is an unpriced
-      Sort over the join method it would use without them.** `explain
-      (costs off) select e.b, k.b from e join k on e.a = k.a order by k.a
-      limit 10` (`e`, `k` analysed, 1000 rows, `k.a` the primary key)
-      prints `Limit` over `Sort` (`Sort Key: k.a`) over a `Hash Join`,
-      every node `cost=0.00..0.00 rows=0 width=0`; PostgreSQL 15.20 prints
-      `Limit` over a `Merge Join` (`Merge Cond: (k.a = e.a)`) of `Index
-      Scan using k_pkey on k` and a Sort of `e`, (cost=65.10..65.71
-      rows=10). The same with `order by e.a`, `order by k.a desc` (an
-      `Index Scan Backward`), a LEFT join from `k`, `select k.b, k2.b from
-      k join k k2 ...` (two index scans) and two tables never analysed
-      (`e.b = k.b ... order by e.b limit 3`). `... on e.a < k.a order by
+- [ ] **An ORDER BY under a LIMIT over a two-table join of analysed
+      tables is an unpriced Sort over the join method it would use
+      without them.** `explain (costs off) select e.b, k.b from e join k
+      on e.a = k.a order by k.a limit 10` (`e`, `k` analysed, 1000 rows,
+      `k.a` the primary key) prints `Limit` over `Sort` (`Sort Key: k.a`)
+      over a `Hash Join`, every node `cost=0.00..0.00 rows=0 width=0`;
+      PostgreSQL 15.20 prints `Limit` over a `Merge Join` (`Merge Cond:
+      (k.a = e.a)`) of `Index Scan using k_pkey on k` and a Sort of `e`,
+      (cost=65.10..65.71 rows=10). The same with `order by e.a`, `order by
+      k.a desc` (an `Index Scan Backward`), a LEFT join from `k` and
+      `select k.b, k2.b from k join k k2 ...`. `... on e.a < k.a order by
       e.b limit 5` is PostgreSQL's bounded Sort over a Nested Loop into
       `Index Scan using k_pkey on k` (`Index Cond: (a > e.a)`); here a
-      Nested Loop of two Seq Scans with a `Join Filter`. With `order by
-      k.a limit 5` PostgreSQL keeps the Sort over the Hash Join, matched
-      here but unpriced. The LIMIT search that matches these shapes on
-      `tools/probes/pg_join_order_matrix.py` does not reach them; find
-      where it declines before sizing. Found while working RP-966.
+      Nested Loop of two Seq Scans with a `Join Filter`.
+      Since 2026-11-27 EXPLAIN prints the plan the LIMIT search
+      (`join_order::plan_searched`) picks, priced, wherever that search
+      plans two tables (`explain_ordered_limit`): over tables never
+      analysed with no WHERE, `order by k.a [desc] limit 3 [offset 2]`,
+      a LEFT join and a self join match 15.20 to the cost. What is left:
+      (1) the search declines every ANALYSED table -- `join_side` and
+      `limit_base_paths` both return `None` on `pt.analyzed`, so a join's
+      selectivity over measured columns (`eqjoinsel` over their MCVs),
+      `stawidth` widths (`Search::widths` reads `get_typavgwidth` only)
+      and measured distinct counts are what it needs; (2) the search
+      takes column equalities on integer keys only, so `e.b = k.b ...
+      order by e.b limit 3` (never analysed) declines, as does an
+      inequality ON (`four_table_chain` needs an `equi`); (3) an ORDER BY
+      of a column no clause reads and no index serves (`order by e.b`
+      over `e.a = k.a`, never analysed: PostgreSQL's bounded Sort over a
+      Hash Join, cost=81.03..81.04) is still unpriced; (4) the renderer
+      declines a Memoize, a bitmap heap scan, a FULL join, an Incremental
+      Sort, NULLS against the direction's default, a WHERE, and VERBOSE
+      or ANALYZE (whose target lists and counts over the searched plan
+      are not modelled: those print the plan without the search). Found
+      while working RP-966.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by under a limit over a join is a merge join], tests/backlog/test_rp_explain_costs.py::test_plan[an order by under a limit over an inequality join reads the index]
       Backlog-ID: RP-1099
 

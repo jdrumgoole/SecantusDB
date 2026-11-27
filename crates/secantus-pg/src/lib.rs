@@ -9519,6 +9519,97 @@ impl PgHandler {
         })
     }
 
+    /// [`PgHandler::explain_ordered_limit`]'s plan in place of `tree`'s
+    /// `Limit` over a `Sort` over the join the plan without the search drew
+    /// (RP-1099), each node priced. Anything else is left as it is.
+    fn explain_join_limit_order(
+        &self,
+        sel: &secantus_pgplan::Select,
+        tree: &mut explain::PlanNode,
+    ) {
+        let Some(sub) = sel.sub.as_ref() else {
+            return;
+        };
+        let Statement::JoinRows(j) = sub.plan.as_ref() else {
+            return;
+        };
+        let [k] = sel.order.as_slice() else {
+            return;
+        };
+        if k.expr.is_some()
+            || k.jsonb
+            || !sel.filter.is_empty()
+            || sel.residual.is_some()
+            || !sel.windows.is_empty()
+            || sel.offset < 0
+            || sel.limit.is_none_or(|l| l < 0)
+            || sel.casts.iter().any(Option::is_some)
+            || sel.lock.is_some()
+            || !j.where_span_aliases.is_empty()
+        {
+            return;
+        }
+        let Some(rows) = sort_bound(sel) else {
+            return;
+        };
+        let plain = |n: &explain::PlanNode| n.estimate.is_none() && n.children.len() == 1;
+        if tree.name != "Limit"
+            || !tree.details.is_empty()
+            || !plain(tree)
+            || tree.children[0].name != "Sort"
+            || !plain(&tree.children[0])
+            || tree.children[0].details.len() != 1
+            || tree.children[0].details[0].0 != "Sort Key"
+        {
+            return;
+        }
+        // The tables' scans as the plan without the search drew them, by
+        // the alias each scan node ends with.
+        fn scans(n: &explain::PlanNode, out: &mut Vec<(String, explain::PlanNode)>) {
+            if n.children.is_empty() {
+                if let Some((_, rel)) = n.name.split_once(" on ") {
+                    let alias = rel.rsplit(' ').next().unwrap_or(rel).to_string();
+                    out.push((alias, n.clone()));
+                }
+                return;
+            }
+            for c in &n.children {
+                scans(c, out);
+            }
+        }
+        let mut found = Vec::new();
+        scans(&tree.children[0].children[0], &mut found);
+        let nulls_first = matches!(k.nulls, secantus_pgplan::Nulls::First);
+        let order = (k.field.as_str(), !k.ascending, k.ascending == nulls_first);
+        let offset = usize::try_from(sel.offset).unwrap_or(0);
+        let Some((join, how)) = join_search::with_join_where(j, || {
+            self.explain_ordered_limit(&j.tree, (rows, offset), order, &found)
+        }) else {
+            return;
+        };
+        let Some(top) = join.estimate else {
+            return;
+        };
+        let count = sel.limit.unwrap_or(0).max(1);
+        let mut sort = tree.children.pop().expect("one child");
+        let input = match how {
+            secantus_pgplan::joincost::OrderedBy::Sort => {
+                let (startup, total) =
+                    secantus_pgplan::joincost::cost_sort(top.1, top.2, top.3, Some(rows as f64));
+                sort.children = vec![join];
+                sort.estimate = Some((startup, total, top.2, top.3));
+                sort
+            }
+            _ => join,
+        };
+        tree.estimate = Some(scan_estimate::limit_estimate(
+            input.estimate.expect("priced"),
+            sel.offset,
+            count,
+        ));
+        tree.children.push(input);
+    }
+
     /// A base table's paths for a LIMIT's join search, in the order
     /// `set_plain_rel_pathlist` makes them (RP-028), each with the joined-row
     /// key an index scan returns its rows in the order of: its sequential
@@ -9543,7 +9634,7 @@ impl PgHandler {
         columns: &[(String, String)],
         keys: &[(usize, String, u32, f64, secantus_pgplan::joincost::MemoKey)],
         order_col: Option<(usize, String)>,
-    ) -> Option<Vec<(secantus_pgplan::joincost::InPath, Option<String>)>> {
+    ) -> Option<Vec<(secantus_pgplan::joincost::InPath, Option<String>, bool)>> {
         use secantus_pgplan::costsize;
         use secantus_pgplan::joincost::InPath;
         let count = self
@@ -9711,8 +9802,9 @@ impl PgHandler {
                 InPath::scan(s, t, rows, None)
             },
             None,
+            false,
         )];
-        let mut bitmaps: Vec<(InPath, Option<String>)> = Vec::new();
+        let mut bitmaps: Vec<(InPath, Option<String>, bool)> = Vec::new();
         let mut param_bitmaps: Vec<(u32, InPath)> = Vec::new();
         for ix in &indexes {
             if qual_fields.contains(&ix.field) {
@@ -9727,11 +9819,13 @@ impl PgHandler {
                 );
                 for (kind, (s, t)) in paths {
                     match kind {
-                        costsize::ScanKind::Index(_) => {
-                            out.push((InPath::scan(s, t, rows, None), Some(joined_key(&ix.field)?)))
-                        }
+                        costsize::ScanKind::Index(_) => out.push((
+                            InPath::scan(s, t, rows, None),
+                            Some(joined_key(&ix.field)?),
+                            false,
+                        )),
                         costsize::ScanKind::Bitmap(_) => {
-                            bitmaps.push((InPath::scan(s, t, rows, None), None))
+                            bitmaps.push((InPath::scan(s, t, rows, None), None, true))
                         }
                         costsize::ScanKind::Seq => {}
                     }
@@ -9746,6 +9840,7 @@ impl PgHandler {
                     out.push((
                         InPath::scan(s, t, rows, Some(*class)),
                         Some(joined_key(&ix.field)?),
+                        false,
                     ));
                     continue;
                 }
@@ -9765,6 +9860,7 @@ impl PgHandler {
             out.push((
                 InPath::scan(s, t, rows, Some(ends[0].0)),
                 Some(joined_key(&ix.field)?),
+                false,
             ));
             for (_, _, outer, loop_count, memo_key) in ends {
                 // A clause that cannot move into this table's scan (an
@@ -9786,7 +9882,7 @@ impl PgHandler {
                     memo_key: Some(*memo_key),
                 };
                 let scan = costsize::param_index_scan(&rel, ix, &quals, nd, *loop_count)?;
-                out.push((param(scan), None));
+                out.push((param(scan), None, false));
                 let bitmap =
                     costsize::param_bitmap_heap_scan(&rel, ix, &quals, nd, *loop_count, ppi_rows)?;
                 // One bitmap heap scan a parameterization, over the cheapest
@@ -9804,7 +9900,7 @@ impl PgHandler {
             return None;
         }
         out.extend(bitmaps);
-        out.extend(param_bitmaps.into_iter().map(|(_, b)| (b, None)));
+        out.extend(param_bitmaps.into_iter().map(|(_, b)| (b, None, true)));
         Some(out)
     }
 
@@ -48165,6 +48261,19 @@ impl PgHandler {
                             }
                         }
                     }
+                }
+                // An ORDER BY under a LIMIT over a join of two stored tables
+                // with no WHERE (RP-1099): the plan the LIMIT's search picks
+                // (`create_ordered_paths`), a bounded Sort over its join or
+                // the join in the ORDER BY's order, under the Limit
+                // (`adjust_limit_rows_costs`).
+                // VERBOSE's target lists and ANALYZE's counts over such a
+                // plan are not modelled: its plan stays the one without the
+                // search.
+                if let (Statement::Select(sel), false) =
+                    (inner.as_ref(), options.verbose || options.analyze)
+                {
+                    self.explain_join_limit_order(sel, &mut tree);
                 }
                 // A Limit straight over one relation's sequential scan
                 // (RP-319): the scan's estimate, then
