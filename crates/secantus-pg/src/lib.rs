@@ -47795,10 +47795,26 @@ impl PgHandler {
                 // its order is a Sort over the join's cheapest (RP-1056):
                 // the join is priced below as it is without one, the Sort
                 // lifted off it until then.
+                // The same for a two-table join planned as joined rows
+                // (RP-1119): the join priced as the select with that ORDER
+                // BY cleared.
+                let joined_sort = match inner.as_ref() {
+                    Statement::Select(sel)
+                        if sel.limit.is_none()
+                            && sel.offset == 0
+                            && matches!(sel.distinct, secantus_pgplan::Distinct::None)
+                            && tree.name == "Sort"
+                            && tree.children.len() == 1 =>
+                    {
+                        self.joined_sort_select(sel)
+                    }
+                    _ => None,
+                };
                 let narrow_sort = match inner.as_ref() {
                     Statement::Select(sel)
-                        if sel.join.is_some()
-                            && self.narrow_sort_column(sel).is_some_and(|c| c.is_some())
+                        if ((sel.join.is_some()
+                            && self.narrow_sort_column(sel).is_some_and(|c| c.is_some()))
+                            || joined_sort.is_some())
                             && sel.limit.is_none()
                             && sel.offset == 0
                             && matches!(sel.distinct, secantus_pgplan::Distinct::None)
@@ -47861,6 +47877,7 @@ impl PgHandler {
                 // where `set_cheapest` keeps that path.
                 if tree.name == "Hash Join" {
                     if let Statement::Select(sel) = inner.as_ref() {
+                        let sel = joined_sort.as_ref().unwrap_or(sel);
                         if let Some((plan, a, b, join, implied, from, indexes)) =
                             self.joined_implied_estimate(sel)
                         {
@@ -47980,6 +47997,7 @@ impl PgHandler {
                     && plain_scan(&tree.children[1].children[0].name)
                 {
                     if let Statement::Select(sel) = inner.as_ref() {
+                        let sel = joined_sort.as_ref().unwrap_or(sel);
                         if let Some((a, b, join, pick, indexes)) = self
                             .hash_join_estimate(sel)
                             .or_else(|| self.join_select_hash_estimate(sel))
@@ -49143,18 +49161,20 @@ impl PgHandler {
                         }
                     }
                     // A join's children: their rows, loops and counters
-                    // (RP-386). Under the narrow path's Sort (RP-1056) the
-                    // join returned every row the Sort did.
+                    // (RP-386). Under the narrow path's Sort (RP-1056), or
+                    // one over joined rows (RP-1119), the join returned
+                    // every row the Sort did.
+                    let joined_sort = self.joined_sort_select(sel);
                     if tree.name == "Sort"
                         && tree.children.len() == 1
-                        && sel.join.is_some()
+                        && (sel.join.is_some() || joined_sort.is_some())
                         && sel.limit.is_none()
                         && sel.offset == 0
                         && matches!(sel.distinct, secantus_pgplan::Distinct::None)
                     {
                         let join = &mut tree.children[0];
                         join.actual_rows = Some(rows);
-                        self.analyze_join_children(join, sel, rows);
+                        self.analyze_join_children(join, joined_sort.as_ref().unwrap_or(sel), rows);
                     } else {
                         self.analyze_join_children(&mut tree, sel, rows);
                     }

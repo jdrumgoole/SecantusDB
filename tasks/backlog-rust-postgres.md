@@ -2317,27 +2317,59 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an expression class beside a where restricts its side by both], tests/backlog/test_rp_explain_costs.py::test_plan[an expression class beside an on inequality keeps it the join filter], tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over an expression class prices its join], tests/backlog/test_rp_explain_costs.py::test_plan[a comma join's expression equality joins its class], tests/backlog/test_rp_explain_costs.py::test_plan[an expression class restricting both sides nests loops]
       Backlog-ID: RP-1171
 
-- [ ] **A Sort of an ORDER BY over a two-table join is unpriced where
-      the narrow path's model declines it.** With no LIMIT, `e`, `k`
-      analysed (1000 rows, `k.a` the primary key), PostgreSQL 15.20 prices
-      the Sort as `cost_sort` over the join's cheapest path: `explain
-      select e.b, k.b from e join k on e.a = k.a order by k.a` is `Sort
-      (cost=94.97..97.47 rows=1000 width=10)` over the Hash Join
-      (cost=27.50..45.14, width 10 with `k.a` a resjunk column). Here
-      every node is `cost=0.00..0.00 rows=0 width=0` in three shapes: an
-      ORDER BY on a join key (`k.a`, `e.a`, a LEFT join's too), declined
-      by `narrow_sort_column` because a merge join yields that order and
-      the model does not weigh `pathkeys`; an ORDER BY the planner keeps
-      as joined rows rather than the narrow path (`order by x` for `e.b as
-      x`, `order by 1`, a comma join `from e, k where e.a = k.a order by
-      k.a`), whose `hash_join_estimate` refuses any ORDER BY; and a WHERE
-      fixing a join key (`where k.a = 5 order by e.b`, PostgreSQL's
-      `Sort (cost=25.81..25.82 rows=1 width=6)` over the Nested Loop into
-      `k_pkey`), whose `join_select_implied_estimate` refuses the ORDER
-      BY. A narrow-path ORDER BY on any other column is priced (RP-1056).
-      Found while working RP-1056.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by a join key over a join prices its sort], tests/backlog/test_rp_explain_costs.py::test_plan[an order by an output alias over a join prices its sort], tests/backlog/test_rp_explain_costs.py::test_plan[an order by over a join a where fixes prices its sort]
+- [ ] **A Sort of an ORDER BY on a join key over a two-table join is
+      unpriced.** With no LIMIT, `e`, `k` analysed (1000 rows, `k.a` the
+      primary key), PostgreSQL 15.20 prices the Sort as `cost_sort` over
+      the join's cheapest path: `explain select e.b, k.b from e join k on
+      e.a = k.a order by k.a` is `Sort (cost=94.97..97.47 rows=1000
+      width=10)` over the Hash Join (cost=27.50..45.14, width 10 with `k.a`
+      a resjunk column). Here every node is `cost=0.00..0.00 rows=0
+      width=0`, `order by e.a` and a LEFT join's key too:
+      `narrow_sort_column` declines a join key because a merge join yields
+      that order, and the model does not weigh `pathkeys`. The faithful
+      fix is `create_ordered_paths`: the cheapest total path sorted against
+      the cheapest path already in the key's class order, keeping the
+      cheaper (`add_path`'s 1.01 fuzz). Those keyed paths are the merges
+      `hash_join_of` builds (both sides sorted, when no key is indexed)
+      and, over a unique indexed key, `unique_key_other_paths`' `JoinRel`
+      (`cheapest_keyed_on(CLASS)`), neither of which `hash_join_of`
+      returns today beside its pick. A LEFT join's merge paths are keyed
+      only with the preserved side outer (`build_join_pathkeys` gives a
+      JOIN_RIGHT none), so `order by k.a` over `e left join k` is always a
+      Sort. Since RP-1119's first part, an ORDER BY on any other column
+      is priced on the narrow path, over joined rows (an alias, an
+      ordinal, a comma join) and over the Nested Loop a WHERE constant
+      leaves. Found while working RP-1056.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by a join key over a join prices its sort]
       Backlog-ID: RP-1119
+
+- [ ] **EXPLAIN prints a Sort for an ORDER BY whose column a WHERE
+      constant fixes.** `explain select e.b, k.b from e join k on e.a =
+      k.a where e.b = 'v1' order by e.b` (`e`, `k` analysed, 1000 rows,
+      `k.a` the primary key) prints an unpriced `Sort` (`Sort Key: e.b`)
+      over the Hash Join; PostgreSQL 15.20 prints the Hash Join alone
+      (cost=18.75..38.50 rows=100 width=6): the constant is in the
+      column's equivalence class, so the pathkey is redundant
+      (`pathkey_is_redundant`) and nothing is sorted. The same over an
+      alias (`order by x` for `e.b as x`), and with a join key the WHERE
+      fixes (`where k.a = 5 order by k.a`, PostgreSQL's Nested Loop into
+      `k_pkey`, width 10 with `k.a` resjunk). The rows come back in the
+      same order. `narrow_sort_column`, `joined_sort_select` and
+      `join_select_implied_estimate` decline such a column, so it is
+      unpriced rather than wrongly priced. Found while working RP-1119.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by a column a where fixes sorts nothing], tests/backlog/test_rp_explain_costs.py::test_plan[an order by an alias a where fixes sorts nothing], tests/backlog/test_rp_explain_costs.py::test_plan[an order by a join key a where fixes sorts nothing]
+      Backlog-ID: RP-1172
+
+- [ ] **EXPLAIN ANALYZE of a join planned as joined rows prints its
+      Hash's memory a kB short.** `explain (analyze, timing off, summary
+      off, costs off) select e.b, k.b from e, k where e.a = k.a` (`e`,
+      `k` analysed, 1000 rows) prints `Buckets: 1024  Batches: 1  Memory
+      Usage: 47kB` under the Hash; PostgreSQL 15.20 prints `48kB`, as this
+      server does for the same join written `e join k on e.a = k.a` on the
+      narrow path. The same under a Sort over joined rows (`order by x`
+      for `e.b as x`). Found while working RP-1119.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a comma join counts its hash table's memory]
+      Backlog-ID: RP-1173
 
 - [ ] **An ORDER BY under a LIMIT over a two-table join is an unpriced
       Sort over the join method it would use without them.** `explain
