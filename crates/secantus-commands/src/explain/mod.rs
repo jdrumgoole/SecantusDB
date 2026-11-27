@@ -2504,7 +2504,13 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                     .filter(|_| (forward_scan && filtered) || on.seek.is_some())
                     .and_then(|g| sbe::group_plan(g, &uuid, last, &on))
             } else if forward_scan && filtered {
-                lookup_joins(ctx, &front.lookups)
+                t.docs(storage)
+                    .ok()
+                    .and_then(|local| {
+                        let disk =
+                            !matches!(r.echo.get("allowDiskUse"), Some(Bson::Boolean(false)));
+                        lookup_joins(ctx, &front.lookups, local, disk)
+                    })
                     .and_then(|joins| sbe::lookup_plan(&uuid, &on, &joins, last))
             } else {
                 None
@@ -2998,7 +3004,12 @@ fn sbe_front(
 /// documents or 100 MiB, `internalQueryCollectionMaxNoOfDocumentsToChooseHashJoin`
 /// and `...MaxDataSizeBytesToChooseHashJoin`, a nested loop join), a
 /// collation, or a spec whose names are not plain strings.
-fn lookup_joins(ctx: &CommandContext, specs: &[Document]) -> Option<Vec<sbe::Join>> {
+fn lookup_joins(
+    ctx: &CommandContext,
+    specs: &[Document],
+    local_docs: &[Document],
+    allow_disk_use: bool,
+) -> Option<Vec<sbe::Join>> {
     let storage = ctx.storage().ok()?;
     let db = &ctx.db_name;
     let mut joins = Vec::new();
@@ -3018,6 +3029,7 @@ fn lookup_joins(ctx: &CommandContext, specs: &[Document]) -> Option<Vec<sbe::Joi
                 foreign_field: foreign.to_string(),
                 as_field: as_field.to_string(),
                 foreign: None,
+                index: None,
             });
             continue;
         }
@@ -3026,19 +3038,42 @@ fn lookup_joins(ctx: &CommandContext, specs: &[Document]) -> Option<Vec<sbe::Joi
             return None;
         }
         let t = target(ctx, from).ok()?;
-        let led = t.catalog.iter().any(|ix| {
+        // An index whose first field is a path above or below the foreign
+        // field is not one mongod's rules (`determineLookupStrategy`) were
+        // measured against here.
+        let related = t.catalog.iter().any(|ix| {
             ix.key.keys().next().is_some_and(|first| {
-                first == foreign
-                    || first
-                        .strip_prefix(foreign)
-                        .is_some_and(|r| r.starts_with('.'))
+                first
+                    .strip_prefix(foreign)
+                    .is_some_and(|r| r.starts_with('.'))
                     || foreign
                         .strip_prefix(first.as_str())
                         .is_some_and(|r| r.starts_with('.'))
             })
-        }) || foreign == "_id"
-            || foreign.starts_with("_id.");
-        if led {
+        }) || foreign.starts_with("_id.");
+        if related {
+            return None;
+        }
+        let index = lookup_index(&t.catalog, foreign);
+        // The seeks are made of KeyStrings: a local key the encoder cannot
+        // write (a decimal) is out of what is built here, as is a local
+        // field an earlier join's `as` has written.
+        let hashed = index
+            .as_ref()
+            .is_some_and(|ix| ix.key.values().next().and_then(Bson::as_str) == Some("hashed"));
+        if index.as_ref().is_some_and(|ix| ix.seekable)
+            && (!hashed && !sbe::seekable_keys(local_docs, local)
+                || specs.iter().take_while(|s| *s != spec).any(|s| {
+                    s.get_str("as").is_ok_and(|a| {
+                        local == a || local.strip_prefix(a).is_some_and(|r| r.starts_with('.'))
+                    })
+                }))
+        {
+            return None;
+        }
+        // A hash join needs `allowDiskUse`; without it a collection no
+        // index serves is joined by a nested loop, which is not built here.
+        if !allow_disk_use && !index.as_ref().is_some_and(|ix| ix.seekable) {
             return None;
         }
         let docs = t.docs(storage).ok()?;
@@ -3046,10 +3081,11 @@ fn lookup_joins(ctx: &CommandContext, specs: &[Document]) -> Option<Vec<sbe::Joi
             .iter()
             .map(|d| secantus_core::bsondoc::to_vec(d).map_or(usize::MAX / 2, |v| v.len()))
             .sum();
-        if docs.len() > 10_000 || bytes >= 100 * 1024 * 1024 {
+        if index.is_none() && (docs.len() > 10_000 || bytes >= 100 * 1024 * 1024) {
             return None;
         }
         joins.push(sbe::Join {
+            index,
             namespace,
             local_field: local.to_string(),
             foreign_field: foreign.to_string(),
@@ -3061,6 +3097,62 @@ fn lookup_joins(ctx: &CommandContext, specs: &[Document]) -> Option<Vec<sbe::Joi
         });
     }
     Some(joins)
+}
+
+/// The index an indexed loop join of a `$lookup` on `foreign` seeks, as
+/// mongod picks it (`determineForeignIndexForRightSideOfLookupPushdown`):
+/// of the indexes that lead with the field and are btree or hashed, not
+/// sparse and not partial (a hidden one is not in the catalog), those
+/// the one without a collation (the query has none), then with the fewest
+/// fields, a btree before a hashed one, then the lesser key pattern. One
+/// with a collation is named by the plan but not seeked: a hash join. `None`
+/// when no index qualifies.
+fn lookup_index(catalog: &[Arc<IndexInfo>], foreign: &str) -> Option<sbe::ForeignIndex> {
+    let mut eligible: Vec<&Arc<IndexInfo>> = catalog
+        .iter()
+        .filter(|ix| {
+            ix.key.keys().next().is_some_and(|first| first == foreign)
+                && !ix.sparse
+                && ix.partial.is_none()
+                && ix.wildcard.is_none()
+                && ix.geo.is_none()
+                && ix.clustered.is_none()
+                && ix.key.values().all(|v| {
+                    crate::util::as_i64(v).is_some()
+                        || matches!(v, Bson::Double(_))
+                        || v.as_str() == Some("hashed")
+                })
+        })
+        .collect();
+    let hashed = |ix: &IndexInfo| ix.key.values().any(|v| v.as_str() == Some("hashed"));
+    eligible.sort_by(|a, b| {
+        // The query has no collation: an index without one comes first.
+        a.collation
+            .is_some()
+            .cmp(&b.collation.is_some())
+            .then(a.key.len().cmp(&b.key.len()))
+            .then(hashed(a).cmp(&hashed(b)))
+            .then_with(|| key_pattern_order(&a.key, &b.key))
+    });
+    let ix = eligible.first()?;
+    Some(sbe::ForeignIndex {
+        name: ix.name.clone(),
+        key: ix.key.clone(),
+        multikey: ix.is_multikey(),
+        unique: ix.unique,
+        seekable: ix.collation.is_none(),
+    })
+}
+
+/// `BSONObj::woCompare` of two key patterns, by value and then field name.
+fn key_pattern_order(a: &Document, b: &Document) -> std::cmp::Ordering {
+    for ((ka, va), (kb, vb)) in a.iter().zip(b.iter()) {
+        let o = secantus_core::order::cmp(va, vb).then_with(|| ka.cmp(kb));
+        if o != std::cmp::Ordering::Equal {
+            return o;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// Under `queryFramework: "sbe"`, the `$addFields` / `$set` specs of a

@@ -22,7 +22,11 @@
 //! RM-683): `hash_lookup` over the query's plan and a scan of the foreign
 //! collection, each foreign record's keys made by a correlated program of
 //! `nlj`, `branch`, `union`, `unwind`, `limit` and `coscan` (`corr.rs`),
-//! run over both collections' documents. Everything else SBE runs is still
+//! run over both collections' documents, and its indexed loop join when an
+//! index leads with the foreign field (`index_join.rs`, RM-683): `nlj` over
+//! the local rows with, for each, `ixseek` of the intervals of the index,
+//! `unique_roaring` over a multikey one and a `seek` of each document.
+//! Everything else SBE runs is still
 //! explained in the classic shape (`tasks/backlog-rust-mongodb.md`, RM-071,
 //! RM-543).
 
@@ -31,6 +35,7 @@ mod expr;
 mod filter;
 mod find;
 mod group;
+mod index_join;
 mod lookup;
 mod print;
 mod stage;
@@ -39,6 +44,7 @@ use bson::{doc, Bson, Document};
 use expr::Slot;
 pub(crate) use filter::Filter;
 pub(crate) use group::{Front, Seek};
+pub(crate) use index_join::{seekable_keys, ForeignIndex};
 pub(crate) use lookup::Join;
 use stage::{Counted, Stage};
 
@@ -338,7 +344,7 @@ fn stats_doc(
             out.insert("thenStage", inputs[0].clone());
             out.insert("elseStage", inputs[1].clone());
         }
-        (Stage::Nlj { .. }, 2) => {
+        (Stage::Nlj { .. } | Stage::IndexJoin { .. }, 2) => {
             out.insert("outerStage", inputs[0].clone());
             out.insert("innerStage", inputs[1].clone());
         }

@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from bson import Decimal128
 
 from tests.backlog.conftest import mongo_answer
 from tests.backlog.test_rm_057_084 import mongod_rs  # noqa: F401 - fixture
@@ -21,23 +22,33 @@ def _join(**over: Any) -> dict:
 
 
 def _top(
-    client: Any, pipeline: list, foreign: list, index: Any = None, local_index: Any = None
+    client: Any,
+    pipeline: list,
+    foreign: list,
+    index: Any = None,
+    local_index: Any = None,
+    options: dict | None = None,
+    index_options: dict | None = None,
+    local: list | None = None,
+    local_collection: dict | None = None,
 ) -> Any:
     """How the reply names the `$lookup` it explains: its explain version,
     whether it lists classic `stages`, and the strategy of its `EQ_LOOKUP`."""
     client.drop_database("rm683lk")
     db = client.rm683lk
-    db.c.insert_many([{"_id": n, "a": n} for n in range(1, 4)])
+    if local_collection:
+        db.create_collection("c", **local_collection)
+    db.c.insert_many(local or [{"_id": n, "a": n} for n in range(1, 4)])
     db.d.insert_many(foreign)
     if index:
-        db.d.create_index(index)
+        db.d.create_index(index, **(index_options or {}))
     if local_index:
         db.c.create_index(local_index)
 
     def run() -> dict:
         reply = db.command(
             "explain",
-            {"aggregate": "c", "pipeline": pipeline, "cursor": {}},
+            {"aggregate": "c", "pipeline": pipeline, "cursor": {}, **(options or {})},
             verbosity="queryPlanner",
         )
         plan = reply.get("queryPlanner", {}).get("winningPlan", {}).get("queryPlan", {})
@@ -75,9 +86,61 @@ def test_a_lookup_on_an_indexed_foreign_field_is_an_indexed_loop_join(
     assert _indexed(rust_mongo) == _indexed(mongod_rs)
 
 
+def _decimal(client: Any) -> dict:
+    local = [{"_id": 1, "a": Decimal128("4")}, {"_id": 2, "a": [Decimal128("1.5"), 2]}]
+    foreign = [{"_id": 1, "b": 4}, {"_id": 2, "b": Decimal128("1.5")}]
+    return {"a decimal local key": _top(client, [_join()], foreign, [("b", 1)], local=local)}
+
+
+@pytest.mark.backlog("RM-838")
+def test_an_indexed_loop_join_over_decimal_keys_is_explained_as_sbe(
+    rust_mongo: Any,
+    mongod_rs: Any,  # noqa: F811
+) -> None:
+    """mongod 8.2.11 seeks a decimal as it seeks any number (a decimal and
+    an int or double that are equal share a KeyString); this server's
+    KeyString encoder does not write a `Decimal128`, so it explains the
+    `$lookup` as a classic `$cursor` and `$lookup`."""
+    assert _decimal(rust_mongo) == _decimal(mongod_rs)
+
+
+def _collated(client: Any) -> dict:
+    en = {"collation": {"locale": "en", "strength": 2}}
+    return {
+        "a command collation over a collated index": _top(
+            client, [_join()], _FOREIGN, [("b", 1)], options=en, index_options=en
+        ),
+        "a command collation over a plain index": _top(
+            client, [_join()], _FOREIGN, [("b", 1)], options=en
+        ),
+        "a collated local collection": _top(
+            client, [_join()], _FOREIGN, [("b", 1)], local_collection=en
+        ),
+        "a collated foreign index under a plain query": _top(
+            client, [_join()], _FOREIGN, [("b", 1)], index_options=en
+        ),
+    }
+
+
+@pytest.mark.backlog("RM-839")
+def test_a_lookup_under_a_collation_is_explained_as_sbe(
+    rust_mongo: Any,
+    mongod_rs: Any,  # noqa: F811
+) -> None:
+    """mongod 8.2.11 explains a `$lookup` under the command's collation, or
+    over a local collection with a default one, as SBE, joining by an index
+    whose collation is the query's (`IndexedLoopJoin`, its seeks made with
+    `collKs`) and by hash or dynamic indexed loop otherwise; this server
+    explains each as a classic `$cursor` and `$lookup`."""
+    assert _collated(rust_mongo) == _collated(mongod_rs)
+
+
 def _nested(client: Any) -> dict:
     big = [{"_id": n, "b": n % 7} for n in range(10_001)]
-    return {"past 10,000 documents": _top(client, [_join()], big)}
+    return {
+        "past 10,000 documents": _top(client, [_join()], big),
+        "without allowDiskUse": _top(client, [_join()], _FOREIGN, options={"allowDiskUse": False}),
+    }
 
 
 @pytest.mark.backlog("RM-683")
@@ -86,8 +149,10 @@ def test_a_lookup_on_a_large_foreign_collection_is_a_nested_loop_join(
     mongod_rs: Any,  # noqa: F811
 ) -> None:
     """mongod 8.2.11 joins a foreign collection of more than 10,000
-    documents (or 100 MiB) by `NestedLoopJoin`, explained as SBE; this
-    server explains it as a classic `$cursor` and `$lookup`."""
+    documents (or 100 MiB), or any collection no index serves when the
+    command has `allowDiskUse: false` (a hash join needs it), by
+    `NestedLoopJoin`, explained as SBE; this server explains it as a classic
+    `$cursor` and `$lookup`."""
     assert _nested(rust_mongo) == _nested(mongod_rs)
 
 

@@ -23,11 +23,13 @@
 //! three more for each component but the last.
 //!
 //! Built for a foreign collection that exists and has no index on the
-//! foreign field, or does not exist (`NonExistentForeignCollection`); the
-//! other strategies are not built here (`None`).
+//! foreign field, or does not exist (`NonExistentForeignCollection`); a
+//! foreign field an index leads is an indexed loop join (`index_join.rs`);
+//! the other strategies are not built here (`None`).
 
 use super::expr::{BinOp, Expr, Slot};
 use super::group::{scan, Front, Scanned, Slots};
+use super::index_join::{self, ForeignIndex};
 use super::stage::{Agg, AggFn, Stage};
 use super::Plan;
 use bson::{doc, Bson, Document};
@@ -43,6 +45,9 @@ pub(crate) struct Join {
     /// The foreign collection's UUID, and its documents in record order;
     /// `None` when it does not exist.
     pub foreign: Option<(String, Vec<Document>)>,
+    /// The index the strategy is an indexed loop join over; `None`: no
+    /// index qualifies, and the foreign collection is scanned.
+    pub index: Option<ForeignIndex>,
 }
 
 /// A frame id source: ids are taken in the order the program is built.
@@ -107,7 +112,7 @@ fn path_below(read: Expr, rest: &[String], frames: &mut Frames) -> Expr {
 }
 
 /// The outer side's join keys: the field's value as a set of keys.
-fn outer_keys(record: Slot, path: &[String], base: u32) -> Expr {
+pub(super) fn outer_keys(record: Slot, path: &[String], base: u32) -> Expr {
     let n = path.len() as u32;
     // `2n` frame ids are taken before the program's own, the let's the last.
     let frame = base + 2 * n;
@@ -152,7 +157,7 @@ fn outer_keys(record: Slot, path: &[String], base: u32) -> Expr {
     )
 }
 
-fn limit_one(node: u32) -> Stage {
+pub(super) fn limit_one(node: u32) -> Stage {
     Stage::LimitLit {
         node,
         limit: 1,
@@ -161,7 +166,7 @@ fn limit_one(node: u32) -> Stage {
 }
 
 /// The frames a local field of `n` components takes.
-fn frames_taken(n: usize) -> u32 {
+pub(super) fn frames_taken(n: usize) -> u32 {
     (5 * n as u32).saturating_sub(3).max(2)
 }
 
@@ -177,7 +182,7 @@ pub(super) fn build(uuid: &str, front: &Front, joins: &[Join], last: bool) -> Op
     let Scanned {
         mut root,
         record,
-        env,
+        mut env,
         mut query_plan,
         ..
     } = scan(front, uuid, BTreeSet::new(), &mut slots)?;
@@ -199,6 +204,7 @@ pub(super) fn build(uuid: &str, front: &Front, joins: &[Join], last: bool) -> Op
         let spec = Expr::SetSpec(vec![join.as_field.clone()]);
         let strategy;
         let result;
+        let mut index_fields: Option<&ForeignIndex> = None;
         match &join.foreign {
             None => {
                 strategy = "NonExistentForeignCollection";
@@ -218,8 +224,34 @@ pub(super) fn build(uuid: &str, front: &Front, joins: &[Join], last: bool) -> Op
                     input: Box::new(root),
                 };
             }
+            Some((foreign_uuid, docs)) if join.index.as_ref().is_some_and(|ix| ix.seekable) => {
+                let index = join.index.as_ref()?;
+                strategy = "IndexedLoopJoin";
+                let joined = index_join::build(
+                    index_join::Inputs {
+                        node,
+                        root,
+                        current,
+                        local: &local,
+                        foreign: &foreign,
+                        frame_base,
+                        object,
+                        spec,
+                        uuid: foreign_uuid,
+                        docs,
+                        index,
+                    },
+                    &mut slots,
+                    &mut env,
+                )?;
+                root = joined.root;
+                result = joined.result;
+                frame_base += joined.frames;
+                index_fields = Some(index);
+            }
             Some((foreign_uuid, docs)) => {
                 strategy = "HashJoin";
+                index_fields = join.index.as_ref();
                 let key = slots.next();
                 let rec = slots.next();
                 let rid = slots.next();
@@ -384,7 +416,7 @@ pub(super) fn build(uuid: &str, front: &Front, joins: &[Join], last: bool) -> Op
             }
         }
         current = result;
-        query_plan = doc! {
+        let mut eq = doc! {
             "stage": "EQ_LOOKUP",
             "planNodeId": node as i32,
             "foreignCollection": join.namespace.clone(),
@@ -392,9 +424,14 @@ pub(super) fn build(uuid: &str, front: &Front, joins: &[Join], last: bool) -> Op
             "foreignField": join.foreign_field.clone(),
             "asField": join.as_field.clone(),
             "strategy": strategy,
-            "scanDirection": "forward",
-            "inputStage": query_plan,
         };
+        if let Some(ix) = index_fields {
+            eq.insert("indexName", ix.name.clone());
+            eq.insert("indexKeyPattern", ix.key.clone());
+        }
+        eq.insert("scanDirection", "forward");
+        eq.insert("inputStage", query_plan);
+        query_plan = eq;
     }
     Some(Plan {
         root,
