@@ -1240,6 +1240,10 @@ one beside it.
       0.82 to 1.28 (2026-11-27). So on CI's runner the fix left the ratio
       near 1.1 where locally it is 1.02: either the runner's noise spans
       the bound or some growth CI sees is not seen on arm64 macOS.
+      A fifth, the next snapshot but one (#3087 at `74aef8b8`, RP-1121's
+      EXPLAIN VERBOSE change; run 46042159284, job 140652457171): 26.9 ms
+      against 31.0 ms, ratio median 1.15, rounds 0.91 to 1.20; #3086
+      between them passed. Two of the last three CI runs now fail it.
       Verify: none -- intermittent on CI; RP-715's, RP-911's and RP-1073's tests are the check
       Backlog-ID: RP-1100
 
