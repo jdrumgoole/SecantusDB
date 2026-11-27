@@ -3457,6 +3457,74 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Index Cond: (a = 3)",
         ],
     ),
+    # Measured on a private PostgreSQL 15.20 cluster: AGG_PLAIN over the
+    # Nested Loop, each aggregate's transition once a row (RP-1104).
+    "an aggregate over a join's class constant is priced": (
+        "RP-1104",
+        _ANALYSED,
+        "explain select count(*) from e join k on e.a = k.a where e.a = 3",
+        [
+            "Aggregate  (cost=25.80..25.82 rows=1 width=8)",
+            "  ->  Nested Loop  (cost=0.28..25.80 rows=1 width=0)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=4)",
+            "              Filter: (a = 3)",
+            "        ->  Index Only Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=4)",
+            "              Index Cond: (a = 3)",
+        ],
+    ),
+    "an aggregate reading the inner side of a join's class constant is priced": (
+        "RP-1104",
+        _ANALYSED,
+        "explain select count(*), max(k.b) from e join k on e.a = k.a where e.a = 3",
+        [
+            "Aggregate  (cost=25.81..25.82 rows=1 width=40)",
+            "  ->  Nested Loop  (cost=0.28..25.80 rows=1 width=3)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=4)",
+            "              Filter: (a = 3)",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "              Index Cond: (a = 3)",
+        ],
+    ),
+    "an aggregate over a join whose inner key the constant fixes": (
+        "RP-1104",
+        _ANALYSED,
+        "explain (costs off) select count(*) from e join k on e.a = k.a where k.a = 3",
+        [
+            "Aggregate",
+            "  ->  Nested Loop",
+            "        ->  Seq Scan on e",
+            "              Filter: (a = 3)",
+            "        ->  Index Only Scan using k_pkey on k",
+            "              Index Cond: (a = 3)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1104).
+    "a group by over a join prints its key": (
+        "RP-1151",
+        _ANALYSED,
+        "explain (costs off) select count(*) from e join k on e.a = k.a group by e.b",
+        [
+            "HashAggregate",
+            "  Group Key: e.b",
+            "  ->  Hash Join",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e",
+            "        ->  Hash",
+            "              ->  Seq Scan on k",
+        ],
+    ),
+    "explain verbose of an aggregate prints its output": (
+        "RP-1152",
+        _ANALYSED,
+        "explain (verbose, costs off) select count(*) from e",
+        [
+            "Aggregate",
+            "  Output: count(*)",
+            "  ->  Seq Scan on public.e",
+            "        Output: a, b",
+        ],
+    ),
     "a three-way comma join's class constant is each inner index's cond": (
         "RP-1105",
         _ANALYSED,
@@ -10309,6 +10377,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1104",
         "RP-1103",
         "RP-1101",
         "RP-1027",
