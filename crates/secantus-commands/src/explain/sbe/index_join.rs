@@ -51,9 +51,12 @@ pub(crate) struct ForeignIndex {
     pub seekable: bool,
 }
 
-/// What the join runs over, and the programs it evaluates.
+/// What the join runs over, and the programs it evaluates. A nested loop
+/// join (`scan`) reads every document for each local row and has no index:
+/// the index's fields below are unused.
 #[derive(Debug)]
 pub(crate) struct Foreign {
+    scan: bool,
     docs: Vec<Document>,
     /// The index's entries, each document's keys: the KeyString of the
     /// whole key, and the record id, in index order.
@@ -232,12 +235,12 @@ pub(super) struct Inputs<'a> {
     pub spec: Expr,
     pub uuid: &'a str,
     pub docs: &'a [Document],
-    pub index: &'a ForeignIndex,
 }
 
 /// The indexed loop join of one `$lookup` over `root`.
 pub(super) fn build(
     i: Inputs<'_>,
+    index: &ForeignIndex,
     slots: &mut Slots,
     env: &mut Vec<(Slot, String)>,
 ) -> Option<Joined> {
@@ -252,7 +255,6 @@ pub(super) fn build(
         spec,
         uuid,
         docs,
-        index,
     } = i;
     let key = &index.key;
     let first_spec = key.values().next().cloned().unwrap_or(Bson::Int32(1));
@@ -419,18 +421,72 @@ pub(super) fn build(
     let after_local = frame_base + local_frames;
     let first_frame = after_local + 2 * foreign.len() as u32 + 1;
     let filter = foreign_filter(foreign, record, set, first_frame);
+    let (right, matched) = grouped_matches(node, fetch, record, filter.clone(), slots);
+    let result = slots.next();
+    let foreign_data = Arc::new(Foreign {
+        scan: false,
+        docs: docs.to_vec(),
+        entries: index_entries(docs, key)?,
+        first_desc,
+        first_hashed,
+        multikey: index.multikey,
+        unique_point: index.unique && key.len() == 1,
+        set,
+        unwound,
+        array_slot,
+        array_value,
+        array_filter,
+        record,
+        filter,
+        matched,
+    });
+    let join = Stage::IndexJoin {
+        node,
+        projects: vec![current],
+        correlated: vec![set],
+        outer: Box::new(outer),
+        inner: Box::new(right),
+        foreign: foreign_data,
+    };
+    let project = Stage::Project {
+        node,
+        binds: vec![(
+            result,
+            Expr::func(object, vec![spec, Expr::Slot(current), Expr::Slot(matched)]),
+        )],
+        input: Box::new(join),
+    };
+    Some(Joined {
+        root: project,
+        result,
+        frames: local_frames + 4 * foreign.len() as u32 - 1,
+    })
+}
+
+/// The stages that keep the foreign records whose keys the local set has,
+/// group them into an array and give an empty one when there is none (the
+/// inner side of a join, under its `limit 1`): `filter` of `source`'s
+/// records, `group`, `project`, and a `union` with a constant. Takes the
+/// slots after the source's: the group's spill, its output, the array, the
+/// constant and the union's output (returned).
+fn grouped_matches(
+    node: u32,
+    source: Stage,
+    record: Slot,
+    predicate: Expr,
+    slots: &mut Slots,
+) -> (Stage, Slot) {
+    const CAP: i32 = 104_857_600;
     let filtered = Stage::Filter {
         node,
-        predicate: filter.clone(),
-        input: Box::new(fetch),
+        predicate,
+        input: Box::new(source),
     };
-    const CAP: i32 = 104_857_600;
     let spill = slots.next();
     let grouped = slots.next();
     let array_out = slots.next();
     let empty = slots.next();
     let matched = slots.next();
-    let result = slots.next();
     let group = Stage::Group {
         node,
         keys: vec![],
@@ -471,18 +527,58 @@ pub(super) fn build(
             outputs: vec![matched],
         }),
     };
+    (right, matched)
+}
+
+/// The nested loop join of one `$lookup` over `root` (`buildNljLookupStage`):
+/// the key set of each local row, and for it a scan of the foreign
+/// collection filtered by the keys, grouped into an array. The slots are the
+/// key set, the scan's record and record id, then the group's.
+pub(super) fn build_nested(i: Inputs<'_>, slots: &mut Slots) -> Joined {
+    let Inputs {
+        node,
+        root,
+        current,
+        local,
+        foreign,
+        frame_base,
+        object,
+        spec,
+        uuid,
+        docs,
+    } = i;
+    let set = slots.next();
+    let local_frames = frames_taken(local.len());
+    let outer = Stage::Project {
+        node,
+        binds: vec![(set, outer_keys(current, local, frame_base))],
+        input: Box::new(root),
+    };
+    let (record, record_id) = (slots.next(), slots.next());
+    let first_frame = frame_base + local_frames + 2 * foreign.len() as u32 + 1;
+    let filter = foreign_filter(foreign, record, set, first_frame);
+    let scan = Stage::Scan {
+        node,
+        record,
+        record_id,
+        fields: vec![],
+        uuid: uuid.to_string(),
+    };
+    let (right, matched) = grouped_matches(node, scan, record, filter.clone(), slots);
+    let result = slots.next();
     let foreign_data = Arc::new(Foreign {
+        scan: true,
         docs: docs.to_vec(),
-        entries: index_entries(docs, key)?,
-        first_desc,
-        first_hashed,
-        multikey: index.multikey,
-        unique_point: index.unique && key.len() == 1,
+        entries: Vec::new(),
+        first_desc: false,
+        first_hashed: false,
+        multikey: false,
+        unique_point: false,
         set,
-        unwound,
-        array_slot,
-        array_value,
-        array_filter,
+        unwound: 0,
+        array_slot: 0,
+        array_value: Expr::null(),
+        array_filter: Expr::null(),
         record,
         filter,
         matched,
@@ -503,11 +599,11 @@ pub(super) fn build(
         )],
         input: Box::new(join),
     };
-    Some(Joined {
+    Joined {
         root: project,
         result,
         frames: local_frames + 4 * foreign.len() as u32 - 1,
-    })
+    }
 }
 
 /// Whether every key a local document's `path` gives is one the plan can
@@ -590,7 +686,7 @@ fn inner_counts(inner: &Stage, t: &Tally, shape: (bool, bool, bool), cut: bool) 
     if l == 0 {
         return Counted::blank(inner);
     }
-    let (with_record, without) = (t.fetching, l - t.with_match);
+    let with_record = t.fetching;
     let more = t.unique;
     // Stages of the values: the unwound keys, and the intervals.
     let unwind = counts(t.values, l, l, true, Some(limit_coscan(l, l, true)));
@@ -660,9 +756,17 @@ fn inner_counts(inner: &Stage, t: &Tally, shape: (bool, bool, bool), cut: bool) 
         inner_closes: with_record,
         ..counts(more, l, l, true, None)
     };
+    matched_counts(t, fetch, more, cut)
+}
+
+/// The statistics of the grouping stages over `source`, which delivered
+/// the documents `tested` tests were made of (`grouped_matches`).
+fn matched_counts(t: &Tally, source: Counted, tested: i64, cut: bool) -> Counted {
+    let l = t.rows;
+    let without = l - t.with_match;
     let filter = Counted {
-        tested: more,
-        ..counts(t.kept, l, l, true, Some(fetch))
+        tested,
+        ..counts(t.kept, l, l, true, Some(source))
     };
     let exhausted = t.with_match < l;
     let group = counts(t.with_match, l, l, exhausted, Some(filter));
@@ -689,6 +793,20 @@ fn inner_counts(inner: &Stage, t: &Tally, shape: (bool, bool, bool), cut: bool) 
     counts(l, l, 1, l > 1 || !cut, Some(union))
 }
 
+/// The statistics of a nested loop join's inner side: a scan of the
+/// `scanned` documents it read in all, the same for each local row.
+fn nested_counts(inner: &Stage, t: &Tally, scanned: i64, cut: bool) -> Counted {
+    let l = t.rows;
+    if l == 0 {
+        return Counted::blank(inner);
+    }
+    let scan = Counted {
+        reads: scanned,
+        ..counts(scanned, l, l, true, None)
+    };
+    matched_counts(t, scan, scanned, cut)
+}
+
 /// `nlj` of the local rows and the index seeks of each (`IndexJoin`).
 pub(super) fn run(stage: &Stage, docs: &[Document], demand: Option<usize>) -> (Vec<Row>, Counted) {
     let Stage::IndexJoin {
@@ -706,12 +824,31 @@ pub(super) fn run(stage: &Stage, docs: &[Document], demand: Option<usize>) -> (V
         ..Tally::default()
     };
     let mut out = Vec::with_capacity(rows.len());
+    let mut scanned = 0_i64;
     for mut row in rows {
         let set = match row.get(&f.set).cloned().flatten() {
             Some(Bson::Array(a)) => a,
             _ => Vec::new(),
         };
         let set_value = Some(Bson::Array(set.clone()));
+        if f.scan {
+            // Every document is read and tested against the set.
+            let mut kept: Vec<Bson> = Vec::new();
+            for d in &f.docs {
+                scanned += 1;
+                let mut r = Row::new();
+                r.insert(f.set, set_value.clone());
+                r.insert(f.record, Some(Bson::Document(d.clone())));
+                if eval(&f.filter, &r) == Some(Bson::Boolean(true)) {
+                    kept.push(Bson::Document(d.clone()));
+                }
+            }
+            t.kept += kept.len() as i64;
+            t.with_match += i64::from(!kept.is_empty());
+            row.insert(f.matched, Some(Bson::Array(kept)));
+            out.push(row);
+            continue;
+        }
         // The intervals of each key of the set.
         let mut bounds: Vec<Bson> = Vec::new();
         for w in &set {
@@ -780,8 +917,11 @@ pub(super) fn run(stage: &Stage, docs: &[Document], demand: Option<usize>) -> (V
         out.push(row);
     }
     let cut = demand.is_some_and(|d| out.len() >= d);
-    let hashed = f.first_hashed;
-    let below = inner_counts(inner, &t, (f.multikey, hashed, f.unique_point), cut);
+    let below = if f.scan {
+        nested_counts(inner, &t, scanned, cut)
+    } else {
+        inner_counts(inner, &t, (f.multikey, f.first_hashed, f.unique_point), cut)
+    };
     let l = t.rows;
     (
         out,

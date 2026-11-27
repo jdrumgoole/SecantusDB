@@ -1200,34 +1200,22 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2 documents and 2 keys of `b_1`). Found 2026-11-26 working RM-682.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_an_expr_equality_on_a_let_variable_uses_an_index
       Backlog-ID: RM-813
-- [ ] **A `$lookup` on `localField` / `foreignField` that mongod joins by
-      a nested loop is explained as a classic stage.** mongod 8.2.11 pushes
-      every `$lookup` on join fields over a collection into SBE and explains
-      it so (`explainVersion` "2", no `stages`, an `EQ_LOOKUP` on top of the
-      query's plan). Built: the hash join (2026-11-26, `explain/sbe/lookup.rs`,
-      `corr.rs`) and, since 2026-11-27, the indexed loop join
-      (`explain/sbe/index_join.rs`: an `ixseek` of each local key's
-      intervals of the foreign index, `unique_roaring` over a multikey one,
-      a `seek` of each document, `filter`, `group`; the index picked as
-      `determineLookupStrategy` picks it, a collated one named in the
-      `queryPlan` of a hash join), each with its `executionStats` from a run
-      over both collections (and the index's entries), for a plain
-      collection scan (a `$match`, `$skip` or `$limit` in front, none after
-      but a `$match` of the joined array or an `$addFields`). Open: the
-      strategies mongod takes when no index qualifies, which this server
-      explains as the classic `$cursor` and `$lookup` (`lookup_joins`,
-      `explain/mod.rs`, declines them on purpose: a stand-in `queryPlan`
-      alone would be wrong): `NestedLoopJoin` past 10,000 documents or
-      100 MiB (`internalQueryCollectionMaxNoOfDocumentsToChooseHashJoin`,
-      `...MaxDataSizeBytesToChooseHashJoin`) or, for a collection no index
-      serves, when the command has `allowDiskUse: false` (a hash join needs
-      it: this server answers `HashJoin` for such a `$lookup` no longer, it
-      declines it); and `DynamicIndexedLoopJoin`, for a collated index under
-      a query without that collation when no hash join is possible
-      (`allowDiskUse: false`, or a large collection). Slice: the
-      `NestedLoopJoin` cutover (`buildNljLookupStage`).
-      Verify: tests/backlog/test_rm_lookup_sbe.py::test_a_lookup_on_a_large_foreign_collection_is_a_nested_loop_join
-      Backlog-ID: RM-683
+- [ ] **A `$lookup` that mongod joins by a dynamic indexed loop is
+      explained as a classic stage.** mongod 8.2.11 explains a `$lookup` on
+      `localField` / `foreignField` as SBE whatever the strategy; this
+      server builds the hash join, the indexed loop join and the nested loop
+      join (`explain/sbe/lookup.rs`, `index_join.rs`; RM-683, closed
+      2026-11-27) and declines the one left: `DynamicIndexedLoopJoin`, which
+      mongod takes when the only index leading with the foreign field has a
+      collation the query lacks and no hash join is possible
+      (`allowDiskUse: false`, or a foreign collection past 10,000 documents
+      or 100 MiB). Its plan decides at run time, for each local key, whether
+      to seek the index or scan the collection
+      (`buildDynamicIndexedLoopJoinLookupStage`, `gen_lookup.cpp`).
+      `lookup_joins` (`explain/mod.rs`) declines it on purpose: a stand-in
+      `queryPlan` alone would be wrong. Found 2026-11-27 working RM-683.
+      Verify: tests/backlog/test_rm_lookup_sbe.py::test_a_collated_index_without_a_hash_join_is_a_dynamic_indexed_loop_join
+      Backlog-ID: RM-840
 - [ ] **An indexed loop join over a decimal key is explained as a classic
       stage.** mongod 8.2.11 seeks a `Decimal128` key as it seeks any number
       (a decimal and an int or double that are equal share a KeyString), and

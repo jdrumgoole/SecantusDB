@@ -27,6 +27,7 @@ from tests.backlog.conftest import (  # noqa: F401  (fixtures)
     mongo_answer,
     mongod,
     mongod_rs,
+    mongod_rs_no_yield,
     rust_mongo,
 )
 

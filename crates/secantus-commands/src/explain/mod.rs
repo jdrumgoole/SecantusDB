@@ -2997,13 +2997,14 @@ fn sbe_front(
     })
 }
 
-/// The `$lookup` stages as the hash join builds them, each with the foreign
-/// collection it reads (RM-683); `None` for one mongod joins another way
-/// or this server has not built: a foreign field an index leads with (an
-/// indexed loop join), a collection past what a hash join takes (10,000
-/// documents or 100 MiB, `internalQueryCollectionMaxNoOfDocumentsToChooseHashJoin`
-/// and `...MaxDataSizeBytesToChooseHashJoin`, a nested loop join), a
-/// collation, or a spec whose names are not plain strings.
+/// The `$lookup` stages as mongod joins them, each with the foreign
+/// collection it reads (RM-683): by an indexed loop join when an index
+/// qualifies, else by hash, else by a nested loop (a collection past
+/// 10,000 documents or 100 MiB, `internalQueryCollectionMaxNoOfDocumentsToChooseHashJoin`
+/// and `...MaxDataSizeBytesToChooseHashJoin`, or a command with
+/// `allowDiskUse: false`); `None` for one this server has not built: a
+/// dynamic indexed loop join, a collation, or a spec whose names are not
+/// plain strings.
 fn lookup_joins(
     ctx: &CommandContext,
     specs: &[Document],
@@ -3030,6 +3031,7 @@ fn lookup_joins(
                 as_field: as_field.to_string(),
                 foreign: None,
                 index: None,
+                nested: false,
             });
             continue;
         }
@@ -3071,21 +3073,27 @@ fn lookup_joins(
         {
             return None;
         }
-        // A hash join needs `allowDiskUse`; without it a collection no
-        // index serves is joined by a nested loop, which is not built here.
-        if !allow_disk_use && !index.as_ref().is_some_and(|ix| ix.seekable) {
-            return None;
-        }
         let docs = t.docs(storage).ok()?;
-        let bytes: usize = docs
-            .iter()
-            .map(|d| secantus_core::bsondoc::to_vec(d).map_or(usize::MAX / 2, |v| v.len()))
-            .sum();
-        if index.is_none() && (docs.len() > 10_000 || bytes >= 100 * 1024 * 1024) {
-            return None;
+        // Without an index to seek, mongod joins by hash when the command
+        // allows disk and the collection is small (10,000 documents,
+        // 100 MiB), else by a nested loop over a scan, or by a dynamic
+        // indexed loop when a collated index qualifies (not built here).
+        let mut nested = false;
+        if !index.as_ref().is_some_and(|ix| ix.seekable) {
+            let bytes: usize = docs
+                .iter()
+                .map(|d| secantus_core::bsondoc::to_vec(d).map_or(usize::MAX / 2, |v| v.len()))
+                .sum();
+            if !allow_disk_use || docs.len() > 10_000 || bytes >= 100 * 1024 * 1024 {
+                if index.is_some() {
+                    return None;
+                }
+                nested = true;
+            }
         }
         joins.push(sbe::Join {
             index,
+            nested,
             namespace,
             local_field: local.to_string(),
             foreign_field: foreign.to_string(),

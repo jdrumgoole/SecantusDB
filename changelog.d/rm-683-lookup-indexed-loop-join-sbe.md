@@ -24,13 +24,11 @@ its `queryPlan`).
 - A `$lookup` on an indexed foreign field was explained as a classic
   `$cursor` and `$lookup` stage. Closes the indexed-loop-join slice of RM-683
   (tests/backlog/test_rm_lookup_sbe.py::test_a_lookup_on_an_indexed_foreign_field_is_an_indexed_loop_join,
-  tests/mongod_live/test_lookup_indexed_loop_join.py); the nested loop join
-  stays open under RM-683, and what the work found is filed as RM-838
-  (decimal keys) and RM-839 (a `$lookup` under a collation).
+  tests/mongod_live/test_lookup_indexed_loop_join.py); what the work found is
+  filed as RM-838 (decimal keys) and RM-839 (a `$lookup` under a collation).
 - A `$lookup` with `allowDiskUse: false` over a collection no index serves was
   explained as a hash join, which needs `allowDiskUse`; mongod joins it by a
-  nested loop (RM-683), so it is explained as the classic stage until that is
-  built.
+  nested loop (see `rm-683-lookup-nested-loop-join-sbe`).
 - The `makeObj` of a `$lookup` in front of another was not evaluated, so the
   second join's local keys were those of a missing field.
 - A `)` or `,` that starts a line of an SBE expression takes back one column

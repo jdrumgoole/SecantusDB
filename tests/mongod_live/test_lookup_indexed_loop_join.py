@@ -12,7 +12,9 @@ seek and key. A collated, sparse or partial index does not qualify and the
 `$lookup` stays a hash join (`test_lookup_hash_join.py`). Compared are the
 whole `queryPlanner`, `executionStats` and classic `stages` of every reply,
 less the clock and with each collection's UUID named by the collection, at
-each verbosity. Measured on 8.2.11, 2026-11-27.
+each verbosity, against a mongod whose time-based plan yielding is off
+(`mongod_rs_no_yield`: its yields are timed, and this server makes none).
+Measured on 8.2.11, 2026-11-27.
 """
 
 from __future__ import annotations
@@ -318,9 +320,9 @@ def explained(client: Any, case: str, verbosity: str) -> str:
 @pytest.mark.parametrize("verbosity", ["queryPlanner", "executionStats", "allPlansExecution"])
 @pytest.mark.parametrize("case", list(CASES))
 def test_an_indexed_loop_join_lookup_is_explained_as_mongod_does(
-    rust_mongo: Any, mongod_rs: Any, case: str, verbosity: str
+    rust_mongo: Any, mongod_rs_no_yield: Any, case: str, verbosity: str
 ) -> None:
-    same(explained(rust_mongo, case, verbosity), explained(mongod_rs, case, verbosity))
+    same(explained(rust_mongo, case, verbosity), explained(mongod_rs_no_yield, case, verbosity))
 
 
 def test_an_explained_indexed_loop_join_is_sbe(rust_mongo: Any) -> None:

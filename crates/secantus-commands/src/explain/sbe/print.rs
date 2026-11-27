@@ -686,7 +686,7 @@ fn tally(stage: &Stage, counted: &Counted, t: &mut Tally) {
     match stage {
         Stage::Scan { .. } => {
             t.docs += counted.reads;
-            t.scans += 1;
+            t.scans += counted.opens.unwrap_or(1);
         }
         // A seek of each fetched document (RM-695).
         Stage::Seek { .. } => {

@@ -75,7 +75,7 @@ def _indexed(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-683")
+@pytest.mark.backlog_fixed("RM-683")
 def test_a_lookup_on_an_indexed_foreign_field_is_an_indexed_loop_join(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -135,6 +135,40 @@ def test_a_lookup_under_a_collation_is_explained_as_sbe(
     assert _collated(rust_mongo) == _collated(mongod_rs)
 
 
+def _dynamic(client: Any) -> dict:
+    en = {"collation": {"locale": "en"}}
+    return {
+        "without allowDiskUse": _top(
+            client,
+            [_join()],
+            _FOREIGN,
+            [("b", 1)],
+            options={"allowDiskUse": False},
+            index_options=en,
+        ),
+        "past 10,000 documents": _top(
+            client,
+            [_join()],
+            [{"_id": n, "b": n} for n in range(10_001)],
+            [("b", 1)],
+            index_options=en,
+        ),
+    }
+
+
+@pytest.mark.backlog("RM-840")
+def test_a_collated_index_without_a_hash_join_is_a_dynamic_indexed_loop_join(
+    rust_mongo: Any,
+    mongod_rs: Any,  # noqa: F811
+) -> None:
+    """mongod 8.2.11 joins by `DynamicIndexedLoopJoin` when the only index
+    that leads with the foreign field has a collation the query lacks and no
+    hash join is possible (`allowDiskUse: false`, or a foreign collection
+    past 10,000 documents), explained as SBE; this server explains it as a
+    classic `$cursor` and `$lookup`."""
+    assert _dynamic(rust_mongo) == _dynamic(mongod_rs)
+
+
 def _nested(client: Any) -> dict:
     big = [{"_id": n, "b": n % 7} for n in range(10_001)]
     return {
@@ -143,7 +177,7 @@ def _nested(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-683")
+@pytest.mark.backlog_fixed("RM-683")
 def test_a_lookup_on_a_large_foreign_collection_is_a_nested_loop_join(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811

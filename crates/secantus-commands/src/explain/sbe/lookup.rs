@@ -48,6 +48,9 @@ pub(crate) struct Join {
     /// The index the strategy is an indexed loop join over; `None`: no
     /// index qualifies, and the foreign collection is scanned.
     pub index: Option<ForeignIndex>,
+    /// No index is seeked and no hash table built: the foreign collection
+    /// is scanned for each local row (`NestedLoopJoin`).
+    pub nested: bool,
 }
 
 /// A frame id source: ids are taken in the order the program is built.
@@ -239,8 +242,8 @@ pub(super) fn build(uuid: &str, front: &Front, joins: &[Join], last: bool) -> Op
                         spec,
                         uuid: foreign_uuid,
                         docs,
-                        index,
                     },
+                    index,
                     &mut slots,
                     &mut env,
                 )?;
@@ -248,6 +251,28 @@ pub(super) fn build(uuid: &str, front: &Front, joins: &[Join], last: bool) -> Op
                 result = joined.result;
                 frame_base += joined.frames;
                 index_fields = Some(index);
+            }
+            Some((foreign_uuid, docs)) if join.nested => {
+                strategy = "NestedLoopJoin";
+                index_fields = join.index.as_ref();
+                let joined = index_join::build_nested(
+                    index_join::Inputs {
+                        node,
+                        root,
+                        current,
+                        local: &local,
+                        foreign: &foreign,
+                        frame_base,
+                        object,
+                        spec,
+                        uuid: foreign_uuid,
+                        docs,
+                    },
+                    &mut slots,
+                );
+                root = joined.root;
+                result = joined.result;
+                frame_base += joined.frames;
             }
             Some((foreign_uuid, docs)) => {
                 strategy = "HashJoin";
