@@ -1306,16 +1306,28 @@ fn finish_join_source(
         above.where_clause = None;
         above.from_clause.clear();
         let node = N::SelectStmt(Box::new(above));
-        let mut keys: Vec<String> = Vec::new();
+        // In the order the query's text first reads each, as
+        // `build_base_rel_tlists` adds them to a table's target list
+        // (`pull_var_clause` over the target list, depth first), which
+        // lays out the tuples a hash join stores (`hash_grown_order`);
+        // `nodes()` walks breadth first.
+        let mut refs: Vec<(i32, String)> = Vec::new();
         for (n, _, _, _) in node.nodes() {
             if let pg_query::NodeRef::ColumnRef(c) = n {
                 if let [f] = c.fields.as_slice() {
                     if let Some(N::String(k)) = f.node.as_ref() {
-                        if k.sval.contains(SEP) && !keys.contains(&k.sval) {
-                            keys.push(k.sval.clone());
+                        if k.sval.contains(SEP) {
+                            refs.push((c.location, k.sval.clone()));
                         }
                     }
                 }
+            }
+        }
+        refs.sort_by_key(|(at, _)| *at);
+        let mut keys: Vec<String> = Vec::new();
+        for (_, k) in refs {
+            if !keys.contains(&k) {
+                keys.push(k);
             }
         }
         keys

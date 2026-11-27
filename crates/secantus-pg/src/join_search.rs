@@ -284,10 +284,10 @@ pub(crate) struct Step {
     /// batches and its OUTER key's type, whose hash places an outer row
     /// in its batch. `None` for one batch.
     pub(crate) batches: Option<(u64, u64, String)>,
-    /// A hash join's hashed side's columns, all of one fixed length, when
-    /// its tuples' sizes are known: a table that outgrows its buckets is
-    /// rebuilt in chunk order (`hash_grown_order`).
-    pub(crate) hash_tuple: Option<(Vec<String>, i64)>,
+    /// A hash join's hashed side's columns in its tuples' order, with
+    /// their layouts, when its tuples' sizes are known: a table that
+    /// outgrows its buckets is rebuilt in chunk order (`hash_grown_order`).
+    pub(crate) hash_tuple: Option<Vec<(String, crate::TupleCol)>>,
     /// Further clauses' keys `(a_key, b_key)`, sorted and matched on after
     /// the first (a join of two relations on several clauses).
     pub(crate) extra: Vec<(String, String)>,
@@ -867,6 +867,90 @@ impl PgHandler {
         } else {
             pair_filters[c.pair].iter().map(|(i, _)| *i).collect()
         };
+        // The tuples a hash join stores: the hashed relation's target list
+        // (`build_joinrel_tlist`), its tables in range-table order (x, y,
+        // z, a RIGHT join's preserved table only ever hashed alone), each
+        // table's columns in its target list's order -- those the query
+        // reads, in the order its text reads them (`build_base_rel_tlists`),
+        // then each ON's keys, the lower ON first (`deconstruct_recurse`
+        // distributes a join's quals after its inputs'), a key kept where a
+        // table outside the relation needs it: the other side of its
+        // clause, or, over one class, every member
+        // (`generate_base_implied_equalities_normal`). A join filter's
+        // columns are not modelled: no layout.
+        let leaves = [x_node.as_ref(), y_node.as_ref(), z_node.as_ref()];
+        let ons = [(xk, yk), (wk, zk)];
+        let tuple = |set: &[usize]| -> Option<Vec<(String, crate::TupleCol)>> {
+            if *other1 || *other2 || spans != 0 {
+                return None;
+            }
+            let needed = needed_keys()?;
+            let inside = |k: &str| set.iter().any(|&t| bases[t].alias == alias_of(k));
+            let mut cols: Vec<(String, crate::TupleCol)> = Vec::new();
+            for t in 0..3 {
+                if !set.contains(&t) {
+                    continue;
+                }
+                let mine = |k: &str| alias_of(k) == bases[t].alias;
+                let mut keys: Vec<&str> = needed
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|k| mine(k))
+                    .collect();
+                for (l, r) in ons {
+                    for (k, other) in [(l, r), (r, l)] {
+                        if mine(k) && (ec || !inside(other)) {
+                            keys.push(k);
+                        }
+                    }
+                }
+                for k in keys {
+                    if cols.iter().any(|(c, _)| c == k) {
+                        continue;
+                    }
+                    let col = crate::TupleCol::of_type(&leaf_key_type(leaves[t], k)?)?;
+                    cols.push((k.to_string(), col));
+                }
+            }
+            Some(cols)
+        };
+        // The hashed side of a hash join of `a` and `b`, and its estimated
+        // rows: a table split into batches never grows its buckets.
+        let hashed = |method: JoinMethod, a: Vec<usize>, b: Vec<usize>, rows: (f64, f64)| {
+            let (set, rows) = match method {
+                JoinMethod::HashOuterA | JoinMethod::HashFullA => (b, rows.1),
+                JoinMethod::HashOuterB | JoinMethod::HashRightB | JoinMethod::HashFullB => {
+                    (a, rows.0)
+                }
+                _ => return None,
+            };
+            let cols = tuple(&set)?;
+            // Its width with no statistics (`get_typavgwidth`: 32 for a
+            // varlena), which sizes its batches.
+            let width = cols
+                .iter()
+                .map(|(_, c)| match c {
+                    crate::TupleCol::Fixed { len, .. } => *len as i64,
+                    crate::TupleCol::Varlena => 32,
+                })
+                .sum();
+            let (_, nbatch) = secantus_pgplan::joincost::hash_table_size(rows, width);
+            (nbatch == 1).then_some(cols)
+        };
+        let first_rows = (side(p.a, &p.a_key)?.rows, side(p.b, &p.b_key)?.rows);
+        let first_tuple = hashed(first.method, vec![p.a], vec![p.b], first_rows);
+        let (pair_set, base_set) = (vec![p.a, p.b], vec![c.base]);
+        let (second_a, second_b) = if c.pair_first {
+            (pair_set, base_set)
+        } else {
+            (base_set, pair_set)
+        };
+        let second_tuple = hashed(
+            choice.method,
+            second_a,
+            second_b,
+            (a.rows, sides[choice.combo].1.rows),
+        );
         let plan = ThreePlan {
             first_filters,
             first: (p.a, p.b),
@@ -881,7 +965,7 @@ impl PgHandler {
                 filters: Vec::new(),
                 batches: None,
                 extra: Vec::new(),
-                hash_tuple: None,
+                hash_tuple: first_tuple,
                 desc: false,
                 nulls_first: false,
             },
@@ -900,7 +984,7 @@ impl PgHandler {
                 filters: rest,
                 batches: None,
                 extra: Vec::new(),
-                hash_tuple: None,
+                hash_tuple: second_tuple,
                 desc: false,
                 nulls_first: false,
             },
@@ -1446,7 +1530,7 @@ impl PgHandler {
         // A hash table that outgrows the buckets its estimate sized: its
         // rows in the rebuilt chains' order, which every arm below keeps.
         let mut grown = false;
-        if let (None, Some((cols, typlen))) = (&step.batches, &step.hash_tuple) {
+        if let (None, Some(cols)) = (&step.batches, &step.hash_tuple) {
             let (rows, key, ty, estimate, keep_nulls) = match step.method {
                 JoinMethod::HashOuterA => (&mut b.rows, &step.b_key, &b_type, step.b_rows, false),
                 JoinMethod::HashFullA => (&mut b.rows, &step.b_key, &b_type, step.b_rows, true),
@@ -1458,7 +1542,7 @@ impl PgHandler {
             };
             if let Some(ty) = ty {
                 if let Some(ordered) =
-                    crate::hash_grown_order(rows, key, ty, estimate, keep_nulls, cols, *typlen)
+                    crate::hash_grown_order(rows, key, ty, estimate, keep_nulls, cols)
                 {
                     *rows = ordered;
                     grown = true;
@@ -1767,6 +1851,31 @@ fn merge_right_fill(
 mod tests {
     use super::{class_members, merge_right_fill, SEP};
     use bson::{doc, Bson, Document};
+
+    #[test]
+    fn a_hashed_tuple_packs_short_text_and_aligns_what_follows() {
+        use crate::{tuple_data_size, TupleCol};
+        // `x.c, x.a, y.c` of `u1 x join t4 y` (RP-1114): 'u6' packs into a
+        // one-byte header (3 bytes), x.a waits for the int boundary at 4,
+        // and 'x85' packs again: 12 bytes of data.
+        let cols = vec![
+            ("x.c".to_string(), TupleCol::Varlena),
+            ("x.a".to_string(), TupleCol::Fixed { len: 4, align: 4 }),
+            ("y.c".to_string(), TupleCol::Varlena),
+        ];
+        let row = doc! {"x.c": "u6", "x.a": 6, "y.c": "x85"};
+        assert_eq!(tuple_data_size(&row, &cols), Some((0, 12)));
+        // A NULL takes no data, only its bit in the bitmap.
+        let row = doc! {"x.c": "u6", "x.a": Bson::Null, "y.c": "x85"};
+        assert_eq!(tuple_data_size(&row, &cols), Some((1, 7)));
+        // Past 126 bytes a text keeps its four-byte header, int-aligned.
+        let long = "w".repeat(127);
+        let row = doc! {"x.c": "u", "x.a": 6, "y.c": long};
+        assert_eq!(tuple_data_size(&row, &cols), Some((0, 4 + 4 + 4 + 127)));
+        // A value long enough for TOAST is not modelled.
+        let row = doc! {"x.c": "w".repeat(2000), "x.a": 6, "y.c": "x"};
+        assert_eq!(tuple_data_size(&row, &cols), None);
+    }
 
     #[test]
     fn a_class_takes_each_on_s_columns_as_written() {

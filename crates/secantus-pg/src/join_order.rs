@@ -500,8 +500,10 @@ impl Search {
     /// marks every member needed by every table of the class).
     /// The columns relation `rel`'s rows carry up to a join above it (its
     /// hashed tuples' columns, `build_joinrel_tlist`) with their one fixed
-    /// length; `None` when they are not all of one fixed-length type.
-    fn hash_tuple(&self, chain: &Chain<'_>, rel: usize) -> Option<(Vec<String>, i64)> {
+    /// length; `None` when they are not all of one fixed-length type (whose
+    /// tuples' sizes do not depend on the columns' order, which this list
+    /// does not keep).
+    fn hash_tuple(&self, chain: &Chain<'_>, rel: usize) -> Option<Vec<(String, TupleCol)>> {
         let set = self.rels[rel].set;
         let needed = self.needed.as_ref()?;
         let outside = |t: usize| set & (1 << t) == 0;
@@ -521,19 +523,21 @@ impl Search {
                 if !used {
                     continue;
                 }
-                let len = match leaf_key_type(chain.leaves[t], key)?.as_str() {
-                    "int2" => 2,
-                    "int4" | "float4" | "date" => 4,
-                    "int8" | "float8" => 8,
-                    _ => return None,
-                };
-                if *typlen.get_or_insert(len) != len {
+                let ty = leaf_key_type(chain.leaves[t], key)?;
+                if ty == "bool" {
                     return None;
                 }
-                cols.push(key.clone());
+                let col @ TupleCol::Fixed { .. } = TupleCol::of_type(&ty)? else {
+                    return None;
+                };
+                if *typlen.get_or_insert(col) != col {
+                    return None;
+                }
+                cols.push((key.clone(), col));
             }
         }
-        Some((cols, typlen?))
+        typlen?;
+        Some(cols)
     }
 
     fn width(&self, set: u8) -> Option<i64> {
