@@ -99,3 +99,94 @@ OTHER = {
 @pytest.mark.parametrize("query", list(OTHER))
 def test_set_op_column_count_and_conversion_positions(conn: Any, query: str) -> None:
     assert answer(conn, query) == OTHER[query]
+
+
+# Parse analysis makes these checks, so a statement that only analyses its
+# query refuses the set operation too, before anything runs: `EXPLAIN` with
+# or without ANALYZE, `PREPARE`, and `CREATE VIEW`, whose query is checked
+# as the client wrote it (RP-1089). Measured on PostgreSQL 15.20.
+ANALYSED = {
+    "explain select null::text union select 1": (
+        "42804",
+        "UNION types text and integer cannot be matched",
+        "40",
+    ),
+    "explain (analyze) select null::text union select 1": (
+        "42804",
+        "UNION types text and integer cannot be matched",
+        "50",
+    ),
+    "explain select 1 union select 'a'::text union select 2": (
+        "42804",
+        "UNION types integer and text cannot be matched",
+        "31",
+    ),
+    "explain select 1 intersect select now()": (
+        "42804",
+        "INTERSECT types integer and timestamp with time zone cannot be matched",
+        "35",
+    ),
+    "explain select 1, 2 union select 3": (
+        "42601",
+        "each UNION query must have the same number of columns",
+        "34",
+    ),
+    "explain values (1) union select 'x'::text": (
+        "42804",
+        "UNION types integer and text cannot be matched",
+        "33",
+    ),
+    "prepare p1089a as select null::text union select 1": (
+        "42804",
+        "UNION types text and integer cannot be matched",
+        "50",
+    ),
+    "prepare p1089b as select 1, 2 union select 3": (
+        "42601",
+        "each UNION query must have the same number of columns",
+        "44",
+    ),
+    "prepare p1089c as select 1::numeric union select 2::oid": (
+        "42846",
+        "UNION could not convert type oid to numeric",
+        "50",
+    ),
+    "create view   v1089a as select null::text union select 1": (
+        "42804",
+        "UNION types text and integer cannot be matched",
+        "56",
+    ),
+    "create view v1089b as select 1, 2 union select 3": (
+        "42601",
+        "each UNION query must have the same number of columns",
+        "48",
+    ),
+    "create view v1089c as select 1 union select 2::oid union select 'x'::text": (
+        "42804",
+        "UNION types oid and text cannot be matched",
+        "65",
+    ),
+    "create view v1089d as select 1::numeric union select 2::oid": (
+        "42846",
+        "UNION could not convert type oid to numeric",
+        "54",
+    ),
+    "create view v1089e as select case when true then 1 else 'a'::text end": (
+        "42804",
+        "CASE types text and integer cannot be matched",
+        "50",
+    ),
+    "select 1; create view v1089f as select 1, 'a'::text union select 2, 3": (
+        "42804",
+        "UNION types text and integer cannot be matched",
+        "69",
+    ),
+    # What analysis accepts still succeeds.
+    "explain select 1 union select 2.5": "EXPLAIN",
+    "explain select null union select 1": "EXPLAIN",
+}
+
+
+@pytest.mark.parametrize("query", list(ANALYSED))
+def test_set_op_refused_at_analysis(conn: Any, query: str) -> None:
+    assert answer(conn, query) == ANALYSED[query]

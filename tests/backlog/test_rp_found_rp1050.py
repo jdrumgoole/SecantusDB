@@ -2,8 +2,9 @@
 unmatched column types under `INSERT ... SELECT` had no position; fixed): RP-1087
 (the mismatch was placed at the wrong column or arm of a plain query;
 fixed), RP-1088 (the `INSERT` checked its column's assignment before the
-set operation's types; fixed) and RP-1089 (a statement that only analyses its query,
-`EXPLAIN` or `PREPARE`, does not check the set operation's types at all).
+set operation's types; fixed) and RP-1089 (a statement that only analysed
+its query, `EXPLAIN` or `PREPARE`, did not check the set operation's types
+at all, and `CREATE VIEW` refused them with no position; fixed).
 
 An answer is `(sqlstate, message, position)` for an error, or the command
 tag. The expected answers were measured on PostgreSQL 15.19; the tests that
@@ -82,10 +83,11 @@ ANALYSED = {
 }
 
 
-@pytest.mark.backlog("RP-1089")
+@pytest.mark.backlog_fixed("RP-1089")
 @pytest.mark.parametrize("query", list(ANALYSED))
 def test_set_op_mismatch_refused_at_analysis(dsn: str, query: str) -> None:
-    """EXPLAIN and PREPARE refuse the unmatched set operation, positioned."""
+    """EXPLAIN and PREPARE succeeded, and CREATE VIEW refused the unmatched
+    set operation with no position; all three refuse it, positioned."""
     assert answer(dsn, query) == (
         "42804",
         "UNION types text and integer cannot be matched",

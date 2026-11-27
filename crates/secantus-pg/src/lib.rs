@@ -397,6 +397,20 @@ struct IndexRelation {
     origin: Option<(String, String)>,
 }
 
+/// One set-operation node's column types (`PgHandler::set_op_types`).
+struct SetOpTypes {
+    /// The output columns: the left side's names, the unified types.
+    schema: Vec<FieldInfo>,
+    /// Where each output column is, for the node above.
+    located: Vec<Option<i32>>,
+    /// The columns whose untyped literal side is read as the other side's
+    /// type: (column, the side holding the literal is the left, type name).
+    retype: Vec<(usize, bool, String)>,
+    /// The columns whose typed side is converted to the unified type:
+    /// (column, the left side, from type, to type).
+    convert: Vec<(usize, bool, Type, Type)>,
+}
+
 /// One queued `NotificationResponse`.
 #[derive(Clone, Debug)]
 struct Notification {
@@ -1536,10 +1550,6 @@ struct RowEnv {
 /// A row-producing statement's schema and rows -- what each side of a set
 /// operation contributes, and what `rows_with_schema` returns.
 type SchemaAndRows = (Vec<FieldInfo>, Vec<Vec<Option<Bson>>>);
-
-/// A set operation's column types as parse analysis resolves them, and
-/// where each column is for the node above (`analyse_set_op_types`).
-type SetOpColumns = (Vec<Type>, Vec<Option<i32>>);
 
 /// An integer sequence field, whichever BSON width it was written at.
 /// Decode a stored document, FLATTENING a subdocument `_id` into
@@ -19869,7 +19879,11 @@ impl PgHandler {
         // `DefineView` parse-analyses the query and plans nothing: a constant
         // is not folded, so `select 1/0` makes a view (RP-968).
         let analyse = |q: &str| secantus_pgplan::analysing_only(|| self.describe_fields(q, 0, &[]));
-        let body_fields = analyse(&cv.body)?.unwrap_or_default();
+        // Positioned in the query as the client wrote it: a location found
+        // in the deparsed `body` is not one in the statement (RP-1089).
+        let body_fields = analyse(&cv.body)
+            .map_err(|e| self.prepare_error_in_source(e, cv.source.as_ref(), 0, &[]))?
+            .unwrap_or_default();
         if cv.columns.len() > body_fields.len() {
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
@@ -32682,7 +32696,7 @@ impl PgHandler {
         // unmatched column types are refused before any column is assigned
         // (RP-1088).
         if let Statement::SetOp(set) = source {
-            self.analyse_set_op_types(set)?;
+            self.set_op_analysed(set)?;
         }
         let Ok(fields) = self.copy_query_fields(source) else {
             return Ok(Vec::new());
@@ -43111,129 +43125,6 @@ impl PgHandler {
         }
     }
 
-    /// A set operation's column types as parse analysis resolves them,
-    /// without running either side: PostgreSQL's `transformSetOperationTree`
-    /// works the left subtree, then the right, then this node's columns in
-    /// order, and refuses an unmatched pair there (42804 from
-    /// `select_common_type`, 42846 from `coerce_to_common_type`, 42601 for
-    /// a column count). So `insert into tct(c) select null::text union
-    /// select 1` is the UNION's 42804 at the `1`, before
-    /// `transformInsertStmt` assigns the query's `text` to `c` (RP-1088).
-    /// The rules and the error locations are `set_op_rows_located`'s, which
-    /// refuses the same pair when the operation runs; with each column's
-    /// type comes where it is, for the node above.
-    ///
-    /// `Ok(None)` when a side cannot be described here: the check is then
-    /// the executor's, as before.
-    fn analyse_set_op_types(
-        &self,
-        set: &secantus_pgplan::SetOpSelect,
-    ) -> PgWireResult<Option<SetOpColumns>> {
-        let side_types =
-            |stmt: &Statement, planned: &[Option<i32>]| -> PgWireResult<Option<SetOpColumns>> {
-                match stmt {
-                    Statement::SetOp(inner) => self.analyse_set_op_types(inner),
-                    leaf => Ok(self
-                        .describe_planned(leaf.clone())
-                        .ok()
-                        .flatten()
-                        .map(|fields| {
-                            (
-                                fields.iter().map(|f| f.datatype().clone()).collect(),
-                                planned.to_vec(),
-                            )
-                        })),
-                }
-            };
-        let left = side_types(&set.left, &set.left_locations)?;
-        let right = side_types(&set.right, &set.right_locations)?;
-        let (Some((left, left_at)), Some((right, right_at))) = (left, right) else {
-            return Ok(None);
-        };
-        let op = match set.kind {
-            secantus_pgplan::SetOpKind::Union => "UNION",
-            secantus_pgplan::SetOpKind::Intersect => "INTERSECT",
-            secantus_pgplan::SetOpKind::Except => "EXCEPT",
-        };
-        if left.len() != right.len() {
-            let first = if right_at.is_empty() {
-                None
-            } else {
-                right_at
-                    .iter()
-                    .find(|l| **l != Some(-1))
-                    .copied()
-                    .unwrap_or(Some(-1))
-            };
-            Self::locate_set_op_error(first);
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".into(),
-                "42601".into(), // syntax_error
-                format!("each {op} query must have the same number of columns"),
-            ))));
-        }
-        // A side's untyped literal columns, read as `set_op_rows_located`
-        // reads them: a constant side knows its own, any other side is read
-        // from the parse tree.
-        let side = |stmt: &Statement, parsed: &[bool], own: fn(&Statement) -> Vec<bool>| {
-            if matches!(stmt, Statement::SelectConstant(_)) {
-                own(stmt)
-            } else {
-                parsed.to_vec()
-            }
-        };
-        let left_nulls = side(
-            &set.left,
-            &set.left_untyped.nulls,
-            Self::null_constant_columns,
-        );
-        let right_nulls = side(
-            &set.right,
-            &set.right_untyped.nulls,
-            Self::null_constant_columns,
-        );
-        let left_strs = side(
-            &set.left,
-            &set.left_untyped.strings,
-            Self::untyped_string_columns,
-        );
-        let right_strs = side(
-            &set.right,
-            &set.right_untyped.strings,
-            Self::untyped_string_columns,
-        );
-        let flag = |v: &[bool], i: usize| v.get(i).copied().unwrap_or(false);
-        let at = |v: &[Option<i32>], i: usize| v.get(i).copied().flatten();
-        let mut types = Vec::with_capacity(left.len());
-        let mut located = Vec::with_capacity(left.len());
-        for (i, (l, r)) in left.iter().zip(&right).enumerate() {
-            let (lat, rat) = (at(&left_at, i), at(&right_at, i));
-            let (ty, from) = if flag(&right_nulls, i) {
-                (l.clone(), lat)
-            } else if flag(&left_nulls, i) {
-                (r.clone(), rat)
-            } else if flag(&right_strs, i) && !flag(&left_strs, i) {
-                (l.clone(), lat)
-            } else if flag(&left_strs, i) && !flag(&right_strs, i) {
-                (r.clone(), rat)
-            } else {
-                let ty = Self::unify_set_op_type(op, l, r)
-                    .inspect_err(|_| Self::locate_set_op_error(rat))?;
-                for (side, side_at) in [(l, lat), (r, rat)] {
-                    if *side != ty {
-                        Self::check_set_op_conversion(op, side, &ty)
-                            .inspect_err(|_| Self::locate_set_op_error(side_at))?;
-                    }
-                }
-                let from = if *l == ty { lat } else { rat };
-                (ty, from)
-            };
-            types.push(ty);
-            located.push(from);
-        }
-        Ok(Some((types, located)))
-    }
-
     /// `UNION` / `INTERSECT` / `EXCEPT`: run both sides, combine, then apply
     /// the ORDER BY / OFFSET / LIMIT that belong to the whole statement.
     ///
@@ -43260,134 +43151,12 @@ impl PgHandler {
         };
         let ((left_schema, left), left_at) = side_rows(&set.left, &set.left_locations)?;
         let ((right_schema, right), right_at) = side_rows(&set.right, &set.right_locations)?;
-        let op = match set.kind {
-            secantus_pgplan::SetOpKind::Union => "UNION",
-            secantus_pgplan::SetOpKind::Intersect => "INTERSECT",
-            secantus_pgplan::SetOpKind::Except => "EXCEPT",
-        };
-        if left_schema.len() != right_schema.len() {
-            // At `exprLocation` of the right side's target list: its first
-            // column that has a location (none for a `VALUES` side).
-            let first = if right_at.is_empty() {
-                None
-            } else {
-                right_at
-                    .iter()
-                    .find(|l| **l != Some(-1))
-                    .copied()
-                    .unwrap_or(Some(-1))
-            };
-            Self::locate_set_op_error(first);
-            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".into(),
-                "42601".into(), // syntax_error
-                format!("each {op} query must have the same number of columns"),
-            ))));
-        }
-        // The column NAMES are the left side's; each TYPE is the two sides
-        // unified, which is also where mismatched types are refused.
-        // A constant side knows its own untyped columns (a bound parameter's
-        // value is typed); any other leaf side is read from the parse tree,
-        // which is where PostgreSQL decides a column is `unknown`.
-        let side = |stmt: &Statement, parsed: &[bool], own: fn(&Statement) -> Vec<bool>| {
-            if matches!(stmt, Statement::SelectConstant(_)) {
-                own(stmt)
-            } else {
-                parsed.to_vec()
-            }
-        };
-        let left_nulls = side(
-            &set.left,
-            &set.left_untyped.nulls,
-            Self::null_constant_columns,
-        );
-        let right_nulls = side(
-            &set.right,
-            &set.right_untyped.nulls,
-            Self::null_constant_columns,
-        );
-        let left_strs = side(
-            &set.left,
-            &set.left_untyped.strings,
-            Self::untyped_string_columns,
-        );
-        let right_strs = side(
-            &set.right,
-            &set.right_untyped.strings,
-            Self::untyped_string_columns,
-        );
-        let flag = |v: &[bool], i: usize| v.get(i).copied().unwrap_or(false);
-        let at = |v: &[Option<i32>], i: usize| v.get(i).copied().flatten();
-        // Where each output column is, for the set operation above this one.
-        let mut located = Vec::with_capacity(left_schema.len());
-        let mut schema = Vec::with_capacity(left_schema.len());
-        // The columns whose untyped literal side is read as the other side's
-        // type: (column, the side holding the literal is the left, type name).
-        let mut retype: Vec<(usize, bool, String)> = Vec::new();
-        // The columns whose typed side is converted to the unified type:
-        // (column, the left side, from type, to type).
-        let mut convert: Vec<(usize, bool, Type, Type)> = Vec::new();
-        for (i, (l, r)) in left_schema.iter().zip(&right_schema).enumerate() {
-            // `select_common_type` keeps the left side's expression unless
-            // it takes the right side's type (an untyped left side, or a
-            // type the left casts to implicitly).
-            let (lat, rat) = (at(&left_at, i), at(&right_at, i));
-            let ty = if flag(&right_nulls, i) {
-                located.push(lat);
-                l.datatype().clone()
-            } else if flag(&left_nulls, i) {
-                located.push(rat);
-                r.datatype().clone()
-            } else if flag(&right_strs, i) && !flag(&left_strs, i) {
-                if let Some(name) = Self::planner_type_name(l.datatype()) {
-                    retype.push((i, false, name));
-                }
-                located.push(lat);
-                l.datatype().clone()
-            } else if flag(&left_strs, i) && !flag(&right_strs, i) {
-                if let Some(name) = Self::planner_type_name(r.datatype()) {
-                    retype.push((i, true, name));
-                }
-                located.push(rat);
-                r.datatype().clone()
-            } else {
-                let ty = Self::unify_set_op_type(op, l.datatype(), r.datatype())
-                    .inspect_err(|_| Self::locate_set_op_error(rat))?;
-                located.push(if *l.datatype() == ty { lat } else { rat });
-                for (on_left, side, side_at) in
-                    [(true, l.datatype(), lat), (false, r.datatype(), rat)]
-                {
-                    if *side != ty {
-                        // `coerce_to_common_type` refuses the side's own
-                        // expression.
-                        Self::check_set_op_conversion(op, side, &ty)
-                            .inspect_err(|_| Self::locate_set_op_error(side_at))?;
-                        convert.push((i, on_left, side.clone(), ty.clone()));
-                    }
-                }
-                ty
-            };
-            // `select_common_typmod`: the sides' shared modifier when both
-            // already have the column's type; an untyped literal side, or
-            // one converted to the common type, has none (RP-493).
-            let typed_mod = |f: &FieldInfo, untyped: bool| {
-                (!untyped && *f.datatype() == ty).then(|| f.type_modifier())
-            };
-            // A side of a domain is of the domain, which the common type
-            // keeps only when both sides are of it (RP-660).
-            let (ld, rd) = (
-                set.left_domains.get(i).cloned().flatten(),
-                set.right_domains.get(i).cloned().flatten(),
-            );
-            let typmod = match (
-                typed_mod(l, flag(&left_nulls, i) || flag(&left_strs, i)),
-                typed_mod(r, flag(&right_nulls, i) || flag(&right_strs, i)),
-            ) {
-                (Some(a), Some(b)) if a == b && ld == rd => a,
-                _ => -1,
-            };
-            schema.push(self.field_mod(l.name().to_string(), ty, typmod));
-        }
+        let SetOpTypes {
+            schema,
+            located,
+            retype,
+            convert,
+        } = self.set_op_types(set, &left_schema, &left_at, &right_schema, &right_at)?;
         let (mut left, mut right) = (left, right);
         if !retype.is_empty() {
             let tz = self.session_timezone();
@@ -43689,6 +43458,196 @@ impl PgHandler {
             out.truncate(take);
         }
         Ok(((schema, out), located))
+    }
+
+    /// The column types of a set operation from its two sides' schemas, as
+    /// `transformSetOperationTree` decides them for one node: the column
+    /// counts must agree (42601), each column's types unify
+    /// (`select_common_type`, 42804) and each side converts to the common
+    /// type (`coerce_to_common_type`, 42846), with where each output column
+    /// is for the node above. The 42804 / 42846 point at the side's column
+    /// (RP-1087). Used on the sides' rows when the set operation runs, and
+    /// on their descriptions when a statement only analyses it (RP-1089).
+    fn set_op_types(
+        &self,
+        set: &secantus_pgplan::SetOpSelect,
+        left_schema: &[FieldInfo],
+        left_at: &[Option<i32>],
+        right_schema: &[FieldInfo],
+        right_at: &[Option<i32>],
+    ) -> PgWireResult<SetOpTypes> {
+        let op = match set.kind {
+            secantus_pgplan::SetOpKind::Union => "UNION",
+            secantus_pgplan::SetOpKind::Intersect => "INTERSECT",
+            secantus_pgplan::SetOpKind::Except => "EXCEPT",
+        };
+        if left_schema.len() != right_schema.len() {
+            // At `exprLocation` of the right side's target list: its first
+            // column that has a location (none for a `VALUES` side).
+            let first = if right_at.is_empty() {
+                None
+            } else {
+                right_at
+                    .iter()
+                    .find(|l| **l != Some(-1))
+                    .copied()
+                    .unwrap_or(Some(-1))
+            };
+            Self::locate_set_op_error(first);
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "42601".into(), // syntax_error
+                format!("each {op} query must have the same number of columns"),
+            ))));
+        }
+        // The column NAMES are the left side's; each TYPE is the two sides
+        // unified, which is also where mismatched types are refused.
+        // A constant side knows its own untyped columns (a bound parameter's
+        // value is typed); any other leaf side is read from the parse tree,
+        // which is where PostgreSQL decides a column is `unknown`.
+        let side = |stmt: &Statement, parsed: &[bool], own: fn(&Statement) -> Vec<bool>| {
+            if matches!(stmt, Statement::SelectConstant(_)) {
+                own(stmt)
+            } else {
+                parsed.to_vec()
+            }
+        };
+        let left_nulls = side(
+            &set.left,
+            &set.left_untyped.nulls,
+            Self::null_constant_columns,
+        );
+        let right_nulls = side(
+            &set.right,
+            &set.right_untyped.nulls,
+            Self::null_constant_columns,
+        );
+        let left_strs = side(
+            &set.left,
+            &set.left_untyped.strings,
+            Self::untyped_string_columns,
+        );
+        let right_strs = side(
+            &set.right,
+            &set.right_untyped.strings,
+            Self::untyped_string_columns,
+        );
+        let flag = |v: &[bool], i: usize| v.get(i).copied().unwrap_or(false);
+        let at = |v: &[Option<i32>], i: usize| v.get(i).copied().flatten();
+        // Where each output column is, for the set operation above this one.
+        let mut located = Vec::with_capacity(left_schema.len());
+        let mut schema = Vec::with_capacity(left_schema.len());
+        // The columns whose untyped literal side is read as the other side's
+        // type: (column, the side holding the literal is the left, type name).
+        let mut retype: Vec<(usize, bool, String)> = Vec::new();
+        // The columns whose typed side is converted to the unified type:
+        // (column, the left side, from type, to type).
+        let mut convert: Vec<(usize, bool, Type, Type)> = Vec::new();
+        for (i, (l, r)) in left_schema.iter().zip(right_schema).enumerate() {
+            // `select_common_type` keeps the left side's expression unless
+            // it takes the right side's type (an untyped left side, or a
+            // type the left casts to implicitly).
+            let (lat, rat) = (at(left_at, i), at(right_at, i));
+            let ty = if flag(&right_nulls, i) {
+                located.push(lat);
+                l.datatype().clone()
+            } else if flag(&left_nulls, i) {
+                located.push(rat);
+                r.datatype().clone()
+            } else if flag(&right_strs, i) && !flag(&left_strs, i) {
+                if let Some(name) = Self::planner_type_name(l.datatype()) {
+                    retype.push((i, false, name));
+                }
+                located.push(lat);
+                l.datatype().clone()
+            } else if flag(&left_strs, i) && !flag(&right_strs, i) {
+                if let Some(name) = Self::planner_type_name(r.datatype()) {
+                    retype.push((i, true, name));
+                }
+                located.push(rat);
+                r.datatype().clone()
+            } else {
+                let ty = Self::unify_set_op_type(op, l.datatype(), r.datatype())
+                    .inspect_err(|_| Self::locate_set_op_error(rat))?;
+                located.push(if *l.datatype() == ty { lat } else { rat });
+                for (on_left, side, side_at) in
+                    [(true, l.datatype(), lat), (false, r.datatype(), rat)]
+                {
+                    if *side != ty {
+                        // `coerce_to_common_type` refuses the side's own
+                        // expression.
+                        Self::check_set_op_conversion(op, side, &ty)
+                            .inspect_err(|_| Self::locate_set_op_error(side_at))?;
+                        convert.push((i, on_left, side.clone(), ty.clone()));
+                    }
+                }
+                ty
+            };
+            // `select_common_typmod`: the sides' shared modifier when both
+            // already have the column's type; an untyped literal side, or
+            // one converted to the common type, has none (RP-493).
+            let typed_mod = |f: &FieldInfo, untyped: bool| {
+                (!untyped && *f.datatype() == ty).then(|| f.type_modifier())
+            };
+            // A side of a domain is of the domain, which the common type
+            // keeps only when both sides are of it (RP-660).
+            let (ld, rd) = (
+                set.left_domains.get(i).cloned().flatten(),
+                set.right_domains.get(i).cloned().flatten(),
+            );
+            let typmod = match (
+                typed_mod(l, flag(&left_nulls, i) || flag(&left_strs, i)),
+                typed_mod(r, flag(&right_nulls, i) || flag(&right_strs, i)),
+            ) {
+                (Some(a), Some(b)) if a == b && ld == rd => a,
+                _ => -1,
+            };
+            schema.push(self.field_mod(l.name().to_string(), ty, typmod));
+        }
+        Ok(SetOpTypes {
+            schema,
+            located,
+            retype,
+            convert,
+        })
+    }
+
+    /// A set operation's output columns and where each is, decided as
+    /// parse analysis decides them, from each side's description: nothing
+    /// in it runs. PostgreSQL checks the sides' column counts and types in
+    /// `transformSetOperationTree`, so a statement that only analyses its
+    /// query refuses a mismatch too -- `explain` or `prepare ... as select
+    /// null::text union select 1` is 42804 at the `1` (RP-1089), where the
+    /// check ran only when the set operation executed -- and an `INSERT ...
+    /// SELECT` refuses it before any column is assigned (RP-1088). `None`
+    /// when a side
+    /// cannot be described without running it: the check is then left to
+    /// execution, which makes it on the sides' rows.
+    fn set_op_analysed(
+        &self,
+        set: &secantus_pgplan::SetOpSelect,
+    ) -> PgWireResult<Option<SetOpTypes>> {
+        let side = |stmt: &Statement, planned: &[Option<i32>]| match stmt {
+            Statement::SetOp(inner) => {
+                PgWireResult::Ok(self.set_op_analysed(inner)?.map(|t| (t.schema, t.located)))
+            }
+            other => match self.describe_planned(other.clone()) {
+                Ok(Some(fields)) => Ok(Some((fields, planned.to_vec()))),
+                // What execution would refuse, it refuses there.
+                Ok(None) | Err(_) => {
+                    let _ = secantus_pgplan::take_error_location();
+                    Ok(None)
+                }
+            },
+        };
+        let Some((left_schema, left_at)) = side(&set.left, &set.left_locations)? else {
+            return Ok(None);
+        };
+        let Some((right_schema, right_at)) = side(&set.right, &set.right_locations)? else {
+            return Ok(None);
+        };
+        self.set_op_types(set, &left_schema, &left_at, &right_schema, &right_at)
+            .map(Some)
     }
 
     /// Record where a set operation's 42804 points: the right side's
@@ -47697,6 +47656,12 @@ impl PgHandler {
                 "a join source reached execution on its own".into(),
             ))),
             Statement::Explain { inner, options } => {
+                // `ExplainQuery` parse-analyses the query before planning
+                // it: a set operation's sides that do not match are refused
+                // with or without ANALYZE (RP-1089).
+                if let Statement::SetOp(set) = inner.as_ref() {
+                    self.set_op_analysed(set)?;
+                }
                 // A LEFT JOIN nothing reads, to a table unique on its ON's
                 // columns: `remove_useless_joins` plans the query without
                 // it (RP-1060).
@@ -60152,6 +60117,8 @@ impl PgHandler {
             // PostgreSQL has it -- names and types both -- and each modifier
             // the two sides' common one (`select_common_typmod`, RP-493).
             Statement::SetOp(set) => {
+                // Parse analysis refuses sides that do not match (RP-1089).
+                self.set_op_analysed(&set)?;
                 let def = secantus_pgplan::set_op_output_def(&set, &|n| self.lookup(n)).ok();
                 self.set_op_fields(&set.left)?
                     .into_iter()

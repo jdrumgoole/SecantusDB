@@ -59,6 +59,10 @@ pub struct AnalysisError {
     pub sqlstate: Option<&'static str>,
     pub detail: Option<String>,
     pub hint: Option<String>,
+    /// Where PostgreSQL's `parser_errposition` points, as a byte offset in
+    /// the analysed query string (RP-1089); `None` where it reports none,
+    /// or this does not know.
+    pub location: Option<i32>,
 }
 
 impl AnalysisError {
@@ -68,6 +72,7 @@ impl AnalysisError {
             sqlstate: None,
             detail: None,
             hint: None,
+            location: None,
         }
     }
 
@@ -81,6 +86,13 @@ impl AnalysisError {
         self
     }
 
+    /// At `parser_errposition(pstate, location)`: a negative location is
+    /// none.
+    pub fn at(mut self, location: i32) -> Self {
+        self.location = (location >= 0).then_some(location);
+        self
+    }
+
     /// An `ereport(ERROR)` of PostgreSQL's, with its SQLSTATE.
     pub fn pg(sqlstate: &'static str, message: impl Into<String>) -> Self {
         AnalysisError {
@@ -88,6 +100,7 @@ impl AnalysisError {
             sqlstate: Some(sqlstate),
             detail: None,
             hint: None,
+            location: None,
         }
     }
 }
