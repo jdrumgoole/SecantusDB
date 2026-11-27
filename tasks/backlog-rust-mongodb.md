@@ -835,18 +835,6 @@ These are explicit non-goals. Don't add them without a reason.
       e01df2d2 (2026-11-08), each command checked against a probe of its own.
       Backlog-ID: RM-360
       Verify: tests/backlog/test_rm_355_364.py::test_every_line_counts_its_interrupt_checks
-- [ ] **A statement of a transaction does not count the transaction's
-      locks.** mongod 8.2.11's line for it counts
-      `MultiDocumentTransactionsBarrier` w 1, `ReplicationStateTransition`
-      w 3 and a flow control ticket beside the statement's Global /
-      Database / Collection, and the command's line has `locks: {}`; this
-      server's statement line has the statement's three only, no
-      `flowControl`, and its command line counts them again. Nothing takes
-      `Resource::MdtBarrier`. Of a collection and of a view alike (a write
-      of a view is refused under the transaction's locks since RM-589).
-      Found while working RM-589, 2026-11-17.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_transaction_statement_counts_the_transactions_locks
-      Backlog-ID: RM-715
 - [ ] **Operations this server runs another way than mongod's plan say
       less.** Since RM-023 a read or a write's read that a stream runs as
       mongod's plan counts its keys and documents examined, and since
@@ -869,10 +857,10 @@ These are explicit non-goals. Don't add them without a reason.
         `$group` (since 2026-11-18 a `$group` on the
         meta field that only counts, which mongod runs over the buckets,
         counts as mongod's does, and since 2026-11-18 one on a constant,
-        `count_documents`'s, and a `$count` stage; a `$group` after a `$match`
-        on a measurement field, which mongod runs in SBE, and one after a
-        `$match` on the meta field, which mongod reads through its index,
-        still count nothing), an inclusion `$project` (RM-456), a
+        `count_documents`'s, a `$count` stage, and since 2026-11-27 a `$group`
+        after a `$match` on a measurement field, which mongod runs in SBE;
+        one after a `$match` on the meta field, which mongod reads through
+        its index, still counts nothing), an inclusion `$project` (RM-456), a
         filter on the meta field (RM-457), a hint or a collation. mongod
         counts the buckets its cursor stage buffered (five of five for a
         sorted `find`). Since RM-455 a `find` is the aggregation mongod
@@ -882,7 +870,7 @@ These are explicit non-goals. Don't add them without a reason.
         mongod 5 keys and 4 documents, this server none).
       Measured 2026-10-27, 2026-11-07, 2026-11-10 and 2026-11-13.
       Backlog-ID: RM-363
-      Verify: tests/backlog/test_rm_355_364.py::test_a_group_after_a_measurement_match_counts_what_it_examined
+      Verify: tests/backlog/test_rm_355_364.py::test_a_group_after_a_meta_match_counts_what_it_examined
 - [ ] **WiredTiger 11's interruptible cache wait is not on the line.**
       mongod 8.2.11's WiredTiger splits a cache wait into the share spent
       in interruptible eviction (`timeWaitingMicros.cacheInterruptibleMicros`)
@@ -1128,6 +1116,12 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       differed in its `executionStats` (an SBE `filter` over a `scan`,
       `saveState` / `restoreState` among the fields shown; the differing
       one was truncated) and passed in 9 reruns, serial and `-n 4`.
+      Again 2026-11-27 (RM-715 gate, load ~7-11):
+      `tests/mongod_live/test_lookup_hash_join.py::test_a_hash_join_lookup_is_explained_as_mongod_does`
+      (one case in the gate, `empty_local_collection-executionStats` in a
+      rerun, then two clean runs): here the side known, mongod's every
+      stage counted `saveState` 5 / `restoreState` 4 to this server's 4 /
+      3, one yield more, which points at mongod's time-based yield.
       Verify: none -- intermittent, once in 13 runs; no deterministic gap test until the differing counter is known
       Backlog-ID: RM-768
 - [ ] **A `$fill` with a `sortBy` passes ties on in a different order.**
@@ -2761,6 +2755,25 @@ touched:
   load cannot change (connect all six behind a barrier and record how
   long they took to land, or compare with the answer mongod gives when
   they land within the second), not a retry.
+  Seen again on CI on rm-batch PR #3073 (49c12d71, run 45959038413, job
+  140372204555, 2026-11-27): with `maxQueueDepth` 2 this server answered
+  its third connection after a wait rounding to 2 s, mongod after 1.
+  **A first fix was reverted (2026-11-27).** e663afaaa stopped the
+  server with SIGSTOP while the six sockets connected and sent `hello`,
+  then resumed it with SIGCONT, so the six landed together whatever the
+  load. It passed 6 of 6 locally under 16 CPU burners, but on CI (PR
+  #3076 at e663afaa, run 45985326929, job 140459373674) the test's own
+  client lost its connection to this server (`AutoReconnect: ...
+  connection closed`). The `finally` that turns the limiter off then
+  failed too, so the limiter stayed on with no queue and closed every
+  new connection, and five later tests in the module failed the same
+  way (RM-010, RM-016, RM-302, RM-305 and RM-386 reported REGRESSED).
+  The likely cause is that pymongo's monitor or a pooled connection
+  reconnected while the server was stopped, and the limiter closed it.
+  A next design must keep the client's own connections out of the
+  limiter's path (a separate client created before the limiter is on,
+  with no monitor reconnects) and must restore the parameters even when
+  that client fails, for example from a fresh client after a wait.
   Backlog-ID: RM-372
   Verify: none -- a timing flake under load; the test passes when the connects land within a second
 
@@ -2797,6 +2810,25 @@ touched:
   such, not as RED. Both batch landers (pg-batch too) use these scripts.
   Verify: none -- tooling; reproduce by running wait_ci.sh with the network down for one call
   Backlog-ID: RM-825
+- [ ] **CI's `apt-install` action fails on a third-party apt source that
+  refuses every attempt (2026-11-27).** The runner image ships
+  `packages.microsoft.com/ubuntu/26.04/prod` in `/etc/apt/sources.list.d/`,
+  and on some runs it answers `403 Forbidden` to `InRelease` ("The
+  repository ... is no longer signed"). `apt-get update` then exits 100
+  on all three of `.github/actions/apt-install`'s attempts ("apt-get
+  update exited 100; giving up after 3 attempts") and the job fails in
+  its toolchain step before any test runs, while the Ubuntu archive and
+  repo.mongodb.org answer fine. Seen twice: rm-batch PR #3073 (run
+  45966663001, `pg-oracle (backlog)`) and pg-batch PR #3080 (8f45d44a,
+  run 45998998087, job 140505550026, `mdb-binary (live)`); the same jobs
+  pass an hour apart, so the 403 comes and goes. The retries are built
+  for a stalled Ubuntu mirror, not for a source that refuses. No job
+  installs from Microsoft's repository: move that source aside before
+  `apt-get update` in the action (or treat an update failure confined to
+  sources no job needs as non-fatal), so a refusal there cannot fail a
+  job. Both batch landers read this failure as RED.
+  Verify: none -- CI infrastructure; reproduce by adding a source that answers 403 to a runner's sources.list.d
+  Backlog-ID: RM-835
 - [ ] **The profiler's level-two test fails when its `find` touches the
   disk or waits on a WiredTiger lock.** `profiler_wt.rs`'s
   `level_two_writes_each_operation_in_mongods_shape` compares a `find`

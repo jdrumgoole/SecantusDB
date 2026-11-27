@@ -81,6 +81,10 @@ pub struct Transaction {
     /// end (what a concurrent `drop` / `createIndexes` / `renameCollection`
     /// / `collMod` waits on, RM-084). `None` where no lock manager is wired.
     pub lock_owner: Option<crate::lock_manager::Owner>,
+    /// What its statements have counted of their locks so far, `None`
+    /// before its first takes any: each statement's line counts on from
+    /// them, as mongod's stashed locker does (RM-715).
+    pub lock_stats: Option<crate::lock_manager::OperationLockStats>,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -104,6 +108,7 @@ impl Transaction {
             started_at: now,
             created: HashMap::new(),
             lock_owner: None,
+            lock_stats: None,
         }
     }
 }

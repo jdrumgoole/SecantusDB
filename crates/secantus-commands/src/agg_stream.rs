@@ -625,6 +625,32 @@ fn time_series(
         .get(lead)
         .is_some_and(|s| groups_on_meta(s, meta.as_deref()) || counts_stage(s))
         && ask.pipeline[lead + 1..].iter().all(fits);
+    // A `$group` after a `$match` on measurement fields, which mongod
+    // 8.2.11 runs in its slot-based engine over the buckets it scanned
+    // (measured 2026-11-27: five of five examined, RM-363). A `$match` on
+    // the meta field is read through its index, which is not this path.
+    let names_meta = |m: &Document| {
+        let mut paths = Vec::new();
+        !filter_paths(m, &mut paths)
+            || meta
+                .as_deref()
+                .is_some_and(|meta| paths.iter().any(|p| root(p) == meta))
+    };
+    let matches = ask
+        .pipeline
+        .iter()
+        .take_while(|s| stage_name(s) == "$match")
+        .count();
+    let measurement_group = matches > 0
+        && ask.pipeline[..matches].iter().all(|s| {
+            matches!(s.as_document().and_then(|d| d.get("$match")), Some(Bson::Document(m)) if !names_meta(m))
+        })
+        && ask
+            .pipeline
+            .get(matches)
+            .is_some_and(|s| stage_name(s) == "$group")
+        && ask.pipeline[matches + 1..].iter().all(fits);
+    let meta_group = meta_group || measurement_group;
     if !(per_bucket || only_projects || meta_group || ask.pipeline.iter().all(fits))
         || ask.pipeline.iter().any(mentions_meta)
     {
