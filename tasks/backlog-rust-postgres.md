@@ -2030,16 +2030,6 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a class constant written twice is costed once]
       Backlog-ID: RP-1150
 
-- [ ] **An aggregate over a join whose class a WHERE constant fixes is
-      drawn over a Hash Join.** `explain (costs off) select count(*) from e
-      join k on e.a = k.a where e.a = 3` is an `Aggregate` over a `Hash
-      Join` here; a private PostgreSQL 15.20 cluster prints the `Nested
-      Loop` the select list alone gets (RP-1065), into `Index Only Scan
-      using k_pkey on k`, `Index Cond: (a = 3)`. Found while working
-      RP-1065.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a join's class constant]
-      Backlog-ID: RP-1104
-
 - [ ] **A comma join of three tables whose class a WHERE constant fixes
       prints its equalities as Join Filters.** `explain (costs off) select
       e.b, k.b from e, k, k k2 where e.a = k.a and k2.a = e.a and e.a = 3`
@@ -3995,3 +3985,28 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       has none on either server. Measured on a private 15.20 cluster.
       Verify: tests/backlog/test_rp_found_rp290.py::test_a_table_with_a_text_column_has_a_toast_table
       Backlog-ID: RP-1140
+
+## Found while working RP-1104 (2026-11-27)
+
+- [ ] **A GROUP BY over a join prints a joined-row key.** `explain (costs
+      off) select count(*) from e join k on e.a = k.a group by e.b` (`e`,
+      `k` analysed, 1000 rows) prints `Group Key: e\x1Fb`, the internal
+      `alias<U+001F>column` key, over the `Hash Join`; a private
+      PostgreSQL 15.20 cluster prints `Group Key: e.b`. RP-1107 is the same
+      key over a cross join with a one-row subquery. With `where e.a = 3`
+      PostgreSQL also draws a `GroupAggregate` over a `Sort` (`Sort Key:
+      e.b`) over RP-1065's Nested Loop, where this server keeps the
+      `HashAggregate` over the `Hash Join`.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a group by over a join prints its key]
+      Backlog-ID: RP-1151
+
+- [ ] **EXPLAIN VERBOSE of an Aggregate prints no `Output` lists.**
+      `explain (verbose, costs off) select count(*) from e` prints
+      `Aggregate` over `Seq Scan on e` with no other line; a private
+      PostgreSQL 15.20 cluster prints `Output: count(*)` on the Aggregate
+      and `Seq Scan on public.e` with `Output: a, b`. Over a join (`select
+      count(*) from e join k on e.a = k.a where e.a = 3`) no node prints
+      its `Output` or its quals prefixed either. RP-966 is the joins'
+      lists without an aggregate.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[explain verbose of an aggregate prints its output]
+      Backlog-ID: RP-1152

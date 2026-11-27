@@ -47862,6 +47862,35 @@ impl PgHandler {
                         }
                     }
                 }
+                // The same under a plain Aggregate (RP-1104): the join
+                // planned as its select's, AGG_PLAIN over its Nested Loop.
+                if tree.name == "Aggregate"
+                    && tree.details.is_empty()
+                    && tree.children.len() == 1
+                    && tree.children[0].name == "Hash Join"
+                {
+                    if let Statement::Aggregate(agg) = inner.as_ref() {
+                        if let Some((plan, a, b, join, implied, from, indexes)) =
+                            PgHandler::aggregate_join_select(agg)
+                                .and_then(|sel| self.joined_implied_estimate(&sel))
+                        {
+                            let loop_ = &mut tree.children[0];
+                            explain::implied_nest_loop(loop_, &implied, &from);
+                            explain::price_nest_loop(loop_, &plan, a, b, join);
+                            let [a_index, b_index] = indexes;
+                            let in_order = if plan.b_outer {
+                                [b_index, a_index]
+                            } else {
+                                [a_index, b_index]
+                            };
+                            explain::name_scan_indexes(
+                                loop_,
+                                &in_order.map(|ix| ix.map(|ix| (ix.name, ix.only))),
+                            );
+                            tree.estimate = scan_estimate::plain_agg_estimate(join, &agg.items);
+                        }
+                    }
+                }
                 // A chain whose join keys a WHERE constant's equivalence
                 // class holds (RP-1065): Nested Loops with no join clause,
                 // each scan filtered by the constant. VERBOSE prints its

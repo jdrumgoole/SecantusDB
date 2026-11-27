@@ -2857,6 +2857,60 @@ impl PgHandler {
         Some((a, b, more, filter, left_join, target_width))
     }
 
+    /// A plain Aggregate over a join's rows, as the select of those rows
+    /// it aggregates (RP-1104): `grouping_planner` plans the join first,
+    /// its cheapest path the same whatever sits above it, and AGG_PLAIN
+    /// over that path. The aggregate's WHERE is the select's; what the
+    /// aggregates read is the join's own `needed`. `None` for any grouping,
+    /// HAVING, ORDER BY, LIMIT or DISTINCT, or a source that is not a join.
+    pub(crate) fn aggregate_join_select(
+        agg: &secantus_pgplan::Aggregate,
+    ) -> Option<secantus_pgplan::Select> {
+        let sub = agg.sub.as_ref()?;
+        if !matches!(sub.plan.as_ref(), secantus_pgplan::Statement::JoinRows(_))
+            || !agg.group_by.is_empty()
+            || agg.grouping_sets.is_some()
+            || !agg.groupings.is_empty()
+            || agg.having.is_some()
+            || !agg.exprs.is_empty()
+            || !agg.order.is_empty()
+            || agg.limit.is_some()
+            || agg.offset != 0
+            || agg.with_ties
+            || agg.distinct
+            || agg.series.is_some()
+            || agg.join.is_some()
+            || agg.items.is_empty()
+            || agg.items.len() != agg.select.len()
+            || !agg
+                .select
+                .iter()
+                .enumerate()
+                .all(|(i, (_, c))| *c == secantus_pgplan::OutputCol::Agg(i))
+        {
+            return None;
+        }
+        Some(secantus_pgplan::Select {
+            table: agg.table.clone(),
+            windows: Vec::new(),
+            sub: Some(sub.clone()),
+            series: None,
+            join: None,
+            columns: Vec::new(),
+            casts: Vec::new(),
+            filter: agg.filter.clone(),
+            residual: None,
+            order: Vec::new(),
+            limit: None,
+            offset: 0,
+            with_ties: false,
+            distinct: secantus_pgplan::Distinct::None,
+            lock: None,
+            lock_clauses: Vec::new(),
+            sort_input: Vec::new(),
+        })
+    }
+
     /// A chain of three or more tables planned as joined rows, each join
     /// INNER on one column equality, whose clauses put every table's key in
     /// one equivalence class and whose WHERE fixes a member to a constant
