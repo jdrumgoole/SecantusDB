@@ -902,6 +902,7 @@ pub(crate) fn runnable(stages: Vec<Bson>) -> Vec<Bson> {
 /// 1}}]` sorts twice. The ties of the later `$sort` then come in the order
 /// the documents had before the earlier one, not in its order.
 pub(crate) fn drop_overridden_sorts(pipeline: &[Bson]) -> Vec<Bson> {
+    let pipeline = &windows_absorb_sorts(pipeline);
     pipeline
         .iter()
         .enumerate()
@@ -914,6 +915,107 @@ pub(crate) fn drop_overridden_sorts(pipeline: &[Bson]) -> Vec<Bson> {
         })
         .map(|(_, stage)| stage.clone())
         .collect()
+}
+
+/// `pipeline` with each `$sort` right behind a window taken into the
+/// `$sort` the window runs behind, when either key is a prefix of the
+/// other: that `$sort` takes the longer key, and the one behind goes
+/// (measured 8.2.11, RM-639: `[{$set}, {$setWindowFields: {sortBy: {n:
+/// 1}}}, {$sort: {n: 1, _id: 1}}]` lists `$sort` `{n: 1, _id: 1}` ahead of
+/// a `$_internalSetWindowFields` whose `sortBy` is still `{n: 1}`, and
+/// nothing behind it). mongod does it on the stages a window parses into
+/// ([`super::shape::desugared_window`]), `[$sort, $_internalSetWindowFields,
+/// $sort]`, so not with any stage between, nor where the window's `$sort`
+/// has gone ahead of an `$unwind` first (an `$unwind` behind only
+/// `$match`es, whose paths that `$sort` does not read). A second
+/// window's `$sort` is taken in alike, leaving that window none to take
+/// in the `$sort` behind it (`[$set, W{n}, W{n}, $sort{n}]` lists no
+/// `$sort` between the windows, and keeps the last).
+fn windows_absorb_sorts(pipeline: &[Bson]) -> Vec<Bson> {
+    let mut out = pipeline.to_vec();
+    let mut i = 0;
+    while i < out.len() {
+        // A `$sort` that took one in is tried again where it stands, as
+        // mongod's optimizer does (`[$set, W{n}, $sort{n}, W{n},
+        // $sort{n}]` lists one `$sort` ahead of both windows, one behind).
+        if let Some((merged, taken)) = absorbed(&out[..i], &out[i..]) {
+            out[i] = merged;
+            // The `$sort` taken in, and the `$skip`s of 0 mongod erased
+            // ahead of it (measured 8.2.11).
+            out.drain(i + 2..=i + taken);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The window `$sort` at the head of `at` with the longer of its key and
+/// that of the `$sort` two stages on, when it takes that one in
+/// ([`windows_absorb_sorts`]); `before` is the stages ahead of it.
+fn absorbed(before: &[Bson], at: &[Bson]) -> Option<(Bson, usize)> {
+    let [first, window, rest @ ..] = at else {
+        return None;
+    };
+    let zero_skip = |s: &Bson| {
+        s.as_document()
+            .filter(|d| d.len() == 1)
+            .and_then(|d| d.get("$skip"))
+            .is_some_and(|v| match v {
+                Bson::Int32(0) | Bson::Int64(0) => true,
+                Bson::Double(d) => *d == 0.0,
+                _ => false,
+            })
+    };
+    let skipped = rest.iter().take_while(|s| zero_skip(s)).count();
+    let next = rest.get(skipped)?;
+    let single = |s: &Bson, name: &str| -> Option<Document> {
+        let d = s.as_document().filter(|d| d.len() == 1)?;
+        d.get_document(name).ok().cloned()
+    };
+    let own = single(first, super::shape::WINDOW_SORT)?;
+    single(window, "$_internalSetWindowFields")?;
+    let after = single(next, "$sort").or_else(|| single(next, super::shape::WINDOW_SORT))?;
+    if !super::order::plain_sort(&own) || !super::order::plain_sort(&after) {
+        return None;
+    }
+    let dir = |v: &Bson| match v {
+        Bson::Int32(n) => i64::from(n.signum()),
+        Bson::Int64(n) => n.signum(),
+        Bson::Double(d) => *d as i64,
+        _ => 0,
+    };
+    let pairs = |d: &Document| {
+        d.iter()
+            .map(|(k, v)| (k.clone(), dir(v)))
+            .collect::<Vec<_>>()
+    };
+    let (a, b) = (pairs(&own), pairs(&after));
+    let n = a.len().min(b.len());
+    if a[..n] != b[..n] {
+        return None;
+    }
+    // The window's `$sort` goes ahead of an `$unwind` it reads nothing of
+    // before it could take this one in.
+    let unwind = before
+        .iter()
+        .rev()
+        .find(|s| as_match(s).is_none())
+        .and_then(|s| s.as_document()?.get("$unwind"));
+    if let Some(unwind) = unwind {
+        let paths = unwind_paths(unwind)?;
+        if own
+            .keys()
+            .all(|k| !paths.iter().any(|p| paths_overlap(k, p)))
+        {
+            return None;
+        }
+    }
+    let longer = if b.len() > a.len() { after } else { own };
+    Some((
+        Bson::Document(doc! { super::shape::WINDOW_SORT: longer }),
+        skipped + 2,
+    ))
 }
 
 /// [`drop_overridden_sorts`] on `pipeline` and on every `$facet`, `$lookup`
@@ -1422,6 +1524,110 @@ mod tests {
             vec![],
             doc! { "$_internalSetWindowFields": { "sortBy": { "n": 1 }, "output": {} } },
         );
+    }
+
+    /// A `$sort` right behind a window goes into the `$sort` the window
+    /// runs behind when either key is a prefix of the other (measured
+    /// 8.2.11, RM-639).
+    #[test]
+    fn a_window_takes_in_the_sort_behind_it() {
+        use crate::explain::shape::WINDOW_SORT;
+        let set = doc! { "$set": { "w": 1 } };
+        let ws = |by: bson::Document| doc! { WINDOW_SORT: by };
+        let iw = doc! { "$_internalSetWindowFields": { "sortBy": { "n": 1 }, "output": {} } };
+        let sort = |by: bson::Document| doc! { "$sort": by };
+        let run = |p: Vec<bson::Document>| drop_overridden_sorts(&stages(p));
+        let n = || doc! { "n": 1 };
+        let nid = || doc! { "n": 1, "_id": 1 };
+        assert_eq!(
+            run(vec![set.clone(), ws(n()), iw.clone(), sort(n())]),
+            stages(vec![set.clone(), ws(n()), iw.clone()])
+        );
+        assert_eq!(
+            run(vec![set.clone(), ws(n()), iw.clone(), sort(nid())]),
+            stages(vec![set.clone(), ws(nid()), iw.clone()])
+        );
+        assert_eq!(
+            run(vec![set.clone(), ws(nid()), iw.clone(), sort(n())]),
+            stages(vec![set.clone(), ws(nid()), iw.clone()])
+        );
+        assert_eq!(
+            run(vec![
+                set.clone(),
+                ws(n()),
+                iw.clone(),
+                ws(n()),
+                iw.clone(),
+                sort(n())
+            ]),
+            stages(vec![
+                set.clone(),
+                ws(n()),
+                iw.clone(),
+                iw.clone(),
+                sort(n())
+            ])
+        );
+        assert_eq!(
+            run(vec![
+                set.clone(),
+                ws(n()),
+                iw.clone(),
+                sort(n()),
+                ws(n()),
+                iw.clone(),
+                sort(n())
+            ]),
+            stages(vec![
+                set.clone(),
+                ws(n()),
+                iw.clone(),
+                iw.clone(),
+                sort(n())
+            ])
+        );
+        assert_eq!(
+            run(vec![
+                set.clone(),
+                ws(n()),
+                iw.clone(),
+                doc! { "$skip": 0 },
+                sort(n())
+            ]),
+            stages(vec![set.clone(), ws(n()), iw.clone()])
+        );
+        let kept = |p: Vec<bson::Document>| assert_eq!(run(p.clone()), stages(p));
+        kept(vec![
+            set.clone(),
+            ws(doc! { "n": -1 }),
+            iw.clone(),
+            sort(n()),
+        ]);
+        kept(vec![
+            set.clone(),
+            ws(n()),
+            iw.clone(),
+            sort(doc! { "_id": 1 }),
+        ]);
+        kept(vec![
+            set.clone(),
+            ws(doc! { "a": 1, "n": 1 }),
+            iw.clone(),
+            sort(n()),
+        ]);
+        kept(vec![
+            doc! { "$unwind": "$t" },
+            ws(n()),
+            iw.clone(),
+            sort(n()),
+        ]);
+        kept(vec![
+            set,
+            ws(n()),
+            iw.clone(),
+            doc! { "$match": { "n": 2 } },
+            sort(n()),
+        ]);
     }
 
     /// Sub-pipelines are optimized alike (RM-524).
