@@ -54941,6 +54941,11 @@ pub struct ExprQual {
     /// (RP-423): `(pattern, insensitive, negated, regex)`, `patternsel`
     /// over an expression with no statistics.
     pub pattern: Option<(String, bool, bool, bool)>,
+    /// The other operand reads the relation too (`(a - 1) = a`, an
+    /// equivalence class's restriction, RP-1117): `eqsel` finds no
+    /// constant side (`get_restriction_variable`) and answers
+    /// `DEFAULT_EQ_SEL`.
+    pub no_constant: bool,
 }
 
 /// A single-relation statement's WHERE as [`ExprQual`]s: `Some` only when
@@ -55306,6 +55311,7 @@ fn expr_qual(n: &pg_query::protobuf::Node, def: &TableDef) -> Option<ExprQual> {
             operators: expr.operators + 1,
             fields: expr.fields,
             pattern: Some((pat.sval.clone(), insensitive, negated, regex)),
+            no_constant: false,
         });
     }
     if AExprKind::try_from(e.kind) != Ok(AExprKind::AexprOp) {
@@ -55350,6 +55356,7 @@ fn expr_qual(n: &pg_query::protobuf::Node, def: &TableDef) -> Option<ExprQual> {
         operators: expr.operators + 1,
         fields: expr.fields,
         pattern: None,
+        no_constant: false,
     })
 }
 

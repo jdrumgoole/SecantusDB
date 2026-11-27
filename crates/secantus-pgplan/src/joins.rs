@@ -120,6 +120,13 @@ pub struct ExprEquality {
     /// The joined-row key a side's operand is, when it is a bare column.
     pub left_column: Option<String>,
     pub right_column: Option<String>,
+    /// Its place among the ON's AND conjuncts, and whether the ON wrote
+    /// the right side's operand first (`k.a - 1 = e.a`): the order
+    /// `process_equivalence` adds members to an equivalence class, which
+    /// decides the restriction and the join clause a class shared with
+    /// another clause leaves (RP-1117).
+    pub position: usize,
+    pub reversed: bool,
 }
 
 /// The equalities of a two-table join's ON and WHERE as PostgreSQL's
@@ -3214,9 +3221,21 @@ fn build_join(
                 equi.push((l, r));
                 equi_reversed.push(reversed);
             }
-            expr_keys = expr_equalities(&q, &left_keys, &right_keys)
-                .into_iter()
-                .map(|(l, r)| {
+            let mut on_conjuncts = Vec::new();
+            split_and(&q, &mut on_conjuncts);
+            expr_keys = on_conjuncts
+                .iter()
+                .enumerate()
+                .flat_map(|(i, c)| {
+                    expr_equalities(c, &left_keys, &right_keys)
+                        .into_iter()
+                        .map(move |(l, r)| (i, c, l, r))
+                })
+                .map(|(position, c, l, r)| {
+                    let written_first = match c.node.as_ref() {
+                        Some(N::AExpr(e)) => e.lexpr.as_deref(),
+                        _ => None,
+                    };
                     Ok(ExprEquality {
                         left: on_expr(l, &side_scope, params)?,
                         right: on_expr(r, &side_scope, params)?,
@@ -3224,6 +3243,8 @@ fn build_join(
                         right_ops: key_expr_ops(r, &side_scope),
                         left_column: bare_key(l),
                         right_column: bare_key(r),
+                        position,
+                        reversed: written_first.is_some_and(|w| std::ptr::eq(w, r)),
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -3279,6 +3300,8 @@ fn build_join(
                 right_ops: e.left_ops,
                 left_column: e.right_column,
                 right_column: e.left_column,
+                position: e.position,
+                reversed: !e.reversed,
             })
             .collect();
         (JoinKind::Left, right, left, right_keys, left_keys)

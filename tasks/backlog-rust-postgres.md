@@ -2291,20 +2291,31 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a full using join a where reduces to a removable left join is removed]
       Backlog-ID: RP-1168
 
-- [ ] **A join whose expression key shares a column with another
-      clause is unpriced.** `explain select e.b from e join k on e.a =
-      k.a - 1 and e.a = k.a` (`e`, `k` analysed, 1000 rows) prints a `Hash
-      Join` on both clauses, every cost zero; PostgreSQL 15.19 puts `e.a`,
-      `(k.a - 1)` and `k.a` in one equivalence class, hashes on `e.a = k.a`
-      alone and filters `k` by `((a - 1) = a)` (`Hash Join
-      (cost=20.06..37.70 rows=5 width=3)`). `... on e.a = e2.a + 1 and e.a
-      = e2.a * 2` is the same: PostgreSQL hashes `(e.a = (e2.a + 1))` and
-      filters `e2` by `((a + 1) = (a * 2))`; here an unpriced Nested Loop.
-      The pricing of expression keys refuses a bare column two clauses
-      share (`joined_sides`) rather than model the class. Found while
-      working RP-1058.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an expression key sharing a column with a column pair joins its class]
-      Backlog-ID: RP-1117
+- [ ] **A join whose expression key shares a class with another clause
+      is unpriced beside a WHERE, a join filter, an aggregate, a comma
+      join, or a restriction of both sides.** `e`, `k` analysed (1000
+      rows, `k.a` the primary key). An inner ON join of two tables whose
+      expression key shares a member with another clause prints and
+      prices its equivalence class as PostgreSQL 15.20 does (`e.a = k.a -
+      1 and e.a = k.a` hashes on `e.a = k.a` and filters `k` by `((a - 1)
+      = a)`, RP-1117), but every node stays `cost=0.00..0.00 rows=0
+      width=0` in these shapes: a WHERE beside it (`... where k.b =
+      'v1'`, PostgreSQL's `Hash Join (cost=22.51..40.15 rows=1 width=3)`
+      with `k` filtered by `((b = 'v1'::text) AND ((a - 1) = a))`; here
+      both ON clauses stay the Hash Cond); an ON inequality beside it
+      (`and e.b < k.b`, a `Join Filter` beside `Hash Cond: (e.a = k.a)`);
+      a plain aggregate over it (`select count(*) ...`,
+      `aggregate_join_select`, RP-1104); a comma join (`from e, k where
+      e.a = k.a - 1 and e.a = k.a`, whose expression equality is a `Join
+      Filter` here rather than a class member); and a class restricting
+      both sides (`e.a = k.a + 1 and e.a - 1 = k.a and e.a = k.a`), where
+      PostgreSQL nests loops over a Materialize (`Nested Loop
+      (cost=0.00..40.39 rows=1 width=3)`, each side 5 rows) and this
+      server draws an unpriced Hash Join. `shared_join_classes` /
+      `joined_sides` model only an inner ON join with no WHERE and no
+      other conjunct. Found while working RP-1117.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an expression class beside a where restricts its side by both], tests/backlog/test_rp_explain_costs.py::test_plan[an expression class beside an on inequality keeps it the join filter], tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over an expression class prices its join], tests/backlog/test_rp_explain_costs.py::test_plan[a comma join's expression equality joins its class], tests/backlog/test_rp_explain_costs.py::test_plan[an expression class restricting both sides nests loops]
+      Backlog-ID: RP-1171
 
 - [ ] **A Sort of an ORDER BY over a two-table join is unpriced where
       the narrow path's model declines it.** With no LIMIT, `e`, `k`

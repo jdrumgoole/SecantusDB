@@ -2990,6 +2990,92 @@ pub(crate) fn placed_join_cond(conds: &[String], clauses: &[(usize, usize, usize
     }
 }
 
+/// A two-table join's ON as its equivalence classes leave it (RP-1117,
+/// [`crate::scan_estimate::JoinClasses`]): its join clauses, `(left
+/// member = right member)` each, as the join's condition, and each
+/// side's restrictions, `(earlier member = later member)` each, by the
+/// scan's alias with the operators each evaluates. Each member's text is
+/// its operand in the ON conjunct that first wrote it. `None` where `on`
+/// is not those conjuncts.
+#[allow(clippy::type_complexity)]
+pub(crate) fn class_join_texts(
+    on: &str,
+    classes: &crate::scan_estimate::JoinClasses<'_>,
+    aliases: (&str, &str),
+) -> Option<(String, Vec<(String, Vec<(u32, String)>)>)> {
+    let parts = split_conjuncts(on);
+    let operands: Vec<(String, String)> = parts
+        .iter()
+        .map(|p| comparison_operands(p))
+        .collect::<Option<_>>()?;
+    let text = |m: usize| -> Option<&str> {
+        let member = classes.members.get(m)?;
+        let (l, r) = operands.get(member.at.0)?;
+        Some(if member.at.1 { r } else { l })
+    };
+    let mut conds = Vec::new();
+    for &(l, r) in &classes.joins {
+        conds.push(format!("({} = {})", text(l)?, text(r)?));
+    }
+    let cond = match conds.len() {
+        1 => conds.remove(0),
+        _ => format!("({})", conds.join(" AND ")),
+    };
+    let mut filters: Vec<(String, Vec<(u32, String)>)> = Vec::new();
+    for &(a, b) in &classes.restricts {
+        let (x, y) = (&classes.members[a], &classes.members[b]);
+        let alias = if x.left { aliases.0 } else { aliases.1 };
+        let qual = (
+            x.ops? + y.ops? + 1,
+            format!("({} = {})", text(a)?, text(b)?),
+        );
+        match filters.iter_mut().find(|(n, _)| n == alias) {
+            Some((_, quals)) => quals.push(qual),
+            None => filters.push((alias.to_string(), vec![qual])),
+        }
+    }
+    Some((cond, filters))
+}
+
+/// Give each scan named in `filters` (by its alias, or its relation's
+/// name) those quals as its `Filter`, cheapest first as
+/// `order_qual_clauses` sorts them (stable, so ties keep their order),
+/// prefixed only under VERBOSE (`show_scan_qual`).
+pub(crate) fn attach_scan_filters(
+    root: &mut PlanNode,
+    filters: &[(String, Vec<(u32, String)>)],
+    verbose: bool,
+) {
+    let mut own = Vec::new();
+    let prop = |k: &str| {
+        root.props
+            .iter()
+            .find(|(p, _)| p == k)
+            .map(|(_, v)| v.clone())
+    };
+    if let Some(name) = prop("Alias").or_else(|| prop("Relation Name")) {
+        own.push(name);
+    }
+    if root.children.is_empty() && is_relation_scan(&root.name) {
+        if let Some((alias, quals)) = filters.iter().find(|(a, _)| own.contains(a)) {
+            let mut quals = quals.clone();
+            quals.sort_by_key(|(cost, _)| *cost);
+            let mut texts: Vec<String> = quals
+                .into_iter()
+                .map(|(_, q)| if verbose { q } else { unqualify(&q, alias) })
+                .collect();
+            let text = match texts.len() {
+                1 => texts.remove(0),
+                _ => format!("({})", texts.join(" AND ")),
+            };
+            root.details.push(("Filter".into(), text));
+        }
+    }
+    for c in &mut root.children {
+        attach_scan_filters(c, filters, verbose);
+    }
+}
+
 /// Put each join's ON condition on its join node (post-order, as
 /// `join_conditions` lists them): `Hash Cond` on a hash join, `Join Filter`
 /// on a nested loop. A hash or merge join whose ON also holds conjuncts
