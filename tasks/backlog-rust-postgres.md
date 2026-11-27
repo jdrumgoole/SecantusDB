@@ -1244,6 +1244,14 @@ one beside it.
       EXPLAIN VERBOSE change; run 46042159284, job 140652457171): 26.9 ms
       against 31.0 ms, ratio median 1.15, rounds 0.91 to 1.20; #3086
       between them passed. Two of the last three CI runs now fail it.
+      A sixth, two snapshots on (#3089 at `c7c3ac8d`, RP-1086's INSERT ...
+      SELECT record coercion, nowhere near the catalog; run 46053786106,
+      job 140691365217, 1 failed of 5,734): 32.6 ms against 36.0 ms,
+      ratio median 1.14, rounds 0.79 to 1.32. Three CI medians in a row
+      at 1.14-1.15 (3.4-4.1 ms more at 3,200 tables, about 1.2 ms per
+      thousand) where arm64 macOS measures 1.02 (0.3 ms) suggest a real
+      growth on Linux x86_64 that this Mac does not show, not only noise;
+      it wants a profile on Linux.
       Verify: none -- intermittent on CI; RP-715's, RP-911's and RP-1073's tests are the check
       Backlog-ID: RP-1100
 
