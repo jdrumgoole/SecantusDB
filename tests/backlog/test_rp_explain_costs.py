@@ -2565,15 +2565,16 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # Measured on a private PostgreSQL 15.20 cluster (2026-11-26, found
     # while working RP-1064): a FULL JOIN `reduce_outer_joins` makes a LEFT
-    # JOIN to a unique key nothing reads is removed, as a written one is.
+    # JOIN to a unique key nothing reads is removed, as a written one is;
+    # here it was kept until RP-1118 was fixed.
     "a full join a where reduces to a removable left join is removed": (
-        "RP-1118",
+        "RP-1118:fixed",
         _ANALYSED,
         "explain (costs off) select e.b from e full join k on e.a = k.a where e.a > 0",
         ["Seq Scan on e", "  Filter: (a > 0)"],
     ),
     "a full join an inner join reduces to a removable left join is removed": (
-        "RP-1118",
+        "RP-1118:fixed",
         _ANALYSED,
         "explain (costs off) select e.b, e2.b from e full join k on e.a = k.a "
         "join e e2 on e2.a = e.a",
@@ -2583,6 +2584,58 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e",
             "  ->  Hash",
             "        ->  Seq Scan on e e2",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (2026-11-27, found
+    # while working RP-1118): `reduce_outer_joins_pass2` flips a RIGHT join
+    # into the LEFT join of its sides swapped, which `remove_useless_joins`
+    # then removes, a written one or a FULL join reduced to one.
+    "a right join to a key nothing reads is removed": (
+        "RP-1166",
+        _ANALYSED,
+        "explain (costs off) select e.b from k right join e on e.a = k.a",
+        ["Seq Scan on e"],
+    ),
+    "a full join a where reduces to a removable right join is removed": (
+        "RP-1166",
+        _ANALYSED,
+        "explain (costs off) select e.b from k full join e on e.a = k.a where e.a > 0",
+        ["Seq Scan on e", "  Filter: (a > 0)"],
+    ),
+    # Measured there too: a FULL USING join reduced to a LEFT join is
+    # removed when nothing reads its merged column, `COALESCE(e.a, k.a)`,
+    # which reads the inner side.
+    "a full using join a where reduces to a removable left join is removed": (
+        "RP-1168",
+        _ANALYSED,
+        "explain (costs off) select e.b from e full join k using (a) where e.a > 0",
+        ["Seq Scan on e", "  Filter: (a > 0)"],
+    ),
+    # Measured there too: a USING join's equality is its Hash Cond, and a
+    # FULL USING join's merged column is `COALESCE` of its sides.
+    "a using join prints its hash cond": (
+        "RP-1167",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e left join k using (b)",
+        [
+            "Hash Left Join",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on k",
+        ],
+    ),
+    "a full using join prints its hash cond and its merged column's filter": (
+        "RP-1167",
+        _ANALYSED,
+        "explain (costs off) select e.b from e full join k using (a) where a > 0",
+        [
+            "Hash Full Join",
+            "  Hash Cond: (e.a = k.a)",
+            "  Filter: (COALESCE(e.a, k.a) > 0)",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on k",
         ],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966): an outer
