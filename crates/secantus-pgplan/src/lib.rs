@@ -55665,26 +55665,36 @@ fn reduce_left_join_on_classes(
     Some((rname, gates))
 }
 
-/// A join of relations reached through inner joins only, whose WHERE makes
-/// one column's equivalence class hold two distinct constants (RP-400).
-/// `generate_base_implied_equalities_const` gives the column's relation the
-/// folded `false` as its own restriction (the class's relids are that one
-/// relation), `relation_excluded_by_constraints` makes it dummy, and a dummy
-/// member of an inner join makes the join dummy: the plan is a bare
-/// `Result` with `One-Time Filter: false`. Only the integer and text
-/// constants `reduce_const_classes` models; a NULL or another type's
-/// constant is left to the plain plan.
+/// A join of relations reached through inner joins only, one of whose
+/// equivalence classes holds two distinct constants (RP-400, RP-1102). The
+/// WHERE's and every inner ON's `column = column` equalities merge their
+/// columns' classes (`process_equivalence`, an int2/int4/int8 member with
+/// another of the integer opfamily, a text one with text), and each
+/// `column = constant` adds its constant to the column's class.
+/// `generate_base_implied_equalities_const` keeps the class's first
+/// constant and folds each other member's equality to it: a second
+/// distinct constant is the folded `false`. Over one relation it is that
+/// relation's own restriction, which `relation_excluded_by_constraints`
+/// makes dummy; over several it is a join clause, and
+/// `restriction_is_constant_false` makes the join rel that first evaluates
+/// it dummy. Either way a dummy member of an inner join makes the join
+/// dummy: the plan is a bare `Result` with `One-Time Filter: false`. Only
+/// the integer and text constants `reduce_const_classes` models; a NULL,
+/// another type's constant, or an equality whose sides are cast to a
+/// common type (a different class member) is left to the plain plan.
 fn join_const_contradiction(query: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> bool {
     use pg_query::protobuf::JoinType as J;
     use pg_query::protobuf::Node as PNode;
     let N::SelectStmt(s) = query else {
         return false;
     };
-    // (name the query refers to it by, its definition)
-    fn relations(
-        n: &PNode,
+    // (name the query refers to it by, its definition); each inner ON's
+    // quals into `quals`.
+    fn relations<'a>(
+        n: &'a PNode,
         lookup: &dyn Fn(&str) -> Option<TableDef>,
         out: &mut Vec<(String, TableDef)>,
+        quals: &mut Vec<&'a PNode>,
     ) -> bool {
         match n.node.as_ref() {
             Some(N::RangeVar(rv)) => {
@@ -55700,25 +55710,38 @@ fn join_const_contradiction(query: &N, lookup: &dyn Fn(&str) -> Option<TableDef>
                 true
             }
             Some(N::JoinExpr(j)) => {
-                J::try_from(j.jointype) == Ok(J::JoinInner)
-                    && j.larg.as_deref().is_some_and(|l| relations(l, lookup, out))
-                    && j.rarg.as_deref().is_some_and(|r| relations(r, lookup, out))
+                if J::try_from(j.jointype) != Ok(J::JoinInner) {
+                    return false;
+                }
+                let (Some(l), Some(r)) = (j.larg.as_deref(), j.rarg.as_deref()) else {
+                    return false;
+                };
+                if !(relations(l, lookup, out, quals) && relations(r, lookup, out, quals)) {
+                    return false;
+                }
+                // A NATURAL or USING join's merged columns are not
+                // modelled; its ON-less equalities are simply not read.
+                if let Some(q) = j.quals.as_deref() {
+                    quals.push(q);
+                }
+                true
             }
             _ => false,
         }
     }
     let mut rels = Vec::new();
+    let mut quals = Vec::new();
     for item in &s.from_clause {
-        if !relations(item, lookup, &mut rels) {
+        if !relations(item, lookup, &mut rels, &mut quals) {
             return false;
         }
     }
     if rels.len() < 2 {
         return false;
     }
-    let Some(where_clause) = s.where_clause.as_deref() else {
-        return false;
-    };
+    if let Some(w) = s.where_clause.as_deref() {
+        quals.push(w);
+    }
     fn flatten<'a>(n: &'a PNode, out: &mut Vec<&'a PNode>) {
         match n.node.as_ref() {
             Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
@@ -55730,7 +55753,9 @@ fn join_const_contradiction(query: &N, lookup: &dyn Fn(&str) -> Option<TableDef>
         }
     }
     let mut parts = Vec::new();
-    flatten(where_clause, &mut parts);
+    for q in quals {
+        flatten(q, &mut parts);
+    }
     // A column reference resolved to (relation index, column, its type).
     let column = |n: Option<&PNode>| -> Option<(usize, String, String)> {
         let Some(N::ColumnRef(c)) = n.and_then(|n| n.node.as_ref()) else {
@@ -55763,6 +55788,12 @@ fn join_const_contradiction(query: &N, lookup: &dyn Fn(&str) -> Option<TableDef>
             ty.trim_start_matches("pg_catalog.").to_string(),
         ))
     };
+    // The btree opfamily a column's `=` belongs to, where modelled.
+    let family = |ty: &str| match ty {
+        "int2" | "int4" | "int8" => Some("integer"),
+        "text" => Some("text"),
+        _ => None,
+    };
     #[derive(PartialEq)]
     enum Value {
         Int(i64),
@@ -55783,7 +55814,25 @@ fn join_const_contradiction(query: &N, lookup: &dyn Fn(&str) -> Option<TableDef>
             _ => None,
         }
     };
-    let mut classes: Vec<((usize, String), Value)> = Vec::new();
+    // The classes as a union-find over the columns the equalities name.
+    let mut members: Vec<(usize, String)> = Vec::new();
+    let mut parent: Vec<usize> = Vec::new();
+    let mut id = |key: (usize, String), parent: &mut Vec<usize>| -> usize {
+        if let Some(i) = members.iter().position(|k| *k == key) {
+            return i;
+        }
+        members.push(key);
+        parent.push(parent.len());
+        parent.len() - 1
+    };
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let mut constants: Vec<(usize, Value)> = Vec::new();
     for p in parts {
         let Some(N::AExpr(e)) = p.node.as_ref() else {
             continue;
@@ -55792,19 +55841,38 @@ fn join_const_contradiction(query: &N, lookup: &dyn Fn(&str) -> Option<TableDef>
             continue;
         }
         let (l, r) = (e.lexpr.as_deref(), e.rexpr.as_deref());
-        let (col, other) = match (column(l), column(r)) {
-            (Some(c), None) => (c, r),
-            (None, Some(c)) => (c, l),
-            _ => continue,
-        };
-        let Some(value) = constant(other, &col.2) else {
-            continue;
-        };
-        let key = (col.0, col.1);
-        match classes.iter().find(|(k, _)| *k == key) {
+        match (column(l), column(r)) {
+            (Some(a), Some(b)) => {
+                if family(&a.2).is_none() || family(&a.2) != family(&b.2) {
+                    continue;
+                }
+                let (ia, ib) = (id((a.0, a.1), &mut parent), id((b.0, b.1), &mut parent));
+                let (ra, rb) = (root(&mut parent, ia), root(&mut parent, ib));
+                parent[rb] = ra;
+            }
+            (Some(c), None) | (None, Some(c)) => {
+                let other = if matches!(l.and_then(|n| n.node.as_ref()), Some(N::ColumnRef(_))) {
+                    r
+                } else {
+                    l
+                };
+                let Some(value) = constant(other, &c.2) else {
+                    continue;
+                };
+                let i = id((c.0, c.1), &mut parent);
+                constants.push((i, value));
+            }
+            (None, None) => {}
+        }
+    }
+    // Each class's first constant, against which every other is compared.
+    let mut first: Vec<(usize, &Value)> = Vec::new();
+    for (i, value) in &constants {
+        let r = root(&mut parent, *i);
+        match first.iter().find(|(k, _)| *k == r) {
             Some((_, v)) if *v != value => return true,
             Some(_) => {}
-            None => classes.push((key, value)),
+            None => first.push((r, value)),
         }
     }
     false
