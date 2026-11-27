@@ -3145,17 +3145,6 @@ Measured on PostgreSQL 15.19 with `create domain pint as int check (value >
 text)` and `create table tct (c ctp, d pint[])` holding `('(1,x)', null)`.
 The gap tests are in `tests/backlog/test_rp_found_rp552.py`.
 
-- [ ] **A `record` column an `INSERT ... SELECT` writes to a
-      non-composite column is 0A000.** `insert into tct(d) select
-      row(1,'x')` is 42804 `column "d" is of type pint[] but expression is
-      of type record` at 27 on PostgreSQL 15.20, and an `int` column's is
-      the same with `integer`; here each is 0A000 `a record cast to pint[]
-      is not supported yet` (`int4`) with no position, from the row write
-      after `check_insert_select_types` (secantus-pg) found no name for the
-      source type. Found while working RP-1049, which closed the composite
-      target there.
-      Verify: tests/backlog/test_rp_found_rp552.py::test_insert_select_record_into_non_composite
-      Backlog-ID: RP-1086
 
 ## Found while working RP-1050 (2026-11-25)
 
@@ -4258,3 +4247,18 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       a different reason.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a group key a where constant fixes is a group aggregate], tests/backlog/test_rp_explain_costs.py::test_plan[a group key a where constant fixes is ordered without a sort]
       Backlog-ID: RP-1165
+
+## Found while working RP-1086 (2026-11-27)
+
+Measured on PostgreSQL 15.19. The gap tests are in
+`tests/backlog/test_rp_found_rp1086.py`.
+
+- [ ] **`CREATE CAST` naming a pseudo-type is "does not exist".** `create
+      cast (record as int) with inout` is 42809 `source data type record is
+      a pseudo-type` on PostgreSQL 15.19, and a pseudo-type target (`int
+      as record`, `int as void`) is the same with `target`; `anyelement`
+      is refused alike. `CreateCast` looks the types up first, then checks
+      `typtype` before anything else. Here each is 42704 `type "record"
+      does not exist`, as the cast's type lookup knows no pseudo-type.
+      Verify: tests/backlog/test_rp_found_rp1086.py::test_create_cast_pseudo_type
+      Backlog-ID: RP-1175

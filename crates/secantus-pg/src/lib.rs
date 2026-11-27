@@ -30658,6 +30658,28 @@ fn assignment_target_oid(pg_type: &str) -> Option<i64> {
     oid_of_name(&format!("{base}[]"))
 }
 
+/// Does a `record` (`source` 2249) or `record[]` (2287) have an ASSIGNMENT
+/// coercion to the built-in `target` (a domain's base type)? Only by I/O
+/// conversion into the string category (`text`, `varchar`, `bpchar`,
+/// `name`); a `record[]` also into an array of one, by its elements
+/// (`find_coercion_pathway`). `None` is a type of no built-in oid -- an
+/// enum, a range, an array of a user type -- which has none.
+fn record_assignable(source: i64, target: Option<i64>) -> bool {
+    const RECORD_ARRAY: i64 = 2287;
+    let string = |oid: i64| matches!(oid, 25 | 1043 | 1042 | 19);
+    let Some(target) = target else {
+        return false;
+    };
+    if string(target) {
+        return true;
+    }
+    source == RECORD_ARRAY
+        && secantus_pgplan::pgtypes::BUILTIN_TYPES
+            .iter()
+            .find(|(_, _, arr)| *arr == target)
+            .is_some_and(|(_, el, _)| string(*el))
+}
+
 fn wire_typmod(pg_type: &str, typmod: i32) -> i32 {
     secantus_pgplan::domains::base_type_and_typmod(pg_type).map_or(typmod, |(_, m, _)| m)
 }
@@ -32701,6 +32723,29 @@ impl PgHandler {
             if source_oid == RECORD && secantus_pgplan::user_composite_oid(&col.pg_type).is_some() {
                 return Err(Self::err(&secantus_pgplan::record_to_composite_mismatch(
                     col,
+                    entry.map_or(-1, |t| t.location),
+                )));
+            }
+            // A `record` (or `record[]`) into anything else: `record` is a
+            // pseudo-type, so no `pg_cast` row and no user cast starts from
+            // it (CREATE CAST refuses one, 42809). What is left of
+            // `find_coercion_pathway` under ASSIGNMENT is the I/O conversion
+            // into the string category, element by element for an array, so
+            // an `int`, `"char"`, `jsonb`, enum, range or array column is
+            // 42804 before a row is read (RP-1086).
+            const RECORD_ARRAY: i64 = 2287;
+            if source_oid == RECORD || source_oid == RECORD_ARRAY {
+                if record_assignable(source_oid, assignment_target_oid(&col.pg_type)) {
+                    continue;
+                }
+                let source_name = if source_oid == RECORD {
+                    "record"
+                } else {
+                    "record[]"
+                };
+                return Err(Self::err(&secantus_pgplan::assignment_mismatch(
+                    col,
+                    source_name,
                     entry.map_or(-1, |t| t.location),
                 )));
             }
