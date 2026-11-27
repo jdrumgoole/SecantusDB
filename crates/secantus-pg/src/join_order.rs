@@ -129,6 +129,9 @@ struct Built {
     clause: Clause,
     /// A LEFT join, `a` its preserved side.
     left: bool,
+    /// The two sides as the whole-pathlist search priced them
+    /// (`Search::general`), which EXPLAIN reads a merge join's plan from.
+    sides: Option<(JoinSide, JoinSide)>,
 }
 
 /// A relation of the search: its tables (a bit each), its rows, its paths
@@ -194,6 +197,8 @@ struct Search {
     /// By table and path index, as `base_lists`: an index scan run
     /// backward (`BackwardScanDirection`), its key descending.
     base_backward: Vec<Vec<bool>>,
+    /// By table and path index, as `base_lists`: a bitmap heap scan.
+    base_bitmap: Vec<Vec<bool>>,
     /// Under a LIMIT with an ORDER BY of one column, its joined-row key and
     /// the equivalence class its order is (`query_pathkeys`): the class's,
     /// an inner join's clause's, or its own (`ORDER_CLASS`). Paths in that
@@ -247,6 +252,7 @@ struct Search {
 type BaseLists = (
     Vec<(Vec<(InPath, Option<String>)>, usize, usize)>,
     Vec<Vec<Option<(String, String)>>>,
+    Vec<Vec<bool>>,
 );
 
 /// The class of an ORDER BY column no clause reads: its own.
@@ -325,6 +331,17 @@ fn walk_tree<'a>(
         }
         _ => None,
     }
+}
+
+/// A search's plan ([`PgHandler::plan_searched`]): the relation of every
+/// table (`top`, by index in `search.rels`), the path picked of it, and
+/// under a LIMIT with an ORDER BY how that path is put in its order.
+struct Planned<'a> {
+    chain: Chain<'a>,
+    search: Search,
+    top: usize,
+    pick: Pick,
+    ordered: Option<secantus_pgplan::joincost::OrderedBy>,
 }
 
 /// Which of a relation's paths a join above reads.
@@ -1010,6 +1027,7 @@ impl PgHandler {
                 aliases,
                 base_lists: Vec::new(),
                 base_backward: Vec::new(),
+                base_bitmap: Vec::new(),
                 order: None,
                 order_desc: false,
                 order_nulls_first: false,
@@ -1399,7 +1417,13 @@ impl PgHandler {
             let rel = &mut search.rels[idx];
             let rows = rel.rows;
             let combo = rel.built.len();
-            rel.built.push(Built { a, b, clause, left });
+            rel.built.push(Built {
+                a,
+                b,
+                clause,
+                left,
+                sides: Some((side_a, side_b)),
+            });
             rel.paths.set_filter_cost(CPU_OPERATOR_COST * filter_ops);
             if full {
                 rel.paths
@@ -1422,7 +1446,13 @@ impl PgHandler {
         }
         let rel = &mut search.rels[idx];
         let combo = rel.built.len();
-        rel.built.push(Built { a, b, clause, left });
+        rel.built.push(Built {
+            a,
+            b,
+            clause,
+            left,
+            sides: None,
+        });
         if full {
             rel.paths.add_full_paths(combo, &side_a, &side_b, true);
         } else {
@@ -2004,42 +2034,68 @@ impl PgHandler {
         later: &[(String, bool)],
         general: bool,
     ) -> PgWireResult<Option<Vec<Document>>> {
+        let Some(planned) = self.plan_searched(node, limit, order, later, general) else {
+            return Ok(None);
+        };
+        if let Some(how) = planned.ordered {
+            use secantus_pgplan::joincost::OrderedBy;
+            let presorted = match how {
+                OrderedBy::Presorted => usize::MAX,
+                OrderedBy::Incremental => 1,
+                OrderedBy::Sort => 0,
+            };
+            crate::GENERAL_JOIN_PRESORTED.with(|c| c.set(presorted));
+        }
+        let Some(joined) = self.run_searched(
+            &planned.search,
+            &planned.chain,
+            planned.top,
+            planned.pick,
+            &Document::new(),
+            &mut HashMap::new(),
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(joined.rows))
+    }
+
+    /// The plan [`PgHandler::searched_rows`] runs: the search, the relation
+    /// of every table and the path picked of it, and with an ORDER BY
+    /// under a LIMIT how that path is put in its order.
+    fn plan_searched<'a>(
+        &self,
+        node: &'a JoinNode,
+        limit: Option<(usize, usize)>,
+        order: Option<(&str, bool, bool)>,
+        later: &[(String, bool)],
+        general: bool,
+    ) -> Option<Planned<'a>> {
         let spanning_modelled = if limit.is_some() {
             crate::join_search::where_clauses_and_filters().is_some()
         } else {
             crate::join_search::where_join_clauses().is_some()
         };
         if !spanning_modelled || LOCK_ROW_IDS.with(|c| c.get()) {
-            return Ok(None);
+            return None;
         }
-        let Some((chain, mut search)) =
-            self.four_table_chain(node, limit.is_some(), order.is_some())
-        else {
-            return Ok(None);
-        };
+        let (chain, mut search) = self.four_table_chain(node, limit.is_some(), order.is_some())?;
         // The ORDER BY's keys after its first that are pathkeys of their own.
         let mut order_keys = 0;
         if general {
             search.general = true;
             if limit.is_some() {
-                let Some(filters) = self.search_filters(&search) else {
-                    return Ok(None);
-                };
+                let filters = self.search_filters(&search)?;
                 search.filters = filters;
             }
             if let Some((key, desc, nulls_first)) = order {
-                let Some(class) = Self::order_class(&search, &chain, key) else {
-                    return Ok(None);
-                };
+                let class = Self::order_class(&search, &chain, key)?;
                 search.order = Some((key.to_string(), class));
                 search.order_desc = desc;
                 search.order_nulls_first = nulls_first;
                 if !later.is_empty() {
                     let names: Vec<String> = later.iter().map(|(k, _)| k.clone()).collect();
-                    let Some(n) = self.later_order_keys_modelled(&search, key, class, &names)
-                    else {
-                        return Ok(None);
-                    };
+                    let n = self.later_order_keys_modelled(&search, key, class, &names)?;
                     search.later_desc = Self::later_desc_classes(&search, key, class, later);
                     // A merge join takes the query's pathkeys only when every
                     // ORDER BY key is one of its clauses' classes
@@ -2053,10 +2109,8 @@ impl PgHandler {
                     order_keys = n;
                 }
             }
-            let Some((mut base_lists, mut param_keys)) = self.build_base_lists(&search, &chain)
-            else {
-                return Ok(None);
-            };
+            let (mut base_lists, mut param_keys, mut base_bitmap) =
+                self.build_base_lists(&search, &chain)?;
             let mut base_backward: Vec<Vec<bool>> = base_lists
                 .iter()
                 .map(|(list, _, _)| vec![false; list.len()])
@@ -2149,6 +2203,7 @@ impl PgHandler {
                         list[i].0.class = Some(secantus_pgplan::joincost::asc_keys(c));
                         list.insert(i + 1, forward);
                         param_keys[t].insert(i + 1, None);
+                        base_bitmap[t].insert(i + 1, false);
                         base_backward[t].insert(i + 1, true);
                         if *ct > i {
                             *ct += 1;
@@ -2182,6 +2237,7 @@ impl PgHandler {
             }
             search.base_lists = base_lists;
             search.base_backward = base_backward;
+            search.base_bitmap = base_bitmap;
             search.param_keys = param_keys;
         }
         if let Some((rows, offset)) = limit {
@@ -2189,26 +2245,20 @@ impl PgHandler {
             let count = rows.saturating_sub(offset).max(1);
             search.limit = Some((count as f64, offset as f64));
         }
-        let Some(top) = self.search_four(&mut search) else {
-            return Ok(None);
-        };
+        let top = self.search_four(&mut search)?;
+        let mut ordered = None;
         let pick = match search.limit {
             Some((count, offset)) => {
                 let r = &search.rels[top];
                 let chosen = match &search.order {
                     Some((key, class)) => {
-                        let Some(width) = search.width(r.set) else {
-                            return Ok(None);
-                        };
+                        let width = search.width(r.set)?;
                         // Keys after the first: an Incremental Sort is
                         // weighed, over the first key's groups.
                         let groups = if order_keys == 0 {
                             None
                         } else {
-                            let Some(g) = self.order_key_groups(&search, key, *class, r.rows)
-                            else {
-                                return Ok(None);
-                            };
+                            let g = self.order_key_groups(&search, key, *class, r.rows)?;
                             Some(g)
                         };
                         secantus_pgplan::joincost::ordered_limit_choice(
@@ -2222,39 +2272,26 @@ impl PgHandler {
                             offset,
                         )
                         .map(|(i, how)| {
-                            use secantus_pgplan::joincost::OrderedBy;
-                            let presorted = match how {
-                                OrderedBy::Presorted => usize::MAX,
-                                OrderedBy::Incremental => 1,
-                                OrderedBy::Sort => 0,
-                            };
-                            crate::GENERAL_JOIN_PRESORTED.with(|c| c.set(presorted));
+                            ordered = Some(how);
                             i
                         })
                     }
                     None => secantus_pgplan::joincost::limit_choice(&r.list, r.rows, count, offset),
                 };
-                let Some(i) = chosen else {
-                    return Ok(None);
-                };
+                let i = chosen?;
                 Pick::Path(i)
             }
             // The whole result: the cheapest path in total (`set_cheapest`).
             None if search.general => Pick::Path(search.rels[top].cheapest.0),
             None => Pick::Best,
         };
-        let Some(joined) = self.run_searched(
-            &search,
-            &chain,
+        Some(Planned {
+            chain,
+            search,
             top,
             pick,
-            &Document::new(),
-            &mut HashMap::new(),
-        )?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(joined.rows))
+            ordered,
+        })
     }
 
     /// The class of the ORDER BY column `key` (`Search::order`): the class
@@ -2465,6 +2502,7 @@ impl PgHandler {
         let multi = pairs.windows(2).any(|w| w[0] == w[1]);
         let mut out = Vec::new();
         let mut param_keys = Vec::new();
+        let mut bitmaps = Vec::new();
         let mut parameterized = false;
         for (t, (table, filter)) in search.tables.iter().enumerate() {
             // Each outer table's clause with this one: this table's key and
@@ -2541,8 +2579,8 @@ impl PgHandler {
                 _ => None,
             };
             let list = self.limit_base_paths(table, filter, columns, &keys, order_col)?;
-            parameterized |= list.iter().any(|(p, _)| p.req_outer != 0);
-            let cands: Vec<InPath> = list.iter().map(|(p, _)| *p).collect();
+            parameterized |= list.iter().any(|(p, ..)| p.req_outer != 0);
+            let cands: Vec<InPath> = list.iter().map(|(p, ..)| *p).collect();
             let (kept, ct, cs) = secantus_pgplan::joincost::base_pathlist(&cands, true)?;
             param_keys.push(
                 kept.iter()
@@ -2555,7 +2593,14 @@ impl PgHandler {
                     })
                     .collect(),
             );
-            out.push((kept.iter().map(|&i| list[i].clone()).collect(), ct, cs));
+            bitmaps.push(kept.iter().map(|&i| list[i].2).collect());
+            out.push((
+                kept.iter()
+                    .map(|&i| (list[i].0, list[i].1.clone()))
+                    .collect(),
+                ct,
+                cs,
+            ));
         }
         // With a scan parameterized by an outer row: a FULL join's
         // parameterized join paths, a join filter or a second clause
@@ -2565,6 +2610,274 @@ impl PgHandler {
         if parameterized && (full || !search.filters.is_empty() || multi) {
             return None;
         }
-        Some((out, param_keys))
+        Some((out, param_keys, bitmaps))
+    }
+}
+
+impl PgHandler {
+    /// EXPLAIN's plan of a join of two stored tables under a LIMIT with an
+    /// ORDER BY (RP-1099): the path [`PgHandler::four_table_join`]'s search
+    /// picks of it (`create_ordered_paths` over the LIMIT's fraction) as
+    /// plan nodes, each with its estimate, and whether a Sort goes over it
+    /// (`OrderedBy::Sort`) or it is in the ORDER BY's order already
+    /// (`OrderedBy::Presorted`). `scans` are the tables' scan nodes as the
+    /// plan without the search drew them, by alias; each becomes the path
+    /// the search read of its table. The join's and the scans' conditions
+    /// are attached after, by the nodes' names. `None` for any plan not
+    /// modelled here: more tables, a Memoize, a bitmap heap scan, a FULL
+    /// join, an Incremental Sort, or an ORDER BY whose merge direction is
+    /// not its own (NULLS against the default, a later key).
+    pub(crate) fn explain_ordered_limit(
+        &self,
+        node: &JoinNode,
+        limit: (usize, usize),
+        order: (&str, bool, bool),
+        scans: &[(String, explain::PlanNode)],
+    ) -> Option<(explain::PlanNode, secantus_pgplan::joincost::OrderedBy)> {
+        use secantus_pgplan::joincost::{OrderedBy, RelPaths};
+        if order.2 {
+            return None;
+        }
+        let planned = self.plan_searched(node, Some(limit), Some(order), &[], true)?;
+        let Planned {
+            search,
+            top,
+            pick,
+            ordered,
+            ..
+        } = &planned;
+        let ordered = (*ordered)?;
+        if ordered == OrderedBy::Incremental || search.tables.len() != 2 || search.merge_asc {
+            return None;
+        }
+        let Pick::Path(at) = *pick else {
+            return None;
+        };
+        let r = &search.rels[*top];
+        let choice = *r.list.get(at)?;
+        let built = r.built.get(choice.combo)?;
+        let (side_a, side_b) = built.sides?;
+        let leaf_of = |rel: usize| -> Option<usize> {
+            let set = search.rels.get(rel)?.set;
+            (set.count_ones() == 1).then_some(set.trailing_zeros() as usize)
+        };
+        let (ta, tb) = (leaf_of(built.a)?, leaf_of(built.b)?);
+        let indexes = self.index_relations();
+        // A table's key as EXPLAIN prints it: `alias.column`.
+        let shown = |t: usize, key: &str| -> Option<String> {
+            let col = column_of(key)?;
+            let def = self.lookup(&search.tables[t].0)?;
+            let name = def
+                .columns
+                .iter()
+                .find(|c| c.name == col)
+                .or_else(|| def.columns.iter().find(|c| c.field() == col))
+                .map(|c| c.name.clone())?;
+            Some(format!("{}.{name}", search.aliases[t]))
+        };
+        // The B-tree a scan of table `t` in `key`'s order reads: the one
+        // index leading with its column, and whether it holds every column
+        // the table returns (an Index Only Scan).
+        let index_on = |t: usize, key: &str| -> Option<(String, bool)> {
+            let def = self.lookup(&search.tables[t].0)?;
+            let col = column_of(key)?;
+            let field = def
+                .columns
+                .iter()
+                .find(|c| c.name == col || c.field() == col)?
+                .field();
+            let mut found = indexes.iter().filter(|ix| {
+                ix.table.name == def.name
+                    && ix
+                        .keys
+                        .first()
+                        .and_then(|k| usize::try_from(*k).ok()?.checked_sub(1))
+                        .and_then(|i| ix.table.columns.get(i))
+                        .is_some_and(|c| c.field() == field)
+            });
+            let ix = found.next()?;
+            if found.next().is_some() {
+                return None;
+            }
+            let held: Vec<String> = ix
+                .keys
+                .iter()
+                .filter_map(|k| usize::try_from(*k).ok()?.checked_sub(1))
+                .filter_map(|i| ix.table.columns.get(i).map(|c| c.field()))
+                .collect();
+            let needed = search.needed.as_ref()?;
+            let set = 1u8 << t;
+            let outside = |u: usize| set & (1 << u) == 0;
+            let only = search.widths.get(t)?.iter().all(|(k, _)| {
+                let used = needed.contains(k)
+                    || search.edges.iter().any(|e| {
+                        (e.u == t && e.u_key == *k && outside(e.v))
+                            || (e.v == t && e.v_key == *k && outside(e.u))
+                    });
+                !used
+                    || column_of(k).is_some_and(|c| {
+                        def.columns
+                            .iter()
+                            .find(|d| d.name == c || d.field() == c)
+                            .is_some_and(|d| held.contains(&d.field()))
+                    })
+            });
+            Some((ix.name.clone(), only))
+        };
+        // Table `t` read by its path `i`, the plan's scan node for it.
+        let leaf = |t: usize, i: usize| -> Option<explain::PlanNode> {
+            let (path, key) = search.base_lists.get(t)?.0.get(i)?;
+            if path.req_outer != 0 || *search.base_bitmap.get(t)?.get(i)? {
+                return None;
+            }
+            let mut n = scans
+                .iter()
+                .find(|(a, _)| *a == search.aliases[t])
+                .map(|(_, n)| n.clone())?;
+            if !n.children.is_empty() || !n.details.is_empty() {
+                return None;
+            }
+            if let Some(key) = key {
+                let index = index_on(t, key)?;
+                explain::name_scan_index(&mut n, &Some(index));
+                if *search.base_backward.get(t)?.get(i)? {
+                    n.name = n.name.replacen(" Scan using ", " Scan Backward using ", 1);
+                }
+            } else {
+                explain::name_scan_index(&mut n, &None);
+            }
+            n.estimate = Some((path.startup, path.total, path.rows, search.width(1 << t)?));
+            Some(n)
+        };
+        let width = |t: usize| search.width(1 << t);
+        let (pa, pb) = (search.in_paths(built.a)?, search.in_paths(built.b)?);
+        fn rel_paths(
+            side: JoinSide,
+            p: &(Vec<InPath>, usize, usize),
+            set: u32,
+            width: i64,
+            key_table: u32,
+        ) -> RelPaths<'_> {
+            RelPaths {
+                side,
+                paths: &p.0,
+                cheapest_total: p.1,
+                cheapest_startup: p.2,
+                set,
+                width,
+                unique: side.unique,
+                key_table,
+            }
+        }
+        let ra = rel_paths(side_a, &pa, 1 << ta, width(ta)?, 1 << built.clause.a_table);
+        let rb = rel_paths(side_b, &pb, 1 << tb, width(tb)?, 1 << built.clause.b_table);
+        let a_key = shown(ta, &built.clause.a_key)?;
+        let b_key = shown(tb, &built.clause.b_key)?;
+        let order_class = search.order.as_ref().map(|(_, c)| *c);
+        let descending = search.order_desc && choice.class.is_some() && choice.class == order_class;
+        let kind = |outer_b: bool| -> &'static str {
+            match (built.left, outer_b) {
+                (false, _) => " Join",
+                (true, false) => " Left Join",
+                (true, true) => " Right Join",
+            }
+        };
+        let mut join = match choice.method {
+            JoinMethod::MergeOuterA { .. }
+            | JoinMethod::MergeOuterB { .. }
+            | JoinMethod::MergeRightB { .. } => {
+                let outer_b = !matches!(choice.method, JoinMethod::MergeOuterA { .. });
+                let plan = r.paths.merge_plan(&choice, &ra, &rb, built.left)?;
+                let (o, i, o_path, i_path, o_key, i_key) = if outer_b {
+                    (tb, ta, choice.b_path, choice.a_path, &b_key, &a_key)
+                } else {
+                    (ta, tb, choice.a_path, choice.b_path, &a_key, &b_key)
+                };
+                let input = |t: usize, p: usize, presorted: bool, sort: (f64, f64), key: &str| {
+                    let scan = leaf(t, p)?;
+                    if presorted {
+                        return Some(scan);
+                    }
+                    let (_, _, rows, w) = scan.estimate?;
+                    let mut s = explain::PlanNode::over("Sort", scan);
+                    let key = if descending {
+                        format!("{key} DESC")
+                    } else {
+                        key.to_string()
+                    };
+                    s.details.push(("Sort Key".into(), key));
+                    s.estimate = Some((sort.0, sort.1, rows, w));
+                    Some(s)
+                };
+                let outer = input(o, o_path, plan.presorted.0, plan.outer_sort, o_key)?;
+                let mut inner = input(i, i_path, plan.presorted.1, plan.inner_sort, i_key)?;
+                if let Some((s, t)) = plan.material {
+                    let (_, _, rows, w) = inner.estimate?;
+                    inner = explain::PlanNode::over("Materialize", inner);
+                    inner.estimate = Some((s, t, rows, w));
+                }
+                let mut m = explain::PlanNode::new(format!("Merge{}", kind(outer_b)));
+                m.inner_unique = !matches!(choice.method, JoinMethod::MergeRightB { .. })
+                    && if outer_b { ra.unique } else { rb.unique };
+                m.children = vec![outer, inner];
+                m
+            }
+            JoinMethod::HashOuterA
+            | JoinMethod::HashOuterB
+            | JoinMethod::HashRightB
+            | JoinMethod::Other
+                if choice.hash || choice.method != JoinMethod::Other =>
+            {
+                let outer_b =
+                    choice.method != JoinMethod::HashOuterA && choice.method != JoinMethod::Other;
+                let (o, i, o_path, i_path) = if outer_b {
+                    (tb, ta, choice.b_path, choice.a_path)
+                } else {
+                    (ta, tb, choice.a_path, choice.b_path)
+                };
+                let outer = leaf(o, o_path)?;
+                let inner = leaf(i, i_path)?;
+                let (_, t, rows, w) = inner.estimate?;
+                let mut hash = explain::PlanNode::over("Hash", inner);
+                hash.estimate = Some((t, t, rows, w));
+                let mut h = explain::PlanNode::new(format!("Hash{}", kind(outer_b)));
+                h.inner_unique = choice.method != JoinMethod::HashRightB
+                    && if outer_b { ra.unique } else { rb.unique };
+                h.children = vec![outer, hash];
+                h
+            }
+            JoinMethod::Other | JoinMethod::NestOuterB => {
+                let outer_b = choice.method == JoinMethod::NestOuterB;
+                let (o, i, o_path, i_path) = if outer_b {
+                    (tb, ta, choice.b_path, choice.a_path)
+                } else {
+                    (ta, tb, choice.a_path, choice.b_path)
+                };
+                if choice.memoized {
+                    return None;
+                }
+                let outer = leaf(o, o_path)?;
+                // An unparameterized inner is read through a Material
+                // (`match_unsorted_outer` weighs only the materialised one).
+                let scan = leaf(i, i_path)?;
+                let in_path = search.base_lists.get(i)?.0.get(i_path)?.0;
+                let (_, _, rows, w) = scan.estimate?;
+                let mat = secantus_pgplan::joincost::material(&in_path, w);
+                let mut inner = explain::PlanNode::over("Materialize", scan);
+                inner.estimate = Some((mat.startup, mat.total, rows, w));
+                let name = if built.left {
+                    "Nested Loop Left Join"
+                } else {
+                    "Nested Loop"
+                };
+                let mut n = explain::PlanNode::new(name);
+                n.inner_unique = if outer_b { ra.unique } else { rb.unique };
+                n.children = vec![outer, inner];
+                n
+            }
+            _ => return None,
+        };
+        join.estimate = Some((choice.startup, choice.total, r.rows, search.width(r.set)?));
+        Some((join, ordered))
     }
 }

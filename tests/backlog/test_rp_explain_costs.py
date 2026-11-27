@@ -2437,6 +2437,114 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "                    Index Cond: (a > e.a)",
         ],
     ),
+    # Measured on PostgreSQL 15.20 (2026-11-27, a private cluster): over
+    # two tables never analysed, the nested loop reading the ORDER BY's index outer, its inner
+    # materialised, is the cheapest to start.
+    "an order by under a limit over a never-analysed join reads the index": (
+        "RP-1099:fixed",
+        _NEVER_ANALYSED,
+        "explain select e.b, k.b from e join k on e.a = k.a order by k.a limit 3",
+        [
+            "Limit  (cost=0.15..57.52 rows=3 width=68)",
+            "  ->  Nested Loop  (cost=0.15..24286.58 rows=1270 width=68)",
+            "        Join Filter: (e.a = k.a)",
+            "        ->  Index Scan using k_pkey on k  (cost=0.15..67.20 rows=1270 width=36)",
+            "        ->  Materialize  (cost=0.00..29.05 rows=1270 width=36)",
+            "              ->  Seq Scan on e  (cost=0.00..22.70 rows=1270 width=36)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (2026-11-27, a private cluster): over
+    # two tables never analysed, the same with the index read backward.
+    "a descending order by under a limit over a never-analysed join reads the index backward": (
+        "RP-1099:fixed",
+        _NEVER_ANALYSED,
+        "explain select e.b, k.b from e join k on e.a = k.a order by k.a desc limit 3",
+        [
+            "Limit  (cost=0.15..57.52 rows=3 width=68)",
+            "  ->  Nested Loop  (cost=0.15..24286.58 rows=1270 width=68)",
+            "        Join Filter: (e.a = k.a)",
+            "        ->  Index Scan Backward using k_pkey on k"
+            "  (cost=0.15..67.20 rows=1270 width=36)",
+            "        ->  Materialize  (cost=0.00..29.05 rows=1270 width=36)",
+            "              ->  Seq Scan on e  (cost=0.00..22.70 rows=1270 width=36)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (2026-11-27, a private cluster): over
+    # two tables never analysed, a bounded Sort over the hash right join, the OFFSET read past.
+    "an order by under a limit over a never-analysed left join sorts the hash join": (
+        "RP-1099:fixed",
+        _NEVER_ANALYSED,
+        "explain select e.b, k.b from k left join e on e.a = k.a order by k.a limit 3 offset 2",
+        [
+            "Limit  (cost=85.72..85.73 rows=3 width=68)",
+            "  ->  Sort  (cost=85.71..88.89 rows=1270 width=68)",
+            "        Sort Key: k.a",
+            "        ->  Hash Right Join  (cost=38.58..64.62 rows=1270 width=68)",
+            "              Hash Cond: (e.a = k.a)",
+            "              ->  Seq Scan on e  (cost=0.00..22.70 rows=1270 width=36)",
+            "              ->  Hash  (cost=22.70..22.70 rows=1270 width=36)",
+            "                    ->  Seq Scan on k  (cost=0.00..22.70 rows=1270 width=36)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (2026-11-27, a private cluster): over
+    # two tables never analysed, JSON prints the backward scan as an `Index Scan` whose
+    # `Scan Direction` is `Backward`.
+    "a backward index scan in json is an index scan of that direction": (
+        "RP-1099:fixed",
+        _NEVER_ANALYSED,
+        "explain (costs off, format json) select e.b, k.b from e join k on e.a = k.a "
+        "order by k.a desc limit 3",
+        [
+            "[\n"
+            "  {\n"
+            '    "Plan": {\n'
+            '      "Node Type": "Limit",\n'
+            '      "Parallel Aware": false,\n'
+            '      "Async Capable": false,\n'
+            '      "Plans": [\n'
+            "        {\n"
+            '          "Node Type": "Nested Loop",\n'
+            '          "Parent Relationship": "Outer",\n'
+            '          "Parallel Aware": false,\n'
+            '          "Async Capable": false,\n'
+            '          "Join Type": "Inner",\n'
+            '          "Inner Unique": false,\n'
+            '          "Join Filter": "(e.a = k.a)",\n'
+            '          "Plans": [\n'
+            "            {\n"
+            '              "Node Type": "Index Scan",\n'
+            '              "Parent Relationship": "Outer",\n'
+            '              "Parallel Aware": false,\n'
+            '              "Async Capable": false,\n'
+            '              "Scan Direction": "Backward",\n'
+            '              "Index Name": "k_pkey",\n'
+            '              "Relation Name": "k",\n'
+            '              "Alias": "k"\n'
+            "            },\n"
+            "            {\n"
+            '              "Node Type": "Materialize",\n'
+            '              "Parent Relationship": "Inner",\n'
+            '              "Parallel Aware": false,\n'
+            '              "Async Capable": false,\n'
+            '              "Plans": [\n'
+            "                {\n"
+            '                  "Node Type": "Seq Scan",\n'
+            '                  "Parent Relationship": "Outer",\n'
+            '                  "Parallel Aware": false,\n'
+            '                  "Async Capable": false,\n'
+            '                  "Relation Name": "e",\n'
+            '                  "Alias": "e"\n'
+            "                }\n"
+            "              ]\n"
+            "            }\n"
+            "          ]\n"
+            "        }\n"
+            "      ]\n"
+            "    }\n"
+            "  }\n"
+            "]"
+        ],
+    ),
     # Measured on PostgreSQL 15.20 (2026-11-25, a private cluster): a
     # merge join of two tables never analysed returns from each sorted side
     # only what the join needs, and prints its Sort Keys prefixed.
