@@ -25,8 +25,8 @@ import pytest
 from tests.backlog.test_rp_batch26 import _dsn
 
 _SETUP = [
-    "drop table if exists tca",
-    "drop type if exists cf, ca, cb, cc, cd, ce, cj, cx, fr, tr, nr, ir, i2r cascade",
+    "drop table if exists tca, tx",
+    "drop type if exists cf, ca, cb, cc, cd, ce, cj, cx, cz, fr, tr, nr, ir, i2r cascade",
     "create type ca as (x int, y text)",
     "create type cb as (x int, y int)",
     "create type cc as (x int, y text, z int)",
@@ -36,6 +36,8 @@ _SETUP = [
     "create type cj as (a int, b json, c xml)",
     "create type cx as (a int, b int, c text)",
     "alter type cx drop attribute b",
+    "create type cz as (a int, b text, c int)",
+    "alter type cz drop attribute b",
     "create type fr as range (subtype = float8)",
     "create type tr as range (subtype = text)",
     "create type nr as range (subtype = numeric)",
@@ -43,6 +45,10 @@ _SETUP = [
     "create type i2r as range (subtype = int2)",
     "create table tca (k int, v ca)",
     "insert into tca values (1, row(1, 'a')), (2, row(2, 'b')), (3, null)",
+    "create table tx (a int, b int, c text)",
+    "alter table tx drop column b",
+    "alter table tx add column d int",
+    "insert into tx values (null, 'a', 1), (1, 'a', null)",
 ]
 
 _DISSIMILAR = (
@@ -482,9 +488,38 @@ RECORD_IMAGE_STILL_REFUSED = {
 # Measured on PostgreSQL 15.20: `cx` had `b` dropped, so each value's
 # `t_infomask2` counts three attributes and its NULL bitmap always marks the
 # dropped one; `row(null, 'a')` and `row(1, 'a')` differ in the bitmap only.
+# `cz` drops its middle attribute and `tx` a table column (then adds `d`), so
+# a live field's bit is its attnum's, not its place's.
 RECORD_IMAGE_DROPPED_ATTRIBUTE = {
     "select (select row(row(null, 'a')::cx)) *< (select row(row(1, 'a')::cx))": [(True,)],
+    "select (select row(row(1, 'a')::cx)) *= (select row(row(1, 'a')::cx))": [(True,)],
+    "select (select row(row(1, 'a')::cx)) *< (select row(row(1, 'b')::cx))": [(True,)],
+    "select (select row(row(1, 2)::cz)) *< (select row(row(1, 3)::cz))": [(True,)],
+    "select (select row(row(null, 2)::cz)) *< (select row(row(1, null)::cz))": [(False,)],
+    "select (select row(row(null, 'a', 1)::tx)) *< (select row(row(1, 'a', null)::tx))": [(False,)],
+    "select (select row(row(1, 'a', null)::tx)) *< (select row(row(1, 'a', 2)::tx))": [(True,)],
+    "select (select row(t1)) *< (select row(t2)), (select row(t2)) *< (select row(t1))"
+    " from tx t1, tx t2 where t1.a is null and t2.a = 1": [(False, True)],
+    "select (select row(array[row(null, 'a')::cx])) *< (select row(array[row(1, 'a')::cx]))": [
+        (True,)
+    ],
 }
+
+# Measured on a private PostgreSQL 15.20 cluster: a row constructor's
+# comparison looks `*<` up per column (`make_row_comparison_op`), and a
+# composite column's `ca *< ca` resolves to `record *< record`.
+RECORD_IMAGE_ROW_COMPARE = {
+    "select row(v) *< row(v), row(v) *= row(v) from tca where k = 1": [(False, True)],
+    "select row(t1) *< row(t2), row(t2) *< row(t1) from tx t1, tx t2"
+    " where t1.a is null and t2.a = 1": [(False, True)],
+}
+
+
+@pytest.mark.backlog("RP-1174")
+@pytest.mark.parametrize("query", list(RECORD_IMAGE_ROW_COMPARE))
+def test_record_image_row_compare_over_a_composite_field(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == RECORD_IMAGE_ROW_COMPARE[query]
+
 
 # Measured on PostgreSQL 15.20: `json_in` and `xml_in` keep the text as it
 # was written, and an array keeps each element's 4-byte header.
@@ -729,7 +764,9 @@ def test_record_image_over_still_refused_field_types(query: str, dsn: str) -> No
     assert answer(dsn, query) == RECORD_IMAGE_STILL_REFUSED[query]
 
 
-@pytest.mark.backlog("RP-976")
+@pytest.mark.backlog_fixed("RP-976")
 @pytest.mark.parametrize("query", list(RECORD_IMAGE_DROPPED_ATTRIBUTE))
 def test_record_image_over_a_composite_with_a_dropped_attribute(query: str, dsn: str) -> None:
+    """A composite with a dropped attribute was imaged as though never
+    altered: its slot was missing from `t_infomask2` and the NULL bitmap."""
     assert answer(dsn, query) == RECORD_IMAGE_DROPPED_ATTRIBUTE[query]
