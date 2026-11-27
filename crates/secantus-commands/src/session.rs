@@ -875,6 +875,17 @@ fn statement(
             .and_then(|p| p.get("maxTransactionLockRequestTimeoutMillis"))
             .and_then(|v| v.as_i32())
             .unwrap_or(5);
+        // The statement counts on from its transaction's earlier ones; the
+        // first counts the transaction's own locks and ticket (RM-715).
+        match txn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .lock_stats
+            .clone()
+        {
+            Some(stats) => crate::lock_manager::resume_operation_lock_stats(&stats),
+            None => crate::lock_manager::note_transaction_begun(),
+        }
         let mut failed = None;
         for (res, mode) in &chain {
             // The ticket the global lock takes first is waited for as
@@ -882,6 +893,11 @@ fn statement(
             if lm.take_global_ticket(owner, res, *mode).is_err() {
                 failed = Some((res.clone(), *mode, false));
                 break;
+            }
+            // A lock the transaction holds already is re-used, not taken
+            // again (RM-715).
+            if lm.holds_covering(owner, res, *mode) {
+                continue;
             }
             let budget_left = secantus_core::deadline::remaining_ms();
             let bounded = limit >= 0 && budget_left.is_none_or(|left| left > f64::from(limit));
@@ -954,12 +970,17 @@ fn statement(
         let handle = t.handle.as_mut().expect("handle created above").as_mut();
         // A cause left by an earlier statement is not this one's.
         let _ = storage.take_write_conflict_cause();
+        let _txn_statement = crate::lock_manager::txn_statement();
         match storage.run_in_user_transaction(handle, &mut || crate::run_handler(handler, doc, ctx))
         {
             Ok(r) => r,
             Err(e) => CommandError::new(1, "InternalError", format!("{e:?}")).into_reply(),
         }
     };
+    if ctx.txn_locks {
+        txn.lock().unwrap_or_else(|e| e.into_inner()).lock_stats =
+            Some(crate::lock_manager::operation_lock_stats());
+    }
     let code = result.get_i32("code").unwrap_or(0);
     if crate::util::did_not_parse(&result) {
         // The command did not parse, so mongod never took it into the

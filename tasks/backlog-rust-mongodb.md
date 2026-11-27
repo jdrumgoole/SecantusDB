@@ -835,18 +835,6 @@ These are explicit non-goals. Don't add them without a reason.
       e01df2d2 (2026-11-08), each command checked against a probe of its own.
       Backlog-ID: RM-360
       Verify: tests/backlog/test_rm_355_364.py::test_every_line_counts_its_interrupt_checks
-- [ ] **A statement of a transaction does not count the transaction's
-      locks.** mongod 8.2.11's line for it counts
-      `MultiDocumentTransactionsBarrier` w 1, `ReplicationStateTransition`
-      w 3 and a flow control ticket beside the statement's Global /
-      Database / Collection, and the command's line has `locks: {}`; this
-      server's statement line has the statement's three only, no
-      `flowControl`, and its command line counts them again. Nothing takes
-      `Resource::MdtBarrier`. Of a collection and of a view alike (a write
-      of a view is refused under the transaction's locks since RM-589).
-      Found while working RM-589, 2026-11-17.
-      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_transaction_statement_counts_the_transactions_locks
-      Backlog-ID: RM-715
 - [ ] **Operations this server runs another way than mongod's plan say
       less.** Since RM-023 a read or a write's read that a stream runs as
       mongod's plan counts its keys and documents examined, and since

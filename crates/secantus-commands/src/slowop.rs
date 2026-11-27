@@ -548,15 +548,19 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     // A statement of a multi-document transaction runs on the transaction's
     // stashed locker, so mongod's line prints `locks: {}` (its profile entry
     // keeps the transaction's locks; measured 8.2.11 2026-11-07, RM-357).
-    let locks = if request.get("autocommit") == Some(&Bson::Boolean(false))
+    // A write whose statement failed aborts the transaction, whose locker
+    // is then the command's own: its line prints the transaction's locks
+    // (measured 8.2.11 2026-11-27, RM-715: an `update` of a view).
+    let stashed = request.get("autocommit") == Some(&Bson::Boolean(false))
         && !matches!(name, "commitTransaction" | "abortTransaction")
-    {
+        && !reply.contains_key("writeErrors");
+    let locks = if stashed {
         Document::new()
     } else {
         ctx.op_locks.clone().unwrap_or_default()
     };
     out.insert("locks", locks);
-    if let Some(fc) = crate::opdebug::flow_control(ctx.flow_control_tickets) {
+    if let Some(fc) = crate::opdebug::flow_control(ctx.flow_control_tickets).filter(|_| !stashed) {
         out.insert("flowControl", fc);
     }
     // A member of a replica set prints the concerns; a standalone has none

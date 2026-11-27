@@ -430,19 +430,25 @@ def test_a_refused_write_of_a_view_takes_mongods_locks(rust_mongo: Any, mongod_r
     assert got["rust"] == got["mongod"]
 
 
-@pytest.mark.backlog("RM-715")
+@pytest.mark.backlog_fixed("RM-715")
 def test_a_transaction_statement_counts_the_transactions_locks(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11's line for a statement of a transaction counts the
     transaction's locks (`MultiDocumentTransactionsBarrier`, three
-    `ReplicationStateTransition` w, a flow control ticket), and the
-    command's line has `locks: {}`; this server's statement line has the
-    statement's Global / Database / Collection only, no `flowControl`, and
-    its command line counts them again. Of a collection and of a view
-    alike."""
+    `ReplicationStateTransition` w, a flow control ticket), adding up over
+    its statements without re-counting a lock it holds, and the command's
+    line has `locks: {}` unless a statement failed (a refused write of a
+    view prints them). This server's statement line had the statement's
+    Global / Database / Collection only, no `flowControl`, each statement
+    counted alone, and the refused write's command line had `{}`."""
 
     def op(db: Any) -> None:
+        with db.client.start_session() as s, s.start_transaction():
+            db.c.update_one({}, {"$set": {"a": 1}}, session=s)
+            db.c.update_one({}, {"$set": {"a": 2}}, session=s)
+            list(db.c.find({}, session=s))
+            db.c.insert_one({"z": 1}, session=s)
         for coll in ("c", "v"):
 
             def txn(d: Any, coll: str = coll) -> None:
@@ -458,6 +464,7 @@ def test_a_transaction_statement_counts_the_transactions_locks(
     statement = got["mongod"][0]
     assert statement[:2] == ("q", "c")
     assert "MultiDocumentTransactionsBarrier" in statement[2]
+    assert got["mongod"][2][2]["Global"] == {"acquireCount": {"w": 2}}
     assert got["rust"] == got["mongod"]
 
 

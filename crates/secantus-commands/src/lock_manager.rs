@@ -317,6 +317,19 @@ impl LockManager {
     /// until it lets the global lock go. X takes none. An error that ends
     /// the ticket's wait other than the deadline is kept for
     /// [`take_ticket_error`].
+    /// Whether `owner` already holds `resource` in a mode that covers
+    /// `mode`: the same mode, any mode over an intent shared request, or
+    /// exclusive. A transaction re-uses such a lock, held by its unit of
+    /// work to its end, without a new acquisition (RM-715).
+    pub fn holds_covering(&self, owner: Owner, resource: &Resource, mode: Mode) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.heads.get(resource).is_some_and(|h| {
+            h.holders
+                .iter()
+                .any(|(o, m)| *o == owner && (*m == mode || *m == Mode::X || mode == Mode::Is))
+        })
+    }
+
     pub fn acquire(
         &self,
         owner: Owner,
@@ -1443,9 +1456,8 @@ thread_local! {
 /// Whether `owner`'s request for `mode` on `resource` takes a flow control
 /// ticket, as mongod's `Locker::getFlowControlTicket` decides: the global
 /// lock in IX, by an owner not holding it already (a nested acquisition
-/// takes none), outside a multi-document transaction (which does not
-/// take part in flow control: a transaction's statement counts `{}`,
-/// measured 8.2.11). This server is always a replica set's primary, and
+/// takes none), outside a multi-document transaction (whose one ticket its
+/// first statement counts: `note_transaction_begun`). This server is always a replica set's primary, and
 /// mongod's flow control is on there by default. Its lag is a single
 /// member's, never past the threshold, so a ticket is always free: each
 /// one is counted and none is waited for.
@@ -1489,6 +1501,46 @@ fn note_operation_lock(kind: &'static str, mode: Mode, waited: bool) {
             None => l.push((kind, mode, 1, u64::from(waited))),
         }
     });
+}
+
+/// What an operation has counted of its locks and flow control tickets,
+/// kept by a multi-document transaction between its statements: mongod's
+/// statements of a transaction run on its stashed locker, whose statistics
+/// add up from its first statement (RM-715).
+#[derive(Clone, Debug, Default)]
+pub struct OperationLockStats {
+    rows: Vec<(&'static str, Mode, u64, u64)>,
+    flow_control: i64,
+}
+
+/// What the operation running on this thread has counted so far.
+pub fn operation_lock_stats() -> OperationLockStats {
+    OperationLockStats {
+        rows: OP_LOCKS.with(|l| l.borrow().clone()),
+        flow_control: flow_control_tickets(),
+    }
+}
+
+/// The operation running on this thread goes on from `stats`: a
+/// transaction's statement counts on from its transaction's earlier ones.
+pub fn resume_operation_lock_stats(stats: &OperationLockStats) {
+    OP_LOCKS.with(|l| *l.borrow_mut() = stats.rows.clone());
+    FLOW_CONTROL.with(|n| n.set(stats.flow_control));
+}
+
+/// What a multi-document transaction's first statement counts beside its
+/// own locks: the `MultiDocumentTransactionsBarrier` in IX, the
+/// replication state transition lock in IX three times, and one flow
+/// control ticket (measured 8.2.11, 2026-11-27, RM-715: a transaction's
+/// first `update` counts `MultiDocumentTransactionsBarrier: {w: 1}`,
+/// `ReplicationStateTransition: {w: 3}` and `flowControl: {acquireCount:
+/// 1}`, and its later statements none of them again).
+pub fn note_transaction_begun() {
+    note_operation_lock("MultiDocumentTransactionsBarrier", Mode::Ix, false);
+    for _ in 0..3 {
+        note_operation_lock("ReplicationStateTransition", Mode::Ix, false);
+    }
+    note_flow_control_ticket();
 }
 
 /// The locks mongod's profiler takes to write a write statement's own
@@ -1604,8 +1656,37 @@ pub fn log_lock(lm: &LockManager) {
     // Refused only by a spent deadline behind a conflicting holder; mongod
     // likewise gives up on this lock (after 500 ms) and writes the line
     // without the statistics, so there is nothing to report.
+    // A statement of a transaction does not count it among the locks the
+    // transaction keeps (measured 8.2.11 2026-11-27, RM-715: a second
+    // `update`'s line counts no global IS for the first's); outside one,
+    // the command's line counts its statements' (RM-357).
+    let counted = IN_TXN_STATEMENT
+        .with(std::cell::Cell::get)
+        .then(operation_lock_stats);
     if lm.acquire(owner, &Resource::Global, Mode::Is).is_ok() {
         lm.release(owner);
+    }
+    if let Some(counted) = counted {
+        resume_operation_lock_stats(&counted);
+    }
+}
+
+thread_local! {
+    static IN_TXN_STATEMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A statement of a multi-document transaction runs on this thread until
+/// dropped: its lines' global IS is not counted (`log_lock`).
+pub struct TxnStatementScope(bool);
+
+pub fn txn_statement() -> TxnStatementScope {
+    TxnStatementScope(IN_TXN_STATEMENT.with(|f| f.replace(true)))
+}
+
+impl Drop for TxnStatementScope {
+    fn drop(&mut self) {
+        let previous = self.0;
+        IN_TXN_STATEMENT.with(|f| f.set(previous));
     }
 }
 
@@ -2300,6 +2381,22 @@ mod tests {
         assert_eq!(row.acquire_count, [("W", 2)]);
         assert_eq!(row.acquire_wait_count, [("W", 1)]);
         assert_eq!(row.time_acquiring_micros.len(), 1);
+    }
+
+    #[test]
+    fn a_held_lock_covers_what_it_includes() {
+        // RM-715: a transaction re-uses a lock it holds in a covering mode.
+        let lm = LockManager::new();
+        let a = lm.statement_owner();
+        let res = Resource::Collection("db.c".into());
+        assert!(!lm.holds_covering(a, &res, Mode::Is));
+        lm.acquire(a, &res, Mode::Ix).unwrap();
+        assert!(lm.holds_covering(a, &res, Mode::Ix));
+        assert!(lm.holds_covering(a, &res, Mode::Is));
+        assert!(!lm.holds_covering(a, &res, Mode::S));
+        assert!(!lm.holds_covering(a, &res, Mode::X));
+        assert!(!lm.holds_covering(lm.statement_owner(), &res, Mode::Is));
+        lm.release(a);
     }
 
     #[test]
