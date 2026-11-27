@@ -3525,8 +3525,12 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Output: a, b",
         ],
     ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1105, fixed): a
+    # comma chain's WHERE equalities join the class as an ON's do, and the
+    # constant replaces them -- no join prints a Join Filter (once Hash
+    # Joins with `Join Filter: (e.a = k.a)` and `(k2.a = e.a)`).
     "a three-way comma join's class constant is each inner index's cond": (
-        "RP-1105",
+        "RP-1105:fixed",
         _ANALYSED,
         "explain (costs off) select e.b, k.b from e, k, k k2 "
         "where e.a = k.a and k2.a = e.a and e.a = 3",
@@ -3536,6 +3540,81 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e",
             "              Filter: (a = 3)",
             "        ->  Index Scan using k_pkey on k",
+            "              Index Cond: (a = 3)",
+            "  ->  Index Only Scan using k_pkey on k k2",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    # Measured likewise: the constant fixing a member other than the first
+    # table's, the equalities chained through `k`.
+    "a three-way comma join's class constant on its last member": (
+        "RP-1105:fixed",
+        _ANALYSED,
+        "explain (costs off) select e.b from e, k, k k2 "
+        "where e.a = k.a and k2.a = k.a and k2.a = 5",
+        [
+            "Nested Loop",
+            "  ->  Nested Loop",
+            "        ->  Seq Scan on e",
+            "              Filter: (a = 5)",
+            "        ->  Index Only Scan using k_pkey on k",
+            "              Index Cond: (a = 5)",
+            "  ->  Index Only Scan using k_pkey on k k2",
+            "        Index Cond: (a = 5)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1105): a comma chain's conjunct over two tables that is not one of
+    # the class's equalities stays the lowest join's Join Filter over the
+    # same Nested Loops; here Hash Joins print every WHERE equality as a
+    # Join Filter beside it.
+    "a three-way comma join's class constant beside a join filter": (
+        "RP-1153",
+        _ANALYSED,
+        "explain (costs off) select e.b from e, k, k k2 "
+        "where e.a = k.a and k2.a = e.a and e.a = 3 and e.b <> k.b",
+        [
+            "Nested Loop",
+            "  ->  Nested Loop",
+            "        Join Filter: (e.b <> k.b)",
+            "        ->  Seq Scan on e",
+            "              Filter: (a = 3)",
+            "        ->  Index Scan using k_pkey on k",
+            "              Index Cond: (a = 3)",
+            "  ->  Index Only Scan using k_pkey on k k2",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    # Measured likewise: a FROM of an explicit JOIN and a comma item. Here
+    # the WHERE prints nowhere -- no join clause for `k2.a = e.a`, no
+    # Filter for `e.a = 3`.
+    "a join beside a comma item hashes on the where's equality": (
+        "RP-1154",
+        _ANALYSED,
+        "explain (costs off) select e.b from e join k on e.a = k.a, k k2 where k2.a = e.a",
+        [
+            "Hash Join",
+            "  Hash Cond: (e.a = k2.a)",
+            "  ->  Hash Join",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e",
+            "        ->  Hash",
+            "              ->  Seq Scan on k",
+            "  ->  Hash",
+            "        ->  Seq Scan on k k2",
+        ],
+    ),
+    "a join beside a comma item takes the where's class constant": (
+        "RP-1154",
+        _ANALYSED,
+        "explain (costs off) select e.b from e join k on e.a = k.a, k k2 "
+        "where k2.a = e.a and e.a = 3",
+        [
+            "Nested Loop",
+            "  ->  Nested Loop",
+            "        ->  Seq Scan on e",
+            "              Filter: (a = 3)",
+            "        ->  Index Only Scan using k_pkey on k",
             "              Index Cond: (a = 3)",
             "  ->  Index Only Scan using k_pkey on k k2",
             "        Index Cond: (a = 3)",
