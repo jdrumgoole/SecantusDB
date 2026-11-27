@@ -216,6 +216,7 @@ pub(super) fn in_list(values: &[Bson]) -> Option<String> {
 /// an int64 with no suffix, a double with a point or an exponent).
 pub(super) fn list_value(v: &Bson) -> Option<String> {
     Some(match v {
+        Bson::Null => "null".to_string(),
         Bson::Boolean(b) => b.to_string(),
         Bson::Int32(n) => n.to_string(),
         Bson::Int64(n) => n.to_string(),

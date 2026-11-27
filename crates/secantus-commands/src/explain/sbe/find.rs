@@ -538,10 +538,16 @@ mod tests {
             .0,
             "$$RESULT=s2 env: { s1 = 1, s5 = InList(1 2), s6 = 2 }"
         );
-        // A null in the list takes another program: not built.
+        // A null in the list folds the value to null, and is built
+        // (RM-071, measured 2026-11-27); on a dotted path it is not.
         assert!(crate::explain::sbe::Filter::parse_find(
             &doc! { "x": { "$in": [null, 1] } },
             &doc! { "x": { "$in": [null, 1] } }
+        )
+        .is_some());
+        assert!(crate::explain::sbe::Filter::parse_find(
+            &doc! { "x.y": { "$in": [null, 1] } },
+            &doc! { "x.y": { "$in": [null, 1] } }
         )
         .is_none());
     }

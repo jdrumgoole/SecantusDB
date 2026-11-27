@@ -59,6 +59,9 @@ FINDS = [
     {"filter": {"x": {"$gt": 0}}, "limit": 2},
     {"filter": {"x": {"$gt": 0}}, "skip": 1, "limit": 2},
     {"filter": {"x": {"$gt": 0}}, "limit": 20},
+    # RM-071 (2026-11-27): an `$in` holding null folds the value to null.
+    {"filter": {"x": {"$in": [None, 1]}}},
+    {"filter": {"x": {"$in": [2, None]}, "y": 0}, "limit": 2},
 ]
 
 
