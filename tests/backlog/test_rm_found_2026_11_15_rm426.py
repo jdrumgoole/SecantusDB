@@ -10,16 +10,27 @@ import pytest
 HASHES = ("queryHash", "planCacheShapeHash", "planCacheKey")
 
 
-def _hashes(client: Any) -> tuple:
+GT2 = {"$match": {"x": {"$gt": 2}}}
+
+DISTINCT_GROUPS = {
+    "plain": [GT2, {"$group": {"_id": "$x"}}],
+    "first": [GT2, {"$group": {"_id": "$x", "f": {"$first": "$y"}}}],
+    "last": [GT2, {"$group": {"_id": "$x", "f": {"$last": "$y"}}}],
+    "sorted": [GT2, {"$sort": {"x": -1}}, {"$group": {"_id": "$x"}}],
+    "unfiltered_sorted": [{"$sort": {"x": 1}}, {"$group": {"_id": "$x"}}],
+}
+
+
+def _hashes(client: Any, pipeline: list | None = None, index: Any = "x") -> tuple:
     client.drop_database("rm426h")
     db = client.rm426h
-    db.d.insert_many([{"_id": n, "x": n} for n in range(1, 7)])
-    db.d.create_index("x")
+    db.d.insert_many([{"_id": n, "x": n, "y": n} for n in range(1, 7)])
+    db.d.create_index(index)
     reply = db.command(
         "explain",
         {
             "aggregate": "d",
-            "pipeline": [{"$match": {"x": {"$gt": 2}}}, {"$group": {"_id": "$x"}}],
+            "pipeline": pipeline or DISTINCT_GROUPS["plain"],
             "cursor": {},
         },
         verbosity="queryPlanner",
@@ -28,12 +39,24 @@ def _hashes(client: Any) -> tuple:
     return tuple(planner[k] for k in HASHES)
 
 
-@pytest.mark.backlog("RM-697")
+@pytest.mark.backlog_fixed("RM-697")
 def test_a_distinct_scan_group_hashes_as_mongod_does(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 hashes a `$group` it reads by a `DISTINCT_SCAN`
-    (`76A99463` / `09B22F21`); this server hashes the same plan as another
-    query."""
+    (`76A99463` / `09B22F21`, shape `gtx||x||x0fs`); this server hashed the
+    same plan as the bare query until RM-697."""
     assert _hashes(rust_mongo) == _hashes(mongod)
+
+
+@pytest.mark.backlog_fixed("RM-697")
+@pytest.mark.parametrize("name", sorted(DISTINCT_GROUPS))
+def test_distinct_scan_group_keys_its_sort_reads_and_direction(
+    rust_mongo: Any, mongod: Any, name: str
+) -> None:
+    """The key carries the pipeline's sort, the fields the `$group` reads
+    and `1` for `$last` (mongod 8.2.11: `gtx|dx|x||x0fs`, `gtx||x-y||x1fs`)."""
+    pipeline = DISTINCT_GROUPS[name]
+    index = [("x", 1), ("y", 1)]
+    assert _hashes(rust_mongo, pipeline, index) == _hashes(mongod, pipeline, index)
 
 
 RANK_FUSION = {

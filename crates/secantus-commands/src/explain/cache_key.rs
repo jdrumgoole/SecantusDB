@@ -768,6 +768,8 @@ pub(crate) struct Parts<'a> {
     pub collation: Option<&'a Collation>,
     /// `distinct`'s key.
     pub distinct: Option<&'a str>,
+    /// The DISTINCT_SCAN runs backward (a `$group` of `$last`s).
+    pub distinct_backward: bool,
     /// Planned by the classic planner and run in SBE.
     pub sbe: bool,
     /// A rooted `$or`'s branch, which the classic subplanner plans and
@@ -787,7 +789,7 @@ pub(crate) fn shape(e: &Expr, p: &Parts) -> String {
     out.push('|');
     if let Some(key) = p.distinct {
         user_string(key, &mut out);
-        out.push('0');
+        out.push(if p.distinct_backward { '1' } else { '0' });
     }
     out.push('f');
     // `c` for a plan the classic engine runs, `s` for one planned by the
@@ -1067,6 +1069,7 @@ mod tests {
             projection: Some(&projection),
             collation: None,
             distinct: None,
+            distinct_backward: false,
             sbe: true,
             subplanner: true,
         };
@@ -1133,6 +1136,7 @@ mod tests {
             projection: None,
             collation: None,
             distinct: None,
+            distinct_backward: false,
             sbe: false,
             subplanner: false,
         };

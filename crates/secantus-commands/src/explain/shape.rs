@@ -49,6 +49,26 @@ pub(crate) struct Shape {
     pub projection_stage: Option<Document>,
     /// The pipeline came from a view definition or an aggregate command.
     pub pipeline: bool,
+    /// A `$group` mongod answers from a DISTINCT_SCAN: what its plan cache
+    /// key carries of it.
+    pub distinct_group: Option<DistinctGroupKey>,
+}
+
+/// What mongod's plan cache key carries of a `$group` it reads by a
+/// DISTINCT_SCAN (measured 8.2.11, 2026-11-26: `gtx|dx|x-y||x1fs` for
+/// `$match` `{x: {$gt: ..}}`, `$sort` `{x: -1}`, `$group` `{_id: "$x", f:
+/// {$last: "$y"}}`): the pipeline's sort, the fields the `$group` reads as
+/// the projection, and the key with `1` for a `$last`.
+#[derive(Clone, Debug)]
+pub(crate) struct DistinctGroupKey {
+    /// The `$group`'s `_id` field.
+    pub field: String,
+    /// The sort before the `$group`.
+    pub sort: Option<Document>,
+    /// The fields the `$group` reads, as an inclusion projection.
+    pub projection: Document,
+    /// Its accumulators are `$last`.
+    pub last: bool,
 }
 
 impl Shape {
@@ -75,6 +95,7 @@ impl Shape {
             rest: vec![],
             projection_stage: None,
             pipeline: false,
+            distinct_group: None,
         }
     }
 }

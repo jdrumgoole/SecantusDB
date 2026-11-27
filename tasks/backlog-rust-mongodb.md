@@ -1945,15 +1945,6 @@ What is left, all on the RUST MongoDB server:
       matches since RM-696. Found 2026-11-26 working RM-696.
       Verify: tests/backlog/test_rm_found_2026_11_15_rm426.py::test_a_fusion_input_unions_stages_count_as_mongod_does
       Backlog-ID: RM-830
-- [ ] **A `$group` read by a `DISTINCT_SCAN` hashes as another query.**
-      mongod 8.2.11 explains `[{$match: {x: {$gt: 2}}}, {$group: {_id:
-      "$x"}}]` over an index `{x: 1}` with `queryHash` /
-      `planCacheShapeHash` `76A99463` and `planCacheKey` `09B22F21`; this
-      server's plan is the same `PROJECTION_COVERED` over `DISTINCT_SCAN`
-      but hashes `FA2103B6` / `CBA7C409`, top-level and inside a
-      `$unionWith` alike. Found 2026-11-15 working RM-426.
-      Verify: tests/backlog/test_rm_found_2026_11_15_rm426.py::test_a_distinct_scan_group_hashes_as_mongod_does
-      Backlog-ID: RM-697
 
 ### 7.074 Change streams, command by command -- 2026-10-11
 
