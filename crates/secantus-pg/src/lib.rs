@@ -47895,12 +47895,18 @@ impl PgHandler {
                 // class holds (RP-1065): Nested Loops with no join clause,
                 // each scan filtered by the constant. VERBOSE prints its
                 // lists over this plan (RP-966).
+                // A comma chain's WHERE equalities are the class's, which
+                // `generate_base_implied_equalities_const` replaces by each
+                // member's equality to the constant: no join prints them
+                // (RP-1105).
+                let mut class_replaces_where_joins = false;
                 if let Statement::Select(sel) = inner.as_ref() {
                     if tree.name == "Hash Join" && !options.analyze {
                         if let Some(c) = self.chain_class_constant(sel) {
                             explain::class_constant_chain(
                                 &mut tree, &c.implied, &c.from, &c.indexes,
                             );
+                            class_replaces_where_joins = c.comma;
                         }
                     }
                 }
@@ -48967,7 +48973,19 @@ impl PgHandler {
                     _ => options.join_conds.clone(),
                 };
                 explain::attach_join_conds(&mut tree, &join_conds, &options.join_cond_splits);
-                explain::attach_join_where(&mut tree, &options.join_where, &index_columns);
+                if class_replaces_where_joins {
+                    // Each conjunct over more than one table is one of
+                    // them (`chain_class_constant` refuses any other).
+                    let one_table: Vec<_> = options
+                        .join_where
+                        .iter()
+                        .filter(|(_, home, _, rels)| home.is_some() || rels.len() < 2)
+                        .cloned()
+                        .collect();
+                    explain::attach_join_where(&mut tree, &one_table, &index_columns);
+                } else {
+                    explain::attach_join_where(&mut tree, &options.join_where, &index_columns);
+                }
                 explain::move_param_conds(&mut tree);
                 explain::apply_implied_filters(&mut tree, &index_columns, &options.class_ranks);
                 explain::attach_scan_alias(&mut tree, &options.scan_alias);

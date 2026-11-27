@@ -2030,18 +2030,33 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a class constant written twice is costed once]
       Backlog-ID: RP-1150
 
-- [ ] **A comma join of three tables whose class a WHERE constant fixes
-      prints its equalities as Join Filters.** `explain (costs off) select
-      e.b, k.b from e, k, k k2 where e.a = k.a and k2.a = e.a and e.a = 3`
-      prints Hash Joins with `Join Filter: (e.a = k.a)` and `(k2.a = e.a)`
-      over Seq Scans here; a private PostgreSQL 15.20 cluster prints the
-      plan the explicit JOINs get (RP-1065): Nested Loops, `Index Cond: (a
-      = 3)` on each of `k` and `k2`. The comma chain's equalities are the
-      WHERE's (`JoinRows::where_equalities`), which
-      `PgHandler::chain_class_constant` does not read. Found while working
-      RP-1065.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a three-way comma join's class constant is each inner index's cond]
-      Backlog-ID: RP-1105
+- [ ] **A comma chain whose class a WHERE constant fixes stays Hash
+      Joins beside a conjunct over two tables that is not an equality.**
+      `explain (costs off) select e.b from e, k, k k2 where e.a = k.a and
+      k2.a = e.a and e.a = 3 and e.b <> k.b` (`e`, `k` analysed, 1000
+      rows) prints Hash Joins with `Join Filter: ((e.a = k.a) AND (e.b <>
+      k.b))` and `(k2.a = e.a)` over Seq Scans here; a private PostgreSQL
+      15.20 cluster prints the Nested Loops the chain gets without it
+      (RP-1105), `Index Cond: (a = 3)` on `k` and `k2`, and `Join Filter:
+      (e.b <> k.b)` on the lower join alone. `chain_class_constant` takes
+      only the class's equalities among the WHERE's conjuncts over two
+      tables. Found while working RP-1105.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a three-way comma join's class constant beside a join filter]
+      Backlog-ID: RP-1153
+
+- [ ] **EXPLAIN of a FROM that holds an explicit JOIN and a comma item
+      prints none of its WHERE.** `explain (costs off) select e.b from e
+      join k on e.a = k.a, k k2 where k2.a = e.a` (`e`, `k` analysed, 1000
+      rows) prints the top Hash Join with no `Hash Cond`; a private
+      PostgreSQL 15.20 cluster prints `Hash Cond: (e.a = k2.a)`. With `and
+      e.a = 3` the scans print no `Filter` or `Index Cond` at all here,
+      Hash Joins over three Seq Scans; PostgreSQL prints the Nested Loops
+      RP-1105's all-comma chain gets, into `Index Only Scan using k_pkey`
+      on `k` and on `k2`, each `Index Cond: (a = 3)`. The
+      class-constant chain refuses a chain of ONs and commas both.
+      Found while working RP-1105.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join beside a comma item hashes on the where's equality], tests/backlog/test_rp_explain_costs.py::test_plan[a join beside a comma item takes the where's class constant]
+      Backlog-ID: RP-1154
 
 - [ ] **A class constant written on the left of its equality is not the
       class's, and the inner index scan prints no condition.** `explain

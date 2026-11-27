@@ -42,6 +42,10 @@ pub(crate) struct ChainConstant {
     /// Each table's scan, by alias: its index and whether index-only,
     /// `None` for the Seq Scan.
     pub indexes: Vec<(String, Option<(String, bool)>)>,
+    /// The joins are a comma join's, their equalities the WHERE's
+    /// conjuncts (RP-1105): the class replaces them, so none prints as a
+    /// join's Join Filter.
+    pub comma: bool,
 }
 
 /// The index an index scan reads, and whether the scan is index-only (the
@@ -2912,7 +2916,8 @@ impl PgHandler {
     }
 
     /// A chain of three or more tables planned as joined rows, each join
-    /// INNER on one column equality, whose clauses put every table's key in
+    /// INNER on one column equality -- an ON's, or a comma join's WHERE
+    /// conjunct (RP-1105) -- whose clauses put every table's key in
     /// one equivalence class and whose WHERE fixes a member to a constant
     /// (RP-1065): `generate_base_implied_equalities_const` filters every
     /// member's scan by the constant, which leaves no join clause, so each
@@ -2937,19 +2942,19 @@ impl PgHandler {
             || sel.offset != 0
             || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
             || sel.with_ties
-            || sel.residual.is_some()
             || sel.casts.iter().any(Option::is_some)
-            || j.where_spans_equality
-            || !j.where_filters.is_empty()
-            || !j.where_span_aliases.is_empty()
         {
             return None;
         }
-        // The leaves, left to right, and the ON equalities.
+        // The leaves, left to right, and the join equalities: an ON's, or
+        // -- a comma join, `FROM e, k, k k2 WHERE e.a = k.a AND ...` --
+        // the WHERE's, which PostgreSQL makes one qual list with the ON's
+        // (`deconstruct_jointree`), so both join the class alike (RP-1105).
         fn walk<'n>(
             n: &'n JoinNode,
             leaves: &mut Vec<&'n JoinNode>,
             pairs: &mut Vec<(String, String)>,
+            comma: &mut Vec<(String, String)>,
         ) -> Option<()> {
             match n {
                 JoinNode::Leaf { .. } => leaves.push(n),
@@ -2957,6 +2962,7 @@ impl PgHandler {
                     kind: JoinKind::Inner,
                     left,
                     right,
+                    on,
                     equi,
                     merged,
                     expr_keys,
@@ -2968,9 +2974,12 @@ impl PgHandler {
                     && expr_keys.is_empty()
                     && on_filters.is_empty() =>
                 {
-                    walk(left, leaves, pairs)?;
-                    walk(right, leaves, pairs)?;
+                    walk(left, leaves, pairs, comma)?;
+                    walk(right, leaves, pairs, comma)?;
                     pairs.push(equi[0].clone());
+                    if on.is_none() {
+                        comma.push(equi[0].clone());
+                    }
                 }
                 _ => return None,
             }
@@ -2978,9 +2987,37 @@ impl PgHandler {
         }
         let mut leaves = Vec::new();
         let mut pairs = Vec::new();
-        walk(&j.tree, &mut leaves, &mut pairs)?;
+        let mut comma = Vec::new();
+        walk(&j.tree, &mut leaves, &mut pairs, &mut comma)?;
         if leaves.len() < 3 {
             return None;
+        }
+        // Every join is a comma's or every one an ON's (a chain of both is
+        // RP-1154), and the WHERE's conjuncts over more than one table are
+        // exactly the comma joins' equalities, each one join's clause. The
+        // executor re-checks them above the join as the select's residual.
+        let same_pair = |(l, r): &(String, String), (x, y): &(String, String)| {
+            (l, r) == (x, y) || (l, r) == (y, x)
+        };
+        if (!comma.is_empty() && comma.len() != pairs.len())
+            || j.where_filters.len() != comma.len()
+            || j.where_span_aliases.len() != comma.len()
+            || j.where_equalities.len() != comma.len()
+            || j.where_spans_equality == comma.is_empty()
+            || !comma
+                .iter()
+                .all(|p| j.where_equalities.iter().any(|q| same_pair(p, q)))
+            || !j
+                .where_equalities
+                .iter()
+                .all(|q| comma.iter().any(|p| same_pair(p, q)))
+        {
+            return None;
+        }
+        match &sel.residual {
+            None => {}
+            Some(r) if !comma.is_empty() && is_key_equality(r, &comma, 0) => {}
+            Some(_) => return None,
         }
         // One class: every clause's keys, each table's one member.
         let mut members: Vec<String> = Vec::new();
@@ -3142,6 +3179,7 @@ impl PgHandler {
             implied,
             from,
             indexes,
+            comma: !comma.is_empty(),
         })
     }
 
