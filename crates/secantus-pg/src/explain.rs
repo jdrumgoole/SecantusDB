@@ -362,7 +362,21 @@ pub(crate) fn plan_tree(stmt: &Statement, scan: &ScanChooser<'_>) -> PlanNode {
                 n
             };
             if !agg.order.is_empty() {
-                node = PlanNode::over("Sort", node);
+                let mut sort = PlanNode::over("Sort", node);
+                // Each ORDER BY key is a group key, which the Sort reads
+                // from the aggregate's output (`show_sort_keys`, RP-1108).
+                // `attach_sort_keys` replaces these with the planned
+                // expressions where the select list is not bare columns.
+                let keys: Vec<String> = agg
+                    .order
+                    .iter()
+                    .filter_map(|o| agg.group_by.get(o.group_index).map(|g| (o, g)))
+                    .map(|(o, g)| agg_sort_key_text(g, o.ascending, o.nulls))
+                    .collect();
+                if keys.len() == agg.order.len() {
+                    sort.details.push(("Sort Key".into(), keys.join(", ")));
+                }
+                node = sort;
             }
             if agg.limit.is_some() || agg.offset > 0 {
                 node = PlanNode::over("Limit", node);
@@ -540,6 +554,34 @@ pub(crate) fn constant_equalities(filter: &Document, out: &mut Vec<String>) {
 fn sort_key_text(k: &secantus_pgplan::OrderKey) -> String {
     let name = display_alias(&k.field);
     match (k.ascending, k.nulls) {
+        (true, secantus_pgplan::Nulls::Last) => name,
+        (true, secantus_pgplan::Nulls::First) => format!("{name} NULLS FIRST"),
+        (false, secantus_pgplan::Nulls::First) => format!("{name} DESC"),
+        (false, secantus_pgplan::Nulls::Last) => format!("{name} DESC NULLS LAST"),
+    }
+}
+
+/// A Sort Key above an aggregate, over one of its group keys: the column
+/// the key reads, `alias.column` over a join (`useprefix`), as
+/// `get_variable` resolves the Sort's reference to the aggregate's output.
+/// A computed key prints parenthesised, as `get_variable` wraps a non-Var
+/// target it reaches through a child plan.
+fn agg_sort_key_text(
+    g: &secantus_pgplan::GroupKey,
+    ascending: bool,
+    nulls: secantus_pgplan::Nulls,
+) -> String {
+    let quote = secantus_pgplan::scalar::quote_identifier;
+    let name = match &g.expr {
+        Some(_) => format!("({})", g.name),
+        None => g
+            .field
+            .split(secantus_pgplan::joins::SEP)
+            .map(quote)
+            .collect::<Vec<_>>()
+            .join("."),
+    };
+    match (ascending, nulls) {
         (true, secantus_pgplan::Nulls::Last) => name,
         (true, secantus_pgplan::Nulls::First) => format!("{name} NULLS FIRST"),
         (false, secantus_pgplan::Nulls::First) => format!("{name} DESC"),
@@ -4285,14 +4327,25 @@ mod join_type_tests {
 /// `alias`, as a range table of more than one relation prints it
 /// (`show_sort_group_keys`'s `useprefix`; a join removed, RP-1060).
 pub(crate) fn qualify_group_keys(n: &mut PlanNode, alias: &str) {
+    let bare = |k: &str| {
+        !k.is_empty()
+            && k.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '"')
+    };
     for (label, value) in &mut n.details {
         if label == "Group Key" {
-            let bare = |k: &str| {
-                !k.is_empty()
-                    && k.chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '"')
-            };
             if value.split(", ").all(bare) {
+                *value = value
+                    .split(", ")
+                    .map(|k| format!("{alias}.{k}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+            }
+        } else if label == "Sort Key" {
+            // The Sort above the aggregate (RP-1108): each key's column,
+            // its direction after it.
+            let column = |k: &str| k.split(' ').next().unwrap_or(k).to_string();
+            if value.split(", ").all(|k| bare(&column(k))) {
                 *value = value
                     .split(", ")
                     .map(|k| format!("{alias}.{k}"))
