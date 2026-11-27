@@ -8816,3 +8816,34 @@ fn outer_join_kinds_as_reduce_outer_joins_leaves_them() {
         [F]
     );
 }
+
+/// A set operation's leaf sides record where each column is, as
+/// `exprLocation` finds the analysed target: a cast of an untyped literal
+/// at the literal, any other expression at its leftmost token, a `*` at
+/// its column reference for every column it expands to, a `VALUES` side
+/// nowhere, and a nested set operation not at all (the executor takes its
+/// columns from the expressions its common types came from). PostgreSQL
+/// 15.19 positions, RP-1087.
+#[test]
+fn a_set_operation_records_each_leaf_sides_column_locations() {
+    let sides = |sql: &str| match plan_ok(sql) {
+        Statement::SetOp(s) => (s.left_locations, s.right_locations),
+        other => panic!("wrong statement for {sql}: {other:?}"),
+    };
+    let sql = "select 1, 2, 3, 4 union select cast(null as text), cast(1 as text), text 'a', 'a'::text || 'b'";
+    let at = |needle: &str| i32::try_from(sql.find(needle).expect(needle)).ok();
+    let (left, right) = sides(sql);
+    assert_eq!(left, vec![at("1,"), at("2,"), at("3,"), at("4 ")]);
+    assert_eq!(
+        right,
+        vec![at("null"), at("cast(1"), at("'a',"), at("'a'::text ||")]
+    );
+    let (_, right) = sides("select 1, 2, 3 union select * from t");
+    assert_eq!(right, vec![Some(28); 3]);
+    let (left, right) = sides("values (1, 2) union select 'a'::text, 2");
+    assert_eq!(left, vec![Some(-1), Some(-1)]);
+    assert_eq!(right, vec![Some(27), Some(38)]);
+    let (left, right) = sides("(select 1 union select 2) union select 3");
+    assert!(left.is_empty());
+    assert_eq!(right, vec![Some(39)]);
+}

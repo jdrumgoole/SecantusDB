@@ -1854,6 +1854,9 @@ jobs:
           # An unaliased CASE column named by its ELSE result, with
           # PostgreSQL 15.20's names written in (RP-1046). Binary only.
           files="$files tests/test_rust_pgserver_case_colname.py"
+          # A set operation's analysis errors at the column PostgreSQL
+          # 15.19 points at (RP-1087). Binary only.
+          files="$files tests/test_rust_pg_set_op_positions.py"
           else
           files=""
           # The DIFFERENTIAL suite, whole: 836 cases against the PostgreSQL 14

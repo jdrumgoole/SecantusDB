@@ -163,6 +163,7 @@ else
         tests/test_rust_pg_binary_smoke.py tests/test_rust_pg_builtin_coverage.py \
         tests/test_rust_pg_dollar_names.py tests/test_rust_pg_corpora.py \
         tests/test_rust_pg_rule_trees.py tests/test_rust_pg_bpchar_key.py \
+        tests/test_rust_pg_set_op_positions.py \
         -q -n 4 --dist worksteal -rs -p no:cacheprovider
 fi
 

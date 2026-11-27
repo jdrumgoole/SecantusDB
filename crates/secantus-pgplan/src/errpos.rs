@@ -471,7 +471,10 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
     // RIGHT arm's expression (`select null::text union select 1`, under `1`),
     // in a plain query and in the query an `INSERT ... SELECT` writes
     // (PostgreSQL 15.19: `insert into tct(c) select (1,'x')::ctp union
-    // select row(2,'y')` is 42804 at the `row`, RP-1050).
+    // select row(2,'y')` is 42804 at the `row`, RP-1050). The executor
+    // records the column pair's own location (RP-1087), which the check
+    // above answers; this guess is for a column whose location it did not
+    // know (an expression `set_op_locations` does not locate).
     if sqlstate == "42804" && m.contains(" types ") && m.ends_with("cannot be matched") {
         let tree = pg_query::parse(sql).ok()?;
         let mut stmt = tree.protobuf.stmts.first()?.stmt.as_deref()?;

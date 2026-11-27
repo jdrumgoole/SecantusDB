@@ -43108,14 +43108,43 @@ impl PgHandler {
     /// one row as PostgreSQL has it. `ALL` keeps duplicates, and for INTERSECT
     /// / EXCEPT it keeps multiplicities -- `min(l, r)` and `l - r` copies.
     fn set_op_rows(&self, set: &secantus_pgplan::SetOpSelect) -> PgWireResult<SchemaAndRows> {
-        let (left_schema, left) = self.rows_with_schema(&set.left)?;
-        let (right_schema, right) = self.rows_with_schema(&set.right)?;
+        Ok(self.set_op_rows_located(set)?.0)
+    }
+
+    /// `set_op_rows`, with where each output column is: the location of
+    /// the side's expression its common type was taken from, as
+    /// `transformSetOperationTree` gives a set operation's column to the
+    /// node above it (`None` when not known). The 42804 of two column types
+    /// that do not match points at the right side's column there, after
+    /// the left side and then the right side have been checked (RP-1087).
+    fn set_op_rows_located(
+        &self,
+        set: &secantus_pgplan::SetOpSelect,
+    ) -> PgWireResult<(SchemaAndRows, Vec<Option<i32>>)> {
+        let side_rows = |stmt: &Statement, planned: &[Option<i32>]| match stmt {
+            Statement::SetOp(inner) => self.set_op_rows_located(inner),
+            other => Ok((self.rows_with_schema(other)?, planned.to_vec())),
+        };
+        let ((left_schema, left), left_at) = side_rows(&set.left, &set.left_locations)?;
+        let ((right_schema, right), right_at) = side_rows(&set.right, &set.right_locations)?;
         let op = match set.kind {
             secantus_pgplan::SetOpKind::Union => "UNION",
             secantus_pgplan::SetOpKind::Intersect => "INTERSECT",
             secantus_pgplan::SetOpKind::Except => "EXCEPT",
         };
         if left_schema.len() != right_schema.len() {
+            // At `exprLocation` of the right side's target list: its first
+            // column that has a location (none for a `VALUES` side).
+            let first = if right_at.is_empty() {
+                None
+            } else {
+                right_at
+                    .iter()
+                    .find(|l| **l != Some(-1))
+                    .copied()
+                    .unwrap_or(Some(-1))
+            };
+            Self::locate_set_op_error(first);
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
                 "42601".into(), // syntax_error
@@ -43155,6 +43184,9 @@ impl PgHandler {
             Self::untyped_string_columns,
         );
         let flag = |v: &[bool], i: usize| v.get(i).copied().unwrap_or(false);
+        let at = |v: &[Option<i32>], i: usize| v.get(i).copied().flatten();
+        // Where each output column is, for the set operation above this one.
+        let mut located = Vec::with_capacity(left_schema.len());
         let mut schema = Vec::with_capacity(left_schema.len());
         // The columns whose untyped literal side is read as the other side's
         // type: (column, the side holding the literal is the left, type name).
@@ -43163,25 +43195,40 @@ impl PgHandler {
         // (column, the left side, from type, to type).
         let mut convert: Vec<(usize, bool, Type, Type)> = Vec::new();
         for (i, (l, r)) in left_schema.iter().zip(&right_schema).enumerate() {
+            // `select_common_type` keeps the left side's expression unless
+            // it takes the right side's type (an untyped left side, or a
+            // type the left casts to implicitly).
+            let (lat, rat) = (at(&left_at, i), at(&right_at, i));
             let ty = if flag(&right_nulls, i) {
+                located.push(lat);
                 l.datatype().clone()
             } else if flag(&left_nulls, i) {
+                located.push(rat);
                 r.datatype().clone()
             } else if flag(&right_strs, i) && !flag(&left_strs, i) {
                 if let Some(name) = Self::planner_type_name(l.datatype()) {
                     retype.push((i, false, name));
                 }
+                located.push(lat);
                 l.datatype().clone()
             } else if flag(&left_strs, i) && !flag(&right_strs, i) {
                 if let Some(name) = Self::planner_type_name(r.datatype()) {
                     retype.push((i, true, name));
                 }
+                located.push(rat);
                 r.datatype().clone()
             } else {
-                let ty = Self::unify_set_op_type(op, l.datatype(), r.datatype())?;
-                for (on_left, side) in [(true, l.datatype()), (false, r.datatype())] {
+                let ty = Self::unify_set_op_type(op, l.datatype(), r.datatype())
+                    .inspect_err(|_| Self::locate_set_op_error(rat))?;
+                located.push(if *l.datatype() == ty { lat } else { rat });
+                for (on_left, side, side_at) in
+                    [(true, l.datatype(), lat), (false, r.datatype(), rat)]
+                {
                     if *side != ty {
-                        Self::check_set_op_conversion(op, side, &ty)?;
+                        // `coerce_to_common_type` refuses the side's own
+                        // expression.
+                        Self::check_set_op_conversion(op, side, &ty)
+                            .inspect_err(|_| Self::locate_set_op_error(side_at))?;
                         convert.push((i, on_left, side.clone(), ty.clone()));
                     }
                 }
@@ -43508,7 +43555,18 @@ impl PgHandler {
             };
             out.truncate(take);
         }
-        Ok((schema, out))
+        Ok(((schema, out), located))
+    }
+
+    /// Record where a set operation's 42804 points: the right side's
+    /// column, or no position at all where PostgreSQL has none (a `VALUES`
+    /// side). Not known: left to `error_position`.
+    fn locate_set_op_error(location: Option<i32>) {
+        match location {
+            Some(l) if l >= 0 => secantus_pgplan::set_error_location(l),
+            Some(_) => secantus_pgplan::set_error_unpositioned(),
+            None => {}
+        }
     }
 
     /// Every row of a row-producing statement as resolved values, in output

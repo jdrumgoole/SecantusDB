@@ -26,6 +26,7 @@ mod pg_regex;
 mod record_image;
 mod regex_flavour;
 mod relabel;
+mod set_op_locations;
 mod sublink_join;
 mod subquery_pullup;
 pub use domain_scope::{select_output_domains, select_target_domain};
@@ -1571,6 +1572,14 @@ pub struct SetOpSelect {
     /// to `select_common_typmod` (RP-660).
     pub left_domains: Vec<Option<String>>,
     pub right_domains: Vec<Option<String>>,
+    /// Where each leaf side's column is, by position, for the 42804 of two
+    /// column types that do not match: `Some` byte offset into the
+    /// statement, `Some(-1)` where PostgreSQL has none (a `VALUES` side),
+    /// `None` (or missing) where it is not known. Empty for a side that is
+    /// itself a set operation, whose columns' locations the executor takes
+    /// from the expressions its common types came from (RP-1087).
+    pub left_locations: Vec<Option<i32>>,
+    pub right_locations: Vec<Option<i32>>,
 }
 
 /// Which select-list entries of one set-operation side are a bare untyped
@@ -4893,7 +4902,7 @@ thread_local! {
 /// Mark the error about to be raised as one PostgreSQL reports with no
 /// position: raised under a parse state made with no query text, as
 /// `AddRelationNewConstraints` is from ALTER TABLE (RP-811).
-pub(crate) fn set_error_unpositioned() {
+pub fn set_error_unpositioned() {
     ERROR_LOCATION.with(|l| l.set(None));
     ERROR_UNPOSITIONED.with(|u| u.set(true));
 }
@@ -4908,7 +4917,7 @@ pub(crate) fn error_unpositioned() -> bool {
 }
 
 /// Record where the error about to be raised points.
-pub(crate) fn set_error_location(location: i32) {
+pub fn set_error_location(location: i32) {
     if location >= 0 {
         ERROR_UNPOSITIONED.with(|u| u.set(false));
         ERROR_LOCATION.with(|l| l.set(Some(location)));
@@ -21870,6 +21879,8 @@ fn plan_set_operation(
         });
     }
     let (limit, offset) = limit_offset(s, params)?;
+    let left_locations = set_op_locations::side_locations(larg, &left);
+    let right_locations = set_op_locations::side_locations(rarg, &right);
 
     Ok(Statement::SetOp(SetOpSelect {
         left: Box::new(left),
@@ -21884,6 +21895,8 @@ fn plan_set_operation(
         right_untyped: UntypedTargets::of(rarg),
         left_domains: domain_scope::side_domains(larg, lookup),
         right_domains: domain_scope::side_domains(rarg, lookup),
+        left_locations,
+        right_locations,
     }))
 }
 
