@@ -869,10 +869,10 @@ These are explicit non-goals. Don't add them without a reason.
         `$group` (since 2026-11-18 a `$group` on the
         meta field that only counts, which mongod runs over the buckets,
         counts as mongod's does, and since 2026-11-18 one on a constant,
-        `count_documents`'s, and a `$count` stage; a `$group` after a `$match`
-        on a measurement field, which mongod runs in SBE, and one after a
-        `$match` on the meta field, which mongod reads through its index,
-        still count nothing), an inclusion `$project` (RM-456), a
+        `count_documents`'s, a `$count` stage, and since 2026-11-27 a `$group`
+        after a `$match` on a measurement field, which mongod runs in SBE;
+        one after a `$match` on the meta field, which mongod reads through
+        its index, still counts nothing), an inclusion `$project` (RM-456), a
         filter on the meta field (RM-457), a hint or a collation. mongod
         counts the buckets its cursor stage buffered (five of five for a
         sorted `find`). Since RM-455 a `find` is the aggregation mongod
@@ -882,7 +882,7 @@ These are explicit non-goals. Don't add them without a reason.
         mongod 5 keys and 4 documents, this server none).
       Measured 2026-10-27, 2026-11-07, 2026-11-10 and 2026-11-13.
       Backlog-ID: RM-363
-      Verify: tests/backlog/test_rm_355_364.py::test_a_group_after_a_measurement_match_counts_what_it_examined
+      Verify: tests/backlog/test_rm_355_364.py::test_a_group_after_a_meta_match_counts_what_it_examined
 - [ ] **WiredTiger 11's interruptible cache wait is not on the line.**
       mongod 8.2.11's WiredTiger splits a cache wait into the share spent
       in interruptible eviction (`timeWaitingMicros.cacheInterruptibleMicros`)

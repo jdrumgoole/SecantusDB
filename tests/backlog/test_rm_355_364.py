@@ -1722,14 +1722,30 @@ def test_a_count_stage_time_series_read_counts_what_it_examined(
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-363")
+@pytest.mark.backlog_fixed("RM-363")
 def test_a_group_after_a_measurement_match_counts_what_it_examined(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11 runs a `$group` after a `$match` on a measurement field
     in the slot-based engine, and its line counts the buckets it examined.
-    This server reads the collection whole there, and counts nothing."""
+    This server read the collection whole there, and counted nothing, until
+    it read the buckets through its cursor (RM-363)."""
     pipeline = [{"$match": {"v": {"$gte": 10}}}, {"$group": {"_id": "$m", "n": {"$sum": 1}}}]
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.aggregate(pipeline)), _series)
+    answers = {s: _counts(_line(lines, "aggregate")) for s, (lines, _) in got.items()}
+    assert "docsExamined" in answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog("RM-363")
+def test_a_group_after_a_meta_match_counts_what_it_examined(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 reads a `$match` on the meta field through its index
+    over the buckets before a `$group`, and its line counts what that read
+    examined. This server reads the collection whole there, and counts
+    nothing."""
+    pipeline = [{"$match": {"m": {"$gte": 2}}}, {"$group": {"_id": "$m", "n": {"$sum": 1}}}]
     got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.aggregate(pipeline)), _series)
     answers = {s: _counts(_line(lines, "aggregate")) for s, (lines, _) in got.items()}
     assert "docsExamined" in answers["mongod"]
