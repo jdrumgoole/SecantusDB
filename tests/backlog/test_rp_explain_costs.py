@@ -3159,8 +3159,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on a private PostgreSQL 15.20 cluster (found while working
-    # RP-1065): the class's equality keeps the place of the class's first
-    # source clause among the scan's quals.
+    # RP-1065, fixed): the class's equality keeps the place of the class's
+    # first source clause among the scan's quals, the classes in the order
+    # `deconstruct_jointree` makes them -- a JOIN's ON before the WHERE --
+    # after the scan's other quals.
     "a class constant's equality keeps its class's place among the quals": (
         "RP-1101",
         _ANALYSED,
@@ -3169,6 +3171,71 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "Nested Loop",
             "  ->  Seq Scan on e",
             "        Filter: ((a = 3) AND (b = 'v3'::text))",
+            "  ->  Index Scan using k_pkey on k",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    "a class made after another keeps its place after it": (
+        "RP-1101",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e, k where e.b = 'v3' and e.a = k.a and e.a = 3",
+        [
+            "Nested Loop",
+            "  ->  Seq Scan on e",
+            "        Filter: ((b = 'v3'::text) AND (a = 3))",
+            "  ->  Index Scan using k_pkey on k",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    "a class made by the join clause goes ahead of the where's": (
+        "RP-1101",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e, k where e.a = k.a and e.b = 'v3' and e.a = 3",
+        [
+            "Nested Loop",
+            "  ->  Seq Scan on e",
+            "        Filter: ((a = 3) AND (b = 'v3'::text))",
+            "  ->  Index Scan using k_pkey on k",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    "an on's one-table equality makes its class first": (
+        "RP-1101",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e join k on e.b = 'v3' and e.a = k.a"
+        " where e.a = 3",
+        [
+            "Nested Loop",
+            "  ->  Seq Scan on e",
+            "        Filter: ((b = 'v3'::text) AND (a = 3))",
+            "  ->  Index Scan using k_pkey on k",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    "the generated side's class equality keeps its class's place": (
+        "RP-1101",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e, k"
+        " where e.a = k.a and k.a = 3 and e.b > 'a' and e.b = 'v3'",
+        [
+            "Nested Loop",
+            "  ->  Seq Scan on e",
+            "        Filter: ((b > 'a'::text) AND (a = 3) AND (b = 'v3'::text))",
+            "  ->  Index Scan using k_pkey on k",
+            "        Index Cond: (a = 3)",
+        ],
+    ),
+    # Found while working RP-1101, on the same cluster: an expression
+    # conjunct on the fixed side leaves the class-constant join a Hash Join.
+    "a class constant join beside an expression qual is a nested loop": (
+        "RP-1147",
+        _ANALYSED,
+        "explain (costs off) select e.b, k.b from e join k on e.a = k.a"
+        " where e.a = 3 and length(e.b) > 1",
+        [
+            "Nested Loop",
+            "  ->  Seq Scan on e",
+            "        Filter: ((a = 3) AND (length(b) > 1))",
             "  ->  Index Scan using k_pkey on k",
             "        Index Cond: (a = 3)",
         ],
@@ -10060,6 +10127,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1101",
         "RP-1027",
         "RP-1030",
         "RP-1071",

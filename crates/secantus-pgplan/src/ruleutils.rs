@@ -6018,6 +6018,139 @@ pub fn join_where(s: &pg_query::protobuf::SelectStmt, cat: &Catalog<'_>) -> Opti
     Some(out)
 }
 
+/// A join's equivalence classes in the order PostgreSQL 15 creates them
+/// (`root->eq_classes`, RP-1101), each as the `(relation, column)` members
+/// it has: `deconstruct_jointree` hands every qual to
+/// `distribute_qual_to_rels` depth first -- a JOIN's two sides, then its
+/// ON's conjuncts, and the WHERE's last -- and each `x = y` joins the
+/// class of `x` or of `y` (`process_equivalence`; a constant is a member
+/// too), or starts one at the list's end. A clause whose two sides are in
+/// different classes merges the second into the first, which keeps its
+/// place. `generate_base_implied_equalities` gives each scan its classes'
+/// equalities in this order. Empty -- the order unknown -- for an outer
+/// join, a USING or NATURAL join, or a FROM item other than a table.
+pub fn class_ranks(
+    s: &pg_query::protobuf::SelectStmt,
+    cat: &Catalog<'_>,
+) -> Vec<Vec<(String, String)>> {
+    (|| {
+        let mut p = Printer::new(cat, 0);
+        p.legacy_joins = true;
+        let mut rtes = Vec::new();
+        p.collect_rtes(&s.from_clause, &mut rtes)?;
+        p.scopes.push(rtes);
+        // The quals in the order `deconstruct_recurse` distributes them.
+        fn gather<'n>(n: &'n Node, out: &mut Vec<std::borrow::Cow<'n, Node>>) -> Option<()> {
+            match n.node.as_ref()? {
+                N::RangeVar(_) => Some(()),
+                N::JoinExpr(j) => {
+                    if JoinType::try_from(j.jointype).ok()? != JoinType::JoinInner
+                        || j.is_natural
+                        || !j.using_clause.is_empty()
+                    {
+                        return None;
+                    }
+                    gather(j.larg.as_deref()?, out)?;
+                    gather(j.rarg.as_deref()?, out)?;
+                    if let Some(q) = j.quals.as_deref() {
+                        and_clauses(q, out);
+                    }
+                    Some(())
+                }
+                _ => None,
+            }
+        }
+        let mut quals = Vec::new();
+        for item in &s.from_clause {
+            gather(item, &mut quals)?;
+        }
+        if let Some(w) = s.where_clause.as_deref() {
+            and_clauses(w, &mut quals);
+        }
+        // A member: a column as `(relation, column)`, anything else by
+        // its tree (`equal()`).
+        #[derive(PartialEq, Clone)]
+        enum Member {
+            Var(String, String),
+            Other(String),
+        }
+        let member = |n: &Node| -> Option<Member> {
+            match n.node.as_ref()? {
+                N::ColumnRef(c) => {
+                    let (rel, col, _) = p.resolve(&names(&c.fields))?;
+                    Some(Member::Var(rel, col))
+                }
+                N::AConst(_) | N::TypeCast(_) | N::ParamRef(_) => {
+                    let mut bare = n.clone();
+                    // Positions are not part of the value.
+                    let _ = crate::walk_expr(&mut bare, &mut |x| {
+                        match x.node.as_mut() {
+                            Some(N::AConst(a)) => a.location = 0,
+                            Some(N::TypeCast(t)) => {
+                                t.location = 0;
+                                if let Some(tn) = t.type_name.as_mut() {
+                                    tn.location = 0;
+                                }
+                            }
+                            Some(N::ParamRef(r)) => r.location = 0,
+                            _ => {}
+                        }
+                        Ok(())
+                    });
+                    Some(Member::Other(format!("{:?}", bare.node)))
+                }
+                _ => None,
+            }
+        };
+        let mut classes: Vec<Vec<Member>> = Vec::new();
+        for q in &quals {
+            let Some(N::AExpr(e)) = q.node.as_ref() else {
+                continue;
+            };
+            if e.kind != AExprKind::AexprOp as i32 || crate::operator_name(e).ok() != Some("=") {
+                continue;
+            }
+            let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) else {
+                continue;
+            };
+            let (Some(l), Some(r)) = (member(l), member(r)) else {
+                continue;
+            };
+            // `const = const` is folded away, not a class.
+            if !matches!(l, Member::Var(..)) && !matches!(r, Member::Var(..)) {
+                continue;
+            }
+            let find =
+                |m: &Member, classes: &[Vec<Member>]| classes.iter().position(|c| c.contains(m));
+            match (find(&l, &classes), find(&r, &classes)) {
+                (Some(a), Some(b)) if a == b => {}
+                (Some(a), Some(b)) => {
+                    let merged = classes.remove(b);
+                    let a = if b < a { a - 1 } else { a };
+                    classes[a].extend(merged);
+                }
+                (Some(a), None) => classes[a].push(r),
+                (None, Some(b)) => classes[b].push(l),
+                (None, None) => classes.push(vec![l, r]),
+            }
+        }
+        Some(
+            classes
+                .into_iter()
+                .map(|c| {
+                    c.into_iter()
+                        .filter_map(|m| match m {
+                            Member::Var(rel, col) => Some((rel, col)),
+                            Member::Other(_) => None,
+                        })
+                        .collect()
+                })
+                .collect(),
+        )
+    })()
+    .unwrap_or_default()
+}
+
 /// Each scan's own conjuncts among `quals` (one per node of `parts`) in
 /// the order a lone scan's are ([`qual_order`], RP-398), back in the
 /// positions they held; left as they are when the two lists differ in
@@ -7343,6 +7476,49 @@ mod join_where_tests {
             .into_iter()
             .map(|(text, home, ..)| (text, home))
             .collect()
+    }
+
+    fn ranks(sql: &str) -> Vec<Vec<(String, String)>> {
+        let p = pg_query::parse(sql).unwrap();
+        let Some(N::SelectStmt(s)) = p.protobuf.stmts[0].stmt.as_ref().unwrap().node.as_ref()
+        else {
+            panic!("{sql}")
+        };
+        let none = |_: &str| None;
+        let cat = Catalog {
+            lookup: &lookup,
+            view_sql: &none,
+            home_schema: None,
+        };
+        class_ranks(s, &cat)
+    }
+
+    #[test]
+    fn classes_in_the_order_deconstruct_jointree_makes_them() {
+        // RP-1101, measured on PostgreSQL 15.20: the ON's clauses before
+        // the WHERE's, each `x = y` joining or starting a class.
+        let v = |a: &str, c: &str| (a.to_string(), c.to_string());
+        assert_eq!(
+            ranks("select * from e, s where e.b = 'x' and e.a = s.a and e.a = 3"),
+            vec![vec![v("e", "b")], vec![v("e", "a"), v("s", "a")]]
+        );
+        assert_eq!(
+            ranks("select * from e join s on e.a = s.a where e.b = 'x' and s.a = 3"),
+            vec![vec![v("e", "a"), v("s", "a")], vec![v("e", "b")]]
+        );
+        // An ON's one-table equality makes its class where it is written.
+        assert_eq!(
+            ranks("select * from e join s on e.b = 'x' and e.a = s.a where e.a = 3"),
+            vec![vec![v("e", "b")], vec![v("e", "a"), v("s", "a")]]
+        );
+        // Two classes a later clause joins are one, in the first's place;
+        // a shared constant is a member of both sides' class.
+        assert_eq!(
+            ranks("select * from e, s where e.a = 3 and s.c = 'y' and s.a = 3"),
+            vec![vec![v("e", "a"), v("s", "a")], vec![v("s", "c")]]
+        );
+        // An outer join's order is not modelled.
+        assert!(ranks("select * from e left join s on e.a = s.a where e.a = 3").is_empty());
     }
 
     #[test]

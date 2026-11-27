@@ -3001,9 +3001,11 @@ pub(crate) fn attach_join_conds(
 /// Give each scan an equivalence class filters (RP-363, RP-364) the
 /// constant the other side's WHERE compares the other key with. The class
 /// re-derives both equalities (`generate_base_implied_equalities_const`),
-/// so on each side the key's equality comes after the scan's own quals,
-/// all in one `Filter`. A filter that is not a plain AND of
-/// parenthesised conjuncts is left as it is.
+/// so on each side the key's equality takes the class's place among the
+/// scan's own class equalities (`class_ranks`, the order
+/// `root->eq_classes` holds them, RP-1101), after its other quals, all in
+/// one `Filter`; with no `class_ranks` it comes last. A filter that is not
+/// a plain AND of parenthesised conjuncts is left as it is.
 /// `(own key column, (alias, key column) whose WHERE fixed the other
 /// key)`: a scan an equivalence class filters by a constant (RP-363).
 pub(crate) type ImpliedFilter = (String, (String, String));
@@ -3020,7 +3022,45 @@ type LeafFilters = (
 pub(crate) fn apply_implied_filters(
     root: &mut PlanNode,
     index_columns: &dyn Fn(&str) -> Vec<String>,
+    class_ranks: &[Vec<(String, String)>],
 ) {
+    // The place of the class `alias.col` is a member of.
+    let rank = |alias: &str, col: &str| {
+        class_ranks
+            .iter()
+            .position(|c| c.iter().any(|(a, k)| a == alias && k == col))
+    };
+    // The column a class equality `(col = ...)` conjunct is over.
+    fn class_column(part: &str) -> Option<&str> {
+        let (col, _) = part.strip_prefix('(')?.split_once(" = ")?;
+        (!col.is_empty() && col.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
+            .then_some(col)
+    }
+    // Where the class equality on `alias.col` goes among `parts`, the
+    // scan's other quals in their printed order (`at` where it stood):
+    // before the first equality of a class created after its class, else
+    // after the last other class equality, PostgreSQL's
+    // `generate_base_implied_equalities` order once `order_qual_clauses`
+    // has sorted the list by cost. `None`: at the end.
+    let place = |parts: &[String], alias: &str, col: &str, at: Option<usize>| {
+        let own = rank(alias, col)?;
+        let ranked = |p: &String| class_column(p).and_then(|c| rank(alias, c));
+        if let Some(i) = parts
+            .iter()
+            .position(|p| ranked(p).is_some_and(|r| r > own))
+        {
+            return Some(i);
+        }
+        let after_last = parts
+            .iter()
+            .rposition(|p| ranked(p).is_some())
+            .map(|i| i + 1);
+        match (at, after_last) {
+            (Some(at), Some(last)) => Some(at.max(last)),
+            (Some(at), None) => Some(at),
+            (None, last) => last,
+        }
+    };
     fn alias_of(n: &PlanNode) -> Option<String> {
         n.props
             .iter()
@@ -3081,12 +3121,15 @@ pub(crate) fn apply_implied_filters(
         let head = format!("({from_col} = ");
         let in_filter = src.as_deref().and_then(conjuncts).and_then(|mut parts| {
             let at = parts.iter().position(|p| p.starts_with(&head))?;
-            Some((parts.remove(at), parts))
+            Some((parts.remove(at), parts, at))
         });
         let rhs = match in_filter {
-            Some((key, mut src_parts)) => {
+            Some((key, mut src_parts, at)) => {
                 let rhs = key[head.len()..].to_string();
-                src_parts.push(key);
+                match place(&src_parts, from_alias, from_col, Some(at)) {
+                    Some(i) => src_parts.insert(i, key),
+                    None => src_parts.push(key),
+                }
                 texts.push((from_alias.clone(), render(&src_parts)));
                 rhs
             }
@@ -3122,7 +3165,10 @@ pub(crate) fn apply_implied_filters(
             }
             continue;
         }
-        own.push(generated);
+        match place(&own, alias, own_col, None) {
+            Some(i) => own.insert(i, generated),
+            None => own.push(generated),
+        }
         texts.push((alias.clone(), render(&own)));
     }
     fn index_scan_reads(
@@ -3568,7 +3614,7 @@ mod join_type_tests {
             .push(scan("e", Some("(b = 'v2'::text)"), None));
         root.children
             .push(scan("k", Some("(a < 500)"), Some(("c", "e"))));
-        apply_implied_filters(&mut root, &|_| Vec::new());
+        apply_implied_filters(&mut root, &|_| Vec::new(), &[]);
         assert_eq!(
             root.children[1].details,
             vec![(
@@ -3580,8 +3626,66 @@ mod join_type_tests {
         root.children
             .push(scan("e", Some("(b = 'v2'::text)"), None));
         root.children.push(scan("k", None, Some(("b", "e"))));
-        apply_implied_filters(&mut root, &|_| Vec::new());
+        apply_implied_filters(&mut root, &|_| Vec::new(), &[]);
         assert_eq!(root.children[1].details[0].1, "(b = 'v2'::text)");
+    }
+
+    /// The class's equality takes its class's place among each scan's
+    /// class equalities (RP-1101): `e.a = k.a` made the class of `e.a`
+    /// before `e.b = 'v3'` made `e.b`'s, so `a = 3` prints first on both
+    /// sides, while a class created after the others still comes last.
+    #[test]
+    fn implied_filters_keep_the_class_order() {
+        let scan = |alias: &str, filter: Option<&str>, implied: Option<(&str, &str)>| {
+            let mut n = PlanNode::new(format!("Seq Scan on {alias}"));
+            n.props.push(("Relation Name".into(), alias.into()));
+            if let Some(f) = filter {
+                n.details.push(("Filter".into(), f.into()));
+            }
+            n.implied_filter = implied.map(|(c, f)| (c.into(), (f.into(), "a".into())));
+            n
+        };
+        let var = |a: &str, c: &str| (a.to_string(), c.to_string());
+        let ranks = vec![
+            vec![var("e", "a"), var("k", "a")],
+            vec![var("e", "b")],
+            vec![var("k", "b")],
+        ];
+        // The fixing side: its WHERE's `a = 3` moves ahead of `b`.
+        let mut root = PlanNode::new("Nested Loop");
+        root.children
+            .push(scan("e", Some("((b = 'v3'::text) AND (a = 3))"), None));
+        root.children.push(scan("k", None, Some(("a", "e"))));
+        apply_implied_filters(&mut root, &|_| Vec::new(), &ranks);
+        assert_eq!(
+            root.children[0].details[0].1,
+            "((a = 3) AND (b = 'v3'::text))"
+        );
+        // The generated side: ahead of its own later class, after a
+        // non-class qual.
+        let mut root = PlanNode::new("Nested Loop");
+        root.children.push(scan("e", Some("(a = 3)"), None));
+        root.children.push(scan(
+            "k",
+            Some("((b > 'a'::text) AND (b = 'v3'::text))"),
+            Some(("a", "e")),
+        ));
+        apply_implied_filters(&mut root, &|_| Vec::new(), &ranks);
+        assert_eq!(
+            root.children[1].details[0].1,
+            "((b > 'a'::text) AND (a = 3) AND (b = 'v3'::text))"
+        );
+        // A class created first by the WHERE's `e.b = 'v3'` keeps its place.
+        let ranks = vec![vec![var("e", "b")], vec![var("e", "a"), var("k", "a")]];
+        let mut root = PlanNode::new("Nested Loop");
+        root.children
+            .push(scan("e", Some("((a = 3) AND (b = 'v3'::text))"), None));
+        root.children.push(scan("k", None, Some(("a", "e"))));
+        apply_implied_filters(&mut root, &|_| Vec::new(), &ranks);
+        assert_eq!(
+            root.children[0].details[0].1,
+            "((b = 'v3'::text) AND (a = 3))"
+        );
     }
 
     /// The class's constant on an index scan's own key column is that
@@ -3598,13 +3702,17 @@ mod join_type_tests {
         let mut root = PlanNode::new("Nested Loop");
         root.children.push(e);
         root.children.push(k);
-        apply_implied_filters(&mut root, &|ix| {
-            if ix == "k_pkey" {
-                vec!["a".into()]
-            } else {
-                Vec::new()
-            }
-        });
+        apply_implied_filters(
+            &mut root,
+            &|ix| {
+                if ix == "k_pkey" {
+                    vec!["a".into()]
+                } else {
+                    Vec::new()
+                }
+            },
+            &[],
+        );
         assert_eq!(
             root.children[1].details,
             vec![
@@ -3627,7 +3735,7 @@ mod join_type_tests {
         let mut root = PlanNode::new("Nested Loop");
         root.children.push(e);
         root.children.push(k);
-        apply_implied_filters(&mut root, &|_| Vec::new());
+        apply_implied_filters(&mut root, &|_| Vec::new(), &[]);
         assert_eq!(
             root.children[0].details,
             vec![("Filter".to_string(), "(a = 3)".to_string())]
@@ -3674,13 +3782,17 @@ mod join_type_tests {
                 ("k2".into(), Some(("k_pkey".into(), true))),
             ],
         );
-        apply_implied_filters(&mut top, &|ix| {
-            if ix == "k_pkey" {
-                vec!["a".into()]
-            } else {
-                Vec::new()
-            }
-        });
+        apply_implied_filters(
+            &mut top,
+            &|ix| {
+                if ix == "k_pkey" {
+                    vec!["a".into()]
+                } else {
+                    Vec::new()
+                }
+            },
+            &[],
+        );
         assert_eq!(top.name, "Nested Loop");
         assert!(top.skip_cond && top.children[0].skip_cond);
         assert_eq!(top.children[0].name, "Nested Loop");
@@ -5415,6 +5527,7 @@ mod heap_fetches_tests {
             join_conds: Vec::new(),
             join_cond_splits: Vec::new(),
             join_where: Vec::new(),
+            class_ranks: Vec::new(),
             subquery_quals: Vec::new(),
             one_time_false: 0,
             nullable_gate: None,

@@ -3733,6 +3733,11 @@ pub struct ExplainOptions {
     /// it filters (`None`: the top join's filter) and the column an index
     /// scan there could take it on (RP-369).
     pub join_where: Vec<ruleutils::JoinQual>,
+    /// A join's equivalence classes in the order PostgreSQL creates them,
+    /// each as its `(relation, column)` members ([`ruleutils::class_ranks`],
+    /// RP-1101): the order a scan's class equalities print in. Empty when
+    /// that order is not known.
+    pub class_ranks: Vec<Vec<(String, String)>>,
     /// A set operation's arms, left to right: each single-relation arm's
     /// WHERE conjuncts, as `scan_quals` holds one statement's. Empty unless
     /// every arm reads one relation.
@@ -12698,6 +12703,7 @@ fn plan_explain(
         join_conds: Vec::new(),
         join_cond_splits: Vec::new(),
         join_where: Vec::new(),
+        class_ranks: Vec::new(),
         subquery_quals: Vec::new(),
         one_time_false: 0,
         nullable_gate: None,
@@ -12954,6 +12960,7 @@ fn plan_explain(
                 // A constant TRUE ON conjunct is folded away (RP-394), and an
                 // inner join's one-table ON conjunct is printed on its table's
                 // scan, as the planner runs it (RP-391).
+                let original = s;
                 let hoisted = joins::prepare_on_quals(s);
                 let s = hoisted.as_ref().unwrap_or(s);
                 // An outer join's ON conjunct over its nullable side alone is
@@ -12989,6 +12996,14 @@ fn plan_explain(
                 } else {
                     Vec::new()
                 };
+                // The classes in the order the ON and WHERE quals make
+                // them, read before an ON's one-table conjuncts are moved
+                // into the WHERE (RP-1101).
+                if joined {
+                    let reduced = joins::reduce_outer_joins(original);
+                    options.class_ranks =
+                        ruleutils::class_ranks(reduced.as_ref().unwrap_or(original), &cat);
+                }
                 // Those go first: `deconstruct_jointree` distributes a join's
                 // own quals before the WHERE's.
                 if joined && !nullable_pushed.is_empty() {

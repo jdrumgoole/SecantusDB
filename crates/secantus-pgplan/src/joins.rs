@@ -4833,7 +4833,7 @@ fn drop_redundant_equalities(
 /// join's do. A WHERE conjunct proves a side non-NULL by
 /// [`strict_aliases`]' terms, its columns qualified; an aliased JOIN,
 /// which hides its leaves from the WHERE, and a FULL join are left alone.
-fn reduce_outer_joins(
+pub(crate) fn reduce_outer_joins(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Option<pg_query::protobuf::SelectStmt> {
     use pg_query::protobuf::JoinType;

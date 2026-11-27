@@ -1971,21 +1971,19 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a filtered relation of a three-way join is joined first], tests/backlog/test_rp_explain_costs.py::test_plan[a range-filtered relation of a three-way join is joined first]
       Backlog-ID: RP-1059
 
-- [ ] **A class constant's equality on the side the WHERE names is
-      printed after that side's other quals, not where the class began.**
-      `explain (costs off) select e.b, k.b from e, k where e.a = k.a and
-      e.a = 3 and e.b = 'v3'` (`e`, `k` analysed, 1000 rows) prints `Filter:
-      ((b = 'v3'::text) AND (a = 3))` on `e`; a private PostgreSQL 15.20
-      cluster prints `((a = 3) AND (b = 'v3'::text))`. Measured there: the
-      class's equality takes the place of the class's first source clause
-      among the scan's own quals, the ON's ahead of the WHERE's -- `where
-      e.b = 'v3' and e.a = k.a and e.a = 3` prints `b` first, every
-      explicit `join k on e.a = k.a where ...` prints `a` first, whatever
-      the WHERE's order. `apply_implied_filters` always moves it last. Find
-      the mechanism in `equivclass.c` / `initsplan.c` before modelling it.
-      Found while working RP-1065.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a class constant's equality keeps its class's place among the quals]
-      Backlog-ID: RP-1101
+- [ ] **A join a class constant fixes stays a Hash Join beside an
+      expression qual on the fixed side.** `explain (costs off) select e.b,
+      k.b from e join k on e.a = k.a where e.a = 3 and length(e.b) > 1`
+      (`e`, `k` analysed, 1000 rows, `k.a` the primary key) prints a `Hash
+      Join` on `(e.a = k.a)`, its Hash over an `Index Scan using k_pkey on
+      k` with no `Index Cond`; a private PostgreSQL 15.20 cluster prints
+      the Nested Loop the query gets without the expression (RP-1065):
+      `Filter: ((a = 3) AND (length(b) > 1))` on `e`, `Index Cond: (a =
+      3)` on `k`. `lower(e.b) = 'v3'` and the comma join are the same; with
+      the constant on `k` (`where k.a = 3 and length(e.b) > 1`) `e` also
+      loses the class's `a = 3`. Found while working RP-1101.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a class constant join beside an expression qual is a nested loop]
+      Backlog-ID: RP-1147
 
 - [ ] **A WHERE that fixes one class to two constants is not the empty
       Result.** `explain (costs off) select e.b, k.b from e join k on e.a =
