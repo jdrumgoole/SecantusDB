@@ -114,7 +114,7 @@ pub(crate) enum Schema {
 }
 
 /// `canonicalizeBSONType`: the types `mongod` orders as one.
-fn canonical_type(v: &Bson) -> i32 {
+pub(crate) fn canonical_type(v: &Bson) -> i32 {
     match v {
         Bson::MinKey => -1,
         Bson::Undefined => 0,

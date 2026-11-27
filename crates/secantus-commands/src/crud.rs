@@ -1238,7 +1238,19 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         } else {
             vec![measurements]
         };
-        let outcomes = crate::ts_store::insert(storage, &db, &coll, batches)?;
+        // The idle bucket expiry's parameters, as the server holds them now.
+        let expiry = {
+            let held = |name: &str, default: i64| {
+                ctx.server_params
+                    .as_ref()
+                    .map_or(default, |p| p.number(name, default))
+            };
+            crate::bucket_catalog::Expiry {
+                threshold: held("timeseriesIdleBucketExpiryMemoryUsageThreshold", 5),
+                max_count: held("timeseriesIdleBucketExpiryMaxCountPerAttempt", 3),
+            }
+        };
+        let outcomes = crate::ts_store::insert(storage, &db, &coll, batches, expiry)?;
         let mut inserted = 0usize;
         let mut errors: Vec<Document> = Vec::new();
         for index in 0..surviving.len() {

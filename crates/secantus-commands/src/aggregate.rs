@@ -707,7 +707,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // ran through its cursor stage: a `$sort` after a `$group`, or the
     // `$sort` or `$project` of a `$bucket`, `$sortByCount` or `$count`
     // (RM-360).
-    let mut sorted_after_sbe: Option<usize> = None;
+    let mut sorted_after_sbe: Option<(usize, bool)> = None;
     // Fetch the input documents + decide the remaining pipeline.
     let (ns, input, working_pipeline): (String, Vec<Document>, Vec<Bson>) = match &coll {
         Some(c) => {
@@ -1311,6 +1311,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let _engine = secantus_core::sbe::enter(false);
     // Whatever an earlier run on this thread left unread.
     secantus_core::memlimit::take_cursor_read();
+    let input_len = input.len();
     let result = run_segmented(
         input,
         &working_pipeline,
@@ -1388,9 +1389,12 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // more for the end, as the cursor stage is (measured 2026-11-18:
     // `[{$addFields}, {$sort}]` over 300 documents ticks 703 times).
     let mut ticks_left = None;
-    if let Some(between) = sorted_after_sbe
+    if let Some((between, limited)) = sorted_after_sbe
         .filter(|_| !crate::explain::order::is_uncounted() && !doc.contains_key("autocommit"))
     {
+        // A `$sort` that took in a `$limit` pulls every document it is
+        // given, however few it passes on.
+        let total = if limited { input_len } else { total };
         let (mut loaded, mut asked) = (0usize, CURSOR_STAGE_FIRST_BUFFER);
         loop {
             crate::lock_manager::let_statement_ticket_go();
@@ -7700,7 +7704,9 @@ const CURSOR_STAGE_FIRST_BUFFER: usize = 32;
 /// before a closing `$sort` when each passes on one document for each it
 /// takes (measured 8.2.11 2026-11-18: `[{$addFields}, {$sort}]` of 300
 /// documents 14 and a `getMore` of 4; `[{$project}, {$sort}]`, the
-/// `$project` in the plan, 12 and 3).
+/// `$project` in the plan, 12 and 3). The second value says a `$limit`
+/// after the `$sort` was folded into it, so the `$sort` pulled more
+/// documents than the pipeline returned.
 fn sort_after_cursor_stage(
     storage: &dyn crate::storage::Storage,
     db: &str,
@@ -7708,21 +7714,42 @@ fn sort_after_cursor_stage(
     pipeline: &[Bson],
     hint: Option<&Bson>,
     collation: Option<&secantus_core::collation::Collation>,
-) -> Option<usize> {
+) -> Option<(usize, bool)> {
     if sort_after_sbe_group(storage, db, coll, pipeline, hint, collation) {
-        return Some(0);
+        return Some((0, false));
     }
     let hoisted = crate::explain::hoist::hoist_runnable(pipeline);
     if crate::explain::sbe_pushdown(storage, db, coll, &hoisted, hint, collation).is_some() {
         return None;
     }
     let query = crate::explain::pipeline_canonical(coll, pipeline);
-    let (sort, between) = query.rest.split_last()?;
     let name = |s: &Bson| {
         s.as_document()
             .and_then(|d| d.keys().next())
             .map_or(String::new(), String::clone)
     };
+    // A `$limit` after the `$sort` folds into it (a top-k sort), which
+    // still pulls every document through the stages before it (measured
+    // 8.2.11 2026-11-27: `[{$addFields}, {$sort}, {$limit: 5}]` of 300
+    // documents 12).
+    let mut rest = query.rest.as_slice();
+    let mut limited = false;
+    if let Some((last, front)) = rest.split_last() {
+        let positive = last
+            .as_document()
+            .and_then(|d| d.get("$limit"))
+            .and_then(|l| match l {
+                Bson::Int32(n) => Some(i64::from(*n)),
+                Bson::Int64(n) => Some(*n),
+                _ => None,
+            })
+            .is_some_and(|n| n > 0);
+        if positive && front.last().is_some_and(|s| name(s) == "$sort") {
+            rest = front;
+            limited = true;
+        }
+    }
+    let (sort, between) = rest.split_last()?;
     let one_for_one = |s: &Bson| {
         matches!(
             name(s).as_str(),
@@ -7736,7 +7763,7 @@ fn sort_after_cursor_stage(
         && !crate::agg_meta::reads_sort_key(sort)
         && !crate::agg_stream::mentions_meta(sort)
         && between.iter().all(one_for_one))
-    .then_some(between.len())
+    .then_some((between.len(), limited))
 }
 
 /// Whether `pipeline` ends in a stage the classic engine runs over

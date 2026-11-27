@@ -163,6 +163,13 @@ const SETTABLE: &[(&str, ParamKind)] = &[
     // atomic beside the stored value.
     ("notablescan", ParamKind::Bool),
     ("quiet", ParamKind::Bool),
+    // The time-series bucket catalog's idle bucket expiry reads this on every
+    // insert (`bucket_catalog::Expiry`): a percentage of memory up to 100,
+    // bytes above, a long mongod coerces from a number or a bool.
+    (
+        "timeseriesIdleBucketExpiryMemoryUsageThreshold",
+        ParamKind::Int64,
+    ),
     // How many queries a second the query stats store records (RM-215):
     // 0 none, -1 every one. Applied to the store as it changes.
     ("internalQueryStatsRateLimit", ParamKind::Int32AtLeast(-1)),
@@ -678,6 +685,29 @@ pub fn parse_startup_parameter(
         return crate::admission::execution::parse_startup(name, value, test_commands, &current)
             .map(|v| (name.to_string(), v))
             .map_err(|why: String| bad(why.as_str()));
+    }
+    if name == "timeseriesIdleBucketExpiryMemoryUsageThreshold" {
+        // A long, any sign (mongod 8.2.11, 2026-11-27).
+        let digits = value.strip_prefix(['-', '+']).unwrap_or(value);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad("Did not consume whole string."));
+        }
+        let n: i64 = value.parse().map_err(|_| bad("Overflow"))?;
+        return Ok((name.to_string(), Bson::Int64(n)));
+    }
+    if name == "timeseriesIdleBucketExpiryMaxCountPerAttempt" {
+        // An int of at least 2, settable only at startup.
+        let digits = value.strip_prefix(['-', '+']).unwrap_or(value);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad("Did not consume whole string."));
+        }
+        let n: i32 = value.parse().map_err(|_| bad("Overflow"))?;
+        if n < 2 {
+            return Err(bad(&format!(
+                "Invalid value for parameter {name}: {n} is not greater than or equal to 2"
+            )));
+        }
+        return Ok((name.to_string(), Bson::Int32(n)));
     }
     if name == SBE_GROUP_BUDGET {
         // A long above 0 (mongod 8.2.11, 2026-11-18): `Did not consume
@@ -1846,6 +1876,48 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    /// The idle bucket expiry's parameters at startup (mongod 8.2.11,
+    /// measured 2026-11-27, RM-711): the threshold a long of any sign, the
+    /// count per attempt an int of at least 2.
+    #[test]
+    fn the_idle_bucket_expiry_parameters_parse_at_startup_as_mongod_does() {
+        let threshold = "timeseriesIdleBucketExpiryMemoryUsageThreshold";
+        let count = "timeseriesIdleBucketExpiryMaxCountPerAttempt";
+        assert_eq!(
+            parse_startup_parameter(&format!("{threshold}=30000"), false, &[]),
+            Ok((threshold.to_string(), Bson::Int64(30_000)))
+        );
+        assert_eq!(
+            parse_startup_parameter(&format!("{threshold}=-3"), false, &[]),
+            Ok((threshold.to_string(), Bson::Int64(-3)))
+        );
+        assert_eq!(
+            parse_startup_parameter(&format!("{count}=7"), false, &[]),
+            Ok((count.to_string(), Bson::Int32(7)))
+        );
+        for (name, value, why) in [
+            (threshold, "abc", "Did not consume whole string."),
+            (threshold, "2.5", "Did not consume whole string."),
+            (count, "abc", "Did not consume whole string."),
+            (count, "99999999999", "Overflow"),
+        ] {
+            assert_eq!(
+                parse_startup_parameter(&format!("{name}={value}"), false, &[]),
+                Err(format!("Bad value for parameter \"{name}\": {why}")),
+                "{name}={value}"
+            );
+        }
+        assert_eq!(
+            parse_startup_parameter(&format!("{count}=1"), false, &[]),
+            Err(format!(
+                "Bad value for parameter \"{count}\": Invalid value for parameter {count}: 1 is not greater than or equal to 2"
+            ))
+        );
+        // The count is startup only: a client may not change it.
+        assert!(!settable(count));
+        assert!(settable(threshold));
     }
 
     #[test]

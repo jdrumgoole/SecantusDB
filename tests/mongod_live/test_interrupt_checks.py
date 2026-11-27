@@ -40,7 +40,7 @@ tick for each document the `$sort` pulls from it, each it passes on, and
 each end found; so does a `$sort` after stages that pass one document on
 for each they take (`$addFields`, `$set`, `$unset`, `$project`,
 `$replaceRoot`, `$replaceWith`), each of them pulled once per document and
-once more for the end.
+once more for the end, a `$limit` after the `$sort` folding into it.
 
 What this server does not count yet prints no field, and is RM-360's
 remainder: plans with several candidates, the pipelines it does not model,
@@ -441,6 +441,31 @@ PIPELINES: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any], tuple[str
     "aggregate sorting after an $addFields, a first batch of none": (
         _documents(300),
         _pipeline([_ADD, {"$sort": {"q": 1, "_id": 1}}], batchSize=0),
+        _PIPELINE,
+    ),
+    # A `$sort` with a `$limit` after it, over stages that pass one
+    # document on for each: the `$limit` folds into the `$sort` (a top-k
+    # sort), which still pulls every document through the stages before it.
+    "aggregate sorting after an $addFields, limited": (
+        _documents(300),
+        _pipeline([_ADD, {"$sort": {"q": 1, "_id": 1}}, {"$limit": 5}]),
+        _PIPELINE,
+    ),
+    "aggregate sorting after an $addFields, limited past a batch": (
+        _documents(300),
+        _pipeline([_ADD, {"$sort": {"q": 1, "_id": 1}}, {"$limit": 150}], batchSize=40),
+        _PIPELINE,
+    ),
+    "aggregate sorting after a $set and $unset, limited, one buffer": (
+        _documents(20),
+        _pipeline(
+            [{"$set": {"w": 1}}, {"$unset": "a"}, {"$sort": {"y": 1, "_id": 1}}, {"$limit": 3}]
+        ),
+        _PIPELINE,
+    ),
+    "aggregate sorting after an $addFields, limited, a first batch of none": (
+        _documents(300),
+        _pipeline([_ADD, {"$sort": {"q": 1, "_id": 1}}, {"$limit": 50}], batchSize=0),
         _PIPELINE,
     ),
     "aggregate counting": (_groups(300), _pipeline([{"$count": "n"}]), _PIPELINE),

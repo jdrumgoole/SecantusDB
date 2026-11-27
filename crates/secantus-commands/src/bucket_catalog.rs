@@ -30,9 +30,14 @@
 //! keep two per bucket of that size; a bucket of fewer than 10 measurements
 //! may grow to 12 MB.
 //!
-//! Not modelled: closing idle buckets when the catalog's own memory passes
-//! `timeseriesIdleBucketExpiryMemoryUsageThreshold`. That threshold counts
-//! `mongod`'s C++ allocations, which this server does not make (backlog).
+//! The catalog's memory (`serverStatus`'s `bucketCatalog.memoryUsage`) is
+//! the bytes `mongod`'s tracking allocators charge for its structures,
+//! kept by `bucket_memory` as the exemplar (Linux x86-64) lays them out.
+//! When that memory passes `timeseriesIdleBucketExpiryMemoryUsageThreshold`
+//! a bucket opened in a stripe first expires the stripe's idle buckets
+//! (`expireIdleBuckets`): the oldest idle ones are archived, then archived
+//! ones closed, at most `timeseriesIdleBucketExpiryMaxCountPerAttempt` + 1
+//! of them.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
@@ -42,6 +47,7 @@ use bson::spec::BinarySubtype;
 use bson::{doc, Binary, Bson, Document};
 use secantus_core::bsoncolumn::{ColumnBuilder, Element};
 
+use crate::bucket_memory::{key_hash, metadata_bytes, stripe_of, BucketMem, BucketView, MemState};
 use crate::storage::Storage;
 use crate::ts_buckets::{fold, Layout, Schema};
 use crate::CommandError;
@@ -274,11 +280,36 @@ struct Bucket {
     last_time: Option<i64>,
     min: Document,
     max: Document,
+    /// What the bucket's structures allocate (`bucket_memory`).
+    mem: BucketMem,
+    /// The bucket's place in its stripe's idle list, when it is on it
+    /// (`idleListEntry`).
+    idle_since: Option<u64>,
     /// This operation's measurements for the bucket: `(input index, doc)`.
     staged: Vec<(usize, Document)>,
     staged_estimate: i32,
     new_field_names: Vec<String>,
     opened_due_to_metadata: bool,
+}
+
+impl Bucket {
+    /// Count the bucket's structures again.
+    fn refresh_mem(&mut self, mem: &mut MemState) {
+        let idle = self.idle_since.is_some();
+        let view = BucketView {
+            field_names: &self.field_names,
+            uncommitted: &self.uncommitted_field_names,
+            columns: self
+                .columns
+                .iter()
+                .map(|(n, b)| (n.as_str(), b.memory_shape()))
+                .collect(),
+            idle,
+            batch_open: !self.staged.is_empty(),
+        };
+        let now = self.mem.bytes(&view);
+        mem.bucket_resized(&mut self.mem, now);
+    }
 }
 
 /// One collection's buckets in memory.
@@ -299,6 +330,28 @@ struct Inner {
     global: ExecutionStats,
     /// `_bucketIdGenCounter`: seeded at random, one step per bucket.
     id_counter: u64,
+    /// What the catalog's structures allocate (`memoryUsage`).
+    mem: MemState,
+}
+
+/// The collection's entry, made (with its execution statistics) at its
+/// first write (`getOrInitializeExecutionStats`).
+fn coll_of<'a>(
+    collections: &'a mut HashMap<Vec<u8>, Collection>,
+    mem: &mut MemState,
+    uuid: &[u8],
+) -> &'a mut Collection {
+    if !collections.contains_key(uuid) {
+        mem.stats_added();
+    }
+    collections.entry(uuid.to_vec()).or_default()
+}
+
+/// A bucket leaves the open set.
+fn close_open(coll: &mut Collection, mem: &mut MemState, at: usize) -> Bucket {
+    let bucket = coll.open.remove(at);
+    mem.bucket_closed(&bucket.mem);
+    bucket
 }
 
 /// The server's bucket catalog (`GlobalBucketCatalog`).
@@ -334,6 +387,13 @@ impl BucketCatalog {
         if let Some(c) = inner.collections.remove(uuid) {
             let active = c.stats.get(Stat::ActiveBuckets);
             inner.global.0[Stat::ActiveBuckets as usize] -= active;
+            for b in &c.open {
+                inner.mem.bucket_closed(&b.mem);
+            }
+            for (key, _) in c.archived.keys() {
+                inner.mem.archived_removed(stripe_of(uuid, key));
+            }
+            inner.mem.stats_removed();
         }
     }
 
@@ -345,12 +405,16 @@ impl BucketCatalog {
         let Inner {
             collections,
             global,
+            mem,
             ..
         } = &mut *inner;
         let Some(c) = collections.get_mut(uuid) else {
             return;
         };
         let before = c.open.len();
+        for b in c.open.iter().filter(|b| &b.id == id) {
+            mem.bucket_closed(&b.mem);
+        }
         c.open.retain(|b| &b.id != id);
         let mut gone = (before - c.open.len()) as i64;
         let archived: Vec<_> = c
@@ -361,6 +425,7 @@ impl BucketCatalog {
             .collect();
         for k in archived {
             c.archived.remove(&k);
+            mem.archived_removed(stripe_of(uuid, &k.0));
             gone += 1;
         }
         c.stats.0[Stat::ActiveBuckets as usize] -= gone;
@@ -371,7 +436,7 @@ impl BucketCatalog {
     /// (`BucketCatalogServerStatus::generateSection`), `None` while no
     /// collection has a catalog entry, as on mongod before the first write
     /// and after the last written collection is dropped. `memoryUsage` is
-    /// reported as 0: the catalog keeps no account of its memory (RM-710).
+    /// the account `bucket_memory` keeps of `mongod`'s tracked allocations.
     pub fn server_status(&self) -> Option<Document> {
         let inner = self.lock();
         if inner.collections.is_empty() {
@@ -397,7 +462,7 @@ impl BucketCatalog {
         // commands every open bucket is idle.
         out.insert("numIdleBuckets", number(open));
         out.insert("numArchivedBuckets", number(active - open));
-        out.insert("memoryUsage", number(0));
+        out.insert("memoryUsage", number(inner.mem.total()));
         inner.global.append_to(&mut out);
         // The bucket state registry: this server clears a collection's
         // buckets at once rather than by era, so the era stays 0.
@@ -424,7 +489,7 @@ impl BucketCatalog {
 }
 
 /// A BSON value's size as an element value.
-fn value_size(v: &Bson) -> i32 {
+pub(crate) fn value_size(v: &Bson) -> i32 {
     crate::bsondoc::to_vec(&doc! {"": v.clone()})
         .map(|b| b.len() as i32 - 7)
         .unwrap_or(0)
@@ -490,6 +555,44 @@ fn cache_derived_max_size(cache_bytes: u64, active: i64) -> (i32, i32) {
 struct Env<'a> {
     layout: &'a Layout,
     cache_bytes: u64,
+    expiry: Expiry,
+}
+
+/// What the idle bucket expiry reads: the parameters
+/// `timeseriesIdleBucketExpiryMemoryUsageThreshold` (a percentage of the
+/// machine's memory up to 100, bytes above, the default when not positive)
+/// and `timeseriesIdleBucketExpiryMaxCountPerAttempt`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Expiry {
+    pub threshold: i64,
+    pub max_count: i64,
+}
+
+impl Default for Expiry {
+    fn default() -> Self {
+        Expiry {
+            threshold: 5,
+            max_count: 3,
+        }
+    }
+}
+
+impl Expiry {
+    /// `getTimeseriesIdleBucketExpiryMemoryUsageThresholdBytes`.
+    fn bytes(&self) -> i64 {
+        let value = if self.threshold <= 0 {
+            5
+        } else {
+            self.threshold
+        };
+        if value <= 100 {
+            // `getSystemMemSizeMB() * value * 10485`: about a percent.
+            return crate::hostinfo::mem_size_mb().map_or(i64::MAX, |mb| {
+                mb.saturating_mul(value).saturating_mul(10485)
+            });
+        }
+        value
+    }
 }
 
 /// `determineRolloverReason`. Takes the measurement into the bucket's
@@ -534,6 +637,8 @@ fn rollover_reason(
             return Reason::CachePressure;
         }
     }
+    // `schemaIncompatible`: the schema keeps what it took before a failure.
+    bucket.mem.schema.update(doc, env.layout.meta.as_deref());
     let held = bucket.schema.clone();
     if !bucket.schema.take(doc, env.layout) {
         bucket.schema = held;
@@ -562,6 +667,7 @@ pub(crate) struct Target<'a> {
     /// The time-series collection's name.
     pub coll: &'a str,
     pub layout: &'a Layout,
+    pub expiry: Expiry,
 }
 
 impl Target<'_> {
@@ -603,6 +709,7 @@ pub(crate) fn insert(
     let env = Env {
         layout: target.layout,
         cache_bytes: target.storage.storage_cache_bytes(),
+        expiry: target.expiry,
     };
     let mut outcomes = HashMap::new();
     let mut inner = catalog.lock();
@@ -675,9 +782,10 @@ fn stage_series(
         let Inner {
             collections,
             global,
+            mem,
             ..
         } = inner;
-        let coll = collections.entry(uuid.to_vec()).or_default();
+        let coll = coll_of(collections, mem, uuid);
         let active = global.get(Stat::ActiveBuckets);
         let mut staged_any = false;
         while let Some(m) = rest.peek() {
@@ -698,6 +806,7 @@ fn stage_series(
         if staged_any && !touched.contains(&bucket.id) {
             touched.push(bucket.id);
         }
+        bucket.refresh_mem(mem);
     }
     Ok(())
 }
@@ -717,6 +826,7 @@ fn forget_changed(
     let Inner {
         collections,
         global,
+        mem,
         ..
     } = inner;
     let Some(coll) = collections.get_mut(uuid) else {
@@ -742,7 +852,9 @@ fn forget_changed(
         if stored == Some(committed as i64) {
             continue;
         }
-        coll.open.retain(|b| b.id != id);
+        if let Some(at) = coll.open.iter().position(|b| b.id == id) {
+            close_open(coll, mem, at);
+        }
         coll.stats.0[Stat::ActiveBuckets as usize] -= 1;
         global.0[Stat::ActiveBuckets as usize] -= 1;
     }
@@ -779,6 +891,7 @@ fn try_stage(
     bucket.size += verified + estimate;
     if newly_opened {
         bucket.schema.take(&m.doc, env.layout);
+        bucket.mem.schema.update(&m.doc, env.layout.meta.as_deref());
     }
     true
 }
@@ -823,9 +936,10 @@ fn eligible_bucket(
         let Inner {
             collections,
             global,
+            mem,
             ..
         } = &mut *inner;
-        let coll = collections.entry(uuid.to_vec()).or_default();
+        let coll = coll_of(collections, mem, uuid);
         let active = global.get(Stat::ActiveBuckets);
         let mut stats = StatsRef {
             coll: &mut coll.stats,
@@ -878,6 +992,7 @@ fn decide_query(reason: Reason, allow: &mut bool) {
 fn roll_over(
     coll: &mut Collection,
     global: &mut ExecutionStats,
+    mem: &mut MemState,
     at: usize,
     reason: Reason,
 ) -> bool {
@@ -891,12 +1006,13 @@ fn roll_over(
         global,
     };
     rollover_stats(&mut stats, reason);
-    let bucket = coll.open.remove(at);
+    let bucket = close_open(coll, mem, at);
     if action(reason) == Action::Archive {
         let slot = (bucket.key.clone(), bucket.min_time);
         if let std::collections::btree_map::Entry::Vacant(e) = coll.archived.entry(slot) {
             // Archived buckets stay active (`removeBucketWithoutStats`).
             e.insert(bucket.id);
+            mem.archived_added(bucket.mem.stripe);
             return true;
         }
     }
@@ -921,9 +1037,10 @@ fn find_open_bucket(
     let Inner {
         collections,
         global,
+        mem,
         ..
     } = inner;
-    let coll = collections.entry(uuid.to_vec()).or_default();
+    let coll = coll_of(collections, mem, uuid);
     let mut none_bucket: Option<ObjectId> = None;
     let mut soft_closed: Vec<ObjectId> = Vec::new();
     let mut archived: Vec<ObjectId> = Vec::new();
@@ -940,9 +1057,13 @@ fn find_open_bucket(
         };
         let reason = coll.open[at].rollover;
         match action(reason) {
-            Action::None => none_bucket = Some(id),
+            Action::None => {
+                none_bucket = Some(id);
+                // `markBucketNotIdle`.
+                coll.open[at].idle_since = None;
+            }
             Action::HardClose => {
-                roll_over(coll, global, at, reason);
+                roll_over(coll, global, mem, at, reason);
                 decide_query(reason, allow_query);
             }
             Action::Archive | Action::SoftClose => {
@@ -954,7 +1075,7 @@ fn find_open_bucket(
                         soft_closed.push(id);
                     }
                 } else {
-                    roll_over(coll, global, at, reason);
+                    roll_over(coll, global, mem, at, reason);
                     decide_query(reason, allow_query);
                 }
             }
@@ -989,6 +1110,7 @@ fn find_open_bucket(
             env,
             &mut stats,
         );
+        bucket.refresh_mem(mem);
         if reason == Reason::None {
             return Some(at);
         }
@@ -1007,6 +1129,8 @@ fn allocate(
     m: &Measurement,
     t: i64,
 ) -> usize {
+    // `expireIdleBuckets`, before the bucket is made.
+    expire_idle(inner, stripe_of(uuid, key), env.expiry);
     let rounding = env.layout.rounding_ms;
     let rounded = t.div_euclid(rounding) * rounding;
     inner.id_counter = inner.id_counter.wrapping_add(1);
@@ -1016,15 +1140,30 @@ fn allocate(
     let Inner {
         collections,
         global,
+        mem,
         ..
     } = inner;
-    let coll = collections.entry(uuid.to_vec()).or_default();
+    let coll = coll_of(collections, mem, uuid);
     coll.stats.0[Stat::ActiveBuckets as usize] += 1;
     global.0[Stat::ActiveBuckets as usize] += 1;
+    let meta = env.layout.meta_of(&m.doc);
+    let mut bucket_mem = BucketMem::new(
+        stripe_of(uuid, key),
+        key.to_vec(),
+        metadata_bytes(env.layout.meta.as_deref().unwrap_or(""), meta.as_ref()),
+    );
+    // `buildControlMinTimestampDoc`: the summary starts with the window's
+    // start, under the time field.
+    let mut control = Document::new();
+    control.insert(
+        env.layout.time.clone(),
+        Bson::DateTime(bson::DateTime::from_millis(rounded)),
+    );
+    bucket_mem.minmax.update(&control, None);
     coll.open.push(Bucket {
         id: ObjectId::from_bytes(bytes),
         key: key.to_vec(),
-        meta: env.layout.meta_of(&m.doc),
+        meta,
         min_time: rounded,
         size: 0,
         count: 0,
@@ -1048,8 +1187,107 @@ fn allocate(
         staged_estimate: 0,
         new_field_names: Vec::new(),
         opened_due_to_metadata: false,
+        mem: bucket_mem,
+        idle_since: None,
     });
-    coll.open.len() - 1
+    let at = coll.open.len() - 1;
+    open_counted(coll, mem, at);
+    at
+}
+
+/// `expireIdleBuckets`: while the catalog's memory is over the threshold and
+/// fewer than `max_count + 1` buckets have expired, the stripe's oldest idle
+/// bucket is archived (closed, when one with its key and window is already
+/// archived), then its archived buckets closed, greatest key first.
+fn expire_idle(inner: &mut Inner, stripe: usize, expiry: Expiry) {
+    let limit = expiry.bytes();
+    let mut expired = 0i64;
+    while expired <= expiry.max_count && inner.mem.total() > limit {
+        let oldest = inner
+            .collections
+            .iter()
+            .flat_map(|(u, c)| {
+                c.open
+                    .iter()
+                    .filter(|b| b.mem.stripe == stripe)
+                    .filter_map(move |b| b.idle_since.map(|since| (since, u.clone(), b.id)))
+            })
+            .min();
+        let Some((_, owner, id)) = oldest else {
+            break;
+        };
+        let Inner {
+            collections,
+            global,
+            mem,
+            ..
+        } = inner;
+        let Some(coll) = collections.get_mut(&owner) else {
+            break;
+        };
+        let Some(at) = coll.open.iter().position(|b| b.id == id) else {
+            break;
+        };
+        // `archiveBucket`: the bucket leaves the open set and stays active
+        // as an archived one, or closes when its slot is taken.
+        let bucket = close_open(coll, mem, at);
+        let slot = (bucket.key.clone(), bucket.min_time);
+        if let std::collections::btree_map::Entry::Vacant(e) = coll.archived.entry(slot) {
+            e.insert(bucket.id);
+            mem.archived_added(bucket.mem.stripe);
+        } else {
+            coll.stats.0[Stat::ActiveBuckets as usize] -= 1;
+            global.0[Stat::ActiveBuckets as usize] -= 1;
+        }
+        let mut stats = StatsRef {
+            coll: &mut coll.stats,
+            global,
+        };
+        stats.inc(Stat::ArchivedDueToMemoryThreshold);
+        expired += 1;
+    }
+    while expired <= expiry.max_count && inner.mem.total() > limit {
+        let first = inner
+            .collections
+            .iter()
+            .flat_map(|(u, c)| {
+                c.archived
+                    .keys()
+                    .filter(|(key, _)| stripe_of(u, key) == stripe)
+                    .map(move |(key, time)| (u.clone(), key_hash(u, key), *time, key.clone()))
+            })
+            .max();
+        let Some((owner, _, time, key)) = first else {
+            break;
+        };
+        let Inner {
+            collections,
+            global,
+            mem,
+            ..
+        } = inner;
+        let Some(coll) = collections.get_mut(&owner) else {
+            break;
+        };
+        // `closeArchivedBucket`.
+        if coll.archived.remove(&(key, time)).is_some() {
+            mem.archived_removed(stripe);
+        }
+        let mut stats = StatsRef {
+            coll: &mut coll.stats,
+            global,
+        };
+        stats.add(Stat::ActiveBuckets, -1);
+        stats.inc(Stat::ClosedDueToMemoryThreshold);
+        expired += 1;
+    }
+}
+
+/// A bucket just pushed onto the open set joins the memory account.
+fn open_counted(coll: &mut Collection, mem: &mut MemState, at: usize) {
+    let bucket = &mut coll.open[at];
+    bucket.refresh_mem(mem);
+    mem.bucket_opened(&bucket.mem);
 }
 
 /// `potentiallyReopenBucket`: an archived bucket whose window holds `t`,
@@ -1070,7 +1308,7 @@ fn reopen(
     let buckets_ns = target.buckets_ns();
     let span = env.layout.span_ms;
     let archived = {
-        let coll = inner.collections.entry(uuid.to_vec()).or_default();
+        let coll = coll_of(&mut inner.collections, &mut inner.mem, uuid);
         coll.archived
             .range((key.to_vec(), i64::MIN)..=(key.to_vec(), t))
             .next_back()
@@ -1086,9 +1324,10 @@ fn reopen(
         let Inner {
             collections,
             global,
+            mem,
             ..
         } = &mut *inner;
-        let coll = collections.entry(uuid.to_vec()).or_default();
+        let coll = coll_of(collections, mem, uuid);
         let mut stats = StatsRef {
             coll: &mut coll.stats,
             global,
@@ -1104,9 +1343,10 @@ fn reopen(
         let Inner {
             collections,
             global,
+            mem,
             ..
         } = &mut *inner;
-        let coll = collections.entry(uuid.to_vec()).or_default();
+        let coll = coll_of(collections, mem, uuid);
         let mut stats = StatsRef {
             coll: &mut coll.stats,
             global,
@@ -1124,27 +1364,45 @@ fn reopen(
         return Ok(None);
     };
     *opened_due_to_metadata = false;
+    let bucket = {
+        let Inner {
+            collections,
+            global,
+            mem,
+            ..
+        } = &mut *inner;
+        let coll = coll_of(collections, mem, uuid);
+        let mut stats = StatsRef {
+            coll: &mut coll.stats,
+            global,
+        };
+        let Some(bucket) = rehydrate(&found, uuid, key, env.layout, &coll.frozen, &mut stats)
+        else {
+            return Ok(None);
+        };
+        if coll.open.iter().any(|b| b.id == bucket.id) {
+            stats.inc(Stat::DuplicateReopened);
+            return Ok(None);
+        }
+        bucket
+    };
+    // `loadBucketIntoCatalog` starts with `expireIdleBuckets`.
+    expire_idle(inner, bucket.mem.stripe, env.expiry);
     let Inner {
         collections,
         global,
+        mem,
         ..
     } = &mut *inner;
-    let coll = collections.entry(uuid.to_vec()).or_default();
+    let coll = coll_of(collections, mem, uuid);
     let mut stats = StatsRef {
         coll: &mut coll.stats,
         global,
     };
-    let Some(bucket) = rehydrate(&found, key, env.layout, &coll.frozen, &mut stats) else {
-        return Ok(None);
-    };
-    if coll.open.iter().any(|b| b.id == bucket.id) {
-        stats.inc(Stat::DuplicateReopened);
-        return Ok(None);
-    }
-    // `loadBucketIntoCatalog`.
     let slot = (key.to_vec(), bucket.min_time);
     if coll.archived.remove(&slot).is_some() {
         stats.add(Stat::ActiveBuckets, -1);
+        mem.archived_removed(bucket.mem.stripe);
     }
     if let Some(at) = coll
         .open
@@ -1153,7 +1411,7 @@ fn reopen(
     {
         stats.inc(Stat::ClosedDueToReopening);
         if coll.open[at].count == coll.open[at].committed {
-            coll.open.remove(at);
+            close_open(coll, mem, at);
             coll.stats.0[Stat::ActiveBuckets as usize] -= 1;
             global.0[Stat::ActiveBuckets as usize] -= 1;
         } else {
@@ -1167,7 +1425,9 @@ fn reopen(
     stats.inc(Stat::Reopened);
     stats.inc(Stat::ActiveBuckets);
     coll.open.push(bucket);
-    Ok(Some(coll.open.len() - 1))
+    let at = coll.open.len() - 1;
+    open_counted(coll, mem, at);
+    Ok(Some(at))
 }
 
 fn decode(raw: &[u8]) -> Result<Document, CommandError> {
@@ -1277,6 +1537,7 @@ fn query_candidate(
 /// `None` when it cannot be reopened.
 fn rehydrate(
     doc: &Document,
+    uuid: &[u8],
     key: &[u8],
     layout: &Layout,
     frozen: &HashSet<ObjectId>,
@@ -1376,6 +1637,17 @@ fn rehydrate(
     }
     let size = crate::bsondoc::to_vec(doc).map_or(0, |b| b.len() as i32);
     let version = control.get("version").and_then(crate::util::as_i64);
+    // `generateMinMaxFromBucketDoc` and `generateSchemaFromBucketDoc`: the
+    // control document's min then max, the meta field not among them.
+    let mut bucket_mem = BucketMem::new(
+        stripe_of(uuid, key),
+        key.to_vec(),
+        metadata_bytes(layout.meta.as_deref().unwrap_or(""), meta.as_ref()),
+    );
+    bucket_mem.minmax.update(min, None);
+    bucket_mem.minmax.update(max, None);
+    bucket_mem.schema.update(min, None);
+    bucket_mem.schema.update(max, None);
     Some(Bucket {
         id: *id,
         key: key.to_vec(),
@@ -1400,6 +1672,8 @@ fn rehydrate(
         staged_estimate: 0,
         new_field_names: Vec::new(),
         opened_due_to_metadata: false,
+        mem: bucket_mem,
+        idle_since: None,
     })
 }
 
@@ -1521,9 +1795,10 @@ fn commit(
     let Inner {
         collections,
         global,
+        mem,
         ..
     } = inner;
-    let coll = collections.entry(uuid.to_vec()).or_default();
+    let coll = coll_of(collections, mem, uuid);
     let Some(at) = coll.open.iter().position(|b| &b.id == id) else {
         return Ok(());
     };
@@ -1549,6 +1824,7 @@ fn commit(
     let mut failed: Option<CommandError> = None;
     for (_, d) in &staged {
         update_min_max(bucket, d, layout);
+        bucket.mem.minmax.update(d, layout.meta.as_deref());
         if let Err(e) = insert_one(bucket, d, layout) {
             failed = Some(e);
             break;
@@ -1633,15 +1909,20 @@ fn commit(
             for (index, _) in &staged {
                 outcomes.insert(*index, Ok(()));
             }
+            // `markBucketIdle`.
+            bucket.idle_since = (bucket.rollover == Reason::None
+                && bucket.count == bucket.committed)
+                .then(|| mem.next_idle());
+            bucket.refresh_mem(mem);
             let reason = bucket.rollover;
             if action(reason) != Action::None {
-                roll_over(coll, global, at, reason);
+                roll_over(coll, global, mem, at, reason);
             }
         }
         Err(e) => {
             // The write failed: the bucket leaves the catalog (`abort`), and
             // is reopened from what is stored when it is next wanted.
-            coll.open.remove(at);
+            close_open(coll, mem, at);
             coll.stats.0[Stat::ActiveBuckets as usize] -= 1;
             global.0[Stat::ActiveBuckets as usize] -= 1;
             if e.code == 112 && e.errmsg == BUCKET_REMOVED {
