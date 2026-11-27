@@ -27350,17 +27350,29 @@ impl PgHandler {
                     Some(_) => None,
                     None => Some(self.relation_oids().unwrap_or_default()),
                 };
-                for t in defs.iter() {
+                // The definitions to read: keyed, only those of the names
+                // the oid can be, each found through the version's name
+                // index, in the definitions' own order. Walking every
+                // definition to compare its name cost about 0.7 ms at 3,200
+                // tables on CI's x86_64 runner (RP-1100).
+                let candidates: Vec<&Arc<TableDef>> = match &named {
+                    Some((names, _)) => {
+                        let mut at: Vec<usize> = names
+                            .iter()
+                            .filter_map(|n| self.table_def_position(&defs, n))
+                            .collect();
+                        at.sort_unstable();
+                        at.dedup();
+                        at.into_iter().map(|p| &defs[p]).collect()
+                    }
+                    None => defs.iter().collect(),
+                };
+                for t in candidates {
                     let relid = match (&named, &oids) {
-                        (Some((names, k)), _) => {
-                            if !names.iter().any(|n| *n == t.name) {
-                                continue;
-                            }
-                            match self.relation_oid(&t.name) {
-                                Some(oid) if oid == *k => oid,
-                                _ => continue,
-                            }
-                        }
+                        (Some((_, k)), _) => match self.relation_oid(&t.name) {
+                            Some(oid) if oid == *k => oid,
+                            _ => continue,
+                        },
                         (None, Some(oids)) => Self::oid_in(oids, &t.name).unwrap_or(0),
                         (None, None) => continue,
                     };
@@ -53698,9 +53710,15 @@ impl PgHandler {
     /// reads one `pg_class` row through its name index, else by a walk
     /// (RP-1073).
     fn table_def_named<'a>(&self, defs: &'a TableDefs, name: &str) -> Option<&'a Arc<TableDef>> {
+        self.table_def_position(defs, name).map(|i| &defs[i])
+    }
+
+    /// The place in `defs` of the definition named `name`, found as
+    /// [`Self::table_def_named`] finds it.
+    fn table_def_position(&self, defs: &TableDefs, name: &str) -> Option<usize> {
         match self.table_names_index(defs) {
-            Some(index) => index.position(name).map(|i| &defs[i]),
-            None => defs.iter().find(|d| d.name == name),
+            Some(index) => index.position(name),
+            None => defs.iter().position(|d| d.name == name),
         }
     }
 
