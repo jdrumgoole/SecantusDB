@@ -1080,12 +1080,16 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       does (RM-325's fix), and while the table stays in that engine's cache
       both report the 4096 bytes WiredTiger creates its file with. Past
       about 14 MB mongod writes pages out, the same every run: 73728 bytes
-      for 28 MB, 204800 for 60 MB (mongod 8.2.11, 2026-11-13). Its tables
-      are zstd-compressed at level -7 (`spillWiredTigerBlockCompressor`),
-      which the vendored WiredTiger is not built with, and it is WiredTiger
-      12.0; this server's uncompressed table leaves its file at 4096 or
-      writes megabytes (2420736 at 60 MB), as its eviction threads happen
-      to run. Found 2026-11-13 working RM-325.
+      for 28 MB, 204800 for 60 MB (mongod 8.2.11, 2026-11-13). The tables
+      are zstd at level -7 on both sides since 2026-11-27 (the open config
+      is mongod's logged one), and this server now stays at 4096 every run.
+      The rest is WiredTiger's eviction: on the 28 MB spill both engines
+      force-evict pages over `memory_page_max=10m`, but mongod's WiredTiger
+      12.0 reconciles 2 of them to the file (`bytes written from cache`
+      1885779, `maximum page size seen at eviction` 10493783), while the
+      vendored 7.0.33 splits its 6 in memory (12180 bytes written, max page
+      size 0). Closing it means 12.0's eviction for the spill engine, a
+      vendoring decision for Joe. Found 2026-11-13 working RM-325.
       Verify: tests/backlog/test_rm_found_2026_11_13_rm325.py::test_a_window_spill_the_engine_writes_out_is_mongods_size
       Backlog-ID: RM-611
 - [ ] **An upsert's field order sometimes repeats for all twelve
