@@ -3525,6 +3525,15 @@ impl PgHandler {
         {
             return None;
         }
+        // A WHERE equality fixing the column puts a constant in its
+        // equivalence class, which makes the pathkey redundant
+        // (`pathkey_is_redundant`): PostgreSQL sorts nothing (RP-1119).
+        if j.filter
+            .iter()
+            .any(|p| p.alias == *alias && p.col == *column && p.op == secantus_pgplan::JoinOp::Eq)
+        {
+            return None;
+        }
         let table = if j.left.1 == *alias {
             &j.left.0
         } else if j.right.1 == *alias {
@@ -3541,6 +3550,104 @@ impl PgHandler {
             return None;
         }
         Some(Some((alias.as_str(), column.as_str())))
+    }
+
+    /// [`Self::narrow_sort_column`] for a join planned as joined rows
+    /// (RP-1119): an ORDER BY of one column of a two-table join kept above
+    /// it (`order by x` for `e.b as x`, `order by 1`, a comma join), whose
+    /// key is the joined-row key `alias<SEP>column`. `Some` for a column
+    /// no join clause names and no index of its table leads with: the
+    /// select with that ORDER BY cleared, which prices the join below the
+    /// Sort -- the column is still among the keys the rows above the join
+    /// read (`JoinRows::needed`), so the join's width counts it as
+    /// PostgreSQL's resjunk entry. `None` for any other ORDER BY, and for a
+    /// select with none.
+    pub(crate) fn joined_sort_select(
+        &self,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<secantus_pgplan::Select> {
+        use secantus_pgplan::joins::JoinNode;
+        use secantus_pgplan::Statement;
+        let sub = sel.sub.as_ref()?;
+        let Statement::JoinRows(j) = sub.plan.as_ref() else {
+            return None;
+        };
+        let [k] = sel.order.as_slice() else {
+            return None;
+        };
+        let default_nulls = if k.ascending {
+            secantus_pgplan::Nulls::Last
+        } else {
+            secantus_pgplan::Nulls::First
+        };
+        if sel.join.is_some()
+            || k.expr.is_some()
+            || k.jsonb
+            || k.bpchar
+            || k.nulls != default_nulls
+            || !j.needed.contains(&k.field)
+        {
+            return None;
+        }
+        let JoinNode::Join {
+            left,
+            right,
+            equi,
+            expr_keys,
+            ..
+        } = &j.tree
+        else {
+            return None;
+        };
+        // A join key -- an ON's, a comma join's WHERE equality's, or a bare
+        // column beside an expression -- is the order a merge join yields.
+        let names = |(l, r): &(String, String)| *l == k.field || *r == k.field;
+        if equi.iter().any(names)
+            || j.where_equalities.iter().any(names)
+            || expr_keys.iter().any(|e| {
+                [&e.left_column, &e.right_column]
+                    .iter()
+                    .any(|c| c.as_deref() == Some(k.field.as_str()))
+            })
+        {
+            return None;
+        }
+        // The leaf of a stored table the key is a column of.
+        let leaf = [left.as_ref(), right.as_ref()].into_iter().find_map(|n| {
+            let JoinNode::Leaf { plan, columns, .. } = n else {
+                return None;
+            };
+            let (_, out) = columns.iter().find(|(key, _)| *key == k.field)?;
+            let Statement::Select(leaf) = plan.as_ref() else {
+                return None;
+            };
+            let (_, field) = leaf.columns.iter().find(|(o, _)| o == out)?;
+            Some((
+                leaf.table.clone(),
+                field.clone(),
+                filter_names(&leaf.filter, field),
+            ))
+        });
+        let (table, field, filtered) = leaf?;
+        // A WHERE on the column may fix it to a constant, whose class
+        // makes the pathkey redundant (`pathkey_is_redundant`) and leaves
+        // PostgreSQL nothing to sort: not priced.
+        if filtered || filter_names(&sel.filter, &k.field) {
+            return None;
+        }
+        let def = self.lookup(&table)?;
+        let column = def.columns.iter().find(|c| c.field() == field)?;
+        let attnum = i32::from(def.attnum_of(&column.name)?);
+        if self
+            .index_relations()
+            .iter()
+            .any(|ix| ix.table.name == table && ix.keys.first() == Some(&attnum))
+        {
+            return None;
+        }
+        let mut cleared = sel.clone();
+        cleared.order.clear();
+        Some(cleared)
     }
 
     /// [`Self::hash_join_estimate`] for a two-table inner join planned on
@@ -3827,7 +3934,6 @@ impl PgHandler {
         if sel.sub.is_some()
             || sel.series.is_some()
             || !sel.windows.is_empty()
-            || !sel.order.is_empty()
             || sel.limit.is_some()
             || sel.offset != 0
             || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
@@ -3837,12 +3943,17 @@ impl PgHandler {
             || j.left_join
             || j.left_sub.is_some()
             || j.right_sub.is_some()
-            || j.order.is_some()
             || j.exprs.iter().any(Option::is_some)
             || j.left.1 == j.right.1
         {
             return None;
         }
+        // An ORDER BY column no path yields in order (RP-1119): a Sort
+        // over the Nested Loop, the column a resjunk entry of its side's
+        // where the select list does not take it. Any other ORDER BY --
+        // a join key, which the constant's class makes redundant
+        // (`pathkey_is_redundant`), included -- stays unpriced.
+        let order = self.narrow_sort_column(sel)?;
         let (a, b) = j.on.as_ref()?;
         let (implied, by) = self.narrow_with_implied(j)?;
         if !matches!(by, crate::NarrowImplied::NoJoinClause) {
@@ -3858,12 +3969,18 @@ impl PgHandler {
                     return None;
                 };
                 let def = self.lookup(table)?;
-                let above: Vec<String> = j
+                let mut above: Vec<String> = j
                     .columns
                     .iter()
                     .filter(|(_, side, _)| side == alias)
                     .map(|(_, _, c)| def.field_of(c))
                     .collect::<Option<_>>()?;
+                if let Some((_, c)) = order.filter(|(a, _)| a == alias) {
+                    let f = def.field_of(c)?;
+                    if !above.contains(&f) {
+                        above.push(f);
+                    }
+                }
                 let mut read = above.clone();
                 let field = def.field_of(key)?;
                 if !read.contains(&field) {

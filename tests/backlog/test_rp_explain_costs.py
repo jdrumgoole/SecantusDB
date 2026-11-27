@@ -4415,7 +4415,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "an order by an output alias over a join prices its sort": (
-        "RP-1119",
+        "RP-1119:fixed",
         _ANALYSED,
         "explain select e.b as x, k.b from e join k on e.a = k.a order by x",
         [
@@ -4429,7 +4429,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "an order by over a join a where fixes prices its sort": (
-        "RP-1119",
+        "RP-1119:fixed",
         _ANALYSED,
         "explain select e.b, k.b from e join k on e.a = k.a where k.a = 5 order by e.b",
         [
@@ -4440,6 +4440,153 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Filter: (a = 5)",
             "        ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
             "              Index Cond: (a = 5)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1119): an ORDER BY
+    # kept above joined rows -- an ordinal, a comma join, a column the
+    # select list does not take, a LEFT join's nullable side, a filtered
+    # side -- and over a Nested Loop a WHERE constant leaves, each
+    # `cost_sort` over the join's cheapest path.
+    "an order by an ordinal over a join prices its sort": (
+        "RP-1119:fixed",
+        _ANALYSED,
+        "explain select e.b, k.b from e join k on e.a = k.a order by 1",
+        [
+            "Sort  (cost=94.97..97.47 rows=1000 width=6)",
+            "  Sort Key: e.b",
+            "  ->  Hash Join  (cost=27.50..45.14 rows=1000 width=6)",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "an order by over a comma join prices its sort": (
+        "RP-1119:fixed",
+        _ANALYSED,
+        "explain select k.b from e, k where e.a = k.a order by e.b desc",
+        [
+            "Sort  (cost=94.97..97.47 rows=1000 width=6)",
+            "  Sort Key: e.b DESC",
+            "  ->  Hash Join  (cost=27.50..45.14 rows=1000 width=6)",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "an order by the nullable side over joined rows prices its sort": (
+        "RP-1119:fixed",
+        _ANALYSED,
+        "explain select e.b as x from e left join k on e.a = k.a order by k.b",
+        [
+            "Sort  (cost=94.97..97.47 rows=1000 width=6)",
+            "  Sort Key: k.b",
+            "  ->  Hash Left Join  (cost=27.50..45.14 rows=1000 width=6)",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "an order by over filtered joined rows prices its sort": (
+        "RP-1119:fixed",
+        _ANALYSED,
+        "explain select e.b as x, k.b from e join k on e.a = k.a where e.b > 'v1' order by k.b",
+        [
+            "Sort  (cost=85.69..87.69 rows=800 width=6)",
+            "  Sort Key: k.b",
+            "  ->  Hash Join  (cost=27.50..47.11 rows=800 width=6)",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=800 width=7)",
+            "              Filter: (b > 'v1'::text)",
+            "        ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "an order by over a comma join a where fixes prices its sort": (
+        "RP-1119:fixed",
+        _ANALYSED,
+        "explain select e.b, k.b from e, k where e.a = k.a and k.a = 5 order by e.b",
+        [
+            "Sort  (cost=25.81..25.82 rows=1 width=6)",
+            "  Sort Key: e.b",
+            "  ->  Nested Loop  (cost=0.28..25.80 rows=1 width=6)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "              Filter: (a = 5)",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "              Index Cond: (a = 5)",
+        ],
+    ),
+    "an order by a column not selected over a join a where fixes": (
+        "RP-1119:fixed",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a = k.a where k.a = 5 order by k.b desc",
+        [
+            "Sort  (cost=25.81..25.82 rows=1 width=6)",
+            "  Sort Key: k.b DESC",
+            "  ->  Nested Loop  (cost=0.28..25.80 rows=1 width=6)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "              Filter: (a = 5)",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "              Index Cond: (a = 5)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1119): a WHERE constant in the ORDER BY column's equivalence class
+    # makes its pathkey redundant (`pathkey_is_redundant`), so no Sort.
+    "an order by a column a where fixes sorts nothing": (
+        "RP-1172",
+        _ANALYSED,
+        "explain select e.b, k.b from e join k on e.a = k.a where e.b = 'v1' order by e.b",
+        [
+            "Hash Join  (cost=18.75..38.50 rows=100 width=6)",
+            "  Hash Cond: (k.a = e.a)",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=17.50..17.50 rows=100 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=7)",
+            "              Filter: (b = 'v1'::text)",
+        ],
+    ),
+    "an order by an alias a where fixes sorts nothing": (
+        "RP-1172",
+        _ANALYSED,
+        "explain select e.b as x, k.b from e join k on e.a = k.a where e.b = 'v1' order by x",
+        [
+            "Hash Join  (cost=18.75..38.50 rows=100 width=6)",
+            "  Hash Cond: (k.a = e.a)",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=17.50..17.50 rows=100 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=7)",
+            "              Filter: (b = 'v1'::text)",
+        ],
+    ),
+    "an order by a join key a where fixes sorts nothing": (
+        "RP-1172",
+        _ANALYSED,
+        "explain select e.b, k.b from e join k on e.a = k.a where k.a = 5 order by k.a",
+        [
+            "Nested Loop  (cost=0.28..25.80 rows=1 width=10)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "        Filter: (a = 5)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = 5)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1119): the Hash of a comma join's inner side.
+    "analyze of a comma join counts its hash table's memory": (
+        "RP-1173",
+        _ANALYSED,
+        "explain (analyze, timing off, summary off, costs off)"
+        " select e.b, k.b from e, k where e.a = k.a",
+        [
+            "Hash Join (actual rows=1000 loops=1)",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e (actual rows=1000 loops=1)",
+            "  ->  Hash (actual rows=1000 loops=1)",
+            "        Buckets: 1024  Batches: 1  Memory Usage: 48kB",
+            "        ->  Seq Scan on k (actual rows=1000 loops=1)",
         ],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966).
