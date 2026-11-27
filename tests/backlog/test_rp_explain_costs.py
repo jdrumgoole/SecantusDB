@@ -4138,7 +4138,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-1058): `e.a`,
     # `(k.a - 1)` and `k.a` are one equivalence class, which hashes on
-    # its column members and filters `k` by the rest.
+    # its column members and filters `k` by the rest. It was an unpriced
+    # Hash Join on both clauses (RP-1117).
     "an expression key sharing a column with a column pair joins its class": (
         "RP-1117",
         _ANALYSED,
@@ -4150,6 +4151,178 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Hash  (cost=20.00..20.00 rows=5 width=4)",
             "        ->  Seq Scan on k  (cost=0.00..20.00 rows=5 width=4)",
             "              Filter: ((a - 1) = a)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (RP-1117): the clauses in the other
+    # order add `k.a` to the class first, so the restriction reads it
+    # first.
+    "an expression key after its column pair restricts in class order": (
+        "RP-1117",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a = k.a and e.a = k.a - 1",
+        [
+            "Hash Join  (cost=20.06..37.70 rows=5 width=3)",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=20.00..20.00 rows=5 width=4)",
+            "        ->  Seq Scan on k  (cost=0.00..20.00 rows=5 width=4)",
+            "              Filter: (a = (a - 1))",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (RP-1117): no column pair, so the join
+    # clause is the first expression member, scoring one plain column; it
+    # was an unpriced Nested Loop on both clauses.
+    "two expression keys sharing a column hash on the first": (
+        "RP-1117",
+        _ANALYSED,
+        "explain select e.b from e join e e2 on e.a = e2.a + 1 and e.a = e2.a * 2",
+        [
+            "Hash Join  (cost=22.56..42.61 rows=5 width=3)",
+            "  Hash Cond: (e.a = (e2.a + 1))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=22.50..22.50 rows=5 width=4)",
+            "        ->  Seq Scan on e e2  (cost=0.00..22.50 rows=5 width=4)",
+            "              Filter: ((a + 1) = (a * 2))",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (RP-1117): the restricted `e` is the
+    # hashed side.
+    "an expression class restricting the left table hashes it": (
+        "RP-1117",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a - 1 = k.a and e.a = k.a",
+        [
+            "Hash Join  (cost=20.06..38.86 rows=5 width=3)",
+            "  Hash Cond: (k.a = e.a)",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
+            "  ->  Hash  (cost=20.00..20.00 rows=5 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..20.00 rows=5 width=7)",
+            "              Filter: ((a - 1) = a)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (RP-1117): four members, two
+    # restrictions of `k`, cheapest first (`order_qual_clauses`).
+    "an expression class of four members orders its restrictions by cost": (
+        "RP-1117",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a = k.a + 1 and e.a = k.a * 2 and e.a = k.a",
+        [
+            "Hash Join  (cost=27.51..45.15 rows=1 width=3)",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=27.50..27.50 rows=1 width=4)",
+            "        ->  Seq Scan on k  (cost=0.00..27.50 rows=1 width=4)",
+            "              Filter: (((a * 2) = a) AND ((a + 1) = (a * 2)))",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (RP-1117): a text class.
+    "a text expression key sharing a column joins its class": (
+        "RP-1117",
+        _ANALYSED,
+        "explain select e.b from e join k on e.b = k.b || 'x' and e.b = k.b",
+        [
+            "Hash Join  (cost=20.06..48.81 rows=500 width=3)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=3)",
+            "  ->  Hash  (cost=20.00..20.00 rows=5 width=3)",
+            "        ->  Seq Scan on k  (cost=0.00..20.00 rows=5 width=3)",
+            "              Filter: ((b || 'x'::text) = b)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (RP-1117): VERBOSE prefixes the
+    # restriction, and the join clause makes `k` inner unique.
+    "an expression class under verbose": (
+        "RP-1117",
+        _ANALYSED,
+        "explain verbose select e.b from e join k on e.a = k.a - 1 and e.a = k.a",
+        [
+            "Hash Join  (cost=20.06..37.70 rows=5 width=3)",
+            "  Output: e.b",
+            "  Inner Unique: true",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on public.e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        Output: e.a, e.b",
+            "  ->  Hash  (cost=20.00..20.00 rows=5 width=4)",
+            "        Output: k.a",
+            "        ->  Seq Scan on public.k  (cost=0.00..20.00 rows=5 width=4)",
+            "              Output: k.a",
+            "              Filter: ((k.a - 1) = k.a)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (found while working RP-1117): the
+    # WHERE's conjunct and the class's restriction filter `k` together.
+    "an expression class beside a where restricts its side by both": (
+        "RP-1171",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a = k.a - 1 and e.a = k.a where k.b = 'v1'",
+        [
+            "Hash Join  (cost=22.51..40.15 rows=1 width=3)",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=22.50..22.50 rows=1 width=4)",
+            "        ->  Seq Scan on k  (cost=0.00..22.50 rows=1 width=4)",
+            "              Filter: ((b = 'v1'::text) AND ((a - 1) = a))",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (found while working RP-1117).
+    "an expression class beside an on inequality keeps it the join filter": (
+        "RP-1171",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a = k.a - 1 and e.a = k.a and e.b < k.b",
+        [
+            "Hash Join  (cost=20.06..37.69 rows=2 width=3)",
+            "  Hash Cond: (e.a = k.a)",
+            "  Join Filter: (e.b < k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=20.00..20.00 rows=5 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..20.00 rows=5 width=7)",
+            "              Filter: ((a - 1) = a)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (found while working RP-1117).
+    "an aggregate over an expression class prices its join": (
+        "RP-1171",
+        _ANALYSED,
+        "explain select count(*) from e join k on e.a = k.a - 1 and e.a = k.a",
+        [
+            "Aggregate  (cost=37.71..37.72 rows=1 width=8)",
+            "  ->  Hash Join  (cost=20.06..37.70 rows=5 width=0)",
+            "        Hash Cond: (e.a = k.a)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+            "        ->  Hash  (cost=20.00..20.00 rows=5 width=4)",
+            "              ->  Seq Scan on k  (cost=0.00..20.00 rows=5 width=4)",
+            "                    Filter: ((a - 1) = a)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (found while working RP-1117): a comma
+    # join's WHERE makes the same class as an ON.
+    "a comma join's expression equality joins its class": (
+        "RP-1171",
+        _ANALYSED,
+        "explain select e.b from e, k where e.a = k.a - 1 and e.a = k.a",
+        [
+            "Hash Join  (cost=20.06..37.70 rows=5 width=3)",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=20.00..20.00 rows=5 width=4)",
+            "        ->  Seq Scan on k  (cost=0.00..20.00 rows=5 width=4)",
+            "              Filter: ((a - 1) = a)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (found while working RP-1117): both
+    # sides restricted to 5 rows, a Materialize loop is cheapest.
+    "an expression class restricting both sides nests loops": (
+        "RP-1171",
+        _ANALYSED,
+        "explain select e.b from e join k on e.a = k.a + 1 and e.a - 1 = k.a and e.a = k.a",
+        [
+            "Nested Loop  (cost=0.00..40.39 rows=1 width=3)",
+            "  Join Filter: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..20.00 rows=5 width=7)",
+            "        Filter: (a = (a - 1))",
+            "  ->  Materialize  (cost=0.00..20.02 rows=5 width=4)",
+            "        ->  Seq Scan on k  (cost=0.00..20.00 rows=5 width=4)",
+            "              Filter: ((a + 1) = a)",
         ],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-966).
@@ -10915,6 +11088,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1117",
         "RP-1108",
         "RP-1104",
         "RP-1103",

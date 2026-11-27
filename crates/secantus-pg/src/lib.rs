@@ -48990,6 +48990,24 @@ impl PgHandler {
                         .collect(),
                     _ => options.join_conds.clone(),
                 };
+                // A join whose expression key shares a member with another
+                // clause hashes on its classes' clauses, and restricts a
+                // side by the rest (RP-1117).
+                // Its restrictions are attached after VERBOSE's columns,
+                // which reads a scan's Filter as its WHERE's.
+                let mut join_conds = join_conds;
+                let mut class_filters = Vec::new();
+                if let (Statement::Select(sel), [on]) = (inner.as_ref(), join_conds.as_mut_slice())
+                {
+                    if let Some((classes, l, r)) = scan_estimate::shared_join_classes(sel) {
+                        if let Some((cond, filters)) =
+                            explain::class_join_texts(on, &classes, (l, r))
+                        {
+                            *on = cond;
+                            class_filters = filters;
+                        }
+                    }
+                }
                 explain::attach_join_conds(&mut tree, &join_conds, &options.join_cond_splits);
                 if class_replaces_where_joins {
                     // Each conjunct over more than one table is one of
@@ -49010,6 +49028,7 @@ impl PgHandler {
                 explain::attach_verbose(&mut tree, &options.verbose_scan);
                 explain::attach_verbose_join(&mut tree, &options.verbose_join);
                 explain::attach_verbose_chain(&mut tree, &options.verbose_chain);
+                explain::attach_scan_filters(&mut tree, &class_filters, options.verbose);
                 // The index tuples ANALYZE's scans read, counted before the
                 // statement runs: a scan marks the entries it finds dead to
                 // all as it goes (`_bt_killitems`), and a count taken after it
