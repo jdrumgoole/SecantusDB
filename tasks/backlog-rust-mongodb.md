@@ -2761,6 +2761,25 @@ touched:
   such, not as RED. Both batch landers (pg-batch too) use these scripts.
   Verify: none -- tooling; reproduce by running wait_ci.sh with the network down for one call
   Backlog-ID: RM-825
+- [ ] **CI's `apt-install` action fails on a third-party apt source that
+  refuses every attempt (2026-11-27).** The runner image ships
+  `packages.microsoft.com/ubuntu/26.04/prod` in `/etc/apt/sources.list.d/`,
+  and on some runs it answers `403 Forbidden` to `InRelease` ("The
+  repository ... is no longer signed"). `apt-get update` then exits 100
+  on all three of `.github/actions/apt-install`'s attempts ("apt-get
+  update exited 100; giving up after 3 attempts") and the job fails in
+  its toolchain step before any test runs, while the Ubuntu archive and
+  repo.mongodb.org answer fine. Seen twice: rm-batch PR #3073 (run
+  45966663001, `pg-oracle (backlog)`) and pg-batch PR #3080 (8f45d44a,
+  run 45998998087, job 140505550026, `mdb-binary (live)`); the same jobs
+  pass an hour apart, so the 403 comes and goes. The retries are built
+  for a stalled Ubuntu mirror, not for a source that refuses. No job
+  installs from Microsoft's repository: move that source aside before
+  `apt-get update` in the action (or treat an update failure confined to
+  sources no job needs as non-fatal), so a refusal there cannot fail a
+  job. Both batch landers read this failure as RED.
+  Verify: none -- CI infrastructure; reproduce by adding a source that answers 403 to a runner's sources.list.d
+  Backlog-ID: RM-835
 - [ ] **The profiler's level-two test fails when its `find` touches the
   disk or waits on a WiredTiger lock.** `profiler_wt.rs`'s
   `level_two_writes_each_operation_in_mongods_shape` compares a `find`
