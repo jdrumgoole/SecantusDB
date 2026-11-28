@@ -493,7 +493,16 @@ fn domain_name(parts: &[pg_query::protobuf::Node]) -> String {
 
 /// `CREATE DOMAIN name AS type [constraints]`.
 pub(crate) fn plan_create_domain(c: &pg_query::protobuf::CreateDomainStmt) -> Result<Statement> {
-    let name = domain_name(&c.domainname);
+    // An unqualified name lands in the path's first schema
+    // (`QualifiedNameGetCreationNamespace`), kept as `schema.name` as a
+    // qualified one is.
+    let name = match c.domainname.as_slice() {
+        [only] => match (only.node.as_ref(), crate::schemas::creation_schema()?) {
+            (Some(N::String(s)), schema) if schema != "public" => format!("{schema}.{}", s.sval),
+            _ => domain_name(&c.domainname),
+        },
+        _ => domain_name(&c.domainname),
+    };
     let tn = c
         .type_name
         .as_ref()

@@ -641,52 +641,62 @@ pub fn resolve_type_names(node: &mut N) -> Result<()> {
             (None, _) => true,
         }
     };
-    let resolve = |tn: &mut pg_query::protobuf::TypeName| -> Result<()> {
-        if tn.pct_type {
-            return Ok(());
-        }
-        // `pg_temp.t` is the session's temporary schema's `t`
-        // (`LookupExplicitNamespace`), keyed under the schema's own name.
-        if let (Some(t), [first, _]) = (temp.as_deref(), tn.names.as_slice()) {
-            if matches!(first.node.as_ref(), Some(N::String(s)) if s.sval == "pg_temp") {
-                tn.names[0] = schema_node(t);
-            }
-            return Ok(());
-        }
-        if tn.names.len() != 1 {
-            return Ok(());
-        }
-        let Some(N::String(name)) = tn.names[0].node.as_ref() else {
-            return Ok(());
-        };
-        let name = name.sval.clone();
-        // The temporary schema is searched ahead of `pg_catalog` unless the
-        // path places `pg_temp` after it (`recomputeNamespacePath`), so a
-        // temporary row type hides a built-in of its name.
-        if let Some(t) = temp.as_deref() {
-            if temp_before_catalog && crate::column_type_exists(&relation_key(t, &name)) {
-                tn.names.insert(0, schema_node(t));
+    // `hidden_is_error`: a type the path does not reach is 42704 (a
+    // column's, a cast's); a DDL statement's object only takes the schema
+    // the path finds, and leaves "does not exist" (or IF EXISTS's notice)
+    // to the statement.
+    let resolve_with =
+        |tn: &mut pg_query::protobuf::TypeName, hidden_is_error: bool| -> Result<()> {
+            if tn.pct_type {
                 return Ok(());
             }
-        }
-        if crate::pgtypes::is_builtin_type(&name) {
-            return Ok(());
-        }
-        if let Some(schema) = type_schema_of(&name) {
-            if schema != "public" {
-                tn.names.insert(0, schema_node(&schema));
+            // `pg_temp.t` is the session's temporary schema's `t`
+            // (`LookupExplicitNamespace`), keyed under the schema's own name.
+            if let (Some(t), [first, _]) = (temp.as_deref(), tn.names.as_slice()) {
+                if matches!(first.node.as_ref(), Some(N::String(s)) if s.sval == "pg_temp") {
+                    tn.names[0] = schema_node(t);
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-        if !public_on_path && AS_SENT.with(std::cell::Cell::get) && crate::column_type_exists(&name)
-        {
-            crate::set_error_location(tn.location);
-            return Err(Error::UndefinedObject(format!(
-                "type \"{name}\" does not exist"
-            )));
-        }
-        Ok(())
-    };
+            if tn.names.len() != 1 {
+                return Ok(());
+            }
+            let Some(N::String(name)) = tn.names[0].node.as_ref() else {
+                return Ok(());
+            };
+            let name = name.sval.clone();
+            // The temporary schema is searched ahead of `pg_catalog` unless the
+            // path places `pg_temp` after it (`recomputeNamespacePath`), so a
+            // temporary row type hides a built-in of its name.
+            if let Some(t) = temp.as_deref() {
+                if temp_before_catalog && crate::column_type_exists(&relation_key(t, &name)) {
+                    tn.names.insert(0, schema_node(t));
+                    return Ok(());
+                }
+            }
+            if crate::pgtypes::is_builtin_type(&name) {
+                return Ok(());
+            }
+            if let Some(schema) = type_schema_of(&name) {
+                if schema != "public" {
+                    tn.names.insert(0, schema_node(&schema));
+                }
+                return Ok(());
+            }
+            if hidden_is_error
+                && !public_on_path
+                && AS_SENT.with(std::cell::Cell::get)
+                && crate::column_type_exists(&name)
+            {
+                crate::set_error_location(tn.location);
+                return Err(Error::UndefinedObject(format!(
+                    "type \"{name}\" does not exist"
+                )));
+            }
+            Ok(())
+        };
+    let resolve = |tn: &mut pg_query::protobuf::TypeName| resolve_with(tn, true);
+    let object = |tn: &mut pg_query::protobuf::TypeName| resolve_with(tn, false);
     // The walk does not reach a CREATE / ALTER TABLE's own columns.
     let columns = |elts: &mut [pg_query::protobuf::Node]| -> Result<()> {
         for e in elts {
@@ -724,6 +734,37 @@ pub fn resolve_type_names(node: &mut N) -> Result<()> {
                 }
             }
         }
+        // Nor the type a DROP / ALTER / COMMENT names, which `LookupTypeName`
+        // finds through the path as it does a column's: after `set
+        // search_path = s`, `drop type t` drops `s.t`.
+        N::DropStmt(d) if names_type(d.remove_type) => {
+            for o in &mut d.objects {
+                type_object(o, &object)?;
+            }
+        }
+        N::RenameStmt(r) if names_type(r.rename_type) => {
+            if let Some(o) = r.object.as_deref_mut() {
+                type_object(o, &object)?;
+            }
+        }
+        N::AlterOwnerStmt(a) if names_type(a.object_type) => {
+            if let Some(o) = a.object.as_deref_mut() {
+                type_object(o, &object)?;
+            }
+        }
+        N::AlterObjectSchemaStmt(a) if names_type(a.object_type) => {
+            if let Some(o) = a.object.as_deref_mut() {
+                type_object(o, &object)?;
+            }
+        }
+        N::CommentStmt(c) if names_type(c.objtype) => {
+            if let Some(o) = c.object.as_deref_mut() {
+                type_object(o, &object)?;
+            }
+        }
+        N::AlterDomainStmt(a) => type_name_list(&mut a.type_name, &object)?,
+        N::AlterEnumStmt(a) => type_name_list(&mut a.type_name, &object)?,
+        N::AlterTypeStmt(a) => type_name_list(&mut a.type_name, &object)?,
         _ => {}
     }
     // SAFETY: the pointers `nodes_mut` hands out point into `node`, which
@@ -763,8 +804,46 @@ pub fn resolve_type_names(node: &mut N) -> Result<()> {
     Ok(())
 }
 
+/// Does a DDL statement's object type name a type (`TYPE` or `DOMAIN`)?
+fn names_type(object_type: i32) -> bool {
+    use pg_query::protobuf::ObjectType;
+    matches!(
+        ObjectType::try_from(object_type),
+        Ok(ObjectType::ObjectType | ObjectType::ObjectDomain)
+    )
+}
+
+/// Resolve a DDL statement's type object: a `TypeName` (`DROP TYPE`,
+/// `COMMENT ON TYPE`) or the `any_name` list the grammar keeps for
+/// `ALTER TYPE ... RENAME` / `OWNER TO` / `SET SCHEMA`.
+fn type_object(
+    o: &mut pg_query::protobuf::Node,
+    resolve: &dyn Fn(&mut pg_query::protobuf::TypeName) -> Result<()>,
+) -> Result<()> {
+    match o.node.as_mut() {
+        Some(N::TypeName(tn)) => resolve(tn),
+        Some(N::List(l)) => type_name_list(&mut l.items, resolve),
+        _ => Ok(()),
+    }
+}
+
+/// Resolve an `any_name` list naming a type, as its `TypeName` would be.
+fn type_name_list(
+    names: &mut Vec<pg_query::protobuf::Node>,
+    resolve: &dyn Fn(&mut pg_query::protobuf::TypeName) -> Result<()>,
+) -> Result<()> {
+    let mut tn = pg_query::protobuf::TypeName {
+        names: std::mem::take(names),
+        location: -1,
+        ..Default::default()
+    };
+    let resolved = resolve(&mut tn);
+    *names = tn.names;
+    resolved
+}
+
 /// A bare relation name in a string literal the statement turns into a
-/// `regclass`: a `::regclass` cast of one, or the first argument of the
+/// `regclass`:a `::regclass` cast of one, or the first argument of the
 /// sequence functions, which take a regclass. With its location.
 ///
 /// # Safety
