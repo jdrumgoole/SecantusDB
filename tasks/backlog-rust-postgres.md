@@ -3456,13 +3456,13 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
 `xu782f` a domain over `text` `collate "und-x-icu"`, `xc782f` one
 `collate "C"`.
 
-- [ ] **`pg_get_viewdef` of 16 system views is NULL.** PostgreSQL
+- [ ] **`pg_get_viewdef` of 11 system views is NULL.** PostgreSQL
       deparses every `pg_catalog` and `information_schema` view's rule.
       Here `system_view_defs` prints `system_views.sql`'s and
       `information_schema.sql`'s queries through `ruleutils`, which
-      reproduces 69 of the 75 `pg_catalog` views and 55 of the 65
+      reproduces 69 of the 75 `pg_catalog` views and 60 of the 65
       `information_schema` views exactly (none printed wrong, measured
-      2026-11-25 in both print modes by md5 against PostgreSQL 15.20) and
+      2026-11-28 in both print modes against PostgreSQL 15.20) and
       leaves the rest NULL rather than print them as written. Remaining:
       the 6 other `pg_catalog` views (`pg_policies`,
       `pg_publication_tables`, `pg_seclabels`,
@@ -3472,19 +3472,19 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
       pg_stat_get_replication_slot(slot_name) s` gives `s` no columns,
       42703 `column s.slot_name does not exist`; `pg_stats_ext` reads a
       column named `values`; `pg_seclabels` a `rel.tableoid` system
-      column); and 10 `information_schema` views. Five call
+      column); and the 5 `information_schema` views calling
       `_pg_expandarray` (`key_column_usage`, `parameters`,
       `data_type_privileges`, `element_types`,
       `triggered_update_columns`), an `information_schema` SQL function
-      returning `SETOF record` with a polymorphic OUT column, which the
-      printer cannot type; `domains` and `sequences` call
-      `_pg_char_max_length` / `_pg_numeric_precision` and their siblings,
-      the information_schema functions the printer has no signature for;
-      `attributes` and `columns` pass a whole row (`_pg_truetypid(a, t)`);
-      `user_mapping_options` refuses at its `pg_has_role(srvowner,
-      'USAGE')` over the `_pg_user_mappings` view. A user view over
-      `generate_series(1, c.relnatts)` is still refused: ruleutils casts
-      the int2 argument to `integer`, which the printer does not add.
+      returning `SETOF record` with a polymorphic OUT column `x` (the
+      argument array's element type) and `n int`. They need a
+      set-returning record call in a subquery's target list
+      (`information_schema._pg_expandarray(c.conkey) AS x`), field
+      selection on that column (`(ss.x).n`, `(ta0.tgat).x`), and a
+      subscript by it (`ss.confkey[(ss.x).n]`); the printer types none
+      of these. A user view over `generate_series(1, c.relnatts)` is
+      still refused: ruleutils casts the int2 argument to `integer`,
+      which the printer does not add.
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_the_remaining_system_views
       Backlog-ID: RP-798
 
