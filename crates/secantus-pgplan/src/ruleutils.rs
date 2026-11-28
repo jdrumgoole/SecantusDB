@@ -290,6 +290,16 @@ enum Parent<'o> {
     Other,
 }
 
+/// A sort / group item as `get_rule_sortgroupclause` sees it.
+enum SortItem {
+    /// A Var or a Const: never parenthesised.
+    Bare,
+    /// A FuncExpr, Aggref or WindowFunc: always parenthesised.
+    Function,
+    /// Anything else: parenthesised when pretty.
+    Other,
+}
+
 fn arith_priority(op: &str) -> u8 {
     match op.chars().next() {
         Some('+' | '-') if op.len() == 1 => 1,
@@ -3342,18 +3352,74 @@ impl<'a> Printer<'a> {
     }
 
     /// `get_rule_sortgroupclause`: a function call, aggregate or window
-    /// function is parenthesised.
+    /// function is parenthesised in either print mode, anything else but a
+    /// Var or a Const when pretty.
     fn sort_expr(&mut self, n: &Node) -> Option<()> {
-        // A Var, or a Const (a set operation's output position), is never
-        // parenthesised (`get_rule_sortgroupclause`).
-        let is_var = matches!(n.node.as_ref(), Some(N::ColumnRef(_) | N::AConst(_)));
-        if !is_var && (self.pretty || matches!(n.node.as_ref(), Some(N::FuncCall(_)))) {
+        let paren = match self.sort_item(n) {
+            SortItem::Bare => false,
+            SortItem::Function => true,
+            SortItem::Other => self.pretty,
+        };
+        if paren {
             self.buf.push('(');
             self.expr(n)?;
             self.buf.push(')');
             return Some(());
         }
         self.expr(n)
+    }
+
+    /// The node the analyser builds for a sort / group item, as far as
+    /// `get_rule_sortgroupclause` tells them apart.
+    fn sort_item(&mut self, n: &Node) -> SortItem {
+        match n.node.as_ref() {
+            // A Var, or a Const (a set operation's output position).
+            Some(N::ColumnRef(_) | N::AConst(_)) => SortItem::Bare,
+            Some(N::FuncCall(_)) => SortItem::Function,
+            Some(N::TypeCast(tc)) => self.cast_sort_item(tc).unwrap_or(SortItem::Other),
+            _ => SortItem::Other,
+        }
+    }
+
+    /// A cast's node, in the cases the TypeCast arm of [`Self::expr`]
+    /// prints: a literal is folded into a Const (a modifier then runs the
+    /// length coercion above it), a same-type cast is its argument's node,
+    /// and anything else is what `find_coercion_pathway` builds -- a cast
+    /// `pg_cast` runs through a function is a FuncExpr (RP-1094).
+    fn cast_sort_item(&mut self, tc: &pg_query::protobuf::TypeCast) -> Option<SortItem> {
+        let tn = tc.type_name.as_ref()?;
+        let target = base_type(&crate::type_name_of(tn));
+        let typmod = crate::declared_typmod_public(tn);
+        let arg = tc.arg.as_deref()?;
+        if information_schema_domain(&target).is_some() {
+            return Some(SortItem::Other);
+        }
+        let own = self.typ(arg)?;
+        if own == "unknown" {
+            if typmod < 0 {
+                return Some(SortItem::Bare);
+            }
+            return Some(
+                if crate::pg_casts::explicit_cast_is_function(&target, &target, typmod) {
+                    SortItem::Function
+                } else {
+                    SortItem::Other
+                },
+            );
+        }
+        if own == target && typmod < 0 {
+            return Some(self.sort_item(arg));
+        }
+        if self.fold_consts && typmod < 0 && folded_numeric_cast(arg, &target).is_some() {
+            return Some(SortItem::Bare);
+        }
+        Some(
+            if crate::pg_casts::explicit_cast_is_function(&own, &target, typmod) {
+                SortItem::Function
+            } else {
+                SortItem::Other
+            },
+        )
     }
 
     fn sort_list(&mut self, items: &[Node]) -> Option<()> {

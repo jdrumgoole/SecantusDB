@@ -322,9 +322,74 @@ pub fn refused(source: &str, target: &str) -> bool {
     !exists(s, t)
 }
 
+/// Is the node `transformTypeCast` builds for `x::target`, over an `x` of
+/// type `source` (a known type, not `unknown`), a FuncExpr at the top?
+/// `typmod` is the declared modifier, -1 for none. `coerce_to_target_type`
+/// reduces both types to their base types and asks `find_coercion_pathway`:
+/// a `pg_cast` row with method `f` is a FuncExpr, `b` a RelabelType, `i` or
+/// no row (an I/O conversion, an array coercion) something else. A modifier
+/// then runs the type's length coercion (its own `pg_cast` row, `varchar`
+/// to `varchar` by `varchar(varchar, int4, bool)`), a FuncExpr above all of
+/// it, and a cast to a domain puts a CoerceToDomain on top. ruleutils'
+/// `get_rule_sortgroupclause` parenthesises a FuncExpr sort item in either
+/// print mode (RP-1094). The caller handles a same-type cast with no
+/// modifier, which builds no node at all.
+pub fn explicit_cast_is_function(source: &str, target: &str, typmod: i32) -> bool {
+    if crate::domains::base_type_and_typmod(target).is_some() {
+        return false;
+    }
+    let oid = crate::user_casts::type_oid;
+    let Some(t) = oid(target) else {
+        return false;
+    };
+    let method = |s: i64, t: i64| {
+        BUILTIN_CASTS
+            .iter()
+            .find(|(_, cs, ct, ..)| *cs == s && *ct == t)
+            .map(|(.., m)| *m as char)
+    };
+    if typmod >= 0 {
+        return method(t, t) == Some('f');
+    }
+    let source =
+        crate::domains::base_type_and_typmod(source).map_or_else(|| source.to_string(), |b| b.0);
+    let Some(s) = oid(&source) else {
+        return false;
+    };
+    if s == t {
+        return false;
+    }
+    match method(s, t) {
+        Some(m) => m == 'f',
+        None => crate::user_casts::find(&source, target).is_some_and(|c| c.method == 'f'),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::explicit_cast_cost;
+
+    /// The casts PostgreSQL 15.20 builds as a FuncExpr, which a view's
+    /// ORDER BY prints parenthesised (RP-1094).
+    #[test]
+    fn explicit_casts_that_are_functions() {
+        use super::explicit_cast_is_function as f;
+        // name to text: `text(name)`; name to varchar: `varchar(name)`.
+        assert!(f("name", "text", -1));
+        assert!(f("name", "varchar", -1));
+        // int2 to int8, float4 to int4: cast functions.
+        assert!(f("int2", "int8", -1));
+        assert!(f("float4", "int4", -1));
+        // "char" to text: `text("char")`.
+        assert!(f("char", "text", -1));
+        // int2 to text: an I/O conversion; oid to regclass: binary.
+        assert!(!f("int2", "text", -1));
+        assert!(!f("oid", "regclass", -1));
+        assert!(!f("text", "varchar", -1));
+        // A modifier runs the length coercion: `varchar(10)`, `numeric(5,1)`.
+        assert!(f("text", "varchar", 14));
+        assert!(f("int2", "numeric", 327_685));
+    }
 
     /// `cost_qual_eval` of a cast, as PostgreSQL 15.19 prices a join
     /// filter holding one (RP-354): a cast function one call, an I/O

@@ -699,12 +699,85 @@ def test_pg_get_viewdef_of_an_in_list_holding_a_column(dsn: str) -> None:
 
 # `get_rule_sortgroupclause` parenthesises a FuncExpr item even when not
 # pretty, and `name::text` is one (`text(name)`, `castmethod = 'f'`).
-# Measured on a private PostgreSQL 15.20 cluster; here the raw print gives
-# `ORDER BY (c.relname)::text`.
-@pytest.mark.backlog("RP-1094")
+# Measured on a private PostgreSQL 15.20 cluster; the raw print gave
+# `ORDER BY (c.relname)::text`, as the printer knew only the binary-coercible
+# casts; fixed by RP-1094.
+@pytest.mark.backlog_fixed("RP-1094")
 def test_pg_get_viewdef_parenthesises_a_function_cast_sort_item(dsn: str) -> None:
     got = _viewdef_of(dsn, "v798o", "select c.oid from pg_class c order by c.relname::text")
     assert got == [(" SELECT c.oid\n   FROM pg_class c\n  ORDER BY ((c.relname)::text);",)]
+
+
+# Which sort / group items `find_coercion_pathway` makes a FuncExpr, in both
+# print modes, each measured on a private PostgreSQL 15.20 cluster: a
+# `pg_cast` function cast, a length coercion, a literal under one, and a
+# function call under a cast that builds no node are parenthesised raw; an
+# I/O conversion, a binary-coercible cast and a domain are not; a same-type
+# cast of a column, and a literal's cast, are bare even when pretty (RP-1094).
+_SORT_ITEMS = [
+    ("c.relname::varchar", "((c.relname)::character varying)", "(c.relname::character varying)"),
+    ("c.relnatts::int8", "((c.relnatts)::bigint)", "(c.relnatts::bigint)"),
+    ("c.reltuples::int4", "((c.reltuples)::integer)", "(c.reltuples::integer)"),
+    ("c.relkind::text", "((c.relkind)::text)", "(c.relkind::text)"),
+    ("c.relnatts::text", "(c.relnatts)::text", "(c.relnatts::text)"),
+    ("c.oid::regclass", "(c.oid)::regclass", "(c.oid::regclass)"),
+    ("c.relname::name", "c.relname", "c.relname"),
+    ("'a'::text", "'a'::text", "'a'::text"),
+    ("'a'::varchar(3)", "('a'::character varying(3))", "('a'::character varying(3))"),
+    (
+        "c.relname::varchar(10)",
+        "((c.relname)::character varying(10))",
+        "(c.relname::character varying(10))",
+    ),
+    ("c.relnatts::numeric(5,1)", "((c.relnatts)::numeric(5,1))", "(c.relnatts::numeric(5,1))"),
+    ("c.relname::text::text", "((c.relname)::text)", "(c.relname::text)"),
+    ("lower(c.relname)::text", "(lower((c.relname)::text))", "(lower(c.relname::text))"),
+]
+
+
+@pytest.mark.backlog_fixed("RP-1094")
+@pytest.mark.parametrize(("item", "raw", "pretty"), _SORT_ITEMS)
+def test_pg_get_viewdef_sort_item_parentheses(dsn: str, item: str, raw: str, pretty: str) -> None:
+    head = " SELECT c.oid\n   FROM pg_class c\n  ORDER BY "
+    with _connect(dsn) as c:
+        c.execute(f"create or replace view v1094 as select c.oid from pg_class c order by {item}")
+        got = _answer(
+            c, "select pg_get_viewdef('v1094'::regclass), pg_get_viewdef('v1094'::regclass, true)"
+        )
+        c.execute("drop view v1094")
+    assert got == [(f"{head}{raw};", f"{head}{pretty};")]
+
+
+# A window's PARTITION BY, a GROUP BY and a DISTINCT ON print each item as
+# an ORDER BY one (PostgreSQL 15.20).
+@pytest.mark.backlog_fixed("RP-1094")
+def test_pg_get_viewdef_function_cast_in_partition_group_distinct(dsn: str) -> None:
+    got = [
+        _viewdef_of(dsn, "v1094", q)
+        for q in [
+            "select c.oid, row_number() over (partition by c.relname::text) from pg_class c",
+            "select c.relname::text, count(*) from pg_class c group by c.relname::text",
+            "select distinct on (c.relname::text) c.oid from pg_class c",
+        ]
+    ]
+    assert got == [
+        [
+            (
+                " SELECT c.oid,\n"
+                "    row_number() OVER (PARTITION BY ((c.relname)::text)) AS row_number\n"
+                "   FROM pg_class c;",
+            )
+        ],
+        [
+            (
+                " SELECT (c.relname)::text AS relname,\n"
+                "    count(*) AS count\n"
+                "   FROM pg_class c\n"
+                "  GROUP BY ((c.relname)::text);",
+            )
+        ],
+        [(" SELECT DISTINCT ON (((c.relname)::text)) c.oid\n   FROM pg_class c;",)],
+    ]
 
 
 # An operator over a column of a user domain resolves on the base type and

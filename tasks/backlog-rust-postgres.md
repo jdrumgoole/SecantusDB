@@ -394,6 +394,13 @@ one beside it.
   2026-11-23 (PR #2958, run 45090485822, job 137418770491), in permutation
   `rc1 ro2 wo1 c1 wa2 c2`, where `wa2` got the same 40001 "Canceled on
   identification as a pivot, during write" and PostgreSQL inserts and commits.
+  Again locally on 2026-11-28, in RP-1094's `gate_pg.sh --fast` backlog
+  step after a rebase (load average about 3-4, the other lane running;
+  the change was only `pg_get_viewdef`'s printer): in permutation `rc1
+  ro2 wa2 wo1 c1 c2` every step matched until `c2`, which was 40001
+  "Canceled on identification as a pivot, during commit attempt", where
+  PostgreSQL commits. So the false pivot is found at commit too, not only
+  during a write.
   Verify: none -- intermittent, not reproduced; RP-254's isolation test is the check
   Backlog-ID: RP-848
 - [ ] **RP-911's regression test failed twice on `main`'s Linux CI on
@@ -3569,25 +3576,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_the_remaining_system_views
       Backlog-ID: RP-798
 
-## Found while working RP-798 (2026-11-18)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster; the
-views read only `pg_class`.
-
-
-- [ ] **`pg_get_viewdef` does not parenthesise a function cast in ORDER
-      BY / PARTITION BY / GROUP BY when not pretty.**
-      `get_rule_sortgroupclause` forces parentheses round a FuncExpr item
-      in either print mode, and a cast PostgreSQL runs through a function
-      (`pg_cast.castmethod = 'f'`, such as `name::text`) is one: `create
-      view v as select c.oid from pg_class c order by c.relname::text`
-      prints `ORDER BY ((c.relname)::text)` on PostgreSQL 15.20 (a private
-      cluster). Here `ORDER BY (c.relname)::text`: the printer knows only
-      the binary-coercible (`'b'`) casts, so it cannot tell a function cast
-      from a relabel. The pretty print matches.
-      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_parenthesises_a_function_cast_sort_item
-      Backlog-ID: RP-1094
-
 ## Found while working RP-816 (2026-11-11)
 
 Measured on a private PostgreSQL 15.19 cluster.
@@ -4110,7 +4098,13 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       (`test_group_by_an_expression_or_a_position`,
       `test_a_grouping_set_query_computes_expressions_over_its_keys`),
       reported together, each gave `''` for the first line and nothing
-      after, and both passed alone (2 in 19 s). Not yet known: whether the
+      after, and both passed alone (2 in 19 s). A seventh time on
+      2026-11-28, in RP-1094's `gate_pg.sh --fast` backlog step after a
+      rebase (load average about 3-4, the other lane running):
+      `tests/backlog/test_rp_found_rp707.py`'s module server gave `''`
+      for its first line and nothing after its stop, so its 31 tests were
+      `REGRESSED`; the module alone passed (31 in 37 s), and the same
+      change's gate before the rebase had no start failure. Not yet known: whether the
       server stalled (a lock, a WiredTiger create waiting on a checkpoint)
       or was starved, since the harness keeps no stack or timing of a
       start it gives up on. The harness should sample the child
