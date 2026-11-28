@@ -1857,6 +1857,9 @@ jobs:
           # A set operation's analysis errors at the column PostgreSQL
           # 15.19 points at (RP-1087). Binary only.
           files="$files tests/test_rust_pg_set_op_positions.py"
+          # client_min_messages withholds a notice at its raise, with
+          # PostgreSQL 15.19's answers written in (RP-1092). Binary only.
+          files="$files tests/test_rust_pg_client_min_messages.py"
           # pg_get_viewdef relabels a user domain to its base where
           # PostgreSQL 15.20 coerces it, 98 views (RP-1095). Binary only.
           files="$files tests/test_rust_pgserver_viewdef_domains.py"

@@ -37,14 +37,16 @@ impl Level {
     }
 
     /// The `S` / `V` field of the message a client sees. `Debug` and `Log`
-    /// are below the default `client_min_messages` and are never sent.
-    pub fn severity(self) -> Option<&'static str> {
+    /// are below the default `client_min_messages`, which decides whether
+    /// one is sent (`PgHandler::queue_notice`).
+    pub fn severity(self) -> &'static str {
         match self {
-            Level::Debug | Level::Log => None,
-            Level::Info => Some("INFO"),
-            Level::Notice => Some("NOTICE"),
-            Level::Warning => Some("WARNING"),
-            Level::Exception => Some("ERROR"),
+            Level::Debug => "DEBUG",
+            Level::Log => "LOG",
+            Level::Info => "INFO",
+            Level::Notice => "NOTICE",
+            Level::Warning => "WARNING",
+            Level::Exception => "ERROR",
         }
     }
 

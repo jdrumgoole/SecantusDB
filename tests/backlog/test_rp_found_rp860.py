@@ -327,13 +327,14 @@ def test_pg_get_partkeydef_keeps_a_key_collation_and_opclass(dsn: str) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-1092")
+@pytest.mark.backlog_fixed("RP-1092")
 def test_client_min_messages_withholds_a_notice(dsn: str) -> None:
     """`set client_min_messages = warning` withholds every NOTICE from the
     client: neither `drop table if exists` of a missing table nor a DO
     block's `raise notice` sends one on PostgreSQL 15.19 (shared reference,
-    port 5415), while `raise warning` still does. Here both NOTICEs arrive.
-    Found while working RP-1052."""
+    port 5415), while `raise warning` still does. Both NOTICEs arrived here
+    until RP-1092 decided each message at its raise. Found while working
+    RP-1052."""
     seen: list[tuple[str, str]] = []
     with psycopg.connect(dsn, autocommit=True) as c:
         c.add_notice_handler(lambda d: seen.append((d.severity or "", d.message_primary or "")))

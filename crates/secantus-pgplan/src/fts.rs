@@ -272,6 +272,14 @@ thread_local! {
 }
 
 fn notice(msg: &str) {
+    // `client_min_messages` decides at the raise, as `errstart` does: a
+    // NOTICE is withheld when the minimum is above it (`warning`, `error`).
+    if matches!(
+        crate::session_setting("client_min_messages").as_deref(),
+        Some("warning" | "error")
+    ) {
+        return;
+    }
     NOTICES.with(|n| n.borrow_mut().push(msg.to_string()));
 }
 

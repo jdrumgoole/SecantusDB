@@ -63,6 +63,14 @@ fn hidden_enum_value(name: &str, value: &str) -> Option<&'static str> {
                 None
             }
         }
+        // `message_level_options`' hidden entries: `debug` is `debug2`, and
+        // the client's list also takes `info` (the server's shows it).
+        "client_min_messages" | "trace_recovery_messages" => match value {
+            "debug" => Some("debug2"),
+            "info" => Some("info"),
+            _ => None,
+        },
+        "log_min_messages" | "log_min_error_statement" => (value == "debug").then_some("debug2"),
         // `on` and its spellings are `pglz`.
         "wal_compression" => {
             if on || value == "on" {

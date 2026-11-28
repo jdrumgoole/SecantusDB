@@ -51,6 +51,7 @@ mod catalog_order;
 mod catalog_places;
 mod catalog_reads;
 mod catcache;
+mod client_messages;
 mod collations;
 mod composite_alter;
 mod config_views;
@@ -3026,11 +3027,7 @@ impl plpgsql_fn::Host for PlHost<'_> {
         // `plpgsql_exec_error_callback` frames every `ereport`, a notice's
         // too: the statement raising it, then each caller's.
         info.where_context = self.h.pl_context(None);
-        self.h
-            .pending_notices
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(info);
+        self.h.queue_notice(info);
         // Out at once, as PostgreSQL sends a RAISE: a function that then
         // runs on (a loop, a long query) does not hold it back.
         self.h.send_live_notices();
@@ -15576,10 +15573,7 @@ impl PgHandler {
         }
         let mut info = ErrorInfo::new("NOTICE".into(), sqlstate.into(), message);
         info.detail = detail;
-        self.pending_notices
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(info);
+        self.queue_notice(info);
         self.send_live_notices();
     }
 
@@ -38817,21 +38811,15 @@ impl PgHandler {
                 maps.push(Arc::new((text.clone(), sql.to_string(), map)));
             }
         }
-        if !warnings.is_empty() {
-            let mut pending = self
-                .pending_notices
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            for w in warnings {
-                let mut info = ErrorInfo::new(
-                    "WARNING".into(),
-                    secantus_pgplan::escape_strings::SQLSTATE.into(),
-                    w.message,
-                );
-                info.hint = Some(w.hint);
-                info.position = Some(w.position.to_string());
-                pending.push(info);
-            }
+        for w in warnings {
+            let mut info = ErrorInfo::new(
+                "WARNING".into(),
+                secantus_pgplan::escape_strings::SQLSTATE.into(),
+                w.message,
+            );
+            info.hint = Some(w.hint);
+            info.position = Some(w.position.to_string());
+            self.queue_notice(info);
         }
         rewritten.map_err(|e| {
             let mut out = Self::err(&e);
@@ -38869,16 +38857,8 @@ impl PgHandler {
     }
 
     fn collect_planner_warnings(&self) {
-        let warnings = secantus_pgplan::take_warnings();
-        if warnings.is_empty() {
-            return;
-        }
-        let mut pending = self
-            .pending_notices
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        for (sqlstate, message) in warnings {
-            pending.push(ErrorInfo::new("WARNING".into(), sqlstate, message));
+        for (sqlstate, message) in secantus_pgplan::take_warnings() {
+            self.queue_notice(ErrorInfo::new("WARNING".into(), sqlstate, message));
         }
     }
 
@@ -39256,10 +39236,7 @@ impl PgHandler {
                         format!("PID {target} is not a PostgreSQL backend process"),
                     );
                     info.routine = Some("pg_signal_backend".into());
-                    self.pending_notices
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push(info);
+                    self.queue_notice(info);
                 }
                 Ok(Bson::Boolean(armed))
             }
@@ -41222,10 +41199,7 @@ impl PgHandler {
 
     /// Raise a WARNING for the statement in flight (sent as `notice` is).
     pub(crate) fn warning(&self, sqlstate: &str, message: String) {
-        self.pending_notices
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(ErrorInfo::new("WARNING".into(), sqlstate.into(), message));
+        self.queue_notice(ErrorInfo::new("WARNING".into(), sqlstate.into(), message));
         self.send_live_notices();
     }
 
@@ -45609,14 +45583,11 @@ impl PgHandler {
                 self.refuse_in_transaction_block("DROP DATABASE")?;
                 let Some(info) = self.databases.lookup(&self.storage, &name)? else {
                     if if_exists {
-                        self.pending_notices
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push(ErrorInfo::new(
-                                "NOTICE".into(),
-                                "00000".into(),
-                                format!("database \"{name}\" does not exist, skipping"),
-                            ));
+                        self.queue_notice(ErrorInfo::new(
+                            "NOTICE".into(),
+                            "00000".into(),
+                            format!("database \"{name}\" does not exist, skipping"),
+                        ));
                         return Ok(vec![Response::Execution(Tag::new("DROP DATABASE"))]);
                     }
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
