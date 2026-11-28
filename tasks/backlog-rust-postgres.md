@@ -3186,14 +3186,6 @@ Measured on PostgreSQL 15.20 with `create domain pint48 as int check (value
 `create table t48 (p pint48, a dia48)` and `create table t48v (x vd48[])`.
 The gap tests are in `tests/backlog/test_rp_found_rp1048.py`.
 
-- [ ] **A value too long for a `varchar(n)` domain is stored in an array of
-      that domain.** `insert into t48v(x) values (array['abcd'::text])`, the
-      same through `INSERT ... SELECT`, and the untyped `'{abcd}'` are each
-      22001 `value too long for type character varying(3)` on PostgreSQL
-      15.20 (the `ArrayCoerceExpr` applies the element domain's length
-      coercion; the literal's error is at 29); here the row is stored.
-      Verify: tests/backlog/test_rp_found_rp1048.py::test_domain_array_element_length
-      Backlog-ID: RP-1084
 - [ ] **A user type created unqualified under a non-public `search_path`
       is created in `public`.** After `create schema s48; set search_path =
       s48`, `create domain d48 as int`, `create type c48 as (a int)` and
@@ -4031,7 +4023,14 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       `tests/backlog/test_rp_catalog_reads.py::test_a_catalog_joins_method_decides_its_reads`
       gave `''` for its first line, so RP-290 was `REGRESSED`; it passed
       alone three times (149 s, 10 s, 9 s), and three lone fresh starts of
-      that build took 3.8-4.3 s each. Not yet known: whether the
+      that build took 3.8-4.3 s each. A sixth time on 2026-11-27,
+      in RP-1084's targeted run of `tests/test_rust_pgserver_slice.py`
+      and 20 backlog files at `-n 4` against a debug build (load average
+      about 3.4, the other lane running): two slice tests
+      (`test_group_by_an_expression_or_a_position`,
+      `test_a_grouping_set_query_computes_expressions_over_its_keys`),
+      reported together, each gave `''` for the first line and nothing
+      after, and both passed alone (2 in 19 s). Not yet known: whether the
       server stalled (a lock, a WiredTiger create waiting on a checkpoint)
       or was starved, since the harness keeps no stack or timing of a
       start it gives up on. The harness should sample the child

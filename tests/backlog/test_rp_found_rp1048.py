@@ -1,8 +1,8 @@
 """Gap tests of the divergences found while working RP-1048 (a `text`
 column an `INSERT ... SELECT` wrote to a domain-array column was accepted):
 RP-1083 (a 42804 assignment error named a domain column by its base type; fixed),
-RP-1084 (a value too long for a `varchar(n)` domain is stored in an array
-of that domain) and RP-1085 (a user type created unqualified under a
+RP-1084 (a value too long for a `varchar(n)` domain was stored in an array
+of that domain; fixed) and RP-1085 (a user type created unqualified under a
 non-public `search_path` is created in `public`).
 
 An answer is the command tag for a statement that returns no rows, or
@@ -129,9 +129,10 @@ def test_domain_column_named_in_default_and_qualified(dsn: str) -> None:
 _LONG = "value too long for type character varying(3)"
 
 
-@pytest.mark.backlog("RP-1084")
+@pytest.mark.backlog_fixed("RP-1084")
 def test_domain_array_element_length(dsn: str) -> None:
-    """The array coercion applies the element domain's length coercion."""
+    """The array coercion applied the element domain's length coercion; the
+    overlong element was stored instead."""
     got = {
         q: answer(dsn, q)
         for q in (
