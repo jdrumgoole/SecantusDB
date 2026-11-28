@@ -398,19 +398,55 @@ def test_pg_get_viewdef_of_user_views_over_the_system_view_shapes(dsn: str) -> N
 
 
 # The system views the printer does not reproduce are still NULL: an
-# `information_schema` view (its domain casts), and `pg_catalog` views
-# such as `pg_stats_ext`.
+# `information_schema` view over `_pg_expandarray`, and `pg_catalog`
+# views such as `pg_stats_ext`.
 @pytest.mark.backlog("RP-798")
 def test_pg_get_viewdef_of_the_remaining_system_views(dsn: str) -> None:
     with _connect(dsn) as c:
         got = [
             _answer(c, sql)
             for sql in [
-                "select pg_get_viewdef('information_schema.domains'::regclass) is not null",
+                "select pg_get_viewdef('information_schema.key_column_usage'::regclass)"
+                " is not null",
                 "select pg_get_viewdef('pg_stats_ext'::regclass) is not null",
             ]
         ]
     assert got == [[(True,)], [(True,)]]
+
+
+# `information_schema` views calling the schema's SQL helpers print as
+# PostgreSQL 15.20 prints them, in both modes (md5 of each text, measured
+# on the shared 15 reference): a helper call qualified by its schema
+# (`information_schema._pg_char_max_length(t.typbasetype, t.typtypmod)`),
+# a whole-row argument as `a.*` (`_pg_truetypid(a.*, t.*)`), and a domain
+# argument of a built-in relabelled to the base type the call resolves on
+# (`pg_has_role((um.srvowner)::name, 'USAGE'::text)`). They were NULL: the
+# printer refused a call qualified by any schema but `pg_catalog`, and
+# resolved a call on the domain rather than its base (RP-798).
+@pytest.mark.backlog_fixed("RP-798")
+def test_pg_get_viewdef_of_views_calling_information_schema_helpers(dsn: str) -> None:
+    views = {
+        "domains": ("eedb92dc096ae8ea0e86ebf43df5c1f7", "c18879dd48dd60932c3e402697952534"),
+        "sequences": ("0fcd87c11d82e3dbd4cc96b6e2642d11", "9dc8943d9e58e79638789eeab395998f"),
+        "attributes": ("96f510bf100a3b070e25661e964fc98a", "5d7d3ad2209fd31066f6dcdb8169a049"),
+        "columns": ("7842197321f6cba974acfc35b1c2c01d", "8efd84cfeebc0c9f6f413499222c33e8"),
+        "user_mapping_options": (
+            "1205e50dcb8538bc2fc4c4ae9ec28253",
+            "2d490f03eac714685bc1a4619b003996",
+        ),
+    }
+    with _connect(dsn) as c:
+        got = {
+            v: tuple(
+                _answer(
+                    c,
+                    f"select md5(pg_get_viewdef('information_schema.{v}'::regclass, {p}))",
+                )[0][0]
+                for p in ("false", "true")
+            )
+            for v in views
+        }
+    assert got == views
 
 
 # A built-in taking IN arguments and returning a record of OUT parameters

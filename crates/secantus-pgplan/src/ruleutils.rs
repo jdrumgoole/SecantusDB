@@ -77,6 +77,9 @@ struct Rte {
     /// The name the query WROTE, which its column references use (empty
     /// for an unnamed JOIN).
     name: String,
+    /// A relation's own name, whose row type a whole-row reference has
+    /// (empty for the other kinds).
+    relname: String,
     /// Each column's name as the query references it (`eref->colnames`),
     /// and its type.
     columns: Vec<(String, String)>,
@@ -447,6 +450,35 @@ fn function_sig(name: &str) -> Option<(Option<&'static str>, Option<&'static str
     })
 }
 
+/// `information_schema`'s SQL helpers over a type's oid and typmod
+/// (`information_schema.sql`): `(argument types, result)`, read from
+/// PostgreSQL 15.19's `pg_proc` (`pronamespace = 'information_schema'`).
+/// `_pg_truetypid` / `_pg_truetypmod` take whole rows of `pg_attribute`
+/// and `pg_type` (`is_row_param`); `_pg_expandarray` returns a set and is
+/// not here.
+fn information_schema_helper(name: &str) -> Option<(&'static [&'static str], &'static str)> {
+    const OID_TYPMOD: &[&str] = &["oid", "int4"];
+    const ROWS: &[&str] = &["pg_attribute", "pg_type"];
+    Some(match name {
+        "_pg_truetypid" => (ROWS, "oid"),
+        "_pg_truetypmod" => (ROWS, "int4"),
+        "_pg_char_max_length"
+        | "_pg_char_octet_length"
+        | "_pg_numeric_precision"
+        | "_pg_numeric_precision_radix"
+        | "_pg_numeric_scale"
+        | "_pg_datetime_precision" => (OID_TYPMOD, "int4"),
+        "_pg_interval_type" => (OID_TYPMOD, "text"),
+        "_pg_index_position" => (&["oid", "int2"], "int4"),
+        _ => return None,
+    })
+}
+
+/// A helper parameter that is a catalog's row type, not a scalar.
+fn is_row_param(t: &str) -> bool {
+    matches!(t, "pg_attribute" | "pg_type")
+}
+
 /// A `jsonb` operator over a jsonb left operand: `(the right operand's
 /// type, the result's)` -- the overload an untyped literal right operand
 /// resolves to (`->` and `->>` take text over integer for one).
@@ -627,6 +659,13 @@ impl<'a> Printer<'a> {
             return None;
         }
         let rel = sval(rel)?;
+        self.relation_named(rel)
+            .map(|(refname, _)| (refname, rel.to_string()))
+    }
+
+    /// The relation in scope a query names `rel`: the name it prints as and
+    /// the relation's own name (`refnameNamespaceItem`).
+    fn relation_named(&self, rel: &str) -> Option<(String, String)> {
         self.scopes
             .iter()
             .enumerate()
@@ -642,7 +681,7 @@ impl<'a> Printer<'a> {
                     })
                     .map(|r| {
                         note_var_level(si);
-                        (r.refname.clone(), r.name.clone())
+                        (r.refname.clone(), r.relname.clone())
                     })
             })
     }
@@ -851,15 +890,23 @@ impl<'a> Printer<'a> {
             }
             N::BoolExpr(_) | N::NullTest(_) | N::BooleanTest(_) => "bool".into(),
             N::FuncCall(f) => {
+                if let Some((_, _, ret)) = self.schema_helper(f) {
+                    return Some(ret.into());
+                }
                 let name = crate::func_name(f)?;
                 if let Some(t) = variadic_any(&name) {
                     return Some(t.into());
                 }
                 let Some((_, result)) = function_sig(&name) else {
+                    // A domain argument resolves on its base type, as
+                    // `call_by_signature` prints it.
                     let types = f
                         .args
                         .iter()
-                        .map(|a| self.typ(a))
+                        .map(|a| {
+                            let t = self.typ(a)?;
+                            Some(information_schema_domain(&t).map_or(t, |(_, b)| b.to_string()))
+                        })
                         .collect::<Option<Vec<String>>>()?;
                     return crate::funcsig::selected_result_type(&name, &types)
                         .or_else(|| crate::funcsig::resolved_result_type(&name, &types))
@@ -2423,6 +2470,9 @@ impl<'a> Printer<'a> {
         if f.func_variadic {
             return None;
         }
+        if let Some((name, params, _)) = self.schema_helper(f) {
+            return self.schema_helper_call(f, &name, params);
+        }
         let parts = names(&f.funcname);
         let name = parts.last()?.clone();
         if parts.len() > 1 && parts[0] != "pg_catalog" {
@@ -2691,6 +2741,105 @@ impl<'a> Printer<'a> {
         Some(())
     }
 
+    /// The `information_schema` helper `f` calls: qualified by its schema,
+    /// or bare inside an `information_schema` view, which
+    /// `information_schema.sql` creates under `search_path =
+    /// information_schema`. Its name, parameter types and result.
+    fn schema_helper(
+        &self,
+        f: &pg_query::protobuf::FuncCall,
+    ) -> Option<(String, &'static [&'static str], &'static str)> {
+        let parts = names(&f.funcname);
+        let name = match parts.as_slice() {
+            [s, n] if s == "information_schema" => n,
+            [n] if self.cat.home_schema == Some("information_schema") => n,
+            _ => return None,
+        };
+        let (params, ret) = information_schema_helper(name)?;
+        Some((name.clone(), params, ret))
+    }
+
+    /// A call of an `information_schema` helper, printed with its schema
+    /// (`generate_function_name` qualifies a function its search path does
+    /// not see), each argument coerced to its parameter's type:
+    /// `information_schema._pg_char_max_length(t.typbasetype, t.typtypmod)`.
+    fn schema_helper_call(
+        &mut self,
+        f: &pg_query::protobuf::FuncCall,
+        name: &str,
+        params: &[&str],
+    ) -> Option<()> {
+        if f.agg_star
+            || f.agg_distinct
+            || f.func_variadic
+            || f.agg_within_group
+            || f.over.is_some()
+            || !f.agg_order.is_empty()
+            || f.agg_filter.is_some()
+            || f.args.len() != params.len()
+        {
+            return None;
+        }
+        // A row-typed parameter takes only a whole row of its relation.
+        let mut rows = Vec::with_capacity(params.len());
+        let (mut types, mut declared) = (Vec::new(), Vec::new());
+        for (a, want) in f.args.iter().zip(params) {
+            if is_row_param(want) {
+                rows.push(Some(self.whole_row_arg(a, want)?));
+            } else {
+                rows.push(None);
+                types.push(self.typ(a)?);
+                declared.push(want.to_string());
+            }
+        }
+        if !matches!(
+            crate::funcsig::select_routine(&[declared], &types),
+            crate::funcsig::RoutineChoice::One(0)
+        ) {
+            return None;
+        }
+        self.buf
+            .push_str(&format!("information_schema.{}(", q(name)));
+        for (i, ((a, want), row)) in f.args.iter().zip(params).zip(rows).enumerate() {
+            if i > 0 {
+                self.buf.push_str(", ");
+            }
+            if let Some(refname) = row {
+                // `get_variable` of a whole-row Var.
+                self.buf.push_str(&format!("{}.*", q(&refname)));
+                continue;
+            }
+            let own = self.typ(a)?;
+            self.expr_as(a, if own == *want { "" } else { want })?;
+        }
+        self.buf.push(')');
+        Some(())
+    }
+
+    /// A whole row of `relname` as an argument, `rel.*` or a bare `rel`
+    /// naming no column (`transformColumnRef` tries a column first, then
+    /// a relation): the name it prints as.
+    fn whole_row_arg(&self, a: &Node, relname: &str) -> Option<String> {
+        let Some(N::ColumnRef(c)) = a.node.as_ref() else {
+            return None;
+        };
+        let rel = match c.fields.as_slice() {
+            [rel, star] if matches!(star.node.as_ref(), Some(N::AStar(_))) => {
+                sval(rel)?.to_string()
+            }
+            [rel] => {
+                let rel = sval(rel)?.to_string();
+                if self.lookup_entry(std::slice::from_ref(&rel)).is_some() {
+                    return None;
+                }
+                rel
+            }
+            _ => return None,
+        };
+        let (refname, own) = self.relation_named(&rel)?;
+        (own == relname).then_some(refname)
+    }
+
     /// A built-in outside `function_sig`'s table, printed when one of its
     /// `pg_proc` overloads declares exactly the arguments' types -- so no
     /// cast is implied -- as `int4range(a, (a + 1))`.
@@ -2703,11 +2852,24 @@ impl<'a> Printer<'a> {
         {
             return None;
         }
-        let types = f
+        let own = f
             .args
             .iter()
             .map(|a| self.typ(a))
             .collect::<Option<Vec<String>>>()?;
+        // An `information_schema` domain argument resolves on its base type
+        // (`func_select_candidate` reduces a domain to its base), and
+        // `make_fn_arguments` relabels it to the parameter's type, which
+        // `get_func_expr` shows: `pg_has_role((um.srvowner)::name, ...)`.
+        let domains: Vec<Option<&str>> = own
+            .iter()
+            .map(|t| information_schema_domain(t).map(|(_, b)| b))
+            .collect();
+        let types: Vec<String> = own
+            .iter()
+            .zip(&domains)
+            .map(|(t, d)| d.map_or_else(|| t.clone(), str::to_string))
+            .collect();
         // Otherwise the overload PostgreSQL's `func_select_candidate` picks,
         // with each argument coerced to its declared type as the analysed
         // query carries it: `to_char(d, 'YYYY')` over a date is
@@ -2723,7 +2885,12 @@ impl<'a> Printer<'a> {
             // A polymorphic parameter takes its argument as it is (an
             // untyped literal would need the polymorphic resolution).
             let mut out = Vec::with_capacity(d.len());
-            for (want, have) in d.iter().zip(&types) {
+            for ((want, have), dom) in d.iter().zip(&types).zip(&domains) {
+                if want.starts_with("any") && dom.is_some() {
+                    // A domain at a polymorphic parameter resolves the
+                    // polymorphism on its base type: not reproduced.
+                    return None;
+                }
                 if want == "any" && have == "unknown" {
                     // `"any"` takes an untyped literal as it is: printed
                     // bare (`jsonb_build_object('a', x)`).
@@ -2744,6 +2911,14 @@ impl<'a> Printer<'a> {
             }
             out
         };
+        let declared: Vec<String> = declared
+            .into_iter()
+            .zip(&domains)
+            .map(|(d, dom)| match (d.is_empty(), dom) {
+                (true, Some(b)) => b.to_string(),
+                _ => d,
+            })
+            .collect();
         self.buf.push_str(&q(name));
         self.buf.push('(');
         for (i, a) in f.args.iter().enumerate() {
@@ -3311,6 +3486,11 @@ impl Printer<'_> {
                 out.push(Rte {
                     refname,
                     name,
+                    relname: if is_cte {
+                        String::new()
+                    } else {
+                        rv.relname.clone()
+                    },
                     columns,
                     kind: if is_cte {
                         RteKind::Other
@@ -7093,6 +7273,23 @@ mod tests {
             home_schema: None,
         };
         viewdef(sql, written, &cat)
+    }
+
+    // An `information_schema` helper prints only over the arguments its
+    // `pg_proc` row takes (RP-798): a whole row of another relation is
+    // PostgreSQL's 42883 at CREATE VIEW, as is a bare helper name outside
+    // `information_schema` (whose views are created under its search
+    // path), so neither prints.
+    #[test]
+    fn an_information_schema_helper_prints_only_over_its_own_arguments() {
+        for sql in [
+            "SELECT information_schema._pg_truetypid(vd_t, vd_u) FROM vd_t, vd_u",
+            "SELECT information_schema._pg_truetypid(vd_t.*, vd_u.*) FROM vd_t, vd_u",
+            "SELECT _pg_numeric_scale(vd_t.id, vd_t.id) FROM vd_t",
+            "SELECT information_schema._pg_numeric_scale(vd_t.t, vd_t.id) FROM vd_t",
+        ] {
+            assert_eq!(render(sql), None, "{sql}");
+        }
     }
 
     // A reference stored under its `schema.name` key carries its bare name
