@@ -9542,11 +9542,29 @@ fn hash_semi_join_of(
 /// (`calc_joinrel_size_estimate`). PostgreSQL 15 hashes only the nullable
 /// side of an anti join. It also weighs a Merge Anti Join, which is not
 /// priced here: the hash join is answered only where it is cheaper than
-/// the two Sorts a merge must start with, so no merge can beat it; a
-/// side read through an index (presorted for a merge) is not priced.
+/// the Sorts a merge must start with, so no merge can beat it. A side
+/// whose key a B-tree leads with (a primary key, RP-1133) may be read
+/// presorted by it, which bounds that side's input by the index's read
+/// instead; over a nullable side so keyed, `match_unsorted_outer` also
+/// probes the index once an outer row, by an index scan and by a bitmap
+/// heap scan ([`joincost::nest_loop_anti_param`]). The nested loop over
+/// the nullable side's cheapest path, or a Material of it, is weighed too
+/// ([`joincost::cheapest_nest_loop_anti`]). Where any of them comes
+/// within the fuzz factor, the plan is not priced: a nested loop anti
+/// join probing the index is not drawn. A preserved side read through an
+/// index for its own WHERE, and a keyed side read through any index, are
+/// not priced.
 fn hash_anti_join_of(a: HashSide, b: HashSide) -> Option<JoinEstimate> {
     use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
-    if a.pg_type != b.pg_type || a.index.is_some() || a.key_indexed || b.key_indexed {
+    if a.pg_type != b.pg_type || a.index.is_some() {
+        return None;
+    }
+    // A side keyed by a B-tree is priced where it is read by its own
+    // scan and the model sizes that index (RP-1133).
+    if [&a, &b]
+        .iter()
+        .any(|s| s.key_indexed && (s.index.is_some() || s.key_index.is_none()))
+    {
         return None;
     }
     fn key(s: &HashSide) -> KeyStats<'_> {
@@ -9599,9 +9617,74 @@ fn hash_anti_join_of(a: HashSide, b: HashSide) -> Option<JoinEstimate> {
             startup
         }
     };
-    let sorts = sort(&a) + sort(&b);
+    // A side whose key's B-tree presorts it (RP-1133) is read through
+    // that index across `mergejoinscansel`'s fraction of it
+    // (`initial_cost_mergejoin`), or sorted, the cheaper. The preserved
+    // side of an anti join is read whole.
+    let scansel = if a.key_ops > 0.0 || b.key_ops > 0.0 || a.no_stats || b.no_stats {
+        None
+    } else if a.key_indexed || b.key_indexed {
+        joincost::mergejoinscansel(&merge_column(&a)?, &merge_column(&b)?)
+    } else {
+        None
+    };
+    let input = |s: &HashSide, frac: (f64, f64)| -> Option<f64> {
+        if !s.key_indexed {
+            return Some(sort(s));
+        }
+        let k = s.key_index.as_ref()?;
+        let (st, tt) = costsize::ordered_index_scan_with(
+            &k.rel,
+            &k.index,
+            &k.quals,
+            costsize::ColSel::Ndistinct(k.ndistinct),
+        );
+        Some(sort(s).min(st + (tt - st) * (frac.1 - frac.0)))
+    };
+    let inner_frac = scansel.map_or((0.0, 1.0), |(_, _, rs, re)| (rs, re));
+    let sorts = input(&a, (0.0, 1.0))? + input(&b, inner_frac)?;
     if total >= sorts {
         return None;
+    }
+    // The nested loops (`match_unsorted_outer`, the preserved side outer):
+    // each pair pays the join clause, its `=` and each side's operators.
+    let qual = costsize::CPU_OPERATOR_COST * (1.0 + a.key_ops + b.key_ops);
+    let total_hash = total;
+    let plain = joincost::cheapest_nest_loop_anti(a.scan, b.scan, qual, (jselec, match_count));
+    if plain.total <= total_hash * 1.01 {
+        return None;
+    }
+    if b.key_indexed {
+        let k = b.key_index.as_ref()?;
+        let loops = a.scan.2;
+        // `get_parameterized_baserel_size`, as `unique_key_other_paths`
+        // sizes the probe.
+        let ppi_rows = costsize::clamp_row_est(k.rel.tuples * k.where_sel / k.ndistinct.max(1.0))
+            .min(b.scan.2);
+        // The outer operand of the index qual, evaluated once a probe
+        // (`genericcostestimate`'s `qual_arg_cost`, RP-1032).
+        let qual_arg = a.key_ops * costsize::CPU_OPERATOR_COST;
+        let probes = [
+            costsize::param_index_scan(&k.rel, &k.index, &k.quals, k.ndistinct, loops)?,
+            costsize::param_bitmap_heap_scan(
+                &k.rel,
+                &k.index,
+                &k.quals,
+                k.ndistinct,
+                loops,
+                ppi_rows,
+            )?,
+        ];
+        for (startup, total) in probes {
+            let (_, nest) = joincost::nest_loop_anti_param(
+                (a.scan.0, a.scan.1, a.scan.2),
+                (startup + qual_arg, total + qual_arg, ppi_rows),
+                (jselec, match_count),
+            );
+            if nest <= total_hash * 1.01 {
+                return None;
+            }
+        }
     }
     let rows = costsize::clamp_row_est(outer.rows * (1.0 - jselec));
     Some((

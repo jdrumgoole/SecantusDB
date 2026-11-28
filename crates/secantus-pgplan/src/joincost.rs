@@ -1113,6 +1113,27 @@ pub fn cheapest_nest_loop_anti(
     nest_loop_paths(a, b, qual, [None, Some(factors)], &[false])
 }
 
+/// The nested loop of an anti join whose inner is the nullable side's
+/// index scan parameterized by the outer row (RP-1133): `outer` its
+/// `(startup, total, rows)`, `inner` the scan's `(startup, total, rows)` a
+/// probe. `final_cost_nestloop` for JOIN_ANTI with `has_indexed_join_quals`:
+/// a matched outer row reads `2 / (match count + 1)` of the probe, an
+/// unmatched one the cost of its first tuple; the join clause is the
+/// index's, so no qual is left to check on a pair. No Memoize:
+/// `inner_unique` is never proven for JOIN_ANTI, and `get_memoize_path`
+/// refuses an anti join that is not. `factors` as
+/// [`cheapest_nest_loop_anti`]'s. `(startup, total)`.
+pub fn nest_loop_anti_param(
+    outer: (f64, f64, f64),
+    inner: (f64, f64, f64),
+    factors: (f64, f64),
+) -> (f64, f64) {
+    let outer = InPath::scan(outer.0, outer.1, outer.2, None);
+    let mut inner = InPath::scan(inner.0, inner.1, inner.2, None);
+    inner.indexed = true;
+    nestloop_cost(&outer, &inner, Some(factors), true, 0.0)
+}
+
 fn nest_loop_paths(
     a: (f64, f64, f64, i64),
     b: (f64, f64, f64, i64),
