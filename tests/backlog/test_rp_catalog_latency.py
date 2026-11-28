@@ -516,7 +516,7 @@ def _block_costs(conn: Any, prefix: str) -> list[float]:
     return costs
 
 
-@pytest.mark.backlog("RP-1112")
+@pytest.mark.backlog_fixed("RP-1112")
 def test_ten_create_tables_in_one_block_cost_what_they_do_one_at_a_time(pg: Any) -> None:
     """A migration tool (Alembic, Django) runs its DDL inside one
     transaction block. PostgreSQL 15.20 takes the same time for ten
@@ -527,8 +527,18 @@ def test_ten_create_tables_in_one_block_cost_what_they_do_one_at_a_time(pg: Any)
     caches and indexes, so the last statement in a block costs what the
     first does. A debug `secantusd-pg` on arm64 macOS took 4.3 s for ten
     in a block against 0.7 s in autocommit, and 14.2 s against 1.2 s for
-    twenty (2026-11-26): each DDL in the block costs more than the one
-    before it, so a block's cost grows with the square of its statements.
+    twenty (2026-11-26): each DDL in the block cost more than the one
+    before it, so a block's cost grew with the square of its statements.
+
+    The cause was the oid counter. Each `CREATE TABLE` mints its oids
+    outside the block, as PostgreSQL's `GetNewObjectId` reads shared
+    memory, and those commits counted as ones the next statement might
+    read: under READ COMMITTED it was moved onto a new snapshot, which
+    replays every write the block has made, the WiredTiger creates of
+    its tables among them. The staleness check now passes over the
+    counter as it does a sequence the block did not write. Then 24 to
+    67 ms a statement, flat over thirty, and twenty in one simple query
+    0.73 s (2026-11-28).
 
     First written as ten in a block against ten in autocommit, within
     twice plus 50 ms. That compared the block with the runner's commit

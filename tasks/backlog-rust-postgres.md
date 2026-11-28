@@ -3999,29 +3999,6 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not exists beside an outer or is a hash anti join], tests/backlog/test_rp_explain_costs.py::test_plan[a not exists beside an outer in list is a hash anti join], tests/backlog/test_rp_explain_costs.py::test_plan[a not exists beside an outer expression comparison is a hash anti join]
       Backlog-ID: RP-1134
 
-## Found while working RP-1073 (2026-11-26)
-
-- [ ] **Each `CREATE TABLE` inside a transaction block costs more than the
-      one before it.** Ten in one `BEGIN` ... `COMMIT` took a debug
-      `secantusd-pg` 4.3 s against 0.7 s for the same ten in autocommit,
-      and twenty 14.2 s against 1.2 s (arm64 macOS, 2026-11-26, an empty
-      schema): the cost grows with the square of the block's statements.
-      A multi-statement simple query, which runs as one implicit block, is
-      the same (twenty in one string, 14.2 s). PostgreSQL 15.20 on a
-      private cluster takes the same time either way (317 ms against
-      266 ms for ten, 82 ms against 62 ms for twenty, with fsync): a
-      statement in the block reads its own transaction's catalog rows
-      through the same caches and indexes. Every migration tool that wraps
-      its DDL in a transaction (Alembic, Django) pays it. Not yet
-      profiled: the in-block reads bypass the committed catalog's shared
-      copies (`block_wrote_catalog`, `in_open_transaction`), which is the
-      first place to look. The gap test compares the block's last
-      statements with its first, not the block with autocommit: CI's
-      Linux runner commits so cheaply that the first form passed there
-      once (run 45774818452, PR #3019, 2026-11-26).
-      Verify: tests/backlog/test_rp_catalog_latency.py::test_ten_create_tables_in_one_block_cost_what_they_do_one_at_a_time
-      Backlog-ID: RP-1112
-
 ## Found on another session's gate (2026-11-26)
 
 - [ ] **`stop()` takes about 2.7 s with nothing to wait for, and the test

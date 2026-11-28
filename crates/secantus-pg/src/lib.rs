@@ -39389,6 +39389,19 @@ impl PgHandler {
                             if Self::is_sequence_collection(coll) && !own_sequences {
                                 return secantus_storage::NsRead::No;
                             }
+                            // The oid counter is read and advanced only
+                            // outside the block (`mint_global_oids`), as
+                            // PostgreSQL's `GetNewObjectId` reads shared
+                            // memory, never a snapshot: its commits, one or
+                            // two for every relation, type or constraint a
+                            // statement creates, change no answer. Counted,
+                            // each DDL statement in a block replayed every
+                            // write the block had made (RP-1112).
+                            if db == Self::OID_COUNTER_NAMESPACE
+                                && coll == Self::OID_COUNTER_COLLECTION
+                            {
+                                return secantus_storage::NsRead::No;
+                            }
                             match &narrow {
                                 Some(reads) => reads.reads(db, coll),
                                 None => secantus_storage::NsRead::All,
