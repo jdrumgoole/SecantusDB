@@ -1296,10 +1296,10 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       and `$in`s), skip, limit, a simple projection of top-level fields,
       since 2026-11-26 a sort on one top-level field with or without a
       limit, and since 2026-11-28 on several, with mongod's parallel-arrays
-      check, or with a skip alone (`explain/sbe/find.rs`). Also not built: a
-      sort on a path (`traverseP` with `getNonLeafSortKeyAsc`), or with a
-      projection, or with a skip and a limit both (mongod's sort limit is
-      then a `let` of `skip + limit`, guarded by `typeMatch`); an `$in` holding null (mongod's `typeMatch` program), a
+      check, or with a skip, alone or with a limit (`explain/sbe/find.rs`).
+      Also not built: a sort on a path (`traverseP` with
+      `getNonLeafSortKeyAsc`), or with a projection; an `$in` holding null
+      (mongod's `typeMatch` program), a
       projection of a path or a computed field, and a projection under both
       a skip and a limit. For an `aggregate` (RM-542) the `$addFields`
       after its query are built when they set new top-level fields to

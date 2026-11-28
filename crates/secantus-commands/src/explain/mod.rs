@@ -2674,14 +2674,12 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                 }
             );
             // A sort on top-level fields over a forward collection scan,
-            // with no skip or projection (RM-543): `sort` over a `project`
-            // of its keys.
+            // with no projection (RM-543): `sort` over a `project` of its
+            // keys.
             let sorted = s
                 .sort
                 .as_ref()
-                .filter(|d| {
-                    !d.is_empty() && own_read && (s.skip == 0 || s.limit == 0) && !projected_find(s)
-                })
+                .filter(|d| !d.is_empty() && own_read && !projected_find(s))
                 .and_then(|d| {
                     d.iter()
                         .map(|(k, v)| match v {

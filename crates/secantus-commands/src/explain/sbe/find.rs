@@ -213,12 +213,14 @@ pub(super) fn build(uuid: &str, front: &Front, spec: Option<&Document>) -> Optio
 /// project's last slot: an `||` of two `isArray`s for two keys, a sum of
 /// `<=>`s for more (measured 8.2.11, 2026-11-28). A skip alone is a
 /// `limitskip none` over the sort, its own `SKIP` node, its constant in
-/// the slot after the sort's (measured 8.2.11, 2026-11-28). `None` with a
-/// skip and a limit both (mongod's sort limit is then a `let` of their
-/// sum), or a `seek`.
+/// the slot after the sort's (measured 8.2.11, 2026-11-28). A skip and a
+/// limit both make the sort's top-k `skip + limit`, printed as a `let` of
+/// the two slots (the limit's, then the skip's) guarded by `typeMatch`,
+/// its frame the one after the filter's, and the skip a `limitskip none`
+/// over the sort on the skip's slot, with no limit stage (measured 8.2.11,
+/// 2026-11-28). `None` for a `seek`.
 pub(super) fn build_sorted(uuid: &str, front: &Front, keys: &[(String, bool)]) -> Option<Plan> {
-    if (front.skip > 0 && front.limit > 0)
-        || front.seek.is_some()
+    if front.seek.is_some()
         || keys.is_empty()
         || keys.iter().any(|(f, _)| f.is_empty() || f.contains('.'))
     {
@@ -307,11 +309,33 @@ pub(super) fn build_sorted(uuid: &str, front: &Front, keys: &[(String, bool)]) -
         env.push((s, front.limit.to_string()));
         (s, front.limit)
     });
+    let skip = (front.skip > 0).then(|| {
+        let s = slots.next();
+        env.push((s, front.skip.to_string()));
+        (s, front.skip)
+    });
+    let (limit, limit_expr) = match (limit, skip) {
+        (Some((l, n)), Some((s, k))) => {
+            let frame = 2 + under.filter.as_ref().map_or(0, |f| f.frames());
+            let sum = Expr::bin(BinOp::Add, Expr::Slot(l), Expr::Slot(s));
+            let guarded = Expr::if_(
+                Expr::TypeMatch(Box::new(Expr::local(frame, false)), 262_144),
+                Expr::func("makeOwn", vec![Expr::local(frame, true)]),
+                Expr::Int64(i64::MAX),
+            );
+            (
+                Some((l, n.saturating_add(k))),
+                Some(Expr::let_(frame, sum, guarded)),
+            )
+        }
+        (limit, _) => (limit, None),
+    };
     let root = Stage::Sort {
         node,
         keys: sort_keys,
         outputs: vec![record],
         limit,
+        limit_expr,
         input: Box::new(project),
     };
     let mut pattern = Document::new();
@@ -324,14 +348,12 @@ pub(super) fn build_sorted(uuid: &str, front: &Front, keys: &[(String, bool)]) -
         "sortPattern": pattern,
         "memLimit": 104_857_600_i32,
     };
-    if front.limit > 0 {
-        sort.insert("limitAmount", super::number(front.limit));
+    if let Some((_, n)) = limit {
+        sort.insert("limitAmount", super::number(n));
     }
     sort.insert("type", "simple");
     sort.insert("inputStage", query_plan);
-    let (root, query_plan) = if front.skip > 0 {
-        let s = slots.next();
-        env.push((s, front.skip.to_string()));
+    let (root, query_plan) = if let Some((s, _)) = skip {
         let root = Stage::LimitSkip {
             node: node + 1,
             limit: None,
@@ -875,10 +897,27 @@ mod tests {
                     .to_string()
             )
         );
-        // Not built: a path, a skip with a limit.
-        assert!(super::build_sorted("u", &gt1(), &[("d.e".to_string(), false)]).is_none());
-        assert!(
-            super::build_sorted("u", &front(doc! {}, 1, 2), &[("y".to_string(), false)]).is_none()
+        // A skip and a limit: the sort's top-k a `let` of their sum, the
+        // frame after the filter's, and no limit stage over the skip
+        // (measured 8.2.11, 2026-11-28).
+        let (_, stages) = sorted(&front(doc! { "x": { "$gt": 1 } }, 1, 2), "y", false);
+        assert_eq!(
+            stages,
+            "[3] limitskip none s7 \n\
+             [2] sort [s5] [asc] [s1] \n    \
+             let [\n        \
+             l4.0 = (s6 + s7) \n    \
+             ] \n    \
+             in \n        \
+             if typeMatch(l4.0, 262144) \n        \
+             then makeOwn(move(l4.0)) \n        \
+             else 9223372036854775807ll \n\
+             \n\
+             [2] project [s5 = getSortKeyAsc(s3)] \n\
+             [1] filter {traverseF(s4, lambda(l2.0) { ((move(l2.0) > 1) ?: false) }, false)} \n\
+             [1] scan s1 s2 none none none none none none [s3 = y, s4 = x] @\"u\" true false "
         );
+        // Not built: a path.
+        assert!(super::build_sorted("u", &gt1(), &[("d.e".to_string(), false)]).is_none());
     }
 }

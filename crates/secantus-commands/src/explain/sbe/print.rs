@@ -465,6 +465,7 @@ fn stage(st: &Stage, level: usize, lines: &mut Vec<String>) {
             keys,
             outputs,
             limit,
+            limit_expr,
             input,
         } => {
             let slots_of: Vec<u32> = keys.iter().map(|(s, _)| *s).collect();
@@ -478,7 +479,9 @@ fn stage(st: &Stage, level: usize, lines: &mut Vec<String>) {
                 dirs.join(", "),
                 slots(outputs)
             );
-            if let Some((s, _)) = limit {
+            if let Some(e) = limit_expr {
+                line.push_str(&expression_at(e, level));
+            } else if let Some((s, _)) = limit {
                 line.push_str(&format!("s{s} "));
             }
             push(lines, level, line);
