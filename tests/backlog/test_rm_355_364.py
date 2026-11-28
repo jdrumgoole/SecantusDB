@@ -521,7 +521,25 @@ _MATCHING_WRITES = {
     "retryable insert, a duplicate last": lambda d: _insert_with_a_duplicate(
         d, ordered=True, docs=[{"_id": 200}, {"_id": 201}, {"_id": 1}]
     ),
+    # More documents than a tenth of `internalInsertMaxBatchSize` (500)
+    # take one read round for the collection's index count, which tunes the
+    # batch size, outside a transaction (`getTunedMaxBatchSize`, measured
+    # 2026-11-28).
+    "insert of fifty": lambda d: _plain(d).c.insert_many([{"_id": 300 + n} for n in range(50)]),
+    "insert of fifty-one": lambda d: _plain(d).c.insert_many([{"_id": 300 + n} for n in range(51)]),
+    "retryable insert of two hundred": lambda d: d.c.insert_many(
+        [{"_id": 300 + n} for n in range(200)]
+    ),
+    "unordered insert of sixty-four, one a duplicate": lambda d: _insert_with_a_duplicate(
+        _plain(d), docs=[{"_id": 1 if n == 30 else 300 + n} for n in range(64)]
+    ),
+    "insert of fifty-one in a transaction": lambda d: _insert_many_in_transaction(d, 51),
 }
+
+
+def _insert_many_in_transaction(d: Any, n: int) -> None:
+    with d.client.start_session() as s, s.start_transaction():
+        d.c.insert_many([{"_id": 300 + i} for i in range(n)], session=s)
 
 
 @pytest.mark.backlog_fixed("RM-357")
@@ -545,21 +563,13 @@ def test_a_write_reports_mongods_locks_and_flow_control(
     collection in X twice under one write round (measured 2026-11-16); this
     server took the plain chain once. An insert of several documents one of
     which fails takes a round for each run of the documents inserted again
-    one at a time (measured 2026-11-27); this server took one round."""
+    one at a time (measured 2026-11-27); this server took one round. An
+    insert of more than 50 documents takes one read round more, for the
+    index count that tunes its batch size (measured 2026-11-28); this
+    server took none."""
     answers = _write_locks(rust_mongo, mongod_rs, _MATCHING_WRITES[name])
     assert answers["mongod"]
     assert answers["rust"] == answers["mongod"]
-
-
-#: Writes whose locks are not mongod's yet (RM-357's remainder).
-_DIVERGING_WRITES = {
-    # mongod takes the transition, global, database and collection locks
-    # in IS once more for a batch of 64 documents, failing or not
-    # (measured 8.2.11, 2026-11-27); this server takes no such round.
-    "insert of sixty-four": lambda d: _plain(d).c.insert_many(
-        [{"_id": 300 + n} for n in range(64)]
-    ),
-}
 
 
 def _insert_with_a_duplicate(d: Any, ordered: bool = False, docs: list | None = None) -> None:
@@ -784,17 +794,6 @@ def test_a_find_and_modify_that_removes_takes_one_round(
 def _in_transaction(d: Any) -> None:
     with d.client.start_session() as s, s.start_transaction():
         d.c.insert_one({"_id": 200}, session=s)
-
-
-@pytest.mark.backlog("RM-357")
-@pytest.mark.parametrize("name", list(_DIVERGING_WRITES))
-def test_more_writes_report_mongods_locks(rust_mongo: Any, mongod_rs: Any, name: str) -> None:
-    """mongod 8.2.11's `locks` and `flowControl` on the lines of the writes
-    above (measured 2026-11-07), which this server's lock rounds do not
-    take yet."""
-    answers = _write_locks(rust_mongo, mongod_rs, _DIVERGING_WRITES[name])
-    assert answers["mongod"]
-    assert answers["rust"] == answers["mongod"]
 
 
 @pytest.mark.backlog_fixed("RM-357")

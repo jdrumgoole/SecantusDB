@@ -675,12 +675,11 @@ These are explicit non-goals. Don't add them without a reason.
       alone once for each X round after the first; since 2026-11-18 a
       collectionless `aggregate`'s `$lookup` and `$unionWith` take the
       global IS twice for each read of their collection, under no lock of
-      the command's. Still different,
+      the command's; since 2026-11-27 a failed batch's one-at-a-time
+      rounds match, and since 2026-11-28 an `insert` of more than 50
+      documents takes mongod's read round for the index count that tunes
+      its batch size. Still different,
       measured against a one-member replica set:
-      - an `insert` of 64 documents or more (measured at 64 and 70, failing
-        or not): mongod takes one more round of the transition, global,
-        database and collection locks in IS; this server takes none (the
-        one-at-a-time rounds after a failed batch match since 2026-11-27);
       - an `insert` whose batch fails counts an interrupt check for each
         lock on mongod; this server's line prints no `numInterruptChecks`
         (RM-360);
@@ -700,7 +699,7 @@ These are explicit non-goals. Don't add them without a reason.
         entry (one more on mongod) and its line's execution admissions are
         not compared yet.
       Backlog-ID: RM-357
-      Verify: tests/backlog/test_rm_355_364.py::test_more_writes_report_mongods_locks
+      Verify: none -- the interrupt checks are RM-360's and the execution admissions RM-355's; a `collMod` of a missing collection and the two profile entries are not measured yet
 - [ ] **Some queries have no `queryShapeHash`.** Since 2026-11-07 a
       `find`'s, `distinct`'s and `aggregate`'s line, profile entry and
       `explain` carry mongod's `queryShapeHash` (`secantus-commands`
