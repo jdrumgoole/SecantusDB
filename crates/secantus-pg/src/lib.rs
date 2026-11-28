@@ -48316,36 +48316,77 @@ impl PgHandler {
                 // A join on an expression key is hashed on the expression
                 // where that path prices (RP-981): the right side under a
                 // Hash, and its ON (attached below) the Hash Cond.
-                if let Statement::Select(sel) = inner.as_ref() {
+                fn hash_expr_key(node: &mut explain::PlanNode) {
                     if matches!(
-                        tree.name.as_str(),
+                        node.name.as_str(),
                         "Nested Loop" | "Nested Loop Left Join" | "Nested Loop Anti Join"
-                    ) && tree.children.len() == 2
-                        && tree.children.iter().all(|c| c.children.is_empty())
-                        && scan_estimate::has_expr_join_key(sel)
-                        && self.hash_join_estimate(sel).is_some()
+                    ) && node.children.len() == 2
+                        && node.children.iter().all(|c| c.children.is_empty())
                     {
-                        tree.name = tree.name.replace("Nested Loop", "Hash");
-                        if tree.name == "Hash" {
-                            tree.name = "Hash Join".into();
+                        node.name = node.name.replace("Nested Loop", "Hash");
+                        if node.name == "Hash" {
+                            node.name = "Hash Join".into();
                         }
-                        let right = tree.children.pop().expect("two children");
-                        tree.children.push(explain::PlanNode::over("Hash", right));
+                        let right = node.children.pop().expect("two children");
+                        node.children.push(explain::PlanNode::over("Hash", right));
                     }
                 }
-                let plain_scan =
-                    |n: &str| n.starts_with("Seq Scan on ") || n.starts_with("Index Scan using ");
-                if matches!(
-                    tree.name.as_str(),
-                    "Hash Join" | "Hash Left Join" | "Hash Anti Join"
-                ) && tree.children.len() == 2
-                    && tree.children[0].children.is_empty()
-                    && plain_scan(&tree.children[0].name)
-                    && tree.children[1].name == "Hash"
-                    && tree.children[1].children.len() == 1
-                    && tree.children[1].children[0].children.is_empty()
-                    && plain_scan(&tree.children[1].children[0].name)
+                if let Statement::Select(sel) = inner.as_ref() {
+                    if scan_estimate::has_expr_join_key(sel)
+                        && self.hash_join_estimate(sel).is_some()
+                    {
+                        hash_expr_key(&mut tree);
+                    }
+                }
+                // A hash join of two relations' plain scans, the right one
+                // under its Hash.
+                fn hash_of_two_scans(node: &explain::PlanNode) -> bool {
+                    let plain_scan = |n: &str| {
+                        n.starts_with("Seq Scan on ") || n.starts_with("Index Scan using ")
+                    };
+                    matches!(
+                        node.name.as_str(),
+                        "Hash Join" | "Hash Left Join" | "Hash Anti Join"
+                    ) && node.children.len() == 2
+                        && node.children[0].children.is_empty()
+                        && plain_scan(&node.children[0].name)
+                        && node.children[1].name == "Hash"
+                        && node.children[1].children.len() == 1
+                        && node.children[1].children[0].children.is_empty()
+                        && plain_scan(&node.children[1].children[0].name)
+                }
+                // The same under a plain Aggregate (RP-1129): the join
+                // priced as the select of the rows it aggregates
+                // (`aggregate_join_select`), its expression key hashed
+                // where that prices, and AGG_PLAIN over the join's
+                // cheapest path.
+                if tree.name == "Aggregate"
+                    && tree.details.is_empty()
+                    && tree.estimate.is_none()
+                    && tree.children.len() == 1
                 {
+                    if let Some(sel) = match inner.as_ref() {
+                        Statement::Aggregate(agg) => PgHandler::aggregate_join_select(agg),
+                        _ => None,
+                    } {
+                        if let Some(est) = self.hash_join_estimate(&sel) {
+                            let join_node = &mut tree.children[0];
+                            if scan_estimate::has_expr_join_key(&sel) {
+                                hash_expr_key(join_node);
+                            }
+                            if hash_of_two_scans(join_node) {
+                                explain::apply_join_pick(join_node, &sel, est, &options.join_conds);
+                                if let (Some(join), Statement::Aggregate(agg)) =
+                                    (join_node.estimate, inner.as_ref())
+                                {
+                                    tree.estimate =
+                                        scan_estimate::plain_agg_estimate(join, &agg.items);
+                                }
+                            }
+                        }
+                    }
+                }
+                if hash_of_two_scans(&tree) {
                     if let Statement::Select(sel) = inner.as_ref() {
                         let sel = joined_sort.as_ref().unwrap_or(sel);
                         if let Some((a, b, join, pick, indexes)) = self

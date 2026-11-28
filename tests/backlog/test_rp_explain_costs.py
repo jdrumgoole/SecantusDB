@@ -6816,7 +6816,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on a private PostgreSQL 15.20 cluster (RP-1129, found while
-    # working RP-1032): `cost_agg`'s AGG_PLAIN over the hash join, each scan narrowed to its key.
+    # working RP-1032): `cost_agg`'s AGG_PLAIN over the hash join, each scan
+    # narrowed to its key. Printed zero costs until RP-1129 priced the join
+    # under the Aggregate as the select of the rows it aggregates.
     "an aggregate over a hash join is priced": (
         "RP-1129",
         _ANALYSED,
@@ -6831,7 +6833,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on a private PostgreSQL 15.20 cluster (RP-1129, found while
-    # working RP-1032): as over a column key, the clause paying the expression's operator.
+    # working RP-1032): as over a column key, the clause paying the
+    # expression's operator. Drawn as an unpriced Nested Loop until RP-1129.
     "an aggregate over a hash join on an expression key is priced": (
         "RP-1129",
         _ANALYSED,
@@ -11503,6 +11506,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1129",
         "RP-1127",
         "RP-1121",
         "RP-1117",
