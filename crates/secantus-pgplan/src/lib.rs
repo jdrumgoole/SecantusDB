@@ -447,6 +447,24 @@ impl Error {
             {
                 Some("You must specify an operator class for the index or define a default operator class for the data type.")
             }
+            // A partition key's (`ComputePartitionAttrs`, RP-1091).
+            Error::UndefinedObject(m)
+                if m.starts_with("data type ")
+                    && m.ends_with(" has no default operator class for access method \"btree\"") =>
+            {
+                Some("You must specify a btree operator class or define a default btree operator class for the data type.")
+            }
+            Error::UndefinedObject(m)
+                if m.starts_with("data type ")
+                    && m.ends_with(" has no default operator class for access method \"hash\"") =>
+            {
+                Some("You must specify a hash operator class or define a default hash operator class for the data type.")
+            }
+            Error::Sqlstate("42P16", m)
+                if m.starts_with("no collation was derived for partition key column ") =>
+            {
+                Some("Use the COLLATE clause to set the collation explicitly.")
+            }
             // A PREFIX operator (`- oid`) has one argument, and its hint says so.
             Error::UndefinedFunction(m)
                 if m

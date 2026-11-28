@@ -3621,17 +3621,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415).
 Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
 tests are in `tests/backlog/test_rp_found_rp860.py`.
 
-- [ ] **`pg_get_partkeydef` drops a partition key's COLLATE and operator
-      class.** `partition by range ((x::text) collate "C")` prints
-      `RANGE (((x)::text) COLLATE "C")` on PostgreSQL 15.19, and
-      `((x::text) text_pattern_ops)` prints `RANGE (((x)::text)
-      text_pattern_ops)`; here both print `RANGE (((x)::text))`.
-      `partitions::lower_create` keeps only each `PartitionElem`'s name or
-      expression, never its `collation` / `opclass`: the catalog keeps
-      neither, so the text cannot print them.
-      Verify: tests/backlog/test_rp_found_rp860.py::test_pg_get_partkeydef_keeps_a_key_collation_and_opclass
-      Backlog-ID: RP-1091
-
 - [ ] **`client_min_messages` does not withhold a NOTICE.** After `set
       client_min_messages = warning`, `drop table if exists` of a missing
       table and a DO block's `raise notice` each still send their NOTICE;
@@ -3640,6 +3629,32 @@ tests are in `tests/backlog/test_rp_found_rp860.py`.
       before a notice goes out (`do_block.rs` assumes the default level).
       Verify: tests/backlog/test_rp_found_rp860.py::test_client_min_messages_withholds_a_notice
       Backlog-ID: RP-1092
+
+## Found while working RP-1091 (2026-11-28)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
+tests are in `tests/backlog/test_rp_found_rp1091.py`.
+
+- [ ] **A partition key's COLLATE does not order its bounds or route its
+      rows.** Under `partition by range (t collate "und-x-icu")` with a
+      partition `from ('a') to ('b')`, `insert ... values ('A')` lands in
+      it on PostgreSQL 15.19 (ICU sorts `a < A < b`); here it is 23514 `no
+      partition of relation "pr" found for row`, because the bound
+      condition compares the key bytewise. The key's collation is in the
+      catalog now (`partition_by.collations`, RP-1091), but
+      `partitions::bound_condition` and `partition::cmp_end` (the overlap
+      check between sibling bounds) never apply it; the faithful fix
+      compares each key column under its `partcollation`, as
+      `partition_rbound_cmp` / `FunctionCall2Coll` do.
+      Verify: tests/backlog/test_rp_found_rp1091.py::test_a_range_key_routes_under_its_collation
+      Backlog-ID: RP-1228
+
+- [ ] **`pg_get_partkeydef` does not quote a column key's name.** `create
+      table pq ("X" int) partition by list ("X")` prints `LIST ("X")` on
+      PostgreSQL 15.19 (`quote_identifier(attname)`); here `LIST (X)`.
+      `partition::partkey_text` prints a column key as stored.
+      Verify: tests/backlog/test_rp_found_rp1091.py::test_pg_get_partkeydef_quotes_a_column_key
+      Backlog-ID: RP-1229
 
 ## Found while working RP-1054 (2026-11-25)
 
