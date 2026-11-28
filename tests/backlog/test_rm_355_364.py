@@ -1736,14 +1736,15 @@ def test_a_group_after_a_measurement_match_counts_what_it_examined(
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-363")
+@pytest.mark.backlog_fixed("RM-363")
 def test_a_group_after_a_meta_match_counts_what_it_examined(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11 reads a `$match` on the meta field through its index
     over the buckets before a `$group`, and its line counts what that read
-    examined. This server reads the collection whole there, and counts
-    nothing."""
+    examined (three keys, three buckets). This server read the collection
+    whole there, and counted nothing, until the `$group` ran over the
+    bounded scan of that index (RM-363)."""
     pipeline = [{"$match": {"m": {"$gte": 2}}}, {"$group": {"_id": "$m", "n": {"$sum": 1}}}]
     got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.aggregate(pipeline)), _series)
     answers = {s: _counts(_line(lines, "aggregate")) for s, (lines, _) in got.items()}
@@ -2313,4 +2314,22 @@ def test_a_contested_group_run_again_counts_what_its_cached_plan_examined(
 
     answers = _contested_lines(rust_mongo, mongod_rs, twice)
     assert answers["mongod"][0][0][1].get("keysExamined") == 133
+    assert answers["rust"] == answers["mongod"]
+
+
+def _points(db: Any) -> None:
+    """Ten points on a line, under a `2d` index."""
+    db.g.create_index([("p", "2d")])
+    db.g.insert_many([{"_id": i, "p": [i, i]} for i in range(10)])
+
+
+@pytest.mark.backlog("RM-363")
+def test_a_geo_within_read_counts_what_it_examined(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 reads a `$geoWithin` box through its `2d` index, and its
+    line counts the keys and documents that read examined. This server
+    reads it another way, and counts none."""
+    query = {"p": {"$geoWithin": {"$box": [[0, 0], [3.5, 3.5]]}}}
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.g.find(query)), _points)
+    answers = {s: _counts(_line(lines, "find")) for s, (lines, _) in got.items()}
+    assert answers["mongod"].get("keysExamined")
     assert answers["rust"] == answers["mongod"]

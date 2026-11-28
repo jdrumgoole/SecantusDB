@@ -346,6 +346,10 @@ struct IndexPosition {
     bounds: Option<Vec<Vec<EncodedInterval>>>,
     /// What the scan's stage rechecks on each bucket it fetches.
     filters: Vec<Document>,
+    /// The scan has met a key within its bounds since the last one past
+    /// them: the next key past them is the one mongod's IXSCAN examines
+    /// before it seeks on (or ends).
+    entered: bool,
 }
 
 /// An interval of one key field, as the index's sort-key encodings.
@@ -375,6 +379,8 @@ pub(crate) struct Buffered {
     pub exhausted: bool,
     /// Bucket documents examined.
     pub examined: i64,
+    /// Index keys examined, for a read through an index over the buckets.
+    pub keys: i64,
     /// The buckets that passed the filter and were unpacked.
     pub buckets: usize,
 }
@@ -424,6 +430,7 @@ impl BucketScan {
         mut self,
         storage: &dyn crate::storage::Storage,
         name: &str,
+        bounds: Option<UnionScan>,
     ) -> Result<Option<BucketScan>, crate::storage::StorageError> {
         let ns = crate::ts_store::buckets_ns(&self.coll);
         if !storage
@@ -439,11 +446,16 @@ impl BucketScan {
         {
             return Ok(None);
         }
+        let (bounds, filters) = match bounds {
+            Some(b) => (Some(b.bounds), b.filters),
+            None => (None, Vec::new()),
+        };
         self.indexes = vec![IndexPosition {
             name: name.to_string(),
             last: None,
-            bounds: None,
-            filters: Vec::new(),
+            bounds,
+            filters,
+            entered: false,
         }];
         Ok(Some(self))
     }
@@ -482,6 +494,7 @@ impl BucketScan {
                 last: None,
                 bounds: Some(child.bounds.clone()),
                 filters: child.filters.clone(),
+                entered: false,
             });
         }
         self.indexes = positions;
@@ -542,6 +555,7 @@ impl BucketScan {
             docs: Vec::new(),
             exhausted: true,
             examined: 0,
+            keys: 0,
             buckets: 0,
         };
         let (mut count, mut bytes) = (0usize, 0usize);
@@ -594,6 +608,7 @@ impl BucketScan {
             docs: Vec::new(),
             exhausted: false,
             examined: 0,
+            keys: 0,
             buckets: 0,
         };
         let (mut count, mut bytes) = (0usize, 0usize);
@@ -631,10 +646,19 @@ impl BucketScan {
                 }
                 let pos = &mut self.indexes[self.at];
                 pos.last = Some((resume, rid.clone()));
-                // An entry outside the scan's bounds is not read.
+                // An entry outside the scan's bounds is not read. mongod
+                // seeks over those below an interval, and examines the key
+                // past one, which ends it (RM-363: three keys for `m >= 2`
+                // over five series).
                 if pos.bounds.as_ref().is_some_and(|b| !within(&raw, b)) {
+                    if pos.entered {
+                        out.keys += 1;
+                        pos.entered = false;
+                    }
                     continue;
                 }
+                out.keys += 1;
+                pos.entered = true;
                 // A scan alone returns a multikey index's bucket once; an
                 // `OR` returns a bucket from its children once, after the
                 // child's own recheck.
