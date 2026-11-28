@@ -1362,7 +1362,16 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .unwrap_or(0);
     let store = ctx.storage.clone();
     if let (true, Some(store)) = (ctx.exec_stats.is_none() && !tailable, store) {
-        let examined = is_clustered(store.as_ref(), &ctx.db_name, &coll)
+        // A `$geoWithin` / `$geoIntersects` read through a geo index is
+        // counted the same way: no stream reads one, and `explain`'s run of
+        // its plan examines what mongod's does (RM-363; mongod 8.2.11 counts
+        // a `$box` over ten points under a `2d` index as `keysExamined: 5`,
+        // `docsExamined: 4`).
+        let counted = is_clustered(store.as_ref(), &ctx.db_name, &coll)
+            || doc
+                .get_document("filter")
+                .is_ok_and(|f| reads_geo_region(f));
+        let examined = counted
             .then(|| {
                 crate::explain::summary::find_examined_marks(store.as_ref(), &ctx.db_name, doc)
             })
@@ -1411,6 +1420,22 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 }
 
 /// `db.coll` is clustered: its records are keyed by `_id`.
+/// Whether a filter names `$geoWithin` / `$geoIntersects` (or the legacy
+/// `$within`) anywhere: a region read, which no stream reads. A `$near`
+/// read is not one of them.
+fn reads_geo_region(filter: &Document) -> bool {
+    fn walk(v: &Bson) -> bool {
+        match v {
+            Bson::Document(d) => d.iter().any(|(k, v)| {
+                matches!(k.as_str(), "$geoWithin" | "$geoIntersects" | "$within") || walk(v)
+            }),
+            Bson::Array(items) => items.iter().any(walk),
+            _ => false,
+        }
+    }
+    walk(&Bson::Document(filter.clone()))
+}
+
 fn is_clustered(storage: &dyn crate::storage::Storage, db: &str, coll: &str) -> bool {
     storage
         .get_collection_options(db, coll)

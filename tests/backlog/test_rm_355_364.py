@@ -2432,13 +2432,26 @@ def _points(db: Any) -> None:
     db.g.insert_many([{"_id": i, "p": [i, i]} for i in range(10)])
 
 
-@pytest.mark.backlog("RM-363")
+@pytest.mark.backlog_fixed("RM-363")
 def test_a_geo_within_read_counts_what_it_examined(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 reads a `$geoWithin` box through its `2d` index, and its
-    line counts the keys and documents that read examined. This server
-    reads it another way, and counts none."""
+    line counts the keys and documents that read examined. This server read
+    it another way and counted none; it now counts what `explain`'s run of
+    the same plan examines."""
     query = {"p": {"$geoWithin": {"$box": [[0, 0], [3.5, 3.5]]}}}
     got = _both(rust_mongo, mongod_rs, lambda d: list(d.g.find(query)), _points)
+    answers = {s: _counts(_line(lines, "find")) for s, (lines, _) in got.items()}
+    assert answers["mongod"].get("keysExamined")
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog("RM-363")
+def test_a_near_read_counts_what_it_examined(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 reads a `$near` point through its `2d` index, and its
+    line counts the keys and documents that read examined. This server
+    reads it another way, and counts none."""
+    query = {"p": {"$near": [0, 0]}}
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.g.find(query).limit(3)), _points)
     answers = {s: _counts(_line(lines, "find")) for s, (lines, _) in got.items()}
     assert answers["mongod"].get("keysExamined")
     assert answers["rust"] == answers["mongod"]

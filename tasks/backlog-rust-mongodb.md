@@ -834,11 +834,13 @@ These are explicit non-goals. Don't add them without a reason.
         sorted `find`). Since RM-455 a `find` is the aggregation mongod
         converts it to, and counts where a time-series `aggregate` streams,
         and since 2026-11-17 under a `$sort`;
-      - a geo, `$near` or `$text` read (`$geoWithin` over a `2d` index:
-        mongod 5 keys and 4 documents, this server none).
-      Measured 2026-10-27, 2026-11-07, 2026-11-10 and 2026-11-13.
+      - a `$near` or `$text` read (since 2026-11-28 a `find`'s
+        `$geoWithin` / `$geoIntersects` counts what `explain`'s run of its
+        plan examines, as mongod's does; a `$near` limited to 3 over a `2d`
+        index: mongod 38 keys, this server 37).
+      Measured 2026-10-27, 2026-11-07, 2026-11-10, 2026-11-13 and 2026-11-28.
       Backlog-ID: RM-363
-      Verify: tests/backlog/test_rm_355_364.py::test_a_geo_within_read_counts_what_it_examined
+      Verify: tests/backlog/test_rm_355_364.py::test_a_near_read_counts_what_it_examined
 - [ ] **WiredTiger 11's interruptible cache wait is not on the line.**
       mongod 8.2.11's WiredTiger splits a cache wait into the share spent
       in interruptible eviction (`timeWaitingMicros.cacheInterruptibleMicros`)
