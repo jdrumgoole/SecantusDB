@@ -4780,7 +4780,9 @@ fn pushdown_filters(
 /// `s` with its joins' ON clauses as the planner sees them, or `None` when
 /// that changes nothing: constant TRUE conjuncts folded away
 /// (`fold_constant_on_quals`, RP-394), then an inner join's one-table
-/// conjuncts moved into the WHERE (`hoist_inner_on_conjuncts`, RP-391).
+/// conjuncts moved into the WHERE (`hoist_inner_on_conjuncts`, RP-391),
+/// and a two-relation join's WHERE equalities between them moved into its
+/// ON (`sink_where_join_equalities`, RP-1127).
 pub(crate) fn prepare_on_quals(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Option<pg_query::protobuf::SelectStmt> {
@@ -4790,7 +4792,144 @@ pub(crate) fn prepare_on_quals(
     let base = folded.as_ref().unwrap_or(s);
     let reduced = reduce_outer_joins(base).or(folded);
     let base = reduced.as_ref().unwrap_or(s);
-    hoist_inner_on_conjuncts(base).or(reduced)
+    let hoisted = hoist_inner_on_conjuncts(base).or(reduced);
+    let base = hoisted.as_ref().unwrap_or(s);
+    sink_where_join_equalities(base).or(hoisted)
+}
+
+/// `s` with the WHERE's equalities between the two relations of an inner
+/// join made conjuncts of its ON, or `None` when that changes nothing
+/// (RP-1127).
+///
+/// PostgreSQL's `deconstruct_jointree` makes an inner join's ON and its
+/// WHERE one list of quals, so `from e, e e2 where e.b = e2.b || 'x'` is
+/// the Merge Join `from e join e e2 on e.b = e2.b || 'x'` is: an equality
+/// between an expression over one relation and one over the other is a
+/// merge or hash clause wherever it was written. The ON is where this
+/// planner collects such a clause (`expr_equalities`), so the WHERE's are
+/// moved there -- with the column equalities beside them, which make one
+/// join with them (`e.a = k.a and e.b = k.b || 'x'`), after the ON's own
+/// conjuncts, the order `deconstruct_recurse` distributes them in.
+///
+/// Taken only where the WHERE holds such an expression equality (a join
+/// on columns alone already plans from the WHERE), for a FROM of two
+/// tables (`from e, k`, or one plain inner `join` or `cross join` of them,
+/// unaliased, with no USING), and for an equality of `expr_equalities`'
+/// shape whose every column is qualified by one of the two: operators,
+/// casts, constants and columns, one operand over each relation. An inner
+/// join's rows are the same whichever list holds a qual.
+fn sink_where_join_equalities(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    use pg_query::protobuf::{AExprKind, JoinType};
+    fn name(n: &pg_query::protobuf::Node) -> Option<String> {
+        match n.node.as_ref()? {
+            N::RangeVar(r) => Some(
+                r.alias
+                    .as_ref()
+                    .map_or_else(|| r.relname.clone(), |a| a.aliasname.clone()),
+            ),
+            _ => None,
+        }
+    }
+    // An operand `expr_equalities` keys on: every column qualified.
+    fn key_shape(n: &pg_query::protobuf::Node) -> bool {
+        match n.node.as_ref() {
+            Some(N::ColumnRef(c)) => {
+                c.fields.len() == 2
+                    && c.fields
+                        .iter()
+                        .all(|f| matches!(f.node.as_ref(), Some(N::String(_))))
+            }
+            Some(N::AConst(_)) | Some(N::ParamRef(_)) => true,
+            Some(N::TypeCast(t)) => t.arg.as_deref().is_some_and(key_shape),
+            Some(N::AExpr(e)) if e.kind == AExprKind::AexprOp as i32 => {
+                e.lexpr.as_deref().is_none_or(key_shape) && e.rexpr.as_deref().is_none_or(key_shape)
+            }
+            _ => false,
+        }
+    }
+    let w = s.where_clause.as_deref()?;
+    let (left, right) = match s.from_clause.as_slice() {
+        [l, r] => (name(l)?, name(r)?),
+        [item] => match item.node.as_ref()? {
+            N::JoinExpr(j)
+                if j.jointype == JoinType::JoinInner as i32
+                    && !j.is_natural
+                    && j.using_clause.is_empty()
+                    && j.alias.is_none() =>
+            {
+                (name(j.larg.as_deref()?)?, name(j.rarg.as_deref()?)?)
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if left == right {
+        return None;
+    }
+    // `Some(expression)` for an equality between the two relations.
+    let spanning = |c: &pg_query::protobuf::Node| -> Option<bool> {
+        let N::AExpr(e) = c.node.as_ref()? else {
+            return None;
+        };
+        if e.kind != AExprKind::AexprOp as i32 || operator_name(e) != Ok("=") {
+            return None;
+        }
+        let (l, r) = (e.lexpr.as_deref()?, e.rexpr.as_deref()?);
+        if !key_shape(l) || !key_shape(r) {
+            return None;
+        }
+        let (a, b) = (single_alias(l, &|_| None)?, single_alias(r, &|_| None)?);
+        let column =
+            |n: &pg_query::protobuf::Node| matches!(n.node.as_ref(), Some(N::ColumnRef(_)));
+        ((a == left && b == right) || (a == right && b == left)).then(|| !(column(l) && column(r)))
+    };
+    let mut conjuncts = Vec::new();
+    split_and(w, &mut conjuncts);
+    let marks: Vec<Option<bool>> = conjuncts.iter().map(|c| spanning(c)).collect();
+    if !marks.contains(&Some(true)) {
+        return None;
+    }
+    let (mut moved, mut kept) = (Vec::new(), Vec::new());
+    for (c, m) in conjuncts.into_iter().zip(&marks) {
+        if m.is_some() {
+            moved.push(c.clone());
+        } else {
+            kept.push(c.clone());
+        }
+    }
+    let mut out = s.clone();
+    out.where_clause = and_of(kept).map(Box::new);
+    match out.from_clause.as_mut_slice() {
+        [item] => {
+            let Some(N::JoinExpr(j)) = item.node.as_mut() else {
+                return None;
+            };
+            let mut quals = Vec::new();
+            if let Some(q) = j.quals.as_deref() {
+                let mut on = Vec::new();
+                split_and(q, &mut on);
+                quals.extend(on.into_iter().cloned());
+            }
+            quals.extend(moved);
+            j.quals = and_of(quals).map(Box::new);
+        }
+        _ => {
+            let mut items = std::mem::take(&mut out.from_clause).into_iter();
+            let (larg, rarg) = (items.next()?, items.next()?);
+            out.from_clause = vec![pg_query::protobuf::Node {
+                node: Some(N::JoinExpr(Box::new(pg_query::protobuf::JoinExpr {
+                    jointype: JoinType::JoinInner as i32,
+                    larg: Some(Box::new(larg)),
+                    rarg: Some(Box::new(rarg)),
+                    quals: and_of(moved).map(Box::new),
+                    ..Default::default()
+                }))),
+            }];
+        }
+    }
+    Some(out)
 }
 
 /// `s` with every WHERE equality an earlier one repeats dropped, or `None` when there is none
@@ -6246,6 +6385,39 @@ mod tests {
             prepared("select * from s join e on 1 = 1 and s.a < e.a"),
             None
         );
+    }
+
+    #[test]
+    fn a_where_expression_equality_between_two_relations_joins_them() {
+        // RP-1127: `deconstruct_jointree` makes an inner join's WHERE and
+        // ON one list of quals, so the WHERE's equality is a join clause.
+        assert_eq!(
+            prepared("select * from e, e e2 where e.b = e2.b || 'x'").as_deref(),
+            Some("SELECT * FROM e JOIN e e2 ON e.b = (e2.b || 'x')")
+        );
+        assert_eq!(
+            prepared("select * from e cross join k where e.a + 1 = k.a and e.b > 'v'").as_deref(),
+            Some("SELECT * FROM e JOIN k ON (e.a + 1) = k.a WHERE e.b > 'v'")
+        );
+        // Column equalities beside it join with it, after an ON's own.
+        assert_eq!(
+            prepared("select * from e join k on e.b = k.b where k.a = e.a::bigint and e.a = k.a")
+                .as_deref(),
+            Some("SELECT * FROM e JOIN k ON e.b = k.b AND k.a = e.a::bigint AND e.a = k.a")
+        );
+        // A join on columns alone, an equality within one relation, an
+        // unqualified column, a function, or a third relation: unchanged.
+        assert_eq!(prepared("select * from e, k where e.a = k.a"), None);
+        assert_eq!(prepared("select * from e, k where e.a = e.a + 1"), None);
+        assert_eq!(prepared("select * from e, k where a + 1 = k.a"), None);
+        assert_eq!(prepared("select * from e, k where e.b = upper(k.b)"), None);
+        assert_eq!(prepared("select * from e, k, s where e.a + 1 = k.a"), None);
+        // Below an outer join, or over an aliased join, it stays.
+        assert_eq!(
+            prepared("select * from e left join k on e.a = k.a where e.a + 1 = k.a or k.a is null"),
+            None
+        );
+        assert_eq!(prepared("select * from e e, e where e.a + 1 = e.a"), None);
     }
 
     /// The ON conjuncts `nullable_side_on_conjuncts` takes from `sql`, as

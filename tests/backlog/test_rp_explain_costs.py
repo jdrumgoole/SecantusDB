@@ -4405,7 +4405,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # Measured on PostgreSQL 15.20 (found while working RP-1117): a comma
     # join's WHERE makes the same class as an ON.
     "a comma join's expression equality joins its class": (
-        "RP-1171",
+        "RP-1171:fixed",
         _ANALYSED,
         "explain select e.b from e, k where e.a = k.a - 1 and e.a = k.a",
         [
@@ -11416,6 +11416,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1127",
         "RP-1121",
         "RP-1117",
         "RP-1108",
