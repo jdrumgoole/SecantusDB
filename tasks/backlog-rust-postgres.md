@@ -4190,19 +4190,6 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       Verify: none -- an intermittent start stall under load, not reproduced; tests/test_rust_pgserver_slice.py::_Server's start deadline is the check
       Backlog-ID: RP-1136
 
-## Found while working RP-1068 (2026-11-26)
-
-- [ ] **An aggregate over a Nested Loop is not priced.** `explain select
-      count(*) from e join k on e.a <> k.a` prints zero costs on the
-      `Aggregate` and on the loop below it, though the loop alone
-      (`select e.b ...`) is priced since RP-329; a private PostgreSQL
-      15.20 cluster prints `Aggregate (cost=17530.00..17530.01 rows=1
-      width=8)` over `Nested Loop (cost=0.00..15032.50 rows=999000
-      width=0)`, each scan narrowed to the join's key (`width=4`), the
-      inner materialised. Found while working RP-1068.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a nested loop is priced]
-      Backlog-ID: RP-1125
-
 ## Found while working RP-1124 (2026-11-28)
 
 - [ ] **A nested loop over an index equality beside a `<>` of another

@@ -48451,6 +48451,51 @@ impl PgHandler {
                         }
                     }
                 }
+                // A Nested Loop of two relations' scans under a plain
+                // Aggregate (RP-1125): the loop priced as the select of the
+                // rows it aggregates, as RP-329 prices that select (each
+                // scan narrowed to what the join and the aggregates read,
+                // the inner materialised where cheaper), and AGG_PLAIN over
+                // the loop. The loop's ON is already its Join Filter here.
+                if tree.name == "Aggregate"
+                    && tree.details.is_empty()
+                    && tree.estimate.is_none()
+                    && tree.children.len() == 1
+                {
+                    let join_node = &tree.children[0];
+                    let loop_of_two_scans = matches!(
+                        join_node.name.as_str(),
+                        "Nested Loop" | "Nested Loop Left Join" | "Nested Loop Anti Join"
+                    ) && join_node.estimate.is_none()
+                        && join_node.details.iter().all(|(k, _)| k == "Join Filter")
+                        && join_node.children.len() == 2
+                        && join_node
+                            .children
+                            .iter()
+                            .all(|c| c.children.is_empty() && explain::is_relation_scan(&c.name));
+                    let seq_scans = join_node
+                        .children
+                        .iter()
+                        .all(|c| c.name.starts_with("Seq Scan on "));
+                    if let (true, Statement::Aggregate(agg)) = (loop_of_two_scans, inner.as_ref()) {
+                        if let Some(sel) = PgHandler::aggregate_join_select(agg) {
+                            if let Some(est) = self.nest_loop_estimate(&sel).or_else(|| {
+                                self.join_select_nest_loop_estimate(&sel)
+                                    .filter(|_| seq_scans)
+                                    .map(|(plan, a, b, join)| {
+                                        (plan, a, b, join, None, [None, None])
+                                    })
+                            }) {
+                                let join_node = &mut tree.children[0];
+                                explain::apply_nest_loop(join_node, est);
+                                if let Some(join) = join_node.estimate {
+                                    tree.estimate =
+                                        scan_estimate::plain_agg_estimate(join, &agg.items);
+                                }
+                            }
+                        }
+                    }
+                }
                 if hash_of_two_scans(&tree) {
                     if let Statement::Select(sel) = inner.as_ref() {
                         let sel = joined_sort.as_ref().unwrap_or(sel);
