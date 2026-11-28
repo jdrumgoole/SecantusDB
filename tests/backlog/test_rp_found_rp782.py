@@ -785,6 +785,9 @@ def test_pg_get_viewdef_function_cast_in_partition_group_distinct(dsn: str) -> N
 # PostgreSQL 15.20 cluster. The column was typed as its base type and
 # printed bare, `(u798.dd > 2)`; fixed by RP-1095, whose wider matrix is
 # tests/test_rust_pgserver_viewdef_domains.py.
+WANT798 = [(" SELECT u798.k\n   FROM u798\n  WHERE ((u798.dd)::integer > 2);",)]
+
+
 @pytest.mark.backlog_fixed("RP-1095")
 def test_pg_get_viewdef_relabels_a_user_domain_operand(dsn: str) -> None:
     with _connect(dsn) as c:
@@ -794,6 +797,24 @@ def test_pg_get_viewdef_relabels_a_user_domain_operand(dsn: str) -> None:
         c.execute("create table u798 (k int, dd dint798)")
         c.execute("create view w798 as select k from u798 where dd > 2")
         got = _answer(c, "select pg_get_viewdef('w798'::regclass)")
+        # RP-1231: failed once on CI (#3109, 2026-11-28) printing `(u798.dd
+        # > 2)`, and never in 120 runs here. When it misses, ask again on
+        # this connection and on fresh ones, and whether the column reads
+        # as the domain: the same answer everywhere means the view was
+        # stored without the relabel; a right answer elsewhere, a stale
+        # per-thread domain list where it was asked.
+        context = ""
+        if got != WANT798:
+            again = [_answer(c, "select pg_get_viewdef('w798'::regclass)")]
+            for _ in range(3):
+                with _connect(dsn) as fresh:
+                    again.append(_answer(fresh, "select pg_get_viewdef('w798'::regclass)"))
+            col = _answer(
+                c,
+                "select format_type(atttypid, atttypmod) from pg_attribute"
+                " where attrelid = 'u798'::regclass and attname = 'dd'",
+            )
+            context = f"; asked again (same, then fresh connections): {again}; dd is {col}"
         c.execute("drop table u798 cascade")
         c.execute("drop domain dint798")
-    assert got == [(" SELECT u798.k\n   FROM u798\n  WHERE ((u798.dd)::integer > 2);",)]
+    assert got == WANT798, f"{got}{context}"

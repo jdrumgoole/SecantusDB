@@ -1245,6 +1245,30 @@ one beside it.
       Verify: none -- measured only on CI's x86_64 runner (the diagnostic workflow on `rp-1100-diag`); RP-715's, RP-911's and RP-1073's tests are the check
       Backlog-ID: RP-1100
 
+## Found by a CI run (2026-11-28)
+
+- [ ] **`pg_get_viewdef` once printed a user-domain operand without its
+      relabel.** RP-1095's regression test
+      (`test_pg_get_viewdef_relabels_a_user_domain_operand`) failed on
+      #3109's `pg-oracle (backlog)` (run 46103003909, snapshot 1f8840da,
+      RP-1093's naming change, which does not touch `ruleutils.rs`):
+      `WHERE (u798.dd > 2)` where PostgreSQL 15.20 prints
+      `WHERE ((u798.dd)::integer > 2)`. It passed on #3107 (RP-1095's own
+      snapshot), and locally against a debug build holding 1f8840da: on a
+      fresh server, after the module's other tests in three orders, and in
+      120 runs of the statements over one and three connections. Suspect:
+      the printer finds the domain through `domains::user_domain`, a
+      THREAD-LOCAL list that `install_user_types` publishes per pool
+      thread, gated by `INSTALLED_USER_TYPES` on the catalog version; a
+      thread that recorded the list at a version before `dint798` was
+      visible would print the column as its base type. Not shown: the test
+      now asks again on the same and on fresh connections when it misses,
+      and reports how `pg_attribute` types the column, to tell a view
+      stored without the relabel from a stale list on one thread.
+      Verify: none -- seen once on CI's runner; the next miss prints the
+      evidence
+      Backlog-ID: RP-1231
+
 ## Found by the CI timing review (2026-11-28)
 
 Measured on `secantusd-pg` (debug, tree 02293a75) and a private
