@@ -8,6 +8,8 @@ from typing import Any
 
 import pytest
 
+from tests.backlog.opdebug import no_timed_yields
+
 _COUNTERS = ("works", "advanced", "needTime", "needYield", "saveState", "restoreState", "isEOF")
 
 
@@ -56,7 +58,9 @@ def test_a_distinct_scan_run_reports_its_work_counters(rust_mongo: Any, mongod: 
     `distinct` and for a `$group` it answers from one, gives every stage's
     `works`, `advanced`, `needTime`, `needYield`, `saveState`,
     `restoreState` and `isEOF`. This server's gave none of them."""
-    got, want = _distinct_scan_runs(rust_mongo), _distinct_scan_runs(mongod)
+    # Time-based yields off: under load mongod yields once more (RM-768).
+    with no_timed_yields(mongod):
+        got, want = _distinct_scan_runs(rust_mongo), _distinct_scan_runs(mongod)
     assert want["distinct"][1]["works"] == 4
     assert got == want
 

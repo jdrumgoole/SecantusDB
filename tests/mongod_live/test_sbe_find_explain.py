@@ -107,21 +107,21 @@ def _explain(client: Any, coll: str, docs: list, cmd: dict, framework: str, verb
 @pytest.mark.parametrize("verbosity", ["queryPlanner", "executionStats", "allPlansExecution"])
 @pytest.mark.parametrize("find", FINDS, ids=[str(f) for f in FINDS])
 def test_sbe_find_explain_matches_mongod(
-    rust_mongo: Any, mongod_rs: Any, find: dict, verbosity: str
+    rust_mongo: Any, mongod_rs_no_yield: Any, find: dict, verbosity: str
 ) -> None:
     cmd = dict({"find": "c"}, **find)
     same(
         _explain(rust_mongo, "c", DOCS, cmd, "sbe", verbosity),
-        _explain(mongod_rs, "c", DOCS, cmd, "sbe", verbosity),
+        _explain(mongod_rs_no_yield, "c", DOCS, cmd, "sbe", verbosity),
     )
 
 
-def test_sbe_find_of_a_missing_collection(rust_mongo: Any, mongod_rs: Any) -> None:
+def test_sbe_find_of_a_missing_collection(rust_mongo: Any, mongod_rs_no_yield: Any) -> None:
     """The `limit 0` / `coscan` plan mongod builds over no collection."""
     cmd = {"find": "missing", "filter": {"x": 1}}
     same(
         _explain(rust_mongo, "missing", [], cmd, "sbe", "executionStats"),
-        _explain(mongod_rs, "missing", [], cmd, "sbe", "executionStats"),
+        _explain(mongod_rs_no_yield, "missing", [], cmd, "sbe", "executionStats"),
     )
 
 
@@ -134,13 +134,13 @@ def test_sbe_find_of_a_missing_collection(rust_mongo: Any, mongod_rs: Any) -> No
     ids=["find", "group"],
 )
 def test_classic_framework_explain_matches_mongod(
-    rust_mongo: Any, mongod_rs: Any, cmd: dict
+    rust_mongo: Any, mongod_rs_no_yield: Any, cmd: dict
 ) -> None:
     """`"classic"` keeps a `$group` out of SBE, and a `find`'s cache key
     and framework control say so."""
     same(
         _explain(rust_mongo, "c", DOCS, cmd, "classic", "queryPlanner"),
-        _explain(mongod_rs, "c", DOCS, cmd, "classic", "queryPlanner"),
+        _explain(mongod_rs_no_yield, "c", DOCS, cmd, "classic", "queryPlanner"),
     )
 
 
@@ -160,27 +160,27 @@ AGGREGATES = [
 @pytest.mark.parametrize("verbosity", ["queryPlanner", "executionStats"])
 @pytest.mark.parametrize("pipeline", AGGREGATES, ids=[str(p) for p in AGGREGATES])
 def test_sbe_aggregate_explain_matches_mongod(
-    rust_mongo: Any, mongod_rs: Any, pipeline: list, verbosity: str
+    rust_mongo: Any, mongod_rs_no_yield: Any, pipeline: list, verbosity: str
 ) -> None:
     """Under `"sbe"` an `aggregate` runs its query in SBE with nothing
     pushed after it, an `$addFields` taken into it (RM-542)."""
     cmd = {"aggregate": "c", "pipeline": pipeline, "cursor": {}}
     same(
         _explain(rust_mongo, "c", DOCS, cmd, "sbe", verbosity),
-        _explain(mongod_rs, "c", DOCS, cmd, "sbe", verbosity),
+        _explain(mongod_rs_no_yield, "c", DOCS, cmd, "sbe", verbosity),
     )
 
 
 @pytest.mark.parametrize("verbosity", ["queryPlanner", "executionStats"])
 def test_sbe_distinct_explain_matches_mongod(
-    rust_mongo: Any, mongod_rs: Any, verbosity: str
+    rust_mongo: Any, mongod_rs_no_yield: Any, verbosity: str
 ) -> None:
     """Under `"sbe"` a `distinct` runs its query in SBE, keyed as a `find`'s
     (RM-542)."""
     cmd = {"distinct": "c", "key": "y", "query": {"x": {"$gt": 1}}}
     same(
         _explain(rust_mongo, "c", DOCS, cmd, "sbe", verbosity),
-        _explain(mongod_rs, "c", DOCS, cmd, "sbe", verbosity),
+        _explain(mongod_rs_no_yield, "c", DOCS, cmd, "sbe", verbosity),
     )
 
 
@@ -215,10 +215,10 @@ MOD_BY_ZERO = {"$expr": {"$eq": [{"$mod": ["$x", 0]}, 0]}}
     ids=["aggregate", "distinct"],
 )
 def test_sbe_framework_runs_aggregate_and_distinct_in_sbe(
-    rust_mongo: Any, mongod_rs: Any, cmd: dict
+    rust_mongo: Any, mongod_rs_no_yield: Any, cmd: dict
 ) -> None:
     """They answer as SBE does, not only explain so (RM-542)."""
-    assert _mod_by_zero(rust_mongo, cmd) == _mod_by_zero(mongod_rs, cmd)
+    assert _mod_by_zero(rust_mongo, cmd) == _mod_by_zero(mongod_rs_no_yield, cmd)
 
 
 def _profiled(client: Any, framework: str) -> list:
@@ -244,7 +244,9 @@ def _profiled(client: Any, framework: str) -> list:
 
 
 @pytest.mark.parametrize("framework", ["sbe", "classic"])
-def test_profile_entries_name_the_engine(rust_mongo: Any, mongod_rs: Any, framework: str) -> None:
+def test_profile_entries_name_the_engine(
+    rust_mongo: Any, mongod_rs_no_yield: Any, framework: str
+) -> None:
     """The `find` and each `getMore` report the engine the setting chose,
     and the cache key the setting moved."""
-    same(_profiled(rust_mongo, framework), _profiled(mongod_rs, framework))
+    same(_profiled(rust_mongo, framework), _profiled(mongod_rs_no_yield, framework))

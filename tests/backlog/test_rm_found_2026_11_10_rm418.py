@@ -10,8 +10,6 @@ from typing import Any
 import pytest
 from bson import Int64
 
-from tests.backlog.test_rm_057_084 import mongod_rs  # noqa: F401 - fixture
-
 DB = "rm418found"
 
 
@@ -58,12 +56,12 @@ AGG_AND_DISTINCT = [
 @pytest.mark.parametrize("cmd", AGG_AND_DISTINCT, ids=["$match", "$match+$addFields", "distinct"])
 def test_sbe_framework_pushes_an_aggregate_and_a_distinct(
     rust_mongo: Any,
-    mongod_rs: Any,  # noqa: F811
+    mongod_rs_no_yield: Any,
     cmd: dict,
 ) -> None:
     """Under `queryFramework: "sbe"` mongod runs these in SBE; this server
     pushed them as without the setting until RM-542 was fixed."""
-    assert _engine(rust_mongo, cmd) == _engine(mongod_rs, cmd)
+    assert _engine(rust_mongo, cmd) == _engine(mongod_rs_no_yield, cmd)
 
 
 FINDS = [
@@ -75,12 +73,12 @@ FINDS = [
 @pytest.mark.parametrize("cmd,index", FINDS, ids=["index"])
 def test_sbe_find_shapes_are_explained_as_sbe(
     rust_mongo: Any,
-    mongod_rs: Any,  # noqa: F811
+    mongod_rs_no_yield: Any,
     cmd: dict,
     index: bool,
 ) -> None:
     """mongod explains these `find`s as the slot-based plans it runs."""
-    assert _engine(rust_mongo, cmd, index) == _engine(mongod_rs, cmd, index)
+    assert _engine(rust_mongo, cmd, index) == _engine(mongod_rs_no_yield, cmd, index)
 
 
 def _find(**fields: Any) -> dict:
@@ -133,13 +131,13 @@ def _untimed(d: Any) -> Any:
 )
 def test_sbe_find_in_and_projection_are_mongods(
     rust_mongo: Any,
-    mongod_rs: Any,  # noqa: F811
+    mongod_rs_no_yield: Any,
     cmd: dict,
 ) -> None:
     """An `$in` and a simple projection under `queryFramework: "sbe"` were
     explained in the classic shape; they now print and run as mongod's
     slot programs (`isMember` over an `InList`, `makeBsonObj`, `newBsonObj`)."""
-    assert _built(rust_mongo, cmd) == _built(mongod_rs, cmd)
+    assert _built(rust_mongo, cmd) == _built(mongod_rs_no_yield, cmd)
 
 
 SORTED_FINDS = [
@@ -158,13 +156,13 @@ SORTED_FINDS = [
 )
 def test_sbe_sorted_find_is_mongods(
     rust_mongo: Any,
-    mongod_rs: Any,  # noqa: F811
+    mongod_rs_no_yield: Any,
     cmd: dict,
 ) -> None:
     """A `find` sorted on one top-level field under `queryFramework: "sbe"`
     was explained in the classic shape; it now prints and runs as mongod's
     `sort` over a `project` of `getSortKeyAsc` / `getSortKeyDesc`."""
-    assert _built(rust_mongo, cmd) == _built(mongod_rs, cmd)
+    assert _built(rust_mongo, cmd) == _built(mongod_rs_no_yield, cmd)
 
 
 def _hinted_key(client: Any, hints: Any = None) -> str:
@@ -178,11 +176,11 @@ def _hinted_key(client: Any, hints: Any = None) -> str:
 @pytest.mark.backlog_fixed("RM-544")
 def test_plan_cache_key_hashes_index_hints(
     rust_mongo: Any,
-    mongod_rs: Any,  # noqa: F811
+    mongod_rs_no_yield: Any,
 ) -> None:
     """A setting's `indexHints` moves mongod's `planCacheKey`; this server
     hashed the hints as unset."""
-    assert _hinted_key(rust_mongo) == _hinted_key(mongod_rs)
+    assert _hinted_key(rust_mongo) == _hinted_key(mongod_rs_no_yield)
 
 
 def _spec(*allowed: Any, coll: str = "a") -> dict:
@@ -204,12 +202,12 @@ HINT_SHAPES = [
 @pytest.mark.parametrize("hints", HINT_SHAPES, ids=str)
 def test_plan_cache_key_hashes_each_hint_shape(
     rust_mongo: Any,
-    mongod_rs: Any,  # noqa: F811
+    mongod_rs_no_yield: Any,
     hints: Any,
 ) -> None:
     """Names, key patterns, `$natural` and several specs hash as mongod's
     `query_settings_hash.cpp` hashes them."""
-    assert _hinted_key(rust_mongo, hints) == _hinted_key(mongod_rs, hints)
+    assert _hinted_key(rust_mongo, hints) == _hinted_key(mongod_rs_no_yield, hints)
 
 
 def _optimization_time(client: Any) -> bool:
@@ -220,7 +218,7 @@ def _optimization_time(client: Any) -> bool:
 @pytest.mark.backlog_fixed("RM-545")
 def test_find_explain_gives_optimization_time(
     rust_mongo: Any,
-    mongod_rs: Any,  # noqa: F811
+    mongod_rs_no_yield: Any,
 ) -> None:
     """A `find` explain lacked mongod's `optimizationTimeMillis`."""
-    assert _optimization_time(rust_mongo) == _optimization_time(mongod_rs)
+    assert _optimization_time(rust_mongo) == _optimization_time(mongod_rs_no_yield)

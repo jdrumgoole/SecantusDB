@@ -1108,31 +1108,36 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2026-11-18 (RM-625).
       Verify: none -- intermittent, about 1 run in 30; no deterministic gap test until the cause is known
       Backlog-ID: RM-721
-- [ ] **RM-434's distinct-scan work counters differed once under load.**
-      `tests/backlog/test_rm_found_2026_11_08_rm310.py::test_a_distinct_scan_run_reports_its_work_counters`
-      (RM-434's regression test) failed in one RM-632 gate run on
-      2026-11-23 (load ~10 on 12 cores) and passed in 12 reruns, serial and
-      `-n 6`: a `distinct` stage's counters differed (the assertion output
-      was truncated, so which counter and which side is not known). A
-      candidate: mongod's time-based yields moving `saveState` /
-      `restoreState`, or this server modelling them by count. Found
-      2026-11-23 (RM-632). Again 2026-11-26 (RM-684 gate, load ~5):
-      `tests/backlog/test_rm_found_2026_11_10_rm418.py::test_sbe_find_in_and_projection_are_mongods[{'filter': {'d.e': {'$in': [1, 2]}}}]`
-      differed in its `executionStats` (an SBE `filter` over a `scan`,
-      `saveState` / `restoreState` among the fields shown; the differing
-      one was truncated) and passed in 9 reruns, serial and `-n 4`.
-      Again 2026-11-27 (RM-715 gate, load ~7-11):
-      `tests/mongod_live/test_lookup_hash_join.py::test_a_hash_join_lookup_is_explained_as_mongod_does`
-      (one case in the gate, `empty_local_collection-executionStats` in a
-      rerun, then two clean runs): here the side known, mongod's every
-      stage counted `saveState` 5 / `restoreState` 4 to this server's 4 /
-      3, one yield more, which points at mongod's time-based yield.
-      Again 2026-11-27 (RM-372 gate, load ~7-10, `-n 4`, 1 of 2455):
-      `test_a_hash_join_lookup_is_explained_as_mongod_does[nested_foreign_field-executionStats]`,
-      every stage of mongod's counting `saveState` 1 / `restoreState` 1 to
-      this server's 0 / 0, so mongod yielded once and this server did not;
-      three serial reruns of the case passed.
-      Verify: none -- intermittent, once in 13 runs; no deterministic gap test until the differing counter is known
+- [ ] **Some explain tests still compare yield counters with a mongod that
+      yields on time.** mongod yields once its executor has run
+      `internalQueryExecYieldPeriodMS` (10 ms) since its last yield, which
+      load decides; each yield moves a stage's `saveState` / `restoreState`
+      by one, and this server's explain counts them structurally, so it
+      never does. Measured 2026-11-28 on `mongo:8.2.11` (Linux x86-64, the
+      exemplar build): the 23 cases of `test_lookup_hash_join.py`'s
+      `executionStats` explain gave the same answer in every one of 5
+      unloaded runs with yields at the default and with the period at
+      86,400,000 ms, and on a container held to 0.05 CPUs 13 of the 23
+      differed across 8 runs at the default (`saveState` / `restoreState`
+      0 or 1, up to 6 on the `many_documents_and_a_match_after` case)
+      against none across 8 with the period off. So the no-yield answer is
+      the exemplar's own, and `mongod_rs_no_yield` / `no_timed_yields` is the
+      reference for these tests. Moved to it: `test_lookup_hash_join.py`,
+      `test_sbe_find_explain.py`, `test_rm_found_2026_11_10_rm418.py`,
+      `test_rm_found_2026_11_14_rm434.py`,
+      `test_rm_found_2026_11_08_rm310.py` (RM-768's occurrences) and
+      RM-683's two loop-join files. Not yet: a sweep that records which
+      tests ever receive a `saveState` / `restoreState` / `numYield(s)` in a
+      reply (a pytest plugin wrapping `Database.command`, stopped after the
+      first fifth of the 61 `tests/mongod_live` and `tests/backlog` explain
+      files) saw
+      them in `test_rm_found_2026_11_09_rm373.py`, `_11_13_rm509.py`,
+      `_11_15_rm426.py`, `_10_26.py`, `test_view_line_namespaces.py`,
+      `test_rm_view_namespaces.py` and `test_clustered_scan_plans.py`, and
+      did not reach the rest; whether each COMPARES them (rather than
+      selecting `nReturned` / `works`) is unread. Do that, and move the ones
+      that do.
+      Verify: none -- intermittent test quality, no gap in the server
       Backlog-ID: RM-768
 - [ ] **A `{$meta: "sortKey"}` with no `$sort` is refused where the query
       layer does not take it.** mongod 8.2.11 gives `[]` in a `$project`
@@ -2911,34 +2916,6 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       Backlog-ID: RM-728
       Verify: none -- a test-quality item: the behaviour is right on every run measured here; what is wrong is that the test can fail on timing alone
 
-- [ ] **RM-501's regression test times mongod, and mongod's own delete
-      once fitted the budget (2026-11-25).**
-      `tests/backlog/test_rm_found_2026_11_10_rm391.py::test_a_batched_delete_many_tests_each_document_twice`
-      gives a `deleteMany` of one slow document 1.5x the fastest of three
-      `find`s and expects code 50 from both servers. On pg-batch snapshot
-      PR #2992 (run 45595956409, job `mdb-binary (backlog)`, head
-      ec891bbfc, a PG planner change only) it read REGRESSED, and the
-      side that differed was mongod's: `theirs` was `None`, so mongod
-      8.2.12's batched delete finished inside the budget. It passed on
-      every other run that day, `main`'s included. mongod re-tests a staged
-      document's filter when the batch is deleted only if the statement
-      yielded and the snapshot moved in between, so "tests each document
-      twice" is itself timing on mongod's side. Decide from mongod's
-      source (`batched_delete_stage.cpp`, `ensureStillMatches`) when the
-      second test happens, then make the test force it, for example with
-      a yield the test can trigger, or compare a count that does not move
-      with the machine. Keep it able to fail on a server that tests once.
-      Reported by the PostgreSQL session; test code unchanged.
-      Again on PG snapshot PR #3092 (run 46067170511, job 140735196294,
-      head 951f5cf6, a PG-only change, 2026-11-27), and this time the
-      side that fitted was THIS server's: mongod's answer was 50 and
-      this server's `None`, so its delete finished inside 1.5x the
-      fastest of its three `find`s. Either all three `find`s ran slow
-      under load or the delete tested the document once; the test does
-      not say which, so the fix should also put the timings in its
-      assertion message.
-      Verify: none -- intermittent on CI; the test itself is the check
-      Backlog-ID: RM-803
 
 - [ ] **RM-391's regression test times mongod, and mongod's own `update`
       went over the budget on CPU time (2026-11-26).**
@@ -2958,10 +2935,35 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       documents the write examined (`docsExamined` in its slow-query line
       or the profiler) against the `find`'s, or the times a filter with a
       countable effect ran, so that it can still fail on a server that
-      tests each document twice. RM-547 and RM-803 are the same shape.
+      tests each document twice. RM-547 and RM-501's test (fixed, RM-803) are the same shape.
       Reported by the PostgreSQL session; test code unchanged.
       Verify: none -- intermittent on CI; the test itself is the check
       Backlog-ID: RM-814
+
+- [ ] **A write to a collection waits for a running write's whole statement.**
+      mongod 8.2.11 lets a second writer update a document while a
+      `deleteMany` is still testing it: a `deleteMany` of one slow document
+      (about 2 s to test) with an `update` of that document sent 0.7 s in
+      returns the update at 0.71 s (`nModified` 1), tests the document again
+      after its yield, finds it changed and deletes nothing (`n` 0, on macOS
+      arm64 and on `mongo:8.2.11` Linux alike). This server answers the
+      update at 4.14 s, after the delete, with `nModified` 0, and the delete
+      deletes the document (`n` 1): each statement of a write holds the
+      collection's `coll_lock` throughout (`secantus-storage`'s
+      `delete_matching_single_txn` and the chunked paths). The update is a
+      different statement; only a writer to the same document should wait,
+      by write conflict. Found 2026-11-28 (RM-803); the regression test of
+      RM-501 compares `serverStatus.batchedDeletes` instead, for want of it.
+      Verify: none -- gap test pending
+      Backlog-ID: RM-841
+- [ ] **`secantusd-mdb` refuses `--setParameter internalQueryExecYieldPeriodMS`
+      at startup.** mongod 8.2.11 takes it on the command line (the
+      `mongod_rs_no_yield` fixture starts one with it); this server answers
+      "secantusd-mdb does not take --setParameter 'internalQueryExecYieldPeriodMS'
+      at startup" and exits, though `setParameter` takes it at run time.
+      Found 2026-11-28 (RM-803).
+      Verify: none -- gap test pending
+      Backlog-ID: RM-842
 
 - [ ] **Stopping a gate run leaves its tests' reference mongods running
       (2026-11-25).** `scripts/detached_run.py stop` on a `gate_rm.py`
