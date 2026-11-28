@@ -948,15 +948,28 @@ def test_startup_drops_spill_idents_after_the_durable_catalog(rust_mongo: Any) -
     assert 10682200 in ids[ids.index(9529903) :], ids
 
 
-@pytest.mark.backlog("RM-305")
+@pytest.mark.backlog_fixed("RM-305")
 def test_startup_reports_flow_control_after_the_spill_idents(rust_mongo: Any) -> None:
     """After `Dropping spill idents` (10682200) mongod 8.2.11 writes
     `Flow Control is enabled on this deployment` (20536) on
     `initandlisten` (measured 2026-11-28 on a restart, after `Initializing
-    cluster server parameters from disk`, 6608200). This server does not
-    write it."""
+    cluster server parameters from disk`, 6608200). This server did not
+    write it until 2026-11-28."""
     ids = _startup_ids(rust_mongo)
     assert 20536 in ids[ids.index(10682200) :], ids
+
+
+@pytest.mark.backlog("RM-305")
+def test_startup_reports_the_topology_version_observer_after_flow_control(
+    rust_mongo: Any,
+) -> None:
+    """After `Flow Control is enabled on this deployment` (20536) and FTDC's
+    `Initializing full-time diagnostic data capture` (20625), mongod 8.2.11
+    writes `Starting the TopologyVersionObserver` (40440, REPL, no
+    attributes) on `initandlisten` (measured 2026-11-28 on a restart). This
+    server does not write it."""
+    ids = _startup_ids(rust_mongo)
+    assert 40440 in ids[ids.index(20536) :], ids
 
 
 def _op_msg(sock: socket.socket, command: dict, request_id: int) -> dict:
