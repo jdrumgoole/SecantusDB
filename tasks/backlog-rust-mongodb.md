@@ -2907,25 +2907,39 @@ Each was measured by running the same writes on mongod 8.2.11 and on
 
 ## Found while working the storage model (2026-11-19)
 
-- [ ] **RM-610's regression test measures wall time, and fails on Linux CI
-      about one run in two since storage-model phase 4a-4b.**
-      `tests/backlog/test_rm_found_2026_11_13_contested_reads.py::test_a_contested_find_and_write_of_one_cost_what_they_return`
-      compares how a contested `find` with a limit and a contested
-      `updateOne` grow in time from 10,000 to 100,000 documents against
-      mongod's (within 3x). On the Linux debug build it failed on PR #2918,
-      on `main` after it (a70d23e2, the `find` this time) and on PR #2920
-      twice (the `updateOne`); it passed on every rerun, on #2920's last
-      commit included. Locally it is flat: 16-17 ms at both sizes, 4 runs of
-      3 on 2026-11-20, and 0 failures in 6 runs under eight CPU burners. It
-      does not fail on one operation, so a checkpoint or eviction landing in
-      the timed window is the likely cause, not shown. Since 2026-11-20 a
-      failure's message carries both servers' milliseconds at both sizes:
-      read those before changing anything. The test should compare what
-      each server examines (`explain`'s `totalKeysExamined` /
-      `totalDocsExamined` at both sizes), which is mongod's own measure of
-      the cost and does not move with the machine.
+- [ ] **RM-610's explain test measures wall time, which moves with the
+      machine.**
+      `tests/backlog/test_rm_found_2026_11_13_contested_reads.py::test_a_contested_read_costs_what_it_returns`
+      compares how an `explain` at `queryPlanner` of a contested `find` grows
+      in time from 10,000 to 100,000 documents against mongod's (within
+      3x). Its sibling for a `find` with a limit and an `updateOne` timed
+      the same way and failed on Linux CI about one run in two after
+      storage-model phase 4a-4b (PRs #2918, #2920, `main` a70d23e2), and
+      again on PG snapshot PR #3127 (run 46122467550, job 140909740969,
+      2026-11-28), where mongod's own `find` went from 0.83 to 3.52 ms. That
+      test now compares `explain`'s `allPlansExecution` counts instead (both
+      servers 101 returned, 101 keys and 101 documents examined, for the
+      winning plan and each of the three trial plans, at both sizes; mongod
+      8.2.11, 2026-11-28). An `explain` at `queryPlanner` reports no counts,
+      so this one can count only through `metrics.queryExecutor`, which
+      this server does not keep (RM-846 below); convert it when that
+      lands.
       Backlog-ID: RM-728
       Verify: none -- a test-quality item: the behaviour is right on every run measured here; what is wrong is that the test can fail on timing alone
+
+- [ ] **RUST MongoDB server: `serverStatus` has no
+      `metrics.queryExecutor`.** mongod 8.2.11 counts the work every read
+      and write does there: `scanned` (index keys examined), `scannedObjects`
+      (documents examined), `collectionScans` `{nonTailable, total}`, and
+      `profiler.collectionScans` `{nonTailable, tailable, total}`. A `find`
+      of `{a: {$gt: 10}}` over 50 documents without an index moves it by 0
+      keys, 50 documents and one collection scan; a contested `find` with a
+      limit of 101 over `{a: {$gte: 0}, b: {$gte: 0}}` (indexes on `a` and
+      `b`) by 101 and 101, at 10,000 documents and at 100,000. This server's
+      `metrics` has no `queryExecutor` key. It is also what a test can count
+      when `explain` reports nothing (RM-728). Found 2026-11-28.
+      Verify: tests/backlog/test_rm_found_2026_11_28_query_executor.py::test_a_find_moves_the_query_executor_counters_as_mongod
+      Backlog-ID: RM-846
 
 
 - [ ] **RM-391's regression test times mongod, and mongod's own `update`

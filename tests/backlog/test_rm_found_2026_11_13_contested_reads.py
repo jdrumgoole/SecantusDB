@@ -3,11 +3,13 @@ two indexes contest reads every match on this server, where mongod 8.2.11
 stops once the read has what it needs.
 
 The reference is mongod, asked live (`mongod_rs`, a one-member replica set);
-the Rust server is `secantusd-mdb` (`rust_mongo`). The test compares how each
-server's time grows with the collection, not the times themselves, so a
-debug build or a slow runner does not move it: a read that stops at its
-limit costs the same over 10,000 documents and 100,000, one that reads
-every match costs ten times as much.
+the Rust server is `secantusd-mdb` (`rust_mongo`). A read that stops at its
+limit costs the same over 10,000 documents and 100,000, one that reads every
+match costs ten times as much. The find and the write compare what `explain`
+says each plan examined, mongod's own measure of the cost; the explain at
+`queryPlanner` reports no counts, so it still compares how each server's
+time grows (RM-728: wall time moved with the machine and failed on CI; it
+can count through `metrics.queryExecutor` once RM-846 lands).
 """
 
 from __future__ import annotations
@@ -80,18 +82,47 @@ def _growth(client: Any, names: tuple[str, ...], label: str = "") -> dict[str, b
     }
 
 
+def _examined(client: Any) -> dict[int, dict[str, list]]:
+    """What `explain` at `allPlansExecution` says the contested find with a
+    limit and the contested updateOne examined, over 10,000 documents and
+    100,000: `[nReturned, totalKeysExamined, totalDocsExamined]` for the
+    winning plan, then for each plan of the trial, sorted."""
+    db = client["rm_found_contested_reads"]
+    commands = {
+        "find with a limit": {"find": "c", "filter": _QUERY, "limit": 101},
+        "updateOne": {"update": "c", "updates": [{"q": _QUERY, "u": {"$inc": {"z": 1}}}]},
+    }
+    counts = ("nReturned", "totalKeysExamined", "totalDocsExamined")
+    out: dict[int, dict[str, list]] = {}
+    try:
+        for n in (10_000, 100_000):
+            _seed(db, n)
+            out[n] = {}
+            for name, command in commands.items():
+                stats = db.command("explain", command, verbosity="allPlansExecution")[
+                    "executionStats"
+                ]
+                trial = sorted([p.get(k) for k in counts] for p in stats["allPlansExecution"])
+                out[n][name] = [[stats[k] for k in counts], *trial]
+    finally:
+        client.drop_database("rm_found_contested_reads")
+    return out
+
+
 @pytest.mark.backlog_fixed("RM-610")
 def test_a_contested_find_and_write_of_one_cost_what_they_return(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """A contested find with a limit and a contested updateOne read every
     match before their trial; since RM-610 the trial reads only what its
-    plans reach, and their cost is flat in the collection's size, as
-    mongod's is."""
-    names = ("find with a limit", "updateOne")
-    theirs = _growth(mongod_rs, names, "mongod")
-    assert all(theirs.values()), (theirs, _TIMES)
-    assert _growth(rust_mongo, names, "secantusd-mdb") == theirs, _TIMES
+    plans reach. mongod 8.2.11 examines 101 keys and 101 documents in the
+    winning plan and in each of the trial's three, over 10,000 documents and
+    over 100,000 (the find returns 101), and so does this server. Counted,
+    not timed (RM-728)."""
+    theirs = _examined(mongod_rs)
+    assert theirs[10_000] == theirs[100_000], theirs
+    assert theirs[100_000]["find with a limit"][0] == [101, 101, 101], theirs
+    assert _examined(rust_mongo) == theirs
 
 
 @pytest.mark.backlog_fixed("RM-610")
