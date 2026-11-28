@@ -486,6 +486,8 @@ impl Expr {
                 let vals: Vec<Value> = args.iter().map(|a| a.eval(env)).collect();
                 new_obj(&vals)
             }
+            // `exists(v)`: whether `v` is not Nothing.
+            "exists" => Some(Bson::Boolean(args[0].eval(env).is_some())),
             // `isMember(v, inList)`: `v` equals one of the list's values
             // under BSON comparison; Nothing is a member of nothing.
             "isMember" => {
