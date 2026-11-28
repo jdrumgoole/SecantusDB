@@ -3697,19 +3697,36 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
 test is in `tests/backlog/test_rp_found_rp833.py`.
 
 
-## Found while working RP-1051 (2026-11-25)
+## Found while working RP-1090 (2026-11-28)
 
-Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
-test is in `tests/backlog/test_rp_found_rp833.py`.
+Measured on PostgreSQL 15.20 (a private, freshly initdb'd cluster; the
+box's 15.19 is now 15.20). The gap tests are in
+`tests/backlog/test_rp_found_rp1090.py`.
 
-- [ ] **A function's CONTEXT label leaves a parameter type unqualified.**
-      `format_procedure` qualifies each parameter type that is not visible
-      on the search path, as it does the function's name: on PostgreSQL
-      15.19 `s1100.f(x s1100.ty)`, `s1100.ty` an enum, called off the path
-      is `PL/pgSQL function s1100.f(s1100.ty) line 1 at RAISE`;
-      `secantusd-pg` gives `s1100.f(ty)`. Found while working RP-1051.
-      Verify: tests/backlog/test_rp_found_rp833.py::test_a_label_qualifies_a_parameter_type_off_the_path
-      Backlog-ID: RP-1090
+- [ ] **A PL/pgSQL parameter of a quoted, mixed-case, schema-qualified type
+      loses its argument.** `g1090(x "S1090"."T")`, `"S1090"."T"` an enum,
+      called with `'b'` returns `b` on PostgreSQL, `pg_typeof(x)` is
+      `"S1090"."T"` and the frame is `g1090("S1090"."T")`; `secantusd-pg`
+      returns NULL, `pg_typeof(x)` is `record` and the frame is `g1090(t)`.
+      The catalog keeps the type right (`'g1090'::regproc::regprocedure` is
+      `g1090("S1090"."T")`); `plpgsql_create_sql` (`lib.rs`) writes each
+      catalog key back into the CREATE text the interpreter parses as is,
+      so `S1090.T` reads back folded to `s1090.t`, a type that does not
+      exist. `plpgsql_fn::sql_type` already re-quotes a key for SQL
+      (`public.My"T[]` -> `public."My""T"[]`). Found while working RP-1090.
+      Verify: tests/backlog/test_rp_found_rp1090.py::test_a_quoted_qualified_parameter_type_keeps_its_argument
+      Backlog-ID: RP-1233
+- [ ] **A function's CONTEXT label takes the search path of its first
+      call, not that of the CREATE FUNCTION that validated it.** `plpgsql_validator` compiles a
+      function at CREATE and the session keeps that compile, its
+      `fn_signature` (`format_procedure` under the search path of the
+      moment) with it: a function made with `s1090` on the path, called in
+      the same session with the path back to `public`, is `f(ty,integer[],ty[])`
+      on PostgreSQL; `secantusd-pg` compiles at the call and labels it
+      `s1090.f(s1090.ty,integer[],s1090.ty[])`, which is what PostgreSQL
+      gives a second session. Found while working RP-1090.
+      Verify: tests/backlog/test_rp_found_rp1090.py::test_a_label_is_fixed_when_create_function_validates_it
+      Backlog-ID: RP-1234
 
 ## Found while working RP-689 (2026-11-10)
 

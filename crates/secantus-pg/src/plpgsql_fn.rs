@@ -1662,6 +1662,15 @@ fn function_label(create_sql: &str) -> String {
                 continue;
             }
             let t = fp.arg_type.as_ref()?;
+            // `format_type_be` of the type the name resolves to: qualified,
+            // each part quoted, when its schema is off the search path
+            // (`s1100.f(s1100.ty)`, RP-1090).
+            if let Some(oid) =
+                secantus_pgplan::user_casts::type_oid(&secantus_pgplan::declared_type_key(t))
+            {
+                args.push(secantus_pgplan::regtype_text(oid));
+                continue;
+            }
             let base = match t.names.last()?.node.as_ref()? {
                 N::String(s) => s.sval.clone(),
                 _ => return None,
@@ -4329,6 +4338,24 @@ fn call_arguments(text: &str) -> Vec<Option<String>> {
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod rp1090_label {
+    use super::function_label;
+
+    /// `format_procedure` prints each argument by `format_type_be`: a type
+    /// whose schema is off the search path keeps its schema, a built-in
+    /// keeps its display name (RP-1090).
+    #[test]
+    fn a_parameter_type_off_the_path_is_qualified() {
+        secantus_pgplan::set_user_types(vec![("s1100.ty".into(), 900_001, vec!["a".into()])]);
+        let sql = "create function s1100.f(x s1100.ty, y int[], z s1100.ty[]) returns int \
+                   language plpgsql as $$ begin return 1; end $$";
+        let label = function_label(sql);
+        secantus_pgplan::set_user_types(Vec::new());
+        assert_eq!(label, "s1100.f(s1100.ty,integer[],s1100.ty[])");
+    }
 }
 
 #[cfg(test)]

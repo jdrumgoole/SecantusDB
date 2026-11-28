@@ -8849,6 +8849,14 @@ fn normalize_serial(ty: &str) -> String {
     }
 }
 
+/// A parameter's declared type as the routine catalog records it
+/// (`param_types`): built-ins by their bare name, a user type by its
+/// registry key, its schema kept when one was written, `[]` for an array.
+/// [`user_casts::type_oid`] resolves it.
+pub fn declared_type_key(t: &pg_query::protobuf::TypeName) -> String {
+    type_name_of(t)
+}
+
 /// The declared type of a `TypeName`, including its array brackets.
 ///
 /// libpg_query keeps `int[]` as the name `int4` plus a non-empty
