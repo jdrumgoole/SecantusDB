@@ -405,6 +405,9 @@ pub struct SpillOpening {
     pub config: String,
     pub messages: Vec<String>,
     pub open: std::time::Duration,
+    /// How many tables an earlier run left in the engine, dropped as it
+    /// opened (`Dropping spill idents`, 10682200).
+    pub dropped_idents: i64,
 }
 
 /// The storage operations the command handlers depend on. Bytes at the seam:

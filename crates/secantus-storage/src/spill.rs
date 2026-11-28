@@ -136,6 +136,9 @@ pub struct SpillOpenRecord {
     pub messages: Vec<String>,
     /// How long `wiredtiger_open` took.
     pub open: std::time::Duration,
+    /// How many tables an earlier run left, dropped as the engine opened
+    /// (mongod's `Dropping spill idents`, 10682200, `numIdents`).
+    pub dropped_idents: i64,
 }
 
 /// The spill engine of the store at `dbpath`, opened by its first table.
@@ -199,12 +202,13 @@ impl SpillEngine {
         }
         let config = open_config(self.cache_mb);
         let started = std::time::Instant::now();
-        let opened = self.open_locked(&mut conn, &config)?;
+        let (opened, dropped_idents) = self.open_locked(&mut conn, &config)?;
         let open = started.elapsed();
         Ok(Some(SpillOpenRecord {
             config,
             messages: opened.take_messages(),
             open,
+            dropped_idents,
         }))
     }
 
@@ -215,19 +219,19 @@ impl SpillEngine {
         if let Some(c) = conn.as_ref() {
             return Ok(Arc::clone(c));
         }
-        let opened = self.open_locked(&mut conn, &open_config(self.cache_mb))?;
+        let (opened, _) = self.open_locked(&mut conn, &open_config(self.cache_mb))?;
         // Nothing logs the messages of an open after startup.
         opened.take_messages();
         Ok(opened)
     }
 
     /// Open the engine into `conn` with `config`, dropping what an earlier
-    /// run left in it.
+    /// run left in it; with how many tables it dropped.
     fn open_locked(
         &self,
         conn: &mut Option<Arc<Connection>>,
         config: &str,
-    ) -> Result<Arc<Connection>> {
+    ) -> Result<(Arc<Connection>, i64)> {
         std::fs::create_dir_all(&self.home).map_err(|e| {
             StorageError::Internal(format!(
                 "could not create the spill engine's directory {}: {e}",
@@ -241,9 +245,9 @@ impl SpillEngine {
             ))
         })?;
         let opened = Arc::new(Connection::open(home, config)?);
-        drop_all(&opened.open_session()?)?;
+        let dropped = drop_all(&opened.open_session()?)?;
         *conn = Some(Arc::clone(&opened));
-        Ok(opened)
+        Ok((opened, dropped))
     }
 
     /// What `serverStatus.spillWiredTiger` reports at mongod 8.2's
@@ -334,8 +338,8 @@ impl Drop for SpillEngine {
 }
 
 /// Drop every table in the engine: mongod's "Dropping spill idents" at
-/// startup, here when the engine opens.
-fn drop_all(session: &Session) -> Result<()> {
+/// startup, here when the engine opens. Returns how many it dropped.
+fn drop_all(session: &Session) -> Result<i64> {
     let mut tables = Vec::new();
     {
         let cursor = session.open_cursor("metadata:", None)?;
@@ -346,10 +350,11 @@ fn drop_all(session: &Session) -> Result<()> {
             }
         }
     }
+    let dropped = tables.len() as i64;
     for t in tables {
         session.drop_table(&t, Some(DROP_CFG))?;
     }
-    Ok(())
+    Ok(dropped)
 }
 
 /// One spill table. Dropped by [`SpillTable::drop_table`], or when the value
@@ -606,5 +611,21 @@ mod tests {
             }
         }
         assert_eq!(tables, 1);
+    }
+    /// RM-305: the open counts what it dropped, for `Dropping spill
+    /// idents`' `numIdents`.
+    #[test]
+    fn opening_counts_what_it_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = SpillEngine::new(dir.path(), 100);
+        {
+            std::fs::create_dir_all(engine.home()).unwrap();
+            let earlier =
+                Connection::open(engine.home().to_str().unwrap(), &open_config(100)).unwrap();
+            let session = earlier.open_session().unwrap();
+            session.create("table:internal-a", TABLE_CFG).unwrap();
+            session.create("table:internal-b", TABLE_CFG).unwrap();
+        }
+        assert_eq!(engine.open().unwrap().unwrap().dropped_idents, 2);
     }
 }

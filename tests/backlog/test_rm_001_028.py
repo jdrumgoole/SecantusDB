@@ -937,14 +937,26 @@ def test_startup_initializes_the_durable_catalog_after_the_spill_engine(rust_mon
     assert first["attr"]["numRecords"] == last["attr"]["numEntries"] >= 0, (first, last)
 
 
-@pytest.mark.backlog("RM-305")
+@pytest.mark.backlog_fixed("RM-305")
 def test_startup_drops_spill_idents_after_the_durable_catalog(rust_mongo: Any) -> None:
     """After `Initializing all collections in durable catalog` (9529903)
     mongod 8.2.11 writes `Dropping spill idents` (10682200, attr
     `numIdents`) on `initandlisten` before it listens (measured 2026-11-18,
-    on a new dbpath and on a restart). This server does not write it."""
+    on a new dbpath and on a restart). This server did not write it until
+    the spill engine's open counted the tables it dropped."""
     ids = _startup_ids(rust_mongo)
     assert 10682200 in ids[ids.index(9529903) :], ids
+
+
+@pytest.mark.backlog("RM-305")
+def test_startup_reports_flow_control_after_the_spill_idents(rust_mongo: Any) -> None:
+    """After `Dropping spill idents` (10682200) mongod 8.2.11 writes
+    `Flow Control is enabled on this deployment` (20536) on
+    `initandlisten` (measured 2026-11-28 on a restart, after `Initializing
+    cluster server parameters from disk`, 6608200). This server does not
+    write it."""
+    ids = _startup_ids(rust_mongo)
+    assert 20536 in ids[ids.index(10682200) :], ids
 
 
 def _op_msg(sock: socket.socket, command: dict, request_id: int) -> dict:

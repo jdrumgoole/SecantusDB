@@ -584,6 +584,11 @@ pub fn bind(
     for entry in secantus_commands::diagnostics::durable_catalog_lines(catalog_entries) {
         logs.log(entry);
     }
+    if let Some(spill) = &spill_opening {
+        logs.log(secantus_commands::diagnostics::spill_idents_line(
+            spill.dropped_idents,
+        ));
+    }
     logs.log(
         LogEntry::new("I", "NETWORK", 23016, "listener", "Waiting for connections").attr(doc! {
             "port": i32::from(address.port()),
