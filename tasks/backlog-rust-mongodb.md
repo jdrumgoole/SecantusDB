@@ -1702,36 +1702,19 @@ Still different, all 77:
       `$elemMatch` over several predicates, a `$not` over several
       predicates, `$jsonSchema`, and an `AND_SORTED` winner. Found
       2026-11-14 (RM-436); object `$elemMatch` sized 2026-11-28.
-      The compound `$or` branch is blocked on RM-826, not on sizing
-      (measured 2026-11-28): tagging the branch's `AND` (the predicate on
-      the scanned index's leading field tagged, `sort_tagged` over it) is
-      a few lines in `plan::or_tags` and `entry_size::or_node`, but this
-      server then reports 5753 against 10381, because it plans 2
-      candidates where mongod plans 4 (RM-826), and with `a_1`, `b_1`,
-      `b_1_a_1` it caches no entry where mongod caches one at 6766. Close
-      RM-826's `$or` enumeration first, then size this.
+      The compound `$or` branch's candidates are mongod's since RM-826
+      (2026-11-28: over `a_1`, `b_1`, `c_1` the four plans, `FETCH(a_1)`
+      or `FETCH(c_1)` or `FETCH(AND_SORTED(a_1, c_1))` under the `OR`,
+      and `FETCH(c_1)`; over `a_1`, `b_1`, `b_1_a_1` the two), so what is
+      left is the sizing: tag the branch's `AND` (the predicate on the
+      scanned index's leading field tagged, `sort_tagged` over it) in
+      `plan::or_tags` and `entry_size::or_node`. The entries of `{$or:
+      [{a: 3}, {b: 5}], c: {$lt: 3}}` over `a_1`, `b_1`, `a_1_c_1` and
+      `b_1_c_1` (9729) and of an object `$elemMatch` of two predicates
+      (3486, over `a_1`, `b_1`, `d.e_1`; this server 3326) are unsized or
+      mis-sized the same way.
       Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_an_or_entry_with_a_compound_branch_reports_its_size
       Backlog-ID: RM-694
-- [ ] **The plan cache holds entries mongod does not, and misses ones it
-      holds.** mongod 8.2.11 caches no entry for `{a: {$lt: 5}, b: {$not:
-      {$gt: 3, $lt: 9}}}` over `a_1` and `b_1` (it plans one candidate);
-      this server caches one. mongod caches one for `{a: {$lt: 5}, d:
-      {$elemMatch: {e: {$lt: 2}, f: null}}}` over `a_1`, `b_1` and `d.e_1`;
-      this server caches none. Which candidates each plans is not yet
-      compared. Also (2026-11-28): mongod caches an entry (9729 bytes) for
-      `{$or: [{a: 3}, {b: 5}], c: {$lt: 3}}` over `a_1`, `b_1`, `a_1_c_1`
-      and `b_1_c_1`; this server caches none. Found 2026-11-26 (RM-694).
-      Candidates compared 2026-11-28 for `{$or: [{a: 3, c: 2}, {b: 5}], c:
-      {$lt: 3}}`: this server builds ONE `OR` candidate, one index a
-      branch. Over `a_1`, `b_1`, `c_1` mongod plans `FETCH(OR(FETCH(a_1),
-      b_1))`, `FETCH(OR(FETCH(c_1), b_1))`, `FETCH(OR(FETCH(AND_SORTED(a_1,
-      c_1)), b_1))` and `FETCH(c_1)`; this server the first and last. Over
-      `a_1`, `b_1`, `b_1_a_1` mongod adds `FETCH(OR(FETCH(a_1), b_1_a_1))`
-      and caches the entry; this server plans one and caches none. The
-      fix is mongod's per-branch `$or` enumeration (`PlanEnumerator`'s
-      `OrAssignment`, each branch's choices crossed).
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_the_plan_cache_holds_the_entries_mongod_holds
-      Backlog-ID: RM-826
 
 ### 7.079 `$out` and `$merge` -- 2026-10-13
 
@@ -2005,6 +1988,24 @@ would see them. What is left:
       the rule (2026-11-26, working RM-660).
       Verify: tests/backlog/test_rm_found_2026_11_24_rm774.py::test_a_random_tree_is_simplified_as_mongod_does
       Backlog-ID: RM-778
+- [ ] **Two `$or`s in one `$and` are planned through the first only.**
+      mongod 8.2.11 plans `{$and: [{$or: [{a: 1}, {b: 2}]}, {$or: [{c: 3},
+      {d: 4}]}]}` over `a_1`, `b_1`, `c_1` and `d_1` through either `$or`
+      (the other is a rejected plan, and its trial caches an entry); this
+      server offers the first `$or`'s plan alone. Found 2026-11-28 (RM-826).
+      Verify: tests/backlog/test_rm_found_2026_11_28_rm826.py::test_two_ors_in_one_and_are_each_planned
+      Backlog-ID: RM-851
+- [ ] **An `$or` with a compound branch beside a clause is enumerated as the
+      product of its branches' indexes; mongod's list is shorter.** mongod
+      8.2.11 lists eight plans for `{$or: [{a: 3, b: 1}, {b: 5}], c: {$lt:
+      3}}` over `a_1`, `b_1`, `a_1_c_1`, `b_1_c_1` and `c_1_a_1` (an `OR`
+      of `FETCH` over `b_1` and `b_1_c_1` wins; no plan reads one index for
+      both branches but through the `b_1` / `b_1_c_1` pair, nor `a_1_c_1`
+      with `b_1_c_1`); `or_variants` (RM-826) offers the full product up to
+      ten, eleven plans. Which pairs the enumerator drops is not modelled.
+      Found 2026-11-28 (RM-826).
+      Verify: tests/backlog/test_rm_found_2026_11_28_rm826.py::test_an_or_of_a_compound_branch_enumerates_mongods_combinations
+      Backlog-ID: RM-852
 - [ ] **RUST MongoDB server: a change stream's `docsExamined` leaves out
       mongod's own oplog entries.** mongod 8.2.11's `executionStats` of a
       change stream counts every oplog entry its scan reads from the start
