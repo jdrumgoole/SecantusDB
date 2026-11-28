@@ -503,6 +503,12 @@ fn reshapes(stage: &Bson) -> Option<Reshape> {
     if let Some(unwind) = d.get("$unwind") {
         return unwind_paths(unwind).map(writes);
     }
+    // A `$lookup` writes only its `as` field (mongod 8.2
+    // `DocumentSourceLookUp::getModifiedPaths`): a `$match` that does not
+    // read it moves ahead (measured 8.2.11, RM-828).
+    if let Ok(spec) = d.get_document("$lookup") {
+        return spec.get_str("as").ok().map(|a| writes(vec![a.to_string()]));
+    }
     if let Ok(spec) = d
         .get_document("$addFields")
         .or_else(|_| d.get_document("$set"))

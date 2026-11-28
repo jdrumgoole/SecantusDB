@@ -1250,13 +1250,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       plain collection scan and stages that hand on whole documents.
       Verify: tests/backlog/test_rm_lookup_sbe.py::test_a_lookup_among_other_pushed_stages_is_explained_as_sbe
       Backlog-ID: RM-827
-- [ ] **A `$match` that does not read a `$lookup`'s `as` field is listed
-      after it.** mongod 8.2.11 moves such a `$match` ahead of the
-      `$lookup` into the query (`parsedQuery` {a: {$eq: 1}}, and the
-      `COLLSCAN`'s filter), classic or SBE; this server lists it after the
-      `$lookup` with an empty query. Found 2026-11-26 working RM-683.
-      Verify: tests/backlog/test_rm_lookup_sbe.py::test_a_match_moves_ahead_of_a_classic_lookup_that_does_not_read_it
-      Backlog-ID: RM-828
 - [ ] **The operation rows `currentOp` lists lack mongod's detail.** Since
       2026-10-20 a registry of running operations stands behind
       `currentOp`, `$currentOp` (with `idleCursors`) and `killOp`, which
