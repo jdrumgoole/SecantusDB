@@ -1272,7 +1272,7 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       - `$currentOp`'s `allUsers`, `idleConnections` and `idleSessions`
         options are not applied.
       Backlog-ID: RM-216
-      Verify: none -- the missing fields are mongod's internal accounting; the registry's own tests are backlog_fixed
+      Verify: tests/backlog/test_rm_216_current_op_fields.py::test_a_running_operations_row_has_mongods_fields, tests/backlog/test_rm_216_current_op_fields.py::test_an_idle_cursors_row_has_mongods_fields
 - [ ] **`dbCheck` `extraIndexKeysCheck` refuses Decimal128 keys and geo / wildcard indexes; `applyOps` some entries.**
       Since 2026-11-14 the check walks an ascending, descending, compound,
       multikey, sparse, partial or collated index as mongod 8.2.11 does
@@ -1314,8 +1314,7 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       since 2026-11-16 a `$jsonSchema` query's setting is kept (RM-358).
       Open: a write made to `config.clusterParameters` directly is read
       only at the next start (mongod's op observer reloads it).
-      Verify: none -- no gap test yet for the direct write to
-      `config.clusterParameters`
+      Verify: tests/backlog/test_rm_418_direct_cluster_parameter_write.py::test_a_direct_delete_of_the_query_settings_lifts_them
       Backlog-ID: RM-418
 - [ ] **A `find` under `queryFramework: "sbe"` that is index-served, or
       sorted on a path or with a skip, is explained in the classic
@@ -2080,7 +2079,13 @@ differs on 5 scenarios. What is left:
       "$w"]}`, 62 to 63 for `v > 3900` under a collation) and this server's
       is one number (2,292, 1,915, 1,017), so no test pins those. Found
       while working RM-457, 2026-11-15.
-      Verify: none -- what is left is the shapes above that still read the collection whole; no gap test pins them yet
+      Measured 2026-11-28 (mongod 8.2.11, the count after a delete): a TTL
+      index (mongod needs its partial filter on the meta field), a
+      2dsphere index and a `$text` / `$where` filter read as mongod does
+      (`$where` and `$text` are refused alike), so they are not left; the
+      string filters under a collation and the `$expr` that is no single
+      comparison are the tests of `test_rm_701_time_series_remainder.py`.
+      Verify: tests/backlog/test_rm_701_time_series_remainder.py::test_a_time_series_string_filter_under_a_collation_buffers_as_mongod, tests/backlog/test_rm_701_time_series_remainder.py::test_a_time_series_expr_that_is_no_single_comparison_buffers_as_mongod
       Backlog-ID: RM-701
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
@@ -2984,7 +2989,7 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       different statement; only a writer to the same document should wait,
       by write conflict. Found 2026-11-28 (RM-803); the regression test of
       RM-501 compares `serverStatus.batchedDeletes` instead, for want of it.
-      Verify: none -- gap test pending
+      Verify: tests/backlog/test_rm_843_concurrent_write.py::test_an_update_does_not_wait_for_a_running_delete_many
       Backlog-ID: RM-843
 - [ ] **`secantusd-mdb` refuses `--setParameter internalQueryExecYieldPeriodMS`
       at startup.** mongod 8.2.11 takes it on the command line (the
@@ -2992,7 +2997,7 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       "secantusd-mdb does not take --setParameter 'internalQueryExecYieldPeriodMS'
       at startup" and exits, though `setParameter` takes it at run time.
       Found 2026-11-28 (RM-803).
-      Verify: none -- gap test pending
+      Verify: tests/backlog/test_rm_844_startup_yield_parameter.py::test_the_yield_period_is_a_startup_parameter
       Backlog-ID: RM-844
 - [ ] **A batched delete's batch size and time are not server parameters,
       and a batch its time target cuts is not its own oplog entry.**
@@ -3152,18 +3157,40 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       `maxRecord` Infinity, the number bracket. This server's
       `plan::rid_clause` bounds nothing for a NaN operand. Found by the
       RM-739 fix; probed, no gap test yet.
-      Verify: none -- gap test to write beside tests/backlog/test_rm_clustered_explain.py, comparing the winning plan's stage and bounds with mongod's
+      Verify: tests/backlog/test_rm_clustered_explain.py::test_an_id_against_nan_is_a_bounded_clustered_scan
       Backlog-ID: RM-822
+
+- [ ] **A partial index of a time-series collection is accepted whatever its
+      filter, where mongod refuses one it cannot translate to the buckets
+      (2026-11-28).** mongod 8.2.11 refuses `partialFilterExpression` of
+      `$type` (by name or number), `$exists: false`, `$ne`, `$regex` and
+      `$eq: null` on a time-series collection with code 5916301 ("Error
+      translating non-metadata time-series predicate to operate on buckets:
+      can't handle this predicate: { v: { $type: [ "number" ] } }", the
+      `$eq: null` one "can't handle comparison to null"); `$in` and `$or` of
+      comparisons are accepted. This server accepts `$type` and `$eq: null`
+      and answers code 67 to `$exists: false`, `$ne` and `$regex`. Found
+      probing RM-701.
+      Verify: tests/backlog/test_rm_701_time_series_remainder.py::test_a_time_series_partial_index_must_translate_to_the_buckets
+      Backlog-ID: RM-854
+
+- [ ] **`{_id: {$gte: NaN}}` on a clustered collection is bounded `NaN`..`NaN`,
+      where mongod bounds it `NaN`..`Infinity` (2026-11-28).** mongod 8.2.11
+      explains it as `CLUSTERED_IXSCAN` with `minRecord` NaN and
+      `maxRecord` Infinity (the whole number bracket, as `$gt: NaN`); this
+      server's `maxRecord` is NaN. Found beside RM-822.
+      Verify: tests/backlog/test_rm_clustered_explain.py::test_an_id_gte_nan_is_bounded_to_infinity
+      Backlog-ID: RM-853
 
 - [ ] **A `tailable` find of an `_id` point on an uncapped clustered
       collection is planned as `EXPRESS`, where mongod refuses it
       (2026-11-26).** mongod 8.2.11 refuses a tailable cursor on a
       collection that is not capped. This server picks the express plan
-      first, and its explain shows `EXPRESS_CLUSTERED_IXSCAN`. Compare
-      the plain find's reply and the explain's with mongod's, and check
-      that the refusal comes before planning. Found by the RM-739 fix;
-      probed, no gap test yet.
-      Verify: none -- gap test to write beside tests/backlog/test_rm_clustered_explain.py, comparing the error code and message with mongod's
+      first, and its explain shows `EXPRESS_CLUSTERED_IXSCAN`. Measured
+      2026-11-28: the `find` itself is refused here as on mongod (code 2);
+      it is the `explain` of the find (an `_id` point, `{}`, a range) that
+      answers a plan here and code 2 on mongod. Found by the RM-739 fix.
+      Verify: tests/backlog/test_rm_clustered_explain.py::test_a_tailable_read_of_an_uncapped_clustered_collection_is_refused
       Backlog-ID: RM-823
 
 - [ ] **The winning plan of a multi-plan trial reports one `works` fewer
@@ -3174,7 +3201,7 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       compares the trial's accounting but says it leaves the winner's own
       run out, so nothing catches it. mongod's final run counts the work
       that reports EOF. Found by the RM-739 fix's probes.
-      Verify: none -- gap test to write: extend tests/mongod_live/test_plan_trial.py's comparison to the winner's executionStages
+      Verify: tests/backlog/test_rm_824_winner_works.py::test_the_winners_works_count_the_final_eof_run
       Backlog-ID: RM-824
 
 - [ ] **A time-series collection's own namespace still has a table and a
