@@ -1257,13 +1257,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       `$lookup` with an empty query. Found 2026-11-26 working RM-683.
       Verify: tests/backlog/test_rm_lookup_sbe.py::test_a_match_moves_ahead_of_a_classic_lookup_that_does_not_read_it
       Backlog-ID: RM-828
-- [ ] **A `$unwind` after a `$lookup` is listed as a stage of its own.**
-      mongod 8.2.11 absorbs a `$unwind` of the `as` field into the
-      `$lookup` (`unwinding: {preserveNullAndEmptyArrays: false}`, and the
-      stages after it count the unwound documents); this server lists both
-      stages. Found 2026-11-26 working RM-683.
-      Verify: tests/backlog/test_rm_lookup_sbe.py::test_an_unwind_after_a_lookup_is_listed_inside_it
-      Backlog-ID: RM-829
 - [ ] **The operation rows `currentOp` lists lack mongod's detail.** Since
       2026-10-20 a registry of running operations stands behind
       `currentOp`, `$currentOp` (with `idleCursors`) and `killOp`, which

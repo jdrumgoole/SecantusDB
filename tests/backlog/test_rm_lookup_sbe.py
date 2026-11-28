@@ -281,16 +281,19 @@ def _unwound(client: Any) -> dict:
         "preserving": _classic(
             client, [_join(), {"$unwind": {"path": "$z", "preserveNullAndEmptyArrays": True}}]
         ),
+        "with an array index": _classic(
+            client, [_join(), {"$unwind": {"path": "$z", "includeArrayIndex": "i"}}]
+        ),
     }
 
 
-@pytest.mark.backlog("RM-829")
+@pytest.mark.backlog_fixed("RM-829")
 def test_an_unwind_after_a_lookup_is_listed_inside_it(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
     """mongod 8.2.11 absorbs a `$unwind` of the `as` field into the
     `$lookup` stage it lists (`unwinding: {preserveNullAndEmptyArrays:
-    false}`); this server lists the two stages. Found 2026-11-26 working
-    RM-683."""
+    false}`); this server listed the two stages until RM-829 folded them.
+    Found 2026-11-26 working RM-683."""
     assert _unwound(rust_mongo) == _unwound(mongod_rs)

@@ -793,6 +793,7 @@ fn listed_internal_window(spec: &Document) -> Document {
 /// added to it. A window's `$sort` (`outputSortKeyMetadata`) takes none.
 /// The stages the `$limit` passed return no more than it lets through.
 pub(crate) fn fold_sort_limits(stages: &mut Vec<Bson>) {
+    fold_lookup_unwinds(stages);
     let name = |s: &Bson| {
         s.as_document()
             .and_then(|d| d.keys().next().cloned())
@@ -828,7 +829,13 @@ pub(crate) fn fold_sort_limits(stages: &mut Vec<Bson>) {
                         .map(|total| (j, total));
                     break;
                 }
-                "$project" | "$addFields" | "$set" | "$replaceRoot" | "$lookup" => {}
+                "$project" | "$addFields" | "$set" | "$replaceRoot" => {}
+                // A `$lookup` that absorbed an `$unwind` changes the count.
+                "$lookup"
+                    if !stages[j]
+                        .as_document()
+                        .and_then(|d| d.get_document("$lookup").ok())
+                        .is_some_and(|l| l.contains_key("unwinding")) => {}
                 _ => break,
             }
             j += 1;
@@ -859,6 +866,58 @@ pub(crate) fn fold_sort_limits(stages: &mut Vec<Bson>) {
         if let Some(Bson::Document(stage)) = stages.get_mut(i) {
             if let Ok(spec) = stage.get_document_mut("$sort") {
                 spec.insert("limit", Bson::Int64(total));
+            }
+        }
+        i += 1;
+    }
+}
+
+/// mongod absorbs a `$unwind` of a `$lookup`'s `as` field into the
+/// `$lookup` (`DocumentSourceLookUp::doOptimizeAt`): it lists one `$lookup`
+/// carrying `unwinding: {preserveNullAndEmptyArrays[, includeArrayIndex]}`,
+/// whose counts are the unwound documents' (measured 8.2.11, RM-829).
+pub(crate) fn fold_lookup_unwinds(stages: &mut Vec<Bson>) {
+    let mut i = 0;
+    while i + 1 < stages.len() {
+        let as_field = stages[i]
+            .as_document()
+            .and_then(|d| d.get_document("$lookup").ok())
+            .filter(|l| !l.contains_key("unwinding"))
+            .and_then(|l| l.get_str("as").ok())
+            .map(str::to_owned);
+        let unwind = stages[i + 1]
+            .as_document()
+            .and_then(|d| d.get_document("$unwind").ok())
+            .cloned();
+        let (Some(as_field), Some(unwind)) = (as_field, unwind) else {
+            i += 1;
+            continue;
+        };
+        if unwind.get_str("path").ok() != Some(format!("${as_field}").as_str()) {
+            i += 1;
+            continue;
+        }
+        let mut unwinding = doc! {
+            "preserveNullAndEmptyArrays":
+                unwind.get_bool("preserveNullAndEmptyArrays").unwrap_or(false),
+        };
+        if let Some(v) = unwind.get("includeArrayIndex") {
+            unwinding.insert("includeArrayIndex", v.clone());
+        }
+        let after = stages
+            .remove(i + 1)
+            .as_document()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(Bson::Document(stage)) = stages.get_mut(i) {
+            if let Ok(spec) = stage.get_document_mut("$lookup") {
+                spec.insert("unwinding", unwinding);
+            }
+            // The stats are the unwound documents'.
+            for (k, v) in after {
+                if k != "$unwind" {
+                    stage.insert(k, v);
+                }
             }
         }
         i += 1;
@@ -1359,6 +1418,35 @@ pub(crate) fn echo(inner: &Document, db: &str) -> Document {
 mod tests {
     use super::{absorb, find, Shape};
     use bson::{doc, Document};
+
+    /// A `$unwind` of the `as` field folds into the `$lookup`, its counts
+    /// with it; one of another path stays (mongod 8.2.11, RM-829).
+    #[test]
+    fn an_unwind_of_the_as_field_folds_into_the_lookup() {
+        use bson::Bson;
+        let mut stages = vec![
+            Bson::Document(doc! { "$lookup": { "from": "d", "as": "z" }, "nReturned": 3_i64 }),
+            Bson::Document(doc! {
+                "$unwind": { "path": "$z", "includeArrayIndex": "i" }, "nReturned": 5_i64,
+            }),
+            Bson::Document(doc! { "$lookup": { "from": "d", "as": "y" } }),
+            Bson::Document(doc! { "$unwind": { "path": "$other" } }),
+        ];
+        super::fold_lookup_unwinds(&mut stages);
+        assert_eq!(
+            stages,
+            vec![
+                Bson::Document(doc! {
+                    "$lookup": { "from": "d", "as": "z", "unwinding": {
+                        "preserveNullAndEmptyArrays": false, "includeArrayIndex": "i",
+                    } },
+                    "nReturned": 5_i64,
+                }),
+                Bson::Document(doc! { "$lookup": { "from": "d", "as": "y" } }),
+                Bson::Document(doc! { "$unwind": { "path": "$other" } }),
+            ]
+        );
+    }
 
     fn absorbed(pipeline: Vec<Document>) -> Shape {
         let mut shape = find("c", &doc! { "find": "c" }).expect("a find shape");
