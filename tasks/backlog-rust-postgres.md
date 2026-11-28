@@ -2376,8 +2376,8 @@ a regression test.
       Backlog-ID: RP-1168
 
 - [ ] **A join whose expression key shares a class with another clause
-      is unpriced beside a WHERE, a join filter, an aggregate, a comma
-      join, or a restriction of both sides.** `e`, `k` analysed (1000
+      is unpriced beside a WHERE, a join filter, an aggregate, or a
+      restriction of both sides.** `e`, `k` analysed (1000
       rows, `k.a` the primary key). An inner ON join of two tables whose
       expression key shares a member with another clause prints and
       prices its equivalence class as PostgreSQL 15.20 does (`e.a = k.a -
@@ -2389,16 +2389,16 @@ a regression test.
       both ON clauses stay the Hash Cond); an ON inequality beside it
       (`and e.b < k.b`, a `Join Filter` beside `Hash Cond: (e.a = k.a)`);
       a plain aggregate over it (`select count(*) ...`,
-      `aggregate_join_select`, RP-1104); a comma join (`from e, k where
-      e.a = k.a - 1 and e.a = k.a`, whose expression equality is a `Join
-      Filter` here rather than a class member); and a class restricting
+      `aggregate_join_select`, RP-1104); and a class restricting
       both sides (`e.a = k.a + 1 and e.a - 1 = k.a and e.a = k.a`), where
       PostgreSQL nests loops over a Materialize (`Nested Loop
       (cost=0.00..40.39 rows=1 width=3)`, each side 5 rows) and this
       server draws an unpriced Hash Join. `shared_join_classes` /
       `joined_sides` model only an inner ON join with no WHERE and no
-      other conjunct. Found while working RP-1117.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an expression class beside a where restricts its side by both], tests/backlog/test_rp_explain_costs.py::test_plan[an expression class beside an on inequality keeps it the join filter], tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over an expression class prices its join], tests/backlog/test_rp_explain_costs.py::test_plan[a comma join's expression equality joins its class], tests/backlog/test_rp_explain_costs.py::test_plan[an expression class restricting both sides nests loops]
+      other conjunct; a comma join's WHERE makes the ON join's class
+      since RP-1127 (`from e, k where e.a = k.a - 1 and e.a = k.a`).
+      Found while working RP-1117.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an expression class beside a where restricts its side by both], tests/backlog/test_rp_explain_costs.py::test_plan[an expression class beside an on inequality keeps it the join filter], tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over an expression class prices its join], tests/backlog/test_rp_explain_costs.py::test_plan[an expression class restricting both sides nests loops]
       Backlog-ID: RP-1171
 
 - [ ] **A Sort of an ORDER BY on a join key over a two-table join is
@@ -2703,8 +2703,8 @@ a regression test.
       `Hash Semi Join (cost=27.50..50.27 rows=50 width=7)` the merge bound
       declines. An outer expression against a unique inner column (`a + 1
       in (select a from k)`) is the inner join `as_inner_join` writes,
-      a comma join whose WHERE expression equality is unpriced
-      (RP-1127). (2)
+      priced since 2026-11-28 as the ON join its WHERE equality makes
+      (`joins::sink_where_join_equalities`). (2)
       Wider shapes still print the scan: a cross-type comparison
       (`a::bigint in (select a from k)`, `int8 = int4`, 15.19's `Hash Join
       (cost=27.50..45.26 rows=1000 width=7)` hashing `k`), an expression
@@ -3836,24 +3836,6 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by on a primary key a computed entry reads is an index scan]
       Backlog-ID: RP-1066
 
-- [ ] **An expression equality in a WHERE joining two relations is
-      unpriced.** Since RP-981 and RP-1032 an expression equality in a
-      JOIN's ON is a priced Hash or Merge Join, but the same clause in the
-      WHERE of a comma join prints a `Nested Loop` with `Join Filter` and
-      zero costs: `select * from e, e e2 where e.b = e2.b || 'x'` (and
-      `from e cross join e e2 where ...`) is, on PostgreSQL 15, the same
-      `Merge Join (cost=129.66..224.66 rows=5000 width=14)` its ON form
-      is. An IN of an outer expression over a unique column, `select *
-      from e where a + 1 in (select a from k)`, reaches this shape: RP-411's
-      `sublink_join::as_inner_join` writes it as `from e, k where (e.a + 1)
-      = k.a`, so it stays unpriced (15's `Hash Join (cost=27.50..45.26
-      rows=1000 width=7)` hashing `k`). The ON form reaches pricing through
-      `JoinNode::Join::expr_keys` (`joins::expr_equalities` over the ON);
-      a WHERE's equality across the two relations is never collected
-      there. Measured on a private 15.20 cluster (2026-11-26, found while
-      working RP-1032).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an expression equality in a comma join's where is a merge join], tests/backlog/test_rp_explain_costs.py::test_plan[an in of an outer expression over a unique column is a hash join]
-      Backlog-ID: RP-1127
 - [ ] **A merge reading a unique index presorted against a sorted
       expression key is not drawn.** Since RP-1032 a join of an expression
       key against a unique column weighs, as PostgreSQL does, the merge
@@ -4004,7 +3986,11 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       to notice delivery only) it took 3.44 s at a load average of about 3
       on the 12-core Mac; the whole `embedded` file at `--test-threads=4`
       then overran once in three runs (3.05 s) at load 2.5, and the test
-      alone passed three of three.
+      alone passed three of three. Again on 2026-11-28 (RP-1127's
+      `--fast` gate, a planner rewrite of a join's quals that this test's
+      CREATE / INSERT never reaches): 3.01 s, beside a 2-worker pytest run
+      at a load average of about 5; alone it then passed five of five at
+      load ~3.
       Verify: none -- an intermittent wall-clock bound under load; crates/secantus-pg/tests/embedded.rs::stop_does_not_wait_on_an_idle_connection is the check
       Backlog-ID: RP-1132
 
