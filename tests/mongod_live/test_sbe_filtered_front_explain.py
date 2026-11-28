@@ -26,6 +26,7 @@ DOCS = (
     [{"a": i, "b": i % 3, "s": str(i), "t": i % 2 == 0, "d": {"e": i}} for i in range(40)]
     + [{"a": [1, 7]}, {"a": [[5]]}, {"x": 1}, {"a": float("nan")}, {"a": "str"}]
     + [{"a": None}, {"d": [{"e": 3}, {"e": 50}]}]
+    + [{"d": 5}, {"d": {"e": None}}, {"d": [1, {"e": None}]}, {"d": {"e": {"f": None}}}]
 )
 
 COUNT = {"$count": "n"}
@@ -66,6 +67,11 @@ PIPELINES = [
     [{"$match": {"x": {"$exists": False}}}, COUNT],
     [{"$match": {"a": {"$in": [1, 2]}, "x": {"$exists": False}}}, COUNT],
     [{"$match": {"a": {"$gt": 2}, "d": {"$exists": True}}}, {"$group": {"_id": "$b"}}],
+    # RM-071 (2026-11-28): a dotted null test guards each level.
+    [{"$match": {"d.e": None}}, COUNT],
+    [{"$match": {"d.e": {"$ne": None}}}, COUNT],
+    [{"$match": {"d.e.f": None}}, COUNT],
+    [{"$match": {"a": {"$gt": 1}, "d.e": None}}, {"$group": {"_id": "$b"}}],
 ]
 
 

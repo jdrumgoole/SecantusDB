@@ -1325,9 +1325,10 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       and `$in`s), skip, limit, a simple projection of top-level fields,
       since 2026-11-26 a sort on one top-level field with or without a
       limit, and since 2026-11-28 on several, with mongod's parallel-arrays
-      check (`explain/sbe/find.rs`). Also not built: a sort on
-      a path (`traverseP` with `getNonLeafSortKeyAsc`), or with a skip or a
-      projection; an `$in` holding null (mongod's `typeMatch` program), a
+      check, or with a skip alone (`explain/sbe/find.rs`). Also not built: a
+      sort on a path (`traverseP` with `getNonLeafSortKeyAsc`), or with a
+      projection, or with a skip and a limit both (mongod's sort limit is
+      then a `let` of `skip + limit`, guarded by `typeMatch`); an `$in` holding null (mongod's `typeMatch` program), a
       projection of a path or a computed field, and a projection under both
       a skip and a limit. For an `aggregate` (RM-542) the `$addFields`
       after its query are built when they set new top-level fields to
@@ -1702,6 +1703,14 @@ Still different, all 77:
       `$elemMatch` over several predicates, a `$not` over several
       predicates, `$jsonSchema`, and an `AND_SORTED` winner. Found
       2026-11-14 (RM-436); object `$elemMatch` sized 2026-11-28.
+      The compound `$or` branch is blocked on RM-826, not on sizing
+      (measured 2026-11-28): tagging the branch's `AND` (the predicate on
+      the scanned index's leading field tagged, `sort_tagged` over it) is
+      a few lines in `plan::or_tags` and `entry_size::or_node`, but this
+      server then reports 5753 against 10381, because it plans 2
+      candidates where mongod plans 4 (RM-826), and with `a_1`, `b_1`,
+      `b_1_a_1` it caches no entry where mongod caches one at 6766. Close
+      RM-826's `$or` enumeration first, then size this.
       Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_an_or_entry_with_a_compound_branch_reports_its_size
       Backlog-ID: RM-694
 - [ ] **The plan cache holds entries mongod does not, and misses ones it
@@ -1713,6 +1722,15 @@ Still different, all 77:
       compared. Also (2026-11-28): mongod caches an entry (9729 bytes) for
       `{$or: [{a: 3}, {b: 5}], c: {$lt: 3}}` over `a_1`, `b_1`, `a_1_c_1`
       and `b_1_c_1`; this server caches none. Found 2026-11-26 (RM-694).
+      Candidates compared 2026-11-28 for `{$or: [{a: 3, c: 2}, {b: 5}], c:
+      {$lt: 3}}`: this server builds ONE `OR` candidate, one index a
+      branch. Over `a_1`, `b_1`, `c_1` mongod plans `FETCH(OR(FETCH(a_1),
+      b_1))`, `FETCH(OR(FETCH(c_1), b_1))`, `FETCH(OR(FETCH(AND_SORTED(a_1,
+      c_1)), b_1))` and `FETCH(c_1)`; this server the first and last. Over
+      `a_1`, `b_1`, `b_1_a_1` mongod adds `FETCH(OR(FETCH(a_1), b_1_a_1))`
+      and caches the entry; this server plans one and caches none. The
+      fix is mongod's per-branch `$or` enumeration (`PlanEnumerator`'s
+      `OrAssignment`, each branch's choices crossed).
       Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_the_plan_cache_holds_the_entries_mongod_holds
       Backlog-ID: RM-826
 
@@ -1862,7 +1880,7 @@ What is left, all on the RUST MongoDB server:
       is, over a forward collection scan with no sort, projection, hint or
       collation, whose filter is `$eq` / `$lt` / `$lte` / `$gt` / `$gte` of
       a number, string or boolean on a path of named fields, `$eq: null`
-      on one field, an `$in` of such values (holding null too on one
+      (on a dotted path too, since 2026-11-28), an `$in` of such values (holding null too on one
       field, since 2026-11-27), the `$not: {$eq}` a `$ne` is
       (since 2026-11-14), and the `$and`s of those (`explain/sbe/filter.rs`), with a skip and a limit where the
       group reads no field (RM-072); whose `_id` is a field path, `$$ROOT`,
@@ -1874,7 +1892,7 @@ What is left, all on the RUST MongoDB server:
       `$exists` on one field (`exists(s)`, since 2026-11-28). Still the
       classic `$cursor` / `stages` shape: any other filter (an `$in` holding
       null on a dotted path, a dotted `$exists` (mongod's `traverseF` of
-      `exists(getField(...))`), a dotted `$eq: null`, `$or`, ...), a sorted,
+      `exists(getField(...))`), `$or`, ...), a sorted,
       projected or index-served front (`IXSCAN` / `FETCH` under a group
       that reads a field; the single-interval `FETCH` under one that reads
       none is built since 2026-11-27, RM-695; the `COUNT_SCAN` of a single-field
@@ -2976,6 +2994,24 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       Found 2026-11-28 (RM-803).
       Verify: none -- gap test pending
       Backlog-ID: RM-844
+- [ ] **A batched delete's batch size and time are not server parameters,
+      and a batch its time target cuts is not its own oplog entry.**
+      mongod 8.2.11 sizes a deleteMany's batches by
+      `batchedDeletesTargetBatchDocs` (10) and
+      `batchedDeletesTargetBatchTimeMS` (5), both taken by `getParameter`
+      and `setParameter`, and writes each batch it commits as one oplog
+      entry: an `applyOps` of its deletes, a batch of one as a plain `d`.
+      With the target at 3 documents, a deleteMany of `_id` 6 to 9 writes
+      `applyOps` of 8, 7, 6 and then `d` of 9. This server answers
+      `getParameter` of either with InvalidOptions, and its batch size is
+      fixed (`secantus-storage`'s `batch_docs`). It also gives a whole
+      staged batch one oplog group, so a batch the time target splits in
+      `delete_chunk_txn` reads back as one `applyOps` (a lone tail as an
+      `applyOps` of one), where mongod writes one entry per commit. Found
+      2026-11-28 diagnosing PR #3139's mongod_live failure, where mongod
+      cut ids 129 to 120 after 121 and logged 120 as a plain `d`.
+      Verify: tests/backlog/test_rm_found_2026_11_28_batched_delete_params.py::test_a_batched_delete_commits_batches_of_its_target_size
+      Backlog-ID: RM-848
 
 - [ ] **Stopping a gate run leaves its tests' reference mongods running
       (2026-11-25).** `scripts/detached_run.py stop` on a `gate_rm.py`

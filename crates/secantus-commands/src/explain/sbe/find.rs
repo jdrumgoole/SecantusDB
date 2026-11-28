@@ -211,10 +211,13 @@ pub(super) fn build(uuid: &str, front: &Front, spec: Option<&Document>) -> Optio
 /// `SORT` node's, the scan reading the keys' fields (in name order) before
 /// the filter's. Two keys or more add the parallel-arrays check, the
 /// project's last slot: an `||` of two `isArray`s for two keys, a sum of
-/// `<=>`s for more (measured 8.2.11, 2026-11-28). `None` with a skip, or a
-/// `seek`.
+/// `<=>`s for more (measured 8.2.11, 2026-11-28). A skip alone is a
+/// `limitskip none` over the sort, its own `SKIP` node, its constant in
+/// the slot after the sort's (measured 8.2.11, 2026-11-28). `None` with a
+/// skip and a limit both (mongod's sort limit is then a `let` of their
+/// sum), or a `seek`.
 pub(super) fn build_sorted(uuid: &str, front: &Front, keys: &[(String, bool)]) -> Option<Plan> {
-    if front.skip > 0
+    if (front.skip > 0 && front.limit > 0)
         || front.seek.is_some()
         || keys.is_empty()
         || keys.iter().any(|(f, _)| f.is_empty() || f.contains('.'))
@@ -326,11 +329,30 @@ pub(super) fn build_sorted(uuid: &str, front: &Front, keys: &[(String, bool)]) -
     }
     sort.insert("type", "simple");
     sort.insert("inputStage", query_plan);
+    let (root, query_plan) = if front.skip > 0 {
+        let s = slots.next();
+        env.push((s, front.skip.to_string()));
+        let root = Stage::LimitSkip {
+            node: node + 1,
+            limit: None,
+            skip: Some((s, front.skip)),
+            input: Box::new(root),
+        };
+        let plan = doc! {
+            "stage": "SKIP",
+            "planNodeId": (node + 1) as i32,
+            "skipAmount": super::number(front.skip),
+            "inputStage": sort,
+        };
+        (root, plan)
+    } else {
+        (root, sort)
+    };
     Some(Plan {
         root,
         result: record,
         env,
-        query_plan: sort,
+        query_plan,
         eof: false,
     })
 }
@@ -840,10 +862,23 @@ mod tests {
         assert!(three.contains(
             "s10 = ((((((isArray(s5) ?: false) <=> false) + ((isArray(s4) ?: false) <=> false)) + ((isArray(s3) ?: false) <=> false)) <= 1) || fail(2, "
         ), "{three}");
-        // Not built: a path, a skip.
+        // A skip: `limitskip none` over the sort, its slot after the sort's.
+        assert_eq!(
+            sorted(&front(doc! { "x": { "$gt": 1 } }, 1, 0), "y", false),
+            (
+                "$$RESULT=s1 env: { s6 = 1 }".to_string(),
+                "[3] limitskip none s6 \n\
+                 [2] sort [s5] [asc] [s1] \n\
+                 [2] project [s5 = getSortKeyAsc(s3)] \n\
+                 [1] filter {traverseF(s4, lambda(l2.0) { ((move(l2.0) > 1) ?: false) }, false)} \n\
+                 [1] scan s1 s2 none none none none none none [s3 = y, s4 = x] @\"u\" true false "
+                    .to_string()
+            )
+        );
+        // Not built: a path, a skip with a limit.
         assert!(super::build_sorted("u", &gt1(), &[("d.e".to_string(), false)]).is_none());
         assert!(
-            super::build_sorted("u", &front(doc! {}, 1, 0), &[("y".to_string(), false)]).is_none()
+            super::build_sorted("u", &front(doc! {}, 1, 2), &[("y".to_string(), false)]).is_none()
         );
     }
 }

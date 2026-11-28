@@ -327,7 +327,7 @@ pub(super) fn scan(
     };
     let mut env: Vec<(Slot, String)> = Vec::new();
     if let Some(f) = &front.filter {
-        let predicate = f.program(&field_slot, &mut || slots.next())?;
+        let predicate = f.program(Some(record), &field_slot, &mut || slots.next())?;
         for (slot, values) in predicate.in_lists() {
             env.push((slot, super::print::in_list(&values)?));
         }
@@ -412,7 +412,7 @@ fn fetch_scan(
     let scan_fields: Vec<(String, Slot)> =
         f.fields().into_iter().map(|n| (n, slots.next())).collect();
     let field_slot = |n: &str| scan_fields.iter().find(|(m, _)| m == n).map(|(_, s)| *s);
-    let predicate = f.program(&field_slot, &mut || slots.next())?;
+    let predicate = f.program(None, &field_slot, &mut || slots.next())?;
     let mut env: Vec<(Slot, String)> = vec![(key_pattern, seek.key_pattern.clone())];
     for (slot, values) in predicate.in_lists() {
         env.push((slot, super::print::in_list(&values)?));

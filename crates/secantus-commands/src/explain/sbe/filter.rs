@@ -58,6 +58,38 @@ struct Leaf {
     negated: bool,
 }
 
+impl Leaf {
+    /// A null test on a dotted path: `null_traverse`'s shape.
+    fn dotted_null(&self) -> bool {
+        matches!(self.test, Test::Null) && self.path.len() > 1
+    }
+
+    /// The frame ids generating the program takes before the lambdas take
+    /// theirs. An `exists` leaf has no lambda but takes one all the same; a
+    /// dotted null test takes `2n - 1` for `n` components (measured
+    /// 2026-11-28: `d.e` alone numbers its lambdas from `l4`, `d.e.f` from
+    /// `l6`).
+    fn taken(&self) -> u32 {
+        let n = self.path.len() as u32;
+        if self.dotted_null() {
+            2 * n - 1
+        } else {
+            n
+        }
+    }
+
+    /// The frame ids its program numbers: a lambda per component, and a
+    /// dotted null test's `let` per level strictly inside the path.
+    fn used(&self) -> u32 {
+        let n = self.path.len() as u32;
+        if self.dotted_null() {
+            2 * n - 2
+        } else {
+            n
+        }
+    }
+}
+
 /// A filter, ready to be given its slots.
 #[derive(Clone, Debug)]
 pub(crate) struct Filter {
@@ -124,9 +156,9 @@ fn leaf(clause: &Document, raw: Option<&Document>) -> Option<Leaf> {
         });
     }
     if name == "$eq" && matches!(value, Bson::Null) {
-        // Measured on a one-field path only: a dotted path's null test
-        // reads the levels above it as well.
-        return (parts.len() == 1).then_some(Leaf {
+        // A dotted path's null test reads the levels above it as well
+        // (`null_traverse`, measured 2026-11-28).
+        return Some(Leaf {
             path: parts,
             test: Test::Null,
             negated,
@@ -212,18 +244,20 @@ impl Filter {
 
     /// How many frame ids generating the program takes: two per lambda.
     pub fn frames(&self) -> u32 {
-        2 * self.lambdas()
+        self.leaves.iter().map(|l| l.taken() + l.used()).sum()
     }
 
     fn lambdas(&self) -> u32 {
-        // An `exists` leaf has no lambda but takes a frame id all the same.
-        self.leaves.iter().map(|l| l.path.len() as u32).sum()
+        self.leaves.iter().map(Leaf::taken).sum()
     }
 
     /// The program, reading each top-level field from `slot_of`; each
     /// `$in`'s list takes the next slot of `slots`, in the program's order.
+    /// `root` is the scan's record slot, which a dotted null test reads
+    /// (`None` where that shape is unmeasured: the program is not built).
     pub fn program(
         &self,
+        root: Option<Slot>,
         slot_of: &dyn Fn(&str) -> Option<Slot>,
         slots: &mut dyn FnMut() -> Slot,
     ) -> Option<Expr> {
@@ -236,6 +270,11 @@ impl Filter {
                 // 2026-11-28: beside one `$in`, the `$in`'s lambda is `l3.0`).
                 let e = Expr::func("exists", vec![top]);
                 built.push(if l.negated { Expr::Not(Box::new(e)) } else { e });
+                continue;
+            }
+            if l.dotted_null() {
+                let t = null_traverse(top, Expr::Slot(root?), &l.path, 0, &mut frame);
+                built.push(if l.negated { Expr::Not(Box::new(t)) } else { t });
                 continue;
             }
             let test: Box<dyn Fn(Expr) -> Expr> = match &l.test {
@@ -276,6 +315,117 @@ impl Filter {
         }
         Some(out)
     }
+}
+
+/// `Test::Null`'s comparison of a lambda's local:
+/// `((if (typeMatch(l, 1024) ?: true) then null else move(l) == null) ?: false)`.
+fn null_test(v: Expr) -> Expr {
+    Expr::fill_empty(
+        Expr::bin(BinOp::Eq, fold_null(v), Expr::Const(Some(Bson::Null))),
+        Expr::Const(Some(Bson::Boolean(false))),
+    )
+}
+
+/// `(f(e) ?: false)`.
+fn guard(f: &'static str, e: Expr) -> Expr {
+    Expr::fill_empty(
+        Expr::func(f, vec![e]),
+        Expr::Const(Some(Bson::Boolean(false))),
+    )
+}
+
+/// The null test of a dotted path, as mongod 8.2.11 prints it (measured
+/// 2026-11-28 on `d.e` and `d.e.f`): level `depth`'s value `input` is
+/// traversed only when it is an object or an array, and otherwise the path
+/// is missing, which matches null unless its `parent` is an array:
+///
+/// `if (typeMatch(x, 24) ?: false) then traverseF(x, lambda(l) { if
+/// (isObject(l) ?: false) then <next> else false }, false) else
+/// !((isArray(parent) ?: false))`
+///
+/// where `<next>` is `traverseF(getField(move(l), "<leaf>"), lambda(m) {
+/// <null test of m> }, false)` before the last component, and otherwise
+/// the same shape again over `let [k = getField(l, "<next>")]`, with `l`
+/// the parent. At the top `x` is the field's slot and the parent the record.
+fn null_traverse(
+    input: Expr,
+    parent: Expr,
+    path: &[String],
+    depth: usize,
+    frame: &mut u32,
+) -> Expr {
+    *frame += 1;
+    let mine = *frame;
+    let next = &path[depth + 1];
+    let inner = if depth + 2 == path.len() {
+        *frame += 1;
+        let leaf = *frame;
+        Expr::func(
+            "traverseF",
+            vec![
+                Expr::func(
+                    "getField",
+                    vec![
+                        Expr::local(mine, true),
+                        Expr::Const(Some(Bson::String(next.clone()))),
+                    ],
+                ),
+                Expr::Lambda {
+                    frame: leaf,
+                    body: Box::new(null_test(Expr::local(leaf, true))),
+                },
+                Expr::Const(Some(Bson::Boolean(false))),
+            ],
+        )
+    } else {
+        *frame += 1;
+        let bound = *frame;
+        let body = null_traverse(
+            Expr::local(bound, true),
+            Expr::local(mine, true),
+            path,
+            depth + 1,
+            frame,
+        );
+        Expr::let_(
+            bound,
+            Expr::func(
+                "getField",
+                vec![
+                    Expr::local(mine, false),
+                    Expr::Const(Some(Bson::String(next.clone()))),
+                ],
+            ),
+            body,
+        )
+    };
+    let lambda_body = Expr::if_(
+        guard("isObject", Expr::local(mine, false)),
+        inner,
+        Expr::Const(Some(Bson::Boolean(false))),
+    );
+    let test_input = match &input {
+        Expr::Local { frame, .. } => Expr::local(*frame, false),
+        other => other.clone(),
+    };
+    Expr::if_(
+        Expr::fill_empty(
+            Expr::TypeMatch(Box::new(test_input), 24),
+            Expr::Const(Some(Bson::Boolean(false))),
+        ),
+        Expr::func(
+            "traverseF",
+            vec![
+                input,
+                Expr::Lambda {
+                    frame: mine,
+                    body: Box::new(lambda_body),
+                },
+                Expr::Const(Some(Bson::Boolean(false))),
+            ],
+        ),
+        Expr::Not(Box::new(guard("isArray", parent))),
+    )
 }
 
 /// `if (typeMatch(l, 1024) ?: true) then null else move(l)`: the lambda's
@@ -348,7 +498,7 @@ mod tests {
     fn text(parsed: bson::Document, slots: &[(&str, u32)]) -> String {
         let f = Filter::parse(&parsed).unwrap();
         let slot = |n: &str| slots.iter().find(|(k, _)| *k == n).map(|(_, s)| *s);
-        expression(&f.program(&slot, &mut || 9).unwrap())
+        expression(&f.program(Some(1), &slot, &mut || 9).unwrap())
     }
 
     /// The filters mongod 8.2.11 prints, measured 2026-11-08.
@@ -406,7 +556,7 @@ mod tests {
         let built = Filter::parse_find(&f, &f).unwrap();
         let slot = |n: &str| (n == "a").then_some(3);
         assert_eq!(
-            expression(&built.program(&slot, &mut || 4).unwrap()),
+            expression(&built.program(Some(1), &slot, &mut || 4).unwrap()),
             "traverseF(s3, lambda(l2.0) { isMember(\n    if (typeMatch(l2.0, 1024) ?: true) \n    \
              then null \n    else move(l2.0) \n, s4) }, false)"
         );
@@ -437,6 +587,45 @@ mod tests {
         assert!(Filter::parse(&doc! { "c.d": { "$exists": true } }).is_none());
     }
 
+    /// A null test on a dotted path traverses only objects and arrays,
+    /// and a missing level matches unless its parent is an array; measured
+    /// against mongod 8.2.11 on 2026-11-28 (RM-071), whose plans print
+    /// these (whitespace aside).
+    #[test]
+    fn a_dotted_null_test_guards_each_level() {
+        let flat = |s: &str| s.split_whitespace().collect::<String>();
+        assert_eq!(
+            flat(&text(doc! { "d.e": { "$eq": null } }, &[("d", 3)])),
+            flat(
+                "if (typeMatch(s3, 24) ?: false) then traverseF(s3, lambda(l4.0) { \
+                 if (isObject(l4.0) ?: false) then traverseF(getField(move(l4.0), \"e\"), \
+                 lambda(l5.0) { ((if (typeMatch(l5.0, 1024) ?: true) then null else move(l5.0) \
+                 == null) ?: false) }, false) else false }, false) else !((isArray(s1) ?: false))"
+            )
+        );
+        assert_eq!(
+            flat(&text(doc! { "d.e.f": { "$eq": null } }, &[("d", 3)])),
+            flat(
+                "if (typeMatch(s3, 24) ?: false) then traverseF(s3, lambda(l6.0) { \
+                 if (isObject(l6.0) ?: false) then let [l7.0 = getField(l6.0, \"e\")] in \
+                 if (typeMatch(l7.0, 24) ?: false) then traverseF(move(l7.0), lambda(l8.0) { \
+                 if (isObject(l8.0) ?: false) then traverseF(getField(move(l8.0), \"f\"), \
+                 lambda(l9.0) { ((if (typeMatch(l9.0, 1024) ?: true) then null else move(l9.0) \
+                 == null) ?: false) }, false) else false }, false) \
+                 else !((isArray(move(l6.0)) ?: false)) else false }, false) \
+                 else !((isArray(s1) ?: false))"
+            )
+        );
+        let and = flat(&text(
+            doc! { "$and": [{ "d.e": { "$eq": null } }, { "a": { "$gt": 1 } }] },
+            &[("a", 3), ("d", 4)],
+        ));
+        assert!(
+            and.contains("lambda(l5.0)") && and.contains("lambda(l7.0){((move(l7.0)>1)"),
+            "{and}"
+        );
+    }
+
     /// What is not built here is left to the classic explain.
     #[test]
     fn other_filters_are_not_built() {
@@ -444,7 +633,6 @@ mod tests {
             doc! {},
             doc! { "a": { "$in": [1, 2] } },
             doc! { "a": { "$not": { "$gt": 2 } } },
-            doc! { "a.b": { "$eq": null } },
             doc! { "a.0": { "$gt": 1 } },
             doc! { "a": { "$gt": f64::NAN } },
             doc! { "$or": [{ "a": { "$eq": 1 } }, { "b": { "$eq": 1 } }] },
