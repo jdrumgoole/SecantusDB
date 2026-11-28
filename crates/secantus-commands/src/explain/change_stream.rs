@@ -27,10 +27,10 @@
 //! So are a `$match` on `documentKey`, (inexactly) on `fullDocument`, on
 //! `ns` and `to`, an `$expr` on `operationType`, `documentKey`, `ns`
 //! or `to`, and the renamed `clusterTime` / `lsid` / `txnNumber`, an
-//! `$expr` on them included (RM-698).
-//! Not reproduced: the rewrites of `updateDescription`,
-//! `fullDocumentBeforeChange`, and of an `$expr` on those (RM-698), and the
-//! change stream's `queryShapeHash` (RM-454). The unwind's filter goes through
+//! `$expr` on them included, and `updateDescription` and (inexactly)
+//! `fullDocumentBeforeChange` (RM-698).
+//! Not reproduced: a `$type`, `$regex` or `$size` on a renamed path
+//! (RM-698), and the change stream's `queryShapeHash` (RM-454). The unwind's filter goes through
 //! mongod's Boolean simplifier (`simplify.rs`, RM-699).
 
 use bson::{doc, Bson, Document, Timestamp};
@@ -688,6 +688,100 @@ fn rewrite_full_document(u: &U) -> Option<M> {
     Some(M::Or(any))
 }
 
+/// An update event's entry: `{op: "u"}` without a replacement's `o._id`.
+fn an_update() -> Vec<M> {
+    vec![op_is("u"), M::Not(Box::new(exists("o._id")))]
+}
+
+/// Whether a predicate matches nothing but a missing or null value.
+fn only_null(u: &U) -> bool {
+    match u {
+        U::Eq(_, v) => matches!(v, Bson::Null),
+        U::In(_, vs, res) => res.is_empty() && vs.iter().all(|v| matches!(v, Bson::Null)),
+        U::Other(_, op, v) => matches!(op.as_str(), "$gte" | "$lte") && matches!(v, Bson::Null),
+        _ => false,
+    }
+}
+
+/// mongod's `matchRewriteUpdateDescription`, as mongod 8.2.11 prints it:
+/// `updateDescription` is only an update's. A field of `updatedFields` is
+/// that field of the entry's `$set`, or of its diff's `i` or `u`; a name in
+/// `removedFields` that field of its `$unset`, or of its diff's `d`. A
+/// predicate that matches a missing value also passes every other event.
+fn rewrite_update_description(u: &U, inexact: bool) -> Option<M> {
+    let path = match u {
+        U::Eq(p, _) | U::In(p, ..) | U::Exists(p) | U::Other(p, ..) | U::ExprEq(p, _) => p,
+        _ => return None,
+    };
+    let parts: Vec<&str> = path.split('.').collect();
+    let others = || {
+        vec![
+            M::And(vec![op_is("u"), exists("o._id")]),
+            M::Not(Box::new(op_is("u"))),
+        ]
+    };
+    if parts.len() == 3 && parts[1] == "updatedFields" {
+        let f = parts[2];
+        let three = ["o.diff.i", "o.diff.u", "o.$set"]
+            .iter()
+            .map(|to| renamed(u, &format!("{to}.{f}")).map(|m| retarget(m, &format!("{to}.{f}"))))
+            .collect::<Option<Vec<M>>>()?;
+        let mut update = an_update();
+        if matches_missing(u) {
+            update.extend(three);
+            let mut any = others();
+            any.push(M::And(update));
+            return Some(M::Or(any));
+        }
+        update.push(M::Or(three));
+        return Some(M::And(update));
+    }
+    let known = parts.len() == 1
+        || (parts.len() == 2
+            && matches!(
+                parts[1],
+                "updatedFields" | "removedFields" | "truncatedArrays"
+            ));
+    if matches_missing(u) {
+        // These fields are always on an update's event, never null.
+        return (known && only_null(u)).then(|| M::Or(others()));
+    }
+    if parts.len() == 2 && parts[1] == "removedFields" {
+        let names: Option<Vec<&str>> = match u {
+            U::Eq(_, Bson::String(s)) => Some(vec![s.as_str()]),
+            U::In(_, vs, res) if res.is_empty() => vs.iter().map(|v| v.as_str()).collect(),
+            _ => None,
+        };
+        if let Some(names) = names {
+            let mut any = Vec::new();
+            for n in names {
+                any.push(exists(&format!("o.$unset.{n}")));
+                any.push(exists(&format!("o.diff.d.{n}")));
+            }
+            let mut update = an_update();
+            update.push(M::Or(any));
+            return Some(M::And(update));
+        }
+    }
+    (inexact || (known && matches!(u, U::Exists(_)))).then(|| M::And(an_update()))
+}
+
+/// A renamed leaf, its path set whole (`renamed` keeps the rest of the
+/// user's path).
+fn retarget(m: M, to: &str) -> M {
+    match m {
+        M::Leaf(_, kind, v) => M::Leaf(to.to_string(), kind, v),
+        other => other,
+    }
+}
+
+/// mongod's `matchRewriteFullDocumentBeforeChange`, inexact only: a
+/// pre-image is an update's, a replacement's or a delete's.
+fn rewrite_before_change(u: &U, inexact: bool) -> Option<M> {
+    (inexact && !matches_missing(u))
+        .then(|| leaf("op", Leaf::In, Bson::Array(vec!["d".into(), "u".into()])))
+}
+
 /// The commands that name a collection in a string field of `o`.
 const COLL_COMMANDS: [&str; 8] = [
     "abortIndexBuild",
@@ -1241,6 +1335,8 @@ fn rewrite(u: &U, inexact: bool, fields: Fields) -> Option<M> {
             Some("ns") => rewrite_namespace(u, p),
             Some("to") => rewrite_to(u, p),
             Some("fullDocument") if inexact => rewrite_full_document(u),
+            Some("updateDescription") => rewrite_update_description(u, inexact),
+            Some("fullDocumentBeforeChange") => rewrite_before_change(u, inexact),
             _ => None,
         },
         // `documentKey` and `fullDocument` keep the twin's operator (their
@@ -1254,6 +1350,12 @@ fn rewrite(u: &U, inexact: bool, fields: Fields) -> Option<M> {
             None
         }
         U::ExprEq(p, _) if p.split('.').next() == Some("documentKey") => rewrite_document_key(u),
+        U::ExprEq(p, _) if p.split('.').next() == Some("updateDescription") => {
+            rewrite_update_description(u, inexact)
+        }
+        U::ExprEq(p, _) if p.split('.').next() == Some("fullDocumentBeforeChange") => {
+            rewrite_before_change(u, inexact)
+        }
         U::ExprEq(p, _) if p.split('.').next() == Some("fullDocument") => {
             inexact.then(|| rewrite_full_document(u)).flatten()
         }
