@@ -4181,7 +4181,12 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       backlog step (load average about 3-3.5, the other lane running):
       `tests/backlog/test_rp_found_rp522.py`'s module server gave `''`
       for its first line, so its 39 checked tests were `REGRESSED`; the
-      module alone passed (85 in 28 s). Not yet known: whether the
+      module alone passed (85 in 28 s). A ninth time on 2026-11-28, in
+      RP-1126's run of the pg-suites list at `-n 4` (about 91% through,
+      load average about 5, the other lane running):
+      `tests/test_rust_pgserver_slice.py::test_full_create_type_checks_its_shell_and_io_functions`
+      gave `''` for its first line and nothing after its stop; it passed
+      alone three times (3.3-3.9 s). Not yet known: whether the
       server stalled (a lock, a WiredTiger create waiting on a checkpoint)
       or was starved, since the harness keeps no stack or timing of a
       start it gives up on. The harness should sample the child
@@ -4224,19 +4229,20 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a where equality to a cast beside a join inequality is a hash join]
       Backlog-ID: RP-1245
 
-## Found while working RP-1066 (2026-11-26)
+## Found while working RP-1126 (2026-11-28)
 
-- [ ] **A DISTINCT whose ORDER BY is a prefix of it sorts on the ORDER BY
-      alone.** `explain (costs off) select distinct b, a+1 from e order by
-      b` prints `Sort Key: b` under the `Unique`; PostgreSQL 15.19 prints
-      `Sort Key: b, ((a + 1))`, the ORDER BY followed by every other
-      DISTINCT column (`transformDistinctClause` appends them to the sort
-      clause), and `select distinct b, a from e order by b` likewise `b,
-      a` where this server prints `b`. SQL leaves the order within one
-      `b` unspecified, so the rows are not wrong; the plan's text is. Both
-      plans are unpriced here.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a distinct sorted on a prefix sorts on every distinct column]
-      Backlog-ID: RP-1126
+- [ ] **An error at an operator expression is placed at the operator, not
+      at the expression's start.** `select distinct a from (values (1))
+      v(a) order by a+0` is 42P10 at position 52 here, the `+`;
+      PostgreSQL 15.19 says 51, the `a`: `exprLocation` of an `A_Expr` is
+      the leftmost of its operator's location and its left operand's
+      (`leftmostLoc`), where `expr_location` (secantus-pgplan) takes the
+      operator's alone. `a * 2 desc` is 53 against 51. `expr_location`
+      has about 26 callers, so the other errors placed through it move
+      too; each is worth checking against the reference when this is
+      fixed.
+      Verify: tests/backlog/test_rp_found_rp1126.py::test_an_unlisted_order_by_expression_is_refused_at_its_start
+      Backlog-ID: RP-1293
 
 ## Found while working RP-1133 (2026-11-28)
 

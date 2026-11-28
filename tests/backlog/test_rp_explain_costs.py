@@ -5171,8 +5171,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ["Index Only Scan using k_pkey on k  (cost=0.28..45.77 rows=1000 width=8)"],
     ),
     # Measured on PostgreSQL 15.19 (found while working RP-1066): the
-    # Sort under a DISTINCT's Unique sorts on the ORDER BY then every
-    # other DISTINCT column.
+    # Sort under a DISTINCT's Unique sorted on the ORDER BY alone; it sorts
+    # on the ORDER BY then every other DISTINCT column since RP-1126.
     "a distinct sorted on a prefix sorts on every distinct column": (
         "RP-1126",
         _ANALYSED,
@@ -5182,6 +5182,76 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Sort",
             "        Sort Key: b, ((a + 1))",
             "        ->  Seq Scan on e",
+        ],
+    ),
+    # PostgreSQL 15.19: the added keys are ascending whatever the ORDER
+    # BY's direction, and follow it.
+    "a distinct of columns sorted on a descending prefix sorts on the rest ascending": (
+        "RP-1126",
+        _ANALYSED,
+        "explain (costs off) select distinct a, b from e order by b desc",
+        [
+            "Unique",
+            "  ->  Sort",
+            "        Sort Key: b DESC, a",
+            "        ->  Seq Scan on e",
+        ],
+    ),
+    # PostgreSQL 15.19: a key on a computed entry, by name, and an entry
+    # listed twice adds it once.
+    "a distinct sorted on a computed entry sorts on the rest after it": (
+        "RP-1126",
+        _ANALYSED,
+        "explain (costs off) select distinct b, upper(b), a, b from e order by upper(b)",
+        [
+            "Unique",
+            "  ->  Sort",
+            "        Sort Key: (upper(b)), b, a",
+            "        ->  Seq Scan on e",
+        ],
+    ),
+    "a distinct sorted on an output name sorts on the rest after it": (
+        "RP-1126",
+        _ANALYSED,
+        "explain (costs off) select distinct b, a+1 as c from e order by c",
+        [
+            "Unique",
+            "  ->  Sort",
+            "        Sort Key: ((a + 1)), b",
+            "        ->  Seq Scan on e",
+        ],
+    ),
+    "a distinct star sorted on a column sorts on every column": (
+        "RP-1126",
+        _ANALYSED,
+        "explain (costs off) select distinct * from e order by b",
+        [
+            "Unique",
+            "  ->  Sort",
+            "        Sort Key: b, a",
+            "        ->  Seq Scan on e",
+        ],
+    ),
+    # PostgreSQL 15.19 (found while working RP-1126): a NULLS placement
+    # other than the direction's default is part of the Sort Key.
+    "a sort key prints a nulls placement that is not the default": (
+        "RP-1292",
+        _ANALYSED,
+        "explain (costs off) select b from e order by b desc nulls last",
+        [
+            "Sort",
+            "  Sort Key: b DESC NULLS LAST",
+            "  ->  Seq Scan on e",
+        ],
+    ),
+    "an ascending sort key prints nulls first": (
+        "RP-1292",
+        _ANALYSED,
+        "explain (costs off) select b from e order by b nulls first",
+        [
+            "Sort",
+            "  Sort Key: b NULLS FIRST",
+            "  ->  Seq Scan on e",
         ],
     ),
     # Priced since RP-1036.
@@ -11959,6 +12029,8 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1126",
+        "RP-1292",
         "RP-1133",
         "RP-1294",
         "RP-1125",

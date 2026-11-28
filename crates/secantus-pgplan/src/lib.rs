@@ -23633,6 +23633,115 @@ fn distinct_on_over_expressions(
     })
 }
 
+/// The sort keys a plain `SELECT DISTINCT` with an ORDER BY adds after the
+/// ORDER BY's own: PostgreSQL 15's `transformDistinctClause` starts the
+/// distinct clause with the sort clause and appends every select-list
+/// entry it does not already hold, ascending (`addTargetToGroupList`), and
+/// the Sort under the Unique sorts on all of them, so `select distinct b,
+/// a+1 from e order by b` is `Sort Key: b, ((a + 1))` and its rows come
+/// back ordered by `a + 1` within each `b` (RP-1126). An entry equal to
+/// one already in the list adds nothing (its pathkey is redundant), so
+/// `select distinct a, b, a ... order by b` sorts on `b, a`. `order` is
+/// the ORDER BY as planned, item for item with `s.sort_clause`. Empty for
+/// any other statement.
+fn distinct_sort_tail(
+    s: &pg_query::protobuf::SelectStmt,
+    columns: &[(String, String)],
+    casts: &[Option<ColumnExpr>],
+    def: &TableDef,
+    order: &[OrderKey],
+) -> Vec<OrderKey> {
+    if !(s.distinct_clause.len() == 1 && s.distinct_clause[0].node.is_none())
+        || s.sort_clause.is_empty()
+        || order.len() != s.sort_clause.len()
+    {
+        return Vec::new();
+    }
+    /// What a sort key is, for telling two of them apart.
+    enum Key<'a> {
+        /// A stored field read as it is.
+        Field(&'a str),
+        /// A computed expression, compared as written.
+        Expr(&'a pg_query::protobuf::Node),
+        /// A computed select-list entry this cannot compare: itself only.
+        Target(usize),
+    }
+    fn same(a: &Key<'_>, b: &Key<'_>) -> bool {
+        match (a, b) {
+            (Key::Field(x), Key::Field(y)) => x == y,
+            (Key::Expr(x), Key::Expr(y)) => same_expression(x, y),
+            (Key::Target(x), Key::Target(y)) => x == y,
+            _ => false,
+        }
+    }
+    // The select list's expressions, one for one with `columns` when no
+    // `*` expanded into several.
+    let nodes: Vec<&pg_query::protobuf::Node> = s
+        .target_list
+        .iter()
+        .filter_map(|t| match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => rt.val.as_deref(),
+            _ => None,
+        })
+        .collect();
+    let aligned = nodes.len() == columns.len()
+        && !nodes.iter().any(|n| {
+            matches!(n.node.as_ref(), Some(N::ColumnRef(c))
+                if c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_)))))
+        });
+    let target_key = |j: usize| -> Key<'_> {
+        match nodes.get(j).filter(|_| aligned) {
+            Some(n) if !matches!(n.node.as_ref(), Some(N::ColumnRef(_))) => Key::Expr(n),
+            _ if casts.get(j).is_none_or(Option::is_none) => Key::Field(&columns[j].1),
+            _ => Key::Target(j),
+        }
+    };
+    let mut keys: Vec<Key<'_>> = Vec::new();
+    for (item, planned) in s.sort_clause.iter().zip(order) {
+        let node = match item.node.as_ref() {
+            Some(N::SortBy(sb)) => sb.node.as_deref(),
+            _ => None,
+        };
+        let target = match node.and_then(|n| n.node.as_ref()) {
+            Some(N::AConst(c)) => match c.val.as_ref() {
+                Some(pg_query::protobuf::a_const::Val::Ival(v)) => {
+                    usize::try_from(v.ival).ok().and_then(|p| p.checked_sub(1))
+                }
+                _ => None,
+            },
+            // An output name wins over a table column, as the key was planned.
+            Some(N::ColumnRef(c)) => {
+                column_ref_name(c).and_then(|name| columns.iter().position(|(out, _)| *out == name))
+            }
+            _ => None,
+        };
+        keys.push(match (target, node) {
+            (Some(j), _) if j < columns.len() => target_key(j),
+            _ if planned.expr.is_none() => Key::Field(&planned.field),
+            (_, Some(n)) => Key::Expr(n),
+            _ => return Vec::new(),
+        });
+    }
+    let mut tail = Vec::new();
+    for (j, (_, field)) in columns.iter().enumerate() {
+        let key = target_key(j);
+        if keys.iter().any(|k| same(k, &key)) {
+            continue;
+        }
+        keys.push(key);
+        let field = field.clone();
+        tail.push(OrderKey {
+            jsonb: jsonb_field(def, &field),
+            bpchar: bpchar_field(def, &field),
+            field,
+            ascending: true,
+            nulls: Nulls::Last,
+            expr: None,
+        });
+    }
+    tail
+}
+
 /// PostgreSQL's rule for a plain `SELECT DISTINCT`: every ORDER BY
 /// expression must be one of the select list's (`transformDistinctClause`),
 /// else 42P10 at the expression. Checked on the statement as written, with
@@ -31680,6 +31789,8 @@ fn plan_select_rest(
             expr,
         });
     }
+
+    order.extend(distinct_sort_tail(s, &columns, &casts, &def, &order));
 
     let (limit, offset) = limit_offset(s, params)?;
 
