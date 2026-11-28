@@ -48148,6 +48148,10 @@ impl PgHandler {
                 // The same for a two-table join planned as joined rows
                 // (RP-1119): the join priced as the select with that ORDER
                 // BY cleared.
+                // An ORDER BY a merge join that is the join's cheapest path
+                // already yields is no Sort at all (RP-1131): the Sort is
+                // lifted off as for RP-1119, and not put back.
+                let mut merge_ordered: Option<&str> = None;
                 let joined_sort = match inner.as_ref() {
                     Statement::Select(sel)
                         if sel.limit.is_none()
@@ -48156,7 +48160,11 @@ impl PgHandler {
                             && tree.name == "Sort"
                             && tree.children.len() == 1 =>
                     {
-                        self.joined_sort_select(sel)
+                        self.joined_sort_select(sel).or_else(|| {
+                            let (s, suffix) = self.joined_merge_order_select(sel)?;
+                            merge_ordered = Some(suffix);
+                            Some(s)
+                        })
                     }
                     _ => None,
                 };
@@ -48333,7 +48341,9 @@ impl PgHandler {
                 }
                 if let Statement::Select(sel) = inner.as_ref() {
                     if scan_estimate::has_expr_join_key(sel)
-                        && self.hash_join_estimate(sel).is_some()
+                        && self
+                            .hash_join_estimate(joined_sort.as_ref().unwrap_or(sel))
+                            .is_some()
                     {
                         hash_expr_key(&mut tree);
                     }
@@ -48449,8 +48459,15 @@ impl PgHandler {
                 }
                 // The Sort back over the join, priced where the join is:
                 // `cost_sort` over the join's rows and width (RP-1056).
-                if let Some(mut sort) = narrow_sort {
-                    if let Some(join) = tree.estimate {
+                let merged_in_order = merge_ordered.is_some()
+                    && tree.estimate.is_some()
+                    && matches!(tree.name.as_str(), "Merge Join" | "Merge Left Join");
+                if merged_in_order {
+                    // Each input sorted in the ORDER BY's direction.
+                    explain::merge_sorts_direction(&mut tree, merge_ordered.unwrap_or(""));
+                }
+                if let Some(mut sort) = narrow_sort.filter(|_| !merged_in_order) {
+                    if let Some(join) = tree.estimate.filter(|_| merge_ordered.is_none()) {
                         let (startup, total) =
                             secantus_pgplan::joincost::cost_sort(join.1, join.2, join.3, None);
                         sort.estimate = Some((startup, total, join.2, join.3));

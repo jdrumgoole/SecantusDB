@@ -2613,94 +2613,96 @@ impl PgHandler {
         // restrictions: `(left side, keys read, operators)`.
         let class_equi: Vec<(String, String)>;
         let mut class_restricts: Vec<(bool, Vec<String>, u32)> = Vec::new();
-        let (equi, expr_pairs): (
-            &Vec<(String, String)>,
-            Vec<(String, String, (bool, u32, String))>,
-        ) = match &classes {
-            Some(c) => {
-                let reads = |m: &ClassMember<'_>| -> Option<Vec<String>> {
-                    if let Some(k) = m.column {
-                        return Some(vec![k.to_string()]);
-                    }
-                    let mut keys = std::collections::HashSet::new();
-                    if !secantus_pgplan::joins::expr_reads(m.expr?, &mut keys) || keys.is_empty() {
-                        return None;
-                    }
-                    let mut keys: Vec<String> = keys.into_iter().collect();
-                    keys.sort();
-                    Some(keys)
-                };
-                let mut pairs = Vec::new();
-                let mut exprs = Vec::new();
-                for &(l, r) in &c.joins {
-                    let (x, y) = (&c.members[l], &c.members[r]);
-                    match (x.column, y.column) {
-                        (Some(a), Some(b)) => pairs.push((a.to_string(), b.to_string())),
-                        (Some(a), None) => {
-                            let [k] = reads(y)?.try_into().ok()?;
-                            let ty = secantus_pgplan::column_expr_type(y.expr?).to_string();
-                            exprs.push((a.to_string(), k, (false, y.ops?, ty)));
+        let (equi, expr_pairs): (&Vec<(String, String)>, Vec<(String, String, KeyExprs)>) =
+            match &classes {
+                Some(c) => {
+                    let reads = |m: &ClassMember<'_>| -> Option<Vec<String>> {
+                        if let Some(k) = m.column {
+                            return Some(vec![k.to_string()]);
                         }
-                        (None, Some(b)) => {
-                            let [k] = reads(x)?.try_into().ok()?;
-                            let ty = secantus_pgplan::column_expr_type(x.expr?).to_string();
-                            exprs.push((k, b.to_string(), (true, x.ops?, ty)));
-                        }
-                        (None, None) => return None,
-                    }
-                }
-                for &(a, b) in &c.restricts {
-                    let (x, y) = (&c.members[a], &c.members[b]);
-                    let mut keys = reads(x)?;
-                    for k in reads(y)? {
-                        if !keys.contains(&k) {
-                            keys.push(k);
-                        }
-                    }
-                    // Each operand's operators, and the equality's.
-                    class_restricts.push((x.left, keys, x.ops? + y.ops? + 1));
-                }
-                class_equi = pairs;
-                (&class_equi, exprs)
-            }
-            None => {
-                // A join on an equality between a column of one side
-                // and an expression over one column of the other is
-                // hashed on the expression (RP-981): keyed here by the
-                // column it reads, priced by the caller with no
-                // statistics for it. Beside column pairs it is one more
-                // hash clause (`hash_inner_and_outer` takes every
-                // hashable clause of the restriction list, RP-1058),
-                // after them.
-                let pairs = if merged.is_empty() {
-                    expr_keys.iter().map(expr_key_pair).collect::<Option<_>>()?
-                } else {
-                    Vec::new()
-                };
-                // With a join filter beside them, a shared member is
-                // not modelled.
-                if !expr_keys.is_empty() {
-                    let mut members: Vec<String> = equi
-                        .iter()
-                        .flat_map(|(l, r)| [l.clone(), r.clone()])
-                        .collect();
-                    let mut exprs: Vec<&secantus_pgplan::ColumnExpr> = Vec::new();
-                    for e in expr_keys {
-                        let (bare, expr) = match (&e.left_column, &e.right_column) {
-                            (Some(l), None) => (l, &e.right),
-                            (None, Some(r)) => (r, &e.left),
-                            _ => return None,
-                        };
-                        if members.contains(bare) || exprs.contains(&expr) {
+                        let mut keys = std::collections::HashSet::new();
+                        if !secantus_pgplan::joins::expr_reads(m.expr?, &mut keys)
+                            || keys.is_empty()
+                        {
                             return None;
                         }
-                        members.push(bare.clone());
-                        exprs.push(expr);
+                        let mut keys: Vec<String> = keys.into_iter().collect();
+                        keys.sort();
+                        Some(keys)
+                    };
+                    let mut pairs = Vec::new();
+                    let mut exprs = Vec::new();
+                    for &(l, r) in &c.joins {
+                        let (x, y) = (&c.members[l], &c.members[r]);
+                        match (x.column, y.column) {
+                            (Some(a), Some(b)) => pairs.push((a.to_string(), b.to_string())),
+                            (Some(a), None) => {
+                                let [k] = reads(y)?.try_into().ok()?;
+                                let ty = secantus_pgplan::column_expr_type(y.expr?).to_string();
+                                exprs.push((a.to_string(), k, [None, Some((y.ops?, ty))]));
+                            }
+                            (None, Some(b)) => {
+                                let [k] = reads(x)?.try_into().ok()?;
+                                let ty = secantus_pgplan::column_expr_type(x.expr?).to_string();
+                                exprs.push((k, b.to_string(), [Some((x.ops?, ty)), None]));
+                            }
+                            (None, None) => return None,
+                        }
                     }
+                    for &(a, b) in &c.restricts {
+                        let (x, y) = (&c.members[a], &c.members[b]);
+                        let mut keys = reads(x)?;
+                        for k in reads(y)? {
+                            if !keys.contains(&k) {
+                                keys.push(k);
+                            }
+                        }
+                        // Each operand's operators, and the equality's.
+                        class_restricts.push((x.left, keys, x.ops? + y.ops? + 1));
+                    }
+                    class_equi = pairs;
+                    (&class_equi, exprs)
                 }
-                (equi, pairs)
-            }
-        };
+                None => {
+                    // A join on an equality between a column of one side
+                    // and an expression over one column of the other is
+                    // hashed on the expression (RP-981): keyed here by the
+                    // column it reads, priced by the caller with no
+                    // statistics for it. Beside column pairs it is one more
+                    // hash clause (`hash_inner_and_outer` takes every
+                    // hashable clause of the restriction list, RP-1058),
+                    // after them.
+                    let pairs = if merged.is_empty() {
+                        expr_keys.iter().map(expr_key_pair).collect::<Option<_>>()?
+                    } else {
+                        Vec::new()
+                    };
+                    // With a join filter beside them, a shared member is
+                    // not modelled.
+                    if !expr_keys.is_empty() {
+                        let mut members: Vec<String> = equi
+                            .iter()
+                            .flat_map(|(l, r)| [l.clone(), r.clone()])
+                            .collect();
+                        let mut exprs: Vec<&secantus_pgplan::ColumnExpr> = Vec::new();
+                        for e in expr_keys {
+                            // Each operand a member: a bare column, or an
+                            // expression (both may be, RP-1131).
+                            for (column, expr) in
+                                [(&e.left_column, &e.left), (&e.right_column, &e.right)]
+                            {
+                                match column {
+                                    Some(bare) if members.contains(bare) => return None,
+                                    Some(bare) => members.push(bare.clone()),
+                                    None if exprs.contains(&expr) => return None,
+                                    None => exprs.push(expr),
+                                }
+                            }
+                        }
+                    }
+                    (equi, pairs)
+                }
+            };
         let synth: Vec<(String, String)>;
         let equi: &Vec<(String, String)> = if expr_pairs.is_empty() {
             equi
@@ -2712,9 +2714,20 @@ impl PgHandler {
                 .collect();
             &synth
         };
+        // A clause with an expression on each side sorts both inputs on
+        // an expression, which makes the merge the cheaper path, and a
+        // merge on several clauses is not compared (`hash_join_of`): an
+        // expression pair is priced as the join's only clause (RP-1131).
+        if equi.len() > 1
+            && expr_pairs
+                .iter()
+                .any(|(_, _, [l, r])| l.is_some() && r.is_some())
+        {
+            return None;
+        }
         // Each clause's expression, where its side is one: `None` for a
         // column pair.
-        let clause_exprs: Vec<Option<&(bool, u32, String)>> =
+        let clause_exprs: Vec<Option<&KeyExprs>> =
             std::iter::repeat_n(None, equi.len() - expr_pairs.len())
                 .chain(expr_pairs.iter().map(|(_, _, x)| Some(x)))
                 .collect();
@@ -2994,10 +3007,10 @@ impl PgHandler {
             })
         };
         let (left, right) = (scan(left, true)?, scan(right, false)?);
-        let mark = |a: &mut JoinedSide, b: &mut JoinedSide, x: Option<&(bool, u32, String)>| {
-            if let Some((left_expr, ops, ty)) = x {
-                let s = if *left_expr { a } else { b };
-                s.key_expr = Some((*ops, ty.clone()));
+        let mark = |a: &mut JoinedSide, b: &mut JoinedSide, x: Option<&KeyExprs>| {
+            if let Some([l, r]) = x {
+                a.key_expr = l.clone();
+                b.key_expr = r.clone();
             }
         };
         let mut a = side(&left, left_key)?;
@@ -3744,6 +3757,113 @@ impl PgHandler {
         let mut cleared = sel.clone();
         cleared.order.clear();
         Some(cleared)
+    }
+
+    /// The select with its ORDER BY cleared where the join's cheapest path
+    /// is a merge join already in that order (RP-1131): `create_ordered_paths`
+    /// keeps the cheapest total path unsorted when its pathkeys hold the
+    /// query's (`pathkeys_contained_in`), and a merge join's are its outer
+    /// input's, the merge clause's equivalence class. So `e join e e2 on
+    /// e.b = e2.b || 'x' order by e.b` is the Merge Join alone. Modelled
+    /// for one ORDER BY column that is a bare column of the join's only
+    /// clause and that no WHERE names, with the suffix its direction adds
+    /// to each merge input's Sort Key (`select_outer_pathkeys_for_merge`
+    /// adopts the query's pathkeys: `e.b DESC`, `((e2.b || 'x'::text))
+    /// DESC`); one past the default direction only over two Sorts, an
+    /// input read presorted through its index being a forward scan's
+    /// order. An inner join's
+    /// class holds both sides' members, a LEFT join's merge only the
+    /// preserved side's, outer (`build_join_pathkeys` gives a JOIN_RIGHT
+    /// path none). `None` where the cheapest path is another; a Sort over
+    /// it against the merge path is RP-1119's.
+    pub(crate) fn joined_merge_order_select(
+        &self,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<(secantus_pgplan::Select, &'static str)> {
+        use secantus_pgplan::joins::{JoinKind, JoinNode};
+        use secantus_pgplan::Statement;
+        let sub = sel.sub.as_ref()?;
+        let Statement::JoinRows(j) = sub.plan.as_ref() else {
+            return None;
+        };
+        let [k] = sel.order.as_slice() else {
+            return None;
+        };
+        if sel.join.is_some()
+            || k.expr.is_some()
+            || k.jsonb
+            || k.bpchar
+            || !j.needed.contains(&k.field)
+        {
+            return None;
+        }
+        let suffix = match (k.ascending, k.nulls) {
+            (true, secantus_pgplan::Nulls::Last) => "",
+            (true, _) => " NULLS FIRST",
+            (false, secantus_pgplan::Nulls::First) => " DESC",
+            (false, _) => " DESC NULLS LAST",
+        };
+        let JoinNode::Join {
+            kind,
+            left,
+            right,
+            equi,
+            expr_keys,
+            merged,
+            ..
+        } = &j.tree
+        else {
+            return None;
+        };
+        if !merged.is_empty() {
+            return None;
+        }
+        // The one clause's bare columns, `[left, right]`.
+        let members: [Option<&String>; 2] = match (&equi[..], &expr_keys[..]) {
+            ([(l, r)], []) => [Some(l), Some(r)],
+            ([], [e]) => [e.left_column.as_ref(), e.right_column.as_ref()],
+            _ => return None,
+        };
+        let ordered = match kind {
+            JoinKind::Inner => members.iter().flatten().any(|m| **m == k.field),
+            JoinKind::Left => members[0] == Some(&k.field),
+            _ => false,
+        };
+        if !ordered {
+            return None;
+        }
+        // A WHERE on a member may fix the class to a constant, which
+        // leaves no merge clause (RP-363) and the pathkey redundant.
+        let leaf_names = |n: &JoinNode, key: &str| -> Option<bool> {
+            let JoinNode::Leaf { plan, columns, .. } = n else {
+                return None;
+            };
+            let Statement::Select(leaf) = plan.as_ref() else {
+                return None;
+            };
+            let Some((_, out)) = columns.iter().find(|(c, _)| c == key) else {
+                return Some(false);
+            };
+            let (_, field) = leaf.columns.iter().find(|(o, _)| o == out)?;
+            Some(filter_names(&leaf.filter, field))
+        };
+        for m in members.iter().flatten() {
+            if filter_names(&sel.filter, m) || leaf_names(left, m)? || leaf_names(right, m)? {
+                return None;
+            }
+        }
+        let mut cleared = sel.clone();
+        cleared.order.clear();
+        let (_, _, _, pick, _) = self.hash_join_estimate(&cleared)?;
+        match pick {
+            JoinPick::Merge { b_outer, plan }
+                if !(b_outer && *kind == JoinKind::Left)
+                    && (suffix.is_empty() || !(plan.presorted.0 || plan.presorted.1)) =>
+            {
+                Some((cleared, suffix))
+            }
+            _ => None,
+        }
     }
 
     /// [`Self::hash_join_estimate`] for a two-table inner join planned on
@@ -8327,14 +8447,16 @@ fn with_in_lengths(mut quals: Vec<(String, costsize::Qual)>) -> Vec<(String, cos
 /// the table's tuples.
 /// One side of a two-table join planned as joined rows
 /// ([`PgHandler::joined_sides`]).
+/// Each side's expression of a join clause, `[left, right]`: the
+/// operators it evaluates and its result type, `None` for a bare column.
+type KeyExprs = [Option<(u32, String)>; 2];
+
 /// One expression equality of a join (RP-981) as a pair of joined-row
-/// keys: the bare column's on one side, and on the other the one column
-/// the expression reads, with whether that is the left side, its
-/// operators and its result type. `None` where neither or both sides are
-/// bare columns, or the expression reads other than one column.
-fn expr_key_pair(
-    e: &secantus_pgplan::joins::ExprEquality,
-) -> Option<(String, String, (bool, u32, String))> {
+/// keys: a bare column's, or the one column an expression reads, on each
+/// side, with each side's expression ([`KeyExprs`]); both sides may be
+/// expressions (`e.b || 'y' = e2.b || 'x'`, RP-1131). `None` where both
+/// are bare columns, or an expression reads other than one column.
+fn expr_key_pair(e: &secantus_pgplan::joins::ExprEquality) -> Option<(String, String, KeyExprs)> {
     let read = |x: &secantus_pgplan::ColumnExpr| {
         let mut keys = std::collections::HashSet::new();
         if !secantus_pgplan::joins::expr_reads(x, &mut keys) || keys.len() != 1 {
@@ -8347,10 +8469,22 @@ fn expr_key_pair(
         (Some(l), None) => Some((
             l.clone(),
             read(&e.right)?,
-            (false, e.right_ops?, ty(&e.right)),
+            [None, Some((e.right_ops?, ty(&e.right)))],
         )),
-        (None, Some(r)) => Some((read(&e.left)?, r.clone(), (true, e.left_ops?, ty(&e.left)))),
-        _ => None,
+        (None, Some(r)) => Some((
+            read(&e.left)?,
+            r.clone(),
+            [Some((e.left_ops?, ty(&e.left))), None],
+        )),
+        (None, None) => Some((
+            read(&e.left)?,
+            read(&e.right)?,
+            [
+                Some((e.left_ops?, ty(&e.left))),
+                Some((e.right_ops?, ty(&e.right))),
+            ],
+        )),
+        (Some(_), Some(_)) => None,
     }
 }
 
@@ -8643,8 +8777,8 @@ impl HashKey {
 
 /// `s`'s hash key: its field, or where its side of the join clause is an
 /// expression (RP-981), that expression -- the ON's one expression
-/// equality's operand that is not a bare column. `None` where the clause
-/// cannot be found.
+/// equality's operand that is not a bare column and reads `s`'s key (each
+/// operand may be one, RP-1131). `None` where the clause cannot be found.
 fn side_hash_key(sel: &secantus_pgplan::Select, s: &JoinedSide) -> Option<HashKey> {
     use secantus_pgplan::joins::JoinNode;
     if s.key_expr.is_none() {
@@ -8662,18 +8796,16 @@ fn side_hash_key(sel: &secantus_pgplan::Select, s: &JoinedSide) -> Option<HashKe
     let ([], [e]) = (&equi[..], &expr_keys[..]) else {
         return None;
     };
-    let expr = match (&e.left_column, &e.right_column) {
-        (Some(_), None) => &e.right,
-        (None, Some(_)) => &e.left,
-        _ => return None,
+    let reads_key = |expr: &secantus_pgplan::ColumnExpr| {
+        let mut keys = std::collections::HashSet::new();
+        secantus_pgplan::joins::expr_reads(expr, &mut keys)
+            && keys.len() == 1
+            && keys.contains(&s.key)
     };
-    let mut keys = std::collections::HashSet::new();
-    if !secantus_pgplan::joins::expr_reads(expr, &mut keys)
-        || keys.len() != 1
-        || !keys.contains(&s.key)
-    {
-        return None;
-    }
+    let expr = [(&e.left_column, &e.left), (&e.right_column, &e.right)]
+        .into_iter()
+        .find(|(column, expr)| column.is_none() && reads_key(expr))?
+        .1;
     Some(HashKey {
         field: s.field.clone(),
         expr: Some((s.key.clone(), expr.clone())),
