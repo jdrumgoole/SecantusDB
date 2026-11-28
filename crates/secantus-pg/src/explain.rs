@@ -1492,6 +1492,31 @@ pub(crate) fn expr_merge_key_texts(left: &PlanNode, cond: &str) -> Option<(Strin
     }
 }
 
+/// Append `suffix` (` DESC`, ` NULLS FIRST`) to the Sort Key of each
+/// Sort under merge join `root`, through a Materialize over the inner
+/// one: the direction of an ORDER BY the merge's pathkeys adopt
+/// (`select_outer_pathkeys_for_merge`, RP-1131).
+pub(crate) fn merge_sorts_direction(root: &mut PlanNode, suffix: &str) {
+    if suffix.is_empty() {
+        return;
+    }
+    for c in &mut root.children {
+        let sort = if c.name == "Materialize" && c.children.len() == 1 {
+            &mut c.children[0]
+        } else {
+            c
+        };
+        if sort.name != "Sort" {
+            continue;
+        }
+        for (k, v) in &mut sort.details {
+            if k == "Sort Key" {
+                v.push_str(suffix);
+            }
+        }
+    }
+}
+
 /// A `Merge Cond` equality with each expression operand as the Sort's
 /// projected value it compares, `(e.b = ((e2.b || 'x'::text)))` (RP-1032).
 fn merge_cond_text(c: &str) -> String {
@@ -3644,6 +3669,35 @@ pub(crate) fn attach_join_where(
             }
             n.details.push((label.into(), combine(&parts)));
         }
+    }
+}
+
+#[cfg(test)]
+mod merge_sorts_direction_tests {
+    use super::{merge_sorts_direction, PlanNode};
+
+    fn sort(key: &str) -> PlanNode {
+        let mut s = PlanNode::over("Sort", PlanNode::new("Seq Scan on e"));
+        s.details.push(("Sort Key".into(), key.into()));
+        s
+    }
+
+    /// Each merge input's Sort takes the ORDER BY's direction, the inner
+    /// one through its Materialize (RP-1131).
+    #[test]
+    fn each_input_sort_takes_the_direction() {
+        let mut root = PlanNode::new("Merge Join");
+        root.children.push(sort("e.b"));
+        root.children
+            .push(PlanNode::over("Materialize", sort("((e2.b || 'x'::text))")));
+        merge_sorts_direction(&mut root, " DESC");
+        assert_eq!(root.children[0].details[0].1, "e.b DESC");
+        assert_eq!(
+            root.children[1].children[0].details[0].1,
+            "((e2.b || 'x'::text)) DESC"
+        );
+        merge_sorts_direction(&mut root, "");
+        assert_eq!(root.children[0].details[0].1, "e.b DESC");
     }
 }
 

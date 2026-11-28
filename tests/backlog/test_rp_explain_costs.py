@@ -7046,8 +7046,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # Measured on a private PostgreSQL 15.20 cluster: a join on an
     # expression of each side, and one ordered by its merge key, are both
     # the priced Merge Join, the latter with no Sort above it.
+    # Measured on PostgreSQL 15.20 (RP-1131, fixed): an expression on each
+    # side of the one clause sorts both inputs on its expression, each
+    # with no statistics, and the merge was priced beside the hash join.
     "a join on an expression of each side is a merge join": (
-        "RP-1131",
+        "RP-1131:fixed",
         _ANALYSED,
         "explain select * from e join e e2 on e.b || 'y' = e2.b || 'x'",
         [
@@ -7061,8 +7064,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
+    # The cheapest path, the merge, already in the ORDER BY's order
+    # (`create_ordered_paths`): no Sort above it (RP-1131, fixed).
     "a join on an expression key ordered by its merge key is a merge join": (
-        "RP-1131",
+        "RP-1131:fixed",
         _ANALYSED,
         "explain select * from e join e e2 on e.b = e2.b || 'x' order by e.b",
         [
@@ -7073,6 +7078,138 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
             "        Sort Key: ((e2.b || 'x'::text))",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1131, fixed):
+    # integer expressions on each side, a LEFT join, an ORDER BY in the
+    # other direction (the merge's pathkeys adopt it), and one the merge
+    # does not yield (a Sort over it).
+    "a join on an integer expression of each side is a merge join": (
+        "RP-1131:fixed",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a + 1 = e2.a + 2",
+        [
+            "Merge Join  (cost=129.66..239.66 rows=5000 width=14)",
+            "  Merge Cond: (((e.a + 1)) = ((e2.a + 2)))",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: ((e.a + 1))",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: ((e2.a + 2))",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a left join on an expression of each side is a merge left join": (
+        "RP-1131:fixed",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.b || 'y' = e2.b || 'x'",
+        [
+            "Merge Left Join  (cost=129.66..239.66 rows=5000 width=14)",
+            "  Merge Cond: (((e.b || 'y'::text)) = ((e2.b || 'x'::text)))",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: ((e.b || 'y'::text))",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: ((e2.b || 'x'::text))",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a join on an expression key ordered by its merge key descending": (
+        "RP-1131:fixed",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.b = e2.b || 'x' order by e.b desc",
+        [
+            "Merge Join  (cost=129.66..224.66 rows=5000 width=14)",
+            "  Merge Cond: (e.b = ((e2.b || 'x'::text)))",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: e.b DESC",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: ((e2.b || 'x'::text)) DESC",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a join on an expression key ordered by another column sorts its merge": (
+        "RP-1131:fixed",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.b = e2.b || 'x' order by e2.a",
+        [
+            "Sort  (cost=531.85..544.35 rows=5000 width=14)",
+            "  Sort Key: e2.a",
+            "  ->  Merge Join  (cost=129.66..224.66 rows=5000 width=14)",
+            "        Merge Cond: (e.b = ((e2.b || 'x'::text)))",
+            "        ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "              Sort Key: e.b",
+            "              ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "        ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "              Sort Key: ((e2.b || 'x'::text))",
+            "              ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1131): a merge on several clauses, one an expression of each side,
+    # sorted on every key.
+    "a join on an expression of each side beside a column pair is a merge join": (
+        "RP-1239",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a + 1 = e2.a + 2 and e.b = e2.b",
+        [
+            "Merge Join  (cost=129.66..159.66 rows=500 width=14)",
+            "  Merge Cond: ((((e.a + 1)) = ((e2.a + 2))) AND (e.b = e2.b))",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: ((e.a + 1)), e.b",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: ((e2.a + 2)), e2.b",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a join on two expression pairs is a merge join": (
+        "RP-1239",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a + 1 = e2.a + 2 and e.b || 'y' = e2.b || 'x'",
+        [
+            "Merge Join  (cost=129.66..164.91 rows=25 width=14)",
+            "  Merge Cond: ((((e.a + 1)) = ((e2.a + 2))) AND"
+            " (((e.b || 'y'::text)) = ((e2.b || 'x'::text))))",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: ((e.a + 1)), ((e.b || 'y'::text))",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: ((e2.a + 2)), ((e2.b || 'x'::text))",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1131): the inequality the merge's join filter.
+    "a join on an expression key beside an inequality is a merge join": (
+        "RP-1240",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.b = e2.b || 'x' and e.a < e2.a",
+        [
+            "Merge Join  (cost=129.66..237.16 rows=1667 width=14)",
+            "  Merge Cond: (e.b = ((e2.b || 'x'::text)))",
+            "  Join Filter: (e.a < e2.a)",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: e.b",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "        Sort Key: ((e2.b || 'x'::text))",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (found while working
+    # RP-1131): a cast whose operand is an expression, hashed.
+    "a join on a cast of an expression is a hash join": (
+        "RP-1241",
+        _ANALYSED,
+        "explain select * from e join e e2 on (e.a + 1)::bigint = e2.a",
+        [
+            "Hash Join  (cost=27.50..58.75 rows=1000 width=14)",
+            "  Hash Cond: (((e.a + 1))::bigint = e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),

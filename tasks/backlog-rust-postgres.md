@@ -1256,17 +1256,28 @@ one beside it.
       `WHERE ((u798.dd)::integer > 2)`. It passed on #3107 (RP-1095's own
       snapshot), and locally against a debug build holding 1f8840da: on a
       fresh server, after the module's other tests in three orders, and in
-      120 runs of the statements over one and three connections. Suspect:
-      the printer finds the domain through `domains::user_domain`, a
-      THREAD-LOCAL list that `install_user_types` publishes per pool
-      thread, gated by `INSTALLED_USER_TYPES` on the catalog version; a
-      thread that recorded the list at a version before `dint798` was
-      visible would print the column as its base type. Not shown: the test
-      now asks again on the same and on fresh connections when it misses,
-      and reports how `pg_attribute` types the column, to tell a view
-      stored without the relabel from a stale list on one thread.
-      Verify: none -- seen once on CI's runner; the next miss prints the
-      evidence
+      120 runs of the statements over one and three connections. It missed
+      again on #3141 (run 46146726556, 2026-11-28), with the diagnostics:
+      the same connection asked again printed it bare again, three fresh
+      connections printed the relabel, and `pg_attribute` typed the column
+      `dint798`. So the view is stored right, and ONE connection held a
+      list without the domain, for every statement until the next catalog
+      bump. Likely cause, read from the code (not reproduced):
+      `publish_user_types` (secantus-pg lib.rs) installs
+      `self.domains().unwrap_or_default()`, so a failed catalog read
+      publishes an EMPTY domain list while `complete` stays true, and
+      `install_user_types` records it in `INSTALLED_USER_TYPES` as current
+      for that catalog version. The same `unwrap_or_default()` swallows a
+      failed read of views, checked views, constraint defs, table defs,
+      relation oids, user aggregates and user functions there; only the
+      comments read (`object_comments_builder`) marks the publish
+      incomplete and raises its error. Fix: every read there that fails
+      makes the publish incomplete (not recorded) and surfaces its error
+      to the statement, as the comments read does, so the next miss also
+      names the storage error that caused it, itself a bug to chase.
+      A deterministic test needs a way to make one of those reads fail.
+      Verify: none -- seen twice on CI's runner (#3109, #3141), never
+      locally; the fix's own test pins the error path
       Backlog-ID: RP-1231
 
 ## Found by the CI timing review (2026-11-28)
@@ -2423,7 +2434,13 @@ a regression test.
       Sort. Since RP-1119's first part, an ORDER BY on any other column
       is priced on the narrow path, over joined rows (an alias, an
       ordinal, a comma join) and over the Nested Loop a WHERE constant
-      leaves. Found while working RP-1056.
+      leaves. Since RP-1131 an ORDER BY of the one clause's key over a
+      join whose cheapest path is the merge already in that order prints
+      the merge alone (`joined_merge_order_select`); one whose cheapest
+      path is a hash join stays unpriced, on an expression key too (`e
+      join e e2 on e.a + 1 = e2.a order by e2.a` is 15.20's `Sort
+      (cost=107.33..109.83 rows=1000 width=14)` over the Hash Join). Found
+      while working RP-1056.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an order by a join key over a join prices its sort]
       Backlog-ID: RP-1119
 
@@ -3909,22 +3926,49 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       Backlog-ID: RP-1238
 ## Found while working RP-1071 (2026-11-26)
 
-- [ ] **A join on an expression of each side, or one ordered by its
-      expression-key merge, is not a priced Merge Join.** `explain select *
-      from e join e e2 on e.b || 'y' = e2.b || 'x'` is in PostgreSQL 15.20
-      (a private cluster) `Merge Join (cost=129.66..239.66 rows=5000
-      width=14)`, each side a Sort on its expression (`Sort Key: ((e.b ||
-      'y'::text))`); `explain select * from e join e e2 on e.b = e2.b ||
-      'x' order by e.b` is the same Merge Join as without the ORDER BY
-      (`cost=129.66..224.66`), its order serving the query's with no Sort
-      above it. Here the first is an unpriced `Nested Loop` with `Join
-      Filter: ((e.b || 'y'::text) = (e2.b || 'x'::text))`, the second an
-      unpriced Sort over that Nested Loop. RP-981 / RP-1032 draw an
-      expression key only against a column of the other side, and the
-      ORDER BY path does not reach the expression merge. Once drawn,
-      VERBOSE prints them already (RP-1071).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join on an expression of each side is a merge join], tests/backlog/test_rp_explain_costs.py::test_plan[a join on an expression key ordered by its merge key is a merge join]
-      Backlog-ID: RP-1131
+
+## Found while working RP-1131 (2026-11-28)
+
+- [ ] **A join on several equalities, one an expression of each side, is
+      unpriced.** `explain select * from e join e e2 on e.a + 1 = e2.a + 2
+      and e.b = e2.b` is in PostgreSQL 15.20 (a private cluster, the gap
+      tests' analysed `e`) `Merge Join (cost=129.66..159.66 rows=500
+      width=14)`, `Merge Cond: ((((e.a + 1)) = ((e2.a + 2))) AND (e.b =
+      e2.b))`, each side a Sort on both keys (`Sort Key: ((e.a + 1)),
+      e.b`); two expression pairs (`... and e.b || 'y' = e2.b || 'x'`) are
+      `Merge Join (cost=129.66..164.91 rows=25 ...)`. Here the first is an
+      unpriced `Hash Join` on both clauses, the second an unpriced `Nested
+      Loop` with the ON its `Join Filter`: `hash_join_of`
+      does not compare a merge on several clauses (its `mergejoinscansel`
+      and its Sort on every key are not modelled), and with an expression
+      on each side of a clause that merge is the cheaper path, so
+      `joined_sides` declines such a clause beside another rather than
+      price the Hash Join (cost=30.00..555.00 for the first) it would pick.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join on an expression of each side beside a column pair is a merge join], tests/backlog/test_rp_explain_costs.py::test_plan[a join on two expression pairs is a merge join]
+      Backlog-ID: RP-1239
+- [ ] **A join on an expression key beside an ON inequality is unpriced.**
+      `explain select * from e join e e2 on e.b = e2.b || 'x' and e.a <
+      e2.a` is in PostgreSQL 15.20 (a private cluster, the gap tests'
+      analysed `e`) `Merge Join (cost=129.66..237.16 rows=1667 width=14)`,
+      `Merge Cond: (e.b = ((e2.b || 'x'::text)))` and `Join Filter: (e.a <
+      e2.a)`, the same Sorts as without the inequality. Here an unpriced
+      `Nested Loop` with `Join Filter: ((e.b = (e2.b || 'x'::text)) AND
+      (e.a < e2.a))`: the lowering marks the ON `on_other`, and a join
+      filter is priced beside column pairs only (RP-375). The same with an
+      expression on each side.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join on an expression key beside an inequality is a merge join]
+      Backlog-ID: RP-1240
+- [ ] **A join on a cast of an expression is unpriced.** `explain select
+      * from e join e e2 on (e.a + 1)::bigint = e2.a` is in PostgreSQL
+      15.20 (a private cluster, the gap tests' analysed `e`) `Hash Join
+      (cost=27.50..58.75 rows=1000 width=14)`, `Hash Cond: (((e.a +
+      1))::bigint = e2.a)`. Here an unpriced `Nested Loop` with the ON its
+      `Join Filter`, while `e.a::bigint = e2.a::bigint * 2` (a cast of a
+      column, RP-1032) is priced: the operator count `ExprEquality` takes
+      (`cast_cost`) is `None` for a cast whose operand is not a column, so
+      the clause is not one `expr_key_pair` prices.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join on a cast of an expression is a hash join]
+      Backlog-ID: RP-1241
 
 ## Found while working RP-980 (2026-11-17)
 
