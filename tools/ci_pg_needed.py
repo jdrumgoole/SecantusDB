@@ -3,7 +3,7 @@
 
     git diff --name-only BASE...HEAD | python3 tools/ci_pg_needed.py
 
-pg-oracle (three shards, ~30 min, the slowest job of a PR run) checks the
+pg-oracle (four shards, ~30 min, the slowest job of a PR run) checks the
 Rust PostgreSQL server against a real PostgreSQL. A change confined to code
 and tests the PostgreSQL server does not link -- the MongoDB server's command
 layer, its binary, its storage adapter, its wire layer, the MongoDB backlog
