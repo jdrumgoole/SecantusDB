@@ -797,12 +797,14 @@ def test_pg_get_viewdef_relabels_a_user_domain_operand(dsn: str) -> None:
         c.execute("create table u798 (k int, dd dint798)")
         c.execute("create view w798 as select k from u798 where dd > 2")
         got = _answer(c, "select pg_get_viewdef('w798'::regclass)")
-        # RP-1231: failed once on CI (#3109, 2026-11-28) printing `(u798.dd
-        # > 2)`, and never in 120 runs here. When it misses, ask again on
-        # this connection and on fresh ones, and whether the column reads
-        # as the domain: the same answer everywhere means the view was
-        # stored without the relabel; a right answer elsewhere, a stale
-        # per-thread domain list where it was asked.
+        # Failed twice on CI (#3109, #3141, 2026-11-28) printing `(u798.dd
+        # > 2)`: the view texts were printed with the domains this thread
+        # had published before (RP-1231, fixed; its deterministic test is
+        # tests/test_rust_pgserver_viewdef_domains.py). On a miss, ask again
+        # on this connection and on fresh ones, and whether the column
+        # reads as the domain: the same answer everywhere means the view
+        # was stored without the relabel; a right answer elsewhere, a stale
+        # per-thread table where it was asked.
         context = ""
         if got != WANT798:
             again = [_answer(c, "select pg_get_viewdef('w798'::regclass)")]

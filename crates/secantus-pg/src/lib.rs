@@ -1977,6 +1977,29 @@ fn inlines_to_constant(d: &Document) -> bool {
     }
 }
 
+/// A catalog read in `publish_user_types`: its value, or on an error the
+/// empty default with the publication marked incomplete, so the empty
+/// table is never recorded as this catalog version's (RP-1231).
+trait OrIncomplete<T> {
+    fn or_incomplete(self, complete: &std::cell::Cell<bool>) -> T;
+}
+
+impl<T: Default, E> OrIncomplete<T> for Result<T, E> {
+    fn or_incomplete(self, complete: &std::cell::Cell<bool>) -> T {
+        self.unwrap_or_else(|_| {
+            complete.set(false);
+            T::default()
+        })
+    }
+}
+
+/// `None` is a failed read too (`relation_oids`).
+impl<T: Default> OrIncomplete<T> for Option<T> {
+    fn or_incomplete(self, complete: &std::cell::Cell<bool>) -> T {
+        self.ok_or(()).or_incomplete(complete)
+    }
+}
+
 fn user_fn_of(d: &Document) -> secantus_pgplan::UserFn {
     let strings = |key: &str| -> Vec<String> {
         d.get_array(key)
@@ -6547,9 +6570,11 @@ impl PgHandler {
 
     /// Build the planner's user-type tables from the catalog and publish
     /// them to this thread. `install_user_types` is the gate in front.
-    /// False when a read the publication needs failed: the planner then holds
-    /// that error where the table would be (the comments, so far), and the
-    /// publication must not be recorded as current.
+    /// False when a read the publication needs failed, and the publication
+    /// must then not be recorded as current: the next statement reads
+    /// again. The comments' read publishes its error where the table would
+    /// be; every other read publishes its table empty for this statement
+    /// alone (raising those errors too is RP-1231's remainder).
     ///
     /// The error is published rather than returned: several of the callers
     /// that install the tables can carry no error (preparing a statement's
@@ -6560,19 +6585,22 @@ impl PgHandler {
     /// outside `install_user_types` records nothing, so it may ignore the
     /// flag: the failure stays published for a reader to raise.
     fn publish_user_types(&self) -> bool {
-        let mut complete = true;
+        // Cleared by any catalog read below that fails: the table it fed is
+        // published empty, and an empty table recorded as current would
+        // answer for this catalog version until the next DDL (RP-1231).
+        let complete = std::cell::Cell::new(true);
         // Views ride the same per-version gate: a view is expanded by the
         // planner, which cannot read the catalog itself.
         // A partition is read and written as a view over its parent (see
         // `partition`), checked CASCADED against its bound.
         let partitions = self.partition_views();
-        let mut checked = self.checked_views().unwrap_or_default();
+        let mut checked = self.checked_views().or_incomplete(&complete);
         checked.extend(
             partitions
                 .iter()
                 .map(|(n, _)| (n.clone(), "CASCADED".into())),
         );
-        let mut views = self.views().unwrap_or_default();
+        let mut views = self.views().or_incomplete(&complete);
         views.extend(partitions);
         secantus_pgplan::set_view_oids(
             views
@@ -6611,7 +6639,7 @@ impl PgHandler {
             std::iter::once((self.session_user_name(), 10i64))
                 .chain(
                     roles
-                        .unwrap_or_default()
+                        .or_incomplete(&complete)
                         .into_iter()
                         .map(|r| (r.name, r.oid)),
                 )
@@ -6620,7 +6648,7 @@ impl PgHandler {
         // A function outside `public` is named `schema.name`, as a relation is.
         let function_schemas: HashMap<String, String> = self
             .type_catalog_docs(Self::FUNCTION_COLLECTION)
-            .unwrap_or_default()
+            .or_incomplete(&complete)
             .iter()
             .filter_map(|d| {
                 Some((
@@ -6631,7 +6659,7 @@ impl PgHandler {
             .collect();
         secantus_pgplan::regobj::set_procs(
             self.functions()
-                .unwrap_or_default()
+                .or_incomplete(&complete)
                 .iter()
                 .map(|f| {
                     let args: Vec<String> = f
@@ -6671,7 +6699,7 @@ impl PgHandler {
         );
         secantus_pgplan::instead_of::set_instead_of_triggers(
             self.trigger_docs()
-                .unwrap_or_default()
+                .or_incomplete(&complete)
                 .iter()
                 .filter(|d| d.get_str("timing") == Ok("INSTEAD OF"))
                 .flat_map(|d| {
@@ -6715,17 +6743,11 @@ impl PgHandler {
                 });
             }
             _ => {
-                let mut constraint_defs = self.constraint_defs().unwrap_or_default();
+                let mut constraint_defs = self.constraint_defs().or_incomplete(&complete);
                 constraint_defs.extend(builtin_constraint_defs.iter().cloned());
                 secantus_pgplan::set_constraint_defs(constraint_defs);
             }
         }
-        secantus_pgplan::set_view_defs(self.view_defs());
-        secantus_pgplan::set_view_defs_pretty(self.view_defs_as(1));
-        secantus_pgplan::set_view_defs_marked(self.view_defs_as(2));
-        secantus_pgplan::set_index_defs(self.read_in_block(|| self.index_defs()));
-        secantus_pgplan::set_trigger_defs(self.trigger_defs());
-        secantus_pgplan::set_statistics_defs(self.statistics_defs());
         let mut sigs = self.function_sigs();
         // A range's constructors, as `\df` prints them.
         for (oid, _, args, ret, _, _, variadic) in self.range_constructors() {
@@ -6768,12 +6790,12 @@ impl PgHandler {
         // Read in place, every oid from one map: a copy of every definition
         // and a map fetch per relation, for each listing below, made the
         // statement after any DDL grow with the schema (RP-911).
-        let table_defs = self.shared_table_defs().unwrap_or_default();
+        let table_defs = self.shared_table_defs().or_incomplete(&complete);
         // Built only when a partitioned table or a partition asks for it.
         let oids = std::cell::OnceCell::new();
         let oid = |name: &str| {
             Self::oid_in(
-                oids.get_or_init(|| self.relation_oids().unwrap_or_default()),
+                oids.get_or_init(|| self.relation_oids().or_incomplete(&complete)),
                 name,
             )
         };
@@ -6806,17 +6828,19 @@ impl PgHandler {
         match self.read_in_block(|| self.object_comments_builder()) {
             Ok(build) => secantus_pgplan::defer_object_comments(build),
             Err(e) => {
-                complete = false;
+                complete.set(false);
                 secantus_pgplan::set_object_comments(Err(Self::plan_error_of(e)));
             }
         }
         secantus_pgplan::set_shared_comments(self.read_in_block(|| self.shared_comments()));
-        secantus_pgplan::domains::set_user_domains(self.domains().unwrap_or_default());
-        secantus_pgplan::user_agg::set_user_aggregates(self.user_aggregates().unwrap_or_default());
+        secantus_pgplan::domains::set_user_domains(self.domains().or_incomplete(&complete));
+        secantus_pgplan::user_agg::set_user_aggregates(
+            self.user_aggregates().or_incomplete(&complete),
+        );
         // User-defined functions, so the planner can type and route a call.
         secantus_pgplan::rule_rewrite::set_rules(self.enabled_rules());
         catalog_meta::install_system_relations();
-        let routines = self.user_function_docs().unwrap_or_default();
+        let routines = self.user_function_docs().or_incomplete(&complete);
         // Each routine's `pg_proc` oid and language, for the validators.
         secantus_pgplan::validators::set_user_function_languages(
             routines
@@ -6859,7 +6883,7 @@ impl PgHandler {
         // resolves only as `schema.name`, exactly like composites and ranges.
         let enums: Vec<(String, i64, Vec<String>)> = self
             .enums_with_schema()
-            .unwrap_or_default()
+            .or_incomplete(&complete)
             .into_iter()
             .map(|(schema, name, oid, labels)| (Self::type_resolution(&schema, &name), oid, labels))
             .collect();
@@ -6868,7 +6892,7 @@ impl PgHandler {
         let mut view_rows: Vec<secantus_pgplan::CompositeType> = Vec::new();
         for d in self
             .type_catalog_docs(Self::VIEW_COLLECTION)
-            .unwrap_or_default()
+            .or_incomplete(&complete)
             .iter()
         {
             let (Ok(view), Ok(row)) = (d.get_str("_id"), d.get_array("row_fields")) else {
@@ -6894,7 +6918,7 @@ impl PgHandler {
         // now, so what is derived is what this catalog version holds.
         let composite_docs = self
             .type_catalog_docs(Self::COMPOSITE_COLLECTION)
-            .unwrap_or_default();
+            .or_incomplete(&complete);
         // Composites resolve by name too; they have no labels, so an empty
         // label list stands in. A `public` composite resolves by its bare name
         // (public is on the default search_path); a schema-qualified one
@@ -7024,7 +7048,7 @@ impl PgHandler {
         // A schema-qualified range resolves as `schema.name`, so
         // `to_regtype('testschema.testrange')` reaches it and a bare
         // `to_regtype('testrange')` reaches only the public one.
-        let ranges_with_schema = self.ranges_with_schema().unwrap_or_default();
+        let ranges_with_schema = self.ranges_with_schema().or_incomplete(&complete);
         let ranges: Vec<(String, String, i64)> = ranges_with_schema
             .iter()
             .map(|(schema, name, oid, subtype)| {
@@ -7052,7 +7076,7 @@ impl PgHandler {
         // the planner refuses a cast to a shell and hides it from to_regtype.
         let base_types: Vec<(String, i64, bool)> = self
             .base_types()
-            .unwrap_or_default()
+            .or_incomplete(&complete)
             .into_iter()
             .map(|b| (Self::type_resolution(&b.schema, &b.name), b.oid, b.defined))
             // An extension's own internal types (RP-105).
@@ -7067,7 +7091,7 @@ impl PgHandler {
         // parses and renders their text forms itself.
         let extension_types: Vec<String> = self
             .base_types()
-            .unwrap_or_default()
+            .or_incomplete(&complete)
             .into_iter()
             .filter(|b| b.extension.is_some())
             .map(|b| Self::type_resolution(&b.schema, &b.name))
@@ -7098,7 +7122,7 @@ impl PgHandler {
         {
             let matviews: Vec<String> = self
                 .matviews()
-                .unwrap_or_default()
+                .or_incomplete(&complete)
                 .into_iter()
                 .map(|(n, _, _)| n)
                 .collect();
@@ -7130,12 +7154,26 @@ impl PgHandler {
             table_defs,
             names,
             self.views()
-                .unwrap_or_default()
+                .or_incomplete(&complete)
                 .into_iter()
                 .map(|(n, _)| n)
                 .collect(),
         );
-        complete
+        // The texts printed now, not when a statement asks, LAST: the
+        // printer reads this thread's published tables (a column of a user
+        // domain is relabelled only when `domain_base` finds the domain),
+        // and printed before them it read the tables this thread published
+        // for an earlier catalog, or another database, or none on a new
+        // connection's thread. A view over a domain made since then lost
+        // its `(t.dd)::integer` relabel, and the publication was recorded
+        // as current (RP-1231).
+        secantus_pgplan::set_view_defs(self.view_defs());
+        secantus_pgplan::set_view_defs_pretty(self.view_defs_as(1));
+        secantus_pgplan::set_view_defs_marked(self.view_defs_as(2));
+        secantus_pgplan::set_index_defs(self.read_in_block(|| self.index_defs()));
+        secantus_pgplan::set_trigger_defs(self.trigger_defs());
+        secantus_pgplan::set_statistics_defs(self.statistics_defs());
+        complete.get()
     }
 
     /// `pg_relation_is_publishable`'s tables: an ordinary or partitioned
