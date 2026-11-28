@@ -1097,26 +1097,28 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       `test_sbe_find_explain.py`, `test_rm_found_2026_11_10_rm418.py`,
       `test_rm_found_2026_11_14_rm434.py`,
       `test_rm_found_2026_11_08_rm310.py` (RM-768's occurrences) and
-      RM-683's two loop-join files. Not yet: a sweep that records which
-      tests ever receive a `saveState` / `restoreState` / `numYield(s)` in a
-      reply (a pytest plugin wrapping `Database.command`; 828 tests of the
-      61 `tests/mongod_live` and `tests/backlog` explain files, in
-      `-n0` order, before it was stopped) saw them in `test_project_storage.py`
-      (29 of 29), `mongod_live/test_geo_wildcard_plans.py` (30 of 30),
-      `test_sbe_group_explain.py`, `test_sbe_fetch_explain.py` (both
-      already under `no_timed_yields`), `test_change_stream_explain.py`,
-      `test_distinct_scan_keys.py`, `test_view_line_namespaces.py`,
-      `test_query_stats_store.py`, `test_internal_window_sort_key.py`,
-      `test_clustered_scan_plans.py`, and in `tests/backlog`:
-      `test_rm_found_2026_11_08_rm071.py`, `_rm342.py`, `_rm404.py`,
-      `_rm373.py`, `_rm426.py`, `_rm509.py`, `_rm325.py`, `_rm519.py`,
-      `_rm707.py`, `_rm472.py`, `_rm476.py`, `_rm515.py`, `_10_25.py`,
-      `_10_26.py`, `test_rm_355_364.py`, `test_rm_geo_wildcard_plans.py`,
-      `test_rm_hashed_index.py`, `test_rm_view_namespaces.py`; the rest of
-      the files were not reached. Whether each COMPARES them (rather than
-      selecting `nReturned` / `works`, or stripping them as
-      `test_rm_154_plan_cache.py` does) is unread. Do that, and move the
-      ones that do to `mongod_rs_no_yield` / `no_timed_yields`.
+      RM-683's two loop-join files, then (2026-11-28) `test_change_stream_explain.py`,
+      `test_rm_355_364.py`'s collectionless-aggregate and `awaitData`
+      tests, `test_rm_found_2026_11_08_rm341.py`'s four plan-cache trial
+      tests and `test_rm_found_2026_11_14_rm539.py`'s `$unionWith` test.
+      Those were found by forcing yields instead of reading each file: a
+      pytest plugin starts every reference mongod that has not turned
+      time-based yields off with `internalQueryExecYieldIterations=1` (a
+      yield at every plan iteration, so a test that compares a yield
+      counter fails every run, not one in thirty) and gives `no_timed_yields`
+      the same off switch; every file under `tests/backlog` and
+      `tests/mongod_live` that mentions `explain` and a reference mongod
+      (117 files; `test_rm_storage_model.py` was stopped part-way, as it
+      has none) was run that way, and each file that failed was rerun
+      without it. What is left:
+      tests that fail without the plugin too on the binary the sweep used
+      (prebuilt 2026-11-28 04:38, older than the tests: `test_rm_found_2026_11_15_rm452.py`,
+      `_rm418.py`'s sorted-find cases, `test_sbe_filtered_front_explain.py`,
+      three tests of `_rm341.py`, four of `test_rm_355_364.py`, the geo-near
+      test of `test_rm_geo_wildcard_plans.py` and `test_rm_001_028.py`'s
+      flow-control test) cannot be told apart from yield counters until they pass, so
+      rerun the sweep on a current binary; and a test that does not say
+      `explain` (a slow-query line's `locks` or `numYield`) was not swept.
       Verify: none -- intermittent test quality, no gap in the server
       Backlog-ID: RM-768
 - [ ] **A `{$meta: "sortKey"}` with no `$sort` is refused where the query

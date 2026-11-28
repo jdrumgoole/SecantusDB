@@ -105,7 +105,7 @@ def test_a_not_inside_elem_match_entry_reports_its_size(rust_mongo: Any, mongod:
 
 
 @pytest.mark.backlog_fixed("RM-437")
-def test_a_sort_merge_candidate_counts_as_mongods(rust_mongo: Any, mongod: Any) -> None:
+def test_a_sort_merge_candidate_counts_as_mongods(rust_mongo: Any, mongod_rs_no_yield: Any) -> None:
     """mongod 8.2.11's winning SORT_MERGE for `{a: {$in: [1, 2]}, b: {$lt:
     90}}` sorted by `c` over `a_1_c_1` and `b_1` reports 82 `works` and its
     `dupsTested` and `dupsDropped` in `creationExecStats`; this server's
@@ -125,7 +125,7 @@ def test_a_sort_merge_candidate_counts_as_mongods(rust_mongo: Any, mongod: Any) 
             if s["stage"] == "SORT_MERGE"
         ]
 
-    assert merge(rust_mongo) == merge(mongod)
+    assert merge(rust_mongo) == merge(mongod_rs_no_yield)
 
 
 def _losers(client: Any, q: dict) -> list:
@@ -146,14 +146,14 @@ def _losers(client: Any, q: dict) -> list:
 
 
 @pytest.mark.backlog_fixed("RM-438")
-def test_a_nin_candidate_reads_mongods_keys(rust_mongo: Any, mongod: Any) -> None:
+def test_a_nin_candidate_reads_mongods_keys(rust_mongo: Any, mongod_rs_no_yield: Any) -> None:
     """mongod 8.2.11's losing candidate for `{a: {$lt: 5}, b: {$nin: [3,
     4]}}` -- `b_1` read over three intervals -- examines 101 keys in the
     trial, seeking 3 times and returning 99; this server's sought twice and
     returned 100, until a seek to the next interval landed at its start
     (RM-433's fix)."""
     q = {"a": {"$lt": 5}, "b": {"$nin": [3, 4]}}
-    assert _losers(rust_mongo, q) == _losers(mongod, q)
+    assert _losers(rust_mongo, q) == _losers(mongod_rs_no_yield, q)
 
 
 @pytest.mark.backlog_fixed("RM-439")
@@ -167,24 +167,24 @@ def test_a_nin_candidate_reads_mongods_keys(rust_mongo: Any, mongod: Any) -> Non
     ],
 )
 def test_an_exists_candidates_filter_is_in_mongods_order(
-    rust_mongo: Any, mongod: Any, q: dict
+    rust_mongo: Any, mongod_rs_no_yield: Any, q: dict
 ) -> None:
     """mongod 8.2.11's losing candidate for `{a: {$lt: 5}, b: {$exists:
     true}}` over `b_1` rechecks `{$and: [{b: {$exists: true}}, {a: {$lt:
     5}}]}` in its FETCH -- the inexact `$exists`, tagged with the index,
     first (`sortUsingTags`); this server put `a` first."""
-    assert _losers(rust_mongo, q) == _losers(mongod, q)
+    assert _losers(rust_mongo, q) == _losers(mongod_rs_no_yield, q)
 
 
 @pytest.mark.backlog_fixed("RM-440")
-def test_a_type_candidate_reads_mongods_keys(rust_mongo: Any, mongod: Any) -> None:
+def test_a_type_candidate_reads_mongods_keys(rust_mongo: Any, mongod_rs_no_yield: Any) -> None:
     """mongod 8.2.11's losing candidate for `{a: {$lt: 5}, b: {$type:
     "int"}}` over `b_1` rechecks `$type` against each key and returns all
     101 keys it examines (every `b` is an int) to its FETCH in the trial;
     this server's returned 6 -- the documents the FETCH keeps -- because it
     answered the scan's key filter with whether the whole query matched."""
     q = {"a": {"$lt": 5}, "b": {"$type": "int"}}
-    assert _losers(rust_mongo, q) == _losers(mongod, q)
+    assert _losers(rust_mongo, q) == _losers(mongod_rs_no_yield, q)
 
 
 @pytest.mark.backlog_fixed("RM-441")

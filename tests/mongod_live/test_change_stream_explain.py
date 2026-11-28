@@ -152,17 +152,20 @@ CASES = {
 
 
 @pytest.mark.parametrize("name", list(CASES))
-def test_explain_of_a_change_stream(rust_mongo: Any, mongod_rs: Any, name: str) -> None:
-    same(_explain(rust_mongo, CASES[name], None), _explain(mongod_rs, CASES[name], None))
+def test_explain_of_a_change_stream(rust_mongo: Any, mongod_rs_no_yield: Any, name: str) -> None:
+    same(_explain(rust_mongo, CASES[name], None), _explain(mongod_rs_no_yield, CASES[name], None))
 
 
 @pytest.mark.parametrize("verbosity", ["queryPlanner", "executionStats", "allPlansExecution"])
 @pytest.mark.parametrize("name", ["collection", "database", "pre- and post-images"])
 def test_explain_of_a_change_stream_at_each_verbosity(
-    rust_mongo: Any, mongod_rs: Any, name: str, verbosity: str
+    rust_mongo: Any, mongod_rs_no_yield: Any, name: str, verbosity: str
 ) -> None:
-    """A new stream, which starts after the last entry and reads nothing."""
+    """A new stream, which starts after the last entry and reads nothing.
+    The reference yields on time, which load decides, and each yield moves
+    the scan's `saveState` / `restoreState` (RM-768): it runs with time-based
+    yields off, as mongod yields none in a short read on the exemplar build."""
     same(
         _explain(rust_mongo, CASES[name], verbosity),
-        _explain(mongod_rs, CASES[name], verbosity),
+        _explain(mongod_rs_no_yield, CASES[name], verbosity),
     )
