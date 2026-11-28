@@ -1238,6 +1238,38 @@ one beside it.
       Verify: none -- measured only on CI's x86_64 runner (the diagnostic workflow on `rp-1100-diag`); RP-715's, RP-911's and RP-1073's tests are the check
       Backlog-ID: RP-1100
 
+## Found by the CI timing review (2026-11-28)
+
+Measured on `secantusd-pg` (debug, tree 02293a75) and a private
+PostgreSQL 15.20 cluster, each table `(a int, b text)` filled from
+`generate_series` and analysed; RSS sampled with `ps` on a fresh server
+per query.
+
+- [ ] **A join holds every joined row in memory before its consumer sees
+      one.** `select count(*) from e join f on e.a > f.a` (2,000 x 100
+      rows, 194,950 joined) raises the server's RSS 227 MB, about 1.1 KB
+      per joined row; over 20,000 x 200 (3,979,900 rows) it rises 3.9 GB
+      and takes 41 s. PostgreSQL runs it as an Aggregate over a Nested
+      Loop, the inner side under a Materialize, holding the 100 inner rows
+      and none of the joined ones, in 15 ms. Equality joins hold their
+      rows too (`count(*), sum(e.a + f.a)` over `e.b = f.b`, 200,000
+      rows: +128 MB), and every shape measured rose the same with
+      `SECANTUS_PG_JOIN_STREAM=0`, so batch 65's bounded-memory join
+      (`stream_join.rs`) bounded none of them; its tests
+      (`test_rust_pgserver_slice.py`) compare rows, never memory. (A bare
+      `count(*)` over an equality join rose only 25 MB in 0.1 s, a
+      counting path that builds no rows.) A large enough join can run the
+      server out of memory where PostgreSQL's runs in work_mem. It is also
+      CI's longest test: RP-919's
+      `test_a_chain_of_inequality_joins_runs_in_the_searched_order` builds
+      4,994,835 rows (3.6 GB, 62 s for a `count(*)` here; 130-200 s on
+      CI's runner) to read five, where PostgreSQL takes 0.4 s. First find
+      why the streamed path declines (or holds) for these shapes, then
+      make the executor pull rows through the join the way PostgreSQL's
+      nodes do.
+      Verify: tests/backlog/test_rp_join_memory.py::test_an_inequality_join_does_not_hold_its_rows
+      Backlog-ID: RP-1227
+
 ## Found by a CI run (2026-11-07)
 
 - [ ] **OPEN — CI: `obj_description` of a commented index answered NULL
