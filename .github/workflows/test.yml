@@ -1564,7 +1564,7 @@ jobs:
           echo "disk watchdog: free space never fell under the threshold"
 
   changes:
-    # Which slow lanes a pull request needs. pg-oracle (three shards, ~30 min,
+    # Which slow lanes a pull request needs. pg-oracle (four shards, ~30 min,
     # the PR run's critical path) is skipped when every changed file is
     # MongoDB-only code or tests the PostgreSQL server does not link
     # (tools/ci_pg_needed.py, an allow-list: anything it does not name runs
@@ -1619,10 +1619,15 @@ jobs:
     # step alone 17): the Rust PG backlog regression and gap tests against
     # a PostgreSQL 15 it starts itself. The split is by FILE: a file named in neither list runs
     # nowhere, so a new suite joins one of them in the step below.
+    # `backlog-long`, split from `backlog` on 2026-11-28 when that shard
+    # was again the critical path (22-32 min, its backlog step 15-19): the
+    # six backlog files that took half the step's test time on #3097 and
+    # #3100 (BACKLOG_LONG below). `backlog` runs every other backlog file
+    # by EXCLUSION, so a new file runs there without being named.
     strategy:
       fail-fast: false
       matrix:
-        shard: [server, backlog, differential]
+        shard: [server, backlog, backlog-long, differential]
     env:
       UV_PYTHON: "3.10"
       # The suites read this (tests/pg_oracle.py); without it they fall back to
@@ -1736,7 +1741,7 @@ jobs:
       # shards compiled every third-party crate on every run: "Build
       # secantusd-pg" took 108-153s, "Build secantusd-mdb" 65s and the cargo
       # tests' build most of their 99s, in the job that sets the PR's CI
-      # time. One cache serves all three shards (`shared-key`). Only the
+      # time. One cache serves all four shards (`shared-key`). Only the
       # `server` shard builds all of it (both binaries and the test
       # targets), so only that shard saves, and only on main (see the
       # ``rust`` job's cache step for why not from PRs).
@@ -1825,7 +1830,7 @@ jobs:
           "
 
       - name: Run the PostgreSQL-oracle suites
-        if: matrix.shard != 'backlog'
+        if: ${{ !startsWith(matrix.shard, 'backlog') }}
         # The Rust PostgreSQL server's suites, named one by one. This lane used
         # to start from every file importing ``pg_oracle``, but all of those
         # test the Python PostgreSQL server, which CI no longer tests (fully
@@ -1944,7 +1949,7 @@ jobs:
       # item that could never read FIXED. Same repository and key as the
       # storage-engine job's step of the same name.
       - name: Register the MongoDB 8.2 apt repository (Linux)
-        if: matrix.shard == 'backlog'
+        if: startsWith(matrix.shard, 'backlog')
         shell: bash
         run: |
           curl -fsSL --retry 3 --retry-all-errors --max-time 60 \
@@ -1953,7 +1958,7 @@ jobs:
           echo "deb [signed-by=/usr/share/keyrings/mongodb-server.gpg] https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.2 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-8.2.list
 
       - name: Install mongod 8.2
-        if: matrix.shard == 'backlog'
+        if: startsWith(matrix.shard, 'backlog')
         uses: ./.github/actions/apt-install
         with:
           packages: mongodb-org-server
@@ -1989,7 +1994,7 @@ jobs:
       # (the `pg15` fixture), which this step starts from the binaries above on
       # the port a developer box uses for it.
       - name: Start a PostgreSQL 15 reference
-        if: matrix.shard == 'backlog'
+        if: startsWith(matrix.shard, 'backlog')
         shell: bash
         run: |
           B=/usr/lib/postgresql/15/bin
@@ -2000,7 +2005,7 @@ jobs:
           psql "host=127.0.0.1 port=5415 dbname=postgres user=postgres" -Atc 'show server_version'
 
       - name: Run the Rust PG backlog regression and gap tests
-        if: matrix.shard == 'backlog'
+        if: startsWith(matrix.shard, 'backlog')
         shell: bash
         env:
           SECANTUS_PG_ORACLE_DSN_15: "host=127.0.0.1 port=5415 dbname=postgres user=postgres"
@@ -2013,10 +2018,36 @@ jobs:
           # the PR run's critical path at 14-28 min). --dist worksteal for
           # the reason the suites step gives: the isolation specs run up to
           # 126 s each, and the default hands them out up front.
-          uv run python -m pytest -m backlog_fixed tests/backlog/test_rust_postgres_gaps.py \
-            tests/backlog/test_rp_*.py -q -n auto --dist worksteal -p no:cacheprovider -rs \
+          #
+          # Split in two by FILE (2026-11-28). `backlog-long` runs the files
+          # in BACKLOG_LONG, chosen by the --durations totals of #3097 and
+          # #3100 (each 160-610 s of worker time, about half the step's);
+          # `backlog` runs every other file. A name in BACKLOG_LONG that no
+          # longer exists fails the step (pytest: file not found), and a
+          # renamed file falls back to `backlog`, so nothing runs nowhere.
+          BACKLOG_LONG=(
+            tests/backlog/test_rp_explain_costs.py
+            tests/backlog/test_rp_top10_found.py
+            tests/backlog/test_rp_function_bodies.py
+            tests/backlog/test_rp_catalog_reads.py
+            tests/backlog/test_rp_isolation.py
+            tests/backlog/test_rp_catalog_latency.py
+          )
+          long="${BACKLOG_LONG[*]}"
+          if [ "${{ matrix.shard }}" = "backlog-long" ]; then
+            files="$long"
+          else
+            files="tests/backlog/test_rust_postgres_gaps.py"
+            for f in tests/backlog/test_rp_*.py; do
+              case " $long " in *" $f "*) ;; *) files="$files $f" ;; esac
+            done
+          fi
+          echo "$files" | wc -w
+          uv run python -m pytest -m backlog_fixed $files \
+            -q -n auto --dist worksteal -p no:cacheprovider -rs \
             --durations=0 --durations-min=1.0
           df -h / | tail -1
+          [ "${{ matrix.shard }}" = "backlog" ] || exit 0
           # And the OPEN items' gap tests, through the backlog's own runner: it
           # exits non-zero when a gap test no longer measures its gap (BROKEN)
           # or now passes (FIXED? -- a change fixed the item; close it in the
