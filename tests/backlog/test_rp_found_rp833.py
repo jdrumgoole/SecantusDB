@@ -2,7 +2,7 @@
 ERROR carried no CONTEXT):
 
 - a function in `pg_temp` is labelled without its schema;
-- a label leaves a parameter type off the path unqualified (RP-1090).
+- a label left a parameter type off the path unqualified (RP-1090).
 
 The expected answers were measured on PostgreSQL 15.19. The test creates
 one function, in its own session's `pg_temp`.
@@ -179,12 +179,13 @@ def test_creating_a_function_assigns_an_xid(dsn: str) -> None:
     assert altered == (None,)
 
 
-@pytest.mark.backlog("RP-1090")
+@pytest.mark.backlog_fixed("RP-1090")
 def test_a_label_qualifies_a_parameter_type_off_the_path(dsn: str) -> None:
     """`format_procedure` qualifies each parameter type that is not visible
     on the search path, as it does the function's name: on PostgreSQL 15.19
     `s1100.f(x s1100.ty)` called off the path is labelled
-    `s1100.f(s1100.ty)`. `secantusd-pg` labels it `s1100.f(ty)`."""
+    `s1100.f(s1100.ty)`. `secantusd-pg` labelled it `s1100.f(ty)`, and now
+    qualifies it."""
     contexts: list[str | None] = []
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute("drop schema if exists s1100 cascade")
