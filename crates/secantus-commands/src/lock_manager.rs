@@ -1122,9 +1122,11 @@ pub fn statement_rounds(
         // collection in X twice, the second nested in the first, so one
         // flow control ticket (measured 8.2.11, 2026-11-16: transition w 1,
         // global r 1 w 1, database w 1, collection W 2). A collection that
-        // is not there is not measured: it keeps the plain chain.
+        // is not there takes the same rounds, and its entry point then
+        // reads the latest optime as for any write that logged nothing
+        // (measured 8.2.11, 2026-11-28: transition w 2, global r 2 w 1).
         "collMod" => {
-            let c = coll.filter(|c| exists(c))?;
+            let c = coll?;
             let mut x = write_round(None);
             x.push((Resource::Collection(format!("{db}.{c}")), X));
             x.push((Resource::Collection(format!("{db}.{c}")), X));

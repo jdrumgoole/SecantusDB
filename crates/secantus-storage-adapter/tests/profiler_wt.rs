@@ -291,6 +291,18 @@ fn level_two_writes_each_operation_in_mongods_shape() {
         if cfg!(target_os = "linux") {
             want.insert(after_millis - 1, "cpuNanos");
         }
+        // A `storage` section is written when WiredTiger counted anything
+        // for the read (bytes read from disk, a wait on the cache, the
+        // schema lock or a handle lock), which the store's state decides,
+        // not the operation (RM-448): where it is, it sits where mongod
+        // 8.2.11 writes it, between `flowControl` and `responseLength`,
+        // and it is a document. After `cpuNanos`: an insert before
+        // `millis` moves it, and `after_millis` with it.
+        if find.contains_key("storage") {
+            assert!(find.get_document("storage").is_ok(), "storage: {find:?}");
+            let at = want.iter().position(|k| *k == "responseLength").unwrap();
+            want.insert(at, "storage");
+        }
         assert_eq!(keys(find), want);
         // Two keys in the bounds and the work that finds the end: three
         // works of the scan's, each the FETCH's too (mongod 8.2.11).

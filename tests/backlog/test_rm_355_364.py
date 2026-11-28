@@ -507,6 +507,7 @@ _MATCHING_WRITES = {
     # A global IS alone, then the collection in X twice in one write round
     # (measured 2026-11-16).
     "collMod": lambda d: d.command("collMod", "c", writeConcern={"w": 1}),
+    "collMod of one not there": lambda d: _collmod_missing(d),
     # A batch of several documents that fails is inserted again a document
     # at a time, in rounds that end at each failure; an unordered batch
     # opens a new round for the documents after one, and a retryable
@@ -537,6 +538,11 @@ _MATCHING_WRITES = {
 }
 
 
+def _collmod_missing(d: Any) -> None:
+    with pytest.raises(pymongo.errors.OperationFailure):
+        d.command("collMod", "k9", writeConcern={"w": 1})
+
+
 def _insert_many_in_transaction(d: Any, n: int) -> None:
     with d.client.start_session() as s, s.start_transaction():
         d.c.insert_many([{"_id": 300 + i} for i in range(n)], session=s)
@@ -561,7 +567,9 @@ def test_a_write_reports_mongods_locks_and_flow_control(
     transition lock (`setLastOpToSystemLastOpTime`, measured 2026-11-12);
     this server did not. A `collMod` takes the global IS alone, then the
     collection in X twice under one write round (measured 2026-11-16); this
-    server took the plain chain once. An insert of several documents one of
+    server took the plain chain once; a `collMod` of a collection not
+    there takes the same rounds, then reads the latest optime (measured
+    2026-11-28). An insert of several documents one of
     which fails takes a round for each run of the documents inserted again
     one at a time (measured 2026-11-27); this server took one round. An
     insert of more than 50 documents takes one read round more, for the
@@ -644,16 +652,19 @@ _UNLOCKED_READS = {
 @pytest.mark.backlog_fixed("RM-357")
 @pytest.mark.parametrize("name", list(_UNLOCKED_READS))
 def test_a_collectionless_aggregate_reads_under_no_lock(
-    rust_mongo: Any, mongod_rs: Any, name: str
+    rust_mongo: Any, mongod_rs_no_yield: Any, name: str
 ) -> None:
     """mongod 8.2.11's line for a collectionless `aggregate` whose
     `$lookup` or `$unionWith` reads a collection takes the global IS once
     and then twice for each read of it, which its sub-pipeline cache makes
     once unless the `$lookup`'s first stage is correlated (`Global: {r: 7}`
     for an equality `$lookup` of three documents; measured 2026-11-18).
-    This server took the global IS once."""
+    This server took the global IS once. Time-based yields are off: each
+    yield releases and takes the lock again, which load decides (RM-768)."""
     answers = _write_locks(
-        rust_mongo, mongod_rs, lambda d: list(_plain(d).aggregate(_UNLOCKED_READS[name]))
+        rust_mongo,
+        mongod_rs_no_yield,
+        lambda d: list(_plain(d).aggregate(_UNLOCKED_READS[name])),
     )
     assert answers["mongod"]
     assert answers["rust"] == answers["mongod"]
@@ -2189,7 +2200,7 @@ def _await_data_admissions(client: Any, is_mongod: bool) -> Any:
 
 @pytest.mark.backlog_fixed("RM-355")
 def test_an_await_data_get_more_takes_mongods_execution_tickets(
-    rust_mongo: Any, mongod_rs: Any
+    rust_mongo: Any, mongod_rs_no_yield: Any
 ) -> None:
     """mongod 8.2.11's `awaitData` getMore yields twice for its wait, so its
     line counts 4 execution admissions for a 500 ms wait; this server's
@@ -2197,7 +2208,7 @@ def test_an_await_data_get_more_takes_mongods_execution_tickets(
     tail's oplog position read 0, so the wait never blocked."""
     got = {
         "rust": _await_data_admissions(rust_mongo, False),
-        "mongod": _await_data_admissions(mongod_rs, True),
+        "mongod": _await_data_admissions(mongod_rs_no_yield, True),
     }
     assert got["rust"] == got["mongod"]
 
@@ -2236,14 +2247,14 @@ def _filtered_await_data_admissions(client: Any, is_mongod: bool) -> Any:
 
 @pytest.mark.backlog_fixed("RM-355")
 def test_an_await_data_get_more_woken_twice_takes_mongods_tickets(
-    rust_mongo: Any, mongod_rs: Any
+    rust_mongo: Any, mongod_rs_no_yield: Any
 ) -> None:
     """mongod 8.2.11 yields twice for each wait, so a filtered tail a
     rejected write wakes (two waits) counts 6 admissions; this server's
     counted 24,000-odd until 2026-11-17, its wait rescanning in a loop."""
     got = {
         "rust": _filtered_await_data_admissions(rust_mongo, False),
-        "mongod": _filtered_await_data_admissions(mongod_rs, True),
+        "mongod": _filtered_await_data_admissions(mongod_rs_no_yield, True),
     }
     assert got["rust"] == got["mongod"]
 

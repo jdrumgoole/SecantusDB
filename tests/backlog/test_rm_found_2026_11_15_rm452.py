@@ -448,7 +448,7 @@ def test_the_unwind_filter_is_simplified(rust_mongo: Any, mongod_rs: Any, op_typ
     assert got == want
 
 
-@pytest.mark.backlog("RM-698")
+@pytest.mark.backlog_fixed("RM-698")
 @pytest.mark.parametrize(
     "match",
     [
@@ -460,5 +460,6 @@ def test_an_expr_or_on_a_renamed_field_joins_the_oplog_filter_as_mongod_does(
 ) -> None:
     """mongod 8.2.11's `RewriteExpr` derives `$_internalExpr*` twins from an
     `$expr` `$or` over one renamed field (measured 2026-11-28: the read's
-    hash differs); this server's `expr_twins` derives none from an `$or`."""
+    hash differed); this server's `expr_twins` derived none from an `$or`,
+    and now derives an `$or` of each child's twins."""
     assert _read_and_unwind(rust_mongo, match) == _read_and_unwind(mongod_rs, match)

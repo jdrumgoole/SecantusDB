@@ -163,7 +163,19 @@ def test_a_write_while_an_index_builds(
         return _Build(client, DB, [{"key": {"z": 1}, "name": "z_1"}], pause)
 
     write = _WRITES["insert"]
-    theirs = _run(mongod_fp, build, write)
+    # The build holds the collection's lock while it records itself; a
+    # transaction's write that asks for its IX lock then waits only
+    # `maxTransactionLockRequestTimeoutMillis` (5 ms) before mongod answers
+    # LockTimeout (24, "Unable to acquire IX lock ... within 5ms"), which
+    # load decides (RM-558: the RM gate at load 16-29). -1 takes the timer
+    # out (measured 2026-11-28 on mongod 8.2.11 with a held collection lock:
+    # LockTimeout at 5, the write waiting out the hold at -1), so the answer
+    # is the one the catalog gives once the lock is free: WriteConflict.
+    mongod_fp.admin.command("setParameter", 1, maxTransactionLockRequestTimeoutMillis=-1)
+    try:
+        theirs = _run(mongod_fp, build, write)
+    finally:
+        mongod_fp.admin.command("setParameter", 1, maxTransactionLockRequestTimeoutMillis=5)
     assert theirs == (*_EXPECTED_CONFLICT, "err", 251), theirs
     assert _run(rust_fp, build, write) == theirs
 

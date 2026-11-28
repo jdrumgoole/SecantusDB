@@ -1823,6 +1823,11 @@ def test_secantus_opens_a_standalone_mongod_store_in_both_modes(tmp_path: Path, 
         )
         client.app.c.create_index("v")
         if how == "killed":
+            # `fsync` checkpoints: without it the kill can land before the
+            # checkpoint that holds the finished build, and the store's
+            # catalog still has `v_1` unfinished, which no server opens
+            # (RM-812). What a store killed mid-build is, is RM-811's test.
+            client.admin.command("fsync")
             proc.send_signal(signal.SIGKILL)
             proc.wait()
     finally:

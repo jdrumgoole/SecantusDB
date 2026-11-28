@@ -246,24 +246,6 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
-- [ ] **`test_a_contested_write_of_many_plans_as_mongod[query0-delete]`
-      compares a timing-dependent order (2026-11-24).** On snapshot PR
-      #2975 (run 45439792340, job `mdb-binary (live)`) it failed, then its
-      re-run on the same commit passed. Both servers deleted the same 5,000
-      documents under the same cached plan; the flattened list of deleted
-      ids from the oplog's batched `applyOps` entries differed at one point
-      (this server's list had `1050` before `1069`, mongod's did not), and
-      within an entry the ids ran descending. The test flattens the
-      entries to ignore where mongod cuts a batch, which its own comment
-      calls timing, but if the order within an entry is not the plan's
-      order, a moved cut still moves an id in the flattened list. Decide
-      from mongod what the batched delete's order inside one `applyOps`
-      entry is (the plan's order, reversed, or the write's buffering), then
-      compare only what the plan decides, keeping the test able to fail on
-      a real order divergence. Found by the MongoDB batch session; test
-      code unchanged.
-      Verify: none -- intermittent on CI; the test itself is the check
-      Backlog-ID: RM-784
 
 
 - [ ] **OPEN — the Go gauge's two mongocryptd leaves: confirm how session
@@ -678,7 +660,8 @@ These are explicit non-goals. Don't add them without a reason.
       the command's; since 2026-11-27 a failed batch's one-at-a-time
       rounds match, and since 2026-11-28 an `insert` of more than 50
       documents takes mongod's read round for the index count that tunes
-      its batch size. Still different,
+      its batch size, and a `collMod` of a collection not there takes the
+      same rounds as one of a collection there. Still different,
       measured against a one-member replica set:
       - an `insert` whose batch fails counts an interrupt check for each
         lock on mongod; this server's line prints no `numInterruptChecks`
@@ -686,7 +669,6 @@ These are explicit non-goals. Don't add them without a reason.
       - a profiled `update` or `delete` statement's entry's locks are taken
         without interrupt checks here (the command's `numInterruptChecks`
         is mongod's without them);
-      - a `collMod` of a collection not there is not measured;
       - each global lock taken apart takes an execution ticket, so where
         these locks differ the line's `queues.execution` admissions differ
         too (RM-355);
@@ -699,7 +681,7 @@ These are explicit non-goals. Don't add them without a reason.
         entry (one more on mongod) and its line's execution admissions are
         not compared yet.
       Backlog-ID: RM-357
-      Verify: none -- the interrupt checks are RM-360's and the execution admissions RM-355's; a `collMod` of a missing collection and the two profile entries are not measured yet
+      Verify: none -- the interrupt checks are RM-360's and the execution admissions RM-355's; the two profile entries are not measured yet
 - [ ] **Some queries have no `queryShapeHash`.** Since 2026-11-07 a
       `find`'s, `distinct`'s and `aggregate`'s line, profile entry and
       `explain` carry mongod's `queryShapeHash` (`secantus-commands`
@@ -712,18 +694,6 @@ These are explicit non-goals. Don't add them without a reason.
       need mongot, so mongod's serializer for them is unmeasured here.
       Backlog-ID: RM-358
       Verify: none -- the mongot inputs need a mongot
-- [ ] **`test_a_write_while_an_index_builds` reads mongod's answer off a
-      5 ms lock wait.** `tests/mongod_live/test_txn_catalog_changes.py`
-      asserts mongod 8.2.11 refuses a transaction's insert while an index
-      build is paused (`hangAfterStartingIndexBuild`) with WriteConflict
-      (112). In the RM gate at load 16-29 (2026-11-12, RM-475's run) mongod
-      answered LockTimeout (24, "Unable to acquire IX lock ... within
-      5ms") instead, before the Rust server was asked; a rerun at load 6
-      passed. Which answer mongod gives depends on whether the lock request
-      outlasts `maxTransactionLockRequestTimeoutMillis`, so the test's
-      reference answer is a race under load. Found 2026-11-12 (RM-475).
-      Verify: none -- an intermittent failure under load, 1 in 2 gate runs
-      Backlog-ID: RM-558
 - [ ] **A spilled SORT of index keys compresses to a different size.**
       Each member mongod 8.2.11 spills carries the id of the storage
       snapshot it was read in, drawn from a process-wide counter every
@@ -1127,26 +1097,28 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       `test_sbe_find_explain.py`, `test_rm_found_2026_11_10_rm418.py`,
       `test_rm_found_2026_11_14_rm434.py`,
       `test_rm_found_2026_11_08_rm310.py` (RM-768's occurrences) and
-      RM-683's two loop-join files. Not yet: a sweep that records which
-      tests ever receive a `saveState` / `restoreState` / `numYield(s)` in a
-      reply (a pytest plugin wrapping `Database.command`; 828 tests of the
-      61 `tests/mongod_live` and `tests/backlog` explain files, in
-      `-n0` order, before it was stopped) saw them in `test_project_storage.py`
-      (29 of 29), `mongod_live/test_geo_wildcard_plans.py` (30 of 30),
-      `test_sbe_group_explain.py`, `test_sbe_fetch_explain.py` (both
-      already under `no_timed_yields`), `test_change_stream_explain.py`,
-      `test_distinct_scan_keys.py`, `test_view_line_namespaces.py`,
-      `test_query_stats_store.py`, `test_internal_window_sort_key.py`,
-      `test_clustered_scan_plans.py`, and in `tests/backlog`:
-      `test_rm_found_2026_11_08_rm071.py`, `_rm342.py`, `_rm404.py`,
-      `_rm373.py`, `_rm426.py`, `_rm509.py`, `_rm325.py`, `_rm519.py`,
-      `_rm707.py`, `_rm472.py`, `_rm476.py`, `_rm515.py`, `_10_25.py`,
-      `_10_26.py`, `test_rm_355_364.py`, `test_rm_geo_wildcard_plans.py`,
-      `test_rm_hashed_index.py`, `test_rm_view_namespaces.py`; the rest of
-      the files were not reached. Whether each COMPARES them (rather than
-      selecting `nReturned` / `works`, or stripping them as
-      `test_rm_154_plan_cache.py` does) is unread. Do that, and move the
-      ones that do to `mongod_rs_no_yield` / `no_timed_yields`.
+      RM-683's two loop-join files, then (2026-11-28) `test_change_stream_explain.py`,
+      `test_rm_355_364.py`'s collectionless-aggregate and `awaitData`
+      tests, `test_rm_found_2026_11_08_rm341.py`'s four plan-cache trial
+      tests and `test_rm_found_2026_11_14_rm539.py`'s `$unionWith` test.
+      Those were found by forcing yields instead of reading each file: a
+      pytest plugin starts every reference mongod that has not turned
+      time-based yields off with `internalQueryExecYieldIterations=1` (a
+      yield at every plan iteration, so a test that compares a yield
+      counter fails every run, not one in thirty) and gives `no_timed_yields`
+      the same off switch; every file under `tests/backlog` and
+      `tests/mongod_live` that mentions `explain` and a reference mongod
+      (117 files; `test_rm_storage_model.py` was stopped part-way, as it
+      has none) was run that way, and each file that failed was rerun
+      without it. What is left:
+      tests that fail without the plugin too on the binary the sweep used
+      (prebuilt 2026-11-28 04:38, older than the tests: `test_rm_found_2026_11_15_rm452.py`,
+      `_rm418.py`'s sorted-find cases, `test_sbe_filtered_front_explain.py`,
+      three tests of `_rm341.py`, four of `test_rm_355_364.py`, the geo-near
+      test of `test_rm_geo_wildcard_plans.py` and `test_rm_001_028.py`'s
+      flow-control test) cannot be told apart from yield counters until they pass, so
+      rerun the sweep on a current binary; and a test that does not say
+      `explain` (a slow-query line's `locks` or `numYield`) was not swept.
       Verify: none -- intermittent test quality, no gap in the server
       Backlog-ID: RM-768
 - [ ] **A `{$meta: "sortKey"}` with no `$sort` is refused where the query
@@ -1946,22 +1918,6 @@ differs on none (re-measured 2026-11-09 after RM-454; 1 earlier that day, 2 on 2
 mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
-- [ ] **RUST MongoDB server: an `$expr` `$or` over a renamed field after a
-      `$changeStream` joins the oplog filter, but not as mongod 8.2.11
-      prints it.** RM-452 and RM-698's eleven slices (2026-11-23 to
-      2026-11-28) ported mongod's rewrite of every event field into the
-      oplog filter, with `$type`, `$regex`, `$size` and an `$in` holding a
-      regex cloned onto each renamed path. Left: `expr_twins` derives no
-      `$_internalExpr*` twin from an `$expr` `$or`
-      (`{$expr: {$or: [{$eq: ["$txnNumber", 1]}, {$eq: ["$txnNumber", 2]}]}}`
-      reads with another hash than mongod's), where mongod's `RewriteExpr`
-      does; an `$or` mixing `documentKey` and `operationType` already
-      matches. A null-matching predicate on `updateDescription` that is not
-      only null (`removedFields: {$in: ["a", null]}`) mongod drops, and so
-      does this server, by a "matches only null" test built from probes, not
-      a port of mongod's code (found working RM-452).
-      Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_an_expr_or_on_a_renamed_field_joins_the_oplog_filter_as_mongod_does
-      Backlog-ID: RM-698
 - [ ] **RUST MongoDB server: the Boolean simplifier differs from mongod's
       on about 0.3 percent of random trees, and on nested `$nor`.** The
       simplifier (`crates/secantus-commands/src/explain/simplify.rs`, RM-774)
@@ -2750,21 +2706,6 @@ touched:
   job. Both batch landers read this failure as RED.
   Verify: none -- CI infrastructure; reproduce by adding a source that answers 403 to a runner's sources.list.d
   Backlog-ID: RM-835
-- [ ] **The profiler's level-two test fails when its `find` touches the
-  disk or waits on a WiredTiger lock.** `profiler_wt.rs`'s
-  `level_two_writes_each_operation_in_mongods_shape` compares a `find`
-  entry's keys with a fixed list that has no `storage`. The entry carries
-  `storage` whenever the operation read or wrote bytes, or waited on the
-  cache, the schema lock or a handle lock (`opdebug::storage_section`), as
-  mongod's does, so the list holds only while WiredTiger stays out of the
-  way. In the local RM gate's `adapter-test` step (2026-11-09) the entry
-  had `storage` between `flowControl` and `responseLength`; the file then
-  passed 30 runs out of 30. Which counter was set was not captured: the
-  test should print the entry's `storage` when it differs, and then
-  either rule that counter out (a store with nothing to read from disk)
-  or accept `storage` where mongod would give it, never drop the check.
-  Backlog-ID: RM-448
-  Verify: none -- an intermittent failure, 1 in 31 runs, whose counter is unknown
 
 ## The macOS `test` lane wedges for its whole 30-minute cap, rarely (2026-09-18)
 
@@ -2932,9 +2873,11 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       servers 101 returned, 101 keys and 101 documents examined, for the
       winning plan and each of the three trial plans, at both sizes; mongod
       8.2.11, 2026-11-28). An `explain` at `queryPlanner` reports no counts,
-      so this one can count only through `metrics.queryExecutor`, which
-      this server does not keep (RM-846 below); convert it when that
-      lands.
+      so this one can count only through `metrics.query.multiPlanner`,
+      which mongod moves for it (202 works at both sizes) and this server
+      does not keep (RM-856; `metrics.queryExecutor`, RM-846,
+      does not move for an explain at `queryPlanner`); convert it when
+      that lands.
       Backlog-ID: RM-728
       Verify: none -- a test-quality item: the behaviour is right on every run measured here; what is wrong is that the test can fail on timing alone
 
@@ -2952,29 +2895,33 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       Verify: tests/backlog/test_rm_found_2026_11_28_query_executor.py::test_a_find_moves_the_query_executor_counters_as_mongod
       Backlog-ID: RM-846
 
+- [ ] **A single-document `update` or `delete` that matches nothing tests its
+      filter a second time.** A filter that draws `$rand` answers differently
+      each time it runs, so the share of statements that match counts the
+      runs. Over 1,500 statements `{$and: [{k: i}, {$expr: {$lt: [{$rand: {}},
+      0.5]}}]}` (an unindexed `k`), mongod 8.2.11 matched 720 of `update`
+      and 715 of `delete` with `limit: 1`, half, as it tests each document
+      once; this server matched 1,133 and 1,125, three quarters: a statement
+      the first test turns away is tried again. `multi: true`, `limit: 0`
+      and `findAndModify` match half on both. A write that matches nothing
+      reads the collection twice. Found 2026-11-28 converting RM-391's test
+      to a count (RM-814).
+      Verify: tests/backlog/test_rm_found_2026_11_28_single_write_retest.py::test_a_single_update_or_delete_tests_a_miss_once
+      Backlog-ID: RM-855
 
-- [ ] **RM-391's regression test times mongod, and mongod's own `update`
-      went over the budget on CPU time (2026-11-26).**
-      `tests/backlog/test_rm_found_2026_11_07d.py::test_a_write_tests_each_document_once`
-      takes the median of five rounds of a write's `cpuNanos` over that of
-      a `find` of the same slow document, and expects both servers under
-      1.5. On pg-batch snapshot PR #3025 (run 45798379181, job
-      `mdb-binary (backlog)` 139834830441, head f2249990; a PG change
-      only) it read REGRESSED, and the assertion that failed was mongod's
-      (line 122, `theirs`): `update` came to 1.544, with finds 0.839,
-      0.517, 0.593, 0.555, 0.75 s and updates 1.295, 0.581, 0.539, 0.862,
-      1.502 s, so the per-round ratios ran from 0.91 to 2.0. The same
-      `find` on the same server took between 0.517 and 0.839 s of CPU, so on
-      a shared runner `cpuNanos` moves with the machine too, and a budget
-      halfway between one filter test and two leaves no margin for that.
-      Make the test count the work rather than time it, for example the
-      documents the write examined (`docsExamined` in its slow-query line
-      or the profiler) against the `find`'s, or the times a filter with a
-      countable effect ran, so that it can still fail on a server that
-      tests each document twice. RM-547 and RM-501's test (fixed, RM-803) are the same shape.
-      Reported by the PostgreSQL session; test code unchanged.
-      Verify: none -- intermittent on CI; the test itself is the check
-      Backlog-ID: RM-814
+- [ ] **RUST MongoDB server: `serverStatus` has no
+      `metrics.query.multiPlanner`.** mongod 8.2.11 counts every plan trial
+      there, `explain` at `queryPlanner` included, which reports no counts
+      of its own: `classicCount`, `classicNumPlans`, `classicWorks` and
+      `stoppingCondition.hitResultsLimit`. An `explain` at `queryPlanner` of
+      a `find` over `{a: {$gte: 0}, b: {$gte: 0}}` with limit 101 (indexes on
+      `a` and `b`) adds 1, 2, 202 and 2, over 10,000 documents and over
+      100,000 alike. This server's `metrics` has no `query.multiPlanner`
+      key. It is the count RM-728's explain test can compare in place of
+      the time the explain took (`metrics.queryExecutor`, RM-846, does not
+      move for an explain at `queryPlanner`). Found 2026-11-28.
+      Verify: tests/backlog/test_rm_found_2026_11_28_multiplanner_metrics.py::test_an_explain_at_query_planner_counts_its_trial_in_server_status
+      Backlog-ID: RM-856
 
 - [ ] **A write to a collection waits for a running write's whole statement.**
       mongod 8.2.11 lets a second writer update a document while a
@@ -3047,24 +2994,6 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       Backlog-ID: RM-727
       Verify: none -- PITR restore is this server's own tool, with no mongod counterpart to compare; reproduce with the test above using insert_many
 
-- [ ] **RM-808's `[killed]` test kills mongod before its store can be
-      opened by anyone.** `test_secantus_opens_a_standalone_mongod_store_in_both_modes[killed]`
-      SIGKILLs mongod right after `create_index` returns. Under load (the
-      gate's backlog step at `-n 4`, about one run in three) mongod has not
-      yet checkpointed: the catalog still holds `v_1` unfinished, and
-      `secantusd-mdb` refuses with `app.c's index v_1 is unfinished and
-      names no build UUID` (the test sees only `did not start: ''`).
-      mongod 8.2.11 cannot open that store either: it logs "Dropping
-      unfinished index" and stops on fatal assertion 40652 (no
-      featureCompatibilityVersion document). The test needs to wait for a
-      checkpoint before the kill (for example `fsync`), and the fixture to
-      print what the server said. (The refusal itself, mongod dropping
-      an unfinished index that has no build UUID where this server refused
-      the store, was RM-811 and is fixed: what remains is that mongod cannot
-      open the store.) Found 2026-11-26 in RM-644's gate.
-      Verify: none -- a test-timing race; reproduce with four parallel
-      runs of `tests/backlog/test_rm_storage_model.py` at `-n 4`
-      Backlog-ID: RM-812
 
 - [ ] **`count`, `distinct`, `update` and `delete` over an `_id` range of a
       clustered collection still plan through the `_id_` index.** A `find` is

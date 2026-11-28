@@ -204,13 +204,16 @@ def rust_mongo_server(store: Any, *extra_args: str) -> Iterator[Any]:
     try:
         assert proc.stdout is not None
         # A store that recovers says what it replayed before it listens.
-        line, m = "", None
+        line, m, said = "", None, []
         for _ in range(20):
             line = proc.stdout.readline()
+            said.append(line)
             m = _RS_BANNER.search(line)
             if m or not line:
                 break
-        assert m, f"secantusd-mdb did not start: {line!r}"
+        # Everything it said before the banner, so a refusal to open a store
+        # is read from the failure and not guessed at (RM-812).
+        assert m, f"secantusd-mdb did not start: {''.join(said)!r}"
         drain_output(proc)
         client = pymongo.MongoClient(
             host=m.group(1), port=int(m.group(2)), serverSelectionTimeoutMS=10_000
