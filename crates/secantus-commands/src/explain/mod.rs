@@ -2679,7 +2679,9 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             let sorted = s
                 .sort
                 .as_ref()
-                .filter(|d| !d.is_empty() && own_read && s.skip == 0 && !projected_find(s))
+                .filter(|d| {
+                    !d.is_empty() && own_read && (s.skip == 0 || s.limit == 0) && !projected_find(s)
+                })
                 .and_then(|d| {
                     d.iter()
                         .map(|(k, v)| match v {
