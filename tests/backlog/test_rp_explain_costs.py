@@ -80,6 +80,14 @@ _ANALYSED_THIRTY = _ANALYSED + [
     "analyze s",
 ]
 
+# Those, and a text column a quarter NULL (RP-1130).
+_ANALYSED_NULLS = _ANALYSED + [
+    "create table n (a int, b text)",
+    "insert into n select g, case when g % 4 = 0 then null else 'x' end"
+    " from generate_series(1, 1000) g",
+    "analyze n",
+]
+
 # Those, two analysed text columns -- a thousand distinct values and fifty
 # of mixed case -- and a table never analysed (RP-404).
 _ANALYSED_STRINGS = _ANALYSED + [
@@ -6837,10 +6845,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
         ],
     ),
-    # Measured on a private PostgreSQL 15.20 cluster (RP-1130, found while
-    # working RP-1032): the filter over the join, its rows the one a NULL test leaves.
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1130, fixed;
+    # found while working RP-1032): the filter was over the join, its
+    # rows the one a NULL test left, its NullTest costing nothing.
     "a left join filtered on its nullable side's other column is priced": (
-        "RP-1130",
+        "RP-1130:fixed",
         _ANALYSED,
         "explain select * from e left join e e2 on e.a = e2.a where e2.b is null",
         [
@@ -6852,11 +6861,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
-    # Measured on a private PostgreSQL 15.20 cluster (RP-1130, found while
-    # working RP-1032): the nullable side's expression key, a Hash Right
-    # Join hashing the preserved side.
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1130, fixed;
+    # found while working RP-1032): the nullable side's expression key
+    # was a Hash Right Join hashing the preserved side.
     "a left join on an expression key filtered on its nullable side's other column is priced": (
-        "RP-1130",
+        "RP-1130:fixed",
         _ANALYSED,
         "explain select * from e left join e e2 on e.a = e2.a + 1 where e2.b is null",
         [
@@ -6866,6 +6875,84 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
             "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1130, fixed):
+    # beside the NULL test, a restriction of the preserved side was pushed
+    # to its scan, which PostgreSQL then hashed.
+    "a left join filtered on its nullable side and restricted on its preserved side is priced": (
+        "RP-1130:fixed",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a = e2.a where e2.b is null and e.b = 'v1'",
+        [
+            "Hash Right Join  (cost=18.75..38.50 rows=1 width=14)",
+            "  Hash Cond: (e2.a = e.a)",
+            "  Filter: (e2.b IS NULL)",
+            "  ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=17.50..17.50 rows=100 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=7)",
+            "              Filter: (b = 'v1'::text)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1130, fixed): the
+    # filter's rows were the column's measured null fraction of the
+    # join's, here a quarter.
+    "a left join filtered on a nullable column holding nulls is priced": (
+        "RP-1130:fixed",
+        _ANALYSED_NULLS,
+        "explain select * from e left join n on e.a = n.a where n.b is null",
+        [
+            "Hash Left Join  (cost=27.50..56.25 rows=250 width=13)",
+            "  Hash Cond: (e.a = n.a)",
+            "  Filter: (n.b IS NULL)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=6)",
+            "        ->  Seq Scan on n  (cost=0.00..15.00 rows=1000 width=6)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1237, found while
+    # working RP-1130): an ON strict in the nullable column the WHERE tests
+    # IS NULL makes the join an anti join.
+    "a left join whose on restricts the nullable column its where tests is an anti join": (
+        "RP-1237",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a = e2.a and e2.b = 'v1' where e2.b is null",
+        [
+            "Hash Anti Join  (cost=18.75..45.49 rows=900 width=14)",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=17.50..17.50 rows=100 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..17.50 rows=100 width=7)",
+            "              Filter: (b = 'v1'::text)",
+        ],
+    ),
+    "a left join whose join filter reads the nullable column its where tests is an anti join": (
+        "RP-1237",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a = e2.a and e.b < e2.b where e2.b is null",
+        [
+            "Hash Anti Join  (cost=27.50..53.84 rows=667 width=14)",
+            "  Hash Cond: (e.a = e2.a)",
+            "  Join Filter: (e.b < e2.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on a private PostgreSQL 15.20 cluster (RP-1238, found while
+    # working RP-1130): the preserved side's own NULL test is its scan's
+    # filter, one row, which PostgreSQL hashes.
+    "a left join whose where tests its preserved side is null is priced": (
+        "RP-1238",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a = e2.a where e.b is null",
+        [
+            "Hash Right Join  (cost=15.01..33.77 rows=1 width=14)",
+            "  Hash Cond: (e2.a = e.a)",
+            "  ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1 width=7)",
+            "              Filter: (b IS NULL)",
         ],
     ),
     # Measured on PostgreSQL 15.19 (RP-1032, fixed): a text expression key

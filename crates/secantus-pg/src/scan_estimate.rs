@@ -507,29 +507,7 @@ impl PgHandler {
         // is that side's restriction (`distribute_qual_to_rels`), run in
         // its scan below the anti join: one the planner pushed, whole,
         // into the left leaf's filter, which prices it there (RP-1027).
-        let held_by_left = |c: &Document| {
-            let JoinNode::Leaf { plan, columns, .. } = left.as_ref() else {
-                return false;
-            };
-            let Statement::Select(leaf) = plan.as_ref() else {
-                return false;
-            };
-            let field = |k: &str| {
-                let (_, out) = columns.iter().find(|(ck, _)| ck == k)?;
-                let (_, f) = leaf.columns.iter().find(|(o, _)| o == out)?;
-                Some(f.clone())
-            };
-            let Some(c) = scan_fields(c, &field) else {
-                return false;
-            };
-            leaf.filter == c
-                || leaf
-                    .filter
-                    .get_array("$and")
-                    .is_ok_and(|items| items.iter().any(|i| i.as_document() == Some(&c)))
-                || matches!(c.iter().collect::<Vec<_>>().as_slice(), [(f, v)]
-                    if PushedConjuncts::new(&leaf.filter).holds(f, v))
-        };
+        let held_by_left = |c: &Document| held_by_leaf(left, c);
         let prefix = format!("{}{}", def.name, secantus_pgplan::joins::SEP);
         let mut key = None;
         for c in top_conjuncts(&sel.filter)? {
@@ -554,6 +532,93 @@ impl PgHandler {
                     .iter()
                     .any(|f| matches!(&f.kind, FilterKind::NotEqual(l, r) if l == k || r == k)));
         strict.then(|| k.clone())
+    }
+
+    /// The nullable side's columns a LEFT join's WHERE tests `IS NULL`
+    /// where none is the join's key (RP-1130): a null test is not strict,
+    /// so `reduce_outer_joins` leaves the join outer, and a qual over the
+    /// nullable side cannot drop below it (`distribute_qual_to_rels` delays
+    /// it to the join): the join's Filter, a `pushed_down` qual whose
+    /// selectivity scales the join's rows after the outer join's clamp
+    /// (`calc_joinrel_size_estimate`'s `pselec`). Each conjunct must be
+    /// such a test or, beside them, a restriction of the preserved side
+    /// pushed to its scan (as [`Self::left_anti_key`]'s), so no other qual
+    /// moves the join. Where the ON reads a tested column it is strict in
+    /// it, and the join is the anti join `reduce_outer_joins` makes of it:
+    /// not this shape.
+    pub(crate) fn left_null_filter(sel: &secantus_pgplan::Select) -> Option<Vec<String>> {
+        use secantus_pgplan::joins::{JoinKind, JoinNode};
+        use secantus_pgplan::Statement;
+        let Statement::JoinRows(j) = sel.sub.as_ref()?.plan.as_ref() else {
+            return None;
+        };
+        let JoinNode::Join {
+            kind: JoinKind::Left,
+            left,
+            right,
+            on: Some(on),
+            on_filters,
+            equi,
+            expr_keys,
+            ..
+        } = &j.tree
+        else {
+            return None;
+        };
+        let JoinNode::Leaf {
+            def, plan, columns, ..
+        } = right.as_ref()
+        else {
+            return None;
+        };
+        let Statement::Select(leaf) = plan.as_ref() else {
+            return None;
+        };
+        if sel.residual.is_some()
+            || !j.where_filters.is_empty()
+            || leaf.residual.is_some()
+            || Self::left_anti_key(sel).is_some()
+        {
+            return None;
+        }
+        // What the ON reads, its conjuncts the scan of the nullable side
+        // runs included.
+        let mut on_reads = std::collections::HashSet::new();
+        if !secantus_pgplan::joins::expr_reads(on, &mut on_reads) {
+            return None;
+        }
+        for f in on_filters {
+            if !secantus_pgplan::joins::expr_reads(&f.expr, &mut on_reads) {
+                return None;
+            }
+        }
+        let on_reads_key = |k: &str| {
+            on_reads.contains(k)
+                || equi.iter().any(|(l, r)| l == k || r == k)
+                || expr_keys.iter().any(|e| {
+                    e.left_column.as_deref() == Some(k) || e.right_column.as_deref() == Some(k)
+                })
+                || columns
+                    .iter()
+                    .find(|(ck, _)| ck == k)
+                    .and_then(|(_, out)| leaf.columns.iter().find(|(o, _)| o == out))
+                    .is_none_or(|(_, f)| filter_names(&leaf.filter, f))
+        };
+        let prefix = format!("{}{}", def.name, secantus_pgplan::joins::SEP);
+        let mut keys = Vec::new();
+        for c in top_conjuncts(&sel.filter)? {
+            match c.iter().collect::<Vec<_>>().as_slice() {
+                [(k, bson::Bson::Null)] if k.starts_with(&prefix) => {
+                    if on_reads_key(k) {
+                        return None;
+                    }
+                    keys.push((*k).clone());
+                }
+                _ if held_by_leaf(left, &c) => {}
+                _ => return None,
+            }
+        }
+        (!keys.is_empty()).then_some(keys)
     }
 
     pub(crate) fn nest_loop_estimate(
@@ -2422,7 +2487,9 @@ impl PgHandler {
             || sel.offset != 0
             || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
             || sel.with_ties
-            || (!j.where_modelled && Self::left_anti_key(sel).is_none())
+            || (!j.where_modelled
+                && Self::left_anti_key(sel).is_none()
+                && Self::left_null_filter(sel).is_none())
         {
             return None;
         }
@@ -2462,6 +2529,13 @@ impl PgHandler {
         // join, priced by the caller (RP-908); that WHERE is not pushed to
         // a scan.
         let anti = left_join && Self::left_anti_key(sel).is_some();
+        // One whose WHERE only tests its nullable side's other columns
+        // `IS NULL` stays a LEFT join, that WHERE its Filter (RP-1130).
+        let null_filter = if left_join {
+            Self::left_null_filter(sel)
+        } else {
+            None
+        };
         // A WHERE whose every conjunct is an expression comparison over
         // the preserved side is pushed to that side's scan and cannot
         // reduce the join (RP-423).
@@ -2474,6 +2548,7 @@ impl PgHandler {
         if left_join
             && !anti
             && !preserved_exprs
+            && null_filter.is_none()
             && (!sel.filter.is_empty() || sel.residual.is_some())
         {
             return None;
@@ -2736,11 +2811,21 @@ impl PgHandler {
         // joined keys: PostgreSQL pushes each down to that table's scan
         // (`distribute_qual_to_rels`), as it does a reduced LEFT join's
         // (RP-365). `None` for any other shape of filter.
-        let above_filter = if anti {
+        let above_filter = if anti || null_filter.is_some() {
             Vec::new()
         } else {
             joined_conjuncts(&sel.filter)?
         };
+        // A column only the Filter reads is evaluated at the join and
+        // carried by the nullable side's scan alone (`build_joinrel_tlist`
+        // leaves it out of the join's width): not modelled.
+        if null_filter
+            .iter()
+            .flatten()
+            .any(|k| !JoinRows::carries(project, k))
+        {
+            return None;
+        }
         // A side's scan, whichever of its columns is the key: the scan's
         // filter, ANDed from its own WHERE and this side's share of the
         // conjuncts above the join, and the fields it carries above the
@@ -2972,10 +3057,21 @@ impl PgHandler {
                 _ => 1.0 / 3.0,
             };
         }
+        // A LEFT join's `IS NULL` tests of its nullable side are quals
+        // delayed to the join (RP-1130): each checked on every pair the
+        // join clauses match, free (`cost_qual_eval` charges a `NullTest`
+        // nothing), and `nulltestsel` each, multiplied
+        // (`clauselist_selectivity`).
+        let mut pushed_selectivity = 1.0;
+        for k in null_filter.iter().flatten() {
+            let s = side(&right, k)?;
+            pushed_selectivity *= self.null_test_sel(&s.table, &s.field);
+        }
         let filter = JoinFilterCost {
-            count: filters.len(),
+            count: filters.len() + null_filter.as_ref().map_or(0, Vec::len),
             ops: filters.iter().map(|f| f.ops).sum(),
             selectivity,
+            pushed_selectivity,
         };
         Some((a, b, more, filter, left_join, target_width))
     }
@@ -4021,6 +4117,20 @@ impl PgHandler {
     /// (`get_variable_numdistinct`, its null fraction and MCV list).
     /// `None` where the column was never measured or its distinct count is
     /// the 200 default, which the estimates here do not model.
+    /// `nulltestsel` for `field IS NULL` over user table `table`
+    /// (RP-1130): the column's measured null fraction, `DEFAULT_UNK_SEL`
+    /// where no statistics row holds it.
+    fn null_test_sel(&self, table: &str, field: &str) -> f64 {
+        let stats = self
+            .storage
+            .count_matching(self.db(), table, &Document::new(), None)
+            .ok()
+            .and_then(|count| self.planner_table(table, count))
+            .and_then(|pt| Some(pt.analyzed.as_ref()?.get(field)?.as_ref()?.stats));
+        // `DEFAULT_UNK_SEL`.
+        stats.map_or(0.005, |s| f64::from(s.null_frac))
+    }
+
     fn analysed_key(&self, table: &str, field: &str) -> Option<AnalysedKey> {
         let count = self
             .storage
@@ -9521,7 +9631,7 @@ fn hash_join_of(
     if left_join {
         rows = rows.max(outer.rows);
     }
-    let rows = costsize::clamp_row_est(rows);
+    let rows = costsize::clamp_row_est(rows * filter.pushed_selectivity);
     let width = a.above + b.above;
     // The merge paths (RP-366): each side sorted from its scan, the
     // clause's tuples `approx_tuple_count`'s (the hash join's too). Not
@@ -10001,10 +10111,14 @@ fn unique_key_other_paths(
 /// they evaluate on each matched pair (`cost_qual_eval`), and their
 /// selectivity (`clauselist_selectivity`).
 #[derive(Debug, Clone, Copy)]
+/// `pushed_selectivity` is a LEFT join's WHERE quals delayed to it
+/// (RP-1130): `calc_joinrel_size_estimate`'s `pselec`, scaling the rows
+/// after the outer join's clamp to its preserved side.
 pub(crate) struct JoinFilterCost {
     pub(crate) count: usize,
     pub(crate) ops: f64,
     pub(crate) selectivity: f64,
+    pub(crate) pushed_selectivity: f64,
 }
 
 impl Default for JoinFilterCost {
@@ -10013,6 +10127,7 @@ impl Default for JoinFilterCost {
             count: 0,
             ops: 0.0,
             selectivity: 1.0,
+            pushed_selectivity: 1.0,
         }
     }
 }
@@ -10089,6 +10204,35 @@ fn bounds_only(filter: &Document, field: &str) -> bool {
         (_, bson::Bson::Document(d)) => !filter_names(d, field),
         _ => true,
     })
+}
+
+/// A WHERE conjunct over a LEFT join's preserved side alone that the
+/// planner pushed, whole, into that side's scan `left` (RP-1027): its
+/// restriction (`distribute_qual_to_rels`), priced in the scan.
+fn held_by_leaf(left: &secantus_pgplan::joins::JoinNode, c: &Document) -> bool {
+    use secantus_pgplan::joins::JoinNode;
+    use secantus_pgplan::Statement;
+    let JoinNode::Leaf { plan, columns, .. } = left else {
+        return false;
+    };
+    let Statement::Select(leaf) = plan.as_ref() else {
+        return false;
+    };
+    let field = |k: &str| {
+        let (_, out) = columns.iter().find(|(ck, _)| ck == k)?;
+        let (_, f) = leaf.columns.iter().find(|(o, _)| o == out)?;
+        Some(f.clone())
+    };
+    let Some(c) = scan_fields(c, &field) else {
+        return false;
+    };
+    leaf.filter == c
+        || leaf
+            .filter
+            .get_array("$and")
+            .is_ok_and(|items| items.iter().any(|i| i.as_document() == Some(&c)))
+        || matches!(c.iter().collect::<Vec<_>>().as_slice(), [(f, v)]
+                if PushedConjuncts::new(&leaf.filter).holds(f, v))
 }
 
 fn filter_names(filter: &Document, field: &str) -> bool {
