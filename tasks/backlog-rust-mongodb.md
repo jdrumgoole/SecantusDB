@@ -800,9 +800,9 @@ These are explicit non-goals. Don't add them without a reason.
       - the other aggregates (since 2026-11-19 a `$sort` closing stages
         that pass one document on for each, `$addFields`, `$set`, `$unset`,
         `$project`, `$replaceRoot`, `$replaceWith`, over a classic read is
-        counted, and since 2026-11-27 with a `$limit` after the `$sort`):
-        a classic `$group` or
-        `$count` after such stages (12 for 300 documents), a `$sample`
+        counted, since 2026-11-27 with a `$limit` after the `$sort`, and
+        since 2026-11-28 a classic `$group` or `$count` closing such
+        stages): a `$group` or `$count` with stages after it, a `$sample`
         (4), one with a `$match` or `$redact` left after
         its read, a `$lookup`,
         `$unionWith`, `$facet`, `$geoNear` or `$out` / `$merge`, a `$group`

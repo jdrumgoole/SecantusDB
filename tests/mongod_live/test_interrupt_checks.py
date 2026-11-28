@@ -40,7 +40,9 @@ tick for each document the `$sort` pulls from it, each it passes on, and
 each end found; so does a `$sort` after stages that pass one document on
 for each they take (`$addFields`, `$set`, `$unset`, `$project`,
 `$replaceRoot`, `$replaceWith`), each of them pulled once per document and
-once more for the end, a `$limit` after the `$sort` folding into it.
+once more for the end, a `$limit` after the `$sort` folding into it; and
+a classic `$group` or `$count` after such stages, which pulls them as a
+limited `$sort` does.
 
 What this server does not count yet prints no field, and is RM-360's
 remainder: plans with several candidates, the pipelines it does not model,
@@ -507,6 +509,39 @@ PIPELINES: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any], tuple[str
                 }
             ]
         ),
+        _PIPELINE,
+    ),
+    # A classic `$group` or `$count` closing stages that pass one document
+    # on for each pulls every document through them, as a limited `$sort`
+    # does, and passes its groups on (measured 8.2.11, 2026-11-28).
+    "aggregate counting after an $addFields": (
+        _documents(300),
+        _pipeline([_ADD, {"$count": "n"}]),
+        _PIPELINE,
+    ),
+    "aggregate counting after an $addFields, one buffer": (
+        _documents(20),
+        _pipeline([_ADD, {"$count": "n"}]),
+        _PIPELINE,
+    ),
+    "aggregate counting after a $set and $unset": (
+        _documents(300),
+        _pipeline([{"$set": {"w": 1}}, {"$unset": "a"}, {"$count": "n"}]),
+        _PIPELINE,
+    ),
+    "aggregate grouping after an $addFields, three groups": (
+        _documents(300),
+        _pipeline([_ADD, {"$group": {"_id": "$y"}}]),
+        _PIPELINE,
+    ),
+    "aggregate grouping after an $addFields, a group each": (
+        _documents(300),
+        _pipeline([_ADD, {"$group": {"_id": "$_id"}}]),
+        _PIPELINE,
+    ),
+    "aggregate grouping after an $addFields, batches of 40": (
+        _documents(300),
+        _pipeline([_ADD, {"$group": {"_id": "$_id"}}], batchSize=40),
         _PIPELINE,
     ),
 }

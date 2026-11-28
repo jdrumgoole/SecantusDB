@@ -7796,13 +7796,29 @@ fn sort_after_cursor_stage(
             limited = true;
         }
     }
-    let (sort, between) = rest.split_last()?;
+    // A `$group` or `$count` closing such stages, run classic, pulls every
+    // document through them as a limited `$sort` does, and passes on its
+    // groups (measured 8.2.11 2026-11-28: `[{$addFields}, {$group}]` of
+    // 300 documents in 3 groups 12, in 300 groups 14 and a `getMore` of 4;
+    // `[{$addFields}, {$count}]` 12).
     let one_for_one = |s: &Bson| {
         matches!(
             name(s).as_str(),
             "$project" | "$unset" | "$addFields" | "$set" | "$replaceRoot" | "$replaceWith"
         ) && !crate::agg_stream::mentions_meta(s)
     };
+    if let (false, Some((last, front))) = (limited, rest.split_last()) {
+        if matches!(name(last).as_str(), "$group" | "$count")
+            && !crate::agg_stream::mentions_meta(last)
+            && !front.is_empty()
+            && front.iter().all(one_for_one)
+            && query.skip == 0
+            && query.limit == 0
+        {
+            return Some((front.len(), true));
+        }
+    }
+    let (sort, between) = rest.split_last()?;
     (query.skip == 0
         && query.limit == 0
         && (!between.is_empty() || query.projection_stage.is_some())
