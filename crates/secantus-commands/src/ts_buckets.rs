@@ -306,16 +306,44 @@ pub(crate) struct BucketScan {
     filter: Document,
     /// The `_id` of the last bucket buffered.
     after: Option<[u8; 12]>,
-    /// The index over the buckets the scan reads in the order of, and the
-    /// last entry it reached and the buckets it has met (a multikey index
-    /// holds a bucket more than once).
-    index: Option<IndexPosition>,
+    /// The index scans over the buckets the scan reads in the order of: one
+    /// for an IXSCAN, the children of an `OR` in turn for a union (RM-701).
+    indexes: Vec<IndexPosition>,
+    /// The scan [`Self::indexes`] is reading.
+    at: usize,
+    /// The buckets it has met (a multikey index holds a bucket more than
+    /// once, and an `OR` returns a bucket once from its children).
+    seen: std::collections::HashSet<RecordId>,
 }
 
+/// One index scan of a [`BucketScan`], and the last entry it reached.
 struct IndexPosition {
     name: String,
     last: Option<(Vec<u8>, RecordId)>,
-    seen: std::collections::HashSet<RecordId>,
+    /// The scan's bounds: per key field, the intervals an entry's value
+    /// lies in; none for a scan of the whole index.
+    bounds: Option<Vec<Vec<EncodedInterval>>>,
+    /// What the scan's stage rechecks on each bucket it fetches.
+    filters: Vec<Document>,
+}
+
+/// An interval of one key field, as the index's sort-key encodings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EncodedInterval {
+    pub lo: Vec<u8>,
+    pub lo_incl: bool,
+    pub hi: Vec<u8>,
+    pub hi_incl: bool,
+}
+
+/// One child of an `OR` over indexes of the buckets (mongod's plan for an
+/// `$or` whose every branch an index answers): the index, its bounds, and
+/// what is rechecked on a bucket it returns.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct UnionScan {
+    pub index: String,
+    pub bounds: Vec<Vec<EncodedInterval>>,
+    pub filters: Vec<Document>,
 }
 
 /// What one refill of a [`BucketScan`] buffered.
@@ -358,7 +386,9 @@ impl BucketScan {
             layout,
             filter,
             after: None,
-            index: None,
+            indexes: Vec::new(),
+            at: 0,
+            seen: Default::default(),
         }))
     }
 
@@ -384,11 +414,52 @@ impl BucketScan {
         {
             return Ok(None);
         }
-        self.index = Some(IndexPosition {
+        self.indexes = vec![IndexPosition {
             name: name.to_string(),
             last: None,
-            seen: Default::default(),
-        });
+            bounds: None,
+            filters: Vec::new(),
+        }];
+        Ok(Some(self))
+    }
+
+    /// This scan read as mongod's `OR` of the index scans `children`, one
+    /// after the other, each bucket once (RM-701); `None` when the buckets
+    /// hold no such index or the store cannot stream it.
+    pub(crate) fn through_union(
+        mut self,
+        storage: &dyn crate::storage::Storage,
+        children: &[UnionScan],
+    ) -> Result<Option<BucketScan>, crate::storage::StorageError> {
+        let ns = crate::ts_store::buckets_ns(&self.coll);
+        let listed = storage.list_indexes(&self.db, &ns)?;
+        let mut positions = Vec::with_capacity(children.len());
+        for child in children {
+            if !listed
+                .iter()
+                .any(|ix| ix.get_str("name") == Ok(child.index.as_str()))
+                || storage
+                    .index_entries_from(
+                        &self.db,
+                        &ns,
+                        &child.index,
+                        IndexFrom::Edge,
+                        None,
+                        0,
+                        false,
+                    )?
+                    .is_none()
+            {
+                return Ok(None);
+            }
+            positions.push(IndexPosition {
+                name: child.index.clone(),
+                last: None,
+                bounds: Some(child.bounds.clone()),
+                filters: child.filters.clone(),
+            });
+        }
+        self.indexes = positions;
         Ok(Some(self))
     }
 
@@ -423,7 +494,7 @@ impl BucketScan {
         want: usize,
         max_bytes: usize,
     ) -> Result<Buffered, CommandError> {
-        if self.index.is_some() {
+        if !self.indexes.is_empty() {
             return self.next_indexed(storage, want, max_bytes);
         }
         let rows = crate::ts_store::stored_bucket_bytes(storage, &self.db, &self.coll)?;
@@ -466,8 +537,8 @@ impl BucketScan {
 }
 
 impl BucketScan {
-    /// [`Self::next_buffer`] through the index: its entries from the last
-    /// one reached, each bucket fetched as it is now.
+    /// [`Self::next_buffer`] through the indexes: the entries of each from
+    /// the last one reached, in turn, each bucket fetched as it is now.
     fn next_indexed(
         &mut self,
         storage: &dyn crate::storage::Storage,
@@ -487,7 +558,7 @@ impl BucketScan {
             if count >= want || (count > 0 && bytes > max_bytes) {
                 return Ok(out);
             }
-            let Some(pos) = self.index.as_mut() else {
+            let Some(pos) = self.indexes.get(self.at) else {
                 out.exhausted = true;
                 return Ok(out);
             };
@@ -500,22 +571,31 @@ impl BucketScan {
                 .map_err(err)?
                 .unwrap_or_default();
             if entries.is_empty() {
-                out.exhausted = true;
-                return Ok(out);
+                // This scan is done: an `OR` goes on with the next child.
+                self.at += 1;
+                continue;
             }
             let mut stopped = false;
-            for IndexEntry { resume, rid, .. } in entries {
+            for IndexEntry { raw, resume, rid } in entries {
                 if count >= want || (count > 0 && bytes > max_bytes) {
                     stopped = true;
                     break;
                 }
-                let pos = self.index.as_mut().expect("indexed scan");
+                let pos = &mut self.indexes[self.at];
                 pos.last = Some((resume, rid.clone()));
-                if !pos.seen.insert(rid.clone()) {
+                // An entry outside the scan's bounds is not read.
+                if pos.bounds.as_ref().is_some_and(|b| !within(&raw, b)) {
+                    continue;
+                }
+                // A scan alone returns a multikey index's bucket once; an
+                // `OR` returns a bucket from its children once, after the
+                // child's own recheck.
+                let single = self.indexes.len() == 1;
+                if single && !self.seen.insert(rid.clone()) {
                     continue;
                 }
                 let Some(Some(raw)) = storage
-                    .records_by_id(&self.db, &ns, &[rid])
+                    .records_by_id(&self.db, &ns, std::slice::from_ref(&rid))
                     .map_err(err)?
                     .and_then(|mut v| v.pop())
                 else {
@@ -524,7 +604,11 @@ impl BucketScan {
                 out.examined += 1;
                 let document = secantus_core::bsondoc::from_bytes(&raw[..])
                     .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))?;
-                if !self.filter.is_empty() && !bucket_matches(&document, &self.filter)? {
+                let mut passes = self.filter.is_empty() || bucket_matches(&document, &self.filter)?;
+                for f in &self.indexes[self.at].filters {
+                    passes = passes && bucket_matches(&document, f)?;
+                }
+                if !passes || (!single && !self.seen.insert(rid)) {
                     continue;
                 }
                 bytes += raw.len();
@@ -541,6 +625,32 @@ impl BucketScan {
             }
         }
     }
+}
+
+/// Whether an index entry (`raw`: its key fields' ascending sort-key
+/// encodings joined by the compound separator) lies within `bounds`, the
+/// intervals each key field's value must fall in.
+fn within(raw: &[u8], bounds: &[Vec<EncodedInterval>]) -> bool {
+    let Some(fields) = secantus_core::sortkey::split_directed(raw, &vec![1; bounds.len()]) else {
+        // Not a key this reads: leave the entry to the recheck.
+        return true;
+    };
+    fields.iter().zip(bounds).all(|(value, intervals)| {
+        let value: &[u8] = value;
+        intervals.iter().any(|i| {
+            let above = match value.cmp(&i.lo[..]) {
+                Ordering::Greater => true,
+                Ordering::Equal => i.lo_incl,
+                Ordering::Less => false,
+            };
+            above
+                && match value.cmp(&i.hi[..]) {
+                    Ordering::Less => true,
+                    Ordering::Equal => i.hi_incl,
+                    Ordering::Greater => false,
+                }
+        })
+    })
 }
 
 /// Whether bucket document `bucket` passes the bucket-level filter. The
@@ -725,6 +835,37 @@ mod tests {
         Layout::of(&doc! {"timeseries": {"timeField": "t", "metaField": "m",
         "granularity": "seconds", "bucketMaxSpanSeconds": 3600}})
         .unwrap()
+    }
+
+    /// An index entry is read by a scan when each key field lies in one of
+    /// its intervals (RM-701).
+    #[test]
+    fn an_entry_is_within_the_bounds_of_its_scan() {
+        let key = |v: i32, w: i32| {
+            let mut raw = secantus_core::sortkey::encode_value(&Bson::Int32(v), None).unwrap();
+            raw.extend_from_slice(secantus_core::sortkey::COMPOUND_SEP);
+            raw.extend(secantus_core::sortkey::encode_value(&Bson::Int32(w), None).unwrap());
+            raw
+        };
+        let enc = |v: Bson| secantus_core::sortkey::encode_value(&v, None).unwrap();
+        let bounds = vec![
+            vec![EncodedInterval {
+                lo: enc(Bson::MinKey),
+                lo_incl: true,
+                hi: enc(Bson::Int32(100)),
+                hi_incl: false,
+            }],
+            vec![EncodedInterval {
+                lo: enc(Bson::MinKey),
+                lo_incl: true,
+                hi: enc(Bson::MaxKey),
+                hi_incl: true,
+            }],
+        ];
+        assert!(within(&key(5, 3000), &bounds));
+        assert!(within(&key(99, 0), &bounds));
+        assert!(!within(&key(100, 0), &bounds));
+        assert!(!within(&key(4000, 1), &bounds));
     }
 
     /// The bucket-level filter's `$_internalExpr*` comparisons: across

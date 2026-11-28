@@ -617,14 +617,15 @@ def test_a_time_series_or_read_beside_an_index_of_its_own_matches_mongod(
     )
 
 
-@pytest.mark.backlog("RM-701")
+@pytest.mark.backlog_fixed("RM-701")
 def test_a_hinted_time_series_read_under_a_collation_scans_the_collated_index(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """With a collated index `{v: 1}` (`en`), a hint to it and a read of
     `v < 100` under that collation is an index scan over the buckets: mongod
-    8.2.11 leaves 63 after the delete (3 of 3 runs); this server reads the
-    collection whole under a collation and a hint, 99."""
+    8.2.11 leaves 63 after the delete (3 of 3 runs), and this server did too
+    once the hinted scan was read under a collation: it had read the
+    collection whole, 99."""
 
     def read(c: Any) -> Any:
         return c.aggregate(
@@ -639,13 +640,14 @@ def test_a_hinted_time_series_read_under_a_collation_scans_the_collated_index(
     assert _after_delete_setup(rust_mongo, setup, read) == want
 
 
-@pytest.mark.backlog("RM-701")
+@pytest.mark.backlog_fixed("RM-701")
 def test_a_time_series_or_read_across_two_indexes_of_its_own_scans_them_as_mongod(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """`{$or: [{v: {$lt: 100}}, {w: {$lt: 100}}]}` beside `{v: 1}` and
     `{w: 1}` is a union of the two index scans under a SUBPLAN: mongod 8.2.11
-    leaves 112 after the delete (3 of 3 runs); this server reads the
+    leaves 112 after the delete (3 of 3 runs), and so does this server
+    since it reads the `OR` of the two scans in turn: it had read the
     collection whole, 184."""
 
     def read(c: Any) -> Any:
@@ -682,3 +684,104 @@ def test_a_time_series_meta_and_time_read_is_tried_against_the_clustered_scan(
     want = _after_delete_setup(mongod, nothing, read)
     assert want == 2399
     assert _after_delete_setup(rust_mongo, nothing, read) == want
+
+
+@pytest.mark.backlog_fixed("RM-701")
+@pytest.mark.parametrize(
+    ("hint", "collation", "match"),
+    [
+        ("m_1_t_1", {"locale": "en"}, {"v": {"$lt": 100}}),
+        ("m_1_t_1", {"locale": "en"}, {"m": {"$lt": 40}, "v": {"$lt": 100}}),
+        ("v_1", None, {"v": {"$lt": 100}}),
+        ("v_1", {"locale": "en", "strength": 2}, {"v": {"$lt": 100}}),
+        ("v_1", {"locale": "en"}, {"v": {"$gte": 3900}}),
+    ],
+    ids=str,
+)
+def test_a_hinted_time_series_read_beside_a_collated_index_matches_mongod(
+    rust_mongo: Any, mongod: Any, hint: str, collation: Any, match: dict[str, Any]
+) -> None:
+    """A hint to an index over the buckets, collated or not, under a collation
+    that is, or is not, the index's: the buckets' access is the hinted
+    index's scan, as mongod 8.2.11 reads it."""
+
+    def read(c: Any) -> Any:
+        options: dict[str, Any] = {"hint": hint, "batchSize": 1}
+        if collation:
+            options["collation"] = collation
+        return c.aggregate([{"$match": match}], **options)
+
+    def setup(db: Any, c: Any) -> None:
+        c.create_index("v", collation={"locale": "en"})
+
+    assert _after_delete_setup(rust_mongo, setup, read) == _after_delete_setup(mongod, setup, read)
+
+
+@pytest.mark.backlog_fixed("RM-701")
+@pytest.mark.parametrize(
+    "match",
+    [
+        {"$or": [{"v": {"$lt": 100}}, {"w": {"$lt": 100}}]},
+        {"$or": [{"w": {"$lt": 100}}, {"v": {"$lt": 100}}]},
+        {"$or": [{"v": {"$lt": 100}}, {"w": {"$in": [5, 9, 3999]}}]},
+        {"$or": [{"v": 5}, {"w": {"$lt": 100}}, {"v": {"$lt": 20}}]},
+        {"$or": [{"v": {"$lt": 100}}, {"w": {"$lt": 100}}, {"v": {"$lt": 3000, "$gt": 2900}}]},
+        {"$or": [{"v": {"$lt": 2000}}, {"w": {"$lt": 2000}}]},
+        {"$or": [{"v": {"$lt": 100}}, {"w": {"$lt": 100}}, {"m": 3}]},
+    ],
+    ids=str,
+)
+def test_a_time_series_or_read_across_two_indexes_matches_mongod(
+    rust_mongo: Any, mongod: Any, match: dict[str, Any]
+) -> None:
+    """An `$or` read beside `{v: 1}` and `{w: 1}`: an `OR` of the index scans
+    each to its end in turn, or what mongod 8.2.11 plans for the shapes
+    it does not take that way."""
+
+    def read(c: Any) -> Any:
+        return c.aggregate([{"$match": match}], batchSize=1)
+
+    setup = _own_index("v", "w")
+    assert _after_delete_setup(rust_mongo, setup, read) == _after_delete_setup(mongod, setup, read)
+
+
+@pytest.mark.backlog("RM-701")
+def test_a_time_series_or_read_beside_a_meta_filter_is_tried_against_the_default_index(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """`m < 40` with the `$or` of `v < 100` and `w < 100` beside `{v: 1}` and
+    `{w: 1}` has two plans for mongod 8.2.11 (the default index's scan with
+    the `$or` as its filter, and the `OR` of the two scans under a FETCH of
+    the meta filter) and runs a trial between them: the default index's
+    wins, `rejectedPlans: 1`, and 144 measurements are left after the
+    delete (3 of 3 runs). This server reads the collection whole, 112."""
+
+    def read(c: Any) -> Any:
+        match = {"m": {"$lt": 40}, "$or": [{"v": {"$lt": 100}}, {"w": {"$lt": 100}}]}
+        return c.aggregate([{"$match": match}], batchSize=1)
+
+    setup = _own_index("v", "w")
+    want = _after_delete_setup(mongod, setup, read)
+    assert want == 144
+    assert _after_delete_setup(rust_mongo, setup, read) == want
+
+
+@pytest.mark.backlog("RM-701")
+def test_a_time_series_or_read_with_a_branch_of_two_indexes_matches_mongod(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """A branch of the `$or` that two indexes could answer (`{v: 1}` and
+    `{v: 1, w: 1}`) is a trial of its own for mongod 8.2.11, which this
+    planner does not run: the read is as mongod's."""
+
+    def read(c: Any) -> Any:
+        return c.aggregate(
+            [{"$match": {"$or": [{"v": {"$lt": 100}}, {"w": {"$lt": 100}}]}}], batchSize=1
+        )
+
+    def setup(db: Any, c: Any) -> None:
+        c.create_index("v")
+        c.create_index("w")
+        c.create_index([("v", 1), ("w", 1)])
+
+    assert _after_delete_setup(rust_mongo, setup, read) == _after_delete_setup(mongod, setup, read)

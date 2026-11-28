@@ -776,8 +776,7 @@ fn time_series(
     // each batch matched under it. A string bound would prune buckets on
     // `control.min` / `control.max`, which compare without the collation,
     // and an index over the buckets carries the simple one: read whole.
-    if ask.collation.is_some() && (hinted.is_some() || has_string(&Bson::Document(filter.clone())))
-    {
+    if ask.collation.is_some() && has_string(&Bson::Document(filter.clone())) {
         return Ok(None);
     }
     let Some(scan) = crate::ts_buckets::BucketScan::of(storage, ask.db, ask.coll, ask.ns, &filter)?
@@ -786,7 +785,8 @@ fn time_series(
     };
     // A filter on the meta field is mongod's scan of the default index
     // over the buckets (RM-457).
-    if ask.collation.is_some() && scan.filters_meta() {
+    // (a hint to the index reads it all the same: RM-701).
+    if ask.collation.is_some() && hinted.is_none() && scan.filters_meta() {
         return Ok(None);
     }
     let through = |name: &str, scan: crate::ts_buckets::BucketScan| {
@@ -816,6 +816,12 @@ fn time_series(
                 Some(scan) => scan,
                 None => return Ok(None),
             },
+            crate::explain::BucketAccess::Union(children) => {
+                match scan.through_union(storage, &children).map_err(read_error)? {
+                    Some(scan) => scan,
+                    None => return Ok(None),
+                }
+            }
             crate::explain::BucketAccess::Unsure => return Ok(None),
         }
     } else {
