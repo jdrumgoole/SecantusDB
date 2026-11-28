@@ -24,6 +24,7 @@ mod join_alias;
 mod join_removal;
 mod pg_regex;
 mod record_image;
+mod regcomp;
 pub mod regex_flavour;
 mod relabel;
 mod set_op_locations;
@@ -18747,6 +18748,7 @@ fn srf_rows(
             let (source, pattern) = (text(&a[0]), text(&a[1]));
             let flags = a.get(2).map(text).unwrap_or_default();
             builtins::check_regex_flags(&flags)?;
+            regcomp::check(&pattern, regcomp::options_cflags(&flags))?;
             let re = pg_regex::PgRegex::new(&regex_flavour::compile_source(
                 &pattern,
                 regex_flavour::ReFlags::options(&flags),
@@ -40815,6 +40817,7 @@ fn regexp_replace(args: &[Bson]) -> Result<Bson> {
     let pattern = text(&args[1])?;
     let replacement = text(&args[2])?;
     let flags = args.get(3).map(text).transpose()?.unwrap_or_default();
+    regcomp::check(&pattern, regcomp::options_cflags(&flags))?;
     let builder = regex_flavour::compile_source(&pattern, regex_flavour::ReFlags::options(&flags));
     let re = pg_regex::PgRegex::new(&builder)
         .map_err(|_| Error::InvalidRegex(format!("invalid regular expression: \"{pattern}\"")))?;
@@ -51845,6 +51848,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             let (Bson::String(subject), Bson::String(pattern)) = (&subject, &pattern) else {
                 return Ok(Bson::Null);
             };
+            regcomp::check(pattern, regcomp::ADVANCED)?;
             let re = regex::Regex::new(&regex_flavour::compile_source(
                 pattern,
                 regex_flavour::ReFlags::operator(false),
@@ -53392,6 +53396,7 @@ fn eval_pattern_match_const(e: &AExpr, params: &[Bson]) -> Result<Bson> {
             source
         }
     } else {
+        regcomp::check(pattern, regcomp::ADVANCED)?;
         regex_flavour::compile_source(pattern, regex_flavour::ReFlags::operator(insensitive))
     };
     let re = pg_regex::PgRegex::new(&source)
@@ -53482,6 +53487,10 @@ fn lower_pattern_match(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Doc
     let regex = if is_like {
         like_to_regex(&pattern, escape)?
     } else {
+        // The planner compiles the regex for its fixed prefix
+        // (`regex_fixed_prefix`), so an invalid one is refused before any
+        // row is read, EXPLAIN included.
+        regcomp::check(&pattern, regcomp::ADVANCED)?;
         regex_flavour::compile_source(&pattern, regex_flavour::ReFlags::operator(insensitive))
     };
     let mut spec = doc! { "$regex": regex };

@@ -577,6 +577,8 @@ impl Parser<'_> {
                 }
                 flags = f;
             }
+            // `makeItemLikeRegex` compiles the regex as the path is read.
+            crate::regcomp::check(&pattern, crate::regcomp::jsonpath_cflags(&flags))?;
             return Ok(Node::new(Item::LikeRegex(Box::new(l), pattern, flags)));
         }
         Ok(l)
