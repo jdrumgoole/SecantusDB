@@ -1916,22 +1916,6 @@ differs on none (re-measured 2026-11-09 after RM-454; 1 earlier that day, 2 on 2
 mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
-- [ ] **RUST MongoDB server: an `$expr` `$or` over a renamed field after a
-      `$changeStream` joins the oplog filter, but not as mongod 8.2.11
-      prints it.** RM-452 and RM-698's eleven slices (2026-11-23 to
-      2026-11-28) ported mongod's rewrite of every event field into the
-      oplog filter, with `$type`, `$regex`, `$size` and an `$in` holding a
-      regex cloned onto each renamed path. Left: `expr_twins` derives no
-      `$_internalExpr*` twin from an `$expr` `$or`
-      (`{$expr: {$or: [{$eq: ["$txnNumber", 1]}, {$eq: ["$txnNumber", 2]}]}}`
-      reads with another hash than mongod's), where mongod's `RewriteExpr`
-      does; an `$or` mixing `documentKey` and `operationType` already
-      matches. A null-matching predicate on `updateDescription` that is not
-      only null (`removedFields: {$in: ["a", null]}`) mongod drops, and so
-      does this server, by a "matches only null" test built from probes, not
-      a port of mongod's code (found working RM-452).
-      Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_an_expr_or_on_a_renamed_field_joins_the_oplog_filter_as_mongod_does
-      Backlog-ID: RM-698
 - [ ] **RUST MongoDB server: the Boolean simplifier differs from mongod's
       on about 0.3 percent of random trees, and on nested `$nor`.** The
       simplifier (`crates/secantus-commands/src/explain/simplify.rs`, RM-774)

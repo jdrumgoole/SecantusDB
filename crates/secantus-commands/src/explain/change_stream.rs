@@ -1697,7 +1697,7 @@ fn rewrite_agg(e: &Bson, inexact: bool, fields: Fields) -> Option<Bson> {
 
 /// The `$_internalExpr*` twins mongod's `RewriteExpr` derives from an
 /// expression: a comparison of a field path and a constant (not an array),
-/// or an `$and` of them. A rewritten path that is no plain field (a
+/// or an `$and` or `$or` of them. A rewritten path that is no plain field (a
 /// `$switch`, a `$let`) derives none.
 fn expr_twins(e: &Document) -> Vec<M> {
     let Some((op, args)) = e.iter().next().filter(|_| e.len() == 1) else {
@@ -1712,6 +1712,23 @@ fn expr_twins(e: &Document) -> Vec<M> {
                 .collect(),
             _ => Vec::new(),
         };
+    }
+    if op == "$or" {
+        // mongod's `_rewriteOrExpression`: an `$or` of each child's twins,
+        // or none when a child derives none.
+        let Bson::Array(a) = args else {
+            return Vec::new();
+        };
+        let mut any = Vec::with_capacity(a.len());
+        for child in a {
+            let mut t = child.as_document().map(expr_twins).unwrap_or_default();
+            match t.len() {
+                0 => return Vec::new(),
+                1 => any.push(t.remove(0)),
+                _ => any.push(M::And(t)),
+            }
+        }
+        return vec![M::Or(any)];
     }
     let kind = |flipped: bool| match (op.as_str(), flipped) {
         ("$eq", _) => Some(Leaf::ExprEq),
