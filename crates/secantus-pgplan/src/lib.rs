@@ -11998,7 +11998,12 @@ fn plan_create_index(
             }
             _ => String::new(),
         };
-        key_sql.push(format!("{}{collate_sql}{opclass_sql}{suffix}", e.name));
+        // ruleutils prints a column key through `quote_identifier`:
+        // `"Big Y" DESC` (RP-1082).
+        key_sql.push(format!(
+            "{}{collate_sql}{opclass_sql}{suffix}",
+            scalar::quote_identifier(&e.name)
+        ));
         // A key under a NONDETERMINISTIC collation is kept by its sort key,
         // so a UNIQUE index refuses what the collation calls equal
         // (`Apple` / `apple` under a case-insensitive one).
@@ -12015,7 +12020,8 @@ fn plan_create_index(
                 ));
                 any_expression = true;
             }
-            None => expressions.push(e.name.clone()),
+            // SQL text, planned as an expression: `"Big Y"`, not `Big Y`.
+            None => expressions.push(scalar::quote_identifier(&e.name)),
         }
         columns.push((e.name.clone(), desc));
     }

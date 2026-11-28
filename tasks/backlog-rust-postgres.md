@@ -3669,15 +3669,25 @@ tests are in `tests/backlog/test_rp_found_rp1091.py`.
 Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
 test is in `tests/backlog/test_rp_found_rp860.py`.
 
-- [ ] **`pg_get_indexdef` prints a plain key column, and an INCLUDE
-      column, unquoted.** `create index i on t ("Big Y" desc) include ("W
-      w")` prints `btree ("Big Y" DESC) INCLUDE ("W w")` on PostgreSQL
-      15.19; here `btree (Big Y DESC) INCLUDE (W w)`. The key text comes
-      from the bare name (`created_index_def`, and `key_sql` in the
-      planner's CREATE INDEX), where ruleutils prints
-      `quote_identifier(attname)`; an expression key already quotes.
-      Verify: tests/backlog/test_rp_found_rp860.py::test_pg_get_indexdef_quotes_a_key_and_an_include_column
-      Backlog-ID: RP-1082
+
+## Found while working RP-1082 (2026-11-28)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
+test is in `tests/backlog/test_rp_found_rp860.py`.
+
+- [ ] **A CREATE INDEX that fails while building its entries leaves the
+      index behind.** `create table d (a int); insert into d values (1);
+      create index dz on d ((10 / (a - 1)))` is 22012 `division by zero`
+      on PostgreSQL 15.19 and no index exists after it; `secantusd-pg`
+      gives the same error but `dz` stays in `pg_indexes`. A UNIQUE build
+      refused for a duplicate (23505) does clean up, so the leak is on the
+      path where computing a row's key errors. Before RP-1082, a quoted
+      plain key in an expression index (`(lower(b), "Big Y")`) failed this
+      way and every later INSERT on the table failed the same as the
+      CREATE; a key that errors only on some rows may do the same.
+      Found while working RP-1082.
+      Verify: tests/backlog/test_rp_found_rp860.py::test_a_failed_index_build_leaves_no_index
+      Backlog-ID: RP-1232
 
 ## Found while working RP-751 (2026-11-10)
 
