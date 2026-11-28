@@ -247,19 +247,52 @@ def _with_d(client: Any, run: Any) -> list:
     return list(col.aggregate([{"$planCacheStats": {}}]))
 
 
-@pytest.mark.backlog("RM-694")
+@pytest.mark.backlog_fixed("RM-694")
 def test_an_object_elem_match_entry_reports_its_size(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 sizes the entry for `{a: {$lt: 5}, d: {$elemMatch: {e:
-    3}}}` over `a_1`, `b_1` and `d.e_1` at 3230 on macOS arm64; this server
-    leaves `estimatedSizeBytes` out."""
+    3}}}` over `a_1`, `b_1` and `d.e_1` at 3230 on macOS arm64 (read from
+    `a_1`), and at 3656 with `a: {$lt: 50}` (read from `d.e_1`); this server
+    left `estimatedSizeBytes` out of both."""
     only_on("darwin", why="RM-341 sizes entries with macOS arm64's layout")
     only_on("arm64", why="RM-341 sizes entries with macOS arm64's layout")
-    q = {"a": {"$lt": 5}, "d": {"$elemMatch": {"e": 3}}}
+    queries = [
+        {"a": {"$lt": 5}, "d": {"$elemMatch": {"e": 3}}},
+        {"a": {"$lt": 50}, "d": {"$elemMatch": {"e": 3}}},
+    ]
 
     def sizes(client: Any) -> list:
-        return [e.get("estimatedSizeBytes") for e in _with_d(client, lambda col: col.find(q))]
+        return [
+            [e.get("estimatedSizeBytes") for e in _with_d(client, lambda col, q=q: col.find(q))]
+            for q in queries
+        ]
 
-    assert sizes(mongod) == [3230]
+    assert sizes(mongod) == [[3230], [3656]]
+    assert sizes(rust_mongo) == sizes(mongod)
+
+
+@pytest.mark.backlog("RM-694")
+def test_an_or_entry_with_a_compound_branch_reports_its_size(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 sizes the entry for `{$or: [{a: 3, c: 2}, {b: 5}], c:
+    {$lt: 3}}` over `a_1`, `b_1` and `c_1` at 10381 on macOS arm64; this
+    server leaves `estimatedSizeBytes` out (a branch of several
+    predicates)."""
+    only_on("darwin", why="RM-341 sizes entries with macOS arm64's layout")
+    only_on("arm64", why="RM-341 sizes entries with macOS arm64's layout")
+    q = {"$or": [{"a": 3, "c": 2}, {"b": 5}], "c": {"$lt": 3}}
+
+    def sizes(client: Any) -> list:
+        client.drop_database("rm341_found")
+        col = client.rm341_found.c
+        col.insert_many(
+            [{"_id": i, "a": i % 100, "b": (i // 20) % 100, "c": i % 7} for i in range(2000)]
+        )
+        for keys in ("a", "b", "c"):
+            col.create_index(keys)
+        for _ in range(2):
+            list(col.find(q))
+        return [e.get("estimatedSizeBytes") for e in col.aggregate([{"$planCacheStats": {}}])]
+
+    assert sizes(mongod) == [10381]
     assert sizes(rust_mongo) == sizes(mongod)
 
 

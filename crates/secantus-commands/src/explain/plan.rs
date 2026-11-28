@@ -814,8 +814,7 @@ fn use_index(index: &Arc<IndexInfo>, leaves: &[Leaf], parts: &[Document], q: &Qu
 /// The index a plan reads and the clauses of `q.canonical` it assigned to
 /// that index -- mongod's index tags, from which it builds the cache
 /// entry's `PlanCacheIndexTree`. `None` unless the plan reads one index
-/// (a scan, or the scans of a merge over points of it) and every clause is
-/// one mongod tags as this planner does (no `$elemMatch`).
+/// (a scan, or the scans of a merge over points of it).
 pub(crate) fn index_tags(q: &Query, winner: &Node) -> Option<(Arc<IndexInfo>, BTreeSet<usize>)> {
     let index = match access_of_plan(winner)? {
         Node::IxScan(ix) => ix.index.clone(),
@@ -834,10 +833,17 @@ pub(crate) fn index_tags(q: &Query, winner: &Node) -> Option<(Arc<IndexInfo>, BT
     };
     let parts = clauses(q.canonical);
     let leaves = leaves_of(&parts);
-    if leaves.iter().any(|l| l.derived) {
-        return None;
+    // An object-form `$elemMatch` is tagged when the index reads one of
+    // its paths: `entry_size` puts the tag on the inner predicate and the
+    // `ELEM_MATCH_OBJECT` (measured 8.2.11: 3230 for `{a: {$lt: 5}, d:
+    // {$elemMatch: {e: 3}}}` read from `a_1`, 3656 read from `d.e_1`).
+    let mut tagged = use_index(&index, &leaves, &parts, q).tagged;
+    for l in &leaves {
+        if l.derived && index.key.contains_key(&l.path) {
+            tagged.insert(l.clause);
+        }
     }
-    Some((index.clone(), use_index(&index, &leaves, &parts, q).tagged))
+    Some((index.clone(), tagged))
 }
 
 /// For a plan that reads an `OR` of index scans beside other clauses

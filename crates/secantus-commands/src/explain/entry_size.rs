@@ -337,9 +337,13 @@ fn clause_node(clause: &Document, tag: Option<&IndexCopy>) -> Option<TreeNode> {
         // `ELEM_MATCH_VALUE` itself (`Indexability::arrayUsesIndexOnOwnField`;
         // measured 8.2.11: two copies of the index entry for `{a: {$lt: 5},
         // b: {$elemMatch: {$not: {$gt: 3}}}}` read from `b_1`, by the
-        // name's length). The object form is left out: no measured figure.
+        // name's length). The object form is an `ELEM_MATCH_OBJECT`
+        // ([`elem_match_object`]).
         ["$elemMatch"] => {
             let inner = pred.get_document("$elemMatch").ok()?;
+            if inner.keys().next().is_some_and(|k| !k.starts_with('$')) {
+                return elem_match_object(inner, tag);
+            }
             let mut children = Vec::with_capacity(inner.len());
             for (op, v) in inner {
                 if !op.starts_with('$') {
@@ -369,6 +373,24 @@ fn clause_node(clause: &Document, tag: Option<&IndexCopy>) -> Option<TreeNode> {
         [_] | ["$regex", "$options"] => Some(leaf()),
         _ => None,
     }
+}
+
+/// An `ELEM_MATCH_OBJECT` over `{path: {$elemMatch: inner}}`: one child,
+/// the inner predicate on its own relative path, which carries the tag
+/// when the plan read it from the index on `path.<field>`; `tagForSort`
+/// then tags the `ELEM_MATCH_OBJECT` with it too (measured 8.2.11: 3230
+/// for `{a: {$lt: 5}, d: {$elemMatch: {e: 3}}}` over `a_1`, `b_1` and
+/// `d.e_1` on macOS arm64). An inner conjunction of several predicates is
+/// left out: no measured figure says how its `AND` is tagged.
+fn elem_match_object(inner: &Document, tag: Option<&IndexCopy>) -> Option<TreeNode> {
+    if inner.len() != 1 {
+        return None;
+    }
+    let child = clause_node(inner, tag)?;
+    Some(sort_tagged(TreeNode {
+        entry: None,
+        children: vec![child],
+    }))
 }
 
 /// An `$or` whose branches are single predicates, each tagged with the
@@ -509,9 +531,21 @@ mod tests {
         ] {
             assert!(tagged_tree(&clause, std::slice::from_ref(&clause), &[]).is_none());
         }
-        // The object form of `$elemMatch` is not built.
-        let clause = doc! { "a": { "$elemMatch": { "b": 1 } } };
+        // The object form of `$elemMatch` over several predicates is not built.
+        let clause = doc! { "a": { "$elemMatch": { "b": 1, "c": 2 } } };
         assert!(tagged_tree(&clause, std::slice::from_ref(&clause), &[]).is_none());
+    }
+
+    #[test]
+    fn an_object_elem_match_tags_its_predicate_and_itself() {
+        // `{d: {$elemMatch: {e: 3}}}` read from `d.e_1`: the
+        // `ELEM_MATCH_OBJECT` and its one predicate both carry the tag.
+        let clause = doc! { "d": { "$elemMatch": { "e": 3 } } };
+        let tags = [ClauseTag::One(a_1("d.e_1"))];
+        let tree = tagged_tree(&clause, std::slice::from_ref(&clause), &tags).unwrap();
+        assert_eq!(tree.entry.as_ref().unwrap().name, "d.e_1");
+        assert_eq!(tree.children.len(), 1);
+        assert_eq!(tree.children[0].entry.as_ref().unwrap().name, "d.e_1");
     }
 
     #[test]
