@@ -26,6 +26,16 @@ on:
     - cron: '0 6 * * 1'
   # Manual trigger from the Actions tab.
   workflow_dispatch:
+    inputs:
+      gate_base:
+        # Set by scripts/gate_actions.py, the lanes' gate on Actions (trial,
+        # 2026-11-28): the commit the gated change sits on. A run with it
+        # behaves as a PR's -- the Linux matrix only, and pg-oracle decided
+        # from the diff against it -- where a bare dispatch runs every cell.
+        description: "gate mode: the base commit (runs as a PR would)"
+        required: false
+        default: ""
+        type: string
 
 # Per-ref lane: a newer push to the same ref cancels that ref's stale run, but
 # distinct refs never cancel each other (one feature branch per session = one CI
@@ -846,7 +856,8 @@ jobs:
         # 43069794449). The release binaries already build on macos-15
         # (release-binaries.yml), so this cell now tests the macOS they ship
         # on. Pinned rather than macos-latest so an image move is a commit.
-        os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","windows-latest","macos-15"]' || '["ubuntu-latest"]') }}
+        # A gate dispatch (`gate_base` set) runs as a PR does: Linux only.
+        os: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.gate_base == '')) && '["ubuntu-latest","windows-latest","macos-15"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Free disk the job does not use
@@ -1579,9 +1590,16 @@ jobs:
           fetch-depth: 0
       - id: pg
         shell: bash
+        env:
+          # A gate dispatch's base (scripts/gate_actions.py); empty otherwise.
+          GATE_BASE: ${{ inputs.gate_base }}
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" > changed.txt
+            wc -l < changed.txt
+            pg=$(python3 tools/ci_pg_needed.py < changed.txt)
+          elif [ -n "$GATE_BASE" ]; then
+            git diff --name-only "$GATE_BASE...HEAD" > changed.txt
             wc -l < changed.txt
             pg=$(python3 tools/ci_pg_needed.py < changed.txt)
           else

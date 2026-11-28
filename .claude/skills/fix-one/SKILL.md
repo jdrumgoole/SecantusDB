@@ -256,6 +256,17 @@ the PG server links them.
 - **It starts with `backlog-ids`** (`tools/backlog.py check-ids`): a
   Backlog-ID the work adds that it did not reserve fails here, not as a
   duplicate on the snapshot PR.
+- **Actions mode (trial, Joe, 2026-11-28).** When the worktree holds
+  `.scratch/gate-actions` (or `SECANTUS_GATE=actions` is set), the gate runs
+  `backlog-ids`, lint and ruff here, and its `actions` step runs every build
+  and test step on CI's `Tests` workflow instead (`scripts/gate_actions.py`):
+  it pushes a snapshot of the working tree to a `gate/...` branch, dispatches
+  `test.yml` there, waits (~15-20 min), and deletes the branch. Your index and
+  HEAD are untouched, so commit afterwards as usual. A red job's log is saved
+  as `.scratch/gate/actions-<job>.log`: read it as you would a step's log.
+  After a fix, rerun `--only actions` (with `lint,ruff-format` too when they
+  failed). It runs on Linux, the exemplar: a Linux-only difference shows up
+  here, not on the snapshot PR.
 - **After a failure, rerun only the failed steps:**
   `scripts/gate_rm.py --only mongod-live,lint` keeps the other steps on
   record and fails unless every recorded step is green. A fix to code

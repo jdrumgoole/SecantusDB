@@ -375,6 +375,16 @@ def main() -> int:
         "backlog-ids",
         [str(py), "tools/backlog.py", "check-ids", "--file", "backlog-rust-mongodb.md"],
     )
+    if os.environ.get("SECANTUS_GATE") == "actions" or (root / ".scratch/gate-actions").exists():
+        # The trial gate on GitHub Actions (scripts/gate_actions.py has the
+        # why): the cheap checks here, every build and test step on CI's
+        # `Tests` run of this working tree, on Linux.
+        print("    actions mode: the build and test steps run on CI's Tests workflow", flush=True)
+        g.step("lint", ["./inv", "lint"])
+        g.step("ruff-check", ["uvx", RUFF, "check", "."])
+        g.step("ruff-format", ["uvx", RUFF, "format", "--check", "."])
+        g.step("actions", [str(py), "scripts/gate_actions.py"])
+        return finish(g, out, only)
     g.step("rust-test", ["./inv", "rust-test"])
     g.step("wt-test", ["./inv", "rust-wt-test"])
     if storage:
@@ -497,6 +507,11 @@ def main() -> int:
     g.step("ruff-check", ["uvx", RUFF, "check", "."])
     g.step("ruff-format", ["uvx", RUFF, "format", "--check", "."])
 
+    return finish(g, out, only)
+
+
+def finish(g: Gate, out: Path, only: set[str] | None) -> int:
+    """The verdict: every step's exit code, and a WiredTiger panic in any log."""
     # A WiredTiger panic in any log is the headline, whatever the exit codes say.
     panics = panicked_logs(out)
     if panics:
