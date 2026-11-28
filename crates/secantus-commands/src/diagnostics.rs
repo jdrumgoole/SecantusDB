@@ -312,6 +312,21 @@ pub fn spill_idents_line(dropped: i64) -> crate::logbuf::LogEntry {
     .attr(doc! {"numIdents": dropped})
 }
 
+/// `Flow Control is enabled on this deployment` (20536), which mongod
+/// 8.2.11 writes on `initandlisten` after `Dropping spill idents` (measured
+/// 2026-11-28, a new store and a restart). Flow control cannot be turned off
+/// on this server (it has no `enableFlowControl`), so the line is always
+/// mongod's default one.
+pub fn flow_control_line() -> crate::logbuf::LogEntry {
+    crate::logbuf::LogEntry::new(
+        "I",
+        "CONTROL",
+        20536,
+        "initandlisten",
+        "Flow Control is enabled on this deployment",
+    )
+}
+
 /// The most sessions mongod's session cache keeps:
 /// `wiredTigerSessionCacheMaxPercentage` (50) percent of the `session_max`
 /// WiredTiger was opened with (8.2.11 logs 16500 for its 33000), WiredTiger's
@@ -1312,6 +1327,14 @@ mod tests {
         let line = spill_idents_line(3);
         assert_eq!(line.id, 10682200);
         assert_eq!(line.attr.as_ref().unwrap(), &doc! {"numIdents": 3i64});
+    }
+
+    /// RM-305: mongod 8.2.11's flow-control line carries no attributes.
+    #[test]
+    fn flow_control_is_mongods_line() {
+        let line = flow_control_line();
+        assert_eq!((line.id, line.component), (20536, "CONTROL"));
+        assert!(line.attr.is_none());
     }
 
     #[test]

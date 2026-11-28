@@ -589,6 +589,7 @@ pub fn bind(
             spill.dropped_idents,
         ));
     }
+    logs.log(secantus_commands::diagnostics::flow_control_line());
     logs.log(
         LogEntry::new("I", "NETWORK", 23016, "listener", "Waiting for connections").attr(doc! {
             "port": i32::from(address.port()),
