@@ -402,11 +402,26 @@ fn or_node(clause: &Document, branches: &[IndexCopy]) -> Option<TreeNode> {
     }
     let mut children = Vec::with_capacity(list.len());
     for (b, ix) in list.iter().zip(branches) {
-        let b = b.as_document()?;
-        if b.len() != 1 || b.keys().any(|k| k.starts_with('$')) {
-            return None;
+        // A branch of several predicates is an `AND` over them, the one on
+        // the index's leading field tagged; `tagForSort` tags the `AND`.
+        let preds = super::plan::clauses(b.as_document()?);
+        let lead = ix.key.keys().next()?;
+        let mut nodes = Vec::with_capacity(preds.len());
+        for p in &preds {
+            if p.len() != 1 || p.keys().any(|k| k.starts_with('$')) {
+                return None;
+            }
+            let tag = p.contains_key(lead).then_some(ix);
+            nodes.push(clause_node(p, tag)?);
         }
-        children.push(clause_node(b, Some(ix))?);
+        if nodes.len() == 1 {
+            children.extend(nodes);
+        } else {
+            children.push(sort_tagged(TreeNode {
+                entry: None,
+                children: nodes,
+            }));
+        }
     }
     Some(sort_tagged(TreeNode {
         entry: None,
@@ -583,6 +598,26 @@ mod tests {
         // `tagForSort`: the lowest-numbered index below, at every level.
         assert_eq!(tree.entry.unwrap().name, "a_1");
         assert_eq!(tree.children[0].entry.as_ref().unwrap().name, "a_1");
+    }
+
+    #[test]
+    fn an_or_branch_of_several_predicates_is_a_tagged_and() {
+        // `{$or: [{a: 3, c: 2}, {b: 5}], c: {$lt: 3}}`, the first branch
+        // read from `a_1`: its `AND` holds `a` tagged and `c` untagged.
+        let mut b_1 = a_1("b_1");
+        b_1.key = doc! { "b": 1 };
+        b_1.number = 2;
+        let clauses = [
+            doc! { "$or": [{ "$and": [{ "a": 3 }, { "c": 2 }] }, { "b": 5 }] },
+            doc! { "c": { "$lt": 3 } },
+        ];
+        let canonical = doc! { "$and": clauses.to_vec() };
+        let tags = [ClauseTag::Or(vec![a_1("a_1"), b_1]), ClauseTag::None];
+        let tree = tagged_tree(&canonical, &clauses, &tags).unwrap();
+        let and = &tree.children[0].children[0];
+        assert_eq!(and.entry.as_ref().unwrap().name, "a_1");
+        assert_eq!(and.children[0].entry.as_ref().unwrap().name, "a_1");
+        assert!(and.children[1].entry.is_none());
     }
 
     #[test]
