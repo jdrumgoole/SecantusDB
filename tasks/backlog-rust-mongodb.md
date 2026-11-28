@@ -1946,50 +1946,21 @@ differs on none (re-measured 2026-11-09 after RM-454; 1 earlier that day, 2 on 2
 mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
-- [ ] **RUST MongoDB server: a `$match` after a `$changeStream` with a
-      `$type`, `$regex` or `$size` on a path the rewrite renames, or on an
-      event field it does not know, is not
-      rewritten into the oplog filter.** mongod 8.2.11
-      rewrites `updateDescription`,
-      `fullDocumentBeforeChange`, the renamed `clusterTime` / `lsid` /
-      `txnNumber` (also into the transaction filter), and an `$expr` over
-      them, and adds them to the read's filter (`ns.coll: "c"`: `queryHash`
-      D801EB4B, not 90A52575; 2026-11-15). RM-452 ported the
-      `operationType` rewrite, RM-698's first slice (2026-11-23)
-      `documentKey` and `fullDocument` for `$eq` / `$in` / `$exists` /
-      `$lt(e)` / `$gt(e)`; a `$regex`, `$type`, `$size`, ... on those
-      paths is still dropped, not renamed. The second slice (2026-11-24)
-      ported `matchRewriteGenericNamespace` for `ns` by `$eq` / `$in`, the
-      third (2026-11-25) for `to` (`o.to` of a command), and the fourth
-      (2026-11-25) a regex on either (mongod's `$expr` of `$regexMatch`
-      over `$substrBytes`), the fifth (2026-11-25) a regex inside an `$in`
-      on either, and the sixth (2026-11-25) an `$expr` on `operationType`
-      (`rewriteAggExpressionTree` with `exprRewriteOperationType`, and the
-      `$_internalExprEq` the optimizer derives), and the seventh
-      (2026-11-25) an `$expr` on `documentKey`, `ns` or `to`
-      (`exprRewriteDocumentKey` / `Ns` / `To`) and the `$_internalExpr*`
-      twins on every rewritten field (`documentKey` and `fullDocument`
-      keep the twin's operator, the others rewrite it as the equality);
-      mongod drops an `$expr` on `fullDocument`, and so does this server.
-      The eighth (2026-11-26) renamed `clusterTime` (`ts`), `lsid` and
-      `txnNumber` into the events and the transaction filter (not the
-      unwind's), for every leaf `renamed` prints, and the ninth
-      (2026-11-26) an `$expr` on them (renamed, beside three copies of each
-      `$_internalExpr*` twin: the user's and one per re-optimisation of the
-      oplog filter); a `$type` on them is still left out of the read, and
-      `expr_twins` derives none from an `$expr` `$or`, which mongod's
-      `RewriteExpr` may. The tenth (2026-11-28) ported
-      `matchRewriteUpdateDescription` (a field of `updatedFields` as
-      `o.$set` / `o.diff.i` / `o.diff.u`, a name in `removedFields` as
-      `o.$unset` / `o.diff.d`) and `matchRewriteFullDocumentBeforeChange`
-      (`op` in `d`, `u`), as measured. Left: `renamed` prints no `$type`,
-      `$regex` or `$size`, which mongod clones onto every renamed path
-      (`updatedFields.a`, and `documentKey` / `fullDocument` likewise); a
-      null-matching predicate on `updateDescription` that is not only null
-      (`removedFields: {$in: ["a", null]}`) mongod drops, and so does this
-      server, by a "matches only null" test built from probes, not a port of
-      mongod's code (found working RM-452).
-      Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_a_type_regex_or_size_on_a_renamed_path_joins_the_oplog_filter
+- [ ] **RUST MongoDB server: an `$expr` `$or` over a renamed field after a
+      `$changeStream` joins the oplog filter, but not as mongod 8.2.11
+      prints it.** RM-452 and RM-698's eleven slices (2026-11-23 to
+      2026-11-28) ported mongod's rewrite of every event field into the
+      oplog filter, with `$type`, `$regex`, `$size` and an `$in` holding a
+      regex cloned onto each renamed path. Left: `expr_twins` derives no
+      `$_internalExpr*` twin from an `$expr` `$or`
+      (`{$expr: {$or: [{$eq: ["$txnNumber", 1]}, {$eq: ["$txnNumber", 2]}]}}`
+      reads with another hash than mongod's), where mongod's `RewriteExpr`
+      does; an `$or` mixing `documentKey` and `operationType` already
+      matches. A null-matching predicate on `updateDescription` that is not
+      only null (`removedFields: {$in: ["a", null]}`) mongod drops, and so
+      does this server, by a "matches only null" test built from probes, not
+      a port of mongod's code (found working RM-452).
+      Verify: tests/backlog/test_rm_found_2026_11_15_rm452.py::test_an_expr_or_on_a_renamed_field_joins_the_oplog_filter_as_mongod_does
       Backlog-ID: RM-698
 - [ ] **RUST MongoDB server: the Boolean simplifier differs from mongod's
       on about 0.3 percent of random trees, and on nested `$nor`.** The
