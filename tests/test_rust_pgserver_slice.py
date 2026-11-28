@@ -21667,6 +21667,34 @@ def test_relation_filepath_names_each_relations_own_file(home: Path) -> None:
         assert (home / by_name[rel]).is_file(), by_name[rel]
 
 
+def test_relation_filepath_sees_what_the_open_block_created(home: Path) -> None:
+    """The transaction that creates a relation sees its own catalog rows,
+    so `pg_relation_filepath` names the file of a table, its primary key,
+    an index and a sequence the open block created, as PostgreSQL 15.20
+    does, and the file it names is the one the relation keeps after COMMIT
+    (RP-1135: all four were NULL until the CREATE committed)."""
+    rels = ("fb", "fb_pkey", "fb_name", "fb_seq")
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE fb (id int PRIMARY KEY, name text)")
+        cur.execute("CREATE INDEX fb_name ON fb (name)")
+        cur.execute("CREATE SEQUENCE fb_seq")
+        cur.execute(
+            "SELECT pg_relation_filepath('fb'), pg_relation_filepath('fb_pkey'),"
+            " pg_relation_filepath('fb_name'), pg_relation_filepath('fb_seq')"
+        )
+        inside = cur.fetchone()
+        conn.commit()
+        cur.execute(
+            "SELECT pg_relation_filepath('fb'), pg_relation_filepath('fb_pkey'),"
+            " pg_relation_filepath('fb_name'), pg_relation_filepath('fb_seq')"
+        )
+        after = cur.fetchone()
+    assert all(f is not None for f in inside), dict(zip(rels, inside, strict=True))
+    assert inside == after
+    assert len(set(inside)) == 4, inside
+
+
 def test_a_sequence_keeps_its_state_in_its_own_file(home: Path) -> None:
     """A sequence's state is the one row of its own relation, as PostgreSQL
     keeps it in the sequence's file (RP-1076): each sequence names a file of

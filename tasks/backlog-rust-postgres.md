@@ -4128,20 +4128,6 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       Backlog-ID: RP-1077
       Verify: tests/backlog/test_rp_storage_model.py::test_relation_filenode
 
-## Found while working RP-1075 (2026-11-26)
-
-- [ ] **`pg_relation_filepath` of a table the open transaction created is
-      NULL.** `begin; create table u (id int primary key); select
-      pg_relation_filepath('u'), pg_relation_filepath('u_pkey')` answers
-      NULL for both until the CREATE commits; PostgreSQL 15.20 names both
-      files, since the creating transaction sees its own catalog rows. The
-      size functions read through the open block (`size_call` ->
-      `read_in_block`, RP-299); `wal_call`'s `pg_relation_filepath` arm
-      does not, so it looks the ident up outside the transaction that made
-      it.
-      Backlog-ID: RP-1135
-      Verify: tests/backlog/test_rp_storage_model.py::test_filepath_of_a_relation_the_open_transaction_created
-
 ## Found while working RP-1074 (2026-11-26)
 
 - [ ] **A fresh `secantusd-pg` once printed nothing for 30 s at start.**
@@ -4190,7 +4176,12 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       `tests/backlog/test_rp_found_rp707.py`'s module server gave `''`
       for its first line and nothing after its stop, so its 31 tests were
       `REGRESSED`; the module alone passed (31 in 37 s), and the same
-      change's gate before the rebase had no start failure. Not yet known: whether the
+      change's gate before the rebase had no start failure. An eighth
+      time on 2026-11-28, in RP-1135's `gate_pg.sh --fast --storage`
+      backlog step (load average about 3-3.5, the other lane running):
+      `tests/backlog/test_rp_found_rp522.py`'s module server gave `''`
+      for its first line, so its 39 checked tests were `REGRESSED`; the
+      module alone passed (85 in 28 s). Not yet known: whether the
       server stalled (a lock, a WiredTiger create waiting on a checkpoint)
       or was starved, since the harness keeps no stack or timing of a
       start it gives up on. The harness should sample the child
