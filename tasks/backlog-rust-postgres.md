@@ -3856,17 +3856,6 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       the loop's 60.16).
       Verify: none -- no shape measured reaches it: PostgreSQL hashes every join of an expression key against a unique column built so far, up to 100,000 rows a side and at the smallest work_mem
       Backlog-ID: RP-1128
-- [ ] **An aggregate over a Hash Join is not priced.** `explain select
-      count(*) from e join k on k.a = e.a` prints zero costs on the
-      `Aggregate` and on the `Hash Join` below it, though the join alone
-      (`select * ...`) is priced since RP-330; a private PostgreSQL 15.20
-      cluster prints `Aggregate (cost=47.64..47.65 rows=1 width=8)` over
-      `Hash Join (cost=27.50..45.14 rows=1000 width=0)`, each scan
-      narrowed to its key (`width=4`). The same over an expression key
-      (`k.a = e.a - 1`, `Aggregate (cost=47.76..47.77 ...)`). The Nested
-      Loop case is RP-1125. Found while working RP-1032 (2026-11-26).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a hash join is priced], tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a hash join on an expression key is priced]
-      Backlog-ID: RP-1129
 - [ ] **ANALYZE of a merge join on an expression key counts nothing
       below it.** `explain (analyze, costs off, timing off, summary off)
       select * from e join e e2 on e.b = e2.b || 'x'` prints, in
