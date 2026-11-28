@@ -752,18 +752,10 @@ fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: 
             entry.insert("planningTimeMicros", micros);
         }
     }
-    // A transaction's command reads its storage statistics under the
-    // transaction's locks, and counts only what it took (RM-357).
-    let locks = match crate::lock_manager::transaction_command_locks() {
-        Some(locks) => locks,
-        None => {
-            let mut locks = ctx.op_locks.clone().unwrap_or_default();
-            if crate::lock_manager::took_global() {
-                bump_global_is(&mut locks);
-            }
-            locks
-        }
-    };
+    let mut locks = ctx.op_locks.clone().unwrap_or_default();
+    if crate::lock_manager::took_global() {
+        bump_global_is(&mut locks);
+    }
     // Flow control holds back writes only: an operation that took no
     // ticket has `{}`.
     if let Some(fc) = crate::opdebug::flow_control(ctx.flow_control_tickets) {
@@ -1386,9 +1378,7 @@ impl<'a> Statements<'a> {
             (Some(a), b) if Some(a) != b => Some((a - b.unwrap_or_default()).as_micros() as i64),
             _ => None,
         };
-        let txn_locks = crate::lock_manager::transaction_statement_locks();
-        let in_txn = txn_locks.is_some();
-        let locks = txn_locks.unwrap_or_else(|| crate::lock_manager::operation_locks(false));
+        let locks = crate::lock_manager::operation_locks(false);
         // The statement's query keys the plan cache as a `find` of it does.
         let hashes = self.storage.and_then(|s| {
             let mut query = doc! { "find": open.coll.clone(), "filter": open.command.get("q").cloned().unwrap_or(Bson::Document(Document::new())) };
@@ -1416,7 +1406,7 @@ impl<'a> Statements<'a> {
                 - then.map_or(0, |c| c.oplog_slot_micros),
             locks,
             flow_control: crate::lock_manager::flow_control_tickets(),
-            took_global: crate::lock_manager::took_global() && !in_txn,
+            took_global: crate::lock_manager::took_global(),
             read_concern: crate::slowop::replicated().then(|| self.read_concern.clone()),
             // A statement's CPU time, as its command's: where mongod reads
             // a thread's CPU clock, Linux (measured 8.2.12).
@@ -1514,11 +1504,8 @@ impl<'a> Statements<'a> {
         }
         if self.profiled {
             // mongod writes the statement's entry now, under locks its
-            // command's line and later statements count; a transaction's
-            // statement's entry is written apart from its locker (RM-357).
-            if !crate::lock_manager::in_transaction_command() {
-                crate::lock_manager::note_statement_profile_write();
-            }
+            // command's line and later statements count.
+            crate::lock_manager::note_statement_profile_write();
             STATEMENTS.with(|s| {
                 if let Some(list) = s.borrow_mut().as_mut() {
                     list.push(statement);
@@ -1629,11 +1616,9 @@ pub(crate) fn refused_statement(
         outcome: StatementOutcome::Failed(error.clone()),
         millis: worked.as_millis() as i64,
         ran: Ran {
-            locks: crate::lock_manager::transaction_statement_locks()
-                .unwrap_or_else(|| crate::lock_manager::operation_locks(false)),
+            locks: crate::lock_manager::operation_locks(false),
             flow_control: crate::lock_manager::flow_control_tickets(),
-            took_global: crate::lock_manager::took_global()
-                && !crate::lock_manager::in_transaction_command(),
+            took_global: crate::lock_manager::took_global(),
             read_concern: crate::slowop::replicated()
                 .then(|| crate::opdebug::read_concern(request)),
             cpu_nanos: cpu
