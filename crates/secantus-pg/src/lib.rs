@@ -23186,92 +23186,96 @@ impl PgHandler {
                 )),
                 _ => Ok(Bson::Null),
             },
-            // The WiredTiger file a relation's rows are in, relative to the
-            // data directory; NULL for one with no storage (a view, a
-            // catalog this server computes).
-            _ => {
-                let oid = match arg(0) {
-                    Bson::Null => return Ok(Bson::Null),
-                    Bson::Int32(i) => i64::from(i),
-                    Bson::Int64(i) => i,
-                    // The argument is a `regclass`: a name is read as
-                    // `regclassin` reads it, an index's, a sequence's and a
-                    // catalog's included, and a missing one is its 42P01.
-                    other => match secantus_pgplan::regclass_oid(&other) {
-                        Some(o) => o,
-                        None => {
-                            let n = secantus_pgplan::value_text(&other);
-                            match self
-                                .relations()
-                                .into_iter()
-                                .find(|(r, _, _)| *r == n)
-                                .map(|(_, o, _)| o)
-                            {
-                                Some(o) => o,
-                                None => match self
-                                    .run_sql_rows("select $1::regclass::oid", &[Bson::String(n)])?
-                                    .first()
-                                    .and_then(|row| row.first())
-                                    .and_then(bson_i64)
-                                {
-                                    Some(o) => o,
-                                    None => return Ok(Bson::Null),
-                                },
-                            }
-                        }
-                    },
-                };
-                let Some(rel) = self
-                    .relations()
-                    .into_iter()
-                    .find(|(_, o, _)| *o == oid)
-                    .map(|(n, _, _)| n)
-                else {
-                    // No relation of this database's (a catalog this server
-                    // computes, an oid nothing has): no file.
-                    return Ok(Bson::Null);
-                };
-                let table = if let Some(ix) =
-                    self.index_relations().into_iter().find(|ix| ix.oid == oid)
-                {
-                    // The index's own WiredTiger table (`index-<UUID>`);
-                    // the primary key is the storage's `_id_` index.
-                    let storage_index = if ix.primary { "_id_" } else { ix.name.as_str() };
-                    match self
-                        .storage
-                        .index_table_name(self.db(), &ix.table.name, storage_index)
-                    {
-                        Ok(Some(t)) => t,
-                        _ => return Ok(Bson::Null),
-                    }
-                } else if self.sequence_names().contains(&rel) {
-                    // The sequence's own relation (RP-1076).
-                    let Some(own) = self
-                        .sequence_doc(&rel)?
-                        .and_then(|d| Self::sequence_relation_of(&d).ok())
-                    else {
-                        return Ok(Bson::Null);
-                    };
-                    match self.storage.collection_table_name(self.db(), &own) {
-                        Ok(Some(t)) => t,
-                        _ => return Ok(Bson::Null),
-                    }
-                } else if self.lookup(&rel).is_some() && Self::virtual_table(&rel).is_none() {
-                    // The table's own WiredTiger table, named by its ident
-                    // (`collection-<UUID>`), as mongod names a collection's.
-                    match self.storage.collection_table_name(self.db(), &rel) {
-                        Ok(Some(t)) => t,
-                        _ => return Ok(Bson::Null),
-                    }
-                } else {
-                    return Ok(Bson::Null);
-                };
-                Ok(Bson::String(format!(
-                    "{}.wt",
-                    table.strip_prefix("table:").unwrap_or(&table)
-                )))
-            }
+            _ => self.read_in_block(|| self.relation_filepath(args)),
         }
+    }
+
+    /// `pg_relation_filepath`: the WiredTiger file a relation's rows are
+    /// in, relative to the data directory; NULL for one with no storage (a
+    /// view, a catalog this server computes). Read through the open block's
+    /// transaction (`read_in_block`), as the size functions are: the
+    /// planner calls it with the block unbound, and a relation the block
+    /// created is one, with its file, to the block (RP-1135).
+    fn relation_filepath(&self, args: &[Bson]) -> PgWireResult<Bson> {
+        let arg = |i: usize| args.get(i).cloned().unwrap_or(Bson::Null);
+        let oid = match arg(0) {
+            Bson::Null => return Ok(Bson::Null),
+            Bson::Int32(i) => i64::from(i),
+            Bson::Int64(i) => i,
+            // The argument is a `regclass`: a name is read as
+            // `regclassin` reads it, an index's, a sequence's and a
+            // catalog's included, and a missing one is its 42P01.
+            other => match secantus_pgplan::regclass_oid(&other) {
+                Some(o) => o,
+                None => {
+                    let n = secantus_pgplan::value_text(&other);
+                    match self
+                        .relations()
+                        .into_iter()
+                        .find(|(r, _, _)| *r == n)
+                        .map(|(_, o, _)| o)
+                    {
+                        Some(o) => o,
+                        None => match self
+                            .run_sql_rows("select $1::regclass::oid", &[Bson::String(n)])?
+                            .first()
+                            .and_then(|row| row.first())
+                            .and_then(bson_i64)
+                        {
+                            Some(o) => o,
+                            None => return Ok(Bson::Null),
+                        },
+                    }
+                }
+            },
+        };
+        let Some(rel) = self
+            .relations()
+            .into_iter()
+            .find(|(_, o, _)| *o == oid)
+            .map(|(n, _, _)| n)
+        else {
+            // No relation of this database's (a catalog this server
+            // computes, an oid nothing has): no file.
+            return Ok(Bson::Null);
+        };
+        let table = if let Some(ix) = self.index_relations().into_iter().find(|ix| ix.oid == oid) {
+            // The index's own WiredTiger table (`index-<UUID>`);
+            // the primary key is the storage's `_id_` index.
+            let storage_index = if ix.primary { "_id_" } else { ix.name.as_str() };
+            match self
+                .storage
+                .index_table_name(self.db(), &ix.table.name, storage_index)
+            {
+                Ok(Some(t)) => t,
+                _ => return Ok(Bson::Null),
+            }
+        } else if self.sequence_names().contains(&rel) {
+            // The sequence's own relation (RP-1076).
+            let Some(own) = self
+                .sequence_doc(&rel)?
+                .and_then(|d| Self::sequence_relation_of(&d).ok())
+            else {
+                return Ok(Bson::Null);
+            };
+            match self.storage.collection_table_name(self.db(), &own) {
+                Ok(Some(t)) => t,
+                _ => return Ok(Bson::Null),
+            }
+        } else if self.lookup(&rel).is_some() && Self::virtual_table(&rel).is_none() {
+            // The table's own WiredTiger table, named by its ident
+            // (`collection-<UUID>`), as mongod names a collection's.
+            match self.storage.collection_table_name(self.db(), &rel) {
+                Ok(Some(t)) => t,
+                _ => return Ok(Bson::Null),
+            }
+        } else {
+            return Ok(Bson::Null);
+        };
+        Ok(Bson::String(format!(
+            "{}.wt",
+            table.strip_prefix("table:").unwrap_or(&table)
+        )))
     }
 
     /// The storage-size functions. A table's main fork is its heap's pages

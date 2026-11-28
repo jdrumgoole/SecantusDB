@@ -11009,9 +11009,11 @@ impl Storage {
     }
 
     /// The WiredTiger table holding `(db, coll)`'s documents, if it has one
-    /// (`$listCatalog`'s `ident`, `pg_relation_filepath`).
+    /// (`$listCatalog`'s `ident`, `pg_relation_filepath`). Read through the
+    /// open user transaction when one is bound, so a collection it created
+    /// has its table (RP-1135).
     pub fn collection_table_name(&self, db: &str, coll: &str) -> Result<Option<String>> {
-        let session = self.conn.open_session()?;
+        let session = self.op_session()?;
         collection_table(&session, db, coll)
     }
 
@@ -11135,9 +11137,10 @@ impl Storage {
     }
 
     /// The WiredTiger table holding index `name`'s entries on `(db, coll)`,
-    /// if the index has one (`$listCatalog`'s `idxIdent`).
+    /// if the index has one (`$listCatalog`'s `idxIdent`). Read through the
+    /// open user transaction when one is bound, as `collection_table_name`.
     pub fn index_table_name(&self, db: &str, coll: &str, name: &str) -> Result<Option<String>> {
-        let session = self.conn.open_session()?;
+        let session = self.op_session()?;
         index_table_of(&session, db, coll, name)
     }
 
