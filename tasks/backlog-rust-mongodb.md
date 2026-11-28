@@ -1128,15 +1128,24 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       `test_rm_found_2026_11_08_rm310.py` (RM-768's occurrences) and
       RM-683's two loop-join files. Not yet: a sweep that records which
       tests ever receive a `saveState` / `restoreState` / `numYield(s)` in a
-      reply (a pytest plugin wrapping `Database.command`, stopped after the
-      first fifth of the 61 `tests/mongod_live` and `tests/backlog` explain
-      files) saw
-      them in `test_rm_found_2026_11_09_rm373.py`, `_11_13_rm509.py`,
-      `_11_15_rm426.py`, `_10_26.py`, `test_view_line_namespaces.py`,
-      `test_rm_view_namespaces.py` and `test_clustered_scan_plans.py`, and
-      did not reach the rest; whether each COMPARES them (rather than
-      selecting `nReturned` / `works`) is unread. Do that, and move the ones
-      that do.
+      reply (a pytest plugin wrapping `Database.command`; 828 tests of the
+      61 `tests/mongod_live` and `tests/backlog` explain files, in
+      `-n0` order, before it was stopped) saw them in `test_project_storage.py`
+      (29 of 29), `mongod_live/test_geo_wildcard_plans.py` (30 of 30),
+      `test_sbe_group_explain.py`, `test_sbe_fetch_explain.py` (both
+      already under `no_timed_yields`), `test_change_stream_explain.py`,
+      `test_distinct_scan_keys.py`, `test_view_line_namespaces.py`,
+      `test_query_stats_store.py`, `test_internal_window_sort_key.py`,
+      `test_clustered_scan_plans.py`, and in `tests/backlog`:
+      `test_rm_found_2026_11_08_rm071.py`, `_rm342.py`, `_rm404.py`,
+      `_rm373.py`, `_rm426.py`, `_rm509.py`, `_rm325.py`, `_rm519.py`,
+      `_rm707.py`, `_rm472.py`, `_rm476.py`, `_rm515.py`, `_10_25.py`,
+      `_10_26.py`, `test_rm_355_364.py`, `test_rm_geo_wildcard_plans.py`,
+      `test_rm_hashed_index.py`, `test_rm_view_namespaces.py`; the rest of
+      the files were not reached. Whether each COMPARES them (rather than
+      selecting `nReturned` / `works`, or stripping them as
+      `test_rm_154_plan_cache.py` does) is unread. Do that, and move the
+      ones that do to `mongod_rs_no_yield` / `no_timed_yields`.
       Verify: none -- intermittent test quality, no gap in the server
       Backlog-ID: RM-768
 - [ ] **A `{$meta: "sortKey"}` with no `$sort` is refused where the query
@@ -2955,7 +2964,7 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       by write conflict. Found 2026-11-28 (RM-803); the regression test of
       RM-501 compares `serverStatus.batchedDeletes` instead, for want of it.
       Verify: none -- gap test pending
-      Backlog-ID: RM-841
+      Backlog-ID: RM-843
 - [ ] **`secantusd-mdb` refuses `--setParameter internalQueryExecYieldPeriodMS`
       at startup.** mongod 8.2.11 takes it on the command line (the
       `mongod_rs_no_yield` fixture starts one with it); this server answers
@@ -2963,7 +2972,7 @@ Each was measured by running the same writes on mongod 8.2.11 and on
       at startup" and exits, though `setParameter` takes it at run time.
       Found 2026-11-28 (RM-803).
       Verify: none -- gap test pending
-      Backlog-ID: RM-842
+      Backlog-ID: RM-844
 
 - [ ] **Stopping a gate run leaves its tests' reference mongods running
       (2026-11-25).** `scripts/detached_run.py stop` on a `gate_rm.py`
