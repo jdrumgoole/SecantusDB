@@ -49,6 +49,81 @@ fn field_value(doc: &Document, field: &str) -> Bson {
     paths::get_path(doc, field).cloned().unwrap_or(Bson::Null)
 }
 
+fn fill_values(d: &mut Document, fillers: &[Filler], vars: &Vars) -> R<()> {
+    for filler in fillers {
+        if let Filler::Value(field, expr) = filler {
+            if !is_filled(d, field) {
+                let v = expressions::evaluate(d, expr, vars)?;
+                paths::set_path(d, field, v).map_err(|_| Fallback::Defer)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `docs` in the order of the `$sort` mongod runs a `$fill` with a method
+/// behind: its partition, then `sortBy`, through the blocking sorter (its
+/// budget, and its order among ties).
+fn window_order(
+    docs: Vec<Document>,
+    fields: Option<&[String]>,
+    by: Option<&Bson>,
+    sort_by: Option<&Document>,
+    vars: &Vars,
+) -> R<Vec<Document>> {
+    let partitioned = fields.is_some() || by.is_some();
+    let sort: Vec<(String, bool)> = match sort_by {
+        Some(s) => crate::aggregate::sort_fields(&Bson::Document(s.clone()))?,
+        None => Vec::new(),
+    };
+    if !partitioned && sort.is_empty() {
+        return Ok(docs);
+    }
+    let mut items: Vec<(Vec<Bson>, Document)> = Vec::with_capacity(docs.len());
+    for d in &docs {
+        let mut keys = Vec::with_capacity(sort.len() + 1);
+        if partitioned {
+            keys.push(partition_value(d, fields, by, vars)?);
+        }
+        keys.extend(crate::aggregate::sort_key_values(d, &sort)?);
+        if !keys.iter().all(order::is_sortable) {
+            return Err(Fallback::Defer); // order::cmp's precondition
+        }
+        items.push((keys, d.clone()));
+    }
+    let offset = usize::from(partitioned);
+    let cmp = |ka: &[Bson], kb: &[Bson]| {
+        if partitioned {
+            let c = order::cmp(&ka[0], &kb[0]);
+            if c != std::cmp::Ordering::Equal {
+                return c;
+            }
+        }
+        for (i, (_, rev)) in sort.iter().enumerate() {
+            let c = order::cmp(&ka[i + offset], &kb[i + offset]);
+            let c = if *rev { c.reverse() } else { c };
+            if c != std::cmp::Ordering::Equal {
+                return c;
+            }
+        }
+        std::cmp::Ordering::Equal
+    };
+    let sizing = crate::sorter::Sizing {
+        beside: None,
+        sizes: None,
+        source: crate::sorter::SortSource::Stored,
+        fields: None,
+        budget: crate::memlimit::budgets().sort,
+        added: None,
+    };
+    let order = crate::sorter::blocking_sort_order(items, &cmp, &sizing)?;
+    let mut taken: Vec<Option<Document>> = docs.into_iter().map(Some).collect();
+    Ok(order
+        .iter()
+        .map(|&i| taken[i].take().expect("each place once"))
+        .collect())
+}
+
 pub fn fill_stage(spec: &Bson, docs: Vec<Document>, vars: &Vars) -> R<Vec<Document>> {
     let spec = spec.as_document().ok_or(Fallback::Defer)?;
     let output = spec
@@ -92,7 +167,22 @@ pub fn fill_stage(spec: &Bson, docs: Vec<Document>, vars: &Vars) -> R<Vec<Docume
         Some(_) => return Err(Fallback::Defer),
     };
 
-    // Partition, preserving partition-discovery order.
+    // A `$fill` with values only is mongod's `$addFields`: no partition and
+    // no sort, so every document keeps its place (measured 8.2.11, RM-767).
+    if !has_method {
+        let mut docs = docs;
+        for d in docs.iter_mut() {
+            fill_values(d, &fillers, vars)?;
+        }
+        return Ok(docs);
+    }
+
+    // Otherwise mongod runs it as a `$setWindowFields` behind ONE `$sort` on
+    // the partition, then `sortBy`: documents whose keys tie come as that
+    // sort leaves them, which is not the order they came in (RM-767).
+    let docs = window_order(docs, part_fields.as_deref(), part_by, sort_by, vars)?;
+
+    // Partition, preserving partition-discovery order (the sort's).
     let mut groups: Vec<Vec<Document>> = Vec::new();
     let mut key_index: HashMap<Vec<u8>, usize> = HashMap::new();
     for doc in docs {
@@ -106,28 +196,7 @@ pub fn fill_stage(spec: &Bson, docs: Vec<Document>, vars: &Vars) -> R<Vec<Docume
 
     let sort_field: Option<String> = sort_by.and_then(|s| s.keys().next().cloned());
 
-    // mongod sorts by the partition key before filling, so the partitions
-    // come out in key order, not in the order they were first seen (measured
-    // 8.2.11, 2026-10-10: partitions "b", "B", "z" are emitted B, b, z).
-    if part_fields.is_some() || part_by.is_some() {
-        let mut keyed: Vec<(Bson, Vec<Document>)> = Vec::with_capacity(groups.len());
-        for group in groups {
-            let key = match group.first() {
-                Some(d) => partition_value(d, part_fields.as_deref(), part_by, vars)?,
-                None => Bson::Null,
-            };
-            keyed.push((key, group));
-        }
-        if keyed.iter().all(|(k, _)| order::is_sortable(k)) {
-            keyed.sort_by(|a, b| order::cmp(&a.0, &b.0));
-        }
-        groups = keyed.into_iter().map(|(_, g)| g).collect();
-    }
-
     for group in groups.iter_mut() {
-        if let Some(s) = sort_by {
-            sort_partition(group, s)?;
-        }
         for filler in &fillers {
             match filler {
                 Filler::Value(field, expr) => {
@@ -181,34 +250,6 @@ fn partition_value(
     } else {
         Bson::Null
     })
-}
-
-/// Stable multi-field sort by `sortBy` (BSON order, like `$sort` / `_SortKey`):
-/// reversed multi-pass so earlier fields take precedence; ties keep input order.
-fn sort_partition(part: &mut [Document], sort_by: &Document) -> R<()> {
-    let fields: Vec<(&String, bool)> = sort_by
-        .iter()
-        .map(|(f, dir)| (f, matches!(dir, Bson::Int32(-1) | Bson::Int64(-1))))
-        .collect();
-    for (f, _) in &fields {
-        if part.iter().any(|d| !order::is_sortable(&field_value(d, f))) {
-            return Err(Fallback::Defer); // order::cmp's precondition
-        }
-    }
-    for (field, desc) in fields.iter().rev() {
-        part.sort_by(|a, b| {
-            let o = order::cmp(
-                &order::sort_repr(field_value(a, field), *desc),
-                &order::sort_repr(field_value(b, field), *desc),
-            );
-            if *desc {
-                o.reverse()
-            } else {
-                o
-            }
-        });
-    }
-    Ok(())
 }
 
 /// Last-observation-carried-forward within a sorted partition; leading nulls
