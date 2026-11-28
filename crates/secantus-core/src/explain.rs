@@ -119,7 +119,16 @@ const BITS_OPS: [&str; 4] = [
 ];
 
 fn is_operator_doc(value: &Bson) -> bool {
-    matches!(value, Bson::Document(d) if d.keys().any(|k| k.starts_with('$')))
+    matches!(value, Bson::Document(d) if d.keys().any(|k| k.starts_with('$')) && !is_dbref(d))
+}
+
+/// A DBRef (`{$ref, $id}`): mongod's parser reads an object whose first
+/// field is `$ref`, `$id` or `$db` as a value to compare, not operators.
+pub fn is_dbref(d: &Document) -> bool {
+    matches!(
+        d.keys().next().map(String::as_str),
+        Some("$ref" | "$id" | "$db")
+    )
 }
 
 /// A bitwise operator's argument as mongod echoes it: set-bit positions. So
@@ -1026,6 +1035,13 @@ pub fn build_stage_tree(
 mod match_as_written_tests {
     use super::match_as_written;
     use bson::{doc, Bson, Document};
+
+    /// A DBRef is a value to compare, not operators (RM-773).
+    #[test]
+    fn a_dbref_is_an_equality() {
+        let got = super::canonical_match(&Bson::Document(doc! {"a": {"$ref": "c", "$id": 1}}));
+        assert_eq!(got, doc! {"a": {"$eq": {"$ref": "c", "$id": 1}}});
+    }
 
     fn written(filter: Document) -> Document {
         match_as_written(&Bson::Document(filter))
