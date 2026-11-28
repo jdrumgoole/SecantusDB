@@ -7,9 +7,9 @@
 //! limit, as `buildCollScan` and `buildLimitSkip` build them, and a simple
 //! projection over them (`buildProjectionSimple`, RM-543): an inclusion or
 //! exclusion of top-level fields. The plan's result is the scanned record,
-//! or the projected one. A sort on one top-level field is built
+//! or the projected one. A sort on top-level fields is built
 //! (`build_sorted`, RM-543). An index-served `find` is not built (`None`),
-//! nor a sort on more keys or a path, nor a projection of a path, a
+//! nor a sort on a path, nor a projection of a path, a
 //! computed field or a `$` operator.
 //!
 //! The same plan is what mongod runs for a `distinct`, and for an
@@ -20,7 +20,7 @@
 //! a slot, then `makeBsonObj` over the record (measured 8.2.11,
 //! 2026-11-14).
 
-use super::expr::Expr;
+use super::expr::{BinOp, Expr};
 use super::group::{arg_of, scan, Arg, Front, Scanned, Slots};
 use super::stage::Stage;
 use super::Plan;
@@ -204,14 +204,21 @@ pub(super) fn build(uuid: &str, front: &Front, spec: Option<&Document>) -> Optio
     })
 }
 
-/// The plan for the `find` whose query is `front`, sorted on one
-/// top-level `field` (`desc`: descending), with `limit` (0: none) as the
-/// sort's top-k: `buildSort` puts a `project` of the key's
+/// The plan for the `find` whose query is `front`, sorted on `keys`
+/// (top-level fields, each `true` when descending), with `limit` (0: none)
+/// as the sort's top-k: `buildSort` puts a `project` of each key's
 /// `getSortKeyAsc` / `getSortKeyDesc` and a `sort` over the scan, both the
-/// `SORT` node's, the scan reading the key's field before the filter's
-/// (measured 8.2.11, 2026-11-26). `None` with a skip, or a `seek`.
-pub(super) fn build_sorted(uuid: &str, front: &Front, field: &str, desc: bool) -> Option<Plan> {
-    if front.skip > 0 || front.seek.is_some() || field.is_empty() || field.contains('.') {
+/// `SORT` node's, the scan reading the keys' fields (in name order) before
+/// the filter's. Two keys or more add the parallel-arrays check, the
+/// project's last slot: an `||` of two `isArray`s for two keys, a sum of
+/// `<=>`s for more (measured 8.2.11, 2026-11-28). `None` with a skip, or a
+/// `seek`.
+pub(super) fn build_sorted(uuid: &str, front: &Front, keys: &[(String, bool)]) -> Option<Plan> {
+    if front.skip > 0
+        || front.seek.is_some()
+        || keys.is_empty()
+        || keys.iter().any(|(f, _)| f.is_empty() || f.contains('.'))
+    {
         return None;
     }
     let under = Front {
@@ -222,7 +229,10 @@ pub(super) fn build_sorted(uuid: &str, front: &Front, field: &str, desc: bool) -
         seek: None,
     };
     let mut slots = Slots(0);
-    let read: BTreeSet<String> = [field.to_string()].into_iter().collect();
+    let read: BTreeSet<String> = keys.iter().map(|(f, _)| f.clone()).collect();
+    if read.len() != keys.len() {
+        return None;
+    }
     let Scanned {
         root,
         record,
@@ -230,17 +240,63 @@ pub(super) fn build_sorted(uuid: &str, front: &Front, field: &str, desc: bool) -
         mut env,
         query_plan,
     } = scan(&under, uuid, read, &mut slots)?;
-    let source = fields.iter().find(|(n, _)| n == field)?.1;
+    let mut sources = Vec::new();
+    for (field, _) in keys {
+        sources.push(fields.iter().find(|(n, _)| n == field)?.1);
+    }
     let node = under.nodes() + 1;
-    let key = slots.next();
-    let get = if desc {
-        "getSortKeyDesc"
-    } else {
-        "getSortKeyAsc"
-    };
+    let mut binds = Vec::new();
+    let mut sort_keys = Vec::new();
+    for ((_, desc), source) in keys.iter().zip(&sources) {
+        let key = slots.next();
+        let get = if *desc {
+            "getSortKeyDesc"
+        } else {
+            "getSortKeyAsc"
+        };
+        binds.push((key, Expr::func(get, vec![Expr::Slot(*source)])));
+        sort_keys.push((key, *desc));
+    }
+    if sources.len() > 1 {
+        let is_array = |s: u32| {
+            Expr::fill_empty(
+                Expr::func("isArray", vec![Expr::Slot(s)]),
+                Expr::Const(Some(Bson::Boolean(false))),
+            )
+        };
+        let fail = Expr::func(
+            "fail",
+            vec![
+                Expr::Const(Some(Bson::Int32(2))),
+                Expr::Const(Some(Bson::String(
+                    "cannot sort with keys that are parallel arrays".into(),
+                ))),
+            ],
+        );
+        let ok = if let [a, b] = sources.as_slice() {
+            Expr::bin(
+                BinOp::LogicOr,
+                Expr::Not(Box::new(is_array(*a))),
+                Expr::Not(Box::new(is_array(*b))),
+            )
+        } else {
+            let count = sources
+                .iter()
+                .map(|s| {
+                    Expr::bin(
+                        BinOp::Cmp3w,
+                        is_array(*s),
+                        Expr::Const(Some(Bson::Boolean(false))),
+                    )
+                })
+                .reduce(|l, r| Expr::bin(BinOp::Add, l, r))?;
+            Expr::bin(BinOp::Lte, count, Expr::Const(Some(Bson::Int32(1))))
+        };
+        binds.push((slots.next(), Expr::bin(BinOp::LogicOr, ok, fail)));
+    }
     let project = Stage::Project {
         node,
-        binds: vec![(key, Expr::func(get, vec![Expr::Slot(source)]))],
+        binds,
         input: Box::new(root),
     };
     let limit = (front.limit > 0).then(|| {
@@ -250,15 +306,19 @@ pub(super) fn build_sorted(uuid: &str, front: &Front, field: &str, desc: bool) -
     });
     let root = Stage::Sort {
         node,
-        keys: vec![(key, desc)],
+        keys: sort_keys,
         outputs: vec![record],
         limit,
         input: Box::new(project),
     };
+    let mut pattern = Document::new();
+    for (field, desc) in keys {
+        pattern.insert(field.clone(), if *desc { -1 } else { 1 });
+    }
     let mut sort = doc! {
         "stage": "SORT",
         "planNodeId": node as i32,
-        "sortPattern": { field: if desc { -1 } else { 1 } },
+        "sortPattern": pattern,
         "memLimit": 104_857_600_i32,
     };
     if front.limit > 0 {
@@ -728,7 +788,7 @@ mod tests {
     fn sort_plans_are_mongods() {
         let gt1 = || front(doc! { "x": { "$gt": 1 } }, 0, 0);
         let sorted = |f: &Front, field: &str, desc: bool| {
-            let plan = super::build_sorted("u", f, field, desc).expect("built");
+            let plan = super::build_sorted("u", f, &[(field.to_string(), desc)]).expect("built");
             let sbp = plan.winning_plan(false);
             let sbp = sbp.get_document("slotBasedPlan").unwrap();
             (
@@ -758,8 +818,32 @@ mod tests {
                     .to_string()
             )
         );
+        let keys = |k: &[(&str, bool)]| -> Vec<(String, bool)> {
+            k.iter().map(|(f, d)| (f.to_string(), *d)).collect()
+        };
+        let multi = |f: &Front, k: &[(&str, bool)]| {
+            let plan = super::build_sorted("u", f, &keys(k)).expect("built");
+            let sbp = plan.winning_plan(false);
+            let sbp = sbp.get_document("slotBasedPlan").unwrap();
+            sbp.get_str("stages").unwrap().to_string()
+        };
+        // Two keys and three (mongod 8.2.11, measured 2026-11-28).
+        assert_eq!(
+            multi(&gt1(), &[("z", false), ("y", true)]),
+            "[2] sort [s6, s7] [asc, desc] [s1] \n\
+             [2] project [s6 = getSortKeyAsc(s4), s7 = getSortKeyDesc(s3), s8 = ((!((isArray(s4) ?: false)) || !((isArray(s3) ?: false))) || fail(2, \"cannot sort with keys that are parallel arrays\"))] \n\
+             [1] filter {traverseF(s5, lambda(l2.0) { ((move(l2.0) > 1) ?: false) }, false)} \n\
+             [1] scan s1 s2 none none none none none none [s3 = y, s4 = z, s5 = x] @\"u\" true false "
+        );
+        let a1 = front(doc! { "a": { "$eq": 1 } }, 0, 0);
+        let three = multi(&a1, &[("z", false), ("y", false), ("b", true)]);
+        assert!(three.contains(
+            "s10 = ((((((isArray(s5) ?: false) <=> false) + ((isArray(s4) ?: false) <=> false)) + ((isArray(s3) ?: false) <=> false)) <= 1) || fail(2, "
+        ), "{three}");
         // Not built: a path, a skip.
-        assert!(super::build_sorted("u", &gt1(), "d.e", false).is_none());
-        assert!(super::build_sorted("u", &front(doc! {}, 1, 0), "y", false).is_none());
+        assert!(super::build_sorted("u", &gt1(), &[("d.e".to_string(), false)]).is_none());
+        assert!(
+            super::build_sorted("u", &front(doc! {}, 1, 0), &[("y".to_string(), false)]).is_none()
+        );
     }
 }

@@ -27,6 +27,10 @@ pub(crate) enum BinOp {
     Div,
     LogicOr,
     LogicAnd,
+    /// `<=>`: the three-way comparison, an int32 -1, 0 or 1.
+    Cmp3w,
+    /// `+`.
+    Add,
 }
 
 /// An SBE expression.
@@ -389,6 +393,20 @@ impl Expr {
                             return None;
                         };
                         match op {
+                            BinOp::Cmp3w => {
+                                Some(Bson::Int32(match secantus_core::order::cmp(&x, &y) {
+                                    Ordering::Less => -1,
+                                    Ordering::Equal => 0,
+                                    Ordering::Greater => 1,
+                                }))
+                            }
+                            BinOp::Add => match (&x, &y) {
+                                (Bson::Int32(p), Bson::Int32(q)) => Some(
+                                    p.checked_add(*q)
+                                        .map_or(Bson::Int64(*p as i64 + *q as i64), Bson::Int32),
+                                ),
+                                _ => Some(Bson::Double(as_f64(&x)? + as_f64(&y)?)),
+                            },
                             BinOp::Div => {
                                 let (p, q) = (as_f64(&x)?, as_f64(&y)?);
                                 (q != 0.0).then(|| Bson::Double(p / q))
@@ -535,6 +553,11 @@ impl Expr {
                     other => other,
                 }
             }
+            // `fail(code, message)`: the error is the command's to raise
+            // (a `find` on parallel arrays fails with code 2 on both
+            // servers); an `executionStats` explain of it answers on
+            // mongod 8.2.11 too (measured 2026-11-28), so it is Nothing.
+            "fail" => None,
             "isNumber" => args[0].eval(env).map(|v| Bson::Boolean(is_number(&v))),
             "isArray" => args[0]
                 .eval(env)

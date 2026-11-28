@@ -296,6 +296,8 @@ fn op_text(op: BinOp) -> &'static str {
         BinOp::Div => "/",
         BinOp::LogicOr => "||",
         BinOp::LogicAnd => "&&",
+        BinOp::Cmp3w => "<=>",
+        BinOp::Add => "+",
     }
 }
 

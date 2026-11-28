@@ -76,11 +76,11 @@ pub(crate) fn find_plan(uuid: &str, front: &Front, projection: Option<&Document>
     find::build(uuid, front, projection)
 }
 
-/// The plan for a `find` whose query is `front`, sorted on the one
-/// top-level `field` (`desc`: descending) under `queryFramework: "sbe"`
+/// The plan for a `find` whose query is `front`, sorted on `keys`
+/// (top-level fields, `true`: descending) under `queryFramework: "sbe"`
 /// (RM-543). `None` when it is outside what is built here.
-pub(crate) fn sorted_plan(uuid: &str, front: &Front, field: &str, desc: bool) -> Option<Plan> {
-    find::build_sorted(uuid, front, field, desc)
+pub(crate) fn sorted_plan(uuid: &str, front: &Front, keys: &[(String, bool)]) -> Option<Plan> {
+    find::build_sorted(uuid, front, keys)
 }
 
 /// The plan for a query `front` with `adds` (`$addFields` specs, in
