@@ -6586,7 +6586,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # Measured on PostgreSQL 15.20 (a private cluster): an outer OR, IN
     # list or expression comparison beside the anti join is its outer
-    # scan's Filter, priced (found while working RP-1027).
+    # scan's Filter, priced (found while working RP-1027). Each printed an
+    # unpriced plan before RP-1134, the third a Hash Left Join.
     "a not exists beside an outer or is a hash anti join": (
         "RP-1134",
         _ANALYSED,
@@ -6627,6 +6628,97 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (length(b) > 1)",
             "  ->  Hash  (cost=15.00..15.00 rows=1000 width=4)",
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20: an IN list over an inner join's key
+    # restricts that side's scan and leaves the join clause, as a bound
+    # does; unpriced before RP-1134, which read it as an equality joining
+    # the key's equivalence class.
+    "an in list over an inner join's key restricts its scan": (
+        "RP-1134",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a = e2.a where e.a in (1, 2, 3)",
+        [
+            "Hash Join  (cost=18.79..37.57 rows=3 width=14)",
+            "  Hash Cond: (e2.a = e.a)",
+            "  ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=18.75..18.75 rows=3 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..18.75 rows=3 width=7)",
+            "              Filter: (a = ANY ('{1,2,3}'::integer[]))",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20: the LEFT join spelling of the anti
+    # join beside an outer expression comparison (RP-1134).
+    "a left join anti form beside an outer expression comparison": (
+        "RP-1134",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a = e2.a"
+        " where length(e.b) > 1 and e2.a is null",
+        [
+            "Hash Anti Join  (cost=27.50..48.75 rows=1 width=14)",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..20.00 rows=333 width=7)",
+            "        Filter: (length(b) > 1)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20 (a private cluster): an OR restricting
+    # one side of an inner or LEFT join is that side's scan's Filter,
+    # priced; a one-item IN list is an equality, which fixes the key's
+    # class (found while working RP-1134).
+    "an inner join beside an or restriction of one side": (
+        "RP-1242",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a = e2.a where (e.b = 'v1' or e.b = 'v2')",
+        [
+            "Hash Join  (cost=22.38..43.02 rows=190 width=14)",
+            "  Hash Cond: (e2.a = e.a)",
+            "  ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=20.00..20.00 rows=190 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..20.00 rows=190 width=7)",
+            "              Filter: ((b = 'v1'::text) OR (b = 'v2'::text))",
+        ],
+    ),
+    "a left join beside an or restriction of its preserved key": (
+        "RP-1242",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a = e2.a where (e.a > 900 or e.a < 10)",
+        [
+            "Hash Right Join  (cost=21.35..41.18 rows=108 width=14)",
+            "  Hash Cond: (e2.a = e.a)",
+            "  ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=20.00..20.00 rows=108 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..20.00 rows=108 width=7)",
+            "              Filter: ((a > 900) OR (a < 10))",
+        ],
+    ),
+    "a one item in list over an inner join's key fixes its class": (
+        "RP-1242",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a = e2.a where e.a in (3)",
+        [
+            "Nested Loop  (cost=0.00..35.01 rows=1 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "        Filter: (a = 3)",
+            "  ->  Seq Scan on e e2  (cost=0.00..17.50 rows=1 width=7)",
+            "        Filter: (a = 3)",
+        ],
+    ),
+    # Measured on PostgreSQL 15.20: a strict expression comparison over a
+    # LEFT join's nullable side makes the join inner, pushed to that
+    # side's scan (found while working RP-1134).
+    "a left join beside a strict expression over its nullable side is inner": (
+        "RP-1243",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a = e2.a where length(e2.b) > 1",
+        [
+            "Hash Join  (cost=24.16..46.24 rows=333 width=14)",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=20.00..20.00 rows=333 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..20.00 rows=333 width=7)",
+            "              Filter: (length(b) > 1)",
         ],
     ),
     # Measured on PostgreSQL 15.19: a temporary table's scan names the
@@ -11643,6 +11735,7 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1134",
         "RP-1129",
         "RP-1127",
         "RP-1121",

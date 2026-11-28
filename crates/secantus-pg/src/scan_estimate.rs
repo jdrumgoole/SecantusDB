@@ -500,7 +500,18 @@ impl PgHandler {
         let JoinNode::Leaf { def, .. } = right.as_ref() else {
             return None;
         };
-        if sel.residual.is_some() || !j.where_filters.is_empty() {
+        // A residual is the WHERE's expression comparisons re-checked above
+        // the join where it is those alone, each over the preserved side and
+        // pushed to its scan, which prices them (RP-423's `join_exprs_of`,
+        // RP-1134). The `IS NULL` beside them is no scan's, so the WHERE is
+        // never `where_modelled` here.
+        let preserved_exprs = |r: &secantus_pgplan::ColumnExpr| {
+            join_exprs_modelled()
+                && leaf_alias(left).is_some_and(join_exprs_only_of)
+                && residual_conjuncts(r) == Some(join_exprs_count())
+        };
+        if sel.residual.as_ref().is_some_and(|r| !preserved_exprs(r)) || !j.where_filters.is_empty()
+        {
             return None;
         }
         // Beside the `IS NULL`, a conjunct over the preserved side alone
@@ -2398,7 +2409,7 @@ impl PgHandler {
         let priced = |p: &JoinedSide| {
             if !p.filter.is_empty()
                 && filter_names(&p.filter, &p.field)
-                && !bounds_only(&p.filter, &p.field)
+                && !keeps_join_clause(&p.filter, &p.field)
             {
                 return None;
             }
@@ -2796,7 +2807,9 @@ impl PgHandler {
         // A WHERE whose every conjunct was pushed to a scan is re-checked
         // above the join too; where those are the expression comparisons
         // the scans are priced with, that residual is theirs (RP-423).
-        let pushed_exprs = !comma_clause && j.where_modelled && join_exprs_modelled();
+        // An anti join's residual is that, [`Self::left_anti_key`] proved
+        // (RP-1134).
+        let pushed_exprs = !comma_clause && (anti || (j.where_modelled && join_exprs_modelled()));
         // A comma join's residual holds its key equalities and, beside
         // them, those same expression comparisons (`e.a = w.a and
         // length(e.b) > 2`).
@@ -10300,13 +10313,6 @@ pub(crate) enum JoinPick {
 /// column)` (RP-364).
 pub(crate) type LeftImplied = (Vec<(String, String)>, (String, String));
 
-/// Whether a stored filter reads `field` anywhere (under `$and`, `$or`
-/// and operators alike).
-/// Does `filter` name `field` only to bound it -- `>`, `>=`, `<`, `<=`
-/// against a constant, at its top or under `$and`? Such a qual is a
-/// restriction of its scan (`distribute_restrictinfo_to_rels`) and leaves
-/// the column's join clause in place, as an equality would not: that one
-/// joins the key's equivalence class (RP-363).
 /// `filter` is one bound of one column against a constant -- `{a: {$gt:
 /// 990}}` -- the shape `clauselist_selectivity` defers as a range clause.
 fn single_bound(filter: &Document) -> bool {
@@ -10318,6 +10324,11 @@ fn single_bound(filter: &Document) -> bool {
     }
 }
 
+/// Does `filter` name `field` only to bound it -- `>`, `>=`, `<`, `<=`
+/// against a constant, at its top or under `$and`? Such a qual is a
+/// restriction of its scan (`distribute_restrictinfo_to_rels`) and leaves
+/// the column's join clause in place, as an equality would not: that one
+/// joins the key's equivalence class (RP-363).
 fn bounds_only(filter: &Document, field: &str) -> bool {
     filter.iter().all(|(k, v)| match (k.as_str(), v) {
         ("$and", bson::Bson::Array(items)) => items.iter().all(|x| match x {
@@ -10335,6 +10346,34 @@ fn bounds_only(filter: &Document, field: &str) -> bool {
         (k, v) if k.starts_with('$') => !filter_names(&bson::doc! { "x": v.clone() }, field),
         (_, bson::Bson::Document(d)) => !filter_names(d, field),
         _ => true,
+    })
+}
+
+/// Does `filter` leave the join clause on `field` in place? Only a
+/// top-level equality of the key with a constant joins its equivalence
+/// class (`distribute_qual_to_rels` makes one only of a mergejoinable
+/// `=`, RP-363). A bound ([`bounds_only`]), an OR -- even of equalities
+/// -- and an IN list of two or more items (a `ScalarArrayOpExpr`, while
+/// `a IN (1)` is `a = 1`) are restrictions of the key's scan, which
+/// price there (RP-1134).
+fn keeps_join_clause(filter: &Document, field: &str) -> bool {
+    filter.iter().all(|(k, v)| match (k.as_str(), v) {
+        ("$and", bson::Bson::Array(items)) => items.iter().all(|x| match x {
+            bson::Bson::Document(d) => keeps_join_clause(d, field),
+            _ => false,
+        }),
+        ("$or", bson::Bson::Array(items)) => items.len() >= 2,
+        (k, bson::Bson::Document(d)) if k == field => {
+            !d.is_empty()
+                && d.iter().all(|(op, c)| match (op.as_str(), c) {
+                    ("$gt" | "$gte" | "$lt" | "$lte", c) => {
+                        !matches!(c, bson::Bson::Document(_) | bson::Bson::Array(_))
+                    }
+                    ("$in", bson::Bson::Array(items)) => items.len() >= 2,
+                    _ => false,
+                })
+        }
+        _ => bounds_only(&bson::doc! { k: v.clone() }, field),
     })
 }
 
@@ -10367,6 +10406,8 @@ fn held_by_leaf(left: &secantus_pgplan::joins::JoinNode, c: &Document) -> bool {
                 if PushedConjuncts::new(&leaf.filter).holds(f, v))
 }
 
+/// Whether a stored filter reads `field` anywhere (under `$and`, `$or`
+/// and operators alike).
 fn filter_names(filter: &Document, field: &str) -> bool {
     filter.iter().any(|(k, v)| {
         k == field
@@ -10378,6 +10419,22 @@ fn filter_names(filter: &Document, field: &str) -> bool {
                 }),
                 _ => false,
             }
+    })
+}
+
+/// How many top-level conjuncts a select's residual holds: its AND's
+/// arguments, or one. `None` for a residual that is not an expression
+/// over the joined row.
+fn residual_conjuncts(residual: &secantus_pgplan::ColumnExpr) -> Option<usize> {
+    use pg_query::protobuf::node::Node as N;
+    let secantus_pgplan::ColumnExpr::Row { expr, .. } = residual else {
+        return None;
+    };
+    Some(match expr.node.as_ref() {
+        Some(N::BoolExpr(b)) if b.boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 => {
+            b.args.len()
+        }
+        _ => 1,
     })
 }
 
@@ -10602,6 +10659,36 @@ mod key_bound_tests {
         // The key under an OR is not a bound of the scan.
         assert!(!bounds_only(
             &doc! { "$or": [{ "a": { "$gt": 5 } }, { "b": "v1" }] },
+            "a"
+        ));
+    }
+
+    #[test]
+    fn only_an_equality_on_the_key_replaces_its_join_clause() {
+        use super::keeps_join_clause;
+        // A bound, an OR (of equalities too) and an IN list of two or more
+        // restrict the key's scan (RP-1134).
+        assert!(keeps_join_clause(&doc! { "a": { "$gt": 5 } }, "a"));
+        assert!(keeps_join_clause(
+            &doc! { "$or": [{ "a": { "$gt": 900 } }, { "a": { "$lt": 10 } }] },
+            "a"
+        ));
+        assert!(keeps_join_clause(
+            &doc! { "$or": [{ "a": 1 }, { "a": 2 }] },
+            "a"
+        ));
+        assert!(keeps_join_clause(&doc! { "a": { "$in": [1, 2, 3] } }, "a"));
+        assert!(keeps_join_clause(
+            &doc! { "$and": [{ "a": { "$in": [1, 2] } }, { "b": "v1" }] },
+            "a"
+        ));
+        // An equality joins the key's equivalence class (RP-363), and
+        // `a IN (1)` is `a = 1`.
+        assert!(!keeps_join_clause(&doc! { "a": 5 }, "a"));
+        assert!(!keeps_join_clause(&doc! { "a": { "$eq": 5 } }, "a"));
+        assert!(!keeps_join_clause(&doc! { "a": { "$in": [1] } }, "a"));
+        assert!(!keeps_join_clause(
+            &doc! { "$and": [{ "a": 5 }, { "b": "v1" }] },
             "a"
         ));
     }

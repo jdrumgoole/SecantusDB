@@ -3980,24 +3980,38 @@ from 15.19): every statement is VALUES-only. The gap tests are in
 
 ## Found while working RP-1027 (2026-11-26)
 
-- [ ] **An anti join beside an outer OR, IN list or expression comparison
-      is unpriced.** `select * from e where (a > 900 or a < 10) and not
-      exists (select 1 from e e2 where e2.a = e.a)` is in PostgreSQL 15.20
-      (a private cluster, the gap tests' analysed `e`) `Hash Anti Join
-      (cost=27.50..47.91 rows=1 width=7)` over `Seq Scan on e
-      (cost=0.00..20.00 rows=108 width=7)`; `a in (1, 2, 3)` is
-      `(cost=27.50..46.26 rows=1 ...)` over `rows=3`, and `length(b) > 1`
-      `(cost=27.50..48.75 rows=1 ...)` over `rows=333`. Here the first two
-      print an unpriced `Hash Anti Join` with the right shape, and the
-      third an unpriced `Hash Left Join` with `Filter: (e2.a IS NULL)`:
-      RP-1027 prices the anti join's outer scan where each conjunct is
-      one its leaf filter holds and `hash_side_with` prices, and an OR or
-      an IN list there is not priced on this path, while an expression
-      comparison is the select's residual, which `left_anti_key` refuses
-      (the inner join prices it, RP-423's `join_exprs_of`). The LEFT join
-      spellings are the same.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not exists beside an outer or is a hash anti join], tests/backlog/test_rp_explain_costs.py::test_plan[a not exists beside an outer in list is a hash anti join], tests/backlog/test_rp_explain_costs.py::test_plan[a not exists beside an outer expression comparison is a hash anti join]
-      Backlog-ID: RP-1134
+
+## Found while working RP-1134 (2026-11-28)
+
+- [ ] **An inner or LEFT hash join whose WHERE restricts one side with an
+      OR is unpriced.** `explain select * from e join e e2 on e.a = e2.a
+      where (e.b = 'v1' or e.b = 'v2')` is in PostgreSQL 15.20 (a private
+      cluster, the gap tests' analysed `e`) `Hash Join (cost=22.38..43.02
+      rows=190 width=14)`, the filtered `e` hashed; `... left join e e2 on
+      e.a = e2.a where (e.a > 900 or e.a < 10)` is `Hash Right Join
+      (cost=21.35..41.18 rows=108 width=14)`. Here both print the right
+      scans and Filter with zero costs, an OR of the key's equalities
+      (`e.a = 3 or e.a = 4`) too. The anti join over the same OR prices
+      (RP-1134), so the side's scan does: the inner and LEFT paths refuse
+      before it. `e.a in (3)`, which PostgreSQL makes `a = 3` and a
+      Nested Loop of two scans each `Filter: (a = 3)`, is an unpriced Hash
+      Join here.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an inner join beside an or restriction of one side], tests/backlog/test_rp_explain_costs.py::test_plan[a left join beside an or restriction of its preserved key], tests/backlog/test_rp_explain_costs.py::test_plan[a one item in list over an inner join's key fixes its class]
+      Backlog-ID: RP-1242
+
+- [ ] **A LEFT JOIN whose WHERE compares an expression over the nullable
+      side is not reduced to an inner join.** `explain select * from e
+      left join e e2 on e.a = e2.a where length(e2.b) > 1` is in
+      PostgreSQL 15.20 `Hash Join (cost=24.16..46.24 rows=333 width=14)`,
+      `Filter: (length(b) > 1)` on the hashed `e e2` scan: the comparison
+      is strict, so `reduce_outer_joins` makes the join inner and
+      `distribute_qual_to_rels` pushes it to that scan. Here it is an
+      unpriced `Hash Left Join` with the comparison its join `Filter`.
+      Beside `e2.a IS NULL` (`... where length(e2.b) > 1 and e2.a is
+      null`) PostgreSQL's is a `Hash Join` whose `e2` scan filters `((a IS
+      NULL) AND (length(b) > 1))`, rows=1; here a Hash Left Join.
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join beside a strict expression over its nullable side is inner]
+      Backlog-ID: RP-1243
 
 ## Found on another session's gate (2026-11-26)
 
