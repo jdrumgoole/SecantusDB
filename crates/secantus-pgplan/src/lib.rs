@@ -447,6 +447,24 @@ impl Error {
             {
                 Some("You must specify an operator class for the index or define a default operator class for the data type.")
             }
+            // A partition key's (`ComputePartitionAttrs`, RP-1091).
+            Error::UndefinedObject(m)
+                if m.starts_with("data type ")
+                    && m.ends_with(" has no default operator class for access method \"btree\"") =>
+            {
+                Some("You must specify a btree operator class or define a default btree operator class for the data type.")
+            }
+            Error::UndefinedObject(m)
+                if m.starts_with("data type ")
+                    && m.ends_with(" has no default operator class for access method \"hash\"") =>
+            {
+                Some("You must specify a hash operator class or define a default hash operator class for the data type.")
+            }
+            Error::Sqlstate("42P16", m)
+                if m.starts_with("no collation was derived for partition key column ") =>
+            {
+                Some("Use the COLLATE clause to set the collation explicitly.")
+            }
             // A PREFIX operator (`- oid`) has one argument, and its hint says so.
             Error::UndefinedFunction(m)
                 if m
@@ -19900,130 +19918,13 @@ fn order_by_ambiguity(s: &pg_query::protobuf::SelectStmt) -> Result<()> {
     Ok(())
 }
 
-/// The name PostgreSQL gives an unaliased expression column: a cast or a
-/// parenthesised reference keeps the column's name, a call takes the
-/// function's, anything else is `?column?`.
+/// The name PostgreSQL gives an unaliased expression column:
+/// `FigureColname`, whose port is `nodetostring::target` (a column or a
+/// call names itself, a cast keeps a definite name from beneath it and
+/// otherwise takes its type's, a `COLLATE` is named for its argument,
+/// anything nameless is `?column?`).
 fn expression_column_name(node: &pg_query::protobuf::Node) -> String {
-    match node.node.as_ref() {
-        // The last field NAME, a trailing `*` ignored (`t.*` is `t`), as
-        // FigureColnameInternal reads a ColumnRef.
-        Some(N::ColumnRef(c)) => c
-            .fields
-            .iter()
-            .rev()
-            .find_map(|f| match f.node.as_ref() {
-                Some(N::String(st)) => Some(st.sval.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| "?column?".to_string()),
-        // A cast keeps a column's or a call's name (`id::int8` is `id`,
-        // `abs(n)::int8` is `abs`) and otherwise takes the TARGET type's bare
-        // name: `(1 + 2)::int8` is `int8`, `x::varchar(3)` is `varchar`.
-        // Nested casts resolve from the inside: `(id::text)::int8` is still
-        // `id`, and `('1'::text)::int8` is the OUTER type, `int8`.
-        Some(N::TypeCast(tc)) => {
-            let inner = tc.arg.as_deref();
-            let strong = inner.is_some_and(cast_source_names_column);
-            let inner_name = inner.map(expression_column_name);
-            match inner_name {
-                Some(n) if strong => n,
-                _ => tc
-                    .type_name
-                    .as_ref()
-                    .and_then(|t| t.names.last())
-                    .and_then(type_name_of_node)
-                    .unwrap_or_else(|| "?column?".to_string()),
-            }
-        }
-        Some(N::FuncCall(f)) => f
-            .funcname
-            .last()
-            .and_then(|n| match n.node.as_ref() {
-                Some(N::String(st)) => Some(st.sval.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| "?column?".to_string()),
-        // The constructor keywords name their column: `array[1]` is `array`,
-        // `row(1)` is `row`, `coalesce(1)` / `greatest(1, 2)` / `least(1)` /
-        // `nullif(1, 2)` take the keyword. Measured on PG 16.
-        // A subquery is named for what it returns: a scalar subquery takes its
-        // one column's name (`(select t.id ...)` is `id`, an alias wins),
-        // EXISTS is `exists` and ARRAY(...) `array`. All three were
-        // `?column?`, so `ORDER BY id` over `id` and `(select t.id ...)` was
-        // not seen as PostgreSQL's 42702 ambiguity.
-        Some(N::SubLink(sl)) => match SubLinkType::try_from(sl.sub_link_type) {
-            Ok(SubLinkType::ExistsSublink) => "exists".to_string(),
-            Ok(SubLinkType::ArraySublink) => "array".to_string(),
-            Ok(SubLinkType::ExprSublink) => {
-                match sl.subselect.as_deref().and_then(|n| n.node.as_ref()) {
-                    // A set operation's targets are its leftmost arm's
-                    // (`transformSetOperationStmt`), which is where the
-                    // analysed query's first `resname` comes from (RP-698).
-                    Some(N::SelectStmt(sel)) => {
-                        let sel = prune_outputs::leftmost_arm(sel);
-                        match sel.target_list.first().and_then(|t| t.node.as_ref()) {
-                            Some(N::ResTarget(rt)) if !rt.name.is_empty() => rt.name.clone(),
-                            Some(N::ResTarget(rt)) => rt
-                                .val
-                                .as_deref()
-                                .map_or_else(|| "?column?".to_string(), expression_column_name),
-                            _ => "?column?".to_string(),
-                        }
-                    }
-                    _ => "?column?".to_string(),
-                }
-            }
-            _ => "?column?".to_string(),
-        },
-        Some(N::AArrayExpr(_)) => "array".to_string(),
-        Some(N::RowExpr(_)) => "row".to_string(),
-        // The SQL/XML keywords name their column too (FigureColname);
-        // `IS DOCUMENT` is nameless.
-        Some(N::XmlExpr(x)) => {
-            use pg_query::protobuf::XmlExprOp as Op;
-            match Op::try_from(x.op) {
-                Ok(Op::IsXmlconcat) => "xmlconcat",
-                Ok(Op::IsXmlelement) => "xmlelement",
-                Ok(Op::IsXmlforest) => "xmlforest",
-                Ok(Op::IsXmlparse) => "xmlparse",
-                Ok(Op::IsXmlpi) => "xmlpi",
-                Ok(Op::IsXmlroot) => "xmlroot",
-                Ok(Op::IsXmlserialize) => "xmlserialize",
-                _ => "?column?",
-            }
-            .to_string()
-        }
-        Some(N::XmlSerialize(_)) => "xmlserialize".to_string(),
-        Some(N::CoalesceExpr(_)) => "coalesce".to_string(),
-        Some(N::MinMaxExpr(m)) => {
-            if m.op == pg_query::protobuf::MinMaxOp::IsGreatest as i32 {
-                "greatest".to_string()
-            } else {
-                "least".to_string()
-            }
-        }
-        Some(N::AExpr(e)) if AExprKind::try_from(e.kind) == Ok(AExprKind::AexprNullif) => {
-            "nullif".to_string()
-        }
-        // A CASE takes its ELSE result's name when that is a definite one
-        // (`else c.relnatts` is `relnatts`), and is `case` otherwise
-        // (FigureColnameInternal, RP-1046).
-        Some(N::CaseExpr(_)) => nodetostring::target::figure_colname(node),
-        // A subscript / field selection names from what it selects: `x[1]`
-        // is `x`, `(array[1, 2])[1]` is `array`, and `(r).f` is the field.
-        Some(N::AIndirection(ind)) => {
-            let field = ind.indirection.last().and_then(|n| match n.node.as_ref() {
-                Some(N::String(st)) => Some(st.sval.clone()),
-                _ => None,
-            });
-            match (field, ind.arg.as_deref()) {
-                (Some(f), _) => f,
-                (None, Some(arg)) => expression_column_name(arg),
-                (None, None) => "?column?".to_string(),
-            }
-        }
-        _ => "?column?".to_string(),
-    }
+    nodetostring::target::figure_colname(node)
 }
 
 /// A rewrite that replaces a select-list expression (`>>` over inets as
@@ -20057,42 +19958,6 @@ fn keep_target_names(
         if expression_column_name(va) != name {
             ra.name = name;
         }
-    }
-}
-
-/// Does this cast source name its column -- a column reference or a call,
-/// through any number of casts? (PostgreSQL's `FigureColname` strength 2.)
-fn cast_source_names_column(node: &pg_query::protobuf::Node) -> bool {
-    match node.node.as_ref() {
-        // PostgreSQL's FigureColname "strength 2" sources: anything that
-        // yields a definite name keeps it through a cast (`array[1]::text`
-        // is `array`); only a nameless expression takes the target type.
-        Some(N::ColumnRef(_))
-        | Some(N::FuncCall(_))
-        | Some(N::AArrayExpr(_))
-        | Some(N::RowExpr(_))
-        | Some(N::CoalesceExpr(_))
-        | Some(N::MinMaxExpr(_)) => true,
-        Some(N::AExpr(e)) => AExprKind::try_from(e.kind) == Ok(AExprKind::AexprNullif),
-        Some(N::AIndirection(ind)) => {
-            ind.indirection
-                .last()
-                .is_some_and(|n| matches!(n.node.as_ref(), Some(N::String(_))))
-                || ind.arg.as_deref().is_some_and(cast_source_names_column)
-        }
-        Some(N::TypeCast(tc)) => tc.arg.as_deref().is_some_and(cast_source_names_column),
-        // A CASE whose ELSE names its column keeps that name through a cast;
-        // a bare `case` is only a fallback, so the cast's type wins.
-        Some(N::CaseExpr(_)) => nodetostring::target::figure_colname_strength(node).1 == 2,
-        // A scalar subquery always names its column (its one target's
-        // `resname`, `?column?` included), as EXISTS and ARRAY(...) do: so
-        // `(select 1 + 1)::int` is `?column?` and `(select a)::int` is `a`.
-        // ANY / ALL / a row comparison names nothing.
-        Some(N::SubLink(sl)) => matches!(
-            SubLinkType::try_from(sl.sub_link_type),
-            Ok(SubLinkType::ExprSublink | SubLinkType::ExistsSublink | SubLinkType::ArraySublink)
-        ),
-        _ => false,
     }
 }
 

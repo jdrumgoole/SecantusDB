@@ -1,6 +1,7 @@
 """Gap tests of the divergences found while working RP-1046 (a CASE column
 takes its ELSE result's name): two more shapes `FigureColnameInternal`
-names that the planner's column naming does not.
+names that the planner's column naming did not, until RP-1093 made the
+planner's naming that port.
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.20 cluster; the statements create nothing.
@@ -26,7 +27,7 @@ def _names(rust_pg: Any, sql: str) -> object:
 
 # A SQLValueFunction names its column at strength 2 (`user`,
 # `current_date`, ...), so a cast above keeps the keyword's name.
-@pytest.mark.backlog("RP-1093")
+@pytest.mark.backlog_fixed("RP-1093")
 def test_a_cast_of_a_sql_value_function_keeps_its_name(rust_pg: Any) -> None:
     got = _names(
         rust_pg,
@@ -45,7 +46,7 @@ def test_a_cast_of_a_sql_value_function_keeps_its_name(rust_pg: Any) -> None:
 
 # A CollateClause is named for its argument (FigureColnameInternal recurses
 # into `arg`), and a cast above keeps that name.
-@pytest.mark.backlog("RP-1093")
+@pytest.mark.backlog_fixed("RP-1093")
 def test_a_collate_clause_keeps_its_argument_name(rust_pg: Any) -> None:
     got = _names(
         rust_pg,

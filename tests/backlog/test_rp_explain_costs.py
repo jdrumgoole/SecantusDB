@@ -11638,11 +11638,17 @@ def test_an_index_only_scan_after_a_delete_and_vacuum(rust_pg: Any) -> None:
 
 # Analysed, never vacuumed: every page is left off the visibility map, so
 # an index-only scan fetches the heap for each index tuple it reads.
+# Autovacuum is off for both tables, as PostgreSQL's own regression tests
+# keep it from the tables whose dead versions they count: `n`'s 5,000
+# inserts pass the insert threshold (1,000 + 0.2 x 5,000), and a launcher
+# wake mid-test vacuumed `n` on CI (#3109, 2026-11-28), so the second bitmap
+# scan read 100 index entries where the test asks for the dead ones too.
+# PostgreSQL 15.20 and this server print the same plans with it off.
 _UNVACUUMED = [
-    "create table k (a int primary key, b text)",
+    "create table k (a int primary key, b text) with (autovacuum_enabled = false)",
     "insert into k select g, 'v' || (g % 10) from generate_series(1, 1000) g",
     "analyze k",
-    "create table n (a int, b int, c text)",
+    "create table n (a int, b int, c text) with (autovacuum_enabled = false)",
     "insert into n select g, g % 50, 'x' || (g % 7) from generate_series(1, 5000) g",
     "create index n_b on n (b)",
     "analyze n",

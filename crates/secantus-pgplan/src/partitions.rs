@@ -88,17 +88,62 @@ pub(crate) fn lower_create(
             _ => return Err(Error::Unsupported("this partitioning strategy".into())),
         };
         let mut columns = Vec::new();
+        // Each key's COLLATE and operator class as written, resolved once
+        // the table's columns are (`key_types`): the element's own COLLATE,
+        // and the one a key expression carries at its top.
+        let (mut key_collate, mut expr_collate, mut key_opclass) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let name_of = |nodes: &[pg_query::protobuf::Node]| -> Vec<Bson> {
+            nodes
+                .iter()
+                .filter_map(|n| match n.node.as_ref() {
+                    Some(N::String(s)) => Some(Bson::String(s.sval.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
         for p in &spec.part_params {
             let Some(N::PartitionElem(e)) = p.node.as_ref() else {
                 continue;
             };
+            let mut outer = Bson::Null;
             // An expression key is kept as its SQL, parenthesised; its type
             // is settled once the table's columns are (see `key_types`).
             match e.expr.as_deref() {
-                Some(expr) => columns.push(Bson::String(format!("({})", deparse_expr(expr)?))),
+                Some(expr) => {
+                    // `ComputePartitionAttrs` strips any top-level COLLATE,
+                    // so `(x COLLATE y)` is `x COLLATE y`, and a key that is
+                    // then a bare column is that column.
+                    let mut inner = expr;
+                    while let Some(N::CollateClause(cc)) = inner.node.as_ref() {
+                        if outer == Bson::Null {
+                            outer = Bson::String(collation::clause_name(cc));
+                        }
+                        let Some(arg) = cc.arg.as_deref() else {
+                            break;
+                        };
+                        inner = arg;
+                    }
+                    match inner.node.as_ref() {
+                        Some(N::ColumnRef(c))
+                            if c.fields.len() == 1 && column_ref_name(c).is_some() =>
+                        {
+                            columns.push(Bson::String(column_ref_name(c).unwrap_or_default()));
+                        }
+                        _ => columns.push(Bson::String(format!("({})", deparse_expr(inner)?))),
+                    }
+                }
                 None if !e.name.is_empty() => columns.push(Bson::String(e.name.clone())),
                 None => return Err(Error::Parse("an empty partition key".into())),
             }
+            key_collate.push(name_of(&e.collation).pop().unwrap_or(Bson::Null));
+            expr_collate.push(outer);
+            let opclass = name_of(&e.opclass);
+            key_opclass.push(if opclass.is_empty() {
+                Bson::Null
+            } else {
+                Bson::Array(opclass)
+            });
         }
         if strategy == "list" && columns.len() > 1 {
             return Err(Error::Sqlstate(
@@ -108,7 +153,13 @@ pub(crate) fn lower_create(
         }
         extra.insert(
             "partition_by",
-            bson::doc! {"strategy": strategy, "columns": columns},
+            bson::doc! {
+                "strategy": strategy,
+                "columns": columns,
+                "key_collate": key_collate,
+                "expr_collate": expr_collate,
+                "key_opclass": key_opclass,
+            },
         );
         out.partspec = None;
     }
@@ -221,8 +272,19 @@ pub(crate) fn key_types(def: &mut TableDef) -> Result<()> {
                 .collect()
         })
         .unwrap_or_default();
-    let mut types = Vec::new();
-    for n in &names {
+    let written = |field: &str, i: usize| -> Option<Bson> {
+        by.get_array(field)
+            .ok()
+            .and_then(|a| a.get(i).cloned())
+            .filter(|b| *b != Bson::Null)
+    };
+    let method = if by.get_str("strategy") == Ok("hash") {
+        "hash"
+    } else {
+        "btree"
+    };
+    let (mut types, mut collations, mut opclasses) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, n) in names.iter().enumerate() {
         let ty = if n.starts_with('(') {
             match plan_check_expression(n, def)? {
                 ColumnExpr::Row { result_type, .. } if !result_type.is_empty() => result_type,
@@ -233,12 +295,329 @@ pub(crate) fn key_types(def: &mut TableDef) -> Result<()> {
             def.column(n)
                 .map_or_else(String::new, |c| c.pg_type.clone())
         };
+        let (collation, opclass) = if ty.is_empty() {
+            (String::new(), 0)
+        } else {
+            let text = |b: Bson| b.as_str().map(str::to_string);
+            let key_collate = written("key_collate", i).and_then(text);
+            let expr_collate = written("expr_collate", i).and_then(text);
+            let parts: Option<Vec<String>> = written("key_opclass", i).and_then(|b| {
+                b.as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+            });
+            (
+                key_collation(i, n, &ty, key_collate, expr_collate, def)?,
+                key_opclass(method, &ty, parts.as_deref())?,
+            )
+        };
         types.push(Bson::String(ty));
+        collations.push(Bson::String(collation));
+        opclasses.push(Bson::Int64(opclass));
     }
     let mut by = by;
     by.insert("key_types", types);
+    // `pg_partitioned_table.partcollation` and `partclass`: what each key
+    // compares under, its collation by name ("" for a type that takes
+    // none), its operator class by oid.
+    by.insert("collations", collations);
+    by.insert("opclasses", opclasses);
+    for written in ["key_collate", "expr_collate", "key_opclass"] {
+        by.remove(written);
+    }
     def.extra.insert("partition_by", by);
     Ok(())
+}
+
+/// The collation partition key `i` (`n`, of type `ty`) compares under, as
+/// `ComputePartitionAttrs` settles it: the expression's own (the COLLATE at
+/// its top, else the one it derives) must exist for a collatable type, then
+/// the element's COLLATE overrides it -- 42804 for a type that takes none,
+/// 42704 for one that does not exist. "" for a type that takes none.
+fn key_collation(
+    i: usize,
+    n: &str,
+    ty: &str,
+    key_collate: Option<String>,
+    expr_collate: Option<String>,
+    def: &TableDef,
+) -> Result<String> {
+    let collatable = collation::collatable(ty);
+    let mut chosen = match expr_collate {
+        Some(c) => Some(c),
+        None => natural_collation(n, def),
+    };
+    // `CheckAttributeType`, before the element's COLLATE is looked at.
+    if n.starts_with('(')
+        && collatable
+        && chosen
+            .as_deref()
+            .is_none_or(|c| c == collation::INDETERMINATE)
+    {
+        return Err(Error::Sqlstate(
+            "42P16",
+            format!(
+                "no collation was derived for partition key column {} with collatable type {}",
+                i + 1,
+                display_type(ty)
+            ),
+        ));
+    }
+    if let Some(c) = key_collate {
+        chosen = Some(c);
+    }
+    let Some(chosen) = chosen.filter(|c| c != collation::INDETERMINATE) else {
+        return Ok(String::new());
+    };
+    if !collatable {
+        return Err(Error::DatatypeMismatch(format!(
+            "collations are not supported by type {}",
+            display_type(ty)
+        )));
+    }
+    collation::resolve(&chosen)?;
+    Ok(chosen
+        .strip_prefix("pg_catalog.")
+        .unwrap_or(&chosen)
+        .to_string())
+}
+
+/// The operator class of `method` a partition key of type `ty` compares
+/// by, as `ComputePartitionAttrs` resolves it: the one written (42704 when
+/// the method has none of that name, 42804 when it does not take the type),
+/// else the type's default (42704 when it has none). Its oid, 0 for a
+/// default this server does not list.
+fn key_opclass(method: &str, ty: &str, written: Option<&[String]>) -> Result<i64> {
+    match written {
+        Some(parts) => misc_alter::explicit_opclass(method, parts, ty)
+            .map(|c| c.oid)
+            .ok_or_else(|| no_such_opclass(parts, method, ty)),
+        None => {
+            if let Err(Error::Sqlstate("42704", m)) = index_operator_class(method, ty, None) {
+                // Worded as an index's, hinted as a partition key's.
+                return Err(Error::UndefinedObject(m));
+            }
+            Ok(default_opclass(method, ty).map_or(0, |c| c.oid))
+        }
+    }
+}
+
+/// `GetDefaultOpClass`: the default class of `method` that takes `ty`, the
+/// one for exactly that type first (a `varchar` key takes `text_ops`).
+fn default_opclass(method: &str, ty: &str) -> Option<misc_alter::OpClass> {
+    let method_oid = misc_alter::method_oid(method)?;
+    let base = match domains::user_domain(ty) {
+        Some(d) => d.base.to_ascii_lowercase(),
+        None => ty.trim().to_ascii_lowercase(),
+    };
+    let exact = pgtypes::oid_of_name(&base);
+    let taking: Vec<misc_alter::OpClass> = misc_alter::all_opclasses()
+        .into_iter()
+        .filter(|c| c.method == method_oid && c.default)
+        .filter(|c| {
+            misc_alter::explicit_opclass(method, &[c.schema.clone(), c.name.clone()], ty)
+                .is_some_and(|found| found.oid == c.oid)
+        })
+        .collect();
+    taking
+        .iter()
+        .find(|c| Some(c.intype) == exact)
+        .or_else(|| taking.first())
+        .cloned()
+}
+
+/// The collation partition key `n` has of itself (`exprCollation`, or the
+/// column's): a column's declared one, else its type's; an expression's as
+/// parse analysis assigns it. `None` for a type that takes none;
+/// [`collation::INDETERMINATE`] for implicit collations that conflict.
+pub fn natural_collation(n: &str, def: &TableDef) -> Option<String> {
+    if !n.starts_with('(') {
+        let col = def.column(n)?;
+        return match col.extra.get_str("collation") {
+            Ok(c) => Some(c.to_string()),
+            Err(_) => type_collation(&col.pg_type),
+        };
+    }
+    let parsed = pg_query::parse(&format!("SELECT {n}")).ok()?;
+    let node = parsed.protobuf.stmts.first()?.stmt.as_deref()?;
+    let Some(N::SelectStmt(s)) = node.node.as_ref() else {
+        return None;
+    };
+    let Some(N::ResTarget(rt)) = s.target_list.first()?.node.as_ref() else {
+        return None;
+    };
+    derive_collation(rt.val.as_deref()?, def).map(|(c, _)| c)
+}
+
+/// A type's own collation (`typcollation`): a domain's COLLATE, "C" for
+/// `name`, "default" for the other collatable types, `None` for the rest.
+fn type_collation(ty: &str) -> Option<String> {
+    if !collation::collatable(ty) {
+        return None;
+    }
+    if let Some(c) = domains::declared_collation(ty) {
+        return Some(c);
+    }
+    let base = domains::base_type_and_typmod(ty).map_or_else(|| ty.to_string(), |(b, _, _)| b);
+    Some(if base.trim_end_matches("[]") == "name" {
+        "C".into()
+    } else {
+        "default".into()
+    })
+}
+
+/// The collation `assign_collations` gives `n` over `def`'s columns, and
+/// whether it is explicit: a COLLATE is; a column's is implicit; an
+/// expression of a collatable type takes its inputs' (an explicit one
+/// first, a non-default implicit one over "default", two different
+/// non-default implicit ones conflicting), or its type's when no input has
+/// one. `None` for a type that takes no collation.
+fn derive_collation(n: &pg_query::protobuf::Node, def: &TableDef) -> Option<(String, bool)> {
+    match n.node.as_ref()? {
+        N::CollateClause(cc) => return Some((collation::clause_name(cc), true)),
+        N::ColumnRef(c) => {
+            let col = def.column(&column_ref_name(c)?)?;
+            return match col.extra.get_str("collation") {
+                Ok(c) => Some((c.to_string(), false)),
+                Err(_) => type_collation(&col.pg_type).map(|c| (c, false)),
+            };
+        }
+        _ => {}
+    }
+    let ty = match plan_check_expression(&deparse_expr(n).ok()?, def) {
+        Ok(ColumnExpr::Row { result_type, .. }) if !result_type.is_empty() => Some(result_type),
+        _ => None,
+    };
+    if ty.as_deref().is_some_and(|t| !collation::collatable(t)) {
+        return None;
+    }
+    // A cast to a domain that names a collation carries it.
+    if let N::TypeCast(tc) = n.node.as_ref()? {
+        if let Some(c) = tc
+            .type_name
+            .as_ref()
+            .and_then(|t| domains::declared_collation(&type_name_of(t)))
+        {
+            return Some((c, false));
+        }
+    }
+    let mut found: Option<(String, bool)> = None;
+    let mut conflict = false;
+    for child in collation_inputs(n) {
+        let Some((c, explicit)) = derive_collation(child, def) else {
+            continue;
+        };
+        match (&found, explicit) {
+            (Some((_, true)), _) => {}
+            (_, true) => {
+                found = Some((c, true));
+                conflict = false;
+            }
+            _ if c == collation::INDETERMINATE => conflict = true,
+            (None, false) => found = Some((c, false)),
+            (Some((f, false)), false) if *f == c || c == "default" => {}
+            (Some((f, false)), false) if f == "default" => found = Some((c, false)),
+            (Some(_), false) => conflict = true,
+        }
+    }
+    match found {
+        Some((c, true)) => Some((c, true)),
+        _ if conflict => Some((collation::INDETERMINATE.to_string(), false)),
+        Some(f) => Some(f),
+        None => ty.as_deref().and_then(type_collation).map(|c| (c, false)),
+    }
+}
+
+/// The inputs an expression takes its collation from.
+fn collation_inputs(n: &pg_query::protobuf::Node) -> Vec<&pg_query::protobuf::Node> {
+    let mut out: Vec<&pg_query::protobuf::Node> = Vec::new();
+    match n.node.as_ref() {
+        Some(N::FuncCall(f)) => out.extend(f.args.iter()),
+        Some(N::AExpr(e)) => out.extend(e.lexpr.as_deref().into_iter().chain(e.rexpr.as_deref())),
+        Some(N::TypeCast(tc)) => out.extend(tc.arg.as_deref()),
+        Some(N::CoalesceExpr(c)) => out.extend(c.args.iter()),
+        Some(N::MinMaxExpr(m)) => out.extend(m.args.iter()),
+        Some(N::AIndirection(a)) => out.extend(a.arg.as_deref()),
+        Some(N::CaseExpr(c)) => {
+            for w in &c.args {
+                if let Some(N::CaseWhen(w)) = w.node.as_ref() {
+                    out.extend(w.result.as_deref());
+                }
+            }
+            out.extend(c.defresult.as_deref());
+        }
+        _ => {}
+    }
+    out
+}
+
+/// What `pg_get_partkeydef` prints after partition key `i` (`n`): its
+/// COLLATE when it is not the key's own, and its operator class when it is
+/// not the type's default (`get_opclass_name`: qualified when not visible).
+pub fn key_decoration(def: &TableDef, i: usize, n: &str) -> String {
+    let Ok(by) = def.extra.get_document("partition_by") else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let collation = by
+        .get_array("collations")
+        .ok()
+        .and_then(|a| a.get(i))
+        .and_then(Bson::as_str)
+        .unwrap_or_default();
+    if !collation.is_empty() && natural_collation(n, def).as_deref() != Some(collation) {
+        out.push_str(&format!(" COLLATE {}", scalar::quote_identifier(collation)));
+    }
+    let opclass = by
+        .get_array("opclasses")
+        .ok()
+        .and_then(|a| a.get(i))
+        .and_then(Bson::as_i64)
+        .unwrap_or(0);
+    if let Some(c) = misc_alter::all_opclasses()
+        .into_iter()
+        .find(|c| c.oid == opclass && !c.default)
+    {
+        if misc_alter::opclass_visible(&c) {
+            out.push_str(&format!(" {}", scalar::quote_identifier(&c.name)));
+        } else {
+            out.push_str(&format!(
+                " {}.{}",
+                scalar::quote_identifier(&c.schema),
+                scalar::quote_identifier(&c.name)
+            ));
+        }
+    }
+    out
+}
+
+/// `pg_partitioned_table.partclass` and `partcollation`, key by key.
+pub fn key_class_and_collation(def: &TableDef) -> (Vec<i64>, Vec<i64>) {
+    let Ok(by) = def.extra.get_document("partition_by") else {
+        return (Vec::new(), Vec::new());
+    };
+    let classes = by
+        .get_array("opclasses")
+        .map(|a| a.iter().map(|v| v.as_i64().unwrap_or(0)).collect())
+        .unwrap_or_default();
+    let names = regobj::collation_names();
+    let collations = by
+        .get_array("collations")
+        .map(|a| {
+            a.iter()
+                .map(|v| {
+                    let c = v.as_str().unwrap_or_default();
+                    names
+                        .iter()
+                        .find(|(n, _)| n == c)
+                        .map_or(0, |(_, oid)| *oid)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (classes, collations)
 }
 
 /// `quote` a bound datum's canonical text as ruleutils prints it in
@@ -634,4 +1013,47 @@ pub(crate) fn rewrite_tableoid(
         join_quals(fc, &mut replace)?;
     }
     Ok(changed.then_some(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The collation a partition key has of itself, which decides whether
+    /// `pg_get_partkeydef` prints its COLLATE, each measured on PostgreSQL
+    /// 15.19 (RP-1091): a column's declared one, `name`'s "C", a cast's
+    /// type's, a call's input's, a non-default implicit one over "default",
+    /// and two different non-default ones conflicting.
+    #[test]
+    fn a_partition_key_has_the_collation_parse_analysis_gives_it() {
+        let mut t = Column::new("t", "text", true);
+        t.extra.insert("collation", "C");
+        let mut u = Column::new("u", "text", true);
+        u.extra.insert("collation", "POSIX");
+        let def = TableDef::new(
+            "p",
+            vec![
+                Column::new("x", "int4", true),
+                t,
+                u,
+                Column::new("v", "text", true),
+                Column::new("n", "name", true),
+            ],
+        );
+        for (key, want) in [
+            ("x", None),
+            ("t", Some("C")),
+            ("v", Some("default")),
+            ("n", Some("C")),
+            ("(x::text)", Some("default")),
+            ("(upper(t))", Some("C")),
+            ("(t || 'a')", Some("C")),
+            ("(t || v)", Some("C")),
+            ("(t || u)", Some(collation::INDETERMINATE)),
+            ("((t || u) COLLATE \"default\")", Some("default")),
+            ("(length(t))", None),
+        ] {
+            assert_eq!(natural_collation(key, &def).as_deref(), want, "{key}");
+        }
+    }
 }

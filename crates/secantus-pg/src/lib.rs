@@ -24278,6 +24278,8 @@ impl PgHandler {
                     secantus_pgcatalog::Column::new("partnatts", "int2", false),
                     secantus_pgcatalog::Column::new("partdefid", "oid", false),
                     secantus_pgcatalog::Column::new("partattrs", "int2vector", false),
+                    secantus_pgcatalog::Column::new("partclass", "oidvector", false),
+                    secantus_pgcatalog::Column::new("partcollation", "oidvector", false),
                 ],
             )),
             "pg_views" => Some(TableDef::new(
@@ -27135,6 +27137,12 @@ impl PgHandler {
                             f("partattrs"),
                             Bson::Array(attrs.into_iter().map(|a| Bson::Int32(a.into())).collect()),
                         );
+                        let (classes, collations) =
+                            secantus_pgplan::partitions::key_class_and_collation(t);
+                        let oids =
+                            |v: Vec<i64>| Bson::Array(v.into_iter().map(Bson::Int64).collect());
+                        d.insert(f("partclass"), oids(classes));
+                        d.insert(f("partcollation"), oids(collations));
                         Some(d)
                     })
                     .collect()

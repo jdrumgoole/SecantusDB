@@ -46,12 +46,17 @@ pub(crate) fn partkey_text(def: &TableDef) -> Option<String> {
     };
     let keys: Vec<String> = key_names(def)
         .into_iter()
-        .map(|k| {
-            if k.starts_with('(') {
+        .enumerate()
+        .map(|(i, k)| {
+            // Then the key's COLLATE and operator class, where they are not
+            // its own (RP-1091).
+            let decoration = secantus_pgplan::partitions::key_decoration(def, i, &k);
+            let shown = if k.starts_with('(') {
                 secantus_pgplan::ruleutils::partkey_expr_def(&k, def).unwrap_or(k)
             } else {
                 k
-            }
+            };
+            format!("{shown}{decoration}")
         })
         .collect();
     Some(format!("{strategy} ({})", keys.join(", ")))

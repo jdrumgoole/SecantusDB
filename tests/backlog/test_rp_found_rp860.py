@@ -297,14 +297,14 @@ def test_pg_get_indexdef_quotes_a_key_and_an_include_column(dsn: str) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-1091")
+@pytest.mark.backlog_fixed("RP-1091")
 def test_pg_get_partkeydef_keeps_a_key_collation_and_opclass(dsn: str) -> None:
     """A partition key's COLLATE and operator class are part of the key:
     `partition by range ((x::text) collate "C")` prints `RANGE (((x)::text)
     COLLATE "C")`, and `((x::text) text_pattern_ops)` prints `RANGE
     (((x)::text) text_pattern_ops)`, on PostgreSQL 15.19 (shared reference,
-    port 5415). Here both print `RANGE (((x)::text))`. Found while working
-    RP-1052."""
+    port 5415). Both printed `RANGE (((x)::text))`: the catalog kept
+    neither. Found while working RP-1052."""
     assert _script(
         dsn,
         [

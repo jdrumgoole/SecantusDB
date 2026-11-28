@@ -394,6 +394,13 @@ one beside it.
   2026-11-23 (PR #2958, run 45090485822, job 137418770491), in permutation
   `rc1 ro2 wo1 c1 wa2 c2`, where `wa2` got the same 40001 "Canceled on
   identification as a pivot, during write" and PostgreSQL inserts and commits.
+  Again locally on 2026-11-28, in RP-1094's `gate_pg.sh --fast` backlog
+  step after a rebase (load average about 3-4, the other lane running;
+  the change was only `pg_get_viewdef`'s printer): in permutation `rc1
+  ro2 wa2 wo1 c1 c2` every step matched until `c2`, which was 40001
+  "Canceled on identification as a pivot, during commit attempt", where
+  PostgreSQL commits. So the false pivot is found at commit too, not only
+  during a write.
   Verify: none -- intermittent, not reproduced; RP-254's isolation test is the check
   Backlog-ID: RP-848
 - [ ] **RP-911's regression test failed twice on `main`'s Linux CI on
@@ -1237,6 +1244,30 @@ one beside it.
       comparison and was not looked at again.
       Verify: none -- measured only on CI's x86_64 runner (the diagnostic workflow on `rp-1100-diag`); RP-715's, RP-911's and RP-1073's tests are the check
       Backlog-ID: RP-1100
+
+## Found by a CI run (2026-11-28)
+
+- [ ] **`pg_get_viewdef` once printed a user-domain operand without its
+      relabel.** RP-1095's regression test
+      (`test_pg_get_viewdef_relabels_a_user_domain_operand`) failed on
+      #3109's `pg-oracle (backlog)` (run 46103003909, snapshot 1f8840da,
+      RP-1093's naming change, which does not touch `ruleutils.rs`):
+      `WHERE (u798.dd > 2)` where PostgreSQL 15.20 prints
+      `WHERE ((u798.dd)::integer > 2)`. It passed on #3107 (RP-1095's own
+      snapshot), and locally against a debug build holding 1f8840da: on a
+      fresh server, after the module's other tests in three orders, and in
+      120 runs of the statements over one and three connections. Suspect:
+      the printer finds the domain through `domains::user_domain`, a
+      THREAD-LOCAL list that `install_user_types` publishes per pool
+      thread, gated by `INSTALLED_USER_TYPES` on the catalog version; a
+      thread that recorded the list at a version before `dint798` was
+      visible would print the column as its base type. Not shown: the test
+      now asks again on the same and on fresh connections when it misses,
+      and reports how `pg_attribute` types the column, to tell a view
+      stored without the relabel from a stale list on one thread.
+      Verify: none -- seen once on CI's runner; the next miss prints the
+      evidence
+      Backlog-ID: RP-1231
 
 ## Found by the CI timing review (2026-11-28)
 
@@ -3569,44 +3600,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_the_remaining_system_views
       Backlog-ID: RP-798
 
-## Found while working RP-798 (2026-11-18)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster; the
-views read only `pg_class`.
-
-
-- [ ] **`pg_get_viewdef` does not parenthesise a function cast in ORDER
-      BY / PARTITION BY / GROUP BY when not pretty.**
-      `get_rule_sortgroupclause` forces parentheses round a FuncExpr item
-      in either print mode, and a cast PostgreSQL runs through a function
-      (`pg_cast.castmethod = 'f'`, such as `name::text`) is one: `create
-      view v as select c.oid from pg_class c order by c.relname::text`
-      prints `ORDER BY ((c.relname)::text)` on PostgreSQL 15.20 (a private
-      cluster). Here `ORDER BY (c.relname)::text`: the printer knows only
-      the binary-coercible (`'b'`) casts, so it cannot tell a function cast
-      from a relabel. The pretty print matches.
-      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_parenthesises_a_function_cast_sort_item
-      Backlog-ID: RP-1094
-
-## Found while working RP-1046 (2026-11-25)
-
-Measured on a private, freshly initdb'd PostgreSQL 15.20 cluster; the
-statements create nothing.
-
-- [ ] **A column under a cast or `COLLATE` loses the name
-      `FigureColnameInternal` gives it.** `select user::text,
-      current_date::text` names its columns `user`, `current_date` on
-      PostgreSQL 15.20 (a SQLValueFunction is strength 2, so the cast
-      keeps it); here `text`, `text`. `select c.relname collate "C" from
-      pg_class c` is `relname` there (a CollateClause is named for its
-      argument, through a cast above too); here `?column?`, and
-      `(c.relname collate "C")::text` is `text`. The planner's
-      `expression_column_name` / `cast_source_names_column`
-      (`crates/secantus-pgplan/src/lib.rs`) have no arm for either; the
-      faithful port is `nodetostring::target::figure_colname_strength`.
-      Verify: tests/backlog/test_rp_found_rp1046.py::test_a_cast_of_a_sql_value_function_keeps_its_name, tests/backlog/test_rp_found_rp1046.py::test_a_collate_clause_keeps_its_argument_name
-      Backlog-ID: RP-1093
-
 ## Found while working RP-816 (2026-11-11)
 
 Measured on a private PostgreSQL 15.19 cluster.
@@ -3628,17 +3621,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415).
 Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
 tests are in `tests/backlog/test_rp_found_rp860.py`.
 
-- [ ] **`pg_get_partkeydef` drops a partition key's COLLATE and operator
-      class.** `partition by range ((x::text) collate "C")` prints
-      `RANGE (((x)::text) COLLATE "C")` on PostgreSQL 15.19, and
-      `((x::text) text_pattern_ops)` prints `RANGE (((x)::text)
-      text_pattern_ops)`; here both print `RANGE (((x)::text))`.
-      `partitions::lower_create` keeps only each `PartitionElem`'s name or
-      expression, never its `collation` / `opclass`: the catalog keeps
-      neither, so the text cannot print them.
-      Verify: tests/backlog/test_rp_found_rp860.py::test_pg_get_partkeydef_keeps_a_key_collation_and_opclass
-      Backlog-ID: RP-1091
-
 - [ ] **`client_min_messages` does not withhold a NOTICE.** After `set
       client_min_messages = warning`, `drop table if exists` of a missing
       table and a DO block's `raise notice` each still send their NOTICE;
@@ -3647,6 +3629,32 @@ tests are in `tests/backlog/test_rp_found_rp860.py`.
       before a notice goes out (`do_block.rs` assumes the default level).
       Verify: tests/backlog/test_rp_found_rp860.py::test_client_min_messages_withholds_a_notice
       Backlog-ID: RP-1092
+
+## Found while working RP-1091 (2026-11-28)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415). The gap
+tests are in `tests/backlog/test_rp_found_rp1091.py`.
+
+- [ ] **A partition key's COLLATE does not order its bounds or route its
+      rows.** Under `partition by range (t collate "und-x-icu")` with a
+      partition `from ('a') to ('b')`, `insert ... values ('A')` lands in
+      it on PostgreSQL 15.19 (ICU sorts `a < A < b`); here it is 23514 `no
+      partition of relation "pr" found for row`, because the bound
+      condition compares the key bytewise. The key's collation is in the
+      catalog now (`partition_by.collations`, RP-1091), but
+      `partitions::bound_condition` and `partition::cmp_end` (the overlap
+      check between sibling bounds) never apply it; the faithful fix
+      compares each key column under its `partcollation`, as
+      `partition_rbound_cmp` / `FunctionCall2Coll` do.
+      Verify: tests/backlog/test_rp_found_rp1091.py::test_a_range_key_routes_under_its_collation
+      Backlog-ID: RP-1228
+
+- [ ] **`pg_get_partkeydef` does not quote a column key's name.** `create
+      table pq ("X" int) partition by list ("X")` prints `LIST ("X")` on
+      PostgreSQL 15.19 (`quote_identifier(attname)`); here `LIST (X)`.
+      `partition::partkey_text` prints a column key as stored.
+      Verify: tests/backlog/test_rp_found_rp1091.py::test_pg_get_partkeydef_quotes_a_column_key
+      Backlog-ID: RP-1229
 
 ## Found while working RP-1054 (2026-11-25)
 
@@ -4129,7 +4137,13 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       (`test_group_by_an_expression_or_a_position`,
       `test_a_grouping_set_query_computes_expressions_over_its_keys`),
       reported together, each gave `''` for the first line and nothing
-      after, and both passed alone (2 in 19 s). Not yet known: whether the
+      after, and both passed alone (2 in 19 s). A seventh time on
+      2026-11-28, in RP-1094's `gate_pg.sh --fast` backlog step after a
+      rebase (load average about 3-4, the other lane running):
+      `tests/backlog/test_rp_found_rp707.py`'s module server gave `''`
+      for its first line and nothing after its stop, so its 31 tests were
+      `REGRESSED`; the module alone passed (31 in 37 s), and the same
+      change's gate before the rebase had no start failure. Not yet known: whether the
       server stalled (a lock, a WiredTiger create waiting on a checkpoint)
       or was starved, since the harness keeps no stack or timing of a
       start it gives up on. The harness should sample the child
