@@ -118,11 +118,13 @@ def test_a_fill_by_a_method_sets_its_windows_sort_key(rust_mongo: Any, mongod: A
     assert by_id(rust_mongo) == by_id(mongod)
 
 
-@pytest.mark.backlog("RM-767")
+@pytest.mark.backlog_fixed("RM-767")
 def test_a_fill_passes_ties_on_in_mongods_order(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 passes the documents a `$fill` fills on, among equal
-    `sortBy` keys, in the order it was handed them; this server gives a
-    different order among the ties (with values only and by a `method`)."""
+    """mongod 8.2.11 runs a `$fill` of values only as an `$addFields`, which
+    keeps every document's place, and one with a `method` as the
+    `$setWindowFields` it parses into, whose `$sort` overrides a `$sort` in
+    front (ties come in the order from before that one). This server sorted
+    both by `sortBy` behind the `$sort` in front, so the ties differed."""
     fills = {
         "values only": {"sortBy": {"n": 1}, "output": {"a": {"value": 1}}},
         "locf": {"sortBy": {"n": 1}, "output": {"a": {"method": "locf"}}},

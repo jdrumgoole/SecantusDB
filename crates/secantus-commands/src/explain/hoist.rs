@@ -1087,6 +1087,19 @@ fn overridden(after: &[Bson]) -> bool {
                     .and_then(|s| s.get_document(super::shape::WINDOW_SORT).ok())
                     .is_some_and(|keys| reads_none(keys, &unwound));
             }
+            // A `$fill` with a `method` is the `$setWindowFields` mongod
+            // parses it into, so it overrides as one; one of values only is
+            // an `$addFields` and sorts nothing (measured 8.2.11, RM-767).
+            "$fill" => {
+                let Some(window) = spec.as_document().and_then(fill_window) else {
+                    return false;
+                };
+                let first = super::shape::desugared_window(&window).into_iter().next();
+                return first
+                    .as_ref()
+                    .and_then(|s| s.get_document(super::shape::WINDOW_SORT).ok())
+                    .is_some_and(|keys| reads_none(keys, &unwound));
+            }
             // Even one that reads the sort key goes ahead of the `$sort`,
             // and reads none there (measured 8.2.11).
             "$match" | PUSHED_MATCH => {
@@ -1464,6 +1477,35 @@ pub(crate) fn unwind_paths(unwind: &Bson) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// The `$setWindowFields` mongod parses a `$fill` with a `method` into: its
+/// `sortBy`, and its partition (`partitionByFields` as the object of those
+/// paths). `None` for a `$fill` of values only, which sorts nothing.
+fn fill_window(spec: &Document) -> Option<Document> {
+    let output = spec.get_document("output").ok()?;
+    let has_method = output
+        .values()
+        .any(|o| o.as_document().is_some_and(|o| o.contains_key("method")));
+    if !has_method {
+        return None;
+    }
+    let mut window = Document::new();
+    if let Some(by) = spec.get("partitionBy") {
+        window.insert("partitionBy", by.clone());
+    } else if let Ok(fields) = spec.get_array("partitionByFields") {
+        let mut by = Document::new();
+        for f in fields {
+            let f = f.as_str()?;
+            by.insert(f, format!("${f}"));
+        }
+        window.insert("partitionBy", by);
+    }
+    if let Ok(sort_by) = spec.get_document("sortBy") {
+        window.insert("sortBy", sort_by.clone());
+    }
+    window.insert("output", Document::new());
+    Some(window)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1474,6 +1516,22 @@ mod tests {
 
     fn stages(docs: Vec<bson::Document>) -> Vec<Bson> {
         docs.into_iter().map(Bson::Document).collect()
+    }
+
+    /// A `$fill` with a `method` overrides a `$sort` in front, as the
+    /// window it parses into does; one of values only does not (RM-767).
+    #[test]
+    fn a_fill_with_a_method_overrides_a_sort() {
+        let k = doc! { "$sort": { "k": 1 } };
+        let locf =
+            doc! { "$fill": { "sortBy": { "n": 1 }, "output": { "a": { "method": "locf" } } } };
+        let value = doc! { "$fill": { "sortBy": { "n": 1 }, "output": { "a": { "value": 1 } } } };
+        assert_eq!(
+            drop_overridden_sorts(&stages(vec![k.clone(), locf.clone()])),
+            stages(vec![locf])
+        );
+        let kept = stages(vec![k, value]);
+        assert_eq!(drop_overridden_sorts(&kept), kept);
     }
 
     /// A `$sort` goes when a later one overrides it, over the stages mongod
