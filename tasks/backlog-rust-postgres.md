@@ -4238,23 +4238,28 @@ from 15.19): every statement is VALUES-only. The gap tests are in
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a distinct sorted on a prefix sorts on every distinct column]
       Backlog-ID: RP-1126
 
-## Found while working RP-1033 (2026-11-26)
+## Found while working RP-1133 (2026-11-28)
 
-- [ ] **An anti join against a primary key is unpriced, and on an
-      expression key is not a hash anti join.** `explain select * from e
-      left join k on k.a = e.a where k.a is null` (`k.a` the primary key)
-      is in PostgreSQL 15.19 `Hash Anti Join (cost=27.50..46.25 rows=1
-      width=14)` hashing `k`; here the same plan with every cost, row
-      count and width zero. Over an expression key, `... on k.a = e.a - 1
-      where k.a is null`, PostgreSQL 15.19 prints `Hash Anti Join
-      (cost=27.50..51.38 rows=500 width=14)` with `Hash Cond: ((e.a - 1) =
-      k.a)`; here an unpriced `Nested Loop Anti Join` with `Join Filter:
-      (k.a = (e.a - 1))`, which EXPLAIN ANALYZE then cannot count below.
-      The same joins against a column with no unique index (`e e2`) are
-      priced Hash Anti Joins (RP-908, RP-981). Measured on the 15.19
-      reference on port 5415.
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an anti join against a primary key is priced], tests/backlog/test_rp_explain_costs.py::test_plan[an anti join on an expression key against a primary key is a hash anti join]
-      Backlog-ID: RP-1133
+- [ ] **An anti join probing a primary key once an outer row is not a
+      Nested Loop Anti Join over its index.** `explain select * from e
+      left join k on k.a = e.a where k.a is null and e.a < 5` is in
+      PostgreSQL 15 `Nested Loop Anti Join (cost=0.28..42.71 rows=1
+      width=14)` over `Seq Scan on e` (`Filter: (a < 5)`) and `Index Scan
+      using k_pkey on k (cost=0.28..6.29 rows=1 width=7)` with `Index
+      Cond: (a = e.a)`; here an unpriced `Hash Anti Join`. Over the
+      expression key `k.a = e.a - 1` PostgreSQL prints the same loop at
+      `cost=0.28..38.68 rows=2` with `Index Cond: (a = (e.a - 1))`; here
+      an unpriced `Nested Loop Anti Join` with a Join Filter over a Seq
+      Scan of `k`. `hash_anti_join_of` already costs this path
+      (`joincost::nest_loop_anti_param`, `final_cost_nestloop`'s
+      `has_indexed_join_quals` branch) and declines to price the hash join
+      when it wins; drawing it is what is missing: the inner Index Scan
+      with its Index Cond and per-loop cost (`param_index_scan`), as
+      `JoinPick::NestParam` draws an inner join's. PostgreSQL switches to
+      the hash join from `e.a < 6` on (measured on a private 15.20
+      cluster, `_ANALYSED`).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an anti join probing a primary key is a nested loop over its index], tests/backlog/test_rp_explain_costs.py::test_plan[an anti join probing a primary key on an expression is a nested loop over its index]
+      Backlog-ID: RP-1295
 
 ## Found while working RP-290 (2026-11-26)
 

@@ -7576,7 +7576,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # ------------- RP-1133 an anti join against a primary key
     # Measured on PostgreSQL 15.19: a LEFT join keeping only its
     # NULL-extended rows hashes the primary key's side, as against a
-    # column with no unique index.
+    # column with no unique index. It was unpriced: a side whose key a
+    # B-tree leads with was refused, its merge and nested loops unweighed.
     "an anti join against a primary key is priced": (
         "RP-1133",
         _ANALYSED,
@@ -7590,7 +7591,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # Measured on PostgreSQL 15.19: over an expression key it is a Hash
-    # Anti Join on the expression too.
+    # Anti Join on the expression too. It was an unpriced Nested Loop Anti
+    # Join with a Join Filter.
     "an anti join on an expression key against a primary key is a hash anti join": (
         "RP-1133",
         _ANALYSED,
@@ -7601,6 +7603,62 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
             "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # ------------- RP-1294 an anti join preserving a primary key
+    # Measured on a private PostgreSQL 15.20 cluster: the preserved side's
+    # primary key could presort it for a merge, which reading `k_pkey`
+    # whole does not make cheaper than hashing `e`. It was unpriced.
+    "an anti join preserving a primary key is priced": (
+        "RP-1294",
+        _ANALYSED,
+        "explain select * from k left join e on e.a = k.a where e.a is null",
+        [
+            "Hash Anti Join  (cost=27.50..46.25 rows=1 width=14)",
+            "  Hash Cond: (k.a = e.a)",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "an anti join preserving a primary key on an expression is priced": (
+        "RP-1294",
+        _ANALYSED,
+        "explain select * from k left join e on e.a = k.a - 1 where e.a is null",
+        [
+            "Hash Anti Join  (cost=27.50..51.38 rows=500 width=14)",
+            "  Hash Cond: ((k.a - 1) = e.a)",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # ------------- RP-1295 an anti join probing a primary key's index
+    # Measured on a private PostgreSQL 15.20 cluster: four outer rows probe
+    # `k_pkey` once each (`final_cost_nestloop`'s JOIN_ANTI with indexed
+    # join quals), cheaper than hashing all of `k`.
+    "an anti join probing a primary key is a nested loop over its index": (
+        "RP-1295",
+        _ANALYSED,
+        "explain select * from e left join k on k.a = e.a where k.a is null and e.a < 5",
+        [
+            "Nested Loop Anti Join  (cost=0.28..42.71 rows=1 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=4 width=7)",
+            "        Filter: (a < 5)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.29 rows=1 width=7)",
+            "        Index Cond: (a = e.a)",
+        ],
+    ),
+    "an anti join probing a primary key on an expression is a nested loop over its index": (
+        "RP-1295",
+        _ANALYSED,
+        "explain select * from e left join k on k.a = e.a - 1 where k.a is null and e.a < 5",
+        [
+            "Nested Loop Anti Join  (cost=0.28..38.68 rows=2 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=4 width=7)",
+            "        Filter: (a < 5)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.29 rows=1 width=7)",
+            "        Index Cond: (a = (e.a - 1))",
         ],
     ),
     # ------------- RP-902 a reduced LEFT join's one-sided ON conjunct
@@ -11901,6 +11959,8 @@ def _marked(name: str, item: str) -> Any:
             name, marks=pytest.mark.backlog_fixed(item.removesuffix(":fixed")), id=name
         )
     fixed = item in (
+        "RP-1133",
+        "RP-1294",
         "RP-1125",
         "RP-1124",
         "RP-1134",
