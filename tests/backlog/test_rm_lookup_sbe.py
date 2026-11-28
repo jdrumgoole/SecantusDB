@@ -261,15 +261,15 @@ def _swapped(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-828")
+@pytest.mark.backlog_fixed("RM-828")
 def test_a_match_moves_ahead_of_a_classic_lookup_that_does_not_read_it(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
 ) -> None:
     """mongod 8.2.11 moves a `$match` that does not read the `as` field
     ahead of the `$lookup`, into the query (`parsedQuery` {a: {$eq: 1}});
-    this server lists it after the `$lookup` with an empty query. Found
-    2026-11-26 working RM-683."""
+    this server listed it after the `$lookup` with an empty query until
+    RM-828. Found 2026-11-26 working RM-683."""
     assert _swapped(rust_mongo) == _swapped(mongod_rs)
 
 
