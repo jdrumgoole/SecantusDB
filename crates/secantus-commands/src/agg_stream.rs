@@ -625,16 +625,15 @@ fn time_series(
         .get(lead)
         .is_some_and(|s| groups_on_meta(s, meta.as_deref()) || counts_stage(s))
         && ask.pipeline[lead + 1..].iter().all(fits);
-    // A `$group` after a `$match` on measurement fields, which mongod
-    // 8.2.11 runs in its slot-based engine over the buckets it scanned
-    // (measured 2026-11-27: five of five examined, RM-363). A `$match` on
-    // the meta field is read through its index, which is not this path.
-    let names_meta = |m: &Document| {
+    // A `$group` after a `$match`, which mongod 8.2.11 runs in its
+    // slot-based engine over the buckets it read: those it scanned for a
+    // `$match` on measurement fields (measured 2026-11-27: five of five
+    // examined), and those its default index over the buckets gave it for
+    // one on the meta field (RM-363). A filter that names fields some other
+    // way is read whole.
+    let unsure = |m: &Document| {
         let mut paths = Vec::new();
         !filter_paths(m, &mut paths)
-            || meta
-                .as_deref()
-                .is_some_and(|meta| paths.iter().any(|p| root(p) == meta))
     };
     let matches = ask
         .pipeline
@@ -643,7 +642,7 @@ fn time_series(
         .count();
     let measurement_group = matches > 0
         && ask.pipeline[..matches].iter().all(|s| {
-            matches!(s.as_document().and_then(|d| d.get("$match")), Some(Bson::Document(m)) if !names_meta(m))
+            matches!(s.as_document().and_then(|d| d.get("$match")), Some(Bson::Document(m)) if !unsure(m))
         })
         && ask
             .pipeline
@@ -789,8 +788,11 @@ fn time_series(
     if ask.collation.is_some() && hinted.is_none() && scan.filters_meta() {
         return Ok(None);
     }
-    let through = |name: &str, scan: crate::ts_buckets::BucketScan| {
-        scan.through_index(storage, name).map_err(read_error)
+    let through = |name: &str,
+                   bounds: Option<crate::ts_buckets::UnionScan>,
+                   scan: crate::ts_buckets::BucketScan| {
+        scan.through_index(storage, name, bounds)
+            .map_err(read_error)
     };
     // A filter on the meta field is the default index's scan, or, where
     // the time field bounds the bucket `_id` too, mongod's trial between
@@ -820,10 +822,12 @@ fn time_series(
         scan.buffer_trial(planned.buffered);
         match planned.access {
             crate::explain::BucketAccess::Scan => scan,
-            crate::explain::BucketAccess::Index(name) => match through(&name, scan)? {
-                Some(scan) => scan,
-                None => return Ok(None),
-            },
+            crate::explain::BucketAccess::Index(name, bounds) => {
+                match through(&name, bounds, scan)? {
+                    Some(scan) => scan,
+                    None => return Ok(None),
+                }
+            }
             crate::explain::BucketAccess::Union(children) => {
                 match scan.through_union(storage, &children).map_err(read_error)? {
                     Some(scan) => scan,
@@ -838,7 +842,7 @@ fn time_series(
         // buckets in order (measured 8.2.11: 2,303 after the delete).
         let by_meta = scan.filters_meta().then_some(default_index).flatten();
         match hinted.or(by_meta) {
-            Some(name) => match through(&name, scan)? {
+            Some(name) => match through(&name, None, scan)? {
                 Some(scan) => scan,
                 None => return Ok(None),
             },
@@ -1390,7 +1394,7 @@ impl AggStream {
                 Ok(StreamedBatch {
                     docs: read.docs,
                     exhausted: read.exhausted,
-                    keys_examined: 0,
+                    keys_examined: read.keys,
                     docs_examined: read.examined,
                 })
             }

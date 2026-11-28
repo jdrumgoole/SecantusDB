@@ -346,8 +346,9 @@ pub(crate) fn plans_table_scan(
 pub(crate) enum BucketAccess {
     /// The buckets in order, a collection scan.
     Scan,
-    /// One index over the buckets, by name: FETCH over its IXSCAN.
-    Index(String),
+    /// One index over the buckets, by name: FETCH over its IXSCAN, with
+    /// its bounds where it is a plain ascending scan they can be read in.
+    Index(String, Option<crate::ts_buckets::UnionScan>),
     /// An `OR` of index scans over the buckets, each child read to its end
     /// in turn (an `$or` every branch of which an index answers).
     Union(Vec<crate::ts_buckets::UnionScan>),
@@ -477,7 +478,6 @@ pub(crate) fn bucket_access(
 /// as a bucket read goes through them; `None` when a child is anything but
 /// an ascending, bounded scan of a plain index whose keys are its values.
 fn union_of(node: &Node) -> Option<Vec<crate::ts_buckets::UnionScan>> {
-    use crate::ts_buckets::{EncodedInterval, UnionScan};
     let (top, or) = match node {
         Node::Fetch { filter, input } => (filter.clone(), &**input),
         other => (None, other),
@@ -485,46 +485,52 @@ fn union_of(node: &Node) -> Option<Vec<crate::ts_buckets::UnionScan>> {
     let Node::Or(children) = or else { return None };
     children
         .iter()
-        .map(|child| {
-            let (own, scan) = match child {
-                Node::Fetch { filter, input } => (filter.clone(), &**input),
-                other => (None, other),
-            };
-            let Node::IxScan(ix) = scan else { return None };
-            let index = &ix.index;
-            if ix.backward
-                || ix.no_bounds
-                || !index.plain
-                || index.collation.is_some()
-                || index.is_multikey()
-                || index.fields().iter().any(|(_, dir)| *dir < 0)
-            {
-                return None;
-            }
-            let bounds = ix
-                .bounds
-                .iter()
-                .map(|list| {
-                    list.iter()
-                        .map(|i| EncodedInterval {
-                            lo: bounds::sort_key(&i.lo),
-                            lo_incl: i.lo_incl,
-                            hi: bounds::sort_key(&i.hi),
-                            hi_incl: i.hi_incl,
-                        })
-                        .collect()
-                })
-                .collect();
-            Some(UnionScan {
-                index: index.name.clone(),
-                bounds,
-                filters: [ix.filter.clone(), own, top.clone()]
-                    .into_iter()
-                    .flatten()
-                    .collect(),
-            })
-        })
+        .map(|child| bounded_scan(child, top.clone()))
         .collect()
+}
+
+/// One ascending, bounded scan of a plain index whose keys are its values
+/// (under a FETCH that may recheck), as a bucket read goes through it, with
+/// `top` rechecked on what it returns too.
+fn bounded_scan(child: &Node, top: Option<Document>) -> Option<crate::ts_buckets::UnionScan> {
+    use crate::ts_buckets::{EncodedInterval, UnionScan};
+    let (own, scan) = match child {
+        Node::Fetch { filter, input } => (filter.clone(), &**input),
+        other => (None, other),
+    };
+    let Node::IxScan(ix) = scan else { return None };
+    let index = &ix.index;
+    if ix.backward
+        || ix.no_bounds
+        || !index.plain
+        || index.collation.is_some()
+        || index.is_multikey()
+        || index.fields().iter().any(|(_, dir)| *dir < 0)
+    {
+        return None;
+    }
+    let bounds = ix
+        .bounds
+        .iter()
+        .map(|list| {
+            list.iter()
+                .map(|i| EncodedInterval {
+                    lo: bounds::sort_key(&i.lo),
+                    lo_incl: i.lo_incl,
+                    hi: bounds::sort_key(&i.hi),
+                    hi_incl: i.hi_incl,
+                })
+                .collect()
+        })
+        .collect();
+    Some(UnionScan {
+        index: index.name.clone(),
+        bounds,
+        filters: [ix.filter.clone(), own, top]
+            .into_iter()
+            .flatten()
+            .collect(),
+    })
 }
 
 /// How a bucket read goes through the plan `node`.
@@ -536,8 +542,10 @@ fn access_of(node: Node, union: bool) -> BucketAccess {
     }
     match node {
         Node::CollScan { .. } => BucketAccess::Scan,
-        Node::Fetch { input, .. } => match *input {
-            Node::IxScan(scan) => BucketAccess::Index(scan.index.name.clone()),
+        Node::Fetch { ref input, .. } => match &**input {
+            Node::IxScan(scan) => {
+                BucketAccess::Index(scan.index.name.clone(), bounded_scan(&node, None))
+            }
             _ => BucketAccess::Unsure,
         },
         _ => BucketAccess::Unsure,
