@@ -3186,6 +3186,55 @@ Measured on PostgreSQL 15.19. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp1087.py::test_set_op_error_names_an_array_type_by_its_element
       Backlog-ID: RP-1176
 
+## Found while working RP-1095 (2026-11-28)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.20 cluster over
+`create table p (k int, t text)`. The gap tests are in
+`tests/backlog/test_rp_found_rp1095.py`.
+
+- [ ] **`pg_get_viewdef` of a view calling `num_nulls` is the definition as
+      written.** `create view v as select num_nulls(k) as x from p` prints
+      ` SELECT num_nulls(p.k) AS x\n   FROM p;` on PostgreSQL 15.20; here
+      ` SELECT num_nulls(k) AS x FROM p;`, the text the view was created
+      with: the printer (`crates/secantus-pgplan/src/ruleutils.rs`) knows
+      no type for a `VARIADIC "any"` built-in outside its `variadic_any`
+      list (the json builders), so it refuses the whole view and the
+      caller keeps the source. `num_nonnulls` is the same.
+      Verify: tests/backlog/test_rp_found_rp1095.py::test_pg_get_viewdef_of_a_num_nulls_call
+      Backlog-ID: RP-1223
+- [ ] **`pg_get_viewdef` casts an untyped literal at a `VARIADIC "any"`
+      parameter to text.** `create view v as select concat(t, 'x') as x
+      from p` prints `concat(p.t, 'x')` on PostgreSQL 15.20: `"any"` takes
+      an `unknown` constant as it is, which `get_const_expr` prints bare.
+      Here `concat(p.t, 'x'::text)`: `function_sig` gives `concat`,
+      `concat_ws` and `format` no parameter type, and an untyped literal
+      argument of such a call is printed as text (the rule for `max('x')`).
+      `format`'s and `concat_ws`'s first parameter is text, and casts.
+      Verify: tests/backlog/test_rp_found_rp1095.py::test_pg_get_viewdef_keeps_an_untyped_literal_at_an_any_parameter
+      Backlog-ID: RP-1224
+- [ ] **`pg_get_viewdef` prints `x = ANY (subquery)` as written, not as
+      `IN`.** `get_sublink_expr` represents an `= ANY` sublink as `IN`,
+      however it was written: `create view v as select k from p where k =
+      any (select k from p)` prints `WHERE (p.k IN ( SELECT p_1.k ...))` on
+      PostgreSQL 15.20, in both print modes. Here `(p.k = ANY ( SELECT
+      ...))`: the printer writes `IN` only when the query wrote `IN` (an
+      empty `oper_name`).
+      Verify: tests/backlog/test_rp_found_rp1095.py::test_pg_get_viewdef_prints_an_equals_any_sublink_as_in
+      Backlog-ID: RP-1225
+- [ ] **`pg_get_viewdef` relabels the members of an `ARRAY[...]` of one
+      domain.** Over `create domain dint as int` and `u(k int, dd dint)`,
+      `select array[dd, dd] from u` prints `ARRAY[u.dd, u.dd]` on
+      PostgreSQL 15.20: members all of one domain resolve to it
+      (`select_common_type`), and the array is that domain's array type
+      (`_dint`). `where dd = any (array[dd, dd])` is then `((u.dd)::integer
+      = ANY ((ARRAY[u.dd, u.dd])::integer[]))`, the array coerced to the
+      base's array type. Here `ARRAY[(u.dd)::integer, (u.dd)::integer]` in
+      both: the printer types an array by its members' base type
+      (RP-1095 kept `COALESCE` / `CASE` of one domain as the domain, not
+      `ARRAY`), and has no domain array types.
+      Verify: tests/backlog/test_rp_found_rp1095.py::test_pg_get_viewdef_keeps_an_array_of_one_domain
+      Backlog-ID: RP-1226
+
 ## Found while working RP-1089 (2026-11-27)
 
 Measured on PostgreSQL 15.20; neither needs objects. The gap tests are in
@@ -3538,21 +3587,6 @@ views read only `pg_class`.
       from a relabel. The pretty print matches.
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_parenthesises_a_function_cast_sort_item
       Backlog-ID: RP-1094
-
-- [ ] **`pg_get_viewdef` prints an operator over a user domain column
-      without relabelling it.** PostgreSQL resolves the operator on the
-      domain's base type and relabels the operand, which `get_oper_expr`
-      shows: over `create domain dint798 as int` and `u798(k int, dd
-      dint798)`, `select k from u798 where dd > 2` prints `WHERE
-      ((u798.dd)::integer > 2)` on PostgreSQL 15.20 (a private cluster).
-      Here `WHERE (u798.dd > 2)`: the printer types a user table's column
-      by its base type, and only an `information_schema` domain column by
-      the domain (RP-798). Typing every domain column as its domain needs
-      the printer to know each user domain's base type everywhere it
-      resolves an operator or a function over one, or it refuses views it
-      prints correctly today.
-      Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_relabels_a_user_domain_operand
-      Backlog-ID: RP-1095
 
 ## Found while working RP-1046 (2026-11-25)
 

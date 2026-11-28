@@ -709,9 +709,10 @@ def test_pg_get_viewdef_parenthesises_a_function_cast_sort_item(dsn: str) -> Non
 
 # An operator over a column of a user domain resolves on the base type and
 # relabels the operand, which `get_oper_expr` shows. Measured on a private
-# PostgreSQL 15.20 cluster; here the column is typed as its base type and
-# prints bare, `(u798.dd > 2)`.
-@pytest.mark.backlog("RP-1095")
+# PostgreSQL 15.20 cluster. The column was typed as its base type and
+# printed bare, `(u798.dd > 2)`; fixed by RP-1095, whose wider matrix is
+# tests/test_rust_pgserver_viewdef_domains.py.
+@pytest.mark.backlog_fixed("RP-1095")
 def test_pg_get_viewdef_relabels_a_user_domain_operand(dsn: str) -> None:
     with _connect(dsn) as c:
         c.execute("drop table if exists u798 cascade")

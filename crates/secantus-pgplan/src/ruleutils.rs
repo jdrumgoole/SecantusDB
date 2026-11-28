@@ -450,6 +450,22 @@ fn function_sig(name: &str) -> Option<(Option<&'static str>, Option<&'static str
     })
 }
 
+/// Whether argument `i` of a [`function_sig`] function is polymorphic or
+/// `"any"`, which takes a domain as it is: `count("any")`,
+/// `array_agg(anynonarray)`, `lag(anyelement, int4, anyelement)`,
+/// `concat(VARIADIC "any")`, ... Every other argument there is a type of
+/// its own (`abs(int4)`, `max(text)`, `string_agg(text, text)`).
+fn polymorphic_arg(name: &str, i: usize) -> bool {
+    match name {
+        "count" | "pg_typeof" | "array_agg" | "json_agg" | "jsonb_agg" | "first_value"
+        | "last_value" | "concat" => true,
+        "lag" | "lead" => i != 1,
+        "nth_value" => i == 0,
+        "concat_ws" | "format" => i > 0,
+        _ => false,
+    }
+}
+
 /// `information_schema`'s SQL helpers over a type's oid and typmod
 /// (`information_schema.sql`): `(argument types, result)`, read from
 /// PostgreSQL 15.19's `pg_proc` (`pronamespace = 'information_schema'`).
@@ -617,18 +633,19 @@ impl<'a> Printer<'a> {
                 def.columns
                     .iter()
                     .map(|c| {
-                        // A column over an `information_schema` domain is
-                        // typed as the domain, which an operator over it
-                        // relabels to its base (`(t.cn)::integer > 2`).
-                        let ty = c
-                            .extra
-                            .get_str("domain_type")
-                            .ok()
-                            .and_then(information_schema_domain)
-                            .map_or_else(
-                                || base_type(&c.pg_type),
-                                |(d, _)| format!("information_schema.{d}"),
-                            );
+                        // A column over a domain is typed as the domain,
+                        // which an operator or a function over it relabels
+                        // to its base (`(t.cn)::integer > 2`, RP-798,
+                        // RP-1095).
+                        let domain = c.extra.get_str("domain_type").ok();
+                        let ty = match domain {
+                            Some(d) => match information_schema_domain(d) {
+                                Some((d, _)) => format!("information_schema.{d}"),
+                                None if domain_base(d).is_some() => d.to_string(),
+                                None => base_type(&c.pg_type),
+                            },
+                            None => base_type(&c.pg_type),
+                        };
                         (c.name.clone(), ty)
                     })
                     .collect(),
@@ -794,9 +811,32 @@ impl<'a> Printer<'a> {
         ))
     }
 
-    /// The analysed type of an expression; `unknown` for an untyped string
-    /// literal or NULL.
+    /// The type operator and function resolution sees for an expression:
+    /// its analysed type with a domain reduced to its base, as
+    /// `binary_oper_exact`, `func_select_candidate` and
+    /// `select_common_type` reduce one (`getBaseType`).
     fn typ(&mut self, n: &Node) -> Option<String> {
+        let t = self.typ_dom(n)?;
+        Some(domain_base(&t).unwrap_or(t))
+    }
+
+    /// `make_fn_arguments` / `coerce_to_common_type` over an argument:
+    /// the type it is coerced to, `want`, or where the argument keeps its
+    /// own type (`""`) but that type is a domain, its base --
+    /// `coerce_type` relabels a domain to its base type, and ruleutils
+    /// shows the RelabelType: `(u.dd)::integer > 2` over a domain over
+    /// integer (PostgreSQL 15.20, RP-1095).
+    fn coerced(&mut self, n: &Node, want: &str) -> Option<String> {
+        if !want.is_empty() {
+            return Some(want.to_string());
+        }
+        let own = self.typ_dom(n)?;
+        Some(domain_base(&own).unwrap_or_default())
+    }
+
+    /// The analysed type of an expression, a domain kept as the domain;
+    /// `unknown` for an untyped string literal or NULL.
+    fn typ_dom(&mut self, n: &Node) -> Option<String> {
         Some(match n.node.as_ref()? {
             N::ColumnRef(c) => match self.whole_row(c) {
                 Some((_, rowtype)) => rowtype,
@@ -865,12 +905,8 @@ impl<'a> Printer<'a> {
                                 return Some(result.into());
                             }
                         }
-                        // A domain operand resolves on its base type.
-                        let base = |t: String| match information_schema_domain(&t) {
-                            Some((_, b)) => b.to_string(),
-                            None => t,
-                        };
-                        Self::arith_result(&op, &base(l), &base(r))?.2
+                        // `typ` reduced a domain operand to its base.
+                        Self::arith_result(&op, &l, &r)?.2
                     }
                     AExprKind::AexprLike
                     | AExprKind::AexprIlike
@@ -898,15 +934,12 @@ impl<'a> Printer<'a> {
                     return Some(t.into());
                 }
                 let Some((_, result)) = function_sig(&name) else {
-                    // A domain argument resolves on its base type, as
-                    // `call_by_signature` prints it.
+                    // A domain argument resolves on its base type (`typ`),
+                    // as `call_by_signature` prints it.
                     let types = f
                         .args
                         .iter()
-                        .map(|a| {
-                            let t = self.typ(a)?;
-                            Some(information_schema_domain(&t).map_or(t, |(_, b)| b.to_string()))
-                        })
+                        .map(|a| self.typ(a))
                         .collect::<Option<Vec<String>>>()?;
                     return crate::funcsig::selected_result_type(&name, &types)
                         .or_else(|| crate::funcsig::resolved_result_type(&name, &types))
@@ -975,8 +1008,8 @@ impl<'a> Printer<'a> {
                     },
                 }
             }
-            N::CoalesceExpr(c) => self.common_type(&c.args)?,
-            N::MinMaxExpr(m) => self.common_type(&m.args)?,
+            N::CoalesceExpr(c) => self.common_type_dom(&c.args)?,
+            N::MinMaxExpr(m) => self.common_type_dom(&m.args)?,
             N::CaseExpr(c) => {
                 let mut results: Vec<Node> = c
                     .args
@@ -986,10 +1019,10 @@ impl<'a> Printer<'a> {
                         _ => None,
                     })
                     .collect();
-                if let Some(d) = c.defresult.as_deref() {
-                    results.push(d.clone());
-                }
-                self.common_type(&results)?
+                // No ELSE is an ELSE NULL, which `select_common_type` counts:
+                // `CASE ... THEN u.dd END` resolves to the domain's base.
+                results.push(c.defresult.as_deref().cloned().unwrap_or_else(null_const));
+                self.common_type_dom(&results)?
             }
             N::SubLink(s) => match SubLinkType::try_from(s.sub_link_type).ok()? {
                 SubLinkType::ExistsSublink | SubLinkType::AnySublink | SubLinkType::AllSublink => {
@@ -1047,6 +1080,28 @@ impl<'a> Printer<'a> {
             }
             _ => return None,
         })
+    }
+
+    /// `select_common_type` where the result may be a domain: expressions
+    /// all of exactly one type resolve to it, a domain included -- "the
+    /// only way that we will resolve the result as being a domain type" --
+    /// and any other mix to [`Self::common_type`] over their base types,
+    /// to which `coerce_to_common_type` relabels a domain member
+    /// (`COALESCE((u.dd)::integer, 0)`, RP-1095).
+    fn common_type_dom(&mut self, nodes: &[Node]) -> Option<String> {
+        let mut first: Option<String> = None;
+        let mut same = true;
+        for n in nodes {
+            let t = self.typ_dom(n)?;
+            match &first {
+                None => first = Some(t),
+                Some(f) => same &= *f == t,
+            }
+        }
+        match first {
+            Some(t) if same && t != "unknown" && domain_base(&t).is_some() => Some(t),
+            _ => self.common_type(nodes),
+        }
     }
 
     /// The type several expressions resolve to (`select_common_type`), with
@@ -1312,7 +1367,8 @@ impl<'a> Printer<'a> {
     /// `get_rule_expr_paren`: `n` inside `parent`, coerced to `want`.
     fn child(&mut self, n: &Node, want: &str, parent: Parent<'_>) -> Option<()> {
         if !want.is_empty() {
-            let own = self.typ(n)?;
+            // A domain coerced to its base is a RelabelType that prints.
+            let own = self.typ_dom(n)?;
             if own == "unknown" {
                 // An untyped literal or NULL takes the wanted type directly.
                 return self.const_as(n, want);
@@ -1644,18 +1700,28 @@ impl<'a> Printer<'a> {
                 let typmod = crate::declared_typmod_public(tn);
                 let label = crate::scalar::format_type_text_public(&target, Some(typmod));
                 let arg = tc.arg.as_deref()?;
-                let own = self.typ(arg)?;
+                // A cast of a domain to its base is a RelabelType, never
+                // dropped as a cast to the type the input has.
+                let own = self.typ_dom(arg)?;
                 // A cast to a domain is a `CoerceToDomain` over its input:
                 // a literal is first folded into a constant of the base
-                // type, and the domain prints schema-qualified, as
-                // `format_type` qualifies a type not on the search path.
-                if let Some((domain, base)) = information_schema_domain(&target) {
-                    let label = format!("information_schema.{domain}");
+                // type, and the domain prints as `format_type` names it,
+                // qualified when not on the search path. A cast to the
+                // type the input already has is no node at all
+                // (`coerce_type`): `t::dtxt` over a `dtxt` column is `u.t`.
+                if let Some(base) = domain_base(&target) {
+                    if own == target {
+                        return self.expr(arg);
+                    }
+                    let label = match information_schema_domain(&target) {
+                        Some((domain, _)) => format!("information_schema.{domain}"),
+                        None => label,
+                    };
                     if !self.pretty {
                         self.buf.push('(');
                     }
                     if own == "unknown" {
-                        self.const_as(arg, base)?;
+                        self.const_as(arg, &base)?;
                     } else if self.pretty {
                         self.child(arg, "", Parent::Cast)?;
                     } else {
@@ -1905,8 +1971,13 @@ impl<'a> Printer<'a> {
         }
     }
 
-    /// An operator expression: parenthesised unless pretty.
+    /// An operator expression: parenthesised unless pretty. An operand
+    /// that keeps its own type relabels a domain to its base, as
+    /// `make_fn_arguments` coerces it to the operator's input
+    /// (`(u.dd)::integer = u.k`).
     fn binary(&mut self, l: &Node, lw: &str, op: &str, r: &Node, rw: &str) -> Option<()> {
+        let (lw, rw) = (self.coerced(l, lw)?, self.coerced(r, rw)?);
+        let (lw, rw) = (lw.as_str(), rw.as_str());
         let open = !self.pretty;
         if open {
             self.buf.push('(');
@@ -1933,7 +2004,8 @@ impl<'a> Printer<'a> {
                         self.buf.push('(');
                     }
                     self.buf.push_str(&format!("{op} "));
-                    self.child(r, "", Parent::Op(&op, false))?;
+                    let rw = self.coerced(r, "")?;
+                    self.child(r, &rw, Parent::Op(&op, false))?;
                     if open {
                         self.buf.push(')');
                     }
@@ -1947,29 +2019,14 @@ impl<'a> Printer<'a> {
                 {
                     return self.row_compare(&op, &lr.args, &rr.args);
                 }
-                let (lt, rt) = (self.typ(l)?, self.typ(r)?);
                 // An operator over a domain resolves on its base type
                 // (`binary_oper_exact`, `func_select_candidate` reduce a
-                // domain to its base), and `make_fn_arguments` relabels
-                // the operand to the operator's input type, which
-                // `get_oper_expr` shows: `(x)::text = 'YES'::text`, and
-                // `(x)::integer` even when the base is already the input.
-                let (ld, rd) = (
-                    information_schema_domain(&lt).map(|(_, b)| b),
-                    information_schema_domain(&rt).map(|(_, b)| b),
-                );
-                if ld.is_some() || rd.is_some() {
-                    let lb = ld.map_or(lt.clone(), str::to_string);
-                    let rb = rd.map_or(rt.clone(), str::to_string);
-                    let (lw, rw) = Self::operator_coercion(&op, &lb, &rb)?;
-                    let relabel = |w: String, dom: Option<&str>| match (w.is_empty(), dom) {
-                        (true, Some(b)) => b.to_string(),
-                        _ => w,
-                    };
-                    let (lw, rw) = (relabel(lw, ld), relabel(rw, rd));
-                    let op = if op == "!=" { "<>".to_string() } else { op };
-                    return self.binary(l, &lw, &op, r, &rw);
-                }
+                // domain to its base, as `typ` does), and
+                // `make_fn_arguments` relabels the operand to the
+                // operator's input type, which `get_oper_expr` shows
+                // (`binary`): `(x)::text = 'YES'::text`, and `(x)::integer`
+                // even when the base is already the input.
+                let (lt, rt) = (self.typ(l)?, self.typ(r)?);
                 // Array containment / overlap: same element types, no cast.
                 if matches!(op.as_str(), "@>" | "<@" | "&&") && is_array(&lt) && is_array(&rt) {
                     if lt != rt {
@@ -2088,6 +2145,7 @@ impl<'a> Printer<'a> {
             AExprKind::AexprDistinct | AExprKind::AexprNotDistinct => {
                 let (l, r) = (e.lexpr.as_deref()?, e.rexpr.as_deref()?);
                 let (lw, rw) = Self::compare_coercion(&self.typ(l)?, &self.typ(r)?)?;
+                let (lw, rw) = (self.coerced(l, &lw)?, self.coerced(r, &rw)?);
                 let open = !self.pretty;
                 // IS NOT DISTINCT FROM is NOT over a DistinctExpr.
                 let not = kind == AExprKind::AexprNotDistinct;
@@ -2177,6 +2235,7 @@ impl<'a> Printer<'a> {
                 if !ew.is_empty() {
                     return None;
                 }
+                let lw = self.coerced(l, &lw)?;
                 let op = if op == "!=" { "<>".to_string() } else { op };
                 let quant = if kind == AExprKind::AexprOpAny {
                     "ANY"
@@ -2198,6 +2257,7 @@ impl<'a> Printer<'a> {
             AExprKind::AexprNullif => {
                 let (l, r) = (e.lexpr.as_deref()?, e.rexpr.as_deref()?);
                 let (lw, rw) = Self::compare_coercion(&self.typ(l)?, &self.typ(r)?)?;
+                let (lw, rw) = (self.coerced(l, &lw)?, self.coerced(r, &rw)?);
                 self.buf.push_str("NULLIF(");
                 self.expr_as(l, &lw)?;
                 self.buf.push_str(", ");
@@ -2335,6 +2395,7 @@ impl<'a> Printer<'a> {
         // has `nameeq` / `namene` and keeps its type.
         let via_text = common == "varchar";
         let lw = if via_text { "text".to_string() } else { lw };
+        let lw = self.coerced(l, &lw)?;
         let open = !self.pretty;
         if open {
             self.buf.push('(');
@@ -2424,7 +2485,8 @@ impl<'a> Printer<'a> {
                         if i > 0 {
                             self.buf.push_str(", ");
                         }
-                        self.expr_as(x, if first { aw } else { bw })?;
+                        let w = self.coerced(x, if first { aw } else { bw })?;
+                        self.expr_as(x, &w)?;
                     }
                     self.buf.push(')');
                 }
@@ -2452,8 +2514,24 @@ impl<'a> Printer<'a> {
         Some((lw.into(), rw.into()))
     }
 
+    /// An argument of a function `get_func_sql_syntax` prints as SQL
+    /// syntax (`SUBSTRING(x FROM n)`, `TRIM(BOTH FROM x)`, ...), which it
+    /// prints with `showimplicit = false`: a domain's relabel to the base
+    /// the parameter takes is hidden (`SUBSTRING(u.t FROM 2)` over a
+    /// domain over text, PostgreSQL 15.20).
+    fn sql_syntax_arg(&mut self, n: &Node, want: &str) -> Option<()> {
+        let want = if self.typ(n)? == want { "" } else { want };
+        self.expr_as(n, want)
+    }
+
+    /// [`Self::sql_syntax_arg`] as a parenthesised operand.
+    fn sql_syntax_child(&mut self, n: &Node, want: &str) -> Option<()> {
+        let want = if self.typ(n)? == want { "" } else { want };
+        self.child(n, want, Parent::Other)
+    }
+
     fn variadic_call(&mut self, word: &str, args: &[Node]) -> Option<()> {
-        let common = self.common_type(args)?;
+        let common = self.common_type_dom(args)?;
         self.buf.push_str(word);
         self.buf.push('(');
         for (i, a) in args.iter().enumerate() {
@@ -2493,7 +2571,7 @@ impl<'a> Printer<'a> {
                         return None;
                     }
                     self.buf.push_str("SUBSTRING(");
-                    self.expr_as(x, "text")?;
+                    self.sql_syntax_arg(x, "text")?;
                     self.buf.push_str(" FROM ");
                     self.expr(from)?;
                     if let [len] = rest {
@@ -2518,7 +2596,7 @@ impl<'a> Printer<'a> {
                     self.buf.push('(');
                     self.child(ts, "", Parent::Other)?;
                     self.buf.push_str(" AT TIME ZONE ");
-                    self.child(zone, zw, Parent::Other)?;
+                    self.sql_syntax_child(zone, zw)?;
                     self.buf.push(')');
                     return Some(());
                 }
@@ -2527,9 +2605,9 @@ impl<'a> Printer<'a> {
                         return None;
                     }
                     self.buf.push_str("POSITION((");
-                    self.expr_as(sub, "text")?;
+                    self.sql_syntax_arg(sub, "text")?;
                     self.buf.push_str(") IN (");
-                    self.expr_as(string, "text")?;
+                    self.sql_syntax_arg(string, "text")?;
                     self.buf.push_str("))");
                     return Some(());
                 }
@@ -2542,9 +2620,9 @@ impl<'a> Printer<'a> {
                         return None;
                     }
                     self.buf.push_str("OVERLAY(");
-                    self.expr_as(x, "text")?;
+                    self.sql_syntax_arg(x, "text")?;
                     self.buf.push_str(" PLACING ");
-                    self.expr_as(y, "text")?;
+                    self.sql_syntax_arg(y, "text")?;
                     self.buf.push_str(" FROM ");
                     self.expr(from)?;
                     if let [len] = rest {
@@ -2569,10 +2647,10 @@ impl<'a> Printer<'a> {
                             return None;
                         }
                         self.buf.push(' ');
-                        self.expr_as(c, "text")?;
+                        self.sql_syntax_arg(c, "text")?;
                     }
                     self.buf.push_str(" FROM ");
-                    self.expr_as(x, "text")?;
+                    self.sql_syntax_arg(x, "text")?;
                     self.buf.push(')');
                     return Some(());
                 }
@@ -2670,7 +2748,7 @@ impl<'a> Printer<'a> {
             let types = vec!["text".to_string(), self.typ(&f.args[1])?];
             let declared = crate::funcsig::selected_args("extract", &types)?;
             self.buf.push_str(&format!("EXTRACT({} FROM ", field));
-            self.expr_as(&f.args[1], declared.get(1)?)?;
+            self.sql_syntax_arg(&f.args[1], declared.get(1)?)?;
             self.buf.push(')');
             return Some(());
         }
@@ -2722,7 +2800,16 @@ impl<'a> Printer<'a> {
                     }
                 }
             };
-            self.expr_as(a, want)?;
+            // A domain argument relabels to its base where the parameter
+            // is a type of its own, not where it is polymorphic or "any"
+            // (`count(u.dd)`, `array_agg(u.dd)`, `lag(u.dd)`, PostgreSQL
+            // 15.20).
+            let want = if polymorphic_arg(&name, i) {
+                want.to_string()
+            } else {
+                self.coerced(a, want)?
+            };
+            self.expr_as(a, &want)?;
         }
         if !f.agg_order.is_empty() {
             self.buf.push_str(" ORDER BY ");
@@ -2809,7 +2896,8 @@ impl<'a> Printer<'a> {
                 self.buf.push_str(&format!("{}.*", q(&refname)));
                 continue;
             }
-            let own = self.typ(a)?;
+            // A domain argument relabels to the parameter's type.
+            let own = self.typ_dom(a)?;
             self.expr_as(a, if own == *want { "" } else { want })?;
         }
         self.buf.push(')');
@@ -2855,20 +2943,18 @@ impl<'a> Printer<'a> {
         let own = f
             .args
             .iter()
-            .map(|a| self.typ(a))
+            .map(|a| self.typ_dom(a))
             .collect::<Option<Vec<String>>>()?;
-        // An `information_schema` domain argument resolves on its base type
+        // A domain argument resolves on its base type
         // (`func_select_candidate` reduces a domain to its base), and
         // `make_fn_arguments` relabels it to the parameter's type, which
-        // `get_func_expr` shows: `pg_has_role((um.srvowner)::name, ...)`.
-        let domains: Vec<Option<&str>> = own
-            .iter()
-            .map(|t| information_schema_domain(t).map(|(_, b)| b))
-            .collect();
+        // `get_func_expr` shows: `pg_has_role((um.srvowner)::name, ...)`,
+        // `abs((u.dd)::integer)` (RP-1095).
+        let domains: Vec<Option<String>> = own.iter().map(|t| domain_base(t)).collect();
         let types: Vec<String> = own
             .iter()
             .zip(&domains)
-            .map(|(t, d)| d.map_or_else(|| t.clone(), str::to_string))
+            .map(|(t, d)| d.clone().unwrap_or_else(|| t.clone()))
             .collect();
         // Otherwise the overload PostgreSQL's `func_select_candidate` picks,
         // with each argument coerced to its declared type as the analysed
@@ -2887,9 +2973,23 @@ impl<'a> Printer<'a> {
             let mut out = Vec::with_capacity(d.len());
             for ((want, have), dom) in d.iter().zip(&types).zip(&domains) {
                 if want.starts_with("any") && dom.is_some() {
-                    // A domain at a polymorphic parameter resolves the
-                    // polymorphism on its base type: not reproduced.
-                    return None;
+                    match want.as_str() {
+                        // `"any"` and `anyelement` take a domain as it
+                        // is, unrelabelled (`to_jsonb(u.dd)`, `lag(u.dd)`,
+                        // PostgreSQL 15.20).
+                        "any" | "anyelement" | "anynonarray" => {
+                            out.push("\u{0}keep".into());
+                            continue;
+                        }
+                        // The `anycompatible` family takes the common
+                        // type of its arguments, domains reduced to their
+                        // bases, and relabels a domain to it
+                        // (`array_append(ARRAY[1], (u.dd)::integer)`).
+                        "anycompatible" | "anycompatiblenonarray" => {}
+                        // A domain at an array, range or enum
+                        // polymorphic parameter: not reproduced.
+                        _ => return None,
+                    }
                 }
                 if want == "any" && have == "unknown" {
                     // `"any"` takes an untyped literal as it is: printed
@@ -2915,7 +3015,7 @@ impl<'a> Printer<'a> {
             .into_iter()
             .zip(&domains)
             .map(|(d, dom)| match (d.is_empty(), dom) {
-                (true, Some(b)) => b.to_string(),
+                (true, Some(b)) => b.clone(),
                 _ => d,
             })
             .collect();
@@ -2934,6 +3034,10 @@ impl<'a> Printer<'a> {
                     None => self.buf.push_str("NULL"),
                     _ => return None,
                 }
+                continue;
+            }
+            if declared[i] == "\u{0}keep" {
+                self.expr(a)?;
                 continue;
             }
             self.expr_as(a, &declared[i])?;
@@ -3098,10 +3202,10 @@ impl<'a> Printer<'a> {
                 _ => None,
             })
             .collect();
-        if let Some(d) = c.defresult.as_deref() {
-            results.push(d.clone());
-        }
-        let common = self.common_type(&results)?;
+        // No ELSE is an ELSE NULL, which `select_common_type` counts:
+        // `CASE ... THEN u.dd END` resolves to the domain's base.
+        results.push(c.defresult.as_deref().cloned().unwrap_or_else(null_const));
+        let common = self.common_type_dom(&results)?;
         let arg_type = match c.arg.as_deref() {
             Some(a) => Some(self.typ(a)?),
             None => None,
@@ -3172,16 +3276,14 @@ impl<'a> Printer<'a> {
                 // A domain resolves the operator on its base type, the
                 // test expression relabelled to the operator's input,
                 // which `get_sublink_expr` shows (`(x)::name IN (...)`).
-                let base = |t: &str| information_schema_domain(t).map(|(_, b)| b);
-                let (ld, rd) = (base(&lt), base(&cols.first()?.1));
-                let (lw, _) =
-                    Self::compare_coercion(ld.unwrap_or(&lt), rd.unwrap_or(&cols.first()?.1))?;
-                let lw = match (lw.is_empty(), ld) {
-                    (true, Some(b)) => b.to_string(),
-                    (true, None) => lw,
-                    (false, _) if ld.is_some() => lw,
-                    (false, _) => return None,
-                };
+                // The subquery's column is coerced inside it, unprinted.
+                let domain = domain_base(&self.typ_dom(test)?).is_some();
+                let col = cols.first()?.1.clone();
+                let (lw, _) = Self::compare_coercion(&lt, &domain_base(&col).unwrap_or(col))?;
+                if !lw.is_empty() && !domain {
+                    return None;
+                }
+                let lw = self.coerced(test, &lw)?;
                 self.buf.push('(');
                 self.expr_as(test, &lw)?;
                 if kind == SubLinkType::AllSublink {
@@ -3314,6 +3416,45 @@ fn information_schema_domain(t: &str) -> Option<(&'static str, &'static str)> {
         "yes_or_no" => ("yes_or_no", "varchar"),
         _ => return None,
     })
+}
+
+/// An untyped NULL constant.
+fn null_const() -> Node {
+    Node {
+        node: Some(N::AConst(pg_query::protobuf::AConst {
+            isnull: true,
+            val: None,
+            location: -1,
+        })),
+    }
+}
+
+/// `getBaseType`: the base type of a domain, through a domain over a
+/// domain to the first type that is not one (`create domain d2 as d1`
+/// relabels to `d1`'s base, PostgreSQL 15.20); `None` for a type that is
+/// not a domain. A name a `pg_catalog` type answers to is never a user
+/// domain's (`pg_catalog` is searched first).
+fn domain_base(t: &str) -> Option<String> {
+    if let Some((_, b)) = information_schema_domain(t) {
+        return Some(b.to_string());
+    }
+    let user = |t: &str| {
+        (t != "unknown" && !crate::pgtypes::is_catalog_type_name(t))
+            .then(|| crate::domains::user_domain(t))
+            .flatten()
+    };
+    let mut d = user(t)?;
+    for _ in 0..32 {
+        let base = base_type(&d.base);
+        if let Some((_, b)) = information_schema_domain(&base) {
+            return Some(b.to_string());
+        }
+        match user(&base) {
+            Some(inner) => d = inner,
+            None => return Some(base),
+        }
+    }
+    None
 }
 
 pub(crate) fn base_type(t: &str) -> String {
@@ -3788,7 +3929,7 @@ impl Printer<'_> {
             ("unnest", [a]) if is_array(a) => a.trim_end_matches("[]").to_string(),
             ("generate_subscripts", [a, "int4"]) if is_array(a) => "int4".to_string(),
             ("regexp_split_to_table", ["text", "text"]) => "text".to_string(),
-            _ => self.typ(&call)?,
+            _ => self.typ_dom(&call)?,
         };
         if ty == "record" || crate::user_composite(&ty).is_some() || ty.is_empty() {
             return None;
@@ -3977,7 +4118,9 @@ impl Printer<'_> {
             let out = targets.and_then(|ts| {
                 ts.iter()
                     .map(|t| {
-                        let ty = self.typ(&t.expr)?;
+                        // An output column keeps a domain type: a Var over
+                        // it is the domain, relabelled where it is used.
+                        let ty = self.typ_dom(&t.expr)?;
                         Some((
                             t.name.clone(),
                             if ty == "unknown" && resolve_unknowns {
@@ -4845,6 +4988,12 @@ fn unknown_typmods(columns: &[(String, String)]) -> Vec<Option<i32>> {
 fn meet_types(o: &str, t: &str) -> Option<String> {
     if o == t {
         return Some(o.to_string());
+    }
+    // Two types that are not the same meet on their bases, a domain
+    // reduced to its own (`select_common_type`).
+    let (ob, tb) = (domain_base(o), domain_base(t));
+    if ob.is_some() || tb.is_some() {
+        return meet_types(ob.as_deref().unwrap_or(o), tb.as_deref().unwrap_or(t));
     }
     if let Some((meet, _)) = numeric_meet(o, t) {
         if !meet.is_empty() {
@@ -6539,7 +6688,8 @@ fn io_casts(p: &Printer<'_>, n: &Node) -> usize {
         };
         let source = p
             .lookup(&names(&c.fields))
-            .and_then(|(si, ri, ci)| Some(p.scopes.get(si)?.get(ri)?.columns.get(ci)?.1.clone()));
+            .and_then(|(si, ri, ci)| Some(p.scopes.get(si)?.get(ri)?.columns.get(ci)?.1.clone()))
+            .map(|t| domain_base(&t).unwrap_or(t));
         if to_text
             && source.is_some_and(|ty| {
                 !matches!(
