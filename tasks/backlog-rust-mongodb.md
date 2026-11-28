@@ -661,7 +661,10 @@ These are explicit non-goals. Don't add them without a reason.
       rounds match, and since 2026-11-28 an `insert` of more than 50
       documents takes mongod's read round for the index count that tunes
       its batch size, and a `collMod` of a collection not there takes the
-      same rounds as one of a collection there. Still different,
+      same rounds as one of a collection there; since 2026-11-28 a
+      transaction takes its reads' locks in IX and its statements' profile
+      entries count what the transaction took for each, and a collectionless
+      `aggregate`'s entry is compared with mongod's. Still different,
       measured against a one-member replica set:
       - an `insert` whose batch fails counts an interrupt check for each
         lock on mongod; this server's line prints no `numInterruptChecks`
@@ -672,16 +675,11 @@ These are explicit non-goals. Don't add them without a reason.
       - each global lock taken apart takes an execution ticket, so where
         these locks differ the line's `queues.execution` admissions differ
         too (RM-355);
-      - a statement of a transaction shows the transaction's initial locks
-        in its profile entry on mongod (its line prints `{}` here too since
-        2026-11-17); the entry is not compared yet;
       - a collectionless `aggregate` whose `$lookup` or `$unionWith` reads
-        a collection takes mongod's global IS on its line since 2026-11-18
-        (once, then twice per read of the collection), but its profile
-        entry (one more on mongod) and its line's execution admissions are
-        not compared yet.
+        a collection: its line's execution admissions are not compared yet
+        (RM-355).
       Backlog-ID: RM-357
-      Verify: none -- the interrupt checks are RM-360's and the execution admissions RM-355's; the two profile entries are not measured yet
+      Verify: none -- the interrupt checks are RM-360's and the execution admissions RM-355's
 - [ ] **Some queries have no `queryShapeHash`.** Since 2026-11-07 a
       `find`'s, `distinct`'s and `aggregate`'s line, profile entry and
       `explain` carry mongod's `queryShapeHash` (`secantus-commands`
@@ -1838,10 +1836,10 @@ What is left, all on the RUST MongoDB server:
       `$count`, `$avg`, `$first`, `$last`, `$min`, `$max`, `$push` and
       `$addToSet`, and at most one distinct dotted path; and the `limit 0`
       / `coscan` plan over a collection that does not exist, and an
-      `$exists` on one field (`exists(s)`, since 2026-11-28). Still the
+      `$exists` (`exists(s)` on one field, a `traverseF` of
+      `exists(getField(...))` on a dotted path, since 2026-11-28). Still the
       classic `$cursor` / `stages` shape: any other filter (an `$in` holding
-      null on a dotted path, a dotted `$exists` (mongod's `traverseF` of
-      `exists(getField(...))`), `$or`, ...), a sorted,
+      null on a dotted path, `$or`, ...), a sorted,
       projected or index-served front (`IXSCAN` / `FETCH` under a group
       that reads a field; the single-interval `FETCH` under one that reads
       none is built since 2026-11-27, RM-695; the `COUNT_SCAN` of a single-field

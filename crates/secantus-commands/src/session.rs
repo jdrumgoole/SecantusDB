@@ -865,6 +865,15 @@ fn statement(
                 }
             }
         }
+        // A transaction takes its intent locks exclusive, reads too:
+        // mongod upgrades a multi-document transaction's IS to IX (measured
+        // 8.2.11 2026-11-28, RM-357: a `find` in a transaction counts the
+        // global, database and collection lock in `w`).
+        for (_, mode) in chain.iter_mut() {
+            if *mode == crate::lock_manager::Mode::Is {
+                *mode = crate::lock_manager::Mode::Ix;
+            }
+        }
         // Each lock request of a transaction gives up after
         // `maxTransactionLockRequestTimeoutMillis` (mongod's 5 ms): a
         // transaction waiting on another's lock fails, transiently, rather
@@ -883,7 +892,7 @@ fn statement(
             .lock_stats
             .clone()
         {
-            Some(stats) => crate::lock_manager::resume_operation_lock_stats(&stats),
+            Some(stats) => crate::lock_manager::resume_transaction_lock_stats(&stats),
             None => crate::lock_manager::note_transaction_begun(),
         }
         let mut failed = None;

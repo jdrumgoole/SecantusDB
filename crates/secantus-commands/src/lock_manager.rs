@@ -1530,6 +1530,89 @@ pub fn resume_operation_lock_stats(stats: &OperationLockStats) {
     FLOW_CONTROL.with(|n| n.set(stats.flow_control));
 }
 
+/// A transaction's command resumes from `stats`, as
+/// `resume_operation_lock_stats`, and its profile entries count from them.
+pub fn resume_transaction_lock_stats(stats: &OperationLockStats) {
+    resume_operation_lock_stats(stats);
+    begin_txn_command();
+}
+
+type LockRows = Vec<(&'static str, Mode, u64, u64)>;
+
+thread_local! {
+    /// A multi-document transaction's command on this thread: its
+    /// transaction's counts when it began, and when its last statement's
+    /// profile entry was taken. mongod's profiler reports a statement of a
+    /// transaction by the counts its stashed locker gained meanwhile.
+    static TXN_BASELINE: std::cell::RefCell<Option<(LockRows, LockRows)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn begin_txn_command() {
+    let rows = OP_LOCKS.with(|l| l.borrow().clone());
+    TXN_BASELINE.with(|b| *b.borrow_mut() = Some((rows.clone(), rows)));
+}
+
+/// Whether the command on this thread is a statement of a multi-document
+/// transaction (one whose locks the transaction keeps).
+pub fn in_transaction_command() -> bool {
+    TXN_BASELINE.with(|b| b.borrow().is_some())
+}
+
+fn rows_since(base: &LockRows, keep: impl Fn(&str) -> bool) -> LockRows {
+    OP_LOCKS.with(|l| {
+        l.borrow()
+            .iter()
+            .filter(|r| keep(r.0))
+            .filter_map(|&(k, m, n, w)| {
+                let (bn, bw) = base
+                    .iter()
+                    .find(|r| r.0 == k && r.1 == m)
+                    .map_or((0, 0), |r| (r.2, r.3));
+                (n > bn).then_some((k, m, n - bn, w.saturating_sub(bw)))
+            })
+            .collect()
+    })
+}
+
+/// A transaction command's profile entry's `locks`: what its transaction
+/// took since the command began, the transaction's own locks for its first
+/// (measured 8.2.11 2026-11-28, RM-357: a transaction's first `insert`
+/// counts `MultiDocumentTransactionsBarrier`, `ReplicationStateTransition`
+/// and the global, database and collection IX; a second `insert` of the
+/// same collection `{}`, of another `Collection: {w: 1}`). `None` outside
+/// a transaction.
+pub fn transaction_command_locks() -> Option<bson::Document> {
+    TXN_BASELINE.with(|b| {
+        b.borrow()
+            .as_ref()
+            .map(|(command, _)| render_locks(rows_since(command, |_| true)))
+    })
+}
+
+/// A transaction's update or delete statement's profile entry's `locks`:
+/// the database and collection locks its transaction took since the
+/// command's previous statement (or its start). mongod takes the
+/// transaction's barrier, transition and global locks at the command, and
+/// a statement re-uses what its transaction holds (measured 8.2.11
+/// 2026-11-28, RM-357: a transaction's first `update`'s statement counts
+/// `Database: {w: 1}, Collection: {w: 1}`; one after a `find` of its
+/// collection `{}`). `None` outside a transaction.
+pub fn transaction_statement_locks() -> Option<bson::Document> {
+    TXN_BASELINE.with(|b| {
+        let mut b = b.borrow_mut();
+        let (_, statement) = b.as_mut()?;
+        let rows = rows_since(statement, |k| {
+            !matches!(
+                k,
+                "MultiDocumentTransactionsBarrier" | "ReplicationStateTransition" | "Global"
+            )
+        });
+        *statement = OP_LOCKS.with(|l| l.borrow().clone());
+        Some(render_locks(rows))
+    })
+}
+
 /// What a multi-document transaction's first statement counts beside its
 /// own locks: the `MultiDocumentTransactionsBarrier` in IX, the
 /// replication state transition lock in IX three times, and one flow
@@ -1538,6 +1621,7 @@ pub fn resume_operation_lock_stats(stats: &OperationLockStats) {
 /// `ReplicationStateTransition: {w: 3}` and `flowControl: {acquireCount:
 /// 1}`, and its later statements none of them again).
 pub fn note_transaction_begun() {
+    begin_txn_command();
     note_operation_lock("MultiDocumentTransactionsBarrier", Mode::Ix, false);
     for _ in 0..3 {
         note_operation_lock("ReplicationStateTransition", Mode::Ix, false);
@@ -1593,6 +1677,10 @@ pub fn operation_locks(extra_global_is: bool) -> bson::Document {
             None => rows.push(("Global", Mode::Is, 1, 0)),
         }
     }
+    render_locks(rows)
+}
+
+fn render_locks(rows: LockRows) -> bson::Document {
     let mut kinds: Vec<&'static str> = rows.iter().map(|r| r.0).collect();
     kinds.sort_by_key(|k| {
         KIND_ORDER
@@ -1633,6 +1721,7 @@ pub fn begin_operation() {
     TICKET_ERROR.with(|t| *t.borrow_mut() = None);
     OP_LOCKS.with(|l| l.borrow_mut().clear());
     FLOW_CONTROL.with(|n| n.set(0));
+    TXN_BASELINE.with(|b| *b.borrow_mut() = None);
 }
 
 /// Whether the operation this thread runs has taken the global lock.

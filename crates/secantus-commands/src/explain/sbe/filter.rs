@@ -148,8 +148,8 @@ fn leaf(clause: &Document, raw: Option<&Document>) -> Option<Leaf> {
     }
     if name == "$exists" {
         // The planner canonicalises `$exists: false` to `$not: {$exists:
-        // true}`; measured on a one-field path only (2026-11-28).
-        return (matches!(value, Bson::Boolean(true)) && parts.len() == 1).then_some(Leaf {
+        // true}`; measured on one field and on dotted paths (2026-11-28).
+        return matches!(value, Bson::Boolean(true)).then_some(Leaf {
             path: parts,
             test: Test::Exists,
             negated,
@@ -268,7 +268,30 @@ impl Filter {
             if let Test::Exists = l.test {
                 // A frame id is taken for it all the same (measured
                 // 2026-11-28: beside one `$in`, the `$in`'s lambda is `l3.0`).
-                let e = Expr::func("exists", vec![top]);
+                // A dotted path traverses every level but the last, whose
+                // field it tests: `traverseF(s, lambda(l) {
+                // exists(getField(move(l), "e")) }, false)` for `d.e`.
+                let e = match l.path.split_last() {
+                    Some((last, above)) if !above.is_empty() => {
+                        let shorter = Leaf {
+                            path: above.to_vec(),
+                            test: Test::Exists,
+                            negated: false,
+                        };
+                        let last = last.clone();
+                        let test = move |v: Expr| {
+                            Expr::func(
+                                "exists",
+                                vec![Expr::func(
+                                    "getField",
+                                    vec![v, Expr::Const(Some(Bson::String(last.clone())))],
+                                )],
+                            )
+                        };
+                        traverse(top, &shorter, &test, 0, &mut frame)
+                    }
+                    _ => Expr::func("exists", vec![top]),
+                };
                 built.push(if l.negated { Expr::Not(Box::new(e)) } else { e });
                 continue;
             }
@@ -584,7 +607,32 @@ mod tests {
             ),
             "(traverseF(s3, lambda(l3.0) { ((move(l3.0) > 2) ?: false) }, false) && !(exists(s4)))"
         );
-        assert!(Filter::parse(&doc! { "c.d": { "$exists": true } }).is_none());
+    }
+
+    /// A dotted `$exists` traverses every level but the last and tests
+    /// that field; measured against mongod 8.2.11 on 2026-11-28 (RM-071).
+    #[test]
+    fn a_dotted_exists_traverses_the_levels_above() {
+        assert_eq!(
+            text(doc! { "d.e": { "$exists": true } }, &[("d", 3)]),
+            "traverseF(s3, lambda(l3.0) { exists(getField(move(l3.0), \"e\")) }, false)"
+        );
+        assert_eq!(
+            text(
+                doc! { "d.e.f": { "$not": { "$exists": true } } },
+                &[("d", 3)]
+            ),
+            "!(traverseF(s3, lambda(l4.0) { traverseF(getField(move(l4.0), \"e\"), \
+             lambda(l5.0) { exists(getField(move(l5.0), \"f\")) }, false) }, false))"
+        );
+        assert_eq!(
+            text(
+                doc! { "$and": [{ "a": { "$gt": 1 } }, { "d.e": { "$exists": true } }] },
+                &[("a", 3), ("d", 4)]
+            ),
+            "(traverseF(s3, lambda(l4.0) { ((move(l4.0) > 1) ?: false) }, false) && \
+             traverseF(s4, lambda(l5.0) { exists(getField(move(l5.0), \"e\")) }, false))"
+        );
     }
 
     /// A null test on a dotted path traverses only objects and arrays,

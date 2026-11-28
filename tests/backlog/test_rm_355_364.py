@@ -670,6 +670,104 @@ def test_a_collectionless_aggregate_reads_under_no_lock(
     assert answers["rust"] == answers["mongod"]
 
 
+def _entry_locks(rust_mongo: Any, mongod: Any, op: Any) -> dict:
+    """Each server's `(op, command, locks)` for each profile entry `op` wrote."""
+    try:
+        got = _both(rust_mongo, mongod, op)
+    finally:
+        while _PLAIN:
+            _PLAIN.pop().close()
+    return {
+        server: [
+            (e.get("op"), next(iter(e.get("command", {})), ""), e.get("locks")) for e in entries
+        ]
+        for server, (_, entries) in got.items()
+    }
+
+
+@pytest.mark.backlog_fixed("RM-357")
+@pytest.mark.parametrize("name", list(_UNLOCKED_READS))
+def test_a_collectionless_aggregates_entry_counts_mongods_locks(
+    rust_mongo: Any, mongod_rs_no_yield: Any, name: str
+) -> None:
+    """A collectionless `aggregate` whose `$lookup` or `$unionWith` reads a
+    collection: its profile entry counts mongod 8.2.11's global IS, one more
+    than its line (measured 2026-11-28)."""
+    answers = _entry_locks(
+        rust_mongo,
+        mongod_rs_no_yield,
+        lambda d: list(_plain(d).aggregate(_UNLOCKED_READS[name])),
+    )
+    assert answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
+
+
+def _in_transaction(*statements: Any) -> Any:
+    def run(d: Any) -> None:
+        with d.client.start_session() as s, s.start_transaction():
+            for statement in statements:
+                statement(d, s)
+
+    return run
+
+
+def _txn_insert(d: Any, s: Any) -> None:
+    d.c.insert_one({"_id": 500}, session=s)
+
+
+def _txn_update(d: Any, s: Any) -> None:
+    d.c.update_one({"_id": 1}, {"$set": {"q": 1}}, session=s)
+
+
+def _txn_find(d: Any, s: Any) -> None:
+    list(d.c.find({"_id": 1}, session=s))
+
+
+def _txn_delete(d: Any, s: Any) -> None:
+    d.c.delete_one({"_id": 2}, session=s)
+
+
+def _txn_find_other(d: Any, s: Any) -> None:
+    list(d.k.find({}, session=s))
+
+
+def _txn_insert_other(d: Any, s: Any) -> None:
+    d.k.insert_one({"_id": 1}, session=s)
+
+
+#: Transactions whose statements' profile entries are compared.
+_TRANSACTIONS = {
+    "insert, update, find, delete": _in_transaction(
+        _txn_insert, _txn_update, _txn_find, _txn_delete
+    ),
+    "update then find": _in_transaction(_txn_update, _txn_find),
+    "find then update": _in_transaction(_txn_find, _txn_update),
+    "two finds": _in_transaction(_txn_find, _txn_find),
+    "find, then a find of another collection": _in_transaction(_txn_find, _txn_find_other),
+    "insert, then an insert into another collection": _in_transaction(
+        _txn_insert, _txn_insert_other
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RM-357")
+@pytest.mark.parametrize("name", list(_TRANSACTIONS))
+def test_a_transaction_statements_entry_counts_what_it_took(
+    rust_mongo: Any, mongod_rs_no_yield: Any, name: str
+) -> None:
+    """mongod 8.2.11 takes a transaction's locks in IX, reads too, and
+    profiles each statement by the locks its transaction took for it: the
+    first command's entry the barrier, transition, global, database and
+    collection locks, an update or delete statement only the database and
+    collection locks, and a later statement only a collection it had not
+    held, with no global IS for its storage statistics and no lock for the
+    profile write (measured 2026-11-28). This server took IS for a read and
+    printed the transaction's running totals."""
+    answers = _entry_locks(rust_mongo, mongod_rs_no_yield, _TRANSACTIONS[name])
+    assert answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
+
+
 #: `$out`, to a new target and replacing one.
 _OUTS = {
     "$out": lambda d: list(_w1(_plain(d)).aggregate([{"$match": {}}, {"$out": "o"}])),
