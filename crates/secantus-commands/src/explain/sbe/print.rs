@@ -16,9 +16,6 @@ struct Out {
     indent: usize,
     /// Nothing written since the last new line: a separator is dropped.
     fresh: bool,
-    /// The indent the text started at: a line back at it is one column
-    /// short.
-    base: usize,
 }
 
 impl Out {
@@ -27,7 +24,6 @@ impl Out {
             text: String::new(),
             indent: 0,
             fresh: false,
-            base: 0,
         }
     }
 
@@ -38,12 +34,13 @@ impl Out {
             text: String::new(),
             indent: level,
             fresh: false,
-            base: level,
         }
     }
 
     fn push(&mut self, s: &str) {
-        if self.fresh && self.base > 0 && self.indent == self.base {
+        // A `,` or `)` that starts a line takes back the last column of the
+        // indent, where the printer removes the space before it.
+        if self.fresh && s.starts_with([',', ')']) && self.text.ends_with(' ') {
             self.text.pop();
         }
         self.text.push_str(s);
@@ -83,6 +80,7 @@ fn constant(v: &Option<Bson>) -> String {
         Some(Bson::Boolean(b)) => b.to_string(),
         Some(Bson::Int32(n)) => n.to_string(),
         Some(Bson::Int64(n)) => format!("{n}ll"),
+        Some(Bson::Undefined) => "undefined".to_string(),
         Some(Bson::Double(d)) => format!("{}L", g17(*d)),
         // Written as it is, with no escaping (`value_printer.cpp`).
         Some(Bson::String(s)) => format!("\"{s}\""),
@@ -366,6 +364,27 @@ fn stage(st: &Stage, level: usize, lines: &mut Vec<String>) {
                 ),
             );
         }
+        Stage::IxSeekBounds {
+            node,
+            low,
+            high,
+            record_id,
+            ident,
+            key,
+            snapshot,
+            index,
+            uuid,
+        } => push(
+            lines,
+            level,
+            format!(
+                "[{node}] ixseek s{low} s{high} s{key} s{record_id} s{snapshot} s{ident} [] @\"{uuid}\" @\"{index}\" true "
+            ),
+        ),
+        Stage::UniqueRoaring { node, slot, input } => {
+            push(lines, level, format!("[{node}] unique_roaring s{slot} "));
+            stage(input, level, lines);
+        }
         Stage::Seek {
             node,
             seek_record_id,
@@ -568,6 +587,14 @@ fn stage(st: &Stage, level: usize, lines: &mut Vec<String>) {
             correlated,
             outer,
             inner,
+        }
+        | Stage::IndexJoin {
+            node,
+            projects,
+            correlated,
+            outer,
+            inner,
+            ..
         } => {
             push(
                 lines,
@@ -621,7 +648,11 @@ fn key_string(bytes: &[u8]) -> String {
 fn has_blocks(st: &Stage) -> bool {
     matches!(
         st,
-        Stage::HashLookup { .. } | Stage::Nlj { .. } | Stage::Branch { .. } | Stage::Union { .. }
+        Stage::HashLookup { .. }
+            | Stage::Nlj { .. }
+            | Stage::IndexJoin { .. }
+            | Stage::Branch { .. }
+            | Stage::Union { .. }
     ) || st.inputs().into_iter().any(has_blocks)
 }
 
@@ -655,19 +686,17 @@ fn tally(stage: &Stage, counted: &Counted, t: &mut Tally) {
     match stage {
         Stage::Scan { .. } => {
             t.docs += counted.reads;
-            t.scans += 1;
+            t.scans += counted.opens.unwrap_or(1);
         }
         // A seek of each fetched document (RM-695).
         Stage::Seek { .. } => {
             t.docs += counted.reads;
             t.seeks += counted.reads;
         }
-        Stage::IxSeek { index, .. } => {
+        Stage::IxSeek { index, .. } | Stage::IxSeekBounds { index, .. } => {
             t.keys += counted.keys;
-            t.index_seeks += 1;
-            if !t.indexes.contains(index) {
-                t.indexes.push(index.clone());
-            }
+            t.index_seeks += counted.seeks;
+            t.indexes.push(index.clone());
         }
         _ => {}
     }
@@ -719,6 +748,34 @@ pub(super) fn specific_stats(st: &Stage, counted: &Counted, out: &mut Document) 
             out.insert("indexKeysToInclude", "0".repeat(32));
             out.insert("seekKeyLow", format!("{} ", key_string(low)));
             out.insert("seekKeyHigh", format!("{} ", key_string(high)));
+        }
+        Stage::IxSeekBounds {
+            low,
+            high,
+            record_id,
+            ident,
+            key,
+            snapshot,
+            index,
+            ..
+        } => {
+            out.insert("indexName", index.clone());
+            out.insert("keysExamined", super::number(counted.keys));
+            out.insert("seeks", super::number(counted.seeks));
+            out.insert("numReads", super::number(counted.reads));
+            out.insert("indexKeySlot", super::number(*key as i64));
+            out.insert("recordIdSlot", super::number(*record_id as i64));
+            out.insert("snapshotIdSlot", super::number(*snapshot as i64));
+            out.insert("indexIdentSlot", super::number(*ident as i64));
+            out.insert("outputSlots", Bson::Array(vec![]));
+            out.insert("indexKeysToInclude", "0".repeat(32));
+            out.insert("seekKeyLow", format!("s{low} "));
+            out.insert("seekKeyHigh", format!("s{high} "));
+        }
+        Stage::UniqueRoaring { slot, .. } => {
+            out.insert("dupsTested", super::number(counted.dups_tested));
+            out.insert("dupsDropped", super::number(counted.dups_dropped));
+            out.insert("keySlot", super::number(*slot as i64));
         }
         Stage::Seek {
             seek_record_id,
@@ -852,6 +909,11 @@ pub(super) fn specific_stats(st: &Stage, counted: &Counted, out: &mut Document) 
             out.insert("outputSlots", list(outputs.clone()));
         }
         Stage::Nlj {
+            projects,
+            correlated,
+            ..
+        }
+        | Stage::IndexJoin {
             projects,
             correlated,
             ..

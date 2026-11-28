@@ -924,6 +924,8 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // (RM-360), as a `find`'s.
                 if !storage.collection_exists(&ctx.db_name, c).unwrap_or(false) {
                     crate::explain::plans_nothing();
+                } else if let Some(e) = pushed_meta_sort_projection_problem(c, &read_pipeline) {
+                    return Err(e);
                 }
                 if geonear_candidate_none || leads_geo_near {
                     let ask = crate::agg_stream::Ask {
@@ -2052,6 +2054,51 @@ fn pushed_project_sort_key_problem(pipeline: &[Bson]) -> Option<CommandError> {
              :: caused by :: cannot use sortKey $meta projection without a sort",
         )
     })
+}
+
+/// mongod 8.2.11's query layer, given a `$sort` with a `$meta` key and no
+/// `$limit`, computes the key as a field `$computed1` and, when the stages
+/// it leaves read only some fields, adds that name (`$computed<n>`, n the
+/// key's place in the sort) to the projection it
+/// pushes down -- which its `FieldPath` refuses with 16410 (RM-691,
+/// measured 2026-11-27: `[{$sort: {a: 1, s: {$meta: "randVal"}}},
+/// {$project: {a: 1}}]`, and a `$group` on a field, an `$unset`, an
+/// `$unwind` or a `$replaceRoot` behind it). A `$limit` taken with the
+/// sort, a projection that itself reads metadata, stages needing the whole
+/// document or none of its fields, and a missing collection all answer.
+fn pushed_meta_sort_projection_problem(coll: &str, pipeline: &[Bson]) -> Option<CommandError> {
+    let q = crate::explain::pipeline_canonical(coll, pipeline);
+    let sort = q.sort.as_ref()?;
+    // The field is named for the key's place in the sort: `$computed0` when
+    // the `$meta` key leads it.
+    let at = sort
+        .values()
+        .position(|v| v.as_document().is_some_and(|d| d.contains_key("$meta")))?;
+    if q.limit > 0 {
+        return None;
+    }
+    let reads_meta = q.projection_stage.iter().chain(&q.rest).any(mentions_meta);
+    let projected = q.projection.is_some() && !reads_meta;
+    projected.then(|| {
+        CommandError::new(
+            16410,
+            "Location16410",
+            format!(
+                "Consider using $getField or $setField for a field path with '.' or '$'. :: \
+                 caused by :: FieldPath field names may not start with '$', given \
+                 '$computed{at}'."
+            ),
+        )
+    })
+}
+
+/// Whether a stage reads any `$meta` value.
+fn mentions_meta(v: &Bson) -> bool {
+    match v {
+        Bson::Document(d) => d.iter().any(|(k, x)| k == "$meta" || mentions_meta(x)),
+        Bson::Array(a) => a.iter().any(mentions_meta),
+        _ => false,
+    }
 }
 
 fn validate_stage_expr_args(pipeline: &[Bson]) -> Result<(), CommandError> {

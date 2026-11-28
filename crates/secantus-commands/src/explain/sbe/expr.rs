@@ -487,7 +487,7 @@ impl Expr {
             // by the spec, in the root's order; Nothing over a non-object
             // (`RetNothing`) for a closed spec, the input for an open one
             // (`RetInput`).
-            "makeBsonObj" => {
+            "makeBsonObj" | "makeObj" => {
                 if let Expr::SetSpec(names) = &args[0] {
                     return set_fields(names, args, env);
                 }

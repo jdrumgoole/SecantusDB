@@ -1200,30 +1200,43 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       2 documents and 2 keys of `b_1`). Found 2026-11-26 working RM-682.
       Verify: tests/backlog/test_rm_found_2026_11_14_rm539.py::test_an_expr_equality_on_a_let_variable_uses_an_index
       Backlog-ID: RM-813
-- [ ] **A `$lookup` on `localField` / `foreignField` that mongod joins by
-      an index or a nested loop is explained as a classic stage.** mongod
-      8.2.11 pushes every `$lookup` on join fields over a collection into
-      SBE and explains it so (`explainVersion` "2", no `stages`, an
-      `EQ_LOOKUP` on top of the query's plan). Since 2026-11-26 the hash
-      join is built (`explain/sbe/lookup.rs`, `corr.rs`): the `EQ_LOOKUP` of
-      strategy `HashJoin` or `NonExistentForeignCollection`, the
-      `hash_lookup`, `nlj`, `group`, `branch`, `union`, `unwind`, `limit` and
-      `coscan` stages with their slots and frames, and each stage's
-      `executionStats` from a run of the foreign side's key program over
-      both collections, for a plain collection scan (a `$match`, `$skip` or
-      `$limit` in front, none after but a `$match` of the joined array or an
-      `$addFields`). Open: the two other strategies, which mongod picks by
-      the foreign collection (measured 8.2.11): `IndexedLoopJoin` when an
-      index (not sparse, partial, hidden or collated; btree or hashed) leads
-      with the foreign field, `_id` included; `NestedLoopJoin` past 10,000
-      documents or 100 MiB (`internalQueryCollectionMaxNoOfDocumentsToChooseHashJoin`,
-      `...MaxDataSizeBytesToChooseHashJoin`). Both are explained as the
-      classic `$cursor` and `$lookup` here, which `lookup_joins`
-      (`explain/mod.rs`) declines on purpose: a stand-in `queryPlan` alone
-      would be wrong. Slices: IndexedLoopJoin (an `ixseek` / `seek` over the
-      foreign index with its stats), then the NestedLoopJoin cutover.
-      Verify: tests/backlog/test_rm_lookup_sbe.py::test_a_lookup_on_an_indexed_foreign_field_is_an_indexed_loop_join, tests/backlog/test_rm_lookup_sbe.py::test_a_lookup_on_a_large_foreign_collection_is_a_nested_loop_join
-      Backlog-ID: RM-683
+- [ ] **A `$lookup` that mongod joins by a dynamic indexed loop is
+      explained as a classic stage.** mongod 8.2.11 explains a `$lookup` on
+      `localField` / `foreignField` as SBE whatever the strategy; this
+      server builds the hash join, the indexed loop join and the nested loop
+      join (`explain/sbe/lookup.rs`, `index_join.rs`; RM-683, closed
+      2026-11-27) and declines the one left: `DynamicIndexedLoopJoin`, which
+      mongod takes when the only index leading with the foreign field has a
+      collation the query lacks and no hash join is possible
+      (`allowDiskUse: false`, or a foreign collection past 10,000 documents
+      or 100 MiB). Its plan decides at run time, for each local key, whether
+      to seek the index or scan the collection
+      (`buildDynamicIndexedLoopJoinLookupStage`, `gen_lookup.cpp`).
+      `lookup_joins` (`explain/mod.rs`) declines it on purpose: a stand-in
+      `queryPlan` alone would be wrong. Found 2026-11-27 working RM-683.
+      Verify: tests/backlog/test_rm_lookup_sbe.py::test_a_collated_index_without_a_hash_join_is_a_dynamic_indexed_loop_join
+      Backlog-ID: RM-840
+- [ ] **An indexed loop join over a decimal key is explained as a classic
+      stage.** mongod 8.2.11 seeks a `Decimal128` key as it seeks any number
+      (a decimal and an int or double that are equal share a KeyString), and
+      explains the `$lookup` as an `IndexedLoopJoin`; this server's
+      KeyString encoder (`key_string.rs`) refuses a `Decimal128`, so
+      `lookup_joins` declines a join whose local keys, or whose foreign
+      index keys, hold one. Found 2026-11-27 working RM-683.
+      Verify: tests/backlog/test_rm_lookup_sbe.py::test_an_indexed_loop_join_over_decimal_keys_is_explained_as_sbe
+      Backlog-ID: RM-838
+- [ ] **A `$lookup` under a collation is explained as a classic stage.**
+      mongod 8.2.11 explains a `$lookup` under the command's `collation`, or
+      over a local collection with a default one, as SBE: an
+      `IndexedLoopJoin` over an index whose collation is the query's (the
+      seeks made with `collKs`, the key sets with `collArrayToSet`), a hash
+      join or a `DynamicIndexedLoopJoin` otherwise; so is a `$lookup` over a
+      foreign collection with a default collation. This server explains each
+      as a classic `$cursor` and `$lookup` (`lookup_joins` declines a
+      foreign collection with a collation, and the query is not planned
+      into SBE under one). Found 2026-11-27 working RM-683.
+      Verify: tests/backlog/test_rm_lookup_sbe.py::test_a_lookup_under_a_collation_is_explained_as_sbe
+      Backlog-ID: RM-839
 - [ ] **A `$lookup` beside other pushed stages is explained as a classic
       stage.** mongod 8.2.11 runs a `$lookup` in SBE after a `$sort`,
       `$project` or `$group` in front, and with a `$project`, `$group`,
@@ -1330,15 +1343,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       (RM-418).
       Verify: tests/backlog/test_rm_found_2026_11_10_rm418.py::test_sbe_find_shapes_are_explained_as_sbe
       Backlog-ID: RM-543
-- [ ] **A `$sort` on a field and `{$meta: "randVal"}` before a `$project`
-      is not refused.** mongod 8.2.11 refuses `[{$sort: {a: 1, s: {$meta:
-      "randVal"}}}, {$project: {a: 1, _id: 0}}]` with 16410 ("FieldPath
-      field names may not start with '$', given '$computed1'", from its
-      pipeline rewrite); the same sort alone, or `{$meta: "randVal"}` as the
-      only key, answers on both, and this server sorts the pipeline. Found
-      2026-11-14 while working RM-423.
-      Verify: tests/backlog/test_rm_found_2026_11_08_rm332.py::test_a_rand_sort_beside_a_field_under_a_project_is_refused
-      Backlog-ID: RM-691
 
 ### 7.085 The shared Rust storage, audited -- 2026-10-20
 

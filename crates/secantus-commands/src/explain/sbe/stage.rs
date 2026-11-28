@@ -213,6 +213,38 @@ pub(crate) enum Stage {
         fields: Vec<(String, Slot)>,
         uuid: String,
     },
+    /// `SimpleIndexScanStage` (`ixseek`) over the intervals a `$lookup`'s
+    /// indexed loop join seeks, each one's low and high KeyString in the
+    /// slots `low` and `high` of the row it is correlated with (RM-683).
+    IxSeekBounds {
+        node: u32,
+        low: Slot,
+        high: Slot,
+        record_id: Slot,
+        ident: Slot,
+        key: Slot,
+        snapshot: Slot,
+        index: String,
+        uuid: String,
+    },
+    /// `UniqueRoaringStage`: each record id once (a multikey index returns a
+    /// document once for each of its keys the seeks reach).
+    UniqueRoaring {
+        node: u32,
+        slot: Slot,
+        input: Box<Stage>,
+    },
+    /// `LoopJoinStage` of a `$lookup`'s indexed loop join: the local rows,
+    /// and for each the foreign side `inner`, which seeks the foreign
+    /// index (`index_join.rs`).
+    IndexJoin {
+        node: u32,
+        projects: Vec<Slot>,
+        correlated: Vec<Slot>,
+        outer: Box<Stage>,
+        inner: Box<Stage>,
+        foreign: std::sync::Arc<super::index_join::Foreign>,
+    },
     /// `SortStage`: the key slots and each one's direction (`true`:
     /// descending), the slots it outputs, and a top-k limit's slot and
     /// amount.
@@ -321,6 +353,9 @@ pub(crate) struct Counted {
     /// A `branch`'s side that is open now, which stays open while it is
     /// re-opened on the same side.
     pub side: Option<usize>,
+    /// A `unique_roaring`'s `dupsTested` and `dupsDropped`.
+    pub dups_tested: i64,
+    pub dups_dropped: i64,
 }
 
 pub(super) type Row = HashMap<Slot, Value>;
@@ -377,6 +412,9 @@ impl Stage {
             | Stage::Union { node, .. }
             | Stage::Nlj { node, .. }
             | Stage::Seek { node, .. }
+            | Stage::IxSeekBounds { node, .. }
+            | Stage::UniqueRoaring { node, .. }
+            | Stage::IndexJoin { node, .. }
             | Stage::HashLookup { node, .. }
             | Stage::Group { node, .. } => *node,
         }
@@ -631,7 +669,10 @@ impl Stage {
             Stage::Nlj { outer, inner, .. } if fetch_of(inner).is_some() => {
                 fetch_join(outer, inner, docs, demand)
             }
-            Stage::Seek { .. } => unreachable!("a seek runs under its nlj"),
+            Stage::IndexJoin { .. } => super::index_join::run(self, docs, demand),
+            Stage::Seek { .. } | Stage::IxSeekBounds { .. } | Stage::UniqueRoaring { .. } => {
+                unreachable!("a seek runs under its join")
+            }
             Stage::Coscan { .. }
             | Stage::LimitLit { .. }
             | Stage::Unwind { .. }
@@ -778,6 +819,9 @@ impl Stage {
             Stage::Union { .. } => "union",
             Stage::Nlj { .. } => "nlj",
             Stage::Seek { .. } => "seek",
+            Stage::IxSeekBounds { .. } => "ixseek",
+            Stage::UniqueRoaring { .. } => "unique_roaring",
+            Stage::IndexJoin { .. } => "nlj",
             Stage::HashLookup { .. } => "hash_lookup",
         }
     }
@@ -787,7 +831,9 @@ impl Stage {
         match self {
             Stage::Branch { then_, else_, .. } => vec![then_, else_],
             Stage::Union { inputs, .. } => inputs.iter().map(|(_, s)| s).collect(),
-            Stage::Nlj { outer, inner, .. } | Stage::HashLookup { outer, inner, .. } => {
+            Stage::Nlj { outer, inner, .. }
+            | Stage::IndexJoin { outer, inner, .. }
+            | Stage::HashLookup { outer, inner, .. } => {
                 vec![outer, inner]
             }
             other => other.input().into_iter().collect(),
@@ -803,8 +849,12 @@ impl Stage {
             | Stage::Union { .. }
             | Stage::Nlj { .. }
             | Stage::Seek { .. }
+            | Stage::IxSeekBounds { .. }
+            | Stage::IndexJoin { .. }
             | Stage::HashLookup { .. } => None,
-            Stage::LimitLit { input, .. } | Stage::Unwind { input, .. } => Some(input),
+            Stage::LimitLit { input, .. }
+            | Stage::Unwind { input, .. }
+            | Stage::UniqueRoaring { input, .. } => Some(input),
             Stage::Filter { input, .. }
             | Stage::LimitSkip { input, .. }
             | Stage::Project { input, .. }
