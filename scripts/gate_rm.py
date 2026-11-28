@@ -5,6 +5,17 @@
     scripts/gate_rm.py --no-build   # the binaries are already built from HEAD
     scripts/gate_rm.py --only rust-test,lint   # rerun steps a fix only they check
     scripts/gate_rm.py --full       # the storage and PG-server tests even if untouched
+    scripts/gate_rm.py --fast       # integration mode: the backlog verify on the PR
+
+``--fast`` is the fix-one lanes' gate (Joe, 2026-11-28), as ``gate_pg.sh
+--fast`` is the PostgreSQL lanes': it leaves the full backlog verify (~17 min
+of a ~50 min gate, measured over 48 gates) to CI's ``mdb-binary (backlog)``
+job, which runs it on every rm-batch snapshot PR before anything reaches
+``main``, and runs in its place the regression (``backlog_fixed``) tests of
+the ``tests/backlog/`` files the work changes, where the item's own re-marked
+gap test lives. What is lost: a regression in a backlog test file the work
+did not touch is found on the snapshot PR, which the lander then bisects,
+not here. ``tests/mongod_live/`` still runs.
 
 The storage crate's own tests (both oplog modes, ~9 min) run only when this
 work changes the storage crates (`STORAGE_PATHS`, compared with the branch it
@@ -162,6 +173,22 @@ def pg_needed(files: list[str]) -> bool:
     return bool(mod.pg_needed(files))
 
 
+def touched_regression_files(files: list[str]) -> list[str]:
+    """The `tests/backlog/` test files among `files` that still exist and hold
+    a `backlog_fixed` test: what `--fast` runs in place of the full verify. A
+    file with none is left out, since pytest exits 5 when `-m backlog_fixed`
+    selects nothing."""
+    return [
+        f
+        for f in files
+        if f.startswith("tests/backlog/")
+        and Path(f).name.startswith("test_")
+        and f.endswith(".py")
+        and Path(f).is_file()
+        and "backlog_fixed(" in Path(f).read_text(errors="replace")
+    ]
+
+
 def is_pg_server_test(path: str) -> bool:
     """A test of the Rust PostgreSQL server, which runs whenever the lane holds
     a `secantusd-pg` and skips when it does not."""
@@ -241,6 +268,12 @@ def main() -> int:
         action="store_true",
         help="run the storage crate's tests and the PostgreSQL server's even when "
         "this work does not touch them",
+    )
+    ap.add_argument(
+        "--fast",
+        action="store_true",
+        help="integration mode: leave the full backlog verify to the snapshot PR's CI "
+        "and run only the regression tests of the backlog files this work changes",
     )
     args = ap.parse_args()
     only = {s.strip() for s in args.only.split(",") if s.strip()} if args.only else None
@@ -362,18 +395,29 @@ def main() -> int:
         "concurrency",
         [*pytest, "tests/test_mongo_server_concurrency.py", "-k", "rust", "-o", "addopts="],
     )
-    g.step(
-        "backlog",
-        [
-            str(py),
-            "tools/backlog.py",
-            "verify",
-            "--file",
-            "backlog-rust-mongodb.md",
-            "--regressions",
-        ],
-        env={"SECANTUS_BACKLOG_WORKERS": WORKERS},
-    )
+    if args.fast:
+        g.skip("backlog", "--fast: CI's mdb-binary (backlog) runs it on the snapshot PR")
+        touched = touched_regression_files(changed)
+        if touched:
+            g.step(
+                "backlog-touched",
+                [*pytest, *touched, "-m", "backlog_fixed", "-o", "addopts=", "-n", WORKERS],
+            )
+        else:
+            g.skip("backlog-touched", "no tests/backlog/ file with a regression test changed")
+    else:
+        g.step(
+            "backlog",
+            [
+                str(py),
+                "tools/backlog.py",
+                "verify",
+                "--file",
+                "backlog-rust-mongodb.md",
+                "--regressions",
+            ],
+            env={"SECANTUS_BACKLOG_WORKERS": WORKERS},
+        )
     g.step(
         "mongod-live",
         [*pytest, "tests/mongod_live", "-m", "mongod_live", "-o", "addopts=", "-n", WORKERS],
